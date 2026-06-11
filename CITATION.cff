@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: >-
+  If you use Unfitted.jl in academic work, please cite the method paper
+  under "preferred-citation" below. The other metadata describes the
+  software itself.
+title: Unfitted.jl
+abstract: >-
+  A compact, dimension-generic Julia implementation of unfitted
+  multi-level hp refinement on axis-aligned Cartesian grids, with
+  selective per-cell activation and finite-cell-method (FCM)
+  immersed-boundary integration via non-negative moment-fit quadrature.
+type: software
+version: 0.1.0
+license: MIT
+repository-code: https://github.com/schmaeke/Unfitted.jl
+keywords:
+  - finite element method
+  - hp refinement
+  - unfitted finite elements
+  - multi-level hp
+  - finite cell method
+  - immersed boundary
+  - julia
+authors:
+  - family-names: Schmäke
+    given-names: Jan Niklas
+preferred-citation:
+  type: article
+  title: Unfitted multi-level hp refinement on Cartesian grids
+  authors:
+    - family-names: Schmäke
+      given-names: Jan Niklas
+    - family-names: Ruess
+      given-names: Martin
+  year: 2026
+  notes: arXiv preprint arXiv:2604.25797
+  url: https://arxiv.org/abs/2604.25797

@@ -1,0 +1,114 @@
+@testset "basis scaffold" begin
+    basis = IntegratedLegendre()
+
+    @test Unfitted.basis_name(basis) == :integrated_legendre
+    @test Unfitted.recommended_quadrature_order(basis, (2, 3)) == (3, 4)
+    @test Unfitted.local_basis_count(basis, (2, 3)) == 12
+end
+
+@testset "integrated Legendre 1D" begin
+    for ξ in (-1.0, -0.3, 0.2, 1.0)
+        @test Unfitted.integrated_legendre_value(0, ξ) ≈ (1.0 - ξ) / 2
+        @test Unfitted.integrated_legendre_value(1, ξ) ≈ (1.0 + ξ) / 2
+        @test Unfitted.integrated_legendre_derivative(0, ξ) ≈ -0.5
+        @test Unfitted.integrated_legendre_derivative(1, ξ) ≈ 0.5
+    end
+
+    for i in 2:8
+        @test abs(Unfitted.integrated_legendre_value(i, -1.0)) < 1.0e-13
+        @test abs(Unfitted.integrated_legendre_value(i, 1.0)) < 1.0e-13
+
+        ξ = -0.7 + 1.4 * (i - 2) / 6
+        h = 1.0e-6
+        fd = (Unfitted.integrated_legendre_value(i, ξ + h) -
+              Unfitted.integrated_legendre_value(i, ξ - h)) / (2h)
+        @test Unfitted.integrated_legendre_derivative(i, ξ) ≈ fd rtol = 1.0e-7 atol = 1.0e-8
+    end
+end
+
+@testset "tensor basis values and ordering" begin
+    basis = IntegratedLegendre()
+
+    @test Unfitted.local_basis_indices(basis, (1, 2)) ==
+          [CartesianIndex(0, 0), CartesianIndex(1, 0), CartesianIndex(0, 1), CartesianIndex(1, 1),
+           CartesianIndex(0, 2), CartesianIndex(1, 2)]
+
+    values = Unfitted.basis_values(basis, (1, 1), (0.25, -0.5))
+    @test length(values) == 4
+    @test sum(values) ≈ 1.0
+
+    values3 = Unfitted.basis_values(basis, (1, 2, 1), (0.0, 0.25, -0.25))
+    @test length(values3) == 12
+
+    values4 = Unfitted.basis_values(basis, (1, 1, 1, 1), (0.0, 0.1, -0.2, 0.3))
+    @test length(values4) == 16
+    @test sum(values4) ≈ 1.0
+end
+
+@testset "total-degree basis filtering" begin
+    basis = IntegratedLegendre()
+
+    @test Unfitted.local_basis_count(basis, (2, 2), :total_degree) == 8
+    @test Unfitted.local_basis_count(basis, (3, 3), :total_degree) == 13
+    @test Unfitted.local_basis_count(basis, (2, 2, 2), :total_degree) == 20
+    @test CartesianIndex(2, 2) ∉ Unfitted.local_basis_indices(basis, (2, 2), :total_degree)
+    @test CartesianIndex(2, 2) ∈ Unfitted.local_basis_indices(basis, (3, 3), :total_degree)
+    @test_throws ArgumentError Unfitted.local_basis_indices(basis, (2, 3), :total_degree)
+
+    values = Unfitted.basis_values(basis, (1, 1), :total_degree, (0.2, -0.3))
+    @test length(values) == 4
+    @test sum(values) ≈ 1.0
+
+    lower = Unfitted.boundary_basis_indices(basis, (2, 2); axis=1, side=:lower, mode=:total_degree)
+    @test length(lower) == 3
+    @test all(id.I[1] == 0 for id in lower)
+end
+
+@testset "tensor basis gradients" begin
+    basis = IntegratedLegendre()
+    gradients1 = Unfitted.reference_basis_gradients(basis, (2,), (0.25,))
+    @test length(gradients1) == 3
+    @test gradients1[1][1] ≈ -0.5
+    @test gradients1[2][1] ≈ 0.5
+
+    order = (2, 2)
+    ξ = (0.15, -0.35)
+    values_plus = similar(Unfitted.basis_values(basis, order, ξ))
+    values_minus = similar(values_plus)
+    gradients = Unfitted.reference_basis_gradients(basis, order, ξ)
+    h = 1.0e-6
+
+    Unfitted.basis_values!(basis, values_plus, order, (ξ[1] + h, ξ[2]))
+    Unfitted.basis_values!(basis, values_minus, order, (ξ[1] - h, ξ[2]))
+    for i in eachindex(gradients)
+        @test gradients[i][1] ≈ (values_plus[i] - values_minus[i]) / (2h) rtol = 1.0e-7 atol = 1.0e-8
+    end
+
+    cell = box((2.0, -1.0), (4.0, 3.0))
+    physical = Unfitted.physical_basis_gradients(basis, order, cell, ξ)
+    @test physical[1] ≈ gradients[1] .* (2 ./ Unfitted.edge_lengths(cell))
+
+    gradients3 = Unfitted.reference_basis_gradients(basis, (1, 1, 1), (0.2, -0.1, 0.4))
+    @test length(gradients3) == 8
+    @test length(gradients3[1]) == 3
+end
+
+@testset "basis boundary metadata and quadrature" begin
+    basis = IntegratedLegendre()
+
+    lower = Unfitted.boundary_basis_indices(basis, (2, 3); axis=1, side=:lower)
+    upper = Unfitted.boundary_basis_indices(basis, (2, 3); axis=2, side=:upper)
+
+    @test all(id.I[1] == 0 for id in lower)
+    @test length(lower) == 4
+    @test all(id.I[2] == 1 for id in upper)
+    @test length(upper) == 3
+    @test Unfitted.is_boundary_basis(basis, CartesianIndex(1, 1, 0), 1, :upper)
+    @test !Unfitted.is_boundary_basis(basis, CartesianIndex(2, 1, 0), 1, :upper)
+
+    q = Unfitted.gauss_rule(basis, (2, 3), Float64)
+    @test length(q.points) == 12
+    @test length(q.weights) == 12
+    @test sum(q.weights) ≈ 4.0
+    @test all(all(-1.0 < x < 1.0 for x in point) for point in q.points)
+end
