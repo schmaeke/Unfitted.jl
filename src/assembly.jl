@@ -118,16 +118,22 @@ end
 
 The current solution iterate at a quadrature point, exposed to weak-form
 callbacks as `q.state` when assembling with `state=`. Query it with
-`value(q.state, field[, component])` and `gradient(q.state, field[, component])`,
-where `field` is a field name `Symbol` or a [`Field`](@ref). Evaluation
-is lazy and reuses the basis data already computed for the integration
-region, so a callback can read `q.state` multiple times without
-recomputing anything.
+`value(q.state, field[, component])` and `field_gradient(q.state, field[,
+component])`, where `field` is a field name `Symbol` or a
+[`Field`](@ref). Evaluation is lazy and reuses the basis data already
+computed for the integration region, so a callback can read `q.state`
+multiple times without recomputing anything.
 
 `FormState` is what makes the assembly path Newton-linearisation
 friendly: a `bilinear` callback that wants the current iterate
 `uₖ(x)` for building a tangent operator simply asks `q.state` for the
 value or gradient.
+
+`field_gradient` (rather than the natural shorter `gradient`) avoids a
+name collision with `Tensors.gradient`, the automatic-differentiation
+entry point of the Tensors.jl package, so the two can be loaded
+together unrestricted; `value` does not collide and keeps its short
+name.
 """
 struct FormState{FD,L<:SystemLayout,C}
     field_data::FD
@@ -136,7 +142,7 @@ struct FormState{FD,L<:SystemLayout,C}
 end
 
 # Resolve a field name to its `fields` index inside the `SystemLayout`.
-# Used by the public `value` / `gradient` on `FormState`.
+# Used by the public `value` / `field_gradient` on `FormState`.
 function _state_field_index(state::FormState, name::Symbol)
     index = get(state.layout.by_name, name, 0)
     index == 0 && throw(ArgumentError("unknown field $name"))
@@ -157,20 +163,23 @@ function value(state::FormState, name::Symbol, component::Integer=1)
 end
 
 """
-    gradient(state::FormState, name_or_field[, component=1])
+    field_gradient(state::FormState, name_or_field[, component=1])
 
 Read the named field's physical gradient at the current quadrature
-point. Same field/component semantics as [`value`](@ref).
+point. Same field/component semantics as [`value`](@ref). The leading
+`field_` is there to avoid colliding with `Tensors.gradient` (the
+automatic-differentiation entry point) when both packages are loaded
+together.
 """
-function gradient(state::FormState, name::Symbol, component::Integer=1)
+function field_gradient(state::FormState, name::Symbol, component::Integer=1)
     index = _state_field_index(state, name)
     return _field_gradient(state.field_data[index], state.layout.fields[index], state.coefficients,
                            component)
 end
 
 value(state::FormState, field::Field, component::Integer=1) = value(state, field.name, component)
-function gradient(state::FormState, field::Field, component::Integer=1)
-    gradient(state, field.name, component)
+function field_gradient(state::FormState, field::Field, component::Integer=1)
+    field_gradient(state, field.name, component)
 end
 
 # Tiny helper raising the "no state attached" error from a single
@@ -180,7 +189,7 @@ function _no_form_state()
     throw(ArgumentError("q.state is unavailable; assemble with `state = current_iterate`"))
 end
 value(::Nothing, args...) = _no_form_state()
-gradient(::Nothing, args...) = _no_form_state()
+field_gradient(::Nothing, args...) = _no_form_state()
 
 # ── Assembly workspace and hot loop ───────────────────────────────────────────
 
@@ -1132,7 +1141,7 @@ where
   - `q.state` — `nothing` unless a `state` (a [`Solution`](@ref) or
     raw active coefficient vector) was passed, in which case it is a
     [`FormState`](@ref) for `value(q.state, field)` and
-    `gradient(q.state, field)`.
+    `field_gradient(q.state, field)`.
 
 Iteration order matches the serial assembly path; threaded assembly
 sees the same `q.point` indices but visits them in a different order.

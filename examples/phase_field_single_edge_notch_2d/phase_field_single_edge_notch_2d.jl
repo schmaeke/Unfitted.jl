@@ -50,6 +50,7 @@ Example:
 using Unfitted
 using LinearAlgebra
 using StaticArrays
+using Tensors
 
 include(joinpath(@__DIR__, "..", "reporting.jl"))
 
@@ -88,20 +89,14 @@ const strip_mesh_template = mesh(strip_domain; cells=(strip_cells_x, strip_cells
 const notch_history_factor = 100.0
 const notch_history_width_factor = 0.25
 
-# Growing-mask knobs.
-# `mask_threshold`: damage value at which a strip cell is permanently triggered.
-# Set well above the residual base-overlay smear (~0.045) so background damage
-# never grows the mask, only the actual crack tip does.
-# `mask_dilation`: Chebyshev halo around the triggered set so each accepted load
-# step has free cells ahead of the tip to propagate into before the next update.
-# `bootstrap_halo`: geometric radius around the notch segment that seeds the
-# initial triggered set.
+# Growing-mask knobs. `mask_threshold` is set well above the residual
+# base-overlay smear (~0.045) so background damage never grows the
+# mask, only the actual crack tip does. `mask_dilation` is the
+# Chebyshev halo around the triggered set, sized so each accepted load
+# step has free cells ahead of the tip to propagate into.
 const mask_threshold = 0.5
 const mask_dilation = 2
 const bootstrap_halo = 2.0 * ell
-
-# RBF + P0 history transfer follows Sartorti & Düster 2024, Sec. 3.3.1 — see
-# the library's `RBFP0` for details. Default neighbour count = 10.
 
 # Adaptive load stepping and Newton tolerances.
 const max_newton_iterations = 24
@@ -122,34 +117,12 @@ const export_force_delta = 0.02
 
 # ── Material, energy split, and constitutive law ─────────────────────────────
 #
-# Implements the tension/compression split of Miehe et al. 2010 (Sec. 3) for
-# the strain-energy density: only the *tensile* part of the elastic energy
-# drives damage, so a crack opens under tension but is allowed to close
-# without further degradation under compression.
-#
-# Voigt notation throughout the mechanics: strain is stored as
-#
-#     ε = (εxx, εyy, γxy)ᵀ,
-#
-# with the engineering shear convention `γxy = 2 εxy`. The split returns
-# per-component arrays in the *tensor* convention (third component
-# `εxy = γxy/2`); the inner products in `positive_energy` and `split_stress`
-# pick up the corresponding factor of 2 so the energy is consistent.
-#
-# Splitting strategy:
-#
-#   1. Spectral decomposition of the 2D strain into principal strains
-#      `e₁ ≥ e₂` and the projection coefficients onto the principal frame.
-#   2. ε⁺ = ⟨e₁⟩₊ P₁ + ⟨e₂⟩₊ P₂,   ε⁻ = ⟨e₁⟩₋ P₁ + ⟨e₂⟩₋ P₂,
-#      with `⟨·⟩₊ = max(·, 0)` and `⟨·⟩₋ = min(·, 0)`.
-#   3. ψ⁺(ε) = ½ λ ⟨tr ε⟩₊² + μ (ε⁺·ε⁺),     ψ⁻(ε) = ½ λ ⟨tr ε⟩₋² + μ (ε⁻·ε⁻),
-#      σ⁺(ε) = λ ⟨tr ε⟩₊ I + 2μ ε⁺,         σ⁻(ε) = λ ⟨tr ε⟩₋ I + 2μ ε⁻.
-#   4. Damage `d ∈ [0, 1]` degrades the tensile branch only:
-#
-#          σ(ε, d) = ((1 − d)² + k) σ⁺(ε) + σ⁻(ε),
-#
-#      where `k = residual_stiffness` is the small ersatz stiffness that
-#      keeps the system non-singular at fully damaged points.
+# Miehe tension/compression split (Sec. 3): only the *tensile* part of
+# the elastic energy drives damage, so a crack opens under tension but
+# closes without further degradation under compression. With strain
+# and stress as `SymmetricTensor{2,2,Float64}`, the off-diagonal
+# `ε[1,2] = εxy` enters double contractions correctly without any
+# factor-of-two Voigt bookkeeping.
 
 """
     Material(lambda, mu, residual_stiffness)
@@ -165,167 +138,115 @@ struct Material
     residual_stiffness::Float64
 end
 
-# Voigt-strain (or Voigt-stress) static vector and stress-tangent static
-# matrix. Aliased so the per-quadrature-point cache stays type-stable.
-const StrainStress = SVector{3,Float64}
-const StressTangent = SMatrix{3,3,Float64,9}
+# Symmetric 2D strain/stress and minor-symmetric 4th-order tangent — the
+# per-quadrature-point cache types. Per-q-point fields (history, frozen
+# damage, …) are stored as plain `Vector`s indexed by `q.point`; the
+# mechanics and phase models share the same space `V`, so they share
+# this indexing.
+const StrainStress = SymmetricTensor{2,2,Float64,3}
+const StressTangent = SymmetricTensor{4,2,Float64,9}
 
-# History and per-step material state are stored as plain vectors indexed by
-# the stable quadrature-point id `q.point` (see
-# `foreach_quadrature_point` / `nquadpoints` in the package). Mechanics and
-# phase models share the same space `V`, so their `q.point` indexing is
-# identical and the same vectors work for both.
-
-# Distance from a physical point to the closest point on the initial notch
-# segment Γ₀ = {(x, 0.5) : 0 ≤ x ≤ 0.5}. Used by `initial_history` (seed the
-# damage bump at the notch tip) and by `bootstrap_triggered_mask` (seed the
-# initial active strip cells).
+# Distance from `x` to the closest point on the initial notch segment
+# Γ₀ = {(x, 0.5) : 0 ≤ x ≤ 0.5}.
 function distance_to_notch(x)
     projection = clamp((x[1] - notch_left[1]) / (notch_tip[1] - notch_left[1]), 0.0, 1.0)
     closest = notch_left + projection * (notch_tip - notch_left)
     return norm(SVector(x[1], x[2]) - closest)
 end
 
-# Smooth exponential decay around the notch segment, used only for the
-# VTK `notch` channel so a viewer can visualise the crack-path band.
+# Smooth exponential decay around the notch for visualising the
+# crack-path band in the VTK `notch` channel.
 reference_notch_profile(x) = exp(-distance_to_notch(x) / ell)
 
-# Initial history-field seed: a Gaussian bump in `ψ⁺` centred on the notch.
-# Pre-loading `H` above the regularisation floor `Gc / ℓ` along the notch
-# means the first phase solve already sees a damaged region there, so the
-# bootstrap solve produces the diffuse-notch field without needing a
-# resolved geometric crack. Restricted to `x ≤ notch_tip + 2ℓ` to avoid
-# polluting the far field with seed energy.
+# Initial history-field seed: a Gaussian bump in `ψ⁺` along the notch,
+# tall enough to push `H` above the regularisation floor `Gc / ℓ` so
+# the bootstrap phase solve produces the diffuse-notch field without
+# needing a resolved geometric crack. Truncated outside `x ≤ notch_tip
+# + 2ℓ` so the far field stays clean.
 function initial_history(x)
     x[1] <= notch_tip[1] + 2ell || return 0.0
     width = notch_history_width_factor * ell
     return notch_history_factor * Gc / ell * exp(-(distance_to_notch(x) / width)^2)
 end
 
-# 2D spectral decomposition of a Voigt strain `ε = (εxx, εyy, γxy)`. The
-# principal strains are
+# Tension/compression split of a 2D symmetric strain via the
+# eigenvector-free identity
 #
-#     e₁ = mean + r,   e₂ = mean − r,
-#     mean = (εxx + εyy) / 2,   diff = (εxx − εyy) / 2,
-#     εxy  = γxy / 2,           r = √(diff² + εxy²),
+#     ε⁺ = (ε + |ε|) / 2,    ε⁻ = ε − ε⁺,
 #
-# and the projection coefficients onto the principal-direction outer
-# products `P_α = p_α p_αᵀ` come from
+# with the matrix absolute value `|ε|` evaluated in closed form by the
+# Cayley-Hamilton theorem: for 2D symmetric `ε`,
+# `ε² = tr(ε) ε − det(ε) I` and `|ε|² = ε²`, giving
 #
-#     p₁₁ = ½ + diff / (2r),   p₂₂ = ½ − diff / (2r),   p₁₂ = εxy / (2r).
+#     |ε| = (tr(ε) ε + 2 ⟨−det(ε)⟩₊ I) / √(tr(ε²) + 2 |det(ε)| + δ).
 #
-# Returning `ε⁺` and `ε⁻` with components in *tensor* shear convention
-# (third component is `εxy`, not `γxy`) — `positive_energy` and
-# `split_stress` apply the right factor of 2 to compensate.
-#
-# The branch `r ≤ 1e-14` handles the spherical case where the principal
-# frame is undefined: both principal strains equal the mean and the
-# off-diagonal vanishes.
-function positive_negative_strain(strain)
-    exx, eyy, gamma = strain
-    exy = 0.5gamma
-    mean = 0.5 * (exx + eyy)
-    diff = 0.5 * (exx - eyy)
-    radius = hypot(diff, exy)
-
-    if radius <= 1.0e-14
-        positive = max(mean, 0.0)
-        negative = min(mean, 0.0)
-        return SVector(positive, positive, 0.0), SVector(negative, negative, 0.0)
-    end
-
-    e1 = mean + radius
-    e2 = mean - radius
-    p11 = 0.5 + diff / (2radius)
-    p22 = 0.5 - diff / (2radius)
-    p12 = exy / (2radius)
-
-    ep1 = max(e1, 0.0)
-    ep2 = max(e2, 0.0)
-    em1 = min(e1, 0.0)
-    em2 = min(e2, 0.0)
-    positive = SVector(ep1 * p11 + ep2 * p22, ep1 * p22 + ep2 * p11, ep1 * p12 - ep2 * p12)
-    negative = SVector(em1 * p11 + em2 * p22, em1 * p22 + em2 * p11, em1 * p12 - em2 * p12)
-    return positive, negative
+# `tr(ε)`, `det(ε)`, and `tr(ε²)` are polynomial in the components, so
+# automatic differentiation through this formula has no `1 / (e₁ − e₂)`
+# blow-up at a degenerate principal frame — that singularity was an
+# artifact of the spectral formula, not a property of ε⁺ itself. The
+# regularising offset `δ = eps(Float64)` removes the unique remaining
+# 0 / 0 at exactly `ε = 0`; its effect on the result at any non-zero
+# strain is below floating-point precision, and at `ε = 0` it returns
+# `ε⁺ = 0` as required.
+function positive_negative_strain(strain::SymmetricTensor{2,2})
+    detε = det(strain)
+    abs_strain = (tr(strain) * strain + 2 * max(-detε, 0.0) * one(strain)) /
+                 sqrt(tr(strain ⋅ strain) + 2 * abs(detε) + eps(Float64))
+    eps_plus = symmetric((strain + abs_strain) / 2)
+    return eps_plus, strain - eps_plus
 end
 
-# Tensile elastic-energy density
-#
-#     ψ⁺(ε) = ½ λ ⟨tr ε⟩₊² + μ (ε⁺ · ε⁺).
-#
-# The `2 eps_plus[3]^2` is the Voigt-product factor: with `eps_plus[3]`
-# carrying the tensor shear `εxy⁺`, the inner product expands to
-# `εxx² + εyy² + 2 εxy²` (the off-diagonal contribution is counted twice
-# because the strain tensor is symmetric).
-#
-# `ψ⁺` is the only energy density driving the history field `H` and
-# therefore the only one driving damage growth in the phase equation.
-function positive_energy(strain, material::Material)
+# Tensile elastic-energy density `ψ⁺(ε) = ½ λ ⟨tr ε⟩₊² + μ (ε⁺ ⊡ ε⁺)`.
+# Drives the history field `H` and so is the sole source of damage
+# growth in the phase equation.
+function positive_energy(strain::SymmetricTensor{2,2}, material::Material)
     eps_plus, _ = positive_negative_strain(strain)
-    trp = max(strain[1] + strain[2], 0.0)
-    return 0.5 * material.lambda * trp^2 +
-           material.mu * (eps_plus[1]^2 + eps_plus[2]^2 + 2eps_plus[3]^2)
+    trp = max(tr(strain), 0.0)
+    return 0.5 * material.lambda * trp^2 + material.mu * (eps_plus ⊡ eps_plus)
 end
 
-# Cauchy stress under the Miehe tension/compression split:
+# Cauchy stress under the Miehe split:
 #
 #     σ(ε, d) = g(d) σ⁺(ε) + σ⁻(ε),
 #     σ⁺ = λ ⟨tr ε⟩₊ I + 2μ ε⁺,    σ⁻ = λ ⟨tr ε⟩₋ I + 2μ ε⁻,
 #     g(d) = (1 − d)² + k.
 #
 # `phase` is clamped to `[0, 1]` so an over-damaged Newton iterate
-# cannot blow up the degradation factor. The third Voigt component of
-# `positive` / `negative` is the *engineering* shear `γxy = 2 εxy` —
-# the spectral decomposition's `2μ εxy⁺` and `2μ εxy⁻` already include
-# the factor of 2 needed to convert the tensor `εxy` it stores back to
-# the engineering convention the assembly path expects.
-function split_stress(strain, phase, material::Material)
+# cannot blow up the degradation factor.
+function split_stress(strain::SymmetricTensor{2,2}, phase, material::Material)
     eps_plus, eps_minus = positive_negative_strain(strain)
     g = (1.0 - clamp(phase, 0.0, 1.0))^2 + material.residual_stiffness
-    trp = max(strain[1] + strain[2], 0.0)
-    trm = min(strain[1] + strain[2], 0.0)
-
-    positive = SVector(material.lambda * trp + 2material.mu * eps_plus[1],
-                       material.lambda * trp + 2material.mu * eps_plus[2],
-                       2material.mu * eps_plus[3])
-    negative = SVector(material.lambda * trm + 2material.mu * eps_minus[1],
-                       material.lambda * trm + 2material.mu * eps_minus[2],
-                       2material.mu * eps_minus[3])
+    trp = max(tr(strain), 0.0)
+    trm = min(tr(strain), 0.0)
+    I2 = one(strain)
+    positive = material.lambda * trp * I2 + 2 * material.mu * eps_plus
+    negative = material.lambda * trm * I2 + 2 * material.mu * eps_minus
     return g * positive + negative
 end
 
-# Numerical stress-tangent `∂σ/∂ε`. Central differences in each Voigt
-# direction. We pay the 6 extra stress evaluations per point and avoid
-# the analytic tangent because the spectral split's projection
-# coefficients have a `1 / r` singularity when the principal frame
-# becomes degenerate (`r → 0`); the finite-difference path is finite-
-# valued through that region thanks to the `r ≤ 1e-14` branch in
-# `positive_negative_strain`. Step size scales with `‖ε‖` to keep
-# the relative perturbation roughly constant.
-function stress_tangent(strain, phase, material::Material)
-    h = 1.0e-7 * max(1.0, norm(strain))
-    columns = ntuple(3) do j
-        direction = SVector(ntuple(i -> i == j ? h : 0.0, 3))
-        (split_stress(strain + direction, phase, material) -
-         split_stress(strain - direction, phase, material)) / (2h)
-    end
-    return SMatrix{3,3}(hcat(columns...))
+# Cauchy stress and tangent `(C, σ)` at one strain via automatic
+# differentiation through `split_stress`. AD-clean at every strain
+# configuration thanks to the Cayley-Hamilton form of
+# `positive_negative_strain`.
+function stress_and_tangent(strain::SymmetricTensor{2,2}, phase, material::Material)
+    return Tensors.gradient(ε -> split_stress(ε, phase, material), strain, :all)
 end
 
-# Strain at an arbitrary physical point from a vector displacement solution.
+# Strain `ε(u) = sym(∇u)` at an arbitrary physical point from a
+# displacement solution.
 function displacement_strain(solution, model, u, x)
-    g1 = gradient(solution, model, u, x, 1)
-    g2 = gradient(solution, model, u, x, 2)
-    return SVector(g1[1], g2[2], g1[2] + g2[1])
+    return symmetric(Tensor{2,2}((i, j) -> field_gradient(solution, model, u, x, i)[j]))
 end
 
-# Strain at a quadrature point from the current iterate exposed as `q.state`.
-function strain_state(state)
-    SVector(gradient(state, :u, 1)[1], gradient(state, :u, 2)[2],
-            gradient(state, :u, 1)[2] + gradient(state, :u, 2)[1])
+# Strain at a quadrature point from the current iterate `q.state`.
+strain_state(state) = symmetric(gradient_tensor(state, :u, Val(2)))
+
+# Damage `d ∈ [0, 1]` at a single physical point.
+function damage_at(damage_solution, phase_state, x)
+    clamp(value(damage_solution, phase_state.model, phase_state.damage, x), 0.0, 1.0)
 end
 
-# Damage values frozen at every quadrature point of `model` (uses `q.point`).
+# Per-quadrature-point damage vector, indexed by `q.point`.
 function frozen_damage(model, damage_solution)
     d = zeros(nquadpoints(model))
     foreach_quadrature_point(model; state=damage_solution) do q
@@ -355,12 +276,10 @@ end
 
 # ── Space and state builders ──────────────────────────────────────────────────
 #
-# `build_space(strip_mask)` composes the model's superposition space:
-# the `(cells_per_axis × cells_per_axis)` base level at total-degree `p`
-# plus the strip overlay carrying the current activation mask. Both `u`
-# and `d` live on this same space, so a single rebuild refreshes the
-# basis for both fields. Total-degree mode is chosen so the overlay
-# does not balloon the dof count at high `p`.
+# Both `u` and `d` live on the same superposition space (a base level
+# plus the strip overlay carrying the current activation mask), so a
+# single rebuild refreshes the basis for both fields. Total-degree mode
+# keeps the dof count manageable at high `p`.
 function build_space(strip_mask)
     V = space(omega; cells=(cells_per_axis, cells_per_axis), order=order, mode=:total_degree)
     return overlay(V, strip_domain; cells=(strip_cells_x, strip_cells_y), order=strip_order,
@@ -369,19 +288,12 @@ end
 
 # ── Growing strip mask ───────────────────────────────────────────────────────
 #
-# Three pieces:
-#
-#   * `dilate_mask(mask, n)` — Chebyshev-distance dilation by `n` cells.
-#     Each iteration ORs in neighbouring `true` cells across all
-#     8-connected (in 2D) directions. Used to add a halo around the
-#     triggered set so the next load step has free cells ahead of the
-#     crack tip to propagate into.
-#   * `bootstrap_triggered_mask()` — initial triggered set: every strip
-#     cell whose centre falls inside `bootstrap_halo` of the notch.
-#   * `update_triggered_mask(previous, …)` — read the current damage
-#     field at every strip cell centre; cells whose damage exceeds
-#     `mask_threshold` join the triggered set. The set is monotone (a
-#     cell, once triggered, never untriggers) so the basis only grows.
+# The triggered set is monotone: a cell, once triggered, never
+# untriggers. `bootstrap_triggered_mask` seeds it from a geometric halo
+# around the notch; `update_triggered_mask` adds cells whose damage has
+# crossed `mask_threshold`; `dilate_mask` then expands the set by a
+# Chebyshev halo so the next load step has free cells ahead of the
+# crack tip to propagate into.
 
 function dilate_mask(mask::BitArray{D}, n::Integer) where {D}
     n <= 0 && return copy(mask)
@@ -417,8 +329,7 @@ function update_triggered_mask(previous, damage_solution, phase_state)
     for ci in cell_indices(strip_mesh_template)
         new_triggered[ci] && continue
         c = center(cell_box(strip_mesh_template, ci))
-        d = clamp(value(damage_solution, phase_state.model, phase_state.damage, c), 0.0, 1.0)
-        d >= mask_threshold && (new_triggered[ci] = true)
+        damage_at(damage_solution, phase_state, c) >= mask_threshold && (new_triggered[ci] = true)
     end
     return new_triggered
 end
@@ -434,19 +345,17 @@ end
 
 function build_displacement_model(V, applied_displacement)
     u = field(:u, V; components=2)
-    # Symmetric SENT setup: u_2 prescribed on the top and bottom edges, with a
-    # codim-D pin at the bottom-left corner removing the u_1 rigid-body mode.
-    # Allowing u_1 to relax on both edges keeps the elastic field symmetric
-    # about y = 0.5, so the phase-field crack stays exactly on the midline.
+    # Symmetric SENT setup: u₂ prescribed on top and bottom edges; a
+    # codim-D pin at the bottom-left corner removes the u₁ rigid-body
+    # mode while leaving u₁ free on the edges, so the elastic field
+    # stays symmetric about y = 0.5 and the crack stays on the midline.
+    bottom = boundary(axis=2, side=:lower)
+    top = boundary(axis=2, side=:upper)
+    pin = boundary((axis=1, side=:lower), (axis=2, side=:lower))
     problem = Problem((u,);
-                      dirichlet=[dirichlet(0.0; on=boundary(axis=2, side=:lower), field=u,
-                                           component=2),
-                                 dirichlet(applied_displacement; on=boundary(axis=2, side=:upper),
-                                           field=u, component=2),
-                                 dirichlet(0.0;
-                                           on=boundary((axis=1, side=:lower),
-                                                       (axis=2, side=:lower)), field=u,
-                                           component=1)], symmetric=false)
+                      dirichlet=[dirichlet(0.0; on=bottom, field=u, component=2),
+                                 dirichlet(applied_displacement; on=top, field=u, component=2),
+                                 dirichlet(0.0; on=pin, field=u, component=1)], symmetric=false)
     return (; model=prepare(problem), u)
 end
 
@@ -455,48 +364,35 @@ end
 #     a(d, v) = ∫_Ω (Gc/ℓ + 2 H + η/τ) d·v dx  +  ∫_Ω Gc ℓ ∇v·∇d dx,
 #     ℓ(v)   = ∫_Ω (2 H + (η/τ) dₙ)·v dx,
 #
-# where `H = max_{s ≤ t} ψ⁺(ε(x, s))` is the history field enforcing
-# damage irreversibility, `η` is the viscosity, `τ = time_step`, and
-# `dₙ` is the damage from the previous load step. The `Gc ℓ ∇v·∇d` term
-# is the standard Γ-convergence regularisation that sets the diffuse
-# crack bandwidth; the `(Gc/ℓ + …) d·v` term provides the local
-# restoring force.
+# with `H = max_{s ≤ t} ψ⁺(ε(x, s))` the irreversible history,
+# `η` the viscosity, `τ = time_step`, and `dₙ` the damage from the
+# previous load step. The `Gc ℓ ∇v·∇d` term is the Γ-convergence
+# regularisation setting the diffuse crack bandwidth; the (Gc/ℓ + …)
+# `d·v` term is the local restoring force.
 #
-# The form is built per-call because `history` and `previous_damage`
-# change between load steps. They are read out of the per-q-point
-# vectors via `q.point`, the stable global quadrature-point index.
-function phase_form(history, previous_damage)
-    return WeakForm(bilinear=(q, trial) -> TestChannels((Gc / ell +
-                                                         2history[q.point] +
-                                                         eta_viscosity / time_step) * trial.value,
-                                                        Gc * ell * trial.gradient),
-                    linear=q -> 2history[q.point] +
-                                eta_viscosity / time_step * previous_damage[q.point],
+# `history_at(q)` and `previous_damage_at(q)` factor out where the per-
+# q-point data comes from. The bootstrap solve at `initial_state`
+# evaluates `H` from `initial_history(q.x)` directly and disables
+# viscous regularisation (no `dₙ` to compare against yet); subsequent
+# solves read both from per-q-point vectors via the stable index
+# `q.point`.
+function phase_form(history_at, previous_damage_at; viscous=true)
+    η_over_τ = viscous ? eta_viscosity / time_step : 0.0
+    return WeakForm(bilinear=(q, trial) -> TestChannels((Gc / ell + 2 * history_at(q) + η_over_τ) *
+                                                        trial.value, Gc * ell * trial.gradient),
+                    linear=q -> 2 * history_at(q) + η_over_τ * previous_damage_at(q),
                     symmetric=true)
 end
 
-# Bootstrap phase form: same structure as `phase_form` but `H` is read
-# directly from `initial_history(q.x)` instead of from a per-q-point
-# vector, and there is no viscous regularisation term. Used once at
-# `initial_state` to produce the diffuse-notch damage field from which
-# the first proper `solve_phase` proceeds.
-function initial_phase_form()
-    return WeakForm(bilinear=(q, trial) -> begin
-                        H = initial_history(q.x)
-                        TestChannels((Gc / ell + 2H) * trial.value, Gc * ell * trial.gradient)
-                    end, linear=q -> 2initial_history(q.x), symmetric=true)
-end
-
-# Solve the regularised phase-field problem at fixed history. Symmetric
-# positive-definite, so a direct solve is enough. The matrix and rhs are
-# rebuilt every call because `history` and `previous_damage` change
-# between load steps; we keep the mass matrix factor on `phase_state`
-# for the L²-projection of `H` onto the damage space (used by
-# `history_solution`), not for this solve.
+# Solve the regularised phase-field problem at fixed history. SPD, so
+# a direct solve is enough. Matrix and rhs are rebuilt every call
+# because `history` and `previous_damage` change between load steps;
+# `phase_state.mass_factor` is reused only by `history_solution` for
+# the L²-projection of `H` onto the damage space.
 function solve_phase(phase_state, history)
     previous = solution(phase_state.model, phase_state.coefficients; method=:previous_phase)
     previous_damage = frozen_damage(phase_state.model, previous)
-    form = phase_form(history, previous_damage)
+    form = phase_form(q -> history[q.point], q -> previous_damage[q.point])
     matrix = assemble_matrix(phase_state.model, block(phase_state.damage, phase_state.damage, form);
                              threaded=false)
     rhs = assemble_vector(phase_state.model, loadform(phase_state.damage, form); threaded=false)
@@ -507,31 +403,15 @@ end
 
 # ── History transfer on mask growth ──────────────────────────────────────────
 #
-# The library provides two transfer primitives this example combines:
+# `u` and `d` migrate by exact raw-key rewiring (`transfer!(...,
+# backend=Rewire())`); because the new active basis is a strict
+# superset of the old one, copying coefficients dof-by-dof reproduces
+# the source field pointwise — no L² projection, no inverse map.
 #
-#   * `transfer!(sol, old_model, new_model; backend=Rewire())` — exact
-#     raw-key rewiring of `u` and `d`. Because the new active basis is a
-#     strict superset of the old one (cells only activate, never
-#     deactivate), copying old active coefficients to their matching
-#     dofs in the new layout and zero-initialising the genuinely new
-#     ones reproduces the source field pointwise. No L² projection, no
-#     inverse mapping, no smoothing.
-#   * `transfer(qfield, old_model, new_model, RBFP0())` — RBF + P0
-#     transfer of the per-quadrature-point history field `H` (Sartorti
-#     & Düster 2024 Sec. 3.3.1). The new q-point cloud does not have
-#     any dof structure, so a point-based interpolant is the right
-#     tool.
-#
-# Wrap the RBF transfer with the phase-field-specific max-floor so `H`
-# stays monotone:
-#
-#     H_new(q) = max( RBF(H_old)(q),  initial_history(q.x),
-#                     ψ⁺(ε(q), material) ).
-#
-# Monotonicity matters: damage is irreversible, so the history must
-# never decrease across a transfer. The `ψ⁺(ε)` floor catches points
-# where the current strain alone justifies more damage than the
-# interpolated history.
+# Per-q-point history `H` migrates by RBF + P0 (Sartorti & Düster 2024
+# Sec. 3.3.1), with a monotone max-floor against `initial_history(x)`
+# and the current `ψ⁺(ε(x))` so damage irreversibility is preserved
+# across the transfer.
 function rbf_transfer_history(old_state, new_phase_state, new_displacement, material)
     transferred = transfer(old_state.history, old_state.phase_state.model, new_phase_state.model,
                            RBFP0())
@@ -544,37 +424,20 @@ function rbf_transfer_history(old_state, new_phase_state, new_displacement, mate
     return transferred
 end
 
-# ── Mechanics: stress/tangent cache, Voigt helpers, Newton solve ─────────────
+# ── Mechanics: stress/tangent cache, channel bridge, Newton solve ────────────
 #
-# The mechanical equilibrium `div σ(u, d) = 0` is solved by Newton's
-# method at every load step. Each iteration:
-#
-#   1. wraps the current coefficient guess as a `solution(model, …)`
-#      so the assembly callbacks can read the current strain from
-#      `q.state` via `strain_state(q.state)`;
-#   2. caches the Cauchy stress and the stress-tangent at every
-#      quadrature point of the current iterate
-#      (`build_mechanics_cache`) — both depend on the current strain
-#      and the *frozen* damage from the most recent phase solve, so
-#      they cannot be reused across iterations;
-#   3. assembles the residual `r = ∫_Ω σ : ∇v dx` as a load-form
-#      contribution — the cached stress is a constant pointwise field,
-#      so the linear callback returns it directly via
-#      `stress_test_channels`;
-#   4. assembles the tangent `K_T = ∫_Ω ∇v : C : ∇u dx` as a block,
-#      where `C = ∂σ/∂ε` is the per-q-point tangent from the cache;
-#   5. solves `K_T Δu = -r`, updates coefficients, checks the
-#      residual and step-norm against the rtol/atol pair.
-#
-# The form is `component_aware = true` and `symmetric = false`: the
-# Miehe energy split breaks the major symmetry of the tangent in
-# general, so we cannot rely on the symmetric-assembly fast path.
+# Newton's method on `div σ(u, d) = 0` at every load step. The
+# per-iteration recipe: cache `σ` and `C = ∂σ/∂ε` at every q-point from
+# the current iterate, assemble `r = ∫ σ : ∇v` as a load-form
+# contribution and `K_T = ∫ ∇v : C : ∇u` as a block, solve `K_T Δu =
+# −r`. Forms are `component_aware = true, symmetric = false`: the Miehe
+# split breaks the major symmetry of the tangent in general, so the
+# symmetric-assembly fast path is unavailable.
 
-# Precompute the Cauchy stress and the stress-tangent at every
-# quadrature point of `model` from the current displacement iterate and
-# the (frozen) phase field. Stored as `Vector{SVector{3}}` and
-# `Vector{SMatrix{3,3}}` indexed by `q.point` so the assembly loop
-# below reads them in constant time per quadrature point.
+# Cache Cauchy stress and tangent at every q-point of the current
+# iterate. Both depend on the current strain and the *frozen* damage
+# from the most recent phase solve, so the cache is rebuilt per Newton
+# iteration.
 function build_mechanics_cache(model, iterate, phase_qp, material)
     n = nquadpoints(model)
     stresses = Vector{StrainStress}(undef, n)
@@ -582,21 +445,20 @@ function build_mechanics_cache(model, iterate, phase_qp, material)
     foreach_quadrature_point(model; state=iterate) do q
         strain = strain_state(q.state)
         phase = phase_qp[q.point]
-        stresses[q.point] = split_stress(strain, phase, material)
-        tangents[q.point] = stress_tangent(strain, phase, material)
+        C, σ = stress_and_tangent(strain, phase, material)
+        stresses[q.point] = σ
+        tangents[q.point] = C
     end
     return (; stresses, tangents)
 end
 
-# Voigt strain produced by the `component`-th displacement direction's basis gradient.
-function trial_strain(grad, component)
-    component == 1 ? SVector(grad[1], 0.0, grad[2]) : SVector(0.0, grad[2], grad[1])
-end
-
-# Test channel pairing a Voigt stress with the `component`-th test direction.
-function stress_test_channels(stress, component)
-    component == 1 ? TestChannels(0.0, SVector(stress[1], stress[3])) :
-    TestChannels(0.0, SVector(stress[3], stress[2]))
+# Channel for a symmetric Cauchy stress paired with the `component`-th
+# test direction. The bilinear contribution `σ : ε_test` collapses, by
+# `σ`'s symmetry and the rank-1 form `ε(v) = ½(eₖ ⊗ ∇N + ∇N ⊗ eₖ)`, to
+# `(σ ⋅ eₖ) · ∇N` — i.e. the gradient channel of `TestChannels` is the
+# `k`-th row of `σ`.
+function stress_test_channels(stress::SymmetricTensor{2,2,Float64}, component::Int)
+    return TestChannels(0.0, Vec{2,Float64}((stress[component, 1], stress[component, 2])))
 end
 
 function solve_displacement(V, applied_displacement, previous_coefficients, damage_solution,
@@ -615,23 +477,26 @@ function solve_displacement(V, applied_displacement, previous_coefficients, dama
         iterate = solution(mech.model, coefficients; method=:newton_state)
         cache = build_mechanics_cache(mech.model, iterate, phase_qp, material)
 
-        load_form = WeakForm(bilinear=(q, trial, c) -> 0.0,
-                             linear=(q, c) -> stress_test_channels(cache.stresses[q.point], c),
-                             symmetric=false, component_aware=true)
-        residual = assemble_vector(mech.model, (loadform(mech.u, load_form),); threaded=false)
+        # Residual: ∫ σ : ∇v dx as a load form with cached σ.
+        residual_form = WeakForm(bilinear=(q, trial, c) -> 0.0,
+                                 linear=(q, c) -> stress_test_channels(cache.stresses[q.point], c),
+                                 symmetric=false, component_aware=true)
+        residual = assemble_vector(mech.model, (loadform(mech.u, residual_form),); threaded=false)
         residual_norm = norm(residual)
         if residual_norm <= max(newton_atol, newton_rtol * max(1.0, norm(coefficients)))
             converged = true
             break
         end
 
-        block_form = WeakForm(bilinear=(q, trial, c) -> stress_test_channels(cache.tangents[q.point] *
-                                                                             trial_strain(trial.gradient,
-                                                                                          trial.component),
-                                                                             c),
-                              linear=(q, c) -> 0.0, symmetric=false, component_aware=true)
-        tangent = assemble_matrix(mech.model, (block(mech.u, mech.u, block_form),); symmetric=false,
-                                  threaded=false)
+        # Tangent: ∫ ∇v : C : ∇u dx. The bilinear callback contracts
+        # the cached C with the rank-1 symmetric trial gradient and
+        # passes the result paired with the test component `c`.
+        tangent_form = WeakForm(bilinear=(q, trial, c) -> stress_test_channels(cache.tangents[q.point] ⊡
+                                                                               symmetric_gradient(trial),
+                                                                               c),
+                                linear=(q, c) -> 0.0, symmetric=false, component_aware=true)
+        tangent = assemble_matrix(mech.model, (block(mech.u, mech.u, tangent_form),);
+                                  symmetric=false, threaded=false)
         delta = tangent \ (-residual)
         coefficients .+= delta
         if norm(delta) <= newton_rtol * max(1.0, norm(coefficients))
@@ -647,38 +512,27 @@ end
 
 # ── Reaction force on the top boundary ───────────────────────────────────────
 #
-# Post-process the reaction force on `y = 1` as a public-API
-# [`boundary_integral`](@ref) of the vertical Cauchy stress over the
-# top facet. The helper iterates the admissible boundary regions on
-# the selected face — accounting for every level whose own face
-# coincides with `y = 1` (base + any overlay touching the top edge) —
-# and applies a Gauss rule whose order is the per-axis maximum of
-# `recommended_quadrature_order(level.basis, level.order)` over the
-# region's covering parents, so reaction integration is at least as
-# accurate as the volume assembly on the same polynomial order.
+# `boundary_integral` of the vertical Cauchy stress over `y = 1`. The
+# helper covers every level whose own face coincides with the selected
+# boundary (base + any overlay touching the top edge) and integrates
+# at the same polynomial order as the volume assembly.
 
 function vertical_reaction(displacement, damage_solution, phase_state, material)
     return boundary_integral(displacement.model; on=boundary(axis=2, side=:upper)) do q
         strain = displacement_strain(displacement.solution, displacement.model, displacement.u, q.x)
-        phase = clamp(value(damage_solution, phase_state.model, phase_state.damage, q.x), 0.0, 1.0)
-        return split_stress(strain, phase, material)[2]
+        phase = damage_at(damage_solution, phase_state, q.x)
+        return split_stress(strain, phase, material)[2, 2]
     end
 end
 
 # ── State transfer on mask growth ────────────────────────────────────────────
 #
 # When the strip mask grows, the active basis changes and every piece
-# of state needs to migrate to the new space:
-#
-#   1. `transfer!(damage,        …, backend=Rewire())`  — exact dof copy.
-#   2. `transfer!(displacement,  …, backend=Rewire())`  — exact dof copy.
-#   3. `rbf_transfer_history(…)` — RBF + P0 transfer of `H`, monotone-
-#      max-clamped against `initial_history` and the current `ψ⁺(ε)`.
-#   4. **Equilibrium step.** Re-solve the phase and the displacement at
-#      the same applied displacement to absorb the small residual the
-#      RBF transfer leaves behind. The next load step then proceeds
-#      from a converged state. This step is standard FCM-remeshing
-#      practice (Sartorti & Düster 2024, Sec. 3.3.1).
+# of state migrates to the new space: `u` and `d` by exact dof
+# rewiring, `H` by RBF + P0. A final equilibrium re-solve at the same
+# applied displacement absorbs the small residual the RBF transfer
+# leaves behind, so the next load step starts from a converged state
+# (Sartorti & Düster 2024, Sec. 3.3.1).
 
 function transfer_state_to_space(state, V_new, material)
     new_phase_state = build_phase_state(V_new)
@@ -694,10 +548,6 @@ function transfer_state_to_space(state, V_new, material)
 
     new_history = rbf_transfer_history(state, new_phase_state, new_displacement, material)
 
-    # Equilibrium step (Sartorti & Düster 2024, Sec. 3.3.1): re-solve the phase
-    # and displacement at the same applied displacement to absorb the small
-    # residual the RBF transfer leaves behind. The next load step then proceeds
-    # from a converged state.
     settled_phase, damage_solution = solve_phase(new_phase_state, new_history)
     new_phase_state = (; new_phase_state..., coefficients=settled_phase)
     settled_displacement = solve_displacement(V_new, state.applied, new_displacement.coefficients,
@@ -708,16 +558,9 @@ function transfer_state_to_space(state, V_new, material)
             displacement_coefficients=settled_displacement.coefficients)
 end
 
-# Decide whether the strip mask needs to grow and, if so, rebuild the
-# space and migrate the state. Three early-out branches before the
-# (expensive) `transfer_state_to_space`:
-#
-#   1. no cells crossed `mask_threshold` since the last update — the
-#      triggered set is unchanged, return immediately;
-#   2. cells crossed but the dilated halo around them is the same set
-#      we already had — the strip mask is unchanged, only book-keeping
-#      changes;
-#   3. otherwise: rebuild the space and run the full transfer pipeline.
+# Three early-out levels before the expensive transfer: (1) no cells
+# crossed `mask_threshold`, (2) the dilated halo is unchanged anyway,
+# (3) rebuild and migrate.
 function maybe_grow_strip_mask(V, state, material, triggered_mask, strip_mask)
     new_triggered = update_triggered_mask(triggered_mask, state.damage_solution, state.phase_state)
     new_triggered == triggered_mask && return V, state, false, triggered_mask, strip_mask
@@ -729,18 +572,13 @@ function maybe_grow_strip_mask(V, state, material, triggered_mask, strip_mask)
 end
 
 # ── Initial state and load step ──────────────────────────────────────────────
-#
-# `initial_state(V)` produces the at-rest state (zero displacement,
-# Gaussian-seed history, bootstrap damage). `solve_load_step(V, …, du)`
-# advances the load by `du`: update history, solve phase, solve
-# displacement, compute reaction, return a tentative next state and the
-# diagnostics the adaptive stepping policy needs.
 
 function initial_state(V)
     phase_state = build_phase_state(V)
-    # Initial-from-notch phase solve provides the `previous_damage` field that the
-    # viscous regularization in the first `solve_phase` will compare against.
-    form = initial_phase_form()
+    # Bootstrap solve from `initial_history` (no viscous term, no `dₙ`
+    # to compare against yet). Produces the diffuse-notch damage field
+    # that the first proper `solve_phase` will use as `previous_damage`.
+    form = phase_form(q -> initial_history(q.x), _ -> 0.0; viscous=false)
     matrix = assemble_matrix(phase_state.model, block(phase_state.damage, phase_state.damage, form))
     rhs = assemble_vector(phase_state.model, loadform(phase_state.damage, form))
     phase_state = (; phase_state..., coefficients=matrix \ rhs)
@@ -778,23 +616,13 @@ end
 
 # ── Adaptive load stepping ───────────────────────────────────────────────────
 #
-# The applied-displacement increment `du` is grown or shrunk based on
-# the per-step phase increment so the load step never advances the
-# damage too far in one go. Three policy primitives:
-#
-#   * `clamp_du(du)`     — clamp to `[min_displacement_step,
-#                          max_displacement_step]`.
-#   * `next_du(du, Δd)`  — grow `du` by `step_growth_factor` when the
-#                          phase change `Δd` is small, shrink it when
-#                          `Δd` approaches `max_phase_increment`,
-#                          otherwise keep it.
-#   * `reject_reason(…)` — enumerate the reasons a candidate step is
-#                          unacceptable. Currently: mechanics did not
-#                          converge, the load value is non-finite,
-#                          the phase increment is non-finite or too
-#                          large, or the reaction force dropped by
-#                          more than `max_force_drop` of its previous
-#                          value (indicating an unstable load step).
+# `du` is grown or shrunk by the per-step phase change so the load
+# never advances the damage too far in one increment. `next_du` is the
+# accept-side policy; `reject_reason` is the diagnostic the outer loop
+# uses to decide whether a candidate must be retried with a smaller du
+# (mechanics non-convergence, non-finite load or phase increment,
+# phase increment exceeding `max_phase_increment`, or a reaction-force
+# drop exceeding `max_force_drop` of the previous value).
 
 clamp_du(du) = clamp(du, min_displacement_step, max_displacement_step)
 
@@ -821,13 +649,9 @@ end
 
 # ── VTK output ───────────────────────────────────────────────────────────────
 #
-# The history field `H` lives on quadrature points, not on the damage
-# basis. To visualise it alongside `u` and `d`, project it onto the
-# damage field by solving the target-side mass system once per snapshot.
-
-# L²-project the per-quadrature-point history onto the damage field so
-# it can be exported alongside the damage solution. Reuses
-# `phase_state.mass_factor` from `build_phase_state` so the mass matrix
+# The history field `H` lives on quadrature points. To visualise it
+# alongside `u` and `d`, it is L²-projected onto the damage field once
+# per snapshot, reusing `phase_state.mass_factor` so the mass matrix
 # is only factorised once per phase model.
 function history_solution(phase_state, history)
     rhs = assemble_vector(phase_state.model,
@@ -863,22 +687,14 @@ end
 
 # ── Main loop ────────────────────────────────────────────────────────────────
 #
-# Outer driver. Bootstrap a strip mask + space + state, then advance
-# the applied displacement adaptively until the target is reached or
-# `max_accepted_steps` runs out. The order of operations inside the
-# loop is:
-#
-#   1. Pick `du` (current candidate increment).
-#   2. Try `solve_load_step`. Any exception that is not "we're already
-#      at the minimum step" gets caught, reported, and the step shrinks.
-#   3. Check `reject_reason`. A rejected candidate triggers a shrink
-#      and a retry; an accepted candidate is committed.
-#   4. After accepting: try to grow the strip mask using the new damage
-#      field; if it grows, `transfer_state_to_space` migrates the state
-#      and the reaction rule rebuilds for the new space.
-#   5. Optional VTK snapshot when the reaction force has moved by at
-#      least `export_force_delta` since the last export.
-#   6. Pick the next `du` from `next_du(du, Δd)` and loop.
+# Bootstrap a strip mask + space + state, then advance the applied
+# displacement adaptively until the target is reached or
+# `max_accepted_steps` runs out. Per iteration: try `solve_load_step`
+# at the current `du`; shrink and retry on exception or
+# `reject_reason`; on acceptance, grow the strip mask if damage has
+# crossed `mask_threshold`, optionally write a VTK snapshot when the
+# reaction force has moved by `export_force_delta`, and pick the next
+# `du` from `next_du`.
 
 function main()
     triggered_mask = bootstrap_triggered_mask()

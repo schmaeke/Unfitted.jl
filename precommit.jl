@@ -163,7 +163,7 @@ end
 
 # ── Reporting ─────────────────────────────────────────────────────────────────
 
-const _STATS_BUCKETS = ("src", "test", "examples", "benchmarks")
+const _STATS_BUCKETS = ("src", "ext", "test", "examples", "benchmarks")
 const _STATS_RULE = repeat('─', 84)
 const _STATS_ROW_FORMAT = Printf.Format("  %-58s %7s %7s %7s\n")
 const _STATS_DATA_FORMAT = Printf.Format("  %-58s %7d %7d %7d\n")

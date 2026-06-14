@@ -185,7 +185,7 @@ function indicator_mask(spec, mesh_, sol, model, src_center)
     for ci in cell_indices(mesh_)
         c = center(cell_box(mesh_, ci))
         Ts[ci] = value(sol, model, c)
-        Gs[ci] = norm(gradient(sol, model, c))
+        Gs[ci] = norm(field_gradient(sol, model, c))
     end
 
     T_max = maximum(Ts)
@@ -337,7 +337,8 @@ function write_snapshot(output_root, index, state, coefficients, t)
     path = joinpath(output_root, "solution_$(lpad(string(index), 4, '0'))")
     write_vtk(path, snapshot, state.model; subdivisions=visualization_subdivisions,
               point_data=(temperature=(u, c, x, xi) -> u(c, xi),
-                          temperature_gradient=(u, c, x, xi) -> gradient(snapshot, state.model, x),
+                          temperature_gradient=(u, c, x, xi) -> field_gradient(snapshot,
+                                                                               state.model, x),
                           source=(u, c, x, xi) -> heat_source(center)(x)),)
     return snapshot
 end

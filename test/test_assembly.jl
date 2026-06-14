@@ -150,7 +150,7 @@ end
 
     solution = solve!(model)
     center_value = value(solution, model, (0.5, 0.5))
-    center_gradient = gradient(solution, model, (0.5, 0.5))
+    center_gradient = field_gradient(solution, model, (0.5, 0.5))
 
     @test center_value isa SVector{2}
     @test center_value[2] ≈ 2center_value[1]
@@ -353,7 +353,8 @@ end
     value_form = WeakForm(bilinear=(q, trial) -> 0.0, linear=q -> value(q.state, :u),
                           symmetric=false)
     grad_form = WeakForm(bilinear=(q, trial) -> 0.0,
-                         linear=q -> TestChannels(0.0, gradient(q.state, :u)), symmetric=false)
+                         linear=q -> TestChannels(0.0, field_gradient(q.state, :u)),
+                         symmetric=false)
 
     @test assemble_vector(model, loadform(u, value_form); state=iterate) ≈ M * coefficients rtol = 1.0e-10
     @test assemble_vector(model, loadform(u, grad_form); state=iterate) ≈ K * coefficients rtol = 1.0e-10
@@ -377,8 +378,8 @@ end
     # divergence load: ∫ (∂x u_x + ∂y u_y) v  for the ux test space, vs M_ux*ux + (coupling)
     Mux = assemble_matrix(model, mass_block(ux))
     div_form = WeakForm(bilinear=(q, trial) -> 0.0,
-                        linear=q -> gradient(q.state, :ux)[1] + gradient(q.state, :uy)[2],
-                        symmetric=false)
+                        linear=q -> field_gradient(q.state, :ux)[1] +
+                                    field_gradient(q.state, :uy)[2], symmetric=false)
     r = assemble_vector(model, loadform(ux, div_form); state=iterate)
     # compare against a direct region-quadrature reference of ∫ div(u_h) φ_i over ux dofs
     @test length(r) == n

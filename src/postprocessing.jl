@@ -4,7 +4,7 @@
 #     bundle from a `(solution, model)` pair; [`write_quadrature_vtm`](@ref)
 #     produces a quadrature-point cloud bundle for inspecting where the
 #     integration regions land. Both rely on `WriteVTK.jl`.
-#   * **Solution evaluation.** [`value`](@ref) and [`gradient`](@ref)
+#   * **Solution evaluation.** [`value`](@ref) and [`field_gradient`](@ref)
 #     evaluate the superposed solution at arbitrary physical points;
 #     [`l2_error`](@ref) computes an analytic / manufactured-solution
 #     error using the model's own integration plan.
@@ -576,7 +576,7 @@ function _level_gradient(coefficients, model::Model{D,T}, layout::FieldLayout{D,
     return result
 end
 
-# Shared pre-flight for the public `value` / `gradient` paths:
+# Shared pre-flight for the public `value` / `field_gradient` paths:
 # coefficient check, point coercion, in-domain check, field-layout
 # lookup. Returns the triple every evaluator needs.
 function _evaluation_data(solution::Solution, model::Model{D,T}, u::Field,
@@ -615,7 +615,7 @@ function _evaluate_field_gradient(coefficients, model::Model{D,T}, layout::Field
     return result
 end
 
-# Component dispatch shared by `value` and `gradient`. When `component
+# Component dispatch shared by `value` and `field_gradient`. When `component
 # === nothing`: return a scalar for single-component fields and an
 # `SVector` across components for vector fields. When `component` is
 # explicit: bounds-check and evaluate that one component.
@@ -667,35 +667,37 @@ function value(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D},
 end
 
 """
-    gradient(solution, model, x)
-    gradient(solution, model, x, component)
-    gradient(solution, model, u::Field, x[, component])
+    field_gradient(solution, model, x)
+    field_gradient(solution, model, x, component)
+    field_gradient(solution, model, u::Field, x[, component])
 
 Evaluate the physical gradient of the superposed solution at physical
 point `x`. Scalar fields return one `SVector{D}` gradient; component
 fields return an `SVector` of component gradients unless a single
 `component` is requested. Overlay levels are extended by zero, same
-as [`value`](@ref).
+as [`value`](@ref). The leading `field_` avoids colliding with
+`Tensors.gradient` when both packages are loaded together.
 
 The gradient is the physical gradient (chain-rule scaled by
 `2 / edge_lengths(parent_box)` per axis), not the reference-frame
 gradient.
 """
-function gradient(solution::Solution, model::Model{D,T}, x::PointLike{D}) where {D,T}
-    return gradient(solution, model, _default_field(model), x)
+function field_gradient(solution::Solution, model::Model{D,T}, x::PointLike{D}) where {D,T}
+    return field_gradient(solution, model, _default_field(model), x)
 end
 
-function gradient(solution::Solution, model::Model{D,T}, x::PointLike{D},
-                  component::Integer) where {D,T}
-    return gradient(solution, model, _default_field(model), x, component)
+function field_gradient(solution::Solution, model::Model{D,T}, x::PointLike{D},
+                        component::Integer) where {D,T}
+    return field_gradient(solution, model, _default_field(model), x, component)
 end
 
-function gradient(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D}) where {D,T}
+function field_gradient(solution::Solution, model::Model{D,T}, u::Field,
+                        x::PointLike{D}) where {D,T}
     _field_quantity(solution, model, u, x, nothing, _evaluate_field_gradient)
 end
 
-function gradient(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D},
-                  component::Integer) where {D,T}
+function field_gradient(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D},
+                        component::Integer) where {D,T}
     _field_quantity(solution, model, u, x, component, _evaluate_field_gradient)
 end
 

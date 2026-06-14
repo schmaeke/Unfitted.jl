@@ -6,7 +6,7 @@
     exact = x -> x[1] * (1 - x[1])
 
     @test value(solution, model, (0.3,)) ≈ exact((0.3,)) atol = 1.0e-12
-    @test gradient(solution, model, (0.3,))[1] ≈ 0.4 atol = 1.0e-12
+    @test field_gradient(solution, model, (0.3,))[1] ≈ 0.4 atol = 1.0e-12
     @test l2_error(solution, model, exact; norm=:absolute) < 1.0e-12
     @test l2_error(solution, model, exact) < 1.0e-12
 end
@@ -34,7 +34,7 @@ end
 
     overlay_delta = 10.0 * Unfitted.integrated_legendre_value(2, 0.0)
     @test value(solution, model, (0.5,)) - value(base_solution, model, (0.5,)) ≈ overlay_delta
-    @test gradient(solution, model, (0.1,)) ≈ gradient(base_solution, model, (0.1,))
+    @test field_gradient(solution, model, (0.1,)) ≈ field_gradient(base_solution, model, (0.1,))
 end
 
 @testset "D-generic constant-field evaluation smoke test" begin
@@ -45,7 +45,7 @@ end
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
     @test value(solution, model, (0.2, 0.3, 0.4)) ≈ 1.0
-    @test all(abs.(gradient(solution, model, (0.2, 0.3, 0.4))) .< 1.0e-12)
+    @test all(abs.(field_gradient(solution, model, (0.2, 0.3, 0.4))) .< 1.0e-12)
     @test l2_error(solution, model, x -> 1.0; norm=:absolute) < 1.0e-12
 end
 
@@ -133,7 +133,7 @@ end
     @test top_trace ≈ 0.5 atol = 1.0e-10
 
     right_flux = boundary_integral(model; on=boundary(axis=1, side=:upper)) do q
-        return gradient(sol, model, q.x)[1]
+        return field_gradient(sol, model, q.x)[1]
     end
     @test right_flux ≈ 0.5 atol = 1.0e-10
 end

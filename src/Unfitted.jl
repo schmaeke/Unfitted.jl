@@ -69,8 +69,28 @@ export AxisBox, GeometryTolerance, PhysicalDomain, physical_domain, classify_cel
        assemble_vector, assemble!, foreach_quadrature_point, nquadpoints, solve!, solution, move!,
        moved, moved_space, activate!, deactivate!, active_cells, transfer!, TransferBackend,
        L2Projection, Rewire, QuadField, QuadTransferScheme, RBFP0, transfer, write_vtk,
-       write_quadrature_vtm, l2_error, boundary_integral, value, gradient, diagnostics,
-       active_unknowns, cell_indices, cell_box, center
+       write_quadrature_vtm, l2_error, boundary_integral, value, field_gradient, diagnostics,
+       active_unknowns, cell_indices, cell_box, center, value_vec, gradient_tensor,
+       symmetric_gradient
+
+# ── Extension stubs ───────────────────────────────────────────────────────────
+#
+# These names are populated by `ext/UnfittedTensorsExt.jl` when Tensors.jl is
+# loaded. They are declared here, not in the extension module, so that any
+# downstream code can write `using Unfitted: symmetric_gradient, value_vec,
+# gradient_tensor` unconditionally; loading Tensors.jl alongside Unfitted
+# installs the concrete methods on these stubs. Calling any of them without
+# a Tensors-compatible signature raises the usual `MethodError`, which is
+# the intended behaviour: the names are only meaningful once tensor algebra
+# is in scope.
+#
+# `symmetric_gradient` is declared here, not extended from Tensors.jl,
+# because Tensors.jl does not export a function under that name; the
+# closest cousins it ships are the AD entry points `gradient`,
+# `hessian`, and `divergence`.
+function symmetric_gradient end
+function value_vec end
+function gradient_tensor end
 
 include("geometry.jl")
 include("physical.jl")

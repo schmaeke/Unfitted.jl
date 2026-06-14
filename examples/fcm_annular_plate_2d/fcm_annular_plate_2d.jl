@@ -65,6 +65,7 @@ non-trivial benchmark.
 using Unfitted
 using LinearAlgebra
 using StaticArrays
+using Tensors
 
 include(joinpath(@__DIR__, "..", "reporting.jl"))
 
@@ -136,26 +137,23 @@ const inner_arc = polyline_mesh(arc_cw(r_inner, n_inner); closed=true)
 
 # ── Bulk weak form: 2D linear elasticity, plane stress, ν = 0 ──────────────
 #
-# For ν = 0 the Voigt stress decouples component-by-component:
+# 4th-order plane-stress elasticity tensor. For ν = 0 the isotropic
+# split reduces to (λ, μ) = (0, E/2):
 #
-#     σ_11 = E ε_11,   σ_22 = E ε_22,   σ_12 = (E/2) γ_12.
+#     ℂ[i,j,k,l] = (E/2) (δ_ik δ_jl + δ_il δ_jk),
 #
-# The component-aware `bilinear(q, trial, c)` returns the
-# `TestChannels` paired with the test gradient for the `(trial.component,
-# c)` pair. Off-diagonal coupling appears through the shear channel.
+# giving σ_11 = E ε_11, σ_22 = E ε_22, σ_12 = E ε_12 (tensor εxy, so
+# the standard `σ = ℂ ⊡ ε` evaluates the engineering-shear factor
+# automatically through the double contraction).
+const ℂ = SymmetricTensor{4,2,Float64}((i, j, k, l) -> (E / 2) *
+                                                       ((i == k) * (j == l) + (i == l) * (j == k)))
 
+# Bulk bilinear: σ(u) : ε(v). The `c`-th channel of the contracted
+# stress is its `c`-th row, picked out as the gradient coefficient of
+# `TestChannels` (σ symmetric ⇒ row = column).
 function elasticity_bilinear(q, trial, c)
-    a = trial.component
-    tx, ty = trial.gradient[1], trial.gradient[2]
-    if a == 1 && c == 1
-        return TestChannels(0.0, SVector(E * tx, (E / 2) * ty))
-    elseif a == 1 && c == 2
-        return TestChannels(0.0, SVector((E / 2) * ty, 0.0))
-    elseif a == 2 && c == 1
-        return TestChannels(0.0, SVector(0.0, (E / 2) * tx))
-    else
-        return TestChannels(0.0, SVector((E / 2) * tx, E * ty))
-    end
+    σ = ℂ ⊡ symmetric_gradient(trial)
+    return TestChannels(0.0, Vec{2,Float64}((σ[c, 1], σ[c, 2])))
 end
 
 const elasticity_block = block(u, u,
@@ -189,43 +187,29 @@ const inner_traction = loadform(u,
 # Nitsche pieces are:
 #
 #   1. `-(σ(u_h)·n)_c · v_c`           → value channel `-T_{a,c}`
-#   2. `-u_h · (σ(v_h)·n)`            → gradient channel
-#                                       `-trial.value · A_{a,c}`
+#   2. `-u_h · (σ(v_h)·n)`             → gradient channel
+#                                        `-trial.value · M_a`
 #   3. `(β/h) δ_{a,c} · ψ_a · v_c`     → value channel `+(β/h)·trial.value`
-#                                       on diagonal pairs.
+#                                        on diagonal pairs.
 #
-# `T_{a,c}` and `A_{a,c}` come from the same component-by-component
-# decomposition as the bulk elasticity bilinear, with the normal `n`
-# folded in.
+# The trial traction comes from `σ(u_trial) · n` with `σ = ℂ ⊡ ε(u_trial)`;
+# the test-side gradient coefficient `M_a` is the `c`-th column of
+# `ℂ ⊡ sym(e_a ⊗ n)`, derived via the major + minor symmetries of ℂ.
 
 function nitsche_bilinear(q, trial, c)
     a = trial.component
-    nx, ny = q.normal[1], q.normal[2]
-    tx, ty = trial.gradient[1], trial.gradient[2]
-    psi = trial.value
+    n = Vec{2,Float64}((q.normal[1], q.normal[2]))
+    ψ = trial.value
 
-    Tac = if a == 1 && c == 1
-        E * tx * nx + (E / 2) * ty * ny
-    elseif a == 1 && c == 2
-        (E / 2) * ty * nx
-    elseif a == 2 && c == 1
-        (E / 2) * tx * ny
-    else
-        (E / 2) * tx * nx + E * ty * ny
-    end
+    σ_trial = ℂ ⊡ symmetric_gradient(trial)
+    T_uc = (σ_trial ⋅ n)[c]                            # (σ(u_trial)·n)_c
 
-    Aac = if a == 1 && c == 1
-        SVector(E * nx, (E / 2) * ny)
-    elseif a == 1 && c == 2
-        SVector((E / 2) * ny, 0.0)
-    elseif a == 2 && c == 1
-        SVector(0.0, (E / 2) * nx)
-    else
-        SVector((E / 2) * nx, E * ny)
-    end
+    e_a = Vec{2,Float64}(ntuple(i -> Float64(i == a), 2))
+    σ_an = ℂ ⊡ symmetric(e_a ⊗ n)                       # 2-tensor; M_a is its c-th column
+    M_a = Vec{2,Float64}((σ_an[1, c], σ_an[2, c]))
 
-    penalty = a == c ? (nitsche_beta / h_nitsche) * psi : 0.0
-    return TestChannels(-Tac + penalty, -psi * Aac)
+    penalty = a == c ? (nitsche_beta / h_nitsche) * ψ : 0.0
+    return TestChannels(-T_uc + penalty, -ψ * M_a)
 end
 
 const nitsche_beta = 100.0
