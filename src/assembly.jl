@@ -304,12 +304,12 @@ function _emit_local_system!(rows::Vector{Int}, cols::Vector{Int}, vals::Vector{
     return nothing
 end
 
-# Resolve a `Field` to its index inside a `SystemLayout`. Used by every
-# block / load loop to translate field references into the layout's
-# field-major data structures.
-function _field_index(layout::SystemLayout, field::Field)
-    index = get(layout.by_name, field.name, 0)
-    index == 0 && throw(ArgumentError("unknown field $(field.name)"))
+# Resolve a field name to its index inside a `SystemLayout`. Used by
+# every block / load loop to translate field references into the
+# layout's field-major data structures.
+function _field_index(layout::SystemLayout, name::Symbol)
+    index = get(layout.by_name, name, 0)
+    index == 0 && throw(ArgumentError("unknown field $name"))
     return index
 end
 
@@ -636,11 +636,11 @@ end
 # detail is contained in the caller (Q-point source, basis refresh,
 # `q` tuple shape).
 function _accumulate_qpoint!(local_matrix, local_rhs, q, qweight::T, field_data, local_by_field,
-                             blocks, loads, symmetric::Bool, model::Model{D,T}, ::Val{D},
-                             ::Type{T}) where {D,T}
+                             blocks::B, loads::L, symmetric::Bool, model::Model{D,T}, ::Val{D},
+                             ::Type{T}) where {B,L,D,T}
     # Loads: linear channels per test parent / dof into local rhs.
     for load in loads
-        test_index = _field_index(model.dofs, load.test_field)
+        test_index = _field_index(model.dofs, load.test_name)
         test_layout = model.dofs.fields[test_index]
         test_data = field_data[test_index]
         local_rows_by_parent = local_by_field[test_index]
@@ -664,8 +664,8 @@ function _accumulate_qpoint!(local_matrix, local_rhs, q, qweight::T, field_data,
     # matrix; Dirichlet-column elimination redirects constrained-trial
     # contributions onto the rhs.
     for block in blocks
-        test_index = _field_index(model.dofs, block.test_field)
-        trial_index = _field_index(model.dofs, block.trial_field)
+        test_index = _field_index(model.dofs, block.test_name)
+        trial_index = _field_index(model.dofs, block.trial_name)
         test_layout = model.dofs.fields[test_index]
         trial_layout = model.dofs.fields[trial_index]
 

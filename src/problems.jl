@@ -203,13 +203,13 @@ Number of scalar components in `field`.
 component_count(::Field{D,T,C}) where {D,T,C} = C
 
 """
-    BlockForm(test_field, trial_field, form, on)
+    BlockForm(test_name::Symbol, trial_name::Symbol, form, on)
 
 One bilinear block of a [`Problem`](@ref). `form.bilinear` contributes
-to the matrix rows of `test_field` and the columns of `trial_field`.
-Same-field blocks produce the diagonal blocks; cross-field blocks
-produce the off-diagonal coupling. The `on` tag selects the
-integration region kind:
+to the matrix rows of the field named `test_name` and the columns of
+the field named `trial_name`. Same-name blocks produce the diagonal
+blocks; cross-name blocks produce the off-diagonal coupling. The `on`
+tag selects the integration region kind:
 
   - `nothing` — volume integration over `Ω`.
   - `::BoundarySelector` — facet integration over the selected portion
@@ -218,27 +218,35 @@ integration region kind:
   - `::BoundaryMesh` — surface integration over the user-supplied
     immersed-boundary mesh.
 
-Use [`block`](@ref) (which accepts `on=` and defaults it to `nothing`)
-to construct values of this type.
+Construct via [`block`](@ref), which accepts the [`Field`](@ref)s
+directly and defaults `on = nothing`.
 """
-struct BlockForm{TF,UF,F,O}
-    test_field::TF
-    trial_field::UF
+# Field *names*, not full `Field` objects: the assembly hot loop only
+# needs the name to look the field up via `_field_index`, and erasing
+# `Field{D,T,C,Space{...}}` from the struct parameters keeps the
+# `Problem`/`Model` type tree from doubling the field-type nesting per
+# block.
+struct BlockForm{F,O}
+    test_name::Symbol
+    trial_name::Symbol
     form::F
     on::O
 end
 
 """
-    LoadForm(test_field, form, on)
+    LoadForm(test_name::Symbol, form, on)
 
 One linear (right-hand-side) contribution to a [`Problem`](@ref).
-`form.linear` contributes to the rhs entries of `test_field`. The `on`
-tag selects the integration region kind exactly as for
-[`BlockForm`](@ref). Use [`loadform`](@ref) (which accepts `on=` and
-defaults it to `nothing`) to construct values of this type.
+`form.linear` contributes to the rhs entries of the field named
+`test_name`. The `on` tag selects the integration region kind exactly
+as for [`BlockForm`](@ref).
+
+Construct via [`loadform`](@ref), which accepts a [`Field`](@ref)
+directly and defaults `on = nothing`.
 """
-struct LoadForm{TF,F,O}
-    test_field::TF
+# See `BlockForm` above for why the field is stored by name.
+struct LoadForm{F,O}
+    test_name::Symbol
     form::F
     on::O
 end
@@ -253,7 +261,7 @@ facet of `∂Ω` instead of the volume — the user-supplied form receives
 `q.normal` and `q.sides` on every quadrature point.
 """
 function block(test_field::Field, trial_field::Field, form; on=nothing)
-    return BlockForm(test_field, trial_field, form, on)
+    return BlockForm(test_field.name, trial_field.name, form, on)
 end
 
 """
@@ -264,7 +272,7 @@ inside a multi-field [`Problem`](@ref). When `on` is a
 [`BoundarySelector`](@ref), the contribution integrates over that facet
 of `∂Ω` instead of the volume.
 """
-loadform(test_field::Field, form; on=nothing) = LoadForm(test_field, form, on)
+loadform(test_field::Field, form; on=nothing) = LoadForm(test_field.name, form, on)
 
 """
     Problem{D,T,S,FS,B,L}
@@ -357,11 +365,10 @@ end
 # on the first unknown field so the user sees the offending name.
 function _check_form_fields(forms, names)
     for form in forms
-        form.test_field.name in names ||
-            throw(ArgumentError("unknown test field $(form.test_field.name)"))
+        form.test_name in names || throw(ArgumentError("unknown test field $(form.test_name)"))
         form isa BlockForm &&
-            !(form.trial_field.name in names) &&
-            throw(ArgumentError("unknown trial field $(form.trial_field.name)"))
+            !(form.trial_name in names) &&
+            throw(ArgumentError("unknown trial field $(form.trial_name)"))
     end
 end
 
