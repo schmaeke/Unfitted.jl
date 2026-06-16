@@ -15,7 +15,8 @@ let
     end
 
     omega = box((-1.0, -1.0), (1.0, 1.0))
-    disk = physical_domain(phi; lipschitz=1.0, subcell_depth=4)
+    # Base cell = 2/8 = 0.25; leaf scale = cell/16 reproduces depth=4.
+    disk = physical_domain(phi; lipschitz=1.0, subcell_length_scale=0.25 / 16, max_depth=4)
 
     V = space(omega; cells=(8, 8), order=2, physical=disk)
     u = field(:u, V)

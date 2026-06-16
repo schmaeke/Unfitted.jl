@@ -16,7 +16,7 @@ using Unfitted: _eliminate_points, _moment_fit_with_retry, _default_moment_gauss
 # The geometry is a disk of radius `0.4` centred at `(0.5, 0.5)`; the
 # benchmark cell `(0.6, 0.4)–(0.8, 0.6)` straddles the boundary
 # (φ < 0 in the lower-left corner, φ > 0 in the upper-right) and so
-# classifies as `:cut` at every `subcell_depth ≥ 0`. The full pipeline
+# classifies as `:cut` at any `subcell_length_scale > 0`. The full pipeline
 # (NNMF moment integration → candidate seeding → elimination loop) runs
 # on every call.
 group = SUITE["microkernels"]["fcm"] = BenchmarkGroup()
@@ -26,7 +26,7 @@ let
     cell = AxisBox(SVector(0.6, 0.4), SVector(0.8, 0.6))
 
     # `moment_fit_rule` and its sub-kernels at three (moment_order,
-    # subcell_depth) points that bracket the regimes the package is
+    # subcell_length_scale) points that bracket the regimes the package is
     # typically used at:
     #
     #   * `(4, 3)`  — low-order, shallow octree. Reference floor; the
@@ -48,9 +48,12 @@ let
     # achievable stair-step floor at depth 4 — i.e. attempt 1 lands
     # close to the target and the early-accept path of
     # `_moment_fit_with_retry` is the steady-state hot path.
+    # Cell extent = 0.2; leaf scale = 0.2 / 2^depth reproduces the original
+    # `subcell_depth = depth` bench points exactly.
     for (mo_p, depth) in ((4, 3), (8, 4), (12, 4))
         moment_order = (mo_p, mo_p)
-        physical = physical_domain(phi_disk; lipschitz=1.0, subcell_depth=depth)
+        physical = physical_domain(phi_disk; lipschitz=1.0, subcell_length_scale=0.2 / 2^depth,
+                                   max_depth=depth)
 
         tag = "mo=$mo_p depth=$depth"
 
@@ -92,7 +95,7 @@ end
 # burned through all 3 retry attempts whenever
 # `target_residual < integrator_floor`, with each attempt doubling
 # per-axis Gauss density (4× candidates in 2D, ~16× NNLS cost). At
-# `subcell_depth = 4` the stair-step floor sits near `1e-6`, so
+# `subcell_length_scale ≈ cell/16` (depth-4 equivalent) the stair-step floor sits near `1e-6`, so
 # `target_residual = 1e-8` is well below what the integrator can
 # deliver — yet every cut cell paid for the full retry budget.
 #
@@ -106,7 +109,7 @@ let
     phi_disk(x) = sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.4
     cell = AxisBox(SVector(0.6, 0.4), SVector(0.8, 0.6))
     moment_order = (8, 8)
-    physical = physical_domain(phi_disk; lipschitz=1.0, subcell_depth=4)
+    physical = physical_domain(phi_disk; lipschitz=1.0, subcell_length_scale=0.0125, max_depth=4)
     gauss = _default_moment_gauss(moment_order)
 
     retry_group = group["retry_stagnation"] = BenchmarkGroup()

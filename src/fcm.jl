@@ -29,18 +29,18 @@
 #   port classifies against a level-set callback via the Lipschitz
 #   certificate in `src/physical.jl`, and approximates the moment integrals
 #   by tensor Gauss quadrature on the octree leaves (stair-step accurate,
-#   bounded by `O(2⁻ˢᵘᵇᶜᵉˡˡ⁻ᵈᵉᵖᵗʰ)`). The QuESo surface-IP / divergence-
-#   theorem path is not ported.
+#   bounded by `O(subcell_length_scale / region_extent)` per axis). The
+#   QuESo surface-IP / divergence-theorem path is not ported.
 #
 #   As a consequence, QuESo's hardcoded default
 #   `moment_fitting_residual = 1.0e-10` (`dictionary_factory.hpp`) and the
 #   `1.0e-8` typical of their shipped examples are unreachable in this
-#   port at `subcell_depth = 4`. The `PhysicalDomain.target_residual`
-#   default of `1.0e-6` is matched to the integrator's own floor and
-#   avoids the catastrophic retry blow-up that an unreachable target
-#   triggers. Users who raise `subcell_depth` should tighten
-#   `target_residual` correspondingly (roughly two decades per additional
-#   level of `subcell_depth`).
+#   port at typical `subcell_length_scale` values. The
+#   `PhysicalDomain.target_residual` default of `1.0e-6` is matched to
+#   the integrator's own floor and avoids the catastrophic retry
+#   blow-up that an unreachable target triggers. Users who tighten
+#   `subcell_length_scale` should tighten `target_residual`
+#   correspondingly (roughly two decades per halving of the scale).
 #
 # Pipeline summary
 #
@@ -86,8 +86,10 @@ end
 """
     foreach_octree_leaf(f, physical, box)
 
-Walk the octree of `box` subdivided against `physical`'s level set down to
-`physical.subcell_depth`. For each leaf, call `f(leaf_box, kind)` where
+Walk the octree of `box` subdivided against `physical`'s level set. The
+leaf size on the largest axis is driven down to
+`physical.subcell_length_scale`, capped at `physical.max_depth` octree
+levels of subdivision. For each leaf, call `f(leaf_box, kind)` where
 `kind` is one of
 
   - `:full` — the leaf is entirely inside Ω,
@@ -104,7 +106,7 @@ disagreeing samples emit `:cut`.
 This is the public entry point; the implementation is in `_walk_octree!`.
 """
 function foreach_octree_leaf(f, physical::PhysicalDomain, box::AxisBox)
-    _walk_octree!(f, physical, box, 0)
+    _walk_octree!(f, physical, box, 0, _effective_subcell_depth(physical, box))
     return nothing
 end
 
@@ -121,8 +123,10 @@ end
 #      verdict (`:full` / `:fictitious`), or `:cut` if corners disagree.
 #   4. Otherwise bisect into 2ᴰ children and recurse on each.
 #
-# The recursion bound is `(2ᴰ)^subcell_depth` leaves per call.
-function _walk_octree!(f, physical::PhysicalDomain, box::AxisBox{D,T}, depth::Integer) where {D,T}
+# The recursion bound is `(2ᴰ)^max_depth` leaves per call, where
+# `max_depth` is set by `_effective_subcell_depth` from the top box.
+function _walk_octree!(f, physical::PhysicalDomain, box::AxisBox{D,T}, depth::Integer,
+                       max_depth::Integer) where {D,T}
     c = center(box)
     r = _half_diagonal(box)
     phi_c = physical.phi(c)
@@ -139,7 +143,7 @@ function _walk_octree!(f, physical::PhysicalDomain, box::AxisBox{D,T}, depth::In
     n_inside, n_outside = _corner_signs(physical, box, phi_c)
     samples_agree = !(n_inside > 0 && n_outside > 0)
 
-    if depth >= physical.subcell_depth
+    if depth >= max_depth
         if samples_agree
             f(box, n_inside > 0 ? :full : :fictitious)
         else
@@ -156,7 +160,7 @@ function _walk_octree!(f, physical::PhysicalDomain, box::AxisBox{D,T}, depth::In
     for ci in CartesianIndices(ntuple(_ -> 0:1, D))
         child_lower = SVector{D,T}(ntuple(d -> ci.I[d] == 0 ? box.lower[d] : c[d], D))
         child_upper = SVector{D,T}(ntuple(d -> ci.I[d] == 0 ? c[d] : box.upper[d], D))
-        _walk_octree!(f, physical, AxisBox{D,T}(child_lower, child_upper), depth + 1)
+        _walk_octree!(f, physical, AxisBox{D,T}(child_lower, child_upper), depth + 1, max_depth)
     end
     return nothing
 end
@@ -274,8 +278,8 @@ Integration walks the octree leaves emitted by
   - `:full` leaves contribute the standard tensor Gauss rule (exact for
     polynomials up to the moment order on the leaf);
   - `:cut` leaves contribute the same rule with points filtered by
-    `φ(x) ≤ 0` — stair-step accurate at the bottom of `subcell_depth`,
-    matched to the integrator's natural floor by the
+    `φ(x) ≤ 0` — stair-step accurate at the resolved leaf size set by
+    `subcell_length_scale`, matched to the integrator's natural floor by the
     `target_residual = 1e-6` default;
   - `:fictitious` leaves contribute nothing.
 
@@ -322,10 +326,10 @@ leaves filtered by `φ(x) ≤ 0`.
 `gauss_per_axis` defaults to `ceil((moment_order + 1) / 2)`, matching
 the per-leaf Gauss density used by [`compute_region_moments`](@ref) —
 the minimum count at which the moment-fit NNLS sees one candidate per
-moment basis function per leaf. With `2ᴰ ⋅ subcell_depth = 2ᴰ ⋅ 4` typical
-leaves and a moment basis cardinality of `prod(moment_order .+ 1)`, this
-already gives the NNLS far more candidates than basis functions; the
-outer retry loop in `_moment_fit_with_retry` doubles per-axis as needed.
+moment basis function per leaf. At the typical octree depths driven by
+`subcell_length_scale`, this already gives the NNLS far more candidates
+than basis functions; the outer retry loop in `_moment_fit_with_retry`
+doubles per-axis as needed.
 """
 function seed_candidate_points(physical::PhysicalDomain, region_box::AxisBox{D,T},
                                moment_order::NTuple{D,Int};
@@ -437,9 +441,10 @@ function _eliminate_points(moments::Vector{T}, candidates::Vector{SVector{D,T}},
     weights, residual = _solve_moment_fit(moments, points, region_box, moment_order)
     residual > _FIT_FAILURE_RESIDUAL && return SVector{D,T}[], T[], residual, 1
 
-    # First-iteration top-N: sort by weight (descending), keep the leading
-    # `nbasis`, then drop near-zero weights. `nbasis` is the maximum number
-    # of non-trivial weights an NNLS against this basis can support.
+    # First-iteration top-N: sort by weight (descending), keep the
+    # leading `nbasis`, drop the near-zero tail. `nbasis` is the
+    # maximum number of non-trivial weights a non-degenerate NNLS
+    # against this basis can support.
     order = sortperm(weights; rev=true)
     keep = min(nbasis, length(weights))
     points = points[order[1:keep]]
@@ -463,8 +468,8 @@ function _eliminate_points(moments::Vector{T}, candidates::Vector{SVector{D,T}},
         length(points) <= min_points && return points, weights, residual, iter
 
         # Drop the weights that fall below `1e-8 · max_weight`. If no
-        # weight falls below the threshold, drop the single smallest one
-        # — the loop must make progress.
+        # weight falls below the threshold, drop the single smallest
+        # one — the loop must make progress.
         max_w = maximum(weights)
         thresh = 1e-8 * max_w
         drop_indices = findall(<(thresh), weights)
@@ -501,7 +506,7 @@ _default_max_outer(moment_order::NTuple{D,Int}) where {D} = maximum(moment_order
 # not at least this many times *smaller* than the previous attempt's
 # residual is considered ineffective — typically because the
 # `compute_region_moments` octree integrator has hit its stair-step
-# accuracy floor (~`2^(-subcell_depth)` per axis) and no NNLS against
+# accuracy floor (≈ `subcell_length_scale / cell_size` per axis) and no NNLS against
 # any candidate cloud can do better. Doubling the candidate density then
 # `_min_retry_improvement`'s reciprocal in cost while delivering nothing,
 # so we stop early.
@@ -608,8 +613,9 @@ function _moment_fit_with_retry(physical::PhysicalDomain, region_box::AxisBox{D,
             # the residual to cross the target, but the achievable
             # residual is bounded below by the moment integrator's
             # stair-step floor — when target is calibrated to that floor
-            # (as the `physical.target_residual = 1e-6` default is for
-            # `subcell_depth = 4`), no candidate-cloud doubling can
+            # (as the `physical.target_residual = 1e-6` default is for a
+            # `subcell_length_scale` matched to the smallest geometric
+            # feature), no candidate-cloud doubling can
             # actually deliver that halving, and the retry is pure
             # waste. Users who genuinely need `residual ≤ target` can
             # tighten `target_residual` and retain the original

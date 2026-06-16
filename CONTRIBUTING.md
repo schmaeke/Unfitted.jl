@@ -523,21 +523,28 @@ quadrature on cut cells (see the QuESo citation above). The geometry of
 Boolean indicator representations are intentionally not supported.
 
   - **Public construction**:
-    `physical_domain(phi; lipschitz=Inf, alpha=0.0, subcell_depth=4,
-    moment_order_factor=2, target_residual=1e-6)`.
+    `physical_domain(phi; lipschitz=Inf, alpha=0.0, subcell_length_scale,
+    max_depth=8, moment_order_factor=2, target_residual=1e-6)`.
 
     - `phi(x)`: scalar function on `SVector{D,T}`; need not be a true
       signed-distance function.
     - `lipschitz`: Lipschitz constant `L` of `φ`. `1.0` for a true SDF;
       `Inf` disables the cheap "uniform sign" certificate and forces
       classification by corner sampling and octree subdivision down to
-      `subcell_depth`.
+      the per-cell length-scale bound.
     - `alpha`: fictitious-region weight for α-FCM stabilization. `0` is
       the strict cut path (cells fully outside `Ω` are dropped from the
       dof layout); `> 0` keeps those cells active with quadrature
       weights pre-multiplied by `α`.
-    - `subcell_depth`: maximum octree depth used by both the cell
-      classifier and the moment integrator on cut leaves.
+    - `subcell_length_scale` (required): target octree leaf size in
+      physical units. The cell classifier and the moment integrator
+      subdivide each cut cell until every leaf's largest axis extent
+      is at most this value. Primary accuracy knob; one `PhysicalDomain`
+      then serves coarse and fine levels of a superposition `Space`
+      without overpaying on the fine level.
+    - `max_depth` (default `8`): hard safety cap on octree depth.
+      Engages only when `subcell_length_scale` would call for more
+      levels than this.
     - `moment_order_factor`: multiplier on the NNMF moment-fit basis
       order per axis. `2` (default) integrates trial × test products
       exactly on the moment basis, matching what tensor Gauss does on
@@ -545,8 +552,10 @@ Boolean indicator representations are intentionally not supported.
       degree-`p` integrands exactly.
     - `target_residual`: target L² residual for the moment fit. The
       default `1e-6` is matched to the natural stair-step accuracy of
-      the octree moment integrator at the default `subcell_depth = 4`.
-      Tighten only when `subcell_depth` is raised correspondingly.
+      the octree moment integrator at the default
+      `subcell_length_scale`. Tighten only when `subcell_length_scale`
+      is tightened correspondingly (rule of thumb: two decades per
+      halving of the scale).
 
   - **Attach** with `space(omega; ..., physical=physical_domain(…))`.
     The default `physical=nothing` keeps the no-FCM hot path.

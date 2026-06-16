@@ -101,7 +101,8 @@ end
     # ParaView contour at level 0 reproduces ∂Ω.
     phi_disk(x) = sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.4
     omega = box((0.0, 0.0), (1.0, 1.0))
-    physical = physical_domain(phi_disk; lipschitz=1.0, alpha=1.0, subcell_depth=3)
+    physical = physical_domain(phi_disk; lipschitz=1.0, alpha=1.0, subcell_length_scale=0.125,
+                               max_depth=3)
     V = space(omega; cells=(2, 2), order=1, physical=physical)
     model = prepare(poisson(V; source=x -> 0.0))
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
@@ -138,7 +139,8 @@ end
     # WriteVTK serialises numeric arrays.
     phi_disk(x) = sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.4
     omega = box((0.0, 0.0), (1.0, 1.0))
-    physical = physical_domain(phi_disk; lipschitz=1.0, alpha=1.0, subcell_depth=2)
+    physical = physical_domain(phi_disk; lipschitz=1.0, alpha=1.0, subcell_length_scale=0.25,
+                               max_depth=2)
     V = space(omega; cells=(1, 1), order=1, physical=physical)
     model = prepare(poisson(V; source=x -> 0.0))
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,

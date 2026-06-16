@@ -12,7 +12,7 @@ end
 
 @testset "FCM — octree leaves on a trivial Ω = whole box" begin
     # phi ≡ -1 ⇒ Ω is everything. The certificate at depth 0 fires → single :full leaf.
-    p = physical_domain(x -> -1.0; lipschitz=1.0)
+    p = physical_domain(x -> -1.0; lipschitz=1.0, subcell_length_scale=1.0)
     leaves = Tuple{AxisBox{2,Float64},Symbol}[]
     Unfitted.foreach_octree_leaf(p, box((0.0, 0.0), (1.0, 1.0))) do leaf, kind
         push!(leaves, (leaf, kind))
@@ -24,7 +24,7 @@ end
 
 @testset "FCM — octree leaves on a trivial Ω = ∅" begin
     # phi ≡ +1 ⇒ Ω is empty. Single :fictitious leaf at depth 0.
-    p = physical_domain(x -> 1.0; lipschitz=1.0)
+    p = physical_domain(x -> 1.0; lipschitz=1.0, subcell_length_scale=1.0)
     leaves = Tuple{AxisBox{2,Float64},Symbol}[]
     Unfitted.foreach_octree_leaf(p, box((0.0, 0.0), (1.0, 1.0))) do leaf, kind
         push!(leaves, (leaf, kind))
@@ -35,7 +35,7 @@ end
 
 @testset "FCM — octree leaves enumerate :full and :cut for a real cut" begin
     # Ω = left half. Octree subdivides; some leaves :full, some :cut at max depth.
-    p = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_depth=3)
+    p = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=0.125, max_depth=3)
     full_count = Ref(0)
     cut_count = Ref(0)
     fict_count = Ref(0)
@@ -52,7 +52,7 @@ end
 
 @testset "FCM — moment integration on trivial Ω matches analytic" begin
     # Ω = whole box [0, 1]. Moments of 1, x, x² match analytic integrals.
-    p = physical_domain(x -> -1.0; lipschitz=1.0)
+    p = physical_domain(x -> -1.0; lipschitz=1.0, subcell_length_scale=1.0)
     moments = Unfitted.compute_region_moments(p, box((0.0,), (1.0,)), (4,))
     # The tensor Legendre basis on [0, 1]:
     #   ψ_0(x) = L_0((2x-1)) = 1
@@ -65,13 +65,13 @@ end
 end
 
 @testset "FCM — candidate seeding respects Ω" begin
-    p = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_depth=3)
+    p = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=0.125, max_depth=3)
     pts = Unfitted.seed_candidate_points(p, box((0.0,), (1.0,)), (4,))
     @test !isempty(pts)
     @test all(pt[1] <= 0.5 + 1e-12 for pt in pts)  # all seeded inside Ω
 
     # Ω = ∅ → no candidates.
-    p_empty = physical_domain(x -> 1.0; lipschitz=1.0)
+    p_empty = physical_domain(x -> 1.0; lipschitz=1.0, subcell_length_scale=1.0)
     @test isempty(Unfitted.seed_candidate_points(p_empty, box((0.0,), (1.0,)), (4,)))
 end
 
@@ -79,8 +79,8 @@ end
     # The fitted rule integrates each tensor Legendre basis function to
     # exactly the moments computed by `compute_region_moments` (within NNLS
     # tolerance). Note: the absolute integration accuracy of the moments
-    # themselves is bounded by `subcell_depth` (stair-step on :cut leaves).
-    p = physical_domain(x -> x[1] - 0.7; lipschitz=1.0, subcell_depth=8)
+    # themselves is bounded by `subcell_length_scale` (stair-step on :cut leaves).
+    p = physical_domain(x -> x[1] - 0.7; lipschitz=1.0, subcell_length_scale=1.0 / 2^8, max_depth=8)
     region = box((0.0,), (1.0,))
     moment_order = (4,)
 
@@ -102,15 +102,17 @@ end
     end
 end
 
-@testset "FCM — moment integration converges with subcell_depth" begin
-    # The stair-step approximation gives O(2^-depth) error on cut leaves.
+@testset "FCM — moment integration converges with subcell refinement" begin
+    # The stair-step approximation gives O(L) error on cut leaves, where L is
+    # the resolved leaf size set by `subcell_length_scale`.
     # Σ-of-weights = ∫_Ω 1 dx → here = 0.7 for the left-of-0.7 cut.
     region = box((0.0,), (1.0,))
     moment_order = (4,)
     truth = 0.7
     errors = Float64[]
     for depth in (4, 6, 8, 10)
-        p = physical_domain(x -> x[1] - 0.7; lipschitz=1.0, subcell_depth=depth)
+        p = physical_domain(x -> x[1] - 0.7; lipschitz=1.0, subcell_length_scale=1.0 / 2^depth,
+                            max_depth=depth)
         m = Unfitted.compute_region_moments(p, region, moment_order)
         push!(errors, abs(m[1] - truth))
     end
@@ -124,7 +126,7 @@ end
     # the fit weights are non-negative with residual ~0. We don't expect the
     # fit to reproduce the standard Gauss rule pointwise (NNLS prefers a
     # sparser support), but Σw and ∫ψ_α reconstruction must match.
-    p = physical_domain(x -> -1.0; lipschitz=1.0)
+    p = physical_domain(x -> -1.0; lipschitz=1.0, subcell_length_scale=1.0)
     region = box((0.0, 0.0), (1.0, 1.0))
     moment_order = (3, 3)
 
@@ -140,7 +142,7 @@ end
     # 2D disk-in-square cut. At a loose target residual the elimination loop
     # should drop points down to the algorithmic floor `prod(moment_order)`.
     p = physical_domain(x -> sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.3; lipschitz=1.0,
-                        subcell_depth=5)
+                        subcell_length_scale=1.0 / 2^5, max_depth=5)
     region = box((0.0, 0.0), (1.0, 1.0))
     moment_order = (3, 3)
     min_points = prod(moment_order)
@@ -155,7 +157,7 @@ end
     # Same setup with target_residual at machine tolerance: elimination
     # cannot reduce below the basis dimension without violating the target.
     p = physical_domain(x -> sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.3; lipschitz=1.0,
-                        subcell_depth=5)
+                        subcell_length_scale=1.0 / 2^5, max_depth=5)
     region = box((0.0, 0.0), (1.0, 1.0))
     moment_order = (3, 3)
     nbasis = prod(moment_order .+ 1)
@@ -169,7 +171,7 @@ end
 @testset "FCM — elimination reproduces moments to NNLS tolerance" begin
     # Whatever point count the elimination chooses, the fitted rule must
     # reproduce the moments to within target_residual.
-    p = physical_domain(x -> x[1] - 0.6; lipschitz=1.0, subcell_depth=6)
+    p = physical_domain(x -> x[1] - 0.6; lipschitz=1.0, subcell_length_scale=1.0 / 2^6, max_depth=6)
     region = box((0.0,), (1.0,))
     moment_order = (4,)
 
@@ -196,7 +198,7 @@ end
     # Whether retry actually triggers depends on geometry — both early-exit
     # and exhaustion are valid outcomes for this contract.
     p = physical_domain(x -> sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.3; lipschitz=1.0,
-                        subcell_depth=4)
+                        subcell_length_scale=0.0625, max_depth=4)
     region = box((0.0, 0.0), (1.0, 1.0))
     moment_order = (3, 3)
     max_outer = 4
@@ -212,9 +214,9 @@ end
 end
 
 @testset "FCM — outer retry uses fewer attempts on a well-resolved cut" begin
-    # With a sufficient subcell_depth the first outer attempt succeeds.
+    # With a sufficiently small subcell_length_scale the first outer attempt succeeds.
     p = physical_domain(x -> sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.3; lipschitz=1.0,
-                        subcell_depth=6)
+                        subcell_length_scale=1.0 / 2^6, max_depth=6)
     region = box((0.0, 0.0), (1.0, 1.0))
     moment_order = (3, 3)
 
@@ -234,7 +236,7 @@ end
     moment_order = (3, 3)
     for phi in (x -> sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.3, x -> x[1] - 0.4,
                 x -> max(x[1] - 0.7, x[2] - 0.6))   # L-shaped Ω
-        p = physical_domain(phi; lipschitz=2.0, subcell_depth=5)
+        p = physical_domain(phi; lipschitz=2.0, subcell_length_scale=1.0 / 2^5, max_depth=5)
         pts, ws, res = Unfitted.moment_fit_rule(p, region, moment_order)
         @test all(w -> w >= 0, ws)
         @test res < 1.0e-8
@@ -245,7 +247,7 @@ end
     # In 2D with a non-trivial Ω and a loose target, elimination should
     # produce a strictly smaller (or equal) rule than single-shot.
     p = physical_domain(x -> sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.3; lipschitz=1.0,
-                        subcell_depth=4)
+                        subcell_length_scale=0.0625, max_depth=4)
     region = box((0.0, 0.0), (1.0, 1.0))
     moment_order = (3, 3)
 

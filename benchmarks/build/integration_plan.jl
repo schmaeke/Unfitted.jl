@@ -33,7 +33,8 @@ end
 let
     R = 0.7
     phi(x) = sqrt(x[1]^2 + x[2]^2) - R
-    disk = physical_domain(phi; lipschitz=1.0, subcell_depth=4)
+    # Base cell = 2/16 = 0.125; leaf scale = cell/16 reproduces depth=4.
+    disk = physical_domain(phi; lipschitz=1.0, subcell_length_scale=0.125 / 16, max_depth=4)
     V = space(box((-1.0, -1.0), (1.0, 1.0)); cells=(16, 16), order=2, physical=disk)
     group["D=2 16x16 FCM disk"] = @benchmarkable Unfitted.integration_plan($V)
 end

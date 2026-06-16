@@ -49,7 +49,7 @@ Boundary conditions imposed weakly:
 
 `u_r(r_o) = 0` by construction, so the Nitsche RHS vanishes.
 
-At `cells = (8, 8)`, `order = 4`, `subcell_depth = 4` this script
+At `cells = (8, 8)`, `order = 4`, `subcell_length_scale ≈ 0.0156` (≈ `cell/16`) this script
 reports relative L² error around `6 · 10⁻⁴` against the analytic
 displacement — well below the 1% mark Ruess targets in the energy
 norm at the same `8 × 8` discretization. The L² convergence of the
@@ -108,7 +108,11 @@ const box_extent = 1.0
 const h_nitsche = 2 * box_extent / cells_per_axis    # base cell size
 
 omega = box((-box_extent, -box_extent), (box_extent, box_extent))
-annulus = physical_domain(phi; lipschitz=1.0, subcell_depth=4)
+# Base cell size = 2 · box_extent / cells_per_axis = 0.25; aim for octree
+# leaves of ~0.0156 (i.e. cell / 16 = 4 levels), matching the original
+# `subcell_depth = 4` semantics on this geometry.
+annulus = physical_domain(phi; lipschitz=1.0,
+                          subcell_length_scale=2 * box_extent / cells_per_axis / 2^4, max_depth=4)
 V = space(omega; cells=(cells_per_axis, cells_per_axis), order=order, physical=annulus)
 u = field(:u, V; components=2)
 
@@ -238,9 +242,10 @@ write_quadrature_vtm(out * "_quadrature", model)
 print_run_report("FCM annular plate (Ruess 2013, §4.2)", report;
                  parameters=(:cells => V.levels[1].mesh.cells, :order => V.levels[1].order,
                              :r_inner => r_inner, :r_outer => r_outer,
-                             :subcell_depth => annulus.subcell_depth,
-                             :lipschitz => annulus.lipschitz, :E => E, :nu => 0.0,
-                             :nitsche_h => h_nitsche, :nitsche_beta => nitsche_beta,
+                             :subcell_length_scale => annulus.subcell_length_scale,
+                             :max_depth => annulus.max_depth, :lipschitz => annulus.lipschitz,
+                             :E => E, :nu => 0.0, :nitsche_h => h_nitsche,
+                             :nitsche_beta => nitsche_beta,
                              :outer_arc_segments => length(outer_arc.cells),
                              :inner_arc_segments => length(inner_arc.cells),
                              :sigma_rr_inner => sigma_rr_inner), output=out)
