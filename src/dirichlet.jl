@@ -580,3 +580,37 @@ end
 function _needs_dirichlet_projection(dirichlet)
     return any(condition -> !(condition.value isa Number && iszero(condition.value)), dirichlet)
 end
+
+# True iff `a` and `b` pick out the same physical facet. The default
+# `==` on a struct that carries a `Vector` field falls back to `===`,
+# so we unfold by hand: Symbol `===` short-circuits, then `Vector ==`
+# does the element-by-element compare on the `(axis, side)` tuples
+# (which are isbits, so `==` is bit-equality). Used by
+# `update_dirichlet!`'s structural check; the function itself lives
+# in `src/model.jl`.
+function _selectors_equal(a::BoundarySelector, b::BoundarySelector)
+    return a.selector === b.selector && a.sides == b.sides
+end
+
+# Cheap structural compatibility check. Re-projecting Dirichlet values
+# in place is only valid when the *set* of constrained dofs is
+# unchanged; that set depends on the boundary selector, field, and
+# component of each condition, but not on its value. Anything else
+# moving means the caller has to go through `prepare(problem)` instead.
+function _check_dirichlet_update_compatibility(old, new)
+    length(new) == length(old) || throw(ArgumentError("update_dirichlet! expects $(length(old)) " *
+                                                      "conditions (the count the model was prepared " *
+                                                      "with), got $(length(new))"))
+    for (i, (o, n)) in enumerate(zip(old, new))
+        _selectors_equal(o.boundary, n.boundary) ||
+            throw(ArgumentError("update_dirichlet! condition $i: boundary selector changed; " *
+                                "rebuild the model with prepare(problem) instead"))
+        o.field === n.field || throw(ArgumentError("update_dirichlet! condition $i: field name " *
+                                                   "changed; rebuild the model with " *
+                                                   "prepare(problem) instead"))
+        o.component === n.component ||
+            throw(ArgumentError("update_dirichlet! condition $i: component changed; rebuild the " *
+                                "model with prepare(problem) instead"))
+    end
+    return nothing
+end

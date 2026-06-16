@@ -222,18 +222,19 @@ mutable struct Model{D,T,P}
     diagnostics::AssemblyDiagnostics
 end
 
-# Pick out the Dirichlet conditions that apply to `field` from a
-# problem's `dirichlet` list: every unscoped condition (`condition.field
-# === nothing`) applies to the only field of a single-field problem and
-# raises on multi-field problems; named conditions match by name.
-function _dirichlet_for_field(problem::Problem, field::Field)
+# Pick out the Dirichlet conditions that apply to the field called
+# `name` from a problem's `dirichlet` list: every unscoped condition
+# (`condition.field === nothing`) applies to the only field of a
+# single-field problem and raises on multi-field problems; named
+# conditions match by name.
+function _dirichlet_for_field(problem::Problem, name::Symbol)
     scoped = Any[]
     for condition in problem.dirichlet
         if condition.field === nothing
             length(problem.fields) == 1 ||
                 throw(ArgumentError("multi-field Dirichlet conditions must specify a field"))
             push!(scoped, condition)
-        elseif condition.field == field.name
+        elseif condition.field === name
             push!(scoped, condition)
         end
     end
@@ -256,8 +257,8 @@ function system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T)) wh
     by_name = Dict{Symbol,Int}()
     offset = 0
     for field in problem.fields
-        layout = dof_layout(field.space; dirichlet=_dirichlet_for_field(problem, field), tolerance,
-                            components=component_count(field))
+        layout = dof_layout(field.space; dirichlet=_dirichlet_for_field(problem, field.name),
+                            tolerance, components=component_count(field))
         push!(layouts, FieldLayout{D,T}(field.name, component_count(field), layout, offset))
         by_name[field.name] = length(layouts)
         offset += active_unknowns(layout)
@@ -594,6 +595,103 @@ function active_cells(model::Model; level::Integer)
     lvl = levels[level]
     lvl.mask === nothing && return trues(lvl.mesh.cells)
     return copy(lvl.mask.on)
+end
+
+# ── Public: refresh Dirichlet values without rebuilding the model ────────────
+
+"""
+    update_dirichlet!(model::Model, dirichlet) -> Model
+
+Refresh the *values* of a prepared model's Dirichlet conditions in
+place, reusing the existing integration plan, dof enumeration,
+facet/surface region caches, and immersed-boundary moment-fit cache.
+
+The argument `dirichlet` is a vector or tuple of
+[`DirichletCondition`](@ref)s that must structurally match the
+conditions the model was prepared with: the same number of
+conditions in the same order, each with identical `boundary`,
+`field`, and `component`. Only the `value` of each condition is
+allowed to differ. Any structural mismatch throws `ArgumentError`
+and asks the caller to rebuild through [`prepare`](@ref) instead.
+
+The canonical use is the inner loop of a load-stepping driver:
+
+```julia
+problem = Problem((u,); dirichlet=[dirichlet(0.0; on=top, field=u),
+                                   dirichlet(0.0; on=bottom, field=u)])
+model = prepare(problem)
+for step in 1:n_steps
+    u_top = step * Δu
+    update_dirichlet!(model, [dirichlet(u_top; on=top, field=u),
+                              dirichlet(0.0;   on=bottom, field=u)])
+    solution = solve!(model)  # or run a Newton loop here
+end
+```
+
+For the same problem, calling `update_dirichlet!` is typically
+orders of magnitude cheaper than re-running `prepare(problem)`
+because the per-step rebuild of the integration plan and the
+NNMF moment-fit cache is skipped — only the boundary-trace mass
+matrix on the constrained-dof subspace is reassembled and resolved.
+
+# Semantics
+
+  - The constrained-dof set is *not* rediscovered. It depends only on
+    the boundary selector + field topology, both of which the
+    structural check pins.
+  - `layout.constrained_values` is refilled by reassembling the
+    boundary mass matrix `M` and solving `M c = b` for the new
+    `b_i = ∫ g(x) φ_i dS`. Existing basis-trace evaluation is reused
+    indirectly through the boundary region cache.
+  - `model.matrix` and `model.rhs` are cleared so the next
+    [`assemble!`](@ref) (or `assemble_vector` / `assemble_matrix`
+    call) picks up the new constrained data through the standard
+    column-elimination path.
+  - `model.version` is *not* bumped: existing [`Solution`](@ref) and
+    [`QuadField`](@ref) handles stay valid against the updated
+    layout.
+  - The model's stored `problem` is replaced with a fresh `Problem`
+    carrying the new Dirichlet list, so `model.problem.dirichlet`
+    reflects the current state for inspection and diagnostics.
+
+# Errors
+
+Throws `ArgumentError` if `dirichlet` is structurally incompatible
+with `model.problem.dirichlet` (different length, or any condition
+moves boundary / field / component). The error message points the
+caller at [`prepare`](@ref).
+"""
+function update_dirichlet!(model::Model{D,T}, dirichlet) where {D,T}
+    new_dirichlet = collect(dirichlet)
+    _check_dirichlet_update_compatibility(model.problem.dirichlet, new_dirichlet)
+
+    # Replace `model.problem` (immutable) with a fresh copy carrying the
+    # new dirichlet list. The inner constructor sidesteps the validation
+    # walk in `Problem(fields; …)` — fields, blocks, loads, and the
+    # symmetric flag were already checked when the model was prepared.
+    p = model.problem
+    model.problem = typeof(p)(p.space, p.fields, p.blocks, p.loads, new_dirichlet, p.symmetric)
+
+    # Re-project values into each field's existing DofLayout. The
+    # constrained-dof set is unchanged, so `_project_dirichlet_values!`
+    # only refills `layout.constrained_values` — it does not touch the
+    # raw-dof index, the active enumeration, or any of the boolean
+    # constraint masks.
+    for field_layout in model.dofs.fields
+        field_dirichlet = _dirichlet_for_field(model.problem, field_layout.name)
+        _project_dirichlet_values!(field_layout.dofs, model.problem.space, field_dirichlet)
+    end
+
+    # Clear cached operators. The RHS depends on the constrained values
+    # via column elimination, so the next assembly must rebuild it. The
+    # matrix would technically still be valid (Dirichlet only moves
+    # entries into the RHS at assembly time), but dropping it too means
+    # the next `solve!` cannot silently use a stale operator if the
+    # caller also changes blocks or loads between steps.
+    model.matrix = nothing
+    model.rhs = nothing
+
+    return model
 end
 
 # ── Diagnostics reporting ─────────────────────────────────────────────────────

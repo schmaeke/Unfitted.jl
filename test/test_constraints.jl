@@ -216,3 +216,69 @@ end
     @test value(sol, model, (0.0, 0.0), 1) ≈ 0.0 atol = 1.0e-10
     @test value(sol, model, (0.5, 1.0), 2) ≈ 0.1 atol = 1.0e-10
 end
+
+# The load-stepping driver pattern: a single `prepare(problem)` followed
+# by `update_dirichlet!` between steps. The converged solution must
+# match what a fresh `prepare(problem)` with the new Dirichlet datum
+# produces, and the model.version must stay unchanged.
+@testset "update_dirichlet! matches fresh prepare for value-only changes" begin
+    omega = box((0.0,), (1.0,))
+    V = space(omega; cells=4, order=2)
+
+    function build(rhs_value)
+        return poisson(V; source=x -> 0.0,
+                       dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower)),
+                                  dirichlet(rhs_value; on=boundary(axis=1, side=:upper))])
+    end
+
+    base = prepare(build(0.0))
+    initial_version = base.version
+
+    for new_value in (0.25, 0.5, -0.1)
+        update_dirichlet!(base,
+                          [dirichlet(0.0; on=boundary(axis=1, side=:lower)),
+                           dirichlet(new_value; on=boundary(axis=1, side=:upper))])
+        @test base.version == initial_version
+        @test base.matrix === nothing
+        @test base.rhs === nothing
+        s = solve!(base)
+
+        reference = solve!(prepare(build(new_value)))
+        @test value(s, base, (0.5,)) ≈ value(reference, prepare(build(new_value)), (0.5,)) atol = 1.0e-10
+        @test value(s, base, (1.0,)) ≈ new_value atol = 1.0e-10
+        @test value(s, base, (0.0,)) ≈ 0.0 atol = 1.0e-10
+    end
+end
+
+# Structural checks: anything beyond a value-only change must throw.
+@testset "update_dirichlet! rejects structural changes" begin
+    V = space(box((0.0,), (1.0,)); cells=4, order=2)
+    p = poisson(V; source=x -> 0.0,
+                dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower)),
+                           dirichlet(0.3; on=boundary(axis=1, side=:upper))])
+    model = prepare(p)
+
+    # Different condition count.
+    @test_throws ArgumentError update_dirichlet!(model,
+                                                 [dirichlet(0.0; on=boundary(axis=1, side=:lower))])
+
+    # Different boundary selector.
+    @test_throws ArgumentError update_dirichlet!(model,
+                                                 [dirichlet(0.0; on=boundary(axis=1, side=:lower)),
+                                                  dirichlet(0.3; on=boundary(axis=1, side=:lower))])
+end
+
+# Function-valued Dirichlet must also refresh correctly. A constant
+# callback `x -> c` must give the same answer as the scalar `c`.
+@testset "update_dirichlet! handles function-valued data" begin
+    V = space(box((0.0,), (1.0,)); cells=4, order=2)
+    model = prepare(poisson(V; source=x -> 0.0,
+                            dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower)),
+                                       dirichlet(x -> 0.0; on=boundary(axis=1, side=:upper))]))
+    update_dirichlet!(model,
+                      [dirichlet(0.0; on=boundary(axis=1, side=:lower)),
+                       dirichlet(x -> 0.4; on=boundary(axis=1, side=:upper))])
+    s = solve!(model)
+    @test value(s, model, (1.0,)) ≈ 0.4 atol = 1.0e-10
+    @test value(s, model, (0.5,)) ≈ 0.2 atol = 1.0e-10
+end
