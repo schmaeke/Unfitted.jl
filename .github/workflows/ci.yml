@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Julia ${{ matrix.julia-version }} • threads=${{ matrix.threads }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.10 is the declared minimum in Project.toml; "1" tracks the
+        # latest stable release.
+        julia-version: ['1.10', '1']
+        # CONTRIBUTING.md requires tests to pass single-threaded and
+        # with more than one thread.
+        threads: ['1', '4']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.julia-version }}
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+        env:
+          JULIA_NUM_THREADS: ${{ matrix.threads }}
+
+  format:
+    name: Format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      # precommit.jl looks for JuliaFormatter in the default depot
+      # (run without --project), per CONTRIBUTING.md's setup notes.
+      - name: Install JuliaFormatter
+        run: julia -e 'import Pkg; Pkg.add("JuliaFormatter")'
+      - name: Verify formatting
+        run: julia precommit.jl --check
