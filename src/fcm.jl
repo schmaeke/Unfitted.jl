@@ -11,11 +11,16 @@
 #     solids", Comput. Methods Appl. Mech. Engrg. 400 (2022) 115584,
 #     doi:10.1016/j.cma.2022.115584.
 #
-#   The Fast NNLS solver wrapped by `nnls!` is
+#   The Lawson–Hanson NNLS solver wrapped by `nnls!` is the classical
 #
-#     R. Bro & S. de Jong, "A fast non-negativity-constrained least squares
-#     algorithm", J. Chemometr. 11(5):393-401, 1997,
-#     doi:10.1002/(SICI)1099-128X(199709/10)11:5<393::AID-CEM483>3.0.CO;2-L.
+#     C. L. Lawson, R. J. Hanson, "Solving Least Squares Problems",
+#     Prentice-Hall (1974), Ch. 23; SIAM Classics in Applied
+#     Mathematics reprint doi:10.1137/1.9781611971217.
+#
+#   The Bro & de Jong (1997) Fast NNLS variant is exposed by the same
+#   `NonNegLeastSquares` package but not wrapped here — its `N × N`
+#   Gram-matrix shape loses to Lawson–Hanson on the short-and-wide
+#   moment-fit matrices this pipeline produces (see `nnls!`).
 #
 # Upstream source and license
 #
@@ -44,7 +49,7 @@
 #
 # Pipeline summary
 #
-#   1. NNLS wrapper around `NonNegLeastSquares.nonneg_lsq` (Fast NNLS).
+#   1. NNLS wrapper around `NonNegLeastSquares.nonneg_lsq` (Lawson–Hanson).
 #   2. D-generic octree leaf walker driven by the PhysicalDomain Lipschitz
 #      certificate and corner sampling.
 #   3. Tensor Legendre moment integration over the octree leaves.
@@ -62,21 +67,32 @@
 """
     nnls!(A, b) -> (x, residual_norm)
 
-Solve
+Solve the non-negativity-constrained linear least-squares problem
 
     minimise  ‖A x − b‖₂  subject to  x ≥ 0,
 
-i.e. the non-negativity-constrained linear least-squares problem, using
-the Fast NNLS algorithm (Bro & de Jong 1997) implemented by
-`NonNegLeastSquares.jl`. Returns the solution vector and the L² residual
-`‖A x − b‖₂`.
+returning the solution vector and the L² residual `‖A x − b‖₂`.
 
-Allocations are entirely owned by `NonNegLeastSquares.jl`; `A` and `b`
-are *not* mutated despite the `!` — the trailing bang is kept for
-forward compatibility with a future in-place port.
+Wraps `NonNegLeastSquares.nonneg_lsq` with `alg = :nnls`, the classical
+Lawson–Hanson (1974) active-set algorithm. It operates directly on the
+`nbasis × npoints` design matrix and converges in roughly `nbasis`
+outer iterations, each solving a small `|P| × |P|` linear system with
+`|P| ≤ nbasis`. The moment-fit matrix is short and wide
+(`nbasis ≪ npoints`, e.g. `64 × 4096` for an order-3 basis with
+`moment_order_factor = 1` on a depth-3 octree of one cut cell), so
+the matrix the algorithm walks IS the small one.
+
+The Bro & de Jong (1997) Fast NNLS variant (`alg = :fnnls`) works on
+the `npoints × npoints` Gram matrix instead. It is faster only when
+`npoints` is small; at our typical `npoints` of several thousand the
+Gram matrix is hundreds of megabytes and `:fnnls` is roughly 30×
+slower (275 ms vs 8.9 ms median at `nbasis = 64`, `npoints = 4096`).
+
+Allocations are owned by `NonNegLeastSquares.jl`; `A` and `b` are not
+mutated despite the `!` — the bang is kept for a future in-place port.
 """
 function nnls!(A::AbstractMatrix{T}, b::AbstractVector{T}) where {T<:Real}
-    x = vec(nonneg_lsq(A, b; alg=:fnnls))
+    x = vec(nonneg_lsq(A, b; alg=:nnls))
     residual = norm(A * x - b)
     return x, residual
 end

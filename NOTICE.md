@@ -20,12 +20,13 @@ surface-IP / divergence-theorem path is not ported.
 
 As a direct consequence of that geometry-kernel swap, the moment
 integration in this port is stair-step accurate (bounded by
-`O(2^-subcell_depth)`) instead of B-rep-exact, so the moment-fit NNLS
-residual cannot fall below the integrator's own floor. The default
-`PhysicalDomain.target_residual` is therefore `1e-6` (matched to the
-default `subcell_depth=4`), looser than QuESo's hardcoded `1e-10` and
-their shipped examples' typical `1e-8`. Users who raise
-`subcell_depth` should tighten `target_residual` accordingly.
+`O(subcell_length_scale / region_extent)` per axis) instead of
+B-rep-exact, so the moment-fit NNLS residual cannot fall below the
+integrator's own floor. The default `PhysicalDomain.target_residual`
+is therefore `1e-6`, matched to that floor at typical
+`subcell_length_scale` values — looser than QuESo's hardcoded `1e-10`
+and their shipped examples' typical `1e-8`. Users who tighten
+`subcell_length_scale` should tighten `target_residual` accordingly.
 
 ### Upstream source
 

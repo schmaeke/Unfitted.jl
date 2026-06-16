@@ -568,10 +568,11 @@ Boolean indicator representations are intentionally not supported.
     `zip(points, weights)`.
 
   - **NNMF defaults**: moment-fit basis order =
-    `2 × max(level.order)` per axis over the region's parents; Fast NNLS
-    via `NonNegLeastSquares.jl`; point-elimination loop floor at
-    `prod(moment_order)`; outer retry up to 3 attempts (4 when any axis
-    order is 2). Cached by canonicalized region bounds + moment order.
+    `2 × max(level.order)` per axis over the region's parents;
+    Lawson–Hanson NNLS via `NonNegLeastSquares.jl`; point-elimination
+    loop floor at `prod(moment_order)`; outer retry up to 3 attempts
+    (4 when any axis order is 2). Cached by canonicalized region
+    bounds + moment order.
 
   - **Diagnostics**: `diagnostics(model, solution).cut_region_count`,
     `fit_failure_count`, `moment_fit_residual_max`,
