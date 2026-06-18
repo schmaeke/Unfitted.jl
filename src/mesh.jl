@@ -308,6 +308,36 @@ function _level_by_id(V::Space, id::Integer)
 end
 
 """
+    instantiate_basis(basis, mesh, order, mode, mask) -> BasisFamily
+
+Finalize a basis family for a concrete level, just before the
+[`Level`](@ref) is built. The default returns `basis` unchanged: most
+families — including the default [`IntegratedLegendre`](@ref) — are fully
+specified before any mesh exists.
+
+Families whose concrete form depends on the level's mesh overload this
+hook. The B-spline family in the `BasicBSpline` extension is the
+motivating case: its per-axis knot vectors are built from the mesh cell
+coordinates, so [`bspline`](@ref) returns a *deferred* specification and
+the real family is materialised here once the mesh is known. Keeping the
+two-phase "spec → concrete family" handshake in one named hook (rather
+than buried in a `Level` constructor overload) makes the extension point
+explicit and means every level-building path treats mesh-dependent
+families uniformly.
+
+All of [`space`](@ref), [`overlay`](@ref), [`moved_space`](@ref), and the
+mask mutators route the basis through this hook, so a mesh-dependent
+family is rebuilt whenever the mesh changes (e.g. an overlay move) and is
+validated against the level's `order` / `mode` / `mask` at construction
+time. `mask` is the normalised [`LevelMask`](@ref) (`nothing` for an
+all-active level).
+"""
+function instantiate_basis(basis::BasisFamily, mesh::CartesianMesh{D,T}, order::NTuple{D,Int},
+                           mode::Symbol, mask) where {D,T}
+    basis
+end
+
+"""
     space(domain::AxisBox; cells, order=1, basis=IntegratedLegendre(),
                           mode=:tensor, active=nothing, physical=nothing)
 
@@ -340,7 +370,8 @@ function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(),
     _check_basis_mode(mode, orders)
     base_mesh = CartesianMesh(domain; cells)
     mask = _normalize_mask(active, base_mesh)
-    base_level = Level{D,T,typeof(basis)}(1, :base, base_mesh, basis, orders, mode, mask)
+    family = instantiate_basis(basis, base_mesh, orders, mode, mask)
+    base_level = Level{D,T,typeof(family)}(1, :base, base_mesh, family, orders, mode, mask)
     return Space{D,T,Tuple{typeof(base_level)}}(domain, (base_level,), physical)
 end
 
@@ -381,7 +412,8 @@ function overlay(V::Space{D,T}, domain::AxisBox{D,T}; cells, order=V.levels[1].o
     overlay_mesh = CartesianMesh(domain; cells)
     mask = _normalize_mask(active, overlay_mesh)
     id = length(V.levels) + 1
-    level = Level{D,T,typeof(basis)}(id, :overlay, overlay_mesh, basis, orders, mode, mask)
+    family = instantiate_basis(basis, overlay_mesh, orders, mode, mask)
+    level = Level{D,T,typeof(family)}(id, :overlay, overlay_mesh, family, orders, mode, mask)
     levels = (V.levels..., level)
     return Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
 end
@@ -402,8 +434,12 @@ function moved_space(V::Space{D,T}; level::Integer, to::AxisBox{D,T},
         throw(ArgumentError("overlay domain must lie inside the physical domain"))
     old = V.levels[level]
     new_mesh = CartesianMesh(to; cells=old.mesh.cells)
-    new_level = Level{D,T,typeof(old.basis)}(old.id, old.role, new_mesh, old.basis, old.order,
-                                             old.mode, old.mask)
+    # Re-instantiate the family against the moved mesh: mesh-dependent
+    # families (B-splines) must rebuild their knot vectors for the new
+    # cell coordinates; mesh-independent families return themselves.
+    family = instantiate_basis(old.basis, new_mesh, old.order, old.mode, old.mask)
+    new_level = Level{D,T,typeof(family)}(old.id, old.role, new_mesh, family, old.order, old.mode,
+                                          old.mask)
     levels = ntuple(i -> i == level ? new_level : V.levels[i], length(V.levels))
     return Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
 end
@@ -415,8 +451,9 @@ function _remasked_space(V::Space{D,T}, level_index::Integer, mask) where {D,T}
     1 <= level_index <= length(V.levels) ||
         throw(ArgumentError("level index $level_index out of bounds"))
     old = V.levels[level_index]
-    new_level = Level{D,T,typeof(old.basis)}(old.id, old.role, old.mesh, old.basis, old.order,
-                                             old.mode, mask)
+    family = instantiate_basis(old.basis, old.mesh, old.order, old.mode, mask)
+    new_level = Level{D,T,typeof(family)}(old.id, old.role, old.mesh, family, old.order, old.mode,
+                                          mask)
     levels = ntuple(i -> i == level_index ? new_level : V.levels[i], length(V.levels))
     return Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
 end

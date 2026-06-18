@@ -327,6 +327,14 @@ end
 # and the tensor-product evaluation kernels. One `Vector{T}` per axis,
 # length `order[d] + 1`. The assembly workspace pre-allocates one of
 # these per level so the hot loop never reallocates.
+#
+# The per-axis size requirement `order[d] + 1` is the count of 1D modes
+# active on a single cell for *every* basis family the package currently
+# supports: integrated Legendre carries one endpoint per side plus
+# `order − 1` bubbles, and an open-knot B-spline of degree `p` has
+# exactly `p + 1` 1D functions non-zero on any single span. So the
+# buffer allocation is family-agnostic; only the per-axis evaluator
+# (`_fill_factor_tables!`) dispatches.
 function _factor_buffers(order::NTuple{D,Int}, ::Type{T}) where {D,T}
     ntuple(d -> Vector{T}(undef, order[d] + 1), D)
 end
@@ -340,13 +348,28 @@ function _indices_order(indices::AbstractVector{CartesianIndex{D}}) where {D}
     ntuple(d -> maximum(id -> id.I[d], indices), D)
 end
 
-# Fill caller-owned per-axis 1D tables for the integrated Legendre basis at
-# one reference point: `val1d[d][m + 1] = N̂ₘ(ξ[d])` for modes m ∈ 0:order[d].
-# The 3-arg form fills only values; the 4-arg form additionally fills
-# `der1d[d][m + 1] = N̂ₘ′(ξ[d])`. One Legendre three-term recurrence per
-# axis, so the per-point cost is `D · (order + 1)` instead of the
-# `D · (order + 1)^D` of evaluating every tensor-product mode independently.
-function _fill_factor_tables!(val1d, order::NTuple{D,Int}, ξ::SVector{D,T}) where {D,T}
+# Fill caller-owned per-axis 1D tables for `basis` at one reference
+# point: `val1d[d][i + 1] = N̂ᵢ(ξ[d])` for the `order[d] + 1` 1D modes
+# active on the cell along axis `d`. The 5-arg form fills only values;
+# the 6-arg form additionally fills `der1d[d][i + 1] = N̂ᵢ′(ξ[d])`. The
+# specific recurrence is basis-family-specific (Legendre three-term for
+# integrated Legendre, de Boor for B-splines); both share the same
+# `O(D · (order + 1))` per-point cost so the tensor-product evaluators
+# downstream stay basis-agnostic.
+#
+# `cell::CartesianIndex{D}` is the parent cell's mesh-index along each
+# axis. Integrated Legendre ignores it (its 1D modes are cell-local in
+# the reference frame, identical on every cell); the B-spline family in
+# the extension uses it to look up the knot-vector span the parent cell
+# corresponds to. Callers always pass the same `parent.cell` the rest
+# of the assembly loop uses, so the integrated-Legendre overhead is
+# zero and the B-spline overload gets the lookup for free.
+#
+# The integrated-Legendre overloads below are the in-package default;
+# additional basis families plug in via further overloads. The B-spline
+# overloads live in `ext/UnfittedBasicBSplineExt.jl`.
+function _fill_factor_tables!(::IntegratedLegendre, val1d, order::NTuple{D,Int}, ξ::SVector{D,T},
+                              ::CartesianIndex{D}) where {D,T}
     @inbounds for d in 1:D
         x = ξ[d]
         p = order[d]
@@ -368,7 +391,8 @@ function _fill_factor_tables!(val1d, order::NTuple{D,Int}, ξ::SVector{D,T}) whe
     return nothing
 end
 
-function _fill_factor_tables!(val1d, der1d, order::NTuple{D,Int}, ξ::SVector{D,T}) where {D,T}
+function _fill_factor_tables!(::IntegratedLegendre, val1d, der1d, order::NTuple{D,Int},
+                              ξ::SVector{D,T}, ::CartesianIndex{D}) where {D,T}
     @inbounds for d in 1:D
         x = ξ[d]
         p = order[d]
@@ -394,14 +418,19 @@ function _fill_factor_tables!(val1d, der1d, order::NTuple{D,Int}, ξ::SVector{D,
     return nothing
 end
 
-# Tensor-product values from precomputed 1D tables. Walks each
-# multi-index `α` in `indices` and assembles the product
-# `N_α(ξ) = ∏_d val1d[d][α_d + 1]`. The caller owns `val1d`.
-function _tensor_values!(values::AbstractVector, indices::AbstractVector{CartesianIndex{D}},
-                         order::NTuple{D,Int}, ξ::SVector{D,T}, val1d) where {D,T}
+# Tensor-product values from precomputed 1D tables. Fills the per-axis
+# tables via `_fill_factor_tables!(basis, …)` (the only family-specific
+# step), then walks each multi-index `α` in `indices` and assembles the
+# product `N_α(ξ) = ∏_d val1d[d][α_d + 1]`. The tensor-product loop is
+# basis-agnostic: it only assumes the per-axis tables are indexed by the
+# 1D mode number on the cell, which is the canonical convention every
+# family in this package follows. The caller owns `val1d`.
+function _tensor_values!(basis::BasisFamily, values::AbstractVector,
+                         indices::AbstractVector{CartesianIndex{D}}, order::NTuple{D,Int},
+                         ξ::SVector{D,T}, val1d, cell::CartesianIndex{D}) where {D,T}
     length(values) == length(indices) ||
         throw(DimensionMismatch("basis value buffer has wrong length"))
-    _fill_factor_tables!(val1d, order, ξ)
+    _fill_factor_tables!(basis, val1d, order, ξ, cell)
     @inbounds for (a, id) in pairs(indices)
         values[a] = prod(ntuple(d -> val1d[d][id.I[d] + 1], D))
     end
@@ -423,14 +452,16 @@ end
 # `O(D²)` per multi-index — for typical `D ≤ 4` and modest mode counts
 # this is comfortably allocation-free with `_product_except` operating
 # on `NTuple` scratch.
-function _tensor_values_grads!(values::AbstractVector, gradients::AbstractVector,
+function _tensor_values_grads!(basis::BasisFamily, values::AbstractVector,
+                               gradients::AbstractVector,
                                indices::AbstractVector{CartesianIndex{D}}, order::NTuple{D,Int},
-                               ξ::SVector{D,T}, scale::SVector{D,T}, val1d, der1d) where {D,T}
+                               ξ::SVector{D,T}, scale::SVector{D,T}, val1d, der1d,
+                               cell::CartesianIndex{D}) where {D,T}
     length(values) == length(indices) ||
         throw(DimensionMismatch("basis value buffer has wrong length"))
     length(gradients) == length(indices) ||
         throw(DimensionMismatch("basis gradient buffer has wrong length"))
-    _fill_factor_tables!(val1d, der1d, order, ξ)
+    _fill_factor_tables!(basis, val1d, der1d, order, ξ, cell)
     @inbounds for (a, id) in pairs(indices)
         vfac = ntuple(d -> val1d[d][id.I[d] + 1], D)
         values[a] = prod(vfac)
@@ -454,6 +485,15 @@ end
 
 # ── Public value and gradient evaluation ──────────────────────────────────────
 
+# Sentinel cell index used by the in-package public-API wrappers
+# (`basis_values`, `physical_basis_gradients`, …) whose call signatures
+# do not carry a parent-cell argument. Integrated Legendre ignores the
+# cell positional in `_fill_factor_tables!`, so any in-bounds value
+# would do; we pick the lowest-corner cell deterministically. Basis
+# families whose evaluator depends on the cell (e.g. B-splines) expose
+# their own public-API wrappers that take a cell explicitly.
+_cell_sentinel(::Val{D}) where {D} = CartesianIndex(ntuple(_ -> 1, D))
+
 """
     basis_values!(basis::IntegratedLegendre, values, order[, mode], xi)
     basis_values!(basis::IntegratedLegendre, values, indices,       xi)
@@ -474,11 +514,12 @@ function basis_values!(basis::IntegratedLegendre, values::AbstractVector, order:
     return basis_values!(basis, values, indices, xi)
 end
 
-function basis_values!(::IntegratedLegendre, values::AbstractVector,
+function basis_values!(basis::IntegratedLegendre, values::AbstractVector,
                        indices::AbstractVector{CartesianIndex{D}}, xi::PointLike{D}) where {D}
     ξ = _reference_coordinate(xi)
     order = _indices_order(indices)
-    return _tensor_values!(values, indices, order, ξ, _factor_buffers(order, eltype(ξ)))
+    return _tensor_values!(basis, values, indices, order, ξ, _factor_buffers(order, eltype(ξ)),
+                           _cell_sentinel(Val(D)))
 end
 
 function basis_values!(basis::IntegratedLegendre, values::AbstractVector, order::NTuple{D,Int},
@@ -504,6 +545,16 @@ function basis_values(basis::IntegratedLegendre, order::NTuple{D,Int}, xi::Point
     basis_values(basis, order, :tensor, xi)
 end
 
+# Cell-aware variant used by `postprocessing.jl` (where the parent cell
+# index is already known) and by any caller that wants to support
+# basis families whose evaluator depends on the cell. Integrated
+# Legendre ignores `cell` and routes to the cell-agnostic method; the
+# B-spline family overloads this signature directly in the extension.
+function basis_values(basis::IntegratedLegendre, order::NTuple{D,Int}, mode::Symbol,
+                      xi::PointLike{D}, ::CartesianIndex{D}) where {D}
+    return basis_values(basis, order, mode, xi)
+end
+
 """
     reference_basis_gradients!(basis::IntegratedLegendre, gradients, order, mode, xi)
     reference_basis_gradients(basis::IntegratedLegendre, order[, mode], xi) -> Vector{SVector{D}}
@@ -523,8 +574,9 @@ function reference_basis_gradients!(basis::IntegratedLegendre, gradients::Abstra
     T = eltype(ξ)
     values = Vector{T}(undef, length(indices))
     scale = SVector{D,T}(ntuple(_ -> one(T), D))
-    _tensor_values_grads!(values, gradients, indices, order, ξ, scale, _factor_buffers(order, T),
-                          _factor_buffers(order, T))
+    _tensor_values_grads!(basis, values, gradients, indices, order, ξ, scale,
+                          _factor_buffers(order, T), _factor_buffers(order, T),
+                          _cell_sentinel(Val(D)))
     return gradients
 end
 
@@ -565,8 +617,9 @@ function physical_basis_gradients!(basis::IntegratedLegendre, gradients::Abstrac
     R = eltype(ξ)
     values = Vector{R}(undef, length(indices))
     scale = SVector{D,R}(2 ./ edge_lengths(cell))
-    _tensor_values_grads!(values, gradients, indices, order, ξ, scale, _factor_buffers(order, R),
-                          _factor_buffers(order, R))
+    _tensor_values_grads!(basis, values, gradients, indices, order, ξ, scale,
+                          _factor_buffers(order, R), _factor_buffers(order, R),
+                          _cell_sentinel(Val(D)))
     return gradients
 end
 
@@ -579,6 +632,18 @@ end
 function physical_basis_gradients(basis::IntegratedLegendre, order::NTuple{D,Int},
                                   cell::AxisBox{D,T}, xi::PointLike{D}) where {D,T}
     physical_basis_gradients(basis, order, :tensor, cell, xi)
+end
+
+# Cell-aware variant used by `postprocessing.jl` (where the parent cell
+# index is already known) and by any caller that wants to support
+# basis families whose evaluator depends on the cell. Integrated
+# Legendre ignores `cell_index` and routes to the cell-agnostic
+# method; the B-spline family overloads this signature directly in
+# the extension.
+function physical_basis_gradients(basis::IntegratedLegendre, order::NTuple{D,Int}, mode::Symbol,
+                                  cell_box::AxisBox{D,T}, xi::PointLike{D},
+                                  ::CartesianIndex{D}) where {D,T}
+    return physical_basis_gradients(basis, order, mode, cell_box, xi)
 end
 
 # ── Boundary and facet basis identification ───────────────────────────────────

@@ -60,7 +60,8 @@ end
 # without state, `l2_error`).
 function _update_parent_basis_values!(data, eta::SVector{D,T}) where {D,T}
     xi = reference_to_physical(data.parent.local_box, eta)
-    _tensor_values!(data.values, data.local_ids, data.order, xi, data.val1d)
+    _tensor_values!(data.basis, data.values, data.local_ids, data.order, xi, data.val1d,
+                    data.parent.cell)
     return data
 end
 
@@ -206,13 +207,50 @@ function _sparse_from_triplets(rows::Vector{Int}, cols::Vector{Int}, vals::Vecto
     return matrix
 end
 
-# Build the cell-local-to-region-active dof index table for one parent
-# and its field. For each `(raw_dof, component)`:
+# Per-parent, per-region dof distribution table built by
+# `_local_parent_dofs!`. Routes each cell-local basis function (and
+# component) through the dof layer's `raw_expansion` into two flat
+# storage layouts — one for *active* branches (entries that land in
+# the local matrix) and one for *Dirichlet* branches (entries that
+# move to the rhs via column elimination). The flat layout keeps the
+# per-parent allocation count at a fixed `8` (four flat vectors plus
+# four small offset/count matrices) regardless of `nbasis × ncomp`,
+# instead of the `O(nbasis × ncomp)` per-(i, c) `Vector` allocations a
+# `Matrix{Vector{…}}` shape would imply.
 #
-#   * map the raw dof to its global active id via the field layout;
-#   * if it is constrained (global id == 0), record `0`;
-#   * otherwise register the global id in `local_by_global` (a fresh
-#     local index per *distinct* global id) and record the local index.
+# For each `(i, c)`, the active branches are stored at
+# `active_pos_flat[active_offset[i, c]:(… + active_count[i, c] - 1)]`
+# with corresponding weights in `active_w_flat[…]`. Dirichlet branches
+# follow the same convention with `dir_*` arrays.
+#
+# In the integrated-Legendre regime — where every constrained raw is
+# either strongly eliminated or physically Dirichlet, and every free
+# raw has identity expansion — branch counts are 0 or 1, the flat
+# vectors total at most `nbasis × ncomp` entries, and the hot loop
+# does a single indexed read per (a, c) (matching today's per-emission
+# cost). Pivots with multi-element expansions (`m + 1` for B-spline
+# C^m boundaries) widen each pivot's branch count proportionally.
+struct LocalDofExpansion{T<:Real}
+    active_pos_flat::Vector{Int}
+    active_w_flat::Vector{T}
+    active_offset::Matrix{Int}
+    active_count::Matrix{Int}
+    dir_raw_flat::Vector{Int}
+    dir_w_flat::Vector{T}
+    dir_offset::Matrix{Int}
+    dir_count::Matrix{Int}
+end
+
+# Build the per-parent dof distribution table. For each `(raw, component)`
+# pair, walks the dof layer's `raw_expansion[raw]` list — typically
+# `[(raw, 1)]` for free raws, `[]` for strongly eliminated, and the
+# resolved pivot expression for linear-constraint pivots — and routes
+# each `(other_raw, weight)` entry to either the active branch
+# (`other_raw`'s component-active id is nonzero) or the Dirichlet
+# branch (`other_raw` is physically Dirichlet on this component). The
+# branches are appended to the flat per-table vectors; the
+# `active_offset`/`active_count` (and analogous `dir_*`) matrices
+# record where each `(i, c)`'s entries live.
 #
 # The shared `local_by_global` cache ensures that a dof shared between
 # two parents in the region gets the same local row/column on both —
@@ -220,7 +258,75 @@ end
 # position before being emitted as triplets. Used inside
 # `_assemble_region!` per region.
 function _local_parent_dofs!(active_dofs::Vector{Int}, local_by_global::Dict{Int,Int}, data,
-                             layout::FieldLayout)
+                             layout::FieldLayout{D,T}) where {D,T}
+    nbasis = length(data.raw_dofs)
+    ncomp = layout.components
+    expansion = layout.dofs.raw_expansion
+    dirichlet = layout.dofs.physical_dirichlet
+    # Pre-size to `nbasis · ncomp` — the count for the common
+    # length-1-expansion case (free raws and physical-Dirichlet raws).
+    # Pivoted raws (rare) may push past this capacity and trigger
+    # one Vector growth at most.
+    total = nbasis * ncomp
+    active_pos_flat = sizehint!(Int[], total)
+    active_w_flat = sizehint!(T[], total)
+    active_offset = Matrix{Int}(undef, nbasis, ncomp)
+    active_count = Matrix{Int}(undef, nbasis, ncomp)
+    dir_raw_flat = Int[]
+    dir_w_flat = T[]
+    dir_offset = Matrix{Int}(undef, nbasis, ncomp)
+    dir_count = Matrix{Int}(undef, nbasis, ncomp)
+
+    for i in 1:nbasis, component in 1:ncomp
+        raw = data.raw_dofs[i]
+        active_offset[i, component] = length(active_pos_flat) + 1
+        dir_offset[i, component] = length(dir_raw_flat) + 1
+        a_n = 0
+        d_n = 0
+        for (other, weight) in expansion[raw]
+            global_dof = _field_component_dof(layout, other, component)
+            if global_dof == 0
+                if dirichlet[other, component]
+                    push!(dir_raw_flat, other)
+                    push!(dir_w_flat, weight)
+                    d_n += 1
+                end
+            else
+                local_pos = get!(local_by_global, global_dof) do
+                    push!(active_dofs, global_dof)
+                    length(active_dofs)
+                end
+                push!(active_pos_flat, local_pos)
+                push!(active_w_flat, weight)
+                a_n += 1
+            end
+        end
+        active_count[i, component] = a_n
+        dir_count[i, component] = d_n
+    end
+    return LocalDofExpansion{T}(active_pos_flat, active_w_flat, active_offset, active_count,
+                                dir_raw_flat, dir_w_flat, dir_offset, dir_count)
+end
+
+# Lightweight per-parent dof table for the common case — every raw maps
+# to a single active local index (or to nothing when it is constrained).
+# Used when the layout has no non-trivial linear constraints
+# (`!has_linear_constraints`), i.e. the integrated Legendre family and
+# the C⁰ B-spline mesh-edge path, where `raw_expansion` is always the
+# identity or empty. For each `(raw, component)`:
+#
+#   * map the raw to its global active id via the field layout;
+#   * if it is constrained (global id == 0), record `0`;
+#   * otherwise register the global id in `local_by_global` (a fresh
+#     local index per *distinct* global id) and record the local index.
+#
+# Returning a plain `Matrix{Int}` keeps the per-parent allocation at one
+# array and lets the matching `_accumulate_qpoint!` overload emit each
+# triplet with a single indexed read — the pre-constraint-primitive
+# cost. The shared `local_by_global` cache ensures a dof shared between
+# two parents gets the same local row/column on both.
+function _local_parent_dofs_simple!(active_dofs::Vector{Int}, local_by_global::Dict{Int,Int}, data,
+                                    layout::FieldLayout)
     local_dofs = Matrix{Int}(undef, length(data.raw_dofs), layout.components)
     for i in eachindex(data.raw_dofs), component in 1:layout.components
         dof = _field_component_dof(layout, data.raw_dofs[i], component)
@@ -325,6 +431,12 @@ end
 
 Thread-local assembly scratch. Carries every buffer the hot loop needs:
 
+  - `bases[i]`     — basis family of level `i`. Looked up by level id so
+    the hot-loop `_fill_factor_tables!` dispatch resolves through one
+    abstract-container access per parent per quadrature point. The
+    container is `Vector{BasisFamily}` (abstract eltype) because a
+    superposition can mix families across levels; the JIT specializes
+    the callee per resolved type.
   - `local_ids[i]` — tensor-product multi-indices of level `i`'s basis.
   - `orders[i]`    — polynomial order tuple of level `i`'s basis.
   - `values[i]`, `gradients[i]` — per-level basis value / gradient
@@ -342,6 +454,7 @@ Constructed by [`_assembly_workspace`](@ref) once per thread (or once
 per assembly call in the serial path).
 """
 struct AssemblyWorkspace{D,T}
+    bases::Vector{BasisFamily}
     local_ids::Vector{Vector{CartesianIndex{D}}}
     orders::Vector{NTuple{D,Int}}
     values::Vector{Vector{T}}
@@ -360,6 +473,7 @@ end
 function _assembly_workspace(model::Model{D,T}) where {D,T}
     levels = model.problem.space.levels
     nlev = length(levels)
+    bases = Vector{BasisFamily}(undef, nlev)
     local_ids = Vector{Vector{CartesianIndex{D}}}(undef, nlev)
     orders = Vector{NTuple{D,Int}}(undef, nlev)
     values = Vector{Vector{T}}(undef, nlev)
@@ -369,6 +483,7 @@ function _assembly_workspace(model::Model{D,T}) where {D,T}
     for level in levels
         i = level.id
         ids = local_basis_indices(level.basis, level.order, level.mode)
+        bases[i] = level.basis
         local_ids[i] = ids
         orders[i] = level.order
         values[i] = Vector{T}(undef, length(ids))
@@ -376,7 +491,7 @@ function _assembly_workspace(model::Model{D,T}) where {D,T}
         val1d[i] = _factor_buffers(level.order, T)
         der1d[i] = _factor_buffers(level.order, T)
     end
-    return AssemblyWorkspace{D,T}(local_ids, orders, values, gradients, val1d, der1d, Int[],
+    return AssemblyWorkspace{D,T}(bases, local_ids, orders, values, gradients, val1d, der1d, Int[],
                                   Dict{Int,Int}(), T[], T[])
 end
 
@@ -404,8 +519,8 @@ function _update_region_basis!(ws::AssemblyWorkspace{D,T}, region::VolumeRegion{
         lvl = parent.level
         xi = reference_to_physical(parent.local_box, eta)
         scale = SVector{D,T}(2 .* inv.(edge_lengths(parent.parent_box)))
-        _tensor_values_grads!(ws.values[lvl], ws.gradients[lvl], ws.local_ids[lvl], ws.orders[lvl],
-                              xi, scale, ws.val1d[lvl], ws.der1d[lvl])
+        _tensor_values_grads!(ws.bases[lvl], ws.values[lvl], ws.gradients[lvl], ws.local_ids[lvl],
+                              ws.orders[lvl], xi, scale, ws.val1d[lvl], ws.der1d[lvl], parent.cell)
     end
     return nothing
 end
@@ -413,14 +528,32 @@ end
 # Build the per-field local-to-global dof table for this region against
 # the workspace's `active_dofs` / `local_by_global`. Both scratch
 # structures are cleared first so the result is per-region; the rebuilt
-# table is `local_by_field[field_index][parent_index]`, the matrix of
-# local row/column indices for that parent and field.
+# table is `local_by_field[field_index][parent_index]`.
+#
+# Two representations, chosen once per region by the layout's
+# `has_linear_constraints` flag:
+#
+#   * no linear constraints (the common case) → `Matrix{Int}` per parent
+#     (single active-or-constrained local index), matched by the
+#     lightweight `_accumulate_qpoint!` overload;
+#   * linear constraints present → `LocalDofExpansion` per parent, matched
+#     by the expansion-distributing overload.
+#
+# The branch makes the return type a small union; the per-quadrature-point
+# `_accumulate_qpoint!` call then resolves through one dispatch per region
+# rather than paying the general machinery's indirection on every emission.
 function _local_active_dof_table!(ws::AssemblyWorkspace, field_data, layout::SystemLayout)
     empty!(ws.active_dofs)
     empty!(ws.local_by_global)
-    return [[_local_parent_dofs!(ws.active_dofs, ws.local_by_global, data, field_layout)
-             for data in field_data[field_index]]
-            for (field_index, field_layout) in pairs(layout.fields)]
+    if has_linear_constraints(layout)
+        return [[_local_parent_dofs!(ws.active_dofs, ws.local_by_global, data, field_layout)
+                 for data in field_data[field_index]]
+                for (field_index, field_layout) in pairs(layout.fields)]
+    else
+        return [[_local_parent_dofs_simple!(ws.active_dofs, ws.local_by_global, data, field_layout)
+                 for data in field_data[field_index]]
+                for (field_index, field_layout) in pairs(layout.fields)]
+    end
 end
 
 """
@@ -486,8 +619,8 @@ function _assemble_region!(ws::AssemblyWorkspace{D,T}, rows::Vector{Int}, cols::
         q = (; x, weight=qweight, point=point_offset + local_qp, state, normal=nothing,
              sides=nothing)
         _update_region_basis!(ws, region, eta)
-        _accumulate_qpoint!(local_matrix, local_rhs, q, qweight, field_data, local_by_field, blocks,
-                            loads, symmetric, model, Val(D), T)
+        _accumulate_qpoint!(local_matrix, local_rhs, q, qweight, field_data, local_by_field,
+                            ws.active_dofs, blocks, loads, symmetric, model, Val(D), T)
     end
 
     # Emit the local system to the global COO triplets / rhs.
@@ -531,8 +664,8 @@ function _assemble_region!(ws::AssemblyWorkspace{D,T}, rows::Vector{Int}, cols::
         q = (; x, weight=qweight, point=point_offset + local_qp, state, normal=region.normal,
              sides=region.sides)
         _update_physical_basis!(ws, region.parents, x)
-        _accumulate_qpoint!(local_matrix, local_rhs, q, qweight, field_data, local_by_field, blocks,
-                            loads, symmetric, model, Val(D), T)
+        _accumulate_qpoint!(local_matrix, local_rhs, q, qweight, field_data, local_by_field,
+                            ws.active_dofs, blocks, loads, symmetric, model, Val(D), T)
     end
 
     _emit_local_system!(rows, cols, vals, rhs, ws.active_dofs, local_matrix, local_rhs)
@@ -552,8 +685,8 @@ function _update_physical_basis!(ws::AssemblyWorkspace{D,T}, parents, x::SVector
         lvl = parent.level
         xi = physical_to_reference(parent.parent_box, x)
         scale = SVector{D,T}(2 .* inv.(edge_lengths(parent.parent_box)))
-        _tensor_values_grads!(ws.values[lvl], ws.gradients[lvl], ws.local_ids[lvl], ws.orders[lvl],
-                              xi, scale, ws.val1d[lvl], ws.der1d[lvl])
+        _tensor_values_grads!(ws.bases[lvl], ws.values[lvl], ws.gradients[lvl], ws.local_ids[lvl],
+                              ws.orders[lvl], xi, scale, ws.val1d[lvl], ws.der1d[lvl], parent.cell)
     end
     return nothing
 end
@@ -592,8 +725,8 @@ function _assemble_region!(ws::AssemblyWorkspace{D,T}, rows::Vector{Int}, cols::
         q = (; x, weight=qweight, point=point_offset + local_qp, state,
              normal=region.normals[local_qp], sides=nothing)
         _update_physical_basis!(ws, region.parents, x)
-        _accumulate_qpoint!(local_matrix, local_rhs, q, qweight, field_data, local_by_field, blocks,
-                            loads, symmetric, model, Val(D), T)
+        _accumulate_qpoint!(local_matrix, local_rhs, q, qweight, field_data, local_by_field,
+                            ws.active_dofs, blocks, loads, symmetric, model, Val(D), T)
     end
 
     _emit_local_system!(rows, cols, vals, rhs, ws.active_dofs, local_matrix, local_rhs)
@@ -635,69 +768,98 @@ end
 # and facet hot loops share their inner work — every kind-specific
 # detail is contained in the caller (Q-point source, basis refresh,
 # `q` tuple shape).
-function _accumulate_qpoint!(local_matrix, local_rhs, q, qweight::T, field_data, local_by_field,
-                             blocks::B, loads::L, symmetric::Bool, model::Model{D,T}, ::Val{D},
-                             ::Type{T}) where {B,L,D,T}
-    # Loads: linear channels per test parent / dof into local rhs.
+#
+# Two overloads, selected by the per-region dof-table representation
+# built in `_local_active_dof_table!`:
+#
+#   * `LocalDofExpansion` tables → the general linear-constraint path,
+#     distributing each emission through the test and trial expansions
+#     (B-spline masks / `continuity_order ≥ 1`);
+#   * `Matrix{Int}` tables → the lightweight path for layouts with no
+#     non-trivial linear constraints (integrated Legendre and the C⁰
+#     B-spline mesh-edge path), where every raw has a single
+#     active-or-constrained target.
+#
+# Both overloads share one outer loop, `_accumulate_qpoint_generic!`;
+# only the per-emission kernels (`_emit_load!` / `_emit_block!`) differ,
+# and they dispatch statically on the concrete table type. These two thin
+# overloads are the per-quadrature-point dispatch barrier: `local_by_field`
+# is a small union at the call site, so resolving it here (once per point)
+# lets the generic body specialise on the concrete table type and inline
+# the right kernel — no per-emission dynamic dispatch.
+function _accumulate_qpoint!(local_matrix, local_rhs, q, qweight::T, field_data,
+                             local_by_field::AbstractVector{<:AbstractVector{<:LocalDofExpansion}},
+                             active_dofs::Vector{Int}, blocks::B, loads::L, symmetric::Bool,
+                             model::Model{D,T}, ::Val{D}, ::Type{T}) where {B,L,D,T}
+    return _accumulate_qpoint_generic!(local_matrix, local_rhs, q, qweight, field_data,
+                                       local_by_field, active_dofs, blocks, loads, symmetric, model,
+                                       Val(D), T)
+end
+
+function _accumulate_qpoint!(local_matrix, local_rhs, q, qweight::T, field_data,
+                             local_by_field::AbstractVector{<:AbstractVector{Matrix{Int}}},
+                             active_dofs::Vector{Int}, blocks::B, loads::L, symmetric::Bool,
+                             model::Model{D,T}, ::Val{D}, ::Type{T}) where {B,L,D,T}
+    return _accumulate_qpoint_generic!(local_matrix, local_rhs, q, qweight, field_data,
+                                       local_by_field, active_dofs, blocks, loads, symmetric, model,
+                                       Val(D), T)
+end
+
+# Shared quadrature-point accumulation: loads (linear channels → rhs)
+# then blocks (bilinear channels → matrix, with Dirichlet-column
+# elimination → rhs). Symmetric blocks emit only the lower triangle;
+# `_sparse_from_triplets` mirrors at the end. Walks the standard
+# field × component × parent × dof nest and defers every per-emission
+# decision to `_emit_load!` / `_emit_block!`, which the typed overloads
+# above specialise to the concrete `local_by_field` table type.
+function _accumulate_qpoint_generic!(local_matrix, local_rhs, q, qweight::T, field_data,
+                                     local_by_field, active_dofs::Vector{Int}, blocks::B, loads::L,
+                                     symmetric::Bool, model::Model{D,T}, ::Val{D},
+                                     ::Type{T}) where {B,L,D,T}
     for load in loads
         test_index = _field_index(model.dofs, load.test_name)
         test_layout = model.dofs.fields[test_index]
         test_data = field_data[test_index]
-        local_rows_by_parent = local_by_field[test_index]
-
+        test_tables = local_by_field[test_index]
         for test_component in 1:test_layout.components
             linear_channels = _linear_channels(load.form, q, test_component, Val(D), T)
-
-            for (data, local_rows) in zip(test_data, local_rows_by_parent)
+            for (data, table) in zip(test_data, test_tables)
                 for a in eachindex(data.raw_dofs)
-                    local_row = local_rows[a, test_component]
-                    local_row == 0 && continue
-                    local_rhs[local_row] += qweight *
-                                            _test_contribution(linear_channels, data.values[a],
-                                                               data.gradients[a])
+                    contribution = qweight * _test_contribution(linear_channels, data.values[a],
+                                                                data.gradients[a])
+                    _emit_load!(local_rhs, table, a, test_component, contribution)
                 end
             end
         end
     end
 
-    # Blocks: bilinear channels per (trial × test) pair into local
-    # matrix; Dirichlet-column elimination redirects constrained-trial
-    # contributions onto the rhs.
     for block in blocks
         test_index = _field_index(model.dofs, block.test_name)
         trial_index = _field_index(model.dofs, block.trial_name)
         test_layout = model.dofs.fields[test_index]
         trial_layout = model.dofs.fields[trial_index]
-
         for trial_component in 1:trial_layout.components
-            for (trial_data, local_cols) in
+            for (trial_data, trial_table) in
                 zip(field_data[trial_index], local_by_field[trial_index])
                 for b in eachindex(trial_data.raw_dofs)
-                    col = _field_component_dof(trial_layout, trial_data.raw_dofs[b],
-                                               trial_component)
                     trial = TrialChannels(trial_component, trial_data.values[b],
                                           trial_data.gradients[b])
-
+                    # Trial-side data invariant across test dofs, hoisted
+                    # once per trial dof: the active-branch offsets for an
+                    # expansion table, or the global/local column for a
+                    # matrix table.
+                    tctx = _trial_block_context(trial_table, trial_data, trial_layout, b,
+                                                trial_component)
                     for test_component in 1:test_layout.components
                         channels = _bilinear_channels(block.form, q, trial, test_component)
-                        for (test_data, local_rows) in
+                        for (test_data, test_table) in
                             zip(field_data[test_index], local_by_field[test_index])
                             for a in eachindex(test_data.raw_dofs)
-                                row = _field_component_dof(test_layout, test_data.raw_dofs[a],
-                                                           test_component)
-                                row == 0 && continue
-                                symmetric && col != 0 && row < col && continue
                                 entry = qweight * _test_contribution(channels, test_data.values[a],
                                                                      test_data.gradients[a])
-                                local_row = local_rows[a, test_component]
-                                if col == 0
-                                    local_rhs[local_row] -= entry *
-                                                            constrained_value(trial_layout.dofs,
-                                                                              trial_data.raw_dofs[b],
-                                                                              trial_component)
-                                else
-                                    local_matrix[local_row, local_cols[b, trial_component]] += entry
-                                end
+                                _emit_block!(local_matrix, local_rhs, test_table, test_data,
+                                             test_layout, tctx, a, test_component, entry, symmetric,
+                                             active_dofs)
                             end
                         end
                     end
@@ -705,7 +867,98 @@ function _accumulate_qpoint!(local_matrix, local_rhs, q, qweight::T, field_data,
             end
         end
     end
+    return nothing
+end
 
+# ── Per-emission kernels (one pair each for the two table types) ──────────────
+
+# Distribute one test dof's linear (load) contribution into the rhs.
+# Expansion table: fan the contribution out across the dof's active
+# branches. Matrix table: a single active row (skip if constrained).
+@inline function _emit_load!(local_rhs, table::LocalDofExpansion, a::Int, c::Int, contribution)
+    base = table.active_offset[a, c] - 1
+    @inbounds for k in 1:table.active_count[a, c]
+        local_rhs[table.active_pos_flat[base + k]] += table.active_w_flat[base + k] * contribution
+    end
+    return nothing
+end
+
+@inline function _emit_load!(local_rhs, table::Matrix{Int}, a::Int, c::Int, contribution)
+    local_row = table[a, c]
+    local_row == 0 && return nothing
+    local_rhs[local_row] += contribution
+    return nothing
+end
+
+# Per-trial-dof context, hoisted out of the test-dof loop. Expansion
+# table: the trial dof's active and Dirichlet branch slices. Matrix
+# table: the trial dof's global active id (`col`, 0 if constrained) and
+# its local column. Both carry `trial_layout.dofs` (for `constrained_value`)
+# and the trial component. Returned as a `NamedTuple` so it inlines with
+# no allocation; the two `_emit_block!` kernels read the fields each needs.
+@inline function _trial_block_context(trial_table::LocalDofExpansion, trial_data, trial_layout,
+                                      b::Int, trc::Int)
+    return (base=trial_table.active_offset[b, trc] - 1, n=trial_table.active_count[b, trc],
+            dbase=trial_table.dir_offset[b, trc] - 1, dn=trial_table.dir_count[b, trc],
+            posflat=trial_table.active_pos_flat, wflat=trial_table.active_w_flat,
+            dwflat=trial_table.dir_w_flat, drawflat=trial_table.dir_raw_flat,
+            dofs=trial_layout.dofs, trc=trc)
+end
+
+@inline function _trial_block_context(trial_table::Matrix{Int}, trial_data, trial_layout, b::Int,
+                                      trc::Int)
+    return (col=_field_component_dof(trial_layout, trial_data.raw_dofs[b], trc),
+            localcol=trial_table[b, trc], raw=trial_data.raw_dofs[b], dofs=trial_layout.dofs,
+            trc=trc)
+end
+
+# Emit one (test a, trial b) bilinear contribution; `tctx` is the trial
+# dof's hoisted context. Expansion table: distribute `entry` through the
+# test × trial active branches into the matrix and the trial Dirichlet
+# branches into the rhs (column elimination). The symmetric lower-triangle
+# skip compares the *global* active ids of the two branches, since a
+# pivot's branches can land at different ids.
+@inline function _emit_block!(local_matrix, local_rhs, test_table::LocalDofExpansion, test_data,
+                              test_layout, tctx, a::Int, tc::Int, entry, symmetric::Bool,
+                              active_dofs::Vector{Int})
+    test_base = test_table.active_offset[a, tc] - 1
+    test_n = test_table.active_count[a, tc]
+    @inbounds for kr in 1:test_n
+        test_local = test_table.active_pos_flat[test_base + kr]
+        tw = test_table.active_w_flat[test_base + kr]
+        for kc in 1:tctx.n
+            trial_local = tctx.posflat[tctx.base + kc]
+            symmetric && active_dofs[test_local] < active_dofs[trial_local] && continue
+            local_matrix[test_local, trial_local] += tw * tctx.wflat[tctx.base + kc] * entry
+        end
+        for kd in 1:tctx.dn
+            local_rhs[test_local] -= tw *
+                                     tctx.dwflat[tctx.dbase + kd] *
+                                     entry *
+                                     constrained_value(tctx.dofs, tctx.drawflat[tctx.dbase + kd],
+                                                       tctx.trc)
+        end
+    end
+    return nothing
+end
+
+# Matrix-table variant: a single (row, col) target. Skip a constrained
+# test row; redirect a constrained trial column to the rhs via Dirichlet
+# elimination (`constrained_value` is zero for homogeneous overlay
+# constraints, so those columns vanish). `local_row == 0` ⇔ the test
+# global id is 0, so it doubles as the constrained-test check.
+@inline function _emit_block!(local_matrix, local_rhs, test_table::Matrix{Int}, test_data,
+                              test_layout, tctx, a::Int, tc::Int, entry, symmetric::Bool,
+                              active_dofs::Vector{Int})
+    local_row = test_table[a, tc]
+    local_row == 0 && return nothing
+    row = _field_component_dof(test_layout, test_data.raw_dofs[a], tc)
+    symmetric && tctx.col != 0 && row < tctx.col && return nothing
+    if tctx.col == 0
+        local_rhs[local_row] -= entry * constrained_value(tctx.dofs, tctx.raw, tctx.trc)
+    else
+        local_matrix[local_row, tctx.localcol] += entry
+    end
     return nothing
 end
 

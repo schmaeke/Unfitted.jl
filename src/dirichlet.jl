@@ -61,17 +61,25 @@ end
 
 # ── Physical-boundary key detection ───────────────────────────────────────────
 
-# True iff the dof key sits on the requested physical-domain face. A key
-# can be on a face only if its axis-`axis` factor is a `_AXIS_NODE` (span
-# modes don't touch axis-perpendicular faces) and its coordinate matches
-# the face's coordinate up to `tol.contain`.
+# True iff the dof key sits on the requested physical-domain face.
+# Composed from two family-aware primitives so it works for any basis
+# family that implements [`_key_on_level_side`](@ref):
+#
+#   1. The key's per-axis factor must anchor on the level's mesh edge
+#      at (`axis`, `side`). Family-specific check.
+#   2. The level's mesh edge at (`axis`, `side`) must coincide with the
+#      physical-domain edge up to `tol.contain`. Pure geometry check.
+#
+# Equivalent to the previous coordinate-matching formulation for the
+# integrated Legendre family (mesh-axis-node coordinate equals
+# `mesh.axes[axis][1]` or `[end]`, and those coincide with the domain
+# edge iff `_level_side_is_physical`); the new formulation generalizes
+# to any family whose boundary-mode classification lives in
+# `_key_on_level_side`.
 function _key_on_physical_side(key::TensorDofKey{D}, level::Level{D,T}, domain::AxisBox{D,T},
                                axis::Integer, side::Symbol, tol::GeometryTolerance{T}) where {D,T}
-    x = _node_coordinate(level, key, axis)
-    x === nothing && return false
-    side === :lower && return _coordinate_matches(x, domain.lower[axis], tol)
-    side === :upper && return _coordinate_matches(x, domain.upper[axis], tol)
-    throw(ArgumentError("boundary side must be :lower or :upper"))
+    _key_on_level_side(key, level, axis, side) || return false
+    return _level_side_is_physical(level, domain, axis, side, tol)
 end
 
 # True iff the dof key sits on *any* of the 2D codim-1 physical faces.
@@ -408,7 +416,7 @@ end
 # ── Boundary trace evaluation ─────────────────────────────────────────────────
 
 """
-    boundary_trace_data(level, raw_dofs, sides, xi) -> NamedTuple
+    boundary_trace_data(level, raw_dofs, sides, xi, cell) -> NamedTuple
 
 Evaluate the basis traces of `level` on the codim-K facet identified by
 `sides`. Returns a `NamedTuple` with two fields:
@@ -419,13 +427,21 @@ Evaluate the basis traces of `level` on the codim-K facet identified by
   - `values::Vector{T}` — corresponding tensor-product basis values at
     reference point `xi` on the parent cell.
 
+`cell::CartesianIndex{D}` is the parent cell's mesh-index along each
+axis. Integrated Legendre ignores it (the 1D modes are cell-local in
+the reference frame); the B-spline family in the extension uses it to
+pick the right knot-vector span when computing the trace. Callers
+should pass the parent's own cell — `_project_dirichlet_values!`
+already has it as `parent.cell`.
+
 For integrated Legendre, `is_facet_basis` reduces to "every 1D mode
 along a constrained axis equals the boundary mode" — the trace is the
 straightforward tensor product of `integrated_legendre_value` factors.
 The fallback method throws for any other basis family.
 """
 function boundary_trace_data(level::Level{D,T,<:IntegratedLegendre}, raw_dofs::Vector{Int},
-                             sides::Vector{Tuple{Int,Symbol}}, xi::SVector{D,T}) where {D,T}
+                             sides::Vector{Tuple{Int,Symbol}}, xi::SVector{D,T},
+                             ::CartesianIndex{D}) where {D,T}
     local_ids = local_basis_indices(level.basis, level.order, level.mode)
     raws = Int[]
     values = T[]
@@ -440,7 +456,8 @@ function boundary_trace_data(level::Level{D,T,<:IntegratedLegendre}, raw_dofs::V
 end
 
 function boundary_trace_data(level::Level{D,T,B}, raw_dofs::Vector{Int},
-                             sides::Vector{Tuple{Int,Symbol}}, xi::SVector{D,T}) where {D,T,B}
+                             sides::Vector{Tuple{Int,Symbol}}, xi::SVector{D,T},
+                             ::CartesianIndex{D}) where {D,T,B}
     throw(ArgumentError("boundary trace projection is not implemented for basis family $(basis_name(level.basis))"))
 end
 
@@ -507,7 +524,7 @@ function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T}, diric
                         level = _level_by_id(V, parent.level)
                         raw_dofs = cell_dofs(layout, parent.level, parent.cell)
                         xi = physical_to_reference(parent.parent_box, x)
-                        boundary_trace_data(level, raw_dofs, sides, xi)
+                        boundary_trace_data(level, raw_dofs, sides, xi, parent.cell)
                     end
 
                     # RHS: ∫_∂Ω g v dx contributions for every component

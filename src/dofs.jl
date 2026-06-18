@@ -69,6 +69,30 @@ struct TensorDofKey{D}
 end
 
 """
+    LinearConstraint{T}
+
+A homogeneous linear constraint among raw dofs of one level:
+
+    Σᵢ coefficientsᵢ · u_{rawsᵢ} = 0
+
+Applies uniformly to every field component (overlay constraints don't
+distinguish components). Used by [`_overlay_constraints`](@ref) to
+encode trace-vanishing conditions at artificial boundaries; the dof
+layer resolves the resulting constraint system into a `raw_expansion`
+table via cascade elimination in [`_resolve_constraints!`](@ref).
+
+A single-raw constraint (`length(raws) == 1`, coefficient `1`) is
+strong elimination of that raw — the regime integrated Legendre uses.
+Multi-raw constraints (typical for B-splines with arbitrary masks or
+higher continuity) couple `p + 1` raws per perpendicular line per
+derivative order.
+"""
+struct LinearConstraint{T<:Real}
+    raws::Vector{Int}
+    coefficients::Vector{T}
+end
+
+"""
     DofLayout{D,T}
 
 Basis-aware global dof numbering for a single field over a superposition
@@ -100,7 +124,35 @@ Fields:
   - `overlay_constraint::Vector{Bool}` — `raw → true` iff raw dof `raw`
     carries an artificial overlay constraint. Overlay constraints
     apply to every component simultaneously (the overlay function is
-    constrained to vanish on its artificial boundary).
+    constrained to vanish on its artificial boundary). Derived from
+    `raw_expansion` below; cached for fast queries during active
+    enumeration and diagnostics.
+  - `raw_expansion::Vector{Vector{Tuple{Int,T}}}` — for each raw, the
+    list of `(other_raw, weight)` pairs that express the raw's value
+    in terms of *non-pivot* raws after constraint resolution. Three
+    regimes:
+      - free raw → `[(raw, 1)]` (identity);
+      - strongly eliminated raw (single-raw constraint, the
+        integrated-Legendre case) → `[]`;
+      - linear-constraint pivot → multi-element list; B-spline overlay
+        boundaries with continuity order `m` produce `m + 1`-element
+        lists per perpendicular line.
+    The assembly hot loop distributes each emitted matrix triplet
+    through both the test and trial expansions, so the strong-
+    elimination case (empty list) skips emission and the free case is
+    the identity. See [`_resolve_constraints!`](@ref) for the
+    construction algorithm.
+  - `has_linear_constraints::Bool` — `true` iff any raw has a
+    *non-trivial* expansion (neither the identity `[(raw, 1)]` nor the
+    empty strong-elimination list `[]`), i.e. a linear-constraint pivot
+    that redistributes a raw onto one or more *other* raws. The
+    integrated Legendre family and the C⁰ B-spline mesh-edge path never
+    produce such expansions, so this is `false` for them and assembly
+    takes the lightweight single-target path; B-spline linear
+    constraints (masks, `continuity_order ≥ 1`, overlay interiors) set
+    it `true` and assembly takes the expansion-distributing path. The
+    flag lets the hot loop pick the cheaper path without paying the
+    general machinery's per-emission indirection on the common case.
   - `constrained_values::Matrix{T}` — `(raw, component) → value` for
     constrained dofs. Filled by [`_project_dirichlet_values!`](@ref)
     for nonzero physical Dirichlet data; zero otherwise.
@@ -117,6 +169,8 @@ struct DofLayout{D,T<:Real}
     active_component::Matrix{Int}
     physical_dirichlet::Matrix{Bool}
     overlay_constraint::Vector{Bool}
+    raw_expansion::Vector{Vector{Tuple{Int,T}}}
+    has_linear_constraints::Bool
     constrained_values::Matrix{T}
     active_count::Int
     tolerance::GeometryTolerance{T}
@@ -124,8 +178,19 @@ end
 
 # Tag values for `AxisDofKey.kind`. `UInt8` keeps the key compact and
 # fast to hash; the values themselves are arbitrary.
+#
+#   _AXIS_NODE   — integrated Legendre endpoint mode at a cell-corner
+#                  node coordinate.
+#   _AXIS_SPAN   — integrated Legendre interior (bubble) mode, cell-local.
+#   _AXIS_BSPLINE — global 1D B-spline function index along the axis;
+#                  used by the B-spline family in
+#                  `ext/UnfittedBasicBSplineExt.jl`. Reserved here so
+#                  the integrated-Legendre keys and B-spline keys live
+#                  in disjoint tag ranges and the dof-key cache can
+#                  share its hash table across mixed-basis problems.
 const _AXIS_NODE = UInt8(0)
 const _AXIS_SPAN = UInt8(1)
+const _AXIS_BSPLINE = UInt8(2)
 
 # Build the per-axis dof key for cell `cell_axis` and 1D mode `mode` in
 # the integrated Legendre basis. Modes 0 and 1 are the two endpoint
@@ -186,22 +251,23 @@ end
 # the physical-Dirichlet detection in `dirichlet.jl`.
 _coordinate_matches(a::Real, b::Real, tol::GeometryTolerance) = abs(a - b) <= tol.contain
 
-# Coordinate of a `_AXIS_NODE` dof key along `axis`. Returns `nothing`
-# for `_AXIS_SPAN` keys (which don't sit at a specific axis coordinate).
-# Used by the physical-side detection in `dirichlet.jl`.
-function _node_coordinate(level::Level, key::TensorDofKey{D}, axis::Integer) where {D}
-    axis_key = key.axes[axis]
-    axis_key.kind == _AXIS_NODE || return nothing
-    return level.mesh.axes[axis][axis_key.index]
-end
-
 # ── Artificial overlay-boundary detection ─────────────────────────────────────
 
-# True iff the `_AXIS_NODE` factor of the key sits at the level mesh's
-# lower (`side = :lower`, index 1) or upper (`side = :upper`, index
-# `cells[axis] + 1`) extent along `axis`.
-function _key_on_level_side(key::TensorDofKey{D}, level::Level{D}, axis::Integer,
-                            side::Symbol) where {D}
+# True iff the per-axis factor of `key` along `axis` anchors at the
+# level's lower (`side = :lower`) or upper (`side = :upper`) mesh edge.
+# Dispatched on the level's basis family so each family's "boundary
+# mode" convention is local to its own implementation. Used by
+# `_key_on_physical_side` and `_has_overlay_constraint` to translate
+# "is this dof at a face" into a basis-family-specific predicate without
+# leaking the family's mode-index conventions into the rest of the dof
+# layer.
+#
+# Integrated Legendre: only `_AXIS_NODE` keys touch a mesh edge —
+# `_AXIS_NODE.index == 1` (lower) or `cells[axis] + 1` (upper). Bubbles
+# never touch any edge. B-spline overloads live in
+# `ext/UnfittedBasicBSplineExt.jl`.
+function _key_on_level_side(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
+                            axis::Integer, side::Symbol) where {D,T}
     axis_key = key.axes[axis]
     axis_key.kind == _AXIS_NODE || return false
     side === :lower && return axis_key.index == 1
@@ -249,8 +315,14 @@ end
 # cells immediately below (`i − 1`) and above (`i`) the candidate face
 # along `axis`. A change in activity ⇒ the face is between an active
 # and an inactive cell of the level, i.e. an active-region face.
-function _on_active_face(key::TensorDofKey{D}, level::Level{D}, axis::Integer, i::Integer,
-                         n::NTuple{D,Int}) where {D}
+#
+# Integrated-Legendre-specific: the node-to-cell support map and the
+# `_AXIS_NODE` / `_AXIS_SPAN` perpendicular incidence rules are
+# integrated-Legendre conventions. The B-spline family in the extension
+# rolls its own active-face check tied to the function's actual support
+# span, which can spread across many cells.
+function _on_active_face(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
+                         axis::Integer, i::Integer, n::NTuple{D,Int}) where {D,T}
     ranges = ntuple(D) do d
         if d == axis
             1:1
@@ -285,8 +357,14 @@ end
 # With `mask === nothing` the active region equals the level's mesh
 # box, only mesh-box faces matter, and this reduces to the original
 # overlay-boundary rule from the paper.
-function _has_overlay_constraint(key::TensorDofKey{D}, level::Level{D,T}, domain::AxisBox{D,T},
-                                 tol::GeometryTolerance{T}) where {D,T}
+#
+# Dispatched on the level's basis family. The integrated-Legendre body
+# below uses the family's node/span index conventions directly; the
+# B-spline overload in `ext/UnfittedBasicBSplineExt.jl` does the same
+# job with B-spline function-index conventions and the C⁰-knot
+# treatment of mask-induced internal junctions.
+function _has_overlay_constraint(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
+                                 domain::AxisBox{D,T}, tol::GeometryTolerance{T}) where {D,T}
     n = level.mesh.cells
     for axis in 1:D
         axis_key = key.axes[axis]
@@ -315,6 +393,179 @@ function _has_overlay_constraint(key::TensorDofKey{D}, level::Level{D,T}, domain
     return false
 end
 
+# ── Linear-constraint collection and resolution ──────────────────────────────
+
+"""
+    _overlay_constraints(level, V, tol, raw_by_key, level_keys) -> Vector{LinearConstraint{T}}
+
+Produce the homogeneous linear constraints that encode `level`'s
+artificial-overlay-boundary trace condition. Dispatched on the level's
+basis family so each family can exploit its own boundary mode structure.
+
+The default fallback walks `level_keys` (the `(key, raw)` pairs that
+belong to this level, pre-bucketed by [`dof_layout`](@ref) so the scan
+is `O(this level's raws)` rather than `O(all raws)` per level), asks the
+family's [`_has_overlay_constraint`](@ref) predicate per raw, and emits a
+*single-raw* constraint `1 · u_raw = 0` for every boundary raw. This is
+strong elimination of the boundary node — the regime the integrated
+Legendre family relies on.
+
+The B-spline family overrides this fallback (dispatching on
+`Level{…,<:BSplineFamily}`) to produce *multi-raw* constraints expressing
+the C^m trace-vanishing condition along every artificial perpendicular
+line, exploiting the tensor-product structure of the B-spline basis to
+factor `m + 1` constraints per perpendicular line at each artificial
+face. The B-spline family therefore never uses this fallback or the
+per-raw `_has_overlay_constraint`; it reaches through `raw_by_key`
+directly to look up raw ids by (cell, mode), and ignores `level_keys`.
+
+`raw_by_key` is the global `TensorDofKey` → raw-id map built in stage 1
+of [`dof_layout`](@ref).
+"""
+function _overlay_constraints(level::Level{D,T,B}, V::Space{D,T}, tol::GeometryTolerance{T},
+                              raw_by_key::AbstractDict{TensorDofKey{D},Int},
+                              level_keys::AbstractVector{Pair{TensorDofKey{D},Int}}) where {D,T,B}
+    constraints = LinearConstraint{T}[]
+    for (key, raw) in level_keys
+        _has_overlay_constraint(key, level, V.domain, tol) || continue
+        push!(constraints, LinearConstraint{T}([raw], [one(T)]))
+    end
+    return constraints
+end
+
+# Combine repeated raws in a list of `(raw, coefficient)` pairs by
+# summing the coefficients, dropping terms whose coefficient falls
+# below the working tolerance. Pure-data helper consumed by the
+# cascade resolver below; sorts in place for compactness.
+function _combine_terms(terms::Vector{Tuple{Int,T}}) where {T}
+    length(terms) <= 1 && return terms
+    sort!(terms; by=first)
+    write = 1
+    @inbounds for read in 2:length(terms)
+        if terms[read][1] == terms[write][1]
+            terms[write] = (terms[write][1], terms[write][2] + terms[read][2])
+        else
+            write += 1
+            terms[write] = terms[read]
+        end
+    end
+    resize!(terms, write)
+    drop_tol = sqrt(eps(T)) * maximum(t -> abs(t[2]), terms; init=one(T))
+    filter!(t -> abs(t[2]) > drop_tol, terms)
+    return terms
+end
+
+# Back-substitute a freshly created pivot's expansion into every other
+# pivot's expansion that mentions the new pivot raw. Necessary because
+# our greedy pivot ordering doesn't guarantee that a constraint's pivot
+# choice is downstream of all its references — when a later constraint
+# pivots a raw that an earlier pivot's expansion still mentions, the
+# earlier expansion needs the substitution to stay in "free raws only"
+# form. Cascade depth is bounded by the spatial dimension `D` for our
+# overlay-boundary constraints, so the total back-substitution work is
+# `O(K · D · p)` across all constraints — negligible at problem scale.
+function _back_substitute!(raw_expansion::Vector{Vector{Tuple{Int,T}}}, pivot_raw::Int,
+                           pivot_expansion::Vector{Tuple{Int,T}},
+                           pivoted::AbstractVector{Bool}) where {T}
+    @inbounds for raw in eachindex(raw_expansion)
+        raw == pivot_raw && continue
+        pivoted[raw] || continue
+        expansion = raw_expansion[raw]
+        # Quick check: does this expansion mention the new pivot?
+        any(t -> first(t) == pivot_raw, expansion) || continue
+        # Rebuild with substitution.
+        new_terms = Tuple{Int,T}[]
+        sizehint!(new_terms, length(expansion) + length(pivot_expansion))
+        for (other, w) in expansion
+            if other == pivot_raw
+                for (sub_other, sub_w) in pivot_expansion
+                    push!(new_terms, (sub_other, w * sub_w))
+                end
+            else
+                push!(new_terms, (other, w))
+            end
+        end
+        raw_expansion[raw] = _combine_terms(new_terms)
+    end
+    return raw_expansion
+end
+
+"""
+    _resolve_constraints!(raw_expansion, constraints, nraw) -> raw_expansion
+
+Resolve a list of homogeneous linear constraints into the per-raw
+expansion table `raw_expansion`, mutated in place.
+
+After resolution every entry is either
+
+  - `[(raw, 1)]` — the raw is *free*, identity expansion,
+  - `[]` — the raw is *strongly eliminated* (single-raw constraint),
+  - `[(rᵢ, wᵢ), …]` — the raw is a *linear-constraint pivot*, expressed
+    in terms of currently-free raws via `u_raw = Σᵢ wᵢ u_rᵢ`.
+
+The algorithm is the classical sparse Gauss elimination, adapted to
+exploit the small constraint matrix's structure:
+
+  1. For each constraint, substitute already-resolved pivot expressions
+     into the constraint's terms (so the constraint is in free-raws +
+     yet-to-resolve raws).
+  2. Combine like terms and drop near-zeros; skip the constraint
+     entirely if it collapses to `0 = 0`.
+  3. Pick a pivot by largest absolute coefficient (numerical stability).
+  4. Express the pivot as a linear combination of the remaining
+     coefficients' raws.
+  5. Back-substitute the pivot into every earlier pivot's expansion
+     that mentions the new pivot raw.
+
+Step 5 keeps the invariant: at any point after a constraint has been
+processed, *every pivot's expansion is in terms of currently-free raws
+only*. Assembly emission then never needs to chase chains.
+
+The cascade depth of overlay-boundary constraints is bounded by the
+spatial dimension `D` — a corner raw of the active region touches at
+most `D` boundary axes — so total resolution cost is `O(K · D · p)`
+where `K` is the constraint count and `p` is the per-constraint raw
+count.
+"""
+function _resolve_constraints!(raw_expansion::Vector{Vector{Tuple{Int,T}}},
+                               constraints::Vector{LinearConstraint{T}}, nraw::Int) where {T}
+    # Identity start: every raw is its own expansion.
+    for raw in 1:nraw
+        raw_expansion[raw] = [(raw, one(T))]
+    end
+    pivoted = falses(nraw)
+
+    for constraint in constraints
+        # 1) Substitute already-pivoted raws.
+        terms = Tuple{Int,T}[]
+        sizehint!(terms, length(constraint.raws))
+        for (raw, coeff) in zip(constraint.raws, constraint.coefficients)
+            for (other, w) in raw_expansion[raw]
+                push!(terms, (other, coeff * w))
+            end
+        end
+
+        # 2) Combine like terms; trivially satisfied constraints fall away.
+        combined = _combine_terms(terms)
+        isempty(combined) && continue
+
+        # 3) Pick pivot by largest |coefficient| (numerical stability).
+        _, pivot_pos = findmax(t -> abs(t[2]), combined)
+        pivot_raw, pivot_coeff = combined[pivot_pos]
+
+        # 4) Build the pivot expansion (in terms of remaining raws).
+        new_expansion = Tuple{Int,T}[(raw, -c / pivot_coeff)
+                                     for (k, (raw, c)) in pairs(combined) if k != pivot_pos]
+
+        raw_expansion[pivot_raw] = new_expansion
+        pivoted[pivot_raw] = true
+
+        # 5) Back-substitute into earlier pivots that mention this raw.
+        _back_substitute!(raw_expansion, pivot_raw, new_expansion, pivoted)
+    end
+    return raw_expansion
+end
+
 # ── DofLayout construction and accessors ──────────────────────────────────────
 
 # Active global id of component `component` of raw dof `raw`, or 0 if
@@ -327,19 +578,24 @@ end
     dof_layout(V::Space; dirichlet=[], tolerance=GeometryTolerance(T), components=1) -> DofLayout
 
 Construct the basis-aware global dof layout for a superposition
-[`Space`](@ref). The construction proceeds in three stages:
+[`Space`](@ref). The construction proceeds in four stages:
 
   1. Walk every level's cells in order and build the cell-local raw dof
      id vector through `TensorDofKey` lookup. Adjacent cells share
      endpoint nodes; bubble (span) modes are cell-local. Inactive cells
      get an empty vector.
-  2. For every raw dof, run the constraint detectors
-     ([`_has_overlay_constraint`](@ref) and
-     [`_has_physical_dirichlet`](@ref) per component) to fill the
-     `overlay_constraint` and `physical_dirichlet` matrices.
-  3. Enumerate active dofs component-major (component 1 first, then
+  2. Collect homogeneous linear constraints from every level via the
+     family-dispatched [`_overlay_constraints`](@ref) hook, then resolve
+     them into the per-raw expansion table via
+     [`_resolve_constraints!`](@ref). The resulting
+     `raw_expansion[raw]` is either the identity `[(raw, 1)]` for free
+     raws, the empty list `[]` for strongly eliminated raws, or a
+     multi-element list for linear-constraint pivots.
+  3. Per-component physical Dirichlet detection via
+     [`_has_physical_dirichlet`](@ref).
+  4. Enumerate active dofs component-major (component 1 first, then
      component 2, …) skipping every (raw, component) entry that is
-     either physically Dirichlet-constrained or overlay-constrained.
+     either physically Dirichlet-constrained or a constraint pivot.
      Project nonzero Dirichlet data onto the boundary trace space via
      [`_project_dirichlet_values!`](@ref).
 
@@ -349,9 +605,13 @@ Keyword arguments:
   - `tolerance` — `GeometryTolerance` used by boundary detection.
   - `components` — scalar channels per field (≥ 1).
 
-The current implementation supports the integrated Legendre basis and
-dof-wise homogeneous overlay constraints; other basis families are
-expected to plug in via the [`_tensor_dof_key`](@ref) dispatch.
+The integrated Legendre family produces single-raw constraints,
+reducing the resolved expansion to strong elimination (`raw_expansion =
+[]` for the pivoted raw); the assembly path then behaves bit-identically
+to the pre-constraint-primitive code. B-spline families produce
+multi-raw constraints encoding the C^m trace-vanishing condition on
+artificial boundaries; the assembly path distributes triplets through
+the expansion automatically.
 """
 function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
                     components::Integer=1) where {D,T}
@@ -374,15 +634,42 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
         cell_dofs_by_level[level_index] = level_cells
     end
 
-    # Stage 2: classify every raw dof against the two constraint kinds.
-    ncomp = Int(components)
+    # Stage 2: collect linear constraints per level and resolve to expansions.
+    # Bucket the raw keys by level once so each level's constraint hook
+    # scans only its own raws (O(total raws) overall, not O(levels × raws)).
     nraw = length(raw_keys)
-    physical_dirichlet = falses(nraw, ncomp)
-    overlay_constraint = falses(nraw)
+    keys_by_level = Dict{Int,Vector{Pair{TensorDofKey{D},Int}}}()
+    for (key, raw) in raw_by_key
+        push!(get!(() -> Pair{TensorDofKey{D},Int}[], keys_by_level, key.level), key => raw)
+    end
+    empty_keys = Pair{TensorDofKey{D},Int}[]
+    constraints = LinearConstraint{T}[]
+    for level in V.levels
+        level_keys = get(keys_by_level, level.id, empty_keys)
+        append!(constraints, _overlay_constraints(level, V, tolerance, raw_by_key, level_keys))
+    end
+    raw_expansion = Vector{Vector{Tuple{Int,T}}}(undef, nraw)
+    _resolve_constraints!(raw_expansion, constraints, nraw)
+    # A raw is "pivoted" (i.e. carries the overlay constraint flag the
+    # `overlay_constraint::Vector{Bool}` field caches) iff its resolved
+    # expansion is anything other than the trivial identity `[(raw, 1)]`.
+    overlay_constraint = [length(e) != 1 || e[1] != (raw, one(T))
+                          for (raw, e) in pairs(raw_expansion)]
+    # A raw is "simple" if its expansion is either the identity
+    # `[(raw, 1)]` (free) or empty `[]` (strongly eliminated) — both
+    # the lightweight assembly path represents directly as a single
+    # active-or-constrained local target. Any other expansion (a
+    # redirect onto other raws) is a genuine linear constraint and
+    # forces the expansion-distributing assembly path.
+    has_linear_constraints = any(pairs(raw_expansion)) do (raw, e)
+        !(isempty(e) || (length(e) == 1 && e[1] == (raw, one(T))))
+    end
 
+    # Stage 3: per-component physical Dirichlet detection.
+    ncomp = Int(components)
+    physical_dirichlet = falses(nraw, ncomp)
     for (raw, key) in pairs(raw_keys)
         level = _level_by_id(V, key.level)
-        overlay_constraint[raw] = _has_overlay_constraint(key, level, V.domain, tolerance)
         for component in 1:ncomp
             physical_dirichlet[raw, component] = _has_physical_dirichlet(key, level, V.domain,
                                                                          dirichlet, tolerance,
@@ -390,7 +677,7 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
         end
     end
 
-    # Stage 3: enumerate active dofs component-major. For all-or-nothing
+    # Stage 4: enumerate active dofs component-major. For all-or-nothing
     # constraints this matches the natural block ordering; per-component
     # constraints simply leave holes in the enumeration.
     active_component = zeros(Int, nraw, ncomp)
@@ -403,10 +690,10 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     end
 
     layout = DofLayout{D,T}(ncomp, cell_dofs_by_level, raw_keys, active_component,
-                            physical_dirichlet, overlay_constraint, zeros(T, nraw, ncomp),
-                            active_count, tolerance)
+                            physical_dirichlet, overlay_constraint, raw_expansion,
+                            has_linear_constraints, zeros(T, nraw, ncomp), active_count, tolerance)
 
-    # Stage 3b: project nonzero Dirichlet data onto the boundary trace
+    # Stage 4b: project nonzero Dirichlet data onto the boundary trace
     # space. Zero-only conditions skip this — `constrained_values` is
     # already zero from the construction above.
     _needs_dirichlet_projection(dirichlet) && _project_dirichlet_values!(layout, V, dirichlet)
@@ -584,6 +871,15 @@ Total number of raw dof slots across every field (sum of
 `raw_dof_count(field.dofs)`).
 """
 raw_dof_count(layout::SystemLayout) = sum(raw_dof_count(field.dofs) for field in layout.fields)
+
+# True iff any field's dof layout carries a non-trivial linear
+# constraint (a [`DofLayout`](@ref) `raw_expansion` that redistributes a
+# raw onto other raws). Assembly consults this once per region to choose
+# between the lightweight single-target path and the general
+# expansion-distributing path; see [`_accumulate_qpoint!`](@ref).
+function has_linear_constraints(layout::SystemLayout)
+    any(field -> field.dofs.has_linear_constraints, layout.fields)
+end
 
 # Resolve the unique field of a single-field layout. Used by the
 # `*_dofs` delegates below so single-field problems do not have to

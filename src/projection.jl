@@ -137,10 +137,12 @@ The trailing `active_dofs` / `local_by_global` / `local_matrix` /
 in place every region, never reallocated.
 """
 struct TransferWorkspace{D,T}
+    source_bases::Vector{BasisFamily}
     source_local_ids::Vector{Vector{CartesianIndex{D}}}
     source_orders::Vector{NTuple{D,Int}}
     source_values::Vector{Vector{T}}
     source_val1d::Vector{NTuple{D,Vector{T}}}
+    target_bases::Vector{BasisFamily}
     target_local_ids::Vector{Vector{CartesianIndex{D}}}
     target_orders::Vector{NTuple{D,Int}}
     target_values::Vector{Vector{T}}
@@ -154,8 +156,12 @@ end
 # Allocate per-level value buffers for one side of the transfer. Mirrors
 # the per-level slot pattern in `_assembly_workspace`: index by level
 # id, size each buffer to the level's basis count and per-axis order.
+# Returns the per-level basis families alongside the buffers so the
+# transfer hot loop can dispatch `_tensor_values!` through the
+# `<side>_bases` vector instead of looking the level up each time.
 function _level_value_buffers(levels::Tuple, ::Val{D}, ::Type{T}) where {D,T}
     n = length(levels)
+    bases = Vector{BasisFamily}(undef, n)
     local_ids = Vector{Vector{CartesianIndex{D}}}(undef, n)
     orders = Vector{NTuple{D,Int}}(undef, n)
     values = Vector{Vector{T}}(undef, n)
@@ -163,19 +169,22 @@ function _level_value_buffers(levels::Tuple, ::Val{D}, ::Type{T}) where {D,T}
     for level in levels
         i = level.id
         ids = local_basis_indices(level.basis, level.order, level.mode)
+        bases[i] = level.basis
         local_ids[i] = ids
         orders[i] = level.order
         values[i] = Vector{T}(undef, length(ids))
         val1d[i] = _factor_buffers(level.order, T)
     end
-    return local_ids, orders, values, val1d
+    return bases, local_ids, orders, values, val1d
 end
 
 function _transfer_workspace(source_model::Model{D,T}, target_model::Model{D,T}) where {D,T}
-    s_ids, s_ord, s_val, s_v1 = _level_value_buffers(source_model.problem.space.levels, Val(D), T)
-    t_ids, t_ord, t_val, t_v1 = _level_value_buffers(target_model.problem.space.levels, Val(D), T)
-    return TransferWorkspace{D,T}(s_ids, s_ord, s_val, s_v1, t_ids, t_ord, t_val, t_v1, Int[],
-                                  Dict{Int,Int}(), T[], T[])
+    s_bs, s_ids, s_ord, s_val, s_v1 = _level_value_buffers(source_model.problem.space.levels,
+                                                           Val(D), T)
+    t_bs, t_ids, t_ord, t_val, t_v1 = _level_value_buffers(target_model.problem.space.levels,
+                                                           Val(D), T)
+    return TransferWorkspace{D,T}(s_bs, s_ids, s_ord, s_val, s_v1, t_bs, t_ids, t_ord, t_val, t_v1,
+                                  Int[], Dict{Int,Int}(), T[], T[])
 end
 
 # Slim per-parent record aliasing the workspace value buffer (no
@@ -197,13 +206,15 @@ function _update_transfer_basis!(ws::TransferWorkspace{D,T}, region::TransferReg
                                  eta::SVector{D,T}) where {D,T}
     for p in region.target_parents
         xi = reference_to_physical(p.local_box, eta)
-        _tensor_values!(ws.target_values[p.level], ws.target_local_ids[p.level],
-                        ws.target_orders[p.level], xi, ws.target_val1d[p.level])
+        _tensor_values!(ws.target_bases[p.level], ws.target_values[p.level],
+                        ws.target_local_ids[p.level], ws.target_orders[p.level], xi,
+                        ws.target_val1d[p.level], p.cell)
     end
     for p in region.source_parents
         xi = reference_to_physical(p.local_box, eta)
-        _tensor_values!(ws.source_values[p.level], ws.source_local_ids[p.level],
-                        ws.source_orders[p.level], xi, ws.source_val1d[p.level])
+        _tensor_values!(ws.source_bases[p.level], ws.source_values[p.level],
+                        ws.source_local_ids[p.level], ws.source_orders[p.level], xi,
+                        ws.source_val1d[p.level], p.cell)
     end
     return nothing
 end
@@ -234,6 +245,76 @@ end
 #      shift the contribution to the rhs scaled by the stored value).
 #   4. Emit the local system as COO triplets and rhs entries.
 #
+# Accumulate one component's transfer contribution at one quadrature
+# point. The target mass matrix `∫ φᵀ_i φᵀ_j` is structurally a symmetric
+# bilinear block and the source rhs `∫ u_S φᵀ_i` a linear load, so this
+# reuses the assembly kernels `_emit_load!`, `_emit_block!`, and
+# `_trial_block_context` (in `assembly.jl`) verbatim — only the per-point
+# entry value (`trial_value · test_value`) differs from a general weak
+# form. Two thin overloads provide the per-point dispatch barrier on the
+# concrete `local_by_parent` table type (`LocalDofExpansion` vs
+# `Matrix{Int}`); the shared body specialises through them.
+function _transfer_qpoint!(local_matrix, local_rhs, target_data, source_data,
+                           local_by_parent::AbstractVector{<:LocalDofExpansion}, target_layout,
+                           source_layout, source_coefficients, active_dofs::Vector{Int}, qweight::T,
+                           component::Int, has_source::Bool,
+                           ::Val{AssembleMass}) where {T,AssembleMass}
+    return _transfer_qpoint_generic!(local_matrix, local_rhs, target_data, source_data,
+                                     local_by_parent, target_layout, source_layout,
+                                     source_coefficients, active_dofs, qweight, component,
+                                     has_source, Val(AssembleMass))
+end
+
+function _transfer_qpoint!(local_matrix, local_rhs, target_data, source_data,
+                           local_by_parent::AbstractVector{Matrix{Int}}, target_layout,
+                           source_layout, source_coefficients, active_dofs::Vector{Int}, qweight::T,
+                           component::Int, has_source::Bool,
+                           ::Val{AssembleMass}) where {T,AssembleMass}
+    return _transfer_qpoint_generic!(local_matrix, local_rhs, target_data, source_data,
+                                     local_by_parent, target_layout, source_layout,
+                                     source_coefficients, active_dofs, qweight, component,
+                                     has_source, Val(AssembleMass))
+end
+
+function _transfer_qpoint_generic!(local_matrix, local_rhs, target_data, source_data,
+                                   local_by_parent, target_layout, source_layout,
+                                   source_coefficients, active_dofs::Vector{Int}, qweight::T,
+                                   component::Int, has_source::Bool,
+                                   ::Val{AssembleMass}) where {T,AssembleMass}
+    # RHS: reconstruct the source value and integrate against target
+    # traces (a linear load). Skipped when the region has no source
+    # coverage (`u_S ≡ 0`).
+    if has_source
+        source_value = _field_value(source_data, source_layout, source_coefficients, component)
+        for (test_data, table) in zip(target_data, local_by_parent)
+            for a in eachindex(test_data.raw_dofs)
+                contribution = qweight * source_value * test_data.values[a]
+                _emit_load!(local_rhs, table, a, component, contribution)
+            end
+        end
+    end
+
+    # Mass matrix: target trace × target trace, a symmetric bilinear
+    # block. Emit only the lower triangle (mirrored at the global stage);
+    # constrained trial columns move to the rhs via Dirichlet elimination.
+    if AssembleMass
+        for (trial_data, trial_table) in zip(target_data, local_by_parent)
+            for b in eachindex(trial_data.raw_dofs)
+                trial_value = trial_data.values[b]
+                tctx = _trial_block_context(trial_table, trial_data, target_layout, b, component)
+                for (test_data, test_table) in zip(target_data, local_by_parent)
+                    for a in eachindex(test_data.raw_dofs)
+                        entry = qweight * trial_value * test_data.values[a]
+                        _emit_block!(local_matrix, local_rhs, test_table, test_data, target_layout,
+                                     tctx, a, component, entry, true, active_dofs)
+                    end
+                end
+            end
+        end
+    end
+    return nothing
+end
+
 # The `::Val{AssembleMass}` parameter compile-time-selects whether to
 # build the mass matrix: callers pass `Val(false)` for the precomputed-
 # target case (caller supplied `backend.matrix`), `Val(true)` otherwise.
@@ -258,8 +339,18 @@ function _assemble_transfer_region!(ws::TransferWorkspace{D,T}, rows::Vector{Int
 
         empty!(ws.active_dofs)
         empty!(ws.local_by_global)
-        local_by_parent = [_local_parent_dofs!(ws.active_dofs, ws.local_by_global, d,
-                                               target_layout) for d in target_data]
+        # Pick the per-parent dof-table representation once per field, as
+        # in volume assembly: the lightweight `Matrix{Int}` table for
+        # layouts without non-trivial linear constraints (the common
+        # case), the `LocalDofExpansion` table otherwise. The matching
+        # `_transfer_qpoint!` overload fires per quadrature point.
+        local_by_parent = if target_layout.dofs.has_linear_constraints
+            [_local_parent_dofs!(ws.active_dofs, ws.local_by_global, d, target_layout)
+             for d in target_data]
+        else
+            [_local_parent_dofs_simple!(ws.active_dofs, ws.local_by_global, d, target_layout)
+             for d in target_data]
+        end
         n = length(ws.active_dofs)
         nn = AssembleMass ? n * n : 0
         resize!(ws.local_matrix, nn)
@@ -275,69 +366,10 @@ function _assemble_transfer_region!(ws::TransferWorkspace{D,T}, rows::Vector{Int
             _update_transfer_basis!(ws, region, eta)
 
             for component in 1:target_layout.components
-                # RHS contribution: reconstruct the source field value
-                # at this point and integrate against target traces.
-                # Skipped when there is no source coverage — `u_S ≡ 0`
-                # over the region and the rhs accumulator stays zero.
-                if has_source
-                    source_value = _field_value(source_data, source_layout, source_coefficients,
-                                                component)
-                    for (test_data, local_rows) in zip(target_data, local_by_parent)
-                        for a in eachindex(test_data.raw_dofs)
-                            local_row = local_rows[a, component]
-                            local_row == 0 && continue
-                            local_rhs[local_row] += qweight * source_value * test_data.values[a]
-                        end
-                    end
-                end
-
-                # Mass-matrix contribution: target trace × target trace.
-                # Symmetric — emit only the lower triangle, mirror at
-                # the global assembly stage. Per-trial-dof work
-                # (`col`, `local_col`, `constrained`) is hoisted out of
-                # the test/a loop so it runs once per trial dof instead
-                # of once per (trial, test) pair.
-                if AssembleMass
-                    for (trial_data, local_cols) in zip(target_data, local_by_parent)
-                        for b in eachindex(trial_data.raw_dofs)
-                            col = _field_component_dof(target_layout, trial_data.raw_dofs[b],
-                                                       component)
-                            trial_value = trial_data.values[b]
-                            if col == 0
-                                # Constrained trial dof: column elimination
-                                # shifts the contribution to the rhs.
-                                constrained = constrained_value(target_layout.dofs,
-                                                                trial_data.raw_dofs[b], component)
-                                for (test_data, local_rows) in zip(target_data, local_by_parent)
-                                    for a in eachindex(test_data.raw_dofs)
-                                        local_row = local_rows[a, component]
-                                        local_row == 0 && continue
-                                        local_rhs[local_row] -= qweight *
-                                                                trial_value *
-                                                                test_data.values[a] *
-                                                                constrained
-                                    end
-                                end
-                            else
-                                # Active trial dof: lower-triangle of the
-                                # symmetric mass matrix.
-                                local_col = local_cols[b, component]
-                                for (test_data, local_rows) in zip(target_data, local_by_parent)
-                                    for a in eachindex(test_data.raw_dofs)
-                                        local_row = local_rows[a, component]
-                                        local_row == 0 && continue
-                                        row = _field_component_dof(target_layout,
-                                                                   test_data.raw_dofs[a], component)
-                                        row < col && continue
-                                        local_matrix[local_row, local_col] += qweight *
-                                                                              trial_value *
-                                                                              test_data.values[a]
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
+                _transfer_qpoint!(local_matrix, local_rhs, target_data, source_data,
+                                  local_by_parent, target_layout, source_layout,
+                                  source_coefficients, ws.active_dofs, qweight, component,
+                                  has_source, Val(AssembleMass))
             end
         end
 

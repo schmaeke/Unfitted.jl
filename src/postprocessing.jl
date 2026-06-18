@@ -541,7 +541,7 @@ function _level_value(coefficients, model::Model{D,T}, layout::FieldLayout{D,T},
 
     parent_box = cell_box(level.mesh, cell)
     xi = physical_to_reference(parent_box, x)
-    values = basis_values(level.basis, level.order, level.mode, xi)
+    values = basis_values(level.basis, level.order, level.mode, xi, cell)
     raw_dofs = cell_dofs(layout.dofs, level.id, cell)
     result = zero(promote_type(T, eltype(coefficients)))
 
@@ -565,7 +565,7 @@ function _level_gradient(coefficients, model::Model{D,T}, layout::FieldLayout{D,
 
     parent_box = cell_box(level.mesh, cell)
     xi = physical_to_reference(parent_box, x)
-    gradients = physical_basis_gradients(level.basis, level.order, level.mode, parent_box, xi)
+    gradients = physical_basis_gradients(level.basis, level.order, level.mode, parent_box, xi, cell)
     raw_dofs = cell_dofs(layout.dofs, level.id, cell)
     result = SVector{D,R}(ntuple(_ -> zero(R), D))
 
