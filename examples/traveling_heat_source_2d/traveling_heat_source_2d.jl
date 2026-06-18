@@ -235,13 +235,12 @@ end
 # (2) N static overlays sharing `trajectory_box`, each carrying its mask,
 # (3) the moving tip overlay with its precomputed circular mask.
 function build_space(center, static_masks)
-    V = space(omega; cells=(N, N), order=p, mode=:total_degree)
+    V = space(omega; cells=(N, N), order=p, mode=:trunk)
     for (spec, mask) in zip(static_overlay_specs, static_masks)
-        V = overlay(V, trajectory_box; cells=spec.cells, order=spec.order, active=mask,
-                    mode=:total_degree)
+        V = overlay(V, trajectory_box; cells=spec.cells, order=spec.order, active=mask, mode=:trunk)
     end
     V = overlay(V, box(center; halfwidth=tip_box_halfwidth); cells=tip_cells, order=tip_order,
-                active=tip_disk_mask, mode=:total_degree)
+                active=tip_disk_mask, mode=:trunk)
     return V
 end
 

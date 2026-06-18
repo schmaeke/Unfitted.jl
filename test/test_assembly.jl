@@ -61,13 +61,15 @@ end
     @test isposdef(Symmetric(Matrix(model.matrix)))
 end
 
-@testset "total-degree scalar H1 assembly is symmetric positive definite" begin
+@testset "trunk scalar H1 assembly is symmetric positive definite" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
-    V = space(omega; cells=(1, 1), order=3, mode=:total_degree)
+    # order=4 is the lowest 2D trunk order with an interior mode, so a
+    # Dirichlet-on-all single cell leaves exactly one interior unknown.
+    V = space(omega; cells=(1, 1), order=4, mode=:trunk)
     model = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     assemble!(model)
-    @test V.levels[1].mode == :total_degree
+    @test V.levels[1].mode == :trunk
     @test size(model.matrix) == (1, 1)
     @test model.matrix[1, 1] > 0.0
     @test model.rhs[1] > 0.0

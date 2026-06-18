@@ -45,21 +45,33 @@ end
     @test sum(values4) ≈ 1.0
 end
 
-@testset "total-degree basis filtering" begin
+@testset "trunk basis filtering" begin
     basis = IntegratedLegendre()
 
-    @test Unfitted.local_basis_count(basis, (2, 2), :total_degree) == 8
-    @test Unfitted.local_basis_count(basis, (3, 3), :total_degree) == 13
-    @test Unfitted.local_basis_count(basis, (2, 2, 2), :total_degree) == 20
-    @test CartesianIndex(2, 2) ∉ Unfitted.local_basis_indices(basis, (2, 2), :total_degree)
-    @test CartesianIndex(2, 2) ∈ Unfitted.local_basis_indices(basis, (3, 3), :total_degree)
-    @test_throws ArgumentError Unfitted.local_basis_indices(basis, (2, 3), :total_degree)
+    # 2D counts: trunk trims only the interior, so p=2 (no interior modes
+    # yet) matches tensor minus the single (2,2) interior mode.
+    @test Unfitted.local_basis_count(basis, (2, 2), :trunk) == 8
+    @test Unfitted.local_basis_count(basis, (3, 3), :trunk) == 12
+    # 3D is where trunk pays off: the interior face/volume modes are the
+    # bulk of the tensor count at moderate order.
+    @test Unfitted.local_basis_count(basis, (2, 2, 2), :trunk) == 20
+    @test Unfitted.local_basis_count(basis, (3, 3, 3), :trunk) == 32
+    @test Unfitted.local_basis_count(basis, (4, 4, 4), :trunk) == 50
 
-    values = Unfitted.basis_values(basis, (1, 1), :total_degree, (0.2, -0.3))
+    # Edge modes survive up to degree p; interior modes only while their
+    # bubble degrees sum to ≤ p, so (2,2) is dropped at p=3 and reappears
+    # at p=4.
+    @test CartesianIndex(2, 2) ∉ Unfitted.local_basis_indices(basis, (2, 2), :trunk)
+    @test CartesianIndex(3, 1) ∈ Unfitted.local_basis_indices(basis, (3, 3), :trunk)
+    @test CartesianIndex(2, 2) ∉ Unfitted.local_basis_indices(basis, (3, 3), :trunk)
+    @test CartesianIndex(2, 2) ∈ Unfitted.local_basis_indices(basis, (4, 4), :trunk)
+    @test_throws ArgumentError Unfitted.local_basis_indices(basis, (2, 3), :trunk)
+
+    values = Unfitted.basis_values(basis, (1, 1), :trunk, (0.2, -0.3))
     @test length(values) == 4
     @test sum(values) ≈ 1.0
 
-    lower = Unfitted.boundary_basis_indices(basis, (2, 2); axis=1, side=:lower, mode=:total_degree)
+    lower = Unfitted.boundary_basis_indices(basis, (2, 2); axis=1, side=:lower, mode=:trunk)
     @test length(lower) == 3
     @test all(id.I[1] == 0 for id in lower)
 end

@@ -238,9 +238,10 @@ optional activation mask. Fields:
     the level share the same family.
   - `order::NTuple{D,Int}` — per-axis polynomial order. May be
     anisotropic for `mode = :tensor`; must be isotropic for
-    `mode = :total_degree`.
+    `mode = :trunk`.
   - `mode::Symbol` — basis index-set mode: `:tensor` (full tensor
-    product) or `:total_degree` (filtered by total polynomial degree).
+    product) or `:trunk` (the Szabó–Babuška trunk space, filtered by
+    trunk degree).
   - `mask::Union{Nothing,LevelMask{D}}` — optional per-cell activation
     mask. `nothing` keeps every cell active and is the type-stable
     no-mask hot path; the `Union` is small so the `Level` type stays
@@ -355,8 +356,8 @@ Keyword arguments:
     `mode = :tensor`).
   - `basis` — basis family. Defaults to [`IntegratedLegendre`](@ref).
   - `mode` — basis index set. `:tensor` is the full tensor product;
-    `:total_degree` filters by total polynomial degree and requires
-    isotropic `order`.
+    `:trunk` is the Szabó–Babuška trunk space (filtered by trunk degree)
+    and requires isotropic `order`.
   - `active` — per-cell activation mask. See
     [`LevelMask`](@ref) and [`_normalize_mask`](@ref) for the accepted
     shapes.

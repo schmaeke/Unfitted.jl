@@ -50,10 +50,16 @@ Two index sets are available, set by the `mode` keyword on
 [`space`](@ref) / [`overlay`](@ref):
 
   - `:tensor` — the full tensor product `∏_d {0, …, p_d}` (default).
-  - `:total_degree` — filter by total polynomial degree
-    `Σ_d max(α_d − 1, 0) ≤ p − 1`, where the contribution of axis `d` is
-    `max(α_d − 1, 0)` because modes 0 and 1 are linear (degree-0 in this
-    counting) and mode m ≥ 2 is degree m − 1. Requires isotropic order.
+  - `:trunk` — the Szabó–Babuška trunk (serendipity) space at isotropic
+    order `p`. Keep every multi-index whose *trunk degree*
+    `Σ_d t(α_d) ≤ p`, where `t(α_d) = α_d` for a bubble mode `α_d ≥ 2`
+    and `t(α_d) = 0` for the two linear endpoint modes `α_d ∈ {0, 1}`.
+    This retains all vertex modes and every edge mode up to degree `p`
+    (so `C⁰` inter-cell conformity is preserved) while trimming the
+    high-degree interior face/volume modes to `Σ` of their bubble
+    degrees `≤ p`. Requires isotropic order. The saving over `:tensor`
+    grows with dimension: e.g. for `p = 4` a hexahedral cell carries 50
+    modes instead of 125.
 
 All integrated-Legendre-specific dof and constraint behaviour
 (endpoint-vs-bubble identification, boundary-mode dispatch, facet
@@ -158,22 +164,20 @@ end
 
 Number of local basis functions on a single cell. For `:tensor` mode
 (default) and integrated Legendre this is `prod(order .+ 1)`. For
-`:total_degree` it is the number of multi-indices satisfying the
-total-degree filter (see [`IntegratedLegendre`](@ref)).
+`:trunk` it is the number of multi-indices satisfying the trunk-degree
+filter (see [`IntegratedLegendre`](@ref)).
 """
 function local_basis_count(::IntegratedLegendre, order::NTuple{D,Int}) where {D}
     return prod(ntuple(i -> order[i] + 1, D))
 end
 
 # Validate a basis-mode symbol against the per-axis polynomial order.
-# `:tensor` accepts anisotropic orders; `:total_degree` currently requires
-# isotropic order, since the total-degree filter compares against a single
-# scalar `p`.
+# `:tensor` accepts anisotropic orders; `:trunk` requires isotropic order,
+# since the trunk-degree filter compares against a single scalar `p`.
 function _check_basis_mode(mode::Symbol, order::NTuple{D,Int}) where {D}
-    mode in (:tensor, :total_degree) ||
-        throw(ArgumentError("basis mode must be :tensor or :total_degree"))
-    if mode === :total_degree && any(!=(order[1]), order)
-        throw(ArgumentError("mode=:total_degree currently requires isotropic order"))
+    mode in (:tensor, :trunk) || throw(ArgumentError("basis mode must be :tensor or :trunk"))
+    if mode === :trunk && any(!=(order[1]), order)
+        throw(ArgumentError("mode=:trunk requires isotropic order"))
     end
     return mode
 end
@@ -275,9 +279,11 @@ a cell of polynomial order `order`. Lexicographic over
 this is the canonical tensor-product ordering used by every basis
 consumer (assembly, projection, post-processing, the dof layer).
 
-`mode` defaults to `:tensor` (no filter); `mode = :total_degree` keeps
-only indices with `Σ_d max(α_d − 1, 0) ≤ p − 1` (isotropic order `p`
-required).
+`mode` defaults to `:tensor` (no filter); `mode = :trunk` keeps only
+indices with trunk degree `Σ_d t(α_d) ≤ p`, where `t(α_d) = α_d` for a
+bubble mode (`α_d ≥ 2`) and `t(α_d) = 0` for the two linear endpoint
+modes (`α_d ∈ {0, 1}`) — the Szabó–Babuška trunk space (isotropic order
+`p` required, see [`IntegratedLegendre`](@ref)).
 """
 function local_basis_indices(::IntegratedLegendre, order::NTuple{D,Int}) where {D}
     all(o -> o >= 1, order) ||
@@ -285,18 +291,23 @@ function local_basis_indices(::IntegratedLegendre, order::NTuple{D,Int}) where {
     return vec(collect(CartesianIndices(ntuple(d -> 0:order[d], D))))
 end
 
-# Filter degree of a 1D mode index in the integrated Legendre family:
-# modes 0 and 1 are linear endpoint shape functions (degree-0 in the
-# total-degree sense), and mode m ≥ 2 is a bubble of degree m − 1.
-_filter_degree(mode::Integer) = max(mode - 1, 0)
+# Trunk degree of a single 1D integrated-Legendre mode index. The two
+# endpoint modes 0 and 1 are the linear vertex shape functions and count
+# as 0; a bubble mode m ≥ 2 is an integrated Legendre polynomial of degree
+# m and counts as m. Counting the vertex factors as 0 is what lets the
+# trunk filter keep every edge mode up to degree p while still trimming
+# the interior — a pure polynomial-total-degree filter would instead drop
+# the top edge modes and break C⁰ conformity.
+_trunk_degree(mode::Integer) = mode ≥ 2 ? Int(mode) : 0
 
-# Total filter degree of a D-dim multi-index `α` is `Σ_d max(α_d − 1, 0)`.
-# This is what the `:total_degree` mode compares against the isotropic
-# polynomial order `p − 1`.
-function _total_filter_degree(id::CartesianIndex{D}) where {D}
+# Trunk degree of a D-dim multi-index `α` is `Σ_d t(α_d)`. This is what the
+# `:trunk` mode compares against the isotropic polynomial order `p`: edge
+# modes (one bubble axis) survive up to degree p, while face/volume modes
+# survive only while their bubble degrees sum to ≤ p.
+function _trunk_degree(id::CartesianIndex{D}) where {D}
     degree = 0
     for axis in 1:D
-        degree += _filter_degree(id.I[axis])
+        degree += _trunk_degree(id.I[axis])
     end
     return degree
 end
@@ -306,7 +317,7 @@ function local_basis_indices(basis::IntegratedLegendre, order::NTuple{D,Int},
     _check_basis_mode(mode, order)
     indices = local_basis_indices(basis, order)
     mode === :tensor && return indices
-    return [id for id in indices if _total_filter_degree(id) <= order[1] - 1]
+    return [id for id in indices if _trunk_degree(id) <= order[1]]
 end
 
 function local_basis_count(basis::IntegratedLegendre, order::NTuple{D,Int}, mode::Symbol) where {D}

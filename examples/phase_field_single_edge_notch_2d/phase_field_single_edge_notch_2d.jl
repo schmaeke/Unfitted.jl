@@ -281,7 +281,7 @@ end
 # single rebuild refreshes the basis for both fields. Total-degree mode
 # keeps the dof count manageable at high `p`.
 function build_space(strip_mask)
-    V = space(omega; cells=(cells_per_axis, cells_per_axis), order=order, mode=:total_degree)
+    V = space(omega; cells=(cells_per_axis, cells_per_axis), order=order, mode=:trunk)
     return overlay(V, strip_domain; cells=(strip_cells_x, strip_cells_y), order=strip_order,
                    active=strip_mask)
 end

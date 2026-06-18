@@ -79,21 +79,24 @@ end
     @test count(!iszero, Unfitted.active_cell_dofs(layout, 1, CartesianIndex(2, 1))) == 2
 end
 
-@testset "total-degree dof layout stays basis-local" begin
-    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(1, 1), order=3, mode=:total_degree)
+@testset "trunk dof layout stays basis-local" begin
+    # order=4 is the lowest 2D trunk order with an interior mode (the
+    # single (2,2) bubble), so a Dirichlet-on-all single cell leaves
+    # exactly one interior unknown.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(1, 1), order=4, mode=:trunk)
     layout = Unfitted.dof_layout(V; dirichlet=[dirichlet(0.0; on=boundary(:all))])
     active = Unfitted.active_cell_dofs(layout, 1, CartesianIndex(1, 1))
 
-    @test V.levels[1].mode == :total_degree
-    @test Unfitted.raw_dof_count(layout) == 13
+    @test V.levels[1].mode == :trunk
+    @test Unfitted.raw_dof_count(layout) == 17
     @test Unfitted.active_unknowns(layout) == 1
     @test count(!iszero, active) == 1
     @test_throws ArgumentError space(box((0.0, 0.0), (1.0, 1.0)); cells=(1, 1), order=(2, 3),
-                                     mode=:total_degree)
+                                     mode=:trunk)
 
     V2 = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(1, 1))
     overlay_active = Unfitted.active_cell_dofs(Unfitted.dof_layout(V2), 2, CartesianIndex(1, 1))
-    @test V2.levels[2].mode == :total_degree
+    @test V2.levels[2].mode == :trunk
     @test count(!iszero, overlay_active) == 1
 end
 
