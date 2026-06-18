@@ -61,16 +61,16 @@ using NonNegLeastSquares
 using WriteVTK
 
 export AxisBox, GeometryTolerance, PhysicalDomain, physical_domain, classify_cell, CartesianMesh,
-       Level, Space, IntegratedLegendre, Field, BlockForm, LoadForm, TrialChannels, TestChannels,
-       WeakForm, Problem, Model, Solution, box, mesh, space, overlay, field, block, loadform,
-       boundary, dirichlet, update_dirichlet!, neumann, BoundaryMesh, segment_mesh, polyline_mesh,
-       triangle_mesh, points_mesh, poisson, mass, mass_form, mass_block, stiffness, stiffness_form,
-       stiffness_block, load, source_form, source_load, load_vector, prepare, assemble_matrix,
-       assemble_vector, assemble!, foreach_quadrature_point, nquadpoints, solve!, solution, move!,
-       moved, moved_space, activate!, deactivate!, active_cells, transfer!, TransferBackend,
-       L2Projection, Rewire, QuadField, QuadTransferScheme, RBFP0, transfer, write_vtk,
-       write_quadrature_vtm, l2_error, boundary_integral, value, field_gradient, diagnostics,
-       active_unknowns, cell_indices, cell_box, center, value_vec, gradient_tensor,
+       Level, Space, IntegratedLegendre, bspline, Field, BlockForm, LoadForm, TrialChannels,
+       TestChannels, WeakForm, Problem, Model, Solution, box, mesh, space, overlay, field, block,
+       loadform, boundary, dirichlet, update_dirichlet!, neumann, BoundaryMesh, segment_mesh,
+       polyline_mesh, triangle_mesh, points_mesh, poisson, mass, mass_form, mass_block, stiffness,
+       stiffness_form, stiffness_block, load, source_form, source_load, load_vector, prepare,
+       assemble_matrix, assemble_vector, assemble!, foreach_quadrature_point, nquadpoints, solve!,
+       solution, move!, moved, moved_space, activate!, deactivate!, active_cells, transfer!,
+       TransferBackend, L2Projection, Rewire, QuadField, QuadTransferScheme, RBFP0, transfer,
+       write_vtk, write_quadrature_vtm, l2_error, boundary_integral, value, field_gradient,
+       diagnostics, active_unknowns, cell_indices, cell_box, center, value_vec, gradient_tensor,
        symmetric_gradient
 
 # ── Extension stubs ───────────────────────────────────────────────────────────
@@ -91,6 +91,19 @@ export AxisBox, GeometryTolerance, PhysicalDomain, physical_domain, classify_cel
 function symmetric_gradient end
 function value_vec end
 function gradient_tensor end
+
+# `bspline(; continuity_order=0)` is the public factory for the
+# open-knot tensor B-spline basis family. It returns a deferred
+# specification that the `instantiate_basis` hook turns into a concrete
+# `BSplineFamily` once the level's mesh is known (the per-axis degree
+# comes from the `order` keyword on `space` / `overlay`, matching the
+# integrated Legendre convention). The struct and all methods live in
+# `ext/UnfittedBasicBSplineExt.jl` and are installed when BasicBSpline.jl
+# is loaded alongside Unfitted. The stub here lets downstream code write
+# `using Unfitted: bspline` unconditionally; calling `bspline(...)`
+# without BasicBSpline loaded raises the usual `MethodError`, which is
+# the intended behaviour.
+function bspline end
 
 include("geometry.jl")
 include("physical.jl")

@@ -13,20 +13,24 @@ StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 WriteVTK = "64499a7a-5c06-52f2-abe2-ccb03c286192"
 
 [weakdeps]
+BasicBSpline = "4c5d9882-2acf-4ea4-9e48-968fd4518195"
 Tensors = "48a634ad-e948-5137-8d70-aa71f2a747f4"
 
 [extensions]
+UnfittedBasicBSplineExt = "BasicBSpline"
 UnfittedTensorsExt = "Tensors"
 
 [compat]
+BasicBSpline = "0.11"
 NearestNeighbors = "0.4"
 NonNegLeastSquares = "0.4.1"
 Tensors = "1.16"
 julia = "1.10"
 
 [extras]
+BasicBSpline = "4c5d9882-2acf-4ea4-9e48-968fd4518195"
 Tensors = "48a634ad-e948-5137-8d70-aa71f2a747f4"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Tensors", "Test"]
+test = ["BasicBSpline", "Tensors", "Test"]

@@ -19,4 +19,5 @@ using Test
     include("test_regressions.jl")
     include("test_api.jl")
     include("test_tensors_ext.jl")
+    include("test_basis_bspline.jl")
 end

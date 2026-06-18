@@ -29,8 +29,10 @@ The method is described in
   overlays with their parents nor introduces hanging-node
   constraints; every overlay imposes homogeneous Dirichlet data on
   its artificial boundary `Γ_o^(k) = ∂Ω^(k) \ ∂Ω` instead. The
-  default basis family is hierarchical integrated Legendre, with a
-  small interface left open for alternatives such as B-splines.
+  default basis family is hierarchical integrated Legendre; an
+  open-knot tensor-product B-spline family is available through the
+  `BasicBSpline.jl` package extension (load `BasicBSpline` alongside
+  `Unfitted` and pass `basis = bspline()`).
 - **Selective per-cell activation** with the `move!`-style invalidation
   contract; useful for transient problems where small-scale features
   evolve in time.
