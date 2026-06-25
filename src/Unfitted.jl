@@ -18,13 +18,21 @@ uses admissible C∞ boxes built from the union of per-axis element-boundary
 coordinates of all participating levels.
 
 The package supports finite-cell-method (FCM) immersed integration through a
-level-set [`PhysicalDomain`](@ref): the geometry of `Ω` is described as
-`Ω = { x : φ(x) ≤ 0 }`, and cut cells use a non-negative moment-fit
-quadrature rule. The moment-fit pipeline is ported from QuESo (M. Meßmer
-et al., *Efficient CAD-integrated isogeometric analysis of trimmed solids*,
-Comput. Methods Appl. Mech. Engrg. **400** (2022) 115584,
-doi:10.1016/j.cma.2022.115584). The deliberate deviations from upstream are
-documented at the top of `src/fcm.jl`.
+[`PhysicalDomain`](@ref): the geometry of `Ω` is a CSG combination of smooth
+level-set leaves (`leaf`, `intersect`, `union`, `setdiff`, `complement`; a
+single callable `φ` with `Ω = {φ ≤ 0}` is the degenerate case). Cut cells use a
+non-negative moment-fit quadrature rule whose moments come from Saye's
+dimension-reduction implicit quadrature on the level set (R. I. Saye, SIAM J.
+Sci. Comput. **37** (2015) A993; J. Comput. Phys. **448** (2022) 110720),
+exact and octree-depth-independent on smooth cut cells. See the top of
+`src/fcm.jl` and `src/implicit.jl`.
+
+Imported boundary-mesh geometry is supported as a signed-distance level set
+through a package extension: with `FileIO` and `MeshIO` loaded (which pull in
+`GeometryBasics`, the extension's third trigger),  `mesh_levelset(mesh)` turns a
+closed `BoundaryMesh` — a 2D segment loop or a 3D triangle surface — into a
+[`LevelSet`](@ref) leaf, and `stl_levelset("part.stl")` reads an STL into one.
+Both compose with the CSG combinators. See `ext/UnfittedMeshIOExt.jl`.
 
 Reference for the unfitted multi-level hp method:
 
@@ -56,11 +64,13 @@ using LinearAlgebra
 using SparseArrays
 using StaticArrays
 using FastGaussQuadrature
+using ForwardDiff
 using NearestNeighbors
 using NonNegLeastSquares
 using WriteVTK
 
-export AxisBox, GeometryTolerance, PhysicalDomain, physical_domain, classify_cell, CartesianMesh,
+export AxisBox, GeometryTolerance, PhysicalDomain, physical_domain, classify_cell, LevelSet, leaf,
+       complement, levelset_value, stl_levelset, mesh_levelset, CartesianMesh,
        Level, Space, IntegratedLegendre, bspline, Field, BlockForm, LoadForm, TrialChannels,
        TestChannels, WeakForm, Problem, Model, Solution, box, mesh, space, overlay, field, block,
        loadform, boundary, dirichlet, update_dirichlet!, neumann, BoundaryMesh, segment_mesh,
@@ -105,8 +115,22 @@ function gradient_tensor end
 # the intended behaviour.
 function bspline end
 
+# `mesh_levelset(mesh::BoundaryMesh)` and `stl_levelset(path)` build a signed-
+# distance [`LevelSet`](@ref) leaf from a closed boundary mesh — a 2D segment
+# loop (`BoundaryMesh{2,T,1}`) or 3D triangle surface (`BoundaryMesh{3,T,2}`);
+# `stl_levelset` reads an STL file into the latter. Both return a
+# `leaf(sdf; lipschitz=1.0)` (negative inside the solid) suitable for
+# `physical_domain` and CSG composition. The signed-distance kernel and the STL
+# loader live in `ext/UnfittedMeshIOExt.jl` and are installed when FileIO,
+# MeshIO, and GeometryBasics are loaded alongside Unfitted. The stubs here let
+# downstream code write `using Unfitted: mesh_levelset` unconditionally; calling
+# them without those packages loaded raises the usual `MethodError`.
+function stl_levelset end
+function mesh_levelset end
+
 include("geometry.jl")
 include("physical.jl")
+include("implicit.jl")
 include("basis.jl")
 include("fcm.jl")
 include("mesh.jl")

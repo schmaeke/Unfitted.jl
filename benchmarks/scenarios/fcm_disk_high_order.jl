@@ -5,25 +5,19 @@ using Unfitted
 # circular FCM geometry, same `subcell_length_scale`, but `order = 4` instead
 # of `2`. With the default `moment_order_factor = 2`, this drives the
 # moment-fit basis order to `8` per axis (cardinality `81` in 2D) — the
-# regime where the NNLS cost, the retry-mechanism behaviour, and the
-# per-leaf Gauss density meaningfully diverge from what the order-2
-# bench exposes.
+# regime where the per-cut-cell cost diverges most from the order-2 bench.
 #
 # Specifically:
 #
-#   * NNLS A matrix grows quadratically in `gauss_per_axis × ncand`, so
-#     any regression that reintroduces the old `gauss_per_axis =
-#     moment_order + 1` default (instead of the
-#     `ceil((moment_order + 1) / 2)` minimum) shows up here as a
-#     `4ˣ`-ish per-region cost jump.
-#   * The integrator's stair-step floor sits near the default
-#     `target_residual = 1e-6`, so any regression in
-#     `_moment_fit_with_retry`'s early-accept / stagnation guards
-#     reintroduces the multi-attempt retry blow-up.
-#   * At order 4 the moment basis is `81` in 2D, vs. `9` at order 2 —
-#     the per-region NNLS cost is roughly an order of magnitude higher,
-#     so this bench is sensitive to NNLS-related regressions that the
-#     order-2 bench's smaller A matrix swallows.
+#   * The exact implicit kernel builds an O(nbasis) candidate cloud and the
+#     moment fit is a single NNLS solve on the `81 × ncand` design matrix; this
+#     bench is the trip-wire for any regression that reintroduces an iterative
+#     point-elimination or accuracy-driven retry around that solve.
+#   * The kernel's volume-rule construction scales with the per-fiber Gauss
+#     count (`max(moment_order) + 2`); a regression inflating it shows up here.
+#   * At order 4 the moment basis is `81` in 2D, vs. `9` at order 2 — the
+#     per-region NNLS cost is roughly an order of magnitude higher, so this
+#     bench is sensitive to NNLS-related regressions the order-2 bench swallows.
 #
 # The 8×8 grid mirrors `fcm_disk_small.jl` so per-cell numbers are
 # directly comparable across orders.

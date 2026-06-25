@@ -13,8 +13,11 @@ using LinearAlgebra
     @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1,
                                                target_residual=-1.0)
 
+    # A bare callable is auto-wrapped as a single leaf carrying the `lipschitz`
+    # keyword; the domain-level integration knobs live on the PhysicalDomain.
     p = physical_domain(x -> x[1]; lipschitz=1.0, subcell_length_scale=0.0625)
-    @test p.lipschitz == 1.0
+    @test p.geometry isa Unfitted.Leaf
+    @test p.geometry.lipschitz == 1.0
     @test p.alpha == 0.0
     @test p.subcell_length_scale == 0.0625
     @test p.max_depth == 8
@@ -28,7 +31,100 @@ using LinearAlgebra
     @test p_tight.target_residual == 1.0e-10
 
     p2 = physical_domain(x -> x[1]; subcell_length_scale=0.1)
-    @test isinf(p2.lipschitz)
+    @test isinf(p2.geometry.lipschitz)
+end
+
+@testset "CSG level-set constructors" begin
+    # leaf wraps a callable; per-leaf Lipschitz is validated on the leaf.
+    @test leaf(x -> x[1]) isa Unfitted.Leaf
+    @test leaf(x -> x[1]; lipschitz=2.0).lipschitz == 2.0
+    @test_throws ArgumentError leaf(x -> x[1]; lipschitz=0.0)
+
+    a = leaf(x -> x[1] - 0.5)
+    b = leaf(x -> x[2] - 0.5)
+    inter = intersect(a, b)
+    uni = union(a, b)
+    diff = setdiff(a, b)
+    comp = complement(a)
+
+    # Membership matches the Boolean semantics; the scalar value agrees in sign.
+    inside = SVector(0.3, 0.3)   # a≤0 and b≤0
+    mixed = SVector(0.3, 0.7)    # a≤0, b>0
+    @test Unfitted._inside(inter, inside) && !Unfitted._inside(inter, mixed)
+    @test Unfitted._inside(uni, inside) && Unfitted._inside(uni, mixed)
+    @test !Unfitted._inside(diff, inside) && Unfitted._inside(diff, mixed)
+    # complement(a) = {a > 0} = {x₁ > 0.5}; flips with x₁, not x₂.
+    @test !Unfitted._inside(comp, inside) && Unfitted._inside(comp, SVector(0.7, 0.3))
+    @test (levelset_value(physical_domain(inter; subcell_length_scale=0.1), mixed) > 0)
+    @test length(Unfitted._leaves(inter)) == 2
+
+    # A CSG tree passes straight through physical_domain.
+    p = physical_domain(inter; subcell_length_scale=0.1)
+    @test p.geometry === inter
+end
+
+@testset "classify_cell — CSG combinations" begin
+    # Annulus r ∈ [0.2, 0.45] about the origin: full in the ring, fictitious in
+    # the hole, cut across either rim.
+    ann = setdiff(leaf(x -> hypot(x...) - 0.45; lipschitz=1.0),
+                  leaf(x -> hypot(x...) - 0.2; lipschitz=1.0))
+    p = physical_domain(ann; subcell_length_scale=0.02)
+    @test classify_cell(p, box((0.30, 0.0), (0.32, 0.02))) === :full
+    @test classify_cell(p, box((0.0, 0.0), (0.05, 0.05))) === :fictitious
+    @test classify_cell(p, box((0.44, 0.0), (0.50, 0.06))) === :cut
+    @test classify_cell(p, box((0.18, 0.0), (0.24, 0.06))) === :cut
+
+    # Union: a box inside one disk classifies :full even where the other leaf is
+    # uncertain (the three-valued certificate short-circuits the union).
+    uni = union(leaf(x -> hypot(x[1] - 0.3, x[2] - 0.3) - 0.2; lipschitz=1.0),
+                leaf(x -> hypot(x[1] - 0.7, x[2] - 0.7) - 0.2; lipschitz=1.0))
+    pu = physical_domain(uni; subcell_length_scale=0.02)
+    @test classify_cell(pu, box((0.28, 0.28), (0.32, 0.32))) === :full
+    @test classify_cell(pu, box((0.0, 0.9), (0.05, 0.95))) === :fictitious
+end
+
+@testset "CSG — levelset_value agrees in sign with membership (VTK contour)" begin
+    # The VTK level_set field uses levelset_value; a contour at 0 reproduces ∂Ω
+    # only if (levelset_value ≤ 0) ⇔ inside Ω for every CSG node — i.e. max/min/
+    # negate are the De Morgan duals of all/any/not. Check on a grid for union,
+    # complement, difference, and a nested tree.
+    a = leaf(x -> hypot(x[1] - 0.35, x[2] - 0.5) - 0.25)
+    b = leaf(x -> hypot(x[1] - 0.65, x[2] - 0.5) - 0.25)
+    c = leaf(x -> x[2] - 0.5)
+    trees = [union(a, b), complement(a), setdiff(union(a, b), c),
+             union(a, b, leaf(x -> hypot(x[1] - 0.5, x[2] - 0.85) - 0.18))]
+    for tree in trees
+        p = physical_domain(tree; subcell_length_scale=0.1)
+        for i in 0:24, j in 0:24
+            x = SVector(i / 24, j / 24)
+            v = levelset_value(p, x)
+            # Agreement holds away from ∂Ω; exactly on a constituent boundary
+            # (value == 0, e.g. the y = 0.5 grid line) the contour and the
+            # strict `≤ 0` membership legitimately coincide in measure zero.
+            abs(v) > 1e-9 && @test (v <= 0) == Unfitted._inside(tree, x)
+        end
+    end
+end
+
+@testset "CSG — classify: union dominance, complement, n-ary intersection" begin
+    # Union short-circuit: a box that is certainly inside A but straddles B's rim
+    # (B uncertain) must still classify :full via AnyOf — the headline case.
+    a = leaf(x -> hypot(x[1] - 0.4, x[2] - 0.5) - 0.45; lipschitz=1.0)
+    b = leaf(x -> hypot(x[1] - 0.6, x[2] - 0.5) - 0.3; lipschitz=1.0)
+    pu = physical_domain(union(a, b); subcell_length_scale=0.02)
+    @test classify_cell(pu, box((0.28, 0.48), (0.32, 0.52))) === :full   # inside A, on B's rim
+
+    # Complement flips full/fictitious.
+    pc = physical_domain(complement(a); subcell_length_scale=0.02)
+    @test classify_cell(pc, box((0.38, 0.48), (0.42, 0.52))) === :fictitious  # inside A
+    @test classify_cell(pc, box((0.94, 0.94), (0.98, 0.98))) === :full        # outside A
+
+    # n-ary (3-part) intersection: Ω = {0.2 ≤ x ≤ 0.8, y ≤ 0.8}.
+    tri = intersect(leaf(x -> x[1] - 0.8), leaf(x -> x[2] - 0.8), leaf(x -> 0.2 - x[1]))
+    pt = physical_domain(tri; subcell_length_scale=0.02)
+    @test classify_cell(pt, box((0.4, 0.4), (0.5, 0.5))) === :full
+    @test classify_cell(pt, box((0.0, 0.4), (0.1, 0.5))) === :fictitious     # x < 0.2
+    @test classify_cell(pt, box((0.75, 0.4), (0.85, 0.5))) === :cut          # straddles x = 0.8
 end
 
 @testset "PhysicalDomain.target_residual drives integration_plan moment-fit" begin
@@ -358,6 +454,38 @@ end
     @test isposdef(Symmetric(Matrix(m.matrix)))
     sol = solve!(m)
     @test all(isfinite, sol.coefficients)
+end
+
+@testset "3D immersed Poisson on a cut sphere — exact-moment kernel, O(nbasis), no OOM" begin
+    # Local proxy for the 3D acceptance criterion (crack_hole_3d on helios):
+    # a 3D FCM problem assembles and solves with the exact implicit-kernel
+    # moments. The moment-fit residual reaches machine precision (the kernel
+    # path is taken, not the octree stair-step), every cut cell carries
+    # O(nbasis) quadrature points rather than the 8^depth cloud that made the
+    # octree path run out of memory in 3D, and the system stays SPD.
+    omega = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    hole = physical_domain(x -> 0.3 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2 + (x[3] - 0.5)^2);
+                           lipschitz=1.0, subcell_length_scale=0.1)
+    V = space(omega; cells=(6, 6, 6), order=1, physical=hole)
+    m = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    assemble!(m)
+
+    @test isposdef(Symmetric(Matrix(m.matrix)))
+    sol = solve!(m)
+    @test all(isfinite, sol.coefficients)
+
+    diag = diagnostics(m)
+    @test diag.cut_region_count > 0
+    @test diag.fit_failure_count == 0
+    # Exact kernel ⇒ residual far below the octree stair-step floor.
+    @test diag.moment_fit_residual_max < 1e-8
+
+    # Every cut-cell rule is O(nbasis): a single NNLS solve keeps at most
+    # nbasis = (order·factor + 1)^D = 3³ = 27 points; the octree path produced
+    # thousands here.
+    plan = Unfitted.integration_plan(m)
+    cut_regions = [r for r in plan.regions if r.quadrature.kind === :cut_fitted]
+    @test maximum(length(r.quadrature.points) for r in cut_regions) <= 27
 end
 
 @testset "Slice 5c — diagnostics report cut_region_count" begin

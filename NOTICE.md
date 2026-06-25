@@ -7,26 +7,58 @@ Ordinary Julia package dependencies fetched through the General registry
 (listed in `Project.toml`) are not reproduced here — their licenses
 travel with each installed package.
 
+## Clean-room algorithm implementations
+
+The following algorithms are implemented from their published descriptions
+(clean-room — no third-party source code is vendored). They are cited here, and
+in full at the top of the implementing file, for academic attribution:
+
+  - **Implicit (level-set) quadrature** in `src/implicit.jl` —
+    R. I. Saye, "High-order quadrature methods for implicitly defined surfaces
+    and volumes in hyperrectangles", SIAM J. Sci. Comput. **37** (2015) A993,
+    [doi:10.1137/140966290](https://doi.org/10.1137/140966290); and
+    "High-order quadrature on multi-component domains…", J. Comput. Phys.
+    **448** (2022) 110720,
+    [doi:10.1016/j.jcp.2021.110720](https://doi.org/10.1016/j.jcp.2021.110720).
+    Its use as a moment source follows B. Müller, F. Kummer, M. Oberlack,
+    Int. J. Numer. Methods Engng. **96** (2013) 512,
+    [doi:10.1002/nme.4569](https://doi.org/10.1002/nme.4569).
+
+  - **Mesh signed-distance** in `ext/UnfittedMeshIOExt.jl` — closest point on a
+    triangle: C. Ericson, "Real-Time Collision Detection", Morgan Kaufmann
+    (2005), ISBN 978-1-55860-732-3; angle-weighted pseudonormal sign:
+    J. A. Bærentzen, H. Aanæs, IEEE Trans. Vis. Comput. Graph. **11** (2005)
+    243, [doi:10.1109/TVCG.2005.49](https://doi.org/10.1109/TVCG.2005.49);
+    generalized winding number: A. Jacobson, L. Kavan, O. Sorkine-Hornung,
+    ACM Trans. Graph. **32** (2013) 33,
+    [doi:10.1145/2461912.2461916](https://doi.org/10.1145/2461912.2461916).
+
 ## QuESo (Quadrature for Embedded Solids)
 
-The finite-cell-method machinery in `src/fcm.jl` — specifically the
-octree leaf walker, the moment-fit / NNLS pipeline, the point-
-elimination inner loop, and the outer retry — is a Julia port of
-QuESo's `QuadratureTrimmedElement`. The structural change is the
-geometry kernel: QuESo classifies bounding boxes against a triangulated
-B-rep, while Unfitted classifies against a user-supplied Lipschitz
-level set (`PhysicalDomain` in `src/physical.jl`); QuESo's
-surface-IP / divergence-theorem path is not ported.
+The finite-cell-method machinery in `src/fcm.jl` adopts the non-negative
+moment-fit-via-NNLS approach to cut-cell quadrature that QuESo's
+`QuadratureTrimmedElement` uses, and the package's FCM pipeline was
+originally developed by porting that structure from QuESo. The current
+implementation no longer contains QuESo-derived code: the distinctly
+QuESo pieces — the octree stair-step moment integrator, the
+`PointElimination` inner loop, and the `AssembleIPs` outer retry — have
+been removed, and the moment-fit-via-NNLS idea itself is the older method
+of B. Müller, F. Kummer, M. Oberlack (Int. J. Numer. Methods Engng. **96**
+(2013) 512, doi:10.1002/nme.4569). QuESo is acknowledged here as the
+reference that informed the FCM pipeline design.
 
-As a direct consequence of that geometry-kernel swap, the moment
-integration in this port is stair-step accurate (bounded by
-`O(subcell_length_scale / region_extent)` per axis) instead of
-B-rep-exact, so the moment-fit NNLS residual cannot fall below the
-integrator's own floor. The default `PhysicalDomain.target_residual`
-is therefore `1e-6`, matched to that floor at typical
-`subcell_length_scale` values — looser than QuESo's hardcoded `1e-10`
-and their shipped examples' typical `1e-8`. Users who tighten
-`subcell_length_scale` should tighten `target_residual` accordingly.
+The geometry and moments are computed differently from QuESo. QuESo
+classifies bounding boxes against a triangulated B-rep and computes
+moments from a B-rep divergence-theorem surface integral; Unfitted
+classifies against a CSG level set (`PhysicalDomain` in
+`src/physical.jl`) and computes the moments from Saye's
+dimension-reduction implicit quadrature (`src/implicit.jl`; R.
+I. Saye, SIAM J. Sci. Comput. **37** (2015) A993, doi:10.1137/140966290,
+and J. Comput. Phys. **448** (2022) 110720, doi:10.1016/j.jcp.2021.110720)
+— a clean-room implementation written from the cited papers and not
+derived from any third-party source. The kernel gives exact,
+octree-depth-independent moments on smooth (graph-like) cut cells,
+machine precision for linear leaves and polytope corners.
 
 ### Upstream source
 

@@ -5,6 +5,7 @@ authors = ["Jan Niklas Schmäke"]
 
 [deps]
 FastGaussQuadrature = "442a2c76-b920-505d-bb47-c5924d526838"
+ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 NearestNeighbors = "b8a86587-4115-5ab1-83bc-aa920d37bbce"
 NonNegLeastSquares = "b7351bd1-99d9-5c5d-8786-f205a815c4d7"
@@ -14,14 +15,22 @@ WriteVTK = "64499a7a-5c06-52f2-abe2-ccb03c286192"
 
 [weakdeps]
 BasicBSpline = "4c5d9882-2acf-4ea4-9e48-968fd4518195"
+FileIO = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
+GeometryBasics = "5c1252a2-5f33-56bf-86c9-59e7332b4326"
+MeshIO = "7269a6da-0436-5bbc-96c2-40638cbb6118"
 Tensors = "48a634ad-e948-5137-8d70-aa71f2a747f4"
 
 [extensions]
 UnfittedBasicBSplineExt = "BasicBSpline"
+UnfittedMeshIOExt = ["FileIO", "GeometryBasics", "MeshIO"]
 UnfittedTensorsExt = "Tensors"
 
 [compat]
 BasicBSpline = "0.11"
+FileIO = "1"
+ForwardDiff = "0.10, 1"
+GeometryBasics = "0.4, 0.5"
+MeshIO = "0.4, 0.5"
 NearestNeighbors = "0.4"
 NonNegLeastSquares = "0.4.1"
 Tensors = "1.16"
@@ -29,8 +38,12 @@ julia = "1.10"
 
 [extras]
 BasicBSpline = "4c5d9882-2acf-4ea4-9e48-968fd4518195"
+FileIO = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
+GeometryBasics = "5c1252a2-5f33-56bf-86c9-59e7332b4326"
+MeshIO = "7269a6da-0436-5bbc-96c2-40638cbb6118"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Tensors = "48a634ad-e948-5137-8d70-aa71f2a747f4"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["BasicBSpline", "Tensors", "Test"]
+test = ["BasicBSpline", "FileIO", "GeometryBasics", "MeshIO", "Random", "Tensors", "Test"]

@@ -9,6 +9,7 @@ using Test
     include("test_constraints.jl")
     include("test_activation.jl")
     include("test_physical.jl")
+    include("test_implicit.jl")
     include("test_fcm.jl")
     include("test_assembly.jl")
     include("test_projection.jl")
@@ -20,4 +21,5 @@ using Test
     include("test_api.jl")
     include("test_tensors_ext.jl")
     include("test_basis_bspline.jl")
+    include("test_meshio_ext.jl")
 end

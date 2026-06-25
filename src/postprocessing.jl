@@ -288,7 +288,7 @@ function _partition_vtk_data(solution::Solution, model::Model{D,T}, subdivisions
             for corner in corners
                 push!(points, _vtk_point(corner))
                 push!(point_samples, _vtk_sample(model, region_id, region, subbox, corner, :point))
-                auto_level_set && push!(level_set_values, T(physical.phi(corner)))
+                auto_level_set && push!(level_set_values, T(levelset_value(physical, corner)))
             end
 
             push!(cells,

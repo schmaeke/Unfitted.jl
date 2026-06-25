@@ -1,63 +1,168 @@
-"""
-    PhysicalDomain{F,T}(phi, lipschitz, alpha, subcell_length_scale, max_depth,
-                       moment_order_factor, target_residual)
+# ── CSG level-set tree ────────────────────────────────────────────────────────
+#
+# An immersed domain Ω is described by a Boolean combination of smooth level
+# sets ("leaves"), rather than a single scalar φ. Carrying the constituent
+# leaves separately keeps every boundary piece smooth, so the implicit
+# quadrature kernel (`src/implicit.jl`) stays high-order across
+# creases and corners that a single `max`/`min` level set would turn into a
+# non-differentiable kink (Saye's multi-component construction: R. I. Saye,
+# "High-order quadrature on multi-component domains implicitly defined by
+# multivariate polynomials", J. Comput. Phys. 448 (2022) 110720).
 
-Level-set description of a physical domain Ω for finite-cell-style immersed
-integration. The convention is `Ω = { x : φ(x) ≤ 0 }`.
+"""
+    LevelSet
+
+Abstract supertype of the CSG nodes describing an immersed domain Ω. The
+concrete nodes are a [`leaf`](@ref) (a single smooth level set with
+`Ω = {f ≤ 0}`) and the Boolean combinators built by `intersect`, `union`,
+`setdiff`, and [`complement`](@ref). A `LevelSet` is passed to
+[`physical_domain`](@ref).
+"""
+abstract type LevelSet end
+
+"""
+    Leaf(f, lipschitz)
+
+A single smooth level set `f` with `Ω_leaf = { x : f(x) ≤ 0 }`. `lipschitz` is
+a Lipschitz constant `L` of `f` (`|f(x) − f(y)| ≤ L‖x − y‖`); `Inf` disables
+the cheap sign certificate in the cell classifier and forces corner sampling.
+Construct with [`leaf`](@ref).
+"""
+struct Leaf{F} <: LevelSet
+    f::F
+    lipschitz::Float64
+end
+
+# n-ary intersection (Ω = ⋂ parts; membership = inside *all* parts) and union
+# (Ω = ⋃ parts; membership = inside *any* part). `Not` is set complement.
+struct AllOf{C<:Tuple} <: LevelSet
+    parts::C
+end
+struct AnyOf{C<:Tuple} <: LevelSet
+    parts::C
+end
+struct Not{C<:LevelSet} <: LevelSet
+    part::C
+end
+
+"""
+    leaf(f; lipschitz = Inf) -> Leaf
+
+Wrap a scalar level-set callback `f` (on `SVector{D,T}` coordinates) as a CSG
+leaf with `Ω_leaf = { x : f(x) ≤ 0 }`. `f` must accept `ForwardDiff.Dual`
+arguments so the quadrature kernel can take its gradient (pass an
+AD-compatible closure, or supply a finite-difference gradient downstream).
+`lipschitz` is the Lipschitz constant used by the cell classifier's sign
+certificate; `1.0` for a true signed-distance leaf, `Inf` to rely on corner
+sampling.
+"""
+function leaf(f; lipschitz::Real=Inf)
+    lipschitz > 0 || throw(ArgumentError("lipschitz must be positive; got $lipschitz"))
+    return Leaf(f, Float64(lipschitz))
+end
+
+# Bare callables passed to a combinator are auto-wrapped as default leaves.
+_as_levelset(g::LevelSet) = g
+_as_levelset(f) = leaf(f)
+
+"""
+    intersect(a::LevelSet, b...) -> LevelSet
+    union(a::LevelSet, b...) -> LevelSet
+    setdiff(a::LevelSet, b) -> LevelSet
+    complement(a) -> LevelSet
+
+CSG combinators on level sets (the `Base` set operations are extended for the
+[`LevelSet`](@ref) type). `intersect` builds `Ω = ⋂ {fᵢ ≤ 0}`, `union` builds
+`Ω = ⋃ {fᵢ ≤ 0}`, `setdiff(a, b) = a ∩ complement(b)` (e.g. an annulus as a
+disk minus a disk), and `complement` flips inside and outside. Bare callable
+arguments are auto-wrapped as default [`leaf`](@ref)s. The first argument must
+be a `LevelSet`, so wrap at least one operand with `leaf` (e.g.
+`intersect(leaf(f), g)`).
+"""
+Base.intersect(a::LevelSet) = a
+Base.intersect(a::LevelSet, b, rest...) = AllOf((a, _as_levelset(b), map(_as_levelset, rest)...))
+Base.union(a::LevelSet) = a
+Base.union(a::LevelSet, b, rest...) = AnyOf((a, _as_levelset(b), map(_as_levelset, rest)...))
+Base.setdiff(a::LevelSet, b) = AllOf((a, Not(_as_levelset(b))))
+
+"""
+    complement(a) -> LevelSet
+
+Set complement of a level set: inside and outside are swapped
+(`Ω ↦ ℝᴰ ∖ Ω`). `a` is a [`LevelSet`](@ref) or a bare callable (auto-wrapped as
+a default [`leaf`](@ref)). One of the CSG combinators alongside `intersect`,
+`union`, and `setdiff`; pass the result to [`physical_domain`](@ref).
+"""
+complement(a) = Not(_as_levelset(a))
+
+# ── Tree evaluation ───────────────────────────────────────────────────────────
+
+# Membership test x ∈ Ω. A leaf is inside where f ≤ 0; intersection/union/
+# complement combine with all/any/not. Short-circuiting is fine here (no
+# index bookkeeping), unlike the classifier's three-valued walk below.
+_inside(l::Leaf, x) = l.f(x) <= 0
+_inside(n::AllOf, x) = all(p -> _inside(p, x), n.parts)
+_inside(n::AnyOf, x) = any(p -> _inside(p, x), n.parts)
+_inside(n::Not, x) = !_inside(n.part, x)
+
+# A single scalar that is ≤ 0 exactly on Ω, reconstructed from the tree
+# (intersection → max, union → min, complement → negate). This is the
+# representation the kernel deliberately avoids for *integration* (its kinks
+# are why we carry leaves separately), but it is the right thing to *display*:
+# a contour at 0 reproduces ∂Ω. Used by VTK export and nowhere in the hot path.
+_value(l::Leaf, x) = l.f(x)
+_value(n::AllOf, x) = maximum(p -> _value(p, x), n.parts)
+_value(n::AnyOf, x) = minimum(p -> _value(p, x), n.parts)
+_value(n::Not, x) = -_value(n.part, x)
+
+# Collect the leaves in a stable depth-first order; the quadrature kernel
+# partitions by these and the classifier certifies each one's sign.
+_collect_leaves!(acc, l::Leaf) = (push!(acc, l); acc)
+_collect_leaves!(acc, n::AllOf) = (foreach(p -> _collect_leaves!(acc, p), n.parts); acc)
+_collect_leaves!(acc, n::AnyOf) = (foreach(p -> _collect_leaves!(acc, p), n.parts); acc)
+_collect_leaves!(acc, n::Not) = _collect_leaves!(acc, n.part)
+_leaves(g::LevelSet) = _collect_leaves!(Leaf[], g)
+
+# ── PhysicalDomain ────────────────────────────────────────────────────────────
+
+"""
+    PhysicalDomain{G,T}(geometry, alpha, subcell_length_scale, max_depth,
+                        moment_order_factor, target_residual)
+
+CSG level-set description of a physical domain Ω for finite-cell-style immersed
+integration. `Ω = { x : x ∈ geometry }`, where `geometry` is a
+[`LevelSet`](@ref) tree of smooth leaves combined by `intersect`/`union`/
+`setdiff`/`complement` (a single [`leaf`](@ref) is the degenerate case, with
+the familiar `Ω = {φ ≤ 0}`).
 
 Fields:
 
-  - `phi(x)`: scalar-valued level set on `SVector{D,T}` coordinates. A true
-    signed-distance function is allowed but not required.
-  - `lipschitz::T`: a Lipschitz constant `L` with
-    `|φ(x) − φ(y)| ≤ L · ‖x − y‖`. `L = 1` for a true SDF; passing `Inf`
-    disables the cheap Lipschitz certificate and forces classification by
-    corner sampling + octree subdivision down to the per-cell length-scale
-    bound.
+  - `geometry::G`: the CSG level-set tree. Each leaf carries its own Lipschitz
+    constant; the tree's Boolean structure defines membership.
   - `alpha::T`: fictitious-region stabilization weight (α-FCM). `0` is the
-    strict cut path (cells fully outside Ω are dropped from the dof
-    layout); `> 0` keeps fictitious cells active with quadrature weights
-    pre-multiplied by `α`.
-  - `subcell_length_scale::T`: target octree leaf size, in physical units.
-    The classifier and moment integrator descend until each leaf has its
-    largest axis extent `≤ subcell_length_scale` (capped by `max_depth`).
-    This is the primary accuracy knob: smaller leaves resolve the rim
-    more finely. Pick it relative to the smallest geometric feature
-    (e.g. half the smallest curvature radius). When the input box is
-    already at or below the scale, the classifier emits the consensus
-    verdict immediately without subdividing — so coarse-mesh and
-    fine-mesh levels in a superposition `Space` share the same
-    `PhysicalDomain` without overpaying on the fine level.
-  - `max_depth::Int`: safety cap on octree recursion. Fires only when
-    `subcell_length_scale` would call for more levels than this; the
-    default keeps even pathological combinations bounded. The cap matches
-    the legacy "fixed depth" mode when `subcell_length_scale` is large
-    enough to never bind.
-  - `moment_order_factor::Int`: multiplier on the NNMF moment-fit basis
-    order per axis. The actual moment order chosen for a cut region is
-    `factor × max(level.order)` over the region's parents. `factor = 2`
-    (default) integrates trial × test products exactly on the moment
-    basis, matching what tensor Gauss does on `:full` regions.
-    `factor = 1` halves the basis but only integrates source-style
-    (degree-`p`) integrands exactly — useful when the bilinear-form
-    approximation is acceptable and cut-cell speed matters.
+    strict cut path (cells fully outside Ω are dropped from the dof layout);
+    `> 0` keeps fictitious cells active with quadrature weights pre-multiplied
+    by `α`.
+  - `subcell_length_scale::T`: target octree leaf size, in physical units. The
+    cell classifier descends until each leaf has its largest axis extent
+    `≤ subcell_length_scale` (capped by `max_depth`). It governs cut/full/
+    fictitious classification and the quadrature kernel's subdivision budget on
+    non-graph-like cells; smooth cut cells get exact, depth-independent moments
+    from the implicit-quadrature kernel (see `src/fcm.jl`), so on those cells
+    accuracy does not depend on this scale. Pick it relative to the smallest
+    geometric feature you must classify cleanly.
+  - `max_depth::Int`: safety cap on octree recursion.
+  - `moment_order_factor::Int`: multiplier on the NNMF moment-fit basis order
+    per axis (`factor × max(level.order)` over the region's parents). `2`
+    (default) integrates trial × test products exactly; `1` halves the basis.
   - `target_residual::T`: NNMF L² residual the moment-fit aims for in cut
-    regions. Default `1e-6` is calibrated to the natural stair-step
-    accuracy floor of the octree moment integration. QuESo's reference
-    implementation hardcodes `1e-10` and its shipped examples typically
-    run `1e-8`, but those rely on QuESo's B-rep-exact surface-integral
-    moments — unreachable in this port's stair-step integrator (see
-    `src/fcm.jl` for the geometry-kernel deviation). Tightening below
-    `1e-6` without also tightening `subcell_length_scale` triggers
-    retries the NNLS cannot satisfy and allocates gigabytes for no
-    accuracy gain. Rule of thumb: lower this by roughly two decades for
-    every halving of the length scale.
+    regions. Default `1e-6`; the exact kernel reaches far below it, so this
+    only bounds the conditioning retry.
 
 Construct via [`physical_domain`](@ref).
 """
-struct PhysicalDomain{F,T<:Real}
-    phi::F
-    lipschitz::T
+struct PhysicalDomain{G<:LevelSet,T<:Real}
+    geometry::G
     alpha::T
     subcell_length_scale::T
     max_depth::Int
@@ -66,36 +171,25 @@ struct PhysicalDomain{F,T<:Real}
 end
 
 """
-    physical_domain(phi; lipschitz=Inf, alpha=0.0, subcell_length_scale,
+    physical_domain(geometry; lipschitz=Inf, alpha=0.0, subcell_length_scale,
                     max_depth=8, moment_order_factor=2, target_residual=1e-6)
 
-Construct a [`PhysicalDomain`](@ref). `phi(x)` must return a real scalar
-with `phi(x) ≤ 0` inside Ω.
+Construct a [`PhysicalDomain`](@ref). `geometry` is either a [`LevelSet`](@ref)
+CSG tree (built from [`leaf`](@ref) and `intersect`/`union`/`setdiff`/
+[`complement`](@ref)) or a bare scalar callable `φ`, which is auto-wrapped as a
+single leaf with `Ω = {φ ≤ 0}` — preserving the single-level-set ergonomics
+`physical_domain(φ; lipschitz=…)`. The `lipschitz` keyword applies only to that
+auto-wrapped single leaf; for a CSG tree, set each leaf's Lipschitz constant on
+the `leaf(...)` call instead.
 
-`subcell_length_scale` is the **required** primary accuracy knob: the
-target octree leaf size in the same physical units as `phi`'s argument.
-The classifier and moment integrator subdivide until each leaf's largest
-axis extent is at most this value (or `max_depth` recursion levels have
-been spent, whichever comes first). Pick it relative to the smallest
-geometric feature you need integrated cleanly (e.g. half the smallest
-curvature radius).
-
-`max_depth` (default `8`) is a hard safety cap on octree depth; it fires
-only when `subcell_length_scale` would call for more levels than this.
-
-`lipschitz` defaults to `Inf` (no certificate; pure sampling-based
-classification). `alpha = 0` is the strict-cut path (fictitious cells
-dropped); pass `alpha > 0` for α-FCM stabilization on fictitious cells.
-`moment_order_factor` tunes the NNMF basis order; see the
-[`PhysicalDomain`](@ref) docstring for the cost / accuracy trade-off.
-`target_residual` is the NNMF residual the moment-fit aims for in cut
-regions; the default is matched to the natural stair-step accuracy of
-the octree moment integration.
+`subcell_length_scale` is the **required** classifier accuracy / subdivision
+scale (see the [`PhysicalDomain`](@ref) docstring). `alpha = 0` is the
+strict-cut path; `alpha > 0` enables α-FCM. `moment_order_factor` and
+`target_residual` tune the NNMF moment fit.
 """
-function physical_domain(phi; lipschitz::Real=Inf, alpha::Real=0.0, subcell_length_scale::Real,
-                         max_depth::Integer=8, moment_order_factor::Integer=2,
-                         target_residual::Real=1.0e-6)
-    lipschitz > 0 || throw(ArgumentError("lipschitz must be positive; got $lipschitz"))
+function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0,
+                         subcell_length_scale::Real, max_depth::Integer=8,
+                         moment_order_factor::Integer=2, target_residual::Real=1.0e-6)
     alpha >= 0 || throw(ArgumentError("alpha must be ≥ 0; got $alpha"))
     subcell_length_scale > 0 ||
         throw(ArgumentError("subcell_length_scale must be > 0; got $subcell_length_scale"))
@@ -104,99 +198,121 @@ function physical_domain(phi; lipschitz::Real=Inf, alpha::Real=0.0, subcell_leng
         throw(ArgumentError("moment_order_factor must be ≥ 1; got $moment_order_factor"))
     target_residual > 0 ||
         throw(ArgumentError("target_residual must be positive; got $target_residual"))
-    T = promote_type(typeof(float(lipschitz)), typeof(float(alpha)),
-                     typeof(float(subcell_length_scale)), typeof(float(target_residual)))
-    return PhysicalDomain{typeof(phi),T}(phi, T(lipschitz), T(alpha), T(subcell_length_scale),
-                                         Int(max_depth), Int(moment_order_factor),
-                                         T(target_residual))
+    # A bare callable becomes a single leaf, honouring the `lipschitz` keyword;
+    # an explicit CSG tree carries per-leaf Lipschitz constants already.
+    g = geometry isa LevelSet ? geometry : leaf(geometry; lipschitz=lipschitz)
+    T = promote_type(typeof(float(alpha)), typeof(float(subcell_length_scale)),
+                     typeof(float(target_residual)))
+    return PhysicalDomain{typeof(g),T}(g, T(alpha), T(subcell_length_scale), Int(max_depth),
+                                       Int(moment_order_factor), T(target_residual))
 end
 
-# Number of octree levels needed to drive `box`'s largest axis extent down
-# to `physical.subcell_length_scale`, capped at `physical.max_depth`. Used
-# by every recursive walker in this file and in `src/fcm.jl` so the
-# accuracy bound is uniform across mesh levels and across the classify /
-# moment-integrate pipeline. Boxes already at or below the scale return
-# 0 (no subdivision; the classifier still emits a verdict via Lipschitz /
-# corner sampling).
+"""
+    levelset_value(physical, x) -> Real
+
+Scalar reconstruction of the domain's level set at `x` that is `≤ 0` exactly on
+Ω (intersection → max of children, union → min, complement → negate, leaf →
+`f(x)`). Intended for visualization — a contour at level 0 reproduces ∂Ω — not
+for integration, which uses the separate leaves.
+"""
+levelset_value(physical::PhysicalDomain, x) = _value(physical.geometry, x)
+
+# ── Box certificates ──────────────────────────────────────────────────────────
+
+# Number of octree levels needed to drive `box`'s largest axis extent down to
+# `physical.subcell_length_scale`, capped at `physical.max_depth`. Shared by the
+# classifier and the quadrature kernel's subdivision budget so the resolution
+# contract is uniform. Boxes already at or below the scale return 0.
 function _effective_subcell_depth(physical::PhysicalDomain, box::AxisBox)
     max_extent = maximum(box.upper - box.lower)
     max_extent <= physical.subcell_length_scale && return 0
     return min(physical.max_depth, ceil(Int, log2(max_extent / physical.subcell_length_scale)))
 end
 
-# Half-diagonal of an axis-aligned box — the radius of the smallest ball
-# enclosing the box. Used by the Lipschitz certificate in `_classify_box`:
-# for a Lipschitz `φ` and any point `y` inside the box, |φ(y) − φ(c)| ≤ L·r
-# where `c` is the center and `r` is the half-diagonal returned here, so a
-# sign of `φ(c)` whose magnitude exceeds `L·r` is uniform across the box.
+# Half-diagonal of an axis-aligned box — the radius of the smallest enclosing
+# ball. Used by the per-leaf Lipschitz certificate: for a Lipschitz `f` and any
+# point `y` in the box, |f(y) − f(c)| ≤ L·r with `c` the center and `r` this
+# radius, so a center sign whose magnitude exceeds `L·r` is uniform on the box.
 _half_diagonal(b::AxisBox) = norm(b.upper - b.lower) / 2
 
-# Sample φ at the 2^D corners of `box` and tally the inside/outside counts.
-# The center sample `phi_c` is reused (it has already been evaluated by
-# `_classify_box` for the Lipschitz certificate), so we count it explicitly
-# instead of re-evaluating φ at the center. Corners — rather than interior
-# points — are the natural sample set for an axis-aligned box: they are the
-# vertices whose signs determine which faces ∂Ω crosses, and they double as
-# the leaf-vertex set when the octree recurses one level deeper.
-function _corner_signs(physical::PhysicalDomain, box::AxisBox{D,T}, phi_c) where {D,T}
-    inside = (phi_c <= zero(phi_c)) ? 1 : 0
-    outside = (phi_c <= zero(phi_c)) ? 0 : 1
+# ── Cell classifier ───────────────────────────────────────────────────────────
+
+# Three-valued (Kleene) membership certificate over the CSG tree: returns
+# `+1` if the box is certainly inside Ω, `-1` if certainly outside, `0` if
+# undetermined. Each leaf is certified by its Lipschitz bound (|f(c)| > L·r ⇒
+# uniform sign); the Boolean combinators propagate certainty without
+# enumerating sign patterns — e.g. a union is certainly inside as soon as one
+# part is, certainly outside only if every part is. This is what lets a cut
+# cell of one component be classified `:full`/`:fictitious` when another
+# component dominates it.
+function _tri(l::Leaf, box::AxisBox)
+    fc = l.f(center(box))
+    thr = l.lipschitz * _half_diagonal(box)
+    return fc < -thr ? 1 : (fc > thr ? -1 : 0)
+end
+function _tri(n::AllOf, box::AxisBox)
+    r = 1
+    for p in n.parts
+        t = _tri(p, box)
+        t == -1 && return -1
+        t == 0 && (r = 0)
+    end
+    return r
+end
+function _tri(n::AnyOf, box::AxisBox)
+    r = -1
+    for p in n.parts
+        t = _tri(p, box)
+        t == 1 && return 1
+        t == 0 && (r = 0)
+    end
+    return r
+end
+_tri(n::Not, box::AxisBox) = -_tri(n.part, box)
+
+# Tally Ω-membership at the box center and its 2ᴰ corners. Mixed counts prove
+# ∂Ω crosses the box; corners — rather than interior points — are the natural
+# sample set for an axis-aligned box and double as the child vertices when the
+# octree recurses.
+function _corner_membership(geometry::LevelSet, box::AxisBox{D,T}) where {D,T}
+    inside = _inside(geometry, center(box)) ? 1 : 0
+    outside = 1 - inside
     for ci in CartesianIndices(ntuple(_ -> 0:1, D))
         x = SVector{D,T}(ntuple(d -> ci.I[d] == 0 ? box.lower[d] : box.upper[d], D))
-        phi_x = physical.phi(x)
-        phi_x <= zero(phi_x) ? (inside += 1) : (outside += 1)
+        _inside(geometry, x) ? (inside += 1) : (outside += 1)
     end
     return inside, outside
 end
 
 # Recursive classifier returning one of `:full`, `:cut`, `:fictitious`.
+# Strategy, cheapest first:
 #
-# Strategy, in order of preference (cheapest to most expensive):
+#   1. Three-valued Lipschitz certificate on the CSG tree. A definite verdict
+#      settles `:full`/`:fictitious` with no sampling.
+#   2. Corner membership. Mixed inside/outside proves ∂Ω crosses the box.
+#   3. Octree recursion. Signs agree but the certificate did not fire; bisect
+#      into 2ᴰ children and recurse. Any `:cut` child, or any disagreement
+#      between `:full`/`:fictitious` children, makes the parent `:cut`.
+#   4. Depth budget exhausted with agreeing samples: trust the consensus.
 #
-#   1. Lipschitz certificate. If |φ(center)| > L · r (r = half-diagonal),
-#      `φ` is sign-uniform across the box and we are exactly inside (`:full`)
-#      or outside (`:fictitious`) Ω. Free when a Lipschitz `L` is supplied;
-#      skipped when `L = Inf`.
-#   2. Corner sampling. Evaluate φ at the 2^D vertices. Mixed signs prove
-#      the boundary crosses the box and we return `:cut` immediately.
-#   3. Octree recursion. Signs all agree but the certificate did not fire
-#      (so we cannot rule out a small cavity strictly inside the box). If
-#      depth budget remains, bisect the box into 2^D equal children and
-#      classify each. Any child returning `:cut` propagates; any
-#      disagreement between children's `:full`/`:fictitious` verdicts also
-#      means the boundary crosses the parent and we return `:cut`. If every
-#      child returns the same verdict, propagate it.
-#   4. Depth budget exhausted with agreeing samples. Trust the consensus
-#      verdict — there is no further evidence available.
-#
-# The depth budget caps the recursive cost at `(2^D)^max_depth` leaf
-# classifications per call. The effective depth is set per top-box from
-# `_effective_subcell_depth`, which drives the leaf size below
-# `physical.subcell_length_scale` on the largest input box.
-function _classify_box(physical::PhysicalDomain, box::AxisBox{D,T}, depth::Integer,
+# The single-leaf case reduces exactly to the Lipschitz-then-corner strategy
+# the package used before CSG.
+function _classify_box(geometry::LevelSet, box::AxisBox{D,T}, depth::Integer,
                        max_depth::Integer) where {D,T}
-    c = center(box)
-    r = _half_diagonal(box)
-    phi_c = physical.phi(c)
-    threshold = physical.lipschitz * r
+    t = _tri(geometry, box)
+    t == 1 && return :full
+    t == -1 && return :fictitious
 
-    phi_c < -threshold && return :full
-    phi_c > threshold && return :fictitious
-
-    n_inside, n_outside = _corner_signs(physical, box, phi_c)
+    n_inside, n_outside = _corner_membership(geometry, box)
     (n_inside > 0 && n_outside > 0) && return :cut
 
     if depth < max_depth
-        # Bisection: every child shares one corner with the parent (the
-        # box center) and inherits seven of its corners' coordinates from
-        # the parent's `lower`/`upper`. The 2^D children are enumerated by
-        # iterating `CartesianIndices(ntuple(_ -> 0:1, D))` — bit 0 in each
-        # axis takes `lower`, bit 1 takes `c`.
+        c = center(box)
         result::Union{Nothing,Symbol} = nothing
         for ci in CartesianIndices(ntuple(_ -> 0:1, D))
             child_lower = SVector{D,T}(ntuple(d -> ci.I[d] == 0 ? box.lower[d] : c[d], D))
             child_upper = SVector{D,T}(ntuple(d -> ci.I[d] == 0 ? c[d] : box.upper[d], D))
-            child_state = _classify_box(physical, AxisBox{D,T}(child_lower, child_upper), depth + 1,
+            child_state = _classify_box(geometry, AxisBox{D,T}(child_lower, child_upper), depth + 1,
                                         max_depth)
             if result === nothing
                 result = child_state
@@ -214,32 +330,26 @@ end
     classify_cell(physical, box) -> Symbol
     classify_cell(physical, box, cache) -> Symbol
 
-Classify an axis-aligned `box` against `physical`'s level set. Returns one
+Classify an axis-aligned `box` against `physical`'s CSG level set. Returns one
 of `:full` (entirely inside Ω), `:cut` (crossed by ∂Ω), or `:fictitious`
-(entirely outside Ω). Uses the Lipschitz certificate first and falls back
-to octree-bounded corner sampling; see the comment block on
+(entirely outside Ω). Uses the three-valued Lipschitz certificate first and
+falls back to octree-bounded corner sampling; see the comment block on
 `_classify_box` for the full strategy.
 
 The 3-arg form memoizes the result by `(box.lower, box.upper)` in a
-caller-owned `Dict`. A prepared model shares one cache between the
-cell-level fold (which classifies every level's cells once at construction
-time) and the per-region dispatch in the integration plan — halving the
-classification work in the common single-level case where the region and
-cell boxes coincide.
+caller-owned `Dict`, shared between the cell-level fold and the per-region
+integration dispatch.
 """
 function classify_cell(physical::PhysicalDomain, box::AxisBox)
-    _classify_box(physical, box, 0, _effective_subcell_depth(physical, box))
+    return _classify_box(physical.geometry, box, 0, _effective_subcell_depth(physical, box))
 end
 
-# Memoisation cache for `classify_cell`: keyed by the box corner pair,
-# valued by the classification verdict. A single cache is threaded through
-# `prepare` and `move!` so the cell-level fold and the per-region dispatch
-# share the work.
+# Memoisation cache for `classify_cell`, keyed by the box corner pair.
 const _ClassifyCache{D,T} = Dict{Tuple{SVector{D,T},SVector{D,T}},Symbol}
 
 function classify_cell(physical::PhysicalDomain, box::AxisBox{D,T},
                        cache::_ClassifyCache{D,T}) where {D,T}
     return get!(cache, (box.lower, box.upper)) do
-        _classify_box(physical, box, 0, _effective_subcell_depth(physical, box))
+        _classify_box(physical.geometry, box, 0, _effective_subcell_depth(physical, box))
     end
 end

@@ -75,10 +75,15 @@ const E = 1.0
 const r_inner = 0.25
 const r_outer = 1.0
 
-# Level set for the annulus `Ω = { r_i ≤ ‖x‖ ≤ r_o }`. Both pieces
-# `r_i − r` and `r − r_o` are 1-Lipschitz; their max is 1-Lipschitz
-# and vanishes on `∂Ω`.
-phi(x) = max(r_inner - sqrt(x[1]^2 + x[2]^2), sqrt(x[1]^2 + x[2]^2) - r_outer)
+# Annulus `Ω = { r_i ≤ ‖x‖ ≤ r_o }` as a CSG intersection of two smooth disk
+# level sets, `‖x‖ − r_o ≤ 0` and `r_i − ‖x‖ ≤ 0`. Carrying the two circle
+# boundaries separately — rather than collapsing them into a single
+# `max(r_i − ‖x‖, ‖x‖ − r_o)`, whose mid-radius crease has a discontinuous
+# gradient — lets the implicit-quadrature kernel integrate both boundaries at
+# high order (machine-accurate moments on the smooth rim cut cells).
+r_norm(x) = sqrt(x[1]^2 + x[2]^2)
+annulus_geometry = intersect(leaf(x -> r_norm(x) - r_outer; lipschitz=1.0),
+                             leaf(x -> r_inner - r_norm(x); lipschitz=1.0))
 
 # Analytic displacement: u(x) = u_r(r) · r̂ = -ln(r²)·x / (4 ln 2).
 exact(x) =
@@ -108,10 +113,11 @@ const box_extent = 1.0
 const h_nitsche = 2 * box_extent / cells_per_axis    # base cell size
 
 omega = box((-box_extent, -box_extent), (box_extent, box_extent))
-# Base cell size = 2 · box_extent / cells_per_axis = 0.25; aim for octree
-# leaves of ~0.0156 (i.e. cell / 16 = 4 levels), matching the original
-# `subcell_depth = 4` semantics on this geometry.
-annulus = physical_domain(phi; lipschitz=1.0,
+# `subcell_length_scale` now drives only the cut/full/fictitious classifier and
+# the kernel's subdivision budget on any non-graph-like cell; the smooth rim cut
+# cells get exact, depth-independent moments regardless. Base cell size = 0.25,
+# octree leaves of ~0.0156 (cell / 16).
+annulus = physical_domain(annulus_geometry;
                           subcell_length_scale=2 * box_extent / cells_per_axis / 2^4, max_depth=4)
 V = space(omega; cells=(cells_per_axis, cells_per_axis), order=order, physical=annulus)
 u = field(:u, V; components=2)
@@ -243,7 +249,7 @@ print_run_report("FCM annular plate (Ruess 2013, §4.2)", report;
                  parameters=(:cells => V.levels[1].mesh.cells, :order => V.levels[1].order,
                              :r_inner => r_inner, :r_outer => r_outer,
                              :subcell_length_scale => annulus.subcell_length_scale,
-                             :max_depth => annulus.max_depth, :lipschitz => annulus.lipschitz,
+                             :max_depth => annulus.max_depth, :geometry => "annulus = disk ∩ disk",
                              :E => E, :nu => 0.0, :nitsche_h => h_nitsche,
                              :nitsche_beta => nitsche_beta,
                              :outer_arc_segments => length(outer_arc.cells),
