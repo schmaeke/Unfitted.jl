@@ -143,15 +143,22 @@ Fields:
     strict cut path (cells fully outside Ω are dropped from the dof layout);
     `> 0` keeps fictitious cells active with quadrature weights pre-multiplied
     by `α`.
-  - `subcell_length_scale::T`: target octree leaf size, in physical units. The
-    cell classifier descends until each leaf has its largest axis extent
-    `≤ subcell_length_scale` (capped by `max_depth`). It governs cut/full/
-    fictitious classification and the quadrature kernel's subdivision budget on
-    non-graph-like cells; smooth cut cells get exact, depth-independent moments
-    from the implicit-quadrature kernel (see `src/fcm.jl`), so on those cells
-    accuracy does not depend on this scale. Pick it relative to the smallest
-    geometric feature you must classify cleanly.
-  - `max_depth::Int`: safety cap on octree recursion.
+  - `subcell_length_scale::T`: target box size, in physical units, for the
+    binary subdivision both the classifier and the moment-fit kernel share. A
+    box is bisected until its largest axis extent is `≤ subcell_length_scale`
+    (capped by `max_depth`); `_effective_subcell_depth` turns the two into a
+    single depth budget. It feeds exactly two consumers, both subdivision
+    budgets — not an octree moment grid:
+    (1) the cut/full/fictitious classifier, which bisects only when the
+    Lipschitz certificate and corner sampling cannot decide a box, so this is a
+    geometry-*robustness* knob (resolving thin or near-tangent features); and
+    (2) the implicit-quadrature kernel's fallback subdivision on *non-graph-like*
+    cut cells (a leaf with a turning point / multiple roots inside the box).
+    Smooth, graph-like cut cells get exact, depth-independent moments from the
+    kernel (see `src/fcm.jl`) and are never subdivided, so on those cells moment
+    accuracy does not depend on this scale at all. Pick it relative to the
+    smallest geometric feature you must classify cleanly.
+  - `max_depth::Int`: hard cap on the subdivision depth of both consumers above.
   - `moment_order_factor::Int`: multiplier on the NNMF moment-fit basis order
     per axis (`factor × max(level.order)` over the region's parents). `2`
     (default) integrates trial × test products exactly; `1` halves the basis.
@@ -219,10 +226,10 @@ levelset_value(physical::PhysicalDomain, x) = _value(physical.geometry, x)
 
 # ── Box certificates ──────────────────────────────────────────────────────────
 
-# Number of octree levels needed to drive `box`'s largest axis extent down to
-# `physical.subcell_length_scale`, capped at `physical.max_depth`. Shared by the
-# classifier and the quadrature kernel's subdivision budget so the resolution
-# contract is uniform. Boxes already at or below the scale return 0.
+# Number of binary-subdivision levels needed to drive `box`'s largest axis
+# extent down to `physical.subcell_length_scale`, capped at `physical.max_depth`.
+# Shared by the classifier and the quadrature kernel's subdivision budget so the
+# resolution contract is uniform. Boxes already at or below the scale return 0.
 function _effective_subcell_depth(physical::PhysicalDomain, box::AxisBox)
     max_extent = maximum(box.upper - box.lower)
     max_extent <= physical.subcell_length_scale && return 0
