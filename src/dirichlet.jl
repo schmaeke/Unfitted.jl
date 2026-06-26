@@ -504,10 +504,12 @@ function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T}, diric
     isempty(unknown_raws) && return layout
 
     raw_to_projection = Dict(raw => i for (i, raw) in pairs(unknown_raws))
-    rows = Int[]
-    cols = Int[]
-    vals = T[]
-    rhs = zeros(T, length(unknown_raws), layout.components)
+    nproj = length(unknown_raws)
+    # The constrained-boundary mass couples only the physically-Dirichlet
+    # dofs (a small set) and is dense-solved below, so it is accumulated
+    # directly into a dense matrix — no sparse intermediate.
+    mass = zeros(T, nproj, nproj)
+    rhs = zeros(T, nproj, layout.components)
 
     for condition in dirichlet
         for sides in _facets(condition.boundary, Val(D))
@@ -560,11 +562,9 @@ function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T}, diric
                                 for a in eachindex(test_trace.raw_dofs)
                                     row = get(raw_to_projection, test_trace.raw_dofs[a], 0)
                                     row == 0 && continue
-                                    push!(rows, row)
-                                    push!(cols, col)
-                                    push!(vals,
-                                          qweight * _test_value_contribution(mass_channels,
-                                                                             test_trace.values[a]))
+                                    mass[row, col] += qweight *
+                                                      _test_value_contribution(mass_channels,
+                                                                               test_trace.values[a])
                                 end
                             end
                         end
@@ -575,11 +575,10 @@ function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T}, diric
     end
 
     # Solve `M c = b` for every component. Cholesky first; pseudoinverse
-    # fallback on the rare indefinite case.
-    mass = sparse(rows, cols, vals, length(unknown_raws), length(unknown_raws))
-    dense_mass = Matrix(mass)
-    factor = cholesky(Symmetric(dense_mass); check=false)
-    projected = issuccess(factor) ? factor \ rhs : pinv(dense_mass) * rhs
+    # fallback on the rare indefinite case (degenerate / zero-area facets
+    # under heavy masking).
+    factor = cholesky(Symmetric(mass); check=false)
+    projected = issuccess(factor) ? factor \ rhs : pinv(mass) * rhs
 
     for (i, raw) in pairs(unknown_raws)
         for component in 1:layout.components

@@ -49,7 +49,7 @@ diagonal pattern `trial.component == test_component`.
 
 `symmetric` flags whether `a(u, v) == a(v, u)`. Symmetric forms are
 assembled in the lower triangle and mirrored, which roughly halves the
-COO-triplet volume.
+stored pattern and the scatter work.
 """
 struct WeakForm{B,L}
     bilinear::B

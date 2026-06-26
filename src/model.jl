@@ -170,6 +170,30 @@ end
 
 # ── Model and lifecycle ───────────────────────────────────────────────────────
 
+# Cached CSC sparsity pattern for a model's matrix assembly. Built once
+# per `model.version` (keyed additionally by the `on`-tag region set and
+# the symmetry flag) by `build_assembly_pattern` in `assembly.jl`; the
+# numeric scatter pass fills a matching `nzval` buffer slot-for-slot, so
+# a dof pair appearing in many integration boxes accumulates with `+=`
+# into one slot — peak memory is the final nnz, not the per-box
+# dense-block over-count.
+#
+# `colptr`/`rowval` are value-type-independent, so one pattern serves
+# mass / stiffness / Newton-tangent and every re-assembly. For symmetric
+# forms the pattern is the lower triangle (global row ≥ col), mirrored as
+# `A + Aᵀ − diag` at the end. `key` is a hash of the ordered region-list
+# set the pattern was built over, so a request touching a different set
+# of `on=` selectors rebuilds rather than reusing a stale pattern.
+# Defined here (rather than in `assembly.jl`) because it is cached on the
+# `Model` and this file is included first.
+struct AssemblyPattern
+    n::Int
+    colptr::Vector{Int}
+    rowval::Vector{Int}
+    symmetric::Bool
+    key::UInt
+end
+
 """
     Model{D,T,P}
 
@@ -209,6 +233,11 @@ re-thread a fresh value through. Fields:
     a cache entry).
   - `diagnostics::AssemblyDiagnostics` — diagnostics record, updated
     in place by every lifecycle event.
+  - `pattern::Union{Nothing,AssemblyPattern}` — cached CSC sparsity
+    pattern for matrix assembly. `nothing` until the first
+    matrix assembly builds it; cleared by every mutator (same
+    invalidation contract as `matrix`/`rhs`). Lets a Newton loop reuse
+    the pattern and re-run only the numeric scatter.
 """
 mutable struct Model{D,T,P}
     problem::P
@@ -220,6 +249,7 @@ mutable struct Model{D,T,P}
     facet_regions::Dict{BoundarySelector,Vector{FacetRegion{D,T}}}
     surface_regions::IdDict{Any,Vector{SurfaceRegion{D,T}}}
     diagnostics::AssemblyDiagnostics
+    pattern::Union{Nothing,AssemblyPattern}
 end
 
 # Pick out the Dirichlet conditions that apply to the field called
@@ -292,7 +322,8 @@ function prepare(problem::Problem{D,T}; kwargs...) where {D,T}
                                surface_region_count=_surface_region_count(surface_regions))
     _set_plan_stats!(diag, plan)
     return Model{D,T,typeof(effective_problem)}(effective_problem, 1, plan, layout, nothing,
-                                                nothing, facet_regions, surface_regions, diag)
+                                                nothing, facet_regions, surface_regions, diag,
+                                                nothing)
 end
 
 # Build the facet-region cache for a problem from every
@@ -465,6 +496,7 @@ function _invalidate_assembly!(model::Model{D,T},
                                tolerance::GeometryTolerance{T}=GeometryTolerance(T)) where {D,T}
     model.matrix = nothing
     model.rhs = nothing
+    model.pattern = nothing
     model.facet_regions = _resolve_facet_regions(model.problem, tolerance)
     model.surface_regions = _resolve_surface_regions(model.problem, tolerance)
     diag = AssemblyDiagnostics(dimension=D, active_unknowns=active_unknowns(model.dofs),
@@ -688,6 +720,12 @@ function update_dirichlet!(model::Model{D,T}, dirichlet) where {D,T}
     # entries into the RHS at assembly time), but dropping it too means
     # the next `solve!` cannot silently use a stale operator if the
     # caller also changes blocks or loads between steps.
+    #
+    # `model.pattern` is deliberately retained: `update_dirichlet!` only
+    # rewrites constrained *values*, leaving the constrained-dof set — and
+    # therefore `active_unknowns` and every region's `active_dofs` — fixed,
+    # so the cached sparsity pattern stays structurally valid and the next
+    # assembly reuses it (the version is not bumped either).
     model.matrix = nothing
     model.rhs = nothing
 

@@ -4,11 +4,14 @@
 # live in `problems.jl` and the prepared-problem lifecycle (`Model`,
 # `prepare`, `move!`, …) lives in `model.jl`.
 #
-# The strategy is the classical sparse-COO assembly path: walk every
-# admissible integration region, evaluate basis values and physical
-# gradients per parent level, and accumulate the user's weak form into
-# a thread-local local matrix / rhs that gets emitted as
-# `(row, col, val)` triplets at the end of the region.
+# The strategy is symbolic + numeric (Gustavson) sparse assembly. A
+# symbolic pass builds the CSC sparsity pattern once (cached on the
+# `Model`); the numeric pass walks every admissible integration region,
+# evaluates basis values and physical gradients per parent level,
+# accumulates the user's weak form into a thread-local local matrix /
+# rhs, and scatter-adds that block into the prebuilt `nzval`. A dof pair
+# appearing in many regions therefore accumulates with `+=` into one slot
+# rather than inflating a triplet array.
 #
 # Two contracts shape the API:
 #
@@ -192,20 +195,165 @@ end
 value(::Nothing, args...) = _no_form_state()
 field_gradient(::Nothing, args...) = _no_form_state()
 
-# ── Assembly workspace and hot loop ───────────────────────────────────────────
+# ── Symbolic assembly pattern (Gustavson) ─────────────────────────────────────
 
-# Build a sparse matrix from COO triplets. Symmetric forms are assembled
-# in the lower triangle; mirroring as `A + Aᵀ − diag(A)` yields the
-# symmetric matrix exactly (IEEE addition is commutative, so the result
-# is symmetric to the bit). `dropzeros!` collapses any explicit zeros
-# produced by Dirichlet column elimination.
-function _sparse_from_triplets(rows::Vector{Int}, cols::Vector{Int}, vals::Vector{T}, n::Int,
-                               symmetric::Bool) where {T}
-    matrix = sparse(rows, cols, vals, n, n)
-    symmetric && (matrix = matrix + matrix' - spdiagm(0 => diag(matrix)))
+# The `AssemblyPattern` struct itself lives in `model.jl` (it is cached
+# model state, and `model.jl` is included before this file); the builder
+# and the numeric scatter that consume it live here.
+
+# Refill `ws.active_dofs` for one region with no quadrature or kernel
+# work — runs the same `_local_active_dof_table!` construction the
+# numeric path uses, so the symbolic pattern is guaranteed to enumerate
+# exactly the dof pairs assembly emits (active branches only; Dirichlet
+# and strongly-eliminated raws resolve to global id 0 and never enter
+# `active_dofs`). Returns the workspace's `active_dofs` vector, valid
+# until the next call.
+# (`ws` is an `AssemblyWorkspace`, defined further down this file.)
+function _region_active_dofs!(ws, model::Model, parents)
+    field_data = [[_parent_dof_data(ws, layout, parent) for parent in parents]
+                  for layout in model.dofs.fields]
+    _local_active_dof_table!(ws, field_data, model.dofs)
+    return ws.active_dofs
+end
+
+# Build the CSC sparsity pattern as the union over every region of the
+# dense coupling block on that region's `active_dofs` (lower triangle
+# when `symmetric`, i.e. global row ≥ col).
+#
+# `feed!` is a function that, given a `visit` callback, calls
+# `visit(active::Vector{Int})` once per dense block to include — one per
+# region for volume/facet assembly, one per (region, field) for the L²
+# transfer mass. The `active` vector may alias workspace storage; the
+# builder copies it.
+#
+# Gustavson's column dedup uses an `O(nactive)` `marker` array — but the
+# trick is correct only when each output column is processed contiguously
+# (`marker[row] == col` must persist across all of that column's
+# contributions). The blocks are not column-ordered, so we first build a
+# dof→blocks inverted index and then sweep one column at a time. The
+# index plus the stored per-block active sets cost `O(Σ nactive)` (one
+# entry per block/dof incidence) — far below the `O(Σ nactive²)`
+# dense-block over-count; the final pattern is the only nnz-sized
+# allocation.
+#
+# Two passes over the columns: the first counts entries per column to
+# build `colptr`; the second fills `rowval` and sorts each column's rows
+# (CSC requires ascending row indices, which the numeric scatter's
+# `searchsortedfirst` also relies on). `marker` need not be reset between
+# columns within a pass — the column id is strictly increasing, so a
+# stale `marker[row]` from an earlier column never equals the current
+# one — but it is cleared between the two passes.
+function _gustavson_pattern(feed!, n::Int, symmetric::Bool, key::UInt)
+    block_actives = Vector{Vector{Int}}()
+    col_blocks = [Int[] for _ in 1:n]
+    feed!() do active
+        push!(block_actives, copy(active))
+        b = length(block_actives)
+        @inbounds for j in active
+            push!(col_blocks[j], b)
+        end
+        return nothing
+    end
+
+    marker = zeros(Int, n)
+    colptr = Vector{Int}(undef, n + 1)
+    colptr[1] = 1
+    @inbounds for j in 1:n
+        cnt = 0
+        for b in col_blocks[j], i in block_actives[b]
+            (symmetric && i < j) && continue
+            if marker[i] != j
+                marker[i] = j
+                cnt += 1
+            end
+        end
+        colptr[j + 1] = colptr[j] + cnt
+    end
+
+    rowval = Vector{Int}(undef, colptr[n + 1] - 1)
+    fill!(marker, 0)
+    @inbounds for j in 1:n
+        pos = colptr[j]
+        for b in col_blocks[j], i in block_actives[b]
+            (symmetric && i < j) && continue
+            if marker[i] != j
+                marker[i] = j
+                rowval[pos] = i
+                pos += 1
+            end
+        end
+        sort!(view(rowval, colptr[j]:(colptr[j + 1] - 1)))
+    end
+
+    return AssemblyPattern(n, colptr, rowval, symmetric, key)
+end
+
+# Assembly pattern over a model's volume / facet region lists: feed one
+# dense block per region from its (all-field) `active_dofs`.
+function build_assembly_pattern(model::Model{D,T}, region_lists, symmetric::Bool,
+                                key::UInt) where {D,T}
+    ws = _assembly_workspace(model)
+    return _gustavson_pattern(active_unknowns(model.dofs), symmetric, key) do visit
+        for regions in region_lists, region in regions
+            visit(_region_active_dofs!(ws, model, region.parents))
+        end
+    end
+end
+
+# Ordered region lists a matrix assembly over `blocks` walks — the volume
+# integration plan (when any block is volume-tagged) followed by each
+# unique `on=` selector's region list, in the same order
+# `_assemble_partitioned` visits them. Returns the lists plus a hash
+# signature of that set, used as the pattern cache key (loads never
+# contribute matrix entries, so they are ignored here).
+function _assembly_region_lists(model::Model, blocks)
+    volume_blocks, _, partitions = _partition_forms_by_on(blocks, ())
+    lists = Any[]
+    key = hash(:assembly_pattern)
+    if !isempty(volume_blocks)
+        push!(lists, integration_plan(model).regions)
+        key = hash(:volume, key)
+    end
+    for (selector, _) in partitions
+        regions = _resolve_on_regions(model, selector)
+        isempty(regions) && continue
+        push!(lists, regions)
+        key = hash(selector, key)
+    end
+    return lists, key
+end
+
+# Return a CSC pattern matching `blocks` and `symmetric`, reusing the one
+# cached on `model` when the region-set key and symmetry agree (so a
+# Newton loop's repeated assembly hits the cache and only the numeric
+# scatter re-runs). Rebuilds and re-caches otherwise.
+function _assembly_pattern!(model::Model, blocks, symmetric::Bool)
+    region_lists, key = _assembly_region_lists(model, blocks)
+    cached = model.pattern
+    if cached !== nothing && cached.symmetric == symmetric && cached.key == key
+        return cached
+    end
+    pattern = build_assembly_pattern(model, region_lists, symmetric, key)
+    model.pattern = pattern
+    return pattern
+end
+
+# Assemble the final sparse matrix from a filled `nzval` buffer and the
+# cached pattern. `colptr`/`rowval` are copied so the cached pattern is
+# never mutated by `dropzeros!`; `nzval` is taken by reference (safe
+# because the caller's `ScatterSink` is single-use). Symmetric forms are
+# scattered in the
+# lower triangle and mirrored here as `A + Aᵀ − diag`; `dropzeros!`
+# collapses the explicit zeros left by Dirichlet column elimination and
+# any structurally-present-but-untouched pattern slots.
+function _matrix_from_pattern(pattern::AssemblyPattern, nzval::Vector{T}) where {T}
+    matrix = SparseMatrixCSC(pattern.n, pattern.n, copy(pattern.colptr), copy(pattern.rowval), nzval)
+    pattern.symmetric && (matrix = matrix + matrix' - spdiagm(0 => diag(matrix)))
     dropzeros!(matrix)
     return matrix
 end
+
+# ── Assembly workspace and hot loop ───────────────────────────────────────────
 
 # Per-parent, per-region dof distribution table built by
 # `_local_parent_dofs!`. Routes each cell-local basis function (and
@@ -255,7 +403,7 @@ end
 # The shared `local_by_global` cache ensures that a dof shared between
 # two parents in the region gets the same local row/column on both —
 # i.e. their stiffness contributions land at the same local matrix
-# position before being emitted as triplets. Used inside
+# position before being scattered into the matrix. Used inside
 # `_assemble_region!` per region.
 function _local_parent_dofs!(active_dofs::Vector{Int}, local_by_global::Dict{Int,Int}, data,
                              layout::FieldLayout{D,T}) where {D,T}
@@ -322,7 +470,7 @@ end
 #
 # Returning a plain `Matrix{Int}` keeps the per-parent allocation at one
 # array and lets the matching `_accumulate_qpoint!` overload emit each
-# triplet with a single indexed read — the pre-constraint-primitive
+# matrix entry with a single indexed read — the pre-constraint-primitive
 # cost. The shared `local_by_global` cache ensures a dof shared between
 # two parents gets the same local row/column on both.
 function _local_parent_dofs_simple!(active_dofs::Vector{Int}, local_by_global::Dict{Int,Int}, data,
@@ -381,32 +529,87 @@ function _bilinear_channels(form::WeakForm, q, trial::TrialChannels{D,T},
     return _as_test_channels(form.bilinear(q, trial), Val(D), T)
 end
 
-# Emit a region's local matrix and rhs to the global COO triplet and rhs
-# arrays. The rhs is scattered into the global rhs by row; the matrix
-# is emitted column-major so the resulting sparse construction is more
-# cache-friendly. Zero entries (e.g. from never-touched constrained
-# columns) are skipped, both to keep the triplet list short and so
-# `dropzeros!` does not have to do the work later.
-function _emit_local_system!(rows::Vector{Int}, cols::Vector{Int}, vals::Vector{T}, rhs::Vector{T},
-                             active_dofs::AbstractVector{Int}, local_matrix::AbstractMatrix{T},
+# ── Scatter sink (matrix destination for one assembly pass) ───────────────────
+
+# Where a region's local matrix block is deposited. The right-hand side
+# always accumulates into a dense vector; only the matrix destination
+# varies behind the sink, so the three `_assemble_region!` overloads and
+# the whole hot loop stay agnostic to it. Two cases:
+#
+#   * `ScatterSink` — `+=` into the pre-built CSC `nzval` slot located via
+#     the cached pattern. The matrix path proper.
+#   * `nothing` — the rhs-only sink used by `assemble_vector`, where no
+#     block is present and the local matrix is empty.
+struct ScatterSink{T}
+    nzval::Vector{T}
+    pattern::AssemblyPattern
+end
+
+# A fresh, empty accumulator with the same destination shape — used by
+# the threaded driver to give each task its own buffer before reducing.
+_empty_like(::Nothing) = nothing
+_empty_like(sink::ScatterSink{T}) where {T} = ScatterSink(zeros(T, length(sink.nzval)), sink.pattern)
+
+# Reduce a per-task sink into the shared one by summing the `nzval`
+# accumulators. The threaded path is held to a tolerance, not bit
+# identity, so the summation order is unconstrained.
+_merge_sink!(::Nothing, ::Nothing) = nothing
+function _merge_sink!(dst::ScatterSink, src::ScatterSink)
+    dst.nzval .+= src.nzval
+    return dst
+end
+
+# Raised when the numeric scatter targets a `(row, col)` the prebuilt
+# pattern does not contain — impossible unless the symbolic and numeric
+# passes disagree about a region's active dofs. Erroring here turns a
+# latent silent corruption (writing into an adjacent column's slot) into
+# an immediate, locatable failure. Kept `@noinline` so the check stays
+# off the hot path's instruction stream.
+@noinline function _scatter_pattern_miss(row::Int, col::Int)
+    error("assembly scatter: entry ($row, $col) is absent from the cached sparsity pattern; " *
+          "the symbolic and numeric passes disagree on the active dofs")
+end
+
+# Scatter a region's dense local block into the matrix, column-major.
+# Zero entries are skipped (so they never enter the accumulation and
+# `dropzeros!` has less to do); the rest locate `(row, col)` in column
+# `col`'s sorted row range via `searchsortedfirst` and `+=` into that
+# `nzval` slot. A miss (the located slot does not hold `row`) means the
+# pattern and the numeric pass disagree and raises rather than corrupting
+# a neighbouring slot. The `nothing` sink (rhs-only assembly) is a no-op.
+# The serial walk visits regions and entries in a fixed order, so repeated
+# serial assembly is deterministic to the bit.
+_emit_matrix!(::Nothing, active_dofs, local_matrix) = nothing
+
+function _emit_matrix!(sink::ScatterSink{T}, active_dofs::AbstractVector{Int},
+                       local_matrix::AbstractMatrix{T}) where {T}
+    isempty(local_matrix) && return nothing
+    pattern = sink.pattern
+    @inbounds for local_col in axes(local_matrix, 2)
+        col = active_dofs[local_col]
+        lo = pattern.colptr[col]
+        hi = pattern.colptr[col + 1] - 1
+        for local_row in axes(local_matrix, 1)
+            entry = local_matrix[local_row, local_col]
+            iszero(entry) && continue
+            row = active_dofs[local_row]
+            slot = searchsortedfirst(pattern.rowval, row, lo, hi, Base.Order.Forward)
+            (slot <= hi && pattern.rowval[slot] == row) || _scatter_pattern_miss(row, col)
+            sink.nzval[slot] += entry
+        end
+    end
+    return nothing
+end
+
+# Emit a region's local system: scatter the rhs by row (identical for
+# every sink) then deposit the matrix block into the sink.
+function _emit_local_system!(sink, rhs::Vector{T}, active_dofs::AbstractVector{Int},
+                             local_matrix::AbstractMatrix{T},
                              local_rhs::AbstractVector{T}) where {T}
     for (local_row, row) in pairs(active_dofs)
         rhs[row] += local_rhs[local_row]
     end
-
-    if !isempty(local_matrix)
-        for local_col in axes(local_matrix, 2)
-            col = active_dofs[local_col]
-            for local_row in axes(local_matrix, 1)
-                entry = local_matrix[local_row, local_col]
-                iszero(entry) && continue
-                push!(rows, active_dofs[local_row])
-                push!(cols, col)
-                push!(vals, entry)
-            end
-        end
-    end
-
+    _emit_matrix!(sink, active_dofs, local_matrix)
     return nothing
 end
 
@@ -557,12 +760,12 @@ function _local_active_dof_table!(ws::AssemblyWorkspace, field_data, layout::Sys
 end
 
 """
-    _assemble_region!(ws, rows, cols, vals, rhs, model, region, blocks, loads,
+    _assemble_region!(ws, sink, rhs, model, region, blocks, loads,
                       symmetric, state_coefficients=nothing, point_offset=0)
 
 Assemble every weak-form contribution at every quadrature point of one
 integration region. This is the assembly hot loop: a single call walks
-the region's quadrature points and updates the COO triplet buffers and
+the region's quadrature points and updates the matrix `sink` and
 right-hand-side vector in place.
 
 Structure of the body, in order:
@@ -590,17 +793,16 @@ Structure of the body, in order:
           (`col == 0`) shifts its stiffness contribution onto the rhs,
           weighted by the dof's stored `constrained_value`.
        e. **Symmetry.** When the form is symmetric, only emit
-          `row ≥ col` entries; `_sparse_from_triplets` mirrors at the
+          `row ≥ col` entries; `_matrix_from_pattern` mirrors at the
           end.
-  4. **Emit.** Flush the local matrix and rhs to the global triplet
-     buffers and rhs via [`_emit_local_system!`](@ref).
+  4. **Emit.** Flush the local matrix and rhs to the matrix `sink` and
+     global rhs via [`_emit_local_system!`](@ref).
 
 `point_offset` is the global quad-point offset of this region in the
 plan, so `q.point = point_offset + local_qp` is the stable index used
 by [`foreach_quadrature_point`](@ref) and per-point history data.
 """
-function _assemble_region!(ws::AssemblyWorkspace{D,T}, rows::Vector{Int}, cols::Vector{Int},
-                           vals::Vector{T}, rhs::Vector{T}, model::Model{D,T},
+function _assemble_region!(ws::AssemblyWorkspace{D,T}, sink, rhs::Vector{T}, model::Model{D,T},
                            region::VolumeRegion{D,T}, blocks, loads, symmetric::Bool,
                            state_coefficients=nothing, point_offset::Int=0) where {D,T}
     # Region setup: Jacobian, per-field parent data, region-local dof
@@ -623,13 +825,13 @@ function _assemble_region!(ws::AssemblyWorkspace{D,T}, rows::Vector{Int}, cols::
                             ws.active_dofs, blocks, loads, symmetric, model, Val(D), T)
     end
 
-    # Emit the local system to the global COO triplets / rhs.
-    _emit_local_system!(rows, cols, vals, rhs, ws.active_dofs, local_matrix, local_rhs)
+    # Scatter the local system into the matrix sink / global rhs.
+    _emit_local_system!(sink, rhs, ws.active_dofs, local_matrix, local_rhs)
     return nothing
 end
 
 """
-    _assemble_region!(ws, rows, cols, vals, rhs, model, region::FacetRegion,
+    _assemble_region!(ws, sink, rhs, model, region::FacetRegion,
                       blocks, loads, symmetric, state_coefficients=nothing,
                       point_offset=0)
 
@@ -650,8 +852,7 @@ is **not** applied here. Modes with zero *value* on the facet (e.g. integrated
 Legendre bubbles along a constrained axis) can still carry nonzero
 *gradient*, which Nitsche-style forms rely on.
 """
-function _assemble_region!(ws::AssemblyWorkspace{D,T}, rows::Vector{Int}, cols::Vector{Int},
-                           vals::Vector{T}, rhs::Vector{T}, model::Model{D,T},
+function _assemble_region!(ws::AssemblyWorkspace{D,T}, sink, rhs::Vector{T}, model::Model{D,T},
                            region::FacetRegion{D,T}, blocks, loads, symmetric::Bool,
                            state_coefficients=nothing, point_offset::Int=0) where {D,T}
     field_data, local_by_field, state, local_matrix, local_rhs = _region_workspace_setup!(ws, model,
@@ -668,7 +869,7 @@ function _assemble_region!(ws::AssemblyWorkspace{D,T}, rows::Vector{Int}, cols::
                             ws.active_dofs, blocks, loads, symmetric, model, Val(D), T)
     end
 
-    _emit_local_system!(rows, cols, vals, rhs, ws.active_dofs, local_matrix, local_rhs)
+    _emit_local_system!(sink, rhs, ws.active_dofs, local_matrix, local_rhs)
     return nothing
 end
 
@@ -692,7 +893,7 @@ function _update_physical_basis!(ws::AssemblyWorkspace{D,T}, parents, x::SVector
 end
 
 """
-    _assemble_region!(ws, rows, cols, vals, rhs, model, region::SurfaceRegion,
+    _assemble_region!(ws, sink, rhs, model, region::SurfaceRegion,
                       blocks, loads, symmetric, state_coefficients=nothing,
                       point_offset=0)
 
@@ -711,8 +912,7 @@ strict construction-time check. Per quadrature point:
 The basis evaluation visits every active local mode; nothing is
 filtered by facet-incidence.
 """
-function _assemble_region!(ws::AssemblyWorkspace{D,T}, rows::Vector{Int}, cols::Vector{Int},
-                           vals::Vector{T}, rhs::Vector{T}, model::Model{D,T},
+function _assemble_region!(ws::AssemblyWorkspace{D,T}, sink, rhs::Vector{T}, model::Model{D,T},
                            region::SurfaceRegion{D,T}, blocks, loads, symmetric::Bool,
                            state_coefficients=nothing, point_offset::Int=0) where {D,T}
     field_data, local_by_field, state, local_matrix, local_rhs = _region_workspace_setup!(ws, model,
@@ -729,7 +929,7 @@ function _assemble_region!(ws::AssemblyWorkspace{D,T}, rows::Vector{Int}, cols::
                             ws.active_dofs, blocks, loads, symmetric, model, Val(D), T)
     end
 
-    _emit_local_system!(rows, cols, vals, rhs, ws.active_dofs, local_matrix, local_rhs)
+    _emit_local_system!(sink, rhs, ws.active_dofs, local_matrix, local_rhs)
     return nothing
 end
 
@@ -762,7 +962,7 @@ end
 # channels into the rhs), then blocks (bilinear channels into the
 # matrix, with Dirichlet-column elimination moving constrained columns
 # onto the rhs). Symmetric blocks emit only the lower-triangular
-# entries; `_sparse_from_triplets` mirrors at the end.
+# entries; `_matrix_from_pattern` mirrors at the end.
 #
 # Extracted from the two `_assemble_region!` overloads so the volume
 # and facet hot loops share their inner work — every kind-specific
@@ -808,7 +1008,7 @@ end
 # Shared quadrature-point accumulation: loads (linear channels → rhs)
 # then blocks (bilinear channels → matrix, with Dirichlet-column
 # elimination → rhs). Symmetric blocks emit only the lower triangle;
-# `_sparse_from_triplets` mirrors at the end. Walks the standard
+# `_matrix_from_pattern` mirrors at the end. Walks the standard
 # field × component × parent × dof nest and defers every per-emission
 # decision to `_emit_load!` / `_emit_block!`, which the typed overloads
 # above specialise to the concrete `local_by_field` table type.
@@ -962,27 +1162,6 @@ end
     return nothing
 end
 
-# Upper bound on the number of matrix triplets emitted by assembly,
-# used to size the COO buffers via `sizehint!`. Correctness-neutral
-# (sizehint only reserves capacity), and intentionally an over-count:
-# constrained dofs are ignored and the full-block / lower-triangular
-# square is used. The overshoot is harmless and keeps the buffer growth
-# from showing up in profiles.
-function _triplet_estimate(model::Model, plan::IntegrationPlan, symmetric::Bool)
-    ncomp = sum(field.components for field in model.dofs.fields)
-    total = 0
-    for region in plan.regions
-        base = 0
-        for parent in region.parents
-            level = _level_by_id(model.problem.space, parent.level)
-            base += local_basis_count(level.basis, level.order, level.mode)
-        end
-        s = base * ncomp
-        total += symmetric ? (s * (s + 1)) ÷ 2 : s * s
-    end
-    return total
-end
-
 # Total quad-point count across all regions of the plan. Used by
 # `nquadpoints`.
 function _quadrature_count(plan::IntegrationPlan)
@@ -1010,109 +1189,73 @@ function _region_qpoint_offsets(regions)
     return offsets
 end
 
-# Append COO triplets and rhs entries from one assembly walk onto an
-# already-initialised set of buffers. Used by `assemble!` /
-# `assemble_matrix` / `assemble_vector` to accumulate contributions
-# from multiple region lists (volume + per-selector facets) into the
-# same destination matrices and rhs.
-function _append_assembly!(rows, cols, vals, rhs, partial)
-    append!(rows, partial.rows)
-    append!(cols, partial.cols)
-    append!(vals, partial.vals)
-    rhs .+= partial.rhs
-    return rows, cols, vals, rhs
-end
-
-# Serial assembly driver: a single workspace and a single COO/rhs
-# buffer set walked across every region in order. `region_filter` lets
-# load assemblies skip regions that do not intersect the load's
-# support. The `regions` argument is any iterable of `VolumeRegion`s or
-# `FacetRegion`s — Julia dispatches the right `_assemble_region!`
-# method automatically.
-function _assemble_system_serial(model::Model{D,T}, regions, nactive::Int, symmetric::Bool, blocks,
-                                 loads, region_filter, state_coefficients,
-                                 size_hint::Int=0) where {D,T}
-    rows = Int[]
-    cols = Int[]
-    vals = T[]
-    rhs = zeros(T, nactive)
+# Serial assembly driver: one workspace and the shared `sink`/`rhs`
+# walked across every region in order. `region_filter` lets load
+# assemblies skip regions that do not intersect the load's support. The
+# `regions` argument is any iterable of `VolumeRegion`s or
+# `FacetRegion`s — Julia dispatches the right `_assemble_region!` method
+# automatically. The serial walk scatters into the sink in a fixed region
+# order, so repeated serial assembly is deterministic to the bit.
+function _assemble_system_serial!(sink, rhs::Vector{T}, model::Model{D,T}, regions,
+                                  symmetric::Bool, blocks, loads, region_filter,
+                                  state_coefficients) where {D,T}
     ws = _assembly_workspace(model)
     offsets = _region_qpoint_offsets(regions)
-    if size_hint > 0
-        sizehint!(rows, size_hint)
-        sizehint!(cols, size_hint)
-        sizehint!(vals, size_hint)
-    end
-
     for (region_index, region) in enumerate(regions)
         region_filter === nothing || region_filter(region) || continue
-        _assemble_region!(ws, rows, cols, vals, rhs, model, region, blocks, loads, symmetric,
+        _assemble_region!(ws, sink, rhs, model, region, blocks, loads, symmetric,
                           state_coefficients, offsets[region_index])
     end
-
-    return (; rows, cols, vals, rhs)
+    return nothing
 end
 
 # Threaded assembly driver: spawn `Threads.nthreads()` tasks, each with
-# its own workspace and COO / rhs buffers. Distribute regions in a
-# striped pattern (`region_index in task_id:task_count:nregions`) so
-# every task processes a uniform random sample of the list. After all
-# tasks complete, reduce the per-task buffers into the final
-# COO / rhs vectors.
+# its own workspace and a fresh per-task sink / rhs (`_empty_like`).
+# Distribute regions in a striped pattern
+# (`region_index in task_id:task_count:nregions`) so every task
+# processes a uniform sample of the list. After all tasks complete,
+# reduce the per-task accumulators into the shared sink / rhs by summing
+# the `nzval` buffers (`_merge_sink!`). The reduction order is
+# deterministic but the floating-point sum order differs from the serial
+# walk, so the threaded result matches serial to a tolerance, not
+# bit-for-bit (documented in CONTRIBUTING's threading rule).
+#
+# Memory: each task holds its own full-length `nzval` accumulator, so the
+# threaded peak is `(nthreads + 1) × nnz` of scatter buffers versus the
+# serial path's `1 × nnz`. This is a bounded multiplier (not the COO
+# over-count this assembly replaced), but on memory-bound large-3D runs
+# capping the thread count trades parallelism for footprint. A lock-free
+# colour-partitioned scatter into one shared `nzval` would restore the
+# `1×` peak at much higher complexity and is intentionally not done here.
 #
 # Region-kind-agnostic: the `regions` iterable can be a volume plan's
-# region vector or a facet selector's region list. The striped
-# distribution is simple and balances well when region costs are
-# roughly uniform.
-function _assemble_system_threaded(model::Model{D,T}, regions, nactive::Int, symmetric::Bool,
-                                   blocks, loads, region_filter, state_coefficients,
-                                   size_hint::Int=0) where {D,T}
+# region vector or a facet selector's region list.
+function _assemble_system_threaded!(sink, rhs::Vector{T}, model::Model{D,T}, regions,
+                                    symmetric::Bool, blocks, loads, region_filter,
+                                    state_coefficients) where {D,T}
     task_count = Threads.nthreads()
-    task_size_hint = size_hint > 0 ? cld(size_hint, task_count) : 0
     offsets = _region_qpoint_offsets(regions)
     n_regions = length(regions)
+    nactive = length(rhs)
     tasks = map(1:task_count) do task_id
         Threads.@spawn begin
-            local_rows = Int[]
-            local_cols = Int[]
-            local_vals = T[]
+            local_sink = _empty_like(sink)
             local_rhs = zeros(T, nactive)
             ws = _assembly_workspace(model)
-            if task_size_hint > 0
-                sizehint!(local_rows, task_size_hint)
-                sizehint!(local_cols, task_size_hint)
-                sizehint!(local_vals, task_size_hint)
-            end
-
             for region_index in task_id:task_count:n_regions
                 region = regions[region_index]
                 region_filter === nothing || region_filter(region) || continue
-                _assemble_region!(ws, local_rows, local_cols, local_vals, local_rhs, model, region,
-                                  blocks, loads, symmetric, state_coefficients,
-                                  offsets[region_index])
+                _assemble_region!(ws, local_sink, local_rhs, model, region, blocks, loads,
+                                  symmetric, state_coefficients, offsets[region_index])
             end
-
-            return (; rows=local_rows, cols=local_cols, vals=local_vals, rhs=local_rhs)
+            return local_sink, local_rhs
         end
     end
-    results = fetch.(tasks)
-    entry_count = sum(result -> length(result.rows), results)
-    rows = Int[]
-    cols = Int[]
-    vals = T[]
-    sizehint!(rows, entry_count)
-    sizehint!(cols, entry_count)
-    sizehint!(vals, entry_count)
-    rhs = zeros(T, nactive)
-
-    for result in results
-        append!(rows, result.rows)
-        append!(cols, result.cols)
-        append!(vals, result.vals)
-        rhs .+= result.rhs
+    for (local_sink, local_rhs) in fetch.(tasks)
+        _merge_sink!(sink, local_sink)
+        rhs .+= local_rhs
     end
-
-    return (; rows, cols, vals, rhs)
+    return nothing
 end
 
 # Partition `blocks` and `loads` by their `on` tag. Returns the
@@ -1159,7 +1302,7 @@ tuple of them.
 
   - `symmetric` — assemble symmetrically when truthy. Defaults to
     "every block reports `form.symmetric == true`".
-  - `threaded` — drive assembly through `_assemble_system_threaded`.
+  - `threaded` — drive assembly through `_assemble_system_threaded!`.
     Default is true when `Threads.nthreads() > 1`.
   - `state` — pass a [`Solution`](@ref) or active coefficient vector
     to expose the current iterate to the forms as `q.state` (used to
@@ -1176,9 +1319,11 @@ function assemble_matrix(model::Model{D,T}, blocks; symmetric=nothing,
                       Bool(symmetric)
     nactive = active_unknowns(model.dofs)
     coeffs = _iterate_coefficients(state, model)
-    rows, cols, vals, _ = _assemble_partitioned(model, block_tuple, (), nactive, symmetric_value,
-                                                nothing, coeffs, threaded)
-    return _sparse_from_triplets(rows, cols, vals, nactive, symmetric_value)
+    pattern = _assembly_pattern!(model, block_tuple, symmetric_value)
+    sink = ScatterSink(zeros(T, length(pattern.rowval)), pattern)
+    _assemble_partitioned!(sink, model, block_tuple, (), nactive, symmetric_value, nothing, coeffs,
+                           threaded)
+    return _matrix_from_pattern(pattern, sink.nzval)
 end
 
 """
@@ -1204,8 +1349,8 @@ function assemble_vector(model::Model{D,T}, loads; threaded::Bool=Threads.nthrea
     load_tuple = _form_tuple(loads)
     nactive = active_unknowns(model.dofs)
     coeffs = _iterate_coefficients(state, model)
-    _, _, _, rhs = _assemble_partitioned(model, (), load_tuple, nactive, false, region_filter,
-                                         coeffs, threaded)
+    _, rhs = _assemble_partitioned!(nothing, model, (), load_tuple, nactive, false, region_filter,
+                                    coeffs, threaded)
     return rhs
 end
 
@@ -1224,12 +1369,14 @@ function assemble!(model::Model{D,T}; threaded::Bool=Threads.nthreads() > 1) whe
     plan = integration_plan(model)
     nactive = active_unknowns(model.dofs)
     symmetric = model.problem.symmetric
-    rows, cols, vals, rhs = _assemble_partitioned(model, model.problem.blocks, model.problem.loads,
-                                                  nactive, symmetric, nothing, nothing, threaded)
+    pattern = _assembly_pattern!(model, model.problem.blocks, symmetric)
+    sink = ScatterSink(zeros(T, length(pattern.rowval)), pattern)
+    _, rhs = _assemble_partitioned!(sink, model, model.problem.blocks, model.problem.loads, nactive,
+                                    symmetric, nothing, nothing, threaded)
 
-    matrix = _sparse_from_triplets(rows, cols, vals, nactive, symmetric)
+    matrix = _matrix_from_pattern(pattern, sink.nzval)
     # Symmetric forms are assembled lower-triangular and mirrored as
-    # `matrix + matrix' - diag(matrix)` in `_sparse_from_triplets`. IEEE
+    # `matrix + matrix' - diag(matrix)` in `_matrix_from_pattern`. IEEE
     # addition is commutative, so the result is symmetric to the bit
     # and the residual is exactly zero.
     symmetry_residual = symmetric ? 0.0 : NaN
@@ -1246,31 +1393,23 @@ function assemble!(model::Model{D,T}; threaded::Bool=Threads.nthreads() > 1) whe
 end
 
 # Partition `blocks` and `loads` by their `on` tag, run one assembly
-# pass per non-empty partition, and accumulate the COO triplets and
-# rhs entries into shared buffers. Volume contributions (`on === nothing`)
-# walk the model's `integration_plan`; facet contributions
-# (`on::BoundarySelector`) walk the cached `model.facet_regions[on]`
-# region list. Volume size hints come from `_triplet_estimate`; facet
-# partitions sizehint after a quick traversal so the COO buffers grow
-# at most once.
-function _assemble_partitioned(model::Model{D,T}, blocks, loads, nactive::Int, symmetric::Bool,
-                               region_filter, state_coefficients, threaded::Bool) where {D,T}
+# pass per non-empty partition, scattering matrix entries into the shared
+# `sink` and accumulating rhs entries into the shared rhs. Volume
+# contributions (`on === nothing`) walk the model's `integration_plan`;
+# facet / surface contributions (`on::BoundarySelector` /
+# `on::BoundaryMesh`) walk the cached region list for that selector.
+function _assemble_partitioned!(sink, model::Model{D,T}, blocks, loads, nactive::Int,
+                                symmetric::Bool, region_filter, state_coefficients,
+                                threaded::Bool) where {D,T}
     volume_blocks, volume_loads, partitions = _partition_forms_by_on(blocks, loads)
-
-    rows = Int[]
-    cols = Int[]
-    vals = T[]
     rhs = zeros(T, nactive)
 
     # Volume contributions — the dominant path. Reuses the cached
-    # integration plan and the triplet-count estimator for COO
-    # sizing.
+    # integration plan.
     if !isempty(volume_blocks) || !isempty(volume_loads)
         plan = integration_plan(model)
-        size_hint = isempty(volume_blocks) ? 0 : _triplet_estimate(model, plan, symmetric)
-        _accumulate_pass!(rows, cols, vals, rhs, model, plan.regions, nactive, symmetric,
-                          Tuple(volume_blocks), Tuple(volume_loads), region_filter,
-                          state_coefficients, threaded, size_hint)
+        _run_pass!(sink, rhs, model, plan.regions, symmetric, Tuple(volume_blocks),
+                   Tuple(volume_loads), region_filter, state_coefficients, threaded)
     end
 
     # Non-volume contributions — one assembly pass per unique `on=`
@@ -1279,29 +1418,28 @@ function _assemble_partitioned(model::Model{D,T}, blocks, loads, nactive::Int, s
     for (selector, (sel_blocks, sel_loads)) in partitions
         regions = _resolve_on_regions(model, selector)
         isempty(regions) && continue
-        _accumulate_pass!(rows, cols, vals, rhs, model, regions, nactive, symmetric,
-                          Tuple(sel_blocks), Tuple(sel_loads), nothing, state_coefficients,
-                          threaded, 0)
+        _run_pass!(sink, rhs, model, regions, symmetric, Tuple(sel_blocks), Tuple(sel_loads),
+                   nothing, state_coefficients, threaded)
     end
 
-    return rows, cols, vals, rhs
+    return sink, rhs
 end
 
-# Drive one assembly pass over a single region list (serial or
-# threaded based on `threaded`) and accumulate the resulting COO
-# triplets and rhs contributions onto the shared buffers. Used by
-# `_assemble_partitioned` for both the volume pass and every facet /
+# Drive one assembly pass over a single region list (serial or threaded
+# based on `threaded`), scattering matrix entries into the shared `sink`
+# and accumulating rhs contributions into the shared `rhs`. Used by
+# `_assemble_partitioned!` for both the volume pass and every facet /
 # surface partition.
-function _accumulate_pass!(rows, cols, vals, rhs, model, regions, nactive, symmetric, blocks, loads,
-                           region_filter, state_coefficients, threaded::Bool, size_hint::Int)
-    partial = if threaded
-        _assemble_system_threaded(model, regions, nactive, symmetric, blocks, loads, region_filter,
-                                  state_coefficients, size_hint)
+function _run_pass!(sink, rhs, model, regions, symmetric, blocks, loads, region_filter,
+                    state_coefficients, threaded::Bool)
+    if threaded
+        _assemble_system_threaded!(sink, rhs, model, regions, symmetric, blocks, loads,
+                                   region_filter, state_coefficients)
     else
-        _assemble_system_serial(model, regions, nactive, symmetric, blocks, loads, region_filter,
-                                state_coefficients, size_hint)
+        _assemble_system_serial!(sink, rhs, model, regions, symmetric, blocks, loads,
+                                 region_filter, state_coefficients)
     end
-    return _append_assembly!(rows, cols, vals, rhs, partial)
+    return nothing
 end
 
 # Resolve a non-`nothing` `on=` value to its region list. Reads from

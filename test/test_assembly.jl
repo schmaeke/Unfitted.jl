@@ -1,5 +1,7 @@
 using LinearAlgebra
 using StaticArrays
+using SparseArrays
+using BasicBSpline  # triggers the B-spline extension for the C¹ scatter fixture
 
 @testset "assembly scaffold" begin
     omega = box((0.0,), (1.0,))
@@ -528,4 +530,145 @@ end
 
     @test Matrix(plain.matrix) ≈ Matrix(explicit.matrix) atol = 1.0e-12
     @test plain.rhs ≈ explicit.rhs atol = 1.0e-12
+end
+
+# ── Symbolic-scatter assembly: cross-cutting invariants ───────────────────────
+
+# Properties the single scatter assembly path must satisfy on every
+# fixture, with no second method to compare against:
+#   * deterministic — repeated serial assembly is bit-identical (also
+#     exercises the cached pattern on the second call);
+#   * threaded matches serial to a roundoff tolerance (the documented
+#     reduction-order difference);
+#   * no explicit stored zeros survive (the `dropzeros!` contract — proves
+#     the dense-block pattern collapses to the true nonzeros);
+#   * symmetric forms produce a structurally symmetric matrix.
+# Numerical correctness itself is pinned by the value-based testsets above
+# and the manufactured-solution / gallery suites.
+function _check_scatter_matrix(model, blocks; symmetric=nothing)
+    serial = assemble_matrix(model, blocks; symmetric=symmetric, threaded=false)
+    @test assemble_matrix(model, blocks; symmetric=symmetric, threaded=false) == serial
+    @test !any(iszero, nonzeros(serial))       # dropzeros! contract: no stored zeros
+    threaded = assemble_matrix(model, blocks; symmetric=symmetric, threaded=true)
+    @test threaded ≈ serial rtol = 1.0e-12 atol = 1.0e-12
+    return serial
+end
+
+# Same invariants driven through the full `assemble!` path (blocks + loads).
+function _check_scatter_assemble!(model)
+    assemble!(model; threaded=false)
+    serial = copy(model.matrix)
+    assemble!(model; threaded=false)               # re-assembly reuses the cached pattern
+    @test model.matrix == serial
+    @test !any(iszero, nonzeros(serial))       # dropzeros! contract: no stored zeros
+    model.problem.symmetric && @test issymmetric(serial)
+    assemble!(model; threaded=true)
+    @test model.matrix ≈ serial rtol = 1.0e-12 atol = 1.0e-12
+    return model
+end
+
+@testset "scatter assembly invariants across the fixture matrix" begin
+    # 1D scalar, single level, symmetric.
+    let V = space(box((0.0,), (1.0,)); cells=4, order=2)
+        model = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+        _check_scatter_assemble!(model)
+    end
+
+    # 2D scalar, higher order, symmetric.
+    let V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=3)
+        model = prepare(poisson(V; source=x -> 1.0 + x[1],
+                                dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+        _check_scatter_assemble!(model)
+    end
+
+    # 2D multi-level superposition (overlay), symmetric.
+    let V0 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2),
+        V = overlay(V0, box((0.2, 0.25), (0.8, 0.75)); cells=(2, 2), order=3)
+
+        model = prepare(poisson(V; source=x -> 1.0 - x[2],
+                                dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+        _check_scatter_assemble!(model)
+    end
+
+    # Vector field, component-unaware form: cross-component blocks are
+    # structurally present in the pattern but always zero — the dropzeros
+    # equivalence the scatter path must reproduce.
+    let V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2), u = field(:u, V; components=2)
+        model = prepare(poisson(u; source=x -> SVector(1.0, 2.0),
+                                dirichlet=[dirichlet(SVector(0.0, 0.0); on=boundary(:all))]))
+        _check_scatter_assemble!(model)
+        # The component-unaware form leaves cross-component blocks in the
+        # dense-block pattern but numerically zero; dropzeros! must remove
+        # them, so the lower-triangle pattern is strictly larger than the
+        # final lower-triangle nnz (proves the superset→drop pipeline).
+        @test length(model.pattern.rowval) > nnz(tril(model.matrix))
+    end
+
+    # Multi-field symmetric coupling block(c, u).
+    let V = space(box((0.0,), (1.0,)); cells=2, order=1), u = field(:u, V), c = field(:c, V)
+        stiff = WeakForm(bilinear=(q, trial) -> TestChannels(0.0, trial.gradient), linear=q -> 0.0,
+                         symmetric=true)
+        coupling = WeakForm(bilinear=(q, trial) -> 0.5 * trial.value, linear=q -> 0.0,
+                            symmetric=true)
+        model = prepare(Problem((u, c);
+                                blocks=(block(u, u, stiff), block(c, c, stiff),
+                                        block(c, u, coupling)),
+                                loads=(loadform(u, stiff), loadform(c, stiff)),
+                                dirichlet=[dirichlet(0.0; on=boundary(:all), field=u),
+                                           dirichlet(0.0; on=boundary(:all), field=c)]))
+        _check_scatter_assemble!(model)
+    end
+
+    # Non-symmetric form (convection-like) — full pattern, no mirror.
+    let V = space(box((0.0,), (1.0,)); cells=4, order=2), u = field(:u, V)
+        conv = WeakForm(bilinear=(q, trial) -> trial.gradient[1], linear=q -> 1.0, symmetric=false)
+        model = prepare(Problem((u,); blocks=(block(u, u, conv),), loads=(loadform(u, conv),),
+                                dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+        @test model.problem.symmetric == false
+        _check_scatter_assemble!(model)
+    end
+
+    # B-spline base + C¹ B-spline overlay (smooth basis family, overlay
+    # artificial-boundary constraints, conforming dof sharing). The
+    # numeric scatter reads the assembled local block over `active_dofs`,
+    # so it is agnostic to whether the dof layer used the simple
+    # `Matrix{Int}` table or the `LocalDofExpansion` (pivot) table — this
+    # fixture exercises the B-spline assembly path regardless.
+    let V0 = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3, basis=bspline()),
+        V = overlay(V0, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3,
+                    basis=bspline(continuity_order=1))
+
+        model = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+        _check_scatter_assemble!(model)
+    end
+
+    # FCM (immersed boundary via a physical domain / moment-fit quadrature).
+    let phi = x -> sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.35,
+        p = physical_domain(phi; lipschitz=1.0, subcell_length_scale=1.0 / 2^4, max_depth=4),
+        V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=p)
+
+        model = prepare(poisson(V; source=x -> 1.0,
+                                dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+        _check_scatter_assemble!(model)
+    end
+
+    # Facet (Robin) block — the `on=` partition contributes facet regions
+    # to the pattern alongside the volume plan.
+    let V = space(box((0.0,), (1.0,)); cells=3, order=2), u = field(:u, V)
+        robin = block(u, u, mass_form(coefficient=4.0); on=boundary(axis=1, side=:upper))
+        model = prepare(Problem((u,); blocks=(stiffness_block(u), robin),
+                                loads=(neumann(u, 5.0; on=boundary(axis=1, side=:upper)),),
+                                dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower))]))
+        _check_scatter_assemble!(model)
+        # also through the operator entry point, exercising pattern caching
+        _check_scatter_matrix(model, (stiffness_block(u), robin))
+    end
+
+    # Operator entry point with pattern-cache reuse across two forms that
+    # share the same region set (mass then stiffness).
+    let V = space(box((0.0,), (1.0,)); cells=2, order=2), u = field(:u, V)
+        model = prepare(Problem((u,); dirichlet=[dirichlet(0.0; on=boundary(:all), field=u)]))
+        _check_scatter_matrix(model, mass_block(u))
+        _check_scatter_matrix(model, stiffness_block(u; diffusion=2.0))
+    end
 end

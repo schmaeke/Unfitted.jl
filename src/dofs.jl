@@ -137,7 +137,7 @@ Fields:
       - linear-constraint pivot → multi-element list; B-spline overlay
         boundaries with continuity order `m` produce `m + 1`-element
         lists per perpendicular line.
-    The assembly hot loop distributes each emitted matrix triplet
+    The assembly hot loop distributes each emitted matrix entry
     through both the test and trial expansions, so the strong-
     elimination case (empty list) skips emission and the free case is
     the identity. See [`_resolve_constraints!`](@ref) for the
@@ -607,10 +607,10 @@ Keyword arguments:
 
 The integrated Legendre family produces single-raw constraints,
 reducing the resolved expansion to strong elimination (`raw_expansion =
-[]` for the pivoted raw); the assembly path then behaves bit-identically
+[]` for the pivoted raw); the assembly path then behaves identically
 to the pre-constraint-primitive code. B-spline families produce
 multi-raw constraints encoding the C^m trace-vanishing condition on
-artificial boundaries; the assembly path distributes triplets through
+artificial boundaries; the assembly path distributes entries through
 the expansion automatically.
 """
 function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
