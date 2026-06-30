@@ -737,6 +737,14 @@ end
 # The branch makes the return type a small union; the per-quadrature-point
 # `_accumulate_qpoint!` call then resolves through one dispatch per region
 # rather than paying the general machinery's indirection on every emission.
+#
+# The dual path is a *measured* optimisation, not a guess. Forcing the common
+# integrated-Legendre assembly onto `LocalDofExpansion` (which routes each
+# emission through a `(raw, weight)` redirect instead of a direct index)
+# roughly doubles `assemble!` time — ≈50 → ≈98 ms on the 2D order-3/4 fixture
+# in `benchmarks/microkernels/dof_table.jl` — so the `Matrix{Int}` fast path is
+# kept. Collapsing onto a single representation would halve assembly throughput
+# for the most common workload; re-run that benchmark before reconsidering.
 function _local_active_dof_table!(ws::AssemblyWorkspace, field_data, layout::SystemLayout)
     empty!(ws.active_dofs)
     empty!(ws.local_by_global)
