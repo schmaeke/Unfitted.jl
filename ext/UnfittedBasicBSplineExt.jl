@@ -17,13 +17,18 @@ on an open knot vector aligned with the level's mesh cell coordinates:
     first 1D function evaluates to 1 at the lower edge and the last
     function evaluates to 1 at the upper edge — every other 1D function
     vanishes at both endpoints.
-  - Interior knots default to multiplicity 1, giving `C^{p_d − 1}`
-    smoothness across cell boundaries (the natural IGA continuity).
-  - Mask-induced internal boundaries get knot multiplicity `p_d − m`
-    inserted at the transition coordinate, lowering the smoothness
-    there to `C^m`. The first PR ships `continuity_order = m = 0`, so
-    mask-induced junctions are `C⁰`; a future PR will lift the
-    parameter.
+  - Interior knots all have multiplicity 1 (max-regularity), giving
+    `C^{p_d − 1}` smoothness across every cell boundary — uniform knots,
+    no insertions.
+
+Boundary smoothness on the artificial overlay boundary (the mesh-edge faces
+and any mask-induced internal faces) is imposed by homogeneous linear
+*trace-vanishing constraints* on the eliminated boundary functions, not by
+knot multiplicity. The `continuity_order = m` parameter requests `C^m` there:
+the trace and its derivatives `k = 0 … m` are constrained to vanish,
+eliminating `m + 1` boundary functions per face. `m` may be anything from `0`
+(`C⁰`, the default) up to `p_d − 1`, and arbitrary mask geometries are
+supported because the constraints need no separability of the mask.
 
 The `D`-dimensional basis is the tensor product of these per-axis 1D
 spaces. Adjacent cells of the level share `p_d` of `p_d + 1` 1D
@@ -39,20 +44,23 @@ global 1D function index via the new `_AXIS_BSPLINE` tag.
     [`instantiate_basis`](@ref) hook, which materialises the per-axis
     `BSplineSpace`s once the mesh axes (and the optional mask
     junctions) are known.
-  - `local_basis_indices`, `local_basis_count`,
-    `recommended_quadrature_order`, `basis_name`, `is_boundary_basis`,
-    `is_facet_basis`, `boundary_basis_indices` overloads matching the
-    integrated-Legendre contract in `src/basis.jl`.
+  - The family-specific basis-interface overloads — `basis_name`,
+    `local_basis_indices`, the `:tensor`-mode `local_basis_count`, and
+    `is_boundary_basis`. The basis-agnostic methods
+    (`recommended_quadrature_order`, the tensor `local_basis_count`,
+    `is_facet_basis`, `boundary_basis_indices`) are inherited from the
+    `::BasisFamily` defaults in `src/basis.jl`.
   - Hot-path `_fill_factor_tables!` overloads (values, values +
     derivatives) using `BasicBSpline.bsplinebasisall` per axis after
     mapping the cell-local reference coordinate `ξ ∈ [−1, 1]` to the
     knot-vector parameter.
-  - `_tensor_dof_key`, `_key_on_level_side`, `_has_overlay_constraint`,
-    and `boundary_trace_data` overloads that route through the
-    `_AXIS_BSPLINE` tag.
-  - Rectangle-union [`LevelMask`](@ref) validation plus C⁰ knot
-    insertion at mask transitions, so masked B-spline levels remain
-    strongly eliminable through the existing dof-elimination machinery.
+  - `_tensor_dof_key`, `_key_on_level_side`, `_overlay_constraints`, and
+    `boundary_trace_data` overloads that route through the `_AXIS_BSPLINE`
+    tag.
+  - The `_overlay_constraints` overload emits the homogeneous
+    trace-vanishing [`LinearConstraint`](@ref)s (orders `k = 0 … m`) on
+    every overlay / mask face, so masked B-spline levels of any geometry
+    remain eliminable through the existing constraint machinery.
 
 The hot loops in `src/assembly.jl` and `src/projection.jl` are
 unchanged — they dispatch on `level.basis` (via the workspace's
@@ -87,11 +95,12 @@ V = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3, basis=bspline())
 
 # Keyword arguments
 
-  - `continuity_order` — boundary smoothness parameter `m ∈ {0}`. The
-    first B-spline release ships `m = 0` (`C⁰` overlay and mask
-    boundaries); higher values error with a "future feature" message
-    and will be unlocked in a follow-up PR that lifts the dof-layer
-    linear-constraint branch.
+  - `continuity_order` — boundary smoothness `m` on the artificial overlay
+    boundary, imposed by homogeneous trace-vanishing constraints (orders
+    `k = 0 … m`). Defaults to `m = 0` (`C⁰`); may be any value from `0` up
+    to `p_d − 1` on the lowest-degree axis, provided the level is thick
+    enough (`cells + p ≥ 2m + 3` per axis). Higher `m` eliminates more
+    boundary functions, lowering the active dof count for smooth problems.
 
 # Why a deferred spec
 
@@ -135,8 +144,8 @@ Open-knot tensor-product B-spline basis family.
 Fields:
 
   - `spaces::S` — `D`-tuple of `BasicBSpline.BSplineSpace` objects, one
-    per axis. Built from the level's mesh axes plus the C⁰ knot
-    multiplicities at mask transitions.
+    per axis. Built from the level's mesh axes as clamped open uniform
+    knot vectors (interior knot multiplicity 1, `C^{p − 1}`).
   - `derivative_spaces::DS` — `D`-tuple of `BSplineDerivativeSpace{1, _}`
     objects, one per axis, precomputed for the derivative hot path so
     every quadrature point uses a stable type.
@@ -144,18 +153,15 @@ Fields:
     coordinates (a copy of `mesh.axes[d]`). Stored on the family so
     the hot kernel can do the `ξ ∈ [−1, 1]` → `t` affine map without
     looking up the level.
-  - `cell_to_span::NTuple{D,Vector{Int}}` — per-axis precomputed
-    mapping from our cell index `c ∈ 1:cells[d]` to the BasicBSpline
-    `intervalindex` span. With no C⁰ junctions the map is the identity;
-    each junction at axis-coordinate `axes[d][j + 1]` shifts every
-    post-junction cell's span by `max(p_d − m, 1) − 1` (the number of
-    extra knots the junction inserts *over* the baseline interior
-    multiplicity of 1, which is also the growth in `dim` from one
-    junction). Also doubles as the per-cell first global 1D function
-    index, since `bsplinebasisall(P, span, t)` returns functions with
-    global indices `span, span + 1, …, span + p`.
-  - `continuity_order::Int` — boundary-smoothness parameter `m`. The
-    first PR ships `m = 0`.
+  - `cell_to_span::NTuple{D,Vector{Int}}` — per-axis map from a cell index
+    `c ∈ 1:cells[d]` to the BasicBSpline span index. With the uniform
+    max-regularity knots used here it is the identity
+    (`cell_to_span[d][c] = c`); it is kept as an explicit field because it
+    also doubles as the per-cell first global 1D function index —
+    `bsplinebasisall(P, span, t)` returns the functions with global
+    indices `span, span + 1, …, span + p`.
+  - `continuity_order::Int` — boundary-smoothness parameter `m`, enforced
+    by trace-vanishing constraints (not knot multiplicity); `0 ≤ m ≤ p_d − 1`.
 
 Constructed automatically from a [`_BSplineSpec`](@ref) by the
 [`instantiate_basis`](@ref) hook in this extension — users do not
@@ -275,17 +281,6 @@ end
 
 Unfitted.basis_name(::BSplineFamily) = :bspline
 
-function Unfitted.recommended_quadrature_order(::BSplineFamily, order::NTuple{D,Int}) where {D}
-    # An `n`-point Gauss rule is exact for polynomials of degree
-    # `2n − 1`. A product of two basis functions on a single span is a
-    # polynomial of degree `2 · p_d`, so `n = p_d + 1` suffices.
-    return ntuple(d -> order[d] + 1, D)
-end
-
-function Unfitted.local_basis_count(::BSplineFamily, order::NTuple{D,Int}) where {D}
-    return prod(ntuple(d -> order[d] + 1, D))
-end
-
 function Unfitted.local_basis_count(family::BSplineFamily, order::NTuple{D,Int},
                                     mode::Symbol) where {D}
     mode === :tensor ||
@@ -320,21 +315,6 @@ function Unfitted.is_boundary_basis(family::BSplineFamily, id::CartesianIndex{D}
     side === :lower && return id.I[axis] == 0
     side === :upper && return id.I[axis] == p
     throw(ArgumentError("boundary side must be :lower or :upper"))
-end
-
-function Unfitted.is_facet_basis(family::BSplineFamily, id::CartesianIndex{D},
-                                 sides::AbstractVector{<:Tuple{Integer,Symbol}}) where {D}
-    for (axis, side) in sides
-        is_boundary_basis(family, id, axis, side) || return false
-    end
-    return true
-end
-
-function Unfitted.boundary_basis_indices(family::BSplineFamily, order::NTuple{D,Int}; axis::Integer,
-                                         side::Symbol, mode::Symbol=:tensor) where {D}
-    return [id
-            for id in local_basis_indices(family, order, mode)
-            if is_boundary_basis(family, id, axis, side)]
 end
 
 # ── Hot kernels: per-axis 1D B-spline value and derivative tables ─────────────

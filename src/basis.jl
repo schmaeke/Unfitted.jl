@@ -16,10 +16,26 @@ layer ask:
   - what quadrature order integrates products of two basis functions
     exactly on a `:full` region.
 
-The concrete implementation shipped here is [`IntegratedLegendre`](@ref).
-Adding a second family (e.g. B-splines) should only require implementing
-this interface plus the corresponding dof/constraint behaviour — geometry,
-intersections, assembly, projection, and solvers stay untouched.
+The concrete implementation shipped here is [`IntegratedLegendre`](@ref); the
+`BasicBSpline` package extension adds a second family. Adding a family means
+implementing this interface plus the corresponding dof/constraint behaviour —
+geometry, intersections, assembly, projection, and solvers stay untouched.
+
+A new family `F <: BasisFamily` provides:
+
+  - `instantiate_basis(spec_or_F, mesh, order)` — build the per-level basis;
+  - `local_basis_indices(::F, order[, mode])` and `local_basis_count(::F,
+    order, mode)` — the cell-local multi-indices and their count, including any
+    order/mode validation;
+  - `is_boundary_basis(::F, id, axis, side)` — per-axis facet incidence;
+  - `basis_values` / `physical_basis_gradients` — the hot-path evaluation;
+  - the dof-key and overlay-constraint hooks the dof layer needs.
+
+It inherits the basis-agnostic `::BasisFamily` defaults — `recommended_
+quadrature_order` (`order .+ 1`), the tensor `local_basis_count` (`prod(order
+.+ 1)`), `is_facet_basis`, and `boundary_basis_indices` — and overrides any
+that do not fit. The integrated Legendre family (this file) and the B-spline
+extension are the two worked examples.
 """
 abstract type BasisFamily end
 
@@ -149,12 +165,13 @@ end
     recommended_quadrature_order(basis::IntegratedLegendre, order) -> NTuple{D,Int}
 
 Per-axis number of Gauss–Legendre points that integrates products of two
-basis functions of polynomial order `order[d]` exactly. For integrated
-Legendre this is `order[d] + 1`: an `n`-point Gauss rule is exact for
-polynomials up to degree `2n − 1`, which covers the degree `2 · order[d]`
-of a product of two degree-`order[d]` modes.
+basis functions of polynomial order `order[d]` exactly. The `::BasisFamily`
+default is `order[d] + 1`: an `n`-point Gauss rule is exact for polynomials up
+to degree `2n − 1`, which covers the degree `2 · order[d]` of a product of two
+degree-`order[d]` modes. A family whose functions are not degree-`order[d]`
+polynomials overrides this.
 """
-function recommended_quadrature_order(::IntegratedLegendre, order::NTuple{D,Int}) where {D}
+function recommended_quadrature_order(::BasisFamily, order::NTuple{D,Int}) where {D}
     return ntuple(i -> order[i] + 1, D)
 end
 
@@ -162,12 +179,14 @@ end
     local_basis_count(basis, order)         -> Int
     local_basis_count(basis, order, mode)   -> Int
 
-Number of local basis functions on a single cell. For `:tensor` mode
-(default) and integrated Legendre this is `prod(order .+ 1)`. For
-`:trunk` it is the number of multi-indices satisfying the trunk-degree
-filter (see [`IntegratedLegendre`](@ref)).
+Number of local basis functions on a single cell. The two-argument form is the
+tensor count `prod(order .+ 1)`, a `::BasisFamily` default for tensor-product
+families. The three-argument form takes a basis mode and is family-specific:
+for integrated Legendre `:trunk` counts the multi-indices passing the
+trunk-degree filter (see [`IntegratedLegendre`](@ref)); other families may
+restrict the supported modes.
 """
-function local_basis_count(::IntegratedLegendre, order::NTuple{D,Int}) where {D}
+function local_basis_count(::BasisFamily, order::NTuple{D,Int}) where {D}
     return prod(ntuple(i -> order[i] + 1, D))
 end
 
@@ -679,14 +698,13 @@ function is_boundary_basis(::IntegratedLegendre, id::CartesianIndex{D}, axis::In
     return boundary_mode(id.I[axis], side)
 end
 
-# Codim-K facet membership for an integrated Legendre tensor-product
-# multi-index: the basis function sits on the facet specified by `sides`
-# (a list of `(axis, side)` pairs) iff its 1D mode along *every* listed
-# axis matches the requested side. Codim 1 reduces to a single
-# `is_boundary_basis` check; codim D (a vertex) requires every listed
-# axis-side match — the unique mode that survives is the corner mode
-# `(α₁, …, α_D)` with α_d ∈ {0, 1} chosen by the listed side per axis.
-function is_facet_basis(basis::IntegratedLegendre, id::CartesianIndex{D},
+# Codim-K facet membership for a tensor-product multi-index: the basis function
+# sits on the facet specified by `sides` (a list of `(axis, side)` pairs) iff
+# its 1D mode along *every* listed axis touches the requested side. Codim 1
+# reduces to a single `is_boundary_basis` check; codim K requires every listed
+# axis-side match. This `::BasisFamily` default delegates the per-axis test to
+# the family's `is_boundary_basis`, so it needs no family-specific override.
+function is_facet_basis(basis::BasisFamily, id::CartesianIndex{D},
                         sides::AbstractVector{<:Tuple{Integer,Symbol}}) where {D}
     for (axis, side) in sides
         is_boundary_basis(basis, id, axis, side) || return false
@@ -695,15 +713,16 @@ function is_facet_basis(basis::IntegratedLegendre, id::CartesianIndex{D},
 end
 
 """
-    boundary_basis_indices(basis::IntegratedLegendre, order; axis, side, mode=:tensor)
+    boundary_basis_indices(basis, order; axis, side, mode=:tensor)
         -> Vector{CartesianIndex{D}}
 
-Multi-indices of the local basis functions whose support touches the
-codim-1 face at the requested `(axis, side)`. Used by the Dirichlet
-projection in `src/dofs.jl` to identify which trial / test modes
-contribute on each physical facet.
+Multi-indices of the local basis functions whose support touches the codim-1
+face at the requested `(axis, side)`. Used by the Dirichlet projection in
+`src/dofs.jl` to identify which trial / test modes contribute on each physical
+facet. This `::BasisFamily` default filters `local_basis_indices(basis, order,
+mode)` through the family's `is_boundary_basis`, so it needs no override.
 """
-function boundary_basis_indices(basis::IntegratedLegendre, order::NTuple{D,Int}; axis::Integer,
+function boundary_basis_indices(basis::BasisFamily, order::NTuple{D,Int}; axis::Integer,
                                 side::Symbol, mode::Symbol=:tensor) where {D}
     return [id
             for id in local_basis_indices(basis, order, mode)
