@@ -112,12 +112,13 @@ end
     locate_cell(m::CartesianMesh, point; tol=GeometryTolerance(T)) -> Union{CartesianIndex,Nothing}
 
 Find the cell of `m` containing `point`, or `nothing` if `point` is outside
-the mesh's `domain` (up to `tol.contain`). For points exactly on an
-interior element boundary, the convention is "lower cell wins" — the
-cell with the smaller index along the boundary axis is returned. Points
-right at the upper boundary of an axis are snapped to the last cell along
-that axis so a point sitting exactly on `domain.upper[d]` still returns a
-valid cell.
+the mesh's `domain` (up to `tol.contain`). For a point lying exactly on an
+interior element boundary the convention is "upper cell wins": the cell
+whose lower face is at the boundary — the larger index along that axis — is
+returned, because `searchsortedlast` maps a coordinate sitting on node
+`axis[i]` to cell `i`. Points right at the upper boundary of an axis are
+snapped to the last cell along that axis so a point sitting exactly on
+`domain.upper[d]` still returns a valid cell.
 
 Used by region-to-parent coverage (`_parents_covering` in
 `intersections.jl`) and by post-processing evaluation

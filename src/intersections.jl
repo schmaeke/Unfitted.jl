@@ -137,11 +137,6 @@ function _cached_tensor_quadrature!(cache::Dict{NTuple{D,Int},TensorQuadrature{D
     end
 end
 
-function _region_quadrature(V::Space{D,T}, parents, cache) where {D,T}
-    counts = _parent_quadrature_counts(Val(D), parents, id -> _level_by_id(V, id))
-    return _cached_tensor_quadrature!(cache, counts, T)
-end
-
 # α-scaled weights cache for `:fictitious_alpha` regions, keyed by
 # per-axis quadrature counts. The PhysicalDomain (and so `alpha`) is
 # constant for the duration of one `integration_plan` call, so `alpha`

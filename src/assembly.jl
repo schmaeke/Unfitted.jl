@@ -487,17 +487,6 @@ function _local_parent_dofs_simple!(active_dofs::Vector{Int}, local_by_global::D
     return local_dofs
 end
 
-# One-shot variant for the off-assembly paths (boundary projection):
-# builds the same `(active_dofs, local_by_parent)` pair from scratch
-# without consuming a shared workspace.
-function _local_active_dof_table(parent_data, layout::FieldLayout)
-    active_dofs = Int[]
-    local_by_global = Dict{Int,Int}()
-    local_by_parent = [_local_parent_dofs!(active_dofs, local_by_global, data, layout)
-                       for data in parent_data]
-    return active_dofs, local_by_parent
-end
-
 # Reusable "no contribution" channel — the all-zero `TestChannels` that
 # the bilinear path falls back on when a component-unaware form is
 # asked for an off-diagonal (trial_component ≠ test_component) entry.

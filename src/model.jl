@@ -44,9 +44,6 @@ Fields:
     `n ≤ 256`; `NaN` otherwise (computing the condition number of a
     large matrix is too expensive for a default diagnostic).
   - `solver::Symbol` — solver tag recorded by [`solve!`](@ref).
-  - `invalidated_blocks::Int` and `reused_blocks::Int` — bookkeeping
-    for caller-provided cached operators (currently used by `move!`
-    only).
   - `inactive_cell_counts::Vector{Int}` — per-level count of cells
     deactivated by `LevelMask`. Includes both user-provided masks and
     the strict-α fictitious fold from `physical.jl`.
@@ -74,8 +71,6 @@ mutable struct AssemblyDiagnostics
     symmetry_residual::Float64
     condition_estimate::Float64
     solver::Symbol
-    invalidated_blocks::Int
-    reused_blocks::Int
     inactive_cell_counts::Vector{Int}
     cut_region_count::Int
     fit_failure_count::Int
@@ -109,8 +104,8 @@ end
 function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regions=0,
                              small_overlap_count=0, min_integration_volume=NaN,
                              min_relative_integration_volume=NaN, symmetry_residual=NaN,
-                             condition_estimate=NaN, solver=:none, invalidated_blocks=0,
-                             reused_blocks=0, small_overlaps=SmallOverlap{Float64}[],
+                             condition_estimate=NaN, solver=:none,
+                             small_overlaps=SmallOverlap{Float64}[],
                              inactive_cell_counts=Int[], cut_region_count=0, fit_failure_count=0,
                              moment_fit_residual_max=0.0, facet_region_count=0,
                              surface_region_count=0)
@@ -118,8 +113,8 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                                Int(small_overlap_count), _float_small_overlaps(small_overlaps),
                                Float64(min_integration_volume),
                                Float64(min_relative_integration_volume), Float64(symmetry_residual),
-                               Float64(condition_estimate), Symbol(solver), Int(invalidated_blocks),
-                               Int(reused_blocks), Int[inactive_cell_counts...],
+                               Float64(condition_estimate), Symbol(solver),
+                               Int[inactive_cell_counts...],
                                Int(cut_region_count), Int(fit_failure_count),
                                Float64(moment_fit_residual_max), Int(facet_region_count),
                                Int(surface_region_count))
@@ -500,7 +495,6 @@ function _invalidate_assembly!(model::Model{D,T},
     model.facet_regions = _resolve_facet_regions(model.problem, tolerance)
     model.surface_regions = _resolve_surface_regions(model.problem, tolerance)
     diag = AssemblyDiagnostics(dimension=D, active_unknowns=active_unknowns(model.dofs),
-                               invalidated_blocks=length(model.problem.space.levels),
                                inactive_cell_counts=_inactive_cell_counts(model.problem.space),
                                facet_region_count=_facet_region_count(model.facet_regions),
                                surface_region_count=_surface_region_count(model.surface_regions))

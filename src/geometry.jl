@@ -53,20 +53,25 @@ indistinguishable up to `tol.merge` produce a single shared interval
 rather than a sliver.
 
 Stable, allocation-light, single-pass after the sort. `values` may be any
-iterable of reals; only one allocation (the sorted output) is made.
+iterable of reals; the sorted working copy is the only allocation — the
+merge dedups in place into its own prefix.
 """
 function merge_coordinates(values, tol::GeometryTolerance{T}) where {T}
     sorted = sort!(T[convert(T, value) for value in values])
     isempty(sorted) && return sorted
 
-    merged = T[first(sorted)]
-    for value in Iterators.drop(sorted, 1)
-        if abs(value - last(merged)) > tol.merge
-            push!(merged, value)
+    # Dedup ascending neighbours in place: keep `sorted[i]` only when it
+    # separates from the last kept representative `sorted[n]` by more than
+    # `tol.merge`. `sorted` is ascending, so the gap is already non-negative
+    # and no `abs` is needed. Survivors are packed into the prefix `1:n`.
+    n = 1
+    @inbounds for i in 2:length(sorted)
+        if sorted[i] - sorted[n] > tol.merge
+            n += 1
+            sorted[n] = sorted[i]
         end
     end
-
-    return merged
+    return resize!(sorted, n)
 end
 
 """
@@ -113,6 +118,22 @@ function AxisBox(lower::NTuple{D,T}, upper::NTuple{D,T}) where {D,T<:Real}
     AxisBox{D,T}(SVector{D,T}(lower), SVector{D,T}(upper))
 end
 
+"""
+    box(lower, upper) -> AxisBox
+    box(center; halfwidth) -> AxisBox
+
+Construct an [`AxisBox`](@ref), the dimension-generic axis-aligned box used
+throughout the package.
+
+  - `box(lower, upper)` takes corner coordinates as an `NTuple{D,<:Real}` or
+    `SVector{D,<:Real}`; the scalar type is promoted from the inputs.
+  - `box(center; halfwidth)` takes a center point and a `halfwidth` that is
+    either a scalar (isotropic) or a `D`-tuple / `SVector` (anisotropic). It
+    is equivalent to `box(center .- halfwidth, center .+ halfwidth)`.
+
+See [`AxisBox`](@ref) for the stored representation and the non-degenerate
+`lower[i] < upper[i]` invariant the constructor enforces.
+"""
 function box(lower::NTuple{D,<:Real}, upper::NTuple{D,<:Real}) where {D}
     return box(SVector(lower), SVector(upper))
 end

@@ -31,7 +31,7 @@ struct SolverDiagnostics
 end
 
 """
-    Solution{T,C}
+    Solution{C}
 
 Wrapper around an active coefficient vector tied to a specific
 [`Model`](@ref) version. The version pin is the stale-solution
@@ -52,14 +52,14 @@ Fields:
 
 Use [`solution`](@ref) or [`solve!`](@ref) to construct.
 """
-struct Solution{T,C}
+struct Solution{C}
     coefficients::C
     model_version::Int
     diagnostics::SolverDiagnostics
 end
 
 function Solution(coefficients::C, model_version::Integer, diagnostics::SolverDiagnostics) where {C}
-    return Solution{eltype(coefficients),C}(coefficients, Int(model_version), diagnostics)
+    return Solution{C}(coefficients, Int(model_version), diagnostics)
 end
 
 function Base.show(io::IO, diagnostics::SolverDiagnostics)
