@@ -95,7 +95,7 @@ function _lpoly2d()
 end
 function _inside_L2(p)
     ((-1e-9 <= p[1] <= 2 + 1e-9) && (-1e-9 <= p[2] <= 1 + 1e-9)) ||
-    ((-1e-9 <= p[1] <= 1 + 1e-9) && (-1e-9 <= p[2] <= 2 + 1e-9))
+        ((-1e-9 <= p[1] <= 1 + 1e-9) && (-1e-9 <= p[2] <= 2 + 1e-9))
 end
 
 # Volume / area of {leaf ≤ 0} ∩ box via the implicit kernel.

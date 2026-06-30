@@ -182,8 +182,8 @@ end
     n = size(M1, 1) ÷ 2                       # component-major dofs: 1:n is component 1
     @test size(Mc) == size(M1)
     @test Mc[1:n, 1:n] ≈ 2 .* M1[1:n, 1:n]
-    @test Mc[(n + 1):(2n), (n + 1):(2n)] ≈ 3 .* M1[(n + 1):(2n), (n + 1):(2n)]
-    @test Mc[1:n, (n + 1):(2n)] ≈ zeros(n, n) atol = 1.0e-13   # component-diagonal
+    @test Mc[(n+1):(2n), (n+1):(2n)] ≈ 3 .* M1[(n+1):(2n), (n+1):(2n)]
+    @test Mc[1:n, (n+1):(2n)] ≈ zeros(n, n) atol = 1.0e-13   # component-diagonal
 
     # A scalar coefficient still applies uniformly to both components.
     ms = prepare(mass(u; coefficient=2.0))

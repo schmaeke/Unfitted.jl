@@ -536,8 +536,8 @@ end
 
 function transfer_state_to_space(state, V_new, material)
     new_phase_state = build_phase_state(V_new)
-    rewired_damage = transfer(state.damage_solution, state.phase_state.model,
-                              new_phase_state.model; via=Rewire())
+    rewired_damage = transfer(state.damage_solution, state.phase_state.model, new_phase_state.model;
+                              via=Rewire())
     new_phase_state = (; new_phase_state..., coefficients=copy(rewired_damage.coefficients))
 
     new_displacement_model = build_displacement_model(V_new, state.applied)

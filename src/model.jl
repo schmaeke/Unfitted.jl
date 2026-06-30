@@ -105,19 +105,17 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                              small_overlap_count=0, min_integration_volume=NaN,
                              min_relative_integration_volume=NaN, symmetry_residual=NaN,
                              condition_estimate=NaN, solver=:none,
-                             small_overlaps=SmallOverlap{Float64}[],
-                             inactive_cell_counts=Int[], cut_region_count=0, fit_failure_count=0,
-                             moment_fit_residual_max=0.0, facet_region_count=0,
-                             surface_region_count=0)
+                             small_overlaps=SmallOverlap{Float64}[], inactive_cell_counts=Int[],
+                             cut_region_count=0, fit_failure_count=0, moment_fit_residual_max=0.0,
+                             facet_region_count=0, surface_region_count=0)
     return AssemblyDiagnostics(Int(dimension), Int(active_unknowns), Int(integration_regions),
                                Int(small_overlap_count), _float_small_overlaps(small_overlaps),
                                Float64(min_integration_volume),
                                Float64(min_relative_integration_volume), Float64(symmetry_residual),
                                Float64(condition_estimate), Symbol(solver),
-                               Int[inactive_cell_counts...],
-                               Int(cut_region_count), Int(fit_failure_count),
-                               Float64(moment_fit_residual_max), Int(facet_region_count),
-                               Int(surface_region_count))
+                               Int[inactive_cell_counts...], Int(cut_region_count),
+                               Int(fit_failure_count), Float64(moment_fit_residual_max),
+                               Int(facet_region_count), Int(surface_region_count))
 end
 
 # Per-level count of cells deactivated by a `LevelMask`. Returns one

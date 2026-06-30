@@ -16,7 +16,7 @@ end
     target_solution = transfer(source_solution, source_model, target_model)
     target_mass = assemble_matrix(target_model, mass_block(first(target_model.problem.fields)))
     reused_solution = transfer(source_solution, source_model, target_model;
-                                via=L2Projection(target_mass; factor=factorize(target_mass)))
+                               via=L2Projection(target_mass; factor=factorize(target_mass)))
     exact = x -> x[1] * (1 - x[1])
 
     @test target_solution.model_version == target_model.version
@@ -50,7 +50,7 @@ end
     # rather than silently return wrong interior coefficients.
     target_mass = assemble_matrix(target_model, mass_block(first(target_model.problem.fields)))
     @test_throws ArgumentError transfer(source_solution, source_model, target_model;
-                                         via=L2Projection(target_mass))
+                                        via=L2Projection(target_mass))
 end
 
 @testset "L2 transfer between shifted overlays preserves constants" begin
@@ -256,8 +256,7 @@ end
     src_coeffs = ones(Unfitted.active_unknowns(source_model.dofs))
     sol = Solution(src_coeffs, source_model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
-    @test_throws ArgumentError transfer(sol, source_model, target_model;
-                                         via=Rewire(; strict=true))
+    @test_throws ArgumentError transfer(sol, source_model, target_model; via=Rewire(; strict=true))
     rewired = transfer(sol, source_model, target_model; via=Rewire(; strict=false))
     @test rewired.diagnostics.method === :rewire
 end

@@ -29,7 +29,9 @@ end
 # `UniformScaling`. Only genuine callables `c(x)` become `FunctionCoefficient`,
 # so a bare per-component value (e.g. `coefficient = SVector(2, 3)`) is resolved
 # component-wise rather than mistakenly called as a function of `x`.
-_as_coefficient(value::Union{Number,AbstractArray,UniformScaling,Tuple}) = ConstantCoefficient(value)
+function _as_coefficient(value::Union{Number,AbstractArray,UniformScaling,Tuple})
+    ConstantCoefficient(value)
+end
 _as_coefficient(value) = FunctionCoefficient(value)
 
 # Resolve a coefficient at the physical point `x`. Constant
