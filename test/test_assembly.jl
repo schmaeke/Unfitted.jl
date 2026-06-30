@@ -700,3 +700,51 @@ end
         _check_scatter_matrix(model, stiffness_block(u; diffusion=2.0))
     end
 end
+
+@testset "neumann explicit-component flux lands only on the matching component's boundary dofs" begin
+    # A constant Neumann flux g on the face x = 1 of the unit square,
+    # restricted to one component of a 2-component vector field via the
+    # explicit `component=` selector, must assemble ∫_face g φ_i ds into
+    # that component's boundary dofs and exactly nothing into the other.
+    # With order-1 (partition-of-unity) shape functions the selected
+    # component's boundary dofs sum to the known integral g·|face| = g,
+    # split as g/2 across the two edge nodes; the off-component block is
+    # identically zero. Guards the per-component branch of `neumann`
+    # (the `component=` selector routed through `_source_value`), which
+    # the scalar Neumann testsets above do not exercise.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    V = space(omega; cells=(1, 1), order=1)
+    u = field(:u, V; components=2)
+    model = prepare(Problem((u,)))                  # no Dirichlet: every dof is free
+
+    n = Unfitted.active_unknowns(model.dofs) ÷ 2    # component-major: 1:n is component 1
+    face = boundary(axis=1, side=:upper)            # x = 1, |face| = 1
+    g = 3.0
+
+    # Flux on component 1 only.
+    r1 = assemble_vector(model, neumann(u, g; on=face, component=1))
+    @test sum(r1[1:n]) ≈ g atol = 1.0e-12                            # ∫_face g ds = g·|face|
+    @test count(x -> isapprox(x, g / 2; atol=1.0e-12), r1[1:n]) == 2 # g/2 per edge node
+    @test r1[(n+1):(2n)] ≈ zeros(n) atol = 1.0e-13                   # nothing leaks to component 2
+
+    # Flux on component 2 only mirrors the result onto the other block.
+    r2 = assemble_vector(model, neumann(u, g; on=face, component=2))
+    @test sum(r2[(n+1):(2n)]) ≈ g atol = 1.0e-12
+    @test r2[1:n] ≈ zeros(n) atol = 1.0e-13
+
+    # The selected component's contribution equals the scalar-field Neumann
+    # load on the same facet — the component routing changes only which block
+    # receives the load, not the per-dof integral. Checked at order 2, where
+    # the hierarchical basis is not a partition of unity, so this pins the
+    # integral independently of the order-1 sum above.
+    Vq = space(omega; cells=(1, 1), order=2)
+    uq = field(:u, Vq; components=2)
+    wq = field(:w, Vq)
+    mq = prepare(Problem((uq,)))
+    sq = prepare(Problem((wq,)))
+    nq = Unfitted.active_unknowns(mq.dofs) ÷ 2
+    rq = assemble_vector(mq, neumann(uq, g; on=face, component=1))
+    rref = assemble_vector(sq, neumann(wq, g; on=face))
+    @test rq[1:nq] ≈ rref atol = 1.0e-12
+    @test rq[(nq+1):(2nq)] ≈ zeros(nq) atol = 1.0e-13
+end

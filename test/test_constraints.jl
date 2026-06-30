@@ -285,3 +285,48 @@ end
     @test value(s, model, (1.0,)) ≈ 0.4 atol = 1.0e-10
     @test value(s, model, (0.5,)) ≈ 0.2 atol = 1.0e-10
 end
+
+# Direct, basis-family-free unit test of the cascade resolver
+# `_resolve_constraints!`. Outside this test the resolver is exercised only
+# transitively through the B-spline Cᵐ overlay path, so this guards the
+# Gauss-elimination + back-substitution machinery on its own, with no
+# B-spline dependency. The hand-built system is engineered so that:
+#   * a later constraint pivots a raw that an EARLIER pivot's expansion
+#     still mentions (constraint B pivots raw 2, which constraint A's pivot
+#     expansion references), forcing step-5 back-substitution into the
+#     earlier pivot; and
+#   * a still-later constraint's raw list references a raw that is itself an
+#     earlier pivot (constraint C references raw 3), forcing step-1 forward
+#     substitution of the already-resolved expansion.
+# All coefficients are dyadic so the resolved (raw, weight) redirects are
+# exactly representable in Float64 and can be checked with `==`.
+@testset "linear-constraint resolver back-substitutes into earlier pivots" begin
+    nraw = 5
+    # A:  u₁ +  u₂ + 2u₃ = 0  ⇒ pivot raw 3 = −½u₁ − ½u₂ (mentions raw 2).
+    # B: 2u₂ +  u₄      = 0  ⇒ pivot raw 2 = −½u₄; back-substituted into raw 3.
+    # C:  u₃ + 2u₅      = 0  ⇒ raw 3 already pivoted (forward substitution);
+    #                          pivot raw 5 in terms of the free raws {1, 4}.
+    constraints = [Unfitted.LinearConstraint{Float64}([1, 2, 3], [1.0, 1.0, 2.0]),
+                   Unfitted.LinearConstraint{Float64}([2, 4], [2.0, 1.0]),
+                   Unfitted.LinearConstraint{Float64}([3, 5], [1.0, 2.0])]
+
+    raw_expansion = Vector{Vector{Tuple{Int,Float64}}}(undef, nraw)
+    Unfitted._resolve_constraints!(raw_expansion, constraints, nraw)
+
+    # Free raws keep the identity expansion; every pivot is redistributed
+    # onto the free raws {1, 4} only — the resolver's "free raws only"
+    # invariant after back-substitution.
+    @test raw_expansion[1] == [(1, 1.0)]
+    @test raw_expansion[4] == [(4, 1.0)]
+    @test raw_expansion[2] == [(4, -0.5)]
+    @test raw_expansion[3] == [(1, -0.5), (4, 0.25)]
+    @test raw_expansion[5] == [(1, 0.25), (4, -0.125)]
+
+    # `has_linear_constraints` mirrors the predicate `dof_layout` derives
+    # from the resolved table: true iff some raw redirects onto *other* raws
+    # (neither the identity `[(raw, 1)]` nor the empty strong-elimination `[]`).
+    has_linear_constraints = any(pairs(raw_expansion)) do (raw, e)
+        !(isempty(e) || (length(e) == 1 && e[1] == (raw, 1.0)))
+    end
+    @test has_linear_constraints
+end
