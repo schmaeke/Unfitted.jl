@@ -20,10 +20,22 @@ Cartesian grids. It implements the method described in
 > <https://arxiv.org/abs/2604.25797>
 
 The implementation is written from the method specification — not ported
-from any single reference codebase. Sub-systems derived from upstream
+from any single reference codebase. Sub-systems informed by upstream
 open-source projects are attributed in `NOTICE.md` and at the top of every
-file that carries the ported logic. The notable case is the finite-cell
-method moment-fit quadrature in `src/fcm.jl`, ported from QuESo:
+file that carries the borrowed design. The notable case is the finite-cell
+method moment-fit quadrature in `src/fcm.jl`. Its cut-cell moments are
+computed exactly by Saye's dimension-reduction implicit quadrature on a CSG
+level set (`src/implicit.jl`, `src/physical.jl`); the non-negative
+moment-fit idea is
+
+> B. Müller, F. Kummer, M. Oberlack, *Highly accurate surface and volume
+> integration on implicit domains by means of moment-fitting*, Int. J.
+> Numer. Methods Engng. **96** (2013) 512–528.
+> [doi:10.1002/nme.4569](https://doi.org/10.1002/nme.4569).
+
+and the non-negative least-squares moment-fit *structure* follows QuESo's
+`QuadratureTrimmedElement` — used as an algorithmic reference only, with no
+code vendored:
 
 > M. Meßmer, T. Teschemacher, L. F. Leidinger, R. Wüchner, K.-U.
 > Bletzinger, *Efficient CAD-integrated isogeometric analysis of trimmed
@@ -114,18 +126,23 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 |-------------------|-------------------------------------------------------------|
 | `Unfitted.jl`     | top-level module: imports, exports, include order           |
 | `geometry.jl`     | D-dimensional axis-aligned boxes, coordinate maps, tolerances |
-| `physical.jl`     | level-set `PhysicalDomain` and the octree cell classifier   |
+| `physical.jl`     | CSG level-set tree, `PhysicalDomain`, three-valued cell classifier |
+| `implicit.jl`     | Saye dimension-reduction implicit quadrature on the level set (volume/surface rules) |
 | `basis.jl`        | basis-family interface, integrated Legendre default, tensor-product evaluation |
-| `fcm.jl`          | finite-cell-method machinery: octree, moment integration, non-negative moment fit (QuESo port) |
+| `fcm.jl`          | finite-cell-method cut-cell quadrature: exact moments from `implicit.jl`, non-negative (NNLS) moment fit |
 | `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks |
-| `intersections.jl`| admissible integration regions for non-matching meshes      |
-| `dofs.jl`         | dof layout, raw/active enumeration, boundary-constraint detection |
-| `assembly.jl`     | weak forms, `Model` lifecycle, sparse global assembly       |
+| `intersections.jl`| admissible integration regions for non-matching meshes; cut/fictitious region-quadrature dispatch |
+| `dofs.jl`         | dof layout, raw/active enumeration, overlay/boundary-constraint detection |
+| `dirichlet.jl`    | physical Dirichlet boundary conditions, boundary selectors, strong elimination and Nitsche enforcement |
+| `surface.jl`      | immersed-boundary surface meshes (`BoundaryMesh`) and surface-region integration |
+| `problems.jl`     | `Field`, weak-form channels and blocks (`BlockForm`/`LoadForm`/`WeakForm`), `Problem` |
+| `model.jl`        | `Model` lifecycle: `prepare`, `move!`/`activate!`/`deactivate!`, diagnostics |
+| `assembly.jl`     | coupled Galerkin assembly: channel calculus, cached symbolic-scatter (Gustavson) sparse path |
 | `solvers.jl`      | small solver/preconditioner wrappers + `Solution`           |
-| `projection.jl`   | variational and rewire-based transfer between models        |
+| `projection.jl`   | variational and rewire-based state transfer between models  |
 | `data.jl`         | per-quadrature-point `QuadField` + RBF transfer             |
 | `postprocessing.jl` | VTK export, L² error, field/gradient evaluation           |
-| `api.jl`          | thin public-API wrappers (mass, stiffness, poisson, …)      |
+| `api.jl`          | thin public-API wrappers (mass, stiffness, poisson, neumann, …) |
 
 Only split a single file when a second basis family, an alternative
 transfer scheme, or an honest test burden makes the split helpful.
@@ -169,9 +186,8 @@ only when an example is specifically about those internals.
 
 ### Benchmarks (`benchmarks/`)
 
-Small targeted benchmarks with their own `Project.toml`. Driven by
-`benchmarks/runbenchmarks.jl`. The `BENCHMARKING.md` file at the repo
-root documents the suite.
+Small targeted benchmarks with their own `Project.toml`. Driven and
+documented by `benchmarks/runbenchmarks.jl`.
 
 ### Developer tooling
 
@@ -211,11 +227,12 @@ this protocol:
      Julia package ecosystem inside `src/`, `test/`, or `examples/`.
 
 QuESo's source under `github.com/manuelmessmer/QuESo` is the algorithmic
-reference for the FCM moment-fit pipeline in `src/fcm.jl`. The deliberate
-deviations from that source (level-set geometry kernel instead of B-rep
-triangulation, octree stair-step moment integration instead of
-divergence-theorem surface integrals) are documented at the top of
-`src/fcm.jl`.
+reference for the *non-negative moment-fit structure* in `src/fcm.jl`; it
+is a design reference only and no QuESo code is vendored. The deliberate
+deviations from that source — a CSG level-set geometry kernel instead of a
+B-rep triangulation, and *exact* moments from Saye's implicit quadrature
+(`src/implicit.jl`) instead of a divergence-theorem surface integral with a
+point-elimination retry — are documented at the top of `src/fcm.jl`.
 
 ## Method and architecture
 
@@ -513,66 +530,82 @@ scope and would require a different abstraction.
 ### Immersed boundary (finite cell method)
 
 The package supports the finite cell method with non-negative moment-fit
-quadrature on cut cells (see the QuESo citation above). The geometry of
-`Ω` is described by a **level-set function** `φ(x)`; the convention is
+quadrature on cut cells. The geometry of `Ω` is a **CSG level set**: a
+Boolean combination of smooth leaves, each a scalar function `f` with
+`Ω_leaf = { x : f(x) ≤ 0 }`. A single leaf is the familiar
+`Ω = { x : φ(x) ≤ 0 }`; the combinators `intersect`, `union`, `setdiff`,
+and `complement` build the rest (e.g. an annulus as a disk minus a disk).
+Carrying the leaves separately — rather than collapsing them into one
+`min`/`max` level set — keeps every boundary piece smooth, so the implicit
+quadrature kernel stays high-order across creases and corners. Boolean
+indicator representations are intentionally not supported.
 
-```text
-Ω = { x : φ(x) ≤ 0 }
-```
-
-Boolean indicator representations are intentionally not supported.
+  - **Build geometry** with [`leaf`](@ref) and the CSG combinators:
+    `leaf(f; lipschitz=Inf)`, `intersect(a, b…)`, `union(a, b…)`,
+    `setdiff(a, b)`, `complement(a)`. A bare callable is auto-wrapped as a
+    default leaf, so the single-level-set case stays ergonomic.
 
   - **Public construction**:
-    `physical_domain(phi; lipschitz=Inf, alpha=0.0, subcell_length_scale,
+    `physical_domain(geometry; lipschitz=Inf, alpha=0.0, subcell_length_scale,
     max_depth=8, moment_order_factor=2, target_residual=1e-6)`.
 
-    - `phi(x)`: scalar function on `SVector{D,T}`; need not be a true
-      signed-distance function.
-    - `lipschitz`: Lipschitz constant `L` of `φ`. `1.0` for a true SDF;
-      `Inf` disables the cheap "uniform sign" certificate and forces
-      classification by corner sampling and octree subdivision down to
-      the per-cell length-scale bound.
+    - `geometry`: a `LevelSet` CSG tree, or a bare scalar callable `φ` on
+      `SVector{D,T}` (auto-wrapped as a single leaf). `φ` need not be a
+      true signed-distance function, but must accept `ForwardDiff.Dual`
+      arguments so the quadrature kernel can take its gradient.
+    - `lipschitz`: Lipschitz constant `L` of the auto-wrapped single leaf.
+      `1.0` for a true SDF; `Inf` disables the cheap "uniform sign"
+      certificate and forces classification by corner sampling and
+      subdivision. For a CSG tree, set each leaf's constant on its
+      `leaf(...)` call instead.
     - `alpha`: fictitious-region weight for α-FCM stabilization. `0` is
       the strict cut path (cells fully outside `Ω` are dropped from the
       dof layout); `> 0` keeps those cells active with quadrature
       weights pre-multiplied by `α`.
-    - `subcell_length_scale` (required): target octree leaf size in
-      physical units. The cell classifier and the moment integrator
-      subdivide each cut cell until every leaf's largest axis extent
-      is at most this value. Primary accuracy knob; one `PhysicalDomain`
-      then serves coarse and fine levels of a superposition `Space`
-      without overpaying on the fine level.
-    - `max_depth` (default `8`): hard safety cap on octree depth.
-      Engages only when `subcell_length_scale` would call for more
-      levels than this.
-    - `moment_order_factor`: multiplier on the NNMF moment-fit basis
-      order per axis. `2` (default) integrates trial × test products
-      exactly on the moment basis, matching what tensor Gauss does on
-      `:full` regions. `1` halves the basis but only integrates
-      degree-`p` integrands exactly.
-    - `target_residual`: target L² residual for the moment fit. The
-      default `1e-6` is matched to the natural stair-step accuracy of
-      the octree moment integrator at the default
-      `subcell_length_scale`. Tighten only when `subcell_length_scale`
-      is tightened correspondingly (rule of thumb: two decades per
-      halving of the scale).
+    - `subcell_length_scale` (required): target box size, in physical
+      units, for the binary subdivision shared by two consumers — the
+      cut/full/fictitious cell classifier, and the implicit kernel's
+      fallback subdivision on *non-graph-like* cut cells (a leaf with a
+      turning point inside the box). It is a geometry-robustness knob
+      (resolving thin or near-tangent features), **not** a moment-accuracy
+      grid: smooth, graph-like cut cells get exact, depth-independent
+      moments and are never subdivided. One `PhysicalDomain` then serves
+      coarse and fine levels of a superposition `Space`.
+    - `max_depth` (default `8`): hard cap on the subdivision depth of both
+      consumers above.
+    - `moment_order_factor`: multiplier on the moment-fit basis order per
+      axis. `2` (default) integrates trial × test products exactly on the
+      moment basis, matching what tensor Gauss does on `:full` regions;
+      `1` halves the basis but only integrates degree-`p` integrands
+      exactly.
+    - `target_residual`: target L² residual for the moment fit. The exact
+      kernel reaches far below the `1e-6` default in a single NNLS solve,
+      so this only bounds a small conditioning retry (a denser candidate
+      cloud) — never moment accuracy or subdivision depth.
 
   - **Attach** with `space(omega; ..., physical=physical_domain(…))`.
     The default `physical=nothing` keeps the no-FCM hot path.
 
+  - **Imported geometry**: with `FileIO` and `MeshIO` loaded,
+    `mesh_levelset(mesh)` turns a closed `BoundaryMesh` (a 2D segment loop
+    or a 3D triangle surface) into a signed-distance leaf, and
+    `stl_levelset("part.stl")` reads an STL into one. Both compose with the
+    CSG combinators (see `ext/UnfittedMeshIOExt.jl`).
+
   - **Region quadrature kinds** (visible via `region.quadrature.kind`):
     `:full` (tensor Gauss), `:fictitious_alpha` (α-scaled tensor Gauss),
-    `:cut_fitted` (NNMF moment-fit rule), `:cut_failed` (NNMF residual
-    exceeded the failure threshold; region contributes zero
+    `:cut_fitted` (NNLS moment-fit rule), `:cut_failed` (moment-fit
+    residual exceeded the failure threshold; region contributes zero
     quadrature). The assembly hot loop is unchanged — it just iterates
     `zip(points, weights)`.
 
-  - **NNMF defaults**: moment-fit basis order =
-    `2 × max(level.order)` per axis over the region's parents;
-    Lawson–Hanson NNLS via `NonNegLeastSquares.jl`; point-elimination
-    loop floor at `prod(moment_order)`; outer retry up to 3 attempts
-    (4 when any axis order is 2). Cached by canonicalized region
-    bounds + moment order.
+  - **Moment-fit defaults**: moment-fit basis order = `moment_order_factor
+    × max(level.order)` per axis over the region's parents; exact tensor
+    Legendre moments from the Saye volume rule; a single Lawson–Hanson
+    NNLS solve (`NonNegLeastSquares.jl`) selects ≤ `nbasis` non-negative
+    weights; up to 3 attempts, retrying only with a denser candidate cloud
+    for NNLS conditioning, never with more subdivision. Rules are cached by
+    canonicalized region bounds + moment order.
 
   - **Diagnostics**: `diagnostics(model, solution).cut_region_count`,
     `fit_failure_count`, `moment_fit_residual_max`,
@@ -646,7 +679,7 @@ The rules:
     pattern matters.
   - **Inline commentary in complex function bodies.** When a function
     body runs more than a handful of lines or chains together
-    non-obvious steps — basis-table updates, sparse triplet emission,
+    non-obvious steps — basis-table updates, sparse-scatter emission,
     boundary projection, retry loops — place a short comment above
     each non-obvious step explaining why it is there. Use one-line
     section headers within a long body to mark distinct stages. A
@@ -684,8 +717,8 @@ below so the codebase converges over time.
     the top of `src/physical.jl` are fully worked examples.
 
   - **Section dividers in long files.** When a file has clearly
-    separable stages or concerns (`src/fcm.jl`'s NNLS / octree / moment
-    / fit pipeline; `precommit.jl`'s CLI / discovery / formatting /
+    separable stages or concerns (`src/fcm.jl`'s NNLS / moment / fit
+    pipeline; `precommit.jl`'s CLI / discovery / formatting /
     stats / main) group them with single-line `─` dividers carrying the
     section name. The canonical form:
 
@@ -771,7 +804,7 @@ Rules:
 
   - Parallelize over independent integration regions, elements, or
     batches.
-  - Use thread-local buffers for sparse triplets and local matrices;
+  - Use thread-local buffers for the sparse scatter and local matrices;
     reduce after threaded loops.
   - Do not push into a shared vector from multiple threads without
     explicit synchronization; prefer thread-local storage.

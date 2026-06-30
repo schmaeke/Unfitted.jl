@@ -37,9 +37,12 @@ The method is described in
   contract; useful for transient problems where small-scale features
   evolve in time.
 - **Immersed-boundary integration** through a `PhysicalDomain` carrying a
-  Lipschitz level set. Cells outside `Ω` are dropped from the dof layout;
-  cells crossed by `∂Ω` use a non-negative moment-fitted quadrature rule
-  ported from QuESo (see [`NOTICE.md`](NOTICE.md) for upstream attribution).
+  CSG level set of smooth leaves (`leaf`/`intersect`/`union`/`setdiff`/
+  `complement`). Cells outside `Ω` are dropped from the dof layout; cells
+  crossed by `∂Ω` use a non-negative moment-fitted quadrature rule whose
+  moments come from Saye's exact implicit quadrature, with the moment-fit
+  structure informed by QuESo (see [`NOTICE.md`](NOTICE.md) for upstream
+  attribution).
 - **D-generic core**: 1D, 2D, 3D, and 4D smoke-tested.
 
 ## Installation
@@ -94,6 +97,7 @@ julia --project=examples/<name> examples/<name>/<name>.jl
 | `traveling_heat_source_2d/` | Transient heat with hierarchical adaptive overlays |
 | `phase_field_single_edge_notch_2d/` | Phase-field fracture, SENT specimen |
 | `fcm_annular_plate_2d/` | FCM plane-stress annular plate with Nitsche + Neumann (Ruess 2013 §4.2) |
+| `fcm_plate_with_hole_2d/` | FCM plate with a circular hole, Kirsch stress verification |
 
 ## Documentation
 
@@ -119,6 +123,8 @@ A machine-readable record will be provided in
 
 Unfitted.jl is distributed under the MIT License (see [`LICENSE.md`](LICENSE.md)).
 
-The finite-cell-method machinery in `src/fcm.jl` is derived from
-[QuESo](https://github.com/manuelmessmer/QuESo) (BSD-4-Clause). See
-[`NOTICE.md`](NOTICE.md) for the full upstream attribution.
+The non-negative moment-fit structure in `src/fcm.jl` is informed by
+[QuESo](https://github.com/manuelmessmer/QuESo) (BSD-4-Clause), used as an
+algorithmic reference only (no code vendored); the cut-cell moments come
+from Saye's implicit quadrature. See [`NOTICE.md`](NOTICE.md) for the full
+upstream attribution.

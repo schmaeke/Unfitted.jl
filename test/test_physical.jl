@@ -128,13 +128,13 @@ end
 end
 
 @testset "PhysicalDomain.target_residual drives integration_plan moment-fit" begin
-    # The default 1.0e-6 is matched to the natural stair-step accuracy of the
-    # octree moment integration. A tight target triggers wasted retries that
-    # cannot actually be satisfied at a fixed subcell_length_scale; the loose
-    # default produces the same residuals at a fraction of the cost. The 2×2
-    # base-cell box is [−1, 1]² split 8×8, giving 0.25-wide cells; a leaf
-    # scale of 1/2^4 = 0.0625 of the cell ≈ 0.016 of the base box reproduces
-    # the old `subcell_length_scale=1.0e-6, max_depth=4` per-cut-cell octree.
+    # The default 1.0e-6 is a loose bound on the moment fit. The Saye kernel's
+    # moments are exact on graph-like cut cells and high-order on curved ones,
+    # so the achieved residual is set by the kernel, not by the target: a
+    # tighter target only triggers extra conditioning retries that cannot beat
+    # the kernel's curved-boundary approximation floor. The 2×2 base box
+    # [−1, 1]² is split 8×8 into 0.25-wide cells; subcell_length_scale here
+    # only bounds classifier/fallback subdivision, not moment accuracy.
     phi(x) = sqrt(x[1]^2 + x[2]^2) - 0.7
     omega = box((-1.0, -1.0), (1.0, 1.0))
 
@@ -154,8 +154,8 @@ end
     cut_tight = count(r -> r.quadrature.kind === :cut_fitted, plan_tight.regions)
     @test cut_loose == cut_tight > 0
 
-    # Tight target cannot actually drive the moment-fit below the octree's
-    # stair-step floor, but the loose default reaches the same accuracy floor.
+    # Both targets reach the same residual floor: it is set by the kernel's
+    # approximation of the curved boundary, which a tighter target cannot beat.
     @test plan_loose.moment_fit_residual_max < 1.0e-5
     @test plan_tight.moment_fit_residual_max < 1.0e-5
 end
@@ -240,18 +240,17 @@ end
 
     active = active_cells(m; level=1)
     @test !active[5, 5] && !active[5, 6] && !active[6, 5] && !active[6, 6]
-    # A cell touching ∂Ω stays active (stair-step approximation in Slice 3).
+    # A cell touching ∂Ω stays active (the classifier keeps it as a cut cell).
     @test active[4, 4]    # touched by the disk but not inside it
     @test active[1, 1]    # well outside the disk
 end
 
 @testset "fictitious-cell fold matches manual deactivation (dof structure)" begin
-    # Verify that the cell-level fictitious fold (Slice 3) drops the same
-    # cells from the dof layout as a manual `active=…` mask. The matrix
-    # values disagree post-Slice-5c because cut cells now use NNMF-fitted
-    # quadrature while the manual variant uses standard Gauss everywhere
-    # the cell is active — different mathematical operators, by design.
-    # Test the structural equivalence only.
+    # Verify that the cell-level fictitious fold drops the same cells from the
+    # dof layout as a manual `active=…` mask. The matrix values differ because
+    # cut cells use moment-fitted quadrature while the manual variant uses
+    # standard Gauss everywhere the cell is active — different mathematical
+    # operators, by design. Test the structural equivalence only.
     bc = dirichlet(0.0; on=boundary(:all))
     src = x -> sin(pi * x[1]) * sin(pi * x[2])
     omega = box((0.0, 0.0), (1.0, 1.0))
@@ -279,7 +278,7 @@ end
     # phi(x) = x[1] − 0.495. Cells whose entire x-range is ≥ 0.495 become
     # fictitious. Overlay cells of width 0.1 at axis-1 indices 3 and 4
     # (covering 0.5–0.6 and 0.6–0.7) are entirely outside Ω; index 2
-    # (0.4–0.5) is :cut and kept active under the Slice 3 stair-step rule.
+    # (0.4–0.5) is :cut and kept active by the classifier.
     p = physical_domain(x -> x[1] - 0.495; lipschitz=1.0, subcell_length_scale=1.0e-6, max_depth=2)
 
     V = overlay(space(omega; cells=(8, 8), order=1, physical=p), box((0.3, 0.3), (0.7, 0.7));
@@ -326,9 +325,9 @@ end
     @test !any(active_cells(m; level=2))   # all overlay cells inactive
 end
 
-# --- Slice 4: region-level classification + α-FCM ---
+# --- Region-level classification and α-FCM ---
 
-@testset "Slice 4 — α=1 + all-fictitious matches no-physical baseline" begin
+@testset "α=1 + all-fictitious matches no-physical baseline" begin
     # 1D, single cell, Ω = ∅ (phi=1 everywhere). With α=1 the region is
     # :fictitious_alpha but the weight scale is 1, so the matrix matches the
     # plain (no physical_domain) assembly.
@@ -349,7 +348,7 @@ end
     @test m_none.matrix ≈ m_alpha1.matrix
 end
 
-@testset "Slice 4 — α-FCM weights scale the bilinear form" begin
+@testset "α-FCM weights scale the bilinear form" begin
     omega = box((0.0,), (1.0,))
     bc = dirichlet(0.0; on=boundary(:all))
 
@@ -368,12 +367,12 @@ end
     @test m05.matrix ≈ 0.5 * m1.matrix
 end
 
-@testset "Slice 4 — α=0 + all-fictitious drops every region" begin
+@testset "α=0 + all-fictitious drops every region" begin
     omega = box((0.0,), (1.0,))
     bc = dirichlet(0.0; on=boundary(:all))
 
-    # phi(x) = 1 ⇒ Ω = ∅. Slice 3 fold deactivates every cell at the cell
-    # level (so dof enumeration is empty); the integration plan correctly
+    # phi(x) = 1 ⇒ Ω = ∅. The fictitious fold deactivates every cell at the
+    # cell level (so dof enumeration is empty); the integration plan correctly
     # produces no regions.
     V = space(omega; cells=1, order=2,
               physical=physical_domain(x -> 1.0; lipschitz=1.0, subcell_length_scale=1.0))
@@ -387,12 +386,12 @@ end
     @test size(m.matrix) == (0, 0)
 end
 
-@testset "Slice 4 — region quadrature kinds" begin
-    # Mixed configuration: a disk hole on a 10×10 mesh. After Slice 5c, the
-    # boundary cells produce `:cut_fitted` regions via NNMF; cells fully
-    # inside Ω stay `:full`; fictitious cells are already dropped at the
-    # cell level by Slice 3. Uses subcell_length_scale=1.0e-6, max_depth=2 + order=1 to keep the
-    # NNMF cost on the surrounding cut cells bounded.
+@testset "region quadrature kinds" begin
+    # Mixed configuration: a disk hole on a 10×10 mesh. Boundary cells produce
+    # `:cut_fitted` regions via the moment fit; cells fully inside Ω stay
+    # `:full`; fictitious cells are already dropped at the cell level by the
+    # fold. Uses subcell_length_scale=1.0e-6, max_depth=2 + order=1 to keep the
+    # moment-fit cost on the surrounding cut cells bounded.
     omega = box((0.0, 0.0), (1.0, 1.0))
     hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0,
                            subcell_length_scale=1.0e-6, max_depth=2)
@@ -405,10 +404,10 @@ end
     @test :cut_fitted in kinds
 end
 
-@testset "Slice 4 — α-FCM weight cache shares the scaled vector" begin
+@testset "α-FCM weight cache shares the scaled vector" begin
     # Two regions of the same tensor order in the same plan should reference
     # the same α-scaled weights vector (cache hit), preserving the
-    # "shared underlying array" invariant Slice 4 documents.
+    # "shared underlying array" invariant the α-FCM weight cache documents.
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(2, 2), order=2,
               physical=physical_domain(x -> 1.0; lipschitz=1.0, alpha=0.5,
@@ -422,9 +421,9 @@ end
     @test all(r.quadrature.weights === w for r in fict_regions)
 end
 
-# --- Slice 5c: NNMF moment-fit hooked into the integration plan ---
+# --- Moment-fit quadrature in the integration plan ---
 
-@testset "Slice 5c — 1D cut mass matrix matches analytic integral" begin
+@testset "1D cut mass matrix matches analytic integral" begin
     # Cell (0, 1), order 2, Ω = (0, 0.7). Mass entry M[1,1] for the
     # endpoint mode N_0(x) = 1 − x: ∫_0^0.7 (1 − x)^2 dx = (1 − 0.3^3) / 3.
     omega = box((0.0,), (1.0,))
@@ -440,7 +439,7 @@ end
     @test issymmetric(M)
 end
 
-@testset "Slice 5c — 2D Poisson on a cut disk solves and is SPD" begin
+@testset "2D Poisson on a cut disk solves and is SPD" begin
     # End-to-end smoke: PhysicalDomain set, system assembles, matrix SPD,
     # solver returns a finite solution. Uses moderate accuracy parameters
     # for a fast test.
@@ -457,12 +456,11 @@ end
 end
 
 @testset "3D immersed Poisson on a cut sphere — exact-moment kernel, O(nbasis), no OOM" begin
-    # Local proxy for the 3D acceptance criterion (crack_hole_3d on helios):
-    # a 3D FCM problem assembles and solves with the exact implicit-kernel
-    # moments. The moment-fit residual reaches machine precision (the kernel
-    # path is taken, not the octree stair-step), every cut cell carries
-    # O(nbasis) quadrature points rather than the 8^depth cloud that made the
-    # octree path run out of memory in 3D, and the system stays SPD.
+    # A 3D FCM problem assembles and solves with the exact implicit-kernel
+    # moments. The moment-fit residual reaches machine precision (the exact
+    # Saye kernel path is taken), every cut cell carries O(nbasis) quadrature
+    # points rather than the 8^depth cloud a stair-step octree would need, and
+    # the system stays SPD.
     omega = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
     hole = physical_domain(x -> 0.3 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2 + (x[3] - 0.5)^2);
                            lipschitz=1.0, subcell_length_scale=0.1)
@@ -477,18 +475,18 @@ end
     diag = diagnostics(m)
     @test diag.cut_region_count > 0
     @test diag.fit_failure_count == 0
-    # Exact kernel ⇒ residual far below the octree stair-step floor.
+    # Exact kernel ⇒ residual at machine precision, far below any stair-step floor.
     @test diag.moment_fit_residual_max < 1e-8
 
     # Every cut-cell rule is O(nbasis): a single NNLS solve keeps at most
-    # nbasis = (order·factor + 1)^D = 3³ = 27 points; the octree path produced
-    # thousands here.
+    # nbasis = (order·factor + 1)^D = 3³ = 27 points; a stair-step octree
+    # would have produced thousands here.
     plan = Unfitted.integration_plan(m)
     cut_regions = [r for r in plan.regions if r.quadrature.kind === :cut_fitted]
     @test maximum(length(r.quadrature.points) for r in cut_regions) <= 27
 end
 
-@testset "Slice 5c — diagnostics report cut_region_count" begin
+@testset "diagnostics report cut_region_count" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0,
                            subcell_length_scale=1.0e-6, max_depth=2)
@@ -503,7 +501,7 @@ end
     @test diag.fit_failure_count == 0   # no failures expected on this smooth Ω
 end
 
-@testset "Slice 5c — moment-fit cache shares rules across identical regions" begin
+@testset "moment-fit cache shares rules across identical regions" begin
     # If the integration plan produces two regions with byte-identical bounds
     # (e.g., symmetric tiling), they should share one fitted rule (cache hit
     # → same Vector identity).
@@ -518,7 +516,7 @@ end
     @test length(cut_regions) <= 1
 end
 
-@testset "Slice 5c — cut region integrates the volume to better than stair-step" begin
+@testset "cut region integrates the volume to better than stair-step" begin
     # Sanity: the moment-fit rule on a 1D cut cell integrates `1` (i.e., the
     # 0th moment) more accurately than full-cell tensor Gauss would.
     omega = box((0.0,), (1.0,))
@@ -533,13 +531,13 @@ end
     @test integral ≈ 0.7 atol = 1.0e-3
 end
 
-@testset "Slice 5c — :cut_failed marks unrecoverable fits" begin
-    # Force a catastrophic NNMF residual by making moments unreachable: very
-    # small Ω with no subdivision → moments dominated by stair-step error.
+@testset ":cut_failed marks unrecoverable fits" begin
+    # A tiny Ω with subdivision disabled (max_depth=0) leaves the moment fit
+    # very little to work with on the single depth-0 cut cell.
     omega = box((0.0,), (1.0,))
-    # Tiny Ω near zero — at subcell_length_scale=10.0, max_depth=0 the classifier emits the whole
-    # region as :cut (corners of [0,1] straddle phi=0), and NNMF must work
-    # with whatever moments the depth-0 stair-step produces.
+    # At subcell_length_scale=10.0, max_depth=0 the classifier emits the whole
+    # region as :cut (corners of [0,1] straddle phi=0), and the NNLS fit must
+    # work with the moments of that single undivided cut cell.
     p = physical_domain(x -> x[1] - 0.001; lipschitz=1.0, subcell_length_scale=10.0, max_depth=0)
     V = space(omega; cells=1, order=2, physical=p)
     plan = Unfitted.integration_plan(V)
@@ -550,9 +548,9 @@ end
     @test failed >= 0   # placeholder: the path exists
 end
 
-# --- Review pass 2: closing test coverage gaps ---
+# --- Space.physical forwarding and moment-fit knobs ---
 
-@testset "Review — moved_space preserves Space.physical" begin
+@testset "moved_space preserves Space.physical" begin
     # Forward an immersed-domain Space through `moved_space` and assert the
     # `physical` field is preserved on the new Space.
     bc = dirichlet(0.0; on=boundary(:all))
@@ -564,7 +562,7 @@ end
     @test V_moved.physical === V.physical
 end
 
-@testset "Review — overlay forwards Space.physical" begin
+@testset "overlay forwards Space.physical" begin
     # Adding an overlay to a Space with a physical_domain must keep the
     # physical_domain on the resulting Space.
     omega = box((0.0, 0.0), (1.0, 1.0))
@@ -574,7 +572,7 @@ end
     @test V_overlay.physical === p
 end
 
-@testset "Review — NNMF on a region with multi-level parents" begin
+@testset "NNMF on a region with multi-level parents" begin
     # A cut base cell that is also covered by a cut overlay cell — exercises
     # `_moment_order_for_region`'s max-over-parents logic. Use orders that
     # differ between levels so the chosen moment_order is meaningful.
@@ -595,7 +593,7 @@ end
     @test moment_order == (4,)
 end
 
-@testset "Review — moment_order_factor knob tunes the NNMF basis" begin
+@testset "moment_order_factor knob tunes the NNMF basis" begin
     omega = box((0.0,), (1.0,))
     p_default = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=1.0e-6,
                                 max_depth=2)
@@ -614,7 +612,7 @@ end
                                                moment_order_factor=0)
 end
 
-@testset "Review — fit_failure_count > 0 on a forced-failure setup" begin
+@testset "fit_failure_count > 0 on a forced-failure setup" begin
     # Construct a setup where the moment basis is unreachable: very high
     # moment_order against a coarsely-resolved Ω near the cell boundary.
     # We can't drive a failure through the public API at default

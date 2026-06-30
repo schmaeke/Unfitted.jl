@@ -21,8 +21,10 @@ running as an agent.
      `examples/` files before proposing changes.
   4. For questions about the numerical method, consult the UMLHP
      preprint cited in `CONTRIBUTING.md`. For questions about the FCM
-     moment-fit pipeline, consult the QuESo paper cited at the top of
-     `src/fcm.jl` and the comments in that file. Do not invent
+     moment-fit pipeline, consult the Saye implicit-quadrature and
+     Müller moment-fit papers cited at the top of `src/fcm.jl` and
+     `src/implicit.jl`, plus the QuESo reference for the moment-fit
+     structure, and the comments in those files. Do not invent
      numerical conventions: when in doubt, ask in the chat or open an
      issue.
   5. State a brief plan for any non-trivial change before editing. For
