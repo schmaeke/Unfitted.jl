@@ -164,6 +164,33 @@ end
                    norm=:absolute) < 1.0e-12
 end
 
+@testset "mass_form per-component coefficient indexes by component" begin
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    V = space(omega; cells=(1, 1), order=2)
+    u = field(:u, V; components=2)
+
+    # A per-component (SVector) mass coefficient must scale each component's
+    # mass block by its own slot. Before the fix this raised a MethodError:
+    # the whole coefficient vector multiplied the scalar trial value.
+    mc = prepare(mass(u; coefficient=SVector(2.0, 3.0)))
+    m1 = prepare(mass(u; coefficient=1.0))
+    assemble!(mc)
+    assemble!(m1)
+    Mc = Matrix(mc.matrix)
+    M1 = Matrix(m1.matrix)
+
+    n = size(M1, 1) ÷ 2                       # component-major dofs: 1:n is component 1
+    @test size(Mc) == size(M1)
+    @test Mc[1:n, 1:n] ≈ 2 .* M1[1:n, 1:n]
+    @test Mc[(n + 1):(2n), (n + 1):(2n)] ≈ 3 .* M1[(n + 1):(2n), (n + 1):(2n)]
+    @test Mc[1:n, (n + 1):(2n)] ≈ zeros(n, n) atol = 1.0e-13   # component-diagonal
+
+    # A scalar coefficient still applies uniformly to both components.
+    ms = prepare(mass(u; coefficient=2.0))
+    assemble!(ms)
+    @test Matrix(ms.matrix) ≈ 2 .* M1
+end
+
 @testset "multi-field block problem reuses the unified assembly path" begin
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=2, order=1)

@@ -24,7 +24,12 @@ struct FunctionCoefficient{F}
     f::F
 end
 
-_as_coefficient(value::Union{Number,AbstractMatrix,UniformScaling}) = ConstantCoefficient(value)
+# A constant coefficient is anything that is not a callback: a scalar, a
+# per-component `SVector`/tuple/array, a `D × D` diffusion tensor, or a
+# `UniformScaling`. Only genuine callables `c(x)` become `FunctionCoefficient`,
+# so a bare per-component value (e.g. `coefficient = SVector(2, 3)`) is resolved
+# component-wise rather than mistakenly called as a function of `x`.
+_as_coefficient(value::Union{Number,AbstractArray,UniformScaling,Tuple}) = ConstantCoefficient(value)
 _as_coefficient(value) = FunctionCoefficient(value)
 
 # Resolve a coefficient at the physical point `x`. Constant
@@ -68,6 +73,18 @@ end
 # the linear closures in `source_form` and `_poisson_form` can share
 # the same pattern.
 _source_value(source, q, test_component) = _component_coefficient_value(source, q.x, test_component)
+
+# Mass bilinear-channel kernel: the component-resolved coefficient times
+# the trial value, diagonal in components (off-diagonal trial/test pairs
+# contribute zero). Mirrors `_stiffness_channels` / `_source_value` so all
+# three canonical forms resolve coefficients the same component-aware way —
+# in particular a per-component (`SVector`/tuple) mass coefficient picks the
+# slot `test_component` rather than multiplying the trial value by the whole
+# coefficient vector.
+function _mass_value(coefficient, q, trial, test_component)
+    return trial.component == test_component ?
+           _component_coefficient_value(coefficient, q.x, test_component) * trial.value : 0.0
+end
 
 # ── Boundary selectors ───────────────────────────────────────────────────────
 
@@ -178,11 +195,9 @@ All three are symmetric and component-aware.
 """
 function mass_form(; coefficient=1)
     coefficient_data = _as_coefficient(coefficient)
-    return WeakForm(bilinear=(q, trial, test_component) -> trial.component == test_component ?
-                                                           _coefficient_value(coefficient_data,
-                                                                              q.x) * trial.value :
-                                                           0.0, linear=(q, test_component) -> 0.0,
-                    symmetric=true, component_aware=true)
+    return WeakForm(bilinear=(q, trial, test_component) -> _mass_value(coefficient_data, q, trial,
+                                                                       test_component),
+                    linear=(q, test_component) -> 0.0, symmetric=true, component_aware=true)
 end
 
 function stiffness_form(; diffusion=1)
@@ -277,8 +292,9 @@ component field `u`:
 
     a(u, v) = ∫_Ω coefficient(x) · v u dx,    ℓ(v) = 0.
 
-`coefficient` accepts a scalar or a callback `coefficient(x)`. For
-vector fields the form is diagonal in the component index.
+`coefficient` accepts a scalar, a callback `coefficient(x)`, or a
+per-component indexable value (`SVector`/tuple). For vector fields the
+form is diagonal in the component index.
 `dirichlet` is the list of physical Dirichlet conditions to impose;
 see [`dirichlet`](@ref).
 """
