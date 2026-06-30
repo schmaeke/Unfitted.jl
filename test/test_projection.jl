@@ -28,6 +28,31 @@ end
     @test value(target_solution, target_model, (1.0,)) ≈ 0.0 atol = 1.0e-12
 end
 
+@testset "L2 transfer applies the Dirichlet lift; cached matrix rejects non-homogeneous targets" begin
+    omega = box((0.0,), (1.0,))
+    exact = x -> 1 + x[1]      # harmonic and linear; representable in both order-2 spaces
+
+    # Source carries u = 1 + x exactly (non-homogeneous Dirichlet, Laplace).
+    source_model = prepare(poisson(space(omega; cells=1, order=2); source=x -> 0.0,
+                                   dirichlet=[dirichlet(exact; on=boundary(:all))]))
+    source_solution = solve!(source_model)
+
+    # The default L2 path must assemble the Dirichlet lift, so the projection
+    # reproduces u = 1 + x exactly — including the free interior dof at x = 0.5.
+    # Without the lift the interior coefficient is wrong (the bug this guards).
+    target_model = prepare(poisson(space(omega; cells=2, order=2); source=x -> 0.0,
+                                   dirichlet=[dirichlet(exact; on=boundary(:all))]))
+    target_solution = transfer!(source_solution, source_model, target_model)
+    @test l2_error(target_solution, target_model, exact; norm=:absolute) < 1.0e-10
+    @test value(target_solution, target_model, (0.5,)) ≈ 1.5 atol = 1.0e-10
+
+    # The cached-matrix path omits the lift, so it must reject this target
+    # rather than silently return wrong interior coefficients.
+    target_mass = assemble_matrix(target_model, mass_block(first(target_model.problem.fields)))
+    @test_throws ArgumentError transfer!(source_solution, source_model, target_model;
+                                         backend=L2Projection(target_mass))
+end
+
 @testset "L2 transfer between shifted overlays preserves constants" begin
     omega = box((0.0,), (1.0,))
     source_space = space(omega; cells=1, order=1)

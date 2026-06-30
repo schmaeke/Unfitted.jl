@@ -450,6 +450,11 @@ between time steps and the target's mass matrix can be cached across
 them. Supplying a `factor` without a `matrix` is rejected: the matrix
 is also needed to compute the solver residual reported in the returned
 solution's diagnostics.
+
+The cached-matrix shortcut requires the target to be homogeneously
+constrained: a cached mass omits the Dirichlet column-elimination lift,
+so a target with non-homogeneous physical Dirichlet data is rejected
+(use the default `L2Projection()` there, which assembles the lift).
 """
 struct L2Projection{M,F} <: TransferBackend
     matrix::M
@@ -516,6 +521,15 @@ function transfer!(source_solution::Solution, source_model::Model{D,T}, target_m
     return _transfer!(source_solution, source_model, target_model, backend, tolerance)
 end
 
+# True when any field of `layout` carries a nonzero constrained value, i.e.
+# non-homogeneous physical Dirichlet data. Artificial overlay constraints are
+# always homogeneous (value 0), so this flags exactly the case where the
+# Dirichlet column-elimination lift `−M_ac·c_c` is nonzero — the term the
+# cached-matrix transfer path omits.
+function _has_nonhomogeneous_constraints(layout::SystemLayout)
+    return any(field -> any(!iszero, field.dofs.constrained_values), layout.fields)
+end
+
 # `L2Projection` implementation: assemble the target mass system and
 # the source-driven rhs on the union admissible-box partition, solve.
 # Cached `backend.matrix` / `backend.factor` short-circuit the
@@ -525,6 +539,17 @@ end
 function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_model::Model{D,T},
                     backend::L2Projection{M,F}, tolerance) where {D,T,M,F}
     _assert_transfer_compatible(source_model, target_model)
+    # The cached-matrix path (M ≠ Nothing) builds only the source-driven rhs and
+    # reuses `backend.matrix`, so it omits the Dirichlet column-elimination lift
+    # `−M_ac·c_c`. That term vanishes only for a homogeneously-constrained
+    # target; with non-homogeneous physical Dirichlet data the cached path would
+    # return wrong interior coefficients, so reject it. The default
+    # `L2Projection()` re-assembles the mass and applies the lift correctly.
+    if M !== Nothing && _has_nonhomogeneous_constraints(target_model.dofs)
+        throw(ArgumentError("L2Projection(matrix): the cached mass omits the Dirichlet lift, so " *
+                            "it cannot transfer onto a target with non-homogeneous Dirichlet " *
+                            "data. Use the default L2Projection() (no cached matrix) here."))
+    end
     source_coefficients = _checked_coefficients(source_solution, source_model)
 
     regions = _transfer_regions(source_model, target_model; tolerance=tolerance)
