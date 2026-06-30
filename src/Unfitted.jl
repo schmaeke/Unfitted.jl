@@ -70,7 +70,7 @@ using NonNegLeastSquares
 using WriteVTK
 
 export AxisBox, GeometryTolerance, PhysicalDomain, physical_domain, classify_cell, LevelSet, leaf,
-       complement, levelset_value, stl_levelset, mesh_levelset, CartesianMesh, Level, Space,
+       complement, levelset_value, stl_levelset, mesh_levelset, CartesianMesh, Space,
        IntegratedLegendre, bspline, Field, BlockForm, LoadForm, TrialChannels, TestChannels,
        WeakForm, Problem, Model, Solution, box, mesh, space, overlay, field, block, loadform,
        boundary, dirichlet, update_dirichlet!, neumann, BoundaryMesh, segment_mesh, polyline_mesh,

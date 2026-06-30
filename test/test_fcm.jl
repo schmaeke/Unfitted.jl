@@ -20,7 +20,7 @@ end
     # Small well-posed NNLS where the unconstrained solution is non-negative.
     A = [1.0 2.0; 3.0 4.0; 5.0 6.0]
     b = A * [0.5, 0.25]
-    x, r = Unfitted.nnls!(A, b)
+    x, r = Unfitted.nnls(A, b)
     @test x ≈ [0.5, 0.25] atol = 1e-12
     @test r < 1e-12
 end

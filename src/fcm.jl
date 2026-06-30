@@ -21,7 +21,7 @@
 #   The NNLS moment-fit structure follows QuESo's `QuadratureTrimmedElement`
 #   (M. Meßmer et al., Comput. Methods Appl. Mech. Engrg. 400 (2022) 115584,
 #   doi:10.1016/j.cma.2022.115584; https://github.com/manuelmessmer/QuESo,
-#   BSD-4-Clause). The Lawson–Hanson NNLS solver wrapped by `nnls!` is the
+#   BSD-4-Clause). The Lawson–Hanson NNLS solver wrapped by `nnls` is the
 #   classical C. L. Lawson, R. J. Hanson, "Solving Least Squares Problems",
 #   Prentice-Hall (1974), Ch. 23 (SIAM reprint doi:10.1137/1.9781611971217).
 #
@@ -54,7 +54,7 @@
 # ── 1. NNLS wrapper ───────────────────────────────────────────────────────────
 
 """
-    nnls!(A, b) -> (x, residual_norm)
+    nnls(A, b) -> (x, residual_norm)
 
 Solve the non-negativity-constrained linear least-squares problem
 
@@ -73,10 +73,10 @@ The Bro & de Jong (1997) Fast NNLS variant (`alg = :fnnls`) works on the
 `npoints × npoints` Gram matrix instead and is faster only when `npoints` is
 small; at our typical `npoints` of several thousand it is far slower.
 
-Allocations are owned by `NonNegLeastSquares.jl`; `A` and `b` are not mutated
-despite the `!` — the bang is kept for a future in-place port.
+Allocations are owned by `NonNegLeastSquares.jl`; `A` and `b` are not mutated,
+so the name carries no `!`.
 """
-function nnls!(A::AbstractMatrix{T}, b::AbstractVector{T}) where {T<:Real}
+function nnls(A::AbstractMatrix{T}, b::AbstractVector{T}) where {T<:Real}
     x = vec(nonneg_lsq(A, b; alg=:nnls))
     residual = norm(A * x - b)
     return x, residual
@@ -179,7 +179,7 @@ end
 function _solve_moment_fit(moments::Vector{T}, points::Vector{SVector{D,T}},
                            region_box::AxisBox{D,T}, moment_order::NTuple{D,Int}) where {D,T}
     A = _build_moment_matrix(points, region_box, moment_order)
-    return nnls!(A, moments)
+    return nnls(A, moments)
 end
 
 # ── 4. Exact moments and candidates from the implicit kernel ──────────────────
