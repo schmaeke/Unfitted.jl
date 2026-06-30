@@ -52,10 +52,10 @@ end
 
 # Analytic membership for a 3D L-shaped prism (reflex edge + vertices), where an
 # equal-weight pseudonormal would mis-sign the reflex Voronoi cone.
-_inside_L3(p) =
-    (-1e-9 <= p[3] <= 1 + 1e-9) &&
-    (((-1e-9 <= p[1] <= 2 + 1e-9) && (-1e-9 <= p[2] <= 1 + 1e-9)) ||
-     ((-1e-9 <= p[1] <= 1 + 1e-9) && (-1e-9 <= p[2] <= 2 + 1e-9)))
+function _inside_L3(p)
+    (-1e-9 <= p[3] <= 1 + 1e-9) && (((-1e-9 <= p[1] <= 2 + 1e-9) && (-1e-9 <= p[2] <= 1 + 1e-9)) ||
+                                    ((-1e-9 <= p[1] <= 1 + 1e-9) && (-1e-9 <= p[2] <= 2 + 1e-9)))
+end
 
 # L-prism as a watertight triangle mesh, auto-oriented outward via `_inside_L3`.
 function _lprism_mesh()
@@ -68,8 +68,8 @@ function _lprism_mesh()
     for (x, y) in poly
         push!(verts, SVector(x, y, 1.0))
     end
-    faces = NTuple{3,Int}[(1, 2, 3), (1, 3, 7), (7, 4, 5), (7, 5, 6),
-                          (8, 9, 10), (8, 10, 14), (14, 11, 12), (14, 12, 13)]
+    faces = NTuple{3,Int}[(1, 2, 3), (1, 3, 7), (7, 4, 5), (7, 5, 6), (8, 9, 10), (8, 10, 14),
+                          (14, 11, 12), (14, 12, 13)]
     for i in 1:n
         j = i % n + 1
         push!(faces, (i, j, j + n))
@@ -89,10 +89,14 @@ end
 _square_poly(lo, hi) = [SVector(lo, lo), SVector(hi, lo), SVector(hi, hi), SVector(lo, hi)]
 
 # CCW L-polygon with a reflex vertex at (1,1), and its analytic membership.
-_lpoly2d() = [SVector(0.0, 0.0), SVector(2.0, 0.0), SVector(2.0, 1.0), SVector(1.0, 1.0),
-              SVector(1.0, 2.0), SVector(0.0, 2.0)]
-_inside_L2(p) = ((-1e-9 <= p[1] <= 2 + 1e-9) && (-1e-9 <= p[2] <= 1 + 1e-9)) ||
-                ((-1e-9 <= p[1] <= 1 + 1e-9) && (-1e-9 <= p[2] <= 2 + 1e-9))
+function _lpoly2d()
+    [SVector(0.0, 0.0), SVector(2.0, 0.0), SVector(2.0, 1.0), SVector(1.0, 1.0), SVector(1.0, 2.0),
+     SVector(0.0, 2.0)]
+end
+function _inside_L2(p)
+    ((-1e-9 <= p[1] <= 2 + 1e-9) && (-1e-9 <= p[2] <= 1 + 1e-9)) ||
+    ((-1e-9 <= p[1] <= 1 + 1e-9) && (-1e-9 <= p[2] <= 2 + 1e-9))
+end
 
 # Volume / area of {leaf ≤ 0} ∩ box via the implicit kernel.
 function _mesh_volume(geom, region; gp=4, ms=3)
@@ -274,7 +278,8 @@ end
     @test tested > 5000
     @test bad == 0
     # Winding mode agrees, including in the reentrant notch.
-    sw = Unfitted._leaves(mesh_levelset(polyline_mesh(_lpoly2d(); closed=true); orientation=:winding))[1].f
+    sw = Unfitted._leaves(mesh_levelset(polyline_mesh(_lpoly2d(); closed=true);
+                                        orientation=:winding))[1].f
     @test (sw(SVector(1.5, 1.5)) < 0) == _inside_L2(SVector(1.5, 1.5))
     @test (sw(SVector(0.5, 0.5)) < 0) == _inside_L2(SVector(0.5, 0.5))
 end

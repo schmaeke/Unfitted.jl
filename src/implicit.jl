@@ -262,7 +262,7 @@ function _emit_fiber!(pts::Vector{SVector{D,T}}, wts::Vector{T}, lsets, embed, l
                       wbase::T, membership, ctx::_QuadCtx) where {D,T}
     breaks = _fiber_breaks(lsets, embed, lo, hi, ctx)
     nodes, gw = ctx.nodes, ctx.weights
-    for i in 1:(length(breaks) - 1)
+    for i in 1:(length(breaks)-1)
         a, b = breaks[i], breaks[i + 1]
         b - a <= ctx.atol && continue
         mid = (a + b) / 2
@@ -355,8 +355,8 @@ function _implicit_quad(lsets, membership, U::AxisBox{D,T}, ctx::_QuadCtx, depth
 
     k, usable = _choose_axis(active, U, ctx)
     if !usable && depth < ctx.max_subdiv
-        return _subdivide_and_collect((box, d) -> _implicit_quad(active, membership, box, ctx, d), U,
-                                      depth)
+        return _subdivide_and_collect((box, d) -> _implicit_quad(active, membership, box, ctx, d),
+                                      U, depth)
     end
 
     # Reduce one dimension: partition-only base, then a fiber rule per base node.

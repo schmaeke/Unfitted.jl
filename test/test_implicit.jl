@@ -59,7 +59,8 @@ end
         exact = a^(m + 1) / (m + 1) * 1 / (n + 1) * 1 / (p + 1)
         @test _quad(x -> x[1]^m * x[2]^n * x[3]^p, rule) ≈ exact atol = 1e-12
     end
-    simplex = _IVQ(x -> x[1] + x[2] + x[3] - 1, box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); gauss_points=8)
+    simplex = _IVQ(x -> x[1] + x[2] + x[3] - 1, box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0));
+                   gauss_points=8)
     @test _quad(x -> 1.0, simplex) ≈ 1 / 6 atol = 1e-12
 end
 
@@ -140,8 +141,7 @@ end
     @test _quad(x -> 1.0, flat) ≈ 1.0 atol = 1e-12
 
     disk = x -> sqrt((x[1] - 0.53)^2 + (x[2] - 0.47)^2) - 0.3
-    perim = _quad(x -> 1.0,
-                  _ISQ(disk, box((0.0, 0.0), (1.0, 1.0)); gauss_points=12, max_subdiv=6))
+    perim = _quad(x -> 1.0, _ISQ(disk, box((0.0, 0.0), (1.0, 1.0)); gauss_points=12, max_subdiv=6))
     @test isapprox(perim, 2π * 0.3; atol=1e-2)
 
     @test_throws ArgumentError _ISQ(x -> x[1] - 0.5, box((0.0,), (1.0,)); gauss_points=4)
@@ -157,9 +157,10 @@ end
 end
 
 # Build a kernel volume rule from a CSG level-set tree (leaves + membership).
-_csg_rule(geom, region; gp, ms=5) = _IVQ(Any[l.f for l in Unfitted._leaves(geom)],
-                                         x -> Unfitted._inside(geom, x), region;
-                                         gauss_points=gp, max_subdiv=ms)
+function _csg_rule(geom, region; gp, ms=5)
+    _IVQ(Any[l.f for l in Unfitted._leaves(geom)], x -> Unfitted._inside(geom, x), region;
+         gauss_points=gp, max_subdiv=ms)
+end
 
 @testset "implicit quadrature — force-reduce stays correct without subdivision" begin
     # A whole disk centred in the box has an interior point where ∇φ = 0 and is
@@ -210,7 +211,8 @@ end
     # ForwardDiff result to integration accuracy.
     a = 0.45
     ad = _IVQ(x -> x[1] - a, box((0.0, 0.0), (1.0, 1.0)); gauss_points=6)
-    fd = _IVQ(x -> x[1] - a, box((0.0, 0.0), (1.0, 1.0)); gauss_points=6, grad=Unfitted._fd_gradient)
+    fd = _IVQ(x -> x[1] - a, box((0.0, 0.0), (1.0, 1.0)); gauss_points=6,
+              grad=Unfitted._fd_gradient)
     @test _quad(x -> 1.0, fd) ≈ _quad(x -> 1.0, ad) atol = 1e-10
     @test _quad(x -> x[1] * x[2], fd) ≈ _quad(x -> x[1] * x[2], ad) atol = 1e-10
 end
@@ -219,5 +221,5 @@ end
     # The kernel is scalar-type generic; a Float32 box returns a Float32 rule.
     rule = _IVQ(x -> x[1] - 0.5f0, box((0.0f0, 0.0f0), (1.0f0, 1.0f0)); gauss_points=5)
     @test eltype(rule[2]) === Float32
-    @test _quad(x -> 1.0f0, rule) ≈ 0.5f0 atol = 1f-5
+    @test _quad(x -> 1.0f0, rule) ≈ 0.5f0 atol = 1.0f-5
 end

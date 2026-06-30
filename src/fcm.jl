@@ -192,7 +192,8 @@ function _moments_from_rule(points::Vector{SVector{D,T}}, weights::Vector{T},
     moments = zeros(T, length(indices))
     factors = _legendre_factor_buffers(moment_order, T)
     @inbounds for q in eachindex(weights)
-        _fill_legendre_factors!(factors, points[q], region_box.lower, region_box.upper, moment_order)
+        _fill_legendre_factors!(factors, points[q], region_box.lower, region_box.upper,
+                                moment_order)
         wq = weights[q]
         for (a, idx) in pairs(indices)
             moments[a] += wq * _tensor_legendre_value(factors, idx)
@@ -215,8 +216,9 @@ end
 #   2. Accuracy on a *curved* cut. A curved boundary is never polynomial, so the
 #      moments are approximated, not exact; a generous floor of `maxorder + 2`
 #      keeps that high-order approximation sharp (it also dominates (1) in 2D).
-_implicit_gauss_points(moment_order::NTuple{D,Int}) where {D} =
+function _implicit_gauss_points(moment_order::NTuple{D,Int}) where {D}
     max(cld(sum(moment_order) + D, 2), maximum(moment_order) + 2)
+end
 
 # Cap the candidate cloud at a small multiple of the moment-basis size so the
 # NNLS design matrix stays O(nbasis) wide regardless of the volume rule's point

@@ -282,7 +282,7 @@ function _gustavson_pattern(feed!, n::Int, symmetric::Bool, key::UInt)
                 pos += 1
             end
         end
-        sort!(view(rowval, colptr[j]:(colptr[j + 1] - 1)))
+        sort!(view(rowval, colptr[j]:(colptr[j+1]-1)))
     end
 
     return AssemblyPattern(n, colptr, rowval, symmetric, key)
@@ -347,7 +347,8 @@ end
 # collapses the explicit zeros left by Dirichlet column elimination and
 # any structurally-present-but-untouched pattern slots.
 function _matrix_from_pattern(pattern::AssemblyPattern, nzval::Vector{T}) where {T}
-    matrix = SparseMatrixCSC(pattern.n, pattern.n, copy(pattern.colptr), copy(pattern.rowval), nzval)
+    matrix = SparseMatrixCSC(pattern.n, pattern.n, copy(pattern.colptr), copy(pattern.rowval),
+                             nzval)
     pattern.symmetric && (matrix = matrix + matrix' - spdiagm(0 => diag(matrix)))
     dropzeros!(matrix)
     return matrix
@@ -548,7 +549,9 @@ end
 # A fresh, empty accumulator with the same destination shape — used by
 # the threaded driver to give each task its own buffer before reducing.
 _empty_like(::Nothing) = nothing
-_empty_like(sink::ScatterSink{T}) where {T} = ScatterSink(zeros(T, length(sink.nzval)), sink.pattern)
+function _empty_like(sink::ScatterSink{T}) where {T}
+    ScatterSink(zeros(T, length(sink.nzval)), sink.pattern)
+end
 
 # Reduce a per-task sink into the shared one by summing the `nzval`
 # accumulators. The threaded path is held to a tolerance, not bit
@@ -1196,9 +1199,8 @@ end
 # `FacetRegion`s — Julia dispatches the right `_assemble_region!` method
 # automatically. The serial walk scatters into the sink in a fixed region
 # order, so repeated serial assembly is deterministic to the bit.
-function _assemble_system_serial!(sink, rhs::Vector{T}, model::Model{D,T}, regions,
-                                  symmetric::Bool, blocks, loads, region_filter,
-                                  state_coefficients) where {D,T}
+function _assemble_system_serial!(sink, rhs::Vector{T}, model::Model{D,T}, regions, symmetric::Bool,
+                                  blocks, loads, region_filter, state_coefficients) where {D,T}
     ws = _assembly_workspace(model)
     offsets = _region_qpoint_offsets(regions)
     for (region_index, region) in enumerate(regions)
@@ -1436,8 +1438,8 @@ function _run_pass!(sink, rhs, model, regions, symmetric, blocks, loads, region_
         _assemble_system_threaded!(sink, rhs, model, regions, symmetric, blocks, loads,
                                    region_filter, state_coefficients)
     else
-        _assemble_system_serial!(sink, rhs, model, regions, symmetric, blocks, loads,
-                                 region_filter, state_coefficients)
+        _assemble_system_serial!(sink, rhs, model, regions, symmetric, blocks, loads, region_filter,
+                                 state_coefficients)
     end
     return nothing
 end

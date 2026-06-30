@@ -127,12 +127,14 @@ end
 
 # Exact traction t = σ·n on the far-field faces. Right face: n = (1, 0) ⇒
 # t = (σxx, σxy). Top face: n = (0, 1) ⇒ t = (σxy, σyy).
-traction_right(x) = let s = kirsch_stress(x)
-    SVector(s[1], s[3])
-end
-traction_top(x) = let s = kirsch_stress(x)
-    SVector(s[3], s[2])
-end
+traction_right(x) =
+    let s = kirsch_stress(x)
+        SVector(s[1], s[3])
+    end
+traction_top(x) =
+    let s = kirsch_stress(x)
+        SVector(s[3], s[2])
+    end
 
 # Exact plane-stress displacement field (the reference for the L² error and the
 # VTK overlay).
@@ -156,8 +158,8 @@ end
 # double contraction σ = ℂ ⊡ ε then reproduces σ_xx = E/(1−ν²)(ε_xx + ν ε_yy),
 # σ_yy = E/(1−ν²)(ε_yy + ν ε_xx), σ_xy = E/(1+ν) ε_xy.
 const ℂ = SymmetricTensor{4,2,Float64}((i, j, k, l) -> λ_ps * (i == j) * (k == l) +
-                                                       μ * ((i == k) * (j == l) +
-                                                            (i == l) * (j == k)))
+                                                       μ *
+                                                       ((i == k) * (j == l) + (i == l) * (j == k)))
 
 # Bulk bilinear σ(u) : ε(v). The `c`-th channel of the contracted stress is its
 # `c`-th row (σ symmetric ⇒ row = column).
@@ -178,14 +180,13 @@ omega = box((0.0, 0.0), (L, L))
 # so the L² error reflects pure p-refinement.
 function run_order(order)
     cell_size = L / cells_per_axis
-    plate = physical_domain(plate_geometry;
-                            subcell_length_scale=cell_size / 2^4, max_depth=4)
+    plate = physical_domain(plate_geometry; subcell_length_scale=cell_size / 2^4, max_depth=4)
     V = space(omega; cells=(cells_per_axis, cells_per_axis), order=order, physical=plate)
     u = field(:u, V; components=2)
 
     elasticity = block(u, u,
-                       WeakForm(bilinear=elasticity_bilinear, linear=(q, c) -> 0.0,
-                                symmetric=true, component_aware=true))
+                       WeakForm(bilinear=elasticity_bilinear, linear=(q, c) -> 0.0, symmetric=true,
+                                component_aware=true))
 
     # Far-field Neumann tractions on the grid-aligned right and top faces.
     load_right = neumann(u, traction_right; on=boundary(axis=1, side=:upper))

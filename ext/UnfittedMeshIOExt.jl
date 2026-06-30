@@ -162,8 +162,9 @@ function _mesh_scale(cells)
 end
 
 # Degenerate (zero-measure) cells have no defined normal and corrupt the sign.
-_is_degenerate(cell::NTuple{2,SVector{D,T}}, scale) where {D,T} =
+function _is_degenerate(cell::NTuple{2,SVector{D,T}}, scale) where {D,T}
     norm(cell[2] - cell[1]) <= 1.0e-10 * scale
+end
 function _is_degenerate(cell::NTuple{3,SVector{3,T}}, scale) where {T}
     ab = cell[2] - cell[1]
     ac = cell[3] - cell[1]
@@ -173,8 +174,7 @@ end
 function _build_mesh_sdf(bmesh::BoundaryMesh{D,T,K}, winding::Bool) where {D,T,K}
     cells = [map(v -> SVector{D,Float64}(v), cell) for cell in bmesh.cells]
     isempty(cells) && throw(ArgumentError("mesh has no cells"))
-    overrides = bmesh.normals === nothing ? nothing :
-                [SVector{D,Float64}(n) for n in bmesh.normals]
+    overrides = bmesh.normals === nothing ? nothing : [SVector{D,Float64}(n) for n in bmesh.normals]
     scale = _mesh_scale(cells)
 
     kept = eltype(cells)[]
@@ -244,7 +244,7 @@ function (m::_MeshSDF{D})(p) where {D}
     best_dv = norm(pv - cpvs[1])
     for k in 2:length(candidates)
         d = norm(pv - cpvs[k])
-        d < best_dv && (best = k; best_dv = d)
+        d < best_dv && (best=k; best_dv=d)
     end
     best_cpv = cpvs[best]
 
@@ -308,7 +308,8 @@ function mesh_levelset(mesh::BoundaryMesh{D,T,K}; lipschitz::Real=1.0,
                        orientation::Symbol=:pseudonormal) where {D,T,K}
     orientation in (:pseudonormal, :winding) ||
         throw(ArgumentError("orientation must be :pseudonormal or :winding; got :$orientation"))
-    (D, K) == (2, 1) || (D, K) == (3, 2) ||
+    (D, K) == (2, 1) ||
+        (D, K) == (3, 2) ||
         throw(ArgumentError("mesh_levelset needs a closed boundary mesh: a BoundaryMesh{2,T,1} " *
                             "(2D segment loop) or BoundaryMesh{3,T,2} (3D triangle surface); " *
                             "got D=$D, K=$K"))

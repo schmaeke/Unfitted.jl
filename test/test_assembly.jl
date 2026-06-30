@@ -593,7 +593,9 @@ end
     # Vector field, component-unaware form: cross-component blocks are
     # structurally present in the pattern but always zero — the dropzeros
     # equivalence the scatter path must reproduce.
-    let V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2), u = field(:u, V; components=2)
+    let V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2),
+        u = field(:u, V; components=2)
+
         model = prepare(poisson(u; source=x -> SVector(1.0, 2.0),
                                 dirichlet=[dirichlet(SVector(0.0, 0.0); on=boundary(:all))]))
         _check_scatter_assemble!(model)
@@ -647,8 +649,7 @@ end
         p = physical_domain(phi; lipschitz=1.0, subcell_length_scale=1.0 / 2^4, max_depth=4),
         V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=p)
 
-        model = prepare(poisson(V; source=x -> 1.0,
-                                dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+        model = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
         _check_scatter_assemble!(model)
     end
 

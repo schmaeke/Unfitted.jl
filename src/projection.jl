@@ -347,7 +347,8 @@ end
 # fresh per transfer (not cached), so the `key` is nominal.
 function _transfer_mass_pattern(ws::TransferWorkspace{D,T}, target_model::Model{D,T},
                                 regions) where {D,T}
-    return _gustavson_pattern(active_unknowns(target_model.dofs), true, hash(:transfer_mass)) do visit
+    return _gustavson_pattern(active_unknowns(target_model.dofs), true, hash(:transfer_mass)
+                              ) do visit
         for region in regions, target_layout in target_model.dofs.fields
             target_data = [_transfer_data(target_layout, p, ws.target_values)
                            for p in region.target_parents]

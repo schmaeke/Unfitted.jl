@@ -70,17 +70,17 @@ using NonNegLeastSquares
 using WriteVTK
 
 export AxisBox, GeometryTolerance, PhysicalDomain, physical_domain, classify_cell, LevelSet, leaf,
-       complement, levelset_value, stl_levelset, mesh_levelset, CartesianMesh,
-       Level, Space, IntegratedLegendre, bspline, Field, BlockForm, LoadForm, TrialChannels,
-       TestChannels, WeakForm, Problem, Model, Solution, box, mesh, space, overlay, field, block,
-       loadform, boundary, dirichlet, update_dirichlet!, neumann, BoundaryMesh, segment_mesh,
-       polyline_mesh, triangle_mesh, points_mesh, poisson, mass, mass_form, mass_block, stiffness,
-       stiffness_form, stiffness_block, load, source_form, source_load, load_vector, prepare,
-       assemble_matrix, assemble_vector, assemble!, foreach_quadrature_point, nquadpoints, solve!,
-       solution, move!, moved, moved_space, activate!, deactivate!, active_cells, transfer!,
-       TransferBackend, L2Projection, Rewire, QuadField, QuadTransferScheme, RBFP0, transfer,
-       write_vtk, write_quadrature_vtm, l2_error, boundary_integral, value, field_gradient,
-       diagnostics, active_unknowns, cell_indices, cell_box, center, value_vec, gradient_tensor,
+       complement, levelset_value, stl_levelset, mesh_levelset, CartesianMesh, Level, Space,
+       IntegratedLegendre, bspline, Field, BlockForm, LoadForm, TrialChannels, TestChannels,
+       WeakForm, Problem, Model, Solution, box, mesh, space, overlay, field, block, loadform,
+       boundary, dirichlet, update_dirichlet!, neumann, BoundaryMesh, segment_mesh, polyline_mesh,
+       triangle_mesh, points_mesh, poisson, mass, mass_form, mass_block, stiffness, stiffness_form,
+       stiffness_block, load, source_form, source_load, load_vector, prepare, assemble_matrix,
+       assemble_vector, assemble!, foreach_quadrature_point, nquadpoints, solve!, solution, move!,
+       moved, moved_space, activate!, deactivate!, active_cells, transfer!, TransferBackend,
+       L2Projection, Rewire, QuadField, QuadTransferScheme, RBFP0, transfer, write_vtk,
+       write_quadrature_vtm, l2_error, boundary_integral, value, field_gradient, diagnostics,
+       active_unknowns, cell_indices, cell_box, center, value_vec, gradient_tensor,
        symmetric_gradient
 
 # ── Extension stubs ───────────────────────────────────────────────────────────

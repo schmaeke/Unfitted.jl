@@ -118,10 +118,9 @@ end
     # dimension (not a constant offset from the order). Compare moment_fit_rule's
     # moments (which use the default `_implicit_gauss_points`) against an
     # independent high-order reference; a too-low default shows up as ~1e-5 here.
-    for (region, phi, order) in
-        ((box((0.0, 0.0), (1.0, 1.0)), x -> x[1] + x[2] - 1.0, (5, 5)),
-         (box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)), x -> x[1] + x[2] + x[3] - 1.0, (3, 3, 3)),
-         (box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)), x -> x[1] + x[2] + x[3] - 1.0, (4, 4, 4)))
+    for (region, phi, order) in ((box((0.0, 0.0), (1.0, 1.0)), x -> x[1] + x[2] - 1.0, (5, 5)),
+                                 (box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)), x -> x[1] + x[2] + x[3] - 1.0, (3, 3, 3)),
+                                 (box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)), x -> x[1] + x[2] + x[3] - 1.0, (4, 4, 4)))
         ref_rule = Unfitted.implicit_volume_quadrature(phi, region; gauss_points=22)
         ref = _legendre_moments(ref_rule[1], ref_rule[2], region, order)
         p = physical_domain(phi; lipschitz=2.0, subcell_length_scale=0.5)

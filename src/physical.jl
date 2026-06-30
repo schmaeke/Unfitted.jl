@@ -194,9 +194,9 @@ scale (see the [`PhysicalDomain`](@ref) docstring). `alpha = 0` is the
 strict-cut path; `alpha > 0` enables α-FCM. `moment_order_factor` and
 `target_residual` tune the NNMF moment fit.
 """
-function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0,
-                         subcell_length_scale::Real, max_depth::Integer=8,
-                         moment_order_factor::Integer=2, target_residual::Real=1.0e-6)
+function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0, subcell_length_scale::Real,
+                         max_depth::Integer=8, moment_order_factor::Integer=2,
+                         target_residual::Real=1.0e-6)
     alpha >= 0 || throw(ArgumentError("alpha must be ≥ 0; got $alpha"))
     subcell_length_scale > 0 ||
         throw(ArgumentError("subcell_length_scale must be > 0; got $subcell_length_scale"))
