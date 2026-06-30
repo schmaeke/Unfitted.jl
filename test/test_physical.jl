@@ -531,7 +531,7 @@ end
     @test integral ≈ 0.7 atol = 1.0e-3
 end
 
-@testset ":cut_failed marks unrecoverable fits" begin
+@testset "starved linear cut stays :cut_fitted, not :cut_failed" begin
     # A tiny Ω with subdivision disabled (max_depth=0) leaves the moment fit
     # very little to work with on the single depth-0 cut cell.
     omega = box((0.0,), (1.0,))
@@ -541,11 +541,17 @@ end
     p = physical_domain(x -> x[1] - 0.001; lipschitz=1.0, subcell_length_scale=10.0, max_depth=0)
     V = space(omega; cells=1, order=2, physical=p)
     plan = Unfitted.integration_plan(V)
-    # NNMF either succeeds (residual ≤ failure threshold → :cut_fitted) or
-    # fails (→ :cut_failed). Either outcome is valid; we just verify the
-    # plan builds without raising and the diagnostic count is consistent.
+    # :cut_failed is a defensive tag (residual > _FIT_FAILURE_RESIDUAL, or an
+    # empty Ω∩R). The leaf here is linear, so the Saye moments are exact and a
+    # zero-residual non-negative fit exists: the region is :cut_fitted, not
+    # :cut_failed, and the max residual stays far below the failure threshold.
     failed = count(r -> r.quadrature.kind === :cut_failed, plan.regions)
-    @test failed >= 0   # placeholder: the path exists
+    @test failed == 0
+    @test plan.moment_fit_residual_max < Unfitted._FIT_FAILURE_RESIDUAL
+    # Diagnostics counts must agree with the plan tags — guarding the flagging
+    # logic that the old `failed >= 0` placeholder did not.
+    m = prepare(stiffness(V; dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    @test diagnostics(m).fit_failure_count == failed
 end
 
 # --- Space.physical forwarding and moment-fit knobs ---
@@ -612,23 +618,15 @@ end
                                                moment_order_factor=0)
 end
 
-@testset "fit_failure_count > 0 on a forced-failure setup" begin
-    # Construct a setup where the moment basis is unreachable: very high
-    # moment_order against a coarsely-resolved Ω near the cell boundary.
-    # We can't drive a failure through the public API at default
-    # `moment_order = 2·level.order`, so test the underlying `_FIT_FAILURE_RESIDUAL`
-    # guard directly via `_build_region_quadrature` with a hand-built scenario.
-    omega = box((0.0,), (1.0,))
+@testset "high moment order on a starved cut still fits below the failure threshold" begin
+    # A high moment order (20) against a coarse, undivided cut cell stresses the
+    # moment fit. The leaf is linear, so the Saye moments are exact and a single
+    # NNLS solve stays well below the failure threshold — the residual branch
+    # that would tag a region :cut_failed is not reached through the public path
+    # with the exact kernel.
     p = physical_domain(x -> 0.5 - x[1]; lipschitz=1.0, subcell_length_scale=10.0, max_depth=0)
-    V = space(omega; cells=1, order=1, physical=p)
-
-    # Manually invoke moment_fit_rule with an absurdly high moment_order on a
-    # single subcell_length_scale=10.0, max_depth=0 cut region. The NNMF is starved on moments and
-    # candidates; we observe the residual classification path.
     region_box = box((0.0,), (1.0,))
     pts, ws, res = Unfitted.moment_fit_rule(p, region_box, (20,); target_residual=1.0e-14)
-    # Either: residual exceeds the failure threshold (would mark :cut_failed
-    # in the plan dispatcher), or NNMF still converges. Both outcomes are
-    # consistent with our error reporting; assert the residual is real.
-    @test isfinite(res)
+    @test !isempty(pts)
+    @test res < Unfitted._FIT_FAILURE_RESIDUAL
 end
