@@ -68,11 +68,34 @@ end
     @test isfinite(diag.condition_estimate)
     @test diag.condition_estimate > 1.0
 
-    move!(model; level=2, to=box((0.2,), (0.4,)), tolerance)
+    move!(model; level=2, to=box((0.2,), (0.4,)))
     moved_diag = diagnostics(model)
     @test moved_diag.small_overlap_count == 0
     @test isempty(moved_diag.small_overlaps)
     @test moved_diag.min_integration_volume > tolerance.small_volume
+end
+
+@testset "mutators preserve prepare-time integration-plan options" begin
+    # Reproducibility: move! must rebuild the plan with the criterion (and
+    # tolerance) captured at prepare, not silently revert to integration_plan
+    # defaults. Reaching one configuration two ways — a direct prepare, and a
+    # prepare-then-move! — must yield the same integration-region structure.
+    # With the non-default :all_levels criterion only the base/overlay overlap
+    # is integrated, so a dropped criterion changes the region count.
+    omega = box((0.0,), (1.0,))
+    base = space(omega; cells=2, order=1)
+    bc = [dirichlet(0.0; on=boundary(:all))]
+
+    V_start = overlay(base, box((0.2,), (0.4,)); cells=1, order=1)
+    V_end = overlay(base, box((0.5,), (0.7,)); cells=1, order=1)
+
+    direct = prepare(stiffness(V_end; dirichlet=bc); criterion=:all_levels)
+    mover = prepare(stiffness(V_start; dirichlet=bc); criterion=:all_levels)
+    move!(mover; level=2, to=box((0.5,), (0.7,)))
+
+    @test mover.plan_options == direct.plan_options
+    @test diagnostics(mover).integration_regions == diagnostics(direct).integration_regions
+    @test diagnostics(mover).active_unknowns == diagnostics(direct).active_unknowns
 end
 
 @testset "diagnostics rejects stale solutions" begin

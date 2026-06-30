@@ -233,6 +233,11 @@ re-thread a fresh value through. Fields:
     matrix assembly builds it; cleared by every mutator (same
     invalidation contract as `matrix`/`rhs`). Lets a Newton loop reuse
     the pattern and re-run only the numeric scatter.
+  - `plan_options::NamedTuple` — the integration-plan keyword options
+    (`tolerance`, `criterion`, …) captured at `prepare`. Every mutator
+    (`move!`, `activate!`, `deactivate!`) rebuilds the plan with these,
+    so a mutation reproduces the prepared plan rather than silently
+    reverting to `integration_plan`'s defaults.
 """
 mutable struct Model{D,T,P}
     problem::P
@@ -245,6 +250,7 @@ mutable struct Model{D,T,P}
     surface_regions::IdDict{Any,Vector{SurfaceRegion{D,T}}}
     diagnostics::AssemblyDiagnostics
     pattern::Union{Nothing,AssemblyPattern}
+    plan_options::NamedTuple
 end
 
 # Pick out the Dirichlet conditions that apply to the field called
@@ -306,8 +312,13 @@ for the full list.
 """
 function prepare(problem::Problem{D,T}; kwargs...) where {D,T}
     effective_problem, classify_cache = _apply_physical_fold_to_problem(problem)
-    plan = integration_plan(effective_problem.space; kwargs..., classify_cache=classify_cache)
-    tolerance = get(kwargs, :tolerance, GeometryTolerance(T))
+    # Capture the user's integration-plan options (tolerance, criterion, …) so
+    # the in-place mutators can reproduce this exact plan instead of reverting
+    # to `integration_plan`'s defaults. `classify_cache` is geometry-derived,
+    # not a user option, so it is rebuilt per mutation rather than stored here.
+    plan_options = (; kwargs...)
+    plan = integration_plan(effective_problem.space; plan_options..., classify_cache=classify_cache)
+    tolerance = get(plan_options, :tolerance, GeometryTolerance(T))
     layout = system_layout(effective_problem; tolerance)
     facet_regions = _resolve_facet_regions(effective_problem, tolerance)
     surface_regions = _resolve_surface_regions(effective_problem, tolerance)
@@ -318,7 +329,7 @@ function prepare(problem::Problem{D,T}; kwargs...) where {D,T}
     _set_plan_stats!(diag, plan)
     return Model{D,T,typeof(effective_problem)}(effective_problem, 1, plan, layout, nothing,
                                                 nothing, facet_regions, surface_regions, diag,
-                                                nothing)
+                                                nothing, plan_options)
 end
 
 # Build the facet-region cache for a problem from every
@@ -504,10 +515,11 @@ function _invalidate_assembly!(model::Model{D,T},
 end
 
 """
-    move!(model; level, to, tolerance=GeometryTolerance) -> Model
+    move!(model; level, to) -> Model
 
 Move overlay `level` of a prepared `model` to box `to` in place,
-rebuilding its integration plan and dof layout and invalidating any
+rebuilding its integration plan (reusing the `tolerance`/`criterion`
+captured at [`prepare`](@ref)) and dof layout, and invalidating any
 assembled operators. The base level (level 1) cannot be moved.
 
 `move!` overwrites the old state; to transfer a solution onto the
@@ -519,19 +531,20 @@ and `model.rhs`, rebuilds the integration plan and dof layout,
 refreshes diagnostics. An outstanding [`Solution`](@ref) raises on
 reuse.
 """
-function move!(model::Model{D,T}; level::Integer, to::AxisBox{D,T}, kwargs...) where {D,T}
-    tolerance = get(kwargs, :tolerance, GeometryTolerance(T))
+function move!(model::Model{D,T}; level::Integer, to::AxisBox{D,T}) where {D,T}
+    opts = model.plan_options
+    tolerance = get(opts, :tolerance, GeometryTolerance(T))
     moved_p = _moved_problem(model, level, to, tolerance)
     model.problem, classify_cache = _apply_physical_fold_to_problem(moved_p)
     model.version += 1
-    model.integration = integration_plan(model.problem.space; tolerance,
+    model.integration = integration_plan(model.problem.space; opts...,
                                          classify_cache=classify_cache)
     model.dofs = system_layout(model.problem; tolerance)
     return _invalidate_assembly!(model, tolerance)
 end
 
 """
-    moved(model; level, to, tolerance=GeometryTolerance) -> Model
+    moved(model; level, to) -> Model
 
 Return a new prepared [`Model`](@ref) with overlay `level` moved to box
 `to`, reusing the source problem's forms and boundary data. Unlike
@@ -541,9 +554,10 @@ the source of a [`transfer!`](@ref):
     target = moved(model; level=2, to=box((0.1,), (0.6,)))
     target_solution = transfer!(solution, model, target)
 """
-function moved(model::Model{D,T}; level::Integer, to::AxisBox{D,T},
-               tolerance=GeometryTolerance(T)) where {D,T}
-    return prepare(_moved_problem(model, level, to, tolerance); tolerance)
+function moved(model::Model{D,T}; level::Integer, to::AxisBox{D,T}) where {D,T}
+    opts = model.plan_options
+    tolerance = get(opts, :tolerance, GeometryTolerance(T))
+    return prepare(_moved_problem(model, level, to, tolerance); opts...)
 end
 
 # Rebuild the model's problem with one level's mask replaced. Symmetric
@@ -558,21 +572,22 @@ end
 # bumps `model.version`, rebuilds the integration plan, dof layout,
 # and diagnostics, and clears any assembled matrix / rhs. Any
 # outstanding `Solution` becomes stale.
-function _update_mask!(model::Model{D,T}, level_index::Integer, cells, value::Bool;
-                       tolerance=GeometryTolerance(T)) where {D,T}
+function _update_mask!(model::Model{D,T}, level_index::Integer, cells, value::Bool) where {D,T}
     1 <= level_index <= length(model.problem.space.levels) ||
         throw(ArgumentError("level index $level_index out of bounds"))
+    opts = model.plan_options
+    tolerance = get(opts, :tolerance, GeometryTolerance(T))
     old_level = model.problem.space.levels[level_index]
     new_mask = _apply_mask_update(old_level.mask, old_level.mesh, cells, value)
     model.problem = _remasked_problem(model, level_index, new_mask)
     model.version += 1
-    model.integration = integration_plan(model.problem.space; tolerance)
+    model.integration = integration_plan(model.problem.space; opts...)
     model.dofs = system_layout(model.problem; tolerance)
     return _invalidate_assembly!(model, tolerance)
 end
 
 """
-    activate!(model; level, cells, tolerance=GeometryTolerance) -> Model
+    activate!(model; level, cells) -> Model
 
 Mark `cells` on `level` as active in place. `cells` accepts the same
 shapes as the `active=` kwarg on [`overlay`](@ref): an iterable of
@@ -591,21 +606,19 @@ on the *effective* mask (which already folds in the geometric
 classifies as fictitious therefore overrides the geometry until the
 next [`move!`](@ref) or fresh [`prepare`](@ref).
 """
-function activate!(model::Model{D,T}; level::Integer, cells,
-                   tolerance=GeometryTolerance(T)) where {D,T}
-    return _update_mask!(model, level, cells, true; tolerance)
+function activate!(model::Model{D,T}; level::Integer, cells) where {D,T}
+    return _update_mask!(model, level, cells, true)
 end
 
 """
-    deactivate!(model; level, cells, tolerance=GeometryTolerance) -> Model
+    deactivate!(model; level, cells) -> Model
 
 Mark `cells` on `level` as inactive in place. See [`activate!`](@ref)
 for the accepted shapes of `cells`, the invalidation contract, and the
 interaction with a model's `physical_domain`.
 """
-function deactivate!(model::Model{D,T}; level::Integer, cells,
-                     tolerance=GeometryTolerance(T)) where {D,T}
-    return _update_mask!(model, level, cells, false; tolerance)
+function deactivate!(model::Model{D,T}; level::Integer, cells) where {D,T}
+    return _update_mask!(model, level, cells, false)
 end
 
 """
