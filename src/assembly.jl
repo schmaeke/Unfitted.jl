@@ -891,6 +891,15 @@ end
 # buffers), build the per-region local-to-global dof table, attach the
 # optional `FormState`, and resize/clear the local matrix and rhs
 # buffers. Returns the assembled view objects the hot loop walks.
+#
+# This per-region setup is invariant across repeated `assemble!` calls for a
+# fixed model, so caching it on the Model (a per-region descriptor cache) was
+# considered. Profiling on helios (32C; 2D order-3/4 and 3D order-3 base+overlay)
+# measured it at only ~0.9% / ~0.1% of repeated-`assemble!` wall time and
+# ≤2.3% of allocation — the hot path is the irreducible `O(Q·n²)` numeric kernel
+# (`_accumulate_qpoint_generic!`), and the threaded GC ceiling comes from the
+# per-task `nzval` scatter accumulators, not from this setup. So it is rebuilt
+# per call rather than cached; re-profile before reconsidering.
 function _region_workspace_setup!(ws::AssemblyWorkspace{D,T}, model::Model{D,T}, parents,
                                   state_coefficients, have_blocks::Bool) where {D,T}
     field_data = [[_parent_dof_data(ws, layout, parent) for parent in parents]
@@ -1105,8 +1114,14 @@ end
                               active_dofs::Vector{Int})
     local_row = test_table[a, tc]
     local_row == 0 && return nothing
-    row = _field_component_dof(test_layout, test_data.raw_dofs[a], tc)
-    symmetric && tctx.col != 0 && row < tctx.col && return nothing
+    # Symmetric lower-triangle skip via the already-resolved global ids:
+    # `active_dofs[local_row]` is this test row's global id — identical to the
+    # old per-emission `_field_component_dof(test_layout, raw_dofs[a], tc)`
+    # recompute, but a single vector index instead of an `active_component`
+    # matrix lookup + offset. Profiling on helios attributed ~21% of the 2D
+    # numeric kernel to that recompute; this matches what the
+    # `LocalDofExpansion` variant already does.
+    symmetric && tctx.col != 0 && active_dofs[local_row] < tctx.col && return nothing
     if tctx.col == 0
         local_rhs[local_row] -= entry * constrained_value(tctx.dofs, tctx.raw, tctx.trc)
     else
