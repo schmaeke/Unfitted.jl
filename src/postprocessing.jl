@@ -543,13 +543,10 @@ function _level_value(coefficients, model::Model{D,T}, layout::FieldLayout{D,T},
     xi = physical_to_reference(parent_box, x)
     values = basis_values(level.basis, level.order, level.mode, xi, cell)
     raw_dofs = cell_dofs(layout.dofs, level.id, cell)
-    result = zero(promote_type(T, eltype(coefficients)))
-
-    for i in eachindex(raw_dofs)
-        result += dof_value(layout, coefficients, raw_dofs[i], component) * values[i]
-    end
-
-    return result
+    # Reuse the assembly reconstruction kernel: the dof sum over
+    # `(raw_dofs, values)` is exactly what `_field_value` computes (constrained
+    # dofs resolved through `dof_value`).
+    return _field_value((; raw_dofs, values), layout, coefficients, component)
 end
 
 # Gradient analogue of `_level_value`. Uses
@@ -567,13 +564,9 @@ function _level_gradient(coefficients, model::Model{D,T}, layout::FieldLayout{D,
     xi = physical_to_reference(parent_box, x)
     gradients = physical_basis_gradients(level.basis, level.order, level.mode, parent_box, xi, cell)
     raw_dofs = cell_dofs(layout.dofs, level.id, cell)
-    result = SVector{D,R}(ntuple(_ -> zero(R), D))
-
-    for i in eachindex(raw_dofs)
-        result += dof_value(layout, coefficients, raw_dofs[i], component) * gradients[i]
-    end
-
-    return result
+    # Reuse the assembly gradient-reconstruction kernel over `(raw_dofs,
+    # gradients)`; the chain-rule scaling is already in `gradients`.
+    return _field_gradient((; raw_dofs, gradients), layout, coefficients, component)
 end
 
 # Shared pre-flight for the public `value` / `field_gradient` paths:
