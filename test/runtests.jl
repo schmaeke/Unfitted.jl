@@ -22,4 +22,5 @@ using Test
     include("test_tensors_ext.jl")
     include("test_basis_bspline.jl")
     include("test_meshio_ext.jl")
+    include("test_examples.jl")
 end

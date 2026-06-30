@@ -54,6 +54,17 @@ using StaticArrays
 
 include(joinpath(@__DIR__, "..", "reporting.jl"))
 
+# Optional environment overrides so a smoke test (or a quick laptop run)
+# can shrink the transient without touching the script. Each reader
+# defaults to the published configuration, so the example is unchanged
+# for a normal run; setting `THS_T_MAX` to a small value runs only a
+# handful of mesh-update intervals, and `THS_WRITE_OUTPUT=false` skips
+# the per-snapshot VTK export.
+env_float(name, default) = parse(Float64, get(ENV, name, string(default)))
+function env_bool(name, default)
+    lowercase(get(ENV, name, default ? "true" : "false")) in ("1", "true", "yes")
+end
+
 # ---------------------------------------------------------------------
 # Domain and base discretization
 L = 10.0
@@ -87,13 +98,13 @@ tip_dilation = 1
 
 # ---------------------------------------------------------------------
 # Time-stepping and IO
-t_max = 4.0
+t_max = env_float("THS_T_MAX", 4.0)
 max_time_step = 1.0 / 30.0
 mesh_update_frequency = 1.0 / 40.0
 export_frequency = 1.0 / 30.0
 theta = 1.0
 visualization_subdivisions = 4
-write_transient_snapshots = true
+write_transient_snapshots = env_bool("THS_WRITE_OUTPUT", true)
 time_tolerance = 1.0e-12
 
 # ---------------------------------------------------------------------
