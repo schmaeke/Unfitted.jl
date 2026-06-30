@@ -37,7 +37,7 @@ end
     coefficients[base_dofs[2]] = 2.0
     source_solution = Solution(coefficients, source_model.version,
                                Unfitted.SolverDiagnostics(:manual, 0.0, true))
-    target_solution = transfer!(source_solution, source_model, target_model)
+    target_solution = transfer(source_solution, source_model, target_model)
 
     @test source_model.version == 1
     @test target_model.version == 1

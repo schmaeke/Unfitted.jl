@@ -15,7 +15,7 @@ Per-solve diagnostic record carried on every [`Solution`](@ref):
   - `method::Symbol` — solver tag. `:direct` for the default direct
     sparse solve; `:custom` for a user-supplied `linear_solver`;
     `:manual` for [`solution`](@ref) wrappers that bypass the solve
-    entirely; `:l2_projection` and `:rewire` from `transfer!`.
+    entirely; `:l2_projection` and `:rewire` from `transfer`.
   - `residual_norm::Float64` — `‖A x − b‖₂` of the returned solution
     against the assembled system; `NaN` when the wrapper bypassed the
     solve (e.g. [`solution`](@ref) constructors fed by an external time

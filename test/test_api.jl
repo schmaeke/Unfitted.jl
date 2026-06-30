@@ -57,5 +57,5 @@ end
     solution = Solution(zeros(Unfitted.active_unknowns(model.dofs)), model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
-    @test_throws ArgumentError transfer!(solution, model)
+    @test_throws ArgumentError transfer(solution, model)
 end

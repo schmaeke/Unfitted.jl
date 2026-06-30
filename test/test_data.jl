@@ -37,7 +37,7 @@ end
     target_model = prepare(poisson(space(omega; cells=(5, 5), order=1); source=x -> 0.0))
 
     source = QuadField{Float64}(source_model; init=q -> 7.25)
-    target = transfer(source, source_model, target_model, RBFP0(; neighbors=10))
+    target = transfer(source, source_model, target_model; via=RBFP0(; neighbors=10))
 
     @test all(isapprox.(target.data, 7.25; atol=1.0e-10))
     @test target.model_version == target_model.version
@@ -50,7 +50,7 @@ end
 
     f = x -> 1.0 + 0.5 * x[1]
     source = QuadField{Float64}(source_model; init=q -> f(q.x))
-    target = transfer(source, source_model, target_model, RBFP0(; neighbors=12))
+    target = transfer(source, source_model, target_model; via=RBFP0(; neighbors=12))
 
     Unfitted.foreach_quadrature_point(target_model) do q
         @test isapprox(target.data[q.point], f(q.x); atol=5.0e-3)
@@ -64,8 +64,8 @@ end
 
     source = QuadField{Float64}(source_model; init=q -> exp(-((q.x[1] - 0.5)^2 + (q.x[2] - 0.5)^2)))
 
-    serial = transfer(source, source_model, target_model, RBFP0(); threaded=false)
-    threaded = transfer(source, source_model, target_model, RBFP0(); threaded=true)
+    serial = transfer(source, source_model, target_model; via=RBFP0(), threaded=false)
+    threaded = transfer(source, source_model, target_model; via=RBFP0(), threaded=true)
 
     @test serial.data == threaded.data
 end
@@ -74,6 +74,6 @@ end
     omega = box((0.0,), (1.0,))
     model = prepare(poisson(space(omega; cells=4, order=2); source=x -> 0.0))
     qf = QuadField{Float64}(model; init=q -> 1.0)
-    @test_throws ArgumentError transfer(qf, model, model, RBFP0(; neighbors=0))
-    @test_throws ArgumentError transfer(qf, model, model, RBFP0(; neighbors=32))
+    @test_throws ArgumentError transfer(qf, model, model; via=RBFP0(; neighbors=0))
+    @test_throws ArgumentError transfer(qf, model, model; via=RBFP0(; neighbors=32))
 end

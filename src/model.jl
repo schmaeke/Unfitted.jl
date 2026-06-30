@@ -524,7 +524,7 @@ assembled operators. The base level (level 1) cannot be moved.
 
 `move!` overwrites the old state; to transfer a solution onto the
 moved configuration, use [`moved`](@ref) to build a separate target
-model and then [`transfer!`](@ref).
+model and then [`transfer`](@ref).
 
 Invalidation contract: bumps `model.version`, clears `model.matrix`
 and `model.rhs`, rebuilds the integration plan and dof layout,
@@ -549,10 +549,10 @@ end
 Return a new prepared [`Model`](@ref) with overlay `level` moved to box
 `to`, reusing the source problem's forms and boundary data. Unlike
 [`move!`](@ref), the source model is left intact, so it can serve as
-the source of a [`transfer!`](@ref):
+the source of a [`transfer`](@ref):
 
     target = moved(model; level=2, to=box((0.1,), (0.6,)))
-    target_solution = transfer!(solution, model, target)
+    target_solution = transfer(solution, model, target)
 """
 function moved(model::Model{D,T}; level::Integer, to::AxisBox{D,T}) where {D,T}
     opts = model.plan_options

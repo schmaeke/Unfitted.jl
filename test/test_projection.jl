@@ -2,7 +2,7 @@ using LinearAlgebra
 using StaticArrays
 
 @testset "projection scaffold" begin
-    @test isdefined(Unfitted, :transfer!)
+    @test isdefined(Unfitted, :transfer)
 end
 
 @testset "L2 transfer preserves an exactly represented polynomial" begin
@@ -13,10 +13,10 @@ end
     target_model = prepare(poisson(space(omega; cells=2, order=2); source=x -> 0.0,
                                    dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
-    target_solution = transfer!(source_solution, source_model, target_model)
+    target_solution = transfer(source_solution, source_model, target_model)
     target_mass = assemble_matrix(target_model, mass_block(first(target_model.problem.fields)))
-    reused_solution = transfer!(source_solution, source_model, target_model;
-                                backend=L2Projection(target_mass; factor=factorize(target_mass)))
+    reused_solution = transfer(source_solution, source_model, target_model;
+                                via=L2Projection(target_mass; factor=factorize(target_mass)))
     exact = x -> x[1] * (1 - x[1])
 
     @test target_solution.model_version == target_model.version
@@ -42,15 +42,15 @@ end
     # Without the lift the interior coefficient is wrong (the bug this guards).
     target_model = prepare(poisson(space(omega; cells=2, order=2); source=x -> 0.0,
                                    dirichlet=[dirichlet(exact; on=boundary(:all))]))
-    target_solution = transfer!(source_solution, source_model, target_model)
+    target_solution = transfer(source_solution, source_model, target_model)
     @test l2_error(target_solution, target_model, exact; norm=:absolute) < 1.0e-10
     @test value(target_solution, target_model, (0.5,)) ≈ 1.5 atol = 1.0e-10
 
     # The cached-matrix path omits the lift, so it must reject this target
     # rather than silently return wrong interior coefficients.
     target_mass = assemble_matrix(target_model, mass_block(first(target_model.problem.fields)))
-    @test_throws ArgumentError transfer!(source_solution, source_model, target_model;
-                                         backend=L2Projection(target_mass))
+    @test_throws ArgumentError transfer(source_solution, source_model, target_model;
+                                         via=L2Projection(target_mass))
 end
 
 @testset "L2 transfer between shifted overlays preserves constants" begin
@@ -68,7 +68,7 @@ end
     source_solution = Solution(coefficients, source_model.version,
                                Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
-    target_solution = transfer!(source_solution, source_model, target_model)
+    target_solution = transfer(source_solution, source_model, target_model)
 
     @test l2_error(target_solution, target_model, x -> 1.0; norm=:absolute) < 1.0e-12
     @test value(target_solution, target_model, (0.05,)) ≈ 1.0 atol = 1.0e-12
@@ -90,7 +90,7 @@ end
     source_solution = Solution(coefficients, source_model.version,
                                Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
-    target_solution = transfer!(source_solution, source_model, target_model)
+    target_solution = transfer(source_solution, source_model, target_model)
     exact = x -> SVector(2.0, -1.0)
 
     @test l2_error(target_solution, target_model, exact; norm=:absolute) < 1.0e-12
@@ -123,7 +123,7 @@ end
     source_solution = Solution(coefficients, source_model.version,
                                Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
-    target_solution = transfer!(source_solution, source_model, target_model)
+    target_solution = transfer(source_solution, source_model, target_model)
     @test value(target_solution, target_model, target_u, (0.3,)) ≈ 2.0
     @test value(target_solution, target_model, target_c, (0.7,)) ≈ -1.0
 end
@@ -140,7 +140,7 @@ end
 
     target_model = prepare(poisson(space(omega; cells=2, order=2); source=x -> 0.0,
                                    dirichlet=[dirichlet(x -> 1 + x[1]; on=boundary(:all))]))
-    target_solution = transfer!(source_solution, source_model, target_model)
+    target_solution = transfer(source_solution, source_model, target_model)
 
     @test value(target_solution, target_model, (0.0,)) ≈ 1.0 atol = 1.0e-12
     @test value(target_solution, target_model, (1.0,)) ≈ 2.0 atol = 1.0e-12
@@ -159,7 +159,7 @@ end
     source_solution = Solution(coefficients, source_model.version,
                                Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
-    target_solution = transfer!(source_solution, source_model, target_model)
+    target_solution = transfer(source_solution, source_model, target_model)
 
     @test value(source_solution, source_model, (0.1,)) ≈ 0.0 atol = 1.0e-12
     @test value(target_solution, target_model, (0.1,)) ≈ 0.0 atol = 1.0e-12
@@ -180,7 +180,7 @@ end
     solution = Solution(ones(Unfitted.active_unknowns(source_model.dofs)), source_model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
-    @test_throws ArgumentError transfer!(solution, source_model, target_model)
+    @test_throws ArgumentError transfer(solution, source_model, target_model)
 end
 
 @testset "Rewire backend reproduces source pointwise on monotone activation" begin
@@ -203,8 +203,8 @@ end
     source_solution = Solution(src_coeffs, source_model.version,
                                Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
-    rewired = transfer!(source_solution, source_model, target_model; backend=Rewire())
-    l2_target = transfer!(source_solution, source_model, target_model)
+    rewired = transfer(source_solution, source_model, target_model; via=Rewire())
+    l2_target = transfer(source_solution, source_model, target_model)
 
     for xy in [(0.1, 0.1), (0.25, 0.25), (0.4, 0.7), (0.0, 0.5), (0.5, 0.0)]
         @test value(rewired, target_model, xy) ≈ value(source_solution, source_model, xy) atol = 1.0e-12
@@ -236,7 +236,7 @@ end
     target_model = prepare(poisson(V_big; source=x -> 1.0,
                                    dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
-    rewired = transfer!(source_solution, source_model, target_model; backend=Rewire())
+    rewired = transfer(source_solution, source_model, target_model; via=Rewire())
 
     # On the original active region (small mask coverage), rewire reproduces source pointwise.
     for x in [SVector(0.5, 0.5), SVector(0.4, 0.5), SVector(0.6, 0.5), SVector(0.5, 0.4)]
@@ -256,8 +256,8 @@ end
     src_coeffs = ones(Unfitted.active_unknowns(source_model.dofs))
     sol = Solution(src_coeffs, source_model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
-    @test_throws ArgumentError transfer!(sol, source_model, target_model;
-                                         backend=Rewire(; strict=true))
-    rewired = transfer!(sol, source_model, target_model; backend=Rewire(; strict=false))
+    @test_throws ArgumentError transfer(sol, source_model, target_model;
+                                         via=Rewire(; strict=true))
+    rewired = transfer(sol, source_model, target_model; via=Rewire(; strict=false))
     @test rewired.diagnostics.method === :rewire
 end

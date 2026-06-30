@@ -397,7 +397,7 @@ function main()
             # Mesh update: rebuild the state at the new source position with a
             # solution-driven mask **per static overlay level**, then
             # variationally transfer the prior state forward. We use the
-            # *build-from-scratch* pattern (build_heat_state + transfer!)
+            # *build-from-scratch* pattern (build_heat_state + transfer)
             # rather than the in-place `activate!`/`deactivate!` mutators:
             # every mesh update also moves the tip overlay and forces a fresh
             # `prepare`/mass + stiffness assembly + factorization, so the
@@ -407,8 +407,8 @@ function main()
             new_center = source_center(t1)
             new_masks = indicator_masks(old_solution, old_model, new_center)
             state = build_heat_state(new_center, new_masks)
-            projected = transfer!(old_solution, old_model, state.model;
-                                  backend=L2Projection(state.mass; factor=state.mass_factor))
+            projected = transfer(old_solution, old_model, state.model;
+                                 via=L2Projection(state.mass; factor=state.mass_factor))
             coefficients = copy(projected.coefficients)
             push!(projection_residuals, projected.diagnostics.residual_norm)
             for (i_level, mask) in enumerate(new_masks)

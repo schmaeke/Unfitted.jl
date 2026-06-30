@@ -418,7 +418,7 @@ end
 """
     abstract type TransferBackend end
 
-Strategy object selecting how [`transfer!`](@ref) moves a
+Strategy object selecting how [`transfer`](@ref) moves a
 [`Solution`](@ref) between two `Model`s. The default
 [`L2Projection`](@ref) is general-purpose but introduces smoothing at
 sharp features; [`Rewire`](@ref) is lossless when the target's active
@@ -500,25 +500,26 @@ end
 Rewire(; strict::Bool=true) = Rewire(strict)
 
 """
-    transfer!(source_solution, source_model, target_model;
-              backend=L2Projection(), tolerance=target_model.dofs.tolerance) -> Solution
+    transfer(source_solution, source_model, target_model;
+             via=L2Projection(), tolerance=target_model.dofs.tolerance) -> Solution
 
-Move a [`Solution`](@ref) from `source_model` onto `target_model` using
-`backend`. Returns a fresh `Solution` pinned to `target_model.version`.
+Move a [`Solution`](@ref) from `source_model` onto `target_model` using the
+strategy `via`. Returns a fresh `Solution` pinned to `target_model.version`.
 
-`backend` defaults to [`L2Projection`](@ref); pass `Rewire()` for the
-lossless raw-key path or a precomputed `L2Projection(matrix; factor)`
-to reuse a cached target mass.
+`via` defaults to [`L2Projection`](@ref); pass `Rewire()` for the lossless
+raw-key path or a precomputed `L2Projection(matrix; factor)` to reuse a cached
+target mass. The same verb `transfer` moves a [`QuadField`](@ref) when given
+one — see that method for the quadrature-point schemes.
 
-`tolerance` controls the geometric merge tolerance used when building
-the source-target union partition; it defaults to the target dof
-layout's stored tolerance and is ignored by backends that do not walk
-the geometry (currently [`Rewire`](@ref)).
+`tolerance` controls the geometric merge tolerance used when building the
+source-target union partition; it defaults to the target dof layout's stored
+tolerance and is ignored by strategies that do not walk the geometry (currently
+[`Rewire`](@ref)).
 """
-function transfer!(source_solution::Solution, source_model::Model{D,T}, target_model::Model{D,T};
-                   backend::TransferBackend=L2Projection(),
-                   tolerance=target_model.dofs.tolerance) where {D,T}
-    return _transfer!(source_solution, source_model, target_model, backend, tolerance)
+function transfer(source_solution::Solution, source_model::Model{D,T}, target_model::Model{D,T};
+                  via::TransferBackend=L2Projection(),
+                  tolerance=target_model.dofs.tolerance) where {D,T}
+    return _transfer!(source_solution, source_model, target_model, via, tolerance)
 end
 
 # True when any field of `layout` carries a nonzero constrained value, i.e.
@@ -585,7 +586,7 @@ end
 function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_model::Model{D,T},
                     backend::Rewire, _tolerance) where {D,T}
     # Rewire walks raw `TensorDofKey`s, never the geometry — the
-    # geometric merge tolerance accepted by `transfer!` has no role
+    # geometric merge tolerance accepted by `transfer` has no role
     # here and is ignored on purpose.
     _assert_transfer_compatible(source_model, target_model)
     source_coefficients = _checked_coefficients(source_solution, source_model)
@@ -632,12 +633,12 @@ end
 
 # Friendlier error-message dispatches for the most common user
 # mistakes: mismatched dimension / scalar type (the model parameters
-# disagree, so the typed `transfer!` above does not match) and missing
+# disagree, so the typed `transfer` above does not match) and missing
 # target model (positional shorthand the API does not support).
-function transfer!(::Solution, ::Model, ::Model; kwargs...)
+function transfer(::Solution, ::Model, ::Model; kwargs...)
     throw(ArgumentError("source and target models must have the same dimension and scalar type for transfer"))
 end
 
-function transfer!(::Solution, ::Model; kwargs...)
-    throw(ArgumentError("transfer! requires source and target models; call transfer!(solution, source_model, target_model)"))
+function transfer(::Solution, ::Model; kwargs...)
+    throw(ArgumentError("transfer requires source and target models; call transfer(solution, source_model, target_model)"))
 end

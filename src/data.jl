@@ -224,10 +224,11 @@ end
 # ── Public transfer ──────────────────────────────────────────────────────────
 
 """
-    transfer(source::QuadField, source_model, target_model, scheme::RBFP0; threaded=true) -> QuadField
+    transfer(source::QuadField, source_model, target_model; via=RBFP0(), threaded=true) -> QuadField
 
-Reconstruct `source` on `target_model`'s quadrature-point cloud using
-`scheme`. Returns a fresh [`QuadField`](@ref) bound to `target_model`.
+Reconstruct `source` on `target_model`'s quadrature-point cloud using the
+scheme `via`. Returns a fresh [`QuadField`](@ref) bound to `target_model`. The
+same verb `transfer` moves a [`Solution`](@ref) when given one.
 
 Algorithm: build a `KDTree` over the source cloud; for each target
 quadrature point find the `scheme.neighbors` nearest source neighbours,
@@ -241,10 +242,10 @@ of thread count for a fixed neighbour set. `threaded = true` is the
 default; pass `threaded = false` for tests that need ordered
 evaluation.
 """
-function transfer(source::QuadField, source_model::Model{D,T}, target_model::Model{D,T},
-                  scheme::RBFP0; threaded::Bool=true) where {D,T}
+function transfer(source::QuadField, source_model::Model{D,T}, target_model::Model{D,T};
+                  via::QuadTransferScheme=RBFP0(), threaded::Bool=true) where {D,T}
     source_data = _checked_quadfield(source, source_model)
-    k = scheme.neighbors
+    k = via.neighbors
     1 <= k <= _RBFP0_MAX_NEIGHBORS ||
         throw(ArgumentError("RBFP0 supports 1..$_RBFP0_MAX_NEIGHBORS neighbours; got $k"))
     nsrc = length(source_data)
