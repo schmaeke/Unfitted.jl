@@ -210,9 +210,7 @@ _simplex_measure(cell::NTuple{1,SVector{D,T}}) where {D,T} = one(T)
 # K = 1: segment cell. Length is the Euclidean norm of the edge
 # vector. Reference frame is `[−1, 1]`, so the Jacobian is
 # `length / 2`.
-function _simplex_measure(cell::NTuple{2,SVector{D,T}}) where {D,T}
-    return sqrt(sum(x -> x * x, cell[2] - cell[1]))
-end
+_simplex_measure(cell::NTuple{2,SVector{D,T}}) where {D,T} = norm(cell[2] - cell[1])
 
 # K = 2: triangle cell. Area via the cross-product norm of two edges
 # (in 2D the cross is a scalar; in 3D it is a vector). Reference
@@ -227,11 +225,7 @@ function _simplex_measure(cell::NTuple{3,SVector{2,T}}) where {T}
 end
 
 function _simplex_measure(cell::NTuple{3,SVector{3,T}}) where {T}
-    e1 = cell[2] - cell[1]
-    e2 = cell[3] - cell[1]
-    n = SVector{3,T}(e1[2] * e2[3] - e1[3] * e2[2], e1[3] * e2[1] - e1[1] * e2[3],
-                     e1[1] * e2[2] - e1[2] * e2[1])
-    return sqrt(sum(x -> x * x, n)) / 2
+    return norm(cross(cell[2] - cell[1], cell[3] - cell[1])) / 2
 end
 
 # Geometric default normal. Throws for K=0 (no normal exists from
@@ -245,8 +239,7 @@ end
 # the polyline as the oriented boundary of a region to its left.
 function _default_normal(cell::NTuple{2,SVector{2,T}}) where {T}
     e = cell[2] - cell[1]
-    n = SVector{2,T}(e[2], -e[1])
-    return n / sqrt(sum(x -> x * x, n))
+    return normalize(SVector{2,T}(e[2], -e[1]))
 end
 
 # K=1 in 3D: a segment in 3D has no canonical normal (the cross
@@ -259,11 +252,7 @@ end
 # K=2 in 3D: unit cross product of two edges (right-hand rule on the
 # vertex ordering).
 function _default_normal(cell::NTuple{3,SVector{3,T}}) where {T}
-    e1 = cell[2] - cell[1]
-    e2 = cell[3] - cell[1]
-    n = SVector{3,T}(e1[2] * e2[3] - e1[3] * e2[2], e1[3] * e2[1] - e1[1] * e2[3],
-                     e1[1] * e2[2] - e1[2] * e2[1])
-    return n / sqrt(sum(x -> x * x, n))
+    return normalize(cross(cell[2] - cell[1], cell[3] - cell[1]))
 end
 
 # K=2 in 2D: degenerate (a triangle filling a 2D region carries the
@@ -487,11 +476,7 @@ function _fan_triangulate(polygon::Vector{SVector{3,T}}, min_area::T) where {T}
     for i in 2:(length(polygon)-1)
         v2 = polygon[i]
         v3 = polygon[i + 1]
-        e1 = v2 - v1
-        e2 = v3 - v1
-        cross = SVector(e1[2] * e2[3] - e1[3] * e2[2], e1[3] * e2[1] - e1[1] * e2[3],
-                        e1[1] * e2[2] - e1[2] * e2[1])
-        area = sqrt(sum(x -> x * x, cross)) / 2
+        area = norm(cross(v2 - v1, v3 - v1)) / 2
         area > min_area && push!(triangles, (v1, v2, v3))
     end
     return triangles
