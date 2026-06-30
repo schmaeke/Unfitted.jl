@@ -751,116 +751,110 @@ function _local_active_dof_table!(ws::AssemblyWorkspace, field_data, layout::Sys
     end
 end
 
+# ── Per-region-kind quadrature accessors ──────────────────────────────────────
+#
+# The volume, facet, and surface hot loops share one body (`_assemble_region!`
+# below). Only three things differ per region kind, captured by these small
+# accessors so the body stays single-source and the per-kind dispatch happens
+# once per accessor rather than as three copied loops.
+
+# Reference→physical Jacobian for the region's weights: `vol(box)/2ᴰ` for a
+# volume region (whose weights are reference-frame), `one(T)` for facet /
+# surface regions (whose weights are already physical-frame).
+_region_jacobian(region::VolumeRegion{D,T}) where {D,T} = volume(region.box) / convert(T, 2^D)
+_region_jacobian(::Union{FacetRegion{D,T},SurfaceRegion{D,T}}) where {D,T} = one(T)
+
+# Advance to local quadrature point `local_qp`: refresh every parent's basis
+# values / physical gradients into the workspace and return `(x, qweight)`. A
+# volume region iterates its reference-frame points `eta`, scales the weight by
+# the region Jacobian, computes `x` through the region box, and refreshes via
+# the region-local frame; facet / surface regions iterate precomputed physical
+# points (weights already physical) and refresh each parent from `x`.
+@inline function _region_qpoint!(ws::AssemblyWorkspace{D,T}, region::VolumeRegion{D,T},
+                                 local_qp::Int, jacobian::T) where {D,T}
+    eta = region.quadrature.points[local_qp]
+    qweight = region.quadrature.weights[local_qp] * jacobian
+    x = reference_to_physical(region.box, eta)
+    _update_region_basis!(ws, region, eta)
+    return x, qweight
+end
+@inline function _region_qpoint!(ws::AssemblyWorkspace{D,T},
+                                 region::Union{FacetRegion{D,T},SurfaceRegion{D,T}}, local_qp::Int,
+                                 ::T) where {D,T}
+    x = region.points[local_qp]
+    qweight = region.weights[local_qp]
+    _update_physical_basis!(ws, region.parents, x)
+    return x, qweight
+end
+
+# `q`-tuple extras the form callbacks read: the outward unit normal at the
+# point (`nothing` for a volume region; the constant face normal for a facet;
+# the per-point normal for an immersed surface) and the codim-`K` facet
+# identifier `q.sides` (only a facet carries one).
+_region_normal(::VolumeRegion, ::Int) = nothing
+_region_normal(region::FacetRegion, ::Int) = region.normal
+_region_normal(region::SurfaceRegion, local_qp::Int) = region.normals[local_qp]
+_region_sides(::VolumeRegion) = nothing
+_region_sides(region::FacetRegion) = region.sides
+_region_sides(::SurfaceRegion) = nothing
+
 """
     _assemble_region!(ws, sink, rhs, model, region, blocks, loads,
                       symmetric, state_coefficients=nothing, point_offset=0)
 
 Assemble every weak-form contribution at every quadrature point of one
-integration region. This is the assembly hot loop: a single call walks
-the region's quadrature points and updates the matrix `sink` and
-right-hand-side vector in place.
+integration region — the assembly hot loop. One call walks the region's
+quadrature points and updates the matrix `sink` and right-hand-side vector in
+place. The body is shared across the three region kinds; only the small
+accessors above (`_region_qpoint!`, `_region_jacobian`, `_region_normal`,
+`_region_sides`) differ:
 
-Structure of the body, in order:
+  * a **volume** region iterates reference-frame points and scales each weight
+    by `vol(box)/2ᴰ`; `q.normal` and `q.sides` are `nothing`;
+  * a **facet** region iterates precomputed physical points and carries the
+    face's outward normal `q.normal` and codim-`K` identifier `q.sides`, so
+    user forms can express Neumann / Robin / Nitsche contributions;
+  * a **surface** (immersed-boundary) region is a facet with a per-point
+    `q.normal` and no `q.sides`.
 
-  1. **Region setup.** Compute the reference-to-physical Jacobian
-     `vol(box) / 2ᴰ`, build per-field parent records (aliasing the
-     workspace buffers), and the per-region local-to-global dof table.
-     Optionally build a [`FormState`](@ref) so callbacks can read the
-     current iterate.
-  2. **Local-system setup.** Resize the workspace's flat
-     `local_matrix` / `local_rhs` buffers to `n×n` and `n` for the
-     number of distinct active dofs touching this region; clear them.
-  3. **Quadrature loop.** At each quadrature point:
-       a. Compose `q = (; x, weight, point, state)` and evaluate every
-          parent's basis values / physical gradients into the workspace.
-       b. **Loads:** for every `LoadForm`, evaluate the linear channels
-          for every test component and accumulate the test-contribution
-          weighted by `qweight` into the local rhs.
-       c. **Blocks:** for every `BlockForm`, iterate trial components,
-          trial parents, trial dofs. Build `trial::TrialChannels` for
-          each, then iterate test components, evaluate the bilinear
-          channels, and iterate test parents and dofs accumulating
-          local-matrix entries.
-       d. **Dirichlet elimination.** A constrained trial column
-          (`col == 0`) shifts its stiffness contribution onto the rhs,
-          weighted by the dof's stored `constrained_value`.
-       e. **Symmetry.** When the form is symmetric, only emit
-          `row ≥ col` entries; `_matrix_from_pattern` mirrors at the
-          end.
-  4. **Emit.** Flush the local matrix and rhs to the matrix `sink` and
-     global rhs via [`_emit_local_system!`](@ref).
+Every active local basis mode of every parent participates — `is_facet_basis`
+is **not** applied on facet / surface regions: a mode with zero *value* on the
+face can still carry nonzero *gradient*, which Nitsche-style forms rely on.
 
-`point_offset` is the global quad-point offset of this region in the
-plan, so `q.point = point_offset + local_qp` is the stable index used
-by [`foreach_quadrature_point`](@ref) and per-point history data.
+Per quadrature point the body refreshes every parent's basis into the workspace
+and composes `q = (; x, weight, point, state, normal, sides)`; then
+`_accumulate_qpoint!` evaluates loads and blocks, applies Dirichlet elimination
+(a constrained trial column shifts its contribution onto the rhs), and respects
+symmetry (emitting only `row ≥ col`, mirrored by `_matrix_from_pattern`). The
+region's local system is finally flushed by [`_emit_local_system!`](@ref).
+
+`point_offset` is the global quad-point offset of this region in the plan, so
+`q.point = point_offset + local_qp` is the stable index used by
+[`foreach_quadrature_point`](@ref) and per-point history data.
 """
 function _assemble_region!(ws::AssemblyWorkspace{D,T}, sink, rhs::Vector{T}, model::Model{D,T},
-                           region::VolumeRegion{D,T}, blocks, loads, symmetric::Bool,
-                           state_coefficients=nothing, point_offset::Int=0) where {D,T}
-    # Region setup: Jacobian, per-field parent data, region-local dof
-    # table, optional state, local matrix / rhs buffers.
-    quadrature = region.quadrature
-    jacobian = volume(region.box) / convert(T, 2^D)
+                           region::Union{VolumeRegion{D,T},FacetRegion{D,T},SurfaceRegion{D,T}},
+                           blocks, loads, symmetric::Bool, state_coefficients=nothing,
+                           point_offset::Int=0) where {D,T}
+    # Region setup: per-field parent data, region-local dof table, optional
+    # state, local matrix / rhs buffers.
     field_data, local_by_field, state, local_matrix, local_rhs = _region_workspace_setup!(ws, model,
                                                                                           region.parents,
                                                                                           state_coefficients,
                                                                                           !isempty(blocks))
+    jacobian = _region_jacobian(region)
+    sides = _region_sides(region)
 
     # Quadrature loop.
-    for (local_qp, (eta, weight)) in enumerate(zip(quadrature.points, quadrature.weights))
-        qweight = weight * jacobian
-        x = reference_to_physical(region.box, eta)
-        q = (; x, weight=qweight, point=point_offset + local_qp, state, normal=nothing,
-             sides=nothing)
-        _update_region_basis!(ws, region, eta)
+    for local_qp in 1:_region_qpoint_count(region)
+        x, qweight = _region_qpoint!(ws, region, local_qp, jacobian)
+        q = (; x, weight=qweight, point=point_offset + local_qp, state,
+             normal=_region_normal(region, local_qp), sides)
         _accumulate_qpoint!(local_matrix, local_rhs, q, qweight, field_data, local_by_field,
                             ws.active_dofs, blocks, loads, symmetric, model, Val(D), T)
     end
 
     # Scatter the local system into the matrix sink / global rhs.
-    _emit_local_system!(sink, rhs, ws.active_dofs, local_matrix, local_rhs)
-    return nothing
-end
-
-"""
-    _assemble_region!(ws, sink, rhs, model, region::FacetRegion,
-                      blocks, loads, symmetric, state_coefficients=nothing,
-                      point_offset=0)
-
-Facet analogue of the volume hot loop. Identical inner work
-(`_accumulate_qpoint!`) — the only differences are:
-
-  * the quadrature is precomputed in physical coordinates and the
-    weight is already physical-frame (Gauss × Jacobian),
-  * each parent's reference point `xi` is obtained by mapping the
-    physical Q-point back into the parent cell via
-    `physical_to_reference(parent.parent_box, x)`,
-  * the `q` tuple carries `q.normal` (the facet's outward unit normal)
-    and `q.sides` (the codim-`K` facet identifier) so user forms can
-    express Neumann / Robin / Nitsche contributions naturally.
-
-Every active local basis mode of every parent participates — `is_facet_basis`
-is **not** applied here. Modes with zero *value* on the facet (e.g. integrated
-Legendre bubbles along a constrained axis) can still carry nonzero
-*gradient*, which Nitsche-style forms rely on.
-"""
-function _assemble_region!(ws::AssemblyWorkspace{D,T}, sink, rhs::Vector{T}, model::Model{D,T},
-                           region::FacetRegion{D,T}, blocks, loads, symmetric::Bool,
-                           state_coefficients=nothing, point_offset::Int=0) where {D,T}
-    field_data, local_by_field, state, local_matrix, local_rhs = _region_workspace_setup!(ws, model,
-                                                                                          region.parents,
-                                                                                          state_coefficients,
-                                                                                          !isempty(blocks))
-
-    for (local_qp, x) in pairs(region.points)
-        qweight = region.weights[local_qp]
-        q = (; x, weight=qweight, point=point_offset + local_qp, state, normal=region.normal,
-             sides=region.sides)
-        _update_physical_basis!(ws, region.parents, x)
-        _accumulate_qpoint!(local_matrix, local_rhs, q, qweight, field_data, local_by_field,
-                            ws.active_dofs, blocks, loads, symmetric, model, Val(D), T)
-    end
-
     _emit_local_system!(sink, rhs, ws.active_dofs, local_matrix, local_rhs)
     return nothing
 end
@@ -871,8 +865,8 @@ end
 # of through a region-local frame (facet / surface regions have no
 # single reference frame shared by every parent — the constrained
 # coordinate is fixed but free-axis coordinates run across multiple
-# cells per level). Used by `_assemble_region!(::FacetRegion, …)` and
-# `_assemble_region!(::SurfaceRegion, …)`.
+# cells per level). Called by `_region_qpoint!` on the facet / surface branch
+# of `_assemble_region!`.
 function _update_physical_basis!(ws::AssemblyWorkspace{D,T}, parents, x::SVector{D,T}) where {D,T}
     for parent in parents
         lvl = parent.level
@@ -881,47 +875,6 @@ function _update_physical_basis!(ws::AssemblyWorkspace{D,T}, parents, x::SVector
         _tensor_values_grads!(ws.bases[lvl], ws.values[lvl], ws.gradients[lvl], ws.local_ids[lvl],
                               ws.orders[lvl], xi, scale, ws.val1d[lvl], ws.der1d[lvl], parent.cell)
     end
-    return nothing
-end
-
-"""
-    _assemble_region!(ws, sink, rhs, model, region::SurfaceRegion,
-                      blocks, loads, symmetric, state_coefficients=nothing,
-                      point_offset=0)
-
-Surface (immersed-boundary) analogue of the volume and facet hot
-loops. The user-supplied [`BoundaryMesh`](@ref) cell maps onto one
-`SurfaceRegion`; the parent set is constant within the region by the
-strict construction-time check. Per quadrature point:
-
-  * basis values + physical gradients refresh per parent via
-    `physical_to_reference(parent.parent_box, x)`,
-  * `q.normal` carries the region's per-Q-point unit normal (constant
-    per region in the MVP; per-Q-point in future for curved meshes),
-  * `q.sides` is `nothing` — immersed surfaces have no facet
-    `(axis, side)` identifier (the user owns the geometry).
-
-The basis evaluation visits every active local mode; nothing is
-filtered by facet-incidence.
-"""
-function _assemble_region!(ws::AssemblyWorkspace{D,T}, sink, rhs::Vector{T}, model::Model{D,T},
-                           region::SurfaceRegion{D,T}, blocks, loads, symmetric::Bool,
-                           state_coefficients=nothing, point_offset::Int=0) where {D,T}
-    field_data, local_by_field, state, local_matrix, local_rhs = _region_workspace_setup!(ws, model,
-                                                                                          region.parents,
-                                                                                          state_coefficients,
-                                                                                          !isempty(blocks))
-
-    for (local_qp, x) in pairs(region.points)
-        qweight = region.weights[local_qp]
-        q = (; x, weight=qweight, point=point_offset + local_qp, state,
-             normal=region.normals[local_qp], sides=nothing)
-        _update_physical_basis!(ws, region.parents, x)
-        _accumulate_qpoint!(local_matrix, local_rhs, q, qweight, field_data, local_by_field,
-                            ws.active_dofs, blocks, loads, symmetric, model, Val(D), T)
-    end
-
-    _emit_local_system!(sink, rhs, ws.active_dofs, local_matrix, local_rhs)
     return nothing
 end
 
