@@ -15,8 +15,8 @@ via non-negative moment-fit quadrature.
 
 The method is described in
 
-> J. N. Schmäke and M. Ruess, *Unfitted multi-level hp refinement on
-> Cartesian grids*, arXiv preprint
+> J. N. Schmäke and M. Ruess, *Unfitted Multi-Level hp Refinement for
+> Localized and Moving Solution Features*, arXiv preprint
 > [arXiv:2604.25797](https://arxiv.org/abs/2604.25797).
 
 ## What's in the package
@@ -64,7 +64,8 @@ Modified Helmholtz on a disk-shaped immersed domain:
 using Unfitted
 
 omega = box((-1.0, -1.0), (1.0, 1.0))
-disk  = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.7; lipschitz=1.0)
+disk  = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.7; lipschitz=1.0,
+                        subcell_length_scale=0.02)
 
 V = space(omega; cells=(16, 16), order=2, physical=disk)
 u = field(:u, V)
@@ -113,8 +114,8 @@ and the contributor / PR workflow, see
 
 If you use Unfitted.jl in academic work, please cite the method paper:
 
-> J. N. Schmäke and M. Ruess, *Unfitted multi-level hp refinement on
-> Cartesian grids*, arXiv:2604.25797.
+> J. N. Schmäke and M. Ruess, *Unfitted Multi-Level hp Refinement for
+> Localized and Moving Solution Features*, arXiv:2604.25797.
 
 A machine-readable record will be provided in
 [`CITATION.cff`](CITATION.cff).

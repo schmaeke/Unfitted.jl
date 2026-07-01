@@ -36,8 +36,8 @@ Both compose with the CSG combinators. See `ext/UnfittedMeshIOExt.jl`.
 
 Reference for the unfitted multi-level hp method:
 
-> J. N. Schmäke and M. Ruess, *Unfitted multi-level hp refinement on
-> Cartesian grids*, arXiv:2604.25797.
+> J. N. Schmäke and M. Ruess, *Unfitted Multi-Level hp Refinement for
+> Localized and Moving Solution Features*, arXiv:2604.25797.
 
 # A small first example
 

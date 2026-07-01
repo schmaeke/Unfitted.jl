@@ -31,7 +31,7 @@ reports:
   * `min_volume` and `first_small_volume` — the worst-overlap volumes,
   * `condition_estimate` — `cond(A)` of the dense matrix where
     `active_unknowns ≤ 256` (see `_condition_estimate` in
-    `src/assembly.jl`); `NaN` for larger systems,
+    `src/model.jl`); `NaN` for larger systems,
   * `residual_norm` — the post-solve residual `‖A x − b‖₂`.
 
 Sweep results print as a single comma-separated row per `(p, k)` pair

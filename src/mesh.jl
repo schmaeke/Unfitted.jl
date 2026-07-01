@@ -87,7 +87,7 @@ cell_indices(m::CartesianMesh{D}) where {D} = CartesianIndices(m.cells)
 
 Per-axis element-boundary coordinates of the mesh: `axes[d]` carries the
 `cells[d] + 1` coordinates separating the cells along axis `d`. Used by
-[`intersections.jl`](@ref) to collect every participating mesh's boundary
+`intersections.jl` to collect every participating mesh's boundary
 coordinates before merging them into the admissible-box partition.
 """
 boundary_coordinates(m::CartesianMesh) = m.axes

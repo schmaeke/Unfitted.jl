@@ -1,7 +1,7 @@
 using BenchmarkTools
 using Unfitted
 
-# Mirrors examples/fcm_disk_helmholtz_2d.jl at a smaller mesh. The `prepare`
+# A small circular-FCM regression scenario. The `prepare`
 # bench is the most useful FCM regression signal here: it triggers the
 # cell-level classification fold and the NNMF moment-fit for every cut region.
 group = SUITE["scenarios"]["fcm_disk_small"] = BenchmarkGroup()

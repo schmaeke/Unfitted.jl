@@ -26,7 +26,7 @@ authors:
     given-names: Jan Niklas
 preferred-citation:
   type: article
-  title: Unfitted multi-level hp refinement on Cartesian grids
+  title: Unfitted Multi-Level hp Refinement for Localized and Moving Solution Features
   authors:
     - family-names: Schmäke
       given-names: Jan Niklas

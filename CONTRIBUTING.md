@@ -15,8 +15,8 @@ Unfitted.jl is a compact, high-performance, science-grade Julia
 implementation of unfitted multi-level hp refinement on axis-aligned
 Cartesian grids. It implements the method described in
 
-> J. N. Schmäke and M. Ruess, *Unfitted multi-level hp refinement on
-> Cartesian grids*, arXiv:2604.25797.
+> J. N. Schmäke and M. Ruess, *Unfitted Multi-Level hp Refinement for
+> Localized and Moving Solution Features*, arXiv:2604.25797.
 > <https://arxiv.org/abs/2604.25797>
 
 The implementation is written from the method specification — not ported
@@ -137,7 +137,7 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `surface.jl`      | immersed-boundary surface meshes (`BoundaryMesh`) and surface-region integration |
 | `problems.jl`     | `Field`, weak-form channels and blocks (`BlockForm`/`LoadForm`/`WeakForm`), `Problem` |
 | `model.jl`        | `Model` lifecycle: `prepare`, `move!`/`activate!`/`deactivate!`, diagnostics |
-| `assembly.jl`     | coupled Galerkin assembly: channel calculus, cached symbolic-scatter (Gustavson) sparse path |
+| `assembly.jl`     | coupled Galerkin assembly: channel calculus, cached symbolic-scatter (Gustavson) pattern, serial scatter + two-phase compute→gather threaded path |
 | `solvers.jl`      | small solver/preconditioner wrappers + `Solution`           |
 | `projection.jl`   | variational and rewire-based state transfer between models  |
 | `data.jl`         | per-quadrature-point `QuadField` + RBF transfer             |
@@ -815,9 +815,11 @@ Rules:
     disjoint-output partition or explicit synchronization; prefer arena
     slices reduced by a fixed-order gather over thread-local accumulators
     (whose peak memory scales with the thread count).
-  - Avoid locks AND atomics in hot assembly loops. A racy atomic scatter
-    is nondeterministic and was measured to corrupt the solve of an
-    ill-conditioned (cond ≈ 3e16) system; a fixed-order gather does not.
+  - Avoid locks and atomic *accumulation* in the hot scatter. A racy atomic
+    scatter is nondeterministic and was measured to corrupt the solve of an
+    ill-conditioned (cond ≈ 3e16) system; a fixed-order gather does not. (An
+    atomic counter that only hands out region indices for load balancing is
+    fine — it never touches the shared output.)
   - Threaded assembly is **bit-identical to serial**: every slot is
     summed in the serial (region, row) order, so results are reproducible
     run-to-run and independent of the thread count. Tests may assert

@@ -2,7 +2,8 @@ using BenchmarkTools
 using LinearAlgebra
 using Unfitted
 
-# Reduced version of examples/traveling_heat_source_2d.jl. Covers the per-step
+# Reduced version of examples/traveling_heat_source_2d/traveling_heat_source_2d.jl.
+# Covers the per-step
 # hot ops of a theta-step (mass + stiffness reassembly, compactly supported
 # load) and one variational transfer between two overlay configurations,
 # both with and without the cached target mass + factor used by the example.
@@ -47,7 +48,8 @@ let
     src_coeffs = [sin(0.01 * i) for i in 1:Unfitted.active_unknowns(model_src.dofs)]
     src_solution = solution(model_src, src_coeffs; method=:synthetic)
 
-    # Cached target operators — mirror examples/traveling_heat_source_2d.jl:411.
+    # Cached target operators — mirror
+    # examples/traveling_heat_source_2d/traveling_heat_source_2d.jl:422.
     # The cached path threads the precomputed mass + factor in through the
     # `L2Projection(matrix; factor)` backend so the transfer skips both the
     # target-side mass assembly and its factorisation. The uncached bench

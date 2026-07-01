@@ -120,9 +120,8 @@ robust at element boundaries (no element-mapping inversion required)
 and matches Sartorti & Düster's recommendation for point-based
 history-data transfer:
 
-> S. Sartorti, A. Düster, "On the transfer of history data in finite
-> cell remeshing schemes for hyperelastic materials at finite strain",
-> Comput. Mech. 77 (2026),
+> R. Sartorti, A. Düster, "Data transfer within a finite cell remeshing
+> approach applied to large deformation problems", Comput. Mech. 77 (2026),
 > [doi:10.1007/s00466-024-02486-0](https://doi.org/10.1007/s00466-024-02486-0).
 
 (See Sec. 3.3.1 of that work for an analysis of why the RBF + P0 scheme
