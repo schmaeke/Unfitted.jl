@@ -397,7 +397,11 @@ function main()
         for t in interval_step_times(t0, t1, snapshot_times)
             coefficients = theta_step(state, coefficients, t0, t)
             time_steps += 1
-            if any(s -> isapprox(s, t; atol=time_tolerance, rtol=0.0), snapshot_times)
+            # `snapshot_times` carries `t_max` even when output is off (so the
+            # stepper still lands on it), so gate the write on the flag too —
+            # otherwise `THS_WRITE_OUTPUT=false` would still emit the final VTK.
+            if write_transient_snapshots &&
+               any(s -> isapprox(s, t; atol=time_tolerance, rtol=0.0), snapshot_times)
                 write_snapshot(output_root, snapshot_index, state, coefficients, t)
                 snapshot_index += 1
             end
