@@ -219,14 +219,18 @@ function _vtk_data_array(values::Vector{Any})
     first_value = first(values)
 
     if all(v -> v isa Number, values)
-        T = promote_type(map(typeof, values)...)
+        # Reduce the element types pairwise rather than splatting them into
+        # `promote_type`: a `Vector{Any}` of thousands of samples would splat
+        # thousands of type arguments and overflow the stack, because
+        # variadic `promote_type` recurses one level per argument.
+        T = mapreduce(typeof, promote_type, values)
         return T[values...]
     elseif all(v -> v isa SVector, values)
         S = typeof(first_value)
         return S[convert(S, v) for v in values]
     elseif first_value isa Tuple &&
            all(v -> v isa Tuple && length(v) == length(first_value), values)
-        T = promote_type((typeof(v[i]) for v in values for i in eachindex(first_value))...)
+        T = reduce(promote_type, (typeof(v[i]) for v in values for i in eachindex(first_value)))
         S = SVector{length(first_value),T}
         return S[S(v) for v in values]
     end
