@@ -154,31 +154,11 @@ struct TransferWorkspace{D,T}
     local_rhs::Vector{T}
 end
 
-# Allocate per-level value buffers for one side of the transfer. Mirrors
-# the per-level slot pattern in `_assembly_workspace`: index by level
-# id, size each buffer to the level's basis count and per-axis order.
-# Returns the per-level basis families alongside the buffers so the
-# transfer hot loop can dispatch `_tensor_values!` through the
-# `<side>_bases` vector instead of looking the level up each time.
-function _level_value_buffers(levels::Tuple, ::Val{D}, ::Type{T}) where {D,T}
-    n = length(levels)
-    bases = Vector{BasisFamily}(undef, n)
-    local_ids = Vector{Vector{CartesianIndex{D}}}(undef, n)
-    orders = Vector{NTuple{D,Int}}(undef, n)
-    values = Vector{Vector{T}}(undef, n)
-    val1d = Vector{NTuple{D,Vector{T}}}(undef, n)
-    for level in levels
-        i = level.id
-        ids = local_basis_indices(level.basis, level.order, level.mode)
-        bases[i] = level.basis
-        local_ids[i] = ids
-        orders[i] = level.order
-        values[i] = Vector{T}(undef, length(ids))
-        val1d[i] = _factor_buffers(level.order, T)
-    end
-    return bases, local_ids, orders, values, val1d
-end
-
+# One bank of per-level value buffers per side. The allocation is shared
+# with the standard assembler through `_level_value_buffers` (defined in
+# assembly.jl); the transfer's value-only integrals reuse exactly the
+# `bases` / `local_ids` / `orders` / `values` / `val1d` banks and skip
+# the assembler's gradient banks.
 function _transfer_workspace(source_model::Model{D,T}, target_model::Model{D,T}) where {D,T}
     s_bs, s_ids, s_ord, s_val, s_v1 = _level_value_buffers(source_model.problem.space.levels,
                                                            Val(D), T)

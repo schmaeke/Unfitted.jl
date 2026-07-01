@@ -260,18 +260,27 @@ function _intervals_from_coordinates(coords::Vector{T}, tol::GeometryTolerance{T
     return intervals
 end
 
-# Per-axis intervals on which the admissible-box partition is built. For
-# each axis, collect every participating mesh's element-boundary
-# coordinates, canonicalise them via `merge_coordinates` (so two meshes'
-# nearly-coincident coordinates collapse to a single shared boundary),
-# and turn the result into non-degenerate intervals.
+# Per-axis merged element-boundary coordinates: gather axis `d`'s
+# element-boundary coordinates from every level's mesh and canonicalise
+# them via `merge_coordinates`, so two meshes' nearly-coincident
+# boundaries collapse to a single shared coordinate. Shared by the
+# integration-region partition (`_axis_intervals`), the physical-facet
+# partition (`_boundary_facet_regions` in dirichlet.jl), and the surface
+# grid lines (`_level_grid_lines` in surface.jl).
+function _merged_axis_coordinates(levels, d::Int, tol::GeometryTolerance{T}) where {T}
+    coords = T[]
+    for level in levels
+        append!(coords, boundary_coordinates(level.mesh)[d])
+    end
+    return merge_coordinates(coords, tol)
+end
+
+# Per-axis intervals on which the admissible-box partition is built: turn
+# each axis's merged element-boundary coordinates
+# (`_merged_axis_coordinates`) into non-degenerate intervals.
 function _axis_intervals(levels::Tuple, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
     return ntuple(D) do d
-        coords = T[]
-        for level in levels
-            append!(coords, boundary_coordinates(level.mesh)[d])
-        end
-        _intervals_from_coordinates(merge_coordinates(coords, tol), tol)
+        _intervals_from_coordinates(_merged_axis_coordinates(levels, d, tol), tol)
     end
 end
 

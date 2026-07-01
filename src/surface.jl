@@ -360,13 +360,7 @@ end
 # A cell that respects this union automatically respects every
 # individual level grid, so the contract holds simultaneously.
 function _level_grid_lines(V::Space{D,T}, tol::GeometryTolerance{T}) where {D,T}
-    return ntuple(D) do d
-        coords = T[]
-        for level in V.levels
-            append!(coords, boundary_coordinates(level.mesh)[d])
-        end
-        merge_coordinates(coords, tol)
-    end
+    return ntuple(d -> _merged_axis_coordinates(V.levels, d, tol), D)
 end
 
 """

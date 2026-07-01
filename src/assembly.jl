@@ -210,8 +210,7 @@ field_gradient(::Nothing, args...) = _no_form_state()
 # until the next call.
 # (`ws` is an `AssemblyWorkspace`, defined further down this file.)
 function _region_active_dofs!(ws, model::Model, parents)
-    field_data = [[_parent_dof_data(ws, layout, parent) for parent in parents]
-                  for layout in model.dofs.fields]
+    field_data = _region_field_data(ws, model, parents)
     _local_active_dof_table!(ws, field_data, model.dofs)
     return ws.active_dofs
 end
@@ -662,19 +661,21 @@ struct AssemblyWorkspace{D,T}
     local_rhs::Vector{T}
 end
 
-# Build a fresh workspace for `model`. Sizes every per-level buffer to
-# the level's basis count and per-axis order. Called once per thread in
-# the threaded path and once per assembly call in the serial path.
-function _assembly_workspace(model::Model{D,T}) where {D,T}
-    levels = model.problem.space.levels
-    nlev = length(levels)
-    bases = Vector{BasisFamily}(undef, nlev)
-    local_ids = Vector{Vector{CartesianIndex{D}}}(undef, nlev)
-    orders = Vector{NTuple{D,Int}}(undef, nlev)
-    values = Vector{Vector{T}}(undef, nlev)
-    gradients = Vector{Vector{SVector{D,T}}}(undef, nlev)
-    val1d = Vector{NTuple{D,Vector{T}}}(undef, nlev)
-    der1d = Vector{NTuple{D,Vector{T}}}(undef, nlev)
+# Allocate the shared per-level value banks of a workspace: index by
+# level id, size each buffer to the level's basis count and per-axis
+# order. Returns the per-level basis families alongside the buffers so
+# hot loops can dispatch `_tensor_values!` through the `bases` vector
+# instead of looking each level up. Shared by `_assembly_workspace`
+# (which adds gradient / derivative-factor banks on top) and by the L²
+# transfer workspace (`_transfer_workspace` in projection.jl), whose
+# value-only integrals never need the gradient banks.
+function _level_value_buffers(levels::Tuple, ::Val{D}, ::Type{T}) where {D,T}
+    n = length(levels)
+    bases = Vector{BasisFamily}(undef, n)
+    local_ids = Vector{Vector{CartesianIndex{D}}}(undef, n)
+    orders = Vector{NTuple{D,Int}}(undef, n)
+    values = Vector{Vector{T}}(undef, n)
+    val1d = Vector{NTuple{D,Vector{T}}}(undef, n)
     for level in levels
         i = level.id
         ids = local_basis_indices(level.basis, level.order, level.mode)
@@ -682,8 +683,25 @@ function _assembly_workspace(model::Model{D,T}) where {D,T}
         local_ids[i] = ids
         orders[i] = level.order
         values[i] = Vector{T}(undef, length(ids))
-        gradients[i] = Vector{SVector{D,T}}(undef, length(ids))
         val1d[i] = _factor_buffers(level.order, T)
+    end
+    return bases, local_ids, orders, values, val1d
+end
+
+# Build a fresh workspace for `model`. Reuses `_level_value_buffers` for
+# the shared value banks, then adds the assembly-only gradient and
+# derivative-factor banks (sized to the same per-level basis count).
+# Called once per thread in the threaded path and once per assembly call
+# in the serial path.
+function _assembly_workspace(model::Model{D,T}) where {D,T}
+    levels = model.problem.space.levels
+    bases, local_ids, orders, values, val1d = _level_value_buffers(levels, Val(D), T)
+    nlev = length(levels)
+    gradients = Vector{Vector{SVector{D,T}}}(undef, nlev)
+    der1d = Vector{NTuple{D,Vector{T}}}(undef, nlev)
+    for level in levels
+        i = level.id
+        gradients[i] = Vector{SVector{D,T}}(undef, length(values[i]))
         der1d[i] = _factor_buffers(level.order, T)
     end
     return AssemblyWorkspace{D,T}(bases, local_ids, orders, values, gradients, val1d, der1d, Int[],
@@ -701,6 +719,18 @@ function _parent_dof_data(ws::AssemblyWorkspace{D,T}, layout::FieldLayout{D,T},
     lvl = parent.level
     raw_dofs = cell_dofs(layout.dofs, lvl, parent.cell)
     return (; level=lvl, raw_dofs, values=ws.values[lvl], gradients=ws.gradients[lvl])
+end
+
+# Per-field, per-parent dof-data table for one region: for every field
+# layout, the slim `_parent_dof_data` record of each covering parent
+# (basis values / gradients alias the workspace level buffers; only the
+# field's raw dof ids are materialised). Shared by the symbolic pattern
+# pass (`_region_active_dofs!`), the numeric per-region setup
+# (`_region_workspace_setup!`), and the quadrature-point walk
+# (`foreach_quadrature_point`), which each need the same nested table.
+function _region_field_data(ws::AssemblyWorkspace, model::Model, parents)
+    return [[_parent_dof_data(ws, layout, parent) for parent in parents]
+            for layout in model.dofs.fields]
 end
 
 # Evaluate basis values and physical gradients once per level present in
@@ -902,8 +932,7 @@ end
 # per call rather than cached; re-profile before reconsidering.
 function _region_workspace_setup!(ws::AssemblyWorkspace{D,T}, model::Model{D,T}, parents,
                                   state_coefficients, have_blocks::Bool) where {D,T}
-    field_data = [[_parent_dof_data(ws, layout, parent) for parent in parents]
-                  for layout in model.dofs.fields]
+    field_data = _region_field_data(ws, model, parents)
     local_by_field = _local_active_dof_table!(ws, field_data, model.dofs)
     state = state_coefficients === nothing ? nothing :
             FormState(field_data, model.dofs, state_coefficients)
@@ -1513,8 +1542,7 @@ function foreach_quadrature_point(f, model::Model{D,T}; state=nothing) where {D,
         offset = offsets[region_index]
         jacobian = volume(region.box) / convert(T, 2^D)
         st = coefficients === nothing ? nothing :
-             FormState([[_parent_dof_data(ws, layout, parent) for parent in region.parents]
-                        for layout in model.dofs.fields], model.dofs, coefficients)
+             FormState(_region_field_data(ws, model, region.parents), model.dofs, coefficients)
         for (local_qp, (eta, weight)) in
             enumerate(zip(region.quadrature.points, region.quadrature.weights))
             coefficients === nothing || _update_region_basis!(ws, region, eta)

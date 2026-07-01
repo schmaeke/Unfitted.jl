@@ -346,11 +346,7 @@ function _boundary_facet_regions(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}
     # Per-axis intervals along the free axes, mirroring
     # `_axis_intervals` from intersections.jl.
     intervals = map(free_axes) do d
-        coords = T[]
-        for level in touching_levels
-            append!(coords, boundary_coordinates(level.mesh)[d])
-        end
-        _intervals_from_coordinates(merge_coordinates(coords, tol), tol)
+        _intervals_from_coordinates(_merged_axis_coordinates(touching_levels, d, tol), tol)
     end
 
     ranges = Tuple(length(intervals[i]) for i in eachindex(intervals))
