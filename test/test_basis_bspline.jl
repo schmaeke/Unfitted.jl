@@ -173,6 +173,11 @@ end
     model = prepare(problem)
     solution = solve!(model)
     @test active_unknowns(model.dofs) > 0
+    # The C¹ corner cascade yields a hugely ill-conditioned system (cond ≈ 3e16,
+    # at the edge of numerical singularity), so whether the direct solve lands a
+    # clean pivot is decided by roundoff at the last bit. The threaded scatter is
+    # BIT-IDENTICAL to serial (deferred compute→gather sums each slot in serial
+    # order), so this residual check is well-posed under any thread count.
     @test diagnostics(model, solution).residual_norm < 1.0e-10
     @test isfinite(value(solution, model, u, (0.5, 0.5)))
 end

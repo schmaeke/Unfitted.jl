@@ -179,12 +179,24 @@ end
 # of `on=` selectors rebuilds rather than reusing a stale pattern.
 # Defined here (rather than in `assembly.jl`) because it is cached on the
 # `Model` and this file is included first.
+#
+# `gather_cache` memoises the threaded scatter's per-region-list `GatherPlan`
+# (the deferred compute→gather layout built by `assembly.jl`), keyed by the
+# region list's `objectid`. It lives on the pattern so it is invalidated for
+# free: a structural change drops `model.pattern`, and the fresh pattern
+# starts with an empty cache. Typed `Any` because `GatherPlan` is defined in
+# `assembly.jl` (included after this file); retrieval goes through a function
+# barrier, so the hot loop stays type-stable.
 struct AssemblyPattern
     n::Int
     colptr::Vector{Int}
     rowval::Vector{Int}
     symmetric::Bool
     key::UInt
+    gather_cache::Dict{UInt,Any}
+end
+function AssemblyPattern(n, colptr, rowval, symmetric, key)
+    AssemblyPattern(n, colptr, rowval, symmetric, key, Dict{UInt,Any}())
 end
 
 """

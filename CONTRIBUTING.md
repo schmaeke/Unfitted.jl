@@ -804,14 +804,24 @@ Rules:
 
   - Parallelize over independent integration regions, elements, or
     batches.
-  - Use thread-local buffers for the sparse scatter and local matrices;
-    reduce after threaded loops.
-  - Do not push into a shared vector from multiple threads without
-    explicit synchronization; prefer thread-local storage.
-  - Avoid locks in hot assembly loops.
-  - Preserve deterministic results where practical. If threaded
-    assembly changes ordering, numerical differences should remain at
-    roundoff scale and tests should allow appropriate tolerances.
+  - The threaded matrix assembly is a deferred compute→gather: phase 1
+    computes each region's local block and rhs into its OWN disjoint
+    arena slice (no shared writes, dynamically load-balanced); phase 2
+    sums the arena into the sparse operator by a disjoint column
+    partition and into the rhs by a disjoint dof partition. Both phases
+    are barrier-free and lock-free, and the symbolic gather layout is
+    cached on the pattern so repeated assembly pays for it once.
+  - Do not push into a shared vector from multiple threads without a
+    disjoint-output partition or explicit synchronization; prefer arena
+    slices reduced by a fixed-order gather over thread-local accumulators
+    (whose peak memory scales with the thread count).
+  - Avoid locks AND atomics in hot assembly loops. A racy atomic scatter
+    is nondeterministic and was measured to corrupt the solve of an
+    ill-conditioned (cond ≈ 3e16) system; a fixed-order gather does not.
+  - Threaded assembly is **bit-identical to serial**: every slot is
+    summed in the serial (region, row) order, so results are reproducible
+    run-to-run and independent of the thread count. Tests may assert
+    equality, not merely a roundoff tolerance.
 
 ### Allocation guidelines
 

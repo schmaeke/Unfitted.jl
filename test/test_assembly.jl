@@ -102,13 +102,32 @@ end
                       dirichlet=[dirichlet(0.0; on=boundary(:all))])
     serial_model = prepare(problem)
     threaded_model = prepare(problem)
+    reassembled = prepare(problem)
 
     assemble!(serial_model; threaded=false)
     assemble!(threaded_model; threaded=true)
 
-    @test Matrix(threaded_model.matrix) ≈ Matrix(serial_model.matrix) rtol = 1.0e-12 atol = 1.0e-12
-    @test threaded_model.rhs ≈ serial_model.rhs rtol = 1.0e-12 atol = 1.0e-12
+    # The deferred compute→gather scatter sums every slot in serial (region,
+    # row) order, so threaded assembly is BIT-IDENTICAL to serial, not merely
+    # close — a stronger guarantee than CONTRIBUTING's roundoff tolerance.
+    @test Matrix(threaded_model.matrix) == Matrix(serial_model.matrix)
+    @test threaded_model.rhs == serial_model.rhs
     @test diagnostics(threaded_model).symmetry_residual ≈ 0.0 atol = 1.0e-13
+
+    # A second threaded assembly reuses the cached gather plan and must give
+    # the identical result (determinism + cache correctness).
+    assemble!(reassembled; threaded=true)
+    assemble!(reassembled; threaded=true)
+    @test Matrix(reassembled.matrix) == Matrix(serial_model.matrix)
+    @test reassembled.rhs == serial_model.rhs
+
+    # rhs-only threaded pass (the `nothing` matrix sink): assemble_vector
+    # defers each region's rhs to an arena and gathers it by dof in serial
+    # order, so it too is bit-identical to the serial walk.
+    load = loadform(field(:u, V),
+                    WeakForm(bilinear=(q, trial) -> 0.0, linear=q -> 1.0, symmetric=false))
+    @test assemble_vector(serial_model, load; threaded=true) ==
+          assemble_vector(serial_model, load; threaded=false)
 end
 
 @testset "poisson accepts scalar and tensor coefficients" begin
@@ -565,8 +584,9 @@ end
 # fixture, with no second method to compare against:
 #   * deterministic — repeated serial assembly is bit-identical (also
 #     exercises the cached pattern on the second call);
-#   * threaded matches serial to a roundoff tolerance (the documented
-#     reduction-order difference);
+#   * threaded assembly is bit-identical to serial — the deferred
+#     compute→gather sums every slot in serial order, so `==` holds on every
+#     fixture (a stronger guarantee than a roundoff tolerance);
 #   * no explicit stored zeros survive (the `dropzeros!` contract — proves
 #     the dense-block pattern collapses to the true nonzeros);
 #   * symmetric forms produce a structurally symmetric matrix.
@@ -577,7 +597,7 @@ function _check_scatter_matrix(model, blocks; symmetric=nothing)
     @test assemble_matrix(model, blocks; symmetric=symmetric, threaded=false) == serial
     @test !any(iszero, nonzeros(serial))       # dropzeros! contract: no stored zeros
     threaded = assemble_matrix(model, blocks; symmetric=symmetric, threaded=true)
-    @test threaded ≈ serial rtol = 1.0e-12 atol = 1.0e-12
+    @test threaded == serial
     return serial
 end
 
@@ -590,7 +610,7 @@ function _check_scatter_assemble!(model)
     @test !any(iszero, nonzeros(serial))       # dropzeros! contract: no stored zeros
     model.problem.symmetric && @test issymmetric(serial)
     assemble!(model; threaded=true)
-    @test model.matrix ≈ serial rtol = 1.0e-12 atol = 1.0e-12
+    @test model.matrix == serial
     return model
 end
 

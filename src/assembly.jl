@@ -534,22 +534,6 @@ struct ScatterSink{T}
     pattern::AssemblyPattern
 end
 
-# A fresh, empty accumulator with the same destination shape — used by
-# the threaded driver to give each task its own buffer before reducing.
-_empty_like(::Nothing) = nothing
-function _empty_like(sink::ScatterSink{T}) where {T}
-    ScatterSink(zeros(T, length(sink.nzval)), sink.pattern)
-end
-
-# Reduce a per-task sink into the shared one by summing the `nzval`
-# accumulators. The threaded path is held to a tolerance, not bit
-# identity, so the summation order is unconstrained.
-_merge_sink!(::Nothing, ::Nothing) = nothing
-function _merge_sink!(dst::ScatterSink, src::ScatterSink)
-    dst.nzval .+= src.nzval
-    return dst
-end
-
 # Raised when the numeric scatter targets a `(row, col)` the prebuilt
 # pattern does not contain — impossible unless the symbolic and numeric
 # passes disagree about a region's active dofs. Erroring here turns a
@@ -927,9 +911,10 @@ end
 # considered. Profiling on helios (32C; 2D order-3/4 and 3D order-3 base+overlay)
 # measured it at only ~0.9% / ~0.1% of repeated-`assemble!` wall time and
 # ≤2.3% of allocation — the hot path is the irreducible `O(Q·n²)` numeric kernel
-# (`_accumulate_qpoint_generic!`), and the threaded GC ceiling comes from the
-# per-task `nzval` scatter accumulators, not from this setup. So it is rebuilt
-# per call rather than cached; re-profile before reconsidering.
+# (`_accumulate_qpoint_generic!`), and the threaded scatter's working memory is
+# the flat, pooled compute→gather arena (thread-count-independent), not this
+# setup. So it is rebuilt per call rather than cached; re-profile before
+# reconsidering.
 function _region_workspace_setup!(ws::AssemblyWorkspace{D,T}, model::Model{D,T}, parents,
                                   state_coefficients, have_blocks::Bool) where {D,T}
     field_data = _region_field_data(ws, model, parents)
@@ -1205,52 +1190,325 @@ function _assemble_system_serial!(sink, rhs::Vector{T}, model::Model{D,T}, regio
     return nothing
 end
 
-# Threaded assembly driver: spawn `Threads.nthreads()` tasks, each with
-# its own workspace and a fresh per-task sink / rhs (`_empty_like`).
-# Distribute regions in a striped pattern
-# (`region_index in task_id:task_count:nregions`) so every task
-# processes a uniform sample of the list. After all tasks complete,
-# reduce the per-task accumulators into the shared sink / rhs by summing
-# the `nzval` buffers (`_merge_sink!`). The reduction order is
-# deterministic but the floating-point sum order differs from the serial
-# walk, so the threaded result matches serial to a tolerance, not
-# bit-for-bit (documented in CONTRIBUTING's threading rule).
+# ── Deferred compute→gather threaded scatter ──────────────────────────────────
 #
-# Memory: each task holds its own full-length `nzval` accumulator, so the
-# threaded peak is `(nthreads + 1) × nnz` of scatter buffers versus the
-# serial path's `1 × nnz`. This is a bounded multiplier (not the COO
-# over-count this assembly replaced), but on memory-bound large-3D runs
-# capping the thread count trades parallelism for footprint. A lock-free
-# colour-partitioned scatter into one shared `nzval` would restore the
-# `1×` peak at much higher complexity and is intentionally not done here.
+# The threaded matrix assembly decouples the region-parallel numeric work from
+# the slot accumulation so both phases run barrier-free:
 #
-# Region-kind-agnostic: the `regions` iterable can be a volume plan's
-# region vector or a facet selector's region list.
+#   Phase 1 — every region computes its dense local block + local rhs and
+#     stores them into its OWN disjoint slice of a flat arena (region-indexed).
+#     No two regions write the same memory, so this is embarrassingly parallel
+#     (dynamically load-balanced), with no colouring and no per-colour barrier.
+#   Phase 2 — a `GatherPlan` (built once, symbolically, and cached on the
+#     pattern) sums the arena into `nzval` by a disjoint column partition and
+#     into `rhs` by a disjoint dof partition. Each output slot has a single
+#     writer, so again no atomics and no barrier between regions.
+#
+# Peak matrix memory is `1 × nnz` plus the flat arena (Σ local-block entries,
+# independent of thread count). Because every slot's contributions are summed
+# in a fixed (region, row) order — the SAME order the serial walk uses — the
+# threaded result is not just deterministic run-to-run but BIT-IDENTICAL to
+# serial assembly, which removes the accumulation-order roundoff sensitivity a
+# colour- or atomic-ordered scatter would leave on ill-conditioned systems.
+# Works for any element type (plain `+=`). The symbolic plan is the only
+# expensive part (a `searchsortedfirst` per contribution); caching it makes
+# repeated assembly — Newton tangents, transient steps, moving overlays — pay
+# it once.
+
+# Cached symbolic layout for one region list against one pattern. Matrix side:
+# `region_arena[r]..region_arena[r+1]-1` is region r's arena slice; the column
+# buckets (`ccolptr`, `cslot`, `csrc`) list, per column, the (nzval slot,
+# arena index) contributions in serial order. RHS side mirrors it by dof
+# (`region_rhs`, `drowptr`, `dsrc`). Matrix arrays are empty for the rhs-only
+# (`nothing` sink) pass.
+struct GatherPlan
+    arena_len::Int
+    region_arena::Vector{Int}
+    ccolptr::Vector{Int}
+    cslot::Vector{Int}
+    csrc::Vector{Int}
+    rhs_len::Int
+    region_rhs::Vector{Int}
+    drowptr::Vector{Int}
+    dsrc::Vector{Int}
+end
+
+# Phase-1 sink: deposit a region's local block + rhs into its arena slices
+# instead of scattering. `pos` / `rhs_pos` are set to the region's offsets
+# before each `_assemble_region!` and advance as entries are written, in the
+# exact structural order `_build_gather` enumerated (column-major, lower
+# triangle row≥col when symmetric).
+mutable struct ArenaSink{T}
+    arena::Vector{T}
+    symmetric::Bool
+    pos::Int
+    rhs_pos::Int
+end
+
+function _emit_matrix!(sink::ArenaSink{T}, active_dofs::AbstractVector{Int},
+                       local_matrix::AbstractMatrix{T}) where {T}
+    isempty(local_matrix) && return nothing
+    sym = sink.symmetric
+    arena = sink.arena
+    p = sink.pos
+    @inbounds for lc in axes(local_matrix, 2)
+        col = active_dofs[lc]
+        for lr in axes(local_matrix, 1)
+            (sym && active_dofs[lr] < col) && continue
+            arena[p] = local_matrix[lr, lc]
+            p += 1
+        end
+    end
+    sink.pos = p
+    return nothing
+end
+
+# Store `local_rhs` into the region's rhs-arena slice (gathered by dof in
+# phase 2) rather than scattering it into a shared vector, then defer the
+# matrix block to `_emit_matrix!`.
+function _emit_local_system!(sink::ArenaSink{T}, rhs_arena::Vector{T},
+                             active_dofs::AbstractVector{Int}, local_matrix::AbstractMatrix{T},
+                             local_rhs::AbstractVector{T}) where {T}
+    p = sink.rhs_pos
+    @inbounds for lr in eachindex(active_dofs)
+        rhs_arena[p] = local_rhs[lr]
+        p += 1
+    end
+    sink.rhs_pos = p
+    _emit_matrix!(sink, active_dofs, local_matrix)
+    return nothing
+end
+
+# Build the symbolic gather plan for `regions` against `pattern` (or `nothing`
+# for the rhs-only pass). Walks every region once, resolving each structural
+# entry's `nzval` slot via `searchsortedfirst` (identical lookup to the serial
+# `_emit_matrix!`) and bucketing contributions by column (matrix) and dof
+# (rhs) in region order, so the phase-2 gather reproduces the serial sum.
+function _build_gather(model::Model, regions, pattern, symmetric::Bool, nactive::Int)
+    ws = _assembly_workspace(model)
+    nreg = length(regions)
+    has_matrix = pattern !== nothing
+    n = has_matrix ? pattern.n : 0
+    region_arena = Vector{Int}(undef, nreg + 1)
+    region_rhs = Vector{Int}(undef, nreg + 1)
+    region_arena[1] = 1
+    region_rhs[1] = 1
+    bslot = [Int[] for _ in 1:n]
+    bsrc = [Int[] for _ in 1:n]
+    ddst = [Int[] for _ in 1:nactive]
+    for (r, region) in enumerate(regions)
+        ad = copy(_region_active_dofs!(ws, model, region.parents))
+        ri = region_rhs[r]
+        @inbounds for lr in eachindex(ad)
+            push!(ddst[ad[lr]], ri)
+            ri += 1
+        end
+        region_rhs[r+1] = ri
+        ai = region_arena[r]
+        if has_matrix
+            colptr = pattern.colptr
+            rowval = pattern.rowval
+            # Enumerated in byte-for-byte lockstep with `_emit_matrix!(::ArenaSink)`
+            # (column-major, lower triangle when symmetric): the arena index `ai`
+            # advances here exactly as that sink's write cursor `p` does at
+            # assembly time, so `arena[csrc[k]]` is the value for slot `cslot[k]`
+            # — the source of the bit-identical-to-serial guarantee. The miss
+            # check mirrors the serial `_emit_matrix!(::ScatterSink)`: a
+            # symbolic/numeric dof disagreement raises here rather than pushing an
+            # out-of-range slot that would later corrupt a neighbouring column and
+            # break phase 2's column-disjointness.
+            @inbounds for lc in eachindex(ad)
+                col = ad[lc]
+                lo = colptr[col]
+                hi = colptr[col+1] - 1
+                for lr in eachindex(ad)
+                    row = ad[lr]
+                    (symmetric && row < col) && continue
+                    slot = searchsortedfirst(rowval, row, lo, hi, Base.Order.Forward)
+                    (slot <= hi && rowval[slot] == row) || _scatter_pattern_miss(row, col)
+                    push!(bslot[col], slot)
+                    push!(bsrc[col], ai)
+                    ai += 1
+                end
+            end
+        end
+        region_arena[r+1] = ai
+    end
+    ccolptr = _csr_ptr(bslot)                    # bslot / bsrc are pushed in lockstep,
+    cslot = _csr_flatten(bslot, ccolptr)         # so they share one pointer array
+    csrc = _csr_flatten(bsrc, ccolptr)
+    drowptr = _csr_ptr(ddst)
+    dsrc = _csr_flatten(ddst, drowptr)
+    return GatherPlan(region_arena[nreg+1] - 1, region_arena, ccolptr, cslot, csrc,
+                      region_rhs[nreg+1] - 1, region_rhs, drowptr, dsrc)
+end
+
+# CSR pointer array (length n+1) from a vector of buckets: `ptr[j]..ptr[j+1]-1`
+# is bucket j's slice in the flattened array.
+function _csr_ptr(buckets)
+    ptr = Vector{Int}(undef, length(buckets) + 1)
+    ptr[1] = 1
+    @inbounds for j in eachindex(buckets)
+        ptr[j+1] = ptr[j] + length(buckets[j])
+    end
+    return ptr
+end
+
+# Flatten a bucket vector into a dense array laid out by the CSR `ptr`. Bucket
+# vectors pushed in lockstep (a slot and its arena index) reuse one `ptr`.
+function _csr_flatten(buckets, ptr)
+    out = Vector{Int}(undef, ptr[end] - 1)
+    @inbounds for j in eachindex(buckets)
+        off = ptr[j] - 1
+        b = buckets[j]
+        for k in eachindex(b)
+            out[off+k] = b[k]
+        end
+    end
+    return out
+end
+
+# Return the cached `GatherPlan` for `regions`, building and memoising it on
+# the pattern on first use (keyed by the region list's identity). The rhs-only
+# pass has no pattern to cache on, so it always rebuilds — assemble_vector is
+# rare and its plan skips the matrix `searchsortedfirst`.
+function _gather_plan!(pattern::AssemblyPattern, model, regions, symmetric::Bool, nactive::Int)
+    key = objectid(regions)
+    cached = get(pattern.gather_cache, key, nothing)
+    cached === nothing || return cached::GatherPlan
+    plan = _build_gather(model, regions, pattern, symmetric, nactive)
+    pattern.gather_cache[key] = plan
+    return plan
+end
+
+# Pooled phase-1 arena buffer, reused across repeated assembly. Kept in the
+# pattern's cache (alongside its `GatherPlan`) so it is invalidated with the
+# structure; the trailing `::Vector{T}` is the function barrier that recovers
+# the concrete type from the `Any`-valued cache. Only used on the fully
+# overwritten block path (see the caller), so a stale buffer is never read.
+function _gather_arena!(pattern::AssemblyPattern, key::UInt, ::Type{T}, len::Int) where {T}
+    return get!(() -> Vector{T}(undef, len), pattern.gather_cache, key)::Vector{T}
+end
+
+# Partition `1:m` into `task_count` contiguous ranges of roughly equal total
+# contribution count (`ptr` is a CSR offset array of length `m+1`). Contiguous
+# by construction, so the ranges own disjoint output slots.
+function _balanced_ranges(ptr::Vector{Int}, m::Int, total::Int, task_count::Int)
+    ranges = Vector{UnitRange{Int}}(undef, task_count)
+    i = 1
+    for t in 1:task_count
+        lo = i
+        cut = div(t * total, task_count)
+        while i <= m && (ptr[i+1] - 1) < cut
+            i += 1
+        end
+        hi = min(i, m)
+        ranges[t] = lo:hi
+        i = hi + 1
+    end
+    return ranges
+end
+
+# Phase 2 (matrix): sum the arena into `nzval` by a disjoint column partition.
+function _gather_matrix!(nzval::Vector{T}, plan::GatherPlan, arena::Vector{T},
+                         task_count::Int) where {T}
+    ccolptr = plan.ccolptr
+    cslot = plan.cslot
+    csrc = plan.csrc
+    n = length(ccolptr) - 1
+    total = ccolptr[n+1] - 1
+    ranges = _balanced_ranges(ccolptr, n, total, task_count)
+    @sync for rg in ranges
+        Threads.@spawn @inbounds for j in rg, k in ccolptr[j]:(ccolptr[j+1]-1)
+            nzval[cslot[k]] += arena[csrc[k]]
+        end
+    end
+    return nothing
+end
+
+# Phase 2 (rhs): sum the rhs-arena into `rhs` by a disjoint dof partition.
+function _gather_rhs!(rhs::Vector{T}, plan::GatherPlan, rhs_arena::Vector{T},
+                      task_count::Int) where {T}
+    drowptr = plan.drowptr
+    dsrc = plan.dsrc
+    nactive = length(drowptr) - 1
+    total = drowptr[nactive+1] - 1
+    ranges = _balanced_ranges(drowptr, nactive, total, task_count)
+    @sync for rg in ranges
+        Threads.@spawn @inbounds for d in rg, k in drowptr[d]:(drowptr[d+1]-1)
+            rhs[d] += rhs_arena[dsrc[k]]
+        end
+    end
+    return nothing
+end
+
+# Threaded assembly driver (deferred compute→gather; see the block comment
+# above `GatherPlan`). Phase 1 dynamically load-balances the regions across
+# `nthreads` tasks — each grabs the next region via an atomic counter and
+# deposits its local block / rhs into that region's disjoint arena slice
+# (`ArenaSink`), so there is no write contention and no barrier. Phase 2 sums
+# the arenas into the shared `sink.nzval` / `rhs` by disjoint column / dof
+# partitions. The symbolic `GatherPlan` is cached on the pattern.
+#
+# Region-kind-agnostic: `regions` may be a volume plan's region vector or a
+# facet selector's region list. The rhs-only pass (`sink === nothing`, from
+# `assemble_vector`) has no pattern; its plan carries only the rhs layout and
+# phase 2 gathers just the rhs.
 function _assemble_system_threaded!(sink, rhs::Vector{T}, model::Model{D,T}, regions,
                                     symmetric::Bool, blocks, loads, region_filter,
                                     state_coefficients) where {D,T}
     task_count = Threads.nthreads()
     offsets = _region_qpoint_offsets(regions)
-    n_regions = length(regions)
+    nreg = length(regions)
     nactive = length(rhs)
-    tasks = map(1:task_count) do task_id
-        Threads.@spawn begin
-            local_sink = _empty_like(sink)
-            local_rhs = zeros(T, nactive)
-            ws = _assembly_workspace(model)
-            for region_index in task_id:task_count:n_regions
-                region = regions[region_index]
-                region_filter === nothing || region_filter(region) || continue
-                _assemble_region!(ws, local_sink, local_rhs, model, region, blocks, loads,
-                                  symmetric, state_coefficients, offsets[region_index])
-            end
-            return local_sink, local_rhs
+    # A pass with no bilinear blocks (e.g. a load-only problem, or `assemble_vector`
+    # with its `nothing` sink) has no matrix to gather — its pattern is empty, so
+    # build the plan on the rhs layout alone and skip the matrix phase.
+    pattern = sink === nothing ? nothing : sink.pattern
+    has_matrix = pattern !== nothing && !isempty(blocks)
+    plan = has_matrix ? _gather_plan!(pattern, model, regions, symmetric, nactive) :
+           _build_gather(model, regions, nothing, symmetric, nactive)
+
+    # On the block path with no `region_filter` every arena slot is overwritten
+    # in phase 1, so the buffers can be POOLED on the pattern — repeated assembly
+    # (Newton tangents, transient steps) then reuses them instead of allocating
+    # ~`nnz` of arena per call, and the pool is dropped for free when the pattern
+    # rebuilds. `region_filter` (compact loads) skips regions, leaving their
+    # slices unwritten, so that path allocates fresh and zeroes; the rhs-only
+    # pass has no pattern to pool on.
+    if has_matrix && region_filter === nothing
+        rid = objectid(regions)
+        arena = _gather_arena!(pattern, hash(:arena, rid), T, plan.arena_len)
+        rhs_arena = _gather_arena!(pattern, hash(:rhs_arena, rid), T, plan.rhs_len)
+    else
+        arena = Vector{T}(undef, plan.arena_len)
+        rhs_arena = Vector{T}(undef, plan.rhs_len)
+        if region_filter !== nothing
+            fill!(arena, zero(T))
+            fill!(rhs_arena, zero(T))
         end
     end
-    for (local_sink, local_rhs) in fetch.(tasks)
-        _merge_sink!(sink, local_sink)
-        rhs .+= local_rhs
+
+    next = Threads.Atomic{Int}(0)
+    @sync for _ in 1:task_count
+        Threads.@spawn begin
+            ws = _assembly_workspace(model)
+            asink = ArenaSink{T}(arena, symmetric, 1, 1)
+            while true
+                region_index = Threads.atomic_add!(next, 1) + 1
+                region_index > nreg && break
+                region = regions[region_index]
+                region_filter === nothing || region_filter(region) || continue
+                asink.pos = plan.region_arena[region_index]
+                asink.rhs_pos = plan.region_rhs[region_index]
+                _assemble_region!(ws, asink, rhs_arena, model, region, blocks, loads, symmetric,
+                                  state_coefficients, offsets[region_index])
+            end
+        end
     end
+
+    has_matrix && _gather_matrix!(sink.nzval, plan, arena, task_count)
+    _gather_rhs!(rhs, plan, rhs_arena, task_count)
     return nothing
 end
 
@@ -1259,9 +1517,9 @@ end
 # `on => (blocks, loads)` grouping every non-volume form by its tag,
 # so one assembly pass per unique `on` value handles every
 # contribution carrying that tag. Iteration order of the dict is
-# insertion order under Julia's Dict (stable per-run), which is
-# enough for deterministic threaded-vs-serial behaviour modulo the
-# existing roundoff contract.
+# insertion order under Julia's Dict (stable per-run), so serial and
+# threaded assembly walk the passes in the same order — part of why the
+# threaded result is bit-identical to serial, not merely close.
 function _partition_forms_by_on(blocks, loads)
     volume_blocks = filter(b -> b.on === nothing, blocks)
     volume_loads = filter(l -> l.on === nothing, loads)
