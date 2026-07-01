@@ -121,7 +121,7 @@ end
 """
     TransferWorkspace{D,T}
 
-Per-region scratch for the L² projection hot loop. Mirrors
+Per-region scratch for the L² projection source-driven rhs pass. Mirrors
 [`AssemblyWorkspace`](@ref) but is value-only (no gradient banks):
 projection integrals contract basis values against basis values, never
 gradients.
@@ -132,9 +132,11 @@ update writes into the side's `values[parent.level]` buffer; since
 `_parents_covering` returns at most one parent per level, the in-place
 update never collides within a region.
 
-The trailing `active_dofs` / `local_by_global` / `local_matrix` /
-`local_rhs` fields are the per-region scatter scratch — resized and reset
-in place every region, never reallocated.
+The trailing `active_dofs` / `local_by_global` / `local_rhs` fields are
+the per-region rhs scatter scratch — resized and reset in place every
+region, never reallocated. The target mass matrix and its Dirichlet lift
+are built by the standard assembler (see [`transfer`](@ref)), so this
+workspace carries no local-matrix bank.
 """
 struct TransferWorkspace{D,T}
     source_bases::Vector{BasisFamily}
@@ -149,7 +151,6 @@ struct TransferWorkspace{D,T}
     target_val1d::Vector{NTuple{D,Vector{T}}}
     active_dofs::Vector{Int}
     local_by_global::Dict{Int,Int}
-    local_matrix::Vector{T}
     local_rhs::Vector{T}
 end
 
@@ -184,7 +185,7 @@ function _transfer_workspace(source_model::Model{D,T}, target_model::Model{D,T})
     t_bs, t_ids, t_ord, t_val, t_v1 = _level_value_buffers(target_model.problem.space.levels,
                                                            Val(D), T)
     return TransferWorkspace{D,T}(s_bs, s_ids, s_ord, s_val, s_v1, t_bs, t_ids, t_ord, t_val, t_v1,
-                                  Int[], Dict{Int,Int}(), T[], T[])
+                                  Int[], Dict{Int,Int}(), T[])
 end
 
 # Slim per-parent record aliasing the workspace value buffer (no
@@ -219,111 +220,16 @@ function _update_transfer_basis!(ws::TransferWorkspace{D,T}, region::TransferReg
     return nothing
 end
 
-# ── L² projection hot loop ───────────────────────────────────────────────────
-
-# Assemble one region's contribution to the target-side L² projection
-# system. For each target field (`target_layout`), the bilinear and
-# linear contributions are
-#
-#     M_ij  += ∫_box  φ_iᵀ φ_jᵀ dx,         (target mass matrix)
-#     b_i   += ∫_box  u_S(x) · φ_iᵀ dx,      (RHS from the source field)
-#
-# where `φᵀ` are the target basis functions and `u_S` is the source
-# field reconstructed from its coefficients on the region's source
-# parents.
-#
-# Loop structure (mirrors `_assemble_region!` in `assembly.jl`):
-#
-#   1. Build per-parent records on both sides; reset the per-region
-#      local-to-global dof table; resize the local matrix / rhs.
-#   2. For each quadrature point: update basis values, then iterate
-#      components × (test parent × test dof) for the rhs, and
-#      additionally components × (trial parent × trial dof) ×
-#      (test parent × test dof) for the symmetric mass matrix.
-#   3. Apply Dirichlet column elimination on constrained target dofs
-#      (their projected value is pinned by the target's dof layout —
-#      shift the contribution to the rhs scaled by the stored value).
-#   4. Scatter the local system into the mass sink and rhs.
-#
-# Accumulate one component's transfer contribution at one quadrature
-# point. The target mass matrix `∫ φᵀ_i φᵀ_j` is structurally a symmetric
-# bilinear block and the source rhs `∫ u_S φᵀ_i` a linear load, so this
-# reuses the assembly kernels `_emit_load!`, `_emit_block!`, and
-# `_trial_block_context` (in `assembly.jl`) verbatim — only the per-point
-# entry value (`trial_value · test_value`) differs from a general weak
-# form. Two thin overloads provide the per-point dispatch barrier on the
-# concrete `local_by_parent` table type (`LocalDofExpansion` vs
-# `Matrix{Int}`); the shared body specialises through them.
-function _transfer_qpoint!(local_matrix, local_rhs, target_data, source_data,
-                           local_by_parent::AbstractVector{<:LocalDofExpansion}, target_layout,
-                           source_layout, source_coefficients, active_dofs::Vector{Int}, qweight::T,
-                           component::Int, has_source::Bool,
-                           ::Val{AssembleMass}) where {T,AssembleMass}
-    return _transfer_qpoint_generic!(local_matrix, local_rhs, target_data, source_data,
-                                     local_by_parent, target_layout, source_layout,
-                                     source_coefficients, active_dofs, qweight, component,
-                                     has_source, Val(AssembleMass))
-end
-
-function _transfer_qpoint!(local_matrix, local_rhs, target_data, source_data,
-                           local_by_parent::AbstractVector{Matrix{Int}}, target_layout,
-                           source_layout, source_coefficients, active_dofs::Vector{Int}, qweight::T,
-                           component::Int, has_source::Bool,
-                           ::Val{AssembleMass}) where {T,AssembleMass}
-    return _transfer_qpoint_generic!(local_matrix, local_rhs, target_data, source_data,
-                                     local_by_parent, target_layout, source_layout,
-                                     source_coefficients, active_dofs, qweight, component,
-                                     has_source, Val(AssembleMass))
-end
-
-function _transfer_qpoint_generic!(local_matrix, local_rhs, target_data, source_data,
-                                   local_by_parent, target_layout, source_layout,
-                                   source_coefficients, active_dofs::Vector{Int}, qweight::T,
-                                   component::Int, has_source::Bool,
-                                   ::Val{AssembleMass}) where {T,AssembleMass}
-    # RHS: reconstruct the source value and integrate against target
-    # traces (a linear load). Skipped when the region has no source
-    # coverage (`u_S ≡ 0`).
-    if has_source
-        source_value = _field_value(source_data, source_layout, source_coefficients, component)
-        for (test_data, table) in zip(target_data, local_by_parent)
-            for a in eachindex(test_data.raw_dofs)
-                contribution = qweight * source_value * test_data.values[a]
-                _emit_load!(local_rhs, table, a, component, contribution)
-            end
-        end
-    end
-
-    # Mass matrix: target trace × target trace, a symmetric bilinear
-    # block. Emit only the lower triangle (mirrored at the global stage);
-    # constrained trial columns move to the rhs via Dirichlet elimination.
-    if AssembleMass
-        for (trial_data, trial_table) in zip(target_data, local_by_parent)
-            for b in eachindex(trial_data.raw_dofs)
-                trial_value = trial_data.values[b]
-                tctx = _trial_block_context(trial_table, trial_data, target_layout, b, component)
-                for (test_data, test_table) in zip(target_data, local_by_parent)
-                    for a in eachindex(test_data.raw_dofs)
-                        entry = qweight * trial_value * test_data.values[a]
-                        _emit_block!(local_matrix, local_rhs, test_table, test_data, target_layout,
-                                     tctx, a, component, entry, true, active_dofs)
-                    end
-                end
-            end
-        end
-    end
-    return nothing
-end
+# ── L² projection source-driven rhs ──────────────────────────────────────────
 
 # Build the per-parent target dof-table for one (transfer region, field),
 # resetting the workspace's `active_dofs` / `local_by_global`. The simple
 # `Matrix{Int}` table is used for layouts without non-trivial linear
 # constraints (the common case) and the `LocalDofExpansion` table
-# otherwise; the matching `_transfer_qpoint!` overload fires per
-# quadrature point. Shared by the symbolic mass pattern
-# ([`_transfer_mass_pattern`](@ref)) and the numeric assembly
-# ([`_assemble_transfer_region!`](@ref)) so the two cannot drift — a drift
-# would make the numeric scatter target a slot the pattern lacks.
+# otherwise; the matching `_emit_load!` overload (in `assembly.jl`) fires
+# per quadrature point. Uses the same dof-table representations as the
+# standard assembler, so the local→global scatter of the transfer rhs
+# lands on exactly the active slots the standard mass assembly enumerates.
 function _transfer_local_dofs!(ws::TransferWorkspace, target_layout, target_data)
     empty!(ws.active_dofs)
     empty!(ws.local_by_global)
@@ -336,44 +242,36 @@ function _transfer_local_dofs!(ws::TransferWorkspace, target_layout, target_data
     end
 end
 
-# CSC sparsity pattern of the target-side L² mass matrix: one dense
-# coupling block per (transfer region, target field) over that field's
-# target `active_dofs`, built through the shared Gustavson core
-# ([`_gustavson_pattern`](@ref) in `assembly.jl`) and the shared
-# [`_transfer_local_dofs!`](@ref) dof-table builder, so the pattern
-# enumerates exactly the slots the numeric pass emits. The active set
-# comes from `cell_dofs` alone (no basis evaluation). The mass matrix is
-# symmetric, so the pattern is the lower triangle. The pattern is built
-# fresh per transfer (not cached), so the `key` is nominal.
-function _transfer_mass_pattern(ws::TransferWorkspace{D,T}, target_model::Model{D,T},
-                                regions) where {D,T}
-    return _gustavson_pattern(active_unknowns(target_model.dofs), true, hash(:transfer_mass)
-                              ) do visit
-        for region in regions, target_layout in target_model.dofs.fields
-            target_data = [_transfer_data(target_layout, p, ws.target_values)
-                           for p in region.target_parents]
-            _transfer_local_dofs!(ws, target_layout, target_data)
-            visit(ws.active_dofs)
-        end
-    end
-end
-
-# The `::Val{AssembleMass}` parameter compile-time-selects whether to
-# build the mass matrix: callers pass `Val(false)` (with `sink = nothing`)
-# for the precomputed-target case (caller supplied `backend.matrix`),
-# `Val(true)` (with a `ScatterSink`) otherwise. The "no source coverage"
-# branch is hoisted to per-region level so the rhs reconstruction is
-# skipped entirely when `region.source_parents` is empty (the source
-# field is identically zero there). The matrix block is deposited into
-# `sink` (a `ScatterSink` into the prebuilt mass pattern, or `nothing`
-# for the rhs-only precomputed-matrix path) by `_emit_local_system!`.
-function _assemble_transfer_region!(ws::TransferWorkspace{D,T}, sink, rhs::Vector{T},
-                                    source_coefficients, source_model::Model{D,T},
-                                    target_model::Model{D,T}, region::TransferRegion{D,T},
-                                    ::Val{AssembleMass}=Val(true)) where {D,T,AssembleMass}
+# Accumulate one transfer region's source-driven rhs contribution. The
+# target mass matrix `M_T` and its Dirichlet column-elimination lift
+# `−M_ac·c_c` are assembled separately by the standard assembler over the
+# target's own integration regions (see [`transfer`](@ref)), so this pass
+# integrates only the linear load
+#
+#     b_i += ∫_box u_S(x) · φ_iᵀ dx,
+#
+# where `u_S` is the source field reconstructed from its coefficients on
+# the region's source parents and `φᵀ` are the target traces. A region the
+# source does not cover contributes nothing (`u_S ≡ 0` there), so it is
+# skipped wholesale.
+#
+# Loop structure (mirrors the load half of `_accumulate_qpoint_generic!`
+# in `assembly.jl`):
+#
+#   1. Build per-parent records on both sides and the per-region target
+#      dof-table; resize / reset the local rhs.
+#   2. For each quadrature point: update basis values, then for each
+#      component reconstruct `u_S(x)` and emit it against every target test
+#      dof via `_emit_load!` (which fans the contribution through the dof
+#      table's active branches).
+#   3. Scatter the local rhs into the global rhs through `ws.active_dofs`.
+function _assemble_transfer_rhs_region!(ws::TransferWorkspace{D,T}, rhs::Vector{T},
+                                        source_coefficients, source_model::Model{D,T},
+                                        target_model::Model{D,T},
+                                        region::TransferRegion{D,T}) where {D,T}
+    isempty(region.source_parents) && return nothing
     quadrature = region.quadrature
     jacobian = volume(region.box) / convert(T, 2^D)
-    has_source = !isempty(region.source_parents)
 
     for target_layout in target_model.dofs.fields
         source_layout = _field_layout(source_model.dofs, target_layout.name)
@@ -382,32 +280,33 @@ function _assemble_transfer_region!(ws::TransferWorkspace{D,T}, sink, rhs::Vecto
         source_data = [_transfer_data(source_layout, p, ws.source_values)
                        for p in region.source_parents]
 
-        # Per-parent dof-table (and `ws.active_dofs`) for this field —
-        # shared with the symbolic mass pattern via `_transfer_local_dofs!`.
+        # Per-parent target dof-table (and `ws.active_dofs`) for this field.
         local_by_parent = _transfer_local_dofs!(ws, target_layout, target_data)
         n = length(ws.active_dofs)
-        nn = AssembleMass ? n * n : 0
-        resize!(ws.local_matrix, nn)
-        fill!(ws.local_matrix, zero(T))
         resize!(ws.local_rhs, n)
         fill!(ws.local_rhs, zero(T))
-        local_matrix = reshape(view(ws.local_matrix, 1:nn), AssembleMass ? n : 0,
-                               AssembleMass ? n : 0)
-        local_rhs = ws.local_rhs
 
         for (eta, weight) in zip(quadrature.points, quadrature.weights)
             qweight = weight * jacobian
             _update_transfer_basis!(ws, region, eta)
-
             for component in 1:target_layout.components
-                _transfer_qpoint!(local_matrix, local_rhs, target_data, source_data,
-                                  local_by_parent, target_layout, source_layout,
-                                  source_coefficients, ws.active_dofs, qweight, component,
-                                  has_source, Val(AssembleMass))
+                # Reconstruct u_S(x) and integrate it against the target
+                # traces — a linear load.
+                source_value = _field_value(source_data, source_layout, source_coefficients,
+                                            component)
+                for (test_data, table) in zip(target_data, local_by_parent)
+                    for a in eachindex(test_data.raw_dofs)
+                        contribution = qweight * source_value * test_data.values[a]
+                        _emit_load!(ws.local_rhs, table, a, component, contribution)
+                    end
+                end
             end
         end
 
-        _emit_local_system!(sink, rhs, ws.active_dofs, local_matrix, local_rhs)
+        # Scatter the local rhs into the global rhs (no matrix block).
+        for (local_row, row) in pairs(ws.active_dofs)
+            rhs[row] += ws.local_rhs[local_row]
+        end
     end
 
     return nothing
@@ -531,47 +430,81 @@ function _has_nonhomogeneous_constraints(layout::SystemLayout)
     return any(field -> any(!iszero, field.dofs.constrained_values), layout.fields)
 end
 
-# `L2Projection` implementation: assemble the target mass system and
-# the source-driven rhs on the union admissible-box partition, solve.
-# Cached `backend.matrix` / `backend.factor` short-circuit the
-# corresponding assembly / factorisation steps. The cache state is
-# encoded in the parametric type `L2Projection{M,F}`, so the mass-
-# assembly branch (via `Val(...)`) folds away at compile time.
+# `L2Projection` implementation. The target-side mass matrix `M_T` and its
+# Dirichlet column-elimination lift `−M_ac·c_c` are assembled by the
+# STANDARD assembler over the target's own integration regions: under exact
+# quadrature `∫_Ω φ_iᵀ φ_jᵀ` (target traces only) is independent of the
+# partition, so the source/target union partition is needed only for the
+# source-driven rhs `∫_Ω u_S(x) φ_iᵀ`, whose integrand mixes the two meshes.
+# That source rhs is accumulated over the union partition, added onto the
+# lift, and the system is solved sparse-direct.
+#
+# The cached-matrix backend (`M ≠ Nothing`) reuses `backend.matrix` and
+# omits the lift, which vanishes only for a homogeneously-constrained
+# target — so a non-homogeneous target is rejected there (the default
+# `L2Projection()` re-assembles the mass and applies the lift correctly).
+# The branch on `M === Nothing` tests a type parameter, so it folds at
+# compile time; a supplied `backend.factor` short-circuits the
+# factorisation.
 function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_model::Model{D,T},
                     backend::L2Projection{M,F}, tolerance) where {D,T,M,F}
     _assert_transfer_compatible(source_model, target_model)
-    # The cached-matrix path (M ≠ Nothing) builds only the source-driven rhs and
-    # reuses `backend.matrix`, so it omits the Dirichlet column-elimination lift
-    # `−M_ac·c_c`. That term vanishes only for a homogeneously-constrained
-    # target; with non-homogeneous physical Dirichlet data the cached path would
-    # return wrong interior coefficients, so reject it. The default
-    # `L2Projection()` re-assembles the mass and applies the lift correctly.
     if M !== Nothing && _has_nonhomogeneous_constraints(target_model.dofs)
         throw(ArgumentError("L2Projection(matrix): the cached mass omits the Dirichlet lift, so " *
                             "it cannot transfer onto a target with non-homogeneous Dirichlet " *
                             "data. Use the default L2Projection() (no cached matrix) here."))
     end
+    # The default path takes the target mass from the standard assembler, which
+    # restricts to the immersed Ω via the FCM cut rules, while the source-driven
+    # rhs below is assembled over the full mesh boxes of the union partition
+    # (FCM-blind). For a target carrying a `physical_domain` those two are
+    # inconsistent, so reject it rather than return a silently wrong projection.
+    # Making the transfer union partition FCM-aware (both mass and rhs restricted
+    # to Ω) is a separate follow-up.
+    if target_model.problem.space.physical !== nothing
+        throw(ArgumentError("L2 transfer onto a target with an immersed physical_domain is not yet " *
+                            "supported: the target mass restricts to Ω but the source-driven rhs " *
+                            "integrates over full mesh boxes, so the two are inconsistent."))
+    end
     source_coefficients = _checked_coefficients(source_solution, source_model)
 
-    regions = _transfer_regions(source_model, target_model; tolerance=tolerance)
     nactive = active_unknowns(target_model.dofs)
     if nactive == 0
         return Solution(T[], target_model.version, SolverDiagnostics(:l2_projection, 0.0, true))
     end
 
-    assemble_mass = Val(M === Nothing)
-    ws = _transfer_workspace(source_model, target_model)
-    # Build the target mass pattern once (when assembling it) and scatter
-    # into it; the precomputed-matrix path uses an rhs-only sink.
-    pattern = M === Nothing ? _transfer_mass_pattern(ws, target_model, regions) : nothing
-    sink = pattern === nothing ? nothing : ScatterSink(zeros(T, length(pattern.rowval)), pattern)
-    rhs = zeros(T, nactive)
-    for region in regions
-        _assemble_transfer_region!(ws, sink, rhs, source_coefficients, source_model, target_model,
-                                   region, assemble_mass)
+    # Target mass + Dirichlet lift. Default path: assemble both from the
+    # standard assembler over the target's own regions in one pass (the
+    # bilinear pass shifts constrained trial columns onto the returned rhs,
+    # which is the lift since there is no source load). Cached path: reuse
+    # `backend.matrix` with a zero lift (homogeneous target, guarded above).
+    if M === Nothing
+        mass_blocks = map(mass_block, target_model.problem.fields)
+        # Build the mass pattern WITHOUT clobbering `target_model.pattern`:
+        # that cache is keyed to the model's own problem, and a transfer must
+        # not evict it. `_assembly_region_lists` + `build_assembly_pattern`
+        # yield a fresh pattern; `_assembly_pattern!` would mutate the cache.
+        region_lists, key = _assembly_region_lists(target_model, mass_blocks)
+        pattern = build_assembly_pattern(target_model, region_lists, true, key)
+        sink = ScatterSink(zeros(T, length(pattern.rowval)), pattern)
+        threaded = Threads.nthreads() > 1
+        _, rhs = _assemble_partitioned!(sink, target_model, mass_blocks, (), nactive, true, nothing,
+                                        nothing, threaded)
+        mass = _matrix_from_pattern(pattern, sink.nzval)
+    else
+        mass = backend.matrix
+        rhs = zeros(T, nactive)
     end
 
-    mass = pattern === nothing ? backend.matrix : _matrix_from_pattern(pattern, sink.nzval)
+    # Source-driven rhs over the source/target union partition, accumulated
+    # onto the lift already in `rhs`.
+    regions = _transfer_regions(source_model, target_model; tolerance=tolerance)
+    ws = _transfer_workspace(source_model, target_model)
+    for region in regions
+        _assemble_transfer_rhs_region!(ws, rhs, source_coefficients, source_model, target_model,
+                                       region)
+    end
+
     coefficients = F === Nothing ? mass \ rhs : backend.factor \ rhs
     residual = norm(mass * coefficients - rhs)
     return Solution(coefficients, target_model.version,

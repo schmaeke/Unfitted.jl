@@ -260,3 +260,21 @@ end
     rewired = transfer(sol, source_model, target_model; via=Rewire(; strict=false))
     @test rewired.diagnostics.method === :rewire
 end
+
+@testset "L2 transfer onto an FCM (physical_domain) target is rejected" begin
+    # The default path takes the target mass from the FCM-aware standard
+    # assembler (restricted to Ω) but the source-driven rhs over full mesh boxes,
+    # so an immersed target pairs an Ω-mass with a full-box rhs and must error
+    # rather than silently mis-project. (FCM-aware transfer is a tracked
+    # follow-up.) The guard fires before the source coefficients are read, so a
+    # trivial source solution suffices.
+    omega = box((-1.0, -1.0), (1.0, 1.0))
+    disk = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.7; lipschitz=1.0,
+                           subcell_length_scale=0.5)
+    source_model = prepare(poisson(space(omega; cells=(2, 2), order=1); source=x -> 0.0))
+    source_solution = Solution(zeros(Unfitted.active_unknowns(source_model.dofs)),
+                               source_model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    target_model = prepare(poisson(space(omega; cells=(2, 2), order=1, physical=disk);
+                                   source=x -> 0.0))
+    @test_throws ArgumentError transfer(source_solution, source_model, target_model)
+end
