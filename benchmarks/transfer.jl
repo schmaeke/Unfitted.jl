@@ -14,7 +14,7 @@ source_solution = Solution(source_coefficients, source_model.version,
                            Unfitted.SolverDiagnostics(:synthetic, 0.0, true))
 
 stats = best_timed(; samples=3) do
-    transfer!(source_solution, source_model, target_model)
+    transfer(source_solution, source_model, target_model)
 end
 target_solution = stats.value
 report = diagnostics(target_model, target_solution)
