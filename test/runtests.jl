@@ -18,6 +18,7 @@ using Test
     include("test_boundary_mesh.jl")
     include("test_vtk.jl")
     include("test_regressions.jl")
+    include("test_coupling.jl")
     include("test_api.jl")
     include("test_tensors_ext.jl")
     include("test_basis_bspline.jl")

@@ -59,6 +59,10 @@ Fields:
     [`SurfaceRegion`](@ref)s cached on the model, summed across every
     cached [`BoundaryMesh`](@ref). Zero for problems with no
     immersed-boundary integration.
+  - `interface_region_count::Int` — total number of
+    [`InterfaceRegion`](@ref)s cached on the model, summed across every
+    cached coupling [`Interface`](@ref). Zero for problems with no
+    multi-domain interface coupling.
 """
 mutable struct AssemblyDiagnostics
     dimension::Int
@@ -77,6 +81,7 @@ mutable struct AssemblyDiagnostics
     moment_fit_residual_max::Float64
     facet_region_count::Int
     surface_region_count::Int
+    interface_region_count::Int
 end
 
 # Promote the small-overlap records of an integration plan to `Float64`
@@ -107,7 +112,8 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                              condition_estimate=NaN, solver=:none,
                              small_overlaps=SmallOverlap{Float64}[], inactive_cell_counts=Int[],
                              cut_region_count=0, fit_failure_count=0, moment_fit_residual_max=0.0,
-                             facet_region_count=0, surface_region_count=0)
+                             facet_region_count=0, surface_region_count=0,
+                             interface_region_count=0)
     return AssemblyDiagnostics(Int(dimension), Int(active_unknowns), Int(integration_regions),
                                Int(small_overlap_count), _float_small_overlaps(small_overlaps),
                                Float64(min_integration_volume),
@@ -115,7 +121,8 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                                Float64(condition_estimate), Symbol(solver),
                                Int[inactive_cell_counts...], Int(cut_region_count),
                                Int(fit_failure_count), Float64(moment_fit_residual_max),
-                               Int(facet_region_count), Int(surface_region_count))
+                               Int(facet_region_count), Int(surface_region_count),
+                               Int(interface_region_count))
 end
 
 # Per-level count of cells deactivated by a `LevelMask`. Returns one
@@ -126,10 +133,22 @@ function _inactive_cell_counts(V::Space)
     return [level.mask === nothing ? 0 : count(!, level.mask.on) for level in V.levels]
 end
 
+# Per-level inactive-cell counts across every distinct subdomain space, in
+# `problem_spaces` order (the same order the reindexed global level ids run).
+# Reduces to `_inactive_cell_counts` for a single-domain problem.
+function _inactive_cell_counts_multi(spaces)
+    counts = Int[]
+    for V in spaces
+        append!(counts, _inactive_cell_counts(V))
+    end
+    return counts
+end
+
 # Scan the integration plan for NNMF-fit statistics. `:cut_fitted` are
-# successful fits; `:cut_failed` is a fit that hit the catastrophic
-# residual threshold and contributes zero quadrature weight. Both count
-# as "cut" regions for diagnostics; only the latter is a fit failure.
+# successful fits; `:cut_failed` (strict α = 0) and `:cut_alpha_failed`
+# (α > 0, α-tensor fallback) both hit the catastrophic residual threshold.
+# All three count as "cut" regions for diagnostics; the two failure kinds
+# count as fit failures.
 function _cut_region_stats(plan::IntegrationPlan)
     cut = 0
     failed = 0
@@ -137,7 +156,7 @@ function _cut_region_stats(plan::IntegrationPlan)
         kind = region.quadrature.kind
         if kind === :cut_fitted
             cut += 1
-        elseif kind === :cut_failed
+        elseif kind === :cut_failed || kind === :cut_alpha_failed
             cut += 1
             failed += 1
         end
@@ -152,6 +171,33 @@ function _set_plan_stats!(diag::AssemblyDiagnostics, plan::IntegrationPlan)
     _set_integration_stats!(diag, plan)
     diag.cut_region_count, diag.fit_failure_count = _cut_region_stats(plan)
     diag.moment_fit_residual_max = plan.moment_fit_residual_max
+    return diag
+end
+
+# Aggregate plan statistics across every subdomain's integration plan into
+# one diagnostics record: region / cut / small-overlap counts sum, minimum
+# volumes take the global minimum, moment-fit residual takes the global
+# maximum. Reduces to `_set_plan_stats!` for a single-domain problem (one
+# plan). The small-overlap records are concatenated so every subdomain's
+# offending regions are reported.
+function _set_plan_stats_multi!(diag::AssemblyDiagnostics, plans)
+    length(plans) == 1 && return _set_plan_stats!(diag, plans[1])
+    diag.integration_regions = sum(length(p.regions) for p in plans; init=0)
+    diag.small_overlap_count = sum(p.small_overlap_count for p in plans; init=0)
+    diag.small_overlaps = reduce(vcat, (_float_small_overlaps(p.small_overlaps) for p in plans);
+                                 init=SmallOverlap{Float64}[])
+    diag.min_integration_volume = minimum(Float64(p.min_volume) for p in plans)
+    diag.min_relative_integration_volume = minimum(Float64(p.min_relative_volume) for p in plans)
+    cut = 0
+    failed = 0
+    for p in plans
+        c, f = _cut_region_stats(p)
+        cut += c
+        failed += f
+    end
+    diag.cut_region_count = cut
+    diag.fit_failure_count = failed
+    diag.moment_fit_residual_max = maximum(p.moment_fit_residual_max for p in plans; init=0.0)
     return diag
 end
 
@@ -213,10 +259,15 @@ re-thread a fresh value through. Fields:
   - `version::Int` — bump counter for stale-solution detection. Every
     in-place mutation that invalidates the assembled state bumps this;
     a [`Solution`](@ref) carrying an older version raises on reuse.
-  - `integration::Union{Nothing,IntegrationPlan{D,T}}` — cached
-    integration plan. `nothing` only between construction and the first
-    integration-plan request; populated by `prepare` and refreshed by
-    every mutator.
+  - `space_plans::Vector{IntegrationPlan{D,T}}` — cached integration
+    plan per *distinct* participating discretisation, in the
+    first-appearance order of [`problem_spaces`](@ref)`(problem)`. A
+    single-domain problem carries one plan; a multi-domain (coupled)
+    problem carries one per subdomain space, each built against that
+    space's own physical fold. Populated by `prepare` and refreshed by
+    every mutator. The field-to-plan routing is intrinsic: each field owns
+    the regions on its space's level-id block (see `FieldLayout.level_ids`
+    and `region_parents`), so no per-plan routing table is stored.
   - `dofs::SystemLayout{D,T}` — per-field dof layout and active
     enumeration.
   - `matrix::Union{Nothing,SparseMatrixCSC{T,Int}}` — assembled global
@@ -236,6 +287,11 @@ re-thread a fresh value through. Fields:
     value carries no canonical hash; identity match prevents two
     structurally-equal but distinct meshes from accidentally sharing
     a cache entry).
+  - `interface_regions::IdDict{Any,Vector{InterfaceRegion{D,T}}}` —
+    per-interface cache of two-sided [`InterfaceRegion`](@ref)s. One
+    entry per [`Interface`](@ref) referenced by a coupling `block`
+    (`couple`'s four blocks share one `Interface` object). Keyed by
+    object identity, as for `surface_regions`.
   - `diagnostics::AssemblyDiagnostics` — diagnostics record, updated
     in place by every lifecycle event.
   - `pattern::Union{Nothing,AssemblyPattern}` — cached CSC sparsity
@@ -252,12 +308,13 @@ re-thread a fresh value through. Fields:
 mutable struct Model{D,T,P}
     problem::P
     version::Int
-    integration::Union{Nothing,IntegrationPlan{D,T}}
+    space_plans::Vector{IntegrationPlan{D,T}}
     dofs::SystemLayout{D,T}
     matrix::Union{Nothing,SparseMatrixCSC{T,Int}}
     rhs::Union{Nothing,Vector{T}}
     facet_regions::Dict{BoundarySelector,Vector{FacetRegion{D,T}}}
     surface_regions::IdDict{Any,Vector{SurfaceRegion{D,T}}}
+    interface_regions::IdDict{Any,Vector{InterfaceRegion{D,T}}}
     diagnostics::AssemblyDiagnostics
     pattern::Union{Nothing,AssemblyPattern}
     plan_options::NamedTuple
@@ -282,6 +339,49 @@ function _dirichlet_for_field(problem::Problem, name::Symbol)
     return scoped
 end
 
+# All levels across every distinct participating space, concatenated in
+# `problem_spaces` order. Because `prepare` reindexes each space's level ids
+# into a disjoint block, the concatenation has globally-unique, contiguous
+# ids `1:N` — exactly what the assembly workspace's flat level-id banks and
+# each field's dof layout agree on. For a single-domain problem this is just
+# the one space's levels.
+function _problem_levels(problem::Problem)
+    levels = Any[]
+    for V in problem_spaces(problem)
+        append!(levels, V.levels)
+    end
+    return levels
+end
+
+# Fold each distinct space against its own `PhysicalDomain` and reindex its
+# level ids into a disjoint global block, then rebuild the fields over the
+# prepared spaces. Returns the effective problem, the prepared distinct
+# spaces (in `problem_spaces` order), and the per-space classification caches
+# (each threaded into its own space's integration plan). This is the
+# multi-domain generalisation of `_apply_physical_fold_to_problem`: it folds
+# and namespaces every subdomain independently so their cut-cell plans, dof
+# blocks, and workspace banks never collide.
+function _prepare_spaces(problem::Problem{D,T}) where {D,T}
+    orig = problem_spaces(problem)
+    prepared = Vector{Space}(undef, length(orig))
+    caches = Vector{_ClassifyCache{D,T}}(undef, length(orig))
+    remap = IdDict{Space,Space}()
+    offset = 0
+    for (i, V) in pairs(orig)
+        cache = _ClassifyCache{D,T}()
+        reindexed = _reindex_space_levels(_apply_physical_fold(V, cache), offset)
+        prepared[i] = reindexed
+        caches[i] = cache
+        remap[V] = reindexed
+        offset += level_count(reindexed)
+    end
+    new_fields = map(f -> field(f.name, remap[f.space]; components=component_count(f)),
+                     problem.fields)
+    effective = Problem(new_fields; blocks=problem.blocks, loads=problem.loads,
+                        dirichlet=problem.dirichlet, symmetric=problem.symmetric)
+    return effective, prepared, caches
+end
+
 """
     system_layout(problem::Problem; tolerance=GeometryTolerance(T)) -> SystemLayout
 
@@ -289,22 +389,44 @@ Build the per-field [`DofLayout`](@ref)s for every field of `problem`
 and assemble them into a [`SystemLayout`](@ref). Each field's active
 dofs are enumerated independently and then offset into a global active
 block, so fields occupy disjoint ranges of the global enumeration.
+Fields over different spaces (multi-domain coupling) each build their
+layout from their own [`Space`](@ref); the disjoint offsets make the
+global enumeration a product space `V₁ × … × Vₙ`.
 
 Called by [`prepare`](@ref) and the in-place mutators. End users do
 not usually call this directly.
 """
-function system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T)) where {D,T}
+function system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T),
+                       classify_caches=IdDict{Space,_ClassifyCache{D,T}}()) where {D,T}
     layouts = FieldLayout{D,T}[]
     by_name = Dict{Symbol,Int}()
     offset = 0
     for field in problem.fields
+        # Reuse the field's space fold cache when `prepare` / `move!` provide it,
+        # so the constraint pass never re-classifies fold-boundary cells.
+        cache = get(() -> _ClassifyCache{D,T}(), classify_caches, field.space)
         layout = dof_layout(field.space; dirichlet=_dirichlet_for_field(problem, field.name),
-                            tolerance, components=component_count(field))
-        push!(layouts, FieldLayout{D,T}(field.name, component_count(field), layout, offset))
+                            tolerance, components=component_count(field), classify_cache=cache)
+        # The field's (reindexed, contiguous) level-id block — how assembly
+        # routes each region to its owning subdomain field without a `served` mask.
+        level_ids = extrema(l.id for l in field.space.levels)
+        push!(layouts, FieldLayout{D,T}(field.name, component_count(field), layout, offset,
+                                        level_ids[1]:level_ids[2]))
         by_name[field.name] = length(layouts)
         offset += active_unknowns(layout)
     end
     return SystemLayout{D,T}(layouts, by_name, offset, tolerance)
+end
+
+# Map each prepared subdomain space to its fold classification cache, for
+# `system_layout` to reuse. Built from the aligned `spaces`/`caches` vectors
+# `_prepare_spaces` returns (identity keys — each field's space is one of these).
+function _caches_by_space(spaces, caches::Vector{_ClassifyCache{D,T}}) where {D,T}
+    by_space = IdDict{Space,_ClassifyCache{D,T}}()
+    for i in eachindex(spaces)
+        by_space[spaces[i]] = caches[i]
+    end
+    return by_space
 end
 
 """
@@ -321,25 +443,32 @@ Forwarded keyword arguments go to `integration_plan`; see its docstring
 for the full list.
 """
 function prepare(problem::Problem{D,T}; kwargs...) where {D,T}
-    effective_problem, classify_cache = _apply_physical_fold_to_problem(problem)
+    effective_problem, spaces, caches = _prepare_spaces(problem)
     # Capture the user's integration-plan options (tolerance, criterion, …) so
     # the in-place mutators can reproduce this exact plan instead of reverting
-    # to `integration_plan`'s defaults. `classify_cache` is geometry-derived,
-    # not a user option, so it is rebuilt per mutation rather than stored here.
+    # to `integration_plan`'s defaults. The classification caches are
+    # geometry-derived, not user options, so they are rebuilt per mutation.
     plan_options = (; kwargs...)
-    plan = integration_plan(effective_problem.space; plan_options..., classify_cache=classify_cache)
     tolerance = get(plan_options, :tolerance, GeometryTolerance(T))
-    layout = system_layout(effective_problem; tolerance)
+    # One integration plan per distinct subdomain space, each sharing that
+    # space's own cell-classification cache.
+    space_plans = IntegrationPlan{D,T}[integration_plan(spaces[i]; plan_options...,
+                                                         classify_cache=caches[i])
+                                       for i in eachindex(spaces)]
+    layout = system_layout(effective_problem; tolerance,
+                           classify_caches=_caches_by_space(spaces, caches))
     facet_regions = _resolve_facet_regions(effective_problem, tolerance)
     surface_regions = _resolve_surface_regions(effective_problem, tolerance)
+    interface_regions = _resolve_interface_regions(effective_problem, layout, tolerance)
     diag = AssemblyDiagnostics(dimension=D, active_unknowns=active_unknowns(layout),
-                               inactive_cell_counts=_inactive_cell_counts(effective_problem.space),
-                               facet_region_count=_facet_region_count(facet_regions),
-                               surface_region_count=_surface_region_count(surface_regions))
-    _set_plan_stats!(diag, plan)
-    return Model{D,T,typeof(effective_problem)}(effective_problem, 1, plan, layout, nothing,
-                                                nothing, facet_regions, surface_regions, diag,
-                                                nothing, plan_options)
+                               inactive_cell_counts=_inactive_cell_counts_multi(spaces),
+                               facet_region_count=_region_count(facet_regions),
+                               surface_region_count=_region_count(surface_regions),
+                               interface_region_count=_region_count(interface_regions))
+    _set_plan_stats_multi!(diag, space_plans)
+    return Model{D,T,typeof(effective_problem)}(effective_problem, 1, space_plans, layout, nothing,
+                                                nothing, facet_regions, surface_regions,
+                                                interface_regions, diag, nothing, plan_options)
 end
 
 # Build the facet-region cache for a problem from every
@@ -354,9 +483,47 @@ function _resolve_facet_regions(problem::Problem{D,T}, tolerance::GeometryTolera
     regions = Dict{BoundarySelector,Vector{FacetRegion{D,T}}}()
     for selector in _referenced_facet_selectors(problem)
         haskey(regions, selector) && continue
-        regions[selector] = _facet_regions_for_selector(problem.space, selector, tolerance)
+        regions[selector] = _facet_regions_for_selector(_facet_selector_space(problem, selector),
+                                                        selector, tolerance)
     end
     return regions
+end
+
+# Whether a form's `on` tag refers to the same single-sided boundary target.
+# A `BoundarySelector` matches by value (`_selectors_equal`); a `BoundaryMesh`
+# matches by object identity (the surface-region cache keys on identity — see
+# the `Model` docstring). Dispatch is on the target so the caller need not know
+# which flavour it holds.
+_on_matches(on, target::BoundarySelector) = on isa BoundarySelector && _selectors_equal(on, target)
+_on_matches(on, target::BoundaryMesh) = on isa BoundaryMesh && on === target
+
+# The test-field space of the first block (then load) whose `on` tag matches
+# `target`, or `nothing` if no bilinear/linear form references it. Shared by the
+# facet-selector and surface-mesh region builders; blocks take precedence over
+# loads, matching the `on`-partition assembly order.
+function _on_test_space(problem::Problem, target)
+    for b in problem.blocks
+        _on_matches(b.on, target) && return _field_space(problem, b.test_name)
+    end
+    for l in problem.loads
+        _on_matches(l.on, target) && return _field_space(problem, l.test_name)
+    end
+    return nothing
+end
+
+# The subdomain space a single-sided `on=BoundarySelector` facet must be built
+# against: the space of a field referencing it through a block, load, or
+# Dirichlet condition (in that precedence). For a single-domain problem this is
+# always the one space; a Dirichlet-only selector still resolves against the
+# constrained field's space, keeping the diagnostics consistent.
+function _facet_selector_space(problem::Problem, selector::BoundarySelector)
+    space = _on_test_space(problem, selector)
+    space === nothing || return space
+    for c in problem.dirichlet
+        (c.field !== nothing && _selectors_equal(c.boundary, selector)) &&
+            return _field_space(problem, c.field)
+    end
+    return problem.space
 end
 
 # Yields every `BoundarySelector` referenced anywhere in `problem`:
@@ -375,25 +542,55 @@ function _resolve_surface_regions(problem::Problem{D,T},
     regions = IdDict{Any,Vector{SurfaceRegion{D,T}}}()
     for mesh in _referenced_boundary_meshes(problem)
         haskey(regions, mesh) && continue
-        regions[mesh] = _surface_regions_for_mesh(problem.space, mesh, tolerance)
+        regions[mesh] = _surface_regions_for_mesh(_surface_mesh_space(problem, mesh), mesh, tolerance)
     end
     return regions
 end
+
+# The subdomain space a single-sided `on=BoundaryMesh` must be built against:
+# the space of a field referencing it through a block or load. A genuine
+# two-sided coupling uses [`Interface`](@ref); a bare `BoundaryMesh` shared by
+# fields on different spaces is rejected at assembly (`_partition_space`). For a
+# single-domain problem this is always the one space.
+_surface_mesh_space(problem::Problem, mesh::BoundaryMesh) =
+    something(_on_test_space(problem, mesh), problem.space)
 
 function _referenced_boundary_meshes(problem::Problem)
     return Iterators.flatten(((b.on for b in problem.blocks if b.on isa BoundaryMesh),
                               (l.on for l in problem.loads if l.on isa BoundaryMesh)))
 end
 
-# Sum of region counts across every cached `BoundaryMesh` for the
-# diagnostics `surface_region_count` field.
-function _surface_region_count(regions::IdDict)
-    total = 0
-    for (_, list) in regions
-        total += length(list)
+# Build the interface-region cache for a problem from every `Interface`
+# referenced by a coupling block's `on` tag (the four blocks a `couple` call
+# emits share one `Interface` object → one cache entry). Each interface's field
+# indices come from the dof `layout` (global field order) and its two subdomain
+# spaces from the effective problem's fields; the two-sided regions are built by
+# subdividing the interface mesh against the merged trace of both grids. Keyed by
+# `IdDict` (object identity), as for the surface cache.
+function _resolve_interface_regions(problem::Problem{D,T}, layout::SystemLayout{D,T},
+                                    tolerance::GeometryTolerance{T}) where {D,T}
+    regions = IdDict{Any,Vector{InterfaceRegion{D,T}}}()
+    for iface in _referenced_interfaces(problem)
+        haskey(regions, iface) && continue
+        field_a = layout.by_name[iface.field_a]
+        field_b = layout.by_name[iface.field_b]
+        space_a = _field_space(problem, iface.field_a)
+        space_b = _field_space(problem, iface.field_b)
+        regions[iface] = _interface_regions(iface, space_a, space_b, field_a, field_b, tolerance)
     end
-    return total
+    return regions
 end
+
+function _referenced_interfaces(problem::Problem)
+    return Iterators.flatten(((b.on for b in problem.blocks if b.on isa Interface),
+                              (l.on for l in problem.loads if l.on isa Interface)))
+end
+
+# Total number of cached regions across a per-selector / per-mesh / per-interface
+# region cache. Sums the list lengths of the facet, surface, or interface caches;
+# used for the diagnostics `facet_region_count` / `surface_region_count` /
+# `interface_region_count` fields.
+_region_count(regions::AbstractDict) = sum(length, values(regions); init=0)
 
 # Resolve one selector into its full list of `FacetRegion`s (the union
 # of regions across every facet the selector covers). Used by
@@ -408,38 +605,14 @@ function _facet_regions_for_selector(V::Space{D,T}, selector::BoundarySelector,
     return regions
 end
 
-# Sum of facet-region list lengths across every cached selector. Used
-# by the diagnostics' `facet_region_count` field.
-function _facet_region_count(regions::Dict)
-    total = 0
-    for (_, list) in regions
-        total += length(list)
-    end
-    return total
-end
-
-# Rebuild `problem` over a new (folded / moved / remasked) space, reusing
-# the field channels, forms, and Dirichlet data. Shared rebuild rule
-# behind `_apply_physical_fold_to_problem`, `_moved_problem`, and
-# `_remasked_problem`.
+# Rebuild `problem` over a new (moved / remasked) space, reusing the field
+# channels, forms, and Dirichlet data. Shared rebuild rule behind `_moved_problem`
+# and `_remasked_problem` (the geometry-fold rebuild goes through
+# `_prepare_spaces`, which also reindexes level ids).
 function _problem_with_space(problem::Problem, new_space::Space)
     new_fields = map(f -> field(f.name, new_space; components=component_count(f)), problem.fields)
     return Problem(new_fields; blocks=problem.blocks, loads=problem.loads,
                    dirichlet=problem.dirichlet, symmetric=problem.symmetric)
-end
-
-# Apply the PhysicalDomain fold (cells outside Ω → inactive in the level
-# mask) to `problem`'s space and return `(new_problem, classify_cache)`.
-# The cache carries the per-box cell classifications computed by the
-# fold; it is threaded into `integration_plan` so the region-level
-# dispatcher reuses them instead of re-classifying the same boxes. A
-# `nothing` physical domain or an empty fictitious set is a no-op fast
-# path (returns the original problem and an empty cache).
-function _apply_physical_fold_to_problem(problem::Problem{D,T}) where {D,T}
-    cache = _ClassifyCache{D,T}()
-    new_space = _apply_physical_fold(problem.space, cache)
-    new_space === problem.space && return problem, cache
-    return _problem_with_space(problem, new_space), cache
 end
 
 function Base.show(io::IO, model::Model{D}) where {D}
@@ -463,17 +636,27 @@ end
 """
     integration_plan(model::Model) -> IntegrationPlan
 
-Cached integration plan held on `model`. Built by [`prepare`](@ref) and
-refreshed by [`move!`](@ref) / [`activate!`](@ref) / [`deactivate!`](@ref),
-so once a model is prepared every assembly call uses the same plan that
-the dof layout was built against. Falls back to a fresh
-`integration_plan(model.problem.space)` only if `model.integration` has
-never been populated (which the lifecycle path keeps from happening in
-normal use).
+The **first** subdomain's cached integration plan (`first(model.space_plans)`).
+Plans are built by [`prepare`](@ref) and refreshed by [`move!`](@ref) /
+[`activate!`](@ref) / [`deactivate!`](@ref), so once a model is prepared every
+assembly call uses the same plan the dof layout was built against. For a
+single-domain model this is *the* plan; a coupled model holds one plan per
+subdomain — use [`integration_plans`](@ref) to reach all of them.
 """
 function integration_plan(model::Model)
-    model.integration === nothing ? integration_plan(model.problem.space) : model.integration
+    return first(model.space_plans)
 end
+
+"""
+    integration_plans(model::Model) -> Vector{IntegrationPlan}
+
+Every subdomain's cached [`IntegrationPlan`](@ref), in [`problem_spaces`](@ref)
+order. The assembly volume pass iterates these; each region is owned by the
+fields on its subdomain intrinsically (`region_parents` via
+`FieldLayout.level_ids`). For a single-domain model this is a one-element vector
+whose only element is what [`integration_plan`](@ref) returns.
+"""
+integration_plans(model::Model) = model.space_plans
 
 """
     dof_layout(model::Model) -> SystemLayout
@@ -496,6 +679,17 @@ active_unknowns(model::Model) = active_unknowns(model.dofs)
 
 # ── Model mutation ────────────────────────────────────────────────────────────
 
+# Guard the positional-level mutators (`move!`, `activate!`, `deactivate!`)
+# against multi-domain models. Those mutators address a level by its position
+# in the single `model.problem.space`, which is ambiguous once a problem spans
+# several subdomain spaces; supporting per-subdomain mutation is deferred.
+# A single-domain model passes through silently.
+function _assert_single_domain(model::Model, op::AbstractString)
+    length(problem_spaces(model.problem)) == 1 ||
+        throw(ArgumentError("$op is not yet supported for multi-domain (coupled) models"))
+    return nothing
+end
+
 # Rebuild the model's problem with overlay `level` moved to box `to`,
 # reusing the existing forms and boundary data on the moved space.
 function _moved_problem(model::Model{D,T}, level::Integer, to::AxisBox{D,T}, tolerance) where {D,T}
@@ -507,7 +701,7 @@ end
 # cached matrix / rhs, rebuilds the facet-region cache against the
 # (already-updated) space, builds a fresh diagnostics record, and folds
 # the current integration plan's stats in. Assumes `model.problem`,
-# `model.dofs`, and `model.integration` already reflect the new state.
+# `model.dofs`, and `model.space_plans` already reflect the new state.
 function _invalidate_assembly!(model::Model{D,T},
                                tolerance::GeometryTolerance{T}=GeometryTolerance(T)) where {D,T}
     model.matrix = nothing
@@ -515,11 +709,13 @@ function _invalidate_assembly!(model::Model{D,T},
     model.pattern = nothing
     model.facet_regions = _resolve_facet_regions(model.problem, tolerance)
     model.surface_regions = _resolve_surface_regions(model.problem, tolerance)
+    model.interface_regions = _resolve_interface_regions(model.problem, model.dofs, tolerance)
     diag = AssemblyDiagnostics(dimension=D, active_unknowns=active_unknowns(model.dofs),
-                               inactive_cell_counts=_inactive_cell_counts(model.problem.space),
-                               facet_region_count=_facet_region_count(model.facet_regions),
-                               surface_region_count=_surface_region_count(model.surface_regions))
-    _set_plan_stats!(diag, model.integration)
+                               inactive_cell_counts=_inactive_cell_counts_multi(problem_spaces(model.problem)),
+                               facet_region_count=_region_count(model.facet_regions),
+                               surface_region_count=_region_count(model.surface_regions),
+                               interface_region_count=_region_count(model.interface_regions))
+    _set_plan_stats_multi!(diag, model.space_plans)
     model.diagnostics = diag
     return model
 end
@@ -542,14 +738,21 @@ refreshes diagnostics. An outstanding [`Solution`](@ref) raises on
 reuse.
 """
 function move!(model::Model{D,T}; level::Integer, to::AxisBox{D,T}) where {D,T}
+    _assert_single_domain(model, "move!")
     opts = model.plan_options
     tolerance = get(opts, :tolerance, GeometryTolerance(T))
     moved_p = _moved_problem(model, level, to, tolerance)
-    model.problem, classify_cache = _apply_physical_fold_to_problem(moved_p)
+    # Same fold → reindex → per-space-plan path as `prepare` (one space here,
+    # since `move!` is single-domain), so the folded plan and dof layout are
+    # rebuilt identically instead of hand-rolled.
+    effective_problem, spaces, caches = _prepare_spaces(moved_p)
+    model.problem = effective_problem
     model.version += 1
-    model.integration = integration_plan(model.problem.space; opts...,
-                                         classify_cache=classify_cache)
-    model.dofs = system_layout(model.problem; tolerance)
+    model.space_plans = IntegrationPlan{D,T}[integration_plan(spaces[i]; opts...,
+                                                              classify_cache=caches[i])
+                                             for i in eachindex(spaces)]
+    model.dofs = system_layout(effective_problem; tolerance,
+                               classify_caches=_caches_by_space(spaces, caches))
     return _invalidate_assembly!(model, tolerance)
 end
 
@@ -583,6 +786,7 @@ end
 # and diagnostics, and clears any assembled matrix / rhs. Any
 # outstanding `Solution` becomes stale.
 function _update_mask!(model::Model{D,T}, level_index::Integer, cells, value::Bool) where {D,T}
+    _assert_single_domain(model, "activate! / deactivate!")
     1 <= level_index <= length(model.problem.space.levels) ||
         throw(ArgumentError("level index $level_index out of bounds"))
     opts = model.plan_options
@@ -591,7 +795,7 @@ function _update_mask!(model::Model{D,T}, level_index::Integer, cells, value::Bo
     new_mask = _apply_mask_update(old_level.mask, old_level.mesh, cells, value)
     model.problem = _remasked_problem(model, level_index, new_mask)
     model.version += 1
-    model.integration = integration_plan(model.problem.space; opts...)
+    model.space_plans = [integration_plan(model.problem.space; opts...)]
     model.dofs = system_layout(model.problem; tolerance)
     return _invalidate_assembly!(model, tolerance)
 end
@@ -776,11 +980,12 @@ function diagnostics(model::Model, solution; exact=nothing)
     _checked_coefficients(solution, model)
     diag = diagnostics(model)
     error = exact === nothing ? nothing : l2_error(solution, model, exact)
-    return (; dimension=diag.dimension, levels=map(_level_report, model.problem.space.levels),
+    return (; dimension=diag.dimension, levels=map(_level_report, _problem_levels(model.problem)),
             active_unknowns=diag.active_unknowns, raw_dofs=raw_dof_count(model.dofs),
             integration_regions=diag.integration_regions,
             facet_region_count=diag.facet_region_count,
             surface_region_count=diag.surface_region_count,
+            interface_region_count=diag.interface_region_count,
             small_overlap_count=diag.small_overlap_count, small_overlaps=diag.small_overlaps,
             min_integration_volume=diag.min_integration_volume,
             min_relative_integration_volume=diag.min_relative_integration_volume,

@@ -356,12 +356,20 @@ end
 # codim-0 integrations — out of scope for boundary integration; cells
 # in those configurations pass through unchanged.
 
-# Per-axis sorted unique grid coordinates across every level of `V`.
-# A cell that respects this union automatically respects every
-# individual level grid, so the contract holds simultaneously.
-function _level_grid_lines(V::Space{D,T}, tol::GeometryTolerance{T}) where {D,T}
-    return ntuple(d -> _merged_axis_coordinates(V.levels, d, tol), D)
+# Per-axis sorted unique grid coordinates across an arbitrary level
+# collection. A cell that respects this union automatically respects
+# every individual level grid, so the contract holds simultaneously.
+# The two-space interface builder feeds the *concatenation* of both
+# subdomains' levels here so a segment/triangle is split at the merged
+# trace of both grids (each sub-cell then lies inside one cut cell of
+# each subdomain — the non-matching segment-merge of the references).
+function _grid_lines_for_levels(levels, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
+    return ntuple(d -> _merged_axis_coordinates(levels, d, tol), D)
 end
+
+# Per-axis sorted unique grid coordinates across every level of `V`.
+_level_grid_lines(V::Space{D,T}, tol::GeometryTolerance{T}) where {D,T} =
+    _grid_lines_for_levels(V.levels, Val(D), tol)
 
 """
     _subdivide_segment(p1, p2, grid_lines, nudge)
@@ -517,9 +525,8 @@ classification then handles those directly.
 """
 _subdivide_mesh(mesh::BoundaryMesh{D,T,0}, ::Space{D,T}, ::GeometryTolerance{T}) where {D,T} = mesh
 
-function _subdivide_mesh(mesh::BoundaryMesh{D,T,1}, V::Space{D,T},
-                         tolerance::GeometryTolerance{T}) where {D,T}
-    grid_lines = _level_grid_lines(V, tolerance)
+function _subdivide_mesh(mesh::BoundaryMesh{D,T,1}, grid_lines::NTuple{D,Vector{T}},
+                         ::GeometryTolerance{T}) where {D,T}
     nudge = sqrt(eps(T))
     cells = NTuple{2,SVector{D,T}}[]
     normals = mesh.normals === nothing ? nothing : SVector{D,T}[]
@@ -536,9 +543,8 @@ function _subdivide_mesh(mesh::BoundaryMesh{D,T,1}, V::Space{D,T},
     return BoundaryMesh{D,T,1}(cells, normals)
 end
 
-function _subdivide_mesh(mesh::BoundaryMesh{3,T,2}, V::Space{3,T},
-                         tolerance::GeometryTolerance{T}) where {T}
-    grid_lines = _level_grid_lines(V, tolerance)
+function _subdivide_mesh(mesh::BoundaryMesh{3,T,2}, grid_lines::NTuple{3,Vector{T}},
+                         ::GeometryTolerance{T}) where {T}
     nudge = sqrt(eps(T))
     cells = NTuple{3,SVector{3,T}}[]
     normals = mesh.normals === nothing ? nothing : SVector{3,T}[]
@@ -554,6 +560,12 @@ function _subdivide_mesh(mesh::BoundaryMesh{3,T,2}, V::Space{3,T},
     end
     return BoundaryMesh{3,T,2}(cells, normals)
 end
+
+# `Space` wrappers: subdivide against one space's own merged grid lines.
+_subdivide_mesh(mesh::BoundaryMesh{D,T,1}, V::Space{D,T}, tol::GeometryTolerance{T}) where {D,T} =
+    _subdivide_mesh(mesh, _level_grid_lines(V, tol), tol)
+_subdivide_mesh(mesh::BoundaryMesh{3,T,2}, V::Space{3,T}, tol::GeometryTolerance{T}) where {T} =
+    _subdivide_mesh(mesh, _level_grid_lines(V, tol), tol)
 
 # Fallback: combinations not covered above (e.g. `K = 2` in `D = 2`,
 # a codim-0 mesh) pass through unchanged.
@@ -586,6 +598,38 @@ struct SurfaceRegion{D,T<:Real}
     normals::Vector{SVector{D,T}}
 end
 
+# Physical quadrature for one sub-cell of a subdivided `BoundaryMesh`: the
+# reference-simplex rule mapped into physical space, jacobian-scaled weights, and
+# a per-point unit normal (the mesh's own normal at `cell_index` when present,
+# else the geometric `_default_normal`). Shared by the single-sided surface-region
+# builder and the two-sided interface-region builder — the only per-consumer
+# difference is parent classification and which region struct wraps the result.
+# `T` is recovered from the simplex measure and the point/normal type `P` from
+# the normal, so both accepted `K` (the cell's topological dimension) branches
+# stay type-stable without threading `{D,T}` in.
+function _simplex_cell_quadrature(cell, cell_index::Integer, mesh_normals, reference_samples,
+                                  reference_area, ::Val{K}) where {K}
+    measure = _simplex_measure(cell)
+    T = typeof(measure)
+    jacobian = K == 0 ? one(T) : measure / convert(T, reference_area)
+    normal = if mesh_normals === nothing
+        _default_normal(cell)
+    else
+        n = mesh_normals[cell_index]
+        n / sqrt(sum(x -> x * x, n))
+    end
+    P = typeof(normal)
+    points = P[]
+    weights = T[]
+    normals = P[]
+    for (eta, w_ref) in reference_samples
+        push!(points, _reference_to_physical_simplex(cell, eta))
+        push!(weights, w_ref * jacobian)
+        push!(normals, normal)
+    end
+    return points, weights, normals
+end
+
 # Build the full list of `SurfaceRegion`s for one `BoundaryMesh`
 # against a given space. Subdivides the user mesh against the cartesian
 # level grids so each emitted cell lies inside one parent per level,
@@ -605,25 +649,8 @@ function _surface_regions_for_mesh(V::Space{D,T}, mesh::BoundaryMesh{D,T,K},
         isempty(parents) &&
             throw(ArgumentError("BoundaryMesh cell #$cell_index lies entirely outside the " *
                                 "discretization — no covering parent found on any level"))
-
-        measure = _simplex_measure(cell)
-        jacobian = K == 0 ? one(T) : measure / convert(T, reference_area)
-        normal = if subdivided.normals === nothing
-            _default_normal(cell)
-        else
-            n = subdivided.normals[cell_index]
-            n / sqrt(sum(x -> x * x, n))
-        end
-
-        points = SVector{D,T}[]
-        weights = T[]
-        normals = SVector{D,T}[]
-        for (eta, w_ref) in reference_samples
-            push!(points, _reference_to_physical_simplex(cell, eta))
-            push!(weights, w_ref * jacobian)
-            push!(normals, normal)
-        end
-
+        points, weights, normals = _simplex_cell_quadrature(cell, cell_index, subdivided.normals,
+                                                            reference_samples, reference_area, Val(K))
         push!(regions, SurfaceRegion{D,T}(parents, points, weights, normals))
     end
 
@@ -667,6 +694,26 @@ function _surface_cell_parents(V::Space{D,T}, mesh::BoundaryMesh{D,T,K},
                                 "an inactive cell on level $(level.id)"))
         push!(parents,
               FacetParent{D,T}(level.id, midpoint_cell, cell_box(level.mesh, midpoint_cell)))
+    end
+    return parents
+end
+
+# Active covering parents of a physical point across every level of `V`:
+# one `FacetParent` per level whose mesh contains the point in an *active*
+# cell. Unlike `_surface_cell_parents` this never throws — a point outside
+# `V`, or inside a level's inactive (fictitious / masked) cell, simply
+# contributes no parent from that level. The two-sided interface builder
+# uses it per side and skips a sub-cell whose midpoint has no active cover
+# on one of the two subdomains (the interface trace there lies outside that
+# subdomain's active region).
+function _active_cover_parents(V::Space{D,T}, point::SVector{D,T},
+                               tol::GeometryTolerance{T}) where {D,T}
+    parents = FacetParent{D,T}[]
+    for level in V.levels
+        cell = locate_cell(level.mesh, point; tol)
+        cell === nothing && continue
+        is_active(level.mask, cell) || continue
+        push!(parents, FacetParent{D,T}(level.id, cell, cell_box(level.mesh, cell)))
     end
     return parents
 end

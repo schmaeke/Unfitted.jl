@@ -13,10 +13,10 @@
     @test diagnostics(model).dimension == 2
     @test diagnostics(model).integration_regions == 16
 
-    old_plan = model.integration
+    old_plan = Unfitted.integration_plan(model)
     move!(model; level=2, to=box((0.2, 0.2), (0.6, 0.6)))
     @test model.version == 2
-    @test model.integration !== old_plan
+    @test Unfitted.integration_plan(model) !== old_plan
     @test model.matrix === nothing
     @test diagnostics(model).integration_regions == 35   # merged (was 49 unmerged)
 end

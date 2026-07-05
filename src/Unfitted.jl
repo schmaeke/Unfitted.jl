@@ -73,7 +73,8 @@ export AxisBox, GeometryTolerance, PhysicalDomain, physical_domain, classify_cel
        complement, levelset_value, stl_levelset, mesh_levelset, CartesianMesh, Space,
        IntegratedLegendre, bspline, Field, BlockForm, LoadForm, TrialChannels, TestChannels,
        WeakForm, Problem, Model, Solution, box, mesh, space, overlay, field, block, loadform,
-       boundary, dirichlet, update_dirichlet!, neumann, BoundaryMesh, segment_mesh, polyline_mesh,
+       boundary, dirichlet, update_dirichlet!, neumann, couple, interface, Interface, InterfaceForm,
+       onside, jump_sign, BoundaryMesh, segment_mesh, polyline_mesh,
        triangle_mesh, points_mesh, poisson, mass, mass_form, mass_block, stiffness, stiffness_form,
        stiffness_block, load, source_form, source_load, load_vector, prepare, assemble_matrix,
        assemble_vector, assemble!, foreach_quadrature_point, nquadpoints, solve!, solution, move!,
@@ -138,6 +139,7 @@ include("dofs.jl")
 include("dirichlet.jl")
 include("surface.jl")
 include("problems.jl")
+include("coupling.jl")
 include("model.jl")
 include("assembly.jl")
 include("solvers.jl")

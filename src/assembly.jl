@@ -209,8 +209,8 @@ field_gradient(::Nothing, args...) = _no_form_state()
 # `active_dofs`). Returns the workspace's `active_dofs` vector, valid
 # until the next call.
 # (`ws` is an `AssemblyWorkspace`, defined further down this file.)
-function _region_active_dofs!(ws, model::Model, parents)
-    field_data = _region_field_data(ws, model, parents)
+function _region_active_dofs!(ws, model::Model, region)
+    field_data = _region_field_data(ws, model, region)
     _local_active_dof_table!(ws, field_data, model.dofs)
     return ws.active_dofs
 end
@@ -287,14 +287,24 @@ function _gustavson_pattern(feed!, n::Int, symmetric::Bool, key::UInt)
     return AssemblyPattern(n, colptr, rowval, symmetric, key)
 end
 
-# Assembly pattern over a model's volume / facet region lists: feed one
-# dense block per region from its (all-field) `active_dofs`.
-function build_assembly_pattern(model::Model{D,T}, region_lists, symmetric::Bool,
+# Ordered volume region lists for an assembly: each distinct subdomain
+# integration plan's `regions` (one list for single-domain). Ownership is
+# intrinsic to each region + field layout (`region_parents`), so no per-pass
+# `served` mask is needed — a field only receives parents on the levels its
+# subdomain owns. Object identity of each `plan.regions` is preserved so the
+# `objectid`-keyed gather / arena caches stay valid. Shared by the numeric
+# volume assembly (`_assemble_partitioned!`) and the symbolic pattern build so
+# both enumerate the same regions in the same order.
+_volume_passes(model::Model) = Any[plan.regions for plan in integration_plans(model)]
+
+# Assembly pattern over a model's volume/on region-list passes: feed one dense
+# block per region from the active dofs its owning fields emit there.
+function build_assembly_pattern(model::Model{D,T}, passes, symmetric::Bool,
                                 key::UInt) where {D,T}
     ws = _assembly_workspace(model)
     return _gustavson_pattern(active_unknowns(model.dofs), symmetric, key) do visit
-        for regions in region_lists, region in regions
-            visit(_region_active_dofs!(ws, model, region.parents))
+        for regions in passes, region in regions
+            visit(_region_active_dofs!(ws, model, region))
         end
     end
 end
@@ -307,19 +317,22 @@ end
 # contribute matrix entries, so they are ignored here).
 function _assembly_region_lists(model::Model, blocks)
     volume_blocks, _, partitions = _partition_forms_by_on(blocks, ())
-    lists = Any[]
+    passes = Any[]
     key = hash(:assembly_pattern)
     if !isempty(volume_blocks)
-        push!(lists, integration_plan(model).regions)
+        for pass in _volume_passes(model)
+            push!(passes, pass)
+        end
         key = hash(:volume, key)
     end
-    for (selector, _) in partitions
-        regions = _resolve_on_regions(model, selector)
+    for (selector, (sel_blocks, sel_loads)) in partitions
+        space = _partition_space(model, selector, sel_blocks, sel_loads)
+        regions = _resolve_on_regions(model, selector, space)
         isempty(regions) && continue
-        push!(lists, regions)
+        push!(passes, regions)
         key = hash(selector, key)
     end
-    return lists, key
+    return passes, key
 end
 
 # Return a CSC pattern matching `blocks` and `symmetric`, reusing the one
@@ -327,12 +340,12 @@ end
 # Newton loop's repeated assembly hits the cache and only the numeric
 # scatter re-runs). Rebuilds and re-caches otherwise.
 function _assembly_pattern!(model::Model, blocks, symmetric::Bool)
-    region_lists, key = _assembly_region_lists(model, blocks)
+    passes, key = _assembly_region_lists(model, blocks)
     cached = model.pattern
     if cached !== nothing && cached.symmetric == symmetric && cached.key == key
         return cached
     end
-    pattern = build_assembly_pattern(model, region_lists, symmetric, key)
+    pattern = build_assembly_pattern(model, passes, symmetric, key)
     model.pattern = pattern
     return pattern
 end
@@ -653,7 +666,7 @@ end
 # (which adds gradient / derivative-factor banks on top) and by the L²
 # transfer workspace (`_transfer_workspace` in projection.jl), whose
 # value-only integrals never need the gradient banks.
-function _level_value_buffers(levels::Tuple, ::Val{D}, ::Type{T}) where {D,T}
+function _level_value_buffers(levels, ::Val{D}, ::Type{T}) where {D,T}
     n = length(levels)
     bases = Vector{BasisFamily}(undef, n)
     local_ids = Vector{Vector{CartesianIndex{D}}}(undef, n)
@@ -678,9 +691,26 @@ end
 # Called once per thread in the threaded path and once per assembly call
 # in the serial path.
 function _assembly_workspace(model::Model{D,T}) where {D,T}
-    levels = model.problem.space.levels
+    p = model.problem
+    # Single-domain (the dominant path) passes the one space's levels as a
+    # concretely-typed `Tuple`, so the build loops below specialise on the level
+    # types instead of paying dynamic `getfield` through a `Vector{Any}`.
+    # Multi-domain passes the union of every subdomain's levels; `prepare`
+    # reindexed each space into a disjoint level-id block, so the concatenation
+    # has contiguous global ids `1:N` and the id-indexed banks never collide.
+    return _is_multidomain(p) ? _build_assembly_workspace(_problem_levels(p), Val(D), T) :
+           _build_assembly_workspace(p.space.levels, Val(D), T)
+end
+
+# Function barrier that specialises the per-level bank-build loops on the
+# concrete `levels` container (a typed `Tuple` single-domain, a `Vector` multi-
+# domain). Reuses `_level_value_buffers` for the shared value banks, then adds
+# the assembly-only gradient and derivative-factor banks (sized to the same
+# per-level basis count). Called once per thread in the threaded path and once
+# per assembly call in the serial path.
+function _build_assembly_workspace(levels, ::Val{D}, ::Type{T}) where {D,T}
     bases, local_ids, orders, values, val1d = _level_value_buffers(levels, Val(D), T)
-    nlev = length(levels)
+    nlev = length(values)
     gradients = Vector{Vector{SVector{D,T}}}(undef, nlev)
     der1d = Vector{NTuple{D,Vector{T}}}(undef, nlev)
     for level in levels
@@ -712,9 +742,30 @@ end
 # pass (`_region_active_dofs!`), the numeric per-region setup
 # (`_region_workspace_setup!`), and the quadrature-point walk
 # (`foreach_quadrature_point`), which each need the same nested table.
-function _region_field_data(ws::AssemblyWorkspace, model::Model, parents)
-    return [[_parent_dof_data(ws, layout, parent) for parent in parents]
-            for layout in model.dofs.fields]
+# Parents of `region` on which field `fl` (global index `field_index`) is
+# evaluated. Subdomain ownership is *intrinsic*: a single-space region hands its
+# parents only to a field whose level-id block contains the region's level, and
+# an empty list (contribute nothing) to every foreign-subdomain field. This
+# replaces the extrinsic per-pass `served` mask — a region built on one
+# subdomain's plan is owned exactly by the fields on that subdomain. For a
+# single-domain model every field's block covers every level, so every field
+# gets the parents (the pre-multidomain fast path, unchanged).
+region_parents(region::Union{VolumeRegion,FacetRegion,SurfaceRegion}, ::Int, fl::FieldLayout) =
+    (isempty(region.parents) || first(region.parents).level in fl.level_ids) ?
+    region.parents : empty(region.parents)
+
+# Two-sided: each coupled field is evaluated on its own subdomain's parents,
+# every other field on none (empty), so an interface pass emits into exactly
+# the four field blocks Kₐₐ, K_ab, K_ba, K_bb. Keyed on the field *index* (the
+# interface stores its two sides' global field indices), not the level block.
+region_parents(region::InterfaceRegion, field_index::Int, ::FieldLayout) =
+    field_index == region.field_a ? region.parents_a :
+    field_index == region.field_b ? region.parents_b : empty(region.parents_a)
+
+function _region_field_data(ws::AssemblyWorkspace, model::Model, region)
+    return [[_parent_dof_data(ws, layout, parent)
+             for parent in region_parents(region, field_index, layout)]
+            for (field_index, layout) in pairs(model.dofs.fields)]
 end
 
 # Evaluate basis values and physical gradients once per level present in
@@ -781,10 +832,11 @@ end
 # once per accessor rather than as three copied loops.
 
 # Reference→physical Jacobian for the region's weights: `vol(box)/2ᴰ` for a
-# volume region (whose weights are reference-frame), `one(T)` for facet /
-# surface regions (whose weights are already physical-frame).
+# volume region (whose weights are reference-frame), `one(T)` for facet, surface,
+# and interface regions (whose weights are already physical-frame).
 _region_jacobian(region::VolumeRegion{D,T}) where {D,T} = volume(region.box) / convert(T, 2^D)
-_region_jacobian(::Union{FacetRegion{D,T},SurfaceRegion{D,T}}) where {D,T} = one(T)
+_region_jacobian(::Union{FacetRegion{D,T},SurfaceRegion{D,T},InterfaceRegion{D,T}}) where {D,T} =
+    one(T)
 
 # Advance to local quadrature point `local_qp`: refresh every parent's basis
 # values / physical gradients into the workspace and return `(x, qweight)`. A
@@ -815,10 +867,23 @@ end
 # identifier `q.sides` (only a facet carries one).
 _region_normal(::VolumeRegion, ::Int) = nothing
 _region_normal(region::FacetRegion, ::Int) = region.normal
-_region_normal(region::SurfaceRegion, local_qp::Int) = region.normals[local_qp]
-_region_sides(::VolumeRegion) = nothing
+_region_normal(region::Union{SurfaceRegion,InterfaceRegion}, local_qp::Int) =
+    region.normals[local_qp]
+_region_sides(::Union{VolumeRegion,SurfaceRegion,InterfaceRegion}) = nothing
 _region_sides(region::FacetRegion) = region.sides
-_region_sides(::SurfaceRegion) = nothing
+
+# Interface region: weights are physical-frame (unit Jacobian, shared above) and
+# each quadrature point refreshes BOTH sides' bases into their (disjoint) level
+# banks at the shared physical point, so the block loop reads field `a` from
+# `a`'s cut cell and field `b` from `b`'s cut cell simultaneously.
+@inline function _region_qpoint!(ws::AssemblyWorkspace{D,T}, region::InterfaceRegion{D,T},
+                                 local_qp::Int, ::T) where {D,T}
+    x = region.points[local_qp]
+    qweight = region.weights[local_qp]
+    _update_physical_basis!(ws, region.parents_a, x)
+    _update_physical_basis!(ws, region.parents_b, x)
+    return x, qweight
+end
 
 """
     _assemble_region!(ws, sink, rhs, model, region, blocks, loads,
@@ -855,13 +920,15 @@ region's local system is finally flushed by [`_emit_local_system!`](@ref).
 [`foreach_quadrature_point`](@ref) and per-point history data.
 """
 function _assemble_region!(ws::AssemblyWorkspace{D,T}, sink, rhs::Vector{T}, model::Model{D,T},
-                           region::Union{VolumeRegion{D,T},FacetRegion{D,T},SurfaceRegion{D,T}},
+                           region::Union{VolumeRegion{D,T},FacetRegion{D,T},SurfaceRegion{D,T},
+                                         InterfaceRegion{D,T}},
                            blocks, loads, symmetric::Bool, state_coefficients=nothing,
                            point_offset::Int=0) where {D,T}
-    # Region setup: per-field parent data, region-local dof table, optional
-    # state, local matrix / rhs buffers.
+    # Region setup: per-field parent data (each field owns its subdomain's
+    # regions intrinsically, see `region_parents`), region-local dof table,
+    # optional state, local matrix / rhs buffers.
     field_data, local_by_field, state, local_matrix, local_rhs = _region_workspace_setup!(ws, model,
-                                                                                          region.parents,
+                                                                                          region,
                                                                                           state_coefficients,
                                                                                           !isempty(blocks))
     jacobian = _region_jacobian(region)
@@ -915,9 +982,9 @@ end
 # the flat, pooled compute→gather arena (thread-count-independent), not this
 # setup. So it is rebuilt per call rather than cached; re-profile before
 # reconsidering.
-function _region_workspace_setup!(ws::AssemblyWorkspace{D,T}, model::Model{D,T}, parents,
+function _region_workspace_setup!(ws::AssemblyWorkspace{D,T}, model::Model{D,T}, region,
                                   state_coefficients, have_blocks::Bool) where {D,T}
-    field_data = _region_field_data(ws, model, parents)
+    field_data = _region_field_data(ws, model, region)
     local_by_field = _local_active_dof_table!(ws, field_data, model.dofs)
     state = state_coefficients === nothing ? nothing :
             FormState(field_data, model.dofs, state_coefficients)
@@ -1150,12 +1217,13 @@ function _quadrature_count(plan::IntegrationPlan)
     sum(length(r.quadrature.weights) for r in plan.regions; init=0)
 end
 
-# Per-region quadrature-point counts, used to compute the
-# `point_offset` each region sees. Defined for both volume and facet
-# regions so the serial/threaded drivers stay region-kind-agnostic.
+# Per-region quadrature-point counts, used to compute the `point_offset` each
+# region sees. Defined for every region kind so the serial/threaded drivers stay
+# region-kind-agnostic; the physical-frame kinds (facet / surface / interface)
+# share one method as their weights vector already holds one entry per point.
 _region_qpoint_count(region::VolumeRegion) = length(region.quadrature.weights)
-_region_qpoint_count(region::FacetRegion) = length(region.weights)
-_region_qpoint_count(region::SurfaceRegion) = length(region.weights)
+_region_qpoint_count(region::Union{FacetRegion,SurfaceRegion,InterfaceRegion}) =
+    length(region.weights)
 
 # Cumulative offsets of the global `q.point` index over a region list.
 # Volume and facet kinds maintain independent counters: callers pass
@@ -1297,7 +1365,7 @@ function _build_gather(model::Model, regions, pattern, symmetric::Bool, nactive:
     bsrc = [Int[] for _ in 1:n]
     ddst = [Int[] for _ in 1:nactive]
     for (r, region) in enumerate(regions)
-        ad = copy(_region_active_dofs!(ws, model, region.parents))
+        ad = copy(_region_active_dofs!(ws, model, region))
         ri = region_rhs[r]
         @inbounds for lr in eachindex(ad)
             push!(ddst[ad[lr]], ri)
@@ -1537,6 +1605,37 @@ function _partition_forms_by_on(blocks, loads)
     return volume_blocks, volume_loads, partitions
 end
 
+# The subdomain space a single-sided `on`-partition acts on, taken from the test
+# field of the forms in the partition (its name is always a problem field, even
+# for a one-shot `assemble_matrix(model, block; on=…)` whose mesh the model never
+# cached). `Interface` partitions are two-sided and return `nothing` — their
+# `InterfaceRegion` carries both sides' parents itself.
+#
+# A single-sided region is built once, against this one space, and its parents
+# live on that space's level block, so only that space's fields evaluate on it
+# (`region_parents`). If one `on` object is shared by forms whose test fields
+# live on *different* subdomain spaces, only the first space's contribution
+# would be assembled and the rest silently
+# dropped. Reject that: give each subdomain its own `on=` mesh/selector object (a
+# genuine coupling between subdomains uses `interface(uₐ, u_b, Γ)` instead).
+function _partition_space(model::Model, on, blocks, loads)
+    on isa Interface && return nothing
+    space = nothing
+    for form in Iterators.flatten((blocks, loads))
+        s = _field_space(model.problem, form.test_name)
+        if space === nothing
+            space = s
+        elseif s !== space
+            throw(ArgumentError(
+                "the single-sided `on=` target is shared by forms whose test fields live on " *
+                "different subdomain spaces, so only one subdomain's contribution would be " *
+                "assembled; give each subdomain its own `on=` mesh/selector object (couple " *
+                "subdomains with `interface(uₐ, u_b, Γ)`)"))
+        end
+    end
+    return space === nothing ? model.problem.space : space
+end
+
 # ── Public assembly API ───────────────────────────────────────────────────────
 
 # Normalise a single-form / form-tuple argument to a tuple. Lets the
@@ -1620,7 +1719,6 @@ The current implementation supports strong Dirichlet elimination
 (through the dof layer) and dof-wise homogeneous overlay constraints.
 """
 function assemble!(model::Model{D,T}; threaded::Bool=Threads.nthreads() > 1) where {D,T}
-    plan = integration_plan(model)
     nactive = active_unknowns(model.dofs)
     symmetric = model.problem.symmetric
     pattern = _assembly_pattern!(model, model.problem.blocks, symmetric)
@@ -1635,14 +1733,13 @@ function assemble!(model::Model{D,T}; threaded::Bool=Threads.nthreads() > 1) whe
     # and the residual is exactly zero.
     symmetry_residual = symmetric ? 0.0 : NaN
     condition_estimate = _condition_estimate(matrix)
-    model.integration = plan
     model.matrix = matrix
     model.rhs = rhs
     diag = model.diagnostics
     diag.active_unknowns = nactive
     diag.symmetry_residual = symmetry_residual
     diag.condition_estimate = condition_estimate
-    _set_plan_stats!(diag, plan)
+    _set_plan_stats_multi!(diag, integration_plans(model))
     return model
 end
 
@@ -1658,19 +1755,25 @@ function _assemble_partitioned!(sink, model::Model{D,T}, blocks, loads, nactive:
     volume_blocks, volume_loads, partitions = _partition_forms_by_on(blocks, loads)
     rhs = zeros(T, nactive)
 
-    # Volume contributions — the dominant path. Reuses the cached
-    # integration plan.
+    # Volume contributions — the dominant path. One pass per distinct subdomain
+    # integration plan; each region is owned by the fields on its subdomain
+    # intrinsically (`region_parents`), so single-domain collapses to one pass
+    # over the shared plan with every field participating.
     if !isempty(volume_blocks) || !isempty(volume_loads)
-        plan = integration_plan(model)
-        _run_pass!(sink, rhs, model, plan.regions, symmetric, Tuple(volume_blocks),
-                   Tuple(volume_loads), region_filter, state_coefficients, threaded)
+        for regions in _volume_passes(model)
+            _run_pass!(sink, rhs, model, regions, symmetric, Tuple(volume_blocks),
+                       Tuple(volume_loads), region_filter, state_coefficients, threaded)
+        end
     end
 
     # Non-volume contributions — one assembly pass per unique `on=`
     # value. `region_filter` is a volume-only convenience and is not
-    # forwarded to the facet / surface passes.
+    # forwarded to the facet / surface passes. `_partition_space` rejects a
+    # single-sided target shared across subdomains, so each region list is owned
+    # by one subdomain's fields.
     for (selector, (sel_blocks, sel_loads)) in partitions
-        regions = _resolve_on_regions(model, selector)
+        space = _partition_space(model, selector, sel_blocks, sel_loads)
+        regions = _resolve_on_regions(model, selector, space)
         isempty(regions) && continue
         _run_pass!(sink, rhs, model, regions, symmetric, Tuple(sel_blocks), Tuple(sel_loads),
                    nothing, state_coefficients, threaded)
@@ -1701,15 +1804,40 @@ end
 # referenced by `prepare(problem)` is pre-resolved); falls back to a
 # fresh build for one-shot calls like
 # `assemble_matrix(model, block_with_unseen_on=…)`.
-function _resolve_on_regions(model::Model{D,T}, selector::BoundarySelector) where {D,T}
-    return get(() -> _facet_regions_for_selector(model.problem.space, selector,
-                                                 model.dofs.tolerance), model.facet_regions,
-               selector)
+# `space` is the subdomain the region is (re)built against on a cache miss; it
+# defaults to the representative space for field-agnostic callers like
+# `boundary_integral`. Cache hits (every `on` referenced by `prepare`) return
+# the regions already built against the referencing field's own space, so the
+# default only matters for a one-shot mesh the model never saw.
+function _resolve_on_regions(model::Model{D,T}, selector::BoundarySelector,
+                             space=model.problem.space) where {D,T}
+    return get(() -> _facet_regions_for_selector(space, selector, model.dofs.tolerance),
+               model.facet_regions, selector)
 end
 
-function _resolve_on_regions(model::Model{D,T}, mesh::BoundaryMesh{D,T}) where {D,T}
-    return get(() -> _surface_regions_for_mesh(model.problem.space, mesh, model.dofs.tolerance),
+function _resolve_on_regions(model::Model{D,T}, mesh::BoundaryMesh{D,T},
+                             space=model.problem.space) where {D,T}
+    return get(() -> _surface_regions_for_mesh(space, mesh, model.dofs.tolerance),
                model.surface_regions, mesh)
+end
+
+# Resolve the two-sided integration regions for an interface coupling tag from
+# the per-model cache (pre-resolved at `prepare` for every referenced
+# interface); build on demand for a one-shot `assemble_matrix(model, block;
+# on=iface)` with an unseen interface.
+function _resolve_on_regions(model::Model, iface::Interface, _space=nothing)
+    return get(() -> _interface_regions_for_model(model, iface), model.interface_regions, iface)
+end
+
+# Resolve an interface tag's field indices and subdomain spaces from the model,
+# then build its regions. Field indices come from the dof layout (global field
+# order); spaces come from the effective problem's fields.
+function _interface_regions_for_model(model::Model, iface::Interface)
+    field_a = _field_index(model.dofs, iface.field_a)
+    field_b = _field_index(model.dofs, iface.field_b)
+    space_a = _field_space(model.problem, iface.field_a)
+    space_b = _field_space(model.problem, iface.field_b)
+    return _interface_regions(iface, space_a, space_b, field_a, field_b, model.dofs.tolerance)
 end
 
 """
@@ -1727,6 +1855,10 @@ variables for inelastic constitutive laws.
     [`foreach_quadrature_point`](@ref) caller).
   - `:facet` — total facet quadrature points across every cached
     [`FacetRegion`](@ref) on the model.
+  - `:surface` — total quadrature points across every cached immersed
+    [`SurfaceRegion`](@ref) ([`BoundaryMesh`](@ref) integration).
+  - `:interface` — total quadrature points across every cached
+    multi-domain coupling [`InterfaceRegion`](@ref).
 
 Counters are **per kind**: a `q.point` index inside a volume form is
 not interchangeable with a `q.point` index inside a future facet
@@ -1734,10 +1866,12 @@ form. Each form's per-point state array should be sized by
 `nquadpoints(model; kind=...)` for its own kind.
 """
 function nquadpoints(model::Model; kind::Symbol=:volume)
-    kind === :volume && return _quadrature_count(integration_plan(model))
+    kind === :volume && return sum(_quadrature_count(p) for p in integration_plans(model); init=0)
     kind === :facet && return _facet_quadpoint_count(model)
     kind === :surface && return _surface_quadpoint_count(model)
-    throw(ArgumentError("nquadpoints kind must be :volume, :facet, or :surface, got $kind"))
+    kind === :interface && return _interface_quadpoint_count(model)
+    throw(ArgumentError("nquadpoints kind must be :volume, :facet, :surface, or :interface, " *
+                        "got $kind"))
 end
 
 # Sum of physical-frame Q-points across every cached facet region. The
@@ -1759,6 +1893,18 @@ end
 function _surface_quadpoint_count(model::Model)
     total = 0
     for (_, list) in model.surface_regions
+        for region in list
+            total += length(region.weights)
+        end
+    end
+    return total
+end
+
+# Sum of physical-frame Q-points across every cached interface region.
+# Used by the `:interface` branch of `nquadpoints`.
+function _interface_quadpoint_count(model::Model)
+    total = 0
+    for (_, list) in model.interface_regions
         for region in list
             total += length(region.weights)
         end
@@ -1790,8 +1936,17 @@ where
 
 Iteration order matches the serial assembly path; threaded assembly
 sees the same `q.point` indices but visits them in a different order.
+
+Single-domain only: on a coupled (multi-subdomain) model this throws,
+since a single global per-point ordering across subdomains is not yet
+defined. `QuadField{T}(model; init)` inherits the same restriction.
 """
 function foreach_quadrature_point(f, model::Model{D,T}; state=nothing) where {D,T}
+    # Walks a single subdomain plan with a single-space workspace, so a coupled
+    # model would silently visit only the first subdomain (and evaluate `state`
+    # on the wrong parents). Per-point iteration across coupled subdomains — one
+    # global quadrature-point ordering shared with assembly — is deferred.
+    _assert_single_domain(model, "foreach_quadrature_point")
     plan = integration_plan(model)
     coefficients = _iterate_coefficients(state, model)
     offsets = _region_qpoint_offsets(plan.regions)
@@ -1800,7 +1955,7 @@ function foreach_quadrature_point(f, model::Model{D,T}; state=nothing) where {D,
         offset = offsets[region_index]
         jacobian = volume(region.box) / convert(T, 2^D)
         st = coefficients === nothing ? nothing :
-             FormState(_region_field_data(ws, model, region.parents), model.dofs, coefficients)
+             FormState(_region_field_data(ws, model, region), model.dofs, coefficients)
         for (local_qp, (eta, weight)) in
             enumerate(zip(region.quadrature.points, region.quadrature.weights))
             coefficients === nothing || _update_region_basis!(ws, region, eta)

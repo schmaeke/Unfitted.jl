@@ -283,9 +283,11 @@ the system, and the Dirichlet conditions imposed at the dof layer.
 
 Fields:
 
-  - `space::S` — the common [`Space`](@ref) every field lives on
-    (multi-field problems currently require all fields over the same
-    space).
+  - `space::S` — a **representative** [`Space`](@ref) (the first field's),
+    used only where a single space suffices: the problem's `(D, T)` and
+    the single-field / single-domain consumers. The authoritative space of
+    each field is `field.space`; a coupled problem carries several distinct
+    subdomain spaces (see [`problem_spaces`](@ref)).
   - `fields::FS` — `Tuple` of [`Field`](@ref)s. Order is preserved in
     the global dof enumeration.
   - `blocks::B` — `Tuple` of [`BlockForm`](@ref)s contributing to the
@@ -326,8 +328,10 @@ Three convenience constructors:
     defaults to "all blocks are symmetric"; pass `symmetric = false`
     explicitly for non-symmetric coupling.
 
-Currently every multi-field problem requires all fields over the same
-space (relaxing this is a known follow-up).
+Fields may live on **distinct** spaces: a coupled problem discretises each
+subdomain on its own [`Space`](@ref) (own mesh, own level-set fold, own dof
+block), and off-diagonal `block(uₐ, u_b, …)` / [`couple`](@ref) forms tie
+them together. Single-space problems are the common special case.
 """
 Problem(V::Space{D,T}, form; dirichlet=[]) where {D,T} = Problem(field(:u, V), form; dirichlet)
 
@@ -347,18 +351,46 @@ function _field_names(fields)
     return names
 end
 
-# Sanity-check the field tuple of a multi-field problem: non-empty, all
-# fields over the same `Space`, no duplicate names. Returns the shared
-# `Space` and the field-name list.
+# Sanity-check the field tuple of a multi-field problem: non-empty, no
+# duplicate names. Fields may live over *different* spaces (multi-domain
+# coupling): each `Field` carries its own `Space`, and the dof, integration,
+# and assembly layers key everything by the owning field. Returns a
+# *representative* space — the first field's — used only to infer the
+# problem's `(D, T)` type parameters and to serve single-field consumers that
+# still reach through `problem.space`; the authoritative per-field space is
+# always `field.space`. Also returns the field-name list.
 function _check_problem_fields(fields::Tuple)
     isempty(fields) && throw(ArgumentError("a problem needs at least one field"))
-    first_field = first(fields)
     names = _field_names(fields)
-    for field in fields
-        field.space == first_field.space ||
-            throw(ArgumentError("multi-field problems currently require fields over the same space"))
+    return first(fields).space, names
+end
+
+# Distinct spaces spanned by a problem's fields, in first-appearance order,
+# deduplicated by object identity (fields sharing a space appear once). This
+# is the set of independent discretisations a multi-domain problem couples;
+# for a single-domain problem it is a one-element vector. Consumers that must
+# act per-discretisation — the physical fold, the per-space integration
+# plans, and the assembly workspace's level-id namespacing — iterate this.
+function problem_spaces(problem::Problem)
+    spaces = Space[]
+    for field in problem.fields
+        any(s -> s === field.space, spaces) || push!(spaces, field.space)
     end
-    return first_field.space, names
+    return spaces
+end
+
+# Whether `problem` couples more than one distinct subdomain space. The
+# single-space case is the dominant path and takes typed fast branches (e.g. the
+# concretely-typed level tuple in `_assembly_workspace`).
+_is_multidomain(problem::Problem) = length(problem_spaces(problem)) > 1
+
+# The `Space` owning `field_name` in `problem`. Used to route a field's
+# volume / boundary / interface contributions to its own discretisation.
+function _field_space(problem::Problem, field_name::Symbol)
+    for field in problem.fields
+        field.name === field_name && return field.space
+    end
+    throw(ArgumentError("unknown field $field_name"))
 end
 
 # Check that every block/load form references known field names. Raises
