@@ -339,6 +339,26 @@ function instantiate_basis(basis::BasisFamily, mesh::CartesianMesh{D,T}, order::
     basis
 end
 
+# Whether a basis family supports an immersed `PhysicalDomain` — the α-FCM fold,
+# cut-cell moment-fit quadrature, and the fictitious-fold C⁰ constraint rule that
+# keeps a cut cell's boundary modes on its fully-fictitious fold faces. Defaults
+# to `true`. The B-spline extension overrides it to `false`: its overlay-
+# constraint generator emits trace-vanishing constraints on every active/inactive
+# face with no fictitious-fold exemption, so it would over-constrain cut-cell
+# modes on fold faces (silently degrading the FCM solution).
+_supports_physical_domain(::BasisFamily) = true
+
+# Reject a `PhysicalDomain` on a basis family that cannot integrate it yet.
+# Called from every space-building entry point once the concrete family exists.
+function _check_physical_basis(family::BasisFamily, physical)
+    physical === nothing || _supports_physical_domain(family) ||
+        throw(ArgumentError(
+            "the $(basis_name(family)) basis family does not yet support an immersed physical " *
+            "domain (finite-cell method): its overlay constraints would over-constrain cut-cell " *
+            "modes on fold faces. Use the default integrated-Legendre basis for FCM problems."))
+    return nothing
+end
+
 """
     space(domain::AxisBox; cells, order=1, basis=IntegratedLegendre(),
                           mode=:tensor, active=nothing, physical=nothing)
@@ -373,6 +393,7 @@ function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(),
     base_mesh = CartesianMesh(domain; cells)
     mask = _normalize_mask(active, base_mesh)
     family = instantiate_basis(basis, base_mesh, orders, mode, mask)
+    _check_physical_basis(family, physical)
     base_level = Level{D,T,typeof(family)}(1, :base, base_mesh, family, orders, mode, mask)
     return Space{D,T,Tuple{typeof(base_level)}}(domain, (base_level,), physical)
 end
@@ -415,6 +436,7 @@ function overlay(V::Space{D,T}, domain::AxisBox{D,T}; cells, order=V.levels[1].o
     mask = _normalize_mask(active, overlay_mesh)
     id = length(V.levels) + 1
     family = instantiate_basis(basis, overlay_mesh, orders, mode, mask)
+    _check_physical_basis(family, V.physical)
     level = Level{D,T,typeof(family)}(id, :overlay, overlay_mesh, family, orders, mode, mask)
     levels = (V.levels..., level)
     return Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
@@ -496,15 +518,17 @@ end
 
 # Apply the PhysicalDomain fold to `V`. For each level, classifies cells
 # against `V.physical` and merges the resulting fictitious mask into the
-# level's user mask. Returns `V` unchanged when there is no physical
-# domain (`V.physical === nothing`) or when α-FCM is in use (`alpha > 0`
-# keeps fictitious cells active with α-scaled quadrature; folding them
-# out of the dof layout here would erroneously drop them). The
-# `_ClassifyCache` carries the per-box classification verdicts so the
-# region-level dispatcher in `intersections.jl` can reuse them.
+# level's user mask, so cells fully outside Ω are dropped from the dof layout.
+# This happens *regardless of α* — the α-FCM stabilization enriches cut-cell
+# quadrature (in `intersections.jl`), it does not keep whole fictitious cells
+# around. Returns `V` unchanged only when there is no physical domain, or when
+# `keep_fictitious` opts into the classic α-FCM treatment (fully-fictitious
+# cells kept active with α-scaled quadrature). The `_ClassifyCache` carries the
+# per-box classification verdicts so the region-level dispatcher in
+# `intersections.jl` can reuse them.
 function _apply_physical_fold(V::Space{D,T}, cache::_ClassifyCache{D,T}) where {D,T}
     V.physical === nothing && return V
-    V.physical.alpha == 0 || return V
+    V.physical.keep_fictitious && return V
 
     new_levels = ntuple(length(V.levels)) do i
         level = V.levels[i]
@@ -524,6 +548,28 @@ end
 # once, discard. Used by `space(...)` and the activation mutators when
 # nobody is going to reuse the cache.
 _apply_physical_fold(V::Space{D,T}) where {D,T} = _apply_physical_fold(V, _ClassifyCache{D,T}())
+
+# Rebuild `V` with every level id shifted by `offset`, giving the space a
+# disjoint level-id block `[offset+1, offset+level_count]`.
+#
+# Level ids are unique only *within* one space (base = 1, overlays 2, 3, …).
+# When several independent discretisations are coupled in one multi-domain
+# model, the assembly workspace banks basis values in a single flat vector
+# indexed by level id, and each field's dof layout keys `cell_dofs` by the
+# same id — so before those are built, each participating space is reindexed
+# into its own contiguous id block. `offset == 0` returns `V` unchanged (the
+# single-domain fast path). Positional level addressing (`move!` / `activate!`,
+# which index `V.levels` by position) is unaffected; `_level_by_id` scans by
+# id and works with any id assignment.
+function _reindex_space_levels(V::Space{D,T}, offset::Int) where {D,T}
+    offset == 0 && return V
+    new_levels = ntuple(length(V.levels)) do i
+        lvl = V.levels[i]
+        Level{D,T,typeof(lvl.basis)}(lvl.id + offset, lvl.role, lvl.mesh, lvl.basis, lvl.order,
+                                     lvl.mode, lvl.mask)
+    end
+    return Space{D,T,typeof(new_levels)}(V.domain, new_levels, V.physical)
+end
 
 # Flip cells in `on` selected by `cells` to `value`. Accepts the same
 # shapes as `_normalize_mask`'s selector branches: `AbstractArray{Bool,D}`,

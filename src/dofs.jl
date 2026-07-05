@@ -364,7 +364,8 @@ end
 # job with B-spline function-index conventions and the C⁰-knot
 # treatment of mask-induced internal junctions.
 function _has_overlay_constraint(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
-                                 domain::AxisBox{D,T}, tol::GeometryTolerance{T}) where {D,T}
+                                 physical, domain::AxisBox{D,T}, tol::GeometryTolerance{T},
+                                 cache::_ClassifyCache{D,T}) where {D,T}
     n = level.mesh.cells
     for axis in 1:D
         axis_key = key.axes[axis]
@@ -381,14 +382,56 @@ function _has_overlay_constraint(key::TensorDofKey{D}, level::Level{D,T,<:Integr
         #                       artificial.
         #   i == n[axis] + 1  — mesh's upper-axis face, symmetric.
         #   otherwise         — internal face between active and inactive
-        #                       cells of the same level, always artificial.
+        #                       cells of the same level. Artificial only when it
+        #                       carries physical material: a fully-fictitious
+        #                       fold face leaves the mode active (see
+        #                       `_internal_face_is_physical`).
         if i == 1
             _level_side_is_physical(level, domain, axis, :lower, tol) || return true
         elseif i == n[axis] + 1
             _level_side_is_physical(level, domain, axis, :upper, tol) || return true
         else
-            return true
+            _internal_face_is_physical(key, level, physical, axis, i, n, cache) && return true
         end
+    end
+    return false
+end
+
+# True iff the internal active/inactive face along `axis` at node index `i`
+# carries physical material — i.e. at least one inactive cell across the face
+# is not fully fictitious. Mirrors `_on_active_face`'s perpendicular incidence
+# so it visits exactly the cells the face separates, and classifies only the
+# inactive neighbour on each such face.
+#
+# The fictitious fold deactivates fully-fictitious cells, so a fold face sees
+# only fictitious material on its inactive side and returns `false`: its
+# boundary modes stay active. They vanish on every physical face — so they
+# cannot break the C⁰ trace condition the overlay constraint enforces — and
+# instead carry the adjacent cut cell's approximation up to ∂Ω. A user mask
+# that excludes *physical* cells returns `true`: those modes are non-zero on a
+# physical face and must be eliminated to keep the truncated solution
+# continuous. With no physical domain there is no fictitious material, so every
+# internal active/inactive face is physical (the original overlay/user-mask
+# behaviour) and the `cache` is never touched.
+function _internal_face_is_physical(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
+                                    physical, axis::Integer, i::Integer, n::NTuple{D,Int},
+                                    cache::_ClassifyCache{D,T}) where {D,T}
+    physical === nothing && return true
+    ranges = ntuple(D) do d
+        if d == axis
+            1:1
+        else
+            kd = key.axes[d]
+            kd.kind == _AXIS_NODE ? (max(1, kd.index-1):min(n[d], kd.index)) : (kd.index:kd.index)
+        end
+    end
+    for outer in CartesianIndices(ranges)
+        below_active = _cell_active(level, axis, i - 1, outer.I, n)
+        above_active = _cell_active(level, axis, i, outer.I, n)
+        below_active == above_active && continue
+        inactive_pos = below_active ? i : i - 1
+        cell = CartesianIndex(ntuple(d -> d == axis ? inactive_pos : outer[d], D))
+        classify_cell(physical, cell_box(level.mesh, cell), cache) === :fictitious || return true
     end
     return false
 end
@@ -424,10 +467,16 @@ of [`dof_layout`](@ref).
 """
 function _overlay_constraints(level::Level{D,T,B}, V::Space{D,T}, tol::GeometryTolerance{T},
                               raw_by_key::AbstractDict{TensorDofKey{D},Int},
-                              level_keys::AbstractVector{Pair{TensorDofKey{D},Int}}) where {D,T,B}
+                              level_keys::AbstractVector{Pair{TensorDofKey{D},Int}},
+                              classify_cache::_ClassifyCache{D,T}) where {D,T,B}
     constraints = LinearConstraint{T}[]
+    # `classify_cache` is the space's fold cache: the internal-face predicate
+    # below re-classifies inactive neighbours to tell a fully-fictitious fold
+    # face (mode stays active) from a physical user-mask face (mode eliminated),
+    # and every fold-boundary cell box is already in the cache. Empty and unused
+    # when `V.physical === nothing`.
     for (key, raw) in level_keys
-        _has_overlay_constraint(key, level, V.domain, tol) || continue
+        _has_overlay_constraint(key, level, V.physical, V.domain, tol, classify_cache) || continue
         push!(constraints, LinearConstraint{T}([raw], [one(T)]))
     end
     return constraints
@@ -604,6 +653,10 @@ Keyword arguments:
   - `dirichlet` — iterable of [`DirichletCondition`](@ref)s.
   - `tolerance` — `GeometryTolerance` used by boundary detection.
   - `components` — scalar channels per field (≥ 1).
+  - `classify_cache` — the space's cell-classification cache (shared with the
+    `PhysicalDomain` fold). The fictitious-fold constraint predicate reuses it
+    instead of re-classifying fold-boundary cells; defaults to a fresh empty
+    cache for standalone calls.
 
 The integrated Legendre family produces single-raw constraints,
 reducing the resolved expansion to strong elimination (`raw_expansion =
@@ -614,15 +667,22 @@ artificial boundaries; the assembly path distributes entries through
 the expansion automatically.
 """
 function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
-                    components::Integer=1) where {D,T}
+                    components::Integer=1,
+                    classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
     components > 0 || throw(ArgumentError("dof layout components must be positive"))
     raw_by_key = Dict{TensorDofKey{D},Int}()
     raw_keys = TensorDofKey{D}[]
-    cell_dofs_by_level = Vector{Array{Vector{Int},D}}(undef, length(V.levels))
+    # Indexed by level *id*, not by position: for a single-domain space the two
+    # coincide (base = 1, overlays 2, 3, …), but a subdomain of a coupled model
+    # is reindexed into a disjoint id block by `_reindex_space_levels`, so this
+    # layout's ids run over that block and match the `parent.level` id the
+    # assembly workspace and `cell_dofs` key by (leading slots below the block
+    # stay `undef` and are never addressed by this field's parents).
+    cell_dofs_by_level = Vector{Array{Vector{Int},D}}(undef, maximum(l -> l.id, V.levels))
 
     # Stage 1: walk every level's cells and assign raw dofs through the
     # `TensorDofKey` cache (cross-cell endpoint sharing happens here).
-    for (level_index, level) in pairs(V.levels)
+    for level in V.levels
         level_cells = Array{Vector{Int},D}(undef, level.mesh.cells)
         for cell in cell_indices(level.mesh)
             if is_active(level.mask, cell)
@@ -631,7 +691,7 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
                 level_cells[cell] = Int[]
             end
         end
-        cell_dofs_by_level[level_index] = level_cells
+        cell_dofs_by_level[level.id] = level_cells
     end
 
     # Stage 2: collect linear constraints per level and resolve to expansions.
@@ -646,7 +706,8 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     constraints = LinearConstraint{T}[]
     for level in V.levels
         level_keys = get(keys_by_level, level.id, empty_keys)
-        append!(constraints, _overlay_constraints(level, V, tolerance, raw_by_key, level_keys))
+        append!(constraints,
+                _overlay_constraints(level, V, tolerance, raw_by_key, level_keys, classify_cache))
     end
     raw_expansion = Vector{Vector{Tuple{Int,T}}}(undef, nraw)
     _resolve_constraints!(raw_expansion, constraints, nraw)
@@ -790,19 +851,27 @@ end
 # ── FieldLayout and SystemLayout (multi-field problems) ───────────────────────
 
 """
-    FieldLayout{D,T}(name, components, dofs, offset)
+    FieldLayout{D,T}(name, components, dofs, offset, level_ids)
 
 One field's slot inside a multi-field [`SystemLayout`](@ref). `dofs` is
 the field's own [`DofLayout`](@ref); `offset` is the field's starting
 column in the global active-dof vector (the active dofs of all earlier
 fields take ids 1 through `offset`, and this field's active dofs take
 ids `offset + 1` through `offset + active_unknowns(dofs)`).
+
+`level_ids` is the contiguous block of (globally reindexed) level ids the
+field's [`Space`](@ref) owns. Assembly uses it to route each integration
+region to the field that owns it: a region whose parents live on a level
+outside this range belongs to another subdomain and this field skips it
+(`region_parents`). For a single-domain problem every field's range covers
+every level, so every field evaluates on every region.
 """
 struct FieldLayout{D,T<:Real}
     name::Symbol
     components::Int
     dofs::DofLayout{D,T}
     offset::Int
+    level_ids::UnitRange{Int}
 end
 
 """

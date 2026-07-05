@@ -12,6 +12,12 @@ using LinearAlgebra
                                                target_residual=0.0)
     @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1,
                                                target_residual=-1.0)
+    # keep_fictitious keeps fully-fictitious cells active, so it needs α > 0 to
+    # give them quadrature; pairing it with the strict-cut path is singular.
+    @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1,
+                                               keep_fictitious=true, alpha=0.0)
+    @test physical_domain(x -> x[1]; subcell_length_scale=0.1, keep_fictitious=true,
+                          alpha=1.0e-6).keep_fictitious
 
     # A bare callable is auto-wrapped as a single leaf carrying the `lipschitz`
     # keyword; the domain-level integration knobs live on the PhysicalDomain.
@@ -245,12 +251,18 @@ end
     @test active[1, 1]    # well outside the disk
 end
 
-@testset "fictitious-cell fold matches manual deactivation (dof structure)" begin
-    # Verify that the cell-level fictitious fold drops the same cells from the
-    # dof layout as a manual `active=…` mask. The matrix values differ because
-    # cut cells use moment-fitted quadrature while the manual variant uses
-    # standard Gauss everywhere the cell is active — different mathematical
-    # operators, by design. Test the structural equivalence only.
+@testset "fictitious-cell fold drops the same cells as a manual mask" begin
+    # The cell-level fictitious fold deactivates exactly the cells a manual
+    # `active=…` mask would (same `active_cells`). The dof layouts differ by
+    # design, though. A geometry-blind mask eliminates every boundary mode on
+    # the active/inactive interface (the C⁰ overlay-constraint trace). The
+    # physical fold instead keeps the modes whose interface face is *fully
+    # fictitious*: they vanish on every physical face — so they cannot break
+    # continuity — and carry the surrounding cut cells' approximation up to ∂Ω.
+    # The fold therefore retains strictly more unknowns: here the 8 perimeter
+    # nodes around the 2×2 hole (a 3×3 node patch minus its interior node,
+    # which neither variant enumerates). (Matrix values differ regardless: cut
+    # cells use moment-fitted quadrature, the manual variant standard Gauss.)
     bc = dirichlet(0.0; on=boundary(:all))
     src = x -> sin(pi * x[1]) * sin(pi * x[2])
     omega = box((0.0, 0.0), (1.0, 1.0))
@@ -266,7 +278,7 @@ end
     m_manual = prepare(poisson(V_manual; source=src, dirichlet=[bc]))
 
     @test active_cells(m_phys; level=1) == active_cells(m_manual; level=1)
-    @test diagnostics(m_phys).active_unknowns == diagnostics(m_manual).active_unknowns
+    @test diagnostics(m_phys).active_unknowns == diagnostics(m_manual).active_unknowns + 8
 end
 
 @testset "physical fold combines with user mask on overlay" begin
@@ -337,7 +349,7 @@ end
     V_none = space(omega; cells=1, order=2)
     V_alpha1 = space(omega; cells=1, order=2,
                      physical=physical_domain(x -> 1.0; lipschitz=1.0, alpha=1.0,
-                                              subcell_length_scale=1.0))
+                                              keep_fictitious=true, subcell_length_scale=1.0))
 
     m_none = prepare(stiffness(V_none; dirichlet=[bc]))
     m_alpha1 = prepare(stiffness(V_alpha1; dirichlet=[bc]))
@@ -354,10 +366,10 @@ end
 
     V_alpha1 = space(omega; cells=1, order=2,
                      physical=physical_domain(x -> 1.0; lipschitz=1.0, alpha=1.0,
-                                              subcell_length_scale=1.0))
+                                              keep_fictitious=true, subcell_length_scale=1.0))
     V_alpha05 = space(omega; cells=1, order=2,
                       physical=physical_domain(x -> 1.0; lipschitz=1.0, alpha=0.5,
-                                               subcell_length_scale=1.0))
+                                               keep_fictitious=true, subcell_length_scale=1.0))
 
     m1 = prepare(stiffness(V_alpha1; dirichlet=[bc]))
     m05 = prepare(stiffness(V_alpha05; dirichlet=[bc]))
@@ -365,6 +377,38 @@ end
     assemble!(m05)
 
     @test m05.matrix ≈ 0.5 * m1.matrix
+end
+
+@testset "α-FCM: cut-cell enrichment, and fictitious cells dropped by default" begin
+    # Ω = {x₁ ≤ 0.5}: the middle column of cells is CUT, the right column is
+    # fully fictitious.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    cut = leaf(x -> x[1] - 0.5; lipschitz=1.0)
+    bc = dirichlet(0.0; on=boundary(:all))
+    V_none = space(omega; cells=(3, 3), order=3)
+
+    # (1) keep_fictitious + α=1: every cell integrated at full weight, so the
+    #     assembly matches a plain no-physical model. This exercises the cut-cell
+    #     rule (1−α)·moment-fit ∪ α·tensor, which at α=1 must collapse to the
+    #     full-cell tensor — a broken cut-cell α term would zero the cut column.
+    V_keep = space(omega; cells=(3, 3), order=3,
+                   physical=physical_domain(cut; lipschitz=1.0, alpha=1.0, keep_fictitious=true,
+                                            subcell_length_scale=0.05, max_depth=4))
+    m_none = prepare(stiffness(V_none; dirichlet=[bc]))
+    m_keep = prepare(stiffness(V_keep; dirichlet=[bc]))
+    assemble!(m_none)
+    assemble!(m_keep)
+    @test Unfitted.active_unknowns(m_none.dofs) == Unfitted.active_unknowns(m_keep.dofs)
+    @test m_none.matrix ≈ m_keep.matrix
+
+    # (2) default (keep_fictitious = false) with α > 0 STILL drops the fully-
+    #     fictitious right column — α stabilises cut cells, not whole fictitious
+    #     cells — so the active dof count is strictly smaller.
+    V_drop = space(omega; cells=(3, 3), order=3,
+                   physical=physical_domain(cut; lipschitz=1.0, alpha=1.0e-6,
+                                            subcell_length_scale=0.05, max_depth=4))
+    m_drop = prepare(stiffness(V_drop; dirichlet=[bc]))
+    @test Unfitted.active_unknowns(m_drop.dofs) < Unfitted.active_unknowns(m_keep.dofs)
 end
 
 @testset "α=0 + all-fictitious drops every region" begin
@@ -410,7 +454,7 @@ end
     # "shared underlying array" invariant the α-FCM weight cache documents.
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(2, 2), order=2,
-              physical=physical_domain(x -> 1.0; lipschitz=1.0, alpha=0.5,
+              physical=physical_domain(x -> 1.0; lipschitz=1.0, alpha=0.5, keep_fictitious=true,
                                        subcell_length_scale=1.0))
     plan = Unfitted.integration_plan(V)
 
@@ -495,7 +539,8 @@ end
 
     diag = diagnostics(m)
     plan = Unfitted.integration_plan(m)
-    expected = count(r -> r.quadrature.kind in (:cut_fitted, :cut_failed), plan.regions)
+    expected = count(r -> r.quadrature.kind in (:cut_fitted, :cut_failed, :cut_alpha_failed),
+                     plan.regions)
     @test diag.cut_region_count == expected
     @test diag.cut_region_count > 0
     @test diag.fit_failure_count == 0   # no failures expected on this smooth Ω
@@ -629,4 +674,27 @@ end
     pts, ws, res = Unfitted.moment_fit_rule(p, region_box, (20,); target_residual=1.0e-14)
     @test !isempty(pts)
     @test res < Unfitted._FIT_FAILURE_RESIDUAL
+end
+
+@testset "α-FCM fit failure is :cut_alpha_failed and counts as a failure" begin
+    # The α>0 moment-fit failure branch is defensive (unreachable via the public
+    # path with exact kernels), so pin its contract directly. Unlike the empty
+    # strict-cut `:cut_failed`, `:cut_alpha_failed` carries a NONZERO α-scaled
+    # rule so the cell's dofs stay α-stabilised; both kinds feed the fit-failure
+    # count, and all three cut kinds count as cut regions.
+    RQ = Unfitted.RegionQuadrature{1,Float64}
+    VR = Unfitted.VolumeRegion{1,Float64}
+    b = box((0.0,), (1.0,))
+    noparents = Unfitted.ParentRef{1,Float64}[]
+    afail = RQ(:cut_alpha_failed, [SVector(0.5)], [0.3])
+    strict = RQ(:cut_failed, SVector{1,Float64}[], Float64[])
+    @test !isempty(afail.weights)          # α fallback is a nonzero rule …
+    @test isempty(strict.weights)          # … the strict failure is empty
+    plan = Unfitted.IntegrationPlan{1,Float64}(
+        [VR(b, noparents, RQ(:cut_fitted, [SVector(0.5)], [1.0])),
+         VR(b, noparents, strict), VR(b, noparents, afail)],
+        GeometryTolerance(Float64), 0, Unfitted.SmallOverlap{Float64}[], 1.0, 1.0, 0.0)
+    cut, failed = Unfitted._cut_region_stats(plan)
+    @test cut == 3
+    @test failed == 2
 end

@@ -140,9 +140,17 @@ Fields:
   - `geometry::G`: the CSG level-set tree. Each leaf carries its own Lipschitz
     constant; the tree's Boolean structure defines membership.
   - `alpha::T`: fictitious-region stabilization weight (α-FCM). `0` is the
-    strict cut path (cells fully outside Ω are dropped from the dof layout);
-    `> 0` keeps fictitious cells active with quadrature weights pre-multiplied
-    by `α`.
+    strict cut path; `> 0` enriches every **cut** cell's quadrature with the
+    α-scaled full-cell rule, so cut-cell dofs whose basis support lies in the
+    fictitious part still get a well-posed contribution (see
+    `_build_region_quadrature` in `intersections.jl`). Fully-fictitious cells
+    (support entirely outside Ω) are **dropped from the dof layout regardless of
+    α** — the α term stabilizes cuts, not whole fictitious cells.
+  - `keep_fictitious::Bool`: opt into the classic α-FCM treatment where
+    fully-fictitious cells are *kept* active with α-scaled full-cell quadrature
+    instead of being dropped. `false` (default) drops them, which keeps the
+    system lean and the physical domain clean for post-processing; `true`
+    requires `alpha > 0` to be meaningful.
   - `subcell_length_scale::T`: target box size, in physical units, for the
     binary subdivision both the classifier and the moment-fit kernel share. A
     box is bisected until its largest axis extent is `≤ subcell_length_scale`
@@ -175,11 +183,13 @@ struct PhysicalDomain{G<:LevelSet,T<:Real}
     max_depth::Int
     moment_order_factor::Int
     target_residual::T
+    keep_fictitious::Bool
 end
 
 """
-    physical_domain(geometry; lipschitz=Inf, alpha=0.0, subcell_length_scale,
-                    max_depth=8, moment_order_factor=2, target_residual=1e-6)
+    physical_domain(geometry; lipschitz=Inf, alpha=0.0, keep_fictitious=false,
+                    subcell_length_scale, max_depth=8, moment_order_factor=2,
+                    target_residual=1e-6)
 
 Construct a [`PhysicalDomain`](@ref). `geometry` is either a [`LevelSet`](@ref)
 CSG tree (built from [`leaf`](@ref) and `intersect`/`union`/`setdiff`/
@@ -191,13 +201,21 @@ the `leaf(...)` call instead.
 
 `subcell_length_scale` is the **required** classifier accuracy / subdivision
 scale (see the [`PhysicalDomain`](@ref) docstring). `alpha = 0` is the
-strict-cut path; `alpha > 0` enables α-FCM. `moment_order_factor` and
-`target_residual` tune the NNMF moment fit.
+strict-cut path; `alpha > 0` enables α-FCM. `keep_fictitious = true` retains
+fully-fictitious cells as active dofs (the classic α-FCM fill) and therefore
+requires `alpha > 0` — pairing it with `alpha = 0` leaves those cells without
+quadrature and is rejected. `moment_order_factor` and `target_residual` tune
+the NNMF moment fit.
 """
-function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0, subcell_length_scale::Real,
+function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0,
+                         keep_fictitious::Bool=false, subcell_length_scale::Real,
                          max_depth::Integer=8, moment_order_factor::Integer=2,
                          target_residual::Real=1.0e-6)
     alpha >= 0 || throw(ArgumentError("alpha must be ≥ 0; got $alpha"))
+    !(keep_fictitious && iszero(alpha)) ||
+        throw(ArgumentError("keep_fictitious=true requires alpha > 0: fully-fictitious cells " *
+                            "kept active under the strict-cut (alpha=0) path receive no " *
+                            "quadrature and would make the system singular"))
     subcell_length_scale > 0 ||
         throw(ArgumentError("subcell_length_scale must be > 0; got $subcell_length_scale"))
     max_depth >= 0 || throw(ArgumentError("max_depth must be ≥ 0; got $max_depth"))
@@ -211,7 +229,7 @@ function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0, subcell
     T = promote_type(typeof(float(alpha)), typeof(float(subcell_length_scale)),
                      typeof(float(target_residual)))
     return PhysicalDomain{typeof(g),T}(g, T(alpha), T(subcell_length_scale), Int(max_depth),
-                                       Int(moment_order_factor), T(target_residual))
+                                       Int(moment_order_factor), T(target_residual), keep_fictitious)
 end
 
 """

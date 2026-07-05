@@ -559,9 +559,14 @@ indicator representations are intentionally not supported.
       subdivision. For a CSG tree, set each leaf's constant on its
       `leaf(...)` call instead.
     - `alpha`: fictitious-region weight for α-FCM stabilization. `0` is
-      the strict cut path (cells fully outside `Ω` are dropped from the
-      dof layout); `> 0` keeps those cells active with quadrature
-      weights pre-multiplied by `α`.
+      the strict cut path; `> 0` enables α-FCM (cut cells are enriched
+      with the α-scaled full-cell rule unconditionally, and fully
+      fictitious cells carry α-scaled weights). Independently, fully
+      fictitious *cells* are dropped from the dof layout by default and
+      retained only when `keep_fictitious = true` (which then requires
+      `α > 0`). The α-scaled cut-cell enrichment applies regardless of
+      `keep_fictitious`, so pre-`keep_fictitious` whole-cell results are
+      not recovered by setting it.
     - `subcell_length_scale` (required): target box size, in physical
       units, for the binary subdivision shared by two consumers — the
       cut/full/fictitious cell classifier, and the implicit kernel's
@@ -594,10 +599,13 @@ indicator representations are intentionally not supported.
 
   - **Region quadrature kinds** (visible via `region.quadrature.kind`):
     `:full` (tensor Gauss), `:fictitious_alpha` (α-scaled tensor Gauss),
-    `:cut_fitted` (NNLS moment-fit rule), `:cut_failed` (moment-fit
-    residual exceeded the failure threshold; region contributes zero
-    quadrature). The assembly hot loop is unchanged — it just iterates
-    `zip(points, weights)`.
+    `:cut_fitted` (NNLS moment-fit rule, plus the α-scaled tensor part
+    when `α > 0`), `:cut_failed` (strict-cut `α = 0` moment-fit residual
+    exceeded the failure threshold; region contributes zero quadrature),
+    `:cut_alpha_failed` (the same fit failure under `α > 0`: the physical
+    part is dropped but the α-scaled tensor rule is retained so the cell's
+    dofs stay α-stabilised — a nonzero rule). The assembly hot loop is
+    unchanged — it just iterates `zip(points, weights)`.
 
   - **Moment-fit defaults**: moment-fit basis order = `moment_order_factor
     × max(level.order)` per axis over the region's parents; exact tensor
@@ -886,9 +894,9 @@ demos.
     contract.
   - Immersed boundary (`PhysicalDomain`): strict-α cell-level
     fictitious fold drops the right cells; the expected
-    `:full` / `:cut_fitted` / `:fictitious_alpha` / `:cut_failed`
-    region-kind tags appear; α-FCM weight scaling on a fully fictitious
-    cell; NNMF moment reproduction to within `target_residual`;
+    `:full` / `:cut_fitted` / `:fictitious_alpha` / `:cut_failed` /
+    `:cut_alpha_failed` region-kind tags appear; α-FCM weight scaling on a
+    fully fictitious cell; NNMF moment reproduction to within `target_residual`;
     end-to-end SPD on a cut-disk Poisson; 1D analytic mass-entry check
     on a cut cell.
 
