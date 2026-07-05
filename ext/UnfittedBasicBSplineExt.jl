@@ -175,6 +175,13 @@ struct BSplineFamily{D,T,S<:Tuple,DS<:Tuple} <: BasisFamily
     continuity_order::Int
 end
 
+# The B-spline overlay-constraint generator (`_overlay_constraints` below) emits
+# trace-vanishing constraints on every active/inactive face without the
+# fictitious-fold exemption the integrated-Legendre path applies, so it would
+# over-constrain a cut cell's boundary modes on fully-fictitious fold faces.
+# Reject the pairing up front until the fold C⁰ rule is implemented here.
+Unfitted._supports_physical_domain(::BSplineFamily) = false
+
 # ── Knot-vector construction ──────────────────────────────────────────────────
 
 # Build a clamped open uniform knot vector for one axis from the mesh's
@@ -472,8 +479,8 @@ end
 function Unfitted._overlay_constraints(level::Level{D,T,<:BSplineFamily}, V::Space{D,T},
                                        tol::GeometryTolerance{T},
                                        raw_by_key::AbstractDict{TensorDofKey{D},Int},
-                                       level_keys::AbstractVector{Pair{TensorDofKey{D},Int}}) where {D,
-                                                                                                     T}
+                                       level_keys::AbstractVector{Pair{TensorDofKey{D},Int}},
+                                       classify_cache::Unfitted._ClassifyCache{D,T}) where {D,T}
     # `level_keys` (this level's pre-bucketed raws) is unused: the
     # B-spline constraint generator walks the mesh face/perp grids and
     # looks up raws through `raw_by_key` directly.

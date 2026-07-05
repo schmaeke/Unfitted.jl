@@ -35,6 +35,20 @@ end
     @test V.levels[1].basis isa Unfitted.BasisFamily
 end
 
+@testset "BSpline extension: immersed physical domain is rejected" begin
+    # The B-spline overlay-constraint generator has no fictitious-fold C⁰ rule,
+    # so pairing it with a PhysicalDomain would silently over-constrain cut-cell
+    # modes on fold faces. That combination is rejected up front (on both the
+    # base space and an overlay), pending a proper fold-aware implementation.
+    hole = physical_domain(x -> 0.25 - norm(x); lipschitz=1.0, subcell_length_scale=1.0e-3,
+                           max_depth=2)
+    @test_throws ArgumentError space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=3,
+                                     basis=bspline(), physical=hole)
+    Vphys = space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=3, physical=hole)  # Legendre: OK
+    @test_throws ArgumentError overlay(Vphys, box((0.25, 0.25), (0.75, 0.75));
+                                       cells=2, order=3, basis=bspline())
+end
+
 @testset "BSpline extension: 1D values match BasicBSpline directly" begin
     # Construct a degree-3 family on [0, 1] with 4 cells. Evaluate the
     # per-axis 1D values at a midpoint of cell 2 and compare to a
