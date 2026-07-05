@@ -162,7 +162,14 @@
              # FCM Kirsch plate-with-hole p-refinement sweep, published 8×8 config;
              # opt-in. Prints the finest-order relative L² error.
              (name="fcm_plate_with_hole_2d", env=Dict{String,String}(), tensors=true, slow=true,
-              check=check_single_l2))
+              check=check_single_l2),
+             # Bi-material inclusion corner: native multi-domain coupling of two
+             # immersed FCM subdomains (penalty interface + penalty weak Dirichlet).
+             # Coarse VTK-disabled config; opt-in. Guarded by exit code — the
+             # coupled immersed solve completing is the smoke test.
+             (name="bimaterial_inclusion_corner_2d",
+              env=Dict("BIC_CELLS" => "11", "BIC_WRITE_OUTPUT" => "false"), tensors=false,
+              slow=true, check=check_success_only))
 
     for case in cases
         @testset "$(case.name)" begin
