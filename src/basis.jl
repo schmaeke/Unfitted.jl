@@ -121,11 +121,17 @@ informational tag set by the integration-region dispatcher in
     shared across regions of the same per-axis order via a per-plan
     cache.
   - `:cut_fitted` — region is crossed by ∂Ω; weights come from the NNMF
-    moment-fit rule (see `src/fcm.jl`) and are unique per region.
-  - `:cut_failed` — the moment-fit residual exceeded the catastrophic
-    threshold and the region was emitted with empty `points`/`weights`
-    so it contributes zero quadrature; the failure is reported in
-    `AssemblyDiagnostics.fit_failure_count`.
+    moment-fit rule (see `src/fcm.jl`) and are unique per region. Under
+    α-FCM (`α > 0`) the rule additionally carries the α-scaled full-cell
+    tensor part (`(1−α)·moment-fit ∪ α·tensor`).
+  - `:cut_failed` — strict-cut (`α = 0`) moment-fit residual exceeded the
+    catastrophic threshold; the region was emitted with empty
+    `points`/`weights` so it contributes zero quadrature.
+  - `:cut_alpha_failed` — same fit failure under α-FCM (`α > 0`); the
+    physical part is dropped but the region carries the α-scaled tensor
+    rule alone so the cell's dofs stay α-stabilised rather than singular.
+
+Both failure kinds are reported in `AssemblyDiagnostics.fit_failure_count`.
 
 Assembly iterates `zip(points, weights)` without dispatching on `kind`,
 so the hot loop's cost is the same regardless of the quadrature source.

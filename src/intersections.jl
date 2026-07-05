@@ -93,7 +93,8 @@ Fields:
     if `regions` is empty.
   - `min_relative_volume::T` — `min_volume / volume(V.domain)`.
   - `moment_fit_residual_max::Float64` — the largest NNMF moment-fit
-    residual observed across all `:cut_fitted` and `:cut_failed` regions.
+    residual observed across all `:cut_fitted`, `:cut_failed`, and
+    `:cut_alpha_failed` regions.
 """
 struct IntegrationPlan{D,T<:Real}
     regions::Vector{VolumeRegion{D,T}}
@@ -201,7 +202,10 @@ end
 #   - `:fictitious` + `alpha == 0`      → drop region (return `nothing`)
 #   - `:fictitious` + `alpha > 0`       → `:fictitious_alpha` α-scaled tensor Gauss
 #   - `:cut` with successful moment fit → `:cut_fitted`       moment-fit rule
-#   - `:cut` with failed moment fit     → `:cut_failed`       empty rule (zero contribution)
+#     (α > 0 appends the α-scaled full-cell tensor rule for stabilisation)
+#   - `:cut`, failed moment fit, α == 0 → `:cut_failed`       empty rule (zero contribution)
+#   - `:cut`, failed moment fit, α > 0  → `:cut_alpha_failed` α-scaled tensor rule only
+#     (nonzero: the physical sliver is negligible, but the cell's dofs stay α-stabilised)
 #
 # Returns `(RegionQuadrature, residual)` for kept regions and
 # `(nothing, 0)` when the region is dropped. The `residual` field is the
@@ -235,10 +239,33 @@ function _build_region_quadrature(V::Space{D,T}, box::AxisBox{D,T}, parents,
         moment_order = _moment_order_for_region(V, parents)
         ref_pts, ref_ws, residual = _cached_moment_fit!(moment_fit_cache, physical, box,
                                                         moment_order)
-        if isempty(ref_pts) || residual > _FIT_FAILURE_RESIDUAL
-            return RegionQuadrature{D,T}(:cut_failed, SVector{D,T}[], T[]), residual
+        fitted = !isempty(ref_pts) && residual <= _FIT_FAILURE_RESIDUAL
+        if iszero(physical.alpha)
+            fitted || return RegionQuadrature{D,T}(:cut_failed, SVector{D,T}[], T[]), residual
+            return RegionQuadrature{D,T}(:cut_fitted, ref_pts, ref_ws), residual
         end
-        return RegionQuadrature{D,T}(:cut_fitted, ref_pts, ref_ws), residual
+
+        # α-FCM on a cut cell: stabilise the fictitious part by *adding* the
+        # α-scaled full-cell tensor rule to the physical moment-fit rule. Writing
+        # the α-FCM integrand as
+        #     ∫_cell α(x) f = ∫_phys f + α∫_fict f = (1−α)∫_phys f + α∫_cell f,
+        # the rule is the concatenation `(1−α)·moment-fit ∪ α·tensor`. Both
+        # summands are exact (moment-fit integrates the physical part, tensor
+        # Gauss the whole cell), so the total is exact for the α-FCM integrand;
+        # unlike the strict physical-only rule it gives *every* mode — including
+        # the interior bubbles whose support lies entirely in the fictitious
+        # corner of a thin cut — a nonzero, well-posed contribution. When the
+        # physical moment-fit fails on a degenerate sliver (whose physical
+        # contribution is negligible by construction — the domain volume is
+        # captured by the well-fitted cells), fall back to the α·tensor part
+        # alone so the cell's dofs are α-stabilised rather than left singular.
+        alpha_weights = base_rule.weights .* physical.alpha
+        if fitted
+            points = vcat(ref_pts, base_rule.points)
+            weights = vcat(ref_ws .* (one(T) - physical.alpha), alpha_weights)
+            return RegionQuadrature{D,T}(:cut_fitted, points, weights), residual
+        end
+        return RegionQuadrature{D,T}(:cut_alpha_failed, base_rule.points, alpha_weights), residual
     end
 end
 
