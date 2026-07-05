@@ -16,12 +16,12 @@ using StaticArrays
                       cell_data=(midpoint_x=(u, c, x, xi) -> x[1],),)
 
     @test joinpath(dir, "case.vtm") in files
-    @test joinpath(dir, "case_solution.vtu") in files
+    @test joinpath(dir, "case_data.vtu") in files
     @test joinpath(dir, "case_level_1_base_wire.vtp") in files
     @test joinpath(dir, "case_level_2_overlay_wire.vtp") in files
     @test all(isfile, files)
 
-    solution_xml = read(joinpath(dir, "case_solution.vtu"), String)
+    solution_xml = read(joinpath(dir, "case_data.vtu"), String)
     @test occursin("uh", solution_xml)
     @test occursin("twice", solution_xml)
     @test occursin("midpoint_x", solution_xml)
@@ -34,9 +34,75 @@ using StaticArrays
     @test occursin("order_max", wire_xml)
 
     bundle_xml = read(joinpath(dir, "case.vtm"), String)
-    @test occursin("case_solution.vtu", bundle_xml)
+    @test occursin("case_data.vtu", bundle_xml)
     @test occursin("case_level_1_base_wire.vtp", bundle_xml)
     @test occursin("case_level_2_overlay_wire.vtp", bundle_xml)
+end
+
+@testset "coupled multi-domain VTK bundle" begin
+    # A coupled model writes one block per field (named by field), each grouping
+    # that field's `data` grid with its own wireframe(s) as sibling leaf datasets
+    # — a homogeneous tree whose leaf names are disambiguated by ASCII index /
+    # level id (not the possibly-Unicode field name) so ParaView's Extract Block
+    # resolves each leaf uniquely — plus one quadrature block per subdomain.
+    V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(2, 2), order=1)
+    u1 = field(:u1, V1)
+    u2 = field(:u2, V2)
+    model = prepare(Problem((u1, u2);
+                            blocks=(stiffness_block(u1), stiffness_block(u2)),
+                            loads=(source_load(u1; source=x -> 1.0),
+                                   source_load(u2; source=x -> 1.0)),
+                            dirichlet=[dirichlet(0.0; on=boundary(:all), field=:u1),
+                                       dirichlet(0.0; on=boundary(:all), field=:u2)]))
+    solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
+                        Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    dir = mktempdir()
+    files = write_vtk(joinpath(dir, "cpl"), solution, model; subdivisions=:none, ascii=true,
+                      append=false, compress=false)
+
+    # one data `.vtu` per field, ASCII-indexed so Extract Block can isolate it
+    @test joinpath(dir, "cpl_data_1.vtu") in files
+    @test joinpath(dir, "cpl_data_2.vtu") in files
+    vtm = read(joinpath(dir, "cpl.vtm"), String)
+    # per-field blocks named u1 / u2, each grouping a data + wireframe leaf
+    @test occursin("name=\"u1\"", vtm)
+    @test occursin("name=\"u2\"", vtm)
+    # leaf names are disambiguated by ASCII index / level id (never by the
+    # possibly-Unicode field name, which ParaView's data assembly would collapse)
+    @test occursin("name=\"data_1\"", vtm) && occursin("name=\"data_2\"", vtm)
+    @test occursin("name=\"level_1_base\"", vtm) && occursin("name=\"level_2_base\"", vtm)
+    @test !occursin("mesh_wireframes", vtm)        # not a separate flat wireframe block
+    @test !occursin("name=\"mesh\"", vtm)          # no sub-block: wireframes are direct leaves
+    # only the two field blocks are `<Block>`s (homogeneous: leaves below them)
+    @test count("<Block", vtm) == 2
+    # one wireframe per distinct level (ids 1 and 2), no duplication
+    wires = filter(f -> occursin("_wire.vtp", f), files)
+    @test length(wires) == 2 == length(unique(wires))
+
+    # quadrature: one block per subdomain (covering-level signatures "1" and "2")
+    qfiles = write_quadrature_vtm(joinpath(dir, "cplq"), model)
+    @test joinpath(dir, "cplq_quadrature_levels_1.vtp") in qfiles
+    @test joinpath(dir, "cplq_quadrature_levels_2.vtp") in qfiles
+end
+
+@testset "two fields on one space write each wireframe once" begin
+    # The wireframe dedup: fields sharing a space must not emit duplicate level
+    # blocks. A two-field/one-space model has a single base level → one wireframe.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    a = field(:a, V)
+    b = field(:b, V)
+    model = prepare(Problem((a, b);
+                            blocks=(stiffness_block(a), mass_block(b)),
+                            loads=(source_load(a; source=x -> 1.0),),
+                            dirichlet=[dirichlet(0.0; on=boundary(:all), field=:a)]))
+    solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
+                        Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    dir = mktempdir()
+    files = write_vtk(joinpath(dir, "shared"), solution, model; subdivisions=:none, ascii=true,
+                      append=false, compress=false)
+    wires = filter(f -> occursin("_wire.vtp", f), files)
+    @test length(wires) == 1
 end
 
 @testset "VTK exports vector point data" begin
@@ -51,8 +117,8 @@ end
     files = write_vtk(joinpath(dir, "vector_case"), solution, model; subdivisions=:none, ascii=true,
                       append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),),)
 
-    @test joinpath(dir, "vector_case_solution.vtu") in files
-    solution_xml = read(joinpath(dir, "vector_case_solution.vtu"), String)
+    @test joinpath(dir, "vector_case_data.vtu") in files
+    solution_xml = read(joinpath(dir, "vector_case_data.vtu"), String)
     @test occursin("uh", solution_xml)
 end
 
@@ -112,7 +178,7 @@ end
     files = write_vtk(joinpath(dir, "disk"), solution, model; subdivisions=:none, ascii=true,
                       append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
 
-    solution_xml = read(joinpath(dir, "disk_solution.vtu"), String)
+    solution_xml = read(joinpath(dir, "disk_data.vtu"), String)
     @test occursin("level_set", solution_xml)
 end
 
@@ -127,7 +193,7 @@ end
     write_vtk(joinpath(dir, "plain"), solution, model; subdivisions=:none, ascii=true, append=false,
               compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
 
-    solution_xml = read(joinpath(dir, "plain_solution.vtu"), String)
+    solution_xml = read(joinpath(dir, "plain_data.vtu"), String)
     @test !occursin("level_set", solution_xml)
 end
 
@@ -151,7 +217,7 @@ end
               append=false, compress=false,
               point_data=(uh=(u, c, x, xi) -> u(c, xi), level_set=(u, c, x, xi) -> 42.0),)
 
-    solution_xml = read(joinpath(dir, "override_solution.vtu"), String)
+    solution_xml = read(joinpath(dir, "override_data.vtu"), String)
     @test occursin("level_set", solution_xml)
     @test occursin("42", solution_xml)
     # The auto-emit would have written the φ value at e.g. (0, 0) ≈

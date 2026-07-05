@@ -122,11 +122,10 @@ end
 #   * `:none`             — no subdivision, one cell per region.
 #   * positive integer    — uniform isotropic count.
 #   * `NTuple{D,Int}`     — explicit per-axis counts.
-function _subdivision_counts(model::Model{D,T}, region::VolumeRegion{D,T}, subdivisions) where {D,T}
+function _subdivision_counts(space::Space{D,T}, region::VolumeRegion{D,T}, subdivisions) where {D,T}
     if subdivisions === :degree
         return ntuple(D) do d
-            maximum(parent -> max(1, _level_by_id(model.problem.space, parent.level).order[d]),
-                    region.parents)
+            maximum(parent -> max(1, _level_by_id(space, parent.level).order[d]), region.parents)
         end
     elseif subdivisions === :none
         return ntuple(_ -> 1, D)
@@ -192,10 +191,18 @@ end
 # parent-evaluation kernels through `_superposed_value_at` — so the
 # callback can compute a scalar, vector, or tuple value without ever
 # touching the dof layer directly.
-function _evaluate_vtk_function(f, solution::Solution, model::Model, sample)
+# `space` / `block_layout` are the subdomain space and field layout of the block
+# currently being written (for a single-domain model, the one space and the
+# default field). The `u(context, xi[, field])` accessor evaluates the block's
+# field by default; a named `field` is resolved on the *same* subdomain's
+# parents (valid for several fields sharing one space). To read a field on a
+# *different* subdomain, call `value(solution, model, other, x)` with the sample
+# coordinate `x` the callback also receives.
+function _evaluate_vtk_function(f, solution::Solution, model::Model, space::Space,
+                                block_layout::FieldLayout, sample)
     u = (context, xi, field=nothing) -> begin
-        layout = _model_field_layout(model, field === nothing ? _default_field(model) : field)
-        _superposed_value_at(solution.coefficients, model, layout, context.parents, xi.region)
+        layout = field === nothing ? block_layout : _model_field_layout(model, field)
+        _superposed_value_at(solution.coefficients, space, layout, context.parents, xi.region)
     end
     return f(u, sample.context, sample.x, sample.xi)
 end
@@ -241,10 +248,12 @@ end
 # Run every `name => callback` pair against every sample in the list,
 # build a typed array of the returned values, and return the
 # `name => array` pairs ready for `WriteVTK` attachment.
-function _evaluate_vtk_data(pairs, samples, solution::Solution, model::Model)
+function _evaluate_vtk_data(pairs, samples, solution::Solution, model::Model, space::Space,
+                           layout::FieldLayout)
     arrays = Pair{String,Any}[]
     for (name, f) in pairs
-        values = Any[_evaluate_vtk_function(f, solution, model, sample) for sample in samples]
+        values = Any[_evaluate_vtk_function(f, solution, model, space, layout, sample)
+                     for sample in samples]
         push!(arrays, name => _vtk_data_array(values))
     end
     return arrays
@@ -266,11 +275,12 @@ end
 # zero-level isocontour) without the user having to wire a `phi`
 # callback themselves. A user-supplied `level_set` entry in
 # `point_data` overrides the built-in.
-function _partition_vtk_data(solution::Solution, model::Model{D,T}, subdivisions, point_data,
-                             cell_data) where {D,T}
+function _partition_vtk_data(solution::Solution, model::Model{D,T}, space::Space{D,T},
+                             plan::IntegrationPlan{D,T}, layout::FieldLayout{D,T}, subdivisions,
+                             point_data, cell_data) where {D,T}
     point_pairs = _vtk_pairs(point_data, :point_data)
     cell_pairs = _vtk_pairs(cell_data, :cell_data)
-    physical = model.problem.space.physical
+    physical = space.physical
     auto_level_set = physical !== nothing && !any(p -> first(p) == "level_set", point_pairs)
 
     points = SVector{3,T}[]
@@ -282,10 +292,9 @@ function _partition_vtk_data(solution::Solution, model::Model{D,T}, subdivisions
     region_ids = Int[]
     cover_counts = Int[]
     level_set_values = auto_level_set ? T[] : nothing
-    plan = integration_plan(model)
 
     for (region_id, region) in pairs(plan.regions)
-        counts = _subdivision_counts(model, region, subdivisions)
+        counts = _subdivision_counts(space, region, subdivisions)
         for subbox in _subboxes(region.box, counts)
             first_point = length(points) + 1
             corners = _box_corners(subbox, Val(D))
@@ -304,9 +313,30 @@ function _partition_vtk_data(solution::Solution, model::Model{D,T}, subdivisions
         end
     end
 
-    point_arrays = _evaluate_vtk_data(point_pairs, point_samples, solution, model)
-    cell_arrays = _evaluate_vtk_data(cell_pairs, cell_samples, solution, model)
+    point_arrays = _evaluate_vtk_data(point_pairs, point_samples, solution, model, space, layout)
+    cell_arrays = _evaluate_vtk_data(cell_pairs, cell_samples, solution, model, space, layout)
     return (; points, cells, point_arrays, cell_arrays, region_ids, cover_counts, level_set_values)
+end
+
+# The fields a VTK write covers: a single explicit `field` (a `Field` or its
+# name `Symbol`) if given, otherwise every field of the model — one grid block
+# each. A single-domain model has exactly one field, reproducing the historical
+# single-block output.
+function _vtk_fields_to_write(model::Model, field)
+    field === nothing && return collect(model.problem.fields)
+    field isa Field && return [field]
+    for f in model.problem.fields
+        f.name === field && return [f]
+    end
+    throw(ArgumentError("unknown field $field"))
+end
+
+# The (subdomain space, its integration plan, its dof layout) a field is written
+# against. For a single-domain model this is the one space / plan / field.
+function _vtk_field_context(model::Model, fld::Field)
+    space = _field_space(model.problem, fld.name)
+    si = findfirst(s -> s === space, problem_spaces(model.problem))::Int
+    return space, integration_plans(model)[si], _model_field_layout(model, fld)
 end
 
 # Map a level's `role` to a small integer tag for the wireframe export.
@@ -360,21 +390,35 @@ end
 
 """
     write_vtk(path, solution, model;
-              subdivisions=:degree, point_data, cell_data, wireframes=true,
-              ascii=false, append=true, compress=false)
+              field=nothing, subdivisions=:degree, point_data, cell_data,
+              wireframes=true, ascii=false, append=true, compress=false)
 
-Write a ParaView bundle rooted at `path`. The top-level file is a
-`.vtm` multiblock dataset containing:
+Write a ParaView bundle rooted at `path`. The top-level file is a `.vtm`
+multiblock dataset with **one block per field**, each named after the field and
+grouping that field's data with its own mesh as sibling leaf datasets so it is a
+self-contained, independently-toggled unit — `<field> → { data_<i>, level_… }`:
 
-  - a partitioned solution `.vtu` whose cells are the model's
-    admissible integration regions optionally subdivided into
-    smaller sub-cells (see `subdivisions`), with per-cell
-    `region_id` / `cover_count` and per-point user-defined arrays;
-  - optionally, one mesh-wireframe `.vtp` per level showing the
-    level's active region.
+  - `data_<i>` — the `i`-th field's partitioned solution `.vtu`, whose cells are
+    that field's admissible integration regions optionally subdivided into
+    smaller sub-cells (see `subdivisions`), with per-cell `region_id` /
+    `cover_count`, per-point user-defined arrays, and (with a
+    [`PhysicalDomain`](@ref)) the field's own `level_set`. A single-field model
+    names it simply `data`;
+  - `level_<id>_<role>` — optionally, one wireframe `.vtp` per level of the
+    field's subdomain showing the level's active region.
+
+A single-field model is the one-block case of this shape. Fields sharing one
+space emit that space's wireframes once, under the first such field. The tree is
+homogeneous (a field block holds only leaf datasets) and every leaf's
+disambiguating name is **ASCII** — the field *index* `i` for `data_<i>`, the
+level *id* for the wireframes — so ParaView's Extract Block (whose data-assembly
+node names keep only ASCII identifier characters) resolves each leaf on its own
+even when the field names themselves are Unicode (`θ₁`, `θ₂`).
 
 Keyword arguments:
 
+  - `field` — restrict the output to a single [`Field`](@ref) (or its
+    name `Symbol`); defaults to every field of the model.
   - `subdivisions` — per-region subdivision count. `:degree`
     (default) uses each region's parent polynomial order; `:none`
     keeps one cell per region; a positive integer uses an isotropic
@@ -401,7 +445,7 @@ as a zero-level isocontour or for filtering cut / full / fictitious
 regions in ParaView. Pass a `level_set` entry in `point_data` to
 override or rename it.
 """
-function write_vtk(path::AbstractString, solution::Solution, model::Model{D,T};
+function write_vtk(path::AbstractString, solution::Solution, model::Model{D,T}; field=nothing,
                    subdivisions=:degree, point_data=_default_vtk_point_data(),
                    cell_data=NamedTuple(), wireframes::Bool=true, ascii::Bool=false,
                    append::Bool=true, compress=false) where {D,T}
@@ -410,36 +454,64 @@ function write_vtk(path::AbstractString, solution::Solution, model::Model{D,T};
     base = _vtk_base_path(path)
     mkpath(dirname(base))
 
-    solution_data = _partition_vtk_data(solution, model, subdivisions, point_data, cell_data)
+    # One grid block per field, each sampled over its own subdomain space. A
+    # single-domain model has one field → a single `data` grid; a coupled model
+    # writes one block per subdomain into the same multiblock file, so opening it
+    # shows every coupled field.
+    fields = _vtk_fields_to_write(model, field)
+    multi = length(fields) > 1
 
+    # One block per field, grouping the field's `data` grid with its own subdomain
+    # mesh wireframe(s) so each coupled field is a self-contained, independently-
+    # toggled unit in ParaView: `<field> → { data, level_… }`. The children of a
+    # field block are all *leaf* datasets — never a mix of a leaf and a sub-block,
+    # which breaks ParaView's Extract-Block resolution.
+    #
+    # Crucially, every leaf's *disambiguating* name part is ASCII. ParaView derives
+    # its Extract-Block data-assembly node names from the dataset names and keeps
+    # only ASCII identifier characters, so a Unicode field name (`θ₁`, `θ₂`) or a
+    # name disambiguated only by Unicode digits collapses to a single node and the
+    # blocks become indistinguishable. The wireframes are keyed by ASCII level id
+    # (`level_<id>_<role>`); the data leaf is likewise keyed by the ASCII field
+    # index (`data_<i>`), NOT by the field name. The field name is still the (only)
+    # block label, where a Unicode collision is harmless — the user extracts leaves.
+    # `meshed` dedups the wireframes of a space shared by several fields onto its
+    # first.
     return vtk_multiblock(base) do vtm
-        vtk_grid(vtm, _vtk_child_path(base, "solution"), solution_data.points, solution_data.cells;
-                 ascii, append, compress) do vtk
-            for (name, data) in solution_data.point_arrays
-                vtk[name, VTKPointData()] = data
+        meshed = Any[]
+        for (i, fld) in enumerate(fields)
+            space, plan, layout = _vtk_field_context(model, fld)
+            data = _partition_vtk_data(solution, model, space, plan, layout, subdivisions,
+                                       point_data, cell_data)
+            field_block = multiblock_add_block(vtm, string(fld.name))
+            data_name = multi ? "data_$i" : "data"
+            vtk = vtk_grid(_vtk_child_path(base, data_name), data.points, data.cells;
+                           ascii, append, compress)
+            multiblock_add_block(field_block, vtk, data_name)
+            for (name, arr) in data.point_arrays
+                vtk[name, VTKPointData()] = arr
             end
-            if solution_data.level_set_values !== nothing
-                vtk["level_set", VTKPointData()] = solution_data.level_set_values
+            if data.level_set_values !== nothing
+                vtk["level_set", VTKPointData()] = data.level_set_values
             end
-            vtk["region_id", VTKCellData()] = solution_data.region_ids
-            vtk["cover_count", VTKCellData()] = solution_data.cover_counts
-            for (name, data) in solution_data.cell_arrays
-                vtk[name, VTKCellData()] = data
+            vtk["region_id", VTKCellData()] = data.region_ids
+            vtk["cover_count", VTKCellData()] = data.cover_counts
+            for (name, arr) in data.cell_arrays
+                vtk[name, VTKCellData()] = arr
             end
-        end
 
-        if wireframes
-            mesh_block = multiblock_add_block(vtm, "mesh_wireframes")
-            for level in model.problem.space.levels
+            (wireframes && !any(s -> s === space, meshed)) || continue
+            push!(meshed, space)
+            for level in space.levels
                 wire = _wireframe_vtk_data(level)
-                filename = _vtk_child_path(base, "level_$(level.id)_$(level.role)_wire")
-                vtk_grid(mesh_block, filename, wire.points, wire.lines; ascii, append, compress
-                         ) do vtk
-                    vtk["level_id", VTKCellData()] = wire.level_ids
-                    vtk["role_id", VTKCellData()] = wire.role_ids
-                    vtk["order_max", VTKCellData()] = wire.order_max
-                    vtk["cell_id", VTKCellData()] = wire.cell_ids
-                end
+                label = "level_$(level.id)_$(level.role)"
+                wvtk = vtk_grid(_vtk_child_path(base, "$(label)_wire"), wire.points, wire.lines;
+                                ascii, append, compress)
+                multiblock_add_block(field_block, wvtk, label)
+                wvtk["level_id", VTKCellData()] = wire.level_ids
+                wvtk["role_id", VTKCellData()] = wire.role_ids
+                wvtk["order_max", VTKCellData()] = wire.order_max
+                wvtk["cell_id", VTKCellData()] = wire.cell_ids
             end
         end
     end
@@ -463,14 +535,22 @@ small regions show up as point clusters with tiny weights.
 """
 function write_quadrature_vtm(path::AbstractString, model::Model{D,T}) where {D,T}
     _check_vtk_dimension(Val(D))
-    plan = integration_plan(model)
     base = _vtk_base_path(path)
     mkpath(dirname(base))
+
+    # Regions of EVERY subdomain integration plan. The reindexed level ids are
+    # globally unique, so a region's covering-level signature already separates
+    # subdomains into distinct blocks — a coupled model shows every subdomain's
+    # quadrature cloud, not just the first.
+    all_regions = VolumeRegion{D,T}[]
+    for plan in integration_plans(model)
+        append!(all_regions, plan.regions)
+    end
 
     # Group regions by the sorted list of covering parent-level ids,
     # then emit one VTP block per group.
     groups = Dict{Vector{Int},Vector{Int}}()
-    for (i, region) in enumerate(plan.regions)
+    for (i, region) in enumerate(all_regions)
         sig = sort!([p.level for p in region.parents])
         push!(get!(groups, sig, Int[]), i)
     end
@@ -482,7 +562,7 @@ function write_quadrature_vtm(path::AbstractString, model::Model{D,T}) where {D,
             verts = MeshCell{PolyData.Verts,SVector{1,Int}}[]
             weights = T[]
             for i in region_indices
-                region = plan.regions[i]
+                region = all_regions[i]
                 jacobian = volume(region.box) / convert(T, 2^D)
                 for (eta, w) in zip(region.quadrature.points, region.quadrature.weights)
                     x = reference_to_physical(region.box, eta)
@@ -492,10 +572,9 @@ function write_quadrature_vtm(path::AbstractString, model::Model{D,T}) where {D,
                 end
             end
             suffix = isempty(sig) ? "none" : join(sig, "_")
-            vtk_grid(vtm, _vtk_child_path(base, "quadrature_levels_" * suffix), points, verts
-                     ) do vtk
-                vtk["weight", VTKPointData()] = weights
-            end
+            vtk = vtk_grid(_vtk_child_path(base, "quadrature_levels_" * suffix), points, verts)
+            multiblock_add_block(vtm, vtk, "levels_" * suffix)
+            vtk["weight", VTKPointData()] = weights
         end
     end
 end
@@ -526,8 +605,15 @@ _point_vector(x::PointLike{D}, ::Type{T}) where {D,T} = SVector{D,T}(x)
 # the model's own geometry tolerance, so points on the domain
 # boundary (up to `tol.contain`) are accepted.
 function _assert_point_in_domain(x::SVector{D,T}, model::Model{D,T}) where {D,T}
-    contains_point(x, model.problem.space.domain, model.dofs.tolerance) ||
-        throw(ArgumentError("evaluation point is outside the physical domain"))
+    _assert_point_in_domain(x, model.problem.space.domain, model.dofs.tolerance)
+end
+
+# Domain-based overload: a coupled model evaluates each field against its own
+# subdomain's bounding box, not the representative space's.
+function _assert_point_in_domain(x::SVector{D,T}, domain::AxisBox{D,T},
+                                 tol::GeometryTolerance{T}) where {D,T}
+    contains_point(x, domain, tol) ||
+        throw(ArgumentError("evaluation point is outside the field's domain"))
 end
 
 # One level's contribution to the superposed value at physical point
@@ -580,7 +666,8 @@ function _evaluation_data(solution::Solution, model::Model{D,T}, u::Field,
                           x::PointLike{D}) where {D,T}
     coefficients = _checked_coefficients(solution, model)
     point = _point_vector(x, T)
-    _assert_point_in_domain(point, model)
+    space = _field_space(model.problem, u.name)
+    _assert_point_in_domain(point, space.domain, model.dofs.tolerance)
     return coefficients, point, _model_field_layout(model, u)
 end
 
@@ -589,13 +676,19 @@ function _check_component(layout::FieldLayout, component::Integer)
     1 <= component <= layout.components || throw(ArgumentError("field component out of bounds"))
 end
 
+# Levels of the space owning `layout`'s field. For a single-domain model this
+# is the one space's levels; for a coupled model it routes each field to its
+# own subdomain's (reindexed) levels, so a point evaluation of field `b` never
+# reaches into field `a`'s grid.
+_field_levels(model::Model, layout::FieldLayout) = _field_space(model.problem, layout.name).levels
+
 # Sum every level's `_level_value` contribution. The overlay
 # zero-extension comes from `_level_value` returning zero when its
 # level does not cover `point`.
 function _evaluate_field_value(coefficients, model::Model{D,T}, layout::FieldLayout{D,T},
                                point::SVector{D,T}, component::Integer=1) where {D,T}
     result = zero(promote_type(T, eltype(coefficients)))
-    for level in model.problem.space.levels
+    for level in _field_levels(model, layout)
         result += _level_value(coefficients, model, layout, level, point, component)
     end
     return result
@@ -606,7 +699,7 @@ function _evaluate_field_gradient(coefficients, model::Model{D,T}, layout::Field
                                   point::SVector{D,T}, component::Integer=1) where {D,T}
     R = promote_type(T, eltype(coefficients))
     result = SVector{D,R}(ntuple(_ -> zero(R), D))
-    for level in model.problem.space.levels
+    for level in _field_levels(model, layout)
         result += _level_gradient(coefficients, model, layout, level, point, component)
     end
     return result
@@ -725,8 +818,8 @@ end
 # to user VTK callbacks; `l2_error` uses the same kernels but reuses
 # its own per-region records to avoid re-allocating per quadrature
 # point.
-function _superposed_value_at(coefficients, model::Model, layout::FieldLayout, parents, eta)
-    field_data = _field_parent_data(model.problem.space, layout, parents; gradients=false)
+function _superposed_value_at(coefficients, space::Space, layout::FieldLayout, parents, eta)
+    field_data = _field_parent_data(space, layout, parents; gradients=false)
     for data in field_data
         _update_parent_basis_values!(data, eta)
     end
