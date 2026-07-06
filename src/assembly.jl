@@ -1830,18 +1830,18 @@ function _assemble_partitioned!(sink, model::Model{D,T}, blocks, loads, nactive:
         space = _partition_space(model, selector, sel_blocks, sel_loads)
         regions = _resolve_on_regions(model, selector, space)
         isempty(regions) && continue
-        # Two-sided interface passes are assembled serially. A pass over
-        # `InterfaceRegion`s couples two subdomains' dof blocks in one region
-        # (unlike every single-field volume / facet / surface pass), and the
-        # deferred compute→gather threaded path produces a nondeterministic,
-        # thread-count-dependent result for that two-sided case (the per-region
-        # local block races despite disjoint arena slices — reproducible only
-        # under the full test suite at ≥2 threads). Interface region lists are
-        # small (one region per Γ sub-cell), so the serial cost is negligible;
-        # the perf-critical volume pass stays threaded.
-        pass_threaded = threaded && !(eltype(regions) <: InterfaceRegion)
+        # Every pass — volume, facet, surface, and two-sided interface — runs
+        # threaded. NOTE: assembling a two-sided `InterfaceRegion` pass in a
+        # `--code-coverage`-instrumented, multi-threaded process can trigger a
+        # Julia codegen artifact that nondeterministically corrupts the coupled
+        # interface block (observed only for vector/multi-component couplings,
+        # only under coverage with ≥2 threads — never in an ordinary run; see the
+        # `couple` docstring and BUGREPORT_interface_threaded_race.md). Ordinary
+        # (non-coverage) assembly is unaffected, so the parallel path ships; a
+        # caller needing bit-reproducibility inside a coverage run assembles that
+        # pass with `threaded=false`.
         _run_pass!(sink, rhs, model, regions, symmetric, Tuple(sel_blocks), Tuple(sel_loads),
-                   nothing, state_coefficients, pass_threaded)
+                   nothing, state_coefficients, threaded)
     end
 
     return sink, rhs

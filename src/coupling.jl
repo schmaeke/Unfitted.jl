@@ -257,6 +257,19 @@ genuinely path-dependent state must be carried by the caller.
 
 For a bespoke interface term that is *not* a symmetric jump coupling, attach it
 directly with `block(test, trial, form; on = interface(uₐ, u_b, Γ))`.
+
+!!! note "Threaded assembly under code coverage"
+    Interface coupling passes assemble in parallel, like every other pass. A known
+    Julia `--code-coverage` + multithreading codegen artifact can, in that specific
+    instrumented configuration, nondeterministically corrupt the assembled
+    two-sided interface block — observed only for vector/multi-component couplings,
+    only under coverage with `Threads.nthreads() ≥ 2`, and never in an ordinary
+    (non-coverage) run. The corruption is a Julia-side issue, not a modelling one;
+    it is not reproducible outside a coverage-instrumented process and does not
+    affect real solves. If you must assemble a coupled system for bit-reproducible
+    output *inside* a coverage-instrumented multithreaded process, assemble that
+    step serially with `assemble!(model; threaded=false)`. See
+    `BUGREPORT_interface_threaded_race.md` for the full investigation.
 """
 function couple(u_a::Field, u_b::Field, geometry::BoundaryMesh, form::WeakForm)
     iface = interface(u_a, u_b, geometry)
