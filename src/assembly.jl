@@ -695,19 +695,21 @@ function _assembly_workspace(model::Model{D,T}) where {D,T}
     # Single-domain (the dominant path) passes the one space's levels as a
     # concretely-typed `Tuple`, so the build loops below specialise on the level
     # types instead of paying dynamic `getfield` through a `Vector{Any}`.
-    # Multi-domain passes the union of every subdomain's levels; `prepare`
-    # reindexed each space into a disjoint level-id block, so the concatenation
-    # has contiguous global ids `1:N` and the id-indexed banks never collide.
-    return _is_multidomain(p) ? _build_assembly_workspace(_problem_levels(p), Val(D), T) :
+    # Multi-domain fills the same id-indexed banks per subdomain space through a
+    # function barrier (`_build_multidomain_workspace`), so each per-level access
+    # is likewise type-stable; `prepare` reindexed each space into a disjoint
+    # level-id block, so the contiguous global ids `1:N` never collide across
+    # subdomains.
+    return _is_multidomain(p) ? _build_multidomain_workspace(problem_spaces(p), Val(D), T) :
            _build_assembly_workspace(p.space.levels, Val(D), T)
 end
 
 # Function barrier that specialises the per-level bank-build loops on the
-# concrete `levels` container (a typed `Tuple` single-domain, a `Vector` multi-
-# domain). Reuses `_level_value_buffers` for the shared value banks, then adds
-# the assembly-only gradient and derivative-factor banks (sized to the same
-# per-level basis count). Called once per thread in the threaded path and once
-# per assembly call in the serial path.
+# single-domain space's concretely-typed level `Tuple`. Reuses
+# `_level_value_buffers` for the shared value banks, then adds the assembly-only
+# gradient and derivative-factor banks (sized to the same per-level basis count).
+# Called once per thread in the threaded path and once per assembly call in the
+# serial path. (Multi-domain routes through `_build_multidomain_workspace`.)
 function _build_assembly_workspace(levels, ::Val{D}, ::Type{T}) where {D,T}
     bases, local_ids, orders, values, val1d = _level_value_buffers(levels, Val(D), T)
     nlev = length(values)
@@ -720,6 +722,59 @@ function _build_assembly_workspace(levels, ::Val{D}, ::Type{T}) where {D,T}
     end
     return AssemblyWorkspace{D,T}(bases, local_ids, orders, values, gradients, val1d, der1d, Int[],
                                   Dict{Int,Int}(), T[], T[])
+end
+
+# Build a multi-domain assembly workspace without the type-unstable `Vector{Any}`
+# level concatenation. `prepare` reindexed every subdomain space into a disjoint,
+# contiguous block of global level ids, so the union spans ids `1:N` where
+# `N = Σ level_count(V)`. The id-indexed banks are allocated once at size `N`,
+# then filled per space through `_fill_assembly_banks!` — a function barrier whose
+# argument is that space's concretely-typed level `Tuple`, so every
+# `level.id / basis / order / mode` access is statically dispatched inside it,
+# exactly like the single-domain typed-tuple path. The only dynamic dispatch is
+# the outer loop over the abstractly-typed `spaces` vector, which is O(number of
+# subdomains) and never touched by the assembly hot loop.
+function _build_multidomain_workspace(spaces, ::Val{D}, ::Type{T}) where {D,T}
+    n = 0
+    for V in spaces
+        n += level_count(V)
+    end
+    bases = Vector{BasisFamily}(undef, n)
+    local_ids = Vector{Vector{CartesianIndex{D}}}(undef, n)
+    orders = Vector{NTuple{D,Int}}(undef, n)
+    values = Vector{Vector{T}}(undef, n)
+    val1d = Vector{NTuple{D,Vector{T}}}(undef, n)
+    gradients = Vector{Vector{SVector{D,T}}}(undef, n)
+    der1d = Vector{NTuple{D,Vector{T}}}(undef, n)
+    for V in spaces
+        _fill_assembly_banks!(bases, local_ids, orders, values, gradients, val1d, der1d,
+                              V.levels, Val(D), T)
+    end
+    return AssemblyWorkspace{D,T}(bases, local_ids, orders, values, gradients, val1d, der1d, Int[],
+                                  Dict{Int,Int}(), T[], T[])
+end
+
+# Function barrier: fill the id-indexed assembly banks from one space's
+# concretely-typed level `Tuple`. Specialising on the tuple type makes every
+# per-level `getfield` (`id`, `basis`, `order`, `mode`) and the downstream
+# `local_basis_indices` / `_factor_buffers` calls statically dispatched — the
+# multi-domain analogue of the single-domain build in `_level_value_buffers` and
+# `_build_assembly_workspace`. Writes by global level id, which `prepare` made
+# contiguous and disjoint across subdomains, so per-space fills never collide.
+function _fill_assembly_banks!(bases, local_ids, orders, values, gradients, val1d, der1d,
+                               levels::Tuple, ::Val{D}, ::Type{T}) where {D,T}
+    for level in levels
+        i = level.id
+        ids = local_basis_indices(level.basis, level.order, level.mode)
+        bases[i] = level.basis
+        local_ids[i] = ids
+        orders[i] = level.order
+        values[i] = Vector{T}(undef, length(ids))
+        gradients[i] = Vector{SVector{D,T}}(undef, length(ids))
+        val1d[i] = _factor_buffers(level.order, T)
+        der1d[i] = _factor_buffers(level.order, T)
+    end
+    return nothing
 end
 
 # Slim per-parent record: basis values / gradients alias the level's
