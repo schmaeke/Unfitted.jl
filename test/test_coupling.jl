@@ -292,9 +292,11 @@ end
     β = 1.0e3
     vpen = InterfaceForm() do q, sides, trial, tc
         # diagonal-in-components: contribute to test row `tc` only from the
-        # matching trial component, so ⟦uᵢ⟧ couples to ⟦vᵢ⟧ alone.
-        s = jump_sign(sides.test) * jump_sign(sides.trial)
-        TestChannels(trial.component == tc ? β * s * trial.value : 0.0, SVector(0.0, 0.0))
+        # matching trial component, so ⟦uᵢ⟧ couples to ⟦vᵢ⟧ alone. Name the sign
+        # `sg`, not `s`: `s` is the source *function* captured by the load
+        # closures below, and assigning `s` here would clobber it in this scope.
+        sg = jump_sign(sides.test) * jump_sign(sides.trial)
+        TestChannels(trial.component == tc ? β * sg * trial.value : 0.0, SVector(0.0, 0.0))
     end
     zero_bc(name, ax, sd) = dirichlet(SVector(0.0, 0.0); on=boundary(axis=ax, side=sd), field=name)
     model = prepare(Problem((u1, u2);
@@ -318,9 +320,12 @@ end
     e2 = maximum(norm(value(sol, model, u2, p) - uex(p)) for p in _P2)
     @test max(e1, e2) < 1.0e-9
 
-    # Where threaded interface assembly is reliable — no coverage instrumentation,
-    # or a single thread — verify it reproduces the serial interface block exactly.
-    if Base.JLOptions().code_coverage == 0 || Threads.nthreads() == 1
+    # Additionally verify the shipped threaded assembly reproduces the serial
+    # interface block — but only where that comparison is both meaningful (real
+    # parallelism) and reliable: with ≥2 threads AND no coverage instrumentation.
+    # Under `--code-coverage` at ≥2 threads the Julia artifact above can corrupt
+    # it, and at 1 thread the "threaded" path is a single task (nothing to check).
+    if Threads.nthreads() > 1 && Base.JLOptions().code_coverage == 0
         serial_matrix = copy(model.matrix)
         assemble!(model; threaded=true)
         @test model.matrix ≈ serial_matrix
