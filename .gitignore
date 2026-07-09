@@ -2,6 +2,7 @@
 .claude/
 Manifest.toml
 refs/
+docs/
 examples/*/output/
 benchmarks/output/
 gallery/
