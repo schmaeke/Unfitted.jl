@@ -169,7 +169,12 @@
              # coupled immersed solve completing is the smoke test.
              (name="bimaterial_inclusion_corner_2d",
               env=Dict("BIC_CELLS" => "11", "BIC_WRITE_OUTPUT" => "false"), tensors=false,
-              slow=true, check=check_success_only))
+              slow=true, check=check_success_only),
+             # Steep tanh layer on a sinusoidal front — the order-reduction benchmark. An
+             # hp-graded overlay stack steps the order down to 1 and the base is reduced
+             # under it; prints one relative L² error. Opt-in (a fine 128² finest overlay).
+             (name="tanh_layer_2d", env=Dict{String,String}(), tensors=false, slow=true,
+              check=check_single_l2))
 
     for case in cases
         @testset "$(case.name)" begin
