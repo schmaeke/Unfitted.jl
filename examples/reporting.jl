@@ -88,6 +88,7 @@ function print_run_report(title, report; parameters=(), output=nothing)
     print_optional_report_value("min relative integration volume", report,
                                 :min_relative_integration_volume)
     print_optional_report_value("inactive cell counts", report, :inactive_cell_counts)
+    print_optional_report_value("reduced mode counts", report, :reduced_mode_counts)
     print_optional_report_value("cut region count", report, :cut_region_count)
     print_optional_report_value("fit failure count", report, :fit_failure_count)
     print_optional_report_value("moment-fit residual (max)", report, :moment_fit_residual_max)

@@ -248,6 +248,10 @@ optional activation mask. Fields:
     no-mask hot path; the `Union` is small so the `Level` type stays
     stable across `activate!` / `deactivate!` transitions between the
     masked and unmasked states.
+  - `reduce_order::Bool` — when `true`, this level sheds its high-order
+    modes wherever a finer level fully covers it (order reduction),
+    keeping only its linear skeleton. See the coverage constraint source
+    in `dofs.jl` and `docs/design/covered-cell-deactivation.md`.
 """
 struct Level{D,T<:Real,B<:BasisFamily}
     id::Int
@@ -257,6 +261,7 @@ struct Level{D,T<:Real,B<:BasisFamily}
     order::NTuple{D,Int}
     mode::Symbol
     mask::Union{Nothing,LevelMask{D}}
+    reduce_order::Bool
 end
 
 """
@@ -385,16 +390,21 @@ Keyword arguments:
   - `physical` — optional [`PhysicalDomain`](@ref) describing an
     immersed `Ω ⊂ domain`. With `nothing` (default) the bounding box is
     the physical domain.
+  - `reduce_order` — when `true`, the base level sheds its high-order
+    modes wherever a finer overlay fully covers it (order reduction),
+    keeping only its linear skeleton.
 """
 function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(),
-               mode::Symbol=:tensor, active=nothing, physical=nothing) where {D,T}
+               mode::Symbol=:tensor, active=nothing, physical=nothing,
+               reduce_order::Bool=true) where {D,T}
     orders = _axis_int_tuple(order, Val(D), :order)
     _check_basis_mode(mode, orders)
     base_mesh = CartesianMesh(domain; cells)
     mask = _normalize_mask(active, base_mesh)
     family = instantiate_basis(basis, base_mesh, orders, mode, mask)
     _check_physical_basis(family, physical)
-    base_level = Level{D,T,typeof(family)}(1, :base, base_mesh, family, orders, mode, mask)
+    base_level = Level{D,T,typeof(family)}(1, :base, base_mesh, family, orders, mode, mask,
+                                           reduce_order)
     return Space{D,T,Tuple{typeof(base_level)}}(domain, (base_level,), physical)
 end
 
@@ -417,6 +427,8 @@ and possibly `order`. Keyword arguments:
   - `tolerance` — slack on the inside-domain check.
   - `active` — optional per-cell mask, same shapes as [`space`](@ref)'s
     `active`.
+  - `reduce_order` — when `true`, this overlay sheds its high-order modes
+    wherever a still-finer overlay fully covers it.
 
 The new level's `id` is `length(V.levels) + 1`. Overlay placement is
 independent of any existing overlay: overlay boundaries need not coincide
@@ -427,7 +439,8 @@ section).
 """
 function overlay(V::Space{D,T}, domain::AxisBox{D,T}; cells, order=V.levels[1].order,
                  basis=V.levels[1].basis, mode::Symbol=V.levels[1].mode,
-                 tolerance=GeometryTolerance(T), active=nothing) where {D,T}
+                 tolerance=GeometryTolerance(T), active=nothing,
+                 reduce_order::Bool=true) where {D,T}
     is_inside(domain, V.domain, tolerance) ||
         throw(ArgumentError("overlay domain must lie inside the physical domain"))
     orders = _axis_int_tuple(order, Val(D), :order)
@@ -437,7 +450,8 @@ function overlay(V::Space{D,T}, domain::AxisBox{D,T}; cells, order=V.levels[1].o
     id = length(V.levels) + 1
     family = instantiate_basis(basis, overlay_mesh, orders, mode, mask)
     _check_physical_basis(family, V.physical)
-    level = Level{D,T,typeof(family)}(id, :overlay, overlay_mesh, family, orders, mode, mask)
+    level = Level{D,T,typeof(family)}(id, :overlay, overlay_mesh, family, orders, mode, mask,
+                                      reduce_order)
     levels = (V.levels..., level)
     return Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
 end
@@ -463,7 +477,7 @@ function moved_space(V::Space{D,T}; level::Integer, to::AxisBox{D,T},
     # cell coordinates; mesh-independent families return themselves.
     family = instantiate_basis(old.basis, new_mesh, old.order, old.mode, old.mask)
     new_level = Level{D,T,typeof(family)}(old.id, old.role, new_mesh, family, old.order, old.mode,
-                                          old.mask)
+                                          old.mask, old.reduce_order)
     levels = ntuple(i -> i == level ? new_level : V.levels[i], length(V.levels))
     return Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
 end
@@ -477,7 +491,7 @@ function _remasked_space(V::Space{D,T}, level_index::Integer, mask) where {D,T}
     old = V.levels[level_index]
     family = instantiate_basis(old.basis, old.mesh, old.order, old.mode, mask)
     new_level = Level{D,T,typeof(family)}(old.id, old.role, old.mesh, family, old.order, old.mode,
-                                          mask)
+                                          mask, old.reduce_order)
     levels = ntuple(i -> i == level_index ? new_level : V.levels[i], length(V.levels))
     return Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
 end
@@ -536,7 +550,7 @@ function _apply_physical_fold(V::Space{D,T}, cache::_ClassifyCache{D,T}) where {
         if any(fict)
             new_mask = _fold_fictitious(level.mask, fict)
             Level{D,T,typeof(level.basis)}(level.id, level.role, level.mesh, level.basis,
-                                           level.order, level.mode, new_mask)
+                                           level.order, level.mode, new_mask, level.reduce_order)
         else
             level
         end
@@ -566,7 +580,7 @@ function _reindex_space_levels(V::Space{D,T}, offset::Int) where {D,T}
     new_levels = ntuple(length(V.levels)) do i
         lvl = V.levels[i]
         Level{D,T,typeof(lvl.basis)}(lvl.id + offset, lvl.role, lvl.mesh, lvl.basis, lvl.order,
-                                     lvl.mode, lvl.mask)
+                                     lvl.mode, lvl.mask, lvl.reduce_order)
     end
     return Space{D,T,typeof(new_levels)}(V.domain, new_levels, V.physical)
 end

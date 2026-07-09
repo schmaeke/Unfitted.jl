@@ -490,12 +490,11 @@ function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T}, diric
     fill!(layout.constrained_values, zero(T))
 
     # Index the raw dofs that need a Dirichlet value (physically
-    # constrained on at least one component, and not eliminated by an
-    # overlay constraint — the overlay-constrained dofs are homogeneous
-    # by construction).
+    # constrained on at least one component, and not eliminated by any
+    # constraint — eliminated dofs are homogeneous by construction).
     unknown_raws = [raw
                     for raw in eachindex(layout.raw_keys)
-                    if !layout.overlay_constraint[raw] &&
+                    if layout.elimination_source[raw] === :free &&
                        any(c -> layout.physical_dirichlet[raw, c], 1:layout.components)]
     isempty(unknown_raws) && return layout
 

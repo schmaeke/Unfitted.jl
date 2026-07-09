@@ -47,6 +47,10 @@ Fields:
   - `inactive_cell_counts::Vector{Int}` — per-level count of cells
     deactivated by `LevelMask`. Includes both user-provided masks and
     the strict-α fictitious fold from `physical.jl`.
+  - `reduced_mode_counts::Vector{Int}` — per-level count of high-order
+    and dedup modes eliminated by order reduction in covered regions
+    (`reduce_order`), in the same field-then-level order as
+    `inactive_cell_counts`.
   - `cut_region_count::Int`, `fit_failure_count::Int`,
     `moment_fit_residual_max::Float64` — FCM moment-fit statistics from
     the integration plan.
@@ -76,6 +80,7 @@ mutable struct AssemblyDiagnostics
     condition_estimate::Float64
     solver::Symbol
     inactive_cell_counts::Vector{Int}
+    reduced_mode_counts::Vector{Int}
     cut_region_count::Int
     fit_failure_count::Int
     moment_fit_residual_max::Float64
@@ -111,6 +116,7 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                              min_relative_integration_volume=NaN, symmetry_residual=NaN,
                              condition_estimate=NaN, solver=:none,
                              small_overlaps=SmallOverlap{Float64}[], inactive_cell_counts=Int[],
+                             reduced_mode_counts=Int[],
                              cut_region_count=0, fit_failure_count=0, moment_fit_residual_max=0.0,
                              facet_region_count=0, surface_region_count=0,
                              interface_region_count=0)
@@ -119,7 +125,8 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                                Float64(min_integration_volume),
                                Float64(min_relative_integration_volume), Float64(symmetry_residual),
                                Float64(condition_estimate), Symbol(solver),
-                               Int[inactive_cell_counts...], Int(cut_region_count),
+                               Int[inactive_cell_counts...], Int[reduced_mode_counts...],
+                               Int(cut_region_count),
                                Int(fit_failure_count), Float64(moment_fit_residual_max),
                                Int(facet_region_count), Int(surface_region_count),
                                Int(interface_region_count))
@@ -140,6 +147,27 @@ function _inactive_cell_counts_multi(spaces)
     counts = Int[]
     for V in spaces
         append!(counts, _inactive_cell_counts(V))
+    end
+    return counts
+end
+
+# Per-level count of raws eliminated by order reduction (`:coverage` or `:dedup`),
+# across every field of the system layout, in field-then-level order — mirroring
+# `_inactive_cell_counts_multi` so the two vectors line up entry-for-entry.
+function _reduced_mode_counts(layout::SystemLayout)
+    counts = Int[]
+    for field in layout.fields
+        dofs = field.dofs
+        per_level = Dict{Int,Int}()
+        for raw in eachindex(dofs.raw_keys)
+            src = dofs.elimination_source[raw]
+            (src === :coverage || src === :dedup) || continue
+            lvl = dofs.raw_keys[raw].level
+            per_level[lvl] = get(per_level, lvl, 0) + 1
+        end
+        for lvl in field.level_ids
+            push!(counts, get(per_level, lvl, 0))
+        end
     end
     return counts
 end
@@ -462,6 +490,7 @@ function prepare(problem::Problem{D,T}; kwargs...) where {D,T}
     interface_regions = _resolve_interface_regions(effective_problem, layout, tolerance)
     diag = AssemblyDiagnostics(dimension=D, active_unknowns=active_unknowns(layout),
                                inactive_cell_counts=_inactive_cell_counts_multi(spaces),
+                               reduced_mode_counts=_reduced_mode_counts(layout),
                                facet_region_count=_region_count(facet_regions),
                                surface_region_count=_region_count(surface_regions),
                                interface_region_count=_region_count(interface_regions))
@@ -712,6 +741,7 @@ function _invalidate_assembly!(model::Model{D,T},
     model.interface_regions = _resolve_interface_regions(model.problem, model.dofs, tolerance)
     diag = AssemblyDiagnostics(dimension=D, active_unknowns=active_unknowns(model.dofs),
                                inactive_cell_counts=_inactive_cell_counts_multi(problem_spaces(model.problem)),
+                               reduced_mode_counts=_reduced_mode_counts(model.dofs),
                                facet_region_count=_region_count(model.facet_regions),
                                surface_region_count=_region_count(model.surface_regions),
                                interface_region_count=_region_count(model.interface_regions))
@@ -989,7 +1019,8 @@ function diagnostics(model::Model, solution; exact=nothing)
             small_overlap_count=diag.small_overlap_count, small_overlaps=diag.small_overlaps,
             min_integration_volume=diag.min_integration_volume,
             min_relative_integration_volume=diag.min_relative_integration_volume,
-            inactive_cell_counts=diag.inactive_cell_counts, cut_region_count=diag.cut_region_count,
+            inactive_cell_counts=diag.inactive_cell_counts,
+            reduced_mode_counts=diag.reduced_mode_counts, cut_region_count=diag.cut_region_count,
             fit_failure_count=diag.fit_failure_count,
             moment_fit_residual_max=diag.moment_fit_residual_max,
             symmetry_residual=diag.symmetry_residual, condition_estimate=diag.condition_estimate,

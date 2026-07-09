@@ -121,12 +121,14 @@ Fields:
   - `physical_dirichlet::Matrix{Bool}` — `(raw, component) → true` iff
     component `component` of raw dof `raw` has a physical Dirichlet
     constraint.
-  - `overlay_constraint::Vector{Bool}` — `raw → true` iff raw dof `raw`
-    carries an artificial overlay constraint. Overlay constraints
-    apply to every component simultaneously (the overlay function is
-    constrained to vanish on its artificial boundary). Derived from
-    `raw_expansion` below; cached for fast queries during active
-    enumeration and diagnostics.
+  - `elimination_source::Vector{Symbol}` — `raw → :free / :overlay /
+    :coverage / :dedup`. `:free` iff the raw survives; otherwise the source
+    that eliminated it: the artificial overlay boundary (`:overlay`) or, from
+    the order-reduction extension, a covered high-order mode (`:coverage`) or a
+    deduped covered vertex (`:dedup`). Applies to every component
+    simultaneously; derived from `raw_expansion`. Serves as both the
+    elimination flag (`!== :free`) and its provenance, read by
+    [`constraint_kind`](@ref), the active enumeration, and diagnostics.
   - `raw_expansion::Vector{Vector{Tuple{Int,T}}}` — for each raw, the
     list of `(other_raw, weight)` pairs that express the raw's value
     in terms of *non-pivot* raws after constraint resolution. Three
@@ -168,7 +170,7 @@ struct DofLayout{D,T<:Real}
     raw_keys::Vector{TensorDofKey{D}}
     active_component::Matrix{Int}
     physical_dirichlet::Matrix{Bool}
-    overlay_constraint::Vector{Bool}
+    elimination_source::Vector{Symbol}
     raw_expansion::Vector{Vector{Tuple{Int,T}}}
     has_linear_constraints::Bool
     constrained_values::Matrix{T}
@@ -482,6 +484,67 @@ function _overlay_constraints(level::Level{D,T,B}, V::Space{D,T}, tol::GeometryT
     return constraints
 end
 
+# ── Order-reduction (coverage) constraint source ─────────────────────────────
+
+# Cells of `level` incident to the entity of `key`, reconstructed from the per-axis
+# node/span structure: a NODE factor at index i touches cells i-1 and i (whichever are
+# in bounds); a SPAN (bubble) factor at index k touches only cell k. Mirrors the
+# perpendicular incidence used by `_on_active_face`.
+function _incident_cells(key::TensorDofKey{D}, n::NTuple{D,Int}) where {D}
+    ranges = ntuple(D) do d
+        a = key.axes[d]
+        a.kind == _AXIS_NODE ? (max(1, a.index - 1):min(n[d], a.index)) : (a.index:a.index)
+    end
+    return CartesianIndices(ranges)
+end
+
+"""
+    _coverage_constraints(level, V, coverage, tol, level_keys)
+        -> Vector{Tuple{LinearConstraint{T},Symbol}}
+
+Order-reduction constraint source, a peer of [`_overlay_constraints`](@ref). For a
+level opted into `reduce_order`, emit a single-raw strong elimination for
+
+  * every **buried high-order** mode (at least one bubble axis, every incident cell
+    covered) — order reduction, source `:coverage`; and
+  * every **buried linear** mode a single nested level above reproduces exactly —
+    dedup, source `:dedup`.
+
+The linear skeleton is otherwise retained, which is what makes the reduced space
+complete (see `docs/design/covered-cell-deactivation.md`). Each returned pair carries
+its elimination source for `constraint_kind` / diagnostics.
+
+Integrated-Legendre only; the generic fallback returns nothing (order reduction is out
+of scope for the B-spline family).
+"""
+function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{D,T},
+                               coverage::Coverage{D}, tol::GeometryTolerance{T},
+                               level_keys::AbstractVector{Pair{TensorDofKey{D},Int}}) where {D,T}
+    out = Tuple{LinearConstraint{T},Symbol}[]
+    cov = coverage.covered[level.id]
+    any(cov) || return out
+    n = level.mesh.cells
+    nested_above = [k for k in V.levels if k.id > level.id && _nested_over(level, k, tol)]
+    for (key, raw) in level_keys
+        cells = _incident_cells(key, n)
+        all(ci -> cov[ci], cells) || continue                       # buried?
+        if any(a -> a.kind == _AXIS_SPAN, key.axes)                 # high-order → order reduction
+            push!(out, (LinearConstraint{T}([raw], [one(T)]), :coverage))
+        elseif any(k -> all(ci -> _covered_by_level(cell_box(level.mesh, ci), k, tol), cells),
+                   nested_above)                                    # linear reproduced by a nested level
+            push!(out, (LinearConstraint{T}([raw], [one(T)]), :dedup))
+        end
+    end
+    return out
+end
+
+# Generic fallback: no order reduction (e.g. the B-spline family).
+function _coverage_constraints(::Level{D,T,B}, ::Space{D,T}, ::Coverage{D},
+                               ::GeometryTolerance{T},
+                               ::AbstractVector{Pair{TensorDofKey{D},Int}}) where {D,T,B}
+    return Tuple{LinearConstraint{T},Symbol}[]
+end
+
 # Combine repeated raws in a list of `(raw, coefficient)` pairs by
 # summing the coefficients, dropping terms whose coefficient falls
 # below the working tolerance. Pure-data helper consumed by the
@@ -704,18 +767,39 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     end
     empty_keys = Pair{TensorDofKey{D},Int}[]
     constraints = LinearConstraint{T}[]
+    # Track only the COVERAGE/DEDUP elimination sources, so `constraint_kind` /
+    # diagnostics can pick an order-reduced or deduped raw out. Overlay-boundary
+    # (and multi-raw B-spline) eliminations are not recorded here — they fall
+    # through to the `:overlay` default when `elimination_source` is built below.
+    source_of = Dict{Int,Symbol}()
+    reduce_any = any(level -> level.reduce_order, V.levels)
+    coverage = reduce_any ? build_coverage(V, tolerance) : Coverage{D}(Dict{Int,BitArray{D}}())
     for level in V.levels
         level_keys = get(keys_by_level, level.id, empty_keys)
+        # Source 1: the artificial-overlay-boundary trace condition (every family).
         append!(constraints,
                 _overlay_constraints(level, V, tolerance, raw_by_key, level_keys, classify_cache))
+        # Source 2: order reduction in covered regions (opt-in per level).
+        if level.reduce_order
+            for (c, src) in _coverage_constraints(level, V, coverage, tolerance, level_keys)
+                push!(constraints, c)
+                source_of[c.raws[1]] = src
+            end
+        end
     end
     raw_expansion = Vector{Vector{Tuple{Int,T}}}(undef, nraw)
     _resolve_constraints!(raw_expansion, constraints, nraw)
-    # A raw is "pivoted" (i.e. carries the overlay constraint flag the
-    # `overlay_constraint::Vector{Bool}` field caches) iff its resolved
-    # expansion is anything other than the trivial identity `[(raw, 1)]`.
-    overlay_constraint = [length(e) != 1 || e[1] != (raw, one(T))
-                          for (raw, e) in pairs(raw_expansion)]
+    # A raw is "pivoted" (eliminated) iff its resolved expansion is anything other
+    # than the trivial identity `[(raw, 1)]`. This local vector is construction
+    # scratch for the active enumeration and for `elimination_source` below; the
+    # layout exposes elimination only through `elimination_source` (`!== :free`).
+    eliminated = [length(e) != 1 || e[1] != (raw, one(T))
+                  for (raw, e) in pairs(raw_expansion)]
+    # Per-raw elimination source: the tracked coverage/dedup source, `:overlay` for
+    # any other eliminated raw (overlay boundary; multi-raw B-spline pivots), and
+    # `:free` when the raw survives. This doubles as the elimination flag.
+    elimination_source = Symbol[eliminated[raw] ? get(source_of, raw, :overlay) : :free
+                                for raw in 1:nraw]
     # A raw is "simple" if its expansion is either the identity
     # `[(raw, 1)]` (free) or empty `[]` (strongly eliminated) — both
     # the lightweight assembly path represents directly as a single
@@ -744,14 +828,14 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     active_component = zeros(Int, nraw, ncomp)
     active_count = 0
     for component in 1:ncomp, raw in 1:nraw
-        if !(physical_dirichlet[raw, component] || overlay_constraint[raw])
+        if !(physical_dirichlet[raw, component] || eliminated[raw])
             active_count += 1
             active_component[raw, component] = active_count
         end
     end
 
     layout = DofLayout{D,T}(ncomp, cell_dofs_by_level, raw_keys, active_component,
-                            physical_dirichlet, overlay_constraint, raw_expansion,
+                            physical_dirichlet, elimination_source, raw_expansion,
                             has_linear_constraints, zeros(T, nraw, ncomp), active_count, tolerance)
 
     # Stage 4b: project nonzero Dirichlet data onto the boundary trace
@@ -809,18 +893,21 @@ Classify a single raw dof. Returns one of:
 
   - `:free`       — no constraint, the dof is enumerated.
   - `:dirichlet`  — physical Dirichlet only.
-  - `:overlay`    — artificial overlay constraint only.
-  - `:mixed`      — both. The overlay rule wins (the dof is eliminated
-                    and its value is held in `constrained_values` from
-                    the Dirichlet projection).
+  - `:overlay`    — artificial overlay-boundary elimination only.
+  - `:coverage`   — order-reduction elimination (covered high-order mode).
+  - `:dedup`      — linear-dedup elimination (covered vertex reproduced by
+                    a nested finer level).
+  - `:mixed`      — physical Dirichlet plus an elimination. The
+                    elimination wins (the dof is eliminated and its value
+                    is held in `constrained_values` from the Dirichlet
+                    projection).
 """
 function constraint_kind(layout::DofLayout, raw::Integer, component::Integer=1)
     physical = layout.physical_dirichlet[raw, component]
-    overlay = layout.overlay_constraint[raw]
-    physical && overlay && return :mixed
+    source = layout.elimination_source[raw]
+    physical && source != :free && return :mixed
     physical && return :dirichlet
-    overlay && return :overlay
-    return :free
+    return source
 end
 
 """
