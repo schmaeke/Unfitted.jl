@@ -1,6 +1,6 @@
 using StaticArrays
 
-@testset "partitioned VTK bundle with wireframes" begin
+@testset "partitioned VTK bundle with level meshes" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(1, 1), order=1)
     V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(1, 1), order=2)
@@ -17,8 +17,8 @@ using StaticArrays
 
     @test joinpath(dir, "case.vtm") in files
     @test joinpath(dir, "case_data.vtu") in files
-    @test joinpath(dir, "case_level_1_base_wire.vtp") in files
-    @test joinpath(dir, "case_level_2_overlay_wire.vtp") in files
+    @test joinpath(dir, "case_level_1_base_mesh.vtu") in files
+    @test joinpath(dir, "case_level_2_overlay_mesh.vtu") in files
     @test all(isfile, files)
 
     solution_xml = read(joinpath(dir, "case_data.vtu"), String)
@@ -28,20 +28,24 @@ using StaticArrays
     @test occursin("region_id", solution_xml)
     @test occursin("cover_count", solution_xml)
 
-    wire_xml = read(joinpath(dir, "case_level_2_overlay_wire.vtp"), String)
-    @test occursin("level_id", wire_xml)
-    @test occursin("role_id", wire_xml)
-    @test occursin("order_max", wire_xml)
+    mesh_xml = read(joinpath(dir, "case_level_2_overlay_mesh.vtu"), String)
+    @test occursin("level_id", mesh_xml)
+    @test occursin("role_id", mesh_xml)
+    @test occursin("order_max", mesh_xml)
+    @test occursin("active", mesh_xml)
+    @test occursin("covered", mesh_xml)
+    @test occursin("active_dofs", mesh_xml)
+    @test occursin("reduced_dofs", mesh_xml)
 
     bundle_xml = read(joinpath(dir, "case.vtm"), String)
     @test occursin("case_data.vtu", bundle_xml)
-    @test occursin("case_level_1_base_wire.vtp", bundle_xml)
-    @test occursin("case_level_2_overlay_wire.vtp", bundle_xml)
+    @test occursin("case_level_1_base_mesh.vtu", bundle_xml)
+    @test occursin("case_level_2_overlay_mesh.vtu", bundle_xml)
 end
 
 @testset "coupled multi-domain VTK bundle" begin
     # A coupled model writes one block per field (named by field), each grouping
-    # that field's `data` grid with its own wireframe(s) as sibling leaf datasets
+    # that field's `data` grid with its own mesh(es) as sibling leaf datasets
     # — a homogeneous tree whose leaf names are disambiguated by ASCII index /
     # level id (not the possibly-Unicode field name) so ParaView's Extract Block
     # resolves each leaf uniquely — plus one quadrature block per subdomain.
@@ -65,20 +69,19 @@ end
     @test joinpath(dir, "cpl_data_1.vtu") in files
     @test joinpath(dir, "cpl_data_2.vtu") in files
     vtm = read(joinpath(dir, "cpl.vtm"), String)
-    # per-field blocks named u1 / u2, each grouping a data + wireframe leaf
+    # per-field blocks named u1 / u2, each grouping a data + mesh leaf
     @test occursin("name=\"u1\"", vtm)
     @test occursin("name=\"u2\"", vtm)
     # leaf names are disambiguated by ASCII index / level id (never by the
     # possibly-Unicode field name, which ParaView's data assembly would collapse)
     @test occursin("name=\"data_1\"", vtm) && occursin("name=\"data_2\"", vtm)
     @test occursin("name=\"level_1_base\"", vtm) && occursin("name=\"level_2_base\"", vtm)
-    @test !occursin("mesh_wireframes", vtm)        # not a separate flat wireframe block
-    @test !occursin("name=\"mesh\"", vtm)          # no sub-block: wireframes are direct leaves
+    @test !occursin("name=\"meshes\"", vtm)        # no grouping sub-block: level meshes are direct leaves
     # only the two field blocks are `<Block>`s (homogeneous: leaves below them)
     @test count("<Block", vtm) == 2
-    # one wireframe per distinct level (ids 1 and 2), no duplication
-    wires = filter(f -> occursin("_wire.vtp", f), files)
-    @test length(wires) == 2 == length(unique(wires))
+    # one mesh per distinct level (ids 1 and 2), no duplication
+    meshes = filter(f -> occursin("_mesh.vtu", f), files)
+    @test length(meshes) == 2 == length(unique(meshes))
 
     # quadrature: one block per subdomain (covering-level signatures "1" and "2")
     qfiles = write_quadrature_vtm(joinpath(dir, "cplq"), model)
@@ -86,9 +89,9 @@ end
     @test joinpath(dir, "cplq_quadrature_levels_2.vtp") in qfiles
 end
 
-@testset "two fields on one space write each wireframe once" begin
-    # The wireframe dedup: fields sharing a space must not emit duplicate level
-    # blocks. A two-field/one-space model has a single base level → one wireframe.
+@testset "two fields on one space write each level mesh once" begin
+    # The mesh dedup: fields sharing a space must not emit duplicate level
+    # blocks. A two-field/one-space model has a single base level → one mesh.
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
     a = field(:a, V)
     b = field(:b, V)
@@ -101,8 +104,8 @@ end
     dir = mktempdir()
     files = write_vtk(joinpath(dir, "shared"), solution, model; subdivisions=:none, ascii=true,
                       append=false, compress=false)
-    wires = filter(f -> occursin("_wire.vtp", f), files)
-    @test length(wires) == 1
+    meshes = filter(f -> occursin("_mesh.vtu", f), files)
+    @test length(meshes) == 1
 end
 
 @testset "VTK exports vector point data" begin
@@ -122,10 +125,10 @@ end
     @test occursin("uh", solution_xml)
 end
 
-@testset "wireframe filters inactive overlay cells" begin
-    # A 3x3 overlay with only one cell active should produce exactly that
-    # cell's edges in the overlay wireframe (1 cell × 4 quad edges = 4 lines),
-    # not the full grid (9 cells × 4 = 36).
+@testset "level mesh exports all cells with an active flag" begin
+    # A 3x3 overlay with only one active cell now exports ALL nine cells as solid
+    # cells, distinguished by the `active` cell-data (1 for the active cell, 0 for
+    # the eight masked ones) — no longer a filtered wireframe.
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(1, 1), order=1)
     active = falses(3, 3)
@@ -139,14 +142,44 @@ end
     files = write_vtk(joinpath(dir, "masked"), soln, model; subdivisions=:none, ascii=true,
                       append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
 
-    @test joinpath(dir, "masked_level_2_overlay_wire.vtp") in files
+    overlay_file = joinpath(dir, "masked_level_2_overlay_mesh.vtu")
+    @test overlay_file in files
+    overlay_xml = read(overlay_file, String)
+    @test occursin("NumberOfCells=\"9\"", overlay_xml)   # all cells exported, not filtered
+    @test occursin("active", overlay_xml)
+    @test occursin("covered", overlay_xml)
 
-    overlay_xml = read(joinpath(dir, "masked_level_2_overlay_wire.vtp"), String)
-    @test occursin("NumberOfLines=\"4\"", overlay_xml)
+    # The single base cell is exported too, as its own mesh block.
+    base_xml = read(joinpath(dir, "masked_level_1_base_mesh.vtu"), String)
+    @test occursin("NumberOfCells=\"1\"", base_xml)
+end
 
-    # The base mesh has no mask, so its full 1x1 wireframe (4 edges) survives.
-    base_xml = read(joinpath(dir, "masked_level_1_base_wire.vtp"), String)
-    @test occursin("NumberOfLines=\"4\"", base_xml)
+@testset "level-mesh cell data reports coverage and reduction per cell" begin
+    # The solid-cell per-level mesh carries `covered` / `reduced_dofs` / `active`
+    # cell data; assert the actual values, not just that the arrays are emitted. A
+    # 4×4 p=2 base with an aligned p=3 overlay over the middle 2×2 block covers four
+    # base cells and sheds high-order (plus one deduped vertex) there.
+    _vtu_ints(xml, name) =
+        parse.(Int, split(match(Regex("Name=\"$name\"[^>]*>([^<]*)</DataArray>"), xml).captures[1]))
+
+    V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2),
+                box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4), order=3)
+    model = prepare(mass(V))
+    sol = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
+                   Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    dir = mktempdir()
+    write_vtk(joinpath(dir, "red"), sol, model; subdivisions=:none, ascii=true, append=false)
+
+    base = read(joinpath(dir, "red_level_1_base_mesh.vtu"), String)
+    covered = _vtu_ints(base, "covered")
+    reduced = _vtu_ints(base, "reduced_dofs")
+    active = _vtu_ints(base, "active")
+
+    @test length(covered) == 16                    # base is 4×4
+    @test sum(covered) == 4                         # the middle 2×2 block is covered
+    @test all(active .== 1)                         # unmasked base → every cell active
+    @test all(reduced[covered .== 0] .== 0)         # reduction only under coverage
+    @test sum(reduced[covered .== 1]) > 0           # covered cells shed high-order modes
 end
 
 @testset "VTK export rejects dimensions above 3" begin

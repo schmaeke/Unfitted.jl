@@ -33,7 +33,7 @@ end
 
 # Compose the file path for a child VTK block by suffixing the base
 # name. Used by the multiblock writer to derive paths for the solution
-# `.vtu` and the per-level wireframe `.vtp`s.
+# `.vtu` and the per-level mesh `.vtu`s.
 function _vtk_child_path(base::AbstractString, suffix::AbstractString)
     return joinpath(dirname(base), basename(base) * "_" * suffix)
 end
@@ -67,15 +67,6 @@ function _vtk_corner_bits(::Val{3})
     ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1))
 end
 
-# Edge connectivity for the wireframe export: each `(a, b)` is a pair
-# of corner indices (1-based, into `_vtk_corner_bits`) defining one
-# edge of the `D`-cube. 2 edges in 1D, 4 in 2D, 12 in 3D.
-_vtk_edge_pairs(::Val{1}) = ((1, 2),)
-_vtk_edge_pairs(::Val{2}) = ((1, 2), (2, 3), (3, 4), (4, 1))
-function _vtk_edge_pairs(::Val{3})
-    ((1, 2), (2, 3), (3, 4), (4, 1), (5, 6), (6, 7), (7, 8), (8, 5), (1, 5), (2, 6), (3, 7), (4, 8))
-end
-
 # Pad a `D`-dimensional physical point with trailing zeros to three
 # coordinates: ParaView point arrays are always 3D regardless of the
 # data's actual dimension. The padded zeros are inert (ParaView
@@ -84,8 +75,7 @@ end
 _vtk_point(x::SVector{D,T}) where {D,T} = SVector{3,T}(ntuple(i -> i <= D ? x[i] : zero(T), 3))
 
 # Collect the 2ᴰ corner coordinates of `b` in VTK canonical order.
-# Used both for solution cells (one cell per subbox) and for wireframe
-# edges (each edge connects two corners by `_vtk_edge_pairs` index).
+# Used for the solution cells and the per-level mesh cells alike.
 function _box_corners(b::AxisBox{D,T}, ::Val{D}) where {D,T}
     return ntuple(Val(2^D)) do i
         bits = _vtk_corner_bits(Val(D))[i]
@@ -259,7 +249,7 @@ function _evaluate_vtk_data(pairs, samples, solution::Solution, model::Model, sp
     return arrays
 end
 
-# ── VTK partition and wireframes ─────────────────────────────────────────────
+# ── VTK partition and level meshes ───────────────────────────────────────────
 
 # Build the partitioned solution dataset: walk every integration
 # region of the model, subdivide each into `_subboxes`, emit one VTK
@@ -339,7 +329,7 @@ function _vtk_field_context(model::Model, fld::Field)
     return space, integration_plans(model)[si], _model_field_layout(model, fld)
 end
 
-# Map a level's `role` to a small integer tag for the wireframe export.
+# Map a level's `role` to a small integer tag for the mesh export.
 # ParaView filters can colour-by-`role_id` to visually distinguish
 # base levels from overlays. Unknown roles map to `-1`.
 function _role_id(role::Symbol)
@@ -348,42 +338,58 @@ function _role_id(role::Symbol)
     return -1
 end
 
-# Build the wireframe VTK dataset for one level: one `PolyData.Lines`
-# segment per cell edge, with per-segment scalar fields
-# `level_id`, `role_id`, `order_max`, `cell_id`. Inactive cells are
-# skipped — the wireframe shows the level's *active region*, not its
-# full mesh.
-function _wireframe_vtk_data(level::Level{D,T}) where {D,T}
+# Build the solid-cell VTK dataset for one level: one `VTK_QUAD` / `VTK_HEXAHEDRON`
+# per mesh cell — *all* cells, active or not — with per-cell scalar fields that make
+# the order-reduction behaviour visible in ParaView:
+#
+#   * `level_id`, `role_id`, `order_max`, `cell_id` — structural tags;
+#   * `active`      — 1 iff the cell survives the `LevelMask` (user mask + fold);
+#   * `covered`     — 1 iff a finer level fully covers the cell (see `Coverage`);
+#   * `active_dofs` — basis modes on the cell with at least one active component;
+#   * `reduced_dofs`— modes eliminated by order reduction (`:coverage` / `:dedup`).
+#
+# Rendered "Surface With Edges" this doubles as the old wireframe while carrying the
+# per-cell data a line mesh could not.
+function _mesh_vtk_data(level::Level{D,T}, dofs::DofLayout{D},
+                        coverage::Coverage{D}) where {D,T}
     points = SVector{3,T}[]
-    line0 = MeshCell(PolyData.Lines(), SVector{2,Int}(1, 2))
-    lines = typeof(line0)[]
+    cell_type = _vtk_cell_type(Val(D))
+    cell0 = MeshCell(cell_type, SVector{2^D,Int}(ntuple(identity, 2^D)))
+    cells = typeof(cell0)[]
     level_ids = Int[]
     role_ids = Int[]
     order_max = Int[]
     cell_ids = Int[]
+    active = Int[]
+    covered = Int[]
+    active_dofs = Int[]
+    reduced_dofs = Int[]
+    cov = coverage.covered[level.id]
     linear = LinearIndices(level.mesh.cells)
 
     for cell in cell_indices(level.mesh)
-        # Inactive cells contribute nothing to the dof layout or
-        # integration plan, so they have no business showing up in the
-        # wireframe either. `is_active(nothing, _) === true`, so
-        # unmasked levels (the base and any maskless overlay) keep
-        # their full grid.
-        is_active(level.mask, cell) || continue
         corners = _box_corners(cell_box(level.mesh, cell), Val(D))
-        for (a, b) in _vtk_edge_pairs(Val(D))
-            first_point = length(points) + 1
-            push!(points, _vtk_point(corners[a]))
-            push!(points, _vtk_point(corners[b]))
-            push!(lines, MeshCell(PolyData.Lines(), SVector{2,Int}(first_point, first_point + 1)))
-            push!(level_ids, level.id)
-            push!(role_ids, _role_id(level.role))
-            push!(order_max, maximum(level.order))
-            push!(cell_ids, linear[cell])
+        first_point = length(points) + 1
+        for corner in corners
+            push!(points, _vtk_point(corner))
         end
+        push!(cells,
+              MeshCell(cell_type, SVector{2^D,Int}(ntuple(i -> first_point + i - 1, 2^D))))
+        push!(level_ids, level.id)
+        push!(role_ids, _role_id(level.role))
+        push!(order_max, maximum(level.order))
+        push!(cell_ids, linear[cell])
+        push!(active, is_active(level.mask, cell) ? 1 : 0)
+        push!(covered, cov[cell] ? 1 : 0)
+        raws = cell_dofs(dofs, level.id, cell)
+        push!(active_dofs,
+              count(raw -> any(c -> dofs.active_component[raw, c] != 0, 1:dofs.components), raws))
+        push!(reduced_dofs,
+              count(raw -> dofs.elimination_source[raw] in (:coverage, :dedup), raws))
     end
 
-    return (; points, lines, level_ids, role_ids, order_max, cell_ids)
+    return (; points, cells, level_ids, role_ids, order_max, cell_ids, active, covered,
+            active_dofs, reduced_dofs)
 end
 
 # ── Public VTK export ────────────────────────────────────────────────────────
@@ -391,7 +397,7 @@ end
 """
     write_vtk(path, solution, model;
               field=nothing, subdivisions=:degree, point_data, cell_data,
-              wireframes=true, ascii=false, append=true, compress=false)
+              level_meshes=true, ascii=false, append=true, compress=false)
 
 Write a ParaView bundle rooted at `path`. The top-level file is a `.vtm`
 multiblock dataset with **one block per field**, each named after the field and
@@ -404,14 +410,16 @@ self-contained, independently-toggled unit — `<field> → { data_<i>, level_�
     `cover_count`, per-point user-defined arrays, and (with a
     [`PhysicalDomain`](@ref)) the field's own `level_set`. A single-field model
     names it simply `data`;
-  - `level_<id>_<role>` — optionally, one wireframe `.vtp` per level of the
-    field's subdomain showing the level's active region.
+  - `level_<id>_<role>` — optionally, one solid-cell `.vtu` per level of the
+    field's subdomain: every mesh cell with per-cell `active`, `covered`,
+    `active_dofs`, `reduced_dofs` (plus `level_id` / `role_id` / `order_max` /
+    `cell_id`), so ParaView can colour the mesh by coverage and order reduction.
 
 A single-field model is the one-block case of this shape. Fields sharing one
-space emit that space's wireframes once, under the first such field. The tree is
+space emit that space's meshes once, under the first such field. The tree is
 homogeneous (a field block holds only leaf datasets) and every leaf's
 disambiguating name is **ASCII** — the field *index* `i` for `data_<i>`, the
-level *id* for the wireframes — so ParaView's Extract Block (whose data-assembly
+level *id* for the meshes — so ParaView's Extract Block (whose data-assembly
 node names keep only ASCII identifier characters) resolves each leaf on its own
 even when the field names themselves are Unicode (`θ₁`, `θ₂`).
 
@@ -433,8 +441,9 @@ Keyword arguments:
     per-cell sample points (the subbox center). Defaults to no
     user-defined cell data; the bundle always includes `region_id`
     and `cover_count` as built-in cell arrays.
-  - `wireframes` — emit one `.vtp` wireframe per level when `true`
-    (default).
+  - `level_meshes` — emit one solid-cell `.vtu` per level when `true`
+    (default), each cell carrying per-cell `active` / `covered` /
+    `active_dofs` / `reduced_dofs` data.
   - `ascii` / `append` / `compress` — pass-through to `WriteVTK`'s
     `vtk_grid` constructor.
 
@@ -447,7 +456,7 @@ override or rename it.
 """
 function write_vtk(path::AbstractString, solution::Solution, model::Model{D,T}; field=nothing,
                    subdivisions=:degree, point_data=_default_vtk_point_data(),
-                   cell_data=NamedTuple(), wireframes::Bool=true, ascii::Bool=false,
+                   cell_data=NamedTuple(), level_meshes::Bool=true, ascii::Bool=false,
                    append::Bool=true, compress=false) where {D,T}
     _check_vtk_dimension(Val(D))
     _checked_coefficients(solution, model)
@@ -462,7 +471,7 @@ function write_vtk(path::AbstractString, solution::Solution, model::Model{D,T}; 
     multi = length(fields) > 1
 
     # One block per field, grouping the field's `data` grid with its own subdomain
-    # mesh wireframe(s) so each coupled field is a self-contained, independently-
+    # mesh(es) so each coupled field is a self-contained, independently-
     # toggled unit in ParaView: `<field> → { data, level_… }`. The children of a
     # field block are all *leaf* datasets — never a mix of a leaf and a sub-block,
     # which breaks ParaView's Extract-Block resolution.
@@ -471,11 +480,11 @@ function write_vtk(path::AbstractString, solution::Solution, model::Model{D,T}; 
     # its Extract-Block data-assembly node names from the dataset names and keeps
     # only ASCII identifier characters, so a Unicode field name (`θ₁`, `θ₂`) or a
     # name disambiguated only by Unicode digits collapses to a single node and the
-    # blocks become indistinguishable. The wireframes are keyed by ASCII level id
+    # blocks become indistinguishable. The meshes are keyed by ASCII level id
     # (`level_<id>_<role>`); the data leaf is likewise keyed by the ASCII field
     # index (`data_<i>`), NOT by the field name. The field name is still the (only)
     # block label, where a Unicode collision is harmless — the user extracts leaves.
-    # `meshed` dedups the wireframes of a space shared by several fields onto its
+    # `meshed` dedups the meshes of a space shared by several fields onto its
     # first.
     return vtk_multiblock(base) do vtm
         meshed = Any[]
@@ -500,18 +509,23 @@ function write_vtk(path::AbstractString, solution::Solution, model::Model{D,T}; 
                 vtk[name, VTKCellData()] = arr
             end
 
-            (wireframes && !any(s -> s === space, meshed)) || continue
+            (level_meshes && !any(s -> s === space, meshed)) || continue
             push!(meshed, space)
+            coverage = build_coverage(space, layout.dofs.tolerance)
             for level in space.levels
-                wire = _wireframe_vtk_data(level)
+                data = _mesh_vtk_data(level, layout.dofs, coverage)
                 label = "level_$(level.id)_$(level.role)"
-                wvtk = vtk_grid(_vtk_child_path(base, "$(label)_wire"), wire.points, wire.lines;
+                mvtk = vtk_grid(_vtk_child_path(base, "$(label)_mesh"), data.points, data.cells;
                                 ascii, append, compress)
-                multiblock_add_block(field_block, wvtk, label)
-                wvtk["level_id", VTKCellData()] = wire.level_ids
-                wvtk["role_id", VTKCellData()] = wire.role_ids
-                wvtk["order_max", VTKCellData()] = wire.order_max
-                wvtk["cell_id", VTKCellData()] = wire.cell_ids
+                multiblock_add_block(field_block, mvtk, label)
+                mvtk["level_id", VTKCellData()] = data.level_ids
+                mvtk["role_id", VTKCellData()] = data.role_ids
+                mvtk["order_max", VTKCellData()] = data.order_max
+                mvtk["cell_id", VTKCellData()] = data.cell_ids
+                mvtk["active", VTKCellData()] = data.active
+                mvtk["covered", VTKCellData()] = data.covered
+                mvtk["active_dofs", VTKCellData()] = data.active_dofs
+                mvtk["reduced_dofs", VTKCellData()] = data.reduced_dofs
             end
         end
     end
