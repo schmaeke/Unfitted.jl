@@ -2030,3 +2030,68 @@ function foreach_quadrature_point(f, model::Model{D,T}; state=nothing) where {D,
     end
     return nothing
 end
+
+"""
+    interface_quadrature_count(model, iface::Interface) -> Int
+
+Number of quadrature points of the two-sided interface `iface` (built with
+[`interface`](@ref)) on the prepared `model`. This is the size of a per-point
+history vector keyed by the `q.point` index that
+[`foreach_interface_quadrature_point`](@ref) and the coupling forms expose.
+"""
+function interface_quadrature_count(model::Model, iface::Interface)
+    regions = _resolve_on_regions(model, iface)
+    return sum(_region_qpoint_count, regions; init=0)
+end
+
+"""
+    foreach_interface_quadrature_point(f, model, iface::Interface; state=nothing)
+
+Call `f(q)` at every quadrature point of the two-sided interface `iface` (built
+with [`interface`](@ref)). The payload is
+
+    q = (; x, weight, point, normal, state)
+
+where
+
+  - `q.x` — physical coordinate of the interface quadrature point,
+  - `q.weight` — the surface quadrature weight (arc length in 2-D, area in 3-D),
+  - `q.point` — stable index in `1:interface_quadrature_count(model, iface)`,
+    matching the index the coupling forms see during assembly, so it is the
+    natural key for per-interface-point history (an irreversible cohesive
+    `κ`, a friction state, …),
+  - `q.normal` — the interface unit normal, oriented from side `a` toward side
+    `b` (the two fields passed to [`couple`](@ref), in order),
+  - `q.state` — `nothing` unless a `state` (a [`Solution`](@ref) or active
+    coefficient vector) was passed, in which case it is a two-field
+    [`FormState`](@ref) exposing **both** coupled fields via
+    `value(q.state, field)` / `field_gradient(q.state, field)` (each evaluated
+    in its own subdomain's covering cut cell at the shared point `q.x`).
+
+Unlike [`foreach_quadrature_point`](@ref) (single subdomain, volume points),
+this walks the two-sided interface regions of a coupled model, so it is the
+companion iterator for reading and committing interface state around a
+nonlinear solve. Dimension-generic (2-D polyline / 3-D triangle interface);
+iteration order matches the serial interface-assembly pass.
+"""
+function foreach_interface_quadrature_point(f, model::Model{D,T}, iface::Interface;
+                                            state=nothing) where {D,T}
+    regions = _resolve_on_regions(model, iface)
+    coefficients = _iterate_coefficients(state, model)
+    ws = _assembly_workspace(model)
+    offsets = _region_qpoint_offsets(regions)
+    for (region_index, region) in enumerate(regions)
+        offset = offsets[region_index]
+        # `field_data` aliases the workspace basis buffers that `_region_qpoint!`
+        # refreshes for *both* sides' parents, so the lazy `FormState` reads the
+        # current point's basis for either coupled field.
+        st = coefficients === nothing ? nothing :
+             FormState(_region_field_data(ws, model, region), model.dofs, coefficients)
+        for local_qp in 1:_region_qpoint_count(region)
+            x, qweight = _region_qpoint!(ws, region, local_qp, one(T))
+            f((; x, weight=qweight, point=offset + local_qp, state=st,
+               normal=_region_normal(region, local_qp)))
+        end
+    end
+    return nothing
+end

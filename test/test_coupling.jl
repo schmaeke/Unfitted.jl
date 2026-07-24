@@ -331,3 +331,70 @@ end
         @test model.matrix ≈ serial_matrix
     end
 end
+
+@testset "foreach_interface_quadrature_point matches the assembly points" begin
+    # Non-matching stacked squares coupled by a jump penalty. The iterator must
+    # visit exactly the quadrature points the coupling forms see during assembly,
+    # under the SAME stable `q.point` numbering (the key for per-point history),
+    # and expose both coupled fields through `q.state`.
+    V1 = space(box((0.0, 0.0), (1.0, 0.5)); cells=(4, 2), order=2)
+    V2 = space(box((0.0, 0.5), (1.0, 1.0)); cells=(3, 2), order=2)   # non-matching in x
+    u1 = field(:u1, V1)
+    u2 = field(:u2, V2)
+    Γ = polyline_mesh([SVector(1.0, 0.5), SVector(0.0, 0.5)])        # normal (0,+1) = a→b
+    iface = interface(u1, u2, Γ)
+
+    # A coupling kernel that records the `q.point` indices seen during assembly.
+    seen = Int[]
+    rec = InterfaceForm() do q, sides, trial, _tc
+        push!(seen, q.point)
+        TestChannels(jump_sign(sides.test) * jump_sign(sides.trial) * trial.value, SVector(0.0, 0.0))
+    end
+    model = prepare(Problem((u1, u2);
+                            blocks=(stiffness_block(u1), stiffness_block(u2),
+                                    couple(u1, u2, Γ, rec)...), symmetric=false))
+    assemble_matrix(model, couple(u1, u2, Γ, rec); threaded=false, symmetric=false)
+
+    count = interface_quadrature_count(model, iface)
+    @test count > 0
+    @test count == nquadpoints(model; kind=:interface)              # single interface ⇒ equal
+    @test Set(seen) == Set(1:count)                                 # assembly sees points 1:count
+
+    # The iterator visits each point once, with unit a→b normals; the weights sum
+    # to the interface length.
+    pts = Int[]
+    arclen = 0.0
+    normals_unit = true
+    normal_dir = SVector(0.0, 0.0)
+    foreach_interface_quadrature_point(model, iface) do q
+        push!(pts, q.point)
+        arclen += q.weight
+        normals_unit &= abs(norm(q.normal) - 1.0) < 1.0e-12
+        normal_dir = q.normal
+    end
+    @test sort(pts) == collect(1:count)                             # each point exactly once
+    @test normals_unit
+    @test normal_dir ≈ SVector(0.0, 1.0)                            # a→b orientation (+y)
+    @test isapprox(arclen, 1.0; atol=1.0e-6)                        # Σ weights == |Γ|
+
+    # `q.state` exposes BOTH coupled fields; a zero state gives a zero jump, a
+    # nonzero state a finite one — and `q.point` is a stable key across passes, so
+    # a monotone max-update (the cohesive κ irreversibility contract) never
+    # decreases when replayed against a smaller state.
+    n = active_unknowns(model)
+    x = solution(model, collect(1.0:n) ./ n)
+    hist = zeros(count)
+    both_finite = true
+    foreach_interface_quadrature_point(model, iface; state=x) do q
+        va, vb = value(q.state, :u1), value(q.state, :u2)
+        both_finite &= isfinite(va) && isfinite(vb)
+        hist[q.point] = max(hist[q.point], abs(va - vb))
+    end
+    @test both_finite
+    @test any(hist .> 0)
+    committed = copy(hist)
+    foreach_interface_quadrature_point(model, iface; state=solution(model, zeros(n))) do q
+        hist[q.point] = max(hist[q.point], abs(value(q.state, :u1) - value(q.state, :u2)))
+    end
+    @test hist == committed                                         # irreversible (monotone)
+end
