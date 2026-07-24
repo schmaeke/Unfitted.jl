@@ -959,10 +959,14 @@ function update_dirichlet!(model::Model{D,T}, dirichlet) where {D,T}
     # constrained-dof set is unchanged, so `_project_dirichlet_values!`
     # only refills `layout.constrained_values` — it does not touch the
     # raw-dof index, the active enumeration, or any of the boolean
-    # constraint masks.
+    # constraint masks. Each field is projected against its OWN space (a
+    # coupled multi-domain problem gives every field an independent space);
+    # `model.problem.space` is only the first field's and does not cover the
+    # others' cells — mirror the per-field routing `prepare` uses.
     for field_layout in model.dofs.fields
         field_dirichlet = _dirichlet_for_field(model.problem, field_layout.name)
-        _project_dirichlet_values!(field_layout.dofs, model.problem.space, field_dirichlet)
+        field_space = _field_space(model.problem, field_layout.name)
+        _project_dirichlet_values!(field_layout.dofs, field_space, field_dirichlet)
     end
 
     # Clear cached operators. The RHS depends on the constrained values

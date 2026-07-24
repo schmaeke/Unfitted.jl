@@ -220,6 +220,47 @@ end
     @test value(sol, model, (0.5, 1.0), 2) ≈ 0.1 atol = 1.0e-10
 end
 
+@testset "same-facet multi-component Dirichlet is not halved" begin
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    V = space(omega; cells=(2, 2), order=1)
+    u = field(:u, V; components=2)
+    bottom = boundary(axis=2, side=:lower)
+    top = boundary(axis=2, side=:upper)
+    # u_1 and u_2 are BOTH prescribed on the same top edge (two conditions, one
+    # facet). A component-blind projection mass double-counts the top-edge dofs
+    # and halves both projected values; the per-component projection returns them
+    # exactly.
+    model = prepare(poisson(u; source=x -> SVector(0.0, 0.0),
+                            dirichlet=[dirichlet(SVector(0.0, 0.0); on=bottom, field=u),
+                                       dirichlet(0.3; on=top, field=u, component=1),
+                                       dirichlet(0.1; on=top, field=u, component=2)]))
+    sol = solve!(model)
+    @test value(sol, model, (0.5, 1.0), 1) ≈ 0.3 atol = 1.0e-10
+    @test value(sol, model, (0.5, 1.0), 2) ≈ 0.1 atol = 1.0e-10
+end
+
+@testset "cross-component corner is not contaminated" begin
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    V = space(omega; cells=(4, 4), order=1)
+    u = field(:u, V; components=2)
+    bottom = boundary(axis=2, side=:lower)
+    top = boundary(axis=2, side=:upper)
+    left = boundary(axis=1, side=:lower)
+    right = boundary(axis=1, side=:upper)
+    # Laterals constrain only u_1; the top prescribes u_2 = 0.1. The top corners
+    # are shared, so a component-blind mass lets the lateral u_1 rows pull the
+    # corner u_2 below 0.1. Per-component projection keeps u_2 = 0.1 exactly
+    # along the whole top edge, corners included.
+    model = prepare(poisson(u; source=x -> SVector(0.0, 0.0),
+                            dirichlet=[dirichlet(SVector(0.0, 0.0); on=bottom, field=u),
+                                       dirichlet(0.0; on=left, field=u, component=1),
+                                       dirichlet(0.0; on=right, field=u, component=1),
+                                       dirichlet(SVector(0.0, 0.1); on=top, field=u)]))
+    sol = solve!(model)
+    @test value(sol, model, (0.5, 1.0), 2) ≈ 0.1 atol = 1.0e-10
+    @test value(sol, model, (1.0, 1.0), 2) ≈ 0.1 atol = 1.0e-8
+end
+
 # The load-stepping driver pattern: a single `prepare(problem)` followed
 # by `update_dirichlet!` between steps. The converged solution must
 # match what a fresh `prepare(problem)` with the new Dirichlet datum
@@ -250,6 +291,35 @@ end
         @test value(s, base, (0.5,)) ≈ value(reference, prepare(build(new_value)), (0.5,)) atol = 1.0e-10
         @test value(s, base, (1.0,)) ≈ new_value atol = 1.0e-10
         @test value(s, base, (0.0,)) ≈ 0.0 atol = 1.0e-10
+    end
+end
+
+# Same driver pattern, but on a COUPLED multi-space model: a Dirichlet on u2's
+# own top face lives on V2's space, which `model.problem.space` (V1) does not
+# cover. `update_dirichlet!` must re-project each field against its own space.
+@testset "update_dirichlet! matches fresh prepare for a coupled multi-space model" begin
+    V1 = space(box((0.0, 0.0), (1.0, 0.5)); cells=(2, 1), order=1)
+    V2 = space(box((0.0, 0.5), (1.0, 1.0)); cells=(2, 1), order=1)
+    u1 = field(:u1, V1)
+    u2 = field(:u2, V2)
+    Γ = polyline_mesh([SVector(1.0, 0.5), SVector(0.0, 0.5)])
+
+    dir(g) = [dirichlet(0.0; on=boundary(axis=2, side=:lower), field=u1),
+              dirichlet(g; on=boundary(axis=2, side=:upper), field=u2)]
+    build(g) = Problem((u1, u2);
+                       blocks=(stiffness_block(u1), stiffness_block(u2),
+                               couple(u1, u2, Γ, mass_form(coefficient=100.0))...),
+                       dirichlet=dir(g))
+
+    base = prepare(build(0.0))
+    initial_version = base.version
+    for g in (0.5, 1.0)
+        update_dirichlet!(base, dir(g))
+        @test base.version == initial_version
+        s = solve!(base)
+        reference = solve!(prepare(build(g)))
+        @test value(s, base, u2, (0.5, 1.0)) ≈ value(reference, prepare(build(g)), u2, (0.5, 1.0)) atol = 1.0e-10
+        @test value(s, base, u2, (0.5, 1.0)) ≈ g atol = 1.0e-8
     end
 end
 

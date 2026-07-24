@@ -488,23 +488,33 @@ end
 # (`prepare(problem)` loads every source file first).
 function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T}, dirichlet) where {D,T}
     fill!(layout.constrained_values, zero(T))
+    ncomp = layout.components
 
-    # Index the raw dofs that need a Dirichlet value (physically
-    # constrained on at least one component, and not eliminated by any
-    # constraint — eliminated dofs are homogeneous by construction).
-    unknown_raws = [raw
-                    for raw in eachindex(layout.raw_keys)
-                    if layout.elimination_source[raw] === :free &&
-                       any(c -> layout.physical_dirichlet[raw, c], 1:layout.components)]
-    isempty(unknown_raws) && return layout
+    # The projection is done PER COMPONENT. Two boundary traces couple in the L²
+    # projection only through the part of ∂Ω where BOTH are constrained in the
+    # SAME displacement component; a dof constrained in one component must not
+    # enter another component's mass matrix. A single shared mass over the union
+    # of all component-constrained dofs (integrated over every condition's facet,
+    # component-blind) is wrong on two counts: two conditions on the same facet
+    # (e.g. u_x = 0 and u_y = ḡ on one edge) double-count the mass and halve the
+    # projected value, and a component-1-only condition (e.g. a lateral u_x = 0)
+    # adds mass to a shared corner's component-2 row with no matching right-hand
+    # side, pulling that u_y toward zero. Per-component unknown sets, mass
+    # matrices, and right-hand sides — each accumulated only over the facets
+    # where a condition actually constrains that component — remove both. For
+    # all-component (vector) conditions this reduces to the previous behaviour.
+    unknowns = [[raw
+                 for raw in eachindex(layout.raw_keys)
+                 if layout.elimination_source[raw] === :free && layout.physical_dirichlet[raw, c]]
+                for c in 1:ncomp]
+    all(isempty, unknowns) && return layout
 
-    raw_to_projection = Dict(raw => i for (i, raw) in pairs(unknown_raws))
-    nproj = length(unknown_raws)
-    # The constrained-boundary mass couples only the physically-Dirichlet
-    # dofs (a small set) and is dense-solved below, so it is accumulated
+    projection = [Dict(raw => i for (i, raw) in pairs(unknowns[c])) for c in 1:ncomp]
+    # The constrained-boundary mass couples only the physically-Dirichlet dofs (a
+    # small set) and is dense-solved below, so each component's is accumulated
     # directly into a dense matrix — no sparse intermediate.
-    mass = zeros(T, nproj, nproj)
-    rhs = zeros(T, nproj, layout.components)
+    mass = [zeros(T, length(unknowns[c]), length(unknowns[c])) for c in 1:ncomp]
+    rhs = [zeros(T, length(unknowns[c])) for c in 1:ncomp]
 
     for condition in dirichlet
         for sides in _facets(condition.boundary, Val(D))
@@ -512,11 +522,10 @@ function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T}, diric
                 for (qp, x) in pairs(region.points)
                     qweight = region.weights[qp]
 
-                    # Evaluate every parent's boundary traces at this
-                    # point once and reuse them for both the RHS and
-                    # mass-matrix contributions below. `parent.parent_box`
-                    # is precomputed on the region, so the only per-Q-point
-                    # geometry work is the affine `physical_to_reference`.
+                    # Evaluate every parent's boundary traces at this point once
+                    # and reuse them across the components below. `parent.parent_box`
+                    # is precomputed on the region, so the only per-Q-point geometry
+                    # work is the affine `physical_to_reference`.
                     traces = map(region.parents) do parent
                         level = _level_by_id(V, parent.level)
                         raw_dofs = cell_dofs(layout, parent.level, parent.cell)
@@ -524,42 +533,41 @@ function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T}, diric
                         boundary_trace_data(level, raw_dofs, sides, xi, parent.cell)
                     end
 
-                    # RHS: ∫_∂Ω g v dx contributions for every component
-                    # this condition applies to.
-                    for component in 1:layout.components
+                    for component in 1:ncomp
                         (condition.component === nothing || condition.component == component) ||
                             continue
+                        index = projection[component]
+                        mass_c = mass[component]
+                        rhs_c = rhs[component]
+
+                        # RHS: ∫_∂Ω g v dx over this component's constrained dofs.
                         g = convert(T, _condition_value(condition, x, component))
                         rhs_channels = _as_test_channels(g, Val(D), T)
-
                         for test_trace in traces
                             for a in eachindex(test_trace.raw_dofs)
-                                row = get(raw_to_projection, test_trace.raw_dofs[a], 0)
+                                row = get(index, test_trace.raw_dofs[a], 0)
                                 row == 0 && continue
-                                rhs[row, component] += qweight *
-                                                       _test_value_contribution(rhs_channels,
-                                                                                test_trace.values[a])
+                                rhs_c[row] += qweight *
+                                              _test_value_contribution(rhs_channels,
+                                                                       test_trace.values[a])
                             end
                         end
-                    end
 
-                    # Mass matrix: ∫_∂Ω φ_i φ_j dx contributions over
-                    # the constrained-dof subspace. Both indices iterate
-                    # over the same `traces`, so the resulting matrix is
-                    # symmetric by construction.
-                    for trial_trace in traces
-                        for b in eachindex(trial_trace.raw_dofs)
-                            col = get(raw_to_projection, trial_trace.raw_dofs[b], 0)
-                            col == 0 && continue
-                            mass_channels = _as_test_channels(trial_trace.values[b], Val(D), T)
-
-                            for test_trace in traces
-                                for a in eachindex(test_trace.raw_dofs)
-                                    row = get(raw_to_projection, test_trace.raw_dofs[a], 0)
-                                    row == 0 && continue
-                                    mass[row, col] += qweight *
-                                                      _test_value_contribution(mass_channels,
-                                                                               test_trace.values[a])
+                        # Mass: ∫_∂Ω φ_i φ_j dx over the same subspace. Both
+                        # indices iterate the same `traces`, so it is symmetric.
+                        for trial_trace in traces
+                            for b in eachindex(trial_trace.raw_dofs)
+                                col = get(index, trial_trace.raw_dofs[b], 0)
+                                col == 0 && continue
+                                mass_channels = _as_test_channels(trial_trace.values[b], Val(D), T)
+                                for test_trace in traces
+                                    for a in eachindex(test_trace.raw_dofs)
+                                        row = get(index, test_trace.raw_dofs[a], 0)
+                                        row == 0 && continue
+                                        mass_c[row, col] += qweight *
+                                                            _test_value_contribution(mass_channels,
+                                                                                     test_trace.values[a])
+                                    end
                                 end
                             end
                         end
@@ -569,15 +577,16 @@ function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T}, diric
         end
     end
 
-    # Solve `M c = b` for every component. Cholesky first; pseudoinverse
-    # fallback on the rare indefinite case (degenerate / zero-area facets
-    # under heavy masking).
-    factor = cholesky(Symmetric(mass); check=false)
-    projected = issuccess(factor) ? factor \ rhs : pinv(mass) * rhs
-
-    for (i, raw) in pairs(unknown_raws)
-        for component in 1:layout.components
-            layout.constrained_values[raw, component] = projected[i, component]
+    # Solve `M c = b` for each component. Cholesky first; pseudoinverse fallback
+    # on the rare indefinite case (degenerate / zero-area facets under heavy
+    # masking, or a codim-D point pin whose facet carries no measure).
+    for component in 1:ncomp
+        isempty(unknowns[component]) && continue
+        mass_c = mass[component]
+        factor = cholesky(Symmetric(mass_c); check=false)
+        projected = issuccess(factor) ? factor \ rhs[component] : pinv(mass_c) * rhs[component]
+        for (i, raw) in pairs(unknowns[component])
+            layout.constrained_values[raw, component] = projected[i]
         end
     end
 
