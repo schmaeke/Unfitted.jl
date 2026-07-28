@@ -110,7 +110,7 @@ write_vtk(out, overlay_solution, overlay_model; subdivisions=8,
           point_data=(uh=(u, c, x, xi) -> u(c, xi), exact=(u, c, x, xi) -> exact(x),
                       error=(u, c, x, xi) -> u(c, xi) - exact(x),
                       strain=(u, c, x, xi) -> field_gradient(overlay_solution, overlay_model, x)[1],
-                      youngs_modulus=(u, c, x, xi) -> youngs_modulus(x)),)
+                      youngs_modulus=(u, c, x, xi) -> youngs_modulus(x)))
 
 # Two reports, side by side, so the reader sees the L²-error gap that
 # the overlay buys at the cost of a few extra dofs.

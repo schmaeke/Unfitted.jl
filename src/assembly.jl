@@ -299,8 +299,7 @@ _volume_passes(model::Model) = Any[plan.regions for plan in integration_plans(mo
 
 # Assembly pattern over a model's volume/on region-list passes: feed one dense
 # block per region from the active dofs its owning fields emit there.
-function build_assembly_pattern(model::Model{D,T}, passes, symmetric::Bool,
-                                key::UInt) where {D,T}
+function build_assembly_pattern(model::Model{D,T}, passes, symmetric::Bool, key::UInt) where {D,T}
     ws = _assembly_workspace(model)
     return _gustavson_pattern(active_unknowns(model.dofs), symmetric, key) do visit
         for regions in passes, region in regions
@@ -747,8 +746,8 @@ function _build_multidomain_workspace(spaces, ::Val{D}, ::Type{T}) where {D,T}
     gradients = Vector{Vector{SVector{D,T}}}(undef, n)
     der1d = Vector{NTuple{D,Vector{T}}}(undef, n)
     for V in spaces
-        _fill_assembly_banks!(bases, local_ids, orders, values, gradients, val1d, der1d,
-                              V.levels, Val(D), T)
+        _fill_assembly_banks!(bases, local_ids, orders, values, gradients, val1d, der1d, V.levels,
+                              Val(D), T)
     end
     return AssemblyWorkspace{D,T}(bases, local_ids, orders, values, gradients, val1d, der1d, Int[],
                                   Dict{Int,Int}(), T[], T[])
@@ -805,17 +804,20 @@ end
 # subdomain's plan is owned exactly by the fields on that subdomain. For a
 # single-domain model every field's block covers every level, so every field
 # gets the parents (the pre-multidomain fast path, unchanged).
-region_parents(region::Union{VolumeRegion,FacetRegion,SurfaceRegion}, ::Int, fl::FieldLayout) =
-    (isempty(region.parents) || first(region.parents).level in fl.level_ids) ?
-    region.parents : empty(region.parents)
+function region_parents(region::Union{VolumeRegion,FacetRegion,SurfaceRegion}, ::Int,
+                        fl::FieldLayout)
+    (isempty(region.parents) || first(region.parents).level in fl.level_ids) ? region.parents :
+    empty(region.parents)
+end
 
 # Two-sided: each coupled field is evaluated on its own subdomain's parents,
 # every other field on none (empty), so an interface pass emits into exactly
 # the four field blocks Kₐₐ, K_ab, K_ba, K_bb. Keyed on the field *index* (the
 # interface stores its two sides' global field indices), not the level block.
-region_parents(region::InterfaceRegion, field_index::Int, ::FieldLayout) =
+function region_parents(region::InterfaceRegion, field_index::Int, ::FieldLayout)
     field_index == region.field_a ? region.parents_a :
     field_index == region.field_b ? region.parents_b : empty(region.parents_a)
+end
 
 function _region_field_data(ws::AssemblyWorkspace, model::Model, region)
     return [[_parent_dof_data(ws, layout, parent)
@@ -890,8 +892,10 @@ end
 # volume region (whose weights are reference-frame), `one(T)` for facet, surface,
 # and interface regions (whose weights are already physical-frame).
 _region_jacobian(region::VolumeRegion{D,T}) where {D,T} = volume(region.box) / convert(T, 2^D)
-_region_jacobian(::Union{FacetRegion{D,T},SurfaceRegion{D,T},InterfaceRegion{D,T}}) where {D,T} =
+function _region_jacobian(::Union{FacetRegion{D,T},SurfaceRegion{D,T},InterfaceRegion{D,T}}) where {D,
+                                                                                                    T}
     one(T)
+end
 
 # Advance to local quadrature point `local_qp`: refresh every parent's basis
 # values / physical gradients into the workspace and return `(x, qweight)`. A
@@ -922,8 +926,9 @@ end
 # identifier `q.sides` (only a facet carries one).
 _region_normal(::VolumeRegion, ::Int) = nothing
 _region_normal(region::FacetRegion, ::Int) = region.normal
-_region_normal(region::Union{SurfaceRegion,InterfaceRegion}, local_qp::Int) =
+function _region_normal(region::Union{SurfaceRegion,InterfaceRegion}, local_qp::Int)
     region.normals[local_qp]
+end
 _region_sides(::Union{VolumeRegion,SurfaceRegion,InterfaceRegion}) = nothing
 _region_sides(region::FacetRegion) = region.sides
 
@@ -976,9 +981,8 @@ region's local system is finally flushed by [`_emit_local_system!`](@ref).
 """
 function _assemble_region!(ws::AssemblyWorkspace{D,T}, sink, rhs::Vector{T}, model::Model{D,T},
                            region::Union{VolumeRegion{D,T},FacetRegion{D,T},SurfaceRegion{D,T},
-                                         InterfaceRegion{D,T}},
-                           blocks, loads, symmetric::Bool, state_coefficients=nothing,
-                           point_offset::Int=0) where {D,T}
+                                         InterfaceRegion{D,T}}, blocks, loads, symmetric::Bool,
+                           state_coefficients=nothing, point_offset::Int=0) where {D,T}
     # Region setup: per-field parent data (each field owns its subdomain's
     # regions intrinsically, see `region_parents`), region-local dof table,
     # optional state, local matrix / rhs buffers.
@@ -1277,8 +1281,9 @@ end
 # region-kind-agnostic; the physical-frame kinds (facet / surface / interface)
 # share one method as their weights vector already holds one entry per point.
 _region_qpoint_count(region::VolumeRegion) = length(region.quadrature.weights)
-_region_qpoint_count(region::Union{FacetRegion,SurfaceRegion,InterfaceRegion}) =
+function _region_qpoint_count(region::Union{FacetRegion,SurfaceRegion,InterfaceRegion})
     length(region.weights)
+end
 
 # Cumulative offsets of the global `q.point` index over a region list.
 # Volume and facet kinds maintain independent counters: callers pass
@@ -1681,11 +1686,10 @@ function _partition_space(model::Model, on, blocks, loads)
         if space === nothing
             space = s
         elseif s !== space
-            throw(ArgumentError(
-                "the single-sided `on=` target is shared by forms whose test fields live on " *
-                "different subdomain spaces, so only one subdomain's contribution would be " *
-                "assembled; give each subdomain its own `on=` mesh/selector object (couple " *
-                "subdomains with `interface(uₐ, u_b, Γ)`)"))
+            throw(ArgumentError("the single-sided `on=` target is shared by forms whose test fields live on " *
+                                "different subdomain spaces, so only one subdomain's contribution would be " *
+                                "assembled; give each subdomain its own `on=` mesh/selector object (couple " *
+                                "subdomains with `interface(uₐ, u_b, Γ)`)"))
         end
     end
     return space === nothing ? model.problem.space : space

@@ -349,7 +349,7 @@ function write_snapshot(output_root, index, state, coefficients, t)
               point_data=(temperature=(u, c, x, xi) -> u(c, xi),
                           temperature_gradient=(u, c, x, xi) -> field_gradient(snapshot,
                                                                                state.model, x),
-                          source=(u, c, x, xi) -> heat_source(center)(x)),)
+                          source=(u, c, x, xi) -> heat_source(center)(x)))
     return snapshot
 end
 

@@ -33,8 +33,7 @@ end
 # (`searchsortedlast`). Cost is O(D·log Nₖ + overlapping cells) rather than O(Nₖ). The
 # ± tol.contain nudges keep a box whose face merely touches a cell boundary from
 # claiming the neighbouring cell.
-function _covered_by_level(box::AxisBox{D,T}, k::Level{D,T},
-                           tol::GeometryTolerance{T}) where {D,T}
+function _covered_by_level(box::AxisBox{D,T}, k::Level{D,T}, tol::GeometryTolerance{T}) where {D,T}
     is_inside(box, k.mesh.domain, tol) || return false
     k.mask === nothing && return true
     ranges = ntuple(D) do d
@@ -80,8 +79,7 @@ end
 # coordinates, per axis. Sufficient for `outer` to reproduce `inner`'s multilinear
 # vertex functions wherever `outer` covers them — the condition under which a covered
 # coarse vertex is an exact duplicate and the linear-dedup rule fires.
-function _nested_over(inner::Level{D,T}, outer::Level{D,T},
-                      tol::GeometryTolerance{T}) where {D,T}
+function _nested_over(inner::Level{D,T}, outer::Level{D,T}, tol::GeometryTolerance{T}) where {D,T}
     for d in 1:D
         lo, hi = outer.mesh.domain.lower[d], outer.mesh.domain.upper[d]
         for x in inner.mesh.axes[d]

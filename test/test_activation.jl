@@ -141,19 +141,19 @@ end
     raw_22 = only(raw
                   for (raw, key) in pairs(layout.raw_keys)
                   if key.level == overlay_level.id &&
-                     key.axes[1].kind == Unfitted._AXIS_NODE &&
-                     key.axes[1].index == 2 &&
-                     key.axes[2].kind == Unfitted._AXIS_NODE &&
-                     key.axes[2].index == 2)
+                         key.axes[1].kind == Unfitted._AXIS_NODE &&
+                         key.axes[1].index == 2 &&
+                         key.axes[2].kind == Unfitted._AXIS_NODE &&
+                         key.axes[2].index == 2)
     @test Unfitted.constraint_kind(layout, raw_22) == :overlay
 
     raw_32 = only(raw
                   for (raw, key) in pairs(layout.raw_keys)
                   if key.level == overlay_level.id &&
-                     key.axes[1].kind == Unfitted._AXIS_NODE &&
-                     key.axes[1].index == 3 &&
-                     key.axes[2].kind == Unfitted._AXIS_NODE &&
-                     key.axes[2].index == 2)
+                         key.axes[1].kind == Unfitted._AXIS_NODE &&
+                         key.axes[1].index == 3 &&
+                         key.axes[2].kind == Unfitted._AXIS_NODE &&
+                         key.axes[2].index == 2)
     @test Unfitted.constraint_kind(layout, raw_32) == :free
 end
 

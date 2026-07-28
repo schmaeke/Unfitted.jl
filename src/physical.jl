@@ -229,7 +229,8 @@ function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0,
     T = promote_type(typeof(float(alpha)), typeof(float(subcell_length_scale)),
                      typeof(float(target_residual)))
     return PhysicalDomain{typeof(g),T}(g, T(alpha), T(subcell_length_scale), Int(max_depth),
-                                       Int(moment_order_factor), T(target_residual), keep_fictitious)
+                                       Int(moment_order_factor), T(target_residual),
+                                       keep_fictitious)
 end
 
 """

@@ -241,7 +241,7 @@ report = diagnostics(model, solution; exact)
 out = joinpath(@__DIR__, "output", "fcm_annular_plate_2d")
 write_vtk(out, solution, model;
           point_data=(uh=(u, c, x, xi) -> u(c, xi), exact=(u, c, x, xi) -> exact(x),
-                      displacement_error=(u, c, x, xi) -> norm(u(c, xi) - exact(x))),)
+                      displacement_error=(u, c, x, xi) -> norm(u(c, xi) - exact(x))))
 
 write_quadrature_vtm(out * "_quadrature", model)
 

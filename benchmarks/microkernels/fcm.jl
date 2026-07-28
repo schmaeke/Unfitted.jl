@@ -31,7 +31,9 @@ let
                                                                        target_residual=1.0e-6)
         group["implicit_volume_quadrature $tag"] = @benchmarkable implicit_volume_quadrature($phi_disk,
                                                                                              $cell;
-                                                                                             gauss_points=$q)
+                                                                                             gauss_points=(
+                                                                                                           $q
+                                                                                                           ))
     end
 end
 
@@ -52,7 +54,9 @@ let
                                                                        target_residual=1.0e-6)
         fcm3d["implicit_volume_quadrature $tag"] = @benchmarkable implicit_volume_quadrature($phi_sphere,
                                                                                              $cell;
-                                                                                             gauss_points=$q)
+                                                                                             gauss_points=(
+                                                                                                           $q
+                                                                                                           ))
     end
 end
 

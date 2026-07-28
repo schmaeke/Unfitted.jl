@@ -27,6 +27,6 @@ let
     mesh3 = CartesianMesh(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(16, 16, 16))
     pt2 = SVector{2,Float64}(0.37, 0.59)
     pt3 = SVector{3,Float64}(0.37, 0.59, 0.23)
-    group["locate_cell D=2"] = @benchmarkable locate_cell($mesh2, $pt2; tol=$tol)
-    group["locate_cell D=3"] = @benchmarkable locate_cell($mesh3, $pt3; tol=$tol)
+    group["locate_cell D=2"] = @benchmarkable locate_cell($mesh2, $pt2; tol=($tol))
+    group["locate_cell D=3"] = @benchmarkable locate_cell($mesh3, $pt3; tol=($tol))
 end

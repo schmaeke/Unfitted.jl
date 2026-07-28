@@ -547,9 +547,8 @@ function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T}, diric
                             for a in eachindex(test_trace.raw_dofs)
                                 row = get(index, test_trace.raw_dofs[a], 0)
                                 row == 0 && continue
-                                rhs_c[row] += qweight *
-                                              _test_value_contribution(rhs_channels,
-                                                                       test_trace.values[a])
+                                rhs_c[row] += qweight * _test_value_contribution(rhs_channels,
+                                                                                 test_trace.values[a])
                             end
                         end
 

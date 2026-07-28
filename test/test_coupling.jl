@@ -34,8 +34,7 @@ using Test
     # One coupled Problem over both spaces, no interface term.
     u1 = field(:u1, V1)
     u2 = field(:u2, V2)
-    prob = Problem((u1, u2);
-                   blocks=(stiffness_block(u1), stiffness_block(u2)),
+    prob = Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
                    loads=(source_load(u1; source=src1), source_load(u2; source=src2)),
                    dirichlet=[bc(:u1); bc(:u2)])
     model = prepare(prob)
@@ -50,18 +49,18 @@ using Test
 
     @test size(A) == (n1 + n2, n1 + n2)
     @test A[1:n1, 1:n1] ≈ A1
-    @test A[(n1 + 1):end, (n1 + 1):end] ≈ A2
-    @test iszero(A[1:n1, (n1 + 1):end])          # no cross coupling without an interface
-    @test iszero(A[(n1 + 1):end, 1:n1])
+    @test A[(n1+1):end, (n1+1):end] ≈ A2
+    @test iszero(A[1:n1, (n1+1):end])          # no cross coupling without an interface
+    @test iszero(A[(n1+1):end, 1:n1])
     @test b[1:n1] ≈ b1
-    @test b[(n1 + 1):end] ≈ b2
+    @test b[(n1+1):end] ≈ b2
 
     # The full solve is the concatenation of the two independent solves.
     s = solve!(model)
     s1 = solve!(m1)
     s2 = solve!(m2)
     @test s.coefficients[1:n1] ≈ s1.coefficients
-    @test s.coefficients[(n1 + 1):end] ≈ s2.coefficients
+    @test s.coefficients[(n1+1):end] ≈ s2.coefficients
 end
 
 @testset "fields sharing one space keep the single-domain path" begin
@@ -71,8 +70,7 @@ end
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=2)
     a = field(:a, V)
     b = field(:b, V)
-    prob = Problem((a, b);
-                   blocks=(stiffness_block(a), mass_block(b)),
+    prob = Problem((a, b); blocks=(stiffness_block(a), mass_block(b)),
                    loads=(source_load(a; source=x -> 1.0),),
                    dirichlet=[dirichlet(0.0; on=boundary(:all), field=:a)])
     model = prepare(prob)
@@ -155,7 +153,7 @@ end
     na = n ÷ 2
     @test length(cb) == 4
     @test K_iface ≈ K_surf                                   # diagonal block == surface mass
-    @test K_ab[1:na, (na + 1):n] ≈ -K_surf[1:na, 1:na]       # off-diagonal == negated mass
+    @test K_ab[1:na, (na+1):n] ≈ -K_surf[1:na, 1:na]       # off-diagonal == negated mass
     @test iszero(K_ab[1:na, 1:na])
 end
 
@@ -169,8 +167,7 @@ function _solve_stacked(β, g; nx1=4, ny1=2, nx2=4, ny2=2, sym=false)
     Γ = polyline_mesh([SVector(0.0, 0.5), SVector(1.0, 0.5)])
     src(x) = 2 * (x[1] - x[1]^2 + x[2] - x[2]^2)             # −Δ[x(1-x)y(1-y)]
     cpl = couple(u1, u2, Γ, mass_form(coefficient=β))
-    prob = Problem((u1, u2);
-                   blocks=(stiffness_block(u1), stiffness_block(u2), cpl...),
+    prob = Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2), cpl...),
                    loads=(source_load(u1; source=src), source_load(u2; source=src)),
                    dirichlet=[dirichlet(g; on=boundary(axis=2, side=:lower), field=:u1),
                               dirichlet(g; on=boundary(axis=1, side=:lower), field=:u1),
@@ -348,7 +345,8 @@ end
     seen = Int[]
     rec = InterfaceForm() do q, sides, trial, _tc
         push!(seen, q.point)
-        TestChannels(jump_sign(sides.test) * jump_sign(sides.trial) * trial.value, SVector(0.0, 0.0))
+        TestChannels(jump_sign(sides.test) * jump_sign(sides.trial) * trial.value,
+                     SVector(0.0, 0.0))
     end
     model = prepare(Problem((u1, u2);
                             blocks=(stiffness_block(u1), stiffness_block(u2),

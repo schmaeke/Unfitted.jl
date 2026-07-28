@@ -215,7 +215,7 @@ end
     # Original triangle area = 0.5·|e1 × e2| = 0.5·|(0.8,0,0) × (0.4,0.8,0)| = 0.5·|0.64 k̂| = 0.32.
     expected_area = 0.32
     function area(tri)
-        e1 = tri[2] - tri[1];
+        e1 = tri[2] - tri[1]
         e2 = tri[3] - tri[1]
         c = SVector(e1[2]*e2[3]-e1[3]*e2[2], e1[3]*e2[1]-e1[1]*e2[3], e1[1]*e2[2]-e1[2]*e2[1])
         sqrt(sum(x->x*x, c)) / 2

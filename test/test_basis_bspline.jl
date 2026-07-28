@@ -42,11 +42,11 @@ end
     # base space and an overlay), pending a proper fold-aware implementation.
     hole = physical_domain(x -> 0.25 - norm(x); lipschitz=1.0, subcell_length_scale=1.0e-3,
                            max_depth=2)
-    @test_throws ArgumentError space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=3,
-                                     basis=bspline(), physical=hole)
+    @test_throws ArgumentError space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=3, basis=bspline(),
+                                     physical=hole)
     Vphys = space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=3, physical=hole)  # Legendre: OK
-    @test_throws ArgumentError overlay(Vphys, box((0.25, 0.25), (0.75, 0.75));
-                                       cells=2, order=3, basis=bspline())
+    @test_throws ArgumentError overlay(Vphys, box((0.25, 0.25), (0.75, 0.75)); cells=2, order=3,
+                                       basis=bspline())
 end
 
 @testset "BSpline extension: 1D values match BasicBSpline directly" begin
@@ -257,7 +257,7 @@ end
     # C⁰ junction; the overlay contribution vanishes on every
     # artificial boundary (mesh-edge + C⁰ junctions).
     Vbase = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=2)
-    overlay_mask = falses(4, 4);
+    overlay_mask = falses(4, 4)
     overlay_mask[1:2, 1:2] .= true
     Vover = overlay(Vbase, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3, basis=bspline(),
                     active=overlay_mask)

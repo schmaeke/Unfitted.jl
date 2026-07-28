@@ -237,7 +237,7 @@ the overlay domain to lie inside the physical domain.
 function is_inside(inner::AxisBox{D,T}, outer::AxisBox{D,T},
                    tol::GeometryTolerance{T}=GeometryTolerance(T)) where {D,T}
     return all(inner.lower[i] >= outer.lower[i] - tol.contain &&
-               inner.upper[i] <= outer.upper[i] + tol.contain for i in 1:D)
+                   inner.upper[i] <= outer.upper[i] + tol.contain for i in 1:D)
 end
 
 """

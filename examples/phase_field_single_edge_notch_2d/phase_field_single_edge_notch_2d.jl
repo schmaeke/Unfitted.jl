@@ -681,7 +681,7 @@ function write_snapshot(output_root, snapshot_index, state, material)
                                                                                            displacement.u,
                                                                                            x),
                                                                        material)),
-                          notch=(u, c, x, xi) -> reference_notch_profile(x)),)
+                          notch=(u, c, x, xi) -> reference_notch_profile(x)))
     return path
 end
 
@@ -718,7 +718,7 @@ function main()
     end
 
     while state.applied < target_displacement - 10eps(max(1.0, target_displacement)) &&
-        accepted_steps < max_accepted_steps
+          accepted_steps < max_accepted_steps
         du = min(clamp_du(du), target_displacement - state.applied)
         attempted_steps += 1
 

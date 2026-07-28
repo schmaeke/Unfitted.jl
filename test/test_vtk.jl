@@ -13,7 +13,7 @@ using StaticArrays
                       append=false, compress=false,
                       point_data=(uh=(u, c, x, xi) -> u(c, xi),
                                   twice=(u, c, x, xi) -> 2 * u(c, xi)),
-                      cell_data=(midpoint_x=(u, c, x, xi) -> x[1],),)
+                      cell_data=(midpoint_x=(u, c, x, xi) -> x[1],))
 
     @test joinpath(dir, "case.vtm") in files
     @test joinpath(dir, "case_data.vtu") in files
@@ -53,8 +53,7 @@ end
     V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(2, 2), order=1)
     u1 = field(:u1, V1)
     u2 = field(:u2, V2)
-    model = prepare(Problem((u1, u2);
-                            blocks=(stiffness_block(u1), stiffness_block(u2)),
+    model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
                             loads=(source_load(u1; source=x -> 1.0),
                                    source_load(u2; source=x -> 1.0)),
                             dirichlet=[dirichlet(0.0; on=boundary(:all), field=:u1),
@@ -95,8 +94,7 @@ end
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
     a = field(:a, V)
     b = field(:b, V)
-    model = prepare(Problem((a, b);
-                            blocks=(stiffness_block(a), mass_block(b)),
+    model = prepare(Problem((a, b); blocks=(stiffness_block(a), mass_block(b)),
                             loads=(source_load(a; source=x -> 1.0),),
                             dirichlet=[dirichlet(0.0; on=boundary(:all), field=:a)]))
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
@@ -118,7 +116,7 @@ end
 
     dir = mktempdir()
     files = write_vtk(joinpath(dir, "vector_case"), solution, model; subdivisions=:none, ascii=true,
-                      append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),),)
+                      append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
 
     @test joinpath(dir, "vector_case_data.vtu") in files
     solution_xml = read(joinpath(dir, "vector_case_data.vtu"), String)
@@ -159,8 +157,9 @@ end
     # cell data; assert the actual values, not just that the arrays are emitted. A
     # 4×4 p=2 base with an aligned p=3 overlay over the middle 2×2 block covers four
     # base cells and sheds high-order (plus one deduped vertex) there.
-    _vtu_ints(xml, name) =
-        parse.(Int, split(match(Regex("Name=\"$name\"[^>]*>([^<]*)</DataArray>"), xml).captures[1]))
+    _vtu_ints(xml, name) = parse.(Int,
+                                  split(match(Regex("Name=\"$name\"[^>]*>([^<]*)</DataArray>"),
+                                              xml).captures[1]))
 
     V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2),
                 box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4), order=3)
@@ -248,7 +247,7 @@ end
     dir = mktempdir()
     write_vtk(joinpath(dir, "override"), solution, model; subdivisions=:none, ascii=true,
               append=false, compress=false,
-              point_data=(uh=(u, c, x, xi) -> u(c, xi), level_set=(u, c, x, xi) -> 42.0),)
+              point_data=(uh=(u, c, x, xi) -> u(c, xi), level_set=(u, c, x, xi) -> 42.0))
 
     solution_xml = read(joinpath(dir, "override_data.vtu"), String)
     @test occursin("level_set", solution_xml)

@@ -16,8 +16,7 @@ using LinearAlgebra
     # give them quadrature; pairing it with the strict-cut path is singular.
     @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1,
                                                keep_fictitious=true, alpha=0.0)
-    @test physical_domain(x -> x[1]; subcell_length_scale=0.1, keep_fictitious=true,
-                          alpha=1.0e-6).keep_fictitious
+    @test physical_domain(x -> x[1]; subcell_length_scale=0.1, keep_fictitious=true, alpha=1.0e-6).keep_fictitious
 
     # A bare callable is auto-wrapped as a single leaf carrying the `lipschitz`
     # keyword; the domain-level integration knobs live on the PhysicalDomain.
@@ -224,7 +223,7 @@ end
     @test diagnostics(m_no).active_unknowns == diagnostics(m_phys).active_unknowns
     @test diagnostics(m_phys).inactive_cell_counts == [0]
 
-    assemble!(m_no);
+    assemble!(m_no)
     assemble!(m_phys)
     @test m_no.matrix == m_phys.matrix
 end
@@ -353,7 +352,7 @@ end
 
     m_none = prepare(stiffness(V_none; dirichlet=[bc]))
     m_alpha1 = prepare(stiffness(V_alpha1; dirichlet=[bc]))
-    assemble!(m_none);
+    assemble!(m_none)
     assemble!(m_alpha1)
 
     @test Unfitted.active_unknowns(m_none.dofs) == Unfitted.active_unknowns(m_alpha1.dofs)
@@ -373,7 +372,7 @@ end
 
     m1 = prepare(stiffness(V_alpha1; dirichlet=[bc]))
     m05 = prepare(stiffness(V_alpha05; dirichlet=[bc]))
-    assemble!(m1);
+    assemble!(m1)
     assemble!(m05)
 
     @test m05.matrix ≈ 0.5 * m1.matrix
@@ -690,10 +689,11 @@ end
     strict = RQ(:cut_failed, SVector{1,Float64}[], Float64[])
     @test !isempty(afail.weights)          # α fallback is a nonzero rule …
     @test isempty(strict.weights)          # … the strict failure is empty
-    plan = Unfitted.IntegrationPlan{1,Float64}(
-        [VR(b, noparents, RQ(:cut_fitted, [SVector(0.5)], [1.0])),
-         VR(b, noparents, strict), VR(b, noparents, afail)],
-        GeometryTolerance(Float64), 0, Unfitted.SmallOverlap{Float64}[], 1.0, 1.0, 0.0)
+    plan = Unfitted.IntegrationPlan{1,Float64}([VR(b, noparents,
+                                                   RQ(:cut_fitted, [SVector(0.5)], [1.0])),
+                                                VR(b, noparents, strict), VR(b, noparents, afail)],
+                                               GeometryTolerance(Float64), 0,
+                                               Unfitted.SmallOverlap{Float64}[], 1.0, 1.0, 0.0)
     cut, failed = Unfitted._cut_region_stats(plan)
     @test cut == 3
     @test failed == 2

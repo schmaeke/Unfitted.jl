@@ -63,6 +63,6 @@ let
     group["assemble_stiffness"] = @benchmarkable assemble_matrix($model_src, $stiff_block_src)
     group["assemble_load"] = @benchmarkable assemble_vector($model_src, $load_src)
     group["transfer cached"] = @benchmarkable transfer($src_solution, $model_src, $model_tgt;
-                                                        via=$cached_backend)
+                                                       via=($cached_backend))
     group["transfer uncached"] = @benchmarkable transfer($src_solution, $model_src, $model_tgt)
 end

@@ -38,8 +38,10 @@ const _INT_X1SQ = 1 / 3
 
 # Reduced 2×2 block: base 4×4 p=2, overlay covering the middle 2×2 base cells at p=3,
 # aligned (overlay nodes ⊇ base nodes), so the buried centre vertex is deduped.
-_nested_block(ro) = overlay(space(_OMEGA_CR; cells=(4, 4), order=2, reduce_order=ro),
-                            box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4), order=3)
+function _nested_block(ro)
+    overlay(space(_OMEGA_CR; cells=(4, 4), order=2, reduce_order=ro),
+            box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4), order=3)
+end
 
 @testset "reduce_order=false is a no-op" begin
     _, lf = _gram(_nested_block(false))
@@ -162,8 +164,8 @@ end
     # A covered region that is also cut by ∂Ω: the fold removes fictitious cells, cut
     # cells keep moment-fit quadrature, and order reduction drops only buried
     # high-order. The reduced immersed solve must remain well posed AND complete.
-    disk = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.35;
-                           lipschitz=1.0, subcell_length_scale=0.125, max_depth=4)
+    disk = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.35; lipschitz=1.0,
+                           subcell_length_scale=0.125, max_depth=4)
     V = overlay(space(_OMEGA_CR; cells=(4, 4), order=2, reduce_order=true, physical=disk),
                 box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4), order=3)
     m, l = _gram(V)
@@ -211,10 +213,11 @@ end
     @test count(==(:coverage), l.elimination_source) > 0     # column-2 cells reduced by A
 
     # A base span-mode incident to the straddled cell (3,2) is NOT coverage-eliminated.
-    straddled = [raw for raw in eachindex(l.raw_keys)
+    straddled = [raw
+                 for raw in eachindex(l.raw_keys)
                  if l.raw_keys[raw].level == 1 &&
-                    any(a -> a.kind == Unfitted._AXIS_SPAN, l.raw_keys[raw].axes) &&
-                    CartesianIndex(3, 2) in Unfitted._incident_cells(l.raw_keys[raw], (4, 4))]
+                        any(a -> a.kind == Unfitted._AXIS_SPAN, l.raw_keys[raw].axes) &&
+                        CartesianIndex(3, 2) in Unfitted._incident_cells(l.raw_keys[raw], (4, 4))]
     @test !isempty(straddled)
     @test all(raw -> l.elimination_source[raw] != :coverage, straddled)
 

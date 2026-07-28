@@ -116,20 +116,18 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                              min_relative_integration_volume=NaN, symmetry_residual=NaN,
                              condition_estimate=NaN, solver=:none,
                              small_overlaps=SmallOverlap{Float64}[], inactive_cell_counts=Int[],
-                             reduced_mode_counts=Int[],
-                             cut_region_count=0, fit_failure_count=0, moment_fit_residual_max=0.0,
-                             facet_region_count=0, surface_region_count=0,
-                             interface_region_count=0)
+                             reduced_mode_counts=Int[], cut_region_count=0, fit_failure_count=0,
+                             moment_fit_residual_max=0.0, facet_region_count=0,
+                             surface_region_count=0, interface_region_count=0)
     return AssemblyDiagnostics(Int(dimension), Int(active_unknowns), Int(integration_regions),
                                Int(small_overlap_count), _float_small_overlaps(small_overlaps),
                                Float64(min_integration_volume),
                                Float64(min_relative_integration_volume), Float64(symmetry_residual),
                                Float64(condition_estimate), Symbol(solver),
                                Int[inactive_cell_counts...], Int[reduced_mode_counts...],
-                               Int(cut_region_count),
-                               Int(fit_failure_count), Float64(moment_fit_residual_max),
-                               Int(facet_region_count), Int(surface_region_count),
-                               Int(interface_region_count))
+                               Int(cut_region_count), Int(fit_failure_count),
+                               Float64(moment_fit_residual_max), Int(facet_region_count),
+                               Int(surface_region_count), Int(interface_region_count))
 end
 
 # Per-level count of cells deactivated by a `LevelMask`. Returns one
@@ -438,8 +436,9 @@ function system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T),
         # The field's (reindexed, contiguous) level-id block — how assembly
         # routes each region to its owning subdomain field without a `served` mask.
         level_ids = extrema(l.id for l in field.space.levels)
-        push!(layouts, FieldLayout{D,T}(field.name, component_count(field), layout, offset,
-                                        level_ids[1]:level_ids[2]))
+        push!(layouts,
+              FieldLayout{D,T}(field.name, component_count(field), layout, offset,
+                               level_ids[1]:level_ids[2]))
         by_name[field.name] = length(layouts)
         offset += active_unknowns(layout)
     end
@@ -481,7 +480,7 @@ function prepare(problem::Problem{D,T}; kwargs...) where {D,T}
     # One integration plan per distinct subdomain space, each sharing that
     # space's own cell-classification cache.
     space_plans = IntegrationPlan{D,T}[integration_plan(spaces[i]; plan_options...,
-                                                         classify_cache=caches[i])
+                                                        classify_cache=caches[i])
                                        for i in eachindex(spaces)]
     layout = system_layout(effective_problem; tolerance,
                            classify_caches=_caches_by_space(spaces, caches))
@@ -571,7 +570,8 @@ function _resolve_surface_regions(problem::Problem{D,T},
     regions = IdDict{Any,Vector{SurfaceRegion{D,T}}}()
     for mesh in _referenced_boundary_meshes(problem)
         haskey(regions, mesh) && continue
-        regions[mesh] = _surface_regions_for_mesh(_surface_mesh_space(problem, mesh), mesh, tolerance)
+        regions[mesh] = _surface_regions_for_mesh(_surface_mesh_space(problem, mesh), mesh,
+                                                  tolerance)
     end
     return regions
 end
@@ -581,8 +581,9 @@ end
 # two-sided coupling uses [`Interface`](@ref); a bare `BoundaryMesh` shared by
 # fields on different spaces is rejected at assembly (`_partition_space`). For a
 # single-domain problem this is always the one space.
-_surface_mesh_space(problem::Problem, mesh::BoundaryMesh) =
+function _surface_mesh_space(problem::Problem, mesh::BoundaryMesh)
     something(_on_test_space(problem, mesh), problem.space)
+end
 
 function _referenced_boundary_meshes(problem::Problem)
     return Iterators.flatten(((b.on for b in problem.blocks if b.on isa BoundaryMesh),
@@ -672,9 +673,7 @@ assembly call uses the same plan the dof layout was built against. For a
 single-domain model this is *the* plan; a coupled model holds one plan per
 subdomain — use [`integration_plans`](@ref) to reach all of them.
 """
-function integration_plan(model::Model)
-    return first(model.space_plans)
-end
+integration_plan(model::Model) = first(model.space_plans)
 
 """
     integration_plans(model::Model) -> Vector{IntegrationPlan}

@@ -493,7 +493,7 @@ end
 function _incident_cells(key::TensorDofKey{D}, n::NTuple{D,Int}) where {D}
     ranges = ntuple(D) do d
         a = key.axes[d]
-        a.kind == _AXIS_NODE ? (max(1, a.index - 1):min(n[d], a.index)) : (a.index:a.index)
+        a.kind == _AXIS_NODE ? (max(1, a.index-1):min(n[d], a.index)) : (a.index:a.index)
     end
     return CartesianIndices(ranges)
 end
@@ -539,8 +539,7 @@ function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{
 end
 
 # Generic fallback: no order reduction (e.g. the B-spline family).
-function _coverage_constraints(::Level{D,T,B}, ::Space{D,T}, ::Coverage{D},
-                               ::GeometryTolerance{T},
+function _coverage_constraints(::Level{D,T,B}, ::Space{D,T}, ::Coverage{D}, ::GeometryTolerance{T},
                                ::AbstractVector{Pair{TensorDofKey{D},Int}}) where {D,T,B}
     return Tuple{LinearConstraint{T},Symbol}[]
 end
@@ -793,8 +792,7 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     # than the trivial identity `[(raw, 1)]`. This local vector is construction
     # scratch for the active enumeration and for `elimination_source` below; the
     # layout exposes elimination only through `elimination_source` (`!== :free`).
-    eliminated = [length(e) != 1 || e[1] != (raw, one(T))
-                  for (raw, e) in pairs(raw_expansion)]
+    eliminated = [length(e) != 1 || e[1] != (raw, one(T)) for (raw, e) in pairs(raw_expansion)]
     # Per-raw elimination source: the tracked coverage/dedup source, `:overlay` for
     # any other eliminated raw (overlay boundary; multi-raw B-spline pivots), and
     # `:free` when the raw survives. This doubles as the elimination flag.

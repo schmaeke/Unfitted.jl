@@ -63,8 +63,9 @@ const BAND0 = 0.25
 
 # Activate a cell iff the front passes within `band` of its centre. `active`
 # predicates receive the cell box and its Cartesian index.
-on_front(band) =
+function on_front(band)
     (b, _) -> abs((b.lower[2] + b.upper[2]) / 2 - front((b.lower[1] + b.upper[1]) / 2)) < band
+end
 
 function layer_space()
     V = space(OMEGA; cells=BASE_CELLS, order=BASE_ORDER)
@@ -93,4 +94,4 @@ println("  order reduction : ", sum(report.reduced_mode_counts), " modes removed
 
 write_vtk(out, solution, model; subdivisions=2,
           point_data=(uh=(u, c, x, xi) -> u(c, xi), exact=(u, c, x, xi) -> exact(x),
-                      error=(u, c, x, xi) -> u(c, xi) - exact(x)),)
+                      error=(u, c, x, xi) -> u(c, xi) - exact(x)))

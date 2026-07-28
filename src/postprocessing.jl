@@ -239,7 +239,7 @@ end
 # build a typed array of the returned values, and return the
 # `name => array` pairs ready for `WriteVTK` attachment.
 function _evaluate_vtk_data(pairs, samples, solution::Solution, model::Model, space::Space,
-                           layout::FieldLayout)
+                            layout::FieldLayout)
     arrays = Pair{String,Any}[]
     for (name, f) in pairs
         values = Any[_evaluate_vtk_function(f, solution, model, space, layout, sample)
@@ -350,8 +350,7 @@ end
 #
 # Rendered "Surface With Edges" this doubles as the old wireframe while carrying the
 # per-cell data a line mesh could not.
-function _mesh_vtk_data(level::Level{D,T}, dofs::DofLayout{D},
-                        coverage::Coverage{D}) where {D,T}
+function _mesh_vtk_data(level::Level{D,T}, dofs::DofLayout{D}, coverage::Coverage{D}) where {D,T}
     points = SVector{3,T}[]
     cell_type = _vtk_cell_type(Val(D))
     cell0 = MeshCell(cell_type, SVector{2^D,Int}(ntuple(identity, 2^D)))
@@ -373,8 +372,7 @@ function _mesh_vtk_data(level::Level{D,T}, dofs::DofLayout{D},
         for corner in corners
             push!(points, _vtk_point(corner))
         end
-        push!(cells,
-              MeshCell(cell_type, SVector{2^D,Int}(ntuple(i -> first_point + i - 1, 2^D))))
+        push!(cells, MeshCell(cell_type, SVector{2^D,Int}(ntuple(i -> first_point + i - 1, 2^D))))
         push!(level_ids, level.id)
         push!(role_ids, _role_id(level.role))
         push!(order_max, maximum(level.order))
@@ -384,12 +382,11 @@ function _mesh_vtk_data(level::Level{D,T}, dofs::DofLayout{D},
         raws = cell_dofs(dofs, level.id, cell)
         push!(active_dofs,
               count(raw -> any(c -> dofs.active_component[raw, c] != 0, 1:dofs.components), raws))
-        push!(reduced_dofs,
-              count(raw -> dofs.elimination_source[raw] in (:coverage, :dedup), raws))
+        push!(reduced_dofs, count(raw -> dofs.elimination_source[raw] in (:coverage, :dedup), raws))
     end
 
-    return (; points, cells, level_ids, role_ids, order_max, cell_ids, active, covered,
-            active_dofs, reduced_dofs)
+    return (; points, cells, level_ids, role_ids, order_max, cell_ids, active, covered, active_dofs,
+            reduced_dofs)
 end
 
 # ── Public VTK export ────────────────────────────────────────────────────────
@@ -494,8 +491,8 @@ function write_vtk(path::AbstractString, solution::Solution, model::Model{D,T}; 
                                        point_data, cell_data)
             field_block = multiblock_add_block(vtm, string(fld.name))
             data_name = multi ? "data_$i" : "data"
-            vtk = vtk_grid(_vtk_child_path(base, data_name), data.points, data.cells;
-                           ascii, append, compress)
+            vtk = vtk_grid(_vtk_child_path(base, data_name), data.points, data.cells; ascii, append,
+                           compress)
             multiblock_add_block(field_block, vtk, data_name)
             for (name, arr) in data.point_arrays
                 vtk[name, VTKPointData()] = arr

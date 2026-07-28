@@ -356,11 +356,11 @@ _supports_physical_domain(::BasisFamily) = true
 # Reject a `PhysicalDomain` on a basis family that cannot integrate it yet.
 # Called from every space-building entry point once the concrete family exists.
 function _check_physical_basis(family::BasisFamily, physical)
-    physical === nothing || _supports_physical_domain(family) ||
-        throw(ArgumentError(
-            "the $(basis_name(family)) basis family does not yet support an immersed physical " *
-            "domain (finite-cell method): its overlay constraints would over-constrain cut-cell " *
-            "modes on fold faces. Use the default integrated-Legendre basis for FCM problems."))
+    physical === nothing ||
+        _supports_physical_domain(family) ||
+        throw(ArgumentError("the $(basis_name(family)) basis family does not yet support an immersed physical " *
+                            "domain (finite-cell method): its overlay constraints would over-constrain cut-cell " *
+                            "modes on fold faces. Use the default integrated-Legendre basis for FCM problems."))
     return nothing
 end
 

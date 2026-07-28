@@ -122,8 +122,7 @@ edge_dir(θ) = SVector(cos(θ), sin(θ))
 # Interface Γ₁₂: the two rotated radial edges (arc → origin → arc). Traversed so
 # the polyline's default normal points from the matrix (Ω₁ = side a) into the
 # inclusion (Ω₂ = side b) — the a→b orientation the coupling form assumes.
-interface_mesh = polyline_mesh([R .* edge_dir(sector_rotation),
-                                SVector(0.0, 0.0),
+interface_mesh = polyline_mesh([R .* edge_dir(sector_rotation), SVector(0.0, 0.0),
                                 R .* edge_dir(sector_rotation + π / 2)])
 # Outer arcs, traversed CCW so their default normal points radially outward.
 arc(a, b, n) = polyline_mesh([R .* edge_dir(t) for t in range(a, b; length=n)])
@@ -151,11 +150,12 @@ nitsche_coupling = InterfaceForm() do q, sides, trial, _tc
 end
 
 # Single-sided Nitsche weak Dirichlet (θ = 0) on a subdomain's outer arc.
-nitsche_dirichlet(κ) = WeakForm(bilinear=(q, trial) -> begin
-                                    n = q.normal
-                                    TestChannels(-κ * dot(trial.gradient, n) + β * trial.value,
-                                                 -κ * trial.value .* n)
-                                end, linear=(q) -> 0.0, symmetric=true)
+function nitsche_dirichlet(κ)
+    WeakForm(bilinear=(q, trial) -> begin
+                 n = q.normal
+                 TestChannels(-κ * dot(trial.gradient, n) + β * trial.value, -κ * trial.value .* n)
+             end, linear=(q) -> 0.0, symmetric=true)
+end
 
 blocks = (stiffness_block(θ₁; diffusion=κ₁), stiffness_block(θ₂; diffusion=κ₂),
           couple(θ₁, θ₂, interface_mesh, nitsche_coupling)...,
@@ -168,7 +168,8 @@ model = prepare(problem)
 sol = solve!(model)
 
 # ── Strain energy U = ½ Σᵢ κᵢ ∫_Ωᵢ ‖∇θᵢ‖² (bulk stiffness only) ─────────────
-bulk = assemble_matrix(model, (stiffness_block(θ₁; diffusion=κ₁), stiffness_block(θ₂; diffusion=κ₂)))
+bulk = assemble_matrix(model,
+                       (stiffness_block(θ₁; diffusion=κ₁), stiffness_block(θ₂; diffusion=κ₂)))
 U_h = 0.5 * dot(sol.coefficients, bulk * sol.coefficients)
 energy_error = abs(U_h - U_ex) / U_ex
 

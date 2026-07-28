@@ -227,7 +227,7 @@ u = finest.u
 out = joinpath(@__DIR__, "output", "fcm_plate_with_hole_2d")
 write_vtk(out, finest.solution, finest.model;
           point_data=(uh=(u, c, x, xi) -> u(c, xi), exact=(u, c, x, xi) -> exact(x),
-                      displacement_error=(u, c, x, xi) -> norm(u(c, xi) - exact(x))),)
+                      displacement_error=(u, c, x, xi) -> norm(u(c, xi) - exact(x))))
 write_quadrature_vtm(out * "_quadrature", finest.model)
 
 print_run_report("FCM plate with circular hole (Kirsch) — order $(last(orders))", finest.report;

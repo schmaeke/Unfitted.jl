@@ -80,7 +80,7 @@ out = joinpath(@__DIR__, "output", "laplace_unit_square_smooth")
 write_vtk(out, solution, model;
           point_data=(uh=(u, c, x, xi) -> u(c, xi), exact=(u, c, x, xi) -> exact(x),
                       error=(u, c, x, xi) -> u(c, xi) - exact(x),
-                      grad_uh=(u, c, x, xi) -> field_gradient(solution, model, x)),)
+                      grad_uh=(u, c, x, xi) -> field_gradient(solution, model, x)))
 
 # Final report.
 print_run_report("Smooth Laplace unit square", report;

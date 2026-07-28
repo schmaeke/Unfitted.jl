@@ -83,7 +83,7 @@ function singular_refinement_space(omega; no_refinements, overlay_ratio, base_ce
 end
 
 V = singular_refinement_space(omega; no_refinements, overlay_ratio, base_cells, overlay_cells,
-                              max_order,)
+                              max_order)
 
 # Poisson problem with Dirichlet data only on the two non-corner edges.
 # The corner sides `x = 0` and `y = 0` are left natural — the symmetry
@@ -104,7 +104,7 @@ out = joinpath(@__DIR__, "output", "singular_square_2d")
 write_vtk(out, solution, model; subdivisions=4,
           point_data=(uh=(u, c, x, xi) -> u(c, xi), exact=(u, c, x, xi) -> exact(x),
                       error=(u, c, x, xi) -> u(c, xi) - exact(x),
-                      grad_uh=(u, c, x, xi) -> field_gradient(solution, model, x)),)
+                      grad_uh=(u, c, x, xi) -> field_gradient(solution, model, x)))
 
 print_run_report("2D singular square", report;
                  parameters=(:no_refinements => no_refinements, :overlay_ratio => overlay_ratio,

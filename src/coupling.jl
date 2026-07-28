@@ -70,8 +70,7 @@ Build an [`Interface`](@ref) `on=` tag coupling `uₐ` and `u_b` across
 `geometry`. Pass it to [`block`](@ref) to attach an arbitrary two-sided
 interface term, or use [`couple`](@ref) for the common jump coupling.
 """
-interface(u_a::Field, u_b::Field, geometry::BoundaryMesh) =
-    Interface(u_a.name, u_b.name, geometry)
+interface(u_a::Field, u_b::Field, geometry::BoundaryMesh) = Interface(u_a.name, u_b.name, geometry)
 
 # ── Interface region ──────────────────────────────────────────────────────────
 
@@ -106,7 +105,8 @@ function _interface_regions(iface::Interface, V_a::Space{D,T}, V_b::Space{D,T}, 
                             field_b::Int, tol::GeometryTolerance{T}) where {D,T}
     merged = _grid_lines_for_levels((V_a.levels..., V_b.levels...), Val(D), tol)
     subdivided = _subdivide_mesh(iface.geometry, merged, tol)
-    qorder = ntuple(d -> max(_surface_quadrature_order(V_a)[d], _surface_quadrature_order(V_b)[d]), D)
+    qorder = ntuple(d -> max(_surface_quadrature_order(V_a)[d], _surface_quadrature_order(V_b)[d]),
+                    D)
     return _emit_interface_regions(subdivided, V_a, V_b, field_a, field_b, qorder, tol)
 end
 
@@ -123,9 +123,11 @@ function _emit_interface_regions(subdivided::BoundaryMesh{D,T,K}, V_a::Space{D,T
         (isempty(parents_a) || isempty(parents_b)) && continue
 
         points, weights, normals = _simplex_cell_quadrature(cell, cell_index, subdivided.normals,
-                                                            reference_samples, reference_area, Val(K))
+                                                            reference_samples, reference_area,
+                                                            Val(K))
         push!(regions,
-              InterfaceRegion{D,T}(field_a, field_b, parents_a, parents_b, points, weights, normals))
+              InterfaceRegion{D,T}(field_a, field_b, parents_a, parents_b, points, weights,
+                                   normals))
     end
     return regions
 end
@@ -274,10 +276,8 @@ directly with `block(test, trial, form; on = interface(uₐ, u_b, Γ))`.
 function couple(u_a::Field, u_b::Field, geometry::BoundaryMesh, form::WeakForm)
     iface = interface(u_a, u_b, geometry)
     neg = _negated_form(form)
-    return (block(u_a, u_a, form; on=iface),
-            block(u_b, u_a, neg; on=iface),
-            block(u_a, u_b, neg; on=iface),
-            block(u_b, u_b, form; on=iface))
+    return (block(u_a, u_a, form; on=iface), block(u_b, u_a, neg; on=iface),
+            block(u_a, u_b, neg; on=iface), block(u_b, u_b, form; on=iface))
 end
 
 """
@@ -293,10 +293,12 @@ is the special case for a pure penalty.
 """
 function couple(u_a::Field, u_b::Field, geometry::BoundaryMesh, form::InterfaceForm)
     iface = interface(u_a, u_b, geometry)
-    side_form(test_side, trial_side) =
-        WeakForm(bilinear=(q, trial, tc) -> form.kernel(q, (test=test_side, trial=trial_side),
-                                                        trial, tc),
-                 linear=(q, tc) -> 0.0, symmetric=form.symmetric, component_aware=true)
+    side_form(test_side, trial_side) = WeakForm(bilinear=(q, trial, tc) -> form.kernel(q,
+                                                                                       (test=test_side,
+                                                                                        trial=trial_side),
+                                                                                       trial, tc),
+                                                linear=(q, tc) -> 0.0, symmetric=form.symmetric,
+                                                component_aware=true)
     return (block(u_a, u_a, side_form(:a, :a); on=iface),
             block(u_a, u_b, side_form(:a, :b); on=iface),
             block(u_b, u_a, side_form(:b, :a); on=iface),

@@ -368,8 +368,9 @@ function _grid_lines_for_levels(levels, ::Val{D}, tol::GeometryTolerance{T}) whe
 end
 
 # Per-axis sorted unique grid coordinates across every level of `V`.
-_level_grid_lines(V::Space{D,T}, tol::GeometryTolerance{T}) where {D,T} =
+function _level_grid_lines(V::Space{D,T}, tol::GeometryTolerance{T}) where {D,T}
     _grid_lines_for_levels(V.levels, Val(D), tol)
+end
 
 """
     _subdivide_segment(p1, p2, grid_lines, nudge)
@@ -562,10 +563,14 @@ function _subdivide_mesh(mesh::BoundaryMesh{3,T,2}, grid_lines::NTuple{3,Vector{
 end
 
 # `Space` wrappers: subdivide against one space's own merged grid lines.
-_subdivide_mesh(mesh::BoundaryMesh{D,T,1}, V::Space{D,T}, tol::GeometryTolerance{T}) where {D,T} =
+function _subdivide_mesh(mesh::BoundaryMesh{D,T,1}, V::Space{D,T},
+                         tol::GeometryTolerance{T}) where {D,T}
     _subdivide_mesh(mesh, _level_grid_lines(V, tol), tol)
-_subdivide_mesh(mesh::BoundaryMesh{3,T,2}, V::Space{3,T}, tol::GeometryTolerance{T}) where {T} =
+end
+function _subdivide_mesh(mesh::BoundaryMesh{3,T,2}, V::Space{3,T},
+                         tol::GeometryTolerance{T}) where {T}
     _subdivide_mesh(mesh, _level_grid_lines(V, tol), tol)
+end
 
 # Fallback: combinations not covered above (e.g. `K = 2` in `D = 2`,
 # a codim-0 mesh) pass through unchanged.
@@ -650,7 +655,8 @@ function _surface_regions_for_mesh(V::Space{D,T}, mesh::BoundaryMesh{D,T,K},
             throw(ArgumentError("BoundaryMesh cell #$cell_index lies entirely outside the " *
                                 "discretization — no covering parent found on any level"))
         points, weights, normals = _simplex_cell_quadrature(cell, cell_index, subdivided.normals,
-                                                            reference_samples, reference_area, Val(K))
+                                                            reference_samples, reference_area,
+                                                            Val(K))
         push!(regions, SurfaceRegion{D,T}(parents, points, weights, normals))
     end
 
