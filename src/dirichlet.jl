@@ -477,97 +477,251 @@ end
 # reports indefiniteness (degenerate facets, zero-area boundaries under
 # heavy masking).
 #
-# Walk every Dirichlet condition × its facets × the boundary regions on
-# that facet × the per-region quadrature points. At each quadrature
-# point: assemble the mass-matrix and RHS contributions over the
-# constrained dofs from every covering parent. The
-# `_test_value_contribution` and `_as_test_channels` helpers are
+# `M` and the boundary walk that builds it depend on the mesh alone; only
+# `b` depends on the prescribed data. A load-stepping driver calls
+# [`update_dirichlet!`](@ref) once per increment on a fixed mesh, so the
+# walk is split in two: [`DirichletProjection`](@ref) holds everything the
+# datum does not enter — the per-component unknown sets, the factorised
+# mass, and the sampled boundary traces — and is built once and reused,
+# while each increment re-accumulates `b` from the samples and
+# back-substitutes. See `DirichletProjection` for why that reuse is exact
+# and when it is invalidated.
+#
+# The `_test_value_contribution` and `_as_test_channels` helpers are
 # defined in `assembly.jl`'s channel layer and reused here so the
 # Dirichlet projection rides the same channel calculus the volume
 # assembly uses; the forward reference resolves at call time
 # (`prepare(problem)` loads every source file first).
-function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T}, dirichlet) where {D,T}
-    fill!(layout.constrained_values, zero(T))
-    ncomp = layout.components
 
-    # The projection is done PER COMPONENT. Two boundary traces couple in the L²
-    # projection only through the part of ∂Ω where BOTH are constrained in the
-    # SAME displacement component; a dof constrained in one component must not
-    # enter another component's mass matrix. A single shared mass over the union
-    # of all component-constrained dofs (integrated over every condition's facet,
-    # component-blind) is wrong on two counts: two conditions on the same facet
-    # (e.g. u_x = 0 and u_y = ḡ on one edge) double-count the mass and halve the
-    # projected value, and a component-1-only condition (e.g. a lateral u_x = 0)
-    # adds mass to a shared corner's component-2 row with no matching right-hand
-    # side, pulling that u_y toward zero. Per-component unknown sets, mass
-    # matrices, and right-hand sides — each accumulated only over the facets
-    # where a condition actually constrains that component — remove both. For
-    # all-component (vector) conditions this reduces to the previous behaviour.
+"""
+    FacetTraceSamples{D,T}(points, weights, offsets, values, rows)
+
+The quadrature sampling of one Dirichlet condition's facet: every
+boundary quadrature point on that facet together with the boundary
+traces of the constrained dofs evaluated there.
+
+The right-hand side `b_i = ∫_∂Ω g φ_i dx` is the only part of the L²
+projection the prescribed data enter, and it is a quadrature sum over
+exactly these samples. Recording them lets a load increment re-evaluate
+`g` and re-accumulate `b` without re-deriving the facet regions or the
+basis traces — the two dominant costs of the walk, both of which scale
+with the finest level's *background* boundary grid rather than with the
+active cells on the boundary.
+
+Fields:
+
+  - `points::Vector{SVector{D,T}}` — the facet's physical-frame
+    quadrature coordinates, in the order the region walk visits them.
+  - `weights::Vector{T}` — the matching physical-frame weights, with the
+    facet Jacobian already applied (see [`FacetRegion`](@ref)).
+  - `offsets::Vector{Int}` — sample pointers of length
+    `length(points) + 1`: the trace entries of sample `k` are
+    `offsets[k] : offsets[k+1] - 1`.
+  - `values::Vector{T}` — each entry's trace value `φ_i(x_k)`.
+  - `rows::Vector{Vector{Int}}` — per component, each entry's row in that
+    component's unknown set, or `0` when the entry's dof is not an
+    unknown of that component. Components the condition does not
+    constrain carry an empty vector and are never indexed.
+"""
+struct FacetTraceSamples{D,T<:Real}
+    points::Vector{SVector{D,T}}
+    weights::Vector{T}
+    offsets::Vector{Int}
+    values::Vector{T}
+    rows::Vector{Vector{Int}}
+end
+
+# One component's solved boundary mass: the Cholesky factorisation when the
+# mass is positive definite, its pseudoinverse when Cholesky reports
+# indefiniteness, and `nothing` when the component has no unknowns at all.
+const DirichletFactor{T} = Union{Nothing,Cholesky{T,Matrix{T}},Matrix{T}}
+
+"""
+    DirichletProjection{D,T}(unknowns, factors, samples)
+
+Everything in the L² Dirichlet projection `M c = b` that the prescribed
+data `g` do not enter: the per-component unknown sets, the per-component
+factorised boundary mass, and the per-facet trace samples a right-hand
+side is accumulated from.
+
+Fields:
+
+  - `facets::Int` — the number of (condition, facet) pairs the
+    projection was built for. A condition list of a different shape
+    cannot reuse it.
+  - `unknowns::Vector{Vector{Int}}` — per component, the raw dofs the
+    projection solves for: the physically-constrained,
+    non-overlay-constrained dofs of that component.
+  - `factors::Vector{DirichletFactor{T}}` — per component, the solved
+    boundary mass (see `DirichletFactor`).
+  - `samples::Vector{FacetTraceSamples{D,T}}` — one entry per
+    (condition, facet) pair, in the order
+    `condition × _facets(condition.boundary)` enumerates them. Empty
+    when no component has an unknown, since then nothing is integrated.
+
+# Validity
+
+A projection is valid for the `(layout, space, condition-structure)`
+triple it was built from. The unknown sets, the facets and the mass
+depend on the mesh, the masks and each condition's boundary selector,
+field and component — never on a condition's *value*. Those are exactly
+the quantities [`update_dirichlet!`](@ref) pins with
+`_check_dirichlet_update_compatibility`, which is why an increment may
+reuse the projection; anything else that moves goes through
+[`prepare`](@ref), `move!`, `activate!` or `deactivate!`, each of which
+builds a fresh dof layout and drops the cached projection with it.
+
+# Exactness
+
+Reuse is bit-exact, not merely accurate to roundoff. The samples are
+recorded in the region walk's own order and the right-hand side is
+re-accumulated term by term in that order, so a reused projection
+produces the same floating-point `b` — and, from the same stored
+factorisation, the same `c` — as a full rebuild would.
+"""
+struct DirichletProjection{D,T<:Real}
+    facets::Int
+    unknowns::Vector{Vector{Int}}
+    factors::Vector{DirichletFactor{T}}
+    samples::Vector{FacetTraceSamples{D,T}}
+end
+
+# True iff `condition` constrains `component`: an unscoped condition
+# constrains every component of its field, a scoped one only its own.
+function _constrains(condition::DirichletCondition, component::Integer)
+    return condition.component === nothing || condition.component == component
+end
+
+# Number of (condition, facet) pairs a Dirichlet list covers. Recorded on a
+# `DirichletProjection` as its `facets` field so a cached projection can be
+# rejected when the condition list no longer has the shape it was built for.
+function _dirichlet_facet_count(dirichlet, ::Val{D}) where {D}
+    return sum(c -> length(_facets(c.boundary, Val(D))), dirichlet; init=0)
+end
+
+# Build the datum-independent half of the projection.
+#
+# The projection is done PER COMPONENT. Two boundary traces couple in the L²
+# projection only through the part of ∂Ω where BOTH are constrained in the
+# SAME displacement component; a dof constrained in one component must not
+# enter another component's mass matrix. A single shared mass over the union
+# of all component-constrained dofs (integrated over every condition's facet,
+# component-blind) is wrong on two counts: two conditions on the same facet
+# (e.g. u_x = 0 and u_y = ḡ on one edge) double-count the mass and halve the
+# projected value, and a component-1-only condition (e.g. a lateral u_x = 0)
+# adds mass to a shared corner's component-2 row with no matching right-hand
+# side, pulling that u_y toward zero. Per-component unknown sets, mass
+# matrices, and right-hand sides — each accumulated only over the facets
+# where a condition actually constrains that component — remove both. For
+# all-component (vector) conditions this reduces to the previous behaviour.
+function _dirichlet_projection(layout::DofLayout{D,T}, V::Space{D,T}, dirichlet) where {D,T}
+    ncomp = layout.components
+    facets = _dirichlet_facet_count(dirichlet, Val(D))
     unknowns = [[raw
                  for raw in eachindex(layout.raw_keys)
                  if layout.elimination_source[raw] === :free && layout.physical_dirichlet[raw, c]]
                 for c in 1:ncomp]
-    all(isempty, unknowns) && return layout
+    empty_factors = DirichletFactor{T}[nothing for _ in 1:ncomp]
+    all(isempty, unknowns) &&
+        return DirichletProjection{D,T}(facets, unknowns, empty_factors,
+                                        FacetTraceSamples{D,T}[])
 
-    projection = [Dict(raw => i for (i, raw) in pairs(unknowns[c])) for c in 1:ncomp]
-    # The constrained-boundary mass couples only the physically-Dirichlet dofs (a
-    # small set) and is dense-solved below, so each component's is accumulated
-    # directly into a dense matrix — no sparse intermediate.
+    index = [Dict(raw => i for (i, raw) in pairs(unknowns[c])) for c in 1:ncomp]
+    # The constrained-boundary mass couples only the physically-Dirichlet dofs
+    # of one component and is dense-solved below, so each component's is
+    # accumulated directly into a dense matrix — no sparse intermediate.
     mass = [zeros(T, length(unknowns[c]), length(unknowns[c])) for c in 1:ncomp]
-    rhs = [zeros(T, length(unknowns[c])) for c in 1:ncomp]
 
+    samples = FacetTraceSamples{D,T}[]
     for condition in dirichlet
         for sides in _facets(condition.boundary, Val(D))
-            for region in _boundary_facet_regions(V, sides, layout.tolerance)
-                for (qp, x) in pairs(region.points)
-                    qweight = region.weights[qp]
+            push!(samples, _sample_dirichlet_facet!(mass, index, layout, V, condition, sides))
+        end
+    end
 
-                    # Evaluate every parent's boundary traces at this point once
-                    # and reuse them across the components below. `parent.parent_box`
-                    # is precomputed on the region, so the only per-Q-point geometry
-                    # work is the affine `physical_to_reference`.
-                    traces = map(region.parents) do parent
-                        level = _level_by_id(V, parent.level)
-                        raw_dofs = cell_dofs(layout, parent.level, parent.cell)
-                        xi = physical_to_reference(parent.parent_box, x)
-                        boundary_trace_data(level, raw_dofs, sides, xi, parent.cell)
-                    end
+    # Solve `M c = b` for each component. Cholesky first; pseudoinverse fallback
+    # on the rare indefinite case (degenerate / zero-area facets under heavy
+    # masking, or a codim-D point pin whose facet carries no measure). Both are
+    # stored rather than applied, so every later increment back-substitutes
+    # against the same factorisation instead of rebuilding it.
+    factors = DirichletFactor{T}[]
+    for component in 1:ncomp
+        if isempty(unknowns[component])
+            push!(factors, nothing)
+            continue
+        end
+        factor = cholesky(Symmetric(mass[component]); check=false)
+        push!(factors, issuccess(factor) ? factor : pinv(mass[component]))
+    end
 
+    return DirichletProjection{D,T}(facets, unknowns, factors, samples)
+end
+
+# Walk one condition's facet: the boundary regions on that facet × the
+# per-region quadrature points. At each quadrature point, evaluate the
+# boundary traces of every covering parent once, record them as a sample, and
+# accumulate the mass-matrix contribution of every component the condition
+# constrains.
+function _sample_dirichlet_facet!(mass::Vector{Matrix{T}}, index::Vector{Dict{Int,Int}},
+                                  layout::DofLayout{D,T}, V::Space{D,T},
+                                  condition::DirichletCondition,
+                                  sides::Vector{Tuple{Int,Symbol}}) where {D,T}
+    ncomp = layout.components
+    points = SVector{D,T}[]
+    weights = T[]
+    offsets = Int[1]
+    values = T[]
+    rows = [Int[] for _ in 1:ncomp]
+
+    for region in _boundary_facet_regions(V, sides, layout.tolerance)
+        for (qp, x) in pairs(region.points)
+            qweight = region.weights[qp]
+
+            # Evaluate every parent's boundary traces at this point once and
+            # reuse them for the sample and for every component's mass.
+            # `parent.parent_box` is precomputed on the region, so the only
+            # per-Q-point geometry work is the affine `physical_to_reference`.
+            traces = map(region.parents) do parent
+                level = _level_by_id(V, parent.level)
+                raw_dofs = cell_dofs(layout, parent.level, parent.cell)
+                xi = physical_to_reference(parent.parent_box, x)
+                boundary_trace_data(level, raw_dofs, sides, xi, parent.cell)
+            end
+
+            # Record the sample. Entries are pushed in the same
+            # parent-then-mode order the right-hand-side loop below would visit
+            # them in, which is what makes a re-accumulated `b` bit-identical.
+            push!(points, x)
+            push!(weights, qweight)
+            for trace in traces
+                for a in eachindex(trace.raw_dofs)
+                    push!(values, trace.values[a])
                     for component in 1:ncomp
-                        (condition.component === nothing || condition.component == component) ||
-                            continue
-                        index = projection[component]
-                        mass_c = mass[component]
-                        rhs_c = rhs[component]
+                        _constrains(condition, component) || continue
+                        push!(rows[component], get(index[component], trace.raw_dofs[a], 0))
+                    end
+                end
+            end
+            push!(offsets, length(values) + 1)
 
-                        # RHS: ∫_∂Ω g v dx over this component's constrained dofs.
-                        g = convert(T, _condition_value(condition, x, component))
-                        rhs_channels = _as_test_channels(g, Val(D), T)
+            # Mass: ∫_∂Ω φ_i φ_j dx over this component's constrained dofs.
+            # Both indices iterate the same `traces`, so it is symmetric.
+            for component in 1:ncomp
+                _constrains(condition, component) || continue
+                index_c = index[component]
+                mass_c = mass[component]
+                for trial_trace in traces
+                    for b in eachindex(trial_trace.raw_dofs)
+                        col = get(index_c, trial_trace.raw_dofs[b], 0)
+                        col == 0 && continue
+                        mass_channels = _as_test_channels(trial_trace.values[b], Val(D), T)
                         for test_trace in traces
                             for a in eachindex(test_trace.raw_dofs)
-                                row = get(index, test_trace.raw_dofs[a], 0)
+                                row = get(index_c, test_trace.raw_dofs[a], 0)
                                 row == 0 && continue
-                                rhs_c[row] += qweight * _test_value_contribution(rhs_channels,
-                                                                                 test_trace.values[a])
-                            end
-                        end
-
-                        # Mass: ∫_∂Ω φ_i φ_j dx over the same subspace. Both
-                        # indices iterate the same `traces`, so it is symmetric.
-                        for trial_trace in traces
-                            for b in eachindex(trial_trace.raw_dofs)
-                                col = get(index, trial_trace.raw_dofs[b], 0)
-                                col == 0 && continue
-                                mass_channels = _as_test_channels(trial_trace.values[b], Val(D), T)
-                                for test_trace in traces
-                                    for a in eachindex(test_trace.raw_dofs)
-                                        row = get(index, test_trace.raw_dofs[a], 0)
-                                        row == 0 && continue
-                                        mass_c[row, col] += qweight *
-                                                            _test_value_contribution(mass_channels,
-                                                                                     test_trace.values[a])
-                                    end
-                                end
+                                mass_c[row, col] += qweight *
+                                                    _test_value_contribution(mass_channels,
+                                                                             test_trace.values[a])
                             end
                         end
                     end
@@ -576,20 +730,80 @@ function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T}, diric
         end
     end
 
-    # Solve `M c = b` for each component. Cholesky first; pseudoinverse fallback
-    # on the rare indefinite case (degenerate / zero-area facets under heavy
-    # masking, or a codim-D point pin whose facet carries no measure).
+    return FacetTraceSamples{D,T}(points, weights, offsets, values, rows)
+end
+
+# Accumulate one facet's contribution to the per-component right-hand sides
+# `b_i = ∫_∂Ω g φ_i dx`. `condition` is deliberately left to dispatch: the
+# Dirichlet list is heterogeneous (each condition carries its own value type),
+# so this call is the function barrier that specializes the sample loop on the
+# concrete condition and keeps the `g` evaluation free of dynamic dispatch.
+#
+# The `@inbounds` rests on two construction invariants of
+# [`FacetTraceSamples`](@ref): `offsets` never leaves `1 : length(values) + 1`
+# and `rows` is as long as `values`, so `e` indexes both; and every nonzero
+# `row` came from the component's own unknown index map, so it indexes `rhs_c`.
+function _accumulate_dirichlet_rhs!(rhs::Vector{Vector{T}}, samples::FacetTraceSamples{D,T},
+                                    condition::DirichletCondition, ncomp::Integer) where {D,T}
+    for k in eachindex(samples.points)
+        x = samples.points[k]
+        qweight = samples.weights[k]
+        first_entry = samples.offsets[k]
+        last_entry = samples.offsets[k + 1] - 1
+        for component in 1:ncomp
+            _constrains(condition, component) || continue
+            g = convert(T, _condition_value(condition, x, component))
+            channels = _as_test_channels(g, Val(D), T)
+            rows = samples.rows[component]
+            rhs_c = rhs[component]
+            @inbounds for e in first_entry:last_entry
+                row = rows[e]
+                row == 0 && continue
+                rhs_c[row] += qweight * _test_value_contribution(channels, samples.values[e])
+            end
+        end
+    end
+    return rhs
+end
+
+# Refill `layout.constrained_values` from `dirichlet`, returning the
+# [`DirichletProjection`](@ref) used so a caller that re-projects the same
+# layout can hand it back and skip the boundary walk. `projection` is reused
+# when given; the facet-count check is a cheap guard for a caller that reaches
+# past `update_dirichlet!`'s structural check, which is what actually
+# establishes that a cached projection still matches the condition list.
+function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T}, dirichlet,
+                                    projection::Union{Nothing,
+                                                      DirichletProjection{D,T}}=nothing) where {D,T}
+    fill!(layout.constrained_values, zero(T))
+    ncomp = layout.components
+    plan = if projection === nothing ||
+              projection.facets != _dirichlet_facet_count(dirichlet, Val(D))
+        _dirichlet_projection(layout, V, dirichlet)
+    else
+        projection
+    end
+    all(isempty, plan.unknowns) && return plan
+
+    rhs = [zeros(T, length(plan.unknowns[c])) for c in 1:ncomp]
+    facet = 0
+    for condition in dirichlet
+        for _ in _facets(condition.boundary, Val(D))
+            facet += 1
+            _accumulate_dirichlet_rhs!(rhs, plan.samples[facet], condition, ncomp)
+        end
+    end
+
     for component in 1:ncomp
-        isempty(unknowns[component]) && continue
-        mass_c = mass[component]
-        factor = cholesky(Symmetric(mass_c); check=false)
-        projected = issuccess(factor) ? factor \ rhs[component] : pinv(mass_c) * rhs[component]
-        for (i, raw) in pairs(unknowns[component])
+        factor = plan.factors[component]
+        factor === nothing && continue
+        projected = factor isa Cholesky ? factor \ rhs[component] : factor * rhs[component]
+        for (i, raw) in pairs(plan.unknowns[component])
             layout.constrained_values[raw, component] = projected[i]
         end
     end
 
-    return layout
+    return plan
 end
 
 # True iff `dirichlet` carries at least one nonzero condition. The

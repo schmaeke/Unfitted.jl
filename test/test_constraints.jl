@@ -261,6 +261,85 @@ end
     @test value(sol, model, (1.0, 1.0), 2) ≈ 0.1 atol = 1.0e-8
 end
 
+# The two per-component projection bugs above, driven through the load-stepping
+# path instead of through `prepare`. `update_dirichlet!` reuses the cached
+# `DirichletProjection` from the second call on, so a cache that lost the
+# per-component split — one shared mass over the union of the constrained dofs
+# — would halve the same-facet values and drag the shared corner's u_2 toward
+# zero exactly as a component-blind rebuild does, but only from the second load
+# step onward, where the `prepare`-time tests above cannot see it.
+@testset "cached Dirichlet projection keeps the per-component split" begin
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    V = space(omega; cells=(4, 4), order=1)
+    u = field(:u, V; components=2)
+    bottom = boundary(axis=2, side=:lower)
+    top = boundary(axis=2, side=:upper)
+    left = boundary(axis=1, side=:lower)
+    right = boundary(axis=1, side=:upper)
+
+    # Two conditions sharing the top edge, one per component: a component-blind
+    # mass double-counts the shared trace dofs and halves both values.
+    halving(g) = [dirichlet(SVector(0.0, 0.0); on=bottom, field=u),
+                  dirichlet(3g; on=top, field=u, component=1),
+                  dirichlet(g; on=top, field=u, component=2)]
+    model = prepare(poisson(u; source=x -> SVector(0.0, 0.0), dirichlet=halving(0.1)))
+    for g in (0.2, 0.3, -0.15)
+        update_dirichlet!(model, halving(g))
+        sol = solve!(model)
+        @test value(sol, model, (0.5, 1.0), 1) ≈ 3g atol = 1.0e-10
+        @test value(sol, model, (0.5, 1.0), 2) ≈ g atol = 1.0e-10
+    end
+
+    # Laterals constrain only u_1 and share the top corners with a vector
+    # condition on the top: mass from the u_1-only conditions must not reach the
+    # corner's u_2 row, which has no matching right-hand side there.
+    corner(g) = [dirichlet(SVector(0.0, 0.0); on=bottom, field=u),
+                 dirichlet(0.0; on=left, field=u, component=1),
+                 dirichlet(0.0; on=right, field=u, component=1),
+                 dirichlet(SVector(0.0, g); on=top, field=u)]
+    model = prepare(poisson(u; source=x -> SVector(0.0, 0.0), dirichlet=corner(0.1)))
+    for g in (0.2, 0.3, -0.15)
+        update_dirichlet!(model, corner(g))
+        sol = solve!(model)
+        @test value(sol, model, (0.5, 1.0), 2) ≈ g atol = 1.0e-10
+        @test value(sol, model, (1.0, 1.0), 2) ≈ g atol = 1.0e-8
+    end
+end
+
+# The cache's exactness contract: a reused `DirichletProjection` must reproduce
+# a full rebuild *bit for bit*, not merely to within roundoff, so that a
+# load-stepping run is reproducible against one that re-prepares every step.
+@testset "reused Dirichlet projection is bit-identical to a fresh one" begin
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2)
+    u = field(:u, V; components=2)
+    build(g) = poisson(u; source=x -> SVector(0.0, 0.0),
+                       dirichlet=[dirichlet(SVector(0.0, 0.0);
+                                            on=boundary(axis=2, side=:lower), field=u),
+                                  dirichlet(x -> 0.3 + g * x[1]; on=boundary(axis=2, side=:upper),
+                                            field=u, component=1),
+                                  dirichlet(g; on=boundary(axis=1, side=:upper), field=u,
+                                            component=2)])
+
+    model = prepare(build(0.1))
+    @test isempty(model.dirichlet_projections)   # `prepare` projects without caching
+
+    update_dirichlet!(model, build(0.2).dirichlet)
+    cached = model.dirichlet_projections[:u]
+    for g in (0.4, -0.25)
+        update_dirichlet!(model, build(g).dirichlet)
+        # Same object, so every later step skips the boundary walk entirely.
+        @test model.dirichlet_projections[:u] === cached
+        reference = prepare(build(g))
+        @test Unfitted.dof_layout(model).fields[1].dofs.constrained_values ==
+              Unfitted.dof_layout(reference).fields[1].dofs.constrained_values
+    end
+
+    # A mask change rebuilds the dof layout, so the cache must be dropped with
+    # it rather than reused against a layout it no longer describes.
+    deactivate!(model; level=1, cells=[CartesianIndex(1, 1)])
+    @test isempty(model.dirichlet_projections)
+end
+
 # The load-stepping driver pattern: a single `prepare(problem)` followed
 # by `update_dirichlet!` between steps. The converged solution must
 # match what a fresh `prepare(problem)` with the new Dirichlet datum

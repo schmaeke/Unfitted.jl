@@ -356,6 +356,12 @@ re-thread a fresh value through. Fields:
     entry per [`Interface`](@ref) referenced by a coupling `block`
     (`couple`'s four blocks share one `Interface` object). Keyed by
     object identity, as for `surface_regions`.
+  - `dirichlet_projections::Dict{Symbol,DirichletProjection{D,T}}` —
+    per-field cache of the datum-independent half of the L² Dirichlet
+    projection (see [`DirichletProjection`](@ref)). Empty at `prepare`
+    and filled by the first [`update_dirichlet!`](@ref) on each field,
+    which is the only path that re-projects an existing dof layout;
+    every mutator rebuilds the layout and empties the cache with it.
   - `diagnostics::AssemblyDiagnostics` — diagnostics record, updated
     in place by every lifecycle event.
   - `pattern::Union{Nothing,AssemblyPattern}` — cached CSC sparsity
@@ -379,6 +385,7 @@ mutable struct Model{D,T,P}
     facet_regions::Dict{BoundarySelector,Vector{FacetRegion{D,T}}}
     surface_regions::IdDict{Any,Vector{SurfaceRegion{D,T}}}
     interface_regions::IdDict{Any,Vector{InterfaceRegion{D,T}}}
+    dirichlet_projections::Dict{Symbol,DirichletProjection{D,T}}
     diagnostics::AssemblyDiagnostics
     pattern::Union{Nothing,AssemblyPattern}
     plan_options::NamedTuple
@@ -534,7 +541,9 @@ function prepare(problem::Problem{D,T}; kwargs...) where {D,T}
     _set_plan_stats_multi!(diag, space_plans)
     return Model{D,T,typeof(effective_problem)}(effective_problem, 1, space_plans, layout, nothing,
                                                 nothing, facet_regions, surface_regions,
-                                                interface_regions, diag, nothing, plan_options)
+                                                interface_regions,
+                                                Dict{Symbol,DirichletProjection{D,T}}(), diag,
+                                                nothing, plan_options)
 end
 
 # Build the facet-region cache for a problem from every
@@ -768,11 +777,17 @@ end
 # (already-updated) space, builds a fresh diagnostics record, and folds
 # the current integration plan's stats in. Assumes `model.problem`,
 # `model.dofs`, and `model.space_plans` already reflect the new state.
+#
+# The Dirichlet projection cache is dropped rather than rebuilt: its unknown
+# sets, facet regions and mass all belong to the dof layout the caller has
+# just replaced, and the next `update_dirichlet!` rebuilds it against the new
+# one.
 function _invalidate_assembly!(model::Model{D,T},
                                tolerance::GeometryTolerance{T}=GeometryTolerance(T)) where {D,T}
     model.matrix = nothing
     model.rhs = nothing
     model.pattern = nothing
+    empty!(model.dirichlet_projections)
     model.facet_regions = _resolve_facet_regions(model.problem, tolerance)
     model.surface_regions = _resolve_surface_regions(model.problem, tolerance)
     model.interface_regions = _resolve_interface_regions(model.problem, model.dofs, tolerance)
@@ -951,18 +966,23 @@ end
 For the same problem, calling `update_dirichlet!` is typically
 orders of magnitude cheaper than re-running `prepare(problem)`
 because the per-step rebuild of the integration plan and the
-NNMF moment-fit cache is skipped — only the boundary-trace mass
-matrix on the constrained-dof subspace is reassembled and resolved.
+NNMF moment-fit cache is skipped — only the right-hand side of the
+boundary-trace projection on the constrained-dof subspace is
+reassembled and back-substituted.
 
 # Semantics
 
   - The constrained-dof set is *not* rediscovered. It depends only on
     the boundary selector + field topology, both of which the
     structural check pins.
-  - `layout.constrained_values` is refilled by reassembling the
-    boundary mass matrix `M` and solving `M c = b` for the new
-    `b_i = ∫ g(x) φ_i dS`. Existing basis-trace evaluation is reused
-    indirectly through the boundary region cache.
+  - `layout.constrained_values` is refilled by solving `M c = b` for the
+    new `b_i = ∫ g(x) φ_i dS`. The boundary mass `M`, and the sampled
+    basis traces that `b` is accumulated from, depend on the mesh
+    alone, so the first call caches them on the model as a
+    [`DirichletProjection`](@ref) and every later call reuses them —
+    exactly, not merely to within roundoff. The facet regions are
+    therefore walked and the mass factorised once per mesh, not once
+    per increment.
   - `model.matrix` and `model.rhs` are cleared so the next
     [`assemble!`](@ref) (or `assemble_vector` / `assemble_matrix`
     call) picks up the new constrained data through the standard
@@ -1000,10 +1020,19 @@ function update_dirichlet!(model::Model{D,T}, dirichlet) where {D,T}
     # coupled multi-domain problem gives every field an independent space);
     # `model.problem.space` is only the first field's and does not cover the
     # others' cells — mirror the per-field routing `prepare` uses.
+    #
+    # The structural check above pins every quantity the field's
+    # `DirichletProjection` depends on, so the cached one — if this is not the
+    # first update on the field — is handed straight back in and only the
+    # right-hand side is rebuilt.
     for field_layout in model.dofs.fields
         field_dirichlet = _dirichlet_for_field(model.problem, field_layout.name)
         field_space = _field_space(model.problem, field_layout.name)
-        _project_dirichlet_values!(field_layout.dofs, field_space, field_dirichlet)
+        cached = get(model.dirichlet_projections, field_layout.name, nothing)
+        model.dirichlet_projections[field_layout.name] = _project_dirichlet_values!(field_layout.dofs,
+                                                                                    field_space,
+                                                                                    field_dirichlet,
+                                                                                    cached)
     end
 
     # Clear cached operators. The RHS depends on the constrained values
