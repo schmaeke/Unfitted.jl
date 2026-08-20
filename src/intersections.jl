@@ -93,8 +93,8 @@ Fields:
     if `regions` is empty.
   - `min_relative_volume::T` — `min_volume / volume(V.domain)`.
   - `moment_fit_residual_max::Float64` — the largest NNMF moment-fit
-    residual observed across all `:cut_fitted`, `:cut_failed`, and
-    `:cut_alpha_failed` regions.
+    residual observed across all `:cut_fitted`, `:cut_fallback`,
+    `:cut_failed`, and `:cut_alpha_failed` regions.
 """
 struct IntegrationPlan{D,T<:Real}
     regions::Vector{VolumeRegion{D,T}}
@@ -165,7 +165,7 @@ function _moment_order_for_region(V::Space{D}, parents) where {D}
 end
 
 # Moment-fit rule cache, keyed by the canonicalised region bounds and the
-# moment basis order. Returns `(ref_points, ref_weights, residual)`:
+# moment basis order. Returns `(ref_points, ref_weights, residual, status)`:
 #
 #   - `ref_points` are the moment-fit physical points mapped into the
 #     region's `[−1, 1]ᴰ` reference frame via `physical_to_reference`;
@@ -173,24 +173,28 @@ end
 #     standard region Jacobian `vol(box) / 2ᴰ`, so the assembly hot
 #     loop's `weight * jacobian` step recovers the original physical
 #     weight (the same convention used for `:full` regions);
-#   - `residual` is the moment-fit L² residual reported by `fcm.jl`.
+#   - `residual` is the moment-fit L² residual reported by `fcm.jl`;
+#   - `status` is `:fitted`, `:fallback`, or `:empty` — see
+#     [`moment_fit_rule`](@ref). The mapping above is rule-agnostic, so a
+#     `:fallback` rule (the raw Saye volume rule) is cached and consumed
+#     exactly like a fitted one.
 #
 # The cache is per-plan, where `V.physical` is fixed; the cache key need
 # not include it.
 const _MomentFitKey{D,T} = Tuple{SVector{D,T},SVector{D,T},NTuple{D,Int}}
-const _MomentFitValue{D,T} = Tuple{Vector{SVector{D,T}},Vector{T},T}
+const _MomentFitValue{D,T} = Tuple{Vector{SVector{D,T}},Vector{T},T,Symbol}
 
 function _cached_moment_fit!(cache::Dict{_MomentFitKey{D,T},_MomentFitValue{D,T}},
                              physical::PhysicalDomain, box::AxisBox{D,T},
                              moment_order::NTuple{D,Int}) where {D,T}
     key = (box.lower, box.upper, moment_order)
     return get!(cache, key) do
-        phys_pts, phys_ws, residual = moment_fit_rule(physical, box, moment_order;
-                                                      target_residual=physical.target_residual)
+        phys_pts, phys_ws, residual, status = moment_fit_rule(physical, box, moment_order;
+                                                              target_residual=physical.target_residual)
         jac = volume(box) / convert(T, 2^D)
         ref_pts = [physical_to_reference(box, p) for p in phys_pts]
         ref_ws = T[w / jac for w in phys_ws]
-        (ref_pts, ref_ws, T(residual))
+        (ref_pts, ref_ws, T(residual), status)
     end
 end
 
@@ -203,8 +207,10 @@ end
 #   - `:fictitious` + `alpha > 0`       → `:fictitious_alpha` α-scaled tensor Gauss
 #   - `:cut` with successful moment fit → `:cut_fitted`       moment-fit rule
 #     (α > 0 appends the α-scaled full-cell tensor rule for stabilisation)
-#   - `:cut`, failed moment fit, α == 0 → `:cut_failed`       empty rule (zero contribution)
-#   - `:cut`, failed moment fit, α > 0  → `:cut_alpha_failed` α-scaled tensor rule only
+#   - `:cut` with failed moment fit     → `:cut_fallback`     raw Saye volume rule
+#     (correct but uncompressed; α > 0 appends the α-scaled tensor rule as above)
+#   - `:cut`, empty Ω ∩ box, α == 0     → `:cut_failed`       empty rule (zero contribution)
+#   - `:cut`, empty Ω ∩ box, α > 0      → `:cut_alpha_failed` α-scaled tensor rule only
 #     (nonzero: the physical sliver is negligible, but the cell's dofs stay α-stabilised)
 #
 # Returns `(RegionQuadrature, residual)` for kept regions and
@@ -237,12 +243,17 @@ function _build_region_quadrature(V::Space{D,T}, box::AxisBox{D,T}, parents,
         return RegionQuadrature{D,T}(:fictitious_alpha, base_rule.points, scaled), zero(T)
     else  # `:cut` — moment-fit pipeline from `src/fcm.jl`.
         moment_order = _moment_order_for_region(V, parents)
-        ref_pts, ref_ws, residual = _cached_moment_fit!(moment_fit_cache, physical, box,
-                                                        moment_order)
-        fitted = !isempty(ref_pts) && residual <= _FIT_FAILURE_RESIDUAL
+        ref_pts, ref_ws, residual, status = _cached_moment_fit!(moment_fit_cache, physical, box,
+                                                                moment_order)
+        # A `:fallback` rule is the Saye volume rule itself, so it is a valid
+        # non-negative physical rule and is consumed exactly like a fit — only
+        # with 50–200× the points. The distinct kind is what makes that cost
+        # visible in the diagnostics instead of hiding it in `:cut_fitted`.
+        kind = status === :fallback ? :cut_fallback : :cut_fitted
         if iszero(physical.alpha)
-            fitted || return RegionQuadrature{D,T}(:cut_failed, SVector{D,T}[], T[]), residual
-            return RegionQuadrature{D,T}(:cut_fitted, ref_pts, ref_ws), residual
+            status === :empty &&
+                return RegionQuadrature{D,T}(:cut_failed, SVector{D,T}[], T[]), residual
+            return RegionQuadrature{D,T}(kind, ref_pts, ref_ws), residual
         end
 
         # α-FCM on a cut cell: stabilise the fictitious part by *adding* the
@@ -254,18 +265,19 @@ function _build_region_quadrature(V::Space{D,T}, box::AxisBox{D,T}, parents,
         # Gauss the whole cell), so the total is exact for the α-FCM integrand;
         # unlike the strict physical-only rule it gives *every* mode — including
         # the interior bubbles whose support lies entirely in the fictitious
-        # corner of a thin cut — a nonzero, well-posed contribution. When the
-        # physical moment-fit fails on a degenerate sliver (whose physical
+        # corner of a thin cut — a nonzero, well-posed contribution. When Ω ∩ box
+        # carries no volume rule at all (a degenerate sliver, whose physical
         # contribution is negligible by construction — the domain volume is
-        # captured by the well-fitted cells), fall back to the α·tensor part
-        # alone so the cell's dofs are α-stabilised rather than left singular.
+        # captured by the well-fitted cells), keep the α·tensor part alone so the
+        # cell's dofs are α-stabilised rather than left singular.
         alpha_weights = base_rule.weights .* physical.alpha
-        if fitted
-            points = vcat(ref_pts, base_rule.points)
-            weights = vcat(ref_ws .* (one(T) - physical.alpha), alpha_weights)
-            return RegionQuadrature{D,T}(:cut_fitted, points, weights), residual
+        if status === :empty
+            return RegionQuadrature{D,T}(:cut_alpha_failed, base_rule.points, alpha_weights),
+                   residual
         end
-        return RegionQuadrature{D,T}(:cut_alpha_failed, base_rule.points, alpha_weights), residual
+        points = vcat(ref_pts, base_rule.points)
+        weights = vcat(ref_ws .* (one(T) - physical.alpha), alpha_weights)
+        return RegionQuadrature{D,T}(kind, points, weights), residual
     end
 end
 

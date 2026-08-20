@@ -538,7 +538,8 @@ end
 
     diag = diagnostics(m)
     plan = Unfitted.integration_plan(m)
-    expected = count(r -> r.quadrature.kind in (:cut_fitted, :cut_failed, :cut_alpha_failed),
+    expected = count(r -> r.quadrature.kind in
+                          (:cut_fitted, :cut_fallback, :cut_failed, :cut_alpha_failed),
                      plan.regions)
     @test diag.cut_region_count == expected
     @test diag.cut_region_count > 0
@@ -585,11 +586,13 @@ end
     p = physical_domain(x -> x[1] - 0.001; lipschitz=1.0, subcell_length_scale=10.0, max_depth=0)
     V = space(omega; cells=1, order=2, physical=p)
     plan = Unfitted.integration_plan(V)
-    # :cut_failed is a defensive tag (residual > _FIT_FAILURE_RESIDUAL, or an
-    # empty Ω∩R). The leaf here is linear, so the Saye moments are exact and a
-    # zero-residual non-negative fit exists: the region is :cut_fitted, not
-    # :cut_failed, and the max residual stays far below the failure threshold.
-    failed = count(r -> r.quadrature.kind === :cut_failed, plan.regions)
+    # :cut_failed (empty Ω∩R) and :cut_fallback (residual >
+    # _FIT_FAILURE_RESIDUAL) are both defensive tags. The leaf here is linear, so
+    # the Saye moments are exact and a zero-residual non-negative fit exists: the
+    # region is :cut_fitted, neither of the two, and the max residual stays far
+    # below the failure threshold.
+    failed = count(r -> r.quadrature.kind in (:cut_fallback, :cut_failed, :cut_alpha_failed),
+                   plan.regions)
     @test failed == 0
     @test plan.moment_fit_residual_max < Unfitted._FIT_FAILURE_RESIDUAL
     # Diagnostics counts must agree with the plan tags — guarding the flagging
@@ -676,25 +679,31 @@ end
 end
 
 @testset "α-FCM fit failure is :cut_alpha_failed and counts as a failure" begin
-    # The α>0 moment-fit failure branch is defensive (unreachable via the public
-    # path with exact kernels), so pin its contract directly. Unlike the empty
-    # strict-cut `:cut_failed`, `:cut_alpha_failed` carries a NONZERO α-scaled
-    # rule so the cell's dofs stay α-stabilised; both kinds feed the fit-failure
-    # count, and all three cut kinds count as cut regions.
+    # The empty-Ω∩R branches are defensive (unreachable via the public path with
+    # exact kernels), so pin their contract directly. Unlike the empty strict-cut
+    # `:cut_failed`, `:cut_alpha_failed` carries a NONZERO α-scaled rule so the
+    # cell's dofs stay α-stabilised. `:cut_fallback` carries the raw Saye volume
+    # rule — a full, correct rule with many more points than a fit. All three
+    # non-fitted kinds feed the fit-failure count, all four count as cut regions,
+    # and only `:cut_fallback` contributes to the fallback point budget.
     RQ = Unfitted.RegionQuadrature{1,Float64}
     VR = Unfitted.VolumeRegion{1,Float64}
     b = box((0.0,), (1.0,))
     noparents = Unfitted.ParentRef{1,Float64}[]
     afail = RQ(:cut_alpha_failed, [SVector(0.5)], [0.3])
     strict = RQ(:cut_failed, SVector{1,Float64}[], Float64[])
+    back = RQ(:cut_fallback, [SVector(0.25), SVector(0.75)], [0.5, 0.5])
     @test !isempty(afail.weights)          # α fallback is a nonzero rule …
     @test isempty(strict.weights)          # … the strict failure is empty
     plan = Unfitted.IntegrationPlan{1,Float64}([VR(b, noparents,
                                                    RQ(:cut_fitted, [SVector(0.5)], [1.0])),
-                                                VR(b, noparents, strict), VR(b, noparents, afail)],
+                                                VR(b, noparents, strict), VR(b, noparents, afail),
+                                                VR(b, noparents, back)],
                                                GeometryTolerance(Float64), 0,
                                                Unfitted.SmallOverlap{Float64}[], 1.0, 1.0, 0.0)
-    cut, failed = Unfitted._cut_region_stats(plan)
-    @test cut == 3
-    @test failed == 2
+    cut, failed, fallback, fallback_points = Unfitted._cut_region_stats(plan)
+    @test cut == 4
+    @test failed == 3
+    @test fallback == 1
+    @test fallback_points == 2
 end

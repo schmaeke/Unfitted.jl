@@ -44,10 +44,13 @@
 #   1. NNLS wrapper around `NonNegLeastSquares.nonneg_lsq` (Lawson–Hanson).
 #   2. Saye implicit volume rule (`implicit_volume_quadrature`) over Ω ∩ R.
 #   3. Exact moments by `mₐ = Σ_q w_q ψₐ(x_q)`; the rule's points are the
-#      moment-fit candidates (capped at O(nbasis)).
+#      moment-fit candidates, capped at a multiple of nbasis that grows with the
+#      retry index.
 #   4. A single NNLS moment fit (Lawson–Hanson naturally yields ≤ nbasis
 #      non-negative weights; a zero-residual non-negative solution exists, so
 #      one solve reaches machine-level residual).
+#   5. If no attempt fits, fall back to the volume rule of step 2 itself — the
+#      moments' own source data, correct but uncompressed.
 #
 #   Public entry point: `moment_fit_rule(physical, region_box, moment_order)`.
 
@@ -148,7 +151,9 @@ const _NNLS_WEIGHT_TOL = 1.0e-12
 
 # Catastrophic failure threshold for the moment-fit residual. A residual above
 # this value indicates the NNLS could not come anywhere near reproducing the
-# moments; the integration-plan dispatcher tags such a region `:cut_failed`.
+# moments; `moment_fit_rule` then returns the raw Saye volume rule instead of the
+# fitted one, and the integration-plan dispatcher tags such a region
+# `:cut_fallback`.
 const _FIT_FAILURE_RESIDUAL = 1.0e-2
 
 # Assemble the moment-fit design matrix
@@ -220,12 +225,30 @@ function _implicit_gauss_points(moment_order::NTuple{D,Int}) where {D}
     max(cld(sum(moment_order) + D, 2), maximum(moment_order) + 2)
 end
 
-# Cap the candidate cloud at a small multiple of the moment-basis size so the
-# NNLS design matrix stays O(nbasis) wide regardless of the volume rule's point
-# count. A uniform stride over the (base-then-fiber ordered) rule keeps the
-# survivors well spread through Ω ∩ R.
-function _cap_candidates(points::Vector{SVector{D,T}}, moment_order::NTuple{D,Int}) where {D,T}
-    cap = 6 * _moment_basis_count(moment_order)
+# Ceiling on the NNLS design matrix, in entries (`nbasis × ncandidates`).
+# Lawson–Hanson sweeps the whole matrix once per accepted column, so both a
+# solve's memory and its time are proportional to this product; 6·10⁶ entries is
+# 48 MB and a fraction of a second at the moment orders in use here. Because the
+# candidate budget below is a multiple of `nbasis`, the entry count grows as
+# `budget · nbasis²` — quadratically in the basis size — so the retry needs an
+# absolute ceiling and not just a relative one. It binds retries only (the `max`
+# in `_cap_candidates` keeps the first attempt exempt), and only bites at all
+# once `nbasis` passes ≈ 1000.
+const _MAX_FIT_MATRIX_ENTRIES = 6_000_000
+
+# Cap the candidate cloud so the NNLS design matrix stays bounded regardless of
+# the volume rule's point count: at most `budget · nbasis` candidates, and never
+# more than `_MAX_FIT_MATRIX_ENTRIES` matrix entries. A uniform stride over the
+# (base-then-fiber ordered) rule keeps the survivors well spread through Ω ∩ R.
+#
+# `budget` comes from `_candidate_budget(attempt)` and grows with the retry, so
+# each attempt draws a genuinely denser cloud. The `max` keeps the first
+# attempt's `6 · nbasis` budget exempt from the ceiling, so the entry point of
+# the pipeline behaves identically at every moment order.
+function _cap_candidates(points::Vector{SVector{D,T}}, moment_order::NTuple{D,Int},
+                         budget::Int) where {D,T}
+    nbasis = _moment_basis_count(moment_order)
+    cap = min(budget * nbasis, max(6 * nbasis, cld(_MAX_FIT_MATRIX_ENTRIES, nbasis)))
     length(points) <= cap && return points
     return points[1:cld(length(points), cap):end]
 end
@@ -236,9 +259,40 @@ end
 # conditioning (a denser candidate cloud), never for moment accuracy.
 const _MAX_IMPLICIT_ATTEMPTS = 3
 
+# Candidate-cloud budget of `attempt`, as a multiple of the moment-basis size
+# `nbasis`: 6·nbasis on the first attempt, eight times that on each retry.
+#
+# The budget has to grow for the retry to mean anything. Lawson–Hanson is greedy
+# and terminates as soon as its passive set holds `nbasis` columns (`nsetp ≥ m`
+# in the classical algorithm), so the fit it returns is decided entirely by which
+# candidates the walk was offered: when the columns it picked are only marginally
+# independent, the closing triangular solve is ill-conditioned and the residual
+# lands near 1e-2 instead of 1e-16. A cell carrying many distinct boundary pieces
+# — a coarse mesh cell spanning a dozen holes — is where that happens. Holding the
+# budget at 6·nbasis made all three attempts draw a cloud of the same size, so
+# they failed together and the "denser candidate cloud" the retry promises never
+# materialised. Measured on one such cell (nbasis = 125, 25216 rule points, the
+# moments held fixed): 742 candidates → residual 4.7e-2, 1484 → 2.8e-2,
+# 2802 → 3.0e-2, but 5044 → 3e-16 and 8406 → 6e-16.
+#
+# The growth factor is large on purpose. `_cap_candidates` selects by a uniform
+# stride, and the volume rule emits its points fiber by fiber in blocks of
+# `gauss_points`, so a stride sharing a factor with that block length reaches
+# only `gauss_points / gcd` of the per-fiber node positions and draws a
+# systematically degenerate cloud. On the cell above (`gauss_points = 8`) the
+# residual at ≈ 750 candidates runs 5e-1 at gcd 8, 2.7e-1 at gcd 4, and 1e-2–5e-2
+# at gcd 2 or 1. A modest bump therefore only buys another unreliable draw; a ×8
+# step moves each retry to a plainly different scale, where the stride is small
+# enough that the aliasing no longer decides the outcome.
+#
+# The first attempt's budget is deliberately unchanged, so every cell that
+# already fits keeps its rule unchanged and pays nothing extra; only cells that
+# fail reach the larger solves.
+_candidate_budget(attempt::Int) = 6 * 8^(attempt - 1)
+
 """
     moment_fit_rule(physical, region_box, moment_order; target_residual=1e-10)
-        -> (points, weights, residual)
+        -> (points, weights, residual, status)
 
 Build a non-negative tensor-Legendre moment-fitted quadrature rule on
 `region_box ∩ Ω`. The rule reproduces the tensor Legendre moments
@@ -262,11 +316,40 @@ rule is already compressed to O(nbasis) points, and because the volume rule
 reproduces the moments with strictly positive weights a zero-residual
 non-negative solution exists, so one solve reaches machine-level residual.
 
-`target_residual` bounds a small conditioning retry (a denser candidate cloud,
-not more octree depth). Returns the best (lowest-residual) fit observed; an
-empty region returns empty point/weight vectors. In the assembly pipeline this
-function is called with `physical.target_residual` (the `physical_domain`
-default is `1e-6`), which overrides the `1e-10` default here.
+`target_residual` bounds a small conditioning retry — up to
+`_MAX_IMPLICIT_ATTEMPTS` attempts, each with a denser candidate cloud, never with
+more octree depth. Both retry knobs act on the cloud alone: the fiber Gauss order
+rises by one per attempt, emitting more volume-rule points, and the candidate
+budget of `_candidate_budget` grows by a factor of eight per attempt, letting
+more of them past the cap. The best (lowest-residual) fit observed is the one
+returned. In the assembly pipeline this function is called with
+`physical.target_residual` (the `physical_domain` default is `1e-6`), which
+overrides the `1e-10` default here.
+
+`status` reports which rule came back, and the integration-region dispatcher in
+`intersections.jl` turns it into the region's quadrature kind:
+
+  - `:fitted` — the moment fit met `_FIT_FAILURE_RESIDUAL`; `points`/`weights`
+    are the compressed O(nbasis) fitted rule. Region kind `:cut_fitted`.
+  - `:fallback` — no attempt met `_FIT_FAILURE_RESIDUAL`, so the returned rule is
+    the highest-order attempt's *raw Saye volume rule* — the very data the
+    moments were computed from, uncompressed. Region kind `:cut_fallback`.
+  - `:empty` — `Ω ∩ region_box` carries no volume rule at all; `points` and
+    `weights` are empty and `residual` is zero. Region kind `:cut_failed`
+    (`:cut_alpha_failed` under α-FCM).
+
+The fallback loses no accuracy: on a cell where the fit fails, the volume rule is
+by construction at least as accurate as a successful fit would have been, and its
+weights are non-negative for the same reason the fit's are — each is a product of
+a positive Gauss weight, a positive fiber half-length and a positive base weight
+(see `_emit_fiber!` in `src/implicit.jl`). What it costs is points: the failing
+cells measured on a 96-hole plate carry 7·10³–2.5·10⁴ volume-rule points where a
+successful fit yields ≈ nbasis ≈ 125, a 50–200× per-cell blow-up in assembly
+work. A fired fallback is therefore a signal that the cell is under-resolved for
+its geometric complexity and is the condition that should drive refinement — it
+is a safety net against the silently wrong answer an empty rule would give, not a
+substitute for an adequate mesh. `AssemblyDiagnostics.cut_fallback_count` and
+`cut_fallback_points` report how often it fired and what it cost.
 """
 function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T},
                          moment_order::NTuple{D,Int}; target_residual::Real=1.0e-10) where {D,T}
@@ -286,22 +369,37 @@ function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T},
     best_pts = SVector{D,T}[]
     best_ws = T[]
     best_res = T(Inf)
+    # The raw volume rule of the attempt last run. It has to outlive the loop
+    # because it is the fallback below, and keeping the *last* attempt's rule
+    # keeps the highest fiber Gauss order — the most accurate of the three.
+    saye_pts = SVector{D,T}[]
+    saye_ws = T[]
     for attempt in 1:_MAX_IMPLICIT_ATTEMPTS
         # Exact moments at q0; denser candidate clouds on retry improve NNLS
-        # conditioning without changing the (already exact) moments.
+        # conditioning without changing the (already exact) moments. Density
+        # comes from both knobs at once — a higher fiber Gauss order emits more
+        # rule points, a larger budget lets more of them past `_cap_candidates`.
         q = q0 + (attempt - 1)
-        pts_vol, w_vol = implicit_volume_quadrature(leaf_fs, membership, region_box;
-                                                    gauss_points=q, max_subdiv=max_subdiv,
-                                                    lipschitz=leaf_ls)
-        isempty(pts_vol) && return SVector{D,T}[], T[], zero(T)
-        moments = _moments_from_rule(pts_vol, w_vol, region_box, moment_order)
-        candidates = _cap_candidates(pts_vol, moment_order)
+        saye_pts, saye_ws = implicit_volume_quadrature(leaf_fs, membership, region_box;
+                                                       gauss_points=q, max_subdiv=max_subdiv,
+                                                       lipschitz=leaf_ls)
+        isempty(saye_pts) && return SVector{D,T}[], T[], zero(T), :empty
+        moments = _moments_from_rule(saye_pts, saye_ws, region_box, moment_order)
+        candidates = _cap_candidates(saye_pts, moment_order, _candidate_budget(attempt))
         weights, residual = _solve_moment_fit(moments, candidates, region_box, moment_order)
         kept = findall(>(_NNLS_WEIGHT_TOL), weights)
         if residual < best_res
             best_pts, best_ws, best_res = candidates[kept], weights[kept], residual
         end
-        best_res <= target && return best_pts, best_ws, best_res
+        best_res <= target && return best_pts, best_ws, best_res, :fitted
     end
-    return best_pts, best_ws, best_res
+    # Short of `target` but inside the failure threshold, the compressed fit is
+    # still the rule to use — that band is ordinary approximation error on a
+    # curved cut, not a broken fit.
+    best_res <= _FIT_FAILURE_RESIDUAL && return best_pts, best_ws, best_res, :fitted
+    # Beyond it the fit is not usable at any price. Hand back the volume rule the
+    # moments themselves were summed from: correct and non-negative by
+    # construction, merely uncompressed. Returning an empty rule here instead —
+    # the pre-fallback behaviour — dropped the cell's entire contribution.
+    return saye_pts, saye_ws, best_res, :fallback
 end

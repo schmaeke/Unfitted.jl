@@ -600,24 +600,34 @@ indicator representations are intentionally not supported.
   - **Region quadrature kinds** (visible via `region.quadrature.kind`):
     `:full` (tensor Gauss), `:fictitious_alpha` (α-scaled tensor Gauss),
     `:cut_fitted` (NNLS moment-fit rule, plus the α-scaled tensor part
-    when `α > 0`), `:cut_failed` (strict-cut `α = 0` moment-fit residual
-    exceeded the failure threshold; region contributes zero quadrature),
-    `:cut_alpha_failed` (the same fit failure under `α > 0`: the physical
-    part is dropped but the α-scaled tensor rule is retained so the cell's
-    dofs stay α-stabilised — a nonzero rule). The assembly hot loop is
-    unchanged — it just iterates `zip(points, weights)`.
+    when `α > 0`), `:cut_fallback` (the moment-fit residual exceeded the
+    failure threshold, so the region carries the raw Saye volume rule the
+    moments were summed from — correct and non-negative, but with 50–200×
+    the points), `:cut_failed` (strict-cut `α = 0` region whose `Ω ∩ box`
+    carries no volume rule at all; region contributes zero quadrature),
+    `:cut_alpha_failed` (the same under `α > 0`: the empty physical part
+    is dropped but the α-scaled tensor rule is retained so the cell's
+    dofs stay α-stabilised — a nonzero rule). The assembly hot loop
+    is unchanged — it just iterates `zip(points, weights)`.
 
   - **Moment-fit defaults**: moment-fit basis order = `moment_order_factor
     × max(level.order)` per axis over the region's parents; exact tensor
     Legendre moments from the Saye volume rule; a single Lawson–Hanson
     NNLS solve (`NonNegLeastSquares.jl`) selects ≤ `nbasis` non-negative
     weights; up to 3 attempts, retrying only with a denser candidate cloud
-    for NNLS conditioning, never with more subdivision. Rules are cached by
-    canonicalized region bounds + moment order.
+    for NNLS conditioning (higher fiber Gauss order *and* an eight-fold
+    larger candidate budget per attempt), never with more subdivision; if
+    no attempt fits, the raw volume rule is used as a fallback rather than
+    dropping the cell. Rules are cached by canonicalized region bounds +
+    moment order.
 
   - **Diagnostics**: `diagnostics(model, solution).cut_region_count`,
     `fit_failure_count`, `moment_fit_residual_max`,
-    `inactive_cell_counts`.
+    `cut_fallback_count`, `cut_fallback_points`,
+    `inactive_cell_counts`. A nonzero `cut_fallback_count` means those
+    cells are under-resolved for their geometric complexity and should
+    drive refinement; the fallback is a safety net, not a substitute for
+    an adequate mesh.
 
 ### Naming
 
@@ -894,8 +904,11 @@ demos.
     contract.
   - Immersed boundary (`PhysicalDomain`): strict-α cell-level
     fictitious fold drops the right cells; the expected
-    `:full` / `:cut_fitted` / `:fictitious_alpha` / `:cut_failed` /
-    `:cut_alpha_failed` region-kind tags appear; α-FCM weight scaling on a
+    `:full` / `:cut_fitted` / `:fictitious_alpha` / `:cut_fallback` /
+    `:cut_failed` / `:cut_alpha_failed` region-kind tags appear; the
+    candidate-cloud retry rescues a many-feature cut cell that the first
+    attempt cannot fit, and the raw-volume-rule fallback still integrates
+    a cell whose fit fails outright; α-FCM weight scaling on a
     fully fictitious cell; NNMF moment reproduction to within `target_residual`;
     end-to-end SPD on a cut-disk Poisson; 1D analytic mass-entry check
     on a cut cell.

@@ -53,7 +53,16 @@ Fields:
     `inactive_cell_counts`.
   - `cut_region_count::Int`, `fit_failure_count::Int`,
     `moment_fit_residual_max::Float64` — FCM moment-fit statistics from
-    the integration plan.
+    the integration plan. `fit_failure_count` counts every cut region
+    whose fit missed `_FIT_FAILURE_RESIDUAL`, whatever rule the region
+    ended up carrying.
+  - `cut_fallback_count::Int`, `cut_fallback_points::Int` — the subset of
+    those failures that fell back to the raw Saye volume rule
+    (`:cut_fallback`), and the total number of quadrature points those
+    regions carry. A successful fit yields ≈ nbasis points, so the second
+    number is the price of the safety net; a nonzero count means the mesh
+    is too coarse for the geometry in those cells and should be refined.
+    See [`moment_fit_rule`](@ref).
   - `facet_region_count::Int` — total number of [`FacetRegion`](@ref)s
     cached on the model, summed across every cached selector
     (Dirichlet conditions and any `block`/`loadform` carrying
@@ -84,6 +93,8 @@ mutable struct AssemblyDiagnostics
     cut_region_count::Int
     fit_failure_count::Int
     moment_fit_residual_max::Float64
+    cut_fallback_count::Int
+    cut_fallback_points::Int
     facet_region_count::Int
     surface_region_count::Int
     interface_region_count::Int
@@ -117,8 +128,9 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                              condition_estimate=NaN, solver=:none,
                              small_overlaps=SmallOverlap{Float64}[], inactive_cell_counts=Int[],
                              reduced_mode_counts=Int[], cut_region_count=0, fit_failure_count=0,
-                             moment_fit_residual_max=0.0, facet_region_count=0,
-                             surface_region_count=0, interface_region_count=0)
+                             moment_fit_residual_max=0.0, cut_fallback_count=0,
+                             cut_fallback_points=0, facet_region_count=0, surface_region_count=0,
+                             interface_region_count=0)
     return AssemblyDiagnostics(Int(dimension), Int(active_unknowns), Int(integration_regions),
                                Int(small_overlap_count), _float_small_overlaps(small_overlaps),
                                Float64(min_integration_volume),
@@ -126,7 +138,8 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                                Float64(condition_estimate), Symbol(solver),
                                Int[inactive_cell_counts...], Int[reduced_mode_counts...],
                                Int(cut_region_count), Int(fit_failure_count),
-                               Float64(moment_fit_residual_max), Int(facet_region_count),
+                               Float64(moment_fit_residual_max), Int(cut_fallback_count),
+                               Int(cut_fallback_points), Int(facet_region_count),
                                Int(surface_region_count), Int(interface_region_count))
 end
 
@@ -170,24 +183,39 @@ function _reduced_mode_counts(layout::SystemLayout)
     return counts
 end
 
-# Scan the integration plan for NNMF-fit statistics. `:cut_fitted` are
-# successful fits; `:cut_failed` (strict α = 0) and `:cut_alpha_failed`
-# (α > 0, α-tensor fallback) both hit the catastrophic residual threshold.
-# All three count as "cut" regions for diagnostics; the two failure kinds
-# count as fit failures.
+# Scan the integration plan for NNMF-fit statistics, returning
+# `(cut, failed, fallback, fallback_points)`. `:cut_fitted` are successful
+# fits; `:cut_fallback` (the raw Saye volume rule), `:cut_failed` (empty
+# Ω ∩ box at α = 0) and `:cut_alpha_failed` (the same at α > 0) all failed
+# to fit. Every kind counts as a "cut" region, and every non-fitted kind
+# counts as a fit failure — so `fit_failure_count` keeps meaning "the
+# moment fit did not reach `_FIT_FAILURE_RESIDUAL`" regardless of which
+# rule the region ended up carrying.
+#
+# `fallback_points` sums the quadrature points of the `:cut_fallback`
+# regions. That is the assembly cost of the safety net, and the number a
+# caller should watch: it is bounded only by the volume rule's own point
+# count, not by nbasis.
 function _cut_region_stats(plan::IntegrationPlan)
     cut = 0
     failed = 0
+    fallback = 0
+    fallback_points = 0
     for region in plan.regions
         kind = region.quadrature.kind
         if kind === :cut_fitted
             cut += 1
+        elseif kind === :cut_fallback
+            cut += 1
+            failed += 1
+            fallback += 1
+            fallback_points += length(region.quadrature.weights)
         elseif kind === :cut_failed || kind === :cut_alpha_failed
             cut += 1
             failed += 1
         end
     end
-    return cut, failed
+    return cut, failed, fallback, fallback_points
 end
 
 # Convenience helper shared by `prepare`, `move!`, `_update_mask!`, and
@@ -195,7 +223,11 @@ end
 # record at once. Returns the diagnostics so call sites can chain.
 function _set_plan_stats!(diag::AssemblyDiagnostics, plan::IntegrationPlan)
     _set_integration_stats!(diag, plan)
-    diag.cut_region_count, diag.fit_failure_count = _cut_region_stats(plan)
+    cut, failed, fallback, fallback_points = _cut_region_stats(plan)
+    diag.cut_region_count = cut
+    diag.fit_failure_count = failed
+    diag.cut_fallback_count = fallback
+    diag.cut_fallback_points = fallback_points
     diag.moment_fit_residual_max = plan.moment_fit_residual_max
     return diag
 end
@@ -216,13 +248,19 @@ function _set_plan_stats_multi!(diag::AssemblyDiagnostics, plans)
     diag.min_relative_integration_volume = minimum(Float64(p.min_relative_volume) for p in plans)
     cut = 0
     failed = 0
+    fallback = 0
+    fallback_points = 0
     for p in plans
-        c, f = _cut_region_stats(p)
+        c, f, b, bp = _cut_region_stats(p)
         cut += c
         failed += f
+        fallback += b
+        fallback_points += bp
     end
     diag.cut_region_count = cut
     diag.fit_failure_count = failed
+    diag.cut_fallback_count = fallback
+    diag.cut_fallback_points = fallback_points
     diag.moment_fit_residual_max = maximum(p.moment_fit_residual_max for p in plans; init=0.0)
     return diag
 end
@@ -1026,6 +1064,8 @@ function diagnostics(model::Model, solution; exact=nothing)
             reduced_mode_counts=diag.reduced_mode_counts, cut_region_count=diag.cut_region_count,
             fit_failure_count=diag.fit_failure_count,
             moment_fit_residual_max=diag.moment_fit_residual_max,
+            cut_fallback_count=diag.cut_fallback_count,
+            cut_fallback_points=diag.cut_fallback_points,
             symmetry_residual=diag.symmetry_residual, condition_estimate=diag.condition_estimate,
             solver=diag.solver, residual_norm=solution.diagnostics.residual_norm, l2_error=error,)
 end
