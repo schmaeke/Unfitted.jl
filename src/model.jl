@@ -192,6 +192,13 @@ end
 # moment fit did not reach `_FIT_FAILURE_RESIDUAL`" regardless of which
 # rule the region ended up carrying.
 #
+# `:cut_custom` — a region integrated by the domain's own `cut_quadrature`
+# rule instead of the fit (see `PhysicalDomain`) — is a cut region but never
+# a fit failure: no fit ran, so there is nothing for the residual-based
+# counter to report. A custom rule that wants to be counted as a failure
+# says so by returning `status === :empty`, which lands the region in
+# `:cut_failed` / `:cut_alpha_failed` instead.
+#
 # `fallback_points` sums the quadrature points of the `:cut_fallback`
 # regions. That is the assembly cost of the safety net, and the number a
 # caller should watch: it is bounded only by the volume rule's own point
@@ -203,7 +210,7 @@ function _cut_region_stats(plan::IntegrationPlan)
     fallback_points = 0
     for region in plan.regions
         kind = region.quadrature.kind
-        if kind === :cut_fitted
+        if kind === :cut_fitted || kind === :cut_custom
             cut += 1
         elseif kind === :cut_fallback
             cut += 1

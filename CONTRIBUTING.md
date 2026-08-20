@@ -547,7 +547,8 @@ indicator representations are intentionally not supported.
 
   - **Public construction**:
     `physical_domain(geometry; lipschitz=Inf, alpha=0.0, subcell_length_scale,
-    max_depth=8, moment_order_factor=2, target_residual=1e-6)`.
+    max_depth=8, moment_order_factor=2, target_residual=1e-6,
+    cut_quadrature=nothing)`.
 
     - `geometry`: a `LevelSet` CSG tree, or a bare scalar callable `φ` on
       `SVector{D,T}` (auto-wrapped as a single leaf). `φ` need not be a
@@ -587,6 +588,15 @@ indicator representations are intentionally not supported.
       kernel reaches far below the `1e-6` default in a single NNLS solve,
       so this only bounds a small conditioning retry (a denser candidate
       cloud) — never moment accuracy or subdivision depth.
+    - `cut_quadrature`: the cut-cell rule. `nothing` (default) is the
+      non-negative moment fit; a callable
+      `(physical, box, moment_order) -> (points, weights, residual, status)`
+      replaces it on cut regions only, and those regions come out tagged
+      `:cut_custom`. The rule must return *physical*-frame points and
+      non-negative weights, gets α-blended downstream exactly as a fit
+      does, and — the trap — silently contributes zero stiffness if it
+      returns no points. The full contract is in the `PhysicalDomain`
+      docstring under "Custom cut-cell quadrature".
 
   - **Attach** with `space(omega; ..., physical=physical_domain(…))`.
     The default `physical=nothing` keeps the no-FCM hot path.
@@ -607,7 +617,9 @@ indicator representations are intentionally not supported.
     carries no volume rule at all; region contributes zero quadrature),
     `:cut_alpha_failed` (the same under `α > 0`: the empty physical part
     is dropped but the α-scaled tensor rule is retained so the cell's
-    dofs stay α-stabilised — a nonzero rule). The assembly hot loop
+    dofs stay α-stabilised — a nonzero rule), `:cut_custom` (the rule came
+    from the domain's `cut_quadrature` callable instead of the moment fit;
+    counted as a cut region, never as a fit failure). The assembly hot loop
     is unchanged — it just iterates `zip(points, weights)`.
 
   - **Moment-fit defaults**: moment-fit basis order = `moment_order_factor

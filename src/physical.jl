@@ -130,8 +130,9 @@ _leaves(g::LevelSet) = _collect_leaves!(Leaf[], g)
 # ── PhysicalDomain ────────────────────────────────────────────────────────────
 
 """
-    PhysicalDomain{G,T}(geometry, alpha, subcell_length_scale, max_depth,
-                        moment_order_factor, target_residual)
+    PhysicalDomain{G,T,Q}(geometry, alpha, subcell_length_scale, max_depth,
+                          moment_order_factor, target_residual, keep_fictitious,
+                          cut_quadrature)
 
 CSG level-set description of a physical domain Ω for finite-cell-style immersed
 integration. `Ω = { x : x ∈ geometry }`, where `geometry` is a
@@ -177,10 +178,72 @@ Fields:
   - `target_residual::T`: NNMF L² residual the moment-fit aims for in cut
     regions. Default `1e-6`; the exact kernel reaches far below it, so this
     only bounds the conditioning retry.
+  - `cut_quadrature::Q`: the cut-cell quadrature rule. `nothing` (the default,
+    `Q === Nothing`) is the package's own non-negative moment fit; any other
+    value is a callable that replaces it on **cut** regions only. See
+    "Custom cut-cell quadrature" below for the contract it must honour.
+
+# Custom cut-cell quadrature
+
+`cut_quadrature` is the extension point for integrating a cut cell by some
+other scheme — a space-tree/octree rule, a tessellation, a rule read from a
+file. It is called once per distinct `(region box, moment order)` pair, with
+the signature
+
+    (physical, box, moment_order) -> (points, weights, residual, status)
+
+and must return the same 4-tuple [`moment_fit_rule`](@ref) returns:
+`points::Vector{SVector{D,T}}`, `weights::Vector{T}`, a scalar `residual`,
+and a `Symbol` status (report `residual = 0` when a rule has no notion of a fit
+residual). Only `:full`, `:fictitious`, and the fictitious fold are unaffected
+— every other part of the pipeline treats the returned rule exactly as it
+treats a fitted one. Four properties of that pipeline are the caller's
+responsibility:
+
+ 1. **Points are in physical coordinates.** `points[q] ∈ box ⊂ ℝᴰ` and
+    `weights[q]` is its physical weight, so `Σ w_q ≈ vol(box ∩ Ω)` — the same
+    convention [`moment_fit_rule`](@ref) returns. The per-box rule cache and
+    the mapping into the region's `[−1, 1]ᴰ` reference frame downstream both
+    assume it; handing back reference-frame points silently integrates the
+    wrong geometry.
+ 2. **Weights must be non-negative.** The α-FCM blend below and the
+    fictitious fold in `src/mesh.jl` both assume `w_q ≥ 0`, and a negative
+    weight can make an otherwise SPD form indefinite. The moment fit
+    guarantees this by construction (NNLS); a custom rule must guarantee it
+    itself.
+ 3. **An empty rule produces silent zero stiffness.** A rule that returns no
+    points for a sliver cell contributes nothing to the tangent, and *no
+    diagnostic is raised*: the region is kept, tagged, and integrates to
+    zero, so every dof supported only there ends up with a zero row and the
+    system is singular. This is not hypothetical — it is what makes an
+    aggressive space-tree configuration singular at `alpha = 0`. A rule that
+    knows it found nothing should return `status === :empty`, which routes
+    the region to `:cut_failed` (α = 0) or `:cut_alpha_failed` (α > 0) exactly
+    as an empty moment fit would, and so at least reaches
+    `diagnostics(...).fit_failure_count`.
+ 4. **α blending still applies**, downstream of the rule. Under `alpha > 0` a
+    cut region carries `(1 − α)·(custom rule) ∪ α·(full-cell tensor rule)`,
+    just as it would with the moment fit, so a custom rule inherits α-FCM
+    rather than replacing it.
+
+The rule must also be a deterministic function of its three arguments: results
+are memoised per `(region box, moment order)` for the lifetime of a plan
+build, so a rule reading mutable state outside its arguments is captured at
+its first answer for a box and silently reused. Put every knob in the callable
+itself — that is what makes the rule reproducible and thread-safe. `residual`
+is reported verbatim through `diagnostics(model).moment_fit_residual_max`.
+
+A region built from a custom rule is tagged `:cut_custom` (see
+`_build_region_quadrature` in `src/intersections.jl`) — one kind for every
+custom rule, whatever status symbol it returns, `:empty` excepted as in point
+3 above. `_cut_region_stats` counts `:cut_custom` as a cut region and **not**
+as a fit failure, since there is no fit to fail. The rule is stored on the domain
+rather than in a global, so two models in one session can use different rules
+and nothing about the choice is process-wide or thread-shared.
 
 Construct via [`physical_domain`](@ref).
 """
-struct PhysicalDomain{G<:LevelSet,T<:Real}
+struct PhysicalDomain{G<:LevelSet,T<:Real,Q}
     geometry::G
     alpha::T
     subcell_length_scale::T
@@ -188,12 +251,13 @@ struct PhysicalDomain{G<:LevelSet,T<:Real}
     moment_order_factor::Int
     target_residual::T
     keep_fictitious::Bool
+    cut_quadrature::Q
 end
 
 """
     physical_domain(geometry; lipschitz=Inf, alpha=0.0, keep_fictitious=false,
                     subcell_length_scale, max_depth=8, moment_order_factor=2,
-                    target_residual=1e-6)
+                    target_residual=1e-6, cut_quadrature=nothing)
 
 Construct a [`PhysicalDomain`](@ref). `geometry` is either a [`LevelSet`](@ref)
 CSG tree (built from [`leaf`](@ref) and `intersect`/`union`/`setdiff`/
@@ -210,11 +274,20 @@ fully-fictitious cells as active dofs (the classic α-FCM fill) and therefore
 requires `alpha > 0` — pairing it with `alpha = 0` leaves those cells without
 quadrature and is rejected. `moment_order_factor` and `target_residual` tune
 the NNMF moment fit.
+
+`cut_quadrature = nothing` (default) integrates cut cells with the package's
+non-negative moment fit. Passing a callable
+`(physical, box, moment_order) -> (points, weights, residual, status)`
+replaces that rule on cut regions and nothing else; the contract it must
+honour — physical-frame points, non-negative weights, the silent-zero-stiffness
+hazard of an empty rule, and the α blend that still applies downstream — is
+spelled out under "Custom cut-cell quadrature" in the [`PhysicalDomain`](@ref)
+docstring.
 """
 function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0,
                          keep_fictitious::Bool=false, subcell_length_scale::Real,
                          max_depth::Integer=8, moment_order_factor::Integer=2,
-                         target_residual::Real=1.0e-6)
+                         target_residual::Real=1.0e-6, cut_quadrature=nothing)
     alpha >= 0 || throw(ArgumentError("alpha must be ≥ 0; got $alpha"))
     !(keep_fictitious && iszero(alpha)) ||
         throw(ArgumentError("keep_fictitious=true requires alpha > 0: fully-fictitious cells " *
@@ -232,9 +305,12 @@ function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0,
     g = geometry isa LevelSet ? geometry : leaf(geometry; lipschitz=lipschitz)
     T = promote_type(typeof(float(alpha)), typeof(float(subcell_length_scale)),
                      typeof(float(target_residual)))
-    return PhysicalDomain{typeof(g),T}(g, T(alpha), T(subcell_length_scale), Int(max_depth),
-                                       Int(moment_order_factor), T(target_residual),
-                                       keep_fictitious)
+    return PhysicalDomain{typeof(g),T,typeof(cut_quadrature)}(g, T(alpha),
+                                                              T(subcell_length_scale),
+                                                              Int(max_depth),
+                                                              Int(moment_order_factor),
+                                                              T(target_residual), keep_fictitious,
+                                                              cut_quadrature)
 end
 
 """

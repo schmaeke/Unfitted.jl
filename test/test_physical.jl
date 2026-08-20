@@ -707,3 +707,85 @@ end
     @test fallback == 1
     @test fallback_points == 2
 end
+
+@testset "custom cut_quadrature rule replaces the moment fit on cut regions" begin
+    # `PhysicalDomain.cut_quadrature` is the public extension point for
+    # integrating cut cells by some other scheme. The rule below is the
+    # plainest one honouring the documented contract: the full-cell tensor
+    # Gauss rule of the region box, in *physical* coordinates, with strictly
+    # positive weights. It ignores Ω on purpose, so `Σ w_q = vol(box)` exactly
+    # — a value no moment fit could return on a cut cell, which is what makes
+    # "the rule was actually used" checkable without re-deriving a fit.
+    calls = Ref(0)
+    function tensor_rule(physical, region_box::Unfitted.AxisBox{D,T},
+                         moment_order::NTuple{D,Int}) where {D,T}
+        calls[] += 1
+        rule = Unfitted._tensor_gauss_rule(moment_order .+ 1, T)
+        jacobian = Unfitted.volume(region_box) / T(2^D)
+        points = [Unfitted.reference_to_physical(region_box, p) for p in rule.points]
+        return points, rule.weights .* jacobian, zero(T), :custom
+    end
+
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    geometry = x -> sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.3
+    settings = (; lipschitz=1.0, subcell_length_scale=0.05)
+    fitted = physical_domain(geometry; settings...)
+    custom = physical_domain(geometry; settings..., cut_quadrature=tensor_rule)
+
+    # `Q === Nothing` on the default keeps the struct concrete, which is the
+    # reason the rule is a field rather than a boxed global.
+    @test fitted.cut_quadrature === nothing
+    @test typeof(fitted).parameters[3] === Nothing
+    @test isconcretetype(typeof(fitted))
+    @test isconcretetype(typeof(custom))
+
+    plan_fitted = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2,
+                                                  physical=fitted))
+    plan_custom = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2,
+                                                  physical=custom))
+
+    kinds(plan) = [r.quadrature.kind for r in plan.regions]
+    @test :cut_fitted in kinds(plan_fitted)
+    @test !(:cut_custom in kinds(plan_fitted))
+    # The rule replaces exactly the cut regions: same region boxes, same
+    # `:full` regions, `:cut_fitted` swapped for `:cut_custom` one for one.
+    @test [r.box for r in plan_custom.regions] == [r.box for r in plan_fitted.regions]
+    @test count(==(:full), kinds(plan_custom)) == count(==(:full), kinds(plan_fitted))
+    @test count(==(:cut_custom), kinds(plan_custom)) ==
+          count(==(:cut_fitted), kinds(plan_fitted)) > 0
+    @test calls[] == count(==(:cut_custom), kinds(plan_custom))
+
+    # Points come back in the region's reference frame with the standard
+    # Jacobian folded out, so `Σ w_q · vol(box) / 2ᴰ` is the physical measure
+    # the rule integrates — here the whole box, since the rule ignores Ω.
+    for region in plan_custom.regions
+        region.quadrature.kind === :cut_custom || continue
+        jacobian = Unfitted.volume(region.box) / 4
+        @test sum(region.quadrature.weights) * jacobian ≈ Unfitted.volume(region.box)
+        @test all(>=(0), region.quadrature.weights)
+    end
+
+    # A custom region is a cut region but never a fit failure: no fit ran, so
+    # there is no residual for `fit_failure_count` to report on.
+    cut, failed, fallback, fallback_points = Unfitted._cut_region_stats(plan_custom)
+    @test cut == count(==(:cut_custom), kinds(plan_custom))
+    @test failed == 0
+    @test fallback == 0
+    @test fallback_points == 0
+
+    # α blends the custom rule exactly as it blends a fit: the region carries
+    # `(1 − α)·custom ∪ α·tensor`, so the custom part is scaled, not replaced.
+    alpha = 0.25
+    blended = physical_domain(geometry; settings..., alpha=alpha,
+                              cut_quadrature=tensor_rule)
+    plan_blended = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2,
+                                                   physical=blended))
+    strict = first(r for r in plan_custom.regions if r.quadrature.kind === :cut_custom)
+    mixed = first(r for r in plan_blended.regions
+                  if r.quadrature.kind === :cut_custom && r.box == strict.box)
+    n = length(strict.quadrature.weights)
+    @test length(mixed.quadrature.weights) > n
+    @test mixed.quadrature.points[1:n] == strict.quadrature.points
+    @test mixed.quadrature.weights[1:n] ≈ strict.quadrature.weights .* (1 - alpha)
+    @test all(>=(0), mixed.quadrature.weights)
+end

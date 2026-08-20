@@ -135,11 +135,16 @@ informational tag set by the integration-region dispatcher in
   - `:cut_alpha_failed` — same under α-FCM (`α > 0`); the physical part is
     empty but the region carries the α-scaled tensor rule alone so the
     cell's dofs stay α-stabilised rather than singular.
+  - `:cut_custom` — region is crossed by ∂Ω and its rule came from the
+    domain's own `cut_quadrature` callable instead of the moment fit (see
+    the [`PhysicalDomain`](@ref) docstring). Under α-FCM the α-scaled
+    tensor part is appended as for `:cut_fitted`.
 
 All three non-fitted kinds are reported in
 `AssemblyDiagnostics.fit_failure_count`; `:cut_fallback` is additionally
 counted, with its point cost, in `cut_fallback_count` and
-`cut_fallback_points`.
+`cut_fallback_points`. `:cut_custom` is not among them — no fit ran, so
+there is no residual to report on.
 
 Assembly iterates `zip(points, weights)` without dispatching on `kind`,
 so the hot loop's cost is the same regardless of the quadrature source.
