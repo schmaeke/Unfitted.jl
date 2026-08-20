@@ -219,6 +219,46 @@ end
     end
 end
 
+@testset "fictitious fold covers a coarse cell whose own centre lies in Ω" begin
+    # The hole is small enough to sit strictly inside one base cell, so the base cell
+    # carries material at its own centre while the overlay block underneath it contains
+    # cells the fold dropped whole. That separation is what the previous test does not
+    # reach — there the hole is wide enough that every base cell with a folded overlay
+    # cell beneath it has its own centre inside the hole too.
+    #
+    # `_covered_by_level` decides the case on the *overlay* cells it overlaps, never on
+    # the coarse box: its fast rejection samples the centre of each inactive overlay
+    # cell, because `:fictitious` means no point of that cell lies in Ω. Reading the
+    # coarse cell's centre instead would let a material coarse centre veto coverage
+    # while a folded overlay cell sits underneath, and the base cell would keep the
+    # high-order modes the overlay already reproduces on Ω — the null mode again.
+    hole = physical_domain(x -> 0.06 - sqrt((x[1] - 0.32)^2 + (x[2] - 0.32)^2); lipschitz=1.0,
+                           subcell_length_scale=0.0078125, max_depth=6)
+    V = overlay(space(_OMEGA_CR; cells=(4, 4), order=2, reduce_order=true, physical=hole),
+                box((0.25, 0.25), (0.75, 0.75)); cells=(16, 16), order=2)
+    m, l = _gram(V)
+    @test diagnostics(m).inactive_cell_counts[2] > 0     # the fold really folds something
+
+    # Base cell (2, 2) is the one holding the hole. Its centre is in Ω, its overlay
+    # block is not entirely active — and it is covered all the same.
+    base, fine = Unfitted._problem_levels(m.problem)[1:2]
+    cell = CartesianIndex(2, 2)
+    @test Unfitted._inside(m.problem.fields[1].space.physical.geometry,
+                           Unfitted.center(Unfitted.cell_box(base.mesh, cell)))
+    @test Unfitted._covered_by_level(Unfitted.cell_box(base.mesh, cell), fine,
+                                     GeometryTolerance(Float64),
+                                     m.problem.fields[1].space.physical,
+                                     Unfitted._ClassifyCache{2,Float64}())
+    @test count(==(:coverage), l.elimination_source) == 8
+
+    # …so no exact kernel, exactly as in the wide-hole case above.
+    M = Symmetric(Matrix(m.matrix))
+    lam = eigvals(M)
+    @test count(<=(1e-13 * maximum(lam)), lam) == 0
+    @test minimum(lam) > 0
+    @test isposdef(M)
+end
+
 @testset "order reduction in 3D (edge, face, and interior modes)" begin
     # Aligned same-order nested overlay over the middle 2×2×2 base block: the buried
     # centre vertex is deduped and the eight covered cells shed their edge/face/interior

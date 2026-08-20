@@ -503,10 +503,33 @@ end
 # rule at region-build time (see `intersections.jl`), while `:fictitious`
 # cells are dropped from the dof layout via the fold below (strict-α path
 # only, i.e. `physical.alpha == 0`).
+#
+# Only cells the level's own mask already keeps active are classified. The fold
+# below combines the two masks with `active .& .!fictitious` (`_fold_fictitious`),
+# so a cell the user already deactivated stays deactivated whatever the classifier
+# would say about it: `false & x == false`. Leaving `fict` at its `false` default
+# there is therefore bit-identical to classifying it, and the guard turns the pass
+# from O(cells of the level) into O(active cells of the level).
+#
+# That distinction is what makes a deep, sparsely-populated overlay affordable.
+# A refinement level whose grid is Nᴰ cells but which carries a handful of active
+# ones — the normal state of an adaptive front — otherwise pays a full-grid
+# classification sweep every time the mesh is folded, and `classify_cell` is not
+# cheap: it walks a bounded octree whenever the Lipschitz certificate cannot
+# settle the box from its centre sample.
+#
+# The classification verdicts of *inactive* cells are still needed further down
+# the pipeline — `_covered_by_level` in `coverage.jl` and `_internal_face_is_physical`
+# in `dofs.jl` both have to tell a fictitious fold from a user mask — but each asks
+# only about the cells on its own fold/mask boundary, and each goes through the same
+# `cache`. Skipping them here turns those queries from cache hits into cache misses;
+# it does not change a single verdict, because `classify_cell` is a pure function of
+# the box and the geometry.
 function _level_fictitious_cells(level::Level{D,T}, physical::PhysicalDomain,
                                  cache::_ClassifyCache{D,T}) where {D,T}
     fict = falses(level.mesh.cells)
     for ci in cell_indices(level.mesh)
+        is_active(level.mask, ci) || continue
         if classify_cell(physical, cell_box(level.mesh, ci), cache) === :fictitious
             fict[ci] = true
         end

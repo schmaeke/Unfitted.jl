@@ -19,6 +19,11 @@ Per-level covered-cell masks for a [`Space`](@ref). `covered[level_id]` is a
 `BitArray{D}` over the level's cells, `true` where the cell is fully covered by the
 active region of the higher-id levels. Built by [`build_coverage`](@ref) and consumed
 by the order-reduction constraint source `_coverage_constraints` in `dofs.jl`.
+
+The flag is only computed where that consumer can read it — on a masked level, the
+active cells and their one-cell ∞-norm halo (see `_coverage_cells`). Outside that set
+the entry keeps its `false` default and carries no information; it is not a claim that
+the cell is uncovered.
 """
 struct Coverage{D}
     covered::Dict{Int,BitArray{D}}
@@ -64,9 +69,27 @@ function _covered_by_level(box::AxisBox{D,T}, k::Level{D,T}, tol::GeometryTolera
         hi = clamp(searchsortedlast(ax, box.upper[d] - tol.contain), 1, last)
         lo:hi
     end
-    for kc in CartesianIndices(ranges)
+    cells = CartesianIndices(ranges)
+
+    # Pass 1 — one centre sample per inactive cell. `:fictitious` means *no* point of the
+    # cell lies in Ω, so a centre inside Ω rules that verdict out, and this is the
+    # overwhelmingly common case: a coarse cell abutting a sparsely-populated overlay
+    # meets that overlay's user-masked (material-carrying) cells, not its folded ones.
+    for kc in cells
         is_active(k.mask, kc) && continue                       # an inactive overlapped cell
         physical === nothing && return false
+        _inside(physical.geometry, center(cell_box(k.mesh, kc))) && return false
+    end
+
+    # Pass 2 — the exact verdict, for the blocks pass 1 could not settle. Splitting the
+    # passes matters because `classify_cell` is not a lookup: the Lipschitz certificate
+    # cannot certify a cell as outside Ω once the cell's half-diagonal exceeds the
+    # feature it sits in, and the classifier then walks its subdivision budget to the
+    # bottom. Interleaved, a block whose leading cells are fictitious would pay that walk
+    # for each of them before reaching the material cell that decides the answer; here
+    # the cheap pass reaches it first, for at most one classification's worth of samples.
+    for kc in cells
+        is_active(k.mask, kc) && continue
         classify_cell(physical, cell_box(k.mesh, kc), cache) === :fictitious || return false
     end
     return true
@@ -88,6 +111,10 @@ from a user mask (which does not) — see `_covered_by_level`. Pass the cache `p
 already filled during the fold so no cell box is classified twice; the default
 allocates a fresh one for standalone calls, and it stays empty and unused when
 `V.physical === nothing`.
+
+Only the cells `_coverage_cells` selects are evaluated; the rest keep the `false`
+default, which the order-reduction rule never reads. On a masked level that is what
+keeps the pass proportional to the *active* region rather than to the level's grid.
 """
 function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T},
                         classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
@@ -96,7 +123,9 @@ function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T},
         cov = falses(level.mesh.cells)
         above = [k for k in V.levels if k.id > level.id]
         if !isempty(above)
+            wanted = _coverage_cells(level)
             for ci in cell_indices(level.mesh)
+                wanted[ci] || continue
                 box = cell_box(level.mesh, ci)
                 cov[ci] = any(k -> _covered_by_level(box, k, tol, V.physical, classify_cache),
                               above)
@@ -105,6 +134,34 @@ function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T},
         covered[level.id] = cov
     end
     return Coverage{D}(covered)
+end
+
+# The cells of `level` whose coverage flag can ever be read, as a `BitArray{D}`.
+#
+# `_coverage_constraints` (in `dofs.jl`) is the only consumer of a `Coverage`, and it
+# tests `cov` exactly on `_incident_cells(key, n)` for the level's raw dof keys. Raw
+# dofs are enumerated on *active* cells only (`dof_layout`, stage 1), and a key born on
+# cell `c` is incident to `c` and — through its node factors — to the cells sharing a
+# face, edge, or vertex with `c`. The read set is therefore the active set dilated by
+# one cell in the ∞-norm, and computing `cov` anywhere else is work whose answer nobody
+# looks at. The remaining `any(cov)` fast-exit in `_coverage_constraints` is unaffected:
+# it can only lose a `true` that belonged to a cell no key is incident to, in which case
+# the loop it guards would have emitted nothing anyway.
+#
+# An unmasked level is all-active, so its dilation is the whole grid and the pass is the
+# original one.
+function _coverage_cells(level::Level{D}) where {D}
+    n = level.mesh.cells
+    level.mask === nothing && return trues(n)
+    wanted = falses(n)
+    lo, hi = oneunit(CartesianIndex{D}), CartesianIndex(n)
+    for c in cell_indices(level.mesh)
+        is_active(level.mask, c) || continue
+        for nb in max(lo, c - lo):min(hi, c + lo)
+            wanted[nb] = true
+        end
+    end
+    return wanted
 end
 
 # True iff `inner`'s mesh is nested inside `outer`'s over their overlap: every `inner`
