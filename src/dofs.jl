@@ -499,7 +499,7 @@ function _incident_cells(key::TensorDofKey{D}, n::NTuple{D,Int}) where {D}
 end
 
 """
-    _coverage_constraints(level, V, coverage, tol, level_keys)
+    _coverage_constraints(level, V, coverage, tol, level_keys, classify_cache)
         -> Vector{Tuple{LinearConstraint{T},Symbol}}
 
 Order-reduction constraint source, a peer of [`_overlay_constraints`](@ref). For a
@@ -514,24 +514,32 @@ The linear skeleton is otherwise retained, which is what makes the reduced space
 complete (see `docs/design/covered-cell-deactivation.md`). Each returned pair carries
 its elimination source for `constraint_kind` / diagnostics.
 
+`classify_cache` is threaded into [`_covered_by_level`](@ref) for the dedup test so it
+applies the same fictitious-fold rule [`build_coverage`](@ref) used.
+
 Integrated-Legendre only; the generic fallback returns nothing (order reduction is out
 of scope for the B-spline family).
 """
 function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{D,T},
                                coverage::Coverage{D}, tol::GeometryTolerance{T},
-                               level_keys::AbstractVector{Pair{TensorDofKey{D},Int}}) where {D,T}
+                               level_keys::AbstractVector{Pair{TensorDofKey{D},Int}},
+                               classify_cache::_ClassifyCache{D,T}) where {D,T}
     out = Tuple{LinearConstraint{T},Symbol}[]
     cov = coverage.covered[level.id]
     any(cov) || return out
     n = level.mesh.cells
     nested_above = [k for k in V.levels if k.id > level.id && _nested_over(level, k, tol)]
+    # A nested level above reproduces a buried vertex function iff it covers every cell
+    # the vertex touches — the same fictitious-aware rule `build_coverage` applied.
+    reproduces(k, cells) = all(cells) do ci
+        _covered_by_level(cell_box(level.mesh, ci), k, tol, V.physical, classify_cache)
+    end
     for (key, raw) in level_keys
         cells = _incident_cells(key, n)
         all(ci -> cov[ci], cells) || continue                       # buried?
         if any(a -> a.kind == _AXIS_SPAN, key.axes)                 # high-order → order reduction
             push!(out, (LinearConstraint{T}([raw], [one(T)]), :coverage))
-        elseif any(k -> all(ci -> _covered_by_level(cell_box(level.mesh, ci), k, tol), cells),
-                   nested_above)                                    # linear reproduced by a nested level
+        elseif any(k -> reproduces(k, cells), nested_above)          # linear reproduced above
             push!(out, (LinearConstraint{T}([raw], [one(T)]), :dedup))
         end
     end
@@ -540,7 +548,8 @@ end
 
 # Generic fallback: no order reduction (e.g. the B-spline family).
 function _coverage_constraints(::Level{D,T,B}, ::Space{D,T}, ::Coverage{D}, ::GeometryTolerance{T},
-                               ::AbstractVector{Pair{TensorDofKey{D},Int}}) where {D,T,B}
+                               ::AbstractVector{Pair{TensorDofKey{D},Int}},
+                               ::_ClassifyCache{D,T}) where {D,T,B}
     return Tuple{LinearConstraint{T},Symbol}[]
 end
 
@@ -716,9 +725,9 @@ Keyword arguments:
   - `tolerance` — `GeometryTolerance` used by boundary detection.
   - `components` — scalar channels per field (≥ 1).
   - `classify_cache` — the space's cell-classification cache (shared with the
-    `PhysicalDomain` fold). The fictitious-fold constraint predicate reuses it
-    instead of re-classifying fold-boundary cells; defaults to a fresh empty
-    cache for standalone calls.
+    `PhysicalDomain` fold). The fictitious-fold constraint predicate and the
+    coverage rule both reuse it instead of re-classifying fold-boundary cells;
+    defaults to a fresh empty cache for standalone calls.
 
 The integrated Legendre family produces single-raw constraints,
 reducing the resolved expansion to strong elimination (`raw_expansion =
@@ -772,7 +781,8 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     # through to the `:overlay` default when `elimination_source` is built below.
     source_of = Dict{Int,Symbol}()
     reduce_any = any(level -> level.reduce_order, V.levels)
-    coverage = reduce_any ? build_coverage(V, tolerance) : Coverage{D}(Dict{Int,BitArray{D}}())
+    coverage = reduce_any ? build_coverage(V, tolerance, classify_cache) :
+               Coverage{D}(Dict{Int,BitArray{D}}())
     for level in V.levels
         level_keys = get(keys_by_level, level.id, empty_keys)
         # Source 1: the artificial-overlay-boundary trace condition (every family).
@@ -780,7 +790,8 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
                 _overlay_constraints(level, V, tolerance, raw_by_key, level_keys, classify_cache))
         # Source 2: order reduction in covered regions (opt-in per level).
         if level.reduce_order
-            for (c, src) in _coverage_constraints(level, V, coverage, tolerance, level_keys)
+            for (c, src) in _coverage_constraints(level, V, coverage, tolerance, level_keys,
+                                                  classify_cache)
                 push!(constraints, c)
                 source_of[c.raws[1]] = src
             end

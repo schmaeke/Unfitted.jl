@@ -182,6 +182,43 @@ end
     end
 end
 
+@testset "fictitious fold counts as coverage: no null mode from a folded fine cell" begin
+    # Ω is the unit square minus a disk, so the fold deactivates every overlay cell
+    # that falls entirely inside the hole. Such a cell carries no material, so it must
+    # still count as *covering*: were it to block coverage, the base cells straddling
+    # ∂Ω would keep high-order modes the overlay already reproduces exactly on Ω, and
+    # the Gram would acquire exact null modes — functions with ‖v_h‖_{L²(Ω)} = 0,
+    # supported entirely in the fictitious part. A user mask is the opposite case and
+    # still blocks coverage; the two are told apart by `classify_cell` in
+    # `_covered_by_level`.
+    #
+    # The overlay is deliberately wider than the hole, so every base cell the fold
+    # touches lies strictly inside it and the check is not entangled with the
+    # artificial overlay boundary.
+    hole = physical_domain(x -> 0.25 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0,
+                           subcell_length_scale=0.015625, max_depth=6)
+    V = overlay(space(_OMEGA_CR; cells=(8, 8), order=2, reduce_order=true, physical=hole),
+                box((0.125, 0.125), (0.875, 0.875)); cells=(12, 12), order=2)
+    m, l = _gram(V)
+    @test diagnostics(m).inactive_cell_counts[2] > 0    # the fold really folds something
+    @test count(==(:coverage), l.elimination_source) > 0
+
+    # No exact kernel: the smallest eigenvalue is a genuine small-cut-cell mode, orders
+    # of magnitude above the roundoff floor, and the Cholesky factorization succeeds.
+    M = Symmetric(Matrix(m.matrix))
+    lam = eigvals(M)
+    @test count(<=(1e-13 * maximum(lam)), lam) == 0
+    @test minimum(lam) > 0
+    @test isposdef(M)
+
+    # Still complete over Ω: the reduced space reproduces the constant pointwise.
+    c = pinv(M) * load_vector(m; source=_one)
+    proj = Solution(c, m.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    for x in (SVector(0.2, 0.2), SVector(0.5, 0.85), SVector(0.8, 0.5))
+        @test value(proj, m, x) ≈ 1.0 atol = 1e-8
+    end
+end
+
 @testset "order reduction in 3D (edge, face, and interior modes)" begin
     # Aligned same-order nested overlay over the middle 2×2×2 base block: the buried
     # centre vertex is deduped and the eight covered cells shed their edge/face/interior
