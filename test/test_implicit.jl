@@ -157,9 +157,13 @@ end
 end
 
 # Build a kernel volume rule from a CSG level-set tree (leaves + membership).
-function _csg_rule(geom, region; gp, ms=5)
-    _IVQ(Any[l.f for l in Unfitted._leaves(geom)], x -> Unfitted._inside(geom, x), region;
-         gauss_points=gp, max_subdiv=ms)
+# `certified = true` forwards the tree's per-leaf Lipschitz constants, which is
+# what `moment_fit_rule` does in the finite-cell pipeline.
+function _csg_rule(geom, region; gp, ms=5, certified=false)
+    leaves = Unfitted._leaves(geom)
+    lipschitz = certified ? Float64[l.lipschitz for l in leaves] : nothing
+    _IVQ(Any[l.f for l in leaves], x -> Unfitted._inside(geom, x), region; gauss_points=gp,
+         max_subdiv=ms, lipschitz=lipschitz)
 end
 
 @testset "implicit quadrature — force-reduce stays correct without subdivision" begin
@@ -222,4 +226,97 @@ end
     rule = _IVQ(x -> x[1] - 0.5f0, box((0.0f0, 0.0f0), (1.0f0, 1.0f0)); gauss_points=5)
     @test eltype(rule[2]) === Float32
     @test _quad(x -> 1.0f0, rule) ≈ 0.5f0 atol = 1.0f-5
+end
+
+# Signed distance to the disc of radius `r` centred at `c` (Lipschitz constant 1)
+# and its negation, so `{_disc ≤ 0}` is the disc and `{_hole ≤ 0}` is everything
+# outside it.
+_disc(c, r) = x -> hypot(x[1] - c[1], x[2] - c[2]) - r
+_hole(c, r) = x -> r - hypot(x[1] - c[1], x[2] - c[2])
+
+@testset "implicit quadrature — a sub-region feature needs the Lipschitz certificate" begin
+    # A disc of radius 0.16 centred at (0.25, 0.25) lies strictly inside [0, 1]²
+    # yet contains neither the box centre nor any of its four corners. Every
+    # sample therefore reports the same sign, `_sample_sign` prunes the only
+    # leaf, and with no leaf left the kernel takes the box to be uniform and
+    # returns the full tensor rule: the hole is silently integrated as solid.
+    # The certificate |f(c)| > L·r bounds f over the *whole* box, so it never
+    # prunes a leaf that varies on it and the hole reappears.
+    region = box((0.0, 0.0), (1.0, 1.0))
+    hole = _hole((0.25, 0.25), 0.16)
+    @test _quad(x -> 1.0, _IVQ(hole, region; gauss_points=12)) ≈ 1.0 atol = 1e-13
+    certified = _IVQ(hole, region; gauss_points=12, lipschitz=1.0)
+    @test _quad(x -> 1.0, certified) ≈ 1 - π * 0.16^2 atol = 5e-5
+    @test all(>(0), certified[2])
+
+    # The surface rule shares the blind spot — it bails out on a uniform sign —
+    # so without the constant the disc has no boundary at all. Its four cardinal
+    # turning points cap the perimeter accuracy, as for a whole disc above.
+    @test isempty(_ISQ(hole, region; gauss_points=12)[1])
+    @test isapprox(_quad(x -> 1.0, _ISQ(hole, region; gauss_points=12, lipschitz=1.0)), 2π * 0.16;
+                   atol=5e-2)
+end
+
+@testset "implicit quadrature — a feature entering the region through an edge" begin
+    # The blind spot is not confined to features enclosed by the box: the disc of
+    # radius 0.25 centred at (−0.05, 0.5) overlaps [0, 1]² through the x = 0 edge
+    # only, and its circular segment still misses the centre and all corners.
+    # ∂f/∂x keeps one sign over the region, so the segment is graph-like in x and
+    # the certified rule is high-order. Segment area with d = 0.05:
+    #   A = r² arccos(d / r) − d √(r² − d²)
+    region = box((0.0, 0.0), (1.0, 1.0))
+    seg = _hole((-0.05, 0.5), 0.25)
+    area = 0.25^2 * acos(0.05 / 0.25) - 0.05 * sqrt(0.25^2 - 0.05^2)
+    @test _quad(x -> 1.0, _IVQ(seg, region; gauss_points=12)) ≈ 1.0 atol = 1e-13
+    @test _quad(x -> 1.0, _IVQ(seg, region; gauss_points=12, lipschitz=1.0)) ≈ 1 - area atol = 1e-5
+end
+
+@testset "implicit quadrature — 3D sub-region feature (dimension-generic)" begin
+    # The same failure in 3D: a ball of radius 0.15 at (0.3, 0.3, 0.3) misses the
+    # centre and all eight corners of [0, 1]³. The recursion bisects until the
+    # ball is graph-like on the children, so the certified volume is far sharper
+    # here than the 2D disc's.
+    region = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    ball = x -> 0.15 - sqrt((x[1] - 0.3)^2 + (x[2] - 0.3)^2 + (x[3] - 0.3)^2)
+    @test _quad(x -> 1.0, _IVQ(ball, region; gauss_points=8)) ≈ 1.0 atol = 1e-13
+    @test _quad(x -> 1.0, _IVQ(ball, region; gauss_points=8, lipschitz=1.0)) ≈
+          1 - 4 / 3 * π * 0.15^3 atol = 1e-7
+end
+
+@testset "implicit quadrature — per-leaf Lipschitz constants on a CSG tree" begin
+    # The multi-component form takes one constant per leaf in leaf order. Two
+    # non-overlapping discs, each individually invisible to sampling on this box,
+    # are both recovered; a length mismatch is an error rather than a silently
+    # truncated pairing.
+    region = box((0.0, 0.0), (1.0, 1.0))
+    geom = complement(union(leaf(_disc((0.25, 0.25), 0.12); lipschitz=1.0),
+                            leaf(_disc((0.75, 0.72), 0.1); lipschitz=1.0)))
+    @test _quad(x -> 1.0, _csg_rule(geom, region; gp=12)) ≈ 1.0 atol = 1e-13
+    @test _quad(x -> 1.0, _csg_rule(geom, region; gp=12, certified=true)) ≈
+          1 - π * (0.12^2 + 0.1^2) atol = 5e-5
+
+    fs = Any[l.f for l in Unfitted._leaves(geom)]
+    membership = x -> Unfitted._inside(geom, x)
+    @test_throws DimensionMismatch _IVQ(fs, membership, region; gauss_points=6, lipschitz=[1.0])
+    @test_throws ArgumentError _IVQ(fs[1], region; gauss_points=6, lipschitz=0.0)
+end
+
+@testset "implicit quadrature — the `lipschitz` default preserves the sampling path" begin
+    # Backwards compatibility. Omitting the keyword, passing `nothing`, and
+    # passing `Inf` (the `leaf` default, documented as the uncertified mode) must
+    # all reproduce the pre-certificate rule bit for bit — blind spot included —
+    # so no existing caller changes behavior.
+    region = box((0.0, 0.0), (1.0, 1.0))
+    hole = _hole((0.25, 0.25), 0.16)
+    plain = _IVQ(hole, region; gauss_points=10)
+    @test _IVQ(hole, region; gauss_points=10, lipschitz=nothing) == plain
+    @test _IVQ(hole, region; gauss_points=10, lipschitz=Inf) == plain
+    @test _ISQ(hole, region; gauss_points=10, lipschitz=Inf) ==
+          _ISQ(hole, region; gauss_points=10)
+
+    # And where sampling already resolves the cut, the certificate changes
+    # nothing: it can only ever keep *more* leaves active, never fewer.
+    tilted = x -> x[1] + x[2] - 1
+    @test _quad(x -> 1.0, _IVQ(tilted, region; gauss_points=8, lipschitz=sqrt(2))) ≈
+          _quad(x -> 1.0, _IVQ(tilted, region; gauss_points=8)) atol = 1e-15
 end

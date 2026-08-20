@@ -25,8 +25,9 @@ abstract type LevelSet end
 
 A single smooth level set `f` with `Ω_leaf = { x : f(x) ≤ 0 }`. `lipschitz` is
 a Lipschitz constant `L` of `f` (`|f(x) − f(y)| ≤ L‖x − y‖`); `Inf` disables
-the cheap sign certificate in the cell classifier and forces corner sampling.
-Construct with [`leaf`](@ref).
+the cheap sign certificate in the cell classifier and in the implicit
+quadrature kernel, and forces corner sampling in both. Construct with
+[`leaf`](@ref).
 """
 struct Leaf{F} <: LevelSet
     f::F
@@ -52,9 +53,12 @@ Wrap a scalar level-set callback `f` (on `SVector{D,T}` coordinates) as a CSG
 leaf with `Ω_leaf = { x : f(x) ≤ 0 }`. `f` must accept `ForwardDiff.Dual`
 arguments so the quadrature kernel can take its gradient (pass an
 AD-compatible closure, or supply a finite-difference gradient downstream).
-`lipschitz` is the Lipschitz constant used by the cell classifier's sign
-certificate; `1.0` for a true signed-distance leaf, `Inf` to rely on corner
-sampling.
+`lipschitz` is the Lipschitz constant used by the sign certificate of both the
+cell classifier and the implicit quadrature kernel; `1.0` for a true
+signed-distance leaf, `Inf` to rely on corner sampling. Supplying it is what
+lets a feature smaller than a mesh cell survive: under `Inf` the kernel can
+prune such a leaf on the cell box and integrate the cut cell as if it were
+entirely inside Ω.
 """
 function leaf(f; lipschitz::Real=Inf)
     lipschitz > 0 || throw(ArgumentError("lipschitz must be positive; got $lipschitz"))

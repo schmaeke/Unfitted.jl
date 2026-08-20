@@ -129,9 +129,35 @@ end
 
 # ── Sign sampling and height-axis certificate ──────────────────────────────────
 
+# A level-set callback carrying a Lipschitz constant `L` of `f`
+# (`|f(x) − f(y)| ≤ L‖x − y‖`). The wrapper is itself callable and forwards to
+# `f`, so every consumer in this file — `_choose_axis`, `_fiber_breaks`,
+# `_emit_fiber!`, the surface root solve, and the `ForwardDiff` gradient
+# operator — keeps treating it as a plain callback; only `_sample_sign`
+# dispatches on the wrapper to use the certificate below.
+struct _LipschitzLeaf{F}
+    f::F
+    lipschitz::Float64
+end
+
+@inline (g::_LipschitzLeaf)(x) = g.f(x)
+
+# Attach a Lipschitz bound to a level-set callback. `nothing` passes the
+# callback through unchanged, which selects the uncertified sampling path.
+_certified(f, ::Nothing) = f
+function _certified(f, lipschitz::Real)
+    lipschitz > 0 || throw(ArgumentError("lipschitz must be positive; got $lipschitz"))
+    return _LipschitzLeaf(f, Float64(lipschitz))
+end
+
 # Sign of `g` if it is uniformly signed across the box center and its 2ᴰ
 # corners, else `0` (a sign change was sampled). Used to prune leaves that do
 # not vary on the box.
+#
+# This is a *heuristic*: a feature smaller than the sample spacing is invisible,
+# and pruning every leaf makes the caller treat the box as uniform. The
+# `_LipschitzLeaf` method below replaces it by a certificate wherever the caller
+# supplied a Lipschitz constant.
 function _sample_sign(g, U::AxisBox{D,T}) where {D,T}
     vc = g(center(U))
     sref = vc < zero(vc) ? -1 : (vc > zero(vc) ? 1 : 0)
@@ -143,6 +169,37 @@ function _sample_sign(g, U::AxisBox{D,T}) where {D,T}
         s != sref && return 0
     end
     return sref
+end
+
+# Certified sign of a Lipschitz leaf on `U`, the same test the CSG cell
+# classifier uses (`_tri` in `src/physical.jl`): with `c` the box center and
+# `r = _half_diagonal(U)` the radius of the smallest enclosing ball,
+#
+#     |f(y) − f(c)| ≤ L‖y − c‖ ≤ L·r    for every y ∈ U,
+#
+# so `|f(c)| > L·r` proves `f` cannot change sign on `U`. Unlike point sampling
+# this never prunes a leaf that does vary on the box, which is what keeps a
+# geometric feature smaller than the sample spacing — a small hole well inside a
+# cell, say — from vanishing into a silently full box rule.
+#
+# `L = Inf` (the default of [`leaf`](@ref)) makes the threshold infinite, which
+# would certify nothing and leave every leaf active; that mode falls back to the
+# point-sampling heuristic above, matching the pre-certificate behavior.
+function _sample_sign(g::_LipschitzLeaf, U::AxisBox{D,T}) where {D,T}
+    thr = g.lipschitz * _half_diagonal(U)
+    isfinite(thr) || return _sample_sign(g.f, U)
+    vc = g.f(center(U))
+    return vc > thr ? 1 : (vc < -thr ? -1 : 0)
+end
+
+# Restrict a level-set callback to the affine slice `{x_k = v}`, the base-problem
+# leaf of one dimension-reduction step. The slice is an isometric embedding of
+# the base into ℝᴰ (`‖_insert_axis(y, k, v) − _insert_axis(z, k, v)‖ = ‖y − z‖`),
+# so a Lipschitz constant of `f` bounds the restriction just as tightly and is
+# carried through unchanged.
+_restrict(g, k::Int, v) = x -> g(_insert_axis(x, k, v))
+function _restrict(g::_LipschitzLeaf, k::Int, v)
+    return _LipschitzLeaf(x -> g.f(_insert_axis(x, k, v)), g.lipschitz)
 end
 
 # Pick a height axis and report whether it is certifiably graph-like. For each
@@ -364,8 +421,8 @@ function _implicit_quad(lsets, membership, U::AxisBox{D,T}, ctx::_QuadCtx, depth
     facelo, facehi = U.lower[k], U.upper[k]
     base = Any[]
     for g in active
-        push!(base, x -> g(_insert_axis(x, k, facelo)))
-        push!(base, x -> g(_insert_axis(x, k, facehi)))
+        push!(base, _restrict(g, k, facelo))
+        push!(base, _restrict(g, k, facehi))
     end
     bpts, bwts = _implicit_quad(base, Returns(true), Ub, ctx, 0)
 
@@ -397,7 +454,7 @@ function _implicit_surface(phi, U::AxisBox{D,T}, ctx::_QuadCtx, depth::Int) wher
 
     Ub = _remove_axis(U, k)
     facelo, facehi = U.lower[k], U.upper[k]
-    base = Any[x -> phi(_insert_axis(x, k, facelo)), x -> phi(_insert_axis(x, k, facehi))]
+    base = Any[_restrict(phi, k, facelo), _restrict(phi, k, facehi)]
     bpts, bwts = _implicit_quad(base, Returns(true), Ub, ctx, 0)
 
     pts = SVector{D,T}[]
@@ -429,9 +486,21 @@ function _quad_ctx(::Type{T}, gauss_points::Int, grad, max_subdiv::Int, scale::R
                     eps(T)^(3 // 4) * T(scale), sqrt(eps(T)))
 end
 
+# Pair each leaf callback with its Lipschitz bound, or pass the callbacks through
+# untouched when the caller opted out. The length check is worth an explicit
+# error: a silently truncated `zip` would certify the wrong leaves.
+function _certified_leaves(leaves::AbstractVector, lipschitz)
+    lipschitz === nothing && return collect(Any, leaves)
+    length(lipschitz) == length(leaves) ||
+        throw(DimensionMismatch("lipschitz has $(length(lipschitz)) entries but there are " *
+                                "$(length(leaves)) leaves"))
+    return Any[_certified(f, L) for (f, L) in zip(leaves, lipschitz)]
+end
+
 """
     implicit_volume_quadrature(leaves, membership, region; gauss_points,
-                               grad=nothing, max_subdiv=4) -> (points, weights)
+                               grad=nothing, max_subdiv=4, lipschitz=nothing)
+        -> (points, weights)
     implicit_volume_quadrature(phi, region; gauss_points, …) -> (points, weights)
 
 Return a quadrature rule `{(xₖ, wₖ)}` for the cut volume `Ω ∩ region`, so that
@@ -461,30 +530,44 @@ Arguments:
   - `max_subdiv`: subdivision-depth budget for non-graph-like cells. Beyond it
     the kernel force-reduces (the region stays correct; order degrades only at
     the unresolved feature).
+  - `lipschitz`: optional Lipschitz constants `Lᵢ` of the leaves
+    (`|fᵢ(x) − fᵢ(y)| ≤ Lᵢ‖x − y‖`) — a vector matching `leaves` in the
+    multi-component form, a scalar in the single-`phi` form, and `nothing`
+    (default) to opt out. `1.0` is the constant of a true signed-distance
+    function. See the sampling note below for what supplying it certifies.
 
-Feature detection is by point sampling: a leaf is pruned where it is uniformly
-signed at the box center and corners, and fiber roots are bracketed by a bounded
-scan. A feature — or a pair of roots — smaller than that sampling can be missed,
-so `region` should be sized below the smallest geometric feature. In the
-finite-cell pipeline the cell classifier sizes cut cells by
-`subcell_length_scale` and shares the same sampling, so a sub-cell feature is
-consistently never routed here.
+Feature detection is by point sampling unless `lipschitz` is supplied: a leaf is
+pruned where it is uniformly signed at the box center and corners, and fiber
+roots are bracketed by a bounded scan. A feature — or a pair of roots — smaller
+than that sampling can be missed, and a box in which *every* leaf is wrongly
+pruned is integrated as if it were uniformly inside or outside Ω, so without
+`lipschitz` the caller must size `region` below the smallest geometric feature.
+
+Passing `lipschitz` replaces the pruning heuristic by the certificate
+`|fᵢ(c)| > Lᵢ·r` at the box center `c` with `r` the half-diagonal — the same test
+the CSG cell classifier uses (`classify_cell`). It never prunes a leaf that does
+vary on the box, so a sub-`region` feature can no longer disappear; the fiber
+scan resolution is unaffected. The certificate is the *only* thing that makes the
+kernel safe on a `region` coarser than the geometry, at the cost of keeping more
+leaves active per box.
 """
 function implicit_volume_quadrature(leaves::AbstractVector, membership, region::AxisBox{D,T};
-                                    gauss_points::Int, grad=nothing, max_subdiv::Int=4) where {D,T}
+                                    gauss_points::Int, grad=nothing, max_subdiv::Int=4,
+                                    lipschitz=nothing) where {D,T}
     ctx = _quad_ctx(T, gauss_points, grad, max_subdiv, maximum(region.upper - region.lower))
-    return _implicit_quad(collect(Any, leaves), membership, region, ctx, 0)
+    return _implicit_quad(_certified_leaves(leaves, lipschitz), membership, region, ctx, 0)
 end
 
 function implicit_volume_quadrature(phi, region::AxisBox{D,T}; gauss_points::Int, grad=nothing,
-                                    max_subdiv::Int=4) where {D,T}
+                                    max_subdiv::Int=4, lipschitz=nothing) where {D,T}
     return implicit_volume_quadrature(Any[phi], x -> phi(x) <= 0, region; gauss_points, grad,
-                                      max_subdiv)
+                                      max_subdiv,
+                                      lipschitz=lipschitz === nothing ? nothing : Any[lipschitz])
 end
 
 """
-    implicit_surface_quadrature(phi, region; gauss_points, grad=nothing, max_subdiv=4)
-        -> (points, weights)
+    implicit_surface_quadrature(phi, region; gauss_points, grad=nothing, max_subdiv=4,
+                                lipschitz=nothing) -> (points, weights)
 
 Return a quadrature rule for the implicit surface `∂Ω ∩ region = {φ = 0} ∩
 region` of a single level set `phi`, so that
@@ -492,10 +575,16 @@ region` of a single level set `phi`, so that
 arguments as [`implicit_volume_quadrature`](@ref); each base node contributes
 its fiber root with the height-graph surface element `|∇φ| / |∂φ/∂x_{d*}|`.
 Defined for `D ≥ 2`.
+
+`lipschitz` is the scalar Lipschitz constant of `phi`. It matters here for the
+same reason as in the volume rule: the recursion returns an empty rule as soon as
+`phi` samples uniformly signed on `region`, so without the certificate a piece of
+`{φ = 0}` smaller than the sample spacing is reported as no surface at all.
+`nothing` (default) keeps the uncertified sampling behavior.
 """
 function implicit_surface_quadrature(phi, region::AxisBox{D,T}; gauss_points::Int, grad=nothing,
-                                     max_subdiv::Int=4) where {D,T}
+                                     max_subdiv::Int=4, lipschitz=nothing) where {D,T}
     D >= 2 || throw(ArgumentError("implicit_surface_quadrature requires D ≥ 2"))
     ctx = _quad_ctx(T, gauss_points, grad, max_subdiv, maximum(region.upper - region.lower))
-    return _implicit_surface(phi, region, ctx, 0)
+    return _implicit_surface(_certified(phi, lipschitz), region, ctx, 0)
 end

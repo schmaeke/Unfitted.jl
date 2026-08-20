@@ -251,7 +251,12 @@ The moments and candidate points come from the Saye implicit-quadrature kernel
 ([`implicit_volume_quadrature`](@ref)) applied to `physical`'s CSG level set:
 the moments are exact (machine precision for linear leaves and polytope
 corners) and octree-depth-independent, and the volume-rule points serve as the
-candidate cloud. A single Lawson–Hanson NNLS solve then picks the non-negative
+candidate cloud. Each leaf's Lipschitz constant is forwarded to the kernel, so a
+geometric feature smaller than `region_box` is certified rather than sampled
+for — leaves left at the `leaf` default `Inf` keep the kernel's point-sampling
+heuristic and its sub-cell blind spot.
+
+A single Lawson–Hanson NNLS solve then picks the non-negative
 weights — its active-set solution carries at most `nbasis` non-zeros, so the
 rule is already compressed to O(nbasis) points, and because the volume rule
 reproduces the moments with strictly positive weights a zero-residual
@@ -268,7 +273,14 @@ function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T},
     target = T(target_residual)
     q0 = _implicit_gauss_points(moment_order)
     max_subdiv = _effective_subcell_depth(physical, region_box)
-    leaf_fs = Any[l.f for l in _leaves(physical.geometry)]
+    # Hand the kernel each leaf's Lipschitz constant, not just its callback: the
+    # region box is a whole mesh cell, which may be much coarser than the
+    # geometry, and only the certificate keeps a sub-cell feature (a hole well
+    # inside the cell) from being pruned away and the cell integrated as solid.
+    # Leaves built with the `leaf` default `Inf` fall back to point sampling.
+    leaves = _leaves(physical.geometry)
+    leaf_fs = Any[l.f for l in leaves]
+    leaf_ls = Float64[l.lipschitz for l in leaves]
     membership = x -> _inside(physical.geometry, x)
 
     best_pts = SVector{D,T}[]
@@ -278,8 +290,9 @@ function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T},
         # Exact moments at q0; denser candidate clouds on retry improve NNLS
         # conditioning without changing the (already exact) moments.
         q = q0 + (attempt - 1)
-        pts_vol, w_vol = implicit_volume_quadrature(leaf_fs, membership, region_box; gauss_points=q,
-                                                    max_subdiv=max_subdiv)
+        pts_vol, w_vol = implicit_volume_quadrature(leaf_fs, membership, region_box;
+                                                    gauss_points=q, max_subdiv=max_subdiv,
+                                                    lipschitz=leaf_ls)
         isempty(pts_vol) && return SVector{D,T}[], T[], zero(T)
         moments = _moments_from_rule(pts_vol, w_vol, region_box, moment_order)
         candidates = _cap_candidates(pts_vol, moment_order)

@@ -130,6 +130,32 @@ end
     end
 end
 
+@testset "FCM — a sub-cell hole is not swallowed by the cut-cell rule" begin
+    # Regression. `moment_fit_rule` runs on the *region* box — a whole mesh cell
+    # — which is routinely coarser than the geometry. A hole strictly inside the
+    # cell that misses its centre and every corner used to prune out of the
+    # implicit kernel, so the cell came back integrated as solid (weights summing
+    # to the full cell volume) with a machine-zero fit residual: a silent,
+    # one-sided over-integration that no diagnostic reported. Forwarding each
+    # leaf's Lipschitz constant certifies the sign instead of sampling it.
+    region = box((0.0, 0.0), (1.0, 1.0))
+    order = (3, 3)
+    phi = x -> 0.16 - hypot(x[1] - 0.25, x[2] - 0.25)      # Ω = outside the disc
+    p = physical_domain(leaf(phi; lipschitz=1.0); subcell_length_scale=0.1)
+    @test classify_cell(p, region) === :cut
+    _, ws, res = Unfitted.moment_fit_rule(p, region, order; target_residual=1.0e-10)
+    @test res < 1.0e-9
+    @test all(>=(0), ws)
+    @test sum(ws) ≈ 1 - π * 0.16^2 atol = 1e-3
+
+    # The same geometry at the `leaf` default `lipschitz = Inf` keeps the
+    # documented uncertified behaviour: the hole stays invisible to the kernel.
+    q = physical_domain(leaf(phi); subcell_length_scale=0.1)
+    @test classify_cell(q, region) === :cut
+    _, wq, _ = Unfitted.moment_fit_rule(q, region, order; target_residual=1.0e-10)
+    @test sum(wq) ≈ 1.0 atol = 1e-10
+end
+
 @testset "FCM — exact moments are octree-depth-independent (3D)" begin
     # The implicit kernel ignores `subcell_length_scale` on smooth cells: a 3D
     # cut cell yields identical exact moments whether the octree would be shallow
