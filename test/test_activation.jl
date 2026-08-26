@@ -280,6 +280,27 @@ end
     @test all(bits[i, j] for i in 1:2, j in 1:4)
 end
 
+@testset "move! carries the caller's mask flips across" begin
+    # `move!` re-derives from the pre-fold problem, so the flips `activate!` /
+    # `deactivate!` recorded have to be recorded there too — otherwise moving
+    # one overlay silently reverts the caller's mask everywhere, including on
+    # levels the move does not touch.
+    bc = dirichlet(0.0; on=boundary(:all))
+    V = overlay(overlay(space(_OMEGA; cells=(8, 8), order=2), box((0.1, 0.1), (0.5, 0.5));
+                        cells=(4, 4), order=2),
+                box((0.5, 0.5), (0.9, 0.9)); cells=(4, 4), order=2)
+    model = prepare(poisson(V; source=1.0, dirichlet=[bc]))
+
+    deactivate!(model; level=2, cells=[CartesianIndex(1, 1)])
+    deactivate!(model; level=3, cells=[CartesianIndex(4, 4)])
+    move!(model; level=2, to=box((0.2, 0.2), (0.6, 0.6)))
+
+    @test !active_cells(model; level=2)[1, 1]   # flip on the moved level
+    @test count(active_cells(model; level=2)) == 15
+    @test !active_cells(model; level=3)[4, 4]   # flip on an untouched level
+    @test count(active_cells(model; level=3)) == 15
+end
+
 @testset "activating to all-on collapses to no-mask fast path" begin
     bc = dirichlet(0.0; on=boundary(:all))
     V = _safe_overlay(active=(b, i) -> i.I[1] <= 2)

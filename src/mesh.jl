@@ -563,6 +563,15 @@ end
 # cells kept active with α-scaled quadrature). The `_ClassifyCache` carries the
 # per-box classification verdicts so the region-level dispatcher in
 # `intersections.jl` can reuse them.
+#
+# Contract: `V` must be a *pre-fold* space — one whose level masks still mean
+# "what the caller asked for". The fold is an intersection
+# (`active .& .!fictitious`) and is not invertible, so applying it to its own
+# output can only remove cells: a cell dropped as fictitious at one overlay
+# position stays dropped after the overlay moves somewhere it would be inside
+# Ω. Callers that fold repeatedly over a model's lifetime must therefore keep
+# the pre-fold space and re-derive from it — see `Model.user_problem` and
+# `_moved_problem` in `model.jl`.
 function _apply_physical_fold(V::Space{D,T}, cache::_ClassifyCache{D,T}) where {D,T}
     V.physical === nothing && return V
     V.physical.keep_fictitious && return V

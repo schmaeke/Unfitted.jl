@@ -316,6 +316,41 @@ function AssemblyPattern(n, colptr, rowval, symmetric, key)
     AssemblyPattern(n, colptr, rowval, symmetric, key, Dict{UInt,Any}())
 end
 
+# ── Single-sided region-cache keys ────────────────────────────────────────────
+#
+# A single-sided region list (`FacetRegion`s for a `BoundarySelector`,
+# `SurfaceRegion`s for a `BoundaryMesh`) is built against exactly *one*
+# subdomain space: its parents live on that space's level-id block, so only
+# that space's fields ever evaluate on it (`region_parents`). On a coupled
+# problem the same `on=` target may legitimately be named by fields on
+# different subdomains — `boundary(axis=1, side=:upper)` is a face of every
+# subdomain that has one — and those are different sets of facets. Keying the
+# cache on the target alone therefore collapses them: the first referencing
+# form's space wins and every other subdomain's contribution is assembled
+# against geometry where its dofs do not exist, i.e. silently dropped.
+#
+# The key is the pair, and the two halves use the equality each half deserves:
+# a `BoundarySelector` is a *description* and matches by value; a `Space` (like
+# a `BoundaryMesh`) is an object whose identity is the package's own notion of
+# "a distinct discretisation" (`problem_spaces` deduplicates spaces by `===`).
+
+struct RegionKey
+    on::Any
+    space::Any
+end
+
+# Equality of two `on=` tags: a `BoundarySelector` by value, everything else
+# (`BoundaryMesh`, and any future tag) by object identity. `_on_hash` mirrors
+# it method for method — the two must agree or `RegionKey` breaks its `Dict`.
+_on_matches(a::BoundarySelector, b::BoundarySelector) = a == b
+_on_matches(a, b) = a === b
+
+_on_hash(on::BoundarySelector, h::UInt) = hash(on, h)
+_on_hash(on, h::UInt) = hash(objectid(on), h)
+
+Base.:(==)(a::RegionKey, b::RegionKey) = a.space === b.space && _on_matches(a.on, b.on)
+Base.hash(k::RegionKey, h::UInt) = _on_hash(k.on, hash(objectid(k.space), h))
+
 """
     Model{D,T,P}
 
@@ -324,9 +359,23 @@ Prepared problem, ready to assemble and solve. Mutable so that
 [`assemble!`](@ref) can update its state without forcing the caller to
 re-thread a fresh value through. Fields:
 
-  - `problem::P` — the underlying [`Problem`](@ref), possibly already
-    folded against a `PhysicalDomain` (cells outside Ω deactivated via
-    the strict-α path in `mesh.jl`'s `_apply_physical_fold`).
+  - `problem::P` — the *effective* [`Problem`](@ref): the one every
+    consumer reads, already folded against a `PhysicalDomain` (cells
+    outside Ω deactivated via the strict-α path in `mesh.jl`'s
+    `_apply_physical_fold`) and reindexed into disjoint level-id blocks.
+  - `user_problem::Problem{D,T}` — the *pre-fold* problem the caller
+    described, kept as the source the lifecycle mutators re-derive from.
+    It is the only record of what the user asked for: once the fold has
+    run, a level's `mask` no longer distinguishes a cell the caller
+    excluded from a cell the classifier found outside Ω, and the fold is
+    not invertible. [`move!`](@ref) and [`moved`](@ref) therefore relocate
+    the overlay on *this* problem and fold the result from scratch, so a
+    move is exactly a [`prepare`](@ref) at the new box; folding the
+    already-folded `problem` instead could only ever *shrink* the active
+    set, leaving cells the move puts back inside Ω permanently dropped.
+    Kept in step with `problem` by every mutator that changes something
+    the caller chose ([`activate!`](@ref) / [`deactivate!`](@ref)'s cell
+    flips, [`update_dirichlet!`](@ref)'s values) and by nothing else.
   - `version::Int` — bump counter for stale-solution detection. Every
     in-place mutation that invalidates the assembled state bumps this;
     a [`Solution`](@ref) carrying an older version raises on reuse.
@@ -346,18 +395,24 @@ re-thread a fresh value through. Fields:
     by every mutator.
   - `rhs::Union{Nothing,Vector{T}}` — assembled right-hand side. Same
     invalidation contract as `matrix`.
-  - `facet_regions::Dict{BoundarySelector,Vector{FacetRegion{D,T}}}` —
-    per-selector cache of physical-boundary [`FacetRegion`](@ref)s. One
-    entry per `BoundarySelector` referenced by a Dirichlet condition
-    or by any `block`/`loadform` carrying `on::BoundarySelector`.
-    Populated at `prepare` and refreshed by every mutator.
-  - `surface_regions::IdDict{Any,Vector{SurfaceRegion{D,T}}}` — per-mesh
-    cache of immersed-boundary [`SurfaceRegion`](@ref)s. One entry per
-    [`BoundaryMesh`](@ref) referenced by a `block`/`loadform` carrying
-    `on::BoundaryMesh`. Keyed by object identity (the `BoundaryMesh`
-    value carries no canonical hash; identity match prevents two
-    structurally-equal but distinct meshes from accidentally sharing
-    a cache entry).
+  - `facet_regions::Dict{RegionKey,Vector{FacetRegion{D,T}}}` — cache of
+    physical-boundary [`FacetRegion`](@ref)s, keyed by
+    `RegionKey(selector, space)`. One entry per
+    `BoundarySelector` **per subdomain space** that names it, whether
+    through a Dirichlet condition or a `block`/`loadform` carrying
+    `on::BoundarySelector`. The space is part of the key because a
+    region list lives on one space's level-id block: two subdomains
+    naming a value-equal selector own different facets and must not
+    share an entry. Populated at `prepare` and refreshed by every
+    mutator.
+  - `surface_regions::Dict{RegionKey,Vector{SurfaceRegion{D,T}}}` — cache
+    of immersed-boundary [`SurfaceRegion`](@ref)s, keyed the same way by
+    `RegionKey(mesh, space)`. One entry per [`BoundaryMesh`](@ref) per
+    subdomain space naming it through a `block`/`loadform` carrying
+    `on::BoundaryMesh`. The mesh half of the key matches by object
+    identity (the `BoundaryMesh` value carries no canonical hash;
+    identity match prevents two structurally-equal but distinct meshes
+    from accidentally sharing a cache entry).
   - `interface_regions::IdDict{Any,Vector{InterfaceRegion{D,T}}}` —
     per-interface cache of two-sided [`InterfaceRegion`](@ref)s. One
     entry per [`Interface`](@ref) referenced by a coupling `block`
@@ -384,13 +439,14 @@ re-thread a fresh value through. Fields:
 """
 mutable struct Model{D,T,P}
     problem::P
+    user_problem::Problem{D,T}
     version::Int
     space_plans::Vector{IntegrationPlan{D,T}}
     dofs::SystemLayout{D,T}
     matrix::Union{Nothing,SparseMatrixCSC{T,Int}}
     rhs::Union{Nothing,Vector{T}}
-    facet_regions::Dict{BoundarySelector,Vector{FacetRegion{D,T}}}
-    surface_regions::IdDict{Any,Vector{SurfaceRegion{D,T}}}
+    facet_regions::Dict{RegionKey,Vector{FacetRegion{D,T}}}
+    surface_regions::Dict{RegionKey,Vector{SurfaceRegion{D,T}}}
     interface_regions::IdDict{Any,Vector{InterfaceRegion{D,T}}}
     dirichlet_projections::Dict{Symbol,DirichletProjection{D,T}}
     diagnostics::AssemblyDiagnostics
@@ -546,102 +602,79 @@ function prepare(problem::Problem{D,T}; kwargs...) where {D,T}
                                surface_region_count=_region_count(surface_regions),
                                interface_region_count=_region_count(interface_regions))
     _set_plan_stats_multi!(diag, space_plans)
-    return Model{D,T,typeof(effective_problem)}(effective_problem, 1, space_plans, layout, nothing,
-                                                nothing, facet_regions, surface_regions,
+    return Model{D,T,typeof(effective_problem)}(effective_problem, problem, 1, space_plans, layout,
+                                                nothing, nothing, facet_regions, surface_regions,
                                                 interface_regions,
                                                 Dict{Symbol,DirichletProjection{D,T}}(), diag,
                                                 nothing, plan_options)
 end
 
-# Build the facet-region cache for a problem from every
-# `BoundarySelector` it references: Dirichlet conditions and any
-# block/load carrying `on::BoundarySelector`. Each unique selector is
-# resolved through `_facet_regions_for_selector` and stored in the
-# returned dict. Selectors without any admissible regions (e.g. an
-# overlay-only level mask emptying a face) end up with an empty list,
-# not absent — callers can distinguish "selector with no regions" from
-# "selector never referenced".
+# Build the facet-region cache for a problem from every *site* that references
+# a `BoundarySelector`: Dirichlet conditions and any block/load carrying
+# `on::BoundarySelector`. Each site contributes the pair (selector, the space of
+# the field naming it), and each distinct pair is resolved through
+# `_facet_regions_for_selector` and stored. Two subdomains naming a value-equal
+# selector get two entries — their own facets each — which is the whole point
+# of keying on the pair. Pairs without any admissible regions (e.g. an
+# overlay-only level mask emptying a face) end up with an empty list, not
+# absent — callers can distinguish "selector with no regions" from "selector
+# never referenced".
 function _resolve_facet_regions(problem::Problem{D,T}, tolerance::GeometryTolerance{T}) where {D,T}
-    regions = Dict{BoundarySelector,Vector{FacetRegion{D,T}}}()
-    for selector in _referenced_facet_selectors(problem)
-        haskey(regions, selector) && continue
-        regions[selector] = _facet_regions_for_selector(_facet_selector_space(problem, selector),
-                                                        selector, tolerance)
+    regions = Dict{RegionKey,Vector{FacetRegion{D,T}}}()
+    for (selector, space) in _referenced_facet_sites(problem)
+        key = RegionKey(selector, space)
+        haskey(regions, key) && continue
+        regions[key] = _facet_regions_for_selector(space, selector, tolerance)
     end
     return regions
 end
 
-# Whether a form's `on` tag refers to the same single-sided boundary target.
-# A `BoundarySelector` matches by value (`_selectors_equal`); a `BoundaryMesh`
-# matches by object identity (the surface-region cache keys on identity — see
-# the `Model` docstring). Dispatch is on the target so the caller need not know
-# which flavour it holds.
-_on_matches(on, target::BoundarySelector) = on isa BoundarySelector && _selectors_equal(on, target)
-_on_matches(on, target::BoundaryMesh) = on isa BoundaryMesh && on === target
-
-# The test-field space of the first block (then load) whose `on` tag matches
-# `target`, or `nothing` if no bilinear/linear form references it. Shared by the
-# facet-selector and surface-mesh region builders; blocks take precedence over
-# loads, matching the `on`-partition assembly order.
-function _on_test_space(problem::Problem, target)
-    for b in problem.blocks
-        _on_matches(b.on, target) && return _field_space(problem, b.test_name)
-    end
-    for l in problem.loads
-        _on_matches(l.on, target) && return _field_space(problem, l.test_name)
-    end
-    return nothing
+# Yields every (selector, space) *site* referenced in `problem`: one entry per
+# Dirichlet condition and per block/load carrying `on::BoundarySelector`, paired
+# with the space of the field that names it. A condition with `field === nothing`
+# (only legal on a single-field problem) and a form on a single-domain problem
+# both land on the one representative space, so the single-domain cache is
+# exactly what it was before the key grew a second half.
+function _referenced_facet_sites(problem::Problem)
+    return Iterators.flatten((((c.boundary, _condition_space(problem, c))
+                               for c in problem.dirichlet),
+                              ((b.on, _field_space(problem, b.test_name))
+                               for b in problem.blocks if b.on isa BoundarySelector),
+                              ((l.on, _field_space(problem, l.test_name))
+                               for l in problem.loads if l.on isa BoundarySelector)))
 end
 
-# The subdomain space a single-sided `on=BoundarySelector` facet must be built
-# against: the space of a field referencing it through a block, load, or
-# Dirichlet condition (in that precedence). For a single-domain problem this is
-# always the one space; a Dirichlet-only selector still resolves against the
-# constrained field's space, keeping the diagnostics consistent.
-function _facet_selector_space(problem::Problem, selector::BoundarySelector)
-    space = _on_test_space(problem, selector)
-    space === nothing || return space
-    for c in problem.dirichlet
-        (c.field !== nothing && _selectors_equal(c.boundary, selector)) &&
-            return _field_space(problem, c.field)
-    end
-    return problem.space
+# The subdomain space a Dirichlet condition constrains. `field === nothing` is
+# only reachable on a single-field problem (the multi-field constructors demand
+# a name), where the representative space *is* that field's space.
+function _condition_space(problem::Problem, condition)
+    condition.field === nothing ? problem.space : _field_space(problem, condition.field)
 end
 
-# Yields every `BoundarySelector` referenced anywhere in `problem`:
-# Dirichlet conditions and the `on` tags of blocks and loads.
-function _referenced_facet_selectors(problem::Problem)
-    return Iterators.flatten(((c.boundary for c in problem.dirichlet),
-                              (b.on for b in problem.blocks if b.on isa BoundarySelector),
-                              (l.on for l in problem.loads if l.on isa BoundarySelector)))
-end
-
-# Build the surface-region cache for a problem from every
-# `BoundaryMesh` referenced by a block or load's `on` tag. Keyed by
-# `IdDict` (object identity) — see the `Model` docstring for why.
+# Build the surface-region cache for a problem from every (mesh, space) site
+# referenced by a block or load's `on` tag, keyed like the facet cache — the
+# mesh half of the key by object identity (a `BoundaryMesh` value carries no
+# canonical hash, and identity match prevents two structurally-equal but
+# distinct meshes from accidentally sharing an entry), the space half likewise.
+# One mesh named by fields on two subdomains yields two entries, each cut
+# against its own grid; a genuine *two-sided* coupling across a mesh is an
+# [`Interface`](@ref), which carries both sides in one region.
 function _resolve_surface_regions(problem::Problem{D,T},
                                   tolerance::GeometryTolerance{T}) where {D,T}
-    regions = IdDict{Any,Vector{SurfaceRegion{D,T}}}()
-    for mesh in _referenced_boundary_meshes(problem)
-        haskey(regions, mesh) && continue
-        regions[mesh] = _surface_regions_for_mesh(_surface_mesh_space(problem, mesh), mesh,
-                                                  tolerance)
+    regions = Dict{RegionKey,Vector{SurfaceRegion{D,T}}}()
+    for (mesh, space) in _referenced_boundary_mesh_sites(problem)
+        key = RegionKey(mesh, space)
+        haskey(regions, key) && continue
+        regions[key] = _surface_regions_for_mesh(space, mesh, tolerance)
     end
     return regions
 end
 
-# The subdomain space a single-sided `on=BoundaryMesh` must be built against:
-# the space of a field referencing it through a block or load. A genuine
-# two-sided coupling uses [`Interface`](@ref); a bare `BoundaryMesh` shared by
-# fields on different spaces is rejected at assembly (`_partition_space`). For a
-# single-domain problem this is always the one space.
-function _surface_mesh_space(problem::Problem, mesh::BoundaryMesh)
-    something(_on_test_space(problem, mesh), problem.space)
-end
-
-function _referenced_boundary_meshes(problem::Problem)
-    return Iterators.flatten(((b.on for b in problem.blocks if b.on isa BoundaryMesh),
-                              (l.on for l in problem.loads if l.on isa BoundaryMesh)))
+function _referenced_boundary_mesh_sites(problem::Problem)
+    return Iterators.flatten((((b.on, _field_space(problem, b.test_name))
+                               for b in problem.blocks if b.on isa BoundaryMesh),
+                              ((l.on, _field_space(problem, l.test_name))
+                               for l in problem.loads if l.on isa BoundaryMesh)))
 end
 
 # Build the interface-region cache for a problem from every `Interface`
@@ -772,11 +805,27 @@ function _assert_single_domain(model::Model, op::AbstractString)
     return nothing
 end
 
-# Rebuild the model's problem with overlay `level` moved to box `to`,
-# reusing the existing forms and boundary data on the moved space.
+# Rebuild the model's *user* problem with overlay `level` moved to box `to`,
+# reusing the existing forms and boundary data on the moved space. Shared by
+# `move!` and `moved`, both of which then hand the result to the same
+# fold → reindex → plan path `prepare` runs.
+#
+# The move starts from `model.user_problem`, never from the effective
+# `model.problem`. The effective problem's masks already carry the fictitious
+# fold computed at the *old* overlay position, and `_apply_physical_fold`
+# intersects (`active .& .!fictitious`), so folding it a second time can only
+# ever remove cells: a cell dropped because the old box put it outside Ω would
+# stay dropped after a move that puts it wholly inside. Re-deriving from the
+# pre-fold problem makes `move!` reproduce `prepare` at the new box exactly —
+# which is the contract both mutators advertise — and it is why the model
+# carries `user_problem` at all.
+#
+# Both callers are single-domain (`_assert_single_domain`), so the
+# representative `user_problem.space` is *the* space and `_problem_with_space`
+# re-homes every field onto the moved copy without ambiguity.
 function _moved_problem(model::Model{D,T}, level::Integer, to::AxisBox{D,T}, tolerance) where {D,T}
-    return _problem_with_space(model.problem,
-                               moved_space(model.problem.space; level, to, tolerance))
+    return _problem_with_space(model.user_problem,
+                               moved_space(model.user_problem.space; level, to, tolerance))
 end
 
 # Shared invalidation tail for `move!` / `_update_mask!`. Clears the
@@ -836,6 +885,7 @@ function move!(model::Model{D,T}; level::Integer, to::AxisBox{D,T}) where {D,T}
     # rebuilt identically instead of hand-rolled.
     effective_problem, spaces, caches = _prepare_spaces(moved_p)
     model.problem = effective_problem
+    model.user_problem = moved_p
     model.version += 1
     model.space_plans = IntegrationPlan{D,T}[integration_plan(spaces[i]; opts...,
                                                               classify_cache=caches[i])
@@ -855,18 +905,29 @@ the source of a [`transfer`](@ref):
 
     target = moved(model; level=2, to=box((0.1,), (0.6,)))
     target_solution = transfer(solution, model, target)
+
+Like [`move!`](@ref), `moved` addresses the level by its position in the
+model's single space and is therefore restricted to single-domain models;
+on a coupled model it throws `ArgumentError`.
 """
 function moved(model::Model{D,T}; level::Integer, to::AxisBox{D,T}) where {D,T}
+    # Same restriction as `move!`, and for the same reason: `level` indexes one
+    # space's level tuple, which is ambiguous once a problem spans several
+    # subdomain spaces. Without this guard `_problem_with_space` re-homes *every*
+    # field onto the first subdomain's moved space — a coupled model silently
+    # collapses to one domain, every field moves to subdomain 1's geometry, and
+    # the result still solves.
+    _assert_single_domain(model, "moved")
     opts = model.plan_options
     tolerance = get(opts, :tolerance, GeometryTolerance(T))
     return prepare(_moved_problem(model, level, to, tolerance); opts...)
 end
 
-# Rebuild the model's problem with one level's mask replaced. Symmetric
-# to `_moved_problem` but swaps the mask instead of the mesh.
-function _remasked_problem(model::Model, level_index::Integer, mask)
-    return _problem_with_space(model.problem,
-                               _remasked_space(model.problem.space, level_index, mask))
+# Rebuild `problem` with one level's mask replaced. Symmetric to
+# `_moved_problem` but swaps the mask instead of the mesh. Applied to both of
+# the model's problems by `_update_mask!`, each with its own mask.
+function _remasked_problem(problem::Problem, level_index::Integer, mask)
+    return _problem_with_space(problem, _remasked_space(problem.space, level_index, mask))
 end
 
 # Activate / deactivate `cells` on `level_index` and rebuild the
@@ -882,7 +943,21 @@ function _update_mask!(model::Model{D,T}, level_index::Integer, cells, value::Bo
     tolerance = get(opts, :tolerance, GeometryTolerance(T))
     old_level = model.problem.space.levels[level_index]
     new_mask = _apply_mask_update(old_level.mask, old_level.mesh, cells, value)
-    model.problem = _remasked_problem(model, level_index, new_mask)
+    model.problem = _remasked_problem(model.problem, level_index, new_mask)
+    # Record the same flip on the pre-fold problem, applied to the *user* mask
+    # rather than to the effective one. Two masks, two meanings, updated
+    # independently: `problem` keeps the documented "operates on the effective
+    # mask" semantics (activating a fictitious cell overrides the geometry
+    # here and now), while `user_problem` keeps a record of the caller's own
+    # choices for the next `move!` to fold afresh. Copying the effective mask
+    # across instead would launder fold-derived deactivations into user intent
+    # and re-create the very bug `_moved_problem` documents; not updating it at
+    # all would make the next `move!` silently discard the caller's flips —
+    # including flips on levels the move does not touch.
+    user_level = model.user_problem.space.levels[level_index]
+    model.user_problem = _remasked_problem(model.user_problem, level_index,
+                                           _apply_mask_update(user_level.mask, user_level.mesh,
+                                                              cells, value))
     model.version += 1
     model.space_plans = [integration_plan(model.problem.space; opts...)]
     model.dofs = system_layout(model.problem; tolerance)
@@ -1018,6 +1093,13 @@ function update_dirichlet!(model::Model{D,T}, dirichlet) where {D,T}
     # symmetric flag were already checked when the model was prepared.
     p = model.problem
     model.problem = typeof(p)(p.space, p.fields, p.blocks, p.loads, new_dirichlet, p.symmetric)
+    # Mirror the new values onto the pre-fold problem too: the Dirichlet data is
+    # a user choice, so a later `move!` — which re-derives from `user_problem` —
+    # must carry the current values across, not silently revert to the ones
+    # `prepare` was handed.
+    up = model.user_problem
+    model.user_problem = typeof(up)(up.space, up.fields, up.blocks, up.loads, new_dirichlet,
+                                    up.symmetric)
 
     # Re-project values into each field's existing DofLayout. The
     # constrained-dof set is unchanged, so `_project_dirichlet_values!`

@@ -524,11 +524,12 @@ function main()
     # ── 15 ── Multi-domain product space, no interface: the block-diagonal
     #          invariant. Insensitive to #9 (no surface geometry at all).
     case(15, "d2-coupled-product", "MUST-NOT-CHANGE",
-         note="facet_region_count (24) and nquadpoints.facet (72) are structural probes of " *
-              "the cache #1 re-keys: the two homogeneous `boundary(:all)` conditions are " *
-              "value-equal, so today both resolve to subdomain 1's 3x3 geometry and the " *
-              "counts read 2x12 rather than 12+8. Fix #1 should move them to 20 and 60 and " *
-              "move nothing else in this case.")
+         note="facet_region_count and nquadpoints.facet are structural probes of the cache " *
+              "#1 re-keyed: before that fix the two value-equal `boundary(:all)` conditions " *
+              "both resolved to subdomain 1's 3x3 geometry, so the counts read 2x12 = 24 and " *
+              "2x36 = 72 rather than 12+8 and 36+32. They now read 20 and 68 — V1 is order 2 " *
+              "(3 points per facet) but V2 is order 3 (4 points), so 12x3 + 8x4 = 68. Nothing " *
+              "else in this case may move.")
     let V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2),
         V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(2, 2), order=3),
         u1 = field(:u1, V1),
@@ -553,10 +554,11 @@ function main()
     #          projection as well.
     case(16, "d2-coupled-dirichlet-lift", "MUST-NOT-CHANGE",
          note="facet_cache_keys (2), facet_region_count (16) and nquadpoints.facet (48) are " *
-              "structural probes of the same cache: today both selectors resolve to " *
-              "subdomain 1's 2x2 geometry, so the counts read 2x8 rather than 8+12. Fix #1 " *
-              "should move them to 20 and 60. Every other value here — above all the four " *
-              "sample values and max_error_vs_exact — must stay bit-identical.")
+              "structural probes of the same cache: before #1 both selectors resolved to " *
+              "subdomain 1's 2x2 geometry, so the counts read 2x8 = 16 and 2x24 = 48 rather " *
+              "than 8+12 and 24+36. They now read 20 and 60 (both subdomains order 2). Every " *
+              "other value here — above all the four sample values and max_error_vs_exact — " *
+              "must stay bit-identical.")
     let V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2),
         V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(3, 3), order=2),
         u1 = field(:u1, V1),
@@ -820,8 +822,14 @@ function main()
             emit(tag * ".error_vs_exact", total - exact_area)
         end
         emit("exact_area", exact_area)
-        report("kwarg_on_tree",
-               physical_domain(leaf(phi); lipschitz=1.0, subcell_length_scale=0.1))
+        # The discarding combination is what #8 rejects, so this one is built
+        # under `attempt`: before the fix it constructs and reports the wrong
+        # integral below, after the fix it throws and there is nothing to report.
+        # Every other configuration here is legal on both sides of the fix.
+        kwarg_on_tree = attempt("kwarg_on_tree.construct",
+                                () -> physical_domain(leaf(phi); lipschitz=1.0,
+                                                      subcell_length_scale=0.1))
+        kwarg_on_tree === nothing || report("kwarg_on_tree", kwarg_on_tree)
         report("leaf_carries_L",
                physical_domain(leaf(phi; lipschitz=1.0); subcell_length_scale=0.1))
         report("callable", physical_domain(phi; lipschitz=1.0, subcell_length_scale=0.1))

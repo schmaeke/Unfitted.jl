@@ -135,9 +135,16 @@ end
     load = loadform(u, source_form(source=0.0); on=mesh)
     model = prepare(Problem((u,); loads=(load,)))
 
+    # One entry, keyed on (mesh, space): the mesh half matches by object
+    # identity, the space half is the subdomain the regions were cut against —
+    # here the model's only space.
     @test length(model.surface_regions) == 1
-    @test haskey(model.surface_regions, mesh)
-    @test diagnostics(model).surface_region_count == length(model.surface_regions[mesh])
+    key = only(keys(model.surface_regions))
+    @test key.on === mesh
+    @test key.space === model.problem.space
+    @test haskey(model.surface_regions, Unfitted.RegionKey(mesh, model.problem.space))
+    @test diagnostics(model).surface_region_count ==
+          length(model.surface_regions[Unfitted.RegionKey(mesh, model.problem.space)])
     @test nquadpoints(model; kind=:surface) > 0
 end
 

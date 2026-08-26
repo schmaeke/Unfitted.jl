@@ -36,6 +36,24 @@ struct BoundarySelector
     sides::Vector{Tuple{Int,Symbol}}
 end
 
+# Value semantics for `BoundarySelector`. A selector is a *description* of a
+# facet, not an object with an identity: `boundary(axis=1, side=:upper)` written
+# twice names the same face both times, and every consumer that reasons about
+# selectors — `_selector_matches`, `_facet_regions_for_selector`,
+# `update_dirichlet!`'s structural check — already compares them by value.
+#
+# The default `==` on a struct carrying a `Vector` falls back to `===`, and the
+# default `hash` to `objectid`, so without these two methods a selector is
+# identity-keyed in every `Dict`: two value-equal selectors are distinct keys,
+# a freshly built selector can never hit a cache populated at `prepare`, and the
+# identity-based and value-based halves of region resolution disagree about
+# which selectors are the same one. `sides` is hashed by value (Julia hashes a
+# `Vector` element-wise), matching the element-wise `==` below; the elements are
+# isbits tuples, so both are exact.
+Base.:(==)(a::BoundarySelector, b::BoundarySelector) = a.selector === b.selector &&
+                                                       a.sides == b.sides
+Base.hash(s::BoundarySelector, h::UInt) = hash(s.sides, hash(s.selector, hash(:BoundarySelector, h)))
+
 """
     DirichletCondition(value, boundary, field, component)
 
@@ -814,16 +832,12 @@ function _needs_dirichlet_projection(dirichlet)
     return any(condition -> !(condition.value isa Number && iszero(condition.value)), dirichlet)
 end
 
-# True iff `a` and `b` pick out the same physical facet. The default
-# `==` on a struct that carries a `Vector` field falls back to `===`,
-# so we unfold by hand: Symbol `===` short-circuits, then `Vector ==`
-# does the element-by-element compare on the `(axis, side)` tuples
-# (which are isbits, so `==` is bit-equality). Used by
-# `update_dirichlet!`'s structural check; the function itself lives
-# in `src/model.jl`.
-function _selectors_equal(a::BoundarySelector, b::BoundarySelector)
-    return a.selector === b.selector && a.sides == b.sides
-end
+# True iff `a` and `b` pick out the same physical facet. Named alias for the
+# value `==` defined next to `BoundarySelector` above, kept because it reads as
+# a predicate at the call sites that ask the question in those words (e.g.
+# `update_dirichlet!`'s structural check, whose function lives in
+# `src/model.jl`).
+_selectors_equal(a::BoundarySelector, b::BoundarySelector) = a == b
 
 # Cheap structural compatibility check. Re-projecting Dirichlet values
 # in place is only valid when the *set* of constrained dofs is

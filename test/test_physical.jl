@@ -39,6 +39,51 @@ using LinearAlgebra
     @test isinf(p2.geometry.lipschitz)
 end
 
+@testset "physical_domain rejects a Lipschitz constant it cannot apply" begin
+    # Regression. `physical_domain(tree; lipschitz=L)` used to drop `L` on the
+    # floor: the keyword only ever reached the auto-wrap of a bare callable, so
+    # with a `LevelSet` argument it was neither applied nor validated. The leaf
+    # then ran uncertified, the kernel pruned it on any cell box whose corners
+    # miss its feature, and a hole smaller than the cell integrated away in
+    # silence — `:cut` classification, round-off fit residual, and 8 % too much
+    # volume (the certified/uncertified split itself is pinned in test_fcm.jl).
+    phi = x -> 0.16 - hypot(x[1] - 0.25, x[2] - 0.25)   # Ω = the square minus a disc
+
+    # The combination that loses the certificate — a constant supplied for a
+    # tree with a leaf that carries none — is rejected, and the message names
+    # the remedy rather than the mistake.
+    err = try
+        physical_domain(leaf(phi); lipschitz=1.0, subcell_length_scale=0.1)
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("leaf(f; lipschitz=1.0)", err.msg)   # the remedy
+    # One uncertified leaf anywhere in a CSG combination is enough.
+    @test_throws ArgumentError physical_domain(setdiff(leaf(x -> hypot(x...) - 0.45;
+                                                            lipschitz=1.0), leaf(phi));
+                                               lipschitz=1.0, subcell_length_scale=0.1)
+
+    # Positivity is checked on every path now, not only on the auto-wrap: the
+    # tree path used to accept a constant the callable path throws on.
+    @test_throws ArgumentError physical_domain(leaf(phi); lipschitz=0.0,
+                                               subcell_length_scale=0.1)
+    @test_throws ArgumentError physical_domain(leaf(phi); lipschitz=-1.0,
+                                               subcell_length_scale=0.1)
+
+    # What stays legal, because no information is lost. A tree whose leaves all
+    # carry their own constant is simply unaffected by the keyword…
+    both = intersect(leaf(x -> x[1] - 0.5; lipschitz=1.0), leaf(x -> x[2] - 0.5; lipschitz=2.0))
+    @test physical_domain(both; lipschitz=1.0, subcell_length_scale=0.1).geometry === both
+    @test physical_domain(leaf(phi; lipschitz=1.0); lipschitz=1.0,
+                          subcell_length_scale=0.1).geometry.lipschitz == 1.0
+    # …and the default `Inf` on an uncertified tree is the documented
+    # corner-sampling path, so it must not be caught by the new check.
+    @test isinf(physical_domain(leaf(phi); subcell_length_scale=0.1).geometry.lipschitz)
+    @test isinf(physical_domain(leaf(phi); lipschitz=Inf,
+                                subcell_length_scale=0.1).geometry.lipschitz)
+end
+
 @testset "CSG level-set constructors" begin
     # leaf wraps a callable; per-leaf Lipschitz is validated on the leaf.
     @test leaf(x -> x[1]) isa Unfitted.Leaf
@@ -334,6 +379,53 @@ end
     # Move the overlay to the right (entirely outside Ω) → all cells fictitious.
     move!(m; level=2, to=box((0.6, 0.3), (0.9, 0.7)))
     @test !any(active_cells(m; level=2))   # all overlay cells inactive
+end
+
+@testset "move! folds the user mask, not the mask the previous fold produced" begin
+    # The fictitious fold is an intersection (`active .& .!fictitious`), so
+    # applying it to its own output can only ever *shrink* the active set: a
+    # cell dropped because the overlay's old position put it outside Ω would
+    # stay dropped after a move that puts it wholly inside. `move!` therefore
+    # has to re-derive from the pre-fold problem, and the moved model must be
+    # indistinguishable from a fresh `prepare` at the destination box.
+    #
+    # The geometry is chosen so the fold verdict genuinely differs between the
+    # two positions: Ω is a disk in the lower-left corner, `outside` misses it
+    # entirely and `inside` meets every overlay cell. Moving between two boxes
+    # that both overlap Ω shows nothing, because there the stale mask happens
+    # to be right at both ends.
+    p = physical_domain(x -> hypot(x[1] - 0.25, x[2] - 0.25) - 0.28; lipschitz=1.0,
+                        subcell_length_scale=1 / 32, max_depth=4)
+    outside = box((0.55, 0.55), (0.95, 0.95))
+    inside = box((0.05, 0.05), (0.45, 0.45))
+    # Stiffness + mass, so the operator is nonsingular without a Dirichlet
+    # condition and the comparison is over the raw assembled system.
+    build = target -> begin
+        V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=p),
+                    target; cells=(2, 2), order=2)
+        u = field(:u, V)
+        prepare(Problem((u,); blocks=(stiffness_block(u), mass_block(u)),
+                        loads=(source_load(u; source=1.0),)))
+    end
+
+    model = build(outside)
+    @test !any(active_cells(model; level=2))     # the whole overlay is fictitious
+
+    move!(model; level=2, to=inside)
+    direct = build(inside)
+
+    # Guards the guard: if the destination did not free any overlay cell the
+    # assertions below would hold for the wrong reason.
+    @test all(active_cells(direct; level=2))
+    @test active_cells(model; level=2) == active_cells(direct; level=2)
+    @test active_unknowns(model) == active_unknowns(direct)
+    @test diagnostics(model).inactive_cell_counts == diagnostics(direct).inactive_cell_counts
+    @test diagnostics(model).integration_regions == diagnostics(direct).integration_regions
+    @test diagnostics(model).reduced_mode_counts == diagnostics(direct).reduced_mode_counts
+    assemble!(model)
+    assemble!(direct)
+    @test model.matrix == direct.matrix
+    @test model.rhs == direct.rhs
 end
 
 # --- Region-level classification and α-FCM ---

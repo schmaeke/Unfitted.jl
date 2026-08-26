@@ -13,6 +13,42 @@ using LinearAlgebra
     @test dirichlet(0.1; on=side, component=2).component == 2
 end
 
+@testset "BoundarySelector has value semantics" begin
+    # A selector is a *description* of a facet, not an object with an identity:
+    # two separately-constructed selectors naming the same facet must be equal,
+    # hash equally, and be one key in a Dict. Without this, every Dict keyed on
+    # a selector is identity-keyed, and the identity-based and value-based
+    # halves of facet-region resolution disagree about which selectors are the
+    # same one (which is how a coupled model silently drops a Neumann load).
+    a = boundary(axis=1, side=:upper)
+    b = boundary(axis=1, side=:upper)
+    @test a !== b                       # genuinely distinct objects
+    @test a == b
+    @test isequal(a, b)
+    @test hash(a) == hash(b)
+    @test length(Dict(a => 1, b => 2)) == 1
+
+    # ...and selectors naming different facets stay distinct.
+    @test boundary(axis=1, side=:upper) != boundary(axis=1, side=:lower)
+    @test boundary(axis=1, side=:upper) != boundary(axis=2, side=:upper)
+    @test boundary(:all) != boundary(axis=1, side=:upper)
+    @test length(Dict(boundary(:all) => 1, boundary(axis=1, side=:lower) => 2)) == 2
+
+    # Multi-side selectors compare element-wise, and order is part of the value.
+    corner = boundary((axis=1, side=:lower), (axis=2, side=:lower))
+    @test corner == boundary((axis=1, side=:lower), (axis=2, side=:lower))
+    @test hash(corner) == hash(boundary((axis=1, side=:lower), (axis=2, side=:lower)))
+    @test corner != boundary((axis=1, side=:lower))
+
+    # `sides` is a Vector, so hashing must be by value, not by the vector's
+    # identity — a fresh selector must find a cache entry a prepared model made.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    model = prepare(poisson(V; source=0.0,
+                            dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:upper))]))
+    @test haskey(model.facet_regions,
+                 Unfitted.RegionKey(boundary(axis=1, side=:upper), model.problem.space))
+end
+
 @testset "per-component Dirichlet frees the other components" begin
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
     u = field(:u, V; components=2)

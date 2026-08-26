@@ -903,7 +903,7 @@ end
 # physical-frame Q-points and weights.
 
 """
-    boundary_integral(integrand, model::Model; on) -> result
+    boundary_integral(integrand, model::Model; on, field=nothing) -> result
 
 Integrate a user callback over a portion of the boundary.
 
@@ -931,13 +931,31 @@ Integrate a user callback over a portion of the boundary.
     facet identifier on a `BoundarySelector` integration; `nothing` on
     a `BoundaryMesh` integration (no facet `(axis, side)` exists).
 
+`field` names the subdomain to integrate over on a multi-domain
+(coupled) model. Each subdomain carries its own discretisation and its
+own boundary, so `on` alone does not identify a set of facets there:
+`boundary(axis=1, side=:upper)` is a face of every subdomain that has
+one. Naming a field selects that field's space and integrates over its
+boundary. On a single-domain model `field` is unnecessary and defaults
+to the only space.
+
+Omitting `field` on a multi-domain model raises. The alternative
+defaults are both wrong rather than merely inconvenient: returning one
+subdomain's answer is silent and arbitrary (it depends on which form
+happens to reference the selector first), and summing the subdomains
+does not give `∂Ω` either — an interface shared by two subdomains lies
+in both `∂Ω₁` and `∂Ω₂` while belonging to neither's physical boundary,
+so the sum double-counts what it should omit. This matches the package's
+existing policy for entry points whose meaning needs a subdomain
+([`move!`](@ref), [`activate!`](@ref), [`foreach_quadrature_point`](@ref)).
+
 The accumulator is `result += q.weight * integrand(q)`; the result
 type is whatever `q.weight * integrand(q)` yields on the first
 sample. Throws `ArgumentError` if no admissible region exists on the
 selected portion of the boundary.
 """
-function boundary_integral(integrand, model::Model; on)
-    regions = _resolve_on_regions(model, on)
+function boundary_integral(integrand, model::Model; on, field::Union{Nothing,Symbol}=nothing)
+    regions = _resolve_on_regions(model, on, _boundary_integral_space(model, field))
     result = nothing
     samples = 0
     for region in regions
@@ -951,6 +969,20 @@ function boundary_integral(integrand, model::Model; on)
     samples == 0 && throw(ArgumentError("no admissible boundary regions for on=$(on); " *
                                         "check the selector or mesh and any level masks"))
     return result
+end
+
+# The subdomain space a `boundary_integral` acts on. A named `field` picks its
+# space; without one, a single-domain model has exactly one answer and a
+# multi-domain model has none, so it raises rather than pick — see the
+# `boundary_integral` docstring for why neither silent default is defensible.
+function _boundary_integral_space(model::Model, field::Union{Nothing,Symbol})
+    field === nothing || return _field_space(model.problem, field)
+    length(problem_spaces(model.problem)) == 1 && return model.problem.space
+    names = join((":" * String(f.name) for f in model.problem.fields), ", ")
+    throw(ArgumentError("boundary_integral on a multi-domain (coupled) model must name the " *
+                        "subdomain to integrate over: pass field=… (one of $names). Each " *
+                        "subdomain owns its own boundary, and their union is not their sum — " *
+                        "a shared interface lies in two subdomain boundaries and in neither ∂Ω"))
 end
 
 # Per-Q-point `q` tuple for facet vs. surface regions. The shape is

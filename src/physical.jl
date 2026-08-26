@@ -264,8 +264,11 @@ CSG tree (built from [`leaf`](@ref) and `intersect`/`union`/`setdiff`/
 [`complement`](@ref)) or a bare scalar callable `φ`, which is auto-wrapped as a
 single leaf with `Ω = {φ ≤ 0}` — preserving the single-level-set ergonomics
 `physical_domain(φ; lipschitz=…)`. The `lipschitz` keyword applies only to that
-auto-wrapped single leaf; for a CSG tree, set each leaf's Lipschitz constant on
-the `leaf(...)` call instead.
+auto-wrapped single leaf; a CSG tree carries one constant per leaf, so set it on
+the `leaf(...)` call instead. Passing a finite `lipschitz` together with a tree
+that has a leaf without its own constant is **rejected**, rather than silently
+ignored: the certificate the caller asked for would never be installed, and the
+uncertified leaf would then be integrated as if its feature were not there.
 
 `subcell_length_scale` is the **required** classifier accuracy / subdivision
 scale (see the [`PhysicalDomain`](@ref) docstring). `alpha = 0` is the
@@ -288,6 +291,10 @@ function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0,
                          keep_fictitious::Bool=false, subcell_length_scale::Real,
                          max_depth::Integer=8, moment_order_factor::Integer=2,
                          target_residual::Real=1.0e-6, cut_quadrature=nothing)
+    # Validated here rather than only inside `leaf`, so the constraint holds on
+    # every path: with a tree argument the auto-wrap never runs, and `lipschitz`
+    # would otherwise reach no check at all.
+    lipschitz > 0 || throw(ArgumentError("lipschitz must be positive; got $lipschitz"))
     alpha >= 0 || throw(ArgumentError("alpha must be ≥ 0; got $alpha"))
     !(keep_fictitious && iszero(alpha)) ||
         throw(ArgumentError("keep_fictitious=true requires alpha > 0: fully-fictitious cells " *
@@ -301,7 +308,33 @@ function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0,
     target_residual > 0 ||
         throw(ArgumentError("target_residual must be positive; got $target_residual"))
     # A bare callable becomes a single leaf, honouring the `lipschitz` keyword;
-    # an explicit CSG tree carries per-leaf Lipschitz constants already.
+    # an explicit CSG tree carries per-leaf Lipschitz constants already, so the
+    # keyword has nowhere to go there. Only the combination that actually loses
+    # information is rejected — a finite constant supplied alongside a tree with
+    # a leaf that carries none — because that is the case where the caller asked
+    # for a certificate and would get none: the classifier and the quadrature
+    # kernel then fall back to corner sampling, prune the uncertified leaf on any
+    # box whose corners miss its feature, and integrate the cell as if the
+    # feature were not there, all while reporting `:cut` and a round-off fit
+    # residual. Rejecting is preferred over applying `L` to the leaves that lack
+    # one: a single constant is not generally valid for every leaf (scaling one
+    # leaf by 10 scales its constant by 10), and a constant that is too small
+    # certifies a uniform sign that does not hold — the same silent
+    # over-integration, now with the package's fingerprints on it. A tree whose
+    # leaves all carry their own constants is unaffected by the keyword, so
+    # passing one alongside such a tree stays legal.
+    if geometry isa LevelSet && !isinf(lipschitz)
+        ls = _leaves(geometry)
+        bare = count(l -> isinf(l.lipschitz), ls)
+        bare == 0 ||
+            throw(ArgumentError("lipschitz=$lipschitz was given with a LevelSet tree. A CSG " *
+                                "tree carries one Lipschitz constant per leaf, and this tree " *
+                                "has leaves without one ($bare of $(length(ls))). Set the " *
+                                "constant where it belongs, on the leaf: " *
+                                "leaf(f; lipschitz=$lipschitz). The physical_domain keyword " *
+                                "applies only to a bare callable φ, which is auto-wrapped as " *
+                                "a single leaf"))
+    end
     g = geometry isa LevelSet ? geometry : leaf(geometry; lipschitz=lipschitz)
     T = promote_type(typeof(float(alpha)), typeof(float(subcell_length_scale)),
                      typeof(float(target_residual)))

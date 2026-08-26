@@ -92,6 +92,43 @@ end
     @test_throws ArgumentError activate!(model; level=1, cells=[CartesianIndex(1, 1)])
 end
 
+@testset "moved is guarded on multi-domain models" begin
+    # `moved` shares `move!`'s positional level addressing — `level` indexes the
+    # *first* field's level tuple — but had no matching guard. Unguarded, the
+    # rebuild re-homes EVERY field onto subdomain 1's moved space: the coupled
+    # model silently collapses to one subdomain, :u2 leaves [2,3]×[0,1] for
+    # [0,1]², and the result is still accepted by `solve!`.
+    #
+    # V1 carries an overlay deliberately. With a bare V1, `moved_space` rejects
+    # `level=2` as "only overlay levels can be moved" long before the missing
+    # guard is reached, and the test would pass without proving anything — so
+    # the throw below is matched on its message, and the `moved_space` call
+    # above it shows that level 2 really is a movable overlay.
+    V1 = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2),
+                 box((0.25, 0.25), (0.75, 0.75)); cells=(2, 2), order=2)
+    V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(2, 2), order=2)
+    u1 = field(:u1, V1)
+    u2 = field(:u2, V2)
+    to = box((0.1, 0.1), (0.6, 0.6))
+    @test moved_space(V1; level=2, to=to) isa Space
+
+    coupled = prepare(Problem((u1, u2);
+                              blocks=(stiffness_block(u1), stiffness_block(u2)),
+                              loads=(source_load(u1; source=1.0),
+                                     source_load(u2; source=1.0)),
+                              dirichlet=[dirichlet(0.0; on=boundary(:all), field=:u1),
+                                         dirichlet(0.0; on=boundary(:all), field=:u2)]))
+    @test length(problem_spaces(coupled.problem)) == 2
+    @test_throws "multi-domain" moved(coupled; level=2, to=to)
+
+    # The same call on the single-domain half is legal, so the guard rejects the
+    # coupling and not the level index.
+    single = prepare(Problem((u1,); blocks=(stiffness_block(u1),),
+                             loads=(source_load(u1; source=1.0),),
+                             dirichlet=[dirichlet(0.0; on=boundary(:all), field=:u1)]))
+    @test moved(single; level=2, to=to) isa Model
+end
+
 @testset "per-point iteration is guarded on multi-domain models" begin
     # foreach_quadrature_point / QuadField walk a single subdomain plan with a
     # single-space workspace, so a coupled model would silently visit only the
@@ -105,29 +142,115 @@ end
     @test_throws ArgumentError QuadField{Float64}(model)
 end
 
-@testset "sharing one single-sided on= mesh across subdomains is rejected" begin
+@testset "one single-sided on= mesh shared across subdomains serves both" begin
     # A single BoundaryMesh object used as the `on=` target for weak forms on two
-    # different subdomains would assemble only the first subdomain's contribution
-    # (the pass serves one space). That silent drop is rejected at assembly.
+    # different subdomains used to be rejected at assembly, because one region
+    # list serves one space and the second subdomain's contribution would have
+    # been silently dropped. The surface cache is now keyed on (mesh, space) and
+    # the `on`-partition is split per subdomain, so the shared object yields one
+    # region list and one pass per subdomain instead.
+    #
+    # The assertion is the property the old rejection was protecting, stated
+    # directly: sharing the object must give *exactly* what the workaround it
+    # demanded — a separate, structurally identical mesh per subdomain — gives.
     V1 = space(box((0.0, 0.0), (1.0, 0.5)); cells=(4, 2), order=2)
     V2 = space(box((0.0, 0.5), (1.0, 1.0)); cells=(4, 2), order=2)
     u1 = field(:u1, V1)
     u2 = field(:u2, V2)
     Γ = polyline_mesh([SVector(0.0, 0.5), SVector(1.0, 0.5)])
-    model = prepare(Problem((u1, u2);
-                            blocks=(stiffness_block(u1), stiffness_block(u2),
-                                    block(u1, u1, mass_form(coefficient=1.0); on=Γ),
-                                    block(u2, u2, mass_form(coefficient=1.0); on=Γ))))
-    @test_throws ArgumentError assemble!(model)
-    # Distinct mesh objects (one per subdomain) are the correct, accepted form.
+    shared = prepare(Problem((u1, u2);
+                             blocks=(stiffness_block(u1), stiffness_block(u2),
+                                     block(u1, u1, mass_form(coefficient=1.0); on=Γ),
+                                     block(u2, u2, mass_form(coefficient=1.0); on=Γ))))
+    assemble!(shared)
+
+    # Distinct mesh objects, one per subdomain: the form the guard used to demand.
     Γ1 = polyline_mesh([SVector(0.0, 0.5), SVector(1.0, 0.5)])
     Γ2 = polyline_mesh([SVector(0.0, 0.5), SVector(1.0, 0.5)])
-    ok = prepare(Problem((u1, u2);
-                         blocks=(stiffness_block(u1), stiffness_block(u2),
-                                 block(u1, u1, mass_form(coefficient=1.0); on=Γ1),
-                                 block(u2, u2, mass_form(coefficient=1.0); on=Γ2))))
-    assemble!(ok)
-    @test ok.matrix !== nothing
+    separate = prepare(Problem((u1, u2);
+                               blocks=(stiffness_block(u1), stiffness_block(u2),
+                                       block(u1, u1, mass_form(coefficient=1.0); on=Γ1),
+                                       block(u2, u2, mass_form(coefficient=1.0); on=Γ2))))
+    assemble!(separate)
+
+    @test shared.matrix !== nothing
+    @test separate.matrix !== nothing
+    @test shared.matrix == separate.matrix
+
+    # One surface-region entry per (mesh, space) site either way: the shared
+    # object is cached twice — once per subdomain — not once.
+    @test length(shared.surface_regions) == 2
+    @test length(separate.surface_regions) == 2
+    @test diagnostics(shared).surface_region_count ==
+          diagnostics(separate).surface_region_count
+
+    # Both subdomains really carry the surface mass: dropping either one would
+    # leave that field's diagonal block equal to its bare stiffness block.
+    bare = prepare(Problem((u1, u2);
+                           blocks=(stiffness_block(u1), stiffness_block(u2))))
+    assemble!(bare)
+    @test shared.matrix != bare.matrix
+    n1 = active_unknowns(prepare(Problem((u1,); blocks=(stiffness_block(u1),))))
+    @test shared.matrix[1:n1, 1:n1] != bare.matrix[1:n1, 1:n1]
+    @test shared.matrix[(n1 + 1):end, (n1 + 1):end] != bare.matrix[(n1 + 1):end, (n1 + 1):end]
+end
+
+@testset "value-equal on= selectors resolve per subdomain, not to the first one" begin
+    # Two subdomains, one Neumann load each, on two *separately constructed but
+    # value-equal* `boundary(axis=1, side=:upper)` selectors. Each subdomain's
+    # upper-x face is a different set of facets, so each load must be integrated
+    # against its own geometry.
+    #
+    # Before the (selector, space) cache key, both selectors resolved to the
+    # first referencing form's space: subdomain 2's load was assembled over
+    # subdomain 1's facets, where u₂ has no dofs, so it vanished. Nothing
+    # complained — the system stayed symmetric positive definite and the solve
+    # reported convergence at round-off, with u₂ ≡ 0.
+    V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2)
+    V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(2, 2), order=2)
+    u1 = field(:u1, V1)
+    u2 = field(:u2, V2)
+
+    # u = x − x₀ on each subdomain: Δu = 0, u = 0 on the lower-x face,
+    # ∂u/∂n = 1 on the upper-x face. Both subdomains have the same exact answer.
+    model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
+                            loads=(neumann(u1, 1.0; on=boundary(axis=1, side=:upper)),
+                                   neumann(u2, 1.0; on=boundary(axis=1, side=:upper))),
+                            dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower),
+                                                 field=:u1),
+                                       dirichlet(0.0; on=boundary(axis=1, side=:lower),
+                                                 field=:u2)]))
+    solution = solve!(model)
+
+    @test value(solution, model, u1, (1.0, 0.5)) ≈ 1.0 atol = 1.0e-12
+    @test value(solution, model, u1, (0.5, 0.5)) ≈ 0.5 atol = 1.0e-12
+    @test value(solution, model, u2, (3.0, 0.5)) ≈ 1.0 atol = 1.0e-12
+    @test value(solution, model, u2, (2.5, 0.5)) ≈ 0.5 atol = 1.0e-12
+
+    # The load reaches the second block of the rhs at all. This is the assertion
+    # that fails loudest without the fix: `rhs` block 2 was exactly zero.
+    n1 = active_unknowns(prepare(Problem((u1,); blocks=(stiffness_block(u1),))))
+    @test !iszero(model.rhs[(n1 + 1):end])
+    @test sum(model.rhs[1:n1]) ≈ sum(model.rhs[(n1 + 1):end])   # symmetric subdomains
+
+    # The cache holds four entries — two selector values × two subdomains — and
+    # each one's facets sit on the face of *its own* subdomain, not subdomain 1's.
+    @test length(model.facet_regions) == 4
+    for (key, regions) in model.facet_regions
+        @test !isempty(regions)
+        expected = key.on.sides == [(1, :upper)] ? key.space.domain.upper[1] :
+                   key.space.domain.lower[1]
+        for region in regions, x in region.points
+            @test x[1] ≈ expected
+        end
+    end
+
+    # Both faces of both subdomains are represented: x = 0 and 1 (subdomain 1),
+    # x = 2 and 3 (subdomain 2). Before the fix only 0 and 1 ever appeared.
+    faces = sort(unique(round(x[1]; digits=12)
+                        for regions in values(model.facet_regions)
+                        for region in regions for x in region.points))
+    @test faces == [0.0, 1.0, 2.0, 3.0]
 end
 
 # ── Interface coupling: the two-sided region + couple verb ────────────────────

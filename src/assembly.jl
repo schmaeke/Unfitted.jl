@@ -324,12 +324,13 @@ function _assembly_region_lists(model::Model, blocks)
         end
         key = hash(:volume, key)
     end
-    for (selector, (sel_blocks, sel_loads)) in partitions
-        space = _partition_space(model, selector, sel_blocks, sel_loads)
-        regions = _resolve_on_regions(model, selector, space)
-        isempty(regions) && continue
-        push!(passes, regions)
-        key = hash(selector, key)
+    for (on, (on_blocks, _)) in partitions
+        for (space, space_blocks, space_loads) in _partition_spaces(model, on, on_blocks, ())
+            regions = _resolve_on_regions(model, on, space)
+            isempty(regions) && continue
+            push!(passes, regions)
+            key = hash(RegionKey(on, space), key)
+        end
     end
     return passes, key
 end
@@ -1665,34 +1666,41 @@ function _partition_forms_by_on(blocks, loads)
     return volume_blocks, volume_loads, partitions
 end
 
-# The subdomain space a single-sided `on`-partition acts on, taken from the test
-# field of the forms in the partition (its name is always a problem field, even
-# for a one-shot `assemble_matrix(model, block; on=…)` whose mesh the model never
-# cached). `Interface` partitions are two-sided and return `nothing` — their
-# `InterfaceRegion` carries both sides' parents itself.
+# Split one single-sided `on`-partition into one pass per subdomain space,
+# returning `(space, blocks, loads)` in the order the spaces first appear among
+# the partition's forms. The space of a form is that of its test field (whose
+# name is always a problem field, even for a one-shot
+# `assemble_matrix(model, block; on=…)` whose mesh the model never cached).
 #
-# A single-sided region is built once, against this one space, and its parents
-# live on that space's level block, so only that space's fields evaluate on it
-# (`region_parents`). If one `on` object is shared by forms whose test fields
-# live on *different* subdomain spaces, only the first space's contribution
-# would be assembled and the rest silently
-# dropped. Reject that: give each subdomain its own `on=` mesh/selector object (a
-# genuine coupling between subdomains uses `interface(uₐ, u_b, Γ)` instead).
-function _partition_space(model::Model, on, blocks, loads)
-    on isa Interface && return nothing
-    space = nothing
-    for form in Iterators.flatten((blocks, loads))
-        s = _field_space(model.problem, form.test_name)
-        if space === nothing
-            space = s
-        elseif s !== space
-            throw(ArgumentError("the single-sided `on=` target is shared by forms whose test fields live on " *
-                                "different subdomain spaces, so only one subdomain's contribution would be " *
-                                "assembled; give each subdomain its own `on=` mesh/selector object (couple " *
-                                "subdomains with `interface(uₐ, u_b, Γ)`)"))
-        end
+# A single-sided region list is built against one space and its parents live on
+# that space's level block, so only that space's fields evaluate on it
+# (`region_parents`). One `on=` target named by fields on *different* subdomains
+# therefore needs one region list — and one pass — per subdomain: a face named
+# `boundary(axis=1, side=:upper)` on two subdomains is two different sets of
+# facets. Folding them into a single pass would assemble the first space's
+# contribution and silently drop the rest, which is exactly the defect
+# `RegionKey` re-keys the caches to prevent; the split here is the assembly-side
+# half of the same fix.
+#
+# `Interface` partitions are two-sided and stay one pass with `space === nothing`
+# — their `InterfaceRegion` carries both sides' parents itself, and the four
+# blocks a `couple` call emits alternate test fields between the two subdomains,
+# so splitting them by test space would tear one coupling into two passes.
+function _partition_spaces(model::Model, on, blocks, loads)
+    on isa Interface && return [(nothing, blocks, loads)]
+    # Single-domain is the dominant path and has nothing to split: every test
+    # field is on the one representative space, so the partition passes through
+    # whole, exactly as it did before the split existed.
+    _is_multidomain(model.problem) || return [(model.problem.space, blocks, loads)]
+
+    form_space(form) = _field_space(model.problem, form.test_name)
+    spaces = Any[]                                    # first-appearance order,
+    for form in Iterators.flatten((blocks, loads))    # deduplicated by identity
+        space = form_space(form)                      # as in `problem_spaces`
+        any(s -> s === space, spaces) || push!(spaces, space)
     end
-    return space === nothing ? model.problem.space : space
+    return [(space, filter(b -> form_space(b) === space, blocks),
+             filter(l -> form_space(l) === space, loads)) for space in spaces]
 end
 
 # ── Public assembly API ───────────────────────────────────────────────────────
@@ -1825,14 +1833,15 @@ function _assemble_partitioned!(sink, model::Model{D,T}, blocks, loads, nactive:
         end
     end
 
-    # Non-volume contributions — one assembly pass per unique `on=`
-    # value. `region_filter` is a volume-only convenience and is not
-    # forwarded to the facet / surface passes. `_partition_space` rejects a
-    # single-sided target shared across subdomains, so each region list is owned
-    # by one subdomain's fields.
-    for (selector, (sel_blocks, sel_loads)) in partitions
-        space = _partition_space(model, selector, sel_blocks, sel_loads)
-        regions = _resolve_on_regions(model, selector, space)
+    # Non-volume contributions — one assembly pass per unique `on=` value *per
+    # subdomain space naming it* (`_partition_spaces`), so a target named by two
+    # subdomains contributes on both instead of only the first. `region_filter`
+    # is a volume-only convenience and is not forwarded to the facet / surface
+    # passes.
+    for (on, (on_blocks, on_loads)) in partitions,
+        (space, sel_blocks, sel_loads) in _partition_spaces(model, on, on_blocks, on_loads)
+
+        regions = _resolve_on_regions(model, on, space)
         isempty(regions) && continue
         # Every pass — volume, facet, surface, and two-sided interface — runs
         # threaded. NOTE: assembling a two-sided `InterfaceRegion` pass in a
@@ -1867,26 +1876,28 @@ function _run_pass!(sink, rhs, model, regions, symmetric, blocks, loads, region_
     return nothing
 end
 
-# Resolve a non-`nothing` `on=` value to its region list. Reads from
-# the per-kind cache on `model` when the entry exists (every selector
-# referenced by `prepare(problem)` is pre-resolved); falls back to a
-# fresh build for one-shot calls like
+# Resolve a non-`nothing` `on=` value **on a named subdomain space** to its
+# region list. Reads from the per-kind cache on `model` when the entry exists
+# (every (target, space) site referenced by `prepare(problem)` is pre-resolved);
+# falls back to a fresh build against `space` for one-shot calls like
 # `assemble_matrix(model, block_with_unseen_on=…)`.
-# `space` is the subdomain the region is (re)built against on a cache miss; it
-# defaults to the representative space for field-agnostic callers like
-# `boundary_integral`. Cache hits (every `on` referenced by `prepare`) return
-# the regions already built against the referencing field's own space, so the
-# default only matters for a one-shot mesh the model never saw.
+#
+# `space` is half of the cache key, not merely a fallback for the miss path: a
+# hit is by construction a region list already built against that same space, so
+# a caller naming subdomain 2 can never be handed subdomain 1's facets. It
+# defaults to the representative space, which is the one space on a single-domain
+# model; field-agnostic callers on a coupled model (`boundary_integral`) resolve
+# the space themselves rather than take the default.
 function _resolve_on_regions(model::Model{D,T}, selector::BoundarySelector,
                              space=model.problem.space) where {D,T}
     return get(() -> _facet_regions_for_selector(space, selector, model.dofs.tolerance),
-               model.facet_regions, selector)
+               model.facet_regions, RegionKey(selector, space))
 end
 
 function _resolve_on_regions(model::Model{D,T}, mesh::BoundaryMesh{D,T},
                              space=model.problem.space) where {D,T}
     return get(() -> _surface_regions_for_mesh(space, mesh, model.dofs.tolerance),
-               model.surface_regions, mesh)
+               model.surface_regions, RegionKey(mesh, space))
 end
 
 # Resolve the two-sided integration regions for an interface coupling tag from

@@ -179,6 +179,56 @@ end
     @test n_corner ≈ [-1.0, -1.0] / sqrt(2.0)
 end
 
+@testset "boundary_integral on a coupled model needs a field and honours it" begin
+    # Two disjoint unit squares. Each has perimeter 4, so ∂Ω of the pair is 8.
+    # Without `field=`, `boundary_integral` used to resolve `boundary(:all)` to
+    # whichever subdomain a form referenced first and return 4.0 — a plausible
+    # number for the wrong domain, with nothing to signal the omission.
+    V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(3, 3), order=1)
+    u1 = field(:u1, V1)
+    u2 = field(:u2, V2)
+    model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
+                            dirichlet=[dirichlet(0.0; on=boundary(:all), field=:u1),
+                                       dirichlet(0.0; on=boundary(:all), field=:u2)]))
+
+    # Naming the subdomain gives that subdomain's boundary — including the
+    # second one, whose facets the shared cache entry never held.
+    @test boundary_integral(q -> 1.0, model; on=boundary(:all), field=:u1) ≈ 4.0
+    @test boundary_integral(q -> 1.0, model; on=boundary(:all), field=:u2) ≈ 4.0
+
+    # A face of each: subdomain 2's upper-x face is at x = 3, not x = 1.
+    right1 = boundary_integral(model; on=boundary(axis=1, side=:upper), field=:u1) do q
+        q.x[1]
+    end
+    right2 = boundary_integral(model; on=boundary(axis=1, side=:upper), field=:u2) do q
+        q.x[1]
+    end
+    @test right1 ≈ 1.0
+    @test right2 ≈ 3.0
+
+    # Omitting `field` raises rather than silently answering for one subdomain.
+    @test_throws ArgumentError boundary_integral(q -> 1.0, model; on=boundary(:all))
+    err = try
+        boundary_integral(q -> 1.0, model; on=boundary(:all))
+    catch e
+        e
+    end
+    @test occursin("field=", err.msg)
+    @test occursin(":u1", err.msg) && occursin(":u2", err.msg)
+
+    # An unknown field name is still an error, not a silent fallback.
+    @test_throws ArgumentError boundary_integral(q -> 1.0, model; on=boundary(:all),
+                                                 field=:nope)
+
+    # Single-domain models are unaffected: `field` is optional and, when given,
+    # agrees with the default exactly.
+    single = prepare(poisson(V1; source=0.0,
+                             dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    @test boundary_integral(q -> 1.0, single; on=boundary(:all)) ==
+          boundary_integral(q -> 1.0, single; on=boundary(:all), field=:u)
+end
+
 @testset "model.facet_regions caches one entry per Dirichlet selector" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(2, 2), order=1)
