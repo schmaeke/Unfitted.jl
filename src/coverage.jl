@@ -1,8 +1,7 @@
 # Per-level coverage of the superposition stack.
 #
-# The order-reduction rule (see docs/design/covered-cell-deactivation.md) sheds a
-# level's high-order modes wherever a finer level fully covers it, keeping only its
-# linear skeleton:
+# The order-reduction rule sheds a level's high-order modes wherever a finer level
+# fully covers it, keeping only its linear skeleton:
 #
 #   a level-j cell is *covered* iff its box lies inside the region of every level
 #   *above* it (higher id) that carries material the finer level represents.

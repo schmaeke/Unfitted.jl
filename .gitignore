@@ -6,3 +6,5 @@ docs/
 examples/*/output/
 benchmarks/output/
 gallery/
+review/
+*.cov

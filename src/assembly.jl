@@ -1839,11 +1839,10 @@ function _assemble_partitioned!(sink, model::Model{D,T}, blocks, loads, nactive:
         # `--code-coverage`-instrumented, multi-threaded process can trigger a
         # Julia codegen artifact that nondeterministically corrupts the coupled
         # interface block (observed only for vector/multi-component couplings,
-        # only under coverage with ≥2 threads — never in an ordinary run; see the
-        # `couple` docstring and BUGREPORT_interface_threaded_race.md). Ordinary
-        # (non-coverage) assembly is unaffected, so the parallel path ships; a
-        # caller needing bit-reproducibility inside a coverage run assembles that
-        # pass with `threaded=false`.
+        # only under coverage with ≥2 threads — never in an ordinary run; see
+        # the `couple` docstring). Ordinary (non-coverage) assembly is unaffected,
+        # so the parallel path ships; a caller needing bit-reproducibility inside
+        # a coverage run assembles that pass with `threaded=false`.
         _run_pass!(sink, rhs, model, regions, symmetric, Tuple(sel_blocks), Tuple(sel_loads),
                    nothing, state_coefficients, threaded)
     end

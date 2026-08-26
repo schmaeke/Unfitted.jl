@@ -3,8 +3,7 @@ Steep tanh Layer Along a Curved Front (order-reduction benchmark)
 =================================================================
 
 A manufactured-solution benchmark for the order-reduction feature (covered
-coarse cells shed their high-order modes; see
-`docs/design/covered-cell-deactivation.md`). The exact solution is a very steep
+coarse cells shed their high-order modes). The exact solution is a very steep
 hyperbolic-tangent layer riding a sinusoidal front on the bi-unit square
 `Ω = (−1, 1)²`:
 

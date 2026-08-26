@@ -270,8 +270,7 @@ directly with `block(test, trial, form; on = interface(uₐ, u_b, Γ))`.
     it is not reproducible outside a coverage-instrumented process and does not
     affect real solves. If you must assemble a coupled system for bit-reproducible
     output *inside* a coverage-instrumented multithreaded process, assemble that
-    step serially with `assemble!(model; threaded=false)`. See
-    `BUGREPORT_interface_threaded_race.md` for the full investigation.
+    step serially with `assemble!(model; threaded=false)`.
 """
 function couple(u_a::Field, u_b::Field, geometry::BoundaryMesh, form::WeakForm)
     iface = interface(u_a, u_b, geometry)

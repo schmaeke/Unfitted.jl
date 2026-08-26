@@ -104,7 +104,7 @@ thread; do not rely on a fixed thread count.
 ```text
 Project.toml                  package metadata + production dependencies
 LICENSE.md                    MIT (Unfitted.jl)
-NOTICE.md                     third-party attributions (QuESo BSD-4-Clause)
+NOTICE.md                     third-party attributions (QuESo BSD-4-Clause) + clean-room algorithm citations
 README.md                     public landing page
 CLAUDE.md                     agent-instruction pointer documents
 CONTRIBUTING.md               this file — contributor + agent guide
@@ -112,9 +112,11 @@ CITATION.cff                  machine-readable citation metadata
 .JuliaFormatter.toml          repo-wide formatting config (yas style, indent 4)
 precommit.jl                  formatter wrapper + SLOC/comment/docstring stats
 src/                          library source
+ext/                          package extensions (BasicBSpline, FileIO+MeshIO+GeometryBasics, Tensors)
 test/                         unit and regression tests
 examples/                     runnable scripts, one sub-directory per example, each with its own Project.toml
 benchmarks/                   targeted performance benchmarks (own Project.toml)
+.github/workflows/ci.yml      CI: tests on Julia 1.10 and latest, 1 and 4 threads, plus the format check
 ```
 
 ### Source files (`src/`)
@@ -132,13 +134,15 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `fcm.jl`          | finite-cell-method cut-cell quadrature: exact moments from `implicit.jl`, non-negative (NNLS) moment fit |
 | `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks |
 | `intersections.jl`| admissible integration regions for non-matching meshes; cut/fictitious region-quadrature dispatch |
+| `coverage.jl`     | per-level covered-cell masks (`Coverage`, `build_coverage`); the mask-aware, fictitious-fold-aware covering rule behind order reduction |
 | `dofs.jl`         | dof layout, raw/active enumeration, overlay/boundary-constraint detection |
-| `dirichlet.jl`    | physical Dirichlet boundary conditions, boundary selectors, strong elimination and Nitsche enforcement |
+| `dirichlet.jl`    | physical Dirichlet conditions and boundary selectors, the per-key boundary-face detection `dof_layout` eliminates on, codim-K facet regions and quadrature, and the L² boundary projection for nonzero data |
 | `surface.jl`      | immersed-boundary surface meshes (`BoundaryMesh`) and surface-region integration |
 | `problems.jl`     | `Field`, weak-form channels and blocks (`BlockForm`/`LoadForm`/`WeakForm`), `Problem` |
+| `coupling.jl`     | multi-domain interface coupling: the `Interface` `on=` tag, two-sided `InterfaceRegion` construction, `InterfaceForm`, and the four-block `couple` jump expansion |
 | `model.jl`        | `Model` lifecycle: `prepare`, `move!`/`activate!`/`deactivate!`, diagnostics |
 | `assembly.jl`     | coupled Galerkin assembly: channel calculus, cached symbolic-scatter (Gustavson) pattern, serial scatter + two-phase compute→gather threaded path |
-| `solvers.jl`      | small solver/preconditioner wrappers + `Solution`           |
+| `solvers.jl`      | `Solution` / `SolverDiagnostics`, the default direct sparse solve, and the `linear_solver` hook for external Krylov or preconditioned solvers |
 | `projection.jl`   | variational and rewire-based state transfer between models  |
 | `data.jl`         | per-quadrature-point `QuadField` + RBF transfer             |
 | `postprocessing.jl` | VTK export, L² error, field/gradient evaluation           |
@@ -338,8 +342,30 @@ properties of *some* families, not of the framework.
 Meshes are axis-aligned Cartesian tensor-product meshes. Each level
 carries its own mesh, basis family, polynomial/order metadata, and dofs.
 Overlay levels are positioned independently of lower levels: overlay
-boundaries need not coincide with lower-level element boundaries. There
-is no fitted multi-level hp deactivation rule for linear independence.
+boundaries need not coincide with lower-level element boundaries, and
+overlays are never topologically merged with their parents. The package
+does, however, carry an *order-reduction* rule for redundancy: with
+`reduce_order = true` (the default on `space` and `overlay`), every
+high-order mode whose entire incidence stencil is covered by a finer
+level is eliminated, leaving the linear skeleton. Elimination is
+per-mode, not per-cell: a mode is shed only when *every* cell it is
+incident to is covered, so an edge or face mode straddling the boundary
+of the covered region survives even though its own cell is covered. A
+buried linear mode that a *nested* finer level reproduces exactly is
+deduplicated. Coverage is mask-aware — a user-masked cell blocks
+coverage, a fictitious fold does not.
+
+Order reduction is a basis-family-specific feature:
+`_coverage_constraints` does the work in its
+`Level{D,T,<:IntegratedLegendre}` method, and every other family — the
+B-spline family included — hits the generic fallback that returns an
+empty constraint list. `reduce_order` nevertheless defaults to `true` on
+`space` and `overlay` for *every* basis family, so on a B-spline space
+the default is on and does nothing. See
+`src/coverage.jl` and `_coverage_constraints` in `src/dofs.jl`;
+`diagnostics(...).reduced_mode_counts` reports the count per level,
+concatenated field-by-field (one entry per level of each field, in
+declaration order).
 
 Cells of a level may also be selectively activated or deactivated via a
 per-cell `LevelMask`. See *Selective activation* below.
@@ -385,14 +411,37 @@ constructed as follows:
   2. Sort and merge coordinates closer than the geometry tolerance.
   3. Form non-degenerate intervals between adjacent coordinates.
   4. Take the Cartesian product of intervals to form candidate boxes.
-  5. Use midpoint containment to identify which parent element of each
-     mesh covers each candidate box.
-  6. Keep boxes that satisfy the caller's criterion: usually "at least
-     the required participating active fields" for coupling assembly,
-     "at least one active field" for field evaluation or visualization,
-     or source/target coverage for projection.
-  7. For every kept box, store each contributing parent element and the
-     box mapped into that element's local coordinates.
+  5. Compute each candidate's per-level *coverage signature* at its
+     midpoint (which cell of each level contains it, or `0` when the
+     level's mesh does not reach the point or that cell is inactive —
+     activity is a per-cell property carried by `Level.mask`, never a
+     property of the level), then greedily merge axis-adjacent
+     candidates that share a signature. Every cell inside a merged box
+     still lies inside a single cell of every covering level, so the
+     `C^∞` contract below is preserved while the region count stays
+     proportional to the number of genuinely distinct coverage
+     patterns.
+  6. For every merged box, resolve the covering parent cells by midpoint
+     containment and keep the box only if it satisfies the caller's
+     `criterion`, expressed over those parent *levels*: `:any_parent`
+     (the default — at least one level covers the box; used by assembly,
+     field evaluation, and visualization), `:all_levels` (every level of
+     the space covers it), or a caller-supplied predicate
+     `parents -> Bool`. No in-tree caller uses the predicate form:
+     `projection.jl` builds its transfer regions from `_merged_boxes` /
+     `_parents_covering` directly and applies its own target-coverage
+     test rather than going through a `criterion`. Any other value
+     raises `ArgumentError`.
+  7. Dispatch the region quadrature on the `PhysicalDomain`
+     classification — tensor Gauss on `:full`, α-scaled tensor Gauss on
+     `:fictitious` with `α > 0`, the moment-fit pipeline on `:cut` (or
+     the domain's `cut_quadrature` callable in its place, see *Region
+     quadrature kinds* below); a `:fictitious` region under strict α
+     (`α = 0`) is dropped outright.
+  8. Store each contributing parent element with the box mapped into
+     that element's local coordinates, record a `SmallOverlap` for every
+     region below `tolerance.small_volume`, and track the largest
+     moment-fit residual seen.
 
 The integrand of a basis-function product is smooth (`C^∞`) inside such
 an admissible box. Do not integrate a product of basis functions across
@@ -513,10 +562,13 @@ features evolve.
     predicate `(cell_box, cell_index) -> Bool`.
   - **Mutation**: `activate!(model; level, cells)` and
     `deactivate!(model; level, cells)`. The mutators follow the `move!`
-    invalidation contract: bump `model.version`, clear `model.matrix`
-    and `model.rhs`, rebuild the integration plan and dof layout,
-    refresh diagnostics. An outstanding `Solution` raises on stale
-    reuse.
+    invalidation contract: bump `model.version`, clear `model.matrix`,
+    `model.rhs` and the cached assembly `pattern`, drop the Dirichlet
+    projection cache, rebuild the integration plan, dof layout and the
+    facet / surface / interface region caches, and refresh diagnostics.
+    An outstanding `Solution` raises on stale reuse. Like `move!`, they
+    address a level by position in the model's single space and
+    therefore raise `ArgumentError` on a multi-domain (coupled) model.
   - **Query**: `active_cells(model; level)` returns a copy of the
     level's `BitArray` (or an all-true array for unmasked levels).
   - **Dof layer treatment**: faces between active and inactive cells of
@@ -546,9 +598,9 @@ indicator representations are intentionally not supported.
     default leaf, so the single-level-set case stays ergonomic.
 
   - **Public construction**:
-    `physical_domain(geometry; lipschitz=Inf, alpha=0.0, subcell_length_scale,
-    max_depth=8, moment_order_factor=2, target_residual=1e-6,
-    cut_quadrature=nothing)`.
+    `physical_domain(geometry; lipschitz=Inf, alpha=0.0, keep_fictitious=false,
+    subcell_length_scale, max_depth=8, moment_order_factor=2,
+    target_residual=1e-6, cut_quadrature=nothing)`.
 
     - `geometry`: a `LevelSet` CSG tree, or a bare scalar callable `φ` on
       `SVector{D,T}` (auto-wrapped as a single leaf). `φ` need not be a
@@ -560,14 +612,19 @@ indicator representations are intentionally not supported.
       subdivision. For a CSG tree, set each leaf's constant on its
       `leaf(...)` call instead.
     - `alpha`: fictitious-region weight for α-FCM stabilization. `0` is
-      the strict cut path; `> 0` enables α-FCM (cut cells are enriched
-      with the α-scaled full-cell rule unconditionally, and fully
-      fictitious cells carry α-scaled weights). Independently, fully
+      the strict cut path; `> 0` enables α-FCM (every cut cell's rule
+      becomes `(1 − α)·(physical rule) ∪ α·(full-cell tensor rule)`, and
+      fully fictitious cells carry α-scaled weights). Independently, fully
       fictitious *cells* are dropped from the dof layout by default and
       retained only when `keep_fictitious = true` (which then requires
       `α > 0`). The α-scaled cut-cell enrichment applies regardless of
       `keep_fictitious`, so pre-`keep_fictitious` whole-cell results are
       not recovered by setting it.
+    - `keep_fictitious` (default `false`): retain fully-fictitious cells
+      in the dof layout with α-scaled full-cell quadrature (the classic
+      α-FCM fill) instead of dropping them. Requires `alpha > 0`; pairing
+      it with `alpha = 0` is rejected with an `ArgumentError`, because
+      those cells would carry no quadrature at all.
     - `subcell_length_scale` (required): target box size, in physical
       units, for the binary subdivision shared by two consumers — the
       cut/full/fictitious cell classifier, and the implicit kernel's
@@ -609,11 +666,14 @@ indicator representations are intentionally not supported.
 
   - **Region quadrature kinds** (visible via `region.quadrature.kind`):
     `:full` (tensor Gauss), `:fictitious_alpha` (α-scaled tensor Gauss),
-    `:cut_fitted` (NNLS moment-fit rule, plus the α-scaled tensor part
-    when `α > 0`), `:cut_fallback` (the moment-fit residual exceeded the
-    failure threshold, so the region carries the raw Saye volume rule the
-    moments were summed from — correct and non-negative, but with 50–200×
-    the points), `:cut_failed` (strict-cut `α = 0` region whose `Ω ∩ box`
+    `:cut_fitted` (NNLS moment-fit rule; under `α > 0` the rule is the
+    concatenation `(1 − α)·moment-fit ∪ α·full-cell tensor Gauss`, from
+    `∫_cell α(x) f = (1 − α)∫_Ω f + α∫_cell f`), `:cut_fallback` (the
+    moment-fit residual exceeded the failure threshold, so the region
+    carries the raw Saye volume rule the moments were summed from —
+    correct and non-negative, but with 50–200× the points, and blended
+    with the α-scaled tensor rule exactly as `:cut_fitted` is under
+    `α > 0`), `:cut_failed` (strict-cut `α = 0` region whose `Ω ∩ box`
     carries no volume rule at all; region contributes zero quadrature),
     `:cut_alpha_failed` (the same under `α > 0`: the empty physical part
     is dropped but the α-scaled tensor rule is retained so the cell's
@@ -633,13 +693,23 @@ indicator representations are intentionally not supported.
     dropping the cell. Rules are cached by canonicalized region bounds +
     moment order.
 
-  - **Diagnostics**: `diagnostics(model, solution).cut_region_count`,
-    `fit_failure_count`, `moment_fit_residual_max`,
-    `cut_fallback_count`, `cut_fallback_points`,
-    `inactive_cell_counts`. A nonzero `cut_fallback_count` means those
-    cells are under-resolved for their geometric complexity and should
-    drive refinement; the fallback is a safety net, not a substitute for
-    an adequate mesh.
+  - **Diagnostics**: the FCM statistics on `diagnostics(model, solution)`
+    are `cut_region_count`, `fit_failure_count`,
+    `moment_fit_residual_max`, `cut_fallback_count`,
+    `cut_fallback_points`, and `inactive_cell_counts` (which folds in the
+    fictitious cell drop). The same report also carries
+    `reduced_mode_counts` (order reduction), `dimension`,
+    `integration_regions`, `facet_region_count`, `surface_region_count`,
+    `interface_region_count`, `raw_dofs`, `active_unknowns`, `levels`,
+    `small_overlap_count` / `small_overlaps`, `min_integration_volume`,
+    `min_relative_integration_volume`, `symmetry_residual`,
+    `condition_estimate`, `solver`, `residual_norm`, and `l2_error`
+    (`nothing` unless `exact=` is passed — the key is always present).
+    `diagnostics(model)` alone returns the cached `AssemblyDiagnostics`
+    record. A nonzero `cut_fallback_count` means those cells are
+    under-resolved for their geometric complexity and should drive
+    refinement; the fallback is a safety net, not a substitute for an
+    adequate mesh.
 
 ### Naming
 
@@ -743,14 +813,14 @@ below so the codebase converges over time.
     signatures (each indented four spaces, one per supported overload),
     followed by a blank line and prose in full sentences. Argument
     conventions, defaults, return value, and citations follow in that
-    order. The `PhysicalDomain` and `physical_domain` docstrings at
-    the top of `src/physical.jl` are fully worked examples.
+    order. The `PhysicalDomain` and `physical_domain` docstrings in
+    `src/physical.jl` are fully worked examples.
 
   - **Section dividers in long files.** When a file has clearly
     separable stages or concerns (`src/fcm.jl`'s NNLS / moment / fit
-    pipeline; `precommit.jl`'s CLI / discovery / formatting /
-    stats / main) group them with single-line `─` dividers carrying the
-    section name. The canonical form:
+    pipeline; `precommit.jl`'s CLI / file discovery / formatting /
+    code statistics / reporting / main) group them with single-line `─`
+    dividers carrying the section name. The canonical form:
 
     ```julia
     # ── Stage name ────────────────────────────────────────────────────────────────
@@ -790,8 +860,11 @@ not have to re-derive them:
     `CartesianIndices(ntuple(d -> 0:order[d], D))`, with the dimension-1
     axis varying fastest.
   - **Global dof ordering**: per-field, then component-major within a
-    field. Constrained dofs are not enumerated; their value is held in
-    `layout.constrained_values`.
+    field. Constrained dofs are not enumerated; their value lives in the
+    per-field `DofLayout.constrained_values` matrix
+    (`(raw, component) → value`), reachable from a `SystemLayout` as
+    `layout.fields[i].dofs.constrained_values` and read through
+    `constrained_value` / `dof_value`.
 
 Tests enforce these conventions. Document any change to them at the top
 of the relevant source file and update the relevant tests in the same
@@ -799,9 +872,10 @@ PR.
 
 ### Dependency policy
 
-Use Julia standard libraries first: `LinearAlgebra`, `SparseArrays`,
-`SuiteSparse`, `Printf`, `Random`, `Test`. Focused dependencies are
-acceptable when they remove real work:
+Use Julia standard libraries first: `LinearAlgebra`, `SparseArrays`
+(with `SuiteSparse` reached implicitly through `\`), and `Test` /
+`Random` in the test environment. Focused dependencies are acceptable
+when they remove real work:
 
   - fixed-size small arrays for geometry and local kernels, e.g.
     `StaticArrays`;
@@ -811,6 +885,11 @@ acceptable when they remove real work:
   - non-negative constrained linear-least-squares solvers, e.g.
     `NonNegLeastSquares` (used by `src/fcm.jl` for the NNMF moment-fit
     solve);
+  - forward-mode automatic differentiation for level-set gradients, e.g.
+    `ForwardDiff` (used by `src/implicit.jl`; every CSG leaf must accept
+    `ForwardDiff.Dual` arguments);
+  - spatial search for scattered-data transfer, e.g. `NearestNeighbors`
+    (the KD-tree behind `RBFP0` in `src/data.jl`);
   - basis-family support packages only when a non-default basis is
     added and the dependency is smaller than implementing the needed
     operations;
@@ -826,6 +905,10 @@ Rules:
     operation that is central to this method.
   - Do not add production dependencies without a short justification in
     the PR summary.
+  - Optional integrations belong in `[weakdeps]` + `[extensions]`, not in
+    `[deps]`. The package currently ships three: `BasicBSpline` (B-spline
+    basis family), `FileIO` + `MeshIO` + `GeometryBasics` (STL /
+    boundary-mesh level sets), and `Tensors` (tensor-notation weak forms).
   - `Manifest.toml` is git-ignored. Do not change that.
 
 ## Performance
@@ -917,13 +1000,42 @@ demos.
   - Immersed boundary (`PhysicalDomain`): strict-α cell-level
     fictitious fold drops the right cells; the expected
     `:full` / `:cut_fitted` / `:fictitious_alpha` / `:cut_fallback` /
-    `:cut_failed` / `:cut_alpha_failed` region-kind tags appear; the
-    candidate-cloud retry rescues a many-feature cut cell that the first
-    attempt cannot fit, and the raw-volume-rule fallback still integrates
-    a cell whose fit fails outright; α-FCM weight scaling on a
-    fully fictitious cell; NNMF moment reproduction to within `target_residual`;
-    end-to-end SPD on a cut-disk Poisson; 1D analytic mass-entry check
-    on a cut cell.
+    `:cut_failed` / `:cut_alpha_failed` / `:cut_custom` region-kind tags
+    appear; the candidate-cloud retry rescues a many-feature cut cell
+    that the first attempt cannot fit, and the raw-volume-rule fallback
+    still integrates a cell whose fit fails outright; α-FCM weight
+    scaling on a fully fictitious cell; NNMF moment reproduction to
+    within `target_residual`; end-to-end SPD on a cut-disk Poisson; 1D
+    analytic mass-entry check on a cut cell; a custom `cut_quadrature`
+    callable replaces the fit on cut regions only and is counted as a
+    cut region, not as a fit failure. **Requirement not yet met:** no
+    test drives a custom rule returning an `:empty` status, so its
+    routing to `:cut_failed` / `:cut_alpha_failed` is unexercised; and
+    because `_merged_boxes` emits pairwise-disjoint boxes, the
+    `(box, moment order)` cache key never repeats within one plan, so
+    no test distinguishes a memoised rule from an unmemoised one.
+  - Multi-domain coupling: a machine-precision Nitsche interface patch
+    test across two independently discretised subdomains; the `couple`
+    four-block sign pattern. **Requirement not yet met:** no coupling
+    test masks a subdomain, so the skip of interface regions where one
+    side has no active cover is unexercised.
+  - Order reduction: covered high-order modes eliminated and buried
+    linear modes deduplicated only under a nested finer level;
+    `reduced_mode_counts` matches the eliminated set. No test in
+    `test_coverage_reduction.jl` builds a masked overlay; the fully
+    deactivated case is pinned indirectly by test_activation.jl's
+    "fully-deactivated overlay equals no overlay", which compares
+    active-unknown counts against an overlay-free space.
+  - Package extensions: the B-spline family's basis values, constraints
+    and a small assembly; the MeshIO signed-distance leaf; the Tensors
+    notation round-trip.
+  - Example smoke suite: the six fast `examples/<name>/<name>.jl`
+    scripts run to a clean exit at a coarse size in the default suite,
+    with a finite, sane headline metric wherever the script prints one;
+    the four slower examples (both FCM plates, the bi-material coupling,
+    the tanh layer) are gated behind `UNFITTED_TEST_SLOW_EXAMPLES=1`,
+    and the three `Tensors`-using examples are skipped outside
+    `Pkg.test`.
 
 ### Testing rules
 

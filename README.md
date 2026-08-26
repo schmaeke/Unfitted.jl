@@ -43,6 +43,33 @@ The method is described in
   moments come from Saye's exact implicit quadrature, with the moment-fit
   structure informed by QuESo (see [`NOTICE.md`](NOTICE.md) for upstream
   attribution).
+- **Multi-domain coupling**: fields may live on *independent* spaces —
+  each subdomain with its own mesh, level-set fold and dof block — tied
+  together across a shared interface mesh by `couple(uₐ, u_b, Γ, form)`.
+  A `WeakForm` gives the jump coupling `∫_Γ a(⟦u⟧, ⟦v⟧) dΓ`, expanded
+  into the four field blocks with the `+ − − +` sign pattern; an
+  `InterfaceForm` kernel — reading `q.normal`, the current side's
+  `trial` gradient (with `sides` naming which side that is), both
+  coupled fields through `q.state`, and the `onside` / `jump_sign`
+  helpers — expresses any two-sided law (weighted Nitsche, cohesive,
+  flux-weighted); `couple` instantiates that kernel once per side pair,
+  so the two-sidedness spans the four blocks. The package supplies the
+  two-sided interface integration, never the constitutive choice.
+- **Order reduction on covered regions** (`reduce_order`, on by
+  default): every high-order mode whose entire incidence stencil is
+  covered by a finer level is eliminated, leaving the linear skeleton.
+  Elimination is per-mode rather than per-cell — a mode is shed only
+  when every cell it touches is covered, so an edge or face mode
+  straddling the boundary of the covered region survives — and a buried
+  linear mode that a *nested* finer level reproduces exactly is
+  deduplicated. Coverage is mask-aware — a user-deactivated overlay cell
+  does not cover, so a fully deactivated overlay still behaves like no
+  overlay — while a cell folded away as fictitious does cover, because
+  it carries no material. The rule is implemented for the
+  integrated-Legendre family only; `reduce_order` still defaults to
+  `true` on a B-spline space, where it silently does nothing.
+  `diagnostics(model, solution).reduced_mode_counts` reports the count
+  per level, concatenated field-by-field.
 - **D-generic core**: 1D, 2D, 3D, and 4D smoke-tested.
 
 ## Installation
@@ -99,6 +126,8 @@ julia --project=examples/<name> examples/<name>/<name>.jl
 | `phase_field_single_edge_notch_2d/` | Phase-field fracture, SENT specimen |
 | `fcm_annular_plate_2d/` | FCM plane-stress annular plate with Nitsche + Neumann (Ruess 2013 §4.2) |
 | `fcm_plate_with_hole_2d/` | FCM plate with a circular hole, Kirsch stress verification |
+| `bimaterial_inclusion_corner_2d/` | Two immersed FCM subdomains coupled by weighted Nitsche across a material interface (Elhaddad 2017 §4.2) |
+| `tanh_layer_2d/` | Steep tanh layer on a curved front — hp-graded overlay stack with order reduction |
 
 ## Documentation
 
@@ -117,7 +146,7 @@ If you use Unfitted.jl in academic work, please cite the method paper:
 > J. N. Schmäke and M. Ruess, *Unfitted Multi-Level hp Refinement for
 > Localized and Moving Solution Features*, arXiv:2604.25797.
 
-A machine-readable record will be provided in
+A machine-readable record is available in
 [`CITATION.cff`](CITATION.cff).
 
 ## License and attribution

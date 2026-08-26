@@ -251,7 +251,7 @@ optional activation mask. Fields:
   - `reduce_order::Bool` — when `true`, this level sheds its high-order
     modes wherever a finer level fully covers it (order reduction),
     keeping only its linear skeleton. See the coverage constraint source
-    in `dofs.jl` and `docs/design/covered-cell-deactivation.md`.
+    in `dofs.jl`.
 """
 struct Level{D,T<:Real,B<:BasisFamily}
     id::Int

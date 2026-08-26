@@ -511,8 +511,8 @@ level opted into `reduce_order`, emit a single-raw strong elimination for
     dedup, source `:dedup`.
 
 The linear skeleton is otherwise retained, which is what makes the reduced space
-complete (see `docs/design/covered-cell-deactivation.md`). Each returned pair carries
-its elimination source for `constraint_kind` / diagnostics.
+complete. Each returned pair carries its elimination source for `constraint_kind` /
+diagnostics.
 
 `classify_cache` is threaded into [`_covered_by_level`](@ref) for the dedup test so it
 applies the same fictitious-fold rule [`build_coverage`](@ref) used.

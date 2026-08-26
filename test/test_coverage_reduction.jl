@@ -1,6 +1,5 @@
 # Regression tests for order reduction in covered regions (the coverage constraint
-# source; see docs/design/covered-cell-deactivation.md). These promote the design
-# spike's configurations to guarded unit tests.
+# source). These promote the design spike's configurations to guarded unit tests.
 #
 # The checks are non-invasive: the mass matrix is the Gram matrix of the active basis,
 # so its rank equals the number of active dofs iff the retained functions are linearly
