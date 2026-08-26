@@ -83,10 +83,11 @@ end
     regions = Unfitted._surface_regions_for_mesh(V, straddling, GeometryTolerance(Float64))
     @test length(regions) == 2
 
-    # Sum of sub-segment lengths matches the original segment to
-    # within the nudge floor.
+    # Subdivision partitions the segment, so the sub-segment quadrature
+    # weights sum to the original length at round-off — there is no
+    # tolerance floor to leave room for.
     total_length = sum(sum(r.weights) for r in regions)
-    @test total_length ≈ 0.1 atol = 1.0e-6
+    @test total_length ≈ 0.1 rtol = 1.0e-14
 
     # The two sub-segments live on different cells of level 1.
     cells_touched = [region.parents[1].cell for region in regions]
@@ -176,27 +177,70 @@ end
 
 @testset "_subdivide_segment: segment crossing multiple grid lines" begin
     # Segment from (0.05, 0.10) to (0.85, 0.40). Crosses x = 0.25, 0.5, 0.75
-    # and y = 0.25. Five grid crossings → six sub-segments expected.
+    # and y = 0.25 — four crossings, so five sub-segments.
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(4, 4), order=1)
     grid_lines = Unfitted._level_grid_lines(V, GeometryTolerance(Float64))
-    subs = Unfitted._subdivide_segment(SVector(0.05, 0.10), SVector(0.85, 0.40), grid_lines,
-                                       sqrt(eps(Float64)))
+    p1 = SVector(0.05, 0.10)
+    p2 = SVector(0.85, 0.40)
+    subs = Unfitted._subdivide_segment(p1, p2, grid_lines, sqrt(eps(Float64)))
     @test length(subs) == 5
 
-    # Sum of sub-segment lengths recovers the original length.
+    # The sub-segments *partition* the input: they start at `p1`, end at
+    # `p2`, and each one begins exactly where the last ended. No arc
+    # length may be discarded at a crossing, so the lengths sum back to
+    # the whole at round-off — not at some tolerance floor.
+    @test subs[1][1] == p1
+    @test subs[end][2] == p2
+    @test all(subs[i][2] == subs[i + 1][1] for i in 1:(length(subs)-1))
     original_length = sqrt(0.80^2 + 0.30^2)
     total = sum(norm(sub[2] - sub[1]) for sub in subs)
-    @test total ≈ original_length atol = 1.0e-6
+    @test total ≈ original_length rtol = 1.0e-14
 
-    # Every sub-segment is strictly inside one cell.
+    # Parent-uniqueness is a statement about each sub-segment's
+    # *interior*: the whole open sub-segment lies in one cell, which is
+    # what lets the region builder attribute it to a parent by midpoint.
+    # The shared endpoints deliberately sit *on* grid lines, where
+    # `locate_cell` snaps to one side and cannot classify them — exactly
+    # as for the K=2 clipping path below.
     for sub in subs
-        mid = (sub[1] + sub[2]) / 2
-        a_cell = Unfitted.locate_cell(V.levels[1].mesh, sub[1])
-        b_cell = Unfitted.locate_cell(V.levels[1].mesh, sub[2])
-        mid_cell = Unfitted.locate_cell(V.levels[1].mesh, mid)
-        @test a_cell == mid_cell == b_cell
+        cells = [Unfitted.locate_cell(V.levels[1].mesh, sub[1] + f * (sub[2] - sub[1]))
+                 for f in (0.1, 0.25, 0.5, 0.75, 0.9)]
+        @test all(c === cells[1] !== nothing for c in cells)
     end
+end
+
+@testset "_subdivide_segment: corner crossing and degenerate splits" begin
+    # A segment through a grid *intersection* produces one crossing per
+    # axis at the same parameter, agreeing only to a few ulp. They must
+    # collapse to a single cut — not to a zero-length sliver straddling
+    # the corner, and not to a gap.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    V = space(omega; cells=(4, 4), order=1)
+    grid_lines = Unfitted._level_grid_lines(V, GeometryTolerance(Float64))
+    nudge = sqrt(eps(Float64))
+
+    corner = Unfitted._subdivide_segment(SVector(0.05, 0.05), SVector(0.45, 0.45), grid_lines,
+                                         nudge)
+    @test length(corner) == 2
+    @test corner[1][2] == corner[2][1]
+    @test sum(norm(s[2] - s[1]) for s in corner) ≈ norm(SVector(0.40, 0.40)) rtol = 1.0e-14
+
+    # Endpoints sitting exactly on grid lines are crossings at t = 0 and
+    # t = 1. Neither may spawn a degenerate sub-segment, and neither may
+    # cost any length.
+    on_lines = Unfitted._subdivide_segment(SVector(0.25, 0.25), SVector(0.75, 0.75), grid_lines,
+                                           nudge)
+    @test all(norm(s[2] - s[1]) > nudge for s in on_lines)
+    @test on_lines[1][1] == SVector(0.25, 0.25)
+    @test on_lines[end][2] == SVector(0.75, 0.75)
+    @test sum(norm(s[2] - s[1]) for s in on_lines) ≈ norm(SVector(0.50, 0.50)) rtol = 1.0e-14
+
+    # A segment lying *along* a grid line still splits across the other
+    # axis and still conserves its length exactly.
+    along = Unfitted._subdivide_segment(SVector(0.05, 0.25), SVector(0.95, 0.25), grid_lines, nudge)
+    @test length(along) == 4
+    @test sum(norm(s[2] - s[1]) for s in along) ≈ 0.90 rtol = 1.0e-14
 end
 
 @testset "_subdivide_triangle: triangle clipped against 3D grid" begin

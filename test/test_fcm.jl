@@ -185,7 +185,8 @@ end
                                                lipschitz=Float64[l.lipschitz for l in leaves])
     moments = Unfitted._moments_from_rule(rule[1], rule[2], region, order)
     starved = Unfitted._cap_candidates(rule[1], order, Unfitted._candidate_budget(1))
-    _, starved_residual = Unfitted._solve_moment_fit(moments, starved, region, order)
+    _, _, starved_residual = Unfitted._solve_moment_fit(moments, starved, region, order,
+                                                       sum(rule[2]))
     @test starved_residual > Unfitted._FIT_FAILURE_RESIDUAL
     # The retry must genuinely enlarge the cloud — the property the fixed cap
     # silently removed.
@@ -276,4 +277,42 @@ end
     pts, _ = Unfitted.implicit_volume_quadrature(phi, region;
                                                  gauss_points=Unfitted._implicit_gauss_points(order))
     @test length(pts) <= 12 * nbasis
+end
+
+@testset "FCM — the weight cutoff is relative to the cut volume" begin
+    # Regression. `_NNLS_WEIGHT_TOL` used to be compared against the fitted
+    # weights as an absolute number. A quadrature weight carries the units of a
+    # volume, so the same geometry at a domain length scale of 1e-5 has 2D weights
+    # of ~1e-12: the truncation then discarded most of the rule (7 of its 9 points
+    # on the cell below) while the region was still reported `:fitted` with a
+    # machine-zero residual — a residual that was, at the time, captured before
+    # the truncation ran and so described a rule nobody received. The measured
+    # symptom was a disc integrating 17 % of its area.
+    #
+    # The rule at scale S must be the rule at scale 1, with the points mapped by
+    # S and the weights by S^D.
+    order = (2, 2)
+    rule_at = S -> begin
+        phi = x -> hypot(x[1] - 0.5S, x[2] - 0.5S) - 0.3S
+        p = physical_domain(phi; lipschitz=1.0, subcell_length_scale=S / 32, max_depth=5)
+        cell = box((0.25S, 0.25S), (0.5S, 0.5S))          # one cut cell of a 4×4 mesh
+        pts, ws, res, status = Unfitted.moment_fit_rule(p, cell, order; target_residual=1.0e-10)
+        return cell, pts, ws, res, status
+    end
+    S = 1.0e-5
+    cell1, pts1, ws1, res1, status1 = rule_at(1.0)
+    cellS, ptsS, wsS, resS, statusS = rule_at(S)
+
+    @test status1 === :fitted
+    @test statusS === :fitted
+    @test length(wsS) == length(ws1)
+    @test sum(wsS) ≈ sum(ws1) * S^2 rtol = 1.0e-10
+    # The whole rule as an integrator, not just its measure: every tensor Legendre
+    # moment in the cell's own reference frame scales by S^D and nothing else.
+    @test _legendre_moments(ptsS, wsS, cellS, order) ≈
+          _legendre_moments(pts1, ws1, cell1, order) .* S^2 rtol = 1.0e-10
+    # The reported residual describes the returned rule, and is machine-level
+    # relative to the cut volume at both scales — the only scale-free reading.
+    @test res1 <= 1.0e-12 * sum(ws1)
+    @test resS <= 1.0e-12 * sum(wsS)
 end

@@ -14,7 +14,11 @@ in the same units as physical-domain coordinates:
     canonicalised to the same value. Drives [`merge_coordinates`](@ref)
     and therefore the admissible-box construction in
     `intersections.jl`, so it sets the smallest distinguishable
-    mesh-coordinate increment.
+    mesh-coordinate increment. Being an absolute length, it has to be
+    read against the geometry it is applied to: a mesh whose spacing on
+    some axis is at or below `merge` would have that axis's own cell
+    boundaries collapsed. [`integration_plan`](@ref) rejects that
+    combination outright instead of integrating a decimated grid.
   - `contain` — slack on point-in-box queries
     ([`contains_point`](@ref), [`is_inside`](@ref), `locate_cell`).
     Containment is conservative: a point counts as inside when
@@ -26,9 +30,12 @@ in the same units as physical-domain coordinates:
     hidden.
 
 The keyword constructor accepts any positive value per field. Defaults are
-`merge = √eps(T)` and `contain = small_volume = merge`. Tighten `merge`
-only when the geometry is known to need finer canonicalisation; loosen
-`contain` only at integration tests that genuinely require it.
+`merge = √eps(T)` and `contain = small_volume = merge`. The defaults are
+calibrated for coordinates of order one; on geometry at a markedly
+different length scale, pass `merge` scaled to that geometry — e.g.
+`√eps(T) · L` for a domain of extent `L`. Tighten `merge` also when the
+geometry is known to need finer canonicalisation; loosen `contain` only
+at integration tests that genuinely require it.
 """
 struct GeometryTolerance{T<:Real}
     merge::T

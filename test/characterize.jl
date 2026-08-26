@@ -66,15 +66,32 @@ if Base.identify_package("BasicBSpline") === nothing
     let env = joinpath(first(DEPOT_PATH), "environments", "unfitted-characterize"),
         repo = normpath(joinpath(@__DIR__, ".."))
 
-        if isfile(joinpath(env, "Project.toml"))
-            Pkg.activate(env; io=devnull)
-        else
-            Pkg.activate(env; io=devnull)
+        Pkg.activate(env; io=devnull)
+        # The environment is persistent and shared across checkouts, so a stale
+        # one may still `dev` a DIFFERENT tree than the one being measured — the
+        # main checkout, say, while this script runs from a git worktree. That
+        # failure is silent and total: the report then describes source the run
+        # never touched, and a fix under test shows up as byte-identical. Re-`dev`
+        # whenever the recorded path is not this repository.
+        needs_dev = !isfile(joinpath(env, "Project.toml"))
+        if !needs_dev
+            manifest = joinpath(env, "Manifest.toml")
+            entry = isfile(manifest) ? get(Pkg.TOML.parsefile(manifest), "deps", nothing) : nothing
+            recorded = entry === nothing ? nothing :
+                       get(first(get(entry, "Unfitted", [Dict()])), "path", nothing)
+            needs_dev = recorded === nothing || normpath(recorded) != normpath(repo)
+        end
+        if needs_dev
             Pkg.develop(; path=repo, io=devnull)
             Pkg.add("BasicBSpline"; io=devnull)
         end
     end
 end
+
+# Precompile with output muted. Otherwise the first run after any `src/` edit
+# interleaves Julia's precompilation chatter into the report, which reads as a
+# spurious diff in whichever case happened to be printing at the time.
+Pkg.precompile(; io=devnull)
 
 using Unfitted
 using BasicBSpline

@@ -58,3 +58,49 @@ end
     @test count(region -> length(region.parents) == 2, plan4.regions) == 1
     assert_parent_maps(V4, plan4)
 end
+
+# `tolerance.merge` is an absolute length. A mesh whose spacing on some axis
+# falls at or below it would have that axis's own element boundaries collapsed
+# by `merge_coordinates`, leaving integration regions that straddle two cells —
+# silently, since nothing downstream can see it. `integration_plan` rejects the
+# combination instead. The threshold is `tolerance.merge` itself, so geometry
+# that merely sits close to it keeps working, and small geometry stays fully
+# supported as soon as the tolerance is scaled to match it.
+@testset "integration regions merge tolerance vs mesh spacing" begin
+    merge_tol = sqrt(eps(Float64))
+
+    # h > merge on both axes: unaffected, one region per cell.
+    Vok = space(box((0.0, 0.0), (1.0, 1.0e-6)); cells=(2, 67), order=1)
+    @test 1.0e-6 / 67 > merge_tol
+    @test length(Unfitted.integration_plan(Vok).regions) == 2 * 67
+
+    # h ≤ merge on axis 2: rejected, and the message has to be actionable.
+    Vbad = space(box((0.0, 0.0), (1.0, 1.0e-7)); cells=(4, 8), order=1)
+    err = try
+        Unfitted.integration_plan(Vbad)
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("axis 2", err.msg)
+    @test occursin(repr(1.0e-7 / 8), err.msg)          # the offending spacing h
+    @test occursin(repr(merge_tol), err.msg)           # the tolerance it violates
+    @test occursin("GeometryTolerance", err.msg)       # the remedy
+
+    # Same geometry with a tolerance scaled to it: fully supported, and every
+    # cell gets its own region back.
+    scaled = GeometryTolerance(; merge=sqrt(eps(Float64)) * 1.0e-7)
+    @test length(Unfitted.integration_plan(Vbad; tolerance=scaled).regions) == 4 * 8
+
+    # A too-fine overlay is caught on the overlay level, named by its own id.
+    Vfine = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1),
+                    box((0.4, 0.4), (0.4 + 1.0e-8, 0.6)); cells=(2, 2), order=1)
+    err2 = try
+        Unfitted.integration_plan(Vfine)
+    catch e
+        e
+    end
+    @test err2 isa ArgumentError
+    @test occursin("level 2", err2.msg)
+    @test occursin("axis 1", err2.msg)
+end

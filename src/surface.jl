@@ -341,11 +341,13 @@ end
 #
 #   * `K = 0` (points)          — trivial, no subdivision needed.
 #   * `K = 1` (segments)        — per-axis parameter-value crossings,
-#                                 sorted, nudged inward at each
-#                                 crossing so sub-segment endpoints
-#                                 fall strictly inside the cell that
-#                                 contains the sub-segment's interior.
-#                                 Works in any `D`.
+#                                 sorted, then cut at exactly. The
+#                                 sub-segments partition the input: an
+#                                 endpoint may land on a grid line, and
+#                                 the sub-segment's *interior* — which
+#                                 is what the midpoint classification
+#                                 sees — lies in one cell. Works in any
+#                                 `D`.
 #   * `K = 2` (triangles in 3D) — Sutherland–Hodgman clipping against
 #                                 the six axis-aligned half-spaces of
 #                                 every cell the triangle overlaps,
@@ -376,9 +378,21 @@ end
     _subdivide_segment(p1, p2, grid_lines, nudge)
 
 Split the segment `(p1, p2)` at every grid-line crossing across every
-axis. Returns a vector of `(a, b)` `SVector` pairs, each contained in
-a single cell of every level (subject to the `nudge` floor). A segment
-with no crossings passes through as `[(p1, p2)]`.
+axis. Returns a vector of `(a, b)` `SVector` pairs that **partition**
+the input: consecutive pairs share their endpoint exactly, the first
+starts at `p1` and the last ends at `p2`, so the sub-segment lengths
+sum back to `‖p2 − p1‖` up to round-off. A segment with no crossings
+passes through as `[(p1, p2)]`.
+
+`nudge` is a tolerance on the *dimensionless* crossing parameter
+`t ∈ [0, 1]` — never on the split geometry. It decides two things and
+nothing else: whether a root of `p1 + t (p2 − p1)` against a grid line
+counts as a crossing at all (the root search admits `t` marginally
+outside `[0, 1]`, since a segment endpoint sitting on a grid line lands
+there), and whether two roots name the same point (a segment through a
+grid *intersection* produces one root per axis, agreeing to a few ulp).
+Because `t` is a ratio of coordinate differences, the tolerance is
+scale-free: rescaling the geometry leaves the subdivision unchanged.
 """
 function _subdivide_segment(p1::SVector{D,T}, p2::SVector{D,T}, grid_lines::NTuple{D},
                             nudge::T) where {D,T}
@@ -388,22 +402,42 @@ function _subdivide_segment(p1::SVector{D,T}, p2::SVector{D,T}, grid_lines::NTup
         iszero(denom) && continue
         for c in grid_lines[d]
             t = (c - p1[d]) / denom
-            -nudge < t < 1 + nudge && push!(crossings, t)
+            # Admit roots marginally outside [0, 1] — an endpoint on a
+            # grid line is one — then clamp, so a split point is never
+            # placed off the segment.
+            -nudge < t < 1 + nudge && push!(crossings, clamp(t, zero(T), one(T)))
         end
     end
     isempty(crossings) && return NTuple{2,SVector{D,T}}[(p1, p2)]
     sort!(crossings)
 
+    # Walk the sorted roots and cut at each one exactly. `a` carries the
+    # previous cut point by value, so neighbouring sub-segments share it
+    # bit-for-bit and no arc length is lost between them. Roots within
+    # `nudge` of the running cut point are the same point (`continue`);
+    # roots within `nudge` of `t = 1` are the far endpoint, and since the
+    # list is sorted every later root is too (`break`) — the closing
+    # `push!` then terminates the chain on the exact `p2`.
+    #
+    # A cut point may therefore land exactly on a grid line, where
+    # `locate_cell` cannot say which side owns it. That is deliberate and
+    # matches the K=2 clipping path: parent-uniqueness is a statement
+    # about a sub-segment's *interior*, which lies strictly inside one
+    # cell precisely because every crossing became a cut. The region
+    # builder classifies by the midpoint (see `_surface_cell_parents`),
+    # so the ambiguity at the shared endpoint is never consulted.
     segments = NTuple{2,SVector{D,T}}[]
-    t_start = zero(T)
+    a = p1
+    t_prev = zero(T)
     for t in crossings
-        t_end = t - nudge
-        if t_end > t_start
-            push!(segments, (p1 + t_start * (p2 - p1), p1 + t_end * (p2 - p1)))
-        end
-        t_start = max(t_start, t + nudge)
+        t - t_prev > nudge || continue
+        one(T) - t > nudge || break
+        b = p1 + t * (p2 - p1)
+        push!(segments, (a, b))
+        a = b
+        t_prev = t
     end
-    t_start < one(T) && push!(segments, (p1 + t_start * (p2 - p1), p2))
+    push!(segments, (a, p2))
     return segments
 end
 

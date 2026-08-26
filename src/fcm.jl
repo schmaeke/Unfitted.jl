@@ -48,7 +48,9 @@
 #      retry index.
 #   4. A single NNLS moment fit (Lawson–Hanson naturally yields ≤ nbasis
 #      non-negative weights; a zero-residual non-negative solution exists, so
-#      one solve reaches machine-level residual).
+#      one solve reaches machine-level residual), then a truncation of the
+#      near-zero weights at a cutoff relative to the cut volume, with the
+#      residual re-measured on the weights that survive it.
 #   5. If no attempt fits, fall back to the volume rule of step 2 itself — the
 #      moments' own source data, correct but uncompressed.
 #
@@ -145,8 +147,17 @@ end
 
 # ── 3. Moment-fit matrix and single solve ─────────────────────────────────────
 
-# Drop a candidate weight when its NNLS solution falls below this absolute
-# threshold (numerical noise around true zeros).
+# Drop a candidate weight when its NNLS solution falls below this threshold
+# (numerical noise around true zeros). The number is dimensionless: a quadrature
+# weight carries the units of a volume, so the cutoff is taken *relative to the
+# cut volume* `∫_{Ω∩R} 1 dx` in `_solve_moment_fit` below. Compared against an
+# absolute constant instead, the same truncation keeps every weight on a geometry
+# of unit size and empties the rule on a small one — at a domain length scale of
+# 1e-5 in 2D a correct cut weight is ~1e-11, an order of magnitude under a 1e-12
+# cutoff. The breakpoint tolerance of `src/implicit.jl` and the mesh-SDF length
+# tolerance of `ext/UnfittedMeshIOExt.jl` are scaled the same way, and for the
+# same reason: the kernel has to behave identically under a rescaling of the
+# geometry.
 const _NNLS_WEIGHT_TOL = 1.0e-12
 
 # Catastrophic failure threshold for the moment-fit residual. A residual above
@@ -179,12 +190,32 @@ function _build_moment_matrix(points::Vector{SVector{D,T}}, region_box::AxisBox{
     return A
 end
 
-# One NNLS solve against the design matrix above: returns `(weights, residual)`
-# for the candidate `points`.
+# One NNLS solve against the design matrix above, followed by the truncation of
+# the near-zero weights: returns `(kept, weights, residual)` — the indices into
+# `points` that survive the truncation, the weights at those points, and the L²
+# moment residual *of that truncated rule*.
+#
+# `cut_volume` is the measure of `Ω ∩ region_box`, the scale the weight cutoff is
+# taken relative to (see `_NNLS_WEIGHT_TOL`). It is deliberately not
+# `volume(region_box)`: on a sliver cut the bounding box and the cut region differ
+# by orders of magnitude, and only the latter tracks the weights being tested.
+#
+# The residual is re-measured after the truncation because what `nnls` reports
+# describes the untruncated weight vector, which is not the rule handed back — a
+# rule truncated to nothing kept a machine-zero residual and read as a perfect
+# fit. Zeroing the dropped entries in place, rather than slicing the matrix down
+# to `kept`, keeps that re-measurement bit-identical to the NNLS residual in the
+# ordinary case, where the truncation drops only the exact zeros of the
+# Lawson–Hanson inactive set.
 function _solve_moment_fit(moments::Vector{T}, points::Vector{SVector{D,T}},
-                           region_box::AxisBox{D,T}, moment_order::NTuple{D,Int}) where {D,T}
+                           region_box::AxisBox{D,T}, moment_order::NTuple{D,Int},
+                           cut_volume::T) where {D,T}
     A = _build_moment_matrix(points, region_box, moment_order)
-    return nnls(A, moments)
+    weights, _ = nnls(A, moments)
+    kept = findall(>(_NNLS_WEIGHT_TOL * cut_volume), weights)
+    truncated = zero(weights)
+    truncated[kept] = weights[kept]
+    return kept, weights[kept], norm(A * truncated - moments)
 end
 
 # ── 4. Exact moments and candidates from the implicit kernel ──────────────────
@@ -334,9 +365,15 @@ overrides the `1e-10` default here.
   - `:fallback` — no attempt met `_FIT_FAILURE_RESIDUAL`, so the returned rule is
     the highest-order attempt's *raw Saye volume rule* — the very data the
     moments were computed from, uncompressed. Region kind `:cut_fallback`.
-  - `:empty` — `Ω ∩ region_box` carries no volume rule at all; `points` and
-    `weights` are empty and `residual` is zero. Region kind `:cut_failed`
-    (`:cut_alpha_failed` under α-FCM).
+  - `:empty` — `Ω ∩ region_box` carries no volume rule at all, or every fitted
+    weight falls below the cut-volume-relative truncation cutoff so the
+    compressed rule would hold no points; `points` and `weights` are empty and
+    `residual` is zero. Region kind `:cut_failed` (`:cut_alpha_failed` under
+    α-FCM).
+
+The returned `residual` measures the rule that is returned: it is taken after the
+near-zero weights have been truncated away, so it never describes a denser rule
+than the caller receives.
 
 The fallback loses no accuracy: on a cell where the fit fails, the volume rule is
 by construction at least as accurate as a successful fit would have been, and its
@@ -386,10 +423,17 @@ function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T},
         isempty(saye_pts) && return SVector{D,T}[], T[], zero(T), :empty
         moments = _moments_from_rule(saye_pts, saye_ws, region_box, moment_order)
         candidates = _cap_candidates(saye_pts, moment_order, _candidate_budget(attempt))
-        weights, residual = _solve_moment_fit(moments, candidates, region_box, moment_order)
-        kept = findall(>(_NNLS_WEIGHT_TOL), weights)
+        kept, kept_ws, residual = _solve_moment_fit(moments, candidates, region_box,
+                                                    moment_order, sum(saye_ws))
+        # A fit whose every weight falls under the truncation cutoff is no rule at
+        # all: hand back the same `:empty` an empty kernel rule returns, so the
+        # caller drops the region (or keeps its α-stabilised tensor part) instead
+        # of consuming a zero-point rule as a successful fit. A denser candidate
+        # cloud cannot resurrect a fit that collapsed to zero, so there is nothing
+        # for the retry to do here.
+        isempty(kept) && return SVector{D,T}[], T[], zero(T), :empty
         if residual < best_res
-            best_pts, best_ws, best_res = candidates[kept], weights[kept], residual
+            best_pts, best_ws, best_res = candidates[kept], kept_ws, residual
         end
         best_res <= target && return best_pts, best_ws, best_res, :fitted
     end

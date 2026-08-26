@@ -440,6 +440,51 @@ function _merged_boxes(levels, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
     return boxes
 end
 
+# ── Merge tolerance vs. mesh spacing ──────────────────────────────────────────
+#
+# `tolerance.merge` is an absolute length, and `merge_coordinates` collapses
+# per-axis element boundaries that separate by no more than it. Between
+# levels that is exactly the intent: two meshes' near-coincident boundaries
+# should become one shared coordinate rather than a sliver. Within a single
+# level it is silent destruction. An axis whose own cell spacing `h`
+# satisfies `h ≤ tolerance.merge` has its boundary list decimated —
+# genuinely distinct cell faces collapse — and every surviving integration
+# region then straddles two cells of that level. That breaks the
+# one-cell-per-axis-per-level contract the whole region partition rests on,
+# and nothing downstream can detect it: the integrand is no longer smooth on
+# the region, yet the tensor Gauss rule is still applied to it. The observed
+# outcomes are a converged, entirely wrong solution for a span-mode B-spline
+# basis, and an unattributed `SingularException` for integrated Legendre.
+#
+# The check is the compatibility condition between the two lengths the user
+# controls — mesh spacing and merge tolerance — not a floor on either one.
+# Geometry at h = 1e-9 stays legal; it needs a `tolerance.merge` below it,
+# in the same spirit as the region-scaled `atol` in `implicit.jl` and the
+# diagonal-scaled sign tolerance in the MeshIO extension.
+#
+# The threshold is `tolerance.merge` itself and not a multiple of it: it
+# mirrors `merge_coordinates`'s own `> tol.merge` keep-test, so exactly the
+# configurations that lose a coordinate are rejected, and configurations
+# that merely sit close to the tolerance keep working.
+function _check_axis_spacing(levels, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
+    for level in levels, d in 1:D
+        coords = boundary_coordinates(level.mesh)[d]
+        spacing = minimum(coords[i + 1] - coords[i] for i in 1:(length(coords)-1))
+        spacing > tol.merge && continue
+        # Report the scale-aware value the default would have had on this
+        # axis, √eps(T) · extent, so the remedy is a number to paste.
+        suggested = sqrt(eps(T)) * (coords[end] - coords[begin])
+        throw(ArgumentError("level $(level.id) has cell spacing h = $spacing on axis $d, at or " *
+                            "below the coordinate merge tolerance $(tol.merge): that axis's " *
+                            "element boundaries collapse into each other, and every integration " *
+                            "region would straddle two cells. Pass a merge tolerance below the " *
+                            "finest spacing, e.g. `tolerance=GeometryTolerance(; " *
+                            "merge=$suggested)` (√eps scaled by this axis's extent), or use " *
+                            "fewer cells on axis $d."))
+    end
+    return nothing
+end
+
 # ── Region parent coverage ────────────────────────────────────────────────────
 
 # For an admissible region `box`, find every parent level whose active
@@ -503,6 +548,11 @@ together with the small-overlap / cut-region / moment-fit diagnostics.
 The construction follows the recipe in `CONTRIBUTING.md`'s "Integration
 regions" section:
 
+  0. Per level, per axis: check that the mesh spacing exceeds
+     `tolerance.merge`. An axis at or below it would have its own cell
+     boundaries collapsed by step 1, silently, so this combination is
+     rejected with an `ArgumentError` naming the axis, its spacing, and
+     the tolerance.
   1. Per axis: collect every active level's element-boundary coordinates
      and canonicalise them via `merge_coordinates` so two meshes'
      near-coincident coordinates collapse to a single shared boundary.
@@ -525,6 +575,9 @@ Keyword arguments:
 
   - `tolerance` — geometry tolerance applied at every step
     (`merge_coordinates`, midpoint containment, small-volume reporting).
+    Its `merge` field is an absolute length, so a mesh finer than it on
+    any axis is rejected rather than silently decimated (step 0). Small
+    geometry is fully supported; it needs a `merge` below its own spacing.
   - `criterion` — `:any_parent` (default), `:all_levels`, or a function
     `parents -> Bool`. See `_criterion_satisfied` for the semantics.
   - `classify_cache` — optional classification cache shared with the
@@ -538,6 +591,10 @@ The function is called by `prepare`, `move!`, and `_update_mask!` in
 """
 function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criterion=:any_parent,
                           classify_cache=_ClassifyCache{D,T}()) where {D,T}
+    # Reject a merge tolerance that cannot resolve the meshes it is about to
+    # canonicalise, before a single region is built. See `_check_axis_spacing`.
+    _check_axis_spacing(V.levels, Val(D), tolerance)
+
     regions = VolumeRegion{D,T}[]
     small_overlaps = SmallOverlap{T}[]
     tensor_cache = Dict{NTuple{D,Int},TensorQuadrature{D,T}}()
