@@ -1,7 +1,7 @@
 @testset "1D solution evaluation and L2 error" begin
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=1, order=2)
-    model = prepare(poisson(V; source=x -> 2.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    model = prepare(poisson(V; source=2.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     solution = solve!(model)
     exact = x -> x[1] * (1 - x[1])
 
@@ -15,7 +15,7 @@ end
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=1, order=1)
     V = overlay(V, box((0.25,), (0.75,)); cells=1, order=2)
-    model = prepare(poisson(V; source=x -> 0.0))
+    model = prepare(poisson(V; source=0.0))
 
     coefficients = zeros(Unfitted.active_unknowns(model.dofs))
     base_dofs = Unfitted.active_cell_dofs(model.dofs, 1, CartesianIndex(1))
@@ -40,7 +40,7 @@ end
 @testset "D-generic constant-field evaluation smoke test" begin
     omega = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
     V = space(omega; cells=(1, 1, 1), order=1)
-    model = prepare(poisson(V; source=x -> 0.0))
+    model = prepare(poisson(V; source=0.0))
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
@@ -52,7 +52,7 @@ end
 @testset "solution/model mismatch checks" begin
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=1, order=1)
-    model = prepare(poisson(V; source=x -> 0.0))
+    model = prepare(poisson(V; source=0.0))
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version + 1,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
@@ -67,7 +67,7 @@ end
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(2, 2), order=2)
     V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(1, 1), order=3)
-    model = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     @test active_unknowns(model) isa Int
     @test active_unknowns(model) == Unfitted.active_unknowns(model.dofs)
@@ -99,7 +99,7 @@ end
     # 2D unit square: ∫_∂Ω 1 ds == 4, per-face == 1, corner point == 1.
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(3, 3), order=2)
-    model = prepare(poisson(V; source=x -> 0.0))
+    model = prepare(poisson(V; source=0.0))
 
     @test boundary_integral(q -> 1.0, model; on=boundary(:all)) ≈ 4.0
     @test boundary_integral(q -> 1.0, model; on=boundary(axis=1, side=:lower)) ≈ 1.0
@@ -110,7 +110,7 @@ end
     # 3D unit cube: ∫_∂Ω 1 ds == 6 (six unit faces), per-face == 1.
     cube = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
     Vc = space(cube; cells=(2, 2, 2), order=1)
-    cube_model = prepare(poisson(Vc; source=x -> 0.0))
+    cube_model = prepare(poisson(Vc; source=0.0))
 
     @test boundary_integral(q -> 1.0, cube_model; on=boundary(:all)) ≈ 6.0
     @test boundary_integral(q -> 1.0, cube_model; on=boundary(axis=3, side=:upper)) ≈ 1.0
@@ -124,8 +124,7 @@ end
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(2, 2), order=2)
     exact_value(x) = x[1] * x[2]
-    model = prepare(poisson(V; source=x -> 0.0,
-                            dirichlet=[dirichlet(exact_value; on=boundary(:all))]))
+    model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(exact_value; on=boundary(:all))]))
     sol = solve!(model)
 
     top_trace = boundary_integral(q -> value(sol, model, q.x), model;
@@ -147,7 +146,7 @@ end
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(2, 2), order=1)
     V = overlay(V, box((0.0, 0.0), (0.5, 0.5)); cells=(1, 1), order=2)
-    model = prepare(poisson(V; source=x -> 0.0))
+    model = prepare(poisson(V; source=0.0))
 
     @test boundary_integral(q -> 1.0, model; on=boundary(axis=2, side=:lower)) ≈ 1.0
     @test boundary_integral(q -> 1.0, model; on=boundary(:all)) ≈ 4.0
@@ -157,7 +156,7 @@ end
     # Codim-1 faces: outward normal should be ±eₐ matching the side.
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(2, 2), order=1)
-    model = prepare(poisson(V; source=x -> 0.0))
+    model = prepare(poisson(V; source=0.0))
 
     # Capture the normal observed at one quadrature point per face.
     function first_normal(selector)
@@ -185,7 +184,7 @@ end
     V = space(omega; cells=(2, 2), order=1)
 
     # No Dirichlet → empty cache, zero facet-region count.
-    plain = prepare(poisson(V; source=x -> 0.0))
+    plain = prepare(poisson(V; source=0.0))
     @test isempty(plain.facet_regions)
     @test diagnostics(plain).facet_region_count == 0
     @test nquadpoints(plain; kind=:facet) == 0
@@ -193,15 +192,14 @@ end
 
     # boundary(:all) → one cached selector. Region count and q-point
     # count match what boundary_integral sees on the same model.
-    with_dirichlet = prepare(poisson(V; source=x -> 0.0,
-                                     dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    with_dirichlet = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     @test length(with_dirichlet.facet_regions) == 1
     selector_count = sum(length, values(with_dirichlet.facet_regions))
     @test diagnostics(with_dirichlet).facet_region_count == selector_count
     @test nquadpoints(with_dirichlet; kind=:facet) > 0
 
     # Distinct selectors are cached separately.
-    multi = prepare(poisson(V; source=x -> 0.0,
+    multi = prepare(poisson(V; source=0.0,
                             dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower)),
                                        dirichlet(0.0; on=boundary(axis=2, side=:upper))]))
     @test length(multi.facet_regions) == 2
@@ -214,7 +212,7 @@ end
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(2, 2), order=1)
     V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(1, 1), order=1)
-    model = prepare(poisson(V; source=x -> 0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     before_count = diagnostics(model).facet_region_count
     move!(model; level=2, to=box((0.3, 0.3), (0.8, 0.8)))
@@ -242,7 +240,7 @@ end
     mask = trues(2, 2)
     mask[:, 1] .= false   # cell (·, y=1) → inactive on the lower row
     V = space(omega; cells=(2, 2), order=1, active=BitArray(mask))
-    model = prepare(poisson(V; source=x -> 0.0))
+    model = prepare(poisson(V; source=0.0))
 
     @test_throws ArgumentError boundary_integral(q -> 1.0, model; on=boundary(axis=2, side=:lower))
 

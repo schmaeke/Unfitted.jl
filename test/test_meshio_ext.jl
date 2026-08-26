@@ -195,7 +195,7 @@ end
     v, f = _cube_mesh(0.2, 0.8)
     dom = physical_domain(mesh_levelset(triangle_mesh(v, f)); subcell_length_scale=0.05)
     V = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(4, 4, 4), order=1, physical=dom)
-    m = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    m = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     assemble!(m)
     @test isposdef(Symmetric(Matrix(m.matrix)))
     sol = solve!(m)

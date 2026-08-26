@@ -7,10 +7,10 @@ end
 
 @testset "L2 transfer preserves an exactly represented polynomial" begin
     omega = box((0.0,), (1.0,))
-    source_model = prepare(poisson(space(omega; cells=1, order=2); source=x -> 2.0,
+    source_model = prepare(poisson(space(omega; cells=1, order=2); source=2.0,
                                    dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     source_solution = solve!(source_model)
-    target_model = prepare(poisson(space(omega; cells=2, order=2); source=x -> 0.0,
+    target_model = prepare(poisson(space(omega; cells=2, order=2); source=0.0,
                                    dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     target_solution = transfer(source_solution, source_model, target_model)
@@ -33,14 +33,14 @@ end
     exact = x -> 1 + x[1]      # harmonic and linear; representable in both order-2 spaces
 
     # Source carries u = 1 + x exactly (non-homogeneous Dirichlet, Laplace).
-    source_model = prepare(poisson(space(omega; cells=1, order=2); source=x -> 0.0,
+    source_model = prepare(poisson(space(omega; cells=1, order=2); source=0.0,
                                    dirichlet=[dirichlet(exact; on=boundary(:all))]))
     source_solution = solve!(source_model)
 
     # The default L2 path must assemble the Dirichlet lift, so the projection
     # reproduces u = 1 + x exactly — including the free interior dof at x = 0.5.
     # Without the lift the interior coefficient is wrong (the bug this guards).
-    target_model = prepare(poisson(space(omega; cells=2, order=2); source=x -> 0.0,
+    target_model = prepare(poisson(space(omega; cells=2, order=2); source=0.0,
                                    dirichlet=[dirichlet(exact; on=boundary(:all))]))
     target_solution = transfer(source_solution, source_model, target_model)
     @test l2_error(target_solution, target_model, exact; norm=:absolute) < 1.0e-10
@@ -58,8 +58,8 @@ end
     source_space = space(omega; cells=1, order=1)
     source_space = overlay(source_space, box((0.25,), (0.75,)); cells=1, order=2)
     target_space = moved_space(source_space; level=2, to=box((0.1,), (0.6,)))
-    source_model = prepare(poisson(source_space; source=x -> 0.0))
-    target_model = prepare(poisson(target_space; source=x -> 0.0))
+    source_model = prepare(poisson(source_space; source=0.0))
+    target_model = prepare(poisson(target_space; source=0.0))
 
     coefficients = zeros(Unfitted.active_unknowns(source_model.dofs))
     base_dofs = Unfitted.active_cell_dofs(source_model.dofs, 1, CartesianIndex(1))
@@ -79,8 +79,8 @@ end
     omega = box((0.0,), (1.0,))
     source_field = field(:u, space(omega; cells=1, order=1); components=2)
     target_field = field(:u, space(omega; cells=2, order=1); components=2)
-    source_model = prepare(poisson(source_field; source=x -> SVector(0.0, 0.0)))
-    target_model = prepare(poisson(target_field; source=x -> SVector(0.0, 0.0)))
+    source_model = prepare(poisson(source_field; source=SVector(0.0, 0.0)))
+    target_model = prepare(poisson(target_field; source=SVector(0.0, 0.0)))
 
     coefficients = zeros(Unfitted.active_unknowns(source_model.dofs))
     for component in 1:2
@@ -130,7 +130,7 @@ end
 
 @testset "L2 transfer preserves target physical constraints" begin
     omega = box((0.0,), (1.0,))
-    source_model = prepare(poisson(space(omega; cells=1, order=1); source=x -> 0.0))
+    source_model = prepare(poisson(space(omega; cells=1, order=1); source=0.0))
     source_coefficients = zeros(Unfitted.active_unknowns(source_model.dofs))
     source_dofs = Unfitted.active_cell_dofs(source_model.dofs, 1, CartesianIndex(1))
     source_coefficients[source_dofs[1]] = 1.0
@@ -138,7 +138,7 @@ end
     source_solution = Solution(source_coefficients, source_model.version,
                                Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
-    target_model = prepare(poisson(space(omega; cells=2, order=2); source=x -> 0.0,
+    target_model = prepare(poisson(space(omega; cells=2, order=2); source=0.0,
                                    dirichlet=[dirichlet(x -> 1 + x[1]; on=boundary(:all))]))
     target_solution = transfer(source_solution, source_model, target_model)
 
@@ -151,8 +151,8 @@ end
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=1, order=1)
     V = overlay(V, box((0.25,), (0.75,)); cells=1, order=2)
-    source_model = prepare(poisson(V; source=x -> 0.0))
-    target_model = prepare(poisson(V; source=x -> 0.0))
+    source_model = prepare(poisson(V; source=0.0))
+    target_model = prepare(poisson(V; source=0.0))
     coefficients = zeros(Unfitted.active_unknowns(source_model.dofs))
     overlay_dofs = Unfitted.active_cell_dofs(source_model.dofs, 2, CartesianIndex(1))
     coefficients[overlay_dofs[3]] = 1.0
@@ -174,9 +174,9 @@ end
 end
 
 @testset "L2 transfer rejects incompatible models" begin
-    source_model = prepare(poisson(space(box((0.0,), (1.0,)); cells=1, order=1); source=x -> 0.0))
+    source_model = prepare(poisson(space(box((0.0,), (1.0,)); cells=1, order=1); source=0.0))
     target_model = prepare(poisson(space(box((0.0, 0.0), (1.0, 1.0)); cells=(1, 1), order=1);
-                                   source=x -> 0.0))
+                                   source=0.0))
     solution = Solution(ones(Unfitted.active_unknowns(source_model.dofs)), source_model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
@@ -191,8 +191,8 @@ end
     V_small = space(omega; cells=(2, 2), order=1, active=half_mask)
     V_big = space(omega; cells=(2, 2), order=1, active=full_mask)
 
-    source_model = prepare(poisson(V_small; source=x -> 0.0))
-    target_model = prepare(poisson(V_big; source=x -> 0.0))
+    source_model = prepare(poisson(V_small; source=0.0))
+    target_model = prepare(poisson(V_big; source=0.0))
 
     src_coeffs = zeros(Unfitted.active_unknowns(source_model.dofs))
     cell_dofs = Unfitted.active_cell_dofs(source_model.dofs, 1, CartesianIndex(1, 1))
@@ -230,10 +230,10 @@ end
     V_big = space(omega; cells=(2, 2), order=2)
     V_big = overlay(V_big, box((0.2, 0.2), (0.8, 0.8)); cells=(4, 4), order=2, active=big_mask)
 
-    source_model = prepare(poisson(V_small; source=x -> 1.0,
+    source_model = prepare(poisson(V_small; source=1.0,
                                    dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     source_solution = solve!(source_model)
-    target_model = prepare(poisson(V_big; source=x -> 1.0,
+    target_model = prepare(poisson(V_big; source=1.0,
                                    dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     rewired = transfer(source_solution, source_model, target_model; via=Rewire())
@@ -250,8 +250,8 @@ end
     V_smaller = space(omega; cells=1, order=1)
 
     # Source has more cells than target — strict mode should throw, lax mode should drop.
-    source_model = prepare(poisson(V_small; source=x -> 0.0))
-    target_model = prepare(poisson(V_smaller; source=x -> 0.0))
+    source_model = prepare(poisson(V_small; source=0.0))
+    target_model = prepare(poisson(V_smaller; source=0.0))
 
     src_coeffs = ones(Unfitted.active_unknowns(source_model.dofs))
     sol = Solution(src_coeffs, source_model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
@@ -271,10 +271,9 @@ end
     omega = box((-1.0, -1.0), (1.0, 1.0))
     disk = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.7; lipschitz=1.0,
                            subcell_length_scale=0.5)
-    source_model = prepare(poisson(space(omega; cells=(2, 2), order=1); source=x -> 0.0))
+    source_model = prepare(poisson(space(omega; cells=(2, 2), order=1); source=0.0))
     source_solution = Solution(zeros(Unfitted.active_unknowns(source_model.dofs)),
                                source_model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
-    target_model = prepare(poisson(space(omega; cells=(2, 2), order=1, physical=disk);
-                                   source=x -> 0.0))
+    target_model = prepare(poisson(space(omega; cells=(2, 2), order=1, physical=disk); source=0.0))
     @test_throws ArgumentError transfer(source_solution, source_model, target_model)
 end

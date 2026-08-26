@@ -4,7 +4,7 @@ using StaticArrays
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(1, 1), order=1)
     V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(1, 1), order=2)
-    model = prepare(poisson(V; source=x -> 0.0))
+    model = prepare(poisson(V; source=0.0))
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
@@ -54,8 +54,7 @@ end
     u1 = field(:u1, V1)
     u2 = field(:u2, V2)
     model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
-                            loads=(source_load(u1; source=x -> 1.0),
-                                   source_load(u2; source=x -> 1.0)),
+                            loads=(source_load(u1; source=1.0), source_load(u2; source=1.0)),
                             dirichlet=[dirichlet(0.0; on=boundary(:all), field=:u1),
                                        dirichlet(0.0; on=boundary(:all), field=:u2)]))
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
@@ -95,7 +94,7 @@ end
     a = field(:a, V)
     b = field(:b, V)
     model = prepare(Problem((a, b); blocks=(stiffness_block(a), mass_block(b)),
-                            loads=(source_load(a; source=x -> 1.0),),
+                            loads=(source_load(a; source=1.0),),
                             dirichlet=[dirichlet(0.0; on=boundary(:all), field=:a)]))
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
@@ -110,7 +109,7 @@ end
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(1, 1), order=2)
     u = field(:u, V; components=2)
-    model = prepare(poisson(u; source=x -> SVector(0.0, 0.0)))
+    model = prepare(poisson(u; source=SVector(0.0, 0.0)))
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
@@ -132,7 +131,7 @@ end
     active = falses(3, 3)
     active[2, 2] = true
     V = overlay(V, box((0.1, 0.1), (0.9, 0.9)); cells=(3, 3), order=1, active=active)
-    model = prepare(poisson(V; source=x -> 0.0))
+    model = prepare(poisson(V; source=0.0))
     coefficients = ones(Unfitted.active_unknowns(model.dofs))
     soln = Solution(coefficients, model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
@@ -184,7 +183,7 @@ end
 @testset "VTK export rejects dimensions above 3" begin
     omega = box((0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0, 1.0))
     V = space(omega; cells=(1, 1, 1, 1), order=1)
-    model = prepare(poisson(V; source=x -> 0.0))
+    model = prepare(poisson(V; source=0.0))
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
@@ -202,7 +201,7 @@ end
     physical = physical_domain(phi_disk; lipschitz=1.0, alpha=1.0, subcell_length_scale=0.125,
                                max_depth=3)
     V = space(omega; cells=(2, 2), order=1, physical=physical)
-    model = prepare(poisson(V; source=x -> 0.0))
+    model = prepare(poisson(V; source=0.0))
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
@@ -217,7 +216,7 @@ end
 @testset "VTK omits level_set when no PhysicalDomain is attached" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(1, 1), order=1)
-    model = prepare(poisson(V; source=x -> 0.0))
+    model = prepare(poisson(V; source=0.0))
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
@@ -240,7 +239,7 @@ end
     physical = physical_domain(phi_disk; lipschitz=1.0, alpha=1.0, subcell_length_scale=0.25,
                                max_depth=2)
     V = space(omega; cells=(1, 1), order=1, physical=physical)
-    model = prepare(poisson(V; source=x -> 0.0))
+    model = prepare(poisson(V; source=0.0))
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
@@ -261,7 +260,7 @@ end
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(2, 2), order=1)
     V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(1, 1), order=1)
-    model = prepare(poisson(V; source=x -> 0.0))
+    model = prepare(poisson(V; source=0.0))
 
     dir = mktempdir()
     files = write_quadrature_vtm(joinpath(dir, "qp"), model)

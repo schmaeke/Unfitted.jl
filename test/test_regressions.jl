@@ -2,8 +2,7 @@
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=2, order=2)
     exact = x -> 1 + x[1] + x[1] * (1 - x[1])
-    model = prepare(poisson(V; source=x -> 2.0,
-                            dirichlet=[dirichlet(x -> 1 + x[1]; on=boundary(:all))]))
+    model = prepare(poisson(V; source=2.0, dirichlet=[dirichlet(x -> 1 + x[1]; on=boundary(:all))]))
     solution = solve!(model)
     report = diagnostics(model, solution; exact)
 
@@ -28,7 +27,7 @@ end
     omega = box((0.0,), (1.0,))
     source_space = space(omega; cells=1, order=1)
     source_space = overlay(source_space, box((0.2,), (0.6,)); cells=1, order=2)
-    source_model = prepare(poisson(source_space; source=x -> 0.0))
+    source_model = prepare(poisson(source_space; source=0.0))
     target_model = moved(source_model; level=2, to=box((0.35,), (0.85,)))
 
     coefficients = zeros(Unfitted.active_unknowns(source_model.dofs))
@@ -50,7 +49,7 @@ end
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=1, order=2)
     V = overlay(V, box((0.9999,), (1.0,)); cells=1, order=2)
-    model = prepare(poisson(V; source=x -> 0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]);
+    model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]);
                     tolerance)
 
     assemble!(model)
@@ -100,7 +99,7 @@ end
 
 @testset "diagnostics rejects stale solutions" begin
     omega = box((0.0,), (1.0,))
-    model = prepare(poisson(space(omega; cells=1, order=1); source=x -> 0.0))
+    model = prepare(poisson(space(omega; cells=1, order=1); source=0.0))
     solution = Solution(zeros(Unfitted.active_unknowns(model.dofs)), model.version + 1,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 

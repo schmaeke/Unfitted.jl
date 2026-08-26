@@ -72,7 +72,7 @@ end
     # Two adjacent cells of the same level should share p = degree
     # raw dofs along the shared axis.
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=3, basis=bspline())
-    problem = poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))])
+    problem = poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))])
     model = prepare(problem)
     field_layout = model.dofs.fields[1]
     cell1 = Unfitted.cell_dofs(field_layout.dofs, 1, CartesianIndex(1, 1))
@@ -112,7 +112,7 @@ end
     # u''(x) = 1, u(0) = u(1) = 0, exact: u(x) = x(1-x)/2.
     V = space(box((0.0,), (1.0,)); cells=8, order=3, basis=bspline())
     u = field(:u, V)
-    problem = poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))])
+    problem = poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))])
     model = prepare(problem)
     solution = solve!(model)
     for x in (0.25, 0.5, 0.75)
@@ -183,7 +183,7 @@ end
     V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3,
                 basis=bspline(continuity_order=1))
     u = field(:u, V)
-    problem = poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))])
+    problem = poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))])
     model = prepare(problem)
     solution = solve!(model)
     @test active_unknowns(model.dofs) > 0
@@ -245,7 +245,7 @@ end
     mask_L[1, 2:4] .= true
     Vover = overlay(Vbase, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3, basis=bspline(),
                     active=mask_L)
-    problem = poisson(Vover; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))])
+    problem = poisson(Vover; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))])
     model = prepare(problem)
     solution = solve!(model)
     @test isfinite(value(solution, model, field(:u, Vover), (0.5, 0.5)))
@@ -262,7 +262,7 @@ end
     Vover = overlay(Vbase, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3, basis=bspline(),
                     active=overlay_mask)
     u = field(:u, Vover)
-    problem = poisson(Vover; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))])
+    problem = poisson(Vover; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))])
     model = prepare(problem)
     solution = solve!(model)
     # Sanity: SPD-style residual is small and the centerline value is
@@ -294,7 +294,7 @@ end
 
     # End-to-end: the moved configuration still assembles and solves.
     u = field(:u, V2)
-    problem = poisson(V2; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))])
+    problem = poisson(V2; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))])
     model = prepare(problem)
     solution = solve!(model)
     @test isfinite(value(solution, model, u, (0.5,)))

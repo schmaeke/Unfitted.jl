@@ -6,7 +6,7 @@ using BasicBSpline  # triggers the B-spline extension for the C¹ scatter fixtur
 @testset "assembly scaffold" begin
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=2, order=1)
-    problem = poisson(V; source=x -> 1.0)
+    problem = poisson(V; source=1.0)
     model = prepare(problem)
 
     @test problem.space === V
@@ -19,7 +19,7 @@ end
 @testset "1D Poisson assembly and direct solve" begin
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=2, order=1)
-    problem = poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))])
+    problem = poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))])
     model = prepare(problem)
 
     assemble!(model)
@@ -53,7 +53,7 @@ end
 @testset "2D scalar H1 assembly is symmetric positive definite" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(1, 1), order=2)
-    model = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     assemble!(model)
     @test size(model.matrix) == (1, 1)
@@ -68,7 +68,7 @@ end
     # order=4 is the lowest 2D trunk order with an interior mode, so a
     # Dirichlet-on-all single cell leaves exactly one interior unknown.
     V = space(omega; cells=(1, 1), order=4, mode=:trunk)
-    model = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     assemble!(model)
     @test V.levels[1].mode == :trunk
@@ -83,7 +83,7 @@ end
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=1, order=2)
     V = overlay(V, box((0.25,), (0.75,)); cells=1, order=2)
-    model = prepare(poisson(V; source=x -> 0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     assemble!(model)
     @test diagnostics(model).active_unknowns == 2
@@ -161,7 +161,7 @@ end
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(1, 1), order=2)
     u = field(:u, V; components=2)
-    model = prepare(poisson(u; source=x -> SVector(1.0, 2.0),
+    model = prepare(poisson(u; source=SVector(1.0, 2.0),
                             dirichlet=[dirichlet(SVector(0.0, 0.0); on=boundary(:all))]))
 
     assemble!(model)
@@ -358,8 +358,7 @@ end
 @testset "1D nonzero Dirichlet uses boundary projection and RHS correction" begin
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=2, order=1)
-    model = prepare(poisson(V; source=x -> 0.0,
-                            dirichlet=[dirichlet(x -> 1 + x[1]; on=boundary(:all))]))
+    model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(x -> 1 + x[1]; on=boundary(:all))]))
 
     assemble!(model)
     @test model.matrix[1, 1] ≈ 4.0
@@ -377,7 +376,7 @@ end
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(1, 1), order=(1, 2))
     g = x -> 1 + x[2]
-    model = prepare(poisson(V; source=x -> 0.0,
+    model = prepare(poisson(V; source=0.0,
                             dirichlet=[dirichlet(g; on=boundary(axis=1, side=:lower))]))
     solution = solve!(model)
 
@@ -561,7 +560,7 @@ end
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(2, 2), order=2)
     u = field(:u, V)
-    src = x -> 1.0
+    src = 1.0
 
     plain = prepare(poisson(V; source=src,
                             dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower))]))
@@ -617,7 +616,7 @@ end
 @testset "scatter assembly invariants across the fixture matrix" begin
     # 1D scalar, single level, symmetric.
     let V = space(box((0.0,), (1.0,)); cells=4, order=2)
-        model = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+        model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
         _check_scatter_assemble!(model)
     end
 
@@ -643,7 +642,7 @@ end
     let V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2),
         u = field(:u, V; components=2)
 
-        model = prepare(poisson(u; source=x -> SVector(1.0, 2.0),
+        model = prepare(poisson(u; source=SVector(1.0, 2.0),
                                 dirichlet=[dirichlet(SVector(0.0, 0.0); on=boundary(:all))]))
         _check_scatter_assemble!(model)
         # The component-unaware form leaves cross-component blocks in the
@@ -687,7 +686,7 @@ end
         V = overlay(V0, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3,
                     basis=bspline(continuity_order=1))
 
-        model = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+        model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
         _check_scatter_assemble!(model)
     end
 
@@ -696,7 +695,7 @@ end
         p = physical_domain(phi; lipschitz=1.0, subcell_length_scale=1.0 / 2^4, max_depth=4),
         V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=p)
 
-        model = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+        model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
         _check_scatter_assemble!(model)
     end
 

@@ -217,8 +217,8 @@ end
     V_phys = space(omega; cells=(8, 8), order=2,
                    physical=physical_domain(x -> -1.0; lipschitz=1.0, subcell_length_scale=1.0))
 
-    m_no = prepare(poisson(V_no; source=x -> 1.0, dirichlet=[bc]))
-    m_phys = prepare(poisson(V_phys; source=x -> 1.0, dirichlet=[bc]))
+    m_no = prepare(poisson(V_no; source=1.0, dirichlet=[bc]))
+    m_phys = prepare(poisson(V_phys; source=1.0, dirichlet=[bc]))
 
     @test diagnostics(m_no).active_unknowns == diagnostics(m_phys).active_unknowns
     @test diagnostics(m_phys).inactive_cell_counts == [0]
@@ -239,7 +239,7 @@ end
                            subcell_length_scale=1.0e-6, max_depth=2)
     V = space(omega; cells=(10, 10), order=1, physical=hole)
 
-    m = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    m = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     @test diagnostics(m).inactive_cell_counts == [4]
 
@@ -295,7 +295,7 @@ end
     V = overlay(space(omega; cells=(8, 8), order=1, physical=p), box((0.3, 0.3), (0.7, 0.7));
                 cells=(4, 4), order=1, active=(b, i) -> i.I[2] != 4)
 
-    m = prepare(poisson(V; source=x -> 1.0, dirichlet=[bc]))
+    m = prepare(poisson(V; source=1.0, dirichlet=[bc]))
     bits = active_cells(m; level=2)
 
     @test all(!bits[i, 4] for i in 1:4)             # user-deactivated row j=4
@@ -310,8 +310,8 @@ end
                            subcell_length_scale=1.0e-6, max_depth=2)
     V = space(omega; cells=(10, 10), order=1, physical=hole)
 
-    m_s = prepare(poisson(V; source=x -> 1.0, dirichlet=[bc]))
-    m_t = prepare(poisson(V; source=x -> 1.0, dirichlet=[bc]))
+    m_s = prepare(poisson(V; source=1.0, dirichlet=[bc]))
+    m_t = prepare(poisson(V; source=1.0, dirichlet=[bc]))
     assemble!(m_s; threaded=false)
     assemble!(m_t; threaded=true)
 
@@ -328,7 +328,7 @@ end
     # Overlay starts on the left (entirely inside Ω) → no fictitious cells.
     V = overlay(space(omega; cells=(8, 8), order=1, physical=p), box((0.1, 0.3), (0.4, 0.7));
                 cells=(3, 4), order=1)
-    m = prepare(poisson(V; source=x -> 1.0, dirichlet=[bc]))
+    m = prepare(poisson(V; source=1.0, dirichlet=[bc]))
     @test all(active_cells(m; level=2))   # all overlay cells active
 
     # Move the overlay to the right (entirely outside Ω) → all cells fictitious.
@@ -439,7 +439,7 @@ end
     hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0,
                            subcell_length_scale=1.0e-6, max_depth=2)
     V = space(omega; cells=(10, 10), order=1, physical=hole)
-    m = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    m = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     plan = Unfitted.integration_plan(m)
     kinds = Set(region.quadrature.kind for region in plan.regions)
@@ -490,7 +490,7 @@ end
     hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0,
                            subcell_length_scale=1.0e-6, max_depth=2)
     V = space(omega; cells=(6, 6), order=1, physical=hole)
-    m = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    m = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     assemble!(m)
 
     @test isposdef(Symmetric(Matrix(m.matrix)))
@@ -508,7 +508,7 @@ end
     hole = physical_domain(x -> 0.3 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2 + (x[3] - 0.5)^2);
                            lipschitz=1.0, subcell_length_scale=0.1)
     V = space(omega; cells=(6, 6, 6), order=1, physical=hole)
-    m = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    m = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     assemble!(m)
 
     @test isposdef(Symmetric(Matrix(m.matrix)))
@@ -534,7 +534,7 @@ end
     hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0,
                            subcell_length_scale=1.0e-6, max_depth=2)
     V = space(omega; cells=(6, 6), order=1, physical=hole)
-    m = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    m = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     diag = diagnostics(m)
     plan = Unfitted.integration_plan(m)

@@ -71,7 +71,7 @@ end
     a = field(:a, V)
     b = field(:b, V)
     prob = Problem((a, b); blocks=(stiffness_block(a), mass_block(b)),
-                   loads=(source_load(a; source=x -> 1.0),),
+                   loads=(source_load(a; source=1.0),),
                    dirichlet=[dirichlet(0.0; on=boundary(:all), field=:a)])
     model = prepare(prob)
     @test length(problem_spaces(model.problem)) == 1

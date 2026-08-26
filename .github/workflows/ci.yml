@@ -19,13 +19,55 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # The four legs are the 2 × 2 product of the Julia versions and thread
+      # counts CONTRIBUTING.md requires: 1.10 is the declared minimum in
+      # Project.toml and "1" tracks the latest stable release, and the suite
+      # must pass single-threaded and with more than one thread.
+      #
+      # The suite is compile-bound rather than compute-bound — a timing run
+      # charged 265.9 s of a 270.6 s invocation to the compiler — so most legs
+      # run at `--optimize=0`, which roughly halves the wall clock and leaves
+      # every assertion running and passing. `julia-runtest` takes the level,
+      # not the flag: `optimize: '0'` becomes `--optimize=0`, and an empty
+      # value means "use Julia's default".
       matrix:
-        # 1.10 is the declared minimum in Project.toml; "1" tracks the
-        # latest stable release.
-        julia-version: ['1.10', '1']
-        # CONTRIBUTING.md requires tests to pass single-threaded and
-        # with more than one thread.
-        threads: ['1', '4']
+        include:
+          - julia-version: '1.10'
+            threads: '1'
+            optimize: '0'
+            opt-label: '-O0'
+            coverage: false
+          - julia-version: '1.10'
+            threads: '4'
+            optimize: '0'
+            opt-label: '-O0'
+            coverage: false
+          - julia-version: '1'
+            threads: '1'
+            optimize: '0'
+            opt-label: '-O0'
+            coverage: false
+          # Deliberately left at Julia's default optimisation level. `-O0`
+          # changes inlining and specialisation decisions, so exactly one leg
+          # has to exercise the suite at the optimisation level users actually
+          # run — this one: newest Julia, more than one thread, so the
+          # multi-threaded assertions are the ones that see the optimiser.
+          # (`Pkg.test` forces `--check-bounds=yes` on every leg regardless,
+          # so no leg is production codegen in the strict sense; the variable
+          # this leg controls is the optimiser, not bounds checking.) Do not
+          # fold this entry into the `--optimize=0` group to make the matrix
+          # uniform.
+          #
+          # Coverage is off on every leg: nothing in this workflow consumes
+          # the `.cov` files, instrumentation costs wall clock, and assertions
+          # guarded on `Base.JLOptions().code_coverage == 0` only run when it
+          # is off. Adding coverage back means adding a leg *and* a step that
+          # consumes it.
+          - julia-version: '1'
+            threads: '4'
+            optimize: ''
+            opt-label: 'default -O'
+            coverage: false
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
@@ -34,6 +76,9 @@ jobs:
       - uses: julia-actions/cache@v2
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
+        with:
+          optimize: ${{ matrix.optimize }}
+          coverage: ${{ matrix.coverage }}
         env:
           JULIA_NUM_THREADS: ${{ matrix.threads }}
 

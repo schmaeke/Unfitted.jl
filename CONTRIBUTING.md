@@ -89,9 +89,20 @@ julia --project=. -e 'using Pkg; Pkg.precompile()'
 Run the test suite and the formatter / code-statistics script:
 
 ```bash
-julia --project=. -e 'using Pkg; Pkg.test("Unfitted")'
+julia --project=. -e 'using Pkg; Pkg.test("Unfitted"; julia_args=["-O0"])'
 julia precommit.jl --check
 ```
+
+`-O0` is the standard developer setting for this suite and not a
+shortcut: the suite is compile-bound rather than compute-bound — a timing
+run charged 265.9 s of a 270.6 s invocation to the compiler — so
+switching the optimiser off roughly halves the time to a verdict while
+every assertion still runs, and still passes. Continuous integration
+keeps exactly one leg at Julia's default optimisation level, so the
+inlining and specialisation decisions users get are exercised too.
+(`Pkg.test` forces `--check-bounds=yes` on every leg, so no leg is
+production code generation in the strict sense — the variable that leg
+controls is the optimiser.)
 
 Both commands must exit zero on a clean checkout. If they do not, please
 open an issue with the failing output before opening a PR.
@@ -116,7 +127,7 @@ ext/                          package extensions (BasicBSpline, FileIO+MeshIO+Ge
 test/                         unit and regression tests
 examples/                     runnable scripts, one sub-directory per example, each with its own Project.toml
 benchmarks/                   targeted performance benchmarks (own Project.toml)
-.github/workflows/ci.yml      CI: tests on Julia 1.10 and latest, 1 and 4 threads, plus the format check
+.github/workflows/ci.yml      CI: tests on Julia 1.10 and latest, 1 and 4 threads (three legs at -O0, one at default -O), plus the format check
 ```
 
 ### Source files (`src/`)
@@ -1029,13 +1040,14 @@ demos.
   - Package extensions: the B-spline family's basis values, constraints
     and a small assembly; the MeshIO signed-distance leaf; the Tensors
     notation round-trip.
-  - Example smoke suite: the six fast `examples/<name>/<name>.jl`
-    scripts run to a clean exit at a coarse size in the default suite,
-    with a finite, sane headline metric wherever the script prints one;
-    the four slower examples (both FCM plates, the bi-material coupling,
-    the tanh layer) are gated behind `UNFITTED_TEST_SLOW_EXAMPLES=1`,
-    and the three `Tensors`-using examples are skipped outside
-    `Pkg.test`.
+  - Example smoke suite: all ten `examples/<name>/<name>.jl` scripts run
+    to a clean exit at a coarse size in the default suite, with a finite,
+    sane headline metric wherever the script prints one. They share one
+    batched subprocess (`test/run_examples_child.jl`), each included into
+    its own `Module`, because the per-process compilation floor dominated
+    when every script paid it separately. The three `Tensors`-using
+    examples are skipped outside `Pkg.test`, where that weak dependency
+    is unavailable.
 
 ### Testing rules
 
@@ -1044,6 +1056,14 @@ demos.
   - Separate fast unit tests from expensive convergence studies.
   - Expensive studies belong in `examples/`, `benchmarks/`, or a
     clearly marked testset that is not required for every quick edit.
+  - Pass constant-valued inputs as bare constants, not as closures, for
+    the coefficient-shaped keywords that accept both — `source`,
+    `coefficient`, `diffusion` and Dirichlet data, which all pass through
+    `_as_coefficient`. Write `source = 1.0`, never `source = x -> 1.0`.
+    Every distinct closure is a distinct *type*, and each one forces a
+    full re-specialisation of the assembly emission kernel at roughly
+    0.9 s of compile time, for
+    an assembled result that is identical either way.
   - When fixing a bug, add a regression test that fails without the
     fix.
   - When adding a new basis family, add at least one small assembly
@@ -1078,8 +1098,11 @@ are implemented — or unless the differences are clearly stated.
      (`feature/...`, `fix/...`, `docs/...`) are preferred.
   2. Make one focused change per PR. Keep diffs small and reviewable.
   3. Add or update tests alongside the implementation.
-  4. Run `julia --project=. -e 'using Pkg; Pkg.test("Unfitted")'` and
-     `julia precommit.jl --check`. Both must pass.
+  4. Run
+     `julia --project=. -e 'using Pkg; Pkg.test("Unfitted"; julia_args=["-O0"])'`
+     and `julia precommit.jl --check`. Both must pass. The suite is
+     compile-bound, so `-O0` roughly halves the wall clock without
+     changing what is asserted; see "Verifying your setup".
   5. Open a pull request with a description that explains the *why*,
      the user-visible change (if any), and any numerical results the
      change produces.

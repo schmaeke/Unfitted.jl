@@ -134,7 +134,7 @@ end
     V = overlay(space(_OMEGA; cells=(8, 8), order=2), box((0.3, 0.3), (0.7, 0.7)); cells=(3, 3),
                 order=3, active=inactive_one)
 
-    model = prepare(poisson(V; source=x -> 1.0, dirichlet=[bc]))
+    model = prepare(poisson(V; source=1.0, dirichlet=[bc]))
     layout = Unfitted._field_layout(model.dofs, :u).dofs
     overlay_level = V.levels[2]
 
@@ -161,7 +161,7 @@ end
     bc = dirichlet(0.0; on=boundary(:all))
     V = _safe_overlay(overlay_cells=(4, 4), active=(b, i) -> i.I[1] <= 2)
 
-    model = prepare(poisson(V; source=x -> 1.0, dirichlet=[bc]))
+    model = prepare(poisson(V; source=1.0, dirichlet=[bc]))
     assemble!(model)
 
     M = Matrix(model.matrix)
@@ -173,8 +173,8 @@ end
     bc = dirichlet(0.0; on=boundary(:all))
     V = _safe_overlay(overlay_cells=(4, 4), active=(b, i) -> i.I[1] <= 2 || i.I[2] <= 2)
 
-    m_serial = prepare(poisson(V; source=x -> 1.0, dirichlet=[bc]))
-    m_threaded = prepare(poisson(V; source=x -> 1.0, dirichlet=[bc]))
+    m_serial = prepare(poisson(V; source=1.0, dirichlet=[bc]))
+    m_threaded = prepare(poisson(V; source=1.0, dirichlet=[bc]))
     assemble!(m_serial; threaded=false)
     assemble!(m_threaded; threaded=true)
 
@@ -218,13 +218,13 @@ end
 
 @testset "active_cells query" begin
     V_clean = _safe_overlay()
-    model_clean = prepare(poisson(V_clean; source=x -> 1.0,
+    model_clean = prepare(poisson(V_clean; source=1.0,
                                   dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     @test active_cells(model_clean; level=1) == trues(8, 8)
     @test active_cells(model_clean; level=2) == trues(4, 4)
 
     V_partial = _safe_overlay(active=(b, i) -> i.I[1] <= 2)
-    model_partial = prepare(poisson(V_partial; source=x -> 1.0,
+    model_partial = prepare(poisson(V_partial; source=1.0,
                                     dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     bits = active_cells(model_partial; level=2)
     @test bits == [i <= 2 for i in 1:4, _ in 1:4]
@@ -270,7 +270,7 @@ end
 @testset "deactivate! flips active cells off" begin
     bc = dirichlet(0.0; on=boundary(:all))
     V = _safe_overlay()
-    model = prepare(poisson(V; source=x -> 1.0, dirichlet=[bc]))
+    model = prepare(poisson(V; source=1.0, dirichlet=[bc]))
 
     deactivate!(model; level=2, cells=(b, i) -> i.I[1] >= 3)
 
@@ -283,7 +283,7 @@ end
 @testset "activating to all-on collapses to no-mask fast path" begin
     bc = dirichlet(0.0; on=boundary(:all))
     V = _safe_overlay(active=(b, i) -> i.I[1] <= 2)
-    model = prepare(poisson(V; source=x -> 1.0, dirichlet=[bc]))
+    model = prepare(poisson(V; source=1.0, dirichlet=[bc]))
 
     @test model.problem.space.levels[2].mask !== nothing
     activate!(model; level=2, cells=trues(4, 4))
@@ -294,7 +294,7 @@ end
 @testset "diagnostics reports inactive cell counts per level" begin
     bc = dirichlet(0.0; on=boundary(:all))
     V = _safe_overlay(active=(b, i) -> i.I[1] <= 2)
-    model = prepare(poisson(V; source=x -> 1.0, dirichlet=[bc]))
+    model = prepare(poisson(V; source=1.0, dirichlet=[bc]))
 
     counts = diagnostics(model).inactive_cell_counts
     @test counts == [0, 8]    # base unmasked; overlay has 8 inactive cells
@@ -332,7 +332,7 @@ end
 @testset "activate! accepts BitArray selector" begin
     bc = dirichlet(0.0; on=boundary(:all))
     V = _safe_overlay(active=falses(4, 4))
-    model = prepare(poisson(V; source=x -> 1.0, dirichlet=[bc]))
+    model = prepare(poisson(V; source=1.0, dirichlet=[bc]))
 
     select = falses(4, 4)
     select[1, 1] = true
@@ -346,7 +346,7 @@ end
 
 @testset "activate! rejects out-of-bounds level" begin
     V = _safe_overlay()
-    model = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     @test_throws ArgumentError activate!(model; level=0, cells=[CartesianIndex(1, 1)])
     @test_throws ArgumentError activate!(model; level=5, cells=[CartesianIndex(1, 1)])
 end

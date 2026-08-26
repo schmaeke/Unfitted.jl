@@ -3,7 +3,7 @@ using LinearAlgebra
 
 @testset "QuadField construction and stale-version contract" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
-    model = prepare(poisson(space(omega; cells=(2, 2), order=1); source=x -> 0.0))
+    model = prepare(poisson(space(omega; cells=(2, 2), order=1); source=0.0))
 
     qf = QuadField{Float64}(model; init=q -> q.x[1] + q.x[2])
     @test length(qf) == Unfitted.nquadpoints(model)
@@ -21,7 +21,7 @@ end
 
 @testset "QuadField indexing and copy" begin
     omega = box((0.0,), (1.0,))
-    model = prepare(poisson(space(omega; cells=2, order=1); source=x -> 0.0))
+    model = prepare(poisson(space(omega; cells=2, order=1); source=0.0))
     qf = QuadField{Float64}(model)
     @test all(==(0.0), qf.data)
     qf[1] = 3.5
@@ -33,8 +33,8 @@ end
 
 @testset "RBFP0 reproduces constant fields exactly (Sartorti & Düster Tab. 3)" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
-    source_model = prepare(poisson(space(omega; cells=(3, 3), order=2); source=x -> 0.0))
-    target_model = prepare(poisson(space(omega; cells=(5, 5), order=1); source=x -> 0.0))
+    source_model = prepare(poisson(space(omega; cells=(3, 3), order=2); source=0.0))
+    target_model = prepare(poisson(space(omega; cells=(5, 5), order=1); source=0.0))
 
     source = QuadField{Float64}(source_model; init=q -> 7.25)
     target = transfer(source, source_model, target_model; via=RBFP0(; neighbors=10))
@@ -45,8 +45,8 @@ end
 
 @testset "RBFP0 reproduces linear fields exactly via the polynomial extension" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
-    source_model = prepare(poisson(space(omega; cells=(3, 3), order=2); source=x -> 0.0))
-    target_model = prepare(poisson(space(omega; cells=(5, 5), order=1); source=x -> 0.0))
+    source_model = prepare(poisson(space(omega; cells=(3, 3), order=2); source=0.0))
+    target_model = prepare(poisson(space(omega; cells=(5, 5), order=1); source=0.0))
 
     f = x -> 1.0 + 0.5 * x[1]
     source = QuadField{Float64}(source_model; init=q -> f(q.x))
@@ -59,8 +59,8 @@ end
 
 @testset "RBFP0 threaded and serial paths are bit-identical" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
-    source_model = prepare(poisson(space(omega; cells=(4, 4), order=2); source=x -> 0.0))
-    target_model = prepare(poisson(space(omega; cells=(6, 6), order=1); source=x -> 0.0))
+    source_model = prepare(poisson(space(omega; cells=(4, 4), order=2); source=0.0))
+    target_model = prepare(poisson(space(omega; cells=(6, 6), order=1); source=0.0))
 
     source = QuadField{Float64}(source_model; init=q -> exp(-((q.x[1] - 0.5)^2 + (q.x[2] - 0.5)^2)))
 
@@ -72,7 +72,7 @@ end
 
 @testset "RBFP0 rejects unsupported neighbour counts" begin
     omega = box((0.0,), (1.0,))
-    model = prepare(poisson(space(omega; cells=4, order=2); source=x -> 0.0))
+    model = prepare(poisson(space(omega; cells=4, order=2); source=0.0))
     qf = QuadField{Float64}(model; init=q -> 1.0)
     @test_throws ArgumentError transfer(qf, model, model; via=RBFP0(; neighbors=0))
     @test_throws ArgumentError transfer(qf, model, model; via=RBFP0(; neighbors=32))

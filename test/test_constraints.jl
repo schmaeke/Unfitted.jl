@@ -20,10 +20,10 @@ end
     top = boundary(axis=2, side=:upper)
 
     # only u_y constrained on top (u_x free); both fixed on the bottom
-    per_component = prepare(poisson(u; source=x -> SVector(0.0, 0.0),
+    per_component = prepare(poisson(u; source=SVector(0.0, 0.0),
                                     dirichlet=[dirichlet(SVector(0.0, 0.0); on=bottom, field=u),
                                                dirichlet(0.1; on=top, field=u, component=2)]))
-    all_components = prepare(poisson(u; source=x -> SVector(0.0, 0.0),
+    all_components = prepare(poisson(u; source=SVector(0.0, 0.0),
                                      dirichlet=[dirichlet(SVector(0.0, 0.0); on=bottom, field=u),
                                                 dirichlet(SVector(0.0, 0.1); on=top, field=u)]))
 
@@ -210,7 +210,7 @@ end
     # Bottom and top constrain only u_2 — without the pin the model is singular
     # (u_1 has a rigid-body translation mode). The codim-D pin at the bottom-left
     # corner kills u_1 at that vertex, restoring uniqueness.
-    model = prepare(poisson(u; source=x -> SVector(0.0, 0.0),
+    model = prepare(poisson(u; source=SVector(0.0, 0.0),
                             dirichlet=[dirichlet(0.0; on=bottom, field=u, component=2),
                                        dirichlet(0.1; on=top, field=u, component=2),
                                        dirichlet(0.0; on=pin, field=u, component=1)]))
@@ -230,7 +230,7 @@ end
     # facet). A component-blind projection mass double-counts the top-edge dofs
     # and halves both projected values; the per-component projection returns them
     # exactly.
-    model = prepare(poisson(u; source=x -> SVector(0.0, 0.0),
+    model = prepare(poisson(u; source=SVector(0.0, 0.0),
                             dirichlet=[dirichlet(SVector(0.0, 0.0); on=bottom, field=u),
                                        dirichlet(0.3; on=top, field=u, component=1),
                                        dirichlet(0.1; on=top, field=u, component=2)]))
@@ -251,7 +251,7 @@ end
     # are shared, so a component-blind mass lets the lateral u_1 rows pull the
     # corner u_2 below 0.1. Per-component projection keeps u_2 = 0.1 exactly
     # along the whole top edge, corners included.
-    model = prepare(poisson(u; source=x -> SVector(0.0, 0.0),
+    model = prepare(poisson(u; source=SVector(0.0, 0.0),
                             dirichlet=[dirichlet(SVector(0.0, 0.0); on=bottom, field=u),
                                        dirichlet(0.0; on=left, field=u, component=1),
                                        dirichlet(0.0; on=right, field=u, component=1),
@@ -282,7 +282,7 @@ end
     halving(g) = [dirichlet(SVector(0.0, 0.0); on=bottom, field=u),
                   dirichlet(3g; on=top, field=u, component=1),
                   dirichlet(g; on=top, field=u, component=2)]
-    model = prepare(poisson(u; source=x -> SVector(0.0, 0.0), dirichlet=halving(0.1)))
+    model = prepare(poisson(u; source=SVector(0.0, 0.0), dirichlet=halving(0.1)))
     for g in (0.2, 0.3, -0.15)
         update_dirichlet!(model, halving(g))
         sol = solve!(model)
@@ -297,7 +297,7 @@ end
                  dirichlet(0.0; on=left, field=u, component=1),
                  dirichlet(0.0; on=right, field=u, component=1),
                  dirichlet(SVector(0.0, g); on=top, field=u)]
-    model = prepare(poisson(u; source=x -> SVector(0.0, 0.0), dirichlet=corner(0.1)))
+    model = prepare(poisson(u; source=SVector(0.0, 0.0), dirichlet=corner(0.1)))
     for g in (0.2, 0.3, -0.15)
         update_dirichlet!(model, corner(g))
         sol = solve!(model)
@@ -312,9 +312,9 @@ end
 @testset "reused Dirichlet projection is bit-identical to a fresh one" begin
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2)
     u = field(:u, V; components=2)
-    build(g) = poisson(u; source=x -> SVector(0.0, 0.0),
-                       dirichlet=[dirichlet(SVector(0.0, 0.0);
-                                            on=boundary(axis=2, side=:lower), field=u),
+    build(g) = poisson(u; source=SVector(0.0, 0.0),
+                       dirichlet=[dirichlet(SVector(0.0, 0.0); on=boundary(axis=2, side=:lower),
+                                            field=u),
                                   dirichlet(x -> 0.3 + g * x[1]; on=boundary(axis=2, side=:upper),
                                             field=u, component=1),
                                   dirichlet(g; on=boundary(axis=1, side=:upper), field=u,
@@ -349,7 +349,7 @@ end
     V = space(omega; cells=4, order=2)
 
     function build(rhs_value)
-        return poisson(V; source=x -> 0.0,
+        return poisson(V; source=0.0,
                        dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower)),
                                   dirichlet(rhs_value; on=boundary(axis=1, side=:upper))])
     end
@@ -405,7 +405,7 @@ end
 # Structural checks: anything beyond a value-only change must throw.
 @testset "update_dirichlet! rejects structural changes" begin
     V = space(box((0.0,), (1.0,)); cells=4, order=2)
-    p = poisson(V; source=x -> 0.0,
+    p = poisson(V; source=0.0,
                 dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower)),
                            dirichlet(0.3; on=boundary(axis=1, side=:upper))])
     model = prepare(p)
@@ -424,7 +424,7 @@ end
 # callback `x -> c` must give the same answer as the scalar `c`.
 @testset "update_dirichlet! handles function-valued data" begin
     V = space(box((0.0,), (1.0,)); cells=4, order=2)
-    model = prepare(poisson(V; source=x -> 0.0,
+    model = prepare(poisson(V; source=0.0,
                             dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower)),
                                        dirichlet(x -> 0.0; on=boundary(axis=1, side=:upper))]))
     update_dirichlet!(model,

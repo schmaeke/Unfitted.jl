@@ -3,7 +3,7 @@
     V = space(omega; cells=(4, 4), order=2)
     V2 = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(2, 2), order=3)
     V3 = moved_space(V2; level=2, to=box((0.2, 0.2), (0.6, 0.6)))
-    model = prepare(poisson(V2; source=x -> 1.0))
+    model = prepare(poisson(V2; source=1.0))
 
     @test Unfitted.level_count(V) == 1
     @test Unfitted.level_count(V2) == 2
@@ -24,7 +24,7 @@ end
 @testset "custom solver hook and compact display" begin
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=2, order=1)
-    model = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     called = Ref(false)
     solution = solve!(model; method=:external_direct, linear_solver=(A, b) -> begin
                           called[] = true
@@ -53,7 +53,7 @@ end
 
 @testset "transfer requires source and target models" begin
     omega = box((0.0,), (1.0,))
-    model = prepare(poisson(space(omega; cells=1, order=1); source=x -> 0.0))
+    model = prepare(poisson(space(omega; cells=1, order=1); source=0.0))
     solution = Solution(zeros(Unfitted.active_unknowns(model.dofs)), model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 

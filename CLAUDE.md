@@ -55,8 +55,11 @@ running as an agent.
 
   1. Run the most specific relevant tests first, then the full suite:
      ```bash
-     julia --project=. -e 'using Pkg; Pkg.test("Unfitted")'
+     julia --project=. -e 'using Pkg; Pkg.test("Unfitted"; julia_args=["-O0"])'
      ```
+     `-O0` is the standard setting here, not a shortcut — the suite is
+     compile-bound, so it roughly halves the time to a verdict while every
+     assertion still runs. See `CONTRIBUTING.md`, "Verifying your setup".
   2. Run the pre-commit script in check mode and treat a non-zero exit
      as a hard failure:
      ```bash
