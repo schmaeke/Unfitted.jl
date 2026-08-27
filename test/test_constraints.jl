@@ -46,7 +46,7 @@ end
     model = prepare(poisson(V; source=0.0,
                             dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:upper))]))
     @test haskey(model.facet_regions,
-                 Unfitted.RegionKey(boundary(axis=1, side=:upper), model.problem.space))
+                 (boundary(axis=1, side=:upper), model.problem.space))
 end
 
 @testset "per-component Dirichlet frees the other components" begin

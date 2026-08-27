@@ -979,10 +979,8 @@ function _boundary_integral_space(model::Model, field::Union{Nothing,Symbol})
     field === nothing || return _field_space(model.problem, field)
     length(problem_spaces(model.problem)) == 1 && return model.problem.space
     names = join((":" * String(f.name) for f in model.problem.fields), ", ")
-    throw(ArgumentError("boundary_integral on a multi-domain (coupled) model must name the " *
-                        "subdomain to integrate over: pass field=… (one of $names). Each " *
-                        "subdomain owns its own boundary, and their union is not their sum — " *
-                        "a shared interface lies in two subdomain boundaries and in neither ∂Ω"))
+    throw(ArgumentError("field argument is required for multi-domain models; pass field=… " *
+                        "(one of $names)"))
 end
 
 # Per-Q-point `q` tuple for facet vs. surface regions. The shape is

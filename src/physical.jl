@@ -327,13 +327,9 @@ function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0,
         ls = _leaves(geometry)
         bare = count(l -> isinf(l.lipschitz), ls)
         bare == 0 ||
-            throw(ArgumentError("lipschitz=$lipschitz was given with a LevelSet tree. A CSG " *
-                                "tree carries one Lipschitz constant per leaf, and this tree " *
-                                "has leaves without one ($bare of $(length(ls))). Set the " *
-                                "constant where it belongs, on the leaf: " *
-                                "leaf(f; lipschitz=$lipschitz). The physical_domain keyword " *
-                                "applies only to a bare callable φ, which is auto-wrapped as " *
-                                "a single leaf"))
+            throw(ArgumentError("lipschitz=$lipschitz was given with a LevelSet tree, and " *
+                                "$bare of its $(length(ls)) leaves carry no constant of their " *
+                                "own; set it on the leaf instead: leaf(f; lipschitz=$lipschitz)"))
     end
     g = geometry isa LevelSet ? geometry : leaf(geometry; lipschitz=lipschitz)
     T = promote_type(typeof(float(alpha)), typeof(float(subcell_length_scale)),

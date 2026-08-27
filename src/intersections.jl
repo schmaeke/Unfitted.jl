@@ -475,12 +475,9 @@ function _check_axis_spacing(levels, ::Val{D}, tol::GeometryTolerance{T}) where 
         # axis, √eps(T) · extent, so the remedy is a number to paste.
         suggested = sqrt(eps(T)) * (coords[end] - coords[begin])
         throw(ArgumentError("level $(level.id) has cell spacing h = $spacing on axis $d, at or " *
-                            "below the coordinate merge tolerance $(tol.merge): that axis's " *
-                            "element boundaries collapse into each other, and every integration " *
-                            "region would straddle two cells. Pass a merge tolerance below the " *
-                            "finest spacing, e.g. `tolerance=GeometryTolerance(; " *
-                            "merge=$suggested)` (√eps scaled by this axis's extent), or use " *
-                            "fewer cells on axis $d."))
+                            "below the coordinate merge tolerance $(tol.merge); pass a smaller " *
+                            "merge tolerance, e.g. `tolerance=GeometryTolerance(; " *
+                            "merge=$suggested)`"))
     end
     return nothing
 end

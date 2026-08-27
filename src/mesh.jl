@@ -570,7 +570,7 @@ end
 # output can only remove cells: a cell dropped as fictitious at one overlay
 # position stays dropped after the overlay moves somewhere it would be inside
 # Ω. Callers that fold repeatedly over a model's lifetime must therefore keep
-# the pre-fold space and re-derive from it — see `Model.user_problem` and
+# the pre-fold space and re-derive from it — see `Model.prefold_space` and
 # `_moved_problem` in `model.jl`.
 function _apply_physical_fold(V::Space{D,T}, cache::_ClassifyCache{D,T}) where {D,T}
     V.physical === nothing && return V

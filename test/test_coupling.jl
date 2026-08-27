@@ -236,10 +236,10 @@ end
     # The cache holds four entries — two selector values × two subdomains — and
     # each one's facets sit on the face of *its own* subdomain, not subdomain 1's.
     @test length(model.facet_regions) == 4
-    for (key, regions) in model.facet_regions
+    for ((on, key_space), regions) in model.facet_regions
         @test !isempty(regions)
-        expected = key.on.sides == [(1, :upper)] ? key.space.domain.upper[1] :
-                   key.space.domain.lower[1]
+        expected = on.sides == [(1, :upper)] ? key_space.domain.upper[1] :
+                   key_space.domain.lower[1]
         for region in regions, x in region.points
             @test x[1] ≈ expected
         end

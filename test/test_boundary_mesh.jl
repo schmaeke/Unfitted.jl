@@ -139,12 +139,12 @@ end
     # identity, the space half is the subdomain the regions were cut against —
     # here the model's only space.
     @test length(model.surface_regions) == 1
-    key = only(keys(model.surface_regions))
-    @test key.on === mesh
-    @test key.space === model.problem.space
-    @test haskey(model.surface_regions, Unfitted.RegionKey(mesh, model.problem.space))
+    on, key_space = only(keys(model.surface_regions))
+    @test on === mesh
+    @test key_space === model.problem.space
+    @test haskey(model.surface_regions, (mesh, model.problem.space))
     @test diagnostics(model).surface_region_count ==
-          length(model.surface_regions[Unfitted.RegionKey(mesh, model.problem.space)])
+          length(model.surface_regions[(mesh, model.problem.space)])
     @test nquadpoints(model; kind=:surface) > 0
 end
 

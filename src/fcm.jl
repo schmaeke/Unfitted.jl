@@ -207,15 +207,26 @@ end
 # to `kept`, keeps that re-measurement bit-identical to the NNLS residual in the
 # ordinary case, where the truncation drops only the exact zeros of the
 # Lawson–Hanson inactive set.
+#
+# "In place" is literal: the zeroing happens in the NNLS solution vector itself.
+# `nnls` returns a vector nothing else holds a reference to, and the surviving
+# entries are copied out before the loop runs, so no second full-length array is
+# needed — which matters, because the candidate cloud is thousands of points
+# wide while the rule handed back is `nbasis` wide.
 function _solve_moment_fit(moments::Vector{T}, points::Vector{SVector{D,T}},
                            region_box::AxisBox{D,T}, moment_order::NTuple{D,Int},
                            cut_volume::T) where {D,T}
     A = _build_moment_matrix(points, region_box, moment_order)
     weights, _ = nnls(A, moments)
-    kept = findall(>(_NNLS_WEIGHT_TOL * cut_volume), weights)
-    truncated = zero(weights)
-    truncated[kept] = weights[kept]
-    return kept, weights[kept], norm(A * truncated - moments)
+    cutoff = _NNLS_WEIGHT_TOL * cut_volume
+    kept = findall(>(cutoff), weights)
+    kept_weights = weights[kept]
+    for i in eachindex(weights)
+        weights[i] > cutoff || (weights[i] = zero(T))
+    end
+    residual = A * weights
+    residual .-= moments
+    return kept, kept_weights, norm(residual)
 end
 
 # ── 4. Exact moments and candidates from the implicit kernel ──────────────────

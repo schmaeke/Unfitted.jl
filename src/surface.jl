@@ -341,13 +341,13 @@ end
 #
 #   * `K = 0` (points)          — trivial, no subdivision needed.
 #   * `K = 1` (segments)        — per-axis parameter-value crossings,
-#                                 sorted, then cut at exactly. The
-#                                 sub-segments partition the input: an
-#                                 endpoint may land on a grid line, and
-#                                 the sub-segment's *interior* — which
-#                                 is what the midpoint classification
-#                                 sees — lies in one cell. Works in any
-#                                 `D`.
+#                                 sorted, then cut at each one exactly.
+#                                 The sub-segments partition the input:
+#                                 an endpoint may land on a grid line,
+#                                 and the sub-segment's *interior* —
+#                                 which is what the midpoint
+#                                 classification sees — lies in one
+#                                 cell. Works in any `D`.
 #   * `K = 2` (triangles in 3D) — Sutherland–Hodgman clipping against
 #                                 the six axis-aligned half-spaces of
 #                                 every cell the triangle overlaps,

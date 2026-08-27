@@ -38,11 +38,13 @@
 #
 # Cost is one-time JIT compilation of the configuration matrix, not arithmetic:
 # the numerical work is well under a second, the process is ~75 s at the default
-# `-O2` and ~55 s at `-O1` (verified byte-identical to `-O2` here, and `-O0` is
-# NOT — it reorders reductions). Whichever you pick, keep it fixed across the
-# runs you intend to diff.
+# `-O2` and ~55 s at `-O1` (verified byte-identical to `-O2` here). Each level
+# is deterministic within itself, but `-O0` does NOT agree with `-O2` — it
+# reorders reductions — so a report is only comparable against one produced at
+# the same level. The checked-in baseline is generated at `-O0`, which is also
+# the level `CONTRIBUTING.md` documents for the test suite; keep it there.
 #
-# Findings this instrument is aimed at (review/phase1-findings.md §3):
+# Findings this instrument is aimed at:
 #   #1 facet/surface region resolution is not subdomain-aware
 #   #2 `_NNLS_WEIGHT_TOL` is an absolute cutoff on a cut-volume-scaled weight
 #   #3 `tolerance.merge` is an absolute length compared against mesh spacing
