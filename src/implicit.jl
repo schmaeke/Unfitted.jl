@@ -53,7 +53,11 @@
 #   at the depth floor the kernel reduces anyway — the multi-root fiber scan
 #   still yields the correct region, only the base partition (and thus the
 #   order) degrades at the unresolved feature. ∇φ is obtained by automatic
-#   differentiation (`ForwardDiff`), with a finite-difference fallback.
+#   differentiation (`ForwardDiff`); a caller whose leaves cannot take `Dual`
+#   arguments overrides that with its own operator through the `grad` keyword,
+#   for which `_fd_gradient` below is the central-difference choice. Nothing in
+#   the finite-cell path sets it, so leaves reaching `moment_fit_rule` must be
+#   AD-capable.
 
 # ── Coordinate insert / remove helpers ─────────────────────────────────────────
 
@@ -94,9 +98,11 @@ struct _QuadCtx{T,G}
     flat_tol::T
 end
 
-# Central-difference gradient fallback for level sets through which automatic
-# differentiation cannot be pushed. Step size is the cube-root-of-eps balance
-# between truncation and round-off, scaled per axis by the coordinate magnitude.
+# Central-difference gradient operator for level sets through which automatic
+# differentiation cannot be pushed. It is opt-in — a caller passes it as the
+# `grad` keyword of `implicit_volume_quadrature`, and nothing falls back to it.
+# The step size is the cube-root-of-eps balance between truncation and round-off,
+# scaled per axis by the coordinate magnitude.
 function _fd_gradient(g, x::SVector{D,T}) where {D,T}
     h0 = cbrt(eps(T))
     return SVector{D,T}(ntuple(D) do d
@@ -489,7 +495,9 @@ Arguments:
     needs `q ≈ (p + D) / 2`, not `≈ p / 2` (the finite-cell pipeline picks this
     via `_implicit_gauss_points`).
   - `grad`: optional gradient operator `(g, x) -> SVector` overriding the
-    `ForwardDiff` default; pass [`_fd_gradient`](@ref) for non-AD callbacks.
+    `ForwardDiff` default; pass `_fd_gradient` from this file for non-AD
+    callbacks. The finite-cell path never sets it, so this keyword is reachable
+    only by calling the kernel directly.
   - `max_subdiv`: subdivision-depth budget for non-graph-like cells. Beyond it
     the kernel force-reduces (the region stays correct; order degrades only at
     the unresolved feature).

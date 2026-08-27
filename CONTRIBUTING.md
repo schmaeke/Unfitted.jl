@@ -140,7 +140,7 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `Unfitted.jl`     | top-level module: imports, exports, include order           |
 | `geometry.jl`     | D-dimensional axis-aligned boxes, coordinate maps, tolerances |
 | `physical.jl`     | CSG level-set tree, `PhysicalDomain`, three-valued cell classifier |
-| `implicit.jl`     | Saye dimension-reduction implicit quadrature on the level set (volume/surface rules) |
+| `implicit.jl`     | Saye dimension-reduction implicit quadrature on the level set (volume rules) |
 | `basis.jl`        | basis-family interface, integrated Legendre default, tensor-product evaluation |
 | `fcm.jl`          | finite-cell-method cut-cell quadrature: exact moments from `implicit.jl`, non-negative (NNLS) moment fit |
 | `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks |
@@ -582,10 +582,13 @@ features evolve.
     therefore raise `ArgumentError` on a multi-domain (coupled) model.
   - **Query**: `active_cells(model; level)` returns a copy of the
     level's `BitArray` (or an all-true array for unmasked levels).
-  - **Dof layer treatment**: faces between active and inactive cells of
-    the same level are artificial overlay constraints, analogous to
-    mesh-box-face constraints. Span-mode dofs of inactive cells are not
-    enumerated.
+  - **Dof layer treatment**: a face between an active and an inactive
+    cell of the same level is an artificial overlay constraint, analogous
+    to a mesh-box-face constraint — unless every inactive cell across it
+    was folded away as fictitious rather than masked by the user, in
+    which case the modes stay free (`_internal_face_is_physical`). A
+    fictitious fold covers; a user mask does not. Span-mode dofs of
+    inactive cells are not enumerated.
 
 All masking lives at cell granularity; sub-cell activation is out of
 scope and would require a different abstraction.

@@ -12,7 +12,7 @@
 # Both subsystems share the same overlay-zero-extension convention: a
 # level whose mesh does not cover the evaluation point contributes
 # zero. That mirrors the assembly contract from
-# `CONTRIBUTING.md`'s "Approximation space" section.
+# `CONTRIBUTING.md`'s "The superposition model" section.
 
 # ── VTK helpers ───────────────────────────────────────────────────────────────
 
@@ -551,9 +551,11 @@ end
 
 Write a ParaView multiblock bundle of the model's quadrature-point
 cloud. One `.vtp` block is emitted per *distinct combination of
-covering parent levels*: every region in the integration plan is
-keyed by `sort([parent.level for parent in region.parents])` and
-regions with the same level signature land in the same block. Each
+covering parent levels*: every region of every subdomain integration
+plan is keyed by `sort([parent.level for parent in region.parents])`
+and regions with the same level signature land in the same block.
+Level ids are unique across subdomains, so a coupled model's
+subdomains land in different blocks and all of them are written. Each
 block stores the physical quadrature-point coordinates and per-point
 physical weight (`weight = w × jacobian`) as point data.
 
@@ -757,7 +759,11 @@ return a scalar; component fields return an `SVector` across
 components unless a single `component` is requested. Overlay levels
 are extended by zero — only levels whose mesh contains `x` (and
 whose covering cell is active) contribute. Throws if `x` lies outside
-the physical domain.
+the evaluated field's own subdomain box, at the model's containment
+tolerance. That box is the embedding domain, not `Ω`: with a
+[`PhysicalDomain`](@ref) in play a point outside `Ω` does not raise. It
+evaluates the polynomial extension inside a cut cell, and zero inside a
+cell the fictitious fold deactivated.
 
 `x` accepts `NTuple{D,<:Real}` or `SVector{D,<:Real}`. Multi-field
 models require the `u::Field` form so the field to evaluate is

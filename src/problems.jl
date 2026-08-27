@@ -77,8 +77,8 @@ a single quadrature point.
 
   - `component::Int` — the trial component currently being assembled. For
     scalar fields this is always `1`; for vector fields the bilinear
-    block iterates over `1:trial.components` and passes each component
-    in turn.
+    block iterates over `1:C` of the trial [`Field`](@ref) and passes
+    each component in turn.
   - `value::T` — the trial basis value at the quadrature point. The
     full reconstructed trial field is `Σ_b coeff_b · value_b`, but
     assembly considers one basis function at a time so the value here
@@ -237,6 +237,11 @@ tag selects the integration region kind:
     whole `∂Ω`).
   - `::BoundaryMesh` — surface integration over the user-supplied
     immersed-boundary mesh.
+  - `::Interface` — two-sided integration over a coupling interface
+    between two independently discretised subdomains, each field
+    evaluated in its own subdomain's cell at the shared quadrature
+    point. Build the tag with [`interface`](@ref); [`couple`](@ref)
+    builds the four blocks of a jump coupling for you.
 
 Construct via [`block`](@ref), which accepts the [`Field`](@ref)s
 directly and defaults `on = nothing`.
@@ -302,7 +307,7 @@ Fields:
     used only where a single space suffices: the problem's `(D, T)` and
     the single-field / single-domain consumers. The authoritative space of
     each field is `field.space`; a coupled problem carries several distinct
-    subdomain spaces (see [`problem_spaces`](@ref)).
+    subdomain spaces (see `problem_spaces`).
   - `fields::FS` — `Tuple` of [`Field`](@ref)s. Order is preserved in
     the global dof enumeration.
   - `blocks::B` — `Tuple` of [`BlockForm`](@ref)s contributing to the
@@ -329,7 +334,7 @@ end
 """
     Problem(V::Space, form; dirichlet=[])
     Problem(u::Field, form; dirichlet=[])
-    Problem(fields::Tuple; blocks, loads=(), dirichlet=[], symmetric=…)
+    Problem(fields::Tuple; blocks=(), loads=(), dirichlet=[], symmetric=nothing)
 
 Three convenience constructors:
 
@@ -380,12 +385,16 @@ function _check_problem_fields(fields::Tuple)
     return first(fields).space, names
 end
 
-# Distinct spaces spanned by a problem's fields, in first-appearance order,
-# deduplicated by object identity (fields sharing a space appear once). This
-# is the set of independent discretisations a multi-domain problem couples;
-# for a single-domain problem it is a one-element vector. Consumers that must
-# act per-discretisation — the physical fold, the per-space integration
-# plans, and the assembly workspace's level-id namespacing — iterate this.
+"""
+    problem_spaces(problem::Problem) -> Vector{Space}
+
+Distinct spaces spanned by a problem's fields, in first-appearance order,
+deduplicated by object identity (fields sharing a space appear once). This
+is the set of independent discretisations a multi-domain problem couples;
+for a single-domain problem it is a one-element vector. Consumers that must
+act per-discretisation — the physical fold, the per-space integration
+plans, and the assembly workspace's level-id namespacing — iterate this.
+"""
 function problem_spaces(problem::Problem)
     spaces = Space[]
     for field in problem.fields

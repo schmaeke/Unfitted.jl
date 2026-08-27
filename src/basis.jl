@@ -11,8 +11,11 @@ layer ask:
   - which multi-indices identify them and in what tensor-product order;
   - what their values and gradients are at a reference point, possibly
     pulled back from a physical cell;
-  - which of them touch a given axis-side of the cell (used for facet
-    identification by the dof layer and the Dirichlet projection);
+  - which of them touch a given axis-side of the cell (used to pick the
+    facet-incident modes for the Dirichlet boundary trace in
+    `src/dirichlet.jl`; the dof layer's own "is this dof on a face" test
+    is the separate `_key_on_level_side` hook, which works on dof keys
+    rather than local mode indices);
   - what quadrature order integrates products of two basis functions
     exactly on a `:full` region.
 
@@ -48,9 +51,23 @@ ones that do not fit: `recommended_quadrature_order` (`order .+ 1`),
 (the lexicographic tensor index set `∏_d {0, …, order[d]}` and its size),
 `is_facet_basis`, `boundary_basis_indices`, and the point evaluators
 [`basis_values`](@ref) / [`physical_basis_gradients`](@ref), which are built on
-`_fill_factor_tables!` and therefore already serve every family. The integrated
-Legendre family (this file) and the B-spline extension are the two worked
-examples.
+`_fill_factor_tables!` and therefore already serve every family.
+
+Two further defaults are silent rather than fatal, so a new family should decide
+about them deliberately:
+
+  - `_supports_physical_domain(::F)` — `true` by default, i.e. the family claims
+    it can carry an immersed [`PhysicalDomain`](@ref). Answer `false` when the
+    family's overlay constraints would over-constrain cut-cell modes on
+    fully-fictitious fold faces; [`space`](@ref) / [`overlay`](@ref) then reject
+    the pairing with an `ArgumentError` instead of silently degrading the FCM
+    solution. The B-spline extension answers `false`.
+  - `_coverage_constraints` (`src/dofs.jl`) — the generic method returns no
+    constraints, so order reduction does nothing off the integrated Legendre
+    path even though `reduce_order` still defaults to `true`.
+
+The integrated Legendre family (this file) and the B-spline extension are the
+two worked examples.
 """
 abstract type BasisFamily end
 
@@ -68,10 +85,11 @@ In each axis the 1D modes are
 
 where Lₘ is the standard Legendre polynomial. Modes 0 and 1 are the
 linear endpoint shape functions; modes m ≥ 2 are bubble functions that
-vanish at the cell boundaries (`N̂ₘ(±1) = 0`). The `√(4m − 2)`
-normalisation makes the L²(−1, 1) inner products `⟨N̂ₘ′, N̂ₙ′⟩` diagonal
-for the bubble block, which keeps the 1D stiffness matrix well-scaled at
-high order.
+vanish at the cell boundaries (`N̂ₘ(±1) = 0`). Each derivative `N̂ₘ′` is a
+scaled Legendre polynomial, so the bubble block of the 1D stiffness matrix
+is diagonal for any scaling; the `√(4m − 2)` normalisation is what fixes
+that diagonal at `⟨N̂ₘ′, N̂ₙ′⟩_{L²(−1,1)} = δₘₙ`, keeping the block
+identically scaled at high order.
 
 `D`-dimensional basis functions are tensor products of the 1D modes:
 
@@ -112,7 +130,7 @@ basis_name(::IntegratedLegendre) = :integrated_legendre
     TensorQuadrature{D,T}(points, weights)
 
 Tensor-product Gauss–Legendre quadrature on the reference cube `[−1, 1]ᴰ`.
-Built once per `(per_axis_counts, T)` pair by [`_tensor_gauss_rule`](@ref)
+Built once per `(per_axis_counts, T)` pair by `_tensor_gauss_rule`
 and cached, so all `:full` regions of the same per-axis order share the
 same `points`/`weights` arrays.
 """
@@ -209,6 +227,8 @@ function recommended_quadrature_order(::BasisFamily, order::NTuple{D,Int}) where
     return ntuple(i -> order[i] + 1, D)
 end
 
+# ── Basis modes and local mode counts ─────────────────────────────────────────
+
 """
     local_basis_count(basis, order)         -> Int
     local_basis_count(basis, order, mode)   -> Int
@@ -276,7 +296,7 @@ recurrence
 
 Used by the per-mode value/derivative wrappers below for testing and one-
 off evaluation. The hot-path assembly route does not call this — see
-[`_fill_factor_tables!`](@ref) for the fused per-axis recurrence that
+`_fill_factor_tables!` for the fused per-axis recurrence that
 serves it.
 """
 function legendre_value(n::Integer, x::Real)
@@ -334,7 +354,7 @@ respect to the reference coordinate:
 
 The closed form for `i ≥ 2` follows from differentiating
 `N̂ᵢ = (Lᵢ − Lᵢ₋₂) / √(4i − 2)` and applying the standard Legendre
-identity `Lₘ′ = ((2m − 1) Lₘ₋₁ + Lₘ₋₃′)`.
+identity `Lₘ′ − Lₘ₋₂′ = (2m − 1) Lₘ₋₁`.
 """
 function integrated_legendre_derivative(i::Integer, ξ::Real)
     i >= 0 || throw(ArgumentError("basis index must be nonnegative"))

@@ -12,9 +12,9 @@
 #     (`triangle_mesh`, or an STL via [`stl_levelset`](@ref)).
 #
 # All of the signed-distance machinery lives here; it loads only when FileIO,
-# MeshIO, and GeometryBasics are present alongside Unfitted. The reusable
-# `BoundaryMesh` geometry helpers (`_default_normal`, `_cell_midpoint`,
-# `_simplex_measure`) come from `src/surface.jl`.
+# MeshIO, and GeometryBasics are present alongside Unfitted. The two
+# `BoundaryMesh` geometry helpers it reuses — `_default_normal` and
+# `_cell_midpoint` — come from `src/surface.jl`.
 #
 # Algorithms (clean-room implementations from the cited sources)
 #
@@ -134,7 +134,8 @@ end
 
 # A boundary mesh prepared for signed-distance queries: the (non-degenerate)
 # cells, a KD-tree over cell midpoints for nearest-cell candidate search, the
-# per-cell outward unit normals, the largest cell circumradius (turns the
+# per-cell outward unit normals, the largest cell radius *about its midpoint*
+# (measured from the same point the tree is keyed on, which is what turns the
 # nearest-midpoint distance into an exact nearest-cell search bound), a
 # mesh-scaled length tolerance `tol` (for the closest-point-coincidence and
 # vertex/edge feature tests, so the sign is scale-free), and the sign
@@ -171,6 +172,15 @@ function _is_degenerate(cell::NTuple{3,SVector{3,T}}, scale) where {T}
     return norm(cross(ab, ac)) <= 1.0e-10 * norm(ab) * norm(ac)   # sin θ ≤ tol (scale-free)
 end
 
+# Prepare a `BoundaryMesh` for signed-distance queries. Vertices are converted
+# to `Float64` (the sign tests and the KD-tree do not need the mesh's eltype),
+# degenerate cells are dropped before anything derived from them is built —
+# their normal is undefined and would corrupt the sign — and each surviving cell
+# contributes its normal (the mesh's own, renormalised, if it carries one, else
+# the geometric `_default_normal`) and its midpoint to the search tree. The two
+# scalars are set here because both are mesh-relative: `maxcr` bounds the
+# candidate search, and `tol` is the length tolerance the vertex/edge feature
+# tests use, taken from the bounding-box diagonal so the sign is scale-free.
 function _build_mesh_sdf(bmesh::BoundaryMesh{D,T,K}, winding::Bool) where {D,T,K}
     cells = [map(v -> SVector{D,Float64}(v), cell) for cell in bmesh.cells]
     isempty(cells) && throw(ArgumentError("mesh has no cells"))
@@ -336,10 +346,12 @@ Read an STL file (ASCII or binary) at `path` and return a signed-distance
     using Unfitted, FileIO, MeshIO   # GeometryBasics loads transitively
     Ω = physical_domain(stl_levelset("part.stl"); subcell_length_scale=h)
 
-`orientation` selects the inside/outside test (see [`mesh_levelset`](@ref)); use
-`orientation = :winding` for imperfect / non-watertight meshes. Accuracy is
-bounded by the STL faceting: each planar facet is integrated exactly, while
-facet edges are creases resolved by the kernel's subdivision.
+`lipschitz` and `orientation` are passed through to [`mesh_levelset`](@ref):
+`1.0` is the exact Lipschitz constant of a true signed distance, and
+`orientation = :winding` is the robust inside/outside test for imperfect /
+non-watertight meshes. Accuracy is bounded by the STL faceting: each planar
+facet is integrated exactly, while facet edges are creases resolved by the
+kernel's subdivision.
 """
 function stl_levelset(path::AbstractString; lipschitz::Real=1.0, orientation::Symbol=:pseudonormal)
     verts, faces = _load_triangles(path)

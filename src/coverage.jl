@@ -3,8 +3,12 @@
 # The order-reduction rule sheds a level's high-order modes wherever a finer level
 # fully covers it, keeping only its linear skeleton:
 #
-#   a level-j cell is *covered* iff its box lies inside the region of every level
-#   *above* it (higher id) that carries material the finer level represents.
+#   a level-j cell is *covered* iff its box lies inside the covering region of a
+#   *single* level above it (higher id) — that level's domain, minus the cells it
+#   masks off that still carry material.
+#
+# The rule is per-covering-level on purpose: a cell covered only by the *union* of
+# two abutting overlays counts as uncovered. See `build_coverage`.
 #
 # Coverage is mask-aware, so a deactivated overlay does not cover — which is what keeps
 # "a fully-deactivated overlay behaves like no overlay" true under order reduction. The
@@ -22,7 +26,10 @@ by the order-reduction constraint source `_coverage_constraints` in `dofs.jl`.
 The flag is only computed where that consumer can read it — on a masked level, the
 active cells and their one-cell ∞-norm halo (see `_coverage_cells`). Outside that set
 the entry keeps its `false` default and carries no information; it is not a claim that
-the cell is uncovered.
+the cell is uncovered. The VTK mesh export (`_mesh_vtk_data` in `postprocessing.jl`)
+also reads the flag, for *every* cell of a level, so its `covered` cell array shows
+`0` on the masked level's far-away inactive cells whatever their true coverage; read
+it alongside the `active` array it is written next to.
 """
 struct Coverage{D}
     covered::Dict{Int,BitArray{D}}
@@ -98,11 +105,11 @@ end
     build_coverage(V::Space, tol) -> Coverage
     build_coverage(V::Space, tol, classify_cache) -> Coverage
 
-Compute, for every level of `V`, the cells covered by the union of the active cells of
-all higher-id levels. Uses single-covering-level containment (a cell counts as covered
-when one level above contains it); a cell covered only by the *union* of two abutting
-overlays is treated as uncovered — a conservative, safe choice (its high-order stays
-active) noted in the design.
+Compute, for every level of `V`, the cells a higher-id level's active region contains.
+Containment is tested one covering level at a time (a cell counts as covered when a
+single level above contains it); a cell covered only by the *union* of two abutting
+overlays is treated as uncovered — a conservative, safe choice, since its high-order
+modes then stay active.
 
 `classify_cache` is the space's cell-classification cache. It is consulted only for
 inactive overlapped cells of a masked level, to tell a fictitious fold (which covers)
@@ -137,7 +144,7 @@ end
 
 # The cells of `level` whose coverage flag can ever be read, as a `BitArray{D}`.
 #
-# `_coverage_constraints` (in `dofs.jl`) is the only consumer of a `Coverage`, and it
+# `_coverage_constraints` (in `dofs.jl`) is the consumer this set is cut for, and it
 # tests `cov` exactly on `_incident_cells(key, n)` for the level's raw dof keys. Raw
 # dofs are enumerated on *active* cells only (`dof_layout`, stage 1), and a key born on
 # cell `c` is incident to `c` and — through its node factors — to the cells sharing a
@@ -149,6 +156,12 @@ end
 #
 # An unmasked level is all-active, so its dilation is the whole grid and the pass is the
 # original one.
+#
+# The dof layer is not the only reader: `_mesh_vtk_data` in `postprocessing.jl` reads
+# `cov` on every cell of the level for its `covered` diagnostic array. That reader is
+# not what the set is sized for, and outside it sees the `false` default rather than a
+# computed verdict — a diagnostic gap, documented on `Coverage`, not a correctness one,
+# since no constraint is ever derived from an entry nobody computed.
 function _coverage_cells(level::Level{D}) where {D}
     n = level.mesh.cells
     level.mask === nothing && return trues(n)

@@ -79,9 +79,12 @@ factor-of-two bookkeeping. The minor symmetry of the strain tensor is
 preserved by the `SymmetricTensor{2,D}` storage so contractions cost
 `D(D+1)/2` multiplies rather than `D²`.
 
-`trial.component` is the spatial component index `1 ≤ k ≤ D` of the
-trial basis function currently being assembled, exactly as documented
-on [`TrialChannels`](@ref).
+`trial.component` is the component index of the trial basis function
+currently being assembled, exactly as documented on
+[`TrialChannels`](@ref). Reading it as the spatial index `k` of `eₖ`
+assumes a field with one component per spatial axis (`C = D`), which is
+what a strain tensor means; a component index above `D` cannot appear in a
+`SymmetricTensor{2,D}` and would return the zero tensor.
 """
 @inline function Unfitted.symmetric_gradient(t::TrialChannels{D,T}) where {D,T}
     g = Vec(t)
@@ -171,8 +174,9 @@ end
     value_vec(state::FormState, field::Field{D,T,C}) -> Vec{C,T}
 
 Read the field's value at the current quadrature point as a
-`Vec{C,T}`. Equivalent to [`value_vec(state, field.name, Val(C))`](@ref)
-but infers the component count from the field's type parameters.
+`Vec{C,T}`. Equivalent to `value_vec(state, field.name, Val(C))` (see
+[`value_vec`](@ref)) but infers the component count from the field's type
+parameters.
 """
 @inline function Unfitted.value_vec(state, field::Field{D,T,C}) where {D,T,C}
     return Vec{C}(ntuple(k -> Unfitted.value(state, field.name, k), Val(C)))

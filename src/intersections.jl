@@ -3,7 +3,7 @@
 """
     ParentRef{D,T}(level, cell, local_box, parent_box)
 
-Reference to one parent cell of an [`VolumeRegion`](@ref). Carries
+Reference to one parent cell of a [`VolumeRegion`](@ref). Carries
 both the parent's identity and the integration box's geometry in the
 parent's reference frame, so the assembly hot loop never re-derives
 either:
@@ -191,12 +191,13 @@ end
 # concretely typed, so `Q === Nothing` folds the branch away and the default
 # path is the moment fit and nothing else.
 #
-# The cache belongs to one *space*, not to one plan. Within a single plan it
-# can never hit: `_merged_boxes` emits pairwise-disjoint boxes, so no two
-# regions share a key. Its value is across plan rebuilds — a `move!` leaves
-# the great majority of cut boxes bit-identical, and refitting one costs
-# hundreds of milliseconds in 3D — so [`Model`](@ref) owns one per distinct
-# participating space and threads it back in through every rebuild. That
+# The cache belongs to one *space*, not to one plan. Within a single plan no
+# two regions share a key — `_merged_boxes` emits pairwise-disjoint boxes — so
+# `_prefit_cut_rules!` fits each key it does not already hold exactly once up
+# front and the region loop below reads back nothing but hits. Its value is across plan rebuilds — a
+# `move!` leaves the great majority of cut boxes bit-identical, and refitting
+# one costs hundreds of milliseconds in 3D — so [`Model`](@ref) owns one per
+# distinct participating space and threads it back in through every rebuild. That
 # scope also keeps the key honest: a space's `PhysicalDomain` is immutable
 # and is carried unchanged through `moved_space` / `_remasked_space`, so one
 # cache sees exactly one `physical` for its whole life and the key need not
@@ -383,9 +384,11 @@ function _coverage_signature(levels::Tuple, linmaps::Tuple, point::SVector{D,T},
     end
 end
 
-# Build the admissible integration boxes for `levels`. The construction
-# follows the seven-step recipe documented in `CONTRIBUTING.md`'s
-# "Integration regions" section:
+# Build the admissible integration boxes for `levels`. This is the box-partition
+# half of the recipe documented in `CONTRIBUTING.md`'s "Integration regions"
+# section — coordinates through greedy merge; `integration_plan` runs the parent
+# resolution, the keep-criterion and the quadrature dispatch over the boxes
+# emitted here:
 #
 #   1. Collect every participating mesh's element-boundary coordinates,
 #      per axis (`_axis_intervals` ⇒ `merge_coordinates` ⇒
@@ -564,9 +567,10 @@ end
 #   - `:any_parent`  — keep the region if any active level covers it
 #                      (the common assembly criterion: every region with
 #                      at least one contributing basis function counts).
-#   - `:all_levels`  — keep the region only if every level covers it
-#                      (the strict criterion used by full-superposition
-#                      diagnostics).
+#   - `:all_levels`  — keep the region only if every level covers it, i.e.
+#                      only where the full superposition overlaps. No
+#                      package code selects it; it is reached through
+#                      `prepare(problem; criterion = :all_levels)`.
 #   - `criterion isa Function` — caller-supplied predicate, called as
 #                      `criterion(parents)` and returning `Bool`. The
 #                      escape hatch for a coverage rule the two symbols
@@ -655,9 +659,11 @@ regions" section:
      boundaries collapsed by step 1, silently, so this combination is
      rejected with an `ArgumentError` naming the axis, its spacing, and
      the tolerance.
-  1. Per axis: collect every active level's element-boundary coordinates
-     and canonicalise them via `merge_coordinates` so two meshes'
-     near-coincident coordinates collapse to a single shared boundary.
+  1. Per axis: collect every level's element-boundary coordinates —
+     masking is per cell, so a level contributes its coordinates
+     whatever its `LevelMask` says — and canonicalise them via
+     `merge_coordinates` so two meshes' near-coincident coordinates
+     collapse to a single shared boundary.
   2. Form the Cartesian product of the resulting intervals to get
      candidate boxes; greedily merge axis-adjacent candidates that share
      a coverage signature (every cell inside the merged box lies inside
@@ -667,8 +673,10 @@ regions" section:
      reference frame, and check the `criterion`.
   4. Dispatch on the `PhysicalDomain` classification to pick the region
      quadrature: tensor Gauss for `:full`, α-scaled tensor Gauss for
-     `:fictitious + alpha > 0`, NNMF moment-fit for `:cut`. Drop the
-     region entirely under strict-α (`alpha = 0` and `:fictitious`).
+     `:fictitious + alpha > 0`, and on `:cut` the NNMF moment-fit — or
+     the domain's `cut_quadrature` callable, when it supplies one, in the
+     fit's place. Drop the region entirely under strict-α (`alpha = 0`
+     and `:fictitious`).
   5. Record a [`SmallOverlap`](@ref) for every region whose physical
      volume falls below `tolerance.small_volume`, and track the maximum
      NNMF residual observed across cut regions.

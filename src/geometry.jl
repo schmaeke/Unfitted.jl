@@ -213,8 +213,11 @@ function contains_point(point::PointLike{D}, b::AxisBox{D,T}, tol::GeometryToler
 end
 
 # Structural equality on the corner coordinates. Floating-point exactness is
-# acceptable here because the boxes consumed downstream are always built
-# from canonicalised grid coordinates produced by `merge_coordinates`.
+# acceptable here because every box this is asked about carries coordinates
+# reproduced bit-for-bit by one deterministic construction — the same
+# user-supplied corners, the mesh axes of `_mesh_axes` in `mesh.jl`, or the
+# canonicalised region coordinates of `merge_coordinates` — never two
+# independently rounded paths to the "same" corner.
 Base.:(==)(a::AxisBox{D}, b::AxisBox{D}) where {D} = a.lower == b.lower && a.upper == b.upper
 
 """
@@ -239,7 +242,8 @@ end
 Tolerance-aware containment of one box inside another: every corner of
 `inner` lies inside `outer` up to `tol.contain` on each axis. Used to
 validate overlay placement, since the `overlay(...)` constructor requires
-the overlay domain to lie inside the physical domain.
+the overlay domain to lie inside the space's bounding box `V.domain` (not
+inside an immersed `Ω` — an overlay may cover fictitious material).
 """
 function is_inside(inner::AxisBox{D,T}, outer::AxisBox{D,T},
                    tol::GeometryTolerance{T}=GeometryTolerance(T)) where {D,T}

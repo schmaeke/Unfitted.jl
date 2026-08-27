@@ -20,9 +20,13 @@ Per-solve diagnostic record carried on every [`Solution`](@ref):
     against the assembled system; `NaN` when the wrapper bypassed the
     solve (e.g. [`solution`](@ref) constructors fed by an external time
     integrator).
-  - `converged::Bool` — true when the solver reports convergence (or
-    the residual is finite for direct solves). Iterative solvers fill
-    this from their own convergence criteria.
+  - `converged::Bool` — whether the solve is to be trusted. [`solve!`](@ref)
+    sets it to `isfinite(residual_norm)` on *both* of its paths: a
+    `linear_solver` hook hands back only a coefficient vector, so it has no
+    channel through which to report a convergence verdict of its own. An
+    iterative solver that tracks its own criteria should record the verdict
+    through [`solution`](@ref), which stores the `converged=` keyword
+    verbatim.
 """
 struct SolverDiagnostics
     method::Symbol
@@ -164,14 +168,19 @@ Two solver paths:
     for iterative Krylov solvers, preconditioned solvers, or any
     domain-specific solve — none of which the package itself depends on.
 
-`method` overrides the recorded solver tag. Defaults to `:direct`
-(no `linear_solver`) or `:custom` (with `linear_solver`).
+`method` renames the solver tag recorded on the returned
+[`SolverDiagnostics`](@ref) and on `diagnostics(model).solver`. It
+defaults to `:direct` without a `linear_solver` and `:custom` with one.
+It renames a solve, it does not select one: without a `linear_solver`
+the only accepted value is `:direct`, and any other name raises
+`ArgumentError` rather than quietly labelling the built-in direct solve
+as something it is not.
 
 Returns a fresh [`Solution`](@ref) carrying the coefficients, the
 model version at solve time, and a [`SolverDiagnostics`](@ref) record
-with `‖A x − b‖₂` as the residual norm. The model's cached
-`matrix`/`rhs` are left untouched so a follow-up `solve!` (e.g. with a
-different `linear_solver`) reuses them.
+with `‖A x − b‖₂` as the residual norm and `converged` set from its
+finiteness. The model's cached `matrix`/`rhs` are left untouched so a
+follow-up `solve!` (e.g. with a different `linear_solver`) reuses them.
 """
 function solve!(model::Model; linear_solver=nothing, method::Union{Nothing,Symbol}=nothing)
     if model.matrix === nothing || model.rhs === nothing

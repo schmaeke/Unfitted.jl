@@ -81,7 +81,7 @@ end
 
 # True iff the dof key sits on the requested physical-domain face.
 # Composed from two family-aware primitives so it works for any basis
-# family that implements [`_key_on_level_side`](@ref):
+# family that implements `_key_on_level_side`:
 #
 #   1. The key's per-axis factor must anchor on the level's mesh edge
 #      at (`axis`, `side`). Family-specific check.
@@ -100,7 +100,7 @@ function _key_on_physical_side(key::TensorDofKey{D}, level::Level{D,T}, domain::
     return _level_side_is_physical(level, domain, axis, side, tol)
 end
 
-# True iff the dof key sits on *any* of the 2D codim-1 physical faces.
+# True iff the dof key sits on *any* of the 2·D codim-1 physical faces.
 # Used to decide whether a key matches a `boundary(:all)` selector.
 function _key_on_any_physical_side(key::TensorDofKey{D}, level::Level{D,T}, domain::AxisBox{D,T},
                                    tol::GeometryTolerance{T}) where {D,T}
@@ -343,8 +343,9 @@ end
 #      candidate sub-rectangles. Fix the constrained-axis coordinates to
 #      the facet's coordinates.
 #   4. For each candidate, find the touching levels' parent cells whose
-#      own face on `sides` contains the candidate's midpoint. Drop
-#      candidates with no parents.
+#      own face on `sides` contains the candidate's midpoint, skipping
+#      any the level's `LevelMask` deactivated — a masked-off cell has
+#      no dofs to constrain. Drop candidates left with no parents.
 #   5. Precompute the per-sub-rectangle Gauss rule and bake the
 #      `vol / 2^(D-K)` Jacobian into the weights. The returned
 #      `FacetRegion` is ready for direct consumption — every Q-point is
@@ -437,7 +438,7 @@ The datum-independent, *point*-independent half of a boundary trace: which of
 `sides`. Returns a `NamedTuple` with four fields:
 
   - `raw_dofs::Vector{Int}` — the subset of `raw_dofs` whose basis functions
-    touch the facet (filtered by [`is_facet_basis`](@ref)), in the original
+    touch the facet (filtered by `is_facet_basis`), in the original
     local-basis order.
   - `local_ids::Vector{CartesianIndex{D}}` — their tensor-product multi-indices,
     in the same order.
@@ -508,12 +509,15 @@ end
 #
 #     M c = b,   M_ij = ∫_∂Ω φ_i φ_j dx,   b_i = ∫_∂Ω g φ_i dx,
 #
-# where `φ_i` are the boundary traces of the physically-constrained,
-# non-overlay-constrained raw dofs. The mass matrix is symmetric
-# positive (semi-)definite, so we try a Cholesky factorisation first
-# and fall back to a pseudoinverse on the rare cases where Cholesky
-# reports indefiniteness (degenerate facets, zero-area boundaries under
-# heavy masking).
+# where `φ_i` are the boundary traces of the physically-constrained raw
+# dofs that survived every artificial elimination — the overlay-boundary
+# condition and, on a `reduce_order` level, order reduction and the
+# linear dedup (`elimination_source === :free`). An eliminated dof has
+# no value to project: its coefficient is not a solved unknown of the
+# system. The mass matrix is symmetric positive (semi-)definite, so we
+# try a Cholesky factorisation first and fall back to a pseudoinverse on
+# the rare cases where Cholesky reports indefiniteness (degenerate
+# facets, zero-area boundaries under heavy masking).
 #
 # `M` and the boundary walk that builds it depend on the mesh alone; only
 # `b` depends on the prescribed data. A load-stepping driver calls
@@ -575,7 +579,7 @@ end
 const DirichletFactor{T} = Union{Nothing,Cholesky{T,Matrix{T}},Matrix{T}}
 
 """
-    DirichletProjection{D,T}(unknowns, factors, samples)
+    DirichletProjection{D,T}(facets, unknowns, factors, samples)
 
 Everything in the L² Dirichlet projection `M c = b` that the prescribed
 data `g` do not enter: the per-component unknown sets, the per-component
@@ -588,8 +592,10 @@ Fields:
     projection was built for. A condition list of a different shape
     cannot reuse it.
   - `unknowns::Vector{Vector{Int}}` — per component, the raw dofs the
-    projection solves for: the physically-constrained,
-    non-overlay-constrained dofs of that component.
+    projection solves for: the dofs of that component carrying a
+    physical Dirichlet condition and no artificial elimination
+    (`elimination_source === :free`, which excludes the overlay boundary
+    as well as order reduction and the linear dedup).
   - `factors::Vector{DirichletFactor{T}}` — per component, the solved
     boundary mass (see `DirichletFactor`).
   - `samples::Vector{FacetTraceSamples{D,T}}` — one entry per

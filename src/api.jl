@@ -49,20 +49,15 @@ end
 
 # Diffusion flux `a · ∇u` for the three accepted shapes of `a`:
 # scalar (isotropic), `UniformScaling` (also isotropic; supports
-# `I` and `λI`), and `D × D` `AbstractMatrix` (anisotropic tensor).
-# The matrix shape is checked at the call site; the scalar / uniform
-# paths broadcast directly across the gradient SVector.
+# `I` and `λI`), and `D × D` `AbstractMatrix` (anisotropic tensor). A
+# callback `a(x)` is not a fourth shape: `_coefficient_value` resolves it
+# to one of these three before the flux is formed. Squareness is checked
+# once at the call site (`_check_square_diffusion`) and agreement with the
+# spatial dimension per point below; the scalar / uniform paths broadcast
+# directly across the gradient SVector.
 _diffusion_flux(a::Number, ugrad::SVector{D}) where {D} = a * ugrad
 _diffusion_flux(a::UniformScaling, ugrad::SVector{D}) where {D} = a * ugrad
 
-# The tensor is copied into an `SMatrix` before the product. A heap
-# `AbstractMatrix` times a static vector takes the generic dense product,
-# which allocates its result vector on every call — and this call sits once
-# per quadrature point per trial function. The static product keeps the whole
-# contraction in registers, and copying `D²` entries is cheaper than the
-# allocation it removes. A tensor that already is an `SMatrix` is passed
-# through untouched, so that spelling pays nothing for the conversion.
-#
 # A diffusion tensor must be square for every spatial dimension, so squareness
 # is checkable the moment the form is built — before `D` is known and, more
 # importantly, before assembly spawns tasks. Deep in a threaded assembly the
@@ -77,6 +72,14 @@ function _check_square_diffusion(a::AbstractMatrix)
 end
 _check_square_diffusion(_) = nothing
 
+# The tensor is copied into an `SMatrix` before the product. A heap
+# `AbstractMatrix` times a static vector takes the generic dense product,
+# which allocates its result vector on every call — and this call sits once
+# per quadrature point per trial function. The static product keeps the whole
+# contraction in registers, and copying `D²` entries is cheaper than the
+# allocation it removes. A tensor that already is an `SMatrix` is passed
+# through untouched, so that spelling pays nothing for the conversion.
+#
 # Both products evaluate the same sum ∑ⱼ aᵢⱼ ∂ⱼu left to right, but the
 # unrolled static row sums contract to FMA under optimisation while the
 # generic ones do not, so the flux can differ from the generic product in the
@@ -205,25 +208,19 @@ end
 
 """
     mass_form(; coefficient=1)
-    stiffness_form(; diffusion=1)
-    source_form(; source)
 
-Build standard accumulator [`WeakForm`](@ref)s without committing to
-a full [`Problem`](@ref). Useful when several operators share one
-prepared model — e.g. building a mass operator and a stiffness
-operator over the same `Model` for time stepping.
+Build the mass [`WeakForm`](@ref) `∫_Ω c(x) · v u dx` without committing
+to a full [`Problem`](@ref). Useful when several operators share one
+prepared model — e.g. building a mass operator and a stiffness operator
+over the same [`Model`](@ref) for time stepping.
 
-  - `mass_form(; coefficient)` — `∫ c(x) · v u dx`. `coefficient` is
-    a scalar, a callback `c(x)`, or a per-component indexable value.
-    Diagonal in components for vector fields.
-  - `stiffness_form(; diffusion)` — `∫ ⟨∇v, A(x) ∇u⟩ dx`. `diffusion`
-    is a scalar (isotropic), a callback returning a scalar, a constant
-    `D × D` matrix (anisotropic), or a callback returning such a
-    matrix. Diagonal in components for vector fields.
-  - `source_form(; source)` — `∫ source(x) · v dx`. `source` is a
-    scalar, a callback `source(x)`, or a per-component value.
+`coefficient` is a scalar (the default `1`), a callback `c(x)`, or an
+indexable value (`SVector`, `Tuple`) carrying one entry per component.
+The form is diagonal in the component index for vector fields, and is
+built with `symmetric = true` and `component_aware = true`.
 
-All three are symmetric and component-aware.
+See [`mass_block`](@ref) for the same form wrapped as a same-field
+block, and [`mass`](@ref) for the whole one-field problem.
 """
 function mass_form(; coefficient=1)
     coefficient_data = _as_coefficient(coefficient)
@@ -232,6 +229,40 @@ function mass_form(; coefficient=1)
                     linear=(q, test_component) -> 0.0, symmetric=true, component_aware=true)
 end
 
+"""
+    stiffness_form(; diffusion=1)
+
+Build the stiffness [`WeakForm`](@ref) `∫_Ω ⟨∇v, A(x) ∇u⟩ dx` without
+committing to a full [`Problem`](@ref).
+
+`diffusion` is a scalar (isotropic; the default `1`), a `UniformScaling`
+(`I`, `λI` — also isotropic), a constant `D × D` matrix (anisotropic
+tensor), or a callback `A(x)` returning any of those. A constant matrix
+argument is checked for squareness here, when the form is built, rather
+than inside the threaded assembly where the `DimensionMismatch` would
+reach the caller wrapped in a `TaskFailedException`; a square tensor
+whose size does not match the space's `D` is still caught at the first
+quadrature point. The form is diagonal in the component index for vector
+fields, and is built with `symmetric = true` and
+`component_aware = true`.
+
+That `symmetric = true` assumes a **symmetric** tensor `A`, which a
+diffusivity or a conductivity is; nothing checks it. A non-symmetric `A`
+still reports the form as symmetric, so a [`Problem`](@ref) built from it
+inherits `symmetric = true` and assembly mirrors the lower triangle
+(see [`WeakForm`](@ref)) — silently discarding the true upper triangle.
+Assemble a non-symmetric tensor by declaring the asymmetry explicitly:
+
+```julia
+# at problem construction …
+Problem((u,); blocks=(stiffness_block(u; diffusion=A),), symmetric=false)
+# … or on a one-shot assemble against an existing model
+assemble_matrix(model, stiffness_block(u; diffusion=A); symmetric=false)
+```
+
+See [`stiffness_block`](@ref) for the same form wrapped as a same-field
+block, and [`stiffness`](@ref) for the whole one-field problem.
+"""
 function stiffness_form(; diffusion=1)
     _check_square_diffusion(diffusion)
     diffusion_coefficient = _as_coefficient(diffusion)
@@ -241,6 +272,22 @@ function stiffness_form(; diffusion=1)
                     linear=(q, test_component) -> 0.0, symmetric=true, component_aware=true)
 end
 
+"""
+    source_form(; source)
+
+Build the load [`WeakForm`](@ref) `ℓ(v) = ∫_Ω source(x) · v dx` without
+committing to a full [`Problem`](@ref). Its bilinear part is identically
+zero, so the form contributes to the right-hand side only.
+
+`source` is a scalar, a callback `source(x)`, or an indexable value
+(`SVector`, `Tuple`) carrying one entry per component. The form is built
+`component_aware = true`, and `symmetric = true` — an inert flag on a
+form whose bilinear part is identically zero.
+
+See [`source_load`](@ref) for the same form wrapped as a load
+contribution, [`load`](@ref) for the whole one-field problem, and
+[`neumann`](@ref) for the boundary-integrated counterpart.
+"""
 function source_form(; source)
     source_coefficient = _as_coefficient(source)
     return WeakForm(bilinear=(q, trial, test_component) -> 0.0,
@@ -268,18 +315,39 @@ end
 # ── Blocks, loads, and problem wrappers ───────────────────────────────────────
 
 """
-    mass_block(u; coefficient=1)         -> BlockForm
-    stiffness_block(u; diffusion=1)      -> BlockForm
-    source_load(u; source)               -> LoadForm
+    mass_block(u::Field; coefficient=1) -> BlockForm
 
-Standard block and load contributions for [`assemble_matrix`](@ref),
-[`assemble_vector`](@ref), or an explicit
-`Problem((fields...); blocks, loads)`. Each wraps the corresponding
-canonical [`WeakForm`](@ref) in a same-field `block(u, u, form)` or
-`loadform(u, form)`.
+Wrap [`mass_form`](@ref) as the same-field bilinear block
+`block(u, u, mass_form(; coefficient))`, ready for [`assemble_matrix`](@ref)
+or an explicit `Problem((fields...); blocks, loads)`. `coefficient` is
+forwarded unchanged; see [`mass_form`](@ref) for the shapes it accepts.
 """
 mass_block(u::Field; coefficient=1) = block(u, u, mass_form(; coefficient))
+
+"""
+    stiffness_block(u::Field; diffusion=1) -> BlockForm
+
+Wrap [`stiffness_form`](@ref) as the same-field bilinear block
+`block(u, u, stiffness_form(; diffusion))`, ready for
+[`assemble_matrix`](@ref) or an explicit
+`Problem((fields...); blocks, loads)`. `diffusion` is forwarded
+unchanged; see [`stiffness_form`](@ref) for the shapes it accepts and for
+why a non-symmetric tensor needs `symmetric = false` at the assembling
+call.
+"""
 stiffness_block(u::Field; diffusion=1) = block(u, u, stiffness_form(; diffusion))
+
+"""
+    source_load(u::Field; source) -> LoadForm
+
+Wrap [`source_form`](@ref) as the load contribution
+`loadform(u, source_form(; source))` to the rows of `u`, ready for
+[`assemble_vector`](@ref) or an explicit
+`Problem((fields...); blocks, loads)`. `source` is forwarded unchanged;
+see [`source_form`](@ref) for the shapes it accepts. Pass `on = …` by
+building the [`loadform`](@ref) directly when the load belongs on a
+boundary rather than in the volume — or use [`neumann`](@ref).
+"""
 source_load(u::Field; source) = loadform(u, source_form(; source))
 
 """
@@ -353,8 +421,11 @@ or a component field `u`:
 
 For vector fields the form is diagonal in the component index.
 `diffusion` accepts the same shapes as [`poisson`](@ref): scalar,
-callback returning a scalar, constant `D × D` matrix, or callback
-returning such a matrix.
+`UniformScaling`, callback returning a scalar, constant `D × D` matrix,
+or callback returning such a matrix — and carries the same assumption
+that a matrix `A` is symmetric (see [`stiffness_form`](@ref)).
+`dirichlet` is the list of physical Dirichlet conditions to impose; see
+[`dirichlet`](@ref).
 """
 function stiffness(V::Space{D,T}; diffusion=one(T), dirichlet=[]) where {D,T}
     return stiffness(field(:u, V); diffusion, dirichlet)
@@ -375,10 +446,11 @@ component field `u`:
 
 For vector fields `source` may return a scalar (applied to all
 components) or an indexable component value (`SVector`, `Tuple`).
-For repeated time-dependent loads on an already prepared model,
-prefer [`load_vector`](@ref) — it reuses the model's existing
-integration plan and dof layout instead of building fresh ones from
-the problem.
+`dirichlet` is the list of physical Dirichlet conditions to impose; see
+[`dirichlet`](@ref). For repeated time-dependent loads on an already
+prepared model, prefer [`load_vector`](@ref) — it reuses the model's
+existing integration plan and dof layout instead of building fresh ones
+from the problem.
 """
 load(V::Space{D,T}; source, dirichlet=[]) where {D,T} = load(field(:u, V); source, dirichlet)
 
@@ -389,12 +461,15 @@ end
 """
     load_vector(model; source) -> Vector
 
-Assemble a load vector on the active field of an already prepared
+Assemble a load vector on the single field of an already prepared
 `model`, reusing its dof layout, constraints, and integration plan.
 `source` may be a scalar, a per-component indexable value, or a
 callback `source(x)`. Equivalent to
-`assemble_vector(model, source_load(default_field, source))` but
-takes the default-field shortcut.
+`assemble_vector(model, source_load(u; source))` for the model's only
+field `u`, which it looks up so the caller need not name it. A
+multi-field model has no implicit field and raises `ArgumentError`;
+spell the field out with [`source_load`](@ref) and
+[`assemble_vector`](@ref) there.
 
 The canonical use case is time-dependent or otherwise repeated load
 assembly: build the model once via [`prepare`](@ref), then call
@@ -417,6 +492,7 @@ Build the H¹ Poisson / Laplace [`Problem`](@ref) over a scalar space
 indexable value (vector fields). `diffusion` accepts:
 
   - a scalar (isotropic constant diffusion),
+  - a `UniformScaling` — `I` or `λI`, also isotropic,
   - a callback returning a scalar (isotropic spatially-varying
     diffusion),
   - a constant `D × D` matrix (anisotropic constant tensor),
@@ -425,7 +501,12 @@ indexable value (vector fields). `diffusion` accepts:
 
 Matrix diffusion is applied as `⟨∇v, A · ∇u⟩` per component (no
 inter-component coupling); for cross-component coupling, build the
-multi-field [`Problem`](@ref) explicitly.
+multi-field [`Problem`](@ref) explicitly. The returned problem declares
+`symmetric = true`, which assumes a symmetric `A`; a non-symmetric
+tensor must be assembled through an explicitly asymmetric
+[`Problem`](@ref) instead — see [`stiffness_form`](@ref). `dirichlet` is
+the list of physical Dirichlet conditions to impose; see
+[`dirichlet`](@ref).
 """
 function poisson(V::Space{D,T}; source, diffusion=one(T), dirichlet=[]) where {D,T}
     return poisson(field(:u, V); source, diffusion, dirichlet)

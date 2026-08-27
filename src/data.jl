@@ -9,9 +9,11 @@
 # updates, h-/p- refinement) changes the quadrature-point cloud, so a
 # `QuadField` belonging to the old model becomes meaningless on the new
 # one. `transfer` rebuilds the field on the target model's quadrature
-# points via a point-based interpolation scheme; the default scheme is
-# [`RBFP0`](@ref), an inverse-multiquadric RBF with a constant
-# polynomial extension.
+# points via a point-based interpolation scheme. [`RBFP0`](@ref) — an
+# inverse-multiquadric RBF with a constant polynomial extension — is the
+# only scheme today; `transfer`'s `via` keyword is typed to it. It moves
+# one scalar per point, so a component-valued state travels as one
+# `QuadField` per component.
 
 # ── QuadField ────────────────────────────────────────────────────────────────
 
@@ -38,6 +40,16 @@ Material-state history variables (phase-field `H`, plastic strain,
 predeformation gradient, …) are the natural use case. Move them across
 model changes with [`transfer`](@ref), which reconstructs the field on the
 new model's quadrature points through an [`RBFP0`](@ref) interpolation.
+The container places no restriction on `T`, but that transfer does: it
+takes a `QuadField{T}` on a `Model{D,T}` and nothing else, so a
+component-valued state is carried one component per `QuadField`.
+
+`QuadField{T}(model; init)` walks the plan through
+[`foreach_quadrature_point`](@ref) and inherits its restriction to
+single-domain models — on a coupled model it raises. Sizing against
+`nquadpoints(model)`, as the `QuadField(data, model)` form does, is not
+enough there: `q.point` restarts at 1 for each subdomain, so one flat
+array would alias the subdomains onto each other.
 """
 mutable struct QuadField{T}
     data::Vector{T}
@@ -149,8 +161,12 @@ _rbf_invmq(r) = inv(sqrt(1 + r * r))
 #
 # where the bottom row enforces `Σ wᵢ = 0` (the standard polynomial
 # orthogonality condition). `r̄ = mean ‖xᵢ − xⱼ‖` is the natural
-# length scale; we floor it at `eps(T)` to handle the degenerate
-# single-cluster case.
+# length scale; it is floored at `eps(T)` so a cluster of coincident
+# neighbours cannot divide by zero, and falls back to `1` at `K = 1`,
+# where there is no pair to average. The fallback value is arbitrary
+# there: the `K = 1` system is `[1 1; 1 0] [w; α] = [f₁; 0]`, whose
+# solution `w = 0`, `α = f₁` is nearest-neighbour extension at any
+# scale.
 function _rbfp0_static_solve(local_sources::NTuple{K,SVector{D,T}},
                              local_values::NTuple{K,T}) where {K,D,T}
     mean_r = zero(T)
@@ -221,6 +237,15 @@ Reconstruct `source` on `target_model`'s quadrature-point cloud with the
 `target_model`. The same verb `transfer` moves a [`Solution`](@ref) when given
 one.
 
+`source` must be a `QuadField{T}` over the models' own scalar type `T`: the
+local solve carries neighbour coordinates and neighbour values in one type,
+so a component-valued state is transferred one component at a time. That one
+is not an argument check — a mismatched element type surfaces as a
+`MethodError` from the local solve. Two
+`ArgumentError`s guard the neighbour count — `1 ≤ via.neighbors ≤ 16` (the
+static-solve cap documented on [`RBFP0`](@ref)) and at least `via.neighbors`
+quadrature points on the source model.
+
 Algorithm: build a `KDTree` over the source cloud; for each target
 quadrature point find the `via.neighbors` nearest source neighbours,
 run the local RBF + P0 solve on them, and evaluate the interpolant at
@@ -230,8 +255,8 @@ The outer loop over target points is embarrassingly parallel: each
 target's small solve is independent and uses pure-Julia
 `StaticArrays` operations, so the result is bit-identical regardless
 of thread count for a fixed neighbour set. `threaded = true` is the
-default; pass `threaded = false` for tests that need ordered
-evaluation.
+default; `threaded = false` runs the same loop serially, which is how the
+suite asserts that the two paths agree bit for bit.
 """
 function transfer(source::QuadField, source_model::Model{D,T}, target_model::Model{D,T};
                   via::RBFP0=RBFP0(), threaded::Bool=true) where {D,T}

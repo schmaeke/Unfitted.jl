@@ -220,10 +220,11 @@ end
 # when `symmetric`, i.e. global row ≥ col).
 #
 # `feed!` is a function that, given a `visit` callback, calls
-# `visit(active::Vector{Int})` once per dense block to include — one per
-# region for volume/facet assembly, one per (region, field) for the L²
-# transfer mass. The `active` vector may alias workspace storage; the
-# builder copies it.
+# `visit(active::Vector{Int})` once per dense block to include. The sole
+# caller is `build_assembly_pattern`, which visits one block per region of
+# every pass a matrix assembly walks — the volume plans plus each `on=`
+# region list. The `active` vector may alias workspace storage; the builder
+# copies it.
 #
 # Gustavson's column dedup uses an `O(nactive)` `marker` array — but the
 # trick is correct only when each output column is processed contiguously
@@ -310,10 +311,10 @@ end
 
 # Ordered region lists a matrix assembly over `blocks` walks — the volume
 # integration plan (when any block is volume-tagged) followed by each
-# unique `on=` selector's region list, in the same order
-# `_assemble_partitioned` visits them. Returns the lists plus a hash
+# unique `on=` selector's region list. Returns the lists plus a hash
 # signature of that set, used as the pattern cache key (loads never
-# contribute matrix entries, so they are ignored here).
+# contribute matrix entries, so they are ignored here). The visiting order
+# is `_assemble_partitioned!`'s.
 function _assembly_region_lists(model::Model, blocks)
     volume_blocks, _, partitions = _partition_forms_by_on(blocks, ())
     passes = Any[]
@@ -597,11 +598,14 @@ end
 
 # Where a region's local matrix block is deposited. The right-hand side
 # always accumulates into a dense vector; only the matrix destination
-# varies behind the sink, so the three `_assemble_region!` overloads and
-# the whole hot loop stay agnostic to it. Two cases:
+# varies behind the sink, so the single `_assemble_region!` body and the
+# whole hot loop stay agnostic to it. Three cases:
 #
 #   * `ScatterSink` — `+=` into the pre-built CSC `nzval` slot located via
-#     the cached pattern. The matrix path proper.
+#     the cached pattern. The serial matrix path proper.
+#   * `ArenaSink` (defined with the threaded scatter further down) — store
+#     the block into the region's own disjoint arena slice, deferring the
+#     accumulation to the phase-2 gather.
 #   * `nothing` — the rhs-only sink used by `assemble_vector`, where no
 #     block is present and the local matrix is empty.
 struct ScatterSink{T}
@@ -621,12 +625,19 @@ end
 end
 
 # Scatter a region's dense local block into the matrix, column-major.
-# Zero entries are skipped (so they never enter the accumulation and
-# `dropzeros!` has less to do); the rest locate `(row, col)` in column
-# `col`'s sorted row range via `searchsortedfirst` and `+=` into that
-# `nzval` slot. A miss (the located slot does not hold `row`) means the
-# pattern and the numeric pass disagree and raises rather than corrupting
-# a neighbouring slot. The `nothing` sink (rhs-only assembly) is a no-op.
+# Zero entries are skipped; the rest locate `(row, col)` in column `col`'s
+# sorted row range via `searchsortedfirst` and `+=` into that `nzval` slot.
+#
+# The skip is load-bearing, not just a saving. Under `symmetric` the pattern
+# stores rows `i ≥ j` only, and the per-emission kernels never write an
+# upper-triangle slot of the local block — so those entries are still exactly
+# the zeros `_region_workspace_setup!` filled, and skipping them is what keeps
+# the lookup below inside the column's stored row range. (It also keeps
+# structural zeros out of the accumulation, giving `dropzeros!` less to do.)
+#
+# A miss — the located slot does not hold `row` — means the pattern and the
+# numeric pass disagree, and raises rather than corrupting a neighbouring
+# slot. The `nothing` sink (rhs-only assembly) is a no-op.
 # The serial walk visits regions and entries in a fixed order, so repeated
 # serial assembly is deterministic to the bit.
 _emit_matrix!(::Nothing, active_dofs, local_matrix) = nothing
@@ -704,10 +715,10 @@ Thread-local assembly scratch. Carries every buffer the hot loop needs:
     evaluator.
   - `active_dofs`, `local_by_global` — per-region local-to-global dof
     table (rebuilt per region; the dict is `empty!`d, not reallocated).
-  - `local_matrix`, `local_rhs` — flat scratch buffers reshaped to
-    `n×n` and `n` per region.
+  - `local_matrix` — flat scratch buffer resized and reshaped to `n×n`
+    per region; `local_rhs` — flat scratch buffer resized to `n`.
 
-Constructed by [`_assembly_workspace`](@ref) once per thread (or once
+Constructed by `_assembly_workspace` once per thread (or once
 per assembly call in the serial path).
 """
 struct AssemblyWorkspace{D,T,B<:BasisFamily}
@@ -827,13 +838,6 @@ function _parent_dof_data(ws::AssemblyWorkspace{D,T}, layout::FieldLayout{D,T},
     return (; level=lvl, raw_dofs, values=ws.values[lvl], gradients=ws.gradients[lvl])
 end
 
-# Per-field, per-parent dof-data table for one region: for every field
-# layout, the slim `_parent_dof_data` record of each covering parent
-# (basis values / gradients alias the workspace level buffers; only the
-# field's raw dof ids are materialised). Shared by the symbolic pattern
-# pass (`_region_active_dofs!`), the numeric per-region setup
-# (`_region_workspace_setup!`), and the quadrature-point walk
-# (`foreach_quadrature_point`), which each need the same nested table.
 # Parents of `region` on which field `fl` (global index `field_index`) is
 # evaluated. Subdomain ownership is *intrinsic*: a single-space region hands its
 # parents only to a field whose level-id block contains the region's level, and
@@ -857,6 +861,14 @@ function region_parents(region::InterfaceRegion, field_index::Int, ::FieldLayout
     field_index == region.field_b ? region.parents_b : empty(region.parents_a)
 end
 
+# Per-field, per-parent dof-data table for one region: for every field
+# layout, the slim `_parent_dof_data` record of each covering parent
+# (basis values / gradients alias the workspace level buffers; only the
+# field's raw dof ids are materialised). Shared by the symbolic pattern
+# pass (`_region_active_dofs!`), the numeric per-region setup
+# (`_region_workspace_setup!`), and the quadrature-point walks
+# (`foreach_quadrature_point`, `foreach_interface_quadrature_point`),
+# which each need the same nested table.
 function _region_field_data(ws::AssemblyWorkspace, model::Model, region)
     return [[_parent_dof_data(ws, layout, parent)
              for parent in region_parents(region, field_index, layout)]
@@ -867,7 +879,7 @@ end
 # the region (parents are unique per level), writing into the workspace
 # buffers. The physical-gradient scale factor is the standard
 # axis-aligned chain rule `scale[d] = 2 / edge_lengths(parent_box)[d]`
-# from `physical_basis_gradients!` in `basis.jl`.
+# from `physical_basis_gradients` in `basis.jl`.
 function _update_region_basis!(ws::AssemblyWorkspace{D,T}, region::VolumeRegion{D,T},
                                eta::SVector{D,T}) where {D,T}
     for parent in region.parents
@@ -921,10 +933,10 @@ end
 
 # ── Per-region-kind quadrature accessors ──────────────────────────────────────
 #
-# The volume, facet, and surface hot loops share one body (`_assemble_region!`
-# below). Only three things differ per region kind, captured by these small
-# accessors so the body stays single-source and the per-kind dispatch happens
-# once per accessor rather than as three copied loops.
+# The volume, facet, surface, and interface hot loops share one body
+# (`_assemble_region!` below). Only three things differ per region kind,
+# captured by these small accessors so the body stays single-source and the
+# per-kind dispatch happens once per accessor rather than as four copied loops.
 
 # Reference→physical Jacobian for the region's weights: `vol(box)/2ᴰ` for a
 # volume region (whose weights are reference-frame), `one(T)` for facet, surface,
@@ -990,7 +1002,7 @@ end
 Assemble every weak-form contribution at every quadrature point of one
 integration region — the assembly hot loop. One call walks the region's
 quadrature points and updates the matrix `sink` and right-hand-side vector in
-place. The body is shared across the three region kinds; only the small
+place. This is a single method over all four region kinds; only the small
 accessors above (`_region_qpoint!`, `_region_jacobian`, `_region_normal`,
 `_region_sides`) differ:
 
@@ -1000,10 +1012,13 @@ accessors above (`_region_qpoint!`, `_region_jacobian`, `_region_normal`,
     face's outward normal `q.normal` and codim-`K` identifier `q.sides`, so
     user forms can express Neumann / Robin / Nitsche contributions;
   * a **surface** (immersed-boundary) region is a facet with a per-point
-    `q.normal` and no `q.sides`.
+    `q.normal` and no `q.sides`;
+  * an **interface** region is two-sided: it refreshes both subdomains' bases
+    at the shared point, carries the per-point normal oriented from side `a`
+    to side `b`, and has no `q.sides`.
 
 Every active local basis mode of every parent participates — `is_facet_basis`
-is **not** applied on facet / surface regions: a mode with zero *value* on the
+is **not** applied on the physical-frame kinds: a mode with zero *value* on the
 face can still carry nonzero *gradient*, which Nitsche-style forms rely on.
 
 Per quadrature point the body refreshes every parent's basis into the workspace
@@ -1011,7 +1026,7 @@ and composes `q = (; x, weight, point, state, normal, sides)`; then
 `_accumulate_qpoint!` evaluates loads and blocks, applies Dirichlet elimination
 (a constrained trial column shifts its contribution onto the rhs), and respects
 symmetry (emitting only `row ≥ col`, mirrored by `_matrix_from_pattern`). The
-region's local system is finally flushed by [`_emit_local_system!`](@ref).
+region's local system is finally flushed by `_emit_local_system!`.
 
 `point_offset` is the global quad-point offset of this region in the plan, so
 `q.point = point_offset + local_qp` is the stable index used by
@@ -1052,7 +1067,7 @@ end
 # single reference frame shared by every parent — the constrained
 # coordinate is fixed but free-axis coordinates run across multiple
 # cells per level). Called by `_region_qpoint!` on the facet / surface branch
-# of `_assemble_region!`.
+# of `_assemble_region!`, and twice — once per side — on the interface branch.
 function _update_physical_basis!(ws::AssemblyWorkspace{D,T}, parents, x::SVector{D,T}) where {D,T}
     for parent in parents
         lvl = parent.level
@@ -1064,11 +1079,11 @@ function _update_physical_basis!(ws::AssemblyWorkspace{D,T}, parents, x::SVector
     return nothing
 end
 
-# Shared workspace setup for both volume and facet `_assemble_region!`
-# methods: build the per-field parent records (aliasing the workspace
-# buffers), build the per-region local-to-global dof table, attach the
-# optional `FormState`, and resize/clear the local matrix and rhs
-# buffers. Returns the assembled view objects the hot loop walks.
+# Region setup for `_assemble_region!`, shared by every region kind: build
+# the per-field parent records (aliasing the workspace buffers), build the
+# per-region local-to-global dof table, attach the optional `FormState`, and
+# resize/clear the local matrix and rhs buffers. Returns the assembled view
+# objects the hot loop walks.
 #
 # This per-region setup is invariant across repeated `assemble!` calls for a
 # fixed model, so caching it on the Model (a per-region descriptor cache) was
@@ -1104,10 +1119,9 @@ end
 # onto the rhs). Symmetric blocks emit only the lower-triangular
 # entries; `_matrix_from_pattern` mirrors at the end.
 #
-# Extracted from the two `_assemble_region!` overloads so the volume
-# and facet hot loops share their inner work — every kind-specific
-# detail is contained in the caller (Q-point source, basis refresh,
-# `q` tuple shape).
+# Extracted from `_assemble_region!` so every region kind shares this
+# inner work — the kind-specific details (Q-point source, basis refresh,
+# `q` tuple shape) all live in the caller and its accessors.
 #
 # Two overloads, selected by the per-region dof-table representation
 # built in `_local_active_dof_table!`:
@@ -1340,10 +1354,11 @@ end
 # Serial assembly driver: one workspace and the shared `sink`/`rhs`
 # walked across every region in order. `region_filter` lets load
 # assemblies skip regions that do not intersect the load's support. The
-# `regions` argument is any iterable of `VolumeRegion`s or
-# `FacetRegion`s — Julia dispatches the right `_assemble_region!` method
-# automatically. The serial walk scatters into the sink in a fixed region
-# order, so repeated serial assembly is deterministic to the bit.
+# `regions` argument is any iterable of one region kind — volume, facet,
+# surface, or interface — which the single `_assemble_region!` method
+# handles through its per-kind accessors. The serial walk scatters into the
+# sink in a fixed region order, so repeated serial assembly is deterministic
+# to the bit.
 function _assemble_system_serial!(sink, rhs::Vector{T}, model::Model{D,T}, regions, symmetric::Bool,
                                   blocks, loads, region_filter, state_coefficients) where {D,T}
     ws = _assembly_workspace(model)
@@ -1378,8 +1393,11 @@ end
 # colour- or atomic-ordered scatter would leave on ill-conditioned systems.
 # Works for any element type (plain `+=`). The symbolic plan is the only
 # expensive part (a `searchsortedfirst` per contribution); caching it makes
-# repeated assembly — Newton tangents, transient steps, moving overlays — pay
-# it once.
+# repeated assembly against one structure — Newton tangents, load steps, a
+# transient march — pay it once. It is *not* carried across a structural
+# change: the cache lives on `model.pattern`, which `move!` / `activate!` /
+# `deactivate!` clear, so a moved overlay rebuilds the plan along with the
+# pattern.
 
 # Cached symbolic layout for one region list against one pattern. Matrix side:
 # `region_arena[r]..region_arena[r+1]-1` is region r's arena slice; the column
@@ -1784,9 +1802,15 @@ tuple of them.
     to expose the current iterate to the forms as `q.state` (used to
     build Newton tangents).
 
-Returns the sparse global matrix. Does not touch `model.matrix` or
-`model.rhs`; for in-place assembly that updates the cached operators
-use [`assemble!`](@ref).
+Returns the sparse global matrix over the *active* dofs: constrained
+columns are eliminated, so the matrix already matches the reduced system.
+The right-hand-side correction that elimination produces (`−A_c g` for a
+nonzero Dirichlet datum `g`) is computed and then discarded, because this
+entry point returns a matrix only — call [`assemble!`](@ref) when the
+problem has nonzero Dirichlet data and you need a consistent pair.
+
+Does not touch `model.matrix` or `model.rhs`; for in-place assembly that
+updates the cached operators use [`assemble!`](@ref).
 """
 function assemble_matrix(model::Model{D,T}, blocks; symmetric=nothing,
                          threaded::Bool=Threads.nthreads() > 1, state=nothing) where {D,T}
@@ -1818,7 +1842,12 @@ a small portion of the mesh) to skip irrelevant regions cheaply.
 `state` exposes the current iterate as `q.state` for Newton-residual
 loads (see [`assemble_matrix`](@ref)).
 
-Returns the assembled right-hand-side vector.
+Returns the assembled right-hand-side vector over the active dofs. It
+carries the load integrals only: no bilinear block participates in this
+call, so there is no Dirichlet column elimination and therefore no `−A_c g`
+correction for nonzero Dirichlet data — [`assemble!`](@ref) is the entry
+point that produces a matrix and a right-hand side consistent with each
+other.
 """
 function assemble_vector(model::Model{D,T}, loads; threaded::Bool=Threads.nthreads() > 1,
                          region_filter=nothing, state=nothing) where {D,T}
@@ -1838,8 +1867,12 @@ in place. Updates `model.matrix`, `model.rhs`, and
 `model.diagnostics` (symmetry residual and condition estimate filled
 in). Returns `model` for chaining.
 
-The current implementation supports strong Dirichlet elimination
-(through the dof layer) and dof-wise homogeneous overlay constraints.
+Constraints are honoured through the dof layer: strong Dirichlet
+elimination (a constrained trial column moves to the right-hand side,
+weighted by its stored value), dof-wise homogeneous overlay elimination, and
+— when the basis family supplies them — general homogeneous linear
+constraints, whose pivots are distributed over their expansions during the
+scatter.
 """
 function assemble!(model::Model{D,T}; threaded::Bool=Threads.nthreads() > 1) where {D,T}
     nactive = active_unknowns(model.dofs)
@@ -2135,7 +2168,8 @@ where
     natural key for per-interface-point history (an irreversible cohesive
     `κ`, a friction state, …),
   - `q.normal` — the interface unit normal, oriented from side `a` toward side
-    `b` (the two fields passed to [`couple`](@ref), in order),
+    `b` (the two fields passed to [`couple`](@ref), in order) — a convention
+    the interface mesh carries and the caller owns, see [`Interface`](@ref),
   - `q.state` — `nothing` unless a `state` (a [`Solution`](@ref) or active
     coefficient vector) was passed, in which case it is a two-field
     [`FormState`](@ref) exposing **both** coupled fields via

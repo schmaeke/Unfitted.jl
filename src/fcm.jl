@@ -32,10 +32,11 @@
 #   classifies against a CSG level set (`PhysicalDomain`) and computes the
 #   moments from the Saye implicit-quadrature kernel — exact and
 #   octree-depth-independent on smooth (graph-like) cut cells, machine precision
-#   for linear leaves and polytope corners. There is a single integrator: the
-#   octree stair-step moment integrator, QuESo's `PointElimination` inner loop
-#   and its accuracy-driven `AssembleIPs` retry are not used, because the exact
-#   kernel removes the stair-step accuracy floor those loops worked around.
+#   for linear leaves and polytope corners. That kernel is the only integrator
+#   here: QuESo's octree stair-step moment integrator, its `PointElimination`
+#   inner loop and its accuracy-driven `AssembleIPs` retry are all absent,
+#   because the exact kernel removes the stair-step accuracy floor those loops
+#   worked around.
 #   Non-graph-like cells (high curvature relative to the cell) are handled by the
 #   kernel's bounded subdivision, so no separate fallback path is needed.
 #
@@ -53,8 +54,9 @@
 #      moment-fit candidates, capped at a multiple of nbasis that grows with the
 #      retry index.
 #   4. A single NNLS moment fit (Lawson–Hanson naturally yields ≤ nbasis
-#      non-negative weights; a zero-residual non-negative solution exists, so
-#      one solve reaches machine-level residual), then a truncation of the
+#      non-negative weights; the volume rule of step 2 is itself a zero-residual
+#      non-negative solution, so one solve on a candidate cloud that retains
+#      enough of it reaches machine-level residual), then a truncation of the
 #      near-zero weights at a cutoff relative to the cut volume, with the
 #      residual re-measured on the weights that survive it.
 #   5. If no attempt fits, fall back to the volume rule of step 2 itself — the
@@ -165,11 +167,12 @@ end
 # Drop a candidate weight when its NNLS solution falls below this threshold
 # (numerical noise around true zeros). The number is dimensionless: a quadrature
 # weight carries the units of a volume, so the cutoff is taken *relative to the
-# cut volume* `∫_{Ω∩R} 1 dx` in `_solve_moment_fit` below. Compared against an
-# absolute constant instead, the same truncation keeps every weight on a geometry
-# of unit size and empties the rule on a small one — at a domain length scale of
-# 1e-5 in 2D a correct cut weight is ~1e-11, an order of magnitude under a 1e-12
-# cutoff. The breakpoint tolerance of `src/implicit.jl` and the mesh-SDF length
+# cut volume* `∫_{Ω∩R} 1 dx` in `_solve_moment_fit` below. Every weight scales as
+# (length scale)ᴰ, so an absolute constant instead keeps every weight on a
+# geometry of unit size and empties the rule on a small one: at a domain length
+# scale of 1e-5 in 3D the whole cut volume is ~1e-15 — three orders of magnitude
+# *under* a 1e-12 cutoff — so a perfectly good rule truncates to nothing.
+# The breakpoint tolerance of `src/implicit.jl` and the mesh-SDF length
 # tolerance of `ext/UnfittedMeshIOExt.jl` are scaled the same way, and for the
 # same reason: the kernel has to behave identically under a rescaling of the
 # geometry.
@@ -283,14 +286,16 @@ function _implicit_gauss_points(moment_order::NTuple{D,Int}) where {D}
 end
 
 # Ceiling on the NNLS design matrix, in entries (`nbasis × ncandidates`).
-# Lawson–Hanson sweeps the whole matrix once per accepted column, so both a
-# solve's memory and its time are proportional to this product; 6·10⁶ entries is
-# 48 MB and a fraction of a second at the moment orders in use here. Because the
-# candidate budget below is a multiple of `nbasis`, the entry count grows as
-# `budget · nbasis²` — quadratically in the basis size — so the retry needs an
-# absolute ceiling and not just a relative one. It binds retries only (the `max`
-# in `_cap_candidates` keeps the first attempt exempt), and only bites at all
-# once `nbasis` passes ≈ 1000.
+# Lawson–Hanson sweeps the whole matrix once per accepted column, so a solve's
+# memory is proportional to this product and its time to the product times the
+# number of accepted columns (≤ nbasis); 6·10⁶ entries is 48 MB and a fraction of
+# a second at the moment orders in use here. Because the candidate budget below
+# is a multiple of `nbasis`, the entry count grows as `budget · nbasis²` —
+# quadratically in the basis size — so the retry needs an absolute ceiling and
+# not just a relative one. It binds retries only (the `max` in `_cap_candidates`
+# keeps the first attempt exempt), and there only once `nbasis` exceeds
+# `√(_MAX_FIT_MATRIX_ENTRIES / budget)`: ≈ 354 on the second attempt, ≈ 126 on
+# the third.
 const _MAX_FIT_MATRIX_ENTRIES = 6_000_000
 
 # Cap the candidate cloud so the NNLS design matrix stays bounded regardless of
@@ -369,9 +374,12 @@ heuristic and its sub-cell blind spot.
 
 A single Lawson–Hanson NNLS solve then picks the non-negative
 weights — its active-set solution carries at most `nbasis` non-zeros, so the
-rule is already compressed to O(nbasis) points, and because the volume rule
-reproduces the moments with strictly positive weights a zero-residual
-non-negative solution exists, so one solve reaches machine-level residual.
+rule is already compressed to O(nbasis) points. The volume rule reproduces the
+moments with strictly positive weights, so a zero-residual non-negative solution
+exists over its *full* point set and one solve normally reaches machine-level
+residual; the candidate cloud is a strided subset of that point set, which is
+why a solve can nevertheless come back ill-conditioned and why the retry below
+densifies the cloud (`_candidate_budget` carries the measurements).
 
 `target_residual` bounds a small conditioning retry — up to
 `_MAX_IMPLICIT_ATTEMPTS` attempts, each with a denser candidate cloud, never with

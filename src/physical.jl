@@ -51,8 +51,11 @@ end
 
 Wrap a scalar level-set callback `f` (on `SVector{D,T}` coordinates) as a CSG
 leaf with `Ω_leaf = { x : f(x) ≤ 0 }`. `f` must accept `ForwardDiff.Dual`
-arguments so the quadrature kernel can take its gradient (pass an
-AD-compatible closure, or supply a finite-difference gradient downstream).
+arguments so the quadrature kernel can take its gradient: the finite-cell path
+(`physical_domain` → `moment_fit_rule`) installs no gradient override, and the
+`grad` keyword of [`implicit_volume_quadrature`](@ref) is reachable only by
+calling that kernel directly.
+
 `lipschitz` is the Lipschitz constant used by the sign certificate of both the
 cell classifier and the implicit quadrature kernel; `1.0` for a true
 signed-distance leaf, `Inf` to rely on corner sampling. Supplying it is what
@@ -85,8 +88,27 @@ be a `LevelSet`, so wrap at least one operand with `leaf` (e.g.
 """
 Base.intersect(a::LevelSet) = a
 Base.intersect(a::LevelSet, b, rest...) = AllOf((a, _as_levelset(b), map(_as_levelset, rest)...))
+
+"""
+    union(a::LevelSet, b...) -> LevelSet
+
+CSG union of level sets: `Ω = ⋃ {fᵢ ≤ 0}`, the region inside *any* part. Bare
+callable arguments are auto-wrapped as default [`leaf`](@ref)s, so only the
+first argument has to be a `LevelSet` (e.g. `union(leaf(f), g)`). One of the
+four combinators documented together under `intersect`; pass the result to
+[`physical_domain`](@ref).
+"""
 Base.union(a::LevelSet) = a
 Base.union(a::LevelSet, b, rest...) = AnyOf((a, _as_levelset(b), map(_as_levelset, rest)...))
+
+"""
+    setdiff(a::LevelSet, b) -> LevelSet
+
+CSG difference of level sets: `setdiff(a, b) = a ∩ complement(b)`, e.g. an
+annulus as a disk minus a disk. `b` may be a bare callable, auto-wrapped as a
+default [`leaf`](@ref). One of the four combinators documented together under
+`intersect`; pass the result to [`physical_domain`](@ref).
+"""
 Base.setdiff(a::LevelSet, b) = AllOf((a, Not(_as_levelset(b))))
 
 """
@@ -149,13 +171,16 @@ Fields:
     α-scaled full-cell rule, so cut-cell dofs whose basis support lies in the
     fictitious part still get a well-posed contribution (see
     `_build_region_quadrature` in `intersections.jl`). Fully-fictitious cells
-    (support entirely outside Ω) are **dropped from the dof layout regardless of
-    α** — the α term stabilizes cuts, not whole fictitious cells.
+    (support entirely outside Ω) are **dropped from the dof layout** unless
+    `keep_fictitious` says otherwise; α alone never keeps them, because the α
+    term stabilizes cuts, not whole fictitious cells.
   - `keep_fictitious::Bool`: opt into the classic α-FCM treatment where
     fully-fictitious cells are *kept* active with α-scaled full-cell quadrature
     instead of being dropped. `false` (default) drops them, which keeps the
     system lean and the physical domain clean for post-processing; `true`
-    requires `alpha > 0` to be meaningful.
+    requires `alpha > 0`, and [`physical_domain`](@ref) raises an
+    `ArgumentError` on the `alpha = 0` pairing rather than building a domain
+    whose kept cells carry no quadrature.
   - `subcell_length_scale::T`: target box size, in physical units, for the
     binary subdivision both the classifier and the moment-fit kernel share. A
     box is bisected until its largest axis extent is `≤ subcell_length_scale`
@@ -187,8 +212,8 @@ Fields:
 
 `cut_quadrature` is the extension point for integrating a cut cell by some
 other scheme — a space-tree/octree rule, a tessellation, a rule read from a
-file. It is called once per distinct `(region box, moment order)` pair, with
-the signature
+file. It is called once per distinct `(region box, moment order)` pair (see the
+memoisation note below), with the signature
 
     (physical, box, moment_order) -> (points, weights, residual, status)
 
@@ -227,11 +252,15 @@ responsibility:
     rather than replacing it.
 
 The rule must also be a deterministic function of its three arguments: results
-are memoised per `(region box, moment order)` for the lifetime of a plan
-build, so a rule reading mutable state outside its arguments is captured at
-its first answer for a box and silently reused. Put every knob in the callable
-itself — that is what makes the rule reproducible and thread-safe. `residual`
-is reported verbatim through `diagnostics(model).moment_fit_residual_max`.
+are memoised per `(region box, moment order)` in a cache the [`Model`](@ref)
+owns per participating space and threads back through every plan rebuild, so a
+rule reading mutable state outside its arguments is captured at its first answer
+for a box and silently reused — across rebuilds, not merely within one. Put
+every knob in the callable itself; that is what makes the rule reproducible.
+The package does not run a custom rule on several threads, unlike its own fit:
+`_prefit_cut_rules!` in `src/intersections.jl` fits custom rules serially,
+because they are caller code under no thread-safety contract. `residual` is
+reported verbatim through `diagnostics(model).moment_fit_residual_max`.
 
 A region built from a custom rule is tagged `:cut_custom` (see
 `_build_region_quadrature` in `src/intersections.jl`) — one kind for every

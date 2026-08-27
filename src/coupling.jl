@@ -83,7 +83,7 @@ weights, and a per-point normal — but carries a *separate* covering-parent lis
 for each side (`parents_a` in `field_a`'s subdomain, `parents_b` in `field_b`'s)
 so the two fields are evaluated in their own cut cells at the shared point.
 `field_a` / `field_b` are the global field indices the assembly hot loop keys on
-through [`region_parents`](@ref).
+through `region_parents`.
 """
 struct InterfaceRegion{D,T<:Real}
     field_a::Int
@@ -191,8 +191,9 @@ bilinear callback, with three extra facts supplied:
     blocks `Kₐₐ, K_ab, K_ba, K_bb` are assembled by calling `kernel` with the
     four `(test, trial)` combinations, so the callback branches on `sides` to
     place its consistency / adjoint / penalty contributions.
-  - `test_component` — the vector component (`1:D`) of the test channel the
-    return value lands on. A scalar law ignores it; a vector law (elasticity
+  - `test_component` — the component of the test field the return value lands
+    on, running over `1:C` of that [`Field`](@ref)'s component count (which
+    need not equal `D`). A scalar law ignores it; a vector law (elasticity
     cohesion / traction) reads the trial's component from `trial` and emits the
     coupling for row `test_component`.
 

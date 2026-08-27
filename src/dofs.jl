@@ -7,7 +7,9 @@
 #   * which raw dofs are constrained, by what kind of constraint, and
 #     (for nonzero physical Dirichlet data) to what value.
 #
-# Two kinds of constraint are tracked separately and never mixed:
+# Physical and artificial constraints are tracked separately and never
+# mixed — the physical ones in `physical_dirichlet`, the artificial ones
+# in `elimination_source`:
 #
 #   * Physical Dirichlet — user-imposed boundary conditions on the
 #     physical domain `∂Ω`. Tracked per-component so vector fields can
@@ -20,7 +22,14 @@
 #     eliminated for the integrated Legendre basis by removing the
 #     corresponding raw dof from active enumeration. Also applied at
 #     internal active/inactive cell faces of the same level when a
-#     `LevelMask` is in play.
+#     `LevelMask` is in play — except where the inactive side is fully
+#     fictitious, since a fold face carries no physical trace to
+#     vanish on (`_internal_face_is_physical`).
+#   * Order reduction — on a level that opted into `reduce_order`, the
+#     high-order modes buried under a finer level, plus the buried
+#     linear modes a nested finer level reproduces exactly. Also a
+#     strong elimination, and also artificial: it removes modes the
+#     superposition already carries, never a physical condition.
 #
 # Active dofs are enumerated component-major (component 1 of every raw
 # first, then component 2, …) so the all-or-nothing constrained case
@@ -28,7 +37,9 @@
 # simply leave holes in the enumeration.
 #
 # This file owns the dof keys, the layout structs, the structural
-# overlay-constraint detection, and the active-enumeration constructor.
+# overlay-constraint detection, the order-reduction constraint source
+# (`_coverage_constraints`, over the masks `coverage.jl` computes), and
+# the active-enumeration constructor.
 # The physical-Dirichlet spec types, per-key Dirichlet detection, and
 # the L² boundary projection live in `dirichlet.jl`. `dof_layout`
 # forward-references `_has_physical_dirichlet` and
@@ -75,9 +86,10 @@ A homogeneous linear constraint among raw dofs of one level:
 
     Σᵢ coefficientsᵢ · u_{rawsᵢ} = 0
 
-Applies uniformly to every field component (overlay constraints don't
-distinguish components). Used by [`_overlay_constraints`](@ref) to
-encode trace-vanishing conditions at artificial boundaries; the dof
+Applies uniformly to every field component (neither constraint source
+distinguishes components). Emitted by [`_overlay_constraints`](@ref) for
+the trace-vanishing conditions at artificial boundaries and by
+[`_coverage_constraints`](@ref) for order-reduction eliminations; the dof
 layer resolves the resulting constraint system into a `raw_expansion`
 table via cascade elimination in [`_resolve_constraints!`](@ref).
 
@@ -108,9 +120,12 @@ Fields:
     (1 for scalar fields, > 1 for vector fields). Constraints are
     tracked per-component so vector boundary conditions can pin
     individual channels.
-  - `cell_dofs_by_level::Vector{Array{Vector{Int},D}}` — one entry per
-    level; each entry is a `D`-dimensional array of cell-local raw dof
-    id vectors, indexed by the level's `CartesianIndex`. Inactive cells
+  - `cell_dofs_by_level::Vector{Array{Vector{Int},D}}` — indexed by
+    level *id*, not by position in `V.levels`, so that it matches the
+    `parent.level` id assembly carries; a subdomain whose ids were
+    reindexed into a higher block leaves the leading slots undefined.
+    Each entry is a `D`-dimensional array of cell-local raw dof id
+    vectors, indexed by the level's `CartesianIndex`. Inactive cells
     carry an empty vector.
   - `raw_keys::Vector{TensorDofKey{D}}` — `raw_keys[i]` is the
     `TensorDofKey` that produced raw dof `i`. The inverse of the
@@ -436,16 +451,19 @@ end
 # ── Linear-constraint collection and resolution ──────────────────────────────
 
 """
-    _overlay_constraints(level, V, tol, raw_by_key, level_keys) -> Vector{LinearConstraint{T}}
+    _overlay_constraints(level, V, tol, raw_by_key, level_keys, classify_cache)
+        -> Vector{LinearConstraint{T}}
 
 Produce the homogeneous linear constraints that encode `level`'s
 artificial-overlay-boundary trace condition. Dispatched on the level's
 basis family so each family can exploit its own boundary mode structure.
+A new family must implement all six arguments, in this order — the hook
+is called positionally from [`dof_layout`](@ref) stage 2.
 
 The default fallback walks `level_keys` (the `(key, raw)` pairs that
 belong to this level, pre-bucketed by [`dof_layout`](@ref) so the scan
 is `O(this level's raws)` rather than `O(all raws)` per level), asks the
-family's [`_has_overlay_constraint`](@ref) predicate per raw, and emits a
+family's `_has_overlay_constraint` predicate per raw, and emits a
 *single-raw* constraint `1 · u_raw = 0` for every boundary raw. This is
 strong elimination of the boundary node — the regime the integrated
 Legendre family relies on.
@@ -460,7 +478,11 @@ per-raw `_has_overlay_constraint`; it reaches through `raw_by_key`
 directly to look up raw ids by (cell, mode), and ignores `level_keys`.
 
 `raw_by_key` is the global `TensorDofKey` → raw-id map built in stage 1
-of [`dof_layout`](@ref).
+of [`dof_layout`](@ref). `classify_cache` is the space's
+cell-classification cache, threaded through for whatever the family
+needs it for; the fallback hands it to `_has_overlay_constraint`, which
+consults it only to tell a fully-fictitious fold face from a user-mask
+face. It is empty, and untouched, when `V.physical === nothing`.
 """
 function _overlay_constraints(level::Level{D,T,B}, V::Space{D,T}, tol::GeometryTolerance{T},
                               raw_by_key::AbstractDict{TensorDofKey{D},Int},
@@ -503,7 +525,7 @@ The linear skeleton is otherwise retained, which is what makes the reduced space
 complete. Each returned pair carries its elimination source for `constraint_kind` /
 diagnostics.
 
-`classify_cache` is threaded into [`_covered_by_level`](@ref) for the dedup test so it
+`classify_cache` is threaded into `_covered_by_level` for the dedup test so it
 applies the same fictitious-fold rule [`build_coverage`](@ref) used.
 
 Integrated-Legendre only; the generic fallback returns nothing (order reduction is out
@@ -693,7 +715,8 @@ function _active_component_dof(layout::DofLayout, raw::Integer, component::Integ
 end
 
 """
-    dof_layout(V::Space; dirichlet=[], tolerance=GeometryTolerance(T), components=1) -> DofLayout
+    dof_layout(V::Space; dirichlet=[], tolerance=GeometryTolerance(T), components=1,
+                         classify_cache=_ClassifyCache{D,T}()) -> DofLayout
 
 Construct the basis-aware global dof layout for a superposition
 [`Space`](@ref). The construction proceeds in four stages:
@@ -702,15 +725,21 @@ Construct the basis-aware global dof layout for a superposition
      id vector through `TensorDofKey` lookup. Adjacent cells share
      endpoint nodes; bubble (span) modes are cell-local. Inactive cells
      get an empty vector.
-  2. Collect homogeneous linear constraints from every level via the
-     family-dispatched [`_overlay_constraints`](@ref) hook, then resolve
-     them into the per-raw expansion table via
-     [`_resolve_constraints!`](@ref). The resulting
-     `raw_expansion[raw]` is either the identity `[(raw, 1)]` for free
-     raws, the empty list `[]` for strongly eliminated raws, or a
-     multi-element list for linear-constraint pivots.
+  2. Collect homogeneous linear constraints from every level, from two
+     sources: the family-dispatched [`_overlay_constraints`](@ref) hook
+     on every level, and [`_coverage_constraints`](@ref) on the levels
+     that opted into `reduce_order` (which needs the per-level masks
+     [`build_coverage`](@ref) computes, so those are built first when
+     any level opted in). A raw the overlay condition already eliminates
+     is not re-constrained by order reduction, so `elimination_source`
+     credits it to the source that actually removed it. Resolve the
+     collected constraints into the per-raw expansion table via
+     [`_resolve_constraints!`](@ref). The resulting `raw_expansion[raw]`
+     is either the identity `[(raw, 1)]` for free raws, the empty list
+     `[]` for strongly eliminated raws, or a multi-element list for
+     linear-constraint pivots.
   3. Per-component physical Dirichlet detection via
-     [`_has_physical_dirichlet`](@ref).
+     `_has_physical_dirichlet`.
   4. Enumerate active dofs component-major (component 1 first, then
      component 2, …) skipping every (raw, component) entry that is
      either physically Dirichlet-constrained or a constraint pivot.

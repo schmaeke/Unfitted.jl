@@ -51,10 +51,15 @@ struct TransferRegion{D,T<:Real}
     quadrature::TensorQuadrature{D,T}
 end
 
-# Sanity-check the source / target compatibility for a transfer:
-# matching physical domain, matching field count, matching per-field
-# component counts. Lets backends fail early with a clear message
-# instead of producing wrong numbers downstream.
+# Sanity-check the source / target compatibility for a transfer: the same
+# space bounding box (`Space.domain`; the immersed `Space.physical` is not
+# compared here), the same number of fields, and the same field names with
+# the same per-field component counts. The name check is implicit in
+# `_field_layout`, which raises on a source field the target does not carry.
+# Lets backends fail early with a clear message instead of producing wrong
+# numbers downstream. On a coupled model `problem.space` is the
+# *representative* (first field's) space, so only that subdomain's box is
+# compared.
 function _assert_transfer_compatible(source_model::Model{D,T}, target_model::Model{D,T}) where {D,T}
     source_model.problem.space.domain == target_model.problem.space.domain ||
         throw(ArgumentError("source and target models must have the same physical domain"))
@@ -139,7 +144,7 @@ update never collides within a region.
 The trailing `active_dofs` / `local_by_global` / `local_rhs` fields are
 the per-region rhs scatter scratch — resized and reset in place every
 region, never reallocated. The target mass matrix and its Dirichlet lift
-are built by the standard assembler (see [`transfer`](@ref)), so this
+are built by the standard assembler (see [`L2Projection`](@ref)), so this
 workspace carries no local-matrix bank.
 """
 struct TransferWorkspace{D,T,BS<:BasisFamily,BT<:BasisFamily}
@@ -230,7 +235,7 @@ end
 # Accumulate one transfer region's source-driven rhs contribution. The
 # target mass matrix `M_T` and its Dirichlet column-elimination lift
 # `−M_ac·c_c` are assembled separately by the standard assembler over the
-# target's own integration regions (see [`transfer`](@ref)), so this pass
+# target's own integration regions (see [`L2Projection`](@ref)), so this pass
 # integrates only the linear load
 #
 #     b_i += ∫_box u_S(x) · φ_iᵀ dx,
@@ -316,11 +321,16 @@ abstract type TransferBackend end
 
 Variational L² projection backend. Builds the target-side mass system
 
-    Σ_T M_T c_T = b_T,   M_T,ij = ∫_Ω φ_iᵀ φ_jᵀ dx,   b_T,i = ∫_Ω u_S(x) φ_iᵀ dx,
+    M_T c_T = b_T,   M_T,ij = ∫_Ω φ_iᵀ φ_jᵀ dx,   b_T,i = ∫_Ω u_S(x) φ_iᵀ dx,
 
-on the union partition of source and target meshes, and solves it
-sparse-direct for the target coefficients. This produces the L²-best
-target approximation of `u_S` in the target's active basis.
+and solves it sparse-direct for the target coefficients. This produces the
+L²-best target approximation of `u_S` in the target's active basis.
+
+`M_T` and its Dirichlet column-elimination lift `−M_ac·c_c` come from the
+standard assembler over the *target's own* integration regions: under exact
+quadrature `∫_Ω φ_iᵀ φ_jᵀ` does not depend on the partition. Only the
+source-driven rhs `b_T`, whose integrand mixes the two meshes, is
+accumulated over a union partition that respects both.
 
 The single-argument form `L2Projection(matrix)` reuses a precomputed
 mass matrix — typically built once via
@@ -339,6 +349,20 @@ The cached-matrix shortcut requires the target to be homogeneously
 constrained: a cached mass omits the Dirichlet column-elimination lift,
 so a target with non-homogeneous physical Dirichlet data is rejected
 (use the default `L2Projection()` there, which assembles the lift).
+
+A target whose [`Space`](@ref) carries a [`PhysicalDomain`](@ref) is
+rejected with an `ArgumentError` as well: the target mass restricts to `Ω`
+through the cut-cell rules while the source-driven rhs integrates over the
+full mesh boxes of the union partition, so the two halves of the system
+would disagree about the domain. Making the union partition FCM-aware is
+separate work.
+
+This backend is single-domain only, and nothing checks it: the union
+partition is built from `problem.space`, the representative (first field's)
+space, while the rhs pass walks every field, so on a coupled model the
+fields of the other subdomains are integrated against subdomain 1's cells
+and the run fails inside the dof lookup rather than with a diagnostic. Use
+[`Rewire`](@ref) there. Several fields sharing *one* space are fine.
 """
 struct L2Projection{M,F} <: TransferBackend
     matrix::M
@@ -357,7 +381,7 @@ end
 Raw-key coefficient mapping backend. For each (raw, component) of every
 source field:
 
-  1. Look up the source's [`TensorDofKey`](@ref) in the target field's
+  1. Look up the source's `TensorDofKey` in the target field's
      `raw_keys` table.
   2. If a target raw matches and is active, copy the source's active
      coefficient into the target's active slot.
@@ -399,6 +423,14 @@ one — see that method for the quadrature-point schemes.
 source-target union partition; it defaults to the target dof layout's stored
 tolerance and is ignored by strategies that do not walk the geometry (currently
 [`Rewire`](@ref)).
+
+The two backends do not cover the same cases. [`L2Projection`](@ref) walks
+the geometry of both models, rejects a target carrying a
+[`PhysicalDomain`](@ref), and is single-domain only. [`Rewire`](@ref) reads
+only raw dof keys, so it also serves coupled models, but it reproduces the
+source exactly only when the target's active basis contains it. Either way
+the two models must agree on the space bounding box, the field names, and
+the per-field component counts.
 """
 function transfer(source_solution::Solution, source_model::Model{D,T}, target_model::Model{D,T};
                   via::TransferBackend=L2Projection(),

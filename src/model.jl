@@ -3,17 +3,23 @@
 # `Problem` into a model (folding the optional `PhysicalDomain`,
 # building the integration plan, the dof layout, and the diagnostics),
 # and the in-place mutators (`move!`, `activate!`, `deactivate!`) that
-# bump the model's version counter and refresh the cached state.
+# bump the model's version counter and refresh the cached state. Also here:
+# `moved` (the non-destructive `move!`), the `active_cells` query, the
+# `diagnostics` reports, and `update_dirichlet!` — which mutates a prepared
+# model but is *not* one of the "mutators" the rest of this file means by
+# that word, because it rewrites constrained values without changing the
+# structure: the version, the integration plan, the dof layout, and the
+# sparsity pattern all survive it.
 #
 # No assembly happens here — the global matrix and rhs are populated by
 # `assemble!` in `assembly.jl`. Loaded between `problems.jl` (whose
 # `Problem` this file owns the prepared form of) and `assembly.jl`
 # (whose `assemble!` mutates `model.matrix` / `model.rhs`).
 #
-# Stale-solution detection contract: every mutator bumps
-# `model.version`. A [`Solution`](@ref) carries the version it was
-# computed against; reusing a solution after a version bump is caught
-# by `_checked_coefficients` in `solvers.jl`.
+# Stale-solution detection contract: each of `move!`, `activate!`, and
+# `deactivate!` bumps `model.version`. A [`Solution`](@ref) carries the
+# version it was computed against; reusing a solution after a version bump
+# is caught by `_checked_coefficients` in `solvers.jl`.
 
 # ── Assembly diagnostics ──────────────────────────────────────────────────────
 
@@ -21,8 +27,11 @@
     AssemblyDiagnostics
 
 Mutable diagnostics record carried on every [`Model`](@ref) and exposed
-through [`diagnostics`](@ref). Updated in place by `prepare`, `move!`,
-`activate!` / `deactivate!`, and `assemble!`. Every field is `Float64`-
+through [`diagnostics`](@ref). [`assemble!`](@ref) and [`solve!`](@ref)
+update the model's record in place; `prepare` and the version-bumping
+mutators (`move!`, `activate!` / `deactivate!`) install a *fresh* record
+instead, so a reference held across one of those keeps reporting the old
+state — re-read it through [`diagnostics`](@ref). Every field is `Float64`-
 or `Int`-typed for stability across scalar types.
 
 Fields:
@@ -37,20 +46,33 @@ Fields:
   - `min_integration_volume::Float64` — smallest region volume.
   - `min_relative_integration_volume::Float64` — same, divided by
     `volume(V.domain)`.
-  - `symmetry_residual::Float64` — `‖A − Aᵀ‖_F` for the assembled
-    matrix; `NaN` until `assemble!` runs, and `0.0` for symmetric forms
-    (assembled lower-triangular and mirrored — bit-exact).
+  - `symmetry_residual::Float64` — the reported value of `‖A − Aᵀ‖_F` for
+    the assembled matrix. It is asserted, never measured: `assemble!`
+    writes exactly `0.0` when the problem declares itself symmetric — such
+    a form is scattered into the lower triangle only and mirrored
+    entry-for-entry by `_mirror_lower`, so `A = Aᵀ` holds to the bit by
+    construction — and `NaN` otherwise. `NaN` therefore means "no symmetry
+    claim", both before `assemble!` has run and for a form the problem did
+    not declare symmetric; it is never a measurement of asymmetry.
   - `condition_estimate::Float64` — `cond(Matrix(A))` for systems with
-    `n ≤ 256`; `NaN` otherwise (computing the condition number of a
-    large matrix is too expensive for a default diagnostic).
+    `1 ≤ n ≤ 256`; `NaN` otherwise (computing the condition number of a
+    large matrix is too expensive for a default diagnostic, and an empty
+    system has none).
   - `solver::Symbol` — solver tag recorded by [`solve!`](@ref).
-  - `inactive_cell_counts::Vector{Int}` — per-level count of cells
-    deactivated by `LevelMask`. Includes both user-provided masks and
-    the strict-α fictitious fold from `physical.jl`.
-  - `reduced_mode_counts::Vector{Int}` — per-level count of high-order
-    and dedup modes eliminated by order reduction in covered regions
-    (`reduce_order`), in the same field-then-level order as
-    `inactive_cell_counts`.
+  - `inactive_cell_counts::Vector{Int}` — count of cells deactivated by
+    `LevelMask`, one entry per level of each distinct participating space,
+    in `problem_spaces` order. Includes both user-provided masks
+    and the fictitious fold `mesh.jl`'s `_apply_physical_fold` applies
+    whenever the domain's `keep_fictitious` is `false` (the default) —
+    that fold runs at any `alpha`, not only in the strict `alpha = 0` case.
+  - `reduced_mode_counts::Vector{Int}` — count of high-order and dedup
+    modes eliminated by order reduction in covered regions
+    (`reduce_order`), one entry per level of each *field*, concatenated in
+    field-declaration order. Note the different granularity from
+    `inactive_cell_counts`, which is per *space*: the two vectors line up
+    entry-for-entry only when every space carries exactly one field (the
+    common case). Two fields over one space give this vector twice the
+    length of that one.
   - `cut_region_count::Int`, `fit_failure_count::Int`,
     `moment_fit_residual_max::Float64` — FCM moment-fit statistics from
     the integration plan. `fit_failure_count` counts every cut region
@@ -141,9 +163,13 @@ function _inactive_cell_counts(spaces)
                for V in spaces for level in V.levels]
 end
 
-# Per-level count of raws eliminated by order reduction (`:coverage` or `:dedup`),
-# across every field of the system layout, in field-then-level order — mirroring
-# `_inactive_cell_counts` so the two vectors line up entry-for-entry.
+# Per-level count of raws eliminated by order reduction (`:coverage` or
+# `:dedup`), across every field of the system layout, in field-then-level
+# order. The granularity is deliberately the *field*, not the space
+# `_inactive_cell_counts` walks: order reduction is a property of a field's
+# own dof layout, and two fields over one space shed different modes. The two
+# vectors therefore line up entry-for-entry only when each space carries one
+# field.
 function _reduced_mode_counts(layout::SystemLayout)
     counts = Int[]
     for field in layout.fields
@@ -318,8 +344,9 @@ re-thread a fresh value through. Fields:
 
   - `problem::P` — the *effective* [`Problem`](@ref): the one every
     consumer reads, already folded against a `PhysicalDomain` (cells
-    outside Ω deactivated via the strict-α path in `mesh.jl`'s
-    `_apply_physical_fold`) and reindexed into disjoint level-id blocks.
+    classified fully outside Ω deactivated by `mesh.jl`'s
+    `_apply_physical_fold`, which runs at any `alpha` unless the domain
+    sets `keep_fictitious`) and reindexed into disjoint level-id blocks.
   - `prefold_space::Space{D,T}` — the *pre-fold* space: the level masks
     exactly as the caller described them, before `_apply_physical_fold`
     intersected them with the geometry. It is the only record of what the
@@ -338,7 +365,7 @@ re-thread a fresh value through. Fields:
     a [`Solution`](@ref) carrying an older version raises on reuse.
   - `space_plans::Vector{IntegrationPlan{D,T}}` — cached integration
     plan per *distinct* participating discretisation, in the
-    first-appearance order of [`problem_spaces`](@ref)`(problem)`. A
+    first-appearance order of `problem_spaces``(problem)`. A
     single-domain problem carries one plan; a multi-domain (coupled)
     problem carries one per subdomain space, each built against that
     space's own physical fold. Populated by `prepare` and refreshed by
@@ -390,13 +417,19 @@ re-thread a fresh value through. Fields:
     and filled by the first [`update_dirichlet!`](@ref) on each field,
     which is the only path that re-projects an existing dof layout;
     every mutator rebuilds the layout and empties the cache with it.
-  - `diagnostics::AssemblyDiagnostics` — diagnostics record, updated
-    in place by every lifecycle event.
+  - `diagnostics::AssemblyDiagnostics` — diagnostics record. Mutated in
+    place by [`assemble!`](@ref) and [`solve!`](@ref); replaced outright by
+    `prepare` and by every version-bumping mutator (see
+    [`AssemblyDiagnostics`](@ref)).
   - `pattern::Union{Nothing,AssemblyPattern}` — cached CSC sparsity
-    pattern for matrix assembly. `nothing` until the first
-    matrix assembly builds it; cleared by every mutator (same
-    invalidation contract as `matrix`/`rhs`). Lets a Newton loop reuse
-    the pattern and re-run only the numeric scatter.
+    pattern for matrix assembly, plus the threaded gather plans and arena
+    buffers memoised on it. `nothing` until the first matrix assembly
+    builds it; cleared by every version-bumping mutator, since those change
+    the structure it describes. [`update_dirichlet!`](@ref) is the
+    exception: it clears `matrix`/`rhs` but *keeps* the pattern, because
+    rewriting constrained values leaves the constrained-dof set — and so
+    every region's active dofs — untouched. Lets a Newton or load-stepping
+    loop reuse the pattern and re-run only the numeric scatter.
   - `plan_options::NamedTuple` — the integration-plan keyword options
     (`tolerance`, `criterion`, …) captured at `prepare`. Every mutator
     (`move!`, `activate!`, `deactivate!`) rebuilds the plan with these,
@@ -458,10 +491,12 @@ end
 # level ids into a disjoint global block, then rebuild the fields over the
 # prepared spaces. Returns the effective problem, the prepared distinct
 # spaces (in `problem_spaces` order), and the per-space classification caches
-# (each threaded into its own space's integration plan). This is the
-# multi-domain generalisation of `_apply_physical_fold_to_problem`: it folds
-# and namespaces every subdomain independently so their cut-cell plans, dof
-# blocks, and workspace banks never collide.
+# (each threaded into its own space's integration plan). Folding and
+# namespacing every subdomain independently is what keeps their cut-cell
+# plans, dof blocks, and workspace banks from colliding: `_reindex_space_levels`
+# gives each prepared space its own contiguous level-id block, and the fields
+# are re-homed onto the prepared copies so no consumer ever sees the pre-fold
+# spaces the caller passed in.
 function _prepare_spaces(problem::Problem{D,T}) where {D,T}
     orig = problem_spaces(problem)
     prepared = Vector{Space}(undef, length(orig))
@@ -484,7 +519,8 @@ function _prepare_spaces(problem::Problem{D,T}) where {D,T}
 end
 
 """
-    system_layout(problem::Problem; tolerance=GeometryTolerance(T)) -> SystemLayout
+    system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T),
+                  classify_caches=IdDict{Space,_ClassifyCache{D,T}}()) -> SystemLayout
 
 Build the per-field [`DofLayout`](@ref)s for every field of `problem`
 and assemble them into a [`SystemLayout`](@ref). Each field's active
@@ -493,6 +529,11 @@ block, so fields occupy disjoint ranges of the global enumeration.
 Fields over different spaces (multi-domain coupling) each build their
 layout from their own [`Space`](@ref); the disjoint offsets make the
 global enumeration a product space `V₁ × … × Vₙ`.
+
+`classify_caches` maps a [`Space`](@ref) to the cell-classification cache
+already filled by that space's fictitious fold, so the constraint pass reuses
+those verdicts instead of re-classifying fold-boundary cells; the empty
+default just classifies on demand.
 
 Called by [`prepare`](@ref) and the in-place mutators. End users do
 not usually call this directly.
@@ -535,11 +576,16 @@ end
     prepare(problem::Problem; tolerance=…, criterion=…) -> Model
 
 Build a fresh [`Model`](@ref) for `problem`. Folds an optional
-[`PhysicalDomain`](@ref) into the per-level cell masks (strict-α path),
+[`PhysicalDomain`](@ref) into the per-level cell masks (dropping cells
+classified fully outside Ω, unless the domain sets `keep_fictitious`),
 constructs the [`IntegrationPlan`](@ref) sharing the cell-classification
 cache, builds the per-field [`DofLayout`](@ref)s, fills the diagnostics
 record, and returns the assembled state with `matrix = rhs = nothing`
 (call [`assemble!`](@ref) or one of the public assembly wrappers next).
+
+On a multi-domain (coupled) problem every distinct participating
+[`Space`](@ref) is folded, reindexed into its own level-id block, and given
+its own integration plan and moment-fit cache.
 
 Forwarded keyword arguments go to `integration_plan`; see its docstring
 for the full list.
@@ -735,7 +781,7 @@ integration_plan(model::Model) = first(model.space_plans)
 """
     integration_plans(model::Model) -> Vector{IntegrationPlan}
 
-Every subdomain's cached [`IntegrationPlan`](@ref), in [`problem_spaces`](@ref)
+Every subdomain's cached [`IntegrationPlan`](@ref), in `problem_spaces`
 order. The assembly volume pass iterates these; each region is owned by the
 fields on its subdomain intrinsically (`region_parents` via
 `FieldLayout.level_ids`). For a single-domain model this is a one-element vector
@@ -843,10 +889,24 @@ assembled operators. The base level (level 1) cannot be moved.
 moved configuration, use [`moved`](@ref) to build a separate target
 model and then [`transfer`](@ref).
 
-Invalidation contract: bumps `model.version`, clears `model.matrix`
-and `model.rhs`, rebuilds the integration plan and dof layout,
-refreshes diagnostics. An outstanding [`Solution`](@ref) raises on
-reuse.
+Invalidation contract — the one the sibling mutators [`activate!`](@ref)
+and [`deactivate!`](@ref) mirror. `move!`
+
+  - bumps `model.version`, so an outstanding [`Solution`](@ref) raises on
+    reuse;
+  - clears `model.matrix`, `model.rhs`, and the cached assembly
+    `model.pattern` (and with it the threaded gather plan and arena pool
+    memoised on that pattern);
+  - empties the Dirichlet projection cache, whose unknown sets and boundary
+    mass belong to the dof layout being replaced;
+  - rebuilds `model.prefold_space` at the new box, the integration plan, the
+    dof layout, and the facet / surface / interface region caches;
+  - installs a fresh [`AssemblyDiagnostics`](@ref) record (a reference taken
+    before the move keeps reporting the old state).
+
+The cut-cell moment-fit cache is deliberately *not* invalidated: it is keyed
+by region bounds and moment order, so a cut region the move leaves unchanged
+reuses its rule instead of being refitted.
 """
 function move!(model::Model{D,T}; level::Integer, to::AxisBox{D,T}) where {D,T}
     _assert_single_domain(model, "move!")
@@ -903,11 +963,12 @@ function _remasked_problem(problem::Problem, level_index::Integer, mask)
     return _problem_with_space(problem, _remasked_space(problem.space, level_index, mask))
 end
 
-# Activate / deactivate `cells` on `level_index` and rebuild the
-# model's reusable state. Same invalidation contract as `move!`:
-# bumps `model.version`, rebuilds the integration plan, dof layout,
-# and diagnostics, and clears any assembled matrix / rhs. Any
-# outstanding `Solution` becomes stale.
+# Activate / deactivate `cells` on `level_index` and rebuild the model's
+# reusable state. Runs the same invalidation tail as `move!` — see that
+# docstring for the contract in full — differing only in what it rebuilds
+# the space from: a mask swap rather than a moved mesh, applied to the
+# effective and pre-fold masks independently (below). Any outstanding
+# `Solution` becomes stale.
 function _update_mask!(model::Model{D,T}, level_index::Integer, cells, value::Bool) where {D,T}
     _assert_single_domain(model, "activate! / deactivate!")
     1 <= level_index <= length(model.problem.space.levels) ||
@@ -947,10 +1008,15 @@ a predicate `(cell_box, cell_index) -> Bool`, or an `AbstractArray{Bool,D}`
 matching the level's cell grid. Currently-active cells in the selection are
 unchanged.
 
-Rebuilds the integration plan, dof layout, and diagnostics; clears any
-assembled matrix / right-hand side; bumps `model.version` so an
-existing [`Solution`](@ref) raises on reuse. Mirrors the
-[`move!`](@ref) invalidation contract.
+Bumps `model.version`, so an existing [`Solution`](@ref) raises on reuse,
+and runs the same invalidation tail as [`move!`](@ref) — see that docstring
+for exactly what is cleared, rebuilt, and deliberately kept. The one
+difference is the pre-fold record: `move!` rebuilds it at the new box, while
+this records the cell flip on it.
+
+Like [`move!`](@ref), it addresses the level by position in the model's
+single space and therefore raises `ArgumentError` on a multi-domain
+(coupled) model.
 
 When the model's space has a `physical_domain`, the mutator operates
 on the *effective* mask (which already folds in the geometric
@@ -977,8 +1043,16 @@ end
     active_cells(model; level) -> BitArray{D}
 
 Return a `BitArray{D}` indicating which cells of `level` are active.
+`level` is a position in the model's space, as for [`activate!`](@ref).
 Returns a copy so caller mutations do not leak into the model. Levels
 without a mask return an all-true array.
+
+The mask returned is the *effective* one: on a space carrying a
+[`PhysicalDomain`](@ref) it already has the fictitious fold applied, so a
+cell can read inactive because the caller excluded it or because the level
+set put it outside Ω. Unlike the mutators this reads the problem's
+representative space (the first field's) rather than raising on a coupled
+model, so on a multi-domain model it reports the first subdomain.
 """
 function active_cells(model::Model; level::Integer)
     levels = model.problem.space.levels

@@ -68,11 +68,16 @@ Construct via [`segment_mesh`](@ref), [`polyline_mesh`](@ref),
 [`block`](@ref), [`loadform`](@ref), or [`boundary_integral`](@ref) via
 `on = mesh`.
 
-User contract: every cell carries one [`SurfaceRegion`](@ref) per
-sub-cell after automatic subdivision against every level's grid; the
-package therefore accepts any mesh whose cells lie inside the
-discretization on the level whose mesh they overlap. Sub-cells inherit
-the parent cell's normal (geometric default or user override).
+User contract: every cell is subdivided against every level's grid and
+each resulting sub-cell carries one [`SurfaceRegion`](@ref), so a mesh
+need not be aligned with the discretization. Each sub-cell must, however,
+land somewhere the space can integrate: its midpoint must lie in at least
+one level's mesh, and the cell it lands in must be active. A sub-cell
+outside every level raises, and one whose midpoint falls in a cell
+deactivated by a [`LevelMask`](@ref) raises as well; both messages carry
+the sub-cell's index in the subdivided mesh, which is not the index of the
+input cell it came from. Sub-cells inherit the parent cell's normal
+(geometric default or user override).
 """
 struct BoundaryMesh{D,T<:Real,K,C}
     cells::Vector{C}
@@ -186,12 +191,14 @@ end
 
 # ── Per-K simplex geometry ───────────────────────────────────────────────────
 #
-# For each simplex dimension K, the package owns three pieces:
+# For each simplex dimension K, the package owns four pieces:
 #
 #   * `_simplex_measure(cell)` — physical volume of the cell (1 for
-#     K=0, length for K=1, area for K=2). The Jacobian baked into
-#     each Q-point weight is `measure / 2^K` for K=1,2 (matching the
-#     reference frame's edge length 2) and just `measure` for K=0.
+#     K=0, length for K=1, area for K=2). The Jacobian baked into each
+#     Q-point weight is uniformly `measure / _reference_area(Val(K))`,
+#     and the reference areas differ per K: 1 for the K=0 point, 2 for
+#     the K=1 segment on `[−1, 1]`, and 1/2 for the K=2 standard
+#     2-simplex. So the K=2 Jacobian is `2 · area`, not a power of 1/2.
 #   * `_default_normal(cell)` — the geometric outward unit normal
 #     derived from cell geometry. Only defined for K=1 in 2D and
 #     K=2 in 3D — the cases where a unique normal exists; K=0
@@ -284,9 +291,11 @@ end
 # K=2: Duffy-mapped tensor Gauss on the standard 2-simplex
 # `{(u, v) : u, v ≥ 0, u + v ≤ 1}`. Uses an `n × n` tensor Gauss rule
 # on `[0, 1]²`, mapped via `u = ξ`, `v = η(1 − ξ)` with Jacobian
-# `(1 − ξ)`. Exact for polynomials of degree `2n − 1` along each axis
-# of the Duffy frame, which covers polynomial integrands of total
-# degree `2n − 1` over the triangle.
+# `(1 − ξ)`. Each Duffy axis carries an `n`-point Gauss rule, exact to
+# degree `2n − 1`, but the Jacobian raises the ξ-degree of a triangle
+# polynomial by one: a total-degree-`p` integrand maps to degree `p + 1`
+# in ξ. The rule is therefore exact over the triangle up to total degree
+# `2n − 2`, one less than the per-axis figure.
 function _simplex_reference_quadrature(::Val{2}, quadrature_order::NTuple{D,Int},
                                        ::Type{T}) where {D,T}
     n = maximum(quadrature_order)
@@ -354,9 +363,11 @@ end
 #                                 followed by fan triangulation of the
 #                                 resulting convex polygon.
 #
-# `K = 2` in `D = 2` (triangles in 2D) and `K = 1` in `D = 1` are
-# codim-0 integrations — out of scope for boundary integration; cells
-# in those configurations pass through unchanged.
+# Every other `(D, K)` combination passes through unchanged — the
+# reachable one is `K = 2` in `D = 2`, a codim-0 integration that is out
+# of scope for boundary integration. `K = 1` is *not* among them: a
+# segment mesh is subdivided at every `D`, the codim-0 `D = 1` case
+# included.
 
 # Per-axis sorted unique grid coordinates across an arbitrary level
 # collection. A cell that respects this union automatically respects
@@ -529,6 +540,18 @@ and the resulting convex polygon is fan-triangulated. Sub-triangles
 inherit the parent triangle's plane (and therefore its normal); the
 combined area of all sub-triangles equals the input triangle's area
 to floating-point precision (modulo nudge-induced sliver drops).
+
+That area statement holds for a triangle that lies inside the grid. Only
+cells between the outermost grid lines are visited, so whatever part of a
+triangle sticks out past them is dropped silently — a triangle entirely
+outside yields no sub-triangles at all, and the region builder then never
+sees it. The segment path does not behave this way: it keeps the whole
+segment and lets the region builder raise.
+
+Unlike `_subdivide_segment`'s parameter-space `nudge`, the `nudge` here is
+compared against physical coordinates (half-space tests, bounding-box
+padding) and against an area (`min_area = nudge²`), so it is a length and
+does not survive a change of geometric scale.
 """
 function _subdivide_triangle(v1::SVector{3,T}, v2::SVector{3,T}, v3::SVector{3,T},
                              grid_lines::NTuple{3}, nudge::T) where {T}
@@ -550,13 +573,22 @@ end
 
 """
     _subdivide_mesh(mesh::BoundaryMesh, V::Space, tolerance) -> BoundaryMesh
+    _subdivide_mesh(mesh::BoundaryMesh, grid_lines::NTuple{D,Vector{T}}, tolerance) -> BoundaryMesh
 
 Return a new `BoundaryMesh` whose cells respect the strict parent-
-uniqueness contract on `V`. Per-cell normals are inherited by every
-sub-cell. No-op for `K = 0` meshes (points trivially satisfy the
-contract) and for `(D, K)` combinations not covered by the segment /
-triangle subdividers — the surface-region builder's midpoint
-classification then handles those directly.
+uniqueness contract. Per-cell normals are inherited by every sub-cell.
+
+The `Space` form splits against that space's own merged grid lines. The
+`grid_lines` form takes the lines directly, which is how the two-sided
+interface builder in `coupling.jl` splits one mesh against the *union* of
+two subdomains' grids; it is defined only for the segment (`K = 1`) and 3D
+triangle (`K = 2`) subdividers, so the pass-through cases below belong to
+the `Space` form alone.
+
+No-op for `K = 0` meshes (points trivially satisfy the contract) and for
+`(D, K)` combinations not covered by the segment / triangle subdividers —
+the surface-region builder's midpoint classification then handles those
+directly.
 """
 _subdivide_mesh(mesh::BoundaryMesh{D,T,0}, ::Space{D,T}, ::GeometryTolerance{T}) where {D,T} = mesh
 
@@ -624,11 +656,13 @@ constant within the region; the quadrature rule is precomputed in
 physical coordinates with weights already including the cell's
 measure-to-reference-area Jacobian.
 
-Fields mirror `FacetRegion` apart from carrying a per-Q-point normal
-list rather than a single facet normal — a generalisation that lets
-future per-Q-point normal sources (curved meshes, user-supplied
-overrides per Q-point) drop in without changing the consumer's hot
-loop.
+Fields mirror [`FacetRegion`](@ref) apart from two differences: the normal
+is a per-Q-point list rather than one facet normal — a generalisation that
+lets future per-Q-point normal sources (curved meshes, user-supplied
+overrides per Q-point) drop in without changing the consumer's hot loop —
+and there is no `sides`, because an immersed cell sits in the interior of
+a mesh cell and has no `(axis, side)` facet identity. Consumers see
+`q.sides === nothing` on a surface region.
 """
 struct SurfaceRegion{D,T<:Real}
     parents::Vector{FacetParent{D,T}}

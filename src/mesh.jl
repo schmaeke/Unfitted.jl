@@ -42,9 +42,9 @@ end
 
 # Per-axis coordinate samples for a uniform Cartesian mesh: axis `d` carries
 # `cells[d] + 1` values evenly spaced from `domain.lower[d]` to
-# `domain.upper[d]`. The explicit form (rather than `range(...)`) keeps the
-# endpoints bit-exact at `domain.lower[d]` and `domain.upper[d]`, which the
-# `Base.:(==)` comparison on `AxisBox` corner coordinates relies on.
+# `domain.upper[d]`. The endpoints come out bit-exact — `i = 0` is `lo`
+# itself and `i = n` reduces to `lo + (hi − lo)` — which the `Base.:(==)`
+# comparison on `AxisBox` corner coordinates relies on.
 function _mesh_axes(domain::AxisBox{D,T}, cells::NTuple{D,Int}) where {D,T}
     return ntuple(D) do d
         lo = domain.lower[d]
@@ -158,6 +158,14 @@ faces between active and inactive cells of the *same* level are treated
 as artificial overlay constraints (analogous to faces between the level
 and its physical-domain complement). Span-mode dofs whose support is
 entirely inside inactive cells are not enumerated.
+
+One exception, and it is a physical one: when the inactive side of such a
+face is inactive only because the finite-cell fold found it *fully
+fictitious*, the face carries no physical material and the modes on it stay
+active — they vanish on every physical face anyway and instead carry the
+adjacent cut cell's approximation up to `∂Ω`. A cell the *user* masked out
+is treated as physical and does constrain. See `_internal_face_is_physical`
+in `src/dofs.jl`.
 """
 struct LevelMask{D}
     on::BitArray{D}
@@ -236,7 +244,10 @@ level's mesh, basis family, polynomial-order metadata, basis mode, and an
 optional activation mask. Fields:
 
   - `id::Int` — level identifier, unique within a `Space`. `1` for the
-    base level, `2, 3, …` for overlays in the order they were added.
+    base level, `2, 3, …` for overlays in the order they were added. In a
+    coupled multi-domain model every subdomain's ids are shifted into a
+    disjoint block by `_reindex_space_levels`, so only the *ordering* of
+    the ids is guaranteed there, not the value `1` for a base level.
   - `role::Symbol` — `:base` or `:overlay`. The base level covers the
     full physical domain; overlay levels live inside it.
   - `mesh::CartesianMesh{D,T}` — the Cartesian mesh that discretizes the
@@ -254,10 +265,12 @@ optional activation mask. Fields:
     no-mask hot path; the `Union` is small so the `Level` type stays
     stable across `activate!` / `deactivate!` transitions between the
     masked and unmasked states.
-  - `reduce_order::Bool` — when `true`, this level sheds its high-order
-    modes wherever a finer level fully covers it (order reduction),
-    keeping only its linear skeleton. See the coverage constraint source
-    in `dofs.jl`.
+  - `reduce_order::Bool` — when `true`, this level sheds every high-order
+    mode all of whose incident cells a finer level covers (order
+    reduction), and additionally sheds a buried *linear* mode that a
+    nested finer level reproduces exactly (dedup). Integrated Legendre
+    only; every other family takes the empty generic fallback. See
+    `_coverage_constraints` in `dofs.jl` and [`space`](@ref).
 """
 struct Level{D,T<:Real,B<:BasisFamily}
     id::Int
@@ -320,7 +333,7 @@ function _level_by_id(V::Space, id::Integer)
     throw(ArgumentError("unknown level id $id"))
 end
 
-# ── Basis-family instantiation ────────────────────────────────────────────────
+# ── Basis-family hooks ────────────────────────────────────────────────────────
 
 """
     instantiate_basis(basis, mesh, order, mode, mask) -> BasisFamily
@@ -343,9 +356,12 @@ families uniformly.
 All of [`space`](@ref), [`overlay`](@ref), [`moved_space`](@ref), and the
 mask mutators route the basis through this hook, so a mesh-dependent
 family is rebuilt whenever the mesh changes (e.g. an overlay move) and is
-validated against the level's `order` / `mode` / `mask` at construction
-time. `mask` is the normalised [`LevelMask`](@ref) (`nothing` for an
-all-active level).
+validated against the level's `order` and `mode` at construction time.
+`mask` is the normalised [`LevelMask`](@ref) (`nothing` for an all-active
+level); it is passed so a family whose concrete form depends on where the
+active region ends can use it, and the shipped B-spline family — which
+handles arbitrary mask geometry through linear constraints instead —
+accepts every mask.
 """
 function instantiate_basis(basis::BasisFamily, mesh::CartesianMesh{D,T}, order::NTuple{D,Int},
                            mode::Symbol, mask) where {D,T}
@@ -413,10 +429,33 @@ Keyword arguments:
     artificial overlay boundary; see [`LevelMask`](@ref).
   - `physical` — optional [`PhysicalDomain`](@ref) describing an
     immersed `Ω ⊂ domain`. With `nothing` (default) the bounding box is
-    the physical domain.
-  - `reduce_order` — when `true`, the base level sheds its high-order
-    modes wherever a finer overlay fully covers it (order reduction),
-    keeping only its linear skeleton.
+    the physical domain. Not every basis family can integrate one: the
+    call raises `ArgumentError` for a family that declares
+    `_supports_physical_domain` false, which the B-spline family in the
+    `BasicBSpline` extension does.
+  - `reduce_order` — when `true` (the default), the base level sheds a
+    mode wherever finer levels make it redundant. Two eliminations, both
+    per-mode rather than per-cell, and both asking first that the mode be
+    *buried* — every cell it is incident to covered by a finer level:
+
+      * a buried **high-order** mode (one with at least one bubble axis)
+        is dropped outright, so a fully covered cell keeps only its linear
+        skeleton — an edge or face mode straddling the boundary of the
+        covered region survives, because its own stencil is not buried;
+      * a buried **linear** mode is dropped only when one finer level
+        reproduces it exactly, which takes both halves of a test: that
+        level's mesh must refine this one's (`_nested_over` in
+        `src/coverage.jl`) *and* its basis must be integrated Legendre.
+        A buried vertex function is a C⁰ hat, and a basis smoother than
+        C⁰ across its own cell boundaries — a B-spline of degree ≥ 2 —
+        carries nothing that reproduces the kink.
+
+    Order reduction as a whole is integrated Legendre only. Every other
+    family takes the generic `_coverage_constraints` fallback, which
+    returns no constraints, so on such a space the default `true` is a
+    no-op. See `src/coverage.jl` and `_coverage_constraints` in
+    `src/dofs.jl`; `diagnostics(...).reduced_mode_counts` reports the
+    per-level count.
 """
 function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(),
                mode::Symbol=:tensor, active=nothing, physical=nothing,
@@ -453,14 +492,17 @@ and possibly `order`. Keyword arguments:
   - `tolerance` — slack on the inside-domain check.
   - `active` — optional per-cell mask, same shapes as [`space`](@ref)'s
     `active`.
-  - `reduce_order` — when `true`, this overlay sheds its high-order modes
-    wherever a still-finer overlay fully covers it.
+  - `reduce_order` — when `true` (the default), this overlay sheds its
+    buried high-order modes, and its buried linear modes wherever a
+    still-finer nested integrated-Legendre overlay reproduces them. The
+    rule and its basis-family restriction are spelled out under
+    [`space`](@ref).
 
 The new level's `id` is `length(V.levels) + 1`. Overlay placement is
 independent of any existing overlay: overlay boundaries need not coincide
 with lower-level element boundaries, and there is no topological merging
 with parents (every overlay imposes homogeneous Dirichlet data on its
-artificial boundary, see `CONTRIBUTING.md`'s "Approximation space"
+artificial boundary, see `CONTRIBUTING.md`'s "The superposition model"
 section).
 """
 function overlay(V::Space{D,T}, domain::AxisBox{D,T}; cells, order=V.levels[1].order,
@@ -529,8 +571,8 @@ end
 # Ω (`:fictitious`). Cells classified as `:full` or `:cut` are kept active:
 # `:cut` cells will get their quadrature replaced by the NNMF moment-fit
 # rule at region-build time (see `intersections.jl`), while `:fictitious`
-# cells are dropped from the dof layout via the fold below (strict-α path
-# only, i.e. `physical.alpha == 0`).
+# cells are dropped from the dof layout via the fold below — at every α,
+# unless `keep_fictitious` asks for the classic α-FCM fill instead.
 #
 # Only cells the level's own mask already keeps active are classified. The fold
 # below combines the two masks with `active .& .!fictitious` (`_fold_fictitious`),

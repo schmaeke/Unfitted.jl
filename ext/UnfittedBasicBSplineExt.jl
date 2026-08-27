@@ -34,7 +34,7 @@ The `D`-dimensional basis is the tensor product of these per-axis 1D
 spaces. Adjacent cells of the level share `p_d` of `p_d + 1` 1D
 functions per axis — the shared dofs fall out of the `TensorDofKey`
 cache in `src/dofs.jl` once each cell-local mode index is mapped to its
-global 1D function index via the new `_AXIS_BSPLINE` tag.
+global 1D function index via the `_AXIS_BSPLINE` tag.
 
 # What this extension installs
 
@@ -42,8 +42,9 @@ global 1D function index via the new `_AXIS_BSPLINE` tag.
     `_BSplineSpec` returned by the public [`bspline`](@ref) factory.
     The deferred form lives only between `bspline(...)` and the
     [`instantiate_basis`](@ref) hook, which materialises the per-axis
-    `BSplineSpace`s once the mesh axes (and the optional mask
-    junctions) are known.
+    `BSplineSpace`s once the mesh axes are known. The knot vectors depend
+    on the mesh alone — never on the mask, whose faces are handled by the
+    constraints described below.
   - The family-specific basis-interface overloads — `basis_name` and
     `is_boundary_basis`. Everything else in the interface is inherited from the
     `::BasisFamily` defaults in `src/basis.jl`: the tensor `local_basis_indices`
@@ -63,6 +64,12 @@ global 1D function index via the new `_AXIS_BSPLINE` tag.
     trace-vanishing [`LinearConstraint`](@ref)s (orders `k = 0 … m`) on
     every overlay / mask face, so masked B-spline levels of any geometry
     remain eliminable through the existing constraint machinery.
+  - `_supports_physical_domain(::BSplineFamily) = false`. The family
+    therefore cannot yet be combined with an immersed [`PhysicalDomain`](@ref):
+    `space(...; basis=bspline(), physical=…)` raises an `ArgumentError`
+    rather than silently over-constraining cut-cell modes on fully-fictitious
+    fold faces (the constraint generator above has no fold exemption). Use
+    the default [`IntegratedLegendre`](@ref) family for finite-cell problems.
 
 The hot loops in `src/assembly.jl` and `src/projection.jl` are
 unchanged — they dispatch on `level.basis` (via the workspace's
@@ -108,11 +115,14 @@ V = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3, basis=bspline())
 # Why a deferred spec
 
 The actual per-axis `BSplineSpace`s depend on the level's mesh-cell
-coordinates (and, for masked levels, on the C⁰ knot insertions at
-mask transitions). `bspline(...)` therefore returns a deferred
-[`_BSplineSpec`](@ref); the concrete [`BSplineFamily`](@ref) is built
-by the [`instantiate_basis`](@ref) hook in this extension once the mesh
-and mask are known. The spec is itself a [`BasisFamily`](@ref) subtype
+coordinates, which do not exist yet when the `basis=` value is chosen.
+`bspline(...)` therefore returns a deferred [`_BSplineSpec`](@ref); the
+concrete [`BSplineFamily`](@ref) is built by the
+[`instantiate_basis`](@ref) hook in this extension once the mesh is known.
+A mask changes nothing about the knot vectors — mask faces are handled by
+the trace-vanishing constraints, not by knot insertion — so a level's
+family is rebuilt on a move but is the same family before and after a
+mask update. The spec is itself a [`BasisFamily`](@ref) subtype
 so the existing `space` / `overlay` code path accepts it without special
 casing.
 """
@@ -129,9 +139,9 @@ Deferred B-spline family specification returned by [`bspline`](@ref).
 Subtypes `BasisFamily` so [`space`](@ref) accepts it as a `basis=`
 value, but carries no per-axis knot vectors yet — the
 [`instantiate_basis`](@ref) hook in this extension materialises a real
-[`BSplineFamily`](@ref) from the mesh axes and the optional
-[`LevelMask`](@ref). Once the level is built, the spec is gone; every
-hot-path method dispatches on the concrete `BSplineFamily` type.
+[`BSplineFamily`](@ref) from the mesh axes. Once the level is built, the
+spec is gone; every hot-path method dispatches on the concrete
+`BSplineFamily` type.
 """
 struct _BSplineSpec <: BasisFamily
     continuity_order::Int
@@ -273,11 +283,13 @@ end
 
 # Re-instantiate an already-concrete `BSplineFamily` against a
 # (possibly new) mesh. Invoked when an overlay carrying this family is
-# moved or re-masked: the per-axis knot vectors must be rebuilt for the
-# new cell coordinates, so reusing the old family would leave stale
-# `axis_coords` / `cell_to_span`. Cell counts and order are unchanged on
-# a move, so the thinness / continuity validation already passed at first
-# construction and is not repeated.
+# moved — where the per-axis knot vectors must be rebuilt for the new cell
+# coordinates, since reusing the old family would leave stale `axis_coords`
+# / `cell_to_span` — and, for uniformity, when it is re-masked, where the
+# mesh is unchanged and the rebuild reproduces an identical family (the
+# mask never enters a knot vector). Cell counts and order are unchanged in
+# both cases, so the thinness / continuity validation already passed at
+# first construction and is not repeated.
 function Unfitted.instantiate_basis(family::BSplineFamily, mesh::CartesianMesh{D,T},
                                     order::NTuple{D,Int}, mode::Symbol,
                                     mask::Union{Nothing,LevelMask{D}}) where {D,T<:Real}
@@ -295,11 +307,20 @@ Unfitted.basis_name(::_BSplineSpec) = :bspline
 
 # ── Boundary / facet incidence ────────────────────────────────────────────────
 
-# True iff cell-local 1D mode index `i ∈ 0:p` corresponds to a function
-# that is non-zero on the requested cell side. For open-knot B-splines
-# on a single span, `i = 0` is the only mode non-zero at the span's
-# lower end and `i = p` the only one non-zero at the upper end; every
-# other mode vanishes at both endpoints.
+# True iff cell-local 1D mode index `i ∈ 0:p` corresponds to a function that
+# is non-zero on the requested side of the *level's* mesh box, where the
+# clamped end knots of multiplicity `p + 1` leave exactly one non-zero 1D
+# function: local index `0` (global index 1) at the lower edge, local index
+# `p` (global index `dim`) at the upper edge.
+#
+# Read it as an outer-boundary predicate, not as a general per-cell support
+# test. In-tree it is only ever asked about a boundary cell's outer face —
+# `is_facet_basis` filters the Dirichlet boundary trace in `dirichlet.jl`,
+# whose facets lie on the physical boundary. At an *interior* cell face the
+# answer would be different: with simple interior knots, `p` of the `p + 1`
+# local functions are non-zero at the face (only local index `p` vanishes at
+# the cell's lower edge, only local index `0` at its upper edge), so a caller
+# that needs interior-face support must ask the knot vector, not this.
 function Unfitted.is_boundary_basis(family::BSplineFamily, id::CartesianIndex{D}, axis::Integer,
                                     side::Symbol) where {D}
     1 <= axis <= D || throw(ArgumentError("axis out of bounds"))
@@ -385,7 +406,7 @@ end
 # `cell_to_span[d][c] + m`; that index uniquely identifies the function
 # across the level, so adjacent cells naturally reuse the dof slot for
 # every shared function through the `TensorDofKey` cache in
-# `src/dofs.jl`. Wrapped in the new `_AXIS_BSPLINE` tag so it lives in
+# `src/dofs.jl`. Wrapped in the `_AXIS_BSPLINE` tag so it lives in
 # a disjoint key range from the integrated-Legendre `_AXIS_NODE` /
 # `_AXIS_SPAN` keys.
 @inline function _bspline_axis_dof_key(family::BSplineFamily, axis::Integer, cell_axis::Integer,
@@ -456,11 +477,16 @@ end
 # performance overhead is small for typical mask layouts.
 #
 # `continuity_order = 0` (`m = 0`) generates the classical C⁰
-# vanishing-trace constraint, equivalent to the C⁰ knot insertion the
-# previous extension version used but without the rectangle-union
-# restriction on the mask. `m > 0` adds vanishing derivatives up to
-# order `m`, matching the `H^{m+1}` essential-BC trace structure
-# discussed in §3 of Ruess et al. (2013, Int. J. Numer. Meth. Engng.).
+# vanishing-trace constraint — the same condition a C⁰ knot insertion at
+# the face would impose, but reached through constraints, which puts no
+# restriction on the shape of the mask. `m > 0` adds vanishing normal
+# derivatives up to order `m`, the trace structure an `H^{m+1}`-conforming
+# essential boundary condition needs; for the B-spline/FCM setting see
+#
+#     M. Ruess, D. Schillinger, Y. Bazilevs, V. Varduhn, E. Rank,
+#     *Weakly Enforced Essential Boundary Conditions for NURBS-embedded and
+#     trimmed NURBS geometries on the basis of the Finite Cell Method*,
+#     Int. J. Numer. Methods Engng. 95 (2013) 811–846.
 function Unfitted._overlay_constraints(level::Level{D,T,<:BSplineFamily}, V::Space{D,T},
                                        tol::GeometryTolerance{T},
                                        raw_by_key::AbstractDict{TensorDofKey{D},Int},
@@ -468,7 +494,10 @@ function Unfitted._overlay_constraints(level::Level{D,T,<:BSplineFamily}, V::Spa
                                        classify_cache::Unfitted._ClassifyCache{D,T}) where {D,T}
     # `level_keys` (this level's pre-bucketed raws) is unused: the
     # B-spline constraint generator walks the mesh face/perp grids and
-    # looks up raws through `raw_by_key` directly.
+    # looks up raws through `raw_by_key` directly. `classify_cache` is
+    # unused too — the family refuses an immersed `PhysicalDomain`
+    # (`_supports_physical_domain` above), so no face here can be a
+    # fictitious fold that needs classifying.
     family = level.basis
     m = family.continuity_order
     n_cells = level.mesh.cells
