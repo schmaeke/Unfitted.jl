@@ -119,9 +119,11 @@ function bspline end
 # `mesh_levelset(mesh::BoundaryMesh)` and `stl_levelset(path)` build a signed-
 # distance [`LevelSet`](@ref) leaf from a closed boundary mesh — a 2D segment
 # loop (`BoundaryMesh{2,T,1}`) or 3D triangle surface (`BoundaryMesh{3,T,2}`);
-# `stl_levelset` reads an STL file into the latter. Both return a
-# `leaf(sdf; lipschitz=1.0)` (negative inside the solid) suitable for
-# `physical_domain` and CSG composition. The signed-distance kernel and the STL
+# `stl_levelset` reads an STL file into the latter. Both return a `leaf` whose
+# level set is negative inside the solid, suitable for `physical_domain` and
+# CSG composition, and carrying the exact Lipschitz constant of the mesh's
+# inside/outside test (`1.0` by default, `Inf` under `orientation = :winding`,
+# whose sign can jump). The signed-distance kernel and the STL
 # loader live in `ext/UnfittedMeshIOExt.jl` and are installed when FileIO,
 # MeshIO, and GeometryBasics are loaded alongside Unfitted. The stubs here let
 # downstream code write `using Unfitted: mesh_levelset` unconditionally; calling

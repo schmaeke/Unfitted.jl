@@ -65,11 +65,12 @@ The method is described in
   deduplicated. Coverage is mask-aware — a user-deactivated overlay cell
   does not cover, so a fully deactivated overlay still behaves like no
   overlay — while a cell folded away as fictitious does cover, because
-  it carries no material. The rule is implemented for the
-  integrated-Legendre family only; `reduce_order` still defaults to
-  `true` on a B-spline space, where it silently does nothing.
-  `diagnostics(model, solution).reduced_mode_counts` reports the count
-  per level, concatenated field-by-field.
+  it carries no material. Shedding high-order modes is
+  integrated-Legendre only; the deduplication also runs on a B-spline
+  level, where it is what keeps a nested stack non-singular rather than
+  an accuracy trade — the duplicate it removes is reproduced exactly by
+  the level above. `diagnostics(model, solution).reduced_mode_counts`
+  reports the count per level, concatenated field-by-field.
 - **D-generic core**: 1D, 2D, 3D, and 4D smoke-tested.
 
 ## Installation

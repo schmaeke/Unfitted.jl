@@ -369,12 +369,12 @@ function instantiate_basis(basis::BasisFamily, mesh::CartesianMesh{D,T}, order::
 end
 
 # Whether a basis family supports an immersed `PhysicalDomain` — the α-FCM fold,
-# cut-cell moment-fit quadrature, and the fictitious-fold C⁰ constraint rule that
-# keeps a cut cell's boundary modes on its fully-fictitious fold faces. Defaults
-# to `true`. The B-spline extension overrides it to `false`: its overlay-
-# constraint generator emits trace-vanishing constraints on every active/inactive
-# face with no fictitious-fold exemption, so it would over-constrain cut-cell
-# modes on fold faces (silently degrading the FCM solution).
+# cut-cell moment-fit quadrature, and the fictitious-fold exemption that keeps a
+# cut cell's boundary modes on its fully-fictitious fold faces. Defaults to
+# `true`, and both shipped families answer it: the exemption is the only piece a
+# family has to get right, and each has it. A family whose constraint generator
+# lacks one must override this to `false` rather than degrade the FCM solution
+# silently.
 _supports_physical_domain(::BasisFamily) = true
 
 # Reject a `PhysicalDomain` on a basis family that cannot integrate it yet.
@@ -431,12 +431,13 @@ Keyword arguments:
     immersed `Ω ⊂ domain`. With `nothing` (default) the bounding box is
     the physical domain. Not every basis family can integrate one: the
     call raises `ArgumentError` for a family that declares
-    `_supports_physical_domain` false, which the B-spline family in the
-    `BasicBSpline` extension does.
+    `_supports_physical_domain` false. Both shipped families declare it
+    true.
   - `reduce_order` — when `true` (the default), the base level sheds a
-    mode wherever finer levels make it redundant. Two eliminations, both
-    per-mode rather than per-cell, and both asking first that the mode be
-    *buried* — every cell it is incident to covered by a finer level:
+    mode wherever finer levels make it redundant. On an integrated
+    Legendre level there are two eliminations, both per-mode rather than
+    per-cell, and both asking first that the mode be *buried* — every cell
+    it is incident to covered by a finer level:
 
       * a buried **high-order** mode (one with at least one bubble axis)
         is dropped outright, so a fully covered cell keeps only its linear
@@ -450,12 +451,15 @@ Keyword arguments:
         C⁰ across its own cell boundaries — a B-spline of degree ≥ 2 —
         carries nothing that reproduces the kink.
 
-    Order reduction as a whole is integrated Legendre only. Every other
-    family takes the generic `_coverage_constraints` fallback, which
-    returns no constraints, so on such a space the default `true` is a
-    no-op. See `src/coverage.jl` and `_coverage_constraints` in
-    `src/dofs.jl`; `diagnostics(...).reduced_mode_counts` reports the
-    per-level count.
+    A B-spline level has no bubble/skeleton split and so has only the
+    second elimination: a buried function is dropped exactly when a nested
+    level above reproduces it, which for that family is not an accuracy
+    trade at all but the thing that keeps a nested stack non-singular —
+    see `bspline` in the `BasicBSpline` extension. Any further family
+    takes the generic `_coverage_constraints` fallback, which returns no
+    constraints, so on such a space the default `true` is a no-op. See
+    `src/coverage.jl` and `_coverage_constraints` in `src/dofs.jl`;
+    `diagnostics(...).reduced_mode_counts` reports the per-level count.
 """
 function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(),
                mode::Symbol=:tensor, active=nothing, physical=nothing,
@@ -493,10 +497,9 @@ and possibly `order`. Keyword arguments:
   - `active` — optional per-cell mask, same shapes as [`space`](@ref)'s
     `active`.
   - `reduce_order` — when `true` (the default), this overlay sheds its
-    buried high-order modes, and its buried linear modes wherever a
-    still-finer nested integrated-Legendre overlay reproduces them. The
-    rule and its basis-family restriction are spelled out under
-    [`space`](@ref).
+    buried high-order modes, and its buried modes wherever a still-finer
+    nested overlay reproduces them exactly. The rule and its
+    basis-family dependence are spelled out under [`space`](@ref).
 
 The new level's `id` is `length(V.levels) + 1`. Overlay placement is
 independent of any existing overlay: overlay boundaries need not coincide

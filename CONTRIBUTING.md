@@ -366,14 +366,18 @@ buried linear mode that a *nested* finer level reproduces exactly is
 deduplicated. Coverage is mask-aware — a user-masked cell blocks
 coverage, a fictitious fold does not.
 
-Order reduction is a basis-family-specific feature:
-`_coverage_constraints` does the work in its
-`Level{D,T,<:IntegratedLegendre}` method, and every other family — the
-B-spline family included — hits the generic fallback that returns an
-empty constraint list. `reduce_order` nevertheless defaults to `true` on
-`space` and `overlay` for *every* basis family, so on a B-spline space
-the default is on and does nothing. See
-`src/coverage.jl` and `_coverage_constraints` in `src/dofs.jl`;
+Order reduction is a basis-family-specific feature, and
+`_coverage_constraints` is where a family implements it. The
+`Level{D,T,<:IntegratedLegendre}` method does both eliminations above.
+The B-spline extension overrides the hook too, but only for the dedup:
+that family has no bubble/skeleton split, so its one reducible mode is
+the one a covering level reproduces exactly — and eliminating it is not
+an accuracy trade but the thing that keeps a nested B-spline stack
+non-singular, since the two copies are linearly dependent. Any further
+family hits the generic fallback that returns an empty constraint list,
+while `reduce_order` still defaults to `true`, so on such a space the
+default is on and does nothing. See `src/coverage.jl` and
+`_coverage_constraints` in `src/dofs.jl`;
 `diagnostics(...).reduced_mode_counts` reports the count per level,
 concatenated field-by-field (one entry per level of each field, in
 declaration order).

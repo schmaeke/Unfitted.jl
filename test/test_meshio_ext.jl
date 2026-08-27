@@ -58,6 +58,10 @@ function _inside_L3(p)
 end
 
 # L-prism as a watertight triangle mesh, auto-oriented outward via `_inside_L3`.
+# Both caps are fanned from the reflex vertex (1,1) — vertex 4 below, 11 above.
+# Any other hub spans the three collinear vertices at y = 1 with a single edge
+# and leaves a T-junction at (1,1), i.e. a cap edge with no matching partner in
+# the wall, which `mesh_levelset` rejects as an unclosed mesh.
 function _lprism_mesh()
     poly = [(0.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0), (1.0, 2.0), (0.0, 2.0), (0.0, 1.0)]
     n = length(poly)
@@ -68,8 +72,8 @@ function _lprism_mesh()
     for (x, y) in poly
         push!(verts, SVector(x, y, 1.0))
     end
-    faces = NTuple{3,Int}[(1, 2, 3), (1, 3, 7), (7, 4, 5), (7, 5, 6), (8, 9, 10), (8, 10, 14),
-                          (14, 11, 12), (14, 12, 13)]
+    faces = NTuple{3,Int}[(4, 5, 6), (4, 6, 7), (4, 7, 1), (4, 1, 2), (4, 2, 3), (11, 12, 13),
+                          (11, 13, 14), (11, 14, 8), (11, 8, 9), (11, 9, 10)]
     for i in 1:n
         j = i % n + 1
         push!(faces, (i, j, j + n))
@@ -81,6 +85,22 @@ function _lprism_mesh()
         _inside_L3((a + b + c) / 3 + 1e-4 * nrm) && (faces[k] = (f[1], f[3], f[2]))
     end
     return verts, faces
+end
+
+# Point-to-triangle distance, independent of the extension's Voronoi-region
+# routine: the in-plane projection when it lands inside the triangle, else the
+# nearest point on an edge.
+function _segment_distance(a, b, p)
+    ab = b - a
+    return norm(p - (a + clamp(dot(p - a, ab) / dot(ab, ab), 0, 1) * ab))
+end
+function _triangle_distance(cell, p)
+    a, b, c = cell
+    edges = ((a, b), (b, c), (c, a))
+    nrm = normalize(cross(b - a, c - a))
+    q = p - dot(p - a, nrm) * nrm
+    all(dot(cross(v - u, q - u), nrm) >= 0 for (u, v) in edges) && return norm(p - q)
+    return minimum(_segment_distance(u, v, p) for (u, v) in edges)
 end
 
 # ── 2D polygons (segment loops) ───────────────────────────────────────────────
@@ -189,6 +209,89 @@ end
     sdf = Unfitted._leaves(mesh_levelset(triangle_mesh(v, bad_faces)))[1].f
     @test isfinite(sdf(SVector(0.5, 0.5, 0.5)))
     @test sdf(SVector(0.5, 0.5, 0.5)) ≈ -0.3 atol = 1e-12
+end
+
+@testset "MeshIO ext — an unclosed or inside-out mesh is rejected, not answered" begin
+    # Each of these used to return a plausible distance with the sign inverted
+    # over part of space. The pseudonormal is exact only on a closed, outward
+    # mesh, so anything else must fail at construction.
+    v, f = _cube_mesh(0.2, 0.8)
+    @test_throws ArgumentError mesh_levelset(triangle_mesh(v, f[1:(end-2)]))     # a hole
+    flipped = [i == 1 ? (f[1][1], f[1][3], f[1][2]) : f[i] for i in eachindex(f)]
+    @test_throws ArgumentError mesh_levelset(triangle_mesh(v, flipped))          # one facet
+    @test_throws ArgumentError mesh_levelset(triangle_mesh(v, [(a, c, b) for (a, b, c) in f]))
+    @test_throws ArgumentError mesh_levelset(polyline_mesh(_square_poly(0.2, 0.8)))   # open 2D
+    @test_throws ArgumentError mesh_levelset(polyline_mesh(reverse(_square_poly(0.2, 0.8));
+                                                           closed=true))              # clockwise
+    # A zero normal normalises to NaN, under which every sign test is false and
+    # the whole space reads as inside.
+    @test_throws ArgumentError mesh_levelset(triangle_mesh(v, f;
+                                                           normals=[SVector(0.0, 0.0, 0.0)
+                                                                    for _ in f]))
+    empty_stl = tempname() * ".stl"
+    write(empty_stl, "solid s\nendsolid s\n")
+    @test_throws ArgumentError stl_levelset(empty_stl)
+    rm(empty_stl; force=true)
+end
+
+@testset "MeshIO ext — vertex welding absorbs an STL's Float32 corners" begin
+    # The closedness check pairs cell faces through welded vertices, and an STL
+    # stores every facet's corners separately in Float32: one corner reached
+    # through two facets can differ by an ulp. Such a mesh is sound, and welding
+    # tighter than that ulp would report it as full of holes.
+    v, f = _cube_mesh(200.0, 800.0)
+    rng = MersenneTwister(23)
+    verts = SVector{3,Float64}[]
+    faces = NTuple{3,Int}[]
+    for tri in f
+        for k in tri
+            push!(verts, map(x -> Float64(nextfloat(Float32(x), rand(rng, -1:1))), v[k]))
+        end
+        push!(faces, (length(verts) - 2, length(verts) - 1, length(verts)))
+    end
+    sdf = Unfitted._leaves(mesh_levelset(triangle_mesh(verts, faces)))[1].f
+    @test sdf(SVector(500.0, 500.0, 500.0)) ≈ -300.0 rtol = 1e-6
+end
+
+@testset "MeshIO ext — winding mode takes the meshes pseudonormal rejects" begin
+    # The documented recourse for an imperfect mesh: an open box still signs
+    # correctly away from the hole, and its Lipschitz declaration drops to Inf
+    # because the sign jumps across the gap at a positive distance from any cell.
+    v, f = _cube_mesh(0.2, 0.8)
+    ls = mesh_levelset(triangle_mesh(v, f[1:(end-2)]); orientation=:winding)
+    @test Unfitted._leaves(ls)[1].lipschitz == Inf
+    @test Unfitted._leaves(mesh_levelset(triangle_mesh(v, f)))[1].lipschitz == 1.0
+    @test Unfitted._leaves(mesh_levelset(triangle_mesh(v, f); lipschitz=2.0))[1].lipschitz == 2.0
+    sdf = Unfitted._leaves(ls)[1].f
+    rng = MersenneTwister(31)
+    for _ in 1:2000
+        p = SVector(rand(rng), rand(rng), rand(rng))
+        inside = all(0.25 .<= p .<= 0.75)
+        (all(0.15 .<= p .<= 0.85) && !inside) && continue   # skip the band around the hole
+        @test (sdf(p) < 0) == inside
+    end
+end
+
+@testset "MeshIO ext — nearest-cell search is exact and the distance is 1-Lipschitz" begin
+    # The KD-tree is keyed on cell midpoints, and the nearest midpoint is not
+    # the nearest cell; the candidate radius `nearest + maxcr` is what makes the
+    # search exact. Checked against an independent brute force over every cell —
+    # and with the search exact and the mesh closed, the leaf is a true signed
+    # distance, which is the `lipschitz = 1.0` the extension declares.
+    verts, faces = _lprism_mesh()
+    mesh = triangle_mesh(verts, faces)
+    cells = [map(x -> SVector{3,Float64}(x), c) for c in mesh.cells]
+    sdf = Unfitted._leaves(mesh_levelset(mesh))[1].f
+    rng = MersenneTwister(17)
+    for _ in 1:400
+        p = SVector(-0.4 + 2.8 * rand(rng), -0.4 + 2.8 * rand(rng), -0.4 + 1.8 * rand(rng))
+        @test abs(sdf(p)) ≈ minimum(_triangle_distance(c, p) for c in cells) atol = 1e-12
+    end
+    for _ in 1:4000
+        p = SVector(-0.4 + 2.8 * rand(rng), -0.4 + 2.8 * rand(rng), -0.4 + 1.8 * rand(rng))
+        q = p + SVector(ntuple(_ -> 0.02 * (rand(rng) - 0.5), 3))
+        @test abs(sdf(p) - sdf(q)) <= norm(p - q) * (1 + 1e-12)
+    end
 end
 
 @testset "MeshIO ext — end-to-end FCM Poisson on an STL solid" begin

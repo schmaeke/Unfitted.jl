@@ -21,9 +21,12 @@ Provided pieces:
     as a `SymmetricTensor{2,D,T}`. Lets a vector-field bilinear callback
     read `ε(u_trial) = symmetric_gradient(trial)` and form the bilinear
     integrand `σ : ε(v)` against any user constitutive law.
-  - `Unfitted.TestChannels(::Real, ::Vec)` — return-side constructor that
-    accepts a Tensors.jl `Vec` for the gradient coefficient. Again a
-    zero-cost tuple repack into the existing `SVector`-typed channel.
+  - `Unfitted.TestChannels(::Real, ::Vec)` and
+    `Unfitted.TestChannels(::Real, ::SecondOrderTensor, ::Integer)` —
+    return-side constructors taking either a Tensors.jl `Vec` gradient
+    coefficient or the stress tensor whose row the test component
+    selects. Both unpack into the existing `SVector`-typed channel
+    without allocating.
   - `Unfitted.value_vec` / `Unfitted.gradient_tensor` — read the value
     and physical Jacobian of a vector field at the current quadrature
     point as a `Vec{D,T}` and a `Tensor{2,D,T}`. Replaces hand-rolled
@@ -72,7 +75,7 @@ callback to read
 
     ε_trial = symmetric_gradient(trial)
     σ_trial = ℂ ⊡ ε_trial          # any constitutive law
-    return TestChannels(0.0, σ_trial ⋅ basevec(Vec{D,T}, test_component))
+    return TestChannels(0.0, σ_trial, test_component)
 
 without hand-rolling the Voigt ↔ tensor conversion or the off-diagonal
 factor-of-two bookkeeping. The minor symmetry of the strain tensor is
@@ -102,14 +105,52 @@ end
 Constructor that accepts a Tensors.jl `Vec` for the gradient
 coefficient, so a callback can return tensor algebra results directly:
 
-    return TestChannels(0.0, σ ⋅ basevec(Vec{D,T}, test_component))
+    return TestChannels(0.0, σ ⋅ n)          # a traction, say
 
-The conversion to the internal `SVector{D,T}` storage is a tuple repack
-(same `NTuple{D,T}` representation) and adds no runtime cost beyond the
-existing `SVector` constructor path.
+The conversion to the internal `SVector{D,T}` storage reads the `D`
+coordinates straight into the existing `SVector` constructor and adds no
+runtime cost beyond it. When the gradient coefficient is a row of a
+stress tensor — the elasticity case — use the three-argument
+constructor below instead of extracting the row by hand.
 """
-@inline Unfitted.TestChannels(value::Real, g::Vec{D,T}) where {D,T} = TestChannels(value,
-                                                                                   SVector{D,T}(Tuple(g)))
+# The coordinates are read through `getindex`, not `Tuple(g)`: `Base.Tuple`
+# has no `Vec` method, so `Tuple(g)` falls through to the generic iterator
+# constructor, whose result length is not statically known, and heap-allocates.
+# This constructor is the return path of every tensor-notation bilinear
+# callback — once per test component per trial dof per quadrature point — so it
+# must stay allocation-free.
+@inline function Unfitted.TestChannels(value::Real, g::Vec{D,T}) where {D,T}
+    return TestChannels(value, SVector{D,T}(ntuple(i -> g[i], Val(D))))
+end
+
+"""
+    TestChannels(value::Real, σ::SecondOrderTensor{D,T}, component::Integer) -> TestChannels{D,T}
+
+Return-side constructor for a stress-like 2nd-order tensor, which is what
+a constitutive law hands back. Assembly contracts the gradient channel
+against the *scalar* test basis gradient of test component `c`, i.e.
+against the test function `v = N eᶜ` with `∇v = eᶜ ⊗ ∇N`, so
+
+    σ : ∇v = Σⱼ σ[c, j] ∂ⱼN = ⟨row c of σ, ∇N⟩,
+
+and the gradient coefficient of `∫ σ : ∇v` is row `component` of `σ`:
+
+    return TestChannels(0.0, ℂ ⊡ symmetric_gradient(trial), test_component)
+
+Row, not column. The two agree for the symmetric `σ` of small-strain
+elasticity, but they differ for a general 2nd-order tensor — a first
+Piola–Kirchhoff stress, say — and the contraction asks for the row in
+both cases.
+
+`component` indexes a row of `σ`, so a test component above `D` raises a
+`BoundsError`. That is the same `C = D` assumption
+[`symmetric_gradient`](@ref) documents: a field carrying more components
+than the space has axes has no stress tensor to take a row of.
+"""
+@inline function Unfitted.TestChannels(value::Real, σ::SecondOrderTensor{D,T},
+                                       component::Integer) where {D,T}
+    return TestChannels(value, SVector{D,T}(ntuple(j -> σ[component, j], Val(D))))
+end
 
 # ── State-side: FormState reads as tensor-valued quantities ───────────────────
 #
@@ -121,6 +162,11 @@ existing `SVector` constructor path.
 # tensor notation. The `Val{D}` parameter is required so the return
 # type is inferred at compile time and the small unrolled `ntuple`
 # expansions stay allocation-free in the assembly hot loop.
+#
+# Each accessor call re-sums the field over every dof of every covering
+# parent, so `gradient_tensor` reads the `D` gradient rows once and then
+# indexes them, rather than calling the accessor for each of the `D²`
+# tensor slots.
 
 """
     value_vec(state::FormState, name::Symbol, ::Val{D}) -> Vec{D,T}
@@ -151,8 +197,9 @@ without ever materialising a Voigt 3-vector. As with [`value_vec`](@ref)
 the dimension must be passed via `Val(D)` for type inference.
 """
 @inline function Unfitted.gradient_tensor(state, name::Symbol, ::Val{D}) where {D}
+    rows = ntuple(i -> Unfitted.field_gradient(state, name, i), Val(D))
     return Tensor{2,D}() do i, j
-        Unfitted.field_gradient(state, name, i)[j]
+        rows[i][j]
     end
 end
 
@@ -179,7 +226,7 @@ Read the field's value at the current quadrature point as a
 parameters.
 """
 @inline function Unfitted.value_vec(state, field::Field{D,T,C}) where {D,T,C}
-    return Vec{C}(ntuple(k -> Unfitted.value(state, field.name, k), Val(C)))
+    return value_vec(state, field.name, Val(C))
 end
 
 """
@@ -192,9 +239,7 @@ dimensions, use the `Val(D)`-explicit overload above and construct
 the rectangular Jacobian manually.
 """
 @inline function Unfitted.gradient_tensor(state, field::Field{D,T,D}) where {D,T}
-    return Tensor{2,D}() do i, j
-        Unfitted.field_gradient(state, field.name, i)[j]
-    end
+    return gradient_tensor(state, field.name, Val(D))
 end
 
 end # module UnfittedTensorsExt

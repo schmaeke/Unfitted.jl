@@ -1,15 +1,15 @@
 using BasicBSpline
 using StaticArrays
-using LinearAlgebra: Symmetric, norm, rank
+using LinearAlgebra: Symmetric, isposdef, norm, pinv, rank
 
 # Smoke tests for the BasicBSpline extension. Mirror the integrated
 # Legendre test surface (`test_basis.jl`) where the interface is shared,
 # and add B-spline-specific tests for the dof-key sharing and mask
 # handling.
 #
-# The two masked-overlay testsets below reuse `_gram` / `_proj_residual` and the
-# `_one` / `_x1` / `_INT_*` constants from `test_coverage_reduction.jl`, which
-# `runtests.jl` includes first.
+# Several testsets below reuse `_gram` / `_proj_residual` and the `_one` / `_x1` /
+# `_INT_*` constants from `test_coverage_reduction.jl`, which `runtests.jl`
+# includes first; this file does not stand alone.
 
 @testset "BSpline extension: basis interface" begin
     fam_marker = bspline()
@@ -53,18 +53,83 @@ end
     @test V.levels[1].basis isa Unfitted.BasisFamily
 end
 
-@testset "BSpline extension: immersed physical domain is rejected" begin
-    # The B-spline overlay-constraint generator has no fictitious-fold C⁰ rule,
-    # so pairing it with a PhysicalDomain would silently over-constrain cut-cell
-    # modes on fold faces. That combination is rejected up front (on both the
-    # base space and an overlay), pending a proper fold-aware implementation.
-    hole = physical_domain(x -> 0.25 - norm(x); lipschitz=1.0, subcell_length_scale=1.0e-3,
-                           max_depth=2)
-    @test_throws ArgumentError space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=3, basis=bspline(),
-                                     physical=hole)
-    Vphys = space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=3, physical=hole)  # Legendre: OK
-    @test_throws ArgumentError overlay(Vphys, box((0.25, 0.25), (0.75, 0.75)); cells=2, order=3,
-                                       basis=bspline())
+@testset "BSpline extension: immersed physical domain — fold exempt, user mask not" begin
+    # The family carries an immersed `PhysicalDomain`. The one thing that takes is
+    # the fold exemption in `_active_cell_at_face`: a face whose inactive side is a
+    # fully-fictitious cell carries no trace to vanish on, so it emits no
+    # constraint, while a user-masked face still does. Without the exemption the
+    # cut cells around the hole would lose their boundary modes.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    hole = physical_domain(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0,
+                           subcell_length_scale=1 / 64, max_depth=6)
+    V = space(omega; cells=8, order=2, basis=bspline(), physical=hole)
+    l = Unfitted._field_layout(prepare(mass(V)).dofs, :u).dofs
+    # dim = cells + p = 10 per axis. Every function touches an active cell, and the
+    # fold contributes no constraint, so every raw survives.
+    @test length(l.raw_keys) == 100
+    @test count(==(:overlay), l.elimination_source) == 0
+
+    # Deactivate a corner block by hand on the same level: that face is a real
+    # artificial boundary and must still be constrained.
+    mask = trues(8, 8)
+    mask[7:8, 7:8] .= false
+    Vm = space(omega; cells=8, order=2, basis=bspline(), physical=hole, active=mask)
+    lm = Unfitted._field_layout(prepare(mass(Vm)).dofs, :u).dofs
+    @test count(==(:overlay), lm.elimination_source) > 0
+end
+
+@testset "BSpline extension: finite-cell solve on a perforated plate" begin
+    # End to end through the FCM path: α-fold, moment-fit cut-cell quadrature and
+    # the B-spline trace constraints together. The operator must stay positive
+    # definite, the space must still reproduce a constant *over Ω* (the covered cut
+    # cells carry the partition of unity there), and the solution must agree with
+    # the integrated-Legendre reference on the same mesh.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    hole = physical_domain(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0,
+                           subcell_length_scale=1 / 64, max_depth=6)
+    V = space(omega; cells=8, order=3, basis=bspline(), physical=hole)
+    m, _ = _gram(V)
+    M = Symmetric(Matrix(m.matrix))
+    @test isposdef(M)
+    c = pinv(M) * load_vector(m; source=_one)
+    proj = Solution(c, m.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    for x in (SVector(0.15, 0.15), SVector(0.5, 0.9), SVector(0.85, 0.5))
+        @test value(proj, m, x) ≈ 1.0 atol = 1e-8
+    end
+
+    bc = [dirichlet(0.0; on=boundary(:all))]
+    ub = field(:u, V)
+    mb = prepare(poisson(V; source=1.0, dirichlet=bc))
+    sb = solve!(mb)
+    Vil = space(omega; cells=8, order=3, physical=hole)
+    uil = field(:u, Vil)
+    mil = prepare(poisson(Vil; source=1.0, dirichlet=bc))
+    sil = solve!(mil)
+    for x in ((0.15, 0.15), (0.5, 0.85))
+        @test isapprox(value(sb, mb, ub, x), value(sil, mil, uil, x), atol=1e-4)
+    end
+
+    # A B-spline overlay on the same immersed base. The overlay's *own* fold empties
+    # the cells inside the hole, so both branches of `_active_cell_at_face` — the
+    # artificial mesh edge and the fold-exempt internal face — run on one level.
+    # `cells=5` does not divide the base's, so no dedup clouds the check.
+    mo, _ = _gram(overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=5, order=3))
+    @test isposdef(Symmetric(Matrix(mo.matrix)))
+
+    # The FCM plumbing must be a no-op when nothing is fictitious: with φ ≡ −1 the
+    # answer is the plain B-spline run's, to roundoff. (Not asserted bit for bit —
+    # the moment-fit rule reproduces tensor Gauss exactly but need not order its
+    # points the same way, and the reduction is not reassociable.)
+    full = physical_domain(x -> -1.0; lipschitz=1.0, subcell_length_scale=1.0)
+    Vf = space(omega; cells=8, order=3, basis=bspline(), physical=full)
+    uf = field(:u, Vf)
+    mf = prepare(poisson(Vf; source=1.0, dirichlet=bc))
+    sf = solve!(mf)
+    Vp = space(omega; cells=8, order=3, basis=bspline())
+    up = field(:u, Vp)
+    mp = prepare(poisson(Vp; source=1.0, dirichlet=bc))
+    sp = solve!(mp)
+    @test value(sf, mf, uf, (0.5, 0.5)) ≈ value(sp, mp, up, (0.5, 0.5)) atol = 1e-12
 end
 
 @testset "BSpline extension: 1D values match BasicBSpline directly" begin
@@ -197,15 +262,55 @@ end
     @test expansion[3] == [(3, 1.0)]
 end
 
+@testset "Linear-constraint resolver: a constraint that collapsed to 0 = 0 eliminates nothing" begin
+    # `_combine_terms` applies its drop tolerance to a one-term list too. It has to:
+    # the B-spline trace generator emits the same constraint once per perpendicular
+    # cell touching a face, and after the first emission pivots its raw away, a
+    # re-emission can be left with a single term whose coefficient is exactly zero.
+    # `0 · u = 0` constrains nothing; pivoting on it would strongly eliminate u.
+    @test isempty(Unfitted._combine_terms([(1, 0.0)]))
+    @test Unfitted._combine_terms([(1, 2.0)]) == [(1, 2.0)]
+    constraints = [Unfitted.LinearConstraint{Float64}([1, 2], [1.0, 0.0]),
+                   Unfitted.LinearConstraint{Float64}([1, 2], [1.0, 0.0])]
+    expansion = Vector{Vector{Tuple{Int,Float64}}}(undef, 2)
+    Unfitted._resolve_constraints!(expansion, constraints, 2)
+    @test expansion[1] == []            # the constraint that says something
+    @test expansion[2] == [(2, 1.0)]    # its duplicate leaves u₂ free
+
+    # The two configurations that reach it end to end. Degree 1 puts exactly two
+    # terms in each trace constraint, one of them zero at a clamped end, so a 2D
+    # overlay must keep `dim − 2 = 3` functions per axis, 9 in all — not 1.
+    free_on_overlay(V) = let l = Unfitted._field_layout(prepare(mass(V)).dofs, :u).dofs
+        count(i -> l.raw_keys[i].level == 2 && l.elimination_source[i] === :free,
+              eachindex(l.raw_keys))
+    end
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    B = box((0.25, 0.25), (0.75, 0.75))
+    @test free_on_overlay(overlay(space(Ω; cells=8, order=1, basis=bspline()), B;
+                                  cells=4, order=1)) == 9
+    # `continuity_order = p − 1` is the other one: its top-order trace constraint
+    # leaves a single zero term behind. dim = 11, m + 1 = 3 eliminated per side ⇒ 5
+    # per axis, 25 in all.
+    @test free_on_overlay(overlay(space(Ω; cells=8, order=3, basis=bspline()), B;
+                                  cells=8, order=3,
+                                  basis=bspline(continuity_order=2))) == 25
+end
+
 @testset "BSpline extension: C¹ overlay strictly inside the base assembles" begin
     # B-spline base + C¹ B-spline overlay whose four corners are *inside*
     # the base's mesh, so each corner raw participates in artificial-
     # boundary constraints from *both* axes (each at derivative orders
     # k = 0 and k = 1). The greedy cascade in `_resolve_constraints!`
-    # must produce a non-singular system. We assert assembly succeeds,
-    # the solver converges to a small residual, and the centerline value
-    # is finite — a coverage smoke test for the back-substitution branch
-    # exercised by C^m overlay corners.
+    # must produce a non-singular system — coverage for the
+    # back-substitution branch Cᵐ overlay corners reach.
+    #
+    # This overlay also *nests* (four cells over half of eight divide the base's),
+    # so the base function buried under it is deduped. That is a separate mechanism
+    # from the corner cascade, and it is the one that decides the conditioning here:
+    # without it the two levels carry the same function twice and the operator is
+    # exactly singular. The nesting testset below isolates it; what this one asserts
+    # is that the corner cascade on top of it still leaves a system a direct solve
+    # handles cleanly (cond ≈ 3e2, not the ≈ 1e17 of the undeduped stack).
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3, basis=bspline())
     V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3,
                 basis=bspline(continuity_order=1))
@@ -214,17 +319,86 @@ end
     model = prepare(problem)
     solution = solve!(model)
     @test active_unknowns(model.dofs) > 0
-    # The C¹ corner cascade yields a hugely ill-conditioned system (cond ≈ 7e16,
-    # at the edge of numerical singularity), so the direct-solve residual is a
-    # pivot lottery decided by the SuiteSparse version, not by this package: for
-    # the byte-identical matrix it measures ~1e-16 under some SuiteSparse builds
-    # and ~5e-3 under others (Julia 1.12 vs 1.10). Threaded assembly is
-    # bit-identical to serial, so it makes no difference here. This is a coverage
-    # smoke test for the Cᵐ-corner back-substitution branch, so it asserts the
-    # cascade yields a solvable, finite system — not a version-dependent residual
-    # bound that no assembly could make well-posed at this conditioning.
-    @test isfinite(diagnostics(model, solution).residual_norm)
-    @test isfinite(value(solution, model, u, (0.5, 0.5)))
+    @test diagnostics(model, solution).residual_norm < 1.0e-10
+    # u(0.5, 0.5) for −Δu = 1 on the unit square with u = 0 on ∂Ω.
+    @test isapprox(value(solution, model, u, (0.5, 0.5)), 0.07367, atol=1.0e-4)
+end
+
+@testset "BSpline extension: a nested overlay deduplicates what it reproduces" begin
+    # An overlay of the same degree whose cell boundaries include the base's
+    # reproduces — exactly — every base function buried underneath it, so the two
+    # levels carry the same function twice and the superposition is singular until
+    # one copy goes. `reduce_order` (`true` by default) removes it.
+    #
+    # Which functions qualify is decidable from the knot vectors alone: with uniform
+    # simple interior knots, base function `i` lives on cells `max(1, i − p) …
+    # min(n, i)`, and it is buried iff that range sits inside the overlay's. Over
+    # base cells 3…6 (the overlay box [0.25, 0.75] on 8 cells) that leaves
+    # `{i : i − p ≥ 3, i ≤ 6}` — `4 − p` functions per axis, `(4 − p)^D` in D
+    # dimensions. The dedup count below is that number, not an observation.
+    nested(ro, p) = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=p,
+                                  basis=bspline(), reduce_order=ro),
+                            box((0.25, 0.25), (0.75, 0.75)); cells=4, order=p)
+    for p in 1:3
+        m, l = _gram(nested(true, p))
+        @test count(==(:dedup), l.elimination_source) == (4 - p)^2
+        # B-splines have no bubble/skeleton split, so the dedup is all of order
+        # reduction for this family — nothing is shed for accuracy.
+        @test count(==(:coverage), l.elimination_source) == 0
+        # Repaired, and still complete: the removed function is reproduced by the
+        # overlay, so the span is unchanged and the projection is unaffected.
+        M = Symmetric(Matrix(m.matrix))
+        @test rank(M) == active_unknowns(l)
+        @test isposdef(M)
+        @test _proj_residual(m, _one, _INT_ONE) < 1e-6
+        @test _proj_residual(m, _x1, _INT_X1SQ) < 1e-6
+    end
+
+    # Opting out keeps the duplicate and the operator is exactly singular. That is
+    # the documented trade — `bspline`'s docstring names it, and names the way out
+    # (break the nesting) — and it is the same one integrated Legendre makes.
+    mf, lf = _gram(nested(false, 3))
+    @test count(==(:dedup), lf.elimination_source) == 0
+    @test rank(Symmetric(Matrix(mf.matrix))) == active_unknowns(lf) - 1
+end
+
+@testset "BSpline extension: the dedup fires only where the span really contains" begin
+    base() = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3, basis=bspline())
+    B = box((0.25, 0.25), (0.75, 0.75))
+    # Non-nested cells, a coarser degree, a finer degree: in each case the covering
+    # span misses the base function — the finer degree because a maximal-regularity
+    # spline of degree p + 1 is C^p at a simple knot, too smooth to carry the kink
+    # of a degree-p one. Nothing is deduped, and nothing is rank deficient either.
+    for over in (overlay(base(), B; cells=5, order=3),
+                 overlay(base(), B; cells=4, order=2),
+                 overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=2, basis=bspline()),
+                         B; cells=4, order=3))
+        m, l = _gram(over)
+        @test count(==(:dedup), l.elimination_source) == 0
+        @test rank(Symmetric(Matrix(m.matrix))) == active_unknowns(l)
+    end
+
+    # The covering *span* decides, not the covering family: a `:tensor` integrated
+    # Legendre overlay of order ≥ p contains every C⁰ tensor polynomial of that
+    # degree on its cells, and a maximal-regularity B-spline of degree p is one.
+    # Below p it is not.
+    for (q, expected) in ((2, 0), (3, 1), (4, 1))
+        m, l = _gram(overlay(base(), B; cells=4, order=q, basis=Unfitted.IntegratedLegendre()))
+        @test count(==(:dedup), l.elimination_source) == expected
+        @test rank(Symmetric(Matrix(m.matrix))) == active_unknowns(l)
+    end
+end
+
+@testset "BSpline extension: nested dedup in 3D" begin
+    # The support rule and the coverage walk are D-generic; 3D is where a wrong
+    # `ntuple` shows up. Degree 1 on 8 base cells buries `{i : i − 1 ≥ 3, i ≤ 6}` =
+    # 3 functions per axis, so 27 of them in 3D.
+    omega3 = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    V = overlay(space(omega3; cells=8, order=1, basis=bspline()),
+                box((0.25, 0.25, 0.25), (0.75, 0.75, 0.75)); cells=4, order=1)
+    m, l = _gram(V)
+    @test count(==(:dedup), l.elimination_source) == 27
+    @test isposdef(Symmetric(Matrix(m.matrix)))
 end
 
 @testset "BSpline extension: C^m overlay reduces dof count for smooth problems" begin

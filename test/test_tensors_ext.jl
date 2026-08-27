@@ -140,6 +140,189 @@ end
     @test visited[] > 0
 end
 
+# ── Return side: the stress row the test-component contraction selects ────────
+
+@testset "UnfittedTensorsExt: TestChannels(value, σ, c) is the row σ : ∇v asks for" begin
+    # Assembly contracts the gradient channel against the scalar test basis
+    # gradient of test component `c`, i.e. against `v = N eᶜ`. The channel
+    # must therefore satisfy ⟨channel, ∇N⟩ = σ : ∇v = σ : (eᶜ ⊗ ∇N) for every
+    # `c`. Checked against a deliberately NON-symmetric σ, where row and
+    # column differ — for the symmetric σ of small-strain elasticity a
+    # transposed extraction is invisible.
+    σ2 = Tensor{2,2,Float64}((1.0, 2.0, 3.0, 4.0))          # column-major
+    @test σ2[1, 2] != σ2[2, 1]
+    ∇N2 = Vec{2,Float64}((0.7, -1.3))
+    for c in 1:2
+        channels = TestChannels(-0.5, σ2, c)
+        @test channels isa TestChannels{2,Float64}
+        @test channels.value == -0.5
+        @test channels.gradient == SVector(σ2[c, 1], σ2[c, 2])
+        e_c = basevec(Vec{2,Float64}, c)
+        @test dot(channels.gradient, SVector(Tuple(∇N2))) ≈ σ2 ⊡ (e_c ⊗ ∇N2)
+    end
+
+    # 3D, and a `SymmetricTensor` argument: same contraction identity.
+    σ3 = SymmetricTensor{2,3,Float64}((1.0, 2.0, 3.0, 4.0, 5.0, 6.0))
+    ∇N3 = Vec{3,Float64}((0.5, -0.25, 1.5))
+    for c in 1:3
+        channels = TestChannels(0.0, σ3, c)
+        @test channels isa TestChannels{3,Float64}
+        e_c = basevec(Vec{3,Float64}, c)
+        @test dot(channels.gradient, SVector(Tuple(∇N3))) ≈ σ3 ⊡ (e_c ⊗ ∇N3)
+    end
+end
+
+# ── State side: the wrappers against an analytic value and Jacobian ───────────
+
+# L² projection of `f` onto the model's space, returned as a coefficient
+# vector for `state =`. Exact whenever `f` lies in the space — a linear
+# field at order ≥ 1 does — so the tensor wrappers can be checked against
+# `f` itself rather than against the accessors they are built from.
+function _project_field(model, u, f)
+    gram = Matrix(assemble_matrix(model, mass_block(u)))
+    rhs = Vector(assemble_vector(model, source_load(u; source=f)))
+    return gram \ rhs
+end
+
+@testset "UnfittedTensorsExt: gradient_tensor is [∂uᵢ/∂xⱼ], not its transpose" begin
+    # A linear field with a non-symmetric Jacobian `A`, reproduced exactly by
+    # the order-1 space. `gradient_tensor` must return `A`; the transposed
+    # convention differs by `|A[1,2] − A[2,1]| = 2`, so this pins the index
+    # order rather than restating the implementation.
+    for (cells, A, b) in (((2, 2), SMatrix{2,2,Float64}(3.0, 7.0, 5.0, 11.0), SVector(0.25, -0.5)),
+                          ((1, 1, 1), SMatrix{3,3,Float64}(1.0, 4.0, 7.0, 2.0, 5.0, 8.0,
+                                                           3.0, 6.0, 10.0),
+                           SVector(0.1, 0.2, 0.3)))
+        D = length(cells)
+        exact(x) = A * SVector{D,Float64}(x) + b
+        V = space(box(ntuple(_ -> 0.0, D), ntuple(_ -> 1.0, D)); cells=cells, order=1)
+        u = field(:u, V; components=D)
+        model = prepare(Problem((u,)))
+        coefficients = _project_field(model, u, exact)
+
+        worst = Ref((0.0, 0.0, 0))
+        foreach_quadrature_point(model; state=coefficients) do q
+            value_error, gradient_error, visited = worst[]
+            v = value_vec(q.state, u)
+            G = gradient_tensor(q.state, u)
+            value_error = max(value_error, maximum(abs.(Tuple(v) .- Tuple(exact(q.x)))))
+            for i in 1:D, j in 1:D
+                gradient_error = max(gradient_error, abs(G[i, j] - A[i, j]))
+            end
+            worst[] = (value_error, gradient_error, visited + 1)
+        end
+        value_error, gradient_error, visited = worst[]
+        @test visited > 0
+        @test value_error < 1.0e-12
+        @test gradient_error < 1.0e-11
+    end
+end
+
+# ── End to end: the elasticity operator annihilates the rigid-body modes ──────
+
+@testset "UnfittedTensorsExt: tensor-notation elasticity kills rigid-body modes" begin
+    # The whole chain — `symmetric_gradient` on the trial side, a constitutive
+    # double contraction, the stress-row return — assembled as a real
+    # `component_aware` block. Its null space must contain the rigid-body
+    # motions of plane elasticity: two translations and the infinitesimal
+    # rotation. Nothing in the implementation encodes that, so it is an
+    # independent check of ε(u), the contraction, and the row convention at
+    # once. A transposed row extraction breaks the rotation mode.
+    λ, μ = 1.0, 1.0
+    ℂ = SymmetricTensor{4,2,Float64}((i, j, k, l) -> λ * (i == j) * (k == l) +
+                                                     μ * ((i == k) * (j == l) +
+                                                          (i == l) * (j == k)))
+    tensor_bilinear(q, trial, c) = TestChannels(0.0, ℂ ⊡ symmetric_gradient(trial), c)
+    # The spelling the shipped examples hand-roll, kept as a second opinion on
+    # the new constructor.
+    function manual_bilinear(q, trial, c)
+        σ = ℂ ⊡ symmetric_gradient(trial)
+        return TestChannels(0.0, Vec{2,Float64}((σ[c, 1], σ[c, 2])))
+    end
+
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    u = field(:u, V; components=2)
+    model = prepare(Problem((u,)))
+    form(bilinear) = WeakForm(bilinear=bilinear, linear=(q, c) -> 0.0, symmetric=true,
+                              component_aware=true)
+    K = Matrix(assemble_matrix(model, block(u, u, form(tensor_bilinear))))
+    K_manual = Matrix(assemble_matrix(model, block(u, u, form(manual_bilinear))))
+    @test K == K_manual
+
+    rigid_modes = (x -> SVector(1.0, 0.0), x -> SVector(0.0, 1.0),
+                   x -> SVector(-x[2], x[1]))
+    scale = opnorm(K)
+    @test scale > 0
+    for mode in rigid_modes
+        coefficients = _project_field(model, u, mode)
+        @test norm(K * coefficients) < 1.0e-10 * scale * max(1.0, norm(coefficients))
+    end
+
+    # A non-rigid mode is not annihilated, so the assertion above has teeth.
+    stretch = _project_field(model, u, x -> SVector(x[1], 0.0))
+    @test norm(K * stretch) > 1.0e-3 * scale
+end
+
+# ── Hot-loop contract: the conversions must not allocate ──────────────────────
+
+# Every conversion the assembly path uses, measured over a warmed loop inside
+# a single function so that each operand is a local of statically known type —
+# the context the element kernel actually provides. Measuring at global scope
+# would report the boxing of the globals instead of the conversion. Each loop
+# feeds `sink` so it cannot be eliminated as dead code, and `sink` is returned
+# so the caller can pin that the work happened.
+function _conversion_allocations()
+    ℂ = SymmetricTensor{4,2,Float64}((i, j, k, l) -> (i == j) * (k == l) +
+                                                     ((i == k) * (j == l) + (i == l) * (j == k)))
+    trial2 = TrialChannels(1, 1.0, SVector(0.7, -1.3))
+    trial3 = TrialChannels(2, 1.0, SVector(0.5, -0.25, 1.5))
+    vec2 = Vec{2,Float64}((1.5, -0.25))
+    vec3 = Vec{3,Float64}((0.1, 0.2, 0.3))
+    stress(trial, c) = TestChannels(0.0, ℂ ⊡ symmetric_gradient(trial), c)
+
+    sink = 0.0
+    warmup = (Vec(trial2)[1], Vec(trial3)[1], symmetric_gradient(trial2)[1, 1],
+              symmetric_gradient(trial3)[1, 1], TestChannels(0.0, vec2).gradient[1],
+              TestChannels(0.0, vec3).gradient[1], stress(trial2, 1).gradient[1])
+    sink += sum(warmup)
+
+    vec_2d = @allocated for _ in 1:100
+        sink += Vec(trial2)[1]
+    end
+    vec_3d = @allocated for _ in 1:100
+        sink += Vec(trial3)[1]
+    end
+    strain_2d = @allocated for _ in 1:100
+        sink += symmetric_gradient(trial2)[1, 1]
+    end
+    strain_3d = @allocated for _ in 1:100
+        sink += symmetric_gradient(trial3)[1, 1]
+    end
+    channels_2d = @allocated for _ in 1:100
+        sink += TestChannels(0.0, vec2).gradient[1]
+    end
+    channels_3d = @allocated for _ in 1:100
+        sink += TestChannels(0.0, vec3).gradient[1]
+    end
+    stress_row = @allocated for _ in 1:100
+        sink += stress(trial2, 1).gradient[1]
+    end
+    return (; vec_2d, vec_3d, strain_2d, strain_3d, channels_2d, channels_3d, stress_row, sink)
+end
+
+@testset "UnfittedTensorsExt: the assembly-path conversions are allocation-free" begin
+    # These conversions run once per test component per trial dof per
+    # quadrature point, so the package's allocation-free element-kernel
+    # contract applies to them. A nonzero count means a conversion fell off
+    # the inlined path — `Tuple(::Vec)` used to, at 208 B a call, on the
+    # return path of every tensor-notation bilinear callback.
+    allocations = _conversion_allocations()
+    @test isfinite(allocations.sink)
+    for name in (:vec_2d, :vec_3d, :strain_2d, :strain_3d, :channels_2d, :channels_3d, :stress_row)
+        @test (name, getfield(allocations, name)) == (name, 0)
+    end
+end
+
 # ── Tension/compression strain split: spectral vs. Cayley-Hamilton ────────────
 #
 # The phase-field single-edge-notched example (`examples/phase_field_*`)

@@ -528,8 +528,11 @@ diagnostics.
 `classify_cache` is threaded into `_covered_by_level` for the dedup test so it
 applies the same fictitious-fold rule [`build_coverage`](@ref) used.
 
-Integrated-Legendre only; the generic fallback returns nothing (order reduction is out
-of scope for the B-spline family).
+The dedup half is not an optimisation: a mode a covering level reproduces exactly is
+linearly dependent on that level's own modes, so leaving both active makes the
+superposed operator exactly singular. The B-spline extension overrides this hook for
+the same reason, and emits nothing but dedups — that family has no bubble modes to
+shed. Every other family takes the generic fallback below and reduces nothing.
 """
 function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{D,T},
                                coverage::Coverage{D}, tol::GeometryTolerance{T},
@@ -566,7 +569,7 @@ function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{
     return out
 end
 
-# Generic fallback: no order reduction (e.g. the B-spline family).
+# Generic fallback: no order reduction for a family that has not opted in.
 function _coverage_constraints(::Level{D,T,B}, ::Space{D,T}, ::Coverage{D}, ::GeometryTolerance{T},
                                ::AbstractVector{Pair{TensorDofKey{D},Int}},
                                ::_ClassifyCache{D,T}) where {D,T,B}
@@ -577,8 +580,14 @@ end
 # summing the coefficients, dropping terms whose coefficient falls
 # below the working tolerance. Pure-data helper consumed by the
 # cascade resolver below; sorts in place for compactness.
+#
+# A one-term list is not a special case, and must not be short-circuited past the
+# drop test. A multi-raw constraint re-emitted after its raws were pivoted away can
+# leave exactly one surviving term whose coefficient is zero — `0·u = 0`, which
+# constrains nothing — and returning that unfiltered makes the resolver pivot on it
+# and eliminate `u` outright.
 function _combine_terms(terms::Vector{Tuple{Int,T}}) where {T}
-    length(terms) <= 1 && return terms
+    isempty(terms) && return terms
     sort!(terms; by=first)
     write = 1
     @inbounds for read in 2:length(terms)

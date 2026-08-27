@@ -157,6 +157,11 @@ end
 # An unmasked level is all-active, so its dilation is the whole grid and the pass is the
 # original one.
 #
+# The B-spline family's own `_coverage_constraints` (in the extension) reads `cov` over a
+# wider stencil — a spline of degree `p` lives on up to `p + 1` cells per axis — but only
+# after requiring every one of those cells to be *active* on this level, and the active
+# cells are the seed of the dilation above. So it too reads only computed entries.
+#
 # The dof layer is not the only reader: `_mesh_vtk_data` in `postprocessing.jl` reads
 # `cov` on every cell of the level for its `covered` diagnostic array. That reader is
 # not what the set is sized for, and outside it sees the `false` default rather than a
@@ -182,7 +187,9 @@ end
 # functions on an `outer` cell boundary, so each is multilinear on each `outer` cell —
 # the geometric half of the linear-dedup condition. The other half belongs to `outer`'s
 # basis, which must also carry the vertex function's kink; `_coverage_constraints`
-# (`dofs.jl`) tests both before deduping.
+# (`dofs.jl`) tests both before deduping. The B-spline family reuses the same geometric
+# half — nesting is what puts each of its interior knots on an `outer` cell boundary —
+# and pairs it with its own span-containment test.
 function _nested_over(inner::Level{D,T}, outer::Level{D,T}, tol::GeometryTolerance{T}) where {D,T}
     for d in 1:D
         lo, hi = outer.mesh.domain.lower[d], outer.mesh.domain.upper[d]

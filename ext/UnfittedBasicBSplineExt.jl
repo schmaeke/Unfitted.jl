@@ -64,12 +64,17 @@ global 1D function index via the `_AXIS_BSPLINE` tag.
     trace-vanishing [`LinearConstraint`](@ref)s (orders `k = 0 … m`) on
     every overlay / mask face, so masked B-spline levels of any geometry
     remain eliminable through the existing constraint machinery.
-  - `_supports_physical_domain(::BSplineFamily) = false`. The family
-    therefore cannot yet be combined with an immersed [`PhysicalDomain`](@ref):
-    `space(...; basis=bspline(), physical=…)` raises an `ArgumentError`
-    rather than silently over-constraining cut-cell modes on fully-fictitious
-    fold faces (the constraint generator above has no fold exemption). Use
-    the default [`IntegratedLegendre`](@ref) family for finite-cell problems.
+  - A `_coverage_constraints` overload. Order reduction for this family is
+    the dedup and nothing else: a buried function a covering level's span
+    already contains exactly is eliminated, because the two are linearly
+    dependent and the superposition is otherwise singular. See
+    [`bspline`](@ref) under "Nested levels".
+  - The fictitious-fold exemption inside that generator: a face whose
+    inactive side is a fully-fictitious cell carries no trace to vanish on
+    and emits no constraint, while a user-masked face still does. That one
+    test is all the family needs to take the `true` default of
+    `_supports_physical_domain` and carry an immersed
+    [`PhysicalDomain`](@ref), so the finite-cell workflow is open to it.
 
 The hot loops in `src/assembly.jl` and `src/projection.jl` are
 unchanged — they dispatch on `level.basis` (via the workspace's
@@ -82,9 +87,11 @@ using Unfitted
 # installs on an Unfitted function is written `Unfitted.f(...)` at its
 # definition, which needs no import. The list is therefore an honest measure of
 # how far the extension reaches into the package.
-using Unfitted: BasisFamily, Level, CartesianMesh, LevelMask, AxisDofKey, TensorDofKey,
-                GeometryTolerance, LinearConstraint, Space, is_active, _AXIS_BSPLINE,
-                _check_basis_mode, _level_side_is_physical, _tensor_dof_key
+using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, LevelMask, AxisDofKey,
+                TensorDofKey, GeometryTolerance, LinearConstraint, Space, Coverage, cell_box,
+                is_active, _AXIS_BSPLINE, _check_basis_mode, _level_side_is_physical,
+                _tensor_dof_key, _ClassifyCache, _covered_by_level, _nested_over,
+                classify_cell
 using StaticArrays: SVector
 using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim
 
@@ -111,6 +118,25 @@ V = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3, basis=bspline())
     to `p_d − 1` on the lowest-degree axis, provided the level is thick
     enough (`cells + p ≥ 2m + 3` per axis). Higher `m` eliminates more
     boundary functions, lowering the active dof count for smooth problems.
+
+# Nested levels
+
+A B-spline overlay of the same degree whose cell boundaries include the
+base's reproduces, exactly, every base function buried underneath it — so
+the two levels carry the same function twice and the superposed operator is
+exactly singular. Nesting is the natural thing to reach for, so the family
+handles it: `reduce_order` (`true` by default on both [`space`](@ref) and
+[`overlay`](@ref)) eliminates the duplicate. That costs nothing here — the
+discrete space is unchanged, unlike integrated Legendre's order reduction,
+which trades accuracy for dofs. A `:tensor` integrated-Legendre overlay of
+order ≥ the base degree reproduces the same functions and is deduped the
+same way.
+
+Passing `reduce_order=false` on a nested stack keeps the duplicate and
+leaves the operator singular, the same trade the integrated-Legendre family
+makes. If a configuration must keep every mode, break the nesting instead:
+a cell count that does not divide the base's (`cells=5` under a base of 8,
+say), or a different degree on the overlay, leaves nothing to deduplicate.
 
 # Why a deferred spec
 
@@ -187,13 +213,6 @@ struct BSplineFamily{D,T,S<:Tuple,DS<:Tuple} <: BasisFamily
     cell_to_span::NTuple{D,Vector{Int}}
     continuity_order::Int
 end
-
-# The B-spline overlay-constraint generator (`_overlay_constraints` below) emits
-# trace-vanishing constraints on every active/inactive face without the
-# fictitious-fold exemption the integrated-Legendre path applies, so it would
-# over-constrain a cut cell's boundary modes on fully-fictitious fold faces.
-# Reject the pairing up front until the fold C⁰ rule is implemented here.
-Unfitted._supports_physical_domain(::BSplineFamily) = false
 
 # ── Knot-vector construction ──────────────────────────────────────────────────
 
@@ -494,10 +513,9 @@ function Unfitted._overlay_constraints(level::Level{D,T,<:BSplineFamily}, V::Spa
                                        classify_cache::Unfitted._ClassifyCache{D,T}) where {D,T}
     # `level_keys` (this level's pre-bucketed raws) is unused: the
     # B-spline constraint generator walks the mesh face/perp grids and
-    # looks up raws through `raw_by_key` directly. `classify_cache` is
-    # unused too — the family refuses an immersed `PhysicalDomain`
-    # (`_supports_physical_domain` above), so no face here can be a
-    # fictitious fold that needs classifying.
+    # looks up raws through `raw_by_key` directly. `classify_cache` goes to
+    # `_active_cell_at_face`, which reads it to tell a fictitious fold face
+    # from a user-mask face; with `V.physical === nothing` it is never touched.
     family = level.basis
     m = family.continuity_order
     n_cells = level.mesh.cells
@@ -532,7 +550,8 @@ function Unfitted._overlay_constraints(level::Level{D,T,<:BSplineFamily}, V::Spa
             coeffs_lower, coeffs_upper = _trace_coeffs(P_d, lower_span, upper_span, t_star, Val(m))
 
             for perp_cell in perp_cells
-                located = _active_cell_at_face(level, d, j, perp_cell, n_cells, Val(D))
+                located = _active_cell_at_face(level, d, j, perp_cell, n_cells, Val(D),
+                                               V.physical, classify_cache)
                 located === nothing && continue
                 active_cell, span = located
                 coeffs_for_span = span == lower_span ? coeffs_lower : coeffs_upper
@@ -583,8 +602,20 @@ end
 # (i.e., contributes a trace constraint), `nothing` otherwise. For mesh
 # edges, "artificial" reduces to "the boundary cell is active"; for
 # internal faces, it's "the two adjacent cells differ in activity".
+#
+# With one exemption, and it is what lets this family carry an immersed
+# `PhysicalDomain`. A `LevelMask` merges two deactivations that mean opposite
+# things: a *user-masked* cell holds material only the coarser level represents,
+# so the face between it and the active side is a real artificial boundary and
+# the trace must vanish there; a *fictitious* cell holds no material at all, so
+# there is no trace to vanish on, and constraining it would delete the cut cell's
+# boundary modes — the very over-constraint the FCM solution must not suffer.
+# `_internal_face_is_physical` in `src/dofs.jl` draws the same line for the
+# integrated-Legendre family. With `physical === nothing` there is no fold and
+# `cache` is never touched.
 function _active_cell_at_face(level::Level{D}, d::Int, j::Int, perp_cell::CartesianIndex{D},
-                              n_cells::NTuple{D,Int}, ::Val{D}) where {D}
+                              n_cells::NTuple{D,Int}, ::Val{D}, physical,
+                              cache::_ClassifyCache{D}) where {D}
     if j == 0 || j == n_cells[d]
         axis_d_idx = j == 0 ? 1 : n_cells[d]
         cell = CartesianIndex(ntuple(e -> e == d ? axis_d_idx : perp_cell[e], D))
@@ -595,7 +626,97 @@ function _active_cell_at_face(level::Level{D}, d::Int, j::Int, perp_cell::Cartes
     a_j = is_active(level.mask, cell_j)
     a_jp1 = is_active(level.mask, cell_jp1)
     a_j == a_jp1 && return nothing
+    inactive = a_j ? cell_jp1 : cell_j
+    if physical !== nothing &&
+       classify_cell(physical, cell_box(level.mesh, inactive), cache) === :fictitious
+        return nothing
+    end
     return a_j ? (cell_j, j) : (cell_jp1, j + 1)
+end
+
+# ── Order reduction: dedup of what a covering level already contains ──────────
+
+# The cells this level's axis-`d` 1D function with global index `i` is supported
+# on. Cell `c` carries the global indices `c … c + p` (uniform knots,
+# `cell_to_span` the identity), so function `i` lives on
+# `max(1, i − p) … min(ncells, i)` — up to `p + 1` cells. The core's
+# `_axis_incidence` cannot answer this: it is written for the integrated-Legendre
+# node / span keys and reports a single cell for any other tag.
+@inline _axis_support(i::Integer, p::Integer, ncells::Integer) = max(1, i - p):min(ncells, i)
+
+function _support_cells(key::TensorDofKey{D}, family::BSplineFamily{D},
+                        n::NTuple{D,Int}) where {D}
+    return CartesianIndices(ntuple(d -> _axis_support(key.axes[d].index,
+                                                      degree(family.spaces[d]), n[d]), D))
+end
+
+# True iff level `k`, standing above a B-spline level of per-axis degree `p`,
+# reproduces that level's buried functions exactly — given the meshes nest, which
+# the caller tests separately with `_nested_over`.
+#
+# A buried function's support lies inside `k`'s active region, and it vanishes
+# there to order `p − 1` (its own end knots are simple), so `k`'s trace conditions
+# — orders `0 … m ≤ p − 1` — never exclude it. What is left is a question about
+# the two spans:
+#
+#   * a B-spline `k` of the *same* degree. Interior knots are simple on both
+#     sides, so `k` is `C^{p−1}` exactly where the buried function kinks and,
+#     under nesting, that function is one of `k`'s own splines. A *higher* degree
+#     does not help — at a shared simple knot `k` would be `C^p`, too smooth to
+#     carry the kink — and a lower one cannot carry the polynomial degree.
+#   * an integrated-Legendre `k` in `:tensor` mode of order ≥ `p`. Its span is
+#     every `C⁰` tensor polynomial of that degree on its cells, which contains a
+#     `C^{p−1}` spline of degree `p`. `:trunk` drops the mixed high-order terms,
+#     so it does not.
+#
+# Every other family answers `false`. That is the safe direction: skipping a
+# legitimate dedup leaves a rank-deficient operator, whereas deduping a function
+# nothing reproduces would delete part of the space.
+function _reproduces(k::Level{D}, p::NTuple{D,Int}) where {D}
+    family = k.basis
+    family isa BSplineFamily && return all(d -> degree(family.spaces[d]) == p[d], 1:D)
+    family isa IntegratedLegendre || return false
+    return k.mode === :tensor && all(d -> k.order[d] >= p[d], 1:D)
+end
+
+# `_coverage_constraints` for a B-spline level — the dedup half only, and it is
+# the whole of order reduction for this family.
+#
+# Integrated Legendre splits into a linear skeleton plus bubble modes, so it can
+# shed the bubbles of a covered cell on their own and trade accuracy for dofs. A
+# B-spline basis has no such split: its only reducible mode is one the covering
+# level reproduces *exactly*, which leaves the discrete space unchanged and is
+# therefore free. What it buys is not dof count but well-posedness — the
+# reproduced function and its copy above are linearly dependent, so leaving both
+# active makes the superposed operator exactly singular. `reduce_order=false`
+# opts out of the repair as well as of the reduction, exactly as it does for
+# integrated Legendre.
+function Unfitted._coverage_constraints(level::Level{D,T,<:BSplineFamily}, V::Space{D,T},
+                                        coverage::Coverage{D}, tol::GeometryTolerance{T},
+                                        level_keys::AbstractVector{Pair{TensorDofKey{D},Int}},
+                                        classify_cache::_ClassifyCache{D,T}) where {D,T}
+    out = Tuple{LinearConstraint{T},Symbol}[]
+    cov = coverage.covered[level.id]
+    any(cov) || return out
+    family = level.basis
+    n = level.mesh.cells
+    p = ntuple(d -> degree(family.spaces[d]), D)
+    above = [k for k in V.levels
+             if k.id > level.id && _reproduces(k, p) && _nested_over(level, k, tol)]
+    isempty(above) && return out
+    for (key, raw) in level_keys
+        cells = _support_cells(key, family, n)
+        # Buried, and buried as a whole function. The `is_active` half matters only
+        # on a masked level: what such a level assembles is the function truncated
+        # to its own active cells, which is not the function `k` reproduces. It also
+        # keeps the `cov` read in range of what `_coverage_cells` computed — that
+        # set is the active cells dilated by one, so every cell tested here is in it.
+        all(ci -> cov[ci] && is_active(level.mask, ci), cells) || continue
+        any(k -> all(ci -> _covered_by_level(cell_box(level.mesh, ci), k, tol, V.physical,
+                                             classify_cache), cells), above) || continue
+        push!(out, (LinearConstraint{T}([raw], [one(T)]), :dedup))
+    end
+    return out
 end
 
 end # module UnfittedBasicBSplineExt
