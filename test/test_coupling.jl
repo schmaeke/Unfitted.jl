@@ -393,6 +393,33 @@ end
     @test _maxerr(uy, _solve_nitsche(1.0e2, uy; nx1=5, ny1=3, nx2=7, ny2=4)...) < 1.0e-8
 end
 
+# Pairs with "WeakForm defaults to asymmetric assembly" in test_api.jl. The
+# interface kernel is where cohesive and one-sided laws live, so a coupling
+# declared by omission must keep the upper triangle the mirror would discard.
+@testset "InterfaceForm defaults to asymmetric assembly" begin
+    V1 = space(box((0.0, 0.0), (1.0, 0.5)); cells=(2, 1), order=1)
+    V2 = space(box((0.0, 0.5), (1.0, 1.0)); cells=(2, 1), order=1)
+    u1, u2 = field(:u1, V1), field(:u2, V2)
+    Γ = polyline_mesh([SVector(1.0, 0.5), SVector(0.0, 0.5)])   # normal (0,+1) = a→b
+    # One-sided consistency flux, no adjoint (θ = 0 Nitsche): a(u, v) ≠ a(v, u).
+    # The bare scalar return also exercises the shorthand on the interface path.
+    onesided = InterfaceForm() do q, sides, trial, _tc
+        jump_sign(sides.test) * dot(trial.gradient, q.normal)
+    end
+    @test !onesided.symmetric
+
+    model = prepare(Problem((u1, u2);
+                            blocks=(stiffness_block(u1), stiffness_block(u2),
+                                    couple(u1, u2, Γ, onesided)...)))
+    @test !model.problem.symmetric   # one asymmetric block ⇒ the problem is asymmetric
+
+    A = assemble!(model).matrix
+    mirrored = assemble_matrix(model, model.problem.blocks; symmetric=true)
+    @test A != A'                 # the upper triangle survives the default …
+    @test mirrored == mirrored'   # … and is replaced by the mirror when declared
+    @test A != mirrored
+end
+
 @testset "component-aware InterfaceForm couples a 2-component field" begin
     # Two stacked 2-component subdomains coupled by a diagonal (component-wise)
     # jump penalty ∫ β Σᵢ [uᵢ][vᵢ], written as a component-aware InterfaceForm

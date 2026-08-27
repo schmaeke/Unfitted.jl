@@ -49,6 +49,38 @@ end
     @test l2_error(solution, model, x -> 1.0; norm=:absolute) < 1.0e-12
 end
 
+@testset "l2_error pins the integration measure absolutely" begin
+    # ‖c‖_{L²(Ω)} = |c|·√|Ω| in closed form, so a constant field measured
+    # against a zero reference fixes the quadrature measure by its absolute
+    # value. Every other l2_error assertion in the suite is `< tiny` or a
+    # ratio, and no positive rescaling of the measure — a dropped 2⁻ᴰ box
+    # Jacobian, say — can violate one of those. The 2D/3D pair pins the
+    # exponent of such a factor, not merely its presence. Order 1 is a
+    # partition of unity, so a uniform coefficient vector is exactly the
+    # constant field, and `value` re-checks that at an off-grid point.
+
+    # 2D: |Ω| = 2·2 = 4, c = 3 ⇒ ‖c‖ = 3·√4 = 6.
+    omega = box((0.0, 0.0), (2.0, 2.0))
+    model = prepare(poisson(space(omega; cells=(2, 3), order=1); source=0.0))
+    solution = Solution(fill(3.0, active_unknowns(model)), model.version,
+                        Unfitted.SolverDiagnostics(:manual, 0.0, true))
+
+    @test value(solution, model, (0.7, 1.3)) ≈ 3.0
+    @test l2_error(solution, model, x -> 0.0; norm=:absolute) ≈ 6.0 rtol = 1.0e-14
+    # A zero reference has no norm to divide by, so the relative form
+    # documents a fall back to the absolute one.
+    @test l2_error(solution, model, x -> 0.0) ≈ 6.0 rtol = 1.0e-14
+
+    # 3D: |Ω| = 3·3·1 = 9, c = 5 ⇒ ‖c‖ = 5·√9 = 15.
+    cube = box((0.0, 0.0, 0.0), (3.0, 3.0, 1.0))
+    cube_model = prepare(poisson(space(cube; cells=(2, 1, 2), order=1); source=0.0))
+    cube_solution = Solution(fill(5.0, active_unknowns(cube_model)), cube_model.version,
+                             Unfitted.SolverDiagnostics(:manual, 0.0, true))
+
+    @test value(cube_solution, cube_model, (0.7, 1.3, 0.4)) ≈ 5.0
+    @test l2_error(cube_solution, cube_model, x -> 0.0; norm=:absolute) ≈ 15.0 rtol = 1.0e-14
+end
+
 @testset "solution/model mismatch checks" begin
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=1, order=1)

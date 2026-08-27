@@ -257,24 +257,24 @@ end
     @test _proj_residual(m, _x1, _INT_X1SQ) < 1e-6
 end
 
-@testset "BSpline extension: block overlay mask buries a vertex the spline cannot replace" begin
-    # The same Gram check on a separable 2×2 block mask, whose active region is a
-    # nested patch of four base cells. Mesh nesting is all `_nested_over` looks at, so
-    # the linear dedup fires on the base vertex buried at (0.375, 0.375) — but the
-    # covering level is a maximal-smoothness spline, which has no kink at a simple
-    # interior knot and so cannot reproduce that hat. Nothing replaces the eliminated
-    # mode: the space stays independent but loses first-order completeness (‖1 − Π1‖ ≈
-    # 6e-3, 0.44 pointwise). The two assertions below are the contract order reduction
-    # claims, and pass once the dedup consults the covering basis, not only its mesh.
+@testset "BSpline extension: block overlay mask keeps the vertex the spline cannot replace" begin
+    # The same Gram check on a separable 2×2 block mask, whose active region is a nested
+    # patch of four base cells, burying the base vertex at (0.375, 0.375). Its hat is
+    # kinked there, and the covering level is a maximal-smoothness spline whose span has
+    # no kink at a simple interior knot — so the linear dedup must not fire, however
+    # perfectly the two meshes nest. Order reduction still sheds the buried high-order
+    # modes; the surviving linear skeleton is what keeps the space complete to first
+    # order. Deduping the vertex costs ‖1 − Π1‖ ≈ 6e-3, 0.44 pointwise.
     Vbase = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=2)
     overlay_mask = falses(4, 4)
     overlay_mask[1:2, 1:2] .= true
     Vover = overlay(Vbase, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3, basis=bspline(),
                     active=overlay_mask)
     m, l = _gram(Vover)
+    @test count(==(:dedup), l.elimination_source) == 0
     @test rank(Symmetric(Matrix(m.matrix))) == active_unknowns(l)
-    @test_broken _proj_residual(m, _one, _INT_ONE) < 1e-6
-    @test_broken _proj_residual(m, _x1, _INT_X1SQ) < 1e-6
+    @test _proj_residual(m, _one, _INT_ONE) < 1e-6
+    @test _proj_residual(m, _x1, _INT_X1SQ) < 1e-6
 end
 
 @testset "BSpline extension: moved overlay rebuilds knot vectors" begin

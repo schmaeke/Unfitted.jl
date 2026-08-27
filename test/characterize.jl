@@ -1033,6 +1033,29 @@ function main()
         end
     end
 
+    # ── 30 ── D = 2, integrated Legendre base under a masked B-spline overlay. The
+    #          one family pairing no other case reaches: case 09 is spline over spline,
+    #          where the base takes the no-op fallback and order reduction never runs.
+    #          Appended after the EXPECTED-TO-CHANGE block rather than filed with the
+    #          other MUST-NOT-CHANGE cases so the 29 cases above keep their numbering.
+    case(30, "d2-legendre-bspline-masked", "MUST-NOT-CHANGE",
+         note="the overlay is a nested 2x2 block of base cells, so the base vertex at " *
+              "(0.375, 0.375) is buried and mesh nesting alone would dedup it. It must " *
+              "survive: a maximal-smoothness spline is C^(p-1) at a simple interior knot " *
+              "and has no kink to replace that hat with. Pins the survival — " *
+              "reduced_mode_counts = [8, 0], the buried high-order modes and nothing " *
+              "else. Deduping the vertex prints [9, 0], one fewer active unknown, and a " *
+              "space that cannot reproduce a constant.")
+    let V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(8, 8), order=2),
+        mask = falses(4, 4)
+
+        mask[1:2, 1:2] .= true
+        V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4), order=3, basis=bspline(),
+                    active=mask)
+        model, _ = poisson_case(V, f2d, u2d, P2)
+        emit("active_cells.level2", maskstr(active_cells(model; level=2)))
+    end
+
     # ── Summary ───────────────────────────────────────────────────────────────
     println()
     println("SUMMARY")

@@ -507,8 +507,8 @@ level opted into `reduce_order`, emit a single-raw strong elimination for
 
   * every **buried high-order** mode (at least one bubble axis, every incident cell
     covered) — order reduction, source `:coverage`; and
-  * every **buried linear** mode a single nested level above reproduces exactly —
-    dedup, source `:dedup`.
+  * every **buried linear** mode a single nested *integrated-Legendre* level above
+    reproduces exactly — dedup, source `:dedup`.
 
 The linear skeleton is otherwise retained, which is what makes the reduced space
 complete. Each returned pair carries its elimination source for `constraint_kind` /
@@ -528,7 +528,16 @@ function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{
     cov = coverage.covered[level.id]
     any(cov) || return out
     n = level.mesh.cells
-    nested_above = [k for k in V.levels if k.id > level.id && _nested_over(level, k, tol)]
+    # A buried vertex function is a C⁰ hat: multilinear on each of `level`'s cells,
+    # kinked across every cell boundary. Mesh nesting only buys the multilinear half —
+    # a span reproduces the kink iff it is no smoother than C⁰ there. Integrated
+    # Legendre is exactly C⁰ across cell boundaries and contains Q1 on every cell
+    # (order ≥ 1 is enforced), so it qualifies; a B-spline of degree p is C^(p−1) at a
+    # simple interior knot, so for p ≥ 2 nothing in its span kinks there. Restricting
+    # the dedup to integrated-Legendre covers can only skip a legitimate dedup, never
+    # eliminate a mode nothing replaces.
+    nested_above = [k for k in V.levels if k.id > level.id && k.basis isa IntegratedLegendre &&
+                                           _nested_over(level, k, tol)]
     # A nested level above reproduces a buried vertex function iff it covers every cell
     # the vertex touches — the same fictitious-aware rule `build_coverage` applied.
     reproduces(k, cells) = all(cells) do ci

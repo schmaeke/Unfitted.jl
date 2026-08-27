@@ -165,9 +165,11 @@ end
 
 # True iff `inner`'s mesh is nested inside `outer`'s over their overlap: every `inner`
 # node coordinate lying within `outer`'s domain also appears among `outer`'s node
-# coordinates, per axis. Sufficient for `outer` to reproduce `inner`'s multilinear
-# vertex functions wherever `outer` covers them — the condition under which a covered
-# coarse vertex is an exact duplicate and the linear-dedup rule fires.
+# coordinates, per axis. That puts every breakpoint of `inner`'s multilinear vertex
+# functions on an `outer` cell boundary, so each is multilinear on each `outer` cell —
+# the geometric half of the linear-dedup condition. The other half belongs to `outer`'s
+# basis, which must also carry the vertex function's kink; `_coverage_constraints`
+# (`dofs.jl`) tests both before deduping.
 function _nested_over(inner::Level{D,T}, outer::Level{D,T}, tol::GeometryTolerance{T}) where {D,T}
     for d in 1:D
         lo, hi = outer.mesh.domain.lower[d], outer.mesh.domain.upper[d]

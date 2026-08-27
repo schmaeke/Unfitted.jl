@@ -174,7 +174,7 @@ function _negated_form(form::WeakForm)
 end
 
 """
-    InterfaceForm(kernel; symmetric=true)
+    InterfaceForm(kernel; symmetric=false)
 
 A *two-sided* interface bilinear form — the general coupling mechanism the
 library provides so a user can express any interface constitutive law
@@ -203,9 +203,14 @@ weighted average flux `⟨σn⟩_w` therefore needs both sides' gradients, which
 why the mechanism is two-sided; a callback may also read `q.state` for a
 damage-dependent (cohesive) traction.
 
-`symmetric` declares whether the *assembled coupling* is symmetric (true for a
-symmetric-variant Nitsche, false for a skew or cohesive one); it flows to the
-block forms so the problem's symmetry is inferred correctly.
+`symmetric` declares whether the *assembled coupling* is symmetric and defaults
+to `false`, so an undeclared coupling is assembled in full. Pass
+`symmetric = true` for a symmetric-variant Nitsche: the flag flows to the four
+block forms, hence to the problem's inferred symmetry and to the lower-triangle
+mirror described under [`WeakForm`](@ref). That mirror *discards* the upper
+triangle, so a cohesive or one-sided law declared by omission would be silently
+symmetrised. The default therefore costs a symmetric coupling the caller forgot
+to declare a factor of two, rather than costing an asymmetric one its correctness.
 
 Mind the interface orientation (see [`Interface`](@ref)): `q.normal` points
 `uₐ → u_b`, and you own that ordering.
@@ -217,7 +222,7 @@ bundled and picked with [`onside`](@ref); jump signs come from [`jump_sign`](@re
 The field is scalar, so `test_component` is unused:
 
 ```julia
-nitsche = InterfaceForm() do q, sides, trial, _tc
+nitsche = InterfaceForm(; symmetric=true) do q, sides, trial, _tc
     n = q.normal
     u = onside(sides.trial, (κ=κₐ, w=wₐ), (κ=κ_b, w=w_b))   # trial-side material
     v = onside(sides.test,  (κ=κₐ, w=wₐ), (κ=κ_b, w=w_b))   # test-side material
@@ -232,7 +237,7 @@ struct InterfaceForm{K}
     kernel::K
     symmetric::Bool
 end
-InterfaceForm(kernel; symmetric::Bool=true) = InterfaceForm{typeof(kernel)}(kernel, symmetric)
+InterfaceForm(kernel; symmetric::Bool=false) = InterfaceForm{typeof(kernel)}(kernel, symmetric)
 
 """
     couple(uₐ::Field, u_b::Field, Γ::BoundaryMesh, form::WeakForm) -> NTuple{4,BlockForm}

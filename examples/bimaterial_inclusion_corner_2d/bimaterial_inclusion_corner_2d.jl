@@ -140,7 +140,7 @@ const β = β_factor * 0.5 * (κ₁ + κ₂) * order^2 / h
 # Interface: t̂ = ⟨κ∇θ·n⟩_w − β⟦θ⟧; symmetric adjoint; four field blocks. Per-side
 # conductivity/weight is bundled and picked with `onside`; jump signs come from
 # `jump_sign`. The field is scalar, so the test-component argument is unused.
-nitsche_coupling = InterfaceForm() do q, sides, trial, _tc
+nitsche_coupling = InterfaceForm(; symmetric=true) do q, sides, trial, _tc
     n = q.normal
     u = onside(sides.trial, (κ=κ₁, w=w₁), (κ=κ₂, w=w₂))    # trial-side material
     v = onside(sides.test, (κ=κ₁, w=w₁), (κ=κ₂, w=w₂))     # test-side material
