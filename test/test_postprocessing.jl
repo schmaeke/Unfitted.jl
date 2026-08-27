@@ -261,6 +261,49 @@ end
           boundary_integral(q -> 1.0, single; on=boundary(:all), field=:u)
 end
 
+@testset "l2_error takes a field and measures that subdomain only" begin
+    # Two disjoint squares carrying different L² projections. Without a field
+    # argument `l2_error` could only reach `_default_field`, which raises on any
+    # multi-field problem — so the package's own coupled workflow had no L²
+    # error report at all.
+    V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(3, 3), order=1)
+    u1 = field(:u1, V1)
+    u2 = field(:u2, V2)
+    # Both data are bilinear, hence exactly representable in the order-1 tensor
+    # space, so each projection reproduces its own datum to round-off.
+    f1 = x -> x[1]
+    f2 = x -> 2 * x[2]
+    model = prepare(Problem((u1, u2); blocks=(mass_block(u1), mass_block(u2)),
+                            loads=(source_load(u1; source=f1), source_load(u2; source=f2))))
+    sol = solve!(model)
+
+    @test l2_error(sol, model, u1, f1; norm=:absolute) < 1.0e-10
+    @test l2_error(sol, model, u2, f2; norm=:absolute) < 1.0e-10
+
+    # Swapping the datum is a large error, so the field argument really selects
+    # which subdomain is integrated rather than being ignored.
+    @test l2_error(sol, model, u1, f2; norm=:absolute) > 0.1
+    @test l2_error(sol, model, u2, f1; norm=:absolute) > 0.1
+
+    # Omitting the field still raises on a multi-field model, and an unknown
+    # field name is an error rather than a silent fallback.
+    @test_throws ArgumentError l2_error(sol, model, f1)
+    @test_throws ArgumentError l2_error(sol, model, field(:nope, V1), f1)
+    @test_throws ArgumentError l2_error(sol, model, u1, f1; norm=:bogus)
+
+    # Single-domain models are unaffected: the field is optional and, when
+    # given, produces the identical number.
+    V = space(box((0.0,), (1.0,)); cells=1, order=2)
+    single = prepare(poisson(V; source=2.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    u = single.problem.fields[1]
+    ss = solve!(single)
+    exact = x -> x[1] * (1 - x[1])
+    @test l2_error(ss, single, exact) === l2_error(ss, single, u, exact)
+    @test l2_error(ss, single, exact; norm=:absolute) ===
+          l2_error(ss, single, u, exact; norm=:absolute)
+end
+
 @testset "model.facet_regions caches one entry per Dirichlet selector" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(2, 2), order=1)

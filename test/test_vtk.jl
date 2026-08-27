@@ -133,6 +133,16 @@ end
     @test joinpath(dir, "vector_case_data.vtu") in files
     solution_xml = read(joinpath(dir, "vector_case_data.vtu"), String)
     @test occursin("uh", solution_xml)
+
+    # A VTK data array is a vector only at three components; a 2-component array
+    # is stored but cannot be assigned as VECTORS, so ParaView's Glyph / Warp By
+    # Vector cannot read it. The 2-D field is padded with a trailing zero, the
+    # same padding `_vtk_point` applies to the geometry it is attached to.
+    uh_header = match(r"<DataArray[^>]*Name=\"uh\"[^>]*>", solution_xml)
+    @test uh_header !== nothing
+    @test occursin("NumberOfComponents=\"3\"", uh_header.match)
+    @test occursin("NumberOfComponents=\"3\"", match(r"<DataArray[^>]*Name=\"Points\"[^>]*>",
+                                                    solution_xml).match)
 end
 
 @testset "level mesh exports all cells with an active flag" begin

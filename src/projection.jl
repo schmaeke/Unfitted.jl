@@ -119,7 +119,7 @@ end
 # ── Transfer workspace ───────────────────────────────────────────────────────
 
 """
-    TransferWorkspace{D,T}
+    TransferWorkspace{D,T,BS,BT}
 
 Per-region scratch for the L² projection source-driven rhs pass. Mirrors
 [`AssemblyWorkspace`](@ref) but is value-only (no gradient banks):
@@ -127,7 +127,11 @@ projection integrals contract basis values against basis values, never
 gradients.
 
 Source and target levels live in independent id ranges so the workspace
-carries one bank of per-level value buffers per side. Each region
+carries one bank of per-level value buffers per side. The two basis banks
+are narrowed to their own eltypes `BS` / `BT` for the reason spelled out
+on [`AssemblyWorkspace`](@ref) — an abstract bank makes the per-parent,
+per-quadrature-point `_tensor_values!` call a dynamic dispatch — and they
+are independent because a transfer may cross basis families. Each region
 update writes into the side's `values[parent.level]` buffer; since
 `_parents_covering` returns at most one parent per level, the in-place
 update never collides within a region.
@@ -138,13 +142,13 @@ region, never reallocated. The target mass matrix and its Dirichlet lift
 are built by the standard assembler (see [`transfer`](@ref)), so this
 workspace carries no local-matrix bank.
 """
-struct TransferWorkspace{D,T}
-    source_bases::Vector{BasisFamily}
+struct TransferWorkspace{D,T,BS<:BasisFamily,BT<:BasisFamily}
+    source_bases::Vector{BS}
     source_local_ids::Vector{Vector{CartesianIndex{D}}}
     source_orders::Vector{NTuple{D,Int}}
     source_values::Vector{Vector{T}}
     source_val1d::Vector{NTuple{D,Vector{T}}}
-    target_bases::Vector{BasisFamily}
+    target_bases::Vector{BT}
     target_local_ids::Vector{Vector{CartesianIndex{D}}}
     target_orders::Vector{NTuple{D,Int}}
     target_values::Vector{Vector{T}}
@@ -164,8 +168,9 @@ function _transfer_workspace(source_model::Model{D,T}, target_model::Model{D,T})
                                                            Val(D), T)
     t_bs, t_ids, t_ord, t_val, t_v1 = _level_value_buffers(target_model.problem.space.levels,
                                                            Val(D), T)
-    return TransferWorkspace{D,T}(s_bs, s_ids, s_ord, s_val, s_v1, t_bs, t_ids, t_ord, t_val, t_v1,
-                                  Int[], Dict{Int,Int}(), T[])
+    return TransferWorkspace{D,T,eltype(s_bs),eltype(t_bs)}(s_bs, s_ids, s_ord, s_val, s_v1, t_bs,
+                                                            t_ids, t_ord, t_val, t_v1, Int[],
+                                                            Dict{Int,Int}(), T[])
 end
 
 # Slim per-parent record aliasing the workspace value buffer (no

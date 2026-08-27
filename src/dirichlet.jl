@@ -220,7 +220,7 @@ Fields:
     (one `(axis, side)` pair per constrained axis). For codim-1 facets
     this is a single pair; for codim-`K > 1` facets the intersection
     of `K` codim-1 faces. Used by the basis-trace machinery
-    ([`boundary_trace_data`](@ref) and `is_facet_basis`) to filter
+    ([`boundary_trace_indices`](@ref) and `is_facet_basis`) to filter
     facet-incident basis modes.
   - `parents::Vector{FacetParent{D,T}}` — every level cell whose own
     facet on `sides` coincides with this region. The parent set is
@@ -430,49 +430,69 @@ end
 # ── Boundary trace evaluation ─────────────────────────────────────────────────
 
 """
-    boundary_trace_data(level, raw_dofs, sides, xi, cell) -> NamedTuple
+    boundary_trace_indices(level, raw_dofs, sides) -> NamedTuple
 
-Evaluate the basis traces of `level` on the codim-K facet identified by
-`sides`. Returns a `NamedTuple` with two fields:
+The datum-independent, *point*-independent half of a boundary trace: which of
+`level`'s local basis functions have support on the codim-K facet identified by
+`sides`. Returns a `NamedTuple` with four fields:
 
-  - `raw_dofs::Vector{Int}` — the subset of `raw_dofs` whose basis
-    functions have support on the facet (filtered by
-    [`is_facet_basis`](@ref)). Listed in the original local-basis order.
-  - `values::Vector{T}` — corresponding tensor-product basis values at
-    reference point `xi` on the parent cell.
+  - `raw_dofs::Vector{Int}` — the subset of `raw_dofs` whose basis functions
+    touch the facet (filtered by [`is_facet_basis`](@ref)), in the original
+    local-basis order.
+  - `local_ids::Vector{CartesianIndex{D}}` — their tensor-product multi-indices,
+    in the same order.
+  - `values::Vector{T}` — the buffer [`boundary_trace_values!`](@ref) refills
+    at each quadrature point; undefined until it does.
+  - `factors::NTuple{D,Vector{T}}` — the per-axis 1D scratch that same call
+    refills; sized for the level's full mode range, not the facet subset,
+    because the family fills whole axes.
 
-`cell::CartesianIndex{D}` is the parent cell's mesh-index along each
-axis. Integrated Legendre ignores it (the 1D modes are cell-local in
-the reference frame); the B-spline family in the extension uses it to
-pick the right knot-vector span when computing the trace. Callers
-should pass the parent's own cell — `_project_dirichlet_values!`
-already has it as `parent.cell`.
+The subset depends only on `(level, sides)`, and a [`FacetRegion`](@ref)'s
+parent list is constant across its quadrature points, so one call per parent
+covers a whole region — the trace's per-point cost is then the tensor product
+alone. The per-axis scratch the tensor product needs is allocated here too, for
+the same reason.
 
-For integrated Legendre, `is_facet_basis` reduces to "every 1D mode
-along a constrained axis equals the boundary mode" — the trace is the
-straightforward tensor product of `integrated_legendre_value` factors.
-The fallback method throws for any other basis family.
+This half is basis-family-agnostic: it asks only for `local_basis_indices` and
+`is_facet_basis`, which every family supplies.
 """
-function boundary_trace_data(level::Level{D,T,<:IntegratedLegendre}, raw_dofs::Vector{Int},
-                             sides::Vector{Tuple{Int,Symbol}}, xi::SVector{D,T},
-                             ::CartesianIndex{D}) where {D,T}
+function boundary_trace_indices(level::Level{D,T}, raw_dofs::Vector{Int},
+                                sides::Vector{Tuple{Int,Symbol}}) where {D,T}
     local_ids = local_basis_indices(level.basis, level.order, level.mode)
     raws = Int[]
-    values = T[]
+    ids = CartesianIndex{D}[]
 
     for (i, local_id) in pairs(local_ids)
         is_facet_basis(level.basis, local_id, sides) || continue
         push!(raws, raw_dofs[i])
-        push!(values, prod(integrated_legendre_value(local_id.I[d], xi[d]) for d in 1:D))
+        push!(ids, local_id)
     end
 
-    return (; raw_dofs=raws, values)
+    return (; raw_dofs=raws, local_ids=ids, values=Vector{T}(undef, length(ids)),
+            factors=_factor_buffers(level.order, T))
 end
 
-function boundary_trace_data(level::Level{D,T,B}, raw_dofs::Vector{Int},
-                             sides::Vector{Tuple{Int,Symbol}}, xi::SVector{D,T},
-                             ::CartesianIndex{D}) where {D,T,B}
-    throw(ArgumentError("boundary trace projection is not implemented for basis family $(basis_name(level.basis))"))
+"""
+    boundary_trace_values!(level, trace, xi) -> trace
+
+The per-point half of a boundary trace: refill `trace.values` with the basis
+traces at reference point `xi` on the parent cell, for the facet-incident modes
+[`boundary_trace_indices`](@ref) selected. `trace` is that call's record,
+extended by the caller with the parent's `cell`. Mirrors the
+`_parent_basis_data` / `_update_parent_basis_values!` pair the volume
+evaluation paths use.
+
+The trace of a tensor-product basis function on a facet is the volume tensor
+product evaluated at a point that happens to lie on the facet, so this is
+`_tensor_values!` restricted to the facet-incident multi-indices — one code
+path for every basis family, reaching the family only through its
+`_fill_factor_tables!` hook. `sides` is already spent by
+[`boundary_trace_indices`](@ref) and plays no part here.
+"""
+function boundary_trace_values!(level::Level{D,T}, trace, xi::SVector{D,T}) where {D,T}
+    _tensor_values!(level.basis, trace.values, trace.local_ids, level.order, xi, trace.factors,
+                    trace.cell)
+    return trace
 end
 
 # ── Dirichlet projection ──────────────────────────────────────────────────────
@@ -692,18 +712,32 @@ function _sample_dirichlet_facet!(mass::Vector{Matrix{T}}, index::Vector{Dict{In
     rows = [Int[] for _ in 1:ncomp]
 
     for region in _boundary_facet_regions(V, sides, layout.tolerance)
+        # Everything about a parent's trace except the point: the level lookup,
+        # the cell's dof list, and the facet-incident subset of its local basis.
+        # `region.parents` is constant across the region's quadrature points by
+        # the `FacetRegion` contract, and the subset depends only on
+        # `(level, sides)`, so all of it is resolved once here instead of at
+        # every point below. `box` is the parent's precomputed physical box, so
+        # the only per-Q-point geometry work left is the affine
+        # `physical_to_reference`. The levels stay in their own vector: a space
+        # may mix basis families across levels, and holding one in the record
+        # would make the record type — and with it the mass double loop below,
+        # which reads nothing family-specific — vary per parent.
+        levels = map(parent -> _level_by_id(V, parent.level), region.parents)
+        traces = map(levels, region.parents) do level, parent
+            all_raw_dofs = cell_dofs(layout, parent.level, parent.cell)
+            (; cell=parent.cell, box=parent.parent_box,
+             boundary_trace_indices(level, all_raw_dofs, sides)...)
+        end
+
         for (qp, x) in pairs(region.points)
             qweight = region.weights[qp]
 
-            # Evaluate every parent's boundary traces at this point once and
-            # reuse them for the sample and for every component's mass.
-            # `parent.parent_box` is precomputed on the region, so the only
-            # per-Q-point geometry work is the affine `physical_to_reference`.
-            traces = map(region.parents) do parent
-                level = _level_by_id(V, parent.level)
-                raw_dofs = cell_dofs(layout, parent.level, parent.cell)
-                xi = physical_to_reference(parent.parent_box, x)
-                boundary_trace_data(level, raw_dofs, sides, xi, parent.cell)
+            # Refresh every parent's trace values at this point. The buffers
+            # live on `traces`, so the sample record and the mass double loop
+            # below all read the same point from every parent.
+            for (i, trace) in pairs(traces)
+                boundary_trace_values!(levels[i], trace, physical_to_reference(trace.box, x))
             end
 
             # Record the sample. Entries are pushed in the same

@@ -94,6 +94,49 @@ end
     @test isposdef(Symmetric(Matrix(model.matrix)))
 end
 
+@testset "assembly workspace narrows its per-level basis bank" begin
+    # The hot loop reads `ws.bases[level]` once per parent per quadrature point,
+    # so a homogeneous space has to give that bank a concrete eltype: an abstract
+    # one turns the read into a dynamic dispatch that boxes the basis call's
+    # arguments. A space that genuinely mixes families widens the bank back to a
+    # common supertype and must still assemble.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    patch = box((0.25, 0.25), (0.75, 0.75))
+    homogeneous = prepare(mass(overlay(space(omega; cells=(4, 4), order=2), patch; cells=2,
+                                       order=3)))
+    @test eltype(Unfitted._assembly_workspace(homogeneous).bases) === IntegratedLegendre
+
+    mixed = prepare(mass(overlay(space(omega; cells=(4, 4), order=2), patch; cells=2, order=3,
+                                 basis=bspline())))
+    @test !isconcretetype(eltype(Unfitted._assembly_workspace(mixed).bases))
+    assemble!(mixed)
+    @test all(isfinite, mixed.matrix.nzval)
+    @test issymmetric(mixed.matrix)
+end
+
+@testset "symmetric mirror reproduces A + Aᵀ − diag(A) to the bit" begin
+    # `_matrix_from_pattern` expands a symmetric form's lower triangle in a single
+    # pass rather than materialising `A + Aᵀ − diag(A)`. The two spellings must
+    # agree exactly — same stored pattern, same bits — including on the explicit
+    # zeros Dirichlet column elimination leaves behind and on columns whose
+    # diagonal slot the pattern never allocated.
+    n = 6
+    rows = [1, 3, 6, 2, 5, 4, 5, 6, 6]
+    cols = [1, 1, 1, 2, 2, 3, 4, 5, 6]
+    vals = [2.0, -1.5, 0.0, 4.0, 3.25, -7.0, 0.5, 1.0, -0.0]
+    lower = sparse(rows, cols, vals, n, n)
+    @test nnz(lower) == length(vals)  # `sparse` kept the explicit zeros
+
+    reference = dropzeros!(lower + lower' - spdiagm(0 => diag(lower)))
+    pattern = Unfitted.AssemblyPattern(n, lower.colptr, lower.rowval, true, hash(:mirror_test))
+    mirrored = Unfitted._matrix_from_pattern(pattern, copy(lower.nzval))
+
+    @test mirrored.colptr == reference.colptr
+    @test mirrored.rowval == reference.rowval
+    @test all(map(isequal, mirrored.nzval, reference.nzval))
+    @test issymmetric(mirrored)
+end
+
 @testset "threaded assembly matches serial assembly" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(3, 3), order=2)
@@ -434,6 +477,67 @@ end
     @test length(r) == n
     @test any(!iszero, r)            # the divergence load is nontrivial
     @test all(isfinite, r)
+end
+
+@testset "q.point is numbered per region list; nquadpoints(; on=) is its size" begin
+    # `q.point` restarts at 1 for every `on=` region list, while the aggregate
+    # `kind=:facet` counter sums across every cached list. A per-point array
+    # sized by the aggregate and indexed by `q.point` would therefore leave the
+    # tail untouched and alias one boundary's points onto another's;
+    # `nquadpoints(model; on=…)` is the size that matches what a form sees.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    V = space(omega; cells=(2, 2), order=1)
+    u = field(:u, V)
+    lower = boundary(axis=1, side=:lower)
+    upper = boundary(axis=1, side=:upper)
+
+    seen_lo = Int[]
+    seen_hi = Int[]
+    probe(sink) = WeakForm(bilinear=(q, trial, c) -> 0.0,
+                           linear=(q, c) -> (push!(sink, q.point); 0.0), symmetric=true,
+                           component_aware=true)
+    lo = loadform(u, probe(seen_lo); on=lower)
+    hi = loadform(u, probe(seen_hi); on=upper)
+    model = prepare(Problem((u,); blocks=(stiffness_block(u),), loads=(lo, hi)))
+    assemble_vector(model, (lo, hi); threaded=false)
+
+    n_lo = nquadpoints(model; on=lower)
+    n_hi = nquadpoints(model; on=upper)
+    @test n_lo > 0 && n_hi > 0
+    @test sort(unique(seen_lo)) == collect(1:n_lo)
+    @test sort(unique(seen_hi)) == collect(1:n_hi)
+
+    # The aggregate counts both lists, so it is strictly larger than either
+    # form's `q.point` range — the mismatch this keyword exists to close.
+    @test nquadpoints(model; kind=:facet) == n_lo + n_hi
+    @test n_lo < nquadpoints(model; kind=:facet)
+
+    # The volume default is untouched by the new keywords.
+    @test nquadpoints(model) == nquadpoints(model; kind=:volume)
+end
+
+@testset "nquadpoints(; on=) resolves the subdomain like boundary_integral" begin
+    # Two disjoint squares with different cell counts, so each subdomain's face
+    # carries a different number of quadrature points and a wrong resolution is
+    # visible in the count alone.
+    V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(3, 3), order=2)
+    u1 = field(:u1, V1)
+    u2 = field(:u2, V2)
+    model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
+                            dirichlet=[dirichlet(0.0; on=boundary(:all), field=:u1),
+                                       dirichlet(0.0; on=boundary(:all), field=:u2)]))
+
+    all_faces = boundary(:all)
+    n1 = nquadpoints(model; on=all_faces, field=:u1)
+    n2 = nquadpoints(model; on=all_faces, field=:u2)
+    @test n1 > 0 && n2 > 0
+    @test n1 != n2                                       # distinct discretisations
+    @test nquadpoints(model; kind=:facet) == n1 + n2     # the aggregate is the sum
+
+    # Omitting `field` raises rather than answering for one subdomain, exactly
+    # as `boundary_integral` does.
+    @test_throws ArgumentError nquadpoints(model; on=all_faces)
 end
 
 @testset "per-quadrature-point index is stable across assembly and traversal" begin

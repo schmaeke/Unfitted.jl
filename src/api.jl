@@ -55,10 +55,36 @@ end
 _diffusion_flux(a::Number, ugrad::SVector{D}) where {D} = a * ugrad
 _diffusion_flux(a::UniformScaling, ugrad::SVector{D}) where {D} = a * ugrad
 
+# The tensor is copied into an `SMatrix` before the product. A heap
+# `AbstractMatrix` times a static vector takes the generic dense product,
+# which allocates its result vector on every call — and this call sits once
+# per quadrature point per trial function. The static product keeps the whole
+# contraction in registers, and copying `D²` entries is cheaper than the
+# allocation it removes. A tensor that already is an `SMatrix` is passed
+# through untouched, so that spelling pays nothing for the conversion.
+#
+# A diffusion tensor must be square for every spatial dimension, so squareness
+# is checkable the moment the form is built — before `D` is known and, more
+# importantly, before assembly spawns tasks. Deep in a threaded assembly the
+# `DimensionMismatch` below would reach the caller wrapped in a
+# `TaskFailedException`, which buries the message; here it names the offending
+# shape at the call site that supplied it. The per-point check remains as the
+# backstop for a square tensor of the wrong size.
+function _check_square_diffusion(a::AbstractMatrix)
+    size(a, 1) == size(a, 2) ||
+        throw(DimensionMismatch("diffusion tensor has size $(size(a)); expected a square matrix"))
+    return nothing
+end
+_check_square_diffusion(_) = nothing
+
+# Both products evaluate the same sum ∑ⱼ aᵢⱼ ∂ⱼu left to right, but the
+# unrolled static row sums contract to FMA under optimisation while the
+# generic ones do not, so the flux can differ from the generic product in the
+# last few ulps.
 function _diffusion_flux(a::AbstractMatrix, ugrad::SVector{D}) where {D}
     size(a) == (D, D) ||
         throw(DimensionMismatch("diffusion tensor has size $(size(a)); expected ($D, $D)"))
-    return SVector{D}(a * ugrad)
+    return SMatrix{D,D}(a) * ugrad
 end
 
 # Stiffness bilinear-channel kernel: returns a `TestChannels` whose
@@ -207,6 +233,7 @@ function mass_form(; coefficient=1)
 end
 
 function stiffness_form(; diffusion=1)
+    _check_square_diffusion(diffusion)
     diffusion_coefficient = _as_coefficient(diffusion)
     return WeakForm(bilinear=(q, trial, test_component) -> _stiffness_channels(diffusion_coefficient,
                                                                                q, trial,
@@ -227,6 +254,7 @@ end
 # `poisson` can wrap one `WeakForm` rather than carrying two and
 # combining them at the `Problem` level.
 function _poisson_form(; source, diffusion=1)
+    _check_square_diffusion(diffusion)
     source_coefficient = _as_coefficient(source)
     diffusion_coefficient = _as_coefficient(diffusion)
     return WeakForm(bilinear=(q, trial, test_component) -> _stiffness_channels(diffusion_coefficient,

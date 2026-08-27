@@ -638,19 +638,47 @@ end
     @test diag.fit_failure_count == 0   # no failures expected on this smooth Ω
 end
 
-@testset "moment-fit cache shares rules across identical regions" begin
-    # If the integration plan produces two regions with byte-identical bounds
-    # (e.g., symmetric tiling), they should share one fitted rule (cache hit
-    # → same Vector identity).
-    omega = box((0.0,), (1.0,))
-    p = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=1.0e-6, max_depth=3)
-    V = space(omega; cells=2, order=2, physical=p)
-    plan = Unfitted.integration_plan(V)
-    cut_regions = [r for r in plan.regions if r.quadrature.kind === :cut_fitted]
-    # 1D, 2 cells, Ω = left half: cell 1 is :full, cell 2 is :cut (sits across
-    # the boundary). Only one cut region, so this is more of a sanity check
-    # that the cache key construction doesn't crash.
-    @test length(cut_regions) <= 1
+@testset "moment-fit cache is the model's and is bounded by the current plan" begin
+    # The cut-region rule cache is keyed by region bounds and moment order and
+    # is owned by the `Model`, so it has two observable properties, and both are
+    # asserted here because both are load-bearing:
+    #
+    #   * it survives a `move!` — a cut region whose box the move left untouched
+    #     must reuse its fitted rule, not be refitted, which shows up as the
+    #     cached rule still being the *same object*; and
+    #   * it does not accumulate — after any lifecycle event it holds exactly
+    #     the current plan's cut regions, so a long `move!` sweep costs one
+    #     plan's rules, not the sweep's.
+    #
+    # Ω = {x ≤ 0.55} on a 4×4 base cuts the x ∈ [0.5, 0.75] column. The overlay
+    # is one cell wide on the base grid and is moved by exactly one base cell,
+    # so both configurations canonicalise to the base's own coordinates and the
+    # cut column's region boxes come out bit-identical either side of the move.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    p = physical_domain(x -> x[1] - 0.55; lipschitz=1.0, subcell_length_scale=1.0e-3, max_depth=3)
+    V = overlay(space(omega; cells=(4, 4), order=1, physical=p),
+                box((0.0, 0.0), (0.25, 0.25)); cells=(1, 1), order=1)
+    model = prepare(mass(V; coefficient=1.0))
+
+    cache = only(model.moment_fit_caches)
+    cut_regions(m) = [r for r in Unfitted.integration_plan(m).regions
+                      if r.quadrature.kind === :cut_fitted]
+    before = cut_regions(model)
+    @test !isempty(before)
+    # Bounded: one entry per cut region, and each region aliases its cached
+    # rule rather than owning a copy of it.
+    @test length(cache) == length(before)
+    cached_weights = Set(objectid(value[2]) for value in values(cache))
+    @test all(r -> objectid(r.quadrature.weights) in cached_weights, before)
+
+    kept = Dict(key => value for (key, value) in cache)
+    move!(model; level=2, to=box((0.25, 0.0), (0.5, 0.25)))
+    after = cut_regions(model)
+    @test length(cache) == length(after)
+    # Every key the move carried over kept its rule object: it was reused, not
+    # refitted. The cut column is untouched by the move, so some key does.
+    @test count(key -> haskey(cache, key), keys(kept)) > 0
+    @test all(key -> !haskey(cache, key) || cache[key] === kept[key], keys(kept))
 end
 
 @testset "cut region integrates the volume to better than stair-step" begin

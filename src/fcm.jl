@@ -33,11 +33,17 @@
 #   moments from the Saye implicit-quadrature kernel — exact and
 #   octree-depth-independent on smooth (graph-like) cut cells, machine precision
 #   for linear leaves and polytope corners. There is a single integrator: the
-#   octree stair-step moment integrator and QuESo's point-elimination /
-#   `AssembleIPs` retry are not used, because the exact kernel removes the
-#   stair-step accuracy floor those loops worked around. Non-graph-like cells
-#   (high curvature relative to the cell) are handled by the kernel's bounded
-#   subdivision, so no separate fallback path is needed.
+#   octree stair-step moment integrator, QuESo's `PointElimination` inner loop
+#   and its accuracy-driven `AssembleIPs` retry are not used, because the exact
+#   kernel removes the stair-step accuracy floor those loops worked around.
+#   Non-graph-like cells (high curvature relative to the cell) are handled by the
+#   kernel's bounded subdivision, so no separate fallback path is needed.
+#
+#   `moment_fit_rule` does carry an outer retry of its own, and it is a different
+#   mechanism from QuESo's: a bounded three-attempt densification of the NNLS
+#   candidate cloud, there purely for the conditioning of the least-squares
+#   solve. It never searches for points to eliminate from a fitted rule, and
+#   never deepens the subdivision the kernel is allowed.
 #
 # Pipeline summary
 #
@@ -78,11 +84,20 @@ The Bro & de Jong (1997) Fast NNLS variant (`alg = :fnnls`) works on the
 `npoints × npoints` Gram matrix instead and is faster only when `npoints` is
 small; at our typical `npoints` of several thousand it is far slower.
 
+`max_iter` is raised to `10 · npoints` from the library default of
+`3 · npoints`. Lawson–Hanson stays feasible at every step, so reaching the cap
+is not a wrong answer — but the library announces it by printing
+`NNLS quitting on iteration count` to stdout, and a library call has no business
+writing there. The cells that reach it (a 3-D order-3 sphere is the case this
+was found on) overrun the default by a few percent, so the wider cap lets the
+active-set walk finish instead of being cut short. Raising a cap cannot change a
+solve that converged under the old one: the cap only ever truncates.
+
 Allocations are owned by `NonNegLeastSquares.jl`; `A` and `b` are not mutated,
 so the name carries no `!`.
 """
 function nnls(A::AbstractMatrix{T}, b::AbstractVector{T}) where {T<:Real}
-    x = vec(nonneg_lsq(A, b; alg=:nnls))
+    x = vec(nonneg_lsq(A, b; alg=:nnls, max_iter=10 * size(A, 2)))
     residual = norm(A * x - b)
     return x, residual
 end

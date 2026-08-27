@@ -291,6 +291,31 @@ function _level_side_is_physical(level::Level{D,T}, domain::AxisBox{D,T}, axis::
     throw(ArgumentError("boundary side must be :lower or :upper"))
 end
 
+# Cells of `level` along `axis` incident to the axis-`axis` factor of a dof key,
+# clipped to the `n[axis]` cells the level has: a `_AXIS_NODE` factor at index
+# `i` touches cells `i − 1` and `i`, since a node sits between two adjacent
+# cells along its axis; a `_AXIS_SPAN` (bubble) factor at index `k` touches
+# only cell `k`, since a bubble mode is cell-local.
+#
+# This is the integrated-Legendre node-to-cell support map, and it is the one
+# place it is written down: `_incident_cells` applies it on every axis, and
+# `_perp_ranges` applies it on every axis but one. The B-spline family in the
+# extension has its own support map — a function's span can cover many cells —
+# and never routes through here.
+function _axis_incidence(axis_key::AxisDofKey, ncells::Int)
+    axis_key.kind == _AXIS_NODE || return axis_key.index:axis_key.index
+    return max(1, axis_key.index - 1):min(ncells, axis_key.index)
+end
+
+# Incidence ranges of `key` on every axis *except* `axis`, which is pinned to
+# `1:1` so a `CartesianIndices` over the result enumerates the perpendicular
+# positions of a candidate face along `axis` exactly once. The `axis` slot of
+# each enumerated index is a placeholder the caller replaces with the cell
+# position on either side of the face.
+function _perp_ranges(key::TensorDofKey{D}, axis::Integer, n::NTuple{D,Int}) where {D}
+    return ntuple(d -> d == axis ? (1:1) : _axis_incidence(key.axes[d], n[d]), D)
+end
+
 # True iff the cell whose axis-`axis` index is `pos` (with the other-axis
 # indices drawn from `outer`, ignoring the axis-`axis` slot) is in bounds
 # and active under the level's `LevelMask`. Used by `_on_active_face` to
@@ -304,41 +329,19 @@ end
 
 # True iff the `_AXIS_NODE` factor of `key` at axis `axis`, node index
 # `i`, lies on a face that separates an active cell from an
-# off-mesh-or-inactive cell on the other side. "Perpendicular" positions
-# in the other axes come from the key's own incidence:
+# off-mesh-or-inactive cell on the other side. The perpendicular positions
+# come from the key's own incidence (`_perp_ranges`); for each of them,
+# sample the activity of the cells immediately below (`i − 1`) and above
+# (`i`) the candidate face along `axis`. A change in activity ⇒ the face is
+# between an active and an inactive cell of the level, i.e. an
+# active-region face.
 #
-#   * a `_AXIS_NODE` factor at index `j` contributes cells `j − 1` and
-#     `j` (whichever are in bounds), since a node sits between two
-#     adjacent cells along its axis;
-#   * a `_AXIS_SPAN` factor at index `k` contributes only cell `k`,
-#     since a span (bubble) mode is cell-local.
-#
-# For each perpendicular `outer` position, sample the activity of the
-# cells immediately below (`i − 1`) and above (`i`) the candidate face
-# along `axis`. A change in activity ⇒ the face is between an active
-# and an inactive cell of the level, i.e. an active-region face.
-#
-# Integrated-Legendre-specific: the node-to-cell support map and the
-# `_AXIS_NODE` / `_AXIS_SPAN` perpendicular incidence rules are
-# integrated-Legendre conventions. The B-spline family in the extension
-# rolls its own active-face check tied to the function's actual support
-# span, which can spread across many cells.
+# Integrated-Legendre-specific, because the incidence rule is. The B-spline
+# family in the extension rolls its own active-face check tied to the
+# function's actual support span, which can spread across many cells.
 function _on_active_face(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
                          axis::Integer, i::Integer, n::NTuple{D,Int}) where {D,T}
-    ranges = ntuple(D) do d
-        if d == axis
-            1:1
-        else
-            kd = key.axes[d]
-            if kd.kind == _AXIS_NODE
-                j = kd.index
-                max(1, j-1):min(n[d], j)
-            else
-                kd.index:kd.index
-            end
-        end
-    end
-    for outer in CartesianIndices(ranges)
+    for outer in CartesianIndices(_perp_ranges(key, axis, n))
         below_active = _cell_active(level, axis, i - 1, outer.I, n)
         above_active = _cell_active(level, axis, i, outer.I, n)
         below_active != above_active && return true
@@ -419,15 +422,7 @@ function _internal_face_is_physical(key::TensorDofKey{D}, level::Level{D,T,<:Int
                                     physical, axis::Integer, i::Integer, n::NTuple{D,Int},
                                     cache::_ClassifyCache{D,T}) where {D,T}
     physical === nothing && return true
-    ranges = ntuple(D) do d
-        if d == axis
-            1:1
-        else
-            kd = key.axes[d]
-            kd.kind == _AXIS_NODE ? (max(1, kd.index-1):min(n[d], kd.index)) : (kd.index:kd.index)
-        end
-    end
-    for outer in CartesianIndices(ranges)
+    for outer in CartesianIndices(_perp_ranges(key, axis, n))
         below_active = _cell_active(level, axis, i - 1, outer.I, n)
         above_active = _cell_active(level, axis, i, outer.I, n)
         below_active == above_active && continue
@@ -486,16 +481,10 @@ end
 
 # ── Order-reduction (coverage) constraint source ─────────────────────────────
 
-# Cells of `level` incident to the entity of `key`, reconstructed from the per-axis
-# node/span structure: a NODE factor at index i touches cells i-1 and i (whichever are
-# in bounds); a SPAN (bubble) factor at index k touches only cell k. Mirrors the
-# perpendicular incidence used by `_on_active_face`.
+# Cells of `level` incident to the entity of `key`, from the per-axis incidence
+# rule of `_axis_incidence` applied on every axis.
 function _incident_cells(key::TensorDofKey{D}, n::NTuple{D,Int}) where {D}
-    ranges = ntuple(D) do d
-        a = key.axes[d]
-        a.kind == _AXIS_NODE ? (max(1, a.index-1):min(n[d], a.index)) : (a.index:a.index)
-    end
-    return CartesianIndices(ranges)
+    return CartesianIndices(ntuple(d -> _axis_incidence(key.axes[d], n[d]), D))
 end
 
 """
@@ -788,6 +777,8 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     # diagnostics can pick an order-reduced or deduped raw out. Overlay-boundary
     # (and multi-raw B-spline) eliminations are not recorded here — they fall
     # through to the `:overlay` default when `elimination_source` is built below.
+    # The loop below keeps that split honest: a raw the overlay condition already
+    # eliminates never reaches this map, whichever source names it second.
     source_of = Dict{Int,Symbol}()
     reduce_any = any(level -> level.reduce_order, V.levels)
     coverage = reduce_any ? build_coverage(V, tolerance, classify_cache) :
@@ -795,12 +786,29 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     for level in V.levels
         level_keys = get(keys_by_level, level.id, empty_keys)
         # Source 1: the artificial-overlay-boundary trace condition (every family).
-        append!(constraints,
-                _overlay_constraints(level, V, tolerance, raw_by_key, level_keys, classify_cache))
+        overlay_constraints = _overlay_constraints(level, V, tolerance, raw_by_key, level_keys,
+                                                   classify_cache)
+        append!(constraints, overlay_constraints)
         # Source 2: order reduction in covered regions (opt-in per level).
+        #
+        # A raw on Γ_o that is also buried carries both constraints. The overlay
+        # one is queued first and strongly eliminates the raw, which leaves the
+        # coverage constraint trivially satisfied — so recording it as the
+        # elimination source would credit order reduction with a raw it did not
+        # save, and `reduced_mode_counts` would over-report. Skipping the
+        # redundant constraint leaves `raw_expansion` untouched:
+        # `_resolve_constraints!` substitutes the already-eliminated raw, gets an
+        # empty term list, and drops the constraint anyway. Only single-raw
+        # overlay constraints eliminate a named raw outright; a multi-raw
+        # (B-spline) constraint picks its pivot during resolution, and that
+        # family emits no coverage constraints at all.
         if level.reduce_order
-            for (c, src) in _coverage_constraints(level, V, coverage, tolerance, level_keys,
-                                                  classify_cache)
+            reductions = _coverage_constraints(level, V, coverage, tolerance, level_keys,
+                                               classify_cache)
+            overlay_raws = isempty(reductions) ? Set{Int}() :
+                           Set{Int}(c.raws[1] for c in overlay_constraints if length(c.raws) == 1)
+            for (c, src) in reductions
+                c.raws[1] in overlay_raws && continue
                 push!(constraints, c)
                 source_of[c.raws[1]] = src
             end

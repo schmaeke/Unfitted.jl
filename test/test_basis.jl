@@ -33,14 +33,18 @@ end
           [CartesianIndex(0, 0), CartesianIndex(1, 0), CartesianIndex(0, 1), CartesianIndex(1, 1),
            CartesianIndex(0, 2), CartesianIndex(1, 2)]
 
-    values = Unfitted.basis_values(basis, (1, 1), (0.25, -0.5))
+    # `basis_values` carries the parent cell in its signature for every family;
+    # integrated Legendre ignores it, so any in-bounds index does here.
+    values = Unfitted.basis_values(basis, (1, 1), :tensor, (0.25, -0.5), CartesianIndex(1, 1))
     @test length(values) == 4
     @test sum(values) ≈ 1.0
 
-    values3 = Unfitted.basis_values(basis, (1, 2, 1), (0.0, 0.25, -0.25))
+    values3 = Unfitted.basis_values(basis, (1, 2, 1), :tensor, (0.0, 0.25, -0.25),
+                                    CartesianIndex(1, 1, 1))
     @test length(values3) == 12
 
-    values4 = Unfitted.basis_values(basis, (1, 1, 1, 1), (0.0, 0.1, -0.2, 0.3))
+    values4 = Unfitted.basis_values(basis, (1, 1, 1, 1), :tensor, (0.0, 0.1, -0.2, 0.3),
+                                    CartesianIndex(1, 1, 1, 1))
     @test length(values4) == 16
     @test sum(values4) ≈ 1.0
 end
@@ -67,9 +71,17 @@ end
     @test CartesianIndex(2, 2) ∈ Unfitted.local_basis_indices(basis, (4, 4), :trunk)
     @test_throws ArgumentError Unfitted.local_basis_indices(basis, (2, 3), :trunk)
 
-    values = Unfitted.basis_values(basis, (1, 1), :trunk, (0.2, -0.3))
+    values = Unfitted.basis_values(basis, (1, 1), :trunk, (0.2, -0.3), CartesianIndex(1, 1))
     @test length(values) == 4
     @test sum(values) ≈ 1.0
+
+    # Mode validation is family-aware: integrated Legendre is the family that
+    # declares `:trunk`, and a mode name no family defines is rejected by the
+    # family-blind gate the family-aware form delegates to. The B-spline suite
+    # covers the other branch — a defined mode a family does not carry.
+    @test Unfitted._supported_modes(basis) == (:tensor, :trunk)
+    @test Unfitted._check_basis_mode(basis, :trunk, (2, 2)) === :trunk
+    @test_throws ArgumentError Unfitted._check_basis_mode(basis, :serendipity, (2, 2))
 
     lower = Unfitted.boundary_basis_indices(basis, (2, 2); axis=1, side=:lower, mode=:trunk)
     @test length(lower) == 3
@@ -78,29 +90,36 @@ end
 
 @testset "tensor basis gradients" begin
     basis = IntegratedLegendre()
-    gradients1 = Unfitted.reference_basis_gradients(basis, (2,), (0.25,))
+    # A cell whose edge length is 2 in every axis *is* the reference cell, so
+    # its chain-rule factor `2 / h_d` is 1 and the physical gradient the single
+    # entry point returns is the bare reference gradient ∂N_α/∂ξ.
+    reference1 = box((-1.0,), (1.0,))
+    gradients1 = Unfitted.physical_basis_gradients(basis, (2,), :tensor, reference1, (0.25,),
+                                                   CartesianIndex(1))
     @test length(gradients1) == 3
     @test gradients1[1][1] ≈ -0.5
     @test gradients1[2][1] ≈ 0.5
 
     order = (2, 2)
     ξ = (0.15, -0.35)
-    values_plus = similar(Unfitted.basis_values(basis, order, ξ))
-    values_minus = similar(values_plus)
-    gradients = Unfitted.reference_basis_gradients(basis, order, ξ)
+    at = CartesianIndex(1, 1)
+    reference2 = box((-1.0, -1.0), (1.0, 1.0))
+    gradients = Unfitted.physical_basis_gradients(basis, order, :tensor, reference2, ξ, at)
     h = 1.0e-6
 
-    Unfitted.basis_values!(basis, values_plus, order, (ξ[1] + h, ξ[2]))
-    Unfitted.basis_values!(basis, values_minus, order, (ξ[1] - h, ξ[2]))
+    values_plus = Unfitted.basis_values(basis, order, :tensor, (ξ[1] + h, ξ[2]), at)
+    values_minus = Unfitted.basis_values(basis, order, :tensor, (ξ[1] - h, ξ[2]), at)
     for i in eachindex(gradients)
         @test gradients[i][1] ≈ (values_plus[i] - values_minus[i]) / (2h) rtol = 1.0e-7 atol = 1.0e-8
     end
 
     cell = box((2.0, -1.0), (4.0, 3.0))
-    physical = Unfitted.physical_basis_gradients(basis, order, cell, ξ)
+    physical = Unfitted.physical_basis_gradients(basis, order, :tensor, cell, ξ, at)
     @test physical[1] ≈ gradients[1] .* (2 ./ Unfitted.edge_lengths(cell))
 
-    gradients3 = Unfitted.reference_basis_gradients(basis, (1, 1, 1), (0.2, -0.1, 0.4))
+    reference3 = box((-1.0, -1.0, -1.0), (1.0, 1.0, 1.0))
+    gradients3 = Unfitted.physical_basis_gradients(basis, (1, 1, 1), :tensor, reference3,
+                                                   (0.2, -0.1, 0.4), CartesianIndex(1, 1, 1))
     @test length(gradients3) == 8
     @test length(gradients3[1]) == 3
 end

@@ -191,26 +191,42 @@ end
 # concretely typed, so `Q === Nothing` folds the branch away and the default
 # path is the moment fit and nothing else.
 #
-# The cache is per-plan, where `V.physical` is fixed; the cache key need
-# not include it.
+# The cache belongs to one *space*, not to one plan. Within a single plan it
+# can never hit: `_merged_boxes` emits pairwise-disjoint boxes, so no two
+# regions share a key. Its value is across plan rebuilds — a `move!` leaves
+# the great majority of cut boxes bit-identical, and refitting one costs
+# hundreds of milliseconds in 3D — so [`Model`](@ref) owns one per distinct
+# participating space and threads it back in through every rebuild. That
+# scope also keeps the key honest: a space's `PhysicalDomain` is immutable
+# and is carried unchanged through `moved_space` / `_remasked_space`, so one
+# cache sees exactly one `physical` for its whole life and the key need not
+# include it. `_prefit_cut_rules!` bounds the cache to the current plan's
+# regions, so a long `move!` sweep holds one plan's rules, not the sweep's.
 const _MomentFitKey{D,T} = Tuple{SVector{D,T},SVector{D,T},NTuple{D,Int}}
 const _MomentFitValue{D,T} = Tuple{Vector{SVector{D,T}},Vector{T},T,Symbol}
+const _MomentFitCache{D,T} = Dict{_MomentFitKey{D,T},_MomentFitValue{D,T}}
 
-function _cached_moment_fit!(cache::Dict{_MomentFitKey{D,T},_MomentFitValue{D,T}},
-                             physical::PhysicalDomain, box::AxisBox{D,T},
-                             moment_order::NTuple{D,Int}) where {D,T}
-    key = (box.lower, box.upper, moment_order)
-    return get!(cache, key) do
-        rule = physical.cut_quadrature
-        phys_pts, phys_ws, residual, status = rule === nothing ?
-                                              moment_fit_rule(physical, box, moment_order;
-                                                              target_residual=physical.target_residual) :
-                                              rule(physical, box, moment_order)
-        jac = volume(box) / convert(T, 2^D)
-        ref_pts = [physical_to_reference(box, p) for p in phys_pts]
-        ref_ws = T[w / jac for w in phys_ws]
-        (ref_pts, ref_ws, T(residual), status)
-    end
+# The rule itself, off the cache: the moment fit (or the user's
+# `cut_quadrature`) followed by the reference-frame mapping described above.
+# Split out of `_cached_moment_fit!` so `_prefit_cut_rules!` can run the very
+# same conversion from another thread, with no `Dict` in reach.
+function _fit_moment_rule(physical::PhysicalDomain, box::AxisBox{D,T},
+                          moment_order::NTuple{D,Int}) where {D,T}
+    rule = physical.cut_quadrature
+    phys_pts, phys_ws, residual, status = rule === nothing ?
+                                          moment_fit_rule(physical, box, moment_order;
+                                                          target_residual=physical.target_residual) :
+                                          rule(physical, box, moment_order)
+    jac = volume(box) / convert(T, 2^D)
+    ref_pts = [physical_to_reference(box, p) for p in phys_pts]
+    ref_ws = T[w / jac for w in phys_ws]
+    return (ref_pts, ref_ws, T(residual), status)
+end
+
+function _cached_moment_fit!(cache::_MomentFitCache{D,T}, physical::PhysicalDomain,
+                             box::AxisBox{D,T}, moment_order::NTuple{D,Int}) where {D,T}
+    return get!(() -> _fit_moment_rule(physical, box, moment_order), cache,
+                (box.lower, box.upper, moment_order))
 end
 
 # Build the region quadrature for one admissible box, dispatching on the
@@ -241,7 +257,7 @@ end
 function _build_region_quadrature(V::Space{D,T}, box::AxisBox{D,T}, parents,
                                   tensor_cache::Dict{NTuple{D,Int},TensorQuadrature{D,T}},
                                   alpha_cache::Dict{NTuple{D,Int},Vector{T}},
-                                  moment_fit_cache::Dict{_MomentFitKey{D,T},_MomentFitValue{D,T}},
+                                  moment_fit_cache::_MomentFitCache{D,T},
                                   classify_cache::_ClassifyCache{D,T}) where {D,T}
     counts = _parent_quadrature_counts(Val(D), parents, id -> _level_by_id(V, id))
     base_rule = _cached_tensor_quadrature!(tensor_cache, counts, T)
@@ -398,6 +414,53 @@ end
 # Gauss rule remains exact. The greedy order of axes can change the
 # *shape* of the resulting boxes (the same volume can be packed many
 # ways) but never their *total* volume or their numerical contribution.
+#
+# Steps 3–4 are split across the three small helpers below rather than
+# written as one flat loop. That split is load-bearing, not style. The
+# greedy merge's running upper corner `hi` is reassigned on every
+# extension *and* read inside `ntuple` closures; written in one frame,
+# Julia heap-boxes it as a `Core.Box`, rebuilds the box on each extension
+# and turns every read into a dynamic dispatch. In that form this single
+# variable accounted for 95% of `integration_plan`'s allocations, on a
+# path `prepare`, `move!` and `activate!` all run. The helpers restore the
+# separation the compiler needs: every frame that *closes over* `hi`
+# receives it as an argument and never writes it, and the one frame that
+# writes it (`_extend_axis`) closes over nothing. Do not fold them back
+# inline.
+
+# Does the candidate slab one step past `hi` along axis `d` join the box
+# seeded at `start`? It does when every candidate in the slab is unvisited
+# and carries the seed signature `sig0`.
+function _slab_matches(sigs, visited, start::NTuple{D,Int}, hi::NTuple{D,Int}, sig0, d::Int,
+                       next::Int) where {D}
+    slab = CartesianIndices(ntuple(e -> e == d ? (next:next) : (start[e]:hi[e]), D))
+    return all(c -> !visited[c] && sigs[c] == sig0, slab)
+end
+
+# Extend `hi` along axis `d` for as long as successive slabs keep matching.
+function _extend_axis(sigs, visited, ranges::NTuple{D,Int}, start::NTuple{D,Int},
+                      hi::NTuple{D,Int}, sig0, d::Int) where {D}
+    while hi[d] < ranges[d]
+        next = hi[d] + 1
+        _slab_matches(sigs, visited, start, hi, sig0, d, next) || break
+        hi = Base.setindex(hi, next, d)
+    end
+    return hi
+end
+
+# Mark every candidate of the merged box `start:hi` visited and push the
+# box's physical extent.
+function _emit_merged_box!(boxes::Vector{AxisBox{D,T}}, visited, intervals,
+                           start::NTuple{D,Int}, hi::NTuple{D,Int}) where {D,T}
+    for c in CartesianIndices(ntuple(e -> start[e]:hi[e], D))
+        visited[c] = true
+    end
+    lower = SVector{D,T}(ntuple(d -> intervals[d][start[d]][1], D))
+    upper = SVector{D,T}(ntuple(d -> intervals[d][hi[d]][2], D))
+    push!(boxes, AxisBox{D,T}(lower, upper))
+    return boxes
+end
+
 function _merged_boxes(levels, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
     intervals = _axis_intervals(levels, Val(D), tol)
     ranges = ntuple(d -> length(intervals[d]), D)
@@ -417,25 +480,14 @@ function _merged_boxes(levels, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
     visited = falses(ranges)
     for start in CartesianIndices(ranges)
         visited[start] && continue
-        sig0 = sigs[start]
-        hi = start
         # Greedy axis-by-axis extension: extend along axis `d` as far as
         # the next slab of candidates matches the seed signature, then
         # repeat for the next axis. The merge never backtracks.
+        hi = start.I
         for d in 1:D
-            while hi.I[d] < ranges[d]
-                next = hi.I[d] + 1
-                slab = CartesianIndices(ntuple(e -> e == d ? (next:next) : (start.I[e]:hi.I[e]), D))
-                all(c -> !visited[c] && sigs[c] == sig0, slab) || break
-                hi = CartesianIndex(ntuple(e -> e == d ? next : hi.I[e], D))
-            end
+            hi = _extend_axis(sigs, visited, ranges, start.I, hi, sigs[start], d)
         end
-        for c in CartesianIndices(ntuple(e -> start.I[e]:hi.I[e], D))
-            visited[c] = true
-        end
-        lower = SVector{D,T}(ntuple(d -> intervals[d][start.I[d]][1], D))
-        upper = SVector{D,T}(ntuple(d -> intervals[d][hi.I[d]][2], D))
-        push!(boxes, AxisBox{D,T}(lower, upper))
+        _emit_merged_box!(boxes, visited, intervals, start.I, hi)
     end
     return boxes
 end
@@ -516,9 +568,11 @@ end
 #                      (the strict criterion used by full-superposition
 #                      diagnostics).
 #   - `criterion isa Function` — caller-supplied predicate, called as
-#                      `criterion(parents)` and returning `Bool`. Used
-#                      by projection to encode source / target coverage
-#                      requirements.
+#                      `criterion(parents)` and returning `Bool`. The
+#                      escape hatch for a coverage rule the two symbols
+#                      do not express; no in-tree caller uses it, and it
+#                      reaches the plan through `prepare(problem;
+#                      criterion = …)`.
 function _criterion_satisfied(parents, level_count::Int, criterion)
     if criterion === :any_parent
         return !isempty(parents)
@@ -533,10 +587,61 @@ end
 
 # ── Plan construction ─────────────────────────────────────────────────────────
 
+# Fit every cut region's moment rule before the region loop consumes any of
+# them, in parallel, and reduce the cache to exactly this plan's regions.
+#
+# At the default `moment_order_factor = 2` the fits *are* the plan: 99.9% of a
+# 3D build, tens of seconds over a few dozen cut cells. They are also
+# independent of one another — `moment_fit_rule` reads the immutable
+# `PhysicalDomain` and the region box and touches nothing else — so the only
+# obstacle to running them in parallel is the two `Dict`s, and neither is in
+# reach of the parallel loop: classification runs first and serially (it is
+# memoised, and a `Dict` is not thread-safe), each fit writes its own slot of a
+# pre-sized vector, and the cache is filled afterwards, serially. The region
+# loop then runs exactly as before, in region order, on nothing but cache hits,
+# so region order, `residual_max` and the small-overlap bookkeeping are the
+# serial path's, bit for bit.
+#
+# A user `cut_quadrature` is fitted serially instead. It is caller code under
+# no thread-safety contract — the package's own test rule counts its calls
+# through a shared `Ref` — so the package does not unilaterally run it on N
+# threads. It still gets the dedup and the cross-plan reuse.
+#
+# `live` is the plan's whole cut-key set, not just its misses, because
+# restricting the cache to it afterwards is what holds a cache threaded through
+# a long `move!` sweep to one plan's worth of rules instead of the sweep's.
+# On exit the cache is exactly this plan's cut regions.
+function _prefit_cut_rules!(cache::_MomentFitCache{D,T}, V::Space{D,T}, admissible,
+                            classify_cache::_ClassifyCache{D,T}) where {D,T}
+    physical = V.physical
+    physical === nothing && return cache
+    live = Set{_MomentFitKey{D,T}}()
+    for (box, parents) in admissible
+        classify_cell(physical, box, classify_cache) === :cut || continue
+        push!(live, (box.lower, box.upper, _moment_order_for_region(V, parents)))
+    end
+    pending = _MomentFitKey{D,T}[key for key in live if !haskey(cache, key)]
+    fitted = Vector{_MomentFitValue{D,T}}(undef, length(pending))
+    fit(key) = _fit_moment_rule(physical, AxisBox{D,T}(key[1], key[2]), key[3])
+    if physical.cut_quadrature === nothing
+        Threads.@threads for i in eachindex(pending)
+            fitted[i] = fit(pending[i])
+        end
+    else
+        map!(fit, fitted, pending)
+    end
+    for i in eachindex(pending)
+        cache[pending[i]] = fitted[i]
+    end
+    filter!(entry -> entry.first in live, cache)
+    return cache
+end
+
 """
     integration_plan(V::Space; tolerance=GeometryTolerance(T),
                                criterion=:any_parent,
-                               classify_cache=_ClassifyCache{D,T}()) -> IntegrationPlan
+                               classify_cache=_ClassifyCache{D,T}(),
+                               moment_fit_cache=_MomentFitCache{D,T}()) -> IntegrationPlan
 
 Build the [`IntegrationPlan`](@ref) for a [`Space`](@ref). The plan carries
 every admissible integration region the assembly path will iterate over,
@@ -576,18 +681,33 @@ Keyword arguments:
     any axis is rejected rather than silently decimated (step 0). Small
     geometry is fully supported; it needs a `merge` below its own spacing.
   - `criterion` — `:any_parent` (default), `:all_levels`, or a function
-    `parents -> Bool`. See `_criterion_satisfied` for the semantics.
+    `parents -> Bool`. See `_criterion_satisfied` for the semantics. The
+    predicate form is an escape hatch for a coverage rule the two symbols do
+    not express; it is reached through `prepare(problem; criterion = …)` and,
+    like every plan option, survives `move!` and `activate!` because
+    [`Model`](@ref) replays its captured `plan_options`.
   - `classify_cache` — optional classification cache shared with the
     cell-level fictitious fold. Pass the same cache through
     `_apply_physical_fold` so the per-cell verdicts computed there can
     be reused at the region level.
+  - `moment_fit_cache` — optional cut-region rule cache, keyed by region
+    bounds and moment order. Pass the same cache across successive plans
+    for one space — [`Model`](@ref) does, through every `move!` and
+    `activate!` — so a cut region the mutation left unchanged reuses its
+    rule instead of being refitted. On return the cache holds exactly this
+    plan's cut regions.
 
-The function is called by `prepare`, `move!`, and `_update_mask!` in
-`assembly.jl`, and once more by the projection plumbing in
-`projection.jl` (with a wider `criterion`).
+The function is called by `prepare`, `move!`, and `_update_mask!`, all in
+`src/model.jl`, which own the plan a [`Model`](@ref) carries; `assembly.jl` and
+`postprocessing.jl` only read that cached plan back through the
+[`integration_plan`](@ref) / [`integration_plans`](@ref) accessors. The
+projection path in `projection.jl` builds no plan at all: it reuses this file's
+admissible-box partition (`_merged_boxes`, `_parents_covering`) directly and
+keeps every box the target covers, without a `criterion`.
 """
 function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criterion=:any_parent,
-                          classify_cache=_ClassifyCache{D,T}()) where {D,T}
+                          classify_cache=_ClassifyCache{D,T}(),
+                          moment_fit_cache=_MomentFitCache{D,T}()) where {D,T}
     # Reject a merge tolerance that cannot resolve the meshes it is about to
     # canonicalise, before a single region is built. See `_check_axis_spacing`.
     _check_axis_spacing(V.levels, Val(D), tolerance)
@@ -596,16 +716,23 @@ function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criteri
     small_overlaps = SmallOverlap{T}[]
     tensor_cache = Dict{NTuple{D,Int},TensorQuadrature{D,T}}()
     alpha_cache = Dict{NTuple{D,Int},Vector{T}}()
-    moment_fit_cache = Dict{_MomentFitKey{D,T},_MomentFitValue{D,T}}()
     domain_volume = volume(V.domain)
     residual_max = 0.0
 
+    # Find covering parents and apply the keep-criterion before touching the
+    # (potentially expensive) quadrature dispatch, then fit every cut region's
+    # rule up front. Both passes leave the region loop below alone: it still
+    # walks the admissible regions in construction order, and every moment fit
+    # it asks for is a cache hit. See `_prefit_cut_rules!`.
+    admissible = Tuple{AxisBox{D,T},Vector{ParentRef{D,T}}}[]
     for box in _merged_boxes(V.levels, Val(D), tolerance)
-        # Find covering parents and apply the keep-criterion before
-        # touching the (potentially expensive) quadrature dispatch.
         parents = _parents_covering(V.levels, box, tolerance)
-        _criterion_satisfied(parents, length(V.levels), criterion) || continue
+        _criterion_satisfied(parents, length(V.levels), criterion) &&
+            push!(admissible, (box, parents))
+    end
+    _prefit_cut_rules!(moment_fit_cache, V, admissible, classify_cache)
 
+    for (box, parents) in admissible
         # Dispatch on PhysicalDomain classification; a `nothing`
         # quadrature signals a strict-α fictitious drop.
         quadrature, residual = _build_region_quadrature(V, box, parents, tensor_cache, alpha_cache,

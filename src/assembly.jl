@@ -350,18 +350,80 @@ function _assembly_pattern!(model::Model, blocks, symmetric::Bool)
     return pattern
 end
 
+# Mirror a symmetric form's lower-triangular CSC arrays — `rowval` holds
+# only rows `i ≥ j`, which is what `_gustavson_pattern` emits under
+# `symmetric` — into the full symmetric matrix, in one pass.
+#
+# The obvious spelling, `A + Aᵀ − diag(A)`, materialises five full-size
+# temporaries: the transpose, the sum, the dense diagonal, the sparse
+# diagonal, and the difference. That is invisible in a wall-clock profile
+# but dominates the allocation of a Newton or transient loop reassembling
+# the same pattern over and over. The pass below allocates only what it
+# returns.
+#
+# Column `j` of the result holds, in this order, the mirrors of the
+# strictly-lower entries of row `j` (one per entry `(j, j′)` of `A` with
+# `j′ < j`) and then column `j`'s own entries, rows `i ≥ j`, which `A`
+# already stores ascending. Sweeping the source columns in increasing `j`
+# and appending each entry `(i, j)` to column `j` and — when `i > j` —
+# its mirror to column `i` produces exactly that order with no sort:
+# every mirror written into column `i` comes from a source column `j < i`,
+# so all of them land before the sweep reaches column `i`'s own entries,
+# and they arrive with strictly increasing row index `j`.
+#
+# Values are copied, never combined, so the result matches the
+# `A + Aᵀ − diag(A)` spelling to the bit: an off-diagonal entry is a single
+# term either way, and the diagonal's `2d − d` is exact in IEEE arithmetic.
+# The two differ only in which numerically-zero slots they store — the sum
+# also materialises every diagonal slot and both triangles' explicit zeros —
+# and `_matrix_from_pattern` runs `dropzeros!` over either, which removes
+# exactly those.
+function _mirror_lower(n::Int, colptr::Vector{Int}, rowval::Vector{Int},
+                       nzval::Vector{T}) where {T}
+    # Count first: every source entry occupies a slot in its own column, and a
+    # strictly-lower one occupies a second slot in the column it mirrors into.
+    # Counts land in `full_colptr[j + 1]`; the prefix sum turns them into offsets.
+    full_colptr = zeros(Int, n + 1)
+    @inbounds for j in 1:n, k in colptr[j]:(colptr[j + 1] - 1)
+        full_colptr[j + 1] += 1
+        rowval[k] > j && (full_colptr[rowval[k] + 1] += 1)
+    end
+    full_colptr[1] = 1
+    @inbounds for j in 1:n
+        full_colptr[j + 1] += full_colptr[j]
+    end
+
+    pos = full_colptr[1:n]  # per-column write cursor
+    full_rowval = Vector{Int}(undef, full_colptr[n + 1] - 1)
+    full_nzval = Vector{T}(undef, length(full_rowval))
+    @inbounds for j in 1:n, k in colptr[j]:(colptr[j + 1] - 1)
+        i = rowval[k]
+        v = nzval[k]
+        full_rowval[pos[j]] = i
+        full_nzval[pos[j]] = v
+        pos[j] += 1
+        if i > j
+            full_rowval[pos[i]] = j
+            full_nzval[pos[i]] = v
+            pos[i] += 1
+        end
+    end
+    return SparseMatrixCSC(n, n, full_colptr, full_rowval, full_nzval)
+end
+
 # Assemble the final sparse matrix from a filled `nzval` buffer and the
-# cached pattern. `colptr`/`rowval` are copied so the cached pattern is
-# never mutated by `dropzeros!`; `nzval` is taken by reference (safe
-# because the caller's `ScatterSink` is single-use). Symmetric forms are
-# scattered in the
-# lower triangle and mirrored here as `A + Aᵀ − diag`; `dropzeros!`
-# collapses the explicit zeros left by Dirichlet column elimination and
-# any structurally-present-but-untouched pattern slots.
+# cached pattern. An unsymmetric form copies `colptr`/`rowval` so the
+# cached pattern is never mutated by `dropzeros!` and takes `nzval` by
+# reference (safe because the caller's `ScatterSink` is single-use); a
+# symmetric one was scattered in the lower triangle only, and
+# `_mirror_lower` builds fresh arrays for the full matrix. `dropzeros!`
+# then collapses the explicit zeros left by Dirichlet column elimination
+# and any structurally-present-but-untouched pattern slots.
 function _matrix_from_pattern(pattern::AssemblyPattern, nzval::Vector{T}) where {T}
-    matrix = SparseMatrixCSC(pattern.n, pattern.n, copy(pattern.colptr), copy(pattern.rowval),
+    matrix = pattern.symmetric ?
+             _mirror_lower(pattern.n, pattern.colptr, pattern.rowval, nzval) :
+             SparseMatrixCSC(pattern.n, pattern.n, copy(pattern.colptr), copy(pattern.rowval),
                              nzval)
-    pattern.symmetric && (matrix = matrix + matrix' - spdiagm(0 => diag(matrix)))
     dropzeros!(matrix)
     return matrix
 end
@@ -618,16 +680,20 @@ function _field_parent_data(V, layout::FieldLayout, parents; gradients::Bool=tru
 end
 
 """
-    AssemblyWorkspace{D,T}
+    AssemblyWorkspace{D,T,B}
 
 Thread-local assembly scratch. Carries every buffer the hot loop needs:
 
-  - `bases[i]`     — basis family of level `i`. Looked up by level id so
-    the hot-loop `_fill_factor_tables!` dispatch resolves through one
-    abstract-container access per parent per quadrature point. The
-    container is `Vector{BasisFamily}` (abstract eltype) because a
-    superposition can mix families across levels; the JIT specializes
-    the callee per resolved type.
+  - `bases[i]`     — basis family of level `i`, read by level id once per
+    parent per quadrature point to dispatch `_fill_factor_tables!`. The
+    bank is `Vector{B}` for the narrowest eltype the space's families
+    share — `IntegratedLegendre` on the default space — because an
+    abstract bank turns that read into a dynamic dispatch which boxes the
+    call's `SVector` / `NTuple` / `CartesianIndex` arguments: measured at
+    448 B per call, and 94% of `assemble_matrix`'s total allocations. A
+    space that genuinely mixes families widens `B` to a common supertype
+    and pays that cost, which is why the field is parameterized rather
+    than pinned to one family.
   - `local_ids[i]` — tensor-product multi-indices of level `i`'s basis.
   - `orders[i]`    — polynomial order tuple of level `i`'s basis.
   - `values[i]`, `gradients[i]` — per-level basis value / gradient
@@ -644,8 +710,8 @@ Thread-local assembly scratch. Carries every buffer the hot loop needs:
 Constructed by [`_assembly_workspace`](@ref) once per thread (or once
 per assembly call in the serial path).
 """
-struct AssemblyWorkspace{D,T}
-    bases::Vector{BasisFamily}
+struct AssemblyWorkspace{D,T,B<:BasisFamily}
+    bases::Vector{B}
     local_ids::Vector{Vector{CartesianIndex{D}}}
     orders::Vector{NTuple{D,Int}}
     values::Vector{Vector{T}}
@@ -662,10 +728,9 @@ end
 # level id, size each buffer to the level's basis count and per-axis
 # order. Returns the per-level basis families alongside the buffers so
 # hot loops can dispatch `_tensor_values!` through the `bases` vector
-# instead of looking each level up. Shared by `_assembly_workspace`
-# (which adds gradient / derivative-factor banks on top) and by the L²
-# transfer workspace (`_transfer_workspace` in projection.jl), whose
-# value-only integrals never need the gradient banks.
+# instead of looking each level up. Used by the L² transfer workspace
+# (`_transfer_workspace` in projection.jl), whose value-only integrals
+# never need the gradient banks the assembly workspace adds.
 function _level_value_buffers(levels, ::Val{D}, ::Type{T}) where {D,T}
     n = length(levels)
     bases = Vector{BasisFamily}(undef, n)
@@ -682,59 +747,30 @@ function _level_value_buffers(levels, ::Val{D}, ::Type{T}) where {D,T}
         values[i] = Vector{T}(undef, length(ids))
         val1d[i] = _factor_buffers(level.order, T)
     end
-    return bases, local_ids, orders, values, val1d
+    # `map(identity, …)` narrows the abstractly-typed build bank to the eltype
+    # the families actually share, so every hot-loop `bases[i]` read dispatches
+    # statically instead of boxing its arguments through a dynamic call. A space
+    # that genuinely mixes families widens back to a common supertype.
+    return map(identity, bases), local_ids, orders, values, val1d
 end
 
-# Build a fresh workspace for `model`. Reuses `_level_value_buffers` for
-# the shared value banks, then adds the assembly-only gradient and
-# derivative-factor banks (sized to the same per-level basis count).
-# Called once per thread in the threaded path and once per assembly call
-# in the serial path.
-function _assembly_workspace(model::Model{D,T}) where {D,T}
-    p = model.problem
-    # Single-domain (the dominant path) passes the one space's levels as a
-    # concretely-typed `Tuple`, so the build loops below specialise on the level
-    # types instead of paying dynamic `getfield` through a `Vector{Any}`.
-    # Multi-domain fills the same id-indexed banks per subdomain space through a
-    # function barrier (`_build_multidomain_workspace`), so each per-level access
-    # is likewise type-stable; `prepare` reindexed each space into a disjoint
-    # level-id block, so the contiguous global ids `1:N` never collide across
-    # subdomains.
-    return _is_multidomain(p) ? _build_multidomain_workspace(problem_spaces(p), Val(D), T) :
-           _build_assembly_workspace(p.space.levels, Val(D), T)
-end
+# Build a fresh workspace for `model`, once per thread in the threaded path and
+# once per assembly call in the serial path.
+_assembly_workspace(model::Model{D,T}) where {D,T} =
+    _build_workspace(problem_spaces(model.problem), Val(D), T)
 
-# Function barrier that specialises the per-level bank-build loops on the
-# single-domain space's concretely-typed level `Tuple`. Reuses
-# `_level_value_buffers` for the shared value banks, then adds the assembly-only
-# gradient and derivative-factor banks (sized to the same per-level basis count).
-# Called once per thread in the threaded path and once per assembly call in the
-# serial path. (Multi-domain routes through `_build_multidomain_workspace`.)
-function _build_assembly_workspace(levels, ::Val{D}, ::Type{T}) where {D,T}
-    bases, local_ids, orders, values, val1d = _level_value_buffers(levels, Val(D), T)
-    nlev = length(values)
-    gradients = Vector{Vector{SVector{D,T}}}(undef, nlev)
-    der1d = Vector{NTuple{D,Vector{T}}}(undef, nlev)
-    for level in levels
-        i = level.id
-        gradients[i] = Vector{SVector{D,T}}(undef, length(values[i]))
-        der1d[i] = _factor_buffers(level.order, T)
-    end
-    return AssemblyWorkspace{D,T}(bases, local_ids, orders, values, gradients, val1d, der1d, Int[],
-                                  Dict{Int,Int}(), T[], T[])
-end
-
-# Build a multi-domain assembly workspace without the type-unstable `Vector{Any}`
-# level concatenation. `prepare` reindexed every subdomain space into a disjoint,
-# contiguous block of global level ids, so the union spans ids `1:N` where
-# `N = Σ level_count(V)`. The id-indexed banks are allocated once at size `N`,
-# then filled per space through `_fill_assembly_banks!` — a function barrier whose
-# argument is that space's concretely-typed level `Tuple`, so every
-# `level.id / basis / order / mode` access is statically dispatched inside it,
-# exactly like the single-domain typed-tuple path. The only dynamic dispatch is
-# the outer loop over the abstractly-typed `spaces` vector, which is O(number of
+# Build an assembly workspace over a problem's subdomain spaces without the
+# type-unstable `Vector{Any}` level concatenation. `prepare` reindexed every
+# subdomain space into a disjoint, contiguous block of global level ids, so the
+# union spans ids `1:N` where `N = Σ level_count(V)` — a single-domain problem
+# is the one-element case, with `N` the one space's level count. The id-indexed
+# banks are allocated once at size `N`, then filled per space through
+# `_fill_assembly_banks!` — a function barrier whose argument is that space's
+# concretely-typed level `Tuple`, so every `level.id / basis / order / mode`
+# access is statically dispatched inside it. The only dynamic dispatch is the
+# outer loop over the abstractly-typed `spaces` vector, which is O(number of
 # subdomains) and never touched by the assembly hot loop.
-function _build_multidomain_workspace(spaces, ::Val{D}, ::Type{T}) where {D,T}
+function _build_workspace(spaces, ::Val{D}, ::Type{T}) where {D,T}
     n = 0
     for V in spaces
         n += level_count(V)
@@ -750,17 +786,18 @@ function _build_multidomain_workspace(spaces, ::Val{D}, ::Type{T}) where {D,T}
         _fill_assembly_banks!(bases, local_ids, orders, values, gradients, val1d, der1d, V.levels,
                               Val(D), T)
     end
-    return AssemblyWorkspace{D,T}(bases, local_ids, orders, values, gradients, val1d, der1d, Int[],
-                                  Dict{Int,Int}(), T[], T[])
+    narrow = map(identity, bases)  # same narrowing as `_level_value_buffers`
+    return AssemblyWorkspace{D,T,eltype(narrow)}(narrow, local_ids, orders, values, gradients,
+                                                 val1d, der1d, Int[], Dict{Int,Int}(), T[], T[])
 end
 
 # Function barrier: fill the id-indexed assembly banks from one space's
 # concretely-typed level `Tuple`. Specialising on the tuple type makes every
 # per-level `getfield` (`id`, `basis`, `order`, `mode`) and the downstream
-# `local_basis_indices` / `_factor_buffers` calls statically dispatched — the
-# multi-domain analogue of the single-domain build in `_level_value_buffers` and
-# `_build_assembly_workspace`. Writes by global level id, which `prepare` made
-# contiguous and disjoint across subdomains, so per-space fills never collide.
+# `local_basis_indices` / `_factor_buffers` calls statically dispatched, even
+# though `_build_workspace`'s outer loop reads `V` from an abstractly-typed
+# vector. Writes by global level id, which `prepare` made contiguous and
+# disjoint across subdomains, so per-space fills never collide.
 function _fill_assembly_banks!(bases, local_ids, orders, values, gradients, val1d, der1d,
                                levels::Tuple, ::Val{D}, ::Type{T}) where {D,T}
     for level in levels
@@ -1641,27 +1678,38 @@ function _assemble_system_threaded!(sink, rhs::Vector{T}, model::Model{D,T}, reg
     return nothing
 end
 
+# Locate the `(blocks, loads)` slot of one `on` tag inside the partition
+# list, appending a fresh slot when the tag has not been seen. Matching is
+# `isequal`, exactly the equality a `Dict` key lookup applied; appending is
+# what keeps the list in first-appearance order.
+function _partition_slot!(partitions, on)
+    for (tag, slot) in partitions
+        isequal(tag, on) && return slot
+    end
+    slot = (Any[], Any[])
+    push!(partitions, on => slot)
+    return slot
+end
+
 # Partition `blocks` and `loads` by their `on` tag. Returns the
-# volume-tagged forms (with `on === nothing`) and a `Dict` of
-# `on => (blocks, loads)` grouping every non-volume form by its tag,
-# so one assembly pass per unique `on` value handles every
-# contribution carrying that tag. Iteration order of the dict is
-# insertion order under Julia's Dict (stable per-run), so serial and
-# threaded assembly walk the passes in the same order — part of why the
-# threaded result is bit-identical to serial, not merely close.
+# volume-tagged forms (with `on === nothing`) and one
+# `on => (blocks, loads)` pair per non-volume tag, grouping every
+# contribution carrying that tag so a single assembly pass handles them
+# all. The partitions are a `Vector` of pairs in first-appearance order
+# rather than a `Dict`: assembly scatters every pass into the same
+# accumulators, so the pass order decides the summation order and must be
+# a property of the forms the caller passed, not of a hash table's slot
+# layout. A problem carries a handful of distinct `on` targets, so the
+# linear `isequal` scan that replaces the hash lookup is not a cost.
 function _partition_forms_by_on(blocks, loads)
     volume_blocks = filter(b -> b.on === nothing, blocks)
     volume_loads = filter(l -> l.on === nothing, loads)
-    partitions = Dict{Any,Tuple{Vector{Any},Vector{Any}}}()
+    partitions = Pair{Any,Tuple{Vector{Any},Vector{Any}}}[]
     for b in blocks
-        b.on === nothing && continue
-        bs, _ls = get!(() -> (Any[], Any[]), partitions, b.on)
-        push!(bs, b)
+        b.on === nothing || push!(_partition_slot!(partitions, b.on)[1], b)
     end
     for l in loads
-        l.on === nothing && continue
-        _bs, ls = get!(() -> (Any[], Any[]), partitions, l.on)
-        push!(ls, l)
+        l.on === nothing || push!(_partition_slot!(partitions, l.on)[2], l)
     end
     return volume_blocks, volume_loads, partitions
 end
@@ -1915,6 +1963,19 @@ function _resolve_on_regions(model::Model, iface::Interface, _space=nothing)
     return get(() -> _interface_regions_for_model(model, iface), model.interface_regions, iface)
 end
 
+# The subdomain space a single-sided `on=` region lookup acts on. A named
+# `field` picks its space; without one, a single-domain model has exactly one
+# answer and a multi-domain model has none, so it raises rather than pick — see
+# the `boundary_integral` docstring for why neither silent default is
+# defensible. Ignored for two-sided `Interface` targets, which carry both sides.
+function _on_regions_space(model::Model, field::Union{Nothing,Symbol})
+    field === nothing || return _field_space(model.problem, field)
+    length(problem_spaces(model.problem)) == 1 && return model.problem.space
+    names = join((":" * String(f.name) for f in model.problem.fields), ", ")
+    throw(ArgumentError("field argument is required for multi-domain models; pass field=… " *
+                        "(one of $names)"))
+end
+
 # Resolve an interface tag's field indices and subdomain spaces from the model,
 # then build its regions. Field indices come from the dof layout (global field
 # order); spaces come from the effective problem's fields.
@@ -1928,72 +1989,64 @@ end
 
 """
     nquadpoints(model::Model; kind::Symbol = :volume) -> Int
+    nquadpoints(model::Model; on, field = nothing) -> Int
 
-Number of quadrature points across all regions of the requested `kind`
-on `model`. Use it to size a per-quadrature-point state vector indexed
-by `q.point` (see [`foreach_quadrature_point`](@ref)) — e.g. history
-variables for inelastic constitutive laws.
+Number of quadrature points on `model`.
 
-`kind` is one of:
+The `on=` form returns the size of the **one** region list a form tagged
+with that `on=` value integrates over, which is exactly the range of the
+`q.point` index that form sees: `1:nquadpoints(model; on=…)`. It takes
+precedence over `kind`, which the two forms never need together. `on` is
+a [`BoundarySelector`](@ref) or a [`BoundaryMesh`](@ref), where `field`
+names the subdomain on a coupled model exactly as it does for
+[`boundary_integral`](@ref), or an [`Interface`](@ref), which spans both
+its subdomains and ignores `field` (this case is
+[`interface_quadrature_count`](@ref)). This is the form that sizes
+per-quadrature-point state — history variables for an inelastic law, a
+cohesive `κ` along an interface.
 
-  - `:volume` (default) — the assembly quadrature points (the count
-    matches the volume `q.point` enumeration used by every existing
-    [`foreach_quadrature_point`](@ref) caller).
-  - `:facet` — total facet quadrature points across every cached
-    [`FacetRegion`](@ref) on the model.
-  - `:surface` — total quadrature points across every cached immersed
-    [`SurfaceRegion`](@ref) ([`BoundaryMesh`](@ref) integration).
-  - `:interface` — total quadrature points across every cached
-    multi-domain coupling [`InterfaceRegion`](@ref).
+The `kind=` form returns the **aggregate** over every cached region list
+of that kind, a structural count for diagnostics:
 
-Counters are **per kind**: a `q.point` index inside a volume form is
-not interchangeable with a `q.point` index inside a future facet
-form. Each form's per-point state array should be sized by
-`nquadpoints(model; kind=...)` for its own kind.
+  - `:volume` (default) — the points of every subdomain integration plan.
+  - `:facet` — every cached [`FacetRegion`](@ref).
+  - `:surface` — every cached immersed [`SurfaceRegion`](@ref)
+    ([`BoundaryMesh`](@ref) integration).
+  - `:interface` — every cached multi-domain [`InterfaceRegion`](@ref).
+
+`q.point` is numbered **per region list**, not per kind: it restarts at 1
+for each distinct `on=` value and, on a coupled model, for each subdomain
+naming that value. So the aggregate exceeds the `q.point` range whenever
+the model caches more than one list of that kind, and indexing a
+`kind=`-sized array by `q.point` would alias one list onto another. Size
+per-point state with `on=`; the `kind=:volume` default is safe only
+because a single-domain model has exactly one plan, and
+[`foreach_quadrature_point`](@ref) (with `QuadField{T}(model; init)`,
+which inherits its restriction) rejects a coupled model for that reason.
 """
-function nquadpoints(model::Model; kind::Symbol=:volume)
+function nquadpoints(model::Model; kind::Symbol=:volume, on=nothing,
+                     field::Union{Nothing,Symbol}=nothing)
+    on isa Interface && return interface_quadrature_count(model, on)
+    on === nothing ||
+        return sum(_region_qpoint_count,
+                   _resolve_on_regions(model, on, _on_regions_space(model, field)); init=0)
     kind === :volume && return sum(_quadrature_count(p) for p in integration_plans(model); init=0)
-    kind === :facet && return _facet_quadpoint_count(model)
-    kind === :surface && return _surface_quadpoint_count(model)
-    kind === :interface && return _interface_quadpoint_count(model)
+    kind === :facet && return _cached_quadpoint_count(model.facet_regions)
+    kind === :surface && return _cached_quadpoint_count(model.surface_regions)
+    kind === :interface && return _cached_quadpoint_count(model.interface_regions)
     throw(ArgumentError("nquadpoints kind must be :volume, :facet, :surface, or :interface, " *
                         "got $kind"))
 end
 
-# Sum of physical-frame Q-points across every cached facet region. The
-# Q-point list is precomputed on the `FacetRegion` so the sum is one
-# arithmetic op per region. Used by the `:facet` branch of
+# Sum of physical-frame Q-points across every region list in one of the
+# model's region caches (`facet_regions`, `surface_regions`,
+# `interface_regions`). Each region carries its Q-point list precomputed, so
+# the sum is one `length` per region. Backs the aggregate `kind=` branches of
 # `nquadpoints`.
-function _facet_quadpoint_count(model::Model)
+function _cached_quadpoint_count(cache)
     total = 0
-    for (_, list) in model.facet_regions
-        for region in list
-            total += length(region.weights)
-        end
-    end
-    return total
-end
-
-# Sum of physical-frame Q-points across every cached surface region.
-# Used by the `:surface` branch of `nquadpoints`.
-function _surface_quadpoint_count(model::Model)
-    total = 0
-    for (_, list) in model.surface_regions
-        for region in list
-            total += length(region.weights)
-        end
-    end
-    return total
-end
-
-# Sum of physical-frame Q-points across every cached interface region.
-# Used by the `:interface` branch of `nquadpoints`.
-function _interface_quadpoint_count(model::Model)
-    total = 0
-    for (_, list) in model.interface_regions
-        for region in list
-            total += length(region.weights)
-        end
+    for (_, list) in cache, region in list
+        total += _region_qpoint_count(region)
     end
     return total
 end

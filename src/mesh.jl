@@ -1,3 +1,5 @@
+# ── Cartesian mesh ────────────────────────────────────────────────────────────
+
 """
     CartesianMesh(domain; cells)
 
@@ -141,6 +143,8 @@ function locate_cell(m::CartesianMesh{D,T}, point::PointLike{D};
     return CartesianIndex(ids)
 end
 
+# ── Per-cell activation mask ──────────────────────────────────────────────────
+
 """
     LevelMask{D}(on::BitArray{D})
 
@@ -221,6 +225,8 @@ function _normalize_mask(cells, mesh::CartesianMesh{D}) where {D}
     end
     return LevelMask{D}(on)
 end
+
+# ── Levels and superposition spaces ───────────────────────────────────────────
 
 """
     Level
@@ -314,6 +320,8 @@ function _level_by_id(V::Space, id::Integer)
     throw(ArgumentError("unknown level id $id"))
 end
 
+# ── Basis-family instantiation ────────────────────────────────────────────────
+
 """
     instantiate_basis(basis, mesh, order, mode, mask) -> BasisFamily
 
@@ -364,9 +372,12 @@ function _check_physical_basis(family::BasisFamily, physical)
     return nothing
 end
 
+# ── Space construction ────────────────────────────────────────────────────────
+
 """
     space(domain::AxisBox; cells, order=1, basis=IntegratedLegendre(),
-                          mode=:tensor, active=nothing, physical=nothing)
+                          mode=:tensor, active=nothing, physical=nothing,
+                          reduce_order=true)
 
 Build the base discretization of a [`Space`](@ref) over `domain`. The
 resulting space has one base level (`role = :base`, `id = 1`); add overlay
@@ -384,9 +395,22 @@ Keyword arguments:
   - `mode` — basis index set. `:tensor` is the full tensor product;
     `:trunk` is the Szabó–Babuška trunk space (filtered by trunk degree)
     and requires isotropic `order`.
-  - `active` — per-cell activation mask. See
-    [`LevelMask`](@ref) and [`_normalize_mask`](@ref) for the accepted
-    shapes.
+  - `active` — per-cell activation mask, `nothing` (default) meaning every
+    cell is active. The accepted shapes, all normalised to a
+    [`LevelMask`](@ref) over the level's cells, are:
+
+      * a `LevelMask{D}`, or an `AbstractArray{Bool,D}` shaped exactly like
+        the level's cell grid, `true` where the cell participates. Both are
+        copied, so mutating the argument afterwards does not reach the level;
+      * a predicate `(cell_box, cell_index) -> Bool` evaluated once per
+        cell, with `cell_box` the cell's [`AxisBox`](@ref) and `cell_index`
+        its `CartesianIndex{D}`;
+      * an iterable of `CartesianIndex{D}` listing the active cells — every
+        cell not listed is inactive.
+
+    Inactive cells are dropped from dof enumeration, and faces between
+    active and inactive cells of one level are treated like that level's
+    artificial overlay boundary; see [`LevelMask`](@ref).
   - `physical` — optional [`PhysicalDomain`](@ref) describing an
     immersed `Ω ⊂ domain`. With `nothing` (default) the bounding box is
     the physical domain.
@@ -409,9 +433,11 @@ function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(),
 end
 
 """
-    overlay(V::Space, domain::AxisBox; cells, order=…, basis=…, mode=…,
+    overlay(V::Space, domain::AxisBox; cells, order=V.levels[1].order,
+                                       basis=V.levels[1].basis,
+                                       mode=V.levels[1].mode,
                                        tolerance=GeometryTolerance(T),
-                                       active=nothing) -> Space
+                                       active=nothing, reduce_order=true) -> Space
 
 Add an overlay level on the sub-box `domain` to an existing [`Space`](@ref)
 `V`, returning the extended space. The overlay's domain must lie inside
@@ -495,6 +521,8 @@ function _remasked_space(V::Space{D,T}, level_index::Integer, mask) where {D,T}
     levels = ntuple(i -> i == level_index ? new_level : V.levels[i], length(V.levels))
     return Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
 end
+
+# ── Fictitious-cell fold ──────────────────────────────────────────────────────
 
 # Per-cell classification of a level's mesh against `physical`. Returns a
 # `BitArray{D}` marking the cells the classifier reports as fully outside
@@ -595,6 +623,8 @@ end
 # nobody is going to reuse the cache.
 _apply_physical_fold(V::Space{D,T}) where {D,T} = _apply_physical_fold(V, _ClassifyCache{D,T}())
 
+# ── Level-id reindexing ───────────────────────────────────────────────────────
+
 # Rebuild `V` with every level id shifted by `offset`, giving the space a
 # disjoint level-id block `[offset+1, offset+level_count]`.
 #
@@ -616,6 +646,8 @@ function _reindex_space_levels(V::Space{D,T}, offset::Int) where {D,T}
     end
     return Space{D,T,typeof(new_levels)}(V.domain, new_levels, V.physical)
 end
+
+# ── Mask updates ──────────────────────────────────────────────────────────────
 
 # Flip cells in `on` selected by `cells` to `value`. Accepts the same
 # shapes as `_normalize_mask`'s selector branches: `AbstractArray{Bool,D}`,
@@ -664,6 +696,8 @@ function _apply_mask_update(old::Union{Nothing,LevelMask{D}}, mesh::CartesianMes
     _flip_cells!(on, cells, mesh, value)
     return all(on) ? nothing : LevelMask{D}(on)
 end
+
+# ── Display ───────────────────────────────────────────────────────────────────
 
 function Base.show(io::IO, level::Level)
     print(io, "Level(id=", level.id, ", role=:", level.role, ", cells=", level.mesh.cells,

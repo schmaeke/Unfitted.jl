@@ -21,21 +21,36 @@ The concrete implementation shipped here is [`IntegratedLegendre`](@ref); the
 implementing this interface plus the corresponding dof/constraint behaviour —
 geometry, intersections, assembly, projection, and solvers stay untouched.
 
-A new family `F <: BasisFamily` provides:
+A new family `F <: BasisFamily` must provide:
 
-  - `instantiate_basis(spec_or_F, mesh, order)` — build the per-level basis;
-  - `local_basis_indices(::F, order[, mode])` and `local_basis_count(::F,
-    order, mode)` — the cell-local multi-indices and their count, including any
-    order/mode validation;
-  - `is_boundary_basis(::F, id, axis, side)` — per-axis facet incidence;
-  - `basis_values` / `physical_basis_gradients` — the hot-path evaluation;
-  - the dof-key and overlay-constraint hooks the dof layer needs.
+  - `basis_name(::F) -> Symbol` — the short identifier error messages and
+    diagnostics print. There is no `::BasisFamily` default, so a family that
+    omits it turns the dof layer's own "not implemented for basis family"
+    message into an unrelated `MethodError`.
+  - `_fill_factor_tables!(::F, val1d[, der1d], order, ξ, cell)` — the per-axis
+    1D value (and derivative) tables at one reference point on one cell. This
+    is the *only* family-specific step on the hot path: tensor-product
+    evaluation, assembly, projection, field evaluation, and the boundary trace
+    all reach the family through it and through nothing else.
+  - `is_boundary_basis(::F, id, axis, side)` — per-axis facet incidence.
+  - the dof-key and overlay-constraint hooks the dof layer needs:
+    `_tensor_dof_key`, `_key_on_level_side`, and either the per-raw
+    `_has_overlay_constraint` predicate or a whole-level `_overlay_constraints`
+    generator (see `src/dofs.jl`).
+  - `instantiate_basis(::F, mesh, order, mode, mask)` — only when the concrete
+    family depends on the level's mesh. The `::BasisFamily` default returns the
+    family unchanged; see [`instantiate_basis`](@ref) for the five-argument
+    contract and why the hook exists.
 
-It inherits the basis-agnostic `::BasisFamily` defaults — `recommended_
-quadrature_order` (`order .+ 1`), the tensor `local_basis_count` (`prod(order
-.+ 1)`), `is_facet_basis`, and `boundary_basis_indices` — and overrides any
-that do not fit. The integrated Legendre family (this file) and the B-spline
-extension are the two worked examples.
+It inherits the basis-agnostic `::BasisFamily` defaults and overrides only the
+ones that do not fit: `recommended_quadrature_order` (`order .+ 1`),
+`_supported_modes` (`(:tensor,)`), `local_basis_indices` / `local_basis_count`
+(the lexicographic tensor index set `∏_d {0, …, order[d]}` and its size),
+`is_facet_basis`, `boundary_basis_indices`, and the point evaluators
+[`basis_values`](@ref) / [`physical_basis_gradients`](@ref), which are built on
+`_fill_factor_tables!` and therefore already serve every family. The integrated
+Legendre family (this file) and the B-spline extension are the two worked
+examples.
 """
 abstract type BasisFamily end
 
@@ -181,7 +196,7 @@ function _tensor_gauss_rule(counts::NTuple{D,Int}, ::Type{T}) where {D,T<:Real}
 end
 
 """
-    recommended_quadrature_order(basis::IntegratedLegendre, order) -> NTuple{D,Int}
+    recommended_quadrature_order(basis, order) -> NTuple{D,Int}
 
 Per-axis number of Gauss–Legendre points that integrates products of two
 basis functions of polynomial order `order[d]` exactly. The `::BasisFamily`
@@ -200,23 +215,50 @@ end
 
 Number of local basis functions on a single cell. The two-argument form is the
 tensor count `prod(order .+ 1)`, a `::BasisFamily` default for tensor-product
-families. The three-argument form takes a basis mode and is family-specific:
+families. The three-argument form takes a basis mode and counts the index set
+that mode selects, so it tracks [`local_basis_indices`](@ref) by construction:
 for integrated Legendre `:trunk` counts the multi-indices passing the
-trunk-degree filter (see [`IntegratedLegendre`](@ref)); other families may
-restrict the supported modes.
+trunk-degree filter (see [`IntegratedLegendre`](@ref)). A family that supports
+only some modes says so through `_supported_modes`, not by counting.
 """
 function local_basis_count(::BasisFamily, order::NTuple{D,Int}) where {D}
     return prod(ntuple(i -> order[i] + 1, D))
 end
 
-# Validate a basis-mode symbol against the per-axis polynomial order.
-# `:tensor` accepts anisotropic orders; `:trunk` requires isotropic order,
-# since the trunk-degree filter compares against a single scalar `p`.
+function local_basis_count(basis::BasisFamily, order::NTuple{D,Int}, mode::Symbol) where {D}
+    return length(local_basis_indices(basis, order, mode))
+end
+
+# The basis modes a family carries. `:tensor` — the full tensor-product index
+# set — is the only mode every tensor-product family can serve, so it is the
+# default; a family offering more (integrated Legendre's `:trunk`) overrides
+# this, and `_check_basis_mode` is the single place the answer is consulted.
+_supported_modes(::BasisFamily) = (:tensor,)
+_supported_modes(::IntegratedLegendre) = (:tensor, :trunk)
+
+# Validate a basis-mode symbol against the per-axis polynomial order, without
+# reference to a family. `:tensor` accepts anisotropic orders; `:trunk`
+# requires isotropic order, since the trunk-degree filter compares against a
+# single scalar `p`. `space` / `overlay` run this form before
+# `instantiate_basis` has produced a concrete family, so it can only reject a
+# mode name the package does not define at all.
 function _check_basis_mode(mode::Symbol, order::NTuple{D,Int}) where {D}
     mode in (:tensor, :trunk) || throw(ArgumentError("basis mode must be :tensor or :trunk"))
     if mode === :trunk && any(!=(order[1]), order)
         throw(ArgumentError("mode=:trunk requires isotropic order"))
     end
+    return mode
+end
+
+# Validate a basis-mode symbol against a concrete family: the family-blind
+# check above, plus the family's own `_supported_modes`. This is what rejects
+# a mode the package defines but *this* family cannot serve, so a family needs
+# no hand-written mode guard of its own.
+function _check_basis_mode(basis::BasisFamily, mode::Symbol, order::NTuple{D,Int}) where {D}
+    _check_basis_mode(mode, order)
+    supported = _supported_modes(basis)
+    mode in supported || throw(ArgumentError("basis family $(basis_name(basis)) does not support " *
+                                             "mode=:$mode; supported: $(join(supported, ", "))"))
     return mode
 end
 
@@ -307,9 +349,18 @@ end
 
 # ── Local basis indexing ──────────────────────────────────────────────────────
 
+# The lexicographic tensor index set `∏_d {0, …, order[d]}` with axis 1
+# varying fastest. This ordering is the package's tensor-product convention
+# (see `CONTRIBUTING.md`, "Coordinate conventions"), so it lives in one place
+# and every family's `local_basis_indices` is a filter over it, never a
+# re-derivation of it.
+function _tensor_index_set(order::NTuple{D,Int}) where {D}
+    return vec(collect(CartesianIndices(ntuple(d -> 0:order[d], D))))
+end
+
 """
-    local_basis_indices(basis::IntegratedLegendre, order)         -> Vector{CartesianIndex{D}}
-    local_basis_indices(basis::IntegratedLegendre, order, mode)   -> Vector{CartesianIndex{D}}
+    local_basis_indices(basis, order)         -> Vector{CartesianIndex{D}}
+    local_basis_indices(basis, order, mode)   -> Vector{CartesianIndex{D}}
 
 Multi-indices `α = (α₁, …, α_D)` enumerating the local basis functions on
 a cell of polynomial order `order`. Lexicographic over
@@ -317,16 +368,34 @@ a cell of polynomial order `order`. Lexicographic over
 this is the canonical tensor-product ordering used by every basis
 consumer (assembly, projection, post-processing, the dof layer).
 
-`mode` defaults to `:tensor` (no filter); `mode = :trunk` keeps only
+The `::BasisFamily` default is that full tensor set, which is what an
+open-knot B-spline span and any other tensor-product family need; a family
+overrides it only to *filter* the set, and inherits the ordering either way.
+Integrated Legendre overrides both forms: the two-argument form to require
+order ≥ 1 per axis (order 0 would leave a single endpoint mode, not a
+partition of unity), the three-argument form to add `:trunk`.
+
+The two-argument form is the `:tensor` set (no filter); `mode = :trunk` keeps only
 indices with trunk degree `Σ_d t(α_d) ≤ p`, where `t(α_d) = α_d` for a
 bubble mode (`α_d ≥ 2`) and `t(α_d) = 0` for the two linear endpoint
 modes (`α_d ∈ {0, 1}`) — the Szabó–Babuška trunk space (isotropic order
 `p` required, see [`IntegratedLegendre`](@ref)).
 """
+function local_basis_indices(::BasisFamily, order::NTuple{D,Int}) where {D}
+    all(o -> o >= 0, order) ||
+        throw(ArgumentError("basis order must be nonnegative in every axis"))
+    return _tensor_index_set(order)
+end
+
+function local_basis_indices(basis::BasisFamily, order::NTuple{D,Int}, mode::Symbol) where {D}
+    _check_basis_mode(basis, mode, order)
+    return local_basis_indices(basis, order)
+end
+
 function local_basis_indices(::IntegratedLegendre, order::NTuple{D,Int}) where {D}
     all(o -> o >= 1, order) ||
         throw(ArgumentError("integrated Legendre order must be at least 1 in every axis"))
-    return vec(collect(CartesianIndices(ntuple(d -> 0:order[d], D))))
+    return _tensor_index_set(order)
 end
 
 # Trunk degree of a single 1D integrated-Legendre mode index. The two
@@ -352,15 +421,10 @@ end
 
 function local_basis_indices(basis::IntegratedLegendre, order::NTuple{D,Int},
                              mode::Symbol) where {D}
-    _check_basis_mode(mode, order)
+    _check_basis_mode(basis, mode, order)
     indices = local_basis_indices(basis, order)
     mode === :tensor && return indices
     return [id for id in indices if _trunk_degree(id) <= order[1]]
-end
-
-function local_basis_count(basis::IntegratedLegendre, order::NTuple{D,Int}, mode::Symbol) where {D}
-    mode === :tensor && return local_basis_count(basis, order)
-    return length(local_basis_indices(basis, order, mode))
 end
 
 # ── Hot-path tensor-product evaluation ────────────────────────────────────────
@@ -386,15 +450,6 @@ end
 # (`_fill_factor_tables!`) dispatches.
 function _factor_buffers(order::NTuple{D,Int}, ::Type{T}) where {D,T}
     ntuple(d -> Vector{T}(undef, order[d] + 1), D)
-end
-
-# Recover the per-axis maximum mode index from a list of multi-indices.
-# Each axis is walked once; the total work is `O(D · #indices)`, which
-# matches a fused single-pass implementation. Used to size the
-# `_factor_buffers` for cases where the caller has an index list but not
-# an explicit `order`.
-function _indices_order(indices::AbstractVector{CartesianIndex{D}}) where {D}
-    ntuple(d -> maximum(id -> id.I[d], indices), D)
 end
 
 # Fill caller-owned per-axis 1D tables for `basis` at one reference
@@ -534,165 +589,68 @@ end
 
 # ── Public value and gradient evaluation ──────────────────────────────────────
 
-# Sentinel cell index used by the in-package public-API wrappers
-# (`basis_values`, `physical_basis_gradients`, …) whose call signatures
-# do not carry a parent-cell argument. Integrated Legendre ignores the
-# cell positional in `_fill_factor_tables!`, so any in-bounds value
-# would do; we pick the lowest-corner cell deterministically. Basis
-# families whose evaluator depends on the cell (e.g. B-splines) expose
-# their own public-API wrappers that take a cell explicitly.
-_cell_sentinel(::Val{D}) where {D} = CartesianIndex(ntuple(_ -> 1, D))
-
 """
-    basis_values!(basis::IntegratedLegendre, values, order[, mode], xi)
-    basis_values!(basis::IntegratedLegendre, values, indices,       xi)
+    basis_values(basis, order, mode, xi, cell) -> Vector
 
-Write the local basis values at reference point `xi` into the caller-owned
-buffer `values`. `length(values)` must equal the number of basis functions
-(either `local_basis_count(basis, order, mode)` or `length(indices)`).
-The 4-arg form lets callers re-use a precomputed index list (the cheaper
-path for the hot loop); the 5-arg form looks the indices up internally.
+Local basis values at reference point `xi ∈ [−1, 1]ᴰ` on the parent `cell`,
+in [`local_basis_indices`](@ref) order. Returns a fresh vector; the hot loops
+in `src/assembly.jl` call `_tensor_values!` with reused scratch instead.
 
-`mode` defaults to `:tensor`. Allocates fresh per-axis scratch buffers
-internally — for hot-loop use go through `_tensor_values!` with reused
-scratch instead.
+`cell::CartesianIndex{D}` is the parent cell's mesh index along each axis.
+Families whose 1D modes are cell-local in the reference frame (integrated
+Legendre) ignore it; families whose modes are global (the B-spline extension's
+knot-vector spans) need it to pick the right span, which is why it is part of
+the signature for *every* family rather than an overload some families add.
+
+This `::BasisFamily` method is built on `_tensor_values!` and therefore serves
+every family through its `_fill_factor_tables!` hook — there is nothing here
+for a family to override.
 """
-function basis_values!(basis::IntegratedLegendre, values::AbstractVector, order::NTuple{D,Int},
-                       mode::Symbol, xi::PointLike{D}) where {D}
-    indices = local_basis_indices(basis, order, mode)
-    return basis_values!(basis, values, indices, xi)
-end
-
-function basis_values!(basis::IntegratedLegendre, values::AbstractVector,
-                       indices::AbstractVector{CartesianIndex{D}}, xi::PointLike{D}) where {D}
-    ξ = _reference_coordinate(xi)
-    order = _indices_order(indices)
-    return _tensor_values!(basis, values, indices, order, ξ, _factor_buffers(order, eltype(ξ)),
-                           _cell_sentinel(Val(D)))
-end
-
-function basis_values!(basis::IntegratedLegendre, values::AbstractVector, order::NTuple{D,Int},
-                       xi::PointLike{D}) where {D}
-    basis_values!(basis, values, order, :tensor, xi)
-end
-
-"""
-    basis_values(basis::IntegratedLegendre, order[, mode], xi) -> Vector
-
-Allocating version of [`basis_values!`](@ref): returns a fresh vector
-holding the local basis values at reference point `xi`. Convenient for
-one-shot evaluation; the in-place form is preferred for hot loops.
-"""
-function basis_values(basis::IntegratedLegendre, order::NTuple{D,Int}, mode::Symbol,
-                      xi::PointLike{D}) where {D}
-    T = promote_type(map(typeof, Tuple(xi))...)
-    values = Vector{T}(undef, local_basis_count(basis, order, mode))
-    return basis_values!(basis, values, order, mode, xi)
-end
-
-function basis_values(basis::IntegratedLegendre, order::NTuple{D,Int}, xi::PointLike{D}) where {D}
-    basis_values(basis, order, :tensor, xi)
-end
-
-# Cell-aware variant used by `postprocessing.jl` (where the parent cell
-# index is already known) and by any caller that wants to support
-# basis families whose evaluator depends on the cell. Integrated
-# Legendre ignores `cell` and routes to the cell-agnostic method; the
-# B-spline family overloads this signature directly in the extension.
-function basis_values(basis::IntegratedLegendre, order::NTuple{D,Int}, mode::Symbol,
-                      xi::PointLike{D}, ::CartesianIndex{D}) where {D}
-    return basis_values(basis, order, mode, xi)
-end
-
-"""
-    reference_basis_gradients!(basis::IntegratedLegendre, gradients, order, mode, xi)
-    reference_basis_gradients(basis::IntegratedLegendre, order[, mode], xi) -> Vector{SVector{D}}
-
-Local basis gradients with respect to the *reference* coordinate `ξ`.
-Each entry is an `SVector{D}` whose `d`-th component is `∂N_α/∂ξ_d` at
-`xi`. For the gradient with respect to the *physical* coordinate on an
-axis-aligned cell, use [`physical_basis_gradients`](@ref) instead.
-
-The in-place form writes into a caller-owned buffer; the allocating form
-returns a fresh vector. Both allocate per-axis scratch buffers internally.
-"""
-function reference_basis_gradients!(basis::IntegratedLegendre, gradients::AbstractVector,
-                                    order::NTuple{D,Int}, mode::Symbol, xi::PointLike{D}) where {D}
+function basis_values(basis::BasisFamily, order::NTuple{D,Int}, mode::Symbol, xi::PointLike{D},
+                      cell::CartesianIndex{D}) where {D}
     indices = local_basis_indices(basis, order, mode)
     ξ = _reference_coordinate(xi)
     T = eltype(ξ)
     values = Vector{T}(undef, length(indices))
-    scale = SVector{D,T}(ntuple(_ -> one(T), D))
-    _tensor_values_grads!(basis, values, gradients, indices, order, ξ, scale,
-                          _factor_buffers(order, T), _factor_buffers(order, T),
-                          _cell_sentinel(Val(D)))
-    return gradients
-end
-
-function reference_basis_gradients(basis::IntegratedLegendre, order::NTuple{D,Int}, mode::Symbol,
-                                   xi::PointLike{D}) where {D}
-    T = promote_type(map(typeof, Tuple(xi))...)
-    gradients = Vector{SVector{D,T}}(undef, local_basis_count(basis, order, mode))
-    return reference_basis_gradients!(basis, gradients, order, mode, xi)
-end
-
-function reference_basis_gradients(basis::IntegratedLegendre, order::NTuple{D,Int},
-                                   xi::PointLike{D}) where {D}
-    reference_basis_gradients(basis, order, :tensor, xi)
+    return _tensor_values!(basis, values, indices, order, ξ, _factor_buffers(order, T), cell)
 end
 
 """
-    physical_basis_gradients!(basis::IntegratedLegendre, gradients, order, mode, cell, xi)
-    physical_basis_gradients(basis::IntegratedLegendre, order[, mode], cell, xi) -> Vector{SVector{D}}
+    physical_basis_gradients(basis, order, mode, cell_box, xi, cell) -> Vector{SVector{D}}
 
 Local basis gradients with respect to the *physical* coordinate on the
-axis-aligned `cell`. The chain rule for an axis-aligned cell with edge
-lengths `h_d = edge_lengths(cell)[d]` gives
+axis-aligned cell `cell_box`, at reference point `xi ∈ [−1, 1]ᴰ`, in
+[`local_basis_indices`](@ref) order. The chain rule for an axis-aligned cell
+with edge lengths `h_d = edge_lengths(cell_box)[d]` gives
 
     ∂N_α/∂x_d = (2 / h_d) · ∂N_α/∂ξ_d,
 
 so the physical gradient is the reference gradient scaled per axis by
-`scale[d] = 2 / h_d`. `xi` is the reference coordinate ξ ∈ [−1, 1]ᴰ; map
-a physical point through [`physical_to_reference`](@ref) first if needed.
+`scale[d] = 2 / h_d`; pass a box of edge length 2 per axis to recover the bare
+reference gradient. Map a physical point through [`physical_to_reference`](@ref)
+first if you have `x` rather than `ξ`.
 
-The in-place form writes into a caller-owned buffer; the allocating form
-returns a fresh vector. Both allocate per-axis scratch internally.
+`cell_box` is the cell's *geometry* and `cell` its *mesh index* — the two are
+independent arguments because the chain-rule scaling needs the former while a
+span-based family needs the latter. As with [`basis_values`](@ref), this
+`::BasisFamily` method is built on `_tensor_values_grads!` and serves every
+family unchanged.
 """
-function physical_basis_gradients!(basis::IntegratedLegendre, gradients::AbstractVector,
-                                   order::NTuple{D,Int}, mode::Symbol, cell::AxisBox{D,T},
-                                   xi::PointLike{D}) where {D,T}
-    indices = local_basis_indices(basis, order, mode)
-    ξ = _reference_coordinate(xi)
-    R = eltype(ξ)
-    values = Vector{R}(undef, length(indices))
-    scale = SVector{D,R}(2 ./ edge_lengths(cell))
-    _tensor_values_grads!(basis, values, gradients, indices, order, ξ, scale,
-                          _factor_buffers(order, R), _factor_buffers(order, R),
-                          _cell_sentinel(Val(D)))
-    return gradients
-end
-
-function physical_basis_gradients(basis::IntegratedLegendre, order::NTuple{D,Int}, mode::Symbol,
-                                  cell::AxisBox{D,T}, xi::PointLike{D}) where {D,T}
-    gradients = Vector{SVector{D,T}}(undef, local_basis_count(basis, order, mode))
-    return physical_basis_gradients!(basis, gradients, order, mode, cell, xi)
-end
-
-function physical_basis_gradients(basis::IntegratedLegendre, order::NTuple{D,Int},
-                                  cell::AxisBox{D,T}, xi::PointLike{D}) where {D,T}
-    physical_basis_gradients(basis, order, :tensor, cell, xi)
-end
-
-# Cell-aware variant used by `postprocessing.jl` (where the parent cell
-# index is already known) and by any caller that wants to support
-# basis families whose evaluator depends on the cell. Integrated
-# Legendre ignores `cell_index` and routes to the cell-agnostic
-# method; the B-spline family overloads this signature directly in
-# the extension.
-function physical_basis_gradients(basis::IntegratedLegendre, order::NTuple{D,Int}, mode::Symbol,
+function physical_basis_gradients(basis::BasisFamily, order::NTuple{D,Int}, mode::Symbol,
                                   cell_box::AxisBox{D,T}, xi::PointLike{D},
-                                  ::CartesianIndex{D}) where {D,T}
-    return physical_basis_gradients(basis, order, mode, cell_box, xi)
+                                  cell::CartesianIndex{D}) where {D,T}
+    indices = local_basis_indices(basis, order, mode)
+    # The cell's scalar type joins the promotion: `scale` is derived from the
+    # box, so a `Float32` reference point on a `Float64` cell must still
+    # compute — and store — the chain rule at the wider precision.
+    R = float(promote_type(map(typeof, Tuple(xi))..., T))
+    ξ = SVector{D,R}(xi)
+    values = Vector{R}(undef, length(indices))
+    gradients = Vector{SVector{D,R}}(undef, length(indices))
+    scale = SVector{D,R}(2 ./ edge_lengths(cell_box))
+    _tensor_values_grads!(basis, values, gradients, indices, order, ξ, scale,
+                          _factor_buffers(order, R), _factor_buffers(order, R), cell)
+    return gradients
 end
 
 # ── Boundary and facet basis identification ───────────────────────────────────

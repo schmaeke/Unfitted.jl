@@ -1,3 +1,5 @@
+using LinearAlgebra
+
 @testset "public API scaffold" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(4, 4), order=2)
@@ -110,4 +112,69 @@ end
     two = Problem((u, field(:w, V)); blocks=(stiffness_block(u),),
                   dirichlet=[dirichlet(0.0; on=everywhere, component=3)])
     @test_throws ArgumentError prepare(two)
+end
+
+# `diffusion` is documented as a scalar, a `D × D` matrix, or a callback
+# returning either, and `_diffusion_flux` also accepts a `UniformScaling`.
+# `_diffusion_flux` copies every `AbstractMatrix` into an `SMatrix` before
+# contracting it with the gradient, so the dense and static spellings of one
+# tensor are a single code path and cannot drift apart; the isotropic spellings
+# must reproduce the tensor that represents them.
+@testset "diffusion spellings agree" begin
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2)
+    u = field(:u, V)
+    model = prepare(Problem((u,); blocks=(stiffness_block(u),)))
+    K(a) = Matrix(assemble_matrix(model, stiffness_block(u; diffusion=a)))
+
+    dense = [2.0 0.75; 0.75 3.0]
+    static = Unfitted.SMatrix{2,2}(dense)
+
+    # Exact, not `≈`: one tensor reaching the assembler two ways runs the same
+    # instructions on the same bits. `≈` alone would let the dense spelling
+    # drift back onto the allocating generic product unnoticed.
+    @test K(dense) ≈ K(static)
+    @test K(dense) == K(static)
+
+    isotropic = 2.5
+    @test K(isotropic) ≈ K(isotropic * I)
+    @test K(isotropic) ≈ K([isotropic 0.0; 0.0 isotropic])
+    @test K(isotropic) ≈ K(Unfitted.SMatrix{2,2}(isotropic, 0.0, 0.0, isotropic))
+
+    # A tensor of the wrong shape is a loud error, never a silent contraction
+    # against whatever subblock happens to fit.
+    @test_throws DimensionMismatch K([1.0 0.0 0.0; 0.0 1.0 0.0])
+    @test_throws DimensionMismatch K([1.0 0.0; 0.0 1.0; 0.0 0.0])
+end
+
+# Every exported name should answer `?name` in a bare `using Unfitted` session.
+# Reading the *source* is what let two of them regress: a docstring separated
+# from its definition by an intervening comment block parses as a standalone
+# string and never reaches `Core.@doc`, so the prose is right there in the file
+# and `?BlockForm` still prints nothing. Only `Base.Docs.meta` sees the
+# difference, so that is what this asserts.
+@testset "exported names carry reachable docstrings" begin
+    meta = Base.Docs.meta(Unfitted)
+    undocumented = [n for n in names(Unfitted)
+                    if n !== :Unfitted && !haskey(meta, Base.Docs.Binding(Unfitted, n))]
+
+    # The two names that regressed, pinned by name so a re-detachment fails here.
+    @test :BlockForm ∉ undocumented
+    @test :LoadForm ∉ undocumented
+
+    # The remaining gaps are known and structural, not detachments:
+    #
+    #   * `mass_form` / `mass_block` each carry one docstring covering their two
+    #     siblings as well; a docstring attaches to a single definition, so the
+    #     siblings have no entry of their own;
+    #   * the extension stubs are documented in the module docstring and in the
+    #     comment blocks above their `function … end` declarations in
+    #     `Unfitted.jl`, and any docstring the extension attaches lands in the
+    #     extension module's `meta`, not this one.
+    #
+    # Subset, not equality: documenting one of these is an improvement and must
+    # not fail the suite, while a *new* undocumented export does.
+    grouped = [:source_form, :stiffness_form, :source_load, :stiffness_block]
+    extension_stubs = [:bspline, :gradient_tensor, :mesh_levelset, :stl_levelset,
+                       :symmetric_gradient, :value_vec]
+    @test issubset(undocumented, union(grouped, extension_stubs))
 end

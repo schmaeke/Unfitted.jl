@@ -217,6 +217,11 @@ function _check_component(component, field::Field)
         throw(ArgumentError("component $component outside 1:$(component_count(field)) of $(field.name)"))
 end
 
+# Field *names*, not full `Field` objects: the assembly hot loop only
+# needs the name to look the field up via `_field_index`, and erasing
+# `Field{D,T,C,Space{...}}` from the struct parameters keeps the
+# `Problem`/`Model` type tree from doubling the field-type nesting per
+# block.
 """
     BlockForm(test_name::Symbol, trial_name::Symbol, form, on)
 
@@ -236,11 +241,6 @@ tag selects the integration region kind:
 Construct via [`block`](@ref), which accepts the [`Field`](@ref)s
 directly and defaults `on = nothing`.
 """
-# Field *names*, not full `Field` objects: the assembly hot loop only
-# needs the name to look the field up via `_field_index`, and erasing
-# `Field{D,T,C,Space{...}}` from the struct parameters keeps the
-# `Problem`/`Model` type tree from doubling the field-type nesting per
-# block.
 struct BlockForm{F,O}
     test_name::Symbol
     trial_name::Symbol
@@ -248,6 +248,7 @@ struct BlockForm{F,O}
     on::O
 end
 
+# See `BlockForm` above for why the field is stored by name.
 """
     LoadForm(test_name::Symbol, form, on)
 
@@ -259,7 +260,6 @@ as for [`BlockForm`](@ref).
 Construct via [`loadform`](@ref), which accepts a [`Field`](@ref)
 directly and defaults `on = nothing`.
 """
-# See `BlockForm` above for why the field is stored by name.
 struct LoadForm{F,O}
     test_name::Symbol
     form::F

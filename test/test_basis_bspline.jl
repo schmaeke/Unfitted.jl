@@ -20,9 +20,23 @@ using LinearAlgebra: Symmetric, norm, rank
     @test Unfitted.basis_name(fam) == :bspline
     @test Unfitted.local_basis_count(fam, (3, 3)) == 16
     @test Unfitted.recommended_quadrature_order(fam, (2, 3)) == (3, 4)
+    # `local_basis_indices` / `local_basis_count` come from the `::BasisFamily`
+    # tensor defaults: an open-knot span carries the full ∏_d {0, …, p_d} set,
+    # so the family adds nothing of its own here.
     @test Unfitted.local_basis_indices(fam, (1, 2))[1] == CartesianIndex(0, 0)
+    @test Unfitted.local_basis_indices(fam, (1, 2)) ==
+          Unfitted.local_basis_indices(fam, (1, 2), :tensor)
+    @test Unfitted.local_basis_count(fam, (3, 3), :tensor) == 16
     # `dim` per axis = cells + p (open knot, no junctions, m=0).
     @test BasicBSpline.dim.(fam.spaces) == (7, 7)
+
+    # The family declares only `:tensor`, so the core mode check — not a
+    # hand-written guard in the extension — rejects integrated Legendre's
+    # `:trunk` for it, at `space` time.
+    @test Unfitted._supported_modes(fam) == (:tensor,)
+    @test_throws ArgumentError space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=3,
+                                     basis=bspline(), mode=:trunk)
+    @test_throws ArgumentError Unfitted.local_basis_indices(fam, (3, 3), :trunk)
 end
 
 @testset "BSpline extension: continuity_order validation" begin
@@ -70,6 +84,15 @@ end
     for i in 1:4
         @test val1d[1][i] ≈ expected[i]
     end
+
+    # The generic `::BasisFamily` evaluator must carry `cell` through to the
+    # span lookup — in 1D its output is exactly the per-axis table, so it can be
+    # compared to BasicBSpline directly, and evaluating the same ξ on cell 1
+    # must give a different span and different values.
+    on_cell2 = Unfitted.basis_values(fam, (3,), :tensor, ξ, cell)
+    on_cell1 = Unfitted.basis_values(fam, (3,), :tensor, ξ, CartesianIndex(1))
+    @test on_cell2 ≈ collect(expected)
+    @test on_cell1 != on_cell2
 end
 
 @testset "BSpline extension: dof-key sharing across cells" begin

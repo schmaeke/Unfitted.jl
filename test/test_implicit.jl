@@ -5,7 +5,6 @@ using LinearAlgebra
 _quad(f, rule) = sum(rule[2][i] * f(rule[1][i]) for i in eachindex(rule[2]); init=0.0)
 
 const _IVQ = Unfitted.implicit_volume_quadrature
-const _ISQ = Unfitted.implicit_surface_quadrature
 
 @testset "implicit quadrature — 1D linear cut moments are exact" begin
     # Ω = {x ≤ 0.7} on [0, 1]. Monomial moments ∫₀^0.7 xⁿ dx = 0.7ⁿ⁺¹/(n+1)
@@ -133,20 +132,6 @@ end
     @test abs(v12 - truth) < abs(v8 - truth)   # higher order ⇒ smaller error
 end
 
-@testset "implicit quadrature — surface rule" begin
-    # Flat surface: {x = 0.5} ∩ [0,1]³ has area 1, reproduced exactly (the
-    # height graph is constant). The full circle perimeter is limited by the
-    # cardinal turning points, like the disk area, but still close.
-    flat = _ISQ(x -> x[1] - 0.5, box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); gauss_points=6)
-    @test _quad(x -> 1.0, flat) ≈ 1.0 atol = 1e-12
-
-    disk = x -> sqrt((x[1] - 0.53)^2 + (x[2] - 0.47)^2) - 0.3
-    perim = _quad(x -> 1.0, _ISQ(disk, box((0.0, 0.0), (1.0, 1.0)); gauss_points=12, max_subdiv=6))
-    @test isapprox(perim, 2π * 0.3; atol=1e-2)
-
-    @test_throws ArgumentError _ISQ(x -> x[1] - 0.5, box((0.0,), (1.0,)); gauss_points=4)
-end
-
 @testset "implicit quadrature — empty and full regions" begin
     # Ω = ∅ (φ ≡ 1) ⇒ no points. Ω = everything (φ ≡ −1) ⇒ full tensor rule
     # whose weights sum to the box volume.
@@ -248,13 +233,6 @@ _hole(c, r) = x -> r - hypot(x[1] - c[1], x[2] - c[2])
     certified = _IVQ(hole, region; gauss_points=12, lipschitz=1.0)
     @test _quad(x -> 1.0, certified) ≈ 1 - π * 0.16^2 atol = 5e-5
     @test all(>(0), certified[2])
-
-    # The surface rule shares the blind spot — it bails out on a uniform sign —
-    # so without the constant the disc has no boundary at all. Its four cardinal
-    # turning points cap the perimeter accuracy, as for a whole disc above.
-    @test isempty(_ISQ(hole, region; gauss_points=12)[1])
-    @test isapprox(_quad(x -> 1.0, _ISQ(hole, region; gauss_points=12, lipschitz=1.0)), 2π * 0.16;
-                   atol=5e-2)
 end
 
 @testset "implicit quadrature — a feature entering the region through an edge" begin
@@ -311,8 +289,6 @@ end
     plain = _IVQ(hole, region; gauss_points=10)
     @test _IVQ(hole, region; gauss_points=10, lipschitz=nothing) == plain
     @test _IVQ(hole, region; gauss_points=10, lipschitz=Inf) == plain
-    @test _ISQ(hole, region; gauss_points=10, lipschitz=Inf) ==
-          _ISQ(hole, region; gauss_points=10)
 
     # And where sampling already resolves the cut, the certificate changes
     # nothing: it can only ever keep *more* leaves active, never fewer.

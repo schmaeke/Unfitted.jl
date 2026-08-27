@@ -146,6 +146,10 @@ end
     @test diagnostics(model).surface_region_count ==
           length(model.surface_regions[(mesh, model.problem.space)])
     @test nquadpoints(model; kind=:surface) > 0
+    # With one cached mesh the aggregate and the per-`on=` count coincide; the
+    # `on=` form is the one that stays equal to the `q.point` range once a
+    # second mesh is cached.
+    @test nquadpoints(model; on=mesh) == nquadpoints(model; kind=:surface)
 end
 
 @testset "block(...; on=BoundaryMesh) contributes to the assembled matrix" begin

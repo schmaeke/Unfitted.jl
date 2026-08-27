@@ -132,9 +132,9 @@ end
 # A level-set callback carrying a Lipschitz constant `L` of `f`
 # (`|f(x) − f(y)| ≤ L‖x − y‖`). The wrapper is itself callable and forwards to
 # `f`, so every consumer in this file — `_choose_axis`, `_fiber_breaks`,
-# `_emit_fiber!`, the surface root solve, and the `ForwardDiff` gradient
-# operator — keeps treating it as a plain callback; only `_sample_sign`
-# dispatches on the wrapper to use the certificate below.
+# `_emit_fiber!`, and the `ForwardDiff` gradient operator — keeps treating it
+# as a plain callback; only `_sample_sign` dispatches on the wrapper to use the
+# certificate below.
 struct _LipschitzLeaf{F}
     f::F
     lipschitz::Float64
@@ -267,7 +267,7 @@ function _choose_axis(lsets, U::AxisBox{D,T}, ctx::_QuadCtx) where {D,T}
         end
         # An axis along which no active leaf varies (all FLAT) cannot root-find
         # the interface — it scores lowest so a genuinely monotone axis wins
-        # (critical for the surface rule, harmless for the volume rule).
+        # whenever one exists.
         any_monotone || (score = zero(T))
         if usable && score > best_score
             best_score = score
@@ -361,8 +361,8 @@ end
 # ── Core recursion ─────────────────────────────────────────────────────────────
 
 # Bisect `U` into its 2ᴰ children and concatenate `recurse(child, depth+1)` over
-# them. This is the shared "not graph-like ⇒ subdivide" branch of the volume and
-# surface recursions; `recurse` is the per-child continuation.
+# them. This is the "not graph-like ⇒ subdivide" branch of the volume recursion;
+# `recurse` is the per-child continuation.
 function _subdivide_and_collect(recurse, U::AxisBox{D,T}, depth::Int) where {D,T}
     c = center(U)
     pts = SVector{D,T}[]
@@ -432,43 +432,6 @@ function _implicit_quad(lsets, membership, U::AxisBox{D,T}, ctx::_QuadCtx, depth
         xb, wb = bpts[n], bwts[n]
         _emit_fiber!(pts, wts, active, t -> _insert_axis(xb, k, t), facelo, facehi, wb, membership,
                      ctx)
-    end
-    return pts, wts
-end
-
-# ── Surface recursion ──────────────────────────────────────────────────────────
-
-# Quadrature for the implicit surface {φ = 0} ∩ U of a single level set. One
-# dimension is reduced as in the volume case; the base over the projection is a
-# partition-only volume rule, and at each base node the single fiber root x*
-# contributes the surface element with the graph Jacobian |∇φ| / |∂φ/∂x_k|.
-# (The single-leaf surface rule is what the package validates against; a
-# multi-component surface rule is a documented follow-up.)
-function _implicit_surface(phi, U::AxisBox{D,T}, ctx::_QuadCtx, depth::Int) where {D,T}
-    _sample_sign(phi, U) != 0 && return SVector{D,T}[], T[]
-
-    k, usable = _choose_axis(Any[phi], U, ctx)
-    if !usable && depth < ctx.max_subdiv
-        return _subdivide_and_collect((box, d) -> _implicit_surface(phi, box, ctx, d), U, depth)
-    end
-
-    Ub = _remove_axis(U, k)
-    facelo, facehi = U.lower[k], U.upper[k]
-    base = Any[_restrict(phi, k, facelo), _restrict(phi, k, facehi)]
-    bpts, bwts = _implicit_quad(base, Returns(true), Ub, ctx, 0)
-
-    pts = SVector{D,T}[]
-    wts = T[]
-    for n in eachindex(bpts)
-        xb, wb = bpts[n], bwts[n]
-        flo = phi(_insert_axis(xb, k, facelo))
-        fhi = phi(_insert_axis(xb, k, facehi))
-        flo * fhi < 0 || continue
-        r = _bisect(t -> phi(_insert_axis(xb, k, t)), facelo, facehi, flo, fhi)
-        xstar = _insert_axis(xb, k, r)
-        grad = ctx.gradient(phi, xstar)
-        push!(pts, xstar)
-        push!(wts, wb * norm(grad) / abs(grad[k]))
     end
     return pts, wts
 end
@@ -563,28 +526,4 @@ function implicit_volume_quadrature(phi, region::AxisBox{D,T}; gauss_points::Int
     return implicit_volume_quadrature(Any[phi], x -> phi(x) <= 0, region; gauss_points, grad,
                                       max_subdiv,
                                       lipschitz=lipschitz === nothing ? nothing : Any[lipschitz])
-end
-
-"""
-    implicit_surface_quadrature(phi, region; gauss_points, grad=nothing, max_subdiv=4,
-                                lipschitz=nothing) -> (points, weights)
-
-Return a quadrature rule for the implicit surface `∂Ω ∩ region = {φ = 0} ∩
-region` of a single level set `phi`, so that
-`∫_{∂Ω ∩ region} f dS ≈ Σₖ wₖ f(xₖ)`. Same dimension-reduction construction and
-arguments as [`implicit_volume_quadrature`](@ref); each base node contributes
-its fiber root with the height-graph surface element `|∇φ| / |∂φ/∂x_{d*}|`.
-Defined for `D ≥ 2`.
-
-`lipschitz` is the scalar Lipschitz constant of `phi`. It matters here for the
-same reason as in the volume rule: the recursion returns an empty rule as soon as
-`phi` samples uniformly signed on `region`, so without the certificate a piece of
-`{φ = 0}` smaller than the sample spacing is reported as no surface at all.
-`nothing` (default) keeps the uncertified sampling behavior.
-"""
-function implicit_surface_quadrature(phi, region::AxisBox{D,T}; gauss_points::Int, grad=nothing,
-                                     max_subdiv::Int=4, lipschitz=nothing) where {D,T}
-    D >= 2 || throw(ArgumentError("implicit_surface_quadrature requires D ≥ 2"))
-    ctx = _quad_ctx(T, gauss_points, grad, max_subdiv, maximum(region.upper - region.lower))
-    return _implicit_surface(_certified(phi, lipschitz), region, ctx, 0)
 end

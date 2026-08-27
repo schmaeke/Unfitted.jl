@@ -501,6 +501,7 @@ end
     count = interface_quadrature_count(model, iface)
     @test count > 0
     @test count == nquadpoints(model; kind=:interface)              # single interface ⇒ equal
+    @test count == nquadpoints(model; on=iface)                     # per-tag counter agrees
     @test Set(seen) == Set(1:count)                                 # assembly sees points 1:count
 
     # The iterator visits each point once, with unit a→b normals; the weights sum

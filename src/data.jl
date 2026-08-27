@@ -36,7 +36,8 @@ Constructors:
 
 Material-state history variables (phase-field `H`, plastic strain,
 predeformation gradient, …) are the natural use case. Move them across
-model changes with [`transfer`](@ref) and a [`QuadTransferScheme`](@ref).
+model changes with [`transfer`](@ref), which reconstructs the field on the
+new model's quadrature points through an [`RBFP0`](@ref) interpolation.
 """
 mutable struct QuadField{T}
     data::Vector{T}
@@ -85,17 +86,7 @@ function Base.show(io::IO, qf::QuadField{T}) where {T}
           ")")
 end
 
-# ── Transfer schemes ─────────────────────────────────────────────────────────
-
-"""
-    abstract type QuadTransferScheme end
-
-Strategy object selecting how [`transfer`](@ref) reconstructs a
-[`QuadField`](@ref) on a new model's quadrature-point cloud. The
-default is [`RBFP0`](@ref); a future B-spline-based scheme would
-plug in as a fresh subtype.
-"""
-abstract type QuadTransferScheme end
+# ── Transfer scheme ──────────────────────────────────────────────────────────
 
 """
     RBFP0(; neighbors=10)
@@ -132,7 +123,7 @@ Neighbour counts up to `_RBFP0_MAX_NEIGHBORS = 16` use a
 `StaticArrays.SMatrix` solve and stay BLAS-free; larger counts are not
 currently supported.
 """
-struct RBFP0 <: QuadTransferScheme
+struct RBFP0
     neighbors::Int
 end
 RBFP0(; neighbors::Int=10) = RBFP0(neighbors)
@@ -206,7 +197,7 @@ end
 # layouts: a `D × N` `Matrix{T}` for `NearestNeighbors.KDTree`
 # compatibility (it indexes points by column) and a
 # `Vector{SVector{D,T}}` for the small RBF solve below.
-function _collect_source_cloud(source::AbstractVector{T}, source_model::Model{D,T}) where {D,T}
+function _collect_source_cloud(source_model::Model{D,T}) where {D,T}
     n = nquadpoints(source_model)
     points = Matrix{T}(undef, D, n)
     svec_points = Vector{SVector{D,T}}(undef, n)
@@ -225,12 +216,13 @@ end
 """
     transfer(source::QuadField, source_model, target_model; via=RBFP0(), threaded=true) -> QuadField
 
-Reconstruct `source` on `target_model`'s quadrature-point cloud using the
-scheme `via`. Returns a fresh [`QuadField`](@ref) bound to `target_model`. The
-same verb `transfer` moves a [`Solution`](@ref) when given one.
+Reconstruct `source` on `target_model`'s quadrature-point cloud with the
+[`RBFP0`](@ref) scheme `via`. Returns a fresh [`QuadField`](@ref) bound to
+`target_model`. The same verb `transfer` moves a [`Solution`](@ref) when given
+one.
 
 Algorithm: build a `KDTree` over the source cloud; for each target
-quadrature point find the `scheme.neighbors` nearest source neighbours,
+quadrature point find the `via.neighbors` nearest source neighbours,
 run the local RBF + P0 solve on them, and evaluate the interpolant at
 the target point.
 
@@ -242,7 +234,7 @@ default; pass `threaded = false` for tests that need ordered
 evaluation.
 """
 function transfer(source::QuadField, source_model::Model{D,T}, target_model::Model{D,T};
-                  via::QuadTransferScheme=RBFP0(), threaded::Bool=true) where {D,T}
+                  via::RBFP0=RBFP0(), threaded::Bool=true) where {D,T}
     source_data = _checked_quadfield(source, source_model)
     k = via.neighbors
     1 <= k <= _RBFP0_MAX_NEIGHBORS ||
@@ -252,7 +244,7 @@ function transfer(source::QuadField, source_model::Model{D,T}, target_model::Mod
         throw(ArgumentError("RBFP0 needs ≥ neighbors=$k source quadrature points, model only has $nsrc"))
 
     # Source cloud + KD-tree built once; target points collected once.
-    cloud_matrix, cloud_svecs = _collect_source_cloud(source_data, source_model)
+    cloud_matrix, cloud_svecs = _collect_source_cloud(source_model)
     tree = KDTree(cloud_matrix; reorder=false)
 
     n_target = nquadpoints(target_model)

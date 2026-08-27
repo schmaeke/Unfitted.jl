@@ -525,3 +525,47 @@ end
     end
     @test has_linear_constraints
 end
+
+@testset "elimination provenance credits the overlay, not order reduction" begin
+    # A raw on an overlay's artificial boundary Γ_o that is *also* buried under a
+    # finer level collects two constraints: the overlay trace condition and the
+    # order-reduction one. The overlay constraint is queued first and is what
+    # actually eliminates the raw, so `elimination_source` must read `:overlay`;
+    # crediting order reduction would make `reduced_mode_counts` (and the
+    # `reduced_dofs` cell array `write_vtk` exports) over-report the saving.
+    #
+    # The stack: a base level, an overlay at order 2, and a nested finer level
+    # over the *same* box, so every cell of the middle overlay is covered and its
+    # boundary node modes are buried. Mixed node/span keys — a node factor on the
+    # Γ_o face, a bubble factor along the other axis — are the ones that collide.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=2)
+    V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=2, order=2)
+    V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=2)
+
+    layout = Unfitted.dof_layout(V)
+    tol = layout.tolerance
+    cache = Unfitted._ClassifyCache{2,Float64}()
+    coverage = Unfitted.build_coverage(V, tol, cache)
+    middle = V.levels[2]
+    level_keys = [key => raw for (raw, key) in pairs(layout.raw_keys) if key.level == middle.id]
+    candidates = Unfitted._coverage_constraints(middle, V, coverage, tol, level_keys, cache)
+
+    on_gamma_o(raw) = Unfitted._has_overlay_constraint(layout.raw_keys[raw], middle, V.physical,
+                                                       V.domain, tol, cache)
+    collisions = count(c -> on_gamma_o(first(c).raws[1]), candidates)
+    # Non-vacuity: this stack really does produce raws carrying both constraints.
+    @test collisions > 0
+
+    mislabelled = count(candidates) do (c, _)
+        raw = c.raws[1]
+        on_gamma_o(raw) && layout.elimination_source[raw] !== :overlay
+    end
+    @test mislabelled == 0
+
+    # Every candidate that is *not* on Γ_o keeps its order-reduction provenance,
+    # so the fix removes only the mislabelled ones.
+    reduced = count(r -> layout.elimination_source[r] === :coverage ||
+                             layout.elimination_source[r] === :dedup,
+                    (c.raws[1] for (c, _) in candidates))
+    @test reduced == length(candidates) - collisions
+end

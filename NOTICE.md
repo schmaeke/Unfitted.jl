@@ -41,11 +41,17 @@ moment-fit-via-NNLS approach to cut-cell quadrature that QuESo's
 originally developed by porting that structure from QuESo. The current
 implementation no longer contains QuESo-derived code: the distinctly
 QuESo pieces — the octree stair-step moment integrator, the
-`PointElimination` inner loop, and the `AssembleIPs` outer retry — have
-been removed, and the moment-fit-via-NNLS idea itself is the older method
-of B. Müller, F. Kummer, M. Oberlack (Int. J. Numer. Methods Engng. **96**
-(2013) 512, doi:10.1002/nme.4569). QuESo is acknowledged here as the
-reference that informed the FCM pipeline design.
+`PointElimination` inner loop, and the accuracy-driven `AssembleIPs` outer
+retry — have been removed, and the moment-fit-via-NNLS idea itself is the
+older method of B. Müller, F. Kummer, M. Oberlack (Int. J. Numer. Methods
+Engng. **96** (2013) 512, doi:10.1002/nme.4569). QuESo is acknowledged here
+as the reference that informed the FCM pipeline design.
+
+`moment_fit_rule` does run a bounded three-attempt outer loop of its own,
+which is a different mechanism: each attempt densifies the NNLS candidate
+cloud to improve the conditioning of the least-squares solve. It never
+searches for points to eliminate from a fitted rule, and never changes the
+subdivision depth the implicit kernel is allowed.
 
 The geometry and moments are computed differently from QuESo. QuESo
 classifies bounding boxes against a triangulated B-rep and computes

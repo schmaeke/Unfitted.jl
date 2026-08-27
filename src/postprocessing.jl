@@ -138,9 +138,7 @@ end
 # (explicit construction). The fallback raises with the offending
 # parameter name (`:point_data` or `:cell_data`) embedded.
 function _vtk_pairs(data, name::Symbol)
-    if data isa NamedTuple
-        return [String(k) => v for (k, v) in pairs(data)]
-    elseif data isa AbstractDict
+    if data isa NamedTuple || data isa AbstractDict
         return [String(k) => v for (k, v) in pairs(data)]
     elseif data isa Tuple && all(item -> item isa Pair, data)
         return [String(k) => v for (k, v) in data]
@@ -151,51 +149,60 @@ end
 
 # ── VTK sample construction ──────────────────────────────────────────────────
 
-# Build the `xi` payload of a VTK sample: the sample's region-reference
-# coordinate `xi.region` and, per covering parent, the sample's
-# coordinate in that parent's cell reference frame. This is the
-# information user callbacks need to evaluate basis functions
-# manually, e.g. for a custom field reconstruction.
-function _point_xi(model::Model{D,T}, region::VolumeRegion{D,T}, x::SVector{D,T}) where {D,T}
-    parents = map(region.parents) do parent
-        (; level=parent.level, cell=parent.cell, xi=physical_to_reference(parent.parent_box, x))
-    end
-    return (; region=physical_to_reference(region.box, x), parents)
-end
-
 # Build the `(context, x, xi)` triple passed to a user VTK callback.
 # `context` carries the integration region's identity, the subbox
 # being sampled, the covering parents, and the model version (so a
 # stale solution can be detected if needed). `location` is `:point`
-# for vertex samples and `:cell` for cell-center samples.
+# for vertex samples and `:cell` for cell-center samples. `xi` carries
+# the sample's region-reference coordinate, which is what the `u`
+# accessor evaluates the solution at.
 function _vtk_sample(model::Model{D,T}, region_id::Int, region::VolumeRegion{D,T},
                      box::AxisBox{D,T}, x::SVector{D,T}, location::Symbol) where {D,T}
     context = (; location, region_id, region=region.box, cell=box, parents=region.parents,
                model_version=model.version,)
-    return (; context, x, xi=_point_xi(model, region, x))
+    return (; context, x, xi=(; region=physical_to_reference(region.box, x)))
 end
 
-# Evaluate one user VTK callback at one sample. The `u(context, xi[, field])`
-# accessor passed to the callback is a closure that lazily evaluates
-# the superposed solution at the sample point — reusing the assembly
-# parent-evaluation kernels through `_superposed_value_at` — so the
-# callback can compute a scalar, vector, or tuple value without ever
-# touching the dof layer directly.
+# The `u(context, xi[, field])` accessor handed to every user VTK callback: it
+# evaluates the superposed solution at the sample without the callback ever
+# touching the dof layer. The per-parent basis records it reduces over are
+# built once per integration region by the caller and refreshed in place here,
+# the same hoist `l2_error` uses — rebuilding them per sample is what used to
+# dominate the export.
+#
 # `space` / `block_layout` are the subdomain space and field layout of the block
 # currently being written (for a single-domain model, the one space and the
-# default field). The `u(context, xi[, field])` accessor evaluates the block's
-# field by default; a named `field` is resolved on the *same* subdomain's
-# parents (valid for several fields sharing one space). To read a field on a
-# *different* subdomain, call `value(solution, model, other, x)` with the sample
-# coordinate `x` the callback also receives.
-function _evaluate_vtk_function(f, solution::Solution, model::Model, space::Space,
-                                block_layout::FieldLayout, sample)
-    u = (context, xi, field=nothing) -> begin
+# default field). The accessor evaluates the block's field by default; a named
+# `field` is resolved on the *same* subdomain's parents (valid for several
+# fields sharing one space) and pays for its own records, since only the
+# block's are cached. To read a field on a *different* subdomain, call
+# `value(solution, model, other, x)` with the sample coordinate `x` the
+# callback also receives.
+function _vtk_value_accessor(coefficients, model::Model, space::Space,
+                             block_layout::FieldLayout, parents, field_data)
+    return (context, xi, field=nothing) -> begin
         layout = field === nothing ? block_layout : _model_field_layout(model, field)
-        _superposed_value_at(solution.coefficients, space, layout, context.parents, xi.region)
+        data = field === nothing ? field_data :
+               _field_parent_data(space, layout, parents; gradients=false)
+        for record in data
+            _update_parent_basis_values!(record, xi.region)
+        end
+        return _superposed_value(data, layout, coefficients)
     end
-    return f(u, sample.context, sample.x, sample.xi)
 end
+
+# Widen a two-component vector array to three components with a trailing zero.
+# VTK gives a point/cell data array a meaning by its component count — 1 is a
+# scalar, 3 a vector, 9 a tensor — and a 2-component array is none of those: it
+# is stored and displayed component-wise, but `vtkDataSetAttributes::SetVectors`
+# rejects it, so ParaView's Glyph, Warp By Vector and Stream Tracer cannot read
+# a 2-D vector field emitted at its natural width. Padding mirrors `_vtk_point`,
+# which pads the geometry of the same 2-D dataset to three coordinates, so the
+# vectors and the points a reader associates them with now agree.
+function _vtk_vector_array(array::Vector{SVector{2,T}}) where {T}
+    return SVector{3,T}[SVector{3,T}(v[1], v[2], zero(T)) for v in array]
+end
+_vtk_vector_array(array::Vector) = array
 
 # Coerce a `Vector{Any}` of callback returns to a typed array suitable
 # for `WriteVTK`. Three accepted patterns:
@@ -208,9 +215,11 @@ end
 #     `N` inferred from the first element and `T` promoted from every
 #     component of every entry.
 #
-# The fallback returns the input untouched. `WriteVTK` will then
-# typically error or produce a mixed-type array — the user gets a
-# clear signal that their callback returned inconsistent shapes.
+# Both vector patterns pass through `_vtk_vector_array`, so a 2-component
+# result reaches ParaView as a VTK vector. The fallback returns the input
+# untouched, and `WriteVTK` then rejects the `Vector{Any}` with
+# `data type not supported by VTK: Any` — an error that names the type but not
+# the offending `name => callback` entry.
 function _vtk_data_array(values::Vector{Any})
     isempty(values) && return Float64[]
     first_value = first(values)
@@ -224,29 +233,22 @@ function _vtk_data_array(values::Vector{Any})
         return T[values...]
     elseif all(v -> v isa SVector, values)
         S = typeof(first_value)
-        return S[convert(S, v) for v in values]
+        return _vtk_vector_array(S[convert(S, v) for v in values])
     elseif first_value isa Tuple &&
            all(v -> v isa Tuple && length(v) == length(first_value), values)
         T = reduce(promote_type, (typeof(v[i]) for v in values for i in eachindex(first_value)))
         S = SVector{length(first_value),T}
-        return S[S(v) for v in values]
+        return _vtk_vector_array(S[S(v) for v in values])
     end
 
     return values
 end
 
-# Run every `name => callback` pair against every sample in the list,
-# build a typed array of the returned values, and return the
-# `name => array` pairs ready for `WriteVTK` attachment.
-function _evaluate_vtk_data(pairs, samples, solution::Solution, model::Model, space::Space,
-                            layout::FieldLayout)
-    arrays = Pair{String,Any}[]
-    for (name, f) in pairs
-        values = Any[_evaluate_vtk_function(f, solution, model, space, layout, sample)
-                     for sample in samples]
-        push!(arrays, name => _vtk_data_array(values))
-    end
-    return arrays
+# Pair each `name => callback` entry with a typed array of the values that
+# callback returned, ready for `WriteVTK` attachment. `values[i]` is the
+# collected output of `pairs[i]`, in sample order.
+function _vtk_data_arrays(pairs, values)
+    return Pair{String,Any}[first(p) => _vtk_data_array(v) for (p, v) in zip(pairs, values)]
 end
 
 # ── VTK partition and level meshes ───────────────────────────────────────────
@@ -277,34 +279,46 @@ function _partition_vtk_data(solution::Solution, model::Model{D,T}, space::Space
     cell_type = _vtk_cell_type(Val(D))
     cell0 = MeshCell(cell_type, SVector{2^D,Int}(ntuple(identity, 2^D)))
     cells = typeof(cell0)[]
-    point_samples = Any[]
-    cell_samples = Any[]
     region_ids = Int[]
     cover_counts = Int[]
     level_set_values = auto_level_set ? T[] : nothing
+    # One value list per callback, filled in sample order. The callbacks run
+    # here, inside the region walk, rather than against a recorded sample list:
+    # that is what lets a region's parent basis records (`_field_parent_data`,
+    # the expensive part of an evaluation) be built once and reused by every
+    # one of the region's samples.
+    point_values = [Any[] for _ in point_pairs]
+    cell_values = [Any[] for _ in cell_pairs]
 
     for (region_id, region) in pairs(plan.regions)
         counts = _subdivision_counts(space, region, subdivisions)
+        u = _vtk_value_accessor(solution.coefficients, model, space, layout, region.parents,
+                                _field_parent_data(space, layout, region.parents; gradients=false))
         for subbox in _subboxes(region.box, counts)
             first_point = length(points) + 1
             corners = _box_corners(subbox, Val(D))
             for corner in corners
                 push!(points, _vtk_point(corner))
-                push!(point_samples, _vtk_sample(model, region_id, region, subbox, corner, :point))
                 auto_level_set && push!(level_set_values, T(levelset_value(physical, corner)))
+                sample = _vtk_sample(model, region_id, region, subbox, corner, :point)
+                for (i, (_, f)) in pairs(point_pairs)
+                    push!(point_values[i], f(u, sample.context, sample.x, sample.xi))
+                end
             end
 
             push!(cells,
                   MeshCell(cell_type, SVector{2^D,Int}(ntuple(i -> first_point + i - 1, 2^D))))
             push!(region_ids, region_id)
             push!(cover_counts, length(region.parents))
-            push!(cell_samples,
-                  _vtk_sample(model, region_id, region, subbox, center(subbox), :cell))
+            sample = _vtk_sample(model, region_id, region, subbox, center(subbox), :cell)
+            for (i, (_, f)) in pairs(cell_pairs)
+                push!(cell_values[i], f(u, sample.context, sample.x, sample.xi))
+            end
         end
     end
 
-    point_arrays = _evaluate_vtk_data(point_pairs, point_samples, solution, model, space, layout)
-    cell_arrays = _evaluate_vtk_data(cell_pairs, cell_samples, solution, model, space, layout)
+    point_arrays = _vtk_data_arrays(point_pairs, point_values)
+    cell_arrays = _vtk_data_arrays(cell_pairs, cell_values)
     return (; points, cells, point_arrays, cell_arrays, region_ids, cover_counts, level_set_values)
 end
 
@@ -321,22 +335,22 @@ function _vtk_fields_to_write(model::Model, field)
     throw(ArgumentError("unknown field $field"))
 end
 
-# The (subdomain space, its integration plan, its dof layout) a field is written
-# against. For a single-domain model this is the one space / plan / field.
-function _vtk_field_context(model::Model, fld::Field)
+# The (subdomain space, its integration plan, its dof layout) a field lives on.
+# For a single-domain model this is the one space / plan / field. Shared by the
+# VTK export and by `l2_error`, which must integrate each field over its own
+# subdomain rather than over the problem's representative space.
+function _field_context(model::Model, fld::Field)
     space = _field_space(model.problem, fld.name)
     si = findfirst(s -> s === space, problem_spaces(model.problem))::Int
     return space, integration_plans(model)[si], _model_field_layout(model, fld)
 end
 
-# Map a level's `role` to a small integer tag for the mesh export.
-# ParaView filters can colour-by-`role_id` to visually distinguish
-# base levels from overlays. Unknown roles map to `-1`.
-function _role_id(role::Symbol)
-    role === :base && return 0
-    role === :overlay && return 1
-    return -1
-end
+# Map a level's `role` to a small integer tag for the mesh export, so ParaView
+# filters can colour-by-`role_id` to distinguish base levels from overlays.
+# `Level.role` is `:base` or `:overlay` and nothing else: the two literals are
+# written in `space` and `overlay` respectively, every other `Level` constructor
+# copies the field, and `Level` is not exported.
+_role_id(role::Symbol) = role === :base ? 0 : 1
 
 # Build the solid-cell VTK dataset for one level: one `VTK_QUAD` / `VTK_HEXAHEDRON`
 # per mesh cell — *all* cells, active or not — with per-cell scalar fields that make
@@ -432,8 +446,12 @@ Keyword arguments:
     pairs. Each callback is invoked at every vertex sample as
     `f(u, context, x, xi)` and returns a per-point scalar / vector /
     tuple value. `u(context, xi[, field])` evaluates the current
-    solution at the sample. Defaults to a single `uh` entry
-    that emits the current solution value.
+    solution at the sample. `x` is the physical coordinate and
+    `xi.region` the same point in the region's reference frame;
+    `context.parents` lists the covering parents, each with the
+    `parent_box` a callback needs to map `x` into a cell's own frame.
+    Defaults to a single `uh` entry that emits the current solution
+    value.
   - `cell_data` — same shape as `point_data` but evaluated at
     per-cell sample points (the subbox center). Defaults to no
     user-defined cell data; the bundle always includes `region_id`
@@ -486,7 +504,7 @@ function write_vtk(path::AbstractString, solution::Solution, model::Model{D,T}; 
     return vtk_multiblock(base) do vtm
         meshed = Any[]
         for (i, fld) in enumerate(fields)
-            space, plan, layout = _vtk_field_context(model, fld)
+            space, plan, layout = _field_context(model, fld)
             data = _partition_vtk_data(solution, model, space, plan, layout, subdivisions,
                                        point_data, cell_data)
             field_block = multiblock_add_block(vtm, string(fld.name))
@@ -612,15 +630,11 @@ end
 # canonical point representation.
 _point_vector(x::PointLike{D}, ::Type{T}) where {D,T} = SVector{D,T}(x)
 
-# Reject evaluation points outside the physical domain. The check uses
-# the model's own geometry tolerance, so points on the domain
-# boundary (up to `tol.contain`) are accepted.
-function _assert_point_in_domain(x::SVector{D,T}, model::Model{D,T}) where {D,T}
-    _assert_point_in_domain(x, model.problem.space.domain, model.dofs.tolerance)
-end
-
-# Domain-based overload: a coupled model evaluates each field against its own
-# subdomain's bounding box, not the representative space's.
+# Reject evaluation points outside a field's own subdomain box, at the model's
+# geometry tolerance so points on the boundary (up to `tol.contain`) are
+# accepted. The domain is always passed in by the caller, never taken from the
+# problem's representative space: on a coupled model each field is bounded by
+# its own subdomain, not by subdomain 1's.
 function _assert_point_in_domain(x::SVector{D,T}, domain::AxisBox{D,T},
                                  tol::GeometryTolerance{T}) where {D,T}
     contains_point(x, domain, tol) ||
@@ -823,22 +837,9 @@ function _superposed_value(field_data, layout::FieldLayout, coefficients)
                           layout.components))
 end
 
-# Evaluate the superposed value at a region-reference point `eta`,
-# allocating fresh per-parent basis records and refreshing them in
-# place. Used by `_evaluate_vtk_function` to expose `u(context, xi)`
-# to user VTK callbacks; `l2_error` uses the same kernels but reuses
-# its own per-region records to avoid re-allocating per quadrature
-# point.
-function _superposed_value_at(coefficients, space::Space, layout::FieldLayout, parents, eta)
-    field_data = _field_parent_data(space, layout, parents; gradients=false)
-    for data in field_data
-        _update_parent_basis_values!(data, eta)
-    end
-    return _superposed_value(field_data, layout, coefficients)
-end
-
 """
     l2_error(solution, model, exact; norm=:relative) -> Real
+    l2_error(solution, model, u::Field, exact; norm=:relative) -> Real
 
 Compute the L² error of `solution` against an analytic / manufactured
 solution `exact(x)`:
@@ -853,23 +854,35 @@ solution `exact(x)`:
 `exact(x)` may return a scalar or a component value (e.g. an
 `SVector` or tuple); the `_squared_norm` helper handles both.
 
+`u` names the field to measure, exactly as for [`value`](@ref) and
+[`field_gradient`](@ref). The error is integrated over that field's own
+subdomain — its space, its integration plan, its dof layout — so on a
+coupled model it is each subdomain's own error, and there is no single
+number for the union: an interface shared by two subdomains would be
+integrated twice. Omitting `u` picks the implied field of a single-field
+model and raises on a multi-field one, which is why the multi-field and
+coupled workflows had no L² error report before this overload existed.
+
 The integration uses the model's own integration plan — the same
 admissible regions assembly walks — so the error is consistent with
 what the solver actually integrated. For SPD model problems this is
 the natural convergence-study metric: monotonic decrease as you
 refine, with the rate matching the basis order.
 """
-function l2_error(solution::Solution, model::Model{D,T}, exact; norm::Symbol=:relative) where {D,T}
+function l2_error(solution::Solution, model::Model, exact; norm::Symbol=:relative)
+    return l2_error(solution, model, _default_field(model), exact; norm)
+end
+
+function l2_error(solution::Solution, model::Model{D,T}, u::Field, exact;
+                  norm::Symbol=:relative) where {D,T}
     norm in (:relative, :absolute) || throw(ArgumentError("norm must be :relative or :absolute"))
     coefficients = _checked_coefficients(solution, model)
-    field_layout = _model_field_layout(model, _default_field(model))
-    plan = integration_plan(model)
+    space, plan, field_layout = _field_context(model, u)
     error_squared = zero(T)
     exact_squared = zero(T)
 
     for region in plan.regions
-        field_data = _field_parent_data(model.problem.space, field_layout, region.parents;
-                                        gradients=false)
+        field_data = _field_parent_data(space, field_layout, region.parents; gradients=false)
         quadrature = region.quadrature
         jacobian = _region_jacobian(region)
 
@@ -955,7 +968,7 @@ sample. Throws `ArgumentError` if no admissible region exists on the
 selected portion of the boundary.
 """
 function boundary_integral(integrand, model::Model; on, field::Union{Nothing,Symbol}=nothing)
-    regions = _resolve_on_regions(model, on, _boundary_integral_space(model, field))
+    regions = _resolve_on_regions(model, on, _on_regions_space(model, field))
     result = nothing
     samples = 0
     for region in regions
@@ -969,18 +982,6 @@ function boundary_integral(integrand, model::Model; on, field::Union{Nothing,Sym
     samples == 0 && throw(ArgumentError("no admissible boundary regions for on=$(on); " *
                                         "check the selector or mesh and any level masks"))
     return result
-end
-
-# The subdomain space a `boundary_integral` acts on. A named `field` picks its
-# space; without one, a single-domain model has exactly one answer and a
-# multi-domain model has none, so it raises rather than pick — see the
-# `boundary_integral` docstring for why neither silent default is defensible.
-function _boundary_integral_space(model::Model, field::Union{Nothing,Symbol})
-    field === nothing || return _field_space(model.problem, field)
-    length(problem_spaces(model.problem)) == 1 && return model.problem.space
-    names = join((":" * String(f.name) for f in model.problem.fields), ", ")
-    throw(ArgumentError("field argument is required for multi-domain models; pass field=… " *
-                        "(one of $names)"))
 end
 
 # Per-Q-point `q` tuple for facet vs. surface regions. The shape is

@@ -644,13 +644,14 @@ end
 # builder and the two-sided interface-region builder — the only per-consumer
 # difference is parent classification and which region struct wraps the result.
 # `T` is recovered from the simplex measure and the point/normal type `P` from
-# the normal, so both accepted `K` (the cell's topological dimension) branches
-# stay type-stable without threading `{D,T}` in.
+# the normal, so the body stays type-stable without threading `{D,T}` in. The
+# Jacobian is uniformly `measure / reference_area`: a K=0 point cell has
+# `measure = 1` and `_reference_area(Val(0)) = 1`, so it needs no special case.
 function _simplex_cell_quadrature(cell, cell_index::Integer, mesh_normals, reference_samples,
                                   reference_area, ::Val{K}) where {K}
     measure = _simplex_measure(cell)
     T = typeof(measure)
-    jacobian = K == 0 ? one(T) : measure / convert(T, reference_area)
+    jacobian = measure / convert(T, reference_area)
     normal = if mesh_normals === nothing
         _default_normal(cell)
     else

@@ -35,12 +35,19 @@ end
 
 Wrapper around an active coefficient vector tied to a specific
 [`Model`](@ref) version. The version pin is the stale-solution
-detection mechanism: any mutator ([`move!`](@ref), [`activate!`](@ref),
-[`deactivate!`](@ref), [`assemble!`](@ref)) bumps `model.version`, and
-every consumer that takes a `Solution` calls `_checked_coefficients`
-to assert the versions still match. The result is that a `Solution`
-built against an older model state raises at the use site instead of
-silently returning wrong numbers.
+detection mechanism: the mutators that change the dof numbering
+([`move!`](@ref), [`activate!`](@ref), [`deactivate!`](@ref)) bump
+`model.version`, and every consumer that takes a `Solution` calls
+`_checked_coefficients` to assert the versions still match. The result is
+that a `Solution` built against an older model state raises at the use site
+instead of silently returning wrong numbers.
+
+[`assemble!`](@ref) and [`update_dirichlet!`](@ref) deliberately do *not*
+bump: they refill the matrix and right-hand side over an unchanged
+active-dof numbering, so an outstanding `Solution` remains a valid
+coefficient vector of that numbering and stays usable. Only its
+`diagnostics.residual_norm` goes stale — it was measured against the system
+that has since been reassembled.
 
 Fields:
 

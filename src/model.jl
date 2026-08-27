@@ -110,18 +110,6 @@ function _float_small_overlaps(records)
             for record in records]
 end
 
-# Copy the plan-derived region statistics into a diagnostics record in
-# place. Used by `_set_plan_stats!` (every lifecycle event) and by
-# `assemble!`.
-function _set_integration_stats!(diag::AssemblyDiagnostics, plan::IntegrationPlan)
-    diag.integration_regions = length(plan.regions)
-    diag.small_overlap_count = plan.small_overlap_count
-    diag.small_overlaps = _float_small_overlaps(plan.small_overlaps)
-    diag.min_integration_volume = Float64(plan.min_volume)
-    diag.min_relative_integration_volume = Float64(plan.min_relative_volume)
-    return diag
-end
-
 function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regions=0,
                              small_overlap_count=0, min_integration_volume=NaN,
                              min_relative_integration_volume=NaN, symmetry_residual=NaN,
@@ -143,28 +131,19 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                                Int(surface_region_count), Int(interface_region_count))
 end
 
-# Per-level count of cells deactivated by a `LevelMask`. Returns one
-# entry per level (0 for unmasked levels), in level order. Used during
-# diagnostics construction so the user can see how many cells each
-# level dropped (mask + fictitious-fold combined).
-function _inactive_cell_counts(V::Space)
-    return [level.mask === nothing ? 0 : count(!, level.mask.on) for level in V.levels]
-end
-
-# Per-level inactive-cell counts across every distinct subdomain space, in
-# `problem_spaces` order (the same order the reindexed global level ids run).
-# Reduces to `_inactive_cell_counts` for a single-domain problem.
-function _inactive_cell_counts_multi(spaces)
-    counts = Int[]
-    for V in spaces
-        append!(counts, _inactive_cell_counts(V))
-    end
-    return counts
+# Per-level count of cells deactivated by a `LevelMask` (mask and
+# fictitious fold combined), across every distinct subdomain space in
+# `problem_spaces` order — the same order the reindexed global level ids
+# run. One entry per level, `0` for an unmasked level. Reported by
+# `diagnostics` so the user can see how many cells each level dropped.
+function _inactive_cell_counts(spaces)
+    return Int[level.mask === nothing ? 0 : count(!, level.mask.on)
+               for V in spaces for level in V.levels]
 end
 
 # Per-level count of raws eliminated by order reduction (`:coverage` or `:dedup`),
 # across every field of the system layout, in field-then-level order — mirroring
-# `_inactive_cell_counts_multi` so the two vectors line up entry-for-entry.
+# `_inactive_cell_counts` so the two vectors line up entry-for-entry.
 function _reduced_mode_counts(layout::SystemLayout)
     counts = Int[]
     for field in layout.fields
@@ -225,28 +204,16 @@ function _cut_region_stats(plan::IntegrationPlan)
     return cut, failed, fallback, fallback_points
 end
 
-# Convenience helper shared by `prepare`, `move!`, `_update_mask!`, and
-# `assemble!`: fold every plan-level statistic into the diagnostics
-# record at once. Returns the diagnostics so call sites can chain.
-function _set_plan_stats!(diag::AssemblyDiagnostics, plan::IntegrationPlan)
-    _set_integration_stats!(diag, plan)
-    cut, failed, fallback, fallback_points = _cut_region_stats(plan)
-    diag.cut_region_count = cut
-    diag.fit_failure_count = failed
-    diag.cut_fallback_count = fallback
-    diag.cut_fallback_points = fallback_points
-    diag.moment_fit_residual_max = plan.moment_fit_residual_max
-    return diag
-end
-
-# Aggregate plan statistics across every subdomain's integration plan into
-# one diagnostics record: region / cut / small-overlap counts sum, minimum
-# volumes take the global minimum, moment-fit residual takes the global
-# maximum. Reduces to `_set_plan_stats!` for a single-domain problem (one
-# plan). The small-overlap records are concatenated so every subdomain's
-# offending regions are reported.
+# Fold every plan-level statistic into a diagnostics record in place, and
+# return it so call sites can chain. Shared by `prepare`, `move!`,
+# `_update_mask!`, and `assemble!`.
+#
+# `plans` holds one integration plan per subdomain and must be non-empty.
+# The aggregation is the identity on a single-domain problem: region / cut /
+# small-overlap counts sum, minimum volumes take the global minimum, the
+# moment-fit residual takes the global maximum, and the small-overlap records
+# are concatenated so every subdomain's offending regions are reported.
 function _set_plan_stats_multi!(diag::AssemblyDiagnostics, plans)
-    length(plans) == 1 && return _set_plan_stats!(diag, plans[1])
     diag.integration_regions = sum(length(p.regions) for p in plans; init=0)
     diag.small_overlap_count = sum(p.small_overlap_count for p in plans; init=0)
     diag.small_overlaps = reduce(vcat, (_float_small_overlaps(p.small_overlaps) for p in plans);
@@ -378,6 +345,15 @@ re-thread a fresh value through. Fields:
     every mutator. The field-to-plan routing is intrinsic: each field owns
     the regions on its space's level-id block (see `FieldLayout.level_ids`
     and `region_parents`), so no per-plan routing table is stored.
+  - `moment_fit_caches::Vector{_MomentFitCache{D,T}}` — one cut-region
+    moment-fit rule cache per distinct participating space, aligned with
+    `space_plans`. Every mutator threads it back into `integration_plan`,
+    so a cut region a `move!` or a mask flip leaves bit-identical reuses
+    its rule instead of being refitted — by far the dominant cost of a 3D
+    plan rebuild. Each cache is scoped to one space and therefore to one
+    immutable [`PhysicalDomain`](@ref), so there is nothing to invalidate;
+    `integration_plan` reduces it to the new plan's own regions on the way
+    out, so it does not grow with the length of a `move!` sweep.
   - `dofs::SystemLayout{D,T}` — per-field dof layout and active
     enumeration.
   - `matrix::Union{Nothing,SparseMatrixCSC{T,Int}}` — assembled global
@@ -432,6 +408,7 @@ mutable struct Model{D,T,P}
     prefold_space::Space{D,T}
     version::Int
     space_plans::Vector{IntegrationPlan{D,T}}
+    moment_fit_caches::Vector{_MomentFitCache{D,T}}
     dofs::SystemLayout{D,T}
     matrix::Union{Nothing,SparseMatrixCSC{T,Int}}
     rhs::Union{Nothing,Vector{T}}
@@ -576,9 +553,13 @@ function prepare(problem::Problem{D,T}; kwargs...) where {D,T}
     plan_options = (; kwargs...)
     tolerance = get(plan_options, :tolerance, GeometryTolerance(T))
     # One integration plan per distinct subdomain space, each sharing that
-    # space's own cell-classification cache.
+    # space's own cell-classification cache. The moment-fit caches, unlike the
+    # classification ones, outlive this call: they are the model's, and every
+    # mutator hands them back so an unchanged cut region is not refitted.
+    fit_caches = _MomentFitCache{D,T}[_MomentFitCache{D,T}() for _ in eachindex(spaces)]
     space_plans = IntegrationPlan{D,T}[integration_plan(spaces[i]; plan_options...,
-                                                        classify_cache=caches[i])
+                                                        classify_cache=caches[i],
+                                                        moment_fit_cache=fit_caches[i])
                                        for i in eachindex(spaces)]
     layout = system_layout(effective_problem; tolerance,
                            classify_caches=_caches_by_space(spaces, caches))
@@ -586,13 +567,14 @@ function prepare(problem::Problem{D,T}; kwargs...) where {D,T}
     surface_regions = _resolve_surface_regions(effective_problem, tolerance)
     interface_regions = _resolve_interface_regions(effective_problem, layout, tolerance)
     diag = AssemblyDiagnostics(dimension=D, active_unknowns=active_unknowns(layout),
-                               inactive_cell_counts=_inactive_cell_counts_multi(spaces),
+                               inactive_cell_counts=_inactive_cell_counts(spaces),
                                reduced_mode_counts=_reduced_mode_counts(layout),
                                facet_region_count=_region_count(facet_regions),
                                surface_region_count=_region_count(surface_regions),
                                interface_region_count=_region_count(interface_regions))
     _set_plan_stats_multi!(diag, space_plans)
     return Model{D,T,typeof(effective_problem)}(effective_problem, problem.space, 1, space_plans,
+                                                fit_caches,
                                                 layout, nothing, nothing, facet_regions,
                                                 surface_regions, interface_regions,
                                                 Dict{Symbol,DirichletProjection{D,T}}(), diag,
@@ -839,7 +821,7 @@ function _invalidate_assembly!(model::Model{D,T},
     model.surface_regions = _resolve_surface_regions(model.problem, tolerance)
     model.interface_regions = _resolve_interface_regions(model.problem, model.dofs, tolerance)
     diag = AssemblyDiagnostics(dimension=D, active_unknowns=active_unknowns(model.dofs),
-                               inactive_cell_counts=_inactive_cell_counts_multi(problem_spaces(model.problem)),
+                               inactive_cell_counts=_inactive_cell_counts(problem_spaces(model.problem)),
                                reduced_mode_counts=_reduced_mode_counts(model.dofs),
                                facet_region_count=_region_count(model.facet_regions),
                                surface_region_count=_region_count(model.surface_regions),
@@ -878,8 +860,10 @@ function move!(model::Model{D,T}; level::Integer, to::AxisBox{D,T}) where {D,T}
     model.problem = effective_problem
     model.prefold_space = moved_p.space
     model.version += 1
+    fit_caches = model.moment_fit_caches
     model.space_plans = IntegrationPlan{D,T}[integration_plan(spaces[i]; opts...,
-                                                              classify_cache=caches[i])
+                                                              classify_cache=caches[i],
+                                                              moment_fit_cache=fit_caches[i])
                                              for i in eachindex(spaces)]
     model.dofs = system_layout(effective_problem; tolerance,
                                classify_caches=_caches_by_space(spaces, caches))
@@ -947,7 +931,8 @@ function _update_mask!(model::Model{D,T}, level_index::Integer, cells, value::Bo
                                           _apply_mask_update(prefold_level.mask,
                                                              prefold_level.mesh, cells, value))
     model.version += 1
-    model.space_plans = [integration_plan(model.problem.space; opts...)]
+    model.space_plans = [integration_plan(model.problem.space; opts...,
+                                          moment_fit_cache=model.moment_fit_caches[1])]
     model.dofs = system_layout(model.problem; tolerance)
     return _invalidate_assembly!(model, tolerance)
 end
@@ -955,11 +940,12 @@ end
 """
     activate!(model; level, cells) -> Model
 
-Mark `cells` on `level` as active in place. `cells` accepts the same
-shapes as the `active=` kwarg on [`overlay`](@ref): an iterable of
-`CartesianIndex{D}`, a predicate `(cell_box, cell_index) -> Bool`, or
-an `AbstractArray{Bool,D}` matching the level's cell grid. Currently-
-active cells in the selection are unchanged.
+Mark `cells` on `level` as active in place. `cells` is a selection of
+cells, not a whole mask, and accepts the selector shapes the `active=`
+keyword of [`space`](@ref) documents: an iterable of `CartesianIndex{D}`,
+a predicate `(cell_box, cell_index) -> Bool`, or an `AbstractArray{Bool,D}`
+matching the level's cell grid. Currently-active cells in the selection are
+unchanged.
 
 Rebuilds the integration plan, dof layout, and diagnostics; clears any
 assembled matrix / right-hand side; bumps `model.version` so an

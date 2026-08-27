@@ -44,19 +44,21 @@ global 1D function index via the new `_AXIS_BSPLINE` tag.
     [`instantiate_basis`](@ref) hook, which materialises the per-axis
     `BSplineSpace`s once the mesh axes (and the optional mask
     junctions) are known.
-  - The family-specific basis-interface overloads — `basis_name`,
-    `local_basis_indices`, the `:tensor`-mode `local_basis_count`, and
-    `is_boundary_basis`. The basis-agnostic methods
-    (`recommended_quadrature_order`, the tensor `local_basis_count`,
-    `is_facet_basis`, `boundary_basis_indices`) are inherited from the
-    `::BasisFamily` defaults in `src/basis.jl`.
+  - The family-specific basis-interface overloads — `basis_name` and
+    `is_boundary_basis`. Everything else in the interface is inherited from the
+    `::BasisFamily` defaults in `src/basis.jl`: the tensor `local_basis_indices`
+    / `local_basis_count` (an open-knot span carries exactly the full
+    `∏_d {0, …, p_d}` set), `recommended_quadrature_order`, `is_facet_basis`,
+    `boundary_basis_indices`, `basis_values`, `physical_basis_gradients`, and
+    the boundary trace. The family declares no mode support of its own either:
+    the `::BasisFamily` default is `:tensor` only, which is exactly what this
+    family serves, so `_check_basis_mode` rejects `:trunk` for it.
   - Hot-path `_fill_factor_tables!` overloads (values, values +
     derivatives) using `BasicBSpline.bsplinebasisall` per axis after
     mapping the cell-local reference coordinate `ξ ∈ [−1, 1]` to the
     knot-vector parameter.
-  - `_tensor_dof_key`, `_key_on_level_side`, `_overlay_constraints`, and
-    `boundary_trace_data` overloads that route through the `_AXIS_BSPLINE`
-    tag.
+  - `_tensor_dof_key`, `_key_on_level_side`, and `_overlay_constraints`
+    overloads that route through the `_AXIS_BSPLINE` tag.
   - The `_overlay_constraints` overload emits the homogeneous
     trace-vanishing [`LinearConstraint`](@ref)s (orders `k = 0 … m`) on
     every overlay / mask face, so masked B-spline levels of any geometry
@@ -69,12 +71,13 @@ unchanged — they dispatch on `level.basis` (via the workspace's
 module UnfittedBasicBSplineExt
 
 using Unfitted
-using Unfitted: BasisFamily, Level, CartesianMesh, LevelMask, AxisBox, AxisDofKey, TensorDofKey,
-                GeometryTolerance, LinearConstraint, Space, edge_lengths, is_active,
-                local_basis_indices, local_basis_count, recommended_quadrature_order, basis_name,
-                is_boundary_basis, is_facet_basis, boundary_basis_indices, _AXIS_BSPLINE,
-                _fill_factor_tables!, _key_on_level_side, _overlay_constraints,
-                _level_side_is_physical, _tensor_dof_key, boundary_trace_data, cell_dofs
+# Only the names this module uses *unqualified* are imported; every method it
+# installs on an Unfitted function is written `Unfitted.f(...)` at its
+# definition, which needs no import. The list is therefore an honest measure of
+# how far the extension reaches into the package.
+using Unfitted: BasisFamily, Level, CartesianMesh, LevelMask, AxisDofKey, TensorDofKey,
+                GeometryTolerance, LinearConstraint, Space, is_active, _AXIS_BSPLINE,
+                _check_basis_mode, _level_side_is_physical, _tensor_dof_key
 using StaticArrays: SVector
 using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim
 
@@ -247,8 +250,7 @@ end
 function Unfitted.instantiate_basis(spec::_BSplineSpec, mesh::CartesianMesh{D,T},
                                     order::NTuple{D,Int}, mode::Symbol,
                                     mask::Union{Nothing,LevelMask{D}}) where {D,T<:Real}
-    mode === :tensor ||
-        throw(ArgumentError("BSplineFamily currently supports mode=:tensor only; got :$mode"))
+    _check_basis_mode(spec, mode, order)
     all(p -> p >= 1, order) ||
         throw(ArgumentError("bspline order (per-axis polynomial degree) must be ≥ 1"))
     m = spec.continuity_order
@@ -279,34 +281,17 @@ end
 function Unfitted.instantiate_basis(family::BSplineFamily, mesh::CartesianMesh{D,T},
                                     order::NTuple{D,Int}, mode::Symbol,
                                     mask::Union{Nothing,LevelMask{D}}) where {D,T<:Real}
-    mode === :tensor ||
-        throw(ArgumentError("BSplineFamily currently supports mode=:tensor only; got :$mode"))
+    _check_basis_mode(family, mode, order)
     return _materialize(_BSplineSpec(family.continuity_order), mesh, order)
 end
 
 # ── Basis-interface methods ───────────────────────────────────────────────────
 
 Unfitted.basis_name(::BSplineFamily) = :bspline
-
-function Unfitted.local_basis_count(family::BSplineFamily, order::NTuple{D,Int},
-                                    mode::Symbol) where {D}
-    mode === :tensor ||
-        throw(ArgumentError("BSplineFamily currently supports mode=:tensor only; got :$mode"))
-    return local_basis_count(family, order)
-end
-
-function Unfitted.local_basis_indices(::BSplineFamily, order::NTuple{D,Int}) where {D}
-    all(p -> p >= 0, order) ||
-        throw(ArgumentError("BSplineFamily order (degree) must be nonnegative on every axis"))
-    return vec(collect(CartesianIndices(ntuple(d -> 0:order[d], D))))
-end
-
-function Unfitted.local_basis_indices(family::BSplineFamily, order::NTuple{D,Int},
-                                      mode::Symbol) where {D}
-    mode === :tensor ||
-        throw(ArgumentError("BSplineFamily currently supports mode=:tensor only; got :$mode"))
-    return local_basis_indices(family, order)
-end
+# The deferred spec answers to the same name: it is the family the user asked
+# for, and `_check_basis_mode` reports through `basis_name` while validating a
+# `space(...; basis=bspline(), mode=…)` call, before the spec is materialised.
+Unfitted.basis_name(::_BSplineSpec) = :bspline
 
 # ── Boundary / facet incidence ────────────────────────────────────────────────
 
@@ -582,76 +567,6 @@ function _active_cell_at_face(level::Level{D}, d::Int, j::Int, perp_cell::Cartes
     a_jp1 = is_active(level.mask, cell_jp1)
     a_j == a_jp1 && return nothing
     return a_j ? (cell_j, j) : (cell_jp1, j + 1)
-end
-
-# ── Cell-aware public-API overloads (used by postprocessing) ──────────────────
-
-# Allocating value evaluation at one reference point on a known parent
-# cell. Mirrors the integrated-Legendre `basis_values(::IntegratedLegendre,
-# order, mode, xi, cell)` overload in `src/basis.jl` but uses the
-# B-spline hot-path kernel (which actually consumes `cell`). Used by
-# `postprocessing.jl::_level_value` to evaluate a field at a user-supplied
-# point.
-function Unfitted.basis_values(family::BSplineFamily, order::NTuple{D,Int}, mode::Symbol, xi,
-                               cell::CartesianIndex{D}) where {D}
-    mode === :tensor ||
-        throw(ArgumentError("BSplineFamily currently supports mode=:tensor only; got :$mode"))
-    indices = local_basis_indices(family, order, mode)
-    R = promote_type(map(typeof, Tuple(xi))...)
-    ξ = SVector{D,R}(xi)
-    values = Vector{R}(undef, length(indices))
-    val1d = ntuple(d -> Vector{R}(undef, order[d] + 1), D)
-    Unfitted._tensor_values!(family, values, indices, order, ξ, val1d, cell)
-    return values
-end
-
-# Allocating physical-gradient evaluation at one reference point on a
-# known parent cell. Mirrors the integrated-Legendre overload in
-# `src/basis.jl`; consumes `cell` to dispatch the B-spline hot-path
-# kernel. Used by `postprocessing.jl::_level_gradient`.
-function Unfitted.physical_basis_gradients(family::BSplineFamily, order::NTuple{D,Int},
-                                           mode::Symbol, cell_box::AxisBox{D,T}, xi,
-                                           cell::CartesianIndex{D}) where {D,T}
-    mode === :tensor ||
-        throw(ArgumentError("BSplineFamily currently supports mode=:tensor only; got :$mode"))
-    indices = local_basis_indices(family, order, mode)
-    R = promote_type(map(typeof, Tuple(xi))..., T)
-    ξ = SVector{D,R}(xi)
-    values = Vector{R}(undef, length(indices))
-    gradients = Vector{SVector{D,R}}(undef, length(indices))
-    scale = SVector{D,R}(2 ./ edge_lengths(cell_box))
-    val1d = ntuple(d -> Vector{R}(undef, order[d] + 1), D)
-    der1d = ntuple(d -> Vector{R}(undef, order[d] + 1), D)
-    Unfitted._tensor_values_grads!(family, values, gradients, indices, order, ξ, scale, val1d,
-                                   der1d, cell)
-    return gradients
-end
-
-# Boundary trace evaluator for B-spline levels. Mirrors the
-# integrated-Legendre implementation in `src/dirichlet.jl` but uses
-# `bsplinebasisall` per axis for the 1D values. The per-axis span /
-# parameter mapping is the same as the volume hot kernel above.
-function Unfitted.boundary_trace_data(level::Level{D,T,<:BSplineFamily}, raw_dofs::Vector{Int},
-                                      sides::Vector{Tuple{Int,Symbol}}, xi::SVector{D,T},
-                                      cell::CartesianIndex{D}) where {D,T}
-    family = level.basis
-    local_ids = local_basis_indices(family, level.order, level.mode)
-    raws = Int[]
-    values = T[]
-    # Per-axis 1D value tables for this point, evaluated once and
-    # reused across every facet-incident multi-index below.
-    val1d = ntuple(D) do d
-        c = cell.I[d]
-        span = family.cell_to_span[d][c]
-        t, _ = _axis_parameter(family, d, c, xi[d])
-        bsplinebasisall(family.spaces[d], span, t)
-    end
-    for (i, local_id) in pairs(local_ids)
-        is_facet_basis(family, local_id, sides) || continue
-        push!(raws, raw_dofs[i])
-        push!(values, prod(val1d[d][local_id.I[d] + 1] for d in 1:D))
-    end
-    return (; raw_dofs=raws, values)
 end
 
 end # module UnfittedBasicBSplineExt

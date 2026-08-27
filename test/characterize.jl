@@ -100,7 +100,8 @@ using BasicBSpline
 using LinearAlgebra
 using SparseArrays
 
-using Unfitted: SVector, active_unknowns, raw_dof_count, volume, problem_spaces, moment_fit_rule
+using Unfitted: SVector, SMatrix, active_unknowns, raw_dof_count, volume, problem_spaces,
+                moment_fit_rule, _diffusion_flux
 
 # ── Formatting ────────────────────────────────────────────────────────────────
 #
@@ -315,22 +316,25 @@ function emit_model(model)
     return nothing
 end
 
-function emit_solution(model, solution; exact=nothing, points=(), fields=())
-    emit("solver.method", solution.diagnostics.method)
-    emit("solver.residual_norm", solution.diagnostics.residual_norm)
-    emit("solver.converged", solution.diagnostics.converged)
-    emit_vector("coefficients", solution.coefficients)
+# `prefix` namespaces every key, so a case reporting more than one solved model
+# keeps its key set unambiguous. The default is empty and prints exactly the
+# unprefixed keys.
+function emit_solution(model, solution; exact=nothing, points=(), fields=(), prefix="")
+    emit(prefix * "solver.method", solution.diagnostics.method)
+    emit(prefix * "solver.residual_norm", solution.diagnostics.residual_norm)
+    emit(prefix * "solver.converged", solution.diagnostics.converged)
+    emit_vector(prefix * "coefficients", solution.coefficients)
     if exact !== nothing
-        emit("l2_error.absolute", l2_error(solution, model, exact; norm=:absolute))
-        emit("l2_error.relative", l2_error(solution, model, exact))
+        emit(prefix * "l2_error.absolute", l2_error(solution, model, exact; norm=:absolute))
+        emit(prefix * "l2_error.relative", l2_error(solution, model, exact))
     end
     for p in points
-        emit("u" * pointlabel(p), value(solution, model, p))
-        exact === nothing || emit("u_exact" * pointlabel(p), Float64(exact(p)))
+        emit(prefix * "u" * pointlabel(p), value(solution, model, p))
+        exact === nothing || emit(prefix * "u_exact" * pointlabel(p), Float64(exact(p)))
     end
     for (u, ps) in fields
         for p in ps
-            emit(String(u.name) * pointlabel(p), value(solution, model, u, p))
+            emit(prefix * String(u.name) * pointlabel(p), value(solution, model, u, p))
         end
     end
     return nothing
@@ -379,6 +383,17 @@ function poisson_case(V, source, exact, points)
     emit_model(model)
     emit_solution(model, solution; exact, points)
     return model, solution
+end
+
+# One prepared + solved model whose only block is `stiffness_block(u; diffusion)`,
+# driven by `source` under zero Dirichlet data on ∂Ω. Split out so the several
+# spellings of `diffusion` reach the assembler through one identical path and a
+# difference between them can only come from `_diffusion_flux`.
+function diffusion_case(V, diffusion, source)
+    u = field(:u, V)
+    model = prepare(Problem((u,); blocks=(stiffness_block(u; diffusion),),
+                            loads=(source_load(u; source),), dirichlet=zero_dirichlet()))
+    return model, solve!(model)
 end
 
 # ── Report ────────────────────────────────────────────────────────────────────
@@ -1054,6 +1069,65 @@ function main()
                     active=mask)
         model, _ = poisson_case(V, f2d, u2d, P2)
         emit("active_cells.level2", maskstr(active_cells(model; level=2)))
+    end
+
+    # ── 31 ── D = 2 under an anisotropic diffusion tensor. Every other case in
+    #          this report leaves `diffusion` at its default `1`, i.e. the scalar
+    #          branch of `_diffusion_flux`; without this case the `AbstractMatrix`
+    #          branch — how `A ∇u` is contracted — is unpinned.
+    case(31, "d2-diffusion-tensor", "MUST-NOT-CHANGE",
+         note="pins the diffusion-tensor contraction ⟨∇v, A ∇u⟩ for the three spellings of " *
+              "`diffusion` the docstring offers: a dense `Matrix{Float64}`, the same tensor " *
+              "as a static `SMatrix`, and an isotropic scalar. The solved model's A is " *
+              "symmetric, which `stiffness_form`'s `symmetric = true` requires, so it cannot " *
+              "see the contraction's orientation; the `flux.*` keys close that by contracting " *
+              "a deliberately NON-symmetric tensor directly, where A and Aᵀ differ. " *
+              "`dense_equals_static` pins that the two matrix spellings are one code path: " *
+              "`_diffusion_flux` copies any `AbstractMatrix` into an `SMatrix` before the " *
+              "product, so both assemble and solve to the same bits at every optimisation " *
+              "level. Contracting the dense spelling through the generic dense product " *
+              "instead prints false above -O0 and still true at the -O0 this baseline is " *
+              "generated at, so that key guards the invariant only above -O0.")
+    let V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2),
+        dense = [2.0 0.75; 0.75 3.0],
+        static = SMatrix{2,2}(dense),
+        # −∇·(A ∇u) for u = u2d and this constant symmetric A. u2d is degree 2
+        # per axis, so `order = 2` reproduces it and l2_error sits at round-off.
+        f_tensor = x -> (2 * dense[1, 1] * x[2] * (1 - x[2]) +
+                         2 * dense[2, 2] * x[1] * (1 - x[1]) -
+                         (dense[1, 2] + dense[2, 1]) * (1 - 2 * x[1]) * (1 - 2 * x[2]))
+
+        emit("tensor", (dense[1, 1], dense[1, 2], dense[2, 1], dense[2, 2]))
+
+        # The contraction on its own, against a non-symmetric tensor. The
+        # solved model below carries a symmetric A, where swapping A for Aᵀ is
+        # invisible; here it moves these numbers, as does landing on the wrong
+        # branch of `_diffusion_flux`. A change of rounding alone does not move
+        # them at the -O0 this baseline is generated at.
+        let skew = [2.0 0.75; 0.25 3.0], g = SVector(0.3, -0.7)
+            emit("flux.dense", Tuple(_diffusion_flux(skew, g)))
+            emit("flux.static", Tuple(_diffusion_flux(SMatrix{2,2}(skew), g)))
+            emit("flux.scalar", Tuple(_diffusion_flux(2.5, g)))
+            emit("flux.uniform_scaling", Tuple(_diffusion_flux(2.5I, g)))
+            attempt("flux.wrong_size", () -> _diffusion_flux([1.0 0.0 0.0; 0.0 1.0 0.0], g))
+        end
+
+        model, solution = diffusion_case(V, dense, f_tensor)
+        emit_model(model)
+        emit_solution(model, solution; exact=u2d, points=P2)
+
+        static_model, static_solution = diffusion_case(V, static, f_tensor)
+        emit_matrix("static.matrix", static_model.matrix)
+        emit_solution(static_model, static_solution; exact=u2d, points=P2, prefix="static.")
+        emit("dense_equals_static.matrix", model.matrix == static_model.matrix)
+        emit("dense_equals_static.coefficients",
+             solution.coefficients == static_solution.coefficients)
+
+        # The isotropic branch at a non-unit coefficient, which no other case
+        # reaches: 2.5 f2d is the source that keeps u2d exact for diffusion 2.5.
+        scalar_model, scalar_solution = diffusion_case(V, 2.5, x -> 2.5 * f2d(x))
+        emit_matrix("scalar.matrix", scalar_model.matrix)
+        emit_solution(scalar_model, scalar_solution; exact=u2d, points=P2, prefix="scalar.")
     end
 
     # ── Summary ───────────────────────────────────────────────────────────────
