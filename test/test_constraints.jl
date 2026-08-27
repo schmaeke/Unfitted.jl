@@ -393,6 +393,14 @@ end
     base = prepare(build(0.0))
     initial_version = base.version
 
+    # A value-only update keeps the cached assembly pattern. The structural
+    # check pins the constrained-dof set, so `active_unknowns` and every
+    # region's active-dof list — everything the pattern indexes — are fixed,
+    # and the next assembly must reuse the same object rather than rebuild it.
+    solve!(base)
+    pattern = base.pattern
+    @test pattern !== nothing
+
     for new_value in (0.25, 0.5, -0.1)
         update_dirichlet!(base,
                           [dirichlet(0.0; on=boundary(axis=1, side=:lower)),
@@ -400,7 +408,9 @@ end
         @test base.version == initial_version
         @test base.matrix === nothing
         @test base.rhs === nothing
+        @test base.pattern === pattern
         s = solve!(base)
+        @test base.pattern === pattern
 
         reference = solve!(prepare(build(new_value)))
         @test value(s, base, (0.5,)) ≈ value(reference, prepare(build(new_value)), (0.5,)) atol = 1.0e-10

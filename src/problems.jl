@@ -17,7 +17,7 @@
 # ── Weak forms and pointwise channels ─────────────────────────────────────────
 
 """
-    WeakForm(; bilinear, linear, symmetric=true, component_aware=false)
+    WeakForm(; bilinear, linear, symmetric=false, component_aware=false)
 
 Accumulator weak-form callbacks and metadata.
 
@@ -47,9 +47,15 @@ For component (vector) fields, pass `component_aware = true` and define
 active row component. Component-unaware forms automatically apply the
 diagonal pattern `trial.component == test_component`.
 
-`symmetric` flags whether `a(u, v) == a(v, u)`. Symmetric forms are
-assembled in the lower triangle and mirrored, which roughly halves the
-stored pattern and the scatter work.
+`symmetric` flags whether `a(u, v) == a(v, u)` and defaults to `false`,
+so an undeclared form is assembled in full. Pass `symmetric = true` for a
+form known to be symmetric: assembly then builds only the lower triangle
+and mirrors it as `tril(A) + tril(A)ᵀ − diag(A)`, roughly halving the
+stored pattern and the scatter work. That mirror *discards* the upper
+triangle, so declaring symmetry on an asymmetric form silently produces
+the wrong matrix. The default therefore costs a symmetric form the caller
+forgot to declare a factor of two, rather than costing an asymmetric one
+its correctness.
 """
 struct WeakForm{B,L}
     bilinear::B
@@ -58,7 +64,7 @@ struct WeakForm{B,L}
     component_aware::Bool
 end
 
-function WeakForm(; bilinear, linear, symmetric::Bool=true, component_aware::Bool=false)
+function WeakForm(; bilinear, linear, symmetric::Bool=false, component_aware::Bool=false)
     return WeakForm{typeof(bilinear),typeof(linear)}(bilinear, linear, symmetric, component_aware)
 end
 
@@ -201,6 +207,15 @@ end
 Number of scalar components in `field`.
 """
 component_count(::Field{D,T,C}) where {D,T,C} = C
+
+# Reject a component index the field does not carry. An out-of-range index
+# matches no component downstream, so the Dirichlet condition or Neumann load
+# carrying it contributes nothing at all — a silently free boundary or an
+# all-zero load rather than an error.
+function _check_component(component, field::Field)
+    component === nothing || 1 ≤ component ≤ component_count(field) ||
+        throw(ArgumentError("component $component outside 1:$(component_count(field)) of $(field.name)"))
+end
 
 """
     BlockForm(test_name::Symbol, trial_name::Symbol, form, on)
@@ -404,12 +419,27 @@ function _check_form_fields(forms, names)
     end
 end
 
+# Range-check each Dirichlet condition's `component` against the field it
+# names, so an index no component carries is rejected here rather than
+# silently leaving its boundary free. A condition left unscoped
+# (`field === nothing`) on a multi-field problem names no field to check
+# against; `_dirichlet_for_field` resolves those at `prepare` time.
+function _check_dirichlet(dirichlet, fields::Tuple)
+    for condition in dirichlet
+        name = condition.field
+        index = name === nothing ? (length(fields) == 1 ? 1 : nothing) :
+                findfirst(f -> f.name === name, fields)
+        index === nothing || _check_component(condition.component, fields[index])
+    end
+end
+
 function Problem(fields::Tuple; blocks=(), loads=(), dirichlet=[], symmetric=nothing)
     space_data, names = _check_problem_fields(fields)
     block_tuple = Tuple(blocks)
     load_tuple = Tuple(loads)
     _check_form_fields(block_tuple, names)
     _check_form_fields(load_tuple, names)
+    _check_dirichlet(dirichlet, fields)
     symmetric_value = symmetric === nothing ? all(block -> block.form.symmetric, block_tuple) :
                       Bool(symmetric)
     D = length(space_data.domain.lower)

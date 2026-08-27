@@ -9,12 +9,15 @@
 # public-API change cannot silently break a paper reproduction without a test
 # going red.
 #
-# For each example it asserts that the script runs to completion and — where
-# the example prints a stable, clearly labelled metric (`relative L2 error`,
-# `residual norm` from the shared `examples/reporting.jl` formatter) — that the
-# metric is finite and within a loose sanity bound. Coarse ≠ accurate: the
-# point is "ran end to end and produced sane numbers", not "converged to the
-# published digits".
+# For each example it asserts that the script runs to completion and that the
+# headline metric it prints (`relative L2 error`, `residual norm`, … from the
+# shared `examples/reporting.jl` formatter, the conditioning sweep's CSV rows,
+# the bi-material energy error) lands inside that case's `tol` band. Each band
+# is the value measured on the configuration the case actually runs, rounded up
+# by about one decade — enough headroom that no legitimate rounding difference
+# can trip it, tight enough that a regression of one decade does. The bands are
+# not a convergence claim: three of the ten cases run coarsened and are far from
+# the published digits, but every case is pinned to what *it* produces today.
 #
 # ── One batched subprocess, not ten ───────────────────────────────────────────
 #
@@ -149,98 +152,134 @@
 
     # Every numeric value printed as "<label>: <number>" by the shared report
     # formatter, in print order. A multi-run example (the 1D bar prints a base
-    # and an overlay error) yields one entry per occurrence.
+    # and an overlay error) yields one entry per occurrence. The separator is
+    # whitespace and/or a colon so the same reader also handles the examples
+    # that lay their report out as an aligned two-column table.
     function metric_values(output, label)
-        pattern = Regex(label * raw"\s*:\s*([-+]?[0-9.]+(?:[eE][-+]?[0-9]+)?)")
+        pattern = Regex(label * raw"[\s:]+([-+]?[0-9.]+(?:[eE][-+]?[0-9]+)?)")
         return [parse(Float64, m.captures[1]) for m in eachmatch(pattern, output)]
     end
 
-    # A relative L² error is sane when it is finite and below one (a coarse run
-    # may be far from the published digits, but a value ≥ 1 or non-finite means
-    # the solve produced garbage).
-    sane_error(e) = isfinite(e) && 0 ≤ e < 1
+    # A metric is sane when it is finite, non-negative and inside its case's
+    # measured band. `NaN`/`Inf` never reach here — the number pattern above
+    # does not match them, so a garbage metric fails the count assertion first.
+    sane_error(value, tol) = isfinite(value) && 0 ≤ value < tol
 
-    # Metric checks, run only after a clean exit. Each asserts the example's
-    # headline metric is present and sane; `check_success_only` is for the
-    # examples whose output is a CSV sweep / transient log with no single
-    # headline number (we still guard that they ran to the end).
-    function check_single_l2(output)
-        errors = metric_values(output, "relative L2 error")
-        @test length(errors) == 1
-        @test sane_error(errors[1])
+    # Metric checks, run only after a clean exit, each taking the case's `tol`.
+    # `check_one` covers every example whose report carries exactly one headline
+    # number; printing it twice (or not at all) is itself a regression.
+    function check_one(output, tol, label)
+        values = metric_values(output, label)
+        @test length(values) == 1
+        @test sane_error(values[1], tol)
     end
 
-    function check_bar(output)
+    check_single_l2(output, tol) = check_one(output, tol, "relative L2 error")
+    check_energy(output, tol) = check_one(output, tol, "relative energy error")
+    check_phase(output, tol) = check_one(output, tol, "residual norm")
+
+    function check_bar(output, tol)
         errors = metric_values(output, "relative L2 error")
         @test length(errors) == 2
-        @test all(sane_error, errors)
+        @test all(e -> sane_error(e, tol), errors)
         # The overlay around the unresolved interface must beat the base-only
         # run — that improvement is the entire point of the example.
         @test errors[2] < errors[1]
     end
 
-    function check_phase(output)
-        residuals = metric_values(output, "residual norm")
-        @test !isempty(residuals)
-        @test isfinite(last(residuals)) && 0 ≤ last(residuals) < 1e-3
+    # The conditioning sweep's report is a CSV body, one row per (p, k); rows
+    # are the only lines that open with an integer followed by a comma. Columns
+    # are read by position, so the sweep's own header is pinned first — a
+    # reordered or inserted column then fails here instead of silently moving
+    # the band onto a different quantity. `cond(A)` grows with both p and 1/δ —
+    # that growth is what §5.3 measures — so its band is per-order; the residual
+    # band is flat, since every one of the 32 rows is a direct solve.
+    function check_conditioning(output, tol)
+        @test occursin("columns: p, k, δ, active_unknowns, regions, small_regions, min_volume, " *
+                       "first_small_volume, cond_estimate, residual_norm", output)
+        rows = [split(line, ", ")
+                for line in eachline(IOBuffer(output)) if occursin(r"^\s*\d+, ", line)]
+        @test length(rows) == 4 * 8
+        @test all(row -> sane_error(parse(Float64, row[9]), tol.condition[parse(Int, row[1])]),
+                  rows)
+        @test all(row -> sane_error(parse(Float64, row[10]), tol.residual), rows)
     end
 
-    check_success_only(output) = nothing
+    # The transient prints no error against an exact solution; the numbers it
+    # does produce are the residuals of the L²-transfers that carry the state
+    # across each mesh update, printed as one Julia vector. A direct mass solve
+    # leaves machine noise, so anything above the band means a transfer failed.
+    function check_transfer(output, tol)
+        printed = match(r"projection_residuals: \[([^\]]*)\]", output)
+        residuals = printed === nothing ? Float64[] :
+                    parse.(Float64, split(printed.captures[1], ", "; keepempty=false))
+        @test !isempty(residuals)
+        @test all(r -> sane_error(r, tol), residuals)
+    end
 
-    # Coarse configuration for each example. `env` holds the size knobs;
-    # `tensors` marks the `Tensors`-using examples; `check` runs the metric
-    # assertions on a clean run.
+    # Configuration for each example. `env` holds the size knobs; `tensors`
+    # marks the `Tensors`-using examples; `check` runs the metric assertions on
+    # a clean run and `tol` is the band it enforces. Every `tol` is the measured
+    # value on this configuration with about a decade of headroom — the comment
+    # on each case records what was measured, so a band that has drifted away
+    # from reality is visible without re-running the example.
     cases = (
              # Smooth manufactured Laplace, published 12×12 p=4 config (already
-             # sub-second numerics); prints one relative L² error.
+             # sub-second numerics); prints one relative L² error, 2.17e-8.
              (name="laplace_unit_square_smooth", env=Dict{String,String}(), tensors=false,
-              check=check_single_l2),
+              check=check_single_l2, tol=1.0e-6),
              # 1D bar, unresolved material interface; tiny base + overlay solves,
-             # prints a base and an overlay relative L² error.
+             # prints a base and an overlay relative L² error, 3.18e-2 and 1.35e-2.
+             # The band is set by the larger, base-only error.
              (name="bar_1d_unresolved_interface", env=Dict{String,String}(), tensors=false,
-              check=check_bar),
-             # Small-overlap conditioning sweep; 32 tiny solves, CSV output with no
-             # single headline metric — guarded by running to the end only.
+              check=check_bar, tol=1.0e-1),
+             # Small-overlap conditioning sweep; 32 tiny solves, CSV output. Largest
+             # `cond(A)` per order (always at δ = 2⁻⁸): 3.65e2, 1.50e3, 6.30e5,
+             # 3.65e7; largest residual over all 32 rows 4.15e-15.
              (name="conditioning_small_overlap", env=Dict{String,String}(), tensors=false,
-              check=check_success_only),
+              check=check_conditioning,
+              tol=(condition=(4.0e3, 2.0e4, 7.0e6, 4.0e8), residual=1.0e-10)),
              # Corner-singularity nested-overlay solve at its published size (small
-             # system; cost is compilation); prints one relative L² error.
+             # system; cost is compilation); prints one relative L² error, 4.34e-5.
              (name="singular_square_2d", env=Dict{String,String}(), tensors=false,
-              check=check_single_l2),
+              check=check_single_l2, tol=1.0e-3),
              # Traveling heat source: shortened transient (`THS_T_MAX=0.05` runs one
-             # mesh-update + L²-transfer interval) and VTK export disabled; no single
-             # headline metric — guarded by running to the end only.
+             # mesh-update + L²-transfer interval) and VTK export disabled. No error
+             # against an exact solution; the transfer residual measures 0.0.
              (name="traveling_heat_source_2d",
               env=Dict("THS_T_MAX" => "0.05", "THS_WRITE_OUTPUT" => "false"), tensors=false,
-              check=check_success_only),
+              check=check_transfer, tol=1.0e-10),
              # Phase-field SENT: coarse base (6×6, p=2), a few load steps to a tiny
-             # final displacement, VTK disabled; prints the converged Newton
-             # residual norm.
+             # final displacement, VTK disabled; prints the converged Newton residual
+             # norm, 3.45e-9. Individual load steps reach 4.4e-8, so the band sits a
+             # decade above those rather than above the final value.
              (name="phase_field_single_edge_notch_2d",
               env=Dict("SHP_PHASE_CELLS" => "6", "SHP_PHASE_ORDER" => "2",
                        "SHP_PHASE_FINAL_DISPLACEMENT" => "1.0e-4",
-                       "SHP_PHASE_WRITE_OUTPUT" => "false"), tensors=true, check=check_phase),
+                       "SHP_PHASE_WRITE_OUTPUT" => "false"), tensors=true, check=check_phase,
+              tol=1.0e-6),
              # FCM annular plate (Nitsche + Neumann on immersed arcs), published
              # 8×8 p=4 config. The only end-to-end driver of weak boundary
-             # conditions on immersed arcs; prints one relative L² error.
+             # conditions on immersed arcs; prints one relative L² error, 3.50e-4.
              (name="fcm_annular_plate_2d", env=Dict{String,String}(), tensors=true,
-              check=check_single_l2),
+              check=check_single_l2, tol=1.0e-2),
              # FCM Kirsch plate-with-hole p-refinement sweep, published 8×8 config;
-             # prints the finest-order relative L² error.
+             # prints the finest-order relative L² error, 2.93e-8.
              (name="fcm_plate_with_hole_2d", env=Dict{String,String}(), tensors=true,
-              check=check_single_l2),
+              check=check_single_l2, tol=1.0e-6),
              # Bi-material inclusion corner: native multi-domain coupling of two
              # immersed FCM subdomains across an immersed interface. Coarse
-             # VTK-disabled config; guarded by running to the end — the coupled
-             # immersed solve completing is the smoke test.
+             # VTK-disabled config; prints the relative energy error against
+             # Elhaddad's reference as a percentage, 0.278 % — so the band is in
+             # percent too.
              (name="bimaterial_inclusion_corner_2d",
               env=Dict("BIC_CELLS" => "11", "BIC_WRITE_OUTPUT" => "false"), tensors=false,
-              check=check_success_only),
+              check=check_energy, tol=3.0),
              # Steep tanh layer on a sinusoidal front — the order-reduction benchmark. An
              # hp-graded overlay stack steps the order down to 1 and the base is reduced
-             # under it; prints one relative L² error.
+             # under it; prints one relative L² error, 1.76e-2.
              (name="tanh_layer_2d", env=Dict{String,String}(), tensors=false,
-              check=check_single_l2))
+              check=check_single_l2, tol=1.0e-1))
 
     # Only the cases that can actually run go into the batch; the rest are
     # reported as skips below.
@@ -272,7 +311,7 @@
                     @error "example did not run to completion" example = case.name status = block.status seconds = block.seconds output = block.output
                 end
                 @test ok
-                ok && case.check(block.output)
+                ok && case.check(block.output, case.tol)
             end
         end
     end

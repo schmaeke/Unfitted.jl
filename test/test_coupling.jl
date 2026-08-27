@@ -427,29 +427,24 @@ end
                             dirichlet=[zero_bc(:u1, 2, :lower), zero_bc(:u1, 1, :lower),
                                        zero_bc(:u1, 1, :upper), zero_bc(:u2, 2, :upper),
                                        zero_bc(:u2, 1, :lower), zero_bc(:u2, 1, :upper)]))
-    # Correctness is checked on a SERIAL assembly so the manufactured-solution
-    # test is deterministic in every CI cell. The shipped interface pass runs
-    # threaded, but a Julia `--code-coverage` + multithreading codegen artifact can
-    # nondeterministically corrupt this two-sided *vector* block under coverage
-    # with ≥2 threads (see the `couple` docstring) — exactly the coverage CI cell.
-    # Pinning correctness on the serial assembly keeps it green while still
-    # exercising the full coupling mechanics.
+    # Correctness is measured on the SERIAL assembly and the shipped threaded
+    # assembly is then pinned to it bit-for-bit, so the manufactured-solution
+    # bound below covers both paths. Splitting the two keeps the diagnosis
+    # sharp: a solution error is a modelling bug, an inequality a threading one.
     assemble!(model; threaded=false)
+    serial_matrix, serial_rhs = copy(model.matrix), copy(model.rhs)
     sol = solve!(model)
     e1 = maximum(norm(value(sol, model, u1, p) - uex(p)) for p in _P1)
     e2 = maximum(norm(value(sol, model, u2, p) - uex(p)) for p in _P2)
     @test max(e1, e2) < 1.0e-9
 
-    # Additionally verify the shipped threaded assembly reproduces the serial
-    # interface block — but only where that comparison is both meaningful (real
-    # parallelism) and reliable: with ≥2 threads AND no coverage instrumentation.
-    # Under `--code-coverage` at ≥2 threads the Julia artifact above can corrupt
-    # it, and at 1 thread the "threaded" path is a single task (nothing to check).
-    if Threads.nthreads() > 1 && Base.JLOptions().code_coverage == 0
-        serial_matrix = copy(model.matrix)
-        assemble!(model; threaded=true)
-        @test model.matrix ≈ serial_matrix
-    end
+    # `==`, not `≈`: threaded assembly sums every slot in the serial (region, row)
+    # order, so matrix and rhs alike differ in no bit at any thread count. Run
+    # unconditionally — a coverage-instrumented multithreaded process is where a
+    # corruption of this block was once seen, so it is the last place to skip it.
+    assemble!(model; threaded=true)
+    @test model.matrix == serial_matrix
+    @test model.rhs == serial_rhs
 end
 
 @testset "foreach_interface_quadrature_point matches the assembly points" begin

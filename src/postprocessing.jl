@@ -574,7 +574,7 @@ function write_quadrature_vtm(path::AbstractString, model::Model{D,T}) where {D,
             weights = T[]
             for i in region_indices
                 region = all_regions[i]
-                jacobian = volume(region.box) / convert(T, 2^D)
+                jacobian = _region_jacobian(region)
                 for (eta, w) in zip(region.quadrature.points, region.quadrature.weights)
                     x = reference_to_physical(region.box, eta)
                     push!(points, _vtk_point(x))
@@ -871,7 +871,7 @@ function l2_error(solution::Solution, model::Model{D,T}, exact; norm::Symbol=:re
         field_data = _field_parent_data(model.problem.space, field_layout, region.parents;
                                         gradients=false)
         quadrature = region.quadrature
-        jacobian = volume(region.box) / convert(T, 2^D)
+        jacobian = _region_jacobian(region)
 
         for (eta, weight) in zip(quadrature.points, quadrature.weights)
             for data in field_data

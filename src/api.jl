@@ -153,6 +153,9 @@ Create a physical Dirichlet condition.
   - `component` — component index for vector fields when constraining
     only one channel (e.g. a roller / symmetry boundary that pins the
     normal component). `nothing` (default) constrains every component.
+    An index outside `1:components` raises `ArgumentError` as soon as the
+    owning field is known — here when `field` is a [`Field`](@ref),
+    otherwise at [`Problem`](@ref) construction.
 
 Nonzero `value` data are projected onto the boundary trace space
 before strong elimination so the constrained dof values reflect the
@@ -167,6 +170,7 @@ function dirichlet(value; on::BoundarySelector, field=nothing, component=nothing
     component === nothing ||
         component isa Integer ||
         throw(ArgumentError("Dirichlet component must be an integer or nothing"))
+    field isa Field && _check_component(component, field)
     return DirichletCondition(value, on, field_name,
                               component === nothing ? nothing : Int(component))
 end
@@ -263,8 +267,9 @@ scalar, a callback `value(x)`, or a per-component indexable value
 (for vector fields). `on` is a [`BoundarySelector`](@ref) selecting
 the facet — build one with [`boundary`](@ref). `component` restricts
 a scalar `value` to one component of a vector field; `nothing`
-(default) applies it to every component. For arbitrary per-component
-values pass an `SVector` / tuple directly.
+(default) applies it to every component, and an index outside
+`1:components` of `u` raises `ArgumentError`. For arbitrary
+per-component values pass an `SVector` / tuple directly.
 
 For Robin, Nitsche, or other non-canonical boundary conditions,
 compose [`block`](@ref) and [`loadform`](@ref) directly with
@@ -274,6 +279,7 @@ integration primitives, not the constitutive choice.
 function neumann(u::Field, value; on::BoundarySelector, component=nothing)
     component === nothing && return loadform(u, source_form(; source=value); on)
     component isa Integer || throw(ArgumentError("Neumann component must be an integer or nothing"))
+    _check_component(component, u)
     selected = Int(component)
 
     # Single-component variant: emit a contribution only when the

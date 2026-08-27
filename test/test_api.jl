@@ -59,3 +59,55 @@ end
 
     @test_throws ArgumentError transfer(solution, model)
 end
+
+# A form assembled as symmetric is built in the lower triangle and mirrored as
+# `tril(A) + tril(A)ᵀ − diag(A)`, so an asymmetric form declared symmetric loses
+# its upper triangle with nothing downstream to notice: the mirrored operator of
+# an advection problem is still solvable and still reports a tiny residual. The
+# default therefore has to be "assemble in full".
+@testset "WeakForm defaults to asymmetric assembly" begin
+    V = space(box((0.0,), (1.0,)); cells=2, order=1)
+    advection(q, trial) = trial.gradient[1]      # a(u, v) = ∫ ∂ₓu · v — not symmetric
+    nosource(q) = 0.0
+
+    form = WeakForm(bilinear=advection, linear=nosource)
+    @test !form.symmetric
+
+    model = prepare(Problem(V, form))
+    @test !model.problem.symmetric
+
+    A = assemble!(model).matrix
+    mirrored = assemble_matrix(model, model.problem.blocks; symmetric=true)
+    @test A != A'                 # the upper triangle survives the default …
+    @test mirrored == mirrored'   # … and is replaced by the mirror when declared
+    @test A != mirrored
+end
+
+# An out-of-range component index matches no dof and no assembly row, so a
+# Dirichlet condition carrying one leaves its boundary free and a Neumann load
+# carrying one assembles to zero — silently in both cases. Every entry point
+# that can see the field's component count rejects it instead.
+@testset "component indices are range-checked" begin
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    u = field(:u, V; components=2)
+    everywhere = boundary(:all)
+
+    @test dirichlet(0.0; on=everywhere, field=u, component=2).component == 2
+    @test_throws ArgumentError dirichlet(0.0; on=everywhere, field=u, component=3)
+    @test_throws ArgumentError dirichlet(0.0; on=everywhere, field=u, component=0)
+    @test_throws ArgumentError neumann(u, 1.0; on=everywhere, component=3)
+
+    # Conditions naming their field by `Symbol`, and unscoped conditions on a
+    # single-field problem, are resolved at `Problem` construction instead.
+    @test_throws ArgumentError poisson(u; source=0.0,
+                                       dirichlet=[dirichlet(0.0; on=everywhere, field=:u,
+                                                            component=3)])
+    @test_throws ArgumentError poisson(u; source=0.0,
+                                       dirichlet=[dirichlet(0.0; on=everywhere, component=3)])
+
+    # An unscoped condition on a multi-field problem names no field to check
+    # against; `_dirichlet_for_field` still rejects it at `prepare` time.
+    two = Problem((u, field(:w, V)); blocks=(stiffness_block(u),),
+                  dirichlet=[dirichlet(0.0; on=everywhere, component=3)])
+    @test_throws ArgumentError prepare(two)
+end

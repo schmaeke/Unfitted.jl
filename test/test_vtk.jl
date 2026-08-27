@@ -1,12 +1,21 @@
 using StaticArrays
 
+# Parse one `<DataArray>` back out of an ASCII `.vtu`/`.vtp` by name, so the
+# tests can assert the numbers ParaView will show. Requires `ascii=true,
+# append=false` on the write; the appended-binary form carries no parsable text.
+_vtu_values(xml, name) = split(match(Regex("Name=\"$name\"[^>]*>([^<]*)</DataArray>"),
+                                     xml).captures[1])
+_vtu_ints(xml, name) = parse.(Int, _vtu_values(xml, name))
+_vtu_floats(xml, name) = parse.(Float64, _vtu_values(xml, name))
+
 @testset "partitioned VTK bundle with level meshes" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(1, 1), order=1)
     V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(1, 1), order=2)
-    model = prepare(poisson(V; source=0.0))
-    solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
-                        Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    # u ≡ 1 solves −Δu = 0 with u = 1 on ∂Ω and lies in the base space, so the
+    # overlay's p = 2 modes come back at zero and every exported value is 1.
+    model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(1.0; on=boundary(:all))]))
+    solution = solve!(model)
 
     dir = mktempdir()
     files = write_vtk(joinpath(dir, "case"), solution, model; subdivisions=:none, ascii=true,
@@ -22,11 +31,15 @@ using StaticArrays
     @test all(isfile, files)
 
     solution_xml = read(joinpath(dir, "case_data.vtu"), String)
-    @test occursin("uh", solution_xml)
-    @test occursin("twice", solution_xml)
-    @test occursin("midpoint_x", solution_xml)
-    @test occursin("region_id", solution_xml)
-    @test occursin("cover_count", solution_xml)
+    # 5 admissible regions (the overlay box plus the four base remainders), one
+    # unsubdivided VTK cell each, 4 corners per cell.
+    uh = _vtu_floats(solution_xml, "uh")
+    @test length(uh) == 20
+    @test maximum(abs, uh .- 1) < 1.0e-12
+    @test maximum(abs, _vtu_floats(solution_xml, "twice") .- 2) < 1.0e-12
+    @test _vtu_ints(solution_xml, "region_id") == 1:5
+    @test _vtu_ints(solution_xml, "cover_count") == [1, 1, 2, 1, 1]
+    @test _vtu_floats(solution_xml, "midpoint_x") ≈ [0.5, 0.125, 0.5, 0.875, 0.5]
 
     mesh_xml = read(joinpath(dir, "case_level_2_overlay_mesh.vtu"), String)
     @test occursin("level_id", mesh_xml)
@@ -156,10 +169,6 @@ end
     # cell data; assert the actual values, not just that the arrays are emitted. A
     # 4×4 p=2 base with an aligned p=3 overlay over the middle 2×2 block covers four
     # base cells and sheds high-order (plus one deduped vertex) there.
-    _vtu_ints(xml, name) = parse.(Int,
-                                  split(match(Regex("Name=\"$name\"[^>]*>([^<]*)</DataArray>"),
-                                              xml).captures[1]))
-
     V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2),
                 box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4), order=3)
     model = prepare(mass(V))
@@ -210,7 +219,9 @@ end
                       append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
 
     solution_xml = read(joinpath(dir, "disk_data.vtu"), String)
-    @test occursin("level_set", solution_xml)
+    points = reshape(_vtu_floats(solution_xml, "Points"), 3, :)
+    @test _vtu_floats(solution_xml, "level_set") ≈
+          [phi_disk(view(points, :, i)) for i in axes(points, 2)] atol = 1.0e-14
 end
 
 @testset "VTK omits level_set when no PhysicalDomain is attached" begin

@@ -261,15 +261,18 @@ For a bespoke interface term that is *not* a symmetric jump coupling, attach it
 directly with `block(test, trial, form; on = interface(uₐ, u_b, Γ))`.
 
 !!! note "Threaded assembly under code coverage"
-    Interface coupling passes assemble in parallel, like every other pass. A known
-    Julia `--code-coverage` + multithreading codegen artifact can, in that specific
-    instrumented configuration, nondeterministically corrupt the assembled
-    two-sided interface block — observed only for vector/multi-component couplings,
-    only under coverage with `Threads.nthreads() ≥ 2`, and never in an ordinary
-    (non-coverage) run. The corruption is a Julia-side issue, not a modelling one;
-    it is not reproducible outside a coverage-instrumented process and does not
-    affect real solves. If you must assemble a coupled system for bit-reproducible
-    output *inside* a coverage-instrumented multithreaded process, assemble that
+    Interface coupling passes assemble in parallel, like every other pass. One
+    unexplained observation stands against that: the assembled two-sided block of
+    a vector-valued coupling was seen to be nondeterministically corrupted under
+    `--code-coverage` with `Threads.nthreads() ≥ 2`, on both x86 and ARM, and
+    never outside a coverage-instrumented process. It has not been reproduced
+    since, and the mechanism is not established. A later stress campaign — some
+    30,000 assemblies compared bit-exactly against serial across both platforms,
+    plus twenty consecutive coverage-instrumented full-suite runs at four threads
+    on Linux x64 — produced no mismatch, with a positive control confirming the
+    comparison detects a one-ulp perturbation. That is a strong negative result
+    and not a proof of absence. If you need bit-reproducible output from a coupled
+    assembly *inside* a coverage-instrumented multithreaded process, assemble that
     step serially with `assemble!(model; threaded=false)`.
 """
 function couple(u_a::Field, u_b::Field, geometry::BoundaryMesh, form::WeakForm)

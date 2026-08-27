@@ -1,11 +1,15 @@
 using BasicBSpline
 using StaticArrays
-using LinearAlgebra: norm
+using LinearAlgebra: Symmetric, norm, rank
 
 # Smoke tests for the BasicBSpline extension. Mirror the integrated
 # Legendre test surface (`test_basis.jl`) where the interface is shared,
 # and add B-spline-specific tests for the dof-key sharing and mask
 # handling.
+#
+# The two masked-overlay testsets below reuse `_gram` / `_proj_residual` and the
+# `_one` / `_x1` / `_INT_*` constants from `test_coverage_reduction.jl`, which
+# `runtests.jl` includes first.
 
 @testset "BSpline extension: basis interface" begin
     fam_marker = bspline()
@@ -234,41 +238,43 @@ end
     @test c2.err < 1.0e-3
 end
 
-@testset "BSpline extension: arbitrary mask geometries solve" begin
-    # Each non-separable mask geometry (L-shape, hole) must produce a
-    # well-posed system with a finite solution. No singularity from
-    # over-elimination thanks to the linear-constraint primitive.
+@testset "BSpline extension: L-shape overlay mask stays independent and complete" begin
+    # The L-shape mask is non-separable, so its artificial boundary is carried by
+    # linear constraints rather than by dof-wise elimination. The mass matrix is the
+    # Gram matrix of the surviving basis, so it is full rank iff those constraints
+    # eliminate nothing they should not, and the space reproduces 1 and x₁ exactly iff
+    # the base's linear skeleton survives under the covered region. The L is one cell
+    # thick, so no base vertex is buried and the linear dedup never fires.
     Vbase = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=2)
-    # L-shape overlay mask.
     mask_L = falses(4, 4)
     mask_L[1:4, 1] .= true
     mask_L[1, 2:4] .= true
     Vover = overlay(Vbase, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3, basis=bspline(),
                     active=mask_L)
-    problem = poisson(Vover; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))])
-    model = prepare(problem)
-    solution = solve!(model)
-    @test isfinite(value(solution, model, field(:u, Vover), (0.5, 0.5)))
+    m, l = _gram(Vover)
+    @test rank(Symmetric(Matrix(m.matrix))) == active_unknowns(l)
+    @test _proj_residual(m, _one, _INT_ONE) < 1e-6
+    @test _proj_residual(m, _x1, _INT_X1SQ) < 1e-6
 end
 
-@testset "BSpline extension: masked overlay still solves" begin
-    # 2D Poisson on the unit square with a B-spline overlay covering
-    # only a sub-rectangle via mask. The mask-induced face becomes a
-    # C⁰ junction; the overlay contribution vanishes on every
-    # artificial boundary (mesh-edge + C⁰ junctions).
+@testset "BSpline extension: block overlay mask buries a vertex the spline cannot replace" begin
+    # The same Gram check on a separable 2×2 block mask, whose active region is a
+    # nested patch of four base cells. Mesh nesting is all `_nested_over` looks at, so
+    # the linear dedup fires on the base vertex buried at (0.375, 0.375) — but the
+    # covering level is a maximal-smoothness spline, which has no kink at a simple
+    # interior knot and so cannot reproduce that hat. Nothing replaces the eliminated
+    # mode: the space stays independent but loses first-order completeness (‖1 − Π1‖ ≈
+    # 6e-3, 0.44 pointwise). The two assertions below are the contract order reduction
+    # claims, and pass once the dedup consults the covering basis, not only its mesh.
     Vbase = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=2)
     overlay_mask = falses(4, 4)
     overlay_mask[1:2, 1:2] .= true
     Vover = overlay(Vbase, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3, basis=bspline(),
                     active=overlay_mask)
-    u = field(:u, Vover)
-    problem = poisson(Vover; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))])
-    model = prepare(problem)
-    solution = solve!(model)
-    # Sanity: SPD-style residual is small and the centerline value is
-    # finite and within a reasonable range of the no-overlay solution.
-    @test active_unknowns(model.dofs) > 0
-    @test isfinite(value(solution, model, u, (0.5, 0.5)))
+    m, l = _gram(Vover)
+    @test rank(Symmetric(Matrix(m.matrix))) == active_unknowns(l)
+    @test_broken _proj_residual(m, _one, _INT_ONE) < 1e-6
+    @test_broken _proj_residual(m, _x1, _INT_X1SQ) < 1e-6
 end
 
 @testset "BSpline extension: moved overlay rebuilds knot vectors" begin

@@ -1,3 +1,4 @@
+using BasicBSpline
 using LinearAlgebra
 using StaticArrays
 
@@ -171,6 +172,34 @@ end
                    for raw in target_overlay_raw
                    if Unfitted.constraint_kind(target_model.dofs, raw) == :overlay]
     @test all(iszero(Unfitted.constrained_value(target_model.dofs, raw)) for raw in constrained)
+end
+
+@testset "L2 transfer between B-spline models across a masked overlay" begin
+    # The package promises a projection test per basis family, and `transfer` had never
+    # run on the second one. A masked B-spline overlay resolves its artificial boundary
+    # into multi-raw pivots, so the target layout takes the `has_linear_constraints`
+    # dof-table branch in `_transfer_local_dofs!`; the flag is asserted so the test
+    # cannot drift off the branch it exists to cover. The target space contains the
+    # source space, so the projection is the identity there and both the linear-solve
+    # residual and the reproduction error must sit at round-off, not merely be finite.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    source_space = space(omega; cells=(4, 4), order=2, basis=bspline())
+    mask = BitArray([true true; true false])
+    # Overlay faces at 0.3 / 0.7 fall inside base cells, so no base combination can
+    # vanish outside the overlay and the superposed mass stays non-singular.
+    target_space = overlay(source_space, box((0.3, 0.3), (0.7, 0.7)); cells=(2, 2), order=2,
+                           basis=bspline(), active=mask)
+
+    source_model = prepare(poisson(source_space; source=1.0,
+                                   dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    source_solution = solve!(source_model)
+    target_model = prepare(poisson(target_space; source=0.0))
+    @test Unfitted.has_linear_constraints(target_model.dofs)
+
+    target_solution = transfer(source_solution, source_model, target_model)
+    @test target_solution.diagnostics.residual_norm < 1.0e-12
+    @test l2_error(target_solution, target_model,
+                   x -> value(source_solution, source_model, x); norm=:relative) < 1.0e-12
 end
 
 @testset "L2 transfer rejects incompatible models" begin

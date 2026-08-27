@@ -1852,14 +1852,13 @@ function _assemble_partitioned!(sink, model::Model{D,T}, blocks, loads, nactive:
         regions = _resolve_on_regions(model, on, space)
         isempty(regions) && continue
         # Every pass — volume, facet, surface, and two-sided interface — runs
-        # threaded. NOTE: assembling a two-sided `InterfaceRegion` pass in a
-        # `--code-coverage`-instrumented, multi-threaded process can trigger a
-        # Julia codegen artifact that nondeterministically corrupts the coupled
-        # interface block (observed only for vector/multi-component couplings,
-        # only under coverage with ≥2 threads — never in an ordinary run; see
-        # the `couple` docstring). Ordinary (non-coverage) assembly is unaffected,
-        # so the parallel path ships; a caller needing bit-reproducibility inside
-        # a coverage run assembles that pass with `threaded=false`.
+        # threaded. One unexplained observation stands against that: a two-sided
+        # `InterfaceRegion` pass for a vector coupling, under `--code-coverage`
+        # at ≥2 threads, was nondeterministically corrupted on both x86 and ARM.
+        # Never seen outside coverage, not reproduced since across ~30,000
+        # bit-exact comparisons, mechanism not established (see the `couple`
+        # docstring); the parallel path ships and `threaded=false` is the
+        # escape hatch.
         _run_pass!(sink, rhs, model, regions, symmetric, Tuple(sel_blocks), Tuple(sel_loads),
                    nothing, state_coefficients, threaded)
     end
