@@ -155,6 +155,7 @@ a few minutes the first time.
 | `applications/interface_coupling_2d/` | Bonded bi-material joint: two independently meshed subdomains tied across a shared seam by a weighted Nitsche interface form |
 | `applications/imported_geometry_3d/` | Heat conduction in a non-convex L-bracket whose geometry arrives as a triangle surface mesh (`FileIO` + `MeshIO`) rather than as a formula |
 | `applications/time_integration/` | Transient heat conduction where Unfitted supplies `M`, `K` and `f` once and `OrdinaryDiffEq.jl` owns the time axis |
+| `applications/thermal_curing_2d/` | Irreversible thermal curing of a thermoset: the cure fraction is per-quadrature-point `QuadField` state, the conductivity depends on it (Picard per step), and the overlay activates on the cure front — with `RBFP0` carrying the state across every rebuild |
 
 ### Reproductions — the paper's benchmarks
 

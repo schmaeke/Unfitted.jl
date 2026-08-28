@@ -368,6 +368,62 @@
         @test all(row -> sane_error(parse(Float64, row[10]), tol.residual), rows)
     end
 
+    # The curing application prints no error against an exact solution — the
+    # problem has none. What it prints instead is a *contrast*: the same
+    # transient run twice, once carrying the per-quadrature-point cure state
+    # across every activation-driven rebuild and once dropping it. Each
+    # assertion below is a sentence of the example's prose.
+    function check_curing(output, tol)
+        # "the script prints the point count on either side of every rebuild,
+        # and they differ every time" — if one rebuild left the quadrature cloud
+        # alone, the transfer would be demonstrating nothing there. Guarded by
+        # the rebuild count below, since an empty list also reports "all
+        # changed".
+        @test occursin("(all changed)", output)
+        rebuilds = match(r"χ transferred \(RBFP0\)\s+(\d+)\s", output)
+        @test rebuilds !== nothing
+        if rebuilds !== nothing
+            @test parse(Int, rebuilds.captures[1]) ≥ tol.rebuilds
+        end
+
+        # "Picard contracts linearly at a rate near 0.2" — the fixed point is
+        # reached on every step rather than the iteration cap being hit.
+        counts = match(r"Picard iterations per step\s*:\s*\[([0-9, ]+)\]", output)
+        @test counts !== nothing
+        if counts !== nothing
+            @test maximum(parse.(Int, split(counts.captures[1], ", "))) ≤ tol.picard
+        end
+
+        # The accuracy claim, and the reason the reference run exists: the
+        # carried answer must reproduce the run that never remeshed, not merely
+        # differ from the run that threw the state away. Contrast proves the
+        # transfer matters; only this proves it is right.
+        accuracy = match(r"carried vs reference[^:]*:\s*([0-9.eE+-]+)\s*%", output)
+        @test accuracy !== nothing
+        if accuracy !== nothing
+            @test parse(Float64, accuracy.captures[1]) ≤ tol.accuracy_percent
+        end
+
+        # "the RBF interpolant is not monotone … it overshoots a little where
+        # the front is steepest". A little is the claim; this is the bound.
+        excursion = metric_values(output, raw"excursion outside \[0, 1\] introduced by the " *
+                                          "RBF transfer")
+        @test length(excursion) == 1
+        @test all(value -> sane_error(value, tol.excursion), excursion)
+
+        # The headline. `cured area = ∫_Ω χ dx` has to be a substantial region
+        # when χ rides along, and a small fraction of it when χ is dropped —
+        # "the physics comes out wrong, not merely less accurate".
+        areas = match(r"cured_area: \(transferred = ([-+0-9.eE]+), dropped = ([-+0-9.eE]+)\)",
+                      output)
+        @test areas !== nothing
+        if areas !== nothing
+            transferred, dropped = parse.(Float64, areas.captures)
+            @test tol.cured_area[1] < transferred < tol.cured_area[2]
+            @test 0 ≤ dropped < transferred / tol.contrast
+        end
+    end
+
     # The transient prints no error against an exact solution; the numbers it
     # does produce are the residuals of the L²-transfers that carry the state
     # across each mesh update, printed as one Julia vector. A direct mass solve
@@ -438,6 +494,20 @@
              # digits under both integrators.
              (name="applications/time_integration", env=Dict{String,String}(),
               requires=("OrdinaryDiffEq",), check=check_single_l2, tol=1.0e-2),
+             # Irreversible thermal curing on a cure front that drives its own
+             # overlay activation: the only example carrying `QuadField`
+             # per-quadrature-point state and `RBFP0` history transfer through a
+             # physical loop. Measured: 6 rebuilds, each moving the quadrature
+             # cloud (576 → 1224 points); Picard converges in at most 13
+             # iterations per step; the RBF transfer undershoots χ by at most
+             # 0.156; cured area 0.1226 carrying χ against exactly 0.0 dropping
+             # it. The contrast factor is the point of the example, so it is
+             # asserted at ten rather than at the ∞ the run actually delivers.
+             (name="applications/thermal_curing_2d", env=Dict{String,String}(), requires=(),
+              check=check_curing,
+              tol=(rebuilds=3, picard=16, excursion=5.0e-1, accuracy_percent=3.0,
+                   cured_area=(1.0e-2, 1.0),
+                   contrast=10)),
 
              # ── Reproductions ───────────────────────────────────────────────
              # Smooth manufactured Laplace, published 12×12 p=4 config (already
