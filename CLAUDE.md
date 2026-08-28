@@ -71,6 +71,21 @@ running as an agent.
      and remaining risks.
   4. Be explicit about any command that failed or was skipped.
 
+## Commit messages
+
+  - **Never put a link to an agent session in a commit message.** No
+    `Claude-Session:` trailer, no `https://claude.ai/...` URL, no session
+    identifier in the body. This repository is public, and a session link
+    is private working context rather than part of the permanent record —
+    it says nothing a future reader of the history needs and cannot be
+    retracted once pushed.
+  - The `Co-Authored-By: Claude <...>` trailer is welcome and should stay.
+    It is attribution, which belongs in the record.
+  - Write the message for someone reading `git log` in two years with no
+    access to the conversation that produced the change: what problem it
+    solves, why this approach, and the measured before/after numbers where
+    the change is a fix or an optimisation.
+
 ## Destructive operations
 
 Match the scope of your actions to what was actually requested. For
