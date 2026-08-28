@@ -95,27 +95,63 @@ Julia 1.10 or newer is required.
 
 ## Quick example
 
-Modified Helmholtz on a disk-shaped immersed domain:
+Poisson on a square plate with a circular hole. The plate's outer edge is a
+face of the background box and carries a Dirichlet condition; the hole is
+immersed — the mesh knows nothing about it — and is left free.
 
 ```julia
 using Unfitted
 
+# The background box. It is meshed regardless of the geometry, which is what
+# makes the method unfitted: cells may be inside Ω, outside it, or cut by ∂Ω.
 omega = box((-1.0, -1.0), (1.0, 1.0))
-disk  = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.7; lipschitz=1.0,
+
+# Ω = { x : φ(x) ≤ 0 } ∩ omega, so this φ keeps the square *minus* a disk of
+# radius 0.7. `lipschitz = 1` certifies φ as a signed distance, which lets the
+# quadrature kernel skip subdivision it can prove unnecessary;
+# `subcell_length_scale` is the geometric resolution for cells it cannot.
+plate = physical_domain(x -> 0.7 - sqrt(x[1]^2 + x[2]^2); lipschitz=1.0,
                         subcell_length_scale=0.02)
 
-V = space(omega; cells=(16, 16), order=2, physical=disk)
+# 16×16 cells of quadratic integrated Legendre. Cells wholly outside Ω are
+# dropped; cut cells get a non-negative moment-fitted rule instead of tensor
+# Gauss. `u` is the unknown field on that space — scalar unless you ask for
+# components.
+V = space(omega; cells=(16, 16), order=2, physical=plate)
 u = field(:u, V)
 
+# The weak form, assembled term by term: `blocks` are bilinear (here ∫ ∇u·∇v),
+# `loads` are linear (∫ f v with f ≡ 1), and `dirichlet` is imposed strongly by
+# eliminating the constrained dofs rather than by penalty.
 problem = Problem((u,);
-                  blocks    = (stiffness_block(u), mass_block(u)),
-                  loads     = (source_load(u; source = x -> 1.0),),
+                  blocks    = (stiffness_block(u),),
+                  loads     = (source_load(u; source = 1.0),),
                   dirichlet = [dirichlet(0.0; on=boundary(:all))])
 
+# `prepare` does the geometry once — classify cells, build integration regions
+# and cut-cell rules, number the dofs, resolve constraints. `solve!` assembles
+# and factorises. `report` carries the numbers you need to trust the run:
+# active unknowns, cut-region and fit-failure counts, residual norm.
 model    = prepare(problem)
 solution = solve!(model)
 report   = diagnostics(model, solution)
+
+# A ParaView bundle: `plate.vtm` and its pieces. The field is sampled on a
+# subdivided grid, since a p = 2 basis is not linear across a cell. The mesh
+# itself is written as whole cells carrying an `active` flag — cut cells are
+# not clipped — so the hole reads as the 76 of 256 cells the fold dropped.
+write_vtk("plate", solution, model)
 ```
+
+`boundary(:all)` selects faces of the background box `omega`, which here are
+genuine material boundary, so the condition constrains 128 of the 824 raw
+degrees of freedom. That distinction matters as soon as the geometry moves
+inside the box: had `Ω` been the disk itself rather than the plate around it,
+those same faces would lie entirely in the fictitious region and the identical
+line would have constrained nothing, silently. A condition on an immersed
+surface is a different construction — approximate it as a `BoundaryMesh` and
+impose the datum weakly with a Nitsche term, as
+`tutorials/03_immersed_fcm/` does on both rims of an annulus.
 
 `examples/` is organised in three tiers, which answer three different
 questions. **Tutorials** teach the API and are meant to be read in order.
