@@ -441,8 +441,8 @@ function _slab_matches(sigs, visited, start::NTuple{D,Int}, hi::NTuple{D,Int}, s
 end
 
 # Extend `hi` along axis `d` for as long as successive slabs keep matching.
-function _extend_axis(sigs, visited, ranges::NTuple{D,Int}, start::NTuple{D,Int},
-                      hi::NTuple{D,Int}, sig0, d::Int) where {D}
+function _extend_axis(sigs, visited, ranges::NTuple{D,Int}, start::NTuple{D,Int}, hi::NTuple{D,Int},
+                      sig0, d::Int) where {D}
     while hi[d] < ranges[d]
         next = hi[d] + 1
         _slab_matches(sigs, visited, start, hi, sig0, d, next) || break
@@ -453,8 +453,8 @@ end
 
 # Mark every candidate of the merged box `start:hi` visited and push the
 # box's physical extent.
-function _emit_merged_box!(boxes::Vector{AxisBox{D,T}}, visited, intervals,
-                           start::NTuple{D,Int}, hi::NTuple{D,Int}) where {D,T}
+function _emit_merged_box!(boxes::Vector{AxisBox{D,T}}, visited, intervals, start::NTuple{D,Int},
+                           hi::NTuple{D,Int}) where {D,T}
     for c in CartesianIndices(ntuple(e -> start[e]:hi[e], D))
         visited[c] = true
     end

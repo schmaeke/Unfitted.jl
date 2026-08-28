@@ -90,8 +90,7 @@ using Unfitted
 using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, LevelMask, AxisDofKey,
                 TensorDofKey, GeometryTolerance, LinearConstraint, Space, Coverage, cell_box,
                 is_active, _AXIS_BSPLINE, _check_basis_mode, _level_side_is_physical,
-                _tensor_dof_key, _ClassifyCache, _covered_by_level, _nested_over,
-                classify_cell
+                _tensor_dof_key, _ClassifyCache, _covered_by_level, _nested_over, classify_cell
 using StaticArrays: SVector
 using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim
 
@@ -550,8 +549,8 @@ function Unfitted._overlay_constraints(level::Level{D,T,<:BSplineFamily}, V::Spa
             coeffs_lower, coeffs_upper = _trace_coeffs(P_d, lower_span, upper_span, t_star, Val(m))
 
             for perp_cell in perp_cells
-                located = _active_cell_at_face(level, d, j, perp_cell, n_cells, Val(D),
-                                               V.physical, classify_cache)
+                located = _active_cell_at_face(level, d, j, perp_cell, n_cells, Val(D), V.physical,
+                                               classify_cache)
                 located === nothing && continue
                 active_cell, span = located
                 coeffs_for_span = span == lower_span ? coeffs_lower : coeffs_upper
@@ -642,12 +641,11 @@ end
 # `max(1, i − p) … min(ncells, i)` — up to `p + 1` cells. The core's
 # `_axis_incidence` cannot answer this: it is written for the integrated-Legendre
 # node / span keys and reports a single cell for any other tag.
-@inline _axis_support(i::Integer, p::Integer, ncells::Integer) = max(1, i - p):min(ncells, i)
+@inline _axis_support(i::Integer, p::Integer, ncells::Integer) = max(1, i-p):min(ncells, i)
 
-function _support_cells(key::TensorDofKey{D}, family::BSplineFamily{D},
-                        n::NTuple{D,Int}) where {D}
-    return CartesianIndices(ntuple(d -> _axis_support(key.axes[d].index,
-                                                      degree(family.spaces[d]), n[d]), D))
+function _support_cells(key::TensorDofKey{D}, family::BSplineFamily{D}, n::NTuple{D,Int}) where {D}
+    return CartesianIndices(ntuple(d -> _axis_support(key.axes[d].index, degree(family.spaces[d]),
+                                                      n[d]), D))
 end
 
 # True iff level `k`, standing above a B-spline level of per-axis degree `p`,
@@ -701,7 +699,8 @@ function Unfitted._coverage_constraints(level::Level{D,T,<:BSplineFamily}, V::Sp
     family = level.basis
     n = level.mesh.cells
     p = ntuple(d -> degree(family.spaces[d]), D)
-    above = [k for k in V.levels
+    above = [k
+             for k in V.levels
              if k.id > level.id && _reproduces(k, p) && _nested_over(level, k, tol)]
     isempty(above) && return out
     for (key, raw) in level_keys

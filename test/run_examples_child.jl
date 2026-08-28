@@ -13,12 +13,12 @@
 #      and two examples can disagree about what `const order` means. A fresh
 #      `Module` has no `include` of its own, so we install one that closes over
 #      the module before including the script — without it the example's own
-#      `include(joinpath(@__DIR__, "..", "reporting.jl"))` cannot resolve.
-#   2. **No ENV bleed.** The coarse-size knobs (`THS_T_MAX`, `SHP_PHASE_*`,
-#      `BIC_*`) are read by the scripts at include time from `ENV`. They are set
-#      immediately around one case and every touched key is restored afterwards
-#      — deleted if it was previously unset — so no knob survives into the next
-#      case or into the rest of the suite.
+#      `include(joinpath(@__DIR__, "..", "..", "reporting.jl"))` cannot resolve.
+#   2. **No ENV bleed.** The coarse-size knobs (`THS_T_MAX`,
+#      `THS_WRITE_OUTPUT`) are read by the scripts at include time from `ENV`.
+#      They are set immediately around one case and every touched key is
+#      restored afterwards — deleted if it was previously unset — so no knob
+#      survives into the next case or into the rest of the suite.
 #   3. **Containment.** A subprocess confined *any* hard failure to one case.
 #      Here each case runs under its own `try`/`catch`, so an exception (or a
 #      failed `using` of an unavailable package) is recorded as that case's
@@ -27,13 +27,13 @@
 #      batch**, where the old design would have lost only one case. The parent
 #      degrades gracefully — every case whose block never closed is reported as
 #      crashed — but the remaining examples genuinely do not get to run. That is
-#      the price paid for running ten examples in one 7.2 s compilation instead
-#      of ten, and it is paid deliberately.
+#      the price paid for running the whole set in one 7.2 s compilation
+#      instead of one compilation per example, and it is paid deliberately.
 #
 # One further property is genuinely lost rather than reproduced: the examples
 # now share a process, so a script that mutated process-global state (an RNG
 # seed, the BLAS thread count, the working directory) would be visible to every
-# case after it. None of the ten does today — the ENV knobs above are the only
+# case after it. None of them does today — the ENV knobs above are the only
 # global any of them touches — but an example that needs true isolation is a
 # reason to give that case its own subprocess again, not to assume the batch
 # will contain it.
@@ -48,10 +48,15 @@
 # delimiters at arbitrary byte offsets.
 #
 # Usage — the parent drives the first form; the second is for running examples
-# by hand (`--project=.` works for every example that does not need `Tensors`):
+# by hand. Each name is the example's `<tier>/<name>` path under `examples/`.
+# `--project=.` works for every example whose only dependency is `Unfitted`
+# itself; one that also needs a weak dependency (`Tensors`, `BasicBSpline`,
+# `FileIO` + `MeshIO`) needs a project that carries it, and one that needs a
+# package the repository does not depend on at all — `OrdinaryDiffEq` — has to
+# be run on its own example project, which `test_examples.jl` explains:
 #
 #     julia -O0 --project=<env> test/run_examples_child.jl --cases=<payload.jl>
-#     julia -O0 --project=. test/run_examples_child.jl laplace_unit_square_smooth
+#     julia -O0 --project=. test/run_examples_child.jl reproductions/singular_square_2d
 #
 # `<payload.jl>` is a file that evaluates to a `NamedTuple`
 #
@@ -67,8 +72,12 @@ const EXAMPLES_DIRECTORY = abspath(joinpath(@__DIR__, "..", "examples"))
 const DEFAULT_MARKERS = (opening="##UNFITTED-EXAMPLE-BEGIN##", closing="##UNFITTED-EXAMPLE-END##",
                          done="##UNFITTED-EXAMPLES-DONE##")
 
-# Path of one example script: `examples/<name>/<name>.jl`.
-example_script(name) = joinpath(EXAMPLES_DIRECTORY, name, name * ".jl")
+# Path of one example script. A case name carries its tier, so it is a
+# *relative path* under `examples/` — `"tutorials/01_first_solve"`,
+# `"reproductions/singular_square_2d"` — while the script inside the leaf
+# directory is named after the last component alone:
+# `examples/<tier>/<name>/<name>.jl`. Hence `basename`.
+example_script(name) = joinpath(EXAMPLES_DIRECTORY, name, basename(name) * ".jl")
 
 # Turn the command line into the `(markers, cases)` payload. `--cases=<file>`
 # supplies both (the parent's form); bare arguments are example names run with

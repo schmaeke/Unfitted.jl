@@ -457,8 +457,8 @@ function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T},
         isempty(saye_pts) && return SVector{D,T}[], T[], zero(T), :empty
         moments = _moments_from_rule(saye_pts, saye_ws, region_box, moment_order)
         candidates = _cap_candidates(saye_pts, moment_order, _candidate_budget(attempt))
-        kept, kept_ws, residual = _solve_moment_fit(moments, candidates, region_box,
-                                                    moment_order, sum(saye_ws))
+        kept, kept_ws, residual = _solve_moment_fit(moments, candidates, region_box, moment_order,
+                                                    sum(saye_ws))
         # A fit whose every weight falls under the truncation cutoff is no rule at
         # all: hand back the same `:empty` an empty kernel rule returns, so the
         # caller drops the region (or keeps its α-stabilised tensor part) instead

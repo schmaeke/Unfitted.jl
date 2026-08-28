@@ -1,7 +1,7 @@
 using BenchmarkTools
 using Unfitted
 
-# Smaller version of examples/singular_square_2d.jl (4 refinements instead of 8
+# Smaller version of examples/reproductions/singular_square_2d/ (4 refinements instead of 8
 # to keep bench wall time reasonable). Nested overlays stress `_merged_boxes`
 # and the per-region triplet emit.
 group = SUITE["scenarios"]["singular_corner"] = BenchmarkGroup()

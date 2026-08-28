@@ -178,8 +178,8 @@ end
 # block's are cached. To read a field on a *different* subdomain, call
 # `value(solution, model, other, x)` with the sample coordinate `x` the
 # callback also receives.
-function _vtk_value_accessor(coefficients, model::Model, space::Space,
-                             block_layout::FieldLayout, parents, field_data)
+function _vtk_value_accessor(coefficients, model::Model, space::Space, block_layout::FieldLayout,
+                             parents, field_data)
     return (context, xi, field=nothing) -> begin
         layout = field === nothing ? block_layout : _model_field_layout(model, field)
         data = field === nothing ? field_data :

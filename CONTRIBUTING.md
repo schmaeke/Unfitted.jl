@@ -125,7 +125,7 @@ precommit.jl                  formatter wrapper + SLOC/comment/docstring stats
 src/                          library source
 ext/                          package extensions (BasicBSpline, FileIO+MeshIO+GeometryBasics, Tensors)
 test/                         unit and regression tests
-examples/                     runnable scripts, one sub-directory per example, each with its own Project.toml
+examples/                     runnable scripts in three tiers (tutorials/, applications/, reproductions/), one sub-directory per example, each with its own Project.toml
 benchmarks/                   targeted performance benchmarks (own Project.toml)
 .github/workflows/ci.yml      CI: tests on Julia 1.10 and latest, 1 and 4 threads (three legs at -O0, one at default -O), plus the format check
 ```
@@ -172,32 +172,55 @@ here; expensive convergence studies belong in `examples/`.
 
 ### Examples (`examples/`)
 
-Self-contained runnable scripts. Each example lives in its own
-sub-directory `examples/<name>/` with a `<name>.jl` driver and a
+Self-contained runnable scripts, organised in three tiers. The tier is
+part of the path, and choosing it is the first decision when adding an
+example:
+
+| Tier | Purpose | What belongs there |
+|---|---|---|
+| `tutorials/` | Teach the API | Numbered, read in order, each building on the last. A header block states what the reader will learn and what they should already know; the comments teach rather than annotate; the dimension is never hardcoded unless the example is deliberately 1-D. Aim at roughly 60 SLOC of code — comment volume is unrestricted, and generosity is expected. |
+| `applications/` | Show the package on a recognisable problem | A problem a reader would know from a textbook or from practice, solved plainly, with no cleverness that obscures the API. This is also where the package is shown working alongside third-party Julia packages (`Tensors.jl`, `FileIO`/`MeshIO`, `OrdinaryDiffEq.jl`). |
+| `reproductions/` | Hold the scientific record | The method paper's benchmarks at their published configurations, plus the FCM reproductions. These are pinned by the example smoke suite and are not to be coarsened for speed. |
+
+Each example lives in its own sub-directory
+`examples/<tier>/<name>/` with a `<name>.jl` driver and a
 `Project.toml` that wires `Unfitted` in via `[sources] = {path =
-"../.."}`. Example-specific dependencies (e.g. `StaticArrays`,
-`LinearAlgebra`, or third-party packages used only for an immersed
-geometry demo) belong in the example's own `Project.toml` and must
-never be added to the package's top-level `Project.toml`. Per-example
-`Project.toml` files set `julia = "1.11"` in `[compat]` because
-`[sources]` is a Julia 1.11 feature; the package itself still
-supports Julia 1.10.
+"../../.."}` — three levels up, because of the tier. Example-specific
+dependencies (e.g. `StaticArrays`, `LinearAlgebra`, or third-party
+packages used only for an imported-geometry or time-integration demo)
+belong in the example's own `Project.toml` and must never be added to
+the package's top-level `Project.toml`. Per-example `Project.toml`
+files set `julia = "1.11"` in `[compat]` because `[sources]` is a
+Julia 1.11 feature; the package itself still supports Julia 1.10.
 
 A shared helper `examples/reporting.jl` is `include`d by every
-example via `joinpath(@__DIR__, "..", "reporting.jl")` and depends
-only on what `Unfitted.jl` already exports.
+example via `joinpath(@__DIR__, "..", "..", "reporting.jl")` and
+depends only on what `Unfitted.jl` already exports. Every example
+prints its report through `print_run_report`, so the whole set reads
+the same way and the smoke suite has one output format to parse.
 
 Run an example with
 
 ```bash
-julia --project=examples/<name> examples/<name>/<name>.jl
+julia --project=examples/<tier>/<name> examples/<tier>/<name>/<name>.jl
 ```
 
-Output artifacts go under `examples/<name>/output/`, which is
+`Manifest.toml` is git-ignored repository-wide, so the first run of an
+example resolves and installs that example's own dependencies.
+
+Output artifacts go under `examples/<tier>/<name>/output/`, which is
 git-ignored repository-wide.
 
-Examples should demonstrate the *public* API; reach into internals
-only when an example is specifically about those internals.
+Examples should demonstrate the *public* API; reach into
+`Unfitted._internal` only when an example is specifically about those
+internals, which none of the current set is.
+
+Prose in an example is held to the same standard as prose in `src/`:
+full sentences, unicode maths, never LaTeX, and a citation with
+authors, title, journal, year and DOI wherever a published result is
+involved. An application or reproduction must state the problem, the
+reference if there is one, and what the printed metric means, so that a
+reader can tell from the output alone whether the run succeeded.
 
 ### Benchmarks (`benchmarks/`)
 
@@ -1006,10 +1029,32 @@ demos.
   - Public API workflow tests that build and solve at least one small
     problem without manual dof enumeration, manual constraint masks,
     or manual intersection-region construction.
-  - Regression examples based on the paper: 1D elastic bar with
-    discontinuous strain, 2D singular corner problem, small-overlap
-    conditioning smoke test, and a moving heat-source smoke or reduced
-    regression test.
+  - Regression examples based on the paper, required here by
+    *capability* rather than by file name, so that reorganising
+    `examples/` cannot quietly drop one: a one-dimensional problem
+    carrying a discontinuous or under-resolved feature; a 2D singular
+    corner problem; a small-overlap conditioning smoke test; and a
+    moving heat-source smoke or reduced regression test. The last three
+    are `reproductions/singular_square_2d`,
+    `reproductions/conditioning_small_overlap` and
+    `reproductions/traveling_heat_source_2d`, all pinned by the example
+    smoke suite. **Requirement not yet met:** the one-dimensional slot
+    is vacant. It used to be `bar_1d_unresolved_interface`, an elastic
+    bar whose material interface fell inside a cell; that example was
+    retired in the examples rebuild, and `tutorials/01_first_solve`,
+    which inherited the 1D slot, solves a *smooth* manufactured sine on
+    the interval — it exercises the 1D path end to end, and the smoke
+    suite pins its error, but it carries no discontinuity and nothing
+    the mesh fails to resolve. The nearest live coverage is split, and
+    none of it is one-dimensional: `test_assembly.jl`'s "discontinuous
+    coefficient need not align with overlay boundaries" for the
+    discontinuity itself, `applications/interface_coupling_2d` for a
+    jump in material data across a seam, and `tutorials/02_overlays`
+    for a feature the base mesh cannot resolve. Restoring the
+    requirement means adding a 1D discontinuous- or
+    unresolved-feature run — most cheaply as a further section of
+    `tutorials/01_first_solve`, or as a `reproductions/` entry if the
+    paper's bar is wanted back verbatim.
   - Selective activation: dof-structure equivalence between a
     `LevelMask` and a geometrically smaller overlay covering the same
     active cells; artificial-boundary constraint on internal
@@ -1047,14 +1092,32 @@ demos.
   - Package extensions: the B-spline family's basis values, constraints
     and a small assembly; the MeshIO signed-distance leaf; the Tensors
     notation round-trip.
-  - Example smoke suite: all ten `examples/<name>/<name>.jl` scripts run
-    to a clean exit at a coarse size in the default suite, with a finite,
-    sane headline metric wherever the script prints one. They share one
-    batched subprocess (`test/run_examples_child.jl`), each included into
-    its own `Module`, because the per-process compilation floor dominated
-    when every script paid it separately. The three `Tensors`-using
-    examples are skipped outside `Pkg.test`, where that weak dependency
-    is unavailable.
+  - Example smoke suite: every `examples/<tier>/<name>/<name>.jl`
+    script runs to a clean exit at a coarse size in the default suite,
+    with a finite, sane headline metric wherever the script prints one,
+    banded at the value measured on the configuration the case actually
+    runs. Where a tutorial's *prose* tells the reader what to look for
+    in the output, that claim is asserted too — the overlay's
+    order-of-magnitude improvement over the base level, the agreement
+    between a reduced and an unreduced stack, the fifteen orders of
+    magnitude of conditioning that one duplicated B-spline mode costs —
+    so a tutorial whose text and output disagree fails here. The cases
+    share one batched subprocess (`test/run_examples_child.jl`), each
+    included into its own `Module`, because the per-process compilation
+    floor dominated when every script paid it separately. Each case
+    declares the packages it needs beyond `Unfitted` in a `requires`
+    field, and a case the active project cannot resolve is skipped
+    rather than failed: the three examples that need a weak dependency
+    (`Tensors`; `BasicBSpline`; `FileIO` + `GeometryBasics` + `MeshIO`)
+    run under `Pkg.test`, where all of those sit in the `test` target,
+    and skip in a bare `--project=.` isolation run.
+    **Requirement not yet met:** `applications/time_integration` needs
+    `OrdinaryDiffEq`, which is deliberately absent from the package's
+    dependencies, weak dependencies and test target — it is a
+    hundred-package tree, and the example exists precisely to show that
+    no extension is needed for it. That case is therefore skipped
+    everywhere and has no automated coverage; it must be run by hand,
+    or by a separate CI job, on the example's own project.
 
 ### Testing rules
 

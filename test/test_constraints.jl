@@ -45,8 +45,7 @@ end
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
     model = prepare(poisson(V; source=0.0,
                             dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:upper))]))
-    @test haskey(model.facet_regions,
-                 (boundary(axis=1, side=:upper), model.problem.space))
+    @test haskey(model.facet_regions, (boundary(axis=1, side=:upper), model.problem.space))
 end
 
 @testset "per-component Dirichlet frees the other components" begin
@@ -565,7 +564,7 @@ end
     # Every candidate that is *not* on Γ_o keeps its order-reduction provenance,
     # so the fix removes only the mislabelled ones.
     reduced = count(r -> layout.elimination_source[r] === :coverage ||
-                             layout.elimination_source[r] === :dedup,
+                         layout.elimination_source[r] === :dedup,
                     (c.raws[1] for (c, _) in candidates))
     @test reduced == length(candidates) - collisions
 end

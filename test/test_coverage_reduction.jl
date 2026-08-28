@@ -245,8 +245,7 @@ end
     @test Unfitted._inside(m.problem.fields[1].space.physical.geometry,
                            Unfitted.center(Unfitted.cell_box(base.mesh, cell)))
     @test Unfitted._covered_by_level(Unfitted.cell_box(base.mesh, cell), fine,
-                                     GeometryTolerance(Float64),
-                                     m.problem.fields[1].space.physical,
+                                     GeometryTolerance(Float64), m.problem.fields[1].space.physical,
                                      Unfitted._ClassifyCache{2,Float64}())
     @test count(==(:coverage), l.elimination_source) == 8
 

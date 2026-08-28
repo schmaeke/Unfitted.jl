@@ -3,8 +3,9 @@ using StaticArrays
 # Parse one `<DataArray>` back out of an ASCII `.vtu`/`.vtp` by name, so the
 # tests can assert the numbers ParaView will show. Requires `ascii=true,
 # append=false` on the write; the appended-binary form carries no parsable text.
-_vtu_values(xml, name) = split(match(Regex("Name=\"$name\"[^>]*>([^<]*)</DataArray>"),
-                                     xml).captures[1])
+function _vtu_values(xml, name)
+    split(match(Regex("Name=\"$name\"[^>]*>([^<]*)</DataArray>"), xml).captures[1])
+end
 _vtu_ints(xml, name) = parse.(Int, _vtu_values(xml, name))
 _vtu_floats(xml, name) = parse.(Float64, _vtu_values(xml, name))
 
@@ -141,8 +142,8 @@ end
     uh_header = match(r"<DataArray[^>]*Name=\"uh\"[^>]*>", solution_xml)
     @test uh_header !== nothing
     @test occursin("NumberOfComponents=\"3\"", uh_header.match)
-    @test occursin("NumberOfComponents=\"3\"", match(r"<DataArray[^>]*Name=\"Points\"[^>]*>",
-                                                    solution_xml).match)
+    @test occursin("NumberOfComponents=\"3\"",
+                   match(r"<DataArray[^>]*Name=\"Points\"[^>]*>", solution_xml).match)
 end
 
 @testset "level mesh exports all cells with an active flag" begin

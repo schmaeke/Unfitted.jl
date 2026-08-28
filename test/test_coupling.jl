@@ -112,10 +112,8 @@ end
     to = box((0.1, 0.1), (0.6, 0.6))
     @test moved_space(V1; level=2, to=to) isa Space
 
-    coupled = prepare(Problem((u1, u2);
-                              blocks=(stiffness_block(u1), stiffness_block(u2)),
-                              loads=(source_load(u1; source=1.0),
-                                     source_load(u2; source=1.0)),
+    coupled = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
+                              loads=(source_load(u1; source=1.0), source_load(u2; source=1.0)),
                               dirichlet=[dirichlet(0.0; on=boundary(:all), field=:u1),
                                          dirichlet(0.0; on=boundary(:all), field=:u2)]))
     @test length(problem_spaces(coupled.problem)) == 2
@@ -181,18 +179,16 @@ end
     # object is cached twice — once per subdomain — not once.
     @test length(shared.surface_regions) == 2
     @test length(separate.surface_regions) == 2
-    @test diagnostics(shared).surface_region_count ==
-          diagnostics(separate).surface_region_count
+    @test diagnostics(shared).surface_region_count == diagnostics(separate).surface_region_count
 
     # Both subdomains really carry the surface mass: dropping either one would
     # leave that field's diagonal block equal to its bare stiffness block.
-    bare = prepare(Problem((u1, u2);
-                           blocks=(stiffness_block(u1), stiffness_block(u2))))
+    bare = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2))))
     assemble!(bare)
     @test shared.matrix != bare.matrix
     n1 = active_unknowns(prepare(Problem((u1,); blocks=(stiffness_block(u1),))))
     @test shared.matrix[1:n1, 1:n1] != bare.matrix[1:n1, 1:n1]
-    @test shared.matrix[(n1 + 1):end, (n1 + 1):end] != bare.matrix[(n1 + 1):end, (n1 + 1):end]
+    @test shared.matrix[(n1+1):end, (n1+1):end] != bare.matrix[(n1+1):end, (n1+1):end]
 end
 
 @testset "value-equal on= selectors resolve per subdomain, not to the first one" begin
@@ -216,10 +212,8 @@ end
     model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
                             loads=(neumann(u1, 1.0; on=boundary(axis=1, side=:upper)),
                                    neumann(u2, 1.0; on=boundary(axis=1, side=:upper))),
-                            dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower),
-                                                 field=:u1),
-                                       dirichlet(0.0; on=boundary(axis=1, side=:lower),
-                                                 field=:u2)]))
+                            dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower), field=:u1),
+                                       dirichlet(0.0; on=boundary(axis=1, side=:lower), field=:u2)]))
     solution = solve!(model)
 
     @test value(solution, model, u1, (1.0, 0.5)) ≈ 1.0 atol = 1.0e-12
@@ -230,16 +224,15 @@ end
     # The load reaches the second block of the rhs at all. This is the assertion
     # that fails loudest without the fix: `rhs` block 2 was exactly zero.
     n1 = active_unknowns(prepare(Problem((u1,); blocks=(stiffness_block(u1),))))
-    @test !iszero(model.rhs[(n1 + 1):end])
-    @test sum(model.rhs[1:n1]) ≈ sum(model.rhs[(n1 + 1):end])   # symmetric subdomains
+    @test !iszero(model.rhs[(n1+1):end])
+    @test sum(model.rhs[1:n1]) ≈ sum(model.rhs[(n1+1):end])   # symmetric subdomains
 
     # The cache holds four entries — two selector values × two subdomains — and
     # each one's facets sit on the face of *its own* subdomain, not subdomain 1's.
     @test length(model.facet_regions) == 4
     for ((on, key_space), regions) in model.facet_regions
         @test !isempty(regions)
-        expected = on.sides == [(1, :upper)] ? key_space.domain.upper[1] :
-                   key_space.domain.lower[1]
+        expected = on.sides == [(1, :upper)] ? key_space.domain.upper[1] : key_space.domain.lower[1]
         for region in regions, x in region.points
             @test x[1] ≈ expected
         end
@@ -247,8 +240,7 @@ end
 
     # Both faces of both subdomains are represented: x = 0 and 1 (subdomain 1),
     # x = 2 and 3 (subdomain 2). Before the fix only 0 and 1 ever appeared.
-    faces = sort(unique(round(x[1]; digits=12)
-                        for regions in values(model.facet_regions)
+    faces = sort(unique(round(x[1]; digits=12) for regions in values(model.facet_regions)
                         for region in regions for x in region.points))
     @test faces == [0.0, 1.0, 2.0, 3.0]
 end

@@ -32,17 +32,26 @@ The method is described in
   default basis family is hierarchical integrated Legendre; an
   open-knot tensor-product B-spline family is available through the
   `BasicBSpline.jl` package extension (load `BasicBSpline` alongside
-  `Unfitted` and pass `basis = bspline()`).
+  `Unfitted` and pass `basis = bspline()`); worked through in
+  [`examples/tutorials/04_bspline/`](examples/tutorials/04_bspline).
 - **Selective per-cell activation** with the `move!`-style invalidation
   contract; useful for transient problems where small-scale features
-  evolve in time.
+  evolve in time. Overlays, masks and the invalidation contract are
+  worked through in
+  [`examples/tutorials/02_overlays/`](examples/tutorials/02_overlays).
 - **Immersed-boundary integration** through a `PhysicalDomain` carrying a
   CSG level set of smooth leaves (`leaf`/`intersect`/`union`/`setdiff`/
   `complement`). Cells outside `Ω` are dropped from the dof layout; cells
   crossed by `∂Ω` use a non-negative moment-fitted quadrature rule whose
   moments come from Saye's exact implicit quadrature, with the moment-fit
   structure informed by QuESo (see [`NOTICE.md`](NOTICE.md) for upstream
-  attribution).
+  attribution). The level set need not be a formula: a closed segment loop
+  or triangle surface becomes a signed-distance leaf through
+  `mesh_levelset` / `stl_levelset` in the `FileIO` + `MeshIO` extension.
+  See [`examples/tutorials/03_immersed_fcm/`](examples/tutorials/03_immersed_fcm)
+  for the analytic route and
+  [`examples/applications/imported_geometry_3d/`](examples/applications/imported_geometry_3d)
+  for the imported one.
 - **Multi-domain coupling**: fields may live on *independent* spaces —
   each subdomain with its own mesh, level-set fold and dof block — tied
   together across a shared interface mesh by `couple(uₐ, u_b, Γ, form)`.
@@ -108,27 +117,53 @@ solution = solve!(model)
 report   = diagnostics(model, solution)
 ```
 
-A small tour of `examples/`. Each example lives in its own
-sub-directory with a self-contained `Project.toml` (Unfitted is wired
-in via `[sources]`), so example-specific dependencies stay out of the
-package's own `Project.toml`. Run any example with
+`examples/` is organised in three tiers, which answer three different
+questions. **Tutorials** teach the API and are meant to be read in order.
+**Applications** are recognisable engineering problems solved plainly, and are
+where the package is shown working alongside third-party Julia packages.
+**Reproductions** are the scientific record — the benchmarks behind the method
+paper, at their published configurations.
+
+Each example lives in its own sub-directory with a self-contained
+`Project.toml` (Unfitted is wired in via `[sources]`), so example-specific
+dependencies stay out of the package's own `Project.toml`. Run any example
+with
 
 ```bash
-julia --project=examples/<name> examples/<name>/<name>.jl
+julia --project=examples/<tier>/<name> examples/<tier>/<name>/<name>.jl
 ```
 
-| Sub-directory | What it demonstrates |
+`Manifest.toml` is git-ignored, so the first run of an example resolves and
+installs that example's own dependencies. Most resolve in seconds;
+`applications/time_integration` pulls in the `OrdinaryDiffEq.jl` tree and takes
+a few minutes the first time.
+
+### Tutorials — start here
+
+| Sub-directory | What it teaches |
 |---|---|
-| `laplace_unit_square_smooth/` | Smooth Laplace verification — public-API walkthrough |
-| `bar_1d_unresolved_interface/` | 1D elastic bar across a discontinuous coefficient |
-| `singular_square_2d/` | 2D corner-singularity convergence with nested overlays |
-| `conditioning_small_overlap/` | Small-overlap conditioning sweep |
-| `traveling_heat_source_2d/` | Transient heat with hierarchical adaptive overlays |
-| `phase_field_single_edge_notch_2d/` | Phase-field fracture, SENT specimen |
-| `fcm_annular_plate_2d/` | FCM plane-stress annular plate with Nitsche + Neumann (Ruess 2013 §4.2) |
-| `fcm_plate_with_hole_2d/` | FCM plate with a circular hole, Kirsch stress verification |
-| `bimaterial_inclusion_corner_2d/` | Two immersed FCM subdomains coupled by weighted Nitsche across a material interface (Elhaddad 2017 §4.2) |
-| `tanh_layer_2d/` | Steep tanh layer on a curved front — hp-graded overlay stack with order reduction |
+| `tutorials/01_first_solve/` | The whole workflow in seven calls: `box → space → field → poisson → prepare → solve! → diagnostics`, first on an interval and then, unchanged, on a square |
+| `tutorials/02_overlays/` | Local refinement by superposition: adding an overlay, masking it to a patch, `activate!`/`deactivate!`, and reading `reduced_mode_counts` |
+| `tutorials/03_immersed_fcm/` | Geometry the mesh knows nothing about: a CSG level set, cut-cell moment-fit quadrature, and a Nitsche condition on an immersed boundary |
+| `tutorials/04_bspline/` | Swapping the basis family to B-splines, why a nested B-spline stack needs deduplication, and B-splines on an immersed domain |
+
+### Applications — the package on real problems
+
+| Sub-directory | What it solves |
+|---|---|
+| `applications/kirsch_plate_2d/` | Plane-stress plate with a circular hole, verified against the Kirsch solution; the weak form is written in `Tensors.jl` notation |
+| `applications/interface_coupling_2d/` | Bonded bi-material joint: two independently meshed subdomains tied across a shared seam by a weighted Nitsche interface form |
+| `applications/imported_geometry_3d/` | Heat conduction in a non-convex L-bracket whose geometry arrives as a triangle surface mesh (`FileIO` + `MeshIO`) rather than as a formula |
+| `applications/time_integration/` | Transient heat conduction where Unfitted supplies `M`, `K` and `f` once and `OrdinaryDiffEq.jl` owns the time axis |
+
+### Reproductions — the paper's benchmarks
+
+| Sub-directory | What it reproduces |
+|---|---|
+| `reproductions/laplace_unit_square_smooth/` | Smooth Laplace verification on the unit square |
+| `reproductions/singular_square_2d/` | 2D corner-singularity convergence with nested overlays |
+| `reproductions/conditioning_small_overlap/` | Small-overlap conditioning sweep, one CSV row per (order, overlap) |
+| `reproductions/traveling_heat_source_2d/` | Transient heat with hierarchical adaptive overlays and L² state transfer between mesh updates |
 
 ## Documentation
 

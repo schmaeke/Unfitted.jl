@@ -34,8 +34,8 @@ using LinearAlgebra: Symmetric, isposdef, norm, pinv, rank
     # hand-written guard in the extension — rejects integrated Legendre's
     # `:trunk` for it, at `space` time.
     @test Unfitted._supported_modes(fam) == (:tensor,)
-    @test_throws ArgumentError space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=3,
-                                     basis=bspline(), mode=:trunk)
+    @test_throws ArgumentError space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=3, basis=bspline(),
+                                     mode=:trunk)
     @test_throws ArgumentError Unfitted.local_basis_indices(fam, (3, 3), :trunk)
 end
 
@@ -60,8 +60,8 @@ end
     # constraint, while a user-masked face still does. Without the exemption the
     # cut cells around the hole would lose their boundary modes.
     omega = box((0.0, 0.0), (1.0, 1.0))
-    hole = physical_domain(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0,
-                           subcell_length_scale=1 / 64, max_depth=6)
+    hole = physical_domain(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0, subcell_length_scale=1 / 64,
+                           max_depth=6)
     V = space(omega; cells=8, order=2, basis=bspline(), physical=hole)
     l = Unfitted._field_layout(prepare(mass(V)).dofs, :u).dofs
     # dim = cells + p = 10 per axis. Every function touches an active cell, and the
@@ -85,8 +85,8 @@ end
     # cells carry the partition of unity there), and the solution must agree with
     # the integrated-Legendre reference on the same mesh.
     omega = box((0.0, 0.0), (1.0, 1.0))
-    hole = physical_domain(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0,
-                           subcell_length_scale=1 / 64, max_depth=6)
+    hole = physical_domain(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0, subcell_length_scale=1 / 64,
+                           max_depth=6)
     V = space(omega; cells=8, order=3, basis=bspline(), physical=hole)
     m, _ = _gram(V)
     M = Symmetric(Matrix(m.matrix))
@@ -280,19 +280,19 @@ end
     # The two configurations that reach it end to end. Degree 1 puts exactly two
     # terms in each trace constraint, one of them zero at a clamped end, so a 2D
     # overlay must keep `dim − 2 = 3` functions per axis, 9 in all — not 1.
-    free_on_overlay(V) = let l = Unfitted._field_layout(prepare(mass(V)).dofs, :u).dofs
-        count(i -> l.raw_keys[i].level == 2 && l.elimination_source[i] === :free,
-              eachindex(l.raw_keys))
-    end
+    free_on_overlay(V) =
+        let l = Unfitted._field_layout(prepare(mass(V)).dofs, :u).dofs
+            count(i -> l.raw_keys[i].level == 2 && l.elimination_source[i] === :free,
+                  eachindex(l.raw_keys))
+        end
     Ω = box((0.0, 0.0), (1.0, 1.0))
     B = box((0.25, 0.25), (0.75, 0.75))
-    @test free_on_overlay(overlay(space(Ω; cells=8, order=1, basis=bspline()), B;
-                                  cells=4, order=1)) == 9
+    @test free_on_overlay(overlay(space(Ω; cells=8, order=1, basis=bspline()), B; cells=4, order=1)) ==
+          9
     # `continuity_order = p − 1` is the other one: its top-order trace constraint
     # leaves a single zero term behind. dim = 11, m + 1 = 3 eliminated per side ⇒ 5
     # per axis, 25 in all.
-    @test free_on_overlay(overlay(space(Ω; cells=8, order=3, basis=bspline()), B;
-                                  cells=8, order=3,
+    @test free_on_overlay(overlay(space(Ω; cells=8, order=3, basis=bspline()), B; cells=8, order=3,
                                   basis=bspline(continuity_order=2))) == 25
 end
 
@@ -336,9 +336,9 @@ end
     # base cells 3…6 (the overlay box [0.25, 0.75] on 8 cells) that leaves
     # `{i : i − p ≥ 3, i ≤ 6}` — `4 − p` functions per axis, `(4 − p)^D` in D
     # dimensions. The dedup count below is that number, not an observation.
-    nested(ro, p) = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=p,
-                                  basis=bspline(), reduce_order=ro),
-                            box((0.25, 0.25), (0.75, 0.75)); cells=4, order=p)
+    nested(ro, p) = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=p, basis=bspline(),
+                                  reduce_order=ro), box((0.25, 0.25), (0.75, 0.75)); cells=4,
+                            order=p)
     for p in 1:3
         m, l = _gram(nested(true, p))
         @test count(==(:dedup), l.elimination_source) == (4 - p)^2
@@ -369,10 +369,9 @@ end
     # span misses the base function — the finer degree because a maximal-regularity
     # spline of degree p + 1 is C^p at a simple knot, too smooth to carry the kink
     # of a degree-p one. Nothing is deduped, and nothing is rank deficient either.
-    for over in (overlay(base(), B; cells=5, order=3),
-                 overlay(base(), B; cells=4, order=2),
-                 overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=2, basis=bspline()),
-                         B; cells=4, order=3))
+    for over in (overlay(base(), B; cells=5, order=3), overlay(base(), B; cells=4, order=2),
+                 overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=2, basis=bspline()), B; cells=4,
+                         order=3))
         m, l = _gram(over)
         @test count(==(:dedup), l.elimination_source) == 0
         @test rank(Symmetric(Matrix(m.matrix))) == active_unknowns(l)

@@ -1,7 +1,7 @@
 using BenchmarkTools
 using Unfitted
 
-# Mirrors examples/laplace_unit_square_smooth.jl. The nonzero Dirichlet edge
+# Mirrors examples/reproductions/laplace_unit_square_smooth/. The nonzero Dirichlet edge
 # exercises `_project_dirichlet_values!` inside `prepare`, so the prepare bench
 # also covers the boundary L² projection (dense cholesky).
 group = SUITE["scenarios"]["laplace_smooth"] = BenchmarkGroup()

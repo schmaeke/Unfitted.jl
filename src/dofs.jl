@@ -319,7 +319,7 @@ end
 # and never routes through here.
 function _axis_incidence(axis_key::AxisDofKey, ncells::Int)
     axis_key.kind == _AXIS_NODE || return axis_key.index:axis_key.index
-    return max(1, axis_key.index - 1):min(ncells, axis_key.index)
+    return max(1, axis_key.index-1):min(ncells, axis_key.index)
 end
 
 # Incidence ranges of `key` on every axis *except* `axis`, which is pinned to
@@ -550,8 +550,11 @@ function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{
     # simple interior knot, so for p ≥ 2 nothing in its span kinks there. Restricting
     # the dedup to integrated-Legendre covers can only skip a legitimate dedup, never
     # eliminate a mode nothing replaces.
-    nested_above = [k for k in V.levels if k.id > level.id && k.basis isa IntegratedLegendre &&
-                                           _nested_over(level, k, tol)]
+    nested_above = [k
+                    for k in V.levels
+                    if k.id > level.id &&
+                           k.basis isa IntegratedLegendre &&
+                           _nested_over(level, k, tol)]
     # A nested level above reproduces a buried vertex function iff it covers every cell
     # the vertex touches — the same fictitious-aware rule `build_coverage` applied.
     reproduces(k, cells) = all(cells) do ci

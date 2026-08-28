@@ -213,7 +213,8 @@ component_count(::Field{D,T,C}) where {D,T,C} = C
 # carrying it contributes nothing at all — a silently free boundary or an
 # all-zero load rather than an error.
 function _check_component(component, field::Field)
-    component === nothing || 1 ≤ component ≤ component_count(field) ||
+    component === nothing ||
+        1 ≤ component ≤ component_count(field) ||
         throw(ArgumentError("component $component outside 1:$(component_count(field)) of $(field.name)"))
 end
 

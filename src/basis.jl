@@ -409,8 +409,7 @@ modes (`α_d ∈ {0, 1}`) — the Szabó–Babuška trunk space (isotropic order
 `p` required, see [`IntegratedLegendre`](@ref)).
 """
 function local_basis_indices(::BasisFamily, order::NTuple{D,Int}) where {D}
-    all(o -> o >= 0, order) ||
-        throw(ArgumentError("basis order must be nonnegative in every axis"))
+    all(o -> o >= 0, order) || throw(ArgumentError("basis order must be nonnegative in every axis"))
     return _tensor_index_set(order)
 end
 

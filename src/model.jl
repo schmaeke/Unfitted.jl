@@ -159,8 +159,8 @@ end
 # run. One entry per level, `0` for an unmasked level. Reported by
 # `diagnostics` so the user can see how many cells each level dropped.
 function _inactive_cell_counts(spaces)
-    return Int[level.mask === nothing ? 0 : count(!, level.mask.on)
-               for V in spaces for level in V.levels]
+    return Int[level.mask === nothing ? 0 : count(!, level.mask.on) for V in spaces
+               for level in V.levels]
 end
 
 # Per-level count of raws eliminated by order reduction (`:coverage` or
@@ -620,8 +620,7 @@ function prepare(problem::Problem{D,T}; kwargs...) where {D,T}
                                interface_region_count=_region_count(interface_regions))
     _set_plan_stats_multi!(diag, space_plans)
     return Model{D,T,typeof(effective_problem)}(effective_problem, problem.space, 1, space_plans,
-                                                fit_caches,
-                                                layout, nothing, nothing, facet_regions,
+                                                fit_caches, layout, nothing, nothing, facet_regions,
                                                 surface_regions, interface_regions,
                                                 Dict{Symbol,DirichletProjection{D,T}}(), diag,
                                                 nothing, plan_options)
@@ -989,8 +988,8 @@ function _update_mask!(model::Model{D,T}, level_index::Integer, cells, value::Bo
     # the caller's flips — including flips on levels the move does not touch.
     prefold_level = model.prefold_space.levels[level_index]
     model.prefold_space = _remasked_space(model.prefold_space, level_index,
-                                          _apply_mask_update(prefold_level.mask,
-                                                             prefold_level.mesh, cells, value))
+                                          _apply_mask_update(prefold_level.mask, prefold_level.mesh,
+                                                             cells, value))
     model.version += 1
     model.space_plans = [integration_plan(model.problem.space; opts...,
                                           moment_fit_cache=model.moment_fit_caches[1])]
@@ -1224,7 +1223,7 @@ function diagnostics(model::Model, solution; exact=nothing)
             fit_failure_count=diag.fit_failure_count,
             moment_fit_residual_max=diag.moment_fit_residual_max,
             cut_fallback_count=diag.cut_fallback_count,
-            cut_fallback_points=diag.cut_fallback_points,
-            symmetry_residual=diag.symmetry_residual, condition_estimate=diag.condition_estimate,
-            solver=diag.solver, residual_norm=solution.diagnostics.residual_norm, l2_error=error,)
+            cut_fallback_points=diag.cut_fallback_points, symmetry_residual=diag.symmetry_residual,
+            condition_estimate=diag.condition_estimate, solver=diag.solver,
+            residual_norm=solution.diagnostics.residual_norm, l2_error=error,)
 end

@@ -154,7 +154,8 @@ end
 # difference, so that is what this asserts.
 @testset "exported names carry reachable docstrings" begin
     meta = Base.Docs.meta(Unfitted)
-    undocumented = [n for n in names(Unfitted)
+    undocumented = [n
+                    for n in names(Unfitted)
                     if n !== :Unfitted && !haskey(meta, Base.Docs.Binding(Unfitted, n))]
 
     # The two names that regressed, pinned by name so a re-detachment fails here.

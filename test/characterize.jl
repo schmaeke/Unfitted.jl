@@ -343,7 +343,7 @@ end
 # Run `f`, reporting either its value or the type of the exception it raised.
 # Used wherever a fix is expected to convert silent-wrong into a loud error, so
 # the report keeps its shape across that transition.
-function attempt(label::AbstractString, f)
+attempt(label::AbstractString, f) =
     try
         v = f()
         emit(label, "ok")
@@ -352,7 +352,6 @@ function attempt(label::AbstractString, f)
         emit(label, "threw:" * String(nameof(typeof(e))))
         return nothing
     end
-end
 
 # ── Shared fixtures ───────────────────────────────────────────────────────────
 
@@ -527,8 +526,7 @@ function main()
 
         model = prepare(Problem((u,); blocks=(stiffness_block(u),),
                                 loads=(neumann(u, 1.0; on=boundary(axis=1, side=:upper)),),
-                                dirichlet=[dirichlet(0.0;
-                                                     on=boundary(axis=1, side=:lower))]))
+                                dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower))]))
         solution = solve!(model)
         emit_model(model)
         emit("facet_measure.x_upper",
@@ -553,8 +551,7 @@ function main()
         u2 = field(:u2, V2)
 
         model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
-                                loads=(source_load(u1; source=1.0),
-                                       source_load(u2; source=2.0)),
+                                loads=(source_load(u1; source=1.0), source_load(u2; source=2.0)),
                                 dirichlet=[dirichlet(0.0; on=boundary(:all), field=:u1),
                                            dirichlet(0.0; on=boundary(:all), field=:u2)]))
         solution = solve!(model)
@@ -637,8 +634,7 @@ function main()
         emit("transfer.residual_norm", transferred.diagnostics.residual_norm)
         emit("transfer.converged", transferred.diagnostics.converged)
         emit_vector("transfer.coefficients", transferred.coefficients)
-        emit("transfer.l2_error.absolute",
-             l2_error(transferred, target_model, u2d; norm=:absolute))
+        emit("transfer.l2_error.absolute", l2_error(transferred, target_model, u2d; norm=:absolute))
         emit("transfer.l2_error.relative", l2_error(transferred, target_model, u2d))
         for p in P2
             emit("transfer.u" * pointlabel(p), value(transferred, target_model, p))
@@ -659,7 +655,6 @@ function main()
             V = overlay(V, ob; cells=2, order=3)
             prepare(poisson(V; source=f1d, dirichlet=zero_dirichlet()))
         end
-
         model = build(box((0.25,), (0.75,)))
         solution = solve!(model)
         emit("start.active_unknowns", active_unknowns(model))
@@ -672,8 +667,7 @@ function main()
         emit("moved.transfer.l2_error", l2_error(transferred, target, u1d; norm=:absolute))
         move!(model; level=2, to=box((0.1,), (0.6,)))
         moved_solution = solve!(model)
-        emit("move!.matches_moved.active",
-             active_unknowns(model) == active_unknowns(target))
+        emit("move!.matches_moved.active", active_unknowns(model) == active_unknowns(target))
         emit("move!.matches_moved.regions",
              diagnostics(model).integration_regions == diagnostics(target).integration_regions)
         direct = build(box((0.1,), (0.6,)))
@@ -726,7 +720,7 @@ function main()
         n = active_unknowns(model)
         half = n ÷ 2
         emit_vector("rhs.block1", model.rhs[1:half])
-        emit_vector("rhs.block2", model.rhs[(half + 1):end])
+        emit_vector("rhs.block2", model.rhs[(half+1):end])
         emit_solution(model, solution;
                       fields=((u1, ((1.0, 0.5), (0.5, 0.5))), (u2, ((3.0, 0.5), (2.5, 0.5)))))
         emit("u1_exact(1.0, 0.5)", 1.0)
@@ -774,7 +768,8 @@ function main()
         emit("h_axis2", H / 8)
         emit("tolerance.merge", sqrt(eps(Float64)))
         emit("mesh_cells", (4, 8))
-        model = attempt("prepare", () -> begin
+        model = attempt("prepare",
+                        () -> begin
                             V = space(box((0.0, 0.0), (1.0, H)); cells=(4, 8), order=3,
                                       basis=bspline())
                             prepare(poisson(V; source=f1d, dirichlet=zero_dirichlet()))
@@ -783,8 +778,7 @@ function main()
             solution = attempt("solve", () -> solve!(model))
             emit_model(model)
             if solution !== nothing
-                emit_solution(model, solution; exact,
-                              points=((0.5, H / 2), (0.25, H / 2)))
+                emit_solution(model, solution; exact, points=((0.5, H / 2), (0.25, H / 2)))
             end
         end
     end
@@ -799,7 +793,8 @@ function main()
     let H = 1.0e-7, exact = x -> x[1] * (1 - x[1])
         emit("h_axis2", H / 8)
         emit("tolerance.merge", sqrt(eps(Float64)))
-        model = attempt("prepare", () -> begin
+        model = attempt("prepare",
+                        () -> begin
                             V = space(box((0.0, 0.0), (1.0, H)); cells=(4, 8), order=2)
                             prepare(poisson(V; source=f1d, dirichlet=zero_dirichlet()))
                         end)
@@ -807,8 +802,7 @@ function main()
             attempt("assemble", () -> assemble!(model))
             emit_model(model)
             solution = attempt("solve", () -> solve!(model))
-            solution === nothing ||
-                emit_solution(model, solution; exact, points=((0.5, H / 2),))
+            solution === nothing || emit_solution(model, solution; exact, points=((0.5, H / 2),))
         end
     end
 
@@ -824,6 +818,7 @@ function main()
     let region = box((0.0, 0.0), (1.0, 1.0)),
         order = (3, 3),
         phi = x -> 0.16 - hypot(x[1] - 0.25, x[2] - 0.25)   # Ω = outside the disc
+
         exact_area = 1 - pi * 0.16^2
 
         report = (tag, domain) -> begin
@@ -866,8 +861,7 @@ function main()
                        "After the fix the deficit must sit at round-off, as it already does " *
                        "for the crossing-free control in case 17.")
     let N = 24, R = 0.3, C = 0.5
-        pts = [SVector(C + R * cos(2pi * (k - 1) / N), C + R * sin(2pi * (k - 1) / N))
-               for k in 1:N]
+        pts = [SVector(C + R * cos(2pi * (k - 1) / N), C + R * sin(2pi * (k - 1) / N)) for k in 1:N]
         Γ = polyline_mesh(pts; closed=true)
         exact_perimeter = N * 2R * sin(pi / N)
         V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(8, 8), order=2)
@@ -911,8 +905,7 @@ function main()
         exact = x -> x[1] * (1 - x[1]) * x[2] * (1 - x[2])
 
         cpl = couple(u1, u2, Γ, mass_form(coefficient=β))
-        model = prepare(Problem((u1, u2);
-                                blocks=(stiffness_block(u1), stiffness_block(u2), cpl...),
+        model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2), cpl...),
                                 loads=(source_load(u1; source=f2d), source_load(u2; source=f2d)),
                                 dirichlet=[dirichlet(0.0; on=boundary(axis=2, side=:lower),
                                                      field=:u1),
@@ -1009,8 +1002,7 @@ function main()
         emit("match.domain_measure", domain_measure(model) == domain_measure(direct))
         emit("match.matrix_nnz", nnz(model.matrix) == nnz(direct.matrix))
         emit("match.matrix_values", nonzeros(model.matrix) == nonzeros(direct.matrix))
-        emit("match.coefficients",
-             moved_solution.coefficients == direct_solution.coefficients)
+        emit("match.coefficients", moved_solution.coefficients == direct_solution.coefficients)
     end
 
     # ── 29 ── #5. `moved` on a coupled model has no single-domain guard: every
@@ -1026,8 +1018,7 @@ function main()
         u2 = field(:u2, V2)
 
         model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
-                                loads=(source_load(u1; source=1.0),
-                                       source_load(u2; source=1.0)),
+                                loads=(source_load(u1; source=1.0), source_load(u2; source=1.0)),
                                 dirichlet=[dirichlet(0.0; on=boundary(:all), field=:u1),
                                            dirichlet(0.0; on=boundary(:all), field=:u2)]))
         emit("source.subdomain_spaces", length(problem_spaces(model.problem)))
@@ -1061,9 +1052,7 @@ function main()
               "reduced_mode_counts = [8, 0], the buried high-order modes and nothing " *
               "else. Deduping the vertex prints [9, 0], one fewer active unknown, and a " *
               "space that cannot reproduce a constant.")
-    let V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(8, 8), order=2),
-        mask = falses(4, 4)
-
+    let V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(8, 8), order=2), mask = falses(4, 4)
         mask[1:2, 1:2] .= true
         V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4), order=3, basis=bspline(),
                     active=mask)
@@ -1093,8 +1082,7 @@ function main()
         static = SMatrix{2,2}(dense),
         # −∇·(A ∇u) for u = u2d and this constant symmetric A. u2d is degree 2
         # per axis, so `order = 2` reproduces it and l2_error sits at round-off.
-        f_tensor = x -> (2 * dense[1, 1] * x[2] * (1 - x[2]) +
-                         2 * dense[2, 2] * x[1] * (1 - x[1]) -
+        f_tensor = x -> (2 * dense[1, 1] * x[2] * (1 - x[2]) + 2 * dense[2, 2] * x[1] * (1 - x[1]) -
                          (dense[1, 2] + dense[2, 1]) * (1 - 2 * x[1]) * (1 - 2 * x[2]))
 
         emit("tensor", (dense[1, 1], dense[1, 2], dense[2, 1], dense[2, 2]))

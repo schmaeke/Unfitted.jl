@@ -10,7 +10,7 @@ benchmark exists so a future change to the projection path can be
 checked against the same setup we used to validate PR1's refactor.
 
 The scenario is the smooth Laplace problem from
-`examples/laplace_unit_square_smooth.jl` at a moderately fine
+`examples/reproductions/laplace_unit_square_smooth/` at a moderately fine
 resolution: nonzero Dirichlet data on one edge (callback `sin(πx)`),
 which forces the projection to assemble a real mass-matrix solve over
 the constrained-dof subspace. Zero-data edges skip the projection

@@ -250,13 +250,11 @@ end
     @test occursin(":u1", err.msg) && occursin(":u2", err.msg)
 
     # An unknown field name is still an error, not a silent fallback.
-    @test_throws ArgumentError boundary_integral(q -> 1.0, model; on=boundary(:all),
-                                                 field=:nope)
+    @test_throws ArgumentError boundary_integral(q -> 1.0, model; on=boundary(:all), field=:nope)
 
     # Single-domain models are unaffected: `field` is optional and, when given,
     # agrees with the default exactly.
-    single = prepare(poisson(V1; source=0.0,
-                             dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    single = prepare(poisson(V1; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     @test boundary_integral(q -> 1.0, single; on=boundary(:all)) ==
           boundary_integral(q -> 1.0, single; on=boundary(:all), field=:u)
 end

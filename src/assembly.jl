@@ -379,13 +379,12 @@ end
 # also materialises every diagonal slot and both triangles' explicit zeros —
 # and `_matrix_from_pattern` runs `dropzeros!` over either, which removes
 # exactly those.
-function _mirror_lower(n::Int, colptr::Vector{Int}, rowval::Vector{Int},
-                       nzval::Vector{T}) where {T}
+function _mirror_lower(n::Int, colptr::Vector{Int}, rowval::Vector{Int}, nzval::Vector{T}) where {T}
     # Count first: every source entry occupies a slot in its own column, and a
     # strictly-lower one occupies a second slot in the column it mirrors into.
     # Counts land in `full_colptr[j + 1]`; the prefix sum turns them into offsets.
     full_colptr = zeros(Int, n + 1)
-    @inbounds for j in 1:n, k in colptr[j]:(colptr[j + 1] - 1)
+    @inbounds for j in 1:n, k in colptr[j]:(colptr[j+1]-1)
         full_colptr[j + 1] += 1
         rowval[k] > j && (full_colptr[rowval[k] + 1] += 1)
     end
@@ -397,7 +396,7 @@ function _mirror_lower(n::Int, colptr::Vector{Int}, rowval::Vector{Int},
     pos = full_colptr[1:n]  # per-column write cursor
     full_rowval = Vector{Int}(undef, full_colptr[n + 1] - 1)
     full_nzval = Vector{T}(undef, length(full_rowval))
-    @inbounds for j in 1:n, k in colptr[j]:(colptr[j + 1] - 1)
+    @inbounds for j in 1:n, k in colptr[j]:(colptr[j+1]-1)
         i = rowval[k]
         v = nzval[k]
         full_rowval[pos[j]] = i
@@ -421,8 +420,7 @@ end
 # then collapses the explicit zeros left by Dirichlet column elimination
 # and any structurally-present-but-untouched pattern slots.
 function _matrix_from_pattern(pattern::AssemblyPattern, nzval::Vector{T}) where {T}
-    matrix = pattern.symmetric ?
-             _mirror_lower(pattern.n, pattern.colptr, pattern.rowval, nzval) :
+    matrix = pattern.symmetric ? _mirror_lower(pattern.n, pattern.colptr, pattern.rowval, nzval) :
              SparseMatrixCSC(pattern.n, pattern.n, copy(pattern.colptr), copy(pattern.rowval),
                              nzval)
     dropzeros!(matrix)
@@ -767,8 +765,9 @@ end
 
 # Build a fresh workspace for `model`, once per thread in the threaded path and
 # once per assembly call in the serial path.
-_assembly_workspace(model::Model{D,T}) where {D,T} =
+function _assembly_workspace(model::Model{D,T}) where {D,T}
     _build_workspace(problem_spaces(model.problem), Val(D), T)
+end
 
 # Build an assembly workspace over a problem's subdomain spaces without the
 # type-unstable `Vector{Any}` level concatenation. `prepare` reindexed every
@@ -2060,9 +2059,8 @@ which inherits its restriction) rejects a coupled model for that reason.
 function nquadpoints(model::Model; kind::Symbol=:volume, on=nothing,
                      field::Union{Nothing,Symbol}=nothing)
     on isa Interface && return interface_quadrature_count(model, on)
-    on === nothing ||
-        return sum(_region_qpoint_count,
-                   _resolve_on_regions(model, on, _on_regions_space(model, field)); init=0)
+    on === nothing || return sum(_region_qpoint_count,
+               _resolve_on_regions(model, on, _on_regions_space(model, field)); init=0)
     kind === :volume && return sum(_quadrature_count(p) for p in integration_plans(model); init=0)
     kind === :facet && return _cached_quadpoint_count(model.facet_regions)
     kind === :surface && return _cached_quadpoint_count(model.surface_regions)

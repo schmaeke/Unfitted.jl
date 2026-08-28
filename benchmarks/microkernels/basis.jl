@@ -26,9 +26,9 @@ for (D, p) in ((1, 4), (2, 2), (2, 4), (3, 2), (3, 3))
     tag = "D=$D p=$p"
     group["fill_factor_tables $tag"] = @benchmarkable _fill_factor_tables!($basis, $val1d, $der1d,
                                                                            $order, $xi, $cell)
-    group["tensor_values_grads $tag"] = @benchmarkable _tensor_values_grads!($basis, $values, $grads,
-                                                                             $indices, $order, $xi,
-                                                                             $scale, $val1d, $der1d,
-                                                                             $cell)
+    group["tensor_values_grads $tag"] = @benchmarkable _tensor_values_grads!($basis, $values,
+                                                                             $grads, $indices,
+                                                                             $order, $xi, $scale,
+                                                                             $val1d, $der1d, $cell)
     group["tensor_gauss_rule $tag"] = @benchmarkable _tensor_gauss_rule($qcounts, Float64)
 end

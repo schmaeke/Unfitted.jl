@@ -363,8 +363,7 @@ function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0,
     g = geometry isa LevelSet ? geometry : leaf(geometry; lipschitz=lipschitz)
     T = promote_type(typeof(float(alpha)), typeof(float(subcell_length_scale)),
                      typeof(float(target_residual)))
-    return PhysicalDomain{typeof(g),T,typeof(cut_quadrature)}(g, T(alpha),
-                                                              T(subcell_length_scale),
+    return PhysicalDomain{typeof(g),T,typeof(cut_quadrature)}(g, T(alpha), T(subcell_length_scale),
                                                               Int(max_depth),
                                                               Int(moment_order_factor),
                                                               T(target_residual), keep_fictitious,

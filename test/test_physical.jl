@@ -60,28 +60,25 @@ end
     @test err isa ArgumentError
     @test occursin("leaf(f; lipschitz=1.0)", err.msg)   # the remedy
     # One uncertified leaf anywhere in a CSG combination is enough.
-    @test_throws ArgumentError physical_domain(setdiff(leaf(x -> hypot(x...) - 0.45;
-                                                            lipschitz=1.0), leaf(phi));
-                                               lipschitz=1.0, subcell_length_scale=0.1)
+    @test_throws ArgumentError physical_domain(setdiff(leaf(x -> hypot(x...) - 0.45; lipschitz=1.0),
+                                                       leaf(phi)); lipschitz=1.0,
+                                               subcell_length_scale=0.1)
 
     # Positivity is checked on every path now, not only on the auto-wrap: the
     # tree path used to accept a constant the callable path throws on.
-    @test_throws ArgumentError physical_domain(leaf(phi); lipschitz=0.0,
-                                               subcell_length_scale=0.1)
-    @test_throws ArgumentError physical_domain(leaf(phi); lipschitz=-1.0,
-                                               subcell_length_scale=0.1)
+    @test_throws ArgumentError physical_domain(leaf(phi); lipschitz=0.0, subcell_length_scale=0.1)
+    @test_throws ArgumentError physical_domain(leaf(phi); lipschitz=-1.0, subcell_length_scale=0.1)
 
     # What stays legal, because no information is lost. A tree whose leaves all
     # carry their own constant is simply unaffected by the keyword…
     both = intersect(leaf(x -> x[1] - 0.5; lipschitz=1.0), leaf(x -> x[2] - 0.5; lipschitz=2.0))
     @test physical_domain(both; lipschitz=1.0, subcell_length_scale=0.1).geometry === both
-    @test physical_domain(leaf(phi; lipschitz=1.0); lipschitz=1.0,
-                          subcell_length_scale=0.1).geometry.lipschitz == 1.0
+    @test physical_domain(leaf(phi; lipschitz=1.0); lipschitz=1.0, subcell_length_scale=0.1).geometry.lipschitz ==
+          1.0
     # …and the default `Inf` on an uncertified tree is the documented
     # corner-sampling path, so it must not be caught by the new check.
     @test isinf(physical_domain(leaf(phi); subcell_length_scale=0.1).geometry.lipschitz)
-    @test isinf(physical_domain(leaf(phi); lipschitz=Inf,
-                                subcell_length_scale=0.1).geometry.lipschitz)
+    @test isinf(physical_domain(leaf(phi); lipschitz=Inf, subcell_length_scale=0.1).geometry.lipschitz)
 end
 
 @testset "CSG level-set constructors" begin
@@ -401,8 +398,8 @@ end
     # Stiffness + mass, so the operator is nonsingular without a Dirichlet
     # condition and the comparison is over the raw assembled system.
     build = target -> begin
-        V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=p),
-                    target; cells=(2, 2), order=2)
+        V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=p), target;
+                    cells=(2, 2), order=2)
         u = field(:u, V)
         prepare(Problem((u,); blocks=(stiffness_block(u), mass_block(u)),
                         loads=(source_load(u; source=1.0),)))
@@ -656,12 +653,13 @@ end
     # cut column's region boxes come out bit-identical either side of the move.
     omega = box((0.0, 0.0), (1.0, 1.0))
     p = physical_domain(x -> x[1] - 0.55; lipschitz=1.0, subcell_length_scale=1.0e-3, max_depth=3)
-    V = overlay(space(omega; cells=(4, 4), order=1, physical=p),
-                box((0.0, 0.0), (0.25, 0.25)); cells=(1, 1), order=1)
+    V = overlay(space(omega; cells=(4, 4), order=1, physical=p), box((0.0, 0.0), (0.25, 0.25));
+                cells=(1, 1), order=1)
     model = prepare(mass(V; coefficient=1.0))
 
     cache = only(model.moment_fit_caches)
-    cut_regions(m) = [r for r in Unfitted.integration_plan(m).regions
+    cut_regions(m) = [r
+                      for r in Unfitted.integration_plan(m).regions
                       if r.quadrature.kind === :cut_fitted]
     before = cut_regions(model)
     @test !isempty(before)
@@ -818,9 +816,8 @@ end
     plan = Unfitted.IntegrationPlan{1,Float64}([VR(b, noparents,
                                                    RQ(:cut_fitted, [SVector(0.5)], [1.0])),
                                                 VR(b, noparents, strict), VR(b, noparents, afail),
-                                                VR(b, noparents, back)],
-                                               GeometryTolerance(Float64), 0,
-                                               Unfitted.SmallOverlap{Float64}[], 1.0, 1.0, 0.0)
+                                                VR(b, noparents, back)], GeometryTolerance(Float64),
+                                               0, Unfitted.SmallOverlap{Float64}[], 1.0, 1.0, 0.0)
     cut, failed, fallback, fallback_points = Unfitted._cut_region_stats(plan)
     @test cut == 4
     @test failed == 3
@@ -859,10 +856,8 @@ end
     @test isconcretetype(typeof(fitted))
     @test isconcretetype(typeof(custom))
 
-    plan_fitted = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2,
-                                                  physical=fitted))
-    plan_custom = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2,
-                                                  physical=custom))
+    plan_fitted = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2, physical=fitted))
+    plan_custom = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2, physical=custom))
 
     kinds(plan) = [r.quadrature.kind for r in plan.regions]
     @test :cut_fitted in kinds(plan_fitted)
@@ -872,7 +867,8 @@ end
     @test [r.box for r in plan_custom.regions] == [r.box for r in plan_fitted.regions]
     @test count(==(:full), kinds(plan_custom)) == count(==(:full), kinds(plan_fitted))
     @test count(==(:cut_custom), kinds(plan_custom)) ==
-          count(==(:cut_fitted), kinds(plan_fitted)) > 0
+          count(==(:cut_fitted), kinds(plan_fitted)) >
+          0
     @test calls[] == count(==(:cut_custom), kinds(plan_custom))
 
     # Points come back in the region's reference frame with the standard
@@ -896,12 +892,11 @@ end
     # α blends the custom rule exactly as it blends a fit: the region carries
     # `(1 − α)·custom ∪ α·tensor`, so the custom part is scaled, not replaced.
     alpha = 0.25
-    blended = physical_domain(geometry; settings..., alpha=alpha,
-                              cut_quadrature=tensor_rule)
-    plan_blended = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2,
-                                                   physical=blended))
+    blended = physical_domain(geometry; settings..., alpha=alpha, cut_quadrature=tensor_rule)
+    plan_blended = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2, physical=blended))
     strict = first(r for r in plan_custom.regions if r.quadrature.kind === :cut_custom)
-    mixed = first(r for r in plan_blended.regions
+    mixed = first(r
+                  for r in plan_blended.regions
                   if r.quadrature.kind === :cut_custom && r.box == strict.box)
     n = length(strict.quadrature.weights)
     @test length(mixed.quadrature.weights) > n

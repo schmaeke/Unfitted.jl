@@ -270,8 +270,7 @@ end
     geom = complement(union(leaf(_disc((0.25, 0.25), 0.12); lipschitz=1.0),
                             leaf(_disc((0.75, 0.72), 0.1); lipschitz=1.0)))
     @test _quad(x -> 1.0, _csg_rule(geom, region; gp=12)) ≈ 1.0 atol = 1e-13
-    @test _quad(x -> 1.0, _csg_rule(geom, region; gp=12, certified=true)) ≈
-          1 - π * (0.12^2 + 0.1^2) atol = 5e-5
+    @test _quad(x -> 1.0, _csg_rule(geom, region; gp=12, certified=true)) ≈ 1 - π * (0.12^2 + 0.1^2) atol = 5e-5
 
     fs = Any[l.f for l in Unfitted._leaves(geom)]
     membership = x -> Unfitted._inside(geom, x)

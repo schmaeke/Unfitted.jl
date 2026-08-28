@@ -1,34 +1,53 @@
 # Smoke-test guard for the `examples/` scripts.
 #
-# The example scripts under `examples/<name>/<name>.jl` are the package's
-# paper-regression reproductions — they are the executable form of the
-# scientific contract (UMLHP §5.* benchmarks, the FCM moment-fit
-# reproductions, the multi-domain coupling, the phase-field and
-# traveling-heat-source demonstrations). The rest of the suite unit-tests the
-# building blocks; this file is what runs the scripts end to end, so a
-# public-API change cannot silently break a paper reproduction without a test
-# going red.
+# The example scripts live at `examples/<tier>/<name>/<name>.jl` in three
+# tiers, and the tiers are why this file matters for more than regression
+# pinning:
+#
+#   - `tutorials/` are the documentation a newcomer reads first. A tutorial
+#     that no longer runs, or whose printed numbers no longer match the prose
+#     telling the reader what to look for, is worse than no tutorial.
+#   - `applications/` are the recognisable problems, and the only place the
+#     package is exercised together with third-party packages.
+#   - `reproductions/` are the executable form of the scientific contract
+#     (the UMLHP §5.* benchmarks and the FCM moment-fit reproductions).
+#
+# The rest of the suite unit-tests the building blocks; this file is what runs
+# the scripts end to end, so a public-API change cannot silently break a
+# tutorial or a paper reproduction without a test going red.
 #
 # For each example it asserts that the script runs to completion and that the
-# headline metric it prints (`relative L2 error`, `residual norm`, … from the
-# shared `examples/reporting.jl` formatter, the conditioning sweep's CSV rows,
-# the bi-material energy error) lands inside that case's `tol` band. Each band
-# is the value measured on the configuration the case actually runs, rounded up
-# by about one decade — enough headroom that no legitimate rounding difference
-# can trip it, tight enough that a regression of one decade does. The bands are
-# not a convergence claim: three of the ten cases run coarsened and are far from
-# the published digits, but every case is pinned to what *it* produces today.
+# headline numbers it prints (`relative L2 error`, `condition estimate`, … from
+# the shared `examples/reporting.jl` formatter, plus each example's own extra
+# lines) land inside that case's `tol` band. Each band is the value measured on
+# the configuration the case actually runs, rounded up by about one decade —
+# enough headroom that no legitimate rounding difference can trip it, tight
+# enough that a regression of one decade does. The bands are not a convergence
+# claim: several cases run coarsened and are far from the published digits, but
+# every case is pinned to what *it* produces today, and the comment on each case
+# records the measurement, so a band that has drifted away from reality is
+# visible without re-running the example.
 #
-# ── One batched subprocess, not ten ───────────────────────────────────────────
+# Where an example's *prose* makes a claim, the claim is asserted rather than
+# the number alone. Tutorial 2 tells the reader the overlay beats the base level
+# by an order of magnitude, that switching order reduction off changes the
+# answer in no digit that matters, and that `activate!`/`deactivate!` reproduce
+# the configuration they rebuild — all three are checked below. Tutorial 4 tells
+# the reader that one duplicated B-spline mode costs fifteen orders of magnitude
+# of conditioning, so both ends of that span are checked. A tutorial whose text
+# and output disagree fails here.
+#
+# ── One batched subprocess, not one per example ───────────────────────────────
 #
 # Every example used to be launched in its own Julia subprocess. That was
 # chosen for three genuine properties — per-case ENV isolation, no collisions
 # between the scripts' top-level `const`s, and containment of a hard failure —
 # but it paid the ~7.2 s package-load-and-compile floor once per example.
-# Measured: the whole set of ten runs in 53.0 s inside a single subprocess,
-# against 70.3 s for the six examples that a per-process run could afford. All
-# three properties are preserved by other means in `run_examples_child.jl`,
-# which is the batch's child half and documents each one at its head:
+# Measured on the previous example set: the whole batch ran in 53.0 s inside a
+# single subprocess, against 70.3 s for the six examples a per-process run could
+# afford. All three properties are preserved by other means in
+# `run_examples_child.jl`, which is the batch's child half and documents each
+# one at its head:
 #
 #   - collisions: each example is `Base.include`d into its own fresh `Module`,
 #     so its globals are private to it;
@@ -50,26 +69,47 @@
 # coarse runs are dominated by JIT compilation, not by the tiny numerics, so
 # unoptimised codegen lowers the wall time with no meaningful runtime cost.
 #
-# ── Project selection and the `Tensors` gate ──────────────────────────────────
+# ── Project selection and the `requires` gate ─────────────────────────────────
 #
-# The batch is launched on the *active* project (`Base.active_project()`):
-# under `Pkg.test` that is the instantiated test sandbox, which carries
+# The batch is launched on the *active* project (`Base.active_project()`).
+# Under `Pkg.test` that is the instantiated test sandbox, which carries
 # `Unfitted` and its dependencies (`StaticArrays`, `LinearAlgebra`,
-# `ForwardDiff`) *and* `Tensors` (a test/weak dependency); in a bare
-# `julia --project=. …` session it is the package root, which lacks `Tensors`.
-# The three `Tensors`-using examples (phase-field, both FCM plates) are
-# therefore gated on `Tensors` actually being loadable in the active project:
-# they run under the full `Pkg.test` suite and are skipped (not failed) in a
-# bare-root isolation run.
+# `ForwardDiff`) *and* every weak dependency listed in the package's `test`
+# target — `BasicBSpline`, `FileIO`, `GeometryBasics`, `MeshIO`, `Tensors`. In
+# a bare `julia --project=. …` session the active project is the package root,
+# which carries none of those, because they are `[weakdeps]` rather than
+# `[deps]`.
 #
-# There is no "slow example" gate. It used to hold back the two FCM plates, the
-# bi-material coupling and the tanh layer behind `UNFITTED_TEST_SLOW_EXAMPLES`,
-# which no CI job and no documented command ever set — so the only end-to-end
-# drivers of FCM-with-Nitsche-on-immersed-arcs, multi-domain interface
-# coupling, and the hp-graded order-reduction stack had no automated coverage
-# at all. Their measured 9.8–15.5 s also sits inside the "fast" set's own
-# 8.0–16.3 s range, so the gate was not separating what it claimed to separate.
-# Batched, running all ten costs less than running six did.
+# Each case therefore declares in `requires` the packages it needs beyond
+# `Unfitted` itself, and a case whose requirements the active project cannot
+# resolve is *skipped* rather than failed. `Base.identify_package` answers that
+# question without loading anything. Four cases carry a requirement:
+# `tutorials/04_bspline` (`BasicBSpline`), `applications/kirsch_plate_2d`
+# (`Tensors`), `applications/imported_geometry_3d` (`FileIO` + `GeometryBasics`
+# + `MeshIO`, the three triggers of `UnfittedMeshIOExt`), and
+# `applications/time_integration` (`OrdinaryDiffEq`).
+#
+# `OrdinaryDiffEq` is the one that behaves differently, and the difference is
+# worth stating plainly rather than hiding behind the gate. It is not a
+# dependency of the package, not a weak dependency, and not in the `test`
+# target — deliberately: it is a hundred-package tree that would dominate the
+# suite's install and precompile time, and the example exists precisely to show
+# that Unfitted needs no extension to work with it. So that case is skipped
+# under `Pkg.test` as well as in an isolation run: it has **no automated
+# coverage here**, and the only way to run it is on its own project,
+#
+#     julia --project=examples/applications/time_integration \
+#         examples/applications/time_integration/time_integration.jl
+#
+# which is what the skip message prints. Giving it a band below anyway would be
+# dishonest — an unreachable assertion is not a test — so its `tol` is recorded
+# for whoever wires up a CI job that does run it, and nothing more.
+#
+# There is no "slow example" gate. It used to hold several cases behind
+# `UNFITTED_TEST_SLOW_EXAMPLES`, which no CI job and no documented command ever
+# set — so the only end-to-end drivers of FCM-with-Nitsche-on-immersed-arcs and
+# multi-domain interface coupling had no automated coverage at all. Batched,
+# running everything costs less than running a subset did.
 
 @testset "examples" begin
     # The batch runs one child process on the active project.
@@ -84,10 +124,11 @@
     markers = (opening="##UNFITTED-EXAMPLE-BEGIN##", closing="##UNFITTED-EXAMPLE-END##",
                done="##UNFITTED-EXAMPLES-DONE##")
 
-    # `Tensors` is a weak/test dependency: it is loadable under `Pkg.test` but
-    # not from a bare `--project=.` session. `identify_package` reports whether
-    # it is a direct dependency of the active project without loading it.
-    tensors_available = Base.identify_package("Tensors") !== nothing
+    # Can the active project resolve this package name? `identify_package`
+    # answers without loading it, which is what lets a weak dependency be
+    # detected rather than attempted.
+    package_available(name) = Base.identify_package(name) !== nothing
+    missing_packages(case) = filter(!package_available, collect(case.requires))
 
     # Run the whole selection in one subprocess and return its captured
     # `(stdout, stderr)`. The case list travels as a Julia literal in a temp
@@ -151,10 +192,10 @@
     end
 
     # Every numeric value printed as "<label>: <number>" by the shared report
-    # formatter, in print order. A multi-run example (the 1D bar prints a base
-    # and an overlay error) yields one entry per occurrence. The separator is
-    # whitespace and/or a colon so the same reader also handles the examples
-    # that lay their report out as an aligned two-column table.
+    # formatter, in print order. A multi-run example (Tutorial 1 prints a 1-D
+    # and a 2-D error; Tutorial 2 prints five) yields one entry per occurrence.
+    # The separator is whitespace and/or a colon so the same reader also handles
+    # the examples that lay their report out as an aligned two-column table.
     function metric_values(output, label)
         pattern = Regex(label * raw"[\s:]+([-+]?[0-9.]+(?:[eE][-+]?[0-9]+)?)")
         return [parse(Float64, m.captures[1]) for m in eachmatch(pattern, output)]
@@ -171,20 +212,142 @@
     function check_one(output, tol, label)
         values = metric_values(output, label)
         @test length(values) == 1
-        @test sane_error(values[1], tol)
+        @test all(value -> sane_error(value, tol), values)
     end
 
     check_single_l2(output, tol) = check_one(output, tol, "relative L2 error")
-    check_energy(output, tol) = check_one(output, tol, "relative energy error")
-    check_phase(output, tol) = check_one(output, tol, "residual norm")
 
-    function check_bar(output, tol)
+    # A report line that must carry one *exact* value — a count of cut regions
+    # or failed fits, a symmetry residual that has to be zero to the bit. These
+    # are structural facts about the run, not converged quantities, so a band
+    # would only hide a change in what the example exercises.
+    function check_exact(output, label, expected)
+        values = metric_values(output, label)
+        @test length(values) == 1
+        @test all(==(expected), values)
+    end
+
+    # Tutorial 1 runs the identical seven-call workflow twice, on the interval
+    # and then on the square, so it prints two errors. Checking both is what
+    # pins the tutorial's central claim — that nothing in the workflow is
+    # dimension-specific — rather than only that the 1-D run happened.
+    function check_first_solve(output, tol)
         errors = metric_values(output, "relative L2 error")
         @test length(errors) == 2
-        @test all(e -> sane_error(e, tol), errors)
-        # The overlay around the unresolved interface must beat the base-only
-        # run — that improvement is the entire point of the example.
-        @test errors[2] < errors[1]
+        @test all(error -> sane_error(error, tol), errors)
+    end
+
+    # Tutorial 2 prints five reports — Run 1 (base only), Run 2 (full overlay),
+    # Run 2b (order reduction off), Run 3 (masked overlay), and a summary that
+    # reprints Run 4's numbers, which are Run 3's discretisation rebuilt by
+    # `deactivate!`. Each assertion below corresponds to a sentence the tutorial
+    # tells the reader to verify from the output.
+    function check_overlays(output, tol)
+        errors = metric_values(output, "relative L2 error")
+        @test length(errors) == 5
+        @test all(error -> sane_error(error, tol.coarsest), errors)
+        # "Run 2's error is more than an order of magnitude below Run 1's" —
+        # the entire point of adding an overlay. Measured factor: 27.3.
+        @test errors[2] < errors[1] / 10
+        # "Run 2b carries the modes that Run 2 shed and lands on the same error
+        # to a dozen digits, so those unknowns really were redundant." If order
+        # reduction ever started costing accuracy, it would show here first.
+        @test isapprox(errors[3], errors[2]; rtol=1.0e-8)
+        # "Run 4's mutated model reproduces Run 3 to the last digit" — the
+        # evidence that `activate!`/`deactivate!` really rebuild the dof layout,
+        # the integration plan and the cached operators.
+        @test isapprox(errors[5], errors[4]; rtol=1.0e-8)
+        @test sane_error(errors[5], tol.headline)
+        # The number the tutorial's order-reduction section tells the reader to
+        # look for: the base level sheds 121 buried high-order modes under the
+        # full overlay, the overlay itself sheds none.
+        @test occursin("reduced mode counts: [121, 0]", output)
+    end
+
+    # Tutorial 3 is the finite-cell tutorial, so the cut-cell pipeline is the
+    # thing under test, not just the error. A cut-region count of zero would
+    # mean the annulus had stopped intersecting the grid and the example was
+    # quietly demonstrating nothing; a nonzero fit-failure count would mean the
+    # moment fit fell back to a raw volume rule, which the tutorial's own text
+    # tells the reader must not happen here.
+    function check_immersed_fcm(output, tol)
+        check_single_l2(output, tol)
+        check_exact(output, "cut region count", 56)
+        check_exact(output, "fit failure count", 0)
+    end
+
+    # Tutorial 4 never calls `diagnostics` with `exact =`, so it prints no
+    # "relative L2 error" line at all — its verification is a reference value
+    # and a cross-family comparison instead, and requiring an L² band here would
+    # simply fail. What it does print, in this order, is a `condition estimate`
+    # for Part 1a (plain base), Part 1b (nested overlay, deduplicated), Part 1c
+    # (the same stack with deduplication off) and then Part 2; the first three
+    # positions are what the section is about, so they are read by position.
+    function check_bspline(output, tol)
+        # One duplicated base mode shed under the nested overlay: the mechanism
+        # the whole of Part 1 exists to show, visible as a number.
+        @test occursin("reduced mode counts: [1, 0]", output)
+
+        conditions = metric_values(output, "condition estimate")
+        @test length(conditions) ≥ 3
+        if length(conditions) ≥ 3
+            # "One redundant unknown costs roughly fifteen orders of magnitude
+            # of conditioning." Both ends of that span are asserted: the
+            # deduplicated nested stack stays a few hundred (measured 687), the
+            # undeduplicated one is numerically singular (measured 3.8e17).
+            @test sane_error(conditions[2], tol.deduplicated)
+            @test isfinite(conditions[3]) && conditions[3] > tol.singular
+        end
+
+        # Part 1's accuracy check: u_h(½, ½) against the Fourier-series value
+        # 0.07367135326539033 for −Δu = 1 on the unit square.
+        centre = match(r"u_h\(0\.5, 0\.5\) = ([-+]?[0-9.]+(?:[eE][-+]?[0-9]+)?)", output)
+        @test centre !== nothing
+        if centre !== nothing
+            reference = 0.07367135326539033
+            @test sane_error(abs(parse(Float64, centre.captures[1]) - reference) / reference,
+                             tol.centre)
+        end
+
+        # Part 2's check: the same immersed problem in two different families on
+        # the same mesh, compared pointwise. Agreement at the size of their own
+        # discretisation error is all one can ask of two different spaces.
+        check_one(output, tol.cross_family, "Largest difference")
+
+        # And the immersed half must actually be immersed, with every cut cell
+        # fitted rather than fallen back on.
+        cut = match(r"Cut regions / fit failures: (\d+) / (\d+)", output)
+        @test cut !== nothing
+        if cut !== nothing
+            @test parse(Int, cut.captures[1]) > 0
+            @test parse(Int, cut.captures[2]) == 0
+        end
+    end
+
+    # The bi-material joint. Beyond the error, two structural facts: the problem
+    # declares `symmetric = true`, so the four coupling blocks must mirror each
+    # other to the bit; and the seam is deliberately placed off the grid lines,
+    # so a cut-region count of zero would mean it had landed on one and the
+    # example had stopped testing what it claims to.
+    function check_interface_coupling(output, tol)
+        check_single_l2(output, tol)
+        check_exact(output, "symmetry residual", 0.0)
+        regions = metric_values(output, "cut region count")
+        @test length(regions) == 1
+        @test all(>(0), regions)
+    end
+
+    # The imported-geometry bracket prints two numbers that check different
+    # things, and the second is the one that exercises the import. The L² error
+    # is governed purely by the z resolution — the exact solution does not vary
+    # in x₁ or x₂, so it would look just as good with the level-set sign
+    # inverted. The volume error compares the finite-cell quadrature summed over
+    # Ω against the analytic volume of the L-prism, and *that* is what a flipped
+    # pseudonormal at the reflex edge, or a mis-integrated notch, breaks.
+    function check_imported_geometry(output, tol)
+        check_single_l2(output, tol.l2)
+        check_one(output, tol.volume, "volume error")
+        check_exact(output, "fit failure count", 0)
     end
 
     # The conditioning sweep's report is a CSV body, one row per (p, k); rows
@@ -214,78 +377,97 @@
         residuals = printed === nothing ? Float64[] :
                     parse.(Float64, split(printed.captures[1], ", "; keepempty=false))
         @test !isempty(residuals)
-        @test all(r -> sane_error(r, tol), residuals)
+        @test all(residual -> sane_error(residual, tol), residuals)
     end
 
-    # Configuration for each example. `env` holds the size knobs; `tensors`
-    # marks the `Tensors`-using examples; `check` runs the metric assertions on
-    # a clean run and `tol` is the band it enforces. Every `tol` is the measured
-    # value on this configuration with about a decade of headroom — the comment
-    # on each case records what was measured, so a band that has drifted away
-    # from reality is visible without re-running the example.
+    # Configuration for each example. `name` is the script's `<tier>/<name>`
+    # path under `examples/`; `env` holds the size knobs; `requires` names the
+    # packages beyond `Unfitted` that the case needs in the active project;
+    # `check` runs the metric assertions on a clean run and `tol` is the band it
+    # enforces.
     cases = (
+             # ── Tutorials ───────────────────────────────────────────────────
+             # The seven-call workflow, run once on the interval and once,
+             # unchanged, on the square. Two relative L² errors: 6.32e-6 (1-D)
+             # and 8.91e-6 (2-D).
+             (name="tutorials/01_first_solve", env=Dict{String,String}(), requires=(),
+              check=check_first_solve, tol=1.0e-4),
+             # Overlays, masking and the activation contract. Five relative L²
+             # errors: 4.30e-2 (base only) then 1.576e-3 four times over, as
+             # the overlay configurations are varied around a fixed answer. The
+             # `coarsest` band covers the base-only run, `headline` the final
+             # patch-only configuration.
+             (name="tutorials/02_overlays", env=Dict{String,String}(), requires=(),
+              check=check_overlays, tol=(coarsest=5.0e-1, headline=1.0e-2)),
+             # Finite cell method on an annulus with Nitsche on both immersed
+             # rims; prints one relative L² error, 1.21e-4, over 56 cut regions
+             # with no failed fits.
+             (name="tutorials/03_immersed_fcm", env=Dict{String,String}(), requires=(),
+              check=check_immersed_fcm, tol=1.0e-3),
+             # The B-spline family. No L² error at all (see `check_bspline`);
+             # measured instead: cond 687.1 deduplicated against 3.76e17
+             # undeduplicated, u_h(½,½) within 4.67e-5 relative of the series
+             # value, and 1.15e-5 largest cross-family pointwise gap.
+             (name="tutorials/04_bspline", env=Dict{String,String}(), requires=("BasicBSpline",),
+              check=check_bspline,
+              tol=(deduplicated=1.0e4, singular=1.0e10, centre=1.0e-3, cross_family=1.0e-4)),
+
+             # ── Applications ────────────────────────────────────────────────
+             # Kirsch plate-with-hole p-refinement sweep on a fixed 8×8 grid;
+             # prints the finest-order relative L² error, 2.96e-8. The weak form
+             # is written in `Tensors.jl` notation, hence the requirement.
+             (name="applications/kirsch_plate_2d", env=Dict{String,String}(),
+              requires=("Tensors",), check=check_single_l2, tol=1.0e-6),
+             # Bonded bi-material joint across a seam that misses the grid
+             # lines; prints the worse of the two subdomain errors, 1.82e-5,
+             # over 14 cut regions with a bit-exact symmetric operator.
+             (name="applications/interface_coupling_2d", env=Dict{String,String}(), requires=(),
+              check=check_interface_coupling, tol=1.0e-3),
+             # L-bracket whose geometry arrives as a triangle surface mesh.
+             # Relative L² error 6.12e-3 (pure z-resolution error), volume error
+             # 5.35e-15 — the latter is the one that exercises the import.
+             (name="applications/imported_geometry_3d", env=Dict{String,String}(),
+              requires=("FileIO", "GeometryBasics", "MeshIO"), check=check_imported_geometry,
+              tol=(l2=1.0e-1, volume=1.0e-12)),
+             # Transient heat conduction with the time axis owned by
+             # `OrdinaryDiffEq`, which is not a dependency of this package and
+             # is not in its test target — so this case is *always* skipped
+             # here and has no automated coverage. Band recorded for whoever
+             # wires up a job that runs it on the example's own project:
+             # measured relative L² error 4.10e-4 at t = 0.2, identical to six
+             # digits under both integrators.
+             (name="applications/time_integration", env=Dict{String,String}(),
+              requires=("OrdinaryDiffEq",), check=check_single_l2, tol=1.0e-2),
+
+             # ── Reproductions ───────────────────────────────────────────────
              # Smooth manufactured Laplace, published 12×12 p=4 config (already
              # sub-second numerics); prints one relative L² error, 2.17e-8.
-             (name="laplace_unit_square_smooth", env=Dict{String,String}(), tensors=false,
-              check=check_single_l2, tol=1.0e-6),
-             # 1D bar, unresolved material interface; tiny base + overlay solves,
-             # prints a base and an overlay relative L² error, 3.18e-2 and 1.35e-2.
-             # The band is set by the larger, base-only error.
-             (name="bar_1d_unresolved_interface", env=Dict{String,String}(), tensors=false,
-              check=check_bar, tol=1.0e-1),
-             # Small-overlap conditioning sweep; 32 tiny solves, CSV output. Largest
-             # `cond(A)` per order (always at δ = 2⁻⁸): 3.65e2, 1.50e3, 6.30e5,
-             # 3.65e7; largest residual over all 32 rows 4.15e-15.
-             (name="conditioning_small_overlap", env=Dict{String,String}(), tensors=false,
-              check=check_conditioning,
-              tol=(condition=(4.0e3, 2.0e4, 7.0e6, 4.0e8), residual=1.0e-10)),
-             # Corner-singularity nested-overlay solve at its published size (small
-             # system; cost is compilation); prints one relative L² error, 4.34e-5.
-             (name="singular_square_2d", env=Dict{String,String}(), tensors=false,
+             (name="reproductions/laplace_unit_square_smooth", env=Dict{String,String}(),
+              requires=(), check=check_single_l2, tol=1.0e-6),
+             # Corner-singularity nested-overlay solve at its published size
+             # (small system; cost is compilation); one relative L² error,
+             # 4.34e-5.
+             (name="reproductions/singular_square_2d", env=Dict{String,String}(), requires=(),
               check=check_single_l2, tol=1.0e-3),
-             # Traveling heat source: shortened transient (`THS_T_MAX=0.05` runs one
-             # mesh-update + L²-transfer interval) and VTK export disabled. No error
-             # against an exact solution; the transfer residual measures 0.0.
-             (name="traveling_heat_source_2d",
-              env=Dict("THS_T_MAX" => "0.05", "THS_WRITE_OUTPUT" => "false"), tensors=false,
-              check=check_transfer, tol=1.0e-10),
-             # Phase-field SENT: coarse base (6×6, p=2), a few load steps to a tiny
-             # final displacement, VTK disabled; prints the converged Newton residual
-             # norm, 3.45e-9. Individual load steps reach 4.4e-8, so the band sits a
-             # decade above those rather than above the final value.
-             (name="phase_field_single_edge_notch_2d",
-              env=Dict("SHP_PHASE_CELLS" => "6", "SHP_PHASE_ORDER" => "2",
-                       "SHP_PHASE_FINAL_DISPLACEMENT" => "1.0e-4",
-                       "SHP_PHASE_WRITE_OUTPUT" => "false"), tensors=true, check=check_phase,
-              tol=1.0e-6),
-             # FCM annular plate (Nitsche + Neumann on immersed arcs), published
-             # 8×8 p=4 config. The only end-to-end driver of weak boundary
-             # conditions on immersed arcs; prints one relative L² error, 3.50e-4.
-             (name="fcm_annular_plate_2d", env=Dict{String,String}(), tensors=true,
-              check=check_single_l2, tol=1.0e-2),
-             # FCM Kirsch plate-with-hole p-refinement sweep, published 8×8 config;
-             # prints the finest-order relative L² error, 2.93e-8.
-             (name="fcm_plate_with_hole_2d", env=Dict{String,String}(), tensors=true,
-              check=check_single_l2, tol=1.0e-6),
-             # Bi-material inclusion corner: native multi-domain coupling of two
-             # immersed FCM subdomains across an immersed interface. Coarse
-             # VTK-disabled config; prints the relative energy error against
-             # Elhaddad's reference as a percentage, 0.278 % — so the band is in
-             # percent too.
-             (name="bimaterial_inclusion_corner_2d",
-              env=Dict("BIC_CELLS" => "11", "BIC_WRITE_OUTPUT" => "false"), tensors=false,
-              check=check_energy, tol=3.0),
-             # Steep tanh layer on a sinusoidal front — the order-reduction benchmark. An
-             # hp-graded overlay stack steps the order down to 1 and the base is reduced
-             # under it; prints one relative L² error, 1.76e-2.
-             (name="tanh_layer_2d", env=Dict{String,String}(), tensors=false,
-              check=check_single_l2, tol=1.0e-1))
+             # Small-overlap conditioning sweep; 32 tiny solves, CSV output.
+             # Largest `cond(A)` per order (always at δ = 2⁻⁸): 3.65e2, 1.50e3,
+             # 6.30e5, 3.65e7; largest residual over all 32 rows 4.15e-15.
+             (name="reproductions/conditioning_small_overlap", env=Dict{String,String}(),
+              requires=(), check=check_conditioning,
+              tol=(condition=(4.0e3, 2.0e4, 7.0e6, 4.0e8), residual=1.0e-10)),
+             # Traveling heat source: shortened transient (`THS_T_MAX=0.05` runs
+             # one mesh-update + L²-transfer interval) and VTK export disabled.
+             # No error against an exact solution; the transfer residual
+             # measures 0.0.
+             (name="reproductions/traveling_heat_source_2d",
+              env=Dict("THS_T_MAX" => "0.05", "THS_WRITE_OUTPUT" => "false"), requires=(),
+              check=check_transfer, tol=1.0e-10))
 
-    # Only the cases that can actually run go into the batch; the rest are
-    # reported as skips below.
-    selection = [case for case in cases if !(case.tensors && !tensors_available)]
+    # Only the cases whose requirements the active project can resolve go into
+    # the batch; the rest are reported as skips below.
+    selection = [case for case in cases if isempty(missing_packages(case))]
     batch_stdout, batch_stderr, batch_ok = isempty(selection) ? ("", "", true) :
-                                            run_batch(selection)
+                                           run_batch(selection)
     blocks = split_blocks(batch_stdout)
     batch_finished = occursin(markers.done, batch_stdout)
     # The child's exit status is a signal no per-case block can carry: a case
@@ -299,8 +481,12 @@
 
     for case in cases
         @testset "$(case.name)" begin
-            if case.tensors && !tensors_available
-                @info "skipping Tensors example (Tensors not in active project; runs under Pkg.test)" example = case.name
+            unavailable = missing_packages(case)
+            if !isempty(unavailable)
+                @info "skipping example (the active project cannot resolve its dependencies); " *
+                      "run it on its own project with " *
+                      "`julia --project=examples/$(case.name) examples/$(case.name)/" *
+                      "$(basename(case.name)).jl`" example = case.name missing = unavailable
                 @test_skip true
             else
                 block = get(blocks, case.name, nothing)

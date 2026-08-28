@@ -1,8 +1,0 @@
-[deps]
-Unfitted = "c68911ed-f311-4fcd-9d58-9cd3adb40d87"
-
-[sources]
-Unfitted = {path = "../.."}
-
-[compat]
-julia = "1.11"

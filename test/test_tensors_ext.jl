@@ -190,8 +190,7 @@ end
     # convention differs by `|A[1,2] − A[2,1]| = 2`, so this pins the index
     # order rather than restating the implementation.
     for (cells, A, b) in (((2, 2), SMatrix{2,2,Float64}(3.0, 7.0, 5.0, 11.0), SVector(0.25, -0.5)),
-                          ((1, 1, 1), SMatrix{3,3,Float64}(1.0, 4.0, 7.0, 2.0, 5.0, 8.0,
-                                                           3.0, 6.0, 10.0),
+                          ((1, 1, 1), SMatrix{3,3,Float64}(1.0, 4.0, 7.0, 2.0, 5.0, 8.0, 3.0, 6.0, 10.0),
                            SVector(0.1, 0.2, 0.3)))
         D = length(cells)
         exact(x) = A * SVector{D,Float64}(x) + b
@@ -230,8 +229,7 @@ end
     # once. A transposed row extraction breaks the rotation mode.
     λ, μ = 1.0, 1.0
     ℂ = SymmetricTensor{4,2,Float64}((i, j, k, l) -> λ * (i == j) * (k == l) +
-                                                     μ * ((i == k) * (j == l) +
-                                                          (i == l) * (j == k)))
+                                                     μ * ((i == k) * (j == l) + (i == l) * (j == k)))
     tensor_bilinear(q, trial, c) = TestChannels(0.0, ℂ ⊡ symmetric_gradient(trial), c)
     # The spelling the shipped examples hand-roll, kept as a second opinion on
     # the new constructor.
@@ -249,8 +247,7 @@ end
     K_manual = Matrix(assemble_matrix(model, block(u, u, form(manual_bilinear))))
     @test K == K_manual
 
-    rigid_modes = (x -> SVector(1.0, 0.0), x -> SVector(0.0, 1.0),
-                   x -> SVector(-x[2], x[1]))
+    rigid_modes = (x -> SVector(1.0, 0.0), x -> SVector(0.0, 1.0), x -> SVector(-x[2], x[1]))
     scale = opnorm(K)
     @test scale > 0
     for mode in rigid_modes

@@ -64,8 +64,8 @@ end
 # (`searchsortedlast`). Cost is O(D·log Nₖ + overlapping cells) rather than O(Nₖ). The
 # ± tol.contain nudges keep a box whose face merely touches a cell boundary from
 # claiming the neighbouring cell.
-function _covered_by_level(box::AxisBox{D,T}, k::Level{D,T}, tol::GeometryTolerance{T},
-                           physical, cache::_ClassifyCache{D,T}) where {D,T}
+function _covered_by_level(box::AxisBox{D,T}, k::Level{D,T}, tol::GeometryTolerance{T}, physical,
+                           cache::_ClassifyCache{D,T}) where {D,T}
     is_inside(box, k.mesh.domain, tol) || return false
     k.mask === nothing && return true
     ranges = ntuple(D) do d
@@ -174,7 +174,7 @@ function _coverage_cells(level::Level{D}) where {D}
     lo, hi = oneunit(CartesianIndex{D}), CartesianIndex(n)
     for c in cell_indices(level.mesh)
         is_active(level.mask, c) || continue
-        for nb in max(lo, c - lo):min(hi, c + lo)
+        for nb in max(lo, c-lo):min(hi, c+lo)
             wanted[nb] = true
         end
     end

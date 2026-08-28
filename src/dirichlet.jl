@@ -50,9 +50,12 @@ end
 # which selectors are the same one. `sides` is hashed by value (Julia hashes a
 # `Vector` element-wise), matching the element-wise `==` below; the elements are
 # isbits tuples, so both are exact.
-Base.:(==)(a::BoundarySelector, b::BoundarySelector) = a.selector === b.selector &&
-                                                       a.sides == b.sides
-Base.hash(s::BoundarySelector, h::UInt) = hash(s.sides, hash(s.selector, hash(:BoundarySelector, h)))
+function Base.:(==)(a::BoundarySelector, b::BoundarySelector)
+    a.selector === b.selector && a.sides == b.sides
+end
+function Base.hash(s::BoundarySelector, h::UInt)
+    hash(s.sides, hash(s.selector, hash(:BoundarySelector, h)))
+end
 
 """
     DirichletCondition(value, boundary, field, component)
@@ -667,8 +670,7 @@ function _dirichlet_projection(layout::DofLayout{D,T}, V::Space{D,T}, dirichlet)
                 for c in 1:ncomp]
     empty_factors = DirichletFactor{T}[nothing for _ in 1:ncomp]
     all(isempty, unknowns) &&
-        return DirichletProjection{D,T}(facets, unknowns, empty_factors,
-                                        FacetTraceSamples{D,T}[])
+        return DirichletProjection{D,T}(facets, unknowns, empty_factors, FacetTraceSamples{D,T}[])
 
     index = [Dict(raw => i for (i, raw) in pairs(unknowns[c])) for c in 1:ncomp]
     # The constrained-boundary mass couples only the physically-Dirichlet dofs
@@ -831,8 +833,8 @@ end
 # past `update_dirichlet!`'s structural check, which is what actually
 # establishes that a cached projection still matches the condition list.
 function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T}, dirichlet,
-                                    projection::Union{Nothing,
-                                                      DirichletProjection{D,T}}=nothing) where {D,T}
+                                    projection::Union{Nothing,DirichletProjection{D,T}}=nothing) where {D,
+                                                                                                        T}
     fill!(layout.constrained_values, zero(T))
     ncomp = layout.components
     plan = if projection === nothing ||

@@ -198,8 +198,8 @@ end
 
     target_solution = transfer(source_solution, source_model, target_model)
     @test target_solution.diagnostics.residual_norm < 1.0e-12
-    @test l2_error(target_solution, target_model,
-                   x -> value(source_solution, source_model, x); norm=:relative) < 1.0e-12
+    @test l2_error(target_solution, target_model, x -> value(source_solution, source_model, x);
+                   norm=:relative) < 1.0e-12
 end
 
 @testset "L2 transfer rejects incompatible models" begin

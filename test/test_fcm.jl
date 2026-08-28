@@ -186,7 +186,7 @@ end
     moments = Unfitted._moments_from_rule(rule[1], rule[2], region, order)
     starved = Unfitted._cap_candidates(rule[1], order, Unfitted._candidate_budget(1))
     _, _, starved_residual = Unfitted._solve_moment_fit(moments, starved, region, order,
-                                                       sum(rule[2]))
+                                                        sum(rule[2]))
     @test starved_residual > Unfitted._FIT_FAILURE_RESIDUAL
     # The retry must genuinely enlarge the cloud — the property the fixed cap
     # silently removed.

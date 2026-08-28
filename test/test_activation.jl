@@ -287,8 +287,7 @@ end
     # levels the move does not touch.
     bc = dirichlet(0.0; on=boundary(:all))
     V = overlay(overlay(space(_OMEGA; cells=(8, 8), order=2), box((0.1, 0.1), (0.5, 0.5));
-                        cells=(4, 4), order=2),
-                box((0.5, 0.5), (0.9, 0.9)); cells=(4, 4), order=2)
+                        cells=(4, 4), order=2), box((0.5, 0.5), (0.9, 0.9)); cells=(4, 4), order=2)
     model = prepare(poisson(V; source=1.0, dirichlet=[bc]))
 
     deactivate!(model; level=2, cells=[CartesianIndex(1, 1)])
