@@ -123,8 +123,7 @@ u = field(:u, V)
 # is never solved as a steady problem here; `prepare` is called for the dof
 # layout, the constraints, and the integration plan, which every operator
 # below is then assembled against.
-problem = Problem((u,); blocks=(stiffness_block(u),),
-                  loads=(source_load(u; source=source),),
+problem = Problem((u,); blocks=(stiffness_block(u),), loads=(source_load(u; source=source),),
                   dirichlet=[dirichlet(0.0; on=boundary(:all))])
 model = prepare(problem)
 
@@ -154,12 +153,12 @@ u₀ = M \ assemble_vector(model, source_load(u; source=initial))
 # having assembled the operator in the first place, and `jac_prototype` gives
 # the integrator the sparsity pattern to factorise.
 
-rhs!(du, v, p, t) = (mul!(du, K, v); du .= f .- du)
+rhs!(du, v, p, t) = (mul!(du, K, v); du.=f .- du)
 # Constant Jacobian, so the integrator asks for it only a handful of times
 # per run — the allocation in `-K` is not on any hot path.
 jacobian!(J, v, p, t) = (J .= -K)
 
-odefunction = ODEFunction(rhs!; mass_matrix=M, jac=jacobian!, jac_prototype=-K)
+odefunction = ODEFunction(rhs!; mass_matrix=M, jac=jacobian!, jac_prototype=(-K))
 ode = ODEProblem(odefunction, u₀, (0.0, t_final))
 
 # Two adaptive stiff integrators of quite different construction — a
@@ -207,8 +206,7 @@ println()
 
 out = joinpath(@__DIR__, "output", "time_integration")
 write_vtk(out, primary.final, model;
-          point_data=(u=(uh, c, x, xi) -> uh(c, xi),
-                      exact=(uh, c, x, xi) -> exact(x, t_final)))
+          point_data=(u=(uh, c, x, xi) -> uh(c, xi), exact=(uh, c, x, xi) -> exact(x, t_final)))
 
 print_run_report("Transient heat conduction — $(primary_name) at t = $(t_final)",
                  diagnostics(model, primary.final; exact=x -> exact(x, t_final)); output=out,

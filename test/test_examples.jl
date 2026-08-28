@@ -406,8 +406,9 @@
 
         # "the RBF interpolant is not monotone … it overshoots a little where
         # the front is steepest". A little is the claim; this is the bound.
-        excursion = metric_values(output, raw"excursion outside \[0, 1\] introduced by the " *
-                                          "RBF transfer")
+        excursion = metric_values(output,
+                                  raw"excursion outside \[0, 1\] introduced by the " *
+                                  "RBF transfer")
         @test length(excursion) == 1
         @test all(value -> sane_error(value, tol.excursion), excursion)
 
@@ -472,8 +473,8 @@
              # Kirsch plate-with-hole p-refinement sweep on a fixed 8×8 grid;
              # prints the finest-order relative L² error, 2.96e-8. The weak form
              # is written in `Tensors.jl` notation, hence the requirement.
-             (name="applications/kirsch_plate_2d", env=Dict{String,String}(),
-              requires=("Tensors",), check=check_single_l2, tol=1.0e-6),
+             (name="applications/kirsch_plate_2d", env=Dict{String,String}(), requires=("Tensors",),
+              check=check_single_l2, tol=1.0e-6),
              # Bonded bi-material joint across a seam that misses the grid
              # lines; prints the worse of the two subdomain errors, 1.82e-5,
              # over 14 cut regions with a bit-exact symmetric operator.
@@ -506,8 +507,7 @@
              (name="applications/thermal_curing_2d", env=Dict{String,String}(), requires=(),
               check=check_curing,
               tol=(rebuilds=3, picard=16, excursion=5.0e-1, accuracy_percent=3.0,
-                   cured_area=(1.0e-2, 1.0),
-                   contrast=10)),
+                   cured_area=(1.0e-2, 1.0), contrast=10)),
 
              # ── Reproductions ───────────────────────────────────────────────
              # Smooth manufactured Laplace, published 12×12 p=4 config (already

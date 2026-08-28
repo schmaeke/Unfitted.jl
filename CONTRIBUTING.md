@@ -234,7 +234,7 @@ The repository root ships `precommit.jl`, a thin wrapper around
 docstring statistics. Three modes:
 
 ```bash
-julia precommit.jl          # format every tracked .jl file in place + print stats
+julia precommit.jl          # format every .jl file in place + print stats
 julia precommit.jl --check  # verify formatting; non-zero exit if anything would change
 julia precommit.jl --stats  # stats only; does not require JuliaFormatter installed
 ```

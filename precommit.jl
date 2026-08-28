@@ -1,7 +1,10 @@
 #!/usr/bin/env julia
 
-# Pre-commit entry point: format every tracked `.jl` file (or verify
-# formatting in `--check` mode) and print a code-statistics summary.
+# Pre-commit entry point: format every `.jl` file under the project root
+# (or verify formatting in `--check` mode) and print a code-statistics
+# summary. Discovery is a filesystem walk, not a git query, so untracked
+# and git-ignored sources are included unless their directory is listed in
+# `SKIP_DIRECTORIES`.
 #
 # Usage:
 #   julia precommit.jl          # format in place + print stats
@@ -10,14 +13,18 @@
 #   julia precommit.jl --stats  # stats only; JuliaFormatter is not required
 #
 # Formatting honours `.JuliaFormatter.toml` at the project root via
-# JuliaFormatter's path-based config lookup. The check mode stages files
-# inside the project root for that reason. `SKIP_DIRECTORIES` excludes
-# generated/output trees.
+# JuliaFormatter's path-based config lookup. The check mode stages each
+# file inside the project root for that reason, keeping the `.jl`
+# extension — `JuliaFormatter.format` dispatches on it and silently does
+# nothing for a path it does not recognise as Julia source, so staging
+# without it makes the check report every file as clean.
+# `SKIP_DIRECTORIES` excludes generated and output trees, and `.claude`,
+# which holds git worktrees during agent-assisted work.
 
 using Printf
 
 const PROJECT_ROOT = @__DIR__
-const SKIP_DIRECTORIES = Set([".git", "old", "tmp", "output", "refs"])
+const SKIP_DIRECTORIES = Set([".git", ".claude", "old", "tmp", "output", "refs"])
 const _FORMATTER_ERROR = Ref{Any}(nothing)
 const _FORMATTER_AVAILABLE = try
     @eval using JuliaFormatter
@@ -61,15 +68,19 @@ end
 function _check_formatted(path::AbstractString)
     original = read(path, String)
     # Stage the file inside the project root so JuliaFormatter discovers
-    # `.JuliaFormatter.toml` via its path-based config lookup.
-    temp_path, temp_io = mktemp(PROJECT_ROOT)
+    # `.JuliaFormatter.toml` via its path-based config lookup. The staged copy
+    # must keep the `.jl` extension: `JuliaFormatter.format` dispatches on it
+    # and silently returns without formatting anything for a path it does not
+    # recognise as Julia source, which would make this function report every
+    # file as clean no matter what it contains.
+    temp_dir = mktempdir(PROJECT_ROOT)
     try
-        write(temp_io, original)
-        close(temp_io)
+        temp_path = joinpath(temp_dir, basename(path))
+        write(temp_path, original)
         JuliaFormatter.format(temp_path; overwrite=true, verbose=false)
         return original == read(temp_path, String)
     finally
-        rm(temp_path; force=true)
+        rm(temp_dir; force=true, recursive=true)
     end
 end
 

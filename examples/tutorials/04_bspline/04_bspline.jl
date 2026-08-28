@@ -111,8 +111,8 @@ _, _, _, report_base = solve_and_report(V_base, "Part 1a — B-spline base level
 # mechanism, visible as a number.
 
 V_nested = overlay(V_base, box((0.25, 0.25), (0.75, 0.75)); cells=4)
-model_nested, solution_nested, u_nested, report_nested =
-    solve_and_report(V_nested, "Part 1b — a nested B-spline overlay on [¼, ¾]²")
+model_nested, solution_nested, u_nested, report_nested = solve_and_report(V_nested,
+                                                                          "Part 1b — a nested B-spline overlay on [¼, ¾]²")
 
 # ── Part 1c: what the deduplication is worth ─────────────────────────────────
 #
@@ -126,9 +126,9 @@ model_nested, solution_nested, u_nested, report_nested =
 
 V_undeduped = overlay(space(omega; cells=8, order=3, basis=bspline(), reduce_order=false),
                       box((0.25, 0.25), (0.75, 0.75)); cells=4)
-_, _, _, report_undeduped =
-    solve_and_report(V_undeduped, "Part 1c — the same stack, deduplication switched off";
-                     parameters=(:reduce_order => false,))
+_, _, _, report_undeduped = solve_and_report(V_undeduped,
+                                             "Part 1c — the same stack, deduplication switched off";
+                                             parameters=(:reduce_order => false,))
 
 println("Nested B-spline stack, deduplicated : unknowns ", report_nested.active_unknowns, ", cond ",
         report_nested.condition_estimate)
@@ -163,12 +163,12 @@ perforated = physical_domain(leaf(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0);
                              subcell_length_scale=1 / 128, max_depth=6)
 
 V_immersed = space(omega; cells=8, order=3, basis=bspline(), physical=perforated)
-model_bs, solution_bs, u_bs, report_bs =
-    solve_and_report(V_immersed, "Part 2 — B-splines on a perforated square (FCM)")
+model_bs, solution_bs, u_bs, report_bs = solve_and_report(V_immersed,
+                                                          "Part 2 — B-splines on a perforated square (FCM)")
 
 V_reference = space(omega; cells=8, order=3, physical=perforated)
-model_il, solution_il, u_il, report_il =
-    solve_and_report(V_reference, "Part 2 — the same problem in integrated Legendre")
+model_il, solution_il, u_il, report_il = solve_and_report(V_reference,
+                                                          "Part 2 — the same problem in integrated Legendre")
 
 println("Cross-family agreement on the perforated square:")
 gaps = Float64[]

@@ -198,9 +198,10 @@ end
 # The conduction form ∫_Ω κ(χ) ∇v ⋅ ∇u dx. This is why χ is a `QuadField` and
 # not a coefficient callback `κ(x)`: the value is attached to the quadrature
 # point through `q.point`, not to the physical position.
-conduction(chi) = WeakForm(; linear=q -> 0.0, symmetric=true,
-                           bilinear=(q, trial) -> TestChannels(0.0,
-                                                               kappa(chi[q.point]) * trial.gradient))
+function conduction(chi)
+    WeakForm(; linear=q -> 0.0, symmetric=true,
+             bilinear=(q, trial) -> TestChannels(0.0, kappa(chi[q.point]) * trial.gradient))
+end
 
 # `chi_old` advanced by one cure step against a temperature iterate.
 function cured(chi_old, state, model)
