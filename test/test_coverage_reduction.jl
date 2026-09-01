@@ -302,3 +302,26 @@ end
     @test _proj_residual(m, _one, _INT_ONE) < 1e-6
     @test _proj_residual(m, _x1, _INT_X1SQ) < 1e-6
 end
+
+# Split cover: two overlays each take half of a base mode's incidence stencil, so
+# the mode is buried under their *union* but under neither one alone. Each overlay
+# is clamped to zero on the face they share, so at that seam nothing carries what
+# the elimination would remove — the mode has to be retained.
+#
+# `cov[ci]` only records that *some* higher level covers cell `ci`, which is why
+# this needs the same single-covering-level test the dedup half already applies.
+function _split_cover(ro)
+    V = space(_OMEGA_CR; cells=(4, 4), order=3, reduce_order=ro)
+    V = overlay(V, box((0.0, 0.0), (0.5, 0.5)); cells=(4, 4), order=3, reduce_order=ro)
+    return overlay(V, box((0.5, 0.0), (1.0, 0.5)); cells=(4, 4), order=3, reduce_order=ro)
+end
+
+@testset "a mode covered by two different levels is retained" begin
+    model, _ = _gram(_split_cover(true))
+    reduced = size(Matrix(model.matrix), 1)
+    unreduced, _ = _gram(_split_cover(false))
+    # The reduced space must still span the unreduced one: pruning may remove
+    # redundancy and nothing else. Before the single-covering-level test this
+    # dropped modes on the seam between the two overlays.
+    @test reduced == rank(Matrix(unreduced.matrix))
+end

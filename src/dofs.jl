@@ -560,11 +560,33 @@ function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{
     reproduces(k, cells) = all(cells) do ci
         _covered_by_level(cell_box(level.mesh, ci), k, tol, V.physical, classify_cache)
     end
+    # Order reduction asks the same *single-level* question the dedup half asks.
+    # `cov[ci]` says only that *some* higher level contains cell `ci`, and a mode
+    # whose incident cells are covered by two different levels is reproduced by
+    # neither: each of them is clamped to zero on the face they share, so at that
+    # seam nothing carries what the elimination removes. Requiring one level to
+    # cover the whole stencil is the same condition the dedup half already
+    # applies, and for the same reason.
+    #
+    # It deliberately does NOT ask the covering level to carry this level's
+    # order. Shedding a buried high-order mode is not a claim that something
+    # reproduces it — that is the dedup half's job, for linear modes. It is the
+    # opt-in this level made with `reduce_order`: over a region a finer level
+    # resolves, a coarse cell's high-order modes buy almost nothing in L² and
+    # carry the oscillation, so a *high-order base with a low-order fine overlay
+    # over a non-smooth feature* is exactly the configuration the rule exists to
+    # serve. Gating on the cover's order turns `reduce_order = true` into
+    # `reduce_order = false` there: measured on a tanh layer with base p = 5 and
+    # a p = 2 overlay, the gate cut the base's shed modes from 189 to 5 and left
+    # far-field oscillation and overshoot bit-identical to switching the rule
+    # off (9.37e-3 both), against 9.95e-4 and 7.03e-4 without it.
+    above = [k for k in V.levels if k.id > level.id]
+    resolves(cells) = any(k -> reproduces(k, cells), above)
     for (key, raw) in level_keys
         cells = _incident_cells(key, n)
         all(ci -> cov[ci], cells) || continue                       # buried?
         if any(a -> a.kind == _AXIS_SPAN, key.axes)                 # high-order → order reduction
-            push!(out, (LinearConstraint{T}([raw], [one(T)]), :coverage))
+            resolves(cells) && push!(out, (LinearConstraint{T}([raw], [one(T)]), :coverage))
         elseif any(k -> reproduces(k, cells), nested_above)          # linear reproduced above
             push!(out, (LinearConstraint{T}([raw], [one(T)]), :dedup))
         end
