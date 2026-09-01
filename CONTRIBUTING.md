@@ -146,6 +146,7 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks |
 | `intersections.jl`| admissible integration regions for non-matching meshes; cut/fictitious region-quadrature dispatch |
 | `coverage.jl`     | per-level covered-cell masks (`Coverage`, `build_coverage`); the mask-aware, fictitious-fold-aware covering rule behind order reduction |
+| `ladder.jl`       | nested refinement ladders: `ladder` declaration, per-level activation via `adapt`, cross-level cell mapping, the `is_nested` predicate |
 | `dofs.jl`         | dof layout, raw/active enumeration, overlay/boundary-constraint detection |
 | `dirichlet.jl`    | physical Dirichlet conditions and boundary selectors, the per-key boundary-face detection `dof_layout` eliminates on, codim-K facet regions and quadrature, and the L² boundary projection for nonzero data |
 | `surface.jl`      | immersed-boundary surface meshes (`BoundaryMesh`) and surface-region integration |

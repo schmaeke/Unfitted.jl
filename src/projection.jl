@@ -390,17 +390,27 @@ source field:
      skip silently (`strict = false`).
 
 Reconstructs the source field pointwise when the target's active basis
-*contains* the source's — typically after a monotone
-[`activate!`](@ref) or an h-/p- refinement that adds new dofs without
-removing any old ones. The interpolation is exact in that case
-(coefficients are not modified), and the smoothing of the L² backend
-is avoided.
+*contains* the source's. The coefficients are not modified, so the
+reconstruction is exact, and the smoothing of the L² backend is avoided.
+
+Containment is a stronger condition than "the target space is larger",
+and on a stack with `reduce_order = true` a refinement does not satisfy
+it: activating a finer level buries the parent's high-order modes, so
+order reduction eliminates them in the target and the target's basis
+trades parent modes for child modes rather than extending. The target's
+*span* still contains the source's — that is what makes the elimination
+lossless — but this backend matches dofs, not spans, and there is no
+counterpart to copy the eliminated coefficients into. It raises in strict
+mode; in non-strict mode it drops them, which silently discards their
+whole contribution to the field. Use [`L2Projection`](@ref) for an
+adaptive step in either direction, and reserve this backend for a target
+built by adding dofs without eliminating any.
 
 `strict = true` (default) is the safe choice: any key mismatch is a
 programming error and should surface at the transfer call rather than
-in mysterious downstream numbers. Pass `strict = false` for
-non-monotone transfers where a few dropped coefficients are expected
-and acceptable.
+in mysterious downstream numbers. Pass `strict = false` only when the
+dropped coefficients are genuinely negligible — it is not a fallback for
+a target this backend cannot express, and it does not warn.
 """
 struct Rewire <: TransferBackend
     strict::Bool

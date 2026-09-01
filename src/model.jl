@@ -479,6 +479,19 @@ end
 # ids `1:N` — exactly what the assembly workspace's flat level-id banks and
 # each field's dof layout agree on. For a single-domain problem this is just
 # the one space's levels.
+# Level reports for every subdomain space, flattened in the same order as
+# `_problem_levels`. Built per space because nesting is a relation between the
+# levels of one space; a coupled problem's spaces are independent stacks.
+function _level_reports(problem::Problem, tol::GeometryTolerance)
+    out = Any[]
+    for V in problem_spaces(problem)
+        for level in V.levels
+            push!(out, _level_report(level, V, tol))
+        end
+    end
+    return out
+end
+
 function _problem_levels(problem::Problem)
     levels = Any[]
     for V in problem_spaces(problem)
@@ -591,18 +604,34 @@ Forwarded keyword arguments go to `integration_plan`; see its docstring
 for the full list.
 """
 function prepare(problem::Problem{D,T}; kwargs...) where {D,T}
+    _prepared_model(problem, (; kwargs...), nothing)
+end
+
+# The body of [`prepare`](@ref), with the moment-fit caches optionally supplied.
+#
+# `prepare` starts them empty. [`adapted`](@ref) hands the source model's back,
+# for the reason `move!` gives for not invalidating them: they are keyed by
+# region bounds and moment order, and an adaptive step changes which cells are
+# active and no geometry at all, so every fitted cut-cell rule is still valid.
+# Rebuilding them instead refits every cut region on every adaptive step, which
+# on an immersed transient is the dominant cost.
+function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
+                         reuse::Union{Nothing,Vector{_MomentFitCache{D,T}}}) where {D,T}
     effective_problem, spaces, caches = _prepare_spaces(problem)
-    # Capture the user's integration-plan options (tolerance, criterion, …) so
-    # the in-place mutators can reproduce this exact plan instead of reverting
-    # to `integration_plan`'s defaults. The classification caches are
-    # geometry-derived, not user options, so they are rebuilt per mutation.
-    plan_options = (; kwargs...)
+    # `plan_options` captures the user's integration-plan options (tolerance,
+    # criterion, …) so the in-place mutators can reproduce this exact plan
+    # instead of reverting to `integration_plan`'s defaults. The classification
+    # caches are geometry-derived, not user options, so they are rebuilt here.
     tolerance = get(plan_options, :tolerance, GeometryTolerance(T))
     # One integration plan per distinct subdomain space, each sharing that
     # space's own cell-classification cache. The moment-fit caches, unlike the
     # classification ones, outlive this call: they are the model's, and every
     # mutator hands them back so an unchanged cut region is not refitted.
-    fit_caches = _MomentFitCache{D,T}[_MomentFitCache{D,T}() for _ in eachindex(spaces)]
+    fit_caches = if reuse !== nothing && length(reuse) == length(spaces)
+        reuse
+    else
+        _MomentFitCache{D,T}[_MomentFitCache{D,T}() for _ in eachindex(spaces)]
+    end
     space_plans = IntegrationPlan{D,T}[integration_plan(spaces[i]; plan_options...,
                                                         classify_cache=caches[i],
                                                         moment_fit_cache=fit_caches[i])
@@ -1039,22 +1068,96 @@ function deactivate!(model::Model{D,T}; level::Integer, cells) where {D,T}
 end
 
 """
-    active_cells(model; level) -> BitArray{D}
+    adapted(model::Model, level => cells, ...) -> Model
+    adapted(model::Model, depths::AbstractArray{<:Integer,D}; grade=0) -> Model
+
+A fresh model whose activation masks are [`adapt`](@ref)ed as the spec says,
+leaving `model` untouched so a solution can be carried across with
+[`transfer`](@ref). The non-mutating counterpart of [`activate!`](@ref) and
+[`deactivate!`](@ref), standing to them as [`moved`](@ref) does to
+[`move!`](@ref) — and the reason it exists at all: both mutators overwrite the
+model in place, so neither can produce the source/target pair a transfer needs.
+
+Setting several levels in one call is one rebuild, where the same edit through
+the mutators is one integration plan and one dof layout per level touched. The
+tolerance and criterion captured at [`prepare`](@ref) are reused, as are the
+moment-fit caches: an adaptive step changes which cells are active and no
+geometry, so every fitted cut-cell rule is still valid.
+
+The spec is applied to the model's *pre-fold* space, which is the record of what
+the caller asked for; [`prepare`](@ref) then folds the result against the
+geometry afresh. Read masks back with `active_cells(model; level,
+effective=false)` for the same reason — an effective mask fed back in would
+record the fictitious fold as the caller's own exclusion.
+
+Single-domain only, as [`moved`](@ref) is: a level index has no meaning once a
+problem spans several subdomain spaces.
+
+# A transient step
+
+```julia
+m = active_cells(model; level=4, effective=false)
+m[marked] .= true
+target = adapted(model, 4 => m)
+u = transfer(u, model, target; via=L2Projection())
+model = target
+```
+
+`L2Projection` is the transfer for an adaptive step in *both* directions, not
+only when coarsening. Refining deepens coverage, so order reduction eliminates
+the *parent's* modes in the target: the target's active basis is not a superset
+of the source's even though the target's span contains the source's, and
+[`Rewire`](@ref) — which matches dofs — has nothing to copy into. It raises in
+strict mode and silently drops those coefficients otherwise.
+
+The transfer is exact to roundoff for integrated Legendre and for maximum-regularity
+B-splines, because reduction removes exactly the redundancy and the source field
+is still in the target's span. It is not exact for reduced-continuity B-splines
+(`bspline(; continuity_order = 0)` or `1` at degree 3), where a refine step was
+measured to lose about 2e-5 per step — an amount comparable with the
+discretisation error, so it accumulates over a transient. That behaviour is a
+property of the family's own reduction rule rather than of this call.
+
+On a model carrying a [`PhysicalDomain`](@ref) there is currently no working
+transfer at all: `L2Projection` rejects an immersed target and `Rewire` has no
+counterpart for the eliminated modes. Adaptive stepping on an immersed model
+therefore has to re-solve rather than carry state forward.
+"""
+function adapted(model::Model{D,T}, spec...; kwargs...) where {D,T}
+    _assert_single_domain(model, "adapted")
+    space = adapt(model.prefold_space, spec...; kwargs...)
+    return _prepared_model(_problem_with_space(model.problem, space), model.plan_options,
+                           model.moment_fit_caches)
+end
+
+"""
+    active_cells(model; level, effective=true) -> BitArray{D}
 
 Return a `BitArray{D}` indicating which cells of `level` are active.
 `level` is a position in the model's space, as for [`activate!`](@ref).
 Returns a copy so caller mutations do not leak into the model. Levels
 without a mask return an all-true array.
 
-The mask returned is the *effective* one: on a space carrying a
-[`PhysicalDomain`](@ref) it already has the fictitious fold applied, so a
-cell can read inactive because the caller excluded it or because the level
-set put it outside Ω. Unlike the mutators this reads the problem's
-representative space (the first field's) rather than raising on a coupled
-model, so on a multi-domain model it reports the first subdomain.
+With `effective = true` (the default) the mask returned is the effective
+one: on a space carrying a [`PhysicalDomain`](@ref) it already has the
+fictitious fold applied, so a cell can read inactive because the caller
+excluded it or because the level set put it outside Ω. Pass
+`effective = false` to read the *pre-fold* mask instead — the caller's own
+selection, with no geometry folded in.
+
+The distinction matters whenever a mask is read back and written again,
+which is what an adaptive step does. Feeding an effective mask to
+[`adapt`](@ref) or [`adapted`](@ref) launders the fold into user intent: the
+cells the geometry switched off are recorded as cells the caller excluded,
+and the next fold cannot undo that. Round-tripping through
+`effective = false` is an identity; through `effective = true` it is not.
+
+Unlike the mutators this reads the problem's representative space (the
+first field's) rather than raising on a coupled model, so on a multi-domain
+model it reports the first subdomain.
 """
-function active_cells(model::Model; level::Integer)
-    levels = model.problem.space.levels
+function active_cells(model::Model; level::Integer, effective::Bool=true)
+    levels = (effective ? model.problem.space : model.prefold_space).levels
     1 <= level <= length(levels) || throw(ArgumentError("level index $level out of bounds"))
     lvl = levels[level]
     lvl.mask === nothing && return trues(lvl.mesh.cells)
@@ -1200,16 +1303,26 @@ diagnostics(model::Model) = model.diagnostics
 # Compact per-level reproducibility report used inside
 # `diagnostics(model, solution)`: enough information to know which
 # basis, order, mode, cell count, and domain a level had at solve time.
-function _level_report(level)
+# Per-level metadata for the diagnostics report. `nested` is the geometric half
+# of the condition order reduction wants — every higher level's node coordinates
+# agree with this level's where they overlap. It is reported per level rather
+# than per space so a violation can be localised, and it is worth reporting at
+# all because it is otherwise invisible: `move!` can void it on a stack that was
+# nested when it was built, and the resulting loss shows up as neither a
+# residual nor a rank deficiency. See [`is_nested`](@ref).
+function _level_report(level, V::Space, tol::GeometryTolerance)
+    nested = all(k -> k.id <= level.id || _nested_over(level, k, tol), V.levels)
     return (; id=level.id, role=level.role, cells=level.mesh.cells, order=level.order,
-            mode=level.mode, basis=basis_name(level.basis), domain=level.mesh.domain,)
+            mode=level.mode, basis=basis_name(level.basis), domain=level.mesh.domain,
+            nested=nested,)
 end
 
-function diagnostics(model::Model, solution; exact=nothing)
+function diagnostics(model::Model{D,T}, solution; exact=nothing) where {D,T}
     _checked_coefficients(solution, model)
     diag = diagnostics(model)
     error = exact === nothing ? nothing : l2_error(solution, model, exact)
-    return (; dimension=diag.dimension, levels=map(_level_report, _problem_levels(model.problem)),
+    tol = get(model.plan_options, :tolerance, GeometryTolerance(T))
+    return (; dimension=diag.dimension, levels=_level_reports(model.problem, tol),
             active_unknowns=diag.active_unknowns, raw_dofs=raw_dof_count(model.dofs),
             integration_regions=diag.integration_regions,
             facet_region_count=diag.facet_region_count,

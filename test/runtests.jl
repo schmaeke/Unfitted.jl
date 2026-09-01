@@ -9,6 +9,7 @@ using Test
     include("test_constraints.jl")
     include("test_activation.jl")
     include("test_coverage_reduction.jl")
+    include("test_ladder.jl")
     include("test_physical.jl")
     include("test_implicit.jl")
     include("test_fcm.jl")
