@@ -328,7 +328,7 @@ end
     # An overlay of the same degree whose cell boundaries include the base's
     # reproduces — exactly — every base function buried underneath it, so the two
     # levels carry the same function twice and the superposition is singular until
-    # one copy goes. `reduce_order` (`true` by default) removes it.
+    # one copy goes. `prune_covered` (`true` by default) removes it.
     #
     # Which functions qualify is decidable from the knot vectors alone: with uniform
     # simple interior knots, base function `i` lives on cells `max(1, i − p) …
@@ -337,7 +337,7 @@ end
     # `{i : i − p ≥ 3, i ≤ 6}` — `4 − p` functions per axis, `(4 − p)^D` in D
     # dimensions. The dedup count below is that number, not an observation.
     nested(ro, p) = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=p, basis=bspline(),
-                                  reduce_order=ro), box((0.25, 0.25), (0.75, 0.75)); cells=4,
+                                  prune_covered=ro), box((0.25, 0.25), (0.75, 0.75)); cells=4,
                             order=p)
     for p in 1:3
         m, l = _gram(nested(true, p))
@@ -458,7 +458,7 @@ end
     # patch of four base cells, burying the base vertex at (0.375, 0.375). Its hat is
     # kinked there, and the covering level is a maximal-smoothness spline whose span has
     # no kink at a simple interior knot — so the linear dedup must not fire, however
-    # perfectly the two meshes nest. Order reduction still sheds the buried high-order
+    # perfectly the two meshes nest. Covered-mode pruning still sheds the buried high-order
     # modes; the surviving linear skeleton is what keeps the space complete to first
     # order. Deduping the vertex costs ‖1 − Π1‖ ≈ 6e-3, 0.44 pointwise.
     Vbase = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=2)

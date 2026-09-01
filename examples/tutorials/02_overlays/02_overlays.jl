@@ -98,7 +98,7 @@ _, _, report_base = solve_and_report(V_base, "Run 1 — base level only")
 # `overlay(V, subdomain; cells, order)` returns a *new* `Space` with one
 # more level. The sub-box need not align with anything — overlay
 # placement is independent of the coarse mesh — but here it does align,
-# which matters later for order reduction. Eight cells across a box of
+# which matters later for covered-mode pruning. Eight cells across a box of
 # half the domain's width is twice the base resolution, and `order` is
 # inherited from the base level, so this is pure h-refinement.
 
@@ -111,7 +111,7 @@ println("Improvement factor      : ", report_base.l2_error / report_overlay.l2_e
 println()
 
 #=
-── Order reduction: what `reduced_mode_counts` is telling you ────────────────
+── Covered-mode pruning: what `reduced_mode_counts` is telling you ───────────
 
 Look at `reduced mode counts` in Run 2's report: one entry per level.
 The base level's entry is large; the overlay's is zero, because nothing
@@ -139,18 +139,18 @@ Two guards keep the elimination from going too far:
     over this one and therefore reproduces it exactly — there the two are
     genuinely linearly dependent, not merely similar.
 
-`reduce_order = false` switches the rule off. Note that it belongs to the
+`prune_covered = false` switches the rule off. Note that it belongs to the
 level that *sheds* the modes — the base — so it is `space` that has to be
 told, not `overlay`. Run 2b does exactly that, so the mechanism is
 measured here rather than merely described.
 =#
 
-# ── Run 2b: the same stack with order reduction switched off ─────────────────
+# ── Run 2b: the same stack with covered-mode pruning switched off ─────────────────
 
-V_unreduced = overlay(space(omega; cells=8, order=3, reduce_order=false), refined_region; cells=8)
+V_unreduced = overlay(space(omega; cells=8, order=3, prune_covered=false), refined_region; cells=8)
 _, _, report_unreduced = solve_and_report(V_unreduced,
-                                          "Run 2b — Run 2 with order reduction switched off";
-                                          parameters=(:reduce_order => false,))
+                                          "Run 2b — Run 2 with covered-mode pruning switched off";
+                                          parameters=(:prune_covered => false,))
 
 println("Run 2  (reduction on) : ", report_overlay.active_unknowns, " unknowns, error ",
         report_overlay.l2_error)

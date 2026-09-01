@@ -145,7 +145,7 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `fcm.jl`          | finite-cell-method cut-cell quadrature: exact moments from `implicit.jl`, non-negative (NNLS) moment fit |
 | `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks |
 | `intersections.jl`| admissible integration regions for non-matching meshes; cut/fictitious region-quadrature dispatch |
-| `coverage.jl`     | per-level covered-cell masks (`Coverage`, `build_coverage`); the mask-aware, fictitious-fold-aware covering rule behind order reduction |
+| `coverage.jl`     | per-level covered-cell masks (`Coverage`, `build_coverage`); the mask-aware, fictitious-fold-aware covering rule behind covered-mode pruning |
 | `ladder.jl`       | nested refinement ladders: `ladder` declaration, per-level activation via `adapt`, cross-level cell mapping, the `is_nested` predicate |
 | `dofs.jl`         | dof layout, raw/active enumeration, overlay/boundary-constraint detection |
 | `dirichlet.jl`    | physical Dirichlet conditions and boundary selectors, the per-key boundary-face detection `dof_layout` eliminates on, codim-K facet regions and quadrature, and the L² boundary projection for nonzero data |
@@ -379,8 +379,8 @@ carries its own mesh, basis family, polynomial/order metadata, and dofs.
 Overlay levels are positioned independently of lower levels: overlay
 boundaries need not coincide with lower-level element boundaries, and
 overlays are never topologically merged with their parents. The package
-does, however, carry an *order-reduction* rule for redundancy: with
-`reduce_order = true` (the default on `space` and `overlay`), every
+does, however, carry an *pruning* rule for redundancy: with
+`prune_covered = true` (the default on `space` and `overlay`), every
 high-order mode whose entire incidence stencil is covered by a finer
 level is eliminated, leaving the linear skeleton. Elimination is
 per-mode, not per-cell: a mode is shed only when *every* cell it is
@@ -390,7 +390,7 @@ buried linear mode that a *nested* finer level reproduces exactly is
 deduplicated. Coverage is mask-aware — a user-masked cell blocks
 coverage, a fictitious fold does not.
 
-Order reduction is a basis-family-specific feature, and
+Covered-mode pruning is a basis-family-specific feature, and
 `_coverage_constraints` is where a family implements it. The
 `Level{D,T,<:IntegratedLegendre}` method does both eliminations above.
 The B-spline extension overrides the hook too, but only for the dedup:
@@ -399,7 +399,7 @@ the one a covering level reproduces exactly — and eliminating it is not
 an accuracy trade but the thing that keeps a nested B-spline stack
 non-singular, since the two copies are linearly dependent. Any further
 family hits the generic fallback that returns an empty constraint list,
-while `reduce_order` still defaults to `true`, so on such a space the
+while `prune_covered` still defaults to `true`, so on such a space the
 default is on and does nothing. See `src/coverage.jl` and
 `_coverage_constraints` in `src/dofs.jl`;
 `diagnostics(...).reduced_mode_counts` reports the count per level,
@@ -740,7 +740,7 @@ indicator representations are intentionally not supported.
     `moment_fit_residual_max`, `cut_fallback_count`,
     `cut_fallback_points`, and `inactive_cell_counts` (which folds in the
     fictitious cell drop). The same report also carries
-    `reduced_mode_counts` (order reduction), `dimension`,
+    `reduced_mode_counts` (covered-mode pruning), `dimension`,
     `integration_regions`, `facet_region_count`, `surface_region_count`,
     `interface_region_count`, `raw_dofs`, `active_unknowns`, `levels`,
     `small_overlap_count` / `small_overlaps`, `min_integration_volume`,
@@ -1083,7 +1083,7 @@ demos.
     four-block sign pattern. **Requirement not yet met:** no coupling
     test masks a subdomain, so the skip of interface regions where one
     side has no active cover is unexercised.
-  - Order reduction: covered high-order modes eliminated and buried
+  - Covered-mode pruning: covered high-order modes eliminated and buried
     linear modes deduplicated only under a nested finer level;
     `reduced_mode_counts` matches the eliminated set. No test in
     `test_coverage_reduction.jl` builds a masked overlay; the fully

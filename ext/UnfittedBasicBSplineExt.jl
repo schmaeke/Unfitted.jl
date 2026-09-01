@@ -64,7 +64,7 @@ global 1D function index via the `_AXIS_BSPLINE` tag.
     trace-vanishing [`LinearConstraint`](@ref)s (orders `k = 0 … m`) on
     every overlay / mask face, so masked B-spline levels of any geometry
     remain eliminable through the existing constraint machinery.
-  - A `_coverage_constraints` overload. Order reduction for this family is
+  - A `_coverage_constraints` overload. Covered-mode pruning for this family is
     the dedup and nothing else: a buried function a covering level's span
     already contains exactly is eliminated, because the two are linearly
     dependent and the superposition is otherwise singular. See
@@ -124,14 +124,14 @@ A B-spline overlay of the same degree whose cell boundaries include the
 base's reproduces, exactly, every base function buried underneath it — so
 the two levels carry the same function twice and the superposed operator is
 exactly singular. Nesting is the natural thing to reach for, so the family
-handles it: `reduce_order` (`true` by default on both [`space`](@ref) and
+handles it: `prune_covered` (`true` by default on both [`space`](@ref) and
 [`overlay`](@ref)) eliminates the duplicate. That costs nothing here — the
-discrete space is unchanged, unlike integrated Legendre's order reduction,
+discrete space is unchanged, unlike integrated Legendre's covered-mode pruning,
 which trades accuracy for dofs. A `:tensor` integrated-Legendre overlay of
 order ≥ the base degree reproduces the same functions and is deduped the
 same way.
 
-Passing `reduce_order=false` on a nested stack keeps the duplicate and
+Passing `prune_covered=false` on a nested stack keeps the duplicate and
 leaves the operator singular, the same trade the integrated-Legendre family
 makes. If a configuration must keep every mode, break the nesting instead:
 a cell count that does not divide the base's (`cells=5` under a base of 8,
@@ -633,7 +633,7 @@ function _active_cell_at_face(level::Level{D}, d::Int, j::Int, perp_cell::Cartes
     return a_j ? (cell_j, j) : (cell_jp1, j + 1)
 end
 
-# ── Order reduction: dedup of what a covering level already contains ──────────
+# ── Covered-mode pruning: dedup of what a covering level already contains ──────────
 
 # The cells this level's axis-`d` 1D function with global index `i` is supported
 # on. Cell `c` carries the global indices `c … c + p` (uniform knots,
@@ -678,7 +678,7 @@ function _reproduces(k::Level{D}, p::NTuple{D,Int}) where {D}
 end
 
 # `_coverage_constraints` for a B-spline level — the dedup half only, and it is
-# the whole of order reduction for this family.
+# the whole of covered-mode pruning for this family.
 #
 # Integrated Legendre splits into a linear skeleton plus bubble modes, so it can
 # shed the bubbles of a covered cell on their own and trade accuracy for dofs. A
@@ -686,7 +686,7 @@ end
 # level reproduces *exactly*, which leaves the discrete space unchanged and is
 # therefore free. What it buys is not dof count but well-posedness — the
 # reproduced function and its copy above are linearly dependent, so leaving both
-# active makes the superposed operator exactly singular. `reduce_order=false`
+# active makes the superposed operator exactly singular. `prune_covered=false`
 # opts out of the repair as well as of the reduction, exactly as it does for
 # integrated Legendre.
 function Unfitted._coverage_constraints(level::Level{D,T,<:BSplineFamily}, V::Space{D,T},

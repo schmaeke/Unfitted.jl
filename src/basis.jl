@@ -65,7 +65,7 @@ about them deliberately:
     thing a family must supply, and it is a single test on the inactive
     neighbour of a face.
   - `_coverage_constraints` (`src/dofs.jl`) — the generic method returns no
-    constraints, so on a family that does not override it `reduce_order` still
+    constraints, so on a family that does not override it `prune_covered` still
     defaults to `true` and does nothing. Overriding it is not only about
     shedding dofs: where a covering level's span *contains* one of this level's
     functions, the two are linearly dependent and the superposed operator is

@@ -30,7 +30,7 @@
 #
 # Where an example's *prose* makes a claim, the claim is asserted rather than
 # the number alone. Tutorial 2 tells the reader the overlay beats the base level
-# by an order of magnitude, that switching order reduction off changes the
+# by an order of magnitude, that switching covered-mode pruning off changes the
 # answer in no digit that matters, and that `activate!`/`deactivate!` reproduce
 # the configuration they rebuild — all three are checked below. Tutorial 4 tells
 # the reader that one duplicated B-spline mode costs fifteen orders of magnitude
@@ -238,7 +238,7 @@
     end
 
     # Tutorial 2 prints five reports — Run 1 (base only), Run 2 (full overlay),
-    # Run 2b (order reduction off), Run 3 (masked overlay), and a summary that
+    # Run 2b (covered-mode pruning off), Run 3 (masked overlay), and a summary that
     # reprints Run 4's numbers, which are Run 3's discretisation rebuilt by
     # `deactivate!`. Each assertion below corresponds to a sentence the tutorial
     # tells the reader to verify from the output.
@@ -258,7 +258,7 @@
         # the integration plan and the cached operators.
         @test isapprox(errors[5], errors[4]; rtol=1.0e-8)
         @test sane_error(errors[5], tol.headline)
-        # The number the tutorial's order-reduction section tells the reader to
+        # The number the tutorial's pruning section tells the reader to
         # look for: the base level sheds 121 buried high-order modes under the
         # full overlay, the overlay itself sheds none.
         @test occursin("reduced mode counts: [121, 0]", output)

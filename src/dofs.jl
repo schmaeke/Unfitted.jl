@@ -25,7 +25,7 @@
 #     `LevelMask` is in play — except where the inactive side is fully
 #     fictitious, since a fold face carries no physical trace to
 #     vanish on (`_internal_face_is_physical`).
-#   * Order reduction — on a level that opted into `reduce_order`, the
+#   * Covered-mode pruning — on a level that opted into `prune_covered`, the
 #     high-order modes buried under a finer level, plus the buried
 #     linear modes a nested finer level reproduces exactly. Also a
 #     strong elimination, and also artificial: it removes modes the
@@ -37,7 +37,7 @@
 # simply leave holes in the enumeration.
 #
 # This file owns the dof keys, the layout structs, the structural
-# overlay-constraint detection, the order-reduction constraint source
+# overlay-constraint detection, the pruning constraint source
 # (`_coverage_constraints`, over the masks `coverage.jl` computes), and
 # the active-enumeration constructor.
 # The physical-Dirichlet spec types, per-key Dirichlet detection, and
@@ -89,7 +89,7 @@ A homogeneous linear constraint among raw dofs of one level:
 Applies uniformly to every field component (neither constraint source
 distinguishes components). Emitted by [`_overlay_constraints`](@ref) for
 the trace-vanishing conditions at artificial boundaries and by
-[`_coverage_constraints`](@ref) for order-reduction eliminations; the dof
+[`_coverage_constraints`](@ref) for pruning eliminations; the dof
 layer resolves the resulting constraint system into a `raw_expansion`
 table via cascade elimination in [`_resolve_constraints!`](@ref).
 
@@ -139,7 +139,7 @@ Fields:
   - `elimination_source::Vector{Symbol}` — `raw → :free / :overlay /
     :coverage / :dedup`. `:free` iff the raw survives; otherwise the source
     that eliminated it: the artificial overlay boundary (`:overlay`) or, from
-    the order-reduction extension, a covered high-order mode (`:coverage`) or a
+    the pruning extension, a covered high-order mode (`:coverage`) or a
     deduped covered vertex (`:dedup`). Applies to every component
     simultaneously; derived from `raw_expansion`. Serves as both the
     elimination flag (`!== :free`) and its provenance, read by
@@ -501,7 +501,7 @@ function _overlay_constraints(level::Level{D,T,B}, V::Space{D,T}, tol::GeometryT
     return constraints
 end
 
-# ── Order-reduction (coverage) constraint source ─────────────────────────────
+# ── Pruning (coverage) constraint source ─────────────────────────────
 
 # Cells of `level` incident to the entity of `key`, from the per-axis incidence
 # rule of `_axis_incidence` applied on every axis.
@@ -513,11 +513,11 @@ end
     _coverage_constraints(level, V, coverage, tol, level_keys, classify_cache)
         -> Vector{Tuple{LinearConstraint{T},Symbol}}
 
-Order-reduction constraint source, a peer of [`_overlay_constraints`](@ref). For a
-level opted into `reduce_order`, emit a single-raw strong elimination for
+Pruning constraint source, a peer of [`_overlay_constraints`](@ref). For a
+level opted into `prune_covered`, emit a single-raw strong elimination for
 
   * every **buried high-order** mode (at least one bubble axis, every incident cell
-    covered) — order reduction, source `:coverage`; and
+    covered) — covered-mode pruning, source `:coverage`; and
   * every **buried linear** mode a single nested *integrated-Legendre* level above
     reproduces exactly — dedup, source `:dedup`.
 
@@ -560,7 +560,7 @@ function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{
     reproduces(k, cells) = all(cells) do ci
         _covered_by_level(cell_box(level.mesh, ci), k, tol, V.physical, classify_cache)
     end
-    # Order reduction asks the same *single-level* question the dedup half asks.
+    # Covered-mode pruning asks the same *single-level* question the dedup half asks.
     # `cov[ci]` says only that *some* higher level contains cell `ci`, and a mode
     # whose incident cells are covered by two different levels is reproduced by
     # neither: each of them is clamped to zero on the face they share, so at that
@@ -571,12 +571,12 @@ function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{
     # It deliberately does NOT ask the covering level to carry this level's
     # order. Shedding a buried high-order mode is not a claim that something
     # reproduces it — that is the dedup half's job, for linear modes. It is the
-    # opt-in this level made with `reduce_order`: over a region a finer level
+    # opt-in this level made with `prune_covered`: over a region a finer level
     # resolves, a coarse cell's high-order modes buy almost nothing in L² and
     # carry the oscillation, so a *high-order base with a low-order fine overlay
     # over a non-smooth feature* is exactly the configuration the rule exists to
-    # serve. Gating on the cover's order turns `reduce_order = true` into
-    # `reduce_order = false` there: measured on a tanh layer with base p = 5 and
+    # serve. Gating on the cover's order turns `prune_covered = true` into
+    # `prune_covered = false` there: measured on a tanh layer with base p = 5 and
     # a p = 2 overlay, the gate cut the base's shed modes from 189 to 5 and left
     # far-field oscillation and overshoot bit-identical to switching the rule
     # off (9.37e-3 both), against 9.95e-4 and 7.03e-4 without it.
@@ -585,7 +585,7 @@ function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{
     for (key, raw) in level_keys
         cells = _incident_cells(key, n)
         all(ci -> cov[ci], cells) || continue                       # buried?
-        if any(a -> a.kind == _AXIS_SPAN, key.axes)                 # high-order → order reduction
+        if any(a -> a.kind == _AXIS_SPAN, key.axes)                 # high-order → covered-mode pruning
             resolves(cells) && push!(out, (LinearConstraint{T}([raw], [one(T)]), :coverage))
         elseif any(k -> reproduces(k, cells), nested_above)          # linear reproduced above
             push!(out, (LinearConstraint{T}([raw], [one(T)]), :dedup))
@@ -594,7 +594,7 @@ function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{
     return out
 end
 
-# Generic fallback: no order reduction for a family that has not opted in.
+# Generic fallback: no covered-mode pruning for a family that has not opted in.
 function _coverage_constraints(::Level{D,T,B}, ::Space{D,T}, ::Coverage{D}, ::GeometryTolerance{T},
                                ::AbstractVector{Pair{TensorDofKey{D},Int}},
                                ::_ClassifyCache{D,T}) where {D,T,B}
@@ -762,10 +762,10 @@ Construct the basis-aware global dof layout for a superposition
   2. Collect homogeneous linear constraints from every level, from two
      sources: the family-dispatched [`_overlay_constraints`](@ref) hook
      on every level, and [`_coverage_constraints`](@ref) on the levels
-     that opted into `reduce_order` (which needs the per-level masks
+     that opted into `prune_covered` (which needs the per-level masks
      [`build_coverage`](@ref) computes, so those are built first when
      any level opted in). A raw the overlay condition already eliminates
-     is not re-constrained by order reduction, so `elimination_source`
+     is not re-constrained by covered-mode pruning, so `elimination_source`
      credits it to the source that actually removed it. Resolve the
      collected constraints into the per-raw expansion table via
      [`_resolve_constraints!`](@ref). The resulting `raw_expansion[raw]`
@@ -843,7 +843,7 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     # The loop below keeps that split honest: a raw the overlay condition already
     # eliminates never reaches this map, whichever source names it second.
     source_of = Dict{Int,Symbol}()
-    reduce_any = any(level -> level.reduce_order, V.levels)
+    reduce_any = any(level -> level.prune_covered, V.levels)
     coverage = reduce_any ? build_coverage(V, tolerance, classify_cache) :
                Coverage{D}(Dict{Int,BitArray{D}}())
     for level in V.levels
@@ -852,12 +852,12 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
         overlay_constraints = _overlay_constraints(level, V, tolerance, raw_by_key, level_keys,
                                                    classify_cache)
         append!(constraints, overlay_constraints)
-        # Source 2: order reduction in covered regions (opt-in per level).
+        # Source 2: covered-mode pruning in covered regions (opt-in per level).
         #
         # A raw on Γ_o that is also buried carries both constraints. The overlay
         # one is queued first and strongly eliminates the raw, which leaves the
         # coverage constraint trivially satisfied — so recording it as the
-        # elimination source would credit order reduction with a raw it did not
+        # elimination source would credit covered-mode pruning with a raw it did not
         # save, and `reduced_mode_counts` would over-report. Skipping the
         # redundant constraint leaves `raw_expansion` untouched:
         # `_resolve_constraints!` substitutes the already-eliminated raw, gets an
@@ -865,7 +865,7 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
         # overlay constraints eliminate a named raw outright; a multi-raw
         # (B-spline) constraint picks its pivot during resolution, and that
         # family emits no coverage constraints at all.
-        if level.reduce_order
+        if level.prune_covered
             reductions = _coverage_constraints(level, V, coverage, tolerance, level_keys,
                                                classify_cache)
             overlay_raws = isempty(reductions) ? Set{Int}() :
@@ -983,7 +983,7 @@ Classify a single raw dof. Returns one of:
   - `:free`       — no constraint, the dof is enumerated.
   - `:dirichlet`  — physical Dirichlet only.
   - `:overlay`    — artificial overlay-boundary elimination only.
-  - `:coverage`   — order-reduction elimination (covered high-order mode).
+  - `:coverage`   — pruning elimination (covered high-order mode).
   - `:dedup`      — linear-dedup elimination (covered vertex reproduced by
                     a nested finer level).
   - `:mixed`      — physical Dirichlet plus an elimination. The

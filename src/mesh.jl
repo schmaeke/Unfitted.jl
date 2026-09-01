@@ -265,7 +265,7 @@ optional activation mask. Fields:
     no-mask hot path; the `Union` is small so the `Level` type stays
     stable across `activate!` / `deactivate!` transitions between the
     masked and unmasked states.
-  - `reduce_order::Bool` — when `true`, this level sheds every high-order
+  - `prune_covered::Bool` — when `true`, this level sheds every high-order
     mode all of whose incident cells a finer level covers (order
     reduction), and additionally sheds a buried *linear* mode that a
     nested finer level reproduces exactly (dedup). Integrated Legendre
@@ -280,7 +280,7 @@ struct Level{D,T<:Real,B<:BasisFamily}
     order::NTuple{D,Int}
     mode::Symbol
     mask::Union{Nothing,LevelMask{D}}
-    reduce_order::Bool
+    prune_covered::Bool
 end
 
 """
@@ -393,7 +393,7 @@ end
 """
     space(domain::AxisBox; cells, order=1, basis=IntegratedLegendre(),
                           mode=:tensor, active=nothing, physical=nothing,
-                          reduce_order=true)
+                          prune_covered=true)
 
 Build the base discretization of a [`Space`](@ref) over `domain`. The
 resulting space has one base level (`role = :base`, `id = 1`); add overlay
@@ -433,23 +433,35 @@ Keyword arguments:
     call raises `ArgumentError` for a family that declares
     `_supports_physical_domain` false. Both shipped families declare it
     true.
-  - `reduce_order` — when `true` (the default), the base level sheds a
-    mode wherever finer levels make it redundant. On an integrated
-    Legendre level there are two eliminations, both per-mode rather than
-    per-cell, and both asking first that the mode be *buried* — every cell
-    it is incident to covered by a finer level:
+  - `prune_covered` — when `true` (the default), a level sheds a mode
+    wherever a *single* finer level has taken over the region that mode
+    lives on. On an integrated Legendre level there are two eliminations,
+    both per-mode rather than per-cell, and both asking first that the
+    mode be *buried* — every cell it is incident to covered by one finer
+    level. They have different characters, and the difference matters:
 
       * a buried **high-order** mode (one with at least one bubble axis)
         is dropped outright, so a fully covered cell keeps only its linear
         skeleton — an edge or face mode straddling the boundary of the
-        covered region survives, because its own stencil is not buried;
+        covered region survives, because its own stencil is not buried.
+        This half is a **trade, not a redundancy claim**: the covering
+        level is not required to reproduce what it displaces. Over a
+        region a finer level resolves, a coarse cell's high-order modes
+        buy little in L² and carry the oscillation, so a high-order base
+        under a low-order fine overlay is exactly the configuration it
+        serves — measured on a tanh layer, shedding cut far-field
+        oscillation from 9.37e-3 to 9.95e-4 and overshoot to 7.03e-4.
+        Pass `prune_covered = false` to decline the trade;
       * a buried **linear** mode is dropped only when one finer level
         reproduces it exactly, which takes both halves of a test: that
         level's mesh must refine this one's (`_nested_over` in
         `src/coverage.jl`) *and* its basis must be integrated Legendre.
         A buried vertex function is a C⁰ hat, and a basis smoother than
         C⁰ across its own cell boundaries — a B-spline of degree ≥ 2 —
-        carries nothing that reproduces the kink.
+        carries nothing that reproduces the kink. This half is *not* a
+        trade: a mode a covering level reproduces exactly is linearly
+        dependent on that level's own modes, so leaving both active makes
+        the superposed operator singular.
 
     A B-spline level has no bubble/skeleton split and so has only the
     second elimination: a buried function is dropped exactly when a nested
@@ -463,7 +475,7 @@ Keyword arguments:
 """
 function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(),
                mode::Symbol=:tensor, active=nothing, physical=nothing,
-               reduce_order::Bool=true) where {D,T}
+               prune_covered::Bool=true) where {D,T}
     orders = _axis_int_tuple(order, Val(D), :order)
     _check_basis_mode(mode, orders)
     base_mesh = CartesianMesh(domain; cells)
@@ -471,7 +483,7 @@ function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(),
     family = instantiate_basis(basis, base_mesh, orders, mode, mask)
     _check_physical_basis(family, physical)
     base_level = Level{D,T,typeof(family)}(1, :base, base_mesh, family, orders, mode, mask,
-                                           reduce_order)
+                                           prune_covered)
     return Space{D,T,Tuple{typeof(base_level)}}(domain, (base_level,), physical)
 end
 
@@ -480,7 +492,7 @@ end
                                        basis=V.levels[1].basis,
                                        mode=V.levels[1].mode,
                                        tolerance=GeometryTolerance(T),
-                                       active=nothing, reduce_order=true) -> Space
+                                       active=nothing, prune_covered=true) -> Space
 
 Add an overlay level on the sub-box `domain` to an existing [`Space`](@ref)
 `V`, returning the extended space. The overlay's domain must lie inside
@@ -496,7 +508,7 @@ and possibly `order`. Keyword arguments:
   - `tolerance` — slack on the inside-domain check.
   - `active` — optional per-cell mask, same shapes as [`space`](@ref)'s
     `active`.
-  - `reduce_order` — when `true` (the default), this overlay sheds its
+  - `prune_covered` — when `true` (the default), this overlay sheds its
     buried high-order modes, and its buried modes wherever a still-finer
     nested overlay reproduces them exactly. The rule and its
     basis-family dependence are spelled out under [`space`](@ref).
@@ -511,7 +523,7 @@ section).
 function overlay(V::Space{D,T}, domain::AxisBox{D,T}; cells, order=V.levels[1].order,
                  basis=V.levels[1].basis, mode::Symbol=V.levels[1].mode,
                  tolerance=GeometryTolerance(T), active=nothing,
-                 reduce_order::Bool=true) where {D,T}
+                 prune_covered::Bool=true) where {D,T}
     is_inside(domain, V.domain, tolerance) ||
         throw(ArgumentError("overlay domain must lie inside the physical domain"))
     orders = _axis_int_tuple(order, Val(D), :order)
@@ -522,7 +534,7 @@ function overlay(V::Space{D,T}, domain::AxisBox{D,T}; cells, order=V.levels[1].o
     family = instantiate_basis(basis, overlay_mesh, orders, mode, mask)
     _check_physical_basis(family, V.physical)
     level = Level{D,T,typeof(family)}(id, :overlay, overlay_mesh, family, orders, mode, mask,
-                                      reduce_order)
+                                      prune_covered)
     levels = (V.levels..., level)
     return Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
 end
@@ -548,7 +560,7 @@ function moved_space(V::Space{D,T}; level::Integer, to::AxisBox{D,T},
     # cell coordinates; mesh-independent families return themselves.
     family = instantiate_basis(old.basis, new_mesh, old.order, old.mode, old.mask)
     new_level = Level{D,T,typeof(family)}(old.id, old.role, new_mesh, family, old.order, old.mode,
-                                          old.mask, old.reduce_order)
+                                          old.mask, old.prune_covered)
     levels = ntuple(i -> i == level ? new_level : V.levels[i], length(V.levels))
     return Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
 end
@@ -562,7 +574,7 @@ function _remasked_space(V::Space{D,T}, level_index::Integer, mask) where {D,T}
     old = V.levels[level_index]
     family = instantiate_basis(old.basis, old.mesh, old.order, old.mode, mask)
     new_level = Level{D,T,typeof(family)}(old.id, old.role, old.mesh, family, old.order, old.mode,
-                                          mask, old.reduce_order)
+                                          mask, old.prune_covered)
     levels = ntuple(i -> i == level_index ? new_level : V.levels[i], length(V.levels))
     return Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
 end
@@ -655,7 +667,7 @@ function _apply_physical_fold(V::Space{D,T}, cache::_ClassifyCache{D,T}) where {
         if any(fict)
             new_mask = _fold_fictitious(level.mask, fict)
             Level{D,T,typeof(level.basis)}(level.id, level.role, level.mesh, level.basis,
-                                           level.order, level.mode, new_mask, level.reduce_order)
+                                           level.order, level.mode, new_mask, level.prune_covered)
         else
             level
         end
@@ -687,7 +699,7 @@ function _reindex_space_levels(V::Space{D,T}, offset::Int) where {D,T}
     new_levels = ntuple(length(V.levels)) do i
         lvl = V.levels[i]
         Level{D,T,typeof(lvl.basis)}(lvl.id + offset, lvl.role, lvl.mesh, lvl.basis, lvl.order,
-                                     lvl.mode, lvl.mask, lvl.reduce_order)
+                                     lvl.mode, lvl.mask, lvl.prune_covered)
     end
     return Space{D,T,typeof(new_levels)}(V.domain, new_levels, V.physical)
 end

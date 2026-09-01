@@ -1,12 +1,12 @@
 # Tests for nested refinement ladders: declaration, per-level activation, and
 # cross-level cell mapping.
 #
-# The property the ladder exists to guarantee is that order reduction is
+# The property the ladder exists to guarantee is that covered-mode pruning is
 # *lossless* — that the reduced stack spans exactly what the unreduced one
 # spans. Rank alone cannot see the failure: off the nested manifold the reduced
 # operator is still full rank at a healthy condition number, which is what makes
 # the failure silent in the first place. Every losslessness check below therefore
-# compares against a hand-built `reduce_order = false` twin of the same geometry,
+# compares against a hand-built `prune_covered = false` twin of the same geometry,
 # and asserts `size(A_reduced, 1) == rank(A_unreduced)`.
 
 using BasicBSpline
@@ -29,11 +29,11 @@ function unreduced_twin(V::Space)
     l1 = V.levels[1]
     W = space(V.domain; cells=l1.mesh.cells, order=l1.order, basis=l1.basis, mode=l1.mode,
               active=(l1.mask === nothing ? nothing : l1.mask.on), physical=V.physical,
-              reduce_order=false)
+              prune_covered=false)
     for k in 2:length(V.levels)
         l = V.levels[k]
         W = overlay(W, l.mesh.domain; cells=l.mesh.cells, order=l.order, basis=l.basis, mode=l.mode,
-                    active=(l.mask === nothing ? nothing : l.mask.on), reduce_order=false)
+                    active=(l.mask === nothing ? nothing : l.mask.on), prune_covered=false)
     end
     return W
 end
@@ -63,7 +63,7 @@ end
     @test_throws ArgumentError ladder(LADDER_OMEGA; cells=6, depth=3, splits=[2, 2])
 end
 
-@testset "order reduction on a ladder is lossless" begin
+@testset "covered-mode pruning on a ladder is lossless" begin
     # The feature, in one assertion. A ladder refined over a block of base cells
     # sheds modes; the reduced space must still span the unreduced one.
     for depth in 1:3
@@ -102,7 +102,7 @@ end
 end
 
 @testset "a lower-order cover still sheds — that is the point of the rule" begin
-    # Order reduction is not a claim that the cover reproduces what it removes;
+    # Covered-mode pruning is not a claim that the cover reproduces what it removes;
     # that is the dedup half's job. It is an opt-in trade: over a region a finer
     # level resolves, the coarse cell's high-order modes buy almost nothing in L²
     # and carry the oscillation. A high-order base under a low-order fine overlay
@@ -114,7 +114,7 @@ end
     @test diagnostics(prepare(mass(equal_order))).reduced_mode_counts[1] > 0
     # At equal order the cover does reproduce what it displaces, so the reduction
     # is lossless. At lower order it is not, and that is the documented trade —
-    # `reduce_order = false` is how a caller declines it.
+    # `prune_covered = false` is how a caller declines it.
     @test lossless(equal_order)
 end
 
@@ -319,7 +319,7 @@ end
 end
 
 @testset "ladder composes with B-splines" begin
-    # The B-spline family reaches order reduction through its own
+    # The B-spline family reaches covered-mode pruning through its own
     # `_coverage_constraints`, which dedups rather than sheds bubbles; a nested
     # stack is non-singular only because that dedup fires. `lossless` compares
     # against the unreduced twin, which for this family is rank-deficient by

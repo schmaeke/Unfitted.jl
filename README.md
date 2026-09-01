@@ -64,7 +64,7 @@ The method is described in
   flux-weighted); `couple` instantiates that kernel once per side pair,
   so the two-sidedness spans the four blocks. The package supplies the
   two-sided interface integration, never the constitutive choice.
-- **Order reduction on covered regions** (`reduce_order`, on by
+- **Covered-mode pruning on covered regions** (`prune_covered`, on by
   default): every high-order mode whose entire incidence stencil is
   covered by a finer level is eliminated, leaving the linear skeleton.
   Elimination is per-mode rather than per-cell — a mode is shed only

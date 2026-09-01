@@ -66,8 +66,8 @@ Fields:
     whenever the domain's `keep_fictitious` is `false` (the default) —
     that fold runs at any `alpha`, not only in the strict `alpha = 0` case.
   - `reduced_mode_counts::Vector{Int}` — count of high-order and dedup
-    modes eliminated by order reduction in covered regions
-    (`reduce_order`), one entry per level of each *field*, concatenated in
+    modes eliminated by covered-mode pruning in covered regions
+    (`prune_covered`), one entry per level of each *field*, concatenated in
     field-declaration order. Note the different granularity from
     `inactive_cell_counts`, which is per *space*: the two vectors line up
     entry-for-entry only when every space carries exactly one field (the
@@ -163,10 +163,10 @@ function _inactive_cell_counts(spaces)
                for level in V.levels]
 end
 
-# Per-level count of raws eliminated by order reduction (`:coverage` or
+# Per-level count of raws eliminated by covered-mode pruning (`:coverage` or
 # `:dedup`), across every field of the system layout, in field-then-level
 # order. The granularity is deliberately the *field*, not the space
-# `_inactive_cell_counts` walks: order reduction is a property of a field's
+# `_inactive_cell_counts` walks: covered-mode pruning is a property of a field's
 # own dof layout, and two fields over one space shed different modes. The two
 # vectors therefore line up entry-for-entry only when each space carries one
 # field.
@@ -1104,7 +1104,7 @@ model = target
 ```
 
 `L2Projection` is the transfer for an adaptive step in *both* directions, not
-only when coarsening. Refining deepens coverage, so order reduction eliminates
+only when coarsening. Refining deepens coverage, so covered-mode pruning eliminates
 the *parent's* modes in the target: the target's active basis is not a superset
 of the source's even though the target's span contains the source's, and
 [`Rewire`](@ref) — which matches dofs — has nothing to copy into. It raises in
@@ -1304,7 +1304,7 @@ diagnostics(model::Model) = model.diagnostics
 # `diagnostics(model, solution)`: enough information to know which
 # basis, order, mode, cell count, and domain a level had at solve time.
 # Per-level metadata for the diagnostics report. `nested` is the geometric half
-# of the condition order reduction wants — every higher level's node coordinates
+# of the condition covered-mode pruning wants — every higher level's node coordinates
 # agree with this level's where they overlap. It is reported per level rather
 # than per space so a violation can be localised, and it is worth reporting at
 # all because it is otherwise invisible: `move!` can void it on a stack that was

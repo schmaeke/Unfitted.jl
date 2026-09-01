@@ -98,7 +98,7 @@ _, _, _, report_base = solve_and_report(V_base, "Part 1a — B-spline base level
 # same function twice, and a matrix with two identical columns is exactly
 # singular — no amount of quadrature care will save it.
 #
-# `reduce_order`, on by default for both `space` and `overlay`, removes
+# `prune_covered`, on by default for both `space` and `overlay`, removes
 # the duplicate. Tutorial 2 showed the integrated Legendre version of the
 # same keyword, where the modes eliminated are only *nearly* redundant, so
 # switching the rule off can in principle buy accuracy (in that tutorial's
@@ -116,7 +116,7 @@ model_nested, solution_nested, u_nested, report_nested = solve_and_report(V_nest
 
 # ── Part 1c: what the deduplication is worth ─────────────────────────────────
 #
-# Turn it off and look at the condition number. `reduce_order` belongs to
+# Turn it off and look at the condition number. `prune_covered` belongs to
 # the level that *sheds* the mode — here the base — so it is `space`, not
 # `overlay`, that has to be told.
 #
@@ -124,11 +124,11 @@ model_nested, solution_nested, u_nested, report_nested = solve_and_report(V_nest
 # estimate; the model prints it for systems small enough to densify
 # (a few hundred unknowns), and `NaN` above that.
 
-V_undeduped = overlay(space(omega; cells=8, order=3, basis=bspline(), reduce_order=false),
+V_undeduped = overlay(space(omega; cells=8, order=3, basis=bspline(), prune_covered=false),
                       box((0.25, 0.25), (0.75, 0.75)); cells=4)
 _, _, _, report_undeduped = solve_and_report(V_undeduped,
                                              "Part 1c — the same stack, deduplication switched off";
-                                             parameters=(:reduce_order => false,))
+                                             parameters=(:prune_covered => false,))
 
 println("Nested B-spline stack, deduplicated : unknowns ", report_nested.active_unknowns, ", cond ",
         report_nested.condition_estimate)

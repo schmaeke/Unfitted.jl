@@ -2,7 +2,7 @@
 #
 # `overlay` places a level anywhere inside the space's bounding box. That freedom
 # is the method; it also has a price the package charges silently. The
-# order-reduction rule in `dofs.jl` sheds a level's buried high-order modes
+# pruning rule in `dofs.jl` sheds a level's buried high-order modes
 # (`:coverage`) and the buried linear modes a nested level reproduces (`:dedup`).
 # Where the levels are nested — `_nested_over` in `coverage.jl` — reduction
 # removes exactly the redundancy. Where they are not, the same default deletes
@@ -57,12 +57,12 @@ end
 """
     ladder(domain::AxisBox; cells, depth, splits=2, order=1, basis=IntegratedLegendre(),
                             mode=:tensor, physical=nothing, active=nothing,
-                            reduce_order=true, tolerance=GeometryTolerance(T)) -> Space
+                            prune_covered=true, tolerance=GeometryTolerance(T)) -> Space
 
 Declare a nested refinement ladder over `domain`: a base level plus `depth`
 overlays, each spanning the whole domain at a per-axis multiple of the previous
 level's resolution. Every level nests over every level below it, so the default
-`reduce_order = true` removes exactly the redundancy rather than deleting modes
+`prune_covered = true` removes exactly the redundancy rather than deleting modes
 nothing replaces.
 
 Every overlay is created with **no active cell**, so the declared stack carries
@@ -84,7 +84,7 @@ Keyword arguments:
     axes on the first overlay and only axis 1 on the second. A factor of `1`
     inherits the previous level's partition on that axis — it never means "one
     cell", which would destroy nesting.
-  - `reduce_order` — forwarded to every level. Leave it `true`: on a nested stack
+  - `prune_covered` — forwarded to every level. Leave it `true`: on a nested stack
     the shed modes are exactly linearly dependent, so `false` gives a singular
     operator rather than a more accurate one. It is exposed because measuring the
     redundancy requires building the unreduced twin.
@@ -140,7 +140,7 @@ V = adapt(V, 4 => m)          # the finest level alone, live on a small patch
 """
 function ladder(domain::AxisBox{D,T}; cells, depth::Integer, splits=2, order=1,
                 basis=IntegratedLegendre(), mode::Symbol=:tensor, physical=nothing, active=nothing,
-                reduce_order::Bool=true,
+                prune_covered::Bool=true,
                 tolerance::GeometryTolerance{T}=GeometryTolerance(T)) where {D,T}
     depth >= 0 || throw(ArgumentError("ladder depth must be non-negative; got $depth"))
     base_cells = _axis_int_tuple(cells, Val(D), :cells)
@@ -148,10 +148,10 @@ function ladder(domain::AxisBox{D,T}; cells, depth::Integer, splits=2, order=1,
     counts = _ladder_counts(base_cells, factors, domain, tolerance)
 
     V = space(domain; cells=base_cells, order=order, basis=basis, mode=mode, physical=physical,
-              active=active, reduce_order=reduce_order)
+              active=active, prune_covered=prune_covered)
     for k in 1:depth
         V = overlay(V, domain; cells=counts[k], order=order, basis=basis, mode=mode,
-                    active=CartesianIndex{D}[], tolerance=tolerance, reduce_order=reduce_order)
+                    active=CartesianIndex{D}[], tolerance=tolerance, prune_covered=prune_covered)
     end
     return V
 end
@@ -170,7 +170,7 @@ function _ladder_counts(base::NTuple{D,Int}, factors::Vector{NTuple{D,Int}}, dom
     for (k, f) in pairs(factors)
         all(isone, f) &&
             throw(ArgumentError("ladder level $k has `splits` of $f, which repeats the grid below it. A level with " *
-                                "the same partition as its parent adds no resolution: order reduction deduplicates " *
+                                "the same partition as its parent adds no resolution: covered-mode pruning deduplicates " *
                                 "it away again, and it costs a plan, a dof layout and an assembly pass. Use a " *
                                 "factor above 1 on at least one axis, or reduce `depth`."))
         current = ntuple(d -> current[d] * f[d], D)
@@ -197,13 +197,13 @@ coordinates that fall inside a higher level's domain coincide with that level's
 node coordinates, per axis.
 
 This is the **geometric** half of the condition the `:dedup` elimination tests,
-and nothing more. It is not a witness that order reduction is lossless on `V`:
+and nothing more. It is not a witness that covered-mode pruning is lossless on `V`:
 
   - it does not look at polynomial order, and a nested cover of *lower* order
     cannot reproduce what it displaces;
   - it does not look at which levels cover which cells, and a mode buried under
     two *different* levels is reproduced by neither;
-  - it does not consult `reduce_order`, so it reports `false` — with all the
+  - it does not consult `prune_covered`, so it reports `false` — with all the
     alarm this docstring might suggest — on a stack that eliminates nothing.
 
 It is still the cheapest check that a hand-built [`overlay`](@ref) stack has the

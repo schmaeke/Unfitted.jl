@@ -354,13 +354,13 @@ _role_id(role::Symbol) = role === :base ? 0 : 1
 
 # Build the solid-cell VTK dataset for one level: one `VTK_QUAD` / `VTK_HEXAHEDRON`
 # per mesh cell — *all* cells, active or not — with per-cell scalar fields that make
-# the order-reduction behaviour visible in ParaView:
+# the pruning behaviour visible in ParaView:
 #
 #   * `level_id`, `role_id`, `order_max`, `cell_id` — structural tags;
 #   * `active`      — 1 iff the cell survives the `LevelMask` (user mask + fold);
 #   * `covered`     — 1 iff a finer level fully covers the cell (see `Coverage`);
 #   * `active_dofs` — basis modes on the cell with at least one active component;
-#   * `reduced_dofs`— modes eliminated by order reduction (`:coverage` / `:dedup`).
+#   * `reduced_dofs`— modes eliminated by covered-mode pruning (`:coverage` / `:dedup`).
 #
 # Rendered "Surface With Edges" this doubles as the old wireframe while carrying the
 # per-cell data a line mesh could not.
@@ -424,7 +424,7 @@ self-contained, independently-toggled unit — `<field> → { data_<i>, level_�
   - `level_<id>_<role>` — optionally, one solid-cell `.vtu` per level of the
     field's subdomain: every mesh cell with per-cell `active`, `covered`,
     `active_dofs`, `reduced_dofs` (plus `level_id` / `role_id` / `order_max` /
-    `cell_id`), so ParaView can colour the mesh by coverage and order reduction.
+    `cell_id`), so ParaView can colour the mesh by coverage and covered-mode pruning.
 
 A single-field model is the one-block case of this shape. Fields sharing one
 space emit that space's meshes once, under the first such field. The tree is

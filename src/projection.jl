@@ -394,9 +394,9 @@ Reconstructs the source field pointwise when the target's active basis
 reconstruction is exact, and the smoothing of the L² backend is avoided.
 
 Containment is a stronger condition than "the target space is larger",
-and on a stack with `reduce_order = true` a refinement does not satisfy
+and on a stack with `prune_covered = true` a refinement does not satisfy
 it: activating a finer level buries the parent's high-order modes, so
-order reduction eliminates them in the target and the target's basis
+covered-mode pruning eliminates them in the target and the target's basis
 trades parent modes for child modes rather than extending. The target's
 *span* still contains the source's — that is what makes the elimination
 lossless — but this backend matches dofs, not spans, and there is no

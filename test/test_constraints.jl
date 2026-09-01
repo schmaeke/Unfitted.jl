@@ -525,12 +525,12 @@ end
     @test has_linear_constraints
 end
 
-@testset "elimination provenance credits the overlay, not order reduction" begin
+@testset "elimination provenance credits the overlay, not covered-mode pruning" begin
     # A raw on an overlay's artificial boundary Γ_o that is *also* buried under a
     # finer level collects two constraints: the overlay trace condition and the
-    # order-reduction one. The overlay constraint is queued first and is what
+    # pruning one. The overlay constraint is queued first and is what
     # actually eliminates the raw, so `elimination_source` must read `:overlay`;
-    # crediting order reduction would make `reduced_mode_counts` (and the
+    # crediting covered-mode pruning would make `reduced_mode_counts` (and the
     # `reduced_dofs` cell array `write_vtk` exports) over-report the saving.
     #
     # The stack: a base level, an overlay at order 2, and a nested finer level
@@ -561,7 +561,7 @@ end
     end
     @test mislabelled == 0
 
-    # Every candidate that is *not* on Γ_o keeps its order-reduction provenance,
+    # Every candidate that is *not* on Γ_o keeps its pruning provenance,
     # so the fix removes only the mislabelled ones.
     reduced = count(r -> layout.elimination_source[r] === :coverage ||
                          layout.elimination_source[r] === :dedup,

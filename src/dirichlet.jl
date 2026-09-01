@@ -514,7 +514,7 @@ end
 #
 # where `φ_i` are the boundary traces of the physically-constrained raw
 # dofs that survived every artificial elimination — the overlay-boundary
-# condition and, on a `reduce_order` level, order reduction and the
+# condition and, on a `prune_covered` level, covered-mode pruning and the
 # linear dedup (`elimination_source === :free`). An eliminated dof has
 # no value to project: its coefficient is not a solved unknown of the
 # system. The mass matrix is symmetric positive (semi-)definite, so we
@@ -598,7 +598,7 @@ Fields:
     projection solves for: the dofs of that component carrying a
     physical Dirichlet condition and no artificial elimination
     (`elimination_source === :free`, which excludes the overlay boundary
-    as well as order reduction and the linear dedup).
+    as well as covered-mode pruning and the linear dedup).
   - `factors::Vector{DirichletFactor{T}}` — per component, the solved
     boundary mass (see `DirichletFactor`).
   - `samples::Vector{FacetTraceSamples{D,T}}` — one entry per

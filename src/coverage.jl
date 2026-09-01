@@ -1,6 +1,6 @@
 # Per-level coverage of the superposition stack.
 #
-# The order-reduction rule sheds a level's high-order modes wherever a finer level
+# The pruning rule sheds a level's high-order modes wherever a finer level
 # fully covers it, keeping only its linear skeleton:
 #
 #   a level-j cell is *covered* iff its box lies inside the covering region of a
@@ -11,7 +11,7 @@
 # two abutting overlays counts as uncovered. See `build_coverage`.
 #
 # Coverage is mask-aware, so a deactivated overlay does not cover — which is what keeps
-# "a fully-deactivated overlay behaves like no overlay" true under order reduction. The
+# "a fully-deactivated overlay behaves like no overlay" true under covered-mode pruning. The
 # one deactivation that still covers is the fictitious fold, because a cell outside Ω
 # carries no material at all; see the comment on `_covered_by_level`.
 
@@ -21,7 +21,7 @@
 Per-level covered-cell masks for a [`Space`](@ref). `covered[level_id]` is a
 `BitArray{D}` over the level's cells, `true` where the cell is fully covered by the
 active region of the higher-id levels. Built by [`build_coverage`](@ref) and consumed
-by the order-reduction constraint source `_coverage_constraints` in `dofs.jl`.
+by the pruning constraint source `_coverage_constraints` in `dofs.jl`.
 
 The flag is only computed where that consumer can read it — on a masked level, the
 active cells and their one-cell ∞-norm halo (see `_coverage_cells`). Outside that set
@@ -119,7 +119,7 @@ allocates a fresh one for standalone calls, and it stays empty and unused when
 `V.physical === nothing`.
 
 Only the cells `_coverage_cells` selects are evaluated; the rest keep the `false`
-default, which the order-reduction rule never reads. On a masked level that is what
+default, which the pruning rule never reads. On a masked level that is what
 keeps the pass proportional to the *active* region rather than to the level's grid.
 """
 function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T},

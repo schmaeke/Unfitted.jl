@@ -1041,7 +1041,7 @@ function main()
 
     # ── 30 ── D = 2, integrated Legendre base under a masked B-spline overlay. The
     #          one family pairing no other case reaches: case 09 is spline over spline,
-    #          where the base takes the no-op fallback and order reduction never runs.
+    #          where the base takes the no-op fallback and covered-mode pruning never runs.
     #          Appended after the EXPECTED-TO-CHANGE block rather than filed with the
     #          other MUST-NOT-CHANGE cases so the 29 cases above keep their numbering.
     case(30, "d2-legendre-bspline-masked", "MUST-NOT-CHANGE",
