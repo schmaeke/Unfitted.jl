@@ -120,11 +120,19 @@ end
 # `level_lookup(id)` resolves a parent's level id to its `Level`. Taking
 # the per-axis maximum guarantees that the rule is exact for every parent
 # level's basis simultaneously.
+#
+# The order is read per parent *cell*, not per level. Under one order per level
+# the two are the same value and the rule is unchanged; under a per-cell order
+# they differ, and reading the cell is both cheaper and still exact — the
+# minimum rule only ever *removes* modes from a cell, so no function on that
+# parent exceeds its own cell's per-axis order. Sizing from the level's nominal
+# maximum instead would make one high-p cell raise the rule on every region the
+# level touches.
 function _parent_quadrature_counts(::Val{D}, parents, level_lookup) where {D}
     return ntuple(D) do d
         maximum(parents) do parent
             level = level_lookup(parent.level)
-            recommended_quadrature_order(level.basis, level.order)[d]
+            recommended_quadrature_order(level.basis, cell_order(level, parent.cell))[d]
         end
     end
 end
@@ -163,7 +171,7 @@ end
 function _moment_order_for_region(V::Space{D}, parents) where {D}
     factor = V.physical.moment_order_factor
     return ntuple(D) do d
-        factor * maximum(p -> _level_by_id(V, p.level).order[d], parents)
+        factor * maximum(p -> cell_order(_level_by_id(V, p.level), p.cell)[d], parents)
     end
 end
 

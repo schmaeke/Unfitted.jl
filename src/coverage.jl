@@ -35,6 +35,27 @@ struct Coverage{D}
     covered::Dict{Int,BitArray{D}}
 end
 
+# The cells of `mesh` that `box` overlaps, as an axis-aligned block. Located by
+# binary search on the sorted per-axis coordinates, so the cost is
+# O(D·log N + overlapping cells) rather than O(N). The ± tol.contain nudges keep
+# a box whose face merely touches a cell boundary from claiming the neighbouring
+# cell.
+#
+# Used by `_covered_by_level` below, which asks whether every overlapped cell of
+# a masked covering level is active or fictitious — the "for every cell of the
+# finer level under this coarser cell" question the block resolution answers.
+function _overlapping_cells(mesh::CartesianMesh{D,T}, box::AxisBox{D,T},
+                            tol::GeometryTolerance{T}) where {D,T}
+    ranges = ntuple(D) do d
+        ax = mesh.axes[d]
+        last = length(ax) - 1                                   # number of cells on axis d
+        lo = clamp(searchsortedlast(ax, box.lower[d] + tol.contain), 1, last)
+        hi = clamp(searchsortedlast(ax, box.upper[d] - tol.contain), 1, last)
+        lo:hi
+    end
+    return CartesianIndices(ranges)
+end
+
 # True iff `box` (a coarser-level cell) lies inside the covering region of the single
 # level `k`: inside k's domain, and — when k is masked — with every k-cell it overlaps
 # either active or fully outside Ω. The unmasked fast path is a single box-containment
@@ -59,23 +80,13 @@ end
 # `physical === nothing` there is no fictitious material and the original
 # active-cells-only rule is recovered without ever touching `cache`.
 #
-# For the masked case we do NOT scan all of k's cells: the k-cells `box` overlaps form
-# an axis-aligned block, located by binary search on k's sorted per-axis coordinates
-# (`searchsortedlast`). Cost is O(D·log Nₖ + overlapping cells) rather than O(Nₖ). The
-# ± tol.contain nudges keep a box whose face merely touches a cell boundary from
-# claiming the neighbouring cell.
+# For the masked case we do NOT scan all of k's cells: `_overlapping_cells` resolves the
+# axis-aligned block by binary search.
 function _covered_by_level(box::AxisBox{D,T}, k::Level{D,T}, tol::GeometryTolerance{T}, physical,
                            cache::_ClassifyCache{D,T}) where {D,T}
     is_inside(box, k.mesh.domain, tol) || return false
     k.mask === nothing && return true
-    ranges = ntuple(D) do d
-        ax = k.mesh.axes[d]
-        last = length(ax) - 1                                   # number of cells on axis d
-        lo = clamp(searchsortedlast(ax, box.lower[d] + tol.contain), 1, last)
-        hi = clamp(searchsortedlast(ax, box.upper[d] - tol.contain), 1, last)
-        lo:hi
-    end
-    cells = CartesianIndices(ranges)
+    cells = _overlapping_cells(k.mesh, box, tol)
 
     # Pass 1 — one centre sample per inactive cell. `:fictitious` means *no* point of the
     # cell lies in Ω, so a centre inside Ω rules that verdict out, and this is the

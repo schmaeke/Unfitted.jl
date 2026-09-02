@@ -1131,6 +1131,54 @@ function adapted(model::Model{D,T}, spec...; kwargs...) where {D,T}
 end
 
 """
+    elevated(model::Model, level => order, ...) -> Model
+
+The [`elevate`](@ref) counterpart of [`adapted`](@ref): a new [`Model`](@ref)
+whose named levels carry the given polynomial orders, prepared with the same
+problem, tolerance and plan options as `model`. `order` takes every shape
+`elevate` accepts.
+
+The spec is applied to the model's *pre-fold* space for the same reason
+[`adapted`](@ref)'s is, and the moment-fit caches are reused: a p-adaptive step
+changes which basis functions exist and no geometry, so every fitted cut-cell
+rule is still valid.
+
+Single-domain only, as [`adapted`](@ref) is. Compose an h- and a p-step in one
+rebuild by handing `adapt`'s result to `elevate` at the `Space` level:
+
+```julia
+target = _prepared_model_from(elevate(adapt(model.prefold_space, 4 => m), 4 => p))
+```
+
+or, more usually, one after the other through this call and `adapted`, paying one
+rebuild each.
+"""
+function elevated(model::Model{D,T}, spec...) where {D,T}
+    _assert_single_domain(model, "elevated")
+    space = elevate(model.prefold_space, spec...)
+    return _prepared_model(_problem_with_space(model.problem, space), model.plan_options,
+                           model.moment_fit_caches)
+end
+
+"""
+    cell_orders(model; level) -> Array{NTuple{D,Int},D}
+
+Per-axis polynomial order of every cell of `level`, as a fresh array. `level` is
+a position in the model's space, as for [`activate!`](@ref). A level whose order
+is uniform returns that order repeated over the cell grid.
+
+Reads the model's *pre-fold* space, so the array can be edited and handed back to
+[`elevated`](@ref) without laundering anything into it — unlike a mask, an order
+field is never touched by the fictitious fold, so the two spaces agree and the
+distinction `active_cells`'s `effective` keyword draws does not arise here.
+
+Unlike the mutators this reads the problem's representative space rather than
+raising on a coupled model, so on a multi-domain model it reports the first
+subdomain.
+"""
+cell_orders(model::Model; level::Integer) = cell_orders(model.prefold_space; level=level)
+
+"""
     active_cells(model; level, effective=true) -> BitArray{D}
 
 Return a `BitArray{D}` indicating which cells of `level` are active.
@@ -1312,9 +1360,15 @@ diagnostics(model::Model) = model.diagnostics
 # residual nor a rank deficiency. See [`is_nested`](@ref).
 function _level_report(level, V::Space, tol::GeometryTolerance)
     nested = all(k -> k.id <= level.id || _nested_over(level, k, tol), V.levels)
+    # `order` stays the level's nominal (maximum) per-axis order, so an existing
+    # reader keeps reading the same field with the same meaning. `order_palette`
+    # carries the distinct per-cell orders — a one-element vector on a uniform
+    # level — so a graded run is reproducible from the report without the entry's
+    # type varying from level to level.
+    order_palette = level.orders === nothing ? [level.order] : copy(level.orders.palette)
     return (; id=level.id, role=level.role, cells=level.mesh.cells, order=level.order,
-            mode=level.mode, basis=basis_name(level.basis), domain=level.mesh.domain,
-            nested=nested,)
+            order_palette=order_palette, mode=level.mode, basis=basis_name(level.basis),
+            domain=level.mesh.domain, nested=nested,)
 end
 
 function diagnostics(model::Model{D,T}, solution; exact=nothing) where {D,T}

@@ -282,7 +282,7 @@ function _facet_quadrature_counts(V::Space{D,T}, parents::Vector{FacetParent{D,T
                                   free_axes::Vector{Int}) where {D,T}
     return [maximum(parents) do parent
                 level = _level_by_id(V, parent.level)
-                recommended_quadrature_order(level.basis, level.order)[d]
+                recommended_quadrature_order(level.basis, cell_order(level, parent.cell))[d]
             end for d in free_axes]
 end
 
@@ -434,7 +434,7 @@ end
 # ── Boundary trace evaluation ─────────────────────────────────────────────────
 
 """
-    boundary_trace_indices(level, raw_dofs, sides) -> NamedTuple
+    boundary_trace_indices(level, cell, raw_dofs, sides) -> NamedTuple
 
 The datum-independent, *point*-independent half of a boundary trace: which of
 `level`'s local basis functions have support on the codim-K facet identified by
@@ -457,12 +457,17 @@ covers a whole region — the trace's per-point cost is then the tensor product
 alone. The per-axis scratch the tensor product needs is allocated here too, for
 the same reason.
 
-This half is basis-family-agnostic: it asks only for `local_basis_indices` and
-`is_facet_basis`, which every family supplies.
+This half is basis-family-agnostic: it asks only for [`cell_basis_indices`](@ref)
+and `is_facet_basis`, which every family supplies. The per-axis scratch is sized
+from the level's nominal order, which is an upper bound on every cell's.
 """
-function boundary_trace_indices(level::Level{D,T}, raw_dofs::Vector{Int},
+function boundary_trace_indices(level::Level{D,T}, cell::CartesianIndex{D}, raw_dofs::Vector{Int},
                                 sides::Vector{Tuple{Int,Symbol}}) where {D,T}
-    local_ids = local_basis_indices(level.basis, level.order, level.mode)
+    # The parent `cell` selects the level's minimum-rule index list for that cell,
+    # which is what `raw_dofs` was built from. Taking the level-wide list instead
+    # would pair the trace modes with the wrong raws on a per-cell-order level —
+    # silently, because the pairing is positional and unchecked.
+    local_ids = cell_basis_indices(level, cell)
     raws = Int[]
     ids = CartesianIndex{D}[]
 
@@ -735,7 +740,7 @@ function _sample_dirichlet_facet!(mass::Vector{Matrix{T}}, index::Vector{Dict{In
         traces = map(levels, region.parents) do level, parent
             all_raw_dofs = cell_dofs(layout, parent.level, parent.cell)
             (; cell=parent.cell, box=parent.parent_box,
-             boundary_trace_indices(level, all_raw_dofs, sides)...)
+             boundary_trace_indices(level, parent.cell, all_raw_dofs, sides)...)
         end
 
         for (qp, x) in pairs(region.points)

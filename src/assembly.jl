@@ -45,8 +45,11 @@
 function _parent_basis_data(V::Space{D,T}, layout::DofLayout{D,T}, parent::ParentRef{D,T};
                             gradients::Bool=true) where {D,T}
     level = _level_by_id(V, parent.level)
+    # The 1D factor buffers are sized at the level's nominal order; the local id
+    # list is the parent cell's own minimum-rule set, which is shorter wherever a
+    # per-cell order puts that cell below the nominal maximum.
     order = level.order
-    local_ids = local_basis_indices(level.basis, order, level.mode)
+    local_ids = cell_basis_indices(level, parent.cell)
     values = Vector{T}(undef, length(local_ids))
     gradient_values = gradients ? Vector{SVector{D,T}}(undef, length(values)) : SVector{D,T}[]
     raw_dofs = cell_dofs(layout, parent.level, parent.cell)
@@ -703,12 +706,23 @@ Thread-local assembly scratch. Carries every buffer the hot loop needs:
     space that genuinely mixes families widens `B` to a common supertype
     and pays that cost, which is why the field is parameterized rather
     than pinned to one family.
-  - `local_ids[i]` — tensor-product multi-indices of level `i`'s basis.
-  - `orders[i]`    — polynomial order tuple of level `i`'s basis.
+  - `local_ids[i]` — tensor-product multi-indices of level `i`'s basis, at
+    its nominal order.
+  - `cell_locals[i]` — `nothing` on a level whose order is uniform (every
+    cell shares `local_ids[i]`), else that level's per-cell minimum-rule
+    index table, read by parent cell. This is the *same object*
+    `_build_cell_dofs!` walked to produce `cell_dofs`, taken straight off
+    the level rather than re-derived, because the positional pairing
+    between a cell's raw dofs and its basis values is the only link
+    between the dof layer and the basis layer and nothing checks it.
+  - `orders[i]`    — nominal polynomial order tuple of level `i`'s basis.
   - `values[i]`, `gradients[i]` — per-level basis value / gradient
     buffers. Indexed by the level id; reused across every region a
     thread processes. A region carries at most one parent per level, so
-    the level-indexed buffers never collide within a region.
+    the level-indexed buffers never collide within a region. Sized at the
+    level's nominal (maximum) order, so a cell at a lower per-cell order
+    fills a prefix — see `_tensor_values_grads!` in `basis.jl` for why
+    that is transparent and why the banks are *not* keyed by order value.
   - `val1d[i]`, `der1d[i]` — per-axis 1D factor buffers for the basis
     evaluator.
   - `active_dofs`, `local_by_global` — per-region local-to-global dof
@@ -722,6 +736,7 @@ per assembly call in the serial path).
 struct AssemblyWorkspace{D,T,B<:BasisFamily}
     bases::Vector{B}
     local_ids::Vector{Vector{CartesianIndex{D}}}
+    cell_locals::Vector{Union{Nothing,Array{Vector{CartesianIndex{D}},D}}}
     orders::Vector{NTuple{D,Int}}
     values::Vector{Vector{T}}
     gradients::Vector{Vector{SVector{D,T}}}
@@ -731,6 +746,17 @@ struct AssemblyWorkspace{D,T,B<:BasisFamily}
     local_by_global::Dict{Int,Int}
     local_matrix::Vector{T}
     local_rhs::Vector{T}
+end
+
+# The multi-index list one parent cell generates: the level-wide list on a level
+# whose order is uniform, and that level's per-cell minimum-rule entry otherwise.
+# One `=== nothing` branch on the common path, and a plain array read on the
+# per-cell path — measured at or below the noise of the basis refresh, which is
+# itself 1.6–4.1% of `_assemble_region!`.
+@inline function _parent_local_ids(local_ids, cell_locals, lvl::Int,
+                                   cell::CartesianIndex{D}) where {D}
+    table = cell_locals[lvl]
+    return table === nothing ? local_ids[lvl] : table[cell]
 end
 
 # Allocate the shared per-level value banks of a workspace: index by
@@ -744,6 +770,7 @@ function _level_value_buffers(levels, ::Val{D}, ::Type{T}) where {D,T}
     n = length(levels)
     bases = Vector{BasisFamily}(undef, n)
     local_ids = Vector{Vector{CartesianIndex{D}}}(undef, n)
+    cell_locals = Vector{Union{Nothing,Array{Vector{CartesianIndex{D}},D}}}(nothing, n)
     orders = Vector{NTuple{D,Int}}(undef, n)
     values = Vector{Vector{T}}(undef, n)
     val1d = Vector{NTuple{D,Vector{T}}}(undef, n)
@@ -752,6 +779,7 @@ function _level_value_buffers(levels, ::Val{D}, ::Type{T}) where {D,T}
         ids = local_basis_indices(level.basis, level.order, level.mode)
         bases[i] = level.basis
         local_ids[i] = ids
+        cell_locals[i] = _cell_locals(level)
         orders[i] = level.order
         values[i] = Vector{T}(undef, length(ids))
         val1d[i] = _factor_buffers(level.order, T)
@@ -760,7 +788,7 @@ function _level_value_buffers(levels, ::Val{D}, ::Type{T}) where {D,T}
     # the families actually share, so every hot-loop `bases[i]` read dispatches
     # statically instead of boxing its arguments through a dynamic call. A space
     # that genuinely mixes families widens back to a common supertype.
-    return map(identity, bases), local_ids, orders, values, val1d
+    return map(identity, bases), local_ids, cell_locals, orders, values, val1d
 end
 
 # Build a fresh workspace for `model`, once per thread in the threaded path and
@@ -787,18 +815,20 @@ function _build_workspace(spaces, ::Val{D}, ::Type{T}) where {D,T}
     end
     bases = Vector{BasisFamily}(undef, n)
     local_ids = Vector{Vector{CartesianIndex{D}}}(undef, n)
+    cell_locals = Vector{Union{Nothing,Array{Vector{CartesianIndex{D}},D}}}(nothing, n)
     orders = Vector{NTuple{D,Int}}(undef, n)
     values = Vector{Vector{T}}(undef, n)
     val1d = Vector{NTuple{D,Vector{T}}}(undef, n)
     gradients = Vector{Vector{SVector{D,T}}}(undef, n)
     der1d = Vector{NTuple{D,Vector{T}}}(undef, n)
     for V in spaces
-        _fill_assembly_banks!(bases, local_ids, orders, values, gradients, val1d, der1d, V.levels,
-                              Val(D), T)
+        _fill_assembly_banks!(bases, local_ids, cell_locals, orders, values, gradients, val1d,
+                              der1d, V.levels, Val(D), T)
     end
     narrow = map(identity, bases)  # same narrowing as `_level_value_buffers`
-    return AssemblyWorkspace{D,T,eltype(narrow)}(narrow, local_ids, orders, values, gradients,
-                                                 val1d, der1d, Int[], Dict{Int,Int}(), T[], T[])
+    return AssemblyWorkspace{D,T,eltype(narrow)}(narrow, local_ids, cell_locals, orders, values,
+                                                 gradients, val1d, der1d, Int[], Dict{Int,Int}(),
+                                                 T[], T[])
 end
 
 # Function barrier: fill the id-indexed assembly banks from one space's
@@ -808,13 +838,14 @@ end
 # though `_build_workspace`'s outer loop reads `V` from an abstractly-typed
 # vector. Writes by global level id, which `prepare` made contiguous and
 # disjoint across subdomains, so per-space fills never collide.
-function _fill_assembly_banks!(bases, local_ids, orders, values, gradients, val1d, der1d,
-                               levels::Tuple, ::Val{D}, ::Type{T}) where {D,T}
+function _fill_assembly_banks!(bases, local_ids, cell_locals, orders, values, gradients, val1d,
+                               der1d, levels::Tuple, ::Val{D}, ::Type{T}) where {D,T}
     for level in levels
         i = level.id
         ids = local_basis_indices(level.basis, level.order, level.mode)
         bases[i] = level.basis
         local_ids[i] = ids
+        cell_locals[i] = _cell_locals(level)
         orders[i] = level.order
         values[i] = Vector{T}(undef, length(ids))
         gradients[i] = Vector{SVector{D,T}}(undef, length(ids))
@@ -834,6 +865,19 @@ function _parent_dof_data(ws::AssemblyWorkspace{D,T}, layout::FieldLayout{D,T},
                           parent::Union{ParentRef{D,T},FacetParent{D,T}}) where {D,T}
     lvl = parent.level
     raw_dofs = cell_dofs(layout.dofs, lvl, parent.cell)
+    # `raw_dofs[i]` ↔ `values[i]` is the only link between the dof layer and the
+    # basis layer, and every consumer walks it positionally without checking it
+    # (`_field_value`, `_field_gradient`, `_emit_block!`). Under a per-cell order
+    # the two lists come from different objects — the layout's `cell_dofs` and
+    # the level's minimum-rule table — so a mismatch is possible in a way it was
+    # not before, and its symptom is a plausible wrong answer rather than an
+    # exception. One integer compare per (region, parent, field) buys the
+    # exception; it is not in the quadrature-point loop.
+    length(raw_dofs) <= length(ws.values[lvl]) ||
+        throw(DimensionMismatch("cell $(parent.cell) of level $lvl has $(length(raw_dofs)) raw " *
+                                "dofs but the workspace bank holds $(length(ws.values[lvl])) " *
+                                "basis values; the per-cell index table and the dof layout have " *
+                                "drifted apart"))
     return (; level=lvl, raw_dofs, values=ws.values[lvl], gradients=ws.gradients[lvl])
 end
 
@@ -885,8 +929,9 @@ function _update_region_basis!(ws::AssemblyWorkspace{D,T}, region::VolumeRegion{
         lvl = parent.level
         xi = reference_to_physical(parent.local_box, eta)
         scale = SVector{D,T}(2 .* inv.(edge_lengths(parent.parent_box)))
-        _tensor_values_grads!(ws.bases[lvl], ws.values[lvl], ws.gradients[lvl], ws.local_ids[lvl],
-                              ws.orders[lvl], xi, scale, ws.val1d[lvl], ws.der1d[lvl], parent.cell)
+        ids = _parent_local_ids(ws.local_ids, ws.cell_locals, lvl, parent.cell)
+        _tensor_values_grads!(ws.bases[lvl], ws.values[lvl], ws.gradients[lvl], ids, ws.orders[lvl],
+                              xi, scale, ws.val1d[lvl], ws.der1d[lvl], parent.cell)
     end
     return nothing
 end
@@ -1072,8 +1117,9 @@ function _update_physical_basis!(ws::AssemblyWorkspace{D,T}, parents, x::SVector
         lvl = parent.level
         xi = physical_to_reference(parent.parent_box, x)
         scale = SVector{D,T}(2 .* inv.(edge_lengths(parent.parent_box)))
-        _tensor_values_grads!(ws.bases[lvl], ws.values[lvl], ws.gradients[lvl], ws.local_ids[lvl],
-                              ws.orders[lvl], xi, scale, ws.val1d[lvl], ws.der1d[lvl], parent.cell)
+        ids = _parent_local_ids(ws.local_ids, ws.cell_locals, lvl, parent.cell)
+        _tensor_values_grads!(ws.bases[lvl], ws.values[lvl], ws.gradients[lvl], ids, ws.orders[lvl],
+                              xi, scale, ws.val1d[lvl], ws.der1d[lvl], parent.cell)
     end
     return nothing
 end

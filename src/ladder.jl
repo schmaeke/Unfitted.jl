@@ -244,6 +244,102 @@ function active_cells(V::Space{D}; level::Integer) where {D}
 end
 
 """
+    cell_orders(V::Space; level) -> Array{NTuple{D,Int},D}
+
+Per-axis polynomial order of every cell of `level`, as a fresh array. A level
+whose order is uniform returns that order repeated over the cell grid, so the
+result has the same shape and meaning whether or not the level carries a per-cell
+field.
+
+The read half of a p-adaptive step, and the `Space` counterpart of
+`cell_orders(::Model; level)`: fetch a level's orders, edit them per cell, hand
+them back to [`elevate`](@ref). Round-tripping through `elevate` is an identity.
+
+```julia
+p = cell_orders(V; level=1)
+p[marked] .+= 1
+V = elevate(V, 1 => p)
+```
+"""
+function cell_orders(V::Space{D}; level::Integer) where {D}
+    lvl = V.levels[_check_level(V, level)]
+    lvl.orders === nothing && return fill(lvl.order, lvl.mesh.cells)
+    return [lvl.orders.palette[c] for c in lvl.orders.class]
+end
+
+"""
+    elevate(V::Space, level => order, ...) -> Space
+
+Return `V` with the named levels' polynomial orders replaced. Meshes, level
+boxes, activation masks and basis families are untouched, so the result has the
+*same type* as `V` and a model rebuilt from it does not recompile the assembly
+pipeline — the per-cell order lives in a `Union{Nothing,CellOrders}` field, not
+in a type parameter.
+
+`order` takes every shape [`space`](@ref)'s `order` keyword takes — an integer,
+an `NTuple{D,Int}`, an array of either shaped like the level's cell grid, or a
+predicate `(cell_box, cell_index) -> order` — plus one shape that only makes
+sense against an existing level:
+
+  * an iterable of `CartesianIndex{D} => order` pairs, raising the listed cells
+    and leaving every other cell at the order it already has. That is the shape a
+    marking loop produces, so a p-adaptive step does not have to materialise the
+    whole field to change twelve cells.
+
+Where two cells of different order share a face, the shared entity carries the
+minimum of the two orders; see [`CellOrders`](@ref) for why that is what keeps
+the space C⁰, and [`space`](@ref) for the per-cell `order ≥ 1` and
+basis-family requirements, which are checked here too.
+
+This is a separate verb from [`adapt`](@ref) rather than another shape of its
+pair form, and the reason is dispatch rather than taste: a mask spec and an order
+spec collide irreducibly on `nothing` ("every cell active" versus "uniform
+order") and on a predicate (`-> Bool` versus `-> Int`), and neither collision can
+be detected before the value is used. Compose them instead —
+`elevate(adapt(V, h), p)` costs two cheap `Space` rebuilds and one
+[`prepare`](@ref), and the dof layout only ever sees the final hp state.
+"""
+function elevate(V::Space{D,T}, pairs::Pair{<:Integer}...) where {D,T}
+    n = length(V.levels)
+    named = falses(n)
+    for (level, _) in pairs
+        k = _check_level(V, level)
+        named[k] && throw(ArgumentError("level $k is named more than once in one `elevate` call"))
+        named[k] = true
+    end
+    out = V
+    for (level, spec) in pairs
+        out = _reordered_space(out, _check_level(V, level), spec)
+    end
+    return out
+end
+
+# The order spec shape that only `elevate` can serve: `cell => order` pairs
+# against the level's current field. Normalised here rather than in
+# `_normalize_order` because it needs a base to fill the unnamed cells from, and
+# `space` / `overlay` have none.
+function _pair_orders(V::Space{D}, k::Int, pairs) where {D}
+    lvl = V.levels[k]
+    out = cell_orders(V; level=k)
+    for entry in pairs
+        entry isa Pair || throw(ArgumentError("an order pair list must contain " *
+                                              "`CartesianIndex{$D} => order` entries; got $(typeof(entry))"))
+        cell, order = entry
+        cell isa CartesianIndex{D} ||
+            throw(ArgumentError("an order pair list must be keyed by CartesianIndex{$D}; " *
+                                "got $(typeof(cell))"))
+        checkbounds(Bool, out, cell) ||
+            throw(ArgumentError("cell index $cell is out of bounds for mesh cells $(lvl.mesh.cells)"))
+        out[cell] = _axis_int_tuple(order, Val(D), :order)
+    end
+    return out
+end
+
+_normalize_elevate_spec(V::Space, k::Int, spec::Pair) = _pair_orders(V, k, (spec,))
+_normalize_elevate_spec(V::Space, k::Int, spec::AbstractVector{<:Pair}) = _pair_orders(V, k, spec)
+_normalize_elevate_spec(::Space, ::Int, spec) = spec
+
+"""
     cell_indices(V::Space; level) -> CartesianIndices
 
 Cell index space of `level`. Together with [`cell_box`](@ref)'s `Space` method

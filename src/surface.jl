@@ -740,6 +740,15 @@ end
 # would pick the maximum across only the covering parents of the
 # specific cell, matching the facet path; not worth the bookkeeping
 # in the MVP.)
+#
+# `level.order` is the level's *nominal* (maximum) order, so on a level carrying
+# a per-cell order this inherits the global maximum p and one high-p cell
+# anywhere raises the immersed-surface and interface rule everywhere. That is
+# conservative — over-integrating is safe — but it is the one quadrature
+# consumer per-cell order makes more expensive rather than less, and the fix is
+# the per-cell variant above: push the choice into `_surface_regions`' per-cell
+# loop, which also changes `coupling.jl`, where `qorder` is computed once from
+# both sides.
 function _surface_quadrature_order(V::Space{D,T}) where {D,T}
     base = ntuple(_ -> 1, D)
     for level in V.levels

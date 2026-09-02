@@ -198,7 +198,7 @@ Fields:
     smallest geometric feature you must classify cleanly.
   - `max_depth::Int`: hard cap on the subdivision depth of both consumers above.
   - `moment_order_factor::Int`: multiplier on the NNMF moment-fit basis order
-    per axis (`factor × max(level.order)` over the region's parents). `2`
+    per axis (`factor × max(cell_order)` over the region's parent cells). `2`
     (default) integrates trial × test products exactly; `1` halves the basis.
   - `target_residual::T`: NNMF L² residual the moment-fit aims for in cut
     regions. Default `1e-6`; the exact kernel reaches far below it, so this

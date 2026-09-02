@@ -150,11 +150,13 @@ workspace carries no local-matrix bank.
 struct TransferWorkspace{D,T,BS<:BasisFamily,BT<:BasisFamily}
     source_bases::Vector{BS}
     source_local_ids::Vector{Vector{CartesianIndex{D}}}
+    source_cell_locals::Vector{Union{Nothing,Array{Vector{CartesianIndex{D}},D}}}
     source_orders::Vector{NTuple{D,Int}}
     source_values::Vector{Vector{T}}
     source_val1d::Vector{NTuple{D,Vector{T}}}
     target_bases::Vector{BT}
     target_local_ids::Vector{Vector{CartesianIndex{D}}}
+    target_cell_locals::Vector{Union{Nothing,Array{Vector{CartesianIndex{D}},D}}}
     target_orders::Vector{NTuple{D,Int}}
     target_values::Vector{Vector{T}}
     target_val1d::Vector{NTuple{D,Vector{T}}}
@@ -169,13 +171,13 @@ end
 # `bases` / `local_ids` / `orders` / `values` / `val1d` banks and skip
 # the assembler's gradient banks.
 function _transfer_workspace(source_model::Model{D,T}, target_model::Model{D,T}) where {D,T}
-    s_bs, s_ids, s_ord, s_val, s_v1 = _level_value_buffers(source_model.problem.space.levels,
-                                                           Val(D), T)
-    t_bs, t_ids, t_ord, t_val, t_v1 = _level_value_buffers(target_model.problem.space.levels,
-                                                           Val(D), T)
-    return TransferWorkspace{D,T,eltype(s_bs),eltype(t_bs)}(s_bs, s_ids, s_ord, s_val, s_v1, t_bs,
-                                                            t_ids, t_ord, t_val, t_v1, Int[],
-                                                            Dict{Int,Int}(), T[])
+    s_bs, s_ids, s_loc, s_ord, s_val, s_v1 = _level_value_buffers(source_model.problem.space.levels,
+                                                                  Val(D), T)
+    t_bs, t_ids, t_loc, t_ord, t_val, t_v1 = _level_value_buffers(target_model.problem.space.levels,
+                                                                  Val(D), T)
+    return TransferWorkspace{D,T,eltype(s_bs),eltype(t_bs)}(s_bs, s_ids, s_loc, s_ord, s_val, s_v1,
+                                                            t_bs, t_ids, t_loc, t_ord, t_val, t_v1,
+                                                            Int[], Dict{Int,Int}(), T[])
 end
 
 # Slim per-parent record aliasing the workspace value buffer (no
@@ -197,15 +199,15 @@ function _update_transfer_basis!(ws::TransferWorkspace{D,T}, region::TransferReg
                                  eta::SVector{D,T}) where {D,T}
     for p in region.target_parents
         xi = reference_to_physical(p.local_box, eta)
-        _tensor_values!(ws.target_bases[p.level], ws.target_values[p.level],
-                        ws.target_local_ids[p.level], ws.target_orders[p.level], xi,
-                        ws.target_val1d[p.level], p.cell)
+        ids = _parent_local_ids(ws.target_local_ids, ws.target_cell_locals, p.level, p.cell)
+        _tensor_values!(ws.target_bases[p.level], ws.target_values[p.level], ids,
+                        ws.target_orders[p.level], xi, ws.target_val1d[p.level], p.cell)
     end
     for p in region.source_parents
         xi = reference_to_physical(p.local_box, eta)
-        _tensor_values!(ws.source_bases[p.level], ws.source_values[p.level],
-                        ws.source_local_ids[p.level], ws.source_orders[p.level], xi,
-                        ws.source_val1d[p.level], p.cell)
+        ids = _parent_local_ids(ws.source_local_ids, ws.source_cell_locals, p.level, p.cell)
+        _tensor_values!(ws.source_bases[p.level], ws.source_values[p.level], ids,
+                        ws.source_orders[p.level], xi, ws.source_val1d[p.level], p.cell)
     end
     return nothing
 end

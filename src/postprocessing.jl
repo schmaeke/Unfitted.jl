@@ -389,7 +389,7 @@ function _mesh_vtk_data(level::Level{D,T}, dofs::DofLayout{D}, coverage::Coverag
         push!(cells, MeshCell(cell_type, SVector{2^D,Int}(ntuple(i -> first_point + i - 1, 2^D))))
         push!(level_ids, level.id)
         push!(role_ids, _role_id(level.role))
-        push!(order_max, maximum(level.order))
+        push!(order_max, maximum(cell_order(level, cell)))
         push!(cell_ids, linear[cell])
         push!(active, is_active(level.mask, cell) ? 1 : 0)
         push!(covered, cov[cell] ? 1 : 0)
@@ -658,7 +658,7 @@ function _level_value(coefficients, model::Model{D,T}, layout::FieldLayout{D,T},
 
     parent_box = cell_box(level.mesh, cell)
     xi = physical_to_reference(parent_box, x)
-    values = basis_values(level.basis, level.order, level.mode, xi, cell)
+    values = _cell_basis_values(level, cell, xi)
     raw_dofs = cell_dofs(layout.dofs, level.id, cell)
     # Reuse the assembly reconstruction kernel: the dof sum over
     # `(raw_dofs, values)` is exactly what `_field_value` computes (constrained
@@ -679,7 +679,7 @@ function _level_gradient(coefficients, model::Model{D,T}, layout::FieldLayout{D,
 
     parent_box = cell_box(level.mesh, cell)
     xi = physical_to_reference(parent_box, x)
-    gradients = physical_basis_gradients(level.basis, level.order, level.mode, parent_box, xi, cell)
+    gradients = _cell_basis_gradients(level, cell, parent_box, xi)
     raw_dofs = cell_dofs(layout.dofs, level.id, cell)
     # Reuse the assembly gradient-reconstruction kernel over `(raw_dofs,
     # gradients)`; the chain-rule scaling is already in `gradients`.
@@ -931,8 +931,8 @@ Integrate a user callback over a portion of the boundary.
   - `boundary(:all)`, `boundary(axis=d, side=s)`,
     `boundary((axis=…, side=…), …)` — the physical boundary `∂Ω`. The
     Gauss rule per region is the per-axis maximum
-    `recommended_quadrature_order(level.basis, level.order)` over the
-    region's covering parents. Overlay levels whose own mesh face
+    `recommended_quadrature_order(level.basis, cell_order(level, cell))`
+    over the region's covering parent cells. Overlay levels whose own mesh face
     coincides with the selected facet contribute their own segment;
     level masking is respected.
   - A [`BoundaryMesh`](@ref) — a user-supplied immersed-boundary mesh

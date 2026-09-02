@@ -674,7 +674,14 @@ function _reproduces(k::Level{D}, p::NTuple{D,Int}) where {D}
     family = k.basis
     family isa BSplineFamily && return all(d -> degree(family.spaces[d]) == p[d], 1:D)
     family isa IntegratedLegendre || return false
-    return k.mode === :tensor && all(d -> k.order[d] >= p[d], 1:D)
+    k.mode === :tensor || return false
+    # `k.order` is the level's nominal maximum, which is not enough when `k` carries
+    # a per-cell order: a single cell below `p` anywhere under the buried function's
+    # support cannot reproduce it. Requiring every palette entry to clear `p` is the
+    # conservative reading — it can only skip a legitimate dedup, never delete a
+    # function nothing reproduces.
+    k.orders === nothing && return all(d -> k.order[d] >= p[d], 1:D)
+    return all(o -> all(d -> o[d] >= p[d], 1:D), k.orders.palette)
 end
 
 # `_coverage_constraints` for a B-spline level — the dedup half only, and it is

@@ -453,6 +453,38 @@ function local_basis_indices(basis::IntegratedLegendre, order::NTuple{D,Int},
     return [id for id in indices if _trunk_degree(id) <= order[1]]
 end
 
+"""
+    _index_admissible(basis, order, mode, id) -> Bool
+
+Whether the multi-index `id` belongs to `local_basis_indices(basis, order, mode)`,
+answered in `O(D)` instead of by scanning the set.
+
+This is the family's own index-set filter, factored out so the dof layer's
+minimum rule can ask it at an order no cell actually carries — the componentwise
+minimum over a shared entity's incident cells. Asking the *filter* rather than
+comparing modes per axis is what makes the rule family-generic: for `:tensor` the
+two agree, and for `:trunk` they do not, because a 3D face mode with bubble
+degrees `(3, 2)` passes a per-axis test at order 4 while its trunk degree 5 puts
+it outside the order-4 trunk set. A family that adds a mode adds it here and the
+minimum rule follows.
+
+The `::BasisFamily` default is the per-axis box every tensor-product family
+carries; integrated Legendre adds the trunk-degree filter. `test_cell_order.jl`
+asserts the two forms agree with `local_basis_indices` over a range of orders,
+modes and dimensions, which is the contract that keeps them from drifting.
+"""
+function _index_admissible(::BasisFamily, order::NTuple{D,Int}, ::Symbol,
+                           id::CartesianIndex{D}) where {D}
+    return all(d -> 0 <= id.I[d] <= order[d], 1:D)
+end
+
+function _index_admissible(::IntegratedLegendre, order::NTuple{D,Int}, mode::Symbol,
+                           id::CartesianIndex{D}) where {D}
+    all(d -> 0 <= id.I[d] <= order[d], 1:D) || return false
+    mode === :tensor && return true
+    return _trunk_degree(id) <= order[1]
+end
+
 # ── Hot-path tensor-product evaluation ────────────────────────────────────────
 
 # Promote a `PointLike` input (NTuple or SVector) to an `SVector{D,T}` whose
@@ -555,10 +587,30 @@ end
 # basis-agnostic: it only assumes the per-axis tables are indexed by the
 # 1D mode number on the cell, which is the canonical convention every
 # family in this package follows. The caller owns `val1d`.
+#
+# The buffer check is `>=`, not `==`. Under a per-cell polynomial order the
+# workspace banks stay sized at the level's *nominal* (maximum) order while
+# `indices` is the cell's own minimum-rule set, which is shorter on every cell
+# below the maximum. Writing into a prefix of the longer buffer is transparent to
+# every consumer, because they all bound their loop by `eachindex(raw_dofs)` and
+# read `values[a]` positionally — the pairing is with the index list, not with
+# the buffer's length. Length-matching with a `view` instead was measured at
+# +24–30% on this kernel and is not worth it. What `>=` gives up is the guard
+# against a *short* buffer, so `test_cell_order.jl` asserts the surviving check
+# still fires.
+#
+# The 1D factor tables are likewise filled at the nominal order and read only up
+# to the cell's own: for integrated Legendre `_fill_factor_tables!` computes mode
+# `m` from `ξ` and `m` alone, with no `p` anywhere in the recurrence, so slots
+# `1:p_cell+1` hold bit-identical values whether the table was filled at `p_cell`
+# or at `p_max`. That identity is what makes the nominal-order banks correct, and
+# it is *false* for a family whose 1D modes depend on the degree — de Boor at
+# degree p yields p+1 span-specific functions — which is one more reason
+# `_supports_cell_order` is false for B-splines.
 function _tensor_values!(basis::BasisFamily, values::AbstractVector,
                          indices::AbstractVector{CartesianIndex{D}}, order::NTuple{D,Int},
                          ξ::SVector{D,T}, val1d, cell::CartesianIndex{D}) where {D,T}
-    length(values) == length(indices) ||
+    length(values) >= length(indices) ||
         throw(DimensionMismatch("basis value buffer has wrong length"))
     _fill_factor_tables!(basis, val1d, order, ξ, cell)
     @inbounds for (a, id) in pairs(indices)
@@ -587,9 +639,9 @@ function _tensor_values_grads!(basis::BasisFamily, values::AbstractVector,
                                indices::AbstractVector{CartesianIndex{D}}, order::NTuple{D,Int},
                                ξ::SVector{D,T}, scale::SVector{D,T}, val1d, der1d,
                                cell::CartesianIndex{D}) where {D,T}
-    length(values) == length(indices) ||
+    length(values) >= length(indices) ||
         throw(DimensionMismatch("basis value buffer has wrong length"))
-    length(gradients) == length(indices) ||
+    length(gradients) >= length(indices) ||
         throw(DimensionMismatch("basis gradient buffer has wrong length"))
     _fill_factor_tables!(basis, val1d, der1d, order, ξ, cell)
     @inbounds for (a, id) in pairs(indices)

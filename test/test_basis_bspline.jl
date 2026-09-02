@@ -11,6 +11,31 @@ using LinearAlgebra: Symmetric, isposdef, norm, pinv, rank
 # `_INT_*` constants from `test_coverage_reduction.jl`, which `runtests.jl`
 # includes first; this file does not stand alone.
 
+@testset "BSpline extension: a per-cell order is refused, not ignored" begin
+    # Per-cell polynomial order is a basis-family capability. A B-spline degree
+    # is a type parameter of the whole-axis knot vector, the clamped end
+    # multiplicity is p + 1, the 1D dimension is `cells + p`, and a function's
+    # support is p + 1 cells wide — so no set of functions belongs to one cell
+    # for a per-cell order to name, and there is no shared entity for the
+    # minimum rule to act on. The request must raise rather than be silently
+    # dropped.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    @test_throws ArgumentError space(Ω; cells=4, order=[2 + (i + j) % 2 for i in 1:4, j in 1:4],
+                                     basis=bspline())
+    V = space(Ω; cells=4, order=2, basis=bspline())
+    @test_throws ArgumentError overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=2,
+                                       order=[2 3; 3 2], basis=bspline())
+    # The trait triggers on non-uniformity, not on the shape: a per-cell field
+    # that happens to be flat is a perfectly well defined B-spline level.
+    W = space(Ω; cells=4, order=fill(3, 4, 4), basis=bspline())
+    @test W.levels[1].orders === nothing
+    @test W.levels[1].order == (3, 3)
+    @test Unfitted.dof_layout(W).active_count ==
+          Unfitted.dof_layout(space(Ω; cells=4, order=3, basis=bspline())).active_count
+    # And `elevate` refuses through the same trait.
+    @test_throws ArgumentError elevate(V, 1 => [1 2 3 1; 1 1 1 1; 1 1 1 1; 1 1 1 1])
+end
+
 @testset "BSpline extension: basis interface" begin
     fam_marker = bspline()
     @test fam_marker isa Unfitted.BasisFamily
