@@ -478,7 +478,7 @@ function boundary_trace_indices(level::Level{D,T}, cell::CartesianIndex{D}, raw_
     end
 
     return (; raw_dofs=raws, local_ids=ids, values=Vector{T}(undef, length(ids)),
-            factors=_factor_buffers(level.order, T))
+            factors=_factor_buffers(nominal_order(level), T))
 end
 
 """
@@ -499,8 +499,8 @@ path for every basis family, reaching the family only through its
 [`boundary_trace_indices`](@ref) and plays no part here.
 """
 function boundary_trace_values!(level::Level{D,T}, trace, xi::SVector{D,T}) where {D,T}
-    _tensor_values!(level.basis, trace.values, trace.local_ids, level.order, xi, trace.factors,
-                    trace.cell)
+    _tensor_values!(level.basis, trace.values, trace.local_ids, nominal_order(level), xi,
+                    trace.factors, trace.cell)
     return trace
 end
 

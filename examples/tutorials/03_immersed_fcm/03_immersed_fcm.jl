@@ -258,7 +258,7 @@ package reports them rather than silently discarding them.
 print_run_report("Tutorial 3 — Poisson on an immersed annulus (FCM + Nitsche)", report;
                  parameters=(:r_inner => R_INNER, :r_outer => R_OUTER,
                              :embedding_box => "[-0.8, 0.8]²", :cells => V.levels[1].mesh.cells,
-                             :order => V.levels[1].order,
+                             :order => nominal_order(V.levels[1]),
                              :subcell_length_scale => annulus.subcell_length_scale,
                              :nitsche_beta => BETA, :nitsche_h => H,
                              :outer_rim_segments => length(outer_rim.cells),

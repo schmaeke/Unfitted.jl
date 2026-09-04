@@ -48,7 +48,7 @@ function _parent_basis_data(V::Space{D,T}, layout::DofLayout{D,T}, parent::Paren
     # The 1D factor buffers are sized at the level's nominal order; the local id
     # list is the parent cell's own minimum-rule set, which is shorter wherever a
     # per-cell order puts that cell below the nominal maximum.
-    order = level.order
+    order = nominal_order(level)
     local_ids = cell_basis_indices(level, parent.cell)
     values = Vector{T}(undef, length(local_ids))
     gradient_values = gradients ? Vector{SVector{D,T}}(undef, length(values)) : SVector{D,T}[]
@@ -706,7 +706,9 @@ Thread-local assembly scratch. Carries every buffer the hot loop needs:
     space that genuinely mixes families widens `B` to a common supertype
     and pays that cost, which is why the field is parameterized rather
     than pinned to one family.
-  - `local_ids[i]` — tensor-product multi-indices of level `i`'s basis, at
+  - `local_ids[i]` — the level's full tensor-product multi-index list, kept only
+    to size the value banks; the per-cell sets a region actually pairs against
+    come from `cell_locals[i]`. Multi-indices of level `i`'s basis, at
     its nominal order.
   - `cell_locals[i]` — `nothing` on a level whose order is uniform (every
     cell shares `local_ids[i]`), else that level's per-cell minimum-rule
@@ -736,7 +738,7 @@ per assembly call in the serial path).
 struct AssemblyWorkspace{D,T,B<:BasisFamily}
     bases::Vector{B}
     local_ids::Vector{Vector{CartesianIndex{D}}}
-    cell_locals::Vector{Union{Nothing,Array{Vector{CartesianIndex{D}},D}}}
+    cell_locals::Vector{CellModes{D}}
     orders::Vector{NTuple{D,Int}}
     values::Vector{Vector{T}}
     gradients::Vector{Vector{SVector{D,T}}}
@@ -753,10 +755,9 @@ end
 # One `=== nothing` branch on the common path, and a plain array read on the
 # per-cell path — measured at or below the noise of the basis refresh, which is
 # itself 1.6–4.1% of `_assemble_region!`.
-@inline function _parent_local_ids(local_ids, cell_locals, lvl::Int,
-                                   cell::CartesianIndex{D}) where {D}
-    table = cell_locals[lvl]
-    return table === nothing ? local_ids[lvl] : table[cell]
+@inline function _parent_local_ids(cell_locals, lvl::Int, cell::CartesianIndex{D}) where {D}
+    modes = cell_locals[lvl]
+    return modes.sets[modes.kind[cell]]
 end
 
 # Allocate the shared per-level value banks of a workspace: index by
@@ -770,19 +771,19 @@ function _level_value_buffers(levels, ::Val{D}, ::Type{T}) where {D,T}
     n = length(levels)
     bases = Vector{BasisFamily}(undef, n)
     local_ids = Vector{Vector{CartesianIndex{D}}}(undef, n)
-    cell_locals = Vector{Union{Nothing,Array{Vector{CartesianIndex{D}},D}}}(nothing, n)
+    cell_locals = Vector{CellModes{D}}(undef, n)
     orders = Vector{NTuple{D,Int}}(undef, n)
     values = Vector{Vector{T}}(undef, n)
     val1d = Vector{NTuple{D,Vector{T}}}(undef, n)
     for level in levels
         i = level.id
-        ids = local_basis_indices(level.basis, level.order, level.mode)
+        ids = local_basis_indices(level.basis, nominal_order(level), level.mode)
         bases[i] = level.basis
         local_ids[i] = ids
         cell_locals[i] = _cell_locals(level)
-        orders[i] = level.order
+        orders[i] = nominal_order(level)
         values[i] = Vector{T}(undef, length(ids))
-        val1d[i] = _factor_buffers(level.order, T)
+        val1d[i] = _factor_buffers(nominal_order(level), T)
     end
     # `map(identity, …)` narrows the abstractly-typed build bank to the eltype
     # the families actually share, so every hot-loop `bases[i]` read dispatches
@@ -815,7 +816,7 @@ function _build_workspace(spaces, ::Val{D}, ::Type{T}) where {D,T}
     end
     bases = Vector{BasisFamily}(undef, n)
     local_ids = Vector{Vector{CartesianIndex{D}}}(undef, n)
-    cell_locals = Vector{Union{Nothing,Array{Vector{CartesianIndex{D}},D}}}(nothing, n)
+    cell_locals = Vector{CellModes{D}}(undef, n)
     orders = Vector{NTuple{D,Int}}(undef, n)
     values = Vector{Vector{T}}(undef, n)
     val1d = Vector{NTuple{D,Vector{T}}}(undef, n)
@@ -842,15 +843,15 @@ function _fill_assembly_banks!(bases, local_ids, cell_locals, orders, values, gr
                                der1d, levels::Tuple, ::Val{D}, ::Type{T}) where {D,T}
     for level in levels
         i = level.id
-        ids = local_basis_indices(level.basis, level.order, level.mode)
+        ids = local_basis_indices(level.basis, nominal_order(level), level.mode)
         bases[i] = level.basis
         local_ids[i] = ids
         cell_locals[i] = _cell_locals(level)
-        orders[i] = level.order
+        orders[i] = nominal_order(level)
         values[i] = Vector{T}(undef, length(ids))
         gradients[i] = Vector{SVector{D,T}}(undef, length(ids))
-        val1d[i] = _factor_buffers(level.order, T)
-        der1d[i] = _factor_buffers(level.order, T)
+        val1d[i] = _factor_buffers(nominal_order(level), T)
+        der1d[i] = _factor_buffers(nominal_order(level), T)
     end
     return nothing
 end
@@ -929,7 +930,7 @@ function _update_region_basis!(ws::AssemblyWorkspace{D,T}, region::VolumeRegion{
         lvl = parent.level
         xi = reference_to_physical(parent.local_box, eta)
         scale = SVector{D,T}(2 .* inv.(edge_lengths(parent.parent_box)))
-        ids = _parent_local_ids(ws.local_ids, ws.cell_locals, lvl, parent.cell)
+        ids = _parent_local_ids(ws.cell_locals, lvl, parent.cell)
         _tensor_values_grads!(ws.bases[lvl], ws.values[lvl], ws.gradients[lvl], ids, ws.orders[lvl],
                               xi, scale, ws.val1d[lvl], ws.der1d[lvl], parent.cell)
     end
@@ -1117,7 +1118,7 @@ function _update_physical_basis!(ws::AssemblyWorkspace{D,T}, parents, x::SVector
         lvl = parent.level
         xi = physical_to_reference(parent.parent_box, x)
         scale = SVector{D,T}(2 .* inv.(edge_lengths(parent.parent_box)))
-        ids = _parent_local_ids(ws.local_ids, ws.cell_locals, lvl, parent.cell)
+        ids = _parent_local_ids(ws.cell_locals, lvl, parent.cell)
         _tensor_values_grads!(ws.bases[lvl], ws.values[lvl], ws.gradients[lvl], ids, ws.orders[lvl],
                               xi, scale, ws.val1d[lvl], ws.der1d[lvl], parent.cell)
     end

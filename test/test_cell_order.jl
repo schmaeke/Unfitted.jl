@@ -3,7 +3,8 @@ using LinearAlgebra: norm
 
 using Unfitted: dof_layout, cell_dofs, cell_basis_indices, _cell_basis_values, _level_by_id,
                 _index_admissible, local_basis_indices, _tensor_values!, _factor_buffers,
-                _minimum_rule_order, _incident_cells, TensorDofKey, _axis_dof_key, _AXIS_SPAN
+                _entity_carries, _incident_cells, TensorDofKey, _axis_dof_key, _AXIS_SPAN,
+                _supports_cell_order, IntegratedLegendre, cell_order
 
 # Per-cell polynomial order: the minimum rule, and the invariants that keep a
 # mixed-order space usable.
@@ -74,17 +75,17 @@ const _CO_3D = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
         D = length(Ω.lower)
         plain = space(Ω; cells=cells, order=p)
         dense = space(Ω; cells=cells, order=fill(p, ntuple(_ -> cells, D)))
-        @test plain.levels[1].orders === nothing
-        @test dense.levels[1].orders === nothing          # collapsed, not merely equal
-        @test dense.levels[1].order == plain.levels[1].order
+        @test length(plain.levels[1].orders.palette) == 1
+        @test length(dense.levels[1].orders.palette) == 1  # collapsed, not merely equal
+        @test nominal_order(dense.levels[1]) == nominal_order(plain.levels[1])
         @test dof_layout(dense).active_count == dof_layout(plain).active_count
         @test cell_orders(plain; level=1) == fill(ntuple(_ -> p, D), ntuple(_ -> cells, D))
     end
 
     # A predicate that returns one order everywhere collapses too.
     V = space(_CO_2D; cells=4, order=(_box, _cell) -> 2)
-    @test V.levels[1].orders === nothing
-    @test V.levels[1].order == (2, 2)
+    @test length(V.levels[1].orders.palette) == 1
+    @test nominal_order(V.levels[1]) == (2, 2)
 
     # And a stacked, pruned space keeps its reduction verdicts.
     ref = overlay(space(_CO_2D; cells=4, order=3), box((0.25, 0.25), (0.75, 0.75)); cells=4,
@@ -207,9 +208,13 @@ end
     @test_throws DimensionMismatch space(_CO_2D; cells=2, order=fill(2, 3, 3))
     @test_throws ArgumentError space(_CO_2D; cells=2, order="two")
     @test_throws ArgumentError space(_CO_2D; cells=2, order=fill(0, 2, 2))
-    # A palette wider than the UInt8 class index is rejected, not wrapped.
-    @test_throws ArgumentError space(box((0.0,), (1.0,)); cells=(300,),
-                                     order=reshape(collect(1:300), 300))
+    # A palette of 300 distinct orders is a p-field, not a mistake: the class
+    # index is `UInt16`, so the cap sits three orders of magnitude above what an
+    # anisotropic estimator produces and is no longer reachable by a test that
+    # builds a level. The rejection itself is still there, just out of reach.
+    wide = space(box((0.0,), (1.0,)); cells=(300,), order=reshape(collect(1:300), 300))
+    @test length(wide.levels[1].orders.palette) == 300
+    @test eltype(wide.levels[1].orders.class) === UInt16
 end
 
 @testset "per-cell order: the index-set membership predicate" begin
@@ -261,10 +266,10 @@ end
     # recompile the assembly pipeline.
     @test typeof(W) === typeof(V)
     @test cell_orders(W; level=1) == p
-    @test W.levels[1].order == (5, 5)                 # nominal = per-axis maximum
-    @test elevate(W, 1 => cell_orders(W; level=1)).levels[1].order == (5, 5)
+    @test nominal_order(W.levels[1]) == (5, 5)                 # nominal = per-axis maximum
+    @test nominal_order(elevate(W, 1 => cell_orders(W; level=1)).levels[1]) == (5, 5)
     # Round-tripping back to a flat field collapses the representation again.
-    @test elevate(W, 1 => 2).levels[1].orders === nothing
+    @test length(elevate(W, 1 => 2).levels[1].orders.palette) == 1
 
     # The pair form raises named cells and leaves every other cell alone.
     Z = elevate(V, 1 => [CartesianIndex(2, 3) => 4])
@@ -278,7 +283,7 @@ end
     S = overlay(space(_CO_2D; cells=4, order=2), box((0.25, 0.25), (0.75, 0.75)); cells=2,
                 order=[3 4; 4 3])
     @test cell_orders(S; level=2) == [(3, 3) (4, 4); (4, 4) (3, 3)]
-    @test S.levels[2].order == (4, 4)
+    @test nominal_order(S.levels[2]) == (4, 4)
     @test worst_trace_jump(S; level=2) == 0.0
 end
 
@@ -293,7 +298,7 @@ end
     d = diagnostics(model, sol)
     @test d.symmetry_residual == 0.0
     @test length(d.levels[1].order_palette) == 3
-    @test d.levels[1].order == (4, 4)
+    @test d.levels[1].order == (4, 4)          # the report keeps its `order` key
     exact(x) = sinpi(x[1]) * sinpi(x[2])
     @test l2_error(sol, model, exact) < 5e-4
     # Point evaluation must read the same per-cell index set the dof walk used —
@@ -407,5 +412,143 @@ end
         b = CartesianIndex(ntuple(k -> k == d0 ? a.I[k] + 1 : a.I[k], 2))
         (Unfitted.is_active(lvl.mask, a) && Unfitted.is_active(lvl.mask, b)) || continue
         @test trace_jump(model.problem.space, 1, a, b, d0; n=5) == 0.0
+    end
+end
+
+@testset "per-cell order: the mode table cannot go stale" begin
+    # `CellModes` is derived by `Level`'s constructor from the orders, mesh, mode
+    # and mask. It used to be an argument, which meant a caller could pair a table
+    # built against one mask with a different one; the failure was silent, because
+    # the dof layout is built *from* the table and went stale with it. A witness
+    # field recorded which mask the table came from so the constructor could check.
+    # There is nothing left to check: the constructor takes no table.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    field = [2 + (i + j) % 3 for i in 1:4, j in 1:4]
+    V = space(Ω; cells=(4, 4), order=field)
+    lvl = V.levels[1]
+
+    @test !hasproperty(lvl, :order)          # the nominal summary is a function now
+    @test nominal_order(lvl) == (4, 4)
+    @test !hasfield(typeof(lvl.orders), :mask)     # the witness is gone with its cause
+    @test !hasfield(typeof(lvl.orders), :locals)   # what the basis emits is not what was asked for
+
+    # The derivation tracks the mask on every path that changes it, and the mode
+    # sets it produces agree with a level built at that mask from scratch.
+    kept = [ci for ci in cell_indices(V; level=1) if ci != CartesianIndex(2, 2)]
+    V2 = adapt(V, 1 => kept)
+    fresh = space(Ω; cells=(4, 4), order=field,
+                  active=[ci != CartesianIndex(2, 2) for ci in CartesianIndices((4, 4))])
+    for ci in cell_indices(V2; level=1)
+        @test cell_basis_indices(V2.levels[1], ci) == cell_basis_indices(fresh.levels[1], ci)
+    end
+    @test active_unknowns(prepare(mass(V2))) < active_unknowns(prepare(mass(V)))
+
+    # A uniform level is a palette of one, not an absence — no second code path.
+    uniform = space(Ω; cells=(4, 4), order=3).levels[1]
+    @test length(uniform.orders.palette) == 1
+    @test cell_order(uniform, CartesianIndex(2, 2)) == (3, 3)
+    @test nominal_order(uniform) == (3, 3)
+
+    # The fictitious fold re-masks underneath the user; it is the case that bit.
+    disc = physical_domain(x -> sum(abs2, x .- 0.5) - 0.09; lipschitz=2.0, alpha=1e-8,
+                           subcell_length_scale=0.03)
+    Vf = space(Ω; cells=(4, 4), order=field, physical=disc)
+    @test active_unknowns(prepare(mass(Vf))) > 0
+end
+
+@testset "per-cell order: the palette admits an anisotropic p-field" begin
+    # An anisotropic estimator is the natural one for a tensor-product family,
+    # and it reaches far more than 255 distinct orders on a modest 3D grid — an
+    # 8³ grid admits 512. The palette index is wide enough that the cap is not a
+    # shape a real p-field runs into.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    anisotropic = [(1 + (i - 1) % 16, 1 + (j - 1) % 16) for i in 1:16, j in 1:16]
+    V = space(Ω; cells=(16, 16), order=anisotropic)
+    @test eltype(V.levels[1].orders.class) === UInt16
+    @test length(V.levels[1].orders.palette) == 256          # would have thrown at 255
+    @test cell_orders(V; level=1)[CartesianIndex(3, 5)] == (3, 5)
+    @test active_unknowns(prepare(mass(V))) > 0
+end
+
+@testset "per-cell order: an h- and a p-step in one rebuild" begin
+    # An hp driver takes both halves every step. Going through `adapted` and
+    # `elevated` in turn builds and discards a complete intermediate model; the
+    # Space-level compose costs microseconds, so the one-rebuild form is the one
+    # a loop should use.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    V = ladder(Ω; cells=(8, 8), order=2, depth=1, splits=2)
+    model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    mask = [ci
+            for ci in cell_indices(V; level=2)
+            if sum(abs2, center(cell_box(V, ci; level=2)) .- 0.5) < 0.08]
+    orders = fill(2, 8, 8)
+    orders[3:6, 3:6] .= 4
+
+    stepwise = elevated(adapted(model, 2 => mask), 1 => orders)
+    composed = adapted(model, elevate(adapt(V, 2 => mask), 1 => orders))
+    @test active_unknowns(composed) == active_unknowns(stepwise)
+    @test cell_orders(composed; level=1) == cell_orders(stepwise; level=1)
+    @test active_cells(composed; level=2) == active_cells(stepwise; level=2)
+    @test norm(solve!(composed).coefficients - solve!(stepwise).coefficients) < 1e-12
+
+    # The caches this reuses are keyed without the geometry, so a space that is
+    # not this model's own is refused rather than fitted with the wrong rules.
+    @test_throws ArgumentError adapted(model,
+                                       space(box((0.0, 0.0), (2.0, 2.0)); cells=(4, 4), order=2))
+end
+
+@testset "per-cell order: the intersection rule is the minimum rule" begin
+    # The kernel asks each incident cell whether it generates the mode, instead of
+    # forming the componentwise minimum and asking there. The two agree only
+    # because `_index_admissible` is monotone non-decreasing in the order — that
+    # is a property of the FAMILY, not of the dof layer, so assert it directly.
+    # A family that broke it would get a silently non-conforming space.
+    for mode in (:tensor, :trunk), D in (2, 3)
+        basis = IntegratedLegendre()
+        @test _supports_cell_order(basis)
+        for lo in 1:4
+            los = ntuple(_ -> lo, D)
+            ids = local_basis_indices(basis, los, mode)
+            for hi in lo:5, d in 1:D
+                his = ntuple(e -> e == d ? hi : lo, D)
+                mode === :trunk && his != ntuple(_ -> hi, D) && continue   # trunk wants isotropy
+                # Raising one axis may only ADD modes, never remove one.
+                @test all(id -> _index_admissible(basis, his, mode, id), ids)
+            end
+        end
+    end
+
+    # And the equivalence itself, cell for cell, against the componentwise
+    # minimum the rule used to form explicitly.
+    minimum_rule(orders, mask, key, n) = begin
+        pmin = nothing
+        for ci in _incident_cells(key, n)
+            Unfitted.is_active(mask, ci) || continue
+            o = orders[ci]
+            pmin = pmin === nothing ? o : ntuple(d -> min(pmin[d], o[d]), length(o))
+        end
+        pmin
+    end
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    for field in
+        ([1 + (i + j) % 4 for i in 1:6, j in 1:6], [(1 + i % 3, 1 + j % 4) for i in 1:6, j in 1:6]),
+        msk in (nothing, [!(i == 3 && j == 3) for i in 1:6, j in 1:6])
+
+        V = space(Ω,; cells=(6, 6), order=field, active=msk)
+        lvl = V.levels[1]
+        orders = [cell_order(lvl, ci) for ci in cell_indices(V; level=1)]
+        n = lvl.mesh.cells
+        for cell in cell_indices(V; level=1)
+            Unfitted.is_active(lvl.mask, cell) || continue
+            for id in local_basis_indices(lvl.basis, cell_order(lvl, cell), lvl.mode)
+                key = TensorDofKey{2}(0, ntuple(d -> _axis_dof_key(cell.I[d], id.I[d]), 2))
+                pmin = minimum_rule(orders, lvl.mask, key, n)
+                classical = pmin === nothing || _index_admissible(lvl.basis, pmin, lvl.mode, id)
+                # The dense `orders` matrix is the reference rule's input; the
+                # kernel reads the palette record the level actually carries.
+                @test _entity_carries(lvl.basis, lvl.orders, lvl.mask, key, n, lvl.mode, id) ==
+                      classical
+            end
+        end
     end
 end

@@ -263,7 +263,6 @@ V = elevate(V, 1 => p)
 """
 function cell_orders(V::Space{D}; level::Integer) where {D}
     lvl = V.levels[_check_level(V, level)]
-    lvl.orders === nothing && return fill(lvl.order, lvl.mesh.cells)
     return [lvl.orders.palette[c] for c in lvl.orders.class]
 end
 

@@ -199,5 +199,5 @@ println()
 print_run_report("Tutorial 4 — summary of the nested B-spline stack", report_nested;
                  parameters=(:base_cells => V_base.levels[1].mesh.cells,
                              :overlay_cells => V_nested.levels[2].mesh.cells,
-                             :degree => V_base.levels[1].order, :basis => "bspline",
+                             :degree => nominal_order(V_base.levels[1]), :basis => "bspline",
                              :centre_value_reference => CENTRE_REFERENCE))

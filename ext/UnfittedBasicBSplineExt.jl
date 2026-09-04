@@ -680,7 +680,6 @@ function _reproduces(k::Level{D}, p::NTuple{D,Int}) where {D}
     # support cannot reproduce it. Requiring every palette entry to clear `p` is the
     # conservative reading — it can only skip a legitimate dedup, never delete a
     # function nothing reproduces.
-    k.orders === nothing && return all(d -> k.order[d] >= p[d], 1:D)
     return all(o -> all(d -> o[d] >= p[d], 1:D), k.orders.palette)
 end
 

@@ -530,12 +530,15 @@ end
 #     asks, so both sides of a face agree by construction and the one-sided mode
 #     is not expressible. A per-cell filter would have to be kept symmetric by
 #     hand.
-#   * It is a **set** test — does the key's own multi-index survive the family's
-#     own index-set filter evaluated at the minimum order — not a per-axis
-#     `mode ≤ order[d]` comparison. The two agree for `:tensor` and in 2D, and
-#     differ in 3D under `:trunk`, where a face key with bubble modes (3, 2) has
-#     trunk degree 5 and passes the per-axis test at order 4 while the order-4
-#     cell never generates it.
+#   * Every question is asked at an order some cell **actually carries**. The
+#     classical statement forms the componentwise minimum first and then asks
+#     the family whether the mode survives *there* — at an order that in general
+#     no cell has, and where the family's index set therefore has to be defined
+#     by extension. That extension is where the rule goes wrong: read per axis
+#     it admits a 3D `:trunk` face key with bubble modes (3, 2), whose trunk
+#     degree is 5, at order 4 — a mode the order-4 cell never generates, and a
+#     measured 0.186 trace jump. Asking each incident cell about its own index
+#     set removes the fiction and with it the ambiguity.
 #   * Inactive incident cells are **skipped, not minimised over**. An inactive
 #     cell generates nothing, so it cannot disagree; letting it lower the entity
 #     would delete dofs nothing replaces. That is not hypothetical: under a
@@ -545,8 +548,21 @@ end
 #
 # One pass suffices — no fixed point. The incident cells of a key form a
 # face-connected `2^(#NODE axes)` hypercube, so agreement across every face of
-# that block already implies agreement with every cell in it, and the one-shot
-# minimum computes that agreement directly.
+# that block already implies agreement with every cell in it.
+#
+# WHY THE INTERSECTION IS THE MINIMUM RULE. `_index_admissible` is, for every
+# family that opts into a per-cell order, a conjunction of upper bounds on the
+# order — `0 ≤ αᵈ ≤ pᵈ` for `:tensor`, plus `Σ t(αᵈ) ≤ p₁` for `:trunk`. Raising
+# an order therefore never removes a mode from a cell's set, only adds: the
+# predicate is monotone non-decreasing in `p`. Given that,
+#
+#     admissible(min over incident cells, α)  ⟺  admissible(order(c), α) ∀ c
+#
+# so the two statements are the same rule and the minimum need never be formed.
+# The equivalence *rests* on that monotonicity, which is a property of the
+# family rather than of this file, so `test_cell_order.jl` asserts it directly
+# for every family answering `_supports_cell_order() == true`. A family that
+# broke it would silently get a non-conforming space from this code.
 #
 # What the rule cannot express, and what therefore has to be checked elsewhere:
 # every cell needs `order ≥ 1` on every axis. `_axis_dof_key` deliberately
@@ -556,57 +572,66 @@ end
 # two endpoint modes. `_build_cell_orders` in `mesh.jl` validates every palette
 # entry through `local_basis_indices` for that reason.
 
-# The order a key's shared entity carries: the componentwise minimum over the
-# *active* cells incident to it, or `nothing` when the key has no active
-# incident cell at all (in which case nothing constrains it and it is admitted).
-function _minimum_rule_order(orders::Array{NTuple{D,Int},D}, mask, key::TensorDofKey{D},
-                             n::NTuple{D,Int}) where {D}
-    pmin = nothing
+# Whether the shared entity of `key` carries the mode `id`: every *active* cell
+# incident to it generates `id` from its own order. The generating cell is itself
+# incident, and `id` came from its own index set, so the loop is never empty and
+# the unconstrained case needs no separate answer.
+function _entity_carries(basis::BasisFamily, orders::CellOrders{D}, mask, key::TensorDofKey{D},
+                         n::NTuple{D,Int}, mode::Symbol, id::CartesianIndex{D}) where {D}
     for ci in _incident_cells(key, n)
         is_active(mask, ci) || continue
-        o = orders[ci]
-        pmin = pmin === nothing ? o : ntuple(d -> min(pmin[d], o[d]), D)
+        _index_admissible(basis, orders.palette[orders.class[ci]], mode, id) || return false
     end
-    return pmin
+    return true
 end
 
-# Per-cell minimum-rule local index table for one integrated-Legendre level.
-# For every active cell, walk the index set at that cell's own order and keep the
-# multi-indices whose dof key survives the minimum rule. Cells that end up with
-# the same kept set share one vector — a graded field carries a handful of
-# distinct sets however many cells it has — and inactive cells carry the empty
-# set, matching the empty `cell_dofs` entry the dof walk gives them.
-#
-# The kept set is in general **not** a tensor product of per-axis ranges: a p=6
-# cell beside a p=4 neighbour keeps every mode except the two whose bubble degree
-# along the shared face exceeds 4. That is why the table is stored per cell
-# rather than derived from an order value, and why every positional pairing of
-# basis functions with raw dofs has to read it.
-#
-# Restricted to integrated Legendre by dispatch: the key construction below is
-# that family's `_axis_dof_key`, and `_supports_cell_order` already refuses a
-# non-uniform field on any other family. The B-spline family has its own support
-# map — a function's span covers many cells — and never routes through here.
-function _cell_local_index_table(basis::IntegratedLegendre, orders::Array{NTuple{D,Int},D},
-                                 mesh::CartesianMesh{D}, mode::Symbol, mask) where {D}
+# One shared index set for every active cell, and the empty set for the rest.
+# This serves two cases that are the same case: a family with no per-cell order,
+# and a level whose palette has a single entry. Neither can lose a mode to the
+# rule — every active cell asks the same question of neighbours carrying the same
+# order — so the filter below would be a no-op, and a uniform level pays nothing
+# for the existence of the graded path.
+function _uniform_cell_modes(basis::BasisFamily, orders::CellOrders{D}, mesh::CartesianMesh{D},
+                             mode::Symbol, mask) where {D}
+    sets = [CartesianIndex{D}[], local_basis_indices(basis, orders.palette[1], mode)]
+    kind = Array{UInt16,D}(undef, mesh.cells)
+    for cell in cell_indices(mesh)
+        kind[cell] = is_active(mask, cell) ? UInt16(2) : UInt16(1)
+    end
+    return CellModes{D}(sets, kind)
+end
+
+function _cell_modes(basis::BasisFamily, orders::CellOrders{D}, mesh::CartesianMesh{D},
+                     mode::Symbol, mask) where {D}
+    return _uniform_cell_modes(basis, orders, mesh, mode, mask)
+end
+
+function _cell_modes(basis::IntegratedLegendre, orders::CellOrders{D}, mesh::CartesianMesh{D},
+                     mode::Symbol, mask) where {D}
+    length(orders.palette) == 1 && return _uniform_cell_modes(basis, orders, mesh, mode, mask)
     n = mesh.cells
-    table = Array{Vector{CartesianIndex{D}},D}(undef, n)
-    shared = Dict{Vector{CartesianIndex{D}},Vector{CartesianIndex{D}}}()
-    inactive = CartesianIndex{D}[]
+    sets = [CartesianIndex{D}[]]
+    index = Dict{Vector{CartesianIndex{D}},UInt16}(sets[1] => UInt16(1))
+    kind = Array{UInt16,D}(undef, n)
     for cell in cell_indices(mesh)
         if !is_active(mask, cell)
-            table[cell] = inactive
+            kind[cell] = UInt16(1)
             continue
         end
         kept = CartesianIndex{D}[]
-        for id in local_basis_indices(basis, orders[cell], mode)
+        for id in local_basis_indices(basis, orders.palette[orders.class[cell]], mode)
             key = TensorDofKey{D}(0, ntuple(d -> _axis_dof_key(cell.I[d], id.I[d]), D))
-            pmin = _minimum_rule_order(orders, mask, key, n)
-            (pmin === nothing || _index_admissible(basis, pmin, mode, id)) && push!(kept, id)
+            _entity_carries(basis, orders, mask, key, n, mode, id) && push!(kept, id)
         end
-        table[cell] = get!(shared, kept, kept)
+        kind[cell] = get!(index, kept) do
+            length(sets) == typemax(UInt16) &&
+                throw(ArgumentError("a level carries at most $(typemax(UInt16)) distinct " *
+                                    "per-cell mode sets, and this one asks for more"))
+            push!(sets, kept)
+            UInt16(length(sets))
+        end
     end
-    return table
+    return CellModes{D}(sets, kind)
 end
 
 """

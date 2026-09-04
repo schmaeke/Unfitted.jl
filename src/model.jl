@@ -1131,6 +1131,36 @@ function adapted(model::Model{D,T}, spec...; kwargs...) where {D,T}
 end
 
 """
+    adapted(model::Model, space::Space) -> Model
+
+Prepare `space` as a new [`Model`](@ref) carrying `model`'s problem, tolerance and
+plan options. This is the one-rebuild form of an hp step: compose the h- and the
+p-half at the `Space` level and hand the result here, rather than paying a full
+`prepare` for the intermediate.
+
+`space` must be derived from `model.prefold_space` — by [`adapt`](@ref),
+[`elevate`](@ref), or both. The moment-fit caches are reused, and their keys are
+`(box, moment_order)` with the geometry deliberately left out, on the reasoning
+that one cache sees exactly one [`PhysicalDomain`](@ref) for its whole life. A
+space carrying a different domain or a different fold would break that, so it is
+refused rather than silently fitted with the wrong cut rules.
+"""
+function adapted(model::Model{D,T}, space::Space{D,T}) where {D,T}
+    _assert_single_domain(model, "adapted")
+    prefold = model.prefold_space
+    space.physical === prefold.physical ||
+        throw(ArgumentError("adapted(model, space) reuses this model's moment-fit caches, whose keys omit the " *
+                            "geometry because one cache sees a single `physical` for its whole life; the space " *
+                            "handed in carries a different one. Derive it from `model.prefold_space` with " *
+                            "`adapt` / `elevate`."))
+    space.domain == prefold.domain ||
+        throw(ArgumentError("adapted(model, space) expects a space over this model's domain $(prefold.domain); " *
+                            "got $(space.domain)."))
+    return _prepared_model(_problem_with_space(model.problem, space), model.plan_options,
+                           model.moment_fit_caches)
+end
+
+"""
     elevated(model::Model, level => order, ...) -> Model
 
 The [`elevate`](@ref) counterpart of [`adapted`](@ref): a new [`Model`](@ref)
@@ -1143,15 +1173,14 @@ The spec is applied to the model's *pre-fold* space for the same reason
 changes which basis functions exist and no geometry, so every fitted cut-cell
 rule is still valid.
 
-Single-domain only, as [`adapted`](@ref) is. Compose an h- and a p-step in one
-rebuild by handing `adapt`'s result to `elevate` at the `Space` level:
+Single-domain only, as [`adapted`](@ref) is. An hp step wants both halves at
+once, and going through this call and [`adapted`](@ref) in turn builds and throws
+away a complete intermediate model. Compose at the `Space` level instead — where
+the compose itself costs microseconds — and prepare once:
 
 ```julia
-target = _prepared_model_from(elevate(adapt(model.prefold_space, 4 => m), 4 => p))
+target = adapted(model, elevate(adapt(model.prefold_space, 4 => m), 4 => p))
 ```
-
-or, more usually, one after the other through this call and `adapted`, paying one
-rebuild each.
 """
 function elevated(model::Model{D,T}, spec...) where {D,T}
     _assert_single_domain(model, "elevated")
@@ -1365,8 +1394,8 @@ function _level_report(level, V::Space, tol::GeometryTolerance)
     # carries the distinct per-cell orders — a one-element vector on a uniform
     # level — so a graded run is reproducible from the report without the entry's
     # type varying from level to level.
-    order_palette = level.orders === nothing ? [level.order] : copy(level.orders.palette)
-    return (; id=level.id, role=level.role, cells=level.mesh.cells, order=level.order,
+    order_palette = copy(level.orders.palette)
+    return (; id=level.id, role=level.role, cells=level.mesh.cells, order=nominal_order(level),
             order_palette=order_palette, mode=level.mode, basis=basis_name(level.basis),
             domain=level.mesh.domain, nested=nested,)
 end

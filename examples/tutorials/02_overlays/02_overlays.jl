@@ -241,5 +241,5 @@ println()
 print_run_report("Tutorial 2 — summary of the final (patch-only) configuration", report_shrunk;
                  parameters=(:dimension => D, :base_cells => V_base.levels[1].mesh.cells,
                              :overlay_cells => V_masked.levels[2].mesh.cells,
-                             :order => V_base.levels[1].order, :alpha => ALPHA,
+                             :order => nominal_order(V_base.levels[1]), :alpha => ALPHA,
                              :patch_radius => PATCH_RADIUS))

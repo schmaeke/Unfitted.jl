@@ -10,7 +10,7 @@ using LinearAlgebra
     @test Unfitted.level_count(V) == 1
     @test Unfitted.level_count(V2) == 2
     @test V2.levels[2].role == :overlay
-    @test V2.levels[2].order == (3, 3)
+    @test nominal_order(V2.levels[2]) == (3, 3)
     @test V3.levels[2].mesh.domain == box((0.2, 0.2), (0.6, 0.6))
     @test diagnostics(model).dimension == 2
     @test diagnostics(model).integration_regions == 16

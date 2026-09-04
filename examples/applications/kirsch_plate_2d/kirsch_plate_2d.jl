@@ -238,7 +238,7 @@ write_quadrature_vtm(out * "_quadrature", finest.model)
 
 print_run_report("Plate with a circular hole (Kirsch) — order $(last(orders))", finest.report;
                  parameters=(:cells => finest.V.levels[1].mesh.cells,
-                             :order => finest.V.levels[1].order, :hole_radius => a,
+                             :order => nominal_order(finest.V.levels[1]), :hole_radius => a,
                              :domain_edge => L, :far_field_traction => T, :E => E, :nu => ν,
                              :geometry => "Ω = { ‖x‖ ≥ a } (single circle leaf)",
                              :subcell_length_scale => finest.plate.subcell_length_scale,

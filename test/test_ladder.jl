@@ -27,13 +27,14 @@ end
 # space the reduced one is supposed to span.
 function unreduced_twin(V::Space)
     l1 = V.levels[1]
-    W = space(V.domain; cells=l1.mesh.cells, order=l1.order, basis=l1.basis, mode=l1.mode,
+    W = space(V.domain; cells=l1.mesh.cells, order=nominal_order(l1), basis=l1.basis, mode=l1.mode,
               active=(l1.mask === nothing ? nothing : l1.mask.on), physical=V.physical,
               prune_covered=false)
     for k in 2:length(V.levels)
         l = V.levels[k]
-        W = overlay(W, l.mesh.domain; cells=l.mesh.cells, order=l.order, basis=l.basis, mode=l.mode,
-                    active=(l.mask === nothing ? nothing : l.mask.on), prune_covered=false)
+        W = overlay(W, l.mesh.domain; cells=l.mesh.cells, order=nominal_order(l), basis=l.basis,
+                    mode=l.mode, active=(l.mask === nothing ? nothing : l.mask.on),
+                    prune_covered=false)
     end
     return W
 end

@@ -752,7 +752,7 @@ end
 function _surface_quadrature_order(V::Space{D,T}) where {D,T}
     base = ntuple(_ -> 1, D)
     for level in V.levels
-        per_axis = recommended_quadrature_order(level.basis, level.order)
+        per_axis = recommended_quadrature_order(level.basis, nominal_order(level))
         base = ntuple(d -> max(base[d], per_axis[d]), D)
     end
     return base

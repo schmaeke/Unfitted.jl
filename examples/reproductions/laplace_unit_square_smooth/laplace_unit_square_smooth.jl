@@ -84,5 +84,5 @@ write_vtk(out, solution, model;
 
 # Final report.
 print_run_report("Smooth Laplace unit square", report;
-                 parameters=(:cells => V.levels[1].mesh.cells, :order => V.levels[1].order),
-                 output=out)
+                 parameters=(:cells => V.levels[1].mesh.cells,
+                             :order => nominal_order(V.levels[1])), output=out)

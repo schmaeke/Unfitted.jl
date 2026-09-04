@@ -28,8 +28,8 @@ using LinearAlgebra: Symmetric, isposdef, norm, pinv, rank
     # The trait triggers on non-uniformity, not on the shape: a per-cell field
     # that happens to be flat is a perfectly well defined B-spline level.
     W = space(Ω; cells=4, order=fill(3, 4, 4), basis=bspline())
-    @test W.levels[1].orders === nothing
-    @test W.levels[1].order == (3, 3)
+    @test length(W.levels[1].orders.palette) == 1
+    @test nominal_order(W.levels[1]) == (3, 3)
     @test Unfitted.dof_layout(W).active_count ==
           Unfitted.dof_layout(space(Ω; cells=4, order=3, basis=bspline())).active_count
     # And `elevate` refuses through the same trait.
