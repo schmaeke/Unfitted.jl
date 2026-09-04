@@ -10,6 +10,15 @@
 #     julia --project=. test/characterize.jl > after.txt
 #     diff before.txt after.txt
 #
+# WHAT THIS INSTRUMENT DOES NOT COVER. Every `order =` argument below is a
+# scalar, so no case here builds a level with a PER-CELL polynomial order. The
+# report was measured byte-identical against five deliberately broken minimum
+# rules — the rule deleted outright, a per-axis test in place of set membership,
+# inactive cells minimised over, a maximum rule, and a truncated incidence walk —
+# so a matching hash says nothing at all about the graded kernel. That kernel has
+# its own instrument: `test/test_graded_golden.jl`, which locks the per-cell mode
+# sets directly and moves under all five of those controls.
+#
 # Every case carries one of two markings:
 #
 #   MUST-NOT-CHANGE     the configuration is *currently correct*. A fix that

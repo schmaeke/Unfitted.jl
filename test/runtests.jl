@@ -10,6 +10,7 @@ using Test
     include("test_activation.jl")
     include("test_coverage_reduction.jl")
     include("test_cell_order.jl")
+    include("test_graded_golden.jl")
     include("test_ladder.jl")
     include("test_physical.jl")
     include("test_implicit.jl")
