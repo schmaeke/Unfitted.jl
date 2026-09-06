@@ -17,6 +17,7 @@ using Test
     include("test_fcm.jl")
     include("test_assembly.jl")
     include("test_projection.jl")
+    include("test_adaptivity.jl")
     include("test_data.jl")
     include("test_postprocessing.jl")
     include("test_boundary_mesh.jl")

@@ -38,11 +38,12 @@ const _INT_X1SQ = 1 / 3
 # Reduced 2×2 block: base 4×4 p=2, overlay covering the middle 2×2 base cells at p=3,
 # aligned (overlay nodes ⊇ base nodes), so the buried centre vertex is deduped.
 function _nested_block(ro)
-    overlay(space(_OMEGA_CR; cells=(4, 4), order=2, prune_covered=ro),
-            box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4), order=3)
+    V = overlay(space(_OMEGA_CR; cells=(4, 4), order=2), box((0.25, 0.25), (0.75, 0.75));
+                cells=(4, 4), order=3)
+    return ro ? V : Unfitted._unpruned(V)
 end
 
-@testset "prune_covered=false is a no-op" begin
+@testset "leaf semantics switched off is a no-op" begin
     _, lf = _gram(_nested_block(false))
     @test all(s -> s in (:free, :overlay), lf.elimination_source)
     @test count(==(:coverage), lf.elimination_source) == 0
@@ -81,10 +82,10 @@ end
     # Overlay is one p=2 cell coincident with the interior base cell (2,2). Its only
     # surviving mode duplicates the base cell's bubble → the full space is rank
     # deficient by one; covered-mode pruning drops that buried bubble.
-    full = overlay(space(_OMEGA_CR; cells=(4, 4), order=2, prune_covered=false),
-                   box((0.25, 0.25), (0.5, 0.5)); cells=(1, 1), order=2)
-    red = overlay(space(_OMEGA_CR; cells=(4, 4), order=2, prune_covered=true),
-                  box((0.25, 0.25), (0.5, 0.5)); cells=(1, 1), order=2)
+    full = Unfitted._unpruned(overlay(space(_OMEGA_CR; cells=(4, 4), order=2),
+                                      box((0.25, 0.25), (0.5, 0.5)); cells=(1, 1), order=2))
+    red = overlay(space(_OMEGA_CR; cells=(4, 4), order=2), box((0.25, 0.25), (0.5, 0.5));
+                  cells=(1, 1), order=2)
 
     mf, lf = _gram(full)
     mr, lr = _gram(red)
@@ -96,8 +97,8 @@ end
 @testset "non-aligned overlay: linear skeleton retained, completeness preserved" begin
     # 3×3 overlay over the middle 2×2 base cells is not nested: the buried centre
     # vertex is NOT reproducible, so it must stay (no dedup) and the constant survives.
-    V = overlay(space(_OMEGA_CR; cells=(4, 4), order=2, prune_covered=true),
-                box((0.25, 0.25), (0.75, 0.75)); cells=(3, 3), order=3)
+    V = overlay(space(_OMEGA_CR; cells=(4, 4), order=2), box((0.25, 0.25), (0.75, 0.75));
+                cells=(3, 3), order=3)
     m, l = _gram(V)
     @test count(==(:coverage), l.elimination_source) > 0     # high-order still shed
     @test count(==(:dedup), l.elimination_source) == 0       # vertex kept
@@ -123,8 +124,8 @@ end
 end
 
 @testset "recursion: three-level stack reduces every covered level" begin
-    V = space(_OMEGA_CR; cells=(4, 4), order=3, prune_covered=true)
-    V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4), order=3, prune_covered=true)
+    V = space(_OMEGA_CR; cells=(4, 4), order=3)
+    V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4), order=3)
     V = overlay(V, box((0.375, 0.375), (0.625, 0.625)); cells=(2, 2), order=3)
     m, l = _gram(V)
 
@@ -150,8 +151,8 @@ end
     src = x -> 2pi^2 * sin(pi * x[1]) * sin(pi * x[2])
     exact = x -> sin(pi * x[1]) * sin(pi * x[2])
     bc = dirichlet(0.0; on=boundary(:all))
-    Vr = overlay(space(_OMEGA_CR; cells=(8, 8), order=3, prune_covered=true),
-                 box((0.3, 0.3), (0.7, 0.7)); cells=(4, 4), order=3)
+    Vr = overlay(space(_OMEGA_CR; cells=(8, 8), order=3), box((0.3, 0.3), (0.7, 0.7)); cells=(4, 4),
+                 order=3)
     m = prepare(poisson(Vr; source=src, dirichlet=[bc]))
     assemble!(m)
     sol = solve!(m)
@@ -165,7 +166,7 @@ end
     # high-order. The reduced immersed solve must remain well posed AND complete.
     disk = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.35; lipschitz=1.0,
                            subcell_length_scale=0.125, max_depth=4)
-    V = overlay(space(_OMEGA_CR; cells=(4, 4), order=2, prune_covered=true, physical=disk),
+    V = overlay(space(_OMEGA_CR; cells=(4, 4), order=2, physical=disk),
                 box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4), order=3)
     m, l = _gram(V)
     @test count(==(:coverage), l.elimination_source) > 0
@@ -196,7 +197,7 @@ end
     # artificial overlay boundary.
     hole = physical_domain(x -> 0.25 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0,
                            subcell_length_scale=0.015625, max_depth=6)
-    V = overlay(space(_OMEGA_CR; cells=(8, 8), order=2, prune_covered=true, physical=hole),
+    V = overlay(space(_OMEGA_CR; cells=(8, 8), order=2, physical=hole),
                 box((0.125, 0.125), (0.875, 0.875)); cells=(12, 12), order=2)
     m, l = _gram(V)
     @test diagnostics(m).inactive_cell_counts[2] > 0    # the fold really folds something
@@ -233,7 +234,7 @@ end
     # high-order modes the overlay already reproduces on Ω — the null mode again.
     hole = physical_domain(x -> 0.06 - sqrt((x[1] - 0.32)^2 + (x[2] - 0.32)^2); lipschitz=1.0,
                            subcell_length_scale=0.0078125, max_depth=6)
-    V = overlay(space(_OMEGA_CR; cells=(4, 4), order=2, prune_covered=true, physical=hole),
+    V = overlay(space(_OMEGA_CR; cells=(4, 4), order=2, physical=hole),
                 box((0.25, 0.25), (0.75, 0.75)); cells=(16, 16), order=2)
     m, l = _gram(V)
     @test diagnostics(m).inactive_cell_counts[2] > 0     # the fold really folds something
@@ -262,7 +263,7 @@ end
     # centre vertex is deduped and the eight covered cells shed their edge/face/interior
     # modes. Exercises the 3-axis incidence and coverage that no 2D config reaches.
     omega3 = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
-    V = overlay(space(omega3; cells=(4, 4, 4), order=2, prune_covered=true),
+    V = overlay(space(omega3; cells=(4, 4, 4), order=2),
                 box((0.25, 0.25, 0.25), (0.75, 0.75, 0.75)); cells=(4, 4, 4), order=2)
     m, l = _gram(V)
     @test count(==(:coverage), l.elimination_source) > 0   # buried edge/face/interior modes
@@ -281,7 +282,7 @@ end
     # leaves them uncovered and their high-order survives, while column-2 (covered by A
     # alone) is reduced. The overlay meshes are non-aligned with the base so no
     # coincident-vertex redundancy clouds the seam behaviour under test.
-    V = space(_OMEGA_CR; cells=(4, 4), order=2, prune_covered=true)
+    V = space(_OMEGA_CR; cells=(4, 4), order=2)
     V = overlay(V, box((0.25, 0.25), (0.625, 0.75)); cells=(5, 3), order=3)
     V = overlay(V, box((0.625, 0.25), (0.75, 0.75)); cells=(2, 3), order=3)
     m, l = _gram(V)
@@ -311,9 +312,10 @@ end
 # `cov[ci]` only records that *some* higher level covers cell `ci`, which is why
 # this needs the same single-covering-level test the dedup half already applies.
 function _split_cover(ro)
-    V = space(_OMEGA_CR; cells=(4, 4), order=3, prune_covered=ro)
-    V = overlay(V, box((0.0, 0.0), (0.5, 0.5)); cells=(4, 4), order=3, prune_covered=ro)
-    return overlay(V, box((0.5, 0.0), (1.0, 0.5)); cells=(4, 4), order=3, prune_covered=ro)
+    V = space(_OMEGA_CR; cells=(4, 4), order=3)
+    V = overlay(V, box((0.0, 0.0), (0.5, 0.5)); cells=(4, 4), order=3)
+    V = overlay(V, box((0.5, 0.0), (1.0, 0.5)); cells=(4, 4), order=3)
+    return ro ? V : Unfitted._unpruned(V)
 end
 
 @testset "a mode covered by two different levels is retained" begin

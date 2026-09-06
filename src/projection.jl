@@ -396,7 +396,7 @@ Reconstructs the source field pointwise when the target's active basis
 reconstruction is exact, and the smoothing of the L² backend is avoided.
 
 Containment is a stronger condition than "the target space is larger",
-and on a stack with `prune_covered = true` a refinement does not satisfy
+and under leaf semantics a refinement does not satisfy
 it: activating a finer level buries the parent's high-order modes, so
 covered-mode pruning eliminates them in the target and the target's basis
 trades parent modes for child modes rather than extending. The target's
@@ -540,6 +540,46 @@ function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_
                     SolverDiagnostics(:l2_projection, Float64(residual), true))
 end
 
+# `Rewire` matches source to target by `TensorDofKey` equality, which is only
+# sound while the same key names the same function on both sides. That is a
+# property of the basis family, and the two shipped families differ on it.
+#
+# An integrated-Legendre key indexes a mode by its DEGREE, and mode 3 is the same
+# function at order 4 and at order 7, so a pure order elevation rewires exactly —
+# measured, order 3 → 4 on 8² transfers with 0.000e+00 error. A B-spline key
+# indexes a global 1D function over the whole axis (`_AXIS_BSPLINE`), and raising
+# the degree rewrites the knot vector, so index *i* at degree 3 and index *i* at
+# degree 4 are simply different functions. The keys still compare equal, the
+# lookup still succeeds, and the coefficients land on the wrong basis: measured,
+# the same order 3 → 4 transfer "succeeded" with no raise and a relative error of
+# 1.80e-1. `strict = true` did not catch it, because it tests key PRESENCE while
+# the docstring promises span containment.
+#
+# The test is family-generic rather than a B-spline special case: the degree lives
+# in `BSplineFamily`'s type (its spaces are `BSplineSpace{p}`), while
+# `IntegratedLegendre` is one type for every order. So comparing the instantiated
+# basis TYPE admits exactly the rewires that are sound and rejects the rest, and a
+# future family inherits the right behaviour by construction. The cell counts are
+# compared for the same reason: a key indexes into a mesh, and two meshes of
+# different size do not share an indexing.
+function _assert_keys_comparable(source_model::Model, target_model::Model)
+    src, tgt = source_model.problem.space, target_model.problem.space
+    for k in 1:min(length(src.levels), length(tgt.levels))
+        a, b = src.levels[k], tgt.levels[k]
+        typeof(a.basis) === typeof(b.basis) ||
+            throw(ArgumentError("Rewire: level $k carries $(basis_name(a.basis)) at order " *
+                                "$(nominal_order(a)) on the source and $(basis_name(b.basis)) at order " *
+                                "$(nominal_order(b)) on the target, and those name different function sets, so a " *
+                                "dof key does not name the same function on both sides — raising a B-spline degree " *
+                                "rewrites the knot vector and does exactly this. Use `L2Projection()` instead."))
+        a.mesh.cells == b.mesh.cells ||
+            throw(ArgumentError("Rewire: level $k has $(a.mesh.cells) cells on the source and $(b.mesh.cells) on the " *
+                                "target; a dof key indexes into a mesh, so the two are not comparable. Use " *
+                                "`L2Projection()` instead."))
+    end
+    return nothing
+end
+
 # `Rewire` implementation: walk every active source dof, find its
 # target counterpart by `TensorDofKey`, and copy the coefficient.
 # Missing target counterparts and freshly-constrained target dofs are
@@ -551,6 +591,7 @@ function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_
     # geometric merge tolerance accepted by `transfer` has no role
     # here and is ignored on purpose.
     _assert_transfer_compatible(source_model, target_model)
+    _assert_keys_comparable(source_model, target_model)
     source_coefficients = _checked_coefficients(source_solution, source_model)
 
     source_layout = source_model.dofs

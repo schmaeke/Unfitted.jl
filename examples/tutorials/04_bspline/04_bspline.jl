@@ -124,11 +124,11 @@ model_nested, solution_nested, u_nested, report_nested = solve_and_report(V_nest
 # estimate; the model prints it for systems small enough to densify
 # (a few hundred unknowns), and `NaN` above that.
 
-V_undeduped = overlay(space(omega; cells=8, order=3, basis=bspline(), prune_covered=false),
-                      box((0.25, 0.25), (0.75, 0.75)); cells=4)
+V_undeduped = Unfitted._unpruned(overlay(space(omega; cells=8, order=3, basis=bspline()),
+                                         box((0.25, 0.25), (0.75, 0.75)); cells=4))
 _, _, _, report_undeduped = solve_and_report(V_undeduped,
                                              "Part 1c — the same stack, deduplication switched off";
-                                             parameters=(:prune_covered => false,))
+                                             parameters=(:pruning => "off",))
 
 println("Nested B-spline stack, deduplicated : unknowns ", report_nested.active_unknowns, ", cond ",
         report_nested.condition_estimate)

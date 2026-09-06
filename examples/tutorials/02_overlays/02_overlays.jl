@@ -139,18 +139,22 @@ Two guards keep the elimination from going too far:
     over this one and therefore reproduces it exactly — there the two are
     genuinely linearly dependent, not merely similar.
 
-`prune_covered = false` switches the rule off. Note that it belongs to the
-level that *sheds* the modes — the base — so it is `space` that has to be
-told, not `overlay`. Run 2b does exactly that, so the mechanism is
-measured here rather than merely described.
+There is no switch for this. A covered cell is the parent of a leaf, and a
+parent carries no unknowns where its children do — that is what makes
+superposition equivalent to ordinary refinement, where h-refining a cell
+*replaces* it. Run 2b builds the space with the rule switched off anyway,
+through the internal `Unfitted._unpruned`, so the mechanism is measured
+here rather than merely described. You will never call it: on an aligned
+stack the result is exactly singular, and where it is not it costs
+unknowns for an advantage that vanishes as the overlay refines.
 =#
 
 # ── Run 2b: the same stack with covered-mode pruning switched off ─────────────────
 
-V_unreduced = overlay(space(omega; cells=8, order=3, prune_covered=false), refined_region; cells=8)
+V_unreduced = Unfitted._unpruned(overlay(space(omega; cells=8, order=3), refined_region; cells=8))
 _, _, report_unreduced = solve_and_report(V_unreduced,
                                           "Run 2b — Run 2 with covered-mode pruning switched off";
-                                          parameters=(:prune_covered => false,))
+                                          parameters=(:pruning => "off",))
 
 println("Run 2  (reduction on) : ", report_overlay.active_unknowns, " unknowns, error ",
         report_overlay.l2_error)

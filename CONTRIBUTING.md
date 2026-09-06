@@ -380,7 +380,7 @@ Overlay levels are positioned independently of lower levels: overlay
 boundaries need not coincide with lower-level element boundaries, and
 overlays are never topologically merged with their parents. The package
 does, however, carry an *pruning* rule for redundancy: with
-`prune_covered = true` (the default on `space` and `overlay`), every
+leaf semantics, which are unconditional and have no keyword, every
 high-order mode whose entire incidence stencil is covered by a finer
 level is eliminated, leaving the linear skeleton. Elimination is
 per-mode, not per-cell: a mode is shed only when *every* cell it is
@@ -399,7 +399,7 @@ the one a covering level reproduces exactly — and eliminating it is not
 an accuracy trade but the thing that keeps a nested B-spline stack
 non-singular, since the two copies are linearly dependent. Any further
 family hits the generic fallback that returns an empty constraint list,
-while `prune_covered` still defaults to `true`, so on such a space the
+while leaf semantics still apply, so on such a space the
 default is on and does nothing. See `src/coverage.jl` and
 `_coverage_constraints` in `src/dofs.jl`;
 `diagnostics(...).reduced_mode_counts` reports the count per level,

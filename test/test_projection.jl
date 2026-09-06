@@ -274,13 +274,15 @@ end
 end
 
 @testset "Rewire backend with strict=false skips missing source dofs" begin
+    # Lax mode exists for source dofs the target does not carry. The honest way
+    # to produce those is a mask change on the SAME mesh: deactivating a cell
+    # removes its dofs while every surviving key still names the same function.
     omega = box((0.0,), (1.0,))
-    V_small = space(omega; cells=2, order=1)
-    V_smaller = space(omega; cells=1, order=1)
-
-    # Source has more cells than target — strict mode should throw, lax mode should drop.
-    source_model = prepare(poisson(V_small; source=0.0))
-    target_model = prepare(poisson(V_smaller; source=0.0))
+    V = space(omega; cells=4, order=1)
+    source_model = prepare(poisson(V; source=0.0))
+    target_model = prepare(poisson(space(omega; cells=4, order=1,
+                                         active=[c != CartesianIndex(2)
+                                                 for c in CartesianIndices((4,))]); source=0.0))
 
     src_coeffs = ones(Unfitted.active_unknowns(source_model.dofs))
     sol = Solution(src_coeffs, source_model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
@@ -288,6 +290,23 @@ end
     @test_throws ArgumentError transfer(sol, source_model, target_model; via=Rewire(; strict=true))
     rewired = transfer(sol, source_model, target_model; via=Rewire(; strict=false))
     @test rewired.diagnostics.method === :rewire
+end
+
+@testset "Rewire refuses a mesh or basis change in either strict mode" begin
+    # `Rewire` matches by dof key, and a key only names the same function while
+    # both sides index the same mesh with the same basis. A 2-cell source and a
+    # 1-cell target share the key for "level 1, cell 1, left node", but that is a
+    # hat on [0, ½] against a hat on [0, 1] — copying between them is the silent
+    # wrong answer the guard exists to stop, so `strict = false` must not "drop"
+    # its way past it either.
+    omega = box((0.0,), (1.0,))
+    src = prepare(poisson(space(omega; cells=2, order=1); source=0.0))
+    tgt = prepare(poisson(space(omega; cells=1, order=1); source=0.0))
+    sol = Solution(ones(Unfitted.active_unknowns(src.dofs)), src.version,
+                   Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    for strict in (true, false)
+        @test_throws ArgumentError transfer(sol, src, tgt; via=Rewire(; strict=strict))
+    end
 end
 
 @testset "L2 transfer onto an FCM (physical_domain) target is rejected" begin

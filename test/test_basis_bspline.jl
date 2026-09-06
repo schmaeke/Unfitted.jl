@@ -361,9 +361,11 @@ end
     # base cells 3…6 (the overlay box [0.25, 0.75] on 8 cells) that leaves
     # `{i : i − p ≥ 3, i ≤ 6}` — `4 − p` functions per axis, `(4 − p)^D` in D
     # dimensions. The dedup count below is that number, not an observation.
-    nested(ro, p) = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=p, basis=bspline(),
-                                  prune_covered=ro), box((0.25, 0.25), (0.75, 0.75)); cells=4,
-                            order=p)
+    function nested(ro, p)
+        V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=p, basis=bspline()),
+                    box((0.25, 0.25), (0.75, 0.75)); cells=4, order=p)
+        return ro ? V : Unfitted._unpruned(V)
+    end
     for p in 1:3
         m, l = _gram(nested(true, p))
         @test count(==(:dedup), l.elimination_source) == (4 - p)^2

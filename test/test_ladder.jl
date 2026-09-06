@@ -6,7 +6,7 @@
 # spans. Rank alone cannot see the failure: off the nested manifold the reduced
 # operator is still full rank at a healthy condition number, which is what makes
 # the failure silent in the first place. Every losslessness check below therefore
-# compares against a hand-built `prune_covered = false` twin of the same geometry,
+# compares against the same geometry with leaf semantics switched off,
 # and asserts `size(A_reduced, 1) == rank(A_unreduced)`.
 
 using BasicBSpline
@@ -23,21 +23,11 @@ function gram(V)
     return Matrix(m.matrix)
 end
 
-# The same geometry and activation with every elimination switched off — the
-# space the reduced one is supposed to span.
-function unreduced_twin(V::Space)
-    l1 = V.levels[1]
-    W = space(V.domain; cells=l1.mesh.cells, order=nominal_order(l1), basis=l1.basis, mode=l1.mode,
-              active=(l1.mask === nothing ? nothing : l1.mask.on), physical=V.physical,
-              prune_covered=false)
-    for k in 2:length(V.levels)
-        l = V.levels[k]
-        W = overlay(W, l.mesh.domain; cells=l.mesh.cells, order=nominal_order(l), basis=l.basis,
-                    mode=l.mode, active=(l.mask === nothing ? nothing : l.mask.on),
-                    prune_covered=false)
-    end
-    return W
-end
+# The same space with leaf semantics switched off — what the reduced one is
+# supposed to span. Not reachable from the public API, and deliberately so: a
+# covered cell that keeps its modes is never what a caller wants. It exists to be
+# the reference this file measures against.
+unreduced_twin(V::Space) = Unfitted._unpruned(V)
 
 # `true` iff reduction removed redundancy and nothing else.
 lossless(V) = size(gram(V), 1) == rank(gram(unreduced_twin(V)))
@@ -115,7 +105,7 @@ end
     @test diagnostics(prepare(mass(equal_order))).reduced_mode_counts[1] > 0
     # At equal order the cover does reproduce what it displaces, so the reduction
     # is lossless. At lower order it is not, and that is the documented trade —
-    # `prune_covered = false` is how a caller declines it.
+    # `Unfitted._unpruned` is how this file switches it off.
     @test lossless(equal_order)
 end
 

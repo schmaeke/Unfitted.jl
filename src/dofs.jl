@@ -760,17 +760,36 @@ end
 # choice is downstream of all its references — when a later constraint
 # pivots a raw that an earlier pivot's expansion still mentions, the
 # earlier expansion needs the substitution to stay in "free raws only"
-# form. Cascade depth is bounded by the spatial dimension `D` for our
-# overlay-boundary constraints, so the total back-substitution work is
-# `O(K · D · p)` across all constraints — negligible at problem scale.
+# form.
+#
+# `mentions` maps a raw to the pivots whose expansion currently contains it,
+# so this visits only the expansions that can possibly need rewriting. It
+# used to scan all `nraw` expansions per constraint, which made the pass
+# `O(K · nraw)` — quadratic in the problem — while the comment here claimed
+# `O(K · D · p)`, "negligible at problem scale". It was not negligible: on a
+# covered stack the dof layout reached 98.7% of `prepare` and 2.8× the cost
+# of `assemble!`, growing ×12.7 and ×14.8 per ×4 in unknowns. The scan's
+# answer was almost always "nothing to do", because every integrated
+# Legendre elimination is a single-raw strong constraint whose pivot
+# expansion is empty and which therefore mentions no raw at all.
+#
+# The index is allowed to over-report: an expansion rewritten by an earlier
+# substitution may no longer contain the raw that registered it, so the
+# membership test below stays. It must never under-report, which is why an
+# entry is added at *every* site that writes an expansion — here and in
+# `_resolve_constraints!` step 4. The identity expansions set up before the
+# loop need no entry: a raw is skipped until it is pivoted, and pivoting
+# overwrites its expansion.
 function _back_substitute!(raw_expansion::Vector{Vector{Tuple{Int,T}}}, pivot_raw::Int,
-                           pivot_expansion::Vector{Tuple{Int,T}},
-                           pivoted::AbstractVector{Bool}) where {T}
-    @inbounds for raw in eachindex(raw_expansion)
+                           pivot_expansion::Vector{Tuple{Int,T}}, pivoted::AbstractVector{Bool},
+                           mentions::Dict{Int,Vector{Int}}) where {T}
+    holders = get(mentions, pivot_raw, nothing)
+    holders === nothing && return raw_expansion
+    @inbounds for raw in holders
         raw == pivot_raw && continue
         pivoted[raw] || continue
         expansion = raw_expansion[raw]
-        # Quick check: does this expansion mention the new pivot?
+        # The index over-reports; this is the exact test.
         any(t -> first(t) == pivot_raw, expansion) || continue
         # Rebuild with substitution.
         new_terms = Tuple{Int,T}[]
@@ -784,9 +803,23 @@ function _back_substitute!(raw_expansion::Vector{Vector{Tuple{Int,T}}}, pivot_ra
                 push!(new_terms, (other, w))
             end
         end
-        raw_expansion[raw] = _combine_terms(new_terms)
+        combined = _combine_terms(new_terms)
+        raw_expansion[raw] = combined
+        # This expansion now mentions the pivot's own references. `pivot_raw`
+        # cannot be among them — `pivot_expansion` was built excluding it — so
+        # the list being iterated is never the one appended to.
+        _register_mentions!(mentions, raw, combined)
     end
     return raw_expansion
+end
+
+# Record that `raw`'s expansion contains each of `terms`' raws.
+function _register_mentions!(mentions::Dict{Int,Vector{Int}}, raw::Int,
+                             terms::Vector{Tuple{Int,T}}) where {T}
+    for (other, _) in terms
+        push!(get!(() -> Int[], mentions, other), raw)
+    end
+    return mentions
 end
 
 """
@@ -833,6 +866,10 @@ function _resolve_constraints!(raw_expansion::Vector{Vector{Tuple{Int,T}}},
         raw_expansion[raw] = [(raw, one(T))]
     end
     pivoted = falses(nraw)
+    # raw -> the pivots whose expansion mentions it. Empty for every
+    # single-raw strong elimination, which is all of them for integrated
+    # Legendre, so this costs nothing on the common path.
+    mentions = Dict{Int,Vector{Int}}()
 
     for constraint in constraints
         # 1) Substitute already-pivoted raws.
@@ -858,9 +895,10 @@ function _resolve_constraints!(raw_expansion::Vector{Vector{Tuple{Int,T}}},
 
         raw_expansion[pivot_raw] = new_expansion
         pivoted[pivot_raw] = true
+        _register_mentions!(mentions, pivot_raw, new_expansion)
 
         # 5) Back-substitute into earlier pivots that mention this raw.
-        _back_substitute!(raw_expansion, pivot_raw, new_expansion, pivoted)
+        _back_substitute!(raw_expansion, pivot_raw, new_expansion, pivoted, mentions)
     end
     return raw_expansion
 end

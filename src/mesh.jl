@@ -469,13 +469,6 @@ optional activation mask. Fields:
   - `modes::CellModes{D}` — the multi-index sets those orders actually
     generate, after the minimum rule. **Derived**, never supplied: see
     [`CellModes`](@ref) for why that is the point rather than a detail.
-  - `orders::Union{Nothing,CellOrders{D}}` — optional per-cell polynomial
-    order. `nothing` means the level is uniform at `order` and is the
-    type-stable no-per-cell-order hot path; the `Union` is small so the
-    `Level` type — and with it the `Space` type, and with it the compiled
-    assembly pipeline — is unchanged by an order edit. See
-    [`CellOrders`](@ref), [`cell_order`](@ref) and
-    [`cell_basis_indices`](@ref).
   - `mode::Symbol` — basis index-set mode: `:tensor` (full tensor
     product) or `:trunk` (the Szabó–Babuška trunk space, filtered by
     trunk degree).
@@ -484,7 +477,8 @@ optional activation mask. Fields:
     no-mask hot path; the `Union` is small so the `Level` type stays
     stable across `activate!` / `deactivate!` transitions between the
     masked and unmasked states.
-  - `prune_covered::Bool` — when `true`, this level sheds every high-order
+  - `prune_covered::Bool` — internal. Always `true` from the public API;
+    see leaf semantics under [`space`](@ref). When `true`, this level sheds every high-order
     mode all of whose incident cells a finer level covers (order
     reduction), and additionally sheds a buried *linear* mode that a
     nested finer level reproduces exactly (dedup). Integrated Legendre
@@ -722,7 +716,7 @@ end
 """
     space(domain::AxisBox; cells, order=1, basis=IntegratedLegendre(),
                           mode=:tensor, active=nothing, physical=nothing,
-                          prune_covered=true)
+                          )
 
 Build the base discretization of a [`Space`](@ref) over `domain`. The
 resulting space has one base level (`role = :base`, `id = 1`); add overlay
@@ -782,35 +776,45 @@ Keyword arguments:
     call raises `ArgumentError` for a family that declares
     `_supports_physical_domain` false. Both shipped families declare it
     true.
-  - `prune_covered` — when `true` (the default), a level sheds a mode
-    wherever a *single* finer level has taken over the region that mode
-    lives on. On an integrated Legendre level there are two eliminations,
-    both per-mode rather than per-cell, and both asking first that the
-    mode be *buried* — every cell it is incident to covered by one finer
-    level. They have different characters, and the difference matters:
+  **Leaf semantics.** A cell carries basis functions only where it is a
+  *leaf* — where no finer level has taken the region over. A covered cell
+  is the parent of a leaf, and a parent carries no unknowns where its
+  children do. This is not an option and there is nothing to configure:
+  it is what makes superposition equivalent to ordinary refinement, in
+  which h-refining a cell *replaces* it rather than adding to it.
+
+  Concretely a level sheds a mode wherever a *single* finer level has
+  taken over the region that mode lives on. On an integrated Legendre
+  level there are two eliminations, both per-mode rather than per-cell,
+  and both asking first that the mode be *buried* — every cell it is
+  incident to covered by one finer level:
 
       * a buried **high-order** mode (one with at least one bubble axis)
-        is dropped outright, so a fully covered cell keeps only its linear
-        skeleton — an edge or face mode straddling the boundary of the
+        is dropped, so a fully covered cell keeps only its linear
+        skeleton. An edge or face mode straddling the boundary of the
         covered region survives, because its own stencil is not buried.
-        This half is a **trade, not a redundancy claim**: the covering
-        level is not required to reproduce what it displaces. Over a
-        region a finer level resolves, a coarse cell's high-order modes
-        buy little in L² and carry the oscillation, so a high-order base
-        under a low-order fine overlay is exactly the configuration it
-        serves — measured on a tanh layer, shedding cut far-field
-        oscillation from 9.37e-3 to 9.95e-4 and overshoot to 7.03e-4.
-        Pass `prune_covered = false` to decline the trade;
-      * a buried **linear** mode is dropped only when one finer level
+      * a buried **linear** mode is dropped when one finer level
         reproduces it exactly, which takes both halves of a test: that
         level's mesh must refine this one's (`_nested_over` in
         `src/coverage.jl`) *and* its basis must be integrated Legendre.
         A buried vertex function is a C⁰ hat, and a basis smoother than
         C⁰ across its own cell boundaries — a B-spline of degree ≥ 2 —
-        carries nothing that reproduces the kink. This half is *not* a
-        trade: a mode a covering level reproduces exactly is linearly
-        dependent on that level's own modes, so leaving both active makes
-        the superposed operator singular.
+        carries nothing that reproduces the kink.
+
+  Leaving a covered mode active makes the superposed operator singular,
+  because it and the covering level's reproduction of it are linearly
+  dependent: 169 to 1378 null directions were measured on nested ladders
+  with the rule switched off.
+
+  The high-order half does not require the covering level to reproduce
+  what it displaces, and that is deliberate rather than an oversight. It
+  is what lets a low-order cover sit under a high-order base and behave
+  the way small low-order elements behave near a singularity in any hp
+  code: the covered region is then resolved at the cover's order, which
+  is what asking for a low-order cover *means*. Once the cover carries at
+  least the base's order the elimination is exactly lossless — measured,
+  the reduced and unreduced errors agree to every printed digit from
+  cover order 4 upward under a p=5 base.
 
     A B-spline level has no bubble/skeleton split and so has only the
     second elimination: a buried function is dropped exactly when a nested
@@ -823,8 +827,7 @@ Keyword arguments:
     `diagnostics(...).reduced_mode_counts` reports the per-level count.
 """
 function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(),
-               mode::Symbol=:tensor, active=nothing, physical=nothing,
-               prune_covered::Bool=true) where {D,T}
+               mode::Symbol=:tensor, active=nothing, physical=nothing) where {D,T}
     base_mesh = CartesianMesh(domain; cells)
     field = _normalize_order(order, base_mesh)
     orders = _nominal_order(field)
@@ -834,7 +837,7 @@ function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(),
     _check_physical_basis(family, physical)
     cell_orders = _build_cell_orders(family, field, base_mesh, mode)
     base_level = Level{D,T,typeof(family)}(1, :base, base_mesh, family, cell_orders, mode, mask,
-                                           prune_covered)
+                                           true)
     return Space{D,T,Tuple{typeof(base_level)}}(domain, (base_level,), physical)
 end
 
@@ -843,7 +846,7 @@ end
                                        basis=V.levels[1].basis,
                                        mode=V.levels[1].mode,
                                        tolerance=GeometryTolerance(T),
-                                       active=nothing, prune_covered=true) -> Space
+                                       active=nothing) -> Space
 
 Add an overlay level on the sub-box `domain` to an existing [`Space`](@ref)
 `V`, returning the extended space. The overlay's domain must lie inside
@@ -861,10 +864,9 @@ and possibly `order`. Keyword arguments:
   - `tolerance` — slack on the inside-domain check.
   - `active` — optional per-cell mask, same shapes as [`space`](@ref)'s
     `active`.
-  - `prune_covered` — when `true` (the default), this overlay sheds its
-    buried high-order modes, and its buried modes wherever a still-finer
-    nested overlay reproduces them exactly. The rule and its
-    basis-family dependence are spelled out under [`space`](@ref).
+  Leaf semantics apply to this overlay exactly as to any level: where it
+  is itself covered by something finer it carries no unknowns, and where
+  it covers the level below, that level carries none. See [`space`](@ref).
 
 The new level's `id` is `length(V.levels) + 1`. Overlay placement is
 independent of any existing overlay: overlay boundaries need not coincide
@@ -875,8 +877,7 @@ section).
 """
 function overlay(V::Space{D,T}, domain::AxisBox{D,T}; cells, order=nominal_order(V.levels[1]),
                  basis=V.levels[1].basis, mode::Symbol=V.levels[1].mode,
-                 tolerance=GeometryTolerance(T), active=nothing,
-                 prune_covered::Bool=true) where {D,T}
+                 tolerance=GeometryTolerance(T), active=nothing) where {D,T}
     is_inside(domain, V.domain, tolerance) ||
         throw(ArgumentError("overlay domain must lie inside the physical domain"))
     overlay_mesh = CartesianMesh(domain; cells)
@@ -889,8 +890,29 @@ function overlay(V::Space{D,T}, domain::AxisBox{D,T}; cells, order=nominal_order
     _check_physical_basis(family, V.physical)
     cell_orders = _build_cell_orders(family, field, overlay_mesh, mode)
     level = Level{D,T,typeof(family)}(id, :overlay, overlay_mesh, family, cell_orders, mode, mask,
-                                      prune_covered)
+                                      true)
     levels = (V.levels..., level)
+    return Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
+end
+
+# Rebuild `V` with leaf semantics DISABLED on every level, so a covered cell keeps
+# the modes it would otherwise shed. Internal, and deliberately not reachable from
+# the public API: the resulting space is never what a caller wants. On a stack
+# whose covers are aligned it is exactly singular — the coarse modes and the fine
+# level's reproductions of them are linearly dependent, and 169 to 1378 null
+# directions were measured on nested ladders — and where it is not singular it
+# costs 11–25% more unknowns for an advantage that decays to 1.02× as the cover
+# refines.
+#
+# It exists for one reason: it is the reference the losslessness assertion is made
+# against. `size(gram(V), 1) == rank(gram(_unpruned(V)))` says the elimination
+# removed redundancy and nothing else, and that assertion is the only instrument
+# that can see a wrong elimination — the reduced operator stays full rank at a
+# healthy condition number either way.
+function _unpruned(V::Space{D,T}) where {D,T}
+    levels = map(V.levels) do l
+        Level{D,T,typeof(l.basis)}(l.id, l.role, l.mesh, l.basis, l.orders, l.mode, l.mask, false)
+    end
     return Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
 end
 

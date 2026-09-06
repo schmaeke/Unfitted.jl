@@ -80,10 +80,10 @@ export AxisBox, GeometryTolerance, PhysicalDomain, physical_domain, classify_cel
        foreach_quadrature_point, foreach_interface_quadrature_point, interface_quadrature_count,
        nquadpoints, solve!, solution, move!, moved, moved_space, activate!, deactivate!,
        active_cells, cell_orders, elevate, elevated, cell_order, nominal_order, ladder, adapt,
-       adapted, depth_masks, is_nested, overlapping_cells, transfer, L2Projection, Rewire,
-       QuadField, RBFP0, write_vtk, write_quadrature_vtm, l2_error, boundary_integral, value,
-       field_gradient, diagnostics, active_unknowns, cell_indices, cell_box, center, value_vec,
-       gradient_tensor, symmetric_gradient
+       adapted, depth_masks, is_nested, overlapping_cells, transfer, L2Projection, Rewire, estimate,
+       refine, QuadField, RBFP0, write_vtk, write_quadrature_vtm, l2_error, boundary_integral,
+       value, field_gradient, diagnostics, active_unknowns, cell_indices, cell_box, center,
+       value_vec, gradient_tensor, symmetric_gradient
 
 # ── Extension stubs ───────────────────────────────────────────────────────────
 #
@@ -150,6 +150,7 @@ include("model.jl")
 include("assembly.jl")
 include("solvers.jl")
 include("projection.jl")
+include("adaptivity.jl")
 include("data.jl")
 include("postprocessing.jl")
 include("api.jl")
