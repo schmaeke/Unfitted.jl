@@ -182,7 +182,7 @@ example:
 |---|---|---|
 | `tutorials/` | Teach the API | Numbered, read in order, each building on the last. A header block states what the reader will learn and what they should already know; the comments teach rather than annotate; the dimension is never hardcoded unless the example is deliberately 1-D. Aim at roughly 60 SLOC of code — comment volume is unrestricted, and generosity is expected. |
 | `applications/` | Show the package on a recognisable problem | A problem a reader would know from a textbook or from practice, solved plainly, with no cleverness that obscures the API. This is also where the package is shown working alongside third-party Julia packages (`Tensors.jl`, `FileIO`/`MeshIO`, `OrdinaryDiffEq.jl`). |
-| `reproductions/` | Hold the scientific record | The method paper's benchmarks at their published configurations, plus the FCM reproductions. These are pinned by the example smoke suite and are not to be coarsened for speed. |
+| `reproductions/` | Hold the scientific record | Benchmarks whose problem, protocol and headline number are fixed and must not move: the method paper's benchmarks at their published configurations, the FCM moment-fit reproductions, and the package's own benchmarks scored against an external reference (`adaptive_tanh_layer_2d` against deal.II 9.5.1's step-27 on a fixed lattice). These are pinned by the example smoke suite and are not to be coarsened for speed. The one standing exception is `traveling_laser_2d`, which runs a fifth of its revolution in the default suite because the published configuration takes thirteen minutes against roughly one and a half for the whole examples testset; its case comment records the full-study numbers and what the shortened run gives up. |
 
 Each example lives in its own sub-directory
 `examples/<tier>/<name>/` with a `<name>.jl` driver and a
@@ -1233,7 +1233,7 @@ demos.
     moving heat-source smoke or reduced regression test. The last three
     are `reproductions/singular_square_2d`,
     `reproductions/conditioning_small_overlap` and
-    `reproductions/traveling_heat_source_2d`, all pinned by the example
+    `reproductions/traveling_laser_2d`, all pinned by the example
     smoke suite. **Requirement not yet met:** the one-dimensional slot
     is vacant. It used to be `bar_1d_unresolved_interface`, an elastic
     bar whose material interface fell inside a cell; that example was
@@ -1301,8 +1301,8 @@ demos.
     **Requirement not yet met:** no example teaches the feature. `elevate`
     and `elevated` occur nowhere under `examples/`, no example passes an
     array or a predicate to `space(...; order=)`, and the tutorial sequence
-    goes from the ladder straight to the automated loop, which spends the
-    order without ever showing the manual verb it is built on. A reader who
+    goes from `05_ladders` to `06_adaptive_hp`, which drives the automated
+    loop without ever showing the manual verb it is built on. A reader who
     wants a graded space has this guide and the tests and no runnable
     demonstration.
   - Nested refinement ladders: `ladder` nests by construction; losslessness

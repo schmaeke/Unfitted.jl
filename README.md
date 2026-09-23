@@ -99,7 +99,9 @@ The method is described in
   every level nests over every level below it by construction.
   `adapt(V, level => mask, …)` or `adapt(V, depths; grade)` switches
   cells on per level in one rebuild, `adapted(model, V)` prepares the
-  result, and `is_nested` / `overlapping_cells` query the stack.
+  result, and `is_nested` / `overlapping_cells` query the stack. Worked
+  through in
+  [`examples/tutorials/05_ladders/`](examples/tutorials/05_ladders).
 - **Automated hp adaptivity**: `estimate(model, u)` is a Bank–Weiser
   indicator carrying a scale-free stopping quantity; `refine(V, est;
   theta, previous)` marks by Dörfler and, given
@@ -107,6 +109,10 @@ The method is described in
   by Melenk–Wohlmuth predicted error reduction — omit `previous` and
   every marked cell takes p, falling back to h only where p is
   unavailable; `coarsen` reverses both steps.
+  [`examples/tutorials/06_adaptive_hp/`](examples/tutorials/06_adaptive_hp)
+  introduces the loop, and
+  [`examples/reproductions/adaptive_tanh_layer_2d/`](examples/reproductions/adaptive_tanh_layer_2d)
+  is the measured protocol that threads `previous`.
 - **D-generic core**: 1D, 2D, 3D, and 4D smoke-tested.
 
 ## Installation
@@ -185,7 +191,8 @@ questions. **Tutorials** teach the API and are meant to be read in order.
 **Applications** are recognisable engineering problems solved plainly, and are
 where the package is shown working alongside third-party Julia packages.
 **Reproductions** are the scientific record — the benchmarks behind the method
-paper, at their published configurations.
+paper at their published configurations, the FCM moment-fit reproductions, and
+the adaptivity benchmark scored against deal.II's step-27.
 
 Each example lives in its own sub-directory with a self-contained
 `Project.toml` (Unfitted is wired in via `[sources]`), so example-specific
@@ -209,6 +216,8 @@ a few minutes the first time.
 | `tutorials/02_overlays/` | Local refinement by superposition: adding an overlay, masking it to a patch, `activate!`/`deactivate!`, and reading `reduced_mode_counts` |
 | `tutorials/03_immersed_fcm/` | Geometry the mesh knows nothing about: a CSG level set, cut-cell moment-fit quadrature, and a Nitsche condition on an immersed boundary |
 | `tutorials/04_bspline/` | Swapping the basis family to B-splines, why a nested B-spline stack needs deduplication, and B-splines on an immersed domain |
+| `tutorials/05_ladders/` | Why a finer overlay can be less accurate, declaring a nested stack with `ladder`, and switching its cells on per level with `adapt` |
+| `tutorials/06_adaptive_hp/` | Handing the refinement decision to the solver: `estimate`, `refine`, and how the loop picks h against p from a cell's own refinement history |
 
 ### Applications — the package on real problems
 
@@ -227,7 +236,8 @@ a few minutes the first time.
 | `reproductions/laplace_unit_square_smooth/` | Smooth Laplace verification on the unit square |
 | `reproductions/singular_square_2d/` | 2D corner-singularity convergence with nested overlays |
 | `reproductions/conditioning_small_overlap/` | Small-overlap conditioning sweep, one CSV row per (order, overlap) |
-| `reproductions/traveling_heat_source_2d/` | Transient heat with hierarchical adaptive overlays and L² state transfer between mesh updates |
+| `reproductions/traveling_laser_2d/` | Moving Gaussian laser: automated hp adaptivity on a transient, against an exact convolution reference |
+| `reproductions/adaptive_tanh_layer_2d/` | Automated hp on a curved interior layer, scored on a fixed background lattice against deal.II step-27 |
 
 ## Documentation
 

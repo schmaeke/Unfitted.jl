@@ -3,7 +3,7 @@ using LinearAlgebra
 using Unfitted
 
 # Reduced version of
-# examples/reproductions/traveling_heat_source_2d/traveling_heat_source_2d.jl.
+# the traveling heat-source study this benchmark was derived from.
 # Covers the per-step
 # hot ops of a theta-step (mass + stiffness reassembly, compactly supported
 # load) and one variational transfer between two overlay configurations,
@@ -50,7 +50,7 @@ let
     src_solution = solution(model_src, src_coeffs; method=:synthetic)
 
     # Cached target operators — mirror
-    # examples/reproductions/traveling_heat_source_2d/traveling_heat_source_2d.jl:422.
+    # the traveling heat-source study this benchmark was derived from.
     # The cached path threads the precomputed mass + factor in through the
     # `L2Projection(matrix; factor)` backend so the transfer skips both the
     # target-side mass assembly and its factorisation. The uncached bench
