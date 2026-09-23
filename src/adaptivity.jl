@@ -10,10 +10,10 @@
 # on; each marked cell is then sent to h or to p by whether its LAST refinement
 # delivered the error reduction that step was entitled to expect. A cell that met
 # its prediction is behaving smoothly and takes p again; one that fell short is
-# not, and takes h. The predictions are Melenk & Wohlmuth's (Adv. Comput. Math.
-# 15, 2001) — see the note above `_partition`.
+# not, and takes h. The predictions are Melenk & Wohlmuth's (2001, see
+# References) — see the note above `_partition`.
 #
-# WHY NOT A SMOOTHNESS INDICATOR. Mitchell & McClain (ACM TOMS 41(1), 2014)
+# WHY NOT A SMOOTHNESS INDICATOR. Mitchell & McClain (2014, see References)
 # compared thirteen hp strategies over twenty problems and rate Legendre
 # coefficient decay the best general-purpose choice — "COEFDECAY appears to be
 # the best choice as a general strategy across all categories of problems". It
@@ -25,20 +25,25 @@
 #
 # The reason is structural rather than a bug, and it is worth recording so nobody
 # reimplements it. σ > 1 is an asymptotic statement about the tail of an
-# expansion, and Mavriplis derived it for spectral elements at p ≈ 8–16. A cell
-# at order 1–3 has two to four bands, and the slope through them measures the
-# ratio of the linear coefficient to the cell mean — a fact about the local
-# amplitude of the solution, not about its analyticity. This loop starts every
-# cell at order 1 and keeps most of them low, so the indicator is read exactly
-# where it has nothing to say: measured on the SMOOTH λ = 5 tanh front, where
-# almost every cell should take p, only 45% of leaves cleared σ > 1, the median σ
-# was 0.87 and the lower quartile 0. Prediction has no such floor. It works from
-# the first refinement at any order, because it asks what the last step actually
-# bought rather than what the coefficients look like.
+# expansion, and Mavriplis (1994, see References) derived it for spectral
+# elements at p ≈ 8–16. A cell at order 1–3 has two to four bands, and the slope
+# through them measures the ratio of the linear coefficient to the cell mean — a
+# fact about the local amplitude of the solution, not about its analyticity. This
+# loop starts every cell at order 1 and keeps most of them low, so the indicator
+# is read exactly where it has nothing to say: measured on the SMOOTH λ = 5 tanh
+# front, where almost every cell should take p, only 45% of leaves cleared σ > 1,
+# the median σ was 0.87 and the lower quartile 0. Prediction has no such floor.
+# It works from the first refinement at any order, because it asks what the last
+# step actually bought rather than what the coefficients look like.
 #
-# WHAT IT IS WORTH, against deal.II's step-27 on the same tanh front, at matched
-# unknowns and on the same mesh-independent lattice measure, over three regimes
-# of the layer steepness λ:
+# WHAT IT IS WORTH, against step-27 of deal.II 9.5 (Arndt et al. 2023, see
+# References) on the same tanh front, at matched unknowns and on the same
+# mesh-independent lattice measure, over three regimes of the layer steepness λ.
+# step-27 is the right comparison precisely because it is the other family: its
+# h/p decision is a Fourier-coefficient-decay smoothness estimate
+# (`SmoothnessEstimator::Fourier::coefficient_decay` feeding
+# `hp::Refinement::choose_p_over_h`), so these rows measure prediction against a
+# smoothness indicator on the same problem and the same marking.
 #
 #              this rule        step-27        no decision (p until pmax)
 #     λ =   5   3.2e-07         6e-07           8.7e-09
@@ -58,16 +63,64 @@
 # is not. It is tempting to fold them together — let the ladder carry an
 # increasing order schedule, so deepening the stack over a cell is simultaneously
 # an h-step and a p-step, and the whole application collapses to incrementing one
-# integer. Measured, that costs a consistent ~1.5×: on the two-feature fixture at
-# matched error, coupled reaches 11.63× against uniform where independent reaches
-# 17.22×. The reason is that coupling cannot express *pure* p — reaching order 7
-# needs four levels of depth, dragging 16× finer cells along with it. It is the
-# same failure the inert p-step produced: an order schedule welded to depth
-# cannot put a high degree on a large cell. Keeping the steps apart is what lets
-# the rule above spend p first and h only when p has run out.
+# integer. Measured, that costs a consistent ~1.5×: on a two-feature problem —
+# u = |x − (0.3, 0.3)|^1.5 plus a Gaussian bump of width 0.08 at (0.7, 0.7) on
+# the unit square, against uniform order 4 — coupling reaches a relative energy
+# error of 2.6e-4 at 5239 unknowns, an 11.63× saving, where the independent
+# increments reach it at 3521, a 17.22× saving. Both figures are one point of a
+# curve and only comparable at a stated error: the same independent loop reads
+# 4.41× at 1e-3. The reason for the gap is that coupling cannot express *pure* p
+# — reaching order 7 needs four levels of depth, dragging 16× finer cells along
+# with it. It is the same failure the inert p-step produced: an order schedule
+# welded to depth cannot put a high degree on a large cell. Keeping the steps
+# apart is what lets the rule above spend p first and h only when p has run out.
+#
+# ── References ────────────────────────────────────────────────────────────────
+#
+# The four published algorithms this file implements, and the reference
+# implementation its numbers are measured against.
+#
+#   R. E. Bank, A. Weiser, "Some a posteriori error estimators for elliptic
+#     partial differential equations", Math. Comp. 44 (1985) 283–301,
+#     doi:10.1090/S0025-5718-1985-0777265-X.
+#     The error indicator: the residual of the computed solution read in an
+#     enriched space, taken through the diagonal of the enriched operator.
+#     `estimate` computes it.
+#
+#   W. Dörfler, "A convergent adaptive algorithm for Poisson's equation", SIAM
+#     J. Numer. Anal. 33 (1996) 1106–1124, doi:10.1137/0733054.
+#     The bulk-chasing marking rule — the smallest set of cells carrying a
+#     fixed fraction θ of the total squared indicator. `_dorfler` implements it.
+#
+#   J. M. Melenk, B. I. Wohlmuth, "On residual-based a posteriori error
+#     estimation in hp-FEM", Adv. Comput. Math. 15 (2001) 311–331,
+#     doi:10.1023/A:1014268310921.
+#     The predicted error reduction that decides h against p, and the constants
+#     γ_p² = 0.4, γ_h² = 4, γ_n² = 1. The note above `_partition` states the
+#     prediction in this package's form.
+#
+#   W. F. Mitchell, M. A. McClain, "A comparison of hp-adaptive strategies for
+#     elliptic partial differential equations", ACM Trans. Math. Softw. 41
+#     (2014) 1, 1–39, doi:10.1145/2629459.
+#     The thirteen-strategy comparison quoted under WHY NOT A SMOOTHNESS
+#     INDICATOR.
+#
+#   C. Mavriplis, "Adaptive mesh strategies for the spectral element method",
+#     Comput. Methods Appl. Mech. Engrg. 116 (1994) 77–86,
+#     doi:10.1016/S0045-7825(94)80010-3.
+#     The σ > 1 coefficient-decay criterion measured and rejected above.
+#
+#   D. Arndt, W. Bangerth, M. Bergbauer, M. Feder, M. Fehling, J. Heinz,
+#     T. Heister, L. Heltai, M. Kronbichler, M. Maier, P. Munch, J.-P. Pelteret,
+#     B. Turcksin, D. Wells, S. Zampini, "The deal.II library, version 9.5",
+#     J. Numer. Math. 31 (2023) 231–246, doi:10.1515/jnma-2023-0089.
+#     Tutorial step-27 is the comparison target above.
+#     `hp::Refinement::predict_error` (`include/deal.II/hp/refinement.h`) is the
+#     form of Melenk & Wohlmuth's prediction this file follows, and ships their
+#     constants unsquared as γ_p = √0.4, γ_h = 2, γ_n = 1.
 
 """
-    ErrorEstimate{T,D}
+    ErrorEstimate{D,T}
 
 What [`estimate`](@ref) returns: a Bank–Weiser error indicator per cell, with the
 scalars a stopping test needs.
@@ -75,21 +128,50 @@ scalars a stopping test needs.
   - `cells::Vector{Array{T,D}}` — `cells[k][c]` is `η_K` for cell `c` of level
     `k`, and zero on cells that carry no approximation there.
   - `total::T` — `√Σ_K η²_K`, the global indicator.
-  - `reference::T` — `√a(u_h, u_h)` in the problem's own bilinear form, so
-    `total / reference` is a scale-free quantity a tolerance can be compared
-    against. The problem supplies the norm, so this stays meaningful when the
-    operator is not the Laplacian.
-  - `consistency::T` — `‖R|_V‖ / ‖R|_W‖`. Galerkin orthogonality makes the
-    numerator zero in exact arithmetic, so a value that stops being small says
-    the enrichment is no longer the dominant missing content and the indicator
-    has entered the regime where it under-reads. It is free — the residual is
-    already computed — and it is the only reliability signal available without
-    an exact solution.
+  - `reference::T` — `√(cᵀ A c)` over the *active* unknowns, in the problem's own
+    bilinear form: the energy of the part of `u_h` the unknowns determine. Under
+    homogeneous Dirichlet data that is `√a(u_h, u_h)`; with nonzero data it is
+    not, because the constrained columns are folded into the right-hand side and
+    the lift's own energy is never formed, so what is measured is the interior
+    part of the solution and the quantity is not invariant under adding a
+    constant to the Dirichlet data. Measured on an 8² order-2 Poisson problem
+    with `u = sin πx sin πy`: adding `C` to the boundary data leaves `total` and
+    the discrete energy error bit-identical at 1.8257e-2 while `reference` runs
+    2.2214, 6.8407 and 53.137 at `C` = 0, 1 and 10, moving `total / reference` by
+    24× with nothing about the approximation changed. It is still scale-free and
+    still what a tolerance should be compared against on one problem; it is not a
+    quantity to compare across different boundary data. The problem supplies the
+    norm, so this stays meaningful when the operator is not the Laplacian. A
+    `reference` of exactly zero means the discrete energy came out below
+    round-off, and `show` prints the ratio as `NaN` rather than dividing.
+  - `consistency::T` — `‖R|_V‖ / ‖R|_W‖`, the residual the injected solution
+    leaves on `V`'s own dofs against what it leaves on the enrichment. It is NOT
+    a saturation check. `V`'s functions and integration regions are identical
+    inside `V⁺`, so the numerator can only differ from the converged residual
+    through what the order change moved: the quadrature the load and the
+    coefficients are integrated with, the Dirichlet trace projected at order
+    `q + 1` instead of `q`, and the solver residual. It is therefore a free
+    data-oscillation and solve check, and it says nothing about whether `W`
+    captures the missing content: a solution whose error happens to be
+    orthogonal to the enrichment gives a small `consistency` and a small `η` at
+    once. Measured on a 4² order-2 space, changing nothing but the data — the
+    non-polynomial `sin πx sin πy` replaced by `x² + y²`, which both rules
+    integrate exactly and whose trace `V` reproduces — drops it from 7.1e-4 to
+    5.2e-7. A value that climbs means the data is under-integrated where `η` is
+    smallest.
+
+    For an actual saturation signal there is one the loop already has, under two
+    conditions: on a refine-only sequence with homogeneous Dirichlet data,
+    Galerkin orthogonality makes `est_new.reference² − est_prev.reference²` the
+    true reduction in squared energy error, so a previous `total²` well below
+    that gain says the previous estimate under-read. Both conditions are load
+    bearing — a [`coarsen`](@ref) breaks the nesting, and a nonzero lift breaks
+    the identification of `reference` with `√a(u_h, u_h)` above.
 
 Read the fields; you never construct one. Same posture as
 [`AssemblyDiagnostics`](@ref).
 """
-struct ErrorEstimate{T,D}
+struct ErrorEstimate{D,T}
     cells::Vector{Array{T,D}}
     total::T
     reference::T
@@ -173,23 +255,34 @@ function _has_h_step(V::Space{D}, k::Integer, cell::CartesianIndex{D},
     return false
 end
 
-# `V` with every cell's order raised by `inc`. A level whose order is uniform is
-# raised uniformly rather than through a per-cell field: it keeps the palette at
-# one entry (so the enriched level pays nothing for machinery it does not use),
-# and it is the only form a B-spline level accepts, since a per-cell degree has
-# no meaning for a whole-axis knot vector.
+# The cells of one level that carry an approximation. `cell_dofs` answers with an
+# empty vector on a dormant cell, so restricting the estimator's two sweeps to
+# these changes no result — only how much of a level has to be walked to find
+# that out. That is the point on a ladder, where a level holds N^D cells however
+# few are switched on: a depth-5 3D chain over a 4³ base declares 2 097 152 of
+# them on its finest level. The mask scan is one pass over a `BitArray`, cheap
+# against the per-cell dof lookup and the vector it allocates per component.
+function _live_cells(level::Level)
+    level.mask === nothing ? cell_indices(level.mesh) :
+    CartesianIndices(level.mask.on)[level.mask.on]
+end
+
+# `V` with every cell's order raised by `inc`. A uniform level is raised as a
+# tuple rather than through a per-cell field, and the reason is cost rather than
+# meaning: `_normalize_order` collapses an all-equal field back to exactly this
+# tuple, so the per-cell path arrives at the same level having materialised three
+# N^D arrays on the way (the field `cell_orders` builds, the raised copy, and the
+# palette scan that collapses it). Measured on a uniform 512² level, 7.9 ms and
+# 13.0 MiB against 1.3 ms and 1.0 MiB for the tuple, for an identical result.
+#
+# The generator's element type is `Pair{Int,Union{NTuple{D,Int},Array{...,D}}}`,
+# which is what `elevate(V, pairs::Pair{<:Integer}...)` already dispatches on, so
+# no `Pair{Int,Any}` accumulator is needed to hold the two shapes together.
 function _enriched_space(V::Space{D,T}, inc::Int) where {D,T}
-    specs = Pair{Int,Any}[]
-    for k in 1:length(V.levels)
-        level = V.levels[k]
-        raised = if length(level.orders.palette) == 1
-            nominal_order(level) .+ inc
-        else
-            map(o -> o .+ inc, cell_orders(V; level=k))
-        end
-        push!(specs, k => raised)
-    end
-    return elevate(V, specs...)
+    raised(k) = (o=V.levels[k].orders;
+                 length(o.palette) == 1 ? o.nominal .+ inc :
+                 map(p -> p .+ inc, cell_orders(V; level=k)))
+    return elevate(V, (k => raised(k) for k in 1:length(V.levels))...)
 end
 
 """
@@ -205,7 +298,9 @@ anisotropic order the two disagree, and the index form selects 5 of the 11
 complement modes at order `(3, 5)`. Each complement mode is shared equally among
 the cells it is incident to, so no cell is charged for a neighbour's error; the
 sharing is always well defined because a mode is only shed when *every* incident
-cell is covered.
+cell is covered. Every component of the field is charged to its own cell: on a
+field declared with `components = n` the sum above runs over all `n` components
+of each complement mode, so `η_K` measures the whole vector-valued residual.
 
 `enrichment` is the order increment defining `V⁺`. One is the usual choice and
 the only one measured here.
@@ -214,20 +309,87 @@ The indicator's quality is what justifies its cost: effectivity drifts 1.23× ov
 a 64× range in unknowns, against 52.57× for a gradient-recovery indicator on the
 same problems.
 
-The cost is real and worth stating precisely, because it is the loop's largest
-single term. Measured on a depth-2 ladder at 24² base cells, one `estimate` is
-32 ms against a 3.7 ms solve and a 32 ms rebuild — about 47% of an adaptive step
-— and splits as `assemble!(V⁺)` 20.1 ms, `prepare(V⁺)` 8.1 ms, the injection
-1.3 ms and the attribution 2.5 ms. The enriched matrix is formed in full and then
-read for a diagonal and one matrix–vector product, so a matrix-free path would
-remove most of the 63% that assembly costs and none of the 25% that `prepare`
-does. That is a capability for `assembly.jl` to grow on its own terms, not
-something this file should reach around.
+The cost is worth stating, because `estimate` is the loop's largest single term
+and stays so at every order. Kernel work per cell is modes² × quadrature points
+and each factor carries a `(p+1)^D`, so raising every cell by one degree
+multiplies the assembly by about `((p+2)/(p+1))^(3D)` — in 2D, 11.4 / 5.6 / 3.8
+at `p` = 1 / 2 / 3. Measured on the ladder of
+`examples/reproductions/adaptive_tanh_layer_2d` (6² base, depth 5, a nested band
+of active cells along the front; four threads, `-O0`, two runs), `assemble!(V⁺)`
+against `assemble!(V)` comes out at 7.5× / 4.9–5.4× / 3.5×: the prediction from
+`p` = 2 up, and short of it at `p` = 1, where per-region work that does not scale
+with the mode count is still a large share of an 18 ms assembly. `estimate` is
+then 78–82% of `prepare + assemble + solve + estimate` at all three orders, worst
+at the low orders the loop starts from. Inside it the split MOVES with the
+order — `assemble!(V⁺)` runs from about half of `estimate` at `p` = 1 to about
+84% at `p` = 3, and `prepare(V⁺)` from about a fifth down to 3% — so no fixed
+split is worth quoting. The injection and the residual matvec are nowhere in it,
+at 1.3–7.6 ms and 0.5–4.4 ms across the same three orders.
 
-Single-field and single-domain. Integrated Legendre only: raising a B-spline's
-degree rewrites the knot vector, so the injection has no meaning (see
-[`Rewire`](@ref)), and this raises rather than returning a number that looks
-plausible.
+None of those shares is all of the assembly. `plus` is a fresh model on every
+call, so it also pays the symbolic pattern and the threaded gather plan in full
+and amortises them over a single assembly — the opposite of the Newton or
+transient loop those caches were built for. Symbolic against numeric inside
+`assemble!(V⁺)`, same ladder and four threads: 63 / 135 / 439 ms against
+103 / 556 / 1796 ms at `-O0`, and 78 / 120 / 253 ms against 22 / 74 / 249 ms at
+the default `-O2`, at `p` = 1 / 2 / 3. So read `-O0` figures as `-O0` figures:
+`estimate` is 3–5× faster at `-O2` and `assemble!(V)` 6–7×, because the kernel is
+the part that shrinks — at `-O2` the symbolic half is the larger of the two at
+`p` = 1 and 2 and level with the numeric at `p` = 3.
+
+A matrix-free path is not the lever: it removes the sparse insertion and none of
+the kernel work. Neither — measured — is a row and column restriction of the
+kernel, which is the obvious reading of the paragraph above. Assembling only what
+the indicator reads (`R_W = b⁺_W − A⁺[W,V] u_V` and `diag A⁺[W,W]`, as a
+selection of matrix entries applied to the pattern, the gather plan and the
+emission loop) halves the entries stored and reproduces `cells`, `total` and
+`reference` to the bit — and is worth 1.15× at `-O0` and nothing at `-O2`
+(0.96–1.05× over the three orders). The contraction count falls by roughly four
+and the time does not: deciding that a (test, trial) pair is unwanted costs about
+what contracting it costs, and the branch that decides it is what stops the
+contraction vectorising.
+
+What would pay is a cheaper question rather than a cheaper answer to this one.
+Both quantities the indicator reads are right-hand-side shaped — `R` is
+`ℓ(v) − a(u⁺, v)` integrated against the injected state, and `diag A⁺` is the
+bilinear form evaluated at `a == b` alone — and neither needs a sparse pattern or
+a gather plan. An rhs pass over `V⁺` that reads the state at every point costs
+9.7 ms at `p` = 3 against the block pass's 249 ms. The price is that `R_W` would
+then come out of quadrature instead of out of `b⁺ − A⁺u⁺`: the two agree to
+3e-14 relative (measured on `‖R|_V‖ / ‖R|_W‖` over the three orders), so every
+`η_K` would move in its last digits. That is why this file still forms the
+operator, and it is the trade to make deliberately rather than by accident.
+
+What the indicator assumes is a **coercive** bilinear form. The diagonal
+Bank–Weiser indicator reads `A⁺_jj` as the energy of complement mode `j`, so it
+needs `A⁺_jj > 0` for every active complement mode and `a(u_h, u_h) > 0`;
+symmetry is not required, so convection–diffusion is fine and Helmholtz above the
+first resonance is not. A non-positive complement diagonal raises rather than
+being skipped: skipping it drops that direction from `η` silently, which is
+exactly the regime where the indicator would otherwise report a plausible number
+for a form it cannot measure. A `reference` that comes out at zero is *not*
+refused, because on a deep, ill-conditioned stack `cᵀ A c` can legitimately lose
+every digit; it is reported as zero and [`ErrorEstimate`](@ref)'s `show` prints
+the ratio as `NaN`.
+
+Forms must not be keyed by quadrature-point index. `estimate` evaluates the
+problem's own blocks and loads a second time, on `V⁺`'s integration plan, whose
+quadrature clouds and `q.point` numbering differ from the base model's — `V⁺` has
+more points per cell, and they sit at different places. A form that reads
+per-point state through `q.point` (a [`QuadField`](@ref), the documented
+mechanism for material history) therefore indexes an array built for `model` with
+`plus`'s indices: out of range where the base plan is the smaller of the two, and
+at the wrong points where it is not. Nothing detects this today. Where a model
+carries per-point state, compute the indicator on a model whose forms read that
+state through the physical point instead.
+
+What it refuses: single-field and single-domain, and every basis family that
+does not carry a per-cell order (`_supports_cell_order`). The injection copies
+coefficients by dof key and needs the same key to name the same function at both
+orders; a B-spline's degree cannot be raised without rewriting its knot vector,
+so the injection has no meaning there (see [`Rewire`](@ref)) and this raises
+rather than returning a number that looks plausible. It also refuses a model that
+has not been assembled, and an `enrichment` below one.
 
 See [`refine`](@ref) for the rest of the loop.
 """
@@ -236,16 +398,31 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     enrichment >= 1 || throw(ArgumentError("enrichment must be at least 1; got $enrichment"))
     V = model.prefold_space
     for (k, level) in pairs(V.levels)
-        level.basis isa IntegratedLegendre ||
-            throw(ArgumentError("estimate: level $k carries $(basis_name(level.basis)), and the Bank–Weiser " *
-                                "indicator injects the solution into an order-elevated space. Raising that " *
-                                "family's degree rewrites its knot vector, so the injection would copy " *
-                                "coefficients onto different functions. Only integrated Legendre is supported."))
+        # The trait, not the family. What the injection needs is that raising the
+        # degree leaves every existing function's dof key naming the same
+        # function, and `_supports_cell_order` is exactly the property that
+        # states it — the knot-vector reasoning behind the B-spline answer lives
+        # with the trait in `mesh.jl`. `Rewire`'s `_assert_keys_comparable` is
+        # the backstop, but it fires only after the enriched model has been
+        # prepared and assembled, which is the expensive half of this call.
+        _supports_cell_order(level.basis) ||
+            throw(ArgumentError("estimate: level $k carries $(basis_name(level.basis)), whose degree " *
+                                "cannot be raised without renaming its functions, so injecting the " *
+                                "solution into an order-elevated space has no meaning (see `Rewire`). " *
+                                "Only families declaring `_supports_cell_order` are supported."))
     end
     model.matrix === nothing &&
         throw(ArgumentError("estimate: the model has not been assembled; call `solve!` or " *
                             "`assemble!` before estimating"))
 
+    # The caches are handed over UNcopied, which is the opposite of what every
+    # other derivation does (`adapted` gives its target its own copy so a fork
+    # cannot evict a sibling's rules). It is deliberate here: `plus` is thrown
+    # away at the end of this call, and the (p+1)-order cut rules it fits are
+    # wanted on `model`, where the next `adapted` copies them forward and the
+    # next `estimate` finds them. `integration_plan` evicts by region box, so
+    # the two moment orders coexist at the same boxes instead of evicting each
+    # other — see `_prefit_cut_rules!` in `intersections.jl`.
     plus = _prepared_model(_problem_with_space(model.problem, _enriched_space(V, Int(enrichment))),
                            model.plan_options, model.moment_fit_caches)
     assemble!(plus)
@@ -257,32 +434,61 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     plus_keys = plus_field.dofs.raw_keys
     enriched = plus.problem.space
 
+    # Both per-raw questions, answered once each rather than once per incidence.
+    # `W` membership is a hash of a `TensorDofKey`, and a raw dof is incident to
+    # 2^D cells and repeated over every component, so asking it inside the sweep
+    # below pays for the same lookup up to 2^D·n_components times. The diagonal
+    # is extracted in one pass for the same reason — `plus.matrix[j, j]` is a
+    # binary search down a sparse column.
+    #
+    # Together with the live-cell restriction below, that is the whole of what
+    # separates this pass from one keyed by `Dict`/`Set` over every declared
+    # cell: measured on the tanh ladder (6² base, depth 5, four threads, `-O0`),
+    # the two sweeps fall from 9.3 / 13.4 / 19.4 ms to 3.2 / 6.5 / 12.8 ms at
+    # `p` = 1 / 2 / 3, on identical output. That is a low single-digit percentage
+    # of `estimate`, which the cost note above explains: the enriched assembly is
+    # the term that matters, and this is what keeps the component loop from
+    # multiplying a term that does not.
+    in_W = BitVector(!(key in base_keys) for key in plus_keys)
+    diagonal = diag(plus.matrix)
+
     # A dof is incident to several cells; its contribution is split equally among
-    # them, so a cell is never charged for a neighbour's error.
-    incidence = Dict{Int,Int}()
-    for k in 1:length(enriched.levels), cell in cell_indices(enriched; level=k)
+    # them, so a cell is never charged for a neighbour's error. Raw ids are
+    # contiguous, so this is a dense vector rather than a `Dict`.
+    incidence = zeros(Int, length(plus_keys))
+    for k in 1:length(enriched.levels), cell in _live_cells(enriched.levels[k])
         for raw in cell_dofs(plus.dofs, k, cell)
-            incidence[raw] = get(incidence, raw, 0) + 1
+            incidence[raw] += 1
         end
     end
 
+    # The attribution sweep. `counted` is indexed by ACTIVE id, not by raw:
+    # active ids are unique across components, so a vector-valued field's
+    # `(raw, component)` slots are each counted once into the V/W split while
+    # every one of them is charged to its cell.
     cells = [zeros(T, level.mesh.cells) for level in enriched.levels]
-    counted = Set{Int}()
+    counted = falses(length(residual))
     residual_V = residual_W = zero(T)
-    for k in 1:length(enriched.levels), cell in cell_indices(enriched; level=k)
+    for k in 1:length(enriched.levels), cell in _live_cells(enriched.levels[k])
         raws = cell_dofs(plus.dofs, k, cell)
-        actives = active_cell_dofs(plus.dofs, k, cell)
-        for (raw, active) in zip(raws, actives)
-            active == 0 && continue                       # constrained away
-            in_W = !(plus_keys[raw] in base_keys)
-            if !(raw in counted)
-                push!(counted, raw)
-                in_W ? (residual_W += residual[active]^2) : (residual_V += residual[active]^2)
+        for component in 1:plus_field.components
+            for (raw, active) in zip(raws, active_cell_dofs(plus.dofs, k, cell, component))
+                active == 0 && continue                   # constrained away
+                if !counted[active]
+                    counted[active] = true
+                    in_W[raw] ? (residual_W += residual[active]^2) :
+                    (residual_V += residual[active]^2)
+                end
+                in_W[raw] || continue
+                d = diagonal[active]
+                d > 0 ||
+                    throw(ArgumentError("estimate: the enriched diagonal of a complement mode on " *
+                                        "level $k, cell $cell, component $component is $d. The " *
+                                        "Bank–Weiser indicator reads that diagonal as the mode's " *
+                                        "energy, so it needs a coercive form; on this one the " *
+                                        "indicator has no meaning."))
+                cells[k][cell] += residual[active]^2 / d / incidence[raw]
             end
-            in_W || continue
-            d = plus.matrix[active, active]
-            d > 0 || continue
-            cells[k][cell] += residual[active]^2 / d / incidence[raw]
         end
     end
     for a in cells
@@ -293,18 +499,18 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     reference = sqrt(max(zero(T), dot(coefficients, model.matrix * coefficients)))
     total = sqrt(sum(sum(a .^ 2) for a in cells))
     consistency = sqrt(residual_V / max(residual_W, eps(T)))
-    return ErrorEstimate{T,D}(cells, total, reference, consistency)
+    return ErrorEstimate{D,T}(cells, total, reference, consistency)
 end
 
-# Dörfler marking: the smallest set of cells carrying `theta` of the total
-# squared indicator, ordered by decreasing η_K.
+# Dörfler marking (1996, see References): the smallest set of cells carrying
+# `theta` of the total squared indicator, ordered by decreasing η_K.
 #
 # `theta` is the loop's only free constant, and the scheme was chosen so that it
 # does not have to be refitted per problem: over a factor-three sweep the
 # resulting unknown count moves by at most 1.46×, against 1.86× for a smoothness
 # threshold and 1.36× for a benefit/cost rule whose informative window is
 # narrower still.
-function _dorfler(estimate::ErrorEstimate{T,D}, theta::Real) where {T,D}
+function _dorfler(estimate::ErrorEstimate{D,T}, theta::Real) where {D,T}
     0 < theta <= 1 || throw(ArgumentError("theta must lie in (0, 1]; got $theta"))
     marked = Tuple{Int,CartesianIndex{D}}[]
     for (k, indicators) in pairs(estimate.cells), cell in CartesianIndices(indicators)
@@ -350,11 +556,12 @@ end
 
 # ── The h-versus-p decision ───────────────────────────────────────────────────
 #
-# Melenk & Wohlmuth's predicted error reduction (Adv. Comput. Math. 15, 2001),
-# in the form deal.II implements it. Each cycle predicts what a cell's indicator
-# ought to become if the solution there is as smooth as the step just taken
-# assumed; the next cycle compares. A cell that met its prediction is behaving
-# smoothly and takes p again; one that fell short is not, and takes h.
+# Melenk & Wohlmuth's predicted error reduction (2001, see References), in the
+# form deal.II's `hp::Refinement::predict_error` implements it. Each cycle
+# predicts what a cell's indicator ought to become if the solution there is as
+# smooth as the step just taken assumed; the next cycle compares. A cell that met
+# its prediction is behaving smoothly and takes p again; one that fell short is
+# not, and takes h.
 #
 #     no step taken     η_pred = ∞     (see below; Melenk & Wohlmuth write γ_n η_K)
 #     p-step by Δp      η_pred = η_K γ_p^{Δp}
@@ -363,8 +570,14 @@ end
 #
 #     take p if η_K < η_pred, else take h
 #
-# with γ_p = √0.4 and γ_h = 2, the values Melenk & Wohlmuth give and deal.II
-# ships. The p row runs in both directions: a *lowered* order makes Δp negative,
+# with γ_p = √0.4 and γ_h = 2. Melenk & Wohlmuth state the constants for SQUARED
+# indicators, γ_p² = 0.4 and γ_h² = 4; these are their square roots, which is
+# what deal.II's `predict_error` ships and what the unsquared η here needs. Both
+# are fixed rather than exposed: they are the literature's calibration of the
+# prediction, not a knob the loop tunes, and `theta` is where a caller who wants
+# one should reach.
+#
+# The p row runs in both directions: a *lowered* order makes Δp negative,
 # γ_p^{Δp} exceeds one, and the cell is predicted to get worse by the reciprocal
 # of what the degree was worth — which is what stops a `coarsen` p-release from
 # being undone on sight. The two h rows are reciprocal in the same way.
@@ -425,6 +638,12 @@ end
 const _GAMMA_P = sqrt(0.4)
 const _GAMMA_H = 2.0
 
+# The evidence one cycle leaves the next: the space that was refined, and the
+# estimate that was read on it. The two travel together because neither means
+# anything alone — a cell's history is the difference between the two spaces,
+# scored by the indicator the earlier one carried.
+const _History{D,T} = Tuple{Space{D,T},ErrorEstimate{D,T}}
+
 # The h-rate ρ^{q/D} between two cells of consecutive levels, from the boxes
 # themselves rather than from an assumed bisection: ρ is the volume ratio, so
 # ρ^{1/D} is the mesh size the h^p law of the energy norm refers to. See the
@@ -439,15 +658,18 @@ end
 # order, an h-step as a cell that was not active before, and an h-release as a
 # cover that was live before and is not now.
 #
-# `orders` memoises `cell_orders(Vprev; level=…)` across the marked cells of one
-# cycle; everything else is read per cell through `_cell_block`, so no whole
-# level is materialised to score a handful of cells.
-function _predicted(V::Space{D,T}, previous, k::Integer, cell::CartesianIndex{D}, q_now,
-                    orders::AbstractDict, gamma_p::Real) where {D,T}
+# Every question here is per cell and has an O(1) accessor: `cell_order` reads
+# one palette entry, `is_active` one mask bit, `_cell_block` resolves the stack
+# by binary search. None of them is memoised, and none should be — a cache keyed
+# by level materialises `cell_orders(…; level=k)`, a dense `Array{NTuple{D,Int},D}`
+# over the whole level, to answer a question about the handful of cells a cycle
+# marks. On the tanh ladder's finest level — 192² cells — that is a measured
+# 589 872 bytes per copy to read a few dozen entries.
+function _predicted(V::Space{D,T}, previous::_History{D,T}, k::Integer,
+                    cell::CartesianIndex{D}) where {D,T}
     Vprev, eprev = previous
     k <= length(Vprev.levels) || return T(Inf)
-    q = minimum(q_now)
-    order_of(j) = get!(() -> cell_orders(Vprev; level=j), orders, j)
+    q = minimum(cell_order(V.levels[k], cell))
 
     if !is_active(Vprev.levels[k].mask, cell)
         # Newly activated, so it is the child of an h-step one level up. The
@@ -463,7 +685,10 @@ function _predicted(V::Space{D,T}, previous, k::Integer, cell::CartesianIndex{D}
         parent === nothing && return T(Inf)              # no parent carried any error
         n = length(_cell_block(Vprev, k - 1, k, parent))
         rate = _h_rate(cell_box(V, cell; level=k), cell_box(Vprev, parent; level=k - 1), q, Val(D))
-        return η * T(_GAMMA_H) * T(rate) * T(gamma_p)^(q - minimum(order_of(k - 1)[parent])) /
+        return η *
+               T(_GAMMA_H) *
+               T(rate) *
+               T(_GAMMA_P)^(q - minimum(cell_order(Vprev.levels[k - 1], parent))) /
                sqrt(T(max(n, 1)))
     end
 
@@ -483,7 +708,8 @@ function _predicted(V::Space{D,T}, previous, k::Integer, cell::CartesianIndex{D}
         for ch in block
             (is_active(Vprev.levels[k + 1].mask, ch) && !is_active(V.levels[k + 1].mask, ch)) ||
                 continue
-            released += (eprev.cells[k + 1][ch] * T(gamma_p)^(q - minimum(order_of(k + 1)[ch])))^2
+            released += (eprev.cells[k + 1][ch] *
+                         T(_GAMMA_P)^(q - minimum(cell_order(Vprev.levels[k + 1], ch))))^2
         end
         if released > 0
             rate = _h_rate(cell_box(Vprev, first(block); level=k + 1),
@@ -494,15 +720,15 @@ function _predicted(V::Space{D,T}, previous, k::Integer, cell::CartesianIndex{D}
 
     # Equal orders mean nothing was applied here, so there is no evidence and the
     # caller takes p. A LOWERED order is evidence, and of the opposite sign: the
-    # exponent goes negative, gamma_p^(negative) exceeds one, and the cell is
+    # exponent goes negative, γ_p^(negative) exceeds one, and the cell is
     # predicted to get WORSE by the reciprocal of what the degree was worth. That
     # is Melenk & Wohlmuth's coarsening row for p, and without it a p-released
     # cell falls through the equality branch and takes p again on sight.
     η = eprev.cells[k][cell]
     η > 0 || return T(Inf)
-    q_prev = minimum(order_of(k)[cell])
+    q_prev = minimum(cell_order(Vprev.levels[k], cell))
     q == q_prev && return T(Inf)
-    return η * T(gamma_p)^(q - q_prev)
+    return η * T(_GAMMA_P)^(q - q_prev)
 end
 
 # A `(level, cell)` mark against the space it names. Both halves are checked
@@ -523,7 +749,7 @@ end
 # otherwise a `BoundsError` from deep inside the prediction or — where two
 # levels happen to agree in shape — a silently misattributed score, so both
 # arguments are checked once, here, against the space each belongs to.
-function _check_estimate(V::Space{D,T}, est::ErrorEstimate{T,D}, name::AbstractString) where {D,T}
+function _check_estimate(V::Space{D,T}, est::ErrorEstimate{D,T}, name::AbstractString) where {D,T}
     shapes = [level.mesh.cells for level in V.levels]
     map(size, est.cells) == shapes ||
         throw(DimensionMismatch("$name holds indicators shaped $(map(size, est.cells)), but this " *
@@ -531,15 +757,12 @@ function _check_estimate(V::Space{D,T}, est::ErrorEstimate{T,D}, name::AbstractS
     return est
 end
 
-function _partition(V::Space{D,T}, estimate::ErrorEstimate{T,D}, marked, pmax::Integer;
-                    previous=nothing, gamma_p::Real=_GAMMA_P) where {D,T}
+function _partition(V::Space{D,T}, estimate::ErrorEstimate{D,T}, marked, pmax::Integer;
+                    previous::Union{Nothing,_History{D,T}}=nothing) where {D,T}
     _check_estimate(V, estimate, "estimate")
     h = Tuple{Int,CartesianIndex{D}}[]
     p = Tuple{Int,CartesianIndex{D}}[]
-    orders = Dict{Int,Any}()
-    prev_orders = Dict{Int,Any}()
     live = _live_levels(V)
-    order_of(k) = get!(() -> cell_orders(V; level=k), orders, k)
     if previous !== nothing
         Vprev, eprev = previous
         _check_estimate(Vprev, eprev, "previous")
@@ -556,12 +779,11 @@ function _partition(V::Space{D,T}, estimate::ErrorEstimate{T,D}, marked, pmax::I
         # would return a new but identical space, and a loop made of those does
         # not terminate.
         h_offered = _has_h_step(V, k, cell, live)
-        p_offered = !all(>=(Int(pmax)), order_of(k)[cell]) && _is_leaf(V, k, cell, live)
+        p_offered = !all(>=(Int(pmax)), cell_order(V.levels[k], cell)) && _is_leaf(V, k, cell, live)
         h_offered || p_offered || continue
         take_p = p_offered && (!h_offered ||
                                previous === nothing ||
-                               estimate.cells[k][cell] <
-                               _predicted(V, previous, k, cell, order_of(k)[cell], prev_orders, gamma_p))
+                               estimate.cells[k][cell] < _predicted(V, previous, k, cell))
         push!(take_p ? p : h, (k, cell))
     end
     return h, p
@@ -631,14 +853,16 @@ index; a ladder may grow levels between cycles. Omit `previous` and every marked
 cell takes p, falling back to h only where p is unavailable; that is the right
 behaviour for the first cycle and the wrong one thereafter. See the note above
 `_partition` in `src/adaptivity.jl` for the prediction and why it is preferred
-here to a smoothness indicator.
+here to a smoothness indicator. The prediction's own constants — Melenk &
+Wohlmuth's γ_p and γ_h — are fixed rather than exposed, because they are the
+literature's calibration of the rule and not a knob to fit per problem; `theta`
+is the loop's only tunable.
 
 See [`estimate`](@ref) for the rest of the loop.
 """
-function refine(V::Space{D,T}, estimate::ErrorEstimate{T,D}; theta::Real=0.5, pmax::Integer=8,
-                previous=nothing, gamma_p::Real=_GAMMA_P) where {D,T}
-    h, p = _partition(V, estimate, _dorfler(estimate, theta), pmax; previous=previous,
-                      gamma_p=gamma_p)
+function refine(V::Space{D,T}, estimate::ErrorEstimate{D,T}; theta::Real=0.5, pmax::Integer=8,
+                previous::Union{Nothing,_History{D,T}}=nothing) where {D,T}
+    h, p = _partition(V, estimate, _dorfler(estimate, theta), pmax; previous=previous)
     return refine(V; h=h, p=p, pmax=pmax)
 end
 
@@ -652,10 +876,8 @@ function refine(V::Space{D,T}; h=(), p=(), pmax::Integer=8) where {D,T}
     # `elevate` rejects a level named twice, so merging is not optional.
     masks = Dict{Int,Any}()
     fields = Dict{Int,Any}()
-    base = Dict{Int,Any}()
     mask_of(k) = get!(() -> active_cells(V; level=k), masks, k)
     field_of(k) = get!(() -> cell_orders(V; level=k), fields, k)
-    base_of(k) = get!(() -> cell_orders(V; level=k), base, k)
     # Raise only the axes below the cap. A `pmax` under a cell's current order is
     # a "no more p here" instruction, not a request to lower an order `refine`
     # was asked to enrich, and the loop's saturation test reads it the same way.
@@ -671,7 +893,13 @@ function refine(V::Space{D,T}; h=(), p=(), pmax::Integer=8) where {D,T}
         _check_mark(V, k, cell, "refine")
         # Level k+1 is the target, and where it has no cell under this one — the
         # finest level, or a level whose box does not reach the cell — there is
-        # nothing to activate and the order step is what is left to spend.
+        # nothing to activate and the order step is what is left to spend. This
+        # is where the substitution happens; `_has_h_step` is where the loop form
+        # DECIDES that h is unavailable, and it sends such a cell to `p` so this
+        # branch is unreachable from `refine(V, estimate)`. The two are not a
+        # duplicated rule: a decision that h is unavailable and an application
+        # that converts an impossible h are different jobs, and the explicit form
+        # — which takes the caller's own sets — needs the second on its own.
         block = k < nlevels ? _cell_block(V, k, k + 1, cell) : nothing
         if block === nothing || isempty(block)
             field = field_of(k)
@@ -680,8 +908,11 @@ function refine(V::Space{D,T}; h=(), p=(), pmax::Integer=8) where {D,T}
         end
         # The children take the parent's order as it stands, uncapped: `coarsen`
         # restores exactly this value on release, and capping here would break
-        # that inverse on any stack whose order already exceeds `pmax`.
-        target = base_of(k)[cell]
+        # that inverse on any stack whose order already exceeds `pmax`. It is read
+        # from `V` rather than from `field_of(k)`, which the p-step above may
+        # already have raised — an h-step hands down the order the parent had when
+        # the cycle started, never one bought in the same cycle.
+        target = cell_order(V.levels[k], cell)
         mask = mask_of(k + 1)
         field = field_of(k + 1)
         for child in block

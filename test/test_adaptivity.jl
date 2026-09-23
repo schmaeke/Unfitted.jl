@@ -1,4 +1,5 @@
 using BasicBSpline
+using StaticArrays
 using Unfitted
 using Unfitted: _dorfler
 
@@ -51,6 +52,8 @@ end
         # no longer the dominant missing content.
         @test est.consistency < 1.0e-2
         @test est.reference > 0
+        # Dimension first, like every other parameterised type in the package.
+        @test est isa Unfitted.ErrorEstimate{2,Float64}
     end
     # Drift is the property that separates a usable indicator from a plausible
     # one: over this 16× range in unknowns it must stay bounded.
@@ -66,6 +69,57 @@ end
                                                  Unfitted.SolverDiagnostics(:manual, 0.0, true)))
     u = solve!(model)
     @test_throws ArgumentError estimate(model, u; enrichment=0)
+end
+
+@testset "estimate charges every component of a vector field" begin
+    # The attribution used to read `active_cell_dofs` at its default component,
+    # so on a vector-valued field it measured component 1 and nothing else. A
+    # two-component problem whose datum sits on component 2 then came back with
+    # `total = 0` and `consistency = 0` — a pair that reads as converged and
+    # stops a Dörfler loop on its first cycle, against a `reference` that says
+    # the solution is not zero at all.
+    V = space(_AD_Ω; cells=4, order=2)
+    homogeneous = [dirichlet(0.0; on=boundary(:all))]
+    scalar = prepare(poisson(V; source=1.0, dirichlet=homogeneous))
+    twin = estimate(scalar, solve!(scalar))
+    @test twin.total > 0
+
+    # `poisson` is diagonal in components, so a two-component field carrying the
+    # scalar problem's source on component 2 alone IS the scalar problem, moved.
+    u = field(:u, V; components=2)
+    zero2 = [dirichlet(SVector(0.0, 0.0); on=boundary(:all))]
+    second = prepare(poisson(u; source=SVector(0.0, 1.0), dirichlet=zero2))
+    second_est = estimate(second, solve!(second))
+    @test second_est.total ≈ twin.total
+    @test second_est.reference ≈ twin.reference
+
+    # Both components loaded is two independent copies of it, so the squared
+    # indicators add and η grows by √2 — per cell as well as in the total.
+    both = prepare(poisson(u; source=SVector(1.0, 1.0), dirichlet=zero2))
+    both_est = estimate(both, solve!(both))
+    @test both_est.total ≈ sqrt(2) * twin.total
+    @test all(both_est.cells[k] ≈ sqrt(2) .* twin.cells[k] for k in 1:length(twin.cells))
+end
+
+@testset "estimate refuses a form it cannot measure" begin
+    # The diagonal Bank–Weiser indicator reads A⁺_jj as the energy of complement
+    # mode j, which is a coercive form's property. On an indefinite one the
+    # diagonal can be negative, and dropping that mode from the sum returns a
+    # smaller, entirely plausible η for a form the indicator has no claim on.
+    # Helmholtz well above the first resonance is the clean case.
+    V = space(_AD_Ω; cells=4, order=2)
+    helmholtz = WeakForm(bilinear=(q, trial) -> TestChannels(-2000.0 * trial.value, trial.gradient),
+                         linear=q -> 1.0, symmetric=true)
+    model = prepare(Problem(V, helmholtz; dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    u = solve!(model)
+    @test_throws ArgumentError estimate(model, u)
+
+    # The same form at a wave number the mesh keeps coercive is estimated
+    # normally, so the guard is about the operator and not about the syntax.
+    mild = WeakForm(bilinear=(q, trial) -> TestChannels(-1.0 * trial.value, trial.gradient),
+                    linear=q -> 1.0, symmetric=true)
+    tame = prepare(Problem(V, mild; dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    @test estimate(tame, solve!(tame)).total > 0
 end
 
 @testset "refine: the h-step and the p-step, on the right levels" begin
@@ -122,7 +176,7 @@ end
     V = ladder(_AD_Ω; cells=4, order=2, depth=2)
     nlevels = length(V.levels)
     marked = [(1, c) for c in cell_indices(V; level=1)]
-    flat(V) = Unfitted.ErrorEstimate{Float64,2}([ones(l.mesh.cells) for l in V.levels], 1.0, 1.0,
+    flat(V) = Unfitted.ErrorEstimate{2,Float64}([ones(l.mesh.cells) for l in V.levels], 1.0, 1.0,
                                                 0.0)
     est = flat(V)
 
@@ -178,7 +232,7 @@ end
     # skip lasted.
     V = ladder(_AD_Ω; cells=4, order=2, depth=2)
     cell = CartesianIndex(2, 2)
-    flat(W) = Unfitted.ErrorEstimate{Float64,2}([ones(l.mesh.cells) for l in W.levels], 1.0, 1.0,
+    flat(W) = Unfitted.ErrorEstimate{2,Float64}([ones(l.mesh.cells) for l in W.levels], 1.0, 1.0,
                                                 0.0)
     grandchildren = overlapping_cells(V, [cell]; from=1, to=3)
     S = adapt(V, 3 => grandchildren)                   # level 3 live, level 2 empty
@@ -236,12 +290,12 @@ end
 
     before = [zeros(l.mesh.cells) for l in V.levels]
     before[1][good] = before[1][bad] = 1.0
-    est_prev = Unfitted.ErrorEstimate{Float64,2}(before, 1.0, 1.0, 0.0)
+    est_prev = Unfitted.ErrorEstimate{2,Float64}(before, 1.0, 1.0, 0.0)
 
     after = [zeros(l.mesh.cells) for l in W.levels]
     after[1][good] = 0.5                               # beat γ_p — smooth
     after[1][bad] = 0.9                                # fell short — not smooth
-    est_now = Unfitted.ErrorEstimate{Float64,2}(after, 1.0, 1.0, 0.0)
+    est_now = Unfitted.ErrorEstimate{2,Float64}(after, 1.0, 1.0, 0.0)
 
     h, p = Unfitted._partition(W, est_now, [(1, good), (1, bad)], 8; previous=(V, est_prev))
     @test p == [(1, good)]
@@ -270,9 +324,8 @@ end
 
     before = [zeros(l.mesh.cells) for l in V.levels]
     before[1][cell] = 1.0
-    est_prev = Unfitted.ErrorEstimate{Float64,2}(before, 1.0, 1.0, 0.0)
-    pred = Unfitted._predicted(W, (V, est_prev), 2, kids[1], cell_orders(W; level=2)[kids[1]],
-                               Dict{Int,Any}(), Unfitted._GAMMA_P)
+    est_prev = Unfitted.ErrorEstimate{2,Float64}(before, 1.0, 1.0, 0.0)
+    pred = Unfitted._predicted(W, (V, est_prev), 2, kids[1])
     # η · γ_h · ρ^{p/D} / √n with ρ = 1/2^D the volume ratio of a bisected child,
     # p = 2 the inherited order and n = 2^D children: 2 · 0.25 / 2 = 0.25 in 2D.
     @test pred ≈ Unfitted._GAMMA_H * 0.5^2 / sqrt(2^2)
@@ -281,7 +334,7 @@ end
     after = [zeros(l.mesh.cells) for l in W.levels]
     after[2][kids[1]] = 1.2 * pred                    # fell short — not smooth
     after[2][kids[2]] = 0.4 * pred                    # beat it — smooth
-    est_now = Unfitted.ErrorEstimate{Float64,2}(after, 1.0, 1.0, 0.0)
+    est_now = Unfitted.ErrorEstimate{2,Float64}(after, 1.0, 1.0, 0.0)
     h, p = Unfitted._partition(W, est_now, [(2, kids[1]), (2, kids[2])], 8; previous=(V, est_prev))
     @test h == [(2, kids[1])]
     @test p == [(2, kids[2])]
@@ -305,9 +358,8 @@ end
     @test length(kids) == 4                           # four, though 4×4 over 4×4
     before = [zeros(l.mesh.cells) for l in U.levels]
     before[1][cell] = 1.0
-    est_prev = Unfitted.ErrorEstimate{Float64,2}(before, 1.0, 1.0, 0.0)
-    @test Unfitted._predicted(UW, (U, est_prev), 2, kids[1], cell_orders(UW; level=2)[kids[1]],
-                              Dict{Int,Any}(), Unfitted._GAMMA_P) ≈ 0.25
+    est_prev = Unfitted.ErrorEstimate{2,Float64}(before, 1.0, 1.0, 0.0)
+    @test Unfitted._predicted(UW, (U, est_prev), 2, kids[1]) ≈ 0.25
 
     # An anisotropic split: level 2 halves axis 1 and leaves axis 2 alone, so the
     # parent has two children and the volume ratio is ½, not ¼. Judging it by the
@@ -321,10 +373,9 @@ end
     @test length(skids) == 2
     sbefore = [zeros(l.mesh.cells) for l in S.levels]
     sbefore[1][cell] = 1.0
-    sprev = Unfitted.ErrorEstimate{Float64,2}(sbefore, 1.0, 1.0, 0.0)
+    sprev = Unfitted.ErrorEstimate{2,Float64}(sbefore, 1.0, 1.0, 0.0)
     # γ_h · (½)^{p/D} / √2 = 2 · 2^{−1} / √2 = 2^{−1/2}, twice the 0.5^p answer.
-    @test Unfitted._predicted(SW, (S, sprev), 2, skids[1], cell_orders(SW; level=2)[skids[1]],
-                              Dict{Int,Any}(), Unfitted._GAMMA_P) ≈ sqrt(0.5)
+    @test Unfitted._predicted(SW, (S, sprev), 2, skids[1]) ≈ sqrt(0.5)
 end
 
 @testset "refine: a cell the level below does not reach" begin
@@ -337,7 +388,7 @@ end
     @test !any(overlapping_cells(U, [corner]; from=1, to=2))
     @test !Unfitted._has_h_step(U, 1, corner)
 
-    flat = Unfitted.ErrorEstimate{Float64,2}([ones(l.mesh.cells) for l in U.levels], 1.0, 1.0, 0.0)
+    flat = Unfitted.ErrorEstimate{2,Float64}([ones(l.mesh.cells) for l in U.levels], 1.0, 1.0, 0.0)
     h, p = Unfitted._partition(U, flat, [(1, corner)], 8)
     @test isempty(h) && p == [(1, corner)]
     @test cell_orders(refine(U; h=[(1, corner)]); level=1)[corner] == (3, 3)
@@ -413,9 +464,8 @@ end
 
     before = [zeros(l.mesh.cells) for l in V.levels]
     before[1][cell] = 1.0
-    est_prev = Unfitted.ErrorEstimate{Float64,2}(before, 1.0, 1.0, 0.0)
-    predicted = Unfitted._predicted(W, (V, est_prev), 1, cell, cell_orders(W; level=1)[cell],
-                                    Dict{Int,Any}(), Unfitted._GAMMA_P)
+    est_prev = Unfitted.ErrorEstimate{2,Float64}(before, 1.0, 1.0, 0.0)
+    predicted = Unfitted._predicted(W, (V, est_prev), 1, cell)
     @test predicted > 1.0                       # the error is expected to grow
     @test predicted ≈ 1.0 / Unfitted._GAMMA_P    # by exactly one degree's worth
 end
@@ -436,9 +486,8 @@ end
     children = overlapping_cells(V, [cell]; from=1, to=2)
     before = [zeros(l.mesh.cells) for l in W.levels]
     before[2][children] .= 1.0                  # η = 1 on each of the four children
-    est_prev = Unfitted.ErrorEstimate{Float64,2}(before, 2.0, 1.0, 0.0)
-    predicted = Unfitted._predicted(R, (W, est_prev), 1, cell, cell_orders(R; level=1)[cell],
-                                    Dict{Int,Any}(), Unfitted._GAMMA_P)
+    est_prev = Unfitted.ErrorEstimate{2,Float64}(before, 2.0, 1.0, 0.0)
+    predicted = Unfitted._predicted(R, (W, est_prev), 1, cell)
     # √(Σ η²) / (γ_h ρ^{p/D}) = 2 / (2 · 0.25) = 4, and the parent's own previous
     # indicator is not consulted: the evidence is the children's.
     @test predicted ≈ 4.0
@@ -482,7 +531,7 @@ end
     # runs to its step limit with nothing changing.
     V = ladder(_AD_Ω; cells=4, order=2, depth=1)
     cell = CartesianIndex(2, 2)
-    zero_est = Unfitted.ErrorEstimate{Float64,2}([zeros(l.mesh.cells) for l in V.levels], 0.0, 1.0,
+    zero_est = Unfitted.ErrorEstimate{2,Float64}([zeros(l.mesh.cells) for l in V.levels], 0.0, 1.0,
                                                  0.0)
     @test isempty(_dorfler(zero_est, 0.5))
     @test refine(V, zero_est) === V
@@ -505,7 +554,7 @@ end
     V = ladder(_AD_Ω; cells=4, order=4, depth=1)
     cell = CartesianIndex(2, 2)
     other = ladder(_AD_Ω; cells=8, order=2, depth=1)
-    flat(W) = Unfitted.ErrorEstimate{Float64,2}([ones(l.mesh.cells) for l in W.levels], 1.0, 1.0,
+    flat(W) = Unfitted.ErrorEstimate{2,Float64}([ones(l.mesh.cells) for l in W.levels], 1.0, 1.0,
                                                 0.0)
 
     # A cell index out of range is the caller's mistake, named as such, rather
@@ -524,7 +573,7 @@ end
     @test_throws DimensionMismatch refine(V, flat(other))
     @test_throws DimensionMismatch Unfitted._partition(V, flat(V), [(1, cell)], 8;
                                                        previous=(other, flat(other)))
-    truncated = Unfitted.ErrorEstimate{Float64,2}([ones(4, 4)], 1.0, 1.0, 0.0)
+    truncated = Unfitted.ErrorEstimate{2,Float64}([ones(4, 4)], 1.0, 1.0, 0.0)
     @test_throws DimensionMismatch refine(V, truncated)
 end
 
@@ -558,7 +607,7 @@ end
         ind[c] = 1.0 + (t - 1) * 1.0e-15        # equal to round-off, not bit-equal
     end
     ind[CartesianIndex(2, 2)] = 0.1             # genuinely smaller
-    est = Unfitted.ErrorEstimate{Float64,2}([ind, zeros(fine)], sqrt(sum(ind .^ 2)), 1.0, 0.0)
+    est = Unfitted.ErrorEstimate{2,Float64}([ind, zeros(fine)], sqrt(sum(ind .^ 2)), 1.0, 0.0)
 
     # θ this small needs one cell to reach the bulk, so the minimal prefix cuts
     # inside the group of four; all four must come back, not the one the sort
