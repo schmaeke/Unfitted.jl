@@ -258,6 +258,16 @@ end
 # ladder onto its 64³ level, 7.65 ms through `overlapping_cells` against 0.29 µs
 # for this block, and a cycle asks it once per mark from four sites.
 #
+# That ratio holds per mark and inverts over a sweep, which is worth saying here
+# because the figures above invite the wrong generalisation. Asking the question
+# for *every* cell of a level is faster through the public verb, called once on
+# the whole set, than through this one called once per cell: one set-wise call
+# amortises the per-axis tabulation, the source scan and the destination mask
+# over the entire selection. Measured over a 2D ladder of 4×4 base cells and five overlays, the
+# release sweep costs 0.058 ms as two `overlapping_cells` calls per level against
+# 0.36 ms as one `_cell_block` per cell — and 56 ms as one `overlapping_cells`
+# per cell, which is the trap. Per mark, this function; per level, the public one.
+#
 # The cell's own node coordinates are passed to `_axis_cells` exactly, with no
 # tolerance. That is the ladder's convention and it is not an oversight: levels
 # of a ladder share their node coordinates bit-for-bit (`_mesh_axes` builds the
@@ -307,6 +317,31 @@ marked = [ci for ci in cell_indices(V; level=3) if indicator[ci] > θ]
 deeper = active_cells(V; level=4) .| overlapping_cells(V, marked; from=3, to=4)
 V = adapt(V, 4 => deeper)
 ```
+
+# Example: reading a level's cover upward
+
+Called with `from` the finer level and `to` the coarser one, the same function
+answers the question a coarsening step asks — *which parents cover a live child,
+and which of those cover only cold ones* — for a whole level at once. The
+overlap relation is symmetric, so nothing has to be said differently in this
+direction:
+
+```julia
+# `indicator` holds the error indicator over level k+1; `peak` its maximum, and
+# `fraction` the share of it below which a child counts as cold.
+live = active_cells(V; level=k + 1)
+hot = live .& (indicator .> fraction * peak)
+releasable = overlapping_cells(V, live; from=k + 1, to=k) .&
+             .!overlapping_cells(V, hot; from=k + 1, to=k)
+```
+
+Two calls per level, rather than one call per cell of level `k` asking what it
+covers below. Both compute the same set, but a single call scans the whole
+source level and allocates a mask over the whole destination level, so per-cell
+use pays for both once per cell where a set-wise call pays once per level. On a
+2D ladder of 4×4 base cells and five overlays (levels up to 128×128, 42–50 live
+cells on each overlay), the sweep above took **0.058 ms against 56 ms** for the
+per-cell loop — the same answer, three orders of magnitude apart.
 """
 function overlapping_cells(V::Space{D,T}, cells; from::Integer, to::Integer) where {D,T}
     src_level = V.levels[_check_level(V, from, "from")]

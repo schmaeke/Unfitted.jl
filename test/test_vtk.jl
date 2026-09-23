@@ -278,6 +278,65 @@ end
     @test !occursin("0.30710678", solution_xml)
 end
 
+@testset "VTK time series indexes one full bundle per frame" begin
+    # A series is `write_vtk` in a loop plus a `.pvd` index over the frames. The
+    # overlay moves between the two frames here, which is the case the feature
+    # exists for: each frame carries its own level meshes, so the animation shows
+    # the mesh following the feature and not just the field on a frozen mesh.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    V = overlay(space(omega; cells=(2, 2), order=1), box((0.1, 0.1), (0.5, 0.5)); cells=(1, 1),
+                order=2)
+    model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+
+    dir = mktempdir()
+    series = vtk_series(joinpath(dir, "run"))
+    first_frame = write_vtk(series, 0.0, solve!(model), model; subdivisions=:none, ascii=true,
+                            append=false, compress=false)
+    @test first_frame == joinpath(dir, "run_frames", "frame_0001.vtm")
+    @test isfile(joinpath(dir, "run_frames", "frame_0001_level_2_overlay_mesh.vtu"))
+
+    # Byte-identity, the contract of the body split: a frame is the ordinary
+    # bundle. Written from the same `(solution, model)` before the overlay moves.
+    solo = solve!(model)
+    write_vtk(joinpath(dir, "solo"), solo, model; subdivisions=:none, ascii=true, append=false,
+              compress=false)
+    @test read(joinpath(dir, "run_frames", "frame_0001_data.vtu")) ==
+          read(joinpath(dir, "solo_data.vtu"))
+
+    move!(model; level=2, to=box((0.5, 0.5), (0.9, 0.9)))
+    write_vtk(series, 0.25, solve!(model), model; subdivisions=:none, ascii=true, append=false,
+              compress=false)
+    @test read(joinpath(dir, "run_frames", "frame_0002_level_2_overlay_mesh.vtu")) !=
+          read(joinpath(dir, "run_frames", "frame_0001_level_2_overlay_mesh.vtu"))
+
+    collection = close(series)
+    @test collection == joinpath(dir, "run.pvd")
+    sets = collect(eachmatch(r"<DataSet timestep=\"([^\"]*)\"[^>]*file=\"([^\"]*)\"",
+                             read(collection, String)))
+    @test length(sets) == 2
+    @test parse.(Float64, [s.captures[1] for s in sets]) == [0.0, 0.25]
+    @test [s.captures[2] for s in sets] ==
+          [joinpath("run_frames", "frame_0001.vtm"), joinpath("run_frames", "frame_0002.vtm")]
+    @test close(series) == collection           # closing twice is harmless
+end
+
+@testset "VTK series writes its frames where it is told" begin
+    # The frames directory is a keyword, the collection names each frame
+    # relative to itself, and a `.pvd` given on the path is stripped rather than
+    # doubled. The time is recorded exactly as handed over — no frame grid.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(1, 1), order=1)
+    model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    dir = mktempdir()
+    series = vtk_series(joinpath(dir, "movie.pvd"); frames=joinpath(dir, "pics"))
+    write_vtk(series, 1.5, solve!(model), model; level_meshes=false)
+
+    @test isfile(joinpath(dir, "pics", "frame_0001.vtm"))
+    @test isfile(joinpath(dir, "pics", "frame_0001_data.vtu"))
+    xml = read(close(series), String)
+    @test occursin("file=\"" * joinpath("pics", "frame_0001.vtm") * "\"", xml)
+    @test occursin("timestep=\"1.5\"", xml)
+end
+
 @testset "quadrature VTM splits regions by parent levels" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(2, 2), order=1)

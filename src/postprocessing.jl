@@ -1,9 +1,12 @@
 # Two concerns share this file:
 #
 #   * **VTK export.** [`write_vtk`](@ref) produces a ParaView multiblock
-#     bundle from a `(solution, model)` pair; [`write_quadrature_vtm`](@ref)
-#     produces a quadrature-point cloud bundle for inspecting where the
-#     integration regions land. Both rely on `WriteVTK.jl`.
+#     bundle from a `(solution, model)` pair; [`vtk_series`](@ref) collects a
+#     sequence of those bundles into a ParaView `.pvd` collection, so a feature
+#     that moves — and the mesh that follows it — can be watched over time;
+#     [`write_quadrature_vtm`](@ref) produces a quadrature-point cloud bundle
+#     for inspecting where the integration regions land. All three rely on
+#     `WriteVTK.jl`.
 #   * **Solution evaluation.** [`value`](@ref) and [`field_gradient`](@ref)
 #     evaluate the superposed solution at arbitrary physical points;
 #     [`l2_error`](@ref) computes an analytic / manufactured-solution
@@ -23,12 +26,13 @@
 # back to the solution evaluation kernel.
 _default_vtk_point_data() = (uh=(u, c, x, xi) -> u(c, xi),)
 
-# Strip a `.vtm` / `.vtu` / `.vtp` extension from `path` so callers can
-# pass either `"out"` or `"out.vtm"` interchangeably. `WriteVTK` adds
-# the extension automatically.
+# Strip a `.vtm` / `.vtu` / `.vtp` / `.pvd` extension from `path` so callers
+# can pass either `"out"` or `"out.vtm"` interchangeably. `WriteVTK` adds the
+# extension automatically — and warns if it finds a different one already
+# there, which is why the collection extension is on the list too.
 function _vtk_base_path(path::AbstractString)
     base, ext = splitext(String(path))
-    return ext in (".vtm", ".vtu", ".vtp") ? base : String(path)
+    return ext in (".vtm", ".vtu", ".vtp", ".pvd") ? base : String(path)
 end
 
 # Compose the file path for a child VTK block by suffixing the base
@@ -412,6 +416,98 @@ end
 
 # ── Public VTK export ────────────────────────────────────────────────────────
 
+# Shared prologue of every bundle writer: reject a dimension VTK has no cell
+# type for, and a solution the model did not produce, *before* any file handle
+# exists — a rejected call must leave no half-written bundle behind — then make
+# the output directory and hand back the extension-free base name.
+function _vtk_bundle_base(path::AbstractString, solution::Solution, model::Model{D}) where {D}
+    _check_vtk_dimension(Val(D))
+    _checked_coefficients(solution, model)
+    base = _vtk_base_path(path)
+    mkpath(dirname(base))
+    return base
+end
+
+# The contents of one bundle, written into an already-open multiblock `vtm`
+# whose children are named after `base`.
+#
+# This is split out of `write_vtk` for one reason: so that the caller owns the
+# multiblock handle. The single-shot writer opens one, fills it here and closes
+# it; the series writer fills one the same way and hands it to a ParaView
+# collection, which closes it and records its path against a physical time.
+# Nothing else differs between the two, so a frame of a series is byte-for-byte
+# the bundle `write_vtk` writes to the same base name.
+#
+# One grid block per field, each sampled over its own subdomain space. A
+# single-domain model has one field → a single `data` grid; a coupled model
+# writes one block per subdomain into the same multiblock file, so opening it
+# shows every coupled field.
+#
+# Each field block groups the field's `data` grid with its own subdomain
+# mesh(es) so each coupled field is a self-contained, independently-toggled
+# unit in ParaView: `<field> → { data, level_… }`. The children of a field
+# block are all *leaf* datasets — never a mix of a leaf and a sub-block, which
+# breaks ParaView's Extract-Block resolution.
+#
+# Crucially, every leaf's *disambiguating* name part is ASCII. ParaView derives
+# its Extract-Block data-assembly node names from the dataset names and keeps
+# only ASCII identifier characters, so a Unicode field name (`θ₁`, `θ₂`) or a
+# name disambiguated only by Unicode digits collapses to a single node and the
+# blocks become indistinguishable. The meshes are keyed by ASCII level id
+# (`level_<id>_<role>`); the data leaf is likewise keyed by the ASCII field
+# index (`data_<i>`), NOT by the field name. The field name is still the (only)
+# block label, where a Unicode collision is harmless — the user extracts leaves.
+# `meshed` dedups the meshes of a space shared by several fields onto its
+# first.
+function _write_vtk_blocks!(vtm, base::AbstractString, solution::Solution, model::Model; field,
+                            subdivisions, point_data, cell_data, level_meshes, ascii, append,
+                            compress)
+    fields = _vtk_fields_to_write(model, field)
+    multi = length(fields) > 1
+    meshed = Any[]
+    for (i, fld) in enumerate(fields)
+        space, plan, layout = _field_context(model, fld)
+        data = _partition_vtk_data(solution, model, space, plan, layout, subdivisions, point_data,
+                                   cell_data)
+        field_block = multiblock_add_block(vtm, string(fld.name))
+        data_name = multi ? "data_$i" : "data"
+        vtk = vtk_grid(_vtk_child_path(base, data_name), data.points, data.cells; ascii, append,
+                       compress)
+        multiblock_add_block(field_block, vtk, data_name)
+        for (name, arr) in data.point_arrays
+            vtk[name, VTKPointData()] = arr
+        end
+        if data.level_set_values !== nothing
+            vtk["level_set", VTKPointData()] = data.level_set_values
+        end
+        vtk["region_id", VTKCellData()] = data.region_ids
+        vtk["cover_count", VTKCellData()] = data.cover_counts
+        for (name, arr) in data.cell_arrays
+            vtk[name, VTKCellData()] = arr
+        end
+
+        (level_meshes && !any(s -> s === space, meshed)) || continue
+        push!(meshed, space)
+        coverage = build_coverage(space, layout.dofs.tolerance)
+        for level in space.levels
+            data = _mesh_vtk_data(level, layout.dofs, coverage)
+            label = "level_$(level.id)_$(level.role)"
+            mvtk = vtk_grid(_vtk_child_path(base, "$(label)_mesh"), data.points, data.cells; ascii,
+                            append, compress)
+            multiblock_add_block(field_block, mvtk, label)
+            mvtk["level_id", VTKCellData()] = data.level_ids
+            mvtk["role_id", VTKCellData()] = data.role_ids
+            mvtk["order_max", VTKCellData()] = data.order_max
+            mvtk["cell_id", VTKCellData()] = data.cell_ids
+            mvtk["active", VTKCellData()] = data.active
+            mvtk["covered", VTKCellData()] = data.covered
+            mvtk["active_dofs", VTKCellData()] = data.active_dofs
+            mvtk["reduced_dofs", VTKCellData()] = data.reduced_dofs
+        end
+    end
+    return vtm
+end
+
 """
     write_vtk(path, solution, model;
               field=nothing, subdivisions=:degree, point_data, cell_data,
@@ -475,82 +571,137 @@ built-in `level_set` point array — convenient for visualising `∂Ω`
 as a zero-level isocontour or for filtering cut / full / fictitious
 regions in ParaView. Pass a `level_set` entry in `point_data` to
 override or rename it.
+
+To write a *sequence* of these bundles as one animation — a moving overlay, an
+adaptive ladder, a time-dependent solution — open a [`vtk_series`](@ref) and
+call this function with it in place of a path.
 """
 function write_vtk(path::AbstractString, solution::Solution, model::Model{D,T}; field=nothing,
                    subdivisions=:degree, point_data=_default_vtk_point_data(),
                    cell_data=NamedTuple(), level_meshes::Bool=true, ascii::Bool=false,
                    append::Bool=true, compress=false) where {D,T}
-    _check_vtk_dimension(Val(D))
-    _checked_coefficients(solution, model)
-    base = _vtk_base_path(path)
-    mkpath(dirname(base))
-
-    # One grid block per field, each sampled over its own subdomain space. A
-    # single-domain model has one field → a single `data` grid; a coupled model
-    # writes one block per subdomain into the same multiblock file, so opening it
-    # shows every coupled field.
-    fields = _vtk_fields_to_write(model, field)
-    multi = length(fields) > 1
-
-    # One block per field, grouping the field's `data` grid with its own subdomain
-    # mesh(es) so each coupled field is a self-contained, independently-
-    # toggled unit in ParaView: `<field> → { data, level_… }`. The children of a
-    # field block are all *leaf* datasets — never a mix of a leaf and a sub-block,
-    # which breaks ParaView's Extract-Block resolution.
-    #
-    # Crucially, every leaf's *disambiguating* name part is ASCII. ParaView derives
-    # its Extract-Block data-assembly node names from the dataset names and keeps
-    # only ASCII identifier characters, so a Unicode field name (`θ₁`, `θ₂`) or a
-    # name disambiguated only by Unicode digits collapses to a single node and the
-    # blocks become indistinguishable. The meshes are keyed by ASCII level id
-    # (`level_<id>_<role>`); the data leaf is likewise keyed by the ASCII field
-    # index (`data_<i>`), NOT by the field name. The field name is still the (only)
-    # block label, where a Unicode collision is harmless — the user extracts leaves.
-    # `meshed` dedups the meshes of a space shared by several fields onto its
-    # first.
+    base = _vtk_bundle_base(path, solution, model)
     return vtk_multiblock(base) do vtm
-        meshed = Any[]
-        for (i, fld) in enumerate(fields)
-            space, plan, layout = _field_context(model, fld)
-            data = _partition_vtk_data(solution, model, space, plan, layout, subdivisions,
-                                       point_data, cell_data)
-            field_block = multiblock_add_block(vtm, string(fld.name))
-            data_name = multi ? "data_$i" : "data"
-            vtk = vtk_grid(_vtk_child_path(base, data_name), data.points, data.cells; ascii, append,
-                           compress)
-            multiblock_add_block(field_block, vtk, data_name)
-            for (name, arr) in data.point_arrays
-                vtk[name, VTKPointData()] = arr
-            end
-            if data.level_set_values !== nothing
-                vtk["level_set", VTKPointData()] = data.level_set_values
-            end
-            vtk["region_id", VTKCellData()] = data.region_ids
-            vtk["cover_count", VTKCellData()] = data.cover_counts
-            for (name, arr) in data.cell_arrays
-                vtk[name, VTKCellData()] = arr
-            end
-
-            (level_meshes && !any(s -> s === space, meshed)) || continue
-            push!(meshed, space)
-            coverage = build_coverage(space, layout.dofs.tolerance)
-            for level in space.levels
-                data = _mesh_vtk_data(level, layout.dofs, coverage)
-                label = "level_$(level.id)_$(level.role)"
-                mvtk = vtk_grid(_vtk_child_path(base, "$(label)_mesh"), data.points, data.cells;
-                                ascii, append, compress)
-                multiblock_add_block(field_block, mvtk, label)
-                mvtk["level_id", VTKCellData()] = data.level_ids
-                mvtk["role_id", VTKCellData()] = data.role_ids
-                mvtk["order_max", VTKCellData()] = data.order_max
-                mvtk["cell_id", VTKCellData()] = data.cell_ids
-                mvtk["active", VTKCellData()] = data.active
-                mvtk["covered", VTKCellData()] = data.covered
-                mvtk["active_dofs", VTKCellData()] = data.active_dofs
-                mvtk["reduced_dofs", VTKCellData()] = data.reduced_dofs
-            end
-        end
+        _write_vtk_blocks!(vtm, base, solution, model; field, subdivisions, point_data, cell_data,
+                           level_meshes, ascii, append, compress)
     end
+end
+
+"""
+    VTKSeries
+
+Handle for a ParaView collection (`.pvd`) being written frame by frame. Opened
+by [`vtk_series`](@ref), extended by `write_vtk(series, time, solution, model)`,
+and finished by `close(series)`. It carries the open collection, the directory
+its frame bundles are written into, and the number of frames written so far.
+"""
+struct VTKSeries
+    collection::WriteVTK.CollectionFile
+    frames::String
+    count::Base.RefValue{Int}
+end
+
+"""
+    vtk_series(path; frames=nothing) -> VTKSeries
+
+Open a ParaView collection at `path` for a sequence of solution bundles — the
+transient sibling of [`write_vtk`](@ref). Write one frame per call, then
+`close` the series to write the collection file:
+
+```julia
+series = vtk_series("output/laser")
+for step in 1:nsteps
+    t, u, model = advance!(…)
+    write_vtk(series, t, u, model)
+end
+close(series)                                  # → "output/laser.pvd"
+```
+
+Opening `laser.pvd` in ParaView plays the sequence: the time slider carries the
+times the frames were written at, and the animation shows the solution *and*
+the mesh that produced it.
+
+  - `path` — the collection file, with or without the `.pvd` extension.
+  - `frames` — the directory the frame bundles go into. Defaults to
+    `<path>_frames`, a sibling of the collection. The collection references
+    each frame by a path relative to itself, so collection and frames move
+    together as one directory tree.
+
+Four properties are worth stating explicitly, because they are what makes this
+usable for a moving feature rather than merely for a fixed mesh in time:
+
+  - **Every frame is a full bundle** — the data grid *and* the per-level meshes
+    — written under its own base name `frame_<n>`, with `n` counted from one
+    and zero-padded so a directory listing sorts. On a moving overlay or an
+    adaptive ladder the mesh differs from frame to frame, and that is usually
+    the thing one wants to see; a series that emitted the mesh once could not
+    show it.
+  - **Keywords are per frame.** Every keyword of [`write_vtk`](@ref) is
+    accepted on each call, with the same meaning and the same default, because
+    both the sampled data and the model change as a run proceeds.
+  - **The collection records each frame's own physical time**, exactly as it is
+    given and in the order given, so a run with an adaptive Δt is never forced
+    onto a uniform frame grid.
+  - **Nothing is deleted.** A re-run that writes fewer frames than the previous
+    one leaves the surplus frame files in place, unreferenced by the new
+    collection — invisible in ParaView, visible in a directory listing.
+    Clearing the frames directory first, if that matters, is the caller's
+    decision; a library that removed files a user might want is not one.
+
+The series deliberately has no schedule of its own — no `every`, no `times`.
+Which steps of a time loop deserve a picture is a property of the loop, not of
+the writer, and a frame costs what a `write_vtk` call costs.
+"""
+function vtk_series(path::AbstractString; frames=nothing)
+    base = _vtk_base_path(path)
+    directory = frames === nothing ? base * "_frames" : String(frames)
+    mkpath(dirname(base))
+    mkpath(directory)
+    return VTKSeries(paraview_collection(base), directory, Ref(0))
+end
+
+"""
+    write_vtk(series::VTKSeries, time, solution, model; kwargs...) -> String
+
+Write one frame of a [`vtk_series`](@ref) and register it in the collection at
+physical `time`. Returns the path of the frame's `.vtm`.
+
+The frame is exactly the bundle `write_vtk(path, solution, model; …)` writes,
+under a name the series chooses (`frame_<n>` in the series' frames directory),
+and every keyword of that method is accepted here unchanged — see
+[`vtk_series`](@ref) for what the series does and does not do with the frames
+it is handed. `time` is recorded in the collection and is otherwise unused: it
+need not be a step index, a multiple of anything, or evenly spaced.
+"""
+function write_vtk(series::VTKSeries, time::Real, solution::Solution, model::Model{D,T};
+                   field=nothing, subdivisions=:degree, point_data=_default_vtk_point_data(),
+                   cell_data=NamedTuple(), level_meshes::Bool=true, ascii::Bool=false,
+                   append::Bool=true, compress=false) where {D,T}
+    n = series.count[] + 1
+    base = _vtk_bundle_base(joinpath(series.frames, "frame_" * lpad(n, 4, '0')), solution, model)
+    vtm = vtk_multiblock(base)
+    _write_vtk_blocks!(vtm, base, solution, model; field, subdivisions, point_data, cell_data,
+                       level_meshes, ascii, append, compress)
+    # Hands the *open* multiblock over: the collection closes it — which is what
+    # writes the frame's files — and records its path, relative to the `.pvd`,
+    # against `time`. The counter advances only once that has succeeded, so a
+    # rejected frame does not burn a frame number.
+    collection_add_timestep(series.collection, vtm, time)
+    series.count[] = n
+    return vtm.path
+end
+
+"""
+    close(series::VTKSeries) -> String
+
+Write the ParaView collection file of `series` and return its path. The frame
+bundles are already on disk — each is written as it is handed over — so this
+writes only the `.pvd` index over them. Calling it a second time writes nothing
+and returns the same path.
+"""
+function Base.close(series::VTKSeries)
+    vtk_save(series.collection)
+    return series.collection.path
 end
 
 """
