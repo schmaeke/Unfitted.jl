@@ -395,6 +395,12 @@ Reconstructs the source field pointwise when the target's active basis
 *contains* the source's. The coefficients are not modified, so the
 reconstruction is exact, and the smoothing of the L² backend is avoided.
 
+A moved overlay ([`moved`](@ref) / [`move!`](@ref)) does not satisfy
+containment either, and in the way that is hardest to notice: the keys survive
+the move unchanged but name functions at the new position, so every lookup
+succeeds and the coefficients land on the wrong basis. This backend raises on a
+level whose mesh has moved rather than translate the field.
+
 Containment is a stronger condition than "the target space is larger",
 and under leaf semantics a refinement does not satisfy
 it: activating a finer level buries the parent's high-order modes, so
@@ -559,9 +565,20 @@ end
 # in `BSplineFamily`'s type (its spaces are `BSplineSpace{p}`), while
 # `IntegratedLegendre` is one type for every order. So comparing the instantiated
 # basis TYPE admits exactly the rewires that are sound and rejects the rest, and a
-# future family inherits the right behaviour by construction. The cell counts are
+# future family inherits the right behaviour by construction. The mesh is
 # compared for the same reason: a key indexes into a mesh, and two meshes of
-# different size do not share an indexing.
+# different size *or position* do not share an indexing. Position is the half a
+# cell-count test alone misses — `moved` and `move!` keep every key and move the
+# function it names, so a displaced overlay matches key for key and lands the
+# source's coefficients on functions somewhere else. Measured with the guard
+# stubbed out, on a 2D Poisson base 8² p=3 carrying a 4×4 overlay displaced by
+# half a fine cell: `strict = true` raised nothing and the transferred field
+# deviated by up to 4.3e-2 from the source, against a solution whose own
+# magnitude is 7.4e-2 — a 58% error, silently.
+#
+# `domain` and `cells` settle it between them: a `CartesianMesh`'s `axes` are
+# derived from exactly those two by `_mesh_axes` (mesh.jl), and `AxisBox`
+# equality is corner-wise and bit-exact for meshes built that way.
 function _assert_keys_comparable(source_model::Model, target_model::Model)
     src, tgt = source_model.problem.space, target_model.problem.space
     for k in 1:min(length(src.levels), length(tgt.levels))
@@ -572,9 +589,11 @@ function _assert_keys_comparable(source_model::Model, target_model::Model)
                                 "$(nominal_order(b)) on the target, and those name different function sets, so a " *
                                 "dof key does not name the same function on both sides — raising a B-spline degree " *
                                 "rewrites the knot vector and does exactly this. Use `L2Projection()` instead."))
-        a.mesh.cells == b.mesh.cells ||
-            throw(ArgumentError("Rewire: level $k has $(a.mesh.cells) cells on the source and $(b.mesh.cells) on the " *
-                                "target; a dof key indexes into a mesh, so the two are not comparable. Use " *
+        (a.mesh.cells == b.mesh.cells && a.mesh.domain == b.mesh.domain) ||
+            throw(ArgumentError("Rewire: level $k is meshed as $(a.mesh.cells) cells over $(a.mesh.domain) on the " *
+                                "source and $(b.mesh.cells) cells over $(b.mesh.domain) on the target; a dof key " *
+                                "indexes into a mesh, so the same key names a function of a different size or at a " *
+                                "different position on the two sides and they are not comparable. Use " *
                                 "`L2Projection()` instead."))
     end
     return nothing

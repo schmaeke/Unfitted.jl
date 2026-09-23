@@ -347,12 +347,80 @@ end
     @test diagnostics(model, solve!(model)).fit_failure_count == 0
 end
 
-@testset "adapted reuses the moment-fit cache" begin
-    disc = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.7; subcell_length_scale=0.25)
+# A cut-cell rule that counts the times it is asked for one. `cut_quadrature` is
+# the documented extension point (`physical_domain`), it sits behind exactly the
+# per-`(box, moment order)` memoisation the moment fit does, and the plan builds
+# it serially, so a plain `Ref` counter sees every fit and nothing else. The rule
+# returned is the region box's own tensor Gauss — the cheapest thing that
+# honours the contract, which is all a counting test needs.
+function counting_cut_rule(fits::Ref{Int})
+    return function (physical, region_box::Unfitted.AxisBox{D,T},
+                     moment_order::NTuple{D,Int}) where {D,T}
+        fits[] += 1
+        rule = Unfitted._tensor_gauss_rule(moment_order .+ 1, T)
+        jacobian = Unfitted.volume(region_box) / T(2^D)
+        points = [Unfitted.reference_to_physical(region_box, p) for p in rule.points]
+        return points, rule.weights .* jacobian, zero(T), :custom
+    end
+end
+
+@testset "derived models reuse the source's cut rules without evicting them" begin
+    # Cache *identity* is the wrong pin: a fork that shares its source's cache
+    # evicts the source's rules when it builds its own plan, which is the bug
+    # this asserts the absence of. What is observable — and what the reuse
+    # exists for — is that no derivation refits a rule the source already holds.
+    fits = Ref(0)
+    disc = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.7; subcell_length_scale=0.25,
+                           cut_quadrature=counting_cut_rule(fits))
     V = ladder(box((-1.0, -1.0), (1.0, 1.0)); cells=8, order=2, depth=1, splits=2, physical=disc)
     model = prepare(mass(adapt(V, 2 => trues(16, 16))))
+    @test fits[] > 0
+
+    fits[] = 0
     target = adapted(model, 2 => trues(16, 16))
-    @test target.moment_fit_caches === model.moment_fit_caches
+    @test fits[] == 0
+    # Its own cache, holding everything the source's does: both models are live
+    # from here, so neither may reduce the other's.
+    @test only(target.moment_fit_caches) !== only(model.moment_fit_caches)
+    @test length(only(target.moment_fit_caches)) == length(only(model.moment_fit_caches))
+
+    # The alternation an hp loop runs. `estimate` builds an order-elevated twin,
+    # which needs a *second* moment order at the very same region boxes; the step
+    # that follows needs the first one back. Evicting a cache to exactly one
+    # plan's keys makes the two orders evict each other, so both refit every
+    # cycle — the cost the reuse was introduced to avoid.
+    u = solve!(model)
+    fits[] = 0
+    estimate(model, u)
+    @test fits[] > 0                                   # the elevated order is new
+    fits[] = 0
+    adapted(model, 2 => trues(16, 16))
+    @test fits[] == 0                                  # ... and the step after it is warm
+    fits[] = 0
+    estimate(model, u)
+    @test fits[] == 0                                  # ... as is the next estimate
+end
+
+@testset "moved reuses the source's cut rules" begin
+    # `moved` is the third non-mutating derivation and goes through the same
+    # builder as `adapted` and `elevated`, so it reuses rules on the same terms:
+    # the boxes the move leaves bit-identical cost nothing, and the source keeps
+    # every rule it had. Ω = {x ≤ 0.55} cuts the x ∈ [0.5, 0.75] column of the
+    # base, which the one-cell overlay never touches at either position.
+    fits = Ref(0)
+    half = physical_domain(x -> x[1] - 0.55; lipschitz=1.0, subcell_length_scale=1.0e-3,
+                           max_depth=3, cut_quadrature=counting_cut_rule(fits))
+    V = overlay(space(LADDER_OMEGA; cells=(4, 4), order=1, physical=half),
+                box((0.0, 0.0), (0.25, 0.25)); cells=(1, 1), order=1)
+    model = prepare(mass(V; coefficient=1.0))
+    before = length(only(model.moment_fit_caches))
+    @test before > 0
+
+    fits[] = 0
+    target = moved(model; level=2, to=box((0.25, 0.0), (0.5, 0.25)))
+    @test fits[] == 0
+    @test only(target.moment_fit_caches) !== only(model.moment_fit_caches)
+    @test length(only(model.moment_fit_caches)) == before
 end
 
 @testset "ladder composes with an immersed domain" begin

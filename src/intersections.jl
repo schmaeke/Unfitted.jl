@@ -620,9 +620,12 @@ end
 # threads. It still gets the dedup and the cross-plan reuse.
 #
 # `live` is the plan's whole cut-key set, not just its misses, because
-# restricting the cache to it afterwards is what holds a cache threaded through
-# a long `move!` sweep to one plan's worth of rules instead of the sweep's.
-# On exit the cache is exactly this plan's cut regions.
+# restricting the cache afterwards is what keeps a cache threaded through a long
+# `move!` sweep from holding the sweep's worth of rules. On exit the cache holds
+# only the *boxes* this plan cuts — but at every moment order fitted at one of
+# them, which is where the eviction rule differs from the lookup key. See the
+# `filter!` below for why the two are not the same rule, and what the difference
+# costs.
 function _prefit_cut_rules!(cache::_MomentFitCache{D,T}, V::Space{D,T}, admissible,
                             classify_cache::_ClassifyCache{D,T}) where {D,T}
     physical = V.physical
@@ -645,7 +648,38 @@ function _prefit_cut_rules!(cache::_MomentFitCache{D,T}, V::Space{D,T}, admissib
     for i in eachindex(pending)
         cache[pending[i]] = fitted[i]
     end
-    filter!(entry -> entry.first in live, cache)
+    # Evict by box, not by full key. The bound the eviction exists for is the
+    # geometric one — a `move!` sweep must not leave the cache holding every box
+    # the overlay ever passed over — and a box that has left the plan takes all
+    # of its rules with it either way, so keying the eviction on the box alone
+    # costs that bound nothing: a move changes which boxes are cut, never the
+    # moment order at one of them.
+    #
+    # What it buys is the case full-key eviction gets wrong. An order-elevated
+    # twin of the same space — `estimate`'s `V⁺`, `adaptivity.jl` — has exactly
+    # this plan's boxes at a higher moment order, and under full-key eviction
+    # the two orders evict each other, so every `estimate` / `adapted`
+    # alternation refits both from scratch. Measured on a 3D sphere probe (base
+    # 4³, order 2, depth 1, 80 cut regions, 4 threads, -O0): a repeated
+    # `estimate` cost 38.7 s and the step after it 1.9 s; evicting by box they
+    # cost 0.006 s and 0.03 s, with the elevated order fitted once.
+    #
+    # What it costs, stated plainly because it is not free: a box that stays
+    # live keeps one entry per distinct moment order ever fitted there. Under a
+    # `move!` sweep that is flat, since orders do not change there. Under an hp
+    # loop it is not: `refine` raises the order at a live cut cell, the box does
+    # not leave the plan, and the entries at it accumulate *per cycle*. Bounded
+    # above — the key's order is `moment_order_factor × cell_order` and `refine`
+    # caps `cell_order` at `pmax` — but not by one plan's worth.
+    #
+    # The trade, measured on one configuration: four `estimate` → `refine` →
+    # `adapted` cycles on a 3D sphere (ladder base 4³, order 1, depth 1, 32 cut
+    # boxes) grew the cache from 32 entries / 0.035 MiB to 96 entries over the
+    # same 32 boxes / 0.61 MiB, and the next step's plan build cost 0.011 s
+    # against 11.9 s with no reuse. An h-step resets the accumulation where it
+    # lands, because the boxes it splits do leave the plan.
+    live_boxes = Set((key[1], key[2]) for key in live)
+    filter!(entry -> (entry.first[1], entry.first[2]) in live_boxes, cache)
     return cache
 end
 
@@ -710,8 +744,17 @@ Keyword arguments:
     bounds and moment order. Pass the same cache across successive plans
     for one space — [`Model`](@ref) does, through every `move!` and
     `activate!` — so a cut region the mutation left unchanged reuses its
-    rule instead of being refitted. On return the cache holds exactly this
-    plan's cut regions.
+    rule instead of being refitted. On return the cache is restricted to the
+    boxes *this* plan cuts: a box that has left the plan is dropped with all
+    of its rules, so a `move!` sweep cannot grow the cache. A box that stays
+    live keeps one entry per distinct moment order fitted there, so an
+    order-elevated twin of the same space and this plan do not evict each
+    other — and, where the order at a live box keeps rising (an hp loop),
+    entries accumulate with the cycles rather than staying at one plan's
+    worth. The accumulation is bounded above by `moment_order_factor × pmax`
+    per axis. On a 3D sphere with 32 cut regions, four hp cycles took the
+    cache from 0.035 MiB to 0.61 MiB and the next plan build from 11.9 s
+    (no reuse) to 0.011 s.
 
 The function is called by `prepare`, `move!`, and `_update_mask!`, all in
 `src/model.jl`, which own the plan a [`Model`](@ref) carries; `assembly.jl` and

@@ -309,6 +309,30 @@ end
     end
 end
 
+@testset "Rewire refuses a moved overlay in either strict mode" begin
+    # The failure a cell-count test cannot see. `moved` keeps every dof key —
+    # same level, same cell grid, same basis — and moves the function each key
+    # names, so every lookup succeeds, `strict = true` raises nothing, and the
+    # source's coefficients land on functions somewhere else. Only the level's
+    # mesh box tells the two apart.
+    omega = box((0.0,), (1.0,))
+    V = overlay(space(omega; cells=4, order=2), box((0.25,), (0.75,)); cells=2, order=2)
+    src = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    sol = solve!(src)
+
+    shifted = moved(src; level=2, to=box((0.375,), (0.875,)))   # half a fine cell
+    for strict in (true, false)
+        @test_throws ArgumentError transfer(sol, src, shifted; via=Rewire(; strict=strict))
+    end
+
+    # The control: a move that is not a move leaves every mesh where it was, so
+    # the keys really do name the same functions and the rewire is exact.
+    same = moved(src; level=2, to=box((0.25,), (0.75,)))
+    rewired = transfer(sol, src, same; via=Rewire())
+    pts = [(x,) for x in 0.05:0.05:0.95]
+    @test maximum(abs(value(rewired, same, p) - value(sol, src, p)) for p in pts) == 0.0
+end
+
 @testset "L2 transfer onto an FCM (physical_domain) target is rejected" begin
     # The default path takes the target mass from the FCM-aware standard
     # assembler (restricted to Ω) but the source-driven rhs over full mesh boxes,

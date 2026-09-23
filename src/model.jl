@@ -377,10 +377,33 @@ re-thread a fresh value through. Fields:
     `space_plans`. Every mutator threads it back into `integration_plan`,
     so a cut region a `move!` or a mask flip leaves bit-identical reuses
     its rule instead of being refitted — by far the dominant cost of a 3D
-    plan rebuild. Each cache is scoped to one space and therefore to one
-    immutable [`PhysicalDomain`](@ref), so there is nothing to invalidate;
-    `integration_plan` reduces it to the new plan's own regions on the way
-    out, so it does not grow with the length of a `move!` sweep.
+    plan rebuild. A cache is keyed by `(region box, moment order)` and omits
+    the geometry, on the reasoning that one cache sees exactly one immutable
+    [`PhysicalDomain`](@ref) for its whole life; that is what the guards on
+    [`adapted`](@ref)`(model, space)` enforce, and it is why there is nothing
+    here to invalidate.
+
+    Lineage, because a cache outlives the model that created it. A mutator
+    (`move!`, `activate!`, `deactivate!`) keeps the model's own cache objects,
+    since it overwrites the model rather than forking it. A non-mutating
+    derivation (`adapted`, `elevated`, `moved`) gives the new model a *copy*,
+    seeded warm from the source: source and target are then both live, and a
+    shared cache would have each one's plan build evict the other's rules.
+
+    Size, because the eviction is by region *box* rather than by the full
+    `(box, moment order)` key. `integration_plan` drops every box the plan it
+    has just built does not cut, so a `move!` sweep costs one plan's worth of
+    rules and not the sweep's. A box that stays live keeps one entry per
+    distinct moment order fitted there, which is what lets a base model and
+    the order-elevated twin [`estimate`](@ref) builds coexist instead of
+    evicting each other — at the price that where the order at a live box
+    keeps rising, as in an hp loop, the entries at it grow with the number of
+    cycles rather than holding at one plan's worth. That growth is bounded
+    above — the moment order is `moment_order_factor × cell_order` and
+    [`refine`](@ref) caps the cell order at `pmax` — and it is the smaller
+    half of the trade: on a 3D sphere with 32 cut regions, four hp cycles
+    took the cache from 0.035 MiB to 0.61 MiB and the next plan build from
+    11.9 s with no reuse to 0.011 s.
   - `dofs::SystemLayout{D,T}` — per-field dof layout and active
     enumeration.
   - `matrix::Union{Nothing,SparseMatrixCSC{T,Int}}` — assembled global
@@ -609,12 +632,28 @@ end
 
 # The body of [`prepare`](@ref), with the moment-fit caches optionally supplied.
 #
-# `prepare` starts them empty. [`adapted`](@ref) hands the source model's back,
-# for the reason `move!` gives for not invalidating them: they are keyed by
-# region bounds and moment order, and an adaptive step changes which cells are
-# active and no geometry at all, so every fitted cut-cell rule is still valid.
-# Rebuilding them instead refits every cut region on every adaptive step, which
-# on an immersed transient is the dominant cost.
+# `prepare` starts them empty. Every derivation of an existing model hands that
+# model's back, for the reason `move!` gives for not invalidating them: they are
+# keyed by region bounds and moment order, and a mask edit, an order edit or a
+# move changes which cells are active and never the geometry, so every fitted
+# cut-cell rule is still valid. Rebuilding them instead refits every cut region
+# on every step, which on an immersed model is the dominant cost of the step.
+#
+# Whether the handed-in caches are *shared* with the source model or a copy of
+# them is the caller's choice, and the two callers make it differently:
+#
+#   - the non-mutating derivations ([`adapted`](@ref), and through it
+#     [`elevated`](@ref) and [`moved`](@ref)) pass a copy, because source and
+#     target are then both live and each builds a plan against its own cut
+#     regions. Sharing would make the fork's plan build evict the rules the
+#     source's own plan is still using — an `O(#cut regions)` copy against a
+#     full refit;
+#   - the in-place mutators pass the model's own caches through `_remodel!`,
+#     since they overwrite the model rather than fork it, so there is no
+#     sibling to protect and the model keeps one cache object for its whole life.
+#
+# `estimate` (`adaptivity.jl`) is the deliberate third case: it shares, so the
+# elevated-order rules its throw-away twin fits land on the source model.
 function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                          reuse::Union{Nothing,Vector{_MomentFitCache{D,T}}}) where {D,T}
     effective_problem, spaces, caches = _prepare_spaces(problem)
@@ -627,10 +666,17 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
     # space's own cell-classification cache. The moment-fit caches, unlike the
     # classification ones, outlive this call: they are the model's, and every
     # mutator hands them back so an unchanged cut region is not refitted.
-    fit_caches = if reuse !== nothing && length(reuse) == length(spaces)
-        reuse
-    else
+    # A handed-in vector is aligned with `problem_spaces`, so a length mismatch
+    # is a caller bug and is raised as one. Falling back to fresh caches here
+    # instead would turn it into a silent full refit — the exact cost the reuse
+    # exists to avoid, and invisible from the outside.
+    fit_caches = if reuse === nothing
         _MomentFitCache{D,T}[_MomentFitCache{D,T}() for _ in eachindex(spaces)]
+    else
+        length(reuse) == length(spaces) ||
+            throw(ArgumentError("moment-fit caches are aligned with the problem's distinct spaces; " *
+                                "got $(length(reuse)) for $(length(spaces))"))
+        reuse
     end
     space_plans = IntegrationPlan{D,T}[integration_plan(spaces[i]; plan_options...,
                                                         classify_cache=caches[i],
@@ -766,10 +812,10 @@ function _facet_regions_for_selector(V::Space{D,T}, selector::BoundarySelector,
     return regions
 end
 
-# Rebuild `problem` over a new (moved / remasked) space, reusing the field
-# channels, forms, and Dirichlet data. Shared rebuild rule behind `_moved_problem`
-# and `_remasked_problem` (the geometry-fold rebuild goes through
-# `_prepare_spaces`, which also reindexes level ids).
+# Rebuild `problem` over a new (adapted / elevated / moved / remasked) space,
+# reusing the field channels, forms, and Dirichlet data. Shared rebuild rule
+# behind `adapted(model, space)` and `_remodel!` (the geometry-fold rebuild goes
+# through `_prepare_spaces`, which also reindexes level ids).
 function _problem_with_space(problem::Problem, new_space::Space)
     new_fields = map(f -> field(f.name, new_space; components=component_count(f)), problem.fields)
     return Problem(new_fields; blocks=problem.blocks, loads=problem.loads,
@@ -849,59 +895,50 @@ function _assert_single_domain(model::Model, op::AbstractString)
     return nothing
 end
 
-# Rebuild the model's problem with overlay `level` moved to box `to`, reusing
-# the existing forms and boundary data on the moved space. Shared by `move!`
-# and `moved`, both of which then hand the result to the same
-# fold → reindex → plan path `prepare` runs.
+# Rebuild every piece of reusable state `model` carries from a derived
+# pre-fold space, in place. This is the whole body of the in-place mutators:
+# `move!`, `activate!` and `deactivate!` differ only in how they derive `space`
+# from `model.prefold_space`, and everything after that is the rebuild
+# `prepare` runs, so it is written once here rather than three times.
 #
 # The geometry comes from `model.prefold_space`, never from the effective
-# `model.problem.space`. The effective masks already carry the fictitious fold
-# computed at the *old* overlay position, and `_apply_physical_fold` intersects
-# (`active .& .!fictitious`), so folding them a second time can only ever remove
-# cells: a cell dropped because the old box put it outside Ω would stay dropped
-# after a move that puts it wholly inside. Starting from the pre-fold masks makes
-# `move!` reproduce `prepare` at the new box exactly, which is the contract both
-# mutators advertise.
+# `model.problem.space`. The effective masks already carry the fictitious fold,
+# and `_apply_physical_fold` intersects (`active .& .!fictitious`), so folding
+# them a second time can only ever remove cells: a cell dropped because the old
+# overlay box put it outside Ω would stay dropped after a move that puts it
+# wholly inside. Deriving from the pre-fold space makes a mutation reproduce
+# `prepare` at the new configuration exactly, which is the contract all three
+# mutators advertise. Everything that is *not* geometry — field names and
+# component counts, blocks, loads, Dirichlet data — is read back from
+# `model.problem`, which carries it unchanged through the fold and is kept
+# current by `update_dirichlet!`. Every caller is single-domain
+# (`_assert_single_domain`), so `prefold_space` is *the* space and
+# `_problem_with_space` re-homes every field onto the derived copy.
 #
-# Everything that is *not* geometry — field names and component counts, blocks,
-# loads, Dirichlet data — is read from `model.problem`, which carries all of it
-# unchanged through the fold and is kept current by `update_dirichlet!`.
-#
-# Both callers are single-domain (`_assert_single_domain`), so `prefold_space`
-# is *the* space and `_problem_with_space` re-homes every field onto the moved
-# copy without ambiguity.
-function _moved_problem(model::Model{D,T}, level::Integer, to::AxisBox{D,T}, tolerance) where {D,T}
-    return _problem_with_space(model.problem,
-                               moved_space(model.prefold_space; level, to, tolerance))
-end
-
-# Shared invalidation tail for `move!` / `_update_mask!`. Clears the
-# cached matrix / rhs, rebuilds the facet-region cache against the
-# (already-updated) space, builds a fresh diagnostics record, and folds
-# the current integration plan's stats in. Assumes `model.problem`,
-# `model.dofs`, and `model.space_plans` already reflect the new state.
+# The moment-fit caches are threaded in uncopied, unlike `adapted`'s: a mutator
+# overwrites the model rather than forking it, so no sibling model can have its
+# rules evicted and the model keeps one cache object for its whole life.
 #
 # The Dirichlet projection cache is dropped rather than rebuilt: its unknown
-# sets, facet regions and mass all belong to the dof layout the caller has
-# just replaced, and the next `update_dirichlet!` rebuilds it against the new
-# one.
-function _invalidate_assembly!(model::Model{D,T},
-                               tolerance::GeometryTolerance{T}=GeometryTolerance(T)) where {D,T}
+# sets, facet regions and mass all belong to the dof layout being replaced, and
+# the next `update_dirichlet!` rebuilds it against the new one.
+function _remodel!(model::Model{D,T}, space::Space{D,T}) where {D,T}
+    fresh = _prepared_model(_problem_with_space(model.problem, space), model.plan_options,
+                            model.moment_fit_caches)
+    model.problem = fresh.problem
+    model.prefold_space = fresh.prefold_space
+    model.space_plans = fresh.space_plans
+    model.moment_fit_caches = fresh.moment_fit_caches
+    model.dofs = fresh.dofs
+    model.facet_regions = fresh.facet_regions
+    model.surface_regions = fresh.surface_regions
+    model.interface_regions = fresh.interface_regions
+    model.diagnostics = fresh.diagnostics
     model.matrix = nothing
     model.rhs = nothing
     model.pattern = nothing
     empty!(model.dirichlet_projections)
-    model.facet_regions = _resolve_facet_regions(model.problem, tolerance)
-    model.surface_regions = _resolve_surface_regions(model.problem, tolerance)
-    model.interface_regions = _resolve_interface_regions(model.problem, model.dofs, tolerance)
-    diag = AssemblyDiagnostics(dimension=D, active_unknowns=active_unknowns(model.dofs),
-                               inactive_cell_counts=_inactive_cell_counts(problem_spaces(model.problem)),
-                               reduced_mode_counts=_reduced_mode_counts(model.dofs),
-                               facet_region_count=_region_count(model.facet_regions),
-                               surface_region_count=_region_count(model.surface_regions),
-                               interface_region_count=_region_count(model.interface_regions))
-    _set_plan_stats_multi!(diag, model.space_plans)
-    model.diagnostics = diag
+    model.version += 1
     return model
 end
 
@@ -934,28 +971,23 @@ and [`deactivate!`](@ref) mirror. `move!`
 
 The cut-cell moment-fit cache is deliberately *not* invalidated: it is keyed
 by region bounds and moment order, so a cut region the move leaves unchanged
-reuses its rule instead of being refitted.
+reuses its rule instead of being refitted. A mutator keeps the model's own
+cache objects — it overwrites the model rather than forking it, so no sibling
+model can lose rules to it — and the plan build bounds them to the boxes the
+new configuration cuts, so a sweep of many moves costs one plan's rules and not
+the sweep's.
 """
 function move!(model::Model{D,T}; level::Integer, to::AxisBox{D,T}) where {D,T}
     _assert_single_domain(model, "move!")
-    opts = model.plan_options
-    tolerance = get(opts, :tolerance, GeometryTolerance(T))
-    moved_p = _moved_problem(model, level, to, tolerance)
-    # Same fold → reindex → per-space-plan path as `prepare` (one space here,
-    # since `move!` is single-domain), so the folded plan and dof layout are
-    # rebuilt identically instead of hand-rolled.
-    effective_problem, spaces, caches = _prepare_spaces(moved_p)
-    model.problem = effective_problem
-    model.prefold_space = moved_p.space
-    model.version += 1
-    fit_caches = model.moment_fit_caches
-    model.space_plans = IntegrationPlan{D,T}[integration_plan(spaces[i]; opts...,
-                                                              classify_cache=caches[i],
-                                                              moment_fit_cache=fit_caches[i])
-                                             for i in eachindex(spaces)]
-    model.dofs = system_layout(effective_problem; tolerance,
-                               classify_caches=_caches_by_space(spaces, caches))
-    return _invalidate_assembly!(model, tolerance)
+    return _remodel!(model, _moved_prefold_space(model, level, to))
+end
+
+# The moved pre-fold space `move!` installs and `moved` prepares. Split out so
+# the two spell the move once, and so `moved` reads as what it is: the same
+# derivation as `move!`, prepared into a second model instead of installed.
+function _moved_prefold_space(model::Model{D,T}, level::Integer, to::AxisBox{D,T}) where {D,T}
+    tolerance = get(model.plan_options, :tolerance, GeometryTolerance(T))
+    return moved_space(model.prefold_space; level, to, tolerance)
 end
 
 """
@@ -972,58 +1004,40 @@ the source of a [`transfer`](@ref):
 Like [`move!`](@ref), `moved` addresses the level by its position in the
 model's single space and is therefore restricted to single-domain models;
 on a coupled model it throws `ArgumentError`.
+
+It derives the moved space and hands it to [`adapted`](@ref)`(model, space)`,
+which is the one builder every derived model goes through, so `moved` reuses
+the source's fitted cut-cell rules on the same terms an adaptive step does: a
+cut region the move leaves bit-identical is not refitted. The target gets its
+own copy of the caches, so the source keeps every rule it has.
 """
 function moved(model::Model{D,T}; level::Integer, to::AxisBox{D,T}) where {D,T}
     # Same restriction as `move!`, and for the same reason: `level` indexes one
     # space's level tuple, which is ambiguous once a problem spans several
     # subdomain spaces. `_problem_with_space` re-homes *every* field onto the
     # moved space, so on a coupled model there is no answer to give rather than
-    # a wrong one — hence a raise, not a pick.
+    # a wrong one — hence a raise, not a pick. It is asserted here, before
+    # `adapted` would assert it under its own name, so the message says `moved`.
     _assert_single_domain(model, "moved")
-    opts = model.plan_options
-    tolerance = get(opts, :tolerance, GeometryTolerance(T))
-    return prepare(_moved_problem(model, level, to, tolerance); opts...)
-end
-
-# Rebuild `problem` with one level's mask replaced. Symmetric to
-# `_moved_problem` but swaps the mask instead of the mesh.
-function _remasked_problem(problem::Problem, level_index::Integer, mask)
-    return _problem_with_space(problem, _remasked_space(problem.space, level_index, mask))
+    return adapted(model, _moved_prefold_space(model, level, to))
 end
 
 # Activate / deactivate `cells` on `level_index` and rebuild the model's
-# reusable state. Runs the same invalidation tail as `move!` — see that
-# docstring for the contract in full — differing only in what it rebuilds
-# the space from: a mask swap rather than a moved mesh, applied to the
-# effective and pre-fold masks independently (below). Any outstanding
-# `Solution` becomes stale.
+# reusable state. The flip is recorded on the *pre-fold* mask — the caller's
+# own record of what was asked for — and `_remodel!` folds the result against
+# the geometry afresh, exactly as `prepare` would at that mask. So on a model
+# carrying a `PhysicalDomain`, activating a cell the level set classifies as
+# fictitious is a no-op on the effective space and stays visible through
+# `active_cells(model; level, effective = false)`, instead of overriding the
+# geometry until the next `move!` re-folded it away. Any outstanding `Solution`
+# becomes stale.
 function _update_mask!(model::Model{D,T}, level_index::Integer, cells, value::Bool) where {D,T}
     _assert_single_domain(model, "activate! / deactivate!")
-    1 <= level_index <= length(model.problem.space.levels) ||
+    1 <= level_index <= length(model.prefold_space.levels) ||
         throw(ArgumentError("level index $level_index out of bounds"))
-    opts = model.plan_options
-    tolerance = get(opts, :tolerance, GeometryTolerance(T))
-    old_level = model.problem.space.levels[level_index]
-    new_mask = _apply_mask_update(old_level.mask, old_level.mesh, cells, value)
-    model.problem = _remasked_problem(model.problem, level_index, new_mask)
-    # Record the same flip on the pre-fold space, applied to the *user* mask
-    # rather than to the effective one. Two masks, two meanings, updated
-    # independently: `problem` keeps the documented "operates on the effective
-    # mask" semantics (activating a fictitious cell overrides the geometry here
-    # and now), while `prefold_space` keeps a record of the caller's own choices
-    # for the next `move!` to fold afresh. Copying the effective mask across
-    # instead would launder fold-derived deactivations into user intent, and
-    # leaving the pre-fold mask untouched would make the next `move!` discard
-    # the caller's flips — including flips on levels the move does not touch.
-    prefold_level = model.prefold_space.levels[level_index]
-    model.prefold_space = _remasked_space(model.prefold_space, level_index,
-                                          _apply_mask_update(prefold_level.mask, prefold_level.mesh,
-                                                             cells, value))
-    model.version += 1
-    model.space_plans = [integration_plan(model.problem.space; opts...,
-                                          moment_fit_cache=model.moment_fit_caches[1])]
-    model.dofs = system_layout(model.problem; tolerance)
-    return _invalidate_assembly!(model, tolerance)
+    level = model.prefold_space.levels[level_index]
+    mask = _apply_mask_update(level.mask, level.mesh, cells, value)
+    return _remodel!(model, _remasked_space(model.prefold_space, level_index, mask))
 end
 
 """
@@ -1046,11 +1060,19 @@ Like [`move!`](@ref), it addresses the level by position in the model's
 single space and therefore raises `ArgumentError` on a multi-domain
 (coupled) model.
 
-When the model's space has a `physical_domain`, the mutator operates
-on the *effective* mask (which already folds in the geometric
-`:fictitious` classification). Activating a cell that the level set
-classifies as fictitious therefore overrides the geometry until the
-next [`move!`](@ref) or fresh [`prepare`](@ref).
+The flip is recorded on the *pre-fold* mask and the result is folded against
+the geometry afresh, so a mutated model is exactly the [`prepare`](@ref) of the
+mask the caller has built up. On a space carrying a
+[`physical_domain`](@ref), activating a cell the level set classifies as
+fictitious is therefore a no-op on the effective space: the request is kept
+(`active_cells(model; level, effective = false)` shows it, and a later
+[`move!`](@ref) that brings the cell inside Ω honours it) but the geometry is
+not overridden. An override would reconstruct exactly the configuration
+[`physical_domain`](@ref) refuses to build in the first place — a fully
+fictitious cell kept active under the strict-cut path receives no quadrature
+and makes the system singular, which is why `keep_fictitious = true` requires
+`alpha > 0` — and it would survive only until the next re-fold, since nothing
+a rebuild reads records it.
 """
 function activate!(model::Model{D,T}; level::Integer, cells) where {D,T}
     return _update_mask!(model, level, cells, true)
@@ -1125,9 +1147,7 @@ therefore has to re-solve rather than carry state forward.
 """
 function adapted(model::Model{D,T}, spec...; kwargs...) where {D,T}
     _assert_single_domain(model, "adapted")
-    space = adapt(model.prefold_space, spec...; kwargs...)
-    return _prepared_model(_problem_with_space(model.problem, space), model.plan_options,
-                           model.moment_fit_caches)
+    return adapted(model, adapt(model.prefold_space, spec...; kwargs...))
 end
 
 """
@@ -1138,12 +1158,22 @@ plan options. This is the one-rebuild form of an hp step: compose the h- and the
 p-half at the `Space` level and hand the result here, rather than paying a full
 `prepare` for the intermediate.
 
+It is also the single builder every non-mutating derivation of a model goes
+through — the spec forms above, [`elevated`](@ref) and [`moved`](@ref) each
+derive a space from `model.prefold_space` and call this — so they all get the
+same guards, the same captured plan options and the same cache lineage, and the
+package has one path from a model to its successor rather than one per verb.
+
 `space` must be derived from `model.prefold_space` — by [`adapt`](@ref),
-[`elevate`](@ref), or both. The moment-fit caches are reused, and their keys are
-`(box, moment_order)` with the geometry deliberately left out, on the reasoning
-that one cache sees exactly one [`PhysicalDomain`](@ref) for its whole life. A
-space carrying a different domain or a different fold would break that, so it is
-refused rather than silently fitted with the wrong cut rules.
+[`elevate`](@ref), [`moved_space`](@ref), or any composition of them. The
+moment-fit caches are reused, and their keys are `(box, moment_order)` with the
+geometry deliberately left out, on the reasoning that one cache sees exactly one
+[`PhysicalDomain`](@ref) for its whole life. A space carrying a different domain
+or a different fold would break that, so it is refused rather than silently
+fitted with the wrong cut rules. The new model gets its own *copy* of the
+caches, seeded with everything the source has fitted: both models are live
+afterwards, and a shared cache would have each one's plan build evict the
+other's rules.
 """
 function adapted(model::Model{D,T}, space::Space{D,T}) where {D,T}
     _assert_single_domain(model, "adapted")
@@ -1156,8 +1186,13 @@ function adapted(model::Model{D,T}, space::Space{D,T}) where {D,T}
     space.domain == prefold.domain ||
         throw(ArgumentError("adapted(model, space) expects a space over this model's domain $(prefold.domain); " *
                             "got $(space.domain)."))
+    # Seeded warm from the source, but the target's own object: both models are
+    # live from here on, and each builds a plan that bounds its cache to its own
+    # cut boxes. Sharing would make the fork evict the rules the source's plan
+    # is still using — the `Model` docstring's `moment_fit_caches` entry has the
+    # lineage rule in full.
     return _prepared_model(_problem_with_space(model.problem, space), model.plan_options,
-                           model.moment_fit_caches)
+                           copy.(model.moment_fit_caches))
 end
 
 """
@@ -1169,9 +1204,10 @@ problem, tolerance and plan options as `model`. `order` takes every shape
 `elevate` accepts.
 
 The spec is applied to the model's *pre-fold* space for the same reason
-[`adapted`](@ref)'s is, and the moment-fit caches are reused: a p-adaptive step
-changes which basis functions exist and no geometry, so every fitted cut-cell
-rule is still valid.
+[`adapted`](@ref)'s is, and the result is handed to
+[`adapted`](@ref)`(model, space)`, so the moment-fit caches are reused on the
+same terms: a p-adaptive step changes which basis functions exist and no
+geometry, so every fitted cut-cell rule is still valid.
 
 Single-domain only, as [`adapted`](@ref) is. An hp step wants both halves at
 once, and going through this call and [`adapted`](@ref) in turn builds and throws
@@ -1184,9 +1220,7 @@ target = adapted(model, elevate(adapt(model.prefold_space, 4 => m), 4 => p))
 """
 function elevated(model::Model{D,T}, spec...) where {D,T}
     _assert_single_domain(model, "elevated")
-    space = elevate(model.prefold_space, spec...)
-    return _prepared_model(_problem_with_space(model.problem, space), model.plan_options,
-                           model.moment_fit_caches)
+    return adapted(model, elevate(model.prefold_space, spec...))
 end
 
 """
