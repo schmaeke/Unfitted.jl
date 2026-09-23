@@ -666,7 +666,7 @@ end
 #
 # WHAT GOES IN — everything the active dof numbering is a function of:
 #
-#   * per level, in order: id, role, mode, basis family name, `prune_covered`,
+#   * per level, in order: id, role, mode, basis family name,
 #     the mesh's corner bits and cell counts, the activation mask's bits, and
 #     the order field's palette, class map and nominal;
 #   * per field: name, component count, offset, raw and active dof counts, and
@@ -727,7 +727,6 @@ function _discretisation_pin(spaces, layout::SystemLayout)
             h = _pin(h, level.role)
             h = _pin(h, level.mode)
             h = _pin(h, basis_name(level.basis))
-            h = _pin(h, level.prune_covered)
             h = _pin(h, level.mesh.domain.lower)
             h = _pin(h, level.mesh.domain.upper)
             h = _pin(h, level.mesh.cells)

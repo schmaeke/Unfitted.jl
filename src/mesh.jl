@@ -143,6 +143,38 @@ function locate_cell(m::CartesianMesh{D,T}, point::PointLike{D};
     return CartesianIndex(ids)
 end
 
+# Index range of the cells of `axis` that the coordinate interval `[lo, hi]`
+# overlaps by a positive length; empty (`1:0`) when the interval misses the axis
+# entirely. The point form of the same lookup is `locate_cell` above.
+#
+# Exact by construction, and the two searches are deliberately different:
+# `searchsortedlast` puts a lower endpoint sitting exactly on a node into the
+# cell *above* it, and `searchsortedfirst` excludes the cell an upper endpoint
+# merely touches. A block that shares only a face with the interval is therefore
+# not claimed, which is what every caller means by "overlaps".
+#
+# Whether the endpoints need a tolerance is the caller's decision, not this
+# function's, and the two in-tree callers answer it differently for reasons that
+# belong to them:
+#
+#   * endpoints taken from ANOTHER mesh are nudged inward by `tol.contain` first
+#     (`_cells_under_box`, `coverage.jl`) — an `overlay` box whose axes were
+#     built by `_mesh_axes` from its own corners does not reproduce a coarser
+#     level's node coordinates bit-for-bit;
+#   * endpoints that are this axis's own nodes, or a ladder sibling's, are passed
+#     exactly (`overlapping_cells` and `_cell_block`, `ladder.jl`), because the
+#     levels of a ladder share their node coordinates bit-for-bit and an additive
+#     epsilon there is wrong twice over — `GeometryTolerance` is absolute, so on a
+#     domain far from the origin it is below the coordinates' own ulp, and on a
+#     fine level it is a sizeable fraction of a cell.
+function _axis_cells(axis::Vector{T}, lo::T, hi::T) where {T}
+    ncells = length(axis) - 1
+    i = searchsortedlast(axis, lo)
+    j = searchsortedfirst(axis, hi) - 1
+    (j < 1 || i > ncells) && return 1:0                     # disjoint from this axis
+    return max(i, 1):min(j, ncells)
+end
+
 # ── Per-cell activation mask ──────────────────────────────────────────────────
 
 """
@@ -180,6 +212,16 @@ mask) treats every cell as active.
 is_active(::Nothing, ::CartesianIndex) = true
 is_active(mask::LevelMask{D}, cell::CartesianIndex{D}) where {D} = mask.on[cell]
 
+# Fold an all-active bit field back into the no-mask default it is. `nothing` is
+# not merely a shorthand: `is_active(::Nothing, _)` is a compile-time `true`,
+# `_covered_by_level` takes an O(1) box-containment answer instead of scanning
+# the block under every coarse cell, and `_coverage_cells` returns `trues`
+# instead of dilating the active front. Routing every construction through this
+# one function is what makes the invariant "a `LevelMask` always excludes at
+# least one cell" hold for `space`, `overlay`, `adapt` and the mutators alike,
+# rather than for the mutators alone.
+_collapse_mask(on::BitArray{D}) where {D} = all(on) ? nothing : LevelMask{D}(on)
+
 # Translate a user-supplied `active` specification into either `nothing`
 # (no mask, default) or a `LevelMask{D}` whose shape matches the mesh's
 # cell grid. Five accepted input shapes, dispatched on type:
@@ -193,6 +235,9 @@ is_active(mask::LevelMask{D}, cell::CartesianIndex{D}) where {D} = mask.on[cell]
 #   * iterable of `CartesianIndex{D}`      — listed cells are active, the
 #                                            rest inactive.
 #
+# Every branch returns through `_collapse_mask`, so a selection that happens to
+# name every cell is stored as the no-mask default whichever shape it arrived in.
+#
 # The fallback signature `_normalize_mask(cells, mesh::CartesianMesh{D})`
 # acts as a generic iterable consumer plus a type-check error path so a
 # wrong-typed `active=` keyword still gives a clear message.
@@ -203,7 +248,7 @@ function _normalize_mask(mask::LevelMask{D}, mesh::CartesianMesh{D}) where {D}
         throw(DimensionMismatch("mask shape $(size(mask.on)) does not match mesh cells $(mesh.cells)"))
     # Copy: a user mutation of `mask.on` after construction must not leak
     # into the level. Matches `active_cells`'s return-a-copy contract.
-    return LevelMask{D}(copy(mask.on))
+    return _collapse_mask(copy(mask.on))
 end
 
 function _normalize_mask(bits::AbstractArray{Bool,D}, mesh::CartesianMesh{D}) where {D}
@@ -211,7 +256,7 @@ function _normalize_mask(bits::AbstractArray{Bool,D}, mesh::CartesianMesh{D}) wh
         throw(DimensionMismatch("mask shape $(size(bits)) does not match mesh cells $(mesh.cells)"))
     on = BitArray(undef, mesh.cells)
     copyto!(on, bits)
-    return LevelMask{D}(on)
+    return _collapse_mask(on)
 end
 
 function _normalize_mask(f::Function, mesh::CartesianMesh{D}) where {D}
@@ -219,7 +264,7 @@ function _normalize_mask(f::Function, mesh::CartesianMesh{D}) where {D}
     for ci in cell_indices(mesh)
         on[ci] = f(cell_box(mesh, ci), ci)::Bool
     end
-    return LevelMask{D}(on)
+    return _collapse_mask(on)
 end
 
 function _normalize_mask(cells, mesh::CartesianMesh{D}) where {D}
@@ -231,7 +276,7 @@ function _normalize_mask(cells, mesh::CartesianMesh{D}) where {D}
             throw(ArgumentError("active cell index $ci is out of bounds for mesh cells $(mesh.cells)"))
         on[ci] = true
     end
-    return LevelMask{D}(on)
+    return _collapse_mask(on)
 end
 
 # ── Per-cell polynomial order ─────────────────────────────────────────────────
@@ -299,26 +344,46 @@ struct CellModes{D}
     kind::Array{UInt16,D}
 end
 
-# Whether a basis family can carry a polynomial order that varies from cell to
-# cell. Defaults to `false` and is answered `true` only by integrated Legendre,
-# whose hierarchic 1D modes make a mixed-order interface a pure question of which
-# shared-entity modes to generate.
+# One shared index set for every active cell, and the empty set for the rest.
+# This serves two cases that are the same case: a family with no per-cell order,
+# and a level whose palette has a single entry. Neither can lose a mode to the
+# minimum rule — every active cell asks the same question of neighbours carrying
+# the same order — so the filter would be a no-op, and a uniform level pays
+# nothing for the existence of the graded path.
+function _uniform_cell_modes(basis::BasisFamily, orders::CellOrders{D}, mesh::CartesianMesh{D},
+                             mode::Symbol, mask) where {D}
+    sets = [CartesianIndex{D}[], local_basis_indices(basis, orders.palette[1], mode)]
+    kind = Array{UInt16,D}(undef, mesh.cells)
+    for cell in cell_indices(mesh)
+        kind[cell] = is_active(mask, cell) ? UInt16(2) : UInt16(1)
+    end
+    return CellModes{D}(sets, kind)
+end
+
+# The multi-index set each cell of a level generates — the minimum rule — as a
+# basis-family hook. This generic method is the whole interface: it is what
+# `Level`'s constructor below calls, and it is bound here so the include order
+# stays the dependency map.
 #
-# B-splines answer `false`, and the reason is structural rather than a missing
-# implementation: the degree is a type parameter of the whole-axis knot vector
-# (`BSplineSpace{p}(kv)`), the clamped end multiplicity is `p + 1` so changing p
-# on one cell rewrites the vector's endpoints, the 1D dimension is `cells + p` —
-# a global count — and a function's support is `p + 1` cells wide, so no set of
-# functions belongs to one cell for a per-cell degree to name. There is likewise
-# no shared entity for a minimum rule to attach to: continuity at an interior
-# knot is C^(p−1), a property of the knot rather than of a face between two cells
-# with independent degrees.
-#
-# The trait is consulted only when the normalised order field is genuinely
-# non-uniform. A B-spline level handed a uniform per-cell field is still a
-# perfectly well defined level and must keep working.
-_supports_cell_order(::BasisFamily) = false
-_supports_cell_order(::IntegratedLegendre) = true
+# A family that declares `_supports_cell_order` supplies its own method where its
+# dof-key incidence machinery lives, exactly as a family supplies its own
+# `_coverage_constraints`: integrated Legendre's is in `dofs.jl`, next to
+# `_entity_carries` and the `TensorDofKey` factors it is expressed over, and the
+# B-spline family's would live in its extension. A family that has not supplied
+# one may only be handed a single-entry palette, and the refusal below is loud on
+# purpose. Falling through to `_uniform_cell_modes` with a real palette would
+# assemble every cell at `palette[1]` while `cell_order` reported the field the
+# caller asked for — a non-conforming space with no error anywhere, which is the
+# exact failure the minimum rule exists to prevent.
+function _cell_modes(basis::BasisFamily, orders::CellOrders{D}, mesh::CartesianMesh{D},
+                     mode::Symbol, mask) where {D}
+    length(orders.palette) == 1 ||
+        throw(ArgumentError("the $(basis_name(basis)) basis family answers _supports_cell_order " *
+                            "but supplies no _cell_modes method: the minimum rule for a graded " *
+                            "level is the family's to state, and the uniform fallback would " *
+                            "silently assemble every cell at $(orders.palette[1])."))
+    return _uniform_cell_modes(basis, orders, mesh, mode, mask)
+end
 
 # Translate a user-supplied `order` specification into either an `NTuple{D,Int}`
 # (uniform — today's representation, and the one the hot path keeps) or a dense
@@ -389,24 +454,22 @@ function _nominal_order(entries::Vector{NTuple{D,Int}}) where {D}
     return out
 end
 
-# Build the `CellOrders` record a level carries, or `nothing` when the normalised
-# field is uniform. Runs three checks a uniform level gets for free:
-#
-#   1. the family must declare `_supports_cell_order`;
-#   2. every palette entry must be a legal order for the family and mode — this
-#      is where the per-*cell* `order ≥ 1` requirement and the `:trunk` isotropy
-#      requirement are enforced, since `local_basis_indices` raises on both and a
-#      per-level check can no longer see a single offending cell;
-#   3. the palette must fit the `UInt16` class index.
+# Build the `CellOrders` record a level carries. Both methods run the same
+# per-palette-entry validation — `local_basis_indices(family, o, mode)`, which
+# checks the mode against the family and raises on an order the family rejects —
+# so the per-*cell* `order ≥ 1` requirement and the `:trunk` isotropy requirement
+# are enforced at the granularity a graded level needs, where a per-level check
+# can no longer see a single offending cell. The graded method adds two checks a
+# uniform level gets for free: the family must declare `_supports_cell_order`,
+# and the palette must fit the `UInt16` class index.
 #
 # This record is what the caller ASKED FOR, and it depends on nothing else — not
 # on the mask, not on the mode. What the basis then emits per cell is derived
-# from it by `_cell_modes` in the dof layer, which owns the key-incidence rule
-# the minimum rule is expressed over, and which `Level`'s constructor calls. The
-# forward reference resolves at call time, as `dof_layout`'s references to
-# `dirichlet.jl` do.
-function _build_cell_orders(::BasisFamily, order::NTuple{D,Int}, mesh::CartesianMesh{D},
-                            ::Symbol) where {D}
+# from it by `_cell_modes`, whose generic method is defined above and whose
+# per-family methods live where each family's key-incidence machinery does.
+function _build_cell_orders(family::BasisFamily, order::NTuple{D,Int}, mesh::CartesianMesh{D},
+                            mode::Symbol) where {D}
+    local_basis_indices(family, order, mode)    # mode against the family, order against both
     return CellOrders{D}([order], fill(UInt16(1), mesh.cells), order)
 end
 
@@ -419,22 +482,26 @@ function _build_cell_orders(family::BasisFamily, entries::Vector{NTuple{D,Int}},
                             "could name and no shared entity for the minimum rule to act on. Use " *
                             "the default integrated-Legendre basis, or pass one order for the level."))
     palette = NTuple{D,Int}[]
+    # A dictionary rather than a scan over `palette`: the class index is `UInt16`
+    # because an anisotropic hp field reaches hundreds of distinct orders on a
+    # modest grid, and `findfirst` over the palette made the build O(cells ×
+    # palette) — measured on a 512² field carrying 500 distinct orders, 284 ms
+    # against 174 ms. It is also the idiom `_cell_modes` already uses for its own
+    # dedup, so the two palette builders now read the same way.
+    slot = Dict{NTuple{D,Int},UInt16}()
     class = Array{UInt16,D}(undef, mesh.cells)
     for (i, ci) in enumerate(cell_indices(mesh))
         o = entries[i]
-        k = findfirst(==(o), palette)
-        if k === nothing
+        class[ci] = get!(slot, o) do
             length(palette) == typemax(UInt16) &&
                 throw(ArgumentError("a level carries at most $(typemax(UInt16)) distinct per-cell " *
                                     "orders, and this one asks for more. That is a palette index " *
                                     "limit, not a statement about your p-field."))
             push!(palette, o)
-            k = length(palette)
+            UInt16(length(palette))
         end
-        class[ci] = UInt16(k)
     end
     for o in palette
-        _check_basis_mode(family, mode, o)
         local_basis_indices(family, o, mode)     # raises on an order the family rejects
     end
     return CellOrders{D}(palette, class, _nominal_order(palette))
@@ -465,7 +532,9 @@ optional activation mask. Fields:
     uniform carries a palette of one entry, so there is no second
     representation and no second code path for the common case. Ask
     [`cell_order`](@ref) for a cell's order and [`nominal_order`](@ref) for
-    the per-axis maximum, which is a sizing quantity only.
+    the per-axis maximum, which is a sizing quantity only. Both take a
+    [`Space`](@ref) and a `level` keyword as well, which is how a caller who
+    is not inside the package should reach them.
   - `modes::CellModes{D}` — the multi-index sets those orders actually
     generate, after the minimum rule. **Derived**, never supplied: see
     [`CellModes`](@ref) for why that is the point rather than a detail.
@@ -476,14 +545,14 @@ optional activation mask. Fields:
     mask. `nothing` keeps every cell active and is the type-stable
     no-mask hot path; the `Union` is small so the `Level` type stays
     stable across `activate!` / `deactivate!` transitions between the
-    masked and unmasked states.
-  - `prune_covered::Bool` — internal. Always `true` from the public API;
-    see leaf semantics under [`space`](@ref). When `true`, this level sheds every high-order
-    mode all of whose incident cells a finer level covers (order
-    reduction), and additionally sheds a buried *linear* mode that a
-    nested finer level reproduces exactly (dedup). Integrated Legendre
-    only; every other family takes the empty generic fallback. See
-    `_coverage_constraints` in `dofs.jl` and [`space`](@ref).
+    masked and unmasked states. An `active =` selection that happens to
+    name every cell is stored as `nothing`, so the fast path survives a
+    round trip through [`adapt`](@ref) as well as through the mutators.
+
+Leaf semantics — which modes a covered level sheds — are a property of the
+whole superposition stack rather than of one level, so the switch lives on
+[`Space`](@ref) and is read once by `dof_layout`. See leaf semantics under
+[`space`](@ref).
 """
 struct Level{D,T<:Real,B<:BasisFamily}
     id::Int
@@ -494,7 +563,6 @@ struct Level{D,T<:Real,B<:BasisFamily}
     modes::CellModes{D}
     mode::Symbol
     mask::Union{Nothing,LevelMask{D}}
-    prune_covered::Bool
 
     # `modes` is DERIVED, and deriving it here is the whole point. It depends on
     # the orders, the mesh, the mode and the mask; when it was a constructor
@@ -506,16 +574,18 @@ struct Level{D,T<:Real,B<:BasisFamily}
     # and a 1e-16 residual. That mismatch used to be guarded by a witness field
     # recording which mask the table was built against; a guard is a confession
     # that the invariant can be violated. Computing the table from the arguments
-    # that determine it makes the mismatch unspellable instead, and the seven
-    # construction sites stop having to remember anything.
-    function Level{D,T,B}(id, role, mesh, basis, orders, mode, mask,
-                          prune_covered) where {D,T<:Real,B<:BasisFamily}
+    # that determine it makes the mismatch unspellable instead, and the
+    # construction sites — which now all go through `_level` / `_new_level`
+    # below — stop having to remember anything.
+    function Level{D,T,B}(id, role, mesh, basis, orders, mode,
+                          mask) where {D,T<:Real,B<:BasisFamily}
         return new{D,T,B}(id, role, mesh, basis, orders,
-                          _cell_modes(basis, orders, mesh, mode, mask), mode, mask, prune_covered)
+                          _cell_modes(basis, orders, mesh, mode, mask), mode, mask)
     end
 end
 
 """
+    nominal_order(V::Space; level) -> NTuple{D,Int}
     nominal_order(level::Level) -> NTuple{D,Int}
 
 The per-axis **maximum** order over the level's cells — a sizing quantity, and
@@ -533,15 +603,25 @@ measurement rather than by the compiler, because the read looked correct.
 Use it for buffer lengths and 1D factor tables, where over-sizing is safe. For
 anything that integrates, evaluates or subdivides, the question you want is
 [`cell_order`](@ref).
+
+The `Space` form takes the level by keyword, as every other space accessor does;
+the `Level` form is the one the package's own kernels call once they have
+resolved the level.
 """
 nominal_order(level::Level) = level.orders.nominal
 
 """
+    cell_order(V::Space, cell::CartesianIndex; level) -> NTuple{D,Int}
     cell_order(level::Level, cell::CartesianIndex) -> NTuple{D,Int}
 
 Per-axis polynomial order of one cell of `level`. A level whose order is uniform
 carries a palette of one entry, so this is the same lookup either way and there
 is no second code path for the common case.
+
+The `Space` form is the public spelling — a marking loop that already asks
+[`cell_box`](@ref)`(V, ci; level)` and [`cell_orders`](@ref)`(V; level)` asks
+this the same way, without reaching into `V.levels`. It costs one bounds check
+on the level index over the `Level` form, which is the one the kernels use.
 """
 @inline function cell_order(level::Level{D}, cell::CartesianIndex{D}) where {D}
     return level.orders.palette[level.orders.class[cell]]
@@ -568,16 +648,26 @@ its multi-indices here, or from a bank filled from `level.modes`.
     return level.modes.sets[level.modes.kind[cell]]
 end
 
-# Basis values / physical gradients of exactly the functions cell `cell` of
-# `level` generates, at reference point `xi`. The family-level `basis_values` and
-# `physical_basis_gradients` take an order and re-derive the index set from it,
-# which is the wrong set on a per-cell-order level — the minimum rule's kept set
-# is not the index set of any order. These two take the cell instead, so the
-# values they return pair positionally with `cell_dofs(layout, level.id, cell)`.
-#
-# Used by the point-evaluation paths in `postprocessing.jl`; the assembly hot
-# loops go through the workspace banks instead and never allocate here.
-function _cell_basis_values(level::Level{D}, cell::CartesianIndex{D}, xi::PointLike{D}) where {D}
+"""
+    basis_values(level::Level, cell::CartesianIndex, xi) -> Vector
+
+Values of exactly the functions cell `cell` of `level` generates, at reference
+point `xi ∈ [−1, 1]ᴰ`, in [`cell_basis_indices`](@ref) order.
+
+This is the per-cell half of the family interface's evaluation pair, and the one
+to reach for whenever the result will be paired with `cell_dofs`. The
+order-keyed method `basis_values(basis, order, mode, xi, cell)` re-derives its
+index set from the order it is handed, which on a level whose order varies from
+cell to cell is not the set the cell generates: the minimum rule has already
+removed the shared-entity modes a lower-order neighbour cannot match, and what
+is left is in general the index set of no order at all. This method reads the
+level's own table instead, so the values pair positionally with
+`cell_dofs(layout, level.id, cell)` on a uniform and a graded level alike.
+
+Allocates a fresh vector per call, as the order-keyed method does. The assembly
+hot loops go through the workspace banks instead and allocate nothing.
+"""
+function basis_values(level::Level{D}, cell::CartesianIndex{D}, xi::PointLike{D}) where {D}
     indices = cell_basis_indices(level, cell)
     ξ = _reference_coordinate(xi)
     R = eltype(ξ)
@@ -586,8 +676,21 @@ function _cell_basis_values(level::Level{D}, cell::CartesianIndex{D}, xi::PointL
     return _tensor_values!(level.basis, values, indices, p, ξ, _factor_buffers(p, R), cell)
 end
 
-function _cell_basis_gradients(level::Level{D}, cell::CartesianIndex{D}, cell_box::AxisBox{D,T},
-                               xi::PointLike{D}) where {D,T}
+"""
+    physical_basis_gradients(level::Level, cell::CartesianIndex, cell_box, xi) -> Vector{SVector{D}}
+
+Physical gradients of exactly the functions cell `cell` of `level` generates, on
+the axis-aligned `cell_box`, at reference point `xi ∈ [−1, 1]ᴰ`, in
+[`cell_basis_indices`](@ref) order.
+
+The gradient counterpart of [`basis_values`](@ref)`(level, cell, xi)` and it
+carries the same reason for existing: the order-keyed method derives its index
+set from an order, which is the wrong set on a level whose order varies from
+cell to cell. The chain rule is the one the order-keyed method documents —
+`∂N_α/∂x_d = (2 / h_d) · ∂N_α/∂ξ_d` with `h = edge_lengths(cell_box)`.
+"""
+function physical_basis_gradients(level::Level{D}, cell::CartesianIndex{D}, cell_box::AxisBox{D,T},
+                                  xi::PointLike{D}) where {D,T}
     indices = cell_basis_indices(level, cell)
     R = float(promote_type(map(typeof, Tuple(xi))..., T))
     ξ = SVector{D,R}(xi)
@@ -599,6 +702,14 @@ function _cell_basis_gradients(level::Level{D}, cell::CartesianIndex{D}, cell_bo
                           _factor_buffers(p, R), _factor_buffers(p, R), cell)
     return gradients
 end
+
+# The private spelling the point-evaluation paths in `postprocessing.jl` use.
+# These are bindings to the same two generics, not second implementations: the
+# per-cell evaluators were private while they were the only callers, and naming
+# them on the family interface is what makes the pairing rule statable in the
+# order-keyed docstrings.
+const _cell_basis_values = basis_values
+const _cell_basis_gradients = physical_basis_gradients
 
 # The per-cell minimum-rule table of a level, or `nothing` when the level is
 # uniform and every cell shares the level-wide index list. Assembly and transfer
@@ -632,11 +743,22 @@ Fields:
     no-FCM hot path: integration is over the bounding box `domain` and
     every cell is `:full`. With a `PhysicalDomain`, cut and fictitious
     cells are handled per the [`PhysicalDomain`](@ref) docstring.
+  - `prune_covered::Bool` — internal, and always `true` from the public
+    API. Leaf semantics: a cell carries basis functions only where no
+    finer level has taken its region over, which is what makes
+    superposition equivalent to ordinary refinement. See [`space`](@ref)
+    for the rule and for why it is not an option. It is a property of the
+    stack rather than of one level — a level cannot shed a covered mode
+    by itself, and the question is always "does something above this
+    reproduce it" — so it is carried once, here, and read once, by
+    `dof_layout`. `_unpruned` is the only writer of `false`: it builds
+    the unreduced twin the losslessness assertion is made against.
 """
 struct Space{D,T<:Real,L<:Tuple}
     domain::AxisBox{D,T}
     levels::L
     physical::Union{Nothing,PhysicalDomain}
+    prune_covered::Bool
 end
 
 """
@@ -654,6 +776,45 @@ function _level_by_id(V::Space, id::Integer)
         level.id == id && return level
     end
     throw(ArgumentError("unknown level id $id"))
+end
+
+# Bounds check shared by every entry point that takes a level index, returning
+# the index as an `Int` so the caller can use the result directly. Written once
+# because every site that spelled it out chose a different message, and two of
+# them raised a `BoundsError` naming the internal level tuple. `name` is the
+# user-visible name of the argument (`"from"`, `"marked level"`, …).
+function _check_level(V::Space, level::Integer, name::AbstractString="level")
+    1 <= level <= length(V.levels) ||
+        throw(ArgumentError("$name index $level is out of bounds for a space with " *
+                            "$(length(V.levels)) levels"))
+    return Int(level)
+end
+
+# The guard the `level => spec` verbs share: every named level exists, and none
+# is named twice. Naming a level twice is always a mistake rather than a
+# last-one-wins composition — the two specs would be applied in argument order
+# and the first silently discarded — and `verb` names the call in the message.
+function _check_named_once(V::Space, pairs, verb::AbstractString)
+    named = falses(length(V.levels))
+    for (level, _) in pairs
+        k = _check_level(V, level)
+        named[k] && throw(ArgumentError("level $k is named more than once in one `$verb` call"))
+        named[k] = true
+    end
+    return nothing
+end
+
+# `V` with its level tuple replaced, and with everything else — domain, physical
+# domain, leaf semantics — carried over. Every rebuild in this file funnels
+# through these two, which is what keeps a new `Space` or `Level` field from
+# having to be remembered at eight call sites; before them, each site spelled out
+# the full positional constructor and a `ntuple` splice of its own.
+function _with_levels(V::Space{D,T}, levels::Tuple) where {D,T}
+    Space{D,T,typeof(levels)}(V.domain, levels, V.physical, V.prune_covered)
+end
+
+function _with_level(V::Space, k::Int, level::Level)
+    return _with_levels(V, ntuple(i -> i == k ? level : V.levels[i], length(V.levels)))
 end
 
 # ── Basis-family hooks ────────────────────────────────────────────────────────
@@ -676,8 +837,11 @@ than buried in a `Level` constructor overload) makes the extension point
 explicit and means every level-building path treats mesh-dependent
 families uniformly.
 
-All of [`space`](@ref), [`overlay`](@ref), [`moved_space`](@ref), and the
-mask mutators route the basis through this hook, so a mesh-dependent
+Every level-building path routes the basis through this hook — there are
+exactly two, `_new_level` for a level built from a user specification
+([`space`](@ref), [`overlay`](@ref), [`elevate`](@ref)) and `_level` for a
+copy of an existing one ([`moved_space`](@ref), [`adapt`](@ref), the mask
+mutators, the fictitious fold, level-id reindexing) — so a mesh-dependent
 family is rebuilt whenever the mesh changes (e.g. an overlay move) and is
 validated against the level's `order` and `mode` at construction time.
 `mask` is the normalised [`LevelMask`](@ref) (`nothing` for an all-active
@@ -691,16 +855,9 @@ function instantiate_basis(basis::BasisFamily, mesh::CartesianMesh{D,T}, order::
     basis
 end
 
-# Whether a basis family supports an immersed `PhysicalDomain` — the α-FCM fold,
-# cut-cell moment-fit quadrature, and the fictitious-fold exemption that keeps a
-# cut cell's boundary modes on its fully-fictitious fold faces. Defaults to
-# `true`, and both shipped families answer it: the exemption is the only piece a
-# family has to get right, and each has it. A family whose constraint generator
-# lacks one must override this to `false` rather than degrade the FCM solution
-# silently.
-_supports_physical_domain(::BasisFamily) = true
-
 # Reject a `PhysicalDomain` on a basis family that cannot integrate it yet.
+# The trait it consults, `_supports_physical_domain`, is declared with the rest
+# of the family interface in `basis.jl`; this is the space-construction guard.
 # Called from every space-building entry point once the concrete family exists.
 function _check_physical_basis(family::BasisFamily, physical)
     physical === nothing ||
@@ -712,6 +869,44 @@ function _check_physical_basis(family::BasisFamily, physical)
 end
 
 # ── Space construction ────────────────────────────────────────────────────────
+
+# A brand-new `Level` from a user-facing specification: the normalise → check →
+# instantiate → derive pipeline `space`, `overlay` and `_reordered_space` each
+# used to spell out. `field` is the already-normalised order (a tuple or a
+# per-cell vector) and `mask` the already-normalised activation, because
+# `_reordered_space` reuses the level's stored mask and `_normalize_mask` would
+# copy it for nothing.
+#
+# The step order matters and is not free to rearrange: `instantiate_basis` must
+# run before `_build_cell_orders`, because a deferred family (the B-spline spec)
+# is not a family yet and `_supports_cell_order` has to be asked of the concrete
+# one.
+function _new_level(id::Int, role::Symbol, mesh::CartesianMesh{D,T}, basis, field, mode::Symbol,
+                    mask, physical) where {D,T}
+    family = instantiate_basis(basis, mesh, _nominal_order(field), mode, mask)
+    _check_physical_basis(family, physical)
+    orders = _build_cell_orders(family, field, mesh, mode)
+    return Level{D,T,typeof(family)}(id, role, mesh, family, orders, mode, mask)
+end
+
+# A copy of an existing `Level` with one thing changed, by keyword. Every rebuild
+# in this file is one of these: a move changes the mesh, `activate!` the mask,
+# `_apply_physical_fold` the mask, coupling the id.
+#
+# The family is re-instantiated unconditionally. That is behaviour-preserving
+# rather than merely convenient: `instantiate_basis` consumes the mesh, the
+# nominal order, the mode and the mask, the first two of which are the only ones
+# a family's concrete form can depend on here — integrated Legendre returns
+# itself, and the B-spline hook rebuilds knot vectors from the mesh axes and the
+# degree, with "a mask changes nothing about the knot vectors" stated in the
+# extension. Before this helper the sites disagreed about it — `moved_space` and
+# the mask rebuilds re-instantiated while the fold and the reindex did not — and
+# the disagreement was invisible because the answers coincide.
+function _level(old::Level{D,T}; id=old.id, mesh=old.mesh, orders=old.orders,
+                mask=old.mask) where {D,T}
+    family = instantiate_basis(old.basis, mesh, orders.nominal, old.mode, mask)
+    return Level{D,T,typeof(family)}(id, old.role, mesh, family, orders, old.mode, mask)
+end
 
 """
     space(domain::AxisBox; cells, order=1, basis=IntegratedLegendre(),
@@ -760,7 +955,9 @@ Keyword arguments:
 
       * a `LevelMask{D}`, or an `AbstractArray{Bool,D}` shaped exactly like
         the level's cell grid, `true` where the cell participates. Both are
-        copied, so mutating the argument afterwards does not reach the level;
+        copied, so mutating the argument afterwards does not reach the level.
+        A selection naming every cell is stored as the no-mask default, which
+        is the same level;
       * a predicate `(cell_box, cell_index) -> Bool` evaluated once per
         cell, with `cell_box` the cell's [`AxisBox`](@ref) and `cell_index`
         its `CartesianIndex{D}`;
@@ -796,10 +993,11 @@ Keyword arguments:
       * a buried **linear** mode is dropped when one finer level
         reproduces it exactly, which takes both halves of a test: that
         level's mesh must refine this one's (`_nested_over` in
-        `src/coverage.jl`) *and* its basis must be integrated Legendre.
-        A buried vertex function is a C⁰ hat, and a basis smoother than
-        C⁰ across its own cell boundaries — a B-spline of degree ≥ 2 —
-        carries nothing that reproduces the kink.
+        `src/coverage.jl`) *and* its basis must span that mesh's hats
+        (`_spans_hats` in `src/dofs.jl`). A buried vertex function is a
+        C⁰ hat, and a basis smoother than C⁰ across its own cell
+        boundaries — a B-spline of degree ≥ 2 — carries nothing that
+        reproduces the kink.
 
   Leaving a covered mode active makes the superposed operator singular,
   because it and the covering level's reproduction of it are linearly
@@ -829,16 +1027,9 @@ Keyword arguments:
 function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(),
                mode::Symbol=:tensor, active=nothing, physical=nothing) where {D,T}
     base_mesh = CartesianMesh(domain; cells)
-    field = _normalize_order(order, base_mesh)
-    orders = _nominal_order(field)
-    _check_basis_mode(mode, orders)
-    mask = _normalize_mask(active, base_mesh)
-    family = instantiate_basis(basis, base_mesh, orders, mode, mask)
-    _check_physical_basis(family, physical)
-    cell_orders = _build_cell_orders(family, field, base_mesh, mode)
-    base_level = Level{D,T,typeof(family)}(1, :base, base_mesh, family, cell_orders, mode, mask,
-                                           true)
-    return Space{D,T,Tuple{typeof(base_level)}}(domain, (base_level,), physical)
+    base_level = _new_level(1, :base, base_mesh, basis, _normalize_order(order, base_mesh), mode,
+                            _normalize_mask(active, base_mesh), physical)
+    return Space{D,T,Tuple{typeof(base_level)}}(domain, (base_level,), physical, true)
 end
 
 """
@@ -881,22 +1072,14 @@ function overlay(V::Space{D,T}, domain::AxisBox{D,T}; cells, order=nominal_order
     is_inside(domain, V.domain, tolerance) ||
         throw(ArgumentError("overlay domain must lie inside the physical domain"))
     overlay_mesh = CartesianMesh(domain; cells)
-    field = _normalize_order(order, overlay_mesh)
-    orders = _nominal_order(field)
-    _check_basis_mode(mode, orders)
-    mask = _normalize_mask(active, overlay_mesh)
-    id = length(V.levels) + 1
-    family = instantiate_basis(basis, overlay_mesh, orders, mode, mask)
-    _check_physical_basis(family, V.physical)
-    cell_orders = _build_cell_orders(family, field, overlay_mesh, mode)
-    level = Level{D,T,typeof(family)}(id, :overlay, overlay_mesh, family, cell_orders, mode, mask,
-                                      true)
-    levels = (V.levels..., level)
-    return Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
+    level = _new_level(length(V.levels) + 1, :overlay, overlay_mesh, basis,
+                       _normalize_order(order, overlay_mesh), mode,
+                       _normalize_mask(active, overlay_mesh), V.physical)
+    return _with_levels(V, (V.levels..., level))
 end
 
-# Rebuild `V` with leaf semantics DISABLED on every level, so a covered cell keeps
-# the modes it would otherwise shed. Internal, and deliberately not reachable from
+# Rebuild `V` with leaf semantics DISABLED, so a covered cell keeps the modes it
+# would otherwise shed. Internal, and deliberately not reachable from
 # the public API: the resulting space is never what a caller wants. On a stack
 # whose covers are aligned it is exactly singular — the coarse modes and the fine
 # level's reproductions of them are linearly dependent, and 169 to 1378 null
@@ -909,11 +1092,12 @@ end
 # removed redundancy and nothing else, and that assertion is the only instrument
 # that can see a wrong elimination — the reduced operator stays full rank at a
 # healthy condition number either way.
+#
+# The levels are shared rather than rebuilt: leaf semantics change which modes
+# the *dof layer* eliminates and nothing about what a level generates, so the
+# twin carries the very same `Level` values and costs one struct.
 function _unpruned(V::Space{D,T}) where {D,T}
-    levels = map(V.levels) do l
-        Level{D,T,typeof(l.basis)}(l.id, l.role, l.mesh, l.basis, l.orders, l.mode, l.mask, false)
-    end
-    return Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
+    return Space{D,T,typeof(V.levels)}(V.domain, V.levels, V.physical, false)
 end
 
 """
@@ -930,55 +1114,219 @@ function moved_space(V::Space{D,T}; level::Integer, to::AxisBox{D,T},
     1 < level <= length(V.levels) || throw(ArgumentError("only overlay levels can be moved"))
     is_inside(to, V.domain, tolerance) ||
         throw(ArgumentError("overlay domain must lie inside the physical domain"))
-    old = V.levels[level]
-    new_mesh = CartesianMesh(to; cells=old.mesh.cells)
-    # Re-instantiate the family against the moved mesh: mesh-dependent
-    # families (B-splines) must rebuild their knot vectors for the new
-    # cell coordinates; mesh-independent families return themselves.
-    family = instantiate_basis(old.basis, new_mesh, nominal_order(old), old.mode, old.mask)
+    k = Int(level)
+    old = V.levels[k]
     # The order field is indexed by cell and a move keeps the cell grid identical
-    # — only the coordinates change — so it carries over verbatim.
-    new_level = Level{D,T,typeof(family)}(old.id, old.role, new_mesh, family, old.orders, old.mode,
-                                          old.mask, old.prune_covered)
-    levels = ntuple(i -> i == level ? new_level : V.levels[i], length(V.levels))
-    return Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
+    # — only the coordinates change — so it carries over verbatim. `_level`
+    # re-instantiates the family against the moved mesh, which is what a
+    # mesh-dependent family (B-splines) needs to rebuild its knot vectors.
+    return _with_level(V, k, _level(old; mesh=CartesianMesh(to; cells=old.mesh.cells)))
 end
 
-# Rebuild `V` with the mask of one level replaced. Mirrors `moved_space`
-# but keeps the mesh / basis / order fixed and swaps only the mask. Used by
-# the `activate!` / `deactivate!` model-level mutators in `assembly.jl`.
-function _remasked_space(V::Space{D,T}, level_index::Integer, mask) where {D,T}
-    1 <= level_index <= length(V.levels) ||
-        throw(ArgumentError("level index $level_index out of bounds"))
-    old = V.levels[level_index]
-    family = instantiate_basis(old.basis, old.mesh, nominal_order(old), old.mode, mask)
-    # A mask edit changes which shared-entity modes survive. Nothing is rebuilt
-    # here: the order field is the caller's and is unaffected, and the constructor
-    # re-derives the modes from the new mask.
-    new_level = Level{D,T,typeof(family)}(old.id, old.role, old.mesh, family, old.orders, old.mode,
-                                          mask, old.prune_covered)
-    levels = ntuple(i -> i == level_index ? new_level : V.levels[i], length(V.levels))
-    return Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
+# Rebuild `V` with the mask of one level replaced. Mirrors `moved_space` but
+# keeps the mesh / basis / order fixed and swaps only the mask. `mask` must
+# already be normalised. Used by [`adapt`](@ref) and by the `activate!` /
+# `deactivate!` model-level mutators in `model.jl`.
+#
+# A mask edit changes which shared-entity modes survive, and nothing has to be
+# rebuilt for that: the order field is the caller's and is unaffected, and
+# `Level`'s constructor re-derives the modes from the new mask.
+function _remasked_space(V::Space, level_index::Integer, mask)
+    k = _check_level(V, level_index)
+    return _with_level(V, k, _level(V.levels[k]; mask=mask))
 end
+
+# ── Reading a level ───────────────────────────────────────────────────────────
+
+"""
+    active_cells(V::Space; level) -> BitArray
+
+Which cells of `level` are active, as a copy. A level with no mask returns an
+all-true array. The `Space` counterpart of `active_cells(::Model; level)`, and
+the read half of an adaptive step: fetch a level's mask, edit it per cell, hand
+it back to [`adapt`](@ref).
+
+On a `Space` this is the mask as written. The `Model` method reports the
+*effective* mask by default, which on a space carrying a [`PhysicalDomain`](@ref)
+already has the fictitious fold applied; pass `effective = false` there to read
+back what the caller asked for.
+"""
+function active_cells(V::Space{D}; level::Integer) where {D}
+    lvl = V.levels[_check_level(V, level)]
+    lvl.mask === nothing && return trues(lvl.mesh.cells)
+    return copy(lvl.mask.on)
+end
+
+"""
+    cell_orders(V::Space; level) -> Array{NTuple{D,Int},D}
+
+Per-axis polynomial order of every cell of `level`, as a fresh array. A level
+whose order is uniform returns that order repeated over the cell grid, so the
+result has the same shape and meaning whether or not the level carries a per-cell
+field.
+
+The read half of a p-adaptive step, and the `Space` counterpart of
+`cell_orders(::Model; level)`: fetch a level's orders, edit them per cell, hand
+them back to [`elevate`](@ref). Round-tripping through `elevate` is an identity.
+
+```julia
+p = cell_orders(V; level=1)
+p[marked] .+= 1
+V = elevate(V, 1 => p)
+```
+"""
+function cell_orders(V::Space{D}; level::Integer) where {D}
+    lvl = V.levels[_check_level(V, level)]
+    return [lvl.orders.palette[c] for c in lvl.orders.class]
+end
+
+nominal_order(V::Space; level::Integer) = nominal_order(V.levels[_check_level(V, level)])
+
+function cell_order(V::Space{D}, cell::CartesianIndex{D}; level::Integer) where {D}
+    return cell_order(V.levels[_check_level(V, level)], cell)
+end
+
+"""
+    cell_indices(V::Space; level) -> CartesianIndices
+
+Cell index space of `level`. Together with [`cell_box`](@ref)'s `Space` method
+this is what lets a caller build a cell selection — evaluate an error indicator
+per cell, mark, [`adapt`](@ref) — without reaching into `V.levels[k].mesh`.
+"""
+cell_indices(V::Space; level::Integer) = cell_indices(V.levels[_check_level(V, level)].mesh)
+
+"""
+    cell_box(V::Space, index::CartesianIndex; level) -> AxisBox
+
+Axis-aligned box of one cell of `level`, in the physical frame.
+"""
+function cell_box(V::Space{D}, index::CartesianIndex{D}; level::Integer) where {D}
+    return cell_box(V.levels[_check_level(V, level)].mesh, index)
+end
+
+# ── Writing a level: the `elevate` and `adapt` verbs ──────────────────────────
+
+# The order spec shape that only `elevate` can serve: `cell => order` pairs
+# against the level's current field. Normalised here rather than in
+# `_normalize_order` because it needs a base to fill the unnamed cells from, and
+# `space` / `overlay` have none.
+function _pair_orders(V::Space{D}, k::Int, pairs) where {D}
+    lvl = V.levels[k]
+    out = cell_orders(V; level=k)
+    for entry in pairs
+        entry isa Pair || throw(ArgumentError("an order pair list must contain " *
+                                              "`CartesianIndex{$D} => order` entries; got $(typeof(entry))"))
+        cell, order = entry
+        cell isa CartesianIndex{D} ||
+            throw(ArgumentError("an order pair list must be keyed by CartesianIndex{$D}; " *
+                                "got $(typeof(cell))"))
+        checkbounds(Bool, out, cell) ||
+            throw(ArgumentError("cell index $cell is out of bounds for mesh cells $(lvl.mesh.cells)"))
+        out[cell] = _axis_int_tuple(order, Val(D), :order)
+    end
+    return out
+end
+
+_normalize_elevate_spec(V::Space, k::Int, spec::Pair) = _pair_orders(V, k, (spec,))
+_normalize_elevate_spec(V::Space, k::Int, spec::AbstractVector{<:Pair}) = _pair_orders(V, k, spec)
+_normalize_elevate_spec(::Space, ::Int, spec) = spec
 
 # Rebuild `V` with the polynomial order of one level replaced. Mirrors
 # `_remasked_space` but keeps the mesh / basis / mask fixed and swaps only the
 # order field, so the level's type — and with it the `Space` type and the
-# compiled assembly pipeline — is unchanged. Used by the `elevate` verb in
-# `ladder.jl`.
-function _reordered_space(V::Space{D,T}, level_index::Integer, spec) where {D,T}
-    1 <= level_index <= length(V.levels) ||
-        throw(ArgumentError("level index $level_index out of bounds"))
-    old = V.levels[level_index]
-    field = _normalize_order(_normalize_elevate_spec(V, Int(level_index), spec), old.mesh)
-    orders = _nominal_order(field)
-    _check_basis_mode(old.mode, orders)
-    family = instantiate_basis(old.basis, old.mesh, orders, old.mode, old.mask)
-    cell_orders = _build_cell_orders(family, field, old.mesh, old.mode)
-    new_level = Level{D,T,typeof(family)}(old.id, old.role, old.mesh, family, cell_orders, old.mode,
-                                          old.mask, old.prune_covered)
-    levels = ntuple(i -> i == level_index ? new_level : V.levels[i], length(V.levels))
-    return Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
+# compiled assembly pipeline — is unchanged. The level's own mask is passed
+# through without re-normalising, which is why this goes to `_new_level` rather
+# than `_level`: the order field is new and the whole pipeline has to run for it.
+function _reordered_space(V::Space, level_index::Integer, spec)
+    k = _check_level(V, level_index)
+    old = V.levels[k]
+    field = _normalize_order(_normalize_elevate_spec(V, k, spec), old.mesh)
+    return _with_level(V, k,
+                       _new_level(old.id, old.role, old.mesh, old.basis, field, old.mode, old.mask,
+                                  V.physical))
+end
+
+"""
+    elevate(V::Space, level => order, ...) -> Space
+
+Return `V` with the named levels' polynomial orders replaced. Meshes, level
+boxes, activation masks and basis families are untouched, so the result has the
+*same type* as `V` and a model rebuilt from it does not recompile the assembly
+pipeline — the per-cell order lives in a `CellOrders` field, not in a type
+parameter.
+
+`order` takes every shape [`space`](@ref)'s `order` keyword takes — an integer,
+an `NTuple{D,Int}`, an array of either shaped like the level's cell grid, or a
+predicate `(cell_box, cell_index) -> order` — plus one shape that only makes
+sense against an existing level:
+
+  * an iterable of `CartesianIndex{D} => order` pairs, raising the listed cells
+    and leaving every other cell at the order it already has. It is the shape a
+    marking loop produces when it changes a dozen cells: the caller states only
+    what changed and never has to read, copy and hand back the whole field. The
+    level's current field is still read once here, to fill the cells the list
+    does not name.
+
+Where two cells of different order share a face, the shared entity carries the
+minimum of the two orders; see [`CellOrders`](@ref) for why that is what keeps
+the space C⁰, and [`space`](@ref) for the per-cell `order ≥ 1` and
+basis-family requirements, which are checked here too.
+
+This is a separate verb from [`adapt`](@ref) rather than another shape of its
+pair form, and the reason is dispatch rather than taste: a mask spec and an order
+spec collide irreducibly on `nothing` ("every cell active" versus "uniform
+order") and on a predicate (`-> Bool` versus `-> Int`), and neither collision can
+be detected before the value is used. Compose them instead —
+`elevate(adapt(V, h), p)` costs two cheap `Space` rebuilds and one
+[`prepare`](@ref), and the dof layout only ever sees the final hp state.
+"""
+function elevate(V::Space, pairs::Pair{<:Integer}...)
+    _check_named_once(V, pairs, "elevate")
+    out = V
+    for (level, spec) in pairs
+        out = _reordered_space(out, level, spec)
+    end
+    return out
+end
+
+"""
+    adapt(V::Space, level => cells, ...) -> Space
+
+Return `V` with the named levels' activation masks replaced. Level boxes, cell
+counts, orders and basis families are untouched, so the result has the *same
+type* as `V` and a model rebuilt from it does not recompile the assembly
+pipeline.
+
+The pair form sets each named level's mask outright and leaves every other level
+alone. `cells` takes the shapes `active =` accepts, so a mask written for
+[`overlay`](@ref) can be handed straight here:
+
+```julia
+m = active_cells(V; level=4)
+m[marked] .= true
+V = adapt(V, 4 => m)
+```
+
+Setting several levels in one call is one integration-plan and dof-layout
+rebuild; the same edit through [`activate!`](@ref) is one of each per level.
+
+Nothing requires a level to be active only where its parent is, or its active
+cells to tile whole parent cells. Both are admissible, and a feature far finer
+than a base cell can be resolved without paying for the intervening levels. What
+they cost is conditioning: where a level's active region boundary does not fall
+on the cell boundaries of the level below, the condition number of the assembled
+operator rises — measured at one to three orders of magnitude on stacked ragged
+masks, against a parent-aligned stack carrying several times the unknowns. Prefer
+a mask whose boundary follows the coarser level's cells when there is a choice.
+"""
+function adapt(V::Space, pairs::Pair{<:Integer}...)
+    _check_named_once(V, pairs, "adapt")
+    out = V
+    for (level, cells) in pairs
+        k = _check_level(V, level)
+        out = _remasked_space(out, k, _normalize_mask(cells, V.levels[k].mesh))
+    end
+    return out
 end
 
 # ── Fictitious-cell fold ──────────────────────────────────────────────────────
@@ -1058,7 +1406,7 @@ end
 # position stays dropped after the overlay moves somewhere it would be inside
 # Ω. Callers that fold repeatedly over a model's lifetime must therefore keep
 # the pre-fold space and re-derive from it — see `Model.prefold_space` and
-# `_moved_problem` in `model.jl`.
+# `_remodel!` in `model.jl`.
 function _apply_physical_fold(V::Space{D,T}, cache::_ClassifyCache{D,T}) where {D,T}
     V.physical === nothing && return V
     V.physical.keep_fictitious && return V
@@ -1066,15 +1414,9 @@ function _apply_physical_fold(V::Space{D,T}, cache::_ClassifyCache{D,T}) where {
     new_levels = ntuple(length(V.levels)) do i
         level = V.levels[i]
         fict = _level_fictitious_cells(level, V.physical, cache)
-        if any(fict)
-            new_mask = _fold_fictitious(level.mask, fict)
-            Level{D,T,typeof(level.basis)}(level.id, level.role, level.mesh, level.basis,
-                                           level.orders, level.mode, new_mask, level.prune_covered)
-        else
-            level
-        end
+        any(fict) ? _level(level; mask=_fold_fictitious(level.mask, fict)) : level
     end
-    return Space{D,T,typeof(new_levels)}(V.domain, new_levels, V.physical)
+    return _with_levels(V, new_levels)
 end
 
 # Convenience overload: allocate a one-shot classification cache, fold
@@ -1096,14 +1438,11 @@ _apply_physical_fold(V::Space{D,T}) where {D,T} = _apply_physical_fold(V, _Class
 # single-domain fast path). Positional level addressing (`move!` / `activate!`,
 # which index `V.levels` by position) is unaffected; `_level_by_id` scans by
 # id and works with any id assignment.
-function _reindex_space_levels(V::Space{D,T}, offset::Int) where {D,T}
+function _reindex_space_levels(V::Space, offset::Int)
     offset == 0 && return V
-    new_levels = ntuple(length(V.levels)) do i
-        lvl = V.levels[i]
-        Level{D,T,typeof(lvl.basis)}(lvl.id + offset, lvl.role, lvl.mesh, lvl.basis, lvl.orders,
-                                     lvl.mode, lvl.mask, lvl.prune_covered)
-    end
-    return Space{D,T,typeof(new_levels)}(V.domain, new_levels, V.physical)
+    return _with_levels(V,
+                        ntuple(i -> _level(V.levels[i]; id=V.levels[i].id + offset),
+                               length(V.levels)))
 end
 
 # ── Mask updates ──────────────────────────────────────────────────────────────
@@ -1144,16 +1483,16 @@ end
 
 # Build the new mask after activating or deactivating `cells` on a level
 # whose current mask is `old`. Starts from the current active set
-# (all-true if `old === nothing`), flips the selected cells, and collapses
-# an all-active result back to `nothing` so the no-mask hot path survives
-# bouncing in and out of the mask. `_flip_cells!` always runs (even when
-# the starting mask is all-on) so out-of-bounds and wrong-typed selectors
-# raise the same error regardless of the starting mask state.
+# (all-true if `old === nothing`), flips the selected cells, and returns
+# through `_collapse_mask` so the no-mask hot path survives bouncing in and out
+# of the mask. `_flip_cells!` always runs (even when the starting mask is
+# all-on) so out-of-bounds and wrong-typed selectors raise the same error
+# regardless of the starting mask state.
 function _apply_mask_update(old::Union{Nothing,LevelMask{D}}, mesh::CartesianMesh{D}, cells,
                             value::Bool) where {D}
     on = old === nothing ? trues(mesh.cells) : copy(old.on)
     _flip_cells!(on, cells, mesh, value)
-    return all(on) ? nothing : LevelMask{D}(on)
+    return _collapse_mask(on)
 end
 
 # ── Display ───────────────────────────────────────────────────────────────────
@@ -1163,10 +1502,10 @@ function Base.show(io::IO, level::Level)
           ", order=", nominal_order(level), ", mode=:", level.mode, ", basis=:",
           basis_name(level.basis))
     # A per-cell field is summarised by its palette size, never dumped: a graded
-    # level carries one order per cell and printing them all is unreadable.
-    if level.orders !== nothing
-        print(io, ", cell_orders=", length(level.orders.palette))
-    end
+    # level carries one order per cell and printing them all is unreadable. A
+    # uniform level's palette holds exactly one entry and says nothing worth
+    # printing, so the suffix appears only where the order actually varies.
+    length(level.orders.palette) > 1 && print(io, ", cell_orders=", length(level.orders.palette))
     if level.mask !== nothing
         print(io, ", active=", count(level.mask.on), "/", length(level.mask.on))
     end

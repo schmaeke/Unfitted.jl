@@ -1,7 +1,7 @@
 using StaticArrays
 using LinearAlgebra: norm
 
-using Unfitted: dof_layout, cell_dofs, cell_basis_indices, _cell_basis_values, _level_by_id,
+using Unfitted: dof_layout, cell_dofs, cell_basis_indices, basis_values, _level_by_id,
                 _index_admissible, local_basis_indices, _tensor_values!, _factor_buffers,
                 _entity_carries, _incident_cells, TensorDofKey, _axis_dof_key, _AXIS_SPAN,
                 _supports_cell_order, IntegratedLegendre, cell_order
@@ -38,8 +38,8 @@ function trace_jump(V, lid, a, b, d; n=13)
     worst = 0.0
     for g in tangential
         face(sign) = SVector{D,Float64}(ntuple(k -> k == d ? sign : g[k < d ? k : k - 1], D))
-        va = _cell_basis_values(level, a, face(1.0))
-        vb = _cell_basis_values(level, b, face(-1.0))
+        va = basis_values(level, a, face(1.0))
+        vb = basis_values(level, b, face(-1.0))
         for r in union(ra, rb)
             ia = findfirst(==(r), ra)
             ib = findfirst(==(r), rb)
@@ -77,7 +77,7 @@ const _CO_3D = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
         dense = space(Ω; cells=cells, order=fill(p, ntuple(_ -> cells, D)))
         @test length(plain.levels[1].orders.palette) == 1
         @test length(dense.levels[1].orders.palette) == 1  # collapsed, not merely equal
-        @test nominal_order(dense.levels[1]) == nominal_order(plain.levels[1])
+        @test nominal_order(dense; level=1) == nominal_order(plain; level=1)
         @test dof_layout(dense).active_count == dof_layout(plain).active_count
         @test cell_orders(plain; level=1) == fill(ntuple(_ -> p, D), ntuple(_ -> cells, D))
     end
@@ -85,7 +85,7 @@ const _CO_3D = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
     # A predicate that returns one order everywhere collapses too.
     V = space(_CO_2D; cells=4, order=(_box, _cell) -> 2)
     @test length(V.levels[1].orders.palette) == 1
-    @test nominal_order(V.levels[1]) == (2, 2)
+    @test nominal_order(V; level=1) == (2, 2)
 
     # And a stacked, pruned space keeps its reduction verdicts.
     ref = overlay(space(_CO_2D; cells=4, order=3), box((0.25, 0.25), (0.75, 0.75)); cells=4,
@@ -266,8 +266,8 @@ end
     # recompile the assembly pipeline.
     @test typeof(W) === typeof(V)
     @test cell_orders(W; level=1) == p
-    @test nominal_order(W.levels[1]) == (5, 5)                 # nominal = per-axis maximum
-    @test nominal_order(elevate(W, 1 => cell_orders(W; level=1)).levels[1]) == (5, 5)
+    @test nominal_order(W; level=1) == (5, 5)                  # nominal = per-axis maximum
+    @test nominal_order(elevate(W, 1 => cell_orders(W; level=1)); level=1) == (5, 5)
     # Round-tripping back to a flat field collapses the representation again.
     @test length(elevate(W, 1 => 2).levels[1].orders.palette) == 1
 
@@ -283,7 +283,7 @@ end
     S = overlay(space(_CO_2D; cells=4, order=2), box((0.25, 0.25), (0.75, 0.75)); cells=2,
                 order=[3 4; 4 3])
     @test cell_orders(S; level=2) == [(3, 3) (4, 4); (4, 4) (3, 3)]
-    @test nominal_order(S.levels[2]) == (4, 4)
+    @test nominal_order(S; level=2) == (4, 4)
     @test worst_trace_jump(S; level=2) == 0.0
 end
 
@@ -444,10 +444,21 @@ end
     @test active_unknowns(prepare(mass(V2))) < active_unknowns(prepare(mass(V)))
 
     # A uniform level is a palette of one, not an absence — no second code path.
-    uniform = space(Ω; cells=(4, 4), order=3).levels[1]
-    @test length(uniform.orders.palette) == 1
-    @test cell_order(uniform, CartesianIndex(2, 2)) == (3, 3)
-    @test nominal_order(uniform) == (3, 3)
+    uniform = space(Ω; cells=(4, 4), order=3)
+    @test length(uniform.levels[1].orders.palette) == 1
+    # The `Space` forms are the public spelling: space plus a `level` keyword,
+    # like every other accessor, with no reach into `V.levels`.
+    @test cell_order(uniform, CartesianIndex(2, 2); level=1) == (3, 3)
+    @test nominal_order(uniform; level=1) == (3, 3)
+    @test cell_order(uniform.levels[1], CartesianIndex(2, 2)) == (3, 3)
+    # `show` summarises a per-cell field by its palette size. A uniform level's
+    # palette has one entry and says nothing, so the suffix belongs only on a
+    # level whose order actually varies.
+    @test !occursin("cell_orders=", sprint(show, uniform.levels[1]))
+    @test occursin("cell_orders=3", sprint(show, space(Ω; cells=(4, 4), order=field).levels[1]))
+    @test_throws ArgumentError cell_order(uniform, CartesianIndex(2, 2); level=2)
+    @test_throws ArgumentError nominal_order(uniform; level=0)
+    @test level_count(uniform) == 1
 
     # The fictitious fold re-masks underneath the user; it is the case that bit.
     disc = physical_domain(x -> sum(abs2, x .- 0.5) - 0.09; lipschitz=2.0, alpha=1e-8,
@@ -551,4 +562,32 @@ end
             end
         end
     end
+end
+
+# A family that declares the per-cell-order capability without supplying the
+# `_cell_modes` method that states its minimum rule. Declared here rather than in
+# `src/` because the point is exactly that no shipped family is in this state.
+struct _OptInNoRule <: Unfitted.BasisFamily end
+Unfitted.basis_name(::_OptInNoRule) = :opt_in_no_rule
+Unfitted._supports_cell_order(::_OptInNoRule) = true
+
+@testset "opting into per-cell order without a minimum rule is refused, not ignored" begin
+    # `_supports_cell_order` and the `_cell_modes` override used to be
+    # independent, so a family could pass `_build_cell_orders`, build a graded
+    # level, and assemble a non-conforming space with no error anywhere: the
+    # generic fallback gives every active cell `palette[1]`'s index set while
+    # `cell_order` reports the field that was asked for. The generic method now
+    # refuses a real palette, so the two cannot be separated.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    mesh = Unfitted.CartesianMesh(Ω; cells=(2, 2))
+    family = _OptInNoRule()
+    graded = Unfitted._build_cell_orders(family, [(1, 1), (2, 2), (1, 1), (2, 2)], mesh, :tensor)
+    @test length(graded.palette) == 2
+    @test_throws ArgumentError Unfitted._cell_modes(family, graded, mesh, :tensor, nothing)
+
+    # A one-entry palette is the uniform case and still goes through.
+    flat = Unfitted._build_cell_orders(family, (2, 2), mesh, :tensor)
+    modes = Unfitted._cell_modes(family, flat, mesh, :tensor, nothing)
+    @test length(modes.sets) == 2                        # the empty set plus the shared one
+    @test all(==(UInt16(2)), modes.kind)                 # every cell active
 end

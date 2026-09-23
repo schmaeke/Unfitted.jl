@@ -204,10 +204,10 @@ end
 
 @testset "documented shapes: base active=, selection shapes, array over pair, vacuous nesting" begin
     # Four shapes the docstrings promise and nothing exercised. The base-level
-    # `active =` one is the reason `adapt`'s array form hands `_with_masks` the
-    # private sentinel rather than `depth_masks`' documented `nothing`: `nothing`
-    # is itself a legal mask meaning "every cell", so passing it through would
-    # activate the very cells the caller deactivated.
+    # `active =` one is why `depth_masks` names only the overlay levels: a base
+    # cell at depth 0 is one no overlay refines, not one the base drops, and an
+    # array form that spoke for the base at all would activate the very cells the
+    # caller deactivated.
     m = trues(4, 4)
     m[1, 1] = false
     V = ladder(LADDER_OMEGA; cells=4, order=2, depth=1, splits=2, active=m)
@@ -264,7 +264,7 @@ end
     V = ladder(LADDER_OMEGA; cells=8, order=2, depth=3, splits=2)
     d = zeros(Int, 8, 8)
     d[4, 4] = 3
-    @test depth_masks(V, d)[1] === nothing                 # the base is never derived
+    @test first.(Unfitted.depth_masks(V, d)) == 2:4        # the base is never named
     plain = adapt(V, d)
     @test count(active_cells(plain; level=4)) == 8^2       # one base cell, 8x8 children
     graded = adapt(V, d; grade=1)
@@ -277,6 +277,32 @@ end
     @test count(active_cells(adapt(V, near; grade=1); level=2)) ==
           count(active_cells(adapt(V, far; grade=1); level=2))
     @test_throws ArgumentError adapt(V, d; grade=-1)
+end
+
+@testset "depth_masks pairs splat into adapt, and an all-active mask is no mask" begin
+    # `depth_masks` is the internal behind `adapt`'s array form and its result is
+    # documented as splatting straight into the pair form. That identity is the
+    # whole contract, so assert it rather than the shape.
+    V = ladder(LADDER_OMEGA; cells=4, order=2, depth=2, splits=2)
+    d = zeros(Int, 4, 4)
+    d[2, 3] = 2
+    by_array = adapt(V, d)
+    by_pairs = adapt(V, Unfitted.depth_masks(V, d)...)
+    @test all(k -> active_cells(by_array; level=k) == active_cells(by_pairs; level=k), 1:3)
+
+    # A ladder with no overlay names no level, and the array form is then the
+    # identity rather than an error.
+    flat = ladder(LADDER_OMEGA; cells=4, order=2, depth=0)
+    @test isempty(Unfitted.depth_masks(flat, zeros(Int, 4, 4)))
+    @test active_cells(adapt(flat, zeros(Int, 4, 4)); level=1) == trues(4, 4)
+
+    # An all-active selection is stored as the no-mask default, whichever route
+    # it arrives by, so the coverage and dof fast paths survive a round trip.
+    @test space(LADDER_OMEGA; cells=4, order=2, active=trues(4, 4)).levels[1].mask === nothing
+    @test adapt(V, 2 => trues(8, 8)).levels[2].mask === nothing
+    @test adapt(V, 2 => cell_indices(V; level=2)).levels[2].mask === nothing
+    full = fill(2, 4, 4)
+    @test adapt(V, full).levels[3].mask === nothing
 end
 
 @testset "is_nested is asserted false where it should be" begin

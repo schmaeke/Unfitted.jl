@@ -44,6 +44,14 @@ A new family `F <: BasisFamily` must provide:
     family depends on the level's mesh. The `::BasisFamily` default returns the
     family unchanged; see [`instantiate_basis`](@ref) for the five-argument
     contract and why the hook exists.
+  - `_supports_cell_order(::F)` — `false` by default, and a *loud* default: a
+    non-uniform `order =` on a family that declines it raises rather than being
+    silently flattened. Answer `true` only where a per-cell degree names a set of
+    functions and the minimum rule has a shared entity to act on, and supply the
+    matching `_cell_modes` method (`src/dofs.jl`) in the same change —
+    `_index_admissible` below is the per-axis filter that rule is expressed over,
+    and `test_cell_order.jl` asserts its monotonicity in the order, which is what
+    makes the rule correct.
 
 It inherits the basis-agnostic `::BasisFamily` defaults and overrides only the
 ones that do not fit: `recommended_quadrature_order` (`order .+ 1`),
@@ -65,8 +73,8 @@ about them deliberately:
     thing a family must supply, and it is a single test on the inactive
     neighbour of a face.
   - `_coverage_constraints` (`src/dofs.jl`) — the generic method returns no
-    constraints, so on a family that does not override it `prune_covered` still
-    defaults to `true` and does nothing. Overriding it is not only about
+    constraints, so on a family that does not override it the space's leaf
+    semantics stay on and do nothing. Overriding it is not only about
     shedding dofs: where a covering level's span *contains* one of this level's
     functions, the two are linearly dependent and the superposed operator is
     exactly singular until one of them is eliminated here. Both shipped
@@ -263,26 +271,27 @@ end
 _supported_modes(::BasisFamily) = (:tensor,)
 _supported_modes(::IntegratedLegendre) = (:tensor, :trunk)
 
-# Validate a basis-mode symbol against the per-axis polynomial order, without
-# reference to a family. `:tensor` accepts anisotropic orders; `:trunk`
-# requires isotropic order, since the trunk-degree filter compares against a
-# single scalar `p`. `space` / `overlay` run this form before
-# `instantiate_basis` has produced a concrete family, so it can only reject a
-# mode name the package does not define at all.
-function _check_basis_mode(mode::Symbol, order::NTuple{D,Int}) where {D}
+# Validate a basis-mode symbol against a concrete family and a per-axis
+# polynomial order. Three conditions, in one place because there is only ever
+# one caller position for them — the family's own index-set constructor:
+#
+#   * the symbol must be a mode the package defines at all;
+#   * `:trunk` requires isotropic order, since the trunk-degree filter compares
+#     against a single scalar `p`;
+#   * the family must list the mode in its `_supported_modes`, which is what
+#     rejects a mode the package defines but *this* family cannot serve, so a
+#     family needs no hand-written mode guard of its own.
+#
+# There used to be a second, family-blind two-argument form, run by `space` and
+# `overlay` before `instantiate_basis` had produced a concrete family. Nothing
+# needed the answer that early: every `Level` construction reaches
+# `local_basis_indices` — through `_build_cell_orders` on a graded level and
+# through `_cell_modes` on a uniform one — and that is where this check lives.
+function _check_basis_mode(basis::BasisFamily, mode::Symbol, order::NTuple{D,Int}) where {D}
     mode in (:tensor, :trunk) || throw(ArgumentError("basis mode must be :tensor or :trunk"))
     if mode === :trunk && any(!=(order[1]), order)
         throw(ArgumentError("mode=:trunk requires isotropic order"))
     end
-    return mode
-end
-
-# Validate a basis-mode symbol against a concrete family: the family-blind
-# check above, plus the family's own `_supported_modes`. This is what rejects
-# a mode the package defines but *this* family cannot serve, so a family needs
-# no hand-written mode guard of its own.
-function _check_basis_mode(basis::BasisFamily, mode::Symbol, order::NTuple{D,Int}) where {D}
-    _check_basis_mode(mode, order)
     supported = _supported_modes(basis)
     mode in supported || throw(ArgumentError("basis family $(basis_name(basis)) does not support " *
                                              "mode=:$mode; supported: $(join(supported, ", "))"))
@@ -452,6 +461,42 @@ function local_basis_indices(basis::IntegratedLegendre, order::NTuple{D,Int},
     mode === :tensor && return indices
     return [id for id in indices if _trunk_degree(id) <= order[1]]
 end
+
+# ── Family capability traits ──────────────────────────────────────────────────
+
+# Whether a basis family can carry a polynomial order that varies from cell to
+# cell. Defaults to `false` and is answered `true` only by integrated Legendre,
+# whose hierarchic 1D modes make a mixed-order interface a pure question of which
+# shared-entity modes to generate.
+#
+# B-splines answer `false`, and the reason is structural rather than a missing
+# implementation: the degree is a type parameter of the whole-axis knot vector
+# (`BSplineSpace{p}(kv)`), the clamped end multiplicity is `p + 1` so changing p
+# on one cell rewrites the vector's endpoints, the 1D dimension is `cells + p` —
+# a global count — and a function's support is `p + 1` cells wide, so no set of
+# functions belongs to one cell for a per-cell degree to name. There is likewise
+# no shared entity for a minimum rule to attach to: continuity at an interior
+# knot is C^(p−1), a property of the knot rather than of a face between two cells
+# with independent degrees.
+#
+# The trait is consulted only when the normalised order field is genuinely
+# non-uniform. A B-spline level handed a uniform per-cell field is still a
+# perfectly well defined level and must keep working. A family that answers
+# `true` owes the dof layer a `_cell_modes` method as well: the generic one
+# (`mesh.jl`) refuses a real palette rather than assembling every cell at the
+# first palette entry, because the minimum rule is the family's to state.
+_supports_cell_order(::BasisFamily) = false
+_supports_cell_order(::IntegratedLegendre) = true
+
+# Whether a basis family supports an immersed `PhysicalDomain` — the α-FCM fold,
+# cut-cell moment-fit quadrature, and the fictitious-fold exemption that keeps a
+# cut cell's boundary modes on its fully-fictitious fold faces. Defaults to
+# `true`, and both shipped families answer it: the exemption is the only piece a
+# family has to get right, and each has it. A family whose constraint generator
+# lacks one must override this to `false` rather than degrade the FCM solution
+# silently. `_check_physical_basis` in `mesh.jl` is the space-construction guard
+# that consults it.
+_supports_physical_domain(::BasisFamily) = true
 
 """
     _index_admissible(basis, order, mode, id) -> Bool
@@ -683,6 +728,16 @@ the signature for *every* family rather than an overload some families add.
 This `::BasisFamily` method is built on `_tensor_values!` and therefore serves
 every family through its `_fill_factor_tables!` hook — there is nothing here
 for a family to override.
+
+!!! warning "Pairing with `cell_dofs`"
+    The result is in `local_basis_indices(basis, order, mode)` order, which is
+    the set the *order* names. On a level whose order varies from cell to cell
+    that is not the set the cell generates: the minimum rule removes the
+    shared-entity modes a lower-order neighbour cannot match, and the survivors
+    are in general not the index set of any order. Pairing this vector
+    positionally with `cell_dofs(layout, level, cell)` then attaches values to
+    the wrong unknowns. Use `basis_values(level::Level, cell, xi)`, which takes
+    the cell rather than an order and reads `cell_basis_indices`.
 """
 function basis_values(basis::BasisFamily, order::NTuple{D,Int}, mode::Symbol, xi::PointLike{D},
                       cell::CartesianIndex{D}) where {D}
@@ -713,6 +768,13 @@ independent arguments because the chain-rule scaling needs the former while a
 span-based family needs the latter. As with [`basis_values`](@ref), this
 `::BasisFamily` method is built on `_tensor_values_grads!` and serves every
 family unchanged.
+
+!!! warning "Pairing with `cell_dofs`"
+    The result is in `local_basis_indices(basis, order, mode)` order and carries
+    the same caveat [`basis_values`](@ref) does: on a level whose order varies
+    from cell to cell the minimum rule has already removed modes from the cell's
+    set, so this vector does not line up with `cell_dofs`. Use
+    `physical_basis_gradients(level::Level, cell, cell_box, xi)` there.
 """
 function physical_basis_gradients(basis::BasisFamily, order::NTuple{D,Int}, mode::Symbol,
                                   cell_box::AxisBox{D,T}, xi::PointLike{D},

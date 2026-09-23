@@ -25,7 +25,7 @@
 #     `LevelMask` is in play — except where the inactive side is fully
 #     fictitious, since a fold face carries no physical trace to
 #     vanish on (`_internal_face_is_physical`).
-#   * Covered-mode pruning — on a level that opted into `prune_covered`, the
+#   * Covered-mode pruning — under the leaf semantics the space declares, the
 #     high-order modes buried under a finer level, plus the buried
 #     linear modes a nested finer level reproduces exactly. Also a
 #     strong elimination, and also artificial: it removes modes the
@@ -585,27 +585,16 @@ function _entity_carries(basis::BasisFamily, orders::CellOrders{D}, mask, key::T
     return true
 end
 
-# One shared index set for every active cell, and the empty set for the rest.
-# This serves two cases that are the same case: a family with no per-cell order,
-# and a level whose palette has a single entry. Neither can lose a mode to the
-# rule — every active cell asks the same question of neighbours carrying the same
-# order — so the filter below would be a no-op, and a uniform level pays nothing
-# for the existence of the graded path.
-function _uniform_cell_modes(basis::BasisFamily, orders::CellOrders{D}, mesh::CartesianMesh{D},
-                             mode::Symbol, mask) where {D}
-    sets = [CartesianIndex{D}[], local_basis_indices(basis, orders.palette[1], mode)]
-    kind = Array{UInt16,D}(undef, mesh.cells)
-    for cell in cell_indices(mesh)
-        kind[cell] = is_active(mask, cell) ? UInt16(2) : UInt16(1)
-    end
-    return CellModes{D}(sets, kind)
-end
-
-function _cell_modes(basis::BasisFamily, orders::CellOrders{D}, mesh::CartesianMesh{D},
-                     mode::Symbol, mask) where {D}
-    return _uniform_cell_modes(basis, orders, mesh, mode, mask)
-end
-
+# Integrated Legendre's method of the `_cell_modes` hook whose generic form is in
+# `mesh.jl`. It lives here, with `_entity_carries` and the `TensorDofKey` factors
+# the minimum rule is expressed over, the same way the B-spline family's
+# `_coverage_constraints` lives in its extension.
+#
+# The per-order index sets are hoisted out of the cell loop: there are only
+# `length(palette)` distinct answers and `local_basis_indices` allocates a fresh
+# vector on every call, so asking it per cell allocated one vector per active
+# cell of the level. Measured on a 16³ level carrying 36 distinct anisotropic
+# orders, 36 973 allocations and 30.6 ms against 23 912 and 28.5 ms.
 function _cell_modes(basis::IntegratedLegendre, orders::CellOrders{D}, mesh::CartesianMesh{D},
                      mode::Symbol, mask) where {D}
     length(orders.palette) == 1 && return _uniform_cell_modes(basis, orders, mesh, mode, mask)
@@ -613,13 +602,14 @@ function _cell_modes(basis::IntegratedLegendre, orders::CellOrders{D}, mesh::Car
     sets = [CartesianIndex{D}[]]
     index = Dict{Vector{CartesianIndex{D}},UInt16}(sets[1] => UInt16(1))
     kind = Array{UInt16,D}(undef, n)
+    sets_by_class = [local_basis_indices(basis, o, mode) for o in orders.palette]
     for cell in cell_indices(mesh)
         if !is_active(mask, cell)
             kind[cell] = UInt16(1)
             continue
         end
         kept = CartesianIndex{D}[]
-        for id in local_basis_indices(basis, orders.palette[orders.class[cell]], mode)
+        for id in sets_by_class[orders.class[cell]]
             key = TensorDofKey{D}(0, ntuple(d -> _axis_dof_key(cell.I[d], id.I[d]), D))
             _entity_carries(basis, orders, mask, key, n, mode, id) && push!(kept, id)
         end
@@ -656,8 +646,9 @@ _spans_hats(::IntegratedLegendre) = true
     _coverage_constraints(level, V, coverage, tol, level_keys, classify_cache)
         -> Vector{Tuple{LinearConstraint{T},Symbol}}
 
-Pruning constraint source, a peer of [`_overlay_constraints`](@ref). For a
-level opted into `prune_covered`, emit a single-raw strong elimination for
+Pruning constraint source, a peer of [`_overlay_constraints`](@ref). Under the
+leaf semantics the space declares (`Space.prune_covered`), emit a single-raw
+strong elimination for
 
   * every **buried high-order** mode (at least one bubble axis, every active incident
     cell covered by and every fictitious one reached by a single finer level) —
@@ -710,12 +701,12 @@ function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{
     # It deliberately does NOT ask the covering level to carry this level's
     # order. Shedding a buried high-order mode is not a claim that something
     # reproduces it — that is the dedup half's job, for linear modes. It is the
-    # opt-in this level made with `prune_covered`: over a region a finer level
+    # leaf semantics the space declares: over a region a finer level
     # resolves, a coarse cell's high-order modes buy almost nothing in L² and
     # carry the oscillation, so a *high-order base with a low-order fine overlay
     # over a non-smooth feature* is exactly the configuration the rule exists to
-    # serve. Gating on the cover's order turns `prune_covered = true` into
-    # `prune_covered = false` there: measured on a tanh layer with base p = 5 and
+    # serve. Gating on the cover's order turns leaf semantics off exactly there:
+    # measured on a tanh layer with base p = 5 and
     # a p = 2 overlay, the gate cut the base's shed modes from 189 to 5 and left
     # far-field oscillation and overshoot bit-identical to switching the rule
     # off (9.37e-3 both), against 9.95e-4 and 7.03e-4 without it.
@@ -942,10 +933,10 @@ Construct the basis-aware global dof layout for a superposition
      get an empty vector.
   2. Collect homogeneous linear constraints from every level, from two
      sources: the family-dispatched [`_overlay_constraints`](@ref) hook
-     on every level, and [`_coverage_constraints`](@ref) on the levels
-     that opted into `prune_covered` (which needs the per-level masks
-     [`build_coverage`](@ref) computes, so those are built first when
-     any level opted in). A raw the overlay condition already eliminates
+     on every level, and [`_coverage_constraints`](@ref) on every level
+     when the space declares leaf semantics (which needs the per-level
+     masks [`build_coverage`](@ref) computes, so those are built first,
+     and skipped entirely on an unpruned space). A raw the overlay condition already eliminates
      is not re-constrained by covered-mode pruning, so `elimination_source`
      credits it to the source that actually removed it. Resolve the
      collected constraints into the per-raw expansion table via
@@ -995,14 +986,22 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
 
     # Stage 1: walk every level's cells and assign raw dofs through the
     # `TensorDofKey` cache (cross-cell endpoint sharing happens here).
+    #
+    # Every inactive cell of every level shares one empty vector. A ladder makes
+    # inactive cells the overwhelming majority of the grid — measured on a
+    # depth-5 2D stack over a 6² base with one base cell refined to the bottom,
+    # 49 140 cells of which 1 400 are active — and a fresh `Int[]` per inactive
+    # cell put one heap allocation on each of them, on every rebuild, and
+    # `estimate` rebuilds. On that layout it is 74 856 allocations against
+    # 27 117. It is per call rather than a module-level constant because a
+    # `const` empty vector is one stray `push!` away from corrupting every
+    # inactive cell of every layout ever built.
+    none = Int[]
     for level in V.levels
         level_cells = Array{Vector{Int},D}(undef, level.mesh.cells)
         for cell in cell_indices(level.mesh)
-            if is_active(level.mask, cell)
-                level_cells[cell] = _build_cell_dofs!(raw_by_key, raw_keys, level, cell)
-            else
-                level_cells[cell] = Int[]
-            end
+            level_cells[cell] = is_active(level.mask, cell) ?
+                                _build_cell_dofs!(raw_by_key, raw_keys, level, cell) : none
         end
         cell_dofs_by_level[level.id] = level_cells
     end
@@ -1024,8 +1023,7 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     # The loop below keeps that split honest: a raw the overlay condition already
     # eliminates never reaches this map, whichever source names it second.
     source_of = Dict{Int,Symbol}()
-    reduce_any = any(level -> level.prune_covered, V.levels)
-    coverage = reduce_any ? build_coverage(V, tolerance, classify_cache) :
+    coverage = V.prune_covered ? build_coverage(V, tolerance, classify_cache) :
                Coverage{D}(Dict{Int,BitArray{D}}())
     for level in V.levels
         level_keys = get(keys_by_level, level.id, empty_keys)
@@ -1046,7 +1044,7 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
         # overlay constraints eliminate a named raw outright; a multi-raw
         # (B-spline) constraint picks its pivot during resolution, and that
         # family emits no coverage constraints at all.
-        if level.prune_covered
+        if V.prune_covered
             reductions = _coverage_constraints(level, V, coverage, tolerance, level_keys,
                                                classify_cache)
             overlay_raws = isempty(reductions) ? Set{Int}() :
@@ -1136,6 +1134,10 @@ active_unknowns(layout::DofLayout) = layout.active_count
 
 Pre-constraint raw dof ids for the cell at `cell` on level `level`, in
 the canonical local-basis order. Inactive cells return an empty vector.
+
+The vector is the layout's own and must not be mutated: every inactive cell of
+every level shares one empty vector, so a `push!` into a returned empty result
+would reach all of them. Copy before editing.
 """
 function cell_dofs(layout::DofLayout{D}, level::Integer, cell::CartesianIndex{D}) where {D}
     1 <= level <= length(layout.cell_dofs_by_level) ||

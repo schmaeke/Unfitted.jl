@@ -80,7 +80,7 @@ export AxisBox, GeometryTolerance, PhysicalDomain, physical_domain, classify_cel
        foreach_quadrature_point, foreach_interface_quadrature_point, interface_quadrature_count,
        nquadpoints, solve!, solution, move!, moved, moved_space, activate!, deactivate!,
        active_cells, cell_orders, elevate, elevated, cell_order, nominal_order, ladder, adapt,
-       adapted, depth_masks, is_nested, overlapping_cells, transfer, L2Projection, Rewire, estimate,
+       adapted, is_nested, overlapping_cells, level_count, transfer, L2Projection, Rewire, estimate,
        refine, coarsen, QuadField, RBFP0, write_vtk, write_quadrature_vtm, l2_error,
        boundary_integral, value, field_gradient, diagnostics, active_unknowns, cell_indices,
        cell_box, center, value_vec, gradient_tensor, symmetric_gradient
@@ -141,6 +141,13 @@ include("mesh.jl")
 include("intersections.jl")
 include("coverage.jl")
 include("ladder.jl")
+# Two files add methods to hooks declared earlier, so a name they define is
+# reached from above them and resolves at call time rather than at include time:
+# `dofs.jl` carries integrated Legendre's `_cell_modes` (the generic method is in
+# `mesh.jl`, which `Level`'s constructor calls) and `dirichlet.jl` carries the
+# boundary-condition machinery `dof_layout` calls. Both are family- or
+# concern-specific methods of an interface defined above, which is the same shape
+# an extension takes; every other dependency runs downward.
 include("dofs.jl")
 include("dirichlet.jl")
 include("surface.jl")

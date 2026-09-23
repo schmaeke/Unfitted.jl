@@ -30,16 +30,6 @@
 # resolved without paying for the levels in between. The cost is conditioning —
 # see [`adapt`](@ref) — not admissibility.
 
-# Bounds check shared by every entry point that takes a level index. Written once
-# because three of them used to spell it out and one of them used to raise a
-# `BoundsError` naming the internal level tuple.
-function _check_level(V::Space, level::Integer, name::AbstractString="level")
-    1 <= level <= length(V.levels) ||
-        throw(ArgumentError("$name index $level is out of bounds for a space with " *
-                            "$(length(V.levels)) levels"))
-    return Int(level)
-end
-
 # Per-level split specification. A `Tuple` is per-axis and applies to every level;
 # a `Vector` is per-level, one entry per overlay, each itself a positive integer
 # or a `D`-tuple. The two readings collide — in 2D `(2, 2)` could be "two axes" or
@@ -84,10 +74,10 @@ Keyword arguments:
     axes on the first overlay and only axis 1 on the second. A factor of `1`
     inherits the previous level's partition on that axis — it never means "one
     cell", which would destroy nesting.
-  - leaf semantics apply to every level of the ladder. On a nested stack
-    the shed modes are exactly linearly dependent, so `false` gives a singular
-    operator rather than a more accurate one. It is exposed because measuring the
-    redundancy requires building the unreduced twin.
+  - leaf semantics apply to every level of the ladder, and there is nothing to
+    configure. On a nested stack the shed modes are exactly linearly dependent,
+    so keeping them would give a singular operator rather than a more accurate
+    one. See [`space`](@ref).
 
 # Order across the ladder
 
@@ -222,174 +212,12 @@ function is_nested(V::Space{D,T}; tolerance::GeometryTolerance{T}=GeometryTolera
     return true
 end
 
-# ── Reading a level ───────────────────────────────────────────────────────────
-
-"""
-    active_cells(V::Space; level) -> BitArray
-
-Which cells of `level` are active, as a copy. A level with no mask returns an
-all-true array. The `Space` counterpart of `active_cells(::Model; level)`, and
-the read half of an adaptive step: fetch a level's mask, edit it per cell, hand
-it back to [`adapt`](@ref).
-
-On a `Space` this is the mask as written. The `Model` method reports the
-*effective* mask by default, which on a space carrying a [`PhysicalDomain`](@ref)
-already has the fictitious fold applied; pass `effective = false` there to read
-back what the caller asked for.
-"""
-function active_cells(V::Space{D}; level::Integer) where {D}
-    lvl = V.levels[_check_level(V, level)]
-    lvl.mask === nothing && return trues(lvl.mesh.cells)
-    return copy(lvl.mask.on)
-end
-
-"""
-    cell_orders(V::Space; level) -> Array{NTuple{D,Int},D}
-
-Per-axis polynomial order of every cell of `level`, as a fresh array. A level
-whose order is uniform returns that order repeated over the cell grid, so the
-result has the same shape and meaning whether or not the level carries a per-cell
-field.
-
-The read half of a p-adaptive step, and the `Space` counterpart of
-`cell_orders(::Model; level)`: fetch a level's orders, edit them per cell, hand
-them back to [`elevate`](@ref). Round-tripping through `elevate` is an identity.
-
-```julia
-p = cell_orders(V; level=1)
-p[marked] .+= 1
-V = elevate(V, 1 => p)
-```
-"""
-function cell_orders(V::Space{D}; level::Integer) where {D}
-    lvl = V.levels[_check_level(V, level)]
-    return [lvl.orders.palette[c] for c in lvl.orders.class]
-end
-
-"""
-    elevate(V::Space, level => order, ...) -> Space
-
-Return `V` with the named levels' polynomial orders replaced. Meshes, level
-boxes, activation masks and basis families are untouched, so the result has the
-*same type* as `V` and a model rebuilt from it does not recompile the assembly
-pipeline — the per-cell order lives in a `Union{Nothing,CellOrders}` field, not
-in a type parameter.
-
-`order` takes every shape [`space`](@ref)'s `order` keyword takes — an integer,
-an `NTuple{D,Int}`, an array of either shaped like the level's cell grid, or a
-predicate `(cell_box, cell_index) -> order` — plus one shape that only makes
-sense against an existing level:
-
-  * an iterable of `CartesianIndex{D} => order` pairs, raising the listed cells
-    and leaving every other cell at the order it already has. That is the shape a
-    marking loop produces, so a p-adaptive step does not have to materialise the
-    whole field to change twelve cells.
-
-Where two cells of different order share a face, the shared entity carries the
-minimum of the two orders; see [`CellOrders`](@ref) for why that is what keeps
-the space C⁰, and [`space`](@ref) for the per-cell `order ≥ 1` and
-basis-family requirements, which are checked here too.
-
-This is a separate verb from [`adapt`](@ref) rather than another shape of its
-pair form, and the reason is dispatch rather than taste: a mask spec and an order
-spec collide irreducibly on `nothing` ("every cell active" versus "uniform
-order") and on a predicate (`-> Bool` versus `-> Int`), and neither collision can
-be detected before the value is used. Compose them instead —
-`elevate(adapt(V, h), p)` costs two cheap `Space` rebuilds and one
-[`prepare`](@ref), and the dof layout only ever sees the final hp state.
-"""
-function elevate(V::Space{D,T}, pairs::Pair{<:Integer}...) where {D,T}
-    n = length(V.levels)
-    named = falses(n)
-    for (level, _) in pairs
-        k = _check_level(V, level)
-        named[k] && throw(ArgumentError("level $k is named more than once in one `elevate` call"))
-        named[k] = true
-    end
-    out = V
-    for (level, spec) in pairs
-        out = _reordered_space(out, _check_level(V, level), spec)
-    end
-    return out
-end
-
-# The order spec shape that only `elevate` can serve: `cell => order` pairs
-# against the level's current field. Normalised here rather than in
-# `_normalize_order` because it needs a base to fill the unnamed cells from, and
-# `space` / `overlay` have none.
-function _pair_orders(V::Space{D}, k::Int, pairs) where {D}
-    lvl = V.levels[k]
-    out = cell_orders(V; level=k)
-    for entry in pairs
-        entry isa Pair || throw(ArgumentError("an order pair list must contain " *
-                                              "`CartesianIndex{$D} => order` entries; got $(typeof(entry))"))
-        cell, order = entry
-        cell isa CartesianIndex{D} ||
-            throw(ArgumentError("an order pair list must be keyed by CartesianIndex{$D}; " *
-                                "got $(typeof(cell))"))
-        checkbounds(Bool, out, cell) ||
-            throw(ArgumentError("cell index $cell is out of bounds for mesh cells $(lvl.mesh.cells)"))
-        out[cell] = _axis_int_tuple(order, Val(D), :order)
-    end
-    return out
-end
-
-_normalize_elevate_spec(V::Space, k::Int, spec::Pair) = _pair_orders(V, k, (spec,))
-_normalize_elevate_spec(V::Space, k::Int, spec::AbstractVector{<:Pair}) = _pair_orders(V, k, spec)
-_normalize_elevate_spec(::Space, ::Int, spec) = spec
-
-"""
-    cell_indices(V::Space; level) -> CartesianIndices
-
-Cell index space of `level`. Together with [`cell_box`](@ref)'s `Space` method
-this is what lets a caller build a cell selection — evaluate an error indicator
-per cell, mark, [`adapt`](@ref) — without reaching into `V.levels[k].mesh`.
-"""
-cell_indices(V::Space; level::Integer) = cell_indices(V.levels[_check_level(V, level)].mesh)
-
-"""
-    cell_box(V::Space, index::CartesianIndex; level) -> AxisBox
-
-Axis-aligned box of one cell of `level`, in the physical frame.
-"""
-function cell_box(V::Space{D}, index::CartesianIndex{D}; level::Integer) where {D}
-    return cell_box(V.levels[_check_level(V, level)].mesh, index)
-end
-
 # ── Mapping cells between levels ──────────────────────────────────────────────
-
-# Index range of `search_axis`'s cells that cell `j` of `index_axis` overlaps
-# along one axis, or an empty range where the two extents are disjoint there.
-#
-# The relation is SYMMETRIC — cell i of one axis overlaps cell j of the other
-# exactly when the reverse holds — so this single search answers the cross-level
-# map in both directions. `overlapping_cells` reads it one way (which source
-# cells does this destination cell see) and `_cell_block` the other (which
-# destination cells does this source cell reach); nothing below has to know which
-# level is the finer one.
-#
-# Deliberately tolerance-free. An additive epsilon on the node coordinates is
-# wrong twice over: `GeometryTolerance` is absolute, so on a domain far from the
-# origin it is smaller than one ulp and does nothing, while on a domain of small
-# extent it is larger than a whole cell and empties every range — both silently.
-# The two searches below are exact instead, and they express the right convention
-# on their own: `searchsortedlast` puts a lower face sitting exactly on a node
-# into the cell above it, `searchsortedfirst` excludes the cell an upper face
-# merely touches. Levels of a ladder share their node coordinates bit-for-bit
-# (`_mesh_axes` builds endpoints exactly), so nothing here has to absorb a
-# rounding difference.
-function _overlap_range(index_axis::Vector{T}, search_axis::Vector{T}, j::Int) where {T}
-    ncells = length(search_axis) - 1
-    lo = searchsortedlast(search_axis, index_axis[j])
-    hi = searchsortedfirst(search_axis, index_axis[j + 1]) - 1
-    (hi < 1 || lo > ncells) && return 1:0                   # disjoint extents
-    return max(lo, 1):min(hi, ncells)
-end
 
 # The block of level-`to` cells that cell `cell` of level `from` overlaps. The
 # answer is always an axis-aligned block, because both meshes are tensor products
 # of sorted axes, so `D` binary searches settle it: O(D·log N + block) rather than
-# the O(N_to) pass `overlapping_cells` makes over the destination grid.
+# the O(N_to) pass over the destination grid a dense answer would make.
 #
 # That difference is why this exists. Adaptivity asks the question one cell at a
 # time — is anything live below this cell, which cells does an h-step activate,
@@ -398,12 +226,28 @@ end
 # ladder onto its 64³ level, 7.65 ms through `overlapping_cells` against 0.29 µs
 # for this block, and a cycle asks it once per mark from four sites.
 #
+# The cell's own node coordinates are passed to `_axis_cells` exactly, with no
+# tolerance. That is the ladder's convention and it is not an oversight: levels
+# of a ladder share their node coordinates bit-for-bit (`_mesh_axes` builds the
+# endpoints exactly), so there is no rounding difference to absorb, and an
+# additive epsilon would be wrong twice over — `GeometryTolerance` is absolute,
+# so on a domain far from the origin it is below one ulp and does nothing, while
+# on a domain of small extent it is larger than a whole cell and empties every
+# range. Both silently. The coverage rule, whose boxes come from a level that
+# does *not* share coordinates, nudges instead; see `_cells_under_box`.
+#
+# The overlap relation is symmetric — cell i of one axis overlaps cell j of the
+# other exactly when the reverse holds — so this one function answers the
+# cross-level map in both directions and nothing here has to know which level is
+# the finer one.
+#
 # An empty block is a legitimate answer rather than an error: a level whose box
 # does not reach this cell covers none of it, which is the ordinary state of
 # affairs on a sub-box overlay. Every caller must read it that way.
 function _cell_block(V::Space{D}, from::Integer, to::Integer, cell::CartesianIndex{D}) where {D}
     f, t = V.levels[from].mesh, V.levels[to].mesh
-    return CartesianIndices(ntuple(d -> _overlap_range(f.axes[d], t.axes[d], cell.I[d]), D))
+    return CartesianIndices(ntuple(d -> _axis_cells(t.axes[d], f.axes[d][cell.I[d]],
+                                                    f.axes[d][cell.I[d] + 1]), D))
 end
 
 """
@@ -447,7 +291,8 @@ function overlapping_cells(V::Space{D,T}, cells; from::Integer, to::Integer) whe
     # 15 625 sources. The per-axis blocks are tabulated once over the source axes
     # so no cell repeats the binary search.
     f, t = src_level.mesh, dst_level.mesh
-    ranges = ntuple(d -> [_overlap_range(f.axes[d], t.axes[d], i) for i in 1:f.cells[d]], D)
+    ranges = ntuple(d -> [_axis_cells(t.axes[d], f.axes[d][i], f.axes[d][i + 1])
+                          for i in 1:f.cells[d]], D)
     out = falses(t.cells)
     for ci in CartesianIndices(src)
         src[ci] || continue
@@ -468,115 +313,46 @@ end
 
 # ── Writing the activation of a whole stack ───────────────────────────────────
 
-# Private "not named by the caller" sentinel. `nothing` cannot serve: it is a
-# legal user value meaning "every cell", so using it here would make
-# `adapt(V, 2 => nothing, 2 => m)` slip past the duplicate-level guard.
-struct _Unset end
-
-# Rebuild `V` with the given per-level masks, `_Unset()` leaving a level alone.
-# One pass, so one integration plan and one dof layout downstream, where the same
-# edit through `activate!` costs one of each per level touched. `_remasked_space`
-# owns the per-level rebuild, including the `instantiate_basis` call that a
-# mesh-dependent family needs.
-function _with_masks(V::Space{D,T}, masks::NTuple{N,Any}) where {D,T,N}
-    out = V
-    for k in 1:N
-        masks[k] isa _Unset && continue
-        out = _remasked_space(out, k, _normalize_mask(masks[k], V.levels[k].mesh))
-    end
-    return out
-end
-
 """
-    adapt(V::Space, level => cells, ...) -> Space
     adapt(V::Space, depths::AbstractArray{<:Integer,D}; grade=0) -> Space
 
-Return `V` with the named levels' activation masks replaced. Level boxes, cell
-counts, orders and basis families are untouched, so the result has the *same
-type* as `V` and a model rebuilt from it does not recompile the assembly
-pipeline.
-
-The pair form sets each named level's mask outright and leaves every other level
-alone. `cells` takes the shapes `active =` accepts, so a mask written for
-[`overlay`](@ref) can be handed straight here:
-
-```julia
-m = active_cells(V; level=4)
-m[marked] .= true
-V = adapt(V, 4 => m)
-```
-
-Setting several levels in one call is one integration-plan and dof-layout
-rebuild; the same edit through [`activate!`](@ref) is one of each per level.
-
-Nothing requires a level to be active only where its parent is, or its active
-cells to tile whole parent cells. Both are admissible, and a feature far finer
-than a base cell can be resolved without paying for the intervening levels. What
-they cost is conditioning: where a level's active region boundary does not fall
-on the cell boundaries of the level below, the condition number of the assembled
-operator rises — measured at one to three orders of magnitude on stacked ragged
-masks, against a parent-aligned stack carrying several times the unknowns. Prefer
-a mask whose boundary follows the coarser level's cells when there is a choice.
-
-The array form is the shorthand for the structured case: it replaces every
-*overlay* level's mask with the one implied by a per-base-cell refinement depth,
-as [`depth_masks`](@ref) builds them, and leaves the base level alone. It
-overwrites masks set by the pair form rather than merging with them, so a stack
+The structured shorthand for the pair form: replace every *overlay* level's mask
+with the one implied by a per-base-cell refinement depth, and leave the base
+level alone. It is literally `adapt(V, depth_masks(V, depths; grade)...)`, so it
+overwrites masks set by the pair form rather than merging with them, and a stack
 maintained per cell should not be edited through it.
 
+The base level is left alone because `depths` says nothing about it: a base cell
+at depth 0 is one that no overlay refines, not one the base itself drops. A base
+mask set through [`space`](@ref)'s or [`ladder`](@ref)'s `active =` therefore
+survives this call.
+
 `grade` bounds how fast the depth may change between neighbouring base cells and
-applies to the array form only. It defaults to `0`, meaning the array is applied
-verbatim; see [`depth_masks`](@ref) for what a positive value buys and costs.
+applies to this form only. It defaults to `0`, meaning the array is applied
+verbatim; see `depth_masks` for what a positive value buys and costs.
 """
-function adapt(V::Space{D,T}, pairs::Pair{<:Integer}...) where {D,T}
-    n = length(V.levels)
-    named = falses(n)
-    for (level, _) in pairs
-        k = _check_level(V, level)
-        named[k] && throw(ArgumentError("level $k is named more than once in one `adapt` call"))
-        named[k] = true
-    end
-    masks = ntuple(k -> _pair_mask(pairs, k), Val(n))
-    return _with_masks(V, masks)
-end
-
-# The mask a pair list gives level `k`, or the sentinel. A loop rather than a
-# `Dict` because a stack carries a handful of levels and this runs inside
-# `ntuple`, where a type-stable return matters more than the asymptotics.
-function _pair_mask(pairs::Tuple, k::Int)
-    for (level, cells) in pairs
-        Int(level) == k && return cells
-    end
-    return _Unset()
-end
-
-function adapt(V::Space{D,T}, depths::AbstractArray{<:Integer,D}; grade::Int=0) where {D,T}
+function adapt(V::Space{D}, depths::AbstractArray{<:Integer,D}; grade::Int=0) where {D}
     eltype(depths) === Bool &&
         throw(ArgumentError("adapt received a Bool array where a per-base-cell depth map was expected. To set one " *
                             "level's mask, name the level: `adapt(V, k => mask)`."))
-    # `depth_masks` reports the base level as `nothing`, which is its documented
-    # way of saying "not derived from `depths`" — but `nothing` is also a legal
-    # mask meaning "every cell", so handing it straight to `_with_masks` would
-    # overwrite a base mask the caller set through `space`'s or `ladder`'s
-    # `active =`, silently activating cells they deactivated. The private
-    # sentinel is the one value that cannot be confused with a mask.
-    masks = depth_masks(V, depths; grade=grade)
-    return _with_masks(V, (_Unset(), Base.tail(masks)...))
+    return adapt(V, depth_masks(V, depths; grade=grade)...)
 end
 
 """
-    depth_masks(V::Space, depths; grade=0) -> NTuple
+    depth_masks(V::Space, depths; grade=0) -> Vector{Pair{Int,BitArray{D}}}
 
-The per-level masks implied by a per-base-cell refinement `depths` array: overlay
-level `k` is active exactly where `depths ≥ k - 1`. A convenience constructor for
-the structured case, not the state of the stack — the masks it returns can be
-edited per cell before being handed to [`adapt`](@ref).
+The per-overlay-level masks implied by a per-base-cell refinement `depths` array:
+overlay level `k` is active exactly where `depths ≥ k - 1`. The internal behind
+[`adapt`](@ref)'s array form, and the pairs it returns splat straight into
+[`adapt`](@ref)'s pair form — `adapt(V, depth_masks(V, d)...)` is exactly what
+the array form does. To edit a level per cell first, compose the two verbs:
+`adapt(adapt(V, depths), k => edited)`.
 
 `depths` is shaped like the base level's cell grid, with values in
 `0:(length(V.levels) - 1)`. A value outside that range raises rather than being
 clamped: a depth the ladder cannot represent means the caller is refining less
-than it believes. The base level's mask is never derived from `depths`; the first
-entry of the returned tuple is always `nothing`.
+than it believes. The base level is never named: `depths` describes which
+overlays refine a base cell, which is not a statement about the base's own mask.
 
 Because a depth is per *base* cell, a marked base cell is refined across its
 whole child block on every deeper level. That is coarser than the stack can
@@ -595,7 +371,7 @@ time for a single deeply refined corner cell. Use it when a level's artificial
 boundary Γ_o, where its contribution is clamped to zero, would otherwise fall on
 the feature that marked it.
 """
-function depth_masks(V::Space{D,T}, depths::AbstractArray{<:Integer,D}; grade::Int=0) where {D,T}
+function depth_masks(V::Space{D}, depths::AbstractArray{<:Integer,D}; grade::Int=0) where {D}
     base = V.levels[1].mesh
     size(depths) == base.cells ||
         throw(DimensionMismatch("depth map shape $(size(depths)) does not match the base " *
@@ -608,8 +384,8 @@ function depth_masks(V::Space{D,T}, depths::AbstractArray{<:Integer,D}; grade::I
 
     d = Array{Int,D}(depths)
     grade > 0 && _grade!(d, grade)
-    return ntuple(k -> k == 1 ? nothing : overlapping_cells(V, findall(>=(k - 1), d); from=1, to=k),
-                  Val(length(V.levels)))
+    return [k => overlapping_cells(V, findall(>=(k - 1), d); from=1, to=k)
+            for k in 2:length(V.levels)]
 end
 
 # Raise every depth that sits more than `by` below a neighbour, to the fixed point

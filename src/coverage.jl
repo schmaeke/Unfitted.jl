@@ -50,25 +50,33 @@ struct Coverage{D}
     covered::Dict{Int,BitArray{D}}
 end
 
-# The cells of `mesh` that `box` overlaps, as an axis-aligned block. Located by
-# binary search on the sorted per-axis coordinates, so the cost is
-# O(D·log N + overlapping cells) rather than O(N). The ± tol.contain nudges keep
-# a box whose face merely touches a cell boundary from claiming the neighbouring
-# cell.
+# The cells of `mesh` that `box` overlaps, as an axis-aligned block. `_axis_cells`
+# (`mesh.jl`) does the per-axis binary search, so the cost is O(D·log N +
+# overlapping cells) rather than O(N), and the exactness convention is stated
+# once, there.
+#
+# What belongs here is the ± tol.contain nudge. `box` comes from *another*
+# level's mesh, and an `overlay` box whose axes `_mesh_axes` built from its own
+# corners does not reproduce a coarser level's node coordinates bit-for-bit, so
+# a face that should land on a node can land a rounding step either side of it.
+# Pulling the interval inward by `tol.contain` keeps a box whose face merely
+# touches a cell boundary — or misses it by a rounding step — from claiming the
+# neighbouring cell. The ladder's own cross-level map passes its endpoints
+# exactly for the opposite reason; see `overlapping_cells` in `ladder.jl`.
+#
+# The name is deliberately not `_overlapping_cells`: that was one underscore
+# from `overlapping_cells`, a public function with a different contract (which
+# cells of one *level* overlap a selection on another, tolerance-free).
 #
 # Used by `_covered_by_level` below, which asks whether every overlapped cell of
 # a masked covering level is active or fictitious — the "for every cell of the
-# finer level under this coarser cell" question the block resolution answers.
-function _overlapping_cells(mesh::CartesianMesh{D,T}, box::AxisBox{D,T},
-                            tol::GeometryTolerance{T}) where {D,T}
-    ranges = ntuple(D) do d
-        ax = mesh.axes[d]
-        last = length(ax) - 1                                   # number of cells on axis d
-        lo = clamp(searchsortedlast(ax, box.lower[d] + tol.contain), 1, last)
-        hi = clamp(searchsortedlast(ax, box.upper[d] - tol.contain), 1, last)
-        lo:hi
-    end
-    return CartesianIndices(ranges)
+# finer level under this coarser cell" question the block resolution answers —
+# and by `_reproduced_on_domain`, which asks it of a support hull that may stick
+# out past the covering level's box.
+function _cells_under_box(mesh::CartesianMesh{D,T}, box::AxisBox{D,T},
+                          tol::GeometryTolerance{T}) where {D,T}
+    return CartesianIndices(ntuple(d -> _axis_cells(mesh.axes[d], box.lower[d] + tol.contain,
+                                                    box.upper[d] - tol.contain), D))
 end
 
 # True iff `box` (a coarser-level cell) lies inside the covering region of the single
@@ -95,13 +103,13 @@ end
 # `physical === nothing` there is no fictitious material and the original
 # active-cells-only rule is recovered without ever touching `cache`.
 #
-# For the masked case we do NOT scan all of k's cells: `_overlapping_cells` resolves the
+# For the masked case we do NOT scan all of k's cells: `_cells_under_box` resolves the
 # axis-aligned block by binary search.
 function _covered_by_level(box::AxisBox{D,T}, k::Level{D,T}, tol::GeometryTolerance{T}, physical,
                            cache::_ClassifyCache{D,T}) where {D,T}
     is_inside(box, k.mesh.domain, tol) || return false
     k.mask === nothing && return true
-    cells = _overlapping_cells(k.mesh, box, tol)
+    cells = _cells_under_box(k.mesh, box, tol)
 
     # Pass 1 — one centre sample per inactive cell. `:fictitious` means *no* point of the
     # cell lies in Ω, so a centre inside Ω rules that verdict out, and this is the
@@ -188,7 +196,7 @@ function _reproduced_on_domain(level::Level{D,T}, k::Level{D,T}, cells::Cartesia
         faces = ((1, k.mesh.domain.lower[d]), (k.mesh.cells[d], k.mesh.domain.upper[d]))
         for (j, x) in faces                                     # k's two box faces on axis d
             hull.lower[d] + tol.contain < x < hull.upper[d] - tol.contain || continue
-            perp = _overlapping_cells(k.mesh, hull, tol)
+            perp = _cells_under_box(k.mesh, hull, tol)
             layer = CartesianIndices(ntuple(e -> e == d ? (j:j) : perp.indices[e], D))
             any(kc -> is_active(k.mask, kc), layer) && return false
         end
