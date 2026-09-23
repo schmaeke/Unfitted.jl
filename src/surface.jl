@@ -203,9 +203,12 @@ end
 #     derived from cell geometry. Only defined for K=1 in 2D and
 #     K=2 in 3D — the cases where a unique normal exists; K=0
 #     requires the user to supply one.
-#   * `_simplex_reference_quadrature(order)` — `(eta, weight)` pairs
-#     in the cell's reference frame, sized by the recommended
-#     quadrature order from the basis layer.
+#   * `_simplex_reference_quadrature(n)` — `(eta, weight)` pairs in the
+#     cell's reference frame, for an `n`-point Gauss rule per reference
+#     axis. `n` comes from the recommended quadrature order of the
+#     cell's own covering parents, so the argument is the scalar point
+#     count rather than a per-axis tuple: a simplex has no axes of the
+#     embedding to keep apart.
 #   * `_reference_to_physical_simplex(cell, eta)` — the affine map
 #     from the reference cell to the physical cell at a reference
 #     point `eta`.
@@ -275,15 +278,11 @@ end
 # weight. The physical weight is `w_reference × measure / reference_area`.
 
 # K=0: one sample, weight 1 (identity).
-function _simplex_reference_quadrature(::Val{0}, ::NTuple{D,Int}, ::Type{T}) where {D,T}
-    [(zero(T), one(T))]
-end
+_simplex_reference_quadrature(::Val{0}, ::Int, ::Type{T}) where {T} = [(zero(T), one(T))]
 
-# K=1: 1D Gauss-Legendre on [−1, 1]. Order is `max(recommended_quadrature_order)`
-# over the covering parents (passed in as `quadrature_order`).
-function _simplex_reference_quadrature(::Val{1}, quadrature_order::NTuple{D,Int},
-                                       ::Type{T}) where {D,T}
-    n = maximum(quadrature_order)
+# K=1: 1D Gauss-Legendre on [−1, 1] with `n` points, `n` being the largest
+# per-axis `recommended_quadrature_order` over the cell's covering parents.
+function _simplex_reference_quadrature(::Val{1}, n::Int, ::Type{T}) where {T}
     points, weights = gausslegendre(n)
     return [(T(p), T(w)) for (p, w) in zip(points, weights)]
 end
@@ -296,9 +295,7 @@ end
 # polynomial by one: a total-degree-`p` integrand maps to degree `p + 1`
 # in ξ. The rule is therefore exact over the triangle up to total degree
 # `2n − 2`, one less than the per-axis figure.
-function _simplex_reference_quadrature(::Val{2}, quadrature_order::NTuple{D,Int},
-                                       ::Type{T}) where {D,T}
-    n = maximum(quadrature_order)
+function _simplex_reference_quadrature(::Val{2}, n::Int, ::Type{T}) where {T}
     pts1d, wts1d = gausslegendre(n)
     # Shift to [0, 1].
     pts01 = [T((p + 1) / 2) for p in pts1d]
@@ -377,7 +374,7 @@ end
 # trace of both grids (each sub-cell then lies inside one cut cell of
 # each subdomain — the non-matching segment-merge of the references).
 function _grid_lines_for_levels(levels, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
-    return ntuple(d -> _merged_axis_coordinates(levels, d, tol), D)
+    return _merged_axis_coordinates(levels, Val(D), tol)
 end
 
 # Per-axis sorted unique grid coordinates across every level of `V`.
@@ -710,11 +707,20 @@ end
 # then walks the resulting sub-cells to emit one `SurfaceRegion` per
 # cell with its physical quadrature, per-Q-point normal, and constant
 # parent set.
+#
+# The rule is sized per sub-cell from that cell's own covering parents
+# (`_parent_quadrature_counts`, the same helper the volume regions and the
+# projection path use — `FacetParent` carries the `.level` / `.cell` fields it
+# is duck-typed on). Every rule a sub-cell can ask for is precomputed once into
+# `rules`, indexed by point count and bounded above by
+# `_surface_quadrature_order`, so a mesh of many cells over a handful of
+# distinct orders builds a handful of `gausslegendre` tables rather than one
+# per cell.
 function _surface_regions_for_mesh(V::Space{D,T}, mesh::BoundaryMesh{D,T,K},
                                    tolerance::GeometryTolerance{T}) where {D,T,K}
     subdivided = _subdivide_mesh(mesh, V, tolerance)
-    quadrature_order = _surface_quadrature_order(V)
-    reference_samples = _simplex_reference_quadrature(Val(K), quadrature_order, T)
+    rules = [_simplex_reference_quadrature(Val(K), n, T)
+             for n in 1:maximum(_surface_quadrature_order(V))]
     reference_area = _reference_area(Val(K))
 
     regions = SurfaceRegion{D,T}[]
@@ -723,8 +729,9 @@ function _surface_regions_for_mesh(V::Space{D,T}, mesh::BoundaryMesh{D,T,K},
         isempty(parents) &&
             throw(ArgumentError("BoundaryMesh cell #$cell_index lies entirely outside the " *
                                 "discretization — no covering parent found on any level"))
+        counts = _parent_quadrature_counts(Val(D), parents, id -> _level_by_id(V, id))
         points, weights, normals = _simplex_cell_quadrature(cell, cell_index, subdivided.normals,
-                                                            reference_samples, reference_area,
+                                                            rules[maximum(counts)], reference_area,
                                                             Val(K))
         push!(regions, SurfaceRegion{D,T}(parents, points, weights, normals))
     end
@@ -732,23 +739,18 @@ function _surface_regions_for_mesh(V::Space{D,T}, mesh::BoundaryMesh{D,T,K},
     return regions
 end
 
-# Choose the per-axis Gauss-Legendre point count for surface
-# integration. We use the per-axis maximum of
-# `recommended_quadrature_order(level.basis, level.order)` across
-# every level of `V` — at least as accurate as the volume assembly
-# would be on the same polynomial order. (A future per-cell variant
-# would pick the maximum across only the covering parents of the
-# specific cell, matching the facet path; not worth the bookkeeping
-# in the MVP.)
+# Upper bound on the per-axis Gauss-Legendre point count any surface or
+# interface region over `V` can ask for: the per-axis maximum of
+# `recommended_quadrature_order(level.basis, nominal_order(level))` across every
+# level. It sizes the precomputed rule table in `_surface_regions_for_mesh` and
+# `_interface_regions`, and nothing else — the rule an individual sub-cell uses
+# comes from that cell's own covering parents, so one high-p cell no longer
+# raises the rule on every region of the mesh.
 #
-# `level.order` is the level's *nominal* (maximum) order, so on a level carrying
-# a per-cell order this inherits the global maximum p and one high-p cell
-# anywhere raises the immersed-surface and interface rule everywhere. That is
-# conservative — over-integrating is safe — but it is the one quadrature
-# consumer per-cell order makes more expensive rather than less, and the fix is
-# the per-cell variant above: push the choice into `_surface_regions`' per-cell
-# loop, which also changes `coupling.jl`, where `qorder` is computed once from
-# both sides.
+# `nominal_order` is the level's per-axis *maximum* over its cells, which is the
+# right question here and only here: over-sizing a table of rules costs a few
+# `gausslegendre` calls, while over-sizing a rule costs every Q-point of every
+# region that uses it.
 function _surface_quadrature_order(V::Space{D,T}) where {D,T}
     base = ntuple(_ -> 1, D)
     for level in V.levels

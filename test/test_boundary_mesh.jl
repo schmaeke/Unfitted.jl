@@ -314,3 +314,42 @@ end
     expected_area = 0.5 * 0.15 * 0.15
     @test boundary_integral(q -> 1.0, model; on=mesh) ≈ expected_area atol = 1.0e-12
 end
+
+@testset "the surface rule is sized from the sub-cell's own parents" begin
+    # `_surface_quadrature_order` is now only the upper bound that sizes the
+    # rule table; the rule a sub-cell uses comes from the cells covering it.
+    # A high-order level elsewhere must not raise the point count of a segment
+    # it does not cover — which is what the level-wide maximum did, and the
+    # reason the immersed-surface path was the one quadrature consumer that a
+    # per-cell order made more expensive rather than less.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    tol = GeometryTolerance(Float64)
+    V = overlay(space(omega; cells=(4, 4), order=1), box((0.5, 0.5), (1.0, 1.0)); cells=(2, 2),
+                order=3)
+
+    near = Unfitted._surface_regions_for_mesh(V,
+                                              segment_mesh([(SVector(0.05, 0.10),
+                                                             SVector(0.20, 0.10))]), tol)
+    @test length(only(near).parents) == 1                 # the base level alone
+    @test length(only(near).points) == 2                  # p = 1 → 2 Gauss points
+
+    far = Unfitted._surface_regions_for_mesh(V,
+                                             segment_mesh([(SVector(0.55, 0.60),
+                                                            SVector(0.70, 0.60))]), tol)
+    @test length(only(far).parents) == 2
+    @test length(only(far).points) == 4                   # max p = 3 → 4 Gauss points
+
+    # The same question on a level carrying a per-cell order, where there is no
+    # per-level order to read even in principle.
+    orders = fill(1, 4, 4)
+    orders[4, 4] = 4
+    W = space(omega; cells=(4, 4), order=orders)
+    quiet = Unfitted._surface_regions_for_mesh(W,
+                                               segment_mesh([(SVector(0.05, 0.10),
+                                                              SVector(0.20, 0.10))]), tol)
+    @test length(only(quiet).points) == 2
+    loud = Unfitted._surface_regions_for_mesh(W,
+                                              segment_mesh([(SVector(0.80, 0.85),
+                                                             SVector(0.95, 0.85))]), tol)
+    @test length(only(loud).points) == 5                  # p = 4 → 5 Gauss points
+end

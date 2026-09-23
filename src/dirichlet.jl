@@ -332,6 +332,25 @@ function _facet_outward_normal(sides::AbstractVector{<:Tuple{Integer,Symbol}}, :
     return iszero(norm_n) ? n : n / norm_n
 end
 
+# The cells of `level` whose own faces all lie on `sides`: index `1` or the last
+# index on each constrained axis, the whole range on the free ones. These are
+# the only cells `_facet_signature` can accept as parents, so restricting the
+# coordinate projection to them makes the facet partition follow the *active
+# boundary layer* rather than the level's whole active region — an overlay live
+# deep in the interior then contributes nothing to a facet it never touches.
+function _side_cells(level::Level{D}, sides::Vector{Tuple{Int,Symbol}}) where {D}
+    counts = level.mesh.cells
+    return CartesianIndices(ntuple(D) do d
+                                for (axis, side) in sides
+                                    axis == d || continue
+                                    side === :lower && return 1:1
+                                    side === :upper && return counts[d]:counts[d]
+                                    throw(ArgumentError("boundary side must be :lower or :upper"))
+                                end
+                                return 1:counts[d]
+                            end)
+end
+
 # Build the admissible boundary regions on the facet identified by
 # `sides`. The algorithm mirrors the volume-region construction in
 # `intersections.jl`, restricted to the facet:
@@ -339,21 +358,43 @@ end
 #   1. Identify the levels whose own mesh face on `sides` coincides with
 #      the physical-domain face — only these levels contribute boundary
 #      trace dofs on this facet.
-#   2. Per free axis, collect every touching level's boundary
-#      coordinates along that axis, merge them, and form non-degenerate
-#      intervals.
+#   2. Per free axis, collect every touching level's boundary coordinates
+#      along that axis that bound an *active* cell whose own face lies on
+#      `sides` — the only cells that can become parents here — merge them,
+#      and form non-degenerate intervals. An unmasked level contributes its
+#      whole grid, since every cell of it is active.
 #   3. Take the Cartesian product of the intervals to enumerate the
 #      candidate sub-rectangles. Fix the constrained-axis coordinates to
 #      the facet's coordinates.
-#   4. For each candidate, find the touching levels' parent cells whose
-#      own face on `sides` contains the candidate's midpoint, skipping
-#      any the level's `LevelMask` deactivated — a masked-off cell has
-#      no dofs to constrain. Drop candidates left with no parents.
-#   5. Precompute the per-sub-rectangle Gauss rule and bake the
+#   4. For each candidate, compute the per-level *signature* at its
+#      midpoint: the linear index of the touching level's on-side active
+#      cell containing it, or `0` where the level contributes nothing —
+#      a cell off the side, or one the `LevelMask` deactivated, has no
+#      dofs to constrain. Drop candidates whose signature is all zero.
+#   5. Greedily merge axis-adjacent candidates that share a signature,
+#      exactly as `_merged_boxes` does over the volume (steps 3–4 there,
+#      through the same `_extend_axis`). Every point of a merged region
+#      still lies inside one cell of every parent level, so a product of
+#      boundary traces is still polynomial on it and the rule below is
+#      still exact for it.
+#   6. Precompute the per-sub-rectangle Gauss rule and bake the
 #      `vol / 2^(D-K)` Jacobian into the weights. The returned
 #      `FacetRegion` is ready for direct consumption — every Q-point is
 #      in physical coordinates with the physical-frame weight already
 #      applied.
+#
+# Steps 2 and 5 together make the facet partition follow the *active* cells
+# on the boundary rather than the finest touching level's background grid.
+# One consequence is worth stating plainly, because it is the one thing the
+# merge changes rather than merely makes cheaper. The exactness argument
+# covers products of boundary traces: the Dirichlet mass matrix, and the
+# Neumann / `boundary_integral` terms. It does not cover a *non-polynomial*
+# datum `g` in the Dirichlet right-hand side `b_i = ∫_∂Ω g φ_i`. The finer
+# slicing integrated that with an incidental composite rule at the finest
+# touching level's boundary spacing; it is now integrated with the parent
+# cell's own rule — the same convention `assembly.jl` already uses for a
+# non-polynomial volume source. Projected Dirichlet values for such a datum
+# therefore move at the boundary-quadrature-error level, not at roundoff.
 function _boundary_facet_regions(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}},
                                  tol::GeometryTolerance{T}) where {D,T}
     touching_levels = [level
@@ -363,72 +404,140 @@ function _boundary_facet_regions(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}
     isempty(touching_levels) && return FacetRegion{D,T}[]
 
     free_axes = _free_axes(sides, Val(D))
+
+    # Per-axis intervals along the free axes, mirroring `_axis_intervals` from
+    # intersections.jl but scanning only the cells that can parent a region
+    # here (`_side_cells`).
+    merged = _merged_axis_coordinates(touching_levels, Val(D), tol,
+                                      level -> _side_cells(level, sides))
+    intervals = map(d -> _intervals_from_coordinates(merged[d], tol), free_axes)
+    any(isempty, intervals) && return FacetRegion{D,T}[]
+
+    return _merged_facet_regions(V, touching_levels, sides, free_axes, intervals, tol,
+                                 Val(length(free_axes)))
+end
+
+# Physical corners of the facet sub-rectangle spanned by the candidate index
+# range `start:hi`: the facet's own coordinate on every constrained axis, the
+# interval endpoints on the free axes. `start == hi` gives one candidate.
+function _facet_corners(domain::AxisBox{D,T}, sides, free_axes, intervals, start::NTuple{F,Int},
+                        hi::NTuple{F,Int}) where {D,T,F}
+    lower = MVector{D,T}(ntuple(d -> _facet_fixed_coord(domain, sides, d), D))
+    upper = MVector{D,T}(ntuple(d -> _facet_fixed_coord(domain, sides, d), D))
+    for (j, d) in pairs(free_axes)
+        lower[d] = intervals[j][start[j]][1]
+        upper[d] = intervals[j][hi[j]][2]
+    end
+    return SVector{D,T}(lower), SVector{D,T}(upper)
+end
+
+# On-side coverage signature at a facet point: per touching level, the linear
+# index of the active cell whose own face on `sides` contains the point, and
+# `0` where the level contributes no boundary dof there. The facet counterpart
+# of `_coverage_signature` (intersections.jl), with that one's "off the mesh or
+# inactive" rule widened by the side filter, and it carries everything the
+# parent list does — `_facet_parents` decodes it once per *emitted* region
+# instead of building a parent list once per candidate.
+function _facet_signature(levels, linmaps, sides, point::SVector{D,T},
+                          tol::GeometryTolerance{T}) where {D,T}
+    sig = zeros(Int, length(levels))
+    for (i, level) in pairs(levels)
+        cell = locate_cell(level.mesh, point; tol)
+        cell === nothing && continue
+        all(_cell_on_side(level, cell, axis, side) for (axis, side) in sides) || continue
+        is_active(level.mask, cell) || continue
+        sig[i] = linmaps[i][cell]
+    end
+    return sig
+end
+
+# The parents a signature stands for, in `touching_levels` order.
+function _facet_parents(levels, sig::Vector{Int}, ::Val{D}, ::Type{T}) where {D,T}
+    parents = FacetParent{D,T}[]
+    for (i, level) in pairs(levels)
+        sig[i] == 0 && continue
+        cell = CartesianIndices(level.mesh.cells)[sig[i]]
+        push!(parents, FacetParent{D,T}(level.id, cell, cell_box(level.mesh, cell)))
+    end
+    return parents
+end
+
+# Candidate enumeration, greedy merge and quadrature for one facet, behind a
+# `Val(F)` barrier on the number of free axes. `F` is a property of the facet's
+# codimension and so a runtime value at the call site; the barrier is what makes
+# `ranges`, the signature grid and the `visited` bitmap concretely typed, which
+# the merge's inner slab test (`_extend_axis`) needs to stay a static dispatch.
+# The codim-`D` vertex facet is `F = 0`, where the grid degenerates to the
+# single candidate `CartesianIndex()`, no axis is ever extended, and the region
+# is the point evaluation such a facet should be.
+function _merged_facet_regions(V::Space{D,T}, touching_levels, sides::Vector{Tuple{Int,Symbol}},
+                               free_axes::Vector{Int}, intervals, tol::GeometryTolerance{T},
+                               ::Val{F}) where {D,T,F}
+    axis_intervals = ntuple(j -> intervals[j], Val(F))
+    ranges = ntuple(j -> length(axis_intervals[j]), Val(F))
     normal = _facet_outward_normal(sides, Val(D), T)
+    linmaps = [LinearIndices(level.mesh.cells) for level in touching_levels]
 
-    # Per-axis intervals along the free axes, mirroring
-    # `_axis_intervals` from intersections.jl.
-    intervals = map(free_axes) do d
-        _intervals_from_coordinates(_merged_axis_coordinates(touching_levels, d, tol), tol)
+    sigs = map(CartesianIndices(ranges)) do index
+        lower, upper = _facet_corners(V.domain, sides, free_axes, axis_intervals, index.I, index.I)
+        midpoint = SVector{D,T}(ntuple(d -> (lower[d] + upper[d]) / 2, D))
+        _facet_signature(touching_levels, linmaps, sides, midpoint, tol)
     end
 
-    ranges = Tuple(length(intervals[i]) for i in eachindex(intervals))
-    any(==(0), ranges) && return FacetRegion{D,T}[]
+    visited = falses(ranges)
     regions = FacetRegion{D,T}[]
+    for start in CartesianIndices(ranges)
+        visited[start] && continue
+        sig = sigs[start]
+        # No active on-side cell anywhere: nothing to constrain, and nothing a
+        # neighbouring region may absorb either, since a merged region must
+        # share this candidate's (empty) parent set.
+        all(iszero, sig) && continue
 
-    for index in CartesianIndices(ranges)
-        # Build the sub-rectangle's corner coordinates: fixed coords on
-        # constrained axes, interval endpoints on free axes.
-        lower = MVector{D,T}(ntuple(d -> _facet_fixed_coord(V.domain, sides, d), D))
-        upper = MVector{D,T}(ntuple(d -> _facet_fixed_coord(V.domain, sides, d), D))
-        for (j, d) in pairs(free_axes)
-            lower[d] = intervals[j][index.I[j]][1]
-            upper[d] = intervals[j][index.I[j]][2]
+        hi = start.I
+        for j in 1:F
+            hi = _extend_axis(sigs, visited, ranges, start.I, hi, sig, j)
         end
-        lower_s = SVector{D,T}(lower)
-        upper_s = SVector{D,T}(upper)
-        midpoint = SVector{D,T}(ntuple(d -> (lower_s[d] + upper_s[d]) / 2, D))
-        parents = FacetParent{D,T}[]
-
-        # Find every touching level whose own face on `sides` contains
-        # this candidate's midpoint.
-        for level in touching_levels
-            cell = locate_cell(level.mesh, midpoint; tol)
-            cell === nothing && continue
-            all(_cell_on_side(level, cell, axis, side) for (axis, side) in sides) || continue
-            is_active(level.mask, cell) || continue
-            push!(parents, FacetParent{D,T}(level.id, cell, cell_box(level.mesh, cell)))
+        for c in CartesianIndices(ntuple(e -> start.I[e]:hi[e], Val(F)))
+            visited[c] = true
         end
 
-        isempty(parents) && continue
+        lower, upper = _facet_corners(V.domain, sides, free_axes, axis_intervals, start.I, hi)
+        parents = _facet_parents(touching_levels, sig, Val(D), T)
+        push!(regions, _facet_region(V, sides, parents, free_axes, lower, upper, normal))
+    end
+    return regions
+end
 
-        # Precompute the physical Q-points and physical-weighted
-        # samples. The Jacobian for a codim-K facet sub-rectangle is
-        # `vol_free / 2^(D-K)`, matching the volume convention
-        # `vol / 2^D` from `reference_to_physical`.
-        counts = _facet_quadrature_counts(V, parents, free_axes)
-        jacobian = if isempty(free_axes)
-            one(T)
-        else
-            prod(upper_s[d] - lower_s[d] for d in free_axes) / convert(T, 2^length(free_axes))
-        end
-
-        physical_points = SVector{D,T}[]
-        physical_weights = T[]
-        for (eta, weight) in _facet_reference_quadrature(counts, T)
-            x = MVector{D,T}(lower_s)
-            for (j, d) in pairs(free_axes)
-                axis_mid = (lower_s[d] + upper_s[d]) / 2
-                axis_half = (upper_s[d] - lower_s[d]) / 2
-                x[d] = axis_mid + axis_half * eta[j]
-            end
-            push!(physical_points, SVector{D,T}(x))
-            push!(physical_weights, weight * jacobian)
-        end
-
-        push!(regions, FacetRegion{D,T}(sides, parents, physical_points, physical_weights, normal))
+# The quadrature of one merged facet region. The Jacobian for a codim-K facet
+# sub-rectangle is `vol_free / 2^(D-K)`, matching the volume convention
+# `vol / 2^D` from `reference_to_physical`. The rule comes from the region's own
+# parents through `_facet_quadrature_counts`, exactly as it did per candidate —
+# a merged region carries the parent set its candidates shared, so the merge
+# changes which points exist, never how they are sized.
+function _facet_region(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}},
+                       parents::Vector{FacetParent{D,T}}, free_axes::Vector{Int},
+                       lower::SVector{D,T}, upper::SVector{D,T}, normal::SVector{D,T}) where {D,T}
+    counts = _facet_quadrature_counts(V, parents, free_axes)
+    jacobian = if isempty(free_axes)
+        one(T)
+    else
+        prod(upper[d] - lower[d] for d in free_axes) / convert(T, 2^length(free_axes))
     end
 
-    return regions
+    physical_points = SVector{D,T}[]
+    physical_weights = T[]
+    for (eta, weight) in _facet_reference_quadrature(counts, T)
+        x = MVector{D,T}(lower)
+        for (j, d) in pairs(free_axes)
+            axis_mid = (lower[d] + upper[d]) / 2
+            axis_half = (upper[d] - lower[d]) / 2
+            x[d] = axis_mid + axis_half * eta[j]
+        end
+        push!(physical_points, SVector{D,T}(x))
+        push!(physical_weights, weight * jacobian)
+    end
+    return FacetRegion{D,T}(sides, parents, physical_points, physical_weights, normal)
 end
 
 # ── Boundary trace evaluation ─────────────────────────────────────────────────
@@ -555,8 +664,7 @@ projection the prescribed data enter, and it is a quadrature sum over
 exactly these samples. Recording them lets a load increment re-evaluate
 `g` and re-accumulate `b` without re-deriving the facet regions or the
 basis traces — the two dominant costs of the walk, both of which scale
-with the finest level's *background* boundary grid rather than with the
-active cells on the boundary.
+with the active cells on the boundary.
 
 Fields:
 

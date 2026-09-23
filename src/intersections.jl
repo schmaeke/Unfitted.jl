@@ -348,28 +348,98 @@ function _intervals_from_coordinates(coords::Vector{T}, tol::GeometryTolerance{T
     return intervals
 end
 
-# Per-axis merged element-boundary coordinates: gather axis `d`'s
-# element-boundary coordinates from every level's mesh and canonicalise
-# them via `merge_coordinates`, so two meshes' nearly-coincident
-# boundaries collapse to a single shared coordinate. Shared by the
-# integration-region partition (`_axis_intervals`), the physical-facet
-# partition (`_boundary_facet_regions` in dirichlet.jl), and the surface
-# grid lines (`_level_grid_lines` in surface.jl).
-function _merged_axis_coordinates(levels, d::Int, tol::GeometryTolerance{T}) where {T}
-    coords = T[]
-    for level in levels
-        append!(coords, boundary_coordinates(level.mesh)[d])
+# The whole cell grid of a level: the default scan range below, and the only
+# one the volume and surface partitions ever want.
+_all_level_cells(level) = CartesianIndices(level.mesh.cells)
+
+# Per-axis live element-boundary coordinates of one level: for each axis, the
+# coordinates that bound at least one *active* cell of `level` whose index lies
+# in `cells`. This is the projection of the level's live region onto the axes,
+# and it replaces the level's whole node grid in every partition the package
+# builds. One pass over the mask marks all `D` axes, so a plan pays for a
+# level's mask once, not once per axis.
+#
+# *Why the partition does not change.* A coordinate is dropped only when it
+# separates two slabs of cells, neither of which is live on this level. It is
+# then the face of no live cell here, and the level's coverage signature
+# (`_coverage_signature`) is the same on both sides of it: either the line is
+# not a node of this mesh, so both sides sit inside one cell, or it is a node
+# whose two neighbouring cells are both dead, so both sides read `0`. A line the
+# *merged* set loses is one that no level keeps, so every level's signature is
+# constant across it and the greedy merge in `_merged_boxes` fuses the two slabs
+# it separates anyway. The emitted box list comes out the same, in the same
+# order — and the candidate grid now follows the active region instead of the
+# finest participating mesh, which is where the cost of a deep `ladder` sat.
+#
+# One class of box does change: a region *no* level covers, which arises only
+# where no level is live at all. The partition then stops at the outermost live
+# face instead of tiling the dead remainder. Such a box has no parent, and every
+# consumer of the partition drops it before anything else — `:any_parent` and
+# `:all_levels` by definition, `projection.jl` for want of a target parent, and
+# a caller's own predicate because a parentless region has no quadrature order
+# to build a rule from in the first place.
+#
+# The remaining caveat is canonicalisation, not geometry: `merge_coordinates` keeps
+# the *first* representative of a group within `tol.merge`. On a nested stack
+# the shared nodes are bit-identical (`_mesh_axes` divides equal rationals), so
+# dropping a dead line cannot change which value represents a group and the plan
+# is bit-identical. On a non-nested overlay a dead line sitting within
+# `tol.merge` below a live line of another level *was* that group's
+# representative, so the canonical coordinate can move by at most `tol.merge`.
+#
+# `cells` exists for the boundary-facet partition in `dirichlet.jl`, which can
+# only be parented by cells with a face on the facet; every other caller takes
+# the default. An unmasked level answers from its axes directly, without
+# touching a mask it does not have.
+function _live_axis_coordinates(level, ::Val{D}, cells::CartesianIndices{D}) where {D}
+    nodes = boundary_coordinates(level.mesh)
+    mask = level.mask
+    lo, hi = first(cells).I, last(cells).I
+    mask === nothing && return ntuple(d -> nodes[d][lo[d]:(hi[d]+1)], D)
+    live = ntuple(d -> falses(length(nodes[d])), D)
+    # `findall` on a `BitVector` walks 64 cells per machine word, so this costs
+    # the mask's size in *words* plus its active cells — not its cell count.
+    # It runs on the flattened mask rather than the `D`-dimensional one on
+    # purpose: `findall` returns `Int` for a vector and `CartesianIndex{D}` for
+    # `D > 1`, and one `D`-generic loop body cannot consume both. `vec` on a
+    # `BitArray` is a reshape, so nothing is copied.
+    cartesian = CartesianIndices(mask.on)
+    for i in findall(vec(mask.on))
+        c = cartesian[i]
+        c in cells || continue
+        for d in 1:D
+            live[d][c.I[d]] = true
+            live[d][c.I[d] + 1] = true
+        end
     end
-    return merge_coordinates(coords, tol)
+    return ntuple(d -> nodes[d][live[d]], D)
+end
+
+# Per-axis merged element-boundary coordinates: gather each axis's live
+# element-boundary coordinates from every level (`_live_axis_coordinates`) and
+# canonicalise them with `merge_coordinates`, so two meshes' nearly-coincident
+# boundaries collapse to a single shared coordinate. Shared by the
+# integration-region partition (`_axis_intervals`), the physical-facet partition
+# (`_boundary_facet_regions` in dirichlet.jl) and the surface grid lines
+# (`_grid_lines_for_levels` in surface.jl).
+function _merged_axis_coordinates(levels, ::Val{D}, tol::GeometryTolerance{T},
+                                  cells=_all_level_cells) where {D,T}
+    per_level = map(level -> _live_axis_coordinates(level, Val(D), cells(level)), levels)
+    return ntuple(D) do d
+        merged = T[]
+        for live in per_level
+            append!(merged, live[d])
+        end
+        merge_coordinates(merged, tol)
+    end
 end
 
 # Per-axis intervals on which the admissible-box partition is built: turn
 # each axis's merged element-boundary coordinates
 # (`_merged_axis_coordinates`) into non-degenerate intervals.
 function _axis_intervals(levels::Tuple, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
-    return ntuple(D) do d
-        _intervals_from_coordinates(_merged_axis_coordinates(levels, d, tol), tol)
-    end
+    coords = _merged_axis_coordinates(levels, Val(D), tol)
+    return ntuple(d -> _intervals_from_coordinates(coords[d], tol), D)
 end
 
 # Coverage signature at a point: the linear cell index per level, with `0`
@@ -398,9 +468,10 @@ end
 # resolution, the keep-criterion and the quadrature dispatch over the boxes
 # emitted here:
 #
-#   1. Collect every participating mesh's element-boundary coordinates,
-#      per axis (`_axis_intervals` ⇒ `merge_coordinates` ⇒
-#      `_intervals_from_coordinates`).
+#   1. Collect, per axis, every participating mesh's element-boundary
+#      coordinates that bound an active cell of that mesh — all of them on an
+#      unmasked level (`_axis_intervals` ⇒ `_active_axis_coordinates` ⇒
+#      `merge_coordinates` ⇒ `_intervals_from_coordinates`).
 #   2. Form the Cartesian product of those intervals, giving the
 #      *candidate* box index grid `CartesianIndices(ranges)`.
 #   3. For each candidate, compute the per-level coverage signature at
@@ -701,11 +772,15 @@ regions" section:
      boundaries collapsed by step 1, silently, so this combination is
      rejected with an `ArgumentError` naming the axis, its spacing, and
      the tolerance.
-  1. Per axis: collect every level's element-boundary coordinates —
-     masking is per cell, so a level contributes its coordinates
-     whatever its `LevelMask` says — and canonicalise them via
-     `merge_coordinates` so two meshes' near-coincident coordinates
-     collapse to a single shared boundary.
+  1. Per axis: collect every level's element-boundary coordinates that
+     bound an active cell of that level — all of them on an unmasked
+     level — and canonicalise them via `merge_coordinates` so two
+     meshes' near-coincident coordinates collapse to a single shared
+     boundary. A coordinate no level keeps is the face of no active
+     cell, so every level's coverage signature is constant across it and
+     the partition is the one the full grids would have produced: the
+     candidate grid follows the active region rather than the finest
+     participating mesh.
   2. Form the Cartesian product of the resulting intervals to get
      candidate boxes; greedily merge axis-adjacent candidates that share
      a coverage signature (every cell inside the merged box lies inside

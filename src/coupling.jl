@@ -105,15 +105,22 @@ function _interface_regions(iface::Interface, V_a::Space{D,T}, V_b::Space{D,T}, 
                             field_b::Int, tol::GeometryTolerance{T}) where {D,T}
     merged = _grid_lines_for_levels((V_a.levels..., V_b.levels...), Val(D), tol)
     subdivided = _subdivide_mesh(iface.geometry, merged, tol)
-    qorder = ntuple(d -> max(_surface_quadrature_order(V_a)[d], _surface_quadrature_order(V_b)[d]),
-                    D)
-    return _emit_interface_regions(subdivided, V_a, V_b, field_a, field_b, qorder, tol)
+    return _emit_interface_regions(subdivided, V_a, V_b, field_a, field_b, tol)
 end
 
+# The rule is sized per sub-cell from the cells that actually cover it, on both
+# sides: the interface integrand is a product of one trace from each subdomain,
+# so the count that integrates it is the larger of the two sides' own counts.
+# The two `_parent_quadrature_counts` lookups have to stay separate because the
+# level ids of `V_a` and `V_b` are independently numbered and a parent from one
+# side would resolve to the wrong level through the other's lookup. `rules`
+# precomputes every rule the sweep can reach, bounded by the larger of the two
+# spaces' nominal-order bounds.
 function _emit_interface_regions(subdivided::BoundaryMesh{D,T,K}, V_a::Space{D,T}, V_b::Space{D,T},
-                                 field_a::Int, field_b::Int, qorder::NTuple{D,Int},
+                                 field_a::Int, field_b::Int,
                                  tol::GeometryTolerance{T}) where {D,T,K}
-    reference_samples = _simplex_reference_quadrature(Val(K), qorder, T)
+    bound = max(maximum(_surface_quadrature_order(V_a)), maximum(_surface_quadrature_order(V_b)))
+    rules = [_simplex_reference_quadrature(Val(K), n, T) for n in 1:bound]
     reference_area = _reference_area(Val(K))
     regions = InterfaceRegion{D,T}[]
     for (cell_index, cell) in pairs(subdivided.cells)
@@ -122,9 +129,10 @@ function _emit_interface_regions(subdivided::BoundaryMesh{D,T,K}, V_a::Space{D,T
         parents_b = _active_cover_parents(V_b, midpoint, tol)
         (isempty(parents_a) || isempty(parents_b)) && continue
 
+        n = max(maximum(_parent_quadrature_counts(Val(D), parents_a, id -> _level_by_id(V_a, id))),
+                maximum(_parent_quadrature_counts(Val(D), parents_b, id -> _level_by_id(V_b, id))))
         points, weights, normals = _simplex_cell_quadrature(cell, cell_index, subdivided.normals,
-                                                            reference_samples, reference_area,
-                                                            Val(K))
+                                                            rules[n], reference_area, Val(K))
         push!(regions,
               InterfaceRegion{D,T}(field_a, field_b, parents_a, parents_b, points, weights,
                                    normals))

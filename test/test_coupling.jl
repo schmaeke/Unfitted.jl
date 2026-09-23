@@ -534,3 +534,29 @@ end
     end
     @test hist == committed                                         # irreversible (monotone)
 end
+
+@testset "the interface rule is sized per sub-cell from both sides" begin
+    # `_emit_interface_regions` used to take one `qorder` for the whole
+    # interface, from both spaces' nominal maxima. It now asks each sub-cell's
+    # own covering parents, per side, and keeps the larger of the two counts —
+    # the interface integrand is a product of one trace from each subdomain, so
+    # neither side alone can size it. The two lookups stay separate because the
+    # level ids of the two spaces are independently numbered.
+    tol = GeometryTolerance(Float64)
+    V1 = overlay(space(box((0.0, 0.0), (1.0, 0.5)); cells=(4, 2), order=1),
+                 box((0.5, 0.25), (1.0, 0.5)); cells=(2, 1), order=3)
+    V2 = space(box((0.0, 0.5), (1.0, 1.0)); cells=(4, 2), order=2)
+    u1 = field(:u1, V1)
+    u2 = field(:u2, V2)
+    Γ = polyline_mesh([SVector(0.0, 0.5), SVector(1.0, 0.5)])
+
+    regions = Unfitted._interface_regions(interface(u1, u2, Γ), V1, V2, 1, 2, tol)
+    counts = [length(r.points) for r in regions]
+    # Left half: base (p = 1 → 2) against V2 (p = 2 → 3). Right half: the
+    # overlay (p = 3 → 4) against V2. A single global rule would print 4 twice.
+    @test sort(unique(counts)) == [3, 4]
+    for region in regions
+        x = sum(p[1] for p in region.points) / length(region.points)
+        @test length(region.points) == (x < 0.5 ? 3 : 4)
+    end
+end

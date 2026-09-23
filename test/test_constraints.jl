@@ -568,3 +568,95 @@ end
                     (c.raws[1] for (c, _) in candidates))
     @test reduced == length(candidates) - collisions
 end
+
+@testset "a dormant level does not change the base space's Dirichlet lift" begin
+    # Every level of a `ladder` spans the whole domain, so every level's mesh
+    # faces coincide with the physical boundary. Before the boundary partition
+    # was projected onto the active cells, an overlay carrying no active cell
+    # still sliced every physical face at its own resolution — and the
+    # composite rule the right-hand side `∫_∂Ω g φ` is integrated with went
+    # with it. A declared-but-unpopulated ladder therefore lifted
+    # non-polynomial data differently from its own base space, which is a
+    # dependence on geometry that carries no unknowns.
+    g(x) = sinpi(x[1]) * exp(x[2])
+    dom = box((0.0, 0.0), (1.0, 1.0))
+    solved = map((space(dom; cells=(4, 4), order=2),
+                  ladder(dom; cells=(4, 4), order=2, depth=3, splits=2))) do V
+        model = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(g; on=boundary(:all))]))
+        (model, solve!(model))
+    end
+    # 4 faces × 4 base cells. The dormant levels at 8², 16² and 32² cells add
+    # nothing, where before they took this to 4 × 32.
+    @test diagnostics(solved[1][1]).facet_region_count == 16
+    @test diagnostics(solved[2][1]).facet_region_count == 16
+    @test solved[1][2].coefficients == solved[2][2].coefficients
+end
+
+@testset "merged facet regions still integrate the boundary exactly" begin
+    # The greedy merge fuses candidate sub-rectangles that share a parent set,
+    # so one region can span several candidates — but never two cells of one
+    # parent level, which is what keeps a product of boundary traces
+    # polynomial on it. Three things must hold: the regions still partition
+    # each facet, a datum the space reproduces still comes back exactly, and
+    # the parents decoded from a merged region's signature are the parents at
+    # its own midpoint.
+    tol = GeometryTolerance(Float64)
+    dom = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    V = ladder(dom; cells=2, order=2, depth=2, splits=2)
+    V = adapt(V, 2 => [CartesianIndex(1, 1, 1)], 3 => [CartesianIndex(1, 1, 1)])
+
+    for axis in 1:3, side in (:lower, :upper)
+        regions = Unfitted._boundary_facet_regions(V, [(axis, side)], tol)
+        @test sum(sum(r.weights) for r in regions) ≈ 1.0 rtol = 1.0e-14   # the face's area
+        for region in regions
+            @test !isempty(region.parents)
+            @test allunique(p.level for p in region.parents)
+            for p in region.parents
+                level = Unfitted._level_by_id(V, p.level)
+                @test Unfitted.is_active(level.mask, p.cell)
+                @test Unfitted._cell_on_side(level, p.cell, axis, side)
+                # Every Q-point lies inside every parent's own cell: the
+                # contract the merge has to preserve, and the reason the rule
+                # below is still exact on a fused region.
+                for x in region.points
+                    @test Unfitted.contains_point(x, p.parent_box, tol)
+                end
+            end
+        end
+    end
+
+    # A codim-2 edge (one free axis) and the codim-3 vertex (none) go through
+    # the same merge with `F = 1` and `F = 0`.
+    edge = Unfitted._boundary_facet_regions(V, [(1, :lower), (2, :lower)], tol)
+    @test sum(sum(r.weights) for r in edge) ≈ 1.0 rtol = 1.0e-14
+    g(x) = 1 + x[1] + 2x[2] - x[3] + x[1] * x[2] - x[2] * x[3]
+    @test sum(sum(w * g(x) for (x, w) in zip(r.points, r.weights)) for r in edge) ≈ 0.5 rtol = 1.0e-14
+    vertex = Unfitted._boundary_facet_regions(V, [(1, :lower), (2, :lower), (3, :lower)], tol)
+    @test length(vertex) == 1
+    @test only(vertex).weights == [1.0]
+    @test only(vertex).points == [Unfitted.SVector(0.0, 0.0, 0.0)]
+
+    # The datum above is in the space, so the solved field reproduces it.
+    model = prepare(poisson(V; source=x -> 0.0, dirichlet=[dirichlet(g; on=boundary(:all))]))
+    @test l2_error(solve!(model), model, g) < 1.0e-12
+end
+
+@testset "the facet merge fires where the partition is finer than the parents" begin
+    # On a 3D face the two free axes make the projected candidate grid finer
+    # than the pattern of parent cells: an overlay live on a corner block cuts
+    # both free axes, and the candidates outside the block share their base
+    # cell and their empty overlay signature. Those are what the merge fuses,
+    # and the regions it emits still tile the face.
+    tol = GeometryTolerance(Float64)
+    dom = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    V = ladder(dom; cells=4, order=2, depth=1, splits=2)
+    V = adapt(V, 2 => CartesianIndices((1:2, 1:2, 1:2)))
+    sides = [(3, :lower)]
+    merged = Unfitted._merged_axis_coordinates(V.levels, Val(3), tol,
+                                               level -> Unfitted._side_cells(level, sides))
+    candidates = prod(length(Unfitted._intervals_from_coordinates(merged[d], tol)) for d in 1:2)
+    regions = Unfitted._boundary_facet_regions(V, sides, tol)
+    @test candidates == 25                       # 5 base lines + 2 overlay lines per free axis
+    @test length(regions) < candidates
+    @test sum(sum(r.weights) for r in regions) ≈ 1.0 rtol = 1.0e-14
+end
