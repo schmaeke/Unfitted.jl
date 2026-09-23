@@ -1,6 +1,6 @@
 using BasicBSpline
 using StaticArrays
-using LinearAlgebra: Symmetric, isposdef, norm, pinv, rank
+using LinearAlgebra: Symmetric, eigvals, isposdef, norm, pinv, rank
 
 # Smoke tests for the BasicBSpline extension. Mirror the integrated
 # Legendre test surface (`test_basis.jl`) where the interface is shared,
@@ -387,6 +387,110 @@ end
     mf, lf = _gram(nested(false, 3))
     @test count(==(:dedup), lf.elimination_source) == 0
     @test rank(Symmetric(Matrix(mf.matrix))) == active_unknowns(lf) - 1
+end
+
+@testset "BSpline extension: a fictitious fold does not disable the dedup" begin
+    # The same half-plane fold as "a cover ending inside a folded coarse cell is still a
+    # cover" in test_coverage_reduction.jl, under a nested B-spline stack. Ω = {x₁ ≤ 0.9}
+    # in [-1, 2]², base 6×6 at degree 2, cover of quarter-size cells.
+    #
+    # The B-spline gap was wider than the integrated-Legendre one and did not need the
+    # cover to stop anywhere in particular: the burial test demanded every support cell
+    # be *active*, and a degree-2 function spans three cells per axis, so one folded cell
+    # anywhere under the support disabled the dedup for every function reaching it. The
+    # cover reaching the domain face (xhi = 2.0) failed exactly like the cover ending
+    # inside the fold (1.5, 1.25) — 16 exact null modes, `dedup == 0`, in all three.
+    #
+    # On Ω the truncated and untruncated base functions coincide (nothing is integrated
+    # over a fictitious cell), the cover's own functions on the fold face are free
+    # (`_active_cell_at_face` exempts it), and a nested same-degree cover reproduces the
+    # base function exactly — so all 16 must go, and the space must be unchanged.
+    Ωfold = box((-1.0, -1.0), (2.0, 2.0))
+    half() = physical_domain(x -> x[1] - 0.9; lipschitz=1.0, subcell_length_scale=0.125,
+                             max_depth=6)
+    function fold_stack(xhi)
+        base = space(Ωfold; cells=6, order=2, basis=bspline(), physical=half())
+        return overlay(base, box((0.0, -1.0), (xhi, 2.0)); cells=(round(Int, 4xhi), 12), order=2)
+    end
+    for xhi in (2.0, 1.5, 1.25)
+        m, l = _gram(fold_stack(xhi))
+        mu, _ = _gram(Unfitted._unpruned(fold_stack(xhi)))
+        M = Symmetric(Matrix(m.matrix))
+        @test count(==(:dedup), l.elimination_source) == 16
+        @test active_unknowns(l) == 102
+        @test rank(M) == active_unknowns(l)
+        @test isposdef(M)
+        @test active_unknowns(l) == rank(Matrix(mu.matrix))     # nothing real deleted
+    end
+
+    # xhi = 1.5 is the case that discriminates the candidate rules. Support cell 6
+    # ([1.5, 2] on the x axis) lies wholly outside the cover, so a rule asking a
+    # fictitious support cell to meet the cover's interior rejects it — and leaves 8 of
+    # the 16 null modes. What actually decides is the cover's own trace condition: its
+    # face at x = 1.5 sits in fictitious material, every cover cell along it is folded
+    # away, no constraint is emitted there, and the cover's clamped span still contains
+    # the buried function on Ω.
+    _, l15 = _gram(fold_stack(1.5))
+    @test count(==(:dedup), l15.elimination_source) == 16
+
+    # The fold is not the only thing the cover face may land in. Here Ω = {x₁ ≤ 0.6}, so
+    # the cover ending at x = 1.0 ends two cells deep in fictitious material: full rank,
+    # all 16 deduped. This is the sharper of the two discriminating cases — the
+    # meets-the-interior rule deduplicates nothing at all here and leaves all 16 null
+    # modes, because every fictitious support cell lies outside the cover's box.
+    deep = overlay(space(Ωfold; cells=6, order=2, basis=bspline(),
+                         physical=physical_domain(x -> x[1] - 0.6; lipschitz=1.0,
+                                                  subcell_length_scale=0.125, max_depth=6)),
+                   box((0.0, -1.0), (1.0, 2.0)); cells=(4, 12), order=2)
+    md, ld = _gram(deep)
+    @test count(==(:dedup), ld.elimination_source) == 16
+    @test rank(Symmetric(Matrix(md.matrix))) == active_unknowns(ld)
+
+    # The one fold configuration still left singular, pinned so a future repair is
+    # noticed. With Ω = {x₁ ≤ 0.9} and the cover ending exactly at x = 1.0, the cover's
+    # boundary cells along that face are cut cells, hence active, hence clamped — and
+    # the difference N₅ − N₆ of two buried base splines vanishes at x = 1 while the part
+    # of it beyond the face is fictitious, so the clamped cover reproduces the
+    # *combination* on Ω though it reproduces neither function. No rule keyed on a single
+    # buried function can see that: 8 exact null modes remain, and the `_unpruned` twin
+    # has the same 8, so nothing the dedup could have kept would help. The repair is
+    # per constrained face — of the p buried functions straddling the face knot with the
+    # same perpendicular factor, keep the m + 1 trace orders and strongly eliminate the
+    # rest — and it is a change to the dedup contract, not to the burial test.
+    ms, ls = _gram(fold_stack(1.0))
+    Ms = Symmetric(Matrix(ms.matrix))
+    @test active_unknowns(ls) == 104
+    @test_broken rank(Ms) == active_unknowns(ls)          # rank 96: the 8 combinations
+end
+
+@testset "BSpline extension: a degree-1 cover is the hat space and deduplicates hats" begin
+    # The reverse direction of "the dedup fires only where the span really contains"
+    # below — an integrated-Legendre base under a B-spline cover, rather than a B-spline
+    # base under an integrated-Legendre cover. A degree-1 open-knot B-spline on a nested mesh *is* the Q1 hat
+    # basis, so it reproduces the buried base hat and the two copies are linearly
+    # dependent; at degree ≥ 2 the cover is C^(p−1) at a simple interior knot and cannot
+    # carry the kink, so the hat must stay. The dedup gate used to test the cover's
+    # family (`k.basis isa IntegratedLegendre`) rather than ask it, so the degree-1 cover
+    # was refused the dedup and the stack carried one exact null mode.
+    base() = space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=2)
+    B = box((0.25, 0.25), (0.75, 0.75))
+    for (deg, dedup, unknowns) in ((1, 1, 81), (2, 0, 89))
+        V = overlay(base(), B; cells=4, order=deg, basis=bspline())
+        @test Unfitted._spans_hats(V.levels[2].basis) == (deg == 1)
+        m, l = _gram(V)
+        @test count(==(:dedup), l.elimination_source) == dedup
+        @test count(==(:coverage), l.elimination_source) == 8
+        @test active_unknowns(l) == unknowns
+        @test rank(Symmetric(Matrix(m.matrix))) == active_unknowns(l)
+        @test isposdef(Symmetric(Matrix(m.matrix)))
+    end
+
+    # And the degree-1 cover gives the same space an integrated-Legendre p = 1 cover
+    # does: same active count, and the Gram spectra agree to roundoff.
+    mb, lb = _gram(overlay(base(), B; cells=4, order=1, basis=bspline()))
+    mi, li = _gram(overlay(base(), B; cells=4, order=1))
+    @test active_unknowns(lb) == active_unknowns(li)
+    @test eigvals(Symmetric(Matrix(mb.matrix))) ≈ eigvals(Symmetric(Matrix(mi.matrix)))
 end
 
 @testset "BSpline extension: the dedup fires only where the span really contains" begin

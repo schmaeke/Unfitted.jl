@@ -258,6 +258,63 @@ end
     @test isposdef(M)
 end
 
+# Ω = {x₁ ≤ 0.9} inside [-1, 2]², so a 3×3 base folds its whole right column away as
+# fictitious and the fold face sits at x = 1. The cover is a sub-box overlay, never a
+# `ladder`: a ladder spans the level below, `is_inside` passes, and the fold is settled
+# by the mask branch of `_covered_by_level` — the configuration below never arises.
+_HALF_PLANE_CR = box((-1.0, -1.0), (2.0, 2.0))
+function _half_plane_cr()
+    physical_domain(x -> x[1] - 0.9; lipschitz=1.0, subcell_length_scale=0.125, max_depth=6)
+end
+function _fold_cover(xhi, p)
+    base = space(_HALF_PLANE_CR; cells=3, order=p, physical=_half_plane_cr())
+    return overlay(base, box((0.0, -1.0), (xhi, 2.0)); cells=(round(Int, 2xhi), 6), order=p)
+end
+
+@testset "a cover ending inside a folded coarse cell is still a cover" begin
+    # The two extents are the two sides of the rule, and both are asserted.
+    #
+    #   xhi = 1.5 — the cover's face lands *inside* the folded base cell [1, 2]. That
+    #     cell is fictitious, so the base's modes on the x = 1 fold face stay free
+    #     (`_internal_face_is_physical`); on the cover the same face is interior, so
+    #     the cover's copies are free too; and under nesting the cover reproduces them
+    #     exactly on Ω. Both copies used to survive — the burial test asked
+    #     `is_inside(cell, cover.domain)` of the fictitious cell, which a cover ending
+    #     inside it fails — and the Gram matrix picked up 10 exact null modes at p = 3
+    #     (4 vertex hats plus 3 × 2 face modes on x = 1) and 4 at p = 1.
+    #   xhi = 1.0 — the cover stops *at* the fold face. Its own boundary cells there are
+    #     cut cells, hence active, hence clamped: the cover's trace vanishes at x = 1
+    #     and it cannot carry the base's hat. The mode must be retained, and is.
+    #
+    # `rank == active_unknowns` is the discriminating assertion. The pointwise
+    # reproduction below is the completeness guard only and cannot stand in for it: the
+    # null modes live entirely in the fictitious part, a pseudo-inverse projection never
+    # touches them, and every reproduction assertion here passes on the singular
+    # operator too. What it does guard is the other direction — that the repair prunes
+    # nothing the space needs.
+    for (p, xhi, dedup, unknowns) in
+        ((3, 1.5, 4, 154), (3, 1.0, 0, 145), (1, 1.5, 4, 22), (1, 1.0, 0, 19))
+        m, l = _gram(_fold_cover(xhi, p))
+        mu, _ = _gram(Unfitted._unpruned(_fold_cover(xhi, p)))
+        M = Symmetric(Matrix(m.matrix))
+        @test count(==(:dedup), l.elimination_source) == dedup
+        @test active_unknowns(l) == unknowns
+        @test rank(M) == active_unknowns(l)
+        @test isposdef(M)
+        # And nothing real was deleted: the cover is nested and same-order, so the
+        # pruned space must still span the unpruned one (the pattern at "a mode covered
+        # by two different levels is retained").
+        @test active_unknowns(l) == rank(Matrix(mu.matrix))
+
+        # Still complete to order p over Ω.
+        c = pinv(M) * load_vector(m; source=x -> x[1]^p)
+        proj = Solution(c, m.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
+        for x in (SVector(-0.5, 0.5), SVector(0.5, -0.3), SVector(0.8, 1.2))
+            @test value(proj, m, x) ≈ x[1]^p atol = 1e-8
+        end
+    end
+end
+
 @testset "covered-mode pruning in 3D (edge, face, and interior modes)" begin
     # Aligned same-order nested overlay over the middle 2×2×2 base block: the buried
     # centre vertex is deduped and the eight covered cells shed their edge/face/interior

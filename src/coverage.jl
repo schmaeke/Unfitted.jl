@@ -14,6 +14,21 @@
 # "a fully-deactivated overlay behaves like no overlay" true under covered-mode pruning. The
 # one deactivation that still covers is the fictitious fold, because a cell outside Ω
 # carries no material at all; see the comment on `_covered_by_level`.
+#
+# The fold is exempt on *both* sides of the question, and the two exemptions are
+# separate functions:
+#
+#   * on the covering level, a fictitious cell of the cover does not stop it covering
+#     (`_covered_by_level`);
+#   * on the level being pruned, a fictitious cell of the *support* neither has to be
+#     covered nor may block the verdict, because nothing is integrated there and the
+#     function the level assembles is the same on Ω with it or without it
+#     (`_reproduced_on_domain`).
+#
+# Reading the rule with only the first exemption in mind is how a nested cover ending
+# inside a folded coarse cell came to leave both copies of an exactly reproduced mode
+# active; `_reproduced_on_domain` is the shared answer, used by the pruning rule in
+# `dofs.jl` and by the B-spline family's own in the extension.
 
 """
     Coverage{D}
@@ -112,6 +127,75 @@ function _covered_by_level(box::AxisBox{D,T}, k::Level{D,T}, tol::GeometryTolera
     return true
 end
 
+# True iff cell `ci` of `level` was deactivated by the fictitious fold rather than by
+# the user's `active =` selection: inactive, and holding no material at all. The two
+# sources are merged into one `LevelMask` by `_apply_physical_fold` (`mesh.jl`) and mean
+# opposite things everywhere the dof layer looks at them; this is the one test that
+# separates them again. With `physical === nothing` there is no fold, so every inactive
+# cell is a user mask and `cache` is never touched.
+function _is_fictitious(level::Level{D,T}, ci::CartesianIndex{D}, physical,
+                        cache::_ClassifyCache{D,T}) where {D,T}
+    is_active(level.mask, ci) && return false
+    physical === nothing && return false
+    return classify_cell(physical, cell_box(level.mesh, ci), cache) === :fictitious
+end
+
+# True iff `k` reproduces on Ω the function `level` assembles from the contiguous cell
+# block `cells` — the support of one of `level`'s dofs. Nesting and the span-containment
+# question ("does k's basis carry this shape at all?") belong to the caller; what is
+# settled here is geometric: does what `k` is *allowed* to represent still contain the
+# function, once the fold has been accounted for on both levels.
+#
+# Three conditions, and each is a separate failure mode:
+#
+#   1. Every *material* (active) cell of the support is covered by `k` alone. `level`
+#      integrates there, so `k` must reach there — and `_covered_by_level` already
+#      applies the fold rule to `k`'s own mask.
+#   2. Every inactive cell of the support is fictitious. An inactive cell generates
+#      nothing, so what `level` assembles is the function truncated to its active
+#      cells. For a fold that truncation is invisible on Ω — nothing is integrated
+#      outside Ω — and the two functions agree where it matters. For a *user*-masked
+#      cell it is not: material there is carried by `level` alone, the truncated
+#      function has a jump `k` does not reproduce, and the dedup must not fire.
+#   3. No face of `k`'s box that cuts the interior of the support carries a trace
+#      condition. `k` is clamped to zero on its artificial boundary — but only where
+#      its boundary cells are *active*, since a fold face emits no constraint
+#      (`_has_overlay_constraint` / `_active_cell_at_face`). A face strictly inside the
+#      support hull is a face the function is generally non-zero on, so one active
+#      boundary cell of `k` along it puts the function outside `k`'s constrained span.
+#      Faces at or outside the hull are harmless: the function vanishes there.
+#      A mesh-box face lying on ∂Ω_global needs no exemption here even though it too
+#      emits nothing — it can never cut the hull, because the hull lies inside the
+#      level's own domain, which lies inside the global one.
+#
+# Condition 3 is vacuous whenever every support cell is active: condition 1 then puts
+# the whole (contiguous, hence hull-filling) block inside `k`'s domain, so no face of
+# `k` is strictly inside the hull. It is the fold that makes the rule bite — a support
+# whose material part `k` covers while its fictitious part sticks out past `k`'s box.
+function _reproduced_on_domain(level::Level{D,T}, k::Level{D,T}, cells::CartesianIndices{D},
+                               physical, tol::GeometryTolerance{T},
+                               cache::_ClassifyCache{D,T}) where {D,T}
+    for ci in cells
+        if is_active(level.mask, ci)
+            _covered_by_level(cell_box(level.mesh, ci), k, tol, physical, cache) || return false
+        else
+            _is_fictitious(level, ci, physical, cache) || return false
+        end
+    end
+    hull = AxisBox{D,T}(cell_box(level.mesh, first(cells)).lower,
+                        cell_box(level.mesh, last(cells)).upper)
+    for d in 1:D
+        faces = ((1, k.mesh.domain.lower[d]), (k.mesh.cells[d], k.mesh.domain.upper[d]))
+        for (j, x) in faces                                     # k's two box faces on axis d
+            hull.lower[d] + tol.contain < x < hull.upper[d] - tol.contain || continue
+            perp = _overlapping_cells(k.mesh, hull, tol)
+            layer = CartesianIndices(ntuple(e -> e == d ? (j:j) : perp.indices[e], D))
+            any(kc -> is_active(k.mask, kc), layer) && return false
+        end
+    end
+    return true
+end
+
 """
     build_coverage(V::Space, tol) -> Coverage
     build_coverage(V::Space, tol, classify_cache) -> Coverage
@@ -169,9 +253,12 @@ end
 # original one.
 #
 # The B-spline family's own `_coverage_constraints` (in the extension) reads `cov` over a
-# wider stencil — a spline of degree `p` lives on up to `p + 1` cells per axis — but only
-# after requiring every one of those cells to be *active* on this level, and the active
-# cells are the seed of the dilation above. So it too reads only computed entries.
+# wider stencil — a spline of degree `p` lives on up to `p + 1` cells per axis. Both
+# consumers read it only on the *active* cells of that stencil, which are the seed of the
+# dilation above, and skip the inactive ones outright: a fictitious support cell can lie
+# several cells past the active front, where the entry is the uninformative `false`
+# default, and `_reproduced_on_domain` settles it by classification instead. So both read
+# only computed entries.
 #
 # The dof layer is not the only reader: `_mesh_vtk_data` in `postprocessing.jl` reads
 # `cov` on every cell of the level for its `covered` diagnostic array. That reader is

@@ -90,7 +90,8 @@ using Unfitted
 using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, LevelMask, AxisDofKey,
                 TensorDofKey, GeometryTolerance, LinearConstraint, Space, Coverage, cell_box,
                 is_active, _AXIS_BSPLINE, _check_basis_mode, _level_side_is_physical,
-                _tensor_dof_key, _ClassifyCache, _covered_by_level, _nested_over, classify_cell
+                _tensor_dof_key, _ClassifyCache, _is_fictitious, _nested_over,
+                _reproduced_on_domain, classify_cell
 using StaticArrays: SVector
 using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim
 
@@ -129,7 +130,38 @@ handles it: `prune_covered` (`true` by default on both [`space`](@ref) and
 discrete space is unchanged, unlike integrated Legendre's covered-mode pruning,
 which trades accuracy for dofs. A `:tensor` integrated-Legendre overlay of
 order ≥ the base degree reproduces the same functions and is deduped the
-same way.
+same way. The converse also holds and the family answers for it: a *degree-1*
+B-spline overlay is the C⁰ multilinear hat space of its own mesh, so it
+deduplicates the buried vertex functions of an integrated-Legendre level
+below; at degree ≥ 2 it is `C^{p−1}` at a simple interior knot, too smooth to
+carry the hat's kink, and nothing is deduplicated.
+
+Under an immersed [`PhysicalDomain`](@ref) the fold takes part on both sides
+of the question. A fictitious cell of the *covering* level does not stop it
+covering, and a fictitious cell under the buried function's *support* neither
+has to be covered nor blocks the dedup: nothing is integrated there, so on Ω
+the truncated and untruncated functions coincide. A user-masked cell is the
+opposite case and still blocks, because material there is carried by the
+coarser level alone. What decides the remaining question is the overlay's own
+trace condition: a face of the overlay's box that cuts the interior of the
+support carries the function's trace, and the overlay is clamped there exactly
+where its boundary cells are active — so the dedup fires iff every overlay
+boundary cell along such a face was folded away.
+
+One fold configuration is still left singular, and breaking the nesting is
+the only way out of it today. When the overlay's box face falls on a knot of
+the level below *inside* a band of cut cells — so the overlay's boundary cells
+there are active and clamped — the clamped overlay can reproduce a
+*combination* of two buried functions (their difference vanishes at the face,
+and the part of it beyond the face is fictitious) while reproducing neither on
+its own. A dedup keyed on single buried functions cannot see that, and the
+operator keeps one exact null mode per such combination: measured at 8 on a
+6×6 degree-2 base over Ω = {x₁ ≤ 0.9} in [-1, 2]² with a quarter-cell overlay
+ending at x = 1. Closing it needs a per-face rank repair — of the `p` buried
+functions straddling the face knot with the same perpendicular factor, keep the
+`m + 1` trace orders and strongly eliminate the rest — which is a change to what
+the dedup is allowed to eliminate, not to the burial test. Move the overlay's
+face off the cut-cell band, or break the nesting, until it lands.
 
 Passing `prune_covered=false` on a nested stack keeps the duplicate and
 leaves the operator singular, the same trade the integrated-Legendre family
@@ -683,6 +715,18 @@ function _reproduces(k::Level{D}, p::NTuple{D,Int}) where {D}
     return all(o -> all(d -> o[d] >= p[d], 1:D), k.orders.palette)
 end
 
+# The reverse direction of `_reproduces`: whether *this* family, standing above an
+# integrated-Legendre level, spans that level's C⁰ hats and may therefore deduplicate
+# them. At degree 1 the open knot vector is the Q1 hat basis outright — simple interior
+# knots give exactly C⁰, the clamped ends give the two boundary hats — so on a nested
+# mesh the buried hat is one of this level's own functions. Any axis at degree ≥ 2 is
+# C^(p−1) with p − 1 ≥ 1 at a simple interior knot, too smooth to carry the kink, and
+# the whole tensor product goes with it. Answering per axis rather than per level is
+# what makes this a mixed-family question: a degree-1 B-spline cover over an
+# integrated-Legendre base is the C⁰ hat space and was previously refused the dedup by a
+# family type test, leaving the stack exactly singular.
+Unfitted._spans_hats(f::BSplineFamily{D}) where {D} = all(d -> degree(f.spaces[d]) == 1, 1:D)
+
 # `_coverage_constraints` for a B-spline level — the dedup half only, and it is
 # the whole of covered-mode pruning for this family.
 #
@@ -711,14 +755,21 @@ function Unfitted._coverage_constraints(level::Level{D,T,<:BSplineFamily}, V::Sp
     isempty(above) && return out
     for (key, raw) in level_keys
         cells = _support_cells(key, family, n)
-        # Buried, and buried as a whole function. The `is_active` half matters only
-        # on a masked level: what such a level assembles is the function truncated
-        # to its own active cells, which is not the function `k` reproduces. It also
-        # keeps the `cov` read in range of what `_coverage_cells` computed — that
-        # set is the active cells dilated by one, so every cell tested here is in it.
-        all(ci -> cov[ci] && is_active(level.mask, ci), cells) || continue
-        any(k -> all(ci -> _covered_by_level(cell_box(level.mesh, ci), k, tol, V.physical,
-                                             classify_cache), cells), above) || continue
+        # Buried, and buried as a whole function — but the two halves of "whole" are
+        # not the same test, and conflating them is what left a folded stack singular.
+        # A *user-masked* support cell blocks: what a masked level assembles is the
+        # function truncated to its own active cells, which is not the function `k`
+        # reproduces. A *fictitious* one does not: nothing is integrated there, so the
+        # truncation is invisible on Ω. It must also bypass `cov`, which is computed
+        # only on the active cells dilated by one (`_coverage_cells`) — a support cell
+        # two cells past the active front holds the `false` default, not a verdict.
+        # What is left of the question `_reproduced_on_domain` settles, including
+        # whether a face of `k`'s box cuts the support and carries a trace condition
+        # there.
+        all(ci -> is_active(level.mask, ci) ? cov[ci] :
+                  _is_fictitious(level, ci, V.physical, classify_cache), cells) || continue
+        any(k -> _reproduced_on_domain(level, k, cells, V.physical, tol, classify_cache), above) ||
+            continue
         push!(out, (LinearConstraint{T}([raw], [one(T)]), :dedup))
     end
     return out

@@ -634,6 +634,24 @@ function _cell_modes(basis::IntegratedLegendre, orders::CellOrders{D}, mesh::Car
     return CellModes{D}(sets, kind)
 end
 
+# Whether a family's span on a mesh contains that mesh's C⁰ multilinear vertex
+# functions — the hats. This is the basis half of the linear dedup in
+# `_coverage_constraints`; `_nested_over` (`coverage.jl`) is the geometric half, and a
+# cover must pass both before a buried hat of the level below is eliminated.
+#
+# Integrated Legendre qualifies in either mode at any per-cell order ≥ 1: it is exactly
+# C⁰ across a cell boundary, and the two endpoint modes it collapses into one node
+# factor have trunk degree 0, so Q1 is in every cell's index set. The default is `false`,
+# which is the safe direction — skipping a legitimate dedup leaves a duplicate, while
+# deduping against a span that does not contain the hat deletes part of the space.
+#
+# It is a family trait rather than a type test on the cover because smoothness is a
+# property of the family's own construction: a maximal-regularity B-spline is C^(p−1) at
+# a simple interior knot, so it carries the kink at degree 1 and at no higher degree —
+# the extension answers exactly that, and a `k.basis isa IntegratedLegendre` gate cannot.
+_spans_hats(::BasisFamily) = false
+_spans_hats(::IntegratedLegendre) = true
+
 """
     _coverage_constraints(level, V, coverage, tol, level_keys, classify_cache)
         -> Vector{Tuple{LinearConstraint{T},Symbol}}
@@ -641,17 +659,21 @@ end
 Pruning constraint source, a peer of [`_overlay_constraints`](@ref). For a
 level opted into `prune_covered`, emit a single-raw strong elimination for
 
-  * every **buried high-order** mode (at least one bubble axis, every incident cell
-    covered) — covered-mode pruning, source `:coverage`; and
-  * every **buried linear** mode a single nested *integrated-Legendre* level above
-    reproduces exactly — dedup, source `:dedup`.
+  * every **buried high-order** mode (at least one bubble axis, every active incident
+    cell covered by and every fictitious one reached by a single finer level) —
+    covered-mode pruning, source `:coverage`; and
+  * every **buried linear** mode a single nested level above whose basis spans that
+    mesh's hats reproduces exactly — dedup, source `:dedup`.
 
 The linear skeleton is otherwise retained, which is what makes the reduced space
 complete. Each returned pair carries its elimination source for `constraint_kind` /
 diagnostics.
 
-`classify_cache` is threaded into `_covered_by_level` for the dedup test so it
-applies the same fictitious-fold rule [`build_coverage`](@ref) used.
+Both halves ask `_reproduced_on_domain` (`coverage.jl`), which applies the
+fictitious-fold rule on the covering level *and* on this one — a support cell folded
+away carries nothing to reproduce, so it neither has to be covered nor may veto the
+verdict. `classify_cache` is threaded through for the classification that tells a fold
+from a user mask, the same one [`build_coverage`](@ref) used.
 
 The dedup half is not an optimisation: a mode a covering level reproduces exactly is
 linearly dependent on that level's own modes, so leaving both active makes the
@@ -668,23 +690,15 @@ function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{
     any(cov) || return out
     n = level.mesh.cells
     # A buried vertex function is a C⁰ hat: multilinear on each of `level`'s cells,
-    # kinked across every cell boundary. Mesh nesting only buys the multilinear half —
-    # a span reproduces the kink iff it is no smoother than C⁰ there. Integrated
-    # Legendre is exactly C⁰ across cell boundaries and contains Q1 on every cell
-    # (order ≥ 1 is enforced), so it qualifies; a B-spline of degree p is C^(p−1) at a
-    # simple interior knot, so for p ≥ 2 nothing in its span kinks there. Restricting
-    # the dedup to integrated-Legendre covers can only skip a legitimate dedup, never
-    # eliminate a mode nothing replaces.
+    # kinked across every cell boundary. Mesh nesting (`_nested_over`) only buys the
+    # multilinear half; the kink is the cover basis's half, and `_spans_hats` is where
+    # each family answers for it. Both halves are necessary and neither is about this
+    # level's family — a cover that spans the hats deduplicates them whoever generated
+    # them.
     nested_above = [k
                     for k in V.levels
-                    if k.id > level.id &&
-                           k.basis isa IntegratedLegendre &&
-                           _nested_over(level, k, tol)]
-    # A nested level above reproduces a buried vertex function iff it covers every cell
-    # the vertex touches — the same fictitious-aware rule `build_coverage` applied.
-    reproduces(k, cells) = all(cells) do ci
-        _covered_by_level(cell_box(level.mesh, ci), k, tol, V.physical, classify_cache)
-    end
+                    if k.id > level.id && _spans_hats(k.basis) && _nested_over(level, k, tol)]
+    reproduces(k, cells) = _reproduced_on_domain(level, k, cells, V.physical, tol, classify_cache)
     # Covered-mode pruning asks the same *single-level* question the dedup half asks.
     # `cov[ci]` says only that *some* higher level contains cell `ci`, and a mode
     # whose incident cells are covered by two different levels is reproduced by
@@ -707,9 +721,13 @@ function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{
     # off (9.37e-3 both), against 9.95e-4 and 7.03e-4 without it.
     above = [k for k in V.levels if k.id > level.id]
     resolves(cells) = any(k -> reproduces(k, cells), above)
+    # The `cov` prefilter is a fast path over the *active* support only, which is both
+    # the set `_coverage_cells` computed and the only set on which a `false` entry is a
+    # verdict rather than a default. An inactive incident cell is settled by
+    # `reproduces`: fictitious and it is skipped, user-masked and it refuses.
     for (key, raw) in level_keys
         cells = _incident_cells(key, n)
-        all(ci -> cov[ci], cells) || continue                       # buried?
+        all(ci -> !is_active(level.mask, ci) || cov[ci], cells) || continue     # buried?
         if any(a -> a.kind == _AXIS_SPAN, key.axes)                 # high-order → covered-mode pruning
             resolves(cells) && push!(out, (LinearConstraint{T}([raw], [one(T)]), :coverage))
         elseif any(k -> reproduces(k, cells), nested_above)          # linear reproduced above
