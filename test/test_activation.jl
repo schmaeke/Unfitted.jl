@@ -370,3 +370,23 @@ end
     @test_throws ArgumentError activate!(model; level=0, cells=[CartesianIndex(1, 1)])
     @test_throws ArgumentError activate!(model; level=5, cells=[CartesianIndex(1, 1)])
 end
+
+@testset "activating a fold-deactivated cell does not override the geometry" begin
+    # The fictitious fold and the user's `active =` selection are merged into one
+    # `LevelMask`, and only one of them is the caller's to set. A cell the
+    # classifier found entirely outside Ω carries no material, has no quadrature
+    # rule and contributes nothing, so `activate!` on it is a no-op on the
+    # effective space — while staying visible in the pre-fold record, which is
+    # what a later `move!` or a geometry change re-derives from.
+    disc = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.4; lipschitz=1.0,
+                           subcell_length_scale=0.05)
+    V = space(box((-1.0, -1.0), (1.0, 1.0)); cells=(4, 4), order=1, physical=disc)
+    model = prepare(mass(V; coefficient=1.0))
+    outside = findfirst(!, active_cells(model; level=1))
+    @test outside !== nothing
+
+    activate!(model; level=1, cells=[outside])
+    @test !active_cells(model; level=1)[outside]                  # the geometry wins
+    @test active_cells(model; level=1, effective=false)[outside]   # the request is kept
+    @test diagnostics(model, solve!(model)).fit_failure_count == 0
+end

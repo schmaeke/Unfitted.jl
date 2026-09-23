@@ -25,11 +25,11 @@
 #     `LevelMask` is in play — except where the inactive side is fully
 #     fictitious, since a fold face carries no physical trace to
 #     vanish on (`_internal_face_is_physical`).
-#   * Covered-mode pruning — under the leaf semantics the space declares, the
-#     high-order modes buried under a finer level, plus the buried
-#     linear modes a nested finer level reproduces exactly. Also a
-#     strong elimination, and also artificial: it removes modes the
-#     superposition already carries, never a physical condition.
+#   * Covered-mode pruning — under leaf semantics, the high-order modes
+#     buried under a finer level, plus the buried linear modes a nested
+#     finer level reproduces exactly. Also a strong elimination, and also
+#     artificial: it removes modes the superposition already carries,
+#     never a physical condition.
 #
 # Active dofs are enumerated component-major (component 1 of every raw
 # first, then component 2, …) so the all-or-nothing constrained case
@@ -647,7 +647,7 @@ _spans_hats(::IntegratedLegendre) = true
         -> Vector{Tuple{LinearConstraint{T},Symbol}}
 
 Pruning constraint source, a peer of [`_overlay_constraints`](@ref). Under the
-leaf semantics the space declares (`Space.prune_covered`), emit a single-raw
+leaf semantics (`dof_layout`'s `prune`, on by default), emit a single-raw
 strong elimination for
 
   * every **buried high-order** mode (at least one bubble axis, every active incident
@@ -701,7 +701,7 @@ function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{
     # It deliberately does NOT ask the covering level to carry this level's
     # order. Shedding a buried high-order mode is not a claim that something
     # reproduces it — that is the dedup half's job, for linear modes. It is the
-    # leaf semantics the space declares: over a region a finer level
+    # what leaf semantics mean: over a region a finer level
     # resolves, a coarse cell's high-order modes buy almost nothing in L² and
     # carry the oscillation, so a *high-order base with a low-order fine overlay
     # over a non-smooth feature* is exactly the configuration the rule exists to
@@ -922,7 +922,7 @@ end
 
 """
     dof_layout(V::Space; dirichlet=[], tolerance=GeometryTolerance(T), components=1,
-                         classify_cache=_ClassifyCache{D,T}()) -> DofLayout
+                         prune=true, classify_cache=_ClassifyCache{D,T}()) -> DofLayout
 
 Construct the basis-aware global dof layout for a superposition
 [`Space`](@ref). The construction proceeds in four stages:
@@ -934,9 +934,9 @@ Construct the basis-aware global dof layout for a superposition
   2. Collect homogeneous linear constraints from every level, from two
      sources: the family-dispatched [`_overlay_constraints`](@ref) hook
      on every level, and [`_coverage_constraints`](@ref) on every level
-     when the space declares leaf semantics (which needs the per-level
-     masks [`build_coverage`](@ref) computes, so those are built first,
-     and skipped entirely on an unpruned space). A raw the overlay condition already eliminates
+     under leaf semantics (which needs the per-level masks
+     [`build_coverage`](@ref) computes, so those are built first, and
+     skipped entirely when `prune = false`). A raw the overlay condition already eliminates
      is not re-constrained by covered-mode pruning, so `elimination_source`
      credits it to the source that actually removed it. Resolve the
      collected constraints into the per-raw expansion table via
@@ -957,6 +957,9 @@ Keyword arguments:
   - `dirichlet` — iterable of [`DirichletCondition`](@ref)s.
   - `tolerance` — `GeometryTolerance` used by boundary detection.
   - `components` — scalar channels per field (≥ 1).
+  - `prune` — leaf semantics, on by default. `false` retains every covered
+    mode and is the unreduced twin the reduction is measured against; see
+    [`prepare`](@ref), which is where a caller reaches it.
   - `classify_cache` — the space's cell-classification cache (shared with the
     `PhysicalDomain` fold). The fictitious-fold constraint predicate and the
     coverage rule both reuse it instead of re-classifying fold-boundary cells;
@@ -971,7 +974,7 @@ artificial boundaries; the assembly path distributes entries through
 the expansion automatically.
 """
 function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
-                    components::Integer=1,
+                    components::Integer=1, prune::Bool=true,
                     classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
     components > 0 || throw(ArgumentError("dof layout components must be positive"))
     raw_by_key = Dict{TensorDofKey{D},Int}()
@@ -1023,7 +1026,7 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     # The loop below keeps that split honest: a raw the overlay condition already
     # eliminates never reaches this map, whichever source names it second.
     source_of = Dict{Int,Symbol}()
-    coverage = V.prune_covered ? build_coverage(V, tolerance, classify_cache) :
+    coverage = prune ? build_coverage(V, tolerance, classify_cache) :
                Coverage{D}(Dict{Int,BitArray{D}}())
     for level in V.levels
         level_keys = get(keys_by_level, level.id, empty_keys)
@@ -1044,7 +1047,7 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
         # overlay constraints eliminate a named raw outright; a multi-raw
         # (B-spline) constraint picks its pivot during resolution, and that
         # family emits no coverage constraints at all.
-        if V.prune_covered
+        if prune
             reductions = _coverage_constraints(level, V, coverage, tolerance, level_keys,
                                                classify_cache)
             overlay_raws = isempty(reductions) ? Set{Int}() :

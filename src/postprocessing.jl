@@ -114,11 +114,12 @@ end
 #   * `NTuple{D,Int}`     — explicit per-axis counts.
 function _subdivision_counts(space::Space{D,T}, region::VolumeRegion{D,T}, subdivisions) where {D,T}
     if subdivisions === :degree
-        # Per parent CELL, not per level: `level.order` is the level's nominal
-        # (per-axis maximum) order, so reading it here subdivides every region at
-        # the order of the loudest cell anywhere on the level. Measured on a 3D
-        # 8³ level at p=1 with a single p=6 cell, the default `write_vtk` path
-        # emitted 110 592 subcells against 512 and 221.9 MB against 2.50 MB.
+        # Per parent CELL, not per level: the level's nominal order
+        # (`nominal_order`) is the per-axis maximum over its cells, so sizing
+        # from it subdivides every region at the order of the loudest cell
+        # anywhere on the level. Measured on a 3D 8³ level at p=1 with a single
+        # p=6 cell, the default `write_vtk` path emitted 110 592 subcells
+        # against 512 and 221.9 MB against 2.50 MB.
         return ntuple(D) do d
             maximum(parent -> max(1, cell_order(_level_by_id(space, parent.level), parent.cell)[d]),
                     region.parents)
@@ -664,7 +665,7 @@ function _level_value(coefficients, model::Model{D,T}, layout::FieldLayout{D,T},
 
     parent_box = cell_box(level.mesh, cell)
     xi = physical_to_reference(parent_box, x)
-    values = _cell_basis_values(level, cell, xi)
+    values = basis_values(level, cell, xi)
     raw_dofs = cell_dofs(layout.dofs, level.id, cell)
     # Reuse the assembly reconstruction kernel: the dof sum over
     # `(raw_dofs, values)` is exactly what `_field_value` computes (constrained
@@ -685,7 +686,7 @@ function _level_gradient(coefficients, model::Model{D,T}, layout::FieldLayout{D,
 
     parent_box = cell_box(level.mesh, cell)
     xi = physical_to_reference(parent_box, x)
-    gradients = _cell_basis_gradients(level, cell, parent_box, xi)
+    gradients = physical_basis_gradients(level, cell, parent_box, xi)
     raw_dofs = cell_dofs(layout.dofs, level.id, cell)
     # Reuse the assembly gradient-reconstruction kernel over `(raw_dofs,
     # gradients)`; the chain-rule scaling is already in `gradients`.

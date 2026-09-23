@@ -74,10 +74,10 @@ refined_region = box(ntuple(_ -> 0.25, D), ntuple(_ -> 0.75, D))
 # the workflow is factored into this helper. Its body is the same five
 # calls as Tutorial 1, in the same order, with nothing hidden.
 
-function solve_and_report(V, title; parameters=())
+function solve_and_report(V, title; parameters=(), prune=true)
     u = field(:u, V)
     problem = poisson(u; source=source, dirichlet=[dirichlet(exact; on=boundary(:all))])
-    model = prepare(problem)
+    model = prepare(problem; prune=prune)
     solution = solve!(model)
     report = diagnostics(model, solution; exact)
     print_run_report(title, report; parameters)
@@ -139,22 +139,36 @@ Two guards keep the elimination from going too far:
     over this one and therefore reproduces it exactly — there the two are
     genuinely linearly dependent, not merely similar.
 
-There is no switch for this. A covered cell is the parent of a leaf, and a
-parent carries no unknowns where its children do — that is what makes
+The space carries no switch for this. A covered cell is the parent of a leaf,
+and a parent carries no unknowns where its children do — that is what makes
 superposition equivalent to ordinary refinement, where h-refining a cell
-*replaces* it. Run 2b builds the space with the rule switched off anyway,
-through the internal `Unfitted._unpruned`, so the mechanism is measured
-here rather than merely described. You will never call it: on an aligned
-stack the result is exactly singular, and where it is not it costs
-unknowns for an advantage that vanishes as the overlay refines.
+*replaces* it. The switch lives one step later, on `prepare`: passing
+`prune = false` builds the **unreduced twin** of the same stack, every covered
+mode retained. Run 2b does that, so the mechanism is measured here rather than
+merely described.
+
+The twin is a diagnostic, not a discretisation to solve with, and the run below
+shows why in both directions. This overlay *nests* over the base — the stricter
+case in the last bullet — so the modes the twin keeps are reproduced exactly,
+not merely closely, and the coefficient directions it adds describe the zero
+function. That makes its operator singular, and by a countable amount: measured
+on this stack, with `mass(V)` assembled both ways, the reduced Gram matrix is
+1033×1033 at rank 1033 and the twin is 1154×1154 at the same rank 1033 — 121
+null directions, exactly the 121 modes the report says the base sheds.
+
+A direct solve still returns an answer, because the system is consistent and
+every vector in that affine set describes the same function. That is what makes
+the comparison below meaningful rather than merely survivable: Run 2b carries
+121 unknowns more than Run 2 and lands on the same relative L² error to twelve
+digits. The unknowns were redundant, not merely cheap.
 =#
 
 # ── Run 2b: the same stack with covered-mode pruning switched off ─────────────────
 
-V_unreduced = Unfitted._unpruned(overlay(space(omega; cells=8, order=3), refined_region; cells=8))
+V_unreduced = overlay(space(omega; cells=8, order=3), refined_region; cells=8)
 _, _, report_unreduced = solve_and_report(V_unreduced,
                                           "Run 2b — Run 2 with covered-mode pruning switched off";
-                                          parameters=(:pruning => "off",))
+                                          parameters=(:pruning => "off",), prune=false)
 
 println("Run 2  (reduction on) : ", report_overlay.active_unknowns, " unknowns, error ",
         report_overlay.l2_error)

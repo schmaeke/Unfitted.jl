@@ -438,12 +438,17 @@ function _collapse_order(entries::Vector{NTuple{D,Int}}) where {D}
 end
 
 # The level's *nominal* order: the uniform order, or the per-axis maximum over a
-# per-cell field. This is what `Level.order` stores, and it is the reason the
-# quadrature-sizing consumers (`_parent_quadrature_counts`,
-# `_moment_order_for_region`, `_facet_quadrature_counts`,
-# `_surface_quadrature_order`, `_subdivision_counts`) need no change: they size a
-# rule from `level.order` and over-integrating is safe where under-integrating is
-# not.
+# per-cell field. It is the `nominal` field of `CellOrders` — there is no
+# `Level.order` any more — and `nominal_order` is its public read.
+#
+# Sizing a quadrature rule from it is always SAFE, because it bounds every cell
+# of the level from above and over-integrating costs points rather than
+# accuracy. Safe is not the same as right, though, and the consumers have since
+# split on that: `_parent_quadrature_counts`, `_moment_order_for_region`,
+# `_facet_quadrature_counts` and `_subdivision_counts` each size from the parent
+# CELL's own order, so one loud cell no longer sets the rule for the level;
+# `_surface_quadrature_order` still sizes from the level, where the region is not
+# owned by a single parent cell.
 _nominal_order(o::NTuple{D,Int}) where {D} = o
 
 function _nominal_order(entries::Vector{NTuple{D,Int}}) where {D}
@@ -550,9 +555,10 @@ optional activation mask. Fields:
     round trip through [`adapt`](@ref) as well as through the mutators.
 
 Leaf semantics — which modes a covered level sheds — are a property of the
-whole superposition stack rather than of one level, so the switch lives on
-[`Space`](@ref) and is read once by `dof_layout`. See leaf semantics under
-[`space`](@ref).
+whole superposition stack rather than of one level, so they are applied once,
+by `dof_layout`, over the whole stack. See leaf semantics under
+[`space`](@ref), and [`prepare`](@ref)'s `prune` keyword for the unreduced
+twin the rule is measured against.
 """
 struct Level{D,T<:Real,B<:BasisFamily}
     id::Int
@@ -703,14 +709,6 @@ function physical_basis_gradients(level::Level{D}, cell::CartesianIndex{D}, cell
     return gradients
 end
 
-# The private spelling the point-evaluation paths in `postprocessing.jl` use.
-# These are bindings to the same two generics, not second implementations: the
-# per-cell evaluators were private while they were the only callers, and naming
-# them on the family interface is what makes the pairing rule statable in the
-# order-keyed docstrings.
-const _cell_basis_values = basis_values
-const _cell_basis_gradients = physical_basis_gradients
-
 # The per-cell minimum-rule table of a level, or `nothing` when the level is
 # uniform and every cell shares the level-wide index list. Assembly and transfer
 # workspaces bank this per level id so a hot loop pays one `=== nothing` branch
@@ -743,22 +741,19 @@ Fields:
     no-FCM hot path: integration is over the bounding box `domain` and
     every cell is `:full`. With a `PhysicalDomain`, cut and fictitious
     cells are handled per the [`PhysicalDomain`](@ref) docstring.
-  - `prune_covered::Bool` — internal, and always `true` from the public
-    API. Leaf semantics: a cell carries basis functions only where no
-    finer level has taken its region over, which is what makes
-    superposition equivalent to ordinary refinement. See [`space`](@ref)
-    for the rule and for why it is not an option. It is a property of the
-    stack rather than of one level — a level cannot shed a covered mode
-    by itself, and the question is always "does something above this
-    reproduce it" — so it is carried once, here, and read once, by
-    `dof_layout`. `_unpruned` is the only writer of `false`: it builds
-    the unreduced twin the losslessness assertion is made against.
+
+Leaf semantics — a cell carries basis functions only where no finer level has
+taken its region over — are not a field here. They are a property of the whole
+stack rather than of one level, and the level that sheds a mode is not the one
+that decides it, so the question is answered once, in `dof_layout`, where the
+modes are enumerated. [`prepare`](@ref)'s `prune` keyword is the one way to
+build a space's unreduced twin, and it exists to be measured against rather
+than solved; see [`space`](@ref) for the rule itself.
 """
 struct Space{D,T<:Real,L<:Tuple}
     domain::AxisBox{D,T}
     levels::L
     physical::Union{Nothing,PhysicalDomain}
-    prune_covered::Bool
 end
 
 """
@@ -805,12 +800,12 @@ function _check_named_once(V::Space, pairs, verb::AbstractString)
 end
 
 # `V` with its level tuple replaced, and with everything else — domain, physical
-# domain, leaf semantics — carried over. Every rebuild in this file funnels
-# through these two, which is what keeps a new `Space` or `Level` field from
-# having to be remembered at eight call sites; before them, each site spelled out
-# the full positional constructor and a `ntuple` splice of its own.
+# domain — carried over. Every rebuild in this file funnels through these two,
+# which is what keeps a new `Space` or `Level` field from having to be
+# remembered at eight call sites; before them, each site spelled out the full
+# positional constructor and a `ntuple` splice of its own.
 function _with_levels(V::Space{D,T}, levels::Tuple) where {D,T}
-    Space{D,T,typeof(levels)}(V.domain, levels, V.physical, V.prune_covered)
+    Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
 end
 
 function _with_level(V::Space, k::Int, level::Level)
@@ -976,9 +971,11 @@ Keyword arguments:
   **Leaf semantics.** A cell carries basis functions only where it is a
   *leaf* — where no finer level has taken the region over. A covered cell
   is the parent of a leaf, and a parent carries no unknowns where its
-  children do. This is not an option and there is nothing to configure:
-  it is what makes superposition equivalent to ordinary refinement, in
-  which h-refining a cell *replaces* it rather than adding to it.
+  children do. There is nothing to configure here: it is what makes
+  superposition equivalent to ordinary refinement, in which h-refining a
+  cell *replaces* it rather than adding to it. [`prepare`](@ref)`(problem;
+  prune = false)` builds the unreduced twin as a diagnostic — a space that
+  keeps every covered mode, and is exactly singular on a nested stack.
 
   Concretely a level sheds a mode wherever a *single* finer level has
   taken over the region that mode lives on. On an integrated Legendre
@@ -1020,7 +1017,7 @@ Keyword arguments:
     trade at all but the thing that keeps a nested stack non-singular —
     see `bspline` in the `BasicBSpline` extension. Any further family
     takes the generic `_coverage_constraints` fallback, which returns no
-    constraints, so on such a space the default `true` is a no-op. See
+    constraints, so on such a space the rule is a no-op. See
     `src/coverage.jl` and `_coverage_constraints` in `src/dofs.jl`;
     `diagnostics(...).reduced_mode_counts` reports the per-level count.
 """
@@ -1029,7 +1026,7 @@ function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(),
     base_mesh = CartesianMesh(domain; cells)
     base_level = _new_level(1, :base, base_mesh, basis, _normalize_order(order, base_mesh), mode,
                             _normalize_mask(active, base_mesh), physical)
-    return Space{D,T,Tuple{typeof(base_level)}}(domain, (base_level,), physical, true)
+    return Space{D,T,Tuple{typeof(base_level)}}(domain, (base_level,), physical)
 end
 
 """
@@ -1076,28 +1073,6 @@ function overlay(V::Space{D,T}, domain::AxisBox{D,T}; cells, order=nominal_order
                        _normalize_order(order, overlay_mesh), mode,
                        _normalize_mask(active, overlay_mesh), V.physical)
     return _with_levels(V, (V.levels..., level))
-end
-
-# Rebuild `V` with leaf semantics DISABLED, so a covered cell keeps the modes it
-# would otherwise shed. Internal, and deliberately not reachable from
-# the public API: the resulting space is never what a caller wants. On a stack
-# whose covers are aligned it is exactly singular — the coarse modes and the fine
-# level's reproductions of them are linearly dependent, and 169 to 1378 null
-# directions were measured on nested ladders — and where it is not singular it
-# costs 11–25% more unknowns for an advantage that decays to 1.02× as the cover
-# refines.
-#
-# It exists for one reason: it is the reference the losslessness assertion is made
-# against. `size(gram(V), 1) == rank(gram(_unpruned(V)))` says the elimination
-# removed redundancy and nothing else, and that assertion is the only instrument
-# that can see a wrong elimination — the reduced operator stays full rank at a
-# healthy condition number either way.
-#
-# The levels are shared rather than rebuilt: leaf semantics change which modes
-# the *dof layer* eliminates and nothing about what a level generates, so the
-# twin carries the very same `Level` values and costs one struct.
-function _unpruned(V::Space{D,T}) where {D,T}
-    return Space{D,T,typeof(V.levels)}(V.domain, V.levels, V.physical, false)
 end
 
 """

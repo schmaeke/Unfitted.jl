@@ -164,3 +164,23 @@ end
 
     @test_throws ArgumentError diagnostics(model, solution)
 end
+
+@testset "the discretisation pin separates a pruned model from its unpruned twin" begin
+    # Leaf semantics change which raws survive, so the two spaces carry different
+    # active dof numberings and a solution from one must not be accepted on the
+    # other. The pin has to say so even though the geometry is identical — it is
+    # the only thing that differs between these two models.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    V = overlay(space(Ω; cells=8, order=3), box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3)
+    pruned = prepare(mass(V))
+    unpruned = prepare(mass(V); prune=false)
+    @test diagnostics(unpruned).active_unknowns > diagnostics(pruned).active_unknowns
+    @test pruned.version != unpruned.version
+
+    # And the converse: where nothing is covered the two layouts are the same
+    # layout, so the pin agreeing is correct rather than a miss. It agrees because
+    # the flag itself is not digested — the numbering is, and here it is identical
+    # down to the `(raw, component) -> active id` map.
+    flat = space(Ω; cells=8, order=3)
+    @test prepare(mass(flat)).version == prepare(mass(flat); prune=false).version
+end

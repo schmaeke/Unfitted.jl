@@ -16,21 +16,18 @@ const LADDER_OMEGA = box((0.0, 0.0), (1.0, 1.0))
 ladder_bc() = [dirichlet(0.0; on=boundary(:all))]
 
 # Gram matrix of the active basis: rank equals the number of active dofs iff the
-# retained functions are linearly independent.
-function gram(V)
-    m = prepare(mass(V))
+# retained functions are linearly independent. `prune = false` is `prepare`'s
+# documented diagnostic — the same geometry with leaf semantics switched off,
+# which is what the reduced space is supposed to span, and what this file
+# measures every losslessness claim against.
+function gram(V; prune::Bool=true)
+    m = prepare(mass(V); prune=prune)
     assemble!(m)
     return Matrix(m.matrix)
 end
 
-# The same space with leaf semantics switched off — what the reduced one is
-# supposed to span. Not reachable from the public API, and deliberately so: a
-# covered cell that keeps its modes is never what a caller wants. It exists to be
-# the reference this file measures against.
-unreduced_twin(V::Space) = Unfitted._unpruned(V)
-
 # `true` iff reduction removed redundancy and nothing else.
-lossless(V) = size(gram(V), 1) == rank(gram(unreduced_twin(V)))
+lossless(V) = size(gram(V), 1) == rank(gram(V; prune=false))
 
 @testset "ladder declares a nested, inert stack" begin
     V = ladder(LADDER_OMEGA; cells=8, order=3, depth=3, splits=2)
@@ -73,7 +70,7 @@ end
     # levels do not nest and `:coverage` removes modes nothing reproduces.
     V = overlay(space(LADDER_OMEGA; cells=4, order=3), box((0.25, 0.25), (0.75, 0.75)); cells=3)
     @test !is_nested(V)
-    @test size(gram(V), 1) < rank(gram(unreduced_twin(V)))
+    @test size(gram(V), 1) < rank(gram(V; prune=false))
     # the same geometry at an integer multiple nests, and is lossless
     W = overlay(space(LADDER_OMEGA; cells=4, order=3), box((0.25, 0.25), (0.75, 0.75)); cells=4)
     @test is_nested(W)
@@ -105,7 +102,7 @@ end
     @test diagnostics(prepare(mass(equal_order))).reduced_mode_counts[1] > 0
     # At equal order the cover does reproduce what it displaces, so the reduction
     # is lossless. At lower order it is not, and that is the documented trade —
-    # `Unfitted._unpruned` is how this file switches it off.
+    # `prepare(mass(V); prune=false)` is how this file switches it off.
     @test lossless(equal_order)
 end
 

@@ -69,9 +69,9 @@ Fields:
     that fold runs at any `alpha`, not only in the strict `alpha = 0` case.
   - `reduced_mode_counts::Vector{Int}` — count of high-order and dedup
     modes eliminated by covered-mode pruning in covered regions
-    (`prune_covered`), one entry per level of each *field*, concatenated in
-    field-declaration order. Note the different granularity from
-    `inactive_cell_counts`, which is per *space*: the two vectors line up
+    (leaf semantics; see [`prepare`](@ref)'s `prune`), one entry per level
+    of each *field*, concatenated in field-declaration order. Note the
+    different granularity from `inactive_cell_counts`, which is per *space*: the two vectors line up
     entry-for-entry only when every space carries exactly one field (the
     common case). Two fields over one space give this vector twice the
     length of that one.
@@ -567,7 +567,7 @@ function _prepare_spaces(problem::Problem{D,T}) where {D,T}
 end
 
 """
-    system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T),
+    system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), prune=true,
                   classify_caches=IdDict{Space,_ClassifyCache{D,T}}()) -> SystemLayout
 
 Build the per-field [`DofLayout`](@ref)s for every field of `problem`
@@ -583,10 +583,14 @@ already filled by that space's fictitious fold, so the constraint pass reuses
 those verdicts instead of re-classifying fold-boundary cells; the empty
 default just classifies on demand.
 
+`prune` is leaf semantics, forwarded to [`dof_layout`](@ref) for every field
+alike — it describes the discretisation, not one field of it. [`prepare`](@ref)
+is where a caller sets it.
+
 Called by [`prepare`](@ref) and the in-place mutators. End users do
 not usually call this directly.
 """
-function system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T),
+function system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), prune::Bool=true,
                        classify_caches=IdDict{Space,_ClassifyCache{D,T}}()) where {D,T}
     layouts = FieldLayout{D,T}[]
     by_name = Dict{Symbol,Int}()
@@ -596,7 +600,8 @@ function system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T),
         # so the constraint pass never re-classifies fold-boundary cells.
         cache = get(() -> _ClassifyCache{D,T}(), classify_caches, field.space)
         layout = dof_layout(field.space; dirichlet=_dirichlet_for_field(problem, field.name),
-                            tolerance, components=component_count(field), classify_cache=cache)
+                            tolerance, components=component_count(field), prune,
+                            classify_cache=cache)
         # The field's (reindexed, contiguous) level-id block — how assembly
         # routes each region to its owning subdomain field without a `served` mask.
         level_ids = extrema(l.id for l in field.space.levels)
@@ -621,7 +626,7 @@ function _caches_by_space(spaces, caches::Vector{_ClassifyCache{D,T}}) where {D,
 end
 
 """
-    prepare(problem::Problem; tolerance=…, criterion=…) -> Model
+    prepare(problem::Problem; prune=true, tolerance=…, criterion=…) -> Model
 
 Build a fresh [`Model`](@ref) for `problem`. Folds an optional
 [`PhysicalDomain`](@ref) into the per-level cell masks (dropping cells
@@ -635,8 +640,34 @@ On a multi-domain (coupled) problem every distinct participating
 [`Space`](@ref) is folded, reindexed into its own level-id block, and given
 its own integration plan and moment-fit cache.
 
-Forwarded keyword arguments go to `integration_plan`; see its docstring
-for the full list.
+`prune` is leaf semantics, on by default and applied by [`dof_layout`](@ref)
+to every field of the problem: a cell carries basis functions only where no
+finer level has taken its region over (see [`space`](@ref) for the rule).
+
+`prune = false` builds the **unreduced twin**, and it is a diagnostic rather
+than a discretisation to solve with. The twin keeps every covered mode, so on
+a nested stack the operator it produces is *exactly singular* — a retained
+coarse mode and the cover's reproduction of it are the same function, and the
+difference is a null direction. Measured on the unit square: 121 null
+directions on an 8-cell p = 3 base under a nested 4-cell overlay, and 794 on a
+depth-2 ladder with every level live.
+
+It exists to be measured against. What covered-mode pruning claims is that it
+removes redundancy and nothing else, and comparing the reduced space's size
+with the *rank* of its unreduced twin — `test/test_ladder.jl` spells it out as
+`size(gram(V), 1) == rank(gram(V; prune = false))` — is the only instrument
+that can see a wrong elimination: the reduced operator stays full rank at a
+healthy condition number whether or not the elimination was correct. Off the nested manifold the
+twin is merely larger — 233 unknowns against 209 on a 4-cell p = 3 base under
+a non-nesting 3-cell overlay — and where nothing is covered the two layouts
+are byte-identical, down to the `(raw, component) -> active id` map, so the
+two models share a pin and a solution crosses between them.
+
+The flag is carried on the model, so a model prepared unpruned stays unpruned
+through [`move!`](@ref), [`activate!`](@ref) and every derivation.
+
+The remaining keyword arguments are forwarded to `integration_plan`; see its
+docstring for the full list.
 """
 function prepare(problem::Problem{D,T}; kwargs...) where {D,T}
     _prepared_model(problem, (; kwargs...), nothing)
@@ -666,15 +697,25 @@ end
 #
 # WHAT GOES IN — everything the active dof numbering is a function of:
 #
-#   * per level, in order: id, role, mode, basis family name,
-#     the mesh's corner bits and cell counts, the activation mask's bits, and
-#     the order field's palette, class map and nominal;
+#   * per level, in order: id, role, mode, basis family name, the mesh's corner
+#     bits and cell counts, the activation mask's bits, and the order field's
+#     palette, class map and nominal;
 #   * per field: name, component count, offset, raw and active dof counts, and
 #     the `(raw, component) -> active id` map itself — which is precisely the
 #     numbering a coefficient vector indexes into, and the only thing that
 #     separates two models differing solely in *which* dofs a Dirichlet
 #     condition constrains rather than how many;
 #   * the system's active-unknown total.
+#
+# Leaf semantics (`prepare`'s `prune`) are deliberately NOT digested as a flag,
+# although they change which raws survive. They reach the digest through the
+# layout instead, and that is the sharper reading of the same question: where
+# the rule eliminates anything, the active counts and the `(raw, component) ->
+# active id` map below already differ, so the two models separate; where it
+# eliminates nothing the two layouts are byte-identical — same raws, same active
+# count, same numbering — and a coefficient vector really is interchangeable
+# between them. Folding the flag in on top would refuse that carry-over for a
+# difference no consumer can observe.
 #
 # WHAT STAYS OUT, and this boundary is the load-bearing half: anything carrying
 # object identity. Forms, closures, `Field` objects, `dirichlet` specs and their
@@ -779,6 +820,14 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
     # instead of reverting to `integration_plan`'s defaults. The classification
     # caches are geometry-derived, not user options, so they are rebuilt here.
     tolerance = get(plan_options, :tolerance, GeometryTolerance(T))
+    # `prune` rides in the same bag although it is a dof-layer option and not a
+    # plan one, because the bag is what every derivation replays: a model
+    # prepared unpruned must stay unpruned through `move!`, `activate!` and
+    # `adapted`, and carrying it anywhere else would mean a second channel that
+    # can disagree with this one. It is split off here rather than forwarded,
+    # since `integration_plan` would reject the keyword.
+    prune = get(plan_options, :prune, true)
+    integration_options = Base.structdiff(plan_options, NamedTuple{(:prune,)})
     # One integration plan per distinct subdomain space, each sharing that
     # space's own cell-classification cache. The moment-fit caches, unlike the
     # classification ones, outlive this call: they are the model's, and every
@@ -795,11 +844,11 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                                 "got $(length(reuse)) for $(length(spaces))"))
         reuse
     end
-    space_plans = IntegrationPlan{D,T}[integration_plan(spaces[i]; plan_options...,
+    space_plans = IntegrationPlan{D,T}[integration_plan(spaces[i]; integration_options...,
                                                         classify_cache=caches[i],
                                                         moment_fit_cache=fit_caches[i])
                                        for i in eachindex(spaces)]
-    layout = system_layout(effective_problem; tolerance,
+    layout = system_layout(effective_problem; tolerance, prune,
                            classify_caches=_caches_by_space(spaces, caches))
     facet_regions = _resolve_facet_regions(effective_problem, tolerance)
     surface_regions = _resolve_surface_regions(effective_problem, tolerance)
@@ -1151,8 +1200,7 @@ end
 # becomes stale.
 function _update_mask!(model::Model{D,T}, level_index::Integer, cells, value::Bool) where {D,T}
     _assert_single_domain(model, "activate! / deactivate!")
-    1 <= level_index <= length(model.prefold_space.levels) ||
-        throw(ArgumentError("level index $level_index out of bounds"))
+    level_index = _check_level(model.prefold_space, level_index)
     level = model.prefold_space.levels[level_index]
     mask = _apply_mask_update(level.mask, level.mesh, cells, value)
     return _remodel!(model, _remasked_space(model.prefold_space, level_index, mask))
@@ -1386,9 +1434,8 @@ first field's) rather than raising on a coupled model, so on a multi-domain
 model it reports the first subdomain.
 """
 function active_cells(model::Model; level::Integer, effective::Bool=true)
-    levels = (effective ? model.problem.space : model.prefold_space).levels
-    1 <= level <= length(levels) || throw(ArgumentError("level index $level out of bounds"))
-    lvl = levels[level]
+    V = effective ? model.problem.space : model.prefold_space
+    lvl = V.levels[_check_level(V, level)]
     lvl.mask === nothing && return trues(lvl.mesh.cells)
     return copy(lvl.mask.on)
 end

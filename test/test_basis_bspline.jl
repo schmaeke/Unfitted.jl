@@ -353,7 +353,7 @@ end
     # An overlay of the same degree whose cell boundaries include the base's
     # reproduces — exactly — every base function buried underneath it, so the two
     # levels carry the same function twice and the superposition is singular until
-    # one copy goes. `prune_covered` (`true` by default) removes it.
+    # one copy goes. Leaf semantics (on by default) remove it.
     #
     # Which functions qualify is decidable from the knot vectors alone: with uniform
     # simple interior knots, base function `i` lives on cells `max(1, i − p) …
@@ -361,13 +361,12 @@ end
     # base cells 3…6 (the overlay box [0.25, 0.75] on 8 cells) that leaves
     # `{i : i − p ≥ 3, i ≤ 6}` — `4 − p` functions per axis, `(4 − p)^D` in D
     # dimensions. The dedup count below is that number, not an observation.
-    function nested(ro, p)
-        V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=p, basis=bspline()),
-                    box((0.25, 0.25), (0.75, 0.75)); cells=4, order=p)
-        return ro ? V : Unfitted._unpruned(V)
+    function nested(p)
+        return overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=p, basis=bspline()),
+                       box((0.25, 0.25), (0.75, 0.75)); cells=4, order=p)
     end
     for p in 1:3
-        m, l = _gram(nested(true, p))
+        m, l = _gram(nested(p))
         @test count(==(:dedup), l.elimination_source) == (4 - p)^2
         # B-splines have no bubble/skeleton split, so the dedup is all of order
         # reduction for this family — nothing is shed for accuracy.
@@ -384,7 +383,7 @@ end
     # Opting out keeps the duplicate and the operator is exactly singular. That is
     # the documented trade — `bspline`'s docstring names it, and names the way out
     # (break the nesting) — and it is the same one integrated Legendre makes.
-    mf, lf = _gram(nested(false, 3))
+    mf, lf = _gram(nested(3); prune=false)
     @test count(==(:dedup), lf.elimination_source) == 0
     @test rank(Symmetric(Matrix(mf.matrix))) == active_unknowns(lf) - 1
 end
@@ -414,7 +413,7 @@ end
     end
     for xhi in (2.0, 1.5, 1.25)
         m, l = _gram(fold_stack(xhi))
-        mu, _ = _gram(Unfitted._unpruned(fold_stack(xhi)))
+        mu, _ = _gram(fold_stack(xhi); prune=false)
         M = Symmetric(Matrix(m.matrix))
         @test count(==(:dedup), l.elimination_source) == 16
         @test active_unknowns(l) == 102
@@ -452,7 +451,7 @@ end
     # the difference N₅ − N₆ of two buried base splines vanishes at x = 1 while the part
     # of it beyond the face is fictitious, so the clamped cover reproduces the
     # *combination* on Ω though it reproduces neither function. No rule keyed on a single
-    # buried function can see that: 8 exact null modes remain, and the `_unpruned` twin
+    # buried function can see that: 8 exact null modes remain, and the unpruned twin
     # has the same 8, so nothing the dedup could have kept would help. The repair is
     # per constrained face — of the p buried functions straddling the face knot with the
     # same perpendicular factor, keep the m + 1 trace orders and strongly eliminate the

@@ -46,6 +46,15 @@ The container places no restriction on `T`, but that transfer does: it
 takes a `QuadField{T}` on a `Model{D,T}` and nothing else, so a
 component-valued state is carried one component per `QuadField`.
 
+Indexing is guarded while a verb re-evaluates the problem's forms on a cloud
+this field does not belong to. [`estimate`](@ref) is that verb: it assembles
+the same blocks and loads on an order-elevated twin, whose `q.point` numbers a
+different and larger set of points, so a `qf[q.point]` there would read out of
+range or — worse — silently at the wrong point. Such a read raises, and
+`estimate` refuses outright when it can see the field among a form's captures.
+Ordinary assembly, and every read against the model the field was built on, is
+unaffected.
+
 `QuadField{T}(model; init)` walks the plan through
 [`foreach_quadrature_point`](@ref) and inherits its restriction to
 single-domain models — on a coupled model it raises. Sizing against
@@ -73,13 +82,42 @@ function QuadField{T}(model::Model; init=_ -> zero(T)) where {T}
     return QuadField{T}(data, model.version)
 end
 
+# The pin of the quadrature cloud currently being walked by a verb that is
+# re-evaluating forms it did not write, or 0 — which is every ordinary
+# assembly, and the value `getindex` below reads. See "Detecting point-keyed
+# state" further down for what the pair guards and what it costs.
+const _FOREIGN_CLOUD = Ref(0)
+
+# Run `f` with the foreign-cloud pin set to `version`, restoring whatever was
+# set before. Nesting is honoured; a `throw` inside `f` still restores. The
+# write happens outside the threaded region `f` starts — `estimate` wraps a
+# whole `assemble!` — so the worker threads only ever read it.
+function _on_foreign_cloud(f, version::Integer)
+    previous = _FOREIGN_CLOUD[]
+    _FOREIGN_CLOUD[] = Int(version)
+    try
+        return f()
+    finally
+        _FOREIGN_CLOUD[] = previous
+    end
+end
+
 # Forwarding to the underlying data vector. `setindex!` returns the
 # `QuadField` itself so chained updates work; `copy` makes a defensive
 # copy of the data and preserves the version pin.
 Base.length(qf::QuadField) = length(qf.data)
 Base.eltype(::Type{QuadField{T}}) where {T} = T
 Base.eltype(qf::QuadField) = eltype(typeof(qf))
-Base.getindex(qf::QuadField, i::Integer) = qf.data[i]
+@inline function Base.getindex(qf::QuadField, i::Integer)
+    pin = _FOREIGN_CLOUD[]
+    (pin == 0 || pin == qf.model_version) ||
+        throw(ArgumentError("this QuadField (pin 0x$(string(qf.model_version; base=16))) is being " *
+                            "read while a second integration plan is being walked (pin " *
+                            "0x$(string(pin; base=16))): `q.point` numbers that cloud, not this " *
+                            "field's. Read the state through the physical point `q.x`, or run " *
+                            "the verb on a model whose forms carry no per-point state."))
+    return qf.data[i]
+end
 Base.setindex!(qf::QuadField, v, i::Integer) = (qf.data[i]=v; qf)
 Base.copy(qf::QuadField{T}) where {T} = QuadField{T}(copy(qf.data), qf.model_version)
 
@@ -101,6 +139,91 @@ end
 function Base.show(io::IO, qf::QuadField{T}) where {T}
     print(io, "QuadField{", T, "}(npoints=", length(qf.data), ", pin=0x",
           string(qf.model_version; base=16), ")")
+end
+
+# ── Detecting point-keyed state ──────────────────────────────────────────────
+#
+# `q.point` is an index into ONE model's quadrature cloud. A verb that
+# re-evaluates forms it did not write, on a second cloud — `estimate`, which
+# assembles the caller's own blocks and loads on an order-elevated twin —
+# therefore hands a form built for `model` the twin's indices: out of range
+# where the base plan is the smaller of the two, and silently at the wrong
+# points where it is not. The `QuadField` pin already separates the two models,
+# and has since the pin became a digest of the discretisation rather than a
+# counter. What it could not do is reach the indexing site: `qf[q.point]` is an
+# ordinary `getindex` on a vector, and the form owns the call.
+#
+# Two layers bring the identity there, and they cover different cases because
+# a form can hold its state in two different ways.
+#
+# The first is this walk, run once by `estimate` before it builds anything. It
+# looks for a `QuadField` among the form's own captures, which is where the
+# documented mechanism puts it: `conduction(chi)` returning a closure over
+# `chi` is the shape `examples/applications/thermal_curing_2d` uses and the one
+# the `QuadField` docstring describes. Finding it there costs one reflective
+# walk per `estimate` call, nothing per point, and lets the refusal name the
+# field and both pins before the expensive half of the call.
+#
+# The walk is bounded rather than exhaustive: it follows struct fields and the
+# elements of tuples, named tuples, arrays and dictionaries to `depth` levels,
+# skipping arrays of bits types (coefficient vectors, masks, meshes), and
+# returns the first field it finds. Missing one is a false negative and never a
+# false alarm, which is the safe direction for a guard that raises.
+#
+# The second layer is `_FOREIGN_CLOUD` and the branch in `getindex`, and it
+# exists because the first has one blind spot that reflection cannot close: a
+# form written at top level reads a *global* binding rather than capturing it,
+# so its closure has no fields at all and carries no evidence of the state it
+# reads. Scoping the pin over the foreign assembly catches that at the read
+# instead, and cannot raise on anything legitimate — the twin is built fresh
+# inside the call, so no field in existence can carry its pin.
+#
+# What the branch costs, measured on helios (`assemble_matrix` of a stiffness
+# form whose integrand reads `chi[q.point]`, four threads, min of seven per
+# run, three runs each way): at 36 864 quadrature points, 7.57/7.70/8.05 ms
+# with the branch against 7.64/7.56/8.16 ms without it at `-O2`, and
+# 44.0/47.6 ms against 44.0/44.7 at `-O0` — a difference the noise swallows. At
+# 9 216 points, 0.95/1.09/0.98 ms against 0.91/0.88/0.94 at `-O2`: at most a
+# tenth of a millisecond, and only forms that actually read a `QuadField` pay
+# any of it. Forms that carry no per-point state never reach this code.
+function _captured_quadfield(x, depth::Int=6)
+    x isa QuadField && return x
+    depth <= 0 && return nothing
+    if x isa Union{Tuple,NamedTuple,AbstractArray,AbstractDict}
+        x isa AbstractArray && isbitstype(eltype(x)) && return nothing
+        for v in (x isa AbstractDict ? values(x) : x)
+            found = _captured_quadfield(v, depth - 1)
+            found === nothing || return found
+        end
+        return nothing
+    end
+    isbits(x) && return nothing
+    for i in 1:nfields(x)
+        isdefined(x, i) || continue
+        found = _captured_quadfield(getfield(x, i), depth - 1)
+        found === nothing || return found
+    end
+    return nothing
+end
+
+# Refuse `verb` on a problem whose forms carry per-quadrature-point state. The
+# message names the field's own pin, which is what identifies the model its
+# `q.point` numbering belongs to. Called by `estimate` (`adaptivity.jl`), whose
+# name it takes as `verb`.
+function _assert_no_point_keyed_state(problem, verb::AbstractString)
+    for form in Iterators.flatten((problem.blocks, problem.loads))
+        qf = _captured_quadfield(form.form)
+        qf === nothing && continue
+        throw(ArgumentError("$verb: a form of this problem captures a $(typeof(qf)) (pin " *
+                            "0x$(string(qf.model_version; base=16))), which is indexed by " *
+                            "`q.point`. This call re-evaluates the problem's own blocks and " *
+                            "loads on a second integration plan, whose quadrature cloud has " *
+                            "more points per cell and puts them elsewhere, so those reads " *
+                            "would land out of range or — worse — on the wrong points. Read " *
+                            "the state through the physical point `q.x` instead, or run this " *
+                            "on a model whose forms carry none."))
+    end
+    return nothing
 end
 
 # ── Transfer scheme ──────────────────────────────────────────────────────────

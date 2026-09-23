@@ -11,7 +11,7 @@
 # delivered the error reduction that step was entitled to expect. A cell that met
 # its prediction is behaving smoothly and takes p again; one that fell short is
 # not, and takes h. The predictions are Melenk & Wohlmuth's (2001, see
-# References) — see the note above `_partition`.
+# References) — see the note above `decide`.
 #
 # WHY NOT A SMOOTHNESS INDICATOR. Mitchell & McClain (2014, see References)
 # compared thirteen hp strategies over twenty problems and rate Legendre
@@ -90,13 +90,13 @@
 #   W. Dörfler, "A convergent adaptive algorithm for Poisson's equation", SIAM
 #     J. Numer. Anal. 33 (1996) 1106–1124, doi:10.1137/0733054.
 #     The bulk-chasing marking rule — the smallest set of cells carrying a
-#     fixed fraction θ of the total squared indicator. `_dorfler` implements it.
+#     fixed fraction θ of the total squared indicator. `mark_cells` implements it.
 #
 #   J. M. Melenk, B. I. Wohlmuth, "On residual-based a posteriori error
 #     estimation in hp-FEM", Adv. Comput. Math. 15 (2001) 311–331,
 #     doi:10.1023/A:1014268310921.
 #     The predicted error reduction that decides h against p, and the constants
-#     γ_p² = 0.4, γ_h² = 4, γ_n² = 1. The note above `_partition` states the
+#     γ_p² = 0.4, γ_h² = 4, γ_n² = 1. The note above `decide` states the
 #     prediction in this package's form.
 #
 #   W. F. Mitchell, M. A. McClain, "A comparison of hp-adaptive strategies for
@@ -372,16 +372,19 @@ refused, because on a deep, ill-conditioned stack `cᵀ A c` can legitimately lo
 every digit; it is reported as zero and [`ErrorEstimate`](@ref)'s `show` prints
 the ratio as `NaN`.
 
-Forms must not be keyed by quadrature-point index. `estimate` evaluates the
-problem's own blocks and loads a second time, on `V⁺`'s integration plan, whose
-quadrature clouds and `q.point` numbering differ from the base model's — `V⁺` has
-more points per cell, and they sit at different places. A form that reads
-per-point state through `q.point` (a [`QuadField`](@ref), the documented
-mechanism for material history) therefore indexes an array built for `model` with
-`plus`'s indices: out of range where the base plan is the smaller of the two, and
-at the wrong points where it is not. Nothing detects this today. Where a model
-carries per-point state, compute the indicator on a model whose forms read that
-state through the physical point instead.
+Forms must not be keyed by quadrature-point index, and this **refuses** one
+that is. `estimate` evaluates the problem's own blocks and loads a second time,
+on `V⁺`'s integration plan, whose quadrature clouds and `q.point` numbering
+differ from the base model's — `V⁺` has more points per cell, and they sit at
+different places. A form that reads per-point state through `q.point` (a
+[`QuadField`](@ref), the documented mechanism for material history) would
+therefore index an array built for `model` with `plus`'s indices: out of range
+where the base plan is the smaller of the two, and at the wrong points where it
+is not, which is the reading that produces a plausible number rather than an
+error. A [`QuadField`](@ref) captured by any of the problem's forms is found
+before the enriched model is built and raises. Where a model carries per-point
+state, compute the indicator on a model whose forms read that state through the
+physical point `q.x` instead.
 
 What it refuses: single-field and single-domain, and every basis family that
 does not carry a per-cell order (`_supports_cell_order`). The injection copies
@@ -414,6 +417,11 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     model.matrix === nothing &&
         throw(ArgumentError("estimate: the model has not been assembled; call `solve!` or " *
                             "`assemble!` before estimating"))
+    # Before the expensive half: the enriched twin below re-runs THESE forms on
+    # a different quadrature cloud, and a form keyed by `q.point` reads the
+    # wrong points there without raising. `data.jl` carries the search and the
+    # reasoning; it runs once per call and never per point.
+    _assert_no_point_keyed_state(model.problem, "estimate")
 
     # The caches are handed over UNcopied, which is the opposite of what every
     # other derivation does (`adapted` gives its target its own copy so a fork
@@ -425,7 +433,9 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     # other — see `_prefit_cut_rules!` in `intersections.jl`.
     plus = _prepared_model(_problem_with_space(model.problem, _enriched_space(V, Int(enrichment))),
                            model.plan_options, model.moment_fit_caches)
-    assemble!(plus)
+    _on_foreign_cloud(plus.version) do
+        assemble!(plus)
+    end
     injected = transfer(solution, model, plus; via=Rewire())
     residual = plus.rhs .- plus.matrix * injected.coefficients
 
@@ -502,15 +512,45 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     return ErrorEstimate{D,T}(cells, total, reference, consistency)
 end
 
-# Dörfler marking (1996, see References): the smallest set of cells carrying
-# `theta` of the total squared indicator, ordered by decreasing η_K.
-#
-# `theta` is the loop's only free constant, and the scheme was chosen so that it
-# does not have to be refitted per problem: over a factor-three sweep the
-# resulting unknown count moves by at most 1.46×, against 1.86× for a smoothness
-# threshold and 1.36× for a benefit/cost rule whose informative window is
-# narrower still.
-function _dorfler(estimate::ErrorEstimate{D,T}, theta::Real) where {D,T}
+"""
+    mark_cells(estimate::ErrorEstimate; theta = 0.5) -> Vector{Tuple{Int,CartesianIndex{D}}}
+
+Mark the cells carrying the bulk of the estimated error: the smallest set whose
+squared indicators sum to at least `theta` of the total, taken in order of
+decreasing η_K. This is Dörfler's bulk criterion (1996, see the References at
+the top of `src/adaptivity.jl`), and it is the first half of the adaptive loop —
+[`refine`](@ref)`(V, est; theta, pmax, previous)` is exactly
+
+    h, p = decide(V, est, mark_cells(est; theta); pmax, previous)
+    refine(V; h, p, pmax)
+
+so a loop that wants the marking or the h/p split in its own hands reaches
+them here rather than reimplementing either.
+
+Returns `(level, cell)` pairs — the shape [`decide`](@ref) takes and the same
+one `refine`'s explicit `h = ` / `p = ` form accepts. A cell whose indicator is
+zero is never marked: it carries no approximation of its own, because it is
+inactive or because a finer level has taken its region over.
+
+`theta` must lie in `(0, 1]`; at `theta = 1` every cell with a positive
+indicator is marked. It is the loop's only free constant, and the criterion was
+chosen so it does not have to be refitted per problem: over a factor-three
+sweep the resulting unknown count moves by at most 1.46×, against 1.86× for a
+smoothness threshold and 1.36× for a benefit/cost rule whose informative window
+is narrower still.
+
+The marked set is extended through the group of equal indicators the `theta`
+cut lands in. Dörfler asks for a set reaching *at least* `theta`, so this is
+permitted, and it is what keeps a symmetric problem's refinement symmetric:
+indicators related by a symmetry agree to about 1e-15 and never bit-identically,
+so a strict prefix hands the decision to round-off and refines part of each
+symmetry orbit.
+
+The verb is `mark_cells` rather than `mark` because `Base` exports `mark` for
+`IO` streams, and a second exported `mark` would make every unqualified use of
+the name ambiguous for anyone writing `using Unfitted`.
+"""
+function mark_cells(estimate::ErrorEstimate{D,T}; theta::Real=0.5) where {D,T}
     0 < theta <= 1 || throw(ArgumentError("theta must lie in (0, 1]; got $theta"))
     marked = Tuple{Int,CartesianIndex{D}}[]
     for (k, indicators) in pairs(estimate.cells), cell in CartesianIndices(indicators)
@@ -693,7 +733,7 @@ function _predicted(V::Space{D,T}, previous::_History{D,T}, k::Integer,
     end
 
     # The h-coarsening row, which is read before the cell's own history because
-    # its evidence is the children's error, not the parent's. `_partition`
+    # its evidence is the children's error, not the parent's. `decide`
     # reaches this only for a leaf of `V`, so a cover that was live in `Vprev`
     # and is not now is exactly an h-release, and the cell is predicted to get
     # worse by the reciprocal of what the subdivision was worth — the children's
@@ -736,16 +776,15 @@ end
 # prediction or the order field, naming an array the caller never handed over.
 function _check_mark(V::Space{D}, k::Integer, cell::CartesianIndex{D},
                      verb::AbstractString) where {D}
-    1 <= k <= length(V.levels) ||
-        throw(ArgumentError("$verb: marked level $k is outside the space's 1:$(length(V.levels))"))
+    k = _check_level(V, k, "$verb: marked level")
     checkbounds(Bool, CartesianIndices(V.levels[k].mesh.cells), cell) ||
         throw(ArgumentError("$verb: marked cell $cell is outside level $k's cell grid " *
                             "$(V.levels[k].mesh.cells)"))
-    return Int(k)
+    return k
 end
 
 # An `ErrorEstimate` is indexed by the cell indices of the space it is read
-# against, from the first line of `_partition` onward. A mismatched one is
+# against, from the first line of `decide` onward. A mismatched one is
 # otherwise a `BoundsError` from deep inside the prediction or — where two
 # levels happen to agree in shape — a silently misattributed score, so both
 # arguments are checked once, here, against the space each belongs to.
@@ -757,8 +796,37 @@ function _check_estimate(V::Space{D,T}, est::ErrorEstimate{D,T}, name::AbstractS
     return est
 end
 
-function _partition(V::Space{D,T}, estimate::ErrorEstimate{D,T}, marked, pmax::Integer;
-                    previous::Union{Nothing,_History{D,T}}=nothing) where {D,T}
+"""
+    decide(V::Space, estimate::ErrorEstimate, marked; pmax = 8, previous = nothing) -> (h, p)
+
+Decide, for each marked cell, whether to spend an h-step or a p-step on it, and
+return the two sets as vectors of `(level, cell)` pairs — the second half of the
+adaptive loop, and exactly what [`refine`](@ref)`(V; h, p, pmax)` applies. `marked`
+is what [`mark_cells`](@ref) returns, or any iterable of `(level, cell)` pairs of
+your own.
+
+A marked cell takes **p** when its indicator met the reduction its last step
+predicted and **h** when it fell short, which is why `previous = (V_last,
+est_last)` — the space and estimate of the cycle before — is what makes the
+decision a decision. Without it every cell takes p, falling back to h only where
+p is unavailable: right for the first cycle and wrong thereafter. The prediction
+is Melenk & Wohlmuth's, with their γ_p and γ_h; the long note above `_GAMMA_P`
+in `src/adaptivity.jl` gives it in full, including why an h-released cover and a
+lowered order are read as evidence of the opposite sign.
+
+Three kinds of marked cell never reach the comparison: one with no h-step
+available takes p; one that is not a leaf, or that is already at `pmax` on every
+axis, takes h; and one with *neither* step available is dropped from both sets,
+which is what lets `refine` report exhaustion by returning its argument
+unchanged. `pmax` bounds the p climb and never lowers an order.
+
+Both `estimate` and `previous`'s estimate are checked against the space they are
+read on, since an indicator is indexed by that space's cells: a shape mismatch
+raises `DimensionMismatch` rather than misattributing a score, and a marked
+level or cell outside `V` raises `ArgumentError`.
+"""
+function decide(V::Space{D,T}, estimate::ErrorEstimate{D,T}, marked; pmax::Integer=8,
+                previous::Union{Nothing,_History{D,T}}=nothing) where {D,T}
     _check_estimate(V, estimate, "estimate")
     h = Tuple{Int,CartesianIndex{D}}[]
     p = Tuple{Int,CartesianIndex{D}}[]
@@ -798,9 +866,18 @@ Refine `V` and return the refined space; prepare it in one rebuild with
 
 The first form is the loop: mark by Dörfler on `estimate` — the smallest set of
 cells carrying `theta` of the total squared indicator — then decide per marked
-cell whether to spend on h or on p, and apply. The second form takes the two sets
-explicitly as iterables of `(level, cell)` pairs, so an indicator of your own
-plugs into the same application step.
+cell whether to spend on h or on p, and apply. Those two halves are
+[`mark_cells`](@ref) and [`decide`](@ref), and this form is their composition,
+
+    refine(V, est; theta, pmax, previous) ==
+        refine(V; decide(V, est, mark_cells(est; theta); pmax, previous)..., pmax)
+
+so a driver that needs the marked set or the h/p split itself — to report them,
+or to keep [`coarsen`](@ref) from releasing what this cycle just refined — calls
+the two directly and hands the result to the second form rather than
+reimplementing either. The second form takes the two sets explicitly as
+iterables of `(level, cell)` pairs, so an indicator of your own plugs into the
+same application step.
 
 The two steps, and what each one means here:
 
@@ -827,6 +904,14 @@ Existing activation is preserved rather than replaced. [`adapt`](@ref) *sets* a
 level's mask, so an application that forgets to keep what is already live
 silently un-refines the rest of the domain; this keeps it.
 
+On an immersed model — one whose space carries a [`PhysicalDomain`](@ref) —
+there is no state transfer across an h-step: [`L2Projection`](@ref) refuses a
+target carrying a physical domain, and [`Rewire`](@ref) refuses a target whose
+active basis does not contain the source's, which is what leaf semantics make of
+a refinement. An adaptive loop on an immersed model therefore re-solves on the
+refined space rather than carrying its iterate across, and `estimate` needs that
+fresh solve before it can be called again.
+
 `refine` returns `V` **itself** when nothing changed — every marked cell was
 already at `pmax`, or on the finest level, or its cover was already live — so
 `refined === V` is the loop's exhaustion signal and is worth testing before
@@ -852,7 +937,7 @@ counts on the levels they share, since a cell's history is read at its own
 index; a ladder may grow levels between cycles. Omit `previous` and every marked
 cell takes p, falling back to h only where p is unavailable; that is the right
 behaviour for the first cycle and the wrong one thereafter. See the note above
-`_partition` in `src/adaptivity.jl` for the prediction and why it is preferred
+[`decide`](@ref) for the prediction and why it is preferred
 here to a smoothness indicator. The prediction's own constants — Melenk &
 Wohlmuth's γ_p and γ_h — are fixed rather than exposed, because they are the
 literature's calibration of the rule and not a knob to fit per problem; `theta`
@@ -862,7 +947,7 @@ See [`estimate`](@ref) for the rest of the loop.
 """
 function refine(V::Space{D,T}, estimate::ErrorEstimate{D,T}; theta::Real=0.5, pmax::Integer=8,
                 previous::Union{Nothing,_History{D,T}}=nothing) where {D,T}
-    h, p = _partition(V, estimate, _dorfler(estimate, theta), pmax; previous=previous)
+    h, p = decide(V, estimate, mark_cells(estimate; theta=theta); pmax=pmax, previous=previous)
     return refine(V; h=h, p=p, pmax=pmax)
 end
 
@@ -981,6 +1066,23 @@ when either of them is marked. A release *is* evidence to the next cycle's
 decision: `refine`'s prediction scores a cell whose cover was just released by
 the reciprocal of what the subdivision was worth, so a released region is not
 re-refined on sight.
+
+An [`ErrorEstimate`](@ref) is indexed by the cells of the space it was taken on,
+and is zero on every cell that carried no approximation there. A release rule
+that reads one must therefore be evaluated on that space, *before* [`refine`](@ref)
+is applied: a cell the same cycle activates scores zero in the earlier estimate
+and reads as cold, so releasing on the refined space undoes the h-step that just
+woke it. Exclude, too, any parent the same cycle marks for h — its cover was
+woken by `refine` and this verb would put it straight back to sleep. Measured on
+`examples/reproductions/traveling_laser_2d`, a driver that released on the
+refined space undid 607 of the 639 h-steps it took, 95 %.
+
+On an immersed model — one whose space carries a [`PhysicalDomain`](@ref) —
+there is no state transfer across this step: [`L2Projection`](@ref) refuses a
+target carrying a physical domain, and [`Rewire`](@ref) refuses a target whose
+basis does not contain the source's, which releasing a cover is. A transient
+that coarsens an immersed model therefore re-solves on the released space
+rather than carrying its iterate across.
 
 There is deliberately no `coarsen(V, estimate)` form. Which cells to release is
 not settled: measured on a translating layer, a monotone loop reached a lower

@@ -14,8 +14,11 @@ using StaticArrays
 const _OMEGA_CR = box((0.0, 0.0), (1.0, 1.0))
 
 # Assemble the mass (Gram) matrix and the field's dof layout for a space.
-function _gram(V)
-    model = prepare(mass(V))
+# `prune = false` is `prepare`'s documented diagnostic: the same geometry with
+# leaf semantics switched off, which is the unreduced twin every losslessness
+# assertion below is made against.
+function _gram(V; prune::Bool=true)
+    model = prepare(mass(V); prune=prune)
     assemble!(model)
     return model, _field_layout(model.dofs, :u).dofs
 end
@@ -37,22 +40,21 @@ const _INT_X1SQ = 1 / 3
 
 # Reduced 2×2 block: base 4×4 p=2, overlay covering the middle 2×2 base cells at p=3,
 # aligned (overlay nodes ⊇ base nodes), so the buried centre vertex is deduped.
-function _nested_block(ro)
-    V = overlay(space(_OMEGA_CR; cells=(4, 4), order=2), box((0.25, 0.25), (0.75, 0.75));
-                cells=(4, 4), order=3)
-    return ro ? V : Unfitted._unpruned(V)
+function _nested_block()
+    return overlay(space(_OMEGA_CR; cells=(4, 4), order=2), box((0.25, 0.25), (0.75, 0.75));
+                   cells=(4, 4), order=3)
 end
 
 @testset "leaf semantics switched off is a no-op" begin
-    _, lf = _gram(_nested_block(false))
+    _, lf = _gram(_nested_block(); prune=false)
     @test all(s -> s in (:free, :overlay), lf.elimination_source)
     @test count(==(:coverage), lf.elimination_source) == 0
     @test count(==(:dedup), lf.elimination_source) == 0
 end
 
 @testset "covered-mode pruning: nested block sheds high-order, stays complete and full rank" begin
-    mf, lf = _gram(_nested_block(false))
-    mr, lr = _gram(_nested_block(true))
+    mf, lf = _gram(_nested_block(); prune=false)
+    mr, lr = _gram(_nested_block())
 
     # Fewer active dofs, and the drop is exactly the covered high-order plus the one
     # deduped centre vertex.
@@ -71,7 +73,7 @@ end
 end
 
 @testset "diagnostics report per-level reduced-mode counts" begin
-    m = prepare(mass(_nested_block(true)))
+    m = prepare(mass(_nested_block()))
     counts = diagnostics(m).reduced_mode_counts
     @test length(counts) == 2          # base + overlay
     @test counts[1] == 9               # base (level 1): 8 coverage + 1 dedup
@@ -82,13 +84,11 @@ end
     # Overlay is one p=2 cell coincident with the interior base cell (2,2). Its only
     # surviving mode duplicates the base cell's bubble → the full space is rank
     # deficient by one; covered-mode pruning drops that buried bubble.
-    full = Unfitted._unpruned(overlay(space(_OMEGA_CR; cells=(4, 4), order=2),
-                                      box((0.25, 0.25), (0.5, 0.5)); cells=(1, 1), order=2))
-    red = overlay(space(_OMEGA_CR; cells=(4, 4), order=2), box((0.25, 0.25), (0.5, 0.5));
-                  cells=(1, 1), order=2)
+    coincident = overlay(space(_OMEGA_CR; cells=(4, 4), order=2), box((0.25, 0.25), (0.5, 0.5));
+                         cells=(1, 1), order=2)
 
-    mf, lf = _gram(full)
-    mr, lr = _gram(red)
+    mf, lf = _gram(coincident; prune=false)
+    mr, lr = _gram(coincident)
     @test rank(Symmetric(Matrix(mf.matrix))) == active_unknowns(lf) - 1   # deficient
     @test rank(Symmetric(Matrix(mr.matrix))) == active_unknowns(lr)       # repaired
     @test _proj_residual(mr, _one, _INT_ONE) < 1e-6
@@ -109,7 +109,7 @@ end
 end
 
 @testset "constraint_kind reports coverage and dedup sources" begin
-    _, l = _gram(_nested_block(true))
+    _, l = _gram(_nested_block())
     kinds = [constraint_kind(l, raw) for raw in eachindex(l.raw_keys)]
     @test :coverage in kinds
     @test :dedup in kinds
@@ -295,7 +295,7 @@ end
     for (p, xhi, dedup, unknowns) in
         ((3, 1.5, 4, 154), (3, 1.0, 0, 145), (1, 1.5, 4, 22), (1, 1.0, 0, 19))
         m, l = _gram(_fold_cover(xhi, p))
-        mu, _ = _gram(Unfitted._unpruned(_fold_cover(xhi, p)))
+        mu, _ = _gram(_fold_cover(xhi, p); prune=false)
         M = Symmetric(Matrix(m.matrix))
         @test count(==(:dedup), l.elimination_source) == dedup
         @test active_unknowns(l) == unknowns
@@ -368,17 +368,16 @@ end
 #
 # `cov[ci]` only records that *some* higher level covers cell `ci`, which is why
 # this needs the same single-covering-level test the dedup half already applies.
-function _split_cover(ro)
+function _split_cover()
     V = space(_OMEGA_CR; cells=(4, 4), order=3)
     V = overlay(V, box((0.0, 0.0), (0.5, 0.5)); cells=(4, 4), order=3)
-    V = overlay(V, box((0.5, 0.0), (1.0, 0.5)); cells=(4, 4), order=3)
-    return ro ? V : Unfitted._unpruned(V)
+    return overlay(V, box((0.5, 0.0), (1.0, 0.5)); cells=(4, 4), order=3)
 end
 
 @testset "a mode covered by two different levels is retained" begin
-    model, _ = _gram(_split_cover(true))
+    model, _ = _gram(_split_cover())
     reduced = size(Matrix(model.matrix), 1)
-    unreduced, _ = _gram(_split_cover(false))
+    unreduced, _ = _gram(_split_cover(); prune=false)
     # The reduced space must still span the unreduced one: pruning may remove
     # redundancy and nothing else. Before the single-covering-level test this
     # dropped modes on the seam between the two overlays.

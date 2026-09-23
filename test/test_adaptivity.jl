@@ -1,7 +1,6 @@
 using BasicBSpline
 using StaticArrays
 using Unfitted
-using Unfitted: _dorfler
 
 # The adaptivity verbs. The assertion that actually validates an error indicator
 # is its EFFECTIVITY — η against the error it estimates — and its drift over a
@@ -181,14 +180,14 @@ end
     est = flat(V)
 
     # With no history, every marked leaf takes p.
-    h, p = Unfitted._partition(V, est, marked, 8)
+    h, p = decide(V, est, marked; pmax=8)
     @test isempty(h) && length(p) == length(marked)
 
     # At `pmax` there is no order left, so the same cells take h. Routing them to
     # p is a step that changes nothing, and a loop made only of those does not
     # terminate — measured, a 20-cycle run froze at 494 unknowns with its base
     # mesh pinned at order 8 and its last three cycles identical.
-    h2, p2 = Unfitted._partition(V, est, marked, 2)      # the space is order 2
+    h2, p2 = decide(V, est, marked; pmax=2)      # the space is order 2
     @test isempty(p2) && length(h2) == length(marked)
 
     # A cell a finer level has taken over is never sent to p — leaf semantics
@@ -197,7 +196,7 @@ end
     part = falses(V.levels[2].mesh.cells)
     part[CartesianIndex(3, 3)] = true                 # one of cell (2, 2)'s four children
     Wpart = adapt(V, 2 => part)
-    h3, p3 = Unfitted._partition(Wpart, flat(Wpart), [(1, CartesianIndex(2, 2))], 8)
+    h3, p3 = decide(Wpart, flat(Wpart), [(1, CartesianIndex(2, 2))]; pmax=8)
     @test h3 == [(1, CartesianIndex(2, 2))] && isempty(p3)
 
     # Once the cover is complete neither step is on offer: p is shed and h sets
@@ -205,23 +204,23 @@ end
     # nothing — the children carry the error from here on — and `refine` says so
     # by returning its argument.
     W = refine(V; h=[(1, CartesianIndex(2, 2))])
-    h5, p5 = Unfitted._partition(W, flat(W), [(1, CartesianIndex(2, 2))], 8)
+    h5, p5 = decide(W, flat(W), [(1, CartesianIndex(2, 2))]; pmax=8)
     @test isempty(h5) && isempty(p5)
     @test refine(W; h=h5, p=p5) === W
 
     # On the finest level there is nothing to activate, so the cell takes p and
     # `refine` turns that into the order step.
-    h4, p4 = Unfitted._partition(V, est, [(nlevels, CartesianIndex(1, 1))], 8)
+    h4, p4 = decide(V, est, [(nlevels, CartesianIndex(1, 1))]; pmax=8)
     @test isempty(h4) && p4 == [(nlevels, CartesianIndex(1, 1))]
 
     # A finest-level cell that is ALSO at `pmax` has neither step, so it is
     # dropped instead of being parked in `p`, where it would make every cycle
     # rebuild an identical space for ever.
-    h6, p6 = Unfitted._partition(V, est, [(nlevels, CartesianIndex(1, 1))], 2)
+    h6, p6 = decide(V, est, [(nlevels, CartesianIndex(1, 1))]; pmax=2)
     @test isempty(h6) && isempty(p6)
 
-    @test_throws ArgumentError Unfitted._partition(V, est, [(99, CartesianIndex(1, 1))], 8)
-    @test_throws ArgumentError Unfitted._partition(V, est, [(1, CartesianIndex(9, 9))], 8)
+    @test_throws ArgumentError decide(V, est, [(99, CartesianIndex(1, 1))]; pmax=8)
+    @test_throws ArgumentError decide(V, est, [(1, CartesianIndex(9, 9))]; pmax=8)
 end
 
 @testset "the leaf test reaches every finer level, not only the one below" begin
@@ -241,7 +240,7 @@ end
     # Nor is there an h-step: every level-2 cell under this one is already held
     # from below, so activating it is dof-inert too.
     @test !Unfitted._has_h_step(S, 1, cell)
-    h, p = Unfitted._partition(S, flat(S), [(1, cell)], 8)
+    h, p = decide(S, flat(S), [(1, cell)]; pmax=8)
     @test isempty(h) && isempty(p)
     @test_throws ArgumentError coarsen(S; p=[(1, cell)])
 
@@ -258,7 +257,7 @@ end
     part[corner] = true
     P = adapt(V, 3 => part)
     @test !Unfitted._is_leaf(P, 1, cell) && Unfitted._has_h_step(P, 1, cell)
-    hp, pp = Unfitted._partition(P, flat(P), [(1, cell)], 8)
+    hp, pp = decide(P, flat(P), [(1, cell)]; pmax=8)
     @test hp == [(1, cell)] && isempty(pp)
     partial = active_unknowns(prepare(_ad_problem(P)))
     @test active_unknowns(prepare(_ad_problem(refine(P; p=[(1, cell)])))) > partial
@@ -297,14 +296,14 @@ end
     after[1][bad] = 0.9                                # fell short — not smooth
     est_now = Unfitted.ErrorEstimate{2,Float64}(after, 1.0, 1.0, 0.0)
 
-    h, p = Unfitted._partition(W, est_now, [(1, good), (1, bad)], 8; previous=(V, est_prev))
+    h, p = decide(W, est_now, [(1, good), (1, bad)]; pmax=8, previous=(V, est_prev))
     @test p == [(1, good)]
     @test h == [(1, bad)]
 
     # Without the history there is nothing to have earned, so both take p. That
     # is the first-cycle convention, and it is why `previous` is not optional in
     # spirit even though it is in signature.
-    h0, p0 = Unfitted._partition(W, est_now, [(1, good), (1, bad)], 8)
+    h0, p0 = decide(W, est_now, [(1, good), (1, bad)]; pmax=8)
     @test isempty(h0) && length(p0) == 2
 end
 
@@ -335,7 +334,7 @@ end
     after[2][kids[1]] = 1.2 * pred                    # fell short — not smooth
     after[2][kids[2]] = 0.4 * pred                    # beat it — smooth
     est_now = Unfitted.ErrorEstimate{2,Float64}(after, 1.0, 1.0, 0.0)
-    h, p = Unfitted._partition(W, est_now, [(2, kids[1]), (2, kids[2])], 8; previous=(V, est_prev))
+    h, p = decide(W, est_now, [(2, kids[1]), (2, kids[2])]; pmax=8, previous=(V, est_prev))
     @test h == [(2, kids[1])]
     @test p == [(2, kids[2])]
 end
@@ -389,13 +388,13 @@ end
     @test !Unfitted._has_h_step(U, 1, corner)
 
     flat = Unfitted.ErrorEstimate{2,Float64}([ones(l.mesh.cells) for l in U.levels], 1.0, 1.0, 0.0)
-    h, p = Unfitted._partition(U, flat, [(1, corner)], 8)
+    h, p = decide(U, flat, [(1, corner)]; pmax=8)
     @test isempty(h) && p == [(1, corner)]
     @test cell_orders(refine(U; h=[(1, corner)]); level=1)[corner] == (3, 3)
 
     # And at `pmax` neither step is left, so the mark is dropped instead of being
     # re-issued every cycle against a cover that does not exist.
-    h2, p2 = Unfitted._partition(U, flat, [(1, corner)], 2)
+    h2, p2 = decide(U, flat, [(1, corner)]; pmax=2)
     @test isempty(h2) && isempty(p2)
 end
 
@@ -533,7 +532,7 @@ end
     cell = CartesianIndex(2, 2)
     zero_est = Unfitted.ErrorEstimate{2,Float64}([zeros(l.mesh.cells) for l in V.levels], 0.0, 1.0,
                                                  0.0)
-    @test isempty(_dorfler(zero_est, 0.5))
+    @test isempty(mark_cells(zero_est; theta=0.5))
     @test refine(V, zero_est) === V
     @test refine(V; h=(), p=()) === V
     @test coarsen(V; h=(), p=()) === V
@@ -571,8 +570,8 @@ end
     # prediction; where they happen to agree it would silently score the wrong
     # cell, so both arguments are checked against the space they are read with.
     @test_throws DimensionMismatch refine(V, flat(other))
-    @test_throws DimensionMismatch Unfitted._partition(V, flat(V), [(1, cell)], 8;
-                                                       previous=(other, flat(other)))
+    @test_throws DimensionMismatch decide(V, flat(V), [(1, cell)]; pmax=8,
+                                          previous=(other, flat(other)))
     truncated = Unfitted.ErrorEstimate{2,Float64}([ones(4, 4)], 1.0, 1.0, 0.0)
     @test_throws DimensionMismatch refine(V, truncated)
 end
@@ -581,7 +580,7 @@ end
     V = ladder(_AD_Ω; cells=8, order=2, depth=1)
     model = prepare(_ad_problem(V))
     est = estimate(model, solve!(model))
-    counts = [length(_dorfler(est, θ)) for θ in (0.1, 0.3, 0.5, 0.9, 1.0)]
+    counts = [length(mark_cells(est; theta=θ)) for θ in (0.1, 0.3, 0.5, 0.9, 1.0)]
     @test issorted(counts)
     @test counts[1] >= 1
     # θ = 1 takes every cell that carries any indicator at all.
@@ -612,14 +611,14 @@ end
     # θ this small needs one cell to reach the bulk, so the minimal prefix cuts
     # inside the group of four; all four must come back, not the one the sort
     # happened to put first.
-    marked = Unfitted._dorfler(est, 0.2)
+    marked = mark_cells(est; theta=0.2)
     @test length(marked) == 4
     @test Set(c for (_, c) in marked) == Set(tie)
 
     # Completing a tie must not sweep in a cell that merely sorts next: 0.1 is a
     # different indicator, not the same one seen through round-off.
     @test !((1, CartesianIndex(2, 2)) in marked)
-    @test length(Unfitted._dorfler(est, 1.0)) == 5
+    @test length(mark_cells(est; theta=1.0)) == 5
 end
 
 @testset "the loop reduces the error and the estimate" begin
@@ -649,7 +648,7 @@ end
 @testset "adaptivity is dimension generic, with the history threaded" begin
     # One cycle per dimension through the PUBLIC keyword path, `refine(V, est;
     # previous = …)`, which nothing else in this file exercises: the synthetic
-    # tests above call `_partition` directly, and the two end-to-end loops omit
+    # tests above call `decide` directly, and the two end-to-end loops omit
     # `previous` and so only ever see the first-cycle "p everywhere" convention.
     #
     # The manufactured solution must not be a polynomial the space reproduces: a
@@ -668,8 +667,8 @@ end
         @test est.total > 0
         @test est.consistency < 1.0e-2
 
-        marked = _dorfler(est, 0.5)
-        h, p = Unfitted._partition(V, est, marked, 8)
+        marked = mark_cells(est; theta=0.5)
+        h, p = decide(V, est, marked; pmax=8)
         @test length(h) + length(p) == length(marked)    # a fresh ladder drops nothing
 
         W = refine(V, est; theta=0.5)
@@ -737,4 +736,101 @@ end
         model = adapted(model, refine(model.prefold_space, estimate(model, u); theta=0.5))
     end
     @test any(o -> o[1] > 1, cell_orders(model.prefold_space; level=1))
+end
+
+@testset "an estimate carries no indicator for a cell the h-step is about to wake" begin
+    V = ladder(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=2, depth=1)
+    model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    u = solve!(model)
+    est = estimate(model, u)
+    mark = (1, CartesianIndex(2, 2))
+    W = refine(V; h=[mark])
+    live = active_cells(W; level=2)
+    children = [ch for ch in CartesianIndices(live) if live[ch]]
+    @test !isempty(children)
+    # Live in W, but zero in the estimate taken on V: the cold reading a release
+    # rule would get if it were evaluated on the refined space.
+    @test all(ch -> est.cells[2][ch] == 0, children)
+end
+
+@testset "estimate refuses a form that reads per-quadrature-point state" begin
+    # `estimate` assembles the problem's own blocks and loads a second time, on
+    # an order-elevated twin whose `q.point` numbers a larger cloud sitting at
+    # different places. A form reading a `QuadField` there indexes an array built
+    # for this model with the twin's indices.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    V = space(Ω; cells=4, order=2)
+    u = field(:u, V)
+    bc = [dirichlet(0.0; on=boundary(:all))]
+    base = prepare(poisson(V; source=1.0, dirichlet=bc))
+    solve!(base)
+    chi = QuadField{Float64}(base; init=q -> 1.0)
+
+    # The documented shape: a function builds the form, so the field travels in
+    # the closure's captures and the refusal comes before anything is built.
+    conduction(c) = WeakForm(; linear=q -> 0.0, symmetric=true,
+                             bilinear=(q, trial) -> TestChannels(0.0, c[q.point] .* trial.gradient))
+    stateful = prepare(Problem((u,); blocks=(block(u, u, conduction(chi)),),
+                               loads=(source_load(u; source=1.0),), dirichlet=bc))
+    @test_throws ArgumentError estimate(stateful, solve!(stateful))
+
+    # And the read itself is guarded, which is what covers the shape reflection
+    # cannot see: a form written at top level reads a global binding and captures
+    # nothing at all. Outside such a pass the read is unguarded.
+    @test_throws ArgumentError Unfitted._on_foreign_cloud(() -> chi[1], base.version + 1)
+    @test Unfitted._on_foreign_cloud(() -> chi[1], base.version) == 1.0
+    @test chi[1] == 1.0
+end
+
+@testset "estimate, refine and coarsen on an immersed domain" begin
+    # The fictitious fold writes a mask of its own, and the verbs read masks
+    # throughout — the attribution sweep, the h/p decision, the application. None
+    # of that was exercised over a `PhysicalDomain` before this testset.
+    #
+    # Ω is the unit square minus the disc of radius 0.2 at its centre, on 8×8
+    # cells of width 0.125, with one dormant level of 16×16 under it.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0,
+                           subcell_length_scale=1.0e-6, max_depth=2)
+    V = ladder(Ω; cells=8, order=2, depth=1, physical=hole)
+    bc = [dirichlet(0.0; on=boundary(:all))]
+    model = prepare(poisson(V; source=1.0, dirichlet=bc))
+    u = solve!(model)
+    est = estimate(model, u)
+
+    # A cell the level set removed carries no approximation, so it must score
+    # zero exactly as a user-masked one does — the indicator is read back at cell
+    # indices, and a fold that leaked into it would misattribute error.
+    folded = findall(!, active_cells(model; level=1))
+    @test length(folded) == 4                    # the four cells inside the disc
+    @test all(c -> est.cells[1][c] == 0, folded)
+    @test est.total > 0 && est.reference > 0
+    @test !isempty(mark_cells(est; theta=0.5))
+
+    # The h-step is applied to the PRE-FOLD space, so it wakes the whole cover
+    # and the next fold decides which of the children survive. (2,2) lies well
+    # outside the disc; (4,3) is cut by it, and one of its four children lies
+    # wholly inside.
+    W = refine(V; h=[(1, CartesianIndex(2, 2)), (1, CartesianIndex(4, 3))])
+    refined = adapted(model, W)
+    @test count(active_cells(refined; level=2, effective=false)) == 8
+    @test count(active_cells(refined; level=2)) == 7
+    @test diagnostics(refined).active_unknowns > diagnostics(model).active_unknowns
+
+    # An h-step on an immersed model has NO working state transfer, and both
+    # refusals are pinned here so neither can decay into dropped coefficients:
+    # `L2Projection` rejects a target carrying a physical domain outright, and
+    # `Rewire` rejects one whose active basis does not contain the source's,
+    # which is what leaf semantics make of a refinement. The loop therefore
+    # re-solves on the refined space rather than carrying its iterate across.
+    assemble!(refined)
+    @test_throws ArgumentError transfer(u, model, refined)
+    @test_throws ArgumentError transfer(u, model, refined; via=Rewire())
+    u2 = solve!(refined)
+    @test estimate(refined, u2).total < est.total
+
+    # And the release inverts the step it was given, masks and orders alike.
+    back = coarsen(W; h=[(1, CartesianIndex(2, 2)), (1, CartesianIndex(4, 3))])
+    @test !any(active_cells(back; level=2))
+    @test cell_orders(back; level=2) == cell_orders(V; level=2)
 end

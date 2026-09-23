@@ -61,9 +61,9 @@ omega = box((0.0, 0.0), (1.0, 1.0))
 homogeneous = [dirichlet(0.0; on=boundary(:all))]
 
 # One run, five calls, exactly as in the earlier tutorials.
-function solve_and_report(V, title; parameters=())
+function solve_and_report(V, title; parameters=(), prune=true)
     u = field(:u, V)
-    model = prepare(poisson(u; source=1.0, dirichlet=homogeneous))
+    model = prepare(poisson(u; source=1.0, dirichlet=homogeneous); prune=prune)
     solution = solve!(model)
     report = diagnostics(model, solution)
     print_run_report(title, report; parameters)
@@ -98,13 +98,12 @@ _, _, _, report_base = solve_and_report(V_base, "Part 1a — B-spline base level
 # same function twice, and a matrix with two identical columns is exactly
 # singular — no amount of quadrature care will save it.
 #
-# `prune_covered`, on by default for both `space` and `overlay`, removes
-# the duplicate. Tutorial 2 showed the integrated Legendre version of the
-# same keyword, where the modes eliminated are only *nearly* redundant, so
-# switching the rule off can in principle buy accuracy (in that tutorial's
-# aligned setup it bought none). Here the overlay reproduces the
-# eliminated function *exactly*, so the discrete space is literally
-# unchanged and the elimination is free.
+# Leaf semantics, which every stack carries, remove the duplicate. Tutorial 2
+# showed the integrated Legendre version of the same rule, where the modes
+# eliminated are only *nearly* redundant, so switching the rule off can in
+# principle buy accuracy (in that tutorial's setup it bought none). Here the
+# overlay reproduces the eliminated function *exactly*, so the discrete space
+# is literally unchanged and the elimination is free.
 #
 # `reduced mode counts` in the report below is `[1, 0]`: one function
 # dropped from the base, none from the overlay. That is the whole
@@ -116,19 +115,20 @@ model_nested, solution_nested, u_nested, report_nested = solve_and_report(V_nest
 
 # ── Part 1c: what the deduplication is worth ─────────────────────────────────
 #
-# Turn it off and look at the condition number. `prune_covered` belongs to
-# the level that *sheds* the mode — here the base — so it is `space`, not
-# `overlay`, that has to be told.
+# Turn it off and look at the condition number. Leaf semantics belong to the
+# stack rather than to one of its levels, so the switch is not on `space` or
+# `overlay` but on `prepare`: `prune = false` builds the unreduced twin, which
+# the docstring documents as a diagnostic rather than a space to solve with.
 #
 # The reported `condition estimate` is a genuine `cond(A)` rather than an
 # estimate; the model prints it for systems small enough to densify
 # (a few hundred unknowns), and `NaN` above that.
 
-V_undeduped = Unfitted._unpruned(overlay(space(omega; cells=8, order=3, basis=bspline()),
-                                         box((0.25, 0.25), (0.75, 0.75)); cells=4))
+V_undeduped = overlay(space(omega; cells=8, order=3, basis=bspline()),
+                      box((0.25, 0.25), (0.75, 0.75)); cells=4)
 _, _, _, report_undeduped = solve_and_report(V_undeduped,
                                              "Part 1c — the same stack, deduplication switched off";
-                                             parameters=(:pruning => "off",))
+                                             parameters=(:pruning => "off",), prune=false)
 
 println("Nested B-spline stack, deduplicated : unknowns ", report_nested.active_unknowns, ", cond ",
         report_nested.condition_estimate)
@@ -139,11 +139,12 @@ println("u_h(0.5, 0.5) = ", value(solution_nested, model_nested, u_nested, (0.5,
 println()
 
 # The undeduplicated operator is numerically singular: its condition
-# number lands around 1e17, well past the 1/ε ≈ 4.5e15 at which double
+# number lands around 3e16, past the 1/ε ≈ 4.5e15 at which double
 # precision has nothing left to give. The direct solver still returns a
 # plausible-looking answer, which is precisely what makes this failure
 # mode dangerous — nothing announces itself. One redundant unknown costs
-# roughly fifteen orders of magnitude of conditioning.
+# roughly fourteen orders of magnitude of conditioning — 687 against
+# 3.43e16, measured.
 
 # ── Part 2: B-splines on an immersed domain ──────────────────────────────────
 #
