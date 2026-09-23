@@ -202,6 +202,64 @@ end
     @test_throws ArgumentError adapt(V, trues(4, 4))                    # Bool is not a depth map
 end
 
+@testset "documented shapes: base active=, selection shapes, array over pair, vacuous nesting" begin
+    # Four shapes the docstrings promise and nothing exercised. The base-level
+    # `active =` one is the reason `adapt`'s array form hands `_with_masks` the
+    # private sentinel rather than `depth_masks`' documented `nothing`: `nothing`
+    # is itself a legal mask meaning "every cell", so passing it through would
+    # activate the very cells the caller deactivated.
+    m = trues(4, 4)
+    m[1, 1] = false
+    V = ladder(LADDER_OMEGA; cells=4, order=2, depth=1, splits=2, active=m)
+    @test active_cells(V; level=1) == m                     # `active =` reaches the base
+    @test active_cells(adapt(V, zeros(Int, 4, 4)); level=1) == m       # array form leaves it alone
+    @test active_cells(adapt(V, 2 => trues(8, 8)); level=1) == m       # so does the pair form
+
+    L = ladder(LADDER_OMEGA; cells=4, order=2, depth=1, splits=2)
+    listed = overlapping_cells(L, [CartesianIndex(2, 2)]; from=1, to=2)
+    @test count(listed) == 4
+    @test overlapping_cells(L, (_, ci) -> ci == CartesianIndex(2, 2); from=1, to=2) == listed
+    sel = falses(4, 4)
+    sel[2, 2] = true
+    @test overlapping_cells(L, Unfitted.LevelMask{2}(sel); from=1, to=2) == listed
+    @test all(overlapping_cells(L, nothing; from=1, to=2))  # `nothing` is every cell
+
+    # The array form overwrites an overlay mask rather than merging with it.
+    P = adapt(L, 2 => trues(8, 8))
+    @test !any(active_cells(adapt(P, zeros(Int, 4, 4)); level=2))
+
+    # `is_nested` passes vacuously where the finer level's box contains no node
+    # of the level below, which its docstring states and no test asserted.
+    @test is_nested(overlay(space(LADDER_OMEGA; cells=4, order=2), box((0.3, 0.3), (0.45, 0.45));
+                            cells=3))
+end
+
+@testset "the per-cell block and the whole-level map are the same rule" begin
+    # `overlapping_cells` answers for a selection by walking the destination
+    # level; `_cell_block` answers for one cell by binary search, which is what
+    # the adaptivity verbs ask and what makes a mark cost microseconds instead of
+    # milliseconds. The two must agree everywhere, in both directions, including
+    # on a stack that is neither nested nor aligned nor isotropic — and including
+    # the empty answer a level whose box misses the cell must give.
+    V = overlay(overlay(space(LADDER_OMEGA; cells=4, order=2), box((0.3, 0.1), (0.8, 0.9));
+                        cells=3), box((0.15, 0.55), (0.65, 0.95)); cells=5)
+    @test !is_nested(V)
+    agrees = true
+    empties = 0
+    for from in 1:length(V.levels), to in 1:length(V.levels)
+        from == to && continue
+        for c in cell_indices(V; level=from)
+            block = Unfitted._cell_block(V, from, to, c)
+            isempty(block) && (empties += 1)
+            got = falses(V.levels[to].mesh.cells)
+            got[block] .= true
+            agrees &= (got == overlapping_cells(V, [c]; from=from, to=to))
+        end
+    end
+    @test agrees
+    @test empties > 0                                       # the sub-box cases really occur
+end
+
 @testset "depth_masks and grading" begin
     V = ladder(LADDER_OMEGA; cells=8, order=2, depth=3, splits=2)
     d = zeros(Int, 8, 8)

@@ -137,18 +137,90 @@ end
     h2, p2 = Unfitted._partition(V, est, marked, 2)      # the space is order 2
     @test isempty(p2) && length(h2) == length(marked)
 
-    # A cell a finer level has taken over takes h however much order it has left:
-    # leaf semantics shed a covered cell's bubbles, so the increment would vanish.
-    W = refine(V; h=[(1, CartesianIndex(2, 2))])
-    h3, p3 = Unfitted._partition(W, flat(W), [(1, CartesianIndex(2, 2))], 8)
+    # A cell a finer level has taken over is never sent to p — leaf semantics
+    # shed a covered cell's bubbles, so the increment would vanish — and it takes
+    # h for as long as h still has something to activate.
+    part = falses(V.levels[2].mesh.cells)
+    part[CartesianIndex(3, 3)] = true                 # one of cell (2, 2)'s four children
+    Wpart = adapt(V, 2 => part)
+    h3, p3 = Unfitted._partition(Wpart, flat(Wpart), [(1, CartesianIndex(2, 2))], 8)
     @test h3 == [(1, CartesianIndex(2, 2))] && isempty(p3)
+
+    # Once the cover is complete neither step is on offer: p is shed and h sets
+    # no mask bit. The mark is dropped rather than spent on a step that changes
+    # nothing — the children carry the error from here on — and `refine` says so
+    # by returning its argument.
+    W = refine(V; h=[(1, CartesianIndex(2, 2))])
+    h5, p5 = Unfitted._partition(W, flat(W), [(1, CartesianIndex(2, 2))], 8)
+    @test isempty(h5) && isempty(p5)
+    @test refine(W; h=h5, p=p5) === W
 
     # On the finest level there is nothing to activate, so the cell takes p and
     # `refine` turns that into the order step.
     h4, p4 = Unfitted._partition(V, est, [(nlevels, CartesianIndex(1, 1))], 8)
     @test isempty(h4) && p4 == [(nlevels, CartesianIndex(1, 1))]
 
+    # A finest-level cell that is ALSO at `pmax` has neither step, so it is
+    # dropped instead of being parked in `p`, where it would make every cycle
+    # rebuild an identical space for ever.
+    h6, p6 = Unfitted._partition(V, est, [(nlevels, CartesianIndex(1, 1))], 2)
+    @test isempty(h6) && isempty(p6)
+
     @test_throws ArgumentError Unfitted._partition(V, est, [(99, CartesianIndex(1, 1))], 8)
+    @test_throws ArgumentError Unfitted._partition(V, est, [(1, CartesianIndex(9, 9))], 8)
+end
+
+@testset "the leaf test reaches every finer level, not only the one below" begin
+    # `ladder` admits a stack that is live on level k+2 while k+1 is dormant, and
+    # the dof layer's covering rule tests every finer level in turn. A leaf test
+    # that looked one level down called such a cell a leaf and sent it to p — an
+    # order step the dof walk then shed again, every cycle, for as long as the
+    # skip lasted.
+    V = ladder(_AD_Ω; cells=4, order=2, depth=2)
+    cell = CartesianIndex(2, 2)
+    flat(W) = Unfitted.ErrorEstimate{Float64,2}([ones(l.mesh.cells) for l in W.levels], 1.0, 1.0,
+                                                0.0)
+    grandchildren = overlapping_cells(V, [cell]; from=1, to=3)
+    S = adapt(V, 3 => grandchildren)                   # level 3 live, level 2 empty
+    @test !any(active_cells(S; level=2))
+    @test !Unfitted._is_leaf(S, 1, cell)
+    # Nor is there an h-step: every level-2 cell under this one is already held
+    # from below, so activating it is dof-inert too.
+    @test !Unfitted._has_h_step(S, 1, cell)
+    h, p = Unfitted._partition(S, flat(S), [(1, cell)], 8)
+    @test isempty(h) && isempty(p)
+    @test_throws ArgumentError coarsen(S; p=[(1, cell)])
+
+    # Inert is measured, not assumed: 97 active unknowns before either explicit
+    # step and 97 after, which is what makes routing the mark anywhere a waste.
+    before = active_unknowns(prepare(_ad_problem(S)))
+    @test active_unknowns(prepare(_ad_problem(refine(S; p=[(1, cell)])))) == before
+    @test active_unknowns(prepare(_ad_problem(refine(S; h=[(1, cell)])))) == before
+
+    # Where the skip holds only part of the cell, both steps buy something: the
+    # cell is not a leaf, h still has a dormant child to wake, and it takes h.
+    corner = first(c for c in CartesianIndices(grandchildren) if grandchildren[c])
+    part = falses(V.levels[3].mesh.cells)
+    part[corner] = true
+    P = adapt(V, 3 => part)
+    @test !Unfitted._is_leaf(P, 1, cell) && Unfitted._has_h_step(P, 1, cell)
+    hp, pp = Unfitted._partition(P, flat(P), [(1, cell)], 8)
+    @test hp == [(1, cell)] && isempty(pp)
+    partial = active_unknowns(prepare(_ad_problem(P)))
+    @test active_unknowns(prepare(_ad_problem(refine(P; p=[(1, cell)])))) > partial
+    @test active_unknowns(prepare(_ad_problem(refine(P; h=[(1, cell)])))) > partial
+
+    # `coarsen`'s release rule reads the stack the same way. Here level 4 holds
+    # one level-2 child while level 3 is empty, so releasing level 1's cover must
+    # leave that child alone and release only its siblings.
+    Vd = ladder(_AD_Ω; cells=4, order=2, depth=3)
+    Wd = refine(Vd; h=[(1, cell)])
+    child = CartesianIndex(3, 3)
+    held = adapt(Wd, 4 => overlapping_cells(Vd, [child]; from=2, to=4))
+    @test !any(active_cells(held; level=3))
+    after = active_cells(coarsen(held; h=[(1, cell)]); level=2)
+    @test after[child]                                 # still held, two levels down
+    @test !after[CartesianIndex(4, 4)]                 # its siblings are released
 end
 
 @testset "the h-versus-p decision: a cell keeps p only if it earned it" begin
@@ -180,6 +252,100 @@ end
     # spirit even though it is in signature.
     h0, p0 = Unfitted._partition(W, est_now, [(1, good), (1, bad)], 8)
     @test isempty(h0) && length(p0) == 2
+end
+
+@testset "the h-versus-p decision: what an h-step's child was promised" begin
+    # The other half of the rule, and the half with the geometry in it. A child
+    # of an h-step inherits an equal share of its parent's indicator, reduced by
+    # the h-rate of the energy norm at the child's own order. Depth 2 is
+    # load-bearing: on a depth-1 ladder the children sit on the finest level and
+    # are routed to p before the prediction is ever consulted.
+    V = ladder(_AD_Ω; cells=4, order=2, depth=2)
+    cell = CartesianIndex(2, 2)
+    W = refine(V; h=[(1, cell)])
+    kids = [c
+            for c in CartesianIndices(overlapping_cells(V, [cell]; from=1, to=2))
+            if overlapping_cells(V, [cell]; from=1, to=2)[c]]
+    @test length(kids) == 4
+
+    before = [zeros(l.mesh.cells) for l in V.levels]
+    before[1][cell] = 1.0
+    est_prev = Unfitted.ErrorEstimate{Float64,2}(before, 1.0, 1.0, 0.0)
+    pred = Unfitted._predicted(W, (V, est_prev), 2, kids[1], cell_orders(W; level=2)[kids[1]],
+                               Dict{Int,Any}(), Unfitted._GAMMA_P)
+    # η · γ_h · ρ^{p/D} / √n with ρ = 1/2^D the volume ratio of a bisected child,
+    # p = 2 the inherited order and n = 2^D children: 2 · 0.25 / 2 = 0.25 in 2D.
+    @test pred ≈ Unfitted._GAMMA_H * 0.5^2 / sqrt(2^2)
+    @test pred ≈ 0.25
+
+    after = [zeros(l.mesh.cells) for l in W.levels]
+    after[2][kids[1]] = 1.2 * pred                    # fell short — not smooth
+    after[2][kids[2]] = 0.4 * pred                    # beat it — smooth
+    est_now = Unfitted.ErrorEstimate{Float64,2}(after, 1.0, 1.0, 0.0)
+    h, p = Unfitted._partition(W, est_now, [(2, kids[1]), (2, kids[2])], 8; previous=(V, est_prev))
+    @test h == [(2, kids[1])]
+    @test p == [(2, kids[2])]
+end
+
+@testset "the prediction off the ladder: sub-box overlays and anisotropic splits" begin
+    # The child count and the h-rate are both read from the geometry, because
+    # neither is implied by the level's cell count off a ladder.
+
+    # A sub-box overlay at the SAME cell count as the base: the ratio of the two
+    # levels' cell counts is 1 where each parent has 2^D children, which made
+    # every child look √(2^D) better than it was and take p on sight.
+    inner = box((0.25, 0.25), (0.75, 0.75))
+    U = overlay(overlay(space(_AD_Ω; cells=4, order=2), inner; cells=4, active=falses(4, 4)), inner;
+                cells=8, active=falses(8, 8))
+    cell = CartesianIndex(2, 2)                       # [0.25, 0.5]², inside the overlay
+    UW = refine(U; h=[(1, cell)])
+    kids = [c
+            for c in CartesianIndices(overlapping_cells(U, [cell]; from=1, to=2))
+            if overlapping_cells(U, [cell]; from=1, to=2)[c]]
+    @test length(kids) == 4                           # four, though 4×4 over 4×4
+    before = [zeros(l.mesh.cells) for l in U.levels]
+    before[1][cell] = 1.0
+    est_prev = Unfitted.ErrorEstimate{Float64,2}(before, 1.0, 1.0, 0.0)
+    @test Unfitted._predicted(UW, (U, est_prev), 2, kids[1], cell_orders(UW; level=2)[kids[1]],
+                              Dict{Int,Any}(), Unfitted._GAMMA_P) ≈ 0.25
+
+    # An anisotropic split: level 2 halves axis 1 and leaves axis 2 alone, so the
+    # parent has two children and the volume ratio is ½, not ¼. Judging it by the
+    # bisection rate 0.5^p would call a merely anisotropic child non-smooth.
+    S = ladder(_AD_Ω; cells=4, order=2, depth=2, splits=[(2, 1), (1, 2)])
+    @test [l.mesh.cells for l in S.levels] == [(4, 4), (8, 4), (8, 8)]
+    SW = refine(S; h=[(1, cell)])
+    skids = [c
+             for c in CartesianIndices(overlapping_cells(S, [cell]; from=1, to=2))
+             if overlapping_cells(S, [cell]; from=1, to=2)[c]]
+    @test length(skids) == 2
+    sbefore = [zeros(l.mesh.cells) for l in S.levels]
+    sbefore[1][cell] = 1.0
+    sprev = Unfitted.ErrorEstimate{Float64,2}(sbefore, 1.0, 1.0, 0.0)
+    # γ_h · (½)^{p/D} / √2 = 2 · 2^{−1} / √2 = 2^{−1/2}, twice the 0.5^p answer.
+    @test Unfitted._predicted(SW, (S, sprev), 2, skids[1], cell_orders(SW; level=2)[skids[1]],
+                              Dict{Int,Any}(), Unfitted._GAMMA_P) ≈ sqrt(0.5)
+end
+
+@testset "refine: a cell the level below does not reach" begin
+    # A sub-box overlay reaches only part of the base level, so an h-mark outside
+    # it has nothing to activate — exactly the position of a cell on the finest
+    # level, and handled by the same rule rather than by silently doing nothing.
+    inner = box((0.25, 0.25), (0.75, 0.75))
+    U = overlay(space(_AD_Ω; cells=8, order=2), inner; cells=8, active=falses(8, 8))
+    corner = CartesianIndex(8, 8)                     # [0.875, 1]², outside the overlay
+    @test !any(overlapping_cells(U, [corner]; from=1, to=2))
+    @test !Unfitted._has_h_step(U, 1, corner)
+
+    flat = Unfitted.ErrorEstimate{Float64,2}([ones(l.mesh.cells) for l in U.levels], 1.0, 1.0, 0.0)
+    h, p = Unfitted._partition(U, flat, [(1, corner)], 8)
+    @test isempty(h) && p == [(1, corner)]
+    @test cell_orders(refine(U; h=[(1, corner)]); level=1)[corner] == (3, 3)
+
+    # And at `pmax` neither step is left, so the mark is dropped instead of being
+    # re-issued every cycle against a cover that does not exist.
+    h2, p2 = Unfitted._partition(U, flat, [(1, corner)], 2)
+    @test isempty(h2) && isempty(p2)
 end
 
 @testset "coarsen: the exact inverse of the h-step" begin
@@ -248,11 +414,118 @@ end
     before = [zeros(l.mesh.cells) for l in V.levels]
     before[1][cell] = 1.0
     est_prev = Unfitted.ErrorEstimate{Float64,2}(before, 1.0, 1.0, 0.0)
-    caches = (Dict{Int,Any}(), Dict{Int,Any}())
     predicted = Unfitted._predicted(W, (V, est_prev), 1, cell, cell_orders(W; level=1)[cell],
-                                    caches, Unfitted._GAMMA_P)
+                                    Dict{Int,Any}(), Unfitted._GAMMA_P)
     @test predicted > 1.0                       # the error is expected to grow
     @test predicted ≈ 1.0 / Unfitted._GAMMA_P    # by exactly one degree's worth
+end
+
+@testset "the prediction reads a released cover as evidence" begin
+    # The h twin of the row above. An h-release leaves the parent active at an
+    # unchanged order, so without a row of its own it falls through to "no
+    # evidence" and buys p on sight — the same oscillation the p-release row was
+    # added to stop. The row is the exact inverse of the h-refinement row: a
+    # cover whose children met their prediction predicts the parent's own
+    # indicator straight back.
+    V = ladder(_AD_Ω; cells=4, order=2, depth=2)
+    cell = CartesianIndex(2, 2)
+    W = refine(V; h=[(1, cell)])
+    R = coarsen(W; h=[(1, cell)])
+    @test !any(active_cells(R; level=2))
+
+    children = overlapping_cells(V, [cell]; from=1, to=2)
+    before = [zeros(l.mesh.cells) for l in W.levels]
+    before[2][children] .= 1.0                  # η = 1 on each of the four children
+    est_prev = Unfitted.ErrorEstimate{Float64,2}(before, 2.0, 1.0, 0.0)
+    predicted = Unfitted._predicted(R, (W, est_prev), 1, cell, cell_orders(R; level=1)[cell],
+                                    Dict{Int,Any}(), Unfitted._GAMMA_P)
+    # √(Σ η²) / (γ_h ρ^{p/D}) = 2 / (2 · 0.25) = 4, and the parent's own previous
+    # indicator is not consulted: the evidence is the children's.
+    @test predicted ≈ 4.0
+end
+
+@testset "refine and coarsen: pmax and pmin bound, they do not move" begin
+    # A cap below a cell's order is "no more p here", not "lower it": `refine`
+    # was asked to enrich the cell, and lowering it would be the opposite. The
+    # floor reads the same way. Both used to move the order to the bound, which
+    # the tests could not see because they set the bound at the current order.
+    V = ladder(_AD_Ω; cells=4, order=4, depth=1)
+    cell = CartesianIndex(2, 2)
+    same(a, b) = all(active_cells(a; level=k) == active_cells(b; level=k) &&
+                         cell_orders(a; level=k) == cell_orders(b; level=k)
+                     for k in 1:length(a.levels))
+
+    @test cell_orders(refine(V; p=[(1, cell)], pmax=2); level=1)[cell] == (4, 4)
+    @test refine(V; p=[(1, cell)], pmax=2) === V
+
+    # The children of an h-step take the parent's order UNCAPPED, because
+    # `coarsen` restores exactly that value and a cap here would break the round
+    # trip on any stack whose order already exceeds `pmax`.
+    H = refine(V; h=[(1, cell)], pmax=2)
+    children = overlapping_cells(V, [cell]; from=1, to=2)
+    @test all(cell_orders(H; level=2)[c] == (4, 4)
+              for c in CartesianIndices(children) if children[c])
+    @test same(coarsen(H; h=[(1, cell)]), V)
+
+    @test cell_orders(coarsen(V; p=[(1, cell)], pmin=6); level=1)[cell] == (4, 4)
+    @test coarsen(V; p=[(1, cell)], pmin=6) === V
+
+    # Per axis, not per cell: an axis below the bound still moves.
+    A = elevate(V, 1 => [cell => (2, 9)])
+    @test cell_orders(refine(A; p=[(1, cell)], pmax=8); level=1)[cell] == (3, 9)
+    @test cell_orders(coarsen(A; p=[(1, cell)], pmin=3); level=1)[cell] == (2, 8)
+end
+
+@testset "refine and coarsen return their argument when nothing moved" begin
+    # Identity is the exhaustion signal. Without it a saturated cycle returns a
+    # fresh but identical `Space`, the caller rebuilds the model, and the loop
+    # runs to its step limit with nothing changing.
+    V = ladder(_AD_Ω; cells=4, order=2, depth=1)
+    cell = CartesianIndex(2, 2)
+    zero_est = Unfitted.ErrorEstimate{Float64,2}([zeros(l.mesh.cells) for l in V.levels], 0.0, 1.0,
+                                                 0.0)
+    @test isempty(_dorfler(zero_est, 0.5))
+    @test refine(V, zero_est) === V
+    @test refine(V; h=(), p=()) === V
+    @test coarsen(V; h=(), p=()) === V
+
+    # A p-step at `pmax`, an h-step on the finest level at `pmax`, and a release
+    # of a cover that was never there all change nothing.
+    @test refine(V; p=[(1, cell)], pmax=2) === V
+    @test refine(V; h=[(2, CartesianIndex(3, 3))], pmax=2) === V
+    @test coarsen(V; h=[(1, cell)]) === V
+    @test coarsen(V; p=[(1, cell)], pmin=2) === V
+
+    # And anything that does move returns a new space, so the signal is exact.
+    @test refine(V; p=[(1, cell)]) !== V
+    @test refine(V; h=[(1, cell)]) !== V
+end
+
+@testset "refine and coarsen: what they refuse" begin
+    V = ladder(_AD_Ω; cells=4, order=4, depth=1)
+    cell = CartesianIndex(2, 2)
+    other = ladder(_AD_Ω; cells=8, order=2, depth=1)
+    flat(W) = Unfitted.ErrorEstimate{Float64,2}([ones(l.mesh.cells) for l in W.levels], 1.0, 1.0,
+                                                0.0)
+
+    # A cell index out of range is the caller's mistake, named as such, rather
+    # than a `BoundsError` from inside an array they never handed over.
+    @test_throws ArgumentError refine(V; p=[(1, CartesianIndex(9, 9))])
+    @test_throws ArgumentError refine(V; h=[(1, CartesianIndex(9, 9))])
+    @test_throws ArgumentError coarsen(V; p=[(1, CartesianIndex(9, 9))])
+    @test_throws ArgumentError coarsen(V; h=[(1, CartesianIndex(9, 9))])
+    @test_throws ArgumentError refine(V; p=[(1, cell)], pmax=0)
+    @test_throws ArgumentError coarsen(V; p=[(1, cell)], pmin=0)
+
+    # An estimate taken on another space is indexed by that space's cells. Where
+    # the shapes disagree it used to surface as a `BoundsError` from inside the
+    # prediction; where they happen to agree it would silently score the wrong
+    # cell, so both arguments are checked against the space they are read with.
+    @test_throws DimensionMismatch refine(V, flat(other))
+    @test_throws DimensionMismatch Unfitted._partition(V, flat(V), [(1, cell)], 8;
+                                                       previous=(other, flat(other)))
+    truncated = Unfitted.ErrorEstimate{Float64,2}([ones(4, 4)], 1.0, 1.0, 0.0)
+    @test_throws DimensionMismatch refine(V, truncated)
 end
 
 @testset "refine: Dörfler marking is monotone in theta" begin
@@ -324,19 +597,51 @@ end
           _ad_energy_error(u, model) < _ad_energy_error(solve!(uniform), uniform)
 end
 
-@testset "adaptivity is dimension generic" begin
-    Ω3 = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
-    exact3(x) = sinpi(x[1]) * sinpi(x[2]) * sinpi(x[3])
-    problem3(W) = poisson(W; source=x -> 3pi^2 * exact3(x),
-                          dirichlet=[dirichlet(exact3; on=boundary(:all))])
-    V = ladder(Ω3; cells=3, order=2, depth=1)
-    model = prepare(problem3(V))
-    u = solve!(model)
-    est = estimate(model, u)
-    @test est.total > 0
-    @test est.consistency < 1.0e-2
-    W = refine(V, est; theta=0.5)
-    @test active_unknowns(prepare(problem3(W))) > active_unknowns(model)
+@testset "adaptivity is dimension generic, with the history threaded" begin
+    # One cycle per dimension through the PUBLIC keyword path, `refine(V, est;
+    # previous = …)`, which nothing else in this file exercises: the synthetic
+    # tests above call `_partition` directly, and the two end-to-end loops omit
+    # `previous` and so only ever see the first-cycle "p everywhere" convention.
+    #
+    # The manufactured solution must not be a polynomial the space reproduces: a
+    # constant source at order 2 in 1D has an exact quadratic solution, and the
+    # indicator comes back at 1e-17 with nothing to mark. `h` is deliberately not
+    # asserted non-empty — on a smooth sine every cell is entitled to p, and on
+    # this fixture none of them fell short.
+    for D in (1, 2, 3)
+        Ω = box(ntuple(_ -> 0.0, D), ntuple(_ -> 1.0, D))
+        exact(x) = prod(sinpi, x)
+        problem(W) = poisson(W; source=x -> D * pi^2 * exact(x),
+                             dirichlet=[dirichlet(exact; on=boundary(:all))])
+        V = ladder(Ω; cells=(D == 3 ? 3 : 4), order=2, depth=2)
+        model = prepare(problem(V))
+        est = estimate(model, solve!(model))
+        @test est.total > 0
+        @test est.consistency < 1.0e-2
+
+        marked = _dorfler(est, 0.5)
+        h, p = Unfitted._partition(V, est, marked, 8)
+        @test length(h) + length(p) == length(marked)    # a fresh ladder drops nothing
+
+        W = refine(V, est; theta=0.5)
+        model2 = prepare(problem(W))
+        est2 = estimate(model2, solve!(model2))
+        @test active_unknowns(model2) > active_unknowns(model)
+        @test est2.total < est.total
+
+        X = refine(W, est2; theta=0.5, previous=(V, est))
+        model3 = prepare(problem(X))
+        est3 = estimate(model3, solve!(model3))
+        @test active_unknowns(model3) > active_unknowns(model2)
+        @test est3.total < est2.total
+
+        # And the explicit verbs close on themselves in every dimension.
+        cell = first(cell_indices(V; level=1))
+        same(a, b) = all(active_cells(a; level=k) == active_cells(b; level=k) &&
+                             cell_orders(a; level=k) == cell_orders(b; level=k)
+                         for k in 1:length(a.levels))
+        @test same(coarsen(refine(V; h=[(1, cell)]); h=[(1, cell)]), V)
+    end
 end
 
 @testset "estimate refuses a family whose keys are not order stable" begin

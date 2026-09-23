@@ -358,8 +358,15 @@ end
 
 # ── Mapping cells between levels ──────────────────────────────────────────────
 
-# Index range of `from`'s cells that cell `j` of `to` overlaps along one axis, or
-# an empty range where `j` lies outside `from`'s extent.
+# Index range of `search_axis`'s cells that cell `j` of `index_axis` overlaps
+# along one axis, or an empty range where the two extents are disjoint there.
+#
+# The relation is SYMMETRIC — cell i of one axis overlaps cell j of the other
+# exactly when the reverse holds — so this single search answers the cross-level
+# map in both directions. `overlapping_cells` reads it one way (which source
+# cells does this destination cell see) and `_cell_block` the other (which
+# destination cells does this source cell reach); nothing below has to know which
+# level is the finer one.
 #
 # Deliberately tolerance-free. An additive epsilon on the node coordinates is
 # wrong twice over: `GeometryTolerance` is absolute, so on a domain far from the
@@ -371,12 +378,32 @@ end
 # merely touches. Levels of a ladder share their node coordinates bit-for-bit
 # (`_mesh_axes` builds endpoints exactly), so nothing here has to absorb a
 # rounding difference.
-function _overlap_range(to_axis::Vector{T}, from_axis::Vector{T}, j::Int) where {T}
-    ncells = length(from_axis) - 1
-    lo = searchsortedlast(from_axis, to_axis[j])
-    hi = searchsortedfirst(from_axis, to_axis[j + 1]) - 1
-    (hi < 1 || lo > ncells) && return 1:0                   # disjoint from `from`'s extent
+function _overlap_range(index_axis::Vector{T}, search_axis::Vector{T}, j::Int) where {T}
+    ncells = length(search_axis) - 1
+    lo = searchsortedlast(search_axis, index_axis[j])
+    hi = searchsortedfirst(search_axis, index_axis[j + 1]) - 1
+    (hi < 1 || lo > ncells) && return 1:0                   # disjoint extents
     return max(lo, 1):min(hi, ncells)
+end
+
+# The block of level-`to` cells that cell `cell` of level `from` overlaps. The
+# answer is always an axis-aligned block, because both meshes are tensor products
+# of sorted axes, so `D` binary searches settle it: O(D·log N + block) rather than
+# the O(N_to) pass `overlapping_cells` makes over the destination grid.
+#
+# That difference is why this exists. Adaptivity asks the question one cell at a
+# time — is anything live below this cell, which cells does an h-step activate,
+# how many children does this parent have — and paying for a whole level per
+# marked cell dominated the cycle: measured mapping one base cell of a depth-3 3D
+# ladder onto its 64³ level, 7.65 ms through `overlapping_cells` against 0.29 µs
+# for this block, and a cycle asks it once per mark from four sites.
+#
+# An empty block is a legitimate answer rather than an error: a level whose box
+# does not reach this cell covers none of it, which is the ordinary state of
+# affairs on a sub-box overlay. Every caller must read it that way.
+function _cell_block(V::Space{D}, from::Integer, to::Integer, cell::CartesianIndex{D}) where {D}
+    f, t = V.levels[from].mesh, V.levels[to].mesh
+    return CartesianIndices(ntuple(d -> _overlap_range(f.axes[d], t.axes[d], cell.I[d]), D))
 end
 
 """
@@ -411,13 +438,20 @@ function overlapping_cells(V::Space{D,T}, cells; from::Integer, to::Integer) whe
     src = _level_selection(cells, src_level)
     from == to && return copy(src)
 
-    from_mesh, to_mesh = src_level.mesh, dst_level.mesh
-    ranges = ntuple(d -> [_overlap_range(to_mesh.axes[d], from_mesh.axes[d], j)
-                          for j in 1:to_mesh.cells[d]], D)
-    out = falses(to_mesh.cells)
-    for ci in cell_indices(to_mesh)
-        block = CartesianIndices(ntuple(d -> ranges[d][ci.I[d]], D))
-        out[ci] = any(@view src[block])
+    # The union of the selected cells' blocks, which is the same set as "every
+    # destination cell that sees a selected source cell" because the overlap
+    # relation is symmetric. Reading it this way costs one block per *selected*
+    # cell instead of one pass over the whole destination grid, which is the
+    # difference between 25 µs and 7.58 ms when 64 base cells are mapped onto a
+    # 64³ level, and parity (1.95 ms against 1.91 ms) in the other direction with
+    # 15 625 sources. The per-axis blocks are tabulated once over the source axes
+    # so no cell repeats the binary search.
+    f, t = src_level.mesh, dst_level.mesh
+    ranges = ntuple(d -> [_overlap_range(f.axes[d], t.axes[d], i) for i in 1:f.cells[d]], D)
+    out = falses(t.cells)
+    for ci in CartesianIndices(src)
+        src[ci] || continue
+        out[CartesianIndices(ntuple(d -> ranges[d][ci.I[d]], D))] .= true
     end
     return out
 end
@@ -520,7 +554,14 @@ function adapt(V::Space{D,T}, depths::AbstractArray{<:Integer,D}; grade::Int=0) 
     eltype(depths) === Bool &&
         throw(ArgumentError("adapt received a Bool array where a per-base-cell depth map was expected. To set one " *
                             "level's mask, name the level: `adapt(V, k => mask)`."))
-    return _with_masks(V, depth_masks(V, depths; grade=grade))
+    # `depth_masks` reports the base level as `nothing`, which is its documented
+    # way of saying "not derived from `depths`" — but `nothing` is also a legal
+    # mask meaning "every cell", so handing it straight to `_with_masks` would
+    # overwrite a base mask the caller set through `space`'s or `ladder`'s
+    # `active =`, silently activating cells they deactivated. The private
+    # sentinel is the one value that cannot be confused with a mask.
+    masks = depth_masks(V, depths; grade=grade)
+    return _with_masks(V, (_Unset(), Base.tail(masks)...))
 end
 
 """
