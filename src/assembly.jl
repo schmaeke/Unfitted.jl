@@ -710,13 +710,15 @@ Thread-local assembly scratch. Carries every buffer the hot loop needs:
     to size the value banks; the per-cell sets a region actually pairs against
     come from `cell_locals[i]`. Multi-indices of level `i`'s basis, at
     its nominal order.
-  - `cell_locals[i]` — `nothing` on a level whose order is uniform (every
-    cell shares `local_ids[i]`), else that level's per-cell minimum-rule
-    index table, read by parent cell. This is the *same object*
-    `_build_cell_dofs!` walked to produce `cell_dofs`, taken straight off
-    the level rather than re-derived, because the positional pairing
-    between a cell's raw dofs and its basis values is the only link
-    between the dof layer and the basis layer and nothing checks it.
+  - `cell_locals[i]` — level `i`'s minimum-rule index table, one
+    [`CellModes`](@ref) per level and read by parent cell as
+    `sets[kind[cell]]`. A level whose order is uniform carries a palette
+    of one set, so there is no second shape and no branch. This is the
+    *same object* `_build_cell_dofs!` walked to produce `cell_dofs`,
+    taken straight off the level rather than re-derived, because the
+    positional pairing between a cell's raw dofs and its basis values is
+    the only link between the dof layer and the basis layer and nothing
+    checks it.
   - `orders[i]`    — nominal polynomial order tuple of level `i`'s basis.
   - `values[i]`, `gradients[i]` — per-level basis value / gradient
     buffers. Indexed by the level id; reused across every region a
@@ -750,11 +752,11 @@ struct AssemblyWorkspace{D,T,B<:BasisFamily}
     local_rhs::Vector{T}
 end
 
-# The multi-index list one parent cell generates: the level-wide list on a level
-# whose order is uniform, and that level's per-cell minimum-rule entry otherwise.
-# One `=== nothing` branch on the common path, and a plain array read on the
-# per-cell path — measured at or below the noise of the basis refresh, which is
-# itself 1.6–4.1% of `_assemble_region!`.
+# The multi-index list one parent cell generates, read out of the level's
+# minimum-rule table. A uniform level's palette holds one set and every active
+# cell points at it, so this is two array reads and no branch either way —
+# measured at or below the noise of the basis refresh, which is itself 1.6–4.1%
+# of `_assemble_region!`.
 @inline function _parent_local_ids(cell_locals, lvl::Int, cell::CartesianIndex{D}) where {D}
     modes = cell_locals[lvl]
     return modes.sets[modes.kind[cell]]
@@ -868,12 +870,17 @@ function _parent_dof_data(ws::AssemblyWorkspace{D,T}, layout::FieldLayout{D,T},
     raw_dofs = cell_dofs(layout.dofs, lvl, parent.cell)
     # `raw_dofs[i]` ↔ `values[i]` is the only link between the dof layer and the
     # basis layer, and every consumer walks it positionally without checking it
-    # (`_field_value`, `_field_gradient`, `_emit_block!`). Under a per-cell order
-    # the two lists come from different objects — the layout's `cell_dofs` and
-    # the level's minimum-rule table — so a mismatch is possible in a way it was
-    # not before, and its symptom is a plausible wrong answer rather than an
-    # exception. One integer compare per (region, parent, field) buys the
-    # exception; it is not in the quadrature-point loop.
+    # (`_field_value`, `_field_gradient`, `_emit_block!`). The two lists cannot
+    # disagree in *length*: `_build_cell_dofs!` reads `cell_basis_indices`, which
+    # is the same `level.modes` table `cell_locals` banks, and `Level`'s inner
+    # constructor derives that table rather than accepting one (see
+    # `mesh.jl`). What this compares is therefore the list against the workspace
+    # BANK, which is sized once from the level's nominal order — the `>=`
+    # relaxation `_tensor_values_grads!` relies on. One integer compare per
+    # (region, parent, field); it is not in the quadrature-point loop. The
+    # message below still names the older hypothesis — a layout/table drift —
+    # which c907576 made unspellable; read it as "this cell needs more basis
+    # values than the level's bank was sized for".
     length(raw_dofs) <= length(ws.values[lvl]) ||
         throw(DimensionMismatch("cell $(parent.cell) of level $lvl has $(length(raw_dofs)) raw " *
                                 "dofs but the workspace bank holds $(length(ws.values[lvl])) " *

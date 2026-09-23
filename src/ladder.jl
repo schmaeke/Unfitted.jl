@@ -51,9 +51,9 @@ end
 
 Declare a nested refinement ladder over `domain`: a base level plus `depth`
 overlays, each spanning the whole domain at a per-axis multiple of the previous
-level's resolution. Every level nests over every level below it, so the default
-leaf semantics remove exactly the redundancy rather than deleting modes
-nothing replaces.
+level's resolution. Every level nests over every level below it, so leaf
+semantics remove exactly the redundancy rather than deleting modes nothing
+replaces.
 
 Every overlay is created with **no active cell**, so the declared stack carries
 the unknowns of the base level alone. Populate it with [`adapt`](@ref).
@@ -74,6 +74,11 @@ Keyword arguments:
     axes on the first overlay and only axis 1 on the second. A factor of `1`
     inherits the previous level's partition on that axis — it never means "one
     cell", which would destroy nesting.
+  - `tolerance` — the [`GeometryTolerance`](@ref) each overlay's placement is
+    checked against, and whose `merge` field is the floor `_ladder_counts`
+    holds a level's cell spacing above, so a `depth` that would collapse the
+    mesh coordinates raises here rather than at `prepare` time. Defaults to
+    `GeometryTolerance(T)`.
   - leaf semantics apply to every level of the ladder, and there is nothing to
     configure. On a nested stack the shed modes are exactly linearly dependent,
     so keeping them would give a singular operator rather than a more accurate
@@ -94,24 +99,50 @@ reduction exists — the coarse high-order modes contribute little in L² and ca
 the oscillation, so shedding them under a fine low-order overlay cut far-field
 oscillation and overshoot by roughly an order of magnitude on a tanh layer.
 
-`ladder` takes the constant-order default and leaves the trade to
-[`overlay`](@ref), which accepts a per-level order. Raising the order with depth
-is likewise sound and likewise an hp choice made there.
+`ladder` takes the constant-order default and leaves the trade to the verbs that
+exist for it: [`elevate`](@ref) rewrites the order of any level — or of named
+cells of it — on a stack that already exists, and [`refine`](@ref) makes the
+same choice per cell inside the adaptive loop. A hand-built stack can also set
+a per-level order at [`overlay`](@ref) time. Raising the order with depth is
+likewise sound and likewise an hp choice made there, not here.
 
 # Cost
 
 Every level spans the whole domain, which is what keeps all their grids mutually
-aligned and lets [`adapt`](@ref) address any level by cell index. The price is
-paid in `integration_plan`: its candidate grid is the `D`-fold product of the
-*finest* level's resolution and is independent of how few cells are active, so it
-is re-paid on every [`adapt`](@ref), not once at setup. Measured on an empty
-stack, base 8 in 2D: depth 3 → 1.5 ms, depth 4 → 7.4 ms, depth 5 → 37 ms per
-plan rebuild. In 3D at base 4 the wall arrives around `depth = 5`.
+aligned and lets [`adapt`](@ref) address any level by cell index. What that
+costs is paid in two places, and only one of them scales with `depth` on its
+own.
+
+`integration_plan` follows the **live** cells, not the declared resolution: the
+candidate grid is built from the element-boundary coordinates that bound an
+active cell, so an inert level contributes none at all and a level live on a few
+cells contributes a few. A declared but unpopulated ladder therefore costs what
+its base costs, whatever depth it carries. Measured at `-O0` on four threads as
+the minimum of seven rebuilds, base 8 in 2D with every overlay inert: 0.084 /
+0.107 / 0.139 / 0.165 ms per plan rebuild at depth 3 / 4 / 5 / 6,
+for 64 regions throughout — the base's own partition, while the finest level
+grows from 64² to 512². In 3D at base 4, 0.167 ms at depth 3 and 0.188 ms at
+depth 5.
+
+Populating it is what costs, and it costs in proportion to the refined region
+rather than to the stack. The live cells' coordinates cut the whole domain along
+each axis, so the candidate grid is the `D`-fold product of what they
+contribute. With one base cell refined to the bottom, base 8 in 2D: 0.24 / 0.94
+/ 3.8 / 17.6 ms at depth 3 / 4 / 5 / 6, for 127 / 319 / 1087 / 4159 regions; in
+3D at base 4, 1.8 ms at depth 3 and 164 ms at depth 5. That is re-paid on every
+[`adapt`](@ref), not once at setup, so a cycle that refines pays it per cycle.
+
+What does scale with `depth` regardless of activity is the per-level dense cell
+grid and its mask: every level spans the whole domain, so level `k` allocates
+`prod(counts[k])` cells whether or not any of them is live. At base 8 in 2D that
+is 22.4 million cells across a depth-9 stack, where [`adapt`](@ref) alone costs
+142 ms. `_ladder_counts` refuses a level above 1e9 cells for that reason.
 
 The finest cell is `domain / (cells .* prod(splits))`, so a feature needing a
 geometric grading of many orders of magnitude toward a point — a corner
-singularity — is still [`overlay`](@ref)'s job: a ladder would need a depth the
-candidate grid cannot afford.
+singularity — is still [`overlay`](@ref)'s job: a ladder would need a depth
+whose dense per-level grids do not fit, even though only a handful of their
+cells would ever be live.
 
 Note that `order` defaults to `1`, at which an overlay contributes only vertex
 functions and a small patch contributes none at all: every vertex of a one-cell
@@ -130,7 +161,6 @@ V = adapt(V, 4 => m)          # the finest level alone, live on a small patch
 """
 function ladder(domain::AxisBox{D,T}; cells, depth::Integer, splits=2, order=1,
                 basis=IntegratedLegendre(), mode::Symbol=:tensor, physical=nothing, active=nothing,
-
                 tolerance::GeometryTolerance{T}=GeometryTolerance(T)) where {D,T}
     depth >= 0 || throw(ArgumentError("ladder depth must be non-negative; got $depth"))
     base_cells = _axis_int_tuple(cells, Val(D), :cells)
@@ -199,7 +229,9 @@ and nothing more. It is not a witness that covered-mode pruning is lossless on `
 It is still the cheapest check that a hand-built [`overlay`](@ref) stack has the
 mesh alignment the reduction rule wants, which is the failure that is otherwise
 invisible. A [`ladder`](@ref) satisfies it by construction; [`move!`](@ref) can
-void it, and nothing re-checks.
+void it, and nothing re-checks. `diagnostics(model, solution).levels[k].nested`
+reports the same question per level, which is where a run records the answer
+without being asked.
 
 Note that it can be satisfied vacuously: a level whose box contains no interior
 node of the level below has nothing to match, so it passes.
@@ -318,9 +350,11 @@ end
 
 The structured shorthand for the pair form: replace every *overlay* level's mask
 with the one implied by a per-base-cell refinement depth, and leave the base
-level alone. It is literally `adapt(V, depth_masks(V, depths; grade)...)`, so it
-overwrites masks set by the pair form rather than merging with them, and a stack
-maintained per cell should not be edited through it.
+level alone. It is literally `adapt(V, Unfitted.depth_masks(V, depths; grade)...)`
+— that builder is internal and not exported, so the composition above is the
+spelling to reach for — and it therefore overwrites masks set by the pair form
+rather than merging with them, so a stack maintained per cell should not be
+edited through it.
 
 The base level is left alone because `depths` says nothing about it: a base cell
 at depth 0 is one that no overlay refines, not one the base itself drops. A base
@@ -329,7 +363,7 @@ survives this call.
 
 `grade` bounds how fast the depth may change between neighbouring base cells and
 applies to this form only. It defaults to `0`, meaning the array is applied
-verbatim; see `depth_masks` for what a positive value buys and costs.
+verbatim; see the internal `depth_masks` for what a positive value buys and costs.
 """
 function adapt(V::Space{D}, depths::AbstractArray{<:Integer,D}; grade::Int=0) where {D}
     eltype(depths) === Bool &&

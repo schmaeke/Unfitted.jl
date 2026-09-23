@@ -64,9 +64,10 @@ The method is described in
   flux-weighted); `couple` instantiates that kernel once per side pair,
   so the two-sidedness spans the four blocks. The package supplies the
   two-sided interface integration, never the constitutive choice.
-- **Covered-mode pruning on covered regions** (`prune_covered`, on by
-  default): every high-order mode whose entire incidence stencil is
-  covered by a finer level is eliminated, leaving the linear skeleton.
+- **Leaf semantics on covered regions**: a cell carries basis functions
+  only where no finer level has taken the region over. Every high-order
+  mode whose entire incidence stencil is covered by a finer level is
+  eliminated, leaving the linear skeleton.
   Elimination is per-mode rather than per-cell — a mode is shed only
   when every cell it touches is covered, so an edge or face mode
   straddling the boundary of the covered region survives — and a buried
@@ -79,7 +80,33 @@ The method is described in
   level, where it is what keeps a nested stack non-singular rather than
   an accuracy trade — the duplicate it removes is reproduced exactly by
   the level above. `diagnostics(model, solution).reduced_mode_counts`
-  reports the count per level, concatenated field-by-field.
+  reports the count per level, concatenated field-by-field. There is
+  nothing to configure: `prepare(problem; prune = false)` builds the
+  unreduced twin, which is a diagnostic — exactly singular on a nested
+  stack — rather than a discretisation to solve with.
+- **Per-cell polynomial order** (integrated Legendre only; any other
+  family raises rather than ignoring a non-uniform field): `space` and
+  `overlay` take `order` as an integer, an `NTuple{D,Int}`, an array
+  shaped like the level's cell grid, or a predicate
+  `(cell_box, cell_index) -> order`. `elevate(V, level => order)` and
+  `elevated(model, …)` change it afterwards — including
+  `CartesianIndex => order` pairs, the shape a marking loop produces —
+  and `cell_orders(V; level)` reads it back. Where two cells of
+  different order share a face the shared entity carries the minimum of
+  the two, which is what keeps the space C⁰.
+- **Nested refinement ladders**: `ladder(domain; cells, order, depth,
+  splits)` declares a stack of aligned levels that arrives inert, so
+  every level nests over every level below it by construction.
+  `adapt(V, level => mask, …)` or `adapt(V, depths; grade)` switches
+  cells on per level in one rebuild, `adapted(model, V)` prepares the
+  result, and `is_nested` / `overlapping_cells` query the stack.
+- **Automated hp adaptivity**: `estimate(model, u)` is a Bank–Weiser
+  indicator carrying a scale-free stopping quantity; `refine(V, est;
+  theta, previous)` marks by Dörfler and, given
+  `previous = (V_last, est_last)`, sends each marked cell to h or to p
+  by Melenk–Wohlmuth predicted error reduction — omit `previous` and
+  every marked cell takes p, falling back to h only where p is
+  unavailable; `coarsen` reverses both steps.
 - **D-generic core**: 1D, 2D, 3D, and 4D smoke-tested.
 
 ## Installation
@@ -193,9 +220,9 @@ a few minutes the first time.
 | `applications/time_integration/` | Transient heat conduction where Unfitted supplies `M`, `K` and `f` once and `OrdinaryDiffEq.jl` owns the time axis |
 | `applications/thermal_curing_2d/` | Irreversible thermal curing of a thermoset: the cure fraction is per-quadrature-point `QuadField` state, the conductivity depends on it (Picard per step), and the overlay activates on the cure front — with `RBFP0` carrying the state across every rebuild |
 
-### Reproductions — the paper's benchmarks
+### Reproductions — the scientific record
 
-| Sub-directory | What it reproduces |
+| Sub-directory | What it pins |
 |---|---|
 | `reproductions/laplace_unit_square_smooth/` | Smooth Laplace verification on the unit square |
 | `reproductions/singular_square_2d/` | 2D corner-singularity convergence with nested overlays |

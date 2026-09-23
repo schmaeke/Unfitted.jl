@@ -284,12 +284,12 @@ end
 """
     CellOrders{D}
 
-Per-cell polynomial order of a [`Level`](@ref), together with the local basis
-index set each cell actually generates under the hp-FEM *minimum rule*.
+The per-cell polynomial order of a [`Level`](@ref), as a palette of the distinct
+orders plus one palette index per cell.
 
-A level whose order is one tuple for every cell carries `nothing` here — that is
-the representation this type extends, not one it replaces, and it stays the
-allocation-free hot path. Fields:
+A level whose order is one tuple for every cell carries a palette of one entry —
+the same representation, so the uniform case has no second code path and the
+lookup stays allocation-free. Fields:
 
   - `palette::Vector{NTuple{D,Int}}` — the distinct per-axis orders occurring on
     the level, in first-occurrence order. Stored as a palette rather than a dense
@@ -301,20 +301,20 @@ allocation-free hot path. Fields:
     (an 8³ grid admits 512), so the index is wide enough that the cap is not a
     shape a real p-field runs into; the normaliser still rejects rather than
     wraps.
-  - `locals::Array{Vector{CartesianIndex{D}},D}` — per cell, the multi-indices of
-    the local basis functions that cell generates, in the canonical
-    [`local_basis_indices`](@ref) order. This is *not* `local_basis_indices` at
-    the cell's own order: the minimum rule removes the shared-entity modes a
-    lower-order neighbour cannot match, and the surviving set is in general not a
-    tensor product of per-axis ranges. Cells carrying the same set share one
-    vector. Inactive cells carry an empty vector.
+  - `nominal::NTuple{D,Int}` — the per-axis maximum over `palette`, computed once
+    at construction and read through [`nominal_order`](@ref). It sizes buffers
+    and 1D factor tables, where over-sizing is safe; it is not the question
+    anything that integrates, evaluates or subdivides should ask. That one is
+    [`cell_order`](@ref).
 
-The `locals` table is what makes the space C⁰. Every consumer that pairs a cell's
-raw dof ids with its local basis functions positionally — the dof walk, the
-assembly and transfer workspaces, the Dirichlet boundary trace, field evaluation
-— must read this one table, because the pairing is the only link between the dof
-layer and the basis layer and nothing checks it at runtime. Go through
-[`cell_basis_indices`](@ref) rather than re-deriving the set.
+This record is what the caller asked for, and it depends on nothing else — not
+on the mask, not on the basis mode. The index sets those orders actually
+generate, once the minimum rule has trimmed the modes a shared entity cannot
+carry, live in [`CellModes`](@ref), which `Level`'s inner constructor derives
+from this record together with the mesh, the mode and the mask. `CellModes` is
+what makes the space C⁰, and it is the table every positional pairing of raw
+dofs with basis values must read; go through [`cell_basis_indices`](@ref)
+rather than re-deriving the set.
 """
 struct CellOrders{D}
     palette::Vector{NTuple{D,Int}}
@@ -386,9 +386,11 @@ function _cell_modes(basis::BasisFamily, orders::CellOrders{D}, mesh::CartesianM
 end
 
 # Translate a user-supplied `order` specification into either an `NTuple{D,Int}`
-# (uniform — today's representation, and the one the hot path keeps) or a dense
-# `Array{NTuple{D,Int},D}` of per-cell orders. Accepted shapes, dispatched on
-# type and deliberately parallel to `_normalize_mask`:
+# (uniform) or a flat `Vector{NTuple{D,Int}}` of per-cell orders in
+# `cell_indices` order. Both are intermediate forms: `_build_cell_orders` folds
+# the first into a palette of one entry and the second into a palette of its
+# distinct entries, so neither shape survives into a `Level`. Accepted shapes,
+# dispatched on type and deliberately parallel to `_normalize_mask`:
 #
 #   * `Integer`                                 — isotropic, uniform.
 #   * `NTuple{D,Integer}`                       — anisotropic, uniform.
@@ -709,10 +711,11 @@ function physical_basis_gradients(level::Level{D}, cell::CartesianIndex{D}, cell
     return gradients
 end
 
-# The per-cell minimum-rule table of a level, or `nothing` when the level is
-# uniform and every cell shares the level-wide index list. Assembly and transfer
-# workspaces bank this per level id so a hot loop pays one `=== nothing` branch
-# instead of a per-cell lookup on the common path.
+# The per-cell minimum-rule table of a level: one `CellModes` always, a palette
+# of one set on a uniform level. Assembly and transfer workspaces bank it per
+# level id so a hot loop reads `sets[kind[cell]]` — two array reads, no branch
+# and no per-cell derivation — and so that the table they pair raw dofs against
+# is literally the one `_build_cell_dofs!` walked.
 _cell_locals(level::Level) = level.modes
 
 """
@@ -905,8 +908,7 @@ end
 
 """
     space(domain::AxisBox; cells, order=1, basis=IntegratedLegendre(),
-                          mode=:tensor, active=nothing, physical=nothing,
-                          )
+                          mode=:tensor, active=nothing, physical=nothing) -> Space
 
 Build the base discretization of a [`Space`](@ref) over `domain`. The
 resulting space has one base level (`role = :base`, `id = 1`); add overlay
@@ -968,58 +970,55 @@ Keyword arguments:
     call raises `ArgumentError` for a family that declares
     `_supports_physical_domain` false. Both shipped families declare it
     true.
-  **Leaf semantics.** A cell carries basis functions only where it is a
-  *leaf* — where no finer level has taken the region over. A covered cell
-  is the parent of a leaf, and a parent carries no unknowns where its
-  children do. There is nothing to configure here: it is what makes
-  superposition equivalent to ordinary refinement, in which h-refining a
-  cell *replaces* it rather than adding to it. [`prepare`](@ref)`(problem;
-  prune = false)` builds the unreduced twin as a diagnostic — a space that
-  keeps every covered mode, and is exactly singular on a nested stack.
 
-  Concretely a level sheds a mode wherever a *single* finer level has
-  taken over the region that mode lives on. On an integrated Legendre
-  level there are two eliminations, both per-mode rather than per-cell,
-  and both asking first that the mode be *buried* — every cell it is
-  incident to covered by one finer level:
+# Leaf semantics
 
-      * a buried **high-order** mode (one with at least one bubble axis)
-        is dropped, so a fully covered cell keeps only its linear
-        skeleton. An edge or face mode straddling the boundary of the
-        covered region survives, because its own stencil is not buried.
-      * a buried **linear** mode is dropped when one finer level
-        reproduces it exactly, which takes both halves of a test: that
-        level's mesh must refine this one's (`_nested_over` in
-        `src/coverage.jl`) *and* its basis must span that mesh's hats
-        (`_spans_hats` in `src/dofs.jl`). A buried vertex function is a
-        C⁰ hat, and a basis smoother than C⁰ across its own cell
-        boundaries — a B-spline of degree ≥ 2 — carries nothing that
-        reproduces the kink.
+A cell carries basis functions only where it is a *leaf* — where no finer level
+has taken the region over. A covered cell is the parent of a leaf, and a parent
+carries no unknowns where its children do. There is nothing to configure: it is
+what makes superposition equivalent to ordinary refinement, in which h-refining
+a cell *replaces* it rather than adding to it. [`prepare`](@ref)`(problem;
+prune = false)` builds the unreduced twin as a diagnostic — a space that keeps
+every covered mode, and that is exactly singular on a nested stack.
 
-  Leaving a covered mode active makes the superposed operator singular,
-  because it and the covering level's reproduction of it are linearly
-  dependent: 169 to 1378 null directions were measured on nested ladders
-  with the rule switched off.
+Concretely a level sheds a mode wherever a *single* finer level has taken over
+the region that mode lives on. On an integrated Legendre level there are two
+eliminations, both per-mode rather than per-cell, and both asking first that the
+mode be *buried* — every cell it is incident to covered by one finer level:
 
-  The high-order half does not require the covering level to reproduce
-  what it displaces, and that is deliberate rather than an oversight. It
-  is what lets a low-order cover sit under a high-order base and behave
-  the way small low-order elements behave near a singularity in any hp
-  code: the covered region is then resolved at the cover's order, which
-  is what asking for a low-order cover *means*. Once the cover carries at
-  least the base's order the elimination is exactly lossless — measured,
-  the reduced and unreduced errors agree to every printed digit from
-  cover order 4 upward under a p=5 base.
+  * a buried **high-order** mode (one with at least one bubble axis) is dropped,
+    so a fully covered cell keeps only its linear skeleton. An edge or face mode
+    straddling the boundary of the covered region survives, because its own
+    stencil is not buried.
+  * a buried **linear** mode is dropped when one finer level reproduces it
+    exactly, which takes both halves of a test: that level's mesh must refine
+    this one's (`_nested_over` in `src/coverage.jl`) *and* its basis must span
+    that mesh's hats (`_spans_hats` in `src/dofs.jl`). A buried vertex function
+    is a C⁰ hat, and a basis smoother than C⁰ across its own cell boundaries — a
+    B-spline of degree ≥ 2 — carries nothing that reproduces the kink.
 
-    A B-spline level has no bubble/skeleton split and so has only the
-    second elimination: a buried function is dropped exactly when a nested
-    level above reproduces it, which for that family is not an accuracy
-    trade at all but the thing that keeps a nested stack non-singular —
-    see `bspline` in the `BasicBSpline` extension. Any further family
-    takes the generic `_coverage_constraints` fallback, which returns no
-    constraints, so on such a space the rule is a no-op. See
-    `src/coverage.jl` and `_coverage_constraints` in `src/dofs.jl`;
-    `diagnostics(...).reduced_mode_counts` reports the per-level count.
+Leaving a covered mode active makes the superposed operator singular, because it
+and the covering level's reproduction of it are linearly dependent: 169 to 1378
+null directions were measured on nested ladders with the rule switched off.
+
+The high-order half does not require the covering level to reproduce what it
+displaces, and that is deliberate rather than an oversight. It is what lets a
+low-order cover sit under a high-order base and behave the way small low-order
+elements behave near a singularity in any hp code: the covered region is then
+resolved at the cover's order, which is what asking for a low-order cover
+*means*. Once the cover carries at least the base's order the elimination is
+exactly lossless — measured, the reduced and unreduced errors agree to every
+printed digit from cover order 4 upward under a p=5 base.
+
+A B-spline level has no bubble/skeleton split and so has only the second
+elimination: a buried function is dropped exactly when a nested level above
+reproduces it, which for that family is not an accuracy trade at all but the
+thing that keeps a nested stack non-singular — see `bspline` in the
+`BasicBSpline` extension. Any further family takes the generic
+`_coverage_constraints` fallback, which returns no constraints, so on such a
+space leaf semantics eliminate nothing. See `src/coverage.jl` and
+`_coverage_constraints` in `src/dofs.jl`;
+`diagnostics(...).reduced_mode_counts` reports the per-level count.
 """
 function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(),
                mode::Symbol=:tensor, active=nothing, physical=nothing) where {D,T}
@@ -1052,9 +1051,12 @@ and possibly `order`. Keyword arguments:
   - `tolerance` — slack on the inside-domain check.
   - `active` — optional per-cell mask, same shapes as [`space`](@ref)'s
     `active`.
-  Leaf semantics apply to this overlay exactly as to any level: where it
-  is itself covered by something finer it carries no unknowns, and where
-  it covers the level below, that level carries none. See [`space`](@ref).
+
+Leaf semantics apply to this overlay exactly as to any level, and there is no
+keyword for them here either: where the overlay is itself covered by something
+finer it carries no unknowns, and where it covers the level below, that level
+carries none. See [`space`](@ref) for the rule and [`prepare`](@ref)'s `prune`
+for the unreduced twin it is measured against.
 
 The new level's `id` is `length(V.levels) + 1`. Overlay placement is
 independent of any existing overlay: overlay boundaries need not coincide
@@ -1227,8 +1229,9 @@ end
 Return `V` with the named levels' polynomial orders replaced. Meshes, level
 boxes, activation masks and basis families are untouched, so the result has the
 *same type* as `V` and a model rebuilt from it does not recompile the assembly
-pipeline — the per-cell order lives in a `CellOrders` field, not in a type
-parameter.
+pipeline — the per-cell order lives in a `CellOrders` field whose palette length
+is a value rather than a type parameter, so a p-step never changes
+`typeof(V)`.
 
 `order` takes every shape [`space`](@ref)'s `order` keyword takes — an integer,
 an `NTuple{D,Int}`, an array of either shaped like the level's cell grid, or a
@@ -1243,7 +1246,7 @@ sense against an existing level:
     does not name.
 
 Where two cells of different order share a face, the shared entity carries the
-minimum of the two orders; see [`CellOrders`](@ref) for why that is what keeps
+minimum of the two orders; see [`CellModes`](@ref) for why that is what keeps
 the space C⁰, and [`space`](@ref) for the per-cell `order ≥ 1` and
 basis-family requirements, which are checked here too.
 

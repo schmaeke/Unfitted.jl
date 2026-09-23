@@ -141,21 +141,22 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `geometry.jl`     | D-dimensional axis-aligned boxes, coordinate maps, tolerances |
 | `physical.jl`     | CSG level-set tree, `PhysicalDomain`, three-valued cell classifier |
 | `implicit.jl`     | Saye dimension-reduction implicit quadrature on the level set (volume rules) |
-| `basis.jl`        | basis-family interface, integrated Legendre default, tensor-product evaluation |
+| `basis.jl`        | basis-family interface and capability traits, integrated Legendre default, the `:tensor` / `:trunk` index sets and the `_index_admissible` filter the minimum rule is expressed over, tensor-product evaluation |
 | `fcm.jl`          | finite-cell-method cut-cell quadrature: exact moments from `implicit.jl`, non-negative (NNLS) moment fit |
-| `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks |
+| `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks (`LevelMask`) and per-cell polynomial order (`CellOrders` / `CellModes`); the `space` / `overlay` / `adapt` / `elevate` verbs |
 | `intersections.jl`| admissible integration regions for non-matching meshes; cut/fictitious region-quadrature dispatch |
 | `coverage.jl`     | per-level covered-cell masks (`Coverage`, `build_coverage`); the mask-aware, fictitious-fold-aware covering rule behind covered-mode pruning |
-| `ladder.jl`       | nested refinement ladders: `ladder` declaration, per-level activation via `adapt`, cross-level cell mapping, the `is_nested` predicate |
-| `dofs.jl`         | dof layout, raw/active enumeration, overlay/boundary-constraint detection |
+| `ladder.jl`       | nested refinement ladders: `ladder` declaration, the depth-map form of `adapt` and the `depth_masks` grading behind it, cross-level cell mapping (`overlapping_cells`), the `is_nested` predicate |
+| `dofs.jl`         | dof layout, raw/active enumeration, overlay/boundary-constraint detection, the hp minimum rule across an order jump, and the leaf-semantics eliminations (`_coverage_constraints`) |
 | `dirichlet.jl`    | physical Dirichlet conditions and boundary selectors, the per-key boundary-face detection `dof_layout` eliminates on, codim-K facet regions and quadrature, and the L² boundary projection for nonzero data |
 | `surface.jl`      | immersed-boundary surface meshes (`BoundaryMesh`) and surface-region integration |
 | `problems.jl`     | `Field`, weak-form channels and blocks (`BlockForm`/`LoadForm`/`WeakForm`), `Problem` |
 | `coupling.jl`     | multi-domain interface coupling: the `Interface` `on=` tag, two-sided `InterfaceRegion` construction, `InterfaceForm`, and the four-block `couple` jump expansion |
-| `model.jl`        | `Model` lifecycle: `prepare`, `move!`/`activate!`/`deactivate!`, diagnostics |
+| `model.jl`        | `Model` lifecycle: `prepare`, `move!`/`moved`, `activate!`/`deactivate!`, the non-mutating `adapted` / `elevated` rebuilds, `active_cells` / `cell_orders` on a model, the discretisation pin, diagnostics |
 | `assembly.jl`     | coupled Galerkin assembly: channel calculus, cached symbolic-scatter (Gustavson) pattern, serial scatter + two-phase compute→gather threaded path |
 | `solvers.jl`      | `Solution` / `SolverDiagnostics`, the default direct sparse solve, and the `linear_solver` hook for external Krylov or preconditioned solvers |
 | `projection.jl`   | variational and rewire-based state transfer between models  |
+| `adaptivity.jl`   | automated hp adaptivity: `estimate` (Bank–Weiser indicator), Dörfler marking, the h-versus-p decision by Melenk–Wohlmuth predicted error reduction, `refine` and `coarsen` |
 | `data.jl`         | per-quadrature-point `QuadField` + RBF transfer             |
 | `postprocessing.jl` | VTK export, L² error, field/gradient evaluation           |
 | `api.jl`          | thin public-API wrappers (mass, stiffness, poisson, neumann, …) |
@@ -379,8 +380,8 @@ carries its own mesh, basis family, polynomial/order metadata, and dofs.
 Overlay levels are positioned independently of lower levels: overlay
 boundaries need not coincide with lower-level element boundaries, and
 overlays are never topologically merged with their parents. The package
-does, however, carry an *pruning* rule for redundancy: with
-leaf semantics, which are unconditional and have no keyword, every
+does, however, carry a pruning rule for redundancy. Under *leaf
+semantics*, which are unconditional and have no keyword, every
 high-order mode whose entire incidence stencil is covered by a finer
 level is eliminated, leaving the linear skeleton. Elimination is
 per-mode, not per-cell: a mode is shed only when *every* cell it is
@@ -399,8 +400,10 @@ the one a covering level reproduces exactly — and eliminating it is not
 an accuracy trade but the thing that keeps a nested B-spline stack
 non-singular, since the two copies are linearly dependent. Any further
 family hits the generic fallback that returns an empty constraint list,
-while leaf semantics still apply, so on such a space the
-default is on and does nothing. See `src/coverage.jl` and
+so on such a space leaf semantics eliminate nothing. `prepare(problem;
+prune = false)` is the one way to build a space's unreduced twin; it is
+a diagnostic — exactly singular on a nested stack — rather than a
+discretisation to solve with. See `src/coverage.jl` and
 `_coverage_constraints` in `src/dofs.jl`;
 `diagnostics(...).reduced_mode_counts` reports the count per level,
 concatenated field-by-field (one entry per level of each field, in
@@ -445,8 +448,13 @@ formula such as `(p + 1)^D` outside integrated Legendre basis code.
 For non-matching axis-aligned meshes, admissible integration boxes are
 constructed as follows:
 
-  1. For each coordinate direction, collect all element-boundary
-     coordinates from the participating meshes.
+  1. For each coordinate direction, collect the element-boundary
+     coordinates of the participating meshes that bound an *active* cell
+     of their own level — all of them on an unmasked level. A coordinate
+     no level keeps separates two slabs carrying the same coverage
+     signature, which step 5 would merge again, so dropping it costs
+     neither a region nor any exactness, and the candidate grid then
+     follows the live cells rather than the declared resolution.
   2. Sort and merge coordinates closer than the geometry tolerance.
   3. Form non-degenerate intervals between adjacent coordinates.
   4. Take the Cartesian product of intervals to form candidate boxes.
@@ -498,6 +506,21 @@ When overlay positions change:
     projection or an energy projection), not by pointwise interpolation;
   - test projection on constants, low-order polynomials, and fields
     represented exactly in both spaces.
+
+**Requirement not yet met:** on an immersed model — a space carrying a
+`PhysicalDomain` — there is no state transfer across an h-refinement or an
+h-release. `L2Projection` refuses any target carrying a physical domain
+outright, and `Rewire` refuses a target whose active basis does not contain
+the source's, which is what leaf semantics make of a refinement and what a
+release makes of a cover. An adaptive or transient loop on an immersed model
+therefore re-solves on the new space rather than carrying its iterate across,
+and `estimate` needs that fresh solve before it can be called again. The
+restriction is specific to the h-step: a pure **p**-step buries nothing, so
+`Rewire` accepts it — measured on the unit square minus a centred disc, an
+8×8 order-2 base raised to order 3 on two leaf cells (216 → 223 unknowns)
+transferred with the evaluated field unchanged to the last bit at four
+interior points. `test_adaptivity.jl` pins both refusals so neither can decay
+into silently dropped coefficients.
 
 ### Small overlaps and conditioning
 
@@ -564,9 +587,14 @@ masks, or intersection-region internals.
   - 1D bar-style problems with point loads or discontinuous
     coefficients and sources.
   - Adding centered or explicitly positioned overlay boxes with
-    per-level order choices.
+    per-level order choices, and grading the polynomial order from cell
+    to cell within one level.
+  - Declaring a nested refinement ladder up front and switching its
+    cells on per level as the solution develops.
   - Selectively activating or deactivating individual overlay cells as
     a feature evolves in time.
+  - Handing the refinement decision to the solver: estimate, mark,
+    refine, coarsen, with the loop itself left to the caller.
   - Attaching an immersed physical domain via a level-set function and
     integrating only over `Ω`.
   - Moving an overlay and rebuilding only the affected geometry and
@@ -608,8 +636,22 @@ features evolve.
     An outstanding `Solution` raises on stale reuse. Like `move!`, they
     address a level by position in the model's single space and
     therefore raise `ArgumentError` on a multi-domain (coupled) model.
-  - **Query**: `active_cells(model; level)` returns a copy of the
-    level's `BitArray` (or an all-true array for unmasked levels).
+  - **Query**: `active_cells(V::Space; level)` returns a copy of the
+    level's `BitArray` (an all-true array for an unmasked level), and
+    `active_cells(model; level, effective = true)` does the same on a
+    prepared model.
+  - **The pre-fold mask is the one a caller writes to.** On a space
+    carrying a `PhysicalDomain` there are two masks per level: the one
+    the caller asked for, on `model.prefold_space`, and the *effective*
+    one the fictitious fold wrote over it. The mutators, `adapt`,
+    `adapted` and `elevated` all derive from the pre-fold space, because
+    a rebuild must re-decide the fold rather than inherit it. The model
+    query defaults to `effective = true` and therefore does **not**
+    round-trip: feeding its result back to `adapt` launders the fold into
+    user intent, the cells the geometry switched off are recorded as
+    cells the caller excluded, and the next fold cannot undo that. Read
+    back with `effective = false` when the mask is going to be written
+    again.
   - **Dof layer treatment**: a face between an active and an inactive
     cell of the same level is an artificial overlay constraint, analogous
     to a mesh-box-face constraint — unless every inactive cell across it
@@ -648,21 +690,38 @@ per-cell degree on a shared knot vector names no set of functions.
     per-axis order of every cell as a fresh array, all-equal on a uniform
     level.
   - **The minimum rule.** Where two cells of different order share a face,
-    the shared entity carries the *minimum* of the two orders (Szabó–Babuška;
-    Demkowicz). Without it a mode generated by only the high-order side is
-    nonzero on the shared face and the space is not C⁰ — and it still
-    assembles, still solves, and still returns a plausible residual. The rule
-    is a predicate on the dof *key*, evaluated as membership of the key's own
-    multi-index in the family's index set at the componentwise minimum over
-    the key's **active** incident cells. Three details are load-bearing: it
-    must be keyed on the key (so both sides agree by construction), it must
-    be a set membership rather than a per-axis mode comparison (they differ
-    in 3D under `:trunk`), and inactive incident cells must be skipped rather
-    than minimised over (a fictitious fold otherwise loses live dofs).
-  - **`Level.order` is the nominal (maximum) order.** Quadrature rules,
-    moment-fit orders and 1D factor buffers are sized from it and stay
-    correct, because over-integrating is safe. `Level.orders` carries the
-    per-cell field.
+    the shared entity carries the *minimum* of the two orders (the minimum
+    rule of Szabó & Babuška 1991 and Demkowicz 2006; full citations in
+    `src/basis.jl` and `src/dofs.jl`). Without it a mode generated by only
+    the high-order side is nonzero on the shared face and the space is not
+    C⁰ — and it still assembles, still solves, and still returns a plausible
+    residual. The rule is a predicate on the dof *key*: the key's own
+    multi-index must belong to the family's index set at the order of every
+    **active** cell incident to it. That intersection is the classical
+    componentwise-minimum statement, because the family's index-set filter
+    (`_index_admissible`) is monotone non-decreasing in the order, and it is
+    the better spelling because the minimum is then never formed and no
+    question is ever asked at an order no cell carries. Three details are
+    load-bearing: it must be keyed on the key (so both sides agree by
+    construction), it must be a set membership rather than a per-axis mode
+    comparison (they differ in 3D under `:trunk`), and inactive incident
+    cells must be skipped rather than minimised over (a fictitious fold
+    otherwise loses live dofs).
+  - **One order field, two readers.** `Level.orders` is a `CellOrders` — a
+    palette of the distinct per-axis orders plus one index per cell, so a
+    uniform level is a palette of one and not a special case.
+    `cell_order(level, cell)` is the question anything that integrates,
+    evaluates or subdivides must ask, and every quadrature consumer does:
+    the region rule, the moment-fit order, the facet rule and the VTK
+    subdivision all size from the parent *cell*. `nominal_order(level)` is
+    the per-axis maximum over the palette, and it is a sizing and default
+    quantity — workspace banks and 1D factor buffers, where over-sizing is
+    safe; `_surface_quadrature_order`, which sizes one table of rules for
+    regions that no single parent cell owns and says so; and the order a
+    new `overlay` or a re-instantiated basis family inherits. `Level.modes`
+    is the derived minimum-rule table (`CellModes`), computed by `Level`'s
+    inner constructor from the orders, the mesh, the mode and the mask, and
+    never supplied by a caller.
   - **Order ≥ 1 per cell** is enforced per palette entry at construction, and
     `mode = :trunk` requires isotropy per cell. Neither can be expressed by
     the minimum rule: the dof key collapses the two endpoint modes into one
@@ -672,6 +731,84 @@ per-cell degree on a shared knot vector names no set of functions.
     rate does *not* discriminate — a non-conforming space is strictly larger
     and its projection error is marginally lower — and the solution's own jump
     norm decays under h-refinement even when the space is broken.
+
+### Automated hp adaptivity
+
+Where to refine can be left to the solver. Three verbs do it, the caller owns
+the loop, and nothing in `src/adaptivity.jl` holds state between cycles.
+
+  - **`estimate(model, solution; enrichment = 1)`** returns an `ErrorEstimate`:
+    a per-level, per-cell indicator `cells`, a scalar `total`, a `reference`
+    against which `total / reference` is a scale-free stopping quantity, and a
+    `consistency` ratio — a free data-oscillation and solve check, *not* a
+    saturation signal, and its docstring says why. `total / reference` is
+    scale-free on one problem but is not comparable across different Dirichlet
+    data, because a nonzero lift's own energy is never formed.
+    The indicator is Bank–Weiser — build the order-elevated
+    space `V⁺`, inject the solution into it, and read the residual in the
+    directions `V` cannot represent, through the diagonal of the enriched
+    operator:
+
+    ```text
+    η²_K = Σ_{j ∈ W(K)} R_j² / A⁺_jj ,   R = b⁺ − A⁺ u⁺ ,   W = V⁺ ⊖ V
+    ```
+
+    `W` is a set difference on dof *keys*, not a comparison of mode indices:
+    the two disagree at an anisotropic order. Every complement mode is shared
+    equally among the cells incident to it. The form must be **coercive**, since
+    the diagonal is read as a mode's energy, and the family's dof keys must
+    survive an order increase naming the same functions — the property
+    `_supports_cell_order` states, and the reason a B-spline level is refused
+    here rather than being given a plausible number.
+
+    > R. E. Bank, A. Weiser, *Some a posteriori error estimators for elliptic
+    > partial differential equations*, Math. Comp. **44** (1985) 283–301.
+    > [doi:10.1090/S0025-5718-1985-0777265-X](https://doi.org/10.1090/S0025-5718-1985-0777265-X).
+
+  - **`refine(V, est; theta = 0.5, pmax = 8, previous = nothing)`** marks by
+    Dörfler — the smallest set of cells carrying `theta` of the total squared
+    indicator — and then sends each marked cell to h or to p. `theta` is the
+    loop's only tunable. The two halves are public as `mark_cells` and
+    `decide`, and `refine`'s loop form is their composition.
+
+    > W. Dörfler, *A convergent adaptive algorithm for Poisson's equation*,
+    > SIAM J. Numer. Anal. **33** (1996) 1106–1124.
+    > [doi:10.1137/0733054](https://doi.org/10.1137/0733054).
+
+  - **The h-versus-p decision is predicted error reduction**, not a smoothness
+    indicator. Each cycle predicts what a cell's indicator ought to become if
+    the solution there is as smooth as the step just taken assumed; the next
+    cycle compares, and a cell that met its prediction takes p again while one
+    that fell short takes h. `previous = (V_last, est_last)` is the only state
+    the rule needs — a p-step shows up as a raised order and an h-step as a
+    cell that was not active before — so nothing is stored between cycles.
+    Omit `previous` and every marked cell takes p, which is right for the first
+    cycle and wrong thereafter. The constants γ_p² = 0.4 and γ_h² = 4 are the
+    literature's calibration and are deliberately not exposed.
+
+    > J. M. Melenk, B. I. Wohlmuth, *On residual-based a posteriori error
+    > estimation in hp-FEM*, Adv. Comput. Math. **15** (2001) 311–331.
+    > [doi:10.1023/A:1014268310921](https://doi.org/10.1023/A:1014268310921).
+
+    A coefficient-decay smoothness indicator was implemented as specified and
+    removed: σ > 1 is an asymptotic statement about a spectral tail, and this
+    loop reads it at orders 1–3 where it has nothing to say. `src/adaptivity.jl`'s
+    header records that measurement, the comparison against deal.II's step-27,
+    and why the two steps are kept independent rather than welded to depth.
+
+  - **`coarsen(V; h, p, pmin = 1)`** is the inverse of both steps: it releases
+    an h-step by deactivating the cover it woke, and a p-step by lowering the
+    order, bounded below by `pmin`. There is deliberately no
+    `coarsen(V, estimate)` form — which cells to release is not settled by the
+    indicator — so the caller marks.
+
+The loop's restrictions, all of them checked rather than assumed: a
+single-domain model; every level on a family declaring `_supports_cell_order`,
+because the decision and the enrichment both rest on a per-cell order; a
+coercive form; an assembled model; `enrichment ≥ 1`; and no form keyed by
+quadrature-point index, which the enriched twin would read on a different
+cloud. On an immersed model the h-step has no state transfer — see *Moving
+overlays and state transfer*.
 
 ### Immersed boundary (finite cell method)
 
@@ -794,7 +931,13 @@ indicator representations are intentionally not supported.
     fictitious cell drop). The same report also carries
     `reduced_mode_counts` (covered-mode pruning), `dimension`,
     `integration_regions`, `facet_region_count`, `surface_region_count`,
-    `interface_region_count`, `raw_dofs`, `active_unknowns`, `levels`,
+    `interface_region_count`, `raw_dofs`, `active_unknowns`, `levels`
+    (one entry per level with `id`, `role`, `cells`, `order` — the nominal
+    per-axis maximum — `order_palette`, the distinct per-cell orders,
+    `mode`, `basis`, `domain`, and `nested`, whether every higher level's
+    nodes coincide with this level's where they overlap: the geometric half
+    of what makes leaf semantics lossless, reported per level because
+    `move!` can void it silently),
     `small_overlap_count` / `small_overlaps`, `min_integration_volume`,
     `min_relative_integration_volume`, `symmetry_residual`,
     `condition_estimate`, `solver`, `residual_norm`, and `l2_error`
@@ -1141,10 +1284,61 @@ demos.
     `test_coverage_reduction.jl` builds a masked overlay; the fully
     deactivated case is pinned indirectly by test_activation.jl's
     "fully-deactivated overlay equals no overlay", which compares
-    active-unknown counts against an overlay-free space.
+    active-unknown counts against an overlay-free space; masked coverage
+    under a ladder — split cover retained, single cover shed, lossless by
+    rank against the unreduced twin — is pinned in `test_ladder.jl`
+    ("covered-mode pruning on a ladder is lossless", with the rank witness).
+  - Per-cell polynomial order: C⁰ conformity across an order jump, asserted
+    as a per-basis-function one-sided trace jump `== 0`; the minimum rule's
+    shape, and its set-membership form under `:trunk` where a per-axis
+    comparison disagrees; inactive incident cells never lowering a shared
+    entity; the `elevate` / `cell_orders` round trip as an identity; the
+    intersection form reproducing the componentwise-minimum form cell for
+    cell, and the index-set filter's monotonicity in the order; refusal of a
+    non-uniform field — through `space` and through `elevate` — on a family
+    that does not declare `_supports_cell_order` (`test_basis_bspline.jl`);
+    and the graded-kernel golden digest (`test_graded_golden.jl`).
+    **Requirement not yet met:** no example teaches the feature. `elevate`
+    and `elevated` occur nowhere under `examples/`, no example passes an
+    array or a predicate to `space(...; order=)`, and the tutorial sequence
+    goes from the ladder straight to the automated loop, which spends the
+    order without ever showing the manual verb it is built on. A reader who
+    wants a graded space has this guide and the tests and no runnable
+    demonstration.
+  - Nested refinement ladders: `ladder` nests by construction; losslessness
+    witnessed by `size(gram(V), 1) == rank(gram(V; prune = false))` with a
+    non-nested negative control; `overlapping_cells` in both directions and
+    under an anisotropic split; both forms of `adapt` — the `level => mask`
+    pairs and the per-base-cell depth map, with grading; `adapted` keeping
+    the source model intact and reusing the moment-fit cache.
+  - Automated hp adaptivity: `estimate`'s effectivity bounded over a range of
+    unknowns, and its refusals — a family whose keys are not order-stable
+    (B-splines), an unassembled model, `enrichment = 0`; the h- and p-steps
+    landing on the levels and cells they claim; the guards that bypass the
+    h/p decision (no step available, not a leaf, already at `pmax`); a cell
+    keeping p only when it met its prediction; `coarsen` as the exact inverse
+    of both steps and its refusal on a covered cell; Dörfler marking monotone
+    in θ with group completion; and the loop reducing both the error and the
+    estimate, with one cycle of the full `previous`-threaded decision running
+    unchanged in 1D, 2D and 3D.
   - Package extensions: the B-spline family's basis values, constraints
-    and a small assembly; the MeshIO signed-distance leaf; the Tensors
-    notation round-trip.
+    and a small assembly; its refusal of a per-cell order through both
+    `space` and `elevate`; the dedup that keeps a nested B-spline stack
+    non-singular, including the mixed-family direction where a degree-1
+    cover spans an integrated-Legendre level's hats; the MeshIO
+    signed-distance leaf; the Tensors notation round-trip.
+    **Requirement not yet met:** one fold configuration is still left
+    singular and is pinned `@test_broken` in `test_basis_bspline.jl`. Where
+    a B-spline overlay's box face falls on a knot of the level below inside
+    a band of cut cells, the clamped overlay reproduces a *combination* of
+    two buried functions without reproducing either on its own, and a dedup
+    keyed on single buried functions cannot see it; the operator keeps one
+    exact null mode per such combination. The repair is a per-face rank
+    repair — of the `p` buried functions straddling the face knot with the
+    same perpendicular factor, keep the `m + 1` trace orders and strongly
+    eliminate the rest — which changes what the dedup may eliminate rather
+    than the burial test. Until it lands, move the overlay's face off the
+    cut-cell band or break the nesting.
   - Example smoke suite: every `examples/<tier>/<name>/<name>.jl`
     script runs to a clean exit at a coarse size in the default suite,
     with a finite, sane headline metric wherever the script prints one,
@@ -1152,7 +1346,7 @@ demos.
     runs. Where a tutorial's *prose* tells the reader what to look for
     in the output, that claim is asserted too — the overlay's
     order-of-magnitude improvement over the base level, the agreement
-    between a reduced and an unreduced stack, the fifteen orders of
+    between a reduced and an unreduced stack, the fourteen orders of
     magnitude of conditioning that one duplicated B-spline mode costs —
     so a tutorial whose text and output disagree fails here. The cases
     share one batched subprocess (`test/run_examples_child.jl`), each

@@ -125,9 +125,10 @@ A B-spline overlay of the same degree whose cell boundaries include the
 base's reproduces, exactly, every base function buried underneath it — so
 the two levels carry the same function twice and the superposed operator is
 exactly singular. Nesting is the natural thing to reach for, so the family
-handles it: `prune_covered` (`true` by default on both [`space`](@ref) and
-[`overlay`](@ref)) eliminates the duplicate. That costs nothing here — the
-discrete space is unchanged, unlike integrated Legendre's covered-mode pruning,
+answers for it: leaf semantics are unconditional on every level and there is no
+keyword to reach for, and they eliminate the duplicate everywhere but the one
+fold configuration named below. That costs nothing here — the discrete space is
+unchanged, unlike integrated Legendre's shedding of buried high-order modes,
 which trades accuracy for dofs. A `:tensor` integrated-Legendre overlay of
 order ≥ the base degree reproduces the same functions and is deduped the
 same way. The converse also holds and the family answers for it: a *degree-1*
@@ -163,11 +164,14 @@ functions straddling the face knot with the same perpendicular factor, keep the
 the dedup is allowed to eliminate, not to the burial test. Move the overlay's
 face off the cut-cell band, or break the nesting, until it lands.
 
-Passing `prune_covered=false` on a nested stack keeps the duplicate and
-leaves the operator singular, the same trade the integrated-Legendre family
-makes. If a configuration must keep every mode, break the nesting instead:
-a cell count that does not divide the base's (`cells=5` under a base of 8,
-say), or a different degree on the overlay, leaves nothing to deduplicate.
+The only stack that carries both copies is the **unreduced twin**
+[`prepare`](@ref)`(problem; prune = false)` builds, and on a nested stack that
+twin is exactly singular by construction — which is what it is for. It exists
+to be measured against, not to be solved with. If a configuration must keep
+every mode in a system that can actually be factorised, break the nesting
+instead: a cell count that does not divide the base's (`cells=5` under a base
+of 8, say), or a different degree on the overlay, leaves nothing to
+deduplicate.
 
 # Why a deferred spec
 
@@ -707,7 +711,7 @@ function _reproduces(k::Level{D}, p::NTuple{D,Int}) where {D}
     family isa BSplineFamily && return all(d -> degree(family.spaces[d]) == p[d], 1:D)
     family isa IntegratedLegendre || return false
     k.mode === :tensor || return false
-    # `k.order` is the level's nominal maximum, which is not enough when `k` carries
+    # `nominal_order(k)` is the level's per-axis maximum, which is not enough when `k` carries
     # a per-cell order: a single cell below `p` anywhere under the buried function's
     # support cannot reproduce it. Requiring every palette entry to clear `p` is the
     # conservative reading — it can only skip a legitimate dedup, never delete a
@@ -736,8 +740,10 @@ Unfitted._spans_hats(f::BSplineFamily{D}) where {D} = all(d -> degree(f.spaces[d
 # level reproduces *exactly*, which leaves the discrete space unchanged and is
 # therefore free. What it buys is not dof count but well-posedness — the
 # reproduced function and its copy above are linearly dependent, so leaving both
-# active makes the superposed operator exactly singular. `prune_covered=false`
-# opts out of the repair as well as of the reduction, exactly as it does for
+# active makes the superposed operator exactly singular. The elimination is
+# therefore unconditional here as everywhere: the only stack that keeps both
+# copies is the unreduced twin `prepare(problem; prune = false)` builds, which
+# opts out of the repair along with the reduction, exactly as it does for
 # integrated Legendre.
 function Unfitted._coverage_constraints(level::Level{D,T,<:BSplineFamily}, V::Space{D,T},
                                         coverage::Coverage{D}, tol::GeometryTolerance{T},

@@ -508,12 +508,6 @@ function _dirichlet_for_field(problem::Problem, name::Symbol)
     return scoped
 end
 
-# All levels across every distinct participating space, concatenated in
-# `problem_spaces` order. Because `prepare` reindexes each space's level ids
-# into a disjoint block, the concatenation has globally-unique, contiguous
-# ids `1:N` — exactly what the assembly workspace's flat level-id banks and
-# each field's dof layout agree on. For a single-domain problem this is just
-# the one space's levels.
 # Level reports for every subdomain space, flattened in the same order as
 # `_problem_levels`. Built per space because nesting is a relation between the
 # levels of one space; a coupled problem's spaces are independent stacks.
@@ -527,6 +521,12 @@ function _level_reports(problem::Problem, tol::GeometryTolerance)
     return out
 end
 
+# All levels across every distinct participating space, concatenated in
+# `problem_spaces` order. Because `prepare` reindexes each space's level ids
+# into a disjoint block, the concatenation has globally-unique, contiguous
+# ids `1:N` — exactly what the assembly workspace's flat level-id banks and
+# each field's dof layout agree on. For a single-domain problem this is just
+# the one space's levels.
 function _problem_levels(problem::Problem)
     levels = Any[]
     for V in problem_spaces(problem)
@@ -1573,19 +1573,28 @@ record. The two-argument form composes a reproducibility-report
 solver residual from the solution, and (optionally) the relative L²
 error against `exact(x)`. The result is the natural artefact to
 include in PR descriptions, paper figures, and regression tests.
+
+Each `levels` entry carries `id`, `role`, `cells`, `order` (the level's
+nominal per-axis maximum), `order_palette` (the distinct per-cell orders, a
+one-element vector on a uniform level), `mode`, `basis`, `domain`, and `nested`
+— whether every higher level's nodes coincide with this level's where the two
+overlap. `nested` is the geometric half of what makes leaf semantics lossless,
+and it is reported per level because [`move!`](@ref) can void it silently; see
+[`is_nested`](@ref).
 """
 diagnostics(model::Model) = model.diagnostics
 
 # Compact per-level reproducibility report used inside
-# `diagnostics(model, solution)`: enough information to know which
-# basis, order, mode, cell count, and domain a level had at solve time.
-# Per-level metadata for the diagnostics report. `nested` is the geometric half
-# of the condition covered-mode pruning wants — every higher level's node coordinates
-# agree with this level's where they overlap. It is reported per level rather
-# than per space so a violation can be localised, and it is worth reporting at
-# all because it is otherwise invisible: `move!` can void it on a stack that was
-# nested when it was built, and the resulting loss shows up as neither a
-# residual nor a rank deficiency. See [`is_nested`](@ref).
+# `diagnostics(model, solution)`: enough to know which basis, order, mode, cell
+# count and domain a level had at solve time, plus whether it was nested under.
+#
+# `nested` is the geometric half of the condition leaf semantics want — every
+# higher level's node coordinates agree with this level's where they overlap. It
+# is reported per level rather than per space so a violation can be localised,
+# and it is worth reporting at all because it is otherwise invisible: `move!`
+# can void it on a stack that was nested when it was built, and the resulting
+# loss shows up as neither a residual nor a rank deficiency. See
+# [`is_nested`](@ref).
 function _level_report(level, V::Space, tol::GeometryTolerance)
     nested = all(k -> k.id <= level.id || _nested_over(level, k, tol), V.levels)
     # `order` stays the level's nominal (maximum) per-axis order, so an existing

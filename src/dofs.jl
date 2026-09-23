@@ -520,9 +520,18 @@ end
 # assembles, it solves, and it returns a plausible residual; only a two-sided
 # trace evaluation sees it.
 #
-# The classical hp-FEM fix (Szabó–Babuška; Demkowicz) is the *minimum rule*: a
-# shared entity carries the minimum of the orders of the cells sharing it. Three
-# properties of the statement below are load-bearing and none of them is
+# The classical hp-FEM fix is the *minimum rule*: a shared entity carries the
+# minimum of the orders of the cells sharing it. It is due to
+#
+#   B. Szabó, I. Babuška, "Finite Element Analysis", Wiley, New York (1991),
+#     ISBN 978-0-471-50273-9 — cited in full above `local_basis_indices` in
+#     `basis.jl`, where the same work's trunk space is defined; and
+#   L. Demkowicz, "Computing with hp-Adaptive Finite Elements, Vol. 1: One and
+#     Two Dimensional Elliptic and Maxwell Problems", Chapman & Hall/CRC (2006),
+#     doi:10.1201/9781420011685 — the constrained-approximation treatment this
+#     package's key-keyed statement of the rule follows.
+#
+# Three properties of the statement below are load-bearing and none of them is
 # cosmetic:
 #
 #   * It is a predicate on the **key**, not on the generating cell. The minimum

@@ -161,13 +161,14 @@ function _cached_alpha_weights!(cache::Dict{NTuple{D,Int},Vector{T}}, counts::NT
 end
 
 # Pick the moment-fit basis order for a cut region. With the default
-# `moment_order_factor = 2` on `V.physical`, the basis spans degree
-# `2 × max(parent.order)` per axis — matching what tensor Gauss
-# integrates exactly on `:full` regions and so bringing cut-region
-# integrand exactness to the same level as the rest of assembly. Users
-# whose integrand is only degree-`p` (linear forms / sources) can set the
-# factor to 1, halving the basis at the cost of giving up bilinear-form
-# exactness.
+# `moment_order_factor = 2` on `V.physical`, the basis spans degree twice the
+# per-axis maximum of `cell_order` over the region's parent CELLS — not over
+# their levels, so one high-p cell elsewhere on a level does not raise the
+# moment basis here — matching what tensor Gauss integrates exactly on `:full`
+# regions and so bringing cut-region integrand exactness to the same level as
+# the rest of assembly. Users whose integrand is only degree-`p` (linear forms
+# / sources) can set the factor to 1, halving the basis at the cost of giving
+# up bilinear-form exactness.
 function _moment_order_for_region(V::Space{D}, parents) where {D}
     factor = V.physical.moment_order_factor
     return ntuple(D) do d
@@ -470,8 +471,11 @@ end
 #
 #   1. Collect, per axis, every participating mesh's element-boundary
 #      coordinates that bound an active cell of that mesh — all of them on an
-#      unmasked level (`_axis_intervals` ⇒ `_active_axis_coordinates` ⇒
-#      `merge_coordinates` ⇒ `_intervals_from_coordinates`).
+#      unmasked level (`_axis_intervals` ⇒ `_merged_axis_coordinates` ⇒
+#      `_live_axis_coordinates` ⇒ `merge_coordinates` ⇒
+#      `_intervals_from_coordinates`). A coordinate no level keeps separates two
+#      slabs of identical coverage signature, which step 4 would have merged
+#      again, so dropping it costs no region and no exactness.
 #   2. Form the Cartesian product of those intervals, giving the
 #      *candidate* box index grid `CartesianIndices(ranges)`.
 #   3. For each candidate, compute the per-level coverage signature at

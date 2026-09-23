@@ -628,8 +628,8 @@ end
 #
 # where `φ_i` are the boundary traces of the physically-constrained raw
 # dofs that survived every artificial elimination — the overlay-boundary
-# condition and, on a `prune_covered` level, covered-mode pruning and the
-# linear dedup (`elimination_source === :free`). An eliminated dof has
+# condition and, under leaf semantics, the shedding of buried high-order modes
+# and the linear dedup (`elimination_source === :free`). An eliminated dof has
 # no value to project: its coefficient is not a solved unknown of the
 # system. The mass matrix is symmetric positive (semi-)definite, so we
 # try a Cholesky factorisation first and fall back to a pseudoinverse on

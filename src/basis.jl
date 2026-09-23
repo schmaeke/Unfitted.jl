@@ -414,8 +414,13 @@ partition of unity), the three-argument form to add `:trunk`.
 The two-argument form is the `:tensor` set (no filter); `mode = :trunk` keeps only
 indices with trunk degree `Σ_d t(α_d) ≤ p`, where `t(α_d) = α_d` for a
 bubble mode (`α_d ≥ 2`) and `t(α_d) = 0` for the two linear endpoint
-modes (`α_d ∈ {0, 1}`) — the Szabó–Babuška trunk space (isotropic order
-`p` required, see [`IntegratedLegendre`](@ref)).
+modes (`α_d ∈ {0, 1}`) — the trunk space of
+
+> B. Szabó, I. Babuška, *Finite Element Analysis*, Wiley, New York (1991),
+> ISBN 978-0-471-50273-9,
+
+which is also the source of the minimum rule `src/dofs.jl` applies across an
+order jump (isotropic order `p` required, see [`IntegratedLegendre`](@ref)).
 """
 function local_basis_indices(::BasisFamily, order::NTuple{D,Int}) where {D}
     all(o -> o >= 0, order) || throw(ArgumentError("basis order must be nonnegative in every axis"))
@@ -505,18 +510,27 @@ Whether the multi-index `id` belongs to `local_basis_indices(basis, order, mode)
 answered in `O(D)` instead of by scanning the set.
 
 This is the family's own index-set filter, factored out so the dof layer's
-minimum rule can ask it at an order no cell actually carries — the componentwise
-minimum over a shared entity's incident cells. Asking the *filter* rather than
-comparing modes per axis is what makes the rule family-generic: for `:tensor` the
-two agree, and for `:trunk` they do not, because a 3D face mode with bubble
-degrees `(3, 2)` passes a per-axis test at order 4 while its trunk degree 5 puts
-it outside the order-4 trunk set. A family that adds a mode adds it here and the
-minimum rule follows.
+minimum rule (`_entity_carries` in `src/dofs.jl`) can ask, per active incident
+cell, whether *that cell's own* order generates the mode. The intersection over
+the incident cells is the classical componentwise-minimum rule, because this
+predicate is monotone non-decreasing in the order — raising an order never
+removes a mode from a cell's set — so the minimum need never be formed and no
+question is ever asked at an order no cell carries. The "WHY THE INTERSECTION IS
+THE MINIMUM RULE" block in `src/dofs.jl` states that argument in full.
+
+Asking the *filter* rather than comparing modes per axis is what makes the rule
+family-generic: for `:tensor` the two agree, and for `:trunk` they do not,
+because a 3D face mode with bubble degrees `(3, 2)` passes a per-axis test at
+order 4 while its trunk degree 5 puts it outside the order-4 trunk set. A family
+that adds a mode adds it here and the minimum rule follows.
 
 The `::BasisFamily` default is the per-axis box every tensor-product family
 carries; integrated Legendre adds the trunk-degree filter. `test_cell_order.jl`
-asserts the two forms agree with `local_basis_indices` over a range of orders,
-modes and dimensions, which is the contract that keeps them from drifting.
+asserts that this predicate agrees with `local_basis_indices` over a range of
+orders, modes and dimensions, that it is monotone in the order for every family
+declaring `_supports_cell_order`, and that the intersection form reproduces the
+componentwise-minimum form cell for cell — the three contracts that keep the two
+layers from drifting.
 """
 function _index_admissible(::BasisFamily, order::NTuple{D,Int}, ::Symbol,
                            id::CartesianIndex{D}) where {D}
