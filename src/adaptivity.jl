@@ -1074,8 +1074,10 @@ is applied: a cell the same cycle activates scores zero in the earlier estimate
 and reads as cold, so releasing on the refined space undoes the h-step that just
 woke it. Exclude, too, any parent the same cycle marks for h — its cover was
 woken by `refine` and this verb would put it straight back to sleep. Measured on
-`examples/reproductions/traveling_laser_2d`, a driver that released on the
-refined space undid 607 of the 639 h-steps it took, 95 %.
+`examples/reproductions/traveling_laser_2d`, a driver missing both guards would
+undo 361 of the 510 h-steps it takes, 71 %. The two are independently
+sufficient on that driver: dropping either one alone leaves the run
+bit-identical, and only removing both lets the cancellation through.
 
 On an immersed model — one whose space carries a [`PhysicalDomain`](@ref) —
 there is no state transfer across this step: [`L2Projection`](@ref) refuses a

@@ -53,51 +53,110 @@ source are activated geometrically from the known path. That is exact a priori
 knowledge, not a fitted constant; everything behind the source — the trail,
 which is the part nobody knows in advance — is found by the indicator.
 
-**What this replaces, and what it costs.** An earlier, unpublished iteration of
-this study shaped the trail by hand, with fitted constants per overlay level:
-threshold fractions on T and on ∇T relative to their running maxima, an
-activation radius, and a dilation count. Tuning them reached **2510 active
-unknowns at 0.57 %** relative L². That pair of numbers is quoted from that
-iteration and is **not reproducible from this repository** — the script it came
-from is not in the history — so read it as the target that motivated this one,
-not as a run you can repeat here.
+**What this replaces, and why it is not a score.** An earlier, unpublished
+iteration of this study shaped the trail by hand, with fitted constants per
+overlay level: threshold fractions on T and on ∇T relative to their running
+maxima, an activation radius, and a dilation count. Tuning them reached **2510
+active unknowns at 0.57 %** relative L². That pair is quoted from that
+iteration, is **not reproducible from this repository** — the script it came
+from is not in the history — and its time discretisation is unrecorded. The
+last of those is what stops it being a comparison, in either direction.
 
-This script has no fitted constants at all. Its entire adjustable surface is the
-Dörfler fraction `TL_THETA_MARK` and the release fraction `TL_RELEASE`, and at
-their defaults it settles at **9346 unknowns at 0.452 %**: 1.26× the tuned
-scheme's accuracy for 3.7× its unknowns. The automated loop is the more accurate
-of the two and the more expensive, and the trade between those is not fixed —
-it moves under both knobs, in opposite ways:
+This script's own headline used to be 0.452 % at a step of 1/40, and that
+number measured the θ-method rather than the mesh. Measured on the published
+configuration at that step: taking the overlay depth from 5 to 6 — halving the
+finest cell to 0.047 and lifting the time-mean unknown count from 7027 to
+13718 — leaves the settled error at 0.4520 %, which is where depth 5 already
+puts it, unchanged to four significant figures. Thirding the step to 1/120
+instead drops it to 0.05246 %, a factor 8.62 against the 9 a second-order
+method predicts. At least 88 % of the old headline was Crank–Nicolson. If the
+baseline's 0.57 % carries a comparable time fraction, its spatial error is
+below every point measured here; if it carries none, it is above most of them.
+The sign of that comparison is unknown, not merely its size, and two numbers —
+one a time-error floor, the other of unrecorded time content — do not subtract.
+Read 2510 / 0.57 % as the target that motivated this study, not as a score
+either scheme wins, and read `TL_DT` below as the reason everything after this
+paragraph is about the mesh.
 
-  - *releasing more eagerly buys back the cost, at a price*. `TL_RELEASE = 0.05`
-    settles at **2472 unknowns at 0.861 %** — the tuned scheme's cost for 1.5×
-    its error. That is the same comparison the tuned scheme won, reached from
-    the other side.
-  - *marking less is free here*. `TL_THETA_MARK = 0.4` settles at **6726
-    unknowns at 0.453 %** — 28 % fewer unknowns for the same error to two
-    digits. The default fraction of 0.6 is simply spending more than this
-    problem needs.
+**Where the two defaults come from.** There are no per-level constants here:
+the whole adjustable surface is the Dörfler fraction `TL_THETA_MARK` and the
+release fraction `TL_RELEASE`. They are not derived either. They were chosen
+once, by the sweep below, scored against the exact solution — an oracle no real
+problem hands you — so "this script has no fitted constants" would be a claim
+it cannot support. What the sweep found is what makes the pair defensible: not
+a point, but a ridge. Time-mean active unknowns and time-mean relative L² over
+the second half of the revolution, at the published configuration and the
+default step:
 
-So the loop is not sitting at an optimum, and there is no reason to expect a
-fixed pair of fractions to sit at one on the next problem either. That is the
-open question this reproduction exists to pose: the hand-tuned scheme bought its
-operating point with ten constants and a person to set them, and two fractions
-reach a better error without either — but they do not, by themselves, find the
-cheapest point that reaches it.
+                    release 0.01     release 0.02     release 0.03
+    marking 0.3     4931 / 0.210 %   3696 / 0.870 %   4070 / 0.234 %
+    marking 0.4     5394 / 0.149 %   4589 / 0.161 %   4244 / 0.359 %
+    marking 0.5     5881 / 0.0696 %  4851 / 0.0742 %  4292 / 0.0915 %
+    marking 0.6     6658 / 0.0594 %  5001 / 0.161 %   4469 / 0.171 %
+
+A marking fraction of 0.5 is the best of the four at release 0.02 and at 0.03,
+and second at 0.01, where 0.6 buys 1.17× less error for 13 % more cost. It
+holds three of the six points on the Pareto front — the whole middle of it —
+and all six dominated settings carry a marking fraction other than 0.5. Down
+that column the release fraction moves the mean error by a factor 1.31, against
+4.15, 2.41 and 2.88 down the other three, so inside it the choice of release is
+close to a coin flip weighted by cost. That insensitivity is the property being
+leaned on, and it is a robustness statement rather than a fit: what carries to
+another problem is "mark about half of the estimated error", not two calibrated
+decimals. The contrast with the scheme this replaces is therefore ten constants
+fitted per overlay level against two global ones — not ten against none.
+
+At the defaults the run settles at **5460 unknowns at 0.0609 %** and averages
+**4851 unknowns at 0.0742 %** over the second half. The second pair is the one
+to read: the active count is a sawtooth spanning 3770 to 6094 there, and the
+settled value is one sample of it.
+
+The two fractions are not interchangeable, and the sweep says which one decides:
+
+  - *the marking fraction does.* Marking 0.4 instead of 0.6 at a fixed release
+    of 0.01 saves 19 % of the mean cost and pays 2.51× the mean error for it.
+    On the endpoint alone the same pair reads 8 % cheaper for 1.51× the error,
+    which is one reason the mean is the metric here — and at the old step it
+    read as free, because the time-error floor hid the difference entirely.
+  - *releasing more eagerly still buys cost back, and the price is now
+    legible.* `TL_RELEASE = 0.05` reaches 3378 mean unknowns at 1.45 % and
+    `0.08` reaches 2694 at 2.49 %, but neither settles: they end the run at
+    2.89× and 5.68× their own best error after t = 1, with the error swinging
+    by factors of 4.96 and 11.06 across the second half. Eleven of the twelve
+    settings above end within 1.07× of their own best; the twelfth, marking 0.6
+    at release 0.03, ends at 2.85×.
+
+**What this reproduction can answer.** Not whether automated hp is competitive
+with hand-tuned overlays: the baseline's time content is unrecorded, so that
+comparison is unsigned rather than merely uncontrolled. Driving the loop down
+to the baseline's cost does not settle it either — marking 0.6 at release 0.05
+reaches 3308 mean unknowns at 0.569 %, the baseline's quoted error at 1.3× its
+unknown count, but ends 5.86× above its own best. What the sweep can answer is
+what an untuned loop costs. Two fractions with no per-level fitting span a
+factor 1.80 in mean cost and 14.6 in mean error, so declining to tune is not
+free. Ranked by the loop's own indicator η — its mean over the second half,
+which needs no exact solution — the twelve settings come out very nearly in the
+order the exact error puts them, with Spearman ρ = 0.93 and the best four in
+identical order, so the operating point is reachable from what the method has
+on a real problem even though an oracle is what found it. And the cheap end of
+the range is not a cheaper answer but an unconverged one.
 
 Environment knobs, so the run can be shortened or re-pointed without editing the
 script. The default is in brackets:
 
   - `TL_T_MAX` (4) — end time. One revolution; the revolution period itself is
     a constant below and does not move with it.
-  - `TL_DT` (1/30) — the largest step the θ-method may take. The step is also
-    clamped onto every mesh-update boundary, so at the defaults the step
-    actually taken is `TL_UPDATE`; set `TL_DT` below `TL_UPDATE` to sub-step.
+  - `TL_DT` (1/120) — the largest step the θ-method may take. The step is also
+    clamped onto every mesh-update boundary, so the step actually taken is
+    `min(TL_DT, TL_UPDATE)`, and that — not `TL_DT` — is what the report prints.
+    At the default `TL_DT` binds, three steps to a mesh update. Raise it above
+    `TL_UPDATE` and the cadence becomes the step again, which is the regime the
+    Crank–Nicolson floor above was measured in.
   - `TL_THETA` (1/2) — the θ of the θ-method. 1/2 is Crank–Nicolson.
   - `TL_KAPPA` (1/20) and `TL_SIGMA` (1/10) — diffusivity and source width.
   - `TL_DEPTH` (5) — overlay levels under the 4×4 base.
-  - `TL_THETA_MARK` (0.6) — the Dörfler fraction the marking uses.
-  - `TL_RELEASE` (0.01) — release a parent whose live cover is everywhere below
+  - `TL_THETA_MARK` (0.5) — the Dörfler fraction the marking uses.
+  - `TL_RELEASE` (0.02) — release a parent whose live cover is everywhere below
     this fraction of the largest indicator.
   - `TL_UPDATE` (1/40) — how often the mesh is adapted.
   - `TL_WRITE_OUTPUT` (true) — write the ParaView series and the CSV.
@@ -114,16 +173,23 @@ include(joinpath(@__DIR__, "..", "..", "reporting.jl"))
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 const T_MAX = env("TL_T_MAX", 4.0)
-const DT_MAX = env("TL_DT", 1 / 30)
+const DT_MAX = env("TL_DT", 1 / 120)
 const THETA = env("TL_THETA", 0.5)                   # 1/2 = Crank–Nicolson
 const KAPPA = env("TL_KAPPA", 0.05)
 const SIGMA = env("TL_SIGMA", 0.1)
 const DEPTH = env("TL_DEPTH", 5)
-const THETA_MARK = env("TL_THETA_MARK", 0.6)         # Dörfler
-const RELEASE = env("TL_RELEASE", 0.01)              # release below this × max η
+const THETA_MARK = env("TL_THETA_MARK", 0.5)         # Dörfler
+const RELEASE = env("TL_RELEASE", 0.02)              # release below this × max η
 const UPDATE_EVERY = env("TL_UPDATE", 1 / 40)        # mesh update interval
 const WRITE_OUTPUT = env("TL_WRITE_OUTPUT", true)
 const VTK_FRAMES = env("TL_VTK_FRAMES", 80)
+
+# The θ-method's step is clamped onto every mesh-update boundary as well as by
+# `TL_DT`, so `STEP` — not `TL_DT` — is the largest step the run actually takes.
+# The two coincide only while `TL_DT` binds below the adaptation cadence, which
+# at the defaults it does; the report prints `STEP`, so the parameter block
+# stays true for a `TL_DT` above the cadence as well.
+const STEP = min(DT_MAX, UPDATE_EVERY)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 #
@@ -219,10 +285,12 @@ end
 # modelⁿ⁺¹'s, and that type name doubles per step — measured here at 730, 2244,
 # 5272, 11328, 23440, 47664 and 96112 characters over seven successive steps,
 # with the inference bill following it: an eight-step run on a depth-3 ladder
-# took 15.3 s that way against 11.4 s this way, at −O0. The update cycle cuts
-# the chain anyway by rebuilding from `nothing`, so at the default cadence of
-# one step per update nothing compounds; the erasure is what keeps a sub-update
-# `TL_DT` — the case the clamp exists for — from paying that price.
+# took 15.3 s that way against 11.4 s this way, at −O0 and at the pre-retune
+# defaults. The update cycle cuts the chain by rebuilding from `nothing`, so
+# what compounds within one cycle is `TL_UPDATE / TL_DT` steps and no more —
+# three of them at the defaults, where `TL_DT` now binds below the cadence. The
+# erasure is therefore load-bearing at the shipped settings and not only for a
+# knob a reader might turn.
 function step_model(V, previous, dt, t0, t1)
     q0, q1 = heat_source(t0), heat_source(t1)
     history = Ref{Any}(previous)
@@ -301,7 +369,7 @@ end
 # the discretisation: asking for a different number of pictures cannot move a
 # step, which is exactly what it used to do. The step count comes from the same
 # three constants the clamp does, so the default 80 frames over the published
-# run's 160 steps is every second step, and a count the steps do not divide
+# run's 480 steps is every sixth step, and a count the steps do not divide
 # rounds to the nearest whole cadence rather than bending the time grid to fit.
 const TOTAL_STEPS = ceil(Int, T_MAX / UPDATE_EVERY) * ceil(Int, UPDATE_EVERY / DT_MAX)
 const FRAME_EVERY = max(1, round(Int, TOTAL_STEPS / VTK_FRAMES))
@@ -326,8 +394,14 @@ end
 #   4. release, computed on the estimate's own space and filtered against
 #      `h_cells` — a parent that also takes an h-step this cycle is dropped,
 #      because `coarsen` would deactivate the cover `refine` has just woken.
-#      Releasing on the refined space instead undid most of the h-steps it had
-#      just taken: measured over the full study, 607 of 639 of them, 95 %;
+#      The hazard is large: evaluated on the refined space, the release rule
+#      hits 361 of the 510 h-steps the full study takes, 71 % of them. The two
+#      guards turn out to be redundant, and both are kept deliberately —
+#      measured on the shortened run, moving the rule to the refined space with
+#      the filter in place is bit-identical to the shipped loop, and so is
+#      dropping the filter with the rule left on the estimate's own space.
+#      Dropping both settles at 1008 unknowns and 1.783 % against 1156 and
+#      1.914 %;
 #   5. refine, then coarsen, then seed the next interval's source cells;
 #   6. record and print the error of the step, on the old model at the old time;
 #   7. rebuild on the new space and carry the state across by L² projection.
@@ -381,6 +455,39 @@ function run_study(series)
     return (; model, u, rows)
 end
 
+# ── The closing pair, and why there are two of them ───────────────────────────
+#
+# Neither the active-unknown count nor the reported error settles. Both are
+# sawtooths at the adaptation cadence: the mesh grows while the source moves
+# into ground the trail has not reached, and drops when the cooled trail behind
+# it is released; the error follows the mesh. The value at t = T_MAX is one
+# sample of that oscillation and not a converged state, and which sample it is
+# depends on where the last release happened to fall. Measured over the twelve
+# (θ_mark, release) settings tabulated in the header, the endpoint understates
+# the time-mean error at eleven of them and overstates the mean cost at ten, so
+# quoting it alone flatters both axes at once. It is kept because it is the one
+# number a reader can check against `diagnostics`, and the mean is printed
+# beside it because it is the one that describes the run.
+#
+# The mean is taken over the second half, which at the published configuration
+# is the second half of one revolution: the first half still carries the
+# transient of a trail that does not yet exist. Rows are recorded one per
+# adaptation cycle at a fixed cadence, so their arithmetic mean is the time
+# mean, and the min–max band beside it is the swing that the mean hides. The
+# cutoff carries the same 1.0e-12 slack the stepping loop uses, because `t` is
+# accumulated by addition and the cycle that lands on T_MAX/2 lands a few ulp
+# below it; without the slack that cycle drops out and the mean moves in the
+# third digit.
+function print_second_half(rows)
+    half = filter(row -> row.time >= T_MAX / 2 - 1.0e-12, rows)
+    isempty(half) && return nothing
+    u, e = [row.unknowns for row in half], [row.rel_l2_error for row in half]
+    println("mean over t ≥ ", sig(T_MAX / 2, 3), ": ", round(Int, sum(u) / length(u)),
+            " unknowns (", minimum(u), "–", maximum(u), ") at relative L2 ",
+            sig(sum(e) / length(e), 4), " (", sig(minimum(e), 4), "–", sig(maximum(e), 4), ")")
+    return nothing
+end
+
 # ── Report and output ─────────────────────────────────────────────────────────
 
 series = WRITE_OUTPUT ? vtk_series(joinpath(@__DIR__, "output", "traveling_laser_2d")) : nothing
@@ -388,13 +495,7 @@ model, u, rows = run_study(series)
 report = diagnostics(model, u; exact=exact_temperature(T_MAX))
 
 println("\nsettled: ", active_unknowns(model), " unknowns at relative L2 ", sig(report.l2_error, 4))
-# Only the published configuration is comparable to the tuned run; a shortened
-# or shallower transient settles somewhere else entirely, so the line is printed
-# only where it means something. See the header for what the baseline is and why
-# it cannot be re-run from this repository.
-if T_MAX == 4.0 && DEPTH == 5
-    println("baseline (hand-tuned overlays, not reproducible here): 2510 at 0.0057")
-end
+print_second_half(rows)
 
 if WRITE_OUTPUT
     open(joinpath(@__DIR__, "output", "history.csv"), "w") do io
@@ -405,6 +506,6 @@ if WRITE_OUTPUT
 end
 
 print_run_report("2D traveling laser, automated hp", report;
-                 parameters=(:t_max => T_MAX, :dt => DT_MAX, :theta => THETA, :kappa => KAPPA,
-                             :sigma => SIGMA, :depth => DEPTH, :theta_mark => THETA_MARK,
-                             :release => RELEASE), output=nothing)
+                 parameters=(:t_max => T_MAX, :dt => STEP, :update => UPDATE_EVERY, :theta => THETA,
+                             :kappa => KAPPA, :sigma => SIGMA, :depth => DEPTH,
+                             :theta_mark => THETA_MARK, :release => RELEASE), output=nothing)

@@ -595,12 +595,24 @@
     # regression this case exists to hold: the script used to clamp every time
     # step onto the frame grid, so asking for a different number of pictures
     # changed how the PDE was integrated. Hence the two-sided band on the
-    # settled error. Measured on this exact configuration: 1686 unknowns at
-    # 0.017389 as it stands, against 1632 at 0.014433 with the frame clamp back
-    # in place — a 17 % move in the reported error, bought with nothing but a
-    # request for three pictures instead of eighty, and one a band open at the
-    # bottom waves straight through. Every band below is the one measured with
-    # output off, for the same reason.
+    # settled error: 1686 unknowns at 0.017389 as it stood, against 1632 at
+    # 0.014433 with the frame clamp back in place — a 17 % move in the reported
+    # error bought with nothing but a request for three pictures instead of
+    # eighty, and one a band open at the bottom waves straight through. That
+    # pair is measured at the pre-retune defaults (marking 0.6, release 0.01,
+    # step 1/40) and is kept as the reason for the band's shape; the clamp is
+    # no longer in the source, so it cannot be re-measured at the current ones.
+    #
+    # The frame count the case asks for is five rather than three, and that is
+    # load-bearing. At the resolved step the shortened run takes 96 steps, and
+    # three divides 96: three pictures would land exactly on step boundaries
+    # and the misalignment this case exists to exercise would be gone. Five is
+    # the smallest count 96 does not divide. Measured at five: six frames, at
+    # t = 0, 0.15833, 0.31667, 0.475, 0.63333 and 0.79167 — none of them at
+    # T_MAX and none a multiple of the update cadence — for a run whose settled
+    # pair is identical to the one with output off. Every band below is the one
+    # measured with output off, so a frame schedule that touched the
+    # discretisation would fail here rather than quietly re-baseline.
     function check_laser(output, tol)
         rows = [(unknowns=parse(Int, m.captures[2]), n_h=parse(Int, m.captures[6]),
                  n_p=parse(Int, m.captures[7]), n_rel=parse(Int, m.captures[8]))
@@ -616,6 +628,20 @@
         if settled !== nothing
             @test tol.unknowns[1] < parse(Int, settled.captures[1]) < tol.unknowns[2]
             @test tol.settled[1] < parse(Float64, settled.captures[2]) < tol.settled[2]
+        end
+        # The script's honest pair: the time-mean over the second half with its
+        # min–max band. Both quantities oscillate at the adaptation cadence, so
+        # the mean is the steadier guard of the two and the endpoint band above
+        # is the one a lucky sample can slip through. The band is asserted to be
+        # a band — a run whose low and high coincide has stopped adapting, and
+        # every other assertion here would still pass.
+        averaged = match(r"mean over t ≥ [\d.]+: (\d+) unknowns \((\d+)–(\d+)\) " *
+                         r"at relative L2 ([\d.e+-]+)", output)
+        @test averaged !== nothing
+        if averaged !== nothing
+            @test tol.mean_unknowns[1] < parse(Int, averaged.captures[1]) < tol.mean_unknowns[2]
+            @test tol.mean_settled[1] < parse(Float64, averaged.captures[4]) < tol.mean_settled[2]
+            @test parse(Int, averaged.captures[2]) < parse(Int, averaged.captures[3])
         end
         check_single_l2(output, tol.l2)
         check_laser_output(output, rows, tol)
@@ -763,38 +789,51 @@
               tol=(condition=(4.0e3, 2.0e4, 7.0e6, 4.0e8), residual=1.0e-10)),
              # Traveling laser: shortened transient (`TL_T_MAX = 0.8`, a fifth
              # of one revolution, `TL_DEPTH = 4`). Measured on that
-             # configuration: 31 updates, Σn_h = 32, Σn_p = 119,
-             # Σn_released = 36, settling at 1686 unknowns and relative L²
-             # 1.7389e-2, 29.0 s wall standalone at four threads. The unknown
-             # band is deliberately narrow (1.4× either side) rather than a
-             # decade, because the one regression it exists to catch has a
-             # known signature: computing the release marks on the refined
-             # space instead of the estimate's own space cancels most of the
-             # h-steps and settles at 1100 instead, which a wider band would
-             # wave through.
+             # configuration: 31 updates, Σn_h = 17, Σn_p = 110,
+             # Σn_released = 41, settling at 1156 unknowns and relative L²
+             # 1.9140e-2, and averaging 933 unknowns (813–1109) at 2.264e-2
+             # over the second half. 27 s wall standalone with output on, at
+             # -O0 and eight threads on an idle 32-core box; the pre-retune
+             # configuration measures 24 s the same way, so resolving the step
+             # costs this case three seconds, not three times its steps — the
+             # mesh it settles on is 31 % smaller.
+             #
+             # The bands on the pair are 1.4× either side on the counts and
+             # ±2.3 % on the errors, and it is the error bands that hold the
+             # regression this case exists to catch. Two conditions guard the
+             # release rule — it is evaluated on the estimate's own space, and
+             # parents taking an h-step the same cycle are filtered out — and
+             # each is measured bit-identical to the shipped loop with the
+             # other in place. Dropping both settles at 1008 unknowns and
+             # 1.783 %, averaging 838 (654–1006) at 2.055 %: inside both count
+             # bands and outside both error bands. The count bands are the
+             # coarse guard against a loop that stopped refining or stopped
+             # releasing, which the error alone would not show.
              #
              # This is the only case that leaves VTK on, and the only automated
-             # coverage the series writer and the CSV have. `TL_VTK_FRAMES = 3`
-             # buys that for about 15 s and ~5 MB of frames, at a frame count
-             # deliberately coprime with the 32 steps — see `check_laser` for
-             # why a misaligned frame count is the interesting one. Every band
-             # below was measured with output off, so a frame schedule that
-             # touched the discretisation would fail here rather than quietly
-             # re-baseline.
+             # coverage the series writer and the CSV have. `TL_VTK_FRAMES = 5`
+             # buys that for about 3 s and 8.2 MB of frames, at a frame count
+             # the 96 steps do not divide — see `check_laser` for why five and
+             # not three, and why a misaligned frame count is the interesting
+             # one. Every band below was measured with output off, so a frame
+             # schedule that touched the discretisation would fail here rather
+             # than quietly re-baseline.
              #
-             # The full study (t = 4, depth 5) settles at 9346 unknowns and
-             # 0.452 % in 13.1 minutes. CONTRIBUTING's rule is that a
-             # reproduction is not coarsened for speed, and this case breaks it
-             # knowingly: thirteen minutes is more than the rest of the example
-             # suite put together. What the shortened run gives up is the
+             # The full study (t = 4, depth 5) settles at 5460 unknowns and
+             # 0.0609 %, averaging 4851 (3770–6094) at 0.0742 %, in 6.3 minutes
+             # under the same conditions — 7.4 minutes at the pre-retune
+             # defaults, so resolving the step made the full study cheaper, not
+             # dearer. CONTRIBUTING's rule is that a reproduction is not
+             # coarsened for speed, and this case breaks it knowingly: the full
+             # run is more than the rest of the example suite put together. What the shortened run gives up is the
              # settled state of the trail, not any branch of the loop — every
              # verb, including `coarsen`, fires inside the first fifth of a
              # revolution.
              (name="reproductions/traveling_laser_2d",
               env=Dict("TL_T_MAX" => "0.8", "TL_DEPTH" => "4", "TL_WRITE_OUTPUT" => "true",
-                       "TL_VTK_FRAMES" => "3"), requires=(), check=check_laser,
-              tol=(l2=1.0e-1, updates=20, unknowns=(1200, 2600), settled=(0.0170, 0.0178),
-                   frames=3)),
+                       "TL_VTK_FRAMES" => "5"), requires=(), check=check_laser,
+              tol=(l2=1.0e-1, updates=20, unknowns=(820, 1620), settled=(0.0187, 0.0196),
+                   mean_unknowns=(660, 1310), mean_settled=(0.0221, 0.0232), frames=6)),
 
              # Automated hp on a curved interior layer: 22 adaptive cycles from
              # a linear 6×6 base at the published size, VTK off, and the
