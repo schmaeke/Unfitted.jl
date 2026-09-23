@@ -182,6 +182,79 @@ end
     @test isempty(h0) && length(p0) == 2
 end
 
+@testset "coarsen: the exact inverse of the h-step" begin
+    # The round trip is the whole contract. A transient loop refines and releases
+    # thousands of times, so anything that does not close exactly accumulates.
+    V = ladder(_AD_Ω; cells=4, order=2, depth=2)
+    cell = CartesianIndex(2, 2)
+    same(a, b) = all(active_cells(a; level=k) == active_cells(b; level=k) &&
+                         cell_orders(a; level=k) == cell_orders(b; level=k)
+                     for k in 1:length(a.levels))
+
+    W = refine(V; h=[(1, cell)])
+    @test !same(W, V)
+    @test same(coarsen(W; h=[(1, cell)]), V)
+
+    # An order the children earned while live must NOT survive the release: the
+    # next h-step onto that region would inherit it. Measured before this was
+    # fixed, one h-step onto a released order-6 cover returned 169 unknowns where
+    # a cold h-step gives 57.
+    children = overlapping_cells(V, [cell]; from=1, to=2)
+    raised = refine(W; p=[(2, c) for c in CartesianIndices(children) if children[c]])
+    @test maximum(first, cell_orders(raised; level=2)) > 2
+    @test same(coarsen(raised; h=[(1, cell)]), V)
+    @test same(refine(coarsen(raised; h=[(1, cell)]); h=[(1, cell)]), W)
+end
+
+@testset "coarsen: the p-step, and what it refuses" begin
+    V = ladder(_AD_Ω; cells=4, order=3, depth=2)
+    cell = CartesianIndex(2, 2)
+
+    lowered = coarsen(V; p=[(1, cell)])
+    @test cell_orders(lowered; level=1)[cell] == (2, 2)
+    @test all(cell_orders(lowered; level=1)[c] == (3, 3)
+              for c in cell_indices(V; level=1) if c != cell)
+    @test cell_orders(coarsen(V; p=[(1, cell)], pmin=3); level=1)[cell] == (3, 3)
+
+    # Lowering a COVERED cell's order is invisible until the cover lifts, and no
+    # diagnostic catches it — measured, 173.5× the energy error with the residual
+    # norm and the estimator's consistency flag unchanged to the last digit. It is
+    # refused rather than reported.
+    covered = refine(V; h=[(1, cell)])
+    @test_throws ArgumentError coarsen(covered; p=[(1, cell)])
+
+    # The finest level covers nothing, so there is nothing to release there.
+    @test_throws ArgumentError coarsen(V; h=[(length(V.levels), CartesianIndex(1, 1))])
+    @test_throws ArgumentError coarsen(V; h=[(99, CartesianIndex(1, 1))])
+
+    # Releasing a cover whose children are themselves covered leaves the deeper
+    # level holding the region: a no-op, not a hole.
+    deep = refine(refine(V; h=[(1, cell)]);
+                  h=[(2, c)
+                     for c in CartesianIndices(overlapping_cells(V, [cell]; from=1, to=2))
+                     if overlapping_cells(V, [cell]; from=1, to=2)[c]])
+    @test active_cells(coarsen(deep; h=[(1, cell)]); level=2) == active_cells(deep; level=2)
+end
+
+@testset "the prediction reads a released order as evidence" begin
+    # A p-released cell used to fall through the equality branch and take p again
+    # on sight, which is the oscillation the release was trying to avoid. Melenk
+    # & Wohlmuth's coarsening row makes the exponent negative, so the cell is
+    # predicted to get WORSE by the reciprocal of what the degree was worth.
+    V = ladder(_AD_Ω; cells=4, order=3, depth=2)
+    cell = CartesianIndex(2, 2)
+    W = coarsen(V; p=[(1, cell)])
+
+    before = [zeros(l.mesh.cells) for l in V.levels]
+    before[1][cell] = 1.0
+    est_prev = Unfitted.ErrorEstimate{Float64,2}(before, 1.0, 1.0, 0.0)
+    caches = (Dict{Int,Any}(), Dict{Int,Any}())
+    predicted = Unfitted._predicted(W, (V, est_prev), 1, cell, cell_orders(W; level=1)[cell],
+                                    caches, Unfitted._GAMMA_P)
+    @test predicted > 1.0                       # the error is expected to grow
+    @test predicted ≈ 1.0 / Unfitted._GAMMA_P    # by exactly one degree's worth
+end
+
 @testset "refine: Dörfler marking is monotone in theta" begin
     V = ladder(_AD_Ω; cells=8, order=2, depth=1)
     model = prepare(_ad_problem(V))

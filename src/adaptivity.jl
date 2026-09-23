@@ -384,7 +384,14 @@ function _predicted(V::Space{D,T}, previous, k::Integer, cell::CartesianIndex{D}
     η = eprev.cells[k][cell]
     η > 0 || return T(Inf)
     q_prev = minimum(get!(() -> cell_orders(Vprev; level=k), prev_orders, k)[cell])
-    q > q_prev || return T(Inf)
+    # Equal orders mean nothing was applied here, so there is no evidence and the
+    # caller takes p. A LOWERED order is evidence, and of the opposite sign: the
+    # exponent goes negative, gamma_p^(negative) exceeds one, and the cell is
+    # predicted to get WORSE by the reciprocal of what the degree was worth. That
+    # is Melenk & Wohlmuth's coarsening row, and without it a p-released cell
+    # falls through the equality branch and takes p again on sight — which is the
+    # oscillation the release was trying to avoid.
+    q == q_prev && return T(Inf)
     return η * T(gamma_p)^(q - q_prev)
 end
 
@@ -504,12 +511,107 @@ function refine(V::Space{D,T}; h=(), p=(), pmax::Integer=8) where {D,T}
         field = field_of(k + 1)
         for child in CartesianIndices(children)
             children[child] || continue
+            # A child that is not live carries whatever order it held in a
+            # previous life, and `coarsen` clears that on release — but only for
+            # the covers it releases. Taking the maximum against a stale entry
+            # would resurrect it: measured, one h-step onto a released order-6
+            # cover returned 169 unknowns where a cold h-step gives 57. The
+            # maximum is still right for a child that IS live, whose order was
+            # earned and may exceed this parent's.
+            field[child] = mask[child] ? max.(field[child], target) : target
             mask[child] = true
-            field[child] = max.(field[child], target)
         end
     end
 
     refined = isempty(masks) ? V : adapt(V, (k => masks[k] for k in sort!(collect(keys(masks))))...)
     isempty(fields) && return refined
     return elevate(refined, (k => fields[k] for k in sort!(collect(keys(fields))))...)
+end
+
+"""
+    coarsen(V::Space; h = (), p = (), pmin = 1) -> Space
+
+Release refinement. The mirror of [`refine`](@ref)'s explicit form, and the verb
+a transient needs: on a moving feature, refinement left behind is pure cost.
+
+  - an **h-mark** `(level, cell)` names a *parent*, and deactivates the cells of
+    the level below that cover it — the exact inverse of `refine`'s h-step. The
+    released children also have their order set back to the parent's, which is
+    exactly what `refine`'s h-step gives them — so the two verbs invert each
+    other on the whole order field, not merely on its observable part;
+  - a **p-mark** `(level, cell)` lowers that cell's own order by one, floored at
+    `pmin`.
+
+Releasing a cover whose children are themselves covered is a no-op rather than
+an error: the region is carried further down and the deeper level is what holds
+it, so releasing this level alone would leave a hole. Release the stack from the
+top down and each call is well defined.
+
+Lowering the order of a cell a finer level has taken over is **rejected**. Under
+leaf semantics a covered cell has already shed its high-order modes, so the
+change is invisible while the cover is live and appears without warning when it
+lifts — measured, 173.5× the energy error, with `diagnostics`, `isposdef`, the
+residual norm and `estimate`'s consistency flag all unchanged to the last digit.
+There is no diagnostic that catches it, so it is refused here instead.
+
+There is deliberately no `coarsen(V, estimate)` form. Which cells to release is
+not settled: measured on a translating layer, a monotone loop reached a lower
+error at fewer unknowns than every release rule tried, because in a diffusive
+problem the heat stays and there is little to release. Release earns its place on
+unknowns rather than on error — a monotone loop carries 2.6× the from-scratch
+optimum after six layer-widths of travel — so the caller marks, and the
+package does not pretend to know the rule.
+"""
+function coarsen(V::Space{D,T}; h=(), p=(), pmin::Integer=1) where {D,T}
+    nlevels = length(V.levels)
+    pmin >= 1 || throw(ArgumentError("pmin must be at least 1; got $pmin"))
+    check(k) = 1 <= k <= nlevels ||
+               throw(ArgumentError("coarsen: marked level $k is outside the space's 1:$nlevels"))
+
+    masks = Dict{Int,Any}()
+    fields = Dict{Int,Any}()
+    mask_of(k) = get!(() -> active_cells(V; level=k), masks, k)
+    field_of(k) = get!(() -> cell_orders(V; level=k), fields, k)
+
+    for (k, cell) in p
+        check(k)
+        _is_leaf(V, k, cell, _below(V, k)) ||
+            throw(ArgumentError("coarsen: cell $cell of level $k is covered by a finer level, " *
+                                "and lowering a covered cell's order is not observable until the " *
+                                "cover lifts. Release the cover first."))
+        field = field_of(k)
+        field[cell] = max.(field[cell] .- 1, Int(pmin))
+    end
+
+    for (k, cell) in h
+        check(k)
+        k < nlevels ||
+            throw(ArgumentError("coarsen: level $k is the finest, so it covers nothing to release"))
+        children = overlapping_cells(V, [cell]; from=k, to=k + 1)
+        mask = mask_of(k + 1)
+        field = field_of(k + 1)
+        # The released children take the PARENT's order, which is exactly what
+        # `refine`'s h-step gives them. An inactive cell's order is unobservable,
+        # so this is not required for correctness — but it makes the two verbs
+        # inverses of the whole order field rather than only of its observable
+        # part, which is what lets a transient loop refine and release the same
+        # region thousands of times without drift. Note `nominal_order` is NOT the
+        # value to use: it is a maximum kept for buffer sizing, and on a level
+        # that has been elevated it has already moved.
+        parent_order = field_of(k)[cell]
+        deeper = k + 1 < nlevels ? _below(V, k + 1) : nothing
+        for child in CartesianIndices(children)
+            children[child] || continue
+            mask[child] || continue
+            # A child that is itself covered is not this level's to release.
+            _is_leaf(V, k + 1, child, deeper) || continue
+            mask[child] = false
+            field[child] = parent_order
+        end
+    end
+
+    released = isempty(masks) ? V :
+               adapt(V, (k => masks[k] for k in sort!(collect(keys(masks))))...)
+    isempty(fields) && return released
+    return elevate(released, (k => fields[k] for k in sort!(collect(keys(fields))))...)
 end
