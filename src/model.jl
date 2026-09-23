@@ -16,10 +16,12 @@
 # `Problem` this file owns the prepared form of) and `assembly.jl`
 # (whose `assemble!` mutates `model.matrix` / `model.rhs`).
 #
-# Stale-solution detection contract: each of `move!`, `activate!`, and
-# `deactivate!` bumps `model.version`. A [`Solution`](@ref) carries the
-# version it was computed against; reusing a solution after a version bump
-# is caught by `_checked_coefficients` in `solvers.jl`.
+# Stale-solution detection contract: `model.version` is a pin on the active dof
+# numbering, seeded by `prepare` from a structural digest of the discretisation
+# (`_discretisation_pin`) and moved on by each of `move!`, `activate!` and
+# `deactivate!`. A [`Solution`](@ref) carries the pin it was computed against;
+# reusing it against a mutated model, or against a model of a different
+# discretisation, is caught by `_checked_coefficients` in `solvers.jl`.
 
 # ── Assembly diagnostics ──────────────────────────────────────────────────────
 
@@ -360,9 +362,19 @@ re-thread a fresh value through. Fields:
     the fold. [`activate!`](@ref) / [`deactivate!`](@ref) record their cell
     flips here as well as on `problem`, since a flip is a caller choice the
     next `move!` must reproduce.
-  - `version::Int` — bump counter for stale-solution detection. Every
-    in-place mutation that invalidates the assembled state bumps this;
-    a [`Solution`](@ref) carrying an older version raises on reuse.
+  - `version::Int` — the discretisation pin: the token a [`Solution`](@ref)
+    or [`QuadField`](@ref) carries so a consumer can ask whether it is still
+    a coefficient vector of *this* model's active dof numbering. It is
+    **not** a count of anything. [`prepare`](@ref) seeds it from a structural
+    digest of the discretisation, so two models prepared from the same
+    discretisation carry the same pin and a state vector moves freely between
+    them — which is what a transient loop that rebuilds its problem every step
+    needs — while two different discretisations carry different pins and a
+    carry-over raises. Every in-place mutation that invalidates the assembled
+    state then moves the pin on as well, so a solution taken before a
+    [`move!`](@ref) or a mask flip raises as it always has. See
+    `_discretisation_pin` for exactly what the digest reads and, just as
+    importantly, what it must not.
   - `space_plans::Vector{IntegrationPlan{D,T}}` — cached integration
     plan per *distinct* participating discretisation, in the
     first-appearance order of `problem_spaces``(problem)`. A
@@ -630,6 +642,112 @@ function prepare(problem::Problem{D,T}; kwargs...) where {D,T}
     _prepared_model(problem, (; kwargs...), nothing)
 end
 
+# ── Discretisation pin ────────────────────────────────────────────────────────
+#
+# `Model.version` is the token a `Solution` or `QuadField` carries so a consumer
+# can ask "are you still a coefficient vector of this model's active numbering".
+# A bare counter answers that only for an in-place mutation of one model. Every
+# `prepare` used to hand back the literal `1`, so two *independently* prepared
+# models were indistinguishable — and independently prepared models are the
+# normal case, not a corner: `adapted`, `elevated`, `moved`, `estimate`'s twin
+# and every rebuild inside an adaptive or transient loop produce them. A
+# solution from one was then accepted on the other whenever the active-unknown
+# counts happened to agree, which on a ladder is ordinary, because many
+# structurally different masks give the same count. Measured: an `l2_error` of
+# 3.2615e-3 reported where the truth was 3.2095e-3, and a complete `estimate`
+# computed from the wrong coefficient vector, neither of them raising.
+#
+# So the token is SEEDED from a structural digest of the discretisation and
+# still moved on in place. Two preparations of the same discretisation get the
+# same seed, which is what a transient loop that re-prepares at an unchanged
+# space and carries its state forward needs; two different discretisations get
+# different seeds, so the carry-over raises; an in-place mutation still moves
+# the token, so every raise the counter produced before is still produced.
+#
+# WHAT GOES IN — everything the active dof numbering is a function of:
+#
+#   * per level, in order: id, role, mode, basis family name, `prune_covered`,
+#     the mesh's corner bits and cell counts, the activation mask's bits, and
+#     the order field's palette, class map and nominal;
+#   * per field: name, component count, offset, raw and active dof counts, and
+#     the `(raw, component) -> active id` map itself — which is precisely the
+#     numbering a coefficient vector indexes into, and the only thing that
+#     separates two models differing solely in *which* dofs a Dirichlet
+#     condition constrains rather than how many;
+#   * the system's active-unknown total.
+#
+# WHAT STAYS OUT, and this boundary is the load-bearing half: anything carrying
+# object identity. Forms, closures, `Field` objects, `dirichlet` specs and their
+# data, the `PhysicalDomain`. A problem rebuilt at an unchanged discretisation
+# constructs all of them afresh every step, so digesting any of them would break
+# the same legitimate loop a bare counter breaks, only from the other side. The
+# geometry is not thereby ignored: its effect on the numbering is the fictitious
+# fold, and the folded masks are digested above. A datum change goes through
+# `update_dirichlet!`, which rewrites values over an unchanged numbering and
+# deliberately does not move the pin.
+#
+# FNV-1a over the integers themselves rather than `Base.hash`, for the reason
+# `test/test_graded_golden.jl` gives for its own digest: `Base.hash` carries no
+# stability guarantee across Julia versions, and this value is displayed, goes
+# into the reproducibility report (`postprocessing.jl`) and may be quoted back
+# in a bug report.
+const _PIN_PRIME = 0x00000100000001b3
+const _PIN_BASIS = 0xcbf29ce484222325
+
+# `x % UInt64` is modular and total, so a `UInt16` order class, a `Bool` and a
+# negative `Int` all fold without a range check.
+function _pin(h::UInt64, x::Integer)
+    v = x % UInt64
+    for shift in 0:8:56
+        h = (h ⊻ ((v >> shift) & 0xff)) * _PIN_PRIME
+    end
+    return h
+end
+_pin(h::UInt64, x::AbstractFloat) = _pin(h, reinterpret(UInt64, Float64(x)))
+_pin(h::UInt64, s::Symbol) = foldl((a, c) -> _pin(a, UInt32(c)), String(s); init=_pin(h, 0x5f))
+_pin(h::UInt64, t::Tuple) = foldl(_pin, t; init=_pin(h, length(t)))
+# A `BitArray` folds through its packed chunks rather than bit by bit: the same
+# value, 64× fewer rounds, and the size is mixed in so two masks that differ
+# only in shape cannot collide on a shared chunk pattern.
+_pin(h::UInt64, b::BitArray) = foldl(_pin, b.chunks; init=_pin(h, size(b)))
+_pin(h::UInt64, a::AbstractArray) = foldl(_pin, a; init=_pin(h, size(a)))
+
+# The digest itself. `spaces` are the *effective* (post-fold, re-indexed)
+# subdomain spaces and `layout` the dof layout built from them, so this reads
+# the discretisation as every consumer sees it rather than as the caller wrote
+# it. Returned as a non-negative `Int` so the pin prints and compares like the
+# counter it replaces, and so the `+= 1` a mutator applies cannot wrap it into
+# the sign bit.
+function _discretisation_pin(spaces, layout::SystemLayout)
+    h = _pin(_PIN_BASIS, length(spaces))
+    for V in spaces
+        h = _pin(h, level_count(V))
+        for level in V.levels
+            h = _pin(h, level.id)
+            h = _pin(h, level.role)
+            h = _pin(h, level.mode)
+            h = _pin(h, basis_name(level.basis))
+            h = _pin(h, level.prune_covered)
+            h = _pin(h, level.mesh.domain.lower)
+            h = _pin(h, level.mesh.domain.upper)
+            h = _pin(h, level.mesh.cells)
+            h = level.mask === nothing ? _pin(h, -1) : _pin(h, level.mask.on)
+            h = _pin(h, level.orders.palette)
+            h = _pin(h, level.orders.class)
+            h = _pin(h, level.orders.nominal)
+        end
+    end
+    for f in layout.fields
+        h = _pin(h, f.name)
+        h = _pin(h, f.components)
+        h = _pin(h, f.offset)
+        h = _pin(h, length(f.dofs.raw_keys))
+        h = _pin(h, f.dofs.active_count)
+        h = _pin(h, f.dofs.active_component)
+    end
+    return Int(_pin(h, layout.active_unknowns) & 0x7fff_ffff_ffff_ffff)
+end
+
 # The body of [`prepare`](@ref), with the moment-fit caches optionally supplied.
 #
 # `prepare` starts them empty. Every derivation of an existing model hands that
@@ -694,7 +812,8 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                                surface_region_count=_region_count(surface_regions),
                                interface_region_count=_region_count(interface_regions))
     _set_plan_stats_multi!(diag, space_plans)
-    return Model{D,T,typeof(effective_problem)}(effective_problem, problem.space, 1, space_plans,
+    return Model{D,T,typeof(effective_problem)}(effective_problem, problem.space,
+                                                _discretisation_pin(spaces, layout), space_plans,
                                                 fit_caches, layout, nothing, nothing, facet_regions,
                                                 surface_regions, interface_regions,
                                                 Dict{Symbol,DirichletProjection{D,T}}(), diag,
@@ -823,9 +942,9 @@ function _problem_with_space(problem::Problem, new_space::Space)
 end
 
 function Base.show(io::IO, model::Model{D}) where {D}
-    print(io, "Model(D=", D, ", version=", model.version, ", active=", active_unknowns(model.dofs),
-          ", regions=", diagnostics(model).integration_regions, ", assembled=",
-          model.matrix !== nothing, ")")
+    print(io, "Model(D=", D, ", pin=0x", string(model.version; base=16), ", active=",
+          active_unknowns(model.dofs), ", regions=", diagnostics(model).integration_regions,
+          ", assembled=", model.matrix !== nothing, ")")
 end
 
 # Condition-number estimator for small assembled matrices. Returns `NaN`

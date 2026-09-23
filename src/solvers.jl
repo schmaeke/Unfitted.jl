@@ -38,13 +38,21 @@ end
     Solution{C}
 
 Wrapper around an active coefficient vector tied to a specific
-[`Model`](@ref) version. The version pin is the stale-solution
-detection mechanism: the mutators that change the dof numbering
-([`move!`](@ref), [`activate!`](@ref), [`deactivate!`](@ref)) bump
-`model.version`, and every consumer that takes a `Solution` calls
-`_checked_coefficients` to assert the versions still match. The result is
-that a `Solution` built against an older model state raises at the use site
-instead of silently returning wrong numbers.
+[`Model`](@ref)'s active dof numbering. The pin it carries is the
+stale-solution detection mechanism: every consumer that takes a `Solution`
+calls `_checked_coefficients` to assert that the pin still matches the model
+it is handed, so a `Solution` used against a numbering it was not computed
+on raises at the use site instead of silently returning wrong numbers.
+
+Two things move the pin, and both are caught. The mutators that change the
+dof numbering ([`move!`](@ref), [`activate!`](@ref), [`deactivate!`](@ref))
+move it on in place. And a model of a *different discretisation* carries a
+different pin, because `model.version` is seeded from a structural digest of
+the discretisation rather than from a counter — so a solution taken on one
+[`adapted`](@ref) / [`moved`](@ref) / [`prepare`](@ref)d model is refused by
+another, which is what [`transfer`](@ref) exists for. Two models prepared
+from the *same* discretisation share a pin, so a transient loop that rebuilds
+its problem every step and carries its state forward keeps working.
 
 [`assemble!`](@ref) and [`update_dirichlet!`](@ref) deliberately do *not*
 bump: they refill the matrix and right-hand side over an unchanged
@@ -58,7 +66,7 @@ Fields:
   - `coefficients::C` — active-dof coefficient vector. Stored as
     supplied (no defensive copy) so external time integrators can
     update the same buffer in place.
-  - `model_version::Int` — the `model.version` at the time of solve.
+  - `model_version::Int` — the `model.version` pin at the time of solve.
   - `diagnostics::SolverDiagnostics` — solver record.
 
 Use [`solution`](@ref) or [`solve!`](@ref) to construct.
@@ -79,8 +87,8 @@ function Base.show(io::IO, diagnostics::SolverDiagnostics)
 end
 
 function Base.show(io::IO, solution::Solution)
-    print(io, "Solution(version=", solution.model_version, ", dofs=", length(solution.coefficients),
-          ", method=:", solution.diagnostics.method, ", residual=",
+    print(io, "Solution(pin=0x", string(solution.model_version; base=16), ", dofs=",
+          length(solution.coefficients), ", method=:", solution.diagnostics.method, ", residual=",
           solution.diagnostics.residual_norm, ")")
 end
 
@@ -109,14 +117,18 @@ end
 # ── Coefficient checks (cross-module) ─────────────────────────────────────────
 
 # Stale-solution check used by every consumer that takes a `Solution`
-# (transfer, evaluation, post-processing). Returns the coefficient
-# vector when version and length agree; raises clear errors otherwise.
-# This is the single source of truth for "does this Solution still
-# match the model that produced it"; assembly, projection, and
-# postprocessing all route through here.
+# (transfer, evaluation, post-processing). Returns the coefficient vector when
+# the pin and the length agree; raises clear errors otherwise. This is the
+# single source of truth for "does this Solution still match the model it is
+# being used on"; assembly, projection, and postprocessing all route through
+# here. The length check stays even though the pin implies it, because it is
+# the one that catches a caller-built coefficient vector of the wrong size.
 function _checked_coefficients(solution::Solution, model::Model)
     solution.model_version == model.version ||
-        throw(ArgumentError("solution belongs to model version $(solution.model_version), but model is at version $(model.version)"))
+        throw(ArgumentError("this solution was computed on a different discretisation, or on this model " *
+                            "before it was mutated (solution pin 0x$(string(solution.model_version; base=16)), " *
+                            "model pin 0x$(string(model.version; base=16))); carry it across with `transfer`, " *
+                            "or re-solve on this model"))
     length(solution.coefficients) == active_unknowns(model.dofs) ||
         throw(DimensionMismatch("solution coefficient vector does not match the model active space"))
     return solution.coefficients

@@ -38,10 +38,69 @@ end
                                Unfitted.SolverDiagnostics(:manual, 0.0, true))
     target_solution = transfer(source_solution, source_model, target_model)
 
-    @test source_model.version == 1
-    @test target_model.version == 1
+    # Two freshly prepared models of *different* discretisations. Their pins
+    # differ, which is what makes the transfer above mandatory rather than
+    # optional — see the two testsets below.
+    @test source_model.version != target_model.version
     @test target_solution.model_version == target_model.version
     @test l2_error(target_solution, target_model, x -> 2.0; norm=:absolute) < 1.0e-12
+end
+
+@testset "a solution does not cross between two models of the same size" begin
+    # The failure this pins. Both models are freshly prepared, both carry the
+    # same number of active unknowns, and their level-2 masks are structurally
+    # different — an ordinary coincidence on a ladder, where many different
+    # masks give the same count. While every `prepare` stamped the literal 1
+    # into `model.version` the guard compared 1 == 1 and then only a length, so
+    # a solution from one was accepted on the other in silence: an `l2_error` of
+    # 3.2615e-3 was reported where the truth was 3.2095e-3, and a complete
+    # `estimate` was computed from the wrong coefficient vector.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    V = ladder(omega; cells=4, depth=1, order=2)
+    function prepared(cells)
+        mask = falses(8, 8)
+        for c in cells
+            mask[c] = true
+        end
+        return prepare(poisson(adapt(V, 2 => mask); source=1.0,
+                               dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    end
+    a = prepared((CartesianIndex(3, 3), CartesianIndex(3, 4)))
+    b = prepared((CartesianIndex(6, 6), CartesianIndex(6, 7)))
+    ua = solve!(a)
+    solve!(b)
+
+    @test active_unknowns(a) == active_unknowns(b)      # the coincidence
+    @test a.version != b.version                        # ... which the pin sees through
+    @test_throws ArgumentError l2_error(ua, b, x -> 0.0)
+    @test_throws ArgumentError value(ua, b, (0.5, 0.5))
+    @test_throws ArgumentError estimate(b, ua)
+    @test_throws ArgumentError Unfitted._checked_quadfield(QuadField{Float64}(a), b)
+    # and the control: on its own model everything still works
+    @test value(ua, a, (0.5, 0.5)) isa Float64
+end
+
+@testset "a problem rebuilt at an unchanged discretisation keeps its state" begin
+    # The shape `examples/reproductions/traveling_laser_2d` runs: a fresh
+    # `Problem` every step — new `Field` object, new source closure, new
+    # `dirichlet` spec — prepared on a space built afresh from the same
+    # description, with the state carried forward and no transfer. This is why
+    # the pin digests structure only. Folding in anything that carries object
+    # identity (a closure, a spec, a `Field`, a `PhysicalDomain`) would break
+    # this loop exactly as badly as a bare counter breaks the testset above,
+    # only from the other side.
+    omega = box((0.0,), (1.0,))
+    described() = overlay(space(omega; cells=4, order=2), box((0.25,), (0.75,)); cells=2, order=3)
+    step() = prepare(poisson(described(); source=x -> 1.0 + x[1],
+                             dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    m1 = step()
+    u = solve!(m1)
+    m2 = step()
+
+    @test m2 !== m1 && m2.problem !== m1.problem       # genuinely rebuilt
+    @test m2.version == m1.version                     # ... and the same discretisation
+    @test l2_error(u, m2, x -> 0.0) == l2_error(u, m1, x -> 0.0)
+    @test value(u, m2, (0.5,)) == value(u, m1, (0.5,))
 end
 
 @testset "small overlap diagnostics expose conditioning risk" begin

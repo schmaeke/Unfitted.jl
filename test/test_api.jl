@@ -16,8 +16,11 @@ using LinearAlgebra
     @test diagnostics(model).integration_regions == 16
 
     old_plan = Unfitted.integration_plan(model)
+    before = model.version
     move!(model; level=2, to=box((0.2, 0.2), (0.6, 0.6)))
-    @test model.version == 2
+    # `version` is a pin on the dof numbering, not a count: `prepare` seeds it
+    # from the discretisation, and a mutation moves it on from there.
+    @test model.version == before + 1
     @test Unfitted.integration_plan(model) !== old_plan
     @test model.matrix === nothing
     @test diagnostics(model).integration_regions == 35   # merged (was 49 unmerged)

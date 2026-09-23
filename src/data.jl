@@ -22,9 +22,11 @@
     QuadField(data::AbstractVector{T}, model::Model)
 
 `T`-valued data indexed by `q.point` over a `Model`'s quadrature points.
-Carries the `model.version` at construction time so reuse against a
-stale model raises — the same contract [`Solution`](@ref) uses for
-solution coefficients.
+Carries the `model.version` pin at construction time so reuse against a
+mutated model, or against a model of a different discretisation, raises —
+the same contract [`Solution`](@ref) uses for solution coefficients, and
+for the same reason: the pin is a digest of the discretisation, so two
+models prepared from the same one share it and two different ones do not.
 
 Constructors:
 
@@ -84,18 +86,21 @@ Base.copy(qf::QuadField{T}) where {T} = QuadField{T}(copy(qf.data), qf.model_ver
 # Stale-QuadField check used by `transfer` and any consumer that reads
 # a `QuadField` against a `Model`. Same contract as
 # `_checked_coefficients` in `solvers.jl`: returns the data vector when
-# version and length agree, raises a clear error otherwise.
+# the pin and the length agree, raises a clear error otherwise.
 function _checked_quadfield(qf::QuadField, model::Model)
     qf.model_version == model.version ||
-        throw(ArgumentError("QuadField belongs to model version $(qf.model_version) but model is at version $(model.version)"))
+        throw(ArgumentError("this QuadField was built on a different discretisation, or on this model " *
+                            "before it was mutated (field pin 0x$(string(qf.model_version; base=16)), " *
+                            "model pin 0x$(string(model.version; base=16))); carry it across with " *
+                            "`transfer`"))
     length(qf.data) == nquadpoints(model) ||
         throw(DimensionMismatch("QuadField length $(length(qf.data)) does not match nquadpoints(model) = $(nquadpoints(model))"))
     return qf.data
 end
 
 function Base.show(io::IO, qf::QuadField{T}) where {T}
-    print(io, "QuadField{", T, "}(npoints=", length(qf.data), ", model_version=", qf.model_version,
-          ")")
+    print(io, "QuadField{", T, "}(npoints=", length(qf.data), ", pin=0x",
+          string(qf.model_version; base=16), ")")
 end
 
 # ── Transfer scheme ──────────────────────────────────────────────────────────
