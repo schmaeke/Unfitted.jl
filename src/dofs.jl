@@ -1208,15 +1208,72 @@ end
 """
     dof_value(layout::DofLayout, coefficients, raw, component=1) -> T
 
-Recover the value of component `component` of raw dof `raw`. Returns the
-constrained value when the dof is constrained, and `coefficients[active]`
-otherwise — i.e. the unified accessor used by assembly and
-post-processing when a basis-function contribution needs the actual dof
-value regardless of constraint status.
+Recover the value of component `component` of raw dof `raw` — the unified
+accessor every reconstruction path uses when a basis-function contribution needs
+the actual dof value regardless of constraint status.
+
+Three regimes, matching the three shapes of `raw_expansion` (see
+[`DofLayout`](@ref)): a free dof reads `coefficients[active]`; a strongly
+eliminated dof reads its [`constrained_value`](@ref), which is zero for an
+artificial-boundary or pruning elimination and the projected datum for nonzero
+Dirichlet data; and a **linear-constraint pivot** is reassembled from its
+expansion,
+
+    u_raw = constrained_value(raw) + Σᵢ wᵢ · u_{rᵢ} .
+
+That third branch is not an embellishment. A pivot is precisely the mechanism a
+basis family uses to impose C^m continuity or an arbitrary-mask trace condition,
+so reading `constrained_value` for it — which is zero — silently drops the dof's
+whole contribution from `value`, `field_gradient`, `l2_error`, `write_vtk` and
+`L2Projection`'s source reconstruction, while the *solve* is correct because
+assembly distributes through the same expansions when it emits. Measured on a
+6×6 degree-3 C¹ B-spline base under an L-masked 4×4 C¹ overlay (8 non-trivial
+expansions of 126 raws), the dropped term reached 4.79e-7 against a field of
+magnitude 7e-2 — silent, and small enough to pass a hand-written tolerance.
+
+The recursion terminates at depth one on a resolved layout, because
+[`_resolve_constraints!`](@ref) leaves every pivot expressed in
+constraint-*free* raws only. The identity-expansion test is what makes that
+robust rather than assumed: physical Dirichlet elimination happens in a later
+stage than constraint resolution, so a raw that is free with respect to the
+constraint system can still be eliminated on one component, and it carries the
+identity expansion `[(raw, 1)]` rather than an empty one.
+
+The `has_linear_constraints` short-circuit keeps the integrated-Legendre path —
+where every expansion is the identity or empty — at exactly its previous cost of
+one lookup and one branch.
 """
 function dof_value(layout::DofLayout, coefficients, raw::Integer, component::Integer=1)
     active = _active_component_dof(layout, raw, component)
-    return active == 0 ? constrained_value(layout, raw, component) : coefficients[active]
+    active == 0 || return coefficients[active]
+    value = constrained_value(layout, raw, component)
+    layout.has_linear_constraints || return value
+    return _expand_dof_value(layout, layout, coefficients, raw, component, value)
+end
+
+# Add a pivot's `Σᵢ wᵢ · u_{rᵢ}` to the value already recovered for `raw`, or
+# return that value unchanged when the raw carries no pivot expansion.
+#
+# Two layout arguments, and they are not the same object on a multi-field
+# problem: `dofs` owns the expansion table, while `outer` is the layout the
+# recursion must go back through, because a `FieldLayout` shifts the active id by
+# the field's offset and a bare `DofLayout` does not. Passing the field layout
+# down is what keeps the recovered value indexed into the *global* coefficient
+# vector.
+#
+# The "is this actually a pivot" test has two shapes and neither may recurse: an
+# empty expansion is a strong elimination, and the identity `[(raw, 1)]` belongs
+# to a constraint-free raw that a later Dirichlet stage eliminated on this
+# component. Recursing on the latter would not terminate.
+function _expand_dof_value(outer, dofs::DofLayout, coefficients, raw::Integer,
+                           component::Integer, value)
+    expansion = dofs.raw_expansion[raw]
+    isempty(expansion) && return value
+    length(expansion) == 1 && first(expansion[1]) == raw && return value
+    for (other, weight) in expansion
+        value += weight * dof_value(outer, coefficients, other, component)
+    end
+    return value
 end
 
 # ── FieldLayout and SystemLayout (multi-field problems) ───────────────────────
@@ -1287,13 +1344,16 @@ end
 
 Recover the value of component `component` of raw `raw` in this field,
 using the global active enumeration. Equivalent to the
-[`DofLayout`](@ref) version but resolves the per-field offset so
-`coefficients` is the global active vector.
+[`DofLayout`](@ref) version — including its reassembly of a
+linear-constraint pivot from `raw_expansion` — but resolves the per-field
+offset so `coefficients` is the global active vector.
 """
 function dof_value(layout::FieldLayout, coefficients, raw::Integer, component::Integer=1)
     global_dof = _field_component_dof(layout, raw, component)
-    return global_dof == 0 ? constrained_value(layout.dofs, raw, component) :
-           coefficients[global_dof]
+    global_dof == 0 || return coefficients[global_dof]
+    value = constrained_value(layout.dofs, raw, component)
+    layout.dofs.has_linear_constraints || return value
+    return _expand_dof_value(layout, layout.dofs, coefficients, raw, component, value)
 end
 
 """

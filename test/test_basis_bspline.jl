@@ -321,6 +321,60 @@ end
                                   basis=bspline(continuity_order=2))) == 25
 end
 
+@testset "Linear-constraint resolver: a pivot contributes its expansion to the field" begin
+    # `dof_value` used to read `constrained_value` for every eliminated raw, which
+    # is zero for a linear-constraint pivot. Assembly distributes through
+    # `raw_expansion` when it emits, so the *solve* was right and only the
+    # *reconstruction* dropped the pivot's contribution — silently, in `value`,
+    # `field_gradient`, `l2_error`, `write_vtk`, and L2Projection's source read.
+    #
+    # The witness is an identity that needs both paths: for a mass operator M and
+    # the active coefficient vector c of an L² projection,
+    #
+    #     cᵀ M c = ∫_Ω u_h²
+    #
+    # exactly, because both sides are the same quadratic form. The left side goes
+    # through assembly, the right through `dof_value`. Measured before the fix:
+    # 4.9e-2 relative on the C¹ masked level below, 5.8e-3 at C⁰, and 4.4e-7 on the
+    # base-plus-masked-overlay stack — small enough to sit under a hand-written
+    # tolerance, which is how it survived.
+    f(x) = sin(2.3 * x[1]) * cos(1.7 * x[2]) + 0.4 * x[1] * x[2]
+    function projection_gap(V)
+        u = field(:u, V)
+        model = prepare(Problem((u,); blocks=(mass_block(u),), loads=(source_load(u; source=f),)))
+        sol = solve!(model)
+        c = sol.coefficients
+        quadratic = c' * model.matrix * c
+        integral = 0.0
+        foreach_quadrature_point(model; state=sol) do q
+            v = value(q.state, u)
+            integral += q.weight * v * v
+            return nothing
+        end
+        return abs(quadratic - integral) / abs(quadratic),
+               Unfitted.has_linear_constraints(model.dofs)
+    end
+
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    mask = trues(6, 6)
+    mask[4:6, 4:6] .= false                          # L-shaped active region
+    for m in 0:1                                     # m < p − 1 ⇒ genuine pivots
+        gap, pivots = projection_gap(space(Ω; cells=6, order=3, active=mask,
+                                           basis=bspline(; continuity_order=m)))
+        @test pivots
+        @test gap < 1e-13
+    end
+    # Two controls, both of which were already correct and must stay so: a family
+    # that produces no pivots at all, and the *maximal*-continuity B-spline level,
+    # whose mask constraints resolve to strong eliminations rather than pivots.
+    for V in (space(Ω; cells=6, order=3, active=mask),
+              space(Ω; cells=6, order=3, active=mask, basis=bspline(; continuity_order=2)))
+        gap, pivots = projection_gap(V)
+        @test !pivots
+        @test gap < 1e-13
+    end
+end
+
 @testset "BSpline extension: C¹ overlay strictly inside the base assembles" begin
     # B-spline base + C¹ B-spline overlay whose four corners are *inside*
     # the base's mesh, so each corner raw participates in artificial-
