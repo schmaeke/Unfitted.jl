@@ -788,7 +788,7 @@ end
     # fixture exercises the B-spline assembly path regardless.
     let V0 = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3, basis=bspline()),
         V = overlay(V0, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3,
-                    basis=bspline(continuity_order=1))
+                    basis=bspline(continuity=1))
 
         model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
         _check_scatter_assemble!(model)

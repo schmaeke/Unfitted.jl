@@ -166,7 +166,7 @@ Fields:
     integrated Legendre family and the C⁰ B-spline mesh-edge path never
     produce such expansions, so this is `false` for them and assembly
     takes the lightweight single-target path; B-spline linear
-    constraints (masks, `continuity_order ≥ 1`, overlay interiors) set
+    constraints (a mask on a level whose `continuity` is below `p − 1`) set
     it `true` and assembly takes the expansion-distributing path. The
     flag lets the hot loop pick the cheaper path without paying the
     general machinery's per-emission indirection on the common case.
@@ -1265,8 +1265,8 @@ end
 # empty expansion is a strong elimination, and the identity `[(raw, 1)]` belongs
 # to a constraint-free raw that a later Dirichlet stage eliminated on this
 # component. Recursing on the latter would not terminate.
-function _expand_dof_value(outer, dofs::DofLayout, coefficients, raw::Integer,
-                           component::Integer, value)
+function _expand_dof_value(outer, dofs::DofLayout, coefficients, raw::Integer, component::Integer,
+                           value)
     expansion = dofs.raw_expansion[raw]
     isempty(expansion) && return value
     length(expansion) == 1 && first(expansion[1]) == raw && return value

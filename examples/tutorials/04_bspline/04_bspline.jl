@@ -22,6 +22,24 @@ treats it as one: geometry, assembly, constraints, projection and
 solvers are family-agnostic, so the only thing that changes below is
 one keyword.
 
+**And the smoothness survives the superposition.** That is the part
+worth pausing on, because it is not automatic. An overlay contribution
+is extended by zero outside its own box, so it can only be smooth there
+if it *vanishes* there — to the same order. `bspline()` defaults to
+`continuity = :maximal`, which keeps exactly the functions whose whole
+support lies inside the level's active region; such a function is
+already `C^(p−1)` everywhere and identically zero outside its support,
+so its extension by zero costs nothing and needs no constraint
+equation. The superposed solution is therefore `C^(p−1)` across the
+overlay boundary too, not merely inside each level. You pay for that in
+unknowns, and the ledger is exact: a level whose faces are all
+artificial keeps `∏_d (n_d − p_d)` functions, so its active region has
+to be more than `p` cells wide in every axis before it carries a single
+unknown. [`support_extension`](@ref) is the helper that turns a marked
+region into one wide enough, and `continuity = m` for an integer `m`
+is the other direction — more unknowns, less smoothness, a globally
+`C^m` stack.
+
 **Loading the family.** `bspline()` lives in a package *extension*. The
 name is always importable from `Unfitted`, but the methods behind it
 only exist once its trigger package is loaded:
@@ -85,11 +103,18 @@ _, _, _, report_base = solve_and_report(V_base, "Part 1a — B-spline base level
 
 # ── Part 1b: a nested overlay ────────────────────────────────────────────────
 #
-# The overlay covers [¼, ¾]² with 4 cells per axis. Its cell size is
-# exactly the base's, and its edges fall on base cell boundaries, so the
-# overlay mesh is *nested* in the base mesh. Equal cell size is the
-# simplest nested case and isolates the effect this section is about; a
-# genuinely finer nested overlay is treated in exactly the same way.
+# The overlay covers [¼, ¾]² with 16 cells per axis — four times the
+# base's resolution — and its edges fall on base cell boundaries, so the
+# overlay mesh is *nested* in the base mesh.
+#
+# Sixteen and not four, and that is the dof ledger showing its teeth. At
+# `continuity = :maximal` the overlay keeps `(16 − 3)² = 169` functions;
+# at four cells per axis it would keep `(4 − 3)² = 1`, and the dedup
+# below removes exactly one base function either way, so a four-cell
+# overlay would leave the unknown count where it started. That is not a
+# defect to route around — a `C²` function that vanishes outside a
+# four-cell box is a thin thing — it is the reason a spline level's
+# refined region has to be chosen with the support in mind.
 #
 # Nesting is the natural thing to reach for, and for this family it is
 # also a trap. A B-spline overlay of the same degree, on a mesh whose
@@ -109,7 +134,7 @@ _, _, _, report_base = solve_and_report(V_base, "Part 1a — B-spline base level
 # dropped from the base, none from the overlay. That is the whole
 # mechanism, visible as a number.
 
-V_nested = overlay(V_base, box((0.25, 0.25), (0.75, 0.75)); cells=4)
+V_nested = overlay(V_base, box((0.25, 0.25), (0.75, 0.75)); cells=16)
 model_nested, solution_nested, u_nested, report_nested = solve_and_report(V_nested,
                                                                           "Part 1b — a nested B-spline overlay on [¼, ¾]²")
 
@@ -125,7 +150,7 @@ model_nested, solution_nested, u_nested, report_nested = solve_and_report(V_nest
 # (a few hundred unknowns), and `NaN` above that.
 
 V_undeduped = overlay(space(omega; cells=8, order=3, basis=bspline()),
-                      box((0.25, 0.25), (0.75, 0.75)); cells=4)
+                      box((0.25, 0.25), (0.75, 0.75)); cells=16)
 _, _, _, report_undeduped = solve_and_report(V_undeduped,
                                              "Part 1c — the same stack, deduplication switched off";
                                              parameters=(:pruning => "off",), prune=false)
@@ -139,12 +164,12 @@ println("u_h(0.5, 0.5) = ", value(solution_nested, model_nested, u_nested, (0.5,
 println()
 
 # The undeduplicated operator is numerically singular: its condition
-# number lands around 3e16, past the 1/ε ≈ 4.5e15 at which double
+# number lands around 7e15, past the 1/ε ≈ 4.5e15 at which double
 # precision has nothing left to give. The direct solver still returns a
 # plausible-looking answer, which is precisely what makes this failure
 # mode dangerous — nothing announces itself. One redundant unknown costs
-# roughly fourteen orders of magnitude of conditioning — 687 against
-# 3.43e16, measured.
+# roughly thirteen orders of magnitude of conditioning — 253.2 against
+# 7.04e15, measured.
 
 # ── Part 2: B-splines on an immersed domain ──────────────────────────────────
 #
@@ -189,8 +214,9 @@ println()
 # ── What to check when this script runs ──────────────────────────────────────
 #
 # Part 1: `reduced mode counts` is `[1, 0]`, the deduplicated condition
-# number is a few hundred while the undeduplicated one is around 1e17,
-# and `u_h(½, ½)` agrees with the series reference to about five decimals.
+# number is a few hundred while the undeduplicated one is around 1e16,
+# and `u_h(½, ½)` agrees with the series reference to seven decimals
+# (measured 0.07367134 against 0.07367135, 249 unknowns).
 #
 # Part 2: the cut-region count is nonzero with no fit failures, and the
 # two families agree to a few times 1e-5 — the size of their own

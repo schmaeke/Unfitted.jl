@@ -1301,7 +1301,7 @@ strict mode and silently drops those coefficients otherwise.
 The transfer is exact to roundoff for integrated Legendre and for maximum-regularity
 B-splines, because reduction removes exactly the redundancy and the source field
 is still in the target's span. It is not exact for reduced-continuity B-splines
-(`bspline(; continuity_order = 0)` or `1` at degree 3), where a refine step was
+(`bspline(; continuity = 0)` or `1` at degree 3), where a refine step was
 measured to lose about 2e-5 per step — an amount comparable with the
 discretisation error, so it accumulates over a transient. That behaviour is a
 property of the family's own reduction rule rather than of this call.
@@ -1438,6 +1438,20 @@ function active_cells(model::Model; level::Integer, effective::Bool=true)
     lvl = V.levels[_check_level(V, level)]
     lvl.mask === nothing && return trues(lvl.mesh.cells)
     return copy(lvl.mask.on)
+end
+
+"""
+    support_extension(model::Model, cells; level) -> BitArray{D}
+
+The `Model` spelling of [`support_extension`](@ref)`(::Space, cells; level)`, for
+a marking loop that has a prepared model rather than a bare space. The dilation
+depends only on the level's mesh and basis family, both of which a fold leaves
+alone, so this reads the pre-fold space and the answer is the one to hand back to
+[`adapt`](@ref) or [`activate!`](@ref) — neither of which may be fed a laundered
+fold (see [`active_cells`](@ref)).
+"""
+function support_extension(model::Model, cells; level::Integer)
+    return support_extension(model.prefold_space, cells; level)
 end
 
 # ── Public: refresh Dirichlet values without rebuilding the model ────────────

@@ -697,8 +697,8 @@
              (name="tutorials/03_immersed_fcm", env=Dict{String,String}(), requires=(),
               check=check_immersed_fcm, tol=1.0e-3),
              # The B-spline family. No L² error at all (see `check_bspline`);
-             # measured instead: 105 unknowns at cond 687.1 deduplicated
-             # against 106 at 3.43e16 undeduplicated, u_h(½,½) within 4.67e-5
+             # measured instead: 249 unknowns at cond 253.2 deduplicated
+             # against 250 at 7.04e15 undeduplicated, u_h(½,½) within 1.6e-8
              # relative of the series value, and 1.15e-5 largest cross-family
              # pointwise gap. Part 1c builds its stack through
              # `prepare(…; prune = false)`; measured bit-for-bit identical to

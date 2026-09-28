@@ -1181,7 +1181,7 @@ end
 #
 #   * `LocalDofExpansion` tables → the general linear-constraint path,
 #     distributing each emission through the test and trial expansions
-#     (B-spline masks / `continuity_order ≥ 1`);
+#     (a B-spline mask below maximal continuity);
 #   * `Matrix{Int}` tables → the lightweight path for layouts with no
 #     non-trivial linear constraints (integrated Legendre and the C⁰
 #     B-spline mesh-edge path), where every raw has a single

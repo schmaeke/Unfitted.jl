@@ -64,18 +64,144 @@ end
     @test_throws ArgumentError Unfitted.local_basis_indices(fam, (3, 3), :trunk)
 end
 
-@testset "BSpline extension: continuity_order validation" begin
-    # Negative continuity_order is rejected at factory time.
-    @test_throws ArgumentError bspline(continuity_order=-1)
-    # continuity_order > p - 1 is rejected at level construction.
+@testset "BSpline extension: continuity validation" begin
+    # Negative continuity is rejected at factory time, and so is a symbol that is
+    # not `:maximal`.
+    @test_throws ArgumentError bspline(continuity=-1)
+    @test_throws ArgumentError bspline(continuity=:smooth)
+    # continuity > p − 1 is rejected at level construction.
     @test_throws ArgumentError space(box((0.0,), (1.0,)); cells=4, order=2,
-                                     basis=bspline(continuity_order=2))
-    # Too-thin level for the requested continuity is rejected.
-    @test_throws ArgumentError space(box((0.0,), (1.0,)); cells=1, order=2,
-                                     basis=bspline(continuity_order=1))
-    # Valid C¹ family on a degree-2 mesh.
-    V = space(box((0.0,), (1.0,)); cells=8, order=3, basis=bspline(continuity_order=1))
+                                     basis=bspline(continuity=2))
+    # Too-thin level for a *clamped* continuity is rejected: eliminating m + 1
+    # functions per side must leave something to pivot onto.
+    @test_throws ArgumentError space(box((0.0,), (1.0,)); cells=1, order=3,
+                                     basis=bspline(continuity=1))
+    # `:maximal` carries no thickness requirement, because it clamps nothing. A
+    # level too thin to hold a whole support contributes no functions, which is a
+    # statement about the spline space (minimal support needs p + 1 cells) rather
+    # than a misuse — an adaptive loop that wakes a small cluster must reach it.
+    Vthin = space(box((0.0,), (1.0,)); cells=1, order=2, basis=bspline())
+    @test Vthin.levels[1].basis isa Unfitted.BasisFamily
+    # Valid C¹ family on a degree-3 mesh.
+    V = space(box((0.0,), (1.0,)); cells=8, order=3, basis=bspline(continuity=1))
     @test V.levels[1].basis isa Unfitted.BasisFamily
+    # An integer request that already equals p − 1 on every axis is `:maximal` by
+    # another name: the same space, reached by selection rather than by a
+    # constraint cascade. The family normalises the one spelling into the other,
+    # so the two levels are indistinguishable afterwards.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    B = box((0.25, 0.25), (0.75, 0.75))
+    max_family = space(Ω; cells=6, order=3, basis=bspline()).levels[1].basis
+    int_family = space(Ω; cells=6, order=3, basis=bspline(continuity=2)).levels[1].basis
+    @test max_family.continuity == int_family.continuity
+    free(b) = Unfitted.active_unknowns(prepare(mass(overlay(space(Ω; cells=16, order=3,
+                                                                  basis=bspline()), B; cells=8,
+                                                            order=3, basis=b))).dofs)
+    @test free(bspline()) == free(bspline(continuity=2))
+end
+
+@testset "BSpline extension: support selection — the dof ledger is the closed form" begin
+    # The two halves of the selection rule, as counts. A level whose faces are all
+    # PHYSICAL keeps every function it has — nothing is artificial, so nothing has
+    # to vanish — and a level whose faces are all ARTIFICIAL keeps exactly the ones
+    # whose whole `(p + 1)`-cell support fits inside it.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    free(V) = Unfitted.active_unknowns(prepare(mass(V)).dofs)
+    for p in 1:4, n in (4, 8)
+        @test free(space(Ω; cells=n, order=p, basis=bspline())) == (n + p)^2
+    end
+    # An overlay on a base fine enough that nothing is nested, so the count below is
+    # the overlay's own contribution and not a dedup in disguise.
+    for p in 1:4, n in (2, 3, 5, 7, 11)
+        base = space(Ω; cells=16, order=p, basis=bspline())
+        V = overlay(base, box((0.25, 0.25), (0.75, 0.75)); cells=n, order=p, basis=bspline())
+        @test free(V) - free(base) == max(0, n - p)^2
+    end
+    # Arbitrary mask geometries are a per-function containment test, so they neither
+    # need the mask to be separable nor produce a single linear-constraint pivot —
+    # which is what keeps assembly on its cheap single-target emission path and makes
+    # the reconstruction defect `dof_value` used to carry unreachable here.
+    for p in 2:3
+        for mask in (let m = trues(12, 12)
+                         m[7:12, 7:12] .= false
+                         m
+                     end,                                        # L-shape
+                     let m = trues(12, 12)
+                         m[4:8, 4:8] .= false
+                         m
+                     end,                                        # hole
+                     BitArray([i + j <= 12 for i in 1:12, j in 1:12]))   # staircase
+            V = space(Ω; cells=12, order=p, basis=bspline(), active=mask)
+            model = prepare(mass(V))
+            @test !Unfitted.has_linear_constraints(model.dofs)
+            A = Symmetric(Matrix(assemble_matrix(model, mass_block(field(:u, V)))))
+            @test rank(A) == Unfitted.active_unknowns(model.dofs)
+            @test isposdef(A)
+        end
+    end
+end
+
+@testset "BSpline extension: the superposition is smooth, not merely each level" begin
+    # The property the family exists for, measured where it can fail: across the
+    # ARTIFICIAL boundary of an overlay, which is the one place a superposition can
+    # lose the smoothness its levels have. Probe the jump in ∂u/∂x₁ across the
+    # overlay face at x₁ = ¼ as the probe closes in. The measured quantity is
+    # `|∂₁u(¼ − ε) − ∂₁u(¼ + ε)|`, which for a C¹ field is `2ε·|∂₁₁u| + O(ε²)` and
+    # therefore falls by ten for every decade in ε; for a merely C⁰ field it tends
+    # to the jump itself and stops falling.
+    # Degree 2, and the last decade before round-off: the smooth term `2ε·∂₁₁u`
+    # dominates a genuine jump until ε is small enough, so a ratio read at
+    # ε = 1e-3 says nothing about either case. Measured across the four decades,
+    # `:maximal` falls by ten at every one of them while `continuity = 0` flattens
+    # out — the jump itself — between the third and the fourth.
+    source(x) = 2.0 * pi^2 * sin(pi * x[1]) * sin(pi * x[2])
+    function decade_ratio(basis)
+        V = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=2, basis=basis)
+        V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=8, order=2, basis=basis)
+        model = prepare(poisson(V; source=source, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+        solution = solve!(model)
+        jump(ε) = maximum(abs(field_gradient(solution, model, (0.25 - ε, y))[1] -
+                              field_gradient(solution, model, (0.25 + ε, y))[1])
+                          for y in (0.35, 0.5, 0.65))
+        return jump(1.0e-4) / jump(1.0e-5)
+    end
+    # `:maximal` is C¹ or better across the face, so the ratio is ten.
+    @test decade_ratio(bspline()) ≈ 10.0 rtol = 1.0e-3
+    # `continuity = 0` keeps the overlay's boundary functions, so the normal
+    # derivative genuinely jumps and the ratio collapses towards one.
+    @test decade_ratio(bspline(; continuity=0)) < 1.5
+    # The default family is C⁰ across the same face, for the same reason.
+    @test decade_ratio(IntegratedLegendre()) < 1.5
+end
+
+@testset "support_extension dilates by the family's support radius" begin
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    marked = [CartesianIndex(8, 8), CartesianIndex(8, 9), CartesianIndex(9, 8),
+              CartesianIndex(9, 9)]
+    # Integrated Legendre's modes are cell-local or shared across the face they sit
+    # on, so its radius is zero and the dilation is the identity.
+    V = space(Ω; cells=16, order=3)
+    @test support_extension(V, marked; level=1) ==
+          Unfitted._normalize_mask(marked, V.levels[1].mesh).on
+    # A degree-p B-spline reaches p cells, so a 2×2 block becomes (2 + 2p)².
+    for p in 1:3
+        W = space(Ω; cells=16, order=p, basis=bspline())
+        extended = support_extension(W, marked; level=1)
+        @test count(extended) == (2 + 2p)^2
+        @test all(extended[c] for c in marked)
+    end
+    # And the dilation is what turns a masked region that carries no unknowns into
+    # one that does. A 2×2 active block is two cells wide, below the `p + 1` cells a
+    # degree-2 support needs, so such a level carries nothing at all; the extension
+    # is 6×6 and carries `(6 − 2)² = 16`.
+    free(cells) = Unfitted.active_unknowns(prepare(mass(space(Ω; cells=16, order=2, basis=bspline(),
+                                                              active=cells))).dofs)
+    @test free(marked) == 0
+    @test free(support_extension(space(Ω; cells=16, order=2, basis=bspline()), marked; level=1)) ==
+          16
+    # The dilation clips to the level's own grid rather than widening its box.
+    edge = space(Ω; cells=8, order=3, basis=bspline())
+    @test size(support_extension(edge, [CartesianIndex(1, 1)]; level=1)) == (8, 8)
 end
 
 @testset "BSpline extension: immersed physical domain — fold exempt, user mask not" begin
@@ -302,23 +428,33 @@ end
     @test expansion[1] == []            # the constraint that says something
     @test expansion[2] == [(2, 1.0)]    # its duplicate leaves u₂ free
 
-    # The two configurations that reach it end to end. Degree 1 puts exactly two
-    # terms in each trace constraint, one of them zero at a clamped end, so a 2D
-    # overlay must keep `dim − 2 = 3` functions per axis, 9 in all — not 1.
-    free_on_overlay(V) =
+    # The configuration that reaches it end to end. A *masked* level below maximal
+    # continuity is the only shape that still emits multi-raw trace constraints: an
+    # overlay's own box faces are clamped ends, whose trace matrix is triangular and
+    # therefore resolves to strong eliminations, and a maximal-continuity level emits
+    # no linear constraint at all. Here the same perpendicular index is constrained
+    # from several mask cells along the face, so the re-emissions are exactly the
+    # collapsed constraints the unit test above pins.
+    free_on_level(V, level) =
         let l = Unfitted._field_layout(prepare(mass(V)).dofs, :u).dofs
-            count(i -> l.raw_keys[i].level == 2 && l.elimination_source[i] === :free,
+            count(i -> l.raw_keys[i].level == level && l.elimination_source[i] === :free,
                   eachindex(l.raw_keys))
         end
     Ω = box((0.0, 0.0), (1.0, 1.0))
+    mask = trues(8, 8)
+    mask[5:8, 5:8] .= false
+    Vmask = space(Ω; cells=8, order=3, basis=bspline(; continuity=1), active=mask)
+    layout = Unfitted._field_layout(prepare(mass(Vmask)).dofs, :u).dofs
+    @test layout.has_linear_constraints
+    @test count(==(:overlay), layout.elimination_source) > 0
+    # And the two shapes that no longer reach it, kept because their dof ledgers are
+    # the closed forms the family's docstring states: `n − p` per axis at maximal
+    # continuity, for a level whose faces are all artificial.
     B = box((0.25, 0.25), (0.75, 0.75))
-    @test free_on_overlay(overlay(space(Ω; cells=8, order=1, basis=bspline()), B; cells=4, order=1)) ==
-          9
-    # `continuity_order = p − 1` is the other one: its top-order trace constraint
-    # leaves a single zero term behind. dim = 11, m + 1 = 3 eliminated per side ⇒ 5
-    # per axis, 25 in all.
-    @test free_on_overlay(overlay(space(Ω; cells=8, order=3, basis=bspline()), B; cells=8, order=3,
-                                  basis=bspline(continuity_order=2))) == 25
+    @test free_on_level(overlay(space(Ω; cells=8, order=1, basis=bspline()), B; cells=4, order=1),
+                        2) == 9
+    @test free_on_level(overlay(space(Ω; cells=8, order=3, basis=bspline()), B; cells=8, order=3),
+                        2) == 25
 end
 
 @testset "Linear-constraint resolver: a pivot contributes its expansion to the field" begin
@@ -360,7 +496,7 @@ end
     mask[4:6, 4:6] .= false                          # L-shaped active region
     for m in 0:1                                     # m < p − 1 ⇒ genuine pivots
         gap, pivots = projection_gap(space(Ω; cells=6, order=3, active=mask,
-                                           basis=bspline(; continuity_order=m)))
+                                           basis=bspline(; continuity=m)))
         @test pivots
         @test gap < 1e-13
     end
@@ -368,7 +504,7 @@ end
     # that produces no pivots at all, and the *maximal*-continuity B-spline level,
     # whose mask constraints resolve to strong eliminations rather than pivots.
     for V in (space(Ω; cells=6, order=3, active=mask),
-              space(Ω; cells=6, order=3, active=mask, basis=bspline(; continuity_order=2)))
+              space(Ω; cells=6, order=3, active=mask, basis=bspline(; continuity=2)))
         gap, pivots = projection_gap(V)
         @test !pivots
         @test gap < 1e-13
@@ -391,8 +527,7 @@ end
     # is that the corner cascade on top of it still leaves a system a direct solve
     # handles cleanly (cond ≈ 3e2, not the ≈ 1e17 of the undeduped stack).
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3, basis=bspline())
-    V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3,
-                basis=bspline(continuity_order=1))
+    V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3, basis=bspline(continuity=1))
     u = field(:u, V)
     problem = poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))])
     model = prepare(problem)
@@ -465,55 +600,54 @@ end
         base = space(Ωfold; cells=6, order=2, basis=bspline(), physical=half())
         return overlay(base, box((0.0, -1.0), (xhi, 2.0)); cells=(round(Int, 4xhi), 12), order=2)
     end
-    for xhi in (2.0, 1.5, 1.25)
+    # Where the cover's face falls no longer changes the answer, and that is the whole
+    # point of the burial test being exact. `xhi = 1.0` is the configuration that used
+    # to be pinned `@test_broken`: the cover's face lands on a knot of the level below
+    # *inside* the band of cut cells, which under the clamped mechanism let the cover
+    # reproduce a *combination* of two buried functions without reproducing either, and
+    # left eight exact null modes no per-function dedup could see. Support selection
+    # removes the functions that caused it — the cover is not clamped at that face, it
+    # simply stops — and the subdivision walk then answers containment exactly.
+    for xhi in (2.0, 1.75, 1.5, 1.25, 1.0)
         m, l = _gram(fold_stack(xhi))
         mu, _ = _gram(fold_stack(xhi); prune=false)
         M = Symmetric(Matrix(m.matrix))
         @test count(==(:dedup), l.elimination_source) == 16
-        @test active_unknowns(l) == 102
-        @test rank(M) == active_unknowns(l)
+        @test active_unknowns(l) == 88
+        @test rank(M) == active_unknowns(l)                     # nothing left over
         @test isposdef(M)
         @test active_unknowns(l) == rank(Matrix(mu.matrix))     # nothing real deleted
     end
 
-    # xhi = 1.5 is the case that discriminates the candidate rules. Support cell 6
-    # ([1.5, 2] on the x axis) lies wholly outside the cover, so a rule asking a
-    # fictitious support cell to meet the cover's interior rejects it — and leaves 8 of
-    # the 16 null modes. What actually decides is the cover's own trace condition: its
-    # face at x = 1.5 sits in fictitious material, every cover cell along it is folded
-    # away, no constraint is emitted there, and the cover's clamped span still contains
-    # the buried function on Ω.
-    _, l15 = _gram(fold_stack(1.5))
-    @test count(==(:dedup), l15.elimination_source) == 16
-
     # The fold is not the only thing the cover face may land in. Here Ω = {x₁ ≤ 0.6}, so
-    # the cover ending at x = 1.0 ends two cells deep in fictitious material: full rank,
-    # all 16 deduped. This is the sharper of the two discriminating cases — the
-    # meets-the-interior rule deduplicates nothing at all here and leaves all 16 null
-    # modes, because every fictitious support cell lies outside the cover's box.
+    # the cover ending at x = 1.0 ends two cells deep in fictitious material. The
+    # subdivision walk reaches past the cover's own box there and finds the fine
+    # functions it needs, because a function whose support sticks out into fictitious
+    # material is itself admissible — nothing is integrated beyond the face, so the
+    # truncation is invisible on Ω. A rule that stopped at the cover's box would
+    # deduplicate nothing here and leave all 16 duplicates.
     deep = overlay(space(Ωfold; cells=6, order=2, basis=bspline(),
                          physical=physical_domain(x -> x[1] - 0.6; lipschitz=1.0,
                                                   subcell_length_scale=0.125, max_depth=6)),
                    box((0.0, -1.0), (1.0, 2.0)); cells=(4, 12), order=2)
     md, ld = _gram(deep)
     @test count(==(:dedup), ld.elimination_source) == 16
+    @test active_unknowns(ld) == 74
     @test rank(Symmetric(Matrix(md.matrix))) == active_unknowns(ld)
 
-    # The one fold configuration still left singular, pinned so a future repair is
-    # noticed. With Ω = {x₁ ≤ 0.9} and the cover ending exactly at x = 1.0, the cover's
-    # boundary cells along that face are cut cells, hence active, hence clamped — and
-    # the difference N₅ − N₆ of two buried base splines vanishes at x = 1 while the part
-    # of it beyond the face is fictitious, so the clamped cover reproduces the
-    # *combination* on Ω though it reproduces neither function. No rule keyed on a single
-    # buried function can see that: 8 exact null modes remain, and the unpruned twin
-    # has the same 8, so nothing the dedup could have kept would help. The repair is
-    # per constrained face — of the p buried functions straddling the face knot with the
-    # same perpendicular factor, keep the m + 1 trace orders and strongly eliminate the
-    # rest — and it is a change to the dedup contract, not to the burial test.
-    ms, ls = _gram(fold_stack(1.0))
-    Ms = Symmetric(Matrix(ms.matrix))
-    @test active_unknowns(ls) == 104
-    @test_broken rank(Ms) == active_unknowns(ls)          # rank 96: the 8 combinations
+    # And the cut line may fall *beyond* the cover's face rather than before it, which
+    # is the case that needs the dedup to reach past the box in the other direction:
+    # Ω = {x₁ ≤ 1.1} with the cover ending at x = 1.25 deduplicates 24, and a rule
+    # keyed on whole cell boxes rejects them all because the base cell straddling
+    # x = 1.1 is not contained in the cover's box even though its material part is.
+    beyond = overlay(space(Ωfold; cells=6, order=2, basis=bspline(),
+                           physical=physical_domain(x -> x[1] - 1.1; lipschitz=1.0,
+                                                    subcell_length_scale=0.125, max_depth=6)),
+                     box((0.0, -1.0), (1.25, 2.0)); cells=(5, 12), order=2)
+    mb, lb = _gram(beyond)
+    @test count(==(:dedup), lb.elimination_source) == 24
+    @test rank(Symmetric(Matrix(mb.matrix))) == active_unknowns(lb)
+    @test active_unknowns(lb) == rank(Matrix(_gram(beyond; prune=false)[1].matrix))
 end
 
 @testset "BSpline extension: a degree-1 cover is the hat space and deduplicates hats" begin
@@ -527,7 +661,10 @@ end
     # was refused the dedup and the stack carried one exact null mode.
     base() = space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=2)
     B = box((0.25, 0.25), (0.75, 0.75))
-    for (deg, dedup, unknowns) in ((1, 1, 81), (2, 0, 89))
+    # The degree-2 cover keeps `(4 − 2)² = 4` functions under support selection, where
+    # the clamped mechanism kept `(4 + 2 − 2)² = 16`; the degree-1 cover is unaffected,
+    # because `p − 1 = 0` makes the two mechanisms the same rule.
+    for (deg, dedup, unknowns) in ((1, 1, 81), (2, 0, 77))
         V = overlay(base(), B; cells=4, order=deg, basis=bspline())
         @test Unfitted._spans_hats(V.levels[2].basis) == (deg == 1)
         m, l = _gram(V)
@@ -592,7 +729,7 @@ end
     smooth(x) = sin(pi * x[1]) * sinh(pi * x[2]) / sinh(pi)
     function build(overlay_basis, base_continuity)
         V = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3,
-                  basis=bspline(continuity_order=base_continuity))
+                  basis=bspline(continuity=base_continuity))
         V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=8, order=3, basis=overlay_basis)
         u = field(:u, V)
         problem = poisson(V; source=0.0,
@@ -605,14 +742,18 @@ end
         return (active=active_unknowns(model.dofs),
                 err=diagnostics(model, solution; exact=smooth).l2_error)
     end
-    c0 = build(bspline(), 0)
-    c1 = build(bspline(continuity_order=1), 0)
-    c2 = build(bspline(continuity_order=2), 1)
-    # Higher continuity strictly reduces active dof count.
+    c0 = build(bspline(; continuity=0), 0)
+    c1 = build(bspline(; continuity=1), 0)
+    c2 = build(bspline(), 0)                      # `:maximal` is C² at degree 3
+    # Smoothness across the overlay's artificial boundary is bought with unknowns,
+    # and the ledger is exact: per axis the overlay keeps `n + p − 2(m + 1)`
+    # functions at a requested `m`, and `n − p` at `:maximal`. With n = 8 and p = 3
+    # that is 9, 7 and 5 per axis, so the counts fall strictly as m rises.
     @test c1.active < c0.active
     @test c2.active < c1.active
-    # All variants reach comparable L² error on the smooth problem
-    # (well below 1e-3).
+    # All variants reach comparable L² error on the smooth problem (well below
+    # 1e-3), which is the point: on a solution this smooth the extra functions the
+    # lower continuities buy are not what the accuracy rests on.
     @test c0.err < 1.0e-3
     @test c1.err < 1.0e-3
     @test c2.err < 1.0e-3

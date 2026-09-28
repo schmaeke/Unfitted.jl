@@ -32,7 +32,11 @@ The method is described in
   default basis family is hierarchical integrated Legendre; an
   open-knot tensor-product B-spline family is available through the
   `BasicBSpline.jl` package extension (load `BasicBSpline` alongside
-  `Unfitted` and pass `basis = bspline()`); worked through in
+  `Unfitted` and pass `basis = bspline()`). That family keeps the
+  functions whose whole support lies inside a level's active region, so
+  the **superposition** is `C^(p−1)` and not merely each level — under
+  any activation pattern, with no constraint equation and no restriction
+  on the shape of the mask. Worked through in
   [`examples/tutorials/04_bspline/`](examples/tutorials/04_bspline).
 - **Selective per-cell activation** with the `move!`-style invalidation
   contract; useful for transient problems where small-scale features

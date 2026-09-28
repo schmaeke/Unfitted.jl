@@ -398,7 +398,13 @@ The B-spline extension overrides the hook too, but only for the dedup:
 that family has no bubble/skeleton split, so its one reducible mode is
 the one a covering level reproduces exactly — and eliminating it is not
 an accuracy trade but the thing that keeps a nested B-spline stack
-non-singular, since the two copies are linearly dependent. Any further
+non-singular, since the two copies are linearly dependent. Under
+`continuity = :maximal` the burial test there is *exact* rather than
+conservative: it walks the subdivision and asks whether every fine
+function the buried one is a combination of survived the cover's own
+support selection, which is necessary as well as sufficient because the
+subdivision coefficients are strictly positive and its representation is
+unique. Any further
 family hits the generic fallback that returns an empty constraint list,
 so on such a space leaf semantics eliminate nothing. `prepare(problem;
 prune = false)` is the one way to build a space's unreduced twin; it is
@@ -671,6 +677,14 @@ increment. It is a basis-family capability: integrated Legendre declares it
 through `_supports_cell_order`, every other family (B-splines included)
 refuses a non-uniform field loudly rather than ignoring it, because a
 per-cell degree on a shared knot vector names no set of functions.
+
+A family that refuses is not thereby stuck at one degree: p-refinement is
+then done the multi-level way, by superposing a level of higher degree over
+the region that needs it. For maximal-continuity splines that superposition
+is linearly independent **by construction** and needs no deduplication — a
+degree-`p`, `C^(p−1)` function supported inside the region would have to be
+`C^p` to lie in the degree-`p+1` space there, hence a polynomial, hence zero
+— so the two spaces intersect trivially.
 
   - **Construction-time order** via `space(...; order=…)` and
     `overlay(...; order=…)`. On top of the two uniform shapes (an integer,
@@ -1323,22 +1337,19 @@ demos.
     unchanged in 1D, 2D and 3D.
   - Package extensions: the B-spline family's basis values, constraints
     and a small assembly; its refusal of a per-cell order through both
-    `space` and `elevate`; the dedup that keeps a nested B-spline stack
-    non-singular, including the mixed-family direction where a degree-1
-    cover spans an integrated-Legendre level's hats; the MeshIO
+    `space` and `elevate`; the support-selection dof ledger — `(n + p)` per
+    axis where a face is physical and `(n − p)` where it is artificial, and
+    the closed form `n + p − 2(m + 1)` at a requested continuity `m`; the
+    superposition being smooth and not merely each level, asserted as the
+    decade ratio of the normal-derivative jump across an overlay face
+    (10 at `:maximal`, below 1.5 at `C⁰` and for integrated Legendre); an
+    arbitrary mask producing no linear-constraint pivot, which is what keeps
+    the fast assembly path and makes the reconstruction defect unreachable;
+    the dedup that keeps a nested B-spline stack non-singular, including the
+    mixed-family direction where a degree-1 cover spans an
+    integrated-Legendre level's hats, and the fold configurations where the
+    cover's face lands before, inside and beyond the cut band; the MeshIO
     signed-distance leaf; the Tensors notation round-trip.
-    **Requirement not yet met:** one fold configuration is still left
-    singular and is pinned `@test_broken` in `test_basis_bspline.jl`. Where
-    a B-spline overlay's box face falls on a knot of the level below inside
-    a band of cut cells, the clamped overlay reproduces a *combination* of
-    two buried functions without reproducing either on its own, and a dedup
-    keyed on single buried functions cannot see it; the operator keeps one
-    exact null mode per such combination. The repair is a per-face rank
-    repair — of the `p` buried functions straddling the face knot with the
-    same perpendicular factor, keep the `m + 1` trace orders and strongly
-    eliminate the rest — which changes what the dedup may eliminate rather
-    than the burial test. Until it lands, move the overlay's face off the
-    cut-cell band or break the nesting.
   - Example smoke suite: every `examples/<tier>/<name>/<name>.jl`
     script runs to a clean exit at a coarse size in the default suite,
     with a finite, sane headline metric wherever the script prints one,
