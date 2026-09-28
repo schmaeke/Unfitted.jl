@@ -692,14 +692,82 @@ end
     end
 end
 
-@testset "estimate refuses a family whose keys are not order stable" begin
+@testset "estimate enriches a non-order-stable family by superposition" begin
     # Raising a B-spline's degree rewrites the knot vector, so injecting the
-    # solution into the enriched space would copy coefficients onto different
-    # functions. `Rewire` now catches that; `estimate` says so up front.
-    V = space(_AD_Ω; cells=4, order=2, basis=bspline())
+    # solution into an order-elevated space would copy coefficients onto different
+    # functions — which is why `estimate` used to refuse such a family outright.
+    # The enrichment is now chosen per family: a co-located level of the same
+    # degree on a mesh refined by `enrichment + 1` renames nothing and nests, so
+    # `V⁺ ⊇ V` holds and the injection is exact.
+    V = space(_AD_Ω; cells=8, order=2, basis=bspline())
     model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     u = solve!(model)
-    @test_throws ArgumentError estimate(model, u)
+    est = estimate(model, u)
+    # Indexed by `V`'s own levels, not by the twin's: the twin exists only inside
+    # the call, and a marked pair naming it could not be applied.
+    @test length(est.cells) == length(V.levels)
+    @test size(est.cells[1]) == V.levels[1].mesh.cells
+    @test est.total > 0 && isfinite(est.total)
+    @test all(isfinite, est.cells[1])
+    # The indicator must see the source it is given. On `−Δu = 1` the error is
+    # spread, so every cell carries some; on a load concentrated in one corner the
+    # indicator has to be largest there.
+    corner(x) = exp(-200.0 * ((x[1] - 0.1)^2 + (x[2] - 0.1)^2))
+    mc = prepare(poisson(V; source=corner, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    ec = estimate(mc, solve!(mc))
+    @test argmax(ec.cells[1]) == CartesianIndex(1, 1)
+end
+
+@testset "the automated loop runs on a spline stack" begin
+    # The whole loop — estimate, Dörfler marking, decide, refine, rebuild — on a
+    # family that carries no per-cell order. Every marked cell takes h, because
+    # that is the only step such a level has, and the h-step support-extends the
+    # cells it wakes so the level actually carries the functions the marking meant
+    # to buy.
+    peak(x) = x[1] *
+              (1 - x[1]) *
+              x[2] *
+              (1 - x[2]) *
+              exp(-120.0 * ((x[1] - 0.3)^2 + (x[2] - 0.7)^2))
+    load(x) =
+        let h = 1.0e-4
+            -(peak((x[1] + h, x[2])) +
+              peak((x[1] - h, x[2])) +
+              peak((x[1], x[2] + h)) +
+              peak((x[1], x[2] - h)) - 4 * peak((x[1], x[2]))) / h^2
+        end
+    V = ladder(_AD_Ω; cells=8, depth=3, order=3, basis=bspline())
+    problem(W) = poisson(W; source=load, dirichlet=[dirichlet(0.0; on=boundary(:all))])
+    model = prepare(problem(V))
+    solution = solve!(model)
+    first_error = l2_error(solution, model, peak)
+    first_eta = estimate(model, solution).total
+    previous = nothing
+    unknowns = Int[active_unknowns(model)]
+    for _ in 1:4
+        est = estimate(model, solution)
+        W = refine(model.prefold_space, est; theta=0.5, previous=previous)
+        W === model.prefold_space && break
+        previous = (model.prefold_space, est)
+        model = adapted(model, W)
+        solution = solve!(model)
+        push!(unknowns, active_unknowns(model))
+    end
+    # It did something, it grew monotonically, and it converged on both measures.
+    @test length(unknowns) > 1
+    @test issorted(unknowns)
+    @test l2_error(solution, model, peak) < first_error / 100
+    @test estimate(model, solution).total < first_eta / 100
+    # h and nothing else: a spline level's order never moves, so the whole stack
+    # still carries the degree it was declared with.
+    @test all(all(o -> o == (3, 3), cell_orders(model.prefold_space; level=k))
+              for k in 1:length(model.prefold_space.levels))
+    # And the woken region is support-extended: every level that woke anything
+    # woke at least `(p + 1)^D` cells, since fewer could carry no function at all.
+    for k in 2:length(model.prefold_space.levels)
+        live = count(active_cells(model.prefold_space; level=k))
+        live == 0 || @test live >= 4^2
+    end
 end
 
 @testset "refine: the p-step actually survives" begin

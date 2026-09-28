@@ -684,7 +684,10 @@ the region that needs it. For maximal-continuity splines that superposition
 is linearly independent **by construction** and needs no deduplication — a
 degree-`p`, `C^(p−1)` function supported inside the region would have to be
 `C^p` to lie in the degree-`p+1` space there, hence a polynomial, hence zero
-— so the two spaces intersect trivially.
+— so the two spaces intersect trivially. `decide` therefore withholds the
+p-step on such a level and sends every marked cell to h, which is the
+adaptive loop the isogeometric literature runs; `estimate` uses the same
+superposition idea for its own enrichment.
 
   - **Construction-time order** via `space(...; order=…)` and
     `overlay(...; order=…)`. On top of the two uniform shapes (an integer,
@@ -770,10 +773,21 @@ the loop, and nothing in `src/adaptivity.jl` holds state between cycles.
     `W` is a set difference on dof *keys*, not a comparison of mode indices:
     the two disagree at an anisotropic order. Every complement mode is shared
     equally among the cells incident to it. The form must be **coercive**, since
-    the diagonal is read as a mode's energy, and the family's dof keys must
-    survive an order increase naming the same functions — the property
-    `_supports_cell_order` states, and the reason a B-spline level is refused
-    here rather than being given a plausible number.
+    the diagonal is read as a mode's energy.
+
+    **How `V⁺` is built is a basis-family question, and there are two answers.**
+    A family carrying a per-cell order (`_supports_cell_order`) is enriched in
+    place by raising every cell's order, which needs its dof keys to survive that
+    increase naming the same functions. A family that does not — a B-spline
+    level, whose degree belongs to a whole-axis knot vector — is enriched by
+    **superposition**: a co-located level of the same family, degree and active
+    region on a mesh refined by `enrichment + 1` per axis. Refining renames
+    nothing, the two spline spaces nest because the factor is an integer, so
+    `V⁺ ⊇ V` and the injection is exact. The twin's per-cell indicators are
+    charged back to the cells of the level it enriches, so the estimate is always
+    indexed by the caller's own levels. It is built with leaf semantics off,
+    because a nested same-degree cover would otherwise deduplicate the very keys
+    the injection looks for.
 
     > R. E. Bank, A. Weiser, *Some a posteriori error estimators for elliptic
     > partial differential equations*, Math. Comp. **44** (1985) 283–301.
@@ -788,6 +802,14 @@ the loop, and nothing in `src/adaptivity.jl` holds state between cycles.
     > W. Dörfler, *A convergent adaptive algorithm for Poisson's equation*,
     > SIAM J. Numer. Anal. **33** (1996) 1106–1124.
     > [doi:10.1137/0733054](https://doi.org/10.1137/0733054).
+
+    Two things the application step owes a family with wide support. The p-step
+    is withheld on a level that carries no per-cell order, so every marked cell
+    there takes h; and the h-step **support-extends** the cells it wakes, by the
+    family's own `_support_radius`, because a region narrower than that radius
+    carries no functions at all and a refinement that refines nothing makes a
+    loop that never terminates. `_support_radius` is zero for integrated
+    Legendre, so neither costs the default family anything.
 
   - **The h-versus-p decision is predicted error reduction**, not a smoothness
     indicator. Each cycle predicts what a cell's indicator ought to become if
@@ -1326,8 +1348,10 @@ demos.
     pairs and the per-base-cell depth map, with grading; `adapted` keeping
     the source model intact and reusing the moment-fit cache.
   - Automated hp adaptivity: `estimate`'s effectivity bounded over a range of
-    unknowns, and its refusals — a family whose keys are not order-stable
-    (B-splines), an unassembled model, `enrichment = 0`; the h- and p-steps
+    unknowns; its refusals — an unassembled model, `enrichment = 0`; its
+    superposed enrichment on a family that carries no per-cell order, indexed
+    back onto the caller's levels, and a whole loop driven on such a stack to a
+    hundredfold reduction in both the error and the estimate; the h- and p-steps
     landing on the levels and cells they claim; the guards that bypass the
     h/p decision (no step available, not a leaf, already at `pmax`); a cell
     keeping p only when it met its prediction; `coarsen` as the exact inverse

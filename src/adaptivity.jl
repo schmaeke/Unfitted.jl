@@ -282,16 +282,69 @@ function _enriched_space(V::Space{D,T}, inc::Int) where {D,T}
     raised(k) = (o=V.levels[k].orders;
                  length(o.palette) == 1 ? o.nominal .+ inc :
                  map(p -> p .+ inc, cell_orders(V; level=k)))
-    return elevate(V, (k => raised(k) for k in 1:length(V.levels))...)
+    graded = [k for k in 1:length(V.levels) if _supports_cell_order(V.levels[k].basis)]
+    W = isempty(graded) ? V : elevate(V, (k => raised(k) for k in graded)...)
+    twins = Tuple{Int,Int,Int}[]
+    for k in 1:length(V.levels)
+        k in graded && continue
+        W = _refinement_twin(W, V.levels[k], inc + 1)
+        push!(twins, (length(W.levels), k, inc + 1))
+    end
+    return W, twins, !isempty(twins)
+end
+
+# A level co-located with `level` — same box, same family, same degree, same
+# active region — on a mesh refined by `factor` per axis. This is the enrichment
+# for a family whose degree cannot be raised in place, and the reason it is a
+# *superposition* rather than an elevation is the same reason `_supports_cell_order`
+# is false for such a family: raising a B-spline degree rewrites the whole-axis
+# knot vector, so every function is renamed and the injection that `estimate` needs
+# has nothing to copy onto. Refining the mesh renames nothing that already exists;
+# it only adds.
+#
+# `factor` is an integer, so the twin's knot lines contain the level's and the two
+# spline spaces nest — which is what makes `V⁺ ⊇ V` and the injection exact. The
+# mask is mapped child-to-parent so the twin is live exactly where the level is,
+# and its own selection rule then trims it to the functions that fit, exactly as it
+# does for any level.
+function _refinement_twin(W::Space{D,T}, level::Level{D,T}, factor::Int) where {D,T}
+    cells = ntuple(d -> level.mesh.cells[d] * factor, D)
+    mask = nothing
+    if level.mask !== nothing
+        on = BitArray(undef, cells)
+        for c in CartesianIndices(cells)
+            on[c] = level.mask.on[CartesianIndex(ntuple(d -> (c.I[d] - 1) ÷ factor + 1, D))]
+        end
+        mask = on
+    end
+    return overlay(W, level.mesh.domain; cells=cells, order=nominal_order(level), basis=level.basis,
+                   mode=level.mode, active=mask)
 end
 
 """
     estimate(model::Model, solution::Solution; enrichment = 1) -> ErrorEstimate
 
-Bank–Weiser error indicator: build the order-elevated space `V⁺`, inject
-`solution` into it, and read the residual in the directions `V` cannot represent.
+Bank–Weiser error indicator: build an enriched space `V⁺ ⊇ V`, inject `solution`
+into it, and read the residual in the directions `V` cannot represent.
 
     η²_K = Σ_{j ∈ W(K)} R_j² / A⁺_jj ,      R = b⁺ − A⁺ u⁺ ,      W = V⁺ ⊖ V
+
+**How `V⁺` is built depends on the family, and it has to.** A family carrying a
+per-cell order (`_supports_cell_order`, which integrated Legendre declares) is
+enriched in place: every cell's order rises by `enrichment`, and the injection is
+exact because a hierarchic mode keeps its identity under an order increase. A
+family that does not — a B-spline level, whose degree belongs to a whole-axis
+knot vector — is enriched by **superposition** instead: a co-located level of the
+same family, degree and active region on a mesh refined by `enrichment + 1` per
+axis. That renames nothing, so the injection is again exact, and the two spline
+spaces nest because the refinement factor is an integer, so `V⁺ ⊇ V` holds. The
+twin's per-cell indicators are charged back to the cells of the level it
+enriches, so the estimate a caller sees is always indexed by `V`'s own levels and
+is fed straight to [`mark_cells`](@ref) and [`refine`](@ref) either way.
+
+The superposed twin is built with leaf semantics off, and the reason is in
+`estimate`'s body: a nested same-degree cover would otherwise deduplicate the
+very keys the injection looks for.
 
 `W` is a set difference on raw dof keys, not a comparison of mode indices: at an
 anisotropic order the two disagree, and the index form selects 5 of the 11
@@ -386,13 +439,12 @@ before the enriched model is built and raises. Where a model carries per-point
 state, compute the indicator on a model whose forms read that state through the
 physical point `q.x` instead.
 
-What it refuses: single-field and single-domain, and every basis family that
-does not carry a per-cell order (`_supports_cell_order`). The injection copies
-coefficients by dof key and needs the same key to name the same function at both
-orders; a B-spline's degree cannot be raised without rewriting its knot vector,
-so the injection has no meaning there (see [`Rewire`](@ref)) and this raises
-rather than returning a number that looks plausible. It also refuses a model that
-has not been assembled, and an `enrichment` below one.
+What it refuses: single-field and single-domain, a model that has not been
+assembled, and an `enrichment` below one. It no longer refuses a basis family
+without a per-cell order — that family is enriched by superposition instead, as
+described above — but the injection still copies coefficients by dof key, so
+[`Rewire`](@ref)'s `_assert_keys_comparable` remains the backstop for a family
+whose keys would not survive the enrichment it chose.
 
 See [`refine`](@ref) for the rest of the loop.
 """
@@ -400,20 +452,6 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     _assert_single_domain(model, "estimate")
     enrichment >= 1 || throw(ArgumentError("enrichment must be at least 1; got $enrichment"))
     V = model.prefold_space
-    for (k, level) in pairs(V.levels)
-        # The trait, not the family. What the injection needs is that raising the
-        # degree leaves every existing function's dof key naming the same
-        # function, and `_supports_cell_order` is exactly the property that
-        # states it — the knot-vector reasoning behind the B-spline answer lives
-        # with the trait in `mesh.jl`. `Rewire`'s `_assert_keys_comparable` is
-        # the backstop, but it fires only after the enriched model has been
-        # prepared and assembled, which is the expensive half of this call.
-        _supports_cell_order(level.basis) ||
-            throw(ArgumentError("estimate: level $k carries $(basis_name(level.basis)), whose degree " *
-                                "cannot be raised without renaming its functions, so injecting the " *
-                                "solution into an order-elevated space has no meaning (see `Rewire`). " *
-                                "Only families declaring `_supports_cell_order` are supported."))
-    end
     model.matrix === nothing &&
         throw(ArgumentError("estimate: the model has not been assembled; call `solve!` or " *
                             "`assemble!` before estimating"))
@@ -431,8 +469,19 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     # next `estimate` finds them. `integration_plan` evicts by region box, so
     # the two moment orders coexist at the same boxes instead of evicting each
     # other — see `_prefit_cut_rules!` in `intersections.jl`.
-    plus = _prepared_model(_problem_with_space(model.problem, _enriched_space(V, Int(enrichment))),
-                           model.plan_options, model.moment_fit_caches)
+    enriched_space, twins, unpruned = _enriched_space(V, Int(enrichment))
+    # A superposed twin is a *nested* level of the same degree, so leaf semantics
+    # would deduplicate the level it enriches — removing exactly the keys the
+    # injection is about to look for, and turning `Rewire` into a refusal. The twin
+    # is built unpruned for that reason, and the duplicates it then carries cost the
+    # indicator nothing: `W` is a set difference on raw keys, a deduplicated key is
+    # still *enumerated* on the pruned side, so it never enters `W`; and a direction
+    # already in `V` has a zero residual, so it would contribute zero even if it did.
+    # `A⁺` is singular on such a twin, which is harmless here — the indicator reads
+    # the diagonal and forms one matrix–vector product, and never factorises.
+    options = unpruned ? merge(model.plan_options, (; prune=false)) : model.plan_options
+    plus = _prepared_model(_problem_with_space(model.problem, enriched_space), options,
+                           model.moment_fit_caches)
     _on_foreign_cloud(plus.version) do
         assemble!(plus)
     end
@@ -501,6 +550,17 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
             end
         end
     end
+    # A superposed twin carries the complement modes of the level it enriches, so
+    # its per-cell squared indicators belong to that level's cells: each twin cell
+    # charges the parent cell it subdivides, and the twins then leave the estimate
+    # altogether. Without this the marked pairs would name levels `refine` cannot
+    # act on — the twins exist only inside this call.
+    for (twin, parent, factor) in twins
+        for c in CartesianIndices(cells[twin])
+            cells[parent][CartesianIndex(ntuple(d -> (c.I[d] - 1) ÷ factor + 1, D))] += cells[twin][c]
+        end
+    end
+    resize!(cells, length(V.levels))
     for a in cells
         a .= sqrt.(a)
     end
@@ -847,7 +907,19 @@ function decide(V::Space{D,T}, estimate::ErrorEstimate{D,T}, marked; pmax::Integ
         # would return a new but identical space, and a loop made of those does
         # not terminate.
         h_offered = _has_h_step(V, k, cell, live)
-        p_offered = !all(>=(Int(pmax)), cell_order(V.levels[k], cell)) && _is_leaf(V, k, cell, live)
+        # A p-step raises one cell's order, so it exists only where the family
+        # carries a per-cell order at all. On a level that does not — a B-spline,
+        # whose degree belongs to a whole-axis knot vector — every marked cell takes
+        # h, which is the adaptive loop the isogeometric literature runs. Raising
+        # such a level's degree is still available, as a modelling decision rather
+        # than a per-cell one: superpose a level of higher degree over the region
+        # with [`overlay`](@ref), which is linearly independent of the level below
+        # by construction, since a degree-`p` spline that vanishes outside a region
+        # would have to be `C^p` there to lie in the degree-`p+1` space, hence a
+        # polynomial, hence zero.
+        p_offered = _supports_cell_order(V.levels[k].basis) &&
+                    !all(>=(Int(pmax)), cell_order(V.levels[k], cell)) &&
+                    _is_leaf(V, k, cell, live)
         h_offered || p_offered || continue
         take_p = p_offered && (!h_offered ||
                                previous === nothing ||
@@ -961,6 +1033,8 @@ function refine(V::Space{D,T}; h=(), p=(), pmax::Integer=8) where {D,T}
     # `elevate` rejects a level named twice, so merging is not optional.
     masks = Dict{Int,Any}()
     fields = Dict{Int,Any}()
+    # The cells this step woke, per level, for the support-extension pass below.
+    woken = Dict{Int,Vector{CartesianIndex{D}}}()
     mask_of(k) = get!(() -> active_cells(V; level=k), masks, k)
     field_of(k) = get!(() -> cell_orders(V; level=k), fields, k)
     # Raise only the axes below the cap. A `pmax` under a cell's current order is
@@ -987,6 +1061,12 @@ function refine(V::Space{D,T}; h=(), p=(), pmax::Integer=8) where {D,T}
         # — which takes the caller's own sets — needs the second on its own.
         block = k < nlevels ? _cell_block(V, k, k + 1, cell) : nothing
         if block === nothing || isempty(block)
+            # Nothing to activate. Where the family carries a per-cell order the
+            # order step is what is left to spend; where it does not there is no
+            # second step, and the cell is dropped rather than turned into a
+            # whole-level order change nobody asked for. `decide` already withholds
+            # such a cell, so this is the explicit form's branch.
+            _supports_cell_order(V.levels[k].basis) || continue
             field = field_of(k)
             field[cell] = raised(field[cell])
             continue
@@ -999,7 +1079,10 @@ function refine(V::Space{D,T}; h=(), p=(), pmax::Integer=8) where {D,T}
         # the cycle started, never one bought in the same cycle.
         target = cell_order(V.levels[k], cell)
         mask = mask_of(k + 1)
-        field = field_of(k + 1)
+        # A level whose degree belongs to a whole-axis knot vector has no per-cell
+        # order to write, and its order is not something an h-step may change.
+        carries_order = _supports_cell_order(V.levels[k + 1].basis)
+        field = carries_order ? field_of(k + 1) : nothing
         for child in block
             # A child that is not live carries whatever order it held in a
             # previous life, and `coarsen` clears that on release — but only for
@@ -1009,8 +1092,35 @@ function refine(V::Space{D,T}; h=(), p=(), pmax::Integer=8) where {D,T}
             # h-step gives 57. A child that IS live is left exactly as it is —
             # its order was earned on its own evidence, and silently raising it
             # would make this an order step wearing an h-step's name.
-            mask[child] || (field[child] = target)
+            if !mask[child]
+                carries_order && (field[child] = target)
+                push!(get!(() -> CartesianIndex{D}[], woken, k + 1), child)
+            end
             mask[child] = true
+        end
+    end
+
+    # The support extension. A family whose functions reach beyond the cell that
+    # generates them carries nothing on a region narrower than that reach, so
+    # waking exactly the cells under a marked parent can wake *no unknowns at all*
+    # — a refinement that refines nothing, and a loop that then marks the same cell
+    # again forever. Dilating the woken set by the family's own support radius is
+    # what makes the step buy what it claims to; it is the support-extension
+    # condition of admissible hierarchical meshes, and it is applied to the cells
+    # this step woke rather than to the whole mask, so a region that was already
+    # live is left exactly as it was. `_support_radius` is zero for integrated
+    # Legendre, so this loop is a no-op on the default family.
+    for (k, cs) in woken
+        radius = _support_radius(V.levels[k].basis, nominal_order(V.levels[k]))
+        all(iszero, radius) && continue
+        seed = falses(V.levels[k].mesh.cells)
+        for c in cs
+            seed[c] = true
+        end
+        mask = mask_of(k)
+        extended = _dilate_cells(seed, radius)
+        for c in CartesianIndices(extended)
+            extended[c] && (mask[c] = true)
         end
     end
 
@@ -1108,6 +1218,13 @@ function coarsen(V::Space{D,T}; h=(), p=(), pmin::Integer=1) where {D,T}
 
     for (k, cell) in p
         _check_mark(V, k, cell, "coarsen")
+        # The mirror of `decide`'s `p_offered`: a level whose degree belongs to a
+        # whole-axis knot vector has no per-cell order to lower, so there is nothing
+        # for this mark to release and it is dropped rather than turned into a
+        # whole-level order change. `refine` never hands such a level a p-step, so a
+        # loop's release set cannot contain one either; this is the explicit form's
+        # branch, and dropping keeps `coarsen` the inverse of `refine` on it.
+        _supports_cell_order(V.levels[k].basis) || continue
         _is_leaf(V, k, cell, live) ||
             throw(ArgumentError("coarsen: cell $cell of level $k is covered by a finer level, " *
                                 "and lowering a covered cell's order is not observable until the " *
@@ -1122,7 +1239,8 @@ function coarsen(V::Space{D,T}; h=(), p=(), pmin::Integer=1) where {D,T}
             throw(ArgumentError("coarsen: level $k is the finest, so it covers nothing to release"))
         block = _cell_block(V, k, k + 1, cell)
         mask = mask_of(k + 1)
-        field = field_of(k + 1)
+        carries_order = _supports_cell_order(V.levels[k + 1].basis)
+        field = carries_order ? field_of(k + 1) : nothing
         # The released children take the PARENT's order, which is exactly what
         # `refine`'s h-step gives them. An inactive cell's order is unobservable,
         # so this is not required for correctness — but it makes the two verbs
@@ -1131,14 +1249,14 @@ function coarsen(V::Space{D,T}; h=(), p=(), pmin::Integer=1) where {D,T}
         # region thousands of times without drift. Note `nominal_order` is NOT the
         # value to use: it is a maximum kept for buffer sizing, and on a level
         # that has been elevated it has already moved.
-        parent_order = field_of(k)[cell]
+        parent_order = carries_order ? field_of(k)[cell] : nothing
         for child in block
             mask[child] || continue
             # A child that is itself covered — by any deeper level, not only the
             # next one — is not this level's to release.
             _is_leaf(V, k + 1, child, live) || continue
             mask[child] = false
-            field[child] = parent_order
+            carries_order && (field[child] = parent_order)
         end
     end
 
