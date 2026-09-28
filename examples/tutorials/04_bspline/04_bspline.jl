@@ -205,6 +205,8 @@ for x in ((0.1, 0.1), (0.5, 0.1), (0.9, 0.5), (0.5, 0.85))
     println("    x = ", x, "   B-spline ", a, "   Legendre ", b, "   difference ", abs(a - b))
 end
 println("Largest difference       : ", maximum(gaps))
+println("immersed scaled cond, bspline : ", report_bs.scaled_condition_estimate)
+println("immersed cond, bspline          : ", report_bs.condition_estimate)
 println("Unknowns, B-spline       : ", report_bs.active_unknowns)
 println("Unknowns, Legendre       : ", report_il.active_unknowns)
 println("Cut regions / fit failures: ", report_bs.cut_region_count, " / ",
@@ -222,6 +224,20 @@ println()
 # two families agree to a few times 1e-5 — the size of their own
 # discretisation error, which is all one can ask of two different spaces
 # on the same mesh.
+#
+# And one pair of numbers that is not about agreement. The B-spline system's
+# `condition estimate` is large and says little: on an immersed system it is
+# dominated by the spread of the diagonal, because a function whose support is
+# almost entirely outside Ω carries an almost-zero entry. The
+# `diagonal-scaled condition` is what a Jacobi-preconditioned solver actually
+# sees, and it is a few tens. The integrated-Legendre system on the same mesh
+# is past the estimator's 256-unknown cap, so its two numbers print as `NaN`;
+# measured separately on a system small enough to report, at degree 3 on 16²
+# cells with a disc removed, the scaled condition is 43.8 for the B-splines
+# and 2.2e10 for integrated Legendre. On a cut cell holding a background
+# vertex only one maximal-continuity spline is supported there, so
+# near-dependence survives only on vertex-free slivers; a C⁰ basis of degree
+# ≥ 2 produces it on every small cut cell.
 
 print_run_report("Tutorial 4 — summary of the nested B-spline stack", report_nested;
                  parameters=(:base_cells => V_base.levels[1].mesh.cells,

@@ -1942,12 +1942,14 @@ function assemble!(model::Model{D,T}; threaded::Bool=Threads.nthreads() > 1) whe
     # and the residual is exactly zero.
     symmetry_residual = symmetric ? 0.0 : NaN
     condition_estimate = _condition_estimate(matrix)
+    scaled_condition_estimate = _scaled_condition_estimate(matrix)
     model.matrix = matrix
     model.rhs = rhs
     diag = model.diagnostics
     diag.active_unknowns = nactive
     diag.symmetry_residual = symmetry_residual
     diag.condition_estimate = condition_estimate
+    diag.scaled_condition_estimate = scaled_condition_estimate
     _set_plan_stats_multi!(diag, integration_plans(model))
     return model
 end

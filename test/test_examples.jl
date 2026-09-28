@@ -427,6 +427,21 @@
         # discretisation error is all one can ask of two different spaces.
         check_one(output, tol.cross_family, "Largest difference")
 
+        # The immersed half's conditioning, which is the number that decides
+        # whether that system is solvable at all. `condition estimate` is large
+        # for both families and says little — it is dominated by the spread of
+        # the diagonal on cut cells. The diagonal-scaled one is what a
+        # Jacobi-preconditioned solver sees, and the families part company there.
+        spline_scaled = metric_values(output, "immersed scaled cond, bspline")
+        spline_raw = metric_values(output, "immersed cond, bspline")
+        @test length(spline_scaled) == 1 && length(spline_raw) == 1
+        if length(spline_scaled) == 1 && length(spline_raw) == 1
+            @test sane_error(spline_scaled[1], tol.scaled_bspline)
+            # The claim the prose makes: the raw number is dominated by the
+            # diagonal's spread and the scaled one is not.
+            @test spline_raw[1] > 100 * spline_scaled[1]
+        end
+
         # And the immersed half must actually be immersed, with every cut cell
         # fitted rather than fallen back on.
         cut = match(r"Cut regions / fit failures: (\d+) / (\d+)", output)
@@ -705,7 +720,8 @@
              # the internal it replaced.
              (name="tutorials/04_bspline", env=Dict{String,String}(), requires=("BasicBSpline",),
               check=check_bspline,
-              tol=(deduplicated=1.0e4, singular=1.0e10, centre=1.0e-3, cross_family=1.0e-4)),
+              tol=(deduplicated=1.0e4, singular=1.0e10, centre=1.0e-3, cross_family=1.0e-4,
+                   scaled_bspline=1.0e4)),
 
              # Nested ladders. No single headline error: the claim is that a
              # finer non-nested overlay is *less* accurate (9 cells against 8)

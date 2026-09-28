@@ -976,7 +976,12 @@ indicator representations are intentionally not supported.
     `move!` can void it silently),
     `small_overlap_count` / `small_overlaps`, `min_integration_volume`,
     `min_relative_integration_volume`, `symmetry_residual`,
-    `condition_estimate`, `solver`, `residual_norm`, and `l2_error`
+    `condition_estimate`, `scaled_condition_estimate` (the same quantity for
+    the diagonally scaled operator `D⁻¹ A D⁻¹`, which is what a Jacobi
+    preconditioner sees — on an immersed system the unscaled number is
+    dominated by the spread of the diagonal and the scaled one is where the
+    basis families differ, measured at 43.8 against 2.2e10 at degree 3 on 16²
+    with a disc removed), `solver`, `residual_norm`, and `l2_error`
     (`nothing` unless `exact=` is passed — the key is always present).
     `diagnostics(model)` alone returns the cached `AssemblyDiagnostics`
     record. A nonzero `cut_fallback_count` means those cells are

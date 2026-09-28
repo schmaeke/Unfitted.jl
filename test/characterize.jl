@@ -19,6 +19,16 @@
 # its own instrument: `test/test_graded_golden.jl`, which locks the per-cell mode
 # sets directly and moves under all five of those controls.
 #
+# A DELIBERATE MOVE, so a diff against an older `before.txt` is not misread.
+# The B-spline family's default changed from `continuity_order = 0` to
+# `continuity = :maximal`, and with it the mechanism: a level now *selects* the
+# functions whose whole support lies inside its active region instead of clamping
+# and constraining its artificial faces. Every `bspline` case below therefore
+# moves — cases 3, 8, 9, 23 and 30 — and the move is the feature, not collateral
+# damage. Their `MUST-NOT-CHANGE` marking is about correctness fixes and still
+# means what it says for any *later* change; re-baseline against a run made on
+# this commit or newer.
+#
 # Every case carries one of two markings:
 #
 #   MUST-NOT-CHANGE     the configuration is *currently correct*. A fix that

@@ -141,6 +141,10 @@ function print_run_report(title, report; parameters=(), output=nothing)
     print_optional_report_value("moment-fit residual (max)", report, :moment_fit_residual_max)
     print_optional_report_value("symmetry residual", report, :symmetry_residual)
     print_optional_report_value("condition estimate", report, :condition_estimate)
+    # Labelled so it does not contain "condition estimate" as a substring: the
+    # example smoke suite scrapes metrics by label with a substring regex, and a
+    # second line matching the first's label would silently double its readings.
+    print_optional_report_value("diagonal-scaled condition", report, :scaled_condition_estimate)
     print_optional_report_value("solver", report, :solver)
     print_optional_report_value("residual norm", report, :residual_norm)
     print_optional_report_value("relative L2 error", report, :l2_error)

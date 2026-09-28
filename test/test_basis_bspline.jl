@@ -229,6 +229,62 @@ end
     @test count(==(:overlay), lm.elimination_source) > 0
 end
 
+@testset "BSpline extension: an immersed spline system is Jacobi-conditionable" begin
+    # The cut-cell conditioning hazard, and the half of it that is about the basis
+    # rather than about the diagonal. `cond(A)` on an immersed system is dominated
+    # by the spread of the diagonal — a function whose support is almost entirely
+    # fictitious carries an almost-zero entry — and a diagonal preconditioner
+    # removes exactly that. What survives is near-dependence among the functions
+    # that remain, and the two families differ on it by ten orders of magnitude:
+    # on a cut cell holding a background vertex only one maximal-continuity spline
+    # is supported there, while a C⁰ basis of degree ≥ 2 produces the dependence
+    # on every small cut cell.
+    #
+    #   F. de Prenter, C. V. Verhoosel, G. J. van Zwieten, E. H. van Brummelen,
+    #   *Condition number analysis and preconditioning of the finite cell method*,
+    #   Comput. Methods Appl. Mech. Engrg. 316 (2017) 297–327,
+    #   doi:10.1016/j.cma.2016.07.025.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    scaled(basis, p, n, r) =
+        let hole = physical_domain(leaf(x -> r - norm(x .- 0.5); lipschitz=1.0);
+                                   subcell_length_scale=1 / 128, max_depth=6),
+            V = space(Ω; cells=n, order=p, basis=basis, physical=hole),
+            model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+
+            diagnostics(model, solve!(model)).scaled_condition_estimate
+        end
+    for r in (0.25, 0.3)
+        # 43.8 and 43.6 measured; the band is generous because the number is a
+        # property of the geometry as well as of the basis.
+        @test scaled(bspline(), 3, 8, r) < 1.0e3
+    end
+    # The default family on the same geometry, at a size the estimator still
+    # reports on: orders of magnitude worse, and the gap is the point.
+    @test scaled(IntegratedLegendre(), 2, 8, 0.25) > 1.0e3
+    @test scaled(bspline(), 2, 8, 0.25) < 1.0e2
+    # Both estimates exist and are finite on a system with no cut cells at all,
+    # and there they agree to a small factor, because the diagonal is nearly
+    # uniform and there is almost nothing for the scaling to remove. Note the
+    # bound is two-sided: diagonal scaling is only optimal up to a factor of the
+    # maximum row count (A. van der Sluis, Numer. Math. 14 (1969) 14–23,
+    # doi:10.1007/BF02165096), so it may raise the condition number slightly —
+    # measured 4.090 against 4.004 here — and an assertion that it never does
+    # would be wrong rather than merely tight.
+    plain = prepare(poisson(space(Ω; cells=4, order=2, basis=bspline()); source=1.0,
+                            dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    d = diagnostics(plain, solve!(plain))
+    @test isfinite(d.condition_estimate) && isfinite(d.scaled_condition_estimate)
+    @test 0.5 < d.scaled_condition_estimate / d.condition_estimate < 2.0
+    # Above the estimator's size cap both are `NaN`, which is a "not computed"
+    # rather than a verdict — the same contract `condition_estimate` has always
+    # had, and the reason the cross-family comparison above runs at a size where
+    # the integrated-Legendre system still fits under it.
+    big = prepare(poisson(space(Ω; cells=8, order=3); source=1.0,
+                          dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    dbig = diagnostics(big, solve!(big))
+    @test isnan(dbig.condition_estimate) && isnan(dbig.scaled_condition_estimate)
+end
+
 @testset "BSpline extension: finite-cell solve on a perforated plate" begin
     # End to end through the FCM path: α-fold, moment-fit cut-cell quadrature and
     # the B-spline trace constraints together. The operator must stay positive

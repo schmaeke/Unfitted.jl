@@ -60,6 +60,35 @@ Fields:
     `1 ≤ n ≤ 256`; `NaN` otherwise (computing the condition number of a
     large matrix is too expensive for a default diagnostic, and an empty
     system has none).
+  - `scaled_condition_estimate::Float64` — the same quantity for the
+    symmetrically diagonal-scaled operator `D⁻¹ A D⁻¹`, `D = diag(√|A_ii|)`,
+    which is what a Jacobi-preconditioned solver actually sees. Same size cap,
+    and `NaN` where any diagonal entry is zero.
+
+    Reporting both is what makes an **immersed** system readable, because on a
+    cut cell the two answer different questions. An unscaled `cond` there is
+    dominated by the spread of the diagonal — a basis function whose support is
+    almost entirely fictitious carries an almost-zero diagonal entry — and that
+    spread is exactly what a diagonal preconditioner removes. Whether anything
+    is left after it is removed is a property of the *basis*, and the two
+    shipped families differ on it sharply. Measured on a disc of radius `r`
+    removed from the unit square at degree 3 on a 16² grid:
+
+    ```text
+    r        family       cond        scaled cond
+    0.25     Legendre     6.3e11      2.2e10
+    0.25     B-spline     1.3e12      4.4e1
+    0.30     Legendre     2.3e12      2.5e10
+    0.30     B-spline     9.2e12      4.4e1
+    ```
+
+    The B-spline rows are the maximal-continuity family: on a cut cell holding a
+    background vertex only one spline is supported there, so near-dependence
+    survives only on vertex-free slivers, while a `C⁰` basis of degree ≥ 2
+    produces it on every small cut cell. That difference is the reason an
+    immersed spline system is solvable with a diagonal preconditioner and an
+    immersed high-order `C⁰` system is not, and it is invisible in
+    `condition_estimate` alone.
   - `solver::Symbol` — solver tag recorded by [`solve!`](@ref).
   - `inactive_cell_counts::Vector{Int}` — count of cells deactivated by
     `LevelMask`, one entry per level of each distinct participating space,
@@ -111,6 +140,7 @@ mutable struct AssemblyDiagnostics
     min_relative_integration_volume::Float64
     symmetry_residual::Float64
     condition_estimate::Float64
+    scaled_condition_estimate::Float64
     solver::Symbol
     inactive_cell_counts::Vector{Int}
     reduced_mode_counts::Vector{Int}
@@ -137,7 +167,7 @@ end
 function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regions=0,
                              small_overlap_count=0, min_integration_volume=NaN,
                              min_relative_integration_volume=NaN, symmetry_residual=NaN,
-                             condition_estimate=NaN, solver=:none,
+                             condition_estimate=NaN, scaled_condition_estimate=NaN, solver=:none,
                              small_overlaps=SmallOverlap{Float64}[], inactive_cell_counts=Int[],
                              reduced_mode_counts=Int[], cut_region_count=0, fit_failure_count=0,
                              moment_fit_residual_max=0.0, cut_fallback_count=0,
@@ -147,12 +177,13 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                                Int(small_overlap_count), _float_small_overlaps(small_overlaps),
                                Float64(min_integration_volume),
                                Float64(min_relative_integration_volume), Float64(symmetry_residual),
-                               Float64(condition_estimate), Symbol(solver),
-                               Int[inactive_cell_counts...], Int[reduced_mode_counts...],
-                               Int(cut_region_count), Int(fit_failure_count),
-                               Float64(moment_fit_residual_max), Int(cut_fallback_count),
-                               Int(cut_fallback_points), Int(facet_region_count),
-                               Int(surface_region_count), Int(interface_region_count))
+                               Float64(condition_estimate), Float64(scaled_condition_estimate),
+                               Symbol(solver), Int[inactive_cell_counts...],
+                               Int[reduced_mode_counts...], Int(cut_region_count),
+                               Int(fit_failure_count), Float64(moment_fit_residual_max),
+                               Int(cut_fallback_count), Int(cut_fallback_points),
+                               Int(facet_region_count), Int(surface_region_count),
+                               Int(interface_region_count))
 end
 
 # Per-level count of cells deactivated by a `LevelMask` (mask and
@@ -1007,6 +1038,37 @@ function _condition_estimate(matrix::SparseMatrixCSC; max_size::Int=256)
     return Float64(cond(Matrix(matrix)))
 end
 
+# The same estimator on the symmetrically diagonal-scaled operator
+# `D⁻¹ A D⁻¹` with `D = diag(√|A_ii|)` — what a Jacobi-preconditioned solver
+# sees, and the half of the conditioning question that is about the basis
+# rather than about the scale spread of the diagonal.
+#
+# On an immersed system those two halves are far apart and the distinction is
+# not academic: a basis function whose support is almost entirely fictitious
+# carries an almost-zero diagonal, which inflates `cond(A)` by the spread of
+# that diagonal alone. Scaling removes exactly that, and what remains measures
+# whether the surviving functions are near-dependent on Ω. `AssemblyDiagnostics`
+# documents the measured gap between the two shipped families.
+#
+# It is also the *accurate* computation of the two on such a system. The
+# unscaled matrix's smallest eigenvalue can sit below `λ_max · eps`, where a
+# dense eigensolver returns roundoff — including a negative value on an operator
+# that is positive definite — while the scaled matrix resolves the same mode
+# comfortably. A `NaN` here means a zero diagonal entry, which is a dof carrying
+# no energy at all rather than a conditioning verdict.
+function _scaled_condition_estimate(matrix::SparseMatrixCSC; max_size::Int=256)
+    n = size(matrix, 1)
+    n == 0 && return NaN
+    n > max_size && return NaN
+    dense = Matrix(matrix)
+    scale = [sqrt(abs(dense[i, i])) for i in 1:n]
+    any(iszero, scale) && return NaN
+    for j in 1:n, i in 1:n
+        dense[i, j] /= scale[i] * scale[j]
+    end
+    return Float64(cond(dense))
+end
+
 """
     integration_plan(model::Model) -> IntegrationPlan
 
@@ -1642,6 +1704,7 @@ function diagnostics(model::Model{D,T}, solution; exact=nothing) where {D,T}
             moment_fit_residual_max=diag.moment_fit_residual_max,
             cut_fallback_count=diag.cut_fallback_count,
             cut_fallback_points=diag.cut_fallback_points, symmetry_residual=diag.symmetry_residual,
-            condition_estimate=diag.condition_estimate, solver=diag.solver,
+            condition_estimate=diag.condition_estimate,
+            scaled_condition_estimate=diag.scaled_condition_estimate, solver=diag.solver,
             residual_norm=solution.diagnostics.residual_norm, l2_error=error,)
 end
