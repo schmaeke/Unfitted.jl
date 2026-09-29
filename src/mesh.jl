@@ -1173,16 +1173,98 @@ marked = [CartesianIndex(6, 6), CartesianIndex(6, 7)]
 V = adapt(V, 2 => support_extension(V, marked; level = 2))
 ```
 
+It is exactly [`dilate`](@ref) with the family's own radius, and the two are
+worth keeping apart: `dilate` is a geometric operation the caller chooses the
+width of, while this one asks the basis how far it reaches and is therefore the
+right call whenever the reason for widening is *that the functions need the
+room*. Nothing else in the package computes that radius for you.
+
 The dilation clips to the level's own cell grid; it does not widen the level's
 box. A marked region against a box face therefore stays against it, and the
 functions that would have reached past the face are the ones the face's own
 condition removes — unless that face is physical, where nothing is removed.
+
+Widening is the caller's job everywhere except inside [`refine`](@ref), whose
+h-step applies this to the cells it wakes. `space` and `overlay` build exactly
+the level they are given: a level too thin to hold a support is accepted and
+carries no functions, which `diagnostics(…).levels[k]` reports as
+`active_functions = 0` against a nonzero `raw_functions`.
 """
 function support_extension(V::Space{D}, cells; level::Integer) where {D}
     lvl = V.levels[_check_level(V, level)]
+    return dilate(V, cells; level=level, by=_support_radius(lvl.basis, nominal_order(lvl)))
+end
+
+"""
+    dilate(V::Space, cells; level, by) -> BitArray{D}
+    dilate(mask::AbstractArray{Bool,D}, by) -> BitArray{D}
+
+Grow a set of cells by `by` cells in every direction, clipped to the grid.
+
+`by` is an `Integer` applied to every axis or an `NTuple{D,Integer}` applied per
+axis, and must be non-negative. The `Space` form takes `cells` in every shape
+[`space`](@ref)'s `active =` keyword takes — a `BitArray`/`Array{Bool,D}` over
+the cell grid, an iterable of `CartesianIndex{D}`, or a predicate
+`(cell_box, cell_index) -> Bool` — and resolves it against `level`'s mesh; the
+array form is the bare operation for a mask already in hand. Both return a
+`BitArray{D}`, which is what [`adapt`](@ref), `active =` and [`activate!`](@ref)
+accept, so a marking loop composes without a conversion.
+
+The dilation is a **box**, not a cross: a cell survives when it is within
+`by[d]` along *each* axis independently, so a single cell grows to
+`∏_d (2·by[d] + 1)`. That is the shape a tensor-product support has, and it is
+the reason [`support_extension`](@ref) — which is this function with the basis
+family's own radius — is written in terms of it.
+
+Two uses, and they are different enough to be worth naming. A **margin** around a
+feature that is about to move: a transient loop that refines a travelling front
+widens the band so the front does not leave it before the next estimate, and
+`by` is then a statement about the time step rather than about the basis. And a
+**halo** a caller wants for its own reasons — a region to hold a coefficient
+transition, or a buffer a downstream tool needs. Where the reason is that the
+basis functions need room, reach for [`support_extension`](@ref) instead, so the
+width follows the order rather than being pinned by hand.
+
+```julia
+front = findall(c -> band(cell_box(V, c; level = 2)), cell_indices(V; level = 2))
+V = adapt(V, 2 => dilate(V, front; level = 2, by = 3))
+```
+
+It never widens the level's box — a region against a face stays against it — and
+it is monotone: dilating an already-dilated set by `a` then `b` is the same as
+dilating once by `a + b`.
+"""
+function dilate(V::Space{D}, cells; level::Integer, by) where {D}
+    lvl = V.levels[_check_level(V, level)]
     marked = _normalize_mask(cells, lvl.mesh)
     marked === nothing && return trues(lvl.mesh.cells)
-    return _dilate_cells(marked.on, _support_radius(lvl.basis, nominal_order(lvl)))
+    return _dilate_cells(marked.on, _dilation_radius(by, Val(D)))
+end
+
+function dilate(mask::AbstractArray{Bool,D}, by) where {D}
+    on = BitArray(undef, size(mask))
+    copyto!(on, mask)
+    return _dilate_cells(on, _dilation_radius(by, Val(D)))
+end
+
+# Coerce a `by =` specification into a per-axis radius. Deliberately parallel to
+# `_axis_int_tuple`, which it cannot reuse: cell counts and polynomial orders
+# must be positive, and a dilation width of zero is the perfectly sensible
+# request to leave one axis alone.
+function _dilation_radius(by::Integer, ::Val{D}) where {D}
+    by >= 0 || throw(ArgumentError("dilate: `by` must be non-negative; got $by"))
+    return ntuple(_ -> Int(by), D)
+end
+
+function _dilation_radius(by::NTuple{D,<:Integer}, ::Val{D}) where {D}
+    all(>=(0), by) ||
+        throw(ArgumentError("dilate: every entry of `by` must be non-negative; " * "got $by"))
+    return Int.(by)
+end
+
+function _dilation_radius(by, ::Val{D}) where {D}
+    throw(ArgumentError("dilate: `by` must be a non-negative integer or an NTuple{$D,Int}; " *
+                        "got $(typeof(by))"))
 end
 
 # Dilate a cell mask by `radius[d]` cells along each axis, clipped to the grid.

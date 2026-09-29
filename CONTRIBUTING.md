@@ -598,7 +598,9 @@ masks, or intersection-region internals.
   - Declaring a nested refinement ladder up front and switching its
     cells on per level as the solution develops.
   - Selectively activating or deactivating individual overlay cells as
-    a feature evolves in time.
+    a feature evolves in time, and growing a marked region by a margin —
+    `dilate` for a width the caller chooses, `support_extension` for the one
+    the basis family needs.
   - Handing the refinement decision to the solver: estimate, mark,
     refine, coarsen, with the loop itself left to the caller.
   - Attaching an immersed physical domain via a level-set function and
@@ -970,10 +972,16 @@ indicator representations are intentionally not supported.
     `interface_region_count`, `raw_dofs`, `active_unknowns`, `levels`
     (one entry per level with `id`, `role`, `cells`, `order` — the nominal
     per-axis maximum — `order_palette`, the distinct per-cell orders,
-    `mode`, `basis`, `domain`, and `nested`, whether every higher level's
+    `mode`, `basis`, `domain`, `nested`, whether every higher level's
     nodes coincide with this level's where they overlap: the geometric half
     of what makes leaf semantics lossless, reported per level because
-    `move!` can void it silently),
+    `move!` can void it silently, and `raw_functions` / `active_functions`,
+    what the level enumerated and what survived its artificial boundary.
+    Both, because the pair separates the two ways of contributing nothing:
+    `raw = 0` is a dormant level, while `raw > 0` with `active = 0` is a
+    level whose boundary took every function it had — the shape a spline
+    overlay too thin to hold a support comes out as, and one that no single
+    number distinguishes),
     `small_overlap_count` / `small_overlaps`, `min_integration_volume`,
     `min_relative_integration_volume`, `symmetry_residual`,
     `condition_estimate`, `scaled_condition_estimate` (the same quantity for
@@ -1296,7 +1304,10 @@ demos.
     `LevelMask` and a geometrically smaller overlay covering the same
     active cells; artificial-boundary constraint on internal
     active/inactive interfaces; `activate!`/`deactivate!` invalidation
-    contract.
+    contract. `dilate`'s box shape (one cell grows to `∏_d (2·by_d + 1)`),
+    its per-axis widths, its monotonicity in the width, its clipping at a
+    box face, its refusals, and its agreement with `support_extension` at
+    the family's own radius.
   - Immersed boundary (`PhysicalDomain`): strict-α cell-level
     fictitious fold drops the right cells; the expected
     `:full` / `:cut_fitted` / `:fictitious_alpha` / `:cut_fallback` /

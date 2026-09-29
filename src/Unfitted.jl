@@ -79,10 +79,10 @@ export AxisBox, GeometryTolerance, PhysicalDomain, physical_domain, classify_cel
        source_form, source_load, load_vector, prepare, assemble_matrix, assemble_vector, assemble!,
        foreach_quadrature_point, foreach_interface_quadrature_point, interface_quadrature_count,
        nquadpoints, solve!, solution, move!, moved, moved_space, activate!, deactivate!,
-       active_cells, support_extension, cell_orders, elevate, elevated, cell_order, nominal_order,
-       ladder, adapt, adapted, is_nested, overlapping_cells, level_count, transfer, L2Projection,
-       Rewire, estimate, mark_cells, decide, refine, coarsen, QuadField, RBFP0, write_vtk,
-       vtk_series, VTKSeries, write_quadrature_vtm, l2_error, boundary_integral, value,
+       active_cells, support_extension, dilate, cell_orders, elevate, elevated, cell_order,
+       nominal_order, ladder, adapt, adapted, is_nested, overlapping_cells, level_count, transfer,
+       L2Projection, Rewire, estimate, mark_cells, decide, refine, coarsen, QuadField, RBFP0,
+       write_vtk, vtk_series, VTKSeries, write_quadrature_vtm, l2_error, boundary_integral, value,
        field_gradient, diagnostics, active_unknowns, cell_indices, cell_box, center, value_vec,
        gradient_tensor, symmetric_gradient
 

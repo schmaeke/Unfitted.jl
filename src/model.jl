@@ -221,6 +221,41 @@ function _reduced_mode_counts(layout::SystemLayout)
     return counts
 end
 
+# Per-level counts of the functions a level *enumerated* and of those that
+# *survived*, keyed by level id and summed over every field of the system
+# layout. Both, and not only the second, because the two answer different
+# questions and the pair is what separates them:
+#
+#   raw = 0, active = 0     the level is dormant — no active cell, so nothing
+#                           was enumerated. A ladder's unwoken rungs look like
+#                           this and it is not a problem.
+#   raw > 0, active = 0     the level enumerated functions and the artificial
+#                           boundary took every one of them. For a
+#                           maximal-continuity spline level that is the thin
+#                           case: a region `p` cells wide or less holds no
+#                           function whose whole support fits inside it, so the
+#                           level costs a mesh and buys nothing.
+#
+# Counted per *function* rather than per unknown, because that is the quantity
+# the basis families' dof ledgers are stated in — `∏_d (n_d − p_d)` for a
+# selected spline level, say. On a field with `components > 1` a function
+# carries one unknown per component, so the entries sum to `active_unknowns`
+# only on scalar fields.
+function _level_function_counts(layout::SystemLayout)
+    raw = Dict{Int,Int}()
+    active = Dict{Int,Int}()
+    for field in layout.fields
+        dofs = field.dofs
+        for r in eachindex(dofs.raw_keys)
+            lvl = dofs.raw_keys[r].level
+            raw[lvl] = get(raw, lvl, 0) + 1
+            any(!iszero, @view dofs.active_component[r, :]) &&
+                (active[lvl] = get(active, lvl, 0) + 1)
+        end
+    end
+    return raw, active
+end
+
 # Scan the integration plan for NNMF-fit statistics, returning
 # `(cut, failed, fallback, fallback_points)`. `:cut_fitted` are successful
 # fits; `:cut_fallback` (the raw Saye volume rule), `:cut_failed` (empty
@@ -542,11 +577,13 @@ end
 # Level reports for every subdomain space, flattened in the same order as
 # `_problem_levels`. Built per space because nesting is a relation between the
 # levels of one space; a coupled problem's spaces are independent stacks.
-function _level_reports(problem::Problem, tol::GeometryTolerance)
+function _level_reports(problem::Problem, tol::GeometryTolerance, layout::SystemLayout)
+    raw, active = _level_function_counts(layout)
     out = Any[]
     for V in problem_spaces(problem)
         for level in V.levels
-            push!(out, _level_report(level, V, tol))
+            push!(out,
+                  _level_report(level, V, tol, get(raw, level.id, 0), get(active, level.id, 0)))
         end
     end
     return out
@@ -1516,6 +1553,18 @@ function support_extension(model::Model, cells; level::Integer)
     return support_extension(model.prefold_space, cells; level)
 end
 
+"""
+    dilate(model::Model, cells; level, by) -> BitArray{D}
+
+The `Model` spelling of [`dilate`](@ref)`(::Space, cells; level, by)`. Reads the
+pre-fold space for the same reason [`support_extension`](@ref) does: the result
+is going back to [`adapt`](@ref) or [`activate!`](@ref), and neither may be fed a
+mask the fictitious fold has already written over.
+"""
+function dilate(model::Model, cells; level::Integer, by)
+    return dilate(model.prefold_space, cells; level=level, by=by)
+end
+
 # ── Public: refresh Dirichlet values without rebuilding the model ────────────
 
 """
@@ -1671,7 +1720,8 @@ diagnostics(model::Model) = model.diagnostics
 # can void it on a stack that was nested when it was built, and the resulting
 # loss shows up as neither a residual nor a rank deficiency. See
 # [`is_nested`](@ref).
-function _level_report(level, V::Space, tol::GeometryTolerance)
+function _level_report(level, V::Space, tol::GeometryTolerance, raw_functions::Int,
+                       active_functions::Int)
     nested = all(k -> k.id <= level.id || _nested_over(level, k, tol), V.levels)
     # `order` stays the level's nominal (maximum) per-axis order, so an existing
     # reader keeps reading the same field with the same meaning. `order_palette`
@@ -1681,7 +1731,8 @@ function _level_report(level, V::Space, tol::GeometryTolerance)
     order_palette = copy(level.orders.palette)
     return (; id=level.id, role=level.role, cells=level.mesh.cells, order=nominal_order(level),
             order_palette=order_palette, mode=level.mode, basis=basis_name(level.basis),
-            domain=level.mesh.domain, nested=nested,)
+            domain=level.mesh.domain, nested=nested, raw_functions=raw_functions,
+            active_functions=active_functions,)
 end
 
 function diagnostics(model::Model{D,T}, solution; exact=nothing) where {D,T}
@@ -1689,7 +1740,7 @@ function diagnostics(model::Model{D,T}, solution; exact=nothing) where {D,T}
     diag = diagnostics(model)
     error = exact === nothing ? nothing : l2_error(solution, model, exact)
     tol = get(model.plan_options, :tolerance, GeometryTolerance(T))
-    return (; dimension=diag.dimension, levels=_level_reports(model.problem, tol),
+    return (; dimension=diag.dimension, levels=_level_reports(model.problem, tol, model.dofs),
             active_unknowns=diag.active_unknowns, raw_dofs=raw_dof_count(model.dofs),
             integration_regions=diag.integration_regions,
             facet_region_count=diag.facet_region_count,

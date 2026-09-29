@@ -204,6 +204,107 @@ end
     @test size(support_extension(edge, [CartesianIndex(1, 1)]; level=1)) == (8, 8)
 end
 
+@testset "dilate: the geometric primitive support_extension is built on" begin
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    V = space(Ω; cells=16, order=3, basis=bspline())
+    one_cell = [CartesianIndex(8, 8)]
+
+    # A box, not a cross: one cell grows to ∏_d (2·by[d] + 1).
+    for by in (0, 1, 2, 3)
+        @test count(dilate(V, one_cell; level=1, by=by)) == (2by + 1)^2
+    end
+    # Per-axis widths, and the array form agrees with the Space form.
+    @test count(dilate(V, one_cell; level=1, by=(1, 3))) == 3 * 7
+    seed = falses(16, 16)
+    seed[8, 8] = true
+    @test dilate(seed, (1, 3)) == dilate(V, one_cell; level=1, by=(1, 3))
+    # `dilate` accepts a plain `Array{Bool}` as well as a `BitArray`.
+    @test dilate(Array(seed), 2) == dilate(seed, 2)
+
+    # Monotone in the width: dilating by `a` then `b` is dilating once by `a + b`.
+    @test dilate(dilate(seed, 2), 3) == dilate(seed, 5)
+    # And `by = 0` is the identity.
+    @test dilate(seed, 0) == seed
+
+    # Clipped to the grid, never widening the box.
+    corner = falses(16, 16)
+    corner[1, 1] = true
+    @test count(dilate(corner, 3)) == 4 * 4
+    @test size(dilate(corner, 3)) == (16, 16)
+
+    # `support_extension` IS `dilate` at the family's own radius — asserted rather
+    # than assumed, because the two are separate public names.
+    marked = [CartesianIndex(8, 8), CartesianIndex(9, 9)]
+    for p in 1:3
+        W = space(Ω; cells=16, order=p, basis=bspline())
+        @test support_extension(W, marked; level=1) == dilate(W, marked; level=1, by=p)
+    end
+    # Integrated Legendre reaches no further than its own cell, so the two differ:
+    # its support extension is the identity while `dilate` still grows what it is
+    # told to.
+    L = space(Ω; cells=16, order=3)
+    @test support_extension(L, marked; level=1) == dilate(L, marked; level=1, by=0)
+    @test count(dilate(L, marked; level=1, by=2)) > count(support_extension(L, marked; level=1))
+
+    # Refusals, so a wrong `by` is loud rather than silently clamped.
+    @test_throws ArgumentError dilate(V, one_cell; level=1, by=-1)
+    @test_throws ArgumentError dilate(V, one_cell; level=1, by=(1, -1))
+    @test_throws ArgumentError dilate(V, one_cell; level=1, by=1.5)
+    # The `Model` spelling reads the pre-fold space, so it agrees with the space's.
+    model = prepare(mass(V))
+    @test dilate(model, one_cell; level=1, by=2) == dilate(V, one_cell; level=1, by=2)
+end
+
+@testset "diagnostics: a level reports what it enumerated and what survived" begin
+    # The pair is what separates the two ways of contributing nothing, which is
+    # the question a too-thin spline overlay raises and which no single number
+    # answers. A dormant level enumerated nothing; a too-thin one enumerated
+    # functions and lost every one of them to its artificial boundary.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    BC = [dirichlet(0.0; on=boundary(:all))]
+    report_of(V) =
+        let model = prepare(poisson(V; source=1.0, dirichlet=BC))
+            diagnostics(model, solve!(model))
+        end
+    levels_of(V) = report_of(V).levels
+
+    base = space(Ω; cells=16, order=3, basis=bspline())
+    thin = overlay(base, box((0.25, 0.25), (0.75, 0.75)); cells=3, order=3, basis=bspline())
+    thick = overlay(base, box((0.25, 0.25), (0.75, 0.75)); cells=8, order=3, basis=bspline())
+    dormant = overlay(base, box((0.25, 0.25), (0.75, 0.75)); cells=8, order=3, basis=bspline(),
+                      active=CartesianIndex{2}[])
+
+    # Too thin: it enumerated (3 + 3)² = 36 functions and kept none.
+    thin_level = levels_of(thin)[2]
+    @test thin_level.raw_functions == 36
+    @test thin_level.active_functions == 0
+    # Dormant: nothing enumerated at all, which is not the same thing.
+    dormant_level = levels_of(dormant)[2]
+    @test dormant_level.raw_functions == 0
+    @test dormant_level.active_functions == 0
+    # Thick enough: the closed form, `(n − p)² = 25`.
+    thick_level = levels_of(thick)[2]
+    @test thick_level.active_functions == 25
+    @test thick_level.raw_functions == (8 + 3)^2
+
+    # On a scalar field a function carries one unknown, so the counts sum to the
+    # total. Read from ONE report: a `Solution` is pinned to the model that
+    # produced it, so pairing one model's diagnostics with another model's
+    # solution is not merely wasteful, it is rejected.
+    thick_report = report_of(thick)
+    report = thick_report.levels
+    @test sum(l -> l.active_functions, report) == thick_report.active_unknowns
+    # A vector field carries one unknown per component per function, so the
+    # functions stay the same and the unknowns scale — which is why the report
+    # counts functions.
+    u = field(:u, thick; components=2)
+    vec_model = prepare(poisson(u; source=SVector(1.0, 1.0),
+                                dirichlet=[dirichlet(SVector(0.0, 0.0); on=boundary(:all))]))
+    vec_report = diagnostics(vec_model, solve!(vec_model))
+    @test [l.active_functions for l in vec_report.levels] == [l.active_functions for l in report]
+    @test vec_report.active_unknowns == 2 * sum(l -> l.active_functions, report)
+end
+
 @testset "BSpline extension: immersed physical domain — fold exempt, user mask not" begin
     # The family carries an immersed `PhysicalDomain`. The one thing that takes is
     # the fold exemption in `_active_cell_at_face`: a face whose inactive side is a

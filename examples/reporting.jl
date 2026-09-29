@@ -78,6 +78,14 @@ function print_level_block(report)
             low, high = extrema(maximum, level.order_palette)
             print(" orders=", length(level.order_palette), " in ", low, ":", high)
         end
+        # What the level actually contributes. `active` alone would leave the two
+        # ways of contributing nothing indistinguishable: a dormant level has
+        # enumerated nothing (`raw = 0`), while a level whose artificial boundary
+        # took every function it had has `raw > 0` and `active = 0` — the shape a
+        # spline overlay too thin to hold a support comes out as.
+        if hasproperty(level, :active_functions)
+            print(" functions=", level.active_functions, "/", level.raw_functions)
+        end
         println()
     end
     return nothing
