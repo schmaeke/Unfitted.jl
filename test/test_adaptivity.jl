@@ -718,6 +718,38 @@ end
     @test argmax(ec.cells[1]) == CartesianIndex(1, 1)
 end
 
+@testset "estimate does not change when a dormant level is appended" begin
+    # The enriched twin needs leaf semantics off for the level it enriches, and only
+    # that one. Turning them off for the whole enriched model instead made the
+    # indicator a function of which levels happen to be present: appending a level
+    # that carries nothing at all inflated the indicator on a covered cell of an
+    # unrelated integrated-Legendre level by 4.1×, because that level's
+    # order-elevated covered modes then survived, landed in the complement, and were
+    # charged as error to a cell `decide` can spend nothing on.
+    source(x) = exp(-200.0 * ((x[1] - 0.75)^2 + (x[2] - 0.25)^2))
+    bc = [dirichlet(0.0; on=boundary(:all))]
+    base = space(_AD_Ω; cells=8, order=2)
+    live = trues(16, 16)
+    live[1:8, 9:16] .= false
+    live[9:16, 9:16] .= false
+    live[1:8, 1:8] .= false
+    plain = overlay(base, _AD_Ω; cells=16, order=2, active=live)
+    withdormant = overlay(plain, _AD_Ω; cells=4, order=2, basis=bspline(),
+                          active=CartesianIndex{2}[])
+
+    a = prepare(poisson(plain; source=source, dirichlet=bc))
+    b = prepare(poisson(withdormant; source=source, dirichlet=bc))
+    sa = solve!(a)
+    sb = solve!(b)
+    # The solved space is the same — a dormant level carries no unknowns.
+    @test active_unknowns(a) == active_unknowns(b)
+    ea = estimate(a, sa)
+    eb = estimate(b, sb)
+    @test eb.total ≈ ea.total
+    @test eb.cells[1] ≈ ea.cells[1]
+    @test eb.cells[2] ≈ ea.cells[2]
+end
+
 @testset "the automated loop runs on a spline stack" begin
     # The whole loop — estimate, Dörfler marking, decide, refine, rebuild — on a
     # family that carries no per-cell order. Every marked cell takes h, because
@@ -762,12 +794,45 @@ end
     # still carries the degree it was declared with.
     @test all(all(o -> o == (3, 3), cell_orders(model.prefold_space; level=k))
               for k in 1:length(model.prefold_space.levels))
-    # And the woken region is support-extended: every level that woke anything
-    # woke at least `(p + 1)^D` cells, since fewer could carry no function at all.
-    for k in 2:length(model.prefold_space.levels)
-        live = count(active_cells(model.prefold_space; level=k))
-        live == 0 || @test live >= 4^2
+    # h and nothing else has already been asserted above; the support extension gets
+    # its own controlled step below, because a floor on the live count here is reached
+    # by the un-extended h-step alone and would pin nothing.
+end
+
+@testset "refine: the h-step support-extends what it wakes, and coarsen releases it" begin
+    # The property, asserted against the un-extended cover rather than against a
+    # floor: `refine` must wake exactly the dilation of the cells `overlapping_cells`
+    # reports, by the family's own radius. A floor of `(p + 1)^D` is reached by four
+    # marked parents on its own, so it passes with the extension deleted.
+    V = ladder(_AD_Ω; cells=8, depth=2, order=3, basis=bspline())
+    cell = CartesianIndex(4, 4)
+    W = refine(V; h=[(1, cell)])
+    core = overlapping_cells(V, [cell]; from=1, to=2)
+    @test count(core) == 4                                   # a 2×2 cover, un-extended
+    @test active_cells(W; level=2) == dilate(core, 3)
+    @test count(active_cells(W; level=2)) == (2 + 2 * 3)^2    # 64, not 4
+
+    # And `coarsen` releases the collar with the cover, so the round trip is the
+    # identity. Without the mirror the collar is unreachable by any public verb and a
+    # transient loop's active set grows without bound — measured before it existed, a
+    # mark walking (3,4) … (7,4) with a release behind it ran 60, 56, 88, 84, 108.
+    @test active_cells(coarsen(W; h=[(1, cell)]); level=2) == active_cells(V; level=2)
+    travel = Int[]
+    marks = [CartesianIndex(i, 4) for i in 3:6]
+    S = V
+    for (i, c) in pairs(marks)
+        S = refine(S; h=[(1, c)])
+        i > 1 && (S = coarsen(S; h=[(1, marks[i - 1])]))
+        push!(travel, count(active_cells(S; level=2)))
     end
+    @test maximum(travel) <= 2 * (2 + 2 * 3)^2               # bounded, not monotone
+
+    # The default family has radius zero, so none of this touches it: the h-step wakes
+    # exactly the cover and the round trip was already exact.
+    L = ladder(_AD_Ω; cells=8, depth=2, order=2)
+    LW = refine(L; h=[(1, cell)])
+    @test active_cells(LW; level=2) == overlapping_cells(L, [cell]; from=1, to=2)
+    @test active_cells(coarsen(LW; h=[(1, cell)]); level=2) == active_cells(L; level=2)
 end
 
 @testset "refine: the p-step actually survives" begin

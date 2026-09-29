@@ -976,12 +976,13 @@ indicator representations are intentionally not supported.
     nodes coincide with this level's where they overlap: the geometric half
     of what makes leaf semantics lossless, reported per level because
     `move!` can void it silently, and `raw_functions` / `active_functions`,
-    what the level enumerated and what survived its artificial boundary.
-    Both, because the pair separates the two ways of contributing nothing:
-    `raw = 0` is a dormant level, while `raw > 0` with `active = 0` is a
-    level whose boundary took every function it had — the shape a spline
-    overlay too thin to hold a support comes out as, and one that no single
-    number distinguishes),
+    what the level enumerated and what survived *every* elimination —
+    artificial-boundary constraints, leaf pruning and physical Dirichlet data
+    alike. Both, because the pair separates the two ways of contributing
+    nothing: `raw = 0` is a dormant level, while `raw > 0` with `active = 0`
+    is a level none of whose functions reach the system, which is the shape a
+    spline overlay too thin to hold a support comes out as and one that no
+    single number distinguishes),
     `small_overlap_count` / `small_overlaps`, `min_integration_volume`,
     `min_relative_integration_volume`, `symmetry_residual`,
     `condition_estimate`, `scaled_condition_estimate` (the same quantity for
@@ -1377,9 +1378,10 @@ demos.
     unchanged in 1D, 2D and 3D.
   - Package extensions: the B-spline family's basis values, constraints
     and a small assembly; its refusal of a per-cell order through both
-    `space` and `elevate`; the support-selection dof ledger — `(n + p)` per
-    axis where a face is physical and `(n − p)` where it is artificial, and
-    the closed form `n + p − 2(m + 1)` at a requested continuity `m`; the
+    `space` and `elevate`; the support-selection dof ledger — per axis
+    `n + p` with both faces physical and `n − p` with both artificial, one
+    eliminated function per artificial face for degree 1 and `p` for higher,
+    and the closed form `n + p − 2(m + 1)` at a requested continuity `m`; the
     superposition being smooth and not merely each level, asserted as the
     decade ratio of the normal-derivative jump across an overlay face
     (10 at `:maximal`, below 1.5 at `C⁰` and for integrated Legendre); an
@@ -1390,6 +1392,19 @@ demos.
     integrated-Legendre level's hats, and the fold configurations where the
     cover's face lands before, inside and beyond the cut band; the MeshIO
     signed-distance leaf; the Tensors notation round-trip.
+    **Requirement not yet met:** the fold configuration that support selection
+    repairs is still singular under the *clamped* mechanism, which `bspline(;
+    continuity = m)` for `m < p − 1` still selects. Where a clamped cover's box
+    face falls on a knot of the level below inside a band of cut cells, it
+    reproduces a *combination* of two buried functions without reproducing either,
+    and a dedup keyed on single buried functions cannot see it: measured at 8 exact
+    null modes of 104 unknowns, pinned `@test_broken` in `test_basis_bspline.jl`.
+    The repair is a per-face rank repair — of the `p` buried functions straddling
+    the face knot with the same perpendicular factor, keep the `m + 1` trace orders
+    and strongly eliminate the rest — which changes what the dedup may eliminate
+    rather than the burial test. Until it lands, use `continuity = :maximal` (the
+    default, where the burial test is exact and the configuration is full rank),
+    move the cover's face off the cut-cell band, or break the nesting.
   - Example smoke suite: every `examples/<tier>/<name>/<name>.jl`
     script runs to a clean exit at a coarse size in the default suite,
     with a finite, sane headline metric wherever the script prints one,
@@ -1397,7 +1412,7 @@ demos.
     runs. Where a tutorial's *prose* tells the reader what to look for
     in the output, that claim is asserted too — the overlay's
     order-of-magnitude improvement over the base level, the agreement
-    between a reduced and an unreduced stack, the fourteen orders of
+    between a reduced and an unreduced stack, the thirteen orders of
     magnitude of conditioning that one duplicated B-spline mode costs —
     so a tutorial whose text and output disagree fails here. The cases
     share one batched subprocess (`test/run_examples_child.jl`), each

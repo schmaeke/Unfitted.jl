@@ -72,15 +72,24 @@ Fields:
     spread is exactly what a diagonal preconditioner removes. Whether anything
     is left after it is removed is a property of the *basis*, and the two
     shipped families differ on it sharply. Measured on a disc of radius `r`
-    removed from the unit square at degree 3 on a 16² grid:
+    removed from the unit square, `−Δu = 1`, degree 2 on an 8² grid — a size at
+    which both families stay under the cap above, so both numbers are the ones
+    this diagnostic prints:
 
     ```text
-    r        family       cond        scaled cond
-    0.25     Legendre     6.3e11      2.2e10
-    0.25     B-spline     1.3e12      4.4e1
-    0.30     Legendre     2.3e12      2.5e10
-    0.30     B-spline     9.2e12      4.4e1
+    r        family       unknowns    cond       scaled cond
+    0.25     Legendre      216        1.36e6     4.22e4
+    0.25     B-spline       64        5.99e2     6.04
+    0.30     Legendre      192        1.06e5     5.58e3
+    0.30     B-spline       64        1.26e5     7.17
     ```
+
+    The gap widens with the degree, and past degree 2 only the B-spline half is
+    reportable here: at degree 3 on the same grid the spline system has 81
+    unknowns and scales to 39.9 (`r = 0.25`) and 45.1 (`r = 0.30`) from 1.48e5
+    and 3.63e8, while the integrated-Legendre system has 504 and is `NaN` by the
+    cap. Computed directly, past the cap, a degree-3 16² pair gives 2.2e10 for
+    integrated Legendre against 4.4e1 for the splines.
 
     The B-spline rows are the maximal-continuity family: on a cut cell holding a
     background vertex only one spline is supported there, so near-dependence
@@ -229,12 +238,21 @@ end
 #   raw = 0, active = 0     the level is dormant — no active cell, so nothing
 #                           was enumerated. A ladder's unwoken rungs look like
 #                           this and it is not a problem.
-#   raw > 0, active = 0     the level enumerated functions and the artificial
-#                           boundary took every one of them. For a
-#                           maximal-continuity spline level that is the thin
-#                           case: a region `p` cells wide or less holds no
-#                           function whose whole support fits inside it, so the
-#                           level costs a mesh and buys nothing.
+#   raw > 0, active = 0     the level enumerated functions and nothing of it
+#                           reaches the system. For a maximal-continuity spline
+#                           level the usual cause is the thin case: a region `p`
+#                           cells wide or less holds no function whose whole
+#                           support fits inside it, so the level costs a mesh and
+#                           buys nothing.
+#
+# `active` is "survived every elimination", not "survived the artificial
+# boundary": it is read off `active_component`, which is zero for an
+# artificial-boundary constraint, for leaf-semantics pruning, and for a physical
+# Dirichlet condition alike. A one-cell order-1 level with Dirichlet data on all
+# four of its faces therefore reports 4 / 0 although it has no artificial boundary
+# at all, and an ordinary 4×4 order-2 Poisson level reports 49 / 81 with the 32
+# missing functions Dirichlet. The signature narrows the cause; it does not name
+# it.
 #
 # Counted per *function* rather than per unknown, because that is the quantity
 # the basis families' dof ledgers are stated in — `∏_d (n_d − p_d)` for a
@@ -244,7 +262,17 @@ end
 function _level_function_counts(layout::SystemLayout)
     raw = Dict{Int,Int}()
     active = Dict{Int,Int}()
+    # Two fields over ONE space enumerate the same functions — `dof_layout` builds
+    # each field's raws from the space alone — so a second field over that space must
+    # not count them again. Fields over *different* spaces hold disjoint level-id
+    # blocks (`_reindex_space_levels`), so a field's block is either wholly counted or
+    # wholly new and the skip is exact rather than a heuristic. Without it a two-field
+    # problem reported every level's counts doubled, while a two-component vector
+    # field over the same space — the same dof count, spelled differently — reported
+    # them once.
+    counted = Set{Int}()
     for field in layout.fields
+        all(in(counted), field.level_ids) && continue
         dofs = field.dofs
         for r in eachindex(dofs.raw_keys)
             lvl = dofs.raw_keys[r].level
@@ -252,6 +280,7 @@ function _level_function_counts(layout::SystemLayout)
             any(!iszero, @view dofs.active_component[r, :]) &&
                 (active[lvl] = get(active, lvl, 0) + 1)
         end
+        union!(counted, field.level_ids)
     end
     return raw, active
 end
@@ -653,12 +682,14 @@ default just classifies on demand.
 
 `prune` is leaf semantics, forwarded to [`dof_layout`](@ref) for every field
 alike — it describes the discretisation, not one field of it. [`prepare`](@ref)
-is where a caller sets it.
+is where a caller sets it. `prune_exempt` is the per-level escape hatch the same
+call forwards; see [`dof_layout`](@ref).
 
 Called by [`prepare`](@ref) and the in-place mutators. End users do
 not usually call this directly.
 """
 function system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), prune::Bool=true,
+                       prune_exempt=(),
                        classify_caches=IdDict{Space,_ClassifyCache{D,T}}()) where {D,T}
     layouts = FieldLayout{D,T}[]
     by_name = Dict{Symbol,Int}()
@@ -668,7 +699,7 @@ function system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), pr
         # so the constraint pass never re-classifies fold-boundary cells.
         cache = get(() -> _ClassifyCache{D,T}(), classify_caches, field.space)
         layout = dof_layout(field.space; dirichlet=_dirichlet_for_field(problem, field.name),
-                            tolerance, components=component_count(field), prune,
+                            tolerance, components=component_count(field), prune, prune_exempt,
                             classify_cache=cache)
         # The field's (reindexed, contiguous) level-id block — how assembly
         # routes each region to its owning subdomain field without a `served` mask.
@@ -895,7 +926,8 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
     # can disagree with this one. It is split off here rather than forwarded,
     # since `integration_plan` would reject the keyword.
     prune = get(plan_options, :prune, true)
-    integration_options = Base.structdiff(plan_options, NamedTuple{(:prune,)})
+    prune_exempt = get(plan_options, :prune_exempt, ())
+    integration_options = Base.structdiff(plan_options, NamedTuple{(:prune, :prune_exempt)})
     # One integration plan per distinct subdomain space, each sharing that
     # space's own cell-classification cache. The moment-fit caches, unlike the
     # classification ones, outlive this call: they are the model's, and every
@@ -916,7 +948,7 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                                                         classify_cache=caches[i],
                                                         moment_fit_cache=fit_caches[i])
                                        for i in eachindex(spaces)]
-    layout = system_layout(effective_problem; tolerance, prune,
+    layout = system_layout(effective_problem; tolerance, prune, prune_exempt,
                            classify_caches=_caches_by_space(spaces, caches))
     facet_regions = _resolve_facet_regions(effective_problem, tolerance)
     surface_regions = _resolve_surface_regions(effective_problem, tolerance)

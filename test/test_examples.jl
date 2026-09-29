@@ -34,7 +34,7 @@
 # by an order of magnitude, that switching covered-mode pruning off changes the
 # answer in no digit that matters, and that `activate!`/`deactivate!` reproduce
 # the configuration they rebuild — all three are checked below. Tutorial 4 tells
-# the reader that one duplicated B-spline mode costs fourteen orders of
+# the reader that one duplicated B-spline mode costs thirteen orders of
 # magnitude of conditioning, so both ends of that span are checked. A tutorial whose text
 # and output disagree fails here.
 #
@@ -400,11 +400,11 @@
         conditions = metric_values(output, "condition estimate")
         @test length(conditions) ≥ 3
         if length(conditions) ≥ 3
-            # "One redundant unknown costs roughly fourteen orders of
+            # "One redundant unknown costs roughly thirteen orders of
             # magnitude of conditioning." Both ends are asserted: the
-            # deduplicated nested stack stays a few hundred (measured 687.1),
-            # the undeduplicated one is numerically singular (measured
-            # 3.43e16). The upper end is a floor rather than a band on purpose:
+            # deduplicated nested stack stays a few hundred (measured 253.2),
+            # the undeduplicated one is numerically singular (measured 4.86e15,
+            # and deliberately not pinned to that figure). The upper end is a floor rather than a band on purpose:
             # once an operator is singular to working precision its reported
             # condition is 1/eps times an accident, and pinning it two-sidedly
             # would pin the accident.
@@ -713,7 +713,7 @@
               check=check_immersed_fcm, tol=1.0e-3),
              # The B-spline family. No L² error at all (see `check_bspline`);
              # measured instead: 249 unknowns at cond 253.2 deduplicated
-             # against 250 at 7.04e15 undeduplicated, u_h(½,½) within 1.6e-8
+             # against 250 at order 5e15 undeduplicated, u_h(½,½) within 1.6e-7
              # relative of the series value, and 1.15e-5 largest cross-family
              # pointwise gap. Part 1c builds its stack through
              # `prepare(…; prune = false)`; measured bit-for-bit identical to

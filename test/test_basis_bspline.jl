@@ -110,12 +110,38 @@ end
     for p in 1:4, n in (4, 8)
         @test free(space(Ω; cells=n, order=p, basis=bspline())) == (n + p)^2
     end
-    # An overlay on a base fine enough that nothing is nested, so the count below is
+    # An overlay whose cell count does not divide the base's, so the count below is
     # the overlay's own contribution and not a dedup in disguise.
     for p in 1:4, n in (2, 3, 5, 7, 11)
         base = space(Ω; cells=16, order=p, basis=bspline())
         V = overlay(base, box((0.25, 0.25), (0.75, 0.75)); cells=n, order=p, basis=bspline())
         @test free(V) - free(base) == max(0, n - p)^2
+    end
+    # And the third ledger, the clamped one: a requested continuity `m` below `p − 1`
+    # leaves `n + p − 2(m + 1)` per axis. It is asserted here because CONTRIBUTING
+    # lists it among what this file pins, and because nothing else does — the
+    # neighbouring testsets assert an *ordering* of dof counts across `m`, which a
+    # rule off by one per side still satisfies.
+    for m in 0:1, n in (7,)
+        base = space(Ω; cells=16, order=3, basis=bspline())
+        V = overlay(base, box((0.25, 0.25), (0.75, 0.75)); cells=n, order=3,
+                    basis=bspline(; continuity=m))
+        @test free(V) - free(base) == (n + 3 - 2 * (m + 1))^2
+    end
+    # A user-masked support cell blocks the dedup — the level assembles the function
+    # truncated to its active cells, which is not the function the cover reproduces —
+    # and that must hold whichever mechanism the cover uses. Leaving it to the
+    # covering predicate deleted one dimension of genuine approximation here, which
+    # `rank(unreduced) == active(pruned)` is the witness for.
+    act = trues(4, 4)
+    act[2, 2] = false
+    masked_base = space(Ω; cells=4, order=2, basis=bspline(; continuity=0), active=act)
+    for cover in (bspline(), bspline(; continuity=0))
+        W = overlay(masked_base, box((0.0, 0.0), (0.75, 0.75)); cells=6, order=2, basis=cover)
+        m, l = _gram(W)
+        mu, _ = _gram(W; prune=false)
+        @test rank(Symmetric(Matrix(m.matrix))) == active_unknowns(l)
+        @test active_unknowns(l) == rank(Matrix(mu.matrix))
     end
     # Arbitrary mask geometries are a per-function containment test, so they neither
     # need the mask to be separable nor produce a single linear-constraint pivot —
@@ -246,7 +272,12 @@ end
     @test support_extension(L, marked; level=1) == dilate(L, marked; level=1, by=0)
     @test count(dilate(L, marked; level=1, by=2)) > count(support_extension(L, marked; level=1))
 
-    # Refusals, so a wrong `by` is loud rather than silently clamped.
+    # Refusals, so a wrong `by` is loud rather than silently clamped — including on
+    # the path where the marked set names every cell, which `_normalize_mask`
+    # collapses to "no mask" and which used to return before `by` was looked at.
+    @test_throws ArgumentError dilate(V, trues(16, 16); level=1, by=-1)
+    @test_throws ArgumentError dilate(V, trues(16, 16); level=1, by=1.5)
+    @test dilate(V, trues(16, 16); level=1, by=2) == trues(16, 16)
     @test_throws ArgumentError dilate(V, one_cell; level=1, by=-1)
     @test_throws ArgumentError dilate(V, one_cell; level=1, by=(1, -1))
     @test_throws ArgumentError dilate(V, one_cell; level=1, by=1.5)
@@ -344,7 +375,7 @@ end
     #   F. de Prenter, C. V. Verhoosel, G. J. van Zwieten, E. H. van Brummelen,
     #   *Condition number analysis and preconditioning of the finite cell method*,
     #   Comput. Methods Appl. Mech. Engrg. 316 (2017) 297–327,
-    #   doi:10.1016/j.cma.2016.07.025.
+    #   doi:10.1016/j.cma.2016.07.006.
     Ω = box((0.0, 0.0), (1.0, 1.0))
     scaled(basis, p, n, r) =
         let hole = physical_domain(leaf(x -> r - norm(x .- 0.5); lipschitz=1.0);
@@ -355,8 +386,8 @@ end
             diagnostics(model, solve!(model)).scaled_condition_estimate
         end
     for r in (0.25, 0.3)
-        # 43.8 and 43.6 measured; the band is generous because the number is a
-        # property of the geometry as well as of the basis.
+        # 39.9 and 45.1 measured on this configuration; the band is generous because
+        # the number is a property of the geometry as well as of the basis.
         @test scaled(bspline(), 3, 8, r) < 1.0e3
     end
     # The default family on the same geometry, at a size the estimator still
@@ -805,6 +836,21 @@ end
     @test count(==(:dedup), lb.elimination_source) == 24
     @test rank(Symmetric(Matrix(mb.matrix))) == active_unknowns(lb)
     @test active_unknowns(lb) == rank(Matrix(_gram(beyond; prune=false)[1].matrix))
+
+    # The defect the `:maximal` loop above repairs is a property of the *clamped*
+    # mechanism, which is still shipped and still reachable as `bspline(; continuity
+    # = m)`. Pinned here so the repair is not read as more general than it is: with
+    # the cover clamped, the same `xhi = 1.0` geometry still leaves eight exact null
+    # modes, because the clamped cover reproduces the difference of two buried base
+    # functions on Ω while reproducing neither on its own, and a dedup keyed on single
+    # buried functions cannot see it.
+    clamped_base = space(Ωfold; cells=6, order=2, basis=bspline(; continuity=0), physical=half())
+    clamped = overlay(clamped_base, box((0.0, -1.0), (1.0, 2.0)); cells=(4, 12), order=2,
+                      basis=bspline(; continuity=0))
+    mc, lc = _gram(clamped)
+    @test count(==(:dedup), lc.elimination_source) == 0
+    @test active_unknowns(lc) == 104
+    @test_broken rank(Symmetric(Matrix(mc.matrix))) == active_unknowns(lc)   # rank 96
 end
 
 @testset "BSpline extension: a degree-1 cover is the hat space and deduplicates hats" begin

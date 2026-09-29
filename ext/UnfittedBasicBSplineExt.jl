@@ -29,7 +29,9 @@ two mechanisms.
 At `continuity = :maximal`, the default, the level keeps exactly the functions
 whose full `(p_d + 1)`-cell support lies inside its admissible region — its
 active cells, the cells a fictitious fold switched off, and everything beyond a
-box face that coincides with `∂Ω`. Such a function is already globally
+box face that coincides with the boundary of the space's own domain — that
+face is not artificial, and what lies past it is not part of the discretised
+domain at all. Such a function is already globally
 `C^{p_d − 1}` and identically zero outside its support, so its extension by zero
 is `C^{p_d − 1}` for free, under any mask geometry and with no constraint
 equation anywhere. This is Kraft's hierarchical-spline selection rule stated for
@@ -147,7 +149,7 @@ V = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3, basis=bspline())
 Write `Â` for the level's **admissible region**: its active cells, plus the
 cells a fictitious fold switched off (nothing is integrated there, so a
 truncation there is invisible on Ω), plus everything beyond a box face that
-coincides with the physical boundary `∂Ω` (that face is not artificial, so
+coincides with the boundary of the space's own domain (that face is not artificial, so
 nothing has to vanish on it). At `:maximal` the level generates exactly
 
     W = span { B_α : supp B_α ⊆ Â }
@@ -794,7 +796,7 @@ end
 # the function that is interpolatory at the boundary (index 1 at the
 # lower edge, index `dim` at the upper edge for an open clamped knot
 # vector) carries the Dirichlet value. Higher-derivative constraints
-# (`continuity_order ≥ 1`) at the **overlay-artificial** boundary are
+# (`continuity ≥ 1`) at the **overlay-artificial** boundary are
 # imposed via the linear-constraint system in
 # [`_overlay_constraints`](@ref), not through this predicate.
 function Unfitted._key_on_level_side(key::TensorDofKey{D}, level::Level{D,T,<:BSplineFamily},
@@ -841,7 +843,7 @@ end
 # substitution), so the redundancy is correctness-preserving and the
 # performance overhead is small for typical mask layouts.
 #
-# `continuity_order = 0` (`m = 0`) generates the classical C⁰
+# `continuity = 0` (`m = 0`) generates the classical C⁰
 # vanishing-trace constraint — the same condition a C⁰ knot insertion at
 # the face would impose, but reached through constraints, which puts no
 # restriction on the shape of the mask. `m > 0` adds vanishing normal
@@ -1055,6 +1057,11 @@ Unfitted._spans_hats(f::BSplineFamily{D}) where {D} = all(d -> degree(f.spaces[d
 # belongs to its knot vectors, so there is one degree per axis and no per-cell
 # field to disagree with.
 function Unfitted._support_radius(family::BSplineFamily{D}, ::NTuple{D,Int}) where {D}
+    # The radius belongs to the SELECTING mechanism. A level clamped at an integer
+    # `continuity` keeps `n + p − 2(m + 1)` functions per axis and carries some on a
+    # region one cell wide, so it needs no room made for it and a nonzero radius here
+    # would make `refine` wake cells nothing asked for.
+    _selects_by_support(family) || return ntuple(_ -> 0, D)
     return ntuple(d -> degree(family.spaces[d]), D)
 end
 
@@ -1114,14 +1121,15 @@ function _reproduced_by_selection(level::Level{D,T,<:BSplineFamily}, key::Tensor
     upper = SVector{D,T}(ntuple(d -> mesh.domain.lower[d] + chi[d] * width[d], D))
     flo, fhi = _fine_cell_range(cover, lower, upper)
     fine = cover.level.basis
-    # Every fine function whose own support fits inside that block must be kept.
-    ranges = ntuple(d -> (flo[d]+degree(fine.spaces[d])):fhi[d], D)
-    any(isempty, ranges) && return false          # nothing to reproduce it with
-    for m in CartesianIndices(ranges)
-        mlo, mhi = _support_block(fine, m.I)
-        _block_admissible(cover, mlo, mhi) || return false
-    end
-    return true
+    # "Every fine function whose own support fits inside the block is admissible" is
+    # the same statement as "every cell of the block is admissible", because those
+    # functions' supports tile it exactly: as `m` sweeps `flo + p … fhi`, the union of
+    # `m − p … m` is `flo … fhi`, no more and no less. Asking it per function re-tests
+    # each cell up to `(p + 1)^D` times for an identical answer, so it is asked once.
+    # The emptiness guard is the one case where the two differ — a block too narrow to
+    # hold a single fine function reproduces nothing — and `false` is the answer there.
+    any(d -> fhi[d] < flo[d] + degree(fine.spaces[d]), 1:D) && return false
+    return _block_admissible(cover, flo, fhi)
 end
 
 # `_coverage_constraints` for a B-spline level — the dedup half only, and it is
@@ -1179,6 +1187,17 @@ function Unfitted._coverage_constraints(level::Level{D,T,<:BSplineFamily}, V::Sp
     clamped_only = all(isnothing, covers)
     for (key, raw) in level_keys
         cells = _support_cells(key, family, n)
+        # The level-side half, and it holds for BOTH mechanisms. A *user-masked*
+        # support cell blocks: what a masked level assembles is the function truncated
+        # to its own active cells, which is not the function the cover reproduces. A
+        # *fictitious* one does not: nothing is integrated there, so the truncation is
+        # invisible on Ω. Leaving this to the covering predicate was wrong — the
+        # subdivision walk looks only at the cover — and what it deleted was real
+        # approximation rather than a null mode: measured on a `continuity = 0` base of
+        # 4² masked at one interior cell under a nested maximal-continuity 6² cover, the
+        # pruned space carried 58 unknowns against an unreduced rank of 59.
+        all(ci -> is_active(level.mask, ci) || _is_fictitious(level, ci, V.physical, classify_cache),
+            cells) || continue
         if clamped_only
             # Buried, and buried as a whole function — but the two halves of "whole"
             # are not the same test. A *user-masked* support cell blocks: what a masked
@@ -1188,8 +1207,7 @@ function Unfitted._coverage_constraints(level::Level{D,T,<:BSplineFamily}, V::Sp
             # bypass `cov`, which is computed only on the active cells dilated by one
             # (`_coverage_cells`) — a support cell two cells past the active front holds
             # the `false` default, not a verdict.
-            all(ci -> is_active(level.mask, ci) ? cov[ci] :
-                      _is_fictitious(level, ci, V.physical, classify_cache), cells) || continue
+            all(ci -> !is_active(level.mask, ci) || cov[ci], cells) || continue
         end
         reproduced = false
         for (j, k) in pairs(above)

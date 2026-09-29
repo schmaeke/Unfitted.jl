@@ -206,6 +206,32 @@ end
                    norm=:relative) < 1.0e-12
 end
 
+@testset "L2 transfer between B-spline models at the default continuity" begin
+    # The reduced-continuity case above covers the `has_linear_constraints` branch;
+    # this one covers the configuration a user actually gets from `bspline()`, where
+    # the artificial boundary resolves to strong eliminations and the layout takes the
+    # other branch. Both are wanted: `CONTRIBUTING` asks for a projection test per
+    # basis family, and the default spelling of that family is this one.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    source_space = space(omega; cells=(8, 8), order=2, basis=bspline())
+    target_space = overlay(source_space, box((0.3, 0.3), (0.7, 0.7)); cells=(5, 5), order=2,
+                           basis=bspline())
+
+    source_model = prepare(poisson(source_space; source=1.0,
+                                   dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    source_solution = solve!(source_model)
+    target_model = prepare(poisson(target_space; source=0.0))
+    @test !Unfitted.has_linear_constraints(target_model.dofs)
+
+    # The target contains the source — the overlay only adds — so the projection is
+    # the identity there and both the solve residual and the reproduction error sit at
+    # round-off rather than merely being finite.
+    target_solution = transfer(source_solution, source_model, target_model)
+    @test target_solution.diagnostics.residual_norm < 1.0e-12
+    @test l2_error(target_solution, target_model, x -> value(source_solution, source_model, x);
+                   norm=:relative) < 1.0e-12
+end
+
 @testset "L2 transfer rejects incompatible models" begin
     source_model = prepare(poisson(space(box((0.0,), (1.0,)); cells=1, order=1); source=0.0))
     target_model = prepare(poisson(space(box((0.0, 0.0), (1.0, 1.0)); cells=(1, 1), order=1);

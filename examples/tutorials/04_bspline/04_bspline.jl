@@ -164,12 +164,14 @@ println("u_h(0.5, 0.5) = ", value(solution_nested, model_nested, u_nested, (0.5,
 println()
 
 # The undeduplicated operator is numerically singular: its condition
-# number lands around 7e15, past the 1/ε ≈ 4.5e15 at which double
+# number lands at order 5e15, past the 1/ε ≈ 4.5e15 at which double
 # precision has nothing left to give. The direct solver still returns a
 # plausible-looking answer, which is precisely what makes this failure
 # mode dangerous — nothing announces itself. One redundant unknown costs
 # roughly thirteen orders of magnitude of conditioning — 253.2 against
-# 7.04e15, measured.
+# order 5e15. Only the first of those is quoted exactly: the second is the
+# condition number of an exactly singular operator, so its smallest singular
+# value is roundoff and moves with the BLAS.
 
 # ── Part 2: B-splines on an immersed domain ──────────────────────────────────
 #
@@ -216,7 +218,7 @@ println()
 # ── What to check when this script runs ──────────────────────────────────────
 #
 # Part 1: `reduced mode counts` is `[1, 0]`, the deduplicated condition
-# number is a few hundred while the undeduplicated one is around 1e16,
+# number is a few hundred while the undeduplicated one is of order 1e15,
 # and `u_h(½, ½)` agrees with the series reference to seven decimals
 # (measured 0.07367134 against 0.07367135, 249 unknowns).
 #

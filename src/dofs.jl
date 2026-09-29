@@ -966,6 +966,13 @@ Keyword arguments:
   - `dirichlet` — iterable of [`DirichletCondition`](@ref)s.
   - `tolerance` — `GeometryTolerance` used by boundary detection.
   - `components` — scalar channels per field (≥ 1).
+  - `prune_exempt` — level ids this pass leaves unpruned while every other level is
+    pruned normally. It exists for [`estimate`](@ref)'s enriched twin, where a
+    co-located same-degree cover would deduplicate exactly the keys the solution is
+    about to be injected onto; turning leaf semantics off *globally* there instead was
+    measured to inflate the indicator on a covered cell of an unrelated level by 4.1×,
+    because that level's order-elevated covered modes then survive and land in the
+    complement. Empty by default, and a no-op when `prune = false`.
   - `prune` — leaf semantics, on by default. `false` retains every covered
     mode and is the unreduced twin the reduction is measured against; see
     [`prepare`](@ref), which is where a caller reaches it.
@@ -983,7 +990,7 @@ artificial boundaries; the assembly path distributes entries through
 the expansion automatically.
 """
 function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
-                    components::Integer=1, prune::Bool=true,
+                    components::Integer=1, prune::Bool=true, prune_exempt=(),
                     classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
     components > 0 || throw(ArgumentError("dof layout components must be positive"))
     raw_by_key = Dict{TensorDofKey{D},Int}()
@@ -1056,7 +1063,7 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
         # overlay constraints eliminate a named raw outright; a multi-raw
         # (B-spline) constraint picks its pivot during resolution, and that
         # family emits no coverage constraints at all.
-        if prune
+        if prune && !(level.id in prune_exempt)
             reductions = _coverage_constraints(level, V, coverage, tolerance, level_keys,
                                                classify_cache)
             overlay_raws = isempty(reductions) ? Set{Int}() :
@@ -1213,11 +1220,12 @@ accessor every reconstruction path uses when a basis-function contribution needs
 the actual dof value regardless of constraint status.
 
 Three regimes, matching the three shapes of `raw_expansion` (see
-[`DofLayout`](@ref)): a free dof reads `coefficients[active]`; a strongly
-eliminated dof reads its [`constrained_value`](@ref), which is zero for an
-artificial-boundary or pruning elimination and the projected datum for nonzero
-Dirichlet data; and a **linear-constraint pivot** is reassembled from its
-expansion,
+[`DofLayout`](@ref)): a free dof reads `coefficients[active]`; a dof with no
+pivot expansion reads its [`constrained_value`](@ref), which is zero for an
+artificial-boundary or pruning elimination and the projected datum for a nonzero
+Dirichlet condition — including on a raw the constraint system left free, which is
+why the identity expansion is tested for and not only the empty one; and a
+**linear-constraint pivot** is reassembled from its expansion,
 
     u_raw = constrained_value(raw) + Σᵢ wᵢ · u_{rᵢ} .
 
@@ -1239,9 +1247,10 @@ stage than constraint resolution, so a raw that is free with respect to the
 constraint system can still be eliminated on one component, and it carries the
 identity expansion `[(raw, 1)]` rather than an empty one.
 
-The `has_linear_constraints` short-circuit keeps the integrated-Legendre path —
-where every expansion is the identity or empty — at exactly its previous cost of
-one lookup and one branch.
+The `has_linear_constraints` short-circuit keeps the integrated-Legendre path to
+one extra field load and one extra branch per call, which is not free: measured on
+a reconstruction-heavy loop it costs about 1.36× the previous two-line body. The
+alternative is a silently wrong field, so it is paid.
 """
 function dof_value(layout::DofLayout, coefficients, raw::Integer, component::Integer=1)
     active = _active_component_dof(layout, raw, component)

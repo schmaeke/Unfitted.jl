@@ -1188,7 +1188,10 @@ Widening is the caller's job everywhere except inside [`refine`](@ref), whose
 h-step applies this to the cells it wakes. `space` and `overlay` build exactly
 the level they are given: a level too thin to hold a support is accepted and
 carries no functions, which `diagnostics(…).levels[k]` reports as
-`active_functions = 0` against a nonzero `raw_functions`.
+`active_functions = 0` against a nonzero `raw_functions`. That signature narrows
+the cause without naming it — `active_functions` counts what survived *every*
+elimination, so physical Dirichlet data produces it too — but on an overlay,
+whose faces are artificial by construction, the thin case is what it means.
 """
 function support_extension(V::Space{D}, cells; level::Integer) where {D}
     lvl = V.levels[_check_level(V, level)]
@@ -1236,9 +1239,14 @@ dilating once by `a + b`.
 """
 function dilate(V::Space{D}, cells; level::Integer, by) where {D}
     lvl = V.levels[_check_level(V, level)]
+    # `by` is validated before the early return, not inside it: `_normalize_mask`
+    # collapses a selection naming every cell to `nothing`, and a bad width would
+    # otherwise pass unchallenged on exactly that input while the array method
+    # rejected it — two spellings of one operation disagreeing.
+    radius = _dilation_radius(by, Val(D))
     marked = _normalize_mask(cells, lvl.mesh)
     marked === nothing && return trues(lvl.mesh.cells)
-    return _dilate_cells(marked.on, _dilation_radius(by, Val(D)))
+    return _dilate_cells(marked.on, radius)
 end
 
 function dilate(mask::AbstractArray{Bool,D}, by) where {D}
@@ -1267,12 +1275,24 @@ function _dilation_radius(by, ::Val{D}) where {D}
                         "got $(typeof(by))"))
 end
 
+# Erode a cell mask by `radius[d]` cells along each axis: the cells whose whole
+# neighbourhood, clipped to the grid, is inside the mask. Written as the dual of
+# the dilation rather than as its own pass, which is both shorter and exactly
+# consistent with it — in particular they agree on the clipping at a box face.
+#
+# Used by `coarsen` to recover the set `refine` dilated, which is the one thing a
+# mask does not record: erosion is a right inverse of dilation on a dilated set,
+# `dilate(erode(dilate(X, r), r), r) == dilate(X, r)`.
+function _erode_cells(marked::BitArray{D}, radius::NTuple{D,Int}) where {D}
+    return .!_dilate_cells(.!marked, radius)
+end
+
 # Dilate a cell mask by `radius[d]` cells along each axis, clipped to the grid.
 #
-# Done as `D` successive one-axis passes rather than one `∏(2r_d + 1)`-cell
-# stencil per marked cell: the separable form is `O(cells · Σ r_d)` against
-# `O(cells · ∏ r_d)`, which at `D = 3` and `p = 3` is 9 reads per cell instead of
-# 343. Each pass reads the previous pass's result, which is what makes the
+# Done as `D` successive one-axis passes rather than one `∏_d (2r_d + 1)`-cell
+# stencil per marked cell: the separable form writes `Σ_d (2r_d + 1)` cells per
+# marked cell against `∏_d (2r_d + 1)`, which at `D = 3` and `r = 3` is 21 instead
+# of 343. Each pass reads the previous pass's result, which is what makes the
 # composition the full box dilation rather than a cross.
 function _dilate_cells(marked::BitArray{D}, radius::NTuple{D,Int}) where {D}
     n = size(marked)

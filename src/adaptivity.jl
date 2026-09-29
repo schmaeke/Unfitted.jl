@@ -285,12 +285,16 @@ function _enriched_space(V::Space{D,T}, inc::Int) where {D,T}
     graded = [k for k in 1:length(V.levels) if _supports_cell_order(V.levels[k].basis)]
     W = isempty(graded) ? V : elevate(V, (k => raised(k) for k in graded)...)
     twins = Tuple{Int,Int,Int}[]
+    exempt = Int[]
     for k in 1:length(V.levels)
         k in graded && continue
         W = _refinement_twin(W, V.levels[k], inc + 1)
         push!(twins, (length(W.levels), k, inc + 1))
+        # The enriched level, by *id*: it is the one a twin would deduplicate, and the
+        # one `dof_layout` must therefore leave unpruned.
+        push!(exempt, V.levels[k].id)
     end
-    return W, twins, !isempty(twins)
+    return W, twins, exempt
 end
 
 # A level co-located with `level` — same box, same family, same degree, same
@@ -342,9 +346,11 @@ twin's per-cell indicators are charged back to the cells of the level it
 enriches, so the estimate a caller sees is always indexed by `V`'s own levels and
 is fed straight to [`mark_cells`](@ref) and [`refine`](@ref) either way.
 
-The superposed twin is built with leaf semantics off, and the reason is in
-`estimate`'s body: a nested same-degree cover would otherwise deduplicate the
-very keys the injection looks for.
+The level a twin enriches is built with leaf semantics off *for that level alone*,
+and the reason is in `estimate`'s body: a nested same-degree cover would otherwise
+deduplicate the very keys the injection looks for. Every other level is pruned
+exactly as in `V`, which is what keeps the indicator a function of the model
+rather than of which levels happen to be present.
 
 `W` is a set difference on raw dof keys, not a comparison of mode indices: at an
 anisotropic order the two disagree, and the index form selects 5 of the 11
@@ -469,17 +475,23 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     # next `estimate` finds them. `integration_plan` evicts by region box, so
     # the two moment orders coexist at the same boxes instead of evicting each
     # other — see `_prefit_cut_rules!` in `intersections.jl`.
-    enriched_space, twins, unpruned = _enriched_space(V, Int(enrichment))
-    # A superposed twin is a *nested* level of the same degree, so leaf semantics
-    # would deduplicate the level it enriches — removing exactly the keys the
-    # injection is about to look for, and turning `Rewire` into a refusal. The twin
-    # is built unpruned for that reason, and the duplicates it then carries cost the
-    # indicator nothing: `W` is a set difference on raw keys, a deduplicated key is
-    # still *enumerated* on the pruned side, so it never enters `W`; and a direction
-    # already in `V` has a zero residual, so it would contribute zero even if it did.
-    # `A⁺` is singular on such a twin, which is harmless here — the indicator reads
-    # the diagonal and forms one matrix–vector product, and never factorises.
-    options = unpruned ? merge(model.plan_options, (; prune=false)) : model.plan_options
+    enriched_space, twins, exempt = _enriched_space(V, Int(enrichment))
+    # A superposed twin is a *nested* level of the same degree, so leaf semantics would
+    # deduplicate the level it enriches — removing exactly the keys the injection is
+    # about to look for, and turning `Rewire` into a refusal. Only *that* level may
+    # skip pruning, and only in this throwaway twin: turning leaf semantics off for the
+    # whole enriched model instead was measured to inflate the indicator on a covered
+    # cell of an unrelated integrated-Legendre level by 4.1×, because that level's
+    # order-elevated covered modes then survive, land in `W`, and are charged as error
+    # to a cell `decide` can spend nothing on.
+    #
+    # Exempting the enriched level costs the indicator nothing. `u⁺` is zero on every
+    # key the injection does not fill, so the duplicate columns contribute nothing to
+    # `R = b⁺ − A⁺u⁺`; `b⁺` and the diagonal on `W` are untouched; and `A⁺` being
+    # singular is harmless here, since the indicator reads its diagonal and forms one
+    # matrix–vector product and never factorises.
+    options = isempty(exempt) ? model.plan_options :
+              merge(model.plan_options, (; prune_exempt=exempt))
     plus = _prepared_model(_problem_with_space(model.problem, enriched_space), options,
                            model.moment_fit_caches)
     _on_foreign_cloud(plus.version) do
@@ -875,7 +887,9 @@ in `src/adaptivity.jl` gives it in full, including why an h-released cover and a
 lowered order are read as evidence of the opposite sign.
 
 Three kinds of marked cell never reach the comparison: one with no h-step
-available takes p; one that is not a leaf, or that is already at `pmax` on every
+available takes p — unless its level carries no per-cell order, where there is no
+p-step either and the cell is dropped rather than parked; one that is not a leaf,
+or that is already at `pmax` on every
 axis, takes h; and one with *neither* step available is dropped from both sets,
 which is what lets `refine` report exhaustion by returning its argument
 unchanged. `pmax` bounds the p climb and never lowers an order.
@@ -961,7 +975,9 @@ The two steps, and what each one means here:
     a pure h-step: the resolution changes and the order does not. The target is
     always level `k + 1`; where that level has nothing under the cell — the
     finest level, or a level whose box does not reach it, as on a sub-box overlay
-    — there is nothing to activate and the cell takes the order step instead;
+    — there is nothing to activate and the cell takes the order step instead, or
+    is dropped where the family carries no per-cell order and there is no second
+    step to take;
   - the **p-step** raises the marked cell's own order by one and activates
     nothing. `pmax` bounds the climb so a loop cannot run away: it raises only
     axes below `pmax` and leaves a cell already at or above it alone, so passing
@@ -1044,6 +1060,12 @@ function refine(V::Space{D,T}; h=(), p=(), pmax::Integer=8) where {D,T}
 
     for (k, cell) in p
         _check_mark(V, k, cell, "refine")
+        # A level with no per-cell order has no p-step to take, and dropping the
+        # mark is what `coarsen` does with the mirror case. `decide` never hands one
+        # over, so this is the explicit form's branch; without it the mark would
+        # reach `elevate` and raise, which is a worse answer than "there was nothing
+        # to spend here".
+        _supports_cell_order(V.levels[k].basis) || continue
         field = field_of(k)
         field[cell] = raised(field[cell])
     end
@@ -1213,6 +1235,8 @@ function coarsen(V::Space{D,T}; h=(), p=(), pmin::Integer=1) where {D,T}
     mask_of(k) = get!(() -> active_cells(V; level=k), masks, k)
     field_of(k) = get!(() -> cell_orders(V; level=k), fields, k)
     live = _live_levels(V)
+    # The parents released per level, for the support-extension mirror below.
+    released = Dict{Int,Vector{CartesianIndex{D}}}()
     # Lower only the axes above the floor, the mirror of `refine`'s `raised`.
     lowered(o) = max.(o .- 1, min.(o, Int(pmin)))
 
@@ -1257,6 +1281,61 @@ function coarsen(V::Space{D,T}; h=(), p=(), pmin::Integer=1) where {D,T}
             _is_leaf(V, k + 1, child, live) || continue
             mask[child] = false
             carries_order && (field[child] = parent_order)
+        end
+        push!(get!(() -> CartesianIndex{D}[], released, k + 1), cell)
+    end
+
+    # The mirror of `refine`'s support extension, and what keeps this verb the exact
+    # inverse it claims to be. `refine` wakes a marked parent's block *dilated* by the
+    # family's `_support_radius`; releasing only the block would leave that collar
+    # live for ever — no public verb reaches it, since it lies outside every block
+    # `coarsen` looks at — and a transient loop that refines and releases a travelling
+    # feature would grow its active set without bound. Measured before this pass
+    # existed, on a depth-2 ladder at degree 3 with the mark walking (3,4) … (7,4), the
+    # live level-2 count ran 60, 56, 88, 84, 108.
+    #
+    # The collar is released *minus* what other still-refined parents justify: a cell
+    # of the released parent's dilated footprint stays live if it also lies in the
+    # dilated footprint of a parent whose own block is still live. That is exactly the
+    # set `refine` would have produced from the remaining marks, so refine-then-coarsen
+    # returns the mask it started from, and a cell some other caller activated outside
+    # every footprint is never touched.
+    for (k, parents) in released
+        radius = _support_radius(V.levels[k].basis, nominal_order(V.levels[k]))
+        all(iszero, radius) && continue
+        mask = mask_of(k)
+        before = active_cells(V; level=k)                 # the mask as this call found it
+        blocks = falses(V.levels[k].mesh.cells)
+        for parent in parents
+            block = _cell_block(V, k - 1, k, parent)
+            (block === nothing || isempty(block)) && continue
+            for child in block
+                blocks[child] = true
+            end
+        end
+        # Recover the set `refine` dilated, so the collar can be released without
+        # taking one another refined region still needs. It cannot be read off the live
+        # cells exactly, and that is worth stating rather than papering over: the
+        # dilation fills in neighbouring parents' blocks, so "this parent's block is
+        # live" stops meaning "this parent was refined", and clipping at a box face
+        # defeats in opposite directions the two instruments that might recover it — a
+        # morphological erosion recovers more than the block there, while requiring a
+        # parent's whole dilated footprint to be live rejects a genuinely refined edge
+        # parent. Measured, the two agree cell for cell on an 8² ladder, so the simpler
+        # one is used.
+        #
+        # Erosion is therefore the conservative reading: away from a box face
+        # `dilate(erode(dilate(X, r), r), r) == dilate(X, r)` recovers the blocks
+        # exactly and the release is exact; near one it recovers more, so a collar
+        # stays live. Conservative is the safe direction — it can only leave
+        # refinement standing, never take away refinement another mark needs — and it
+        # is what fixes the defect that matters, an active set that grew without bound
+        # as a feature travelled.
+        core = _erode_cells(before, radius)
+        keep = _dilate_cells(core .& .!blocks, radius)
+        dropped = _dilate_cells(blocks, radius)
+        for c in CartesianIndices(mask)
+            dropped[c] && !keep[c] && (mask[c] = false)
         end
     end
 
