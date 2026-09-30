@@ -250,7 +250,7 @@ volume_error = abs(quadrature_volume[] - exact_volume) / exact_volume
 
 out = joinpath(@__DIR__, "output", "imported_geometry_3d")
 write_vtk(out, sol, model;
-          point_data=(u=(uh, c, x, xi) -> uh(c, xi), exact=(uh, c, x, xi) -> exact(x)))
+          point_data=(u=(uh, c, x, xi) -> uh(c, xi), exact=(uh, c, x, xi) -> exact(x)), subdivisions=10)
 write_quadrature_vtm(out * "_quadrature", model)
 
 print_run_report("L-bracket from a triangle surface — imported-geometry level set",
