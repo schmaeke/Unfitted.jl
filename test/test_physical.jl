@@ -904,3 +904,200 @@ end
     @test mixed.quadrature.weights[1:n] ≈ strict.quadrature.weights .* (1 - alpha)
     @test all(>=(0), mixed.quadrature.weights)
 end
+
+@testset "an affine slice of the CSG tree is the geometry one dimension down" begin
+    # A codim-K facet of the background box is the affine slice ⋂ⱼ {x_{kⱼ} = vⱼ},
+    # so the geometry *on* that facet is Ω restricted to the slice.
+    # `_restrict_domain` walks the tree, restricts each leaf's callback through
+    # `_restrict` and rebuilds the Boolean structure around the results, giving a
+    # `PhysicalDomain` of dimension D − K. `PhysicalDomain` carries no dimension
+    # parameter, so every consumer that takes its `D` from the box it is handed
+    # works on the slice with no further arrangement.
+    plate = leaf(x -> x[2] - x[1] - 0.55; lipschitz=sqrt(2.0))
+    slant = leaf(x -> x[1] - x[2] - 0.8; lipschitz=sqrt(2.0))
+    hole = leaf(x -> 0.1 - hypot(x[1] - 0.2, x[2] - 0.5); lipschitz=1.0)
+    # One tree reaching all four node types: AllOf(AnyOf(Leaf, Leaf), Not(Leaf)).
+    tree = setdiff(union(plate, slant), hole)
+    p2 = physical_domain(tree; subcell_length_scale=0.0625)
+    sliced = Unfitted._restrict_domain(p2, [(1, 0.0)])
+
+    # The Boolean structure survives node for node, and every leaf keeps its own
+    # Lipschitz constant: the slice is an isometric embedding of the base into ℝᴰ,
+    # so a constant of the parent callback bounds the restriction just as tightly.
+    # Losing it here would be invisible in the shape of the result and fatal to a
+    # sub-cell feature, which only the certificate can see (below).
+    @test sliced.geometry isa Unfitted.AllOf
+    @test sliced.geometry.parts[1] isa Unfitted.AnyOf
+    @test sliced.geometry.parts[2] isa Unfitted.Not
+    @test [l.lipschitz for l in Unfitted._leaves(sliced.geometry)] ==
+          [l.lipschitz for l in Unfitted._leaves(tree)]
+
+    # Membership on the slice is membership on the parent at the lifted point,
+    # which is the one property the whole construction has to have.
+    @test all(Unfitted._inside(sliced.geometry, SVector(y)) ==
+              Unfitted._inside(tree, SVector(0.0, y)) for y in 0.0:0.025:1.0)
+
+    # And the slice is not merely *equivalent* to the same geometry written in one
+    # dimension fewer — it is bit-identical to it. The restricted closure evaluates
+    # the parent callback at the lifted point, so with the pinned coordinate
+    # contributing exactly (x₁ = 0 here) the two leaves agree to the last bit, and
+    # with them the kernel's root finding, its base partition and the fitted rule.
+    # Hence `==` and not `≈`: a restriction that perturbed the geometry at all
+    # would be a different geometry, and the facet rule built on it would no longer
+    # be the rule the cells behind the face are integrated with. Swept over the
+    # moment order (the kernel's fiber Gauss order), `subcell_length_scale` (its
+    # subdivision budget) and the box, because each of the three enters the rule
+    # by a different route.
+    identical = 0
+    for scale in (0.0625, 0.25), order in (2, 4, 6),
+        bounds in ((0.0, 1.0), (0.4, 0.8), (0.5, 0.6), (0.25, 0.75))
+
+        here = Unfitted._restrict_domain(physical_domain(plate; subcell_length_scale=scale),
+                                         [(1, 0.0)])
+        native = physical_domain(leaf(y -> y[1] - 0.55; lipschitz=sqrt(2.0));
+                                 subcell_length_scale=scale)
+        interval = box((bounds[1],), (bounds[2],))
+        a_pts, a_ws, _, a_status = Unfitted.moment_fit_rule(here, interval, (order,))
+        b_pts, b_ws, _, b_status = Unfitted.moment_fit_rule(native, interval, (order,))
+        @test a_pts == b_pts
+        @test a_ws == b_ws
+        @test a_status === b_status
+        @test classify_cell(here, interval) === classify_cell(native, interval)
+        identical += 1
+    end
+    @test identical == 24
+
+    # The upper face pins at a coordinate that does not vanish, where the
+    # restricted arithmetic is its own: Ω reaches x₂ ≤ 1.55 there, so the whole
+    # face is physical and the slice classifies `:full`.
+    upper = Unfitted._restrict_domain(physical_domain(plate; subcell_length_scale=0.0625),
+                                      [(1, 1.0)])
+    @test classify_cell(upper, box((0.0,), (1.0,))) === :full
+    @test sum(Unfitted.moment_fit_rule(upper, box((0.0,), (1.0,)), (4,))[2]) ≈ 1.0 rtol = 1.0e-14
+
+    # Codimension 2: two pins consumed in descending axis order, which is what
+    # keeps every remaining pin's index the one the caller named. Consuming them
+    # the other way round would renumber the axes that survive the first
+    # restriction under the pins still to come — here the pin on axis 3 would
+    # address a slot the two-coordinate slice no longer has.
+    ball = leaf(x -> 0.3 - sqrt(x[1]^2 + x[2]^2 + x[3]^2); lipschitz=1.0)
+    p3 = physical_domain(ball; subcell_length_scale=0.0625)
+    edge = Unfitted._restrict_domain(p3, [(3, 0.0), (1, 0.0)])
+    @test Unfitted._inside(edge.geometry, SVector(0.4)) ==
+          Unfitted._inside(p3.geometry, SVector(0.0, 0.4, 0.0))
+    @test classify_cell(edge, box((0.0,), (0.25,))) === :fictitious   # inside the ball
+    @test classify_cell(edge, box((0.25,), (0.5,))) === :cut          # ∂Ω crosses at 0.3
+    @test classify_cell(edge, box((0.5,), (1.0,))) === :full
+    # Codimension 3 leaves no axis at all, and the lone point of ℝ⁰ is the
+    # facet's own corner: membership is the whole verdict.
+    vertex = Unfitted._restrict_domain(p3, [(3, 0.0), (2, 0.0), (1, 0.0)])
+    @test !Unfitted._inside(vertex.geometry, SVector{0,Float64}())
+end
+
+@testset "a slice preserves every field of the domain it slices" begin
+    # Built by direct struct construction precisely so that all eight fields come
+    # along: a face and the cells behind it then resolve the same geometry at the
+    # same accuracy, with the same α treatment and the same cut-cell rule. Routing
+    # through `physical_domain` instead would mean re-passing seven keywords and
+    # submitting the slice to argument validation that is about what a *caller* may
+    # ask for — its uncertified-leaf rejection, in particular, would fire on a tree
+    # the caller never wrote.
+    rule = (physical, region_box, moment_order) -> (SVector{1,Float64}[], Float64[], 0.0, :empty)
+    p = physical_domain(leaf(x -> x[2] - 0.5; lipschitz=1.0); alpha=1.0e-3, keep_fictitious=true,
+                        subcell_length_scale=0.0125, max_depth=5, moment_order_factor=3,
+                        target_residual=1.0e-9, cut_quadrature=rule)
+    sliced = Unfitted._restrict_domain(p, [(1, 0.25)])
+    for field in fieldnames(typeof(p))
+        field === :geometry && continue
+        @test getfield(sliced, field) === getfield(p, field)
+    end
+    @test length(fieldnames(typeof(p))) == 8
+    @test sliced isa Unfitted.PhysicalDomain
+    @test isconcretetype(typeof(sliced))
+end
+
+@testset "the facet frame and the lift back to ℝᴰ are inverse" begin
+    # The two coordinate maps a slice needs: `_facet_box` drops the pinned axes
+    # from the region's corner pair (selecting the free ones, since the
+    # intermediate box of a multi-axis drop is degenerate and `AxisBox` rejects
+    # that), and `_lift` splices the pinned coordinates back in. A rule built on
+    # the slice reaches its consumers through the second map, so a disagreement
+    # between them would place every quadrature point on the wrong facet.
+    x = SVector(0.1, 0.2, 0.3, 0.4)
+    for pins in ([(4, 0.4)], [(3, 0.3), (1, 0.1)], [(4, 0.4), (3, 0.3), (2, 0.2)],
+                 [(4, 0.4), (3, 0.3), (2, 0.2), (1, 0.1)])
+        # `pins` are descending, which is the order the restriction consumes them
+        # in; the drop below follows the same order for the same reason.
+        reduced = foldl((y, pin) -> Unfitted._remove_axis(y, pin[1]), pins; init=x)
+        @test length(reduced) == 4 - length(pins)
+        @test Unfitted._lift(reduced, pins) == x
+    end
+
+    # Through the facet's own helpers: the free-axis box of a codim-2 facet of the
+    # unit cube, and the lift of one of its points.
+    sides = [(1, :lower), (3, :upper)]
+    domain = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    pins = Unfitted._facet_pins(domain, sides)
+    @test pins == [(3, 1.0), (1, 0.0)]
+    lower, upper = SVector(0.0, 0.25, 1.0), SVector(0.0, 0.75, 1.0)
+    @test Unfitted._facet_box(lower, upper, [2], Val(1)) == box((0.25,), (0.75,))
+    @test Unfitted._lift(SVector(0.5), pins) == SVector(0.0, 0.5, 1.0)
+end
+
+@testset "restricting the leaves beats restricting the collapsed level set" begin
+    # Ω = {x₂ ≤ x₁ + 0.25} ∩ {x₂ ≤ 1.25 − x₁} is a wedge whose two faces meet at
+    # (0.5, 0.75) — strictly inside the unit square, and independent of x₃, so
+    # every slice x₃ = c cuts the same plane figure of area exactly 0.5.
+    #
+    # Restricting leaf by leaf keeps those two faces as two smooth leaves, which is
+    # what the quadrature kernel's multi-component construction needs. Restricting
+    # `levelset_value` instead — the tree collapsed to max/min — hands the kernel a
+    # single leaf with a crease along the ridge, exactly the representation that
+    # function's own docstring warns against for integration. Measured at moment
+    # order 4 on the slice: 3.63e-4 leaf-wise against 4.97e-3 collapsed, 13.7×
+    # worse, and the gap persists at orders 6 and 8 (2.2× and 2.5×).
+    wedge = intersect(leaf(x -> x[2] - x[1] - 0.25; lipschitz=sqrt(2.0)),
+                      leaf(x -> x[2] + x[1] - 1.25; lipschitz=sqrt(2.0)))
+    p3 = physical_domain(wedge; subcell_length_scale=0.25)
+    face = box((0.0, 0.0), (1.0, 1.0))
+
+    leafwise = Unfitted._restrict_domain(p3, [(3, 0.5)])
+    collapsed = physical_domain(leaf(y -> levelset_value(p3, SVector(y[1], y[2], 0.5));
+                                     lipschitz=sqrt(2.0)); subcell_length_scale=0.25)
+    # Same sign everywhere, so the two describe the same set and differ only in
+    # how smooth the kernel can take its boundary to be.
+    @test all(Unfitted._inside(leafwise.geometry, SVector(a, b)) ==
+              (levelset_value(collapsed, SVector(a, b)) <= 0)
+              for a in 0.05:0.1:0.95, b in 0.05:0.1:0.95)
+
+    err(domain) = abs(sum(Unfitted.moment_fit_rule(domain, face, (4, 4))[2]) - 0.5)
+    @test err(leafwise) < 1.0e-3
+    @test err(leafwise) < err(collapsed) / 3
+end
+
+@testset "a feature on a face needs its leaf's Lipschitz constant" begin
+    # The certificate is load-bearing on a slice, not a formality. A ball of radius
+    # 0.02 centred on the x₃ = 0 face cuts that face in a disc of the same radius,
+    # placed so that the disc holds neither the face box's centre nor any of its four
+    # corners. With `lipschitz = 1.0` the bound |f(c)| > L·r holds f over the whole
+    # box, so the leaf is never pruned and the kernel's own subdivision gets to
+    # resolve the disc — the face measure comes back 3.8e-7 from analytic. With the
+    # `leaf` default `Inf` every one of those five samples reports the same sign,
+    # `_sample_sign` prunes the only leaf on the *top* box, and a box with no leaf
+    # left is taken to be uniform — so the kernel never bisects at all and hands back
+    # the full-face tensor rule, the whole measure to round-off, at every subdivision
+    # budget rather than merely a coarse one. The disc is 1.26e-3 of the face, three
+    # orders above that round-off, so the two readings are never in doubt. This is
+    # the blind spot the constant exists to close, and it survives the restriction
+    # only because `_restrict` carries the constant through.
+    face = box((0.0, 0.0), (1.0, 1.0))
+    measure(L, scale) =
+        let ball = leaf(x -> 0.02 - sqrt((x[1] - 0.31337)^2 + (x[2] - 0.43731)^2 + x[3]^2);
+                        lipschitz=L),
+            p = physical_domain(ball; subcell_length_scale=scale)
+
+            sum(Unfitted.moment_fit_rule(Unfitted._restrict_domain(p, [(3, 0.0)]), face, (4, 4))[2])
+        end
+    @test measure(1.0, 0.01) ≈ 1 - π * 0.02^2 rtol = 1.0e-6
+    @test all(isapprox(measure(Inf, scale), 1.0; rtol=1.0e-14) for scale in (1.0, 0.1, 0.01))
+end

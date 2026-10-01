@@ -653,13 +653,16 @@ constant within the region; the quadrature rule is precomputed in
 physical coordinates with weights already including the cell's
 measure-to-reference-area Jacobian.
 
-Fields mirror [`FacetRegion`](@ref) apart from two differences: the normal
+Fields mirror [`FacetRegion`](@ref) apart from three differences: the normal
 is a per-Q-point list rather than one facet normal — a generalisation that
 lets future per-Q-point normal sources (curved meshes, user-supplied
 overrides per Q-point) drop in without changing the consumer's hot loop —
-and there is no `sides`, because an immersed cell sits in the interior of
-a mesh cell and has no `(axis, side)` facet identity. Consumers see
-`q.sides === nothing` on a surface region.
+there is no `sides`, because an immersed cell sits in the interior of
+a mesh cell and has no `(axis, side)` facet identity (consumers see
+`q.sides === nothing` on a surface region), and there is no `kind`: a facet
+region's geometry is inherited from the mesh, so the package has to decide
+which part of it lies in `Ω`, while a `BoundaryMesh`'s geometry is stated by
+the user and already *is* a piece of `∂Ω`.
 """
 struct SurfaceRegion{D,T<:Real}
     parents::Vector{FacetParent{D,T}}

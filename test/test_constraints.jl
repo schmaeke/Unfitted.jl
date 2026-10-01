@@ -692,6 +692,7 @@ end
             @test c.sides == r.sides
             @test c.lower == r.lower
             @test c.upper == r.upper
+            @test c.kind == r.kind
             @test c.points == r.points
             @test c.weights == r.weights
             @test c.normal == r.normal
@@ -845,6 +846,14 @@ end
     @test diagnostics(cut_model).facet_region_count == 4
     @test diagnostics(cut_model).cut_facet_region_count == 2
 
+    # The count is a count of `FacetRegion.kind`, so pin the kinds themselves. The
+    # verdict is `classify_cell` on each region's own face box against the level
+    # set restricted to the x₁ = 0 slice, which is why the third region reads
+    # `:cut` and the fourth `:fictitious` rather than both reading the same thing.
+    cut_regions = cut_model.facet_regions[(face, cut_model.problem.space)]
+    @test [r.lower[2] for r in cut_regions] == [0.0, 0.25, 0.5, 0.75]
+    @test [r.kind for r in cut_regions] == [:full, :full, :cut, :fictitious]
+
     # What the count is warning about, pinned as a number. The face's physical
     # measure is 0.55; the facet rule integrates the whole face. When facet
     # integration learns about the level set, this assertion is the one that has
@@ -867,14 +876,18 @@ end
     # ...and the cells really are cut, so this is a live discrimination and not a
     # geometry in which the two tests trivially agree.
     hole_regions = hole_model.facet_regions[(boundary(:all), hole_model.problem.space)]
+    @test all(r -> r.kind === :full, hole_regions)
     @test count(r -> any(p -> Unfitted.classify_cell(interior, p.parent_box) === :cut, r.parents),
                 hole_regions) == 2
 
-    # No geometry at all: nothing can leave Ω.
+    # No geometry at all: nothing can leave Ω, and the classification says so
+    # without a level set to ask — `_classify_facet` dispatches on the absent
+    # `PhysicalDomain` rather than testing for it.
     Vplain = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2)
     plain = prepare(poisson(Vplain; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     @test diagnostics(plain).facet_region_count == 16
     @test diagnostics(plain).cut_facet_region_count == 0
+    @test all(r -> r.kind === :full, plain.facet_regions[(boundary(:all), plain.problem.space)])
 
     # `keep_fictitious = true` keeps whole fictitious cells in the layout, so it can
     # only add regions, never retract a verdict: the count is a property of the
@@ -885,6 +898,106 @@ end
     kept_model = prepare(poisson(Vkept; source=0.0, dirichlet=[dirichlet(0.0; on=face)]))
     @test diagnostics(kept_model).facet_region_count == 4
     @test diagnostics(kept_model).cut_facet_region_count == 2
+end
+
+@testset "a facet region's kind is the verdict on its own face, in every codimension" begin
+    # Every codimension goes through the same two steps — restrict the level set to
+    # the facet's affine slice, then classify the region's own face box against it —
+    # and the only thing that changes is how many axes the box has: a codim-1 face
+    # reaches an `AxisBox{D-1}`, a codim-2 edge an `AxisBox{1}`, and the codim-D
+    # vertex has no box at all, `AxisBox` being non-degenerate by construction, so it
+    # is decided by membership at the one point of the slice.
+    #
+    # Ω = (0,1)³ ∖ {‖x‖ ≤ 0.3} puts the hole on a corner, so each of the three
+    # lower faces meets a quarter disc of radius 0.3 and the lower edges meet it as
+    # an interval. On a face box whose corners all have non-negative coordinates the
+    # nearest and farthest points of the box are its own corners, which gives an
+    # independent analytic verdict to compare every kind against.
+    tol = GeometryTolerance(Float64)
+    ball = leaf(x -> 0.3 - sqrt(x[1]^2 + x[2]^2 + x[3]^2); lipschitz=1.0)
+    p = physical_domain(ball; subcell_length_scale=0.0625)
+    V = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(4, 4, 4), order=2, physical=p)
+    expected(region) =
+        let near = norm(region.lower), far = norm(region.upper)
+            far <= 0.3 ? :fictitious : (near >= 0.3 ? :full : :cut)
+        end
+
+    for axis in 1:3
+        regions = Unfitted._boundary_facet_regions(V, [(axis, :lower)], tol)
+        @test length(regions) == 16
+        @test all(r -> r.kind === expected(r), regions)
+        @test count(r -> r.kind === :cut, regions) == 3
+        @test count(r -> r.kind === :fictitious, regions) == 0
+        # The upper faces are a whole unit away from the hole, so nothing on them
+        # can leave Ω — the discrimination is live, not a geometry in which every
+        # face answers the same.
+        @test all(r -> r.kind === :full, Unfitted._boundary_facet_regions(V, [(axis, :upper)], tol))
+    end
+
+    # Codim-2: the ball covers the edge out to x₃ = 0.3, so the first region lies
+    # wholly outside Ω and the second is crossed.
+    edge = Unfitted._boundary_facet_regions(V, [(1, :lower), (2, :lower)], tol)
+    @test [r.kind for r in edge] == [:fictitious, :cut, :full, :full]
+    @test all(r -> r.kind === expected(r), edge)
+
+    # Codim-3: the origin is the centre of the ball, hence outside Ω.
+    vertex = Unfitted._boundary_facet_regions(V, [(1, :lower), (2, :lower), (3, :lower)], tol)
+    @test only(vertex).kind === :fictitious
+    far_vertex = Unfitted._boundary_facet_regions(V, [(1, :upper), (2, :upper), (3, :upper)], tol)
+    @test only(far_vertex).kind === :full
+
+    # The ball is symmetric in all three axes, which leaves the *coordinate* half of
+    # the slice untested in both of its directions. `_facet_box` selects the free axes
+    # in ascending order while `_facet_pins` hands `_restrict_domain` the pinned ones
+    # in descending order, and the two have to agree on which slice coordinate is
+    # which original axis; on a geometry symmetric in the axes that survive, any
+    # permutation of the slice's coordinate slots is invisible. Measured on the ball
+    # above: reversing the free-axis slots moves 0 of the 16 verdicts on each of its
+    # lower faces, so nothing here is protected by the assertions above.
+    #
+    # Ω = {2x₁ + 3x₂ + x₃ > 0.9} carries a distinct coefficient on every axis, so no
+    # permutation survives it, and being affine it makes the classifier exact: an
+    # affine function attains its extremes over a box at corners, so `:cut` is
+    # precisely "the corners disagree" and `expected_tilt` below is an oracle rather
+    # than a recorded run. No cell corner lies on the plane (`2i + 3j + k = 3.6` has
+    # no integer solution on this mesh), so no verdict sits on a tie, and no cell is
+    # wholly fictitious, so the mask retracts nothing and every face keeps all 16
+    # regions — the geometry under test is the slice and nothing else.
+    tilt = physical_domain(leaf(x -> 0.9 - 2x[1] - 3x[2] - x[3]; lipschitz=sqrt(14.0));
+                           subcell_length_scale=0.0625)
+    Vtilt = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(4, 4, 4), order=2, physical=tilt)
+    expected_tilt(region) =
+        let lo = 2region.lower[1] + 3region.lower[2] + region.lower[3],
+            hi = 2region.upper[1] + 3region.upper[2] + region.upper[3]
+
+            lo > 0.9 ? :full : (hi <= 0.9 ? :fictitious : :cut)
+        end
+
+    for axis in 1:3, side in (:lower, :upper)
+        regions = Unfitted._boundary_facet_regions(Vtilt, [(axis, side)], tol)
+        @test length(regions) == 16
+        @test all(r -> r.kind === expected_tilt(r), regions)
+    end
+
+    # The x₂ face is the only codim-1 face of a 3-D box whose free axes interleave
+    # with its pinned one (1 and 3 around 2), hence the only one on which swapping the
+    # slice's coordinate slots shows at all: it would classify against x₁ + 2x₃ and
+    # move 4 of these 16 verdicts. All three verdicts occur on it, so the oracle is
+    # discriminating here and not a face on which every region answers the same.
+    tilted_face = Unfitted._boundary_facet_regions(Vtilt, [(2, :lower)], tol)
+    @test map(k -> count(r -> r.kind === k, tilted_face), (:full, :cut, :fictitious)) == (10, 5, 1)
+
+    # The pinned axes interleave in turn whenever the lower-numbered one is not the
+    # last — axes 1 and 2 of a 3-D box, whose free axis is 3. Consuming the pins
+    # ascending would drop axis 1 first and leave the pin named "2" addressing x₃, the
+    # edge's own free axis, pinning it to the axis-2 coordinate and reading
+    # `[:fictitious, :cut, :full, :full]` along the edge instead. (A pin pair whose
+    # higher axis is the last one cannot go wrong silently: the stale index addresses
+    # a slot the shortened coordinate vector does not have, and the restriction
+    # throws.)
+    tilted_edge = Unfitted._boundary_facet_regions(Vtilt, [(1, :lower), (2, :lower)], tol)
+    @test [r.kind for r in tilted_edge] == [:fictitious, :fictitious, :fictitious, :cut]
+    @test all(r -> r.kind === expected_tilt(r), tilted_edge)
 end
 
 @testset "boundary(:all; except=…) is the union of the faces that remain" begin

@@ -975,12 +975,16 @@ indicator representations are intentionally not supported.
     over it — Dirichlet projection, a Neumann / Robin / Nitsche term tagged
     `on::BoundarySelector`, `boundary_integral` — spends weight on area `Ω`
     does not contain; a homogeneous datum is unaffected, which is why a
-    nonzero count can sit in a working model unnoticed. The test is on the
+    nonzero count can sit in a working model unnoticed. The verdict is on the
     face and not on the parent cells, because a cut *cell* whose face lies
-    wholly inside `Ω` is integrated correctly; it is sampled at the region's
-    quadrature points and corners, so it never over-reports and can miss a
-    sliver falling between samples), `surface_region_count`,
-    `interface_region_count`, `raw_dofs`, `active_unknowns`, `levels`
+    wholly inside `Ω` is integrated correctly; it is `FacetRegion.kind`, i.e.
+    `classify_cell` on the region's own face box against the level set
+    restricted to the facet's affine slice, so it carries the classifier's own
+    resolution instead of the rule's: a fictitious sliver counts whenever
+    `subcell_length_scale` and `max_depth` resolve it, and one finer than that
+    budget is missed exactly as it is missed on the cell behind the face),
+    `surface_region_count`, `interface_region_count`, `raw_dofs`,
+    `active_unknowns`, `levels`
     (one entry per level with `id`, `role`, `cells`, `order` — the nominal
     per-axis maximum — `order_palette`, the distinct per-cell orders,
     `mode`, `basis`, `domain`, `nested`, whether every higher level's

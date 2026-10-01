@@ -156,17 +156,21 @@ Fields:
     field is what makes it visible before a nonzero datum or a flux term
     meets it.
 
-    The test is on the face, not on the parent cells: a cut *cell* whose
+    The verdict is on the face, not on the parent cells: a cut *cell* whose
     face lies wholly inside `Ω` is integrated correctly and is not counted.
     A region whose face lies wholly *outside* `Ω` is counted — that is the
     extreme case rather than an exception, and it is what a symmetry plane
-    through a hole produces. The verdict is sampled at the region's own
-    quadrature points plus the corners of its extent, so it is taken at the
-    resolution the integral itself uses: the count never over-reports, and
-    it can miss a fictitious sliver that falls between samples, whose
-    contribution to the integral is correspondingly small. Zero when the
-    space carries no [`PhysicalDomain`](@ref), and zero on an immersed space
-    all of whose integrated faces lie inside `Ω`.
+    through a hole produces. It is the `kind` field of each
+    [`FacetRegion`](@ref), i.e. [`classify_cell`](@ref) applied to the
+    region's own face box against the level set restricted to the facet's
+    affine slice, and the count is of the regions whose kind is not
+    `:full`. Being a classification rather than a sampling of the rule, it
+    carries the classifier's own resolution: a fictitious sliver of face is
+    counted whenever `subcell_length_scale` and `max_depth` resolve it,
+    however the rule's points happen to fall, and missed below that budget
+    exactly as it is missed on the cell behind the face. Zero when the space
+    carries no [`PhysicalDomain`](@ref), and zero on an immersed space all
+    of whose integrated faces lie inside `Ω`.
   - `surface_region_count::Int` — total number of
     [`SurfaceRegion`](@ref)s cached on the model, summed across every
     cached [`BoundaryMesh`](@ref). Zero for problems with no
@@ -1148,69 +1152,41 @@ _region_count(regions::AbstractDict) = sum(length, values(regions); init=0)
 # `facet_region_count` is (summed over every cached selector, so a region two
 # selectors share is counted once per selector, exactly as the total is).
 #
-# Why the number is worth reporting at all. Grid-aligned facet integration is
-# level-set-blind: `_boundary_facet_regions` takes no `PhysicalDomain` argument,
-# selects its contributing levels with `_level_side_is_physical` — pure mesh-edge
-# versus domain-edge geometry — and partitions the face over `_side_cells`.
-# Nothing on that path consults `V.physical`. A `FacetRegion` is therefore the
-# *whole* grid-aligned face of its parent cells, carrying a tensor Gauss rule
-# over all of it, and where that face leaves Ω the rule integrates the fictitious
-# part along with the physical part. Every consumer of a facet region inherits
-# it: the L² Dirichlet mass and right-hand side, a Neumann / Robin / Nitsche term
-# placed with `on = boundary(…)`, and `boundary_integral`. A homogeneous datum is
-# unaffected — ∫ 0 = 0 over any region, and `_needs_dirichlet_projection` skips
-# the boundary walk outright for one — which is exactly why the condition can sit
-# in a working model unnoticed. This count is what makes it visible before a
-# nonzero datum or a flux term meets it.
+# Why the number is worth reporting at all. The grid-aligned facet *partition* is
+# level-set-blind: `_boundary_facet_regions` selects its contributing levels with
+# `_level_side_is_physical` — pure mesh-edge versus domain-edge geometry — and
+# partitions the face over `_side_cells`. A `FacetRegion` is therefore the *whole*
+# grid-aligned face of its parent cells, carrying a tensor Gauss rule over all of
+# it, and where that face leaves Ω the rule integrates the fictitious part along
+# with the physical part. Every consumer of a facet region inherits it: the L²
+# Dirichlet mass and right-hand side, a Neumann / Robin / Nitsche term placed with
+# `on = boundary(…)`, and `boundary_integral`. A homogeneous datum is unaffected —
+# ∫ 0 = 0 over any region, and `_needs_dirichlet_projection` skips the boundary
+# walk outright for one — which is exactly why the condition can sit in a working
+# model unnoticed. This count is what makes it visible before a nonzero datum or a
+# flux term meets it.
 #
-# The test is on the region's own *face*, not on its parent cells, and the
-# distinction is not academic: a cut cell can have a face lying wholly inside Ω,
-# and the integral over that face is then exactly right. Testing the cells would
-# make the number a loose upper bound — on the space-time cavity example at
+# It reads `FacetRegion.kind`, the verdict `classify_cell` returns on the region's
+# own face box against the level set restricted to the facet's affine slice, and
+# counts everything that is not `:full`. Two properties come from reading the
+# classification rather than re-deriving a test here. It is **as sharp as the
+# classifier** — `subcell_length_scale` and `max_depth`, and nothing about the
+# rule — so a sliver of fictitious face the classifier resolves is `:cut` whether or
+# not the region's own points reach it, where the sampled test could only report a
+# lower bound; a sliver finer than that budget is missed by both, the same blind spot
+# the fictitious-cell fold has. And it is **independent of the rule** on the region,
+# so it keeps describing the face when the rule over it is no longer a plain full-face
+# tensor product — a diagnostic that sampled the rule it is meant to describe
+# would extinguish itself exactly when it started to matter.
+#
+# The classification is of the region's own *face*, not of its parent cells, and
+# the distinction is not academic: a cut cell can have a face lying wholly inside
+# Ω, and the integral over that face is then exactly right. Classifying the cells
+# would make the number a loose upper bound — on the space-time cavity example at
 # `SC_CELLS = 3` it reads 61 of 81 against a true 1, because the growing cavity
 # cuts nearly every cell while touching only the `t = 0` and `t = T` faces.
 function _cut_facet_region_count(regions::Dict{RegionKey,Vector{FacetRegion{D,T}}}) where {D,T}
-    total = 0
-    for ((_, space), list) in regions
-        physical = space.physical
-        physical === nothing && continue
-        total += count(region -> _facet_region_exits_domain(physical, region), list)
-    end
-    return total
-end
-
-# True iff some sampled point of `region`'s face lies strictly outside Ω, which
-# is what makes the facet integral over it wrong: the rule spends weight on area
-# the physical domain does not contain. A region whose face lies *entirely*
-# outside Ω counts too — that is the extreme case, not an exception, and it is
-# the shape a symmetry plane through a hole produces (a cut cell whose whole
-# grid-aligned edge is inside the hole).
-#
-# `levelset_value` is the CSG tree's scalar reconstruction, `≤ 0` exactly on Ω.
-# Its docstring warns against using it for *integration*, because collapsing the
-# tree to max/min creases ∂Ω and costs the quadrature kernel its high order. That
-# warning is about smoothness and does not apply here: the reconstruction's
-# *sign* is exact by construction, and a sign is all this asks for.
-#
-# Resolution, stated rather than implied. The samples are the region's own
-# quadrature points — exactly the resolution at which the integral is taken — plus
-# the `2ᴰ` corners of the region's extent, so that a rule whose points are all
-# interior cannot miss a crossing that only reaches an edge. A fictitious sliver
-# falling between samples is missed, which makes the count a lower bound; that is
-# acceptable for a diagnostic precisely because such a sliver contributes
-# correspondingly little to the integral it is warning about. It never
-# over-reports, because every sample lies on the region itself.
-#
-# The corner loop walks `2ᴰ` and not `2^(D−K)` points: on a constrained axis
-# `lower` and `upper` coincide, so the extra indices repeat corners the facet
-# already has rather than inventing new ones, and this way the walk needs no
-# free-axis bookkeeping to stay dimension-generic.
-function _facet_region_exits_domain(physical::PhysicalDomain, region::FacetRegion{D,T}) where {D,T}
-    any(x -> levelset_value(physical, x) > 0, region.points) && return true
-    return any(CartesianIndices(ntuple(_ -> 2, Val(D)))) do corner
-        x = SVector{D,T}(ntuple(d -> corner.I[d] == 1 ? region.lower[d] : region.upper[d], Val(D)))
-        return levelset_value(physical, x) > 0
-    end
+    return sum(list -> count(region -> region.kind !== :full, list), values(regions); init=0)
 end
 
 # Resolve one selector into its full list of `FacetRegion`s (the union

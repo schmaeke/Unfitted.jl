@@ -516,3 +516,52 @@ function classify_cell(physical::PhysicalDomain, box::AxisBox{D,T},
         _classify_box(physical.geometry, box, 0, _effective_subcell_depth(physical, box))
     end
 end
+
+# ── Affine slices ─────────────────────────────────────────────────────────────
+
+# Restrict a CSG tree to the affine slice `{x_k = v}`, one dimension down. Each
+# leaf's callback is restricted by the callback-level `_restrict` in
+# `src/implicit.jl` — which carries the leaf's Lipschitz constant through
+# unchanged, the slice being an isometric embedding of the base into ℝᴰ — and the
+# Boolean structure is rebuilt around the restricted leaves.
+#
+# Restricting the *leaves* rather than the scalar reconstruction is the whole
+# point. `levelset_value` collapses the tree to max/min, which creases ∂Ω wherever
+# two components meet, and a crease inside the sliced box costs the quadrature
+# kernel its high order exactly as that function's docstring warns: on a wedge
+# whose two faces meet strictly inside the sliced box, the leaf-wise slice
+# integrates the area to 3.6e-4 at moment order 4 where the collapsed one reaches
+# only 5.0e-3, 13× worse. `test_physical.jl` pins that comparison.
+_restrict(l::Leaf, k::Int, v) = Leaf(_restrict(l.f, k, v), l.lipschitz)
+_restrict(n::AllOf, k::Int, v) = AllOf(map(p -> _restrict(p, k, v), n.parts))
+_restrict(n::AnyOf, k::Int, v) = AnyOf(map(p -> _restrict(p, k, v), n.parts))
+_restrict(n::Not, k::Int, v) = Not(_restrict(n.part, k, v))
+
+# Ω restricted to the affine slice `⋂ⱼ {x_{kⱼ} = vⱼ}` named by `pins`, as a
+# `PhysicalDomain` of dimension `D − length(pins)`. The struct carries no
+# dimension parameter, so a slice is the same domain with a restricted tree, and
+# every consumer that takes its `D` from the box it is handed — `classify_cell`,
+# `_effective_subcell_depth`, [`moment_fit_rule`](@ref) — works on the slice
+# unchanged. The integration knobs come along with it, which is what makes a face
+# and the cells behind it resolve the same geometry at the same accuracy.
+#
+# `pins` are `(axis, coordinate)` pairs in DESCENDING axis order, and the order is
+# load-bearing: each restriction drops its axis from the coordinate vector, so an
+# axis index stays the one the caller named only while no lower-numbered axis has
+# been dropped before it.
+#
+# Built by direct struct construction rather than through `physical_domain`, so
+# that all eight fields survive verbatim — `keep_fictitious` and `cut_quadrature`
+# included — with no keyword round-trip, and so that the slice never meets that
+# constructor's argument validation, which is about what a caller may *ask* for
+# and has nothing to say about a slice of an already-valid domain (its
+# uncertified-leaf rejection, in particular, would fire on a tree the caller never
+# wrote).
+function _restrict_domain(physical::PhysicalDomain{G,T,Q}, pins) where {G,T,Q}
+    geometry = foldl((g, pin) -> _restrict(g, pin[1], pin[2]), pins; init=physical.geometry)
+    return PhysicalDomain{typeof(geometry),T,Q}(geometry, physical.alpha,
+                                                physical.subcell_length_scale, physical.max_depth,
+                                                physical.moment_order_factor,
+                                                physical.target_residual, physical.keep_fictitious,
+                                                physical.cut_quadrature)
+end
