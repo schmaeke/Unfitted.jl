@@ -17,7 +17,7 @@
     BoundarySelector(selector, sides)
 
 Specification of a facet on the physical boundary `∂Ω` used by Dirichlet
-conditions and the dof-layer's constraint detection. Two `selector`
+conditions and the dof-layer's constraint detection. Three `selector`
 shapes are supported:
 
   - `:all` — the whole physical boundary `∂Ω`, encoded as the union of
@@ -27,6 +27,17 @@ shapes are supported:
     2D pick a corner; two pairs in 3D pick an edge; three pairs in 3D
     pick a vertex. Each axis may appear at most once and `side` must be
     `:lower` or `:upper`.
+  - `:except` — the union of every codim-1 face *except* the ones listed
+    in `sides`. Here `sides` is a complement rather than a facet
+    specification, and an axis may appear twice (both of its faces
+    excluded). The kept faces are taken closed, so a dof on the edge
+    between a kept and an excluded face still matches.
+
+`sides` is therefore read against `selector` and never on its own. The
+kind lives in `selector` rather than in a fourth field because the
+facet-region cache keys on a selector's *value* (see the `==` / `hash`
+methods below), and a `:sides` selector's `sides` can never be mistaken
+for an `:except` one's: the discriminant is already there.
 
 Use the public [`boundary`](@ref) constructor instead of building this
 directly.
@@ -111,13 +122,46 @@ function _key_on_any_physical_side(key::TensorDofKey{D}, level::Level{D,T}, doma
                for side in (:lower, :upper))
 end
 
+# The codim-1 faces an `:except` selector keeps: every face of the physical box
+# that its `sides` list — the *excluded* faces — does not name. The order is
+# `boundary(:all)`'s own, axis-major with `:lower` before `:upper`, so an
+# `:except` selector enumerates its facets in exactly the order the whole
+# boundary would, minus the dropped entries. That is what makes the Dirichlet
+# projection through one `:except` condition bit-identical to the same faces
+# written out individually in that order, rather than merely equal to roundoff:
+# the projection accumulates its mass and right-hand side facet by facet in this
+# walk's order, and floating-point addition is not associative.
+#
+# Both checks need `D` and so cannot live in `boundary`, which builds a selector
+# without reference to a space — exactly as the bound check on
+# `boundary(axis=4, side=:lower)` waits for one. Excluding every face is an
+# error, not an empty facet list: nothing selected is never what a caller meant,
+# and silently constraining nothing is the failure mode this selector exists to
+# prevent.
+function _kept_faces(excluded::Vector{Tuple{Int,Symbol}}, ::Val{D}) where {D}
+    for (axis, _) in excluded
+        1 <= axis <= D ||
+            throw(ArgumentError("boundary axis $axis is out of bounds for dimension $D"))
+    end
+    kept = [(axis, side) for axis in 1:D for side in (:lower, :upper) if (axis, side) ∉ excluded]
+    isempty(kept) && throw(ArgumentError("boundary(:all; except=…) excludes all $(2D) faces of " *
+                                         "the physical boundary in $(D)D, selecting nothing"))
+    return kept
+end
+
 # True iff the dof key matches the facet picked out by a `BoundarySelector`.
-# For `:all` the predicate is "on any physical face"; for `:sides` it is
+# For `:all` the predicate is "on any physical face"; for `:except` it is "on any
+# kept physical face", which is the same union over a subset; for `:sides` it is
 # "on every listed (axis, side) face" (i.e. the intersection of the listed
 # codim-1 faces).
 function _selector_matches(key::TensorDofKey{D}, level::Level{D,T}, domain::AxisBox{D,T},
                            selector::BoundarySelector, tol::GeometryTolerance{T}) where {D,T}
     selector.selector === :all && return _key_on_any_physical_side(key, level, domain, tol)
+
+    if selector.selector === :except
+        return any(_key_on_physical_side(key, level, domain, axis, side, tol)
+                   for (axis, side) in _kept_faces(selector.sides, Val(D)))
+    end
 
     if selector.selector === :sides
         for (axis, side) in selector.sides
@@ -146,12 +190,17 @@ end
 
 # Decompose a `BoundarySelector` into the list of facets it covers. For
 # `:all` this is one codim-1 facet per physical face (their union is
-# `∂Ω`); for `:sides` it is the single facet identified by the listed
-# `(axis, side)` constraints. Used by `_project_dirichlet_values!` to
-# iterate over the support of each Dirichlet condition.
+# `∂Ω`); for `:except` it is one per *kept* face, the same list with the
+# excluded entries removed; for `:sides` it is the single facet identified
+# by the listed `(axis, side)` constraints. Used by
+# `_project_dirichlet_values!` to iterate over the support of each Dirichlet
+# condition, and by `_facet_regions_for_selector` to assemble the region
+# union — which is why a union selector needs nothing else to integrate.
 function _facets(selector::BoundarySelector, ::Val{D}) where {D}
     if selector.selector === :all
         return [Tuple{Int,Symbol}[(axis, side)] for axis in 1:D for side in (:lower, :upper)]
+    elseif selector.selector === :except
+        return [Tuple{Int,Symbol}[face] for face in _kept_faces(selector.sides, Val(D))]
     elseif selector.selector === :sides
         for (axis, _) in selector.sides
             1 <= axis <= D ||
@@ -207,7 +256,7 @@ struct FacetParent{D,T<:Real}
 end
 
 """
-    FacetRegion{D,T}(sides, parents, points, weights, normal)
+    FacetRegion{D,T}(sides, lower, upper, parents, points, weights, normal)
 
 One admissible integration region on a codim-`K` facet of the physical
 domain (where `K = length(sides)`). The region carries the precomputed
@@ -225,6 +274,16 @@ Fields:
     of `K` codim-1 faces. Used by the basis-trace machinery
     ([`boundary_trace_indices`](@ref) and `is_facet_basis`) to filter
     facet-incident basis modes.
+  - `lower::SVector{D,T}`, `upper::SVector{D,T}` — the region's own corner
+    coordinates: the facet's fixed coordinate on every constrained axis
+    (so `lower[axis] == upper[axis]` there), and the region's merged
+    interval bounds on the free axes. They are the region's *own* extent,
+    which after the greedy merge is in general a strict subset of the
+    intersection of its parents' cell faces, so a consumer that needs the
+    region's geometry — rather than a bound on it — has to read them here.
+    Held as a corner pair rather than an [`AxisBox`](@ref) because a facet
+    box is degenerate on its constrained axes and `AxisBox` requires
+    strictly positive extent on every axis.
   - `parents::Vector{FacetParent{D,T}}` — every level cell whose own
     facet on `sides` coincides with this region. The parent set is
     constant across the region's quadrature points (the contract that
@@ -242,6 +301,8 @@ Fields:
 """
 struct FacetRegion{D,T<:Real}
     sides::Vector{Tuple{Int,Symbol}}
+    lower::SVector{D,T}
+    upper::SVector{D,T}
     parents::Vector{FacetParent{D,T}}
     points::Vector{SVector{D,T}}
     weights::Vector{T}
@@ -352,8 +413,10 @@ function _side_cells(level::Level{D}, sides::Vector{Tuple{Int,Symbol}}) where {D
 end
 
 # Build the admissible boundary regions on the facet identified by
-# `sides`. The algorithm mirrors the volume-region construction in
-# `intersections.jl`, restricted to the facet:
+# `sides`.
+#
+# The algorithm mirrors the volume-region construction in `intersections.jl`,
+# restricted to the facet:
 #
 #   1. Identify the levels whose own mesh face on `sides` coincides with
 #      the physical-domain face — only these levels contribute boundary
@@ -537,7 +600,7 @@ function _facet_region(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}},
         push!(physical_points, SVector{D,T}(x))
         push!(physical_weights, weight * jacobian)
     end
-    return FacetRegion{D,T}(sides, parents, physical_points, physical_weights, normal)
+    return FacetRegion{D,T}(sides, lower, upper, parents, physical_points, physical_weights, normal)
 end
 
 # ── Boundary trace evaluation ─────────────────────────────────────────────────

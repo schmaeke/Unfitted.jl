@@ -660,3 +660,221 @@ end
     @test length(regions) < candidates
     @test sum(sum(r.weights) for r in regions) ≈ 1.0 rtol = 1.0e-14
 end
+
+@testset "facet regions are memoised per face, not per selector" begin
+    # `_resolve_facet_regions` keys the cache it *retains* on (selector, space),
+    # but resolution itself runs through a per-face memo. The two are not the
+    # same granularity: `boundary(:all)` and `boundary(axis=1, side=:lower)` are
+    # not value-equal, yet the second names one of the four faces the first
+    # already covers, and keying the resolution on the selector resolved that
+    # shared face twice. Per-face memoisation makes the sharing deliberate. It
+    # must be invisible in the regions: the same faces, in the same order, with
+    # the same numbers.
+    tol = GeometryTolerance(Float64)
+    dom = box((0.0, 0.0), (1.0, 1.0))
+    V = ladder(dom; cells=2, order=2, depth=1, splits=2)
+    V = adapt(V, 2 => [CartesianIndex(1, 1)])
+
+    faces = Dict{Unfitted.FacetKey,Vector{Unfitted.FacetRegion{2,Float64}}}()
+    whole = Unfitted._facet_regions_for_selector(V, boundary(:all), tol, faces)
+    single = Unfitted._facet_regions_for_selector(V, boundary(axis=1, side=:lower), tol, faces)
+    # Four entries, one per face of the space — not the five face resolutions
+    # the two selectors would have asked for one at a time.
+    @test length(faces) == 4
+
+    # Every memoised face carries exactly what an independent resolution of that
+    # face builds: same region count, same order, same quadrature, same parents.
+    for sides in Unfitted._facets(boundary(:all), Val(2))
+        reference = Unfitted._boundary_facet_regions(V, sides, tol)
+        cached = faces[(V, sides)]
+        @test length(cached) == length(reference)
+        for (c, r) in zip(cached, reference)
+            @test c.sides == r.sides
+            @test c.lower == r.lower
+            @test c.upper == r.upper
+            @test c.points == r.points
+            @test c.weights == r.weights
+            @test c.normal == r.normal
+            @test [(p.level, p.cell, p.parent_box) for p in c.parents] ==
+                  [(p.level, p.cell, p.parent_box) for p in r.parents]
+        end
+    end
+
+    # The second selector got the memo's regions themselves, not copies of them —
+    # which is the storage half of the saving — and `boundary(:all)`'s union
+    # still opens with that same face, since `_facets` lists it first.
+    shared = faces[(V, [(1, :lower)])]
+    @test length(single) == length(shared)
+    @test all(a === b for (a, b) in zip(single, shared))
+    @test all(a === b for (a, b) in zip(view(whole, 1:length(shared)), shared))
+
+    # Through the public API: a problem naming two overlapping selectors over one
+    # space keeps both cache entries, keeps the region count they sum to, and
+    # still reproduces a datum the trace space contains.
+    g(x) = 1 + x[1] + 2x[2] + x[1] * x[2]
+    both = prepare(poisson(V; source=x -> 0.0,
+                           dirichlet=[dirichlet(g; on=boundary(:all)),
+                                      dirichlet(g; on=boundary(axis=1, side=:lower))]))
+    @test length(both.facet_regions) == 2
+    @test diagnostics(both).facet_region_count == length(whole) + length(single)
+    @test l2_error(solve!(both), both, g) < 1.0e-12
+end
+
+@testset "boundary(:all; except=…) is the union of the faces that remain" begin
+    # The gap `except` closes: `:sides` gives the *intersection* of its faces, so
+    # before this the union of a face *subset* had no spelling at all and every
+    # caller enumerated the faces by hand. What the selector must deliver is not
+    # an approximation of that list but the list itself — same constrained dofs,
+    # same projected values, same solution — in every dimension.
+    g(x) = 1 + x[1] + 2x[2]
+
+    for (D, cells) in ((2, (3, 2)), (3, (2, 3, 2)))
+        domain = box(ntuple(_ -> 0.0, D), ntuple(_ -> 1.0, D))
+        V = space(domain; cells=cells, order=2)
+        all_faces = [(axis, side) for axis in 1:D for side in (:lower, :upper)]
+
+        for dropped in all_faces
+            kept = filter(!=(dropped), all_faces)
+            selector = boundary(:all; except=(axis=dropped[1], side=dropped[2]))
+
+            # The facet decomposition every consumer reads is `boundary(:all)`'s
+            # list minus the one entry, in that order.
+            @test Unfitted._facets(selector, Val(D)) == [[face] for face in kept]
+
+            one = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(g; on=selector)]))
+            many = prepare(poisson(V; source=0.0,
+                                   dirichlet=[dirichlet(g; on=boundary(axis=a, side=s))
+                                              for (a, s) in kept]))
+            one_dofs, many_dofs = only(one.dofs.fields).dofs, only(many.dofs.fields).dofs
+            @test one_dofs.physical_dirichlet == many_dofs.physical_dirichlet
+            @test one_dofs.constrained_values == many_dofs.constrained_values
+            # End to end, not merely the same dof count: one solved system
+            # against the other, coefficient for coefficient.
+            @test solve!(one).coefficients == solve!(many).coefficients
+        end
+
+        # And it solves the mixed problem it describes. Dropping a face of the
+        # last axis and taking a datum independent of that coordinate makes the
+        # natural zero-flux condition on the dropped face hold for the datum's
+        # own harmonic extension, so `h` is the exact solution here and the
+        # selector reproduces it.
+        h(x) = 1 + x[1]
+        open_top = boundary(:all; except=(axis=D, side=:upper))
+        mixed = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(h; on=open_top)]))
+        @test l2_error(solve!(mixed), mixed, h) < 1.0e-12
+
+        # The whole-axis spelling drops both faces of the axis, and the facet
+        # count confirms it against the 2D−2 that remain.
+        whole_axis = boundary(:all; except=(axis=D,))
+        @test length(Unfitted._facets(whole_axis, Val(D))) == 2D - 2
+        @test Unfitted._facets(whole_axis, Val(D)) == [[face] for face in all_faces if face[1] != D]
+    end
+end
+
+@testset "boundary(:all; except=…) parses an exclusion list permissively" begin
+    # An omitted `side` means both faces of the axis, and it canonicalises to
+    # exactly that pair — so the short spelling and the long one are one selector
+    # *value*, hence one facet-region cache entry instead of two resolutions of
+    # the same faces. Order in the list is not part of the value either: it is a
+    # set of faces to remove.
+    @test boundary(:all; except=(axis=2,)) ==
+          boundary(:all; except=((axis=2, side=:lower), (axis=2, side=:upper)))
+    @test hash(boundary(:all; except=(axis=2,))) ==
+          hash(boundary(:all; except=((axis=2, side=:upper), (axis=2, side=:lower))))
+    scrambled = [(axis=3, side=:upper), (axis=3, side=:lower), (axis=1, side=:lower)]
+    @test boundary(:all; except=((axis=1, side=:lower), (axis=3,))) ==
+          boundary(:all; except=scrambled)
+
+    # A repeated axis is meaningless for an intersection and `boundary(pairs...)`
+    # rejects it. For an exclusion list it is ordinary and must construct; so must
+    # a face named twice over.
+    @test_throws ArgumentError boundary((axis=3, side=:lower), (axis=3, side=:upper))
+    @test boundary(:all; except=((axis=3, side=:lower), (axis=3, side=:upper))).sides ==
+          [(3, :lower), (3, :upper)]
+    @test boundary(:all; except=((axis=1,), (axis=1, side=:lower))).sides ==
+          [(1, :lower), (1, :upper)]
+    @test boundary(:all; except=(axis=1, side=:lower)).selector === :except
+
+    # `except` removes faces from the whole boundary, so it means nothing on any
+    # other selector, and the error has to say that rather than complain about
+    # the faces.
+    @test_throws ArgumentError boundary(:sides; except=(axis=1, side=:lower))
+    @test_throws ArgumentError boundary(:nonsense; except=(axis=1,))
+
+    # Malformed entries. The unknown-key rejection is what keeps the optional
+    # `side` safe: `sides=:lower` would otherwise read as `(axis=1,)` and quietly
+    # exclude one face too many.
+    @test_throws ArgumentError boundary(:all; except=(axis=1, side=:left))
+    @test_throws ArgumentError boundary(:all; except=(side=:lower,))
+    @test_throws ArgumentError boundary(:all; except=(axis=1, sides=:lower))
+    @test_throws ArgumentError boundary(:all; except=(axis=0,))
+    @test_throws ArgumentError boundary(:all; except=(1, :lower))
+
+    # Excluding every face selects nothing, which is never what a caller meant.
+    # Like the out-of-bounds axis check below it needs `D`, so it fires when the
+    # selector meets a space — the same moment `boundary(axis=4, side=:lower)`
+    # fails in 2D.
+    everything = boundary(:all; except=((axis=1,), (axis=2,)))
+    @test_throws ArgumentError Unfitted._facets(everything, Val(2))
+    @test_throws ArgumentError Unfitted._facets(boundary(:all; except=(axis=3,)), Val(2))
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    @test_throws ArgumentError prepare(poisson(V; source=0.0,
+                                               dirichlet=[dirichlet(0.0; on=everything)]))
+    # ...but in 3D that same list keeps the two faces of axis 3.
+    @test length(Unfitted._facets(everything, Val(3))) == 2
+end
+
+@testset "boundary(:all) is unchanged by the except keyword" begin
+    # `except` is a pure addition: with no exclusions the method returns the
+    # selector the one-line method always returned, by value and by hash, so a
+    # freshly built `boundary(:all)` still finds the facet-region cache entry a
+    # prepared model made for it.
+    everywhere = boundary(:all)
+    @test everywhere == Unfitted.BoundarySelector(:all, Tuple{Int,Symbol}[])
+    @test hash(everywhere) == hash(Unfitted.BoundarySelector(:all, Tuple{Int,Symbol}[]))
+    @test everywhere == boundary(:all; except=())
+    @test hash(everywhere) == hash(boundary(:all; except=()))
+    @test everywhere != boundary(:all; except=(axis=1, side=:lower))
+    @test length(Dict(everywhere => 1, boundary(:all; except=(axis=1, side=:lower)) => 2)) == 2
+
+    # An unsupported symbol with no `except` still constructs and still fails
+    # exactly where it used to — at prepare time, not at construction.
+    @test boundary(:nonsense).selector === :nonsense
+    @test isempty(boundary(:nonsense).sides)
+    @test_throws ArgumentError Unfitted._facets(boundary(:nonsense), Val(2))
+
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    @test haskey(model.facet_regions, (boundary(:all), model.problem.space))
+end
+
+@testset "except excludes closed faces, so the seam dof stays constrained" begin
+    # Exclusion is by closed face: the kept faces come with their closure, so a
+    # dof where a kept face meets an excluded one is still constrained, because
+    # the kept face's datum extends to its own edge. That is exactly what makes
+    # the dof set equal the hand-written union's, and it is the one thing about
+    # `except` that can surprise — it is not "∂Ω minus a face" by measure.
+    #
+    # Q1 on a 2×2 grid has 9 nodes, 8 of them on ∂Ω. Dropping the x-upper face
+    # leaves 7 constrained, not 5: only its *open* middle node comes free, while
+    # its two corner nodes are shared with the kept y-faces and stay pinned.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    selector = boundary(:all; except=(axis=1, side=:upper))
+    model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(1.0; on=selector)]))
+    dofs = only(model.dofs.fields).dofs
+    @test count(dofs.physical_dirichlet) == 7
+
+    # Named directly: the corner dof is on an excluded face and a kept one at
+    # once, and the selector matches it.
+    folded = model.problem.space
+    level, domain, tol = folded.levels[1], folded.domain, dofs.tolerance
+    matches(key, on) = Unfitted._selector_matches(key, level, domain, on, tol)
+    corner = only(key
+                  for key in dofs.raw_keys
+                  if matches(key, boundary((axis=1, side=:upper), (axis=2, side=:lower))))
+    @test matches(corner, selector)
+    # ...while the mid-face dof of the excluded face, which no kept face touches,
+    # does not.
+    @test count(key -> matches(key, boundary(axis=1, side=:upper)) && !matches(key, selector),
+                dofs.raw_keys) == 1
+end

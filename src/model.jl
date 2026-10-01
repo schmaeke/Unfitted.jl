@@ -129,7 +129,21 @@ Fields:
     cached on the model, summed across every cached selector
     (Dirichlet conditions and any `block`/`loadform` carrying
     `on::BoundarySelector`). Zero for problems with no physical-
-    boundary integration.
+    boundary integration. Because the sum runs over selector × face pairs and
+    not over distinct regions, two selectors that name the same face each count
+    it, so this number **grows** when the same boundary is spelled with fewer,
+    broader selectors even though the resolved regions and the integration work
+    are unchanged — the regions themselves are shared through
+    `_resolve_facet_regions`' per-face memo either way. The space-time cavity
+    example is the instance: at `SC_CELLS = 3` it constrains five distinct faces
+    carrying nine regions each, and spelling them one face at a time made `θ`'s
+    and `u`'s conditions on a shared plate edge *the same selector value*, which
+    the cache keys together — five entries, 5 × 9 = 45. One
+    `boundary(:all; except=…)` per field gives each field its own selector, so
+    the four faces both name are counted twice: nine selector × face pairs,
+    9 × 9 = 81. The faces, the regions and the quadrature are identical in both
+    spellings, so read a rise here as a change of spelling until the region
+    geometry itself has been checked.
   - `surface_region_count::Int` — total number of
     [`SurfaceRegion`](@ref)s cached on the model, summed across every
     cached [`BoundaryMesh`](@ref). Zero for problems with no
@@ -430,6 +444,26 @@ end
 # deduplicates spaces by `===`, so "a distinct discretisation" is package-wide
 # synonymous with "a distinct `Space` object".
 const RegionKey = Tuple{Any,Any}
+
+# Key of the per-*face* memo threaded through facet-region resolution: one entry
+# per `(space, facet)` pair, where the facet is the `(axis, side)` list a
+# `BoundarySelector` decomposes into (`_facets`). This is one level below
+# `RegionKey`, which keys whole selectors.
+#
+# The distinction matters because a selector is a *union* of faces while
+# `_boundary_facet_regions` resolves *one* face, so two selectors that are not
+# value-equal can still overlap: `boundary(:all)` covers every face, hence every
+# face any other selector names. Keyed on the selector, each overlap resolves the
+# shared face again; keyed on the face, each face of each space is resolved
+# exactly once and the selectors' region vectors are assembled from the shared
+# results. That is worth doing because the overlap is not rare — it is what any
+# spelling of "the whole boundary except one face" produces for a coupled
+# problem, one such selector per field.
+#
+# The space half is identity-keyed for the reason given above; the `sides` half
+# is a `Vector{Tuple{Int,Symbol}}`, which `Tuple` hashes and compares
+# element-wise, so the same face spelled by two different selectors is one key.
+const FacetKey = Tuple{Any,Vector{Tuple{Int,Symbol}}}
 
 """
     Model{D,T,P}
@@ -977,12 +1011,21 @@ end
 # admissible regions (e.g. an overlay-only level mask emptying a face) end up
 # with an empty list, not absent — callers can distinguish "selector with no
 # regions" from "selector never referenced".
+#
+# `faces` is the per-face memo (`FacetKey`) every selector of every space
+# resolves through, so a face two *different* selectors both name is resolved
+# once and its `FacetRegion`s are shared between their vectors rather than built
+# twice. It lives for the duration of this call: the regions it holds are
+# retained by the selector vectors themselves, and the memo's own job — making
+# the sharing deliberate rather than an accident of how the caller happened to
+# spell its conditions — is finished when the last selector has been assembled.
 function _resolve_facet_regions(problem::Problem{D,T}, tolerance::GeometryTolerance{T}) where {D,T}
     regions = Dict{RegionKey,Vector{FacetRegion{D,T}}}()
+    faces = Dict{FacetKey,Vector{FacetRegion{D,T}}}()
     for (selector, space) in _referenced_facet_sites(problem)
         key = (selector, space)
         haskey(regions, key) && continue
-        regions[key] = _facet_regions_for_selector(space, selector, tolerance)
+        regions[key] = _facet_regions_for_selector(space, selector, tolerance, faces)
     end
     return regions
 end
@@ -1070,11 +1113,29 @@ _region_count(regions::AbstractDict) = sum(length, values(regions); init=0)
 # of regions across every facet the selector covers). Used by
 # `_resolve_facet_regions` and reused by consumers that need to look up
 # a selector that was not pre-resolved at `prepare` time.
+#
+# The union is assembled through the per-face memo `faces` (see `FacetKey`), so
+# a face already resolved on `V` — by this selector or by any other selector
+# sharing it — contributes the regions it resolved to rather than a second copy.
+# `_boundary_facet_regions` is a pure function of `(V, sides, tolerance)`, so the
+# memo returns exactly what a fresh resolution would: the same regions, in the
+# same order, region objects shared instead of duplicated. The default is a
+# private memo, which is what the one-shot lookup path (`_resolve_on_regions` on
+# a selector no `prepare` saw) wants — there is no second selector there to share
+# with, only this selector's own faces, which `_facets` already lists once each.
 function _facet_regions_for_selector(V::Space{D,T}, selector::BoundarySelector,
                                      tolerance::GeometryTolerance{T}) where {D,T}
+    return _facet_regions_for_selector(V, selector, tolerance,
+                                       Dict{FacetKey,Vector{FacetRegion{D,T}}}())
+end
+
+function _facet_regions_for_selector(V::Space{D,T}, selector::BoundarySelector,
+                                     tolerance::GeometryTolerance{T},
+                                     faces::Dict{FacetKey,Vector{FacetRegion{D,T}}}) where {D,T}
     regions = FacetRegion{D,T}[]
     for sides in _facets(selector, Val(D))
-        append!(regions, _boundary_facet_regions(V, sides, tolerance))
+        append!(regions,
+                get!(() -> _boundary_facet_regions(V, sides, tolerance), faces, (V, sides)))
     end
     return regions
 end

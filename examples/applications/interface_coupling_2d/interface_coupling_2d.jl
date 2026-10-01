@@ -221,12 +221,17 @@ end
 # is one linear system over both dof blocks — never two systems iterated
 # against each other.
 
-bcs = [dirichlet(exact₁; on=boundary(axis=1, side=:lower), field=u₁),
-       dirichlet(exact₁; on=boundary(axis=2, side=:lower), field=u₁),
-       dirichlet(exact₁; on=boundary(axis=2, side=:upper), field=u₁),
-       dirichlet(exact₂; on=boundary(axis=1, side=:upper), field=u₂),
-       dirichlet(exact₂; on=boundary(axis=2, side=:lower), field=u₂),
-       dirichlet(exact₂; on=boundary(axis=2, side=:upper), field=u₂)]
+# Each subdomain is Dirichlet on every face of its own box except the one facing
+# the seam: box₁ reaches past `s` to 0.70, so its x-upper face lies inside the
+# *other* material, where Ω₁ does not exist and no boundary condition belongs —
+# and symmetrically for box₂'s x-lower face at 0.42. `boundary(:all; except = …)`
+# names that directly. The exclusion is closed, so the corners the excluded face
+# shares with the kept y-faces are still constrained; written out face by face
+# this is three conditions per subdomain instead of one, constraining the same
+# dofs to the same projected values.
+
+bcs = [dirichlet(exact₁; on=boundary(:all; except=(axis=1, side=:upper)), field=u₁),
+       dirichlet(exact₂; on=boundary(:all; except=(axis=1, side=:lower)), field=u₂)]
 
 blocks = (stiffness_block(u₁; diffusion=κ₁), stiffness_block(u₂; diffusion=κ₂),
           couple(u₁, u₂, seam, bond)...)

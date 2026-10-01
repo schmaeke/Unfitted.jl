@@ -121,6 +121,7 @@ end
 
 """
     boundary(:all)
+    boundary(:all; except = (axis=d, side=s))
     boundary(axis=d, side=s)
     boundary((axis=d1, side=s1), (axis=d2, side=s2), ...)
 
@@ -128,6 +129,11 @@ Select a physical facet for boundary conditions:
 
   - `boundary(:all)` — the whole physical boundary `∂Ω` (union of all
     codim-1 faces).
+  - `boundary(:all; except = …)` — the union of all codim-1 faces *but*
+    the ones listed. An entry is `(axis=d, side=s)` for a single face or
+    `(axis=d,)` for both faces of axis `d`; pass one entry, or a tuple or
+    vector of them. `except` is accepted on `:all` only, and it may not
+    name every face — that would select nothing.
   - `boundary(axis=d, side=s)` — one codim-1 face. `side` is `:lower`
     or `:upper`.
   - `boundary((axis=d₁, side=s₁), …)` — the intersection of `K`
@@ -136,12 +142,85 @@ Select a physical facet for boundary conditions:
     vertex. Each axis may appear at most once, and `side` must be
     `:lower` or `:upper`.
 
+Several faces therefore mean two different things depending on where
+they are written, and the difference is the whole reason `except` exists:
+in the positional form they *intersect* — `boundary((axis=1, side=:lower),
+(axis=2, side=:lower))` is the corner where two faces meet, not the pair
+of them — while in `except` they are removed from a union. On a box every
+face subset is the complement of another, so `except` reaches all of
+them, and an axis may be named twice there (`(axis=3, side=:lower)` and
+`(axis=3, side=:upper)` together) where the positional form rejects it.
+
 The dimension-independent Dirichlet projection treats every facet
 through one code path: a codim-`K` facet is integrated against the
 `(D − K)`-dim quadrature on the facet, which for `K = D` collapses to
 a single point evaluation with unit weight.
+
+Exclusions are **closed-face** exclusions. The kept faces are taken with
+their closure, so a dof on the seam where a kept face meets an excluded
+one is *still* constrained, and `boundary(:all; except = …)` picks out
+exactly the dof set the remaining faces spelled out one by one do. That
+is right for a Dirichlet trace — the datum on a kept face extends to that
+face's own edge, and the hand-written union behaves identically — and it
+is a genuine surprise for a flux: an `except` selector is not "`∂Ω` minus
+a face" in the sense of measure, it is the closed union of what remains,
+and [`neumann`](@ref) integrates over the kept faces with no special
+treatment of the edges they share with the excluded ones.
 """
-boundary(selector::Symbol) = BoundarySelector(selector, Tuple{Int,Symbol}[])
+function boundary(selector::Symbol; except=())
+    # The no-exclusion path is the original one-line method, and it is reached
+    # before every other check in this method so that it stays exactly that: any
+    # symbol still constructs the selector it always constructed, and one that
+    # no consumer supports still fails where it always failed — at prepare time,
+    # in `_facets` / `_selector_matches`, not here.
+    isempty(except) && return BoundarySelector(selector, Tuple{Int,Symbol}[])
+    selector === :all ||
+        throw(ArgumentError("except= removes faces from the whole boundary, so it applies " *
+                            "only to boundary(:all); got boundary(:$selector)"))
+    return BoundarySelector(:except, _excluded_faces(except))
+end
+
+# Parse `boundary`'s `except` argument into the excluded codim-1 faces stored on
+# an `:except` selector. One named tuple is accepted directly, so the common
+# single-exclusion case needs no wrapping brackets.
+#
+# This is deliberately *not* `boundary(pairs...)`'s parser. That one rejects a
+# repeated axis, which is right for an intersection — `(axis=3, side=:lower)`
+# together with `(axis=3, side=:upper)` names an empty facet — and wrong for an
+# exclusion list, where the same pair is the perfectly ordinary request to drop
+# both faces of axis 3. Here a repeated axis, and even a repeated face, is
+# admissible: the list is a set of faces to remove, so duplicates are dropped
+# rather than diagnosed.
+#
+# Unknown keys *are* rejected, which `boundary(pairs...)` has no need to do. The
+# reason is the optional `side`: a typo such as `(axis=1, sides=:lower)` would
+# otherwise read as `(axis=1,)` and silently exclude one face too many.
+#
+# The result is canonicalised — deduplicated, then sorted — so that two spellings
+# of the same exclusion set are one selector *value*: `(axis=2,)` and its two
+# faces written out are then a single facet-region cache entry rather than two
+# resolutions of the same faces, and the whole list is a set, order and all. The
+# order the *kept* faces come out in is `_kept_faces`' business, not this one's.
+_excluded_faces(spec::NamedTuple) = _excluded_faces((spec,))
+
+function _excluded_faces(specs)
+    faces = Tuple{Int,Symbol}[]
+    for spec in specs
+        spec isa NamedTuple && haskey(spec, :axis) && issubset(keys(spec), (:axis, :side)) ||
+            throw(ArgumentError("boundary except entries must be named tuples (axis=d, side=s) " *
+                                "or (axis=d,); got $spec"))
+        axis = Int(spec.axis)
+        axis >= 1 || throw(ArgumentError("boundary axis $axis must be positive"))
+        if haskey(spec, :side)
+            spec.side in (:lower, :upper) ||
+                throw(ArgumentError("boundary side must be :lower or :upper"))
+            push!(faces, (axis, spec.side))
+        else
+            append!(faces, ((axis, :lower), (axis, :upper)))
+        end
+    end
+    return sort!(unique!(faces))
+end
 
 function boundary(; axis::Integer, side::Symbol)
     side in (:lower, :upper) || throw(ArgumentError("boundary side must be :lower or :upper"))
@@ -190,6 +269,13 @@ Nonzero `value` data are projected onto the boundary trace space
 before strong elimination so the constrained dof values reflect the
 correct trace. Homogeneous (constant-zero) data skip the projection
 entirely.
+
+A `boundary(:all; except = …)` selector constrains its kept faces *closed*
+(see [`boundary`](@ref)): a dof on the edge between a kept face and an
+excluded one carries this condition, because the datum on the kept face
+extends to that face's own boundary. One such condition is therefore
+interchangeable with the remaining faces written out one by one — same
+dofs, same projected values.
 """
 function dirichlet(value; on::BoundarySelector, field=nothing, component=nothing)
     field_name = field isa Field ? field.name : field
@@ -217,7 +303,10 @@ over the same [`Model`](@ref) for time stepping.
 `coefficient` is a scalar (the default `1`), a callback `c(x)`, or an
 indexable value (`SVector`, `Tuple`) carrying one entry per component.
 The form is diagonal in the component index for vector fields, and is
-built with `symmetric = true` and `component_aware = true`.
+built with `symmetric = true` and `component_aware = true`. It declares
+its `bilinear` side and no `linear` one, and an absent side is absent
+rather than zero (see [`WeakForm`](@ref)), so it belongs on a
+[`block`](@ref).
 
 See [`mass_block`](@ref) for the same form wrapped as a same-field
 block, and [`mass`](@ref) for the whole one-field problem.
@@ -226,7 +315,7 @@ function mass_form(; coefficient=1)
     coefficient_data = _as_coefficient(coefficient)
     return WeakForm(bilinear=(q, trial, test_component) -> _mass_value(coefficient_data, q, trial,
                                                                        test_component),
-                    linear=(q, test_component) -> 0.0, symmetric=true, component_aware=true)
+                    symmetric=true, component_aware=true)
 end
 
 """
@@ -244,7 +333,28 @@ reach the caller wrapped in a `TaskFailedException`; a square tensor
 whose size does not match the space's `D` is still caught at the first
 quadrature point. The form is diagonal in the component index for vector
 fields, and is built with `symmetric = true` and
-`component_aware = true`.
+`component_aware = true`. It declares its `bilinear` side and no `linear`
+one, and an absent side is absent rather than zero (see
+[`WeakForm`](@ref)), so it belongs on a [`block`](@ref).
+
+`A` need not be full rank. Squareness is the only structural property checked
+when the form is built, and agreement with the space's `D` the only one checked
+per point; nothing asks `A` to be positive definite. A tensor with a zero row
+and column `d` — for a diagonal tensor simply `A[d,d] = 0` — therefore names an
+axis the operator does not differentiate along, so `A = κ · diag(1, 1, 0)` on a
+three-axis mesh is the directional Laplacian `∫_Ω κ (∂₁v ∂₁u + ∂₂v ∂₂u) dx`.
+That covers an anisotropic medium impermeable along one axis, a plane reduction
+of a higher-dimensional mesh, and the spatial part of a space-time operator,
+none of which need a hand-written [`WeakForm`](@ref).
+
+What a dropped axis costs is well-posedness, not correctness. The flux along it
+is genuinely zero, so this block on its own annihilates every function that
+varies only along the dropped axes, and something else has to remove that null
+space: a Dirichlet condition on faces orthogonal to a *differentiated* axis, or
+another term in the same rows — the ∂ₜ channel of a space-time form, say. With
+`A = diag(1, 0)` on a 3 × 3 unit square at order 1, constraining the two axis-1
+faces leaves a full-rank 8 × 8 block while constraining the two axis-2 faces
+leaves rank 6.
 
 That `symmetric = true` assumes a **symmetric** tensor `A`, which a
 diffusivity or a conductivity is; nothing checks it. A non-symmetric `A`
@@ -269,20 +379,22 @@ function stiffness_form(; diffusion=1)
     return WeakForm(bilinear=(q, trial, test_component) -> _stiffness_channels(diffusion_coefficient,
                                                                                q, trial,
                                                                                test_component),
-                    linear=(q, test_component) -> 0.0, symmetric=true, component_aware=true)
+                    symmetric=true, component_aware=true)
 end
 
 """
     source_form(; source)
 
 Build the load [`WeakForm`](@ref) `ℓ(v) = ∫_Ω source(x) · v dx` without
-committing to a full [`Problem`](@ref). Its bilinear part is identically
-zero, so the form contributes to the right-hand side only.
+committing to a full [`Problem`](@ref). It declares its `linear` side and
+no `bilinear` one, so it contributes to the right-hand side only — and an
+absent side is absent rather than zero (see [`WeakForm`](@ref)), so it
+belongs on a [`loadform`](@ref) and not on a [`block`](@ref).
 
 `source` is a scalar, a callback `source(x)`, or an indexable value
 (`SVector`, `Tuple`) carrying one entry per component. The form is built
 `component_aware = true`, and `symmetric = true` — an inert flag on a
-form whose bilinear part is identically zero.
+form with no bilinear part to mirror.
 
 See [`source_load`](@ref) for the same form wrapped as a load
 contribution, [`load`](@ref) for the whole one-field problem, and
@@ -290,8 +402,7 @@ contribution, [`load`](@ref) for the whole one-field problem, and
 """
 function source_form(; source)
     source_coefficient = _as_coefficient(source)
-    return WeakForm(bilinear=(q, trial, test_component) -> 0.0,
-                    linear=(q, test_component) -> _source_value(source_coefficient, q,
+    return WeakForm(linear=(q, test_component) -> _source_value(source_coefficient, q,
                                                                 test_component), symmetric=true,
                     component_aware=true)
 end
@@ -371,6 +482,14 @@ For Robin, Nitsche, or other non-canonical boundary conditions,
 compose [`block`](@ref) and [`loadform`](@ref) directly with
 `on = …` and your own [`WeakForm`](@ref) — the package supplies the
 integration primitives, not the constitutive choice.
+
+A `boundary(:all; except = …)` selector puts the flux on its kept faces
+taken *closed* (see [`boundary`](@ref)): the load is the sum over those
+faces, and the edges they share with the excluded ones get no special
+treatment. That is the right reading for a Dirichlet trace and a
+deliberate one to check for a flux, where "`∂Ω` minus a face" might be
+expected to mean something about measure. It does not; nothing here is
+trimmed.
 """
 function neumann(u::Field, value; on::BoundarySelector, component=nothing)
     component === nothing && return loadform(u, source_form(; source=value); on)
@@ -382,8 +501,7 @@ function neumann(u::Field, value; on::BoundarySelector, component=nothing)
     # walking test component matches the requested one.
     coefficient = _as_coefficient(value)
     return loadform(u,
-                    WeakForm(bilinear=(q, trial, c) -> 0.0,
-                             linear=(q, c) -> c == selected ? _source_value(coefficient, q, c) : 0.0,
+                    WeakForm(linear=(q, c) -> c == selected ? _source_value(coefficient, q, c) : 0.0,
                              symmetric=true, component_aware=true); on)
 end
 
@@ -423,7 +541,9 @@ For vector fields the form is diagonal in the component index.
 `diffusion` accepts the same shapes as [`poisson`](@ref): scalar,
 `UniformScaling`, callback returning a scalar, constant `D × D` matrix,
 or callback returning such a matrix — and carries the same assumption
-that a matrix `A` is symmetric (see [`stiffness_form`](@ref)).
+that a matrix `A` is symmetric, as well as the same freedom to be
+rank-deficient, whose zero rows drop those axes from the operator (see
+[`stiffness_form`](@ref)).
 `dirichlet` is the list of physical Dirichlet conditions to impose; see
 [`dirichlet`](@ref).
 """
@@ -501,12 +621,17 @@ indexable value (vector fields). `diffusion` accepts:
 
 Matrix diffusion is applied as `⟨∇v, A · ∇u⟩` per component (no
 inter-component coupling); for cross-component coupling, build the
-multi-field [`Problem`](@ref) explicitly. The returned problem declares
-`symmetric = true`, which assumes a symmetric `A`; a non-symmetric
-tensor must be assembled through an explicitly asymmetric
-[`Problem`](@ref) instead — see [`stiffness_form`](@ref). `dirichlet` is
-the list of physical Dirichlet conditions to impose; see
-[`dirichlet`](@ref).
+multi-field [`Problem`](@ref) explicitly. A matrix `A` need not be full
+rank — a zero row and column drops that axis from the operator, which is
+how a plane reduction or a medium impermeable along one axis is spelled;
+see [`stiffness_form`](@ref) for what the dropped axis costs in
+well-posedness.
+
+The returned problem declares `symmetric = true`, which assumes a
+symmetric `A`; a non-symmetric tensor must be assembled through an
+explicitly asymmetric [`Problem`](@ref) instead — see
+[`stiffness_form`](@ref). `dirichlet` is the list of physical Dirichlet
+conditions to impose; see [`dirichlet`](@ref).
 """
 function poisson(V::Space{D,T}; source, diffusion=one(T), dirichlet=[]) where {D,T}
     return poisson(field(:u, V); source, diffusion, dirichlet)
