@@ -198,8 +198,40 @@ Fields:
     smallest geometric feature you must classify cleanly.
   - `max_depth::Int`: hard cap on the subdivision depth of both consumers above.
   - `moment_order_factor::Int`: multiplier on the NNMF moment-fit basis order
-    per axis (`factor × max(cell_order)` over the region's parent cells). `2`
-    (default) integrates trial × test products exactly; `1` halves the basis.
+    per axis (`factor × max(cell_order)` over the region's parent cells).
+
+    `2` (the default) spans degree `2p`, so the fit solves for `∏(2p+1)`
+    weights and trial × test *products* integrate exactly — matching on cut
+    regions what tensor Gauss already delivers on `:full` ones.
+
+    `1` spans degree `p` and solves for `∏(p+1)` weights, the same point count
+    tensor Gauss uses on an uncut cell. It is the convention of much of the
+    moment-fitting literature and of QuESo, whose trimmed-element rules
+    likewise carry `n ≤ ∏(p+1)` points, and it is dramatically cheaper: the
+    fit costs roughly the cube of the weight count, so over the 146 cut cells
+    of the space-time cavity geometry at cells `(8,8,8)` it runs 1.1 s at
+    `∏(p+1) = 125` against ≈ 500 s at `∏(2p+1) = 729`.
+
+    It is not, however, a free choice, and the condition is sharp. A stiffness
+    integrand `∇u·∇v` has degree `2(p−1)`, so exactness needs the moment basis
+    to span `2p − 2`, i.e. `factor ≥ 2 − 2/p` — which `1` satisfies only up to
+    `p = 2`. Linear functionals (sources, loads) are degree `p` and are exact
+    at `1` for any order. Measured on `examples/applications/kirsch_plate_2d`,
+    a plane-stress plate swept over orders 1–7, relative L² error at factor
+    `1` against factor `2`:
+
+        order 1   2.41e-2    2.19e-2
+        order 2   1.12e-3    1.11e-3
+        order 3   4.48e-4    1.03e-4
+        order 4   3.39e-4    9.39e-6
+        order 7   7.33e-2    < 1e-6
+
+    At factor `1` the sequence stops converging after `p = 2` and then
+    diverges, ending three times worse than first order, while the moment-fit
+    residual holds at ~1e-16 throughout — the fit is exact for what it fits,
+    and what it fits is too little. Use `1` for low-order work or when only
+    linear functionals are integrated over cut cells; keep `2` whenever
+    high-order convergence on cut cells is the point.
   - `target_residual::T`: NNMF L² residual the moment-fit aims for in cut
     regions. Default `1e-6`; the exact kernel reaches far below it, so this
     only bounds the conditioning retry.

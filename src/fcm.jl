@@ -83,17 +83,32 @@ The moment-fit matrix is short and wide (`nbasis ≪ npoints`), so the matrix th
 algorithm walks IS the small one.
 
 The Bro & de Jong (1997) Fast NNLS variant (`alg = :fnnls`) works on the
-`npoints × npoints` Gram matrix instead and is faster only when `npoints` is
-small; at our typical `npoints` of several thousand it is far slower.
+`npoints × npoints` Gram matrix instead, which is the wrong shape here: our
+candidate cloud is `6 · nbasis` wide, so the Gram matrix is the large one.
+Measured on one cut cell of the space-time cavity geometry, `:fnnls` against
+`:nnls` at a candidate count of 162 / 750 / 2058: 0.000 s vs 0.004 s,
+0.014 s vs 0.005 s, and 29.7 s vs 0.124 s — it wins only on the smallest cloud
+and is 240× slower by `nbasis = 343`. It is also markedly less accurate, the
+relative moment residual running 2.7e-15 / 6.2e-05 / 1.4e-03 against
+`:nnls`'s uniform ~1e-15, so the Gram formulation loses the conditioning the
+Householder walk keeps. `:nnls` is the right choice on both counts.
 
 `max_iter` is raised to `10 · npoints` from the library default of
-`3 · npoints`. Lawson–Hanson stays feasible at every step, so reaching the cap
-is not a wrong answer — but the library announces it by printing
+`3 · npoints`. It counts the algorithm's *inner* iterations, not its outer ones
+(`NonNegLeastSquares/src/nnls.jl`), so it is not a bound on the `nbasis` columns
+the active set accepts. Lawson–Hanson stays feasible at every step, so reaching
+the cap is not a wrong answer — but the library announces it by printing
 `NNLS quitting on iteration count` to stdout, and a library call has no business
-writing there. The cells that reach it (a 3-D order-3 sphere is the case this
-was found on) overrun the default by a few percent, so the wider cap lets the
-active-set walk finish instead of being cut short. Raising a cap cannot change a
-solve that converged under the old one: the cap only ever truncates.
+writing there. Raising a cap cannot change a solve that converged under the old
+one: the cap only ever truncates.
+
+How far cells overrun is not a few percent. At moment order `(8, 8, 8)` on the
+space-time cavity geometry the cap is still reached, at ten times the library
+default, on cells whose candidate cloud is degenerate enough to make the walk
+cycle. Those are the cells `_cap_candidates` used to manufacture with an integer
+stride; the fractional spacing it now uses removes most of them, and the ones
+that remain are a signal that the cell is under-resolved for its geometric
+complexity rather than evidence the cap is too small.
 
 Allocations are owned by `NonNegLeastSquares.jl`; `A` and `b` are not mutated,
 so the name carries no `!`.
@@ -288,8 +303,14 @@ end
 # Ceiling on the NNLS design matrix, in entries (`nbasis × ncandidates`).
 # Lawson–Hanson sweeps the whole matrix once per accepted column, so a solve's
 # memory is proportional to this product and its time to the product times the
-# number of accepted columns (≤ nbasis); 6·10⁶ entries is 48 MB and a fraction of
-# a second at the moment orders in use here. Because the candidate budget below
+# number of accepted columns (≤ nbasis). 6·10⁶ entries is 48 MB — and nothing
+# like a fraction of a second at the top of the range. Measured serially at
+# `-O2` on the space-time cavity geometry, one cut cell's fit takes 0.2 ms at
+# `nbasis = 27`, 7 ms at 125, 215 ms at 343 and ≈ 2.4 s (median; 17 s worst) at
+# 729, where the matrix is 729 × 4374 = 3.2·10⁶ entries, 25 MB. The growth is
+# steeper than the `nbasis³` the flop count predicts because past ~10 MB the
+# matrix no longer fits in per-core cache and the sweep becomes
+# bandwidth-bound rather than compute-bound. Because the candidate budget below
 # is a multiple of `nbasis`, the entry count grows as `budget · nbasis²` —
 # quadratically in the basis size — so the retry needs an absolute ceiling and
 # not just a relative one. It binds retries only (the `max` in `_cap_candidates`

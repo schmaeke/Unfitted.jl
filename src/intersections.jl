@@ -160,15 +160,24 @@ function _cached_alpha_weights!(cache::Dict{NTuple{D,Int},Vector{T}}, counts::NT
     end
 end
 
-# Pick the moment-fit basis order for a cut region. With the default
-# `moment_order_factor = 2` on `V.physical`, the basis spans degree twice the
-# per-axis maximum of `cell_order` over the region's parent CELLS — not over
-# their levels, so one high-p cell elsewhere on a level does not raise the
-# moment basis here — matching what tensor Gauss integrates exactly on `:full`
-# regions and so bringing cut-region integrand exactness to the same level as
-# the rest of assembly. Users whose integrand is only degree-`p` (linear forms
-# / sources) can set the factor to 1, halving the basis at the cost of giving
-# up bilinear-form exactness.
+# Pick the moment-fit basis order for a cut region: `moment_order_factor` times
+# the per-axis maximum of `cell_order` over the region's parent CELLS — not over
+# their levels, so one high-p cell elsewhere on a level does not raise the moment
+# basis here.
+#
+# At the default `moment_order_factor = 2` the basis spans degree `2p`, so trial ×
+# test products integrate exactly and cut regions reach the exactness `:full`
+# regions already get from tensor Gauss. That costs `∏(2p+1)` weights against the
+# `∏(p+1)` a factor of 1 would need — 4.6×–5.8× the points in 3D at `p = 2…4`, and
+# roughly the cube of that in fit time: over the 146 cut cells of the space-time
+# cavity geometry the fit runs 1.1 s at 125 weights and ≈ 500 s at 729.
+#
+# A factor of 1 is nevertheless not a drop-in saving, and the condition is sharp:
+# a stiffness integrand is degree `2(p−1)`, so exactness needs `factor ≥ 2 − 2/p`,
+# which 1 meets only to `p = 2`. Measured on the order-1-to-7 Kirsch plate, factor
+# 1 stops converging after `p = 2` and by `p = 7` is three times worse than first
+# order while the fit residual stays at ~1e-16. `physical_domain`'s docstring
+# carries that table.
 function _moment_order_for_region(V::Space{D}, parents) where {D}
     factor = V.physical.moment_order_factor
     return ntuple(D) do d

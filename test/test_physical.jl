@@ -776,7 +776,13 @@ end
 
     parents = Unfitted._parents_covering(V_def.levels, box((0.0,), (1.0,)),
                                          GeometryTolerance(Float64))
+    # The default spans degree `2p`, which is what makes trial × test products
+    # exact on the moment basis.
+    @test p_default.moment_order_factor == 2
     @test Unfitted._moment_order_for_region(V_def, parents) == (4,)
+    # Factor 1 spans degree `p` only: `∏(p+1)` weights, the tensor Gauss count on
+    # an uncut cell, exact for linear functionals but — see `physical_domain`'s
+    # docstring — for a stiffness form only up to `p = 2`.
     @test Unfitted._moment_order_for_region(V_che, parents) == (2,)
 
     @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1,

@@ -906,10 +906,14 @@ indicator representations are intentionally not supported.
     - `max_depth` (default `8`): hard cap on the subdivision depth of both
       consumers above.
     - `moment_order_factor`: multiplier on the moment-fit basis order per
-      axis. `2` (default) integrates trial × test products exactly on the
-      moment basis, matching what tensor Gauss does on `:full` regions;
-      `1` halves the basis but only integrates degree-`p` integrands
-      exactly.
+      axis. `2` (default) spans degree `2p`, integrating trial × test
+      products exactly and so matching on cut regions what tensor Gauss does
+      on `:full` ones. `1` spans degree `p`, carrying only `∏(p+1)` points —
+      the tensor Gauss count on an uncut cell, and QuESo's convention — at
+      roughly the cube less fit time, but exact for a stiffness form only up
+      to `p = 2` (the condition is `factor ≥ 2 − 2/p`). `physical_domain`'s
+      docstring carries the measured order-1-to-7 comparison, where factor
+      `1` stops converging after `p = 2`.
     - `target_residual`: target L² residual for the moment fit. The exact
       kernel reaches far below the `1e-6` default in a single NNLS solve,
       so this only bounds a small conditioning retry (a denser candidate
@@ -952,15 +956,19 @@ indicator representations are intentionally not supported.
     is unchanged — it just iterates `zip(points, weights)`.
 
   - **Moment-fit defaults**: moment-fit basis order = `moment_order_factor
-    × max(cell_order)` per axis over the region's parent cells; exact tensor
-    Legendre moments from the Saye volume rule; a single Lawson–Hanson
-    NNLS solve (`NonNegLeastSquares.jl`) selects ≤ `nbasis` non-negative
-    weights; up to 3 attempts, retrying only with a denser candidate cloud
-    for NNLS conditioning (higher fiber Gauss order *and* an eight-fold
-    larger candidate budget per attempt), never with more subdivision; if
-    no attempt fits, the raw volume rule is used as a fallback rather than
-    dropping the cell. Rules are cached by canonicalized region bounds +
-    moment order.
+    × max(cell_order)` per axis over the region's parent cells, the factor
+    defaulting to `1`; exact tensor Legendre moments from the Saye volume
+    rule; a single Lawson–Hanson NNLS solve (`NonNegLeastSquares.jl`) selects
+    ≤ `nbasis` non-negative weights from a candidate cloud drawn by even
+    fractional spacing over the volume rule (an integer stride aliases
+    against the fiber Gauss count and draws a degenerate cloud); up to 3
+    attempts, retrying only with a denser cloud — a larger cloud spans a
+    wider cone and so admits a non-negative exact solution the smaller one
+    did not — never with more subdivision; `target_residual` bounds that
+    retry and is **relative** to `‖m‖`, since the residual carries the units
+    of a moment; if no attempt fits, the raw volume rule is used as a
+    fallback rather than dropping the cell. Rules are cached by canonicalized
+    region bounds + moment order.
 
   - **Diagnostics**: the FCM statistics on `diagnostics(model, solution)`
     are `cut_region_count`, `fit_failure_count`,
