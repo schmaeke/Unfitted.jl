@@ -485,6 +485,10 @@ function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T},
     # keeps the highest fiber Gauss order — the most accurate of the three.
     saye_pts = SVector{D,T}[]
     saye_ws = T[]
+    # L² norm of the moment vector of the attempt last run — the scale both
+    # residual thresholds below are taken relative to. It outlives the loop for the
+    # same reason the raw rule does.
+    moment_scale = zero(T)
     for attempt in 1:_MAX_IMPLICIT_ATTEMPTS
         # Exact moments at q0; denser candidate clouds on retry improve NNLS
         # conditioning without changing the (already exact) moments. Density
@@ -496,6 +500,24 @@ function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T},
                                                        lipschitz=leaf_ls)
         isempty(saye_pts) && return SVector{D,T}[], T[], zero(T), :empty
         moments = _moments_from_rule(saye_pts, saye_ws, region_box, moment_order)
+        # `target_residual` is a RELATIVE tolerance, so the comparison needs the
+        # scale of the right-hand side. `‖A w − m‖` carries the units of a moment,
+        # and `m₀ = ∫_{Ω∩R} 1 dx` is the cut volume, so a bare absolute constant is
+        # not a tolerance at all but a statement about the size of the cell: at a
+        # cell extent of 0.125 in 3D, `‖m‖ ≈ 1e-3`, and a 1e-6 absolute target
+        # accepts a 1e-3 *relative* error. Measured consequence, on the space-time
+        # cone fixture at moment order (8,8,8): a degenerate candidate cloud fitted
+        # to 5.2e-4 relative and was accepted as `:fitted`, because 5.2e-4 × 1.4e-3
+        # = 7.3e-7 slips under 1e-6. `_NNLS_WEIGHT_TOL` is scaled for exactly this
+        # reason, and `test/test_fcm.jl`'s cut-volume-relative weight-cutoff test is
+        # the same contract one level down.
+        #
+        # Every kernel weight is a product of a positive Gauss weight, a positive
+        # fiber half-length and a positive base weight, so `m₀ > 0` and this is
+        # strictly positive on a non-empty rule. Were it ever zero the comparisons
+        # below would simply fail and the cell would take the `:fallback` path,
+        # which is the safe direction.
+        moment_scale = norm(moments)
         candidates = _cap_candidates(saye_pts, moment_order, _candidate_budget(attempt))
         kept, kept_ws, residual = _solve_moment_fit(moments, candidates, region_box, moment_order,
                                                     sum(saye_ws))
@@ -509,7 +531,7 @@ function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T},
         if residual < best_res
             best_pts, best_ws, best_res = candidates[kept], kept_ws, residual
         end
-        best_res <= target && return best_pts, best_ws, best_res, :fitted
+        best_res <= target * moment_scale && return best_pts, best_ws, best_res, :fitted
     end
     # Short of `target` but inside the failure threshold, the compressed fit is
     # still the rule to use — that band is ordinary approximation error on a
