@@ -17,7 +17,7 @@
 # ── Weak forms and pointwise channels ─────────────────────────────────────────
 
 """
-    WeakForm(; bilinear, linear, symmetric=false, component_aware=false)
+    WeakForm(; bilinear=nothing, linear=nothing, symmetric=false, component_aware=false)
 
 Accumulator weak-form callbacks and metadata.
 
@@ -30,7 +30,10 @@ pointwise scalar trial data as [`TrialChannels`](@ref) and returns
 [`TestChannels`](@ref), whose fields are the coefficients that multiply
 the corresponding *test* value and *test* physical gradient. Returning
 a scalar is shorthand for "value coefficient only, no gradient
-coefficient".
+coefficient". A gradient coefficient shorter than the mesh dimension is
+zero-extended into the remaining slots — the shape a field with fewer
+components than the mesh has axes produces — while a longer one raises a
+`DimensionMismatch`; see [`TestChannels`](@ref).
 
 The `linear` callback represents the integrand of the linear form
 
@@ -40,6 +43,25 @@ evaluated at a single quadrature point. `linear(q)` follows the same
 return convention; the assembly path then contracts the returned
 `TestChannels` against the test basis value and gradient to produce one
 entry of the right-hand side per active dof.
+
+Both callbacks default to `nothing`, so a form declares only the sides it
+actually has: a bilinear-only form to hand to [`block`](@ref), a linear-only
+form to hand to [`loadform`](@ref). A form declaring neither side describes no
+contribution at all and raises `ArgumentError` — `symmetric` and
+`component_aware` carry no integrand and do not rescue it.
+
+An absent side is *absent*, not zero: nothing substitutes a zero callback for
+it. Attach a one-sided form *directly* only on the side it declares —
+[`block`](@ref) reads `bilinear` and [`loadform`](@ref) reads `linear`, which
+makes that pairing the natural one, while the wrong pairing reaches the
+assembly loop with an uncallable `nothing` and raises a `MethodError` instead
+of contributing zero.
+
+The single-field `Problem(V, form)` / `Problem(u, form)` constructors attach
+both sides of one form, and read the declaration to decide which: a one-sided
+form there yields a problem carrying that side alone. A bilinear-only form is
+the Laplace-with-boundary-data shape — an operator with no load, driven
+entirely by its inhomogeneous Dirichlet data — and needs no stub to say so.
 
 For component (vector) fields, pass `component_aware = true` and define
 `bilinear(q, trial, test_component)` and `linear(q, test_component)`.
@@ -64,7 +86,10 @@ struct WeakForm{B,L}
     component_aware::Bool
 end
 
-function WeakForm(; bilinear, linear, symmetric::Bool=false, component_aware::Bool=false)
+function WeakForm(; bilinear=nothing, linear=nothing, symmetric::Bool=false,
+                  component_aware::Bool=false)
+    (bilinear === nothing && linear === nothing) &&
+        throw(ArgumentError("a WeakForm needs a bilinear part, a linear part, or both"))
     return WeakForm{typeof(bilinear),typeof(linear)}(bilinear, linear, symmetric, component_aware)
 end
 
@@ -125,6 +150,16 @@ contribution sets `value = source` and `gradient = 0`.
 Callbacks may also return a plain scalar, which is interpreted as a pure
 value coefficient with a zero gradient coefficient (see
 `_as_test_channels`).
+
+The gradient coefficient may also be **shorter** than the mesh dimension
+`D`, in which case assembly zero-extends it into the remaining slots. That
+is what a field with fewer components than the mesh has axes produces — a
+`C`-component displacement on a `D`-axis space-time mesh has a `C × C`
+stress, whose rows are `C`-length coefficients — and the axes it does not
+reach are the ones the field carries no component for, where the flux is
+genuinely zero. A coefficient **longer** than `D` names a flux along an
+axis the mesh does not have and raises a `DimensionMismatch` rather than
+being truncated.
 """
 struct TestChannels{D,T<:Real}
     value::T
@@ -146,12 +181,14 @@ end
 _zero_gradient(::Val{D}, ::Type{T}) where {D,T} = SVector{D,T}(ntuple(_ -> zero(T), Val(D)))
 
 # Coerce a callback return to a `TestChannels{D,T}` of the assembly's
-# scalar type. Three dispatched cases:
+# scalar type. Four dispatched cases:
 #
 #   * The callback already returned a `TestChannels{D,T}` — pass through.
 #   * The callback returned a `TestChannels{D, T'}` with a different
 #     scalar type — convert in-place.
 #   * The callback returned a scalar — wrap as a value-only channel.
+#   * The callback returned a channel whose gradient is *shorter* than the
+#     mesh dimension — zero-extend it (see the block below).
 _as_test_channels(channels::TestChannels{D,T}, ::Val{D}, ::Type{T}) where {D,T<:Real} = channels
 
 function _as_test_channels(channels::TestChannels{D}, ::Val{D}, ::Type{T}) where {D,T<:Real}
@@ -160,6 +197,36 @@ end
 
 function _as_test_channels(value::Number, ::Val{D}, ::Type{T}) where {D,T<:Real}
     return TestChannels{D,T}(convert(T, value), _zero_gradient(Val(D), T))
+end
+
+# A gradient coefficient shorter than the mesh dimension, zero-extended into
+# the remaining slots.
+#
+# A short coefficient is legitimate, and the space-time case is where it comes
+# from: a field of `C` components on a mesh of `D = C + 1` axes (the last axis
+# time) has a `C × C` stress, and the row of it that the test component selects
+# is a `C`-length gradient coefficient, while assembly contracts against the
+# `D`-length test gradient. The slots the coefficient does not reach are the
+# axes the field carries no component for, and the callback's flux along them
+# really is zero, so extending by zero records what the callback said rather
+# than patching what it forgot.
+#
+# The long direction is an error and not a truncation. A coefficient longer
+# than the mesh dimension names a flux along an axis that does not exist;
+# dropping the surplus slots would quietly delete a term the callback asked
+# for, and the resulting operator would still be symmetric, still solve and
+# still converge — the same silent wrongness this method exists to remove from
+# the short direction. The two methods above tie `TestChannels{D}` to `Val{D}`
+# and are strictly more specific, so this one is reached only when `K ≠ D` and
+# the guard is the only thing standing between the two directions.
+function _as_test_channels(channels::TestChannels{K}, ::Val{D}, ::Type{T}) where {K,D,T<:Real}
+    K < D || throw(DimensionMismatch("a test gradient coefficient of length $K cannot be used on " *
+                                     "a $D-dimensional mesh: it names a flux along an axis the " *
+                                     "mesh does not have"))
+    gradient = channels.gradient
+    return TestChannels{D,T}(convert(T, channels.value),
+                             SVector{D,T}(ntuple(i -> i ≤ K ? convert(T, gradient[i]) : zero(T),
+                                                 Val(D))))
 end
 
 # Scalar contraction `channels.value × test_value`. Used by the Dirichlet
@@ -280,6 +347,20 @@ Wrap `form` as the bilinear contribution from `trial_field` (columns) to
 a [`BoundarySelector`](@ref), the contribution integrates over that
 facet of `∂Ω` instead of the volume — the user-supplied form receives
 `q.normal` and `q.sides` on every quadrature point.
+
+A block carries `form.bilinear` and nothing else. A [`WeakForm`](@ref) that
+also declares a `linear` part contributes nothing to the right-hand side
+through `block`: assembly reads the load side only from the [`LoadForm`](@ref)s
+in a problem's `loads`. The linear part of a two-sided form therefore has to be
+attached separately with [`loadform`](@ref) — or, for the plain `ℓ(v) = ∫_Ω f v dx`
+shape, with [`source_load`](@ref). Omitting it leaves the homogeneous system,
+which assembles, solves, and reports a clean residual, so the omission surfaces
+only as a wrong answer.
+
+The single-field `Problem(V, form)` / `Problem(u, form)` constructors do attach
+both sides of a form that declares both. That is why the habit the convenience
+path teaches does not carry over here: on the multi-field path the two sides are
+two separate attachments.
 """
 function block(test_field::Field, trial_field::Field, form; on=nothing)
     return BlockForm(test_field.name, trial_field.name, form, on)
@@ -341,7 +422,9 @@ Three convenience constructors:
 
   - **Scalar over a space** — wraps `V` in an implicit field named `:u`,
     pairs it with itself in the bilinear `block(u, u, form)` and as the
-    load test field `loadform(u, form)`. Symmetry inherited from `form`.
+    load test field `loadform(u, form)`, attaching each side only when
+    `form` declares it (see [`WeakForm`](@ref)). Symmetry inherited from
+    `form`.
   - **Component-field shorthand** — same pattern but with a caller-named
     [`Field`](@ref), so vector fields and custom names work.
   - **Multi-field** — explicit `(field₁, field₂, …)` tuple plus a list
@@ -356,9 +439,18 @@ them together. Single-space problems are the common special case.
 """
 Problem(V::Space{D,T}, form; dirichlet=[]) where {D,T} = Problem(field(:u, V), form; dirichlet)
 
+# The single-field shorthand attaches one form to both sides, so it attaches
+# each side only where the form declares one. `WeakForm` required both callbacks
+# until it learned to take `nothing`, so on every form constructible before then
+# both branches are taken and this is a no-op; what it adds is the one-sided
+# case, where a `nothing` would otherwise reach the assembly loop and raise. The
+# bilinear-only direction is the useful one: an operator with no load, driven
+# entirely by inhomogeneous Dirichlet data, which is Laplace with boundary data
+# and which used to need a dead `linear = q -> 0.0` to say so.
 function Problem(u::Field, form; dirichlet=[])
-    return Problem((u,); blocks=(block(u, u, form),), loads=(loadform(u, form),), dirichlet,
-                   symmetric=form.symmetric)
+    blocks = form.bilinear === nothing ? () : (block(u, u, form),)
+    loads = form.linear === nothing ? () : (loadform(u, form),)
+    return Problem((u,); blocks, loads, dirichlet, symmetric=form.symmetric)
 end
 
 # Collect the field names of a problem's field tuple and check for

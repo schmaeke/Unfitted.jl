@@ -313,8 +313,7 @@ function couple(u_a::Field, u_b::Field, geometry::BoundaryMesh, form::InterfaceF
                                                                                        (test=test_side,
                                                                                         trial=trial_side),
                                                                                        trial, tc),
-                                                linear=(q, tc) -> 0.0, symmetric=form.symmetric,
-                                                component_aware=true)
+                                                symmetric=form.symmetric, component_aware=true)
     return (block(u_a, u_a, side_form(:a, :a); on=iface),
             block(u_a, u_b, side_form(:a, :b); on=iface),
             block(u_b, u_a, side_form(:b, :a); on=iface),

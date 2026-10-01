@@ -260,6 +260,122 @@ end
     @test norm(K * stretch) > 1.0e-3 * scale
 end
 
+# ── Space-time shape: fewer field components than the mesh has axes ───────────
+
+@testset "UnfittedTensorsExt: the strain is sized by the field, not by the mesh" begin
+    # Three mesh axes, two field components — the space-time shape, where the
+    # last axis is time and the displacement carries one component per
+    # *spatial* axis. One prepared model serves every assertion below: the
+    # suite is compile-bound, so a second discretisation would cost more than
+    # it proves.
+    λ, μ = 1.3, 0.7
+    isotropic(i, j, k, l) = λ * (i == j) * (k == l) +
+                            μ * ((i == k) * (j == l) + (i == l) * (j == k))
+    ℂ_mesh = SymmetricTensor{4,3,Float64}(isotropic)
+    ℂ_field = SymmetricTensor{4,2,Float64}(isotropic)
+
+    V = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(2, 2, 2), order=1)
+    u = field(:u, V; components=2)
+    @test u isa Field{3,Float64,2}
+    model = prepare(Problem((u,)))
+    form(bilinear) = WeakForm(bilinear=bilinear, linear=(q, c) -> 0.0, symmetric=true,
+                              component_aware=true)
+
+    # The one-argument strain is a 3×3 tensor here — the defect — while the
+    # two-argument one is the 2×2 tensor the field actually has.
+    mesh_bilinear(q, trial, c) = TestChannels(0.0, ℂ_mesh ⊡ symmetric_gradient(trial), c)
+    field_bilinear(q, trial, c) = TestChannels(0.0, ℂ_field ⊡ symmetric_gradient(trial, u), c)
+    A_mesh = Matrix(assemble_matrix(model, block(u, u, form(mesh_bilinear))))
+    A_field = Matrix(assemble_matrix(model, block(u, u, form(field_bilinear))))
+
+    # The surplus the mesh-sized strain carries, written from scratch as an
+    # ordinary component-diagonal stiffness along the last axis rather than
+    # derived from either form above, so the identity below is a genuine
+    # cross-check and not a restatement. A component-unaware form supplies the
+    # `trial.component == test_component` pattern itself.
+    time_bilinear(q, trial) = TestChannels(0.0, SVector(0.0, 0.0, μ * trial.gradient[3]))
+    A_time = Matrix(assemble_matrix(model,
+                                    block(u, u,
+                                          WeakForm(bilinear=time_bilinear, linear=q -> 0.0,
+                                                   symmetric=true))))
+
+    # The load-bearing assertion is the exact identity
+    #
+    #     A_mesh − A_field = μ ∫_Q ∂ₜu · ∂ₜv,
+    #
+    # because it states the defect in the language of the defect. A tolerance
+    # on a solution cannot: the mesh-sized operator is symmetric, positive
+    # semi-definite, solves to roundoff and converges under refinement, so a
+    # coincidentally close answer satisfies any bound placed on it. This
+    # equality holds only if the surplus is exactly the spurious
+    # time-stiffness and nothing else, and it breaks the moment either strain
+    # changes size.
+    scale = opnorm(A_mesh)
+    @test scale > 0
+    @test opnorm(A_time) > 0.1 * scale               # the defect is not a rounding matter
+    @test norm(A_mesh - A_field - A_time) < 1.0e-13 * scale
+
+    # The two-argument form returns a genuine 2×2 tensor — not a 3×3 one with
+    # the time slots zeroed, which would still report the wrong trace to
+    # `dev` and the wrong invariants to any material law — and it agrees with
+    # the mesh-sized result exactly where the two overlap.
+    trial = TrialChannels(1, 1.0, SVector(0.7, -1.3, 0.4))
+    ε_field = symmetric_gradient(trial, u)
+    ε_mesh = symmetric_gradient(trial)
+    @test ε_field isa SymmetricTensor{2,2,Float64}
+    @test ε_mesh isa SymmetricTensor{2,3,Float64}
+    @test ε_field === symmetric_gradient(trial, Val(2))
+    for i in 1:2, j in 1:2
+        @test ε_field[i, j] == ε_mesh[i, j]
+    end
+
+    # The short gradient coefficient a C×C stress produces is zero-extended
+    # into the axes the field has no component for.
+    @test Unfitted._as_test_channels(TestChannels(1.5, SVector(2.0, 3.0)), Val(3), Float64) ===
+          TestChannels(1.5, SVector(2.0, 3.0, 0.0))
+
+    # Both guards refuse the long direction loudly. Truncating either would be
+    # a fresh instance of the silent wrongness this testset exists to pin.
+    @test_throws DimensionMismatch symmetric_gradient(trial, Val(4))
+    @test_throws DimensionMismatch Unfitted._as_test_channels(TestChannels(0.0,
+                                                                           SVector(1.0, 2.0, 3.0)),
+                                                              Val(2), Float64)
+
+    # The ergonomic three-argument `TestChannels(value, σ, component)` return
+    # path died inside assembly with a `MethodError` on `_as_test_channels`
+    # whenever the stress was smaller than the mesh, which is every `C ≠ D`
+    # field. Drive it through a whole solve.
+    solved = prepare(Problem(u,
+                             WeakForm(bilinear=field_bilinear,
+                                      linear=(q, c) -> (c == 1 ? 1.0 : 0.0), symmetric=true,
+                                      component_aware=true);
+                             dirichlet=[dirichlet(SVector(0.0, 0.0); on=boundary(:all))]))
+    assemble!(solved)
+    sol = solve!(solved)
+    @test active_unknowns(solved) > 0
+    @test norm(solved.matrix * sol.coefficients - solved.rhs) < 1.0e-10 * norm(solved.rhs)
+    @test norm(sol.coefficients) > 0
+
+    # `gradient_tensor`'s one `Val` argument sizes both tensor indices, so a
+    # `C ≠ D` field has no square Jacobian to read: `Val(C)` truncates the
+    # columns to the first `C` axes and `Val(D)` runs off the components the
+    # field carries. Pinned so the docstring saying exactly that stays honest.
+    coefficients = [1.0 + 0.1 * i for i in 1:active_unknowns(model)]
+    visited = Ref(0)
+    foreach_quadrature_point(model; state=coefficients) do q
+        visited[] += 1
+        visited[] == 1 || return nothing
+        G = gradient_tensor(q.state, :u, Val(2))
+        for i in 1:2, j in 1:2
+            @test G[i, j] == field_gradient(q.state, :u, i)[j]
+        end
+        @test_throws BoundsError gradient_tensor(q.state, :u, Val(3))
+        @test_throws MethodError gradient_tensor(q.state, u)
+        return nothing
+    end
+    @test visited[] > 0
+end
+
 # ── Hot-loop contract: the conversions must not allocate ──────────────────────
 
 # Every conversion the assembly path uses, measured over a warmed loop inside

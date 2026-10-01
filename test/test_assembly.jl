@@ -50,6 +50,90 @@ end
     @test diagnostics(model).symmetry_residual ≈ 0.0 atol = 1.0e-13
 end
 
+@testset "a WeakForm declares only the sides it has" begin
+    # ∫_Ω ∇v ⋅ ∇u dx with no load, and ∫_Ω 1 ⋅ v dx with no operator: each side
+    # stands alone, and neither writes the zero stub the constructor used to
+    # demand.
+    bilinear_only = WeakForm(bilinear=(q, trial) -> TestChannels(0.0, trial.gradient),
+                             symmetric=true)
+    @test bilinear_only.linear === nothing
+    @test bilinear_only.bilinear !== nothing
+
+    linear_only = WeakForm(linear=q -> 1.0)
+    @test linear_only.bilinear === nothing
+    @test linear_only.linear !== nothing
+
+    # Neither side is no contribution at all; the metadata flags carry no
+    # integrand and do not stand in for one.
+    @test_throws ArgumentError WeakForm()
+    @test_throws ArgumentError WeakForm(symmetric=true, component_aware=true)
+
+    # The shape the space-time example uses: the operator arrives as a block and
+    # the load as its own `loadform`. The reference values are the 1D Poisson
+    # ones from the testset above, because this is that problem spelled in two
+    # halves.
+    V = space(box((0.0,), (1.0,)); cells=2, order=1)
+    u = field(:u, V)
+    model = prepare(Problem((u,); blocks=(block(u, u, bilinear_only),),
+                            loads=(loadform(u, linear_only),),
+                            dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    @test model.problem.symmetric
+
+    assemble!(model)
+    @test size(model.matrix) == (1, 1)
+    @test model.matrix[1, 1] ≈ 4.0
+    @test model.rhs[1] ≈ 0.5
+
+    solution = solve!(model)
+    @test solution.coefficients[1] ≈ 0.125
+    @test solution.diagnostics.residual_norm < 1.0e-12
+end
+
+@testset "the single-field shorthand attaches the sides the form declares" begin
+    V = space(box((0.0,), (1.0,)); cells=2, order=1)
+    bilinear_only = WeakForm(bilinear=(q, trial) -> TestChannels(0.0, trial.gradient),
+                             symmetric=true)
+    linear_only = WeakForm(linear=q -> 1.0)
+
+    # Laplace with boundary data: an operator, no load, and a solution driven
+    # entirely by the inhomogeneous Dirichlet datum, which used to need a dead
+    # `linear = q -> 0.0` to express. The rhs is the Dirichlet column
+    # elimination alone, so u ≡ 2 and rhs = 4 × 2.
+    model = prepare(Problem(V, bilinear_only; dirichlet=[dirichlet(2.0; on=boundary(:all))]))
+    @test length(model.problem.blocks) == 1
+    @test isempty(model.problem.loads)
+
+    assemble!(model)
+    @test model.matrix[1, 1] ≈ 4.0
+    @test model.rhs[1] ≈ 8.0
+
+    solution = solve!(model)
+    @test solution.coefficients[1] ≈ 2.0
+    @test value(solution, model, (0.5,)) ≈ 2.0
+    @test value(solution, model, (0.25,)) ≈ 2.0
+
+    # The other side is treated the same way: a linear-only form yields a
+    # load-only problem. Whether that problem is solvable is the caller's
+    # business; what matters here is that neither side is invented.
+    load_only = prepare(Problem(V, linear_only))
+    @test isempty(load_only.problem.blocks)
+    @test length(load_only.problem.loads) == 1
+
+    # A *direct* attachment on the side a form does not declare is still an
+    # error and not a silent zero — the `WeakForm` docstring says so, and this
+    # keeps it honest. Serial assembly so the `MethodError` arrives unwrapped
+    # rather than inside a `CompositeException` from a worker task.
+    u = field(:u, V)
+    wrong_block = prepare(Problem((u,); blocks=(block(u, u, linear_only),),
+                                  dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    @test_throws MethodError assemble!(wrong_block; threaded=false)
+
+    wrong_load = prepare(Problem((u,); blocks=(block(u, u, bilinear_only),),
+                                 loads=(loadform(u, bilinear_only),),
+                                 dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    @test_throws MethodError assemble!(wrong_load; threaded=false)
+end
+
 @testset "2D scalar H1 assembly is symmetric positive definite" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(1, 1), order=2)
