@@ -191,6 +191,28 @@ and to build the reference-to-physical affine map below.
 """
 center(b::AxisBox) = (b.lower + b.upper) / 2
 
+# The 2ᴰ children of one bisection of `b` on every axis, ordered by the
+# lexicographic bit pattern that selects `lower` (bit 0) or the center (bit 1)
+# per axis — the same enumeration shape `_classify_box` and the implicit
+# kernel's subdivision use, hoisted here so a third consumer need not repeat it.
+#
+# Returns `nothing` when the bisection would be degenerate. On a box whose
+# extent has reached the floating-point floor the midpoint coincides with a
+# bound on some axis, and `AxisBox`'s strict `lower[i] < upper[i]` invariant
+# would reject the child; the caller stops subdividing instead. The guard
+# mirrors `_bisect` in `implicit.jl`, which halts on the same condition rather
+# than looping on a midpoint that no longer moves.
+function _box_children(b::AxisBox{D,T}) where {D,T}
+    c = center(b)
+    all(d -> b.lower[d] < c[d] < b.upper[d], 1:D) || return nothing
+    return ntuple(Val(2^D)) do i
+        bits = ntuple(d -> (i - 1) >> (d - 1) & 1, D)
+        lower = SVector{D,T}(ntuple(d -> bits[d] == 0 ? b.lower[d] : c[d], D))
+        upper = SVector{D,T}(ntuple(d -> bits[d] == 0 ? c[d] : b.upper[d], D))
+        AxisBox{D,T}(lower, upper)
+    end
+end
+
 # Strict containment without tolerance: a point lies in the box iff every
 # coordinate satisfies `lower[i] ≤ x[i] ≤ upper[i]`. Use `contains_point`
 # instead when the query is geometrically motivated and a positive
