@@ -361,3 +361,223 @@ end
     @test occursin("qp_quadrature_levels_1.vtp", bundle_xml)
     @test occursin("qp_quadrature_levels_1_2.vtp", bundle_xml)
 end
+
+# Per-cell x-extent of every quad in a parsed 2D `.vtu`, used by the
+# `cut_depth` tests below: the refinement is uniform per level, so a cell's
+# width identifies the tree level it came from.
+function _vtu_quad_widths(xml)
+    points = reshape(_vtu_floats(xml, "Points"), 3, :)
+    connectivity = reshape(_vtu_ints(xml, "connectivity"), 4, :)
+    return [begin
+                xs = @view points[1, connectivity[:, c] .+ 1]
+                maximum(xs) - minimum(xs)
+            end
+            for c in axes(connectivity, 2)]
+end
+
+# Which cells of a parsed 2D `.vtu` straddle ∂Ω, judged by the sign of the
+# exported `level_set` at their corners — exactly the test ParaView's Clip
+# applies when it decides whether to cut a cell.
+function _vtu_mixed_cells(xml)
+    phi = _vtu_floats(xml, "level_set")
+    connectivity = reshape(_vtu_ints(xml, "connectivity"), 4, :)
+    return [c
+            for c in axes(connectivity, 2)
+            if !allequal(phi[i + 1] <= 0 for i in connectivity[:, c])]
+end
+
+# A disk cutting every cell of a 2×2 mesh: four regions, all `:cut_fitted`.
+function _cut_depth_disk_model()
+    phi_disk(x) = sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.4
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    physical = physical_domain(phi_disk; lipschitz=1.0, alpha=1.0, subcell_length_scale=0.125,
+                               max_depth=3)
+    V = space(omega; cells=(2, 2), order=1, physical=physical)
+    model = prepare(poisson(V; source=0.0))
+    solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
+                        Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    return phi_disk, model, solution
+end
+
+@testset "cut_depth bisects only the sub-cells ∂Ω passes through" begin
+    # Four `:cut_fitted` regions of width 0.5. Each level of `cut_depth`
+    # bisects only the marked boxes, so the cell count grows far slower than
+    # the 4ᵏ of a uniform 2D refinement (4, 16, 64, 256) once boxes start
+    # falling away from the boundary.
+    phi_disk, model, solution = _cut_depth_disk_model()
+    dir = mktempdir()
+
+    for (depth, cells) in ((0, 4), (1, 16), (2, 52), (3, 160))
+        write_vtk(joinpath(dir, "d$(depth)"), solution, model; subdivisions=:none, cut_depth=depth,
+                  ascii=true, append=false, compress=false,
+                  point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+        xml = read(joinpath(dir, "d$(depth)_data.vtu"), String)
+        widths = _vtu_quad_widths(xml)
+        @test length(widths) == cells
+
+        # The crack invariant, stated executably: every cell ParaView will cut
+        # sits at the finest level, so two of them meeting at a face carry
+        # identical corner coordinates and their clip facets agree exactly.
+        # Coarser cells survive only where φ has one sign, and those contribute
+        # no cut surface at all — which is why no 2:1 balance pass is needed.
+        finest = 0.5 / 2^depth
+        mixed = _vtu_mixed_cells(xml)
+        @test !isempty(mixed)
+        @test all(w -> w ≈ finest, widths[mixed])
+        # Every width is a power-of-two fraction of the 0.5 base box, and the
+        # finest level is always reached. The coarsest need not survive: this
+        # disk crosses all four regions, so at depth ≥ 1 every base box is
+        # marked and nothing stays at 0.5.
+        @test all(w -> any(l -> w ≈ 0.5 / 2^l, 0:depth), widths)
+        @test minimum(widths) ≈ finest
+    end
+end
+
+@testset "cut_depth keeps level_set exact on the refined path" begin
+    # The refinement must not interpolate φ: every emitted vertex, including
+    # the ones the tree introduced, carries `levelset_value` evaluated there.
+    phi_disk, model, solution = _cut_depth_disk_model()
+    dir = mktempdir()
+    write_vtk(joinpath(dir, "exact"), solution, model; subdivisions=:none, cut_depth=2, ascii=true,
+              append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+
+    xml = read(joinpath(dir, "exact_data.vtu"), String)
+    points = reshape(_vtu_floats(xml, "Points"), 3, :)
+    @test _vtu_floats(xml, "level_set") ≈ [phi_disk(view(points, :, i)) for i in axes(points, 2)] atol = 1.0e-14
+end
+
+@testset "cut_depth hands cell callbacks the refined leaf" begin
+    # `context.cell` must be the box actually emitted, not the `subdivisions`
+    # box it was carved from — the subtlest plumbing error this change can
+    # introduce, and invisible in the geometry.
+    _, model, solution = _cut_depth_disk_model()
+    dir = mktempdir()
+    write_vtk(joinpath(dir, "leaf"), solution, model; subdivisions=:none, cut_depth=2, ascii=true,
+              append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),),
+              cell_data=(w=(u, c, x, xi) -> c.cell.upper[1] - c.cell.lower[1],))
+
+    xml = read(joinpath(dir, "leaf_data.vtu"), String)
+    @test sort(unique(round.(_vtu_floats(xml, "w"); digits=12))) == [0.125, 0.25]
+    @test _vtu_floats(xml, "w") ≈ _vtu_quad_widths(xml)
+end
+
+@testset "cut_depth spares full and fictitious regions" begin
+    # A disk small enough to leave whole cells inside and whole cells outside
+    # it. `keep_fictitious` holds the outside cells in the layout — α alone
+    # does not — so all three region kinds are present at once and only the cut
+    # ones may be refined.
+    phi_disk(x) = sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.3
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    physical = physical_domain(phi_disk; lipschitz=1.0, alpha=1.0, keep_fictitious=true,
+                               subcell_length_scale=1 / 32, max_depth=4)
+    V = space(omega; cells=(8, 8), order=1, physical=physical)
+    model = prepare(poisson(V; source=0.0))
+    solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
+                        Unfitted.SolverDiagnostics(:manual, 0.0, true))
+
+    plan = Unfitted.integration_plans(model)[1]
+    kinds = [r.quadrature.kind for r in plan.regions]
+    @test :full in kinds
+    @test :fictitious_alpha in kinds
+    uncut = Set(i for (i, k) in pairs(kinds) if k === :full || k === :fictitious_alpha)
+    @test !isempty(uncut)
+
+    dir = mktempdir()
+    write_vtk(joinpath(dir, "mixed"), solution, model; subdivisions=:none, cut_depth=2, ascii=true,
+              append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+    xml = read(joinpath(dir, "mixed_data.vtu"), String)
+    widths = _vtu_quad_widths(xml)
+    region_ids = _vtu_ints(xml, "region_id")
+
+    # Every cell belonging to an uncut region is still a whole base box, and
+    # each such region contributes exactly the one cell it did before: 44
+    # uncut regions, 44 unrefined cells, every one of them 1/8 wide.
+    @test length(uncut) == 44
+    @test count(r -> r in uncut, region_ids) == 44
+    @test all(widths[cell] ≈ 0.125 for (cell, region) in pairs(region_ids) if region in uncut)
+    @test length(widths) > length(uncut)
+end
+
+@testset "cut_depth is inert without a PhysicalDomain and at :none" begin
+    # The non-immersed path must not pay for, or notice, the new keyword, and
+    # `:none` must reproduce the unrefined writer byte for byte.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    V = space(omega; cells=(2, 2), order=1)
+    model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(1.0; on=boundary(:all))]))
+    solution = solve!(model)
+
+    dir = mktempdir()
+    reference = nothing
+    for depth in (:none, 0, 3)
+        write_vtk(joinpath(dir, "plain_$(depth)"), solution, model; subdivisions=2, cut_depth=depth,
+                  ascii=true, append=false, compress=false,
+                  point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+        xml = read(joinpath(dir, "plain_$(depth)_data.vtu"), String)
+        reference === nothing ? (reference = xml) : @test(xml == reference)
+    end
+
+    _, fcm_model, fcm_solution = _cut_depth_disk_model()
+    for depth in (:none, 0)
+        write_vtk(joinpath(dir, "fcm_$(depth)"), fcm_solution, fcm_model; subdivisions=:none,
+                  cut_depth=depth, ascii=true, append=false, compress=false,
+                  point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+    end
+    @test read(joinpath(dir, "fcm_none_data.vtu"), String) ==
+          read(joinpath(dir, "fcm_0_data.vtu"), String)
+end
+
+@testset "cut_depth rejects values outside its budget" begin
+    # The budget is resolved before any file handle exists, so a rejected call
+    # leaves nothing on disk — the same contract `_vtk_bundle_base` keeps for
+    # the dimension and coefficient checks.
+    _, model, solution = _cut_depth_disk_model()
+    dir = mktempdir()
+    for bad in (-1, 9, :deep, 2.5)
+        @test_throws ArgumentError write_vtk(joinpath(dir, "bad"), solution, model; cut_depth=bad,
+                                             subdivisions=:none)
+    end
+    @test isempty(readdir(dir))
+end
+
+@testset "cut_depth survives the series byte-identity contract" begin
+    # A refined frame must still be the same bytes as the solo write it
+    # mirrors: the tree walk may not introduce ordering that depends on
+    # anything but the geometry.
+    _, model, solution = _cut_depth_disk_model()
+    dir = mktempdir()
+    series = vtk_series(joinpath(dir, "run"); frames=joinpath(dir, "frames"))
+    write_vtk(series, 0.0, solution, model; subdivisions=:none, cut_depth=2, ascii=true,
+              append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+    close(series)
+    write_vtk(joinpath(dir, "solo"), solution, model; subdivisions=:none, cut_depth=2, ascii=true,
+              append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+
+    @test read(joinpath(dir, "frames", "frame_0001_data.vtu")) ==
+          read(joinpath(dir, "solo_data.vtu"))
+end
+
+@testset "write_vtk compresses by default" begin
+    # The default is `compress = true`, matching `WriteVTK`'s own. Pinned two
+    # ways: the appended payload really is zlib (the `.vtu` declares the
+    # compressor, and the file is markedly smaller), and the decompressed
+    # content is unchanged — a reader sees the same arrays either way.
+    _, model, solution = _cut_depth_disk_model()
+    dir = mktempdir()
+    pd = (uh=(u, c, x, xi) -> u(c, xi),)
+
+    write_vtk(joinpath(dir, "on"), solution, model; subdivisions=4, cut_depth=:none, point_data=pd)
+    write_vtk(joinpath(dir, "off"), solution, model; subdivisions=4, cut_depth=:none, point_data=pd,
+              compress=false)
+
+    on_xml = read(joinpath(dir, "on_data.vtu"), String)
+    off_xml = read(joinpath(dir, "off_data.vtu"), String)
+    @test occursin("compressor=\"vtkZLibDataCompressor\"", on_xml)
+    @test !occursin("compressor=", off_xml)
+    @test filesize(joinpath(dir, "on_data.vtu")) < filesize(joinpath(dir, "off_data.vtu")) / 2
+
+    # Same numbers underneath: written as parsable text, the two agree exactly.
+    write_vtk(joinpath(dir, "plain"), solution, model; subdivisions=4, cut_depth=:none,
+              point_data=pd, ascii=true, append=false, compress=false)
+    plain_xml = read(joinpath(dir, "plain_data.vtu"), String)
+    @test length(_vtu_floats(plain_xml, "uh")) == length(_vtu_floats(plain_xml, "level_set"))
+end

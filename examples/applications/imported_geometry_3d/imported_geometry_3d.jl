@@ -248,9 +248,19 @@ volume_error = abs(quadrature_volume[] - exact_volume) / exact_volume
 
 # ── Output ──────────────────────────────────────────────────────────────────
 
+# `subdivisions` sizes the sub-cells that resolve the *solution*, so the
+# order-2 default of two per axis is right here. The boundary is a separate
+# question: ParaView reconstructs it from the `level_set` array by interpolating
+# linearly inside each cell, so a sharp picture of the bracket needs small cells
+# where ∂Ω runs — and only there. `cut_depth` bisects exactly those, three times
+# over, giving sixteen sub-cells per axis across the surface for a fraction of
+# what the same resolution would cost applied to every region. The notch's
+# reflex edge is a crease of the mesh level set, where the collapsed φ is only
+# C⁰ and the clip converges at first order, so the edge stays comparatively
+# faceted however deep this goes.
 out = joinpath(@__DIR__, "output", "imported_geometry_3d")
 write_vtk(out, sol, model;
-          point_data=(u=(uh, c, x, xi) -> uh(c, xi), exact=(uh, c, x, xi) -> exact(x)), subdivisions=10)
+          point_data=(u=(uh, c, x, xi) -> uh(c, xi), exact=(uh, c, x, xi) -> exact(x)), cut_depth=3)
 write_quadrature_vtm(out * "_quadrature", model)
 
 print_run_report("L-bracket from a triangle surface — imported-geometry level set",

@@ -398,6 +398,19 @@ end
 # radius, so a center sign whose magnitude exceeds `L·r` is uniform on the box.
 _half_diagonal(b::AxisBox) = norm(b.upper - b.lower) / 2
 
+# Largest Lipschitz constant declared anywhere in the tree, or `Inf` if any leaf
+# declines to declare one. `levelset_value` collapses the tree with max / min /
+# negate, and each of those is non-expansive in its arguments, so the collapsed
+# scalar is itself Lipschitz with this constant. That is what the VTK export's
+# cut refinement needs: it bands on the collapsed φ rather than on the separate
+# leaves, so it needs a constant for φ, not one per leaf. `Inf` propagates — one
+# undeclared leaf leaves the whole tree uncertified, exactly as it does for
+# `_tri`, and the export then falls back to corner signs.
+_levelset_lipschitz(l::Leaf) = float(l.lipschitz)
+_levelset_lipschitz(n::AllOf) = maximum(_levelset_lipschitz, n.parts)
+_levelset_lipschitz(n::AnyOf) = maximum(_levelset_lipschitz, n.parts)
+_levelset_lipschitz(n::Not) = _levelset_lipschitz(n.part)
+
 # ── Cell classifier ───────────────────────────────────────────────────────────
 
 # Three-valued (Kleene) membership certificate over the CSG tree: returns
