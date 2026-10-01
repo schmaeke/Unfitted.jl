@@ -169,19 +169,23 @@ treatment of the edges they share with the excluded ones.
 
 A selector names **grid-aligned** geometry and nothing else. Its facets
 are faces of the background box, partitioned over the cells that touch
-them, and they are *not* trimmed by an immersed [`PhysicalDomain`](@ref):
-integration over `boundary(axis=d, side=s)` covers the whole face of
-every cell that stays active, so where `∂Ω` cuts a face it spends weight
-on the part outside `Ω`, while a cell lying *entirely* outside `Ω` is
-masked inactive and parents nothing — the face shrinks by whole cells but
-never within one. See [`dirichlet`](@ref), [`neumann`](@ref) and
-[`boundary_integral`](@ref) for what each does with the surplus. The
-`cut_facet_region_count` field of [`AssemblyDiagnostics`](@ref) counts how
-many resolved facet regions have part of their face outside `Ω`; a face
-that stays inside `Ω` is integrated correctly even where its cells are
-cut. For the immersed boundary itself, integrate over a
-[`BoundaryMesh`](@ref) instead, which is cut against the grid and carries
-only material-side points.
+them — but what is *integrated* over them is only the part inside `Ω`.
+On an immersed space the rule on a face `∂Ω` crosses is the finite-cell
+moment fit applied to the level set restricted to that face's own affine
+slice, so `boundary_integral(q -> 1.0; on=boundary(axis=d, side=s))`
+returns the measure of `face ∩ Ω`. A cell lying *entirely* outside `Ω` is
+also masked inactive and parents nothing, so a face loses whole cells
+through the mask and the rest of its non-physical area through the rule.
+The `cut_facet_region_count` field of [`AssemblyDiagnostics`](@ref) counts
+how many resolved facet regions needed that trimming; on a straight cut the
+trimmed rule is machine-exact, on a curved one accurate rather than exact,
+and `facet_moment_fit_residual_max` reports how well the fits went.
+
+What a selector does **not** name is the immersed boundary itself. `∂Ω`'s
+grid-aligned part and its immersed part are disjoint and together make up
+`∂Ω`, so integrate the immersed part over a [`BoundaryMesh`](@ref) and add
+the two — see [`boundary_integral`](@ref), which states the closure
+identity the pair satisfies.
 """
 function boundary(selector::Symbol; except=())
     # The no-exclusion path is the original one-line method, and it is reached
@@ -286,20 +290,26 @@ before strong elimination so the constrained dof values reflect the
 correct trace. Homogeneous (constant-zero) data skip the projection
 entirely.
 
-On an immersed space, that projection is taken over the **whole**
-grid-aligned face: a facet region is the entire face of its cells and is
-not trimmed by the level set (see [`boundary`](@ref)), so where `∂Ω` cuts
-the selected face the mass matrix `∫ φᵢ φⱼ ds` and the right-hand side
-`∫ g φᵢ ds` both integrate the fictitious part of the face as well as the
-physical part, and the projected trace values are those of a least-squares
-fit over the larger face. A homogeneous datum is unaffected — the
-projection is skipped outright for one, and `∫ 0 = 0` over any region
-regardless — which is why a Dirichlet condition on a cut face is easy to
-ship without noticing. The `cut_facet_region_count` field of
-[`AssemblyDiagnostics`](@ref) counts the regions whose face leaves `Ω`.
-Which dofs are *constrained* is a separate question, decided per dof key
-by the same grid-aligned face test and likewise independent of the level
-set.
+On an immersed space, that projection is taken over `face ∩ Ω`: where `∂Ω`
+cuts the selected face, the mass matrix `∫ φᵢ φⱼ ds` and the right-hand
+side `∫ g φᵢ ds` are both integrated with the trimmed rule
+(see [`boundary`](@ref)), so `value` is only ever evaluated at points
+inside `Ω` and the fitted trace is the least-squares fit over the physical
+face. A datum defined only on `Ω` — a square root, a reciprocal distance,
+an interpolated field from a prior solution — is therefore usable on a cut
+face.
+
+Two consequences worth knowing. Trimming is a small-cut generator for the
+trace mass exactly as a thin cut cell is one for the stiffness matrix: a
+face whose physical sliver is tiny gives a near-singular mass, and
+`min_relative_facet_measure` on [`AssemblyDiagnostics`](@ref) reports the
+worst such ratio. And which dofs are *constrained* is a separate question,
+decided per dof key by the grid-aligned face test alone, so a dof can be
+constrained while the trimmed support it would be fitted on carries no
+measure at all; the trace solve then falls back from a Cholesky
+factorisation to a pseudoinverse and assigns it the minimum-norm value.
+`α` on the [`PhysicalDomain`](@ref) is honoured on facets and is the knob
+for both — it defaults to `0`, so neither is stabilised unless asked for.
 
 A `boundary(:all; except = …)` selector constrains its kept faces *closed*
 (see [`boundary`](@ref)): a dof on the edge between a kept face and an
@@ -514,16 +524,17 @@ compose [`block`](@ref) and [`loadform`](@ref) directly with
 `on = …` and your own [`WeakForm`](@ref) — the package supplies the
 integration primitives, not the constitutive choice.
 
-On an immersed space the load is integrated over the **whole**
-grid-aligned face named by `on`: a facet region is the entire face of its
-cells and is not trimmed by the level set (see [`boundary`](@ref)), so a
-flux placed on a face that `∂Ω` cuts is applied over the fictitious part of
-the face too, and `ℓ(v)` is correspondingly too large. A zero `value` is
-unaffected. The same holds for any Robin or Nitsche term composed by hand
-with `on = boundary(…)`. The `cut_facet_region_count` field of
-[`AssemblyDiagnostics`](@ref) counts the regions whose face leaves `Ω`;
-a flux on the immersed boundary itself belongs on a
-[`BoundaryMesh`](@ref), which is cut against the grid.
+On an immersed space the load is integrated over `face ∩ Ω` for the face
+named by `on` (see [`boundary`](@ref)), so a flux placed on a face that
+`∂Ω` cuts is applied to the physical part of that face and `ℓ(v)` carries
+the physical measure. The same holds for any Robin or Nitsche term composed
+by hand with `on = boundary(…)`. On a straight cut the rule is
+machine-exact; on a curved one it is accurate and not exact, and
+`cut_facet_region_count` / `facet_moment_fit_residual_max` on
+[`AssemblyDiagnostics`](@ref) say how many faces are in that regime and how
+well their fits went. A flux on the immersed boundary itself belongs on a
+[`BoundaryMesh`](@ref): the two parts of `∂Ω` are disjoint, so the total
+flux is the sum of the two integrals.
 
 A `boundary(:all; except = …)` selector puts the flux on its kept faces
 taken *closed* (see [`boundary`](@ref)): the load is the sum over those

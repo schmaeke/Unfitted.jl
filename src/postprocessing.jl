@@ -1092,19 +1092,27 @@ Integrate a user callback over a portion of the boundary.
     `recommended_quadrature_order(level.basis, cell_order(level, cell))`
     over the region's covering parent cells. Overlay levels whose own mesh face
     coincides with the selected facet contribute their own segment;
-    level masking is respected. The facet is the whole grid-aligned face and is
-    **not** trimmed by an immersed [`PhysicalDomain`](@ref) (see
-    [`boundary`](@ref)), so on a face that `∂Ω` cuts the returned value
-    includes the fictitious part of the face: `boundary_integral(q -> 1.0,
-    model; on=boundary(axis=d, side=s))` returns the face's full measure, not
-    the measure of its physical part. Level *masking* is what the integration
-    follows, and a whole-cell fictitious fold is a mask, so the face shrinks by
-    whole cells but never within one. The `cut_facet_region_count` field of
-    [`AssemblyDiagnostics`](@ref) counts how many of the integrated regions have
-    part of their face outside `Ω`.
+    level masking is respected. On an immersed [`PhysicalDomain`](@ref) the
+    integral runs over `face ∩ Ω` (see [`boundary`](@ref)):
+    `boundary_integral(q -> 1.0, model; on=boundary(axis=d, side=s))` returns
+    the measure of the face's physical part, and `integrand` is called only at
+    points inside `Ω`. The `cut_facet_region_count` field of
+    [`AssemblyDiagnostics`](@ref) counts how many of the integrated regions
+    needed trimming, and `facet_moment_fit_residual_max` how well their fits
+    went — a straight cut is machine-exact, a curved one accurate rather than
+    exact. A selector every one of whose faces lies outside `Ω` carries no
+    quadrature at all and raises, exactly as a selector no active cell reaches
+    does.
   - A [`BoundaryMesh`](@ref) — a user-supplied immersed-boundary mesh
     (segments in 2D, triangles in 3D, points in any D). The package
     walks the precomputed per-cell quadrature rules.
+
+The two cases are the two halves of `∂Ω` and they are disjoint, which is
+worth stating as an identity: for an immersed model whose `BoundaryMesh`
+carries the whole immersed part of `∂Ω`, the grid-aligned integrals summed
+over `boundary(:all)` plus the mesh integral is an integral over the closed
+surface `∂Ω`, so `∮ n dS = 0` and `∮ x·n dS = D·|Ω|` hold up to the
+quadrature error of the two rules. `test_constraints.jl` pins both.
 
 `integrand(q)` is called at every quadrature point with a named tuple:
 
@@ -1152,8 +1160,14 @@ function boundary_integral(integrand, model::Model; on, field::Union{Nothing,Sym
             samples += 1
         end
     end
-    samples == 0 && throw(ArgumentError("no admissible boundary regions for on=$(on); " *
-                                        "check the selector or mesh and any level masks"))
+    # A third cause joins "no such facet" and "every cell masked out" now that a
+    # facet rule is trimmed: a selector all of whose faces lie outside Ω resolves to
+    # regions that carry no quadrature. Naming it here is the difference between a
+    # user checking their selector and a user checking their geometry.
+    samples == 0 &&
+        throw(ArgumentError("no admissible boundary quadrature for on=$(on); check the " *
+                            "selector or mesh, any level masks, and whether the selected " *
+                            "faces lie outside Ω"))
     return result
 end
 

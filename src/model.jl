@@ -147,30 +147,70 @@ Fields:
   - `cut_facet_region_count::Int` — how many of those regions have part of
     their **own face** outside `Ω`, counted the same way (so it is directly
     comparable with `facet_region_count`). A facet region is the whole
-    grid-aligned face of its parent cells and is not trimmed by the level
-    set, so where that face leaves `Ω` every integral taken over it — the L²
-    Dirichlet mass and right-hand side, a Neumann / Robin / Nitsche term
-    placed with `on = boundary(…)`, [`boundary_integral`](@ref) — spends
-    weight on area `Ω` does not contain. A homogeneous datum is unaffected,
-    which is why a nonzero count can sit in a working model unnoticed; this
-    field is what makes it visible before a nonzero datum or a flux term
-    meets it.
+    grid-aligned face of its parent cells, and its rule covers the part of
+    that face inside `Ω`: this count is how much of the boundary integration
+    — the L² Dirichlet mass and right-hand side, a Neumann / Robin / Nitsche
+    term placed with `on = boundary(…)`, [`boundary_integral`](@ref) — rests
+    on a trimmed rule rather than on an exact tensor product. On a face
+    `∂Ω` crosses transversally that rule is accurate, not exact (see
+    `facet_moment_fit_residual_max`), so a nonzero count is where to look
+    when a boundary quantity is less accurate than the cells behind it.
 
     The verdict is on the face, not on the parent cells: a cut *cell* whose
-    face lies wholly inside `Ω` is integrated correctly and is not counted.
-    A region whose face lies wholly *outside* `Ω` is counted — that is the
+    face lies wholly inside `Ω` needs no trimming and is not counted. A
+    region whose face lies wholly *outside* `Ω` is counted — that is the
     extreme case rather than an exception, and it is what a symmetry plane
-    through a hole produces. It is the `kind` field of each
-    [`FacetRegion`](@ref), i.e. [`classify_cell`](@ref) applied to the
-    region's own face box against the level set restricted to the facet's
-    affine slice, and the count is of the regions whose kind is not
-    `:full`. Being a classification rather than a sampling of the rule, it
-    carries the classifier's own resolution: a fictitious sliver of face is
-    counted whenever `subcell_length_scale` and `max_depth` resolve it,
-    however the rule's points happen to fall, and missed below that budget
-    exactly as it is missed on the cell behind the face. Zero when the space
-    carries no [`PhysicalDomain`](@ref), and zero on an immersed space all
-    of whose integrated faces lie inside `Ω`.
+    through a hole produces; such a region keeps its place in the list, with
+    an empty rule, because its parents still carry constrained trace dofs.
+    It is the `kind` field of each [`FacetRegion`](@ref), built from
+    [`classify_cell`](@ref) applied to the region's own face box against the
+    level set restricted to the facet's affine slice, and the count is of
+    the regions whose kind is not `:full`. Being a classification rather
+    than a sampling of the rule, it carries the classifier's own
+    resolution: a fictitious sliver of face is counted whenever
+    `subcell_length_scale` and `max_depth` resolve it, however the rule's
+    points happen to fall, and missed below that budget exactly as it is
+    missed on the cell behind the face. Zero when the space carries no
+    [`PhysicalDomain`](@ref), and zero on an immersed space all of whose
+    integrated faces lie inside `Ω`.
+  - `facet_fit_failure_count::Int`, `facet_cut_fallback_count::Int`,
+    `facet_moment_fit_residual_max::Float64` — the facet analogues of
+    `fit_failure_count` / `cut_fallback_count` / `moment_fit_residual_max`,
+    over the cut *faces* rather than the cut cells, and counted the same way
+    `cut_facet_region_count` is. A facet cut region's rule is the moment fit
+    on the facet's affine slice of `Ω`, so it has the same three outcomes a
+    cell's does: a fit (`:cut_fitted`), the raw Saye rule on the slice when
+    the residual misses the failure threshold (`:cut_fallback`), and no rule
+    at all where `Ω ∩ face` carries none (`:cut_failed` /
+    `:cut_alpha_failed`). The residual is the accuracy statistic for every
+    boundary integral taken over a cut face; it is zero on a model with no
+    cut face.
+
+    Read a nonzero `facet_fit_failure_count` with
+    `facet_moment_fit_residual_max` beside it, because the two name different
+    situations and only one is a warning. A *tangency* — `∂Ω` touching a face
+    without crossing it — classifies `:cut` while `Ω ∩ face` has measure
+    zero, so the fit returns nothing, the region's rule is correctly empty,
+    and the residual stays at `0.0`. That is `kirsch_plate_2d`: both of its
+    counted regions are tangencies, `facet_fit_failure_count` reads 2, and
+    each symmetry face still integrates to its exact 3.0 from the `:full`
+    regions alone. A fit that genuinely struggled shows up as a nonzero
+    residual or as `facet_cut_fallback_count`.
+  - `min_relative_facet_measure::Float64` — the smallest ratio of a facet
+    region's integrated measure (its weight sum) to the full geometric
+    measure of its own face, over every resolved facet region. `1.0` when
+    nothing is trimmed, which includes a model with no facet regions at
+    all, and `0.0` when some face lies wholly outside `Ω` under strict
+    `α = 0`. This is the facet analogue of
+    `min_relative_integration_volume` and the conditioning warning to read
+    before a trimmed boundary condition: trimming is a small-cut generator
+    for the Dirichlet trace mass in exactly the way a thin cut cell is one
+    for the stiffness matrix — measured on a straight cut through one face,
+    the trace mass goes from condition 40 at an untrimmed face to 2.8e5 at a
+    ratio of 5e-2 and 9.6e13 at 1e-3. The package reports the ratio and
+    leaves the stabilisation to the caller, `α` on the domain being the
+    knob — `CONTRIBUTING.md` asks for conditioning behaviour to be visible
+    before stabilisation is added, not for a default stabiliser.
   - `surface_region_count::Int` — total number of
     [`SurfaceRegion`](@ref)s cached on the model, summed across every
     cached [`BoundaryMesh`](@ref). Zero for problems with no
@@ -201,6 +241,10 @@ mutable struct AssemblyDiagnostics
     cut_fallback_points::Int
     facet_region_count::Int
     cut_facet_region_count::Int
+    facet_fit_failure_count::Int
+    facet_cut_fallback_count::Int
+    facet_moment_fit_residual_max::Float64
+    min_relative_facet_measure::Float64
     surface_region_count::Int
     interface_region_count::Int
 end
@@ -223,6 +267,8 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                              reduced_mode_counts=Int[], cut_region_count=0, fit_failure_count=0,
                              moment_fit_residual_max=0.0, cut_fallback_count=0,
                              cut_fallback_points=0, facet_region_count=0, cut_facet_region_count=0,
+                             facet_fit_failure_count=0, facet_cut_fallback_count=0,
+                             facet_moment_fit_residual_max=0.0, min_relative_facet_measure=1.0,
                              surface_region_count=0, interface_region_count=0)
     return AssemblyDiagnostics(Int(dimension), Int(active_unknowns), Int(integration_regions),
                                Int(small_overlap_count), _float_small_overlaps(small_overlaps),
@@ -234,7 +280,10 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                                Int(fit_failure_count), Float64(moment_fit_residual_max),
                                Int(cut_fallback_count), Int(cut_fallback_points),
                                Int(facet_region_count), Int(cut_facet_region_count),
-                               Int(surface_region_count), Int(interface_region_count))
+                               Int(facet_fit_failure_count), Int(facet_cut_fallback_count),
+                               Float64(facet_moment_fit_residual_max),
+                               Float64(min_relative_facet_measure), Int(surface_region_count),
+                               Int(interface_region_count))
 end
 
 # Per-level count of cells deactivated by a `LevelMask` (mask and
@@ -1023,11 +1072,16 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
     facet_regions = _resolve_facet_regions(effective_problem, facet_resolver)
     surface_regions = _resolve_surface_regions(effective_problem, tolerance)
     interface_regions = _resolve_interface_regions(effective_problem, layout, tolerance)
+    facet_stats = _facet_region_stats(facet_regions)
     diag = AssemblyDiagnostics(dimension=D, active_unknowns=active_unknowns(layout),
                                inactive_cell_counts=_inactive_cell_counts(spaces),
                                reduced_mode_counts=_reduced_mode_counts(layout),
                                facet_region_count=_region_count(facet_regions),
-                               cut_facet_region_count=_cut_facet_region_count(facet_regions),
+                               cut_facet_region_count=facet_stats.cut,
+                               facet_fit_failure_count=facet_stats.fit_failures,
+                               facet_cut_fallback_count=facet_stats.fallbacks,
+                               facet_moment_fit_residual_max=facet_stats.residual_max,
+                               min_relative_facet_measure=facet_stats.min_relative_measure,
                                surface_region_count=_region_count(surface_regions),
                                interface_region_count=_region_count(interface_regions))
     _set_plan_stats_multi!(diag, space_plans)
@@ -1147,46 +1201,57 @@ end
 # `interface_region_count` fields.
 _region_count(regions::AbstractDict) = sum(length, values(regions); init=0)
 
-# How many of the resolved facet regions integrate over area that is not in Ω —
-# the diagnostics field `cut_facet_region_count`, counted the same way
-# `facet_region_count` is (summed over every cached selector, so a region two
-# selectors share is counted once per selector, exactly as the total is).
+# Everything the diagnostics report about the resolved facet regions' rules:
+# `(cut, fit_failures, fallbacks, residual_max, min_relative_measure)`, the facet
+# counterparts of what `_cut_region_stats` reads off an integration plan.
+# Counted the same way `facet_region_count` is — summed over every cached selector,
+# so a region two selectors share is counted once per selector, exactly as the
+# total is.
 #
-# Why the number is worth reporting at all. The grid-aligned facet *partition* is
+# Why the cut count is worth reporting at all. The grid-aligned facet *partition* is
 # level-set-blind: `_boundary_facet_regions` selects its contributing levels with
 # `_level_side_is_physical` — pure mesh-edge versus domain-edge geometry — and
 # partitions the face over `_side_cells`. A `FacetRegion` is therefore the *whole*
-# grid-aligned face of its parent cells, carrying a tensor Gauss rule over all of
-# it, and where that face leaves Ω the rule integrates the fictitious part along
-# with the physical part. Every consumer of a facet region inherits it: the L²
-# Dirichlet mass and right-hand side, a Neumann / Robin / Nitsche term placed with
-# `on = boundary(…)`, and `boundary_integral`. A homogeneous datum is unaffected —
-# ∫ 0 = 0 over any region, and `_needs_dirichlet_projection` skips the boundary
-# walk outright for one — which is exactly why the condition can sit in a working
-# model unnoticed. This count is what makes it visible before a nonzero datum or a
-# flux term meets it.
+# grid-aligned face of its parent cells, and where that face leaves Ω the rule on it
+# is the moment fit on the facet's affine slice of Ω rather than an exact tensor
+# product. Every consumer of a facet region inherits that: the L² Dirichlet mass and
+# right-hand side, a Neumann / Robin / Nitsche term placed with `on = boundary(…)`,
+# and `boundary_integral`. On a straight cut the fit is machine-exact; on a curved
+# one it is accurate and not exact, so the count says how much of a model's boundary
+# integration rests on a fitted rule, and `residual_max` says how well those fits
+# went.
 #
-# It reads `FacetRegion.kind`, the verdict `classify_cell` returns on the region's
-# own face box against the level set restricted to the facet's affine slice, and
-# counts everything that is not `:full`. Two properties come from reading the
-# classification rather than re-deriving a test here. It is **as sharp as the
-# classifier** — `subcell_length_scale` and `max_depth`, and nothing about the
-# rule — so a sliver of fictitious face the classifier resolves is `:cut` whether or
-# not the region's own points reach it, where the sampled test could only report a
-# lower bound; a sliver finer than that budget is missed by both, the same blind spot
-# the fictitious-cell fold has. And it is **independent of the rule** on the region,
-# so it keeps describing the face when the rule over it is no longer a plain full-face
-# tensor product — a diagnostic that sampled the rule it is meant to describe
-# would extinguish itself exactly when it started to matter.
+# It reads `FacetRegion.kind` and counts everything that is not `:full`. Two
+# properties come from reading the kind rather than re-deriving a test here. It is
+# **as sharp as the classifier** behind that kind — `subcell_length_scale` and
+# `max_depth`, and nothing about the rule — so a sliver of fictitious face the
+# classifier resolves is counted whether or not the region's own points reach it,
+# where a sampled test could only report a lower bound; a sliver finer than that
+# budget is missed by both, the same blind spot the fictitious-cell fold has. And it
+# is **independent of the rule** on the region, which is what lets it keep
+# describing the face now that the rule over a cut face is no longer a plain
+# full-face tensor product — a diagnostic that sampled the rule it is meant to
+# describe would extinguish itself exactly when it started to matter.
 #
 # The classification is of the region's own *face*, not of its parent cells, and
 # the distinction is not academic: a cut cell can have a face lying wholly inside
-# Ω, and the integral over that face is then exactly right. Classifying the cells
+# Ω, and no trimming is needed there. Classifying the cells
 # would make the number a loose upper bound — on the space-time cavity example at
 # `SC_CELLS = 3` it reads 61 of 81 against a true 1, because the growing cavity
 # cuts nearly every cell while touching only the `t = 0` and `t = T` faces.
-function _cut_facet_region_count(regions::Dict{RegionKey,Vector{FacetRegion{D,T}}}) where {D,T}
-    return sum(list -> count(region -> region.kind !== :full, list), values(regions); init=0)
+#
+# The `:full` regions are filtered out first and so contribute to nothing: a model
+# that trims no face reports `min_relative_measure` as exactly 1 rather than as a
+# Gauss weight sum's last bit, and the four reductions below each run over the
+# handful of regions they describe.
+function _facet_region_stats(regions::Dict{RegionKey,Vector{FacetRegion{D,T}}}) where {D,T}
+    trimmed = [region for list in values(regions) for region in list if region.kind !== :full]
+    return (; cut=length(trimmed),
+            fit_failures=count(r -> r.kind in (:cut_fallback, :cut_failed, :cut_alpha_failed),
+                               trimmed), fallbacks=count(r -> r.kind === :cut_fallback, trimmed),
+            residual_max=maximum(r -> Float64(r.residual), trimmed; init=0.0),
+            min_relative_measure=minimum(r -> Float64(sum(r.weights) / _face_measure(r)), trimmed;
+                                         init=1.0),)
 end
 
 # Resolve one selector into its full list of `FacetRegion`s (the union
@@ -1916,6 +1981,10 @@ function diagnostics(model::Model{D,T}, solution; exact=nothing) where {D,T}
             integration_regions=diag.integration_regions,
             facet_region_count=diag.facet_region_count,
             cut_facet_region_count=diag.cut_facet_region_count,
+            facet_fit_failure_count=diag.facet_fit_failure_count,
+            facet_cut_fallback_count=diag.facet_cut_fallback_count,
+            facet_moment_fit_residual_max=diag.facet_moment_fit_residual_max,
+            min_relative_facet_measure=diag.min_relative_facet_measure,
             surface_region_count=diag.surface_region_count,
             interface_region_count=diag.interface_region_count,
             small_overlap_count=diag.small_overlap_count, small_overlaps=diag.small_overlaps,

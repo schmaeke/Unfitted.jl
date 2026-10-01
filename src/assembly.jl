@@ -2100,7 +2100,15 @@ The `kind=` form returns the **aggregate** over every cached region list
 of that kind, a structural count for diagnostics:
 
   - `:volume` (default) — the points of every subdomain integration plan.
-  - `:facet` — every cached [`FacetRegion`](@ref).
+  - `:facet` — every cached [`FacetRegion`](@ref). On an immersed space this
+    is not a function of the mesh and the orders alone: a region on a face
+    `∂Ω` crosses carries the moment-fit rule on the facet's affine slice, not
+    the tensor product `_facet_quadrature_counts` sizes, so its point count
+    is whatever the fit compressed to (`≤ nbasis`, and in practice fewer
+    points than the untrimmed rule); a region whose face lies wholly outside
+    `Ω` carries none at all under strict `α = 0`. The count therefore moves
+    with the geometry, and `cut_facet_region_count` says how many regions are
+    in that regime.
   - `:surface` — every cached immersed [`SurfaceRegion`](@ref)
     ([`BoundaryMesh`](@ref) integration).
   - `:interface` — every cached multi-domain [`InterfaceRegion`](@ref).

@@ -951,6 +951,20 @@ indicator representations are intentionally not supported.
     counted as a cut region, never as a fit failure). The assembly hot loop
     is unchanged — it just iterates `zip(points, weights)`.
 
+    **Grid-aligned boundary faces use the same vocabulary**, on
+    `FacetRegion.kind`, because they run the same dispatch one dimension
+    down: a codim-`K` facet is the affine slice `⋂ⱼ {x_{kⱼ} = vⱼ}`, so `Ω`
+    on it is the CSG tree with every leaf restricted to that slice
+    (`_restrict_domain`), and the region's own `(D − K)`-dimensional face box
+    is classified and moment-fitted against it. Two deliberate differences.
+    A zero-measure facet region is **kept**, with an empty rule, where a
+    fictitious volume region is dropped — its parent cells still carry the
+    trace dofs the dof layer constrains on the grid-aligned face test, which
+    knows nothing about the level set. And `cut_quadrature` is **not**
+    consulted on a facet: it is specified as a rule on a cell box in the
+    model's own dimension, so a facet cut region always goes through
+    `moment_fit_rule`. `:cut_custom` therefore never appears on a facet.
+
   - **Moment-fit defaults**: moment-fit basis order = `moment_order_factor
     × max(cell_order)` per axis over the region's parent cells; exact tensor
     Legendre moments from the Saye volume rule; a single Lawson–Hanson
@@ -970,19 +984,30 @@ indicator representations are intentionally not supported.
     `reduced_mode_counts` (covered-mode pruning), `dimension`,
     `integration_regions`, `facet_region_count`, `cut_facet_region_count`
     (how many of those facet regions have part of their own *face* outside
-    `Ω`: a facet region is the whole grid-aligned face of its cells and is
-    not trimmed by the level set, so where that face leaves `Ω` an integral
+    `Ω`, hence carry a trimmed rule rather than an exact tensor product: a
+    facet region is the whole grid-aligned face of its cells, and an integral
     over it — Dirichlet projection, a Neumann / Robin / Nitsche term tagged
-    `on::BoundarySelector`, `boundary_integral` — spends weight on area `Ω`
-    does not contain; a homogeneous datum is unaffected, which is why a
-    nonzero count can sit in a working model unnoticed. The verdict is on the
-    face and not on the parent cells, because a cut *cell* whose face lies
-    wholly inside `Ω` is integrated correctly; it is `FacetRegion.kind`, i.e.
-    `classify_cell` on the region's own face box against the level set
-    restricted to the facet's affine slice, so it carries the classifier's own
-    resolution instead of the rule's: a fictitious sliver counts whenever
-    `subcell_length_scale` and `max_depth` resolve it, and one finer than that
-    budget is missed exactly as it is missed on the cell behind the face),
+    `on::BoundarySelector`, `boundary_integral` — runs over `face ∩ Ω`. The
+    verdict is on the face and not on the parent cells, because a cut *cell*
+    whose face lies wholly inside `Ω` needs no trimming; it is
+    `FacetRegion.kind`, built from `classify_cell` on the region's own face
+    box against the level set restricted to the facet's affine slice, so it
+    carries the classifier's own resolution instead of the rule's: a
+    fictitious sliver counts whenever `subcell_length_scale` and `max_depth`
+    resolve it, and one finer than that budget is missed exactly as it is
+    missed on the cell behind the face), `facet_fit_failure_count`,
+    `facet_cut_fallback_count`, `facet_moment_fit_residual_max` (the facet
+    analogues of the three cut-cell fit statistics, over the cut faces; a
+    straight cut fits machine-exactly, a curved one to the residual reported
+    here, so this is the accuracy statistic for every boundary integral taken
+    over a cut face), `min_relative_facet_measure` (the smallest ratio of a
+    facet region's integrated measure to the full geometric measure of its own
+    face — `1.0` when nothing is trimmed, `0.0` when a face lies wholly
+    outside `Ω` under strict `α = 0`. The facet analogue of
+    `min_relative_integration_volume`, and the conditioning warning for a
+    trimmed Dirichlet condition: trimming is a small-cut generator for the
+    trace mass exactly as a thin cut cell is one for the stiffness matrix.
+    Reported and not stabilised, per "Small overlaps and conditioning" above),
     `surface_region_count`, `interface_region_count`, `raw_dofs`,
     `active_unknowns`, `levels`
     (one entry per level with `id`, `role`, `cells`, `order` — the nominal

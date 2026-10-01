@@ -659,10 +659,11 @@ lets future per-Q-point normal sources (curved meshes, user-supplied
 overrides per Q-point) drop in without changing the consumer's hot loop —
 there is no `sides`, because an immersed cell sits in the interior of
 a mesh cell and has no `(axis, side)` facet identity (consumers see
-`q.sides === nothing` on a surface region), and there is no `kind`: a facet
-region's geometry is inherited from the mesh, so the package has to decide
-which part of it lies in `Ω`, while a `BoundaryMesh`'s geometry is stated by
-the user and already *is* a piece of `∂Ω`.
+`q.sides === nothing` on a surface region), and there is no `kind` or
+`residual`: a facet region's geometry is inherited from the mesh, so the
+package has to decide which part of it lies in `Ω` and trim its rule
+accordingly, while a `BoundaryMesh`'s geometry is stated by the user and
+already *is* a piece of `∂Ω`.
 """
 struct SurfaceRegion{D,T<:Real}
     parents::Vector{FacetParent{D,T}}
