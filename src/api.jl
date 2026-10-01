@@ -166,6 +166,22 @@ is a genuine surprise for a flux: an `except` selector is not "`∂Ω` minus
 a face" in the sense of measure, it is the closed union of what remains,
 and [`neumann`](@ref) integrates over the kept faces with no special
 treatment of the edges they share with the excluded ones.
+
+A selector names **grid-aligned** geometry and nothing else. Its facets
+are faces of the background box, partitioned over the cells that touch
+them, and they are *not* trimmed by an immersed [`PhysicalDomain`](@ref):
+integration over `boundary(axis=d, side=s)` covers the whole face of
+every cell that stays active, so where `∂Ω` cuts a face it spends weight
+on the part outside `Ω`, while a cell lying *entirely* outside `Ω` is
+masked inactive and parents nothing — the face shrinks by whole cells but
+never within one. See [`dirichlet`](@ref), [`neumann`](@ref) and
+[`boundary_integral`](@ref) for what each does with the surplus. The
+`cut_facet_region_count` field of [`AssemblyDiagnostics`](@ref) counts how
+many resolved facet regions have part of their face outside `Ω`; a face
+that stays inside `Ω` is integrated correctly even where its cells are
+cut. For the immersed boundary itself, integrate over a
+[`BoundaryMesh`](@ref) instead, which is cut against the grid and carries
+only material-side points.
 """
 function boundary(selector::Symbol; except=())
     # The no-exclusion path is the original one-line method, and it is reached
@@ -269,6 +285,21 @@ Nonzero `value` data are projected onto the boundary trace space
 before strong elimination so the constrained dof values reflect the
 correct trace. Homogeneous (constant-zero) data skip the projection
 entirely.
+
+On an immersed space, that projection is taken over the **whole**
+grid-aligned face: a facet region is the entire face of its cells and is
+not trimmed by the level set (see [`boundary`](@ref)), so where `∂Ω` cuts
+the selected face the mass matrix `∫ φᵢ φⱼ ds` and the right-hand side
+`∫ g φᵢ ds` both integrate the fictitious part of the face as well as the
+physical part, and the projected trace values are those of a least-squares
+fit over the larger face. A homogeneous datum is unaffected — the
+projection is skipped outright for one, and `∫ 0 = 0` over any region
+regardless — which is why a Dirichlet condition on a cut face is easy to
+ship without noticing. The `cut_facet_region_count` field of
+[`AssemblyDiagnostics`](@ref) counts the regions whose face leaves `Ω`.
+Which dofs are *constrained* is a separate question, decided per dof key
+by the same grid-aligned face test and likewise independent of the level
+set.
 
 A `boundary(:all; except = …)` selector constrains its kept faces *closed*
 (see [`boundary`](@ref)): a dof on the edge between a kept face and an
@@ -482,6 +513,17 @@ For Robin, Nitsche, or other non-canonical boundary conditions,
 compose [`block`](@ref) and [`loadform`](@ref) directly with
 `on = …` and your own [`WeakForm`](@ref) — the package supplies the
 integration primitives, not the constitutive choice.
+
+On an immersed space the load is integrated over the **whole**
+grid-aligned face named by `on`: a facet region is the entire face of its
+cells and is not trimmed by the level set (see [`boundary`](@ref)), so a
+flux placed on a face that `∂Ω` cuts is applied over the fictitious part of
+the face too, and `ℓ(v)` is correspondingly too large. A zero `value` is
+unaffected. The same holds for any Robin or Nitsche term composed by hand
+with `on = boundary(…)`. The `cut_facet_region_count` field of
+[`AssemblyDiagnostics`](@ref) counts the regions whose face leaves `Ω`;
+a flux on the immersed boundary itself belongs on a
+[`BoundaryMesh`](@ref), which is cut against the grid.
 
 A `boundary(:all; except = …)` selector puts the flux on its kept faces
 taken *closed* (see [`boundary`](@ref)): the load is the sum over those

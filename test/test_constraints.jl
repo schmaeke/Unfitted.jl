@@ -720,6 +720,68 @@ end
     @test l2_error(solve!(both), both, g) < 1.0e-12
 end
 
+@testset "cut_facet_region_count reports level-set-blind facet integration" begin
+    # Grid-aligned facet integration takes no `PhysicalDomain`: a facet region is
+    # the whole face of its parent cells, so where that face leaves Ω the rule
+    # spends weight on area Ω does not contain. `cut_facet_region_count` is what
+    # makes that visible. Ω = { x₂ ≤ x₁ + 0.55 } ∩ (0, 1)² puts a plane through
+    # the x₁ = 0 face: physical for x₂ ≤ 0.55, fictitious above it.
+    plane = leaf(x -> x[2] - x[1] - 0.55; lipschitz=sqrt(2.0))
+    cut_domain = physical_domain(plane; subcell_length_scale=0.0625)
+    Vcut = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=cut_domain)
+    face = boundary(axis=1, side=:lower)
+    cut_model = prepare(poisson(Vcut; source=0.0, dirichlet=[dirichlet(0.0; on=face)]))
+
+    # Four regions on that face, one per cell along it. On the face φ = x₂ − 0.55,
+    # so the region over x₂ ∈ [0.5, 0.75] is *crossed* by ∂Ω and the one over
+    # x₂ ∈ [0.75, 1] lies wholly outside Ω. Both count: what the number reports is
+    # regions that integrate non-physical area, and lying entirely outside is the
+    # extreme of that, not an exception to it. The lower two faces stay inside Ω.
+    @test diagnostics(cut_model).facet_region_count == 4
+    @test diagnostics(cut_model).cut_facet_region_count == 2
+
+    # What the count is warning about, pinned as a number. The face's physical
+    # measure is 0.55; the facet rule integrates the whole face. When facet
+    # integration learns about the level set, this assertion is the one that has
+    # to change, deliberately, from 1.0 to 0.55.
+    @test boundary_integral(q -> 1.0, cut_model; on=face) ≈ 1.0 rtol = 1.0e-14
+
+    # The case that separates the *face* test from a test on the parent cells, and
+    # the reason the count is not simply "any parent is cut". A circle of radius
+    # 0.1 about (0.2, 0.5) cuts two cells that sit on the x₁ = 0 face, but it stops
+    # at x₁ = 0.1 and never reaches the face, so every integrated face lies inside
+    # Ω and every facet integral is exactly right. Counting cut cells would report
+    # those two regions; counting cut faces reports none.
+    offset = leaf(x -> 0.1 - sqrt((x[1] - 0.2)^2 + (x[2] - 0.5)^2); lipschitz=1.0)
+    interior = physical_domain(offset; subcell_length_scale=0.0625)
+    Vhole = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=interior)
+    hole_model = prepare(poisson(Vhole; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    @test diagnostics(hole_model).cut_region_count > 0
+    @test diagnostics(hole_model).facet_region_count == 16
+    @test diagnostics(hole_model).cut_facet_region_count == 0
+    # ...and the cells really are cut, so this is a live discrimination and not a
+    # geometry in which the two tests trivially agree.
+    hole_regions = hole_model.facet_regions[(boundary(:all), hole_model.problem.space)]
+    @test count(r -> any(p -> Unfitted.classify_cell(interior, p.parent_box) === :cut, r.parents),
+                hole_regions) == 2
+
+    # No geometry at all: nothing can leave Ω.
+    Vplain = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2)
+    plain = prepare(poisson(Vplain; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    @test diagnostics(plain).facet_region_count == 16
+    @test diagnostics(plain).cut_facet_region_count == 0
+
+    # `keep_fictitious = true` keeps whole fictitious cells in the layout, so it can
+    # only add regions, never retract a verdict: the count is a property of the
+    # geometry and the face, not of the fold. On this geometry no cell on the face
+    # is wholly fictitious, so both numbers are unchanged.
+    kept = physical_domain(plane; alpha=1.0e-3, keep_fictitious=true, subcell_length_scale=0.0625)
+    Vkept = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=kept)
+    kept_model = prepare(poisson(Vkept; source=0.0, dirichlet=[dirichlet(0.0; on=face)]))
+    @test diagnostics(kept_model).facet_region_count == 4
+    @test diagnostics(kept_model).cut_facet_region_count == 2
+end
+
 @testset "boundary(:all; except=…) is the union of the faces that remain" begin
     # The gap `except` closes: `:sides` gives the *intersection* of its faces, so
     # before this the union of a face *subset* had no spelling at all and every
@@ -877,4 +939,90 @@ end
     # does not.
     @test count(key -> matches(key, boundary(axis=1, side=:upper)) && !matches(key, selector),
                 dofs.raw_keys) == 1
+end
+
+# `_boundary_facet_regions` has exactly two callers, and they must see the same
+# facet: `_facet_regions_for_selector` (src/model.jl), behind the per-face memo
+# that assembly and `boundary_integral` share, and `_sample_dirichlet_facet!`
+# (src/dirichlet.jl), which calls it directly to build the L² boundary-trace
+# projection. They agree today only because the function is a pure function of
+# `(V, sides, tolerance)`. Nothing else in the suite would notice if one of them
+# stopped being.
+#
+# The defect this guards against is the level-set blindness of grid-aligned
+# facet integration — the one `cut_facet_region_count` reports. See the testset
+# "cut_facet_region_count reports level-set-blind facet integration" above, and
+# `_cut_facet_region_count` in src/model.jl. The fix for it trims a cut face's
+# rule to the physical part, and it has to land on BOTH paths at once. On the
+# operator path alone, the Dirichlet datum would be fitted over the whole face
+# while the operator integrates only the physical part: a clean residual, a
+# converging solve, and boundary data fitted over area that is not in Ω. On the
+# projection path alone, the mirror image. Neither shows up in a norm.
+#
+# This is a guard, not a snapshot: it asserts that the two sides read the SAME
+# thing, never what that thing is. Ω = { x₂ ≤ x₁ + 0.55 } ∩ (0,1)² reduces on
+# the x₁ = 0 face to φ = x₂ − 0.55, so of that face's full measure 1.0 exactly
+# 0.55 is physical. Both sides read 1.0 today, because neither is trimmed; after
+# the fix both must read 0.55. Every assertion below holds either way and none
+# of them needs editing when the value moves — the single deliberate pin of the
+# 1.0 lives in the neighbouring testset named above, and stays the only one.
+@testset "the Dirichlet projection and the operator integrate the same facet" begin
+    plane = leaf(x -> x[2] - x[1] - 0.55; lipschitz=sqrt(2.0))
+    cut_domain = physical_domain(plane; subcell_length_scale=0.0625)
+    Vcut = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=cut_domain)
+    face = boundary(axis=1, side=:lower)
+    # A NONZERO datum. `_needs_dirichlet_projection` skips the boundary walk
+    # outright for a homogeneous one, so a zero datum never reaches the
+    # projection path and this comparison would have nothing to read on one side.
+    g(x) = 1 + x[1] + 2x[2]
+    model = prepare(poisson(Vcut; source=0.0, dirichlet=[dirichlet(g; on=face)]))
+
+    # The geometry, pinned against the level set itself rather than against any
+    # quadrature: the face straddles ∂Ω and crosses it at x₂ = 0.55, which is
+    # where its physical measure 0.55 comes from. A live discrimination, then —
+    # not a face that happens to lie inside Ω, for which the two paths would
+    # agree with nothing to disagree about.
+    @test levelset_value(cut_domain, SVector(0.0, 0.0)) < 0        # inside Ω
+    @test levelset_value(cut_domain, SVector(0.0, 1.0)) > 0        # outside Ω
+    @test levelset_value(cut_domain, SVector(0.0, 0.55)) ≈ 0 atol = 1.0e-15
+
+    # The projection side. `prepare` projects without caching, so the quadrature
+    # `_sample_dirichlet_facet!` actually walked is published by the first
+    # `update_dirichlet!`, as a cached `DirichletProjection`. The datum is
+    # unchanged, so this re-projects exactly the values `prepare` already fitted.
+    update_dirichlet!(model, [dirichlet(g; on=face)])
+    projection = model.dirichlet_projections[:u]
+    @test projection.facets == 1
+    trace = only(projection.samples)
+
+    # The operator side, read independently and through the public consumer:
+    # `boundary_integral` resolves the face through the model's per-face memo —
+    # the same regions a Neumann, Robin or Nitsche term `on = face` assembles
+    # over. Nothing here is derived from `trace`.
+    operator_points = SVector{2,Float64}[]
+    operator_weights = Float64[]
+    operator_measure = boundary_integral(model; on=face) do q
+        push!(operator_points, q.x)
+        push!(operator_weights, q.weight)
+        return 1.0
+    end
+
+    # 1. Measure agreement: the face the projection fits `g` over carries the
+    #    measure the operator integrates.
+    @test sum(trace.weights) ≈ operator_measure rtol = 1.0e-14
+
+    # 2. Point-set agreement, as multisets — the same rule, not merely the same
+    #    total, so a divergence that preserves the measure is caught too. Region
+    #    order differs between the paths (the projection walks one face, while
+    #    `boundary_integral` walks the resolved union), hence the sort.
+    order(x) = (x[1], x[2])
+    @test length(trace.points) == length(operator_points)
+    @test sort(trace.points; by=order) == sort(operator_points; by=order)
+    @test sort(trace.weights) ≈ sort(operator_weights) rtol = 1.0e-14
+
+    # ...and the projection is not vacuous: the face carries unknowns and the
+    # datum lands on them, so a divergence between the two faces would move real
+    # numbers rather than agreeing emptily.
+    @test !isempty(projection.unknowns[1])
+    @test count(!iszero, only(model.dofs.fields).dofs.constrained_values) > 0
 end

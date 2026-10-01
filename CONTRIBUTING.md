@@ -968,7 +968,18 @@ indicator representations are intentionally not supported.
     `cut_fallback_points`, and `inactive_cell_counts` (which folds in the
     fictitious cell drop). The same report also carries
     `reduced_mode_counts` (covered-mode pruning), `dimension`,
-    `integration_regions`, `facet_region_count`, `surface_region_count`,
+    `integration_regions`, `facet_region_count`, `cut_facet_region_count`
+    (how many of those facet regions have part of their own *face* outside
+    `Ω`: a facet region is the whole grid-aligned face of its cells and is
+    not trimmed by the level set, so where that face leaves `Ω` an integral
+    over it — Dirichlet projection, a Neumann / Robin / Nitsche term tagged
+    `on::BoundarySelector`, `boundary_integral` — spends weight on area `Ω`
+    does not contain; a homogeneous datum is unaffected, which is why a
+    nonzero count can sit in a working model unnoticed. The test is on the
+    face and not on the parent cells, because a cut *cell* whose face lies
+    wholly inside `Ω` is integrated correctly; it is sampled at the region's
+    quadrature points and corners, so it never over-reports and can miss a
+    sliver falling between samples), `surface_region_count`,
     `interface_region_count`, `raw_dofs`, `active_unknowns`, `levels`
     (one entry per level with `id`, `role`, `cells`, `order` — the nominal
     per-axis maximum — `order_palette`, the distinct per-cell orders,

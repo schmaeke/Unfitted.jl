@@ -415,6 +415,25 @@ end
 # Build the admissible boundary regions on the facet identified by
 # `sides`.
 #
+# The regions are **grid-aligned and level-set-blind**, and that is the one
+# property to know before using them. There is no `PhysicalDomain` argument
+# here and none reaches any step below: step 1 selects levels by comparing mesh
+# edges against the space's `AxisBox` (`_level_side_is_physical`), step 2
+# partitions over `_side_cells`, step 4 asks `locate_cell` and the `LevelMask`.
+# So a region is the whole face of its parent cells, and where `∂Ω` crosses that
+# face the rule in step 6 integrates the fictitious part along with the physical
+# part. Every consumer inherits it — the L² Dirichlet mass and right-hand side
+# below, a Neumann / Robin / Nitsche term tagged `on::BoundarySelector`, and
+# `boundary_integral`. A homogeneous Dirichlet datum is unaffected (∫ 0 = 0, and
+# `_needs_dirichlet_projection` skips the walk for one), which is why the
+# property is easy to miss; `cut_facet_region_count` in the assembly diagnostics
+# counts the regions part of whose own face falls outside Ω, which is the subset
+# it actually costs anything on. Integration over the immersed boundary
+# itself goes through a `BoundaryMesh` (`surface.jl`), which *is* cut against
+# the grid. The whole-cell fictitious fold does reach here, through the mask
+# step 4 reads: a fully fictitious cell is inactive and parents nothing, so the
+# face shrinks by whole cells, never within one.
+#
 # The algorithm mirrors the volume-region construction in `intersections.jl`,
 # restricted to the facet:
 #

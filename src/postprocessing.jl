@@ -1092,7 +1092,16 @@ Integrate a user callback over a portion of the boundary.
     `recommended_quadrature_order(level.basis, cell_order(level, cell))`
     over the region's covering parent cells. Overlay levels whose own mesh face
     coincides with the selected facet contribute their own segment;
-    level masking is respected.
+    level masking is respected. The facet is the whole grid-aligned face and is
+    **not** trimmed by an immersed [`PhysicalDomain`](@ref) (see
+    [`boundary`](@ref)), so on a face that `∂Ω` cuts the returned value
+    includes the fictitious part of the face: `boundary_integral(q -> 1.0,
+    model; on=boundary(axis=d, side=s))` returns the face's full measure, not
+    the measure of its physical part. Level *masking* is what the integration
+    follows, and a whole-cell fictitious fold is a mask, so the face shrinks by
+    whole cells but never within one. The `cut_facet_region_count` field of
+    [`AssemblyDiagnostics`](@ref) counts how many of the integrated regions have
+    part of their face outside `Ω`.
   - A [`BoundaryMesh`](@ref) — a user-supplied immersed-boundary mesh
     (segments in 2D, triangles in 3D, points in any D). The package
     walks the precomputed per-cell quadrature rules.

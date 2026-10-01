@@ -60,17 +60,40 @@
 # `-O2` and ~55 s at `-O1` (verified byte-identical to `-O2` here). Each level
 # is deterministic within itself, but `-O0` does NOT agree with `-O2` — it
 # reorders reductions — so a report is only comparable against one produced at
-# the same level. The checked-in baseline is generated at `-O0`, which is also
-# the level `CONTRIBUTING.md` documents for the test suite; keep it there.
+# the same level. The reference baseline is generated at `-O0`, which is also the
+# level `CONTRIBUTING.md` documents for the test suite; keep it there. Nothing is
+# checked in — the report is a hand-run before/after pair, as the recipe above
+# says, so a baseline is only ever as good as the commit it was taken on. Take a
+# fresh one whenever a case is added, because an older baseline has no lines to
+# diff the new case against.
 #
 # Findings this instrument is aimed at:
-#   #1 facet/surface region resolution is not subdomain-aware
-#   #2 `_NNLS_WEIGHT_TOL` is an absolute cutoff on a cut-volume-scaled weight
-#   #3 `tolerance.merge` is an absolute length compared against mesh spacing
-#   #4 the fictitious fold is applied to the already-folded mask
-#   #5 `moved` has no single-domain guard
-#   #8 `physical_domain(tree; lipschitz=L)` discards L
-#   #9 `_subdivide_segment` discards 2·nudge of arc length per grid crossing
+#   #1  facet/surface region resolution is not subdomain-aware
+#   #2  `_NNLS_WEIGHT_TOL` is an absolute cutoff on a cut-volume-scaled weight
+#   #3  `tolerance.merge` is an absolute length compared against mesh spacing
+#   #4  the fictitious fold is applied to the already-folded mask
+#   #5  `moved` has no single-domain guard
+#   #8  `physical_domain(tree; lipschitz=L)` discards L
+#   #9  `_subdivide_segment` discards 2·nudge of arc length per grid crossing
+#   #T4 grid-aligned facet integration is not level-set-aware
+#
+# WHY #T4 NEEDED TWO NEW CASES, and what the 31 before them do NOT say about it.
+# Grid-aligned facet integration takes no `PhysicalDomain`: a `FacetRegion` is the
+# whole face of its parent cells, so where `∂Ω` crosses that face the rule spends
+# weight on area Ω does not contain. Cases 32 and 33 are the only cases that can
+# see it, and the gap they close was not an oversight but a property of the
+# matrix: the two ingredients #T4 needs never co-occurred. The immersed cases
+# (12, 13, 22, 28) carry no boundary selector at all, so they resolve no facet
+# region whatsoever; the facet cases (14, 15, 16, 21) are not immersed, so no face
+# of theirs can leave Ω. Nor are cases 17, 26 and 27, the ones that look immersed:
+# their curved geometry is a user-supplied `BoundaryMesh` or interface, which is
+# cut against the grid already and is out of #T4's scope on principle — the
+# package must decide which part of a face it inherited from the mesh lies in Ω,
+# but must not second-guess geometry the user stated. Every
+# `cut_facet_region_count` those cases print is therefore 0,
+# and a prototype of the full fix left all 31 of them byte-identical. Read their
+# stability under a facet-integration change as an artifact of the matrix, not as
+# evidence about the change.
 
 # ── Environment ───────────────────────────────────────────────────────────────
 #
@@ -297,6 +320,21 @@ function empty_region_count(model)
     return n
 end
 
+# Which branch the L² Dirichlet trace solve took on one component. The boundary
+# mass is symmetric positive *semi*-definite, so `_dirichlet_projection` tries a
+# `Cholesky` and falls back to a dense pseudoinverse when that reports
+# indefiniteness — which is what a constrained dof whose facet support carries no
+# measure produces, since its row and column of the mass are identically zero.
+# The fallback is silent and assigns such a dof its minimum-norm value, so the
+# branch is worth printing: it is the only externally visible trace of a trace
+# space that has gone singular.
+#
+# Reported as a short tag rather than the raw type, so the key cannot move with a
+# Julia-version change in a type parameter.
+factor_kind(::Nothing) = :none
+factor_kind(::Cholesky) = :Cholesky
+factor_kind(::AbstractMatrix) = :pinv
+
 # The whole diagnostics record, in a fixed order, plus the plan-derived
 # quantities the record does not carry.
 function emit_model(model)
@@ -321,6 +359,7 @@ function emit_model(model)
     emit("cut_fallback_points", d.cut_fallback_points)
     emit("moment_fit_residual_max", d.moment_fit_residual_max)
     emit("facet_region_count", d.facet_region_count)
+    emit("cut_facet_region_count", d.cut_facet_region_count)
     emit("surface_region_count", d.surface_region_count)
     emit("interface_region_count", d.interface_region_count)
     emit("nquadpoints.volume", nquadpoints(model; kind=:volume))
@@ -356,6 +395,30 @@ function emit_solution(model, solution; exact=nothing, points=(), fields=(), pre
             emit(prefix * String(u.name) * pointlabel(p), value(solution, model, u, p))
         end
     end
+    return nothing
+end
+
+# The L² Dirichlet trace projection's own record, for the cases whose subject is
+# the facet rule that projection is built on: how many of the model's constrained
+# values came out nonzero, and which branch the per-component trace solve took.
+#
+# `prepare` projects the datum and then discards the `DirichletProjection`; the
+# first `update_dirichlet!` publishes it on `model.dirichlet_projections`. So
+# `dirichlet` here is the list the model was already prepared with — re-applying
+# it re-fits bit-identical values, by the exactness contract on
+# `DirichletProjection`, and only makes the factorisation readable. It also drops
+# the cached operators, which is why this must come after `emit_model`.
+#
+# `only` twice over, on the field layouts and on the projection cache, keeps this
+# inside the determinism rules rather than beside them: both collections carry one
+# entry on a single-field model, so no iteration order is observable, and `only`
+# throws rather than printing an arbitrary one if a later case is multi-field.
+function emit_dirichlet_projection(model, dirichlet)
+    emit("dirichlet.nonzero_value_count",
+         count(!iszero, only(model.dofs.fields).dofs.constrained_values))
+    update_dirichlet!(model, dirichlet)
+    emit("dirichlet.trace_factors",
+         map(factor_kind, only(values(model.dirichlet_projections)).factors))
     return nothing
 end
 
@@ -1135,6 +1198,115 @@ function main()
         scalar_model, scalar_solution = diffusion_case(V, 2.5, x -> 2.5 * f2d(x))
         emit_matrix("scalar.matrix", scalar_model.matrix)
         emit_solution(scalar_model, scalar_solution; exact=u2d, points=P2, prefix="scalar.")
+    end
+
+    # ── 32 ── #T4. A cut face carrying a NONZERO Dirichlet datum — the one shape
+    #          neither this report nor any shipped application had. On the x₁ = 0
+    #          face the leaf x₂ − x₁ − 0.55 restricts to φ = x₂ − 0.55, so of that
+    #          face's unit measure exactly 0.55 is physical: the crossing sits at
+    #          x₂ = 0.55, inside the third of the face's four regions, which the
+    #          plane cuts while the fourth lies wholly above it. The datum is
+    #          nonzero because `_needs_dirichlet_projection` skips the boundary
+    #          walk outright for a constant-zero one, and a skipped walk would
+    #          leave the trace projection out of the report altogether.
+    case(32, "x-facet-cut-nonzero-datum", "EXPECTED-TO-CHANGE (#T4)",
+         wrong_because="facet_measure.x_lower reads 1.0 where the face's physical measure is " *
+                       "0.55, and facet_flux.x_lower reads -1.0 where it is -0.55: the " *
+                       "grid-aligned facet rule is not trimmed by the level set, so 45% of " *
+                       "its weight sits on area Ω does not contain. The exposure is " *
+                       "cut_facet_region_count = 2 of facet_region_count = 4, and it is not " *
+                       "confined to those two numbers — the trace projection's mass, its " *
+                       "right-hand side and therefore every coefficients.* checksum below " *
+                       "describe an L² fit of g over the larger face. After the fix the two " *
+                       "measures must read 0.55 and -0.55 to machine precision, the restricted " *
+                       "leaf being linear on the face, and nquadpoints.facet moves 12 → 14.")
+    let plane = leaf(x -> x[2] - x[1] - 0.55; lipschitz=sqrt(2.0)),
+        p = physical_domain(plane; subcell_length_scale=0.0625),
+        face = boundary(axis=1, side=:lower),
+        g = x -> 1 + x[1] + 2x[2]
+
+        V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=p)
+        model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(g; on=face)]))
+        solution = solve!(model)
+        emit_model(model)
+        emit("facet_measure.x_lower", boundary_integral(q -> 1.0, model; on=face))
+        emit("facet_measure_exact.x_lower", 0.55)
+        # The trimmed FLUX, which nothing else in the repository measures — no
+        # shipped example puts a Neumann or Robin term on a face that ∂Ω cuts. The
+        # outward normal here is the constant −e₁, so this integral is exactly
+        # minus the measure above and moves with it; a flux is the consumer a wrong
+        # face measure corrupts most directly, since a reaction force or a heat
+        # flow *is* this integral rather than merely being fitted over it.
+        emit("facet_flux.x_lower", boundary_integral(q -> q.normal[1], model; on=face))
+        emit("facet_flux_exact.x_lower", -0.55)
+        # No manufactured solution: g is harmonic, but the immersed cut carries the
+        # natural condition rather than g, so the solution is not g anywhere. These
+        # are diffable sample values, not an accuracy claim.
+        emit_solution(model, solution; points=P2)
+        emit_dirichlet_projection(model, [dirichlet(g; on=face)])
+    end
+
+    # ── 33 ── #T4 at its sharpest: a face lying WHOLLY outside Ω on a cell that
+    #          is still active. Ω = (0,1)² ∖ {‖x‖ ≤ 0.3} puts the hole on the
+    #          corner, so the corner cell [0, 0.25]² is cut — its far corner sits
+    #          at r = 0.354 > 0.3 — and is therefore active and parents a region
+    #          on each of its two boundary faces, while both of those faces lie
+    #          at r ≤ 0.25 < 0.3, entirely in the hole. The whole-cell fictitious
+    #          fold cannot reach them: the cell is not fictitious, only its faces
+    #          are, which is precisely the configuration a face can only lose by
+    #          being trimmed within one cell.
+    case(33, "x-facet-wholly-fictitious", "EXPECTED-TO-CHANGE (#T4)",
+         wrong_because="all four facet_measure keys read 1.0 while the two faces the disc " *
+                       "reaches have physical measure 0.7 — cut_facet_region_count = 4 of 16. " *
+                       "The sharp part is the corner cell: it classifies :cut, hence is active " *
+                       "and parents a region on each of its two faces, yet a positive " *
+                       "corner_cell.face_phi_at_far_end says both of those faces lie entirely " *
+                       "outside Ω (φ = 0.3 − x₂ is monotone along the face, so its far end is " *
+                       "the least-fictitious point there is). After the fix the two reached " *
+                       "faces must read 0.7 to machine precision — the disc restricts to that " *
+                       "same linear φ on them — the corner cell's two regions must carry no " *
+                       "measure at all, and its rows of the trace mass go identically zero: " *
+                       "dirichlet.trace_factors therefore moves [:Cholesky] → [:pinv] and " *
+                       "dirichlet.nonzero_value_count 32 → 31, the pseudoinverse silently " *
+                       "pinning that dof to its minimum-norm value. That last move is the " *
+                       "hazard worth naming: a dof can carry a Dirichlet condition with no " *
+                       "measure anywhere on its facet support while its volume support still " *
+                       "reaches into Ω, and nothing today says so out loud.")
+    let disc = leaf(x -> 0.3 - hypot(x[1], x[2]); lipschitz=1.0),
+        p = physical_domain(disc; subcell_length_scale=0.0625),
+        # −Δ sin(x₁ + 2x₂) = 5 sin(x₁ + 2x₂), so g is the manufactured solution of
+        # the box problem. It is NOT the solution here: the immersed hole carries
+        # the natural condition, which g does not satisfy, so l2_error.* reads a
+        # few percent and is a diffable scalar rather than an accuracy claim. It
+        # earns its place by being global — it moves if the trace fit moves at all.
+        g = x -> sin(x[1] + 2x[2])
+
+        V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=p)
+        model = prepare(poisson(V; source=x -> 5 * sin(x[1] + 2x[2]),
+                                dirichlet=[dirichlet(g; on=boundary(:all))]))
+        solution = solve!(model)
+        emit_model(model)
+        measure = face -> boundary_integral(q -> 1.0, model; on=face)
+        emit("facet_measure.x_lower", measure(boundary(axis=1, side=:lower)))
+        emit("facet_measure.x_upper", measure(boundary(axis=1, side=:upper)))
+        emit("facet_measure.y_lower", measure(boundary(axis=2, side=:lower)))
+        emit("facet_measure.y_upper", measure(boundary(axis=2, side=:upper)))
+        # Only the two faces the disc reaches are wrong; the upper two already read
+        # their physical measure of 1.0, and that they keep reading it is half the
+        # point of printing all four.
+        emit("facet_measure_exact.x_lower", 1 - 0.3)
+        emit("facet_measure_exact.y_lower", 1 - 0.3)
+        # The hazard, pinned so it cannot quietly stop being the hazard: were the
+        # corner cell ever to classify fictitious, the whole-cell fold would drop
+        # its faces and the `pinv` transition above would not be reachable here.
+        # The two faces are mirror images through x₁ ↔ x₂ and `hypot` is symmetric,
+        # so one φ reading covers both.
+        emit("corner_cell.classification",
+             classify_cell(p, cell_box(V, CartesianIndex(1, 1); level=1)))
+        emit("corner_cell.active", active_cells(model; level=1)[1, 1])
+        emit("corner_cell.face_phi_at_far_end", levelset_value(p, SVector(0.0, 0.25)))
+        emit_solution(model, solution; exact=g, points=P2)
+        emit_dirichlet_projection(model, [dirichlet(g; on=boundary(:all))])
     end
 
     # ── Summary ───────────────────────────────────────────────────────────────

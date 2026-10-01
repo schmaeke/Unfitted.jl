@@ -144,6 +144,29 @@ Fields:
     9 × 9 = 81. The faces, the regions and the quadrature are identical in both
     spellings, so read a rise here as a change of spelling until the region
     geometry itself has been checked.
+  - `cut_facet_region_count::Int` — how many of those regions have part of
+    their **own face** outside `Ω`, counted the same way (so it is directly
+    comparable with `facet_region_count`). A facet region is the whole
+    grid-aligned face of its parent cells and is not trimmed by the level
+    set, so where that face leaves `Ω` every integral taken over it — the L²
+    Dirichlet mass and right-hand side, a Neumann / Robin / Nitsche term
+    placed with `on = boundary(…)`, [`boundary_integral`](@ref) — spends
+    weight on area `Ω` does not contain. A homogeneous datum is unaffected,
+    which is why a nonzero count can sit in a working model unnoticed; this
+    field is what makes it visible before a nonzero datum or a flux term
+    meets it.
+
+    The test is on the face, not on the parent cells: a cut *cell* whose
+    face lies wholly inside `Ω` is integrated correctly and is not counted.
+    A region whose face lies wholly *outside* `Ω` is counted — that is the
+    extreme case rather than an exception, and it is what a symmetry plane
+    through a hole produces. The verdict is sampled at the region's own
+    quadrature points plus the corners of its extent, so it is taken at the
+    resolution the integral itself uses: the count never over-reports, and
+    it can miss a fictitious sliver that falls between samples, whose
+    contribution to the integral is correspondingly small. Zero when the
+    space carries no [`PhysicalDomain`](@ref), and zero on an immersed space
+    all of whose integrated faces lie inside `Ω`.
   - `surface_region_count::Int` — total number of
     [`SurfaceRegion`](@ref)s cached on the model, summed across every
     cached [`BoundaryMesh`](@ref). Zero for problems with no
@@ -173,6 +196,7 @@ mutable struct AssemblyDiagnostics
     cut_fallback_count::Int
     cut_fallback_points::Int
     facet_region_count::Int
+    cut_facet_region_count::Int
     surface_region_count::Int
     interface_region_count::Int
 end
@@ -194,8 +218,8 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                              small_overlaps=SmallOverlap{Float64}[], inactive_cell_counts=Int[],
                              reduced_mode_counts=Int[], cut_region_count=0, fit_failure_count=0,
                              moment_fit_residual_max=0.0, cut_fallback_count=0,
-                             cut_fallback_points=0, facet_region_count=0, surface_region_count=0,
-                             interface_region_count=0)
+                             cut_fallback_points=0, facet_region_count=0, cut_facet_region_count=0,
+                             surface_region_count=0, interface_region_count=0)
     return AssemblyDiagnostics(Int(dimension), Int(active_unknowns), Int(integration_regions),
                                Int(small_overlap_count), _float_small_overlaps(small_overlaps),
                                Float64(min_integration_volume),
@@ -205,8 +229,8 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                                Int[reduced_mode_counts...], Int(cut_region_count),
                                Int(fit_failure_count), Float64(moment_fit_residual_max),
                                Int(cut_fallback_count), Int(cut_fallback_points),
-                               Int(facet_region_count), Int(surface_region_count),
-                               Int(interface_region_count))
+                               Int(facet_region_count), Int(cut_facet_region_count),
+                               Int(surface_region_count), Int(interface_region_count))
 end
 
 # Per-level count of cells deactivated by a `LevelMask` (mask and
@@ -991,6 +1015,7 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                                inactive_cell_counts=_inactive_cell_counts(spaces),
                                reduced_mode_counts=_reduced_mode_counts(layout),
                                facet_region_count=_region_count(facet_regions),
+                               cut_facet_region_count=_cut_facet_region_count(facet_regions),
                                surface_region_count=_region_count(surface_regions),
                                interface_region_count=_region_count(interface_regions))
     _set_plan_stats_multi!(diag, space_plans)
@@ -1108,6 +1133,76 @@ end
 # used for the diagnostics `facet_region_count` / `surface_region_count` /
 # `interface_region_count` fields.
 _region_count(regions::AbstractDict) = sum(length, values(regions); init=0)
+
+# How many of the resolved facet regions integrate over area that is not in Ω —
+# the diagnostics field `cut_facet_region_count`, counted the same way
+# `facet_region_count` is (summed over every cached selector, so a region two
+# selectors share is counted once per selector, exactly as the total is).
+#
+# Why the number is worth reporting at all. Grid-aligned facet integration is
+# level-set-blind: `_boundary_facet_regions` takes no `PhysicalDomain` argument,
+# selects its contributing levels with `_level_side_is_physical` — pure mesh-edge
+# versus domain-edge geometry — and partitions the face over `_side_cells`.
+# Nothing on that path consults `V.physical`. A `FacetRegion` is therefore the
+# *whole* grid-aligned face of its parent cells, carrying a tensor Gauss rule
+# over all of it, and where that face leaves Ω the rule integrates the fictitious
+# part along with the physical part. Every consumer of a facet region inherits
+# it: the L² Dirichlet mass and right-hand side, a Neumann / Robin / Nitsche term
+# placed with `on = boundary(…)`, and `boundary_integral`. A homogeneous datum is
+# unaffected — ∫ 0 = 0 over any region, and `_needs_dirichlet_projection` skips
+# the boundary walk outright for one — which is exactly why the condition can sit
+# in a working model unnoticed. This count is what makes it visible before a
+# nonzero datum or a flux term meets it.
+#
+# The test is on the region's own *face*, not on its parent cells, and the
+# distinction is not academic: a cut cell can have a face lying wholly inside Ω,
+# and the integral over that face is then exactly right. Testing the cells would
+# make the number a loose upper bound — on the space-time cavity example at
+# `SC_CELLS = 3` it reads 61 of 81 against a true 1, because the growing cavity
+# cuts nearly every cell while touching only the `t = 0` and `t = T` faces.
+function _cut_facet_region_count(regions::Dict{RegionKey,Vector{FacetRegion{D,T}}}) where {D,T}
+    total = 0
+    for ((_, space), list) in regions
+        physical = space.physical
+        physical === nothing && continue
+        total += count(region -> _facet_region_exits_domain(physical, region), list)
+    end
+    return total
+end
+
+# True iff some sampled point of `region`'s face lies strictly outside Ω, which
+# is what makes the facet integral over it wrong: the rule spends weight on area
+# the physical domain does not contain. A region whose face lies *entirely*
+# outside Ω counts too — that is the extreme case, not an exception, and it is
+# the shape a symmetry plane through a hole produces (a cut cell whose whole
+# grid-aligned edge is inside the hole).
+#
+# `levelset_value` is the CSG tree's scalar reconstruction, `≤ 0` exactly on Ω.
+# Its docstring warns against using it for *integration*, because collapsing the
+# tree to max/min creases ∂Ω and costs the quadrature kernel its high order. That
+# warning is about smoothness and does not apply here: the reconstruction's
+# *sign* is exact by construction, and a sign is all this asks for.
+#
+# Resolution, stated rather than implied. The samples are the region's own
+# quadrature points — exactly the resolution at which the integral is taken — plus
+# the `2ᴰ` corners of the region's extent, so that a rule whose points are all
+# interior cannot miss a crossing that only reaches an edge. A fictitious sliver
+# falling between samples is missed, which makes the count a lower bound; that is
+# acceptable for a diagnostic precisely because such a sliver contributes
+# correspondingly little to the integral it is warning about. It never
+# over-reports, because every sample lies on the region itself.
+#
+# The corner loop walks `2ᴰ` and not `2^(D−K)` points: on a constrained axis
+# `lower` and `upper` coincide, so the extra indices repeat corners the facet
+# already has rather than inventing new ones, and this way the walk needs no
+# free-axis bookkeeping to stay dimension-generic.
+function _facet_region_exits_domain(physical::PhysicalDomain, region::FacetRegion{D,T}) where {D,T}
+    any(x -> levelset_value(physical, x) > 0, region.points) && return true
+    return any(CartesianIndices(ntuple(_ -> 2, Val(D)))) do corner
+        x = SVector{D,T}(ntuple(d -> corner.I[d] == 1 ? region.lower[d] : region.upper[d], Val(D)))
+        return levelset_value(physical, x) > 0
+    end
+end
 
 # Resolve one selector into its full list of `FacetRegion`s (the union
 # of regions across every facet the selector covers). Used by
@@ -1837,6 +1932,7 @@ function diagnostics(model::Model{D,T}, solution; exact=nothing) where {D,T}
             active_unknowns=diag.active_unknowns, raw_dofs=raw_dof_count(model.dofs),
             integration_regions=diag.integration_regions,
             facet_region_count=diag.facet_region_count,
+            cut_facet_region_count=diag.cut_facet_region_count,
             surface_region_count=diag.surface_region_count,
             interface_region_count=diag.interface_region_count,
             small_overlap_count=diag.small_overlap_count, small_overlaps=diag.small_overlaps,
