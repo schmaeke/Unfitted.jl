@@ -2023,7 +2023,10 @@ end
 # region list. Reads from the per-kind cache on `model` when the entry exists
 # (every (target, space) site referenced by `prepare(problem)` is pre-resolved);
 # falls back to a fresh build against `space` for one-shot calls like
-# `assemble_matrix(model, block_with_unseen_on=…)`.
+# `assemble_matrix(model, block_with_unseen_on=…)`. "Fresh" is per *selector*,
+# not per face: the miss path resolves through the model's `FacetResolver`, so an
+# unseen selector built from faces `prepare` already resolved reuses them, and a
+# genuinely new face is resolved once however many such calls name it.
 #
 # `space` is half of the cache key, not merely a fallback for the miss path: a
 # hit is by construction a region list already built against that same space, so
@@ -2033,7 +2036,7 @@ end
 # the space themselves rather than take the default.
 function _resolve_on_regions(model::Model{D,T}, selector::BoundarySelector,
                              space=model.problem.space) where {D,T}
-    return get(() -> _facet_regions_for_selector(space, selector, model.dofs.tolerance),
+    return get(() -> _facet_regions_for_selector(space, selector, model.facet_resolver),
                model.facet_regions, (selector, space))
 end
 

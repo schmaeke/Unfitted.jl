@@ -309,6 +309,90 @@ struct FacetRegion{D,T<:Real}
     normal::SVector{D,T}
 end
 
+# Key of the per-*face* memo a `FacetResolver` holds: one entry per
+# `(space, facet)` pair, where the facet is the `(axis, side)` list a
+# `BoundarySelector` decomposes into (`_facets`). This is one level below
+# `RegionKey` (`model.jl`), which keys whole selectors.
+#
+# The distinction matters because a selector is a *union* of faces while
+# `_boundary_facet_regions` resolves *one* face, so two selectors that are not
+# value-equal can still overlap: `boundary(:all)` covers every face, hence every
+# face any other selector names. Keyed on the selector, each overlap resolves the
+# shared face again; keyed on the face, each face of each space is resolved
+# exactly once and the selectors' region vectors are assembled from the shared
+# results. That is worth doing because the overlap is not rare — it is what any
+# spelling of "the whole boundary except one face" produces for a coupled
+# problem, one such selector per field.
+#
+# The space half is identity-keyed, because `problem_spaces` already deduplicates
+# spaces by `===`: "a distinct discretisation" is package-wide synonymous with
+# "a distinct `Space` object". The `sides` half is a `Vector{Tuple{Int,Symbol}}`,
+# which `Tuple` hashes and compares element-wise, so the same face spelled by two
+# different selectors is one key.
+const FacetKey = Tuple{Any,Vector{Tuple{Int,Symbol}}}
+
+"""
+    FacetResolver{D,T}(tolerance)
+    FacetResolver{D,T}(tolerance, faces)
+
+The package's one route from a boundary face to its [`FacetRegion`](@ref)s: the
+geometry tolerance the resolution runs at, together with the per-face memo
+(`FacetKey` → region list) it fills as faces are asked for.
+
+One resolver belongs to a [`Model`](@ref) and lives as long as it does, so every
+consumer of grid-aligned boundary integration shares one resolution per
+`(space, face)` pair — the per-selector cache `prepare` builds
+(`_resolve_facet_regions`), the one-shot lookup `_resolve_on_regions` falls back
+to for a selector no `prepare` saw, and the L² Dirichlet projection
+(`_dirichlet_projection`), which reaches the same faces from the dof layer.
+Sharing is worth arranging because `_boundary_facet_regions` is a pure function
+of `(V, sides, tolerance)`: a second resolution of a face can only ever
+reproduce the first one, at full price.
+
+The memo is filled lazily and so is mutated by lookups, which is safe for the
+same reason the integration plan's moment-fit cache is: every resolution happens
+on the task that called the public API — `prepare`, `update_dirichlet!`,
+`boundary_integral`, or an `assemble*` call resolving its passes — and never
+inside an assembly worker, which is handed a region list that is already built.
+
+Fields:
+
+  - `tolerance::GeometryTolerance{T}` — the tolerance every resolution through
+    this memo runs at. It travels with the memo rather than with each call
+    because it is part of what a cached entry *means*: the coordinates a face is
+    partitioned at are merged against it, so regions built at one tolerance are
+    not the regions another would have produced, and a consumer holding a
+    different one must not read these entries. `_project_dirichlet_values!`
+    raises on the mismatch rather than resolving against the wrong memo.
+  - `faces::Dict{FacetKey,Vector{FacetRegion{D,T}}}` — the memo itself. The
+    space half of a key is matched by identity, so an entry for a space that is
+    no longer referenced is dead weight and never a stale answer; every mutator
+    replaces the model's resolver along with the dof layout, which is what keeps
+    such entries from accumulating across a move or a mask flip. Within one space
+    the memo is bounded by construction: a `BoundarySelector` decomposes into
+    codim-`K` facets of the background box, of which there are at most `3^D − 1`
+    (each axis is unconstrained, pinned low, or pinned high), so no sequence of
+    one-shot lookups can grow it without limit.
+"""
+struct FacetResolver{D,T<:Real}
+    tolerance::GeometryTolerance{T}
+    faces::Dict{FacetKey,Vector{FacetRegion{D,T}}}
+end
+
+function FacetResolver{D,T}(tolerance::GeometryTolerance{T}) where {D,T<:Real}
+    return FacetResolver{D,T}(tolerance, Dict{FacetKey,Vector{FacetRegion{D,T}}}())
+end
+
+# Resolve one face of `V` through `facets`, building it with
+# `_boundary_facet_regions` (defined below) on a miss. This is that function's
+# only `get!` call site anywhere in the package, which is what makes "one
+# resolution per (space, face) per model lifetime" a property of the code rather
+# than a convention several independent call sites happen to honour.
+function _resolve_face(facets::FacetResolver{D,T}, V::Space{D,T},
+                       sides::Vector{Tuple{Int,Symbol}}) where {D,T}
+    return get!(() -> _boundary_facet_regions(V, sides, facets.tolerance), facets.faces, (V, sides))
+end
+
 # Axes *not* constrained by `sides`. Each codim-1 face has `D − 1` free
 # axes; a codim-D vertex has zero free axes. Used to size the
 # free-axis tensor quadrature and to enumerate which axes carry physical
@@ -786,9 +870,11 @@ side is accumulated from.
 
 Fields:
 
-  - `facets::Int` — the number of (condition, facet) pairs the
+  - `facet_count::Int` — the number of (condition, facet) pairs the
     projection was built for. A condition list of a different shape
-    cannot reuse it.
+    cannot reuse it. Named for the count rather than for the facets
+    themselves because `facets` is, everywhere else on this path, the
+    [`FacetResolver`](@ref) the facets are resolved through.
   - `unknowns::Vector{Vector{Int}}` — per component, the raw dofs the
     projection solves for: the dofs of that component carrying a
     physical Dirichlet condition and no artificial elimination
@@ -804,7 +890,7 @@ Fields:
 # Validity
 
 A projection is valid for the `(layout, space, condition-structure)`
-triple it was built from. The unknown sets, the facets and the mass
+triple it was built from. The unknown sets, the facet count and the mass
 depend on the mesh, the masks and each condition's boundary selector,
 field and component — never on a condition's *value*. Those are exactly
 the quantities [`update_dirichlet!`](@ref) pins with
@@ -822,7 +908,7 @@ produces the same floating-point `b` — and, from the same stored
 factorisation, the same `c` — as a full rebuild would.
 """
 struct DirichletProjection{D,T<:Real}
-    facets::Int
+    facet_count::Int
     unknowns::Vector{Vector{Int}}
     factors::Vector{DirichletFactor{T}}
     samples::Vector{FacetTraceSamples{D,T}}
@@ -856,16 +942,25 @@ end
 # matrices, and right-hand sides — each accumulated only over the facets
 # where a condition actually constrains that component — remove both. For
 # all-component (vector) conditions this reduces to the previous behaviour.
-function _dirichlet_projection(layout::DofLayout{D,T}, V::Space{D,T}, dirichlet) where {D,T}
+#
+# `facets` is the model's [`FacetResolver`](@ref): the boundary walk below reads
+# the *same* resolved faces the assembly path and `boundary_integral` read, so
+# the operator and the projected datum can never integrate different facets.
+function _dirichlet_projection(layout::DofLayout{D,T}, V::Space{D,T}, facets::FacetResolver{D,T},
+                               dirichlet) where {D,T}
     ncomp = layout.components
-    facets = _dirichlet_facet_count(dirichlet, Val(D))
+    facet_count = _dirichlet_facet_count(dirichlet, Val(D))
     unknowns = [[raw
                  for raw in eachindex(layout.raw_keys)
                  if layout.elimination_source[raw] === :free && layout.physical_dirichlet[raw, c]]
                 for c in 1:ncomp]
-    empty_factors = DirichletFactor{T}[nothing for _ in 1:ncomp]
-    all(isempty, unknowns) &&
-        return DirichletProjection{D,T}(facets, unknowns, empty_factors, FacetTraceSamples{D,T}[])
+    # Nothing is constrained anywhere: no mass to accumulate and no facet to walk,
+    # so the projection is the empty one its `facet_count` still has to carry.
+    if all(isempty, unknowns)
+        return DirichletProjection{D,T}(facet_count, unknowns,
+                                        DirichletFactor{T}[nothing for _ in 1:ncomp],
+                                        FacetTraceSamples{D,T}[])
+    end
 
     index = [Dict(raw => i for (i, raw) in pairs(unknowns[c])) for c in 1:ncomp]
     # The constrained-boundary mass couples only the physically-Dirichlet dofs
@@ -876,7 +971,8 @@ function _dirichlet_projection(layout::DofLayout{D,T}, V::Space{D,T}, dirichlet)
     samples = FacetTraceSamples{D,T}[]
     for condition in dirichlet
         for sides in _facets(condition.boundary, Val(D))
-            push!(samples, _sample_dirichlet_facet!(mass, index, layout, V, condition, sides))
+            push!(samples,
+                  _sample_dirichlet_facet!(mass, index, layout, V, facets, condition, sides))
         end
     end
 
@@ -895,7 +991,7 @@ function _dirichlet_projection(layout::DofLayout{D,T}, V::Space{D,T}, dirichlet)
         push!(factors, issuccess(factor) ? factor : pinv(mass[component]))
     end
 
-    return DirichletProjection{D,T}(facets, unknowns, factors, samples)
+    return DirichletProjection{D,T}(facet_count, unknowns, factors, samples)
 end
 
 # Walk one condition's facet: the boundary regions on that facet × the
@@ -904,7 +1000,7 @@ end
 # accumulate the mass-matrix contribution of every component the condition
 # constrains.
 function _sample_dirichlet_facet!(mass::Vector{Matrix{T}}, index::Vector{Dict{Int,Int}},
-                                  layout::DofLayout{D,T}, V::Space{D,T},
+                                  layout::DofLayout{D,T}, V::Space{D,T}, facets::FacetResolver{D,T},
                                   condition::DirichletCondition,
                                   sides::Vector{Tuple{Int,Symbol}}) where {D,T}
     ncomp = layout.components
@@ -914,7 +1010,7 @@ function _sample_dirichlet_facet!(mass::Vector{Matrix{T}}, index::Vector{Dict{In
     values = T[]
     rows = [Int[] for _ in 1:ncomp]
 
-    for region in _boundary_facet_regions(V, sides, layout.tolerance)
+    for region in _resolve_face(facets, V, sides)
         # Everything about a parent's trace except the point: the level lookup,
         # the cell's dof list, and the facet-incident subset of its local basis.
         # `region.parents` is constant across the region's quadrature points by
@@ -1021,23 +1117,51 @@ function _accumulate_dirichlet_rhs!(rhs::Vector{Vector{T}}, samples::FacetTraceS
     return rhs
 end
 
+# The [`FacetResolver`](@ref) a Dirichlet projection resolves its faces through:
+# the caller's when it supplied one, a private throw-away keyed on the layout's
+# own tolerance otherwise (the standalone `dof_layout(V; dirichlet)` call, which
+# has no model to share with).
+#
+# A tolerance mismatch is a caller bug and is raised as one. A memo's entries
+# were merged against *its* tolerance, so reading them with a layout built at
+# another one would project the datum over a different partition of ∂Ω than the
+# one the layout's constrained dofs were detected on. Quietly substituting a
+# fresh resolver instead would hide that behind a second resolution of every
+# face — exactly the cost sharing the resolver exists to remove.
+function _dirichlet_resolver(layout::DofLayout{D,T},
+                             facets::Union{Nothing,FacetResolver{D,T}}) where {D,T}
+    facets === nothing && return FacetResolver{D,T}(layout.tolerance)
+    facets.tolerance == layout.tolerance ||
+        throw(ArgumentError("facet resolver tolerance $(facets.tolerance) does not match the dof " *
+                            "layout's $(layout.tolerance); a layout and the resolver it projects " *
+                            "through must come from the same prepare"))
+    return facets
+end
+
 # Refill `layout.constrained_values` from `dirichlet`, returning the
 # [`DirichletProjection`](@ref) used so a caller that re-projects the same
 # layout can hand it back and skip the boundary walk. `projection` is reused
 # when given; the facet-count check is a cheap guard for a caller that reaches
 # past `update_dirichlet!`'s structural check, which is what actually
 # establishes that a cached projection still matches the condition list.
-function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T}, dirichlet,
+#
+# `facets` is the resolver the boundary walk resolves faces through, or `nothing`
+# to resolve through a private one; see `_dirichlet_resolver`.
+function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T},
+                                    facets::Union{Nothing,FacetResolver{D,T}}, dirichlet,
                                     projection::Union{Nothing,DirichletProjection{D,T}}=nothing) where {D,
                                                                                                         T}
-    fill!(layout.constrained_values, zero(T))
     ncomp = layout.components
     plan = if projection === nothing ||
-              projection.facets != _dirichlet_facet_count(dirichlet, Val(D))
-        _dirichlet_projection(layout, V, dirichlet)
+              projection.facet_count != _dirichlet_facet_count(dirichlet, Val(D))
+        _dirichlet_projection(layout, V, _dirichlet_resolver(layout, facets), dirichlet)
     else
         projection
     end
+    # Only now clear the old values. Everything that can reject the call — the
+    # resolver's tolerance above all — has happened, so a rejected call leaves the
+    # layout exactly as it found it instead of zeroed and unprojected.
+    fill!(layout.constrained_values, zero(T))
     all(isempty, plan.unknowns) && return plan
 
     rhs = [zeros(T, length(plan.unknowns[c])) for c in 1:ncomp]

@@ -675,18 +675,18 @@ end
     V = ladder(dom; cells=2, order=2, depth=1, splits=2)
     V = adapt(V, 2 => [CartesianIndex(1, 1)])
 
-    faces = Dict{Unfitted.FacetKey,Vector{Unfitted.FacetRegion{2,Float64}}}()
-    whole = Unfitted._facet_regions_for_selector(V, boundary(:all), tol, faces)
-    single = Unfitted._facet_regions_for_selector(V, boundary(axis=1, side=:lower), tol, faces)
+    facets = Unfitted.FacetResolver{2,Float64}(tol)
+    whole = Unfitted._facet_regions_for_selector(V, boundary(:all), facets)
+    single = Unfitted._facet_regions_for_selector(V, boundary(axis=1, side=:lower), facets)
     # Four entries, one per face of the space — not the five face resolutions
     # the two selectors would have asked for one at a time.
-    @test length(faces) == 4
+    @test length(facets.faces) == 4
 
     # Every memoised face carries exactly what an independent resolution of that
     # face builds: same region count, same order, same quadrature, same parents.
     for sides in Unfitted._facets(boundary(:all), Val(2))
         reference = Unfitted._boundary_facet_regions(V, sides, tol)
-        cached = faces[(V, sides)]
+        cached = facets.faces[(V, sides)]
         @test length(cached) == length(reference)
         for (c, r) in zip(cached, reference)
             @test c.sides == r.sides
@@ -703,7 +703,7 @@ end
     # The second selector got the memo's regions themselves, not copies of them —
     # which is the storage half of the saving — and `boundary(:all)`'s union
     # still opens with that same face, since `_facets` lists it first.
-    shared = faces[(V, [(1, :lower)])]
+    shared = facets.faces[(V, [(1, :lower)])]
     @test length(single) == length(shared)
     @test all(a === b for (a, b) in zip(single, shared))
     @test all(a === b for (a, b) in zip(view(whole, 1:length(shared)), shared))
@@ -718,6 +718,111 @@ end
     @test length(both.facet_regions) == 2
     @test diagnostics(both).facet_region_count == length(whole) + length(single)
     @test l2_error(solve!(both), both, g) < 1.0e-12
+end
+
+@testset "one FacetResolver resolves each face of a model exactly once" begin
+    # The memo above used to be a throw-away of the per-selector sweep, and the L²
+    # Dirichlet projection had none at all — it called `_boundary_facet_regions`
+    # itself, so a face carrying a nonzero datum was resolved twice per `prepare`
+    # and again on every `update_dirichlet!`. One `FacetResolver` per model is now
+    # the only route to a face, and the assertions below are on object IDENTITY
+    # rather than on a count, because a count is precisely what a second,
+    # equal-looking build would also satisfy.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2)
+    V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(1, 1), order=2)
+    face = boundary(axis=1, side=:lower)
+    # Two overlapping selectors — the second names a face the first already covers
+    # — and a NONZERO datum, which is what makes the projection walk the boundary
+    # at all: `_needs_dirichlet_projection` skips a homogeneous one, so under a zero
+    # datum one of the two consumers would be silent and the test vacuous.
+    g(x) = 1 + x[1] + 2x[2]
+    model = prepare(poisson(V; source=0.0,
+                            dirichlet=[dirichlet(g; on=boundary(:all)), dirichlet(g; on=face)]))
+    resolver = model.facet_resolver
+
+    # The four faces of the space, resolved once each — against the five
+    # selector × face pairs the two selectors name between them, and the nine
+    # resolutions the two consumers would have asked for separately.
+    @test resolver.tolerance == model.dofs.tolerance
+    @test Set(keys(resolver.faces)) ==
+          Set((model.problem.space, sides) for sides in Unfitted._facets(boundary(:all), Val(2)))
+
+    # Every region in every per-selector cache entry IS one of the resolver's,
+    # position for position — not a copy of one carrying the same numbers.
+    for ((selector, each_space), list) in model.facet_regions
+        shared = reduce(vcat,
+                        (resolver.faces[(each_space, sides)]
+                         for sides in Unfitted._facets(selector, Val(2))))
+        @test length(list) == length(shared)
+        @test all(a === b for (a, b) in zip(list, shared))
+    end
+
+    # A load step resolves nothing. `update_dirichlet!` re-projects through the
+    # model's resolver, so it walks the entries that are already there — the same
+    # list objects, not equal rebuilds of them. This is the cost consolidation
+    # buys, and the reason to do it before a facet rule becomes anything more
+    # expensive than a tensor product.
+    before = copy(resolver.faces)
+    update_dirichlet!(model, [dirichlet(g; on=boundary(:all)), dirichlet(g; on=face)])
+    @test Set(keys(resolver.faces)) == Set(keys(before))
+    @test all(resolver.faces[key] === before[key] for key in keys(before))
+
+    # And the projection resolves through *this* resolver, which the assertions so
+    # far cannot see: `_resolve_facet_regions` runs after `system_layout` at
+    # `prepare` and names the Dirichlet selectors among its own sites, so the four
+    # keys above would be here either way. Emptying the memo first makes the
+    # question order-sensitive. Dropping the cached `DirichletProjection` forces
+    # the next load step to rebuild it, hence to walk the boundary again, and the
+    # faces it resolves on that walk are the only thing that can refill the memo —
+    # so a projection holding a resolver of its own leaves it empty.
+    delete!(model.dirichlet_projections, only(model.dofs.fields).name)
+    empty!(resolver.faces)
+    update_dirichlet!(model, [dirichlet(g; on=boundary(:all)), dirichlet(g; on=face)])
+    @test Set(keys(resolver.faces)) == Set(keys(before))
+
+    # The same hand-off on the `prepare` side, which runs one level further down:
+    # `system_layout` forwards the resolver through `dof_layout` into the
+    # projection, so a resolver handed to the layout *alone* comes back carrying
+    # the conditions' faces. That is the half of the thread the step above cannot
+    # reach, and the order is the whole point again — at `prepare` this walk
+    # happens first, which is why `_resolve_facet_regions` afterwards resolves
+    # nothing and the model ends up at four.
+    fresh = Unfitted.FacetResolver{2,Float64}(model.dofs.tolerance)
+    Unfitted.system_layout(model.problem; tolerance=model.dofs.tolerance, facets=fresh)
+    @test Set(keys(fresh.faces)) == Set(keys(before))
+
+    # A resolver at another tolerance is not interchangeable: its entries were
+    # merged against that tolerance, so the faces it holds are not the partition
+    # this layout's constrained dofs were detected on, and projecting through it
+    # would fit `g` over a boundary the operator does not integrate — the one
+    # failure mode sharing the resolution is meant to rule out. It raises, and
+    # raises before touching the values it was going to overwrite.
+    layout = only(model.dofs.fields).dofs
+    projected = copy(layout.constrained_values)
+    @test any(!iszero, projected)
+    coarse = Unfitted.FacetResolver{2,Float64}(GeometryTolerance(Float64; merge=1.0e-3))
+    @test_throws ArgumentError Unfitted._project_dirichlet_values!(layout, model.problem.space,
+                                                                   coarse, model.problem.dirichlet)
+    @test layout.constrained_values == projected
+
+    # `nothing` is the standalone spelling — `dof_layout(V; dirichlet)` with no
+    # model behind it — and projects through a private resolver at the layout's own
+    # tolerance. Bit-identical to the shared route, which is what makes the
+    # resolver a saving rather than a semantic change.
+    @test Unfitted._project_dirichlet_values!(layout, model.problem.space, nothing,
+                                              model.problem.dirichlet) isa
+          Unfitted.DirichletProjection{2,Float64}
+    @test layout.constrained_values == projected
+
+    # `move!` replaces the resolver along with the dof layout, so the memo tracks
+    # the live discretisation: every key holds the space the model has now, and the
+    # faces resolved on the superseded space are gone rather than carried forward
+    # as ballast no lookup can reach.
+    retired = model.problem.space
+    move!(model; level=2, to=box((0.3, 0.3), (0.8, 0.8)))
+    @test model.problem.space !== retired
+    @test !isempty(model.facet_resolver.faces)
+    @test all(key[1] === model.problem.space for key in keys(model.facet_resolver.faces))
 end
 
 @testset "cut_facet_region_count reports level-set-blind facet integration" begin
@@ -941,13 +1046,16 @@ end
                 dofs.raw_keys) == 1
 end
 
-# `_boundary_facet_regions` has exactly two callers, and they must see the same
-# facet: `_facet_regions_for_selector` (src/model.jl), behind the per-face memo
-# that assembly and `boundary_integral` share, and `_sample_dirichlet_facet!`
-# (src/dirichlet.jl), which calls it directly to build the L² boundary-trace
-# projection. They agree today only because the function is a pure function of
-# `(V, sides, tolerance)`. Nothing else in the suite would notice if one of them
-# stopped being.
+# Grid-aligned facet integration has two consumers that must see the same facet:
+# `_facet_regions_for_selector` (src/model.jl), which assembly and
+# `boundary_integral` read through, and `_sample_dirichlet_facet!`
+# (src/dirichlet.jl), which builds the L² boundary-trace projection. Both resolve
+# through the model's one `FacetResolver`, so today they read the same region
+# objects; before that they called `_boundary_facet_regions` separately and agreed
+# only because it is a pure function of `(V, sides, tolerance)`. Nothing else in
+# the suite would notice if either side stopped reading the shared resolution —
+# which is a live risk again the moment one of them is given a rule the other is
+# not.
 #
 # The defect this guards against is the level-set blindness of grid-aligned
 # facet integration — the one `cut_facet_region_count` reports. See the testset
@@ -992,7 +1100,7 @@ end
     # unchanged, so this re-projects exactly the values `prepare` already fitted.
     update_dirichlet!(model, [dirichlet(g; on=face)])
     projection = model.dirichlet_projections[:u]
-    @test projection.facets == 1
+    @test projection.facet_count == 1
     trace = only(projection.samples)
 
     # The operator side, read independently and through the public consumer:

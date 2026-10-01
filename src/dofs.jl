@@ -45,6 +45,11 @@
 # forward-references `_has_physical_dirichlet` and
 # `_project_dirichlet_values!`; the references resolve at call time
 # (when `prepare(problem)` runs, after every source file is loaded).
+# Its `facets` keyword is left unannotated for the same reason: a
+# `FacetResolver{D,T}` annotation is evaluated where the method is
+# *defined*, which is before `dirichlet.jl` has introduced that type, so
+# the typing is done by `_project_dirichlet_values!` at the end of the
+# forward chain instead.
 
 # ── Dof keys and layout struct ────────────────────────────────────────────────
 
@@ -931,7 +936,8 @@ end
 
 """
     dof_layout(V::Space; dirichlet=[], tolerance=GeometryTolerance(T), components=1,
-                         prune=true, classify_cache=_ClassifyCache{D,T}()) -> DofLayout
+                         prune=true, classify_cache=_ClassifyCache{D,T}(),
+                         facets=nothing) -> DofLayout
 
 Construct the basis-aware global dof layout for a superposition
 [`Space`](@ref). The construction proceeds in four stages:
@@ -980,6 +986,13 @@ Keyword arguments:
     `PhysicalDomain` fold). The fictitious-fold constraint predicate and the
     coverage rule both reuse it instead of re-classifying fold-boundary cells;
     defaults to a fresh empty cache for standalone calls.
+  - `facets` — the model's `FacetResolver`, through which stage 4b resolves the
+    boundary faces it projects the Dirichlet datum over. Sharing it is what makes
+    the projection read the very faces the assembly path and
+    [`boundary_integral`](@ref) read, at one resolution per `(space, face)`
+    rather than one per consumer. `nothing` (the default) gives this call a
+    private resolver at `tolerance`, which is what a standalone `dof_layout` with
+    no model behind it wants. Its tolerance must match `tolerance`.
 
 The integrated Legendre family produces single-raw constraints,
 reducing the resolved expansion to strong elimination (`raw_expansion =
@@ -991,7 +1004,8 @@ the expansion automatically.
 """
 function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
                     components::Integer=1, prune::Bool=true, prune_exempt=(),
-                    classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
+                    classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}(),
+                    facets=nothing) where {D,T}
     components > 0 || throw(ArgumentError("dof layout components must be positive"))
     raw_by_key = Dict{TensorDofKey{D},Int}()
     raw_keys = TensorDofKey{D}[]
@@ -1128,7 +1142,8 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     # Stage 4b: project nonzero Dirichlet data onto the boundary trace
     # space. Zero-only conditions skip this — `constrained_values` is
     # already zero from the construction above.
-    _needs_dirichlet_projection(dirichlet) && _project_dirichlet_values!(layout, V, dirichlet)
+    _needs_dirichlet_projection(dirichlet) &&
+        _project_dirichlet_values!(layout, V, facets, dirichlet)
     return layout
 end
 
