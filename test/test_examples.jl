@@ -553,6 +553,25 @@
         end
     end
 
+    # The space-time cavity is one solve, so its temperature error is the only
+    # accuracy number there is — the displacement it drives has no closed form on
+    # this geometry (the example's header explains why one cannot exist alongside
+    # a spatially varying temperature), and verifying the elastic block against
+    # the free-expansion field is a unit test's job rather than this example's.
+    # `fit failure count` is the geometry assertion: a nonzero value means the
+    # growing cone has grazed a grid line, which is what the off-grid cavity
+    # centre exists to avoid, and it is exact rather than banded because it is a
+    # structural fact about the run and not a converged quantity. `cut region
+    # count` guards the other direction — a run that folded the cavity away
+    # entirely would still converge, and would still be wrong.
+    function check_spacetime_cavity(output, tol)
+        check_single_l2(output, tol.l2)
+        check_exact(output, "fit failure count", 0)
+        regions = metric_values(output, "cut region count")
+        @test length(regions) == 1
+        @test all(>(0), regions)
+    end
+
     # Where the traveling laser writes its ParaView series and its CSV. The
     # series writer deletes nothing, by design, so the directory is cleared
     # before the batch runs — otherwise a stale collection from an earlier run
@@ -786,6 +805,39 @@
               check=check_curing,
               tol=(rebuilds=3, picard=16, excursion=5.0e-1, accuracy_percent=3.0,
                    cured_area=(1.0e-2, 1.0), contrast=10)),
+             # Space-time thermo-elasticity on a growing cavity: time is the
+             # third mesh axis, so the moving domain is one static cone-shaped
+             # level set and the whole transient is a single solve. The only case
+             # carrying a non-symmetric custom space-time form, an anisotropic
+             # order, and a field whose component count (2) differs from the mesh
+             # dimension (3) — none of which had coverage before.
+             #
+             # This case is the suite's one exception to the `-O0` bargain in the
+             # header: it is bound by the cut-cell moment fit, not by compilation,
+             # and at order (2, 2, 3) the fit runs at moment order (4, 4, 6) in
+             # three dimensions. The shipped default (`SC_CELLS = 6`) measures
+             # 29 s standalone at -O2: relative L² 4.7177e-3 on 6533 unknowns over
+             # 84 cut regions, moment-fit residual 2.66e-8, zero fit failures.
+             # Coarsened to `SC_CELLS = 3` here, which gives 3.6152e-2 and 25.2 s
+             # in this batch.
+             #
+             # Order, not mesh size, is this example's cost driver, and it is steep
+             # enough to be worth recording where someone will find it. The moment
+             # fit is exact for the *tensor* basis, so it solves for ∏(2p+1)
+             # weights per cut cell — 125, 343, 729 in 3-D at p = 2, 3, 4 — and
+             # its cost grows faster than the cube of that: measured serially on an
+             # idle machine at cells (8, 8, 8), `prepare` takes 2.05 s at p = 2,
+             # 47.95 s at p = 3 and 1091.2 s at p = 4. `subcell_length_scale`
+             # barely matters by comparison (2.18 / 2.05 / 2.05 s across three
+             # halvings) because the exact Lipschitz certificate decides most cells
+             # without subdividing. That is why the example fixes p = 2 in space
+             # instead of sweeping it.
+             #
+             # Those timings are easy to get wrong: they are numerics-bound, so a
+             # single competing process on the machine inflates them severalfold.
+             # Re-measure serially on an idle box before trusting any of them.
+             (name="applications/spacetime_cavity_2d", env=Dict("SC_CELLS" => "3"),
+              requires=("Tensors",), check=check_spacetime_cavity, tol=(l2=1.0e-1,)),
 
              # ── Reproductions ───────────────────────────────────────────────
              # Smooth manufactured Laplace, published 12×12 p=4 config (already
