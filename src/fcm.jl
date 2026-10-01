@@ -300,8 +300,33 @@ const _MAX_FIT_MATRIX_ENTRIES = 6_000_000
 
 # Cap the candidate cloud so the NNLS design matrix stays bounded regardless of
 # the volume rule's point count: at most `budget · nbasis` candidates, and never
-# more than `_MAX_FIT_MATRIX_ENTRIES` matrix entries. A uniform stride over the
-# (base-then-fiber ordered) rule keeps the survivors well spread through Ω ∩ R.
+# more than `_MAX_FIT_MATRIX_ENTRIES` matrix entries.
+#
+# The survivors are `cap` indices spread across the rule by FRACTIONAL spacing,
+# `(n − 1) / (cap − 1)`, rather than by an integer stride. The integer stride this
+# replaces carried two separate defects, both measured on the space-time cone
+# fixture of `examples/applications/spacetime_cavity_2d` at cells (8, 8, 8):
+#
+#   1. It drew the wrong NUMBER of points. `cld(n, cap)` rounds the stride up, so
+#      the draw retained `cld(n, stride)` candidates and not `cap` — 2744 of an
+#      allowed 4374 on a 5488-point rule, throwing away 37% of a budget the solve
+#      was already sized for.
+#   2. It aliased. The volume rule emits its points fiber by fiber in blocks of
+#      `gauss_points`, so an integer stride sharing a factor with that block
+#      length reaches only `gauss_points / gcd` of the per-fiber node positions.
+#      At moment order (8, 8, 8) the fiber count is 14, and the 5488- and
+#      8232-point rules both take stride 2: 82 of 146 cut cells then fitted to a
+#      relative residual above 1e-12 and 57 of them above 1e-3. Drawn without the
+#      stride at the *same* candidate count, those cells reach ~2e-15. Shifting
+#      the stride's starting index does not help, so what matters is the
+#      periodicity and not its phase.
+#
+# Fractional spacing addresses both at once: it spends the whole budget, and its
+# step is not an integer, so successive indices sweep the per-fiber positions
+# instead of locking onto a fixed subset of them. It is deterministic, which
+# everything in this path owes `test/characterize.jl`, and it is
+# dimension-generic — the rule is a flat `Vector{SVector{D,T}}` and nothing here
+# inspects `D`.
 #
 # `budget` comes from `_candidate_budget(attempt)` and grows with the retry, so
 # each attempt draws a genuinely denser cloud. The `max` keeps the first
@@ -311,8 +336,11 @@ function _cap_candidates(points::Vector{SVector{D,T}}, moment_order::NTuple{D,In
                          budget::Int) where {D,T}
     nbasis = _moment_basis_count(moment_order)
     cap = min(budget * nbasis, max(6 * nbasis, cld(_MAX_FIT_MATRIX_ENTRIES, nbasis)))
-    length(points) <= cap && return points
-    return points[1:cld(length(points), cap):end]
+    n = length(points)
+    n <= cap && return points
+    # `n > cap` holds here, so the spacing exceeds 1 and the rounded indices are
+    # strictly increasing: the draw cannot repeat a candidate.
+    return points[round.(Int, range(1, n; length=cap))]
 end
 
 # ── 5. Public moment-fit rule ─────────────────────────────────────────────────
@@ -324,28 +352,40 @@ const _MAX_IMPLICIT_ATTEMPTS = 3
 # Candidate-cloud budget of `attempt`, as a multiple of the moment-basis size
 # `nbasis`: 6·nbasis on the first attempt, eight times that on each retry.
 #
-# The budget has to grow for the retry to mean anything. Lawson–Hanson is greedy
-# and terminates as soon as its passive set holds `nbasis` columns (`nsetp ≥ m`
-# in the classical algorithm), so the fit it returns is decided entirely by which
-# candidates the walk was offered: when the columns it picked are only marginally
-# independent, the closing triangular solve is ill-conditioned and the residual
-# lands near 1e-2 instead of 1e-16. A cell carrying many distinct boundary pieces
-# — a coarse mesh cell spanning a dozen holes — is where that happens. Holding the
-# budget at 6·nbasis made all three attempts draw a cloud of the same size, so
-# they failed together and the "denser candidate cloud" the retry promises never
-# materialised. Measured on one such cell (nbasis = 125, 25216 rule points, the
-# moments held fixed): 742 candidates → residual 4.7e-2, 1484 → 2.8e-2,
-# 2802 → 3.0e-2, but 5044 → 3e-16 and 8406 → 6e-16.
+# The budget has to grow for the retry to mean anything, and what it buys is cone
+# membership rather than conditioning. Lawson–Hanson is greedy and terminates as
+# soon as its passive set holds `nbasis` columns (`nsetp ≥ m` in the classical
+# algorithm), so the fit it returns is decided by which candidates the walk was
+# offered — but what decides whether a zero-residual non-negative fit EXISTS over
+# those candidates is narrower: the moments admit one only if `m` lies in the
+# convex cone spanned by the selected columns' moment vectors. The full volume
+# rule always satisfies that by construction, its own positive weights being such
+# a solution. A subset need not, and a subset that does not cannot be rescued by
+# any solver, however well conditioned.
 #
-# The growth factor is large on purpose. `_cap_candidates` selects by a uniform
-# stride, and the volume rule emits its points fiber by fiber in blocks of
-# `gauss_points`, so a stride sharing a factor with that block length reaches
-# only `gauss_points / gcd` of the per-fiber node positions and draws a
-# systematically degenerate cloud. On the cell above (`gauss_points = 8`) the
-# residual at ≈ 750 candidates runs 5e-1 at gcd 8, 2.7e-1 at gcd 4, and 1e-2–5e-2
-# at gcd 2 or 1. A modest bump therefore only buys another unreliable draw; a ×8
-# step moves each retry to a plainly different scale, where the stride is small
-# enough that the aliasing no longer decides the outcome.
+# That distinction is measurable, and the measurement picks cone membership. At
+# moment order (8,8,8) on the space-time cone geometry, with the draw held
+# non-degenerate so that only the COUNT varies, the relative residual runs 1.9e-2
+# at 1.5·nbasis candidates, 9.2e-3 at 2·nbasis and 1.9e-3 at 3·nbasis, then falls
+# to 3.1e-15 at the 6·nbasis the first attempt uses. A ×2 change in count moves
+# the residual by orders of magnitude while leaving the conditioning of any one
+# selection untouched — the signature of the cone widening, not of a triangular
+# solve improving. The first attempt's 6·nbasis is therefore load-bearing and
+# cannot be trimmed to buy speed.
+#
+# An earlier measurement of the same effect, on a cell carrying many distinct
+# boundary pieces (nbasis = 125, 25216 rule points, the moments held fixed): 742
+# candidates → residual 4.7e-2, 1484 → 2.8e-2, 2802 → 3.0e-2, but 5044 → 3e-16
+# and 8406 → 6e-16. Holding the budget at 6·nbasis for every attempt made all
+# three draw a cloud of the same size, so they failed together and the "denser
+# candidate cloud" the retry promises never materialised.
+#
+# The growth factor is large on purpose: a ×8 step moves each retry to a plainly
+# different scale, so a cell whose cone was too narrow gets a materially wider one
+# instead of another draw of much the same extent. Before `_cap_candidates`
+# selected by even fractional spacing the step also had to escape the aliasing of
+# an integer stride, which a modest bump could not reliably do; that failure mode
+# is gone, but the cone argument for a large step is not.
 #
 # The first attempt's budget is deliberately unchanged, so every cell that
 # already fits keeps its rule unchanged and pays nothing extra; only cells that

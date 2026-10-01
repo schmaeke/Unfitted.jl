@@ -156,6 +156,50 @@ end
     @test sum(wq) ≈ 1.0 atol = 1e-10
 end
 
+@testset "FCM — the candidate cap spends its whole budget, without an integer stride" begin
+    # Regression, two defects in one line. `_cap_candidates` used to draw
+    # `points[1:cld(n, cap):end]`, which
+    #
+    #   1. kept `cld(n, stride)` points rather than `cap`, because rounding the
+    #      stride *up* overshoots the reduction — at `n = 200`, `cap = 150` the
+    #      stride is 2 and only 100 candidates survive, a third of the budget the
+    #      solve is already sized for thrown away; and
+    #   2. selected on a fixed period, which aliases against the fiber-block
+    #      length of the volume rule (`implicit_volume_quadrature` emits points in
+    #      blocks of `gauss_points`), reaching only `gauss_points / gcd` of the
+    #      per-fiber node positions and drawing a degenerate cloud.
+    #
+    # Even fractional spacing fixes both. The properties asserted here are the
+    # ones the fit depends on: the full budget is spent, no candidate is drawn
+    # twice, the ends of the rule are both represented, and a rule already under
+    # the cap is handed back untouched.
+    order = (4, 4)
+    nbasis = prod(order .+ 1)
+    budget = Unfitted._candidate_budget(1)
+    cap = min(budget * nbasis, max(6 * nbasis, cld(Unfitted._MAX_FIT_MATRIX_ENTRIES, nbasis)))
+    pts = [SVector(Float64(i), 0.0) for i in 1:200]
+    @test length(pts) > cap          # the premise of the test: the cap must bite
+
+    capped = Unfitted._cap_candidates(pts, order, budget)
+    # The whole budget, not `cld(n, stride)` of it. The old stride returned 100.
+    @test length(capped) == cap
+    # Distinct candidates: a duplicated column is a rank-deficient one.
+    @test length(unique(capped)) == cap
+    # Monotone, and spanning the rule rather than a prefix of it.
+    @test issorted([p[1] for p in capped])
+    @test first(capped) == first(pts)
+    @test last(capped) == last(pts)
+    # No fixed period: the gaps between selected indices must take more than one
+    # value, which is exactly what an integer stride cannot do and what the
+    # fiber-block aliasing needs.
+    gaps = diff([Int(p[1]) for p in capped])
+    @test length(unique(gaps)) > 1
+
+    # A rule already inside the cap is returned as-is, identically.
+    small = [SVector(Float64(i), 0.0) for i in 1:(cap-1)]
+    @test Unfitted._cap_candidates(small, order, budget) === small
+end
+
 @testset "FCM — the candidate-cloud retry rescues a many-feature cut cell" begin
     # Regression. `moment_fit_rule` retries a failed fit with a *denser candidate
     # cloud*, but the cap in `_cap_candidates` used to be a fixed `6 · nbasis`,
