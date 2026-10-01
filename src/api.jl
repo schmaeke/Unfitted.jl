@@ -335,7 +335,13 @@ worst such ratio. And which dofs are *constrained* is a separate question,
 decided per dof key by the grid-aligned face test alone, so a dof can be
 constrained while the trimmed support it would be fitted on carries no
 measure at all; the trace solve then falls back from a Cholesky
-factorisation to a pseudoinverse and assigns it the minimum-norm value.
+factorisation to a pseudoinverse and assigns it the minimum-norm value. That
+outcome is reported rather than chosen — `unsupported_dirichlet_dof_count`
+counts those dofs, `unsupported_dirichlet_dofs` names them and
+`dirichlet_trace_factors` says which branch each component's solve took, all on
+[`AssemblyDiagnostics`](@ref) — because what a Dirichlet condition *ought* to
+mean on a dof whose volume support still reaches into `Ω` is an open question;
+see [`UnsupportedDirichletDof`](@ref).
 `α` on the [`PhysicalDomain`](@ref) is honoured on facets and is the knob
 for both — it defaults to `0`, so neither is stabilised unless asked for, and
 raising it is what costs the `Ω`-only datum above.

@@ -967,6 +967,159 @@ end
     @test_throws DomainError prepare(poisson(Vkept; source=0.0, dirichlet=[only_on_omega]))
 end
 
+@testset "a Dirichlet dof with no measure on its facet support is reported, not hidden" begin
+    # Trimming splits two questions an untrimmed grid-aligned boundary answered
+    # together. Which dofs a condition CONSTRAINS is decided per dof key by the face
+    # test alone; what is INTEGRATED over a face is only the part inside Ω. So a dof
+    # can carry a Dirichlet condition while every facet region its trace reaches has
+    # been trimmed away: its row of the trace mass is identically zero, `cholesky`
+    # reports the mass indefinite, and the pseudoinverse fallback assigns it the
+    # minimum-norm value. These assertions pin the REPORT and not the outcome — what
+    # such a condition ought to mean is an open semantic question, and answering it
+    # by leaving the dof free would move `active_unknowns` and the size of the
+    # system.
+    #
+    # Ω = (0,1)² ∖ {‖x‖ ≤ 0.3} at 4×4 puts the hole on a corner, so the corner cell
+    # [0, ¼]² is CUT — its far corner sits at r = √2/4 ≈ 0.354 > 0.3 — hence active
+    # and parenting a region on each of its two boundary faces, while both of those
+    # faces lie at r ≤ 0.25 < 0.3 and are wholly outside Ω. The whole-cell
+    # fictitious fold cannot reach that: the cell is not fictitious, only its faces
+    # are, which is the one configuration a face can reach only by being trimmed
+    # inside a single cell.
+    disc = physical_domain(leaf(x -> 0.3 - hypot(x[1], x[2]); lipschitz=1.0);
+                           subcell_length_scale=0.0625)
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=disc)
+    g(x) = sin(x[1] + 2x[2])
+    model = prepare(poisson(V; source=x -> 5 * sin(x[1] + 2x[2]),
+                            dirichlet=[dirichlet(g; on=boundary(:all))]))
+    layout = only(model.dofs.fields).dofs
+    report = diagnostics(model)
+
+    # The hazard is live rather than assumed: the cell classifies cut, stays active,
+    # and the first region of each of its two faces carries no rule at all.
+    @test classify_cell(disc, cell_box(V, CartesianIndex(1, 1); level=1)) === :cut
+    @test active_cells(model; level=1)[1, 1]
+    for sides in ([(1, :lower)], [(2, :lower)])
+        region = first(model.facet_resolver.faces[(model.problem.space, sides)])
+        @test region.kind === :fictitious
+        @test isempty(region.weights)
+    end
+
+    # Three dofs, and exactly the three the geometry names: of those the face test
+    # constrains on the two faces, the ones supported on that first region ALONE are
+    # the node at the origin — the only node of either face inside the hole — and
+    # each face's own bubble over its first cell. The node at (0, ¼) also sits on
+    # the second region, which the arc merely crosses, so it keeps a measure of 0.2
+    # and is fitted normally. Identified by dof key rather than by count, a count
+    # being what a different three dofs would satisfy too.
+    node = Unfitted._axis_dof_key(1, 0)                 # the node at coordinate 0
+    bubble = Unfitted._axis_dof_key(1, 2)               # cell 1's own bubble mode
+    @test report.unsupported_dirichlet_dof_count == 3
+    @test all(r -> r.field === :u && r.component == 1, report.unsupported_dirichlet_dofs)
+    @test Set(layout.raw_keys[r.raw] for r in report.unsupported_dirichlet_dofs) ==
+          Set(Unfitted.TensorDofKey{2}(1, axes)
+              for axes in ((node, node), (bubble, node), (node, bubble)))
+
+    # The branch the count explains. A zero row makes the mass positive
+    # SEMI-definite, which is the one thing `cholesky(…; check = false)` does
+    # detect, so the solve falls back — and carries on.
+    @test report.dirichlet_trace_factors == [:pseudoinverse]
+
+    # What it falls back to, and why the count is worth carrying at all: the
+    # minimum-norm value is zero only to the roundoff of the pseudoinverse's
+    # singular-value decomposition, so two of the three come out at ~1e-16 and the
+    # pinned dofs are invisible in a scan of the projected values — 31 of the 32
+    # nonzero, not 29.
+    @test all(abs(layout.constrained_values[r.raw, r.component]) < 1.0e-14
+              for r in report.unsupported_dirichlet_dofs)
+    @test count(!iszero, layout.constrained_values) == 31
+
+    # And the discretisation does not move. Reporting a dof is not refusing to
+    # constrain it; the alternative — leaving an unsupported dof free — is the
+    # separate semantic decision this deliberately does not take, and taking it
+    # would show up right here.
+    @test active_unknowns(model) == 49
+
+    # Both quantities come off the boundary mass, so they are datum-independent in
+    # exactly the sense the cached projection is: a load increment restates them.
+    pinned = copy(report.unsupported_dirichlet_dofs)
+    update_dirichlet!(model, [dirichlet(x -> 3 * sin(x[1] + 2x[2]); on=boundary(:all))])
+    @test diagnostics(model).dirichlet_trace_factors == [:pseudoinverse]
+    @test diagnostics(model).unsupported_dirichlet_dofs == pinned
+
+    # The far end of a face, which an index running the wrong way along the axis
+    # would get wrong while still counting two. Ω = {x₂ ≤ x₁ + 0.55} restricts to
+    # φ = x₂ − 0.55 on the x₁ = 0 face, so it is the FOURTH region, over
+    # x₂ ∈ [¾, 1], that lies outside Ω: the node at x₂ = 1 and cell 4's bubble lose
+    # their measure, while the node at x₂ = ¾ keeps the 0.05 the third region has.
+    plane = physical_domain(leaf(x -> x[2] - x[1] - 0.55; lipschitz=sqrt(2.0));
+                            subcell_length_scale=0.0625)
+    face = boundary(axis=1, side=:lower)
+    Vplane = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=plane)
+    cut_model = prepare(poisson(Vplane; source=0.0,
+                                dirichlet=[dirichlet(x -> 1 + x[1] + 2x[2]; on=face)]))
+    cut_report = diagnostics(cut_model)
+    cut_keys = only(cut_model.dofs.fields).dofs.raw_keys
+    @test cut_report.dirichlet_trace_factors == [:pseudoinverse]
+    @test cut_report.unsupported_dirichlet_dof_count == 2
+    @test Set(cut_keys[r.raw] for r in cut_report.unsupported_dirichlet_dofs) ==
+          Set(Unfitted.TensorDofKey{2}(1, axes)
+              for axes in
+                  ((node, Unfitted._axis_dof_key(4, 1)), (node, Unfitted._axis_dof_key(4, 2))))
+
+    # Two controls. A non-immersed face has nothing to trim, so the solve is a
+    # Cholesky and the list is empty; and a homogeneous condition runs no projection
+    # at all, so both read their "nothing has happened" value until a nonzero
+    # increment establishes them — the one event short of a rebuild that moves either.
+    Vplain = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2)
+    plain = prepare(poisson(Vplain; source=0.0,
+                            dirichlet=[dirichlet(x -> 1 + x[1]; on=boundary(:all))]))
+    @test diagnostics(plain).dirichlet_trace_factors == [:cholesky]
+    @test isempty(diagnostics(plain).unsupported_dirichlet_dofs)
+
+    quiet = prepare(poisson(Vplain; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    @test diagnostics(quiet).dirichlet_trace_factors == [:none]
+    @test diagnostics(quiet).unsupported_dirichlet_dof_count == 0
+    update_dirichlet!(quiet, [dirichlet(x -> 1 + x[1]; on=boundary(:all))])
+    @test diagnostics(quiet).dirichlet_trace_factors == [:cholesky]
+
+    # Per component, because the trace solve is: a condition scoped to one channel
+    # integrates only its own facets, so the other channel has no unknown to solve
+    # for and reports `:none` beside the fallback. Here u₁ is pinned on the x₁ = 0
+    # face alone, which costs it that face's two dofs supported only inside the hole
+    # — the origin node and the face's first bubble — while u₂ is untouched.
+    u = field(:u, V; components=2)
+    vector_model = prepare(poisson(u; source=SVector(0.0, 0.0),
+                                   dirichlet=[dirichlet(0.5; on=face, field=u, component=1)]))
+    vector_report = diagnostics(vector_model)
+    @test vector_report.dirichlet_trace_factors == [:pseudoinverse, :none]
+    @test [r.component for r in vector_report.unsupported_dirichlet_dofs] == [1, 1]
+    @test Set(only(vector_model.dofs.fields).dofs.raw_keys[r.raw]
+              for r in vector_report.unsupported_dirichlet_dofs) ==
+          Set(Unfitted.TensorDofKey{2}(1, axes) for axes in ((node, node), (node, bubble)))
+
+    # And the knob that removes the condition instead of reporting it, which is also
+    # why no shipped example reaches it. At α > 0 a wholly fictitious face keeps an
+    # α-scaled full-face rule in place of an empty one, so the three dofs above get
+    # α-stabilised mass rather than none, the trace mass is positive definite again
+    # and nothing is left unsupported. α = 1e-6 — the only nonzero α any shipped
+    # example uses, `spacetime_cavity_2d`'s — already suffices, the fallback's test
+    # being definiteness and not conditioning. It stays a knob rather than becoming a
+    # default because the price is the one `boundary` documents: the rule's points
+    # no longer lie inside Ω, so a datum defined only there can no longer be used.
+    stabilised = physical_domain(leaf(x -> 0.3 - hypot(x[1], x[2]); lipschitz=1.0); alpha=1.0e-6,
+                                 subcell_length_scale=0.0625)
+    Vstable = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=stabilised)
+    stable_model = prepare(poisson(Vstable; source=x -> 5 * sin(x[1] + 2x[2]),
+                                   dirichlet=[dirichlet(g; on=boundary(:all))]))
+    stable_faces = stable_model.facet_resolver.faces
+    @test first(stable_faces[(stable_model.problem.space, [(1, :lower)])]).kind ===
+          :fictitious_alpha
+    @test diagnostics(stable_model).dirichlet_trace_factors == [:cholesky]
+    @test diagnostics(stable_model).unsupported_dirichlet_dof_count == 0
+    @test active_unknowns(stable_model) == 49
+end
+
 @testset "a facet region's kind is the verdict on its own face, in every codimension" begin
     # Every codimension goes through the same two steps — restrict the level set to
     # the facet's affine slice, then classify the region's own face box against it —

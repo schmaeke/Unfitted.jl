@@ -1105,13 +1105,67 @@ end
 # indefiniteness, and `nothing` when the component has no unknowns at all.
 const DirichletFactor{T} = Union{Nothing,Cholesky{T,Matrix{T}},Matrix{T}}
 
+# Which of those three a component's factor is, as a short tag. The
+# pseudoinverse branch is the only externally visible trace of a boundary trace
+# space that has gone singular — `cholesky(…; check = false)` reports the
+# indefiniteness and the projection carries on against the minimum-norm solution
+# — so the branch is reported rather than merely taken; see
+# `AssemblyDiagnostics.dirichlet_trace_factors`. A tag and not the type itself,
+# so neither a reader nor a recorded report is reading a Julia version's choice
+# of type parameters.
+_trace_branch(::Nothing) = :none
+_trace_branch(::Cholesky) = :cholesky
+_trace_branch(::AbstractMatrix) = :pseudoinverse
+
 """
-    DirichletProjection{D,T}(facets, unknowns, factors, samples)
+    UnsupportedDirichletDof(field, component, raw)
+
+Diagnostic record for a dof that a Dirichlet condition constrains with no
+measure anywhere on its facet support. Which dofs a condition constrains is
+decided per dof key by the grid-aligned face test alone, while what is
+*integrated* over a face is only the part inside `Ω` (see [`boundary`](@ref)), so
+on an immersed space the two can come apart: every facet region this dof's trace
+reaches is trimmed down to nothing, its row and column of the boundary mass
+`∫ φᵢ φⱼ ds` are identically zero, and the L² projection determines no value for
+it. The pseudoinverse the trace solve falls back to then assigns it the
+minimum-norm value — zero, to the roundoff of the singular-value decomposition.
+
+The configuration is reachable only inside one cell, and no whole-cell fold can
+stand in for it: a cell whose own faces lie entirely outside `Ω` while the cell
+itself is cut stays active and keeps parenting regions on those faces. Measured
+on `Ω = (0,1)² ∖ {‖x‖ ≤ 0.3}` at 4×4, order 2, with a nonzero datum on
+`boundary(:all)` — the corner cell `[0, ¼]²` is cut (its far corner sits at
+`r = 0.354 > 0.3`) while both of its boundary faces lie at `r ≤ 0.25`: three dofs
+report here, the node at the origin and the two face bubbles of that cell.
+
+Reported, not resolved. What a Dirichlet condition *ought* to mean on such a dof
+is an open semantic question rather than a defect in the rule: its *volume*
+support still reaches into `Ω`, so leaving it free instead is a defensible answer
+— and a different discretisation, since it moves `active_unknowns` and the size
+of the system. The package therefore pins the value it does assign and names the
+dofs it assigned it to. Fields:
+
+  - `field::Symbol` — the field whose dof layout the dof belongs to.
+  - `component::Int` — the component the condition constrains it in. A
+    component-scoped condition integrates only its own facets, so one component
+    of a dof can be unsupported while another is fitted normally.
+  - `raw::Int` — the dof's raw index, i.e. its position in that field's
+    [`DofLayout`](@ref) `raw_keys`, which is where its level and its per-axis
+    modes are read back from.
+"""
+struct UnsupportedDirichletDof
+    field::Symbol
+    component::Int
+    raw::Int
+end
+
+"""
+    DirichletProjection{D,T}(facet_count, unknowns, unsupported, factors, samples)
 
 Everything in the L² Dirichlet projection `M c = b` that the prescribed
-data `g` do not enter: the per-component unknown sets, the per-component
-factorised boundary mass, and the per-facet trace samples a right-hand
-side is accumulated from.
+data `g` do not enter: the per-component unknown sets, which of those the mass
+leaves undetermined, the per-component factorised boundary mass, and the
+per-facet trace samples a right-hand side is accumulated from.
 
 Fields:
 
@@ -1125,6 +1179,13 @@ Fields:
     physical Dirichlet condition and no artificial elimination
     (`elimination_source === :free`, which excludes the overlay boundary
     as well as covered-mode pruning and the linear dedup).
+  - `unsupported::Vector{Vector{Int}}` — per component, the subset of
+    `unknowns` whose row of the boundary mass is identically zero: dofs the
+    conditions constrain over a facet support that carries no measure, so the
+    solve assigns them the minimum-norm value instead of a fitted one. Empty on
+    every untrimmed boundary. Reported through [`diagnostics`](@ref) as
+    [`UnsupportedDirichletDof`](@ref) records; see that docstring for what the
+    package does and does not decide about them.
   - `factors::Vector{DirichletFactor{T}}` — per component, the solved
     boundary mass (see `DirichletFactor`).
   - `samples::Vector{FacetTraceSamples{D,T}}` — one entry per
@@ -1155,6 +1216,7 @@ factorisation, the same `c` — as a full rebuild would.
 struct DirichletProjection{D,T<:Real}
     facet_count::Int
     unknowns::Vector{Vector{Int}}
+    unsupported::Vector{Vector{Int}}
     factors::Vector{DirichletFactor{T}}
     samples::Vector{FacetTraceSamples{D,T}}
 end
@@ -1202,7 +1264,7 @@ function _dirichlet_projection(layout::DofLayout{D,T}, V::Space{D,T}, facets::Fa
     # Nothing is constrained anywhere: no mass to accumulate and no facet to walk,
     # so the projection is the empty one its `facet_count` still has to carry.
     if all(isempty, unknowns)
-        return DirichletProjection{D,T}(facet_count, unknowns,
+        return DirichletProjection{D,T}(facet_count, unknowns, [Int[] for _ in 1:ncomp],
                                         DirichletFactor{T}[nothing for _ in 1:ncomp],
                                         FacetTraceSamples{D,T}[])
     end
@@ -1221,6 +1283,19 @@ function _dirichlet_projection(layout::DofLayout{D,T}, V::Space{D,T}, facets::Fa
         end
     end
 
+    # The dofs this projection cannot determine, read off the mass it just
+    # accumulated. `M` is the Gram matrix of the boundary traces over the part of
+    # ∂Ω these conditions integrate and every facet weight is non-negative, so
+    # `M[i,i] = ∫ φᵢ² ds` vanishes exactly when φᵢ vanishes almost everywhere
+    # there — and the whole row and column vanish with it. The diagonal is
+    # therefore an exact test rather than a thresholded one, and deliberately so:
+    # it reads zero only where the rule integrates nothing, which on a trimmed
+    # face is structural (an empty rule, or a trace vanishing at every point of
+    # one), while a merely *small* diagonal is the conditioning question
+    # `min_relative_facet_measure` already answers and not a missing constraint.
+    unsupported = [Int[raw for (i, raw) in pairs(unknowns[c]) if iszero(mass[c][i, i])]
+                   for c in 1:ncomp]
+
     # Solve `M c = b` for each component. Cholesky first; pseudoinverse fallback
     # on the rare indefinite case (degenerate / zero-area facets under heavy
     # masking, or a codim-D point pin whose facet carries no measure). Both are
@@ -1236,7 +1311,7 @@ function _dirichlet_projection(layout::DofLayout{D,T}, V::Space{D,T}, facets::Fa
         push!(factors, issuccess(factor) ? factor : pinv(mass[component]))
     end
 
-    return DirichletProjection{D,T}(facet_count, unknowns, factors, samples)
+    return DirichletProjection{D,T}(facet_count, unknowns, unsupported, factors, samples)
 end
 
 # Walk one condition's facet: the boundary regions on that facet × the
@@ -1407,6 +1482,15 @@ function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T},
     # resolver's tolerance above all — has happened, so a rejected call leaves the
     # layout exactly as it found it instead of zeroed and unprojected.
     fill!(layout.constrained_values, zero(T))
+    # Mirror the solve's datum-independent verdict onto the layout. The layout is
+    # the half of the two that `prepare` keeps — it discards the projection it has
+    # just built — so `diagnostics` reads both quantities from here. Restated on
+    # every call rather than only on the one that built the plan, so a
+    # re-projection through a cached plan cannot leave a stale pair behind.
+    for c in 1:ncomp
+        layout.dirichlet_trace_factors[c] = _trace_branch(plan.factors[c])
+        copy!(layout.unsupported_dirichlet[c], plan.unsupported[c])
+    end
     all(isempty, plan.unknowns) && return plan
 
     rhs = [zeros(T, length(plan.unknowns[c])) for c in 1:ncomp]

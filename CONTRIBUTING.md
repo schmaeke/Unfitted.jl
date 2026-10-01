@@ -1015,6 +1015,18 @@ indicator representations are intentionally not supported.
     Dirichlet condition: trimming is a small-cut generator for the trace mass
     exactly as a thin cut cell is one for the stiffness matrix.
     Reported and not stabilised, per "Small overlaps and conditioning" above),
+    `dirichlet_trace_factors` (which branch the L² Dirichlet trace solve took on
+    each component of each field — `:cholesky`, `:pseudoinverse`, or `:none`
+    where the component had nothing to solve for — concatenated in
+    field-declaration order),
+    `unsupported_dirichlet_dof_count` / `unsupported_dirichlet_dofs` (the dofs a
+    Dirichlet condition constrains with no measure anywhere on their facet
+    support, which is the configuration trimming makes reachable: the constrained
+    set is decided by the grid-aligned face test alone, so a dof whose every
+    facet region is trimmed away is constrained with nothing left to fit it on
+    and the pseudoinverse pins it to zero. Reported, not resolved — not
+    constraining such a dof would move `active_unknowns` and the size of the
+    system, and is a separate semantic decision),
     `surface_region_count`, `interface_region_count`, `raw_dofs`,
     `active_unknowns`, `levels`
     (one entry per level with `id`, `role`, `cells`, `order` — the nominal

@@ -178,6 +178,19 @@ Fields:
   - `constrained_values::Matrix{T}` — `(raw, component) → value` for
     constrained dofs. Filled by [`_project_dirichlet_values!`](@ref)
     for nonzero physical Dirichlet data; zero otherwise.
+  - `dirichlet_trace_factors::Vector{Symbol}` — per component, which branch the
+    L² Dirichlet trace solve took: `:cholesky`, `:pseudoinverse` where the
+    boundary mass came out indefinite, or `:none` where the component had no
+    constrained dof to solve for.
+  - `unsupported_dirichlet::Vector{Vector{Int}}` — per component, the raw dofs
+    that solve left undetermined: constrained with no measure anywhere on their
+    facet support, hence pinned to their minimum-norm value instead of fitted.
+    See [`UnsupportedDirichletDof`](@ref). Empty on every untrimmed boundary.
+
+    The last two are filled by the same call that fills `constrained_values` and
+    both describe the *mesh* rather than the datum, so a load increment restates
+    them unchanged. Both read `:none` / empty until a projection has run at all,
+    homogeneous data skipping it entirely.
   - `active_count::Int` — total number of active (i.e. enumerated) dofs.
   - `tolerance::GeometryTolerance{T}` — tolerance used during boundary
     detection.
@@ -194,6 +207,8 @@ struct DofLayout{D,T<:Real}
     raw_expansion::Vector{Vector{Tuple{Int,T}}}
     has_linear_constraints::Bool
     constrained_values::Matrix{T}
+    dirichlet_trace_factors::Vector{Symbol}
+    unsupported_dirichlet::Vector{Vector{Int}}
     active_count::Int
     tolerance::GeometryTolerance{T}
 end
@@ -1137,7 +1152,8 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
 
     layout = DofLayout{D,T}(ncomp, cell_dofs_by_level, raw_keys, active_component,
                             physical_dirichlet, elimination_source, raw_expansion,
-                            has_linear_constraints, zeros(T, nraw, ncomp), active_count, tolerance)
+                            has_linear_constraints, zeros(T, nraw, ncomp), fill(:none, ncomp),
+                            [Int[] for _ in 1:ncomp], active_count, tolerance)
 
     # Stage 4b: project nonzero Dirichlet data onto the boundary trace
     # space. Zero-only conditions skip this — `constrained_values` is

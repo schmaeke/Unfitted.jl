@@ -227,6 +227,40 @@ Fields:
     reports the ratio and leaves the stabilisation to the caller, `α` on the
     domain being the knob — `CONTRIBUTING.md` asks for conditioning behaviour to
     be visible before stabilisation is added, not for a default stabiliser.
+  - `dirichlet_trace_factors::Vector{Symbol}` — which branch the L² Dirichlet
+    trace solve `M c = b` took, one entry per component of each field,
+    concatenated in field-declaration order. Every field contributes exactly its
+    own `components` entries, so a position names a `(field, component)` pair
+    without a lookup. `:cholesky` where that component's boundary mass
+    `∫ φᵢ φⱼ ds` was positive definite, `:pseudoinverse` where `cholesky`
+    reported it indefinite, and `:none` where the component had no constrained
+    dof to solve for — which is also what a model prepared with homogeneous data
+    reads, constant-zero data skipping the projection at [`prepare`](@ref)
+    altogether.
+
+    `:pseudoinverse` is the entry worth reading: it is the only externally
+    visible trace of a boundary trace space that has gone singular, and on an
+    immersed space its commonest cause is the next two fields. It is a
+    definiteness verdict and **not** a conditioning one, so it says nothing
+    about a mass that is merely near-singular — `min_relative_facet_measure` is
+    the field for that, and a `:cholesky` beside a tiny ratio there is the
+    combination to distrust.
+  - `unsupported_dirichlet_dof_count::Int`,
+    `unsupported_dirichlet_dofs::Vector{UnsupportedDirichletDof}` — the dofs a
+    Dirichlet condition constrains with no measure anywhere on their facet
+    support, and their count (`length` of the list, carried as a scalar so a
+    report prints it without walking the list, exactly as `small_overlap_count`
+    is). Trimming is what makes the configuration reachable: which dofs a
+    condition constrains is decided by the grid-aligned face test alone, so a
+    dof whose every facet region is trimmed away is still constrained, while the
+    projection has nothing left to fit it on and the pseudoinverse pins it to
+    zero. Zero on a non-immersed space and on every immersed space whose
+    integrated faces stay inside `Ω`.
+
+    What such a condition *ought* to mean is an open semantic question and the
+    package does not answer it here; the record exists so the answer it does give
+    is not silent. [`UnsupportedDirichletDof`](@ref) has the measured instance
+    and the alternative.
   - `surface_region_count::Int` — total number of
     [`SurfaceRegion`](@ref)s cached on the model, summed across every
     cached [`BoundaryMesh`](@ref). Zero for problems with no
@@ -261,6 +295,9 @@ mutable struct AssemblyDiagnostics
     facet_cut_fallback_count::Int
     facet_moment_fit_residual_max::Float64
     min_relative_facet_measure::Float64
+    dirichlet_trace_factors::Vector{Symbol}
+    unsupported_dirichlet_dof_count::Int
+    unsupported_dirichlet_dofs::Vector{UnsupportedDirichletDof}
     surface_region_count::Int
     interface_region_count::Int
 end
@@ -285,6 +322,8 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                              cut_fallback_points=0, facet_region_count=0, cut_facet_region_count=0,
                              facet_fit_failure_count=0, facet_cut_fallback_count=0,
                              facet_moment_fit_residual_max=0.0, min_relative_facet_measure=1.0,
+                             dirichlet_trace_factors=Symbol[],
+                             unsupported_dirichlet_dofs=UnsupportedDirichletDof[],
                              surface_region_count=0, interface_region_count=0)
     return AssemblyDiagnostics(Int(dimension), Int(active_unknowns), Int(integration_regions),
                                Int(small_overlap_count), _float_small_overlaps(small_overlaps),
@@ -298,8 +337,11 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                                Int(facet_region_count), Int(cut_facet_region_count),
                                Int(facet_fit_failure_count), Int(facet_cut_fallback_count),
                                Float64(facet_moment_fit_residual_max),
-                               Float64(min_relative_facet_measure), Int(surface_region_count),
-                               Int(interface_region_count))
+                               Float64(min_relative_facet_measure),
+                               Symbol[dirichlet_trace_factors...],
+                               length(unsupported_dirichlet_dofs),
+                               UnsupportedDirichletDof[unsupported_dirichlet_dofs...],
+                               Int(surface_region_count), Int(interface_region_count))
 end
 
 # Per-level count of cells deactivated by a `LevelMask` (mask and
@@ -466,6 +508,36 @@ function _set_plan_stats_multi!(diag::AssemblyDiagnostics, plans)
     diag.cut_fallback_count = fallback
     diag.cut_fallback_points = fallback_points
     diag.moment_fit_residual_max = maximum(p.moment_fit_residual_max for p in plans; init=0.0)
+    return diag
+end
+
+# Fold the L² Dirichlet trace solve's own verdict into a diagnostics record in
+# place, and return it so call sites can chain — the counterpart of
+# `_set_plan_stats_multi!` for the boundary-trace half of the layout.
+#
+# Read back off the dof layouts the projection filled rather than off the
+# `DirichletProjection`s themselves, because the projection is per field and
+# transient — `prepare` builds one inside `dof_layout` and discards it, while
+# `update_dirichlet!` caches it on the model — whereas the layout is what every
+# consumer of a prepared model already holds.
+#
+# Both quantities describe the boundary mass and not the datum, so a load
+# increment restates the same answers; the two events that move them are a
+# rebuilt layout and a *first* projection, the latter being why
+# `update_dirichlet!` calls this too. A model prepared with homogeneous data has
+# run no projection at all, and its first nonzero increment is where the branch
+# and the unsupported dofs are established.
+function _set_dirichlet_trace_stats!(diag::AssemblyDiagnostics, layout::SystemLayout)
+    diag.dirichlet_trace_factors = Symbol[branch for field in layout.fields
+                                          for branch in field.dofs.dirichlet_trace_factors]
+    # Self-describing records rather than a flattened vector: the list is empty on
+    # every untrimmed boundary, so there is no position worth counting from.
+    records = UnsupportedDirichletDof[]
+    for field in layout.fields, (component, raws) in pairs(field.dofs.unsupported_dirichlet)
+        append!(records, (UnsupportedDirichletDof(field.name, component, raw) for raw in raws))
+    end
+    diag.unsupported_dirichlet_dofs = records
+    diag.unsupported_dirichlet_dof_count = length(records)
     return diag
 end
 
@@ -1101,6 +1173,7 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                                surface_region_count=_region_count(surface_regions),
                                interface_region_count=_region_count(interface_regions))
     _set_plan_stats_multi!(diag, space_plans)
+    _set_dirichlet_trace_stats!(diag, layout)
     return Model{D,T,typeof(effective_problem)}(effective_problem, problem.space,
                                                 _discretisation_pin(spaces, layout), space_plans,
                                                 fit_caches, layout, nothing, nothing,
@@ -1868,6 +1941,11 @@ reassembled and back-substituted.
     per increment; and the regions themselves come from the model's
     `FacetResolver`, so even that first walk resolves no face
     [`prepare`](@ref) has not already resolved.
+  - The `dirichlet_trace_factors` and `unsupported_dirichlet_dof*` entries of
+    [`diagnostics`](@ref) are refreshed. They too describe the boundary mass, so
+    an increment restates them — except the *first* one on a model prepared with
+    homogeneous data, which runs the trace solve for the first time and is where
+    they are established.
   - `model.matrix` and `model.rhs` are cleared so the next
     [`assemble!`](@ref) (or `assemble_vector` / `assemble_matrix`
     call) picks up the new constrained data through the standard
@@ -1920,6 +1998,11 @@ function update_dirichlet!(model::Model{D,T}, dirichlet) where {D,T}
                                                                                     field_dirichlet,
                                                                                     cached)
     end
+    # A model prepared with homogeneous data has run no trace solve, so this is
+    # where a first nonzero increment establishes its branch and its unsupported
+    # dofs. Later increments restate the same two answers: both describe the
+    # boundary mass, which the structural check above pins.
+    _set_dirichlet_trace_stats!(model.diagnostics, model.dofs)
 
     # Clear cached operators. The RHS depends on the constrained values
     # via column elimination, so the next assembly must rebuild it. The
@@ -2002,6 +2085,9 @@ function diagnostics(model::Model{D,T}, solution; exact=nothing) where {D,T}
             facet_cut_fallback_count=diag.facet_cut_fallback_count,
             facet_moment_fit_residual_max=diag.facet_moment_fit_residual_max,
             min_relative_facet_measure=diag.min_relative_facet_measure,
+            dirichlet_trace_factors=diag.dirichlet_trace_factors,
+            unsupported_dirichlet_dof_count=diag.unsupported_dirichlet_dof_count,
+            unsupported_dirichlet_dofs=diag.unsupported_dirichlet_dofs,
             surface_region_count=diag.surface_region_count,
             interface_region_count=diag.interface_region_count,
             small_overlap_count=diag.small_overlap_count, small_overlaps=diag.small_overlaps,
