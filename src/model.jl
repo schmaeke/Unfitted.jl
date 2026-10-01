@@ -182,9 +182,13 @@ Fields:
     cell's does: a fit (`:cut_fitted`), the raw Saye rule on the slice when
     the residual misses the failure threshold (`:cut_fallback`), and no rule
     at all where `Ω ∩ face` carries none (`:cut_failed` /
-    `:cut_alpha_failed`). The residual is the accuracy statistic for every
-    boundary integral taken over a cut face; it is zero on a model with no
-    cut face.
+    `:cut_alpha_failed`). The residual bounds the fit's own compression error —
+    how well the returned rule reproduces the moments the quadrature kernel
+    handed it — and is zero on a model with no cut face. It does **not** bound
+    the kernel's error on those moments, which is a separate and silent ceiling
+    where the restricted tree's leaves meet inside the face box; the condition
+    for an exact facet rule, and both ways it fails, are in
+    [`boundary`](@ref)'s docstring.
 
     Read a nonzero `facet_fit_failure_count` with
     `facet_moment_fit_residual_max` beside it, because the two name different
@@ -199,18 +203,30 @@ Fields:
   - `min_relative_facet_measure::Float64` — the smallest ratio of a facet
     region's integrated measure (its weight sum) to the full geometric
     measure of its own face, over every resolved facet region. `1.0` when
-    nothing is trimmed, which includes a model with no facet regions at
-    all, and `0.0` when some face lies wholly outside `Ω` under strict
-    `α = 0`. This is the facet analogue of
-    `min_relative_integration_volume` and the conditioning warning to read
-    before a trimmed boundary condition: trimming is a small-cut generator
-    for the Dirichlet trace mass in exactly the way a thin cut cell is one
-    for the stiffness matrix — measured on a straight cut through one face,
-    the trace mass goes from condition 40 at an untrimmed face to 2.8e5 at a
-    ratio of 5e-2 and 9.6e13 at 1e-3. The package reports the ratio and
-    leaves the stabilisation to the caller, `α` on the domain being the
-    knob — `CONTRIBUTING.md` asks for conditioning behaviour to be visible
-    before stabilisation is added, not for a default stabiliser.
+    nothing is trimmed, which includes a model with no facet regions at all.
+    It is a fraction of **one face**, so it is not comparable with
+    `min_relative_integration_volume`, which is one region's volume as a
+    fraction of the whole domain and therefore falls with the cell count rather
+    than with a cut; the two answer different questions and have no common
+    scale.
+
+    `0.0` wants reading beside `facet_fit_failure_count`, for the same reason
+    that field carries a tangency caveat. Two situations report it: a face lying
+    wholly outside `Ω` under strict `α = 0`, which is the one worth looking at,
+    and a zero-measure `:cut_failed` region, where `∂Ω` is merely tangent to the
+    face and the `:full` regions beside it already integrate it exactly.
+    `kirsch_plate_2d` is the in-tree instance of the second — its two symmetry
+    faces report `0.0` here and `2` in `facet_fit_failure_count` while each
+    still integrates to its exact `3.0`.
+
+    Either way it is the conditioning warning to read before a trimmed boundary
+    condition: trimming is a small-cut generator for the Dirichlet trace mass in
+    exactly the way a thin cut cell is one for the stiffness matrix — measured on
+    a single-plane cut through one face, the trace mass goes from condition 40 at
+    an untrimmed face to 2.8e5 at a ratio of 5e-2 and 9.6e13 at 1e-3. The package
+    reports the ratio and leaves the stabilisation to the caller, `α` on the
+    domain being the knob — `CONTRIBUTING.md` asks for conditioning behaviour to
+    be visible before stabilisation is added, not for a default stabiliser.
   - `surface_region_count::Int` — total number of
     [`SurfaceRegion`](@ref)s cached on the model, summed across every
     cached [`BoundaryMesh`](@ref). Zero for problems with no
@@ -1216,10 +1232,11 @@ _region_count(regions::AbstractDict) = sum(length, values(regions); init=0)
 # is the moment fit on the facet's affine slice of Ω rather than an exact tensor
 # product. Every consumer of a facet region inherits that: the L² Dirichlet mass and
 # right-hand side, a Neumann / Robin / Nitsche term placed with `on = boundary(…)`,
-# and `boundary_integral`. On a straight cut the fit is machine-exact; on a curved
-# one it is accurate and not exact, so the count says how much of a model's boundary
-# integration rests on a fitted rule, and `residual_max` says how well those fits
-# went.
+# and `boundary_integral`. That fit is machine-exact only where the restricted level
+# set is a single affine function (`boundary`'s docstring states the condition and
+# both ways it fails), so the count says how much of a model's boundary integration
+# rests on a fitted rule, and `residual_max` says how well those fits reproduced the
+# moments they were given — not how right those moments were.
 #
 # It reads `FacetRegion.kind` and counts everything that is not `:full`. Two
 # properties come from reading the kind rather than re-deriving a test here. It is

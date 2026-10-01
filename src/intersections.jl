@@ -169,10 +169,23 @@ end
 # the rest of assembly. Users whose integrand is only degree-`p` (linear forms
 # / sources) can set the factor to 1, halving the basis at the cost of giving
 # up bilinear-form exactness.
+#
+# `axes` names the axes the fit has coordinates on, which are also the slots of the
+# order it returns: all `D` of them for a volume region, and a facet region's free
+# axes where the fit runs on the facet's affine slice one or more dimensions down
+# (`_facet_region` in `dirichlet.jl`). The convention is per axis, so reading it on
+# a subset is the whole of what a face needs — and reading it from here rather than
+# restating it is what keeps a cut face and the cells behind it integrating products
+# of traces to the same degree. `parents` is any list of items carrying `level` and
+# `cell`, which is both [`ParentRef`](@ref) and `FacetParent`.
 function _moment_order_for_region(V::Space{D}, parents) where {D}
+    return _moment_order_for_region(V, parents, ntuple(identity, Val(D)), Val(D))
+end
+
+function _moment_order_for_region(V::Space, parents, axes, ::Val{N}) where {N}
     factor = V.physical.moment_order_factor
-    return ntuple(D) do d
-        factor * maximum(p -> cell_order(_level_by_id(V, p.level), p.cell)[d], parents)
+    return ntuple(Val(N)) do j
+        factor * maximum(p -> cell_order(_level_by_id(V, p.level), p.cell)[axes[j]], parents)
     end
 end
 

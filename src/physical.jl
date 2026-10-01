@@ -170,10 +170,15 @@ Fields:
     strict cut path; `> 0` enriches every **cut** cell's quadrature with the
     α-scaled full-cell rule, so cut-cell dofs whose basis support lies in the
     fictitious part still get a well-posed contribution (see
-    `_build_region_quadrature` in `intersections.jl`). Fully-fictitious cells
-    (support entirely outside Ω) are **dropped from the dof layout** unless
-    `keep_fictitious` says otherwise; α alone never keeps them, because the α
-    term stabilizes cuts, not whole fictitious cells.
+    `_build_region_quadrature` in `intersections.jl`). It is honoured one
+    dimension down on a boundary **face** in exactly the same way — on the level
+    set restricted to that face's affine slice (`_facet_region` in
+    `dirichlet.jl`) — which is what lets α stabilise a thin physical sliver of
+    face; the price there is that the rule then carries points outside Ω, so a
+    datum defined only on Ω needs `alpha = 0` (see [`boundary`](@ref)).
+    Fully-fictitious cells (support entirely outside Ω) are **dropped from the
+    dof layout** unless `keep_fictitious` says otherwise; α alone never keeps
+    them, because the α term stabilizes cuts, not whole fictitious cells.
   - `keep_fictitious::Bool`: opt into the classic α-FCM treatment where
     fully-fictitious cells are *kept* active with α-scaled full-cell quadrature
     instead of being dropped. `false` (default) drops them, which keeps the

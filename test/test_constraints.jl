@@ -865,6 +865,25 @@ end
     # is the single deliberate pin of that defect's disappearance.
     @test boundary_integral(q -> 1.0, cut_model; on=face) ≈ 0.55 rtol = 1.0e-14
 
+    # Where every point of that rule *is* is the other half of the contract, and
+    # the half no measure can see: a weight sum stays right whenever the stray
+    # points happen to cancel, while `dirichlet`'s promise that a datum defined
+    # only on Ω — a square root, a reciprocal distance, a field interpolated from
+    # a prior solution — is usable on a cut face holds only if no point of the
+    # rule leaves Ω at all. Asserted at the default α = 0, pinned both ways: the
+    # `kept_model` block below is the same geometry under the α-FCM blend, where
+    # the promise is deliberately forfeited.
+    @test all(Unfitted._inside(cut_domain.geometry, p) for r in cut_regions for p in r.points)
+    # And it is a promise such a datum checks for itself. √(0.55 + x₁ − x₂) is real
+    # on the physical face and nowhere above it, so this is the whole class of data
+    # that was unusable on a cut face before trimming — asserted through the public
+    # API, and on the projected values rather than on merely surviving `prepare`.
+    only_on_omega = dirichlet(x -> sqrt(-(x[2] - x[1] - 0.55)); on=face)
+    omega_model = prepare(poisson(Vcut; source=0.0, dirichlet=[only_on_omega]))
+    projected = only(omega_model.dofs.fields).dofs.constrained_values
+    @test all(isfinite, projected)
+    @test count(!iszero, projected) > 0
+
     # Three facet diagnostics come off those same kinds. The fit is exact, so no
     # failure and no fallback; the residual is a real NNLS residual on the cut
     # region and nothing more. `min_relative_facet_measure` is the smallest
@@ -936,6 +955,16 @@ end
     # And the relative measure now reports α on the fictitious face rather than
     # zero: its dofs carry α-stabilised mass instead of none.
     @test diagnostics(kept_model).min_relative_facet_measure ≈ 1.0e-3 rtol = 1.0e-14
+
+    # The blend's price, and the reason α stays opt-in rather than becoming the
+    # default cure for the sliver it stabilises: the full-face tensor rule it
+    # concatenates carries points *outside* Ω, so the α = 0 invariant above is
+    # forfeited on exactly the faces α touches — 5 of the 17 points here. The
+    # datum that prepared cleanly at α = 0 therefore raises, and raises rather
+    # than being silently extended, which is the behaviour to want of it.
+    kept_regions = kept_model.facet_regions[(face, kept_model.problem.space)]
+    @test count(!Unfitted._inside(kept.geometry, p) for r in kept_regions for p in r.points) == 5
+    @test_throws DomainError prepare(poisson(Vkept; source=0.0, dirichlet=[only_on_omega]))
 end
 
 @testset "a facet region's kind is the verdict on its own face, in every codimension" begin
@@ -1057,7 +1086,16 @@ end
     # and the Dirichlet projection resolve through, so its weight sum IS the measure
     # every consumer of that face integrates over.
     tol = GeometryTolerance(Float64)
-    measure(V, sides) = sum(sum(r.weights) for r in Unfitted._boundary_facet_regions(V, sides, tol))
+    regions(V, sides) = Unfitted._boundary_facet_regions(V, sides, tol)
+    measure(V, sides) = sum(sum(r.weights) for r in regions(V, sides))
+    # The anchors are measures, and a measure cannot see *where* the points are: a
+    # weight sum stays right whenever the stray points cancel. So each α = 0 anchor
+    # carries the point-set invariant beside it — every point of the rule inside Ω,
+    # which is what makes a datum defined only on Ω usable on a cut face. The curved
+    # anchor below runs at α = 1e-6 and so is deliberately exempt; the α-FCM blend
+    # and its forfeiture of this invariant are pinned where α is.
+    on_omega(V, sides) = all(Unfitted._inside(V.physical.geometry, p) for r in regions(V, sides)
+                             for p in r.points)
 
     # 1. A symmetry plane through a hole — the shape `kirsch_plate_2d` ships, which
     #    is the reason this defect was worth fixing rather than documenting. Ω is the
@@ -1082,8 +1120,9 @@ end
     for axis in 1:2
         @test measure(Vplate, [(axis, :lower)]) ≈ 3.0 rtol = 1.0e-14
         @test measure(Vplate, [(axis, :upper)]) ≈ 4.0 rtol = 1.0e-14
-        @test [r.kind for r in Unfitted._boundary_facet_regions(Vplate, [(axis, :lower)], tol)] ==
+        @test [r.kind for r in regions(Vplate, [(axis, :lower)])] ==
               [:fictitious, :cut_failed, :full, :full, :full, :full, :full, :full]
+        @test on_omega(Vplate, [(axis, :lower)])
     end
 
     # 2. Two subdomains partition the face they share, which nothing else in the
@@ -1106,6 +1145,10 @@ end
     @test measure₁ ≈ seam_x rtol = 1.0e-14
     @test measure₂ ≈ 1 - seam_x rtol = 1.0e-14
     @test measure₁ + measure₂ ≈ 1.0 rtol = 1.0e-14
+    # Neither half reaches into the other, which the sum alone would not catch: two
+    # rules straying symmetrically across the seam still add to 1.
+    @test on_omega(V₁, [(2, :lower)])
+    @test on_omega(V₂, [(2, :lower)])
 
     # 3. A curved cut face, where the rule is accurate rather than exact. The
     #    space-time cavity's t = 0 slice is the disc of radius r₀ = 0.1373 about
@@ -1118,7 +1161,7 @@ end
     #    declares the sliced sub-boxes graph-like and stops bisecting, so driving
     #    `subcell_length_scale` from 1/12 to 1/192 (effective depth 2 → 6) or capping
     #    `max_depth` at 2 reproduces the value to the last bit. The only knob is the
-    #    moment order, which `_facet_moment_order` takes from the parent cells.
+    #    moment order, which `_moment_order_for_region` takes from the parent cells.
     r₀, ṙ = 0.1373, 0.22
     centre = SVector(0.4967, 0.5013)
     cavity = leaf(x -> (r₀ + ṙ * x[3]) - sqrt((x[1] - centre[1])^2 + (x[2] - centre[2])^2);

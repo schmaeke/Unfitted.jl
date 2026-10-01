@@ -317,7 +317,10 @@ Fields:
     regions whose kind is not `:full`.
   - `points::Vector{SVector{D,T}}` — physical-frame quadrature
     coordinates on the facet, covering `face ∩ Ω` rather than the whole
-    face. **Empty** on a zero-measure region: such a region is kept in the
+    face and so lying inside `Ω` — up to the α-FCM blend when `α > 0`, which
+    appends the full-face tensor points to every trimmed kind and is the one
+    configuration in which a point of a facet rule lies outside `Ω`.
+    **Empty** on a zero-measure region: such a region is kept in the
     list because its parents still carry the trace dofs the dof layer
     constrains, so `points` is not a proxy for the region's extent — read
     `lower` / `upper` for that.
@@ -618,12 +621,24 @@ end
 # therefore move at the boundary-quadrature-error level, not at roundoff.
 #
 # On a *cut* face the exactness argument is the moment fit's rather than tensor
-# Gauss's, and it reaches the same degree by construction: `_facet_moment_order`
-# takes the volume path's own `moment_order_factor × max(cell_order)` over the
-# region's parents, so with the default factor 2 the fitted rule reproduces the
-# moments of products of traces. That makes it exact where the restricted level set
-# is affine or 1-D-bisected, and accurate to the reported residual where it curves —
-# never exact on a curved cut, which is why nothing here promises exactness.
+# Gauss's, and it reaches the same degree by construction: the order is the volume
+# path's own `_moment_order_for_region` read over the free axes, so with the default
+# `moment_order_factor = 2` the fitted rule reproduces the moments of products of
+# traces. The maximum over parents that primitive takes is exactly what a merged
+# region needs, for the same reason `_facet_quadrature_counts` takes one — `adapt`
+# and per-cell order let a region span cells of different orders, and anything less
+# would under-integrate the finest of them.
+#
+# That makes the rule exact where the restricted level set is a single affine
+# function, and accurate to the reported residual where it curves — never exact on a
+# curved cut, which is why nothing here promises exactness. Nor is it exact where the
+# restricted tree's leaves meet at a corner strictly *inside* the face box: the
+# quadrature kernel's base partition places no breakpoint at such a corner
+# (`implicit.jl`), so the moments the fit reproduces are themselves slightly wrong and
+# the residual cannot see it — measured 3.6e-4 on a face cut by two planes meeting
+# inside it, with the fit's own residual at 3.5e-16. That is a pre-existing property
+# of the kernel, shared by volume integration; `boundary`'s docstring states the
+# condition for the public reader.
 function _boundary_facet_regions(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}},
                                  tol::GeometryTolerance{T}) where {D,T}
     touching_levels = [level
@@ -852,23 +867,6 @@ function _facet_tensor_rule(V::Space{D,T}, parents::Vector{FacetParent{D,T}},
     return points, weights
 end
 
-# Per-free-axis moment-fit basis order for a cut facet region: `moment_order_factor
-# × max(cell_order)` over the region's parents, which is `_moment_order_for_region`'s
-# convention (`intersections.jl`) read over the free axes. A face and the cells
-# behind it therefore integrate products of traces to the same degree, which is what
-# makes the Dirichlet trace mass on a cut face as exact as the stiffness block on
-# the cell behind it. The maximum is taken over parents for the same reason
-# `_facet_quadrature_counts` takes one: `adapt` and per-cell order let a merged
-# region span cells of different orders, and anything less than the maximum would
-# under-integrate the finest of them.
-function _facet_moment_order(V::Space{D,T}, parents::Vector{FacetParent{D,T}},
-                             free_axes::Vector{Int}, ::Val{F}) where {D,T,F}
-    factor = V.physical.moment_order_factor
-    return ntuple(Val(F)) do j
-        factor * maximum(p -> cell_order(_level_by_id(V, p.level), p.cell)[free_axes[j]], parents)
-    end
-end
-
 # One merged facet region: the classification of its face, and the rule that
 # verdict calls for. This is the facet counterpart of `_build_region_quadrature`
 # (`intersections.jl`) — the same three-way dispatch, the same α-FCM blend, the
@@ -927,7 +925,7 @@ function _facet_region(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}},
     end
 
     box = _facet_box(lower, upper, free_axes, Val(F))
-    moment_order = _facet_moment_order(V, parents, free_axes, Val(F))
+    moment_order = _moment_order_for_region(V, parents, free_axes, Val(F))
     fit_points, fit_weights, residual, status = moment_fit_rule(slice, box, moment_order;
                                                                 target_residual=slice.target_residual)
     if status === :empty
