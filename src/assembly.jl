@@ -1212,62 +1212,121 @@ function _accumulate_qpoint!(local_matrix, local_rhs, q, qweight::T, field_data,
                                        Val(D), T)
 end
 
+# Apply `f(form, args...)` to every form of the tuple `forms`, first to last,
+# unrolled at compile time by recursion on `first` / `Base.tail`. The hot loop
+# below walks its `blocks` and `loads` through this rather than through
+# `for form in forms`.
+#
+# Why not a `for` loop: every `WeakForm` closure is its own type, so a problem's
+# `blocks` and `loads` are heterogeneous tuples. A `for` loop reads a tuple's
+# elements through a runtime index, and inference types the loop variable as the
+# union of the element types — but only up to three members (the compiler's
+# `MAX_TYPEUNION_LENGTH`). A fourth distinct form type widens the loop variable
+# to the abstract `BlockForm` / `LoadForm`, and every `_bilinear_channels` /
+# `_linear_channels` call, and everything downstream of its result, then
+# dispatches dynamically and allocates, once per trial dof × component ×
+# quadrature point. Measured on Julia 1.12.5, serial: one scalar field on a
+# 16 × 16 order-2 mesh assembled three distinct blocks in 1.7 ms and 1.0 MB, and
+# four in 65 ms and 420 MB; a space-time Navier–Stokes Jacobian with the four
+# blocks (u,u), (u,p), (p,u), (p,p) took 1.19 s and 7.5 GB, where the same four
+# blocks assembled one at a time took 0.029 s. The recursion hands every call
+# its element's concrete type, so the cost no longer depends on how many
+# distinct forms a problem carries.
+#
+# Why the per-form work is a named function taking explicit arguments, and not
+# a `do` block: a closure capturing the dozen locals of the accumulation is too
+# large to inline, so every one of those reads goes through the closure object,
+# and that alone measured about 4 % slower on single-form Poisson assembly, where
+# this walker is level with the old `for` loop. `args` is one concrete `Tuple`
+# rather than a vararg, because Julia may decline to specialise on a vararg that
+# is only passed through.
+#
+# Order and arithmetic are unchanged: `f` sees the forms in tuple order and runs
+# the old loop body, so wherever that loop was type-stable — up to three
+# distinct form types — the matrices and right-hand sides are the same bits as
+# before, serial and threaded alike. Beyond three, the dynamic path called the
+# contraction `_test_contribution` as a standalone method, and at the default
+# optimisation level LLVM fuses its `@simd` dot product into multiply-adds only
+# when it is inlined; those results therefore move by a few ulps, onto the bits
+# the type-stable path gives.
+@inline _foreach_form(f::F, ::Tuple{}, args::Tuple) where {F} = nothing
+@inline function _foreach_form(f::F, forms::Tuple, args::Tuple) where {F}
+    f(first(forms), args...)
+    return _foreach_form(f, Base.tail(forms), args)
+end
+
 # Shared quadrature-point accumulation: loads (linear channels → rhs)
 # then blocks (bilinear channels → matrix, with Dirichlet-column
 # elimination → rhs). Symmetric blocks emit only the lower triangle;
 # `_matrix_from_pattern` mirrors at the end. Walks the standard
 # field × component × parent × dof nest and defers every per-emission
 # decision to `_emit_load!` / `_emit_block!`, which the typed overloads
-# above specialise to the concrete `local_by_field` table type.
+# above specialise to the concrete `local_by_field` table type. The forms
+# themselves are walked by `_foreach_form`, never by a `for` loop: see the
+# comment above it for why.
 function _accumulate_qpoint_generic!(local_matrix, local_rhs, q, qweight::T, field_data,
                                      local_by_field, active_dofs::Vector{Int}, blocks::B, loads::L,
                                      symmetric::Bool, model::Model{D,T}, ::Val{D},
                                      ::Type{T}) where {B,L,D,T}
-    for load in loads
-        test_index = _field_index(model.dofs, load.test_name)
-        test_layout = model.dofs.fields[test_index]
-        test_data = field_data[test_index]
-        test_tables = local_by_field[test_index]
-        for test_component in 1:test_layout.components
-            linear_channels = _linear_channels(load.form, q, test_component, Val(D), T)
-            for (data, table) in zip(test_data, test_tables)
-                for a in eachindex(data.raw_dofs)
-                    contribution = qweight * _test_contribution(linear_channels, data.values[a],
-                                                                data.gradients[a])
-                    _emit_load!(local_rhs, table, a, test_component, contribution)
-                end
+    _foreach_form(_accumulate_load!, loads,
+                  (local_rhs, q, qweight, field_data, local_by_field, model))
+    _foreach_form(_accumulate_block!, blocks,
+                  (local_matrix, local_rhs, q, qweight, field_data, local_by_field, active_dofs,
+                   symmetric, model))
+    return nothing
+end
+
+# One load's contribution at one quadrature point: its linear channels,
+# contracted against every test dof of its field and emitted into the rhs.
+function _accumulate_load!(load, local_rhs, q, qweight::T, field_data, local_by_field,
+                           model::Model{D,T}) where {D,T}
+    test_index = _field_index(model.dofs, load.test_name)
+    test_layout = model.dofs.fields[test_index]
+    test_data = field_data[test_index]
+    test_tables = local_by_field[test_index]
+    for test_component in 1:test_layout.components
+        linear_channels = _linear_channels(load.form, q, test_component, Val(D), T)
+        for (data, table) in zip(test_data, test_tables)
+            for a in eachindex(data.raw_dofs)
+                contribution = qweight * _test_contribution(linear_channels, data.values[a],
+                                                            data.gradients[a])
+                _emit_load!(local_rhs, table, a, test_component, contribution)
             end
         end
     end
+    return nothing
+end
 
-    for block in blocks
-        test_index = _field_index(model.dofs, block.test_name)
-        trial_index = _field_index(model.dofs, block.trial_name)
-        test_layout = model.dofs.fields[test_index]
-        trial_layout = model.dofs.fields[trial_index]
-        for trial_component in 1:trial_layout.components
-            for (trial_data, trial_table) in
-                zip(field_data[trial_index], local_by_field[trial_index])
-                for b in eachindex(trial_data.raw_dofs)
-                    trial = TrialChannels(trial_component, trial_data.values[b],
-                                          trial_data.gradients[b])
-                    # Trial-side data invariant across test dofs, hoisted
-                    # once per trial dof: the active-branch offsets for an
-                    # expansion table, or the global/local column for a
-                    # matrix table.
-                    tctx = _trial_block_context(trial_table, trial_data, trial_layout, b,
-                                                trial_component)
-                    for test_component in 1:test_layout.components
-                        channels = _bilinear_channels(block.form, q, trial, test_component)
-                        for (test_data, test_table) in
-                            zip(field_data[test_index], local_by_field[test_index])
-                            for a in eachindex(test_data.raw_dofs)
-                                entry = qweight * _test_contribution(channels, test_data.values[a],
-                                                                     test_data.gradients[a])
-                                _emit_block!(local_matrix, local_rhs, test_table, test_data,
-                                             test_layout, tctx, a, test_component, entry, symmetric,
-                                             active_dofs)
-                            end
+# One block's contribution at one quadrature point: the trial × test nest over
+# its two fields, emitted into the local matrix with Dirichlet-column
+# elimination onto the rhs.
+function _accumulate_block!(block, local_matrix, local_rhs, q, qweight::T, field_data,
+                            local_by_field, active_dofs::Vector{Int}, symmetric::Bool,
+                            model::Model{D,T}) where {D,T}
+    test_index = _field_index(model.dofs, block.test_name)
+    trial_index = _field_index(model.dofs, block.trial_name)
+    test_layout = model.dofs.fields[test_index]
+    trial_layout = model.dofs.fields[trial_index]
+    for trial_component in 1:trial_layout.components
+        for (trial_data, trial_table) in zip(field_data[trial_index], local_by_field[trial_index])
+            for b in eachindex(trial_data.raw_dofs)
+                trial = TrialChannels(trial_component, trial_data.values[b],
+                                      trial_data.gradients[b])
+                # Trial-side data invariant across test dofs, hoisted once per
+                # trial dof: the active-branch offsets for an expansion table, or
+                # the global/local column for a matrix table.
+                tctx = _trial_block_context(trial_table, trial_data, trial_layout, b,
+                                            trial_component)
+                for test_component in 1:test_layout.components
+                    channels = _bilinear_channels(block.form, q, trial, test_component)
+                    for (test_data, test_table) in
+                        zip(field_data[test_index], local_by_field[test_index])
+                        for a in eachindex(test_data.raw_dofs)
+                            entry = qweight * _test_contribution(channels, test_data.values[a],
+                                                                 test_data.gradients[a])
+                            _emit_block!(local_matrix, local_rhs, test_table, test_data,
+                                         test_layout, tctx, a, test_component, entry, symmetric,
+                                         active_dofs)
                         end
                     end
                 end

@@ -955,3 +955,51 @@ end
     @test rq[1:nq] ≈ rref atol = 1.0e-12
     @test rq[(nq+1):(2nq)] ≈ zeros(nq) atol = 1.0e-13
 end
+
+# ── Many distinct form types in one assembly ──────────────────────────────────
+
+# Bytes allocated by one serial assembly call after a warm-up, measured behind a
+# function barrier so the figure is the assembly's own rather than the boxing of
+# test-scope locals.
+function _serial_assembly_bytes(assemble, model, forms)
+    assemble(model, forms; threaded=false)
+    return @allocated assemble(model, forms; threaded=false)
+end
+
+@testset "four distinct form types assemble without dynamic dispatch" begin
+    # Every `WeakForm` closure is its own type, so a problem's blocks and loads
+    # are heterogeneous tuples, and inference unions at most three element types.
+    # A fourth used to widen the hot loop's per-form variable to the abstract
+    # `BlockForm` / `LoadForm`, so every channel evaluation dispatched dynamically
+    # and allocated: 19× the bytes of assembling the same four blocks one at a
+    # time here, 7.5 GB on a space-time Navier–Stokes Jacobian. At the default
+    # optimisation level that path also rounded differently from the inlined one.
+    #
+    # Four scalar fields and four distinct (test, trial) pairs, so every matrix
+    # entry and every rhs row is written by exactly one form. The combined
+    # assembly must then equal the sum of the one-form assemblies to the bit, and
+    # since it pays the region setup once where the separate calls pay it four
+    # times, it can never legitimately allocate more than they do together.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2)
+    a, b, c, d = field(:a, V), field(:b, V), field(:c, V), field(:d, V)
+    model = prepare(Problem((a, b, c, d)))
+    forms = (WeakForm(bilinear=(q, trial) -> TestChannels(0.0, trial.gradient), linear=q -> 1.0),
+             WeakForm(bilinear=(q, trial) -> trial.gradient[1], linear=q -> q.x[1]),
+             WeakForm(bilinear=(q, trial) -> -trial.gradient[2],
+                      linear=q -> TestChannels(0.0, q.x)),
+             WeakForm(bilinear=(q, trial) -> trial.value, linear=q -> q.x[2]^2))
+    blocks = (block(a, a, forms[1]), block(b, c, forms[2]), block(c, b, forms[3]),
+              block(d, d, forms[4]))
+    loads = (loadform(a, forms[1]), loadform(b, forms[2]), loadform(c, forms[3]),
+             loadform(d, forms[4]))
+
+    for (assemble, combined_forms) in ((assemble_matrix, blocks), (assemble_vector, loads))
+        combined = assemble(model, combined_forms; threaded=false)
+        @test combined == sum(form -> assemble(model, (form,); threaded=false), combined_forms)
+        @test assemble(model, combined_forms; threaded=true) == combined
+
+        separate_bytes = sum(form -> _serial_assembly_bytes(assemble, model, (form,)),
+                             combined_forms)
+        @test _serial_assembly_bytes(assemble, model, combined_forms) ≤ separate_bytes
+    end
+end
