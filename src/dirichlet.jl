@@ -1,9 +1,10 @@
 # Physical Dirichlet boundary conditions: the user-facing spec types,
 # the per-key boundary-face detection used by `dof_layout` to populate
 # the `physical_dirichlet` matrix, the codim-K facet integration
-# machinery (regions, tensor Gauss quadrature, basis traces), and the
-# L² boundary projection that turns nonzero Dirichlet data into the
-# `constrained_values` stored on the layout.
+# machinery (the per-face resolver, regions, the affine-slice
+# restriction that trims a rule to `face ∩ Ω`, tensor Gauss quadrature,
+# basis traces), and the L² boundary projection that turns nonzero
+# Dirichlet data into the `constrained_values` stored on the layout.
 #
 # Loads after `dofs.jl` so the dof keys and `DofLayout` it operates on
 # already exist. The `dof_layout` constructor in `dofs.jl` forward-
@@ -809,10 +810,8 @@ end
 # It is the classifier's verdict with exactly
 # the classifier's resolution — the Lipschitz certificate where a leaf carries a
 # constant, octree-bounded corner sampling where it does not — and in particular it
-# is not a sampling of the *rule* on the region: a fictitious sliver of face is seen
-# whenever the classifier resolves it, however the rule's points happen to fall, and
-# missed when it is finer than the octree budget, which is the same blind spot the
-# cell classification behind the face has.
+# is not a sampling of the *rule* on the region. `FacetRegion.kind`'s own docstring
+# states what that resolution does and does not see.
 #
 # Three cases, by dispatch rather than by branch. A space with no `PhysicalDomain`
 # has nothing outside Ω to find. A codim-`D` facet is a single point, with no box
@@ -1228,7 +1227,7 @@ function _constrains(condition::DirichletCondition, component::Integer)
 end
 
 # Number of (condition, facet) pairs a Dirichlet list covers. Recorded on a
-# `DirichletProjection` as its `facets` field so a cached projection can be
+# `DirichletProjection` as its `facet_count` field so a cached projection can be
 # rejected when the condition list no longer has the shape it was built for.
 function _dirichlet_facet_count(dirichlet, ::Val{D}) where {D}
     return sum(c -> length(_facets(c.boundary, Val(D))), dirichlet; init=0)

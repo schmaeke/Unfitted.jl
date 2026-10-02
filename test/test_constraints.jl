@@ -1230,6 +1230,16 @@ end
     tilted_edge = Unfitted._boundary_facet_regions(Vtilt, [(1, :lower), (2, :lower)], tol)
     @test [verdict(r) for r in tilted_edge] == [:fictitious, :fictitious, :fictitious, :cut]
     @test all(r -> verdict(r) === expected_tilt(r), tilted_edge)
+    # And the codim-2 *rule*, not just its verdicts. Every measure anchor in
+    # "a trimmed facet rule integrates the physical part of its face" is codim-1, so
+    # without this one a restriction that classified a `D − 2` face correctly and then
+    # built the wrong rule on it would pass the whole suite. On this edge — x₁ = x₂ = 0,
+    # free axis 3 — the level set reduces to φ = 0.9 − x₃, so Ω takes x₃ > 0.9 and the
+    # edge's measure is exactly 0.1 of a geometric 1.0. Machine-exact because the
+    # restricted leaf is affine in the one surviving coordinate, which is also why this
+    # is an analytic anchor and not a recorded run.
+    @test sum(sum(r.weights) for r in tilted_edge) ≈ 0.1 rtol = 1.0e-14
+    @test all(Unfitted._inside(tilt.geometry, p) for r in tilted_edge for p in r.points)
 end
 
 @testset "a trimmed facet rule integrates the physical part of its face" begin

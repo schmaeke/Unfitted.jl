@@ -167,10 +167,9 @@ Fields:
     level set restricted to the facet's affine slice, and the count is of
     the regions whose kind is not `:full`. Being a classification rather
     than a sampling of the rule, it carries the classifier's own
-    resolution: a fictitious sliver of face is counted whenever
-    `subcell_length_scale` and `max_depth` resolve it, however the rule's
-    points happen to fall, and missed below that budget exactly as it is
-    missed on the cell behind the face. Zero when the space carries no
+    resolution rather than the rule's point spacing; the `kind` field of
+    [`FacetRegion`](@ref) states what that resolution does and does not
+    see. Zero when the space carries no
     [`PhysicalDomain`](@ref), and zero on an immersed space all of whose
     integrated faces lie inside `Ω`.
   - `facet_fit_failure_count::Int`, `facet_cut_fallback_count::Int`,
@@ -1313,11 +1312,9 @@ _region_count(regions::AbstractDict) = sum(length, values(regions); init=0)
 #
 # It reads `FacetRegion.kind` and counts everything that is not `:full`. Two
 # properties come from reading the kind rather than re-deriving a test here. It is
-# **as sharp as the classifier** behind that kind — `subcell_length_scale` and
-# `max_depth`, and nothing about the rule — so a sliver of fictitious face the
-# classifier resolves is counted whether or not the region's own points reach it,
-# where a sampled test could only report a lower bound; a sliver finer than that
-# budget is missed by both, the same blind spot the fictitious-cell fold has. And it
+# **as sharp as the classifier** behind that kind and no sharper, where a sampled
+# test could only ever report a lower bound; `FacetRegion.kind`'s docstring states
+# what that sharpness does and does not see. And it
 # is **independent of the rule** on the region, which is what lets it keep
 # describing the face now that the rule over a cut face is no longer a plain
 # full-face tensor product — a diagnostic that sampled the rule it is meant to

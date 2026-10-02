@@ -137,8 +137,9 @@ function print_run_report(title, report; parameters=(), output=nothing)
     print_optional_report_value("raw dofs", report, :raw_dofs)
     print_optional_report_value("integration regions", report, :integration_regions)
     print_optional_report_value("facet regions", report, :facet_region_count)
-    # How many of those regions have part of their own face outside Ω, where the
-    # facet rule therefore spends weight on non-physical area. Labelled so it
+    # How many of those regions have part of their own face outside Ω — the ones
+    # whose rule is trimmed to `face ∩ Ω` instead of covering the whole face.
+    # Labelled so it
     # does not contain "facet regions" as a substring — the same scraping hazard
     # the "diagonal-scaled condition" line below is named around: the example
     # smoke suite collects metrics by label with a substring regex, so the
