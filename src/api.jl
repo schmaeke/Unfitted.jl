@@ -185,7 +185,7 @@ The trimmed rule is **machine-exact where the level set restricted to the
 face is a single affine function** — one planar leaf, or one a 1-D bisection
 resolves exactly — and accurate rather than exact everywhere else, in two
 distinguishable ways. A curved cut converges in the moment order and in
-nothing else: measured 1.9e-5 on a disc cutting one cell of a face, unmoved
+nothing else: measured 3.0e-5 on a disc cutting one cell of a face, unmoved
 by `subcell_length_scale` or `max_depth`. A CSG tree whose leaves meet at a
 corner *strictly inside* the face box is limited by something the fit cannot
 report, because the limit is not in the fit: the quadrature kernel places no

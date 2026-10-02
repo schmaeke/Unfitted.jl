@@ -113,7 +113,7 @@ example's problem to solve. One limit is particular to `θ`'s nonzero Dirichlet
 data. Facet integration *is* trimmed by the level set — the initial temperature
 is fitted over the material part of the `t = 0` face and not over the cavity's
 footprint — but on a curved cut face the trimmed rule is accurate rather than
-exact: the face's measure comes out at `1 − π r₀² − 1.9e-5`, an error that falls
+exact: the face's measure comes out at `1 − π r₀² − 3.0e-5`, an error that falls
 with the moment order (`moment_order_factor`) and not at all with
 `subcell_length_scale` or `max_depth`, since the sliced sub-boxes are graph-like
 and the classifier stops bisecting them. (α is honoured on a face as it is on a
