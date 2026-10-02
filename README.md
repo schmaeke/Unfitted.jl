@@ -1,4 +1,7 @@
-# Unfitted.jl
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="resources/logo-dark.svg">
+  <img alt="Unfitted.jl" src="resources/logo.svg" width="440">
+</picture>
 
 > [!WARNING]
 > **Early development.** Unfitted.jl is under active development and has not
