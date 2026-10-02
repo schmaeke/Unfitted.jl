@@ -133,9 +133,9 @@ Fields:
     not over distinct regions, two selectors that name the same face each count
     it, so this number **grows** when the same boundary is spelled with fewer,
     broader selectors even though the resolved regions and the integration work
-    are unchanged — the regions themselves are shared through
-    `_resolve_facet_regions`' per-face memo either way. The space-time cavity
-    example is the instance: at `SC_CELLS = 3` it constrains five distinct faces
+    are unchanged — the regions themselves are shared through the model's
+    [`FacetResolver`](@ref) either way. The space-time cavity example is the
+    instance: at `SC_CELLS = 3` it constrains five distinct faces
     carrying nine regions each, and spelling them one face at a time made `θ`'s
     and `u`'s conditions on a shared plate edge *the same selector value*, which
     the cache keys together — five entries, 5 × 9 = 45. One
@@ -144,6 +144,122 @@ Fields:
     9 × 9 = 81. The faces, the regions and the quadrature are identical in both
     spellings, so read a rise here as a change of spelling until the region
     geometry itself has been checked.
+  - `cut_facet_region_count::Int` — how many of those regions have part of
+    their **own face** outside `Ω`, counted the same way (so it is directly
+    comparable with `facet_region_count`). A facet region is the whole
+    grid-aligned face of its parent cells, and its rule covers the part of
+    that face inside `Ω`: this count is how much of the boundary integration
+    — the L² Dirichlet mass and right-hand side, a Neumann / Robin / Nitsche
+    term placed with `on = boundary(…)`, [`boundary_integral`](@ref) — rests
+    on a trimmed rule rather than on an exact tensor product. On a face
+    `∂Ω` crosses transversally that rule is accurate, not exact (see
+    `facet_moment_fit_residual_max`), so a nonzero count is where to look
+    when a boundary quantity is less accurate than the cells behind it.
+
+    The verdict is on the face, not on the parent cells: a cut *cell* whose
+    face lies wholly inside `Ω` needs no trimming and is not counted. A
+    region whose face lies wholly *outside* `Ω` is counted — that is the
+    extreme case rather than an exception, and it is what a symmetry plane
+    through a hole produces; such a region keeps its place in the list, with
+    an empty rule, because its parents still carry constrained trace dofs.
+    It is the `kind` field of each [`FacetRegion`](@ref), built from
+    [`classify_cell`](@ref) applied to the region's own face box against the
+    level set restricted to the facet's affine slice, and the count is of
+    the regions whose kind is not `:full`. Being a classification rather
+    than a sampling of the rule, it carries the classifier's own
+    resolution rather than the rule's point spacing; the `kind` field of
+    [`FacetRegion`](@ref) states what that resolution does and does not
+    see. Zero when the space carries no
+    [`PhysicalDomain`](@ref), and zero on an immersed space all of whose
+    integrated faces lie inside `Ω`.
+  - `facet_fit_failure_count::Int`, `facet_cut_fallback_count::Int`,
+    `facet_moment_fit_residual_max::Float64` — the facet analogues of
+    `fit_failure_count` / `cut_fallback_count` / `moment_fit_residual_max`,
+    over the cut *faces* rather than the cut cells, and counted the same way
+    `cut_facet_region_count` is. A facet cut region's rule is the moment fit
+    on the facet's affine slice of `Ω`, so it has the same three outcomes a
+    cell's does: a fit (`:cut_fitted`), the raw Saye rule on the slice when
+    the residual misses the failure threshold (`:cut_fallback`), and no rule
+    at all where `Ω ∩ face` carries none (`:cut_failed` /
+    `:cut_alpha_failed`). The residual bounds the fit's own compression error —
+    how well the returned rule reproduces the moments the quadrature kernel
+    handed it — and is zero on a model with no cut face. It does **not** bound
+    the kernel's error on those moments, which is a separate and silent ceiling
+    where the restricted tree's leaves meet inside the face box; the condition
+    for an exact facet rule, and both ways it fails, are in
+    [`boundary`](@ref)'s docstring.
+
+    Read a nonzero `facet_fit_failure_count` with
+    `facet_moment_fit_residual_max` beside it, because the two name different
+    situations and only one is a warning. A *tangency* — `∂Ω` touching a face
+    without crossing it — classifies `:cut` while `Ω ∩ face` has measure
+    zero, so the fit returns nothing, the region's rule is correctly empty,
+    and the residual stays at `0.0`. That is `kirsch_plate_2d`: both of its
+    counted regions are tangencies, `facet_fit_failure_count` reads 2, and
+    each symmetry face still integrates to its exact 3.0 from the `:full`
+    regions alone. A fit that genuinely struggled shows up as a nonzero
+    residual or as `facet_cut_fallback_count`.
+  - `min_relative_facet_measure::Float64` — the smallest ratio of a facet
+    region's integrated measure (its weight sum) to the full geometric
+    measure of its own face, over every resolved facet region. `1.0` when
+    nothing is trimmed, which includes a model with no facet regions at all.
+    It is a fraction of **one face**, so it is not comparable with
+    `min_relative_integration_volume`, which is one region's volume as a
+    fraction of the whole domain and therefore falls with the cell count rather
+    than with a cut; the two answer different questions and have no common
+    scale.
+
+    `0.0` wants reading beside `facet_fit_failure_count`, for the same reason
+    that field carries a tangency caveat. Two situations report it: a face lying
+    wholly outside `Ω` under strict `α = 0`, which is the one worth looking at,
+    and a zero-measure `:cut_failed` region, where `∂Ω` is merely tangent to the
+    face and the `:full` regions beside it already integrate it exactly.
+    `kirsch_plate_2d` is the in-tree instance of the second — its two symmetry
+    faces report `0.0` here and `2` in `facet_fit_failure_count` while each
+    still integrates to its exact `3.0`.
+
+    Either way it is the conditioning warning to read before a trimmed boundary
+    condition: trimming is a small-cut generator for the Dirichlet trace mass in
+    exactly the way a thin cut cell is one for the stiffness matrix — measured on
+    a single-plane cut through one face, the trace mass goes from condition 40 at
+    an untrimmed face to 2.8e5 at a ratio of 5e-2 and 9.6e13 at 1e-3. The package
+    reports the ratio and leaves the stabilisation to the caller, `α` on the
+    domain being the knob — `CONTRIBUTING.md` asks for conditioning behaviour to
+    be visible before stabilisation is added, not for a default stabiliser.
+  - `dirichlet_trace_factors::Vector{Symbol}` — which branch the L² Dirichlet
+    trace solve `M c = b` took, one entry per component of each field,
+    concatenated in field-declaration order. Every field contributes exactly its
+    own `components` entries, so a position names a `(field, component)` pair
+    without a lookup. `:cholesky` where that component's boundary mass
+    `∫ φᵢ φⱼ ds` was positive definite, `:pseudoinverse` where `cholesky`
+    reported it indefinite, and `:none` where the component had no constrained
+    dof to solve for — which is also what a model prepared with homogeneous data
+    reads, constant-zero data skipping the projection at [`prepare`](@ref)
+    altogether.
+
+    `:pseudoinverse` is the entry worth reading: it is the only externally
+    visible trace of a boundary trace space that has gone singular, and on an
+    immersed space its commonest cause is the next two fields. It is a
+    definiteness verdict and **not** a conditioning one, so it says nothing
+    about a mass that is merely near-singular — `min_relative_facet_measure` is
+    the field for that, and a `:cholesky` beside a tiny ratio there is the
+    combination to distrust.
+  - `unsupported_dirichlet_dof_count::Int`,
+    `unsupported_dirichlet_dofs::Vector{UnsupportedDirichletDof}` — the dofs a
+    Dirichlet condition constrains with no measure anywhere on their facet
+    support, and their count (`length` of the list, carried as a scalar so a
+    report prints it without walking the list, exactly as `small_overlap_count`
+    is). Trimming is what makes the configuration reachable: which dofs a
+    condition constrains is decided by the grid-aligned face test alone, so a
+    dof whose every facet region is trimmed away is still constrained, while the
+    projection has nothing left to fit it on and the pseudoinverse pins it to
+    zero. Zero on a non-immersed space and on every immersed space whose
+    integrated faces stay inside `Ω`.
+
+    What such a condition *ought* to mean is an open semantic question and the
+    package does not answer it here; the record exists so the answer it does give
+    is not silent. [`UnsupportedDirichletDof`](@ref) has the measured instance
+    and the alternative.
   - `surface_region_count::Int` — total number of
     [`SurfaceRegion`](@ref)s cached on the model, summed across every
     cached [`BoundaryMesh`](@ref). Zero for problems with no
@@ -173,6 +289,14 @@ mutable struct AssemblyDiagnostics
     cut_fallback_count::Int
     cut_fallback_points::Int
     facet_region_count::Int
+    cut_facet_region_count::Int
+    facet_fit_failure_count::Int
+    facet_cut_fallback_count::Int
+    facet_moment_fit_residual_max::Float64
+    min_relative_facet_measure::Float64
+    dirichlet_trace_factors::Vector{Symbol}
+    unsupported_dirichlet_dof_count::Int
+    unsupported_dirichlet_dofs::Vector{UnsupportedDirichletDof}
     surface_region_count::Int
     interface_region_count::Int
 end
@@ -194,8 +318,12 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                              small_overlaps=SmallOverlap{Float64}[], inactive_cell_counts=Int[],
                              reduced_mode_counts=Int[], cut_region_count=0, fit_failure_count=0,
                              moment_fit_residual_max=0.0, cut_fallback_count=0,
-                             cut_fallback_points=0, facet_region_count=0, surface_region_count=0,
-                             interface_region_count=0)
+                             cut_fallback_points=0, facet_region_count=0, cut_facet_region_count=0,
+                             facet_fit_failure_count=0, facet_cut_fallback_count=0,
+                             facet_moment_fit_residual_max=0.0, min_relative_facet_measure=1.0,
+                             dirichlet_trace_factors=Symbol[],
+                             unsupported_dirichlet_dofs=UnsupportedDirichletDof[],
+                             surface_region_count=0, interface_region_count=0)
     return AssemblyDiagnostics(Int(dimension), Int(active_unknowns), Int(integration_regions),
                                Int(small_overlap_count), _float_small_overlaps(small_overlaps),
                                Float64(min_integration_volume),
@@ -205,8 +333,14 @@ function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regio
                                Int[reduced_mode_counts...], Int(cut_region_count),
                                Int(fit_failure_count), Float64(moment_fit_residual_max),
                                Int(cut_fallback_count), Int(cut_fallback_points),
-                               Int(facet_region_count), Int(surface_region_count),
-                               Int(interface_region_count))
+                               Int(facet_region_count), Int(cut_facet_region_count),
+                               Int(facet_fit_failure_count), Int(facet_cut_fallback_count),
+                               Float64(facet_moment_fit_residual_max),
+                               Float64(min_relative_facet_measure),
+                               Symbol[dirichlet_trace_factors...],
+                               length(unsupported_dirichlet_dofs),
+                               UnsupportedDirichletDof[unsupported_dirichlet_dofs...],
+                               Int(surface_region_count), Int(interface_region_count))
 end
 
 # Per-level count of cells deactivated by a `LevelMask` (mask and
@@ -376,6 +510,36 @@ function _set_plan_stats_multi!(diag::AssemblyDiagnostics, plans)
     return diag
 end
 
+# Fold the L² Dirichlet trace solve's own verdict into a diagnostics record in
+# place, and return it so call sites can chain — the counterpart of
+# `_set_plan_stats_multi!` for the boundary-trace half of the layout.
+#
+# Read back off the dof layouts the projection filled rather than off the
+# `DirichletProjection`s themselves, because the projection is per field and
+# transient — `prepare` builds one inside `dof_layout` and discards it, while
+# `update_dirichlet!` caches it on the model — whereas the layout is what every
+# consumer of a prepared model already holds.
+#
+# Both quantities describe the boundary mass and not the datum, so a load
+# increment restates the same answers; the two events that move them are a
+# rebuilt layout and a *first* projection, the latter being why
+# `update_dirichlet!` calls this too. A model prepared with homogeneous data has
+# run no projection at all, and its first nonzero increment is where the branch
+# and the unsupported dofs are established.
+function _set_dirichlet_trace_stats!(diag::AssemblyDiagnostics, layout::SystemLayout)
+    diag.dirichlet_trace_factors = Symbol[branch for field in layout.fields
+                                          for branch in field.dofs.dirichlet_trace_factors]
+    # Self-describing records rather than a flattened vector: the list is empty on
+    # every untrimmed boundary, so there is no position worth counting from.
+    records = UnsupportedDirichletDof[]
+    for field in layout.fields, (component, raws) in pairs(field.dofs.unsupported_dirichlet)
+        append!(records, (UnsupportedDirichletDof(field.name, component, raw) for raw in raws))
+    end
+    diag.unsupported_dirichlet_dofs = records
+    diag.unsupported_dirichlet_dof_count = length(records)
+    return diag
+end
+
 function Base.show(io::IO, diagnostics::AssemblyDiagnostics)
     print(io, "AssemblyDiagnostics(D=", diagnostics.dimension, ", active=",
           diagnostics.active_unknowns, ", regions=", diagnostics.integration_regions, ", small=",
@@ -444,26 +608,6 @@ end
 # deduplicates spaces by `===`, so "a distinct discretisation" is package-wide
 # synonymous with "a distinct `Space` object".
 const RegionKey = Tuple{Any,Any}
-
-# Key of the per-*face* memo threaded through facet-region resolution: one entry
-# per `(space, facet)` pair, where the facet is the `(axis, side)` list a
-# `BoundarySelector` decomposes into (`_facets`). This is one level below
-# `RegionKey`, which keys whole selectors.
-#
-# The distinction matters because a selector is a *union* of faces while
-# `_boundary_facet_regions` resolves *one* face, so two selectors that are not
-# value-equal can still overlap: `boundary(:all)` covers every face, hence every
-# face any other selector names. Keyed on the selector, each overlap resolves the
-# shared face again; keyed on the face, each face of each space is resolved
-# exactly once and the selectors' region vectors are assembled from the shared
-# results. That is worth doing because the overlap is not rare — it is what any
-# spelling of "the whole boundary except one face" produces for a coupled
-# problem, one such selector per field.
-#
-# The space half is identity-keyed for the reason given above; the `sides` half
-# is a `Vector{Tuple{Int,Symbol}}`, which `Tuple` hashes and compares
-# element-wise, so the same face spelled by two different selectors is one key.
-const FacetKey = Tuple{Any,Vector{Tuple{Int,Symbol}}}
 
 """
     Model{D,T,P}
@@ -552,6 +696,19 @@ re-thread a fresh value through. Fields:
     by every mutator.
   - `rhs::Union{Nothing,Vector{T}}` — assembled right-hand side. Same
     invalidation contract as `matrix`.
+  - `facet_resolver::FacetResolver{D,T}` — the model's single route from a
+    boundary *face* to its [`FacetRegion`](@ref)s, and the memo of every face
+    already resolved (see [`FacetResolver`](@ref)). It sits one level below
+    `facet_regions`: that cache keys whole `BoundarySelector`s, which are unions
+    of faces, while this memo keys the faces themselves, so a face two selectors
+    both name is resolved once and shared. Every consumer resolves through it —
+    the per-selector cache below, the one-shot lookup for a selector no
+    `prepare` saw, and the L² Dirichlet projection, which the dof layer reaches
+    through the resolver `prepare` hands `system_layout`. Replaced wholesale by
+    every mutator, which is also what retires the entries of the spaces the
+    mutation left behind; a non-mutating derivation (`adapted`, `elevated`,
+    `moved`) gets its own fresh one rather than a copy, since the keys are
+    spaces and a derivation has new ones to resolve anyway.
   - `facet_regions::Dict{RegionKey,Vector{FacetRegion{D,T}}}` — cache of
     physical-boundary [`FacetRegion`](@ref)s, keyed by
     the `RegionKey` pair `(selector, space)`. One entry per
@@ -609,6 +766,7 @@ mutable struct Model{D,T,P}
     dofs::SystemLayout{D,T}
     matrix::Union{Nothing,SparseMatrixCSC{T,Int}}
     rhs::Union{Nothing,Vector{T}}
+    facet_resolver::FacetResolver{D,T}
     facet_regions::Dict{RegionKey,Vector{FacetRegion{D,T}}}
     surface_regions::Dict{RegionKey,Vector{SurfaceRegion{D,T}}}
     interface_regions::IdDict{Any,Vector{InterfaceRegion{D,T}}}
@@ -699,7 +857,8 @@ end
 
 """
     system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), prune=true,
-                  classify_caches=IdDict{Space,_ClassifyCache{D,T}}()) -> SystemLayout
+                  classify_caches=IdDict{Space,_ClassifyCache{D,T}}(),
+                  facets=nothing) -> SystemLayout
 
 Build the per-field [`DofLayout`](@ref)s for every field of `problem`
 and assemble them into a [`SystemLayout`](@ref). Each field's active
@@ -719,12 +878,19 @@ alike — it describes the discretisation, not one field of it. [`prepare`](@ref
 is where a caller sets it. `prune_exempt` is the per-level escape hatch the same
 call forwards; see [`dof_layout`](@ref).
 
+`facets` is the model's `FacetResolver`, forwarded likewise, so each field's
+Dirichlet projection resolves its boundary faces through the same memo the
+assembly path and [`boundary_integral`](@ref) use. Every field of every
+subdomain shares one resolver: the memo is keyed by `(space, face)`, so fields
+over different spaces cannot collide. `nothing` gives each field's layout a
+private resolver, which is what a standalone call with no model behind it wants.
+
 Called by [`prepare`](@ref) and the in-place mutators. End users do
 not usually call this directly.
 """
 function system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), prune::Bool=true,
-                       prune_exempt=(),
-                       classify_caches=IdDict{Space,_ClassifyCache{D,T}}()) where {D,T}
+                       prune_exempt=(), classify_caches=IdDict{Space,_ClassifyCache{D,T}}(),
+                       facets=nothing) where {D,T}
     layouts = FieldLayout{D,T}[]
     by_name = Dict{Symbol,Int}()
     offset = 0
@@ -734,7 +900,7 @@ function system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), pr
         cache = get(() -> _ClassifyCache{D,T}(), classify_caches, field.space)
         layout = dof_layout(field.space; dirichlet=_dirichlet_for_field(problem, field.name),
                             tolerance, components=component_count(field), prune, prune_exempt,
-                            classify_cache=cache)
+                            classify_cache=cache, facets)
         # The field's (reindexed, contiguous) level-id block — how assembly
         # routes each region to its owning subdomain field without a `served` mask.
         level_ids = extrema(l.id for l in field.space.levels)
@@ -982,22 +1148,36 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                                                         classify_cache=caches[i],
                                                         moment_fit_cache=fit_caches[i])
                                        for i in eachindex(spaces)]
+    # The facet resolver is built before the dof layout, not after the region
+    # caches, because the layout's Dirichlet projection resolves faces too: it is
+    # the first consumer, and handing it the model's resolver is what makes the
+    # projection and the operator integrate the same facet by construction rather
+    # than by two call sites agreeing.
+    facet_resolver = FacetResolver{D,T}(tolerance)
     layout = system_layout(effective_problem; tolerance, prune, prune_exempt,
-                           classify_caches=_caches_by_space(spaces, caches))
-    facet_regions = _resolve_facet_regions(effective_problem, tolerance)
+                           classify_caches=_caches_by_space(spaces, caches), facets=facet_resolver)
+    facet_regions = _resolve_facet_regions(effective_problem, facet_resolver)
     surface_regions = _resolve_surface_regions(effective_problem, tolerance)
     interface_regions = _resolve_interface_regions(effective_problem, layout, tolerance)
+    facet_stats = _facet_region_stats(facet_regions)
     diag = AssemblyDiagnostics(dimension=D, active_unknowns=active_unknowns(layout),
                                inactive_cell_counts=_inactive_cell_counts(spaces),
                                reduced_mode_counts=_reduced_mode_counts(layout),
                                facet_region_count=_region_count(facet_regions),
+                               cut_facet_region_count=facet_stats.cut,
+                               facet_fit_failure_count=facet_stats.fit_failures,
+                               facet_cut_fallback_count=facet_stats.fallbacks,
+                               facet_moment_fit_residual_max=facet_stats.residual_max,
+                               min_relative_facet_measure=facet_stats.min_relative_measure,
                                surface_region_count=_region_count(surface_regions),
                                interface_region_count=_region_count(interface_regions))
     _set_plan_stats_multi!(diag, space_plans)
+    _set_dirichlet_trace_stats!(diag, layout)
     return Model{D,T,typeof(effective_problem)}(effective_problem, problem.space,
                                                 _discretisation_pin(spaces, layout), space_plans,
-                                                fit_caches, layout, nothing, nothing, facet_regions,
-                                                surface_regions, interface_regions,
+                                                fit_caches, layout, nothing, nothing,
+                                                facet_resolver, facet_regions, surface_regions,
+                                                interface_regions,
                                                 Dict{Symbol,DirichletProjection{D,T}}(), diag,
                                                 nothing, plan_options)
 end
@@ -1012,20 +1192,20 @@ end
 # with an empty list, not absent — callers can distinguish "selector with no
 # regions" from "selector never referenced".
 #
-# `faces` is the per-face memo (`FacetKey`) every selector of every space
-# resolves through, so a face two *different* selectors both name is resolved
-# once and its `FacetRegion`s are shared between their vectors rather than built
-# twice. It lives for the duration of this call: the regions it holds are
-# retained by the selector vectors themselves, and the memo's own job — making
-# the sharing deliberate rather than an accident of how the caller happened to
-# spell its conditions — is finished when the last selector has been assembled.
-function _resolve_facet_regions(problem::Problem{D,T}, tolerance::GeometryTolerance{T}) where {D,T}
+# `facets` is the model's [`FacetResolver`](@ref), so a face two *different*
+# selectors both name is resolved once and its `FacetRegion`s are shared between
+# their vectors rather than built twice. Because the resolver is the model's and
+# not a throw-away of this sweep, the sharing also reaches outside it in both
+# directions: `system_layout` has already run, so every face carrying a nonzero
+# Dirichlet datum is read from the memo here rather than resolved a second time,
+# and the one-shot lookup for a selector no `prepare` saw reads the same entries
+# later.
+function _resolve_facet_regions(problem::Problem{D,T}, facets::FacetResolver{D,T}) where {D,T}
     regions = Dict{RegionKey,Vector{FacetRegion{D,T}}}()
-    faces = Dict{FacetKey,Vector{FacetRegion{D,T}}}()
     for (selector, space) in _referenced_facet_sites(problem)
         key = (selector, space)
         haskey(regions, key) && continue
-        regions[key] = _facet_regions_for_selector(space, selector, tolerance, faces)
+        regions[key] = _facet_regions_for_selector(space, selector, facets)
     end
     return regions
 end
@@ -1109,33 +1289,75 @@ end
 # `interface_region_count` fields.
 _region_count(regions::AbstractDict) = sum(length, values(regions); init=0)
 
+# Everything the diagnostics report about the resolved facet regions' rules:
+# `(cut, fit_failures, fallbacks, residual_max, min_relative_measure)`, the facet
+# counterparts of what `_cut_region_stats` reads off an integration plan.
+# Counted the same way `facet_region_count` is — summed over every cached selector,
+# so a region two selectors share is counted once per selector, exactly as the
+# total is.
+#
+# Why the cut count is worth reporting at all. The grid-aligned facet *partition* is
+# level-set-blind: `_boundary_facet_regions` selects its contributing levels with
+# `_level_side_is_physical` — pure mesh-edge versus domain-edge geometry — and
+# partitions the face over `_side_cells`. A `FacetRegion` is therefore the *whole*
+# grid-aligned face of its parent cells, and where that face leaves Ω the rule on it
+# is the moment fit on the facet's affine slice of Ω rather than an exact tensor
+# product. Every consumer of a facet region inherits that: the L² Dirichlet mass and
+# right-hand side, a Neumann / Robin / Nitsche term placed with `on = boundary(…)`,
+# and `boundary_integral`. That fit is machine-exact only where the restricted level
+# set is a single affine function (`boundary`'s docstring states the condition and
+# both ways it fails), so the count says how much of a model's boundary integration
+# rests on a fitted rule, and `residual_max` says how well those fits reproduced the
+# moments they were given — not how right those moments were.
+#
+# It reads `FacetRegion.kind` and counts everything that is not `:full`. Two
+# properties come from reading the kind rather than re-deriving a test here. It is
+# **as sharp as the classifier** behind that kind and no sharper, where a sampled
+# test could only ever report a lower bound; `FacetRegion.kind`'s docstring states
+# what that sharpness does and does not see. And it
+# is **independent of the rule** on the region, which is what lets it keep
+# describing the face now that the rule over a cut face is no longer a plain
+# full-face tensor product — a diagnostic that sampled the rule it is meant to
+# describe would extinguish itself exactly when it started to matter.
+#
+# The classification is of the region's own *face*, not of its parent cells, and
+# the distinction is not academic: a cut cell can have a face lying wholly inside
+# Ω, and no trimming is needed there. Classifying the cells
+# would make the number a loose upper bound — on the space-time cavity example at
+# `SC_CELLS = 3` it reads 61 of 81 against a true 1, because the growing cavity
+# cuts nearly every cell while touching only the `t = 0` and `t = T` faces.
+#
+# The `:full` regions are filtered out first and so contribute to nothing: a model
+# that trims no face reports `min_relative_measure` as exactly 1 rather than as a
+# Gauss weight sum's last bit, and the four reductions below each run over the
+# handful of regions they describe.
+function _facet_region_stats(regions::Dict{RegionKey,Vector{FacetRegion{D,T}}}) where {D,T}
+    trimmed = [region for list in values(regions) for region in list if region.kind !== :full]
+    return (; cut=length(trimmed),
+            fit_failures=count(r -> r.kind in (:cut_fallback, :cut_failed, :cut_alpha_failed),
+                               trimmed), fallbacks=count(r -> r.kind === :cut_fallback, trimmed),
+            residual_max=maximum(r -> Float64(r.residual), trimmed; init=0.0),
+            min_relative_measure=minimum(r -> Float64(sum(r.weights) / _face_measure(r)), trimmed;
+                                         init=1.0),)
+end
+
 # Resolve one selector into its full list of `FacetRegion`s (the union
 # of regions across every facet the selector covers). Used by
 # `_resolve_facet_regions` and reused by consumers that need to look up
 # a selector that was not pre-resolved at `prepare` time.
 #
-# The union is assembled through the per-face memo `faces` (see `FacetKey`), so
-# a face already resolved on `V` — by this selector or by any other selector
-# sharing it — contributes the regions it resolved to rather than a second copy.
-# `_boundary_facet_regions` is a pure function of `(V, sides, tolerance)`, so the
-# memo returns exactly what a fresh resolution would: the same regions, in the
-# same order, region objects shared instead of duplicated. The default is a
-# private memo, which is what the one-shot lookup path (`_resolve_on_regions` on
-# a selector no `prepare` saw) wants — there is no second selector there to share
-# with, only this selector's own faces, which `_facets` already lists once each.
+# The union is assembled face by face through `facets` (see
+# [`FacetResolver`](@ref)), so a face already resolved on `V` — by this selector
+# or by any other selector sharing it — contributes the regions it resolved to
+# rather than a second copy. `_boundary_facet_regions` is a pure function of
+# `(V, sides, tolerance)`, so the memo returns exactly what a fresh resolution
+# would: the same regions, in the same order, region objects shared instead of
+# duplicated.
 function _facet_regions_for_selector(V::Space{D,T}, selector::BoundarySelector,
-                                     tolerance::GeometryTolerance{T}) where {D,T}
-    return _facet_regions_for_selector(V, selector, tolerance,
-                                       Dict{FacetKey,Vector{FacetRegion{D,T}}}())
-end
-
-function _facet_regions_for_selector(V::Space{D,T}, selector::BoundarySelector,
-                                     tolerance::GeometryTolerance{T},
-                                     faces::Dict{FacetKey,Vector{FacetRegion{D,T}}}) where {D,T}
+                                     facets::FacetResolver{D,T}) where {D,T}
     regions = FacetRegion{D,T}[]
     for sides in _facets(selector, Val(D))
-        append!(regions,
-                get!(() -> _boundary_facet_regions(V, sides, tolerance), faces, (V, sides)))
+        append!(regions, _resolve_face(facets, V, sides))
     end
     return regions
 end
@@ -1280,7 +1502,11 @@ end
 #
 # The Dirichlet projection cache is dropped rather than rebuilt: its unknown
 # sets, facet regions and mass all belong to the dof layout being replaced, and
-# the next `update_dirichlet!` rebuilds it against the new one.
+# the next `update_dirichlet!` rebuilds it against the new one. The facet
+# resolver is replaced for the same reason and with a second effect: its keys
+# hold spaces by identity, so taking the fresh model's resolver retires every
+# entry resolved on the space this rebuild has just superseded, instead of
+# carrying them forward as ballast no lookup can reach.
 function _remodel!(model::Model{D,T}, space::Space{D,T}) where {D,T}
     fresh = _prepared_model(_problem_with_space(model.problem, space), model.plan_options,
                             model.moment_fit_caches)
@@ -1289,6 +1515,7 @@ function _remodel!(model::Model{D,T}, space::Space{D,T}) where {D,T}
     model.space_plans = fresh.space_plans
     model.moment_fit_caches = fresh.moment_fit_caches
     model.dofs = fresh.dofs
+    model.facet_resolver = fresh.facet_resolver
     model.facet_regions = fresh.facet_regions
     model.surface_regions = fresh.surface_regions
     model.interface_regions = fresh.interface_regions
@@ -1708,7 +1935,14 @@ reassembled and back-substituted.
     [`DirichletProjection`](@ref) and every later call reuses them —
     exactly, not merely to within roundoff. The facet regions are
     therefore walked and the mass factorised once per mesh, not once
-    per increment.
+    per increment; and the regions themselves come from the model's
+    `FacetResolver`, so even that first walk resolves no face
+    [`prepare`](@ref) has not already resolved.
+  - The `dirichlet_trace_factors` and `unsupported_dirichlet_dof*` entries of
+    [`diagnostics`](@ref) are refreshed. They too describe the boundary mass, so
+    an increment restates them — except the *first* one on a model prepared with
+    homogeneous data, which runs the trace solve for the first time and is where
+    they are established.
   - `model.matrix` and `model.rhs` are cleared so the next
     [`assemble!`](@ref) (or `assemble_vector` / `assemble_matrix`
     call) picks up the new constrained data through the standard
@@ -1757,9 +1991,15 @@ function update_dirichlet!(model::Model{D,T}, dirichlet) where {D,T}
         cached = get(model.dirichlet_projections, field_layout.name, nothing)
         model.dirichlet_projections[field_layout.name] = _project_dirichlet_values!(field_layout.dofs,
                                                                                     field_space,
+                                                                                    model.facet_resolver,
                                                                                     field_dirichlet,
                                                                                     cached)
     end
+    # A model prepared with homogeneous data has run no trace solve, so this is
+    # where a first nonzero increment establishes its branch and its unsupported
+    # dofs. Later increments restate the same two answers: both describe the
+    # boundary mass, which the structural check above pins.
+    _set_dirichlet_trace_stats!(model.diagnostics, model.dofs)
 
     # Clear cached operators. The RHS depends on the constrained values
     # via column elimination, so the next assembly must rebuild it. The
@@ -1837,6 +2077,14 @@ function diagnostics(model::Model{D,T}, solution; exact=nothing) where {D,T}
             active_unknowns=diag.active_unknowns, raw_dofs=raw_dof_count(model.dofs),
             integration_regions=diag.integration_regions,
             facet_region_count=diag.facet_region_count,
+            cut_facet_region_count=diag.cut_facet_region_count,
+            facet_fit_failure_count=diag.facet_fit_failure_count,
+            facet_cut_fallback_count=diag.facet_cut_fallback_count,
+            facet_moment_fit_residual_max=diag.facet_moment_fit_residual_max,
+            min_relative_facet_measure=diag.min_relative_facet_measure,
+            dirichlet_trace_factors=diag.dirichlet_trace_factors,
+            unsupported_dirichlet_dof_count=diag.unsupported_dirichlet_dof_count,
+            unsupported_dirichlet_dofs=diag.unsupported_dirichlet_dofs,
             surface_region_count=diag.surface_region_count,
             interface_region_count=diag.interface_region_count,
             small_overlap_count=diag.small_overlap_count, small_overlaps=diag.small_overlaps,

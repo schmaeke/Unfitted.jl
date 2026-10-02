@@ -137,6 +137,15 @@ function print_run_report(title, report; parameters=(), output=nothing)
     print_optional_report_value("raw dofs", report, :raw_dofs)
     print_optional_report_value("integration regions", report, :integration_regions)
     print_optional_report_value("facet regions", report, :facet_region_count)
+    # How many of those regions have part of their own face outside Ω — the ones
+    # whose rule is trimmed to `face ∩ Ω` instead of covering the whole face.
+    # Labelled so it
+    # does not contain "facet regions" as a substring — the same scraping hazard
+    # the "diagonal-scaled condition" line below is named around: the example
+    # smoke suite collects metrics by label with a substring regex, so the
+    # obvious "cut facet regions" would silently double every reading of the
+    # line above it.
+    print_optional_report_value("regions on cut faces", report, :cut_facet_region_count)
     print_optional_report_value("surface regions", report, :surface_region_count)
     print_small_overlap_block(report)
     print_optional_report_value("min integration volume", report, :min_integration_volume)

@@ -110,12 +110,17 @@ time axis split into slabs coupled across `t = const` seams — the construction
 `applications/interface_coupling_2d` already performs across a spatial seam. A
 body that *appears* after `t = 0` is genuinely underdetermined and is not this
 example's problem to solve. One limit is particular to `θ`'s nonzero Dirichlet
-data: facet integration is grid-aligned and never trimmed by the level set, so
-where the cone crosses the `t = 0` face the initial temperature is fitted over
-the cavity's footprint as well as over the material part. That footprint is the
-cone's base disc, `π r₀² ≈ 0.06` of the unit face, so the fitted initial
-condition is a least-squares compromise over an area some six percent larger
-than the physical one.
+data. Facet integration *is* trimmed by the level set — the initial temperature
+is fitted over the material part of the `t = 0` face and not over the cavity's
+footprint — but on a curved cut face the trimmed rule is accurate rather than
+exact: the face's measure comes out at `1 − π r₀² − 1.9e-5`, an error that falls
+with the moment order (`moment_order_factor`) and not at all with
+`subcell_length_scale` or `max_depth`, since the sliced sub-boxes are graph-like
+and the classifier stops bisecting them. (α is honoured on a face as it is on a
+cell, so `α = 1e-6` adds 5.9e-8 of the footprint back on top of that.) The `regions on cut faces` diagnostic
+reports how many faces are in that regime — one at `SC_CELLS = 3`, the central
+cell of the `t = 0` face, which holds the whole footprint, and four at
+`SC_CELLS = 6`.
 
 Unlike most of this example suite, the cost here is the cut-cell moment fit
 rather than compilation, so this is one of the few cases that runs *faster* at

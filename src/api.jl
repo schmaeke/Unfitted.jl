@@ -166,6 +166,52 @@ is a genuine surprise for a flux: an `except` selector is not "`∂Ω` minus
 a face" in the sense of measure, it is the closed union of what remains,
 and [`neumann`](@ref) integrates over the kept faces with no special
 treatment of the edges they share with the excluded ones.
+
+A selector names **grid-aligned** geometry and nothing else. Its facets
+are faces of the background box, partitioned over the cells that touch
+them — but what is *integrated* over them is only the part inside `Ω`.
+On an immersed space the rule on a face `∂Ω` crosses is the finite-cell
+moment fit applied to the level set restricted to that face's own affine
+slice, so under the default `α = 0` every quadrature point lies inside `Ω`
+and `boundary_integral(q -> 1.0; on=boundary(axis=d, side=s))` returns the
+measure of `face ∩ Ω`. A cell lying *entirely* outside `Ω` is also masked
+inactive and parents nothing, so a face loses whole cells through the mask
+and the rest of its non-physical area through the rule. The
+`cut_facet_region_count` field of [`AssemblyDiagnostics`](@ref) counts how
+many resolved facet regions needed that trimming, and
+`facet_moment_fit_residual_max` reports how well their fits went.
+
+The trimmed rule is **machine-exact where the level set restricted to the
+face is a single affine function** — one planar leaf, or one a 1-D bisection
+resolves exactly — and accurate rather than exact everywhere else, in two
+distinguishable ways. A curved cut converges in the moment order and in
+nothing else: measured 1.9e-5 on a disc cutting one cell of a face, unmoved
+by `subcell_length_scale` or `max_depth`. A CSG tree whose leaves meet at a
+corner *strictly inside* the face box is limited by something the fit cannot
+report, because the limit is not in the fit: the quadrature kernel places no
+breakpoint at such a corner, so the moments the fit reproduces are themselves
+slightly wrong, and a face cut by two planes meeting inside it comes out
+3.6e-4 off with the fit's own residual at 3.5e-16. Read
+`facet_moment_fit_residual_max` as a bound on the fit and never on the
+kernel. That second ceiling is the kernel's rather than the facet path's, and
+volume integration on such a tree meets it too.
+
+`α` on the [`PhysicalDomain`](@ref) is honoured on a face exactly as it is in
+a cell. At `α > 0` a trimmed region's rule is the blend
+`(1−α)·fit ∪ α·tensor`, from `∫_face α f = (1−α)∫_{face∩Ω} f + α∫_face f`,
+and a region whose face lies wholly outside `Ω` keeps an α-scaled full-face
+rule in place of an empty one. So the points no longer lie inside `Ω`, a unit
+integral reads `|face ∩ Ω| + α·|face ∖ Ω|`, and an integrand or datum
+undefined outside `Ω` is no longer usable on a cut face. That is the trade `α`
+offers — a conditioning stabiliser for a thin physical sliver of face, paid
+for with evaluations outside `Ω` — and it defaults to `0`, so nothing is
+blended unless asked for.
+
+What a selector does **not** name is the immersed boundary itself. `∂Ω`'s
+grid-aligned part and its immersed part are disjoint and together make up
+`∂Ω`, so integrate the immersed part over a [`BoundaryMesh`](@ref) and add
+the two — see [`boundary_integral`](@ref), which states the closure
+identity the pair satisfies.
 """
 function boundary(selector::Symbol; except=())
     # The no-exclusion path is the original one-line method, and it is reached
@@ -269,6 +315,36 @@ Nonzero `value` data are projected onto the boundary trace space
 before strong elimination so the constrained dof values reflect the
 correct trace. Homogeneous (constant-zero) data skip the projection
 entirely.
+
+On an immersed space, that projection is taken over `face ∩ Ω`: where `∂Ω`
+cuts the selected face, the mass matrix `∫ φᵢ φⱼ ds` and the right-hand
+side `∫ g φᵢ ds` are both integrated with the trimmed rule
+(see [`boundary`](@ref)), so under the default `α = 0` `value` is only ever
+evaluated at points inside `Ω` and the fitted trace is the least-squares fit
+over the physical face. A datum defined only on `Ω` — a square root, a
+reciprocal distance, an interpolated field from a prior solution — is
+therefore usable on a cut face, and usable there **only at `α = 0`**: the
+α-FCM blend appends full-face points, so such a datum raises on them rather
+than being quietly extended.
+
+Two consequences worth knowing. Trimming is a small-cut generator for the
+trace mass exactly as a thin cut cell is one for the stiffness matrix: a
+face whose physical sliver is tiny gives a near-singular mass, and
+`min_relative_facet_measure` on [`AssemblyDiagnostics`](@ref) reports the
+worst such ratio. And which dofs are *constrained* is a separate question,
+decided per dof key by the grid-aligned face test alone, so a dof can be
+constrained while the trimmed support it would be fitted on carries no
+measure at all; the trace solve then falls back from a Cholesky
+factorisation to a pseudoinverse and assigns it the minimum-norm value. That
+outcome is reported rather than chosen — `unsupported_dirichlet_dof_count`
+counts those dofs, `unsupported_dirichlet_dofs` names them and
+`dirichlet_trace_factors` says which branch each component's solve took, all on
+[`AssemblyDiagnostics`](@ref) — because what a Dirichlet condition *ought* to
+mean on a dof whose volume support still reaches into `Ω` is an open question;
+see [`UnsupportedDirichletDof`](@ref).
+`α` on the [`PhysicalDomain`](@ref) is honoured on facets and is the knob
+for both — it defaults to `0`, so neither is stabilised unless asked for, and
+raising it is what costs the `Ω`-only datum above.
 
 A `boundary(:all; except = …)` selector constrains its kept faces *closed*
 (see [`boundary`](@ref)): a dof on the edge between a kept face and an
@@ -482,6 +558,19 @@ For Robin, Nitsche, or other non-canonical boundary conditions,
 compose [`block`](@ref) and [`loadform`](@ref) directly with
 `on = …` and your own [`WeakForm`](@ref) — the package supplies the
 integration primitives, not the constitutive choice.
+
+On an immersed space the load is integrated over `face ∩ Ω` for the face
+named by `on` (see [`boundary`](@ref)), so a flux placed on a face that
+`∂Ω` cuts is applied to the physical part of that face and, at the default
+`α = 0`, `ℓ(v)` carries the physical measure — `α > 0` blends the full face
+back in, as [`boundary`](@ref) states. The same holds for any Robin or Nitsche
+term composed by hand with `on = boundary(…)`. How exact that rule is depends
+on the restricted level set rather than on the dimension, and
+[`boundary`](@ref) gives the condition; `cut_facet_region_count` /
+`facet_moment_fit_residual_max` on [`AssemblyDiagnostics`](@ref) say how many
+faces are in that regime and how well their fits went. A flux on the immersed boundary itself belongs on a
+[`BoundaryMesh`](@ref): the two parts of `∂Ω` are disjoint, so the total
+flux is the sum of the two integrals.
 
 A `boundary(:all; except = …)` selector puts the flux on its kept faces
 taken *closed* (see [`boundary`](@ref)): the load is the sum over those

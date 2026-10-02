@@ -2023,7 +2023,10 @@ end
 # region list. Reads from the per-kind cache on `model` when the entry exists
 # (every (target, space) site referenced by `prepare(problem)` is pre-resolved);
 # falls back to a fresh build against `space` for one-shot calls like
-# `assemble_matrix(model, block_with_unseen_on=…)`.
+# `assemble_matrix(model, block_with_unseen_on=…)`. "Fresh" is per *selector*,
+# not per face: the miss path resolves through the model's `FacetResolver`, so an
+# unseen selector built from faces `prepare` already resolved reuses them, and a
+# genuinely new face is resolved once however many such calls name it.
 #
 # `space` is half of the cache key, not merely a fallback for the miss path: a
 # hit is by construction a region list already built against that same space, so
@@ -2033,7 +2036,7 @@ end
 # the space themselves rather than take the default.
 function _resolve_on_regions(model::Model{D,T}, selector::BoundarySelector,
                              space=model.problem.space) where {D,T}
-    return get(() -> _facet_regions_for_selector(space, selector, model.dofs.tolerance),
+    return get(() -> _facet_regions_for_selector(space, selector, model.facet_resolver),
                model.facet_regions, (selector, space))
 end
 
@@ -2097,7 +2100,18 @@ The `kind=` form returns the **aggregate** over every cached region list
 of that kind, a structural count for diagnostics:
 
   - `:volume` (default) — the points of every subdomain integration plan.
-  - `:facet` — every cached [`FacetRegion`](@ref).
+  - `:facet` — every cached [`FacetRegion`](@ref). On an immersed space this
+    is not a function of the mesh and the orders alone: a region on a face
+    `∂Ω` crosses carries the moment-fit rule on the facet's affine slice, not
+    the tensor product `_facet_quadrature_counts` sizes, so its point count is
+    whatever that rule came out at — at most the moment basis size on a
+    `:cut_fitted` region, which at a low order is *more* points than the
+    untrimmed rule rather than fewer (measured 3 → 5 on a cut face of an
+    order-2 space), the raw Saye rule on a `:cut_fallback` one, and none at all
+    for a face wholly outside `Ω` under strict `α = 0`. `α > 0` appends the
+    full-face tensor rule to each of those. The count therefore moves with the
+    geometry, and `cut_facet_region_count` says how many regions are in that
+    regime.
   - `:surface` — every cached immersed [`SurfaceRegion`](@ref)
     ([`BoundaryMesh`](@ref) integration).
   - `:interface` — every cached multi-domain [`InterfaceRegion`](@ref).

@@ -45,6 +45,11 @@
 # forward-references `_has_physical_dirichlet` and
 # `_project_dirichlet_values!`; the references resolve at call time
 # (when `prepare(problem)` runs, after every source file is loaded).
+# Its `facets` keyword is left unannotated for the same reason: a
+# `FacetResolver{D,T}` annotation is evaluated where the method is
+# *defined*, which is before `dirichlet.jl` has introduced that type, so
+# the typing is done by `_project_dirichlet_values!` at the end of the
+# forward chain instead.
 
 # ── Dof keys and layout struct ────────────────────────────────────────────────
 
@@ -173,6 +178,19 @@ Fields:
   - `constrained_values::Matrix{T}` — `(raw, component) → value` for
     constrained dofs. Filled by [`_project_dirichlet_values!`](@ref)
     for nonzero physical Dirichlet data; zero otherwise.
+  - `dirichlet_trace_factors::Vector{Symbol}` — per component, which branch the
+    L² Dirichlet trace solve took: `:cholesky`, `:pseudoinverse` where the
+    boundary mass came out indefinite, or `:none` where the component had no
+    constrained dof to solve for.
+  - `unsupported_dirichlet::Vector{Vector{Int}}` — per component, the raw dofs
+    that solve left undetermined: constrained with no measure anywhere on their
+    facet support, hence pinned to their minimum-norm value instead of fitted.
+    See [`UnsupportedDirichletDof`](@ref). Empty on every untrimmed boundary.
+
+    The last two are filled by the same call that fills `constrained_values` and
+    both describe the *mesh* rather than the datum, so a load increment restates
+    them unchanged. Both read `:none` / empty until a projection has run at all,
+    homogeneous data skipping it entirely.
   - `active_count::Int` — total number of active (i.e. enumerated) dofs.
   - `tolerance::GeometryTolerance{T}` — tolerance used during boundary
     detection.
@@ -189,6 +207,8 @@ struct DofLayout{D,T<:Real}
     raw_expansion::Vector{Vector{Tuple{Int,T}}}
     has_linear_constraints::Bool
     constrained_values::Matrix{T}
+    dirichlet_trace_factors::Vector{Symbol}
+    unsupported_dirichlet::Vector{Vector{Int}}
     active_count::Int
     tolerance::GeometryTolerance{T}
 end
@@ -931,7 +951,8 @@ end
 
 """
     dof_layout(V::Space; dirichlet=[], tolerance=GeometryTolerance(T), components=1,
-                         prune=true, classify_cache=_ClassifyCache{D,T}()) -> DofLayout
+                         prune=true, classify_cache=_ClassifyCache{D,T}(),
+                         facets=nothing) -> DofLayout
 
 Construct the basis-aware global dof layout for a superposition
 [`Space`](@ref). The construction proceeds in four stages:
@@ -980,6 +1001,13 @@ Keyword arguments:
     `PhysicalDomain` fold). The fictitious-fold constraint predicate and the
     coverage rule both reuse it instead of re-classifying fold-boundary cells;
     defaults to a fresh empty cache for standalone calls.
+  - `facets` — the model's `FacetResolver`, through which stage 4b resolves the
+    boundary faces it projects the Dirichlet datum over. Sharing it is what makes
+    the projection read the very faces the assembly path and
+    [`boundary_integral`](@ref) read, at one resolution per `(space, face)`
+    rather than one per consumer. `nothing` (the default) gives this call a
+    private resolver at `tolerance`, which is what a standalone `dof_layout` with
+    no model behind it wants. Its tolerance must match `tolerance`.
 
 The integrated Legendre family produces single-raw constraints,
 reducing the resolved expansion to strong elimination (`raw_expansion =
@@ -991,7 +1019,8 @@ the expansion automatically.
 """
 function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
                     components::Integer=1, prune::Bool=true, prune_exempt=(),
-                    classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
+                    classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}(),
+                    facets=nothing) where {D,T}
     components > 0 || throw(ArgumentError("dof layout components must be positive"))
     raw_by_key = Dict{TensorDofKey{D},Int}()
     raw_keys = TensorDofKey{D}[]
@@ -1123,12 +1152,14 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
 
     layout = DofLayout{D,T}(ncomp, cell_dofs_by_level, raw_keys, active_component,
                             physical_dirichlet, elimination_source, raw_expansion,
-                            has_linear_constraints, zeros(T, nraw, ncomp), active_count, tolerance)
+                            has_linear_constraints, zeros(T, nraw, ncomp), fill(:none, ncomp),
+                            [Int[] for _ in 1:ncomp], active_count, tolerance)
 
     # Stage 4b: project nonzero Dirichlet data onto the boundary trace
     # space. Zero-only conditions skip this — `constrained_values` is
     # already zero from the construction above.
-    _needs_dirichlet_projection(dirichlet) && _project_dirichlet_values!(layout, V, dirichlet)
+    _needs_dirichlet_projection(dirichlet) &&
+        _project_dirichlet_values!(layout, V, facets, dirichlet)
     return layout
 end
 

@@ -675,23 +675,24 @@ end
     V = ladder(dom; cells=2, order=2, depth=1, splits=2)
     V = adapt(V, 2 => [CartesianIndex(1, 1)])
 
-    faces = Dict{Unfitted.FacetKey,Vector{Unfitted.FacetRegion{2,Float64}}}()
-    whole = Unfitted._facet_regions_for_selector(V, boundary(:all), tol, faces)
-    single = Unfitted._facet_regions_for_selector(V, boundary(axis=1, side=:lower), tol, faces)
+    facets = Unfitted.FacetResolver{2,Float64}(tol)
+    whole = Unfitted._facet_regions_for_selector(V, boundary(:all), facets)
+    single = Unfitted._facet_regions_for_selector(V, boundary(axis=1, side=:lower), facets)
     # Four entries, one per face of the space — not the five face resolutions
     # the two selectors would have asked for one at a time.
-    @test length(faces) == 4
+    @test length(facets.faces) == 4
 
     # Every memoised face carries exactly what an independent resolution of that
     # face builds: same region count, same order, same quadrature, same parents.
     for sides in Unfitted._facets(boundary(:all), Val(2))
         reference = Unfitted._boundary_facet_regions(V, sides, tol)
-        cached = faces[(V, sides)]
+        cached = facets.faces[(V, sides)]
         @test length(cached) == length(reference)
         for (c, r) in zip(cached, reference)
             @test c.sides == r.sides
             @test c.lower == r.lower
             @test c.upper == r.upper
+            @test c.kind == r.kind
             @test c.points == r.points
             @test c.weights == r.weights
             @test c.normal == r.normal
@@ -703,7 +704,7 @@ end
     # The second selector got the memo's regions themselves, not copies of them —
     # which is the storage half of the saving — and `boundary(:all)`'s union
     # still opens with that same face, since `_facets` lists it first.
-    shared = faces[(V, [(1, :lower)])]
+    shared = facets.faces[(V, [(1, :lower)])]
     @test length(single) == length(shared)
     @test all(a === b for (a, b) in zip(single, shared))
     @test all(a === b for (a, b) in zip(view(whole, 1:length(shared)), shared))
@@ -718,6 +719,708 @@ end
     @test length(both.facet_regions) == 2
     @test diagnostics(both).facet_region_count == length(whole) + length(single)
     @test l2_error(solve!(both), both, g) < 1.0e-12
+end
+
+@testset "one FacetResolver resolves each face of a model exactly once" begin
+    # The memo above used to be a throw-away of the per-selector sweep, and the L²
+    # Dirichlet projection had none at all — it called `_boundary_facet_regions`
+    # itself, so a face carrying a nonzero datum was resolved twice per `prepare`
+    # and again on every `update_dirichlet!`. One `FacetResolver` per model is now
+    # the only route to a face, and the assertions below are on object IDENTITY
+    # rather than on a count, because a count is precisely what a second,
+    # equal-looking build would also satisfy.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2)
+    V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(1, 1), order=2)
+    face = boundary(axis=1, side=:lower)
+    # Two overlapping selectors — the second names a face the first already covers
+    # — and a NONZERO datum, which is what makes the projection walk the boundary
+    # at all: `_needs_dirichlet_projection` skips a homogeneous one, so under a zero
+    # datum one of the two consumers would be silent and the test vacuous.
+    g(x) = 1 + x[1] + 2x[2]
+    model = prepare(poisson(V; source=0.0,
+                            dirichlet=[dirichlet(g; on=boundary(:all)), dirichlet(g; on=face)]))
+    resolver = model.facet_resolver
+
+    # The four faces of the space, resolved once each — against the five
+    # selector × face pairs the two selectors name between them, and the nine
+    # resolutions the two consumers would have asked for separately.
+    @test resolver.tolerance == model.dofs.tolerance
+    @test Set(keys(resolver.faces)) ==
+          Set((model.problem.space, sides) for sides in Unfitted._facets(boundary(:all), Val(2)))
+
+    # Every region in every per-selector cache entry IS one of the resolver's,
+    # position for position — not a copy of one carrying the same numbers.
+    for ((selector, each_space), list) in model.facet_regions
+        shared = reduce(vcat,
+                        (resolver.faces[(each_space, sides)]
+                         for sides in Unfitted._facets(selector, Val(2))))
+        @test length(list) == length(shared)
+        @test all(a === b for (a, b) in zip(list, shared))
+    end
+
+    # A load step resolves nothing. `update_dirichlet!` re-projects through the
+    # model's resolver, so it walks the entries that are already there — the same
+    # list objects, not equal rebuilds of them. This is the cost consolidation
+    # buys, and the reason to do it before a facet rule becomes anything more
+    # expensive than a tensor product.
+    before = copy(resolver.faces)
+    update_dirichlet!(model, [dirichlet(g; on=boundary(:all)), dirichlet(g; on=face)])
+    @test Set(keys(resolver.faces)) == Set(keys(before))
+    @test all(resolver.faces[key] === before[key] for key in keys(before))
+
+    # And the projection resolves through *this* resolver, which the assertions so
+    # far cannot see: `_resolve_facet_regions` runs after `system_layout` at
+    # `prepare` and names the Dirichlet selectors among its own sites, so the four
+    # keys above would be here either way. Emptying the memo first makes the
+    # question order-sensitive. Dropping the cached `DirichletProjection` forces
+    # the next load step to rebuild it, hence to walk the boundary again, and the
+    # faces it resolves on that walk are the only thing that can refill the memo —
+    # so a projection holding a resolver of its own leaves it empty.
+    delete!(model.dirichlet_projections, only(model.dofs.fields).name)
+    empty!(resolver.faces)
+    update_dirichlet!(model, [dirichlet(g; on=boundary(:all)), dirichlet(g; on=face)])
+    @test Set(keys(resolver.faces)) == Set(keys(before))
+
+    # The same hand-off on the `prepare` side, which runs one level further down:
+    # `system_layout` forwards the resolver through `dof_layout` into the
+    # projection, so a resolver handed to the layout *alone* comes back carrying
+    # the conditions' faces. That is the half of the thread the step above cannot
+    # reach, and the order is the whole point again — at `prepare` this walk
+    # happens first, which is why `_resolve_facet_regions` afterwards resolves
+    # nothing and the model ends up at four.
+    fresh = Unfitted.FacetResolver{2,Float64}(model.dofs.tolerance)
+    Unfitted.system_layout(model.problem; tolerance=model.dofs.tolerance, facets=fresh)
+    @test Set(keys(fresh.faces)) == Set(keys(before))
+
+    # A resolver at another tolerance is not interchangeable: its entries were
+    # merged against that tolerance, so the faces it holds are not the partition
+    # this layout's constrained dofs were detected on, and projecting through it
+    # would fit `g` over a boundary the operator does not integrate — the one
+    # failure mode sharing the resolution is meant to rule out. It raises, and
+    # raises before touching the values it was going to overwrite.
+    layout = only(model.dofs.fields).dofs
+    projected = copy(layout.constrained_values)
+    @test any(!iszero, projected)
+    coarse = Unfitted.FacetResolver{2,Float64}(GeometryTolerance(Float64; merge=1.0e-3))
+    @test_throws ArgumentError Unfitted._project_dirichlet_values!(layout, model.problem.space,
+                                                                   coarse, model.problem.dirichlet)
+    @test layout.constrained_values == projected
+
+    # `nothing` is the standalone spelling — `dof_layout(V; dirichlet)` with no
+    # model behind it — and projects through a private resolver at the layout's own
+    # tolerance. Bit-identical to the shared route, which is what makes the
+    # resolver a saving rather than a semantic change.
+    @test Unfitted._project_dirichlet_values!(layout, model.problem.space, nothing,
+                                              model.problem.dirichlet) isa
+          Unfitted.DirichletProjection{2,Float64}
+    @test layout.constrained_values == projected
+
+    # `move!` replaces the resolver along with the dof layout, so the memo tracks
+    # the live discretisation: every key holds the space the model has now, and the
+    # faces resolved on the superseded space are gone rather than carried forward
+    # as ballast no lookup can reach.
+    retired = model.problem.space
+    move!(model; level=2, to=box((0.3, 0.3), (0.8, 0.8)))
+    @test model.problem.space !== retired
+    @test !isempty(model.facet_resolver.faces)
+    @test all(key[1] === model.problem.space for key in keys(model.facet_resolver.faces))
+end
+
+@testset "cut_facet_region_count reports the facet regions whose face leaves Ω" begin
+    # A facet region is the whole grid-aligned face of its parent cells, and the
+    # rule on it covers the part of that face inside Ω. `cut_facet_region_count` is
+    # how many of a model's facet regions needed that trimming, which is also how
+    # much of its boundary integration rests on a fitted rule rather than on an
+    # exact tensor product. Ω = { x₂ ≤ x₁ + 0.55 } ∩ (0, 1)² puts a plane through
+    # the x₁ = 0 face: physical for x₂ ≤ 0.55, fictitious above it.
+    plane = leaf(x -> x[2] - x[1] - 0.55; lipschitz=sqrt(2.0))
+    cut_domain = physical_domain(plane; subcell_length_scale=0.0625)
+    Vcut = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=cut_domain)
+    face = boundary(axis=1, side=:lower)
+    cut_model = prepare(poisson(Vcut; source=0.0, dirichlet=[dirichlet(0.0; on=face)]))
+
+    # Four regions on that face, one per cell along it. On the face φ = x₂ − 0.55,
+    # so the region over x₂ ∈ [0.5, 0.75] is *crossed* by ∂Ω and the one over
+    # x₂ ∈ [0.75, 1] lies wholly outside Ω. Both count: what the number reports is
+    # regions that integrate non-physical area, and lying entirely outside is the
+    # extreme of that, not an exception to it. The lower two faces stay inside Ω.
+    @test diagnostics(cut_model).facet_region_count == 4
+    @test diagnostics(cut_model).cut_facet_region_count == 2
+
+    # The count is a count of `FacetRegion.kind`, so pin the kinds themselves. The
+    # verdict is `classify_cell` on each region's own face box against the level
+    # set restricted to the x₁ = 0 slice, which is why the third region reads a
+    # `:cut_*` kind and the fourth `:fictitious` rather than both reading the same
+    # thing; `:cut_fitted` rather than `:cut_fallback` because the restricted leaf
+    # is affine, so the moment fit on it is machine-exact.
+    cut_regions = cut_model.facet_regions[(face, cut_model.problem.space)]
+    @test [r.lower[2] for r in cut_regions] == [0.0, 0.25, 0.5, 0.75]
+    @test [r.kind for r in cut_regions] == [:full, :full, :cut_fitted, :fictitious]
+
+    # The number the count is about. The face's full geometric measure is 1.0 and
+    # its physical measure is exactly 0.55 — the two `:full` regions contribute
+    # 0.5, the `:cut_fitted` one the 0.05 of [0.5, 0.75] below x₂ = 0.55, and the
+    # `:fictitious` one nothing at all. Machine-exact, because φ restricted to the
+    # face is affine. This assertion read 1.0 before facet rules were trimmed and
+    # is the single deliberate pin of that defect's disappearance.
+    @test boundary_integral(q -> 1.0, cut_model; on=face) ≈ 0.55 rtol = 1.0e-14
+
+    # Where every point of that rule *is* is the other half of the contract, and
+    # the half no measure can see: a weight sum stays right whenever the stray
+    # points happen to cancel, while `dirichlet`'s promise that a datum defined
+    # only on Ω — a square root, a reciprocal distance, a field interpolated from
+    # a prior solution — is usable on a cut face holds only if no point of the
+    # rule leaves Ω at all. Asserted at the default α = 0, pinned both ways: the
+    # `kept_model` block below is the same geometry under the α-FCM blend, where
+    # the promise is deliberately forfeited.
+    @test all(Unfitted._inside(cut_domain.geometry, p) for r in cut_regions for p in r.points)
+    # And it is a promise such a datum checks for itself. √(0.55 + x₁ − x₂) is real
+    # on the physical face and nowhere above it, so this is the whole class of data
+    # that was unusable on a cut face before trimming — asserted through the public
+    # API, and on the projected values rather than on merely surviving `prepare`.
+    only_on_omega = dirichlet(x -> sqrt(-(x[2] - x[1] - 0.55)); on=face)
+    omega_model = prepare(poisson(Vcut; source=0.0, dirichlet=[only_on_omega]))
+    projected = only(omega_model.dofs.fields).dofs.constrained_values
+    @test all(isfinite, projected)
+    @test count(!iszero, projected) > 0
+
+    # Three facet diagnostics come off those same kinds. The fit is exact, so no
+    # failure and no fallback; the residual is a real NNLS residual on the cut
+    # region and nothing more. `min_relative_facet_measure` is the smallest
+    # integrated-to-geometric measure ratio over the regions, which the wholly
+    # fictitious face drives to exactly zero at α = 0 — the conditioning warning
+    # a trimmed Dirichlet condition needs, since such a region's trace dofs are
+    # constrained with no measure to fit them on.
+    @test diagnostics(cut_model).facet_fit_failure_count == 0
+    @test diagnostics(cut_model).facet_cut_fallback_count == 0
+    @test diagnostics(cut_model).facet_moment_fit_residual_max < 1.0e-14
+    @test diagnostics(cut_model).min_relative_facet_measure == 0.0
+
+    # The case that separates the *face* test from a test on the parent cells, and
+    # the reason the count is not simply "any parent is cut". A circle of radius
+    # 0.1 about (0.2, 0.5) cuts two cells that sit on the x₁ = 0 face, but it stops
+    # at x₁ = 0.1 and never reaches the face, so every integrated face lies inside
+    # Ω and every facet integral is exactly right. Counting cut cells would report
+    # those two regions; counting cut faces reports none.
+    offset = leaf(x -> 0.1 - sqrt((x[1] - 0.2)^2 + (x[2] - 0.5)^2); lipschitz=1.0)
+    interior = physical_domain(offset; subcell_length_scale=0.0625)
+    Vhole = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=interior)
+    hole_model = prepare(poisson(Vhole; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    @test diagnostics(hole_model).cut_region_count > 0
+    @test diagnostics(hole_model).facet_region_count == 16
+    @test diagnostics(hole_model).cut_facet_region_count == 0
+    @test diagnostics(hole_model).min_relative_facet_measure == 1.0
+    # Every face lies inside Ω, so every rule is the untrimmed tensor product and
+    # the boundary measure is the box perimeter to the bit — a cut cell behind a
+    # face costs the face nothing.
+    @test boundary_integral(q -> 1.0, hole_model; on=boundary(:all)) ≈ 4.0 rtol = 1.0e-14
+    # ...and the cells really are cut, so this is a live discrimination and not a
+    # geometry in which the two tests trivially agree.
+    hole_regions = hole_model.facet_regions[(boundary(:all), hole_model.problem.space)]
+    @test all(r -> r.kind === :full, hole_regions)
+    @test count(r -> any(p -> Unfitted.classify_cell(interior, p.parent_box) === :cut, r.parents),
+                hole_regions) == 2
+
+    # No geometry at all: nothing can leave Ω, and the classification says so
+    # without a level set to ask — `_classify_facet` dispatches on the absent
+    # `PhysicalDomain` rather than testing for it.
+    Vplain = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2)
+    plain = prepare(poisson(Vplain; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    @test diagnostics(plain).facet_region_count == 16
+    @test diagnostics(plain).cut_facet_region_count == 0
+    @test all(r -> r.kind === :full, plain.facet_regions[(boundary(:all), plain.problem.space)])
+
+    # `keep_fictitious = true` keeps whole fictitious cells in the layout, so it can
+    # only add regions, never retract a verdict: the count is a property of the
+    # geometry and the face, not of the fold. On this geometry no cell on the face
+    # is wholly fictitious, so both numbers are unchanged.
+    kept = physical_domain(plane; alpha=1.0e-3, keep_fictitious=true, subcell_length_scale=0.0625)
+    Vkept = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=kept)
+    kept_model = prepare(poisson(Vkept; source=0.0, dirichlet=[dirichlet(0.0; on=face)]))
+    @test diagnostics(kept_model).facet_region_count == 4
+    @test diagnostics(kept_model).cut_facet_region_count == 2
+
+    # α is honoured on facets exactly as it is on cells, and this is the package's
+    # one exercise of that path. Writing the α-FCM integrand as
+    #     ∫_face α(x) f = ∫_{face∩Ω} f + α ∫_{face∖Ω} f
+    #                   = (1 − α) ∫_{face∩Ω} f + α ∫_face f,
+    # the `:cut` region's rule is the concatenation `(1−α)·fit ∪ α·tensor` and the
+    # fictitious region's is `α·tensor` — the same two rules the volume dispatch
+    # builds. So the face's unit integral is `0.55 + α·0.45` exactly: the physical
+    # 0.55, plus α times the 0.45 of face that is not in Ω. Every term is affine or
+    # a whole cell, so this is machine-exact and not a band.
+    @test [r.kind for r in kept_model.facet_regions[(face, kept_model.problem.space)]] ==
+          [:full, :full, :cut_fitted, :fictitious_alpha]
+    @test boundary_integral(q -> 1.0, kept_model; on=face) ≈ 0.55 + 1.0e-3 * 0.45 rtol = 1.0e-14
+    # And the relative measure now reports α on the fictitious face rather than
+    # zero: its dofs carry α-stabilised mass instead of none.
+    @test diagnostics(kept_model).min_relative_facet_measure ≈ 1.0e-3 rtol = 1.0e-14
+
+    # The blend's price, and the reason α stays opt-in rather than becoming the
+    # default cure for the sliver it stabilises: the full-face tensor rule it
+    # concatenates carries points *outside* Ω, so the α = 0 invariant above is
+    # forfeited on exactly the faces α touches — 5 of the 17 points here. The
+    # datum that prepared cleanly at α = 0 therefore raises, and raises rather
+    # than being silently extended, which is the behaviour to want of it.
+    kept_regions = kept_model.facet_regions[(face, kept_model.problem.space)]
+    @test count(!Unfitted._inside(kept.geometry, p) for r in kept_regions for p in r.points) == 5
+    @test_throws DomainError prepare(poisson(Vkept; source=0.0, dirichlet=[only_on_omega]))
+end
+
+@testset "a Dirichlet dof with no measure on its facet support is reported, not hidden" begin
+    # Trimming splits two questions an untrimmed grid-aligned boundary answered
+    # together. Which dofs a condition CONSTRAINS is decided per dof key by the face
+    # test alone; what is INTEGRATED over a face is only the part inside Ω. So a dof
+    # can carry a Dirichlet condition while every facet region its trace reaches has
+    # been trimmed away: its row of the trace mass is identically zero, `cholesky`
+    # reports the mass indefinite, and the pseudoinverse fallback assigns it the
+    # minimum-norm value. These assertions pin the REPORT and not the outcome — what
+    # such a condition ought to mean is an open semantic question, and answering it
+    # by leaving the dof free would move `active_unknowns` and the size of the
+    # system.
+    #
+    # Ω = (0,1)² ∖ {‖x‖ ≤ 0.3} at 4×4 puts the hole on a corner, so the corner cell
+    # [0, ¼]² is CUT — its far corner sits at r = √2/4 ≈ 0.354 > 0.3 — hence active
+    # and parenting a region on each of its two boundary faces, while both of those
+    # faces lie at r ≤ 0.25 < 0.3 and are wholly outside Ω. The whole-cell
+    # fictitious fold cannot reach that: the cell is not fictitious, only its faces
+    # are, which is the one configuration a face can reach only by being trimmed
+    # inside a single cell.
+    disc = physical_domain(leaf(x -> 0.3 - hypot(x[1], x[2]); lipschitz=1.0);
+                           subcell_length_scale=0.0625)
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=disc)
+    g(x) = sin(x[1] + 2x[2])
+    model = prepare(poisson(V; source=x -> 5 * sin(x[1] + 2x[2]),
+                            dirichlet=[dirichlet(g; on=boundary(:all))]))
+    layout = only(model.dofs.fields).dofs
+    report = diagnostics(model)
+
+    # The hazard is live rather than assumed: the cell classifies cut, stays active,
+    # and the first region of each of its two faces carries no rule at all.
+    @test classify_cell(disc, cell_box(V, CartesianIndex(1, 1); level=1)) === :cut
+    @test active_cells(model; level=1)[1, 1]
+    for sides in ([(1, :lower)], [(2, :lower)])
+        region = first(model.facet_resolver.faces[(model.problem.space, sides)])
+        @test region.kind === :fictitious
+        @test isempty(region.weights)
+    end
+
+    # Three dofs, and exactly the three the geometry names: of those the face test
+    # constrains on the two faces, the ones supported on that first region ALONE are
+    # the node at the origin — the only node of either face inside the hole — and
+    # each face's own bubble over its first cell. The node at (0, ¼) also sits on
+    # the second region, which the arc merely crosses, so it keeps a measure of 0.2
+    # and is fitted normally. Identified by dof key rather than by count, a count
+    # being what a different three dofs would satisfy too.
+    node = Unfitted._axis_dof_key(1, 0)                 # the node at coordinate 0
+    bubble = Unfitted._axis_dof_key(1, 2)               # cell 1's own bubble mode
+    @test report.unsupported_dirichlet_dof_count == 3
+    @test all(r -> r.field === :u && r.component == 1, report.unsupported_dirichlet_dofs)
+    @test Set(layout.raw_keys[r.raw] for r in report.unsupported_dirichlet_dofs) ==
+          Set(Unfitted.TensorDofKey{2}(1, axes)
+              for axes in ((node, node), (bubble, node), (node, bubble)))
+
+    # The branch the count explains. A zero row makes the mass positive
+    # SEMI-definite, which is the one thing `cholesky(…; check = false)` does
+    # detect, so the solve falls back — and carries on.
+    @test report.dirichlet_trace_factors == [:pseudoinverse]
+
+    # What it falls back to, and why the count is worth carrying at all: the
+    # minimum-norm value is zero only to the roundoff of the pseudoinverse's
+    # singular-value decomposition, so two of the three come out at ~1e-16 and the
+    # pinned dofs are invisible in a scan of the projected values — 31 of the 32
+    # nonzero, not 29.
+    @test all(abs(layout.constrained_values[r.raw, r.component]) < 1.0e-14
+              for r in report.unsupported_dirichlet_dofs)
+    @test count(!iszero, layout.constrained_values) == 31
+
+    # And the discretisation does not move. Reporting a dof is not refusing to
+    # constrain it; the alternative — leaving an unsupported dof free — is the
+    # separate semantic decision this deliberately does not take, and taking it
+    # would show up right here.
+    @test active_unknowns(model) == 49
+
+    # Both quantities come off the boundary mass, so they are datum-independent in
+    # exactly the sense the cached projection is: a load increment restates them.
+    pinned = copy(report.unsupported_dirichlet_dofs)
+    update_dirichlet!(model, [dirichlet(x -> 3 * sin(x[1] + 2x[2]); on=boundary(:all))])
+    @test diagnostics(model).dirichlet_trace_factors == [:pseudoinverse]
+    @test diagnostics(model).unsupported_dirichlet_dofs == pinned
+
+    # The far end of a face, which an index running the wrong way along the axis
+    # would get wrong while still counting two. Ω = {x₂ ≤ x₁ + 0.55} restricts to
+    # φ = x₂ − 0.55 on the x₁ = 0 face, so it is the FOURTH region, over
+    # x₂ ∈ [¾, 1], that lies outside Ω: the node at x₂ = 1 and cell 4's bubble lose
+    # their measure, while the node at x₂ = ¾ keeps the 0.05 the third region has.
+    plane = physical_domain(leaf(x -> x[2] - x[1] - 0.55; lipschitz=sqrt(2.0));
+                            subcell_length_scale=0.0625)
+    face = boundary(axis=1, side=:lower)
+    Vplane = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=plane)
+    cut_model = prepare(poisson(Vplane; source=0.0,
+                                dirichlet=[dirichlet(x -> 1 + x[1] + 2x[2]; on=face)]))
+    cut_report = diagnostics(cut_model)
+    cut_keys = only(cut_model.dofs.fields).dofs.raw_keys
+    @test cut_report.dirichlet_trace_factors == [:pseudoinverse]
+    @test cut_report.unsupported_dirichlet_dof_count == 2
+    @test Set(cut_keys[r.raw] for r in cut_report.unsupported_dirichlet_dofs) ==
+          Set(Unfitted.TensorDofKey{2}(1, axes)
+              for axes in
+                  ((node, Unfitted._axis_dof_key(4, 1)), (node, Unfitted._axis_dof_key(4, 2))))
+
+    # Two controls. A non-immersed face has nothing to trim, so the solve is a
+    # Cholesky and the list is empty; and a homogeneous condition runs no projection
+    # at all, so both read their "nothing has happened" value until a nonzero
+    # increment establishes them — the one event short of a rebuild that moves either.
+    Vplain = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2)
+    plain = prepare(poisson(Vplain; source=0.0,
+                            dirichlet=[dirichlet(x -> 1 + x[1]; on=boundary(:all))]))
+    @test diagnostics(plain).dirichlet_trace_factors == [:cholesky]
+    @test isempty(diagnostics(plain).unsupported_dirichlet_dofs)
+
+    quiet = prepare(poisson(Vplain; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    @test diagnostics(quiet).dirichlet_trace_factors == [:none]
+    @test diagnostics(quiet).unsupported_dirichlet_dof_count == 0
+    update_dirichlet!(quiet, [dirichlet(x -> 1 + x[1]; on=boundary(:all))])
+    @test diagnostics(quiet).dirichlet_trace_factors == [:cholesky]
+
+    # Per component, because the trace solve is: a condition scoped to one channel
+    # integrates only its own facets, so the other channel has no unknown to solve
+    # for and reports `:none` beside the fallback. Here u₁ is pinned on the x₁ = 0
+    # face alone, which costs it that face's two dofs supported only inside the hole
+    # — the origin node and the face's first bubble — while u₂ is untouched.
+    u = field(:u, V; components=2)
+    vector_model = prepare(poisson(u; source=SVector(0.0, 0.0),
+                                   dirichlet=[dirichlet(0.5; on=face, field=u, component=1)]))
+    vector_report = diagnostics(vector_model)
+    @test vector_report.dirichlet_trace_factors == [:pseudoinverse, :none]
+    @test [r.component for r in vector_report.unsupported_dirichlet_dofs] == [1, 1]
+    @test Set(only(vector_model.dofs.fields).dofs.raw_keys[r.raw]
+              for r in vector_report.unsupported_dirichlet_dofs) ==
+          Set(Unfitted.TensorDofKey{2}(1, axes) for axes in ((node, node), (node, bubble)))
+
+    # And the knob that removes the condition instead of reporting it, which is also
+    # why no shipped example reaches it. At α > 0 a wholly fictitious face keeps an
+    # α-scaled full-face rule in place of an empty one, so the three dofs above get
+    # α-stabilised mass rather than none, the trace mass is positive definite again
+    # and nothing is left unsupported. α = 1e-6 — the only nonzero α any shipped
+    # example uses, `spacetime_cavity_2d`'s — already suffices, the fallback's test
+    # being definiteness and not conditioning. It stays a knob rather than becoming a
+    # default because the price is the one `boundary` documents: the rule's points
+    # no longer lie inside Ω, so a datum defined only there can no longer be used.
+    stabilised = physical_domain(leaf(x -> 0.3 - hypot(x[1], x[2]); lipschitz=1.0); alpha=1.0e-6,
+                                 subcell_length_scale=0.0625)
+    Vstable = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=stabilised)
+    stable_model = prepare(poisson(Vstable; source=x -> 5 * sin(x[1] + 2x[2]),
+                                   dirichlet=[dirichlet(g; on=boundary(:all))]))
+    stable_faces = stable_model.facet_resolver.faces
+    @test first(stable_faces[(stable_model.problem.space, [(1, :lower)])]).kind ===
+          :fictitious_alpha
+    @test diagnostics(stable_model).dirichlet_trace_factors == [:cholesky]
+    @test diagnostics(stable_model).unsupported_dirichlet_dof_count == 0
+    @test active_unknowns(stable_model) == 49
+end
+
+@testset "a facet region's kind is the verdict on its own face, in every codimension" begin
+    # Every codimension goes through the same two steps — restrict the level set to
+    # the facet's affine slice, then classify the region's own face box against it —
+    # and the only thing that changes is how many axes the box has: a codim-1 face
+    # reaches an `AxisBox{D-1}`, a codim-2 edge an `AxisBox{1}`, and the codim-D
+    # vertex has no box at all, `AxisBox` being non-degenerate by construction, so it
+    # is decided by membership at the one point of the slice.
+    #
+    # `FacetRegion.kind` names the *rule* the region ended up with, so it refines
+    # that verdict — a cut face reads `:cut_fitted`, `:cut_fallback` or `:cut_failed`
+    # according to how the moment fit on the slice went, a fictitious one
+    # `:fictitious_alpha` under α > 0. This testset is about the verdict, so the
+    # verdict is read back out of the kind through a closed table: an unexpected kind
+    # raises a `KeyError` here rather than quietly passing as something else.
+    #
+    # Ω = (0,1)³ ∖ {‖x‖ ≤ 0.3} puts the hole on a corner, so each of the three
+    # lower faces meets a quarter disc of radius 0.3 and the lower edges meet it as
+    # an interval. On a face box whose corners all have non-negative coordinates the
+    # nearest and farthest points of the box are its own corners, which gives an
+    # independent analytic verdict to compare every kind against.
+    tol = GeometryTolerance(Float64)
+    ball = leaf(x -> 0.3 - sqrt(x[1]^2 + x[2]^2 + x[3]^2); lipschitz=1.0)
+    p = physical_domain(ball; subcell_length_scale=0.0625)
+    V = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(4, 4, 4), order=2, physical=p)
+    verdicts = Dict(:full => :full, :fictitious => :fictitious, :fictitious_alpha => :fictitious,
+                    :cut_fitted => :cut, :cut_fallback => :cut, :cut_failed => :cut,
+                    :cut_alpha_failed => :cut)
+    verdict(region) = verdicts[region.kind]
+    expected(region) =
+        let near = norm(region.lower), far = norm(region.upper)
+            far <= 0.3 ? :fictitious : (near >= 0.3 ? :full : :cut)
+        end
+
+    for axis in 1:3
+        regions = Unfitted._boundary_facet_regions(V, [(axis, :lower)], tol)
+        @test length(regions) == 16
+        @test all(r -> verdict(r) === expected(r), regions)
+        @test count(r -> verdict(r) === :cut, regions) == 3
+        @test count(r -> verdict(r) === :fictitious, regions) == 0
+        # The upper faces are a whole unit away from the hole, so nothing on them
+        # can leave Ω — the discrimination is live, not a geometry in which every
+        # face answers the same.
+        @test all(r -> r.kind === :full, Unfitted._boundary_facet_regions(V, [(axis, :upper)], tol))
+    end
+
+    # Codim-2: the ball covers the edge out to x₃ = 0.3, so the first region lies
+    # wholly outside Ω and the second is crossed.
+    edge = Unfitted._boundary_facet_regions(V, [(1, :lower), (2, :lower)], tol)
+    @test [verdict(r) for r in edge] == [:fictitious, :cut, :full, :full]
+    @test all(r -> verdict(r) === expected(r), edge)
+
+    # Codim-3: the origin is the centre of the ball, hence outside Ω.
+    vertex = Unfitted._boundary_facet_regions(V, [(1, :lower), (2, :lower), (3, :lower)], tol)
+    @test only(vertex).kind === :fictitious
+    far_vertex = Unfitted._boundary_facet_regions(V, [(1, :upper), (2, :upper), (3, :upper)], tol)
+    @test only(far_vertex).kind === :full
+
+    # The ball is symmetric in all three axes, which leaves the *coordinate* half of
+    # the slice untested in both of its directions. `_facet_box` selects the free axes
+    # in ascending order while `_facet_pins` hands `_restrict_domain` the pinned ones
+    # in descending order, and the two have to agree on which slice coordinate is
+    # which original axis; on a geometry symmetric in the axes that survive, any
+    # permutation of the slice's coordinate slots is invisible. Measured on the ball
+    # above: reversing the free-axis slots moves 0 of the 16 verdicts on each of its
+    # lower faces, so nothing here is protected by the assertions above.
+    #
+    # Ω = {2x₁ + 3x₂ + x₃ > 0.9} carries a distinct coefficient on every axis, so no
+    # permutation survives it, and being affine it makes the classifier exact: an
+    # affine function attains its extremes over a box at corners, so `:cut` is
+    # precisely "the corners disagree" and `expected_tilt` below is an oracle rather
+    # than a recorded run. No cell corner lies on the plane (`2i + 3j + k = 3.6` has
+    # no integer solution on this mesh), so no verdict sits on a tie, and no cell is
+    # wholly fictitious, so the mask retracts nothing and every face keeps all 16
+    # regions — the geometry under test is the slice and nothing else.
+    tilt = physical_domain(leaf(x -> 0.9 - 2x[1] - 3x[2] - x[3]; lipschitz=sqrt(14.0));
+                           subcell_length_scale=0.0625)
+    Vtilt = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(4, 4, 4), order=2, physical=tilt)
+    expected_tilt(region) =
+        let lo = 2region.lower[1] + 3region.lower[2] + region.lower[3],
+            hi = 2region.upper[1] + 3region.upper[2] + region.upper[3]
+
+            lo > 0.9 ? :full : (hi <= 0.9 ? :fictitious : :cut)
+        end
+
+    for axis in 1:3, side in (:lower, :upper)
+        regions = Unfitted._boundary_facet_regions(Vtilt, [(axis, side)], tol)
+        @test length(regions) == 16
+        @test all(r -> verdict(r) === expected_tilt(r), regions)
+    end
+
+    # The x₂ face is the only codim-1 face of a 3-D box whose free axes interleave
+    # with its pinned one (1 and 3 around 2), hence the only one on which swapping the
+    # slice's coordinate slots shows at all: it would classify against x₁ + 2x₃ and
+    # move 4 of these 16 verdicts. All three verdicts occur on it, so the oracle is
+    # discriminating here and not a face on which every region answers the same.
+    tilted_face = Unfitted._boundary_facet_regions(Vtilt, [(2, :lower)], tol)
+    @test map(k -> count(r -> verdict(r) === k, tilted_face), (:full, :cut, :fictitious)) ==
+          (10, 5, 1)
+
+    # The pinned axes interleave in turn whenever the lower-numbered one is not the
+    # last — axes 1 and 2 of a 3-D box, whose free axis is 3. Consuming the pins
+    # ascending would drop axis 1 first and leave the pin named "2" addressing x₃, the
+    # edge's own free axis, pinning it to the axis-2 coordinate and reading
+    # `[:fictitious, :cut, :full, :full]` along the edge instead. (A pin pair whose
+    # higher axis is the last one cannot go wrong silently: the stale index addresses
+    # a slot the shortened coordinate vector does not have, and the restriction
+    # throws.)
+    tilted_edge = Unfitted._boundary_facet_regions(Vtilt, [(1, :lower), (2, :lower)], tol)
+    @test [verdict(r) for r in tilted_edge] == [:fictitious, :fictitious, :fictitious, :cut]
+    @test all(r -> verdict(r) === expected_tilt(r), tilted_edge)
+    # And the codim-2 *rule*, not just its verdicts. Every measure anchor in
+    # "a trimmed facet rule integrates the physical part of its face" is codim-1, so
+    # without this one a restriction that classified a `D − 2` face correctly and then
+    # built the wrong rule on it would pass the whole suite. On this edge — x₁ = x₂ = 0,
+    # free axis 3 — the level set reduces to φ = 0.9 − x₃, so Ω takes x₃ > 0.9 and the
+    # edge's measure is exactly 0.1 of a geometric 1.0. Machine-exact because the
+    # restricted leaf is affine in the one surviving coordinate, which is also why this
+    # is an analytic anchor and not a recorded run.
+    @test sum(sum(r.weights) for r in tilted_edge) ≈ 0.1 rtol = 1.0e-14
+    @test all(Unfitted._inside(tilt.geometry, p) for r in tilted_edge for p in r.points)
+end
+
+@testset "a trimmed facet rule integrates the physical part of its face" begin
+    # The anchors for facet trimming, each against an analytic value and never
+    # against a recorded run of itself. `_boundary_facet_regions` is read directly
+    # where only the rule is under test: it is the one function both the operator
+    # and the Dirichlet projection resolve through, so its weight sum IS the measure
+    # every consumer of that face integrates over.
+    tol = GeometryTolerance(Float64)
+    regions(V, sides) = Unfitted._boundary_facet_regions(V, sides, tol)
+    measure(V, sides) = sum(sum(r.weights) for r in regions(V, sides))
+    # The anchors are measures, and a measure cannot see *where* the points are: a
+    # weight sum stays right whenever the stray points cancel. So each α = 0 anchor
+    # carries the point-set invariant beside it — every point of the rule inside Ω,
+    # which is what makes a datum defined only on Ω usable on a cut face. The curved
+    # anchor below runs at α = 1e-6 and so is deliberately exempt; the α-FCM blend
+    # and its forfeiture of this invariant are pinned where α is.
+    on_omega(V, sides) = all(Unfitted._inside(V.physical.geometry, p) for r in regions(V, sides)
+                             for p in r.points)
+
+    # 1. A symmetry plane through a hole — the shape `kirsch_plate_2d` ships, which
+    #    is the reason this defect was worth fixing rather than documenting. Ω is the
+    #    quarter plate (0,4)² outside the unit circle at the origin, 8×8 cells. On
+    #    the x₁ = 0 face φ reduces to 1 − x₂, so the face is physical for x₂ ≥ 1 and
+    #    its measure is exactly 3.0 of a geometric 4.0. The cell [0, 0.5]² is wholly
+    #    fictitious, and on a prepared model the fold has already dropped it, which
+    #    is why the untrimmed integral read 3.5 rather than 4.0: a face loses whole
+    #    cells through the mask and the rest through the rule. Read here before the
+    #    fold, so both losses are visible at once.
+    #
+    #    The hole is *tangent* to the face — it touches it at the single point
+    #    x₂ = 1 — so the region [0.5, 1] classifies `:cut` while `Ω ∩ face` on it has
+    #    measure zero, and the moment fit on the slice comes back `:empty`. That is
+    #    `:cut_failed`, an empty rule, and the face's 3.0 is then the six `:full`
+    #    regions alone: machine-exact without a fit having to be. Pinning the kinds
+    #    is what keeps this a tangency test rather than a measure test that happens
+    #    to pass.
+    plate = physical_domain(leaf(x -> 1.0 - sqrt(x[1]^2 + x[2]^2); lipschitz=1.0);
+                            subcell_length_scale=0.5 / 2^4, max_depth=4)
+    Vplate = space(box((0.0, 0.0), (4.0, 4.0)); cells=(8, 8), order=2, physical=plate)
+    for axis in 1:2
+        @test measure(Vplate, [(axis, :lower)]) ≈ 3.0 rtol = 1.0e-14
+        @test measure(Vplate, [(axis, :upper)]) ≈ 4.0 rtol = 1.0e-14
+        @test [r.kind for r in regions(Vplate, [(axis, :lower)])] ==
+              [:fictitious, :cut_failed, :full, :full, :full, :full, :full, :full]
+        @test on_omega(Vplate, [(axis, :lower)])
+    end
+
+    # 2. Two subdomains partition the face they share, which nothing else in the
+    #    suite checks and which is the one place a sign or side error in the
+    #    restriction would survive every other assertion here: slicing the wrong
+    #    way keeps each half a plausible number while their sum stops being 1.
+    #    `interface_coupling_2d`'s geometry — the seam x₁ = 0.53 crossing two
+    #    non-matching meshes whose boxes overlap, Ω₁ = {x₁ ≤ 0.53}, Ω₂ = {x₁ ≥ 0.53}.
+    #    Ω₁'s bottom face spans six of its seven cells (the seventh, [0.6, 0.7], is
+    #    wholly fictitious) and so is 0.6 untrimmed; Ω₂'s spans five of six and is
+    #    0.483333. Trimmed they are 0.53 and 0.47, and the two halves of y = 0 meet
+    #    at the seam with no gap and no overlap.
+    seam_x = 0.53
+    left = physical_domain(leaf(x -> x[1] - seam_x; lipschitz=1.0); subcell_length_scale=0.1 / 16)
+    right = physical_domain(leaf(x -> seam_x - x[1]; lipschitz=1.0); subcell_length_scale=0.1 / 16)
+    V₁ = space(box((0.0, 0.0), (0.70, 1.0)); cells=(7, 6), order=2, physical=left)
+    V₂ = space(box((0.42, 0.0), (1.0, 1.0)); cells=(6, 8), order=2, physical=right)
+    measure₁ = measure(V₁, [(2, :lower)])
+    measure₂ = measure(V₂, [(2, :lower)])
+    @test measure₁ ≈ seam_x rtol = 1.0e-14
+    @test measure₂ ≈ 1 - seam_x rtol = 1.0e-14
+    @test measure₁ + measure₂ ≈ 1.0 rtol = 1.0e-14
+    # Neither half reaches into the other, which the sum alone would not catch: two
+    # rules straying symmetrically across the seam still add to 1.
+    @test on_omega(V₁, [(2, :lower)])
+    @test on_omega(V₂, [(2, :lower)])
+
+    # 3. A curved cut face, where the rule is accurate rather than exact. The
+    #    space-time cavity's t = 0 slice is the disc of radius r₀ = 0.1373 about
+    #    (0.4967, 0.5013) inside the central cell of a 3×3 grid, so the face measure
+    #    is the analytic 1 − π r₀². The moment fit on the slice reaches it to 1.9e-5,
+    #    which is the honest ceiling on a curved cut face and the reason no docstring
+    #    here promises exactness.
+    #
+    #    And it is insensitive to the geometric-robustness knobs: `_choose_axis`
+    #    declares the sliced sub-boxes graph-like and stops bisecting, so driving
+    #    `subcell_length_scale` from 1/12 to 1/192 (effective depth 2 → 6) or capping
+    #    `max_depth` at 2 reproduces the value to the last bit. The only knob is the
+    #    moment order, which `_moment_order_for_region` takes from the parent cells.
+    r₀, ṙ = 0.1373, 0.22
+    centre = SVector(0.4967, 0.5013)
+    cavity = leaf(x -> (r₀ + ṙ * x[3]) - sqrt((x[1] - centre[1])^2 + (x[2] - centre[2])^2);
+                  lipschitz=sqrt(1 + ṙ^2))
+    slab(scale, depth) =
+        let dom = physical_domain(cavity; alpha=1.0e-6, subcell_length_scale=scale, max_depth=depth)
+            space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(3, 3, 3), order=(2, 2, 3),
+                  physical=dom)
+        end
+    initial = measure(slab(1 / 12, 8), [(3, :lower)])
+    @test initial ≈ 1 - π * r₀^2 atol = 3.0e-5
+    @test abs(initial - (1 - π * r₀^2)) > 1.0e-6          # accurate, not exact
+    @test measure(slab(1 / 192, 8), [(3, :lower)]) == initial
+    @test measure(slab(1 / 12, 2), [(3, :lower)]) == initial
+    # The t = T face is cut by the grown cavity too, against its own analytic value
+    # 1 − π r(T)², so the slab is not a geometry in which only one face can see the
+    # restriction. It comes out an order of magnitude *better* than t = 0 (3.9e-7
+    # against 1.9e-5) because the larger disc spans nine cells instead of one, so
+    # each cut region sees a shallower arc — which is the convergence this error
+    # does have. The uncut side faces stay exactly 1.0: the trimming touches the
+    # faces the level set reaches and no others.
+    @test measure(slab(1 / 12, 8), [(3, :upper)]) ≈ 1 - π * (r₀ + ṙ)^2 atol = 1.0e-6
+    @test measure(slab(1 / 12, 8), [(1, :lower)]) ≈ 1.0 rtol = 1.0e-14
+    @test measure(slab(1 / 12, 8), [(2, :upper)]) ≈ 1.0 rtol = 1.0e-14
+end
+
+@testset "the trimmed faces and the immersed surface close ∂Ω" begin
+    # The anchor that reaches a curved cut in a form no single rule can satisfy on
+    # its own. Trimming makes ∂Ω's two halves — the grid-aligned faces and the
+    # user's `BoundaryMesh` — a partition of ∂Ω for the first time, so the
+    # divergence theorem applies to their union: ∮_∂Ω n dS = 0 identically, and
+    # ∮_∂Ω x·n dS = D·|Ω| ties the facet rule, the surface rule and the volume rule
+    # into one number. Untrimmed, the grid-aligned half double-counts the hole's
+    # footprint and the first residual is (−0.3, −0.3) — O(1), a direct measurement
+    # of the defect rather than a tolerance question.
+    #
+    # Ω = (1,2)² ∖ {‖x − c‖ ≤ 0.3} with c = (1,1), on 4×4 cells. The hole sits on a
+    # corner so its boundary is a quarter arc, and the box is offset from the origin
+    # so that x·n does not vanish on the two trimmed faces — centred at the origin
+    # it would, and the second identity would be blind to the trimming it is meant
+    # to check.
+    R, segments = 0.3, 64
+    c = SVector(1.0, 1.0)
+    hole = physical_domain(leaf(x -> R - norm(x - c); lipschitz=1.0); subcell_length_scale=0.0625)
+    V = space(box((1.0, 1.0), (2.0, 2.0)); cells=(4, 4), order=2, physical=hole)
+    # Traversed (0, R) → (R, 0) about `c`: a 2-D segment's normal is 90° clockwise
+    # from its direction, which points at the centre here, i.e. out of Ω.
+    arc = polyline_mesh([c + R * SVector(sin(t), cos(t))
+                         for t in range(0, π / 2; length=segments + 1)])
+    model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+
+    # Both trimmed faces, machine-exact: on the x₁ = 1 face the leaf restricts to
+    # R − |x₂ − c₂|, affine on each region, and the cut sits inside one cell.
+    @test boundary_integral(q -> 1.0, model; on=boundary(axis=1, side=:lower)) ≈ 0.7 rtol = 1.0e-14
+    @test boundary_integral(q -> 1.0, model; on=boundary(axis=2, side=:lower)) ≈ 0.7 rtol = 1.0e-14
+    @test diagnostics(model).cut_facet_region_count == 4
+    @test diagnostics(model).facet_fit_failure_count == 0
+    # Four of the sixteen regions are trimmed, two per cut face: the one inside the
+    # hole and the one the arc crosses. The relative measure reports the worst of
+    # them, which is the wholly fictitious one at α = 0, hence exactly zero.
+    @test [r.kind for r in model.facet_regions[(boundary(:all), model.problem.space)][1:4]] ==
+          [:fictitious, :cut_fitted, :full, :full]
+    @test diagnostics(model).min_relative_facet_measure == 0.0
+
+    # ∮ n dS = 0. The surface half contributes rot(b − a) exactly, whatever the
+    # subdivision, so the whole residual is the facet rule's — which is why this is
+    # the form that pins the trimming and not a property of the polyline.
+    faces = boundary_integral(q -> q.normal, model; on=boundary(:all))
+    surface = boundary_integral(q -> q.normal, model; on=arc)
+    @test norm(faces + surface) < 1.0e-13
+    @test norm(surface) > 0.4                      # the surface half is not empty
+    # ...and untrimmed it would not close. The four faces at full measure sum to
+    # zero on any box, so the residual was exactly −surface, of norm R√2 = 0.424:
+    # the whole arc was surplus, and that is the O(1) defect this closes.
+    @test norm(surface) ≈ norm(SVector(R, R)) rtol = 1.0e-14
+
+    # ∮ x·n dS = D·|Ω|, against the volume rule on the same geometry — the stronger
+    # form, which ties the facet rule, the surface rule and the volume rule into one
+    # number. The residual decomposes exactly, with nothing left over for the facet
+    # rule: the 64-segment polyline's chord-versus-arc deficit
+    # 2·N·(R²/2)(θ − sin θ) with θ = π/2N, plus twice the volume rule's own error on
+    # the quarter disc. A trimming error would land here and nowhere else, so the
+    # identity below is what makes this a test of three rules agreeing rather than a
+    # tolerance on any one of them.
+    moment = boundary_integral(q -> dot(q.x, q.normal), model; on=boundary(:all)) +
+             boundary_integral(q -> dot(q.x, q.normal), model; on=arc)
+    volume = Ref(0.0)
+    foreach_quadrature_point(model) do q
+        volume[] += q.weight
+    end
+    area = 1 - π * R^2 / 4
+    θ = π / (2 * segments)
+    deficit = 2 * segments * (R^2 / 2) * (θ - sin(θ))
+    @test volume[] ≈ area rtol = 1.0e-9
+    @test abs(moment - 2 * volume[]) < 2.0e-5
+    @test (moment - 2 * volume[]) - deficit ≈ -2 * (volume[] - area) atol = 1.0e-14
 end
 
 @testset "boundary(:all; except=…) is the union of the faces that remain" begin
@@ -877,4 +1580,93 @@ end
     # does not.
     @test count(key -> matches(key, boundary(axis=1, side=:upper)) && !matches(key, selector),
                 dofs.raw_keys) == 1
+end
+
+# Grid-aligned facet integration has two consumers that must see the same facet:
+# `_facet_regions_for_selector` (src/model.jl), which assembly and
+# `boundary_integral` read through, and `_sample_dirichlet_facet!`
+# (src/dirichlet.jl), which builds the L² boundary-trace projection. Both resolve
+# through the model's one `FacetResolver`, so today they read the same region
+# objects; before that they called `_boundary_facet_regions` separately and agreed
+# only because it is a pure function of `(V, sides, tolerance)`. Nothing else in
+# the suite would notice if either side stopped reading the shared resolution —
+# which is a live risk again the moment one of them is given a rule the other is
+# not.
+#
+# What this guards is the trimming of a cut face's rule to its physical part —
+# the regions `cut_facet_region_count` reports. See the testset
+# "cut_facet_region_count reports the facet regions whose face leaves Ω" above,
+# and `_facet_region_stats` in src/model.jl. That trimming has to land on BOTH
+# paths at once. On the operator path alone, the Dirichlet datum would be fitted
+# over the whole face while the operator integrates only the physical part: a
+# clean residual, a converging solve, and boundary data fitted over area that is
+# not in Ω. On the projection path alone, the mirror image. Neither shows up in a
+# norm.
+#
+# This is a guard, not a snapshot: it asserts that the two sides read the SAME
+# thing, never what that thing is. Ω = { x₂ ≤ x₁ + 0.55 } ∩ (0,1)² reduces on
+# the x₁ = 0 face to φ = x₂ − 0.55, so of that face's full measure 1.0 exactly
+# 0.55 is physical. Both sides read 0.55 — and read 1.0 before the trimming
+# landed, with every assertion below holding either way. None of them needed
+# editing when the value moved; the single deliberate pin of it lives in the
+# neighbouring testset named above, and stays the only one.
+@testset "the Dirichlet projection and the operator integrate the same facet" begin
+    plane = leaf(x -> x[2] - x[1] - 0.55; lipschitz=sqrt(2.0))
+    cut_domain = physical_domain(plane; subcell_length_scale=0.0625)
+    Vcut = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=cut_domain)
+    face = boundary(axis=1, side=:lower)
+    # A NONZERO datum. `_needs_dirichlet_projection` skips the boundary walk
+    # outright for a homogeneous one, so a zero datum never reaches the
+    # projection path and this comparison would have nothing to read on one side.
+    g(x) = 1 + x[1] + 2x[2]
+    model = prepare(poisson(Vcut; source=0.0, dirichlet=[dirichlet(g; on=face)]))
+
+    # The geometry, pinned against the level set itself rather than against any
+    # quadrature: the face straddles ∂Ω and crosses it at x₂ = 0.55, which is
+    # where its physical measure 0.55 comes from. A live discrimination, then —
+    # not a face that happens to lie inside Ω, for which the two paths would
+    # agree with nothing to disagree about.
+    @test levelset_value(cut_domain, SVector(0.0, 0.0)) < 0        # inside Ω
+    @test levelset_value(cut_domain, SVector(0.0, 1.0)) > 0        # outside Ω
+    @test levelset_value(cut_domain, SVector(0.0, 0.55)) ≈ 0 atol = 1.0e-15
+
+    # The projection side. `prepare` projects without caching, so the quadrature
+    # `_sample_dirichlet_facet!` actually walked is published by the first
+    # `update_dirichlet!`, as a cached `DirichletProjection`. The datum is
+    # unchanged, so this re-projects exactly the values `prepare` already fitted.
+    update_dirichlet!(model, [dirichlet(g; on=face)])
+    projection = model.dirichlet_projections[:u]
+    @test projection.facet_count == 1
+    trace = only(projection.samples)
+
+    # The operator side, read independently and through the public consumer:
+    # `boundary_integral` resolves the face through the model's per-face memo —
+    # the same regions a Neumann, Robin or Nitsche term `on = face` assembles
+    # over. Nothing here is derived from `trace`.
+    operator_points = SVector{2,Float64}[]
+    operator_weights = Float64[]
+    operator_measure = boundary_integral(model; on=face) do q
+        push!(operator_points, q.x)
+        push!(operator_weights, q.weight)
+        return 1.0
+    end
+
+    # 1. Measure agreement: the face the projection fits `g` over carries the
+    #    measure the operator integrates.
+    @test sum(trace.weights) ≈ operator_measure rtol = 1.0e-14
+
+    # 2. Point-set agreement, as multisets — the same rule, not merely the same
+    #    total, so a divergence that preserves the measure is caught too. Region
+    #    order differs between the paths (the projection walks one face, while
+    #    `boundary_integral` walks the resolved union), hence the sort.
+    order(x) = (x[1], x[2])
+    @test length(trace.points) == length(operator_points)
+    @test sort(trace.points; by=order) == sort(operator_points; by=order)
+    @test sort(trace.weights) ≈ sort(operator_weights) rtol = 1.0e-14
+
+    # ...and the projection is not vacuous: the face carries unknowns and the
+    # datum lands on them, so a divergence between the two faces would move real
+    # numbers rather than agreeing emptily.
+    @test !isempty(projection.unknowns[1])
+    @test count(!iszero, only(model.dofs.fields).dofs.constrained_values) > 0
 end
