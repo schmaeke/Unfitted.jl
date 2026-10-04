@@ -312,8 +312,7 @@ function _vtk_value_accessor(coefficients, model::Model, space::Space, block_lay
                              parents, field_data)
     return (context, xi, field=nothing) -> begin
         layout = field === nothing ? block_layout : _model_field_layout(model, field)
-        data = field === nothing ? field_data :
-               _field_parent_data(space, layout, parents; gradients=false)
+        data = field === nothing ? field_data : _field_parent_data(space, layout, parents)
         for record in data
             _update_parent_basis_values!(record, xi.region)
         end
@@ -432,7 +431,7 @@ function _partition_vtk_data(solution::Solution, model::Model{D,T}, space::Space
 
     for (region_id, region) in pairs(plan.regions)
         u = _vtk_value_accessor(solution.coefficients, model, space, layout, region.parents,
-                                _field_parent_data(space, layout, region.parents; gradients=false))
+                                _field_parent_data(space, layout, region.parents))
         for subbox in _region_boxes(space, region, subdivisions, cut_depth, lipschitz)
             first_point = length(points) + 1
             corners = _box_corners(subbox, Val(D))
@@ -947,6 +946,69 @@ function write_quadrature_vtm(path::AbstractString, model::Model{D,T}) where {D,
     end
 end
 
+# ── Per-parent field reconstruction ───────────────────────────────────────────
+#
+# The evaluation paths of this file — `write_vtk`'s sample accessor, `l2_error`,
+# and the point evaluations `value` / `field_gradient` — reconstruct a field one
+# covering parent at a time and sum the parents. Assembly and the
+# quadrature-point walker evaluate into a workspace's `BasisBank` instead
+# (`_refresh!` and `_state_point!` in `assembly.jl`), which keeps the same
+# association: per-parent partial sums, then the sum over parents.
+
+# One record per parent of `parents` on which `layout`'s field is evaluated: the
+# parent, its level's basis family and nominal order, the parent cell's own
+# basis index set and raw dofs, and fresh value and 1D-factor buffers. A caller
+# builds a region's records once and refreshes them per sample
+# (`_update_parent_basis_values!`), since building them is the expensive part of
+# an evaluation. The factor buffers are sized at the level's nominal order; the
+# index set is the cell's own minimum-rule set, which is shorter wherever a
+# per-cell order puts the cell below the nominal maximum.
+function _field_parent_data(V::Space{D,T}, layout::FieldLayout{D,T}, parents) where {D,T}
+    return map(parents) do parent
+        level = _level_by_id(V, parent.level)
+        order = nominal_order(level)
+        local_ids = cell_basis_indices(level, parent.cell)
+        return (; parent, basis=level.basis, order, local_ids,
+                values=Vector{T}(undef, length(local_ids)),
+                raw_dofs=cell_dofs(layout.dofs, parent.level, parent.cell),
+                val1d=_factor_buffers(order, T))
+    end
+end
+
+# Evaluate a parent record's basis values at the region-reference point `eta`
+# into its value buffer.
+function _update_parent_basis_values!(data, eta::SVector{D,T}) where {D,T}
+    xi = reference_to_physical(data.parent.local_box, eta)
+    _tensor_values!(data.basis, data.values, data.local_ids, data.order, xi, data.val1d,
+                    data.parent.cell)
+    return data
+end
+
+# The field on one parent cell: `Σᵢ u(rawᵢ, component)·φᵢ` over the cell's raw
+# dofs, with `φ` the cell's basis values (the field's value) or physical basis
+# gradients (its gradient). `dof_value` reads `u`, so a constrained dof
+# contributes its pinned value and a linear-constraint pivot its expansion. The
+# number type is the coefficients' promoted with the model's.
+function _parent_field(layout::FieldLayout{D,T}, coefficients, raw_dofs, φ,
+                       component::Integer) where {D,T}
+    result = zero(promote_type(T, eltype(coefficients))) * zero(eltype(φ))
+    for i in eachindex(raw_dofs)
+        result += dof_value(layout, coefficients, raw_dofs[i], component) * φ[i]
+    end
+    return result
+end
+
+# The superposed value of one component: `_parent_field` summed over the parent
+# records of an evaluation region.
+function _field_value(field_data, layout::FieldLayout{D,T}, coefficients,
+                      component::Integer) where {D,T}
+    result = zero(promote_type(T, eltype(coefficients)))
+    for data in field_data
+        result += _parent_field(layout, coefficients, data.raw_dofs, data.values, component)
+    end
+    return result
+end
+
 # ── Solution evaluation ──────────────────────────────────────────────────────
 
 # Look up the per-field layout of `field` inside the model's
@@ -996,11 +1058,8 @@ function _level_value(coefficients, model::Model{D,T}, layout::FieldLayout{D,T},
     parent_box = cell_box(level.mesh, cell)
     xi = physical_to_reference(parent_box, x)
     values = basis_values(level, cell, xi)
-    raw_dofs = cell_dofs(layout.dofs, level.id, cell)
-    # Reuse the assembly reconstruction kernel: the dof sum over
-    # `(raw_dofs, values)` is exactly what `_field_value` computes (constrained
-    # dofs resolved through `dof_value`).
-    return _field_value((; raw_dofs, values), layout, coefficients, component)
+    return _parent_field(layout, coefficients, cell_dofs(layout.dofs, level.id, cell), values,
+                         component)
 end
 
 # Gradient analogue of `_level_value`. Uses
@@ -1017,10 +1076,8 @@ function _level_gradient(coefficients, model::Model{D,T}, layout::FieldLayout{D,
     parent_box = cell_box(level.mesh, cell)
     xi = physical_to_reference(parent_box, x)
     gradients = physical_basis_gradients(level, cell, parent_box, xi)
-    raw_dofs = cell_dofs(layout.dofs, level.id, cell)
-    # Reuse the assembly gradient-reconstruction kernel over `(raw_dofs,
-    # gradients)`; the chain-rule scaling is already in `gradients`.
-    return _field_gradient((; raw_dofs, gradients), layout, coefficients, component)
+    return _parent_field(layout, coefficients, cell_dofs(layout.dofs, level.id, cell), gradients,
+                         component)
 end
 
 # Shared pre-flight for the public `value` / `field_gradient` paths:
@@ -1169,11 +1226,9 @@ end
 _squared_norm(value::Number) = abs2(value)
 _squared_norm(value) = sum(abs2, value)
 
-# Superposed value over already-evaluated per-parent records. Scalar
-# fields return a scalar; component fields return an `SVector` over
-# the components. Reuses the assembly parent-evaluation kernels
-# (`_field_value` from `assembly.jl`) so we don't re-implement the dof
-# reduction.
+# Superposed value over already-evaluated per-parent records (`_field_value`).
+# Scalar fields return a scalar; component fields return an `SVector` over the
+# components.
 function _superposed_value(field_data, layout::FieldLayout, coefficients)
     layout.components == 1 && return _field_value(field_data, layout, coefficients, 1)
     return SVector(ntuple(c -> _field_value(field_data, layout, coefficients, c),
@@ -1225,7 +1280,7 @@ function l2_error(solution::Solution, model::Model{D,T}, u::Field, exact;
     exact_squared = zero(T)
 
     for region in plan.regions
-        field_data = _field_parent_data(space, field_layout, region.parents; gradients=false)
+        field_data = _field_parent_data(space, field_layout, region.parents)
         quadrature = region.quadrature
         jacobian = _region_jacobian(region)
 
@@ -1250,13 +1305,14 @@ end
 
 # ── Boundary integration ─────────────────────────────────────────────────────
 #
-# Quadrature-only postprocessing on a portion of the boundary. The
-# region list comes from `_region_list`, the lookup assembly uses, so the same
-# code path handles physical [`FacetRegion`](@ref)s and immersed
-# [`SurfaceRegion`](@ref)s; the per-region `_boundary_q` helper builds
-# the right `q` tuple for each kind. No per-Q-point geometry work
-# happens in this hot path — every region carries precomputed
-# physical-frame Q-points and weights.
+# Quadrature-only postprocessing on a portion of the boundary. It is a sum over
+# the quadrature-point walker (`_walk` in `assembly.jl`), so it integrates over
+# the region list assembly resolves for the same `on=` target, visits the points
+# in the serial assembly order and hands the integrand the payload a form sees.
+# Physical [`FacetRegion`](@ref)s, immersed [`SurfaceRegion`](@ref)s and
+# two-sided [`InterfaceRegion`](@ref)s take one path, and no per-point geometry
+# work happens in it — every region carries precomputed physical-frame points
+# and weights.
 
 """
     boundary_integral(integrand, model::Model; on, field=nothing) -> result
@@ -1287,24 +1343,33 @@ Integrate a user callback over a portion of the boundary.
   - A [`BoundaryMesh`](@ref) — a user-supplied immersed-boundary mesh
     (segments in 2D, triangles in 3D, points in any D). The package
     walks the precomputed per-cell quadrature rules.
+  - An [`Interface`](@ref) — the two-sided interface of a coupled model, which
+    spans both its subdomains and ignores `field`.
 
-The two cases are the two halves of `∂Ω` and they are disjoint, which is
-worth stating as an identity: for an immersed model whose `BoundaryMesh`
+The first two cases are the two halves of `∂Ω` and they are disjoint, which
+is worth stating as an identity: for an immersed model whose `BoundaryMesh`
 carries the whole immersed part of `∂Ω`, the grid-aligned integrals summed
 over `boundary(:all)` plus the mesh integral is an integral over the closed
 surface `∂Ω`, so `∮ n dS = 0` and `∮ x·n dS = D·|Ω|` hold up to the
 quadrature error of the two rules. `test_constraints.jl` pins both.
 
-`integrand(q)` is called at every quadrature point with a named tuple:
+`integrand(q)` is called at every quadrature point with the payload a form
+tagged with the same `on=` sees during assembly, and that
+[`foreach_quadrature_point`](@ref) passes:
 
   - `q.x::SVector{D,T}` — physical coordinate.
   - `q.weight::T` — physical-frame weight (Gauss × measure Jacobian).
+  - `q.point::Int` — the point's index in `1:nquadpoints(model; on, field)`.
+  - `q.state` — always `nothing`; the integrand reads a solution through
+    [`value`](@ref) at `q.x`.
   - `q.normal::SVector{D,T}` — outward unit normal (facet's outward
     normal for `BoundarySelector` `on`; cell-geometry / user-supplied
-    normal for `BoundaryMesh`).
+    normal for `BoundaryMesh`; the normal from side `a` toward side `b` on
+    an `Interface`).
   - `q.sides::Union{Nothing,Vector{Tuple{Int,Symbol}}}` — the codim-`K`
     facet identifier on a `BoundarySelector` integration; `nothing` on
-    a `BoundaryMesh` integration (no facet `(axis, side)` exists).
+    a `BoundaryMesh` or `Interface` integration (no facet `(axis, side)`
+    exists).
 
 `field` names the subdomain to integrate over on a multi-domain
 (coupled) model. Each subdomain carries its own discretisation and its
@@ -1329,35 +1394,20 @@ type is whatever `q.weight * integrand(q)` yields on the first
 sample. Throws `ArgumentError` if no admissible region exists on the
 selected portion of the boundary.
 """
-function boundary_integral(integrand, model::Model; on, field::Union{Nothing,Symbol}=nothing)
-    regions = _region_list(model, on, _target_space(model, on, field)).regions
-    result = nothing
-    samples = 0
-    for region in regions
-        for (qp, x) in pairs(region.points)
-            q = _boundary_q(region, qp, x)
-            contribution = q.weight * integrand(q)
-            result = result === nothing ? contribution : result + contribution
-            samples += 1
-        end
-    end
+function boundary_integral(integrand, model::Model;
+                           on::Union{BoundarySelector,BoundaryMesh,Interface},
+                           field::Union{Nothing,Symbol}=nothing)
+    list = _region_list(model, on, _target_space(model, on, field))
     # A third cause joins "no such facet" and "every cell masked out" now that a
     # facet rule is trimmed: a selector all of whose faces lie outside Ω resolves to
     # regions that carry no quadrature. Naming it here is the difference between a
     # user checking their selector and a user checking their geometry.
-    samples == 0 &&
+    list.offsets[end] == 0 &&
         throw(ArgumentError("no admissible boundary quadrature for on=$(on); check the " *
                             "selector or mesh, any level masks, and whether the selected " *
                             "faces lie outside Ω"))
-    return result
-end
-
-# Per-Q-point `q` tuple for facet vs. surface regions. The shape is
-# kept identical across kinds — every `q` carries `x`, `weight`,
-# `normal`, and `sides`; `sides === nothing` on surface regions.
-function _boundary_q(region::FacetRegion, qp::Int, x)
-    (; x, weight=region.weights[qp], normal=region.normal, sides=region.sides)
-end
-function _boundary_q(region::SurfaceRegion, qp::Int, x)
-    (; x, weight=region.weights[qp], normal=region.normals[qp], sides=nothing)
+    return _walk(nothing, nothing, list, nothing) do result, q
+        contribution = q.weight * integrand(q)
+        return result === nothing ? contribution : result + contribution
+    end
 end

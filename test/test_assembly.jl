@@ -771,6 +771,12 @@ end
 
     # The volume default is untouched by the new keywords.
     @test nquadpoints(model) == nquadpoints(model; kind=:volume)
+
+    # The count is inferred as an `Int`. Callers size arrays and loops by it, and
+    # an uninferred count made the `RBFP0` transfer's serial loop over the target
+    # points dispatch dynamically, allocating at every point.
+    @test (@inferred nquadpoints(model)) isa Int
+    @test (@inferred nquadpoints(model; kind=:facet)) isa Int
 end
 
 @testset "nquadpoints(; on=) resolves the subdomain like boundary_integral" begin
@@ -880,6 +886,67 @@ end
     v0, g0 = walk(zeros(length(c)))
     @test all(isapprox.((vε .- vbig) ./ ε, v1 .- v0; rtol=1.0e-10, atol=1.0e-10))
     @test all(isapprox.((gε .- gbig) ./ ε, g1 .- g0; rtol=1.0e-10, atol=1.0e-10))
+end
+
+@testset "the walker covers every on= target and subdomain with assembly's payload" begin
+    # `foreach_quadrature_point(f, model; on, field, state)` walks the region list
+    # that a form with the same `on=` and, on a coupled model, the same test field
+    # integrates over, and hands `f` the payload that form sees. Two loads record
+    # the whole payload during serial assembly with a state — on a facet of the
+    # second subdomain and on the volume of the first — and the walker with the
+    # same keywords and state must reproduce every record to the bit, since both
+    # build the payload in one place and evaluate the state through the same
+    # frame, basis refresh and per-point sums. The first subdomain has an overlay
+    # and nonzero Dirichlet data, so the state reads several parents and
+    # constrained values.
+    V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2)
+    V1 = overlay(V1, box((0.25, 0.25), (0.75, 0.75)); cells=(2, 2), order=3)
+    V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(2, 2), order=3)
+    u1, u2 = field(:u1, V1), field(:u2, V2)
+    model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
+                            dirichlet=[dirichlet(x -> 1.0 + x[1]; on=boundary(:all), field=:u1),
+                                       dirichlet(0.0; on=boundary(:all), field=:u2)]))
+    c = [sin(3i) for i in 1:active_unknowns(model)]
+    upper = boundary(axis=2, side=:upper)
+    record(sink, name) = q -> begin
+        sink[q.point] = (keys(q), q.x, q.weight, q.normal, q.sides, value(q.state, name),
+                         field_gradient(q.state, name))
+        return 0.0
+    end
+    probe(sink, name) = WeakForm(bilinear=(q, trial) -> 0.0, linear=record(sink, name),
+                                 symmetric=false)
+
+    # A boundary walk with a state, its subdomain named by `field`.
+    assembled, walked = Dict{Int,Any}(), Dict{Int,Any}()
+    assemble_vector(model, loadform(u2, probe(assembled, :u2); on=upper); state=c, threaded=false)
+    foreach_quadrature_point(record(walked, :u2), model; on=upper, field=:u2, state=c)
+    n = nquadpoints(model; on=upper, field=:u2)
+    @test n > 0 && sort(collect(keys(walked))) == collect(1:n)
+    @test walked == assembled
+    @test first(walked[1]) == (:x, :weight, :point, :state, :normal, :sides)
+    @test walked[1][4] == SVector(0.0, 1.0) && walked[1][5] == [(2, :upper)]
+
+    # `boundary_integral` is a sum over the same walk without a state: the same
+    # points in the same order, `q.state === nothing`, and the weights summed in
+    # point order to the bit.
+    seen = Int[]
+    total = boundary_integral(model; on=upper, field=:u2) do q
+        q.state === nothing && push!(seen, q.point)
+        return 1.0
+    end
+    @test seen == collect(1:n)
+    @test total == foldl(+, walked[p][3] for p in 1:n)
+
+    # A volume walk on one subdomain of a coupled model, selected by `field`
+    # alone, and the count that sizes it.
+    assembled, walked = Dict{Int,Any}(), Dict{Int,Any}()
+    assemble_vector(model, loadform(u1, probe(assembled, :u1)); state=c, threaded=false)
+    foreach_quadrature_point(record(walked, :u1), model; field=:u1, state=c)
+    n1 = nquadpoints(model; field=:u1)
+    @test n1 > 0 && sort(collect(keys(walked))) == collect(1:n1)
+    @test walked == assembled
+    @test walked[1][4] === nothing && walked[1][5] === nothing
+    @test n1 + nquadpoints(model; field=:u2) == nquadpoints(model)
 end
 
 @testset "1D bar with inhomogeneous Neumann data has analytic solution" begin
@@ -1137,8 +1204,8 @@ end
     # own box faces are clamped ends, whose constraints resolve to strong
     # eliminations. A *masked* level below maximal continuity is the shape that
     # does. Its active/inactive faces emit multi-raw trace constraints, which the
-    # resolver turns into pivots u_p = Σₖ wₖ u_{oₖ}, and assembly distributes
-    # every pivot over its branches in both the test rows and the trial columns.
+    # resolver turns into pivots u_p = Σₖ wₖ u_{oₖ}, and assembly condenses
+    # every pivot onto its branches in both the test rows and the trial columns.
     # Nonzero Dirichlet data on the box faces makes some branches land on a raw
     # that carries a nonzero value, so the Dirichlet lift runs through the
     # expansion as well.

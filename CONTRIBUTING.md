@@ -1460,8 +1460,9 @@ demos.
     superposition being smooth and not merely each level, asserted as the
     decade ratio of the normal-derivative jump across an overlay face
     (10 at `:maximal`, below 1.5 at `C⁰` and for integrated Legendre); an
-    arbitrary mask producing no linear-constraint pivot, which is what keeps
-    the fast assembly path and makes the reconstruction defect unreachable;
+    arbitrary mask producing no linear-constraint pivot, which spares
+    assembly any pivot to condense and makes the reconstruction defect
+    unreachable;
     the dedup that keeps a nested B-spline stack non-singular, including the
     mixed-family direction where a degree-1 cover spans an
     integrated-Legendre level's hats, and the fold configurations where the

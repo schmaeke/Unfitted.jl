@@ -1010,11 +1010,11 @@ Keyword arguments:
 
 The integrated Legendre family produces single-raw constraints,
 reducing the resolved expansion to strong elimination (`raw_expansion =
-[]` for the pivoted raw); the assembly path then behaves identically
-to the pre-constraint-primitive code. B-spline families produce
-multi-raw constraints encoding the C^m trace-vanishing condition on
-artificial boundaries; the assembly path distributes entries through
-the expansion automatically.
+[]` for the pivoted raw), so assembly sees only active and constrained
+dofs. B-spline families produce multi-raw constraints encoding the C^m
+trace-vanishing condition on artificial boundaries; assembly gives each
+pivot a local row and column of its own and condenses them onto the
+pivot's expansion once per integration region.
 """
 function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
                     components::Integer=1, prune::Bool=true, prune_exempt=(),

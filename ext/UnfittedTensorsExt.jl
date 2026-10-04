@@ -293,9 +293,10 @@ end
 
 # ── State-side: FormState reads as tensor-valued quantities ───────────────────
 #
-# At a quadrature point the assembly path exposes `q.state::FormState`,
-# whose `value(state, name, k)` and `field_gradient(state, name, k)` accessors
-# read the current iterate's component-wise value and physical gradient.
+# At a quadrature point the assembly path and `foreach_quadrature_point`
+# expose `q.state::FormState`, whose `value(state, name, k)` and
+# `field_gradient(state, name, k)` accessors read the current iterate's
+# component-wise value and physical gradient.
 # The wrappers below stack those scalar reads into a `Vec{D}` or a
 # `Tensor{2,D}` at the call site so constitutive callbacks read in
 # tensor notation. The `Val{D}` parameter is required so the return

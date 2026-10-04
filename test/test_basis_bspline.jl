@@ -647,8 +647,8 @@ end
 
 @testset "Linear-constraint resolver: a pivot contributes its expansion to the field" begin
     # `dof_value` used to read `constrained_value` for every eliminated raw, which
-    # is zero for a linear-constraint pivot. Assembly distributes through
-    # `raw_expansion` when it emits, so the *solve* was right and only the
+    # is zero for a linear-constraint pivot. Assembly read `raw_expansion`
+    # itself, so the *solve* was right and only the
     # *reconstruction* dropped the pivot's contribution — silently, in `value`,
     # `field_gradient`, `l2_error`, `write_vtk`, and L2Projection's source read.
     #

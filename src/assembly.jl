@@ -44,97 +44,6 @@
 # local row and column while a region is integrated, and is condensed
 # onto the active dofs of its expansion once per region.
 
-# ── Field evaluation ──────────────────────────────────────────────────────────
-
-# Per-parent record carrying everything `_field_value`/`_field_gradient`
-# need to reconstruct a field at a quadrature point: the parent's basis
-# family, order, local-id list, gradient scaling factor, per-axis 1D
-# factor buffers, and the slot for the evaluated values and gradients.
-# Allocates fresh buffers, so it serves the one-shot evaluation paths of
-# `postprocessing.jl`; assembly and the quadrature-point walks evaluate
-# into a workspace's `BasisBank` instead.
-function _parent_basis_data(V::Space{D,T}, layout::DofLayout{D,T}, parent::ParentRef{D,T};
-                            gradients::Bool=true) where {D,T}
-    level = _level_by_id(V, parent.level)
-    # The 1D factor buffers are sized at the level's nominal order; the local id
-    # list is the parent cell's own minimum-rule set, which is shorter wherever a
-    # per-cell order puts that cell below the nominal maximum.
-    order = nominal_order(level)
-    local_ids = cell_basis_indices(level, parent.cell)
-    values = Vector{T}(undef, length(local_ids))
-    gradient_values = gradients ? Vector{SVector{D,T}}(undef, length(values)) : SVector{D,T}[]
-    raw_dofs = cell_dofs(layout, parent.level, parent.cell)
-    gradient_scale = SVector{D,T}(2 .* inv.(edge_lengths(parent.parent_box)))
-    val1d = _factor_buffers(order, T)
-    der1d = gradients ? _factor_buffers(order, T) : ntuple(_ -> Vector{T}(undef, 0), D)
-    return (; parent, basis=level.basis, order, local_ids, gradient_scale, values,
-            gradients=gradient_values, raw_dofs, val1d, der1d)
-end
-
-# Evaluate the value-only basis tables at a region-reference point `eta`
-# into the parent record's value buffer. Used by the non-hot-loop
-# evaluation paths in `postprocessing.jl` (`l2_error`, `write_vtk`).
-function _update_parent_basis_values!(data, eta::SVector{D,T}) where {D,T}
-    xi = reference_to_physical(data.parent.local_box, eta)
-    _tensor_values!(data.basis, data.values, data.local_ids, data.order, xi, data.val1d,
-                    data.parent.cell)
-    return data
-end
-
-# Reconstruct a scalar field value over one parent. Sums
-# `Σ_i dof_value(...) × basis_value_i` over the parent's raw dofs;
-# constrained dofs are resolved through `dof_value`, so the
-# reconstruction includes their pinned values.
-function _field_value(data, layout::Union{DofLayout{D,T},FieldLayout{D,T}}, coefficients,
-                      component::Integer=1) where {D,T}
-    R = promote_type(T, eltype(coefficients))
-    result = zero(R)
-    for i in eachindex(data.raw_dofs)
-        result += dof_value(layout, coefficients, data.raw_dofs[i], component) * data.values[i]
-    end
-    return result
-end
-
-# Sum the parent contributions of `_field_value` over every parent
-# covering the integration region — the actual superposed value.
-function _field_value(parent_data::AbstractVector, layout::Union{DofLayout{D,T},FieldLayout{D,T}},
-                      coefficients, component::Integer=1) where {D,T}
-    R = promote_type(T, eltype(coefficients))
-    result = zero(R)
-    for data in parent_data
-        result += _field_value(data, layout, coefficients, component)
-    end
-    return result
-end
-
-# Gradient analogue of the one-parent `_field_value`: an `SVector{D}` per
-# parent. Its callers sum over parents themselves.
-function _field_gradient(data, layout::Union{DofLayout{D,T},FieldLayout{D,T}}, coefficients,
-                         component::Integer=1) where {D,T}
-    R = promote_type(T, eltype(coefficients))
-    result = zero(SVector{D,R})
-    for i in eachindex(data.raw_dofs)
-        result += dof_value(layout, coefficients, data.raw_dofs[i], component) * data.gradients[i]
-    end
-    return result
-end
-
-# Resolve a field name to its index inside a `SystemLayout`. Used by
-# every block / load loop to translate field references into the
-# layout's field-major data structures.
-function _field_index(layout::SystemLayout, name::Symbol)
-    index = get(layout.by_name, name, 0)
-    index == 0 && throw(ArgumentError("unknown field $name"))
-    return index
-end
-
-# One-shot per-parent record collector. Used by the evaluation paths of
-# `postprocessing.jl`, which allocate fresh basis buffers; assembly and the
-# quadrature-point walks evaluate into a workspace's `BasisBank` instead.
-function _field_parent_data(V, layout::FieldLayout, parents; gradients::Bool=true)
-    [_parent_basis_data(V, layout.dofs, parent; gradients) for parent in parents]
-end
-
 # ── Region lists and passes ───────────────────────────────────────────────────
 #
 # The cache types (`RegionList`, `RegionDofs`, `AssemblyPattern`,
@@ -206,10 +115,19 @@ function _regions(@nospecialize(model::Model), iface::Interface, _)
                               model.dofs.tolerance), false
 end
 
+# Resolve a field name to its index inside a `SystemLayout`, raising on an
+# unknown name. How the kernel's blocks and loads, an interface's region build
+# and a `FormState` read find a field in the layout's field-major data.
+function _field_index(layout::SystemLayout, name::Symbol)
+    index = get(layout.by_name, name, 0)
+    index == 0 && throw(ArgumentError("unknown field $name"))
+    return index
+end
+
 # The `RegionList` of pass target `target` on `space` (`RegionKey`
 # `(target, space)`; `space` is `nothing` for an `Interface`). Every consumer
-# resolves through here — the assembly passes, `nquadpoints`, the
-# quadrature-point walkers and `boundary_integral` — so all of them see one
+# resolves through here — the assembly passes, `nquadpoints`,
+# `foreach_quadrature_point` and `boundary_integral` — so all of them see one
 # list, one set of offsets and so one `q.point` numbering. A list `prepare`
 # resolved is kept for the model's lifetime; a target it did not see goes to
 # the bounded one-shot cache, so a hot one is resolved once rather than on every
@@ -251,13 +169,13 @@ function _lru_push!(lru::Vector, entry::Pair, capacity::Int)
     return last(entry)
 end
 
-# The subdomain space a single-sided `on=` target resolves on, for the callers
-# that name a target rather than a form (`nquadpoints`, `boundary_integral`). A
-# named `field` picks its space; without one, a single-domain model has exactly
-# one answer and a multi-domain model has none, so it raises rather than pick —
-# see the `boundary_integral` docstring for why neither silent default is
-# defensible. An `Interface` spans both its subdomains and resolves on
-# `nothing`.
+# The subdomain space an `on=` target resolves on, for the callers that name a
+# target rather than a form (`nquadpoints`, `foreach_quadrature_point`,
+# `boundary_integral`). A named `field` picks its space; without one, a
+# single-domain model has exactly one answer and a multi-domain model has none,
+# so it raises rather than pick — see the `boundary_integral` docstring for why
+# neither silent default is defensible. An `Interface` spans both its
+# subdomains and resolves on `nothing`.
 function _target_space(@nospecialize(model::Model), @nospecialize(on), field::Union{Nothing,Symbol})
     on isa Interface && return nothing
     field === nothing || return _field_space(model.problem, field)
@@ -887,6 +805,16 @@ end
 _region_sides(::Union{VolumeRegion,SurfaceRegion,InterfaceRegion}) = nothing
 _region_sides(region::FacetRegion) = region.sides
 
+# The `q` payload of point `k` of `region`, given the point's coordinate, weight,
+# index and state: `(; x, weight, point, state, normal, sides)`. The kernel hands
+# it to every form callback and the walker (`_walk`) to its caller, so a form and
+# a walk over the same list see the same payload at the same point by
+# construction.
+@inline function _payload(region, k::Int, x, weight, point::Int, state)
+    return (; x, weight, point, state, normal=_region_normal(region, k),
+            sides=_region_sides(region))
+end
+
 # Evaluate every parent's basis at the current point into the bank: values and
 # physical gradients (`Val(true)`), or values only (`Val(false)`, for the L²
 # transfer rhs, whose integrand never reads a gradient). The gradient scale is
@@ -917,8 +845,9 @@ end
 """
     FormState
 
-The current solution iterate at a quadrature point, exposed to weak-form
-callbacks as `q.state` when assembling with `state=`. Query it with
+The current solution iterate at a quadrature point, exposed as `q.state` to
+weak-form callbacks when assembling with `state=`, and to the callback of
+[`foreach_quadrature_point`](@ref) when walking with `state=`. Query it with
 `value(q.state, field[, component])` and `field_gradient(q.state, field[,
 component])`, where `field` is a field name `Symbol` or a
 [`Field`](@ref).
@@ -973,8 +902,7 @@ end
 
 # Buffer index of field `name`, component `component`, checking both.
 function _state_index(state::FormState, name::Symbol, component::Integer)
-    f = get(state.layout.by_name, name, 0)
-    f == 0 && throw(ArgumentError("unknown field $name"))
+    f = _field_index(state.layout, name)
     1 <= component <= state.layout.fields[f].components ||
         throw(BoundsError(state, (name, component)))
     return state.offsets[f] + component
@@ -1036,9 +964,10 @@ end
 
 # Evaluate every field's components at the current point from the refreshed
 # bank: per parent the partial sum `Σᵢ uᵢ φᵢ` (and `Σᵢ uᵢ ∇φᵢ` when `G`), then the
-# sum over parents. That is the association of the field-evaluation helpers
-# above; the basis values themselves reach the two along different routes, so
-# the association is all they share. Returns `state`, which becomes `q.state`.
+# sum over parents. That is the association of `_field_value` in
+# `postprocessing.jl`; the basis values themselves reach the two along different
+# routes, so the association is all they share. Returns `state`, which becomes
+# `q.state`.
 function _state_point!(state::FormState{D,R}, ws::AssemblyWorkspace, ::Val{G}) where {D,R,G}
     bank = ws.bank
     for (f, fl) in pairs(ws.layout.fields), c in 1:fl.components
@@ -1138,9 +1067,9 @@ end
 # Nitsche-style forms rely on.
 #
 # Per point the kernel refreshes the bases, evaluates the state when there is
-# one, and composes `q = (; x, weight, point, state, normal, sides)`, with
-# `point = offset + k` the stable index `nquadpoints` sizes and the walkers
-# share. Loads are evaluated first, then blocks, each through `_emit!`.
+# one, and composes `q` (`_payload`), with `point = offset + k` the stable index
+# `nquadpoints` sizes and `foreach_quadrature_point` shares. Loads are evaluated
+# first, then blocks, each through `_emit!`.
 # Constrained trial columns move to the rhs as they are emitted; pivot rows and
 # columns are kept whole and condensed once after the last point.
 #
@@ -1161,8 +1090,7 @@ end
         x, w, ref = _region_point(region, k, jacobian)
         _refresh!(ws, region, ref, Val(true))
         st = state === nothing ? nothing : _state_point!(state, ws, Val(true))
-        q = (; x, weight=w, point=offset + k, state=st, normal=_region_normal(region, k),
-             sides=_region_sides(region))
+        q = _payload(region, k, x, w, offset + k, st)
         _foreach_form(_load!, pass.loads, (ws, q, n, m, sym))
         _foreach_form(_block!, pass.blocks, (ws, q, n, m, sym))
     end
@@ -1876,26 +1804,28 @@ function _assemble(@nospecialize(model::Model), @nospecialize(blocks), @nospecia
     end
 end
 
+# ── Quadrature-point walker ───────────────────────────────────────────────────
+
 """
     nquadpoints(model::Model; kind::Symbol = :volume) -> Int
-    nquadpoints(model::Model; on, field = nothing) -> Int
+    nquadpoints(model::Model; on = nothing, field = nothing) -> Int
 
 Number of quadrature points on `model`.
 
-The `on=` form returns the size of the **one** region list a form tagged
-with that `on=` value integrates over, which is exactly the range of the
-`q.point` index that form sees: `1:nquadpoints(model; on=…)`. It takes
-precedence over `kind`, which the two forms never need together. `on` is
-a [`BoundarySelector`](@ref) or a [`BoundaryMesh`](@ref), where `field`
-names the subdomain on a coupled model exactly as it does for
-[`boundary_integral`](@ref), or an [`Interface`](@ref), which spans both
-its subdomains and ignores `field` (this case is
-[`interface_quadrature_count`](@ref)). This is the form that sizes
+With `on` or `field`, the size of the **one** region list that a form tagged
+with that `on=` value — and, on a coupled model, with test field `field` — is
+integrated over: exactly the range `1:nquadpoints(model; on, field)` of the
+`q.point` index that form sees, and that [`foreach_quadrature_point`](@ref)
+visits with the same keywords. `on` is a [`BoundarySelector`](@ref) or a
+[`BoundaryMesh`](@ref), whose subdomain `field` names on a coupled model exactly
+as it does for [`boundary_integral`](@ref); an [`Interface`](@ref), which spans
+both its subdomains and ignores `field`; or `nothing`, the volume, where `field`
+alone selects its own subdomain's integration plan. This is the form that sizes
 per-quadrature-point state — history variables for an inelastic law, a
 cohesive `κ` along an interface.
 
-The `kind=` form returns the **aggregate** over every cached region list
-of that kind, a structural count for diagnostics:
+Without `on` and `field`, the **aggregate** over every cached region list of
+kind `kind`, a structural count for diagnostics:
 
   - `:volume` (default) — the points of every subdomain integration plan.
   - `:facet` — every cached [`FacetRegion`](@ref). On an immersed space this
@@ -1919,96 +1849,91 @@ for each distinct `on=` value and, on a coupled model, for each subdomain
 naming that value. So the aggregate exceeds the `q.point` range whenever
 the model caches more than one list of that kind, and indexing a
 `kind=`-sized array by `q.point` would alias one list onto another. Size
-per-point state with `on=`; the `kind=:volume` default is safe only
-because a single-domain model has exactly one plan, and
-[`foreach_quadrature_point`](@ref) (with `QuadField{T}(model; init)`,
-which inherits its restriction) rejects a coupled model for that reason.
+per-point state with `on` and `field`; the `kind=:volume` default is safe
+only because a single-domain model has exactly one plan, and both
+[`foreach_quadrature_point`](@ref) without `field` and
+`QuadField{T}(model; init)` reject a coupled model for that reason.
 """
 function nquadpoints(model::Model; kind::Symbol=:volume, on=nothing,
-                     field::Union{Nothing,Symbol}=nothing)
-    on === nothing || return _region_list(model, on, _target_space(model, on, field)).offsets[end]
-    kind === :volume && return sum(plan -> sum(_region_qpoint_count, plan.regions; init=0),
-               integration_plans(model); init=0)
-    kind === :facet && return _cached_quadpoint_count(model.facet_regions)
-    kind === :surface && return _cached_quadpoint_count(model.surface_regions)
-    kind === :interface && return _cached_quadpoint_count(model.interface_regions)
-    throw(ArgumentError("nquadpoints kind must be :volume, :facet, :surface, or :interface, " *
-                        "got $kind"))
-end
-
-# Sum of physical-frame Q-points across every region list in one of the
-# model's region caches (`facet_regions`, `surface_regions`,
-# `interface_regions`). Each region carries its Q-point list precomputed, so
-# the sum is one `length` per region. Backs the aggregate `kind=` branches of
-# `nquadpoints`.
-function _cached_quadpoint_count(cache)
-    total = 0
-    for (_, list) in cache, region in list
-        total += _region_qpoint_count(region)
-    end
-    return total
+                     field::Union{Nothing,Symbol}=nothing)::Int
+    (on === nothing && field === nothing) ||
+        return _region_list(model, on, _target_space(model, on, field)).offsets[end]
+    # The aggregate sums over one of four iterator types, which inference does not
+    # follow; the declared `::Int` is what keeps a caller that sizes a loop by the
+    # count type-stable (the `RBFP0` transfer's serial loop allocated per point).
+    lists = kind === :volume ? (plan.regions for plan in integration_plans(model)) :
+            kind === :facet ? values(model.facet_regions) :
+            kind === :surface ? values(model.surface_regions) :
+            kind === :interface ? values(model.interface_regions) :
+            throw(ArgumentError("nquadpoints kind must be :volume, :facet, :surface, or " *
+                                ":interface, got $kind"))
+    return sum(regions -> sum(_region_qpoint_count, regions; init=0), lists; init=0)
 end
 
 """
-    foreach_quadrature_point(f, model; state=nothing)
+    foreach_quadrature_point(f, model; on=nothing, field=nothing, state=nothing)
 
-Call `f(q)` at every assembly quadrature point of `model`. The
-quadrature-point payload is
+Call `f(q)` at every quadrature point of one integration region list of
+`model`: the points at which a form tagged with the same `on=` — and, on a
+coupled model, with test field `field` — is integrated, in the order the
+serial assembly visits them. `q` is the payload such a form sees,
 
-    q = (; x, weight, point, state)
+    q = (; x, weight, point, state, normal, sides)
 
 where
 
-  - `q.x` — physical coordinate of the quadrature point,
-  - `q.weight` — `weight × jacobian`, matching what forms see during
-    assembly,
-  - `q.point` — stable global index in `1:nquadpoints(model)`. The
-    indices match the indices forms see during assembly, so `q.point`
-    is the natural key for per-point internal state (history
-    variables, phase-field damage, plastic strain, …).
-  - `q.state` — `nothing` unless a `state` (a [`Solution`](@ref) or
-    raw active coefficient vector) was passed, in which case it is a
-    [`FormState`](@ref) for `value(q.state, field)` and
-    `field_gradient(q.state, field)`.
+  - `q.x` — the physical coordinate of the point;
+  - `q.weight` — its physical quadrature weight: the reference weight times
+    the cell Jacobian on the volume, the measure on a boundary, surface or
+    interface;
+  - `q.point` — its index in `1:nquadpoints(model; on, field)`, the index the
+    forms see during assembly, serial or threaded, and so the natural key for
+    per-point state (history variables, phase-field damage, plastic strain,
+    an irreversible cohesive `κ`, …);
+  - `q.state` — `nothing` unless a `state` (a [`Solution`](@ref) or an active
+    coefficient vector) is passed, in which case it is a [`FormState`](@ref):
+    `value(q.state, field)` and `field_gradient(q.state, field)` read any field
+    at the point, each on its own subdomain — on an interface, both coupled
+    fields, each in its own cut cell at the shared point;
+  - `q.normal` — `nothing` on the volume, the outward unit normal on a
+    boundary or surface, and on an interface the unit normal oriented from
+    side `a` toward side `b` (the two fields passed to [`couple`](@ref), in
+    order);
+  - `q.sides` — the facet identifier on a [`BoundarySelector`](@ref),
+    `nothing` elsewhere.
 
-Iteration order matches the serial assembly path; threaded assembly
-sees the same `q.point` indices but visits them in a different order.
+`on` selects the list as it does for a form: `nothing` (the default) the
+volume, a [`BoundarySelector`](@ref) the physical boundary, a
+[`BoundaryMesh`](@ref) an immersed surface, and an [`Interface`](@ref) the
+two-sided interface of a coupled model. On a coupled model `field` names the
+subdomain of a volume, boundary or surface walk, as for
+[`boundary_integral`](@ref), and omitting it raises, because each subdomain
+numbers its points separately and there is no single list to walk; an
+interface spans both its subdomains and ignores `field`.
 
-Single-domain only: on a coupled (multi-subdomain) model this throws,
-since a single global per-point ordering across subdomains is not yet
-defined. `QuadField{T}(model; init)` inherits the same restriction.
+The basis is evaluated only when a `state` is given, so a walk without one
+costs a pass over the stored points and weights.
 """
-function foreach_quadrature_point(f, model::Model{D,T}; state=nothing) where {D,T}
-    # Walks a single subdomain plan with a single-space workspace, so a coupled
-    # model would silently visit only the first subdomain (and evaluate `state`
-    # on the wrong parents). Per-point iteration across coupled subdomains — one
-    # global quadrature-point ordering shared with assembly — is deferred.
-    _assert_single_domain(model, "foreach_quadrature_point")
-    return _walk(f, _volume_payload, _assembly_workspace(model),
-                 _region_list(model, nothing, model.problem.space), _walk_state(state, model))
-end
-
-# The `q` payloads of the two walkers: the volume walker's `(x, weight, point,
-# state)` and the interface walker's, which adds the interface normal.
-_volume_payload(region, k, x, weight, point, state) = (; x, weight, point, state)
-function _interface_payload(region, k, x, weight, point, state)
-    return (; x, weight, point, state, normal=_region_normal(region, k))
-end
-
-# A walker's `FormState`, or `nothing` without a state.
-function _walk_state(@nospecialize(state), @nospecialize(model::Model))
+function foreach_quadrature_point(f, @nospecialize(model::Model); on=nothing,
+                                  field::Union{Nothing,Symbol}=nothing, state=nothing)
+    list = _region_list(model, on, _target_space(model, on, field))
     coefficients = _state_vector(state, model)
-    return coefficients === nothing ? nothing : FormState(model.dofs, coefficients)
+    state = coefficients === nothing ? nothing : FormState(model.dofs, coefficients)
+    workspace = state === nothing ? nothing : _assembly_workspace(model)
+    return _walk((acc, q) -> (f(q); acc), nothing, workspace, list, state)
 end
 
-# Call `f(q)` at every quadrature point of `list`, in the serial assembly
-# order, with the point's coordinates and weight computed exactly as the kernel
-# computes them and `q.point = list.offsets[r] + k` its numbering. With a state, each
-# region's dof values are read once and every field is evaluated at every point
-# through the same `_frame!`, `_refresh!` and `_state_point!` the kernel uses;
-# without one, no basis is evaluated at all. Behind a function barrier on the
-# workspace, so the per-point calls are static.
-function _walk(f, payload, ws::AssemblyWorkspace, list::RegionList, state)
+# Fold `op(acc, q)` over every quadrature point of `list` in the serial assembly
+# order, starting from `acc`, and return the result: `foreach_quadrature_point`
+# discards it, `boundary_integral` sums through it. The payload is the kernel's
+# own (`_payload`), from the same `_region_point`, with `q.point =
+# list.offsets[r] + k`. With a state, each region's dof values are read once and
+# every field is evaluated at every point through the same `_frame!`,
+# `_refresh!` and `_state_point!` the kernel uses, on the workspace `ws`;
+# without one, `ws` is `nothing` and no basis is evaluated at all. Reached by a
+# dynamic call, which makes it the function barrier for the region and state
+# types.
+function _walk(op, acc, ws, list::RegionList, state)
     for (r, region) in pairs(list.regions)
         state === nothing || _state_region!(state, _frame!(ws, region))
         jacobian = _region_jacobian(region)
@@ -2016,59 +1941,8 @@ function _walk(f, payload, ws::AssemblyWorkspace, list::RegionList, state)
             x, w, ref = _region_point(region, k, jacobian)
             st = state === nothing ? nothing :
                  (_refresh!(ws, region, ref, Val(true)); _state_point!(state, ws, Val(true)))
-            f(payload(region, k, x, w, list.offsets[r] + k, st))
+            acc = op(acc, _payload(region, k, x, w, list.offsets[r] + k, st))
         end
     end
-    return nothing
-end
-
-"""
-    interface_quadrature_count(model, iface::Interface) -> Int
-
-Number of quadrature points of the two-sided interface `iface` (built with
-[`interface`](@ref)) on the prepared `model`. This is the size of a per-point
-history vector keyed by the `q.point` index that
-[`foreach_interface_quadrature_point`](@ref) and the coupling forms expose.
-"""
-function interface_quadrature_count(model::Model, iface::Interface)
-    return _region_list(model, iface, nothing).offsets[end]
-end
-
-"""
-    foreach_interface_quadrature_point(f, model, iface::Interface; state=nothing)
-
-Call `f(q)` at every quadrature point of the two-sided interface `iface` (built
-with [`interface`](@ref)). The payload is
-
-    q = (; x, weight, point, normal, state)
-
-where
-
-  - `q.x` — physical coordinate of the interface quadrature point,
-  - `q.weight` — the surface quadrature weight (arc length in 2-D, area in 3-D),
-  - `q.point` — stable index in `1:interface_quadrature_count(model, iface)`,
-    matching the index the coupling forms see during assembly, so it is the
-    natural key for per-interface-point history (an irreversible cohesive
-    `κ`, a friction state, …),
-  - `q.normal` — the interface unit normal, oriented from side `a` toward side
-    `b` (the two fields passed to [`couple`](@ref), in order) — a convention
-    the interface mesh carries and the caller owns, see [`Interface`](@ref),
-  - `q.state` — `nothing` unless a `state` (a [`Solution`](@ref) or active
-    coefficient vector) was passed, in which case it is a two-field
-    [`FormState`](@ref) exposing **both** coupled fields via
-    `value(q.state, field)` / `field_gradient(q.state, field)` (each evaluated
-    in its own subdomain's covering cut cell at the shared point `q.x`).
-
-Unlike [`foreach_quadrature_point`](@ref) (single subdomain, volume points),
-this walks the two-sided interface regions of a coupled model, so it is the
-companion iterator for reading and committing interface state around a
-nonlinear solve. Dimension-generic (2-D polyline / 3-D triangle interface);
-iteration order matches the serial interface-assembly pass.
-"""
-function foreach_interface_quadrature_point(f, model::Model{D,T}, iface::Interface;
-                                            state=nothing) where {D,T}
-    # The frame and the refresh cover *both* sides' parents, so the state
-    # evaluates each coupled field in its own subdomain's cut cell.
-    return _walk(f, _interface_payload, _assembly_workspace(model),
-                 _region_list(model, iface, nothing), _walk_state(state, model))
+    return acc
 end

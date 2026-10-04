@@ -100,8 +100,8 @@ global 1D function index via the `_AXIS_BSPLINE` tag.
     so the finite-cell workflow is open to it.
 
 The hot loops in `src/assembly.jl` and `src/projection.jl` are
-unchanged — they dispatch on `level.basis` (via the workspace's
-`bases` vector) and the B-spline overloads fire naturally.
+unchanged — they dispatch on `level.basis` (via the `bases` vector of
+the workspace's basis bank) and the B-spline overloads fire naturally.
 """
 module UnfittedBasicBSplineExt
 

@@ -1007,8 +1007,8 @@ The per-point half of a boundary trace: refill `trace.values` with the basis
 traces at reference point `xi` on the parent cell, for the facet-incident modes
 [`boundary_trace_indices`](@ref) selected. `trace` is that call's record,
 extended by the caller with the parent's `cell`. Mirrors the
-`_parent_basis_data` / `_update_parent_basis_values!` pair the volume
-evaluation paths use.
+`_field_parent_data` / `_update_parent_basis_values!` pair the volume
+evaluation paths of `postprocessing.jl` use.
 
 The trace of a tensor-product basis function on a facet is the volume tensor
 product evaluated at a point that happens to lie on the facet, so this is

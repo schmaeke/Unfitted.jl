@@ -504,11 +504,6 @@ function problem_spaces(problem::Problem)
     return spaces
 end
 
-# Whether `problem` couples more than one distinct subdomain space. The
-# single-space case is the dominant path and takes typed fast branches (e.g. the
-# concretely-typed level tuple in `_assembly_workspace`).
-_is_multidomain(problem::Problem) = length(problem_spaces(problem)) > 1
-
 # The `Space` owning `field_name` in `problem`. Used to route a field's
 # volume / boundary / interface contributions to its own discretisation.
 function _field_space(problem::Problem, field_name::Symbol)

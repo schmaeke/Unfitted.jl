@@ -128,15 +128,18 @@ end
 end
 
 @testset "per-point iteration is guarded on multi-domain models" begin
-    # foreach_quadrature_point / QuadField walk a single subdomain plan with a
-    # single-space workspace, so a coupled model would silently visit only the
-    # first subdomain — guarded rather than wrong.
+    # Each subdomain of a coupled model numbers its quadrature points separately,
+    # so there is no single list for foreach_quadrature_point without `field`, or
+    # for QuadField (which has no `field`), to walk; visiting only the first
+    # subdomain would be silently wrong, so both raise — the walker naming the
+    # keyword that selects a subdomain.
     V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=3, order=1)
     V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=3, order=1)
     model = prepare(Problem((field(:u1, V1), field(:u2, V2));
                             blocks=(stiffness_block(field(:u1, V1)),
                                     stiffness_block(field(:u2, V2)))))
     @test_throws ArgumentError foreach_quadrature_point(q -> nothing, model)
+    @test_throws "field=" foreach_quadrature_point(q -> nothing, model)
     @test_throws ArgumentError QuadField{Float64}(model)
 end
 
@@ -466,8 +469,8 @@ end
     @test model.rhs == serial_rhs
 end
 
-@testset "foreach_interface_quadrature_point matches the assembly points" begin
-    # Non-matching stacked squares coupled by a jump penalty. The iterator must
+@testset "foreach_quadrature_point(; on = iface) matches the assembly points" begin
+    # Non-matching stacked squares coupled by a jump penalty. The walker must
     # visit exactly the quadrature points the coupling forms see during assembly,
     # under the SAME stable `q.point` numbering (the key for per-point history),
     # and expose both coupled fields through `q.state`.
@@ -490,10 +493,9 @@ end
                                     couple(u1, u2, Γ, rec)...), symmetric=false))
     assemble_matrix(model, couple(u1, u2, Γ, rec); threaded=false, symmetric=false)
 
-    count = interface_quadrature_count(model, iface)
+    count = nquadpoints(model; on=iface)
     @test count > 0
     @test count == nquadpoints(model; kind=:interface)              # single interface ⇒ equal
-    @test count == nquadpoints(model; on=iface)                     # per-tag counter agrees
     @test Set(seen) == Set(1:count)                                 # assembly sees points 1:count
 
     # The iterator visits each point once, with unit a→b normals; the weights sum
@@ -502,7 +504,7 @@ end
     arclen = 0.0
     normals_unit = true
     normal_dir = SVector(0.0, 0.0)
-    foreach_interface_quadrature_point(model, iface) do q
+    foreach_quadrature_point(model; on=iface) do q
         push!(pts, q.point)
         arclen += q.weight
         normals_unit &= abs(norm(q.normal) - 1.0) < 1.0e-12
@@ -512,6 +514,9 @@ end
     @test normals_unit
     @test normal_dir ≈ SVector(0.0, 1.0)                            # a→b orientation (+y)
     @test isapprox(arclen, 1.0; atol=1.0e-6)                        # Σ weights == |Γ|
+    # `boundary_integral` sums over the same walk, so it visits the same points in
+    # the same order with the same weights: the same sum, to the bit.
+    @test boundary_integral(q -> 1.0, model; on=iface) == arclen
 
     # `q.state` exposes BOTH coupled fields; a zero state gives a zero jump, a
     # nonzero state a finite one — and `q.point` is a stable key across passes, so
@@ -521,7 +526,7 @@ end
     x = solution(model, collect(1.0:n) ./ n)
     hist = zeros(count)
     both_finite = true
-    foreach_interface_quadrature_point(model, iface; state=x) do q
+    foreach_quadrature_point(model; on=iface, state=x) do q
         va, vb = value(q.state, :u1), value(q.state, :u2)
         both_finite &= isfinite(va) && isfinite(vb)
         hist[q.point] = max(hist[q.point], abs(va - vb))
@@ -529,7 +534,7 @@ end
     @test both_finite
     @test any(hist .> 0)
     committed = copy(hist)
-    foreach_interface_quadrature_point(model, iface; state=solution(model, zeros(n))) do q
+    foreach_quadrature_point(model; on=iface, state=solution(model, zeros(n))) do q
         hist[q.point] = max(hist[q.point], abs(value(q.state, :u1) - value(q.state, :u2)))
     end
     @test hist == committed                                         # irreversible (monotone)
