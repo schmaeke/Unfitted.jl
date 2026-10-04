@@ -759,8 +759,9 @@ end
     # model's, so a `BigFloat` iterate yields `BigFloat` values and gradients
     # instead of being rounded to `Float64` on the way in. Both walks sum the same
     # terms, so they agree to Float64 roundoff: measured 4.4e-16 on values of size
-    # ≈ 2 and 4.2e-15 on gradients. The nonzero Dirichlet datum makes every point
-    # also read constrained (`Float64`) values next to the active ones.
+    # ≈ 2 and 4.2e-15 on gradients. The nonzero Dirichlet datum makes points near
+    # the boundary also read constrained (`Float64`) values next to the active
+    # ones.
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2)
     V = overlay(V, box((0.2, 0.25), (0.8, 0.75)); cells=(2, 2), order=3)
     u = field(:u, V)
@@ -784,6 +785,18 @@ end
     @test all(g -> g isa SVector{2,BigFloat}, gbig)
     @test all(isapprox.(vbig, v64; rtol=1.0e-14, atol=1.0e-14))
     @test all(isapprox.(gbig, g64; rtol=1.0e-14, atol=1.0e-14))
+
+    # The checks above cannot see a `BigFloat` state rounded to `Float64` and
+    # promoted back, because `BigFloat.(c)` is exactly representable in Float64.
+    # A perturbation far below Float64 resolution can: the walk is affine in the
+    # coefficients, so its response to `c + ε` must be ε times the response to
+    # the all-ones direction, which a rounded state would lose entirely.
+    ε = big(2.0)^-70
+    vε, gε = walk(BigFloat.(c) .+ ε)
+    v1, g1 = walk(ones(length(c)))
+    v0, g0 = walk(zeros(length(c)))
+    @test all(isapprox.((vε .- vbig) ./ ε, v1 .- v0; rtol=1.0e-10, atol=1.0e-10))
+    @test all(isapprox.((gε .- gbig) ./ ε, g1 .- g0; rtol=1.0e-10, atol=1.0e-10))
 end
 
 @testset "1D bar with inhomogeneous Neumann data has analytic solution" begin
@@ -1070,6 +1083,19 @@ end
         @test model.rhs == b
     end
 
+    # Anchors that do not depend on how the code expands a pivot. The lift check
+    # below compares assembly against the state reconstruction, and both read a
+    # pivot's branches from the dof layer, so a defect in that shared rule would
+    # move both sides alike and pass. These three numbers were measured on the
+    # assembler that distributed every emission through the expansions before it
+    # condensed per region, with w = sin(3i). Rounding moves them by about 1e-16;
+    # dropping or misweighting the Dirichlet branch of one pivot moves them by
+    # 2.5–40 %.
+    w = [sin(3i) for i in eachindex(b)]
+    @test dot(w, b) ≈ -1.932281255352028 rtol = 1.0e-12
+    @test sum(b) ≈ 26.955956630714347 rtol = 1.0e-12
+    @test dot(w, A \ b) ≈ -0.18106058297953753 rtol = 1.0e-12
+
     # The lift agrees with the reconstruction. For any active coefficient vector
     # x, u_h = Σⱼ xⱼ φⱼ + u_g, where u_g is the Dirichlet lift that `dof_value`
     # reconstructs, pivot expansions included. Since b = F − a(u_g, ·),
@@ -1186,10 +1212,12 @@ end
 
 # ── Concurrent assembly calls on one model ────────────────────────────────────
 
-# Assemble every operator of `operators` from its own task, `rounds` times each.
-# The tasks start at staggered offsets into the list, so at any moment the
-# concurrent calls ask for different operators, and therefore for different
-# cached sparsity patterns. Returns `(operator index, matrix)` pairs.
+# One task per operator index; each task assembles `rounds` operators, cycling
+# through the list from a staggered start, so at any moment the concurrent calls
+# ask for different operators, and therefore for different cached sparsity
+# patterns. Returns `(operator index, matrix)` pairs. Only `threaded=false` is
+# pinned so far: the threaded variant is not yet safe, because concurrent
+# threaded calls race on the gather arenas pooled on the model.
 function _concurrent_assembly(model, operators; threaded::Bool, rounds::Int=8)
     tasks = map(eachindex(operators)) do k
         return Threads.@spawn [let i = mod1(k + r, length(operators))
