@@ -1116,11 +1116,11 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     elimination_source = Symbol[eliminated[raw] ? get(source_of, raw, :overlay) : :free
                                 for raw in 1:nraw]
     # A raw is "simple" if its expansion is either the identity
-    # `[(raw, 1)]` (free) or empty `[]` (strongly eliminated) — both
-    # the lightweight assembly path represents directly as a single
-    # active-or-constrained local target. Any other expansion (a
-    # redirect onto other raws) is a genuine linear constraint and
-    # forces the expansion-distributing assembly path.
+    # `[(raw, 1)]` (free) or empty `[]` (strongly eliminated) — both of
+    # which assembly's slot table holds directly, as an active or a
+    # constrained local slot. Any other expansion (a redirect onto other
+    # raws) is a genuine linear constraint: assembly gives it a pivot slot
+    # of its own and condenses it once per region, K ← PᵀKP, b ← Pᵀb − lift.
     has_linear_constraints = any(pairs(raw_expansion)) do (raw, e)
         !(isempty(e) || (length(e) == 1 && e[1] == (raw, one(T))))
     end

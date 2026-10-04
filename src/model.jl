@@ -548,42 +548,6 @@ end
 
 # ── Model and lifecycle ───────────────────────────────────────────────────────
 
-# Cached CSC sparsity pattern for a model's matrix assembly. Built once
-# per `model.version` (keyed additionally by the `on`-tag region set and
-# the symmetry flag) by `build_assembly_pattern` in `assembly.jl`; the
-# numeric scatter pass fills a matching `nzval` buffer slot-for-slot, so
-# a dof pair appearing in many integration boxes accumulates with `+=`
-# into one slot — peak memory is the final nnz, not the per-box
-# dense-block over-count.
-#
-# `colptr`/`rowval` are value-type-independent, so one pattern serves
-# mass / stiffness / Newton-tangent and every re-assembly. For symmetric
-# forms the pattern is the lower triangle (global row ≥ col), mirrored as
-# `A + Aᵀ − diag` at the end. `key` is a hash of the ordered region-list
-# set the pattern was built over, so a request touching a different set
-# of `on=` selectors rebuilds rather than reusing a stale pattern.
-# Defined here (rather than in `assembly.jl`) because it is cached on the
-# `Model` and this file is included first.
-#
-# `gather_cache` memoises the threaded scatter's per-region-list `GatherPlan`
-# (the deferred compute→gather layout built by `assembly.jl`), keyed by the
-# region list's `objectid`. It lives on the pattern so it is invalidated for
-# free: a structural change drops `model.pattern`, and the fresh pattern
-# starts with an empty cache. Typed `Any` because `GatherPlan` is defined in
-# `assembly.jl` (included after this file); retrieval goes through a function
-# barrier, so the hot loop stays type-stable.
-struct AssemblyPattern
-    n::Int
-    colptr::Vector{Int}
-    rowval::Vector{Int}
-    symmetric::Bool
-    key::UInt
-    gather_cache::Dict{UInt,Any}
-end
-function AssemblyPattern(n, colptr, rowval, symmetric, key)
-    AssemblyPattern(n, colptr, rowval, symmetric, key, Dict{UInt,Any}())
-end
-
 # ── Single-sided region-cache keys ────────────────────────────────────────────
 #
 # A single-sided region list (`FacetRegion`s for a `BoundarySelector`,
@@ -608,6 +572,99 @@ end
 # deduplicates spaces by `===`, so "a distinct discretisation" is package-wide
 # synonymous with "a distinct `Space` object".
 const RegionKey = Tuple{Any,Any}
+
+# ── Assembly cache ────────────────────────────────────────────────────────────
+#
+# Everything assembly derives from a model's structure and reuses across calls
+# lives in one object, `model.assembly`. The types are defined here rather than
+# in `assembly.jl` because the `Model` holds them and this file is included
+# first; the code that fills and reads them lives in `assembly.jl`.
+#
+# A `RegionKey` names every integration pass an assembly call can run:
+#
+#     volume plan of `space`         (nothing, space)
+#     facet list of a selector       (selector, space)
+#     surface list of a mesh         (mesh, space)
+#     two-sided interface            (iface, nothing)
+#
+# Selectors compare by value, spaces, meshes and interfaces by identity (see
+# above), and every key holds a reference to its objects, so no two distinct
+# lists can ever share a key. That rules out by construction the failure of a
+# cache keyed by `objectid`: once a transient region list is collected, a later
+# list can be allocated at the same address and inherit an entry that describes
+# a different list.
+
+# The sorted active global dof ids of every region of one list: region `r` owns
+# `val[ptr[r]:ptr[r+1]-1]`, ascending. Read as a matrix it is the dofs × regions
+# CSC incidence the sparsity pattern is built from, and it fixes each region's
+# slice of the threaded arena, so it is derived once per list, through the same
+# `_frame!` and `_slots!` the numeric pass runs.
+struct RegionDofs
+    ptr::Vector{Int}
+    val::Vector{Int}
+end
+
+# One integration region list as assembly sees it: the regions, the `q.point`
+# offset of each (region `r`'s points are `offsets[r] .+ (1:npoints)`, and
+# `offsets[end]` is the list's point count), and, once a matrix or a threaded
+# call has needed them, the regions' active dofs. `dofs` is filled once, under
+# the cache lock, and never changes afterwards.
+mutable struct RegionList{R}
+    const regions::Vector{R}
+    const offsets::Vector{Int}
+    dofs::Union{Nothing,RegionDofs}
+end
+
+# CSC sparsity pattern of one operator over the active dofs: the union over
+# every region of every matrix pass of the dense block on the region's active
+# dofs. A symmetric operator stores the lower triangle (global row ≥ col) only
+# and is mirrored when the matrix is built. `colptr` and `rowval` do not depend
+# on the scalar type or on any value, so one pattern serves every operator over
+# the same passes: mass, stiffness, a Newton tangent at any iterate.
+struct AssemblyPattern
+    n::Int
+    colptr::Vector{Int}
+    rowval::Vector{Int}
+    symmetric::Bool
+end
+
+# The model's assembly cache. Every field is guarded by `lock`, which an
+# assembly call takes a fixed handful of times (list and pattern lookup, the
+# symbolic dof lists, scratch checkout and return) and never inside the
+# quadrature loop or the scatter.
+#
+#   - `lists` — the region lists of every volume plan and of every `on=` target
+#     `prepare` resolved. Bounded by those, so never evicted.
+#   - `oneshot` — the lists of `on=` targets `prepare` did not see (a block
+#     built after the fact, `boundary_integral` on a new selector), most
+#     recently used first, at most 8. A hot one-shot target is resolved once.
+#   - `patterns` — sparsity patterns keyed by the matrix passes' keys and the
+#     symmetry flag, most recently used first, at most 4, so operators that
+#     alternate (mass and stiffness of a time stepper, the problem's own
+#     operator and a transfer's mass) keep their patterns.
+#   - `arena`, `rhs_arena` — the threaded scratch of the last threaded call,
+#     handed to one call at a time; a concurrent call that finds them taken
+#     allocates its own, and the larger pair is kept when they come back.
+#   - `workspaces` — idle `AssemblyWorkspace`s, at most `Threads.nthreads()`.
+#     Typed `Any` because the workspace type is defined in `assembly.jl`; the
+#     drivers recover it behind a function barrier.
+#
+# Nothing here depends on constrained values, so `update_dirichlet!` keeps the
+# cache, and `_remodel!` replaces it whole when the structure changes.
+mutable struct AssemblyCache{T}
+    const lock::ReentrantLock
+    const lists::Dict{RegionKey,RegionList}
+    const oneshot::Vector{Pair{RegionKey,RegionList}}
+    const patterns::Vector{Pair{Tuple{Vector{RegionKey},Bool},AssemblyPattern}}
+    arena::Vector{T}
+    rhs_arena::Vector{T}
+    const workspaces::Vector{Any}
+end
+function AssemblyCache{T}() where {T}
+    return AssemblyCache{T}(ReentrantLock(), Dict{RegionKey,RegionList}(),
+                            Pair{RegionKey,RegionList}[],
+                            Pair{Tuple{Vector{RegionKey},Bool},AssemblyPattern}[], T[], T[], Any[])
+end
 
 """
     Model{D,T,P}
@@ -742,15 +799,21 @@ re-thread a fresh value through. Fields:
     place by [`assemble!`](@ref) and [`solve!`](@ref); replaced outright by
     `prepare` and by every version-bumping mutator (see
     [`AssemblyDiagnostics`](@ref)).
-  - `pattern::Union{Nothing,AssemblyPattern}` — cached CSC sparsity
-    pattern for matrix assembly, plus the threaded gather plans and arena
-    buffers memoised on it. `nothing` until the first matrix assembly
-    builds it; cleared by every version-bumping mutator, since those change
-    the structure it describes. [`update_dirichlet!`](@ref) is the
-    exception: it clears `matrix`/`rhs` but *keeps* the pattern, because
-    rewriting constrained values leaves the constrained-dof set — and so
-    every region's active dofs — untouched. Lets a Newton or load-stepping
-    loop reuse the pattern and re-run only the numeric scatter.
+  - `assembly::AssemblyCache{T}` — what assembly derives from the
+    structure and reuses across calls: the region list of every pass with
+    its `q.point` offsets and its regions' active dofs (unbounded for the
+    volume plans and the `on=` targets `prepare` resolved; the 8 most
+    recent for targets it did not), the CSC sparsity patterns of the 4 most
+    recently assembled pass sets, and pooled per-call scratch (workspaces,
+    the threaded arena). Every version-bumping mutator replaces it, since
+    those change the structure it describes. [`update_dirichlet!`](@ref)
+    is the exception: it clears `matrix`/`rhs` but *keeps* the cache,
+    because rewriting constrained values leaves the constrained-dof set —
+    and so every region's active dofs — untouched. Lets a Newton or
+    load-stepping loop reuse the pattern and re-run only the numeric
+    scatter. The cache is locked, so several tasks may assemble on one
+    model at the same time, serial or threaded; mutating the model while
+    an assembly runs is not supported.
   - `plan_options::NamedTuple` — the integration-plan keyword options
     (`tolerance`, `criterion`, …) captured at `prepare`. Every mutator
     (`move!`, `activate!`, `deactivate!`) rebuilds the plan with these,
@@ -772,7 +835,7 @@ mutable struct Model{D,T,P}
     interface_regions::IdDict{Any,Vector{InterfaceRegion{D,T}}}
     dirichlet_projections::Dict{Symbol,DirichletProjection{D,T}}
     diagnostics::AssemblyDiagnostics
-    pattern::Union{Nothing,AssemblyPattern}
+    assembly::AssemblyCache{T}
     plan_options::NamedTuple
 end
 
@@ -1179,7 +1242,7 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                                                 facet_resolver, facet_regions, surface_regions,
                                                 interface_regions,
                                                 Dict{Symbol,DirichletProjection{D,T}}(), diag,
-                                                nothing, plan_options)
+                                                AssemblyCache{T}(), plan_options)
 end
 
 # Build the facet-region cache for a problem from every *site* that references
@@ -1522,7 +1585,7 @@ function _remodel!(model::Model{D,T}, space::Space{D,T}) where {D,T}
     model.diagnostics = fresh.diagnostics
     model.matrix = nothing
     model.rhs = nothing
-    model.pattern = nothing
+    model.assembly = fresh.assembly
     empty!(model.dirichlet_projections)
     model.version += 1
     return model
@@ -1545,9 +1608,8 @@ and [`deactivate!`](@ref) mirror. `move!`
 
   - bumps `model.version`, so an outstanding [`Solution`](@ref) raises on
     reuse;
-  - clears `model.matrix`, `model.rhs`, and the cached assembly
-    `model.pattern` (and with it the threaded gather plan and arena pool
-    memoised on that pattern);
+  - clears `model.matrix` and `model.rhs`, and replaces the assembly cache
+    `model.assembly` (region lists, sparsity patterns, pooled scratch);
   - empties the Dirichlet projection cache, whose unknown sets and boundary
     mass belong to the dof layout being replaced;
   - rebuilds `model.prefold_space` at the new box, the integration plan, the
@@ -2008,11 +2070,14 @@ function update_dirichlet!(model::Model{D,T}, dirichlet) where {D,T}
     # the next `solve!` cannot silently use a stale operator if the
     # caller also changes blocks or loads between steps.
     #
-    # `model.pattern` is deliberately retained: `update_dirichlet!` only
+    # `model.assembly` is deliberately retained: `update_dirichlet!` only
     # rewrites constrained *values*, leaving the constrained-dof set — and
-    # therefore `active_unknowns` and every region's `active_dofs` — fixed,
-    # so the cached sparsity pattern stays structurally valid and the next
-    # assembly reuses it (the version is not bumped either).
+    # therefore `active_unknowns` and every region's active dofs — fixed, so
+    # the cached region lists and sparsity patterns stay structurally valid and
+    # the next assembly reuses them (the version is not bumped either). Nothing
+    # in the cache holds a constrained value: assembly reads the elimination
+    # values and a pivot's Dirichlet branches from the dof layout, which this
+    # function has just rewritten in place, at numeric time.
     model.matrix = nothing
     model.rhs = nothing
 

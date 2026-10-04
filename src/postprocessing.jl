@@ -1251,7 +1251,7 @@ end
 # ── Boundary integration ─────────────────────────────────────────────────────
 #
 # Quadrature-only postprocessing on a portion of the boundary. The
-# region list comes from `_resolve_on_regions(model, on)` so the same
+# region list comes from `_region_list`, the lookup assembly uses, so the same
 # code path handles physical [`FacetRegion`](@ref)s and immersed
 # [`SurfaceRegion`](@ref)s; the per-region `_boundary_q` helper builds
 # the right `q` tuple for each kind. No per-Q-point geometry work
@@ -1330,7 +1330,7 @@ sample. Throws `ArgumentError` if no admissible region exists on the
 selected portion of the boundary.
 """
 function boundary_integral(integrand, model::Model; on, field::Union{Nothing,Symbol}=nothing)
-    regions = _resolve_on_regions(model, on, _on_regions_space(model, field))
+    regions = _region_list(model, on, _target_space(model, on, field)).regions
     result = nothing
     samples = 0
     for region in regions

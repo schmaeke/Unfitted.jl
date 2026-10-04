@@ -384,8 +384,8 @@ geometry tolerance the resolution runs at, together with the per-face memo
 One resolver belongs to a [`Model`](@ref) and lives as long as it does, so every
 consumer of grid-aligned boundary integration shares one resolution per
 `(space, face)` pair — the per-selector cache `prepare` builds
-(`_resolve_facet_regions`), the one-shot lookup `_resolve_on_regions` falls back
-to for a selector no `prepare` saw, and the L² Dirichlet projection
+(`_resolve_facet_regions`), the one-shot lookup `_region_list` falls back to
+for a selector no `prepare` saw, and the L² Dirichlet projection
 (`_dirichlet_projection`), which reaches the same faces from the dof layer.
 Sharing is worth arranging because `_boundary_facet_regions` is a pure function
 of `(V, sides, tolerance)`: a second resolution of a face can only ever

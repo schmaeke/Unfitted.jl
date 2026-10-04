@@ -386,8 +386,8 @@ split is worth quoting. The injection and the residual matvec are nowhere in it,
 at 1.3–7.6 ms and 0.5–4.4 ms across the same three orders.
 
 None of those shares is all of the assembly. `plus` is a fresh model on every
-call, so it also pays the symbolic pattern and the threaded gather plan in full
-and amortises them over a single assembly — the opposite of the Newton or
+call, so it also pays the symbolic region-dof lists and pattern in full and
+amortises them over a single assembly — the opposite of the Newton or
 transient loop those caches were built for. Symbolic against numeric inside
 `assemble!(V⁺)`, same ladder and four threads: 63 / 135 / 439 ms against
 103 / 556 / 1796 ms at `-O0`, and 78 / 120 / 253 ms against 22 / 74 / 249 ms at
@@ -400,8 +400,8 @@ A matrix-free path is not the lever: it removes the sparse insertion and none of
 the kernel work. Neither — measured — is a row and column restriction of the
 kernel, which is the obvious reading of the paragraph above. Assembling only what
 the indicator reads (`R_W = b⁺_W − A⁺[W,V] u_V` and `diag A⁺[W,W]`, as a
-selection of matrix entries applied to the pattern, the gather plan and the
-emission loop) halves the entries stored and reproduces `cells`, `total` and
+selection of matrix entries applied to the symbolic data and the emission
+loop) halves the entries stored and reproduces `cells`, `total` and
 `reference` to the bit — and is worth 1.15× at `-O0` and nothing at `-O2`
 (0.96–1.05× over the three orders). The contraction count falls by roughly four
 and the time does not: deciding that a (test, trial) pair is unwanted costs about
@@ -411,9 +411,9 @@ contraction vectorising.
 What would pay is a cheaper question rather than a cheaper answer to this one.
 Both quantities the indicator reads are right-hand-side shaped — `R` is
 `ℓ(v) − a(u⁺, v)` integrated against the injected state, and `diag A⁺` is the
-bilinear form evaluated at `a == b` alone — and neither needs a sparse pattern or
-a gather plan. An rhs pass over `V⁺` that reads the state at every point costs
-9.7 ms at `p` = 3 against the block pass's 249 ms. The price is that `R_W` would
+bilinear form evaluated at `a == b` alone — and neither needs a sparse pattern.
+An rhs pass over `V⁺` that reads the state at every point costs 9.7 ms at `p` = 3
+against the block pass's 249 ms. The price is that `R_W` would
 then come out of quadrature instead of out of `b⁺ − A⁺u⁺`: the two agree to
 3e-14 relative (measured on `‖R|_V‖ / ‖R|_W‖` over the three orders), so every
 `η_K` would move in its last digits. That is why this file still forms the

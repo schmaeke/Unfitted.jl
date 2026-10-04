@@ -4,15 +4,21 @@
 # live in `problems.jl` and the prepared-problem lifecycle (`Model`,
 # `prepare`, `move!`, …) lives in `model.jl`.
 #
-# The strategy is symbolic + numeric (Gustavson) sparse assembly. A
-# symbolic pass builds the CSC sparsity pattern once (cached on the
-# `Model`); the numeric pass walks every admissible integration region,
-# evaluates basis values and physical gradients per parent level,
-# accumulates the user's weak form into a per-task local matrix / rhs
-# over the region's sorted local dof numbering, and scatter-adds that
-# block into the prebuilt `nzval`. A dof pair appearing in many regions
-# therefore accumulates with `+=` into one slot rather than inflating a
-# triplet array.
+# The strategy is symbolic + numeric sparse assembly. An assembly call
+# first lists its passes (`_passes`): one integration region list each,
+# with the forms integrated over it. The symbolic data — every region's
+# sorted active dof list and the CSC sparsity pattern over them — is
+# derived once per structure and cached on the `Model`
+# (`model.assembly`). The numeric pass walks every region, evaluates
+# basis values and physical gradients per parent level, accumulates the
+# user's weak form into a per-task local matrix / rhs over the region's
+# sorted local dof numbering, and merges each local column into its
+# pattern column of the prebuilt `nzval`. A dof pair appearing in many
+# regions therefore accumulates with `+=` into one slot rather than
+# inflating a triplet array. The threaded driver runs the same kernel,
+# parks each region's result in a private arena slice, and sums the
+# arena by owned dof ranges through the same column merge, so its result
+# is bit-identical to the serial walk.
 #
 # Two contracts shape the API:
 #
@@ -101,8 +107,8 @@ function _field_value(parent_data::AbstractVector, layout::Union{DofLayout{D,T},
     return result
 end
 
-# Gradient analogues of `_field_value`. Returns an `SVector{D}` per
-# parent, then sums to get the superposed gradient.
+# Gradient analogue of the one-parent `_field_value`: an `SVector{D}` per
+# parent. Its callers sum over parents themselves.
 function _field_gradient(data, layout::Union{DofLayout{D,T},FieldLayout{D,T}}, coefficients,
                          component::Integer=1) where {D,T}
     R = promote_type(T, eltype(coefficients))
@@ -113,172 +119,319 @@ function _field_gradient(data, layout::Union{DofLayout{D,T},FieldLayout{D,T}}, c
     return result
 end
 
-function _field_gradient(parent_data::AbstractVector,
-                         layout::Union{DofLayout{D,T},FieldLayout{D,T}}, coefficients,
-                         component::Integer=1) where {D,T}
-    R = promote_type(T, eltype(coefficients))
-    result = zero(SVector{D,R})
-    for data in parent_data
-        result += _field_gradient(data, layout, coefficients, component)
+# Resolve a field name to its index inside a `SystemLayout`. Used by
+# every block / load loop to translate field references into the
+# layout's field-major data structures.
+function _field_index(layout::SystemLayout, name::Symbol)
+    index = get(layout.by_name, name, 0)
+    index == 0 && throw(ArgumentError("unknown field $name"))
+    return index
+end
+
+# One-shot per-parent record collector. Used by the evaluation paths of
+# `postprocessing.jl`, which allocate fresh basis buffers; assembly and the
+# quadrature-point walks evaluate into a workspace's `BasisBank` instead.
+function _field_parent_data(V, layout::FieldLayout, parents; gradients::Bool=true)
+    [_parent_basis_data(V, layout.dofs, parent; gradients) for parent in parents]
+end
+
+# ── Region lists and passes ───────────────────────────────────────────────────
+#
+# The cache types (`RegionList`, `RegionDofs`, `AssemblyPattern`,
+# `AssemblyCache`) live in `model.jl`, because the `Model` holds them and that
+# file is included first; the code that fills and reads them lives here.
+#
+# Everything from here to the end of the symbolic section is an assembly call's
+# cold path: it runs once per call or once per pass, never per region. Whatever
+# takes the `Model` or the form tuples is deliberately unspecialised
+# (`@nospecialize`), so it compiles once per process rather than once per form
+# tuple or problem type; the form types and `Model{D,T,P}` reach only the
+# per-pass drivers and the kernel. On a prototype of this structure, measured
+# per new form type at `-O0` against the fully specialised assembler it
+# replaced, a new block's first assembly compiled in 0.28× the time and the same
+# block on a second problem type in 0.03×; the price is a few microseconds of
+# dynamic dispatch per call.
+
+# A region list with its `q.point` offsets. Its active dofs are derived later,
+# on first need (`_dofs!`).
+function RegionList(regions::Vector{R}) where {R}
+    offsets = Vector{Int}(undef, length(regions) + 1)
+    offsets[1] = 0
+    for (r, region) in pairs(regions)
+        offsets[r+1] = offsets[r] + _region_qpoint_count(region)
     end
-    return result
+    return RegionList{R}(regions, offsets, nothing)
 end
 
-# ── Symbolic assembly pattern (Gustavson) ─────────────────────────────────────
-
-# The `AssemblyPattern` struct itself lives in `model.jl` (it is cached
-# model state, and `model.jl` is included before this file); the builder
-# and the numeric scatter that consume it live here.
-
-# Fill `ws.dofs` with one region's sorted active global dof ids, with no
-# quadrature or kernel work. It runs the same `_frame!` and `_slots!` the
-# numeric pass runs, so the symbolic pattern enumerates exactly the dof pairs
-# assembly emits: active ids and the active branches of every pivot, never a
-# constrained id. Returns `ws.dofs`, valid until the workspace's next region.
-# (`ws` is an `AssemblyWorkspace`, defined further down this file.)
-function _region_active_dofs!(ws, model::Model, region)
-    _slots!(_frame!(ws, region))
-    return ws.dofs
+# One pass of one assembly call: a region list, its `RegionKey`, and the blocks
+# and loads integrated over it as concretely typed tuples. The per-pass drivers
+# and the kernel are compiled per `Pass` type — per form tuple and region kind —
+# and nothing else in an assembly call is.
+struct Pass{R,B<:Tuple,L<:Tuple}
+    key::RegionKey
+    list::RegionList{R}
+    blocks::B
+    loads::L
 end
 
-# Build the CSC sparsity pattern as the union over every region of the
-# dense coupling block on that region's `active_dofs` (lower triangle
-# when `symmetric`, i.e. global row ≥ col).
+# The regions of pass target `target` on `space`, and whether they are the
+# model's own prepare-time list (`true`) or were resolved just now for a target
+# `prepare` never saw (`false`). The miss paths are the builders `prepare` runs.
+# "Fresh" is per target, not per face: a selector resolves through the model's
+# `FacetResolver`, so a face `prepare` already resolved is reused, and a new face
+# is resolved once however many selectors name it.
+function _regions(@nospecialize(model::Model), ::Nothing, @nospecialize(space))
+    plan = findfirst(s -> s === space, problem_spaces(model.problem))
+    return model.space_plans[plan].regions, true
+end
+function _regions(@nospecialize(model::Model), selector::BoundarySelector, @nospecialize(space))
+    cached = get(model.facet_regions, (selector, space), nothing)
+    cached === nothing || return cached, true
+    return _facet_regions_for_selector(space, selector, model.facet_resolver), false
+end
+function _regions(@nospecialize(model::Model), mesh::BoundaryMesh, @nospecialize(space))
+    cached = get(model.surface_regions, (mesh, space), nothing)
+    cached === nothing || return cached, true
+    return _surface_regions_for_mesh(space, mesh, model.dofs.tolerance), false
+end
+# An interface's field indices come from the dof layout (global field order),
+# its two spaces from the effective problem's fields.
+function _regions(@nospecialize(model::Model), iface::Interface, _)
+    cached = get(model.interface_regions, iface, nothing)
+    cached === nothing || return cached, true
+    field_a = _field_index(model.dofs, iface.field_a)
+    field_b = _field_index(model.dofs, iface.field_b)
+    return _interface_regions(iface, _field_space(model.problem, iface.field_a),
+                              _field_space(model.problem, iface.field_b), field_a, field_b,
+                              model.dofs.tolerance), false
+end
+
+# The `RegionList` of pass target `target` on `space` (`RegionKey`
+# `(target, space)`; `space` is `nothing` for an `Interface`). Every consumer
+# resolves through here — the assembly passes, `nquadpoints`, the
+# quadrature-point walkers and `boundary_integral` — so all of them see one
+# list, one set of offsets and so one `q.point` numbering. A list `prepare`
+# resolved is kept for the model's lifetime; a target it did not see goes to
+# the bounded one-shot cache, so a hot one is resolved once rather than on every
+# call. Lookup and build run under the cache lock: a one-shot facet miss also
+# extends the model's `FacetResolver` memo, which concurrent calls must not do
+# at the same time. `Base.@lock` rather than `lock(f, l)`, whose closure would
+# be one more type to compile for every caller.
+function _region_list(@nospecialize(model::Model), @nospecialize(target), @nospecialize(space))
+    cache = model.assembly
+    key = (target, space)
+    Base.@lock cache.lock begin
+        list = get(cache.lists, key, nothing)
+        list === nothing || return list
+        list = _lru_get!(cache.oneshot, key)
+        list === nothing || return list
+        regions, owned = _regions(model, target, space)
+        list = RegionList(regions)
+        owned ? (cache.lists[key] = list) : _lru_push!(cache.oneshot, key => list, 8)
+        return list
+    end
+end
+
+# A small most-recently-used-first cache kept in a `Vector` of `key => value`
+# pairs. `_lru_get!` returns the value stored under `key` and moves its entry to
+# the front, or returns `nothing`; `_lru_push!` adds an entry at the front and
+# drops the least recently used one beyond `capacity`. Keys compare by
+# `isequal`, as a `Dict`'s would. A linear search is the right tool at these
+# sizes (at most 8 entries), and the bound is what keeps one-shot targets and
+# alternating operators from growing the cache without limit.
+function _lru_get!(lru::Vector, @nospecialize(key))
+    i = findfirst(entry -> isequal(first(entry), key), lru)
+    i === nothing && return nothing
+    i > 1 && pushfirst!(lru, popat!(lru, i))
+    return last(first(lru))
+end
+function _lru_push!(lru::Vector, entry::Pair, capacity::Int)
+    pushfirst!(lru, entry)
+    length(lru) > capacity && pop!(lru)
+    return last(entry)
+end
+
+# The subdomain space a single-sided `on=` target resolves on, for the callers
+# that name a target rather than a form (`nquadpoints`, `boundary_integral`). A
+# named `field` picks its space; without one, a single-domain model has exactly
+# one answer and a multi-domain model has none, so it raises rather than pick —
+# see the `boundary_integral` docstring for why neither silent default is
+# defensible. An `Interface` spans both its subdomains and resolves on
+# `nothing`.
+function _target_space(@nospecialize(model::Model), @nospecialize(on), field::Union{Nothing,Symbol})
+    on isa Interface && return nothing
+    field === nothing || return _field_space(model.problem, field)
+    length(problem_spaces(model.problem)) == 1 && return model.problem.space
+    names = join((":" * String(f.name) for f in model.problem.fields), ", ")
+    throw(ArgumentError("field argument is required for multi-domain models; pass field=… " *
+                        "(one of $names)"))
+end
+
+# The passes of one assembly call over `blocks` and `loads`, in the order they
+# are summed. Every pass accumulates into the same matrix and rhs, so this order
+# is part of the result, and it is a property of the caller's form list alone:
 #
-# `feed!` is a function that, given a `visit` callback, calls
-# `visit(active::Vector{Int})` once per dense block to include. The sole
-# caller is `build_assembly_pattern`, which visits one block per region of
-# every pass a matrix assembly walks — the volume plans plus each `on=`
-# region list. The `active` vector may alias workspace storage; the builder
-# copies it.
+#   1. the volume target first, then every `on=` target in its first appearance
+#      in `(blocks..., loads...)`, matched by `isequal` — value-equal selectors
+#      are one target, meshes and interfaces match by identity;
+#   2. each target split per subdomain space, in `problem_spaces` order, a pass
+#      taking the forms whose test field lives on that space. A region list is
+#      built on one space's level block and only that space's fields evaluate on
+#      it (`region_parents`), so a target named on two subdomains is two
+#      independent passes, and a volume form runs on its own subdomain's plan
+#      only;
+#   3. except an `Interface`, which is one pass: its regions carry both sides'
+#      parents, and the four blocks of a `couple` alternate their test field
+#      between the two subdomains.
 #
-# Gustavson's column dedup uses an `O(nactive)` `marker` array — but the
-# trick is correct only when each output column is processed contiguously
-# (`marker[row] == col` must persist across all of that column's
-# contributions). The blocks are not column-ordered, so we first build a
-# dof→blocks inverted index and then sweep one column at a time. The
-# index plus the stored per-block active sets cost `O(Σ nactive)` (one
-# entry per block/dof incidence) — far below the `O(Σ nactive²)`
-# dense-block over-count; the final pattern is the only nnz-sized
-# allocation.
-#
-# Two passes over the columns: the first counts entries per column to
-# build `colptr`; the second fills `rowval` and sorts each column's rows
-# (CSC requires ascending row indices, which the numeric scatter's
-# `searchsortedfirst` also relies on). `marker` need not be reset between
-# columns within a pass — the column id is strictly increasing, so a
-# stale `marker[row]` from an earlier column never equals the current
-# one — but it is cleared between the two passes.
-function _gustavson_pattern(feed!, n::Int, symmetric::Bool, key::UInt)
-    block_actives = Vector{Vector{Int}}()
-    col_blocks = [Int[] for _ in 1:n]
-    feed!() do active
-        push!(block_actives, copy(active))
-        b = length(block_actives)
-        @inbounds for j in active
-            push!(col_blocks[j], b)
+# A space with no form on a target gets no pass, and neither does a target whose
+# list is empty. The sparsity pattern is built from the passes that carry a
+# block, so the symbolic and the numeric side enumerate the same lists by
+# construction.
+function _passes(@nospecialize(model::Model), @nospecialize(blocks::Tuple),
+                 @nospecialize(loads::Tuple))
+    forms = (blocks..., loads...)
+    targets = Any[]
+    any(form -> form.on === nothing, forms) && push!(targets, nothing)
+    for form in forms
+        form.on === nothing || any(t -> isequal(t, form.on), targets) || push!(targets, form.on)
+    end
+    passes = Any[]
+    for target in targets,
+        space in (target isa Interface ? Any[nothing] : problem_spaces(model.problem))
+
+        mine = form -> isequal(form.on, target) &&
+                       (space === nothing || _field_space(model.problem, form.test_name) === space)
+        target_blocks, target_loads = filter(mine, blocks), filter(mine, loads)
+        isempty(target_blocks) && isempty(target_loads) && continue
+        list = _region_list(model, target, space)
+        isempty(list.regions) ||
+            push!(passes, Pass((target, space), list, target_blocks, target_loads))
+    end
+    return passes
+end
+
+# ── Symbolic data: region dofs and the sparsity pattern ───────────────────────
+
+# The active dofs of every region of `list` (see `RegionDofs`), derived once per
+# list and kept on it. It runs the numeric pass's own `_frame!` and `_slots!` on
+# the workspace `ws`, so the pattern and the threaded arena layout describe
+# exactly the dofs the kernel emits: active ids and the active branches of every
+# pivot, never a constrained id. Called under the cache lock
+# (`_assembly_pattern!`, `_dofs_all!`), which is what makes the one-time fill
+# safe when calls run concurrently.
+function _dofs!(list::RegionList, ws)
+    list.dofs === nothing || return list.dofs
+    ptr = Vector{Int}(undef, length(list.regions) + 1)
+    ptr[1] = 1
+    val = Int[]
+    for (r, region) in pairs(list.regions)
+        _slots!(_frame!(ws, region))
+        append!(val, ws.dofs)
+        ptr[r+1] = length(val) + 1
+    end
+    return list.dofs = RegionDofs(ptr, val)
+end
+
+# The region dofs of every pass of a threaded call, whose arena layout is read
+# from them (`_threaded!`), under one lock for the whole call.
+function _dofs_all!(@nospecialize(cache::AssemblyCache), passes::Vector{Any}, @nospecialize(ws))
+    Base.@lock cache.lock begin
+        for pass in passes
+            _dofs!(pass.list, ws)
         end
-        return nothing
     end
+    return nothing
+end
 
+# The CSC sparsity pattern over `n` active dofs of the dense blocks on every
+# region of `sets` (the matrix passes' region dofs): column `j` holds every row
+# `i` that shares a region with `j` — only `i ≥ j` when `symmetric` — ascending.
+#
+# Gustavson's column dedup marks each row with the current column in an `O(n)`
+# `marker` array, which is correct only when each output column is processed
+# contiguously. So the regions are first inverted into a dof → regions index:
+# the concatenated region dofs read as the CSC incidence dofs × regions, whose
+# transpose lists, per dof, the regions containing it. That index costs
+# `O(Σ nactive)` — one entry per (region, dof) incidence, far below the
+# `O(Σ nactive²)` dense-block over-count — and the pattern itself is the only
+# nnz-sized allocation.
+#
+# Two passes over the columns: the first counts each column's rows to build
+# `colptr`, the second fills `rowval` and sorts each column (CSC wants ascending
+# rows, and the scatter's merge relies on it). Counting first sizes `rowval`
+# exactly; appending instead nearly doubled the transient (18.6 against
+# 10.8 MiB on a 2D overlay fixture). `marker` need not be reset between columns
+# within a pass — the column id strictly increases, so a stale `marker[i]` never
+# equals the current one — but is cleared between the two passes.
+function _pattern(n::Int, sets::Vector{RegionDofs}, symmetric::Bool)
+    nregions = sum(set -> length(set.ptr) - 1, sets; init=0)
+    ptr = Vector{Int}(undef, nregions + 1)
+    val = Vector{Int}(undef, sum(set -> length(set.val), sets; init=0))
+    ptr[1] = 1
+    r = 0
+    for set in sets
+        copyto!(val, ptr[r+1], set.val, 1, length(set.val))
+        for k in 1:(length(set.ptr)-1)
+            r += 1
+            ptr[r+1] = ptr[r] + (set.ptr[k+1] - set.ptr[k])
+        end
+    end
+    owners = copy(transpose(SparseMatrixCSC(n, nregions, ptr, val, fill(true, length(val)))))
+    regions = rowvals(owners)
     marker = zeros(Int, n)
     colptr = Vector{Int}(undef, n + 1)
     colptr[1] = 1
     @inbounds for j in 1:n
-        cnt = 0
-        for b in col_blocks[j], i in block_actives[b]
-            (symmetric && i < j) && continue
-            if marker[i] != j
-                marker[i] = j
-                cnt += 1
-            end
+        entries = 0
+        for t in nzrange(owners, j), k in ptr[regions[t]]:(ptr[regions[t]+1]-1)
+            i = val[k]
+            ((symmetric && i < j) || marker[i] == j) && continue
+            marker[i] = j
+            entries += 1
         end
-        colptr[j + 1] = colptr[j] + cnt
+        colptr[j+1] = colptr[j] + entries
     end
-
-    rowval = Vector{Int}(undef, colptr[n + 1] - 1)
+    rowval = Vector{Int}(undef, colptr[n+1] - 1)
     fill!(marker, 0)
     @inbounds for j in 1:n
         pos = colptr[j]
-        for b in col_blocks[j], i in block_actives[b]
-            (symmetric && i < j) && continue
-            if marker[i] != j
-                marker[i] = j
-                rowval[pos] = i
-                pos += 1
-            end
+        for t in nzrange(owners, j), k in ptr[regions[t]]:(ptr[regions[t]+1]-1)
+            i = val[k]
+            ((symmetric && i < j) || marker[i] == j) && continue
+            marker[i] = j
+            rowval[pos] = i
+            pos += 1
         end
         sort!(view(rowval, colptr[j]:(colptr[j+1]-1)))
     end
-
-    return AssemblyPattern(n, colptr, rowval, symmetric, key)
+    return AssemblyPattern(n, colptr, rowval, symmetric)
 end
 
-# Ordered volume region lists for an assembly: each distinct subdomain
-# integration plan's `regions` (one list for single-domain). Ownership is
-# intrinsic to each region + field layout (`region_parents`), so no per-pass
-# `served` mask is needed — a field only receives parents on the levels its
-# subdomain owns. Object identity of each `plan.regions` is preserved so the
-# `objectid`-keyed gather / arena caches stay valid. Shared by the numeric
-# volume assembly (`_assemble_partitioned!`) and the symbolic pattern build so
-# both enumerate the same regions in the same order.
-_volume_passes(model::Model) = Any[plan.regions for plan in integration_plans(model)]
-
-# Assembly pattern over a model's volume/on region-list passes: feed one dense
-# block per region from the active dofs its owning fields emit there.
-function build_assembly_pattern(model::Model{D,T}, passes, symmetric::Bool, key::UInt) where {D,T}
-    ws = _assembly_workspace(model)
-    return _gustavson_pattern(active_unknowns(model.dofs), symmetric, key) do visit
-        for regions in passes, region in regions
-            visit(_region_active_dofs!(ws, model, region))
-        end
+# The sparsity pattern of the matrix passes `passes` (those carrying a block),
+# from the model's pattern cache, keyed by the passes' `RegionKey`s and the
+# symmetry flag; `nothing` when there is no matrix pass. Loads add no matrix
+# entry and are not part of the key, so `assemble!` on a volume-only problem and
+# `assemble_matrix(model, mass_block(u))` share one entry, and a caller that
+# alternates operators keeps every pattern it uses (up to four) instead of
+# rebuilding one per call. A miss derives each list's region dofs (`_dofs!`) on
+# `ws`, the caller's checked-out workspace, under the lock.
+function _assembly_pattern!(@nospecialize(model::Model), passes::Vector{Any}, symmetric::Bool,
+                            @nospecialize(ws))
+    isempty(passes) && return nothing
+    cache = model.assembly
+    key = (RegionKey[pass.key for pass in passes], symmetric)
+    Base.@lock cache.lock begin
+        pattern = _lru_get!(cache.patterns, key)
+        pattern === nothing || return pattern
+        sets = RegionDofs[_dofs!(pass.list, ws) for pass in passes]
+        return _lru_push!(cache.patterns,
+                          key => _pattern(active_unknowns(model.dofs), sets, symmetric), 4)
     end
-end
-
-# Ordered region lists a matrix assembly over `blocks` walks — the volume
-# integration plan (when any block is volume-tagged) followed by each
-# unique `on=` selector's region list. Returns the lists plus a hash
-# signature of that set, used as the pattern cache key (loads never
-# contribute matrix entries, so they are ignored here). The visiting order
-# is `_assemble_partitioned!`'s.
-function _assembly_region_lists(model::Model, blocks)
-    volume_blocks, _, partitions = _partition_forms_by_on(blocks, ())
-    passes = Any[]
-    key = hash(:assembly_pattern)
-    if !isempty(volume_blocks)
-        for pass in _volume_passes(model)
-            push!(passes, pass)
-        end
-        key = hash(:volume, key)
-    end
-    for (on, (on_blocks, _)) in partitions
-        for (space, _, _) in _partition_space(model, on, on_blocks, ())
-            regions = _resolve_on_regions(model, on, space)
-            isempty(regions) && continue
-            push!(passes, regions)
-            key = hash((on, space), key)
-        end
-    end
-    return passes, key
-end
-
-# Return a CSC pattern matching `blocks` and `symmetric`, reusing the one
-# cached on `model` when the region-set key and symmetry agree (so a
-# Newton loop's repeated assembly hits the cache and only the numeric
-# scatter re-runs). Rebuilds and re-caches otherwise.
-function _assembly_pattern!(model::Model, blocks, symmetric::Bool)
-    passes, key = _assembly_region_lists(model, blocks)
-    cached = model.pattern
-    if cached !== nothing && cached.symmetric == symmetric && cached.key == key
-        return cached
-    end
-    pattern = build_assembly_pattern(model, passes, symmetric, key)
-    model.pattern = pattern
-    return pattern
 end
 
 # Mirror a symmetric form's lower-triangular CSC arrays — `rowval` holds
-# only rows `i ≥ j`, which is what `_gustavson_pattern` emits under
+# only rows `i ≥ j`, which is what `_pattern` emits under
 # `symmetric` — into the full symmetric matrix, in one pass.
 #
 # The obvious spelling, `A + Aᵀ − diag(A)`, materialises five full-size
@@ -340,7 +493,7 @@ end
 # Assemble the final sparse matrix from a filled `nzval` buffer and the
 # cached pattern. An unsymmetric form copies `colptr`/`rowval` so the
 # cached pattern is never mutated by `dropzeros!` and takes `nzval` by
-# reference (safe because the caller's `ScatterSink` is single-use); a
+# reference (safe because every assembly call allocates its own); a
 # symmetric one was scattered in the lower triangle only, and
 # `_mirror_lower` builds fresh arrays for the full matrix. `dropzeros!`
 # then collapses the explicit zeros left by Dirichlet column elimination
@@ -351,102 +504,6 @@ function _matrix_from_pattern(pattern::AssemblyPattern, nzval::Vector{T}) where 
                              nzval)
     dropzeros!(matrix)
     return matrix
-end
-
-# ── Scatter sink (matrix destination for one assembly pass) ───────────────────
-
-# Where a region's local matrix block is deposited. The right-hand side
-# always accumulates into a dense vector; only the matrix destination
-# varies behind the sink, so the single `_assemble_region!` body and the
-# whole hot loop stay agnostic to it. Three cases:
-#
-#   * `ScatterSink` — `+=` into the pre-built CSC `nzval` slot located via
-#     the cached pattern. The serial matrix path proper.
-#   * `ArenaSink` (defined with the threaded scatter further down) — store
-#     the block into the region's own disjoint arena slice, deferring the
-#     accumulation to the phase-2 gather.
-#   * `nothing` — the rhs-only sink used by `assemble_vector`, where no
-#     block is present and the local matrix is empty.
-struct ScatterSink{T}
-    nzval::Vector{T}
-    pattern::AssemblyPattern
-end
-
-# Raised when the numeric scatter targets a `(row, col)` the prebuilt
-# pattern does not contain — impossible unless the symbolic and numeric
-# passes disagree about a region's active dofs. Erroring here turns a
-# latent silent corruption (writing into an adjacent column's slot) into
-# an immediate, locatable failure. Kept `@noinline` so the check stays
-# off the hot path's instruction stream.
-@noinline function _scatter_pattern_miss(row::Int, col::Int)
-    error("assembly scatter: entry ($row, $col) is absent from the cached sparsity pattern; " *
-          "the symbolic and numeric passes disagree on the active dofs")
-end
-
-# Scatter a region's dense local block into the matrix, column-major.
-# Zero entries are skipped; the rest locate `(row, col)` in column `col`'s
-# sorted row range via `searchsortedfirst` and `+=` into that `nzval` slot.
-#
-# The skip is load-bearing, not just a saving. Under `symmetric` the pattern
-# stores rows `i ≥ j` only, and the kernel never writes an upper-triangle slot
-# of the local block — so those entries are still exactly the zeros
-# `_integrate!` filled, and skipping them is what keeps the lookup below inside
-# the column's stored row range. (It also keeps
-# structural zeros out of the accumulation, giving `dropzeros!` less to do.)
-#
-# A miss — the located slot does not hold `row` — means the pattern and the
-# numeric pass disagree, and raises rather than corrupting a neighbouring
-# slot. The `nothing` sink (rhs-only assembly) is a no-op.
-# The serial walk visits regions and entries in a fixed order, so repeated
-# serial assembly is deterministic to the bit.
-_emit_matrix!(::Nothing, active_dofs, local_matrix) = nothing
-
-function _emit_matrix!(sink::ScatterSink{T}, active_dofs::AbstractVector{Int},
-                       local_matrix::AbstractMatrix{T}) where {T}
-    isempty(local_matrix) && return nothing
-    pattern = sink.pattern
-    @inbounds for local_col in axes(local_matrix, 2)
-        col = active_dofs[local_col]
-        lo = pattern.colptr[col]
-        hi = pattern.colptr[col + 1] - 1
-        for local_row in axes(local_matrix, 1)
-            entry = local_matrix[local_row, local_col]
-            iszero(entry) && continue
-            row = active_dofs[local_row]
-            slot = searchsortedfirst(pattern.rowval, row, lo, hi, Base.Order.Forward)
-            (slot <= hi && pattern.rowval[slot] == row) || _scatter_pattern_miss(row, col)
-            sink.nzval[slot] += entry
-        end
-    end
-    return nothing
-end
-
-# Emit a region's local system: scatter the rhs by row (identical for
-# every sink) then deposit the matrix block into the sink.
-function _emit_local_system!(sink, rhs::Vector{T}, active_dofs::AbstractVector{Int},
-                             local_matrix::AbstractMatrix{T},
-                             local_rhs::AbstractVector{T}) where {T}
-    for (local_row, row) in pairs(active_dofs)
-        rhs[row] += local_rhs[local_row]
-    end
-    _emit_matrix!(sink, active_dofs, local_matrix)
-    return nothing
-end
-
-# Resolve a field name to its index inside a `SystemLayout`. Used by
-# every block / load loop to translate field references into the
-# layout's field-major data structures.
-function _field_index(layout::SystemLayout, name::Symbol)
-    index = get(layout.by_name, name, 0)
-    index == 0 && throw(ArgumentError("unknown field $name"))
-    return index
-end
-
-# One-shot per-parent record collector. Used by the evaluation paths of
-# `postprocessing.jl`, which allocate fresh basis buffers; assembly and the
-# quadrature-point walks evaluate into a workspace's `BasisBank` instead.
-function _field_parent_data(V, layout::FieldLayout, parents; gradients::Bool=true)
-    [_parent_basis_data(V, layout.dofs, parent; gradients) for parent in parents]
 end
 
 # ── Basis bank and assembly workspace ─────────────────────────────────────────
@@ -581,10 +638,64 @@ function AssemblyWorkspace(layout::SystemLayout{D,T}, spaces) where {D,T}
 end
 
 # A fresh workspace for `model`. Deliberately unspecialised: it runs once per
-# pass or per task, never per region, and specialising it on `Model{D,T,P}`
-# would only compile it again for every problem type.
+# call, never per region, and specialising it on `Model{D,T,P}` would only
+# compile it again for every problem type.
 function _assembly_workspace(@nospecialize(model::Model))
     return AssemblyWorkspace(model.dofs, problem_spaces(model.problem))
+end
+
+# Take one call's scratch out of the model's cache: `tasks` workspaces, idle ones
+# first and fresh ones for the rest, and for a threaded call the pooled arena
+# pair, leaving empty arenas behind so that a concurrent call allocates its own.
+# Scratch is never shared between calls; together with the locked lookups that
+# is what makes concurrent assembly on one model safe, serial or threaded. A
+# workspace costs about 4 µs to build, a sizable share of a small threaded call,
+# hence the pool. Returns `(workspaces, arena, rhs_arena)`, with a concretely
+# typed `workspaces` vector and the arenas `nothing` for a serial call.
+function _checkout!(@nospecialize(cache::AssemblyCache), @nospecialize(model::Model), tasks::Int,
+                    threaded::Bool)
+    idle, arena, rhs_arena = Base.@lock cache.lock begin
+        taken = Any[pop!(cache.workspaces) for _ in 1:min(tasks, length(cache.workspaces))]
+        pooled, pooled_rhs = cache.arena, cache.rhs_arena
+        if threaded
+            cache.arena, cache.rhs_arena = similar(pooled, 0), similar(pooled_rhs, 0)
+        end
+        (taken, threaded ? pooled : nothing, threaded ? pooled_rhs : nothing)
+    end
+    layout, spaces = model.dofs, problem_spaces(model.problem)
+    head = isempty(idle) ? AssemblyWorkspace(layout, spaces) : idle[1]
+    return _fill_checkout(head, idle, tasks, layout, spaces), arena, rhs_arena
+end
+
+# Function barrier of `_checkout!`: `head` and then the other idle workspaces,
+# topped up with fresh ones to `tasks`, in a vector of `head`'s concrete type, so
+# the drivers index it without dispatch.
+function _fill_checkout(head::W, idle::Vector{Any}, tasks::Int, layout, spaces) where {W}
+    workspaces = Vector{W}(undef, tasks)
+    workspaces[1] = head
+    for t in 2:tasks
+        workspaces[t] = t <= length(idle) ? idle[t]::W : AssemblyWorkspace(layout, spaces)::W
+    end
+    return workspaces
+end
+
+# Return a call's scratch to the cache: the workspaces, keeping at most
+# `Threads.nthreads()` idle ones, and the larger of the returned and the resident
+# arena pair, so the pool holds the maximum over calls, never their sum. Every
+# per-region field of a workspace is reset before it is used again, so scratch
+# returned from a call a callback error aborted is as good as any.
+function _checkin!(@nospecialize(cache::AssemblyCache), @nospecialize(workspaces),
+                   @nospecialize(arena), @nospecialize(rhs_arena))
+    Base.@lock cache.lock begin
+        for ws in workspaces
+            length(cache.workspaces) < Threads.nthreads() && push!(cache.workspaces, ws)
+        end
+        if arena !== nothing
+            length(arena) > length(cache.arena) && (cache.arena = arena)
+            length(rhs_arena) > length(cache.rhs_arena) && (cache.rhs_arena = rhs_arena)
+        end
+    end
+    return nothing
 end
 
 # ── Region frame and slot table ───────────────────────────────────────────────
@@ -904,9 +1015,9 @@ end
 
 # Evaluate every field's components at the current point from the refreshed
 # bank: per parent the partial sum `Σᵢ uᵢ φᵢ` (and `Σᵢ uᵢ ∇φᵢ` when `G`), then the
-# sum over parents. That is the association the field-evaluation helpers above
-# use, so a state reads the same bits as `value(solution, model, x)`'s
-# reconstruction of the same sum. Returns `state`, which becomes `q.state`.
+# sum over parents. That is the association of the field-evaluation helpers
+# above; the basis values themselves reach the two along different routes, so
+# the association is all they share. Returns `state`, which becomes `q.state`.
 function _state_point!(state::FormState{D,R}, ws::AssemblyWorkspace, ::Val{G}) where {D,R,G}
     bank = ws.bank
     for (f, fl) in pairs(ws.layout.fields), c in 1:fl.components
@@ -1016,7 +1127,7 @@ end
 # one compiled instance per (pass type, region kind, state type), and the
 # contraction's code generation, which decides how `_test_contribution`'s
 # `dot` rounds, is fixed inside it whichever driver calls it.
-@noinline function _integrate!(ws::AssemblyWorkspace{D,T}, pass, region, offset::Int, state,
+@noinline function _integrate!(ws::AssemblyWorkspace{D,T}, pass::Pass, region, offset::Int, state,
                                sym::Bool) where {D,T}
     _frame!(ws, region)
     n = _slots!(ws)
@@ -1188,493 +1299,268 @@ function _condense!(ws::AssemblyWorkspace, n::Int, m::Int, sym::Bool, matrix::Bo
     return nothing
 end
 
-# Bridge from the kernel to the sink-based drivers below: integrate one region,
-# then hand its active block, rhs and dof list to `_emit_local_system!`.
-function _assemble_region!(ws::AssemblyWorkspace, sink, rhs, region, blocks, loads, symmetric::Bool,
-                           state, point_offset::Int)
-    n = _integrate!(ws, (; blocks, loads), region, point_offset, state, symmetric)
-    m = isempty(blocks) ? 0 : n + length(ws.pivots)
-    k = min(n, m)
-    local_matrix = view(reshape(view(ws.K, 1:(m*m)), m, m), 1:k, 1:k)
-    _emit_local_system!(sink, rhs, ws.dofs, local_matrix, ws.b)
-    return nothing
-end
-
-# Total quad-point count across all regions of the plan. Used by
-# `nquadpoints`.
-function _quadrature_count(plan::IntegrationPlan)
-    sum(length(r.quadrature.weights) for r in plan.regions; init=0)
-end
-
-# Per-region quadrature-point counts, used to compute the `point_offset` each
-# region sees. Defined for every region kind so the serial/threaded drivers stay
-# region-kind-agnostic; the physical-frame kinds (facet / surface / interface)
-# share one method as their weights vector already holds one entry per point.
+# Number of quadrature points of a region, which sizes its `q.point` range
+# (`RegionList`) and drives the kernel's point loop. The physical-frame kinds
+# (facet / surface / interface) share one method, as their weights vector
+# already holds one entry per point.
 _region_qpoint_count(region::VolumeRegion) = length(region.quadrature.weights)
 function _region_qpoint_count(region::Union{FacetRegion,SurfaceRegion,InterfaceRegion})
     length(region.weights)
 end
 
-# Cumulative offsets of the global `q.point` index over a region list.
-# Volume and facet kinds maintain independent counters: callers pass
-# the kind-specific region list and receive offsets stable across
-# threaded vs. serial assembly.
-function _region_qpoint_offsets(regions)
-    offsets = Vector{Int}(undef, length(regions))
-    acc = 0
-    for (i, region) in enumerate(regions)
-        offsets[i] = acc
-        acc += _region_qpoint_count(region)
-    end
-    return offsets
+# ── Serial driver and the column kernel ───────────────────────────────────────
+
+# Raised when the scatter meets a `(row, col)` the cached pattern does not
+# contain — impossible unless the symbolic and numeric passes disagree about a
+# region's active dofs. Raising turns a latent silent corruption (writing into a
+# neighbouring slot) into an immediate, locatable failure. `@noinline` keeps the
+# check off the hot path's instruction stream.
+@noinline function _pattern_miss(row::Int, col::Int)
+    error("assembly scatter: entry ($row, $col) is absent from the cached sparsity pattern; " *
+          "the symbolic and numeric passes disagree on the active dofs")
 end
 
-# Serial assembly driver: one workspace and the shared `sink`/`rhs`
-# walked across every region in order. `region_filter` lets load
-# assemblies skip regions that do not intersect the load's support. The
-# `regions` argument is any iterable of one region kind — volume, facet,
-# surface, or interface — which the single `_assemble_region!` method
-# handles through its per-kind accessors. The serial walk scatters into the
-# sink in a fixed region order, so repeated serial assembly is deterministic
-# to the bit.
-function _assemble_system_serial!(sink, rhs::Vector{T}, model::Model{D,T}, regions, symmetric::Bool,
-                                  blocks, loads, region_filter, state_coefficients) where {D,T}
-    state = state_coefficients === nothing ? nothing : FormState(model.dofs, state_coefficients)
-    _serial_regions!(_assembly_workspace(model), sink, rhs, regions, symmetric, blocks, loads,
-                     region_filter, state, _region_qpoint_offsets(regions))
-    return nothing
-end
-
-# The serial region loop, behind a function barrier on the workspace: the
-# workspace's basis-family parameter is a runtime property of the space, so the
-# loop is compiled for the concrete workspace type and calls the kernel
-# statically, with no dispatch or boxing per region.
-function _serial_regions!(ws::AssemblyWorkspace, sink, rhs, regions, symmetric::Bool, blocks, loads,
-                          region_filter, state, offsets)
-    for (region_index, region) in enumerate(regions)
-        region_filter === nothing || region_filter(region) || continue
-        _assemble_region!(ws, sink, rhs, region, blocks, loads, symmetric, state,
-                          offsets[region_index])
-    end
-    return nothing
-end
-
-# ── Deferred compute→gather threaded scatter ──────────────────────────────────
+# Add one column of a region's local matrix into the global `nz`: local column
+# `lc` of a region whose sorted global ids are `dofs`, its stored rows
+# `from:length(dofs)` read consecutively from `src`, starting at `src[s]`. This is
+# the one association of local entries with pattern slots. The serial scatter
+# (`src` the workspace's `K`) and threaded phase 2 (`src` the region's arena
+# slice) both go through it, which is half of why the two are bit-identical.
 #
-# The threaded matrix assembly decouples the region-parallel numeric work from
-# the slot accumulation so both phases run barrier-free:
-#
-#   Phase 1 — every region computes its dense local block + local rhs and
-#     stores them into its OWN disjoint slice of a flat arena (region-indexed).
-#     No two regions write the same memory, so this is embarrassingly parallel
-#     (dynamically load-balanced), with no colouring and no per-colour barrier.
-#   Phase 2 — a `GatherPlan` (built once, symbolically, and cached on the
-#     pattern) sums the arena into `nzval` by a disjoint column partition and
-#     into `rhs` by a disjoint dof partition. Each output slot has a single
-#     writer, so again no atomics and no barrier between regions.
-#
-# Peak matrix memory is `1 × nnz` plus the flat arena (Σ local-block entries,
-# independent of thread count). Because every slot's contributions are summed
-# in a fixed (region, row) order — the SAME order the serial walk uses — the
-# threaded result is not just deterministic run-to-run but BIT-IDENTICAL to
-# serial assembly, which removes the accumulation-order roundoff sensitivity a
-# colour- or atomic-ordered scatter would leave on ill-conditioned systems.
-# Works for any element type (plain `+=`). The symbolic plan is the only
-# expensive part (a `searchsortedfirst` per contribution); caching it makes
-# repeated assembly against one structure — Newton tangents, load steps, a
-# transient march — pay it once. It is *not* carried across a structural
-# change: the cache lives on `model.pattern`, which `move!` / `activate!` /
-# `deactivate!` clear, so a moved overlay rebuilds the plan along with the
-# pattern.
-
-# Cached symbolic layout for one region list against one pattern. Matrix side:
-# `region_arena[r]..region_arena[r+1]-1` is region r's arena slice; the column
-# buckets (`ccolptr`, `cslot`, `csrc`) list, per column, the (nzval slot,
-# arena index) contributions in serial order. RHS side mirrors it by dof
-# (`region_rhs`, `drowptr`, `dsrc`). Matrix arrays are empty for the rhs-only
-# (`nothing` sink) pass.
-struct GatherPlan
-    arena_len::Int
-    region_arena::Vector{Int}
-    ccolptr::Vector{Int}
-    cslot::Vector{Int}
-    csrc::Vector{Int}
-    rhs_len::Int
-    region_rhs::Vector{Int}
-    drowptr::Vector{Int}
-    dsrc::Vector{Int}
-end
-
-# Phase-1 sink: deposit a region's local block + rhs into its arena slices
-# instead of scattering. `pos` / `rhs_pos` are set to the region's offsets
-# before each `_assemble_region!` and advance as entries are written, in the
-# exact structural order `_build_gather` enumerated (column-major, lower
-# triangle row≥col when symmetric).
-mutable struct ArenaSink{T}
-    arena::Vector{T}
-    symmetric::Bool
-    pos::Int
-    rhs_pos::Int
-end
-
-function _emit_matrix!(sink::ArenaSink{T}, active_dofs::AbstractVector{Int},
-                       local_matrix::AbstractMatrix{T}) where {T}
-    isempty(local_matrix) && return nothing
-    sym = sink.symmetric
-    arena = sink.arena
-    p = sink.pos
-    @inbounds for lc in axes(local_matrix, 2)
-        col = active_dofs[lc]
-        for lr in axes(local_matrix, 1)
-            (sym && active_dofs[lr] < col) && continue
-            arena[p] = local_matrix[lr, lc]
+# The region's rows are an ascending subset of the pattern column's, so one
+# forward merge finds every slot: measured 2.7× faster than a binary search per
+# entry, and a galloping merge gained nothing (0.99–1.00×) even on the 4 488-entry
+# columns of a deep 3D ladder. Zero entries are skipped, as the scatter always
+# has: Dirichlet column elimination leaves explicit zeros that `dropzeros!` then
+# has less to remove, and the skip keeps the sum in every slot — down to the sign
+# of a zero — what it has always been.
+@inline function _scatter_column!(nz, pattern::AssemblyPattern, dofs, src, s::Int, lc::Int,
+                                  from::Int)
+    col = dofs[lc]
+    p, hi = pattern.colptr[col], pattern.colptr[col+1] - 1
+    @inbounds for lr in from:length(dofs)
+        e = src[s]
+        s += 1
+        iszero(e) && continue
+        row = dofs[lr]
+        while p <= hi && pattern.rowval[p] < row
             p += 1
         end
+        (p <= hi && pattern.rowval[p] == row) || _pattern_miss(row, col)
+        nz[p] += e
     end
-    sink.pos = p
     return nothing
 end
 
-# Store `local_rhs` into the region's rhs-arena slice (gathered by dof in
-# phase 2) rather than scattering it into a shared vector, then defer the
-# matrix block to `_emit_matrix!`.
-function _emit_local_system!(sink::ArenaSink{T}, rhs_arena::Vector{T},
-                             active_dofs::AbstractVector{Int}, local_matrix::AbstractMatrix{T},
-                             local_rhs::AbstractVector{T}) where {T}
-    p = sink.rhs_pos
-    @inbounds for lr in eachindex(active_dofs)
-        rhs_arena[p] = local_rhs[lr]
-        p += 1
+# The serial driver of one pass: integrate every region the filter admits, in
+# list order, and move each into the global system. It is specialised on the
+# pass, so `_integrate!` is a static call per region, and the move is
+# `_flush!`, compiled once per workspace type. A fixed region order makes
+# repeated serial assembly deterministic to the bit.
+function _serial!(nz, rhs, pattern, pass::Pass, ws::AssemblyWorkspace, state, region_filter,
+                  symmetric::Bool)
+    for (r, region) in pairs(pass.list.regions)
+        region_filter === nothing || region_filter(region) || continue
+        n = _integrate!(ws, pass, region, pass.list.offsets[r], state, symmetric)
+        _flush!(nz, rhs, pattern, ws, n, symmetric, !isempty(pass.blocks))
     end
-    sink.rhs_pos = p
-    _emit_matrix!(sink, active_dofs, local_matrix)
     return nothing
 end
 
-# Build the symbolic gather plan for `regions` against `pattern` (or `nothing`
-# for the rhs-only pass). Walks every region once, resolving each structural
-# entry's `nzval` slot via `searchsortedfirst` (identical lookup to the serial
-# `_emit_matrix!`) and bucketing contributions by column (matrix) and dof
-# (rhs) in region order, so the phase-2 gather reproduces the serial sum.
-function _build_gather(model::Model, regions, pattern, symmetric::Bool, nactive::Int)
-    ws = _assembly_workspace(model)
-    nreg = length(regions)
-    has_matrix = pattern !== nothing
-    n = has_matrix ? pattern.n : 0
-    region_arena = Vector{Int}(undef, nreg + 1)
-    region_rhs = Vector{Int}(undef, nreg + 1)
-    region_arena[1] = 1
-    region_rhs[1] = 1
-    bslot = [Int[] for _ in 1:n]
-    bsrc = [Int[] for _ in 1:n]
-    ddst = [Int[] for _ in 1:nactive]
-    for (r, region) in enumerate(regions)
-        ad = copy(_region_active_dofs!(ws, model, region))
-        ri = region_rhs[r]
-        @inbounds for lr in eachindex(ad)
-            push!(ddst[ad[lr]], ri)
-            ri += 1
-        end
-        region_rhs[r+1] = ri
-        ai = region_arena[r]
-        if has_matrix
-            colptr = pattern.colptr
-            rowval = pattern.rowval
-            # Enumerated in byte-for-byte lockstep with `_emit_matrix!(::ArenaSink)`
-            # (column-major, lower triangle when symmetric): the arena index `ai`
-            # advances here exactly as that sink's write cursor `p` does at
-            # assembly time, so `arena[csrc[k]]` is the value for slot `cslot[k]`
-            # — the source of the bit-identical-to-serial guarantee. The miss
-            # check mirrors the serial `_emit_matrix!(::ScatterSink)`: a
-            # symbolic/numeric dof disagreement raises here rather than pushing an
-            # out-of-range slot that would later corrupt a neighbouring column and
-            # break phase 2's column-disjointness.
-            @inbounds for lc in eachindex(ad)
-                col = ad[lc]
-                lo = colptr[col]
-                hi = colptr[col+1] - 1
-                for lr in eachindex(ad)
-                    row = ad[lr]
-                    (symmetric && row < col) && continue
-                    slot = searchsortedfirst(rowval, row, lo, hi, Base.Order.Forward)
-                    (slot <= hi && rowval[slot] == row) || _scatter_pattern_miss(row, col)
-                    push!(bslot[col], slot)
-                    push!(bsrc[col], ai)
-                    ai += 1
-                end
+# Move one integrated region's local system into the global one: the rhs entry of
+# every local index, in local order, then — for a pass with blocks — every local
+# column through `_scatter_column!`, rows `lc:n` under a symmetric form (the
+# kernel never writes above the diagonal) and `1:n` otherwise. Form-independent
+# and `@noinline`, so it compiles once per workspace type, not per form tuple.
+@noinline function _flush!(nz, rhs, pattern, ws::AssemblyWorkspace, n::Int, symmetric::Bool,
+                           matrix::Bool)
+    for k in 1:n
+        rhs[ws.dofs[k]] += ws.b[k]
+    end
+    matrix || return nothing
+    m = n + length(ws.pivots)
+    for lc in 1:n
+        from = symmetric ? lc : 1
+        _scatter_column!(nz, pattern, ws.dofs, ws.K, (lc - 1) * m + from, lc, from)
+    end
+    return nothing
+end
+
+# ── Threaded driver: deferred compute → gather ────────────────────────────────
+#
+# The threaded driver splits a pass into two phases that share no output slot,
+# so neither needs a lock, an atomic accumulation, or a barrier between regions:
+#
+#   Phase 1 — tasks take regions from an atomic counter (dynamic load balance),
+#     integrate each with the serial driver's own `_integrate!`, and copy its
+#     rhs and stored matrix columns into the region's own slice of a flat arena.
+#     No two regions share a slice.
+#   Phase 2 — each task owns a contiguous range of global dofs (balanced by
+#     pattern entries for a matrix pass, even for an rhs-only one) and walks
+#     every region in list order, adding the region's entries in its owned rows
+#     of the rhs and its owned columns of the matrix through the serial
+#     scatter's `_scatter_column!`.
+#
+# Every slot then has exactly one writer. That writer visits the regions in
+# list order and receives each region's entry at most once, bit for bit the
+# value the serial driver computed, through the same column merge with the same
+# zero skip. So threaded assembly is BIT-IDENTICAL to serial — not merely
+# deterministic — and independent of the thread count, which removes the
+# accumulation-order roundoff a colour- or atomic-ordered scatter leaves on an
+# ill-conditioned system.
+#
+# The arena layout is a closed form of the region dof counts (`_packed`),
+# evaluated by writer and reader alike, so nothing is planned or cached per
+# list: the region dofs (`RegionDofs`) are the whole symbolic input. The arena
+# holds `Σ n(n+1)/2` entries for a symmetric pass and `Σ n²` otherwise, whatever
+# the thread count, and is pooled on the model between calls. The cost of
+# walking every region in every phase-2 task measured 1.5–2 ns per region per
+# task: nothing on 3D fixtures, 2.4 % of the wall time at 64 tasks on a 2D
+# order-2 overlay, and 14 % only for 65 000 order-1 regions at 64 tasks, where a
+# per-task region index would be the fix.
+
+# Offset of local column `lc`'s first stored entry inside a region's packed
+# block, for a region with `n` local dofs: column `c` stores rows `c:n` under a
+# symmetric form and `1:n` otherwise. `_packed(n, n + 1, symmetric)` is the
+# block's size.
+function _packed(n::Int, lc::Int, symmetric::Bool)
+    return symmetric ? (lc - 1) * n - ((lc - 1) * (lc - 2)) ÷ 2 : (lc - 1) * n
+end
+
+# Raised by phase 1 when a region's freshly numbered dofs differ from its cached
+# `RegionDofs` slice: the threaded counterpart of `_pattern_miss`, which turns a
+# symbolic/numeric disagreement into an error instead of a corrupted arena.
+@noinline function _drift(r::Int)
+    error("threaded assembly: the active dofs of region $r differ from its cached symbolic " *
+          "list; the symbolic and numeric passes disagree")
+end
+
+# Run one pass threaded, accumulating into `nz` (`nothing` without a matrix) and
+# `rhs`. `workspaces` and `states` hold one entry per task; `arena` and
+# `rhs_arena` are the call's checked-out scratch, grown here when a pass needs
+# more. Form-independent: `pass` is not specialised on, so this compiles once
+# per workspace and state type, and the one form-specialised step, `_phase1!`,
+# is reached by a single dynamic call. `done[r]` records the regions phase 1
+# integrated; a region `region_filter` rejected stays `false` and phase 2 skips
+# it, so a stale arena slice is never read.
+function _threaded!(nz, rhs, pattern, @nospecialize(pass::Pass), workspaces, states, region_filter,
+                    symmetric::Bool, arena, rhs_arena)
+    dofs = pass.list.dofs::RegionDofs
+    nregions = length(dofs.ptr) - 1
+    matrix = !isempty(pass.blocks)
+    offsets = Vector{Int}(undef, nregions + 1)
+    offsets[1] = 1
+    for r in 1:nregions
+        n = dofs.ptr[r+1] - dofs.ptr[r]
+        offsets[r+1] = offsets[r] + (matrix ? _packed(n, n + 1, symmetric) : 0)
+    end
+    length(arena) < offsets[end] - 1 && resize!(arena, offsets[end] - 1)
+    length(rhs_arena) < dofs.ptr[end] - 1 && resize!(rhs_arena, dofs.ptr[end] - 1)
+    done = fill(false, nregions)
+    _phase1!(pass, workspaces, states, dofs, arena, rhs_arena, offsets, done, region_filter,
+             symmetric)
+    tasks = length(workspaces)
+    owned = matrix ? _balanced_ranges(pattern.colptr, tasks) : _even_ranges(length(rhs), tasks)
+    target = matrix ? nz : nothing
+    @sync for range in owned
+        Threads.@spawn _gather!(target, rhs, pattern, dofs, arena, rhs_arena, offsets, done, range,
+                                symmetric)
+    end
+    return nothing
+end
+
+# Phase 1 of one pass: one task per workspace, each running `_compute!` until the
+# shared region counter runs out. The only per-pass-type code of the threaded
+# path besides `_compute!`; an error a callback raises in a task arrives wrapped
+# (`TaskFailedException` inside a `CompositeException`), as from any `@sync`.
+function _phase1!(pass::Pass, workspaces, states, dofs::RegionDofs, arena, rhs_arena,
+                  offsets::Vector{Int}, done::Vector{Bool}, region_filter, symmetric::Bool)
+    next = Threads.Atomic{Int}(1)
+    @sync for t in eachindex(workspaces)
+        Threads.@spawn _compute!(workspaces[t], states === nothing ? nothing : states[t], pass,
+                                 dofs, arena, rhs_arena, offsets, done, next, region_filter,
+                                 symmetric)
+    end
+    return nothing
+end
+
+# The phase-1 task body: take the next region, integrate it with the serial
+# driver's own `_integrate!`, check that its dofs are its cached ones, and copy
+# its rhs to `rhs_arena[dofs.ptr[r] …]` and each stored column `lc` to
+# `arena[offsets[r] + _packed(n, lc, symmetric) …]`.
+function _compute!(ws::AssemblyWorkspace, state, pass::Pass, dofs::RegionDofs, arena, rhs_arena,
+                   offsets::Vector{Int}, done::Vector{Bool}, next::Threads.Atomic{Int},
+                   region_filter, symmetric::Bool)
+    regions = pass.list.regions
+    while true
+        r = Threads.atomic_add!(next, 1)
+        r > length(regions) && return nothing
+        region = regions[r]
+        region_filter === nothing || region_filter(region) || continue
+        n = _integrate!(ws, pass, region, pass.list.offsets[r], state, symmetric)
+        lo = dofs.ptr[r]
+        (n == dofs.ptr[r+1] - lo && view(dofs.val, lo:(lo+n-1)) == ws.dofs) || _drift(r)
+        copyto!(rhs_arena, lo, ws.b, 1, n)
+        if !isempty(pass.blocks)
+            m = n + length(ws.pivots)
+            for lc in 1:n
+                from = symmetric ? lc : 1
+                copyto!(arena, offsets[r] + _packed(n, lc, symmetric), ws.K, (lc - 1) * m + from,
+                        n - from + 1)
             end
         end
-        region_arena[r+1] = ai
+        done[r] = true
     end
-    ccolptr = _csr_ptr(bslot)                    # bslot / bsrc are pushed in lockstep,
-    cslot = _csr_flatten(bslot, ccolptr)         # so they share one pointer array
-    csrc = _csr_flatten(bsrc, ccolptr)
-    drowptr = _csr_ptr(ddst)
-    dsrc = _csr_flatten(ddst, drowptr)
-    return GatherPlan(region_arena[nreg+1] - 1, region_arena, ccolptr, cslot, csrc,
-                      region_rhs[nreg+1] - 1, region_rhs, drowptr, dsrc)
 end
 
-# CSR pointer array (length n+1) from a vector of buckets: `ptr[j]..ptr[j+1]-1`
-# is bucket j's slice in the flattened array.
-function _csr_ptr(buckets)
-    ptr = Vector{Int}(undef, length(buckets) + 1)
-    ptr[1] = 1
-    @inbounds for j in eachindex(buckets)
-        ptr[j+1] = ptr[j] + length(buckets[j])
-    end
-    return ptr
-end
-
-# Flatten a bucket vector into a dense array laid out by the CSR `ptr`. Bucket
-# vectors pushed in lockstep (a slot and its arena index) reuse one `ptr`.
-function _csr_flatten(buckets, ptr)
-    out = Vector{Int}(undef, ptr[end] - 1)
-    @inbounds for j in eachindex(buckets)
-        off = ptr[j] - 1
-        b = buckets[j]
-        for k in eachindex(b)
-            out[off+k] = b[k]
+# The phase-2 task body for the dof range `owned`: every region phase 1 computed,
+# in list order, adds its rhs entries of owned dofs and, for a matrix pass, its
+# owned columns. A region's dofs are sorted, so whether it touches `owned` is one
+# comparison of its first and last dof, and its owned local indices are one
+# `searchsorted` range.
+function _gather!(nz, rhs, pattern, dofs::RegionDofs, arena, rhs_arena, offsets::Vector{Int},
+                  done::Vector{Bool}, owned::UnitRange{Int}, symmetric::Bool)
+    c0, c1 = first(owned), last(owned)
+    for r in 1:(length(dofs.ptr)-1)
+        lo, hi = dofs.ptr[r], dofs.ptr[r+1] - 1
+        (done[r] && lo <= hi && dofs.val[lo] <= c1 && dofs.val[hi] >= c0) || continue
+        region = view(dofs.val, lo:hi)
+        columns = searchsortedfirst(region, c0):searchsortedlast(region, c1)
+        for k in columns
+            rhs[region[k]] += rhs_arena[lo+k-1]
+        end
+        nz === nothing && continue
+        n = length(region)
+        for lc in columns
+            from = symmetric ? lc : 1
+            _scatter_column!(nz, pattern, region, arena, offsets[r] + _packed(n, lc, symmetric), lc,
+                             from)
         end
     end
-    return out
+    return nothing
 end
 
-# Return the cached `GatherPlan` for `regions`, building and memoising it on
-# the pattern on first use (keyed by the region list's identity). The rhs-only
-# pass has no pattern to cache on, so it always rebuilds — assemble_vector is
-# rare and its plan skips the matrix `searchsortedfirst`.
-function _gather_plan!(pattern::AssemblyPattern, model, regions, symmetric::Bool, nactive::Int)
-    key = objectid(regions)
-    cached = get(pattern.gather_cache, key, nothing)
-    cached === nothing || return cached::GatherPlan
-    plan = _build_gather(model, regions, pattern, symmetric, nactive)
-    pattern.gather_cache[key] = plan
-    return plan
-end
-
-# Pooled phase-1 arena buffer, reused across repeated assembly. Kept in the
-# pattern's cache (alongside its `GatherPlan`) so it is invalidated with the
-# structure; the trailing `::Vector{T}` is the function barrier that recovers
-# the concrete type from the `Any`-valued cache. Only used on the fully
-# overwritten block path (see the caller), so a stale buffer is never read.
-function _gather_arena!(pattern::AssemblyPattern, key::UInt, ::Type{T}, len::Int) where {T}
-    return get!(() -> Vector{T}(undef, len), pattern.gather_cache, key)::Vector{T}
-end
-
-# Partition `1:m` into `task_count` contiguous ranges of roughly equal total
-# contribution count (`ptr` is a CSR offset array of length `m+1`). Contiguous
-# by construction, so the ranges own disjoint output slots.
-function _balanced_ranges(ptr::Vector{Int}, m::Int, total::Int, task_count::Int)
-    ranges = Vector{UnitRange{Int}}(undef, task_count)
+# Partition the columns `1:length(ptr)-1` of a CSC pattern into `tasks`
+# contiguous ranges of roughly equal entry count, the last one running to the
+# final column. Contiguous by construction, so the ranges own disjoint slots.
+function _balanced_ranges(ptr::Vector{Int}, tasks::Int)
+    m, total = length(ptr) - 1, ptr[end] - 1
+    ranges = Vector{UnitRange{Int}}(undef, tasks)
     i = 1
-    for t in 1:task_count
+    for t in 1:tasks
         lo = i
-        cut = div(t * total, task_count)
-        while i <= m && (ptr[i+1] - 1) < cut
+        while i <= m && ptr[i+1] - 1 < div(t * total, tasks)
             i += 1
         end
-        hi = min(i, m)
+        hi = t == tasks ? m : min(i, m)
         ranges[t] = lo:hi
         i = hi + 1
     end
     return ranges
 end
 
-# Phase 2 (matrix): sum the arena into `nzval` by a disjoint column partition.
-function _gather_matrix!(nzval::Vector{T}, plan::GatherPlan, arena::Vector{T},
-                         task_count::Int) where {T}
-    ccolptr = plan.ccolptr
-    cslot = plan.cslot
-    csrc = plan.csrc
-    n = length(ccolptr) - 1
-    total = ccolptr[n+1] - 1
-    ranges = _balanced_ranges(ccolptr, n, total, task_count)
-    @sync for rg in ranges
-        Threads.@spawn @inbounds for j in rg, k in ccolptr[j]:(ccolptr[j+1]-1)
-            nzval[cslot[k]] += arena[csrc[k]]
-        end
-    end
-    return nothing
-end
-
-# Phase 2 (rhs): sum the rhs-arena into `rhs` by a disjoint dof partition.
-function _gather_rhs!(rhs::Vector{T}, plan::GatherPlan, rhs_arena::Vector{T},
-                      task_count::Int) where {T}
-    drowptr = plan.drowptr
-    dsrc = plan.dsrc
-    nactive = length(drowptr) - 1
-    total = drowptr[nactive+1] - 1
-    ranges = _balanced_ranges(drowptr, nactive, total, task_count)
-    @sync for rg in ranges
-        Threads.@spawn @inbounds for d in rg, k in drowptr[d]:(drowptr[d+1]-1)
-            rhs[d] += rhs_arena[dsrc[k]]
-        end
-    end
-    return nothing
-end
-
-# Threaded assembly driver (deferred compute→gather; see the block comment
-# above `GatherPlan`). Phase 1 dynamically load-balances the regions across
-# `nthreads` tasks — each grabs the next region via an atomic counter and
-# deposits its local block / rhs into that region's disjoint arena slice
-# (`ArenaSink`), so there is no write contention and no barrier. Phase 2 sums
-# the arenas into the shared `sink.nzval` / `rhs` by disjoint column / dof
-# partitions. The symbolic `GatherPlan` is cached on the pattern.
-#
-# Region-kind-agnostic: `regions` may be a volume plan's region vector or a
-# facet selector's region list. The rhs-only pass (`sink === nothing`, from
-# `assemble_vector`) has no pattern; its plan carries only the rhs layout and
-# phase 2 gathers just the rhs.
-function _assemble_system_threaded!(sink, rhs::Vector{T}, model::Model{D,T}, regions,
-                                    symmetric::Bool, blocks, loads, region_filter,
-                                    state_coefficients) where {D,T}
-    task_count = Threads.nthreads()
-    offsets = _region_qpoint_offsets(regions)
-    nactive = length(rhs)
-    # A pass with no bilinear blocks (e.g. a load-only problem, or `assemble_vector`
-    # with its `nothing` sink) has no matrix to gather — its pattern is empty, so
-    # build the plan on the rhs layout alone and skip the matrix phase.
-    pattern = sink === nothing ? nothing : sink.pattern
-    has_matrix = pattern !== nothing && !isempty(blocks)
-    plan = has_matrix ? _gather_plan!(pattern, model, regions, symmetric, nactive) :
-           _build_gather(model, regions, nothing, symmetric, nactive)
-
-    # On the block path with no `region_filter` every arena slot is overwritten
-    # in phase 1, so the buffers can be POOLED on the pattern — repeated assembly
-    # (Newton tangents, transient steps) then reuses them instead of allocating
-    # ~`nnz` of arena per call, and the pool is dropped for free when the pattern
-    # rebuilds. `region_filter` (compact loads) skips regions, leaving their
-    # slices unwritten, so that path allocates fresh and zeroes; the rhs-only
-    # pass has no pattern to pool on.
-    if has_matrix && region_filter === nothing
-        rid = objectid(regions)
-        arena = _gather_arena!(pattern, hash(:arena, rid), T, plan.arena_len)
-        rhs_arena = _gather_arena!(pattern, hash(:rhs_arena, rid), T, plan.rhs_len)
-    else
-        arena = Vector{T}(undef, plan.arena_len)
-        rhs_arena = Vector{T}(undef, plan.rhs_len)
-        if region_filter !== nothing
-            fill!(arena, zero(T))
-            fill!(rhs_arena, zero(T))
-        end
-    end
-
-    next = Threads.Atomic{Int}(0)
-    @sync for _ in 1:task_count
-        Threads.@spawn begin
-            state = state_coefficients === nothing ? nothing :
-                    FormState(model.dofs, state_coefficients)
-            _arena_regions!(_assembly_workspace(model), ArenaSink{T}(arena, symmetric, 1, 1),
-                            rhs_arena, regions, plan, next, symmetric, blocks, loads, region_filter,
-                            state, offsets)
-        end
-    end
-
-    has_matrix && _gather_matrix!(sink.nzval, plan, arena, task_count)
-    _gather_rhs!(rhs, plan, rhs_arena, task_count)
-    return nothing
-end
-
-# One phase-1 task: take regions from the shared atomic counter until none is
-# left and deposit each into its arena slices. Behind a function barrier on the
-# workspace for the reason given at `_serial_regions!`.
-function _arena_regions!(ws::AssemblyWorkspace, asink::ArenaSink, rhs_arena, regions,
-                         plan::GatherPlan, next::Threads.Atomic{Int}, symmetric::Bool, blocks,
-                         loads, region_filter, state, offsets)
-    while true
-        region_index = Threads.atomic_add!(next, 1) + 1
-        region_index > length(regions) && break
-        region = regions[region_index]
-        region_filter === nothing || region_filter(region) || continue
-        asink.pos = plan.region_arena[region_index]
-        asink.rhs_pos = plan.region_rhs[region_index]
-        _assemble_region!(ws, asink, rhs_arena, region, blocks, loads, symmetric, state,
-                          offsets[region_index])
-    end
-    return nothing
-end
-
-# Locate the `(blocks, loads)` slot of one `on` tag inside the partition
-# list, appending a fresh slot when the tag has not been seen. Matching is
-# `isequal`, exactly the equality a `Dict` key lookup applied; appending is
-# what keeps the list in first-appearance order.
-function _partition_slot!(partitions, on)
-    for (tag, slot) in partitions
-        isequal(tag, on) && return slot
-    end
-    slot = (Any[], Any[])
-    push!(partitions, on => slot)
-    return slot
-end
-
-# Partition `blocks` and `loads` by their `on` tag. Returns the
-# volume-tagged forms (with `on === nothing`) and one
-# `on => (blocks, loads)` pair per non-volume tag, grouping every
-# contribution carrying that tag so a single assembly pass handles them
-# all. The partitions are a `Vector` of pairs in first-appearance order
-# rather than a `Dict`: assembly scatters every pass into the same
-# accumulators, so the pass order decides the summation order and must be
-# a property of the forms the caller passed, not of a hash table's slot
-# layout. A problem carries a handful of distinct `on` targets, so the
-# linear `isequal` scan that replaces the hash lookup is not a cost.
-function _partition_forms_by_on(blocks, loads)
-    volume_blocks = filter(b -> b.on === nothing, blocks)
-    volume_loads = filter(l -> l.on === nothing, loads)
-    partitions = Pair{Any,Tuple{Vector{Any},Vector{Any}}}[]
-    for b in blocks
-        b.on === nothing || push!(_partition_slot!(partitions, b.on)[1], b)
-    end
-    for l in loads
-        l.on === nothing || push!(_partition_slot!(partitions, l.on)[2], l)
-    end
-    return volume_blocks, volume_loads, partitions
-end
-
-# Split one single-sided `on`-partition by subdomain space, returning
-# `(space, blocks, loads)` for each space that has forms in it, in
-# `problem_spaces` order. The space of a form is that of its test field (whose
-# name is always a problem field, even for a one-shot
-# `assemble_matrix(model, block; on=…)` whose mesh the model never cached), so
-# the spaces reached here are always a subset of `problem_spaces(model.problem)`
-# and iterating that already-deduplicated list is enough.
-#
-# A single-sided region list is built against one space and its parents live on
-# that space's level block, so only that space's fields evaluate on it
-# (`region_parents`). One `on=` target named by fields on *different* subdomains
-# therefore needs one region list — and one pass — per subdomain: a face named
-# `boundary(axis=1, side=:upper)` on two subdomains is two different sets of
-# facets, and each subdomain's pass writes only rows its own fields own, so the
-# passes are independent and their order is immaterial.
-#
-# A space with no forms in the partition is dropped rather than emitted with
-# empty lists: an empty pass still contributes its region list's dof blocks to
-# the sparsity pattern (`_assembly_region_lists`), which would add structural
-# zeros for a subdomain that never integrates there.
-#
-# `Interface` partitions are two-sided and stay one pass with `space === nothing`
-# — their `InterfaceRegion` carries both sides' parents itself, and the four
-# blocks a `couple` call emits alternate test fields between the two subdomains,
-# so splitting them by test space would tear one coupling into two passes.
-function _partition_space(model::Model, on, blocks, loads)
-    on isa Interface && return [(nothing, blocks, loads)]
-    # Single-domain is the dominant path and has nothing to split: every test
-    # field is on the one representative space, so the partition passes through
-    # whole.
-    _is_multidomain(model.problem) || return [(model.problem.space, blocks, loads)]
-
-    form_space(form) = _field_space(model.problem, form.test_name)
-    # Untyped: `blocks` / `loads` arrive as `Vector`s here and as `()` from the
-    # pattern walk, and `filter` preserves each container type.
-    passes = Any[]
-    for space in problem_spaces(model.problem)
-        space_blocks = filter(b -> form_space(b) === space, blocks)
-        space_loads = filter(l -> form_space(l) === space, loads)
-        isempty(space_blocks) && isempty(space_loads) && continue
-        push!(passes, (space, space_blocks, space_loads))
-    end
-    return passes
-end
+# Partition `1:n` into `tasks` contiguous ranges of near-equal length.
+_even_ranges(n::Int, tasks::Int) = [(div((t-1)*n, tasks)+1):div(t*n, tasks) for t in 1:tasks]
 
 # ── Public assembly API ───────────────────────────────────────────────────────
 
@@ -1695,8 +1581,9 @@ tuple of them.
 
   - `symmetric` — assemble symmetrically when truthy. Defaults to
     "every block reports `form.symmetric == true`".
-  - `threaded` — drive assembly through `_assemble_system_threaded!`.
-    Default is true when `Threads.nthreads() > 1`.
+  - `threaded` — assemble with the threaded driver, whose result is
+    bit-identical to the serial one. Default is true when
+    `Threads.nthreads() > 1`.
   - `state` — pass a [`Solution`](@ref) or active coefficient vector
     to expose the current iterate to the forms as `q.state` (used to
     build Newton tangents).
@@ -1716,13 +1603,8 @@ function assemble_matrix(model::Model{D,T}, blocks; symmetric=nothing,
     block_tuple = _form_tuple(blocks)
     symmetric_value = symmetric === nothing ? all(block -> block.form.symmetric, block_tuple) :
                       Bool(symmetric)
-    nactive = active_unknowns(model.dofs)
-    coeffs = _state_vector(state, model)
-    pattern = _assembly_pattern!(model, block_tuple, symmetric_value)
-    sink = ScatterSink(zeros(T, length(pattern.rowval)), pattern)
-    _assemble_partitioned!(sink, model, block_tuple, (), nactive, symmetric_value, nothing, coeffs,
-                           threaded)
-    return _matrix_from_pattern(pattern, sink.nzval)
+    matrix, _ = _assemble(model, block_tuple, (), symmetric_value, threaded, state, nothing)
+    return _or_empty(matrix, model)
 end
 
 """
@@ -1750,12 +1632,8 @@ other.
 """
 function assemble_vector(model::Model{D,T}, loads; threaded::Bool=Threads.nthreads() > 1,
                          region_filter=nothing, state=nothing) where {D,T}
-    load_tuple = _form_tuple(loads)
-    nactive = active_unknowns(model.dofs)
-    coeffs = _state_vector(state, model)
-    _, rhs = _assemble_partitioned!(nothing, model, (), load_tuple, nactive, false, region_filter,
-                                    coeffs, threaded)
-    return rhs
+    _, rhs = _assemble(model, (), _form_tuple(loads), false, threaded, state, region_filter)
+    return rhs::Vector{T}
 end
 
 """
@@ -1776,12 +1654,9 @@ scatter.
 function assemble!(model::Model{D,T}; threaded::Bool=Threads.nthreads() > 1) where {D,T}
     nactive = active_unknowns(model.dofs)
     symmetric = model.problem.symmetric
-    pattern = _assembly_pattern!(model, model.problem.blocks, symmetric)
-    sink = ScatterSink(zeros(T, length(pattern.rowval)), pattern)
-    _, rhs = _assemble_partitioned!(sink, model, model.problem.blocks, model.problem.loads, nactive,
-                                    symmetric, nothing, nothing, threaded)
-
-    matrix = _matrix_from_pattern(pattern, sink.nzval)
+    assembled, rhs = _assemble(model, model.problem.blocks, model.problem.loads, symmetric,
+                               threaded, nothing, nothing)
+    matrix = _or_empty(assembled, model)
     # Symmetric forms are assembled lower-triangular and mirrored as
     # `matrix + matrix' - diag(matrix)` in `_matrix_from_pattern`. IEEE
     # addition is commutative, so the result is symmetric to the bit
@@ -1800,128 +1675,70 @@ function assemble!(model::Model{D,T}; threaded::Bool=Threads.nthreads() > 1) whe
     return model
 end
 
-# Partition `blocks` and `loads` by their `on` tag, run one assembly
-# pass per non-empty partition, scattering matrix entries into the shared
-# `sink` and accumulating rhs entries into the shared rhs. Volume
-# contributions (`on === nothing`) walk the model's `integration_plan`;
-# facet / surface contributions (`on::BoundarySelector` /
-# `on::BoundaryMesh`) walk the cached region list for that selector.
-function _assemble_partitioned!(sink, model::Model{D,T}, blocks, loads, nactive::Int,
-                                symmetric::Bool, region_filter, state_coefficients,
-                                threaded::Bool) where {D,T}
-    volume_blocks, volume_loads, partitions = _partition_forms_by_on(blocks, loads)
-    rhs = zeros(T, nactive)
-
-    # Volume contributions — the dominant path. One pass per distinct subdomain
-    # integration plan; each region is owned by the fields on its subdomain
-    # intrinsically (`region_parents`), so single-domain collapses to one pass
-    # over the shared plan with every field participating.
-    if !isempty(volume_blocks) || !isempty(volume_loads)
-        for regions in _volume_passes(model)
-            _run_pass!(sink, rhs, model, regions, symmetric, Tuple(volume_blocks),
-                       Tuple(volume_loads), region_filter, state_coefficients, threaded)
-        end
-    end
-
-    # Non-volume contributions — one assembly pass per unique `on=` value *per
-    # subdomain space naming it* (`_partition_space`), so a target named by two
-    # subdomains contributes on both instead of only the first. `region_filter`
-    # is a volume-only convenience and is not forwarded to the facet / surface
-    # passes.
-    for (on, (on_blocks, on_loads)) in partitions,
-        (space, sel_blocks, sel_loads) in _partition_space(model, on, on_blocks, on_loads)
-
-        regions = _resolve_on_regions(model, on, space)
-        isempty(regions) && continue
-        # Every pass — volume, facet, surface, and two-sided interface — runs
-        # threaded. One unexplained observation stands against that: a two-sided
-        # `InterfaceRegion` pass for a vector coupling, under `--code-coverage`
-        # at ≥2 threads, was nondeterministically corrupted on both x86 and ARM.
-        # Never seen outside coverage, not reproduced since across ~30,000
-        # bit-exact comparisons, mechanism not established (see the `couple`
-        # docstring); the parallel path ships and `threaded=false` is the
-        # escape hatch.
-        _run_pass!(sink, rhs, model, regions, symmetric, Tuple(sel_blocks), Tuple(sel_loads),
-                   nothing, state_coefficients, threaded)
-    end
-
-    return sink, rhs
+# A call's matrix, or the empty `n × n` matrix when no pass carried a block
+# (every block's target resolved to no region, or there was no block at all).
+function _or_empty(matrix, model::Model{D,T}) where {D,T}
+    n = active_unknowns(model.dofs)
+    return (matrix === nothing ? spzeros(T, n, n) : matrix)::SparseMatrixCSC{T,Int}
 end
 
-# Drive one assembly pass over a single region list (serial or threaded
-# based on `threaded`), scattering matrix entries into the shared `sink`
-# and accumulating rhs contributions into the shared `rhs`. Used by
-# `_assemble_partitioned!` for both the volume pass and every facet /
-# surface partition.
-function _run_pass!(sink, rhs, model, regions, symmetric, blocks, loads, region_filter,
-                    state_coefficients, threaded::Bool)
-    if threaded
-        _assemble_system_threaded!(sink, rhs, model, regions, symmetric, blocks, loads,
-                                   region_filter, state_coefficients)
-    else
-        _assemble_system_serial!(sink, rhs, model, regions, symmetric, blocks, loads, region_filter,
-                                 state_coefficients)
-    end
-    return nothing
-end
-
-# Resolve a non-`nothing` `on=` value **on a named subdomain space** to its
-# region list. Reads from the per-kind cache on `model` when the entry exists
-# (every (target, space) site referenced by `prepare(problem)` is pre-resolved);
-# falls back to a fresh build against `space` for one-shot calls like
-# `assemble_matrix(model, block_with_unseen_on=…)`. "Fresh" is per *selector*,
-# not per face: the miss path resolves through the model's `FacetResolver`, so an
-# unseen selector built from faces `prepare` already resolved reuses them, and a
-# genuinely new face is resolved once however many such calls name it.
+# The core every assembly entry point calls: assemble `blocks` and `loads` (form
+# tuples) on `model` and return `(matrix, rhs)`, the matrix `nothing` when no
+# pass carries a block. The rhs includes the Dirichlet lift of every block, so
+# the pair is consistent. `state` is `nothing`, a `Solution` or a coefficient
+# vector; `region_filter` applies to the volume passes only.
 #
-# `space` is half of the cache key, not merely a fallback for the miss path: a
-# hit is by construction a region list already built against that same space, so
-# a caller naming subdomain 2 can never be handed subdomain 1's facets. It
-# defaults to the representative space, which is the one space on a single-domain
-# model; field-agnostic callers on a coupled model (`boundary_integral`) resolve
-# the space themselves rather than take the default.
-function _resolve_on_regions(model::Model{D,T}, selector::BoundarySelector,
-                             space=model.problem.space) where {D,T}
-    return get(() -> _facet_regions_for_selector(space, selector, model.facet_resolver),
-               model.facet_regions, (selector, space))
-end
-
-function _resolve_on_regions(model::Model{D,T}, mesh::BoundaryMesh{D,T},
-                             space=model.problem.space) where {D,T}
-    return get(() -> _surface_regions_for_mesh(space, mesh, model.dofs.tolerance),
-               model.surface_regions, (mesh, space))
-end
-
-# Resolve the two-sided integration regions for an interface coupling tag from
-# the per-model cache (pre-resolved at `prepare` for every referenced
-# interface); build on demand for a one-shot `assemble_matrix(model, block;
-# on=iface)` with an unseen interface.
-function _resolve_on_regions(model::Model, iface::Interface, _space=nothing)
-    return get(() -> _interface_regions_for_model(model, iface), model.interface_regions, iface)
-end
-
-# The subdomain space a single-sided `on=` region lookup acts on. A named
-# `field` picks its space; without one, a single-domain model has exactly one
-# answer and a multi-domain model has none, so it raises rather than pick — see
-# the `boundary_integral` docstring for why neither silent default is
-# defensible. Ignored for two-sided `Interface` targets, which carry both sides.
-function _on_regions_space(model::Model, field::Union{Nothing,Symbol})
-    field === nothing || return _field_space(model.problem, field)
-    length(problem_spaces(model.problem)) == 1 && return model.problem.space
-    names = join((":" * String(f.name) for f in model.problem.fields), ", ")
-    throw(ArgumentError("field argument is required for multi-domain models; pass field=… " *
-                        "(one of $names)"))
-end
-
-# Resolve an interface tag's field indices and subdomain spaces from the model,
-# then build its regions. Field indices come from the dof layout (global field
-# order); spaces come from the effective problem's fields.
-function _interface_regions_for_model(model::Model, iface::Interface)
-    field_a = _field_index(model.dofs, iface.field_a)
-    field_b = _field_index(model.dofs, iface.field_b)
-    space_a = _field_space(model.problem, iface.field_a)
-    space_b = _field_space(model.problem, iface.field_b)
-    return _interface_regions(iface, space_a, space_b, field_a, field_b, model.dofs.tolerance)
+# Deliberately unspecialised, like the rest of the cold path: it compiles once
+# per process, not once per form tuple or problem type. Its handful of dynamic
+# calls cost a few microseconds per call, and the one that matters is the
+# dispatch per pass into `_serial!` or `_threaded!`, where specialisation on the
+# forms begins.
+#
+# The per-call scratch is checked out of the model's cache and returned in a
+# `finally`, so an error a callback raises still hands it back; every
+# per-region field of a workspace is reset before it is reused, and phase 2 only
+# reads arena slices phase 1 wrote in the same pass.
+function _assemble(@nospecialize(model::Model), @nospecialize(blocks::Tuple),
+                   @nospecialize(loads::Tuple), symmetric::Bool, threaded::Bool,
+                   @nospecialize(state), @nospecialize(region_filter))
+    coefficients = _state_vector(state, model)
+    passes = _passes(model, blocks, loads)
+    tasks = threaded ? Threads.nthreads() : 1
+    cache = model.assembly
+    workspaces, arena, rhs_arena = _checkout!(cache, model, tasks, threaded)
+    try
+        states = coefficients === nothing ? nothing :
+                 [FormState(model.dofs, coefficients) for _ in 1:tasks]
+        pattern = _assembly_pattern!(model, filter(pass -> !isempty(pass.blocks), passes),
+                                     symmetric, first(workspaces))
+        threaded && _dofs_all!(cache, passes, first(workspaces))
+        T = _scalar(model.dofs)
+        nz = pattern === nothing ? nothing : zeros(T, length(pattern.rowval))
+        rhs = zeros(T, active_unknowns(model.dofs))
+        for pass in passes
+            # `region_filter` is a volume-pass convenience (compactly supported
+            # sources); the facet, surface and interface passes ignore it.
+            filter_pass = pass.key[1] === nothing ? region_filter : nothing
+            if threaded
+                # Every pass — volume, facet, surface, and two-sided interface —
+                # runs threaded. One unexplained observation stands against that:
+                # a two-sided `InterfaceRegion` pass for a vector coupling, under
+                # `--code-coverage` at ≥2 threads, was nondeterministically
+                # corrupted on both x86 and ARM. Never seen outside coverage, not
+                # reproduced since across ~30,000 bit-exact comparisons, mechanism
+                # not established (see the `couple` docstring); the parallel path
+                # ships and `threaded=false` is the escape hatch.
+                _threaded!(nz, rhs, pattern, pass, workspaces, states, filter_pass, symmetric,
+                           arena, rhs_arena)
+            else
+                _serial!(nz, rhs, pattern, pass, first(workspaces),
+                         states === nothing ? nothing : first(states), filter_pass, symmetric)
+            end
+        end
+        return (pattern === nothing ? nothing : _matrix_from_pattern(pattern, nz)), rhs
+    finally
+        _checkin!(cache, workspaces, arena, rhs_arena)
+    end
 end
 
 """
@@ -1974,10 +1791,9 @@ which inherits its restriction) rejects a coupled model for that reason.
 """
 function nquadpoints(model::Model; kind::Symbol=:volume, on=nothing,
                      field::Union{Nothing,Symbol}=nothing)
-    on isa Interface && return interface_quadrature_count(model, on)
-    on === nothing || return sum(_region_qpoint_count,
-               _resolve_on_regions(model, on, _on_regions_space(model, field)); init=0)
-    kind === :volume && return sum(_quadrature_count(p) for p in integration_plans(model); init=0)
+    on === nothing || return _region_list(model, on, _target_space(model, on, field)).offsets[end]
+    kind === :volume && return sum(plan -> sum(_region_qpoint_count, plan.regions; init=0),
+               integration_plans(model); init=0)
     kind === :facet && return _cached_quadpoint_count(model.facet_regions)
     kind === :surface && return _cached_quadpoint_count(model.surface_regions)
     kind === :interface && return _cached_quadpoint_count(model.interface_regions)
@@ -2033,9 +1849,8 @@ function foreach_quadrature_point(f, model::Model{D,T}; state=nothing) where {D,
     # on the wrong parents). Per-point iteration across coupled subdomains — one
     # global quadrature-point ordering shared with assembly — is deferred.
     _assert_single_domain(model, "foreach_quadrature_point")
-    regions = integration_plan(model).regions
-    return _walk(f, _volume_payload, _assembly_workspace(model), regions,
-                 _region_qpoint_offsets(regions), _walk_state(state, model))
+    return _walk(f, _volume_payload, _assembly_workspace(model),
+                 _region_list(model, nothing, model.problem.space), _walk_state(state, model))
 end
 
 # The `q` payloads of the two walkers: the volume walker's `(x, weight, point,
@@ -2051,22 +1866,22 @@ function _walk_state(@nospecialize(state), @nospecialize(model::Model))
     return coefficients === nothing ? nothing : FormState(model.dofs, coefficients)
 end
 
-# Call `f(q)` at every quadrature point of `regions`, in the serial assembly
+# Call `f(q)` at every quadrature point of `list`, in the serial assembly
 # order, with the point's coordinates and weight computed exactly as the kernel
-# computes them and `q.point = offsets[r] + k` its numbering. With a state, each
+# computes them and `q.point = list.offsets[r] + k` its numbering. With a state, each
 # region's dof values are read once and every field is evaluated at every point
 # through the same `_frame!`, `_refresh!` and `_state_point!` the kernel uses;
 # without one, no basis is evaluated at all. Behind a function barrier on the
 # workspace, so the per-point calls are static.
-function _walk(f, payload, ws::AssemblyWorkspace, regions, offsets, state)
-    for (r, region) in enumerate(regions)
+function _walk(f, payload, ws::AssemblyWorkspace, list::RegionList, state)
+    for (r, region) in pairs(list.regions)
         state === nothing || _state_region!(state, _frame!(ws, region))
         jacobian = _region_jacobian(region)
         for k in 1:_region_qpoint_count(region)
             x, w, ref = _region_point(region, k, jacobian)
             st = state === nothing ? nothing :
                  (_refresh!(ws, region, ref, Val(true)); _state_point!(state, ws, Val(true)))
-            f(payload(region, k, x, w, offsets[r] + k, st))
+            f(payload(region, k, x, w, list.offsets[r] + k, st))
         end
     end
     return nothing
@@ -2081,8 +1896,7 @@ history vector keyed by the `q.point` index that
 [`foreach_interface_quadrature_point`](@ref) and the coupling forms expose.
 """
 function interface_quadrature_count(model::Model, iface::Interface)
-    regions = _resolve_on_regions(model, iface)
-    return sum(_region_qpoint_count, regions; init=0)
+    return _region_list(model, iface, nothing).offsets[end]
 end
 
 """
@@ -2118,9 +1932,8 @@ iteration order matches the serial interface-assembly pass.
 """
 function foreach_interface_quadrature_point(f, model::Model{D,T}, iface::Interface;
                                             state=nothing) where {D,T}
-    regions = _resolve_on_regions(model, iface)
     # The frame and the refresh cover *both* sides' parents, so the state
     # evaluates each coupled field in its own subdomain's cut cell.
-    return _walk(f, _interface_payload, _assembly_workspace(model), regions,
-                 _region_qpoint_offsets(regions), _walk_state(state, model))
+    return _walk(f, _interface_payload, _assembly_workspace(model),
+                 _region_list(model, iface, nothing), _walk_state(state, model))
 end

@@ -637,9 +637,9 @@ features evolve.
     predicate `(cell_box, cell_index) -> Bool`.
   - **Mutation**: `activate!(model; level, cells)` and
     `deactivate!(model; level, cells)`. The mutators follow the `move!`
-    invalidation contract: bump `model.version`, clear `model.matrix`,
-    `model.rhs` and the cached assembly `pattern`, drop the Dirichlet
-    projection cache, rebuild the integration plan, dof layout and the
+    invalidation contract: bump `model.version`, clear `model.matrix` and
+    `model.rhs`, replace the assembly cache (`model.assembly`), drop the
+    Dirichlet projection cache, rebuild the integration plan, dof layout and the
     facet / surface / interface region caches, and refresh diagnostics.
     An outstanding `Solution` raises on stale reuse. Like `move!`, they
     address a level by position in the model's single space and
@@ -1271,13 +1271,21 @@ Rules:
 
   - Parallelize over independent integration regions, elements, or
     batches.
-  - The threaded matrix assembly is a deferred compute→gather: phase 1
+  - The threaded assembly is a deferred compute→gather: phase 1
     computes each region's local block and rhs into its OWN disjoint
     arena slice (no shared writes, dynamically load-balanced); phase 2
-    sums the arena into the sparse operator by a disjoint column
-    partition and into the rhs by a disjoint dof partition. Both phases
-    are barrier-free and lock-free, and the symbolic gather layout is
-    cached on the pattern so repeated assembly pays for it once.
+    gives each task a contiguous range of dofs, walks every region in
+    list order, and adds the region's entries in its owned rows and
+    columns through the column kernel the serial scatter uses. Both
+    phases are barrier-free and lock-free. There is no gather plan: the
+    arena layout is a closed form of each region's dof count, and the
+    only symbolic input, each region's sorted dof list, is cached on the
+    model with the pattern, so repeated assembly pays for it once.
+  - The model's assembly cache is locked, and every call checks out its
+    own scratch (workspaces, arena), so several tasks may assemble on one
+    `Model` at the same time, serial or threaded. The lock is taken a
+    fixed handful of times per call, never in the quadrature loop or the
+    scatter.
   - Do not push into a shared vector from multiple threads without a
     disjoint-output partition or explicit synchronization; prefer arena
     slices reduced by a fixed-order gather over thread-local accumulators

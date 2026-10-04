@@ -5,7 +5,7 @@
 #   * `Interface` — the `on=` tag that names the two coupled fields and the
 #     interface geometry (a user-supplied `BoundaryMesh`). It sits beside
 #     `BoundarySelector` and `BoundaryMesh` as a third `BlockForm.on` kind and
-#     is grouped into its own assembly pass by `_partition_forms_by_on`.
+#     is grouped into its own assembly pass by `_passes`.
 #   * `InterfaceRegion` — a two-sided integration region: shared physical
 #     quadrature points / weights / per-point normals (like `SurfaceRegion`),
 #     plus a *separate* covering-parent list per side, so field `a` is

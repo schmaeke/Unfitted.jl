@@ -193,9 +193,11 @@ end
     # once per parent per quadrature point, and an abstract bank turns the read
     # into a dynamic dispatch that boxes the basis call's arguments, so a
     # homogeneous space has to give the bank a concrete eltype. Measured on this
-    # fixture, a per-region dof table took the count from 345 at 4² cells to
-    # 3 659 at 16², and a boxed basis call from 1 724 to 26 510; the kernel that
-    # allocates nothing grows by at most a handful.
+    # fixture, the per-region dof tables of the earlier kernel took `assemble!`
+    # from 1 005 allocations at 8² cells to 3 779 at 16², and `assemble_matrix`
+    # from 332 at 4² to 3 775 at 16²; on the mixed-family fixture below, a boxed
+    # basis call grew the count from 1 724 at 4² to 26 510 at 16². The kernel
+    # that allocates nothing grows by at most a handful.
     #
     # `assemble!` is compared between 8² and 16², because below 256 unknowns it
     # also computes the condition estimate, whose allocations would hide growth
@@ -235,7 +237,7 @@ end
     @test nnz(lower) == length(vals)  # `sparse` kept the explicit zeros
 
     reference = dropzeros!(lower + lower' - spdiagm(0 => diag(lower)))
-    pattern = Unfitted.AssemblyPattern(n, lower.colptr, lower.rowval, true, hash(:mirror_test))
+    pattern = Unfitted.AssemblyPattern(n, lower.colptr, lower.rowval, true)
     mirrored = Unfitted._matrix_from_pattern(pattern, copy(lower.nzval))
 
     @test mirrored.colptr == reference.colptr
@@ -264,16 +266,16 @@ end
     @test threaded_model.rhs == serial_model.rhs
     @test diagnostics(threaded_model).symmetry_residual ≈ 0.0 atol = 1.0e-13
 
-    # A second threaded assembly reuses the cached gather plan and must give
-    # the identical result (determinism + cache correctness).
+    # A second threaded assembly reuses the cached region dofs and pattern and
+    # must give the identical result (determinism + cache correctness).
     assemble!(reassembled; threaded=true)
     assemble!(reassembled; threaded=true)
     @test Matrix(reassembled.matrix) == Matrix(serial_model.matrix)
     @test reassembled.rhs == serial_model.rhs
 
-    # rhs-only threaded pass (the `nothing` matrix sink): assemble_vector
-    # defers each region's rhs to an arena and gathers it by dof in serial
-    # order, so it too is bit-identical to the serial walk.
+    # rhs-only threaded pass: assemble_vector defers each region's rhs to an
+    # arena and gathers it by dof in serial order, so it too is bit-identical
+    # to the serial walk.
     load = loadform(field(:u, V),
                     WeakForm(bilinear=(q, trial) -> 0.0, linear=q -> 1.0, symmetric=false))
     @test assemble_vector(serial_model, load; threaded=true) ==
@@ -994,8 +996,14 @@ end
         # The component-unaware form leaves cross-component blocks in the
         # dense-block pattern but numerically zero; dropzeros! must remove
         # them, so the lower-triangle pattern is strictly larger than the
-        # final lower-triangle nnz (proves the superset→drop pipeline).
-        @test length(model.pattern.rowval) > nnz(tril(model.matrix))
+        # final lower-triangle nnz (proves the superset→drop pipeline), and the
+        # matrix stores no entry coupling the two components.
+        @test length(only(model.assembly.patterns).second.rowval) > nnz(tril(model.matrix))
+        layout = Unfitted._field_layout(model.dofs, :u)
+        ids(c) = filter(!iszero, layout.dofs.active_component[:, c]) .+ layout.offset
+        @test !isempty(ids(1)) && !isempty(ids(2))
+        @test nnz(model.matrix[ids(1), ids(2)]) == 0
+        @test nnz(model.matrix[ids(2), ids(1)]) == 0
     end
 
     # Multi-field symmetric coupling block(c, u).
@@ -1105,6 +1113,14 @@ end
         @test model.matrix == A
         @test model.rhs == b
     end
+
+    # The unsymmetric branch of the condensation folds every row and column in
+    # full, and its threaded arena stores whole columns. On this symmetric
+    # operator it must reproduce the symmetric branch up to summation order, and
+    # threaded must still equal serial to the bit.
+    unsymmetric = assemble_matrix(model, stiffness_block(u); symmetric=false, threaded=false)
+    @test unsymmetric ≈ A rtol = 1.0e-14
+    @test assemble_matrix(model, stiffness_block(u); symmetric=false, threaded=true) == unsymmetric
 
     # Anchors that do not depend on how the code expands a pivot. The lift check
     # below compares assembly against the state reconstruction, and both read a
@@ -1238,9 +1254,7 @@ end
 # One task per operator index; each task assembles `rounds` operators, cycling
 # through the list from a staggered start, so at any moment the concurrent calls
 # ask for different operators, and therefore for different cached sparsity
-# patterns. Returns `(operator index, matrix)` pairs. Only `threaded=false` is
-# pinned so far: the threaded variant is not yet safe, because concurrent
-# threaded calls race on the gather arenas pooled on the model.
+# patterns. Returns `(operator index, matrix)` pairs.
 function _concurrent_assembly(model, operators; threaded::Bool, rounds::Int=8)
     tasks = map(eachindex(operators)) do k
         return Threads.@spawn [let i = mod1(k + r, length(operators))
@@ -1270,4 +1284,144 @@ end
     results = _concurrent_assembly(model, operators; threaded=false)
     @test length(results) == 8 * length(operators)
     @test all(A == reference[i] for (i, A) in results)
+end
+
+@testset "concurrent threaded assembly on one model matches sequential assembly" begin
+    # The threaded variant of the test above. Each threaded call parks its
+    # regions' local systems in an arena before summing them, and that scratch
+    # is pooled on the model between calls, so two calls running at once must
+    # never be handed the same arena or the same workspace. The earlier
+    # assembler pooled its arenas without handing them out one call at a time,
+    # and one call's regions then overwrote another's slices between its two
+    # phases: under this schedule 6–8 of 128 matrices came out wrong at 6
+    # threads, and 16 of 128 at 1 thread, where the tasks interleave at every
+    # `@sync`.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2)
+    V = overlay(V, box((0.2, 0.25), (0.8, 0.75)); cells=(2, 2), order=3)
+    u = field(:u, V)
+    robin = block(u, u, mass_form(coefficient=4.0); on=boundary(axis=1, side=:upper))
+    model = prepare(Problem((u,); blocks=(stiffness_block(u), robin),
+                            dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower))]))
+    operators = ((mass_block(u),), (stiffness_block(u),), (stiffness_block(u), robin), (robin,))
+    reference = [assemble_matrix(model, operator; threaded=false) for operator in operators]
+
+    results = _concurrent_assembly(model, operators; threaded=true, rounds=32)
+    @test length(results) == 32 * length(operators)
+    @test count(((i, A),) -> A != reference[i], results) == 0
+end
+
+# ── Assembly cache ────────────────────────────────────────────────────────────
+
+@testset "threaded one-shot on= assembly survives garbage collection" begin
+    # A block whose `on=` target the problem never names has no prepared region
+    # list; the first call resolves one. Whatever a threaded call derives from
+    # that list and keeps — its regions' dofs, the arena layout, the pattern —
+    # must stay attached to that list and to nothing else. Keyed by the list's
+    # `objectid`, as it once was, it was not: a list dropped after its call and
+    # collected left its address free, a later call's list could be allocated
+    # there, and that list was then assembled with the other target's layout.
+    # Here 10–12 of 200 matrices came out wrong that way, at 1 thread as at 6.
+    #
+    # Between calls the loop collects the young generation and allocates a
+    # varying number of small arrays, as any program does between two
+    # assemblies; the varying offset is what lands a fresh list on a dead
+    # list's address.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(6, 6), order=2)
+    u = field(:u, V)
+    model = prepare(Problem((u,); blocks=(stiffness_block(u),),
+                            dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower))]))
+    lo = block(u, u, mass_form(coefficient=1.0); on=boundary(axis=2, side=:lower))
+    hi = block(u, u, mass_form(coefficient=3.0); on=boundary(axis=2, side=:upper))
+    reference = assemble_matrix(model, (lo, hi); threaded=false)
+    @test nnz(reference) > 0
+
+    wrong = 0
+    for call in 1:200
+        GC.gc(false)
+        ballast = [Int[] for _ in 1:mod(97*call, 257)]
+        wrong += assemble_matrix(model, (lo, hi); threaded=true) != reference
+        empty!(ballast)
+    end
+    @test wrong == 0
+end
+
+@testset "the assembly cache stays bounded" begin
+    # Region lists of targets `prepare` resolved are kept for the model's
+    # lifetime. Those of targets it never saw, and the sparsity patterns, are
+    # kept in small most-recently-used caches (8 lists, 4 patterns), so a loop
+    # over ever new one-shot targets cannot grow the model without bound, and a
+    # one-shot entry falling out never takes a prepared list with it.
+    V = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(2, 2, 2), order=1)
+    u = field(:u, V)
+    prepared = boundary(axis=1, side=:lower)
+    model = prepare(Problem((u,); blocks=(stiffness_block(u),),
+                            loads=(neumann(u, 1.0; on=prepared),),
+                            dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:upper))]))
+    assemble!(model)
+    space_ = model.problem.space
+    @test haskey(model.assembly.lists, (nothing, space_))
+    @test haskey(model.assembly.lists, (prepared, space_))
+
+    # 20 distinct selectors, none of them named by the problem: the 12 edges and
+    # the 8 corners of the cube.
+    side(axis, upper) = (axis=axis, side=upper ? :upper : :lower)
+    edges = [boundary(side(a, s), side(b, t)) for (a, b) in ((1, 2), (1, 3), (2, 3))
+             for s in (false, true) for t in (false, true)]
+    corners = [boundary(side(1, s), side(2, t), side(3, r)) for s in (false, true)
+               for t in (false, true) for r in (false, true)]
+    selectors = vcat(edges, corners)
+    @test length(unique(selectors)) == 20
+    @test !any(s -> isequal(s, prepared), selectors)
+
+    form = mass_form(coefficient=2.0)
+    for selector in selectors
+        A = assemble_matrix(model, block(u, u, form; on=selector); threaded=true)
+        @test A == assemble_matrix(model, block(u, u, form; on=selector); threaded=false)
+        b = assemble_vector(model, neumann(u, 1.0; on=selector); threaded=true)
+        @test b == assemble_vector(model, neumann(u, 1.0; on=selector); threaded=false)
+    end
+    @test length(model.assembly.oneshot) <= 8
+    @test length(model.assembly.patterns) <= 4
+    @test length(model.assembly.lists) == 2
+    @test haskey(model.assembly.lists, (nothing, space_))
+    @test haskey(model.assembly.lists, (prepared, space_))
+
+    # Every entry still assembles what it did before: the problem's own system,
+    # whose pattern the loop above evicted, is rebuilt bit for bit.
+    A, b = copy(model.matrix), copy(model.rhs)
+    assemble!(model)
+    @test model.matrix == A
+    @test model.rhs == b
+end
+
+@testset "an L2 transfer keeps the target's own sparsity pattern" begin
+    # The default L² transfer assembles the target mass through the target's
+    # own assembly cache. It must add its pattern beside the problem's rather
+    # than replace it, so the next solve on the target rebuilds nothing; on a
+    # symmetric volume-only problem the two are one and the same pattern.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    source = prepare(poisson(space(omega; cells=(3, 3), order=2); source=1.0,
+                             dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    solution = solve!(source)
+
+    # A Robin face makes the problem's matrix passes differ from the mass's.
+    V = space(omega; cells=(4, 4), order=2)
+    u = field(:u, V)
+    robin = block(u, u, mass_form(coefficient=2.0); on=boundary(axis=1, side=:upper))
+    target = prepare(Problem((u,); blocks=(stiffness_block(u), robin),
+                             loads=(source_load(u; source=1.0),),
+                             dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower))]))
+    solve!(target)
+    own = only(target.assembly.patterns).second
+    transfer(solution, source, target)
+    @test length(target.assembly.patterns) == 2
+    @test any(entry -> entry.second === own, target.assembly.patterns)
+    assemble!(target)
+    @test first(target.assembly.patterns).second === own
+
+    volume_only = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    solve!(volume_only)
+    own = only(volume_only.assembly.patterns).second
+    transfer(solution, source, volume_only)
+    @test only(volume_only.assembly.patterns).second === own
 end

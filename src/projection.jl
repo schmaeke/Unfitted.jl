@@ -403,18 +403,13 @@ function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_
     # which is the lift since there is no source load). Cached path: reuse
     # `backend.matrix` with a zero lift (homogeneous target, guarded above).
     if M === Nothing
-        mass_blocks = map(mass_block, target_model.problem.fields)
-        # Build the mass pattern WITHOUT clobbering `target_model.pattern`:
-        # that cache is keyed to the model's own problem, and a transfer must
-        # not evict it. `_assembly_region_lists` + `build_assembly_pattern`
-        # yield a fresh pattern; `_assembly_pattern!` would mutate the cache.
-        region_lists, key = _assembly_region_lists(target_model, mass_blocks)
-        pattern = build_assembly_pattern(target_model, region_lists, true, key)
-        sink = ScatterSink(zeros(T, length(pattern.rowval)), pattern)
-        threaded = Threads.nthreads() > 1
-        _, rhs = _assemble_partitioned!(sink, target_model, mass_blocks, (), nactive, true, nothing,
-                                        nothing, threaded)
-        mass = _matrix_from_pattern(pattern, sink.nzval)
+        # The mass pattern joins the target's pattern cache, which keeps the
+        # four most recently used ones, so the transfer evicts nothing the
+        # target's own problem uses; on a symmetric volume-only problem the
+        # problem's operator and the mass integrate over the same pass, and the
+        # two share one pattern.
+        mass, rhs = _assemble(target_model, map(mass_block, target_model.problem.fields), (), true,
+                              Threads.nthreads() > 1, nothing, nothing)
     else
         mass = backend.matrix
         rhs = zeros(T, nactive)
