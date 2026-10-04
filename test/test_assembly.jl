@@ -1521,6 +1521,92 @@ end
     @test issorted(width[dofs.order]; rev=true)
     @test all(k -> width[dofs.order[k]] > width[dofs.order[k+1]] || dofs.order[k] < dofs.order[k+1],
               1:(length(width)-1))
+
+    # And phase 1 follows that order. A probe load records which task reached
+    # each quadrature point; region `r` owns the points `offsets[r] .+
+    # (1:npoints)`, so the records give the regions each task integrated, in the
+    # order it took them. Every region is integrated by exactly one task, and
+    # each task meets its regions in `dofs.order` order — at one thread, one task
+    # meets exactly `dofs.order`. Handed out in list order instead, a task meets
+    # its regions in list order, which disagrees here: region 1 is a corner,
+    # among the narrowest, and wider ones follow it.
+    list = model.assembly.lists[(nothing, model.problem.space)]
+    visits = Tuple{Task,Int}[]
+    guard = ReentrantLock()
+    record(q) = (lock(() -> push!(visits, (current_task(), q.point)), guard); 0.0)
+    assemble_vector(model, loadform(only(model.problem.fields), WeakForm(linear=record));
+                    threaded=true)
+    region_of(point) = searchsortedfirst(list.offsets, point) - 1
+    rank = invperm(dofs.order)
+    met = [unique(region_of(point) for (task, point) in visits if task === t)
+           for t in unique(first.(visits))]
+    @test sort(reduce(vcat, met)) == eachindex(width)
+    @test all(regions -> issorted(rank[regions]), met)
+end
+
+@testset "threaded phase 2 split over several dof owners matches serial" begin
+    # Phase 2 hands each task a contiguous range of global dofs to own — balanced
+    # by pattern entries for a matrix pass (`_balanced_ranges`), even for an
+    # rhs-only one (`_even_ranges`) — and the task sums every region's entries
+    # in those rows and columns. It runs one task per `_GATHER_GRAIN` entries it
+    # gathers, at most one per thread, so on a small problem a single task owns
+    # every dof, and a partition that lost or repeated the dofs at a range
+    # boundary would leave every such test passing.
+    #
+    # First the partitions themselves, at any thread count: in order, they cover
+    # every dof or column exactly once, also when there are more tasks than
+    # columns and when columns store nothing.
+    for n in (0, 1, 5, 64), tasks in 1:7
+        ranges = Unfitted._even_ranges(n, tasks)
+        @test length(ranges) == tasks
+        @test reduce(vcat, ranges; init=Int[]) == 1:n
+    end
+    colptr = cumsum([1; [0, 3, 1, 0, 7, 2, 2, 9, 0, 4, 1, 6]])
+    for tasks in 1:14
+        ranges = Unfitted._balanced_ranges(colptr, tasks)
+        @test length(ranges) == tasks
+        @test reduce(vcat, ranges; init=Int[]) == 1:(length(colptr)-1)
+    end
+
+    # Then through the drivers: a two-level overlay large enough that even the
+    # rhs-only pass, which gathers the fewest entries (`Σ n` over its regions, a
+    # matrix pass `n(n+1)/2` or `n²` per region on top), is worth three owners.
+    # The suite's multi-thread run then splits phase 2 of every pass below over
+    # at least two owners. The size is asserted, so a larger grain fails here
+    # rather than quietly taking the test back to one owner. Each threaded call
+    # must reproduce serial's bits: a symmetric problem and an unsymmetric one,
+    # both with a Dirichlet lift, and a load with and without a region filter,
+    # whose rejected regions phase 2 must skip in every owner's range.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(28, 28), order=2)
+    V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(7, 7), order=3)
+    lift = dirichlet(x -> x[2] - x[1]; on=boundary(:all))
+    symmetric = prepare(poisson(V; source=x -> 1 + x[1] * x[2], dirichlet=[lift]))
+    u = field(:u, V)
+    # a(u, v) = ∫ (∂ₓu + y·u) v + 0.1 ∇u·∇v, unsymmetric through ∂ₓu v.
+    convect(q, trial) = TestChannels(trial.gradient[1] + q.x[2] * trial.value, 0.1 * trial.gradient)
+    convection = WeakForm(bilinear=convect, linear=q -> 1 + q.x[1], symmetric=false)
+    unsymmetric = prepare(Problem((u,); blocks=(block(u, u, convection),),
+                                  loads=(loadform(u, convection),), dirichlet=[lift]))
+    @test !unsymmetric.problem.symmetric
+    for model in (symmetric, unsymmetric)
+        assemble!(model; threaded=false)
+        A, b = copy(model.matrix), copy(model.rhs)
+        assemble!(model; threaded=true)
+        @test model.matrix.colptr == A.colptr
+        @test model.matrix.rowval == A.rowval
+        @test model.matrix.nzval == A.nzval
+        @test model.rhs == b
+    end
+    width = diff(symmetric.assembly.lists[(nothing, symmetric.problem.space)].dofs.ptr)
+    @test cld(sum(width), Unfitted._GATHER_GRAIN) ≥ 3
+
+    load = source_load(only(symmetric.problem.fields); source=x -> 1 + x[1] * x[2])
+    left = region -> region.box.upper[1] <= 0.5 + 1.0e-12
+    full = assemble_vector(symmetric, load; threaded=false)
+    part = assemble_vector(symmetric, load; region_filter=left, threaded=false)
+    @test part != full
+    @test assemble_vector(symmetric, load; threaded=true) == full
+    @test assemble_vector(symmetric, load; region_filter=left, threaded=true) == part
 end
 
 @testset "an L2 transfer keeps the target's own sparsity pattern" begin
