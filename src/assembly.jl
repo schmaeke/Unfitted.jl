@@ -325,12 +325,13 @@ function _dofs!(list::RegionList, ws)
     ptr = Vector{Int}(undef, length(list.regions) + 1)
     ptr[1] = 1
     val = Int[]
+    width = Vector{Int}(undef, length(list.regions))
     for (r, region) in pairs(list.regions)
-        _slots!(_frame!(ws, region))
+        width[r] = _slots!(_frame!(ws, region)) + length(ws.pivots)
         append!(val, ws.dofs)
         ptr[r+1] = length(val) + 1
     end
-    return list.dofs = RegionDofs(ptr, val)
+    return list.dofs = RegionDofs(ptr, val, sortperm(width; rev=true))
 end
 
 # The region dofs of every pass of a threaded call, whose arena layout is read
@@ -644,6 +645,25 @@ function _assembly_workspace(@nospecialize(model::Model))
     return AssemblyWorkspace(model.dofs, problem_spaces(model.problem))
 end
 
+# A workspace for one more task of the same model: `ws`'s layout and read-only
+# basis metadata — the families, mode tables and orders, which are the level's
+# own objects in every workspace anyway and which no task writes — and fresh
+# scratch of the same sizes. A threaded call needs a workspace per task, and
+# building each from the spaces re-derives that metadata through `BasisBank`'s
+# type-unstable walk over the levels: 3.5–8 KB and about 4 µs a workspace on the
+# gate's problems, which at 16 tasks was the largest single share of a small
+# cold call's extra allocation. A sibling allocates only its basis value,
+# gradient and 1D-factor buffers, plus the empty frame vectors: 2.6 KB against
+# 6.4 KB on an order-3 square grid.
+function _sibling(ws::AssemblyWorkspace{D,T,B}) where {D,T,B}
+    bank = ws.bank
+    scratch = BasisBank{D,T,B}(bank.bases, bank.modes, bank.orders, map(similar, bank.values),
+                               map(similar, bank.gradients), map(t -> map(similar, t), bank.val1d),
+                               map(t -> map(similar, t), bank.der1d))
+    return AssemblyWorkspace(ws.layout, scratch, empty(ws.parents), zero(ws.fptr), empty(ws.slots),
+                             empty(ws.dofs), empty(ws.pivots), empty(ws.K), empty(ws.b))
+end
+
 # Take one call's scratch out of the model's cache: `tasks` workspaces, idle ones
 # first and fresh ones for the rest, and for a threaded call the pooled arena
 # pair, leaving empty arenas behind so that a concurrent call allocates its own.
@@ -662,19 +682,18 @@ function _checkout!(@nospecialize(cache::AssemblyCache), @nospecialize(model::Mo
         end
         (taken, threaded ? pooled : nothing, threaded ? pooled_rhs : nothing)
     end
-    layout, spaces = model.dofs, problem_spaces(model.problem)
-    head = isempty(idle) ? AssemblyWorkspace(layout, spaces) : idle[1]
-    return _fill_checkout(head, idle, tasks, layout, spaces), arena, rhs_arena
+    head = isempty(idle) ? _assembly_workspace(model) : idle[1]
+    return _fill_checkout(head, idle, tasks), arena, rhs_arena
 end
 
 # Function barrier of `_checkout!`: `head` and then the other idle workspaces,
-# topped up with fresh ones to `tasks`, in a vector of `head`'s concrete type, so
-# the drivers index it without dispatch.
-function _fill_checkout(head::W, idle::Vector{Any}, tasks::Int, layout, spaces) where {W}
+# topped up with siblings of `head` to `tasks`, in a vector of `head`'s concrete
+# type, so the drivers index it without dispatch.
+function _fill_checkout(head::W, idle::Vector{Any}, tasks::Int) where {W}
     workspaces = Vector{W}(undef, tasks)
     workspaces[1] = head
     for t in 2:tasks
-        workspaces[t] = t <= length(idle) ? idle[t]::W : AssemblyWorkspace(layout, spaces)::W
+        workspaces[t] = t <= length(idle) ? idle[t]::W : _sibling(head)
     end
     return workspaces
 end
@@ -683,12 +702,14 @@ end
 # `Threads.nthreads()` idle ones, and the larger of the returned and the resident
 # arena pair, so the pool holds the maximum over calls, never their sum. Every
 # per-region field of a workspace is reset before it is used again, so scratch
-# returned from a call a callback error aborted is as good as any.
+# returned from a call a callback error aborted is as good as any. By index
+# rather than by iteration: `workspaces` is not inferred here, and each
+# iteration state would be boxed.
 function _checkin!(@nospecialize(cache::AssemblyCache), @nospecialize(workspaces),
                    @nospecialize(arena), @nospecialize(rhs_arena))
     Base.@lock cache.lock begin
-        for ws in workspaces
-            length(cache.workspaces) < Threads.nthreads() && push!(cache.workspaces, ws)
+        for t in 1:min(length(workspaces), Threads.nthreads()-length(cache.workspaces))
+            push!(cache.workspaces, workspaces[t])
         end
         if arena !== nothing
             length(arena) > length(cache.arena) && (cache.arena = arena)
@@ -1392,9 +1413,9 @@ end
 # so neither needs a lock, an atomic accumulation, or a barrier between regions:
 #
 #   Phase 1 — tasks take regions from an atomic counter (dynamic load balance),
-#     integrate each with the serial driver's own `_integrate!`, and copy its
-#     rhs and stored matrix columns into the region's own slice of a flat arena.
-#     No two regions share a slice.
+#     widest first, integrate each with the serial driver's own `_integrate!`,
+#     and copy its rhs and stored matrix columns into the region's own slice of
+#     a flat arena. No two regions share a slice.
 #   Phase 2 — each task owns a contiguous range of global dofs (balanced by
 #     pattern entries for a matrix pass, even for an rhs-only one) and walks
 #     every region in list order, adding the region's entries in its owned rows
@@ -1419,6 +1440,25 @@ end
 # task: nothing on 3D fixtures, 2.4 % of the wall time at 64 tasks on a 2D
 # order-2 overlay, and 14 % only for 65 000 order-1 regions at 64 tasks, where a
 # per-task region index would be the fix.
+#
+# Neither phase's task count enters the result, so each is sized to its work
+# rather than to the thread count. A task costs a spawn, about half a kilobyte,
+# and a phase-1 task a workspace as well, built by a cold call and pooled
+# afterwards; on the gate's smallest problems at 16 threads, one task per thread
+# in both phases of every pass came to three quarters of the serial call's
+# allocation, for tasks that had little or nothing to do. Phase 1 runs at most
+# one task per region, and a call checks out at most as many workspaces as its
+# largest pass has regions; otherwise phase 1 runs one task per thread,
+# because how long a region takes depends on the user's callbacks, which
+# nothing here can see. Phase 2 runs one task per `_GATHER_GRAIN` arena entries
+# it gathers, because there the work is exactly that: a merge per entry, and no
+# callback.
+
+# Phase-2 arena entries per task. Measured at 16 threads on a 16-core machine
+# against one task per thread: 1024 or 4096 took the threaded assembly of the
+# gate's small problems to 0.80–0.96× and left the large ones within 1 %;
+# 16384 was 5–8 % slower on mid-sized overlays.
+const _GATHER_GRAIN = 4096
 
 # Offset of local column `lc`'s first stored entry inside a region's packed
 # block, for a region with `n` local dofs: column `c` stores rows `c:n` under a
@@ -1470,7 +1510,8 @@ end
 end
 
 # Run one pass threaded, accumulating into `nz` (`nothing` without a matrix) and
-# `rhs`. `workspaces` and `states` hold one entry per task; `arena` and
+# `rhs`. `workspaces` and `states` hold one entry per task the call may run;
+# phase 1 of this pass uses as many as it has regions. `arena` and
 # `rhs_arena` are the call's checked-out scratch, which `_assemble` has already
 # sized for the call's largest pass (`_arenas`), so the growth check below never
 # fires there and only keeps this function correct on its own. Form-independent:
@@ -1495,8 +1536,8 @@ function _threaded!(nz, rhs, pattern, @nospecialize(pass::Pass), workspaces, sta
     done = fill(false, nregions)
     _phase1!(pass, workspaces, states, dofs, arena, rhs_arena, offsets, done, region_filter,
              symmetric)
-    tasks = length(workspaces)
-    owned = matrix ? _balanced_ranges(pattern.colptr, tasks) : _even_ranges(length(rhs), tasks)
+    owners = clamp(cld(offsets[end] - 1 + dofs.ptr[end] - 1, _GATHER_GRAIN), 1, Threads.nthreads())
+    owned = matrix ? _balanced_ranges(pattern.colptr, owners) : _even_ranges(length(rhs), owners)
     target = matrix ? nz : nothing
     @sync for range in owned
         Threads.@spawn _gather!(target, rhs, pattern, dofs, arena, rhs_arena, offsets, done, range,
@@ -1505,14 +1546,15 @@ function _threaded!(nz, rhs, pattern, @nospecialize(pass::Pass), workspaces, sta
     return nothing
 end
 
-# Phase 1 of one pass: one task per workspace, each running `_compute!` until the
-# shared region counter runs out. The only per-pass-type code of the threaded
-# path besides `_compute!`; an error a callback raises in a task arrives wrapped
+# Phase 1 of one pass: one task per workspace, but never more tasks than the
+# pass has regions, each running `_compute!` until the shared region counter
+# runs out. The only per-pass-type code of the threaded path besides
+# `_compute!`; an error a callback raises in a task arrives wrapped
 # (`TaskFailedException` inside a `CompositeException`), as from any `@sync`.
 function _phase1!(pass::Pass, workspaces, states, dofs::RegionDofs, arena, rhs_arena,
                   offsets::Vector{Int}, done::Vector{Bool}, region_filter, symmetric::Bool)
     next = Threads.Atomic{Int}(1)
-    @sync for t in eachindex(workspaces)
+    @sync for t in 1:min(length(workspaces), length(pass.list.regions))
         Threads.@spawn _compute!(workspaces[t], states === nothing ? nothing : states[t], pass,
                                  dofs, arena, rhs_arena, offsets, done, next, region_filter,
                                  symmetric)
@@ -1524,13 +1566,28 @@ end
 # driver's own `_integrate!`, check that its dofs are its cached ones, and copy
 # its rhs to `rhs_arena[dofs.ptr[r] …]` and each stored column `lc` to
 # `arena[offsets[r] + _packed(n, lc, symmetric) …]`.
+#
+# The counter walks `dofs.order`, the regions widest first, rather than the
+# list. Nothing a region computes depends on the order or on the task, so the
+# result does not change, but each task's first region is now the widest it
+# will see: its local system and frame buffers are allocated once, at that
+# size, and never grow again. Taken in list order, a task's buffers grew each
+# time it met a wider region than any before, and each growth overallocated
+# and left the outgrown buffer dead: on the gate's cold B-spline overlay at 16
+# tasks, about 23 KB a task for a local system that needs at most 11 KB
+# (37 × 37). Sizing every task for the widest region up front instead would
+# cost the problems whose widest region is rare — a 4D mesh with one interior
+# cell — a full-width system in every task. Widest first is roughly longest
+# first, the usual order for balancing a dynamic schedule; it measured neutral
+# in wall time.
 function _compute!(ws::AssemblyWorkspace, state, pass::Pass, dofs::RegionDofs, arena, rhs_arena,
                    offsets::Vector{Int}, done::Vector{Bool}, next::Threads.Atomic{Int},
                    region_filter, symmetric::Bool)
     regions = pass.list.regions
     while true
-        r = Threads.atomic_add!(next, 1)
-        r > length(regions) && return nothing
+        k = Threads.atomic_add!(next, 1)
+        k > length(regions) && return nothing
+        r = dofs.order[k]
         region = regions[r]
         region_filter === nothing || region_filter(region) || continue
         n = _integrate!(ws, pass, region, pass.list.offsets[r], state, symmetric)
@@ -1739,7 +1796,10 @@ function _assemble(@nospecialize(model::Model), @nospecialize(blocks::Tuple),
                    @nospecialize(state), @nospecialize(region_filter))
     coefficients = _state_vector(state, model)
     passes = _passes(model, blocks, loads)
-    tasks = threaded ? Threads.nthreads() : 1
+    # One task per thread, but no more than the largest pass has regions: a task
+    # with no region to take would cost a workspace and buy nothing.
+    tasks = threaded ?
+            min(Threads.nthreads(), maximum(pass -> length(pass.list.regions), passes; init=1)) : 1
     cache = model.assembly
     workspaces, arena, rhs_arena = _checkout!(cache, model, tasks, threaded)
     try

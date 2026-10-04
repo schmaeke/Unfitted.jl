@@ -1445,6 +1445,84 @@ end
     @test threaded - serial ≤ arena + (tasks - 1) * workspace + 16_384 * (tasks + 1)
 end
 
+@testset "a task's workspace shares the model's basis metadata" begin
+    # A threaded call needs one workspace per task. Every one but the first is a
+    # sibling of the first: it shares the families, mode tables and orders —
+    # the levels' own objects, which no task writes — and owns only its
+    # scratch. Built from the spaces instead, each re-derived that metadata,
+    # which on small problems at 16 threads was the largest single share of a
+    # cold call's extra allocation.
+    V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=3),
+                box((0.25, 0.25), (0.75, 0.75)); cells=(2, 2), order=4)
+    model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    head = Unfitted._assembly_workspace(model)
+    sibling = Unfitted._sibling(head)
+    @test typeof(sibling) === typeof(head)
+    @test sibling.layout === head.layout
+    @test sibling.bank.bases === head.bank.bases
+    @test sibling.bank.modes === head.bank.modes
+    @test sibling.bank.orders === head.bank.orders
+    shape(buffer) = buffer isa Tuple ? map(length, buffer) : length(buffer)
+    for (mine, theirs) in
+        ((sibling.bank.values, head.bank.values), (sibling.bank.gradients, head.bank.gradients),
+         (sibling.bank.val1d, head.bank.val1d), (sibling.bank.der1d, head.bank.der1d))
+        @test mine !== theirs
+        @test all(l -> mine[l] !== theirs[l] && shape(mine[l]) == shape(theirs[l]),
+                  eachindex(theirs))
+    end
+    @test sibling.K !== head.K && sibling.b !== head.b && sibling.fptr !== head.fptr
+    @test (@allocated Unfitted._sibling(head)) <
+          (@allocated Unfitted._assembly_workspace(model)) ÷ 2
+
+    # A cold threaded call builds one workspace and siblings of it for the
+    # other tasks, so every workspace it pools shares that one metadata.
+    assemble!(model; threaded=true)
+    pool = model.assembly.workspaces
+    @test !isempty(pool)
+    @test all(ws -> ws.bank.bases === first(pool).bank.bases, pool)
+end
+
+@testset "a threaded call runs no more tasks than its largest pass has regions" begin
+    # A task costs a workspace and a spawn whether or not there is a region left
+    # for it, so a call checks out at most as many workspaces as its largest
+    # pass has regions, and phase 1 spawns no more. A load on one side of a
+    # 2 × 2 grid is two facet regions: a fresh model keeps two workspaces after
+    # it, not one per thread.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2)
+    u = field(:u, V)
+    model = prepare(Problem((u,)))
+    load = neumann(u, x -> 1.0 + x[2]; on=boundary(axis=1, side=:lower))
+    b = assemble_vector(model, load; threaded=true)
+    @test length(model.assembly.workspaces) == min(Threads.nthreads(), 2)
+    @test b == assemble_vector(model, load; threaded=false)
+end
+
+@testset "threaded phase 1 takes regions widest first" begin
+    # Phase 1 hands out regions widest first (`RegionDofs.order`), so a task's
+    # first region is the widest it will see and its local system is allocated
+    # once, at that size, instead of regrowing each time a wider one comes. The
+    # order must not move a bit: a region's local system depends on the region
+    # alone and lands in its own arena slice. Dirichlet data on every face make
+    # the boundary regions narrower than the interior ones, so the order is not
+    # the list order; integrated Legendre has no pivots, so the local system
+    # order is the region's active dof count.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=3)
+    model = prepare(poisson(V; source=x -> 1 + x[1],
+                            dirichlet=[dirichlet(x -> x[2]; on=boundary(:all))]))
+    assemble!(model; threaded=false)
+    A, b = copy(model.matrix), copy(model.rhs)
+    assemble!(model; threaded=true)
+    @test model.matrix == A
+    @test model.rhs == b
+    dofs = model.assembly.lists[(nothing, model.problem.space)].dofs
+    width = diff(dofs.ptr)
+    @test sort(dofs.order) == eachindex(width)
+    @test dofs.order != eachindex(width)
+    @test issorted(width[dofs.order]; rev=true)
+    @test all(k -> width[dofs.order[k]] > width[dofs.order[k+1]] || dofs.order[k] < dofs.order[k+1],
+              1:(length(width)-1))
+end
+
 @testset "an L2 transfer keeps the target's own sparsity pattern" begin
     # The default L² transfer assembles the target mass through the target's
     # own assembly cache. It must add its pattern beside the problem's rather
