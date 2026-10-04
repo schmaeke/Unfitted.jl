@@ -1413,7 +1413,8 @@ end
 # evaluated by writer and reader alike, so nothing is planned or cached per
 # list: the region dofs (`RegionDofs`) are the whole symbolic input. The arena
 # holds `Σ n(n+1)/2` entries for a symmetric pass and `Σ n²` otherwise, whatever
-# the thread count, and is pooled on the model between calls. The cost of
+# the thread count; it is sized once per call for the call's largest pass, which
+# every pass then reuses, and pooled on the model between calls. The cost of
 # walking every region in every phase-2 task measured 1.5–2 ns per region per
 # task: nothing on 3D fixtures, 2.4 % of the wall time at 64 tasks on a 2D
 # order-2 overlay, and 14 % only for 65 000 order-1 regions at 64 tasks, where a
@@ -1427,6 +1428,39 @@ function _packed(n::Int, lc::Int, symmetric::Bool)
     return symmetric ? (lc - 1) * n - ((lc - 1) * (lc - 2)) ÷ 2 : (lc - 1) * n
 end
 
+# The arena pair of one threaded call, sized once for its largest pass: the
+# packed matrix arena holds `Σ _packed(n, n + 1, symmetric)` entries over the
+# regions of the largest matrix pass, the rhs arena `Σ n` over those of the
+# largest pass of any kind. Every pass's phase 1 then writes a prefix of each,
+# and phase 2 reads only what that pass's phase 1 wrote. A checked-out pair
+# already that large is reused; a shorter one is replaced rather than resized,
+# since nothing in it is read again and `resize!` would copy it.
+#
+# Sized here rather than grown pass by pass, because growth reallocated — and
+# copied — an arena at every pass larger than all before it, each time leaving
+# the outgrown buffer dead, and `resize!`'s overallocation could round the
+# buffer up past the final size. On a cold five-pass interface problem the dead
+# buffers came to more than the final arena (64 against 51 KB) and took the
+# threaded call at 6 threads to 1.63× the serial call's allocation; sized once,
+# it is 1.47×. Called from the unspecialised `_assemble`, after `_dofs_all!` has
+# derived every pass's dofs.
+function _arenas(@nospecialize(arena), @nospecialize(rhs_arena), passes::Vector{Any},
+                 symmetric::Bool)
+    packed = maximum(pass -> isempty(pass.blocks) ? 0 : _arena_length(pass.list.dofs, symmetric),
+                     passes; init=0)
+    entries = maximum(pass -> pass.list.dofs.ptr[end] - 1, passes; init=0)
+    return (length(arena) < packed ? similar(arena, packed) : arena,
+            length(rhs_arena) < entries ? similar(rhs_arena, entries) : rhs_arena)
+end
+
+# Packed arena length of a matrix pass over regions `dofs`. A function barrier:
+# `_arenas` reads the dofs off an untyped pass, and the per-region sum must not
+# dispatch.
+function _arena_length(dofs::RegionDofs, symmetric::Bool)
+    stored(r) = _packed(dofs.ptr[r+1] - dofs.ptr[r], dofs.ptr[r+1] - dofs.ptr[r] + 1, symmetric)
+    return sum(stored, 1:(length(dofs.ptr)-1); init=0)
+end
+
 # Raised by phase 1 when a region's freshly numbered dofs differ from its cached
 # `RegionDofs` slice: the threaded counterpart of `_pattern_miss`, which turns a
 # symbolic/numeric disagreement into an error instead of a corrupted arena.
@@ -1437,12 +1471,14 @@ end
 
 # Run one pass threaded, accumulating into `nz` (`nothing` without a matrix) and
 # `rhs`. `workspaces` and `states` hold one entry per task; `arena` and
-# `rhs_arena` are the call's checked-out scratch, grown here when a pass needs
-# more. Form-independent: `pass` is not specialised on, so this compiles once
-# per workspace and state type, and the one form-specialised step, `_phase1!`,
-# is reached by a single dynamic call. `done[r]` records the regions phase 1
-# integrated; a region `region_filter` rejected stays `false` and phase 2 skips
-# it, so a stale arena slice is never read.
+# `rhs_arena` are the call's checked-out scratch, which `_assemble` has already
+# sized for the call's largest pass (`_arenas`), so the growth check below never
+# fires there and only keeps this function correct on its own. Form-independent:
+# `pass` is not specialised on, so this compiles once per workspace and state
+# type, and the one form-specialised step, `_phase1!`, is reached by a single
+# dynamic call. `done[r]` records the regions phase 1 integrated; a region
+# `region_filter` rejected stays `false` and phase 2 skips it, so a stale arena
+# slice is never read.
 function _threaded!(nz, rhs, pattern, @nospecialize(pass::Pass), workspaces, states, region_filter,
                     symmetric::Bool, arena, rhs_arena)
     dofs = pass.list.dofs::RegionDofs
@@ -1711,7 +1747,10 @@ function _assemble(@nospecialize(model::Model), @nospecialize(blocks::Tuple),
                  [FormState(model.dofs, coefficients) for _ in 1:tasks]
         pattern = _assembly_pattern!(model, filter(pass -> !isempty(pass.blocks), passes),
                                      symmetric, first(workspaces))
-        threaded && _dofs_all!(cache, passes, first(workspaces))
+        if threaded
+            _dofs_all!(cache, passes, first(workspaces))
+            arena, rhs_arena = _arenas(arena, rhs_arena, passes, symmetric)
+        end
         T = _scalar(model.dofs)
         nz = pattern === nothing ? nothing : zeros(T, length(pattern.rowval))
         rhs = zeros(T, active_unknowns(model.dofs))

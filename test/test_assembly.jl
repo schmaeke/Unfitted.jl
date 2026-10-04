@@ -1394,6 +1394,57 @@ end
     @test model.rhs == b
 end
 
+# A fresh model of one order-3 field on `cells × cells` square cells, and three
+# mass blocks on facet targets of growing size — one side, three sides, the
+# whole boundary — so a call over them runs three matrix passes, each with more
+# regions than the one before.
+function _growing_facet_passes(cells::Int)
+    u = field(:u, space(box((0.0, 0.0), (1.0, 1.0)); cells=(cells, cells), order=3))
+    form = mass_form(coefficient=1.0)
+    blocks = (block(u, u, form; on=boundary(axis=1, side=:lower)),
+              block(u, u, form; on=boundary(:all; except=(axis=2, side=:upper))),
+              block(u, u, form; on=boundary(:all)))
+    return prepare(Problem((u,))), blocks
+end
+
+# Bytes allocated by the first `assemble_matrix` call on a fresh such model, and
+# the model, so the caller can read what the call left pooled on it.
+function _cold_matrix_bytes(cells::Int, threaded::Bool)
+    model, blocks = _growing_facet_passes(cells)
+    return (@allocated assemble_matrix(model, blocks; threaded)), model
+end
+
+@testset "a threaded call allocates one arena, sized for its largest pass" begin
+    # The threaded driver parks every region's local system in a packed arena
+    # before summing it (`Σ n(n+1)/2` entries on a symmetric pass), and every
+    # pass of a call writes a prefix of the same arena pair. Sizing that pair
+    # once, for the largest pass, before the first pass runs is what keeps a
+    # threaded call within one arena of the serial call. Grown pass by pass
+    # instead, the arena was reallocated at every pass larger than all before it,
+    # each outgrown buffer was dead allocation, and `resize!` rounded the last one
+    # up past the size it needed: on this fixture that waste came to 444 KB
+    # beside a 233 KB arena, at every thread count.
+    #
+    # The bound: a cold threaded call allocates at most what the cold serial call
+    # does, plus the arena pair it leaves pooled, plus per-task scratch — a
+    # workspace for every task but the first, and per task a few kilobytes for
+    # its buffers to grow to the region size and for its task objects. That last
+    # part measured 15 KB at 1 thread and 46 KB at 6; 16 KB per task plus 16 KB
+    # bounds it.
+    for threaded in (false, true)
+        _cold_matrix_bytes(2, threaded)                 # compile both drivers first
+    end
+    serial, _ = _cold_matrix_bytes(48, false)
+    threaded, model = _cold_matrix_bytes(48, true)
+    cache = model.assembly
+    arena = sizeof(cache.arena) + sizeof(cache.rhs_arena)
+    @test arena > 0
+    Unfitted._assembly_workspace(model)
+    workspace = @allocated Unfitted._assembly_workspace(model)
+    tasks = Threads.nthreads()
+    @test threaded - serial ≤ arena + (tasks - 1) * workspace + 16_384 * (tasks + 1)
+end
+
 @testset "an L2 transfer keeps the target's own sparsity pattern" begin
     # The default L² transfer assembles the target mass through the target's
     # own assembly cache. It must add its pattern beside the problem's rather
