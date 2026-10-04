@@ -81,7 +81,7 @@ global 1D function index via the `_AXIS_BSPLINE` tag.
     single-raw strong elimination for every function whose `(p_d + 1)`-cell
     support is not contained in the level's admissible region, and no linear
     constraint at all, so `has_linear_constraints` stays `false` and assembly
-    keeps its cheap single-target emission path. At an integer
+    has no pivot to look for or condense. At an integer
     `continuity = m < p_d − 1` it emits the homogeneous trace-vanishing
     [`LinearConstraint`](@ref)s (orders `k = 0 … m`) on every overlay / mask
     face. Masked levels of any geometry are eliminable either way.
@@ -761,10 +761,9 @@ end
 # the ones that do not survive are removed outright. Three consequences follow
 # from that and none of them is incidental:
 #
-#   * `has_linear_constraints` stays `false`, so assembly keeps the cheap
-#     single-target emission path instead of distributing every entry through a
-#     pivot expansion — measured at roughly 2× on the emission kernel even when
-#     every branch count is 1.
+#   * `has_linear_constraints` stays `false`, so assembly never searches a
+#     region for pivots and never condenses one: every slot is a plain active or
+#     constrained dof.
 #   * There are no pivots, so the reconstruction path cannot mis-read one. The
 #     defect that `dof_value` used to carry is unreachable here by construction
 #     rather than by repair.

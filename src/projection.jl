@@ -121,186 +121,75 @@ function _transfer_regions(source_model::Model{D,T}, target_model::Model{D,T};
     return regions
 end
 
-# ── Transfer workspace ───────────────────────────────────────────────────────
-
-"""
-    TransferWorkspace{D,T,BS,BT}
-
-Per-region scratch for the L² projection source-driven rhs pass. Mirrors
-[`AssemblyWorkspace`](@ref) but is value-only (no gradient banks):
-projection integrals contract basis values against basis values, never
-gradients.
-
-Source and target levels live in independent id ranges so the workspace
-carries one bank of per-level value buffers per side. The two basis banks
-are narrowed to their own eltypes `BS` / `BT` for the reason spelled out
-on [`AssemblyWorkspace`](@ref) — an abstract bank makes the per-parent,
-per-quadrature-point `_tensor_values!` call a dynamic dispatch — and they
-are independent because a transfer may cross basis families. Each region
-update writes into the side's `values[parent.level]` buffer; since
-`_parents_covering` returns at most one parent per level, the in-place
-update never collides within a region.
-
-The trailing `active_dofs` / `local_by_global` / `local_rhs` fields are
-the per-region rhs scatter scratch — resized and reset in place every
-region, never reallocated. The target mass matrix and its Dirichlet lift
-are built by the standard assembler (see [`L2Projection`](@ref)), so this
-workspace carries no local-matrix bank.
-"""
-struct TransferWorkspace{D,T,BS<:BasisFamily,BT<:BasisFamily}
-    source_bases::Vector{BS}
-    source_local_ids::Vector{Vector{CartesianIndex{D}}}
-    source_cell_locals::Vector{CellModes{D}}
-    source_orders::Vector{NTuple{D,Int}}
-    source_values::Vector{Vector{T}}
-    source_val1d::Vector{NTuple{D,Vector{T}}}
-    target_bases::Vector{BT}
-    target_local_ids::Vector{Vector{CartesianIndex{D}}}
-    target_cell_locals::Vector{CellModes{D}}
-    target_orders::Vector{NTuple{D,Int}}
-    target_values::Vector{Vector{T}}
-    target_val1d::Vector{NTuple{D,Vector{T}}}
-    active_dofs::Vector{Int}
-    local_by_global::Dict{Int,Int}
-    local_rhs::Vector{T}
-end
-
-# One bank of per-level value buffers per side. The allocation is shared
-# with the standard assembler through `_level_value_buffers` (defined in
-# assembly.jl); the transfer's value-only integrals reuse exactly the
-# `bases` / `local_ids` / `orders` / `values` / `val1d` banks and skip
-# the assembler's gradient banks.
-function _transfer_workspace(source_model::Model{D,T}, target_model::Model{D,T}) where {D,T}
-    s_bs, s_ids, s_loc, s_ord, s_val, s_v1 = _level_value_buffers(source_model.problem.space.levels,
-                                                                  Val(D), T)
-    t_bs, t_ids, t_loc, t_ord, t_val, t_v1 = _level_value_buffers(target_model.problem.space.levels,
-                                                                  Val(D), T)
-    return TransferWorkspace{D,T,eltype(s_bs),eltype(t_bs)}(s_bs, s_ids, s_loc, s_ord, s_val, s_v1,
-                                                            t_bs, t_ids, t_loc, t_ord, t_val, t_v1,
-                                                            Int[], Dict{Int,Int}(), T[])
-end
-
-# Slim per-parent record aliasing the workspace value buffer (no
-# allocation; the basis values for the parent's level live in
-# `values[parent.level]`). Same `NamedTuple` shape downstream consumers
-# (`_field_value`, `_local_parent_dofs!`) already expect. Pass the side's
-# `ws.target_values` or `ws.source_values` directly.
-function _transfer_data(layout::FieldLayout, parent::ParentRef, values::Vector{Vector{T}}) where {T}
-    lvl = parent.level
-    return (; level=lvl, raw_dofs=cell_dofs(layout.dofs, lvl, parent.cell), values=values[lvl])
-end
-
-# Refresh the workspace value buffers at one region-reference point
-# `eta`. Each parent's `values` buffer aliases the level slot
-# (`ws.{source,target}_values[parent.level]`); since
-# `_parents_covering` returns at most one parent per level on each
-# side, the in-place update never collides within a region.
-function _update_transfer_basis!(ws::TransferWorkspace{D,T}, region::TransferRegion{D,T},
-                                 eta::SVector{D,T}) where {D,T}
-    for p in region.target_parents
-        xi = reference_to_physical(p.local_box, eta)
-        ids = _parent_local_ids(ws.target_cell_locals, p.level, p.cell)
-        _tensor_values!(ws.target_bases[p.level], ws.target_values[p.level], ids,
-                        ws.target_orders[p.level], xi, ws.target_val1d[p.level], p.cell)
-    end
-    for p in region.source_parents
-        xi = reference_to_physical(p.local_box, eta)
-        ids = _parent_local_ids(ws.source_cell_locals, p.level, p.cell)
-        _tensor_values!(ws.source_bases[p.level], ws.source_values[p.level], ids,
-                        ws.source_orders[p.level], xi, ws.source_val1d[p.level], p.cell)
-    end
-    return nothing
-end
-
 # ── L² projection source-driven rhs ──────────────────────────────────────────
 
-# Build the per-parent target dof-table for one (transfer region, field),
-# resetting the workspace's `active_dofs` / `local_by_global`. The simple
-# `Matrix{Int}` table is used for layouts without non-trivial linear
-# constraints (the common case) and the `LocalDofExpansion` table
-# otherwise; the matching `_emit_load!` overload (in `assembly.jl`) fires
-# per quadrature point. Uses the same dof-table representations as the
-# standard assembler, so the local→global scatter of the transfer rhs
-# lands on exactly the active slots the standard mass assembly enumerates.
-function _transfer_local_dofs!(ws::TransferWorkspace, target_layout, target_data)
-    empty!(ws.active_dofs)
-    empty!(ws.local_by_global)
-    if target_layout.dofs.has_linear_constraints
-        return [_local_parent_dofs!(ws.active_dofs, ws.local_by_global, d, target_layout)
-                for d in target_data]
-    else
-        return [_local_parent_dofs_simple!(ws.active_dofs, ws.local_by_global, d, target_layout)
-                for d in target_data]
-    end
+# One side of a [`TransferRegion`](@ref) as the assembly kernel's helpers see a
+# region: its parent list. The target and the source sides each get one, so
+# `_frame!`, `_refresh!` and the state evaluation run on them unchanged, with
+# `region_parents` and `_parent_lists` taking their single-sided defaults.
+struct _TransferView{D,T}
+    parents::Vector{ParentRef{D,T}}
 end
 
-# Accumulate one transfer region's source-driven rhs contribution. The
-# target mass matrix `M_T` and its Dirichlet column-elimination lift
-# `−M_ac·c_c` are assembled separately by the standard assembler over the
-# target's own integration regions (see [`L2Projection`](@ref)), so this pass
-# integrates only the linear load
+# Accumulate the source-driven rhs of the L² transfer over the union partition
+# `regions`, onto `rhs`. The target mass matrix `M_T` and its Dirichlet
+# column-elimination lift `−M_ac·c_c` are assembled separately, by the standard
+# assembler over the target's own integration regions (see
+# [`L2Projection`](@ref)), so this pass integrates only the linear load
 #
 #     b_i += ∫_box u_S(x) · φ_iᵀ dx,
 #
-# where `u_S` is the source field reconstructed from its coefficients on
-# the region's source parents and `φᵀ` are the target traces. A region the
-# source does not cover contributes nothing (`u_S ≡ 0` there), so it is
-# skipped wholesale.
+# where `u_S` is the source field reconstructed from its coefficients on the
+# region's source parents and `φᵀ` are the target traces.
 #
-# Loop structure (mirrors the load half of `_accumulate_qpoint_generic!`
-# in `assembly.jl`):
-#
-#   1. Build per-parent records on both sides and the per-region target
-#      dof-table; resize / reset the local rhs.
-#   2. For each quadrature point: update basis values, then for each
-#      component reconstruct `u_S(x)` and emit it against every target test
-#      dof via `_emit_load!` (which fans the contribution through the dof
-#      table's active branches).
-#   3. Scatter the local rhs into the global rhs through `ws.active_dofs`.
-function _assemble_transfer_rhs_region!(ws::TransferWorkspace{D,T}, rhs::Vector{T},
-                                        source_coefficients, source_model::Model{D,T},
-                                        target_model::Model{D,T},
-                                        region::TransferRegion{D,T}) where {D,T}
-    isempty(region.source_parents) && return nothing
-    quadrature = region.quadrature
-    jacobian = volume(region.box) / convert(T, 2^D)
+# It runs on two assembly workspaces, because the two models' level ids
+# overlap and so cannot share a bank: the target one numbers the region's
+# target dofs (`_frame!` and `_slots!`, one table for every basis family) and
+# collects the local rhs, and the source one evaluates `u_S` as a `FormState`
+# over the source coefficients. Both refresh values only, since the integrand
+# never reads a gradient.
+function _transfer_rhs!(rhs, source_coefficients, source_model::Model, target_model::Model, regions)
+    target = _assembly_workspace(target_model)
+    source = _assembly_workspace(source_model)
+    state = FormState(source_model.dofs, _state_vector(source_coefficients, source_model))
+    return _transfer_rhs_regions!(rhs, target, source, state, regions)
+end
 
-    for target_layout in target_model.dofs.fields
-        source_layout = _field_layout(source_model.dofs, target_layout.name)
-        target_data = [_transfer_data(target_layout, p, ws.target_values)
-                       for p in region.target_parents]
-        source_data = [_transfer_data(source_layout, p, ws.source_values)
-                       for p in region.source_parents]
-
-        # Per-parent target dof-table (and `ws.active_dofs`) for this field.
-        local_by_parent = _transfer_local_dofs!(ws, target_layout, target_data)
-        n = length(ws.active_dofs)
-        resize!(ws.local_rhs, n)
-        fill!(ws.local_rhs, zero(T))
-
-        for (eta, weight) in zip(quadrature.points, quadrature.weights)
+# The region loop of `_transfer_rhs!`, behind a function barrier on the two
+# workspaces. Per region the source dof values are read once; per point and per
+# target field component, `u_S` of the same-named source field is emitted
+# against every target test function as a load, `(qweight·u_S)·φ`, accumulated
+# per row in point order. A pivot target is condensed onto its branches before
+# the local rhs is added to the global one. A region the source does not cover
+# contributes nothing (`u_S ≡ 0` there) and is skipped.
+function _transfer_rhs_regions!(rhs::Vector{T}, target::AssemblyWorkspace{D,T},
+                                source::AssemblyWorkspace, state::FormState, regions) where {D,T}
+    # Target field `f`'s component `c` reads the source field of the same name.
+    source_field = [_field_index(source.layout, fl.name) for fl in target.layout.fields]
+    for region in regions
+        isempty(region.source_parents) && continue
+        target_view = _TransferView(region.target_parents)
+        source_view = _TransferView(region.source_parents)
+        n = _slots!(_frame!(target, target_view))
+        m = n + length(target.pivots)
+        _state_region!(state, _frame!(source, source_view))
+        fill!(resize!(target.b, m), zero(T))
+        jacobian = volume(region.box) / convert(T, 2^D)
+        for (η, weight) in zip(region.quadrature.points, region.quadrature.weights)
             qweight = weight * jacobian
-            _update_transfer_basis!(ws, region, eta)
-            for component in 1:target_layout.components
-                # Reconstruct u_S(x) and integrate it against the target
-                # traces — a linear load.
-                source_value = _field_value(source_data, source_layout, source_coefficients,
-                                            component)
-                for (test_data, table) in zip(target_data, local_by_parent)
-                    for a in eachindex(test_data.raw_dofs)
-                        contribution = qweight * source_value * test_data.values[a]
-                        _emit_load!(ws.local_rhs, table, a, component, contribution)
-                    end
-                end
+            _refresh!(target, target_view, η, Val(false))
+            _refresh!(source, source_view, η, Val(false))
+            _state_point!(state, source, Val(false))
+            for (f, fl) in pairs(target.layout.fields), c in 1:fl.components
+                u = state.values[state.offsets[source_field[f]]+c]
+                _emit!(target, qweight * u, f, c, one(T), 0, -one(T), n, m, false)
             end
         end
-
-        # Scatter the local rhs into the global rhs (no matrix block).
-        for (local_row, row) in pairs(ws.active_dofs)
-            rhs[row] += ws.local_rhs[local_row]
+        isempty(target.pivots) || _condense!(target, n, m, false, false)
+        for k in 1:n
+            rhs[target.dofs[k]] += target.b[k]
         end
     end
-
     return nothing
 end
 
@@ -534,11 +423,7 @@ function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_
     # Source-driven rhs over the source/target union partition, accumulated
     # onto the lift already in `rhs`.
     regions = _transfer_regions(source_model, target_model; tolerance=tolerance)
-    ws = _transfer_workspace(source_model, target_model)
-    for region in regions
-        _assemble_transfer_rhs_region!(ws, rhs, source_coefficients, source_model, target_model,
-                                       region)
-    end
+    _transfer_rhs!(rhs, source_coefficients, source_model, target_model, regions)
 
     coefficients = F === Nothing ? mass \ rhs : backend.factor \ rhs
     residual = norm(mass * coefficients - rhs)

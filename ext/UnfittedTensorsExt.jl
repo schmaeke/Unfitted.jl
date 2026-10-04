@@ -302,10 +302,10 @@ end
 # type is inferred at compile time and the small unrolled `ntuple`
 # expansions stay allocation-free in the assembly hot loop.
 #
-# Each accessor call re-sums the field over every dof of every covering
-# parent, so `gradient_tensor` reads the `D` gradient rows once and then
-# indexes them, rather than calling the accessor for each of the `D²`
-# tensor slots.
+# `FormState` evaluates every field once per point, so each accessor call
+# is a field-name lookup and a buffer read; `gradient_tensor` still reads
+# the `D` gradient rows once and then indexes them, rather than calling the
+# accessor for each of the `D²` tensor slots.
 
 """
     value_vec(state::FormState, name::Symbol, ::Val{D}) -> Vec{D,T}

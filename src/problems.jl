@@ -175,9 +175,8 @@ function TestChannels(value::Real, gradient::NTuple{D,<:Real}) where {D}
     TestChannels(value, SVector{D}(gradient))
 end
 
-# Zero-vector gradient in the assembly scalar type, used both as the
-# default test-gradient coefficient when a callback returns a scalar and
-# as an initialiser for the FormState gradient evaluation.
+# Zero-vector gradient in the assembly scalar type, used as the default
+# test-gradient coefficient when a callback returns a scalar.
 _zero_gradient(::Val{D}, ::Type{T}) where {D,T} = SVector{D,T}(ntuple(_ -> zero(T), Val(D)))
 
 # Coerce a callback return to a `TestChannels{D,T}` of the assembly's
@@ -230,9 +229,12 @@ function _as_test_channels(channels::TestChannels{K}, ::Val{D}, ::Type{T}) where
 end
 
 # Scalar contraction `channels.value × test_value`. Used by the Dirichlet
-# projection path in `dirichlet.jl` and by the value-only branch of
-# `_emit_*`.
+# projection path in `dirichlet.jl`.
 @inline _test_value_contribution(channels::TestChannels, test_value) = channels.value * test_value
+
+# Value-only contraction for a scalar channel, the L² transfer rhs: it never
+# reads the test gradient, so a value-only basis refresh is enough.
+@inline _test_contribution(channel::Number, test_value, _) = channel * test_value
 
 # Full contraction `channels.value × test_value + ⟨channels.gradient,
 # test_gradient⟩`. The `@inline` makes sure the dot product is constant-

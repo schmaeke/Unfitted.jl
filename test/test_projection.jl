@@ -177,12 +177,12 @@ end
 @testset "L2 transfer between B-spline models across a masked overlay" begin
     # The package promises a projection test per basis family, and `transfer` had never
     # run on the second one. A masked B-spline overlay *below maximal continuity*
-    # resolves its artificial boundary into multi-raw pivots, so the target layout takes
-    # the `has_linear_constraints` dof-table branch in `_transfer_local_dofs!`; the flag
-    # is asserted so the test cannot drift off the branch it exists to cover. Maximal
-    # continuity is the default and would take the other branch, because selection emits
-    # single-raw eliminations and never a pivot — that branch is covered by the
-    # integrated-Legendre transfers above, so the reduced continuity here is deliberate.
+    # resolves its artificial boundary into multi-raw pivots, so the transfer rhs has
+    # pivot rows to condense onto their branches; the `has_linear_constraints` flag is
+    # asserted so the test cannot drift off the path it exists to cover. Maximal
+    # continuity is the default and has no pivot, because selection emits single-raw
+    # eliminations only — that path is covered by the integrated-Legendre transfers
+    # above, so the reduced continuity here is deliberate.
     # The target space contains the source space, so the projection is the identity
     # there and both the linear-solve residual and the reproduction error must sit at
     # round-off, not merely be finite.
@@ -207,11 +207,11 @@ end
 end
 
 @testset "L2 transfer between B-spline models at the default continuity" begin
-    # The reduced-continuity case above covers the `has_linear_constraints` branch;
-    # this one covers the configuration a user actually gets from `bspline()`, where
-    # the artificial boundary resolves to strong eliminations and the layout takes the
-    # other branch. Both are wanted: `CONTRIBUTING` asks for a projection test per
-    # basis family, and the default spelling of that family is this one.
+    # The reduced-continuity case above covers a target with pivots; this one covers
+    # the configuration a user actually gets from `bspline()`, where the artificial
+    # boundary resolves to strong eliminations and there is no pivot. Both are
+    # wanted: `CONTRIBUTING` asks for a projection test per basis family, and the
+    # default spelling of that family is this one.
     omega = box((0.0, 0.0), (1.0, 1.0))
     source_space = space(omega; cells=(8, 8), order=2, basis=bspline())
     target_space = overlay(source_space, box((0.3, 0.3), (0.7, 0.7)); cells=(5, 5), order=2,

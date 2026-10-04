@@ -8,10 +8,11 @@
 # symbolic pass builds the CSC sparsity pattern once (cached on the
 # `Model`); the numeric pass walks every admissible integration region,
 # evaluates basis values and physical gradients per parent level,
-# accumulates the user's weak form into a thread-local local matrix /
-# rhs, and scatter-adds that block into the prebuilt `nzval`. A dof pair
-# appearing in many regions therefore accumulates with `+=` into one slot
-# rather than inflating a triplet array.
+# accumulates the user's weak form into a per-task local matrix / rhs
+# over the region's sorted local dof numbering, and scatter-adds that
+# block into the prebuilt `nzval`. A dof pair appearing in many regions
+# therefore accumulates with `+=` into one slot rather than inflating a
+# triplet array.
 #
 # Two contracts shape the API:
 #
@@ -32,16 +33,20 @@
 # eliminated column-wise during assembly: a constrained trial column's
 # stiffness contribution is moved to the right-hand side, weighted by
 # the dof's stored constrained value (zero for overlay/homogeneous,
-# projected datum for nonzero Dirichlet).
+# projected datum for nonzero Dirichlet). A linear-constraint pivot of a
+# basis family (a B-spline mask below maximal continuity) keeps its own
+# local row and column while a region is integrated, and is condensed
+# onto the active dofs of its expansion once per region.
 
-# ── Field evaluation and FormState ────────────────────────────────────────────
+# ── Field evaluation ──────────────────────────────────────────────────────────
 
 # Per-parent record carrying everything `_field_value`/`_field_gradient`
 # need to reconstruct a field at a quadrature point: the parent's basis
 # family, order, local-id list, gradient scaling factor, per-axis 1D
 # factor buffers, and the slot for the evaluated values and gradients.
-# Allocates fresh buffers; for hot-loop use go through the workspace-
-# backed `_parent_dof_data` from the assembly section instead.
+# Allocates fresh buffers, so it serves the one-shot evaluation paths of
+# `postprocessing.jl`; assembly and the quadrature-point walks evaluate
+# into a workspace's `BasisBank` instead.
 function _parent_basis_data(V::Space{D,T}, layout::DofLayout{D,T}, parent::ParentRef{D,T};
                             gradients::Bool=true) where {D,T}
     level = _level_by_id(V, parent.level)
@@ -62,8 +67,7 @@ end
 
 # Evaluate the value-only basis tables at a region-reference point `eta`
 # into the parent record's value buffer. Used by the non-hot-loop
-# evaluation paths (FormState value access, `foreach_quadrature_point`
-# without state, `l2_error`).
+# evaluation paths in `postprocessing.jl` (`l2_error`, `write_vtk`).
 function _update_parent_basis_values!(data, eta::SVector{D,T}) where {D,T}
     xi = reference_to_physical(data.parent.local_box, eta)
     _tensor_values!(data.basis, data.values, data.local_ids, data.order, xi, data.val1d,
@@ -120,102 +124,21 @@ function _field_gradient(parent_data::AbstractVector,
     return result
 end
 
-"""
-    FormState
-
-The current solution iterate at a quadrature point, exposed to weak-form
-callbacks as `q.state` when assembling with `state=`. Query it with
-`value(q.state, field[, component])` and `field_gradient(q.state, field[,
-component])`, where `field` is a field name `Symbol` or a
-[`Field`](@ref). Evaluation is lazy and reuses the basis data already
-computed for the integration region, so a callback can read `q.state`
-multiple times without recomputing anything.
-
-`FormState` is what makes the assembly path Newton-linearisation
-friendly: a `bilinear` callback that wants the current iterate
-`uₖ(x)` for building a tangent operator simply asks `q.state` for the
-value or gradient.
-
-`field_gradient` (rather than the natural shorter `gradient`) avoids a
-name collision with `Tensors.gradient`, the automatic-differentiation
-entry point of the Tensors.jl package, so the two can be loaded
-together unrestricted; `value` does not collide and keeps its short
-name.
-"""
-struct FormState{FD,L<:SystemLayout,C}
-    field_data::FD
-    layout::L
-    coefficients::C
-end
-
-# Resolve a field name to its `fields` index inside the `SystemLayout`.
-# Used by the public `value` / `field_gradient` on `FormState`.
-function _state_field_index(state::FormState, name::Symbol)
-    index = get(state.layout.by_name, name, 0)
-    index == 0 && throw(ArgumentError("unknown field $name"))
-    return index
-end
-
-"""
-    value(state::FormState, name_or_field[, component=1])
-
-Read the named field's value at the current quadrature point. `name` is
-either a `Symbol` matching a field name in the model or a [`Field`](@ref)
-object. For multi-component fields, pass `component`.
-"""
-function value(state::FormState, name::Symbol, component::Integer=1)
-    index = _state_field_index(state, name)
-    return _field_value(state.field_data[index], state.layout.fields[index], state.coefficients,
-                        component)
-end
-
-"""
-    field_gradient(state::FormState, name_or_field[, component=1])
-
-Read the named field's physical gradient at the current quadrature
-point. Same field/component semantics as [`value`](@ref). The leading
-`field_` is there to avoid colliding with `Tensors.gradient` (the
-automatic-differentiation entry point) when both packages are loaded
-together.
-"""
-function field_gradient(state::FormState, name::Symbol, component::Integer=1)
-    index = _state_field_index(state, name)
-    return _field_gradient(state.field_data[index], state.layout.fields[index], state.coefficients,
-                           component)
-end
-
-value(state::FormState, field::Field, component::Integer=1) = value(state, field.name, component)
-function field_gradient(state::FormState, field::Field, component::Integer=1)
-    field_gradient(state, field.name, component)
-end
-
-# Tiny helper raising the "no state attached" error from a single
-# location. Reaching it indicates a callback dereferenced `q.state`
-# without the caller passing `state =` to the assembly entry point.
-function _no_form_state()
-    throw(ArgumentError("q.state is unavailable; assemble with `state = current_iterate`"))
-end
-value(::Nothing, args...) = _no_form_state()
-field_gradient(::Nothing, args...) = _no_form_state()
-
 # ── Symbolic assembly pattern (Gustavson) ─────────────────────────────────────
 
 # The `AssemblyPattern` struct itself lives in `model.jl` (it is cached
 # model state, and `model.jl` is included before this file); the builder
 # and the numeric scatter that consume it live here.
 
-# Refill `ws.active_dofs` for one region with no quadrature or kernel
-# work — runs the same `_local_active_dof_table!` construction the
-# numeric path uses, so the symbolic pattern is guaranteed to enumerate
-# exactly the dof pairs assembly emits (active branches only; Dirichlet
-# and strongly-eliminated raws resolve to global id 0 and never enter
-# `active_dofs`). Returns the workspace's `active_dofs` vector, valid
-# until the next call.
+# Fill `ws.dofs` with one region's sorted active global dof ids, with no
+# quadrature or kernel work. It runs the same `_frame!` and `_slots!` the
+# numeric pass runs, so the symbolic pattern enumerates exactly the dof pairs
+# assembly emits: active ids and the active branches of every pivot, never a
+# constrained id. Returns `ws.dofs`, valid until the workspace's next region.
 # (`ws` is an `AssemblyWorkspace`, defined further down this file.)
 function _region_active_dofs!(ws, model::Model, region)
-    field_data = _region_field_data(ws, model, region)
-    _local_active_dof_table!(ws, field_data, model.dofs)
-    return ws.active_dofs
+    _slots!(_frame!(ws, region))
+    return ws.dofs
 end
 
 # Build the CSC sparsity pattern as the union over every region of the
@@ -430,171 +353,6 @@ function _matrix_from_pattern(pattern::AssemblyPattern, nzval::Vector{T}) where 
     return matrix
 end
 
-# ── Assembly workspace and hot loop ───────────────────────────────────────────
-
-# Per-parent, per-region dof distribution table built by
-# `_local_parent_dofs!`. Routes each cell-local basis function (and
-# component) through the dof layer's `raw_expansion` into two flat
-# storage layouts — one for *active* branches (entries that land in
-# the local matrix) and one for *Dirichlet* branches (entries that
-# move to the rhs via column elimination). The flat layout keeps the
-# per-parent allocation count at a fixed `8` (four flat vectors plus
-# four small offset/count matrices) regardless of `nbasis × ncomp`,
-# instead of the `O(nbasis × ncomp)` per-(i, c) `Vector` allocations a
-# `Matrix{Vector{…}}` shape would imply.
-#
-# For each `(i, c)`, the active branches are stored at
-# `active_pos_flat[active_offset[i, c]:(… + active_count[i, c] - 1)]`
-# with corresponding weights in `active_w_flat[…]`. Dirichlet branches
-# follow the same convention with `dir_*` arrays.
-#
-# In the integrated-Legendre regime — where every constrained raw is
-# either strongly eliminated or physically Dirichlet, and every free
-# raw has identity expansion — branch counts are 0 or 1, the flat
-# vectors total at most `nbasis × ncomp` entries, and the hot loop
-# does a single indexed read per (a, c) (matching today's per-emission
-# cost). Pivots with multi-element expansions (`m + 1` for B-spline
-# C^m boundaries) widen each pivot's branch count proportionally.
-struct LocalDofExpansion{T<:Real}
-    active_pos_flat::Vector{Int}
-    active_w_flat::Vector{T}
-    active_offset::Matrix{Int}
-    active_count::Matrix{Int}
-    dir_raw_flat::Vector{Int}
-    dir_w_flat::Vector{T}
-    dir_offset::Matrix{Int}
-    dir_count::Matrix{Int}
-end
-
-# Build the per-parent dof distribution table. For each `(raw, component)`
-# pair, walks the dof layer's `raw_expansion[raw]` list — typically
-# `[(raw, 1)]` for free raws, `[]` for strongly eliminated, and the
-# resolved pivot expression for linear-constraint pivots — and routes
-# each `(other_raw, weight)` entry to either the active branch
-# (`other_raw`'s component-active id is nonzero) or the Dirichlet
-# branch (`other_raw` is physically Dirichlet on this component). The
-# branches are appended to the flat per-table vectors; the
-# `active_offset`/`active_count` (and analogous `dir_*`) matrices
-# record where each `(i, c)`'s entries live.
-#
-# The shared `local_by_global` cache ensures that a dof shared between
-# two parents in the region gets the same local row/column on both —
-# i.e. their stiffness contributions land at the same local matrix
-# position before being scattered into the matrix. Used inside
-# `_assemble_region!` per region.
-function _local_parent_dofs!(active_dofs::Vector{Int}, local_by_global::Dict{Int,Int}, data,
-                             layout::FieldLayout{D,T}) where {D,T}
-    nbasis = length(data.raw_dofs)
-    ncomp = layout.components
-    expansion = layout.dofs.raw_expansion
-    dirichlet = layout.dofs.physical_dirichlet
-    # Pre-size to `nbasis · ncomp` — the count for the common
-    # length-1-expansion case (free raws and physical-Dirichlet raws).
-    # Pivoted raws (rare) may push past this capacity and trigger
-    # one Vector growth at most.
-    total = nbasis * ncomp
-    active_pos_flat = sizehint!(Int[], total)
-    active_w_flat = sizehint!(T[], total)
-    active_offset = Matrix{Int}(undef, nbasis, ncomp)
-    active_count = Matrix{Int}(undef, nbasis, ncomp)
-    dir_raw_flat = Int[]
-    dir_w_flat = T[]
-    dir_offset = Matrix{Int}(undef, nbasis, ncomp)
-    dir_count = Matrix{Int}(undef, nbasis, ncomp)
-
-    for i in 1:nbasis, component in 1:ncomp
-        raw = data.raw_dofs[i]
-        active_offset[i, component] = length(active_pos_flat) + 1
-        dir_offset[i, component] = length(dir_raw_flat) + 1
-        a_n = 0
-        d_n = 0
-        for (other, weight) in expansion[raw]
-            global_dof = _field_component_dof(layout, other, component)
-            if global_dof == 0
-                if dirichlet[other, component]
-                    push!(dir_raw_flat, other)
-                    push!(dir_w_flat, weight)
-                    d_n += 1
-                end
-            else
-                local_pos = get!(local_by_global, global_dof) do
-                    push!(active_dofs, global_dof)
-                    length(active_dofs)
-                end
-                push!(active_pos_flat, local_pos)
-                push!(active_w_flat, weight)
-                a_n += 1
-            end
-        end
-        active_count[i, component] = a_n
-        dir_count[i, component] = d_n
-    end
-    return LocalDofExpansion{T}(active_pos_flat, active_w_flat, active_offset, active_count,
-                                dir_raw_flat, dir_w_flat, dir_offset, dir_count)
-end
-
-# Lightweight per-parent dof table for the common case — every raw maps
-# to a single active local index (or to nothing when it is constrained).
-# Used when the layout has no non-trivial linear constraints
-# (`!has_linear_constraints`), i.e. the integrated Legendre family and
-# the C⁰ B-spline mesh-edge path, where `raw_expansion` is always the
-# identity or empty. For each `(raw, component)`:
-#
-#   * map the raw to its global active id via the field layout;
-#   * if it is constrained (global id == 0), record `0`;
-#   * otherwise register the global id in `local_by_global` (a fresh
-#     local index per *distinct* global id) and record the local index.
-#
-# Returning a plain `Matrix{Int}` keeps the per-parent allocation at one
-# array and lets the matching `_accumulate_qpoint!` overload emit each
-# matrix entry with a single indexed read — the pre-constraint-primitive
-# cost. The shared `local_by_global` cache ensures a dof shared between
-# two parents gets the same local row/column on both.
-function _local_parent_dofs_simple!(active_dofs::Vector{Int}, local_by_global::Dict{Int,Int}, data,
-                                    layout::FieldLayout)
-    local_dofs = Matrix{Int}(undef, length(data.raw_dofs), layout.components)
-    for i in eachindex(data.raw_dofs), component in 1:layout.components
-        dof = _field_component_dof(layout, data.raw_dofs[i], component)
-        local_dofs[i, component] = dof == 0 ? 0 : get!(local_by_global, dof) do
-            push!(active_dofs, dof)
-            length(active_dofs)
-        end
-    end
-    return local_dofs
-end
-
-# Reusable "no contribution" channel — the all-zero `TestChannels` that
-# the bilinear path falls back on when a component-unaware form is
-# asked for an off-diagonal (trial_component ≠ test_component) entry.
-function _zero_test_channels(::Val{D}, ::Type{T}) where {D,T}
-    TestChannels(zero(T), _zero_gradient(Val(D), T))
-end
-
-# Evaluate the linear callback at a quadrature point and coerce its
-# return to `TestChannels{D,T}`. Component-aware forms get
-# `(q, test_component)`; the rest get `(q,)` and apply to every test
-# component uniformly.
-function _linear_channels(form::WeakForm, q, test_component::Int, ::Val{D}, ::Type{T}) where {D,T}
-    value = form.component_aware ? form.linear(q, test_component) : form.linear(q)
-    return _as_test_channels(value, Val(D), T)
-end
-
-# Evaluate the bilinear callback. Component-aware forms receive the full
-# `(q, trial, test_component)` triple. Component-unaware forms receive
-# `(q, trial)` and apply only when `trial.component == test_component`
-# (the implicit diagonal-in-components pattern) — for off-diagonal
-# components the helper returns a zero channel to keep the assembly
-# loops branch-free.
-function _bilinear_channels(form::WeakForm, q, trial::TrialChannels{D,T},
-                            test_component::Int) where {D,T}
-    if form.component_aware
-        return _as_test_channels(form.bilinear(q, trial, test_component), Val(D), T)
-    end
-
-    trial.component == test_component || return _zero_test_channels(Val(D), T)
-    return _as_test_channels(form.bilinear(q, trial), Val(D), T)
-end
-
 # ── Scatter sink (matrix destination for one assembly pass) ───────────────────
 
 # Where a region's local matrix block is deposited. The right-hand side
@@ -630,10 +388,10 @@ end
 # sorted row range via `searchsortedfirst` and `+=` into that `nzval` slot.
 #
 # The skip is load-bearing, not just a saving. Under `symmetric` the pattern
-# stores rows `i ≥ j` only, and the per-emission kernels never write an
-# upper-triangle slot of the local block — so those entries are still exactly
-# the zeros `_region_workspace_setup!` filled, and skipping them is what keeps
-# the lookup below inside the column's stored row range. (It also keeps
+# stores rows `i ≥ j` only, and the kernel never writes an upper-triangle slot
+# of the local block — so those entries are still exactly the zeros
+# `_integrate!` filled, and skipping them is what keeps the lookup below inside
+# the column's stored row range. (It also keeps
 # structural zeros out of the accumulation, giving `dropzeros!` less to do.)
 #
 # A miss — the located slot does not hold `row` — means the pattern and the
@@ -684,311 +442,269 @@ function _field_index(layout::SystemLayout, name::Symbol)
     return index
 end
 
-# One-shot per-parent record collector. Used by paths that allocate
-# fresh basis buffers (boundary projection, single-shot evaluation);
-# the hot-loop path uses `_parent_dof_data` against a workspace instead.
+# One-shot per-parent record collector. Used by the evaluation paths of
+# `postprocessing.jl`, which allocate fresh basis buffers; assembly and the
+# quadrature-point walks evaluate into a workspace's `BasisBank` instead.
 function _field_parent_data(V, layout::FieldLayout, parents; gradients::Bool=true)
     [_parent_basis_data(V, layout.dofs, parent; gradients) for parent in parents]
 end
 
-"""
-    AssemblyWorkspace{D,T,B}
+# ── Basis bank and assembly workspace ─────────────────────────────────────────
 
-Thread-local assembly scratch. Carries every buffer the hot loop needs:
-
-  - `bases[i]`     — basis family of level `i`, read by level id once per
-    parent per quadrature point to dispatch `_fill_factor_tables!`. The
-    bank is `Vector{B}` for the narrowest eltype the space's families
-    share — `IntegratedLegendre` on the default space — because an
-    abstract bank turns that read into a dynamic dispatch which boxes the
-    call's `SVector` / `NTuple` / `CartesianIndex` arguments: measured at
-    448 B per call, and 94% of `assemble_matrix`'s total allocations. A
-    space that genuinely mixes families widens `B` to a common supertype
-    and pays that cost, which is why the field is parameterized rather
-    than pinned to one family.
-  - `local_ids[i]` — the level's full tensor-product multi-index list, kept only
-    to size the value banks; the per-cell sets a region actually pairs against
-    come from `cell_locals[i]`. Multi-indices of level `i`'s basis, at
-    its nominal order.
-  - `cell_locals[i]` — level `i`'s minimum-rule index table, one
-    [`CellModes`](@ref) per level and read by parent cell as
-    `sets[kind[cell]]`. A level whose order is uniform carries a palette
-    of one set, so there is no second shape and no branch. This is the
-    *same object* `_build_cell_dofs!` walked to produce `cell_dofs`,
-    taken straight off the level rather than re-derived, because the
-    positional pairing between a cell's raw dofs and its basis values is
-    the only link between the dof layer and the basis layer and nothing
-    checks it.
-  - `orders[i]`    — nominal polynomial order tuple of level `i`'s basis.
-  - `values[i]`, `gradients[i]` — per-level basis value / gradient
-    buffers. Indexed by the level id; reused across every region a
-    thread processes. A region carries at most one parent per level, so
-    the level-indexed buffers never collide within a region. Sized at the
-    level's nominal (maximum) order, so a cell at a lower per-cell order
-    fills a prefix — see `_tensor_values_grads!` in `basis.jl` for why
-    that is transparent and why the banks are *not* keyed by order value.
-  - `val1d[i]`, `der1d[i]` — per-axis 1D factor buffers for the basis
-    evaluator.
-  - `active_dofs`, `local_by_global` — per-region local-to-global dof
-    table (rebuilt per region; the dict is `empty!`d, not reallocated).
-  - `local_matrix` — flat scratch buffer resized and reshaped to `n×n`
-    per region; `local_rhs` — flat scratch buffer resized to `n`.
-
-Constructed by `_assembly_workspace` once per thread (or once
-per assembly call in the serial path).
-"""
-struct AssemblyWorkspace{D,T,B<:BasisFamily}
+# Per global level id, everything the kernel needs to evaluate that level's basis
+# at a point: the family, the per-cell index sets, the nominal order, and the
+# value, gradient and 1D factor buffers the evaluation writes into. The buffers
+# are indexed by level id, which `prepare` made contiguous and disjoint across
+# subdomains, and reused across every region a task processes; a region carries
+# at most one parent per level, so they never collide within a region.
+#
+# Struct of arrays on purpose. Only `bases` may be abstract — on a space that
+# mixes families, or B-splines of different degrees — and such a space then pays
+# one dynamic basis call per parent per point, which it must. Every value and
+# gradient read in the emission loop stays concrete either way. A per-level
+# record bundling the same buffers would itself be abstract on a mixed space and
+# make every one of those reads dynamic: measured 4.5× slower on a mixed-family
+# overlay.
+#
+#   - `bases[i]` is narrowed by `map(identity, …)` to the eltype the space's
+#     families share, `IntegratedLegendre` on the default space. An abstract
+#     bank turns the per-point basis call into a dynamic dispatch that boxes its
+#     `SVector` / `NTuple` / `CartesianIndex` arguments: measured at 448 B per
+#     call, and 94 % of `assemble_matrix`'s allocations.
+#   - `modes[i]` is the level's own minimum-rule table (`level.modes`), read by
+#     parent cell as `sets[kind[cell]]`. It is the same object
+#     `_build_cell_dofs!` walked to produce `cell_dofs`, taken off the level
+#     rather than re-derived, because the positional pairing between a cell's
+#     raw dofs and its basis values is the only link between the dof layer and
+#     the basis layer, and nothing checks it.
+#   - `values[i]` and `gradients[i]` are sized at the level's nominal (maximum)
+#     order, so a cell at a lower per-cell order fills a prefix. See
+#     `_tensor_values_grads!` in `basis.jl` for why that is transparent and why
+#     the buffers are not keyed by order value.
+struct BasisBank{D,T,B<:BasisFamily}
     bases::Vector{B}
-    local_ids::Vector{Vector{CartesianIndex{D}}}
-    cell_locals::Vector{CellModes{D}}
+    modes::Vector{CellModes{D}}
     orders::Vector{NTuple{D,Int}}
     values::Vector{Vector{T}}
     gradients::Vector{Vector{SVector{D,T}}}
     val1d::Vector{NTuple{D,Vector{T}}}
     der1d::Vector{NTuple{D,Vector{T}}}
-    active_dofs::Vector{Int}
-    local_by_global::Dict{Int,Int}
-    local_matrix::Vector{T}
-    local_rhs::Vector{T}
 end
 
-# The multi-index list one parent cell generates, read out of the level's
-# minimum-rule table. A uniform level's palette holds one set and every active
-# cell points at it, so this is two array reads and no branch either way —
-# measured at or below the noise of the basis refresh, which is itself 1.6–4.1%
-# of `_assemble_region!`.
-@inline function _parent_local_ids(cell_locals, lvl::Int, cell::CartesianIndex{D}) where {D}
-    modes = cell_locals[lvl]
-    return modes.sets[modes.kind[cell]]
-end
-
-# Allocate the shared per-level value banks of a workspace: index by
-# level id, size each buffer to the level's basis count and per-axis
-# order. Returns the per-level basis families alongside the buffers so
-# hot loops can dispatch `_tensor_values!` through the `bases` vector
-# instead of looking each level up. Used by the L² transfer workspace
-# (`_transfer_workspace` in projection.jl), whose value-only integrals
-# never need the gradient banks the assembly workspace adds.
-function _level_value_buffers(levels, ::Val{D}, ::Type{T}) where {D,T}
-    n = length(levels)
-    bases = Vector{BasisFamily}(undef, n)
-    local_ids = Vector{Vector{CartesianIndex{D}}}(undef, n)
-    cell_locals = Vector{CellModes{D}}(undef, n)
-    orders = Vector{NTuple{D,Int}}(undef, n)
-    values = Vector{Vector{T}}(undef, n)
-    val1d = Vector{NTuple{D,Vector{T}}}(undef, n)
-    for level in levels
-        i = level.id
-        ids = local_basis_indices(level.basis, nominal_order(level), level.mode)
-        bases[i] = level.basis
-        local_ids[i] = ids
-        cell_locals[i] = _cell_locals(level)
-        orders[i] = nominal_order(level)
-        values[i] = Vector{T}(undef, length(ids))
-        val1d[i] = _factor_buffers(nominal_order(level), T)
-    end
-    # `map(identity, …)` narrows the abstractly-typed build bank to the eltype
-    # the families actually share, so every hot-loop `bases[i]` read dispatches
-    # statically instead of boxing its arguments through a dynamic call. A space
-    # that genuinely mixes families widens back to a common supertype.
-    return map(identity, bases), local_ids, cell_locals, orders, values, val1d
-end
-
-# Build a fresh workspace for `model`, once per thread in the threaded path and
-# once per assembly call in the serial path.
-function _assembly_workspace(model::Model{D,T}) where {D,T}
-    _build_workspace(problem_spaces(model.problem), Val(D), T)
-end
-
-# Build an assembly workspace over a problem's subdomain spaces without the
-# type-unstable `Vector{Any}` level concatenation. `prepare` reindexed every
-# subdomain space into a disjoint, contiguous block of global level ids, so the
-# union spans ids `1:N` where `N = Σ level_count(V)` — a single-domain problem
-# is the one-element case, with `N` the one space's level count. The id-indexed
-# banks are allocated once at size `N`, then filled per space through
-# `_fill_assembly_banks!` — a function barrier whose argument is that space's
-# concretely-typed level `Tuple`, so every `level.id / basis / order / mode`
-# access is statically dispatched inside it. The only dynamic dispatch is the
-# outer loop over the abstractly-typed `spaces` vector, which is O(number of
-# subdomains) and never touched by the assembly hot loop.
-function _build_workspace(spaces, ::Val{D}, ::Type{T}) where {D,T}
+# Build the bank over a problem's subdomain spaces without a type-unstable level
+# concatenation. `prepare` reindexed every subdomain space into a disjoint,
+# contiguous block of global level ids, so the union spans `1:N` with
+# `N = Σ level_count(V)`. The buffers are allocated once at size `N` and filled
+# per space through `_fill_bank!`; the only dynamic dispatch is the loop over
+# the abstractly typed `spaces`, once per subdomain.
+function BasisBank(spaces, ::Val{D}, ::Type{T}) where {D,T}
     n = 0
     for V in spaces
         n += level_count(V)
     end
     bases = Vector{BasisFamily}(undef, n)
-    local_ids = Vector{Vector{CartesianIndex{D}}}(undef, n)
-    cell_locals = Vector{CellModes{D}}(undef, n)
+    modes = Vector{CellModes{D}}(undef, n)
     orders = Vector{NTuple{D,Int}}(undef, n)
     values = Vector{Vector{T}}(undef, n)
-    val1d = Vector{NTuple{D,Vector{T}}}(undef, n)
     gradients = Vector{Vector{SVector{D,T}}}(undef, n)
+    val1d = Vector{NTuple{D,Vector{T}}}(undef, n)
     der1d = Vector{NTuple{D,Vector{T}}}(undef, n)
     for V in spaces
-        _fill_assembly_banks!(bases, local_ids, cell_locals, orders, values, gradients, val1d,
-                              der1d, V.levels, Val(D), T)
+        _fill_bank!(bases, modes, orders, values, gradients, val1d, der1d, V.levels, T)
     end
-    narrow = map(identity, bases)  # same narrowing as `_level_value_buffers`
-    return AssemblyWorkspace{D,T,eltype(narrow)}(narrow, local_ids, cell_locals, orders, values,
-                                                 gradients, val1d, der1d, Int[], Dict{Int,Int}(),
-                                                 T[], T[])
+    narrow = map(identity, bases)
+    return BasisBank{D,T,eltype(narrow)}(narrow, modes, orders, values, gradients, val1d, der1d)
 end
 
-# Function barrier: fill the id-indexed assembly banks from one space's
-# concretely-typed level `Tuple`. Specialising on the tuple type makes every
-# per-level `getfield` (`id`, `basis`, `order`, `mode`) and the downstream
-# `local_basis_indices` / `_factor_buffers` calls statically dispatched, even
-# though `_build_workspace`'s outer loop reads `V` from an abstractly-typed
-# vector. Writes by global level id, which `prepare` made contiguous and
-# disjoint across subdomains, so per-space fills never collide.
-function _fill_assembly_banks!(bases, local_ids, cell_locals, orders, values, gradients, val1d,
-                               der1d, levels::Tuple, ::Val{D}, ::Type{T}) where {D,T}
+# Function barrier: fill the id-indexed bank from one space's concretely typed
+# level `Tuple`, so every per-level field read and the `local_basis_indices` /
+# `_factor_buffers` calls dispatch statically.
+function _fill_bank!(bases, modes, orders, values, gradients, val1d, der1d, levels::Tuple,
+                     ::Type{T}) where {T}
     for level in levels
-        i = level.id
-        ids = local_basis_indices(level.basis, nominal_order(level), level.mode)
+        i, p = level.id, nominal_order(level)
+        nbasis = length(local_basis_indices(level.basis, p, level.mode))
         bases[i] = level.basis
-        local_ids[i] = ids
-        cell_locals[i] = _cell_locals(level)
-        orders[i] = nominal_order(level)
-        values[i] = Vector{T}(undef, length(ids))
-        gradients[i] = Vector{SVector{D,T}}(undef, length(ids))
-        val1d[i] = _factor_buffers(nominal_order(level), T)
-        der1d[i] = _factor_buffers(nominal_order(level), T)
+        modes[i] = _cell_locals(level)
+        orders[i] = p
+        values[i] = Vector{T}(undef, nbasis)
+        gradients[i] = Vector{eltype(eltype(gradients))}(undef, nbasis)
+        val1d[i] = _factor_buffers(p, T)
+        der1d[i] = _factor_buffers(p, T)
     end
     return nothing
 end
 
-# Slim per-parent record: basis values / gradients alias the level's
-# workspace buffers (no allocation); only the field-specific raw dof
-# ids are materialised per parent (and even those are a view into the
-# pre-built `cell_dofs_by_level` table on the dof layout). Accepts
-# both `ParentRef` (volume) and `FacetParent` (facet) — the body only
-# touches `parent.level` and `parent.cell`, which both carry.
-function _parent_dof_data(ws::AssemblyWorkspace{D,T}, layout::FieldLayout{D,T},
-                          parent::Union{ParentRef{D,T},FacetParent{D,T}}) where {D,T}
-    lvl = parent.level
-    raw_dofs = cell_dofs(layout.dofs, lvl, parent.cell)
-    # `raw_dofs[i]` ↔ `values[i]` is the only link between the dof layer and the
-    # basis layer, and every consumer walks it positionally without checking it
-    # (`_field_value`, `_field_gradient`, `_emit_block!`). The two lists cannot
-    # disagree in *length*: `_build_cell_dofs!` reads `cell_basis_indices`, which
-    # is the same `level.modes` table `cell_locals` banks, and `Level`'s inner
-    # constructor derives that table rather than accepting one (see
-    # `mesh.jl`). What this compares is therefore the list against the workspace
-    # BANK, which is sized once from the level's nominal order — the `>=`
-    # relaxation `_tensor_values_grads!` relies on. One integer compare per
-    # (region, parent, field); it is not in the quadrature-point loop. The
-    # message below still names the older hypothesis — a layout/table drift —
-    # which c907576 made unspellable; read it as "this cell needs more basis
-    # values than the level's bank was sized for".
-    length(raw_dofs) <= length(ws.values[lvl]) ||
-        throw(DimensionMismatch("cell $(parent.cell) of level $lvl has $(length(raw_dofs)) raw " *
-                                "dofs but the workspace bank holds $(length(ws.values[lvl])) " *
-                                "basis values; the per-cell index table and the dof layout have " *
-                                "drifted apart"))
-    return (; level=lvl, raw_dofs, values=ws.values[lvl], gradients=ws.gradients[lvl])
+"""
+    AssemblyWorkspace{D,T,B}
+
+Per-task assembly scratch, for one integration region at a time. A workspace
+belongs to one task for the duration of a call and is never shared; every
+per-region field is reset before it is reused.
+
+  - `layout` — the model's [`SystemLayout`](@ref). The kernel reads the dof
+    layer through it and never sees `Model{D,T,P}`, so it compiles once per
+    workspace type, not once per problem type.
+  - `bank` — the basis buffers by level id (`BasisBank`).
+  - `parents`, `fptr` — the region frame `_frame!` builds: one
+    `(level, slot offset, raw dofs)` record per (field, covering parent),
+    field-major, so field `f` owns `parents[fptr[f]:fptr[f+1]-1]`. The raw dof
+    vector is the layout's own `cell_dofs` entry, aliased, never copied.
+  - `slots` — the slot table. Slot `s₀ + (c − 1)·length(raw) + i` of a parent
+    record (component `c`, cell-local basis function `i`) holds the local index
+    `1:n` of an active dof, `0` for a constrained one (Dirichlet or strongly
+    eliminated), or `n + k` for the `k`-th linear-constraint pivot.
+  - `dofs` — the global active ids of local indices `1:n`, ascending.
+  - `pivots` — the `(field, raw, component)` of pivot slot `n + k`.
+  - `K`, `b` — the local system, `m × m` column-major and length `m`, with
+    `m = n + length(pivots)`. A pivot's row and column are condensed onto its
+    branches before the system leaves the workspace.
+"""
+struct AssemblyWorkspace{D,T,B<:BasisFamily}
+    layout::SystemLayout{D,T}
+    bank::BasisBank{D,T,B}
+    parents::Vector{Tuple{Int,Int,Vector{Int}}}
+    fptr::Vector{Int}
+    slots::Vector{Int}
+    dofs::Vector{Int}
+    pivots::Vector{NTuple{3,Int}}
+    K::Vector{T}
+    b::Vector{T}
 end
 
-# Parents of `region` on which field `fl` (global index `field_index`) is
-# evaluated. Subdomain ownership is *intrinsic*: a single-space region hands its
-# parents only to a field whose level-id block contains the region's level, and
-# an empty list (contribute nothing) to every foreign-subdomain field. This
-# replaces the extrinsic per-pass `served` mask — a region built on one
-# subdomain's plan is owned exactly by the fields on that subdomain. For a
-# single-domain model every field's block covers every level, so every field
-# gets the parents (the pre-multidomain fast path, unchanged).
-function region_parents(region::Union{VolumeRegion,FacetRegion,SurfaceRegion}, ::Int,
-                        fl::FieldLayout)
+# Build a workspace from the dof layout and the subdomain spaces rather than
+# from the `Model`, so that nothing in it is specialised on the problem type.
+function AssemblyWorkspace(layout::SystemLayout{D,T}, spaces) where {D,T}
+    return AssemblyWorkspace(layout, BasisBank(spaces, Val(D), T), Tuple{Int,Int,Vector{Int}}[],
+                             zeros(Int, length(layout.fields) + 1), Int[], Int[], NTuple{3,Int}[],
+                             T[], T[])
+end
+
+# A fresh workspace for `model`. Deliberately unspecialised: it runs once per
+# pass or per task, never per region, and specialising it on `Model{D,T,P}`
+# would only compile it again for every problem type.
+function _assembly_workspace(@nospecialize(model::Model))
+    return AssemblyWorkspace(model.dofs, problem_spaces(model.problem))
+end
+
+# ── Region frame and slot table ───────────────────────────────────────────────
+
+# Parents of `region` on which field `fl` (global index `f`) is evaluated, or
+# `nothing` when the field does not live there. Subdomain ownership is
+# intrinsic: a single-space region hands its parents only to a field whose
+# level-id block contains the region's level, so a region built on one
+# subdomain's plan is owned exactly by the fields on that subdomain. On a
+# single-domain model every field's block covers every level and every field
+# gets the parents. `nothing` rather than an empty vector keeps the frame
+# allocation-free.
+function region_parents(region, ::Int, fl::FieldLayout)
     (isempty(region.parents) || first(region.parents).level in fl.level_ids) ? region.parents :
-    empty(region.parents)
+    nothing
 end
 
-# Two-sided: each coupled field is evaluated on its own subdomain's parents,
-# every other field on none (empty), so an interface pass emits into exactly
-# the four field blocks Kₐₐ, K_ab, K_ba, K_bb. Keyed on the field *index* (the
-# interface stores its two sides' global field indices), not the level block.
-function region_parents(region::InterfaceRegion, field_index::Int, ::FieldLayout)
-    field_index == region.field_a ? region.parents_a :
-    field_index == region.field_b ? region.parents_b : empty(region.parents_a)
+# Two-sided: each coupled field is evaluated on its own subdomain's parents and
+# every other field on none, so an interface pass emits into exactly the four
+# field blocks Kₐₐ, K_ab, K_ba, K_bb. Keyed on the field *index* (the interface
+# stores its two sides' global field indices), not on the level block.
+function region_parents(region::InterfaceRegion, f::Int, ::FieldLayout)
+    f == region.field_a ? region.parents_a : f == region.field_b ? region.parents_b : nothing
 end
 
-# Per-field, per-parent dof-data table for one region: for every field
-# layout, the slim `_parent_dof_data` record of each covering parent
-# (basis values / gradients alias the workspace level buffers; only the
-# field's raw dof ids are materialised). Shared by the symbolic pattern
-# pass (`_region_active_dofs!`), the numeric per-region setup
-# (`_region_workspace_setup!`), and the quadrature-point walks
-# (`foreach_quadrature_point`, `foreach_interface_quadrature_point`),
-# which each need the same nested table.
-function _region_field_data(ws::AssemblyWorkspace, model::Model, region)
-    return [[_parent_dof_data(ws, layout, parent)
-             for parent in region_parents(region, field_index, layout)]
-            for (field_index, layout) in pairs(model.dofs.fields)]
-end
-
-# Evaluate basis values and physical gradients once per level present in
-# the region (parents are unique per level), writing into the workspace
-# buffers. The physical-gradient scale factor is the standard
-# axis-aligned chain rule `scale[d] = 2 / edge_lengths(parent_box)[d]`
-# from `physical_basis_gradients` in `basis.jl`.
-function _update_region_basis!(ws::AssemblyWorkspace{D,T}, region::VolumeRegion{D,T},
-                               eta::SVector{D,T}) where {D,T}
-    for parent in region.parents
-        lvl = parent.level
-        xi = reference_to_physical(parent.local_box, eta)
-        scale = SVector{D,T}(2 .* inv.(edge_lengths(parent.parent_box)))
-        ids = _parent_local_ids(ws.cell_locals, lvl, parent.cell)
-        _tensor_values_grads!(ws.bases[lvl], ws.values[lvl], ws.gradients[lvl], ids, ws.orders[lvl],
-                              xi, scale, ws.val1d[lvl], ws.der1d[lvl], parent.cell)
+# Build the region frame: for every field and every parent the field owns in
+# `region`, record `(level, slot offset, raw dofs)` and push one provisional
+# slot per (component, basis function), component-major per parent, holding the
+# global active id (0 when constrained). This, with `_slots!`, is the one place
+# a region's dof list is derived: the symbolic pattern, the threaded arena
+# layout and the numeric pass all go through it, so they cannot disagree.
+#
+# The guard compares a cell's raw dof list with the bank, which is sized once
+# from the level's nominal order — the `>=` relaxation `_tensor_values_grads!`
+# relies on. `_build_cell_dofs!` and the bank both read `level.modes`, so the
+# list and the cell's own index set cannot disagree in length; what can fail is
+# a cell needing more basis values than its level's bank holds. One integer
+# compare per (region, parent, field), outside the quadrature loop.
+function _frame!(ws::AssemblyWorkspace, region)
+    empty!(ws.parents)
+    empty!(ws.slots)
+    for (f, fl) in pairs(ws.layout.fields)
+        ws.fptr[f] = length(ws.parents) + 1
+        parents = region_parents(region, f, fl)
+        parents === nothing && continue
+        for p in parents
+            raw = cell_dofs(fl.dofs, p.level, p.cell)
+            length(raw) <= length(ws.bank.values[p.level]) ||
+                throw(DimensionMismatch("cell $(p.cell) of level $(p.level) has $(length(raw)) raw " *
+                                        "dofs but the workspace bank holds " *
+                                        "$(length(ws.bank.values[p.level])) basis values"))
+            push!(ws.parents, (p.level, length(ws.slots), raw))
+            for c in 1:fl.components, r in raw
+                push!(ws.slots, _field_component_dof(fl, r, c))
+            end
+        end
     end
-    return nothing
+    ws.fptr[end] = length(ws.parents) + 1
+    return ws
 end
 
-# Build the per-field local-to-global dof table for this region against
-# the workspace's `active_dofs` / `local_by_global`. Both scratch
-# structures are cleared first so the result is per-region; the rebuilt
-# table is `local_by_field[field_index][parent_index]`.
+# Number the region's dofs locally and give every slot its role. Returns `n`,
+# the number of active local indices.
 #
-# Two representations, chosen once per region by the layout's
-# `has_linear_constraints` flag:
+#   1. Collect the active global ids of the frame.
+#   2. On a field with linear constraints, turn every constrained slot whose
+#      (raw, component) is a pivot into pivot slot `k`, and collect the active
+#      ids of its branches: a pivot widens the region's active set to its
+#      expansion. The rule is the dof layer's `_fold_pivot`, the same one
+#      `dof_value` reconstructs a pivot from.
+#   3. Sort and deduplicate the ids. Every global id then has exactly one local
+#      index, and local order is global order. The second property is what lets
+#      the kernel apply a symmetric form's "global row ≥ col" test to local
+#      indices before it contracts, and the scatter merge a region column into a
+#      sorted pattern column.
+#   4. Rewrite each slot: active id `g` ↦ its local index, `0` ↦ `0`, pivot
+#      `k` ↦ `n + k`.
 #
-#   * no linear constraints (the common case) → `Matrix{Int}` per parent
-#     (single active-or-constrained local index), matched by the
-#     lightweight `_accumulate_qpoint!` overload;
-#   * linear constraints present → `LocalDofExpansion` per parent, matched
-#     by the expansion-distributing overload.
-#
-# The branch makes the return type a small union; the per-quadrature-point
-# `_accumulate_qpoint!` call then resolves through one dispatch per region
-# rather than paying the general machinery's indirection on every emission.
-#
-# The dual path is a *measured* optimisation, not a guess. Forcing the common
-# integrated-Legendre assembly onto `LocalDofExpansion` (which routes each
-# emission through a `(raw, weight)` redirect instead of a direct index)
-# roughly doubles `assemble!` time — ≈50 → ≈98 ms on the 2D order-3/4 fixture
-# in `benchmarks/microkernels/dof_table.jl` — so the `Matrix{Int}` fast path is
-# kept. Collapsing onto a single representation would halve assembly throughput
-# for the most common workload; re-run that benchmark before reconsidering.
-function _local_active_dof_table!(ws::AssemblyWorkspace, field_data, layout::SystemLayout)
-    empty!(ws.active_dofs)
-    empty!(ws.local_by_global)
-    if has_linear_constraints(layout)
-        return [[_local_parent_dofs!(ws.active_dofs, ws.local_by_global, data, field_layout)
-                 for data in field_data[field_index]]
-                for (field_index, field_layout) in pairs(layout.fields)]
-    else
-        return [[_local_parent_dofs_simple!(ws.active_dofs, ws.local_by_global, data, field_layout)
-                 for data in field_data[field_index]]
-                for (field_index, field_layout) in pairs(layout.fields)]
+# The renumbering is bit-neutral: every local sum still receives the same terms
+# in the same order. `QuickSort` sorts in place; the default algorithm allocates
+# a radix scratch buffer beyond about 40 entries, which is once per region in
+# 3D.
+function _slots!(ws::AssemblyWorkspace)
+    empty!(ws.dofs)
+    empty!(ws.pivots)
+    for g in ws.slots
+        g > 0 && push!(ws.dofs, g)
     end
+    for (f, fl) in pairs(ws.layout.fields)
+        fl.dofs.has_linear_constraints || continue
+        id = (o, c) -> _field_component_dof(fl, o, c)
+        for p in ws.fptr[f]:(ws.fptr[f+1]-1)
+            _, s0, raw = ws.parents[p]
+            for c in 1:fl.components, i in eachindex(raw)
+                k = s0 + (c - 1) * length(raw) + i
+                ws.slots[k] == 0 || continue
+                _, pivot = _fold_pivot(_push_active_branch, ws.dofs, fl.dofs, id, raw[i], c)
+                pivot || continue
+                push!(ws.pivots, (f, raw[i], c))
+                ws.slots[k] = -length(ws.pivots)
+            end
+        end
+    end
+    unique!(sort!(ws.dofs; alg=QuickSort))
+    n = length(ws.dofs)
+    for k in eachindex(ws.slots)
+        g = ws.slots[k]
+        ws.slots[k] = g > 0 ? searchsortedfirst(ws.dofs, g) : g < 0 ? n - g : 0
+    end
+    return n
 end
+
+# The `_fold_pivot` step of `_slots!`: collect a branch's active id.
+_push_active_branch(dofs, g, _, _) = (g > 0 && push!(dofs, g); dofs)
 
 # ── Per-region-kind quadrature accessors ──────────────────────────────────────
 #
-# The volume, facet, surface, and interface hot loops share one body
-# (`_assemble_region!` below). Only three things differ per region kind,
-# captured by these small accessors so the body stays single-source and the
-# per-kind dispatch happens once per accessor rather than as four copied loops.
+# Volume, facet, surface and interface regions share one kernel, `_integrate!`
+# below. Only these small accessors differ per region kind, and they dispatch
+# statically on the region type.
 
 # Reference→physical Jacobian for the region's weights: `vol(box)/2ᴰ` for a
 # volume region (whose weights are reference-frame), `one(T)` for facet, surface,
@@ -999,33 +715,38 @@ function _region_jacobian(::Union{FacetRegion{D,T},SurfaceRegion{D,T},InterfaceR
     one(T)
 end
 
-# Advance to local quadrature point `local_qp`: refresh every parent's basis
-# values / physical gradients into the workspace and return `(x, qweight)`. A
-# volume region iterates its reference-frame points `eta`, scales the weight by
-# the region Jacobian, computes `x` through the region box, and refreshes via
-# the region-local frame; facet / surface regions iterate precomputed physical
-# points (weights already physical) and refresh each parent from `x`.
-@inline function _region_qpoint!(ws::AssemblyWorkspace{D,T}, region::VolumeRegion{D,T},
-                                 local_qp::Int, jacobian::T) where {D,T}
-    eta = region.quadrature.points[local_qp]
-    qweight = region.quadrature.weights[local_qp] * jacobian
-    x = reference_to_physical(region.box, eta)
-    _update_region_basis!(ws, region, eta)
-    return x, qweight
+# Quadrature point `k` of `region` as `(x, weight, ref)`: the physical point, the
+# physical weight, and the reference each parent maps to its own frame
+# (`_parent_xi`). A volume region iterates reference points `η` of its box, so
+# `ref = η` and every parent maps it through its `local_box`. Facet, surface and
+# interface regions carry physical points and weights, and each parent maps the
+# physical point through its own `parent_box`: a facet region has no single
+# reference frame shared by every parent, since its free-axis coordinates run
+# across several cells per level.
+@inline function _region_point(region::VolumeRegion, k::Int, jacobian)
+    η = region.quadrature.points[k]
+    return reference_to_physical(region.box, η), region.quadrature.weights[k] * jacobian, η
 end
-@inline function _region_qpoint!(ws::AssemblyWorkspace{D,T},
-                                 region::Union{FacetRegion{D,T},SurfaceRegion{D,T}}, local_qp::Int,
-                                 ::T) where {D,T}
-    x = region.points[local_qp]
-    qweight = region.weights[local_qp]
-    _update_physical_basis!(ws, region.parents, x)
-    return x, qweight
+@inline function _region_point(region::Union{FacetRegion,SurfaceRegion,InterfaceRegion}, k::Int, _)
+    x = region.points[k]
+    return x, region.weights[k], x
 end
+
+_parent_xi(p::ParentRef, η) = reference_to_physical(p.local_box, η)
+_parent_xi(p::FacetParent, x) = physical_to_reference(p.parent_box, x)
+
+# The parent lists refreshed at every point: a region's one list, or both sides
+# of an interface, whose parents live in the two subdomains' disjoint level
+# banks, so the kernel reads field `a` from `a`'s cut cell and field `b` from
+# `b`'s at the same physical point.
+_parent_lists(region) = (region.parents,)
+_parent_lists(region::InterfaceRegion) = (region.parents_a, region.parents_b)
 
 # `q`-tuple extras the form callbacks read: the outward unit normal at the
 # point (`nothing` for a volume region; the constant face normal for a facet;
-# the per-point normal for an immersed surface) and the codim-`K` facet
-# identifier `q.sides` (only a facet carries one).
+# the per-point normal for an immersed surface or an interface, oriented from
+# side `a` to side `b` there) and the codim-`K` facet identifier `q.sides` (only
+# a facet carries one).
 _region_normal(::VolumeRegion, ::Int) = nothing
 _region_normal(region::FacetRegion, ::Int) = region.normal
 function _region_normal(region::Union{SurfaceRegion,InterfaceRegion}, local_qp::Int)
@@ -1034,186 +755,199 @@ end
 _region_sides(::Union{VolumeRegion,SurfaceRegion,InterfaceRegion}) = nothing
 _region_sides(region::FacetRegion) = region.sides
 
-# Interface region: weights are physical-frame (unit Jacobian, shared above) and
-# each quadrature point refreshes BOTH sides' bases into their (disjoint) level
-# banks at the shared physical point, so the block loop reads field `a` from
-# `a`'s cut cell and field `b` from `b`'s cut cell simultaneously.
-@inline function _region_qpoint!(ws::AssemblyWorkspace{D,T}, region::InterfaceRegion{D,T},
-                                 local_qp::Int, ::T) where {D,T}
-    x = region.points[local_qp]
-    qweight = region.weights[local_qp]
-    _update_physical_basis!(ws, region.parents_a, x)
-    _update_physical_basis!(ws, region.parents_b, x)
-    return x, qweight
-end
-
-"""
-    _assemble_region!(ws, sink, rhs, model, region, blocks, loads,
-                      symmetric, state_coefficients=nothing, point_offset=0)
-
-Assemble every weak-form contribution at every quadrature point of one
-integration region — the assembly hot loop. One call walks the region's
-quadrature points and updates the matrix `sink` and right-hand-side vector in
-place. This is a single method over all four region kinds; only the small
-accessors above (`_region_qpoint!`, `_region_jacobian`, `_region_normal`,
-`_region_sides`) differ:
-
-  * a **volume** region iterates reference-frame points and scales each weight
-    by `vol(box)/2ᴰ`; `q.normal` and `q.sides` are `nothing`;
-  * a **facet** region iterates precomputed physical points and carries the
-    face's outward normal `q.normal` and codim-`K` identifier `q.sides`, so
-    user forms can express Neumann / Robin / Nitsche contributions;
-  * a **surface** (immersed-boundary) region is a facet with a per-point
-    `q.normal` and no `q.sides`;
-  * an **interface** region is two-sided: it refreshes both subdomains' bases
-    at the shared point, carries the per-point normal oriented from side `a`
-    to side `b`, and has no `q.sides`.
-
-Every active local basis mode of every parent participates — `is_facet_basis`
-is **not** applied on the physical-frame kinds: a mode with zero *value* on the
-face can still carry nonzero *gradient*, which Nitsche-style forms rely on.
-
-Per quadrature point the body refreshes every parent's basis into the workspace
-and composes `q = (; x, weight, point, state, normal, sides)`; then
-`_accumulate_qpoint!` evaluates loads and blocks, applies Dirichlet elimination
-(a constrained trial column shifts its contribution onto the rhs), and respects
-symmetry (emitting only `row ≥ col`, mirrored by `_matrix_from_pattern`). The
-region's local system is finally flushed by `_emit_local_system!`.
-
-`point_offset` is the global quad-point offset of this region in the plan, so
-`q.point = point_offset + local_qp` is the stable index used by
-[`foreach_quadrature_point`](@ref) and per-point history data.
-"""
-function _assemble_region!(ws::AssemblyWorkspace{D,T}, sink, rhs::Vector{T}, model::Model{D,T},
-                           region::Union{VolumeRegion{D,T},FacetRegion{D,T},SurfaceRegion{D,T},
-                                         InterfaceRegion{D,T}}, blocks, loads, symmetric::Bool,
-                           state_coefficients=nothing, point_offset::Int=0) where {D,T}
-    # Region setup: per-field parent data (each field owns its subdomain's
-    # regions intrinsically, see `region_parents`), region-local dof table,
-    # optional state, local matrix / rhs buffers.
-    field_data, local_by_field, state, local_matrix, local_rhs = _region_workspace_setup!(ws, model,
-                                                                                          region,
-                                                                                          state_coefficients,
-                                                                                          !isempty(blocks))
-    jacobian = _region_jacobian(region)
-    sides = _region_sides(region)
-
-    # Quadrature loop.
-    for local_qp in 1:_region_qpoint_count(region)
-        x, qweight = _region_qpoint!(ws, region, local_qp, jacobian)
-        q = (; x, weight=qweight, point=point_offset + local_qp, state,
-             normal=_region_normal(region, local_qp), sides)
-        _accumulate_qpoint!(local_matrix, local_rhs, q, qweight, field_data, local_by_field,
-                            ws.active_dofs, blocks, loads, symmetric, model, Val(D), T)
-    end
-
-    # Scatter the local system into the matrix sink / global rhs.
-    _emit_local_system!(sink, rhs, ws.active_dofs, local_matrix, local_rhs)
-    return nothing
-end
-
-# Refresh basis values and physical gradients per parent at a physical
-# quadrature point `x`. Mirrors `_update_region_basis!` for volume
-# regions but maps `x` through each parent's own `parent_box` instead
-# of through a region-local frame (facet / surface regions have no
-# single reference frame shared by every parent — the constrained
-# coordinate is fixed but free-axis coordinates run across multiple
-# cells per level). Called by `_region_qpoint!` on the facet / surface branch
-# of `_assemble_region!`, and twice — once per side — on the interface branch.
-function _update_physical_basis!(ws::AssemblyWorkspace{D,T}, parents, x::SVector{D,T}) where {D,T}
-    for parent in parents
-        lvl = parent.level
-        xi = physical_to_reference(parent.parent_box, x)
-        scale = SVector{D,T}(2 .* inv.(edge_lengths(parent.parent_box)))
-        ids = _parent_local_ids(ws.cell_locals, lvl, parent.cell)
-        _tensor_values_grads!(ws.bases[lvl], ws.values[lvl], ws.gradients[lvl], ids, ws.orders[lvl],
-                              xi, scale, ws.val1d[lvl], ws.der1d[lvl], parent.cell)
+# Evaluate every parent's basis at the current point into the bank: values and
+# physical gradients (`Val(true)`), or values only (`Val(false)`, for the L²
+# transfer rhs, whose integrand never reads a gradient). The gradient scale is
+# the axis-aligned chain rule `2 / edge_lengths(parent_box)` of
+# `physical_basis_gradients` in `basis.jl`. One basis evaluation per parent per
+# point; a region's parents have distinct levels, so their bank slots never
+# collide.
+@noinline function _refresh!(ws::AssemblyWorkspace{D,T}, region, ref, ::Val{G}) where {D,T,G}
+    bank = ws.bank
+    for parents in _parent_lists(region), p in parents
+        l = p.level
+        ids = bank.modes[l].sets[bank.modes[l].kind[p.cell]]
+        xi = _parent_xi(p, ref)
+        if G
+            scale = SVector{D,T}(2 .* inv.(edge_lengths(p.parent_box)))
+            _tensor_values_grads!(bank.bases[l], bank.values[l], bank.gradients[l], ids,
+                                  bank.orders[l], xi, scale, bank.val1d[l], bank.der1d[l], p.cell)
+        else
+            _tensor_values!(bank.bases[l], bank.values[l], ids, bank.orders[l], xi, bank.val1d[l],
+                            p.cell)
+        end
     end
     return nothing
 end
 
-# Region setup for `_assemble_region!`, shared by every region kind: build
-# the per-field parent records (aliasing the workspace buffers), build the
-# per-region local-to-global dof table, attach the optional `FormState`, and
-# resize/clear the local matrix and rhs buffers. Returns the assembled view
-# objects the hot loop walks.
-#
-# This per-region setup is invariant across repeated `assemble!` calls for a
-# fixed model, so caching it on the Model (a per-region descriptor cache) was
-# considered. Profiling on helios (32C; 2D order-3/4 and 3D order-3 base+overlay)
-# measured it at only ~0.9% / ~0.1% of repeated-`assemble!` wall time and
-# ≤2.3% of allocation — the hot path is the irreducible `O(Q·n²)` numeric kernel
-# (`_accumulate_qpoint_generic!`), and the threaded scatter's working memory is
-# the flat, pooled compute→gather arena (thread-count-independent), not this
-# setup. So it is rebuilt per call rather than cached; re-profile before
-# reconsidering.
-function _region_workspace_setup!(ws::AssemblyWorkspace{D,T}, model::Model{D,T}, region,
-                                  state_coefficients, have_blocks::Bool) where {D,T}
-    field_data = _region_field_data(ws, model, region)
-    local_by_field = _local_active_dof_table!(ws, field_data, model.dofs)
-    state = state_coefficients === nothing ? nothing :
-            FormState(field_data, model.dofs, state_coefficients)
+# ── FormState ─────────────────────────────────────────────────────────────────
 
-    n = length(ws.active_dofs)
-    nn = have_blocks ? n * n : 0
-    resize!(ws.local_matrix, nn)
-    fill!(ws.local_matrix, zero(T))
-    resize!(ws.local_rhs, n)
-    fill!(ws.local_rhs, zero(T))
-    local_matrix = reshape(view(ws.local_matrix, 1:nn), have_blocks ? n : 0, have_blocks ? n : 0)
-    local_rhs = ws.local_rhs
-    return field_data, local_by_field, state, local_matrix, local_rhs
+"""
+    FormState
+
+The current solution iterate at a quadrature point, exposed to weak-form
+callbacks as `q.state` when assembling with `state=`. Query it with
+`value(q.state, field[, component])` and `field_gradient(q.state, field[,
+component])`, where `field` is a field name `Symbol` or a
+[`Field`](@ref).
+
+Evaluation is eager. Every field's value and physical gradient, per
+component, is computed once per quadrature point from dof values read once
+per integration region, so a read is an index into a buffer and a callback
+can read `q.state` as often as it likes. The values are those of the current
+point and are valid during the callback only: the same object is refilled at
+the next point, so keep the numbers, not the `FormState`.
+
+The values carry the iterate's number type promoted with the model's: a
+`BigFloat` iterate on a `Float64` model yields `BigFloat` values and
+gradients. A component outside the field's range raises a `BoundsError`, and
+an unknown field name an `ArgumentError`.
+
+`FormState` is what makes the assembly path Newton-linearisation
+friendly: a `bilinear` callback that wants the current iterate
+`uₖ(x)` for building a tangent operator simply asks `q.state` for the
+value or gradient.
+
+`field_gradient` (rather than the natural shorter `gradient`) avoids a
+name collision with `Tensors.gradient`, the automatic-differentiation
+entry point of the Tensors.jl package, so the two can be loaded
+together unrestricted; `value` does not collide and keeps its short
+name.
+"""
+struct FormState{D,R,L<:SystemLayout}
+    # The model's layout and the iterate, converted once per call to
+    # `Vector{R}`, `R = promote_type(T, eltype(state))`; shared read-only.
+    layout::L
+    coefficients::Vector{R}
+    # `dof_value` of every slot of the current region (`_state_region!`).
+    slot_values::Vector{R}
+    # Field `f`, component `c` at the current point lives at `offsets[f] + c`
+    # (`_state_point!`).
+    values::Vector{R}
+    gradients::Vector{SVector{D,R}}
+    offsets::Vector{Int}
 end
 
-# Accumulate every weak-form contribution at one quadrature point into
-# the per-region local matrix and rhs. Walks loads first (linear
-# channels into the rhs), then blocks (bilinear channels into the
-# matrix, with Dirichlet-column elimination moving constrained columns
-# onto the rhs). Symmetric blocks emit only the lower-triangular
-# entries; `_matrix_from_pattern` mirrors at the end.
-#
-# Extracted from `_assemble_region!` so every region kind shares this
-# inner work — the kind-specific details (Q-point source, basis refresh,
-# `q` tuple shape) all live in the caller and its accessors.
-#
-# Two overloads, selected by the per-region dof-table representation
-# built in `_local_active_dof_table!`:
-#
-#   * `LocalDofExpansion` tables → the general linear-constraint path,
-#     distributing each emission through the test and trial expansions
-#     (a B-spline mask below maximal continuity);
-#   * `Matrix{Int}` tables → the lightweight path for layouts with no
-#     non-trivial linear constraints (integrated Legendre and the C⁰
-#     B-spline mesh-edge path), where every raw has a single
-#     active-or-constrained target.
-#
-# Both overloads share one outer loop, `_accumulate_qpoint_generic!`;
-# only the per-emission kernels (`_emit_load!` / `_emit_block!`) differ,
-# and they dispatch statically on the concrete table type. These two thin
-# overloads are the per-quadrature-point dispatch barrier: `local_by_field`
-# is a small union at the call site, so resolving it here (once per point)
-# lets the generic body specialise on the concrete table type and inline
-# the right kernel — no per-emission dynamic dispatch.
-function _accumulate_qpoint!(local_matrix, local_rhs, q, qweight::T, field_data,
-                             local_by_field::AbstractVector{<:AbstractVector{<:LocalDofExpansion}},
-                             active_dofs::Vector{Int}, blocks::B, loads::L, symmetric::Bool,
-                             model::Model{D,T}, ::Val{D}, ::Type{T}) where {B,L,D,T}
-    return _accumulate_qpoint_generic!(local_matrix, local_rhs, q, qweight, field_data,
-                                       local_by_field, active_dofs, blocks, loads, symmetric, model,
-                                       Val(D), T)
+# A state with private per-point buffers over the shared coefficient vector:
+# one per task, since the buffers are rewritten at every point.
+function FormState(layout::SystemLayout{D}, coefficients::Vector{R}) where {D,R}
+    offsets = zeros(Int, length(layout.fields) + 1)
+    for (f, fl) in pairs(layout.fields)
+        offsets[f+1] = offsets[f] + fl.components
+    end
+    return FormState{D,R,typeof(layout)}(layout, coefficients, R[], zeros(R, offsets[end]),
+                                         zeros(SVector{D,R}, offsets[end]), offsets)
 end
 
-function _accumulate_qpoint!(local_matrix, local_rhs, q, qweight::T, field_data,
-                             local_by_field::AbstractVector{<:AbstractVector{Matrix{Int}}},
-                             active_dofs::Vector{Int}, blocks::B, loads::L, symmetric::Bool,
-                             model::Model{D,T}, ::Val{D}, ::Type{T}) where {B,L,D,T}
-    return _accumulate_qpoint_generic!(local_matrix, local_rhs, q, qweight, field_data,
-                                       local_by_field, active_dofs, blocks, loads, symmetric, model,
-                                       Val(D), T)
+# Buffer index of field `name`, component `component`, checking both.
+function _state_index(state::FormState, name::Symbol, component::Integer)
+    f = get(state.layout.by_name, name, 0)
+    f == 0 && throw(ArgumentError("unknown field $name"))
+    1 <= component <= state.layout.fields[f].components ||
+        throw(BoundsError(state, (name, component)))
+    return state.offsets[f] + component
 end
+
+"""
+    value(state::FormState, name_or_field[, component=1])
+
+Read the named field's value at the current quadrature point. `name` is
+either a `Symbol` matching a field name in the model or a [`Field`](@ref)
+object. For multi-component fields, pass `component`.
+"""
+function value(state::FormState, name::Symbol, component::Integer=1)
+    return state.values[_state_index(state, name, component)]
+end
+
+"""
+    field_gradient(state::FormState, name_or_field[, component=1])
+
+Read the named field's physical gradient at the current quadrature
+point. Same field/component semantics as [`value`](@ref). The leading
+`field_` is there to avoid colliding with `Tensors.gradient` (the
+automatic-differentiation entry point) when both packages are loaded
+together.
+"""
+function field_gradient(state::FormState, name::Symbol, component::Integer=1)
+    return state.gradients[_state_index(state, name, component)]
+end
+
+value(state::FormState, field::Field, component::Integer=1) = value(state, field.name, component)
+function field_gradient(state::FormState, field::Field, component::Integer=1)
+    field_gradient(state, field.name, component)
+end
+
+# Tiny helper raising the "no state attached" error from a single
+# location. Reaching it indicates a callback dereferenced `q.state`
+# without the caller passing `state =` to the assembly entry point.
+function _no_form_state()
+    throw(ArgumentError("q.state is unavailable; assemble with `state = current_iterate`"))
+end
+value(::Nothing, args...) = _no_form_state()
+field_gradient(::Nothing, args...) = _no_form_state()
+
+# Read the dof value of every slot of the region `ws` was framed on, once per
+# region: `dof_value` resolves a constrained slot to its stored value and a
+# pivot to its expansion, so the per-point sums below need no branch. This
+# replaces a `dof_value` call per dof per read, which made a Newton tangent
+# reading `q.state` cost O(n²) state work per point instead of O(n).
+function _state_region!(state::FormState, ws::AssemblyWorkspace)
+    resize!(state.slot_values, length(ws.slots))
+    for (f, fl) in pairs(ws.layout.fields), p in ws.fptr[f]:(ws.fptr[f+1]-1)
+        _, s0, raw = ws.parents[p]
+        for c in 1:fl.components, i in eachindex(raw)
+            state.slot_values[s0+(c-1)*length(raw)+i] = dof_value(fl, state.coefficients, raw[i], c)
+        end
+    end
+    return state
+end
+
+# Evaluate every field's components at the current point from the refreshed
+# bank: per parent the partial sum `Σᵢ uᵢ φᵢ` (and `Σᵢ uᵢ ∇φᵢ` when `G`), then the
+# sum over parents. That is the association the field-evaluation helpers above
+# use, so a state reads the same bits as `value(solution, model, x)`'s
+# reconstruction of the same sum. Returns `state`, which becomes `q.state`.
+function _state_point!(state::FormState{D,R}, ws::AssemblyWorkspace, ::Val{G}) where {D,R,G}
+    bank = ws.bank
+    for (f, fl) in pairs(ws.layout.fields), c in 1:fl.components
+        v, g = zero(R), zero(SVector{D,R})
+        for p in ws.fptr[f]:(ws.fptr[f+1]-1)
+            l, s0, raw = ws.parents[p]
+            s = s0 + (c - 1) * length(raw)
+            pv, pg = zero(R), zero(SVector{D,R})
+            @inbounds for i in eachindex(raw)
+                u = state.slot_values[s+i]
+                pv += u * bank.values[l][i]
+                G && (pg += u * bank.gradients[l][i])
+            end
+            v += pv
+            G && (g += pg)
+        end
+        state.values[state.offsets[f]+c] = v
+        state.gradients[state.offsets[f]+c] = g
+    end
+    return state
+end
+
+# The scalar type `T` of a layout.
+_scalar(::SystemLayout{D,T}) where {D,T} = T
+
+# Check a `state` argument (`nothing`, a pin-checked `Solution`, or a
+# length-checked coefficient vector, see `_iterate_coefficients`) and convert it
+# once to `Vector{R}` with `R = promote_type(T, eltype(state))`, so the eltype
+# stays generic while the state's container type stops being a specialisation
+# axis of the kernel. A `Vector{R}` passes through without a copy.
+function _state_vector(@nospecialize(state), @nospecialize(model::Model))
+    coefficients = _iterate_coefficients(state, model)
+    coefficients === nothing && return nothing
+    R = promote_type(_scalar(model.dofs), eltype(coefficients))
+    return coefficients isa Vector{R} ? coefficients : convert(Vector{R}, coefficients)
+end
+
+# ── The kernel ────────────────────────────────────────────────────────────────
 
 # Apply `f(form, args...)` to every form of the tuple `forms`, first to last,
-# unrolled at compile time by recursion on `first` / `Base.tail`. The hot loop
+# unrolled at compile time by recursion on `first` / `Base.tail`. The kernel
 # below walks its `blocks` and `loads` through this rather than through
 # `for form in forms`.
 #
@@ -1222,215 +956,247 @@ end
 # elements through a runtime index, and inference types the loop variable as the
 # union of the element types — but only up to three members (the compiler's
 # `MAX_TYPEUNION_LENGTH`). A fourth distinct form type widens the loop variable
-# to the abstract `BlockForm` / `LoadForm`, and every `_bilinear_channels` /
-# `_linear_channels` call, and everything downstream of its result, then
-# dispatches dynamically and allocates, once per trial dof × component ×
-# quadrature point. Measured on Julia 1.12.5, serial: one scalar field on a
-# 16 × 16 order-2 mesh assembled three distinct blocks in 1.7 ms and 1.0 MB, and
-# four in 65 ms and 420 MB; a space-time Navier–Stokes Jacobian with the four
-# blocks (u,u), (u,p), (p,u), (p,p) took 1.19 s and 7.5 GB, where the same four
-# blocks assembled one at a time took 0.029 s. The recursion hands every call
-# its element's concrete type, so the cost no longer depends on how many
-# distinct forms a problem carries.
+# to the abstract `BlockForm` / `LoadForm`, and every callback call, and
+# everything downstream of its result, then dispatches dynamically and
+# allocates, once per trial dof × component × quadrature point. Measured on
+# Julia 1.12.5, serial: one scalar field on a 16 × 16 order-2 mesh assembled
+# three distinct blocks in 1.7 ms and 1.0 MB, and four in 65 ms and 420 MB; a
+# space-time Navier–Stokes Jacobian with the four blocks (u,u), (u,p), (p,u),
+# (p,p) took 1.19 s and 7.5 GB, where the same four blocks assembled one at a
+# time took 0.029 s. The recursion hands every call its element's concrete
+# type, so the cost no longer depends on how many distinct forms a problem
+# carries.
 #
 # Why the per-form work is a named function taking explicit arguments, and not
-# a `do` block: a closure capturing the dozen locals of the accumulation is too
-# large to inline, so every one of those reads goes through the closure object,
-# and that alone measured about 4 % slower on single-form Poisson assembly, where
-# this walker is level with the old `for` loop. `args` is one concrete `Tuple`
-# rather than a vararg, because Julia may decline to specialise on a vararg that
-# is only passed through.
-#
-# Order and arithmetic are unchanged: `f` sees the forms in tuple order and runs
-# the old loop body, so wherever that loop was type-stable — up to three
-# distinct form types — the matrices and right-hand sides are the same bits as
-# before, serial and threaded alike. Beyond three, the dynamic path called the
-# contraction `_test_contribution` as a standalone method, and at the default
-# optimisation level LLVM fuses its `@simd` dot product into multiply-adds only
-# when it is inlined; those results therefore move by a few ulps, onto the bits
-# the type-stable path gives.
+# a `do` block: a closure capturing the locals of the accumulation is too large
+# to inline, so every one of those reads goes through the closure object, and
+# that alone measured about 4 % slower on single-form Poisson assembly. `args`
+# is one concrete `Tuple` rather than a vararg, because Julia may decline to
+# specialise on a vararg that is only passed through.
 @inline _foreach_form(f::F, ::Tuple{}, args::Tuple) where {F} = nothing
 @inline function _foreach_form(f::F, forms::Tuple, args::Tuple) where {F}
     f(first(forms), args...)
     return _foreach_form(f, Base.tail(forms), args)
 end
 
-# Shared quadrature-point accumulation: loads (linear channels → rhs)
-# then blocks (bilinear channels → matrix, with Dirichlet-column
-# elimination → rhs). Symmetric blocks emit only the lower triangle;
-# `_matrix_from_pattern` mirrors at the end. Walks the standard
-# field × component × parent × dof nest and defers every per-emission
-# decision to `_emit_load!` / `_emit_block!`, which the typed overloads
-# above specialise to the concrete `local_by_field` table type. The forms
-# themselves are walked by `_foreach_form`, never by a `for` loop: see the
-# comment above it for why.
-function _accumulate_qpoint_generic!(local_matrix, local_rhs, q, qweight::T, field_data,
-                                     local_by_field, active_dofs::Vector{Int}, blocks::B, loads::L,
-                                     symmetric::Bool, model::Model{D,T}, ::Val{D},
-                                     ::Type{T}) where {B,L,D,T}
-    _foreach_form(_accumulate_load!, loads,
-                  (local_rhs, q, qweight, field_data, local_by_field, model))
-    _foreach_form(_accumulate_block!, blocks,
-                  (local_matrix, local_rhs, q, qweight, field_data, local_by_field, active_dofs,
-                   symmetric, model))
-    return nothing
+# Integrate every form of `pass` (its `blocks` and `loads` tuples) over one
+# integration region into the workspace's local system, and return `n`, the
+# region's number of active local indices. `ws.dofs` then names the global id of
+# each local index, `ws.b[1:n]` is the region's rhs and, for a pass with blocks,
+# `ws.K` holds its matrix as an `m × m` column-major array whose leading `n × n`
+# block is the active part (`m = n + length(ws.pivots)`). This is the assembly
+# hot loop.
+#
+# One method serves all four region kinds; only the accessors above differ:
+#
+#   * a **volume** region iterates reference-frame points and scales each weight
+#     by `vol(box)/2ᴰ`; `q.normal` and `q.sides` are `nothing`;
+#   * a **facet** region iterates precomputed physical points and carries the
+#     face's outward normal `q.normal` and codim-`K` identifier `q.sides`, so
+#     forms can express Neumann, Robin and Nitsche contributions;
+#   * a **surface** (immersed-boundary) region is a facet with a per-point
+#     `q.normal` and no `q.sides`;
+#   * an **interface** region is two-sided: it refreshes both subdomains' bases
+#     at the shared point and carries the per-point normal oriented from side
+#     `a` to side `b`.
+#
+# Every active local basis function of every parent participates. In
+# particular `is_facet_basis` is not applied on the physical-frame kinds: a
+# function with zero *value* on a face can carry a nonzero *gradient*, which
+# Nitsche-style forms rely on.
+#
+# Per point the kernel refreshes the bases, evaluates the state when there is
+# one, and composes `q = (; x, weight, point, state, normal, sides)`, with
+# `point = offset + k` the stable index `nquadpoints` sizes and the walkers
+# share. Loads are evaluated first, then blocks, each through `_emit!`.
+# Constrained trial columns move to the rhs as they are emitted; pivot rows and
+# columns are kept whole and condensed once after the last point.
+#
+# `@noinline` is the per-region function barrier the drivers rely on: there is
+# one compiled instance per (pass type, region kind, state type), and the
+# contraction's code generation, which decides how `_test_contribution`'s
+# `dot` rounds, is fixed inside it whichever driver calls it.
+@noinline function _integrate!(ws::AssemblyWorkspace{D,T}, pass, region, offset::Int, state,
+                               sym::Bool) where {D,T}
+    _frame!(ws, region)
+    n = _slots!(ws)
+    m = n + length(ws.pivots)
+    state === nothing || _state_region!(state, ws)
+    fill!(resize!(ws.K, isempty(pass.blocks) ? 0 : m * m), zero(T))
+    fill!(resize!(ws.b, m), zero(T))
+    jacobian = _region_jacobian(region)
+    for k in 1:_region_qpoint_count(region)
+        x, w, ref = _region_point(region, k, jacobian)
+        _refresh!(ws, region, ref, Val(true))
+        st = state === nothing ? nothing : _state_point!(state, ws, Val(true))
+        q = (; x, weight=w, point=offset + k, state=st, normal=_region_normal(region, k),
+             sides=_region_sides(region))
+        _foreach_form(_load!, pass.loads, (ws, q, n, m, sym))
+        _foreach_form(_block!, pass.blocks, (ws, q, n, m, sym))
+    end
+    isempty(ws.pivots) || _condense!(ws, n, m, sym, !isempty(pass.blocks))
+    return n
 end
 
-# One load's contribution at one quadrature point: its linear channels,
-# contracted against every test dof of its field and emitted into the rhs.
-function _accumulate_load!(load, local_rhs, q, qweight::T, field_data, local_by_field,
-                           model::Model{D,T}) where {D,T}
-    test_index = _field_index(model.dofs, load.test_name)
-    test_layout = model.dofs.fields[test_index]
-    test_data = field_data[test_index]
-    test_tables = local_by_field[test_index]
-    for test_component in 1:test_layout.components
-        linear_channels = _linear_channels(load.form, q, test_component, Val(D), T)
-        for (data, table) in zip(test_data, test_tables)
-            for a in eachindex(data.raw_dofs)
-                contribution = qweight * _test_contribution(linear_channels, data.values[a],
-                                                            data.gradients[a])
-                _emit_load!(local_rhs, table, a, test_component, contribution)
+# Contract one test channel `ch` against every test function of field `f`,
+# component `tc`, and emit the weighted result `e = w · ch(φ)` by the roles of
+# the test row and the trial column `col`:
+#
+#   * a constrained test row (slot 0) is dropped;
+#   * `col > 0`, an active or pivot trial column, accumulates `K[row, col] += e`;
+#   * `col == 0`, a constrained trial column with value `g`, moves to the rhs as
+#     `b[row] −= e·g` (column elimination). A load is emitted as this case with
+#     `g = −1`, since `b − e·(−1)` is exactly `b + e` in IEEE arithmetic.
+#
+# Under a symmetric form an active row above an active column is skipped before
+# the contraction, which halves it: sorted local numbering makes "local row <
+# col" the same test as "global row < col", and the mirror rebuilds that half.
+# Pivot rows and columns (`> n`) are never skipped; `_condense!` keeps the
+# triangle when it folds them.
+#
+# The bank is read through `ws` inside the loop on purpose. Hoisting
+# `ws.bank.values[l]` above it made 3D assembly 1.6× slower (8³ cells, order 2:
+# 19.7 against 12.2 ms), so re-measure 3D before changing this loop's shape.
+@inline function _emit!(ws::AssemblyWorkspace, ch, f::Int, tc::Int, w, col::Int, g, n::Int, m::Int,
+                        sym::Bool)
+    for p in ws.fptr[f]:(ws.fptr[f+1]-1)
+        l, s0, raw = ws.parents[p]
+        s = s0 + (tc - 1) * length(raw)
+        @inbounds for a in eachindex(raw)
+            row = ws.slots[s+a]
+            (row == 0 || (sym && row < col <= n)) && continue
+            e = w * _test_contribution(ch, ws.bank.values[l][a], ws.bank.gradients[l][a])
+            if col == 0
+                ws.b[row] -= e * g
+            else
+                ws.K[(col-1)*m+row] += e
             end
         end
     end
     return nothing
 end
 
-# One block's contribution at one quadrature point: the trial × test nest over
-# its two fields, emitted into the local matrix with Dirichlet-column
-# elimination onto the rhs.
-function _accumulate_block!(block, local_matrix, local_rhs, q, qweight::T, field_data,
-                            local_by_field, active_dofs::Vector{Int}, symmetric::Bool,
-                            model::Model{D,T}) where {D,T}
-    test_index = _field_index(model.dofs, block.test_name)
-    trial_index = _field_index(model.dofs, block.trial_name)
-    test_layout = model.dofs.fields[test_index]
-    trial_layout = model.dofs.fields[trial_index]
-    for trial_component in 1:trial_layout.components
-        for (trial_data, trial_table) in zip(field_data[trial_index], local_by_field[trial_index])
-            for b in eachindex(trial_data.raw_dofs)
-                trial = TrialChannels(trial_component, trial_data.values[b],
-                                      trial_data.gradients[b])
-                # Trial-side data invariant across test dofs, hoisted once per
-                # trial dof: the active-branch offsets for an expansion table, or
-                # the global/local column for a matrix table.
-                tctx = _trial_block_context(trial_table, trial_data, trial_layout, b,
-                                            trial_component)
-                for test_component in 1:test_layout.components
-                    channels = _bilinear_channels(block.form, q, trial, test_component)
-                    for (test_data, test_table) in
-                        zip(field_data[test_index], local_by_field[test_index])
-                        for a in eachindex(test_data.raw_dofs)
-                            entry = qweight * _test_contribution(channels, test_data.values[a],
-                                                                 test_data.gradients[a])
-                            _emit_block!(local_matrix, local_rhs, test_table, test_data,
-                                         test_layout, tctx, a, test_component, entry, symmetric,
-                                         active_dofs)
-                        end
-                    end
+# One load at one quadrature point: its linear channels, per test component,
+# emitted into the rhs. A field that owns no parent in this region returns
+# before the callback runs (a foreign subdomain on a coupled model).
+# Component-aware forms are called with `(q, test_component)`, the rest with
+# `(q,)` and apply to every component alike.
+function _load!(ld::LoadForm, ws::AssemblyWorkspace{D,T}, q, n::Int, m::Int, sym::Bool) where {D,T}
+    f = _field_index(ws.layout, ld.test_name)
+    ws.fptr[f] == ws.fptr[f+1] && return nothing
+    for tc in 1:ws.layout.fields[f].components
+        ch = _as_test_channels(ld.form.component_aware ? ld.form.linear(q, tc) : ld.form.linear(q),
+                               Val(D), T)
+        _emit!(ws, ch, f, tc, q.weight, 0, -one(T), n, m, sym)
+    end
+    return nothing
+end
+
+# One block at one quadrature point: the trial component → trial parent → trial
+# function → test component nest, each channel emitted by `_emit!` over the test
+# parents. The trial function's slot is read once, with its constrained value
+# `g` when the column is eliminated. Component-aware forms see every
+# (trial, test) component pair; component-unaware forms apply on the diagonal
+# `test_component == trial_component` only and are called with `(q, trial)`. A
+# block whose test field owns no parent in this region returns before the
+# callback runs.
+function _block!(bl::BlockForm, ws::AssemblyWorkspace{D,T}, q, n::Int, m::Int,
+                 sym::Bool) where {D,T}
+    tf, uf = _field_index(ws.layout, bl.test_name), _field_index(ws.layout, bl.trial_name)
+    ws.fptr[tf] == ws.fptr[tf+1] && return nothing
+    C, ul, aware = ws.layout.fields[tf].components, ws.layout.fields[uf], bl.form.component_aware
+    for trc in 1:ul.components, pu in ws.fptr[uf]:(ws.fptr[uf+1]-1)
+        l, s0, raw = ws.parents[pu]
+        for j in eachindex(raw)
+            col = ws.slots[s0+(trc-1)*length(raw)+j]
+            g = col == 0 ? constrained_value(ul.dofs, raw[j], trc) : zero(T)
+            trial = TrialChannels(trc, ws.bank.values[l][j], ws.bank.gradients[l][j])
+            for tc in (aware ? (1:C) : (trc:min(trc, C)))
+                ch = _as_test_channels(aware ? bl.form.bilinear(q, trial, tc) :
+                                       bl.form.bilinear(q, trial), Val(D), T)
+                _emit!(ws, ch, tf, tc, q.weight, col, g, n, m, sym)
+            end
+        end
+    end
+    return nothing
+end
+
+# Fold the region's linear-constraint pivots onto their branches, once after the
+# quadrature loop. With `P` the `m × n` expansion that is the identity on the
+# active indices and maps pivot `n + k` onto its active branches `(x, w)`, this
+# is
+#
+#     K ← Pᵀ K P,    b ← Pᵀ b − lift,
+#
+# restricted to the active block, where `lift` carries each pivot column's
+# Dirichlet branches `(w, v)`. Every expansion has depth one, so one pass over
+# the rows and one over the columns is exact:
+#
+#   * row step, pivot test row `v` and active branch `(x, w)`:
+#     `b[x] += w·b[v]` and `K[x, y] += w·K[v, y]` for every column `y`, keeping
+#     `x ≥ y` for an active `y` under a symmetric form. A test row's Dirichlet
+#     branch is dropped, as a constrained test row is;
+#   * column step, pivot trial column `u`: an active branch `(y, w)` adds
+#     `w·K[x, u]` to `K[x, y]` for `x ∈ (sym ? y : 1):n`; a Dirichlet branch
+#     with value `v ≠ 0` lifts `b[x] −= (w·v)·K[x, u]` for every `x ∈ 1:n`.
+#
+# The branches come from the dof layer's `_fold_pivot`, which `dof_value` reads
+# too, so assembly and reconstruction cannot expand a pivot differently. It
+# differs from distributing every emission through the expansions only in
+# summation order (≤ 1e-16 relative on the gate's pivot scenarios). It handles a
+# branch shared by several slots, a pivot appearing in several parents, and the
+# lift through a pivot, with no branching in the emission loop.
+function _condense!(ws::AssemblyWorkspace, n::Int, m::Int, sym::Bool, matrix::Bool)
+    K, b = ws.K, ws.b
+    for k in eachindex(ws.pivots)
+        v = n + k
+        f, raw, c = ws.pivots[k]
+        fl = ws.layout.fields[f]
+        id = (o, cc) -> _field_component_dof(fl, o, cc)
+        _fold_pivot(nothing, fl.dofs, id, raw, c) do _, g, w, _
+            g == 0 && return nothing
+            x = searchsortedfirst(ws.dofs, g)
+            b[x] += w * b[v]
+            matrix || return nothing
+            for y in 1:m
+                (sym && y <= n && x < y) || (K[(y-1)*m+x] += w * K[(y-1)*m+v])
+            end
+            return nothing
+        end
+    end
+    matrix || return nothing
+    for k in eachindex(ws.pivots)
+        u = n + k
+        f, raw, c = ws.pivots[k]
+        fl = ws.layout.fields[f]
+        id = (o, cc) -> _field_component_dof(fl, o, cc)
+        _fold_pivot(nothing, fl.dofs, id, raw, c) do _, g, w, gv
+            if g == 0
+                iszero(gv) && return nothing
+                for x in 1:n
+                    b[x] -= w * gv * K[(u-1)*m+x]
+                end
+            else
+                y = searchsortedfirst(ws.dofs, g)
+                for x in (sym ? y : 1):n
+                    K[(y-1)*m+x] += w * K[(u-1)*m+x]
                 end
             end
+            return nothing
         end
     end
     return nothing
 end
 
-# ── Per-emission kernels (one pair each for the two table types) ──────────────
-
-# Distribute one test dof's linear (load) contribution into the rhs.
-# Expansion table: fan the contribution out across the dof's active
-# branches. Matrix table: a single active row (skip if constrained).
-@inline function _emit_load!(local_rhs, table::LocalDofExpansion, a::Int, c::Int, contribution)
-    base = table.active_offset[a, c] - 1
-    @inbounds for k in 1:table.active_count[a, c]
-        local_rhs[table.active_pos_flat[base + k]] += table.active_w_flat[base + k] * contribution
-    end
-    return nothing
-end
-
-@inline function _emit_load!(local_rhs, table::Matrix{Int}, a::Int, c::Int, contribution)
-    local_row = table[a, c]
-    local_row == 0 && return nothing
-    local_rhs[local_row] += contribution
-    return nothing
-end
-
-# Per-trial-dof context, hoisted out of the test-dof loop. Expansion
-# table: the trial dof's active and Dirichlet branch slices. Matrix
-# table: the trial dof's global active id (`col`, 0 if constrained) and
-# its local column. Both carry `trial_layout.dofs` (for `constrained_value`)
-# and the trial component. Returned as a `NamedTuple` so it inlines with
-# no allocation; the two `_emit_block!` kernels read the fields each needs.
-@inline function _trial_block_context(trial_table::LocalDofExpansion, trial_data, trial_layout,
-                                      b::Int, trc::Int)
-    return (base=trial_table.active_offset[b, trc] - 1, n=trial_table.active_count[b, trc],
-            dbase=trial_table.dir_offset[b, trc] - 1, dn=trial_table.dir_count[b, trc],
-            posflat=trial_table.active_pos_flat, wflat=trial_table.active_w_flat,
-            dwflat=trial_table.dir_w_flat, drawflat=trial_table.dir_raw_flat,
-            dofs=trial_layout.dofs, trc=trc)
-end
-
-@inline function _trial_block_context(trial_table::Matrix{Int}, trial_data, trial_layout, b::Int,
-                                      trc::Int)
-    return (col=_field_component_dof(trial_layout, trial_data.raw_dofs[b], trc),
-            localcol=trial_table[b, trc], raw=trial_data.raw_dofs[b], dofs=trial_layout.dofs,
-            trc=trc)
-end
-
-# Emit one (test a, trial b) bilinear contribution; `tctx` is the trial
-# dof's hoisted context. Expansion table: distribute `entry` through the
-# test × trial active branches into the matrix and the trial Dirichlet
-# branches into the rhs (column elimination). The symmetric lower-triangle
-# skip compares the *global* active ids of the two branches, since a
-# pivot's branches can land at different ids.
-@inline function _emit_block!(local_matrix, local_rhs, test_table::LocalDofExpansion, test_data,
-                              test_layout, tctx, a::Int, tc::Int, entry, symmetric::Bool,
-                              active_dofs::Vector{Int})
-    test_base = test_table.active_offset[a, tc] - 1
-    test_n = test_table.active_count[a, tc]
-    @inbounds for kr in 1:test_n
-        test_local = test_table.active_pos_flat[test_base + kr]
-        tw = test_table.active_w_flat[test_base + kr]
-        for kc in 1:tctx.n
-            trial_local = tctx.posflat[tctx.base + kc]
-            symmetric && active_dofs[test_local] < active_dofs[trial_local] && continue
-            local_matrix[test_local, trial_local] += tw * tctx.wflat[tctx.base + kc] * entry
-        end
-        for kd in 1:tctx.dn
-            local_rhs[test_local] -= tw *
-                                     tctx.dwflat[tctx.dbase + kd] *
-                                     entry *
-                                     constrained_value(tctx.dofs, tctx.drawflat[tctx.dbase + kd],
-                                                       tctx.trc)
-        end
-    end
-    return nothing
-end
-
-# Matrix-table variant: a single (row, col) target. Skip a constrained
-# test row; redirect a constrained trial column to the rhs via Dirichlet
-# elimination (`constrained_value` is zero for homogeneous overlay
-# constraints, so those columns vanish). `local_row == 0` ⇔ the test
-# global id is 0, so it doubles as the constrained-test check.
-@inline function _emit_block!(local_matrix, local_rhs, test_table::Matrix{Int}, test_data,
-                              test_layout, tctx, a::Int, tc::Int, entry, symmetric::Bool,
-                              active_dofs::Vector{Int})
-    local_row = test_table[a, tc]
-    local_row == 0 && return nothing
-    # Symmetric lower-triangle skip via the already-resolved global ids:
-    # `active_dofs[local_row]` is this test row's global id — identical to the
-    # old per-emission `_field_component_dof(test_layout, raw_dofs[a], tc)`
-    # recompute, but a single vector index instead of an `active_component`
-    # matrix lookup + offset. Profiling on helios attributed ~21% of the 2D
-    # numeric kernel to that recompute; this matches what the
-    # `LocalDofExpansion` variant already does.
-    symmetric && tctx.col != 0 && active_dofs[local_row] < tctx.col && return nothing
-    if tctx.col == 0
-        local_rhs[local_row] -= entry * constrained_value(tctx.dofs, tctx.raw, tctx.trc)
-    else
-        local_matrix[local_row, tctx.localcol] += entry
-    end
+# Bridge from the kernel to the sink-based drivers below: integrate one region,
+# then hand its active block, rhs and dof list to `_emit_local_system!`.
+function _assemble_region!(ws::AssemblyWorkspace, sink, rhs, region, blocks, loads, symmetric::Bool,
+                           state, point_offset::Int)
+    n = _integrate!(ws, (; blocks, loads), region, point_offset, state, symmetric)
+    m = isempty(blocks) ? 0 : n + length(ws.pivots)
+    k = min(n, m)
+    local_matrix = view(reshape(view(ws.K, 1:(m*m)), m, m), 1:k, 1:k)
+    _emit_local_system!(sink, rhs, ws.dofs, local_matrix, ws.b)
     return nothing
 end
 
@@ -1473,12 +1239,22 @@ end
 # to the bit.
 function _assemble_system_serial!(sink, rhs::Vector{T}, model::Model{D,T}, regions, symmetric::Bool,
                                   blocks, loads, region_filter, state_coefficients) where {D,T}
-    ws = _assembly_workspace(model)
-    offsets = _region_qpoint_offsets(regions)
+    state = state_coefficients === nothing ? nothing : FormState(model.dofs, state_coefficients)
+    _serial_regions!(_assembly_workspace(model), sink, rhs, regions, symmetric, blocks, loads,
+                     region_filter, state, _region_qpoint_offsets(regions))
+    return nothing
+end
+
+# The serial region loop, behind a function barrier on the workspace: the
+# workspace's basis-family parameter is a runtime property of the space, so the
+# loop is compiled for the concrete workspace type and calls the kernel
+# statically, with no dispatch or boxing per region.
+function _serial_regions!(ws::AssemblyWorkspace, sink, rhs, regions, symmetric::Bool, blocks, loads,
+                          region_filter, state, offsets)
     for (region_index, region) in enumerate(regions)
         region_filter === nothing || region_filter(region) || continue
-        _assemble_region!(ws, sink, rhs, model, region, blocks, loads, symmetric,
-                          state_coefficients, offsets[region_index])
+        _assemble_region!(ws, sink, rhs, region, blocks, loads, symmetric, state,
+                          offsets[region_index])
     end
     return nothing
 end
@@ -1755,7 +1531,6 @@ function _assemble_system_threaded!(sink, rhs::Vector{T}, model::Model{D,T}, reg
                                     state_coefficients) where {D,T}
     task_count = Threads.nthreads()
     offsets = _region_qpoint_offsets(regions)
-    nreg = length(regions)
     nactive = length(rhs)
     # A pass with no bilinear blocks (e.g. a load-only problem, or `assemble_vector`
     # with its `nothing` sink) has no matrix to gather — its pattern is empty, so
@@ -1788,23 +1563,35 @@ function _assemble_system_threaded!(sink, rhs::Vector{T}, model::Model{D,T}, reg
     next = Threads.Atomic{Int}(0)
     @sync for _ in 1:task_count
         Threads.@spawn begin
-            ws = _assembly_workspace(model)
-            asink = ArenaSink{T}(arena, symmetric, 1, 1)
-            while true
-                region_index = Threads.atomic_add!(next, 1) + 1
-                region_index > nreg && break
-                region = regions[region_index]
-                region_filter === nothing || region_filter(region) || continue
-                asink.pos = plan.region_arena[region_index]
-                asink.rhs_pos = plan.region_rhs[region_index]
-                _assemble_region!(ws, asink, rhs_arena, model, region, blocks, loads, symmetric,
-                                  state_coefficients, offsets[region_index])
-            end
+            state = state_coefficients === nothing ? nothing :
+                    FormState(model.dofs, state_coefficients)
+            _arena_regions!(_assembly_workspace(model), ArenaSink{T}(arena, symmetric, 1, 1),
+                            rhs_arena, regions, plan, next, symmetric, blocks, loads, region_filter,
+                            state, offsets)
         end
     end
 
     has_matrix && _gather_matrix!(sink.nzval, plan, arena, task_count)
     _gather_rhs!(rhs, plan, rhs_arena, task_count)
+    return nothing
+end
+
+# One phase-1 task: take regions from the shared atomic counter until none is
+# left and deposit each into its arena slices. Behind a function barrier on the
+# workspace for the reason given at `_serial_regions!`.
+function _arena_regions!(ws::AssemblyWorkspace, asink::ArenaSink, rhs_arena, regions,
+                         plan::GatherPlan, next::Threads.Atomic{Int}, symmetric::Bool, blocks,
+                         loads, region_filter, state, offsets)
+    while true
+        region_index = Threads.atomic_add!(next, 1) + 1
+        region_index > length(regions) && break
+        region = regions[region_index]
+        region_filter === nothing || region_filter(region) || continue
+        asink.pos = plan.region_arena[region_index]
+        asink.rhs_pos = plan.region_rhs[region_index]
+        _assemble_region!(ws, asink, rhs_arena, region, blocks, loads, symmetric, state,
+                          offsets[region_index])
+    end
     return nothing
 end
 
@@ -1930,7 +1717,7 @@ function assemble_matrix(model::Model{D,T}, blocks; symmetric=nothing,
     symmetric_value = symmetric === nothing ? all(block -> block.form.symmetric, block_tuple) :
                       Bool(symmetric)
     nactive = active_unknowns(model.dofs)
-    coeffs = _iterate_coefficients(state, model)
+    coeffs = _state_vector(state, model)
     pattern = _assembly_pattern!(model, block_tuple, symmetric_value)
     sink = ScatterSink(zeros(T, length(pattern.rowval)), pattern)
     _assemble_partitioned!(sink, model, block_tuple, (), nactive, symmetric_value, nothing, coeffs,
@@ -1965,7 +1752,7 @@ function assemble_vector(model::Model{D,T}, loads; threaded::Bool=Threads.nthrea
                          region_filter=nothing, state=nothing) where {D,T}
     load_tuple = _form_tuple(loads)
     nactive = active_unknowns(model.dofs)
-    coeffs = _iterate_coefficients(state, model)
+    coeffs = _state_vector(state, model)
     _, rhs = _assemble_partitioned!(nothing, model, (), load_tuple, nactive, false, region_filter,
                                     coeffs, threaded)
     return rhs
@@ -2246,20 +2033,40 @@ function foreach_quadrature_point(f, model::Model{D,T}; state=nothing) where {D,
     # on the wrong parents). Per-point iteration across coupled subdomains — one
     # global quadrature-point ordering shared with assembly — is deferred.
     _assert_single_domain(model, "foreach_quadrature_point")
-    plan = integration_plan(model)
-    coefficients = _iterate_coefficients(state, model)
-    offsets = _region_qpoint_offsets(plan.regions)
-    ws = _assembly_workspace(model)
-    for (region_index, region) in enumerate(plan.regions)
-        offset = offsets[region_index]
-        jacobian = volume(region.box) / convert(T, 2^D)
-        st = coefficients === nothing ? nothing :
-             FormState(_region_field_data(ws, model, region), model.dofs, coefficients)
-        for (local_qp, (eta, weight)) in
-            enumerate(zip(region.quadrature.points, region.quadrature.weights))
-            coefficients === nothing || _update_region_basis!(ws, region, eta)
-            x = reference_to_physical(region.box, eta)
-            f((; x, weight=weight * jacobian, point=offset + local_qp, state=st))
+    regions = integration_plan(model).regions
+    return _walk(f, _volume_payload, _assembly_workspace(model), regions,
+                 _region_qpoint_offsets(regions), _walk_state(state, model))
+end
+
+# The `q` payloads of the two walkers: the volume walker's `(x, weight, point,
+# state)` and the interface walker's, which adds the interface normal.
+_volume_payload(region, k, x, weight, point, state) = (; x, weight, point, state)
+function _interface_payload(region, k, x, weight, point, state)
+    return (; x, weight, point, state, normal=_region_normal(region, k))
+end
+
+# A walker's `FormState`, or `nothing` without a state.
+function _walk_state(@nospecialize(state), @nospecialize(model::Model))
+    coefficients = _state_vector(state, model)
+    return coefficients === nothing ? nothing : FormState(model.dofs, coefficients)
+end
+
+# Call `f(q)` at every quadrature point of `regions`, in the serial assembly
+# order, with the point's coordinates and weight computed exactly as the kernel
+# computes them and `q.point = offsets[r] + k` its numbering. With a state, each
+# region's dof values are read once and every field is evaluated at every point
+# through the same `_frame!`, `_refresh!` and `_state_point!` the kernel uses;
+# without one, no basis is evaluated at all. Behind a function barrier on the
+# workspace, so the per-point calls are static.
+function _walk(f, payload, ws::AssemblyWorkspace, regions, offsets, state)
+    for (r, region) in enumerate(regions)
+        state === nothing || _state_region!(state, _frame!(ws, region))
+        jacobian = _region_jacobian(region)
+        for k in 1:_region_qpoint_count(region)
+            x, w, ref = _region_point(region, k, jacobian)
+            st = state === nothing ? nothing :
+                 (_refresh!(ws, region, ref, Val(true)); _state_point!(state, ws, Val(true)))
+            f(payload(region, k, x, w, offsets[r] + k, st))
         end
     end
     return nothing
@@ -2312,21 +2119,8 @@ iteration order matches the serial interface-assembly pass.
 function foreach_interface_quadrature_point(f, model::Model{D,T}, iface::Interface;
                                             state=nothing) where {D,T}
     regions = _resolve_on_regions(model, iface)
-    coefficients = _iterate_coefficients(state, model)
-    ws = _assembly_workspace(model)
-    offsets = _region_qpoint_offsets(regions)
-    for (region_index, region) in enumerate(regions)
-        offset = offsets[region_index]
-        # `field_data` aliases the workspace basis buffers that `_region_qpoint!`
-        # refreshes for *both* sides' parents, so the lazy `FormState` reads the
-        # current point's basis for either coupled field.
-        st = coefficients === nothing ? nothing :
-             FormState(_region_field_data(ws, model, region), model.dofs, coefficients)
-        for local_qp in 1:_region_qpoint_count(region)
-            x, qweight = _region_qpoint!(ws, region, local_qp, one(T))
-            f((; x, weight=qweight, point=offset + local_qp, state=st,
-               normal=_region_normal(region, local_qp)))
-        end
-    end
-    return nothing
+    # The frame and the refresh cover *both* sides' parents, so the state
+    # evaluates each coupled field in its own subdomain's cut cell.
+    return _walk(f, _interface_payload, _assembly_workspace(model), regions,
+                 _region_qpoint_offsets(regions), _walk_state(state, model))
 end

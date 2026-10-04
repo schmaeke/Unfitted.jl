@@ -178,21 +178,44 @@ end
     @test isposdef(Symmetric(Matrix(model.matrix)))
 end
 
-@testset "assembly workspace narrows its per-level basis bank" begin
-    # The hot loop reads `ws.bases[level]` once per parent per quadrature point,
-    # so a homogeneous space has to give that bank a concrete eltype: an abstract
-    # one turns the read into a dynamic dispatch that boxes the basis call's
-    # arguments. A space that genuinely mixes families widens the bank back to a
-    # common supertype and must still assemble.
+# Allocation count of one warm serial assembly call, behind a function barrier so
+# the count is the call's own.
+function _warm_allocations(assemble, model, args...)
+    assemble(model, args...; threaded=false)
+    assemble(model, args...; threaded=false)
+    return @allocations assemble(model, args...; threaded=false)
+end
+
+@testset "assembly allocates nothing per region or quadrature point" begin
+    # The kernel's per-region and per-point work must not allocate once warm, so
+    # a call's allocation count cannot grow with the mesh. The likeliest way to
+    # break that is the basis bank: the hot loop reads `ws.bank.bases[level]`
+    # once per parent per quadrature point, and an abstract bank turns the read
+    # into a dynamic dispatch that boxes the basis call's arguments, so a
+    # homogeneous space has to give the bank a concrete eltype. Measured on this
+    # fixture, a per-region dof table took the count from 345 at 4² cells to
+    # 3 659 at 16², and a boxed basis call from 1 724 to 26 510; the kernel that
+    # allocates nothing grows by at most a handful.
+    #
+    # `assemble!` is compared between 8² and 16², because below 256 unknowns it
+    # also computes the condition estimate, whose allocations would hide growth
+    # at 4²; `assemble_matrix` has no such step and is compared from 4².
     omega = box((0.0, 0.0), (1.0, 1.0))
     patch = box((0.25, 0.25), (0.75, 0.75))
-    homogeneous = prepare(mass(overlay(space(omega; cells=(4, 4), order=2), patch; cells=2,
-                                       order=3)))
-    @test eltype(Unfitted._assembly_workspace(homogeneous).bases) === IntegratedLegendre
+    homogeneous(c) = prepare(mass(overlay(space(omega; cells=(c, c), order=2), patch; cells=c ÷ 2,
+                                          order=3)))
+    small, medium, large = homogeneous(4), homogeneous(8), homogeneous(16)
+    @test eltype(Unfitted._assembly_workspace(small).bank.bases) === IntegratedLegendre
+    @test _warm_allocations(assemble!, large) - _warm_allocations(assemble!, medium) < 20
+    mass_u(model) = mass_block(only(model.problem.fields))
+    @test _warm_allocations(assemble_matrix, large, mass_u(large)) -
+          _warm_allocations(assemble_matrix, small, mass_u(small)) < 20
 
+    # A space that genuinely mixes families widens the bank back to a common
+    # supertype, pays the dynamic basis call, and must still assemble.
     mixed = prepare(mass(overlay(space(omega; cells=(4, 4), order=2), patch; cells=2, order=3,
                                  basis=bspline())))
-    @test !isconcretetype(eltype(Unfitted._assembly_workspace(mixed).bases))
+    @test !isconcretetype(eltype(Unfitted._assembly_workspace(mixed).bank.bases))
     assemble!(mixed)
     @test all(isfinite, mixed.matrix.nzval)
     @test issymmetric(mixed.matrix)
@@ -1001,10 +1024,10 @@ end
 
     # B-spline base + C¹ B-spline overlay (smooth basis family, overlay
     # artificial-boundary constraints, conforming dof sharing). The
-    # numeric scatter reads the assembled local block over `active_dofs`,
-    # so it is agnostic to whether the dof layer used the simple
-    # `Matrix{Int}` table or the `LocalDofExpansion` (pivot) table — this
-    # fixture exercises the B-spline assembly path regardless.
+    # numeric scatter reads the assembled local block over the region's
+    # sorted active dofs, so it is agnostic to whether the dof layer
+    # produced linear-constraint pivots — this fixture exercises the
+    # B-spline assembly path regardless.
     let V0 = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3, basis=bspline()),
         V = overlay(V0, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3,
                     basis=bspline(continuity=1))

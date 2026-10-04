@@ -23,9 +23,10 @@
 #     constitutive content (β, flux weights, cohesive traction) lives entirely
 #     in `a`, written by the user from ordinary `WeakForm`s.
 #
-# The region assembly accessors (`_region_qpoint!`, `_region_normal`, …) and
-# the `on`-resolution live with the other region kinds in `assembly.jl`; the
-# per-model region cache lives on the `Model` in `model.jl`.
+# The region assembly accessors (`_region_point`, `_refresh!`,
+# `_region_normal`, …) and the `on`-resolution live with the other region
+# kinds in `assembly.jl`; the per-model region cache lives on the `Model` in
+# `model.jl`.
 
 # ── Interface tag ─────────────────────────────────────────────────────────────
 
