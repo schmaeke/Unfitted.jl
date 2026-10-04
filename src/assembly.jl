@@ -1664,136 +1664,172 @@ _form_tuple(forms::Tuple) = forms
 _form_tuple(form) = (form,)
 
 """
-    assemble_matrix(model, block_or_blocks; symmetric=nothing,
-                    threaded=Threads.nthreads() > 1, state=nothing) -> SparseMatrixCSC
+    assemble(model; symmetric=model.problem.symmetric,
+             threaded=Threads.nthreads() > 1, state=nothing,
+             region_filter=nothing) -> (A, b)
+    assemble(model, blocks, loads; symmetric=nothing,
+             threaded=Threads.nthreads() > 1, state=nothing,
+             region_filter=nothing) -> (A, b)
 
-Assemble one or more bilinear block contributions on the already
-prepared `model`, reusing its dof layout, constraints, and integration
-plan. `block_or_blocks` is either a single [`BlockForm`](@ref) or a
-tuple of them.
+Assemble a Galerkin system on the prepared `model` and return the pair of its
+sparse matrix `A::SparseMatrixCSC{T,Int}` and its right-hand side `b::Vector{T}`,
+both over the model's `n =` [`active_unknowns`](@ref)`(model)` active dofs. Every
+other assembly entry point wraps this one: [`assemble!`](@ref) stores the pair of
+the first form on the model, and [`assemble_matrix`](@ref) and
+[`assemble_vector`](@ref) each return one half of the second form's.
 
-  - `symmetric` — assemble symmetrically when truthy. Defaults to
-    "every block reports `form.symmetric == true`".
-  - `threaded` — assemble with the threaded driver, whose result is
-    bit-identical to the serial one. Default is true when
-    `Threads.nthreads() > 1`.
-  - `state` — pass a [`Solution`](@ref) or active coefficient vector
-    to expose the current iterate to the forms as `q.state` (used to
-    build Newton tangents).
+The first form assembles the model's own problem: its blocks and loads, by
+default under the problem's `symmetric` flag. The second assembles any `blocks` (a
+[`BlockForm`](@ref) or a tuple of them) and `loads` (a [`LoadForm`](@ref) or a
+tuple of them), either of which may be the empty tuple `()`, on the same dof
+layout, constraints and integration regions — the operator of a time step or of a
+Newton iteration, say, without preparing a second model.
 
-Returns the sparse global matrix over the *active* dofs: constrained
-columns are eliminated, so the matrix already matches the reduced system.
-The right-hand-side correction that elimination produces (`−A_c g` for a
-nonzero Dirichlet datum `g`) is computed and then discarded, because this
-entry point returns a matrix only — call [`assemble!`](@ref) when the
-problem has nonzero Dirichlet data and you need a consistent pair.
+The two halves are consistent with each other. Constrained dofs are eliminated
+column by column: with `a` the active and `c` the constrained dofs, and `g` the
+constrained values (the projected Dirichlet datum; zero for homogeneous and
+overlay constraints),
 
-Does not touch `model.matrix` or `model.rhs`; for in-place assembly that
-updates the cached operators use [`assemble!`](@ref).
+    A = K_aa,    b = F_a − K_ac g,
+
+where `K` is the matrix of `blocks` and `F` the vector of `loads` over all dofs.
+The lift `−K_ac g` is that of exactly the blocks in the call, so `loads = ()`
+returns it alone. A linear-constraint pivot of a basis family (a masked B-spline
+level below maximal continuity) is condensed onto the active dofs of its
+expansion, in rows and columns alike. Without a block — none given, or none whose
+target has a region — `A` is the empty `n × n` matrix.
+
+  - `symmetric` — assemble the lower triangle only and mirror it, which halves the
+    scatter and makes `A` symmetric to the bit; declared for an unsymmetric form, it
+    produces a wrong matrix (see [`WeakForm`](@ref)). Defaults to the problem's flag
+    in the first form and to "every block declares `symmetric = true`" in the
+    second.
+  - `threaded` — run the threaded driver, whose result is bit-identical to the
+    serial one at any thread count.
+  - `state` — a [`Solution`](@ref) or an active coefficient vector, exposed to every
+    form as `q.state` and read through [`value`](@ref) and
+    [`field_gradient`](@ref): how a Newton tangent and residual see the current
+    iterate. With the default `nothing`, a form that reads `q.state` raises.
+  - `region_filter` — a predicate on integration regions; a volume region it
+    rejects is skipped. It serves compactly supported loads, such as a moving point
+    source, whose cost should scale with their support, and applies to volume terms
+    only: boundary, surface and interface terms always integrate in full.
+
+What assembly derives from the structure — the region lists, every region's
+active dofs, the sparsity patterns — is cached on the model and reused by every
+later call over the same targets, through any of the entry points, until a
+mutator ([`move!`](@ref), [`activate!`](@ref), [`deactivate!`](@ref)) changes the
+structure; [`update_dirichlet!`](@ref) keeps it. Several tasks may assemble on one
+model at the same time.
 """
-function assemble_matrix(model::Model{D,T}, blocks; symmetric=nothing,
-                         threaded::Bool=Threads.nthreads() > 1, state=nothing) where {D,T}
-    block_tuple = _form_tuple(blocks)
-    symmetric_value = symmetric === nothing ? all(block -> block.form.symmetric, block_tuple) :
-                      Bool(symmetric)
-    matrix, _ = _assemble(model, block_tuple, (), symmetric_value, threaded, state, nothing)
-    return _or_empty(matrix, model)
+function assemble(model::Model{D,T}, @nospecialize(blocks), @nospecialize(loads); symmetric=nothing,
+                  threaded::Bool=Threads.nthreads() > 1, state=nothing,
+                  region_filter=nothing) where {D,T}
+    matrix, rhs = _assemble(model, blocks, loads, symmetric, threaded, state, region_filter)
+    n = length(rhs)
+    return (matrix === nothing ? spzeros(T, n, n) : matrix)::SparseMatrixCSC{T,Int}, rhs::Vector{T}
+end
+function assemble(model::Model; kw...)
+    problem = model.problem
+    return assemble(model, problem.blocks, problem.loads; symmetric=problem.symmetric, kw...)
 end
 
 """
-    assemble_vector(model, load_or_loads; threaded=…, region_filter=nothing,
-                    state=nothing) -> Vector
+    assemble_matrix(model, block_or_blocks; symmetric=nothing,
+                    threaded=Threads.nthreads() > 1, state=nothing,
+                    region_filter=nothing) -> SparseMatrixCSC
 
-Assemble one or more right-hand-side contributions on the already
-prepared `model`, reusing its dof layout, constraints, and integration
-plan. `load_or_loads` is either a single [`LoadForm`](@ref) or a tuple
-of them.
+Assemble one or more bilinear block contributions on the prepared `model`: the
+matrix half of [`assemble`](@ref)`(model, block_or_blocks, (); kw...)`, whose
+docstring describes the keywords. `block_or_blocks` is a single
+[`BlockForm`](@ref) or a tuple of them.
 
-`region_filter` is an optional predicate on integration regions used by
-compactly-supported loads (e.g. a moving point source supported only on
-a small portion of the mesh) to skip irrelevant regions cheaply.
+Constrained columns are eliminated, so the matrix is over the active dofs and
+matches the reduced system. The right-hand-side lift that the elimination
+produces (`−K_ac g` for nonzero Dirichlet data `g`) goes with the vector half;
+call [`assemble`](@ref) for the consistent pair.
 
-`state` exposes the current iterate as `q.state` for Newton-residual
-loads (see [`assemble_matrix`](@ref)).
-
-Returns the assembled right-hand-side vector over the active dofs. It
-carries the load integrals only: no bilinear block participates in this
-call, so there is no Dirichlet column elimination and therefore no `−A_c g`
-correction for nonzero Dirichlet data — [`assemble!`](@ref) is the entry
-point that produces a matrix and a right-hand side consistent with each
-other.
+Does not touch `model.matrix` or `model.rhs`; for in-place assembly that updates
+the cached operators use [`assemble!`](@ref).
 """
-function assemble_vector(model::Model{D,T}, loads; threaded::Bool=Threads.nthreads() > 1,
-                         region_filter=nothing, state=nothing) where {D,T}
-    _, rhs = _assemble(model, (), _form_tuple(loads), false, threaded, state, region_filter)
-    return rhs::Vector{T}
+function assemble_matrix(model::Model, @nospecialize(blocks); kw...)
+    first(assemble(model, blocks, (); kw...))
+end
+
+"""
+    assemble_vector(model, load_or_loads; threaded=Threads.nthreads() > 1,
+                    region_filter=nothing, state=nothing) -> Vector
+
+Assemble one or more right-hand-side contributions on the prepared `model`: the
+vector half of [`assemble`](@ref)`(model, (), load_or_loads; threaded,
+region_filter, state)`, whose docstring describes the keywords. `load_or_loads`
+is a single [`LoadForm`](@ref) or a tuple of them.
+
+The vector carries the load integrals only. No bilinear block takes part, so
+there is no Dirichlet column elimination and no lift `−K_ac g` for nonzero
+Dirichlet data; [`assemble`](@ref) and [`assemble!`](@ref) return a right-hand
+side consistent with a matrix. `region_filter` lets a compactly supported load (a
+moving point source, say) skip the volume regions outside its support cheaply.
+"""
+function assemble_vector(model::Model{D,T}, @nospecialize(loads);
+                         threaded::Bool=Threads.nthreads() > 1, region_filter=nothing,
+                         state=nothing) where {D,T}
+    # Straight to the core: `assemble` would build an empty `n × n` matrix only
+    # for this wrapper to discard it.
+    return last(_assemble(model, (), loads, false, threaded, state, region_filter))::Vector{T}
 end
 
 """
     assemble!(model; threaded=Threads.nthreads() > 1) -> Model
 
-Assemble the global matrix and right-hand side for `model`'s problem
-in place. Updates `model.matrix`, `model.rhs`, and
-`model.diagnostics` (symmetry residual and condition estimate filled
-in). Returns `model` for chaining.
+Assemble `model`'s problem in place: store the pair
+[`assemble`](@ref)`(model; threaded)` as `model.matrix` and `model.rhs`, which
+[`solve!`](@ref) then reuses, and fill the assembly entries of
+[`diagnostics`](@ref): `symmetry_residual` — exactly `0.0` for a problem declared
+symmetric, whose matrix is mirrored to the bit, and `NaN` otherwise — and the two
+condition estimates (see [`AssemblyDiagnostics`](@ref)). Returns `model` for
+chaining.
 
-Constraints are honoured through the dof layer: strong Dirichlet
-elimination (a constrained trial column moves to the right-hand side,
-weighted by its stored value), dof-wise homogeneous overlay elimination, and
-— when the basis family supplies them — general homogeneous linear
-constraints, whose pivots are distributed over their expansions during the
-scatter.
+Constraints are honoured through the dof layer as in [`assemble`](@ref): strong
+Dirichlet elimination, which moves a constrained trial column to the right-hand
+side weighted by its stored value; dof-wise homogeneous overlay elimination; and,
+where a basis family supplies them, linear constraints, whose pivots are
+condensed onto their expansions once per integration region.
 """
-function assemble!(model::Model{D,T}; threaded::Bool=Threads.nthreads() > 1) where {D,T}
-    nactive = active_unknowns(model.dofs)
-    symmetric = model.problem.symmetric
-    assembled, rhs = _assemble(model, model.problem.blocks, model.problem.loads, symmetric,
-                               threaded, nothing, nothing)
-    matrix = _or_empty(assembled, model)
-    # Symmetric forms are assembled lower-triangular and mirrored as
-    # `matrix + matrix' - diag(matrix)` in `_matrix_from_pattern`. IEEE
-    # addition is commutative, so the result is symmetric to the bit
-    # and the residual is exactly zero.
-    symmetry_residual = symmetric ? 0.0 : NaN
-    condition_estimate = _condition_estimate(matrix)
-    scaled_condition_estimate = _scaled_condition_estimate(matrix)
-    model.matrix = matrix
-    model.rhs = rhs
+function assemble!(model::Model; threaded::Bool=Threads.nthreads() > 1)
+    matrix, rhs = assemble(model; threaded)
+    model.matrix, model.rhs = matrix, rhs
     diag = model.diagnostics
-    diag.active_unknowns = nactive
-    diag.symmetry_residual = symmetry_residual
-    diag.condition_estimate = condition_estimate
-    diag.scaled_condition_estimate = scaled_condition_estimate
-    _set_plan_stats_multi!(diag, integration_plans(model))
+    diag.symmetry_residual = model.problem.symmetric ? 0.0 : NaN
+    diag.condition_estimate = _condition_estimate(matrix)
+    diag.scaled_condition_estimate = _scaled_condition_estimate(matrix)
     return model
 end
 
-# A call's matrix, or the empty `n × n` matrix when no pass carried a block
-# (every block's target resolved to no region, or there was no block at all).
-function _or_empty(matrix, model::Model{D,T}) where {D,T}
-    n = active_unknowns(model.dofs)
-    return (matrix === nothing ? spzeros(T, n, n) : matrix)::SparseMatrixCSC{T,Int}
-end
-
-# The core every assembly entry point calls: assemble `blocks` and `loads` (form
-# tuples) on `model` and return `(matrix, rhs)`, the matrix `nothing` when no
-# pass carries a block. The rhs includes the Dirichlet lift of every block, so
-# the pair is consistent. `state` is `nothing`, a `Solution` or a coefficient
-# vector; `region_filter` applies to the volume passes only.
+# The core every assembly entry point calls: assemble `blocks` and `loads` (a
+# form or a tuple of forms each) on `model` and return `(matrix, rhs)`, the matrix
+# `nothing` when no pass carries a block. The rhs includes the Dirichlet lift of
+# every block, so the pair is consistent. `symmetric` is a `Bool`, or `nothing`
+# for "every block declares symmetry"; `state` is `nothing`, a `Solution` or a
+# coefficient vector; `region_filter` applies to the volume passes only.
 #
 # Deliberately unspecialised, like the rest of the cold path: it compiles once
 # per process, not once per form tuple or problem type. Its handful of dynamic
 # calls cost a few microseconds per call, and the one that matters is the
 # dispatch per pass into `_serial!` or `_threaded!`, where specialisation on the
-# forms begins.
+# forms begins. The public wrappers above specialise on the `Model` alone, which
+# is what types their results.
 #
 # The per-call scratch is checked out of the model's cache and returned in a
 # `finally`, so an error a callback raises still hands it back; every
 # per-region field of a workspace is reset before it is reused, and phase 2 only
 # reads arena slices phase 1 wrote in the same pass.
-function _assemble(@nospecialize(model::Model), @nospecialize(blocks::Tuple),
-                   @nospecialize(loads::Tuple), symmetric::Bool, threaded::Bool,
-                   @nospecialize(state), @nospecialize(region_filter))
+function _assemble(@nospecialize(model::Model), @nospecialize(blocks), @nospecialize(loads),
+                   @nospecialize(symmetric), threaded::Bool, @nospecialize(state),
+                   @nospecialize(region_filter))
+    blocks, loads = _form_tuple(blocks), _form_tuple(loads)
+    symmetric = (symmetric === nothing ? all(block -> block.form.symmetric, blocks) :
+                 Bool(symmetric))::Bool
     coefficients = _state_vector(state, model)
     passes = _passes(model, blocks, loads)
     # One task per thread, but no more than the largest pass has regions: a task

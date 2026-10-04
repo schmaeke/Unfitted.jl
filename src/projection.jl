@@ -404,12 +404,11 @@ function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_
     # `backend.matrix` with a zero lift (homogeneous target, guarded above).
     if M === Nothing
         # The mass pattern joins the target's pattern cache, which keeps the
-        # four most recently used ones, so the transfer evicts nothing the
-        # target's own problem uses; on a symmetric volume-only problem the
-        # problem's operator and the mass integrate over the same pass, and the
-        # two share one pattern.
-        mass, rhs = _assemble(target_model, map(mass_block, target_model.problem.fields), (), true,
-                              Threads.nthreads() > 1, nothing, nothing)
+        # four most recently used ones, beside the problem's own pattern rather
+        # than in place of it; on a symmetric volume-only problem the problem's
+        # operator and the mass integrate over the same pass, and the two share
+        # one pattern.
+        mass, rhs = assemble(target_model, map(mass_block, target_model.problem.fields), ())
     else
         mass = backend.matrix
         rhs = zeros(T, nactive)

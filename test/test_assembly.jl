@@ -515,6 +515,64 @@ end
     @test_throws DimensionMismatch solution(model, Float64[])
 end
 
+@testset "assemble returns the consistent pair the other entry points wrap" begin
+    # `assemble` is the one assembler: `assemble!` stores its pair, and
+    # `assemble_matrix` / `assemble_vector` keep one half each, so all four must
+    # agree to the bit. The fixture has what makes a pair worth having: nonzero
+    # Dirichlet data across two levels, whose lift −K_ac g only a call carrying
+    # the blocks can produce, and a facet load besides the volume source.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    V = overlay(space(omega; cells=(4, 4), order=2), box((0.0, 0.25), (0.5, 0.75)); cells=(2, 2),
+                order=3)
+    u = field(:u, V)
+    blocks = (stiffness_block(u; diffusion=2.0),)
+    loads = (source_load(u; source=x -> 1 + x[1]),
+             neumann(u, 0.5; on=boundary(axis=2, side=:upper)))
+    model = prepare(Problem((u,); blocks, loads,
+                            dirichlet=[dirichlet(x -> 1 + x[2]^2; on=boundary(axis=1, side=:lower))]))
+
+    assemble!(model)
+    A, b = assemble(model)
+    @test A == model.matrix && b == model.rhs
+    @test assemble(model, blocks, loads) == (A, b)
+    @test assemble(model, only(blocks), loads) == (A, b)  # a lone form needs no tuple
+    @test assemble(model; threaded=true) == assemble(model; threaded=false)
+
+    # The halves: the matrix is the blocks' alone, and the rhs is the loads'
+    # vector plus the blocks' lift, which a call without loads returns on its own.
+    blocks_only, lift = assemble(model, blocks, ())
+    @test blocks_only == A == assemble_matrix(model, blocks)
+    @test norm(lift) > 0
+    @test lift + assemble_vector(model, loads) ≈ b rtol = 1.0e-13
+    @test last(assemble(model, (), loads)) == assemble_vector(model, loads)
+
+    # Without a block the matrix is the empty n × n one, not a missing one.
+    empty_matrix, zero_rhs = assemble(model, (), ())
+    @test size(empty_matrix) == size(A) && nnz(empty_matrix) == 0 && iszero(zero_rhs)
+
+    # `region_filter` acts on the volume terms only: rejecting every region
+    # leaves exactly the facet load.
+    filtered_matrix, filtered_rhs = assemble(model; region_filter=region -> false)
+    @test nnz(filtered_matrix) == 0
+    @test filtered_rhs == assemble_vector(model, loads[2])
+
+    # `symmetric = false` assembles both triangles: the same operator to roundoff.
+    full_matrix, full_rhs = assemble(model, blocks, loads; symmetric=false)
+    @test full_matrix ≈ A rtol = 1.0e-13
+    @test full_rhs ≈ b rtol = 1.0e-13
+
+    # The no-form call takes the problem's symmetry flag, not the forms' default:
+    # an unsymmetric form wrongly declared symmetric is assembled in full when the
+    # problem says it is not symmetric, and only mirrored when the forms decide —
+    # or when the call overrides the problem's flag.
+    advection = block(u, u, WeakForm(bilinear=(q, trial) -> trial.gradient[1], symmetric=true))
+    unsymmetric = prepare(Problem((u,); blocks=(advection,), symmetric=false))
+    mirrored = assemble_matrix(unsymmetric, advection)
+    @test first(assemble(unsymmetric)) == assemble_matrix(unsymmetric, advection; symmetric=false)
+    @test first(assemble(unsymmetric)) != mirrored
+    @test first(assemble(unsymmetric; symmetric=true)) == mirrored
+end
+
 @testset "operator vector assembly respects field offsets" begin
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=2, order=1)

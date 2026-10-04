@@ -476,8 +476,8 @@ function _cut_region_stats(plan::IntegrationPlan)
 end
 
 # Fold every plan-level statistic into a diagnostics record in place, and
-# return it so call sites can chain. Shared by `prepare`, `move!`,
-# `_update_mask!`, and `assemble!`.
+# return it so call sites can chain. Shared by `prepare`, `move!` and
+# `_update_mask!`, which install a fresh record.
 #
 # `plans` holds one integration plan per subdomain and must be non-empty.
 # The aggregation is the identity on a single-domain problem: region / cut /

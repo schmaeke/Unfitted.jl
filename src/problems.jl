@@ -78,6 +78,12 @@ triangle, so declaring symmetry on an asymmetric form silently produces
 the wrong matrix. The default therefore costs a symmetric form the caller
 forgot to declare a factor of two, rather than costing an asymmetric one
 its correctness.
+
+Assembly calls a form's callbacks only at the quadrature points of regions on
+which its test field has degrees of freedom. On a coupled model, a volume form
+therefore runs over its own subdomain and nowhere else, and a callback must not
+rely on being called at the points of another subdomain — to count or record
+them, say.
 """
 struct WeakForm{B,L}
     bilinear::B
