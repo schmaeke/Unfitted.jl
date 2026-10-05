@@ -1227,12 +1227,16 @@ end
     # The trimmed disc of the testset above, so the verdicts carry information: u's
     # solve falls back to the pseudoinverse with three dofs unsupported, and v's
     # component-1-only condition leaves two unsupported beside a component 2 with
-    # nothing to solve. w carries no condition at all. Three fields, so the field
-    # then component then raw order of both lists is pinned as well.
+    # nothing to solve. w carries no condition at all, so `prepare` skips its
+    # projection; it has two components because the homogeneous branch must still
+    # contribute one `:none` per component — the docstring's promise that a position
+    # names a (field, component) pair — and a one-component w cannot tell one entry
+    # per component from one entry per field. Three fields, so the field then
+    # component then raw order of both lists is pinned as well.
     disc = physical_domain(leaf(x -> 0.3 - hypot(x[1], x[2]); lipschitz=1.0);
                            subcell_length_scale=0.0625)
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=disc)
-    u, v, w = field(:u, V), field(:v, V; components=2), field(:w, V)
+    u, v, w = field(:u, V), field(:v, V; components=2), field(:w, V; components=2)
     conditions = [dirichlet(x -> sin(x[1] + 2x[2]); on=boundary(:all), field=u),
                   dirichlet(0.5; on=boundary(axis=1, side=:lower), field=v, component=1)]
     model = prepare(Problem((u, v, w);
@@ -1240,7 +1244,7 @@ end
                             dirichlet=conditions))
     @test isempty(model.dirichlet_projections)
     report = diagnostics(model)
-    @test report.dirichlet_trace_factors == [:pseudoinverse, :pseudoinverse, :none, :none]
+    @test report.dirichlet_trace_factors == [:pseudoinverse, :pseudoinverse, :none, :none, :none]
     @test [(r.field, r.component) for r in report.unsupported_dirichlet_dofs] ==
           [(:u, 1), (:u, 1), (:u, 1), (:v, 1), (:v, 1)]
     @test report.unsupported_dirichlet_dof_count == 5
