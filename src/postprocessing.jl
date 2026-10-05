@@ -1170,8 +1170,10 @@ solution `exact(x)`:
     absolute error so it stays meaningful for zero-reference checks
     (e.g. a fabricated test where `exact(x) ≡ 0`).
 
-`exact(x)` may return a scalar or a component value (e.g. an
-`SVector` or tuple); the `_squared_norm` helper handles both.
+`exact(x)` returns a scalar for a scalar field, or an indexable value with
+one entry per component (an `SVector`, a tuple or a vector) for a vector
+field; the pointwise error is summed component by component,
+`‖u_h − u_exact‖² = Σ_c (u_h[c] − u_exact[c])²`.
 
 `u` names the field to measure, exactly as for [`value`](@ref) and
 [`field_gradient`](@ref). The error is integrated over that field's own
@@ -1239,7 +1241,8 @@ _squared_norm(value) = sum(abs2, value)
 """
     boundary_integral(integrand, model::Model; on, field=nothing) -> result
 
-Integrate a user callback over a portion of the boundary.
+Integrate a user callback over a portion of the boundary or over a coupling
+interface.
 
 `on` selects the integration region:
 

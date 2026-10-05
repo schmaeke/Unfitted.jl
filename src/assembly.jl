@@ -219,6 +219,11 @@ can read `q.state` as often as it likes. The values are those of the current
 point and are valid during the callback only: the same object is refilled at
 the next point, so keep the numbers, not the `FormState`.
 
+On a coupled model a field is evaluated only where it lives: on its own
+subdomain's regions, and on an interface on its own side. Every other field
+reads zero there, even where it is defined at the point; read it from a
+[`Solution`](@ref) with `value(solution, model, u, q.x)` instead.
+
 The values carry the iterate's number type promoted with the model's: a
 `BigFloat` iterate on a `Float64` model yields `BigFloat` values and
 gradients. A component outside the field's range raises a `BoundsError`, and
@@ -1690,10 +1695,12 @@ function field_gradient(state::FormState, field::Union{Symbol,Field}, component:
 end
 
 # Tiny helper raising the "no state attached" error from a single
-# location. Reaching it indicates a callback dereferenced `q.state`
-# without the caller passing `state =` to the assembly entry point.
+# location. Reaching it indicates a callback read `q.state` where it is
+# `nothing`: an assembly call or a walk given no `state =`, or a
+# `boundary_integral`, whose `q.state` always is.
 function _no_form_state()
-    throw(ArgumentError("q.state is unavailable; assemble with `state = current_iterate`"))
+    throw(ArgumentError("q.state is unavailable: pass `state=` to the assembly call or walk; " *
+                        "`boundary_integral` reads a solution by `value(solution, model, u, q.x)`"))
 end
 value(::Nothing, args...) = _no_form_state()
 field_gradient(::Nothing, args...) = _no_form_state()
@@ -1714,9 +1721,9 @@ visits with the same keywords. `on` is a [`BoundarySelector`](@ref) or a
 [`BoundaryMesh`](@ref), whose subdomain `field` names on a coupled model exactly
 as it does for [`boundary_integral`](@ref); an [`Interface`](@ref), which spans
 both its subdomains and ignores `field`; or `nothing`, the volume, where `field`
-alone selects its own subdomain's integration plan. This is the form that sizes
-per-quadrature-point state — history variables for an inelastic law, a
-cohesive `κ` along an interface.
+alone selects its own subdomain's integration plan. `kind` is ignored in this
+form. This is the form that sizes per-quadrature-point state — history
+variables for an inelastic law, a cohesive `κ` along an interface.
 
 Without `on` and `field`, the **aggregate** over every cached region list of
 kind `kind`, a structural count for diagnostics:
@@ -1786,9 +1793,12 @@ where
     an irreversible cohesive `κ`, …);
   - `q.state` — `nothing` unless a `state` (a [`Solution`](@ref) or an active
     coefficient vector) is passed, in which case it is a [`FormState`](@ref):
-    `value(q.state, field)` and `field_gradient(q.state, field)` read any field
-    at the point, each on its own subdomain — on an interface, both coupled
-    fields, each in its own cut cell at the shared point;
+    `value(q.state, field)` and `field_gradient(q.state, field)` read the
+    fields of the walked list at the point — on a volume, boundary or surface
+    walk those of the walked subdomain, on an interface both coupled fields,
+    each in its own cut cell at the shared point. Any other field reads zero,
+    even where it is defined at `q.x`; evaluate it there with
+    `value(solution, model, u, q.x)`;
   - `q.normal` — `nothing` on the volume, the outward unit normal on a
     boundary or surface, and on an interface the unit normal oriented from
     side `a` toward side `b` (the two fields passed to [`couple`](@ref), in
@@ -1803,7 +1813,10 @@ two-sided interface of a coupled model. On a coupled model `field` names the
 subdomain of a volume, boundary or surface walk, as for
 [`boundary_integral`](@ref), and omitting it raises, because each subdomain
 numbers its points separately and there is no single list to walk; an
-interface spans both its subdomains and ignores `field`.
+interface spans both its subdomains and ignores `field`. An `Interface`
+matches by identity: walk with the one the coupling blocks carry, whose list
+`prepare` resolved, or keep one `interface(…)` for every walk, since each new
+object is resolved again.
 
 The basis is evaluated only when a `state` is given, so a walk without one
 costs a pass over the stored points and weights once its list is resolved.

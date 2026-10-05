@@ -73,9 +73,14 @@ The method is described in
   flux-weighted); `couple` instantiates that kernel once per side pair,
   so the two-sidedness spans the four blocks. The package supplies the
   two-sided interface integration, never the constitutive choice.
-  `foreach_quadrature_point(f, model; on = interface(uₐ, u_b, Γ), state)`
-  walks the interface's points under the `q.point` numbering the coupling
-  forms see, the key for per-point history such as a cohesive damage state.
+  `foreach_quadrature_point(f, model; on = iface, state)` walks the
+  interface's points under the `q.point` numbering the coupling forms see,
+  the key for per-point history such as a cohesive damage state. An
+  `Interface` matches by identity, so walk with the one the coupling
+  carries (`iface = first(blocks).on` for the `blocks = couple(…)` given
+  to the problem), whose points `prepare` already resolved, or build one
+  `interface(uₐ, u_b, Γ)` and reuse it: every new `Interface` object
+  intersects Γ with both grids again.
 - **Leaf semantics on covered regions**: a cell carries basis functions
   only where no finer level has taken the region over. Every high-order
   mode whose entire incidence stencil is covered by a finer level is
