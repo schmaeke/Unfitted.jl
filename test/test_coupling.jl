@@ -498,6 +498,17 @@ end
     @test count == nquadpoints(model; kind=:interface)              # single interface ⇒ equal
     @test Set(seen) == Set(1:count)                                 # assembly sees points 1:count
 
+    # An `Interface` matches by its two field names, in order, and its mesh
+    # object, so the `iface` built here apart from `couple` is the coupling's own
+    # key and walks the list `prepare` resolved. Swapped fields are another
+    # coupling, and an equal mesh rebuilt as a new object is another key,
+    # resolved again on its own to the same points.
+    @test iface == interface(u1, u2, Γ) && haskey(model.interface_regions, iface)
+    @test interface(u2, u1, Γ) != iface
+    Γ′ = polyline_mesh([SVector(1.0, 0.5), SVector(0.0, 0.5)])
+    @test interface(u1, u2, Γ′) != iface && !haskey(model.interface_regions, interface(u1, u2, Γ′))
+    @test nquadpoints(model; on=interface(u1, u2, Γ′)) == count
+
     # The iterator visits each point once, with unit a→b normals; the weights sum
     # to the interface length.
     pts = Int[]

@@ -1813,10 +1813,12 @@ two-sided interface of a coupled model. On a coupled model `field` names the
 subdomain of a volume, boundary or surface walk, as for
 [`boundary_integral`](@ref), and omitting it raises, because each subdomain
 numbers its points separately and there is no single list to walk; an
-interface spans both its subdomains and ignores `field`. An `Interface`
-matches by identity: walk with the one the coupling blocks carry, whose list
-`prepare` resolved, or keep one `interface(…)` for every walk, since each new
-object is resolved again.
+interface spans both its subdomains and ignores `field`. Two `Interface`s
+match when they name the same two fields, in the same order, over the same
+[`BoundaryMesh`](@ref) object: a fresh `interface(uₐ, u_b, Γ)` over the mesh
+given to [`couple`](@ref), like the coupling blocks' own `first(blocks).on`,
+finds the list `prepare` resolved, while a mesh rebuilt as a new object, even
+an equal one, is intersected with both grids again.
 
 The basis is evaluated only when a `state` is given, so a walk without one
 costs a pass over the stored points and weights once its list is resolved.
