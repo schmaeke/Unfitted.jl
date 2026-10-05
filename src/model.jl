@@ -606,13 +606,13 @@ end
 
 # One integration region list as assembly sees it: the regions, the `q.point`
 # offset of each (region `r`'s points are `offsets[r] .+ (1:npoints)`, and
-# `offsets[end]` is the list's point count), and, once a matrix or a threaded
-# call has needed them, the regions' active dofs. `dofs` is filled once, under
-# the cache lock, and never changes afterwards.
-mutable struct RegionList{R}
-    const regions::Vector{R}
-    const offsets::Vector{Int}
-    dofs::Union{Nothing,RegionDofs}
+# `offsets[end]` is the list's point count), and the regions' active dofs. All
+# three are derived once, under the cache lock, when the list is first
+# resolved, and never change afterwards.
+struct RegionList{R}
+    regions::Vector{R}
+    offsets::Vector{Int}
+    dofs::RegionDofs
 end
 
 # CSC sparsity pattern of one operator over the active dofs: the union over
@@ -629,9 +629,9 @@ struct AssemblyPattern
 end
 
 # The model's assembly cache. Every field is guarded by `lock`, which an
-# assembly call takes a fixed handful of times (list and pattern lookup, the
-# symbolic dof lists, scratch checkout and return) and never inside the
-# quadrature loop or the scatter.
+# assembly call takes a fixed handful of times (list and pattern lookup,
+# scratch checkout and return) and never inside the quadrature loop or the
+# scatter.
 #
 #   - `lists` — the region lists of every volume plan and of every `on=` target
 #     `prepare` resolved. Bounded by those, so never evicted.

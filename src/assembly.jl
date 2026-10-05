@@ -61,15 +61,25 @@
 # block on a second problem type in 0.03×; the price is a few microseconds of
 # dynamic dispatch per call.
 
-# A region list with its `q.point` offsets. Its active dofs are derived later,
-# on first need (`_dofs!`).
-function RegionList(regions::Vector{R}) where {R}
+# A region list with its `q.point` offsets and the active dofs of every region
+# (see `RegionDofs`), all derived once, when the list is resolved. The dofs come
+# from the numeric pass's own `_frame!` and `_slots!`, run on the workspace `ws`,
+# so the pattern and the threaded arena layout describe exactly the dofs the
+# kernel emits: active ids and the active branches of every pivot, never a
+# constrained id. A plain loop rather than `cumsum` over a `map`, which cost
+# 30–40 ms of first-call compile per region kind.
+function RegionList(regions::Vector{R}, ws) where {R}
     offsets = Vector{Int}(undef, length(regions) + 1)
-    offsets[1] = 0
+    ptr = Vector{Int}(undef, length(regions) + 1)
+    offsets[1], ptr[1] = 0, 1
+    val = Int[]
     for (r, region) in pairs(regions)
         offsets[r+1] = offsets[r] + _region_qpoint_count(region)
+        _slots!(_frame!(ws, region))
+        append!(val, ws.dofs)
+        ptr[r+1] = length(val) + 1
     end
-    return RegionList{R}(regions, offsets, nothing)
+    return RegionList{R}(regions, offsets, RegionDofs(ptr, val))
 end
 
 # One pass of one assembly call: a region list, its `RegionKey`, and the blocks
@@ -133,8 +143,12 @@ end
 # the bounded one-shot cache, so a hot one is resolved once rather than on every
 # call. Lookup and build run under the cache lock: a one-shot facet miss also
 # extends the model's `FacetResolver` memo, which concurrent calls must not do
-# at the same time. `Base.@lock` rather than `lock(f, l)`, whose closure would
-# be one more type to compile for every caller.
+# at the same time, and a miss derives the list's region dofs on an idle pooled
+# workspace, which no other call can take while the lock is held. With none
+# idle it pools a fresh one, which the call's own checkout then takes: building
+# one per list instead added 11 % to a cold interface problem's allocation.
+# `Base.@lock` rather than `lock(f, l)`, whose closure would be one more type to
+# compile for every caller.
 function _region_list(@nospecialize(model::Model), @nospecialize(target), @nospecialize(space))
     cache = model.assembly
     key = (target, space)
@@ -144,7 +158,8 @@ function _region_list(@nospecialize(model::Model), @nospecialize(target), @nospe
         list = _lru_get!(cache.oneshot, key)
         list === nothing || return list
         regions, owned = _regions(model, target, space)
-        list = RegionList(regions)
+        isempty(cache.workspaces) && push!(cache.workspaces, _assembly_workspace(model))
+        list = RegionList(regions, last(cache.workspaces))
         owned ? (cache.lists[key] = list) : _lru_push!(cache.oneshot, key => list, 8)
         return list
     end
@@ -231,37 +246,6 @@ end
 
 # ── Symbolic data: region dofs and the sparsity pattern ───────────────────────
 
-# The active dofs of every region of `list` (see `RegionDofs`), derived once per
-# list and kept on it. It runs the numeric pass's own `_frame!` and `_slots!` on
-# the workspace `ws`, so the pattern and the threaded arena layout describe
-# exactly the dofs the kernel emits: active ids and the active branches of every
-# pivot, never a constrained id. Called under the cache lock
-# (`_assembly_pattern!`, `_dofs_all!`), which is what makes the one-time fill
-# safe when calls run concurrently.
-function _dofs!(list::RegionList, ws)
-    list.dofs === nothing || return list.dofs
-    ptr = Vector{Int}(undef, length(list.regions) + 1)
-    ptr[1] = 1
-    val = Int[]
-    for (r, region) in pairs(list.regions)
-        _slots!(_frame!(ws, region))
-        append!(val, ws.dofs)
-        ptr[r+1] = length(val) + 1
-    end
-    return list.dofs = RegionDofs(ptr, val)
-end
-
-# The region dofs of every pass of a threaded call, whose arena layout is read
-# from them (`_threaded!`), under one lock for the whole call.
-function _dofs_all!(@nospecialize(cache::AssemblyCache), passes::Vector{Any}, @nospecialize(ws))
-    Base.@lock cache.lock begin
-        for pass in passes
-            _dofs!(pass.list, ws)
-        end
-    end
-    return nothing
-end
-
 # The CSC sparsity pattern over `n` active dofs of the dense blocks on every
 # region of `sets` (the matrix passes' region dofs): column `j` holds every row
 # `i` that shares a region with `j` — only `i ≥ j` when `symmetric` — ascending.
@@ -332,17 +316,15 @@ end
 # entry and are not part of the key, so `assemble!` on a volume-only problem and
 # `assemble_matrix(model, mass_block(u))` share one entry, and a caller that
 # alternates operators keeps every pattern it uses (up to four) instead of
-# rebuilding one per call. A miss derives each list's region dofs (`_dofs!`) on
-# `ws`, the caller's checked-out workspace, under the lock.
-function _assembly_pattern!(@nospecialize(model::Model), passes::Vector{Any}, symmetric::Bool,
-                            @nospecialize(ws))
+# rebuilding one per call.
+function _assembly_pattern!(@nospecialize(model::Model), passes::Vector{Any}, symmetric::Bool)
     isempty(passes) && return nothing
     cache = model.assembly
     key = (RegionKey[pass.key for pass in passes], symmetric)
     Base.@lock cache.lock begin
         pattern = _lru_get!(cache.patterns, key)
         pattern === nothing || return pattern
-        sets = RegionDofs[_dofs!(pass.list, ws) for pass in passes]
+        sets = RegionDofs[pass.list.dofs for pass in passes]
         return _lru_push!(cache.patterns,
                           key => _pattern(active_unknowns(model.dofs), sets, symmetric), 4)
     end
@@ -1389,8 +1371,7 @@ end
 # buffer up past the final size. On a cold five-pass interface problem the dead
 # buffers came to more than the final arena (64 against 51 KB) and took the
 # threaded call at 6 threads to 1.63× the serial call's allocation; sized once,
-# it is 1.47×. Called from the unspecialised `_assemble`, after `_dofs_all!` has
-# derived every pass's dofs.
+# it is 1.47×. Called from the unspecialised `_assemble`.
 function _arenas(@nospecialize(arena), @nospecialize(rhs_arena), passes::Vector{Any},
                  symmetric::Bool)
     packed = maximum(pass -> isempty(pass.blocks) ? 0 : _arena_length(pass.list.dofs, symmetric),
@@ -1731,9 +1712,8 @@ function _assemble(@nospecialize(model::Model), @nospecialize(blocks), @nospecia
         states = coefficients === nothing ? nothing :
                  [FormState(model.dofs, coefficients) for _ in 1:tasks]
         pattern = _assembly_pattern!(model, filter(pass -> !isempty(pass.blocks), passes),
-                                     symmetric, first(workspaces))
+                                     symmetric)
         if threaded
-            _dofs_all!(cache, passes, first(workspaces))
             arena, rhs_arena = _arenas(arena, rhs_arena, passes, symmetric)
         end
         T = _scalar(model.dofs)
@@ -1873,7 +1853,7 @@ numbers its points separately and there is no single list to walk; an
 interface spans both its subdomains and ignores `field`.
 
 The basis is evaluated only when a `state` is given, so a walk without one
-costs a pass over the stored points and weights.
+costs a pass over the stored points and weights once its list is resolved.
 """
 function foreach_quadrature_point(f, @nospecialize(model::Model); on=nothing,
                                   field::Union{Nothing,Symbol}=nothing, state=nothing)
