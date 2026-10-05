@@ -909,6 +909,28 @@ end
     @test all(isapprox.((gε .- gbig) ./ ε, g1 .- g0; rtol=1.0e-10, atol=1.0e-10))
 end
 
+@testset "state= rejects a stale Solution and a vector of the wrong length" begin
+    # Every route that takes a state checks it once, on the way in: a `Solution`
+    # must carry the model's current pin, and a raw coefficient vector needs one
+    # entry per active dof. Unchecked, a stale solution would be read against a
+    # dof numbering it was not computed on, and a vector of the wrong length
+    # would be read out of bounds or silently cut short.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2)
+    u = field(:u, V)
+    model = prepare(poisson(u; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    n = active_unknowns(model)
+    stale = Solution(zeros(n), model.version + 1, Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    walk = q -> nothing
+
+    @test_throws DimensionMismatch assemble_vector(model, source_load(u; source=1.0);
+                                                   state=zeros(n + 1))
+    @test_throws DimensionMismatch assemble_matrix(model, stiffness_block(u); state=zeros(n - 1))
+    @test_throws DimensionMismatch foreach_quadrature_point(walk, model; state=zeros(n - 1))
+    @test_throws ArgumentError assemble_matrix(model, stiffness_block(u); state=stale)
+    @test_throws ArgumentError assemble(model; state=stale)
+    @test_throws ArgumentError foreach_quadrature_point(walk, model; state=stale)
+end
+
 @testset "the walker covers every on= target and subdomain with assembly's payload" begin
     # `foreach_quadrature_point(f, model; on, field, state)` walks the region list
     # that a form with the same `on=` and, on a coupled model, the same test field
