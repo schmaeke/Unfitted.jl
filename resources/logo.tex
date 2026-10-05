@@ -33,7 +33,6 @@
 \begin{document}
   \begin{tikzpicture}[isometric view, rounded corners = 0.01mm]%
     \begin{scope}[canvas is xy plane at z = 0]
-      % \fill[juliapurple] (-1cm, -1cm) rectangle (1cm, 1cm);
       \draw[\ink, thick] (-1cm, -1cm) rectangle (1cm, 1cm);
 
 
@@ -48,48 +47,25 @@
       \draw[\ink] (-1cm, -1cm) grid[step = 0.5cm] (1cm, 1cm);
 
       \begin{scope}
-        \clip (-1, -1) to[out = 10, in = 210] (1, 1) -- (-1, 1) -- cycle;
-        \clip (-0.75, -0.3) to[closed, curve through = {(0.2, -0.7) (0.7, 0.4) (-0.15, 0.5)}] (-0.3, 0.6);
-
-        \draw[\ink, fill = juliared] (0.25cm, 0.3cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliared] (0.25cm, 0.15cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliared] (0.1cm, 0.15cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliared] (0.1cm, 0cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliared] (0.1cm, -0.15cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliared] (-0.05cm, 0cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliared] (-0.05cm, -0.15cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliared] (-0.05cm, -0.3cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliared] (-0.2cm, -0.3cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliared] (-0.2cm, -0.45cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliared] (-0.2cm, -0.6cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliared] (-0.35cm, -0.6cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliared] (-0.35cm, -0.75cm) rectangle ++(0.15cm, 0.15cm);
-      \end{scope}
-
-      \begin{scope}
-        \clip (-1, -1) to[out = 10, in = 210] (1, 1) -- (1, -1) -- cycle;
-        \clip (-0.75, -0.3) to[closed, curve through = {(0.2, -0.7) (0.7, 0.4) (-0.15, 0.5)}] (-0.3, 0.6);
-
-        \draw[\ink, fill = juliablue] (-0.3cm, -0.7cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliablue] (-0.3cm, -0.55cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliablue] (-0.15cm, -0.55cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliablue] (-0.15cm, -0.4cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliablue] (-0cm, -0.4cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliablue] (-0cm, -0.25cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliablue] (-0cm, -0.1cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliablue] (0.15cm, -0.1cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliablue] (0.15cm, 0.05cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliablue] (0.15cm, 0.2cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliablue] (0.3cm, 0.2cm) rectangle ++(0.15cm, 0.15cm);
-        \draw[\ink, fill = juliablue] (0.3cm, 0.35cm) rectangle ++(0.15cm, 0.15cm);
-      \end{scope}
-
-      \begin{scope}
         \clip (-0.75, -0.3) to[closed, curve through = {(0.2, -0.7) (0.7, 0.4) (-0.15, 0.5)}] (-0.3, 0.6);
         \draw[\ink] (-1, -1) to[out = 10, in = 210] (1, 1);
       \end{scope}
 
       \node[right, text = \ink] at (1, -1) {\Huge\sffamily\bfseries Unfitted.jl};
     \end{scope}
+
+    \begin{scope}[canvas is xy plane at z=0, xshift = -0.6cm, yshift = -0.2cm]
+      \fill[\ink, opacity = 0.3] (0cm, 0cm) rectangle ++(0.5cm, 0.5cm);
+    \end{scope}
+
+    \foreach \x in {-0.6, -0.1}
+      \foreach \y in {-0.2, 0.3}
+        \draw[\ink, densely dotted] (\x, \y, 0) -- ++(0, 0, 0.3);
+
+    \begin{scope}[canvas is xy plane at z=0.3, xshift = -0.6cm, yshift = -0.2cm]
+      \fill[juliared] (0cm, 0cm) rectangle ++(0.5cm, 0.5cm);
+      \draw[\ink] (0cm, 0cm) grid[step = 0.25cm] ++(0.5cm, 0.5cm);
+    \end{scope}
+
   \end{tikzpicture}%
 \end{document}
