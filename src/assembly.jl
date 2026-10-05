@@ -125,15 +125,6 @@ function _regions(@nospecialize(model::Model), iface::Interface, _)
                               model.dofs.tolerance), false
 end
 
-# Resolve a field name to its index inside a `SystemLayout`, raising on an
-# unknown name. How the kernel's blocks and loads, an interface's region build
-# and a `FormState` read find a field in the layout's field-major data.
-function _field_index(layout::SystemLayout, name::Symbol)
-    index = get(layout.by_name, name, 0)
-    index == 0 && throw(ArgumentError("unknown field $name"))
-    return index
-end
-
 # The `RegionList` of pass target `target` on `space` (`RegionKey`
 # `(target, space)`; `space` is `nothing` for an `Interface`). Every consumer
 # resolves through here — the assembly passes, `nquadpoints`,
@@ -412,12 +403,10 @@ end
 # `_mirror_lower` builds fresh arrays for the full matrix. `dropzeros!`
 # then collapses the explicit zeros left by Dirichlet column elimination
 # and any structurally-present-but-untouched pattern slots.
-function _matrix_from_pattern(pattern::AssemblyPattern, nzval::Vector{T}) where {T}
-    matrix = pattern.symmetric ? _mirror_lower(pattern.n, pattern.colptr, pattern.rowval, nzval) :
-             SparseMatrixCSC(pattern.n, pattern.n, copy(pattern.colptr), copy(pattern.rowval),
-                             nzval)
-    dropzeros!(matrix)
-    return matrix
+function _matrix_from_pattern(pattern::AssemblyPattern, nzval::Vector)
+    n, colptr, rowval = pattern.n, pattern.colptr, pattern.rowval
+    return dropzeros!(pattern.symmetric ? _mirror_lower(n, colptr, rowval, nzval) :
+                      SparseMatrixCSC(n, n, copy(colptr), copy(rowval), nzval))
 end
 
 # ── Basis bank and assembly workspace ─────────────────────────────────────────
@@ -898,8 +887,10 @@ function FormState(layout::SystemLayout{D}, coefficients::Vector{R}) where {D,R}
                                          zeros(SVector{D,R}, offsets[end]), offsets)
 end
 
-# Buffer index of field `name`, component `component`, checking both.
-function _state_index(state::FormState, name::Symbol, component::Integer)
+# Buffer index of `field` (a name or a `Field`), component `component`,
+# checking both.
+function _state_index(state::FormState, field::Union{Symbol,Field}, component::Integer)
+    name = field isa Field ? field.name : field
     f = _field_index(state.layout, name)
     1 <= component <= state.layout.fields[f].components ||
         throw(BoundsError(state, (name, component)))
@@ -913,8 +904,8 @@ Read the named field's value at the current quadrature point. `name` is
 either a `Symbol` matching a field name in the model or a [`Field`](@ref)
 object. For multi-component fields, pass `component`.
 """
-function value(state::FormState, name::Symbol, component::Integer=1)
-    return state.values[_state_index(state, name, component)]
+function value(state::FormState, field::Union{Symbol,Field}, component::Integer=1)
+    return state.values[_state_index(state, field, component)]
 end
 
 """
@@ -926,13 +917,8 @@ point. Same field/component semantics as [`value`](@ref). The leading
 automatic-differentiation entry point) when both packages are loaded
 together.
 """
-function field_gradient(state::FormState, name::Symbol, component::Integer=1)
-    return state.gradients[_state_index(state, name, component)]
-end
-
-value(state::FormState, field::Field, component::Integer=1) = value(state, field.name, component)
-function field_gradient(state::FormState, field::Field, component::Integer=1)
-    field_gradient(state, field.name, component)
+function field_gradient(state::FormState, field::Union{Symbol,Field}, component::Integer=1)
+    return state.gradients[_state_index(state, field, component)]
 end
 
 # Tiny helper raising the "no state attached" error from a single
@@ -1411,7 +1397,7 @@ function _threaded!(nz, rhs, pattern, @nospecialize(pass::Pass), offsets::Vector
     done = fill(false, length(dofs.ptr) - 1)
     _phase1!(pass, workspaces, states, dofs, arena, offsets, done, region_filter, symmetric)
     owners = clamp(cld(offsets[end] - 1, _GATHER_GRAIN), 1, Threads.nthreads())
-    owned = matrix ? _balanced_ranges(pattern.colptr, owners) : _even_ranges(length(rhs), owners)
+    owned = _balanced_ranges(matrix ? pattern.colptr : (1:(length(rhs)+1)), owners)
     @sync for range in owned
         Threads.@spawn _gather!(matrix ? nz : nothing, rhs, pattern, dofs, arena, offsets, done,
                                 range, symmetric)
@@ -1492,26 +1478,23 @@ function _gather!(nz, rhs, pattern, dofs::RegionDofs, arena, offsets::Vector{Int
 end
 
 # Partition the columns `1:length(ptr)-1` of a CSC pattern into `tasks`
-# contiguous ranges of roughly equal entry count, the last one running to the
-# final column. Contiguous by construction, so the ranges own disjoint slots.
-function _balanced_ranges(ptr::Vector{Int}, tasks::Int)
+# contiguous ranges of roughly equal entry count: range `t` ends at the first
+# column through which the pattern holds `t/tasks` of its entries, found by
+# bisection on `ptr`, and the last one runs to the final column. A range is
+# empty when one column holds more than a task's share. Contiguous by
+# construction, so the ranges own disjoint slots. An rhs-only pass, one entry
+# per dof, passes `ptr = 1:(n+1)` and gets `n` split into near-equal lengths.
+function _balanced_ranges(ptr::AbstractVector{Int}, tasks::Int)
     m, total = length(ptr) - 1, ptr[end] - 1
     ranges = Vector{UnitRange{Int}}(undef, tasks)
-    i = 1
+    lo = 1
     for t in 1:tasks
-        lo = i
-        while i <= m && ptr[i+1] - 1 < div(t * total, tasks)
-            i += 1
-        end
-        hi = t == tasks ? m : min(i, m)
+        hi = t == tasks ? m : min(searchsortedfirst(ptr, div(t * total, tasks) + 1) - 1, m)
         ranges[t] = lo:hi
-        i = hi + 1
+        lo = hi + 1
     end
     return ranges
 end
-
-# Partition `1:n` into `tasks` contiguous ranges of near-equal length.
-_even_ranges(n::Int, tasks::Int) = [(div((t-1)*n, tasks)+1):div(t*n, tasks) for t in 1:tasks]
 
 # ── Public assembly API ───────────────────────────────────────────────────────
 

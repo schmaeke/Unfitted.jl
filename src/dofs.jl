@@ -1382,12 +1382,17 @@ struct SystemLayout{D,T<:Real}
     tolerance::GeometryTolerance{T}
 end
 
-# Look up the per-field layout by name. Throws on unknown name.
-function _field_layout(system::SystemLayout, name::Symbol)
+# Resolve a field name to its index inside a `SystemLayout`, raising on an
+# unknown name. How the assembly kernel's blocks and loads, an interface's region
+# build and a `FormState` read find a field in the layout's field-major data.
+function _field_index(system::SystemLayout, name::Symbol)
     index = get(system.by_name, name, 0)
     index == 0 && throw(ArgumentError("unknown field $name"))
-    return system.fields[index]
+    return index
 end
+
+# Look up the per-field layout by name. Throws on unknown name.
+_field_layout(system::SystemLayout, name::Symbol) = system.fields[_field_index(system, name)]
 
 # Global active dof id for component `component` of raw `raw` in this
 # field, or 0 if the (raw, component) is constrained. Per-field active

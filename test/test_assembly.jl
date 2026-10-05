@@ -1651,7 +1651,7 @@ end
 @testset "threaded phase 2 split over several dof owners matches serial" begin
     # Phase 2 hands each task a contiguous range of global dofs to own — balanced
     # by pattern entries for a matrix pass (`_balanced_ranges`), even for an
-    # rhs-only one (`_even_ranges`) — and the task sums every region's entries
+    # rhs-only one (one entry per dof) — and the task sums every region's entries
     # in those rows and columns. It runs one task per `_GATHER_GRAIN` entries it
     # gathers, at most one per thread, so on a small problem a single task owns
     # every dof, and a partition that lost or repeated the dofs at a range
@@ -1661,7 +1661,7 @@ end
     # every dof or column exactly once, also when there are more tasks than
     # columns and when columns store nothing.
     for n in (0, 1, 5, 64), tasks in 1:7
-        ranges = Unfitted._even_ranges(n, tasks)
+        ranges = Unfitted._balanced_ranges(1:(n+1), tasks)
         @test length(ranges) == tasks
         @test reduce(vcat, ranges; init=Int[]) == 1:n
     end
