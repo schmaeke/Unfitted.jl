@@ -73,6 +73,40 @@ end
     @test value(solution, per_component, (0.5, 0.0), 1) ≈ 0.0 atol = 1.0e-10   # u_x fixed on bottom
 end
 
+@testset "a system layout's per-dof accessors honour the component" begin
+    # A roller on the top face pins u_y there and leaves u_x free, so the two
+    # components of one raw are constrained differently. The single-field system
+    # forms of `constraint_kind` and `constrained_value` must answer for the
+    # component asked about, as the `DofLayout` forms do. `constraint_kind` on a
+    # `SystemLayout` once took no component at all and so read component 1, and a
+    # caller asking about component 2 got a `MethodError`.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    u = field(:u, V; components=2)
+    model = prepare(poisson(u; source=SVector(0.0, 0.0),
+                            dirichlet=[dirichlet(0.1; on=boundary(axis=2, side=:upper), field=u,
+                                                 component=2)]))
+    layout = model.dofs
+    dofs = only(layout.fields).dofs
+
+    # The three nodes of the top face, in component 2 only.
+    pinned = findall(dofs.physical_dirichlet[:, 2])
+    @test length(pinned) == 3
+    @test !any(dofs.physical_dirichlet[:, 1])
+
+    raw = first(pinned)
+    @test Unfitted.constraint_kind(layout, raw, 2) === :dirichlet
+    @test Unfitted.constraint_kind(layout, raw, 1) === :free
+    @test Unfitted.constraint_kind(layout, raw) === :free             # component 1 by default
+    @test Unfitted.constrained_value(layout, raw, 2) ≈ 0.1
+    @test Unfitted.constrained_value(layout, raw, 1) == 0.0
+
+    # Every (raw, component) agrees with the field's own layout.
+    @test all(Unfitted.constraint_kind(layout, r, c) === Unfitted.constraint_kind(dofs, r, c)
+              for r in eachindex(dofs.raw_keys), c in 1:2)
+    @test all(Unfitted.constrained_value(layout, r, c) === Unfitted.constrained_value(dofs, r, c)
+              for r in eachindex(dofs.raw_keys), c in 1:2)
+end
+
 @testset "1D conforming dof sharing and physical constraints" begin
     V = space(box((0.0,), (1.0,)); cells=2, order=2)
     layout = Unfitted.dof_layout(V; dirichlet=[dirichlet(0.0; on=boundary(:all))])

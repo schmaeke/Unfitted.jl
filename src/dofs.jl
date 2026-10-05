@@ -135,7 +135,8 @@ The space block:
   - `cell_dofs_by_level::Vector{Array{Vector{Int},D}}` — indexed by
     level *id*, not by position in `V.levels`, so that it matches the
     `parent.level` id assembly carries; a subdomain whose ids were
-    reindexed into a higher block leaves the leading slots undefined.
+    reindexed into a higher block leaves the leading slots undefined,
+    and [`cell_dofs`](@ref) refuses them with an `ArgumentError`.
     Each entry is a `D`-dimensional array of cell-local raw dof id
     vectors, indexed by the level's `CartesianIndex`. Inactive cells
     carry an empty vector.
@@ -1040,12 +1041,6 @@ end
 
 # ── DofLayout construction and accessors ──────────────────────────────────────
 
-# Active global id of component `component` of raw dof `raw`, or 0 if
-# the (raw, component) is constrained.
-function _active_component_dof(layout::DofLayout, raw::Integer, component::Integer)
-    layout.active_component[raw, component]
-end
-
 # Step 1 of a layout: the space block, built from the space alone. Raw enumeration
 # (`_enumerate_raws`), then every level's artificial eliminations recorded in one
 # `EliminationLedger` — the family's `_overlay_constraints!`, then, under leaf
@@ -1117,36 +1112,61 @@ active_unknowns(layout::DofLayout) = layout.active_count
 """
     cell_dofs(layout, level::Integer, cell::CartesianIndex) -> Vector{Int}
 
-Pre-constraint raw dof ids for the cell at `cell` on level `level`, in
-the canonical local-basis order. Inactive cells return an empty vector.
+Pre-constraint raw dof ids for the cell at `cell` on the level with id `level`,
+in the canonical local-basis order. Inactive cells return an empty vector.
+`layout` is a [`DofLayout`](@ref), or the `SystemLayout` of a single-field
+problem.
+
+`level` is a level *id*. For a single-domain space that is the level's position
+in `V.levels`, but each subdomain of a coupled problem has its ids reindexed
+into a block of its own, and its layout holds no cells for an id outside that
+block. Such an id, or one no level carries, raises an `ArgumentError`.
 
 The vector is the layout's own and must not be mutated: every inactive cell of
 every level shares one empty vector, so a `push!` into a returned empty result
 would reach all of them. Copy before editing.
 """
 function cell_dofs(layout::DofLayout{D}, level::Integer, cell::CartesianIndex{D}) where {D}
-    1 <= level <= length(layout.cell_dofs_by_level) ||
-        throw(ArgumentError("unknown level id $level"))
-    return layout.cell_dofs_by_level[level][cell]
+    # One `isassigned` covers both an id past the end of the table and a slot
+    # below a reindexed subdomain block, which would otherwise surface as an
+    # `UndefRefError` from inside the table. It replaces the range check rather
+    # than adding to it, so assembly's `_frame!`, which calls this once per
+    # (region, parent, field), pays one test as before, and the read after it is
+    # in bounds.
+    tables = layout.cell_dofs_by_level
+    isassigned(tables, level) ||
+        throw(ArgumentError("level id $level is not a level of this layout's space"))
+    return @inbounds(tables[level])[cell]
 end
 
 """
-    active_cell_dofs(layout, level::Integer, cell::CartesianIndex, component=1) -> Vector{Int}
+    active_cell_dofs(layout::DofLayout, level::Integer, cell::CartesianIndex, component=1) -> Vector{Int}
+    active_cell_dofs(layout::SystemLayout, level::Integer, cell::CartesianIndex, component=1) -> Vector{Int}
+    active_cell_dofs(layout::SystemLayout, field::Symbol, level::Integer, cell::CartesianIndex,
+                     component=1) -> Vector{Int}
 
-Active global ids for component `component` of the cell-local raw dofs,
-with `0` standing for any dof that was eliminated by a constraint. The
-order matches the canonical local-basis ordering (same length as
-`cell_dofs(layout, level, cell)`).
+Active ids for component `component` of the cell-local raw dofs, with `0`
+standing for any dof that was eliminated by a constraint. The order matches the
+canonical local-basis ordering (same length as `cell_dofs(layout, level, cell)`),
+and `level` is a level id, as there.
+
+On a `DofLayout` the ids are the field's own, in `1:active_unknowns(layout)`. On
+a [`SystemLayout`](@ref) they are global: shifted by the field's `offset` into
+the system's active-dof vector, so they index a [`Solution`](@ref)'s
+coefficients directly. The second form reads the only field of a single-field
+problem; the third names the field.
 """
 function active_cell_dofs(layout::DofLayout{D}, level::Integer, cell::CartesianIndex{D},
                           component::Integer=1) where {D}
-    return [_active_component_dof(layout, raw, component) for raw in cell_dofs(layout, level, cell)]
+    return [layout.active_component[raw, component] for raw in cell_dofs(layout, level, cell)]
 end
 
 """
-    constraint_kind(layout::DofLayout, raw, component=1) -> Symbol
+    constraint_kind(layout, raw, component=1) -> Symbol
 
-Classify a single raw dof. Returns one of:
+Classify component `component` of a single raw dof. `layout` is a
+[`DofLayout`](@ref), or the `SystemLayout` of a single-field problem. Returns
+one of:
 
   - `:free`       — no constraint, the dof is enumerated.
   - `:dirichlet`  — physical Dirichlet only.
@@ -1155,9 +1175,12 @@ Classify a single raw dof. Returns one of:
   - `:dedup`      — linear-dedup elimination (covered vertex reproduced by
                     a nested finer level).
   - `:mixed`      — physical Dirichlet plus an elimination. The
-                    elimination wins (the dof is eliminated and its value
-                    is held in `constrained_values` from the Dirichlet
-                    projection).
+                    elimination wins: the dof is eliminated, and its
+                    [`constrained_value`](@ref) is zero, the homogeneous
+                    artificial constraint's, whatever the Dirichlet data.
+                    The Dirichlet projection solves only for the physical
+                    dofs no artificial elimination removed, so it never
+                    writes a value here.
 """
 function constraint_kind(layout::DofLayout, raw::Integer, component::Integer=1)
     physical = layout.physical_dirichlet[raw, component]
@@ -1168,62 +1191,16 @@ function constraint_kind(layout::DofLayout, raw::Integer, component::Integer=1)
 end
 
 """
-    constrained_value(layout::DofLayout, raw, component=1) -> T
+    constrained_value(layout, raw, component=1) -> T
 
-Stored value of a constrained (raw, component). Zero for overlay
-constraints and homogeneous Dirichlet conditions; the projected value
-for nonzero Dirichlet data.
+Stored value of a constrained (raw, component). Zero for every artificial
+elimination (overlay boundary, pruning, and a `:mixed` dof, see
+[`constraint_kind`](@ref)) and for homogeneous Dirichlet conditions; the
+projected value for nonzero Dirichlet data. `layout` is a
+[`DofLayout`](@ref), or the `SystemLayout` of a single-field problem.
 """
 function constrained_value(layout::DofLayout, raw::Integer, component::Integer=1)
     layout.constrained_values[raw, component]
-end
-
-"""
-    dof_value(layout::DofLayout, coefficients, raw, component=1) -> T
-
-Recover the value of component `component` of raw dof `raw` — the unified
-accessor every reconstruction path uses when a basis-function contribution needs
-the actual dof value regardless of constraint status.
-
-An active dof reads `coefficients[active]`. A constrained one reads its
-[`constrained_value`](@ref) — zero for an artificial-boundary or pruning
-elimination, the projected datum for a nonzero Dirichlet condition — and, if it is
-a **linear-constraint pivot**, adds the pivot's expansion from the layout's
-`pivots` table (see [`DofLayout`](@ref)):
-
-    u_raw = constrained_value(raw) + Σᵢ wᵢ · u_{rᵢ} .
-
-That pivot term is not an embellishment. A pivot is precisely the mechanism a
-basis family uses to impose C^m continuity or an arbitrary-mask trace condition,
-so reading `constrained_value` for it — which is zero — silently drops the dof's
-whole contribution from `value`, `field_gradient`, `l2_error`, `write_vtk` and
-`L2Projection`'s source reconstruction, while the *solve* is correct because
-assembly condenses every pivot through the same expansion. Measured on a
-6×6 degree-3 C¹ B-spline base under an L-masked 4×4 C¹ overlay (8 non-trivial
-expansions of 126 raws), the dropped term reached 4.79e-7 against a field of
-magnitude 7e-2 — silent, and small enough to pass a hand-written tolerance.
-
-One level of expansion is enough, because `_resolve_rows!` leaves every pivot
-expressed over raws the artificial constraints leave free, and the topology build
-checks it once (`_assert_resolved`). Such a branch
-may still be constrained on `component` by a physical Dirichlet condition, which
-is resolved later; it then contributes its constrained value rather than a
-coefficient.
-
-A layout without pivots — every integrated-Legendre layout — stops at the test
-for an empty table, before any per-raw read.
-
-The expansion is read through `_fold_pivot`, the one statement of the pivot rule
-that assembly reads as well, so a pivot cannot be reconstructed one way and
-assembled another.
-"""
-function dof_value(layout::DofLayout, coefficients, raw::Integer, component::Integer=1)
-    active = _active_component_dof(layout, raw, component)
-    active == 0 || return coefficients[active]
-    value, _ = _fold_pivot(_branch_value(coefficients), constrained_value(layout, raw, component),
-                           layout, (other, c) -> _active_component_dof(layout, other, c), raw,
-                           component)
-    return value
 end
 
 """
@@ -1243,19 +1220,19 @@ has_linear_constraints(d::DofLayout) = !isempty(d.pivots)
 #     u(raw, c) = Σₖ wₖ · u(oₖ, c)
 #
 # over constraint-free raws `oₖ`: `_resolve_rows!` leaves every pivot expressed
-# at depth one, and `_assert_resolved` checks it once per build. Two readers share this fold — `dof_value`, which
-# reconstructs a pivot from it, and `_slots!` in assembly, which detects a
-# region's pivots, widens its active set to their branches and records those
-# branches for `_condense!` to fold the pivot's local row and column onto. When
-# reconstruction and emission each carried their own encoding they could
-# disagree, and a field was then solved correctly but reconstructed wrong; one
-# definition rules that out.
+# at depth one, and `_assert_resolved` checks it once per build. Two readers
+# share this fold — `dof_value`, which reconstructs a pivot from it, and
+# `_slots!` in assembly, which detects a region's pivots, widens its active set
+# to their branches and records those branches for `_condense!` to fold the
+# pivot's local row and column onto. When reconstruction and emission each
+# carried their own encoding they could disagree, and a field was then solved
+# correctly but reconstructed wrong; one definition rules that out.
 #
 # `f(acc, g, w, v)` is folded over the branches in expansion order, where
 # `g = id(oₖ, c)` is the branch's active id (0 when it is constrained) and `v` its
 # constrained value when `g == 0`, zero otherwise. `id` maps `(raw, component)` to
-# the active id in whichever numbering the caller needs: a bare `DofLayout`'s, or
-# a `FieldLayout`'s, which shifts it into the global system. Returns
+# the active id in whichever numbering the caller needs; both readers pass a
+# field's global one, `_field_component_dof`. Returns
 # `(acc, true)` for a pivot. A non-pivot returns `(acc, false)` without calling
 # `f`, and needs no test of its own: the `pivots` table holds pivots only, so a
 # free raw, a strongly eliminated one and a constraint-free raw a Dirichlet
@@ -1339,20 +1316,53 @@ _field_layout(system::SystemLayout, name::Symbol) = system.fields[_field_index(s
 # Global active dof id for component `component` of raw `raw` in this
 # field, or 0 if the (raw, component) is constrained. Per-field active
 # ids are shifted by the field's `offset` so they live in disjoint
-# blocks of the global active enumeration.
+# blocks of the global active enumeration. Read once per slot by
+# assembly's `_frame!` and per branch by `_slots!`, so it stays one table
+# read and one add.
 function _field_component_dof(layout::FieldLayout, raw::Integer, component::Integer)
-    (active=_active_component_dof(layout.dofs, raw, component);
-     active == 0 ? 0 : layout.offset + active)
+    active = layout.dofs.active_component[raw, component]
+    return active == 0 ? 0 : layout.offset + active
 end
 
 """
     dof_value(layout::FieldLayout, coefficients, raw, component=1) -> T
 
-Recover the value of component `component` of raw `raw` in this field,
-using the global active enumeration. Equivalent to the
-[`DofLayout`](@ref) version — including its reassembly of a
-linear-constraint pivot from the layout's `pivots` table — but resolves the
-per-field offset so `coefficients` is the global active vector.
+Recover the value of component `component` of raw dof `raw` in this field — the
+unified accessor every reconstruction path uses when a basis-function
+contribution needs the actual dof value regardless of constraint status.
+`coefficients` is the system's global active vector, a [`Solution`](@ref)'s
+coefficients, and the field's `offset` is resolved here.
+
+An active dof reads `coefficients[offset + active]`. A constrained one reads its
+[`constrained_value`](@ref) — zero for an artificial-boundary or pruning
+elimination, the projected datum for a nonzero Dirichlet condition — and, if it is
+a **linear-constraint pivot**, adds the pivot's expansion from the field's
+`pivots` table (see [`DofLayout`](@ref)):
+
+    u_raw = constrained_value(raw) + Σᵢ wᵢ · u_{rᵢ} .
+
+That pivot term is not an embellishment. A pivot is precisely the mechanism a
+basis family uses to impose C^m continuity or an arbitrary-mask trace condition,
+so reading `constrained_value` for it — which is zero — silently drops the dof's
+whole contribution from `value`, `field_gradient`, `l2_error`, `write_vtk` and
+`L2Projection`'s source reconstruction, while the *solve* is correct because
+assembly condenses every pivot through the same expansion. Measured on a
+6×6 degree-3 C¹ B-spline base under an L-masked 4×4 C¹ overlay (8 non-trivial
+expansions of 126 raws), the dropped term reached 4.79e-7 against a field of
+magnitude 7e-2 — silent, and small enough to pass a hand-written tolerance.
+
+One level of expansion is enough, because `_resolve_rows!` leaves every pivot
+expressed over raws the artificial constraints leave free, and the topology build
+checks it once (`_assert_resolved`). Such a branch may still be constrained on
+`component` by a physical Dirichlet condition, which is resolved later; it then
+contributes its constrained value rather than a coefficient.
+
+A layout without pivots — every integrated-Legendre layout — stops at the test
+for an empty table, before any per-raw read.
+
+The expansion is read through `_fold_pivot`, the one statement of the pivot rule
+that assembly reads as well, so a pivot cannot be reconstructed one way and
+assembled another.
 """
 function dof_value(layout::FieldLayout, coefficients, raw::Integer, component::Integer=1)
     global_dof = _field_component_dof(layout, raw, component)
@@ -1395,36 +1405,33 @@ function _only_field_layout(layout::SystemLayout)
     return only(layout.fields)
 end
 
-# `cell_dofs`/`active_cell_dofs`/`constraint_kind`/`constrained_value`
-# delegates that thread through `_only_field_layout` for single-field
-# problems or through `_field_layout(name)` for the multi-field call
-# forms. The explicit overloads keep grep-friendly call sites and
-# preserve the per-field offset translation.
-
+# The system forms of the per-dof accessors, one method per verb, documented
+# with the `DofLayout` forms above. Without a field name they read the only
+# field of a single-field problem, so its callers need not name it; the
+# active-id form also takes a name, for a multi-field problem. Each takes the
+# same `component` as the `DofLayout` form it forwards to, and the active ids
+# come back global, shifted by the field's offset — the numbering a
+# `Solution`'s coefficients use.
 function cell_dofs(layout::SystemLayout, level::Integer, cell::CartesianIndex)
     cell_dofs(_only_field_layout(layout).dofs, level, cell)
 end
-function active_cell_dofs(layout::SystemLayout, level::Integer, cell::CartesianIndex)
-    active_cell_dofs(_only_field_layout(layout).dofs, level, cell)
-end
 
 function active_cell_dofs(layout::SystemLayout, level::Integer, cell::CartesianIndex,
-                          component::Integer)
-    field = _only_field_layout(layout)
+                          component::Integer=1)
+    active_cell_dofs(layout, _only_field_layout(layout).name, level, cell, component)
+end
+
+function active_cell_dofs(layout::SystemLayout, name::Symbol, level::Integer, cell::CartesianIndex,
+                          component::Integer=1)
+    field = _field_layout(layout, name)
     return [_field_component_dof(field, raw, component)
             for raw in cell_dofs(field.dofs, level, cell)]
 end
 
-function active_cell_dofs(layout::SystemLayout, field_name::Symbol, level::Integer,
-                          cell::CartesianIndex, component::Integer=1)
-    field = _field_layout(layout, field_name)
-    return [_field_component_dof(field, raw, component)
-            for raw in cell_dofs(field.dofs, level, cell)]
+function constraint_kind(layout::SystemLayout, raw::Integer, component::Integer=1)
+    constraint_kind(_only_field_layout(layout).dofs, raw, component)
 end
 
-function constraint_kind(layout::SystemLayout, raw::Integer)
-    constraint_kind(_only_field_layout(layout).dofs, raw)
-end
 function constrained_value(layout::SystemLayout, raw::Integer, component::Integer=1)
     constrained_value(_only_field_layout(layout).dofs, raw, component)
 end
