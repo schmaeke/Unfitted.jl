@@ -595,6 +595,22 @@ end
     @test isempty(first_writer.pivots)
 end
 
+@testset "a row is resolved against the raws eliminated before it" begin
+    # The second half of the ledger's ordering contract: a level's rows are resolved
+    # after both hooks, against everything eliminated so far, and a raw already
+    # eliminated contributes no term to a row. No family eliminates a raw directly on
+    # a level that also records rows today, so only a hand-built ledger reaches this.
+    # Raw 2 is eliminated first; the row u₁ + 4u₂ + 2u₃ = 0 then reads u₁ + 2u₃ = 0
+    # and pivots raw 3. Had raw 2 kept its term, its coefficient 4 would have made it
+    # the pivot, a second elimination of an eliminated raw, which `_pivot!` refuses.
+    ledger = Unfitted.EliminationLedger{Float64}(3)
+    Unfitted._eliminate!(ledger, 2, :coverage)
+    Unfitted._constrain!(ledger, [1, 2, 3], [1.0, 4.0, 2.0], :overlay)
+    Unfitted._cascade!(ledger)
+    @test ledger.source == [:free, :coverage, :overlay]
+    @test ledger.pivots[3] == [(1, -0.5)]
+end
+
 @testset "elimination provenance credits the overlay, not covered-mode pruning" begin
     # A raw on an overlay's artificial boundary Γ_o that is *also* buried under a
     # finer level collects two constraints: the overlay trace condition and the
