@@ -11,6 +11,11 @@ using LinearAlgebra: Symmetric, eigvals, isposdef, norm, pinv, rank
 # `_INT_*` constants from `test_coverage_reduction.jl`, which `runtests.jl`
 # includes first; this file does not stand alone.
 
+# The extension module, for the internals it alone defines: the cascade resolver
+# of linear-constraint rows (`_cascade!`, `_combine_terms`) lives there, not in
+# `Unfitted`.
+const BSExt = Base.get_extension(Unfitted, :UnfittedBasicBSplineExt)
+
 @testset "BSpline extension: a per-cell order is refused, not ignored" begin
     # Per-cell polynomial order is a basis-family capability. A B-spline degree
     # is a type parameter of the whole-axis knot vector, the clamped end
@@ -581,6 +586,44 @@ end
     @test V_hole.levels[1].basis isa Unfitted.BasisFamily
 end
 
+# Direct unit test of the cascade resolver `_cascade!`, this family's
+# `_resolve_rows!` method, on hand-built rows. Outside this test the resolver is
+# exercised only transitively through the B-spline Cᵐ overlay path, so this
+# guards the Gauss-elimination + back-substitution machinery on its own,
+# independent of the trace generator. The hand-built rows are engineered so that:
+#   * a later row pivots a raw that an EARLIER pivot's expansion still
+#     mentions (row B pivots raw 2, which row A's pivot expansion
+#     references), forcing step-5 back-substitution into the earlier pivot;
+#     and
+#   * a still-later row's raw list references a raw that is itself an
+#     earlier pivot (row C references raw 3), forcing step-1 forward
+#     substitution of the already-resolved expansion.
+# All coefficients are dyadic so the resolved (raw, weight) redirects are
+# exactly representable in Float64 and can be checked with `==`.
+@testset "Linear-constraint resolver: back-substitutes into earlier pivots" begin
+    ledger = Unfitted.EliminationLedger{Float64}(5)
+    # A:  u₁ +  u₂ + 2u₃ = 0  ⇒ pivot raw 3 = −½u₁ − ½u₂ (mentions raw 2).
+    # B: 2u₂ +  u₄      = 0  ⇒ pivot raw 2 = −½u₄; back-substituted into raw 3.
+    # C:  u₃ + 2u₅      = 0  ⇒ raw 3 already pivoted (forward substitution);
+    #                          pivot raw 5 in terms of the free raws {1, 4}.
+    Unfitted._constrain!(ledger, [1, 2, 3], [1.0, 1.0, 2.0], :overlay)
+    Unfitted._constrain!(ledger, [2, 4], [2.0, 1.0], :overlay)
+    Unfitted._constrain!(ledger, [3, 5], [1.0, 2.0], :overlay)
+    BSExt._cascade!(ledger)
+
+    # Free raws stay free; every pivot is redistributed onto the free raws
+    # {1, 4} only — the resolver's "free raws only" invariant after
+    # back-substitution.
+    @test ledger.source[1] === ledger.source[4] === :free
+    @test ledger.pivots[2] == [(4, -0.5)]
+    @test ledger.pivots[3] == [(1, -0.5), (4, 0.25)]
+    @test ledger.pivots[5] == [(1, 0.25), (4, -0.125)]
+
+    # The pivot table is what `has_linear_constraints` reads off a layout:
+    # non-empty iff some raw redirects onto *other* raws.
+    @test !isempty(ledger.pivots)
+end
+
 @testset "Linear-constraint resolver: cascade through chained pivots" begin
     # Hand-crafted rows that require the back-substitution branch of
     # `_cascade!`. Three raws, two rows:
@@ -595,9 +638,25 @@ end
     ledger = Unfitted.EliminationLedger{Float64}(3)
     Unfitted._constrain!(ledger, [1, 2], [1.0, -1.0], :overlay)
     Unfitted._constrain!(ledger, [2, 3], [2.0, -1.0], :overlay)
-    Unfitted._cascade!(ledger)
+    BSExt._cascade!(ledger)
     @test ledger.pivots[1] == ledger.pivots[2] == [(3, 0.5)]
     @test ledger.source[3] === :free
+end
+
+@testset "Linear-constraint resolver: a row is resolved against the raws eliminated before it" begin
+    # The second half of the ledger's ordering contract: a level's rows are resolved
+    # after both hooks, against everything eliminated so far, and a raw already
+    # eliminated contributes no term to a row. No family eliminates a raw directly on
+    # a level that also records rows today, so only a hand-built ledger reaches this.
+    # Raw 2 is eliminated first; the row u₁ + 4u₂ + 2u₃ = 0 then reads u₁ + 2u₃ = 0
+    # and pivots raw 3. Had raw 2 kept its term, its coefficient 4 would have made it
+    # the pivot, a second elimination of an eliminated raw, which `_pivot!` refuses.
+    ledger = Unfitted.EliminationLedger{Float64}(3)
+    Unfitted._eliminate!(ledger, 2, :coverage)
+    Unfitted._constrain!(ledger, [1, 2, 3], [1.0, 4.0, 2.0], :overlay)
+    BSExt._cascade!(ledger)
+    @test ledger.source == [:free, :coverage, :overlay]
+    @test ledger.pivots[3] == [(1, -0.5)]
 end
 
 @testset "Linear-constraint resolver: a constraint that collapsed to 0 = 0 eliminates nothing" begin
@@ -606,12 +665,12 @@ end
     # cell touching a face, and after the first emission pivots its raw away, a
     # re-emission can be left with a single term whose coefficient is exactly zero.
     # `0 · u = 0` constrains nothing; pivoting on it would strongly eliminate u.
-    @test isempty(Unfitted._combine_terms([(1, 0.0)]))
-    @test Unfitted._combine_terms([(1, 2.0)]) == [(1, 2.0)]
+    @test isempty(BSExt._combine_terms([(1, 0.0)]))
+    @test BSExt._combine_terms([(1, 2.0)]) == [(1, 2.0)]
     ledger = Unfitted.EliminationLedger{Float64}(2)
     Unfitted._constrain!(ledger, [1, 2], [1.0, 0.0], :overlay)
     Unfitted._constrain!(ledger, [1, 2], [1.0, 0.0], :overlay)
-    Unfitted._cascade!(ledger)
+    BSExt._cascade!(ledger)
     # The row that says something eliminates u₁ strongly: an empty expansion,
     # which leaves the pivot table unallocated.
     @test ledger.source[1] !== :free

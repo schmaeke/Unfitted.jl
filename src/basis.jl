@@ -40,7 +40,10 @@ A new family `F <: BasisFamily` must provide:
     `_tensor_dof_key`, `_key_on_level_side`, and either the per-raw
     `_has_overlay_constraint` predicate or a whole-level `_overlay_constraints!`
     method that records into the dof layer's `EliminationLedger` (see
-    `src/dofs.jl`).
+    `src/dofs.jl`), plus `_resolve_rows!` if the family records
+    linear-constraint rows: the dof layer stores rows but resolves none itself,
+    and its default raises. The B-spline extension's cascade is the one shipped
+    resolver.
   - `instantiate_basis(::F, mesh, order, mode, mask)` — only when the concrete
     family depends on the level's mesh. The `::BasisFamily` default returns the
     family unchanged; see [`instantiate_basis`](@ref) for the five-argument

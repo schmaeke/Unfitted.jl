@@ -527,44 +527,6 @@ end
     @test value(s, model, (0.5,)) ≈ 0.2 atol = 1.0e-10
 end
 
-# Direct, basis-family-free unit test of the cascade resolver `_cascade!`.
-# Outside this test the resolver is exercised only transitively through the
-# B-spline Cᵐ overlay path, so this guards the Gauss-elimination +
-# back-substitution machinery on its own, with no B-spline dependency. The
-# hand-built rows are engineered so that:
-#   * a later row pivots a raw that an EARLIER pivot's expansion still
-#     mentions (row B pivots raw 2, which row A's pivot expansion
-#     references), forcing step-5 back-substitution into the earlier pivot;
-#     and
-#   * a still-later row's raw list references a raw that is itself an
-#     earlier pivot (row C references raw 3), forcing step-1 forward
-#     substitution of the already-resolved expansion.
-# All coefficients are dyadic so the resolved (raw, weight) redirects are
-# exactly representable in Float64 and can be checked with `==`.
-@testset "linear-constraint resolver back-substitutes into earlier pivots" begin
-    ledger = Unfitted.EliminationLedger{Float64}(5)
-    # A:  u₁ +  u₂ + 2u₃ = 0  ⇒ pivot raw 3 = −½u₁ − ½u₂ (mentions raw 2).
-    # B: 2u₂ +  u₄      = 0  ⇒ pivot raw 2 = −½u₄; back-substituted into raw 3.
-    # C:  u₃ + 2u₅      = 0  ⇒ raw 3 already pivoted (forward substitution);
-    #                          pivot raw 5 in terms of the free raws {1, 4}.
-    Unfitted._constrain!(ledger, [1, 2, 3], [1.0, 1.0, 2.0], :overlay)
-    Unfitted._constrain!(ledger, [2, 4], [2.0, 1.0], :overlay)
-    Unfitted._constrain!(ledger, [3, 5], [1.0, 2.0], :overlay)
-    Unfitted._cascade!(ledger)
-
-    # Free raws stay free; every pivot is redistributed onto the free raws
-    # {1, 4} only — the resolver's "free raws only" invariant after
-    # back-substitution.
-    @test ledger.source[1] === ledger.source[4] === :free
-    @test ledger.pivots[2] == [(4, -0.5)]
-    @test ledger.pivots[3] == [(1, -0.5), (4, 0.25)]
-    @test ledger.pivots[5] == [(1, 0.25), (4, -0.125)]
-
-    # The pivot table is what `has_linear_constraints` reads off a layout:
-    # non-empty iff some raw redirects onto *other* raws.
-    @test !isempty(ledger.pivots)
-end
-
 @testset "the ledger refuses a pivot over an eliminated raw" begin
     # `_fold_pivot`, `dof_value` and assembly's condensation read one level of
     # expansion and never chase a chain, so every pivot must be expressed over
@@ -595,20 +557,23 @@ end
     @test isempty(first_writer.pivots)
 end
 
-@testset "a row is resolved against the raws eliminated before it" begin
-    # The second half of the ledger's ordering contract: a level's rows are resolved
-    # after both hooks, against everything eliminated so far, and a raw already
-    # eliminated contributes no term to a row. No family eliminates a raw directly on
-    # a level that also records rows today, so only a hand-built ledger reaches this.
-    # Raw 2 is eliminated first; the row u₁ + 4u₂ + 2u₃ = 0 then reads u₁ + 2u₃ = 0
-    # and pivots raw 3. Had raw 2 kept its term, its coefficient 4 would have made it
-    # the pivot, a second elimination of an eliminated raw, which `_pivot!` refuses.
-    ledger = Unfitted.EliminationLedger{Float64}(3)
-    Unfitted._eliminate!(ledger, 2, :coverage)
-    Unfitted._constrain!(ledger, [1, 2, 3], [1.0, 4.0, 2.0], :overlay)
-    Unfitted._cascade!(ledger)
-    @test ledger.source == [:free, :coverage, :overlay]
-    @test ledger.pivots[3] == [(1, -0.5)]
+@testset "the core resolves no linear-constraint row itself" begin
+    # The dof layer stores a level's rows but leaves their resolution to the family
+    # that recorded them; the cascade lives in the B-spline extension, its only
+    # user. A family that records rows without a `_resolve_rows!` method must fail
+    # loudly, naming itself, rather than leave the rows unresolved and the raws they
+    # constrain silently free. No shipped family reaches this end to end — integrated
+    # Legendre eliminates dof-wise — so the default is driven by hand on one of its
+    # levels.
+    level = space(box((0.0, 0.0), (1.0, 1.0)); cells=2, order=2).levels[1]
+    ledger = Unfitted.EliminationLedger{Float64}(4)
+    Unfitted._constrain!(ledger, [1, 2], [1.0, -1.0], :overlay)
+    @test_throws ArgumentError Unfitted._resolve_rows!(ledger, level)
+    @test_throws "integrated_legendre" Unfitted._resolve_rows!(ledger, level)
+    # The raise touches nothing: the row is still pending and every raw is free.
+    @test length(ledger.rows) == 1
+    @test all(==(:free), ledger.source)
+    @test isempty(ledger.pivots)
 end
 
 @testset "elimination provenance credits the overlay, not covered-mode pruning" begin

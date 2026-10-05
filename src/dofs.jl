@@ -211,15 +211,18 @@ end
 #   _AXIS_NODE   — integrated Legendre endpoint mode at a cell-corner
 #                  node coordinate.
 #   _AXIS_SPAN   — integrated Legendre interior (bubble) mode, cell-local.
-#   _AXIS_BSPLINE — global 1D B-spline function index along the axis;
-#                  used by the B-spline family in
-#                  `ext/UnfittedBasicBSplineExt.jl`. Reserved here so
-#                  the integrated-Legendre keys and B-spline keys live
-#                  in disjoint tag ranges and the dof-key cache can
-#                  share its hash table across mixed-basis problems.
+#
+# A tag need only be unique within one basis family, so each family owns
+# its tags: the B-spline extension defines its `_AXIS_BSPLINE` next to its
+# own key construction. Keys of two families can never be confused even
+# where their tags coincide. A key carries its level id and one level has
+# one family, so two keys of different families differ in their level and
+# the dof-key cache of a mixed-family space never takes one for the other;
+# and `_assert_keys_comparable` (`projection.jl`) refuses to match keys
+# across a change of family between two models. The shipped values happen
+# to be distinct (the extension's is `0x02`); nothing relies on it.
 const _AXIS_NODE = UInt8(0)
 const _AXIS_SPAN = UInt8(1)
-const _AXIS_BSPLINE = UInt8(2)
 
 # Build the per-axis dof key for cell `cell_axis` and 1D mode `mode` in
 # the integrated Legendre basis. Modes 0 and 1 are the two endpoint
@@ -545,9 +548,10 @@ The order is the core's, and it is what makes the attribution exact:
 
   - Levels are processed one at a time, in `V.levels` order: the level's
     `_overlay_constraints!`, then, under leaf semantics, its
-    `_coverage_constraints!`, then `_resolve_rows!` on whatever rows the two
-    recorded. A row names only its own level's raws, so resolving level by level
-    is the same as resolving every row of the space in one pass.
+    `_coverage_constraints!`, then the family's `_resolve_rows!` on whatever rows
+    the two recorded (the core stores rows but resolves none). A row names only
+    its own level's raws, so resolving level by level is the same as resolving
+    every row of the space in one pass.
   - Within a level, the direct eliminations from both hooks are applied as they
     arrive, and the first writer wins: a raw is credited to the first source that
     eliminates it. The artificial boundary is recorded first, so a raw that both
@@ -627,11 +631,19 @@ elimination, else a depth-one expansion over raws that remain free — credited 
 the row that eliminated it. It must not otherwise write `ledger.source`, and it
 must not clear `ledger.rows`: the caller does.
 
-This method resolves the rows of every family with the cascade Gauss elimination
-`_cascade!`. The B-spline family below maximal continuity is the only family that
-records rows.
+The core resolves nothing itself: a family that records rows implements this, and
+this default raises. The integer-continuity B-spline family in
+`ext/UnfittedBasicBSplineExt.jl` is the only one today; its method is the cascade
+Gauss elimination `_cascade!`, which lives there with it. The default is written
+over `Level{D,T}` with both parameters free, as a family method naturally is
+(`Level{D,T,<:F} where {D,T}`): over a bare `Level`, whose `T` is bounded by
+`Real`, such a method would be ambiguous with it rather than more specific.
 """
-_resolve_rows!(ledger::EliminationLedger, ::Level) = _cascade!(ledger)
+function _resolve_rows!(ledger::EliminationLedger, level::Level{D,T}) where {D,T}
+    throw(ArgumentError("the $(basis_name(level.basis)) family recorded $(length(ledger.rows)) " *
+                        "linear-constraint row(s) on level $(level.id) but implements no " *
+                        "`_resolve_rows!` method to resolve them"))
+end
 
 # Every pivot must be expressed over raws that stay free: `_fold_pivot`, `dof_value`
 # and assembly's condensation read ONE level of expansion and never chase a chain. A
@@ -984,204 +996,6 @@ end
 function _coverage_constraints!(ledger::EliminationLedger, ::Level{D,T},
                                 ::_LevelContext{D,T}) where {D,T}
     ledger
-end
-
-# ── Resolving a level's rows: the cascade ─────────────────────────────────────
-
-# Combine repeated raws in a list of `(raw, coefficient)` pairs by
-# summing the coefficients, dropping terms whose coefficient falls
-# below the working tolerance. Pure-data helper consumed by the
-# cascade resolver below; sorts in place for compactness.
-#
-# A one-term list is not a special case, and must not be short-circuited past the
-# drop test. A multi-raw constraint re-emitted after its raws were pivoted away can
-# leave exactly one surviving term whose coefficient is zero — `0·u = 0`, which
-# constrains nothing — and returning that unfiltered makes the resolver pivot on it
-# and eliminate `u` outright.
-function _combine_terms(terms::Vector{Tuple{Int,T}}) where {T}
-    isempty(terms) && return terms
-    sort!(terms; by=first)
-    write = 1
-    @inbounds for read in 2:length(terms)
-        if terms[read][1] == terms[write][1]
-            terms[write] = (terms[write][1], terms[write][2] + terms[read][2])
-        else
-            write += 1
-            terms[write] = terms[read]
-        end
-    end
-    resize!(terms, write)
-    drop_tol = sqrt(eps(T)) * maximum(t -> abs(t[2]), terms; init=one(T))
-    filter!(t -> abs(t[2]) > drop_tol, terms)
-    return terms
-end
-
-# Back-substitute a freshly created pivot's expansion into every other
-# pivot's expansion that mentions the new pivot raw. Necessary because
-# our greedy pivot ordering doesn't guarantee that a constraint's pivot
-# choice is downstream of all its references — when a later constraint
-# pivots a raw that an earlier pivot's expansion still mentions, the
-# earlier expansion needs the substitution to stay in "free raws only"
-# form.
-#
-# `mentions` lists, per raw, the pivots whose expansion currently contains it,
-# so this visits only the expansions that can possibly need rewriting. It
-# used to scan all `nraw` expansions per constraint, which made the pass
-# `O(K · nraw)` — quadratic in the problem — while the comment here claimed
-# `O(K · D · p)`, "negligible at problem scale". It was not negligible: on a
-# covered stack the dof layout reached 98.7% of `prepare` and 2.8× the cost
-# of `assemble!`, growing ×12.7 and ×14.8 per ×4 in unknowns. The scan's
-# answer was almost always "nothing to do", because every integrated
-# Legendre elimination was then a single-raw strong constraint whose pivot
-# expansion is empty and which therefore mentions no raw at all. (Those are
-# direct `_eliminate!` calls now and never reach the resolver.)
-#
-# The index is allowed to over-report: an expansion rewritten by an earlier
-# substitution may no longer contain the raw that registered it, so the
-# membership test below stays. It must never under-report, which is why an
-# entry is added at *every* site that writes an expansion — here and in
-# `_cascade!` step 4. Every holder it lists is a pivot, since only a pivot's
-# expansion is ever registered, so each one has an assigned `expansions` entry.
-#
-# Both tables are `_cascade!`'s level-local ones: entry `raw - offset` belongs to
-# `raw`, and an entry stays unassigned until something is written to it.
-function _back_substitute!(expansions::Vector{Vector{Tuple{Int,T}}}, mentions::Vector{Vector{Int}},
-                           offset::Int, pivot_raw::Int,
-                           pivot_expansion::Vector{Tuple{Int,T}}) where {T}
-    isassigned(mentions, pivot_raw - offset) || return expansions
-    @inbounds for raw in mentions[pivot_raw - offset]
-        raw == pivot_raw && continue
-        expansion = expansions[raw - offset]
-        # The index over-reports; this is the exact test.
-        any(t -> first(t) == pivot_raw, expansion) || continue
-        # Rebuild with substitution.
-        new_terms = Tuple{Int,T}[]
-        sizehint!(new_terms, length(expansion) + length(pivot_expansion))
-        for (other, w) in expansion
-            if other == pivot_raw
-                for (sub_other, sub_w) in pivot_expansion
-                    push!(new_terms, (sub_other, w * sub_w))
-                end
-            else
-                push!(new_terms, (other, w))
-            end
-        end
-        combined = _combine_terms(new_terms)
-        expansions[raw - offset] = combined
-        # This expansion now mentions the pivot's own references. `pivot_raw`
-        # cannot be among them — `pivot_expansion` was built excluding it — so
-        # the list being iterated is never the one appended to.
-        _register_mentions!(mentions, offset, raw, combined)
-    end
-    return expansions
-end
-
-# Record that `raw`'s expansion contains each of `terms`' raws, in the level-local
-# `mentions` table of `_back_substitute!`. A raw's list is allocated by its first
-# mention, so a level whose pivots are all strong eliminations allocates none.
-function _register_mentions!(mentions::Vector{Vector{Int}}, offset::Int, raw::Int,
-                             terms::Vector{Tuple{Int,T}}) where {T}
-    for (other, _) in terms
-        k = other - offset
-        isassigned(mentions, k) ? push!(mentions[k], raw) : (mentions[k] = [raw])
-    end
-    return mentions
-end
-
-"""
-    _cascade!(ledger::EliminationLedger) -> ledger
-
-Resolve the current level's rows, `ledger.rows`, by cascade elimination and record
-every raw they eliminate with `_pivot!`: strongly, when its expansion is empty, or
-as a *linear-constraint pivot* `u_raw = Σᵢ wᵢ u_{rᵢ}` over raws that stay free.
-
-The algorithm is the classical sparse Gauss elimination, adapted to
-exploit the small constraint matrix's structure:
-
-  1. For each row, in emission order, substitute what is already known
-     into its terms: a raw pivoted by an earlier row of this level
-     contributes its expansion, a raw that is still free contributes
-     itself, and a raw eliminated before the rows (by `_eliminate!`)
-     contributes nothing.
-  2. Combine like terms and drop near-zeros; skip the row entirely if it
-     collapses to `0 = 0`. A skipped row eliminates nothing and is
-     credited with nothing.
-  3. Pick a pivot by largest absolute coefficient (numerical stability).
-  4. Express the pivot as a linear combination of the remaining
-     terms' raws, and credit it to the row's source.
-  5. Back-substitute the pivot into every earlier pivot's expansion
-     that mentions the new pivot raw.
-
-Step 5 keeps the invariant: at any point after a row has been
-processed, *every pivot's expansion is in terms of currently-free raws
-only*. Assembly emission then never needs to chase chains. The pivots are
-written to the ledger once the last row is processed, in raw order; storage
-is per raw, so the order is immaterial.
-
-Each row costs a substitution and a sort-and-combine over its terms after
-substitution, plus one rewrite per earlier pivot that mentions the new pivot
-raw, found through the `mentions` index rather than by scanning every
-expansion (see `_back_substitute!`).
-
-The working tables are dense vectors over the span `lo:hi` of the raws the rows
-name, entry `raw - (lo - 1)` for `raw`. That span holds every raw a table is ever
-indexed by — a term, a pivot and a mention all name a raw some row names — and,
-since a level's rows name only its own raws, it lies inside the level. Dense
-level-local tables instead of hash tables keyed by raw: the arithmetic is the
-same, but no new `Dict` type is compiled at the first build that resolves a
-row, and the lookups are plain loads.
-"""
-function _cascade!(ledger::EliminationLedger{T}) where {T}
-    lo, hi = typemax(Int), typemin(Int)
-    for (raws, _, _) in ledger.rows, raw in raws
-        lo, hi = min(lo, raw), max(hi, raw)
-    end
-    lo > hi && return ledger                    # no row names a raw: nothing to resolve
-    offset, n = lo - 1, hi - lo + 1
-    # Per raw: the source of the row that pivoted it, `:free` until one does, and
-    # its current expansion, assigned with it.
-    sources = fill(:free, n)
-    expansions = Vector{Vector{Tuple{Int,T}}}(undef, n)
-    # Per raw: the pivots whose expansion mentions it (see `_back_substitute!`).
-    mentions = Vector{Vector{Int}}(undef, n)
-
-    for (raws, coefficients, source) in ledger.rows
-        # 1) Substitute already-pivoted raws; drop already-eliminated ones.
-        terms = Tuple{Int,T}[]
-        sizehint!(terms, length(raws))
-        for (raw, coeff) in zip(raws, coefficients)
-            if sources[raw - offset] !== :free
-                for (other, w) in expansions[raw - offset]
-                    push!(terms, (other, coeff * w))
-                end
-            elseif ledger.source[raw] === :free
-                push!(terms, (raw, coeff))
-            end
-        end
-
-        # 2) Combine like terms; trivially satisfied rows fall away.
-        combined = _combine_terms(terms)
-        isempty(combined) && continue
-
-        # 3) Pick pivot by largest |coefficient| (numerical stability).
-        _, pivot_pos = findmax(t -> abs(t[2]), combined)
-        pivot_raw, pivot_coeff = combined[pivot_pos]
-
-        # 4) Build the pivot expansion (in terms of remaining raws).
-        new_expansion = Tuple{Int,T}[(raw, -c / pivot_coeff)
-                                     for (k, (raw, c)) in pairs(combined) if k != pivot_pos]
-
-        expansions[pivot_raw - offset] = new_expansion
-        sources[pivot_raw - offset] = source
-        _register_mentions!(mentions, offset, pivot_raw, new_expansion)
-
-        # 5) Back-substitute into earlier pivots that mention this raw.
-        _back_substitute!(expansions, mentions, offset, pivot_raw, new_expansion)
-    end
-    for (k, source) in pairs(sources)
-        source === :free || _pivot!(ledger, k + offset, expansions[k], source)
-    end
-    return ledger
 end
 
 # ── DofLayout construction and accessors ──────────────────────────────────────
