@@ -177,7 +177,7 @@ end
 @testset "per-cell order: inactive cells do not lower a shared entity" begin
     # An inactive cell generates nothing, so it cannot disagree across a face and
     # must not enter the minimum. Letting it in would silently delete live dofs on
-    # a fictitious fold, where `_internal_face_is_physical` deliberately keeps the
+    # a fictitious fold, where `_has_overlay_constraint` deliberately keeps the
     # boundary modes free.
     orders = fill(4, 3, 3)
     orders[2, 2] = 1

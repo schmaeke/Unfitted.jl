@@ -98,7 +98,7 @@ end
 # Letting a fictitious cell block coverage therefore leaves a parent mode active that
 # the finer level already duplicates on Ω, and the assembled operator acquires an exact
 # null mode — a function with ‖v_h‖_{L²(Ω)} = 0, living entirely in the fictitious part.
-# This mirrors `_internal_face_is_physical` in `dofs.jl`, which draws the same
+# This mirrors `_has_overlay_constraint` in `dofs.jl`, which draws the same
 # fold-versus-user-mask distinction for the artificial overlay trace condition. With
 # `physical === nothing` there is no fictitious material and the original
 # active-cells-only rule is recovered without ever touching `cache`.

@@ -695,7 +695,7 @@ features evolve.
     cell of the same level is an artificial overlay constraint, analogous
     to a mesh-box-face constraint — unless every inactive cell across it
     was folded away as fictitious rather than masked by the user, in
-    which case the modes stay free (`_internal_face_is_physical`). A
+    which case the modes stay free (`_has_overlay_constraint`). A
     fictitious fold covers; a user mask does not. Span-mode dofs of
     inactive cells are not enumerated.
 

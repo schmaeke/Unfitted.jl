@@ -24,7 +24,7 @@
 #     internal active/inactive cell faces of the same level when a
 #     `LevelMask` is in play — except where the inactive side is fully
 #     fictitious, since a fold face carries no physical trace to
-#     vanish on (`_internal_face_is_physical`).
+#     vanish on (`_has_overlay_constraint`).
 #   * Covered-mode pruning — under leaf semantics, the high-order modes
 #     buried under a finer level, plus the buried linear modes a nested
 #     finer level reproduces exactly. Also a strong elimination, and also
@@ -1097,35 +1097,15 @@ end
 
 # True iff the cell whose axis-`axis` index is `pos` (with the other-axis
 # indices drawn from `outer`, ignoring the axis-`axis` slot) is in bounds
-# and active under the level's `LevelMask`. Used by `_on_active_face` to
-# probe both sides of a candidate face for active/inactive transitions.
+# and active under the level's `LevelMask`. Used by `_has_overlay_constraint`
+# to probe both sides of a candidate face for an active/inactive transition.
+# A position off the mesh reads as inactive, so a mesh-box face is a
+# transition wherever the cell just inside it is active.
 function _cell_active(level::Level{D}, axis::Integer, pos::Integer, outer::NTuple{D,Int},
                       n::NTuple{D,Int}) where {D}
     1 <= pos <= n[axis] || return false
     cell_tuple = ntuple(d -> d == axis ? pos : outer[d], D)
     return is_active(level.mask, CartesianIndex(cell_tuple))
-end
-
-# True iff the `_AXIS_NODE` factor of `key` at axis `axis`, node index
-# `i`, lies on a face that separates an active cell from an
-# off-mesh-or-inactive cell on the other side. The perpendicular positions
-# come from the key's own incidence (`_perp_ranges`); for each of them,
-# sample the activity of the cells immediately below (`i − 1`) and above
-# (`i`) the candidate face along `axis`. A change in activity ⇒ the face is
-# between an active and an inactive cell of the level, i.e. an
-# active-region face.
-#
-# Integrated-Legendre-specific, because the incidence rule is. The B-spline
-# family in the extension rolls its own active-face check tied to the
-# function's actual support span, which can spread across many cells.
-function _on_active_face(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
-                         axis::Integer, i::Integer, n::NTuple{D,Int}) where {D,T}
-    for outer in CartesianIndices(_perp_ranges(key, axis, n))
-        below_active = _cell_active(level, axis, i - 1, outer.I, n)
-        above_active = _cell_active(level, axis, i, outer.I, n)
-        below_active != above_active && return true
-    end
-    return false
 end
 
 # True iff `key` sits on the artificial boundary of the level's *active
@@ -1142,72 +1122,65 @@ end
 # box, only mesh-box faces matter, and this reduces to the original
 # overlay-boundary rule from the paper.
 #
-# Dispatched on the level's basis family. The integrated-Legendre body
-# below uses the family's node/span index conventions directly; the
-# B-spline overload in `ext/UnfittedBasicBSplineExt.jl` does the same
-# job with B-spline function-index conventions and the C⁰-knot
-# treatment of mask-induced internal junctions.
-function _has_overlay_constraint(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
-                                 physical, domain::AxisBox{D,T}, tol::GeometryTolerance{T},
-                                 cache::_ClassifyCache{D,T}) where {D,T}
+# One walk per node axis decides it. Only an `_AXIS_NODE` factor sits on a
+# face: at node index `i` it is the face between cells `i − 1` and `i` along
+# `axis`, and the key's incidence on the other axes (`_perp_ranges`) gives
+# the perpendicular positions the face spans under the key's support. Every
+# position where activity changes across the face is a face of the active
+# region, and
+#
+#   * on a mesh-box face (`i == 1` or `i == n[axis] + 1`) the first such
+#     position settles the axis: the face constrains unless the level side
+#     lies on the physical boundary (`_level_side_is_physical`), and the rest
+#     of the face cannot say otherwise;
+#   * on an internal face, a position constrains when the inactive cell
+#     across it is not `_is_fictitious`.
+#
+# The second case is the fold exemption. The fictitious fold deactivates
+# fully-fictitious cells, so a fold face sees no material on its inactive
+# side, and its boundary modes stay active. They vanish on every physical
+# face — so they cannot break the C⁰ trace condition the overlay constraint
+# enforces — and instead carry the adjacent cut cell's approximation up to
+# ∂Ω. A cell the *user* masked out still holds material: the modes on its
+# face are non-zero on a physical face and must be eliminated to keep the
+# truncated solution continuous. With no physical domain there is no
+# fictitious material, so every internal active/inactive face constrains
+# (the original overlay/user-mask behaviour) and `cache` is never touched.
+# The walk stops at the first constraining position, so a fold face
+# classifies its inactive neighbours only until one of them holds material.
+#
+# This runs once per raw on every layout build, so two measured choices keep
+# it as cheap as the two-walk predicate it replaced: `@inline`, without which
+# the call stays out of `_overlay_constraints!`'s per-raw loop (1.1–1.8× the
+# pass time on the layout probe's spaces), and the side test at the first
+# transition rather than ahead of the walk, so an internal face without one
+# pays for nothing but the walk (ahead of it: 1.2× on 2D overlays and ladders).
+#
+# Integrated-Legendre-specific, because the incidence rule is. The B-spline
+# family in `ext/UnfittedBasicBSplineExt.jl` does the same job in its own
+# `_overlay_constraints!`, with a support map that spans several cells and
+# the same fold exemption (`_active_cell_at_face`).
+@inline function _has_overlay_constraint(key::TensorDofKey{D},
+                                         level::Level{D,T,<:IntegratedLegendre}, physical,
+                                         domain::AxisBox{D,T}, tol::GeometryTolerance{T},
+                                         cache::_ClassifyCache{D,T}) where {D,T}
     n = level.mesh.cells
     for axis in 1:D
         axis_key = key.axes[axis]
         axis_key.kind == _AXIS_NODE || continue
         i = axis_key.index
-
-        # Only nodes that actually sit on an active-region face matter.
-        _on_active_face(key, level, axis, i, n) || continue
-
-        # Three cases for an active-region face along this axis:
-        #   i == 1            — mesh's lower-axis face. Physical iff the
-        #                       level's lower bound coincides with the
-        #                       physical domain's lower bound; otherwise
-        #                       artificial.
-        #   i == n[axis] + 1  — mesh's upper-axis face, symmetric.
-        #   otherwise         — internal face between active and inactive
-        #                       cells of the same level. Artificial only when it
-        #                       carries physical material: a fully-fictitious
-        #                       fold face leaves the mode active (see
-        #                       `_internal_face_is_physical`).
-        if i == 1
-            _level_side_is_physical(level, domain, axis, :lower, tol) || return true
-        elseif i == n[axis] + 1
-            _level_side_is_physical(level, domain, axis, :upper, tol) || return true
-        else
-            _internal_face_is_physical(key, level, physical, axis, i, n, cache) && return true
+        for outer in CartesianIndices(_perp_ranges(key, axis, n))
+            below_active = _cell_active(level, axis, i - 1, outer.I, n)
+            below_active == _cell_active(level, axis, i, outer.I, n) && continue
+            if i == 1 || i == n[axis] + 1
+                side = i == 1 ? :lower : :upper
+                _level_side_is_physical(level, domain, axis, side, tol) && break
+                return true
+            end
+            across = below_active ? i : i - 1          # the inactive cell's axis position
+            inactive = CartesianIndex(ntuple(d -> d == axis ? across : outer[d], D))
+            _is_fictitious(level, inactive, physical, cache) || return true
         end
-    end
-    return false
-end
-
-# True iff the internal active/inactive face along `axis` at node index `i`
-# carries physical material — i.e. at least one inactive cell across the face
-# is not fully fictitious. Mirrors `_on_active_face`'s perpendicular incidence
-# so it visits exactly the cells the face separates, and classifies only the
-# inactive neighbour on each such face.
-#
-# The fictitious fold deactivates fully-fictitious cells, so a fold face sees
-# only fictitious material on its inactive side and returns `false`: its
-# boundary modes stay active. They vanish on every physical face — so they
-# cannot break the C⁰ trace condition the overlay constraint enforces — and
-# instead carry the adjacent cut cell's approximation up to ∂Ω. A user mask
-# that excludes *physical* cells returns `true`: those modes are non-zero on a
-# physical face and must be eliminated to keep the truncated solution
-# continuous. With no physical domain there is no fictitious material, so every
-# internal active/inactive face is physical (the original overlay/user-mask
-# behaviour) and the `cache` is never touched.
-function _internal_face_is_physical(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
-                                    physical, axis::Integer, i::Integer, n::NTuple{D,Int},
-                                    cache::_ClassifyCache{D,T}) where {D,T}
-    physical === nothing && return true
-    for outer in CartesianIndices(_perp_ranges(key, axis, n))
-        below_active = _cell_active(level, axis, i - 1, outer.I, n)
-        above_active = _cell_active(level, axis, i, outer.I, n)
-        below_active == above_active && continue
-        inactive_pos = below_active ? i : i - 1
-        cell = CartesianIndex(ntuple(d -> d == axis ? inactive_pos : outer[d], D))
-        classify_cell(physical, cell_box(level.mesh, cell), cache) === :fictitious || return true
     end
     return false
 end
@@ -1262,7 +1235,7 @@ end
 #   * Inactive incident cells are **skipped, not minimised over**. An inactive
 #     cell generates nothing, so it cannot disagree; letting it lower the entity
 #     would delete dofs nothing replaces. That is not hypothetical: under a
-#     fictitious fold `_internal_face_is_physical` deliberately keeps the modes
+#     fictitious fold `_has_overlay_constraint` deliberately keeps the modes
 #     on a fold face free, precisely so the adjacent cut cell's approximation
 #     reaches ∂Ω.
 #

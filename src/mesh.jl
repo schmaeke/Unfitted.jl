@@ -222,7 +222,7 @@ face is inactive only because the finite-cell fold found it *fully
 fictitious*, the face carries no physical material and the modes on it stay
 active — they vanish on every physical face anyway and instead carry the
 adjacent cut cell's approximation up to `∂Ω`. A cell the *user* masked out
-is treated as physical and does constrain. See `_internal_face_is_physical`
+is treated as physical and does constrain. See `_has_overlay_constraint`
 in `src/dofs.jl`.
 """
 struct LevelMask{D}
@@ -1538,7 +1538,7 @@ end
 # settle the box from its centre sample.
 #
 # The classification verdicts of *inactive* cells are still needed further down
-# the pipeline — `_covered_by_level` in `coverage.jl` and `_internal_face_is_physical`
+# the pipeline — `_covered_by_level` in `coverage.jl` and `_has_overlay_constraint`
 # in `dofs.jl` both have to tell a fictitious fold from a user mask — but each asks
 # only about the cells on its own fold/mask boundary, and each goes through the same
 # `cache`. Skipping them here turns those queries from cache hits into cache misses;

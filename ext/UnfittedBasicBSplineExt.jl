@@ -976,7 +976,7 @@ end
 # the trace must vanish there; a *fictitious* cell holds no material at all, so
 # there is no trace to vanish on, and constraining it would delete the cut cell's
 # boundary modes — the very over-constraint the FCM solution must not suffer.
-# `_internal_face_is_physical` in `src/dofs.jl` draws the same line for the
+# `_has_overlay_constraint` in `src/dofs.jl` draws the same line for the
 # integrated-Legendre family. With `physical === nothing` there is no fold and
 # `cache` is never touched.
 function _active_cell_at_face(level::Level{D}, d::Int, j::Int, perp_cell::CartesianIndex{D},
