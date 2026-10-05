@@ -598,13 +598,10 @@ const RegionKey = Tuple{Any,Any}
 # `val[ptr[r]:ptr[r+1]-1]`, ascending. Read as a matrix it is the dofs × regions
 # CSC incidence the sparsity pattern is built from, and it fixes each region's
 # slice of the threaded arena, so it is derived once per list, through the same
-# `_frame!` and `_slots!` the numeric pass runs. `order` lists the regions
-# widest first, by local system order `m = n + #pivots` (ties in list order):
-# the order in which threaded phase 1 hands them out (see `_compute!`).
+# `_frame!` and `_slots!` the numeric pass runs.
 struct RegionDofs
     ptr::Vector{Int}
     val::Vector{Int}
-    order::Vector{Int}
 end
 
 # One integration region list as assembly sees it: the regions, the `q.point`

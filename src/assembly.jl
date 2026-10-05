@@ -243,13 +243,12 @@ function _dofs!(list::RegionList, ws)
     ptr = Vector{Int}(undef, length(list.regions) + 1)
     ptr[1] = 1
     val = Int[]
-    width = Vector{Int}(undef, length(list.regions))
     for (r, region) in pairs(list.regions)
-        width[r] = _slots!(_frame!(ws, region)) + length(ws.pivots)
+        _slots!(_frame!(ws, region))
         append!(val, ws.dofs)
         ptr[r+1] = length(val) + 1
     end
-    return list.dofs = RegionDofs(ptr, val, sortperm(width; rev=true))
+    return list.dofs = RegionDofs(ptr, val)
 end
 
 # The region dofs of every pass of a threaded call, whose arena layout is read
@@ -563,25 +562,6 @@ function _assembly_workspace(@nospecialize(model::Model))
     return AssemblyWorkspace(model.dofs, problem_spaces(model.problem))
 end
 
-# A workspace for one more task of the same model: `ws`'s layout and read-only
-# basis metadata — the families, mode tables and orders, which are the level's
-# own objects in every workspace anyway and which no task writes — and fresh
-# scratch of the same sizes. A threaded call needs a workspace per task, and
-# building each from the spaces re-derives that metadata through `BasisBank`'s
-# type-unstable walk over the levels: 3.5–8 KB and about 4 µs a workspace on the
-# gate's problems, which at 16 tasks was the largest single share of a small
-# cold call's extra allocation. A sibling allocates only its basis value,
-# gradient and 1D-factor buffers, plus the empty frame vectors: 2.6 KB against
-# 6.4 KB on an order-3 square grid.
-function _sibling(ws::AssemblyWorkspace{D,T,B}) where {D,T,B}
-    bank = ws.bank
-    scratch = BasisBank{D,T,B}(bank.bases, bank.modes, bank.orders, map(similar, bank.values),
-                               map(similar, bank.gradients), map(t -> map(similar, t), bank.val1d),
-                               map(t -> map(similar, t), bank.der1d))
-    return AssemblyWorkspace(ws.layout, scratch, empty(ws.parents), zero(ws.fptr), empty(ws.slots),
-                             empty(ws.dofs), empty(ws.pivots), empty(ws.K), empty(ws.b))
-end
-
 # Take one call's scratch out of the model's cache: `tasks` workspaces, idle ones
 # first and fresh ones for the rest, and for a threaded call the pooled arena
 # pair, leaving empty arenas behind so that a concurrent call allocates its own.
@@ -601,17 +581,18 @@ function _checkout!(@nospecialize(cache::AssemblyCache), @nospecialize(model::Mo
         (taken, threaded ? pooled : nothing, threaded ? pooled_rhs : nothing)
     end
     head = isempty(idle) ? _assembly_workspace(model) : idle[1]
-    return _fill_checkout(head, idle, tasks), arena, rhs_arena
+    return _fill_checkout(head, idle, tasks, model), arena, rhs_arena
 end
 
 # Function barrier of `_checkout!`: `head` and then the other idle workspaces,
-# topped up with siblings of `head` to `tasks`, in a vector of `head`'s concrete
-# type, so the drivers index it without dispatch.
-function _fill_checkout(head::W, idle::Vector{Any}, tasks::Int) where {W}
+# topped up with fresh ones to `tasks`, in a vector of `head`'s concrete type, so
+# the drivers index it without dispatch.
+function _fill_checkout(head::W, idle::Vector{Any}, tasks::Int,
+                        @nospecialize(model::Model)) where {W}
     workspaces = Vector{W}(undef, tasks)
     workspaces[1] = head
     for t in 2:tasks
-        workspaces[t] = t <= length(idle) ? idle[t]::W : _sibling(head)
+        workspaces[t] = t <= length(idle) ? idle[t]::W : _assembly_workspace(model)::W
     end
     return workspaces
 end
@@ -1341,9 +1322,9 @@ end
 # so neither needs a lock, an atomic accumulation, or a barrier between regions:
 #
 #   Phase 1 — tasks take regions from an atomic counter (dynamic load balance),
-#     widest first, integrate each with the serial driver's own `_integrate!`,
-#     and copy its rhs and stored matrix columns into the region's own slice of
-#     a flat arena. No two regions share a slice.
+#     integrate each with the serial driver's own `_integrate!`, and copy its
+#     rhs and stored matrix columns into the region's own slice of a flat
+#     arena. No two regions share a slice.
 #   Phase 2 — each task owns a contiguous range of global dofs (balanced by
 #     pattern entries for a matrix pass, even for an rhs-only one) and walks
 #     every region in list order, adding the region's entries in its owned rows
@@ -1375,12 +1356,10 @@ end
 # afterwards; on the gate's smallest problems at 16 threads, one task per thread
 # in both phases of every pass came to three quarters of the serial call's
 # allocation, for tasks that had little or nothing to do. Phase 1 runs at most
-# one task per region, and a call checks out at most as many workspaces as its
-# largest pass has regions; otherwise phase 1 runs one task per thread,
-# because how long a region takes depends on the user's callbacks, which
-# nothing here can see. Phase 2 runs one task per `_GATHER_GRAIN` arena entries
-# it gathers, because there the work is exactly that: a merge per entry, and no
-# callback.
+# one task per region; otherwise it runs one task per thread, because how long
+# a region takes depends on the user's callbacks, which nothing here can see.
+# Phase 2 runs one task per `_GATHER_GRAIN` arena entries it gathers, because
+# there the work is exactly that: a merge per entry, and no callback.
 
 # Phase-2 arena entries per task. Measured at 16 threads on a 16-core machine
 # against one task per thread: 1024 or 4096 took the threaded assembly of the
@@ -1494,28 +1473,13 @@ end
 # driver's own `_integrate!`, check that its dofs are its cached ones, and copy
 # its rhs to `rhs_arena[dofs.ptr[r] …]` and each stored column `lc` to
 # `arena[offsets[r] + _packed(n, lc, symmetric) …]`.
-#
-# The counter walks `dofs.order`, the regions widest first, rather than the
-# list. Nothing a region computes depends on the order or on the task, so the
-# result does not change, but each task's first region is now the widest it
-# will see: its local system and frame buffers are allocated once, at that
-# size, and never grow again. Taken in list order, a task's buffers grew each
-# time it met a wider region than any before, and each growth overallocated
-# and left the outgrown buffer dead: on the gate's cold B-spline overlay at 16
-# tasks, about 23 KB a task for a local system that needs at most 11 KB
-# (37 × 37). Sizing every task for the widest region up front instead would
-# cost the problems whose widest region is rare — a 4D mesh with one interior
-# cell — a full-width system in every task. Widest first is roughly longest
-# first, the usual order for balancing a dynamic schedule; it measured neutral
-# in wall time.
 function _compute!(ws::AssemblyWorkspace, state, pass::Pass, dofs::RegionDofs, arena, rhs_arena,
                    offsets::Vector{Int}, done::Vector{Bool}, next::Threads.Atomic{Int},
                    region_filter, symmetric::Bool)
     regions = pass.list.regions
     while true
-        k = Threads.atomic_add!(next, 1)
-        k > length(regions) && return nothing
-        r = dofs.order[k]
+        r = Threads.atomic_add!(next, 1)
+        r > length(regions) && return nothing
         region = regions[r]
         region_filter === nothing || region_filter(region) || continue
         n = _integrate!(ws, pass, region, pass.list.offsets[r], state, symmetric)
@@ -1760,10 +1724,7 @@ function _assemble(@nospecialize(model::Model), @nospecialize(blocks), @nospecia
                  Bool(symmetric))::Bool
     coefficients = _state_vector(state, model)
     passes = _passes(model, blocks, loads)
-    # One task per thread, but no more than the largest pass has regions: a task
-    # with no region to take would cost a workspace and buy nothing.
-    tasks = threaded ?
-            min(Threads.nthreads(), maximum(pass -> length(pass.list.regions), passes; init=1)) : 1
+    tasks = threaded ? Threads.nthreads() : 1
     cache = model.assembly
     workspaces, arena, rhs_arena = _checkout!(cache, model, tasks, threaded)
     try
