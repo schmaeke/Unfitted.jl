@@ -58,12 +58,21 @@
 #
 # `model.jl` composes the four, for one field (`dof_layout(V; …)`) and for
 # every field of a problem (`system_layout`, step 1 once per space), and
-# reads the projection's statistics into the diagnostics there. This file
-# owns the dof keys, the layout structs, the elimination ledger and the
-# hooks' typed context, steps 1 and 3, the accessors, and the
-# integrated-Legendre family's dof hooks (artificial boundary,
-# covered-mode pruning, the hp minimum rule). It calls nothing defined in
-# a later file.
+# reads the projection's statistics into the diagnostics there.
+#
+# The file is in two parts. The first is family-agnostic: the dof keys and
+# the layout structs; the elimination ledger, the raising `_resolve_rows!`
+# default and the hooks' typed context; steps 1 and 3; the boundary-side
+# geometry shared with `dirichlet.jl`; the generic defaults of the
+# artificial-boundary and pruning hooks; and the accessors. The second,
+# from the "Integrated Legendre family" divider to the end, is that
+# family's side of the dof-layer interface: its key tags and keys, its
+# boundary association, its artificial-boundary predicate, the hp minimum
+# rule, its covered-mode pruning and dedup, and the `_spans_hats` trait.
+# The fallbacks of `_tensor_dof_key` and `_spans_hats` sit beside this
+# family's methods. The B-spline family implements the same hooks in
+# `ext/UnfittedBasicBSplineExt.jl`. The file calls nothing defined in a
+# later file.
 
 # ── Dof keys and layout struct ────────────────────────────────────────────────
 
@@ -245,315 +254,6 @@ struct _DofTopology{D,T<:Real}
     tolerance::GeometryTolerance{T}
 end
 
-# Tag values for `AxisDofKey.kind`. `UInt8` keeps the key compact and
-# fast to hash; the values themselves are arbitrary.
-#
-#   _AXIS_NODE   — integrated Legendre endpoint mode at a cell-corner
-#                  node coordinate.
-#   _AXIS_SPAN   — integrated Legendre interior (bubble) mode, cell-local.
-#
-# A tag need only be unique within one basis family, so each family owns
-# its tags: the B-spline extension defines its `_AXIS_BSPLINE` next to its
-# own key construction. Keys of two families can never be confused even
-# where their tags coincide. A key carries its level id and one level has
-# one family, so two keys of different families differ in their level and
-# the dof-key cache of a mixed-family space never takes one for the other;
-# and `_assert_keys_comparable` (`projection.jl`) refuses to match keys
-# across a change of family between two models. The shipped values happen
-# to be distinct (the extension's is `0x02`); nothing relies on it.
-const _AXIS_NODE = UInt8(0)
-const _AXIS_SPAN = UInt8(1)
-
-# Build the per-axis dof key for cell `cell_axis` and 1D mode `mode` in
-# the integrated Legendre basis. Modes 0 and 1 are the two endpoint
-# shape functions — they map to `_AXIS_NODE` factors at the cell's
-# lower-endpoint coordinate index (`cell_axis`) and upper-endpoint index
-# (`cell_axis + 1`) respectively. Mode m ≥ 2 is a cell-local bubble and
-# maps to an `_AXIS_SPAN` factor at index `cell_axis` carrying the mode
-# number for cross-cell distinguishability.
-function _axis_dof_key(cell_axis::Int, mode::Int)
-    mode == 0 && return AxisDofKey(_AXIS_NODE, cell_axis, 0)
-    mode == 1 && return AxisDofKey(_AXIS_NODE, cell_axis + 1, 0)
-    return AxisDofKey(_AXIS_SPAN, cell_axis, mode)
-end
-
-# Build the full `TensorDofKey` for one tensor-product basis function
-# `local_id` on `cell` of `level`. The integrated Legendre specialisation
-# above produces the per-axis keys; a fallback method throws for any
-# other basis family so the dof layer fails early instead of producing
-# silently-wrong keys.
-function _tensor_dof_key(level::Level{D,T,<:IntegratedLegendre}, cell::CartesianIndex{D},
-                         local_id::CartesianIndex{D}) where {D,T}
-    axes = ntuple(d -> _axis_dof_key(cell.I[d], local_id.I[d]), D)
-    return TensorDofKey{D}(level.id, axes)
-end
-
-function _tensor_dof_key(level::Level{D,T,B}, cell::CartesianIndex{D},
-                         local_id::CartesianIndex{D}) where {D,T,B}
-    throw(ArgumentError("dof layout is not implemented for basis family $(basis_name(level.basis))"))
-end
-
-# Build the per-cell raw dof id vector for one cell. For every local
-# basis function on the cell, compute its `TensorDofKey` and either
-# reuse the raw id already registered for that key (the cross-cell dof
-# reuse path: adjacent cells share endpoint nodes, identical levels
-# share interior modes) or register a fresh id by appending the key to
-# `raw_keys`.
-function _build_cell_dofs!(raw_by_key::Dict{TensorDofKey{D},Int}, raw_keys::Vector{TensorDofKey{D}},
-                           level::Level{D}, cell::CartesianIndex{D}) where {D}
-    local_ids = cell_basis_indices(level, cell)
-    raw_ids = Vector{Int}(undef, length(local_ids))
-
-    for (a, local_id) in pairs(local_ids)
-        key = _tensor_dof_key(level, cell, local_id)
-        raw_ids[a] = get!(raw_by_key, key) do
-            push!(raw_keys, key)
-            length(raw_keys)
-        end
-    end
-
-    return raw_ids
-end
-
-# Stage 1 of the layout: walk every level's cells and assign raw dofs through
-# the `TensorDofKey` cache (cross-cell endpoint sharing happens here). Levels go
-# in `V.levels` order, cells in `cell_indices` order, local functions in
-# `cell_basis_indices` order, and a raw's id is the order of its key's first
-# appearance. Returns the key → raw map, `raw_keys`, the per-level cell tables
-# and the per-level raw ranges.
-#
-# The ranges cost one `UnitRange` per level and replace a pass that bucketed
-# every key by level through a `Dict` — in that `Dict`'s hash order, which is
-# also the order the constraint hooks then visited a level's raws in. They are
-# exact because a key carries its level id: walking level L can only create or
-# reuse L's keys, so L's raws are precisely the ids appended while L is walked,
-# and visiting them is visiting them in raw order.
-function _enumerate_raws(V::Space{D}) where {D}
-    raw_by_key = Dict{TensorDofKey{D},Int}()
-    raw_keys = TensorDofKey{D}[]
-    # Indexed by level *id*, not by position: for a single-domain space the two
-    # coincide (base = 1, overlays 2, 3, …), but a subdomain of a coupled model
-    # is reindexed into a disjoint id block by `_reindex_space_levels`, so this
-    # layout's ids run over that block and match the `parent.level` id the
-    # assembly workspace and `cell_dofs` key by (leading slots below the block
-    # stay `undef` and are never addressed by this field's parents).
-    nid = maximum(l -> l.id, V.levels)
-    cell_dofs_by_level = Vector{Array{Vector{Int},D}}(undef, nid)
-    level_raws = fill(1:0, nid)
-
-    # Every inactive cell of every level shares one empty vector. A ladder makes
-    # inactive cells the overwhelming majority of the grid — measured on a
-    # depth-5 2D stack over a 6² base with one base cell refined to the bottom,
-    # 49 140 cells of which 1 400 are active — and a fresh `Int[]` per inactive
-    # cell put one heap allocation on each of them, on every rebuild, and
-    # `estimate` rebuilds. On that layout it is 74 856 allocations against
-    # 27 117. It is per call rather than a module-level constant because a
-    # `const` empty vector is one stray `push!` away from corrupting every
-    # inactive cell of every layout ever built.
-    none = Int[]
-    for level in V.levels
-        first_raw = length(raw_keys) + 1
-        level_cells = Array{Vector{Int},D}(undef, level.mesh.cells)
-        for cell in cell_indices(level.mesh)
-            level_cells[cell] = is_active(level.mask, cell) ?
-                                _build_cell_dofs!(raw_by_key, raw_keys, level, cell) : none
-        end
-        cell_dofs_by_level[level.id] = level_cells
-        level_raws[level.id] = first_raw:length(raw_keys)
-    end
-    return raw_by_key, raw_keys, cell_dofs_by_level, level_raws
-end
-
-# ── Geometric helpers shared with `dirichlet.jl` ──────────────────────────────
-
-# Tolerance-aware coordinate equality used throughout boundary
-# detection. Pulled out so the `<= tol.contain` convention is in one
-# place; consumed both by the overlay-constraint detection below and by
-# the physical-Dirichlet detection in `dirichlet.jl`.
-_coordinate_matches(a::Real, b::Real, tol::GeometryTolerance) = abs(a - b) <= tol.contain
-
-# ── Artificial overlay-boundary detection ─────────────────────────────────────
-
-# True iff the per-axis factor of `key` along `axis` anchors at the
-# level's lower (`side = :lower`) or upper (`side = :upper`) mesh edge.
-# Dispatched on the level's basis family so each family's "boundary
-# mode" convention is local to its own implementation. Used by the
-# physical-Dirichlet detection (`_key_faces` in `dirichlet.jl`) to
-# translate "is this dof at a face" into a basis-family-specific predicate
-# without leaking the family's mode-index conventions into the rest of the
-# dof layer. The integrated-Legendre `_has_overlay_constraint` below does
-# not route through it: it already walks the key's node factors and reads
-# the mesh-edge indices (`1` and `cells[axis] + 1`) off them directly.
-#
-# Integrated Legendre: only `_AXIS_NODE` keys touch a mesh edge —
-# `_AXIS_NODE.index == 1` (lower) or `cells[axis] + 1` (upper). Bubbles
-# never touch any edge. B-spline overloads live in
-# `ext/UnfittedBasicBSplineExt.jl`.
-function _key_on_level_side(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
-                            axis::Integer, side::Symbol) where {D,T}
-    axis_key = key.axes[axis]
-    axis_key.kind == _AXIS_NODE || return false
-    side === :lower && return axis_key.index == 1
-    side === :upper && return axis_key.index == level.mesh.cells[axis] + 1
-    throw(ArgumentError("boundary side must be :lower or :upper"))
-end
-
-# True iff the level's mesh-domain boundary on the given axis-side
-# coincides with the physical-domain boundary up to `tol.contain`. Used
-# by `_has_overlay_constraint` to decide whether a mesh-boundary face is
-# a physical face (no overlay constraint) or an artificial overlay face
-# (homogeneous Dirichlet constraint).
-function _level_side_is_physical(level::Level{D,T}, domain::AxisBox{D,T}, axis::Integer,
-                                 side::Symbol, tol::GeometryTolerance{T}) where {D,T}
-    side === :lower &&
-        return _coordinate_matches(level.mesh.domain.lower[axis], domain.lower[axis], tol)
-    side === :upper &&
-        return _coordinate_matches(level.mesh.domain.upper[axis], domain.upper[axis], tol)
-    throw(ArgumentError("boundary side must be :lower or :upper"))
-end
-
-# Cells of `level` along `axis` incident to the axis-`axis` factor of a dof key,
-# clipped to the `n[axis]` cells the level has: a `_AXIS_NODE` factor at index
-# `i` touches cells `i − 1` and `i`, since a node sits between two adjacent
-# cells along its axis; a `_AXIS_SPAN` (bubble) factor at index `k` touches
-# only cell `k`, since a bubble mode is cell-local.
-#
-# This is the integrated-Legendre node-to-cell support map, and it is the one
-# place it is written down: `_incident_cells` applies it on every axis, and
-# `_perp_ranges` applies it on every axis but one. The B-spline family in the
-# extension has its own support map — a function's span can cover many cells —
-# and never routes through here.
-function _axis_incidence(axis_key::AxisDofKey, ncells::Int)
-    axis_key.kind == _AXIS_NODE || return axis_key.index:axis_key.index
-    return max(1, axis_key.index-1):min(ncells, axis_key.index)
-end
-
-# Incidence ranges of `key` on every axis *except* `axis`, which is pinned to
-# `1:1` so a `CartesianIndices` over the result enumerates the perpendicular
-# positions of a candidate face along `axis` exactly once. The `axis` slot of
-# each enumerated index is a placeholder the caller replaces with the cell
-# position on either side of the face.
-function _perp_ranges(key::TensorDofKey{D}, axis::Integer, n::NTuple{D,Int}) where {D}
-    return ntuple(d -> d == axis ? (1:1) : _axis_incidence(key.axes[d], n[d]), D)
-end
-
-# True iff the cell whose axis-`axis` index is `pos` (with the other-axis
-# indices drawn from `outer`, ignoring the axis-`axis` slot) is in bounds
-# and active under the level's `LevelMask`. Used by `_on_active_face` to
-# probe both sides of a candidate face for active/inactive transitions.
-function _cell_active(level::Level{D}, axis::Integer, pos::Integer, outer::NTuple{D,Int},
-                      n::NTuple{D,Int}) where {D}
-    1 <= pos <= n[axis] || return false
-    cell_tuple = ntuple(d -> d == axis ? pos : outer[d], D)
-    return is_active(level.mask, CartesianIndex(cell_tuple))
-end
-
-# True iff the `_AXIS_NODE` factor of `key` at axis `axis`, node index
-# `i`, lies on a face that separates an active cell from an
-# off-mesh-or-inactive cell on the other side. The perpendicular positions
-# come from the key's own incidence (`_perp_ranges`); for each of them,
-# sample the activity of the cells immediately below (`i − 1`) and above
-# (`i`) the candidate face along `axis`. A change in activity ⇒ the face is
-# between an active and an inactive cell of the level, i.e. an
-# active-region face.
-#
-# Integrated-Legendre-specific, because the incidence rule is. The B-spline
-# family in the extension rolls its own active-face check tied to the
-# function's actual support span, which can spread across many cells.
-function _on_active_face(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
-                         axis::Integer, i::Integer, n::NTuple{D,Int}) where {D,T}
-    for outer in CartesianIndices(_perp_ranges(key, axis, n))
-        below_active = _cell_active(level, axis, i - 1, outer.I, n)
-        above_active = _cell_active(level, axis, i, outer.I, n)
-        below_active != above_active && return true
-    end
-    return false
-end
-
-# True iff `key` sits on the artificial boundary of the level's *active
-# region* and therefore carries a homogeneous overlay constraint. The
-# active region is the union of active cells; its boundary includes
-#
-#   * the mesh-box face on every axis where the level's mesh boundary
-#     does not coincide with the physical-domain boundary (i.e. the
-#     artificial overlay boundary `Γ_o^(k) = ∂Ω^(k) \ ∂Ω`);
-#   * internal faces between active and inactive cells of the *same*
-#     level (the `LevelMask` boundary inside the level).
-#
-# With `mask === nothing` the active region equals the level's mesh
-# box, only mesh-box faces matter, and this reduces to the original
-# overlay-boundary rule from the paper.
-#
-# Dispatched on the level's basis family. The integrated-Legendre body
-# below uses the family's node/span index conventions directly; the
-# B-spline overload in `ext/UnfittedBasicBSplineExt.jl` does the same
-# job with B-spline function-index conventions and the C⁰-knot
-# treatment of mask-induced internal junctions.
-function _has_overlay_constraint(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
-                                 physical, domain::AxisBox{D,T}, tol::GeometryTolerance{T},
-                                 cache::_ClassifyCache{D,T}) where {D,T}
-    n = level.mesh.cells
-    for axis in 1:D
-        axis_key = key.axes[axis]
-        axis_key.kind == _AXIS_NODE || continue
-        i = axis_key.index
-
-        # Only nodes that actually sit on an active-region face matter.
-        _on_active_face(key, level, axis, i, n) || continue
-
-        # Three cases for an active-region face along this axis:
-        #   i == 1            — mesh's lower-axis face. Physical iff the
-        #                       level's lower bound coincides with the
-        #                       physical domain's lower bound; otherwise
-        #                       artificial.
-        #   i == n[axis] + 1  — mesh's upper-axis face, symmetric.
-        #   otherwise         — internal face between active and inactive
-        #                       cells of the same level. Artificial only when it
-        #                       carries physical material: a fully-fictitious
-        #                       fold face leaves the mode active (see
-        #                       `_internal_face_is_physical`).
-        if i == 1
-            _level_side_is_physical(level, domain, axis, :lower, tol) || return true
-        elseif i == n[axis] + 1
-            _level_side_is_physical(level, domain, axis, :upper, tol) || return true
-        else
-            _internal_face_is_physical(key, level, physical, axis, i, n, cache) && return true
-        end
-    end
-    return false
-end
-
-# True iff the internal active/inactive face along `axis` at node index `i`
-# carries physical material — i.e. at least one inactive cell across the face
-# is not fully fictitious. Mirrors `_on_active_face`'s perpendicular incidence
-# so it visits exactly the cells the face separates, and classifies only the
-# inactive neighbour on each such face.
-#
-# The fictitious fold deactivates fully-fictitious cells, so a fold face sees
-# only fictitious material on its inactive side and returns `false`: its
-# boundary modes stay active. They vanish on every physical face — so they
-# cannot break the C⁰ trace condition the overlay constraint enforces — and
-# instead carry the adjacent cut cell's approximation up to ∂Ω. A user mask
-# that excludes *physical* cells returns `true`: those modes are non-zero on a
-# physical face and must be eliminated to keep the truncated solution
-# continuous. With no physical domain there is no fictitious material, so every
-# internal active/inactive face is physical (the original overlay/user-mask
-# behaviour) and the `cache` is never touched.
-function _internal_face_is_physical(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
-                                    physical, axis::Integer, i::Integer, n::NTuple{D,Int},
-                                    cache::_ClassifyCache{D,T}) where {D,T}
-    physical === nothing && return true
-    for outer in CartesianIndices(_perp_ranges(key, axis, n))
-        below_active = _cell_active(level, axis, i - 1, outer.I, n)
-        above_active = _cell_active(level, axis, i, outer.I, n)
-        below_active == above_active && continue
-        inactive_pos = below_active ? i : i - 1
-        cell = CartesianIndex(ntuple(d -> d == axis ? inactive_pos : outer[d], D))
-        classify_cell(physical, cell_box(level.mesh, cell), cache) === :fictitious || return true
-    end
-    return false
-end
-
 # ── The elimination ledger ────────────────────────────────────────────────────
 
 """
@@ -724,6 +424,107 @@ struct _LevelContext{D,T,S<:Space{D,T},P}
     raws::UnitRange{Int}
 end
 
+# ── DofLayout construction ────────────────────────────────────────────────────
+
+# Build the per-cell raw dof id vector for one cell. For every local
+# basis function on the cell, compute its `TensorDofKey` and either
+# reuse the raw id already registered for that key (the cross-cell dof
+# reuse path: adjacent cells share endpoint nodes, identical levels
+# share interior modes) or register a fresh id by appending the key to
+# `raw_keys`.
+function _build_cell_dofs!(raw_by_key::Dict{TensorDofKey{D},Int}, raw_keys::Vector{TensorDofKey{D}},
+                           level::Level{D}, cell::CartesianIndex{D}) where {D}
+    local_ids = cell_basis_indices(level, cell)
+    raw_ids = Vector{Int}(undef, length(local_ids))
+
+    for (a, local_id) in pairs(local_ids)
+        key = _tensor_dof_key(level, cell, local_id)
+        raw_ids[a] = get!(raw_by_key, key) do
+            push!(raw_keys, key)
+            length(raw_keys)
+        end
+    end
+
+    return raw_ids
+end
+
+# Stage 1 of the layout: walk every level's cells and assign raw dofs through
+# the `TensorDofKey` cache (cross-cell endpoint sharing happens here). Levels go
+# in `V.levels` order, cells in `cell_indices` order, local functions in
+# `cell_basis_indices` order, and a raw's id is the order of its key's first
+# appearance. Returns the key → raw map, `raw_keys`, the per-level cell tables
+# and the per-level raw ranges.
+#
+# The ranges cost one `UnitRange` per level and replace a pass that bucketed
+# every key by level through a `Dict` — in that `Dict`'s hash order, which is
+# also the order the constraint hooks then visited a level's raws in. They are
+# exact because a key carries its level id: walking level L can only create or
+# reuse L's keys, so L's raws are precisely the ids appended while L is walked,
+# and visiting them is visiting them in raw order.
+function _enumerate_raws(V::Space{D}) where {D}
+    raw_by_key = Dict{TensorDofKey{D},Int}()
+    raw_keys = TensorDofKey{D}[]
+    # Indexed by level *id*, not by position: for a single-domain space the two
+    # coincide (base = 1, overlays 2, 3, …), but a subdomain of a coupled model
+    # is reindexed into a disjoint id block by `_reindex_space_levels`, so this
+    # layout's ids run over that block and match the `parent.level` id the
+    # assembly workspace and `cell_dofs` key by (leading slots below the block
+    # stay `undef` and are never addressed by this field's parents).
+    nid = maximum(l -> l.id, V.levels)
+    cell_dofs_by_level = Vector{Array{Vector{Int},D}}(undef, nid)
+    level_raws = fill(1:0, nid)
+
+    # Every inactive cell of every level shares one empty vector. A ladder makes
+    # inactive cells the overwhelming majority of the grid — measured on a
+    # depth-5 2D stack over a 6² base with one base cell refined to the bottom,
+    # 49 140 cells of which 1 400 are active — and a fresh `Int[]` per inactive
+    # cell put one heap allocation on each of them, on every rebuild, and
+    # `estimate` rebuilds. On that layout it is 74 856 allocations against
+    # 27 117. It is per call rather than a module-level constant because a
+    # `const` empty vector is one stray `push!` away from corrupting every
+    # inactive cell of every layout ever built.
+    none = Int[]
+    for level in V.levels
+        first_raw = length(raw_keys) + 1
+        level_cells = Array{Vector{Int},D}(undef, level.mesh.cells)
+        for cell in cell_indices(level.mesh)
+            level_cells[cell] = is_active(level.mask, cell) ?
+                                _build_cell_dofs!(raw_by_key, raw_keys, level, cell) : none
+        end
+        cell_dofs_by_level[level.id] = level_cells
+        level_raws[level.id] = first_raw:length(raw_keys)
+    end
+    return raw_by_key, raw_keys, cell_dofs_by_level, level_raws
+end
+
+# Step 1 of a layout: the space block, built from the space alone. Raw enumeration
+# (`_enumerate_raws`), then every level's artificial eliminations recorded in one
+# `EliminationLedger` — the family's `_overlay_constraints!`, then, under leaf
+# semantics, its `_coverage_constraints!` against the masks `build_coverage`
+# computes (so those are built first, and not at all when `prune = false`), then
+# `_resolve_rows!` on whatever linear-constraint rows the two recorded — and finally
+# the depth-one check on the pivots the rows resolved to. The ledger's per-raw
+# sources and pivot table become the topology's.
+#
+# A topology reads neither a field's components nor its Dirichlet data, so one is
+# the same for every field over the space, and `_system_layout` builds it once per
+# space and shares it between them. `V.physical` is passed to
+# `_record_eliminations!` as an argument rather than read there, which is the
+# function barrier that types the hooks' context (see `_LevelContext`).
+function _dof_topology(V::Space{D,T}; tolerance::GeometryTolerance{T}=GeometryTolerance(T),
+                       prune::Bool=true, prune_exempt=(),
+                       classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
+    raw_by_key, raw_keys, cell_dofs_by_level, level_raws = _enumerate_raws(V)
+    coverage = prune ? build_coverage(V, tolerance, classify_cache) :
+               Coverage{D}(Dict{Int,BitArray{D}}())
+    ledger = EliminationLedger{T}(length(raw_keys))
+    _record_eliminations!(ledger, V, V.physical, tolerance, classify_cache, coverage, raw_keys,
+                          raw_by_key, level_raws, prune, prune_exempt)
+    _assert_resolved(ledger)
+    return _DofTopology{D,T}(cell_dofs_by_level, raw_keys, level_raws, ledger.source, ledger.pivots,
+                             tolerance)
+end
+
 # Stage 2 of the layout: every level's artificial eliminations, recorded into `ledger`
 # one level at a time (`_level_eliminations!`). `physical` is `V.physical`, passed
 # separately on purpose: receiving it as an argument is the function barrier that hands
@@ -758,7 +559,53 @@ function _level_eliminations!(ledger::EliminationLedger, level::Level, ctx::_Lev
     return ledger
 end
 
-# ── The artificial-boundary hook ──────────────────────────────────────────────
+# Step 3 of a layout: number one field over a topology, given its physical-Dirichlet
+# flags (step 2, `_physical_dirichlet`). Active ids run component-major — component
+# 1 of every raw, then component 2, … — skipping every (raw, component) a physical
+# Dirichlet condition constrains or an artificial elimination removed, so an
+# all-or-nothing constraint leaves the natural block ordering and a per-component
+# one leaves holes. The constrained values start at zero, which is already the
+# answer for homogeneous data; nonzero data are projected into them afterwards
+# (step 4, `_project_dirichlet_values!`).
+#
+# The topology's arrays are handed on, not copied: the space block is never mutated
+# once built, and this is the one place a layout receives it.
+function DofLayout(t::_DofTopology{D,T}, physical_dirichlet::Matrix{Bool}) where {D,T}
+    nraw, ncomp = size(physical_dirichlet)
+    active_component = zeros(Int, nraw, ncomp)
+    active_count = 0
+    for c in 1:ncomp, raw in 1:nraw
+        (physical_dirichlet[raw, c] || t.elimination_source[raw] !== :free) && continue
+        active_component[raw, c] = (active_count += 1)
+    end
+    return DofLayout{D,T}(t.cell_dofs_by_level, t.raw_keys, t.level_raws, t.elimination_source,
+                          t.pivots, t.tolerance, ncomp, physical_dirichlet, active_component,
+                          active_count, zeros(T, nraw, ncomp))
+end
+
+# ── Geometric helpers shared with `dirichlet.jl` ──────────────────────────────
+
+# Tolerance-aware coordinate equality used throughout boundary
+# detection. Pulled out so the `<= tol.contain` convention is in one
+# place; consumed both by the overlay-constraint detection below and by
+# the physical-Dirichlet detection in `dirichlet.jl`.
+_coordinate_matches(a::Real, b::Real, tol::GeometryTolerance) = abs(a - b) <= tol.contain
+
+# True iff the level's mesh-domain boundary on the given axis-side
+# coincides with the physical-domain boundary up to `tol.contain`. Used
+# by `_has_overlay_constraint` to decide whether a mesh-boundary face is
+# a physical face (no overlay constraint) or an artificial overlay face
+# (homogeneous Dirichlet constraint).
+function _level_side_is_physical(level::Level{D,T}, domain::AxisBox{D,T}, axis::Integer,
+                                 side::Symbol, tol::GeometryTolerance{T}) where {D,T}
+    side === :lower &&
+        return _coordinate_matches(level.mesh.domain.lower[axis], domain.lower[axis], tol)
+    side === :upper &&
+        return _coordinate_matches(level.mesh.domain.upper[axis], domain.upper[axis], tol)
+    throw(ArgumentError("boundary side must be :lower or :upper"))
+end
+
+# ── The artificial-boundary and pruning hooks ─────────────────────────────────
 
 """
     _overlay_constraints!(ledger::EliminationLedger, level::Level, ctx::_LevelContext) -> ledger
@@ -796,302 +643,13 @@ function _overlay_constraints!(ledger::EliminationLedger, level::Level{D,T},
     return ledger
 end
 
-# ── Pruning (coverage) constraint source ─────────────────────────────
-
-# Cells of `level` incident to the entity of `key`, from the per-axis incidence
-# rule of `_axis_incidence` applied on every axis.
-function _incident_cells(key::TensorDofKey{D}, n::NTuple{D,Int}) where {D}
-    return CartesianIndices(ntuple(d -> _axis_incidence(key.axes[d], n[d]), D))
-end
-
-# ── The minimum rule: per-cell order across a shared entity ──────────────────
-#
-# A cell at order 5 beside a cell at order 2 generates dof keys the neighbour
-# does not. Interior bubble keys are cell-local (`_AXIS_SPAN` on every axis) and
-# vertex keys carry mode 0 on every axis, so neither is a problem. The keys that
-# are shared *and* carry a mode — edge keys in 2D, edge and face keys in 3D —
-# are the whole difficulty: a raw generated by only one of the two cells is
-# nonzero on the face they share, so the superposed space is no longer C⁰. It
-# assembles, it solves, and it returns a plausible residual; only a two-sided
-# trace evaluation sees it.
-#
-# The classical hp-FEM fix is the *minimum rule*: a shared entity carries the
-# minimum of the orders of the cells sharing it. It is due to
-#
-#   B. Szabó, I. Babuška, "Finite Element Analysis", Wiley, New York (1991),
-#     ISBN 978-0-471-50273-9 — cited in full above `local_basis_indices` in
-#     `basis.jl`, where the same work's trunk space is defined; and
-#   L. Demkowicz, "Computing with hp-Adaptive Finite Elements, Vol. 1: One and
-#     Two Dimensional Elliptic and Maxwell Problems", Chapman & Hall/CRC (2006),
-#     doi:10.1201/9781420011685 — the constrained-approximation treatment this
-#     package's key-keyed statement of the rule follows.
-#
-# Three properties of the statement below are load-bearing and none of them is
-# cosmetic:
-#
-#   * It is a predicate on the **key**, not on the generating cell. The minimum
-#     over `_incident_cells(key, n)` is the same number whichever incident cell
-#     asks, so both sides of a face agree by construction and the one-sided mode
-#     is not expressible. A per-cell filter would have to be kept symmetric by
-#     hand.
-#   * Every question is asked at an order some cell **actually carries**. The
-#     classical statement forms the componentwise minimum first and then asks
-#     the family whether the mode survives *there* — at an order that in general
-#     no cell has, and where the family's index set therefore has to be defined
-#     by extension. That extension is where the rule goes wrong: read per axis
-#     it admits a 3D `:trunk` face key with bubble modes (3, 2), whose trunk
-#     degree is 5, at order 4 — a mode the order-4 cell never generates, and a
-#     measured 0.186 trace jump. Asking each incident cell about its own index
-#     set removes the fiction and with it the ambiguity.
-#   * Inactive incident cells are **skipped, not minimised over**. An inactive
-#     cell generates nothing, so it cannot disagree; letting it lower the entity
-#     would delete dofs nothing replaces. That is not hypothetical: under a
-#     fictitious fold `_internal_face_is_physical` deliberately keeps the modes
-#     on a fold face free, precisely so the adjacent cut cell's approximation
-#     reaches ∂Ω.
-#
-# One pass suffices — no fixed point. The incident cells of a key form a
-# face-connected `2^(#NODE axes)` hypercube, so agreement across every face of
-# that block already implies agreement with every cell in it.
-#
-# WHY THE INTERSECTION IS THE MINIMUM RULE. `_index_admissible` is, for every
-# family that opts into a per-cell order, a conjunction of upper bounds on the
-# order — `0 ≤ αᵈ ≤ pᵈ` for `:tensor`, plus `Σ t(αᵈ) ≤ p₁` for `:trunk`. Raising
-# an order therefore never removes a mode from a cell's set, only adds: the
-# predicate is monotone non-decreasing in `p`. Given that,
-#
-#     admissible(min over incident cells, α)  ⟺  admissible(order(c), α) ∀ c
-#
-# so the two statements are the same rule and the minimum need never be formed.
-# The equivalence *rests* on that monotonicity, which is a property of the
-# family rather than of this file, so `test_cell_order.jl` asserts it directly
-# for every family answering `_supports_cell_order() == true`. A family that
-# broke it would silently get a non-conforming space from this code.
-#
-# What the rule cannot express, and what therefore has to be checked elsewhere:
-# every cell needs `order ≥ 1` on every axis. `_axis_dof_key` deliberately
-# collapses the two endpoint modes 0 and 1 into one `_AXIS_NODE` factor — that
-# collapse is exactly what makes an endpoint mode shareable across a cell
-# boundary — so no filter over keys can notice that a cell is missing one of its
-# two endpoint modes. `_build_cell_orders` in `mesh.jl` validates every palette
-# entry through `local_basis_indices` for that reason.
-
-# Whether the shared entity of `key` carries the mode `id`: every *active* cell
-# incident to it generates `id` from its own order. The generating cell is itself
-# incident, and `id` came from its own index set, so the loop is never empty and
-# the unconstrained case needs no separate answer.
-function _entity_carries(basis::BasisFamily, orders::CellOrders{D}, mask, key::TensorDofKey{D},
-                         n::NTuple{D,Int}, mode::Symbol, id::CartesianIndex{D}) where {D}
-    for ci in _incident_cells(key, n)
-        is_active(mask, ci) || continue
-        _index_admissible(basis, orders.palette[orders.class[ci]], mode, id) || return false
-    end
-    return true
-end
-
-# Integrated Legendre's method of the `_cell_modes` hook whose generic form is in
-# `mesh.jl`. It lives here, with `_entity_carries` and the `TensorDofKey` factors
-# the minimum rule is expressed over, the same way the B-spline family's
-# `_coverage_constraints!` lives in its extension.
-#
-# The per-order index sets are hoisted out of the cell loop: there are only
-# `length(palette)` distinct answers and `local_basis_indices` allocates a fresh
-# vector on every call, so asking it per cell allocated one vector per active
-# cell of the level. Measured on a 16³ level carrying 36 distinct anisotropic
-# orders, 36 973 allocations and 30.6 ms against 23 912 and 28.5 ms.
-function _cell_modes(basis::IntegratedLegendre, orders::CellOrders{D}, mesh::CartesianMesh{D},
-                     mode::Symbol, mask) where {D}
-    length(orders.palette) == 1 && return _uniform_cell_modes(basis, orders, mesh, mode, mask)
-    n = mesh.cells
-    sets = [CartesianIndex{D}[]]
-    index = Dict{Vector{CartesianIndex{D}},UInt16}(sets[1] => UInt16(1))
-    kind = Array{UInt16,D}(undef, n)
-    sets_by_class = [local_basis_indices(basis, o, mode) for o in orders.palette]
-    for cell in cell_indices(mesh)
-        if !is_active(mask, cell)
-            kind[cell] = UInt16(1)
-            continue
-        end
-        kept = CartesianIndex{D}[]
-        for id in sets_by_class[orders.class[cell]]
-            key = TensorDofKey{D}(0, ntuple(d -> _axis_dof_key(cell.I[d], id.I[d]), D))
-            _entity_carries(basis, orders, mask, key, n, mode, id) && push!(kept, id)
-        end
-        kind[cell] = get!(index, kept) do
-            length(sets) == typemax(UInt16) &&
-                throw(ArgumentError("a level carries at most $(typemax(UInt16)) distinct " *
-                                    "per-cell mode sets, and this one asks for more"))
-            push!(sets, kept)
-            UInt16(length(sets))
-        end
-    end
-    return CellModes{D}(sets, kind)
-end
-
-# Whether a family's span on a mesh contains that mesh's C⁰ multilinear vertex
-# functions — the hats. This is the basis half of the linear dedup in
-# `_coverage_constraints!`; `_nested_over` (`coverage.jl`) is the geometric half, and a
-# cover must pass both before a buried hat of the level below is eliminated.
-#
-# Integrated Legendre qualifies in either mode at any per-cell order ≥ 1: it is exactly
-# C⁰ across a cell boundary, and the two endpoint modes it collapses into one node
-# factor have trunk degree 0, so Q1 is in every cell's index set. The default is `false`,
-# which is the safe direction — skipping a legitimate dedup leaves a duplicate, while
-# deduping against a span that does not contain the hat deletes part of the space.
-#
-# It is a family trait rather than a type test on the cover because smoothness is a
-# property of the family's own construction: a maximal-regularity B-spline is C^(p−1) at
-# a simple interior knot, so it carries the kink at degree 1 and at no higher degree —
-# the extension answers exactly that, and a `k.basis isa IntegratedLegendre` gate cannot.
-_spans_hats(::BasisFamily) = false
-_spans_hats(::IntegratedLegendre) = true
-
-"""
-    _coverage_constraints!(ledger::EliminationLedger, level::Level, ctx::_LevelContext) -> ledger
-
-Pruning constraint source, the peer of [`_overlay_constraints!`](@ref) and bound by
-the same contract. Called only under leaf semantics (`dof_layout`'s `prune`, on by
-default) and only on a level outside `prune_exempt`, after the level's
-`_overlay_constraints!`. This integrated-Legendre method strongly eliminates
-
-  * every **buried high-order** mode (at least one bubble axis, every active incident
-    cell covered by and every fictitious one reached by a single finer level) —
-    covered-mode pruning, source `:coverage`; and
-  * every **buried linear** mode a single nested level above whose basis spans that
-    mesh's hats reproduces exactly — dedup, source `:dedup`.
-
-The linear skeleton is otherwise retained, which is what makes the reduced space
-complete. Each elimination is credited with its source for `constraint_kind` /
-diagnostics, unless the artificial boundary already eliminated the raw: the first
-writer wins (see [`EliminationLedger`](@ref)), so a buried raw on `Γ_o` stays
-credited to `:overlay`.
-
-Both halves ask `_reproduced_on_domain` (`coverage.jl`), which applies the
-fictitious-fold rule on the covering level *and* on this one — a support cell folded
-away carries nothing to reproduce, so it neither has to be covered nor may veto the
-verdict. `ctx.classify_cache` is the classification that tells a fold from a user
-mask, the same one [`build_coverage`](@ref) used.
-
-The dedup half is not an optimisation: a mode a covering level reproduces exactly is
-linearly dependent on that level's own modes, so leaving both active makes the
-superposed operator exactly singular. The B-spline extension overrides this hook for
-the same reason, and records nothing but dedups — that family has no bubble modes to
-shed. Every other family takes the generic fallback below and records nothing.
-"""
-function _coverage_constraints!(ledger::EliminationLedger, level::Level{D,T,<:IntegratedLegendre},
-                                ctx::_LevelContext{D,T}) where {D,T}
-    cov = ctx.coverage.covered[level.id]
-    any(cov) || return ledger
-    V, tol, n = ctx.space, ctx.tolerance, level.mesh.cells
-    # A buried vertex function is a C⁰ hat: multilinear on each of `level`'s cells,
-    # kinked across every cell boundary. Mesh nesting (`_nested_over`) only buys the
-    # multilinear half; the kink is the cover basis's half, and `_spans_hats` is where
-    # each family answers for it. Both halves are necessary and neither is about this
-    # level's family — a cover that spans the hats deduplicates them whoever generated
-    # them.
-    nested_above = [k
-                    for k in V.levels
-                    if k.id > level.id && _spans_hats(k.basis) && _nested_over(level, k, tol)]
-    reproduces(k, cells) = _reproduced_on_domain(level, k, cells, ctx.physical, tol,
-                                                 ctx.classify_cache)
-    # Covered-mode pruning asks the same *single-level* question the dedup half asks.
-    # `cov[ci]` says only that *some* higher level contains cell `ci`, and a mode
-    # whose incident cells are covered by two different levels is reproduced by
-    # neither: each of them is clamped to zero on the face they share, so at that
-    # seam nothing carries what the elimination removes. Requiring one level to
-    # cover the whole stencil is the same condition the dedup half already
-    # applies, and for the same reason.
-    #
-    # It deliberately does NOT ask the covering level to carry this level's
-    # order. Shedding a buried high-order mode is not a claim that something
-    # reproduces it — that is the dedup half's job, for linear modes. It is the
-    # what leaf semantics mean: over a region a finer level
-    # resolves, a coarse cell's high-order modes buy almost nothing in L² and
-    # carry the oscillation, so a *high-order base with a low-order fine overlay
-    # over a non-smooth feature* is exactly the configuration the rule exists to
-    # serve. Gating on the cover's order turns leaf semantics off exactly there:
-    # measured on a tanh layer with base p = 5 and
-    # a p = 2 overlay, the gate cut the base's shed modes from 189 to 5 and left
-    # far-field oscillation and overshoot bit-identical to switching the rule
-    # off (9.37e-3 both), against 9.95e-4 and 7.03e-4 without it.
-    above = [k for k in V.levels if k.id > level.id]
-    resolves(cells) = any(k -> reproduces(k, cells), above)
-    # The `cov` prefilter is a fast path over the *active* support only, which is both
-    # the set `_coverage_cells` computed and the only set on which a `false` entry is a
-    # verdict rather than a default. An inactive incident cell is settled by
-    # `reproduces`: fictitious and it is skipped, user-masked and it refuses.
-    for raw in ctx.raws
-        key = ctx.raw_keys[raw]
-        cells = _incident_cells(key, n)
-        all(ci -> !is_active(level.mask, ci) || cov[ci], cells) || continue     # buried?
-        if any(a -> a.kind == _AXIS_SPAN, key.axes)                 # high-order → covered-mode pruning
-            resolves(cells) && _eliminate!(ledger, raw, :coverage)
-        elseif any(k -> reproduces(k, cells), nested_above)          # linear reproduced above
-            _eliminate!(ledger, raw, :dedup)
-        end
-    end
-    return ledger
-end
-
 # Generic fallback: no covered-mode pruning for a family that has not opted in.
 function _coverage_constraints!(ledger::EliminationLedger, ::Level{D,T},
                                 ::_LevelContext{D,T}) where {D,T}
     ledger
 end
 
-# ── DofLayout construction and accessors ──────────────────────────────────────
-
-# Step 1 of a layout: the space block, built from the space alone. Raw enumeration
-# (`_enumerate_raws`), then every level's artificial eliminations recorded in one
-# `EliminationLedger` — the family's `_overlay_constraints!`, then, under leaf
-# semantics, its `_coverage_constraints!` against the masks `build_coverage`
-# computes (so those are built first, and not at all when `prune = false`), then
-# `_resolve_rows!` on whatever linear-constraint rows the two recorded — and finally
-# the depth-one check on the pivots the rows resolved to. The ledger's per-raw
-# sources and pivot table become the topology's.
-#
-# A topology reads neither a field's components nor its Dirichlet data, so one is
-# the same for every field over the space, and `_system_layout` builds it once per
-# space and shares it between them. `V.physical` is passed to
-# `_record_eliminations!` as an argument rather than read there, which is the
-# function barrier that types the hooks' context (see `_LevelContext`).
-function _dof_topology(V::Space{D,T}; tolerance::GeometryTolerance{T}=GeometryTolerance(T),
-                       prune::Bool=true, prune_exempt=(),
-                       classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
-    raw_by_key, raw_keys, cell_dofs_by_level, level_raws = _enumerate_raws(V)
-    coverage = prune ? build_coverage(V, tolerance, classify_cache) :
-               Coverage{D}(Dict{Int,BitArray{D}}())
-    ledger = EliminationLedger{T}(length(raw_keys))
-    _record_eliminations!(ledger, V, V.physical, tolerance, classify_cache, coverage, raw_keys,
-                          raw_by_key, level_raws, prune, prune_exempt)
-    _assert_resolved(ledger)
-    return _DofTopology{D,T}(cell_dofs_by_level, raw_keys, level_raws, ledger.source, ledger.pivots,
-                             tolerance)
-end
-
-# Step 3 of a layout: number one field over a topology, given its physical-Dirichlet
-# flags (step 2, `_physical_dirichlet`). Active ids run component-major — component
-# 1 of every raw, then component 2, … — skipping every (raw, component) a physical
-# Dirichlet condition constrains or an artificial elimination removed, so an
-# all-or-nothing constraint leaves the natural block ordering and a per-component
-# one leaves holes. The constrained values start at zero, which is already the
-# answer for homogeneous data; nonzero data are projected into them afterwards
-# (step 4, `_project_dirichlet_values!`).
-#
-# The topology's arrays are handed on, not copied: the space block is never mutated
-# once built, and this is the one place a layout receives it.
-function DofLayout(t::_DofTopology{D,T}, physical_dirichlet::Matrix{Bool}) where {D,T}
-    nraw, ncomp = size(physical_dirichlet)
-    active_component = zeros(Int, nraw, ncomp)
-    active_count = 0
-    for c in 1:ncomp, raw in 1:nraw
-        (physical_dirichlet[raw, c] || t.elimination_source[raw] !== :free) && continue
-        active_component[raw, c] = (active_count += 1)
-    end
-    return DofLayout{D,T}(t.cell_dofs_by_level, t.raw_keys, t.level_raws, t.elimination_source,
-                          t.pivots, t.tolerance, ncomp, physical_dirichlet, active_component,
-                          active_count, zeros(T, nraw, ncomp))
-end
+# ── DofLayout accessors and the pivot rule ────────────────────────────────────
 
 """
     raw_dof_count(layout::DofLayout) -> Int
@@ -1434,4 +992,459 @@ end
 
 function constrained_value(layout::SystemLayout, raw::Integer, component::Integer=1)
     constrained_value(_only_field_layout(layout).dofs, raw, component)
+end
+
+# ── Integrated Legendre family ────────────────────────────────────────────────
+
+# Tag values for `AxisDofKey.kind`. `UInt8` keeps the key compact and
+# fast to hash; the values themselves are arbitrary.
+#
+#   _AXIS_NODE   — integrated Legendre endpoint mode at a cell-corner
+#                  node coordinate.
+#   _AXIS_SPAN   — integrated Legendre interior (bubble) mode, cell-local.
+#
+# A tag need only be unique within one basis family, so each family owns
+# its tags: the B-spline extension defines its `_AXIS_BSPLINE` next to its
+# own key construction. Keys of two families can never be confused even
+# where their tags coincide. A key carries its level id and one level has
+# one family, so two keys of different families differ in their level and
+# the dof-key cache of a mixed-family space never takes one for the other;
+# and `_assert_keys_comparable` (`projection.jl`) refuses to match keys
+# across a change of family between two models. The shipped values happen
+# to be distinct (the extension's is `0x02`); nothing relies on it.
+const _AXIS_NODE = UInt8(0)
+const _AXIS_SPAN = UInt8(1)
+
+# Build the per-axis dof key for cell `cell_axis` and 1D mode `mode` in
+# the integrated Legendre basis. Modes 0 and 1 are the two endpoint
+# shape functions — they map to `_AXIS_NODE` factors at the cell's
+# lower-endpoint coordinate index (`cell_axis`) and upper-endpoint index
+# (`cell_axis + 1`) respectively. Mode m ≥ 2 is a cell-local bubble and
+# maps to an `_AXIS_SPAN` factor at index `cell_axis` carrying the mode
+# number for cross-cell distinguishability.
+function _axis_dof_key(cell_axis::Int, mode::Int)
+    mode == 0 && return AxisDofKey(_AXIS_NODE, cell_axis, 0)
+    mode == 1 && return AxisDofKey(_AXIS_NODE, cell_axis + 1, 0)
+    return AxisDofKey(_AXIS_SPAN, cell_axis, mode)
+end
+
+# Build the full `TensorDofKey` for one tensor-product basis function
+# `local_id` on `cell` of `level`. The integrated Legendre specialisation
+# above produces the per-axis keys; a fallback method throws for any
+# other basis family so the dof layer fails early instead of producing
+# silently-wrong keys.
+function _tensor_dof_key(level::Level{D,T,<:IntegratedLegendre}, cell::CartesianIndex{D},
+                         local_id::CartesianIndex{D}) where {D,T}
+    axes = ntuple(d -> _axis_dof_key(cell.I[d], local_id.I[d]), D)
+    return TensorDofKey{D}(level.id, axes)
+end
+
+function _tensor_dof_key(level::Level{D,T,B}, cell::CartesianIndex{D},
+                         local_id::CartesianIndex{D}) where {D,T,B}
+    throw(ArgumentError("dof layout is not implemented for basis family $(basis_name(level.basis))"))
+end
+
+# True iff the per-axis factor of `key` along `axis` anchors at the
+# level's lower (`side = :lower`) or upper (`side = :upper`) mesh edge.
+# Dispatched on the level's basis family so each family's "boundary
+# mode" convention is local to its own implementation. Used by the
+# physical-Dirichlet detection (`_key_faces` in `dirichlet.jl`) to
+# translate "is this dof at a face" into a basis-family-specific predicate
+# without leaking the family's mode-index conventions into the rest of the
+# dof layer. The integrated-Legendre `_has_overlay_constraint` below does
+# not route through it: it already walks the key's node factors and reads
+# the mesh-edge indices (`1` and `cells[axis] + 1`) off them directly.
+#
+# Integrated Legendre: only `_AXIS_NODE` keys touch a mesh edge —
+# `_AXIS_NODE.index == 1` (lower) or `cells[axis] + 1` (upper). Bubbles
+# never touch any edge. B-spline overloads live in
+# `ext/UnfittedBasicBSplineExt.jl`.
+function _key_on_level_side(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
+                            axis::Integer, side::Symbol) where {D,T}
+    axis_key = key.axes[axis]
+    axis_key.kind == _AXIS_NODE || return false
+    side === :lower && return axis_key.index == 1
+    side === :upper && return axis_key.index == level.mesh.cells[axis] + 1
+    throw(ArgumentError("boundary side must be :lower or :upper"))
+end
+
+# ── Artificial overlay-boundary detection ─────────────────────────────────────
+
+# Cells of `level` along `axis` incident to the axis-`axis` factor of a dof key,
+# clipped to the `n[axis]` cells the level has: a `_AXIS_NODE` factor at index
+# `i` touches cells `i − 1` and `i`, since a node sits between two adjacent
+# cells along its axis; a `_AXIS_SPAN` (bubble) factor at index `k` touches
+# only cell `k`, since a bubble mode is cell-local.
+#
+# This is the integrated-Legendre node-to-cell support map, and it is the one
+# place it is written down: `_incident_cells` applies it on every axis, and
+# `_perp_ranges` applies it on every axis but one. The B-spline family in the
+# extension has its own support map — a function's span can cover many cells —
+# and never routes through here.
+function _axis_incidence(axis_key::AxisDofKey, ncells::Int)
+    axis_key.kind == _AXIS_NODE || return axis_key.index:axis_key.index
+    return max(1, axis_key.index-1):min(ncells, axis_key.index)
+end
+
+# Incidence ranges of `key` on every axis *except* `axis`, which is pinned to
+# `1:1` so a `CartesianIndices` over the result enumerates the perpendicular
+# positions of a candidate face along `axis` exactly once. The `axis` slot of
+# each enumerated index is a placeholder the caller replaces with the cell
+# position on either side of the face.
+function _perp_ranges(key::TensorDofKey{D}, axis::Integer, n::NTuple{D,Int}) where {D}
+    return ntuple(d -> d == axis ? (1:1) : _axis_incidence(key.axes[d], n[d]), D)
+end
+
+# True iff the cell whose axis-`axis` index is `pos` (with the other-axis
+# indices drawn from `outer`, ignoring the axis-`axis` slot) is in bounds
+# and active under the level's `LevelMask`. Used by `_on_active_face` to
+# probe both sides of a candidate face for active/inactive transitions.
+function _cell_active(level::Level{D}, axis::Integer, pos::Integer, outer::NTuple{D,Int},
+                      n::NTuple{D,Int}) where {D}
+    1 <= pos <= n[axis] || return false
+    cell_tuple = ntuple(d -> d == axis ? pos : outer[d], D)
+    return is_active(level.mask, CartesianIndex(cell_tuple))
+end
+
+# True iff the `_AXIS_NODE` factor of `key` at axis `axis`, node index
+# `i`, lies on a face that separates an active cell from an
+# off-mesh-or-inactive cell on the other side. The perpendicular positions
+# come from the key's own incidence (`_perp_ranges`); for each of them,
+# sample the activity of the cells immediately below (`i − 1`) and above
+# (`i`) the candidate face along `axis`. A change in activity ⇒ the face is
+# between an active and an inactive cell of the level, i.e. an
+# active-region face.
+#
+# Integrated-Legendre-specific, because the incidence rule is. The B-spline
+# family in the extension rolls its own active-face check tied to the
+# function's actual support span, which can spread across many cells.
+function _on_active_face(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
+                         axis::Integer, i::Integer, n::NTuple{D,Int}) where {D,T}
+    for outer in CartesianIndices(_perp_ranges(key, axis, n))
+        below_active = _cell_active(level, axis, i - 1, outer.I, n)
+        above_active = _cell_active(level, axis, i, outer.I, n)
+        below_active != above_active && return true
+    end
+    return false
+end
+
+# True iff `key` sits on the artificial boundary of the level's *active
+# region* and therefore carries a homogeneous overlay constraint. The
+# active region is the union of active cells; its boundary includes
+#
+#   * the mesh-box face on every axis where the level's mesh boundary
+#     does not coincide with the physical-domain boundary (i.e. the
+#     artificial overlay boundary `Γ_o^(k) = ∂Ω^(k) \ ∂Ω`);
+#   * internal faces between active and inactive cells of the *same*
+#     level (the `LevelMask` boundary inside the level).
+#
+# With `mask === nothing` the active region equals the level's mesh
+# box, only mesh-box faces matter, and this reduces to the original
+# overlay-boundary rule from the paper.
+#
+# Dispatched on the level's basis family. The integrated-Legendre body
+# below uses the family's node/span index conventions directly; the
+# B-spline overload in `ext/UnfittedBasicBSplineExt.jl` does the same
+# job with B-spline function-index conventions and the C⁰-knot
+# treatment of mask-induced internal junctions.
+function _has_overlay_constraint(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
+                                 physical, domain::AxisBox{D,T}, tol::GeometryTolerance{T},
+                                 cache::_ClassifyCache{D,T}) where {D,T}
+    n = level.mesh.cells
+    for axis in 1:D
+        axis_key = key.axes[axis]
+        axis_key.kind == _AXIS_NODE || continue
+        i = axis_key.index
+
+        # Only nodes that actually sit on an active-region face matter.
+        _on_active_face(key, level, axis, i, n) || continue
+
+        # Three cases for an active-region face along this axis:
+        #   i == 1            — mesh's lower-axis face. Physical iff the
+        #                       level's lower bound coincides with the
+        #                       physical domain's lower bound; otherwise
+        #                       artificial.
+        #   i == n[axis] + 1  — mesh's upper-axis face, symmetric.
+        #   otherwise         — internal face between active and inactive
+        #                       cells of the same level. Artificial only when it
+        #                       carries physical material: a fully-fictitious
+        #                       fold face leaves the mode active (see
+        #                       `_internal_face_is_physical`).
+        if i == 1
+            _level_side_is_physical(level, domain, axis, :lower, tol) || return true
+        elseif i == n[axis] + 1
+            _level_side_is_physical(level, domain, axis, :upper, tol) || return true
+        else
+            _internal_face_is_physical(key, level, physical, axis, i, n, cache) && return true
+        end
+    end
+    return false
+end
+
+# True iff the internal active/inactive face along `axis` at node index `i`
+# carries physical material — i.e. at least one inactive cell across the face
+# is not fully fictitious. Mirrors `_on_active_face`'s perpendicular incidence
+# so it visits exactly the cells the face separates, and classifies only the
+# inactive neighbour on each such face.
+#
+# The fictitious fold deactivates fully-fictitious cells, so a fold face sees
+# only fictitious material on its inactive side and returns `false`: its
+# boundary modes stay active. They vanish on every physical face — so they
+# cannot break the C⁰ trace condition the overlay constraint enforces — and
+# instead carry the adjacent cut cell's approximation up to ∂Ω. A user mask
+# that excludes *physical* cells returns `true`: those modes are non-zero on a
+# physical face and must be eliminated to keep the truncated solution
+# continuous. With no physical domain there is no fictitious material, so every
+# internal active/inactive face is physical (the original overlay/user-mask
+# behaviour) and the `cache` is never touched.
+function _internal_face_is_physical(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
+                                    physical, axis::Integer, i::Integer, n::NTuple{D,Int},
+                                    cache::_ClassifyCache{D,T}) where {D,T}
+    physical === nothing && return true
+    for outer in CartesianIndices(_perp_ranges(key, axis, n))
+        below_active = _cell_active(level, axis, i - 1, outer.I, n)
+        above_active = _cell_active(level, axis, i, outer.I, n)
+        below_active == above_active && continue
+        inactive_pos = below_active ? i : i - 1
+        cell = CartesianIndex(ntuple(d -> d == axis ? inactive_pos : outer[d], D))
+        classify_cell(physical, cell_box(level.mesh, cell), cache) === :fictitious || return true
+    end
+    return false
+end
+
+# ── Pruning (coverage) constraint source ──────────────────────────────────────
+
+# Cells of `level` incident to the entity of `key`, from the per-axis incidence
+# rule of `_axis_incidence` applied on every axis.
+function _incident_cells(key::TensorDofKey{D}, n::NTuple{D,Int}) where {D}
+    return CartesianIndices(ntuple(d -> _axis_incidence(key.axes[d], n[d]), D))
+end
+
+# ── The minimum rule: per-cell order across a shared entity ───────────────────
+#
+# A cell at order 5 beside a cell at order 2 generates dof keys the neighbour
+# does not. Interior bubble keys are cell-local (`_AXIS_SPAN` on every axis) and
+# vertex keys carry mode 0 on every axis, so neither is a problem. The keys that
+# are shared *and* carry a mode — edge keys in 2D, edge and face keys in 3D —
+# are the whole difficulty: a raw generated by only one of the two cells is
+# nonzero on the face they share, so the superposed space is no longer C⁰. It
+# assembles, it solves, and it returns a plausible residual; only a two-sided
+# trace evaluation sees it.
+#
+# The classical hp-FEM fix is the *minimum rule*: a shared entity carries the
+# minimum of the orders of the cells sharing it. It is due to
+#
+#   B. Szabó, I. Babuška, "Finite Element Analysis", Wiley, New York (1991),
+#     ISBN 978-0-471-50273-9 — cited in full above `local_basis_indices` in
+#     `basis.jl`, where the same work's trunk space is defined; and
+#   L. Demkowicz, "Computing with hp-Adaptive Finite Elements, Vol. 1: One and
+#     Two Dimensional Elliptic and Maxwell Problems", Chapman & Hall/CRC (2006),
+#     doi:10.1201/9781420011685 — the constrained-approximation treatment this
+#     package's key-keyed statement of the rule follows.
+#
+# Three properties of the statement below are load-bearing and none of them is
+# cosmetic:
+#
+#   * It is a predicate on the **key**, not on the generating cell. The minimum
+#     over `_incident_cells(key, n)` is the same number whichever incident cell
+#     asks, so both sides of a face agree by construction and the one-sided mode
+#     is not expressible. A per-cell filter would have to be kept symmetric by
+#     hand.
+#   * Every question is asked at an order some cell **actually carries**. The
+#     classical statement forms the componentwise minimum first and then asks
+#     the family whether the mode survives *there* — at an order that in general
+#     no cell has, and where the family's index set therefore has to be defined
+#     by extension. That extension is where the rule goes wrong: read per axis
+#     it admits a 3D `:trunk` face key with bubble modes (3, 2), whose trunk
+#     degree is 5, at order 4 — a mode the order-4 cell never generates, and a
+#     measured 0.186 trace jump. Asking each incident cell about its own index
+#     set removes the fiction and with it the ambiguity.
+#   * Inactive incident cells are **skipped, not minimised over**. An inactive
+#     cell generates nothing, so it cannot disagree; letting it lower the entity
+#     would delete dofs nothing replaces. That is not hypothetical: under a
+#     fictitious fold `_internal_face_is_physical` deliberately keeps the modes
+#     on a fold face free, precisely so the adjacent cut cell's approximation
+#     reaches ∂Ω.
+#
+# One pass suffices — no fixed point. The incident cells of a key form a
+# face-connected `2^(#NODE axes)` hypercube, so agreement across every face of
+# that block already implies agreement with every cell in it.
+#
+# WHY THE INTERSECTION IS THE MINIMUM RULE. `_index_admissible` is, for every
+# family that opts into a per-cell order, a conjunction of upper bounds on the
+# order — `0 ≤ αᵈ ≤ pᵈ` for `:tensor`, plus `Σ t(αᵈ) ≤ p₁` for `:trunk`. Raising
+# an order therefore never removes a mode from a cell's set, only adds: the
+# predicate is monotone non-decreasing in `p`. Given that,
+#
+#     admissible(min over incident cells, α)  ⟺  admissible(order(c), α) ∀ c
+#
+# so the two statements are the same rule and the minimum need never be formed.
+# The equivalence *rests* on that monotonicity, which is a property of the
+# family rather than of this file, so `test_cell_order.jl` asserts it directly
+# for every family answering `_supports_cell_order() == true`. A family that
+# broke it would silently get a non-conforming space from this code.
+#
+# What the rule cannot express, and what therefore has to be checked elsewhere:
+# every cell needs `order ≥ 1` on every axis. `_axis_dof_key` deliberately
+# collapses the two endpoint modes 0 and 1 into one `_AXIS_NODE` factor — that
+# collapse is exactly what makes an endpoint mode shareable across a cell
+# boundary — so no filter over keys can notice that a cell is missing one of its
+# two endpoint modes. `_build_cell_orders` in `mesh.jl` validates every palette
+# entry through `local_basis_indices` for that reason.
+
+# Whether the shared entity of `key` carries the mode `id`: every *active* cell
+# incident to it generates `id` from its own order. The generating cell is itself
+# incident, and `id` came from its own index set, so the loop is never empty and
+# the unconstrained case needs no separate answer.
+function _entity_carries(basis::BasisFamily, orders::CellOrders{D}, mask, key::TensorDofKey{D},
+                         n::NTuple{D,Int}, mode::Symbol, id::CartesianIndex{D}) where {D}
+    for ci in _incident_cells(key, n)
+        is_active(mask, ci) || continue
+        _index_admissible(basis, orders.palette[orders.class[ci]], mode, id) || return false
+    end
+    return true
+end
+
+# Integrated Legendre's method of the `_cell_modes` hook whose generic form is in
+# `mesh.jl`. It lives here, with `_entity_carries` and the `TensorDofKey` factors
+# the minimum rule is expressed over, the same way the B-spline family's
+# `_coverage_constraints!` lives in its extension.
+#
+# The per-order index sets are hoisted out of the cell loop: there are only
+# `length(palette)` distinct answers and `local_basis_indices` allocates a fresh
+# vector on every call, so asking it per cell allocated one vector per active
+# cell of the level. Measured on a 16³ level carrying 36 distinct anisotropic
+# orders, 36 973 allocations and 30.6 ms against 23 912 and 28.5 ms.
+function _cell_modes(basis::IntegratedLegendre, orders::CellOrders{D}, mesh::CartesianMesh{D},
+                     mode::Symbol, mask) where {D}
+    length(orders.palette) == 1 && return _uniform_cell_modes(basis, orders, mesh, mode, mask)
+    n = mesh.cells
+    sets = [CartesianIndex{D}[]]
+    index = Dict{Vector{CartesianIndex{D}},UInt16}(sets[1] => UInt16(1))
+    kind = Array{UInt16,D}(undef, n)
+    sets_by_class = [local_basis_indices(basis, o, mode) for o in orders.palette]
+    for cell in cell_indices(mesh)
+        if !is_active(mask, cell)
+            kind[cell] = UInt16(1)
+            continue
+        end
+        kept = CartesianIndex{D}[]
+        for id in sets_by_class[orders.class[cell]]
+            key = TensorDofKey{D}(0, ntuple(d -> _axis_dof_key(cell.I[d], id.I[d]), D))
+            _entity_carries(basis, orders, mask, key, n, mode, id) && push!(kept, id)
+        end
+        kind[cell] = get!(index, kept) do
+            length(sets) == typemax(UInt16) &&
+                throw(ArgumentError("a level carries at most $(typemax(UInt16)) distinct " *
+                                    "per-cell mode sets, and this one asks for more"))
+            push!(sets, kept)
+            UInt16(length(sets))
+        end
+    end
+    return CellModes{D}(sets, kind)
+end
+
+# Whether a family's span on a mesh contains that mesh's C⁰ multilinear vertex
+# functions — the hats. This is the basis half of the linear dedup in
+# `_coverage_constraints!`; `_nested_over` (`coverage.jl`) is the geometric half, and a
+# cover must pass both before a buried hat of the level below is eliminated.
+#
+# Integrated Legendre qualifies in either mode at any per-cell order ≥ 1: it is exactly
+# C⁰ across a cell boundary, and the two endpoint modes it collapses into one node
+# factor have trunk degree 0, so Q1 is in every cell's index set. The default is `false`,
+# which is the safe direction — skipping a legitimate dedup leaves a duplicate, while
+# deduping against a span that does not contain the hat deletes part of the space.
+#
+# It is a family trait rather than a type test on the cover because smoothness is a
+# property of the family's own construction: a maximal-regularity B-spline is C^(p−1) at
+# a simple interior knot, so it carries the kink at degree 1 and at no higher degree —
+# the extension answers exactly that, and a `k.basis isa IntegratedLegendre` gate cannot.
+_spans_hats(::BasisFamily) = false
+_spans_hats(::IntegratedLegendre) = true
+
+"""
+    _coverage_constraints!(ledger::EliminationLedger, level::Level, ctx::_LevelContext) -> ledger
+
+Pruning constraint source, the peer of [`_overlay_constraints!`](@ref) and bound by
+the same contract. Called only under leaf semantics (`dof_layout`'s `prune`, on by
+default) and only on a level outside `prune_exempt`, after the level's
+`_overlay_constraints!`. This integrated-Legendre method strongly eliminates
+
+  * every **buried high-order** mode (at least one bubble axis, every active incident
+    cell covered by and every fictitious one reached by a single finer level) —
+    covered-mode pruning, source `:coverage`; and
+  * every **buried linear** mode a single nested level above whose basis spans that
+    mesh's hats reproduces exactly — dedup, source `:dedup`.
+
+The linear skeleton is otherwise retained, which is what makes the reduced space
+complete. Each elimination is credited with its source for `constraint_kind` /
+diagnostics, unless the artificial boundary already eliminated the raw: the first
+writer wins (see [`EliminationLedger`](@ref)), so a buried raw on `Γ_o` stays
+credited to `:overlay`.
+
+Both halves ask `_reproduced_on_domain` (`coverage.jl`), which applies the
+fictitious-fold rule on the covering level *and* on this one — a support cell folded
+away carries nothing to reproduce, so it neither has to be covered nor may veto the
+verdict. `ctx.classify_cache` is the classification that tells a fold from a user
+mask, the same one [`build_coverage`](@ref) used.
+
+The dedup half is not an optimisation: a mode a covering level reproduces exactly is
+linearly dependent on that level's own modes, so leaving both active makes the
+superposed operator exactly singular. The B-spline extension overrides this hook for
+the same reason, and records nothing but dedups — that family has no bubble modes to
+shed. Every other family takes the generic fallback above and records nothing.
+"""
+function _coverage_constraints!(ledger::EliminationLedger, level::Level{D,T,<:IntegratedLegendre},
+                                ctx::_LevelContext{D,T}) where {D,T}
+    cov = ctx.coverage.covered[level.id]
+    any(cov) || return ledger
+    V, tol, n = ctx.space, ctx.tolerance, level.mesh.cells
+    # A buried vertex function is a C⁰ hat: multilinear on each of `level`'s cells,
+    # kinked across every cell boundary. Mesh nesting (`_nested_over`) only buys the
+    # multilinear half; the kink is the cover basis's half, and `_spans_hats` is where
+    # each family answers for it. Both halves are necessary and neither is about this
+    # level's family — a cover that spans the hats deduplicates them whoever generated
+    # them.
+    nested_above = [k
+                    for k in V.levels
+                    if k.id > level.id && _spans_hats(k.basis) && _nested_over(level, k, tol)]
+    reproduces(k, cells) = _reproduced_on_domain(level, k, cells, ctx.physical, tol,
+                                                 ctx.classify_cache)
+    # Covered-mode pruning asks the same *single-level* question the dedup half asks.
+    # `cov[ci]` says only that *some* higher level contains cell `ci`, and a mode
+    # whose incident cells are covered by two different levels is reproduced by
+    # neither: each of them is clamped to zero on the face they share, so at that
+    # seam nothing carries what the elimination removes. Requiring one level to
+    # cover the whole stencil is the same condition the dedup half already
+    # applies, and for the same reason.
+    #
+    # It deliberately does NOT ask the covering level to carry this level's
+    # order. Shedding a buried high-order mode is not a claim that something
+    # reproduces it — that is the dedup half's job, for linear modes. It is the
+    # what leaf semantics mean: over a region a finer level
+    # resolves, a coarse cell's high-order modes buy almost nothing in L² and
+    # carry the oscillation, so a *high-order base with a low-order fine overlay
+    # over a non-smooth feature* is exactly the configuration the rule exists to
+    # serve. Gating on the cover's order turns leaf semantics off exactly there:
+    # measured on a tanh layer with base p = 5 and
+    # a p = 2 overlay, the gate cut the base's shed modes from 189 to 5 and left
+    # far-field oscillation and overshoot bit-identical to switching the rule
+    # off (9.37e-3 both), against 9.95e-4 and 7.03e-4 without it.
+    above = [k for k in V.levels if k.id > level.id]
+    resolves(cells) = any(k -> reproduces(k, cells), above)
+    # The `cov` prefilter is a fast path over the *active* support only, which is both
+    # the set `_coverage_cells` computed and the only set on which a `false` entry is a
+    # verdict rather than a default. An inactive incident cell is settled by
+    # `reproduces`: fictitious and it is skipped, user-masked and it refuses.
+    for raw in ctx.raws
+        key = ctx.raw_keys[raw]
+        cells = _incident_cells(key, n)
+        all(ci -> !is_active(level.mask, ci) || cov[ci], cells) || continue     # buried?
+        if any(a -> a.kind == _AXIS_SPAN, key.axes)                 # high-order → covered-mode pruning
+            resolves(cells) && _eliminate!(ledger, raw, :coverage)
+        elseif any(k -> reproduces(k, cells), nested_above)          # linear reproduced above
+            _eliminate!(ledger, raw, :dedup)
+        end
+    end
+    return ledger
 end
