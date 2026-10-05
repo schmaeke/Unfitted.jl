@@ -19,174 +19,7 @@
 #     `activate!` — and avoids the projection cost / smoothing in that
 #     case.
 
-# ── Transfer regions ──────────────────────────────────────────────────────────
-
-"""
-    TransferRegion{D,T}(box, target_parents, source_parents, quadrature)
-
-One admissible integration region for a source-to-target L²
-projection. Mirrors [`VolumeRegion`](@ref) but carries *two*
-parent lists — one per side of the projection — so the assembly hot
-loop can evaluate the source field and the target trace
-simultaneously without re-walking the mesh.
-
-Fields:
-
-  - `box::AxisBox{D,T}` — the region's physical-frame extent. Built
-    from the *union* of source and target mesh boundaries so the
-    integrand is smooth across the box.
-  - `target_parents` — active target levels whose cell contains the
-    box midpoint, with the box in each parent's reference frame.
-  - `source_parents` — same, for the source. May be empty when the box
-    lies in part of `Ω` the source did not cover (e.g. after an
-    overlay activation extended the target).
-  - `quadrature::TensorQuadrature{D,T}` — shared cached tensor Gauss
-    rule, sized by the per-axis maximum recommended quadrature order
-    across both sides.
-"""
-struct TransferRegion{D,T<:Real}
-    box::AxisBox{D,T}
-    target_parents::Vector{ParentRef{D,T}}
-    source_parents::Vector{ParentRef{D,T}}
-    quadrature::TensorQuadrature{D,T}
-end
-
-# Sanity-check the source / target compatibility for a transfer: the same
-# space bounding box (`Space.domain`; the immersed `Space.physical` is not
-# compared here), the same number of fields, and the same field names with
-# the same per-field component counts. The name check is implicit in
-# `_field_layout`, which raises on a source field the target does not carry.
-# Lets backends fail early with a clear message instead of producing wrong
-# numbers downstream. On a coupled model `problem.space` is the
-# *representative* (first field's) space, so only that subdomain's box is
-# compared.
-function _assert_transfer_compatible(source_model::Model{D,T}, target_model::Model{D,T}) where {D,T}
-    source_model.problem.space.domain == target_model.problem.space.domain ||
-        throw(ArgumentError("source and target models must have the same physical domain"))
-    length(source_model.dofs.fields) == length(target_model.dofs.fields) ||
-        throw(ArgumentError("source and target models must have the same fields"))
-    for source_field in source_model.dofs.fields
-        target_field = _field_layout(target_model.dofs, source_field.name)
-        source_field.components == target_field.components ||
-            throw(ArgumentError("source and target field $(source_field.name) have different component counts"))
-    end
-    return nothing
-end
-
-# Per-axis quadrature counts for a transfer region: take the per-axis
-# maximum recommended order across the *union* of source and target
-# parents, so the rule integrates source × target basis products exactly
-# regardless of which side carries the higher-order basis.
-#
-# When `source_parents` is empty (no source coverage at this region),
-# the source-side count drops to 1 — the rhs contribution there is zero
-# anyway, so any rule will do, and the cheap `1` keeps cache pressure
-# low.
-function _transfer_quadrature_counts(source_model::Model{D}, target_model::Model{D}, target_parents,
-                                     source_parents) where {D}
-    target_counts = _parent_quadrature_counts(Val(D), target_parents,
-                                              id -> _level_by_id(target_model.problem.space, id))
-    source_counts = isempty(source_parents) ? ntuple(_ -> 1, D) :
-                    _parent_quadrature_counts(Val(D), source_parents,
-                                              id -> _level_by_id(source_model.problem.space, id))
-    return ntuple(d -> max(target_counts[d], source_counts[d]), D)
-end
-
-function _transfer_quadrature(source_model::Model{D,T}, target_model::Model{D,T}, target_parents,
-                              source_parents, cache) where {D,T}
-    counts = _transfer_quadrature_counts(source_model, target_model, target_parents, source_parents)
-    return _cached_tensor_quadrature!(cache, counts, T)
-end
-
-# Build the [`TransferRegion`](@ref) list. Reuses the volume
-# admissible-box partition from `intersections.jl`: feed both sides'
-# levels to `_merged_boxes` so the resulting boxes respect every mesh
-# boundary on both sides. Drop boxes the target does not cover (no
-# rhs contribution and no place to deposit the result).
-function _transfer_regions(source_model::Model{D,T}, target_model::Model{D,T};
-                           tolerance=target_model.dofs.tolerance) where {D,T}
-    levels = (source_model.problem.space.levels..., target_model.problem.space.levels...)
-    regions = TransferRegion{D,T}[]
-    quadrature_cache = Dict{NTuple{D,Int},TensorQuadrature{D,T}}()
-
-    for box in _merged_boxes(levels, Val(D), tolerance)
-        target_parents = _parents_covering(target_model.problem.space.levels, box, tolerance)
-        isempty(target_parents) && continue
-        source_parents = _parents_covering(source_model.problem.space.levels, box, tolerance)
-        quadrature = _transfer_quadrature(source_model, target_model, target_parents,
-                                          source_parents, quadrature_cache)
-        push!(regions, TransferRegion{D,T}(box, target_parents, source_parents, quadrature))
-    end
-
-    return regions
-end
-
-# ── L² projection source-driven rhs ──────────────────────────────────────────
-
-# Accumulate the source-driven rhs of the L² transfer over the union partition
-# `regions`, onto `rhs`. The target mass matrix `M_T` and its Dirichlet
-# column-elimination lift `−M_ac·c_c` are assembled separately, by the standard
-# assembler over the target's own integration regions (see
-# [`L2Projection`](@ref)), so this pass integrates only the linear load
-#
-#     b_i += ∫_box u_S(x) · φ_iᵀ dx,
-#
-# where `u_S` is the source field reconstructed from its coefficients on the
-# region's source parents and `φᵀ` are the target traces.
-#
-# It runs on two assembly workspaces, because the two models' level ids
-# overlap and so cannot share a bank: the target one numbers the region's
-# target dofs (`_frame!` and `_slots!`, one table for every basis family) and
-# collects the local rhs, and the source one evaluates `u_S` as a `FormState`
-# over the source coefficients. Both refresh values only, since the integrand
-# never reads a gradient.
-function _transfer_rhs!(rhs, source_coefficients, source_model::Model, target_model::Model, regions)
-    target = _assembly_workspace(target_model)
-    source = _assembly_workspace(source_model)
-    state = FormState(source_model.dofs, _state_vector(source_coefficients, source_model))
-    return _transfer_rhs_regions!(rhs, target, source, state, regions)
-end
-
-# The region loop of `_transfer_rhs!`, behind a function barrier on the two
-# workspaces. Per region the source dof values are read once; per point and per
-# target field component, `u_S` of the same-named source field is emitted
-# against every target test function as a load, `(qweight·u_S)·φ`, accumulated
-# per row in point order. A pivot target is condensed onto its branches before
-# the local rhs is added to the global one. A region the source does not cover
-# contributes nothing (`u_S ≡ 0` there) and is skipped.
-function _transfer_rhs_regions!(rhs::Vector{T}, target::AssemblyWorkspace{D,T},
-                                source::AssemblyWorkspace, state::FormState, regions) where {D,T}
-    # Target field `f`'s component `c` reads the source field of the same name.
-    source_field = [_field_index(source.layout, fl.name) for fl in target.layout.fields]
-    for region in regions
-        isempty(region.source_parents) && continue
-        # Each side as the kernel's helpers see a region, a parent list, so
-        # `_frame!`, `_refresh!` and the state evaluation run on it unchanged,
-        # with `region_parents` and `_parent_lists` taking their defaults.
-        target_view, source_view = (; parents=region.target_parents),
-                                   (; parents=region.source_parents)
-        n = _slots!(_frame!(target, target_view))
-        m = n + length(target.pivots)
-        _state_region!(state, _frame!(source, source_view))
-        fill!(resize!(target.b, m), zero(T))
-        jacobian = volume(region.box) / convert(T, 2^D)
-        for (η, weight) in zip(region.quadrature.points, region.quadrature.weights)
-            qweight = weight * jacobian
-            _refresh!(target, target_view, η, Val(false))
-            _refresh!(source, source_view, η, Val(false))
-            _state_point!(state, source, Val(false))
-            for (f, fl) in pairs(target.layout.fields), c in 1:fl.components
-                u = state.values[state.offsets[source_field[f]]+c]
-                _emit!(target, qweight * u, f, c, one(T), 0, -one(T), n, m, false)
-            end
-        end
-        isempty(target.pivots) || _condense!(target, n, m, false, false)
-        _flush!(nothing, rhs, nothing, target, n, false, false)
-    end
-    return nothing
-end
-
-# ── Public API and backends ──────────────────────────────────────────────────
+# ── Backends and transfer regions ─────────────────────────────────────────────
 
 """
     abstract type TransferBackend end
@@ -308,6 +141,38 @@ end
 Rewire(; strict::Bool=true) = Rewire(strict)
 
 """
+    TransferRegion{D,T}(box, target_parents, source_parents, quadrature)
+
+One admissible integration region for a source-to-target L²
+projection. Mirrors [`VolumeRegion`](@ref) but carries *two*
+parent lists — one per side of the projection — so the assembly hot
+loop can evaluate the source field and the target trace
+simultaneously without re-walking the mesh.
+
+Fields:
+
+  - `box::AxisBox{D,T}` — the region's physical-frame extent. Built
+    from the *union* of source and target mesh boundaries so the
+    integrand is smooth across the box.
+  - `target_parents` — active target levels whose cell contains the
+    box midpoint, with the box in each parent's reference frame.
+  - `source_parents` — same, for the source. May be empty when the box
+    lies in part of `Ω` the source did not cover (e.g. after an
+    overlay activation extended the target).
+  - `quadrature::TensorQuadrature{D,T}` — shared cached tensor Gauss
+    rule, sized by the per-axis maximum recommended quadrature order
+    across both sides.
+"""
+struct TransferRegion{D,T<:Real}
+    box::AxisBox{D,T}
+    target_parents::Vector{ParentRef{D,T}}
+    source_parents::Vector{ParentRef{D,T}}
+    quadrature::TensorQuadrature{D,T}
+end
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+"""
     transfer(source_solution, source_model, target_model;
              via=L2Projection(), tolerance=target_model.dofs.tolerance) -> Solution
 
@@ -338,14 +203,19 @@ function transfer(source_solution::Solution, source_model::Model{D,T}, target_mo
     return _transfer!(source_solution, source_model, target_model, via, tolerance)
 end
 
-# True when any field of `layout` carries a nonzero constrained value, i.e.
-# non-homogeneous physical Dirichlet data. Artificial overlay constraints are
-# always homogeneous (value 0), so this flags exactly the case where the
-# Dirichlet column-elimination lift `−M_ac·c_c` is nonzero — the term the
-# cached-matrix transfer path omits.
-function _has_nonhomogeneous_constraints(layout::SystemLayout)
-    return any(field -> any(!iszero, field.dofs.constrained_values), layout.fields)
+# Friendlier error-message dispatches for the most common user
+# mistakes: mismatched dimension / scalar type (the model parameters
+# disagree, so the typed `transfer` above does not match) and missing
+# target model (positional shorthand the API does not support).
+function transfer(::Solution, ::Model, ::Model; kwargs...)
+    throw(ArgumentError("source and target models must have the same dimension and scalar type for transfer"))
 end
+
+function transfer(::Solution, ::Model; kwargs...)
+    throw(ArgumentError("transfer requires source and target models; call transfer(solution, source_model, target_model)"))
+end
+
+# ── L² projection ─────────────────────────────────────────────────────────────
 
 # `L2Projection` implementation. The target-side mass matrix `M_T` and its
 # Dirichlet column-elimination lift `−M_ac·c_c` are assembled by the
@@ -418,58 +288,149 @@ function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_
                     SolverDiagnostics(:l2_projection, Float64(residual), true))
 end
 
-# `Rewire` matches source to target by `TensorDofKey` equality, which is only
-# sound while the same key names the same function on both sides. That is a
-# property of the basis family, and the two shipped families differ on it.
-#
-# An integrated-Legendre key indexes a mode by its DEGREE, and mode 3 is the same
-# function at order 4 and at order 7, so a pure order elevation rewires exactly —
-# measured, order 3 → 4 on 8² transfers with 0.000e+00 error. A B-spline key
-# indexes a global 1D function over the whole axis (`_AXIS_BSPLINE`), and raising
-# the degree rewrites the knot vector, so index *i* at degree 3 and index *i* at
-# degree 4 are simply different functions. The keys still compare equal, the
-# lookup still succeeds, and the coefficients land on the wrong basis: measured,
-# the same order 3 → 4 transfer "succeeded" with no raise and a relative error of
-# 1.80e-1. `strict = true` did not catch it, because it tests key PRESENCE while
-# the docstring promises span containment.
-#
-# The test is family-generic rather than a B-spline special case: the degree lives
-# in `BSplineFamily`'s type (its spaces are `BSplineSpace{p}`), while
-# `IntegratedLegendre` is one type for every order. So comparing the instantiated
-# basis TYPE admits exactly the rewires that are sound and rejects the rest, and a
-# future family inherits the right behaviour by construction. The mesh is
-# compared for the same reason: a key indexes into a mesh, and two meshes of
-# different size *or position* do not share an indexing. Position is the half a
-# cell-count test alone misses — `moved` and `move!` keep every key and move the
-# function it names, so a displaced overlay matches key for key and lands the
-# source's coefficients on functions somewhere else. Measured with the guard
-# stubbed out, on a 2D Poisson base 8² p=3 carrying a 4×4 overlay displaced by
-# half a fine cell: `strict = true` raised nothing and the transferred field
-# deviated by up to 4.3e-2 from the source, against a solution whose own
-# magnitude is 7.4e-2 — a 58% error, silently.
-#
-# `domain` and `cells` settle it between them: a `CartesianMesh`'s `axes` are
-# derived from exactly those two by `_mesh_axes` (mesh.jl), and `AxisBox`
-# equality is corner-wise and bit-exact for meshes built that way.
-function _assert_keys_comparable(source_model::Model, target_model::Model)
-    src, tgt = source_model.problem.space, target_model.problem.space
-    for k in 1:min(length(src.levels), length(tgt.levels))
-        a, b = src.levels[k], tgt.levels[k]
-        typeof(a.basis) === typeof(b.basis) ||
-            throw(ArgumentError("Rewire: level $k carries $(basis_name(a.basis)) at order " *
-                                "$(nominal_order(a)) on the source and $(basis_name(b.basis)) at order " *
-                                "$(nominal_order(b)) on the target, and those name different function sets, so a " *
-                                "dof key does not name the same function on both sides — raising a B-spline degree " *
-                                "rewrites the knot vector and does exactly this. Use `L2Projection()` instead."))
-        (a.mesh.cells == b.mesh.cells && a.mesh.domain == b.mesh.domain) ||
-            throw(ArgumentError("Rewire: level $k is meshed as $(a.mesh.cells) cells over $(a.mesh.domain) on the " *
-                                "source and $(b.mesh.cells) cells over $(b.mesh.domain) on the target; a dof key " *
-                                "indexes into a mesh, so the same key names a function of a different size or at a " *
-                                "different position on the two sides and they are not comparable. Use " *
-                                "`L2Projection()` instead."))
+# Sanity-check the source / target compatibility for a transfer: the same
+# space bounding box (`Space.domain`; the immersed `Space.physical` is not
+# compared here), the same number of fields, and the same field names with
+# the same per-field component counts. The name check is implicit in
+# `_field_layout`, which raises on a source field the target does not carry.
+# Lets backends fail early with a clear message instead of producing wrong
+# numbers downstream. On a coupled model `problem.space` is the
+# *representative* (first field's) space, so only that subdomain's box is
+# compared.
+function _assert_transfer_compatible(source_model::Model{D,T}, target_model::Model{D,T}) where {D,T}
+    source_model.problem.space.domain == target_model.problem.space.domain ||
+        throw(ArgumentError("source and target models must have the same physical domain"))
+    length(source_model.dofs.fields) == length(target_model.dofs.fields) ||
+        throw(ArgumentError("source and target models must have the same fields"))
+    for source_field in source_model.dofs.fields
+        target_field = _field_layout(target_model.dofs, source_field.name)
+        source_field.components == target_field.components ||
+            throw(ArgumentError("source and target field $(source_field.name) have different component counts"))
     end
     return nothing
 end
+
+# True when any field of `layout` carries a nonzero constrained value, i.e.
+# non-homogeneous physical Dirichlet data. Artificial overlay constraints are
+# always homogeneous (value 0), so this flags exactly the case where the
+# Dirichlet column-elimination lift `−M_ac·c_c` is nonzero — the term the
+# cached-matrix transfer path omits.
+function _has_nonhomogeneous_constraints(layout::SystemLayout)
+    return any(field -> any(!iszero, field.dofs.constrained_values), layout.fields)
+end
+
+# Build the [`TransferRegion`](@ref) list. Reuses the volume
+# admissible-box partition from `intersections.jl`: feed both sides'
+# levels to `_merged_boxes` so the resulting boxes respect every mesh
+# boundary on both sides. Drop boxes the target does not cover (no
+# rhs contribution and no place to deposit the result).
+function _transfer_regions(source_model::Model{D,T}, target_model::Model{D,T};
+                           tolerance=target_model.dofs.tolerance) where {D,T}
+    levels = (source_model.problem.space.levels..., target_model.problem.space.levels...)
+    regions = TransferRegion{D,T}[]
+    quadrature_cache = Dict{NTuple{D,Int},TensorQuadrature{D,T}}()
+
+    for box in _merged_boxes(levels, Val(D), tolerance)
+        target_parents = _parents_covering(target_model.problem.space.levels, box, tolerance)
+        isempty(target_parents) && continue
+        source_parents = _parents_covering(source_model.problem.space.levels, box, tolerance)
+        quadrature = _transfer_quadrature(source_model, target_model, target_parents,
+                                          source_parents, quadrature_cache)
+        push!(regions, TransferRegion{D,T}(box, target_parents, source_parents, quadrature))
+    end
+
+    return regions
+end
+
+function _transfer_quadrature(source_model::Model{D,T}, target_model::Model{D,T}, target_parents,
+                              source_parents, cache) where {D,T}
+    counts = _transfer_quadrature_counts(source_model, target_model, target_parents, source_parents)
+    return _cached_tensor_quadrature!(cache, counts, T)
+end
+
+# Per-axis quadrature counts for a transfer region: take the per-axis
+# maximum recommended order across the *union* of source and target
+# parents, so the rule integrates source × target basis products exactly
+# regardless of which side carries the higher-order basis.
+#
+# When `source_parents` is empty (no source coverage at this region),
+# the source-side count drops to 1 — the rhs contribution there is zero
+# anyway, so any rule will do, and the cheap `1` keeps cache pressure
+# low.
+function _transfer_quadrature_counts(source_model::Model{D}, target_model::Model{D}, target_parents,
+                                     source_parents) where {D}
+    target_counts = _parent_quadrature_counts(Val(D), target_parents,
+                                              id -> _level_by_id(target_model.problem.space, id))
+    source_counts = isempty(source_parents) ? ntuple(_ -> 1, D) :
+                    _parent_quadrature_counts(Val(D), source_parents,
+                                              id -> _level_by_id(source_model.problem.space, id))
+    return ntuple(d -> max(target_counts[d], source_counts[d]), D)
+end
+
+# Accumulate the source-driven rhs of the L² transfer over the union partition
+# `regions`, onto `rhs`. The target mass matrix `M_T` and its Dirichlet
+# column-elimination lift `−M_ac·c_c` are assembled separately, by the standard
+# assembler over the target's own integration regions (see
+# [`L2Projection`](@ref)), so this pass integrates only the linear load
+#
+#     b_i += ∫_box u_S(x) · φ_iᵀ dx,
+#
+# where `u_S` is the source field reconstructed from its coefficients on the
+# region's source parents and `φᵀ` are the target traces.
+#
+# It runs on two assembly workspaces, because the two models' level ids
+# overlap and so cannot share a bank: the target one numbers the region's
+# target dofs (`_frame!` and `_slots!`, one table for every basis family) and
+# collects the local rhs, and the source one evaluates `u_S` as a `FormState`
+# over the source coefficients. Both refresh values only, since the integrand
+# never reads a gradient.
+function _transfer_rhs!(rhs, source_coefficients, source_model::Model, target_model::Model, regions)
+    target = _assembly_workspace(target_model)
+    source = _assembly_workspace(source_model)
+    state = FormState(source_model.dofs, _state_vector(source_coefficients, source_model))
+    return _transfer_rhs_regions!(rhs, target, source, state, regions)
+end
+
+# The region loop of `_transfer_rhs!`, behind a function barrier on the two
+# workspaces. Per region the source dof values are read once; per point and per
+# target field component, `u_S` of the same-named source field is emitted
+# against every target test function as a load, `(qweight·u_S)·φ`, accumulated
+# per row in point order. A pivot target is condensed onto its branches before
+# the local rhs is added to the global one. A region the source does not cover
+# contributes nothing (`u_S ≡ 0` there) and is skipped.
+function _transfer_rhs_regions!(rhs::Vector{T}, target::AssemblyWorkspace{D,T},
+                                source::AssemblyWorkspace, state::FormState, regions) where {D,T}
+    # Target field `f`'s component `c` reads the source field of the same name.
+    source_field = [_field_index(source.layout, fl.name) for fl in target.layout.fields]
+    for region in regions
+        isempty(region.source_parents) && continue
+        # Each side as the kernel's helpers see a region, a parent list, so
+        # `_frame!`, `_refresh!` and the state evaluation run on it unchanged,
+        # with `region_parents` and `_parent_lists` taking their defaults.
+        target_view, source_view = (; parents=region.target_parents),
+                                   (; parents=region.source_parents)
+        n = _slots!(_frame!(target, target_view))
+        m = n + length(target.pivots)
+        _state_region!(state, _frame!(source, source_view))
+        fill!(resize!(target.b, m), zero(T))
+        jacobian = volume(region.box) / convert(T, 2^D)
+        for (η, weight) in zip(region.quadrature.points, region.quadrature.weights)
+            qweight = weight * jacobian
+            _refresh!(target, target_view, η, Val(false))
+            _refresh!(source, source_view, η, Val(false))
+            _state_point!(state, source, Val(false))
+            for (f, fl) in pairs(target.layout.fields), c in 1:fl.components
+                u = state.values[state.offsets[source_field[f]]+c]
+                _emit!(target, qweight * u, f, c, one(T), 0, -one(T), n, m, false)
+            end
+        end
+        isempty(target.pivots) || _condense!(target, n, m, false, false)
+        _flush!(nothing, rhs, nothing, target, n, false, false)
+    end
+    return nothing
+end
+
+# ── Rewire ────────────────────────────────────────────────────────────────────
 
 # `Rewire` implementation: walk every active source dof, find its
 # target counterpart by `TensorDofKey`, and copy the coefficient.
@@ -525,14 +486,55 @@ function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_
     return Solution(coefficients, target_model.version, SolverDiagnostics(:rewire, 0.0, true))
 end
 
-# Friendlier error-message dispatches for the most common user
-# mistakes: mismatched dimension / scalar type (the model parameters
-# disagree, so the typed `transfer` above does not match) and missing
-# target model (positional shorthand the API does not support).
-function transfer(::Solution, ::Model, ::Model; kwargs...)
-    throw(ArgumentError("source and target models must have the same dimension and scalar type for transfer"))
-end
-
-function transfer(::Solution, ::Model; kwargs...)
-    throw(ArgumentError("transfer requires source and target models; call transfer(solution, source_model, target_model)"))
+# `Rewire` matches source to target by `TensorDofKey` equality, which is only
+# sound while the same key names the same function on both sides. That is a
+# property of the basis family, and the two shipped families differ on it.
+#
+# An integrated-Legendre key indexes a mode by its DEGREE, and mode 3 is the same
+# function at order 4 and at order 7, so a pure order elevation rewires exactly —
+# measured, order 3 → 4 on 8² transfers with 0.000e+00 error. A B-spline key
+# indexes a global 1D function over the whole axis (`_AXIS_BSPLINE`), and raising
+# the degree rewrites the knot vector, so index *i* at degree 3 and index *i* at
+# degree 4 are simply different functions. The keys still compare equal, the
+# lookup still succeeds, and the coefficients land on the wrong basis: measured,
+# the same order 3 → 4 transfer "succeeded" with no raise and a relative error of
+# 1.80e-1. `strict = true` did not catch it, because it tests key PRESENCE while
+# the docstring promises span containment.
+#
+# The test is family-generic rather than a B-spline special case: the degree lives
+# in `BSplineFamily`'s type (its spaces are `BSplineSpace{p}`), while
+# `IntegratedLegendre` is one type for every order. So comparing the instantiated
+# basis TYPE admits exactly the rewires that are sound and rejects the rest, and a
+# future family inherits the right behaviour by construction. The mesh is
+# compared for the same reason: a key indexes into a mesh, and two meshes of
+# different size *or position* do not share an indexing. Position is the half a
+# cell-count test alone misses — `moved` and `move!` keep every key and move the
+# function it names, so a displaced overlay matches key for key and lands the
+# source's coefficients on functions somewhere else. Measured with the guard
+# stubbed out, on a 2D Poisson base 8² p=3 carrying a 4×4 overlay displaced by
+# half a fine cell: `strict = true` raised nothing and the transferred field
+# deviated by up to 4.3e-2 from the source, against a solution whose own
+# magnitude is 7.4e-2 — a 58% error, silently.
+#
+# `domain` and `cells` settle it between them: a `CartesianMesh`'s `axes` are
+# derived from exactly those two by `_mesh_axes` (mesh.jl), and `AxisBox`
+# equality is corner-wise and bit-exact for meshes built that way.
+function _assert_keys_comparable(source_model::Model, target_model::Model)
+    src, tgt = source_model.problem.space, target_model.problem.space
+    for k in 1:min(length(src.levels), length(tgt.levels))
+        a, b = src.levels[k], tgt.levels[k]
+        typeof(a.basis) === typeof(b.basis) ||
+            throw(ArgumentError("Rewire: level $k carries $(basis_name(a.basis)) at order " *
+                                "$(nominal_order(a)) on the source and $(basis_name(b.basis)) at order " *
+                                "$(nominal_order(b)) on the target, and those name different function sets, so a " *
+                                "dof key does not name the same function on both sides — raising a B-spline degree " *
+                                "rewrites the knot vector and does exactly this. Use `L2Projection()` instead."))
+        (a.mesh.cells == b.mesh.cells && a.mesh.domain == b.mesh.domain) ||
+            throw(ArgumentError("Rewire: level $k is meshed as $(a.mesh.cells) cells over $(a.mesh.domain) on the " *
+                                "source and $(b.mesh.cells) cells over $(b.mesh.domain) on the target; a dof key " *
+                                "indexes into a mesh, so the same key names a function of a different size or at a " *
+                                "different position on the two sides and they are not comparable. Use " *
+                                "`L2Projection()` instead."))
+    end
+    return nothing
 end
