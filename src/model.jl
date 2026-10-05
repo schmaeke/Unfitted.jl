@@ -402,8 +402,8 @@ end
 function _level_function_counts(layout::SystemLayout)
     raw = Dict{Int,Int}()
     active = Dict{Int,Int}()
-    # Two fields over ONE space enumerate the same functions — `dof_layout` builds
-    # each field's raws from the space alone — so a second field over that space must
+    # Two fields over ONE space enumerate the same functions — they share that
+    # space's one dof topology (`_system_layout`) — so a second field over it must
     # not count them again. Fields over *different* spaces hold disjoint level-id
     # blocks (`_reindex_space_levels`), so a field's block is either wholly counted or
     # wholly new and the skip is exact rather than a heuristic. Without it a two-field
@@ -1028,6 +1028,13 @@ Fields over different spaces (multi-domain coupling) each build their
 layout from their own [`Space`](@ref); the disjoint offsets make the
 global enumeration a product space `V₁ × … × Vₙ`.
 
+Fields over one space (the same object) share that space's dof topology:
+its raw dofs, cell → raw tables, level ranges, artificial eliminations and
+pivots are built once, and every such field's [`DofLayout`](@ref) holds
+the same arrays (`===`). Each field still has its own physical-Dirichlet
+flags, active numbering and constrained values, so two fields over one
+space are numbered, constrained and updated independently.
+
 `classify_caches` maps a [`Space`](@ref) to the cell-classification cache
 already filled by that space's fictitious fold, so the constraint pass reuses
 those verdicts instead of re-classifying fold-boundary cells; the empty
@@ -1065,20 +1072,29 @@ system_layout(problem::Problem; kwargs...) = first(_system_layout(problem; kwarg
 # model `prepare` returns keeps none of them: `model.dirichlet_projections` is
 # filled by `update_dirichlet!` alone.
 #
-# Each field builds the topology of its own space, `_dof_topology`, and numbers
-# itself over it.
+# The topology (`_dof_topology`) is built once per distinct space — keyed by object
+# identity, as `problem_spaces` keys it — and every field over that space numbers
+# itself over the one result. A topology reads only the space and this call's
+# `tolerance`, `prune` and `prune_exempt`, so building it again for a second field
+# would repeat the whole cell walk, the coverage masks and every level's
+# eliminations to produce equal arrays. The fields share them instead: their
+# layouts hold the same space-block arrays (`===`), which `DofLayout` documents as
+# never mutated, and only detection, numbering and projection run per field.
 function _system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), prune::Bool=true,
                         prune_exempt=(), classify_caches=IdDict{Space,_ClassifyCache{D,T}}(),
                         facets::FacetResolver{D,T}=FacetResolver{D,T}(tolerance)) where {D,T}
     layouts = FieldLayout{D,T}[]
     by_name = Dict{Symbol,Int}()
     factors, unsupported = Symbol[], UnsupportedDirichletDof[]
+    topologies = IdDict{Space,_DofTopology{D,T}}()
     offset = 0
     for field in problem.fields
-        # Reuse the field's space fold cache when `prepare` / `move!` provide it,
-        # so the constraint pass never re-classifies fold-boundary cells.
-        cache = get(() -> _ClassifyCache{D,T}(), classify_caches, field.space)
-        t = _dof_topology(field.space; tolerance, prune, prune_exempt, classify_cache=cache)
+        t = get!(topologies, field.space) do
+            # Reuse the space's fold cache when `prepare` / `move!` provide it, so
+            # the constraint pass never re-classifies fold-boundary cells.
+            cache = get(() -> _ClassifyCache{D,T}(), classify_caches, field.space)
+            _dof_topology(field.space; tolerance, prune, prune_exempt, classify_cache=cache)
+        end
         components = component_count(field)
         dofs, projection = _field_dofs(t, field.space, _dirichlet_for_field(problem, field.name),
                                        components, facets)

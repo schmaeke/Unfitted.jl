@@ -39,10 +39,12 @@
 # A layout has two halves. The *space block* — the raw dofs, each level's
 # cell → raw tables and raw range, every raw's artificial elimination
 # source and the linear-constraint pivots — is a function of the space
-# alone. The *field block* — the per-component physical-Dirichlet flags,
-# the active numbering and the constrained values — depends on one field's
-# components and Dirichlet data. A layout is built in four steps, each
-# reading only what the steps before it produced:
+# alone, so it is built once per distinct space and every field over that
+# space holds the same arrays. The *field block* — the per-component
+# physical-Dirichlet flags, the active numbering and the constrained
+# values — depends on one field's components and Dirichlet data. A layout
+# is built in four steps, each reading only what the steps before it
+# produced:
 #
 #   1. Topology (`_dof_topology`, here): raw enumeration, then the
 #      artificial eliminations, recorded level by level in an
@@ -55,12 +57,13 @@
 #      (`_project_dirichlet_values!`, `dirichlet.jl`).
 #
 # `model.jl` composes the four, for one field (`dof_layout(V; …)`) and for
-# every field of a problem (`system_layout`), and reads the projection's
-# statistics into the diagnostics there. This file owns the dof keys, the
-# layout structs, the elimination ledger and the hooks' typed context,
-# steps 1 and 3, the accessors, and the integrated-Legendre family's dof
-# hooks (artificial boundary, covered-mode pruning, the hp minimum rule).
-# It calls nothing defined in a later file.
+# every field of a problem (`system_layout`, step 1 once per space), and
+# reads the projection's statistics into the diagnostics there. This file
+# owns the dof keys, the layout structs, the elimination ledger and the
+# hooks' typed context, steps 1 and 3, the accessors, and the
+# integrated-Legendre family's dof hooks (artificial boundary,
+# covered-mode pruning, the hp minimum rule). It calls nothing defined in
+# a later file.
 
 # ── Dof keys and layout struct ────────────────────────────────────────────────
 
@@ -117,9 +120,15 @@ The fields fall into two blocks. The **space block** is a function of the
 space alone, never of the field's components or Dirichlet data. It is what
 the first step of the build, the dof topology, produced: the layout holds
 the topology's arrays themselves, not copies, and nothing mutates them
-once they are built. The **field block** is the field's own. Build a layout
-with [`dof_layout`](@ref) for one field, or with `system_layout` for every
-field of a problem.
+once they are built. `system_layout` builds one topology per distinct
+space, so the layouts of all fields over one space hold the *same* arrays
+(`===`) — a write through one of them would change every other field over
+the space, which is why they are never written after the build, by the
+package or by a caller. The **field block** is the field's own, never
+shared: `physical_dirichlet`, `active_component` and `constrained_values`
+are separate arrays for every field, even two over one space. Build a
+layout with [`dof_layout`](@ref) for one field, or with `system_layout`
+for every field of a problem.
 
 The space block:
 
@@ -221,7 +230,8 @@ end
 # The product of the first build step, `_dof_topology`: exactly the space block of
 # `DofLayout`, as one value. Physical-Dirichlet detection and numbering both read it
 # before any layout exists, which is why it is a type of its own rather than a
-# half-built layout. It is transient — nothing stores it — and the numbering
+# half-built layout. It is transient — nothing keeps it past the build that made
+# it, which shares it between the fields over its space — and the numbering
 # constructor `DofLayout(topology, physical_dirichlet)` is the one place its arrays
 # are handed on, so a field added to the space block cannot reach some layouts and
 # miss others.
@@ -1046,7 +1056,8 @@ end
 # sources and pivot table become the topology's.
 #
 # A topology reads neither a field's components nor its Dirichlet data, so one is
-# the same for every field over the space. `V.physical` is passed to
+# the same for every field over the space, and `_system_layout` builds it once per
+# space and shares it between them. `V.physical` is passed to
 # `_record_eliminations!` as an argument rather than read there, which is the
 # function barrier that types the hooks' context (see `_LevelContext`).
 function _dof_topology(V::Space{D,T}; tolerance::GeometryTolerance{T}=GeometryTolerance(T),

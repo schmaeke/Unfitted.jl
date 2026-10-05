@@ -494,6 +494,73 @@ end
     end
 end
 
+@testset "fields over one space share its dof topology and nothing else" begin
+    # `system_layout` builds a space's dof topology once and hands the same arrays
+    # to every field over that space: the raw keys, the cell → raw tables, the level
+    # ranges, the elimination sources and the pivot table. What a field's components
+    # and Dirichlet data decide stays the field's own. u is scalar and constrained on
+    # every side; v has two components, constrained on the left side and, in its
+    # second component, on the top side, so the two fields' flags, numbering and
+    # values all differ. Sharing must change none of them: each field's layout is
+    # the one a standalone `dof_layout` builds for it, re-projecting u's data leaves
+    # v's values alone, and the per-level function counts read the shared raws once
+    # rather than once per field.
+    V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=10, order=3), box((0.3, 0.3), (0.7, 0.7));
+                cells=8, order=2)
+    u, v = field(:u, V), field(:v, V; components=2)
+    g(x) = sin(π * x[1]) * sin(π * x[2]) + exp(x[1]) * sin(x[2]) + 1.0
+    conditions(s) = [dirichlet(x -> s * g(x); on=boundary(:all), field=:u),
+                     dirichlet(x -> SVector(x[1], x[2]^2); on=boundary(axis=1, side=:lower),
+                               field=:v),
+                     dirichlet(0.0; on=boundary(axis=2, side=:upper), field=:v, component=2)]
+    model = prepare(Problem((u, v); blocks=(stiffness_block(u), stiffness_block(v)),
+                            loads=(source_load(u; source=1.0),), dirichlet=conditions(1.0)))
+    layout = Unfitted.dof_layout(model)
+    ud, vd = layout.fields[1].dofs, layout.fields[2].dofs
+
+    # One space block …
+    @test ud.cell_dofs_by_level === vd.cell_dofs_by_level
+    @test ud.raw_keys === vd.raw_keys
+    @test ud.level_raws === vd.level_raws
+    @test ud.elimination_source === vd.elimination_source
+    @test ud.pivots === vd.pivots
+    # … and two field blocks.
+    @test ud.physical_dirichlet !== vd.physical_dirichlet
+    @test ud.active_component !== vd.active_component
+    @test ud.constrained_values !== vd.constrained_values
+
+    # Each field is exactly the layout it would have on its own, over the prepared
+    # space, with only its own conditions.
+    for (fl, own) in
+        ((layout.fields[1], conditions(1.0)[1:1]), (layout.fields[2], conditions(1.0)[2:3]))
+        alone = Unfitted.dof_layout(model.problem.space; dirichlet=own, tolerance=fl.dofs.tolerance,
+                                    components=fl.components)
+        @test alone.raw_keys == fl.dofs.raw_keys
+        @test alone.cell_dofs_by_level == fl.dofs.cell_dofs_by_level
+        @test alone.elimination_source == fl.dofs.elimination_source
+        @test alone.physical_dirichlet == fl.dofs.physical_dirichlet
+        @test alone.active_component == fl.dofs.active_component
+        @test alone.constrained_values == fl.dofs.constrained_values
+    end
+
+    # New data for u alone: u's values follow it, v's stay bit for bit.
+    u_before, v_before = copy(ud.constrained_values), copy(vd.constrained_values)
+    update_dirichlet!(model, conditions(3.0))
+    @test Unfitted.dof_layout(model) === layout
+    @test ud.constrained_values != u_before
+    @test ud.constrained_values ≈ 3 .* u_before
+    @test vd.constrained_values == v_before
+
+    # The level reports count each level's raws once, not once per field, while the
+    # reduced-mode counts stay per field as documented: two equal blocks.
+    report = diagnostics(model, solution(model, zeros(active_unknowns(model))))
+    @test [level.raw_functions for level in report.levels] ==
+          [length(ud.level_raws[level.id]) for level in report.levels]
+    @test sum(level.raw_functions for level in report.levels) == length(ud.raw_keys)
+    reduced = diagnostics(model).reduced_mode_counts
+    @test length(reduced) == 4 && reduced[1:2] == reduced[3:4]
+end
+
 # Structural checks: anything beyond a value-only change must throw.
 @testset "update_dirichlet! rejects structural changes" begin
     V = space(box((0.0,), (1.0,)); cells=4, order=2)
