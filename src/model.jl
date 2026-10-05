@@ -505,33 +505,47 @@ function _set_plan_stats_multi!(diag::AssemblyDiagnostics, plans)
     return diag
 end
 
-# Fold the L² Dirichlet trace solve's own verdict into a diagnostics record in
-# place, and return it so call sites can chain — the counterpart of
-# `_set_plan_stats_multi!` for the boundary-trace half of the layout.
+# Append one field's L² Dirichlet trace-solve verdicts to `factors` and
+# `unsupported`, in component order: the branch each component's solve took
+# (`_trace_branch` of its factor) and an `UnsupportedDirichletDof` record for each
+# dof that solve left undetermined. `projection` is the one the field's data were
+# just projected through, or `nothing` for a field whose data are homogeneous —
+# `prepare` skips the projection for those, so every component reads `:none` and
+# nothing is unsupported.
 #
-# Read back off the dof layouts the projection filled rather than off the
-# `DirichletProjection`s themselves, because the projection is per field and
-# transient — `prepare` builds one inside `dof_layout` and discards it, while
-# `update_dirichlet!` caches it on the model — whereas the layout is what every
-# consumer of a prepared model already holds.
+# Read off the projection because that is where the verdicts live and nowhere
+# else: the dof layout keeps no copy of them, and `prepare` drops each projection
+# it builds as soon as this has read it, so the model it returns holds none.
+# `update_dirichlet!` reads the ones it caches the same way.
+function _append_trace_stats!(factors::Vector{Symbol}, unsupported::Vector{UnsupportedDirichletDof},
+                              name::Symbol, projection, components::Integer)
+    for c in 1:components
+        push!(factors, projection === nothing ? :none : _trace_branch(projection.factors[c]))
+        projection === nothing && continue
+        append!(unsupported,
+                (UnsupportedDirichletDof(name, c, raw) for raw in projection.unsupported[c]))
+    end
+    return factors, unsupported
+end
+
+# Install the trace-solve verdicts `_append_trace_stats!` collected, over every
+# field in field order, in a diagnostics record in place, and return it so call
+# sites can chain — the counterpart of `_set_plan_stats_multi!` for the
+# boundary-trace half of the build. The unsupported dofs are self-describing
+# records rather than a flattened vector: the list is empty on every untrimmed
+# boundary, so there is no position worth counting from.
 #
 # Both quantities describe the boundary mass and not the datum, so a load
 # increment restates the same answers; the two events that move them are a
 # rebuilt layout and a *first* projection, the latter being why
 # `update_dirichlet!` calls this too. A model prepared with homogeneous data has
-# run no projection at all, and its first nonzero increment is where the branch
-# and the unsupported dofs are established.
-function _set_dirichlet_trace_stats!(diag::AssemblyDiagnostics, layout::SystemLayout)
-    diag.dirichlet_trace_factors = Symbol[branch for field in layout.fields
-                                          for branch in field.dofs.dirichlet_trace_factors]
-    # Self-describing records rather than a flattened vector: the list is empty on
-    # every untrimmed boundary, so there is no position worth counting from.
-    records = UnsupportedDirichletDof[]
-    for field in layout.fields, (component, raws) in pairs(field.dofs.unsupported_dirichlet)
-        append!(records, (UnsupportedDirichletDof(field.name, component, raw) for raw in raws))
-    end
-    diag.unsupported_dirichlet_dofs = records
-    diag.unsupported_dirichlet_dof_count = length(records)
+# run no projection at all, and its first increment is where the branch and the
+# unsupported dofs are established.
+function _set_dirichlet_trace_stats!(diag::AssemblyDiagnostics, factors::Vector{Symbol},
+                                     unsupported::Vector{UnsupportedDirichletDof})
+    diag.dirichlet_trace_factors = factors
+    diag.unsupported_dirichlet_dofs = unsupported
+    diag.unsupported_dirichlet_dof_count = length(unsupported)
     return diag
 end
 
@@ -913,10 +927,98 @@ function _prepare_spaces(problem::Problem{D,T}) where {D,T}
     return effective, prepared, caches
 end
 
+# One field over an already built topology: steps 2 to 4 of the layout (see
+# `dofs.jl`). Detection, then numbering, then — for nonzero data only — the
+# projection, which is returned beside the layout so the caller can read its
+# trace-solve verdicts (`_append_trace_stats!`) and then let it go. Homogeneous
+# data return `nothing` in its place: their constrained values are the zeros the
+# numbering already wrote, so no boundary is walked and no mass factorised.
+function _field_dofs(t::_DofTopology{D,T}, V::Space{D,T}, conditions, components::Integer,
+                     facets::FacetResolver{D,T}) where {D,T}
+    dofs = DofLayout(t, _physical_dirichlet(t, V, conditions, components))
+    _needs_dirichlet_projection(conditions) || return dofs, nothing
+    return dofs, _project_dirichlet_values!(dofs, V, facets, conditions)
+end
+
+"""
+    dof_layout(V::Space; dirichlet=[], tolerance=GeometryTolerance(T), components=1,
+               prune=true, prune_exempt=(), classify_cache=_ClassifyCache{D,T}()) -> DofLayout
+
+Construct the basis-aware dof layout of one field over a superposition
+[`Space`](@ref). The construction proceeds in four steps:
+
+  1. **Topology.** Walk every level's cells in order and build each active
+     cell's raw dof id vector through `TensorDofKey` lookup: adjacent cells
+     share endpoint nodes, bubble (span) modes are cell-local, inactive cells
+     get an empty vector, and each level's raws come out as one contiguous
+     range (`level_raws`). Then record the artificial eliminations in an
+     [`EliminationLedger`](@ref), one level at a time: the family-dispatched
+     [`_overlay_constraints!`](@ref), then, under leaf semantics,
+     [`_coverage_constraints!`](@ref) against the masks
+     [`build_coverage`](@ref) computes, then the family's `_resolve_rows!` on
+     any linear-constraint rows the two recorded. A raw is credited to the
+     first source that eliminates it, so a raw the artificial boundary
+     eliminates keeps `:overlay` when covered-mode pruning names it too. The
+     ledger's sources become `elimination_source` and its pivot table
+     `pivots`, once every pivot is checked to be expressed over raws that
+     stay free. This step reads the space alone.
+  2. **Physical-Dirichlet detection**, per component: one pass per level
+     over the level's raws, matching the physical faces each raw's function
+     lies on against every condition's facets as face bitmasks.
+  3. **Numbering**: active ids component-major (component 1 first, then
+     component 2, …), skipping every (raw, component) entry that is either
+     physically Dirichlet-constrained or artificially eliminated.
+  4. **Projection** of nonzero Dirichlet data onto the boundary trace space,
+     into `constrained_values` (see [`DirichletProjection`](@ref)). Skipped
+     for homogeneous data, whose constrained values are zero already.
+
+Keyword arguments:
+
+  - `dirichlet` — iterable of [`DirichletCondition`](@ref)s.
+  - `tolerance` — `GeometryTolerance` used by boundary detection, and the
+    tolerance of the private `FacetResolver` the projection resolves faces
+    through. A [`Model`](@ref) shares one resolver between its projections and
+    its assembly path instead, through [`prepare`](@ref).
+  - `components` — scalar channels per field (≥ 1).
+  - `prune` — leaf semantics, on by default. `false` retains every covered
+    mode and is the unreduced twin the reduction is measured against; see
+    [`prepare`](@ref), which is where a caller reaches it.
+  - `prune_exempt` — level ids this pass leaves unpruned while every other level is
+    pruned normally. It exists for [`estimate`](@ref)'s enriched twin, where a
+    co-located same-degree cover would deduplicate exactly the keys the solution is
+    about to be injected onto; turning leaf semantics off *globally* there instead was
+    measured to inflate the indicator on a covered cell of an unrelated level by 4.1×,
+    because that level's order-elevated covered modes then survive and land in the
+    complement. Empty by default, and a no-op when `prune = false`.
+  - `classify_cache` — the space's cell-classification cache (shared with the
+    `PhysicalDomain` fold). The fictitious-fold constraint predicate and the
+    coverage rule both reuse it instead of re-classifying fold-boundary cells;
+    defaults to a fresh empty cache for standalone calls.
+
+The integrated Legendre family eliminates strongly and records no rows, so
+its layout has no pivot and assembly sees only active and constrained dofs,
+and so does the B-spline family at maximal continuity. Below maximal
+continuity a B-spline level records multi-raw rows encoding the C^m
+trace-vanishing condition on artificial boundaries; assembly gives each
+pivot they resolve to a local row and column of its own and condenses them
+onto the pivot's expansion once per integration region.
+
+The projection's own verdicts — which branch each component's trace solve
+took, and which dofs it left undetermined — are not kept: they reach a user
+through [`diagnostics`](@ref) on a prepared model.
+"""
+function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
+                    components::Integer=1, prune::Bool=true, prune_exempt=(),
+                    classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
+    components > 0 || throw(ArgumentError("dof layout components must be positive"))
+    t = _dof_topology(V; tolerance, prune, prune_exempt, classify_cache)
+    return first(_field_dofs(t, V, dirichlet, components, FacetResolver{D,T}(tolerance)))
+end
+
 """
     system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), prune=true,
-                  classify_caches=IdDict{Space,_ClassifyCache{D,T}}(),
-                  facets=nothing) -> SystemLayout
+                  prune_exempt=(), classify_caches=IdDict{Space,_ClassifyCache{D,T}}(),
+                  facets=FacetResolver{D,T}(tolerance)) -> SystemLayout
 
 Build the per-field [`DofLayout`](@ref)s for every field of `problem`
 and assemble them into a [`SystemLayout`](@ref). Each field's active
@@ -931,44 +1033,65 @@ already filled by that space's fictitious fold, so the constraint pass reuses
 those verdicts instead of re-classifying fold-boundary cells; the empty
 default just classifies on demand.
 
-`prune` is leaf semantics, forwarded to [`dof_layout`](@ref) for every field
-alike — it describes the discretisation, not one field of it. [`prepare`](@ref)
-is where a caller sets it. `prune_exempt` is the per-level escape hatch the same
-call forwards; see [`dof_layout`](@ref).
+`prune` is leaf semantics, applied to every field alike — it describes the
+discretisation, not one field of it. [`prepare`](@ref) is where a caller sets
+it. `prune_exempt` is the per-level escape hatch; see [`dof_layout`](@ref) for
+both.
 
-`facets` is the model's `FacetResolver`, forwarded likewise, so each field's
-Dirichlet projection resolves its boundary faces through the same memo the
-assembly path and [`boundary_integral`](@ref) use. Every field of every
-subdomain shares one resolver: the memo is keyed by `(space, face)`, so fields
-over different spaces cannot collide. `nothing` gives each field's layout a
-private resolver, which is what a standalone call with no model behind it wants.
+`facets` is the `FacetResolver` every field's Dirichlet projection resolves
+its boundary faces through, so all of them share one memo: it is keyed by
+`(space, face)`, so fields over different spaces cannot collide, and fields
+over one space resolve each face once between them. [`prepare`](@ref) hands
+in the model's own resolver, which is what makes the projection read the very
+faces the assembly path and [`boundary_integral`](@ref) read. The default is a
+fresh resolver at `tolerance`, which is what a standalone call with no model
+behind it wants; a resolver handed in must carry `tolerance` too.
+
+The trace solves' verdicts are not part of the result — `prepare` reads them
+into [`diagnostics`](@ref) from the projections as they are built, and then
+drops the projections.
 
 Called by [`prepare`](@ref) and the in-place mutators. End users do
 not usually call this directly.
 """
-function system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), prune::Bool=true,
-                       prune_exempt=(), classify_caches=IdDict{Space,_ClassifyCache{D,T}}(),
-                       facets=nothing) where {D,T}
+system_layout(problem::Problem; kwargs...) = first(_system_layout(problem; kwargs...))
+
+# `system_layout`, plus the Dirichlet trace-solve verdicts of the projections it
+# built: `(layout, factors, unsupported)`, with `factors` per field per component and
+# `unsupported` per field, component and raw, in that order — which is what
+# `diagnostics` reports and what `_set_dirichlet_trace_stats!` installs. Each
+# projection is read (`_append_trace_stats!`) as soon as its field is laid out and
+# then dropped, so the layout is built with at most one projection alive, and the
+# model `prepare` returns keeps none of them: `model.dirichlet_projections` is
+# filled by `update_dirichlet!` alone.
+#
+# Each field builds the topology of its own space, `_dof_topology`, and numbers
+# itself over it.
+function _system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), prune::Bool=true,
+                        prune_exempt=(), classify_caches=IdDict{Space,_ClassifyCache{D,T}}(),
+                        facets::FacetResolver{D,T}=FacetResolver{D,T}(tolerance)) where {D,T}
     layouts = FieldLayout{D,T}[]
     by_name = Dict{Symbol,Int}()
+    factors, unsupported = Symbol[], UnsupportedDirichletDof[]
     offset = 0
     for field in problem.fields
         # Reuse the field's space fold cache when `prepare` / `move!` provide it,
         # so the constraint pass never re-classifies fold-boundary cells.
         cache = get(() -> _ClassifyCache{D,T}(), classify_caches, field.space)
-        layout = dof_layout(field.space; dirichlet=_dirichlet_for_field(problem, field.name),
-                            tolerance, components=component_count(field), prune, prune_exempt,
-                            classify_cache=cache, facets)
+        t = _dof_topology(field.space; tolerance, prune, prune_exempt, classify_cache=cache)
+        components = component_count(field)
+        dofs, projection = _field_dofs(t, field.space, _dirichlet_for_field(problem, field.name),
+                                       components, facets)
+        _append_trace_stats!(factors, unsupported, field.name, projection, components)
         # The field's (reindexed, contiguous) level-id block — how assembly
         # routes each region to its owning subdomain field without a `served` mask.
         level_ids = extrema(l.id for l in field.space.levels)
         push!(layouts,
-              FieldLayout{D,T}(field.name, component_count(field), layout, offset,
-                               level_ids[1]:level_ids[2]))
+              FieldLayout{D,T}(field.name, components, dofs, offset, level_ids[1]:level_ids[2]))
         by_name[field.name] = length(layouts)
-        offset += active_unknowns(layout)
+        offset += active_unknowns(dofs)
     end
-    return SystemLayout{D,T}(layouts, by_name, offset, tolerance)
+    return SystemLayout{D,T}(layouts, by_name, offset, tolerance), factors, unsupported
 end
 
 # Map each prepared subdomain space to its fold classification cache, for
@@ -1211,9 +1334,15 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
     # the first consumer, and handing it the model's resolver is what makes the
     # projection and the operator integrate the same facet by construction rather
     # than by two call sites agreeing.
+    #
+    # The projections themselves are not kept (`_system_layout`): their trace-solve
+    # verdicts come back beside the layout and go into the diagnostics below, and
+    # `dirichlet_projections` starts empty, for `update_dirichlet!` to fill.
     facet_resolver = FacetResolver{D,T}(tolerance)
-    layout = system_layout(effective_problem; tolerance, prune, prune_exempt,
-                           classify_caches=_caches_by_space(spaces, caches), facets=facet_resolver)
+    classify_caches = _caches_by_space(spaces, caches)
+    layout, trace_factors, unsupported = _system_layout(effective_problem; tolerance, prune,
+                                                        prune_exempt, classify_caches,
+                                                        facets=facet_resolver)
     facet_regions = _resolve_facet_regions(effective_problem, facet_resolver)
     surface_regions = _resolve_surface_regions(effective_problem, tolerance)
     interface_regions = _resolve_interface_regions(effective_problem, layout)
@@ -1230,7 +1359,7 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                                surface_region_count=_region_count(surface_regions),
                                interface_region_count=_region_count(interface_regions))
     _set_plan_stats_multi!(diag, space_plans)
-    _set_dirichlet_trace_stats!(diag, layout)
+    _set_dirichlet_trace_stats!(diag, trace_factors, unsupported)
     return Model{D,T,typeof(effective_problem)}(effective_problem, problem.space,
                                                 _discretisation_pin(spaces, layout), space_plans,
                                                 fit_caches, layout, nothing, nothing,
@@ -2037,21 +2166,25 @@ function update_dirichlet!(model::Model{D,T}, dirichlet) where {D,T}
     # `DirichletProjection` depends on, so the cached one — if this is not the
     # first update on the field — is handed straight back in and only the
     # right-hand side is rebuilt.
+    #
+    # Each projection's trace-solve verdicts are read off it as it comes back, in
+    # field then component order, exactly as `prepare` reads the ones it builds.
+    trace_factors, unsupported = Symbol[], UnsupportedDirichletDof[]
     for field_layout in model.dofs.fields
-        field_dirichlet = _dirichlet_for_field(model.problem, field_layout.name)
-        field_space = _field_space(model.problem, field_layout.name)
-        cached = get(model.dirichlet_projections, field_layout.name, nothing)
-        model.dirichlet_projections[field_layout.name] = _project_dirichlet_values!(field_layout.dofs,
-                                                                                    field_space,
-                                                                                    model.facet_resolver,
-                                                                                    field_dirichlet,
-                                                                                    cached)
+        name = field_layout.name
+        cached = get(model.dirichlet_projections, name, nothing)
+        projection = _project_dirichlet_values!(field_layout.dofs,
+                                                _field_space(model.problem, name),
+                                                model.facet_resolver,
+                                                _dirichlet_for_field(model.problem, name), cached)
+        model.dirichlet_projections[name] = projection
+        _append_trace_stats!(trace_factors, unsupported, name, projection, field_layout.components)
     end
     # A model prepared with homogeneous data has run no trace solve, so this is
-    # where a first nonzero increment establishes its branch and its unsupported
-    # dofs. Later increments restate the same two answers: both describe the
-    # boundary mass, which the structural check above pins.
-    _set_dirichlet_trace_stats!(model.diagnostics, model.dofs)
+    # where its first increment establishes the branch and the unsupported dofs.
+    # Later increments restate the same two answers: both describe the boundary
+    # mass, which the structural check above pins.
+    _set_dirichlet_trace_stats!(model.diagnostics, trace_factors, unsupported)
 
     # Clear cached operators. The RHS depends on the constrained values
     # via column elimination, so the next assembly must rebuild it. The

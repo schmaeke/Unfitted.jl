@@ -7,11 +7,12 @@
 # basis traces), and the L² boundary projection that turns nonzero
 # Dirichlet data into the `constrained_values` stored on the layout.
 #
-# Loads after `dofs.jl` so the dof keys and `DofLayout` it operates on
-# already exist. The `dof_layout` constructor in `dofs.jl` forward-
-# references `_physical_dirichlet` and `_project_dirichlet_values!`
-# defined here — they are resolved at call time (when the user runs
-# `prepare(problem)`), by which point every source file is loaded.
+# The detection and the projection are steps 2 and 4 of a dof layout's
+# build (see `dofs.jl`): detection reads the dof topology of step 1, and
+# the projection fills the layout that step 3's numbering produced.
+# `model.jl` runs the four steps in order, so this file loads after
+# `dofs.jl`, whose dof keys, topology and `DofLayout` it operates on, and
+# before `model.jl`, which calls it.
 
 # ── Dirichlet condition spec ──────────────────────────────────────────────────
 
@@ -170,11 +171,11 @@ _face_mask(facet) = mapreduce(((axis, side),) -> _face_bit(axis, side), |, facet
 # every raw × component × condition, allocating an `:except` selector's kept faces
 # on every call.
 #
-# `t` is anything carrying `raw_keys`, `level_raws` and `tolerance` — the layout
-# build's own arrays in a named tuple, or a finished `DofLayout` — so the pass runs
-# before the layout it feeds exists. Two bits per axis in a `UInt64` hold up to
-# `D = 32`; beyond that a face's bit would shift out of the word and the face drop
-# out of its mask unnoticed, so it refuses instead.
+# `t` is anything carrying `raw_keys`, `level_raws` and `tolerance` — the build's
+# `_DofTopology`, or a finished `DofLayout` — so the pass runs before the layout it
+# feeds exists. Two bits per axis in a `UInt64` hold up to `D = 32`; beyond that a
+# face's bit would shift out of the word and the face drop out of its mask
+# unnoticed, so it refuses instead.
 function _physical_dirichlet(t, V::Space{D,T}, conditions, components::Integer) where {D,T}
     marks = zeros(Bool, length(t.raw_keys), components)
     isempty(conditions) && return marks
@@ -1111,7 +1112,7 @@ end
 # and when it is invalidated.
 #
 # The `_test_value_contribution` and `_as_test_channels` helpers are
-# defined in `assembly.jl`'s channel layer and reused here so the
+# defined in `problems.jl`'s channel layer and reused here so the
 # Dirichlet projection rides the same channel calculus the volume
 # assembly uses; the forward reference resolves at call time
 # (`prepare(problem)` loads every source file first).
@@ -1205,6 +1206,12 @@ dofs it assigned it to. Fields:
   - `raw::Int` — the dof's raw index, i.e. its position in that field's
     [`DofLayout`](@ref) `raw_keys`, which is where its level and its per-axis
     modes are read back from.
+
+The records are built from the projection itself, out of its per-component
+`unsupported` lists (see [`DirichletProjection`](@ref)), by `prepare` for the
+projections it builds and by [`update_dirichlet!`](@ref) for the ones it
+caches. The dof layout keeps no copy, so they are read through
+[`diagnostics`](@ref).
 """
 struct UnsupportedDirichletDof
     field::Symbol
@@ -1303,9 +1310,11 @@ end
 # where a condition actually constrains that component — remove both. For
 # all-component (vector) conditions this reduces to the previous behaviour.
 #
-# `facets` is the model's [`FacetResolver`](@ref): the boundary walk below reads
-# the *same* resolved faces the assembly path and `boundary_integral` read, so
-# the operator and the projected datum can never integrate different facets.
+# `facets` is the [`FacetResolver`](@ref) the caller projects through. Under a
+# model it is the model's, so the boundary walk below reads the *same* resolved
+# faces the assembly path and `boundary_integral` read, and the operator and the
+# projected datum can never integrate different facets; a standalone `dof_layout`
+# hands in a private one at the layout's tolerance.
 function _dirichlet_projection(layout::DofLayout{D,T}, V::Space{D,T}, facets::FacetResolver{D,T},
                                dirichlet) where {D,T}
     ncomp = layout.components
@@ -1490,20 +1499,14 @@ function _accumulate_dirichlet_rhs!(rhs::Vector{Vector{T}}, samples::FacetTraceS
     return rhs
 end
 
-# The [`FacetResolver`](@ref) a Dirichlet projection resolves its faces through:
-# the caller's when it supplied one, a private throw-away keyed on the layout's
-# own tolerance otherwise (the standalone `dof_layout(V; dirichlet)` call, which
-# has no model to share with).
-#
-# A tolerance mismatch is a caller bug and is raised as one. A memo's entries
-# were merged against *its* tolerance, so reading them with a layout built at
-# another one would project the datum over a different partition of ∂Ω than the
-# one the layout's constrained dofs were detected on. Quietly substituting a
-# fresh resolver instead would hide that behind a second resolution of every
-# face — exactly the cost sharing the resolver exists to remove.
-function _dirichlet_resolver(layout::DofLayout{D,T},
-                             facets::Union{Nothing,FacetResolver{D,T}}) where {D,T}
-    facets === nothing && return FacetResolver{D,T}(layout.tolerance)
+# Check that `facets` may resolve the faces `layout`'s Dirichlet data are projected
+# over, and return it. A tolerance mismatch is a caller bug and is raised as one. A
+# memo's entries were merged against *its* tolerance, so reading them with a layout
+# built at another one would project the datum over a different partition of ∂Ω
+# than the one the layout's constrained dofs were detected on. Quietly substituting
+# a fresh resolver instead would hide that behind a second resolution of every face
+# — exactly the cost sharing the resolver exists to remove.
+function _dirichlet_resolver(layout::DofLayout{D,T}, facets::FacetResolver{D,T}) where {D,T}
     facets.tolerance == layout.tolerance ||
         throw(ArgumentError("facet resolver tolerance $(facets.tolerance) does not match the dof " *
                             "layout's $(layout.tolerance); a layout and the resolver it projects " *
@@ -1512,16 +1515,19 @@ function _dirichlet_resolver(layout::DofLayout{D,T},
 end
 
 # Refill `layout.constrained_values` from `dirichlet`, returning the
-# [`DirichletProjection`](@ref) used so a caller that re-projects the same
-# layout can hand it back and skip the boundary walk. `projection` is reused
+# [`DirichletProjection`](@ref) used. The caller reads the trace solve's verdicts —
+# `_trace_branch` of each factor and the `unsupported` dofs — off the returned
+# projection, which is the only place they live, and a caller that re-projects the
+# same layout can hand it back and skip the boundary walk. `projection` is reused
 # when given; the facet-count check is a cheap guard for a caller that reaches
 # past `update_dirichlet!`'s structural check, which is what actually
 # establishes that a cached projection still matches the condition list.
 #
-# `facets` is the resolver the boundary walk resolves faces through, or `nothing`
-# to resolve through a private one; see `_dirichlet_resolver`.
+# `facets` is the resolver the boundary walk resolves faces through: the model's
+# under `prepare` and `update_dirichlet!`, a private one for a standalone
+# `dof_layout`. See `_dirichlet_resolver` for the tolerance it must share.
 function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T},
-                                    facets::Union{Nothing,FacetResolver{D,T}}, dirichlet,
+                                    facets::FacetResolver{D,T}, dirichlet,
                                     projection::Union{Nothing,DirichletProjection{D,T}}=nothing) where {D,
                                                                                                         T}
     ncomp = layout.components
@@ -1535,15 +1541,6 @@ function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T},
     # resolver's tolerance above all — has happened, so a rejected call leaves the
     # layout exactly as it found it instead of zeroed and unprojected.
     fill!(layout.constrained_values, zero(T))
-    # Mirror the solve's datum-independent verdict onto the layout. The layout is
-    # the half of the two that `prepare` keeps — it discards the projection it has
-    # just built — so `diagnostics` reads both quantities from here. Restated on
-    # every call rather than only on the one that built the plan, so a
-    # re-projection through a cached plan cannot leave a stale pair behind.
-    for c in 1:ncomp
-        layout.dirichlet_trace_factors[c] = _trace_branch(plan.factors[c])
-        copy!(layout.unsupported_dirichlet[c], plan.unsupported[c])
-    end
     all(isempty, plan.unknowns) && return plan
 
     rhs = [zeros(T, length(plan.unknowns[c])) for c in 1:ncomp]
@@ -1575,13 +1572,6 @@ function _needs_dirichlet_projection(dirichlet)
     return any(condition -> !(condition.value isa Number && iszero(condition.value)), dirichlet)
 end
 
-# True iff `a` and `b` pick out the same physical facet. Named alias for the
-# value `==` defined next to `BoundarySelector` above, kept because it reads as
-# a predicate at the call sites that ask the question in those words (e.g.
-# `update_dirichlet!`'s structural check, whose function lives in
-# `src/model.jl`).
-_selectors_equal(a::BoundarySelector, b::BoundarySelector) = a == b
-
 # Cheap structural compatibility check. Re-projecting Dirichlet values
 # in place is only valid when the *set* of constrained dofs is
 # unchanged; that set depends on the boundary selector, field, and
@@ -1592,7 +1582,7 @@ function _check_dirichlet_update_compatibility(old, new)
                                                       "conditions (the count the model was prepared " *
                                                       "with), got $(length(new))"))
     for (i, (o, n)) in enumerate(zip(old, new))
-        _selectors_equal(o.boundary, n.boundary) ||
+        o.boundary == n.boundary ||
             throw(ArgumentError("update_dirichlet! condition $i: boundary selector changed; " *
                                 "rebuild the model with prepare(problem) instead"))
         o.field === n.field || throw(ArgumentError("update_dirichlet! condition $i: field name " *

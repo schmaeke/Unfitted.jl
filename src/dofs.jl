@@ -36,21 +36,31 @@
 # matches the natural block ordering, and per-component constraints
 # simply leave holes in the enumeration.
 #
-# This file owns the dof keys, the layout structs, the elimination ledger
-# every artificial elimination is recorded in (`EliminationLedger`), the
-# structural overlay-constraint detection, the pruning constraint source
-# (`_coverage_constraints!`, over the masks `coverage.jl` computes), and
-# the active-enumeration constructor.
-# The physical-Dirichlet spec types, per-level Dirichlet detection, and
-# the L² boundary projection live in `dirichlet.jl`. `dof_layout`
-# forward-references `_physical_dirichlet` and
-# `_project_dirichlet_values!`; the references resolve at call time
-# (when `prepare(problem)` runs, after every source file is loaded).
-# Its `facets` keyword is left unannotated for the same reason: a
-# `FacetResolver{D,T}` annotation is evaluated where the method is
-# *defined*, which is before `dirichlet.jl` has introduced that type, so
-# the typing is done by `_project_dirichlet_values!` at the end of the
-# forward chain instead.
+# A layout has two halves. The *space block* — the raw dofs, each level's
+# cell → raw tables and raw range, every raw's artificial elimination
+# source and the linear-constraint pivots — is a function of the space
+# alone. The *field block* — the per-component physical-Dirichlet flags,
+# the active numbering and the constrained values — depends on one field's
+# components and Dirichlet data. A layout is built in four steps, each
+# reading only what the steps before it produced:
+#
+#   1. Topology (`_dof_topology`, here): raw enumeration, then the
+#      artificial eliminations, recorded level by level in an
+#      `EliminationLedger` through the basis family's hooks. Its product,
+#      a `_DofTopology`, is exactly the space block.
+#   2. Physical-Dirichlet detection (`_physical_dirichlet`, `dirichlet.jl`).
+#   3. Numbering (the `DofLayout(topology, physical_dirichlet)` constructor,
+#      here).
+#   4. Projection of nonzero Dirichlet data onto the boundary trace space
+#      (`_project_dirichlet_values!`, `dirichlet.jl`).
+#
+# `model.jl` composes the four, for one field (`dof_layout(V; …)`) and for
+# every field of a problem (`system_layout`), and reads the projection's
+# statistics into the diagnostics there. This file owns the dof keys, the
+# layout structs, the elimination ledger and the hooks' typed context,
+# steps 1 and 3, the accessors, and the integrated-Legendre family's dof
+# hooks (artificial boundary, covered-mode pruning, the hp minimum rule).
+# It calls nothing defined in a later file.
 
 # ── Dof keys and layout struct ────────────────────────────────────────────────
 
@@ -103,12 +113,16 @@ across every level and every active cell), then constraints are detected
 and the active enumeration assigns positive ids to the unconstrained
 dofs only.
 
-Fields:
+The fields fall into two blocks. The **space block** is a function of the
+space alone, never of the field's components or Dirichlet data. It is what
+the first step of the build, the dof topology, produced: the layout holds
+the topology's arrays themselves, not copies, and nothing mutates them
+once they are built. The **field block** is the field's own. Build a layout
+with [`dof_layout`](@ref) for one field, or with `system_layout` for every
+field of a problem.
 
-  - `components::Int` — number of scalar channels the field carries
-    (1 for scalar fields, > 1 for vector fields). Constraints are
-    tracked per-component so vector boundary conditions can pin
-    individual channels.
+The space block:
+
   - `cell_dofs_by_level::Vector{Array{Vector{Int},D}}` — indexed by
     level *id*, not by position in `V.levels`, so that it matches the
     `parent.level` id assembly carries; a subdomain whose ids were
@@ -129,12 +143,6 @@ Fields:
     constraint hooks, physical-Dirichlet detection, the per-level
     diagnostics — reads its level's raws off this range instead of
     scanning, bucketing or looking up the level of every raw.
-  - `active_component::Matrix{Int}` — `(raw, component) → active id`.
-    Entry is `0` when component `component` of raw dof `raw` is
-    constrained.
-  - `physical_dirichlet::Matrix{Bool}` — `(raw, component) → true` iff
-    component `component` of raw dof `raw` has a physical Dirichlet
-    constraint.
   - `elimination_source::Vector{Symbol}` — `raw → :free / :overlay /
     :coverage / :dedup`. `:free` iff the raw survives; otherwise the source
     that eliminated it: the artificial overlay boundary (`:overlay`) or, from
@@ -151,7 +159,7 @@ Fields:
     through *other* raws, `u_raw = Σᵢ wᵢ u_{rᵢ}`, and `pivots[raw]` is that
     expansion `[(r₁, w₁), …]` in resolution order. It has depth one: every
     `rᵢ` is free with respect to the artificial constraints, so a reader
-    never chases a chain, and `dof_layout` checks this once per build. Like
+    never chases a chain, and the topology build checks this once. Like
     `elimination_source`, it comes from the ledger. The table is empty when
     the layout has no pivot, which
     is every integrated-Legendre and every maximal-continuity B-spline
@@ -167,41 +175,62 @@ Fields:
     same expansion. Both read it through `_fold_pivot`, which returns at
     once on an empty table, so a layout without pivots never reads an
     entry. [`has_linear_constraints`](@ref) is `!isempty(pivots)`.
+  - `tolerance::GeometryTolerance{T}` — the tolerance the topology was
+    built at and boundary detection ran at. A `FacetResolver` the layout's
+    Dirichlet data are projected through must carry the same one.
+
+The field block:
+
+  - `components::Int` — number of scalar channels the field carries
+    (1 for scalar fields, > 1 for vector fields). Constraints are
+    tracked per-component so vector boundary conditions can pin
+    individual channels.
+  - `physical_dirichlet::Matrix{Bool}` — `(raw, component) → true` iff
+    component `component` of raw dof `raw` has a physical Dirichlet
+    constraint.
+  - `active_component::Matrix{Int}` — `(raw, component) → active id`.
+    Entry is `0` when component `component` of raw dof `raw` is
+    constrained, physically or artificially.
+  - `active_count::Int` — total number of active (i.e. enumerated) dofs.
   - `constrained_values::Matrix{T}` — `(raw, component) → value` for
     constrained dofs. Filled by [`_project_dirichlet_values!`](@ref)
-    for nonzero physical Dirichlet data; zero otherwise.
-  - `dirichlet_trace_factors::Vector{Symbol}` — per component, which branch the
-    L² Dirichlet trace solve took: `:cholesky`, `:pseudoinverse` where the
-    boundary mass came out indefinite, or `:none` where the component had no
-    constrained dof to solve for.
-  - `unsupported_dirichlet::Vector{Vector{Int}}` — per component, the raw dofs
-    that solve left undetermined: constrained with no measure anywhere on their
-    facet support, hence pinned to their minimum-norm value instead of fitted.
-    See [`UnsupportedDirichletDof`](@ref). Empty on every untrimmed boundary.
+    for nonzero physical Dirichlet data; zero otherwise. The one array of
+    a layout that is rewritten after it is built: [`update_dirichlet!`](@ref)
+    re-projects into it in place.
 
-    The last two are filled by the same call that fills `constrained_values` and
-    both describe the *mesh* rather than the datum, so a load increment restates
-    them unchanged. Both read `:none` / empty until a projection has run at all,
-    homogeneous data skipping it entirely.
-  - `active_count::Int` — total number of active (i.e. enumerated) dofs.
-  - `tolerance::GeometryTolerance{T}` — tolerance used during boundary
-    detection.
-
-Use [`dof_layout`](@ref) to construct.
+What the L² Dirichlet trace solve concluded — which branch each component's
+solve took, and which dofs it left undetermined — is not part of the
+layout. Both describe the projection rather than the numbering, so
+[`diagnostics`](@ref) reports them (`dirichlet_trace_factors`,
+`unsupported_dirichlet_dofs`) from the projection that produced them.
 """
 struct DofLayout{D,T<:Real}
-    components::Int
     cell_dofs_by_level::Vector{Array{Vector{Int},D}}
     raw_keys::Vector{TensorDofKey{D}}
     level_raws::Vector{UnitRange{Int}}
-    active_component::Matrix{Int}
-    physical_dirichlet::Matrix{Bool}
     elimination_source::Vector{Symbol}
     pivots::Vector{Vector{Tuple{Int,T}}}
-    constrained_values::Matrix{T}
-    dirichlet_trace_factors::Vector{Symbol}
-    unsupported_dirichlet::Vector{Vector{Int}}
+    tolerance::GeometryTolerance{T}
+    components::Int
+    physical_dirichlet::Matrix{Bool}
+    active_component::Matrix{Int}
     active_count::Int
+    constrained_values::Matrix{T}
+end
+
+# The product of the first build step, `_dof_topology`: exactly the space block of
+# `DofLayout`, as one value. Physical-Dirichlet detection and numbering both read it
+# before any layout exists, which is why it is a type of its own rather than a
+# half-built layout. It is transient — nothing stores it — and the numbering
+# constructor `DofLayout(topology, physical_dirichlet)` is the one place its arrays
+# are handed on, so a field added to the space block cannot reach some layouts and
+# miss others.
+struct _DofTopology{D,T<:Real}
+    cell_dofs_by_level::Vector{Array{Vector{Int},D}}
+    raw_keys::Vector{TensorDofKey{D}}
+    level_raws::Vector{UnitRange{Int}}
+    elimination_source::Vector{Symbol}
+    pivots::Vector{Vector{Tuple{Int,T}}}
     tolerance::GeometryTolerance{T}
 end
 
@@ -522,9 +551,10 @@ end
 The record a basis family's dof-layer hooks write a space's artificial
 eliminations into: per raw dof, whether it is eliminated and by which source; the
 current level's pending linear-constraint rows; and the pivot table the resolved
-rows produce. [`dof_layout`](@ref) builds one per call, sized to the raw count,
-runs every level's hooks into it, and keeps its `source` and `pivots` as the
-layout's `elimination_source` and `pivots`.
+rows produce. The topology build (`_dof_topology`) makes one, sized to its
+space's raw count, runs every level's hooks into it, and keeps its `source` and
+`pivots` as the topology's, hence the layout's, `elimination_source` and
+`pivots`.
 
 Fields:
 
@@ -1006,124 +1036,55 @@ function _active_component_dof(layout::DofLayout, raw::Integer, component::Integ
     layout.active_component[raw, component]
 end
 
-"""
-    dof_layout(V::Space; dirichlet=[], tolerance=GeometryTolerance(T), components=1,
-                         prune=true, classify_cache=_ClassifyCache{D,T}(),
-                         facets=nothing) -> DofLayout
-
-Construct the basis-aware global dof layout for a superposition
-[`Space`](@ref). The construction proceeds in four stages:
-
-  1. Walk every level's cells in order and build the cell-local raw dof
-     id vector through `TensorDofKey` lookup. Adjacent cells share
-     endpoint nodes; bubble (span) modes are cell-local. Inactive cells
-     get an empty vector. Each level's raws come out as one contiguous
-     range, recorded in `level_raws`, and the constraint hooks of stage 2
-     visit a level's raws in that (raw) order.
-  2. Record the artificial eliminations in an [`EliminationLedger`](@ref),
-     one level at a time: the family-dispatched
-     [`_overlay_constraints!`](@ref) hook, then, under leaf semantics,
-     [`_coverage_constraints!`](@ref) (which needs the per-level masks
-     [`build_coverage`](@ref) computes, so those are built first, and
-     skipped entirely when `prune = false`), then `_resolve_rows!` on any
-     linear-constraint rows the two recorded. A raw is credited to the
-     first source that eliminates it, so a raw the overlay condition
-     already eliminates keeps `:overlay` when covered-mode pruning names it
-     too. The ledger's per-raw sources become `elimination_source` and its
-     pivot table becomes `pivots`, once `_assert_resolved` has checked that
-     every pivot is expressed over raws that stay free.
-  3. Per-component physical Dirichlet detection: one pass per level
-     over the level's raws, matching the physical faces each raw's
-     function lies on against every condition's facets as face bitmasks
-     (`_physical_dirichlet`).
-  4. Enumerate active dofs component-major (component 1 first, then
-     component 2, …) skipping every (raw, component) entry that is
-     either physically Dirichlet-constrained or artificially eliminated.
-     Project nonzero Dirichlet data onto the boundary trace space via
-     [`_project_dirichlet_values!`](@ref).
-
-Keyword arguments:
-
-  - `dirichlet` — iterable of [`DirichletCondition`](@ref)s.
-  - `tolerance` — `GeometryTolerance` used by boundary detection.
-  - `components` — scalar channels per field (≥ 1).
-  - `prune_exempt` — level ids this pass leaves unpruned while every other level is
-    pruned normally. It exists for [`estimate`](@ref)'s enriched twin, where a
-    co-located same-degree cover would deduplicate exactly the keys the solution is
-    about to be injected onto; turning leaf semantics off *globally* there instead was
-    measured to inflate the indicator on a covered cell of an unrelated level by 4.1×,
-    because that level's order-elevated covered modes then survive and land in the
-    complement. Empty by default, and a no-op when `prune = false`.
-  - `prune` — leaf semantics, on by default. `false` retains every covered
-    mode and is the unreduced twin the reduction is measured against; see
-    [`prepare`](@ref), which is where a caller reaches it.
-  - `classify_cache` — the space's cell-classification cache (shared with the
-    `PhysicalDomain` fold). The fictitious-fold constraint predicate and the
-    coverage rule both reuse it instead of re-classifying fold-boundary cells;
-    defaults to a fresh empty cache for standalone calls.
-  - `facets` — the model's `FacetResolver`, through which stage 4b resolves the
-    boundary faces it projects the Dirichlet datum over. Sharing it is what makes
-    the projection read the very faces the assembly path and
-    [`boundary_integral`](@ref) read, at one resolution per `(space, face)`
-    rather than one per consumer. `nothing` (the default) gives this call a
-    private resolver at `tolerance`, which is what a standalone `dof_layout` with
-    no model behind it wants. Its tolerance must match `tolerance`.
-
-The integrated Legendre family eliminates strongly and records no rows, so
-its layout has no pivot and assembly sees only active and constrained dofs,
-and so does the B-spline family at maximal continuity. Below maximal
-continuity a B-spline level records multi-raw rows encoding the C^m
-trace-vanishing condition on artificial boundaries; assembly gives each
-pivot they resolve to a local row and column of its own and condenses them
-onto the pivot's expansion once per integration region.
-"""
-function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
-                    components::Integer=1, prune::Bool=true, prune_exempt=(),
-                    classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}(),
-                    facets=nothing) where {D,T}
-    components > 0 || throw(ArgumentError("dof layout components must be positive"))
-    # Stage 1: raw enumeration, with each level's raws as one range.
+# Step 1 of a layout: the space block, built from the space alone. Raw enumeration
+# (`_enumerate_raws`), then every level's artificial eliminations recorded in one
+# `EliminationLedger` — the family's `_overlay_constraints!`, then, under leaf
+# semantics, its `_coverage_constraints!` against the masks `build_coverage`
+# computes (so those are built first, and not at all when `prune = false`), then
+# `_resolve_rows!` on whatever linear-constraint rows the two recorded — and finally
+# the depth-one check on the pivots the rows resolved to. The ledger's per-raw
+# sources and pivot table become the topology's.
+#
+# A topology reads neither a field's components nor its Dirichlet data, so one is
+# the same for every field over the space. `V.physical` is passed to
+# `_record_eliminations!` as an argument rather than read there, which is the
+# function barrier that types the hooks' context (see `_LevelContext`).
+function _dof_topology(V::Space{D,T}; tolerance::GeometryTolerance{T}=GeometryTolerance(T),
+                       prune::Bool=true, prune_exempt=(),
+                       classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
     raw_by_key, raw_keys, cell_dofs_by_level, level_raws = _enumerate_raws(V)
-
-    # Stage 2: the artificial eliminations, level by level, into one ledger.
-    nraw = length(raw_keys)
     coverage = prune ? build_coverage(V, tolerance, classify_cache) :
                Coverage{D}(Dict{Int,BitArray{D}}())
-    ledger = EliminationLedger{T}(nraw)
+    ledger = EliminationLedger{T}(length(raw_keys))
     _record_eliminations!(ledger, V, V.physical, tolerance, classify_cache, coverage, raw_keys,
                           raw_by_key, level_raws, prune, prune_exempt)
     _assert_resolved(ledger)
-    elimination_source, pivots = ledger.source, ledger.pivots
+    return _DofTopology{D,T}(cell_dofs_by_level, raw_keys, level_raws, ledger.source, ledger.pivots,
+                             tolerance)
+end
 
-    # Stage 3: per-component physical Dirichlet detection, one face-mask pass per
-    # level over the level's raw range (`dirichlet.jl`). The layout does not exist
-    # yet, so the pass reads the three arrays it needs from a named tuple.
-    ncomp = Int(components)
-    physical_dirichlet = _physical_dirichlet((; raw_keys, level_raws, tolerance), V, dirichlet,
-                                             ncomp)
-
-    # Stage 4: enumerate active dofs component-major. For all-or-nothing
-    # constraints this matches the natural block ordering; per-component
-    # constraints simply leave holes in the enumeration.
+# Step 3 of a layout: number one field over a topology, given its physical-Dirichlet
+# flags (step 2, `_physical_dirichlet`). Active ids run component-major — component
+# 1 of every raw, then component 2, … — skipping every (raw, component) a physical
+# Dirichlet condition constrains or an artificial elimination removed, so an
+# all-or-nothing constraint leaves the natural block ordering and a per-component
+# one leaves holes. The constrained values start at zero, which is already the
+# answer for homogeneous data; nonzero data are projected into them afterwards
+# (step 4, `_project_dirichlet_values!`).
+#
+# The topology's arrays are handed on, not copied: the space block is never mutated
+# once built, and this is the one place a layout receives it.
+function DofLayout(t::_DofTopology{D,T}, physical_dirichlet::Matrix{Bool}) where {D,T}
+    nraw, ncomp = size(physical_dirichlet)
     active_component = zeros(Int, nraw, ncomp)
     active_count = 0
-    for component in 1:ncomp, raw in 1:nraw
-        if !(physical_dirichlet[raw, component] || elimination_source[raw] !== :free)
-            active_count += 1
-            active_component[raw, component] = active_count
-        end
+    for c in 1:ncomp, raw in 1:nraw
+        (physical_dirichlet[raw, c] || t.elimination_source[raw] !== :free) && continue
+        active_component[raw, c] = (active_count += 1)
     end
-
-    layout = DofLayout{D,T}(ncomp, cell_dofs_by_level, raw_keys, level_raws, active_component,
-                            physical_dirichlet, elimination_source, pivots, zeros(T, nraw, ncomp),
-                            fill(:none, ncomp), [Int[] for _ in 1:ncomp], active_count, tolerance)
-
-    # Stage 4b: project nonzero Dirichlet data onto the boundary trace
-    # space. Zero-only conditions skip this — `constrained_values` is
-    # already zero from the construction above.
-    _needs_dirichlet_projection(dirichlet) &&
-        _project_dirichlet_values!(layout, V, facets, dirichlet)
-    return layout
+    return DofLayout{D,T}(t.cell_dofs_by_level, t.raw_keys, t.level_raws, t.elimination_source,
+                          t.pivots, t.tolerance, ncomp, physical_dirichlet, active_component,
+                          active_count, zeros(T, nraw, ncomp))
 end
 
 """
@@ -1232,8 +1193,8 @@ expansions of 126 raws), the dropped term reached 4.79e-7 against a field of
 magnitude 7e-2 — silent, and small enough to pass a hand-written tolerance.
 
 One level of expansion is enough, because `_resolve_rows!` leaves every pivot
-expressed over raws the artificial constraints leave free, and `dof_layout` checks
-it once per build (`_assert_resolved`). Such a branch
+expressed over raws the artificial constraints leave free, and the topology build
+checks it once (`_assert_resolved`). Such a branch
 may still be constrained on `component` by a physical Dirichlet condition, which
 is resolved later; it then contributes its constrained value rather than a
 coefficient.

@@ -898,13 +898,16 @@ end
                                                                    coarse, model.problem.dirichlet)
     @test layout.constrained_values == projected
 
-    # `nothing` is the standalone spelling — `dof_layout(V; dirichlet)` with no
-    # model behind it — and projects through a private resolver at the layout's own
-    # tolerance. Bit-identical to the shared route, which is what makes the
-    # resolver a saving rather than a semantic change.
-    @test Unfitted._project_dirichlet_values!(layout, model.problem.space, nothing,
+    # A private resolver at the layout's own tolerance is what the standalone
+    # `dof_layout(V; dirichlet)` builds, with no model behind it to share one. It
+    # starts empty and resolves every face itself, and the values come out
+    # bit-identical to the shared route, which is what makes the resolver a saving
+    # rather than a semantic change.
+    private = Unfitted.FacetResolver{2,Float64}(layout.tolerance)
+    @test Unfitted._project_dirichlet_values!(layout, model.problem.space, private,
                                               model.problem.dirichlet) isa
           Unfitted.DirichletProjection{2,Float64}
+    @test Set(keys(private.faces)) == Set(keys(before))
     @test layout.constrained_values == projected
 
     # `move!` replaces the resolver along with the dof layout, so the memo tracks
@@ -1210,6 +1213,51 @@ end
     @test diagnostics(stable_model).dirichlet_trace_factors == [:cholesky]
     @test diagnostics(stable_model).unsupported_dirichlet_dof_count == 0
     @test active_unknowns(stable_model) == 49
+end
+
+@testset "prepare keeps no Dirichlet projection; diagnostics read the ones it built" begin
+    # `prepare` projects nonzero Dirichlet data while it lays the fields out, reads
+    # the trace solve's verdicts off each projection into the diagnostics, and drops
+    # the projection: a prepared model holds none, so its memory does not grow by a
+    # boundary mass and a trace sample set per field. Only `update_dirichlet!`
+    # caches one. The verdicts must nevertheless be the projection's own, which the
+    # first increment with unchanged data proves — it builds the same projections
+    # again, keeps them this time, and must report exactly what `prepare` reported.
+    #
+    # The trimmed disc of the testset above, so the verdicts carry information: u's
+    # solve falls back to the pseudoinverse with three dofs unsupported, and v's
+    # component-1-only condition leaves two unsupported beside a component 2 with
+    # nothing to solve. w carries no condition at all. Three fields, so the field
+    # then component then raw order of both lists is pinned as well.
+    disc = physical_domain(leaf(x -> 0.3 - hypot(x[1], x[2]); lipschitz=1.0);
+                           subcell_length_scale=0.0625)
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=disc)
+    u, v, w = field(:u, V), field(:v, V; components=2), field(:w, V)
+    conditions = [dirichlet(x -> sin(x[1] + 2x[2]); on=boundary(:all), field=u),
+                  dirichlet(0.5; on=boundary(axis=1, side=:lower), field=v, component=1)]
+    model = prepare(Problem((u, v, w);
+                            blocks=(stiffness_block(u), stiffness_block(v), stiffness_block(w)),
+                            dirichlet=conditions))
+    @test isempty(model.dirichlet_projections)
+    report = diagnostics(model)
+    @test report.dirichlet_trace_factors == [:pseudoinverse, :pseudoinverse, :none, :none]
+    @test [(r.field, r.component) for r in report.unsupported_dirichlet_dofs] ==
+          [(:u, 1), (:u, 1), (:u, 1), (:v, 1), (:v, 1)]
+    @test report.unsupported_dirichlet_dof_count == 5
+    factors = copy(report.dirichlet_trace_factors)
+    unsupported = copy(report.unsupported_dirichlet_dofs)
+
+    update_dirichlet!(model, conditions)
+    field_names = (:u, :v, :w)
+    @test Set(keys(model.dirichlet_projections)) == Set(field_names)
+    cached = [model.dirichlet_projections[name] for name in field_names]
+    @test diagnostics(model).dirichlet_trace_factors == factors
+    @test diagnostics(model).unsupported_dirichlet_dofs == unsupported
+    @test diagnostics(model).unsupported_dirichlet_dof_count == 5
+    @test factors == [Unfitted._trace_branch(factor) for p in cached for factor in p.factors]
+    @test unsupported ==
+          [Unfitted.UnsupportedDirichletDof(name, c, raw) for (name, p) in zip(field_names, cached)
+           for (c, raws) in pairs(p.unsupported) for raw in raws]
 end
 
 @testset "a facet region's kind is the verdict on its own face, in every codimension" begin
