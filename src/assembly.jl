@@ -465,43 +465,43 @@ end
 # Build the bank over a problem's subdomain spaces without a type-unstable level
 # concatenation. `prepare` reindexed every subdomain space into a disjoint,
 # contiguous block of global level ids, so the union spans `1:N` with
-# `N = Σ level_count(V)`. The buffers are allocated once at size `N` and filled
-# per space through `_fill_bank!`; the only dynamic dispatch is the loop over
-# the abstractly typed `spaces`, once per subdomain.
+# `N = Σ level_count(V)`. The bank is allocated once at size `N`, with an
+# abstract family slot, filled per space through `_fill_bank!`, and then rebuilt
+# around the narrowed `bases`; the only dynamic dispatch is the loop over the
+# abstractly typed `spaces`, once per subdomain. A plain loop sums the level
+# counts: `sum` over the untyped spaces cost 50–60 ms of first-call compile.
 function BasisBank(spaces, ::Val{D}, ::Type{T}) where {D,T}
     n = 0
     for V in spaces
         n += level_count(V)
     end
-    bases = Vector{BasisFamily}(undef, n)
-    modes = Vector{CellModes{D}}(undef, n)
-    orders = Vector{NTuple{D,Int}}(undef, n)
-    values = Vector{Vector{T}}(undef, n)
-    gradients = Vector{Vector{SVector{D,T}}}(undef, n)
-    val1d = Vector{NTuple{D,Vector{T}}}(undef, n)
-    der1d = Vector{NTuple{D,Vector{T}}}(undef, n)
+    bank = BasisBank{D,T,BasisFamily}(Vector{BasisFamily}(undef, n), Vector{CellModes{D}}(undef, n),
+                                      Vector{NTuple{D,Int}}(undef, n), Vector{Vector{T}}(undef, n),
+                                      Vector{Vector{SVector{D,T}}}(undef, n),
+                                      Vector{NTuple{D,Vector{T}}}(undef, n),
+                                      Vector{NTuple{D,Vector{T}}}(undef, n))
     for V in spaces
-        _fill_bank!(bases, modes, orders, values, gradients, val1d, der1d, V.levels, T)
+        _fill_bank!(bank, V.levels)
     end
-    narrow = map(identity, bases)
-    return BasisBank{D,T,eltype(narrow)}(narrow, modes, orders, values, gradients, val1d, der1d)
+    narrow = map(identity, bank.bases)
+    return BasisBank{D,T,eltype(narrow)}(narrow, bank.modes, bank.orders, bank.values,
+                                         bank.gradients, bank.val1d, bank.der1d)
 end
 
 # Function barrier: fill the id-indexed bank from one space's concretely typed
 # level `Tuple`, so every per-level field read and the `local_basis_indices` /
 # `_factor_buffers` calls dispatch statically.
-function _fill_bank!(bases, modes, orders, values, gradients, val1d, der1d, levels::Tuple,
-                     ::Type{T}) where {T}
+function _fill_bank!(bank::BasisBank{D,T}, levels::Tuple) where {D,T}
     for level in levels
         i, p = level.id, nominal_order(level)
         nbasis = length(local_basis_indices(level.basis, p, level.mode))
-        bases[i] = level.basis
-        modes[i] = _cell_locals(level)
-        orders[i] = p
-        values[i] = Vector{T}(undef, nbasis)
-        gradients[i] = Vector{eltype(eltype(gradients))}(undef, nbasis)
-        val1d[i] = _factor_buffers(p, T)
-        der1d[i] = _factor_buffers(p, T)
+        bank.bases[i] = level.basis
+        bank.modes[i] = _cell_locals(level)
+        bank.orders[i] = p
+        bank.values[i] = Vector{T}(undef, nbasis)
+        bank.gradients[i] = Vector{SVector{D,T}}(undef, nbasis)
+        bank.val1d[i] = _factor_buffers(p, T)
+        bank.der1d[i] = _factor_buffers(p, T)
     end
     return nothing
 end
@@ -743,14 +743,21 @@ end
 # below. Only these small accessors differ per region kind, and they dispatch
 # statically on the region type.
 
+# The region kinds that store their quadrature points and weights in the
+# physical frame, one entry per point: facets, immersed surfaces and interfaces.
+# A volume region instead carries a reference rule on its box.
+const _PhysicalRegion = Union{FacetRegion,SurfaceRegion,InterfaceRegion}
+
+# Number of quadrature points of a region, which sizes its `q.point` range
+# (`RegionList`) and drives the kernel's point loop.
+_region_qpoint_count(region::VolumeRegion) = length(region.quadrature.weights)
+_region_qpoint_count(region::_PhysicalRegion) = length(region.weights)
+
 # Reference→physical Jacobian for the region's weights: `vol(box)/2ᴰ` for a
-# volume region (whose weights are reference-frame), `one(T)` for facet, surface,
+# volume region (whose weights are reference-frame), one for facet, surface,
 # and interface regions (whose weights are already physical-frame).
 _region_jacobian(region::VolumeRegion{D,T}) where {D,T} = volume(region.box) / convert(T, 2^D)
-function _region_jacobian(::Union{FacetRegion{D,T},SurfaceRegion{D,T},InterfaceRegion{D,T}}) where {D,
-                                                                                                    T}
-    one(T)
-end
+_region_jacobian(region::_PhysicalRegion) = one(eltype(region.weights))
 
 # Quadrature point `k` of `region` as `(x, weight, ref)`: the physical point, the
 # physical weight, and the reference each parent maps to its own frame
@@ -764,7 +771,7 @@ end
     η = region.quadrature.points[k]
     return reference_to_physical(region.box, η), region.quadrature.weights[k] * jacobian, η
 end
-@inline function _region_point(region::Union{FacetRegion,SurfaceRegion,InterfaceRegion}, k::Int, _)
+@inline function _region_point(region::_PhysicalRegion, k::Int, _)
     x = region.points[k]
     return x, region.weights[k], x
 end
@@ -786,18 +793,22 @@ _parent_lists(region::InterfaceRegion) = (region.parents_a, region.parents_b)
 # a facet carries one).
 _region_normal(::VolumeRegion, ::Int) = nothing
 _region_normal(region::FacetRegion, ::Int) = region.normal
-function _region_normal(region::Union{SurfaceRegion,InterfaceRegion}, local_qp::Int)
-    region.normals[local_qp]
-end
+_region_normal(region::Union{SurfaceRegion,InterfaceRegion}, k::Int) = region.normals[k]
 _region_sides(::Union{VolumeRegion,SurfaceRegion,InterfaceRegion}) = nothing
 _region_sides(region::FacetRegion) = region.sides
 
-# The `q` payload of point `k` of `region`, given the point's coordinate, weight,
-# index and state: `(; x, weight, point, state, normal, sides)`. The kernel hands
-# it to every form callback and the walker (`_walk`) to its caller, so a form and
-# a walk over the same list see the same payload at the same point by
-# construction.
-@inline function _payload(region, k::Int, x, weight, point::Int, state)
+# The per-point step shared by the kernel and the walker: the `q` payload of
+# point `k` of `region`, whose index in its list is `point`,
+# `(; x, weight, point, state, normal, sides)`. With a workspace `ws` the basis
+# is refreshed at the point first and, with a `state`, every field is evaluated
+# there; a walk without a state passes `ws = nothing` and evaluates nothing. The
+# kernel hands the payload to every form callback and the walker (`_walk`) to
+# its caller, so a form and a walk over the same list see the same payload at
+# the same point by construction.
+@inline function _payload!(ws, region, k::Int, jacobian, point::Int, state)
+    x, weight, ref = _region_point(region, k, jacobian)
+    ws === nothing || _refresh!(ws, region, ref, Val(true))
+    state = state === nothing ? nothing : _state_point!(state, ws, Val(true))
     return (; x, weight, point, state, normal=_region_normal(region, k),
             sides=_region_sides(region))
 end
@@ -1054,7 +1065,7 @@ end
 # Nitsche-style forms rely on.
 #
 # Per point the kernel refreshes the bases, evaluates the state when there is
-# one, and composes `q` (`_payload`), with `point = offset + k` the stable index
+# one, and composes `q` (`_payload!`), with `point = offset + k` the stable index
 # `nquadpoints` sizes and `foreach_quadrature_point` shares. Loads are evaluated
 # first, then blocks, each through `_emit!`.
 # Constrained trial columns move to the rhs as they are emitted; pivot rows and
@@ -1074,10 +1085,7 @@ end
     fill!(resize!(ws.b, m), zero(T))
     jacobian = _region_jacobian(region)
     for k in 1:_region_qpoint_count(region)
-        x, w, ref = _region_point(region, k, jacobian)
-        _refresh!(ws, region, ref, Val(true))
-        st = state === nothing ? nothing : _state_point!(state, ws, Val(true))
-        q = _payload(region, k, x, w, offset + k, st)
+        q = _payload!(ws, region, k, jacobian, offset + k, state)
         _foreach_form(_load!, pass.loads, (ws, q, n, m, sym))
         _foreach_form(_block!, pass.blocks, (ws, q, n, m, sym))
     end
@@ -1220,15 +1228,6 @@ function _condense!(ws::AssemblyWorkspace, n::Int, m::Int, sym::Bool, matrix::Bo
         end
     end
     return nothing
-end
-
-# Number of quadrature points of a region, which sizes its `q.point` range
-# (`RegionList`) and drives the kernel's point loop. The physical-frame kinds
-# (facet / surface / interface) share one method, as their weights vector
-# already holds one entry per point.
-_region_qpoint_count(region::VolumeRegion) = length(region.quadrature.weights)
-function _region_qpoint_count(region::Union{FacetRegion,SurfaceRegion,InterfaceRegion})
-    length(region.weights)
 end
 
 # ── Serial driver and the column kernel ───────────────────────────────────────
@@ -1867,7 +1866,7 @@ end
 # Fold `op(acc, q)` over every quadrature point of `list` in the serial assembly
 # order, starting from `acc`, and return the result: `foreach_quadrature_point`
 # discards it, `boundary_integral` sums through it. The payload is the kernel's
-# own (`_payload`), from the same `_region_point`, with `q.point =
+# own (`_payload!`), from the same `_region_point`, with `q.point =
 # list.offsets[r] + k`. With a state, each region's dof values are read once and
 # every field is evaluated at every point through the same `_frame!`,
 # `_refresh!` and `_state_point!` the kernel uses, on the workspace `ws`;
@@ -1879,10 +1878,7 @@ function _walk(op, acc, ws, list::RegionList, state)
         state === nothing || _state_region!(state, _frame!(ws, region))
         jacobian = _region_jacobian(region)
         for k in 1:_region_qpoint_count(region)
-            x, w, ref = _region_point(region, k, jacobian)
-            st = state === nothing ? nothing :
-                 (_refresh!(ws, region, ref, Val(true)); _state_point!(state, ws, Val(true)))
-            acc = op(acc, _payload(region, k, x, w, list.offsets[r] + k, st))
+            acc = op(acc, _payload!(ws, region, k, jacobian, list.offsets[r] + k, state))
         end
     end
     return acc
