@@ -1024,7 +1024,7 @@ end
 # earlier expansion needs the substitution to stay in "free raws only"
 # form.
 #
-# `mentions` maps a raw to the pivots whose expansion currently contains it,
+# `mentions` lists, per raw, the pivots whose expansion currently contains it,
 # so this visits only the expansions that can possibly need rewriting. It
 # used to scan all `nraw` expansions per constraint, which made the pass
 # `O(K · nraw)` — quadratic in the problem — while the comment here claimed
@@ -1041,15 +1041,17 @@ end
 # membership test below stays. It must never under-report, which is why an
 # entry is added at *every* site that writes an expansion — here and in
 # `_cascade!` step 4. Every holder it lists is a pivot, since only a pivot's
-# expansion is ever registered, so each one has an entry in `expansions`.
-function _back_substitute!(expansions::Dict{Int,Vector{Tuple{Int,T}}}, pivot_raw::Int,
-                           pivot_expansion::Vector{Tuple{Int,T}},
-                           mentions::Dict{Int,Vector{Int}}) where {T}
-    holders = get(mentions, pivot_raw, nothing)
-    holders === nothing && return expansions
-    @inbounds for raw in holders
+# expansion is ever registered, so each one has an assigned `expansions` entry.
+#
+# Both tables are `_cascade!`'s level-local ones: entry `raw - offset` belongs to
+# `raw`, and an entry stays unassigned until something is written to it.
+function _back_substitute!(expansions::Vector{Vector{Tuple{Int,T}}}, mentions::Vector{Vector{Int}},
+                           offset::Int, pivot_raw::Int,
+                           pivot_expansion::Vector{Tuple{Int,T}}) where {T}
+    isassigned(mentions, pivot_raw - offset) || return expansions
+    @inbounds for raw in mentions[pivot_raw - offset]
         raw == pivot_raw && continue
-        expansion = expansions[raw]
+        expansion = expansions[raw - offset]
         # The index over-reports; this is the exact test.
         any(t -> first(t) == pivot_raw, expansion) || continue
         # Rebuild with substitution.
@@ -1065,20 +1067,23 @@ function _back_substitute!(expansions::Dict{Int,Vector{Tuple{Int,T}}}, pivot_raw
             end
         end
         combined = _combine_terms(new_terms)
-        expansions[raw] = combined
+        expansions[raw - offset] = combined
         # This expansion now mentions the pivot's own references. `pivot_raw`
         # cannot be among them — `pivot_expansion` was built excluding it — so
         # the list being iterated is never the one appended to.
-        _register_mentions!(mentions, raw, combined)
+        _register_mentions!(mentions, offset, raw, combined)
     end
     return expansions
 end
 
-# Record that `raw`'s expansion contains each of `terms`' raws.
-function _register_mentions!(mentions::Dict{Int,Vector{Int}}, raw::Int,
+# Record that `raw`'s expansion contains each of `terms`' raws, in the level-local
+# `mentions` table of `_back_substitute!`. A raw's list is allocated by its first
+# mention, so a level whose pivots are all strong eliminations allocates none.
+function _register_mentions!(mentions::Vector{Vector{Int}}, offset::Int, raw::Int,
                              terms::Vector{Tuple{Int,T}}) where {T}
     for (other, _) in terms
-        push!(get!(() -> Int[], mentions, other), raw)
+        k = other - offset
+        isassigned(mentions, k) ? push!(mentions[k], raw) : (mentions[k] = [raw])
     end
     return mentions
 end
@@ -1110,32 +1115,43 @@ exploit the small constraint matrix's structure:
 Step 5 keeps the invariant: at any point after a row has been
 processed, *every pivot's expansion is in terms of currently-free raws
 only*. Assembly emission then never needs to chase chains. The pivots are
-written to the ledger once the last row is processed; storage is per raw, so
-their order is immaterial.
+written to the ledger once the last row is processed, in raw order; storage
+is per raw, so the order is immaterial.
 
 Each row costs a substitution and a sort-and-combine over its terms after
 substitution, plus one rewrite per earlier pivot that mentions the new pivot
 raw, found through the `mentions` index rather than by scanning every
-expansion (see `_back_substitute!`). The working tables are per level and
-hold only that level's pivots.
+expansion (see `_back_substitute!`).
+
+The working tables are dense vectors over the span `lo:hi` of the raws the rows
+name, entry `raw - (lo - 1)` for `raw`. That span holds every raw a table is ever
+indexed by — a term, a pivot and a mention all name a raw some row names — and,
+since a level's rows name only its own raws, it lies inside the level. Dense
+level-local tables instead of hash tables keyed by raw: the arithmetic is the
+same, but no new `Dict` type is compiled at the first build that resolves a
+row, and the lookups are plain loads.
 """
 function _cascade!(ledger::EliminationLedger{T}) where {T}
-    # raw -> its expansion and the source of the row that pivoted it, for the
-    # raws this level's rows pivot so far.
-    expansions = Dict{Int,Vector{Tuple{Int,T}}}()
-    sources = Dict{Int,Symbol}()
-    # raw -> the pivots whose expansion mentions it. Empty while every pivot is
-    # a strong elimination, which mentions no raw.
-    mentions = Dict{Int,Vector{Int}}()
+    lo, hi = typemax(Int), typemin(Int)
+    for (raws, _, _) in ledger.rows, raw in raws
+        lo, hi = min(lo, raw), max(hi, raw)
+    end
+    lo > hi && return ledger                    # no row names a raw: nothing to resolve
+    offset, n = lo - 1, hi - lo + 1
+    # Per raw: the source of the row that pivoted it, `:free` until one does, and
+    # its current expansion, assigned with it.
+    sources = fill(:free, n)
+    expansions = Vector{Vector{Tuple{Int,T}}}(undef, n)
+    # Per raw: the pivots whose expansion mentions it (see `_back_substitute!`).
+    mentions = Vector{Vector{Int}}(undef, n)
 
     for (raws, coefficients, source) in ledger.rows
         # 1) Substitute already-pivoted raws; drop already-eliminated ones.
         terms = Tuple{Int,T}[]
         sizehint!(terms, length(raws))
         for (raw, coeff) in zip(raws, coefficients)
-            expansion = get(expansions, raw, nothing)
-            if expansion !== nothing
-                for (other, w) in expansion
+            if sources[raw - offset] !== :free
+                for (other, w) in expansions[raw - offset]
                     push!(terms, (other, coeff * w))
                 end
             elseif ledger.source[raw] === :free
@@ -1155,15 +1171,15 @@ function _cascade!(ledger::EliminationLedger{T}) where {T}
         new_expansion = Tuple{Int,T}[(raw, -c / pivot_coeff)
                                      for (k, (raw, c)) in pairs(combined) if k != pivot_pos]
 
-        expansions[pivot_raw] = new_expansion
-        sources[pivot_raw] = source
-        _register_mentions!(mentions, pivot_raw, new_expansion)
+        expansions[pivot_raw - offset] = new_expansion
+        sources[pivot_raw - offset] = source
+        _register_mentions!(mentions, offset, pivot_raw, new_expansion)
 
         # 5) Back-substitute into earlier pivots that mention this raw.
-        _back_substitute!(expansions, pivot_raw, new_expansion, mentions)
+        _back_substitute!(expansions, mentions, offset, pivot_raw, new_expansion)
     end
-    for (raw, expansion) in expansions
-        _pivot!(ledger, raw, expansion, sources[raw])
+    for (k, source) in pairs(sources)
+        source === :free || _pivot!(ledger, k + offset, expansions[k], source)
     end
     return ledger
 end

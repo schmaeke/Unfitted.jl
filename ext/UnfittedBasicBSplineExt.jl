@@ -1173,23 +1173,22 @@ function Unfitted._coverage_constraints!(ledger::EliminationLedger,
     # actually is. A cover that selects by support answers the question *exactly*,
     # by walking the subdivision and asking whether every fine function in it
     # survived its own selection; it therefore needs that cover's admissibility
-    # record, built once here rather than once per buried function. Any other cover
-    # — an integrated-Legendre overlay, or a B-spline level below maximal
+    # record, built once per cover rather than once per buried function. Any other
+    # cover — an integrated-Legendre overlay, or a B-spline level below maximal
     # continuity — is *clamped* on its artificial boundary, so its span near that
     # boundary is not described by any statement about supports, and the
     # conservative geometric predicate `_reproduced_on_domain` is the right one.
     selecting(k) = k.basis isa BSplineFamily && _selects_by_support(k.basis)
-    covers = [selecting(k) ? _admissibility(k, ctx) : nothing for k in above]
     # `coverage`'s per-cell verdict is a prefilter for the clamped path only. It
     # tests the *whole* cell box against the cover's box, which under an immersed
     # geometry can reject a cell whose material part the cover does reach — the rest
     # of it being fictitious — and that would silently under-deduplicate. The exact
     # path needs no prefilter: its first block test fails immediately for a function
     # nowhere near the cover, which is what keeps the walk off the level's bulk.
-    clamped_only = all(isnothing, covers)
+    clamped_only = !any(selecting, above)
+    candidates = Int[]
     for raw in ctx.raws
-        key = ctx.raw_keys[raw]
-        cells = _support_cells(key, family, n)
+        cells = _support_cells(ctx.raw_keys[raw], family, n)
         # The level-side half, and it holds for BOTH mechanisms. A *user-masked*
         # support cell blocks: what a masked level assembles is the function truncated
         # to its own active cells, which is not the function the cover reproduces. A
@@ -1212,17 +1211,50 @@ function Unfitted._coverage_constraints!(ledger::EliminationLedger,
             # the `false` default, not a verdict.
             all(ci -> !is_active(level.mask, ci) || cov[ci], cells) || continue
         end
-        reproduced = false
-        for (j, k) in pairs(above)
-            cover = covers[j]
-            reproduced = cover === nothing ?
-                         _reproduced_on_domain(level, k, cells, physical, tol, cache) :
-                         _reproduced_by_selection(level, key, cover)
-            reproduced && break
-        end
-        reproduced && _dedup!(ledger, level, raw)
+        push!(candidates, raw)
+    end
+    # The covers are asked one at a time, each about the candidates no earlier cover
+    # reproduced: every candidate meets its covers in `above` order up to the first
+    # that reproduces it, exactly as a per-function loop over the covers would ask
+    # them. The dedups are then recorded in raw order, which is the order the rows of
+    # a clamped level must keep (see `_dedup!`).
+    reproduced = falses(length(candidates))
+    for k in above
+        cover = selecting(k) ? _admissibility(k, ctx) : nothing
+        _mark_reproduced!(reproduced, candidates, level, k, cover, ctx)
+    end
+    for (i, raw) in pairs(candidates)
+        reproduced[i] && _dedup!(ledger, level, raw)
     end
     return ledger
+end
+
+# Mark every candidate of `level` that the covering level `k` reproduces and no
+# earlier cover did: by subdivision against `cover`, `k`'s admissibility record, when
+# `k` selects by support, and by `_reproduced_on_domain` when `cover` is `nothing`.
+#
+# A function of its own, with the cover's record a local of the caller rather than an
+# element of a per-level vector. A `Vector{Union{Nothing, _Admissibility}}` is built by
+# `collect`'s element-type widening, which is compiled for every element type it passes
+# through, and inference reaches it on every B-spline space, including a one-level one
+# whose burial test never runs; and each record read back out of it was re-boxed for
+# the call, 272 bytes per candidate (measured on a 48² degree-3 level under a nested
+# maximal-continuity cover). The barrier also keeps this per-raw loop specialised on
+# `k` and `cover` when the space mixes basis families and `above` is abstractly
+# typed: the call then dispatches once per cover rather than once per raw.
+function _mark_reproduced!(reproduced::BitVector, candidates::Vector{Int},
+                           level::Level{D,T,<:BSplineFamily}, k::Level{D,T}, cover,
+                           ctx::_LevelContext{D,T}) where {D,T}
+    family, n = level.basis, level.mesh.cells
+    for (i, raw) in pairs(candidates)
+        reproduced[i] && continue
+        key = ctx.raw_keys[raw]
+        reproduced[i] = cover === nothing ?
+                        _reproduced_on_domain(level, k, _support_cells(key, family, n),
+                                              ctx.physical, ctx.tolerance, ctx.classify_cache) :
+                        _reproduced_by_selection(level, key, cover)
+    end
+    return reproduced
 end
 
 # The dedup is a strong elimination on a selecting level, but a one-term ROW on a
