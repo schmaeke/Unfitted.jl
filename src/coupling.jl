@@ -57,10 +57,13 @@ struct Interface{G}
     geometry::G
 end
 
-# Identity semantics: `couple` shares one `Interface` object across its four
-# blocks, so `on`-partitioning and the `IdDict` region cache key on that object.
-# Two independent `interface(...)` calls are distinct couplings even over the
-# same mesh, and this also avoids hashing the (potentially large) geometry.
+# Egal semantics: an `Interface` is immutable, so `===` compares its fields: the
+# two field names, and the geometry, an immutable `BoundaryMesh` whose arrays
+# compare by identity. Two `interface(uₐ, u_b, Γ)` calls over the same `Γ`
+# object are therefore one coupling, one `on=` target and one key of the
+# `IdDict` region cache, while a mesh rebuilt as a new object, even an equal
+# one, is a different coupling. `==` and `hash` follow `===` and `objectid`, so
+# neither ever compares or hashes the (potentially large) geometry's points.
 Base.hash(iface::Interface, h::UInt) = hash(objectid(iface), h)
 Base.:(==)(a::Interface, b::Interface) = a === b
 
