@@ -1505,8 +1505,8 @@ end
                             dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:upper))]))
     assemble!(model)
     space_ = model.problem.space
-    @test haskey(model.assembly.lists, (nothing, space_))
-    @test haskey(model.assembly.lists, (prepared, space_))
+    @test haskey(Dict(model.assembly.lists), (nothing, space_))
+    @test haskey(Dict(model.assembly.lists), (prepared, space_))
 
     # 20 distinct selectors, none of them named by the problem: the 12 edges and
     # the 8 corners of the cube.
@@ -1529,8 +1529,8 @@ end
     @test length(model.assembly.oneshot) <= 8
     @test length(model.assembly.patterns) <= 4
     @test length(model.assembly.lists) == 2
-    @test haskey(model.assembly.lists, (nothing, space_))
-    @test haskey(model.assembly.lists, (prepared, space_))
+    @test haskey(Dict(model.assembly.lists), (nothing, space_))
+    @test haskey(Dict(model.assembly.lists), (prepared, space_))
 
     # Every entry still assembles what it did before: the problem's own system,
     # whose pattern the loop above evicted, is rebuilt bit for bit.
@@ -1655,7 +1655,7 @@ end
         @test model.matrix.nzval == A.nzval
         @test model.rhs == b
     end
-    width = diff(symmetric.assembly.lists[(nothing, symmetric.problem.space)].dofs.ptr)
+    width = diff(Dict(symmetric.assembly.lists)[(nothing, symmetric.problem.space)].dofs.ptr)
     @test cld(sum(width), Unfitted._GATHER_GRAIN) ≥ 3
 
     load = source_load(only(symmetric.problem.fields); source=x -> 1 + x[1] * x[2])

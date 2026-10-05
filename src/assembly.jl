@@ -151,32 +151,42 @@ end
 # compile for every caller.
 function _region_list(@nospecialize(model::Model), @nospecialize(target), @nospecialize(space))
     cache = model.assembly
-    key = (target, space)
     Base.@lock cache.lock begin
-        list = get(cache.lists, key, nothing)
+        list = _lru_get!(cache.lists, target, space)
         list === nothing || return list
-        list = _lru_get!(cache.oneshot, key)
+        list = _lru_get!(cache.oneshot, target, space)
         list === nothing || return list
         regions, owned = _regions(model, target, space)
         isempty(cache.workspaces) && push!(cache.workspaces, _assembly_workspace(model))
         list = RegionList(regions, last(cache.workspaces))
-        owned ? (cache.lists[key] = list) : _lru_push!(cache.oneshot, key => list, 8)
+        entry = (target, space) => list
+        owned ? push!(cache.lists, entry) : _lru_push!(cache.oneshot, entry, 8)
         return list
     end
 end
 
 # A small most-recently-used-first cache kept in a `Vector` of `key => value`
-# pairs. `_lru_get!` returns the value stored under `key` and moves its entry to
-# the front, or returns `nothing`; `_lru_push!` adds an entry at the front and
-# drops the least recently used one beyond `capacity`. Keys compare by
-# `isequal`, as a `Dict`'s would. A linear search is the right tool at these
-# sizes (at most 8 entries), and the bound is what keeps one-shot targets and
-# alternating operators from growing the cache without limit.
-function _lru_get!(lru::Vector, @nospecialize(key))
-    i = findfirst(entry -> isequal(first(entry), key), lru)
-    i === nothing && return nothing
-    i > 1 && pushfirst!(lru, popat!(lru, i))
-    return last(first(lru))
+# pairs, every key a 2-tuple. `_lru_get!` returns the value stored under
+# `(head, tail)` and moves its entry to the front, or returns `nothing`;
+# `_lru_push!` adds an entry at the front and drops the least recently used one
+# beyond `capacity`. A key matches when its `tail` is the same object (a space,
+# `nothing`, or the symmetry flag) and its `head` is `isequal` (a selector by
+# value, everything else by identity), exactly as `isequal` on the tuple would
+# decide. A linear search is the right tool at these sizes (at most 8 entries,
+# or the handful of lists `prepare` resolved), and the bound is what keeps
+# one-shot targets and alternating operators from growing the cache without
+# limit. An index loop on the two halves, rather than a `Dict` or `findfirst`
+# with a closure over a key tuple: either compiles its hashing or its closure
+# once per key type, which every new space or selector type paid on its first
+# call.
+function _lru_get!(lru::Vector, @nospecialize(head), @nospecialize(tail))
+    for i in eachindex(lru)
+        stored = first(lru[i])
+        (stored[2] === tail && isequal(stored[1], head)) || continue
+        i > 1 && pushfirst!(lru, popat!(lru, i))
+        return last(first(lru))
+    end
+    return nothing
 end
 function _lru_push!(lru::Vector, entry::Pair, capacity::Int)
     pushfirst!(lru, entry)
@@ -311,8 +321,11 @@ function _pattern(n::Int, sets::Vector{RegionDofs}, symmetric::Bool)
 end
 
 # The sparsity pattern of the matrix passes `passes` (those carrying a block),
-# from the model's pattern cache, keyed by the passes' `RegionKey`s and the
-# symmetry flag; `nothing` when there is no matrix pass. Loads add no matrix
+# from the model's pattern cache, keyed by the passes' region lists and the
+# symmetry flag; `nothing` when there is no matrix pass. The key holds the lists
+# themselves, so it can never alias the lists of another structure; a one-shot
+# list that fell out of its cache and was resolved again misses its pattern
+# once. Loads add no matrix
 # entry and are not part of the key, so `assemble!` on a volume-only problem and
 # `assemble_matrix(model, mass_block(u))` share one entry, and a caller that
 # alternates operators keeps every pattern it uses (up to four) instead of
@@ -320,13 +333,14 @@ end
 function _assembly_pattern!(@nospecialize(model::Model), passes::Vector{Any}, symmetric::Bool)
     isempty(passes) && return nothing
     cache = model.assembly
-    key = (RegionKey[pass.key for pass in passes], symmetric)
+    lists = RegionList[pass.list for pass in passes]
     Base.@lock cache.lock begin
-        pattern = _lru_get!(cache.patterns, key)
+        pattern = _lru_get!(cache.patterns, lists, symmetric)
         pattern === nothing || return pattern
-        sets = RegionDofs[pass.list.dofs for pass in passes]
+        sets = RegionDofs[list.dofs for list in lists]
         return _lru_push!(cache.patterns,
-                          key => _pattern(active_unknowns(model.dofs), sets, symmetric), 4)
+                          (lists, symmetric) =>
+                              _pattern(active_unknowns(model.dofs), sets, symmetric), 4)
     end
 end
 

@@ -634,13 +634,14 @@ end
 # scatter.
 #
 #   - `lists` — the region lists of every volume plan and of every `on=` target
-#     `prepare` resolved. Bounded by those, so never evicted.
+#     `prepare` resolved, as `key => list` pairs searched linearly. Bounded by
+#     those, so never evicted.
 #   - `oneshot` — the lists of `on=` targets `prepare` did not see (a block
 #     built after the fact, `boundary_integral` on a new selector), most
 #     recently used first, at most 8. A hot one-shot target is resolved once.
-#   - `patterns` — sparsity patterns keyed by the matrix passes' keys and the
-#     symmetry flag, most recently used first, at most 4, so operators that
-#     alternate (mass and stiffness of a time stepper, the problem's own
+#   - `patterns` — sparsity patterns keyed by the matrix passes' region lists
+#     and the symmetry flag, most recently used first, at most 4, so operators
+#     that alternate (mass and stiffness of a time stepper, the problem's own
 #     operator and a transfer's mass) keep their patterns.
 #   - `arena` — the threaded scratch of the last threaded call, handed to one
 #     call at a time; a concurrent call that finds it taken allocates its own,
@@ -653,16 +654,16 @@ end
 # cache, and `_remodel!` replaces it whole when the structure changes.
 mutable struct AssemblyCache{T}
     const lock::ReentrantLock
-    const lists::Dict{RegionKey,RegionList}
+    const lists::Vector{Pair{RegionKey,RegionList}}
     const oneshot::Vector{Pair{RegionKey,RegionList}}
-    const patterns::Vector{Pair{Tuple{Vector{RegionKey},Bool},AssemblyPattern}}
+    const patterns::Vector{Pair{Tuple{Vector{RegionList},Bool},AssemblyPattern}}
     arena::Vector{T}
     const workspaces::Vector{Any}
 end
 function AssemblyCache{T}() where {T}
-    return AssemblyCache{T}(ReentrantLock(), Dict{RegionKey,RegionList}(),
+    return AssemblyCache{T}(ReentrantLock(), Pair{RegionKey,RegionList}[],
                             Pair{RegionKey,RegionList}[],
-                            Pair{Tuple{Vector{RegionKey},Bool},AssemblyPattern}[], T[], Any[])
+                            Pair{Tuple{Vector{RegionList},Bool},AssemblyPattern}[], T[], Any[])
 end
 
 """
