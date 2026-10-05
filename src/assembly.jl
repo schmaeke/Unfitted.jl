@@ -1477,7 +1477,7 @@ function _slots!(ws::AssemblyWorkspace)
         g > 0 && push!(ws.dofs, g)
     end
     for (f, fl) in pairs(ws.layout.fields)
-        fl.dofs.has_linear_constraints || continue
+        has_linear_constraints(fl.dofs) || continue
         id = (o, c) -> _field_component_dof(fl, o, c)
         for p in ws.fptr[f]:(ws.fptr[f+1]-1)
             _, s0, raw = ws.parents[p]

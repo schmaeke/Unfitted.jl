@@ -633,8 +633,17 @@ end
     mask[5:8, 5:8] .= false
     Vmask = space(Ω; cells=8, order=3, basis=bspline(; continuity=1), active=mask)
     layout = Unfitted._field_layout(prepare(mass(Vmask)).dofs, :u).dofs
-    @test layout.has_linear_constraints
+    @test Unfitted.has_linear_constraints(layout)
     @test count(==(:overlay), layout.elimination_source) > 0
+    # The pivot table holds the pivots and nothing else: one entry per raw, a
+    # non-empty one only on an eliminated raw and only over raws that stay free
+    # (depth one), and every other raw sharing a single empty vector.
+    @test length(layout.pivots) == length(layout.raw_keys)
+    none = layout.pivots[findfirst(isempty, layout.pivots)]
+    @test all(e -> !isempty(e) || e === none, layout.pivots)
+    @test all(r -> isempty(layout.pivots[r]) || layout.elimination_source[r] !== :free,
+              eachindex(layout.pivots))
+    @test all(e -> all(((o, _),) -> layout.elimination_source[o] === :free, e), layout.pivots)
     # And the two shapes that no longer reach it, kept because their dof ledgers are
     # the closed forms the family's docstring states: `n − p` per axis at maximal
     # continuity, for a level whose faces are all artificial.
@@ -647,7 +656,7 @@ end
 
 @testset "Linear-constraint resolver: a pivot contributes its expansion to the field" begin
     # `dof_value` used to read `constrained_value` for every eliminated raw, which
-    # is zero for a linear-constraint pivot. Assembly read `raw_expansion`
+    # is zero for a linear-constraint pivot. Assembly read the pivot expansions
     # itself, so the *solve* was right and only the
     # *reconstruction* dropped the pivot's contribution — silently, in `value`,
     # `field_gradient`, `l2_error`, `write_vtk`, and L2Projection's source read.

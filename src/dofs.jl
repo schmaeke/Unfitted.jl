@@ -103,8 +103,9 @@ Applies uniformly to every field component (neither constraint source
 distinguishes components). Emitted by [`_overlay_constraints`](@ref) for
 the trace-vanishing conditions at artificial boundaries and by
 [`_coverage_constraints`](@ref) for pruning eliminations; the dof
-layer resolves the resulting constraint system into a `raw_expansion`
-table via cascade elimination in [`_resolve_constraints!`](@ref).
+layer resolves the resulting constraint system by cascade elimination
+in [`_resolve_constraints!`](@ref) and keeps the linear-constraint
+pivots it produces in [`DofLayout`](@ref)'s `pivots` table.
 
 A single-raw constraint (`length(raws) == 1`, coefficient `1`) is
 strong elimination of that raw — the regime integrated Legendre uses.
@@ -164,34 +165,28 @@ Fields:
     that eliminated it: the artificial overlay boundary (`:overlay`) or, from
     the pruning extension, a covered high-order mode (`:coverage`) or a
     deduped covered vertex (`:dedup`). Applies to every component
-    simultaneously; derived from `raw_expansion`. Serves as both the
+    simultaneously; set by constraint resolution. Serves as both the
     elimination flag (`!== :free`) and its provenance, read by
     [`constraint_kind`](@ref), the active enumeration, and diagnostics.
-  - `raw_expansion::Vector{Vector{Tuple{Int,T}}}` — for each raw, the
-    list of `(other_raw, weight)` pairs that express the raw's value
-    in terms of *non-pivot* raws after constraint resolution. Three
-    regimes:
-      - free raw → `[(raw, 1)]` (identity);
-      - strongly eliminated raw (single-raw constraint, the
-        integrated-Legendre case) → `[]`;
-      - linear-constraint pivot → multi-element list; B-spline overlay
-        boundaries with continuity order `m` produce `m + 1`-element
-        lists per perpendicular line.
-    Assembly keeps a pivot's own local row and column while it
-    integrates a region and condenses them onto the pivot's active
-    branches once per region (`K ← PᵀKP`, `b ← Pᵀb − lift`); the
-    strong-elimination case (empty list) is a constrained dof like any
-    other and the free case is the identity. See
-    [`_resolve_constraints!`](@ref) for the construction algorithm.
-  - `has_linear_constraints::Bool` — `true` iff any raw has a
-    *non-trivial* expansion (neither the identity `[(raw, 1)]` nor the
-    empty strong-elimination list `[]`), i.e. a linear-constraint pivot
-    that redistributes a raw onto one or more *other* raws. The
-    integrated Legendre family and the C⁰ B-spline mesh-edge path never
-    produce such expansions, so this is `false` for them; B-spline linear
-    constraints (a mask on a level whose `continuity` is below `p − 1`) set
-    it `true`. Assembly and `dof_value` consult it per field, so a
-    layout without pivots never looks at an expansion.
+  - `pivots::Vector{Vector{Tuple{Int,T}}}` — the linear-constraint pivots,
+    and nothing else. A pivot is a raw that constraint resolution expressed
+    through *other* raws, `u_raw = Σᵢ wᵢ u_{rᵢ}`, and `pivots[raw]` is that
+    expansion `[(r₁, w₁), …]` in resolution order. It has depth one: every
+    `rᵢ` is free with respect to the constraint system, so a reader never
+    chases a chain. The table is empty when the layout has no pivot, which
+    is every integrated-Legendre and every maximal-continuity B-spline
+    layout: only the multi-raw trace constraints of a B-spline level below
+    maximal continuity (on a `LevelMask` face, for instance) produce one.
+    Otherwise it holds one entry per raw, and every raw that is not a pivot
+    — free or strongly eliminated alike, which `elimination_source` tells
+    apart — shares one empty vector; like the shared empty `cell_dofs`
+    vector, it must never be pushed into. Assembly keeps a pivot's own
+    local row and column while it integrates a region and condenses them
+    onto the pivot's active branches once per region (`K ← PᵀKP`,
+    `b ← Pᵀb − lift`); [`dof_value`](@ref) reconstructs a pivot from the
+    same expansion. Both read it through `_fold_pivot`, which returns at
+    once on an empty table, so a layout without pivots never reads an
+    entry. [`has_linear_constraints`](@ref) is `!isempty(pivots)`.
   - `constrained_values::Matrix{T}` — `(raw, component) → value` for
     constrained dofs. Filled by [`_project_dirichlet_values!`](@ref)
     for nonzero physical Dirichlet data; zero otherwise.
@@ -222,8 +217,7 @@ struct DofLayout{D,T<:Real}
     active_component::Matrix{Int}
     physical_dirichlet::Matrix{Bool}
     elimination_source::Vector{Symbol}
-    raw_expansion::Vector{Vector{Tuple{Int,T}}}
-    has_linear_constraints::Bool
+    pivots::Vector{Vector{Tuple{Int,T}}}
     constrained_values::Matrix{T}
     dirichlet_trace_factors::Vector{Symbol}
     unsupported_dirichlet::Vector{Vector{Int}}
@@ -1040,11 +1034,12 @@ Construct the basis-aware global dof layout for a superposition
      skipped entirely when `prune = false`). A raw the overlay condition already eliminates
      is not re-constrained by covered-mode pruning, so `elimination_source`
      credits it to the source that actually removed it. Resolve the
-     collected constraints into the per-raw expansion table via
-     [`_resolve_constraints!`](@ref). The resulting `raw_expansion[raw]`
-     is either the identity `[(raw, 1)]` for free raws, the empty list
-     `[]` for strongly eliminated raws, or a multi-element list for
-     linear-constraint pivots.
+     collected constraints into a per-raw expansion table via
+     [`_resolve_constraints!`](@ref): the identity `[(raw, 1)]` for a free
+     raw, the empty list `[]` for a strongly eliminated one, and a list
+     over other raws for a linear-constraint pivot. A raw is eliminated iff
+     its expansion is not the identity, and the layout keeps the pivots
+     alone, in `pivots`.
   3. Per-component physical Dirichlet detection: one pass per level
      over the level's raws, matching the physical faces each raw's
      function lies on against every condition's facets as face bitmasks
@@ -1082,10 +1077,10 @@ Keyword arguments:
     private resolver at `tolerance`, which is what a standalone `dof_layout` with
     no model behind it wants. Its tolerance must match `tolerance`.
 
-The integrated Legendre family produces single-raw constraints,
-reducing the resolved expansion to strong elimination (`raw_expansion =
-[]` for the pivoted raw), so assembly sees only active and constrained
-dofs. B-spline families produce multi-raw constraints encoding the C^m
+The integrated Legendre family produces single-raw constraints, each
+resolving to a strong elimination, so its layout has no pivot and
+assembly sees only active and constrained dofs. B-spline families
+below maximal continuity produce multi-raw constraints encoding the C^m
 trace-vanishing condition on artificial boundaries; assembly gives each
 pivot a local row and column of its own and condenses them onto the
 pivot's expansion once per integration region.
@@ -1148,22 +1143,27 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     _resolve_constraints!(raw_expansion, constraints, nraw)
     # A raw is "pivoted" (eliminated) iff its resolved expansion is anything other
     # than the trivial identity `[(raw, 1)]`. This local vector is construction
-    # scratch for the active enumeration and for `elimination_source` below; the
-    # layout exposes elimination only through `elimination_source` (`!== :free`).
+    # scratch for the active enumeration and for `elimination_source` and `pivots`
+    # below; the layout exposes elimination only through `elimination_source`
+    # (`!== :free`).
     eliminated = [length(e) != 1 || e[1] != (raw, one(T)) for (raw, e) in pairs(raw_expansion)]
     # Per-raw elimination source: the tracked coverage/dedup source, `:overlay` for
     # any other eliminated raw (overlay boundary; multi-raw B-spline pivots), and
     # `:free` when the raw survives. This doubles as the elimination flag.
     elimination_source = Symbol[eliminated[raw] ? get(source_of, raw, :overlay) : :free
                                 for raw in 1:nraw]
-    # A raw is "simple" if its expansion is either the identity
-    # `[(raw, 1)]` (free) or empty `[]` (strongly eliminated) — both of
-    # which assembly's slot table holds directly, as an active or a
-    # constrained local slot. Any other expansion (a redirect onto other
-    # raws) is a genuine linear constraint: assembly gives it a pivot slot
-    # of its own and condenses it once per region, K ← PᵀKP, b ← Pᵀb − lift.
-    has_linear_constraints = any(pairs(raw_expansion)) do (raw, e)
-        !(isempty(e) || (length(e) == 1 && e[1] == (raw, one(T))))
+    # Keep the linear-constraint pivots alone: the eliminated raws whose expansion
+    # is not empty, i.e. a redirect onto other raws. A free raw (the identity) and a
+    # strongly eliminated one (`[]`) are what `elimination_source` already says, and
+    # assembly's slot table holds them directly; a pivot gets a slot of its own and
+    # is condensed once per region, K ← PᵀKP, b ← Pᵀb − lift. The table stays empty
+    # without a pivot, and on the first one becomes per raw with one shared empty
+    # vector everywhere else, so readers test emptiness and nothing else.
+    pivots = Vector{Tuple{Int,T}}[]
+    for (raw, e) in pairs(raw_expansion)
+        (eliminated[raw] && !isempty(e)) || continue
+        isempty(pivots) && fill!(resize!(pivots, nraw), Tuple{Int,T}[])
+        pivots[raw] = e
     end
 
     # Stage 3: per-component physical Dirichlet detection, one face-mask pass per
@@ -1186,9 +1186,8 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     end
 
     layout = DofLayout{D,T}(ncomp, cell_dofs_by_level, raw_keys, level_raws, active_component,
-                            physical_dirichlet, elimination_source, raw_expansion,
-                            has_linear_constraints, zeros(T, nraw, ncomp), fill(:none, ncomp),
-                            [Int[] for _ in 1:ncomp], active_count, tolerance)
+                            physical_dirichlet, elimination_source, pivots, zeros(T, nraw, ncomp),
+                            fill(:none, ncomp), [Int[] for _ in 1:ncomp], active_count, tolerance)
 
     # Stage 4b: project nonzero Dirichlet data onto the boundary trace
     # space. Zero-only conditions skip this — `constrained_values` is
@@ -1285,17 +1284,15 @@ Recover the value of component `component` of raw dof `raw` — the unified
 accessor every reconstruction path uses when a basis-function contribution needs
 the actual dof value regardless of constraint status.
 
-Three regimes, matching the three shapes of `raw_expansion` (see
-[`DofLayout`](@ref)): a free dof reads `coefficients[active]`; a dof with no
-pivot expansion reads its [`constrained_value`](@ref), which is zero for an
-artificial-boundary or pruning elimination and the projected datum for a nonzero
-Dirichlet condition — including on a raw the constraint system left free, which is
-why the identity expansion is tested for and not only the empty one; and a
-**linear-constraint pivot** is reassembled from its expansion,
+An active dof reads `coefficients[active]`. A constrained one reads its
+[`constrained_value`](@ref) — zero for an artificial-boundary or pruning
+elimination, the projected datum for a nonzero Dirichlet condition — and, if it is
+a **linear-constraint pivot**, adds the pivot's expansion from the layout's
+`pivots` table (see [`DofLayout`](@ref)):
 
     u_raw = constrained_value(raw) + Σᵢ wᵢ · u_{rᵢ} .
 
-That third branch is not an embellishment. A pivot is precisely the mechanism a
+That pivot term is not an embellishment. A pivot is precisely the mechanism a
 basis family uses to impose C^m continuity or an arbitrary-mask trace condition,
 so reading `constrained_value` for it — which is zero — silently drops the dof's
 whole contribution from `value`, `field_gradient`, `l2_error`, `write_vtk` and
@@ -1305,18 +1302,14 @@ assembly condenses every pivot through the same expansion. Measured on a
 expansions of 126 raws), the dropped term reached 4.79e-7 against a field of
 magnitude 7e-2 — silent, and small enough to pass a hand-written tolerance.
 
-One level of expansion is enough on a resolved layout, because
-[`_resolve_constraints!`](@ref) leaves every pivot expressed in
-constraint-*free* raws only. The identity-expansion test is what makes that
-robust rather than assumed: physical Dirichlet elimination happens in a later
-stage than constraint resolution, so a raw that is free with respect to the
-constraint system can still be eliminated on one component, and it carries the
-identity expansion `[(raw, 1)]` rather than an empty one.
+One level of expansion is enough, because [`_resolve_constraints!`](@ref) leaves
+every pivot expressed over raws the constraint system leaves free. Such a branch
+may still be constrained on `component` by a physical Dirichlet condition, which
+is resolved later; it then contributes its constrained value rather than a
+coefficient.
 
-The `has_linear_constraints` short-circuit keeps the integrated-Legendre path to
-one extra field load and one extra branch per call, which is not free: measured on
-a reconstruction-heavy loop it costs about 1.36× the previous two-line body. The
-alternative is a silently wrong field, so it is paid.
+A layout without pivots — every integrated-Legendre layout — stops at the test
+for an empty table, before any per-raw read.
 
 The expansion is read through `_fold_pivot`, the one statement of the pivot rule
 that assembly reads as well, so a pivot cannot be reconstructed one way and
@@ -1330,6 +1323,18 @@ function dof_value(layout::DofLayout, coefficients, raw::Integer, component::Int
                            component)
     return value
 end
+
+"""
+    has_linear_constraints(layout::DofLayout) -> Bool
+
+Whether the layout carries a linear-constraint pivot: a raw that constraint
+resolution expressed through other raws (see [`DofLayout`](@ref)'s `pivots`),
+which assembly condenses and [`dof_value`](@ref) reconstructs. `false` for every
+integrated-Legendre and every maximal-continuity B-spline layout, whose
+eliminations are all strong; assembly reads it per field and skips the pivot
+search when it is `false`.
+"""
+has_linear_constraints(d::DofLayout) = !isempty(d.pivots)
 
 # The pivot rule, stated once. A linear-constraint pivot is
 #
@@ -1350,15 +1355,14 @@ end
 # the active id in whichever numbering the caller needs: a bare `DofLayout`'s, or
 # a `FieldLayout`'s, which shifts it into the global system. Returns
 # `(acc, true)` for a pivot. A non-pivot returns `(acc, false)` without calling
-# `f`: a free raw, a strongly eliminated one (empty expansion), and a raw that is
-# free with respect to the constraint system but that a later Dirichlet stage
-# eliminated on `c` (identity expansion `[(raw, 1)]`). Testing for the identity
-# is what keeps the depth-one property robust rather than assumed.
+# `f`, and needs no test of its own: the `pivots` table holds pivots only, so a
+# free raw, a strongly eliminated one and a constraint-free raw a Dirichlet
+# condition eliminated on `c` all read an empty entry — or an empty table, when
+# the layout has no pivot at all.
 @inline function _fold_pivot(f::F, acc, d::DofLayout, id::I, raw::Integer, c::Integer) where {F,I}
-    d.has_linear_constraints || return acc, false
-    expansion = d.raw_expansion[raw]
-    (isempty(expansion) || (length(expansion) == 1 && first(expansion[1]) == raw)) &&
-        return acc, false
+    isempty(d.pivots) && return acc, false
+    expansion = d.pivots[raw]
+    isempty(expansion) && return acc, false
     for (other, w) in expansion
         g = id(other, c)
         acc = f(acc, g, w, g == 0 ? constrained_value(d, other, c) : zero(w))
@@ -1445,8 +1449,8 @@ end
 Recover the value of component `component` of raw `raw` in this field,
 using the global active enumeration. Equivalent to the
 [`DofLayout`](@ref) version — including its reassembly of a
-linear-constraint pivot from `raw_expansion` — but resolves the per-field
-offset so `coefficients` is the global active vector.
+linear-constraint pivot from the layout's `pivots` table — but resolves the
+per-field offset so `coefficients` is the global active vector.
 """
 function dof_value(layout::FieldLayout, coefficients, raw::Integer, component::Integer=1)
     global_dof = _field_component_dof(layout, raw, component)
@@ -1473,12 +1477,11 @@ Total number of raw dof slots across every field (sum of
 """
 raw_dof_count(layout::SystemLayout) = sum(raw_dof_count(field.dofs) for field in layout.fields)
 
-# True iff any field's dof layout carries a non-trivial linear
-# constraint (a [`DofLayout`](@ref) `raw_expansion` that redistributes a
-# raw onto other raws). Assembly itself reads the per-field flag; this
-# system-wide form serves tests and diagnostics.
+# True iff any field's dof layout carries a linear-constraint pivot (a raw
+# redistributed onto other raws; see [`DofLayout`](@ref)'s `pivots`). Assembly
+# itself asks per field; this system-wide form serves tests and diagnostics.
 function has_linear_constraints(layout::SystemLayout)
-    any(field -> field.dofs.has_linear_constraints, layout.fields)
+    any(field -> has_linear_constraints(field.dofs), layout.fields)
 end
 
 # Resolve the unique field of a single-field layout. Used by the
