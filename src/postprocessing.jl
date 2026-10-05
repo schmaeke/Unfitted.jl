@@ -702,7 +702,7 @@ function _vtk_vector_array(array::Vector{SVector{2,T}}) where {T}
 end
 _vtk_vector_array(array::Vector) = array
 
-# ── Cut-cell refinement ──────────────────────────────────────────────────────
+# ── Cut-cell refinement ───────────────────────────────────────────────────────
 #
 # ParaView's Clip reconstructs ∂Ω from the `level_set` point array by linear
 # interpolation along each cell's edges, so the cut surface it draws is a
@@ -1225,7 +1225,7 @@ end
 _squared_norm(value::Number) = abs2(value)
 _squared_norm(value) = sum(abs2, value)
 
-# ── Boundary integration ─────────────────────────────────────────────────────
+# ── Boundary integration ──────────────────────────────────────────────────────
 #
 # Quadrature-only postprocessing on a portion of the boundary. It is a sum over
 # the quadrature-point walker (`_walk` in `assembly.jl`), so it integrates over

@@ -546,8 +546,6 @@ function Base.show(io::IO, diagnostics::AssemblyDiagnostics)
           diagnostics.small_overlap_count, ", solver=:", diagnostics.solver, ")")
 end
 
-# ── Model and lifecycle ───────────────────────────────────────────────────────
-
 # ── Single-sided region-cache keys ────────────────────────────────────────────
 #
 # A single-sided region list (`FacetRegion`s for a `BoundarySelector`,
@@ -665,6 +663,8 @@ function AssemblyCache{T}() where {T}
                             Pair{RegionKey,RegionList}[],
                             Pair{Tuple{Vector{RegionList},Bool},AssemblyPattern}[], T[], Any[])
 end
+
+# ── Model and lifecycle ───────────────────────────────────────────────────────
 
 """
     Model{D,T,P}

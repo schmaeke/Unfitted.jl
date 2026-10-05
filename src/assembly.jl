@@ -1116,6 +1116,25 @@ end
           "list; the symbolic and numeric passes disagree")
 end
 
+# Partition the columns `1:length(ptr)-1` of a CSC pattern into `tasks`
+# contiguous ranges of roughly equal entry count: range `t` ends at the first
+# column through which the pattern holds `t/tasks` of its entries, found by
+# bisection on `ptr`, and the last one runs to the final column. A range is
+# empty when one column holds more than a task's share. Contiguous by
+# construction, so the ranges own disjoint slots. An rhs-only pass, one entry
+# per dof, passes `ptr = 1:(n+1)` and gets `n` split into near-equal lengths.
+function _balanced_ranges(ptr::AbstractVector{Int}, tasks::Int)
+    m, total = length(ptr) - 1, ptr[end] - 1
+    ranges = Vector{UnitRange{Int}}(undef, tasks)
+    lo = 1
+    for t in 1:tasks
+        hi = t == tasks ? m : min(searchsortedfirst(ptr, div(t * total, tasks) + 1) - 1, m)
+        ranges[t] = lo:hi
+        lo = hi + 1
+    end
+    return ranges
+end
+
 # The phase-2 task body for the dof range `owned`: every region phase 1 computed,
 # in list order, adds its rhs entries of owned dofs and, for a matrix pass, its
 # owned columns. A region's dofs are sorted, so whether it touches `owned` is one
@@ -1141,25 +1160,6 @@ function _gather!(nz, rhs, pattern, dofs::RegionDofs, arena, offsets::Vector{Int
         end
     end
     return nothing
-end
-
-# Partition the columns `1:length(ptr)-1` of a CSC pattern into `tasks`
-# contiguous ranges of roughly equal entry count: range `t` ends at the first
-# column through which the pattern holds `t/tasks` of its entries, found by
-# bisection on `ptr`, and the last one runs to the final column. A range is
-# empty when one column holds more than a task's share. Contiguous by
-# construction, so the ranges own disjoint slots. An rhs-only pass, one entry
-# per dof, passes `ptr = 1:(n+1)` and gets `n` split into near-equal lengths.
-function _balanced_ranges(ptr::AbstractVector{Int}, tasks::Int)
-    m, total = length(ptr) - 1, ptr[end] - 1
-    ranges = Vector{UnitRange{Int}}(undef, tasks)
-    lo = 1
-    for t in 1:tasks
-        hi = t == tasks ? m : min(searchsortedfirst(ptr, div(t * total, tasks) + 1) - 1, m)
-        ranges[t] = lo:hi
-        lo = hi + 1
-    end
-    return ranges
 end
 
 # ── The kernel ────────────────────────────────────────────────────────────────
@@ -1661,16 +1661,6 @@ function _state_point!(state::FormState{D,R}, ws::AssemblyWorkspace, ::Val{G}) w
     return state
 end
 
-# Buffer index of `field` (a name or a `Field`), component `component`,
-# checking both.
-function _state_index(state::FormState, field::Union{Symbol,Field}, component::Integer)
-    name = field isa Field ? field.name : field
-    f = _field_index(state.layout, name)
-    1 <= component <= state.layout.fields[f].components ||
-        throw(BoundsError(state, (name, component)))
-    return state.offsets[f] + component
-end
-
 """
     value(state::FormState, name_or_field[, component=1])
 
@@ -1695,6 +1685,16 @@ function field_gradient(state::FormState, field::Union{Symbol,Field}, component:
     return state.gradients[_state_index(state, field, component)]
 end
 
+# Buffer index of `field` (a name or a `Field`), component `component`,
+# checking both.
+function _state_index(state::FormState, field::Union{Symbol,Field}, component::Integer)
+    name = field isa Field ? field.name : field
+    f = _field_index(state.layout, name)
+    1 <= component <= state.layout.fields[f].components ||
+        throw(BoundsError(state, (name, component)))
+    return state.offsets[f] + component
+end
+
 # Tiny helper raising the "no state attached" error from a single
 # location. Reaching it indicates a callback read `q.state` where it is
 # `nothing`: an assembly call or a walk given no `state =`, or a
@@ -1706,7 +1706,7 @@ end
 value(::Nothing, args...) = _no_form_state()
 field_gradient(::Nothing, args...) = _no_form_state()
 
-# ── Quadrature-point walker ───────────────────────────────────────────────────
+# ── Quadrature-point count and walker ─────────────────────────────────────────
 
 """
     nquadpoints(model::Model; kind::Symbol = :volume) -> Int
