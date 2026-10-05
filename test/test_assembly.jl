@@ -934,14 +934,14 @@ end
 @testset "the walker covers every on= target and subdomain with assembly's payload" begin
     # `foreach_quadrature_point(f, model; on, field, state)` walks the region list
     # that a form with the same `on=` and, on a coupled model, the same test field
-    # integrates over, and hands `f` the payload that form sees. Two loads record
-    # the whole payload during serial assembly with a state — on a facet of the
-    # second subdomain and on the volume of the first — and the walker with the
-    # same keywords and state must reproduce every record to the bit, since both
-    # build the payload in one place and evaluate the state through the same
-    # frame, basis refresh and per-point sums. The first subdomain has an overlay
-    # and nonzero Dirichlet data, so the state reads several parents and
-    # constrained values.
+    # integrates over, and hands `f` the payload that form sees. Loads record the
+    # whole payload during serial assembly with a state — on a facet of the
+    # second subdomain, and on an immersed surface and the volume of the first —
+    # and the walker with the same keywords and state must reproduce every
+    # record to the bit, since both build the payload in one place and evaluate
+    # the state through the same frame, basis refresh and per-point sums. The
+    # first subdomain has an overlay and nonzero Dirichlet data, so the state
+    # reads several parents and constrained values.
     V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2)
     V1 = overlay(V1, box((0.25, 0.25), (0.75, 0.75)); cells=(2, 2), order=3)
     V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(2, 2), order=3)
@@ -979,6 +979,18 @@ end
     end
     @test seen == collect(1:n)
     @test total == foldl(+, walked[p][3] for p in 1:n)
+
+    # A surface walk with a state: an immersed `BoundaryMesh` the problem never
+    # names, crossing the first subdomain's overlay, its subdomain named by
+    # `field` as for a boundary.
+    Γ = polyline_mesh([SVector(0.1, 0.5), SVector(0.9, 0.5)])
+    assembled, walked = Dict{Int,Any}(), Dict{Int,Any}()
+    assemble_vector(model, loadform(u1, probe(assembled, :u1); on=Γ); state=c, threaded=false)
+    foreach_quadrature_point(record(walked, :u1), model; on=Γ, field=:u1, state=c)
+    ns = nquadpoints(model; on=Γ, field=:u1)
+    @test ns > 0 && sort(collect(keys(walked))) == collect(1:ns)
+    @test walked == assembled
+    @test norm(walked[1][4]) ≈ 1.0 && walked[1][5] === nothing
 
     # A volume walk on one subdomain of a coupled model, selected by `field`
     # alone, and the count that sizes it.
@@ -1167,6 +1179,8 @@ end
         # final lower-triangle nnz (proves the superset→drop pipeline), and the
         # matrix stores no entry coupling the two components.
         @test length(only(model.assembly.patterns).second.rowval) > nnz(tril(model.matrix))
+        # The component dof ids come from the internal layout on purpose: no
+        # public accessor numbers the active dofs by component.
         layout = Unfitted._field_layout(model.dofs, :u)
         ids(c) = filter(!iszero, layout.dofs.active_component[:, c]) .+ layout.offset
         @test !isempty(ids(1)) && !isempty(ids(2))
