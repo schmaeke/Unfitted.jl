@@ -527,49 +527,72 @@ end
     @test value(s, model, (0.5,)) ≈ 0.2 atol = 1.0e-10
 end
 
-# Direct, basis-family-free unit test of the cascade resolver
-# `_resolve_constraints!`. Outside this test the resolver is exercised only
-# transitively through the B-spline Cᵐ overlay path, so this guards the
-# Gauss-elimination + back-substitution machinery on its own, with no
-# B-spline dependency. The hand-built system is engineered so that:
-#   * a later constraint pivots a raw that an EARLIER pivot's expansion
-#     still mentions (constraint B pivots raw 2, which constraint A's pivot
-#     expansion references), forcing step-5 back-substitution into the
-#     earlier pivot; and
-#   * a still-later constraint's raw list references a raw that is itself an
-#     earlier pivot (constraint C references raw 3), forcing step-1 forward
+# Direct, basis-family-free unit test of the cascade resolver `_cascade!`.
+# Outside this test the resolver is exercised only transitively through the
+# B-spline Cᵐ overlay path, so this guards the Gauss-elimination +
+# back-substitution machinery on its own, with no B-spline dependency. The
+# hand-built rows are engineered so that:
+#   * a later row pivots a raw that an EARLIER pivot's expansion still
+#     mentions (row B pivots raw 2, which row A's pivot expansion
+#     references), forcing step-5 back-substitution into the earlier pivot;
+#     and
+#   * a still-later row's raw list references a raw that is itself an
+#     earlier pivot (row C references raw 3), forcing step-1 forward
 #     substitution of the already-resolved expansion.
 # All coefficients are dyadic so the resolved (raw, weight) redirects are
 # exactly representable in Float64 and can be checked with `==`.
 @testset "linear-constraint resolver back-substitutes into earlier pivots" begin
-    nraw = 5
+    ledger = Unfitted.EliminationLedger{Float64}(5)
     # A:  u₁ +  u₂ + 2u₃ = 0  ⇒ pivot raw 3 = −½u₁ − ½u₂ (mentions raw 2).
     # B: 2u₂ +  u₄      = 0  ⇒ pivot raw 2 = −½u₄; back-substituted into raw 3.
     # C:  u₃ + 2u₅      = 0  ⇒ raw 3 already pivoted (forward substitution);
     #                          pivot raw 5 in terms of the free raws {1, 4}.
-    constraints = [Unfitted.LinearConstraint{Float64}([1, 2, 3], [1.0, 1.0, 2.0]),
-                   Unfitted.LinearConstraint{Float64}([2, 4], [2.0, 1.0]),
-                   Unfitted.LinearConstraint{Float64}([3, 5], [1.0, 2.0])]
+    Unfitted._constrain!(ledger, [1, 2, 3], [1.0, 1.0, 2.0], :overlay)
+    Unfitted._constrain!(ledger, [2, 4], [2.0, 1.0], :overlay)
+    Unfitted._constrain!(ledger, [3, 5], [1.0, 2.0], :overlay)
+    Unfitted._cascade!(ledger)
 
-    raw_expansion = Vector{Vector{Tuple{Int,Float64}}}(undef, nraw)
-    Unfitted._resolve_constraints!(raw_expansion, constraints, nraw)
+    # Free raws stay free; every pivot is redistributed onto the free raws
+    # {1, 4} only — the resolver's "free raws only" invariant after
+    # back-substitution.
+    @test ledger.source[1] === ledger.source[4] === :free
+    @test ledger.pivots[2] == [(4, -0.5)]
+    @test ledger.pivots[3] == [(1, -0.5), (4, 0.25)]
+    @test ledger.pivots[5] == [(1, 0.25), (4, -0.125)]
 
-    # Free raws keep the identity expansion; every pivot is redistributed
-    # onto the free raws {1, 4} only — the resolver's "free raws only"
-    # invariant after back-substitution.
-    @test raw_expansion[1] == [(1, 1.0)]
-    @test raw_expansion[4] == [(4, 1.0)]
-    @test raw_expansion[2] == [(4, -0.5)]
-    @test raw_expansion[3] == [(1, -0.5), (4, 0.25)]
-    @test raw_expansion[5] == [(1, 0.25), (4, -0.125)]
+    # The pivot table is what `has_linear_constraints` reads off a layout:
+    # non-empty iff some raw redirects onto *other* raws.
+    @test !isempty(ledger.pivots)
+end
 
-    # `has_linear_constraints` mirrors the predicate `dof_layout` derives
-    # from the resolved table: true iff some raw redirects onto *other* raws
-    # (neither the identity `[(raw, 1)]` nor the empty strong-elimination `[]`).
-    has_linear_constraints = any(pairs(raw_expansion)) do (raw, e)
-        !(isempty(e) || (length(e) == 1 && e[1] == (raw, 1.0)))
-    end
-    @test has_linear_constraints
+@testset "the ledger refuses a pivot over an eliminated raw" begin
+    # `_fold_pivot`, `dof_value` and assembly's condensation read one level of
+    # expansion and never chase a chain, so every pivot must be expressed over
+    # raws that stay free. A resolver that left a branch eliminated would make
+    # assembly and reconstruction disagree silently; the depth-one guard
+    # `dof_layout` runs once per build is what turns that into an error.
+    ledger = Unfitted.EliminationLedger{Float64}(3)
+    Unfitted._pivot!(ledger, 3, [(1, 0.5)], :overlay)
+    @test Unfitted._assert_resolved(ledger) === nothing
+    Unfitted._eliminate!(ledger, 1, :dedup)
+    @test_throws ArgumentError Unfitted._assert_resolved(ledger)
+
+    # A resolver records each raw it eliminates exactly once: a second `_pivot!`
+    # would overwrite the source and the expansion other readers rely on.
+    @test_throws ArgumentError Unfitted._pivot!(ledger, 3, [(2, 1.0)], :overlay)
+    @test_throws ArgumentError Unfitted._pivot!(ledger, 1, Tuple{Int,Float64}[], :overlay)
+    @test ledger.pivots[3] == [(1, 0.5)]
+    @test ledger.source == [:dedup, :free, :overlay]
+
+    # A direct elimination is credited to its first writer and ignores the rest,
+    # which is what keeps the artificial boundary's credit on a raw pruning also
+    # names; a strong `_pivot!` allocates no pivot table.
+    first_writer = Unfitted.EliminationLedger{Float64}(2)
+    Unfitted._eliminate!(first_writer, 1, :overlay)
+    Unfitted._eliminate!(first_writer, 1, :coverage)
+    Unfitted._pivot!(first_writer, 2, Tuple{Int,Float64}[], :dedup)
+    @test first_writer.source == [:overlay, :dedup]
+    @test isempty(first_writer.pivots)
 end
 
 @testset "elimination provenance credits the overlay, not covered-mode pruning" begin
@@ -593,27 +616,68 @@ end
     cache = Unfitted._ClassifyCache{2,Float64}()
     coverage = Unfitted.build_coverage(V, tol, cache)
     middle = V.levels[2]
-    level_keys = [key => raw for (raw, key) in pairs(layout.raw_keys) if key.level == middle.id]
-    candidates = Unfitted._coverage_constraints(middle, V, coverage, tol, level_keys, cache)
+    # The pruning hook alone, on a fresh ledger: every raw it eliminates is a
+    # pruning candidate, whether or not the overlay condition also names it.
+    ledger = Unfitted.EliminationLedger{Float64}(length(layout.raw_keys))
+    ctx = Unfitted._LevelContext(V, V.physical, tol, cache, coverage, layout.raw_keys,
+                                 Dict(k => r for (r, k) in pairs(layout.raw_keys)),
+                                 layout.level_raws[middle.id])
+    Unfitted._coverage_constraints!(ledger, middle, ctx)
+    candidates = [r for r in ctx.raws if ledger.source[r] !== :free]
 
     on_gamma_o(raw) = Unfitted._has_overlay_constraint(layout.raw_keys[raw], middle, V.physical,
                                                        V.domain, tol, cache)
-    collisions = count(c -> on_gamma_o(first(c).raws[1]), candidates)
+    collisions = count(on_gamma_o, candidates)
     # Non-vacuity: this stack really does produce raws carrying both constraints.
     @test collisions > 0
 
-    mislabelled = count(candidates) do (c, _)
-        raw = c.raws[1]
-        on_gamma_o(raw) && layout.elimination_source[raw] !== :overlay
-    end
+    mislabelled = count(r -> on_gamma_o(r) && layout.elimination_source[r] !== :overlay, candidates)
     @test mislabelled == 0
 
     # Every candidate that is *not* on Γ_o keeps its pruning provenance,
     # so the fix removes only the mislabelled ones.
     reduced = count(r -> layout.elimination_source[r] === :coverage ||
-                         layout.elimination_source[r] === :dedup,
-                    (c.raws[1] for (c, _) in candidates))
+                         layout.elimination_source[r] === :dedup, candidates)
     @test reduced == length(candidates) - collisions
+end
+
+# Bytes one integrated-Legendre artificial-boundary pass allocates, measured
+# inside a function so that only the call itself is counted.
+function _overlay_pass_bytes(ledger, level, ctx)
+    @allocated Unfitted._overlay_constraints!(ledger, level, ctx)
+end
+
+@testset "the artificial-boundary pass over an immersed level does not allocate per raw" begin
+    # `Space.physical` is abstractly typed. The dof-layer hooks read it from a
+    # `_LevelContext` built behind a function barrier, so the per-raw predicate
+    # `_has_overlay_constraint` — which classifies the inactive neighbour of every
+    # fold face — specialises on the concrete physical domain. Read off the space
+    # instead, it dispatched dynamically on every raw and boxed its arguments, which
+    # is an allocation per raw on every layout build of an immersed space.
+    disc = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.37; lipschitz=1.0,
+                           subcell_length_scale=1 / 128, max_depth=3)
+    for n in (16, 32)
+        problem = mass(space(box((0.0, 0.0), (1.0, 1.0)); cells=n, order=2, physical=disc))
+        # The folded space and its warm classification cache, exactly as `prepare`
+        # hands them to the layout build.
+        _, spaces, caches = Unfitted._prepare_spaces(problem)
+        V, cache = only(spaces), only(caches)
+        level = only(V.levels)
+        raw_by_key, raw_keys, _, level_raws = Unfitted._enumerate_raws(V)
+        ctx = Unfitted._LevelContext(V, V.physical, Unfitted.GeometryTolerance(Float64), cache,
+                                     Unfitted.Coverage{2}(Dict{Int,BitArray{2}}()), raw_keys,
+                                     raw_by_key, level_raws[level.id])
+        @test ctx isa Unfitted._LevelContext{2,Float64,typeof(V),typeof(V.physical)}
+        # Non-vacuity: the fold deactivated cells, so the pass walks fold faces.
+        @test count(!, level.mask.on) > 0
+        ledger() = Unfitted.EliminationLedger{Float64}(length(raw_keys))
+        Unfitted._overlay_constraints!(ledger(), level, ctx)      # compile once
+        fresh = ledger()
+        @test _overlay_pass_bytes(fresh, level, ctx) <= 1024
+        # The fold exemption: a fold face carries no physical trace, so no mode is
+        # eliminated on it, and every box face of this level is physical.
+        @test all(==(:free), fresh.source)
+    end
 end
 
 @testset "a dormant level does not change the base space's Dirichlet lift" begin

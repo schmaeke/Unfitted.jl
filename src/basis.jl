@@ -38,8 +38,9 @@ A new family `F <: BasisFamily` must provide:
   - `is_boundary_basis(::F, id, axis, side)` — per-axis facet incidence.
   - the dof-key and overlay-constraint hooks the dof layer needs:
     `_tensor_dof_key`, `_key_on_level_side`, and either the per-raw
-    `_has_overlay_constraint` predicate or a whole-level `_overlay_constraints`
-    generator (see `src/dofs.jl`).
+    `_has_overlay_constraint` predicate or a whole-level `_overlay_constraints!`
+    method that records into the dof layer's `EliminationLedger` (see
+    `src/dofs.jl`).
   - `instantiate_basis(::F, mesh, order, mode, mask)` — only when the concrete
     family depends on the level's mesh. The `::BasisFamily` default returns the
     family unchanged; see [`instantiate_basis`](@ref) for the five-argument
@@ -72,8 +73,8 @@ about them deliberately:
     solution. Both shipped families answer `true`: the fold exemption is the one
     thing a family must supply, and it is a single test on the inactive
     neighbour of a face.
-  - `_coverage_constraints` (`src/dofs.jl`) — the generic method returns no
-    constraints, so on a family that does not override it the space's leaf
+  - `_coverage_constraints!` (`src/dofs.jl`) — the generic method records
+    nothing, so on a family that does not override it the space's leaf
     semantics stay on and do nothing. Overriding it is not only about
     shedding dofs: where a covering level's span *contains* one of this level's
     functions, the two are linearly dependent and the superposed operator is

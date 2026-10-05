@@ -533,7 +533,7 @@ end
 
 @testset "ladder composes with B-splines" begin
     # The B-spline family reaches covered-mode pruning through its own
-    # `_coverage_constraints`, which dedups rather than sheds bubbles; a nested
+    # `_coverage_constraints!`, which dedups rather than sheds bubbles; a nested
     # stack is non-singular only because that dedup fires. `lossless` compares
     # against the unreduced twin, which for this family is rank-deficient by
     # exactly the deduped modes, so it is the right check here too.

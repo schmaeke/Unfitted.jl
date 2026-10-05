@@ -393,7 +393,7 @@ end
 #
 # A family that declares `_supports_cell_order` supplies its own method where its
 # dof-key incidence machinery lives, exactly as a family supplies its own
-# `_coverage_constraints`: integrated Legendre's is in `dofs.jl`, next to
+# `_coverage_constraints!`: integrated Legendre's is in `dofs.jl`, next to
 # `_entity_carries` and the `TensorDofKey` factors it is expressed over, and the
 # B-spline family's would live in its extension. A family that has not supplied
 # one may only be handed a single-entry palette, and the refusal below is loud on
@@ -1041,9 +1041,9 @@ elimination: a buried function is dropped exactly when a nested level above
 reproduces it, which for that family is not an accuracy trade at all but the
 thing that keeps a nested stack non-singular — see `bspline` in the
 `BasicBSpline` extension. Any further family takes the generic
-`_coverage_constraints` fallback, which returns no constraints, so on such a
+`_coverage_constraints!` fallback, which records nothing, so on such a
 space leaf semantics eliminate nothing. See `src/coverage.jl` and
-`_coverage_constraints` in `src/dofs.jl`;
+`_coverage_constraints!` in `src/dofs.jl`;
 `diagnostics(...).reduced_mode_counts` reports the per-level count.
 """
 function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(),

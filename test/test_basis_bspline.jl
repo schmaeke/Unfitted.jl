@@ -582,8 +582,8 @@ end
 end
 
 @testset "Linear-constraint resolver: cascade through chained pivots" begin
-    # Hand-crafted constraint system that requires the back-substitution
-    # branch of `_resolve_constraints!`. Three raws, two constraints:
+    # Hand-crafted rows that require the back-substitution branch of
+    # `_cascade!`. Three raws, two rows:
     #
     #     C1:  u₁ − u₂ = 0       greedy pivots u₁, expansion = [(2, 1)]
     #     C2:  2 u₂ − u₃ = 0     greedy pivots u₂, expansion = [(3, 0.5)]
@@ -592,13 +592,12 @@ end
     # u₂ becomes a pivot: u₁ = u₂ = 0.5 u₃. Without the back-substitute
     # step u₁ would still mention the now-pivoted u₂ and the assembly
     # would chase a stale pointer.
-    constraints = [Unfitted.LinearConstraint{Float64}([1, 2], [1.0, -1.0]),
-                   Unfitted.LinearConstraint{Float64}([2, 3], [2.0, -1.0])]
-    expansion = Vector{Vector{Tuple{Int,Float64}}}(undef, 3)
-    Unfitted._resolve_constraints!(expansion, constraints, 3)
-    @test expansion[1] == [(3, 0.5)]
-    @test expansion[2] == [(3, 0.5)]
-    @test expansion[3] == [(3, 1.0)]
+    ledger = Unfitted.EliminationLedger{Float64}(3)
+    Unfitted._constrain!(ledger, [1, 2], [1.0, -1.0], :overlay)
+    Unfitted._constrain!(ledger, [2, 3], [2.0, -1.0], :overlay)
+    Unfitted._cascade!(ledger)
+    @test ledger.pivots[1] == ledger.pivots[2] == [(3, 0.5)]
+    @test ledger.source[3] === :free
 end
 
 @testset "Linear-constraint resolver: a constraint that collapsed to 0 = 0 eliminates nothing" begin
@@ -609,12 +608,15 @@ end
     # `0 · u = 0` constrains nothing; pivoting on it would strongly eliminate u.
     @test isempty(Unfitted._combine_terms([(1, 0.0)]))
     @test Unfitted._combine_terms([(1, 2.0)]) == [(1, 2.0)]
-    constraints = [Unfitted.LinearConstraint{Float64}([1, 2], [1.0, 0.0]),
-                   Unfitted.LinearConstraint{Float64}([1, 2], [1.0, 0.0])]
-    expansion = Vector{Vector{Tuple{Int,Float64}}}(undef, 2)
-    Unfitted._resolve_constraints!(expansion, constraints, 2)
-    @test expansion[1] == []            # the constraint that says something
-    @test expansion[2] == [(2, 1.0)]    # its duplicate leaves u₂ free
+    ledger = Unfitted.EliminationLedger{Float64}(2)
+    Unfitted._constrain!(ledger, [1, 2], [1.0, 0.0], :overlay)
+    Unfitted._constrain!(ledger, [1, 2], [1.0, 0.0], :overlay)
+    Unfitted._cascade!(ledger)
+    # The row that says something eliminates u₁ strongly: an empty expansion,
+    # which leaves the pivot table unallocated.
+    @test ledger.source[1] !== :free
+    @test isempty(ledger.pivots)
+    @test ledger.source[2] === :free    # its duplicate leaves u₂ free
 
     # The configuration that reaches it end to end. A *masked* level below maximal
     # continuity is the only shape that still emits multi-raw trace constraints: an
@@ -712,7 +714,7 @@ end
     # B-spline base + C¹ B-spline overlay whose four corners are *inside*
     # the base's mesh, so each corner raw participates in artificial-
     # boundary constraints from *both* axes (each at derivative orders
-    # k = 0 and k = 1). The greedy cascade in `_resolve_constraints!`
+    # k = 0 and k = 1). The greedy cascade in `_cascade!`
     # must produce a non-singular system — coverage for the
     # back-substitution branch Cᵐ overlay corners reach.
     #
@@ -772,6 +774,40 @@ end
     mf, lf = _gram(nested(3); prune=false)
     @test count(==(:dedup), lf.elimination_source) == 0
     @test rank(Symmetric(Matrix(mf.matrix))) == active_unknowns(lf) - 1
+end
+
+@testset "BSpline extension: a clamped level credits the trace row a dedup follows" begin
+    # A maximal base, a C¹ overlay clamped at its artificial faces, and an
+    # integrated-Legendre cover over one corner of the overlay. On the clamped
+    # level the dedup and the trace rows can name the same function: a buried
+    # function whose support reaches the overlay's own face is a term of a trace
+    # row there. The trace rows are resolved first and already eliminate it, so
+    # its one-term dedup row collapses to `0 = 0` and eliminates nothing, and the
+    # raw must be credited to the trace row that removed it. Crediting the dedup
+    # instead labelled 12 of the overlay's trace eliminations `:dedup`, and
+    # `reduced_mode_counts` (and the `reduced_dofs` cell array `write_vtk`
+    # exports) reported 16 deduplicated functions on the overlay where 4 are.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3, basis=bspline())
+    V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=8, order=3, basis=bspline(; continuity=1))
+    V = overlay(V, box((0.25, 0.25), (0.5, 0.5)); cells=4, order=3, basis=IntegratedLegendre())
+    problem = poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))])
+    model = prepare(problem)
+    @test diagnostics(model).reduced_mode_counts == [1, 4, 0]
+
+    # The trace rows alone: an unpruned build records no dedup, so what it
+    # eliminates on the overlay is exactly what the trace rows eliminate. The raw
+    # numbering does not depend on pruning.
+    pruned = only(model.dofs.fields).dofs
+    unpruned = only(prepare(problem; prune=false).dofs.fields).dofs
+    @test unpruned.raw_keys == pruned.raw_keys
+    trace = [r for r in pruned.level_raws[2] if unpruned.elimination_source[r] !== :free]
+    @test !isempty(trace)
+    @test all(r -> Unfitted.constraint_kind(pruned, r) === :overlay, trace)
+    # Non-vacuity: the dedup does fire on the overlay, on functions the trace rows
+    # leave free.
+    deduped = [r for r in pruned.level_raws[2] if pruned.elimination_source[r] === :dedup]
+    @test length(deduped) == 4
+    @test all(r -> unpruned.elimination_source[r] === :free, deduped)
 end
 
 @testset "BSpline extension: a fictitious fold does not disable the dedup" begin

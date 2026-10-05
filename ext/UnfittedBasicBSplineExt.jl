@@ -74,18 +74,21 @@ global 1D function index via the `_AXIS_BSPLINE` tag.
     derivatives) using `BasicBSpline.bsplinebasisall` per axis after
     mapping the cell-local reference coordinate `ξ ∈ [−1, 1]` to the
     knot-vector parameter.
-  - `_tensor_dof_key`, `_key_on_level_side`, and `_overlay_constraints`
-    overloads that route through the `_AXIS_BSPLINE` tag.
-  - The `_overlay_constraints` overload, which carries both artificial-boundary
-    mechanisms. At `continuity = :maximal` it is the **support selection**: one
-    single-raw strong elimination for every function whose `(p_d + 1)`-cell
-    support is not contained in the level's admissible region, and no linear
-    constraint at all, so `has_linear_constraints` stays `false` and assembly
-    has no pivot to look for or condense. At an integer
-    `continuity = m < p_d − 1` it emits the homogeneous trace-vanishing
-    [`LinearConstraint`](@ref)s (orders `k = 0 … m`) on every overlay / mask
-    face. Masked levels of any geometry are eliminable either way.
-  - A `_coverage_constraints` overload. Covered-mode pruning for this family is
+  - `_tensor_dof_key` and `_key_on_level_side` overloads that route through the
+    `_AXIS_BSPLINE` tag.
+  - The `_overlay_constraints!` overload, which carries both artificial-boundary
+    mechanisms and writes them into the dof layer's
+    [`EliminationLedger`](@ref). At `continuity = :maximal` it is the **support
+    selection**: a strong elimination (`_eliminate!`) of every function whose
+    `(p_d + 1)`-cell support is not contained in the level's admissible region,
+    and no linear constraint at all, so the layout has no pivot,
+    `has_linear_constraints` is `false`, and assembly has no pivot to look for or
+    condense. At an integer `continuity = m < p_d − 1` it records the
+    homogeneous trace-vanishing conditions (orders `k = 0 … m`) on every overlay
+    / mask face as linear-constraint rows (`_constrain!`), which the dof layer
+    resolves into pivots. Masked levels of any geometry are eliminable either
+    way.
+  - A `_coverage_constraints!` overload. Covered-mode pruning for this family is
     the dedup and nothing else: a buried function a covering level's span
     already contains exactly is eliminated, because the two are linearly
     dependent and the superposition is otherwise singular. Under selection the
@@ -111,7 +114,7 @@ using Unfitted
 # definition, which needs no import. The list is therefore an honest measure of
 # how far the extension reaches into the package.
 using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, LevelMask, AxisDofKey,
-                TensorDofKey, GeometryTolerance, LinearConstraint, Space, Coverage, cell_box,
+                TensorDofKey, EliminationLedger, _LevelContext, _eliminate!, _constrain!, cell_box,
                 cell_indices, is_active, AxisBox, _AXIS_BSPLINE, _check_basis_mode,
                 _level_side_is_physical, _tensor_dof_key, _ClassifyCache, _is_fictitious,
                 _nested_over, _reproduced_on_domain, classify_cell
@@ -338,7 +341,7 @@ Fields:
     [`_MAXIMAL_CONTINUITY`](@ref) sentinel for `C^{p_d − 1}` per axis. The two
     are different *mechanisms*, not just different numbers: at the sentinel the
     level selects the functions whose full support lies inside its admissible
-    region and emits single-raw eliminations, while a requested `m < p_d − 1`
+    region and eliminates the rest strongly, while a requested `m < p_d − 1`
     clamps the level at its artificial faces and imposes trace-vanishing
     conditions of orders `0 … m`. See [`bspline`](@ref).
 
@@ -382,8 +385,9 @@ end
 # B-spline parameter coincides with the cell's mesh index.
 #
 # Boundary conditions on the artificial overlay boundary (mesh-edge
-# faces and mask-induced internal faces) are imposed via the
-# linear-constraint system in `_overlay_constraints` below — *not*
+# faces and mask-induced internal faces) are imposed by
+# `_overlay_constraints!` below — by support selection at maximal
+# continuity, by trace-vanishing linear constraints below it — *not*
 # via knot multiplicity. This keeps the basis globally `C^{p − 1}`
 # inside the active region regardless of mask geometry.
 function _open_knot_vector(axis_coords::AbstractVector{T}, p::Integer) where {T<:Real}
@@ -437,7 +441,7 @@ end
 # A request for an integer `continuity = m` that already equals `p_d − 1` on
 # every axis is normalised to the `:maximal` sentinel. The two name the same
 # space — the proof is in `bspline`'s docstring — but selection reaches it with
-# single-raw eliminations rather than a constraint cascade, so routing the
+# strong eliminations rather than a constraint cascade, so routing the
 # integer spelling through the cheaper mechanism costs the caller nothing and
 # saves the dof layer a pass.
 function Unfitted.instantiate_basis(spec::_BSplineSpec, mesh::CartesianMesh{D,T},
@@ -628,8 +632,9 @@ end
 # integrated there, so the truncated and untruncated functions agree on Ω and the
 # function may stay. That single distinction is the whole of this family's
 # finite-cell compatibility — it is what keeps a cut cell's modes alive instead of
-# constraining them away — and it costs one classification per inactive cell,
-# already cached by `prepare`'s fold.
+# constraining them away — and it costs one classification per inactive cell. The
+# fold classifies only the cells that were active before it, so that is a cache hit
+# for a cell the fold switched off and a fresh classification for a user-masked one.
 #
 # Materialised as a dense `Array{Bool,D}` rather than asked per function because
 # a degree-`p` function's support meets `(p + 1)^D` cells and every cell is
@@ -661,20 +666,23 @@ struct _Admissibility{D,T,P,S}
     cache::_ClassifyCache{D,T}
 end
 
-function _admissibility(level::Level{D,T,S}, V::Space{D,T}, tol::GeometryTolerance{T},
-                        cache::_ClassifyCache{D,T}) where {D,T,S}
+# The admissibility record of `level`, read off the hook context of the level being
+# processed. `level` may be another level of the same space — the burial test builds
+# one for each covering level — because everything it takes from `ctx` (the domain,
+# the physical domain, the tolerance and the classification cache) is space-wide.
+# `ctx.physical` is concretely typed, so `P` is too, and every admissibility query
+# specialises on it.
+function _admissibility(level::Level{D,T,S}, ctx::_LevelContext{D,T}) where {D,T,S}
     mesh = level.mesh
     width = ntuple(d -> (mesh.domain.upper[d] - mesh.domain.lower[d]) / mesh.cells[d], D)
-    return _Admissibility{D,T,typeof(V.physical),S}(level,
-                                                    _admissible_cells(level, V.physical, cache),
-                                                    ntuple(d -> _level_side_is_physical(level,
-                                                                                        V.domain, d,
-                                                                                        :lower, tol),
-                                                           D),
-                                                    ntuple(d -> _level_side_is_physical(level,
-                                                                                        V.domain, d,
-                                                                                        :upper, tol),
-                                                           D), width, V.physical, cache)
+    domain, tol = ctx.space.domain, ctx.tolerance
+    lower = ntuple(d -> _level_side_is_physical(level, domain, d, :lower, tol), D)
+    upper = ntuple(d -> _level_side_is_physical(level, domain, d, :upper, tol), D)
+    return _Admissibility{D,T,typeof(ctx.physical),S}(level,
+                                                      _admissible_cells(level, ctx.physical,
+                                                                        ctx.classify_cache), lower,
+                                                      upper, width, ctx.physical,
+                                                      ctx.classify_cache)
 end
 
 # The box of cell `c` of the level's grid, for a `c` that may lie outside
@@ -751,8 +759,8 @@ function _support_admissible(a::_Admissibility{D,T,P,<:BSplineFamily},
     return _block_admissible(a, lo, hi)
 end
 
-# `_overlay_constraints` at `continuity = :maximal`: one single-raw strong
-# elimination per function whose support is not admissible, and nothing else.
+# `_overlay_constraints!` at `continuity = :maximal`: one strong elimination per
+# function whose support is not admissible, and nothing else.
 #
 # This is the whole artificial-boundary treatment for a maximal-continuity level,
 # and it is a *selection* rather than a constraint system. The functions that
@@ -774,17 +782,13 @@ end
 # Arbitrary mask geometries are handled without a special case, because
 # containment is a per-function test and knows nothing about the shape of the
 # region it tests against.
-function _selection_constraints(level::Level{D,T,<:BSplineFamily}, V::Space{D,T},
-                                tol::GeometryTolerance{T},
-                                level_keys::AbstractVector{Pair{TensorDofKey{D},Int}},
-                                cache::_ClassifyCache{D,T}) where {D,T}
-    admissibility = _admissibility(level, V, tol, cache)
-    constraints = LinearConstraint{T}[]
-    for (key, raw) in level_keys
-        _support_admissible(admissibility, key) && continue
-        push!(constraints, LinearConstraint{T}([raw], [one(T)]))
+function _selection_constraints!(ledger::EliminationLedger, level::Level{D,T,<:BSplineFamily},
+                                 ctx::_LevelContext{D,T}) where {D,T}
+    admissibility = _admissibility(level, ctx)
+    for raw in ctx.raws
+        _support_admissible(admissibility, ctx.raw_keys[raw]) || _eliminate!(ledger, raw, :overlay)
     end
-    return constraints
+    return ledger
 end
 
 # ── Boundary classification and Dirichlet trace ───────────────────────────────
@@ -796,8 +800,8 @@ end
 # lower edge, index `dim` at the upper edge for an open clamped knot
 # vector) carries the Dirichlet value. Higher-derivative constraints
 # (`continuity ≥ 1`) at the **overlay-artificial** boundary are
-# imposed via the linear-constraint system in
-# [`_overlay_constraints`](@ref), not through this predicate.
+# imposed by the linear-constraint rows
+# [`_overlay_constraints!`](@ref) records, not through this predicate.
 function Unfitted._key_on_level_side(key::TensorDofKey{D}, level::Level{D,T,<:BSplineFamily},
                                      axis::Integer, side::Symbol) where {D,T}
     axis_key = key.axes[axis]
@@ -809,13 +813,14 @@ function Unfitted._key_on_level_side(key::TensorDofKey{D}, level::Level{D,T,<:BS
     throw(ArgumentError("boundary side must be :lower or :upper"))
 end
 
-# Generate the homogeneous linear constraints encoding the
-# trace-vanishing condition `∂^k u^(level) / ∂n^k = 0` for
-# `k = 0, …, m` on every artificial face of the level's active
-# region. Replaces the per-raw `_has_overlay_constraint` predicate
-# the integrated-Legendre family uses with a multi-raw constraint
-# generator that exploits the tensor-product structure of the
-# B-spline basis.
+# The B-spline `_overlay_constraints!`. At `continuity = :maximal` it is the
+# support selection above. Below it, it records the homogeneous linear
+# constraints encoding the trace-vanishing condition `∂^k u^(level) / ∂n^k = 0`
+# for `k = 0, …, m` on every artificial face of the level's active region, as
+# rows of the ledger (`_constrain!`, credited to `:overlay`). That replaces the
+# per-raw `_has_overlay_constraint` predicate the integrated-Legendre family uses
+# with a multi-raw constraint generator that exploits the tensor-product
+# structure of the B-spline basis.
 #
 # Mathematics. At an artificial face perpendicular to axis `d` at
 # physical coordinate `t* = axes[d][cell]`, the trace condition
@@ -836,11 +841,12 @@ end
 # `TensorDofKey → raw` map, with a representative active cell chosen
 # on the active side of the face. For arbitrary mask geometries the
 # *same* α' may produce *identical* constraints from multiple
-# `(perp_cell, perp_local_mode)` iterations — the cascade resolver in
-# `_resolve_constraints!` treats subsequent identical emissions as
-# trivially satisfied (the constraint collapses to `0 = 0` after
-# substitution), so the redundancy is correctness-preserving and the
-# performance overhead is small for typical mask layouts.
+# `(perp_cell, perp_local_mode)` iterations. The redundancy is
+# correctness-preserving: the cascade resolver `_cascade!` substitutes the
+# first emission's pivot into each re-emission, which then collapses to
+# `0 = 0` and eliminates nothing. Its cost is per face — a re-emission is one
+# more row of `p_d + 1` terms to substitute and combine for each perpendicular
+# cell that touches the face.
 #
 # `continuity = 0` (`m = 0`) generates the classical C⁰
 # vanishing-trace constraint — the same condition a C⁰ knot insertion at
@@ -853,22 +859,20 @@ end
 #     *Weakly Enforced Essential Boundary Conditions for NURBS-embedded and
 #     trimmed NURBS geometries on the basis of the Finite Cell Method*,
 #     Int. J. Numer. Methods Engng. 95 (2013) 811–846.
-function Unfitted._overlay_constraints(level::Level{D,T,<:BSplineFamily}, V::Space{D,T},
-                                       tol::GeometryTolerance{T},
-                                       raw_by_key::AbstractDict{TensorDofKey{D},Int},
-                                       level_keys::AbstractVector{Pair{TensorDofKey{D},Int}},
-                                       classify_cache::Unfitted._ClassifyCache{D,T}) where {D,T}
-    _selects_by_support(level.basis) &&
-        return _selection_constraints(level, V, tol, level_keys, classify_cache)
-    # `level_keys` (this level's pre-bucketed raws) is unused on the clamped
-    # path: the trace generator walks the mesh face/perp grids and looks up raws
-    # through `raw_by_key` directly. `classify_cache` goes to
-    # `_active_cell_at_face`, which reads it to tell a fictitious fold face
-    # from a user-mask face; with `V.physical === nothing` it is never touched.
+function Unfitted._overlay_constraints!(ledger::EliminationLedger,
+                                        level::Level{D,T,<:BSplineFamily},
+                                        ctx::_LevelContext{D,T}) where {D,T}
+    _selects_by_support(level.basis) && return _selection_constraints!(ledger, level, ctx)
+    # The clamped path does not walk `ctx.raws`: the trace generator walks the
+    # mesh face/perp grids and looks raws up through `ctx.raw_by_key`, and every
+    # key it builds carries `level.id`, so its rows name only this level's raws.
+    # `ctx.classify_cache` goes to `_active_cell_at_face`, which reads it to tell
+    # a fictitious fold face from a user-mask face; with no physical domain it
+    # is never touched.
     family = level.basis
     m = family.continuity
     n_cells = level.mesh.cells
-    constraints = LinearConstraint{T}[]
+    domain, tol, raw_by_key = ctx.space.domain, ctx.tolerance, ctx.raw_by_key
 
     for d in 1:D
         p_d = degree(family.spaces[d])
@@ -881,8 +885,8 @@ function Unfitted._overlay_constraints(level::Level{D,T,<:BSplineFamily}, V::Spa
             # Skip physical-boundary edges — the physical-Dirichlet
             # branch in `dof_layout` handles them, not the overlay
             # constraint.
-            j == 0 && _level_side_is_physical(level, V.domain, d, :lower, tol) && continue
-            j == n_cells[d] && _level_side_is_physical(level, V.domain, d, :upper, tol) && continue
+            j == 0 && _level_side_is_physical(level, domain, d, :lower, tol) && continue
+            j == n_cells[d] && _level_side_is_physical(level, domain, d, :upper, tol) && continue
 
             t_star = j == 0 ? family.axis_coords[d][1] :
                      j == n_cells[d] ? family.axis_coords[d][end] : family.axis_coords[d][j + 1]
@@ -899,8 +903,8 @@ function Unfitted._overlay_constraints(level::Level{D,T,<:BSplineFamily}, V::Spa
             coeffs_lower, coeffs_upper = _trace_coeffs(P_d, lower_span, upper_span, t_star, Val(m))
 
             for perp_cell in perp_cells
-                located = _active_cell_at_face(level, d, j, perp_cell, n_cells, Val(D), V.physical,
-                                               classify_cache)
+                located = _active_cell_at_face(level, d, j, perp_cell, n_cells, Val(D),
+                                               ctx.physical, ctx.classify_cache)
                 located === nothing && continue
                 active_cell, span = located
                 coeffs_for_span = span == lower_span ? coeffs_lower : coeffs_upper
@@ -920,13 +924,13 @@ function Unfitted._overlay_constraints(level::Level{D,T,<:BSplineFamily}, V::Spa
                             push!(raws, raw)
                             push!(cs, T(coeffs[i + 1]))
                         end
-                        isempty(raws) || push!(constraints, LinearConstraint{T}(raws, cs))
+                        isempty(raws) || _constrain!(ledger, raws, cs, :overlay)
                     end
                 end
             end
         end
     end
-    return constraints
+    return ledger
 end
 
 # Per-face trace coefficients (axis-d B-spline values and derivatives at
@@ -1131,7 +1135,7 @@ function _reproduced_by_selection(level::Level{D,T,<:BSplineFamily}, key::Tensor
     return _block_admissible(cover, flo, fhi)
 end
 
-# `_coverage_constraints` for a B-spline level — the dedup half only, and it is
+# `_coverage_constraints!` for a B-spline level — the dedup half only, and it is
 # the whole of covered-mode pruning for this family.
 #
 # Integrated Legendre splits into a linear skeleton plus bubble modes, so it can
@@ -1150,22 +1154,21 @@ end
 # removes is exactly `{β : supp β ⊆ Ω^{k}}`, the functions Kraft's construction
 # drops from the coarse level when a finer one takes over (Giannelli, Jüttler,
 # Speleers, Comput. Aided Geom. Design 29 (2012) 485–498, Definition 1(I)). The
-# fine half is the support selection in `_selection_constraints`; together they
+# fine half is the support selection in `_selection_constraints!`; together they
 # are the hierarchical spline basis, stated for superposed independent grids.
-function Unfitted._coverage_constraints(level::Level{D,T,<:BSplineFamily}, V::Space{D,T},
-                                        coverage::Coverage{D}, tol::GeometryTolerance{T},
-                                        level_keys::AbstractVector{Pair{TensorDofKey{D},Int}},
-                                        classify_cache::_ClassifyCache{D,T}) where {D,T}
-    out = Tuple{LinearConstraint{T},Symbol}[]
-    cov = coverage.covered[level.id]
-    any(cov) || return out
+function Unfitted._coverage_constraints!(ledger::EliminationLedger,
+                                         level::Level{D,T,<:BSplineFamily},
+                                         ctx::_LevelContext{D,T}) where {D,T}
+    cov = ctx.coverage.covered[level.id]
+    any(cov) || return ledger
     family = level.basis
     n = level.mesh.cells
     p = ntuple(d -> degree(family.spaces[d]), D)
+    physical, tol, cache = ctx.physical, ctx.tolerance, ctx.classify_cache
     above = [k
-             for k in V.levels
+             for k in ctx.space.levels
              if k.id > level.id && _reproduces(k, p) && _nested_over(level, k, tol)]
-    isempty(above) && return out
+    isempty(above) && return ledger
     # One reproduction predicate per covering level, chosen by what that cover
     # actually is. A cover that selects by support answers the question *exactly*,
     # by walking the subdivision and asking whether every fine function in it
@@ -1176,7 +1179,7 @@ function Unfitted._coverage_constraints(level::Level{D,T,<:BSplineFamily}, V::Sp
     # boundary is not described by any statement about supports, and the
     # conservative geometric predicate `_reproduced_on_domain` is the right one.
     selecting(k) = k.basis isa BSplineFamily && _selects_by_support(k.basis)
-    covers = [selecting(k) ? _admissibility(k, V, tol, classify_cache) : nothing for k in above]
+    covers = [selecting(k) ? _admissibility(k, ctx) : nothing for k in above]
     # `coverage`'s per-cell verdict is a prefilter for the clamped path only. It
     # tests the *whole* cell box against the cover's box, which under an immersed
     # geometry can reject a cell whose material part the cover does reach — the rest
@@ -1184,7 +1187,8 @@ function Unfitted._coverage_constraints(level::Level{D,T,<:BSplineFamily}, V::Sp
     # path needs no prefilter: its first block test fails immediately for a function
     # nowhere near the cover, which is what keeps the walk off the level's bulk.
     clamped_only = all(isnothing, covers)
-    for (key, raw) in level_keys
+    for raw in ctx.raws
+        key = ctx.raw_keys[raw]
         cells = _support_cells(key, family, n)
         # The level-side half, and it holds for BOTH mechanisms. A *user-masked*
         # support cell blocks: what a masked level assembles is the function truncated
@@ -1195,8 +1199,8 @@ function Unfitted._coverage_constraints(level::Level{D,T,<:BSplineFamily}, V::Sp
         # approximation rather than a null mode: measured on a `continuity = 0` base of
         # 4² masked at one interior cell under a nested maximal-continuity 6² cover, the
         # pruned space carried 58 unknowns against an unreduced rank of 59.
-        all(ci -> is_active(level.mask, ci) || _is_fictitious(level, ci, V.physical, classify_cache),
-            cells) || continue
+        all(ci -> is_active(level.mask, ci) || _is_fictitious(level, ci, physical, cache), cells) ||
+            continue
         if clamped_only
             # Buried, and buried as a whole function — but the two halves of "whole"
             # are not the same test. A *user-masked* support cell blocks: what a masked
@@ -1212,14 +1216,26 @@ function Unfitted._coverage_constraints(level::Level{D,T,<:BSplineFamily}, V::Sp
         for (j, k) in pairs(above)
             cover = covers[j]
             reproduced = cover === nothing ?
-                         _reproduced_on_domain(level, k, cells, V.physical, tol, classify_cache) :
+                         _reproduced_on_domain(level, k, cells, physical, tol, cache) :
                          _reproduced_by_selection(level, key, cover)
             reproduced && break
         end
-        reproduced || continue
-        push!(out, (LinearConstraint{T}([raw], [one(T)]), :dedup))
+        reproduced && _dedup!(ledger, level, raw)
     end
-    return out
+    return ledger
+end
+
+# The dedup is a strong elimination on a selecting level, but a one-term ROW on a
+# clamped one. There a buried function can also be a term of a trace row, and only
+# resolving the level's rows in order decides which of the two eliminates it and is
+# credited: the trace rows come first, so a function they eliminate outright stays
+# credited to `:overlay`, and its dedup row collapses to `0 = 0`. Eliminating it
+# directly instead would remove it *before* the trace rows are resolved and change
+# which raws they pivot (see `EliminationLedger`).
+function _dedup!(ledger::EliminationLedger{T}, level::Level{D,T,<:BSplineFamily},
+                 raw::Int) where {D,T}
+    _selects_by_support(level.basis) && return _eliminate!(ledger, raw, :dedup)
+    return _constrain!(ledger, [raw], [one(T)], :dedup)
 end
 
 end # module UnfittedBasicBSplineExt

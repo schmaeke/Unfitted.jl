@@ -36,9 +36,10 @@
 # matches the natural block ordering, and per-component constraints
 # simply leave holes in the enumeration.
 #
-# This file owns the dof keys, the layout structs, the structural
-# overlay-constraint detection, the pruning constraint source
-# (`_coverage_constraints`, over the masks `coverage.jl` computes), and
+# This file owns the dof keys, the layout structs, the elimination ledger
+# every artificial elimination is recorded in (`EliminationLedger`), the
+# structural overlay-constraint detection, the pruning constraint source
+# (`_coverage_constraints!`, over the masks `coverage.jl` computes), and
 # the active-enumeration constructor.
 # The physical-Dirichlet spec types, per-level Dirichlet detection, and
 # the L² boundary projection live in `dirichlet.jl`. `dof_layout`
@@ -93,32 +94,6 @@ Base.hash(k::AxisDofKey, h::UInt) = hash(k.mode, hash(k.index, hash(k.kind, h)))
 Base.hash(k::TensorDofKey, h::UInt) = hash(k.axes, hash(k.level, h))
 
 """
-    LinearConstraint{T}
-
-A homogeneous linear constraint among raw dofs of one level:
-
-    Σᵢ coefficientsᵢ · u_{rawsᵢ} = 0
-
-Applies uniformly to every field component (neither constraint source
-distinguishes components). Emitted by [`_overlay_constraints`](@ref) for
-the trace-vanishing conditions at artificial boundaries and by
-[`_coverage_constraints`](@ref) for pruning eliminations; the dof
-layer resolves the resulting constraint system by cascade elimination
-in [`_resolve_constraints!`](@ref) and keeps the linear-constraint
-pivots it produces in [`DofLayout`](@ref)'s `pivots` table.
-
-A single-raw constraint (`length(raws) == 1`, coefficient `1`) is
-strong elimination of that raw — the regime integrated Legendre uses.
-Multi-raw constraints (typical for B-splines with arbitrary masks or
-higher continuity) couple `p + 1` raws per perpendicular line per
-derivative order.
-"""
-struct LinearConstraint{T<:Real}
-    raws::Vector{Int}
-    coefficients::Vector{T}
-end
-
-"""
     DofLayout{D,T}
 
 Basis-aware global dof numbering for a single field over a superposition
@@ -165,15 +140,20 @@ Fields:
     that eliminated it: the artificial overlay boundary (`:overlay`) or, from
     the pruning extension, a covered high-order mode (`:coverage`) or a
     deduped covered vertex (`:dedup`). Applies to every component
-    simultaneously; set by constraint resolution. Serves as both the
-    elimination flag (`!== :free`) and its provenance, read by
-    [`constraint_kind`](@ref), the active enumeration, and diagnostics.
+    simultaneously. It is the `source` vector of the
+    [`EliminationLedger`](@ref) the layout's artificial eliminations were
+    recorded in, so a raw is credited to the source that actually removed
+    it. Serves as both the elimination flag (`!== :free`) and its
+    provenance, read by [`constraint_kind`](@ref), the active enumeration,
+    and diagnostics.
   - `pivots::Vector{Vector{Tuple{Int,T}}}` — the linear-constraint pivots,
     and nothing else. A pivot is a raw that constraint resolution expressed
     through *other* raws, `u_raw = Σᵢ wᵢ u_{rᵢ}`, and `pivots[raw]` is that
     expansion `[(r₁, w₁), …]` in resolution order. It has depth one: every
-    `rᵢ` is free with respect to the constraint system, so a reader never
-    chases a chain. The table is empty when the layout has no pivot, which
+    `rᵢ` is free with respect to the artificial constraints, so a reader
+    never chases a chain, and `dof_layout` checks this once per build. Like
+    `elimination_source`, it comes from the ledger. The table is empty when
+    the layout has no pivot, which
     is every integrated-Legendre and every maximal-continuity B-spline
     layout: only the multi-raw trace constraints of a B-spline level below
     maximal continuity (on a `LevelMask` face, for instance) produce one.
@@ -355,11 +335,12 @@ _coordinate_matches(a::Real, b::Real, tol::GeometryTolerance) = abs(a - b) <= to
 # level's lower (`side = :lower`) or upper (`side = :upper`) mesh edge.
 # Dispatched on the level's basis family so each family's "boundary
 # mode" convention is local to its own implementation. Used by the
-# physical-Dirichlet detection (`_key_faces` in `dirichlet.jl`) and by
-# `_has_overlay_constraint` to translate
-# "is this dof at a face" into a basis-family-specific predicate without
-# leaking the family's mode-index conventions into the rest of the dof
-# layer.
+# physical-Dirichlet detection (`_key_faces` in `dirichlet.jl`) to
+# translate "is this dof at a face" into a basis-family-specific predicate
+# without leaking the family's mode-index conventions into the rest of the
+# dof layer. The integrated-Legendre `_has_overlay_constraint` below does
+# not route through it: it already walks the key's node factors and reads
+# the mesh-edge indices (`1` and `cells[axis] + 1`) off them directly.
 #
 # Integrated Legendre: only `_AXIS_NODE` keys touch a mesh edge —
 # `_AXIS_NODE.index == 1` (lower) or `cells[axis] + 1` (upper). Bubbles
@@ -530,58 +511,236 @@ function _internal_face_is_physical(key::TensorDofKey{D}, level::Level{D,T,<:Int
     return false
 end
 
-# ── Linear-constraint collection and resolution ──────────────────────────────
+# ── The elimination ledger ────────────────────────────────────────────────────
 
 """
-    _overlay_constraints(level, V, tol, raw_by_key, level_keys, classify_cache)
-        -> Vector{LinearConstraint{T}}
+    EliminationLedger{T}
 
-Produce the homogeneous linear constraints that encode `level`'s
-artificial-overlay-boundary trace condition. Dispatched on the level's
-basis family so each family can exploit its own boundary mode structure.
-A new family must implement all six arguments, in this order — the hook
-is called positionally from [`dof_layout`](@ref) stage 2.
+The record a basis family's dof-layer hooks write a space's artificial
+eliminations into: per raw dof, whether it is eliminated and by which source; the
+current level's pending linear-constraint rows; and the pivot table the resolved
+rows produce. [`dof_layout`](@ref) builds one per call, sized to the raw count,
+runs every level's hooks into it, and keeps its `source` and `pivots` as the
+layout's `elimination_source` and `pivots`.
 
-The default fallback walks `level_keys` (the `(key, raw)` pairs that
-belong to this level, in raw order, read off the level's range in
-`level_raws` by [`dof_layout`](@ref) so the scan is `O(this level's
-raws)` rather than `O(all raws)` per level), asks the
-family's `_has_overlay_constraint` predicate per raw, and emits a
-*single-raw* constraint `1 · u_raw = 0` for every boundary raw. This is
-strong elimination of the boundary node — the regime the integrated
-Legendre family relies on.
+Fields:
 
-The B-spline family overrides this fallback (dispatching on
-`Level{…,<:BSplineFamily}`) to produce *multi-raw* constraints expressing
-the C^m trace-vanishing condition along every artificial perpendicular
-line, exploiting the tensor-product structure of the B-spline basis to
-factor `m + 1` constraints per perpendicular line at each artificial
-face. The B-spline family therefore never uses this fallback or the
-per-raw `_has_overlay_constraint`; it reaches through `raw_by_key`
-directly to look up raw ids by (cell, mode), and ignores `level_keys`.
+  - `source::Vector{Symbol}` — per raw, `:free` until something eliminates it,
+    then the source credited with the elimination: `:overlay` (the artificial
+    overlay boundary), `:coverage` (a covered high-order mode) or `:dedup` (a
+    buried function a covering level reproduces).
+  - `rows::Vector{Tuple{Vector{Int},Vector{T},Symbol}}` — the current level's
+    homogeneous linear constraints `Σᵢ cᵢ u_{rᵢ} = 0`, as `(raws, coefficients,
+    source)` in emission order. Empty between levels.
+  - `pivots::Vector{Vector{Tuple{Int,T}}}` — empty until the first pivot, then one
+    entry per raw: a pivot's depth-one expansion, and one shared empty vector for
+    every other raw, which nothing pushes into. See [`DofLayout`](@ref).
 
-`raw_by_key` is the global `TensorDofKey` → raw-id map built in stage 1
-of [`dof_layout`](@ref). `classify_cache` is the space's
-cell-classification cache, threaded through for whatever the family
-needs it for; the fallback hands it to `_has_overlay_constraint`, which
-consults it only to tell a fully-fictitious fold face from a user-mask
-face. It is empty, and untouched, when `V.physical === nothing`.
+A family writes through three verbs and nothing else: `_eliminate!(ledger, raw,
+source)` for a dof-wise strong elimination, `_constrain!(ledger, raws,
+coefficients, source)` for a row, and, only from a `_resolve_rows!` method,
+`_pivot!(ledger, raw, expansion, source)` for each raw the rows eliminate.
+
+The order is the core's, and it is what makes the attribution exact:
+
+  - Levels are processed one at a time, in `V.levels` order: the level's
+    `_overlay_constraints!`, then, under leaf semantics, its
+    `_coverage_constraints!`, then `_resolve_rows!` on whatever rows the two
+    recorded. A row names only its own level's raws, so resolving level by level
+    is the same as resolving every row of the space in one pass.
+  - Within a level, the direct eliminations from both hooks are applied as they
+    arrive, and the first writer wins: a raw is credited to the first source that
+    eliminates it. The artificial boundary is recorded first, so a raw that both
+    it and pruning remove is credited to the boundary.
+  - The level's rows are resolved *after* both hooks, against everything
+    eliminated so far; an eliminated raw contributes no term to a row. A row that
+    collapses to `0 = 0` eliminates nothing, so it is credited with nothing.
+  - A family that needs an elimination ordered *among* its rows records it as the
+    one-term row `_constrain!(ledger, [raw], [one(T)], source)`. The resolution
+    then decides whether it eliminates anything, and which row is credited. The
+    dedup of a B-spline level below maximal continuity is that case: a buried
+    function there can also be a term of a trace row, and eliminating it directly
+    would change which raws the trace rows pivot.
 """
-function _overlay_constraints(level::Level{D,T,B}, V::Space{D,T}, tol::GeometryTolerance{T},
-                              raw_by_key::AbstractDict{TensorDofKey{D},Int},
-                              level_keys::AbstractVector{Pair{TensorDofKey{D},Int}},
-                              classify_cache::_ClassifyCache{D,T}) where {D,T,B}
-    constraints = LinearConstraint{T}[]
-    # `classify_cache` is the space's fold cache: the internal-face predicate
-    # below re-classifies inactive neighbours to tell a fully-fictitious fold
-    # face (mode stays active) from a physical user-mask face (mode eliminated),
-    # and every fold-boundary cell box is already in the cache. Empty and unused
-    # when `V.physical === nothing`.
-    for (key, raw) in level_keys
-        _has_overlay_constraint(key, level, V.physical, V.domain, tol, classify_cache) || continue
-        push!(constraints, LinearConstraint{T}([raw], [one(T)]))
+struct EliminationLedger{T<:Real}
+    source::Vector{Symbol}
+    rows::Vector{Tuple{Vector{Int},Vector{T},Symbol}}
+    pivots::Vector{Vector{Tuple{Int,T}}}
+end
+
+# A ledger over `nraw` raws with nothing eliminated, no row pending and no pivot.
+function EliminationLedger{T}(nraw::Integer) where {T}
+    return EliminationLedger{T}(fill(:free, nraw), Tuple{Vector{Int},Vector{T},Symbol}[],
+                                Vector{Tuple{Int,T}}[])
+end
+
+# A dof-wise strong elimination of `raw` by `source`. The first source to eliminate a
+# raw is the one it is credited to, which is what makes the artificial boundary,
+# recorded first, win over pruning on a raw both remove.
+function _eliminate!(ledger::EliminationLedger, raw::Integer, source::Symbol)
+    ledger.source[raw] === :free && (ledger.source[raw] = source)
+    return ledger
+end
+
+# One homogeneous linear constraint Σᵢ cᵢ u_{rawsᵢ} = 0 among the current level's raws,
+# credited to `source`. It is held until both of the level's hooks have run and is then
+# handed to `_resolve_rows!`. The vectors are stored, not copied.
+function _constrain!(ledger::EliminationLedger{T}, raws::Vector{Int}, coefficients::Vector{T},
+                     source::Symbol) where {T}
+    push!(ledger.rows, (raws, coefficients, source))
+    return ledger
+end
+
+# The resolver's one write: `raw` is eliminated by the row credited `source`, either
+# strongly (`expansion` empty) or as the depth-one pivot u_raw = Σᵢ wᵢ u_{rᵢ}.
+#
+# The pivot table is allocated on the first pivot, as one shared empty vector per raw,
+# so a space without pivots, which is every integrated-Legendre and every
+# maximal-continuity B-spline space, never allocates it. A raw already eliminated is
+# refused: a resolver that pivoted it again would silently overwrite its source and,
+# for a pivot, the expansion other readers already rely on.
+function _pivot!(ledger::EliminationLedger{T}, raw::Integer, expansion::Vector{Tuple{Int,T}},
+                 source::Symbol) where {T}
+    ledger.source[raw] === :free ||
+        throw(ArgumentError("raw $raw is already eliminated; a resolver records each raw it " *
+                            "eliminates exactly once"))
+    ledger.source[raw] = source
+    isempty(expansion) && return ledger
+    if isempty(ledger.pivots)
+        none = Tuple{Int,T}[]           # shared by every non-pivot raw; never pushed into
+        fill!(resize!(ledger.pivots, length(ledger.source)), none)
     end
-    return constraints
+    ledger.pivots[raw] = expansion
+    return ledger
+end
+
+"""
+    _resolve_rows!(ledger::EliminationLedger, level::Level) -> ledger
+
+Resolve the linear-constraint rows `level`'s hooks recorded with `_constrain!`.
+Called once per level, after `_overlay_constraints!` and `_coverage_constraints!`,
+and only if a row is pending. A method receives `ledger.rows` in emission order,
+every row naming only `level`'s raws; a raw with `ledger.source[raw] !== :free` is
+already eliminated and contributes no term. It must record every raw the rows
+eliminate exactly once, with `_pivot!` — an empty expansion for a strong
+elimination, else a depth-one expansion over raws that remain free — credited to
+the row that eliminated it. It must not otherwise write `ledger.source`, and it
+must not clear `ledger.rows`: the caller does.
+
+This method resolves the rows of every family with the cascade Gauss elimination
+`_cascade!`. The B-spline family below maximal continuity is the only family that
+records rows.
+"""
+_resolve_rows!(ledger::EliminationLedger, ::Level) = _cascade!(ledger)
+
+# Every pivot must be expressed over raws that stay free: `_fold_pivot`, `dof_value`
+# and assembly's condensation read ONE level of expansion and never chase a chain. A
+# family resolver that broke this would make assembly and reconstruction silently
+# disagree, so it is checked once per build. The cost is one read per pivot term, and
+# nothing at all without pivots.
+function _assert_resolved(ledger::EliminationLedger)
+    for expansion in ledger.pivots, (branch, _) in expansion
+        ledger.source[branch] === :free ||
+            throw(ArgumentError("pivot branch $branch is itself eliminated: `_resolve_rows!` " *
+                                "must leave every pivot expressed over free raws"))
+    end
+    return nothing
+end
+
+# Everything a dof-layer hook may read about the level it is called for: the space,
+# its physical domain and tolerance, the space's cell-classification cache, the
+# coverage masks (empty when the build does not prune), the raw keys and the key → raw
+# map of stage 1 (for a family that addresses functions by `(cell, mode)`), and the
+# level's own raws.
+#
+# `P` is the CONCRETE type of `V.physical`. `Space.physical` is abstractly typed, so a
+# hook that read it off the space dispatched dynamically on every per-raw predicate
+# call it fed it to. Building this struct inside a function that received `physical`
+# as an argument is the function barrier: the hooks, and every predicate they call,
+# specialise on `P` instead. Measured on the integrated-Legendre artificial-boundary
+# pass over an immersed disc at 128² p2 (29 281 raws): 304 bytes per raw and 1.26 ms
+# with `P = Any`, nothing and 0.24 ms typed.
+struct _LevelContext{D,T,S<:Space{D,T},P}
+    space::S
+    physical::P
+    tolerance::GeometryTolerance{T}
+    classify_cache::_ClassifyCache{D,T}
+    coverage::Coverage{D}
+    raw_keys::Vector{TensorDofKey{D}}
+    raw_by_key::Dict{TensorDofKey{D},Int}
+    raws::UnitRange{Int}
+end
+
+# Stage 2 of the layout: every level's artificial eliminations, recorded into `ledger`
+# one level at a time (`_level_eliminations!`). `physical` is `V.physical`, passed
+# separately on purpose: receiving it as an argument is the function barrier that hands
+# every hook a context whose `physical` is concretely typed (see `_LevelContext`). The
+# loop over a heterogeneous `V.levels` tuple then dispatches once per level, which is
+# the second barrier: each level's hooks run specialised on its basis family.
+function _record_eliminations!(ledger::EliminationLedger{T}, V::Space{D,T}, physical,
+                               tolerance::GeometryTolerance{T}, classify_cache::_ClassifyCache{D,T},
+                               coverage::Coverage{D}, raw_keys::Vector{TensorDofKey{D}},
+                               raw_by_key::Dict{TensorDofKey{D},Int},
+                               level_raws::Vector{UnitRange{Int}}, prune::Bool,
+                               prune_exempt) where {D,T}
+    for level in V.levels
+        ctx = _LevelContext(V, physical, tolerance, classify_cache, coverage, raw_keys, raw_by_key,
+                            level_raws[level.id])
+        _level_eliminations!(ledger, level, ctx, prune && !(level.id in prune_exempt))
+    end
+    return ledger
+end
+
+# One level: its artificial boundary, then, under leaf semantics, its pruning, then
+# the resolution of whatever linear-constraint rows the two recorded. The core owns
+# this order and the pruning gate (`prune`, `prune_exempt`), so no family
+# re-implements either: a family that forgot the gate would prune the unreduced twin.
+function _level_eliminations!(ledger::EliminationLedger, level::Level, ctx::_LevelContext,
+                              pruned::Bool)
+    _overlay_constraints!(ledger, level, ctx)
+    pruned && _coverage_constraints!(ledger, level, ctx)
+    isempty(ledger.rows) && return ledger
+    _resolve_rows!(ledger, level)
+    empty!(ledger.rows)
+    return ledger
+end
+
+# ── The artificial-boundary hook ──────────────────────────────────────────────
+
+"""
+    _overlay_constraints!(ledger::EliminationLedger, level::Level, ctx::_LevelContext) -> ledger
+
+Record `level`'s artificial-overlay-boundary condition in `ledger`. Dispatched on
+the level's basis family, so each family can exploit its own boundary mode
+structure. Called once per level, before `_coverage_constraints!` (see
+[`EliminationLedger`](@ref) for the order). A method names only raws in
+`ctx.raws`, reads only `ctx` (see `_LevelContext`), and records through
+`_eliminate!` and `_constrain!`. Every method ties `{D,T}` across `Level{D,T}` and
+`_LevelContext{D,T}`, as this default does, so that no two methods are ambiguous.
+
+This default walks the level's raws, asks the family's per-raw
+`_has_overlay_constraint` predicate about each, and strongly eliminates every raw
+it accepts with `_eliminate!(ledger, raw, :overlay)`: the regime the integrated
+Legendre family relies on. The predicate consults `ctx.classify_cache`, the
+space's cell-classification cache, only to tell a fully-fictitious fold face from
+a user-mask face; the cache is untouched when the space has no physical domain.
+
+The B-spline family in the extension overrides this default. At `continuity =
+:maximal` its method is a support selection, which again eliminates strongly. At
+an integer continuity `m` it records multi-raw rows instead: the `Cᵐ`
+trace-vanishing condition along every artificial perpendicular line, `m + 1` rows
+per line per face, factored through the tensor-product structure of the basis and
+looking raw ids up by `(cell, mode)` in `ctx.raw_by_key`. That family therefore
+never reaches this default or the per-raw `_has_overlay_constraint`.
+"""
+function _overlay_constraints!(ledger::EliminationLedger, level::Level{D,T},
+                               ctx::_LevelContext{D,T}) where {D,T}
+    for raw in ctx.raws
+        _has_overlay_constraint(ctx.raw_keys[raw], level, ctx.physical, ctx.space.domain,
+                                ctx.tolerance, ctx.classify_cache) &&
+            _eliminate!(ledger, raw, :overlay)
+    end
+    return ledger
 end
 
 # ── Pruning (coverage) constraint source ─────────────────────────────
@@ -680,7 +839,7 @@ end
 # Integrated Legendre's method of the `_cell_modes` hook whose generic form is in
 # `mesh.jl`. It lives here, with `_entity_carries` and the `TensorDofKey` factors
 # the minimum rule is expressed over, the same way the B-spline family's
-# `_coverage_constraints` lives in its extension.
+# `_coverage_constraints!` lives in its extension.
 #
 # The per-order index sets are hoisted out of the cell loop: there are only
 # `length(palette)` distinct answers and `local_basis_indices` allocates a fresh
@@ -718,7 +877,7 @@ end
 
 # Whether a family's span on a mesh contains that mesh's C⁰ multilinear vertex
 # functions — the hats. This is the basis half of the linear dedup in
-# `_coverage_constraints`; `_nested_over` (`coverage.jl`) is the geometric half, and a
+# `_coverage_constraints!`; `_nested_over` (`coverage.jl`) is the geometric half, and a
 # cover must pass both before a buried hat of the level below is eliminated.
 #
 # Integrated Legendre qualifies in either mode at any per-cell order ≥ 1: it is exactly
@@ -735,12 +894,12 @@ _spans_hats(::BasisFamily) = false
 _spans_hats(::IntegratedLegendre) = true
 
 """
-    _coverage_constraints(level, V, coverage, tol, level_keys, classify_cache)
-        -> Vector{Tuple{LinearConstraint{T},Symbol}}
+    _coverage_constraints!(ledger::EliminationLedger, level::Level, ctx::_LevelContext) -> ledger
 
-Pruning constraint source, a peer of [`_overlay_constraints`](@ref). Under the
-leaf semantics (`dof_layout`'s `prune`, on by default), emit a single-raw
-strong elimination for
+Pruning constraint source, the peer of [`_overlay_constraints!`](@ref) and bound by
+the same contract. Called only under leaf semantics (`dof_layout`'s `prune`, on by
+default) and only on a level outside `prune_exempt`, after the level's
+`_overlay_constraints!`. This integrated-Legendre method strongly eliminates
 
   * every **buried high-order** mode (at least one bubble axis, every active incident
     cell covered by and every fictitious one reached by a single finer level) —
@@ -749,29 +908,28 @@ strong elimination for
     mesh's hats reproduces exactly — dedup, source `:dedup`.
 
 The linear skeleton is otherwise retained, which is what makes the reduced space
-complete. Each returned pair carries its elimination source for `constraint_kind` /
-diagnostics.
+complete. Each elimination is credited with its source for `constraint_kind` /
+diagnostics, unless the artificial boundary already eliminated the raw: the first
+writer wins (see [`EliminationLedger`](@ref)), so a buried raw on `Γ_o` stays
+credited to `:overlay`.
 
 Both halves ask `_reproduced_on_domain` (`coverage.jl`), which applies the
 fictitious-fold rule on the covering level *and* on this one — a support cell folded
 away carries nothing to reproduce, so it neither has to be covered nor may veto the
-verdict. `classify_cache` is threaded through for the classification that tells a fold
-from a user mask, the same one [`build_coverage`](@ref) used.
+verdict. `ctx.classify_cache` is the classification that tells a fold from a user
+mask, the same one [`build_coverage`](@ref) used.
 
 The dedup half is not an optimisation: a mode a covering level reproduces exactly is
 linearly dependent on that level's own modes, so leaving both active makes the
 superposed operator exactly singular. The B-spline extension overrides this hook for
-the same reason, and emits nothing but dedups — that family has no bubble modes to
-shed. Every other family takes the generic fallback below and reduces nothing.
+the same reason, and records nothing but dedups — that family has no bubble modes to
+shed. Every other family takes the generic fallback below and records nothing.
 """
-function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{D,T},
-                               coverage::Coverage{D}, tol::GeometryTolerance{T},
-                               level_keys::AbstractVector{Pair{TensorDofKey{D},Int}},
-                               classify_cache::_ClassifyCache{D,T}) where {D,T}
-    out = Tuple{LinearConstraint{T},Symbol}[]
-    cov = coverage.covered[level.id]
-    any(cov) || return out
-    n = level.mesh.cells
+function _coverage_constraints!(ledger::EliminationLedger, level::Level{D,T,<:IntegratedLegendre},
+                                ctx::_LevelContext{D,T}) where {D,T}
+    cov = ctx.coverage.covered[level.id]
+    any(cov) || return ledger
+    V, tol, n = ctx.space, ctx.tolerance, level.mesh.cells
     # A buried vertex function is a C⁰ hat: multilinear on each of `level`'s cells,
     # kinked across every cell boundary. Mesh nesting (`_nested_over`) only buys the
     # multilinear half; the kink is the cover basis's half, and `_spans_hats` is where
@@ -781,7 +939,8 @@ function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{
     nested_above = [k
                     for k in V.levels
                     if k.id > level.id && _spans_hats(k.basis) && _nested_over(level, k, tol)]
-    reproduces(k, cells) = _reproduced_on_domain(level, k, cells, V.physical, tol, classify_cache)
+    reproduces(k, cells) = _reproduced_on_domain(level, k, cells, ctx.physical, tol,
+                                                 ctx.classify_cache)
     # Covered-mode pruning asks the same *single-level* question the dedup half asks.
     # `cov[ci]` says only that *some* higher level contains cell `ci`, and a mode
     # whose incident cells are covered by two different levels is reproduced by
@@ -808,24 +967,26 @@ function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{
     # the set `_coverage_cells` computed and the only set on which a `false` entry is a
     # verdict rather than a default. An inactive incident cell is settled by
     # `reproduces`: fictitious and it is skipped, user-masked and it refuses.
-    for (key, raw) in level_keys
+    for raw in ctx.raws
+        key = ctx.raw_keys[raw]
         cells = _incident_cells(key, n)
         all(ci -> !is_active(level.mask, ci) || cov[ci], cells) || continue     # buried?
         if any(a -> a.kind == _AXIS_SPAN, key.axes)                 # high-order → covered-mode pruning
-            resolves(cells) && push!(out, (LinearConstraint{T}([raw], [one(T)]), :coverage))
+            resolves(cells) && _eliminate!(ledger, raw, :coverage)
         elseif any(k -> reproduces(k, cells), nested_above)          # linear reproduced above
-            push!(out, (LinearConstraint{T}([raw], [one(T)]), :dedup))
+            _eliminate!(ledger, raw, :dedup)
         end
     end
-    return out
+    return ledger
 end
 
 # Generic fallback: no covered-mode pruning for a family that has not opted in.
-function _coverage_constraints(::Level{D,T,B}, ::Space{D,T}, ::Coverage{D}, ::GeometryTolerance{T},
-                               ::AbstractVector{Pair{TensorDofKey{D},Int}},
-                               ::_ClassifyCache{D,T}) where {D,T,B}
-    return Tuple{LinearConstraint{T},Symbol}[]
+function _coverage_constraints!(ledger::EliminationLedger, ::Level{D,T},
+                                ::_LevelContext{D,T}) where {D,T}
+    ledger
 end
+
+# ── Resolving a level's rows: the cascade ─────────────────────────────────────
 
 # Combine repeated raws in a list of `(raw, coefficient)` pairs by
 # summing the coefficients, dropping terms whose coefficient falls
@@ -871,25 +1032,24 @@ end
 # covered stack the dof layout reached 98.7% of `prepare` and 2.8× the cost
 # of `assemble!`, growing ×12.7 and ×14.8 per ×4 in unknowns. The scan's
 # answer was almost always "nothing to do", because every integrated
-# Legendre elimination is a single-raw strong constraint whose pivot
-# expansion is empty and which therefore mentions no raw at all.
+# Legendre elimination was then a single-raw strong constraint whose pivot
+# expansion is empty and which therefore mentions no raw at all. (Those are
+# direct `_eliminate!` calls now and never reach the resolver.)
 #
 # The index is allowed to over-report: an expansion rewritten by an earlier
 # substitution may no longer contain the raw that registered it, so the
 # membership test below stays. It must never under-report, which is why an
 # entry is added at *every* site that writes an expansion — here and in
-# `_resolve_constraints!` step 4. The identity expansions set up before the
-# loop need no entry: a raw is skipped until it is pivoted, and pivoting
-# overwrites its expansion.
-function _back_substitute!(raw_expansion::Vector{Vector{Tuple{Int,T}}}, pivot_raw::Int,
-                           pivot_expansion::Vector{Tuple{Int,T}}, pivoted::AbstractVector{Bool},
+# `_cascade!` step 4. Every holder it lists is a pivot, since only a pivot's
+# expansion is ever registered, so each one has an entry in `expansions`.
+function _back_substitute!(expansions::Dict{Int,Vector{Tuple{Int,T}}}, pivot_raw::Int,
+                           pivot_expansion::Vector{Tuple{Int,T}},
                            mentions::Dict{Int,Vector{Int}}) where {T}
     holders = get(mentions, pivot_raw, nothing)
-    holders === nothing && return raw_expansion
+    holders === nothing && return expansions
     @inbounds for raw in holders
         raw == pivot_raw && continue
-        pivoted[raw] || continue
-        expansion = raw_expansion[raw]
+        expansion = expansions[raw]
         # The index over-reports; this is the exact test.
         any(t -> first(t) == pivot_raw, expansion) || continue
         # Rebuild with substitution.
@@ -905,13 +1065,13 @@ function _back_substitute!(raw_expansion::Vector{Vector{Tuple{Int,T}}}, pivot_ra
             end
         end
         combined = _combine_terms(new_terms)
-        raw_expansion[raw] = combined
+        expansions[raw] = combined
         # This expansion now mentions the pivot's own references. `pivot_raw`
         # cannot be among them — `pivot_expansion` was built excluding it — so
         # the list being iterated is never the one appended to.
         _register_mentions!(mentions, raw, combined)
     end
-    return raw_expansion
+    return expansions
 end
 
 # Record that `raw`'s expansion contains each of `terms`' raws.
@@ -924,65 +1084,66 @@ function _register_mentions!(mentions::Dict{Int,Vector{Int}}, raw::Int,
 end
 
 """
-    _resolve_constraints!(raw_expansion, constraints, nraw) -> raw_expansion
+    _cascade!(ledger::EliminationLedger) -> ledger
 
-Resolve a list of homogeneous linear constraints into the per-raw
-expansion table `raw_expansion`, mutated in place.
-
-After resolution every entry is either
-
-  - `[(raw, 1)]` — the raw is *free*, identity expansion,
-  - `[]` — the raw is *strongly eliminated* (single-raw constraint),
-  - `[(rᵢ, wᵢ), …]` — the raw is a *linear-constraint pivot*, expressed
-    in terms of currently-free raws via `u_raw = Σᵢ wᵢ u_rᵢ`.
+Resolve the current level's rows, `ledger.rows`, by cascade elimination and record
+every raw they eliminate with `_pivot!`: strongly, when its expansion is empty, or
+as a *linear-constraint pivot* `u_raw = Σᵢ wᵢ u_{rᵢ}` over raws that stay free.
 
 The algorithm is the classical sparse Gauss elimination, adapted to
 exploit the small constraint matrix's structure:
 
-  1. For each constraint, substitute already-resolved pivot expressions
-     into the constraint's terms (so the constraint is in free-raws +
-     yet-to-resolve raws).
-  2. Combine like terms and drop near-zeros; skip the constraint
-     entirely if it collapses to `0 = 0`.
+  1. For each row, in emission order, substitute what is already known
+     into its terms: a raw pivoted by an earlier row of this level
+     contributes its expansion, a raw that is still free contributes
+     itself, and a raw eliminated before the rows (by `_eliminate!`)
+     contributes nothing.
+  2. Combine like terms and drop near-zeros; skip the row entirely if it
+     collapses to `0 = 0`. A skipped row eliminates nothing and is
+     credited with nothing.
   3. Pick a pivot by largest absolute coefficient (numerical stability).
   4. Express the pivot as a linear combination of the remaining
-     coefficients' raws.
+     terms' raws, and credit it to the row's source.
   5. Back-substitute the pivot into every earlier pivot's expansion
      that mentions the new pivot raw.
 
-Step 5 keeps the invariant: at any point after a constraint has been
+Step 5 keeps the invariant: at any point after a row has been
 processed, *every pivot's expansion is in terms of currently-free raws
-only*. Assembly emission then never needs to chase chains.
+only*. Assembly emission then never needs to chase chains. The pivots are
+written to the ledger once the last row is processed; storage is per raw, so
+their order is immaterial.
 
-The cascade depth of overlay-boundary constraints is bounded by the
-spatial dimension `D` — a corner raw of the active region touches at
-most `D` boundary axes — so total resolution cost is `O(K · D · p)`
-where `K` is the constraint count and `p` is the per-constraint raw
-count.
+Each row costs a substitution and a sort-and-combine over its terms after
+substitution, plus one rewrite per earlier pivot that mentions the new pivot
+raw, found through the `mentions` index rather than by scanning every
+expansion (see `_back_substitute!`). The working tables are per level and
+hold only that level's pivots.
 """
-function _resolve_constraints!(raw_expansion::Vector{Vector{Tuple{Int,T}}},
-                               constraints::Vector{LinearConstraint{T}}, nraw::Int) where {T}
-    # Identity start: every raw is its own expansion.
-    for raw in 1:nraw
-        raw_expansion[raw] = [(raw, one(T))]
-    end
-    pivoted = falses(nraw)
-    # raw -> the pivots whose expansion mentions it. Empty for every
-    # single-raw strong elimination, which is all of them for integrated
-    # Legendre, so this costs nothing on the common path.
+function _cascade!(ledger::EliminationLedger{T}) where {T}
+    # raw -> its expansion and the source of the row that pivoted it, for the
+    # raws this level's rows pivot so far.
+    expansions = Dict{Int,Vector{Tuple{Int,T}}}()
+    sources = Dict{Int,Symbol}()
+    # raw -> the pivots whose expansion mentions it. Empty while every pivot is
+    # a strong elimination, which mentions no raw.
     mentions = Dict{Int,Vector{Int}}()
 
-    for constraint in constraints
-        # 1) Substitute already-pivoted raws.
+    for (raws, coefficients, source) in ledger.rows
+        # 1) Substitute already-pivoted raws; drop already-eliminated ones.
         terms = Tuple{Int,T}[]
-        sizehint!(terms, length(constraint.raws))
-        for (raw, coeff) in zip(constraint.raws, constraint.coefficients)
-            for (other, w) in raw_expansion[raw]
-                push!(terms, (other, coeff * w))
+        sizehint!(terms, length(raws))
+        for (raw, coeff) in zip(raws, coefficients)
+            expansion = get(expansions, raw, nothing)
+            if expansion !== nothing
+                for (other, w) in expansion
+                    push!(terms, (other, coeff * w))
+                end
+            elseif ledger.source[raw] === :free
+                push!(terms, (raw, coeff))
             end
         end
 
-        # 2) Combine like terms; trivially satisfied constraints fall away.
+        # 2) Combine like terms; trivially satisfied rows fall away.
         combined = _combine_terms(terms)
         isempty(combined) && continue
 
@@ -994,14 +1155,17 @@ function _resolve_constraints!(raw_expansion::Vector{Vector{Tuple{Int,T}}},
         new_expansion = Tuple{Int,T}[(raw, -c / pivot_coeff)
                                      for (k, (raw, c)) in pairs(combined) if k != pivot_pos]
 
-        raw_expansion[pivot_raw] = new_expansion
-        pivoted[pivot_raw] = true
+        expansions[pivot_raw] = new_expansion
+        sources[pivot_raw] = source
         _register_mentions!(mentions, pivot_raw, new_expansion)
 
         # 5) Back-substitute into earlier pivots that mention this raw.
-        _back_substitute!(raw_expansion, pivot_raw, new_expansion, pivoted, mentions)
+        _back_substitute!(expansions, pivot_raw, new_expansion, mentions)
     end
-    return raw_expansion
+    for (raw, expansion) in expansions
+        _pivot!(ledger, raw, expansion, sources[raw])
+    end
+    return ledger
 end
 
 # ── DofLayout construction and accessors ──────────────────────────────────────
@@ -1026,27 +1190,25 @@ Construct the basis-aware global dof layout for a superposition
      get an empty vector. Each level's raws come out as one contiguous
      range, recorded in `level_raws`, and the constraint hooks of stage 2
      visit a level's raws in that (raw) order.
-  2. Collect homogeneous linear constraints from every level, from two
-     sources: the family-dispatched [`_overlay_constraints`](@ref) hook
-     on every level, and [`_coverage_constraints`](@ref) on every level
-     under leaf semantics (which needs the per-level masks
+  2. Record the artificial eliminations in an [`EliminationLedger`](@ref),
+     one level at a time: the family-dispatched
+     [`_overlay_constraints!`](@ref) hook, then, under leaf semantics,
+     [`_coverage_constraints!`](@ref) (which needs the per-level masks
      [`build_coverage`](@ref) computes, so those are built first, and
-     skipped entirely when `prune = false`). A raw the overlay condition already eliminates
-     is not re-constrained by covered-mode pruning, so `elimination_source`
-     credits it to the source that actually removed it. Resolve the
-     collected constraints into a per-raw expansion table via
-     [`_resolve_constraints!`](@ref): the identity `[(raw, 1)]` for a free
-     raw, the empty list `[]` for a strongly eliminated one, and a list
-     over other raws for a linear-constraint pivot. A raw is eliminated iff
-     its expansion is not the identity, and the layout keeps the pivots
-     alone, in `pivots`.
+     skipped entirely when `prune = false`), then `_resolve_rows!` on any
+     linear-constraint rows the two recorded. A raw is credited to the
+     first source that eliminates it, so a raw the overlay condition
+     already eliminates keeps `:overlay` when covered-mode pruning names it
+     too. The ledger's per-raw sources become `elimination_source` and its
+     pivot table becomes `pivots`, once `_assert_resolved` has checked that
+     every pivot is expressed over raws that stay free.
   3. Per-component physical Dirichlet detection: one pass per level
      over the level's raws, matching the physical faces each raw's
      function lies on against every condition's facets as face bitmasks
      (`_physical_dirichlet`).
   4. Enumerate active dofs component-major (component 1 first, then
      component 2, …) skipping every (raw, component) entry that is
-     either physically Dirichlet-constrained or a constraint pivot.
+     either physically Dirichlet-constrained or artificially eliminated.
      Project nonzero Dirichlet data onto the boundary trace space via
      [`_project_dirichlet_values!`](@ref).
 
@@ -1077,13 +1239,13 @@ Keyword arguments:
     private resolver at `tolerance`, which is what a standalone `dof_layout` with
     no model behind it wants. Its tolerance must match `tolerance`.
 
-The integrated Legendre family produces single-raw constraints, each
-resolving to a strong elimination, so its layout has no pivot and
-assembly sees only active and constrained dofs. B-spline families
-below maximal continuity produce multi-raw constraints encoding the C^m
+The integrated Legendre family eliminates strongly and records no rows, so
+its layout has no pivot and assembly sees only active and constrained dofs,
+and so does the B-spline family at maximal continuity. Below maximal
+continuity a B-spline level records multi-raw rows encoding the C^m
 trace-vanishing condition on artificial boundaries; assembly gives each
-pivot a local row and column of its own and condenses them onto the
-pivot's expansion once per integration region.
+pivot they resolve to a local row and column of its own and condenses them
+onto the pivot's expansion once per integration region.
 """
 function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
                     components::Integer=1, prune::Bool=true, prune_exempt=(),
@@ -1093,78 +1255,15 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     # Stage 1: raw enumeration, with each level's raws as one range.
     raw_by_key, raw_keys, cell_dofs_by_level, level_raws = _enumerate_raws(V)
 
-    # Stage 2: collect linear constraints per level and resolve to expansions.
+    # Stage 2: the artificial eliminations, level by level, into one ledger.
     nraw = length(raw_keys)
-    constraints = LinearConstraint{T}[]
-    # Track only the COVERAGE/DEDUP elimination sources, so `constraint_kind` /
-    # diagnostics can pick a pruned or deduped raw out. Overlay-boundary
-    # (and multi-raw B-spline) eliminations are not recorded here — they fall
-    # through to the `:overlay` default when `elimination_source` is built below.
-    # The loop below keeps that split honest: a raw the overlay condition already
-    # eliminates never reaches this map, whichever source names it second.
-    source_of = Dict{Int,Symbol}()
     coverage = prune ? build_coverage(V, tolerance, classify_cache) :
                Coverage{D}(Dict{Int,BitArray{D}}())
-    for level in V.levels
-        # The level's `(key, raw)` pairs, in raw order, read off its range. Only
-        # the constraint hooks' signature wants them in this form; it is an
-        # adapter that goes once the hooks read the level's range themselves.
-        level_keys = Pair{TensorDofKey{D},Int}[raw_keys[r] => r for r in level_raws[level.id]]
-        # Source 1: the artificial-overlay-boundary trace condition (every family).
-        overlay_constraints = _overlay_constraints(level, V, tolerance, raw_by_key, level_keys,
-                                                   classify_cache)
-        append!(constraints, overlay_constraints)
-        # Source 2: covered-mode pruning in covered regions (opt-in per level).
-        #
-        # A raw on Γ_o that is also buried carries both constraints. The overlay
-        # one is queued first and strongly eliminates the raw, which leaves the
-        # coverage constraint trivially satisfied — so recording it as the
-        # elimination source would credit covered-mode pruning with a raw it did not
-        # save, and `reduced_mode_counts` would over-report. Skipping the
-        # redundant constraint leaves `raw_expansion` untouched:
-        # `_resolve_constraints!` substitutes the already-eliminated raw, gets an
-        # empty term list, and drops the constraint anyway. Only single-raw
-        # overlay constraints eliminate a named raw outright; a multi-raw
-        # (B-spline) constraint picks its pivot during resolution, and that
-        # family emits no coverage constraints at all.
-        if prune && !(level.id in prune_exempt)
-            reductions = _coverage_constraints(level, V, coverage, tolerance, level_keys,
-                                               classify_cache)
-            overlay_raws = isempty(reductions) ? Set{Int}() :
-                           Set{Int}(c.raws[1] for c in overlay_constraints if length(c.raws) == 1)
-            for (c, src) in reductions
-                c.raws[1] in overlay_raws && continue
-                push!(constraints, c)
-                source_of[c.raws[1]] = src
-            end
-        end
-    end
-    raw_expansion = Vector{Vector{Tuple{Int,T}}}(undef, nraw)
-    _resolve_constraints!(raw_expansion, constraints, nraw)
-    # A raw is "pivoted" (eliminated) iff its resolved expansion is anything other
-    # than the trivial identity `[(raw, 1)]`. This local vector is construction
-    # scratch for the active enumeration and for `elimination_source` and `pivots`
-    # below; the layout exposes elimination only through `elimination_source`
-    # (`!== :free`).
-    eliminated = [length(e) != 1 || e[1] != (raw, one(T)) for (raw, e) in pairs(raw_expansion)]
-    # Per-raw elimination source: the tracked coverage/dedup source, `:overlay` for
-    # any other eliminated raw (overlay boundary; multi-raw B-spline pivots), and
-    # `:free` when the raw survives. This doubles as the elimination flag.
-    elimination_source = Symbol[eliminated[raw] ? get(source_of, raw, :overlay) : :free
-                                for raw in 1:nraw]
-    # Keep the linear-constraint pivots alone: the eliminated raws whose expansion
-    # is not empty, i.e. a redirect onto other raws. A free raw (the identity) and a
-    # strongly eliminated one (`[]`) are what `elimination_source` already says, and
-    # assembly's slot table holds them directly; a pivot gets a slot of its own and
-    # is condensed once per region, K ← PᵀKP, b ← Pᵀb − lift. The table stays empty
-    # without a pivot, and on the first one becomes per raw with one shared empty
-    # vector everywhere else, so readers test emptiness and nothing else.
-    pivots = Vector{Tuple{Int,T}}[]
-    for (raw, e) in pairs(raw_expansion)
-        (eliminated[raw] && !isempty(e)) || continue
-        isempty(pivots) && fill!(resize!(pivots, nraw), Tuple{Int,T}[])
-        pivots[raw] = e
-    end
+    ledger = EliminationLedger{T}(nraw)
+    _record_eliminations!(ledger, V, V.physical, tolerance, classify_cache, coverage, raw_keys,
+                          raw_by_key, level_raws, prune, prune_exempt)
+    _assert_resolved(ledger)
+    elimination_source, pivots = ledger.source, ledger.pivots
 
     # Stage 3: per-component physical Dirichlet detection, one face-mask pass per
     # level over the level's raw range (`dirichlet.jl`). The layout does not exist
@@ -1179,7 +1278,7 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     active_component = zeros(Int, nraw, ncomp)
     active_count = 0
     for component in 1:ncomp, raw in 1:nraw
-        if !(physical_dirichlet[raw, component] || eliminated[raw])
+        if !(physical_dirichlet[raw, component] || elimination_source[raw] !== :free)
             active_count += 1
             active_component[raw, component] = active_count
         end
@@ -1302,8 +1401,9 @@ assembly condenses every pivot through the same expansion. Measured on a
 expansions of 126 raws), the dropped term reached 4.79e-7 against a field of
 magnitude 7e-2 — silent, and small enough to pass a hand-written tolerance.
 
-One level of expansion is enough, because [`_resolve_constraints!`](@ref) leaves
-every pivot expressed over raws the constraint system leaves free. Such a branch
+One level of expansion is enough, because `_resolve_rows!` leaves every pivot
+expressed over raws the artificial constraints leave free, and `dof_layout` checks
+it once per build (`_assert_resolved`). Such a branch
 may still be constrained on `component` by a physical Dirichlet condition, which
 is resolved later; it then contributes its constrained value rather than a
 coefficient.
@@ -1340,8 +1440,8 @@ has_linear_constraints(d::DofLayout) = !isempty(d.pivots)
 #
 #     u(raw, c) = Σₖ wₖ · u(oₖ, c)
 #
-# over constraint-free raws `oₖ`: `_resolve_constraints!` leaves every pivot
-# expressed at depth one. Two readers share this fold — `dof_value`, which
+# over constraint-free raws `oₖ`: `_resolve_rows!` leaves every pivot expressed
+# at depth one, and `_assert_resolved` checks it once per build. Two readers share this fold — `dof_value`, which
 # reconstructs a pivot from it, and `_slots!` in assembly, which detects a
 # region's pivots, widens its active set to their branches and records those
 # branches for `_condense!` to fold the pivot's local row and column onto. When
