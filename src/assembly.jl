@@ -527,6 +527,9 @@ per-region field is reset before it is reused.
     eliminated), or `n + k` for the `k`-th linear-constraint pivot.
   - `dofs` — the global active ids of local indices `1:n`, ascending.
   - `pivots` — the `(field, raw, component)` of pivot slot `n + k`.
+  - `branches` — every pivot's expansion, one `(k, x, w, v)` per branch in
+    expansion order: pivot `k`, the branch's local index `x` (`0` when it is
+    constrained, with constrained value `v`) and its weight `w`.
   - `K`, `b` — the local system, `m × m` column-major and length `m`, with
     `m = n + length(pivots)`. A pivot's row and column are condensed onto its
     branches before the system leaves the workspace.
@@ -539,6 +542,7 @@ struct AssemblyWorkspace{D,T,B<:BasisFamily}
     slots::Vector{Int}
     dofs::Vector{Int}
     pivots::Vector{NTuple{3,Int}}
+    branches::Vector{Tuple{Int,Int,T,T}}
     K::Vector{T}
     b::Vector{T}
 end
@@ -548,7 +552,7 @@ end
 function AssemblyWorkspace(layout::SystemLayout{D,T}, spaces) where {D,T}
     return AssemblyWorkspace(layout, BasisBank(spaces, Val(D), T), Tuple{Int,Int,Vector{Int}}[],
                              zeros(Int, length(layout.fields) + 1), Int[], Int[], NTuple{3,Int}[],
-                             T[], T[])
+                             Tuple{Int,Int,T,T}[], T[], T[])
 end
 
 # A fresh workspace for `model`. Deliberately unspecialised: it runs once per
@@ -675,17 +679,17 @@ end
 #
 #   1. Collect the active global ids of the frame.
 #   2. On a field with linear constraints, turn every constrained slot whose
-#      (raw, component) is a pivot into pivot slot `k`, and collect the active
-#      ids of its branches: a pivot widens the region's active set to its
-#      expansion. The rule is the dof layer's `_fold_pivot`, the same one
-#      `dof_value` reconstructs a pivot from.
+#      (raw, component) is a pivot into pivot slot `k`, record its branches for
+#      `_condense!`, and collect their active ids: a pivot widens the region's
+#      active set to its expansion. The rule is the dof layer's `_fold_pivot`,
+#      the same one `dof_value` reconstructs a pivot from.
 #   3. Sort and deduplicate the ids. Every global id then has exactly one local
 #      index, and local order is global order. The second property is what lets
 #      the kernel apply a symmetric form's "global row ≥ col" test to local
 #      indices before it contracts, and the scatter merge a region column into a
 #      sorted pattern column.
 #   4. Rewrite each slot: active id `g` ↦ its local index, `0` ↦ `0`, pivot
-#      `k` ↦ `n + k`.
+#      `k` ↦ `n + k`; and each branch's active id to its local index.
 #
 # The renumbering is bit-neutral: every local sum still receives the same terms
 # in the same order. `QuickSort` sorts in place; the default algorithm allocates
@@ -694,6 +698,7 @@ end
 function _slots!(ws::AssemblyWorkspace)
     empty!(ws.dofs)
     empty!(ws.pivots)
+    empty!(ws.branches)
     for g in ws.slots
         g > 0 && push!(ws.dofs, g)
     end
@@ -705,7 +710,7 @@ function _slots!(ws::AssemblyWorkspace)
             for c in 1:fl.components, i in eachindex(raw)
                 k = s0 + (c - 1) * length(raw) + i
                 ws.slots[k] == 0 || continue
-                _, pivot = _fold_pivot(_push_active_branch, ws.dofs, fl.dofs, id, raw[i], c)
+                _, pivot = _fold_pivot(_push_branch, ws, fl.dofs, id, raw[i], c)
                 pivot || continue
                 push!(ws.pivots, (f, raw[i], c))
                 ws.slots[k] = -length(ws.pivots)
@@ -718,11 +723,19 @@ function _slots!(ws::AssemblyWorkspace)
         g = ws.slots[k]
         ws.slots[k] = g > 0 ? searchsortedfirst(ws.dofs, g) : g < 0 ? n - g : 0
     end
+    for (j, (k, g, w, v)) in pairs(ws.branches)
+        ws.branches[j] = (k, g > 0 ? searchsortedfirst(ws.dofs, g) : 0, w, v)
+    end
     return n
 end
 
-# The `_fold_pivot` step of `_slots!`: collect a branch's active id.
-_push_active_branch(dofs, g, _, _) = (g > 0 && push!(dofs, g); dofs)
+# The `_fold_pivot` step of `_slots!`: record a branch of the pivot about to be
+# numbered, and collect its active id.
+function _push_branch(ws::AssemblyWorkspace, g, w, v)
+    push!(ws.branches, (length(ws.pivots) + 1, g, w, v))
+    g > 0 && push!(ws.dofs, g)
+    return ws
+end
 
 # ── Per-region-kind quadrature accessors ──────────────────────────────────────
 #
@@ -1174,49 +1187,36 @@ end
 #     `w·K[x, u]` to `K[x, y]` for `x ∈ (sym ? y : 1):n`; a Dirichlet branch
 #     with value `v ≠ 0` lifts `b[x] −= (w·v)·K[x, u]` for every `x ∈ 1:n`.
 #
-# The branches come from the dof layer's `_fold_pivot`, which `dof_value` reads
-# too, so assembly and reconstruction cannot expand a pivot differently. It
-# differs from distributing every emission through the expansions only in
-# summation order (≤ 1e-16 relative on the gate's pivot scenarios). It handles a
-# branch shared by several slots, a pivot appearing in several parents, and the
-# lift through a pivot, with no branching in the emission loop.
+# The branches are the ones `_slots!` recorded from the dof layer's
+# `_fold_pivot`, which `dof_value` reads too, so assembly and reconstruction
+# cannot expand a pivot differently. The result differs from distributing every
+# emission through the expansions only in summation order (≤ 1e-16 relative on
+# the gate's pivot scenarios). It handles a branch shared by several slots, a
+# pivot appearing in several parents, and the lift through a pivot, with no
+# branching in the emission loop.
 function _condense!(ws::AssemblyWorkspace, n::Int, m::Int, sym::Bool, matrix::Bool)
     K, b = ws.K, ws.b
-    for k in eachindex(ws.pivots)
+    for (k, x, w, _) in ws.branches
+        x == 0 && continue
         v = n + k
-        f, raw, c = ws.pivots[k]
-        fl = ws.layout.fields[f]
-        id = (o, cc) -> _field_component_dof(fl, o, cc)
-        _fold_pivot(nothing, fl.dofs, id, raw, c) do _, g, w, _
-            g == 0 && return nothing
-            x = searchsortedfirst(ws.dofs, g)
-            b[x] += w * b[v]
-            matrix || return nothing
-            for y in 1:m
-                (sym && y <= n && x < y) || (K[(y-1)*m+x] += w * K[(y-1)*m+v])
-            end
-            return nothing
+        b[x] += w * b[v]
+        matrix || continue
+        for y in 1:m
+            (sym && y <= n && x < y) || (K[(y-1)*m+x] += w * K[(y-1)*m+v])
         end
     end
     matrix || return nothing
-    for k in eachindex(ws.pivots)
+    for (k, y, w, value) in ws.branches
         u = n + k
-        f, raw, c = ws.pivots[k]
-        fl = ws.layout.fields[f]
-        id = (o, cc) -> _field_component_dof(fl, o, cc)
-        _fold_pivot(nothing, fl.dofs, id, raw, c) do _, g, w, gv
-            if g == 0
-                iszero(gv) && return nothing
-                for x in 1:n
-                    b[x] -= w * gv * K[(u-1)*m+x]
-                end
-            else
-                y = searchsortedfirst(ws.dofs, g)
-                for x in (sym ? y : 1):n
-                    K[(y-1)*m+x] += w * K[(u-1)*m+x]
-                end
+        if y == 0
+            iszero(value) && continue
+            for x in 1:n
+                b[x] -= w * value * K[(u-1)*m+x]
             end
-            return nothing
+        else
+            for x in (sym ? y : 1):n
+                K[(y-1)*m+x] += w * K[(u-1)*m+x]
+            end
         end
     end
     return nothing

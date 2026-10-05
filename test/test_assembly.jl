@@ -1299,6 +1299,52 @@ end
     @test reconstructed ≈ A * x + F - b rtol = 1.0e-12
 end
 
+@testset "unsymmetric pivot condensation: the full pair, and the transpose of the adjoint" begin
+    # The masked C¹ level of the testset above, where pivots carry branches onto
+    # raws with nonzero Dirichlet values. A form that is not declared symmetric
+    # runs the unsymmetric branch of the per-region condensation: every pivot row
+    # folds onto every column, and every pivot column onto every row of its
+    # branches, with the lift of its Dirichlet branches in the rhs.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    mask = trues(6, 6)
+    mask[4:6, 4:6] .= false
+    V = space(Ω; cells=6, order=3, basis=bspline(; continuity=1), active=mask)
+    u = field(:u, V)
+    load = source_load(u; source=1.0)
+    model = prepare(Problem((u,); blocks=(stiffness_block(u),), loads=(load,),
+                            dirichlet=[dirichlet(x -> 1.0 + x[1] * x[2]; on=boundary(:all))]))
+    @test Unfitted.has_linear_constraints(model.dofs)
+
+    # A symmetric operator assembled without the symmetry shortcut gives the
+    # pair of the symmetric branch, lift included, up to summation order.
+    As, bs = assemble(model, stiffness_block(u), load; symmetric=true, threaded=false)
+    Au, bu = assemble(model, stiffness_block(u), load; symmetric=false, threaded=false)
+    @test Au ≈ As rtol = 1.0e-13
+    @test bu ≈ bs rtol = 1.0e-13
+    @test assemble(model, stiffness_block(u), load; symmetric=false, threaded=true) == (Au, bu)
+
+    # An unsymmetric operator and its adjoint. With
+    #
+    #     a(u, v) = ∫ (∂ₓu + y·u) v + 0.1 ∇u·∇v,    a*(u, v) = a(v, u),
+    #
+    # the element matrices are transposes of each other, and condensing a pivot,
+    # K ← Pᵀ K P on the active block, commutes with the transpose, as does
+    # dropping the constrained rows and columns. So the two assembled matrices
+    # are transposes up to summation order, and a defect in only the row step or
+    # only the column step breaks that.
+    convect(q, trial) = TestChannels(trial.gradient[1] + q.x[2] * trial.value, 0.1 * trial.gradient)
+    adjoint(q, trial) = TestChannels(q.x[2] * trial.value,
+                                     SVector(trial.value, 0.0) + 0.1 * trial.gradient)
+    forward = block(u, u, WeakForm(bilinear=convect, symmetric=false))
+    backward = block(u, u, WeakForm(bilinear=adjoint, symmetric=false))
+    A = assemble_matrix(model, forward; threaded=false)
+    Aᵀ = assemble_matrix(model, backward; threaded=false)
+    @test norm(A - transpose(A)) > 0.1 * norm(A)
+    @test A ≈ transpose(Aᵀ) rtol = 1.0e-13
+    @test assemble_matrix(model, forward; threaded=true) == A
+    @test assemble_matrix(model, backward; threaded=true) == Aᵀ
+end
+
 @testset "neumann explicit-component flux lands only on the matching component's boundary dofs" begin
     # A constant Neumann flux g on the face x = 1 of the unit square,
     # restricted to one component of a 2-component vector field via the

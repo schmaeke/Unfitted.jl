@@ -1300,13 +1300,13 @@ end
 #     u(raw, c) = Σₖ wₖ · u(oₖ, c)
 #
 # over constraint-free raws `oₖ`: `_resolve_constraints!` leaves every pivot
-# expressed at depth one. Three readers share this fold — `dof_value`, which
-# reconstructs a pivot from it; `_slots!` in assembly, which detects a region's
-# pivots and widens its active set to their branches; and `_condense!`, which
-# folds a pivot's local row and column onto those branches. When reconstruction
-# and emission each carried their own encoding they could disagree, and a field
-# was then solved correctly but reconstructed wrong; one definition rules that
-# out.
+# expressed at depth one. Two readers share this fold — `dof_value`, which
+# reconstructs a pivot from it, and `_slots!` in assembly, which detects a
+# region's pivots, widens its active set to their branches and records those
+# branches for `_condense!` to fold the pivot's local row and column onto. When
+# reconstruction and emission each carried their own encoding they could
+# disagree, and a field was then solved correctly but reconstructed wrong; one
+# definition rules that out.
 #
 # `f(acc, g, w, v)` is folded over the branches in expansion order, where
 # `g = id(oₖ, c)` is the branch's active id (0 when it is constrained) and `v` its
