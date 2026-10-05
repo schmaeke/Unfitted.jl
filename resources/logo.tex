@@ -12,11 +12,14 @@
 \definecolor{juliared}{HTML}{CB3C33}
 \definecolor{juliapurple}{HTML}{9558B2}
 
-% Ink for every stroke in the drawing: the background mesh, the domain
-% outline, the cell edges, the material interface and the wordmark. Fills stay
-% fixed -- the four Julia colours read on either ground -- so the light and the
-% dark asset differ in exactly one macro, and the dark variant is this same
-% file compiled with `\ink' predefined.
+% Ink for every stroke in the drawing -- the background mesh, the domain
+% outline, the material interface, the lifted cell's grid, the dotted lines
+% beneath it and the wordmark -- and for the shadow that cell casts on the
+% plane, which is the ink at 30% opacity, so it darkens a light ground and
+% lightens a dark one. The coloured fills stay fixed, since the Julia purple,
+% green and red read on either ground. The light and the dark asset therefore
+% differ in exactly one macro, and the dark variant is this same file compiled
+% with `\ink' predefined.
 %
 % The README assets are SVG, built through DVI rather than PDF: dvisvgm only
 % accepts PDF input via Ghostscript < 10.01 or mutool, while its DVI path is
