@@ -109,6 +109,17 @@ function _interface_regions(iface::Interface, V_a::Space{D,T}, V_b::Space{D,T}, 
     return _emit_interface_regions(subdivided, V_a, V_b, field_a, field_b, tol)
 end
 
+# The regions of `iface` across the two subdomains of `problem`, with the coupled
+# fields' global indices taken from `layout`: how `prepare` builds the regions of
+# every interface a form names, and how assembly builds them for an interface
+# `prepare` did not see.
+function _interface_regions(iface::Interface, problem::Problem, layout::SystemLayout)
+    return _interface_regions(iface, _field_space(problem, iface.field_a),
+                              _field_space(problem, iface.field_b),
+                              _field_index(layout, iface.field_a),
+                              _field_index(layout, iface.field_b), layout.tolerance)
+end
+
 # The rule is sized per sub-cell from the cells that actually cover it, on both
 # sides: the interface integrand is a product of one trace from each subdomain,
 # so the count that integrates it is the larger of the two sides' own counts.

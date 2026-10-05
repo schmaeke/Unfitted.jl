@@ -123,14 +123,6 @@ end
 
 # ── L² projection source-driven rhs ──────────────────────────────────────────
 
-# One side of a [`TransferRegion`](@ref) as the assembly kernel's helpers see a
-# region: its parent list. The target and the source sides each get one, so
-# `_frame!`, `_refresh!` and the state evaluation run on them unchanged, with
-# `region_parents` and `_parent_lists` taking their single-sided defaults.
-struct _TransferView{D,T}
-    parents::Vector{ParentRef{D,T}}
-end
-
 # Accumulate the source-driven rhs of the L² transfer over the union partition
 # `regions`, onto `rhs`. The target mass matrix `M_T` and its Dirichlet
 # column-elimination lift `−M_ac·c_c` are assembled separately, by the standard
@@ -168,8 +160,11 @@ function _transfer_rhs_regions!(rhs::Vector{T}, target::AssemblyWorkspace{D,T},
     source_field = [_field_index(source.layout, fl.name) for fl in target.layout.fields]
     for region in regions
         isempty(region.source_parents) && continue
-        target_view = _TransferView(region.target_parents)
-        source_view = _TransferView(region.source_parents)
+        # Each side as the kernel's helpers see a region, a parent list, so
+        # `_frame!`, `_refresh!` and the state evaluation run on it unchanged,
+        # with `region_parents` and `_parent_lists` taking their defaults.
+        target_view, source_view = (; parents=region.target_parents),
+                                   (; parents=region.source_parents)
         n = _slots!(_frame!(target, target_view))
         m = n + length(target.pivots)
         _state_region!(state, _frame!(source, source_view))
@@ -186,9 +181,7 @@ function _transfer_rhs_regions!(rhs::Vector{T}, target::AssemblyWorkspace{D,T},
             end
         end
         isempty(target.pivots) || _condense!(target, n, m, false, false)
-        for k in 1:n
-            rhs[target.dofs[k]] += target.b[k]
-        end
+        _flush!(nothing, rhs, nothing, target, n, false, false)
     end
     return nothing
 end

@@ -1221,7 +1221,7 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                            classify_caches=_caches_by_space(spaces, caches), facets=facet_resolver)
     facet_regions = _resolve_facet_regions(effective_problem, facet_resolver)
     surface_regions = _resolve_surface_regions(effective_problem, tolerance)
-    interface_regions = _resolve_interface_regions(effective_problem, layout, tolerance)
+    interface_regions = _resolve_interface_regions(effective_problem, layout)
     facet_stats = _facet_region_stats(facet_regions)
     diag = AssemblyDiagnostics(dimension=D, active_unknowns=active_unknowns(layout),
                                inactive_cell_counts=_inactive_cell_counts(spaces),
@@ -1322,21 +1322,16 @@ end
 
 # Build the interface-region cache for a problem from every `Interface`
 # referenced by a coupling block's `on` tag (the four blocks a `couple` call
-# emits share one `Interface` object → one cache entry). Each interface's field
-# indices come from the dof `layout` (global field order) and its two subdomain
-# spaces from the effective problem's fields; the two-sided regions are built by
-# subdividing the interface mesh against the merged trace of both grids. Keyed by
-# `IdDict` (object identity), as for the surface cache.
-function _resolve_interface_regions(problem::Problem{D,T}, layout::SystemLayout{D,T},
-                                    tolerance::GeometryTolerance{T}) where {D,T}
+# emits share one `Interface` object → one cache entry), each built by
+# `_interface_regions(iface, problem, layout)` exactly as a one-shot interface
+# is: field indices from the dof `layout` (global field order), the two
+# subdomain spaces from the effective problem's fields, and the two-sided
+# regions by subdividing the interface mesh against the merged trace of both
+# grids. Keyed by `IdDict` (object identity), as for the surface cache.
+function _resolve_interface_regions(problem::Problem{D,T}, layout::SystemLayout{D,T}) where {D,T}
     regions = IdDict{Any,Vector{InterfaceRegion{D,T}}}()
     for iface in _referenced_interfaces(problem)
-        haskey(regions, iface) && continue
-        field_a = layout.by_name[iface.field_a]
-        field_b = layout.by_name[iface.field_b]
-        space_a = _field_space(problem, iface.field_a)
-        space_b = _field_space(problem, iface.field_b)
-        regions[iface] = _interface_regions(iface, space_a, space_b, field_a, field_b, tolerance)
+        haskey(regions, iface) || (regions[iface] = _interface_regions(iface, problem, layout))
     end
     return regions
 end

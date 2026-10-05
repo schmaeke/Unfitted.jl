@@ -134,22 +134,30 @@ function _checked_coefficients(solution::Solution, model::Model)
     return solution.coefficients
 end
 
-# Active coefficient vector of the iterate passed as `state=` to
-# `assemble_matrix` / `assemble_vector` / `foreach_quadrature_point`.
-# Three dispatched cases:
+# The active coefficient vector of the iterate passed as `state=` to `assemble`
+# and its wrappers, `foreach_quadrature_point` and the L² transfer's source
+# evaluation, checked and converted once. Three dispatched cases:
 #
-#   * `nothing`  → assembly runs without `q.state`, callbacks see
-#                  `q.state == nothing`.
-#   * `Solution` → version-checked via `_checked_coefficients`.
+#   * `nothing`  → no state: callbacks see `q.state == nothing`.
+#   * `Solution` → version- and length-checked via `_checked_coefficients`.
 #   * `AbstractVector` → length-checked only; useful for embedding
 #     external time integrators that own their own coefficient buffers
 #     and don't bother wrapping them in a `Solution`.
-_iterate_coefficients(::Nothing, model::Model) = nothing
-_iterate_coefficients(solution::Solution, model::Model) = _checked_coefficients(solution, model)
-function _iterate_coefficients(coefficients::AbstractVector, model::Model)
+#
+# The result is a `Vector{R}`, `R = promote_type(T, eltype(state))`, so the
+# eltype stays generic while the state's container type stops being a
+# specialisation axis of the kernel; a `Vector{R}` passes through without a
+# copy. Dispatched methods rather than one unspecialised body, which measured
+# three more allocations per call.
+_state_vector(::Nothing, ::Model) = nothing
+function _state_vector(solution::Solution, model::Model)
+    return _state_vector(_checked_coefficients(solution, model), model)
+end
+function _state_vector(coefficients::AbstractVector, model::Model)
     length(coefficients) == active_unknowns(model.dofs) ||
         throw(DimensionMismatch("state coefficient vector does not match the model active space"))
-    return coefficients
+    R = promote_type(_scalar(model.dofs), eltype(coefficients))
+    return coefficients isa Vector{R} ? coefficients : convert(Vector{R}, coefficients)
 end
 
 # ── Solve ─────────────────────────────────────────────────────────────────────

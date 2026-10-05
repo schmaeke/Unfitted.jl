@@ -113,16 +113,10 @@ function _regions(@nospecialize(model::Model), mesh::BoundaryMesh, @nospecialize
     cached === nothing || return cached, true
     return _surface_regions_for_mesh(space, mesh, model.dofs.tolerance), false
 end
-# An interface's field indices come from the dof layout (global field order),
-# its two spaces from the effective problem's fields.
 function _regions(@nospecialize(model::Model), iface::Interface, _)
     cached = get(model.interface_regions, iface, nothing)
     cached === nothing || return cached, true
-    field_a = _field_index(model.dofs, iface.field_a)
-    field_b = _field_index(model.dofs, iface.field_b)
-    return _interface_regions(iface, _field_space(model.problem, iface.field_a),
-                              _field_space(model.problem, iface.field_b), field_a, field_b,
-                              model.dofs.tolerance), false
+    return _interface_regions(iface, model.problem, model.dofs), false
 end
 
 # The `RegionList` of pass target `target` on `space` (`RegionKey`
@@ -976,18 +970,6 @@ end
 
 # The scalar type `T` of a layout.
 _scalar(::SystemLayout{D,T}) where {D,T} = T
-
-# Check a `state` argument (`nothing`, a pin-checked `Solution`, or a
-# length-checked coefficient vector, see `_iterate_coefficients`) and convert it
-# once to `Vector{R}` with `R = promote_type(T, eltype(state))`, so the eltype
-# stays generic while the state's container type stops being a specialisation
-# axis of the kernel. A `Vector{R}` passes through without a copy.
-function _state_vector(@nospecialize(state), @nospecialize(model::Model))
-    coefficients = _iterate_coefficients(state, model)
-    coefficients === nothing && return nothing
-    R = promote_type(_scalar(model.dofs), eltype(coefficients))
-    return coefficients isa Vector{R} ? coefficients : convert(Vector{R}, coefficients)
-end
 
 # ── The kernel ────────────────────────────────────────────────────────────────
 
