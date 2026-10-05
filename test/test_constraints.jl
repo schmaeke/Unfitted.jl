@@ -186,6 +186,39 @@ end
     @test all(iszero, Unfitted.active_cell_dofs(layout4, 2, CartesianIndex(1, 1, 1, 1)))
 end
 
+@testset "each level's raws are one contiguous range, by level id" begin
+    # `level_raws` is what the per-level passes read instead of scanning every raw,
+    # so it has to partition the raws exactly: level `id`'s range holds precisely
+    # the raws whose key carries `id`, and the ranges tile `1:nraw` in level order.
+    dom = box((0.0, 0.0), (1.0, 1.0))
+    V = space(dom; cells=(4, 4), order=3)
+    V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4), order=3)
+    V = overlay(V, box((0.375, 0.375), (0.625, 0.625)); cells=(2, 2), order=2)
+    stack = Unfitted.dof_layout(V)
+    rungs = Unfitted.dof_layout(ladder(dom; cells=(4, 4), order=2, depth=3, splits=2))
+    for layout in (stack, rungs)
+        @test reduce(vcat, collect.(layout.level_raws)) == eachindex(layout.raw_keys)
+        @test all(layout.raw_keys[r].level == id for id in eachindex(layout.level_raws)
+                  for r in layout.level_raws[id])
+    end
+    @test length.(stack.level_raws) == [13^2, 13^2, 5^2]
+    # A ladder's unwoken rungs enumerate nothing: their ranges are empty.
+    @test length(rungs.level_raws) == 4
+    @test all(isempty, rungs.level_raws[2:end])
+
+    # A subdomain reindexed into a higher id block holds no raw below it, and the
+    # leading slot reads empty rather than undefined.
+    V2 = overlay(space(box((2.0, 0.0), (3.0, 1.0)); cells=3, order=3),
+                 box((2.25, 0.25), (2.75, 0.75)); cells=2, order=2)
+    u1, u2 = field(:u1, space(dom; cells=4, order=2)), field(:u2, V2)
+    model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
+                            loads=(source_load(u1; source=x -> 1.0),
+                                   source_load(u2; source=x -> 1.0))))
+    second = model.dofs.fields[2]
+    @test second.level_ids == 2:3
+    @test second.dofs.level_raws == [1:0, 1:100, 101:125]
+end
+
 @testset "codim-D point dirichlet pins a single vertex dof" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(2, 2), order=2)

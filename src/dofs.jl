@@ -143,6 +143,16 @@ Fields:
   - `raw_keys::Vector{TensorDofKey{D}}` — `raw_keys[i]` is the
     `TensorDofKey` that produced raw dof `i`. The inverse of the
     construction dictionary.
+  - `level_raws::Vector{UnitRange{Int}}` — indexed by level *id*, like
+    `cell_dofs_by_level`: the raws level `id` enumerated, as one
+    contiguous range, so `raw_keys[r].level == id` exactly for the `r` in
+    `level_raws[id]`. Contiguous by construction: a key carries its level
+    id, so walking one level's cells can only create or reuse that level's
+    keys. A dormant level (no active cell) has an empty range, and an id
+    the space does not hold reads `1:0`. Every per-level pass — the
+    constraint hooks, physical-Dirichlet detection, the per-level
+    diagnostics — reads its level's raws off this range instead of
+    scanning, bucketing or looking up the level of every raw.
   - `active_component::Matrix{Int}` — `(raw, component) → active id`.
     Entry is `0` when component `component` of raw dof `raw` is
     constrained.
@@ -208,6 +218,7 @@ struct DofLayout{D,T<:Real}
     components::Int
     cell_dofs_by_level::Vector{Array{Vector{Int},D}}
     raw_keys::Vector{TensorDofKey{D}}
+    level_raws::Vector{UnitRange{Int}}
     active_component::Matrix{Int}
     physical_dirichlet::Matrix{Bool}
     elimination_source::Vector{Symbol}
@@ -285,6 +296,55 @@ function _build_cell_dofs!(raw_by_key::Dict{TensorDofKey{D},Int}, raw_keys::Vect
     end
 
     return raw_ids
+end
+
+# Stage 1 of the layout: walk every level's cells and assign raw dofs through
+# the `TensorDofKey` cache (cross-cell endpoint sharing happens here). Levels go
+# in `V.levels` order, cells in `cell_indices` order, local functions in
+# `cell_basis_indices` order, and a raw's id is the order of its key's first
+# appearance. Returns the key → raw map, `raw_keys`, the per-level cell tables
+# and the per-level raw ranges.
+#
+# The ranges cost one `UnitRange` per level and replace a pass that bucketed
+# every key by level through a `Dict` — in that `Dict`'s hash order, which is
+# also the order the constraint hooks then visited a level's raws in. They are
+# exact because a key carries its level id: walking level L can only create or
+# reuse L's keys, so L's raws are precisely the ids appended while L is walked,
+# and visiting them is visiting them in raw order.
+function _enumerate_raws(V::Space{D}) where {D}
+    raw_by_key = Dict{TensorDofKey{D},Int}()
+    raw_keys = TensorDofKey{D}[]
+    # Indexed by level *id*, not by position: for a single-domain space the two
+    # coincide (base = 1, overlays 2, 3, …), but a subdomain of a coupled model
+    # is reindexed into a disjoint id block by `_reindex_space_levels`, so this
+    # layout's ids run over that block and match the `parent.level` id the
+    # assembly workspace and `cell_dofs` key by (leading slots below the block
+    # stay `undef` and are never addressed by this field's parents).
+    nid = maximum(l -> l.id, V.levels)
+    cell_dofs_by_level = Vector{Array{Vector{Int},D}}(undef, nid)
+    level_raws = fill(1:0, nid)
+
+    # Every inactive cell of every level shares one empty vector. A ladder makes
+    # inactive cells the overwhelming majority of the grid — measured on a
+    # depth-5 2D stack over a 6² base with one base cell refined to the bottom,
+    # 49 140 cells of which 1 400 are active — and a fresh `Int[]` per inactive
+    # cell put one heap allocation on each of them, on every rebuild, and
+    # `estimate` rebuilds. On that layout it is 74 856 allocations against
+    # 27 117. It is per call rather than a module-level constant because a
+    # `const` empty vector is one stray `push!` away from corrupting every
+    # inactive cell of every layout ever built.
+    none = Int[]
+    for level in V.levels
+        first_raw = length(raw_keys) + 1
+        level_cells = Array{Vector{Int},D}(undef, level.mesh.cells)
+        for cell in cell_indices(level.mesh)
+            level_cells[cell] = is_active(level.mask, cell) ?
+                                _build_cell_dofs!(raw_by_key, raw_keys, level, cell) : none
+        end
+        cell_dofs_by_level[level.id] = level_cells
+        level_raws[level.id] = first_raw:length(raw_keys)
+    end
+    return raw_by_key, raw_keys, cell_dofs_by_level, level_raws
 end
 
 # ── Geometric helpers shared with `dirichlet.jl` ──────────────────────────────
@@ -488,8 +548,9 @@ A new family must implement all six arguments, in this order — the hook
 is called positionally from [`dof_layout`](@ref) stage 2.
 
 The default fallback walks `level_keys` (the `(key, raw)` pairs that
-belong to this level, pre-bucketed by [`dof_layout`](@ref) so the scan
-is `O(this level's raws)` rather than `O(all raws)` per level), asks the
+belong to this level, in raw order, read off the level's range in
+`level_raws` by [`dof_layout`](@ref) so the scan is `O(this level's
+raws)` rather than `O(all raws)` per level), asks the
 family's `_has_overlay_constraint` predicate per raw, and emits a
 *single-raw* constraint `1 · u_raw = 0` for every boundary raw. This is
 strong elimination of the boundary node — the regime the integrated
@@ -967,7 +1028,9 @@ Construct the basis-aware global dof layout for a superposition
   1. Walk every level's cells in order and build the cell-local raw dof
      id vector through `TensorDofKey` lookup. Adjacent cells share
      endpoint nodes; bubble (span) modes are cell-local. Inactive cells
-     get an empty vector.
+     get an empty vector. Each level's raws come out as one contiguous
+     range, recorded in `level_raws`, and the constraint hooks of stage 2
+     visit a level's raws in that (raw) order.
   2. Collect homogeneous linear constraints from every level, from two
      sources: the family-dispatched [`_overlay_constraints`](@ref) hook
      on every level, and [`_coverage_constraints`](@ref) on every level
@@ -1029,47 +1092,11 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
                     classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}(),
                     facets=nothing) where {D,T}
     components > 0 || throw(ArgumentError("dof layout components must be positive"))
-    raw_by_key = Dict{TensorDofKey{D},Int}()
-    raw_keys = TensorDofKey{D}[]
-    # Indexed by level *id*, not by position: for a single-domain space the two
-    # coincide (base = 1, overlays 2, 3, …), but a subdomain of a coupled model
-    # is reindexed into a disjoint id block by `_reindex_space_levels`, so this
-    # layout's ids run over that block and match the `parent.level` id the
-    # assembly workspace and `cell_dofs` key by (leading slots below the block
-    # stay `undef` and are never addressed by this field's parents).
-    cell_dofs_by_level = Vector{Array{Vector{Int},D}}(undef, maximum(l -> l.id, V.levels))
-
-    # Stage 1: walk every level's cells and assign raw dofs through the
-    # `TensorDofKey` cache (cross-cell endpoint sharing happens here).
-    #
-    # Every inactive cell of every level shares one empty vector. A ladder makes
-    # inactive cells the overwhelming majority of the grid — measured on a
-    # depth-5 2D stack over a 6² base with one base cell refined to the bottom,
-    # 49 140 cells of which 1 400 are active — and a fresh `Int[]` per inactive
-    # cell put one heap allocation on each of them, on every rebuild, and
-    # `estimate` rebuilds. On that layout it is 74 856 allocations against
-    # 27 117. It is per call rather than a module-level constant because a
-    # `const` empty vector is one stray `push!` away from corrupting every
-    # inactive cell of every layout ever built.
-    none = Int[]
-    for level in V.levels
-        level_cells = Array{Vector{Int},D}(undef, level.mesh.cells)
-        for cell in cell_indices(level.mesh)
-            level_cells[cell] = is_active(level.mask, cell) ?
-                                _build_cell_dofs!(raw_by_key, raw_keys, level, cell) : none
-        end
-        cell_dofs_by_level[level.id] = level_cells
-    end
+    # Stage 1: raw enumeration, with each level's raws as one range.
+    raw_by_key, raw_keys, cell_dofs_by_level, level_raws = _enumerate_raws(V)
 
     # Stage 2: collect linear constraints per level and resolve to expansions.
-    # Bucket the raw keys by level once so each level's constraint hook
-    # scans only its own raws (O(total raws) overall, not O(levels × raws)).
     nraw = length(raw_keys)
-    keys_by_level = Dict{Int,Vector{Pair{TensorDofKey{D},Int}}}()
-    for (key, raw) in raw_by_key
-        push!(get!(() -> Pair{TensorDofKey{D},Int}[], keys_by_level, key.level), key => raw)
-    end
-    empty_keys = Pair{TensorDofKey{D},Int}[]
     constraints = LinearConstraint{T}[]
     # Track only the COVERAGE/DEDUP elimination sources, so `constraint_kind` /
     # diagnostics can pick a pruned or deduped raw out. Overlay-boundary
@@ -1081,7 +1108,10 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     coverage = prune ? build_coverage(V, tolerance, classify_cache) :
                Coverage{D}(Dict{Int,BitArray{D}}())
     for level in V.levels
-        level_keys = get(keys_by_level, level.id, empty_keys)
+        # The level's `(key, raw)` pairs, in raw order, read off its range. Only
+        # the constraint hooks' signature wants them in this form; it is an
+        # adapter that goes once the hooks read the level's range themselves.
+        level_keys = Pair{TensorDofKey{D},Int}[raw_keys[r] => r for r in level_raws[level.id]]
         # Source 1: the artificial-overlay-boundary trace condition (every family).
         overlay_constraints = _overlay_constraints(level, V, tolerance, raw_by_key, level_keys,
                                                    classify_cache)
@@ -1133,11 +1163,17 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
         !(isempty(e) || (length(e) == 1 && e[1] == (raw, one(T))))
     end
 
-    # Stage 3: per-component physical Dirichlet detection.
+    # Stage 3: per-component physical Dirichlet detection, level by level over each
+    # level's raw range. The ranges tile the raws in level order, so this is still raw
+    # order, but the predicate gets its level handed in rather than found again per
+    # raw. Searching `V.levels` for every raw's id copied the level struct out once
+    # per raw, and that copy's cost swung with the process's memory layout: on a deep
+    # 2D ladder (6² base, depth 5) this stage took 4.7–8.1 ms per process that way
+    # and takes 3.5–4.4 ms walking the ranges.
     ncomp = Int(components)
     physical_dirichlet = falses(nraw, ncomp)
-    for (raw, key) in pairs(raw_keys)
-        level = _level_by_id(V, key.level)
+    for level in V.levels, raw in level_raws[level.id]
+        key = raw_keys[raw]
         for component in 1:ncomp
             physical_dirichlet[raw, component] = _has_physical_dirichlet(key, level, V.domain,
                                                                          dirichlet, tolerance,
@@ -1157,7 +1193,7 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
         end
     end
 
-    layout = DofLayout{D,T}(ncomp, cell_dofs_by_level, raw_keys, active_component,
+    layout = DofLayout{D,T}(ncomp, cell_dofs_by_level, raw_keys, level_raws, active_component,
                             physical_dirichlet, elimination_source, raw_expansion,
                             has_linear_constraints, zeros(T, nraw, ncomp), fill(:none, ncomp),
                             [Int[] for _ in 1:ncomp], active_count, tolerance)

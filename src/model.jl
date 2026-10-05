@@ -354,34 +354,26 @@ function _inactive_cell_counts(spaces)
 end
 
 # Per-level count of raws eliminated by covered-mode pruning (`:coverage` or
-# `:dedup`), across every field of the system layout, in field-then-level
-# order. The granularity is deliberately the *field*, not the space
-# `_inactive_cell_counts` walks: covered-mode pruning is a property of a field's
-# own dof layout, and two fields over one space shed different modes. The two
-# vectors therefore line up entry-for-entry only when each space carries one
-# field.
+# `:dedup`), one entry per id of each field's level block, concatenated in field
+# order. That is the per-*field* granularity the `reduced_mode_counts` docstring
+# states, not the per-space one `_inactive_cell_counts` walks, so the two vectors
+# line up entry-for-entry only when each space carries one field. Pruning reads
+# the space alone — never a field's components or Dirichlet data — so two fields
+# over one space report the same counts, once each.
+#
+# Each level's raws are one range of the layout (`level_raws`), so a level is
+# counted from its own elimination sources without a pass over every raw.
 function _reduced_mode_counts(layout::SystemLayout)
-    counts = Int[]
-    for field in layout.fields
-        dofs = field.dofs
-        per_level = Dict{Int,Int}()
-        for raw in eachindex(dofs.raw_keys)
-            src = dofs.elimination_source[raw]
-            (src === :coverage || src === :dedup) || continue
-            lvl = dofs.raw_keys[raw].level
-            per_level[lvl] = get(per_level, lvl, 0) + 1
-        end
-        for lvl in field.level_ids
-            push!(counts, get(per_level, lvl, 0))
-        end
-    end
-    return counts
+    return Int[count(s -> s === :coverage || s === :dedup,
+                     view(f.dofs.elimination_source, f.dofs.level_raws[id])) for f in layout.fields
+               for id in f.level_ids]
 end
 
 # Per-level counts of the functions a level *enumerated* and of those that
-# *survived*, keyed by level id and summed over every field of the system
-# layout. Both, and not only the second, because the two answer different
-# questions and the pair is what separates them:
+# *survived*, keyed by level id over every field of the system layout, each
+# level counted once however many fields share its space. Both, and not only
+# the second, because the two answer different questions and the pair is what
+# separates them:
 #
 #   raw = 0, active = 0     the level is dormant — no active cell, so nothing
 #                           was enumerated. A ladder's unwoken rungs look like
@@ -418,15 +410,18 @@ function _level_function_counts(layout::SystemLayout)
     # problem reported every level's counts doubled, while a two-component vector
     # field over the same space — the same dof count, spelled differently — reported
     # them once.
+    #
+    # A level's functions are one range of the layout (`level_raws`), so each id is
+    # counted from that range alone. A dormant level reads an explicit 0, which the
+    # consumer's `get(raw, id, 0)` already assumed for it.
     counted = Set{Int}()
     for field in layout.fields
         all(in(counted), field.level_ids) && continue
         dofs = field.dofs
-        for r in eachindex(dofs.raw_keys)
-            lvl = dofs.raw_keys[r].level
-            raw[lvl] = get(raw, lvl, 0) + 1
-            any(!iszero, @view dofs.active_component[r, :]) &&
-                (active[lvl] = get(active, lvl, 0) + 1)
+        for id in field.level_ids
+            raws = dofs.level_raws[id]
+            raw[id] = length(raws)
+            active[id] = count(r -> any(!iszero, view(dofs.active_component, r, :)), raws)
         end
         union!(counted, field.level_ids)
     end
