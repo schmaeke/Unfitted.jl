@@ -176,6 +176,64 @@ end
     end
 end
 
+@testset "levels share their node coordinates on a non-dyadic domain" begin
+    # The cross-level map compares node coordinates with no tolerance, so a
+    # ladder is only nested if its levels share their nodes bit for bit. On an
+    # extent that is not a power of two they did not: `_mesh_axes` scaled before
+    # dividing, so each level rounded a different product, and on [0, 0.7] in
+    # three cells refined by three the base axis ended one ulp short of 0.7 and
+    # its cells claimed 4, 4 and 3 fine cells instead of 3 each.
+    V = ladder(box((0.0,), (0.7,)); cells=3, depth=1, splits=3)
+    @test V.levels[1].mesh.axes[1][end] == 0.7
+    @test [Unfitted._cell_block(V, 1, 2, CartesianIndex(i)) for i in 1:3] ==
+          [CartesianIndices((1:3,)), CartesianIndices((4:6,)), CartesianIndices((7:9,))]
+
+    # Every node of a level is a node of the level above it, bit for bit, every
+    # axis ends exactly on the domain's corners, and the cross-level map gives
+    # each coarse cell exactly its `splits` block and each fine cell exactly one
+    # parent.
+    function nests_exactly(V::Unfitted.Space{D}) where {D}
+        ok = true
+        for level in V.levels, d in 1:D
+            axis, domain = level.mesh.axes[d], level.mesh.domain
+            ok &= first(axis) == domain.lower[d] && last(axis) == domain.upper[d]
+        end
+        for k in 2:length(V.levels)
+            coarse, fine = V.levels[k - 1].mesh, V.levels[k].mesh
+            s = fine.cells .÷ coarse.cells
+            for d in 1:D
+                ok &= fine.axes[d][1:s[d]:end] == coarse.axes[d]
+            end
+            for c in cell_indices(V; level=k - 1)
+                ok &= size(Unfitted._cell_block(V, k - 1, k, c)) == s
+            end
+            for c in cell_indices(V; level=k)
+                ok &= length(Unfitted._cell_block(V, k, k - 1, c)) == 1
+            end
+        end
+        return ok
+    end
+
+    # A sweep over offsets, extents, base counts and split factors in 1D, where
+    # the scale-first order mis-nested a large share of the combinations.
+    failures = 0
+    for lo in (0.0, 0.1, -0.3), extent in (0.7, 0.3, 1.1), cells in 1:4, splits in 2:5
+        failures += !nests_exactly(ladder(box((lo,), (lo + extent,)); cells=cells, depth=2,
+                                          splits=splits))
+    end
+    @test failures == 0
+
+    # Anisotropic and per-level in 2D, and what a user sees: a depth map refines
+    # a base cell across exactly its own child blocks.
+    V2 = ladder(box((0.1, -0.3), (0.8, 2.6)); cells=(3, 5), depth=2, splits=[(3, 2), (2, 3)])
+    @test nests_exactly(V2)
+    d = zeros(Int, 3, 5)
+    d[2, 3] = 2
+    W2 = adapt(V2, d)
+    @test count(active_cells(W2; level=2)) == 3 * 2
+    @test count(active_cells(W2; level=3)) == (3 * 2) * (2 * 3)
+end
+
 @testset "adapt: pair form sets, leaves others alone, does not alias" begin
     V = ladder(LADDER_OMEGA; cells=8, order=2, depth=2, splits=2)
     m = falses(32, 32)

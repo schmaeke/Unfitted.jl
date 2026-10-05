@@ -41,16 +41,42 @@ function _axis_int_tuple(_, ::Val{D}, name::Symbol) where {D}
 end
 
 # Per-axis coordinate samples for a uniform Cartesian mesh: axis `d` carries
-# `cells[d] + 1` values evenly spaced from `domain.lower[d]` to
-# `domain.upper[d]`. The endpoints come out bit-exact — `i = 0` is `lo`
-# itself and `i = n` reduces to `lo + (hi − lo)` — which the `Base.:(==)`
-# comparison on `AxisBox` corner coordinates relies on.
+# `cells[d] + 1` values evenly spaced from `lo = domain.lower[d]` to
+# `hi = domain.upper[d]`,
+#
+#     xᵢ = lo + (hi − lo) · fl(i / n)   for i < n,     xₙ = hi,
+#
+# with `fl(i / n)` the correctly rounded quotient. Two bit-level properties hang
+# on evaluating it in exactly that way.
+#
+#   * The endpoints are the domain's own corners. `x₀` is `lo` because the
+#     quotient is zero, and `xₙ` is `hi` by definition rather than by arithmetic:
+#     the sum `lo + (hi − lo)` rounds, and on `[0, 0.7]` in three cells the
+#     scale-first order below put the last node one ulp short of `0.7`.
+#   * Meshes of the same domain whose cell counts are multiples of each other
+#     share their nodes. A node depends on `i` and `n` only through `fl(i / n)`,
+#     and the correct rounding of a rational does not depend on how it is
+#     written, so node `j·s` of an `n·s`-cell axis is node `j` of an `n`-cell
+#     axis, bit for bit. A `ladder` is built on that: its cross-level cell map
+#     (`_cell_block`, `ladder.jl`) compares node coordinates with no tolerance.
+#     Scaling first, `(hi − lo)·i / n`, rounds a different product `(hi − lo)·i`
+#     on each level before dividing, and the levels part by an ulp: on
+#     `[0, 0.7]` in three cells refined by three, the last coarse cell claimed
+#     three fine cells and the other two claimed four each.
+#
+# Where `hi − lo` is exactly a power of two, the scale-first order gave the same
+# nodes bit for bit, so the dyadic domains of most tests and examples are
+# unchanged by the switch; a power-of-two cell count keeps every interior node
+# too. Elsewhere a node can move by an ulp, and it is then no longer the
+# correctly rounded value of `lo + (hi − lo)·i/n` even on an integer extent —
+# `[0, 3]` in five cells puts the second node at `0.6000000000000001` — which is
+# within rounding of the exact coordinate and is the price of nesting.
 function _mesh_axes(domain::AxisBox{D,T}, cells::NTuple{D,Int}) where {D,T}
     return ntuple(D) do d
         lo = domain.lower[d]
         hi = domain.upper[d]
         n = cells[d]
-        [lo + (hi - lo) * convert(T, i) / convert(T, n) for i in 0:n]
+        [i == n ? hi : lo + (hi - lo) * (convert(T, i) / convert(T, n)) for i in 0:n]
     end
 end
 
