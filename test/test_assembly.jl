@@ -1002,6 +1002,15 @@ end
     @test walked == assembled
     @test walked[1][4] === nothing && walked[1][5] === nothing
     @test n1 + nquadpoints(model; field=:u2) == nquadpoints(model)
+
+    # A field off the walked list reads exactly zero: the first subdomain's
+    # volume walk never evaluates `u2`, which lives on the second.
+    off_list = Tuple{Float64,SVector{2,Float64}}[]
+    foreach_quadrature_point(model; field=:u1, state=c) do q
+        push!(off_list, (value(q.state, :u2), field_gradient(q.state, :u2)))
+    end
+    @test length(off_list) == n1
+    @test all(r -> r[1] == 0 && r[2] == zero(SVector{2,Float64}), off_list)
 end
 
 @testset "1D bar with inhomogeneous Neumann data has analytic solution" begin

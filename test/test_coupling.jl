@@ -551,6 +551,39 @@ end
     @test hist == committed                                         # irreversible (monotone)
 end
 
+@testset "an interface walk evaluates only the two coupled fields" begin
+    # `q.state` on an interface evaluates the two fields the `Interface` couples,
+    # each on its own side. A third field `p1` shares side `a`'s space, so it is
+    # defined at every interface point, yet it reads exactly zero there, as the
+    # `FormState` and `foreach_quadrature_point` docstrings state; on its own
+    # subdomain's volume it reads normally. A kernel that wants it on the
+    # interface must evaluate it from a `Solution` instead.
+    V1 = space(box((0.0, 0.0), (1.0, 0.5)); cells=(4, 2), order=2)
+    V2 = space(box((0.0, 0.5), (1.0, 1.0)); cells=(3, 2), order=2)
+    u1, p1, u2 = field(:u1, V1), field(:p1, V1), field(:u2, V2)
+    Γ = polyline_mesh([SVector(1.0, 0.5), SVector(0.0, 0.5)])
+    blocks = couple(u1, u2, Γ, mass_form(coefficient=10.0))
+    model = prepare(Problem((u1, p1, u2);
+                            blocks=(stiffness_block(u1), mass_block(p1), stiffness_block(u2),
+                                    blocks...)))
+    c = [sin(3i) for i in 1:active_unknowns(model)]
+    zero_gradient = zero(SVector{2,Float64})
+
+    reads = Tuple{Float64,Float64,Float64,SVector{2,Float64}}[]
+    foreach_quadrature_point(model; on=first(blocks).on, state=c) do q
+        push!(reads,
+              (value(q.state, :u1), value(q.state, :u2), value(q.state, :p1),
+               field_gradient(q.state, :p1)))
+    end
+    @test length(reads) == nquadpoints(model; on=first(blocks).on) > 0
+    @test any(r -> r[1] != 0, reads) && any(r -> r[2] != 0, reads)
+    @test all(r -> r[3] == 0 && r[4] == zero_gradient, reads)
+
+    on_volume = Float64[]
+    foreach_quadrature_point(q -> push!(on_volume, value(q.state, :p1)), model; field=:p1, state=c)
+    @test any(!=(0), on_volume)
+end
+
 @testset "the interface rule is sized per sub-cell from both sides" begin
     # `_emit_interface_regions` used to take one `qorder` for the whole
     # interface, from both spaces' nominal maxima. It now asks each sub-cell's

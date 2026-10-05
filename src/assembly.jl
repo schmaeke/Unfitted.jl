@@ -220,8 +220,9 @@ point and are valid during the callback only: the same object is refilled at
 the next point, so keep the numbers, not the `FormState`.
 
 On a coupled model a field is evaluated only where it lives: on its own
-subdomain's regions, and on an interface on its own side. Every other field
-reads zero there, even where it is defined at the point; read it from a
+subdomain's volume, boundary and surface regions, and on an interface only
+the two coupled fields are, each on its own side. Every other field reads
+zero there, even where it is defined at the point; read it from a
 [`Solution`](@ref) with `value(solution, model, u, q.x)` instead.
 
 The values carry the iterate's number type promoted with the model's: a
