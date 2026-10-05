@@ -642,9 +642,9 @@ end
 #     symmetry flag, most recently used first, at most 4, so operators that
 #     alternate (mass and stiffness of a time stepper, the problem's own
 #     operator and a transfer's mass) keep their patterns.
-#   - `arena`, `rhs_arena` — the threaded scratch of the last threaded call,
-#     handed to one call at a time; a concurrent call that finds them taken
-#     allocates its own, and the larger pair is kept when they come back.
+#   - `arena` — the threaded scratch of the last threaded call, handed to one
+#     call at a time; a concurrent call that finds it taken allocates its own,
+#     and the larger one is kept when it comes back.
 #   - `workspaces` — idle `AssemblyWorkspace`s, at most `Threads.nthreads()`.
 #     Typed `Any` because the workspace type is defined in `assembly.jl`; the
 #     drivers recover it behind a function barrier.
@@ -657,13 +657,12 @@ mutable struct AssemblyCache{T}
     const oneshot::Vector{Pair{RegionKey,RegionList}}
     const patterns::Vector{Pair{Tuple{Vector{RegionKey},Bool},AssemblyPattern}}
     arena::Vector{T}
-    rhs_arena::Vector{T}
     const workspaces::Vector{Any}
 end
 function AssemblyCache{T}() where {T}
     return AssemblyCache{T}(ReentrantLock(), Dict{RegionKey,RegionList}(),
                             Pair{RegionKey,RegionList}[],
-                            Pair{Tuple{Vector{RegionKey},Bool},AssemblyPattern}[], T[], T[], Any[])
+                            Pair{Tuple{Vector{RegionKey},Bool},AssemblyPattern}[], T[], Any[])
 end
 
 """

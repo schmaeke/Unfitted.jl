@@ -545,25 +545,23 @@ function _assembly_workspace(@nospecialize(model::Model))
 end
 
 # Take one call's scratch out of the model's cache: `tasks` workspaces, idle ones
-# first and fresh ones for the rest, and for a threaded call the pooled arena
-# pair, leaving empty arenas behind so that a concurrent call allocates its own.
+# first and fresh ones for the rest, and for a threaded call the pooled arena,
+# leaving an empty one behind so that a concurrent call allocates its own.
 # Scratch is never shared between calls; together with the locked lookups that
 # is what makes concurrent assembly on one model safe, serial or threaded. A
 # workspace costs about 4 µs to build, a sizable share of a small threaded call,
-# hence the pool. Returns `(workspaces, arena, rhs_arena)`, with a concretely
-# typed `workspaces` vector and the arenas `nothing` for a serial call.
+# hence the pool. Returns `(workspaces, arena)`, with a concretely typed
+# `workspaces` vector and the arena `nothing` for a serial call.
 function _checkout!(@nospecialize(cache::AssemblyCache), @nospecialize(model::Model), tasks::Int,
                     threaded::Bool)
-    idle, arena, rhs_arena = Base.@lock cache.lock begin
+    idle, arena = Base.@lock cache.lock begin
         taken = Any[pop!(cache.workspaces) for _ in 1:min(tasks, length(cache.workspaces))]
-        pooled, pooled_rhs = cache.arena, cache.rhs_arena
-        if threaded
-            cache.arena, cache.rhs_arena = similar(pooled, 0), similar(pooled_rhs, 0)
-        end
-        (taken, threaded ? pooled : nothing, threaded ? pooled_rhs : nothing)
+        pooled = cache.arena
+        threaded && (cache.arena = similar(pooled, 0))
+        (taken, threaded ? pooled : nothing)
     end
     head = isempty(idle) ? _assembly_workspace(model) : idle[1]
-    return _fill_checkout(head, idle, tasks, model), arena, rhs_arena
+    return _fill_checkout(head, idle, tasks, model), arena
 end
 
 # Function barrier of `_checkout!`: `head` and then the other idle workspaces,
@@ -581,20 +579,19 @@ end
 
 # Return a call's scratch to the cache: the workspaces, keeping at most
 # `Threads.nthreads()` idle ones, and the larger of the returned and the resident
-# arena pair, so the pool holds the maximum over calls, never their sum. Every
+# arena, so the pool holds the maximum over calls, never their sum. Every
 # per-region field of a workspace is reset before it is used again, so scratch
 # returned from a call a callback error aborted is as good as any. By index
 # rather than by iteration: `workspaces` is not inferred here, and each
 # iteration state would be boxed.
 function _checkin!(@nospecialize(cache::AssemblyCache), @nospecialize(workspaces),
-                   @nospecialize(arena), @nospecialize(rhs_arena))
+                   @nospecialize(arena))
     Base.@lock cache.lock begin
         for t in 1:min(length(workspaces), Threads.nthreads()-length(cache.workspaces))
             push!(cache.workspaces, workspaces[t])
         end
-        if arena !== nothing
-            length(arena) > length(cache.arena) && (cache.arena = arena)
-            length(rhs_arena) > length(cache.rhs_arena) && (cache.rhs_arena = rhs_arena)
+        if arena !== nothing && length(arena) > length(cache.arena)
+            cache.arena = arena
         end
     end
     return nothing
@@ -1321,16 +1318,17 @@ end
 # accumulation-order roundoff a colour- or atomic-ordered scatter leaves on an
 # ill-conditioned system.
 #
-# The arena layout is a closed form of the region dof counts (`_packed`),
-# evaluated by writer and reader alike, so nothing is planned or cached per
-# list: the region dofs (`RegionDofs`) are the whole symbolic input. The arena
-# holds `Σ n(n+1)/2` entries for a symmetric pass and `Σ n²` otherwise, whatever
-# the thread count; it is sized once per call for the call's largest pass, which
-# every pass then reuses, and pooled on the model between calls. The cost of
-# walking every region in every phase-2 task measured 1.5–2 ns per region per
-# task: nothing on 3D fixtures, 2.4 % of the wall time at 64 tasks on a 2D
-# order-2 overlay, and 14 % only for 65 000 order-1 regions at 64 tasks, where a
-# per-task region index would be the fix.
+# The arena layout is a closed form of the region dof counts (`_arena_offsets`),
+# evaluated once per pass and read by writer and reader alike, so nothing is
+# planned or cached per list: the region dofs (`RegionDofs`) are the whole
+# symbolic input. The arena holds a pass's `Σ n` rhs entries followed by its
+# packed matrix columns, `Σ n(n+1)/2` entries for a symmetric pass and `Σ n²`
+# otherwise, whatever the thread count; it is sized once per call for the
+# call's largest pass, which every pass then reuses, and pooled on the model
+# between calls. The cost of walking every region in every phase-2 task
+# measured 1.5–2 ns per region per task: nothing on 3D fixtures, 2.4 % of the
+# wall time at 64 tasks on a 2D order-2 overlay, and 14 % only for 65 000
+# order-1 regions at 64 tasks, where a per-task region index would be the fix.
 #
 # Neither phase's task count enters the result, so each is sized to its work
 # rather than to the thread count. A task costs a spawn, about half a kilobyte,
@@ -1357,36 +1355,21 @@ function _packed(n::Int, lc::Int, symmetric::Bool)
     return symmetric ? (lc - 1) * n - ((lc - 1) * (lc - 2)) ÷ 2 : (lc - 1) * n
 end
 
-# The arena pair of one threaded call, sized once for its largest pass: the
-# packed matrix arena holds `Σ _packed(n, n + 1, symmetric)` entries over the
-# regions of the largest matrix pass, the rhs arena `Σ n` over those of the
-# largest pass of any kind. Every pass's phase 1 then writes a prefix of each,
-# and phase 2 reads only what that pass's phase 1 wrote. A checked-out pair
-# already that large is reused; a shorter one is replaced rather than resized,
-# since nothing in it is read again and `resize!` would copy it.
-#
-# Sized here rather than grown pass by pass, because growth reallocated — and
-# copied — an arena at every pass larger than all before it, each time leaving
-# the outgrown buffer dead, and `resize!`'s overallocation could round the
-# buffer up past the final size. On a cold five-pass interface problem the dead
-# buffers came to more than the final arena (64 against 51 KB) and took the
-# threaded call at 6 threads to 1.63× the serial call's allocation; sized once,
-# it is 1.47×. Called from the unspecialised `_assemble`.
-function _arenas(@nospecialize(arena), @nospecialize(rhs_arena), passes::Vector{Any},
-                 symmetric::Bool)
-    packed = maximum(pass -> isempty(pass.blocks) ? 0 : _arena_length(pass.list.dofs, symmetric),
-                     passes; init=0)
-    entries = maximum(pass -> pass.list.dofs.ptr[end] - 1, passes; init=0)
-    return (length(arena) < packed ? similar(arena, packed) : arena,
-            length(rhs_arena) < entries ? similar(rhs_arena, entries) : rhs_arena)
-end
-
-# Packed arena length of a matrix pass over regions `dofs`. A function barrier:
-# `_arenas` reads the dofs off an untyped pass, and the per-region sum must not
+# The arena layout of one threaded pass over regions `dofs`, as offsets: region
+# `r`'s rhs entries sit at `arena[dofs.ptr[r] …]` and, for a matrix pass, its
+# packed columns at `arena[offsets[r] + _packed(n, lc, symmetric) …]`, the
+# matrix block following the `Σ n` rhs entries of the whole pass, so
+# `offsets[end] - 1` is the arena length the pass needs. A function barrier:
+# `_assemble` reads the dofs off an untyped pass, and the per-region sum must not
 # dispatch.
-function _arena_length(dofs::RegionDofs, symmetric::Bool)
-    stored(r) = _packed(dofs.ptr[r+1] - dofs.ptr[r], dofs.ptr[r+1] - dofs.ptr[r] + 1, symmetric)
-    return sum(stored, 1:(length(dofs.ptr)-1); init=0)
+function _arena_offsets(dofs::RegionDofs, matrix::Bool, symmetric::Bool)
+    offsets = Vector{Int}(undef, length(dofs.ptr))
+    offsets[1] = dofs.ptr[end]
+    for r in 1:(length(dofs.ptr)-1)
+        n = dofs.ptr[r+1] - dofs.ptr[r]
+        offsets[r+1] = offsets[r] + (matrix ? _packed(n, n + 1, symmetric) : 0)
+    end
+    return offsets
 end
 
 # Raised by phase 1 when a region's freshly numbered dofs differ from its cached
@@ -1399,84 +1382,73 @@ end
 
 # Run one pass threaded, accumulating into `nz` (`nothing` without a matrix) and
 # `rhs`. `workspaces` and `states` hold one entry per task the call may run;
-# phase 1 of this pass uses as many as it has regions. `arena` and
-# `rhs_arena` are the call's checked-out scratch, which `_assemble` has already
-# sized for the call's largest pass (`_arenas`), so the growth check below never
-# fires there and only keeps this function correct on its own. Form-independent:
-# `pass` is not specialised on, so this compiles once per workspace and state
-# type, and the one form-specialised step, `_phase1!`, is reached by a single
-# dynamic call. `done[r]` records the regions phase 1 integrated; a region
-# `region_filter` rejected stays `false` and phase 2 skips it, so a stale arena
-# slice is never read.
-function _threaded!(nz, rhs, pattern, @nospecialize(pass::Pass), workspaces, states, region_filter,
-                    symmetric::Bool, arena, rhs_arena)
+# phase 1 of this pass uses as many as it has regions. `arena` is the call's
+# checked-out scratch, which `_assemble` has sized for the call's largest pass,
+# and `offsets` this pass's layout in it (`_arena_offsets`). Form-independent:
+# neither the pass nor the per-task scratch is specialised on, so this compiles
+# once per scalar type, and the one form-specialised step, `_phase1!`, is
+# reached by a single dynamic call. `done[r]` records the regions phase 1
+# integrated; a region `region_filter` rejected stays `false` and phase 2 skips
+# it, so a stale arena slice is never read.
+function _threaded!(nz, rhs, pattern, @nospecialize(pass::Pass), offsets::Vector{Int},
+                    @nospecialize(workspaces), @nospecialize(states), @nospecialize(region_filter),
+                    symmetric::Bool, arena)
     dofs = pass.list.dofs::RegionDofs
-    nregions = length(dofs.ptr) - 1
     matrix = !isempty(pass.blocks)
-    offsets = Vector{Int}(undef, nregions + 1)
-    offsets[1] = 1
-    for r in 1:nregions
-        n = dofs.ptr[r+1] - dofs.ptr[r]
-        offsets[r+1] = offsets[r] + (matrix ? _packed(n, n + 1, symmetric) : 0)
-    end
-    length(arena) < offsets[end] - 1 && resize!(arena, offsets[end] - 1)
-    length(rhs_arena) < dofs.ptr[end] - 1 && resize!(rhs_arena, dofs.ptr[end] - 1)
-    done = fill(false, nregions)
-    _phase1!(pass, workspaces, states, dofs, arena, rhs_arena, offsets, done, region_filter,
-             symmetric)
-    owners = clamp(cld(offsets[end] - 1 + dofs.ptr[end] - 1, _GATHER_GRAIN), 1, Threads.nthreads())
+    done = fill(false, length(dofs.ptr) - 1)
+    _phase1!(pass, workspaces, states, dofs, arena, offsets, done, region_filter, symmetric)
+    owners = clamp(cld(offsets[end] - 1, _GATHER_GRAIN), 1, Threads.nthreads())
     owned = matrix ? _balanced_ranges(pattern.colptr, owners) : _even_ranges(length(rhs), owners)
-    target = matrix ? nz : nothing
     @sync for range in owned
-        Threads.@spawn _gather!(target, rhs, pattern, dofs, arena, rhs_arena, offsets, done, range,
-                                symmetric)
+        Threads.@spawn _gather!(matrix ? nz : nothing, rhs, pattern, dofs, arena, offsets, done,
+                                range, symmetric)
     end
     return nothing
 end
 
 # Phase 1 of one pass: one task per workspace, but never more tasks than the
-# pass has regions, each running `_compute!` until the shared region counter
-# runs out. The only per-pass-type code of the threaded path besides
-# `_compute!`; an error a callback raises in a task arrives wrapped
-# (`TaskFailedException` inside a `CompositeException`), as from any `@sync`.
-function _phase1!(pass::Pass, workspaces, states, dofs::RegionDofs, arena, rhs_arena,
-                  offsets::Vector{Int}, done::Vector{Bool}, region_filter, symmetric::Bool)
-    next = Threads.Atomic{Int}(1)
-    @sync for t in 1:min(length(workspaces), length(pass.list.regions))
-        Threads.@spawn _compute!(workspaces[t], states === nothing ? nothing : states[t], pass,
-                                 dofs, arena, rhs_arena, offsets, done, next, region_filter,
-                                 symmetric)
+# pass has regions. Each task takes the next region from the shared counter,
+# integrates it with the serial driver's own `_integrate!` and parks its local
+# system in the arena (`_park!`), until the counter runs out. The only
+# per-pass-type code of the threaded path; an error a callback raises in a task
+# arrives wrapped (`TaskFailedException` inside a `CompositeException`), as from
+# any `@sync`. It is allocation-free per region only while `workspaces` and
+# `states` are concretely typed vectors, which `_checkout!` guarantees.
+function _phase1!(pass::Pass, workspaces, states, dofs::RegionDofs, arena, offsets::Vector{Int},
+                  done::Vector{Bool}, region_filter, symmetric::Bool)
+    regions, next = pass.list.regions, Threads.Atomic{Int}(1)
+    @sync for t in 1:min(length(workspaces), length(regions))
+        Threads.@spawn begin
+            ws, state = workspaces[t], states === nothing ? nothing : states[t]
+            while (r = Threads.atomic_add!(next, 1)) <= length(regions)
+                region_filter === nothing || region_filter(regions[r]) || continue
+                n = _integrate!(ws, pass, regions[r], pass.list.offsets[r], state, symmetric)
+                _park!(arena, ws, dofs, offsets, r, n, symmetric, !isempty(pass.blocks))
+                done[r] = true
+            end
+        end
     end
     return nothing
 end
 
-# The phase-1 task body: take the next region, integrate it with the serial
-# driver's own `_integrate!`, check that its dofs are its cached ones, and copy
-# its rhs to `rhs_arena[dofs.ptr[r] …]` and each stored column `lc` to
-# `arena[offsets[r] + _packed(n, lc, symmetric) …]`.
-function _compute!(ws::AssemblyWorkspace, state, pass::Pass, dofs::RegionDofs, arena, rhs_arena,
-                   offsets::Vector{Int}, done::Vector{Bool}, next::Threads.Atomic{Int},
-                   region_filter, symmetric::Bool)
-    regions = pass.list.regions
-    while true
-        r = Threads.atomic_add!(next, 1)
-        r > length(regions) && return nothing
-        region = regions[r]
-        region_filter === nothing || region_filter(region) || continue
-        n = _integrate!(ws, pass, region, pass.list.offsets[r], state, symmetric)
-        lo = dofs.ptr[r]
-        (n == dofs.ptr[r+1] - lo && view(dofs.val, lo:(lo+n-1)) == ws.dofs) || _drift(r)
-        copyto!(rhs_arena, lo, ws.b, 1, n)
-        if !isempty(pass.blocks)
-            m = n + length(ws.pivots)
-            for lc in 1:n
-                from = symmetric ? lc : 1
-                copyto!(arena, offsets[r] + _packed(n, lc, symmetric), ws.K, (lc - 1) * m + from,
-                        n - from + 1)
-            end
-        end
-        done[r] = true
+# Check that region `r`'s fresh dofs are its cached ones, and copy its local
+# system into its arena slices: the rhs to `arena[dofs.ptr[r] …]` and each stored
+# column `lc` to `arena[offsets[r] + _packed(n, lc, symmetric) …]`.
+# Form-independent and `@noinline`, like `_flush!`, so it compiles once per
+# workspace type rather than once per pass type.
+@noinline function _park!(arena, ws::AssemblyWorkspace, dofs::RegionDofs, offsets::Vector{Int},
+                          r::Int, n::Int, symmetric::Bool, matrix::Bool)
+    lo = dofs.ptr[r]
+    (n == dofs.ptr[r+1] - lo && view(dofs.val, lo:(lo+n-1)) == ws.dofs) || _drift(r)
+    copyto!(arena, lo, ws.b, 1, n)
+    matrix || return nothing
+    m = n + length(ws.pivots)
+    for lc in 1:n
+        from = symmetric ? lc : 1
+        copyto!(arena, offsets[r] + _packed(n, lc, symmetric), ws.K, (lc - 1) * m + from,
+                n - from + 1)
     end
+    return nothing
 end
 
 # The phase-2 task body for the dof range `owned`: every region phase 1 computed,
@@ -1484,7 +1456,7 @@ end
 # owned columns. A region's dofs are sorted, so whether it touches `owned` is one
 # comparison of its first and last dof, and its owned local indices are one
 # `searchsorted` range.
-function _gather!(nz, rhs, pattern, dofs::RegionDofs, arena, rhs_arena, offsets::Vector{Int},
+function _gather!(nz, rhs, pattern, dofs::RegionDofs, arena, offsets::Vector{Int},
                   done::Vector{Bool}, owned::UnitRange{Int}, symmetric::Bool)
     c0, c1 = first(owned), last(owned)
     for r in 1:(length(dofs.ptr)-1)
@@ -1493,7 +1465,7 @@ function _gather!(nz, rhs, pattern, dofs::RegionDofs, arena, rhs_arena, offsets:
         region = view(dofs.val, lo:hi)
         columns = searchsortedfirst(region, c0):searchsortedlast(region, c1)
         for k in columns
-            rhs[region[k]] += rhs_arena[lo+k-1]
+            rhs[region[k]] += arena[lo+k-1]
         end
         nz === nothing && continue
         n = length(region)
@@ -1707,19 +1679,33 @@ function _assemble(@nospecialize(model::Model), @nospecialize(blocks), @nospecia
     passes = _passes(model, blocks, loads)
     tasks = threaded ? Threads.nthreads() : 1
     cache = model.assembly
-    workspaces, arena, rhs_arena = _checkout!(cache, model, tasks, threaded)
+    workspaces, arena = _checkout!(cache, model, tasks, threaded)
     try
         states = coefficients === nothing ? nothing :
                  [FormState(model.dofs, coefficients) for _ in 1:tasks]
         pattern = _assembly_pattern!(model, filter(pass -> !isempty(pass.blocks), passes),
                                      symmetric)
+        # A threaded call reads every pass's arena layout off its region dofs and
+        # sizes the one arena once, for its largest pass, which every pass then
+        # reuses. Grown pass by pass instead, it was reallocated, and copied, at
+        # every pass larger than all before it, each outgrown buffer dead: on a
+        # cold five-pass interface problem more than the final arena (64 against
+        # 51 KB). A checked-out arena already that large is reused; a shorter one
+        # is replaced rather than resized, since nothing in it is read again. A
+        # plain loop rather than a comprehension: a closure over the untyped
+        # passes would compile once per form tuple.
+        layouts = Vector{Int}[]
         if threaded
-            arena, rhs_arena = _arenas(arena, rhs_arena, passes, symmetric)
+            for pass in passes
+                push!(layouts, _arena_offsets(pass.list.dofs, !isempty(pass.blocks), symmetric))
+            end
+            entries = maximum(last, layouts; init=1) - 1
+            length(arena) < entries && (arena = similar(arena, entries))
         end
         T = _scalar(model.dofs)
         nz = pattern === nothing ? nothing : zeros(T, length(pattern.rowval))
         rhs = zeros(T, active_unknowns(model.dofs))
-        for pass in passes
+        for (p, pass) in pairs(passes)
             # `region_filter` is a volume-pass convenience (compactly supported
             # sources); the facet, surface and interface passes ignore it.
             filter_pass = pass.key[1] === nothing ? region_filter : nothing
@@ -1732,8 +1718,8 @@ function _assemble(@nospecialize(model::Model), @nospecialize(blocks), @nospecia
                 # reproduced since across ~30,000 bit-exact comparisons, mechanism
                 # not established (see the `couple` docstring); the parallel path
                 # ships and `threaded=false` is the escape hatch.
-                _threaded!(nz, rhs, pattern, pass, workspaces, states, filter_pass, symmetric,
-                           arena, rhs_arena)
+                _threaded!(nz, rhs, pattern, pass, layouts[p], workspaces, states, filter_pass,
+                           symmetric, arena)
             else
                 _serial!(nz, rhs, pattern, pass, first(workspaces),
                          states === nothing ? nothing : first(states), filter_pass, symmetric)
@@ -1741,7 +1727,7 @@ function _assemble(@nospecialize(model::Model), @nospecialize(blocks), @nospecia
         end
         return (pattern === nothing ? nothing : _matrix_from_pattern(pattern, nz)), rhs
     finally
-        _checkin!(cache, workspaces, arena, rhs_arena)
+        _checkin!(cache, workspaces, arena)
     end
 end
 

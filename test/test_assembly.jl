@@ -178,12 +178,12 @@ end
     @test isposdef(Symmetric(Matrix(model.matrix)))
 end
 
-# Allocation count of one warm serial assembly call, behind a function barrier so
-# the count is the call's own.
-function _warm_allocations(assemble, model, args...)
-    assemble(model, args...; threaded=false)
-    assemble(model, args...; threaded=false)
-    return @allocations assemble(model, args...; threaded=false)
+# Allocation count of one warm assembly call, serial unless `threaded`, behind a
+# function barrier so the count is the call's own.
+function _warm_allocations(assemble, model, args...; threaded=false)
+    assemble(model, args...; threaded)
+    assemble(model, args...; threaded)
+    return @allocations assemble(model, args...; threaded)
 end
 
 @testset "assembly allocates nothing per region or quadrature point" begin
@@ -221,6 +221,27 @@ end
     assemble!(mixed)
     @test all(isfinite, mixed.matrix.nzval)
     @test issymmetric(mixed.matrix)
+end
+
+@testset "threaded assembly allocates nothing per region or quadrature point" begin
+    # The threaded twin of the testset above. Every phase-1 task runs the serial
+    # kernel and parks each region's local system in the arena, and that loop
+    # allocates nothing only while it reaches the task's workspace and state
+    # concretely typed: read from an untyped vector, `_integrate!` and `_park!`
+    # would dispatch, and allocate, once per region, which on these fixtures is
+    # a growth of several hundred. What a threaded call may legitimately add with
+    # the mesh is phase-2 tasks, one per `_GATHER_GRAIN` gathered entries and at
+    # most one per thread, at a handful of allocations each. Measured growth from
+    # 4² to 16² cells: 5 at 1 thread and 26 at 6.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    patch = box((0.25, 0.25), (0.75, 0.75))
+    homogeneous(c) = prepare(mass(overlay(space(omega; cells=(c, c), order=2), patch; cells=c ÷ 2,
+                                          order=3)))
+    small, large = homogeneous(4), homogeneous(16)
+    mass_u(model) = mass_block(only(model.problem.fields))
+    @test _warm_allocations(assemble_matrix, large, mass_u(large); threaded=true) -
+          _warm_allocations(assemble_matrix, small, mass_u(small); threaded=true) ≤
+          20 + 8 * Threads.nthreads()
 end
 
 @testset "symmetric mirror reproduces A + Aᵀ − diag(A) to the bit" begin
@@ -1542,7 +1563,7 @@ end
 @testset "a threaded call allocates one arena, sized for its largest pass" begin
     # The threaded driver parks every region's local system in a packed arena
     # before summing it (`Σ n(n+1)/2` entries on a symmetric pass), and every
-    # pass of a call writes a prefix of the same arena pair. Sizing that pair
+    # pass of a call writes a prefix of the same arena. Sizing that arena
     # once, for the largest pass, before the first pass runs is what keeps a
     # threaded call within one arena of the serial call. Grown pass by pass
     # instead, the arena was reallocated at every pass larger than all before it,
@@ -1551,7 +1572,7 @@ end
     # beside a 233 KB arena, at every thread count.
     #
     # The bound: a cold threaded call allocates at most what the cold serial call
-    # does, plus the arena pair it leaves pooled, plus per-task scratch — a
+    # does, plus the arena it leaves pooled, plus per-task scratch — a
     # workspace for every task but the first, and per task a few kilobytes for
     # its buffers to grow to the region size and for its task objects. That last
     # part measured 15 KB at 1 thread and 46 KB at 6; 16 KB per task plus 16 KB
@@ -1562,7 +1583,7 @@ end
     serial, _ = _cold_matrix_bytes(48, false)
     threaded, model = _cold_matrix_bytes(48, true)
     cache = model.assembly
-    arena = sizeof(cache.arena) + sizeof(cache.rhs_arena)
+    arena = sizeof(cache.arena)
     @test arena > 0
     Unfitted._assembly_workspace(model)
     workspace = @allocated Unfitted._assembly_workspace(model)
