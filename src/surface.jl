@@ -29,9 +29,9 @@
 #
 #   * `block(...; on::BoundaryMesh)` / `loadform(...; on::BoundaryMesh)`
 #     — already supported by the unified `on=` kwarg in `problems.jl`.
-#   * `_assemble_region!(::SurfaceRegion, …)` and the assembly
-#     partitioning that routes `BoundaryMesh`-tagged forms — in
-#     `src/assembly.jl`.
+#   * the `SurfaceRegion` accessors of the assembly kernel (`_integrate!`)
+#     and the pass enumeration that routes `BoundaryMesh`-tagged forms
+#     (`_passes`) — in `src/assembly.jl`.
 #   * `boundary_integral(integrand, model; on::BoundaryMesh)` — in
 #     `src/postprocessing.jl`.
 

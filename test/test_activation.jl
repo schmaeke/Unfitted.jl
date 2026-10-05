@@ -202,9 +202,9 @@ end
 
     x_inactive = SVector(0.6, 0.6)
     overlay_level = V.levels[2]
-    overlay_value = Unfitted._level_value(sol.coefficients, model,
+    overlay_value = Unfitted._level_field(sol.coefficients, model,
                                           Unfitted._field_layout(model.dofs, :u), overlay_level,
-                                          x_inactive)
+                                          x_inactive, 1, Val(false))
     @test overlay_value == 0.0
 end
 

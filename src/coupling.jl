@@ -5,7 +5,7 @@
 #   * `Interface` — the `on=` tag that names the two coupled fields and the
 #     interface geometry (a user-supplied `BoundaryMesh`). It sits beside
 #     `BoundarySelector` and `BoundaryMesh` as a third `BlockForm.on` kind and
-#     is grouped into its own assembly pass by `_partition_forms_by_on`.
+#     is grouped into its own assembly pass by `_passes`.
 #   * `InterfaceRegion` — a two-sided integration region: shared physical
 #     quadrature points / weights / per-point normals (like `SurfaceRegion`),
 #     plus a *separate* covering-parent list per side, so field `a` is
@@ -23,9 +23,10 @@
 #     constitutive content (β, flux weights, cohesive traction) lives entirely
 #     in `a`, written by the user from ordinary `WeakForm`s.
 #
-# The region assembly accessors (`_region_qpoint!`, `_region_normal`, …) and
-# the `on`-resolution live with the other region kinds in `assembly.jl`; the
-# per-model region cache lives on the `Model` in `model.jl`.
+# The region assembly accessors (`_region_point`, `_refresh!`,
+# `_region_normal`, …) and the `on`-resolution live with the other region
+# kinds in `assembly.jl`; the per-model region cache lives on the `Model` in
+# `model.jl`.
 
 # ── Interface tag ─────────────────────────────────────────────────────────────
 
@@ -56,10 +57,13 @@ struct Interface{G}
     geometry::G
 end
 
-# Identity semantics: `couple` shares one `Interface` object across its four
-# blocks, so `on`-partitioning and the `IdDict` region cache key on that object.
-# Two independent `interface(...)` calls are distinct couplings even over the
-# same mesh, and this also avoids hashing the (potentially large) geometry.
+# Egal semantics: an `Interface` is immutable, so `===` compares its fields: the
+# two field names, and the geometry, an immutable `BoundaryMesh` whose arrays
+# compare by identity. Two `interface(uₐ, u_b, Γ)` calls over the same `Γ`
+# object are therefore one coupling, one `on=` target and one key of the
+# `IdDict` region cache, while a mesh rebuilt as a new object, even an equal
+# one, is a different coupling. `==` and `hash` follow `===` and `objectid`, so
+# neither ever compares or hashes the (potentially large) geometry's points.
 Base.hash(iface::Interface, h::UInt) = hash(objectid(iface), h)
 Base.:(==)(a::Interface, b::Interface) = a === b
 
@@ -106,6 +110,17 @@ function _interface_regions(iface::Interface, V_a::Space{D,T}, V_b::Space{D,T}, 
     merged = _grid_lines_for_levels((V_a.levels..., V_b.levels...), Val(D), tol)
     subdivided = _subdivide_mesh(iface.geometry, merged, tol)
     return _emit_interface_regions(subdivided, V_a, V_b, field_a, field_b, tol)
+end
+
+# The regions of `iface` across the two subdomains of `problem`, with the coupled
+# fields' global indices taken from `layout`: how `prepare` builds the regions of
+# every interface a form names, and how assembly builds them for an interface
+# `prepare` did not see.
+function _interface_regions(iface::Interface, problem::Problem, layout::SystemLayout)
+    return _interface_regions(iface, _field_space(problem, iface.field_a),
+                              _field_space(problem, iface.field_b),
+                              _field_index(layout, iface.field_a),
+                              _field_index(layout, iface.field_b), layout.tolerance)
 end
 
 # The rule is sized per sub-cell from the cells that actually cover it, on both

@@ -101,6 +101,58 @@ end
     @test joinpath(dir, "cplq_quadrature_levels_2.vtp") in qfiles
 end
 
+@testset "a VTK callback reads only fields of the block's own subdomain" begin
+    # The sample accessor evaluates fields on the parents of the region being
+    # written, which are cells of the block's own subdomain. A field of the other
+    # subdomain of a coupled model owns none of them, so asking for it is a
+    # usage error with a pointer to the point evaluation, not a wrong number or
+    # a crash deep in the dof layer.
+    V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(2, 2), order=1)
+    u1 = field(:u1, V1)
+    u2 = field(:u2, V2)
+    model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
+                            loads=(source_load(u1; source=1.0), source_load(u2; source=1.0)),
+                            dirichlet=[dirichlet(0.0; on=boundary(:all), field=:u1),
+                                       dirichlet(0.0; on=boundary(:all), field=:u2)]))
+    solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
+                        Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    dir = mktempdir()
+    foreign = (other=(u, c, x, xi) -> u(c, xi, u2),)
+    err = try
+        write_vtk(joinpath(dir, "foreign"), solution, model; field=:u1, level_meshes=false,
+                  subdivisions=:none, point_data=foreign)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("value(solution, model, u2, x)", sprint(showerror, err))
+end
+
+@testset "a VTK callback reads another field of the same subdomain" begin
+    # Two fields on one space: writing `a`, a callback may evaluate `b` at the
+    # sample, and gets the value the point evaluation gives at the same `x`.
+    V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2),
+                box((0.0, 0.0), (0.5, 0.5)); cells=(2, 2), order=3)
+    a = field(:a, V)
+    b = field(:b, V)
+    model = prepare(Problem((a, b); blocks=(stiffness_block(a), mass_block(b)),
+                            loads=(source_load(a; source=1.0),),
+                            dirichlet=[dirichlet(x -> 1.0 + x[1]; on=boundary(:all), field=:a)]))
+    n = Unfitted.active_unknowns(model.dofs)
+    solution = Solution([sin(3i) for i in 1:n], model.version,
+                        Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    gaps = Float64[]
+    record(gap) = (push!(gaps, abs(gap)); gap)
+    point_data = (own=(u, c, x, xi) -> record(u(c, xi) - value(solution, model, a, x)),
+                  other=(u, c, x, xi) -> record(u(c, xi, b) - value(solution, model, b, x)))
+    write_vtk(joinpath(mktempdir(), "named"), solution, model; field=:a, level_meshes=false,
+              subdivisions=2, point_data)
+    @test length(gaps) > 100
+    @test maximum(gaps) ≤ 1.0e-12
+end
+
 @testset "two fields on one space write each level mesh once" begin
     # The mesh dedup: fields sharing a space must not emit duplicate level
     # blocks. A two-field/one-space model has a single base level → one mesh.

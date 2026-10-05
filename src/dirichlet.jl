@@ -384,8 +384,8 @@ geometry tolerance the resolution runs at, together with the per-face memo
 One resolver belongs to a [`Model`](@ref) and lives as long as it does, so every
 consumer of grid-aligned boundary integration shares one resolution per
 `(space, face)` pair — the per-selector cache `prepare` builds
-(`_resolve_facet_regions`), the one-shot lookup `_resolve_on_regions` falls back
-to for a selector no `prepare` saw, and the L² Dirichlet projection
+(`_resolve_facet_regions`), the one-shot lookup `_region_list` falls back to
+for a selector no `prepare` saw, and the L² Dirichlet projection
 (`_dirichlet_projection`), which reaches the same faces from the dof layer.
 Sharing is worth arranging because `_boundary_facet_regions` is a pure function
 of `(V, sides, tolerance)`: a second resolution of a face can only ever
@@ -1006,9 +1006,9 @@ end
 The per-point half of a boundary trace: refill `trace.values` with the basis
 traces at reference point `xi` on the parent cell, for the facet-incident modes
 [`boundary_trace_indices`](@ref) selected. `trace` is that call's record,
-extended by the caller with the parent's `cell`. Mirrors the
-`_parent_basis_data` / `_update_parent_basis_values!` pair the volume
-evaluation paths use.
+extended by the caller with the parent's `cell`. Mirrors the per-level
+evaluation buffers an assembly workspace refreshes for the volume
+(`_refresh!` in `assembly.jl`).
 
 The trace of a tensor-product basis function on a facet is the volume tensor
 product evaluated at a point that happens to lie on the facet, so this is

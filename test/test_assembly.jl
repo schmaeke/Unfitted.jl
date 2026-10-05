@@ -178,24 +178,70 @@ end
     @test isposdef(Symmetric(Matrix(model.matrix)))
 end
 
-@testset "assembly workspace narrows its per-level basis bank" begin
-    # The hot loop reads `ws.bases[level]` once per parent per quadrature point,
-    # so a homogeneous space has to give that bank a concrete eltype: an abstract
-    # one turns the read into a dynamic dispatch that boxes the basis call's
-    # arguments. A space that genuinely mixes families widens the bank back to a
-    # common supertype and must still assemble.
+# Allocation count of one warm assembly call, serial unless `threaded`, behind a
+# function barrier so the count is the call's own.
+function _warm_allocations(assemble, model, args...; threaded=false)
+    assemble(model, args...; threaded)
+    assemble(model, args...; threaded)
+    return @allocations assemble(model, args...; threaded)
+end
+
+@testset "assembly allocates nothing per region or quadrature point" begin
+    # The kernel's per-region and per-point work must not allocate once warm, so
+    # a call's allocation count cannot grow with the mesh. The likeliest way to
+    # break that is the basis bank: the hot loop reads `ws.bank.bases[level]`
+    # once per parent per quadrature point, and an abstract bank turns the read
+    # into a dynamic dispatch that boxes the basis call's arguments, so a
+    # homogeneous space has to give the bank a concrete eltype. Measured on this
+    # fixture, the per-region dof tables of the earlier kernel took `assemble!`
+    # from 1 005 allocations at 8² cells to 3 779 at 16², and `assemble_matrix`
+    # from 332 at 4² to 3 775 at 16²; on the mixed-family fixture below, a boxed
+    # basis call grew the count from 1 724 at 4² to 26 510 at 16². The kernel
+    # that allocates nothing grows by at most a handful.
+    #
+    # `assemble!` is compared between 8² and 16², because below 256 unknowns it
+    # also computes the condition estimate, whose allocations would hide growth
+    # at 4²; `assemble_matrix` has no such step and is compared from 4².
     omega = box((0.0, 0.0), (1.0, 1.0))
     patch = box((0.25, 0.25), (0.75, 0.75))
-    homogeneous = prepare(mass(overlay(space(omega; cells=(4, 4), order=2), patch; cells=2,
-                                       order=3)))
-    @test eltype(Unfitted._assembly_workspace(homogeneous).bases) === IntegratedLegendre
+    homogeneous(c) = prepare(mass(overlay(space(omega; cells=(c, c), order=2), patch; cells=c ÷ 2,
+                                          order=3)))
+    small, medium, large = homogeneous(4), homogeneous(8), homogeneous(16)
+    @test eltype(Unfitted._assembly_workspace(small).bank.bases) === IntegratedLegendre
+    @test _warm_allocations(assemble!, large) - _warm_allocations(assemble!, medium) < 20
+    mass_u(model) = mass_block(only(model.problem.fields))
+    @test _warm_allocations(assemble_matrix, large, mass_u(large)) -
+          _warm_allocations(assemble_matrix, small, mass_u(small)) < 20
 
+    # A space that genuinely mixes families widens the bank back to a common
+    # supertype, pays the dynamic basis call, and must still assemble.
     mixed = prepare(mass(overlay(space(omega; cells=(4, 4), order=2), patch; cells=2, order=3,
                                  basis=bspline())))
-    @test !isconcretetype(eltype(Unfitted._assembly_workspace(mixed).bases))
+    @test !isconcretetype(eltype(Unfitted._assembly_workspace(mixed).bank.bases))
     assemble!(mixed)
     @test all(isfinite, mixed.matrix.nzval)
     @test issymmetric(mixed.matrix)
+end
+
+@testset "threaded assembly allocates nothing per region or quadrature point" begin
+    # The threaded twin of the testset above. Every phase-1 task runs the serial
+    # kernel and parks each region's local system in the arena, and that loop
+    # allocates nothing only while it reaches the task's workspace and state
+    # concretely typed: read from an untyped vector, `_integrate!` and `_park!`
+    # would dispatch, and allocate, once per region, which on these fixtures is
+    # a growth of several hundred. What a threaded call may legitimately add with
+    # the mesh is phase-2 tasks, one per `_GATHER_GRAIN` gathered entries and at
+    # most one per thread, at a handful of allocations each. Measured growth from
+    # 4² to 16² cells: 5 at 1 thread and 26 at 6.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    patch = box((0.25, 0.25), (0.75, 0.75))
+    homogeneous(c) = prepare(mass(overlay(space(omega; cells=(c, c), order=2), patch; cells=c ÷ 2,
+                                          order=3)))
+    small, large = homogeneous(4), homogeneous(16)
+    mass_u(model) = mass_block(only(model.problem.fields))
+    @test _warm_allocations(assemble_matrix, large, mass_u(large); threaded=true) -
+          _warm_allocations(assemble_matrix, small, mass_u(small); threaded=true) ≤
+          20 + 8 * Threads.nthreads()
 end
 
 @testset "symmetric mirror reproduces A + Aᵀ − diag(A) to the bit" begin
@@ -212,7 +258,7 @@ end
     @test nnz(lower) == length(vals)  # `sparse` kept the explicit zeros
 
     reference = dropzeros!(lower + lower' - spdiagm(0 => diag(lower)))
-    pattern = Unfitted.AssemblyPattern(n, lower.colptr, lower.rowval, true, hash(:mirror_test))
+    pattern = Unfitted.AssemblyPattern(n, lower.colptr, lower.rowval, true)
     mirrored = Unfitted._matrix_from_pattern(pattern, copy(lower.nzval))
 
     @test mirrored.colptr == reference.colptr
@@ -241,20 +287,56 @@ end
     @test threaded_model.rhs == serial_model.rhs
     @test diagnostics(threaded_model).symmetry_residual ≈ 0.0 atol = 1.0e-13
 
-    # A second threaded assembly reuses the cached gather plan and must give
-    # the identical result (determinism + cache correctness).
+    # A second threaded assembly reuses the cached region dofs and pattern and
+    # must give the identical result (determinism + cache correctness).
     assemble!(reassembled; threaded=true)
     assemble!(reassembled; threaded=true)
     @test Matrix(reassembled.matrix) == Matrix(serial_model.matrix)
     @test reassembled.rhs == serial_model.rhs
 
-    # rhs-only threaded pass (the `nothing` matrix sink): assemble_vector
-    # defers each region's rhs to an arena and gathers it by dof in serial
-    # order, so it too is bit-identical to the serial walk.
+    # rhs-only threaded pass: assemble_vector defers each region's rhs to an
+    # arena and gathers it by dof in serial order, so it too is bit-identical
+    # to the serial walk.
     load = loadform(field(:u, V),
                     WeakForm(bilinear=(q, trial) -> 0.0, linear=q -> 1.0, symmetric=false))
     @test assemble_vector(serial_model, load; threaded=true) ==
           assemble_vector(serial_model, load; threaded=false)
+end
+
+@testset "a region filter assembles the same vector threaded and serial" begin
+    # `region_filter` lets a compactly supported load skip the regions outside its
+    # support. The threaded driver has to honour it exactly as the serial walk
+    # does: a rejected region contributes nothing, and the regions that remain are
+    # summed in the same order, so the two vectors agree to the bit. The filtered
+    # and unfiltered threaded calls alternate on one model, so scratch that a call
+    # reuses from the previous one can never carry a rejected region's stale
+    # values into the result.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2)
+    V = overlay(V, box((0.2, 0.25), (0.8, 0.75)); cells=(2, 2), order=3)
+    u = field(:u, V)
+    model = prepare(Problem((u,); dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    load = source_load(u; source=1.0)
+    left = region -> region.box.upper[1] <= 0.5 + 1.0e-12
+    right = region -> region.box.upper[1] > 0.5 + 1.0e-12
+    nowhere = region -> false
+
+    full = assemble_vector(model, load; threaded=false)
+    lo = assemble_vector(model, load; region_filter=left, threaded=false)
+    hi = assemble_vector(model, load; region_filter=right, threaded=false)
+    none = zeros(length(full))
+    # The filters really select. Each half misses part of the load, and the two
+    # halves partition the regions, so they add up to the full vector up to the
+    # order of summation.
+    @test lo != full && hi != full
+    @test lo + hi ≈ full rtol = 1.0e-13
+    @test assemble_vector(model, load; region_filter=nowhere, threaded=false) == none
+
+    for _ in 1:2
+        @test assemble_vector(model, load; threaded=true) == full
+        @test assemble_vector(model, load; region_filter=left, threaded=true) == lo
+        @test assemble_vector(model, load; region_filter=right, threaded=true) == hi
+        @test assemble_vector(model, load; region_filter=nowhere, threaded=true) == none
+    end
 end
 
 @testset "poisson accepts scalar and tensor coefficients" begin
@@ -454,6 +536,64 @@ end
     @test_throws DimensionMismatch solution(model, Float64[])
 end
 
+@testset "assemble returns the consistent pair the other entry points wrap" begin
+    # `assemble` is the one assembler: `assemble!` stores its pair, and
+    # `assemble_matrix` / `assemble_vector` keep one half each, so all four must
+    # agree to the bit. The fixture has what makes a pair worth having: nonzero
+    # Dirichlet data across two levels, whose lift −K_ac g only a call carrying
+    # the blocks can produce, and a facet load besides the volume source.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    V = overlay(space(omega; cells=(4, 4), order=2), box((0.0, 0.25), (0.5, 0.75)); cells=(2, 2),
+                order=3)
+    u = field(:u, V)
+    blocks = (stiffness_block(u; diffusion=2.0),)
+    loads = (source_load(u; source=x -> 1 + x[1]),
+             neumann(u, 0.5; on=boundary(axis=2, side=:upper)))
+    model = prepare(Problem((u,); blocks, loads,
+                            dirichlet=[dirichlet(x -> 1 + x[2]^2; on=boundary(axis=1, side=:lower))]))
+
+    assemble!(model)
+    A, b = assemble(model)
+    @test A == model.matrix && b == model.rhs
+    @test assemble(model, blocks, loads) == (A, b)
+    @test assemble(model, only(blocks), loads) == (A, b)  # a lone form needs no tuple
+    @test assemble(model; threaded=true) == assemble(model; threaded=false)
+
+    # The halves: the matrix is the blocks' alone, and the rhs is the loads'
+    # vector plus the blocks' lift, which a call without loads returns on its own.
+    blocks_only, lift = assemble(model, blocks, ())
+    @test blocks_only == A == assemble_matrix(model, blocks)
+    @test norm(lift) > 0
+    @test lift + assemble_vector(model, loads) ≈ b rtol = 1.0e-13
+    @test last(assemble(model, (), loads)) == assemble_vector(model, loads)
+
+    # Without a block the matrix is the empty n × n one, not a missing one.
+    empty_matrix, zero_rhs = assemble(model, (), ())
+    @test size(empty_matrix) == size(A) && nnz(empty_matrix) == 0 && iszero(zero_rhs)
+
+    # `region_filter` acts on the volume terms only: rejecting every region
+    # leaves exactly the facet load.
+    filtered_matrix, filtered_rhs = assemble(model; region_filter=region -> false)
+    @test nnz(filtered_matrix) == 0
+    @test filtered_rhs == assemble_vector(model, loads[2])
+
+    # `symmetric = false` assembles both triangles: the same operator to roundoff.
+    full_matrix, full_rhs = assemble(model, blocks, loads; symmetric=false)
+    @test full_matrix ≈ A rtol = 1.0e-13
+    @test full_rhs ≈ b rtol = 1.0e-13
+
+    # The no-form call takes the problem's symmetry flag, not the forms' default:
+    # an unsymmetric form wrongly declared symmetric is assembled in full when the
+    # problem says it is not symmetric, and only mirrored when the forms decide —
+    # or when the call overrides the problem's flag.
+    advection = block(u, u, WeakForm(bilinear=(q, trial) -> trial.gradient[1], symmetric=true))
+    unsymmetric = prepare(Problem((u,); blocks=(advection,), symmetric=false))
+    mirrored = assemble_matrix(unsymmetric, advection)
+    @test first(assemble(unsymmetric)) == assemble_matrix(unsymmetric, advection; symmetric=false)
+    @test first(assemble(unsymmetric)) != mirrored
+    @test first(assemble(unsymmetric; symmetric=true)) == mirrored
+end
+
 @testset "operator vector assembly respects field offsets" begin
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=2, order=1)
@@ -563,6 +703,60 @@ end
     @test all(isfinite, r)
 end
 
+@testset "a state-reading tangent is the derivative of its residual" begin
+    # A Newton step for −∇·((1 + u²) ∇u) = 1 assembles the residual
+    #
+    #     Rᵢ(c) = ∫ (1 + u_h²) ∇u_h · ∇φᵢ − φᵢ
+    #
+    # with `assemble_vector(…; state = c)`, and its tangent
+    #
+    #     Jᵢⱼ = ∂Rᵢ/∂cⱼ = ∫ (1 + u_h²) ∇φⱼ · ∇φᵢ + 2 u_h φⱼ ∇u_h · ∇φᵢ
+    #
+    # with `assemble_matrix(…; state = c)`, both reading the iterate u_h through
+    # `q.state`. The tangent has to be the derivative of the residual, which a
+    # central difference checks column by column: its truncation error is O(h²),
+    # and it measured 1.9e-11 relative here. The nonzero Dirichlet datum puts a
+    # lift into u_h, so the state's constrained values are read as well, and the
+    # 2 u_h φⱼ term makes the tangent unsymmetric, so the full pattern is used.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2)
+    V = overlay(V, box((0.2, 0.25), (0.8, 0.75)); cells=(2, 2), order=3)
+    u = field(:u, V)
+    model = prepare(Problem((u,); dirichlet=[dirichlet(x -> x[1] - 0.5 * x[2]; on=boundary(:all))]))
+    residual = loadform(u,
+                        WeakForm(linear=q -> (uk=value(q.state, u); gk=field_gradient(q.state, u);
+                                              TestChannels(-1.0, (1 + uk^2) * gk))))
+    tangent = block(u, u,
+                    WeakForm(bilinear=(q, trial) -> (uk=value(q.state, u);
+                                                     gk=field_gradient(q.state, u);
+                                                     TestChannels(0.0,
+                                                                  (1 + uk^2) * trial.gradient +
+                                                                  2uk * trial.value * gk))))
+    n = Unfitted.active_unknowns(model.dofs)
+    c = [0.5 * sin(3i) for i in 1:n]
+
+    J = assemble_matrix(model, tangent; state=c, threaded=false)
+    h = 1.0e-5
+    e = zeros(n)
+    finite_difference = zeros(n, n)
+    for j in 1:n
+        e[j] = h
+        finite_difference[:, j] = (assemble_vector(model, residual; state=c + e, threaded=false) -
+                                   assemble_vector(model, residual; state=c - e, threaded=false)) /
+                                  2h
+        e[j] = 0.0
+    end
+    @test !issymmetric(J)
+    @test Matrix(J) ≈ finite_difference rtol = 1.0e-6
+
+    # Threaded is bit-identical to serial with a state too, and a `Solution`
+    # carrying the same coefficients is the same iterate as the raw vector.
+    @test assemble_matrix(model, tangent; state=c, threaded=true) == J
+    @test assemble_vector(model, residual; state=c, threaded=true) ==
+          assemble_vector(model, residual; state=c, threaded=false)
+    @test assemble_matrix(model, tangent; state=solution(model, c; method=:test), threaded=false) ==
+          J
+end
+
 @testset "q.point is numbered per region list; nquadpoints(; on=) is its size" begin
     # `q.point` restarts at 1 for every `on=` region list, while the aggregate
     # `kind=:facet` counter sums across every cached list. A per-point array
@@ -598,6 +792,12 @@ end
 
     # The volume default is untouched by the new keywords.
     @test nquadpoints(model) == nquadpoints(model; kind=:volume)
+
+    # The count is inferred as an `Int`. Callers size arrays and loops by it, and
+    # an uninferred count made the `RBFP0` transfer's serial loop over the target
+    # points dispatch dynamically, allocating at every point.
+    @test (@inferred nquadpoints(model)) isa Int
+    @test (@inferred nquadpoints(model; kind=:facet)) isa Int
 end
 
 @testset "nquadpoints(; on=) resolves the subdomain like boundary_integral" begin
@@ -662,6 +862,155 @@ end
         push!(resampled, value(q.state, :u))
     end
     @test all(isapprox(v, 2.5; atol=1.0e-10) for v in resampled)
+end
+
+@testset "a state of any eltype is read at its own precision" begin
+    # `q.state` evaluates in the coefficients' number type promoted with the
+    # model's, so a `BigFloat` iterate yields `BigFloat` values and gradients
+    # instead of being rounded to `Float64` on the way in. Both walks sum the same
+    # terms, so they agree to Float64 roundoff: measured 4.4e-16 on values of size
+    # ≈ 2 and 4.2e-15 on gradients. The nonzero Dirichlet datum makes points near
+    # the boundary also read constrained (`Float64`) values next to the active
+    # ones.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2)
+    V = overlay(V, box((0.2, 0.25), (0.8, 0.75)); cells=(2, 2), order=3)
+    u = field(:u, V)
+    model = prepare(Problem((u,); dirichlet=[dirichlet(x -> 1.0 + x[1]; on=boundary(:all))]))
+    c = [sin(3i) for i in 1:Unfitted.active_unknowns(model.dofs)]
+    function walk(state)
+        vals, grads = Any[], Any[]
+        foreach_quadrature_point(model; state) do q
+            push!(vals, value(q.state, u))
+            push!(grads, field_gradient(q.state, :u))
+            return nothing
+        end
+        return vals, grads
+    end
+    v64, g64 = walk(c)
+    vbig, gbig = walk(BigFloat.(c))
+
+    @test length(vbig) == length(v64) == nquadpoints(model)
+    @test all(v -> v isa Float64, v64) && all(g -> g isa SVector{2,Float64}, g64)
+    @test all(v -> v isa BigFloat, vbig)
+    @test all(g -> g isa SVector{2,BigFloat}, gbig)
+    @test all(isapprox.(vbig, v64; rtol=1.0e-14, atol=1.0e-14))
+    @test all(isapprox.(gbig, g64; rtol=1.0e-14, atol=1.0e-14))
+
+    # The checks above cannot see a `BigFloat` state rounded to `Float64` and
+    # promoted back, because `BigFloat.(c)` is exactly representable in Float64.
+    # A perturbation far below Float64 resolution can: the walk is affine in the
+    # coefficients, so its response to `c + ε` must be ε times the response to
+    # the all-ones direction, which a rounded state would lose entirely.
+    ε = big(2.0)^-70
+    vε, gε = walk(BigFloat.(c) .+ ε)
+    v1, g1 = walk(ones(length(c)))
+    v0, g0 = walk(zeros(length(c)))
+    @test all(isapprox.((vε .- vbig) ./ ε, v1 .- v0; rtol=1.0e-10, atol=1.0e-10))
+    @test all(isapprox.((gε .- gbig) ./ ε, g1 .- g0; rtol=1.0e-10, atol=1.0e-10))
+end
+
+@testset "state= rejects a stale Solution and a vector of the wrong length" begin
+    # Every route that takes a state checks it once, on the way in: a `Solution`
+    # must carry the model's current pin, and a raw coefficient vector needs one
+    # entry per active dof. Unchecked, a stale solution would be read against a
+    # dof numbering it was not computed on, and a vector of the wrong length
+    # would be read out of bounds or silently cut short.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2)
+    u = field(:u, V)
+    model = prepare(poisson(u; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    n = active_unknowns(model)
+    stale = Solution(zeros(n), model.version + 1, Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    walk = q -> nothing
+
+    @test_throws DimensionMismatch assemble_vector(model, source_load(u; source=1.0);
+                                                   state=zeros(n + 1))
+    @test_throws DimensionMismatch assemble_matrix(model, stiffness_block(u); state=zeros(n - 1))
+    @test_throws DimensionMismatch foreach_quadrature_point(walk, model; state=zeros(n - 1))
+    @test_throws ArgumentError assemble_matrix(model, stiffness_block(u); state=stale)
+    @test_throws ArgumentError assemble(model; state=stale)
+    @test_throws ArgumentError foreach_quadrature_point(walk, model; state=stale)
+end
+
+@testset "the walker covers every on= target and subdomain with assembly's payload" begin
+    # `foreach_quadrature_point(f, model; on, field, state)` walks the region list
+    # that a form with the same `on=` and, on a coupled model, the same test field
+    # integrates over, and hands `f` the payload that form sees. Loads record the
+    # whole payload during serial assembly with a state — on a facet of the
+    # second subdomain, and on an immersed surface and the volume of the first —
+    # and the walker with the same keywords and state must reproduce every
+    # record to the bit, since both build the payload in one place and evaluate
+    # the state through the same frame, basis refresh and per-point sums. The
+    # first subdomain has an overlay and nonzero Dirichlet data, so the state
+    # reads several parents and constrained values.
+    V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2)
+    V1 = overlay(V1, box((0.25, 0.25), (0.75, 0.75)); cells=(2, 2), order=3)
+    V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(2, 2), order=3)
+    u1, u2 = field(:u1, V1), field(:u2, V2)
+    model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
+                            dirichlet=[dirichlet(x -> 1.0 + x[1]; on=boundary(:all), field=:u1),
+                                       dirichlet(0.0; on=boundary(:all), field=:u2)]))
+    c = [sin(3i) for i in 1:active_unknowns(model)]
+    upper = boundary(axis=2, side=:upper)
+    record(sink, name) = q -> begin
+        sink[q.point] = (keys(q), q.x, q.weight, q.normal, q.sides, value(q.state, name),
+                         field_gradient(q.state, name))
+        return 0.0
+    end
+    probe(sink, name) = WeakForm(bilinear=(q, trial) -> 0.0, linear=record(sink, name),
+                                 symmetric=false)
+
+    # A boundary walk with a state, its subdomain named by `field`.
+    assembled, walked = Dict{Int,Any}(), Dict{Int,Any}()
+    assemble_vector(model, loadform(u2, probe(assembled, :u2); on=upper); state=c, threaded=false)
+    foreach_quadrature_point(record(walked, :u2), model; on=upper, field=:u2, state=c)
+    n = nquadpoints(model; on=upper, field=:u2)
+    @test n > 0 && sort(collect(keys(walked))) == collect(1:n)
+    @test walked == assembled
+    @test first(walked[1]) == (:x, :weight, :point, :state, :normal, :sides)
+    @test walked[1][4] == SVector(0.0, 1.0) && walked[1][5] == [(2, :upper)]
+
+    # `boundary_integral` is a sum over the same walk without a state: the same
+    # points in the same order, `q.state === nothing`, and the weights summed in
+    # point order to the bit.
+    seen = Int[]
+    total = boundary_integral(model; on=upper, field=:u2) do q
+        q.state === nothing && push!(seen, q.point)
+        return 1.0
+    end
+    @test seen == collect(1:n)
+    @test total == foldl(+, walked[p][3] for p in 1:n)
+
+    # A surface walk with a state: an immersed `BoundaryMesh` the problem never
+    # names, crossing the first subdomain's overlay, its subdomain named by
+    # `field` as for a boundary.
+    Γ = polyline_mesh([SVector(0.1, 0.5), SVector(0.9, 0.5)])
+    assembled, walked = Dict{Int,Any}(), Dict{Int,Any}()
+    assemble_vector(model, loadform(u1, probe(assembled, :u1); on=Γ); state=c, threaded=false)
+    foreach_quadrature_point(record(walked, :u1), model; on=Γ, field=:u1, state=c)
+    ns = nquadpoints(model; on=Γ, field=:u1)
+    @test ns > 0 && sort(collect(keys(walked))) == collect(1:ns)
+    @test walked == assembled
+    @test norm(walked[1][4]) ≈ 1.0 && walked[1][5] === nothing
+
+    # A volume walk on one subdomain of a coupled model, selected by `field`
+    # alone, and the count that sizes it.
+    assembled, walked = Dict{Int,Any}(), Dict{Int,Any}()
+    assemble_vector(model, loadform(u1, probe(assembled, :u1)); state=c, threaded=false)
+    foreach_quadrature_point(record(walked, :u1), model; field=:u1, state=c)
+    n1 = nquadpoints(model; field=:u1)
+    @test n1 > 0 && sort(collect(keys(walked))) == collect(1:n1)
+    @test walked == assembled
+    @test walked[1][4] === nothing && walked[1][5] === nothing
+    @test n1 + nquadpoints(model; field=:u2) == nquadpoints(model)
+
+    # A field off the walked list reads exactly zero: the first subdomain's
+    # volume walk never evaluates `u2`, which lives on the second.
+    off_list = Tuple{Float64,SVector{2,Float64}}[]
+    foreach_quadrature_point(model; field=:u1, state=c) do q
+        push!(off_list, (value(q.state, :u2), field_gradient(q.state, :u2)))
+    end
+    @test length(off_list) == n1
+    @test all(r -> r[1] == 0 && r[2] == zero(SVector{2,Float64}), off_list)
 end
 
 @testset "1D bar with inhomogeneous Neumann data has analytic solution" begin
@@ -836,8 +1185,16 @@ end
         # The component-unaware form leaves cross-component blocks in the
         # dense-block pattern but numerically zero; dropzeros! must remove
         # them, so the lower-triangle pattern is strictly larger than the
-        # final lower-triangle nnz (proves the superset→drop pipeline).
-        @test length(model.pattern.rowval) > nnz(tril(model.matrix))
+        # final lower-triangle nnz (proves the superset→drop pipeline), and the
+        # matrix stores no entry coupling the two components.
+        @test length(only(model.assembly.patterns).second.rowval) > nnz(tril(model.matrix))
+        # The component dof ids come from the internal layout on purpose: no
+        # public accessor numbers the active dofs by component.
+        layout = Unfitted._field_layout(model.dofs, :u)
+        ids(c) = filter(!iszero, layout.dofs.active_component[:, c]) .+ layout.offset
+        @test !isempty(ids(1)) && !isempty(ids(2))
+        @test nnz(model.matrix[ids(1), ids(2)]) == 0
+        @test nnz(model.matrix[ids(2), ids(1)]) == 0
     end
 
     # Multi-field symmetric coupling block(c, u).
@@ -866,10 +1223,10 @@ end
 
     # B-spline base + C¹ B-spline overlay (smooth basis family, overlay
     # artificial-boundary constraints, conforming dof sharing). The
-    # numeric scatter reads the assembled local block over `active_dofs`,
-    # so it is agnostic to whether the dof layer used the simple
-    # `Matrix{Int}` table or the `LocalDofExpansion` (pivot) table — this
-    # fixture exercises the B-spline assembly path regardless.
+    # numeric scatter reads the assembled local block over the region's
+    # sorted active dofs, so it is agnostic to whether the dof layer
+    # produced linear-constraint pivots — this fixture exercises the
+    # B-spline assembly path regardless.
     let V0 = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3, basis=bspline()),
         V = overlay(V0, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3,
                     basis=bspline(continuity=1))
@@ -906,6 +1263,131 @@ end
         _check_scatter_matrix(model, mass_block(u))
         _check_scatter_matrix(model, stiffness_block(u; diffusion=2.0))
     end
+end
+
+@testset "pivot assembly with nonzero Dirichlet data: threaded == serial, lift consistent" begin
+    # The C¹ fixture above never reaches a linear-constraint pivot: an overlay's
+    # own box faces are clamped ends, whose constraints resolve to strong
+    # eliminations. A *masked* level below maximal continuity is the shape that
+    # does. Its active/inactive faces emit multi-raw trace constraints, which the
+    # resolver turns into pivots u_p = Σₖ wₖ u_{oₖ}, and assembly condenses
+    # every pivot onto its branches in both the test rows and the trial columns.
+    # Nonzero Dirichlet data on the box faces makes some branches land on a raw
+    # that carries a nonzero value, so the Dirichlet lift runs through the
+    # expansion as well.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    mask = trues(6, 6)
+    mask[4:6, 4:6] .= false                          # L-shaped active region
+    V = space(Ω; cells=6, order=3, basis=bspline(; continuity=1), active=mask)
+    u = field(:u, V)
+    load = source_load(u; source=1.0)
+    model = prepare(Problem((u,); blocks=(stiffness_block(u),), loads=(load,),
+                            dirichlet=[dirichlet(x -> 1.0 + x[1] * x[2]; on=boundary(:all))]))
+
+    # The fixture reaches the path under test: some pivot has a branch onto a raw
+    # with a nonzero Dirichlet value.
+    @test Unfitted.has_linear_constraints(model.dofs)
+    layout = Unfitted._field_layout(model.dofs, :u).dofs
+    @test any(eachindex(layout.raw_expansion)) do raw
+        expansion = layout.raw_expansion[raw]
+        return !isempty(expansion) &&
+               expansion != [(raw, 1.0)] &&
+               any(((other, _),) -> Unfitted.constrained_value(layout, other) != 0, expansion)
+    end
+
+    # Threaded assembly is bit-identical to serial on the pivot path too, and
+    # stays so when a second threaded call reuses what the first one cached.
+    assemble!(model; threaded=false)
+    A, b = copy(model.matrix), copy(model.rhs)
+    for _ in 1:2
+        assemble!(model; threaded=true)
+        @test model.matrix == A
+        @test model.rhs == b
+    end
+
+    # The unsymmetric branch of the condensation folds every row and column in
+    # full, and its threaded arena stores whole columns. On this symmetric
+    # operator it must reproduce the symmetric branch up to summation order, and
+    # threaded must still equal serial to the bit.
+    unsymmetric = assemble_matrix(model, stiffness_block(u); symmetric=false, threaded=false)
+    @test unsymmetric ≈ A rtol = 1.0e-14
+    @test assemble_matrix(model, stiffness_block(u); symmetric=false, threaded=true) == unsymmetric
+
+    # Anchors that do not depend on how the code expands a pivot. The lift check
+    # below compares assembly against the state reconstruction, and both read a
+    # pivot's branches from the dof layer, so a defect in that shared rule would
+    # move both sides alike and pass. These three numbers were measured on the
+    # assembler that distributed every emission through the expansions before it
+    # condensed per region, with w = sin(3i). Rounding moves them by about 1e-16;
+    # dropping or misweighting the Dirichlet branch of one pivot moves them by
+    # 2.5–40 %.
+    w = [sin(3i) for i in eachindex(b)]
+    @test dot(w, b) ≈ -1.932281255352028 rtol = 1.0e-12
+    @test sum(b) ≈ 26.955956630714347 rtol = 1.0e-12
+    @test dot(w, A \ b) ≈ -0.18106058297953753 rtol = 1.0e-12
+
+    # The lift agrees with the reconstruction. For any active coefficient vector
+    # x, u_h = Σⱼ xⱼ φⱼ + u_g, where u_g is the Dirichlet lift that `dof_value`
+    # reconstructs, pivot expansions included. Since b = F − a(u_g, ·),
+    #
+    #     a(u_h, φᵢ) = (A x)ᵢ + Fᵢ − bᵢ .
+    #
+    # The left side goes through the state reconstruction, the right side through
+    # assembly's emission and lift, so they agree only if both expand every pivot
+    # the same way. Measured at 3.2e-16 relative; leaving the pivots' Dirichlet
+    # branches out of the reconstruction alone moves it to 4.4e-2.
+    F = assemble_vector(model, load; threaded=false)
+    @test norm(F - b) > norm(F)                     # the lift dominates the load here
+    x = [sin(3i) for i in eachindex(b)]
+    energy = WeakForm(linear=q -> TestChannels(0.0, field_gradient(q.state, u)))
+    reconstructed = assemble_vector(model, loadform(u, energy); state=x, threaded=false)
+    @test reconstructed ≈ A * x + F - b rtol = 1.0e-12
+end
+
+@testset "unsymmetric pivot condensation: the full pair, and the transpose of the adjoint" begin
+    # The masked C¹ level of the testset above, where pivots carry branches onto
+    # raws with nonzero Dirichlet values. A form that is not declared symmetric
+    # runs the unsymmetric branch of the per-region condensation: every pivot row
+    # folds onto every column, and every pivot column onto every row of its
+    # branches, with the lift of its Dirichlet branches in the rhs.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    mask = trues(6, 6)
+    mask[4:6, 4:6] .= false
+    V = space(Ω; cells=6, order=3, basis=bspline(; continuity=1), active=mask)
+    u = field(:u, V)
+    load = source_load(u; source=1.0)
+    model = prepare(Problem((u,); blocks=(stiffness_block(u),), loads=(load,),
+                            dirichlet=[dirichlet(x -> 1.0 + x[1] * x[2]; on=boundary(:all))]))
+    @test Unfitted.has_linear_constraints(model.dofs)
+
+    # A symmetric operator assembled without the symmetry shortcut gives the
+    # pair of the symmetric branch, lift included, up to summation order.
+    As, bs = assemble(model, stiffness_block(u), load; symmetric=true, threaded=false)
+    Au, bu = assemble(model, stiffness_block(u), load; symmetric=false, threaded=false)
+    @test Au ≈ As rtol = 1.0e-13
+    @test bu ≈ bs rtol = 1.0e-13
+    @test assemble(model, stiffness_block(u), load; symmetric=false, threaded=true) == (Au, bu)
+
+    # An unsymmetric operator and its adjoint. With
+    #
+    #     a(u, v) = ∫ (∂ₓu + y·u) v + 0.1 ∇u·∇v,    a*(u, v) = a(v, u),
+    #
+    # the element matrices are transposes of each other, and condensing a pivot,
+    # K ← Pᵀ K P on the active block, commutes with the transpose, as does
+    # dropping the constrained rows and columns. So the two assembled matrices
+    # are transposes up to summation order, and a defect in only the row step or
+    # only the column step breaks that.
+    convect(q, trial) = TestChannels(trial.gradient[1] + q.x[2] * trial.value, 0.1 * trial.gradient)
+    adjoint(q, trial) = TestChannels(q.x[2] * trial.value,
+                                     SVector(trial.value, 0.0) + 0.1 * trial.gradient)
+    forward = block(u, u, WeakForm(bilinear=convect, symmetric=false))
+    backward = block(u, u, WeakForm(bilinear=adjoint, symmetric=false))
+    A = assemble_matrix(model, forward; threaded=false)
+    Aᵀ = assemble_matrix(model, backward; threaded=false)
+    @test norm(A - transpose(A)) > 0.1 * norm(A)
+    @test A ≈ transpose(Aᵀ) rtol = 1.0e-13
+    @test assemble_matrix(model, forward; threaded=true) == A
+    @test assemble_matrix(model, backward; threaded=true) == Aᵀ
 end
 
 @testset "neumann explicit-component flux lands only on the matching component's boundary dofs" begin
@@ -1002,4 +1484,308 @@ end
                              combined_forms)
         @test _serial_assembly_bytes(assemble, model, combined_forms) ≤ separate_bytes
     end
+end
+
+# ── Concurrent assembly calls on one model ────────────────────────────────────
+
+# One task per operator index; each task assembles `rounds` operators, cycling
+# through the list from a staggered start, so at any moment the concurrent calls
+# ask for different operators, and therefore for different cached sparsity
+# patterns. Returns `(operator index, matrix)` pairs.
+function _concurrent_assembly(model, operators; threaded::Bool, rounds::Int=8)
+    tasks = map(eachindex(operators)) do k
+        return Threads.@spawn [let i = mod1(k + r, length(operators))
+                                   (i, assemble_matrix(model, operators[i]; threaded))
+                               end
+                               for r in 1:rounds]
+    end
+    return reduce(vcat, fetch.(tasks))
+end
+
+@testset "concurrent serial assembly on one model matches sequential assembly" begin
+    # Several tasks may assemble operators of one prepared model at the same time,
+    # for instance a time stepper building its mass and stiffness matrices in
+    # parallel. No call may disturb another: whatever a call caches on the model
+    # must be read-only to the others or private to the call. The four operators
+    # cover two region sets, the volume plan and a facet target the problem
+    # prepared, so the concurrent calls disagree about the pattern they need.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2)
+    V = overlay(V, box((0.2, 0.25), (0.8, 0.75)); cells=(2, 2), order=3)
+    u = field(:u, V)
+    robin = block(u, u, mass_form(coefficient=4.0); on=boundary(axis=1, side=:upper))
+    model = prepare(Problem((u,); blocks=(stiffness_block(u), robin),
+                            dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower))]))
+    operators = ((mass_block(u),), (stiffness_block(u),), (stiffness_block(u), robin), (robin,))
+    reference = [assemble_matrix(model, operator; threaded=false) for operator in operators]
+
+    results = _concurrent_assembly(model, operators; threaded=false)
+    @test length(results) == 8 * length(operators)
+    @test all(A == reference[i] for (i, A) in results)
+end
+
+@testset "concurrent threaded assembly on one model matches sequential assembly" begin
+    # The threaded variant of the test above. Each threaded call parks its
+    # regions' local systems in an arena before summing them, and that scratch
+    # is pooled on the model between calls, so two calls running at once must
+    # never be handed the same arena or the same workspace. The earlier
+    # assembler pooled its arenas without handing them out one call at a time,
+    # and one call's regions then overwrote another's slices between its two
+    # phases: under this schedule 6–8 of 128 matrices came out wrong at 6
+    # threads, and 16 of 128 at 1 thread, where the tasks interleave at every
+    # `@sync`.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2)
+    V = overlay(V, box((0.2, 0.25), (0.8, 0.75)); cells=(2, 2), order=3)
+    u = field(:u, V)
+    robin = block(u, u, mass_form(coefficient=4.0); on=boundary(axis=1, side=:upper))
+    model = prepare(Problem((u,); blocks=(stiffness_block(u), robin),
+                            dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower))]))
+    operators = ((mass_block(u),), (stiffness_block(u),), (stiffness_block(u), robin), (robin,))
+    reference = [assemble_matrix(model, operator; threaded=false) for operator in operators]
+
+    results = _concurrent_assembly(model, operators; threaded=true, rounds=32)
+    @test length(results) == 32 * length(operators)
+    @test count(((i, A),) -> A != reference[i], results) == 0
+end
+
+# ── Assembly cache ────────────────────────────────────────────────────────────
+
+@testset "threaded one-shot on= assembly survives garbage collection" begin
+    # A block whose `on=` target the problem never names has no prepared region
+    # list; the first call resolves one. Whatever a threaded call derives from
+    # that list and keeps — its regions' dofs, the arena layout, the pattern —
+    # must stay attached to that list and to nothing else. Keyed by the list's
+    # `objectid`, as it once was, it was not: a list dropped after its call and
+    # collected left its address free, a later call's list could be allocated
+    # there, and that list was then assembled with the other target's layout.
+    # Here 10–12 of 200 matrices came out wrong that way, at 1 thread as at 6.
+    #
+    # Between calls the loop collects the young generation and allocates a
+    # varying number of small arrays, as any program does between two
+    # assemblies; the varying offset is what lands a fresh list on a dead
+    # list's address.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(6, 6), order=2)
+    u = field(:u, V)
+    model = prepare(Problem((u,); blocks=(stiffness_block(u),),
+                            dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower))]))
+    lo = block(u, u, mass_form(coefficient=1.0); on=boundary(axis=2, side=:lower))
+    hi = block(u, u, mass_form(coefficient=3.0); on=boundary(axis=2, side=:upper))
+    reference = assemble_matrix(model, (lo, hi); threaded=false)
+    @test nnz(reference) > 0
+
+    wrong = 0
+    for call in 1:200
+        GC.gc(false)
+        ballast = [Int[] for _ in 1:mod(97*call, 257)]
+        wrong += assemble_matrix(model, (lo, hi); threaded=true) != reference
+        empty!(ballast)
+    end
+    @test wrong == 0
+end
+
+@testset "the assembly cache stays bounded" begin
+    # Region lists of targets `prepare` resolved are kept for the model's
+    # lifetime. Those of targets it never saw, and the sparsity patterns, are
+    # kept in small most-recently-used caches (8 lists, 4 patterns), so a loop
+    # over ever new one-shot targets cannot grow the model without bound, and a
+    # one-shot entry falling out never takes a prepared list with it.
+    V = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(2, 2, 2), order=1)
+    u = field(:u, V)
+    prepared = boundary(axis=1, side=:lower)
+    model = prepare(Problem((u,); blocks=(stiffness_block(u),),
+                            loads=(neumann(u, 1.0; on=prepared),),
+                            dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:upper))]))
+    assemble!(model)
+    space_ = model.problem.space
+    @test haskey(Dict(model.assembly.lists), (nothing, space_))
+    @test haskey(Dict(model.assembly.lists), (prepared, space_))
+
+    # 20 distinct selectors, none of them named by the problem: the 12 edges and
+    # the 8 corners of the cube.
+    side(axis, upper) = (axis=axis, side=upper ? :upper : :lower)
+    edges = [boundary(side(a, s), side(b, t)) for (a, b) in ((1, 2), (1, 3), (2, 3))
+             for s in (false, true) for t in (false, true)]
+    corners = [boundary(side(1, s), side(2, t), side(3, r)) for s in (false, true)
+               for t in (false, true) for r in (false, true)]
+    selectors = vcat(edges, corners)
+    @test length(unique(selectors)) == 20
+    @test !any(s -> isequal(s, prepared), selectors)
+
+    form = mass_form(coefficient=2.0)
+    for selector in selectors
+        A = assemble_matrix(model, block(u, u, form; on=selector); threaded=true)
+        @test A == assemble_matrix(model, block(u, u, form; on=selector); threaded=false)
+        b = assemble_vector(model, neumann(u, 1.0; on=selector); threaded=true)
+        @test b == assemble_vector(model, neumann(u, 1.0; on=selector); threaded=false)
+    end
+    @test length(model.assembly.oneshot) <= 8
+    @test length(model.assembly.patterns) <= 4
+    @test length(model.assembly.lists) == 2
+    @test haskey(Dict(model.assembly.lists), (nothing, space_))
+    @test haskey(Dict(model.assembly.lists), (prepared, space_))
+
+    # Every entry still assembles what it did before: the problem's own system,
+    # whose pattern the loop above evicted, is rebuilt bit for bit.
+    A, b = copy(model.matrix), copy(model.rhs)
+    assemble!(model)
+    @test model.matrix == A
+    @test model.rhs == b
+end
+
+# A fresh model of one order-3 field on `cells × cells` square cells, and three
+# mass blocks on facet targets of growing size — one side, three sides, the
+# whole boundary — so a call over them runs three matrix passes, each with more
+# regions than the one before.
+function _growing_facet_passes(cells::Int)
+    u = field(:u, space(box((0.0, 0.0), (1.0, 1.0)); cells=(cells, cells), order=3))
+    form = mass_form(coefficient=1.0)
+    blocks = (block(u, u, form; on=boundary(axis=1, side=:lower)),
+              block(u, u, form; on=boundary(:all; except=(axis=2, side=:upper))),
+              block(u, u, form; on=boundary(:all)))
+    return prepare(Problem((u,))), blocks
+end
+
+# Bytes allocated by the first `assemble_matrix` call on a fresh such model, and
+# the model, so the caller can read what the call left pooled on it.
+function _cold_matrix_bytes(cells::Int, threaded::Bool)
+    model, blocks = _growing_facet_passes(cells)
+    return (@allocated assemble_matrix(model, blocks; threaded)), model
+end
+
+@testset "a threaded call allocates one arena, sized for its largest pass" begin
+    # The threaded driver parks every region's local system in a packed arena
+    # before summing it (`Σ n(n+1)/2` entries on a symmetric pass), and every
+    # pass of a call writes a prefix of the same arena. Sizing that arena
+    # once, for the largest pass, before the first pass runs is what keeps a
+    # threaded call within one arena of the serial call. Grown pass by pass
+    # instead, the arena was reallocated at every pass larger than all before it,
+    # each outgrown buffer was dead allocation, and `resize!` rounded the last one
+    # up past the size it needed: on this fixture that waste came to 444 KB
+    # beside a 233 KB arena, at every thread count.
+    #
+    # The bound: a cold threaded call allocates at most what the cold serial call
+    # does, plus the arena it leaves pooled, plus per-task scratch — a
+    # workspace for every task but the first, and per task a few kilobytes for
+    # its buffers to grow to the region size and for its task objects. That last
+    # part measured 15 KB at 1 thread and 46 KB at 6; 16 KB per task plus 16 KB
+    # bounds it.
+    for threaded in (false, true)
+        _cold_matrix_bytes(2, threaded)                 # compile both drivers first
+    end
+    serial, _ = _cold_matrix_bytes(48, false)
+    threaded, model = _cold_matrix_bytes(48, true)
+    cache = model.assembly
+    arena = sizeof(cache.arena)
+    @test arena > 0
+    Unfitted._assembly_workspace(model)
+    workspace = @allocated Unfitted._assembly_workspace(model)
+    tasks = Threads.nthreads()
+    @test threaded - serial ≤ arena + (tasks - 1) * workspace + 16_384 * (tasks + 1)
+end
+
+@testset "a threaded pass with fewer regions than threads matches serial" begin
+    # Phase 1 spawns no more tasks than its pass has regions. A load on one side
+    # of a 2 × 2 grid is two facet regions.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2)
+    u = field(:u, V)
+    model = prepare(Problem((u,)))
+    load = neumann(u, x -> 1.0 + x[2]; on=boundary(axis=1, side=:lower))
+    b = assemble_vector(model, load; threaded=true)
+    @test b == assemble_vector(model, load; threaded=false)
+end
+
+@testset "threaded phase 2 split over several dof owners matches serial" begin
+    # Phase 2 hands each task a contiguous range of global dofs to own — balanced
+    # by pattern entries for a matrix pass (`_balanced_ranges`), even for an
+    # rhs-only one (one entry per dof) — and the task sums every region's entries
+    # in those rows and columns. It runs one task per `_GATHER_GRAIN` entries it
+    # gathers, at most one per thread, so on a small problem a single task owns
+    # every dof, and a partition that lost or repeated the dofs at a range
+    # boundary would leave every such test passing.
+    #
+    # First the partitions themselves, at any thread count: in order, they cover
+    # every dof or column exactly once, also when there are more tasks than
+    # columns and when columns store nothing.
+    for n in (0, 1, 5, 64), tasks in 1:7
+        ranges = Unfitted._balanced_ranges(1:(n+1), tasks)
+        @test length(ranges) == tasks
+        @test reduce(vcat, ranges; init=Int[]) == 1:n
+    end
+    colptr = cumsum([1; [0, 3, 1, 0, 7, 2, 2, 9, 0, 4, 1, 6]])
+    for tasks in 1:14
+        ranges = Unfitted._balanced_ranges(colptr, tasks)
+        @test length(ranges) == tasks
+        @test reduce(vcat, ranges; init=Int[]) == 1:(length(colptr)-1)
+    end
+
+    # Then through the drivers: a two-level overlay large enough that even the
+    # rhs-only pass, which gathers the fewest entries (`Σ n` over its regions, a
+    # matrix pass `n(n+1)/2` or `n²` per region on top), is worth three owners.
+    # The suite's multi-thread run then splits phase 2 of every pass below over
+    # at least two owners. The size is asserted, so a larger grain fails here
+    # rather than quietly taking the test back to one owner. Each threaded call
+    # must reproduce serial's bits: a symmetric problem and an unsymmetric one,
+    # both with a Dirichlet lift, and a load with and without a region filter,
+    # whose rejected regions phase 2 must skip in every owner's range.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(28, 28), order=2)
+    V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(7, 7), order=3)
+    lift = dirichlet(x -> x[2] - x[1]; on=boundary(:all))
+    symmetric = prepare(poisson(V; source=x -> 1 + x[1] * x[2], dirichlet=[lift]))
+    u = field(:u, V)
+    # a(u, v) = ∫ (∂ₓu + y·u) v + 0.1 ∇u·∇v, unsymmetric through ∂ₓu v.
+    convect(q, trial) = TestChannels(trial.gradient[1] + q.x[2] * trial.value, 0.1 * trial.gradient)
+    convection = WeakForm(bilinear=convect, linear=q -> 1 + q.x[1], symmetric=false)
+    unsymmetric = prepare(Problem((u,); blocks=(block(u, u, convection),),
+                                  loads=(loadform(u, convection),), dirichlet=[lift]))
+    @test !unsymmetric.problem.symmetric
+    for model in (symmetric, unsymmetric)
+        assemble!(model; threaded=false)
+        A, b = copy(model.matrix), copy(model.rhs)
+        assemble!(model; threaded=true)
+        @test model.matrix.colptr == A.colptr
+        @test model.matrix.rowval == A.rowval
+        @test model.matrix.nzval == A.nzval
+        @test model.rhs == b
+    end
+    width = diff(Dict(symmetric.assembly.lists)[(nothing, symmetric.problem.space)].dofs.ptr)
+    @test cld(sum(width), Unfitted._GATHER_GRAIN) ≥ 3
+
+    load = source_load(only(symmetric.problem.fields); source=x -> 1 + x[1] * x[2])
+    left = region -> region.box.upper[1] <= 0.5 + 1.0e-12
+    full = assemble_vector(symmetric, load; threaded=false)
+    part = assemble_vector(symmetric, load; region_filter=left, threaded=false)
+    @test part != full
+    @test assemble_vector(symmetric, load; threaded=true) == full
+    @test assemble_vector(symmetric, load; region_filter=left, threaded=true) == part
+end
+
+@testset "an L2 transfer keeps the target's own sparsity pattern" begin
+    # The default L² transfer assembles the target mass through the target's
+    # own assembly cache. It must add its pattern beside the problem's rather
+    # than replace it, so the next solve on the target rebuilds nothing; on a
+    # symmetric volume-only problem the two are one and the same pattern.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    source = prepare(poisson(space(omega; cells=(3, 3), order=2); source=1.0,
+                             dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    solution = solve!(source)
+
+    # A Robin face makes the problem's matrix passes differ from the mass's.
+    V = space(omega; cells=(4, 4), order=2)
+    u = field(:u, V)
+    robin = block(u, u, mass_form(coefficient=2.0); on=boundary(axis=1, side=:upper))
+    target = prepare(Problem((u,); blocks=(stiffness_block(u), robin),
+                             loads=(source_load(u; source=1.0),),
+                             dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower))]))
+    solve!(target)
+    own = only(target.assembly.patterns).second
+    transfer(solution, source, target)
+    @test length(target.assembly.patterns) == 2
+    @test any(entry -> entry.second === own, target.assembly.patterns)
+    assemble!(target)
+    @test first(target.assembly.patterns).second === own
+
+    volume_only = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    solve!(volume_only)
+    own = only(volume_only.assembly.patterns).second
+    transfer(solution, source, volume_only)
+    @test only(volume_only.assembly.patterns).second === own
 end

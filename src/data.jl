@@ -55,12 +55,12 @@ range or — worse — silently at the wrong point. Such a read raises, and
 Ordinary assembly, and every read against the model the field was built on, is
 unaffected.
 
-`QuadField{T}(model; init)` walks the plan through
-[`foreach_quadrature_point`](@ref) and inherits its restriction to
-single-domain models — on a coupled model it raises. Sizing against
-`nquadpoints(model)`, as the `QuadField(data, model)` form does, is not
-enough there: `q.point` restarts at 1 for each subdomain, so one flat
-array would alias the subdomains onto each other.
+`QuadField{T}(model; init)` walks the volume through
+[`foreach_quadrature_point`](@ref) and is single-domain only — on a coupled
+model it raises. Sizing against `nquadpoints(model)`, as the
+`QuadField(data, model)` form does, is not enough there: `q.point` restarts
+at 1 for each subdomain, so one flat array would alias the subdomains onto
+each other.
 """
 mutable struct QuadField{T}
     data::Vector{T}
@@ -74,6 +74,7 @@ function QuadField(data::AbstractVector{T}, model::Model) where {T}
 end
 
 function QuadField{T}(model::Model; init=_ -> zero(T)) where {T}
+    _assert_single_domain(model, "QuadField")
     n = nquadpoints(model)
     data = Vector{T}(undef, n)
     foreach_quadrature_point(model) do q

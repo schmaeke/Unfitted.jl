@@ -89,6 +89,7 @@ end
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
     @test_throws ArgumentError value(solution, model, (0.5,))
+    @test_throws ArgumentError l2_error(solution, model, x -> 0.0)
     @test_throws ArgumentError value(Solution(ones(Unfitted.active_unknowns(model.dofs)),
                                               model.version,
                                               Unfitted.SolverDiagnostics(:manual, 0.0, true)),

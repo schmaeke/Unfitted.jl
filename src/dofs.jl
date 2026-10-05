@@ -159,22 +159,21 @@ Fields:
       - linear-constraint pivot → multi-element list; B-spline overlay
         boundaries with continuity order `m` produce `m + 1`-element
         lists per perpendicular line.
-    The assembly hot loop distributes each emitted matrix entry
-    through both the test and trial expansions, so the strong-
-    elimination case (empty list) skips emission and the free case is
-    the identity. See [`_resolve_constraints!`](@ref) for the
-    construction algorithm.
+    Assembly keeps a pivot's own local row and column while it
+    integrates a region and condenses them onto the pivot's active
+    branches once per region (`K ← PᵀKP`, `b ← Pᵀb − lift`); the
+    strong-elimination case (empty list) is a constrained dof like any
+    other and the free case is the identity. See
+    [`_resolve_constraints!`](@ref) for the construction algorithm.
   - `has_linear_constraints::Bool` — `true` iff any raw has a
     *non-trivial* expansion (neither the identity `[(raw, 1)]` nor the
     empty strong-elimination list `[]`), i.e. a linear-constraint pivot
     that redistributes a raw onto one or more *other* raws. The
     integrated Legendre family and the C⁰ B-spline mesh-edge path never
-    produce such expansions, so this is `false` for them and assembly
-    takes the lightweight single-target path; B-spline linear
+    produce such expansions, so this is `false` for them; B-spline linear
     constraints (a mask on a level whose `continuity` is below `p − 1`) set
-    it `true` and assembly takes the expansion-distributing path. The
-    flag lets the hot loop pick the cheaper path without paying the
-    general machinery's per-emission indirection on the common case.
+    it `true`. Assembly and `dof_value` consult it per field, so a
+    layout without pivots never looks at an expansion.
   - `constrained_values::Matrix{T}` — `(raw, component) → value` for
     constrained dofs. Filled by [`_project_dirichlet_values!`](@ref)
     for nonzero physical Dirichlet data; zero otherwise.
@@ -1011,11 +1010,11 @@ Keyword arguments:
 
 The integrated Legendre family produces single-raw constraints,
 reducing the resolved expansion to strong elimination (`raw_expansion =
-[]` for the pivoted raw); the assembly path then behaves identically
-to the pre-constraint-primitive code. B-spline families produce
-multi-raw constraints encoding the C^m trace-vanishing condition on
-artificial boundaries; the assembly path distributes entries through
-the expansion automatically.
+[]` for the pivoted raw), so assembly sees only active and constrained
+dofs. B-spline families produce multi-raw constraints encoding the C^m
+trace-vanishing condition on artificial boundaries; assembly gives each
+pivot a local row and column of its own and condenses them onto the
+pivot's expansion once per integration region.
 """
 function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
                     components::Integer=1, prune::Bool=true, prune_exempt=(),
@@ -1117,11 +1116,11 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
     elimination_source = Symbol[eliminated[raw] ? get(source_of, raw, :overlay) : :free
                                 for raw in 1:nraw]
     # A raw is "simple" if its expansion is either the identity
-    # `[(raw, 1)]` (free) or empty `[]` (strongly eliminated) — both
-    # the lightweight assembly path represents directly as a single
-    # active-or-constrained local target. Any other expansion (a
-    # redirect onto other raws) is a genuine linear constraint and
-    # forces the expansion-distributing assembly path.
+    # `[(raw, 1)]` (free) or empty `[]` (strongly eliminated) — both of
+    # which assembly's slot table holds directly, as an active or a
+    # constrained local slot. Any other expansion (a redirect onto other
+    # raws) is a genuine linear constraint: assembly gives it a pivot slot
+    # of its own and condenses it once per region, K ← PᵀKP, b ← Pᵀb − lift.
     has_linear_constraints = any(pairs(raw_expansion)) do (raw, e)
         !(isempty(e) || (length(e) == 1 && e[1] == (raw, one(T))))
     end
@@ -1265,12 +1264,12 @@ basis family uses to impose C^m continuity or an arbitrary-mask trace condition,
 so reading `constrained_value` for it — which is zero — silently drops the dof's
 whole contribution from `value`, `field_gradient`, `l2_error`, `write_vtk` and
 `L2Projection`'s source reconstruction, while the *solve* is correct because
-assembly distributes through the same expansions when it emits. Measured on a
+assembly condenses every pivot through the same expansion. Measured on a
 6×6 degree-3 C¹ B-spline base under an L-masked 4×4 C¹ overlay (8 non-trivial
 expansions of 126 raws), the dropped term reached 4.79e-7 against a field of
 magnitude 7e-2 — silent, and small enough to pass a hand-written tolerance.
 
-The recursion terminates at depth one on a resolved layout, because
+One level of expansion is enough on a resolved layout, because
 [`_resolve_constraints!`](@ref) leaves every pivot expressed in
 constraint-*free* raws only. The identity-expansion test is what makes that
 robust rather than assumed: physical Dirichlet elimination happens in a later
@@ -1282,39 +1281,59 @@ The `has_linear_constraints` short-circuit keeps the integrated-Legendre path to
 one extra field load and one extra branch per call, which is not free: measured on
 a reconstruction-heavy loop it costs about 1.36× the previous two-line body. The
 alternative is a silently wrong field, so it is paid.
+
+The expansion is read through `_fold_pivot`, the one statement of the pivot rule
+that assembly reads as well, so a pivot cannot be reconstructed one way and
+assembled another.
 """
 function dof_value(layout::DofLayout, coefficients, raw::Integer, component::Integer=1)
     active = _active_component_dof(layout, raw, component)
     active == 0 || return coefficients[active]
-    value = constrained_value(layout, raw, component)
-    layout.has_linear_constraints || return value
-    return _expand_dof_value(layout, layout, coefficients, raw, component, value)
-end
-
-# Add a pivot's `Σᵢ wᵢ · u_{rᵢ}` to the value already recovered for `raw`, or
-# return that value unchanged when the raw carries no pivot expansion.
-#
-# Two layout arguments, and they are not the same object on a multi-field
-# problem: `dofs` owns the expansion table, while `outer` is the layout the
-# recursion must go back through, because a `FieldLayout` shifts the active id by
-# the field's offset and a bare `DofLayout` does not. Passing the field layout
-# down is what keeps the recovered value indexed into the *global* coefficient
-# vector.
-#
-# The "is this actually a pivot" test has two shapes and neither may recurse: an
-# empty expansion is a strong elimination, and the identity `[(raw, 1)]` belongs
-# to a constraint-free raw that a later Dirichlet stage eliminated on this
-# component. Recursing on the latter would not terminate.
-function _expand_dof_value(outer, dofs::DofLayout, coefficients, raw::Integer, component::Integer,
-                           value)
-    expansion = dofs.raw_expansion[raw]
-    isempty(expansion) && return value
-    length(expansion) == 1 && first(expansion[1]) == raw && return value
-    for (other, weight) in expansion
-        value += weight * dof_value(outer, coefficients, other, component)
-    end
+    value, _ = _fold_pivot(_branch_value(coefficients), constrained_value(layout, raw, component),
+                           layout, (other, c) -> _active_component_dof(layout, other, c), raw,
+                           component)
     return value
 end
+
+# The pivot rule, stated once. A linear-constraint pivot is
+#
+#     u(raw, c) = Σₖ wₖ · u(oₖ, c)
+#
+# over constraint-free raws `oₖ`: `_resolve_constraints!` leaves every pivot
+# expressed at depth one. Two readers share this fold — `dof_value`, which
+# reconstructs a pivot from it, and `_slots!` in assembly, which detects a
+# region's pivots, widens its active set to their branches and records those
+# branches for `_condense!` to fold the pivot's local row and column onto. When
+# reconstruction and emission each carried their own encoding they could
+# disagree, and a field was then solved correctly but reconstructed wrong; one
+# definition rules that out.
+#
+# `f(acc, g, w, v)` is folded over the branches in expansion order, where
+# `g = id(oₖ, c)` is the branch's active id (0 when it is constrained) and `v` its
+# constrained value when `g == 0`, zero otherwise. `id` maps `(raw, component)` to
+# the active id in whichever numbering the caller needs: a bare `DofLayout`'s, or
+# a `FieldLayout`'s, which shifts it into the global system. Returns
+# `(acc, true)` for a pivot. A non-pivot returns `(acc, false)` without calling
+# `f`: a free raw, a strongly eliminated one (empty expansion), and a raw that is
+# free with respect to the constraint system but that a later Dirichlet stage
+# eliminated on `c` (identity expansion `[(raw, 1)]`). Testing for the identity
+# is what keeps the depth-one property robust rather than assumed.
+@inline function _fold_pivot(f::F, acc, d::DofLayout, id::I, raw::Integer, c::Integer) where {F,I}
+    d.has_linear_constraints || return acc, false
+    expansion = d.raw_expansion[raw]
+    (isempty(expansion) || (length(expansion) == 1 && first(expansion[1]) == raw)) &&
+        return acc, false
+    for (other, w) in expansion
+        g = id(other, c)
+        acc = f(acc, g, w, g == 0 ? constrained_value(d, other, c) : zero(w))
+    end
+    return acc, true
+end
+
+# The `_fold_pivot` step of `dof_value`: add a branch's weighted value, read from
+# the coefficients when the branch is active and from its stored constrained
+# value otherwise — `value += wₖ · u(oₖ, c)`, in expansion order.
+_branch_value(coefficients) = (acc, g, w, v) -> acc + w * (g == 0 ? v : coefficients[g])
 
 # ── FieldLayout and SystemLayout (multi-field problems) ───────────────────────
 
@@ -1363,12 +1382,17 @@ struct SystemLayout{D,T<:Real}
     tolerance::GeometryTolerance{T}
 end
 
-# Look up the per-field layout by name. Throws on unknown name.
-function _field_layout(system::SystemLayout, name::Symbol)
+# Resolve a field name to its index inside a `SystemLayout`, raising on an
+# unknown name. How the assembly kernel's blocks and loads, an interface's region
+# build and a `FormState` read find a field in the layout's field-major data.
+function _field_index(system::SystemLayout, name::Symbol)
     index = get(system.by_name, name, 0)
     index == 0 && throw(ArgumentError("unknown field $name"))
-    return system.fields[index]
+    return index
 end
+
+# Look up the per-field layout by name. Throws on unknown name.
+_field_layout(system::SystemLayout, name::Symbol) = system.fields[_field_index(system, name)]
 
 # Global active dof id for component `component` of raw `raw` in this
 # field, or 0 if the (raw, component) is constrained. Per-field active
@@ -1391,9 +1415,10 @@ offset so `coefficients` is the global active vector.
 function dof_value(layout::FieldLayout, coefficients, raw::Integer, component::Integer=1)
     global_dof = _field_component_dof(layout, raw, component)
     global_dof == 0 || return coefficients[global_dof]
-    value = constrained_value(layout.dofs, raw, component)
-    layout.dofs.has_linear_constraints || return value
-    return _expand_dof_value(layout, layout.dofs, coefficients, raw, component, value)
+    value, _ = _fold_pivot(_branch_value(coefficients),
+                           constrained_value(layout.dofs, raw, component), layout.dofs,
+                           (other, c) -> _field_component_dof(layout, other, c), raw, component)
+    return value
 end
 
 """
@@ -1414,9 +1439,8 @@ raw_dof_count(layout::SystemLayout) = sum(raw_dof_count(field.dofs) for field in
 
 # True iff any field's dof layout carries a non-trivial linear
 # constraint (a [`DofLayout`](@ref) `raw_expansion` that redistributes a
-# raw onto other raws). Assembly consults this once per region to choose
-# between the lightweight single-target path and the general
-# expansion-distributing path; see [`_accumulate_qpoint!`](@ref).
+# raw onto other raws). Assembly itself reads the per-field flag; this
+# system-wide form serves tests and diagnostics.
 function has_linear_constraints(layout::SystemLayout)
     any(field -> field.dofs.has_linear_constraints, layout.fields)
 end

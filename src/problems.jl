@@ -78,6 +78,12 @@ triangle, so declaring symmetry on an asymmetric form silently produces
 the wrong matrix. The default therefore costs a symmetric form the caller
 forgot to declare a factor of two, rather than costing an asymmetric one
 its correctness.
+
+Assembly calls a form's callbacks only at the quadrature points of regions on
+which its test field has degrees of freedom. On a coupled model, a volume form
+therefore runs over its own subdomain and nowhere else, and a callback must not
+rely on being called at the points of another subdomain — to count or record
+them, say.
 """
 struct WeakForm{B,L}
     bilinear::B
@@ -175,9 +181,8 @@ function TestChannels(value::Real, gradient::NTuple{D,<:Real}) where {D}
     TestChannels(value, SVector{D}(gradient))
 end
 
-# Zero-vector gradient in the assembly scalar type, used both as the
-# default test-gradient coefficient when a callback returns a scalar and
-# as an initialiser for the FormState gradient evaluation.
+# Zero-vector gradient in the assembly scalar type, used as the default
+# test-gradient coefficient when a callback returns a scalar.
 _zero_gradient(::Val{D}, ::Type{T}) where {D,T} = SVector{D,T}(ntuple(_ -> zero(T), Val(D)))
 
 # Coerce a callback return to a `TestChannels{D,T}` of the assembly's
@@ -230,9 +235,12 @@ function _as_test_channels(channels::TestChannels{K}, ::Val{D}, ::Type{T}) where
 end
 
 # Scalar contraction `channels.value × test_value`. Used by the Dirichlet
-# projection path in `dirichlet.jl` and by the value-only branch of
-# `_emit_*`.
+# projection path in `dirichlet.jl`.
 @inline _test_value_contribution(channels::TestChannels, test_value) = channels.value * test_value
+
+# Value-only contraction for a scalar channel, the L² transfer rhs: it never
+# reads the test gradient, so a value-only basis refresh is enough.
+@inline _test_contribution(channel::Number, test_value, _) = channel * test_value
 
 # Full contraction `channels.value × test_value + ⟨channels.gradient,
 # test_gradient⟩`. The `@inline` makes sure the dot product is constant-
@@ -495,11 +503,6 @@ function problem_spaces(problem::Problem)
     end
     return spaces
 end
-
-# Whether `problem` couples more than one distinct subdomain space. The
-# single-space case is the dominant path and takes typed fast branches (e.g. the
-# concretely-typed level tuple in `_assembly_workspace`).
-_is_multidomain(problem::Problem) = length(problem_spaces(problem)) > 1
 
 # The `Space` owning `field_name` in `problem`. Used to route a field's
 # volume / boundary / interface contributions to its own discretisation.

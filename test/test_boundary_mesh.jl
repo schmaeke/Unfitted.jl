@@ -127,6 +127,38 @@ end
     @test all(n ≈ SVector(0.0, -1.0) for n in normals_seen)
 end
 
+# Allocation count of one warm `boundary_integral` call, behind a function
+# barrier so the count is the call's own.
+function _warm_boundary_allocations(integrand, model, on)
+    boundary_integral(integrand, model; on)
+    boundary_integral(integrand, model; on)
+    return @allocations boundary_integral(integrand, model; on)
+end
+
+@testset "boundary_integral allocates nothing per quadrature point" begin
+    # `boundary_integral` folds over the quadrature-point walker, whose point loop
+    # runs behind a function barrier on the concrete region type. A loop over the
+    # untyped region list instead dispatches, and allocates, at every point: an
+    # earlier version did, and on the 16 × 16 fixture below took 6 570
+    # allocations and 655 µs for the ring where this one takes 12 and about
+    # 1 µs. A warm call's allocation count must not grow with the number of
+    # points, on an immersed surface and on a physical facet target alike.
+    function ring_model(c)
+        V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(c, c), order=2)
+        θ = range(0, 2π; length=8c + 1)[1:(end-1)]
+        ring = polyline_mesh([SVector(0.5 + 0.31cos(t), 0.5 + 0.27sin(t)) for t in θ]; closed=true)
+        u = field(:u, V)
+        return prepare(Problem((u,); loads=(loadform(u, source_form(source=0.0); on=ring),))), ring
+    end
+    integrand = q -> q.normal[1] * q.x[1]
+    (small, small_ring), (large, large_ring) = ring_model(4), ring_model(16)
+    @test nquadpoints(large; on=large_ring) ≥ 4 * nquadpoints(small; on=small_ring)
+    @test _warm_boundary_allocations(integrand, large, large_ring) -
+          _warm_boundary_allocations(integrand, small, small_ring) < 10
+    @test _warm_boundary_allocations(integrand, large, boundary(:all)) -
+          _warm_boundary_allocations(integrand, small, boundary(:all)) < 10
+end
+
 @testset "model.surface_regions caches one entry per BoundaryMesh" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(4, 4), order=1)

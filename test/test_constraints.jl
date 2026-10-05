@@ -397,9 +397,10 @@ end
     # region's active-dof list — everything the pattern indexes — are fixed,
     # and the next assembly must reuse the same object rather than rebuild it.
     solve!(base)
-    pattern = base.pattern
-    @test pattern !== nothing
+    @test length(base.assembly.patterns) == 1
+    pattern = first(base.assembly.patterns).second
 
+    warm_bytes = Int[]
     for new_value in (0.25, 0.5, -0.1)
         update_dirichlet!(base,
                           [dirichlet(0.0; on=boundary(axis=1, side=:lower)),
@@ -407,15 +408,28 @@ end
         @test base.version == initial_version
         @test base.matrix === nothing
         @test base.rhs === nothing
-        @test base.pattern === pattern
-        s = solve!(base)
-        @test base.pattern === pattern
+        @test length(base.assembly.patterns) == 1 &&
+              first(base.assembly.patterns).second === pattern
+        timed = @timed solve!(base)
+        s = timed.value
+        push!(warm_bytes, timed.bytes)
+        @test length(base.assembly.patterns) == 1 &&
+              first(base.assembly.patterns).second === pattern
 
         reference = solve!(prepare(build(new_value)))
         @test value(s, base, (0.5,)) ≈ value(reference, prepare(build(new_value)), (0.5,)) atol = 1.0e-10
         @test value(s, base, (1.0,)) ≈ new_value atol = 1.0e-10
         @test value(s, base, (0.0,)) ≈ 0.0 atol = 1.0e-10
     end
+
+    # The reuse is what a load-stepping loop sees: a warm step allocates no more
+    # than the one before it, and less than the same solve on a twin model whose
+    # cache is still empty, which pays for the region lists, the region dofs and
+    # the pattern.
+    @test warm_bytes[2] <= warm_bytes[1]
+    @test warm_bytes[3] <= warm_bytes[1]
+    twin = prepare(build(-0.1))
+    @test warm_bytes[3] < @allocated solve!(twin)
 end
 
 # Same driver pattern, but on a COUPLED multi-space model: a Dirichlet on u2's
