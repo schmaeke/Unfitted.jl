@@ -456,8 +456,11 @@ function depth_masks(V::Space{D}, depths::AbstractArray{<:Integer,D}; grade::Int
 
     d = Array{Int,D}(depths)
     grade > 0 && _grade!(d, grade)
-    return [k => overlapping_cells(V, findall(>=(k - 1), d); from=1, to=k)
-            for k in 2:length(V.levels)]
+    # The selection is a `BitArray` over the base grid, which is a cell selection
+    # in every dimension. `findall` is not: on a `Vector` it returns plain `Int`
+    # indices rather than `CartesianIndex{1}`, which `overlapping_cells` rejects,
+    # so a 1D ladder with an overlay could not take a depth map at all.
+    return [k => overlapping_cells(V, d .>= k - 1; from=1, to=k) for k in 2:length(V.levels)]
 end
 
 # Raise every depth that sits more than `by` below a neighbour, to the fixed point

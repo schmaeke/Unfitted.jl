@@ -334,6 +334,21 @@ end
     @test_throws ArgumentError adapt(V, d; grade=-1)
 end
 
+@testset "adapt takes a depth map in 1D" begin
+    # `depth_masks` used to select the base cells with `findall`, which on a
+    # `Vector` returns plain `Int` indices rather than `CartesianIndex{1}`, and
+    # `overlapping_cells` rejected them: the array form threw on every 1D ladder.
+    V = ladder(box((0.0,), (1.0,)); cells=4, order=2, depth=2, splits=2)
+    W = adapt(V, [0, 1, 2, 0])
+    @test active_cells(W; level=1) == trues(4)               # the base is left alone
+    @test findall(active_cells(W; level=2)) == 3:6           # base cells 2 and 3
+    @test findall(active_cells(W; level=3)) == 9:12          # base cell 3
+    # grading runs in 1D too: the neighbours of a depth-2 cell rise to depth 1
+    graded = adapt(V, [0, 0, 2, 0]; grade=1)
+    @test findall(active_cells(graded; level=2)) == 3:8
+    @test findall(active_cells(graded; level=3)) == 9:12
+end
+
 @testset "depth_masks pairs splat into adapt, and an all-active mask is no mask" begin
     # `depth_masks` is the internal behind `adapt`'s array form and its result is
     # documented as splatting straight into the pair form. That identity is the
