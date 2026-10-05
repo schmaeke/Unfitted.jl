@@ -1219,11 +1219,9 @@ function l2_error(solution::Solution, model::Model{D,T}, u::Field, exact;
     return iszero(exact_norm) ? error_norm : error_norm / exact_norm
 end
 
-# Pointwise squared magnitude that works for both scalar fields
-# (`abs2(value)`) and vector / tuple / SVector fields
-# (`sum(abs2, value)`). Used by `l2_error` so the error norm
-# generalises to multi-component results without per-component
-# dispatch at the call site.
+# The squared magnitude `‖u_exact‖²` of an exact value, scalar (`abs2`) or
+# component-indexable (`sum(abs2, …)`): the integrand of `l2_error`'s reference
+# norm. The error itself is summed component by component in `l2_error`.
 _squared_norm(value::Number) = abs2(value)
 _squared_norm(value) = sum(abs2, value)
 

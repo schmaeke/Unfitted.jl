@@ -727,11 +727,10 @@ end
 # symmetry flag; `nothing` when there is no matrix pass. The key holds the lists
 # themselves, so it can never alias the lists of another structure; a one-shot
 # list that fell out of its cache and was resolved again misses its pattern
-# once. Loads add no matrix
-# entry and are not part of the key, so `assemble!` on a volume-only problem and
-# `assemble_matrix(model, mass_block(u))` share one entry, and a caller that
-# alternates operators keeps every pattern it uses (up to four) instead of
-# rebuilding one per call.
+# once. Loads add no matrix entry and are not part of the key, so `assemble!` on
+# a volume-only problem and `assemble_matrix(model, mass_block(u))` share one
+# entry, and a caller that alternates operators keeps every pattern it uses (up
+# to four) instead of rebuilding one per call.
 function _assembly_pattern!(@nospecialize(model::Model), passes::Vector{Any}, symmetric::Bool)
     isempty(passes) && return nothing
     cache = model.assembly
@@ -997,16 +996,14 @@ end
 # wall time at 64 tasks on a 2D order-2 overlay, and 14 % only for 65 000
 # order-1 regions at 64 tasks, where a per-task region index would be the fix.
 #
-# Neither phase's task count enters the result, so each is sized to its work
-# rather than to the thread count. A task costs a spawn, about half a kilobyte,
-# and a phase-1 task a workspace as well, built by a cold call and pooled
-# afterwards; on the gate's smallest problems at 16 threads, one task per thread
-# in both phases of every pass came to three quarters of the serial call's
-# allocation, for tasks that had little or nothing to do. Phase 1 runs at most
-# one task per region; otherwise it runs one task per thread, because how long
-# a region takes depends on the user's callbacks, which nothing here can see.
-# Phase 2 runs one task per `_GATHER_GRAIN` arena entries it gathers, because
-# there the work is exactly that: a merge per entry, and no callback.
+# Neither phase's task count enters the result, so each is sized to its work.
+# A threaded call checks out one workspace per thread, pooled on the model after
+# the first call, so an idle phase-1 task costs only its spawn, about half a
+# kilobyte. Phase 1 runs one task per thread, because how long a region takes
+# depends on the user's callbacks, which nothing here can see, but never more
+# tasks than the pass has regions. Phase 2 runs one task per `_GATHER_GRAIN`
+# arena entries it gathers, at most one per thread, because there the work is
+# exactly that: a merge per entry, and no callback.
 
 # Phase-2 arena entries per task. Measured at 16 threads on a 16-core machine
 # against one task per thread: 1024 or 4096 took the threaded assembly of the
@@ -1052,7 +1049,7 @@ end
 function _threaded!(nz, rhs, pattern, @nospecialize(pass::Pass), offsets::Vector{Int},
                     @nospecialize(workspaces), @nospecialize(states), @nospecialize(region_filter),
                     symmetric::Bool, arena)
-    dofs = pass.list.dofs::RegionDofs
+    dofs = pass.list.dofs
     matrix = !isempty(pass.blocks)
     done = fill(false, length(dofs.ptr) - 1)
     _phase1!(pass, workspaces, states, dofs, arena, offsets, done, region_filter, symmetric)
@@ -1611,6 +1608,9 @@ end
 _parent_lists(region) = (region.parents,)
 _parent_lists(region::InterfaceRegion) = (region.parents_a, region.parents_b)
 
+# A parent's own reference coordinate of the current point: a volume region's
+# `η` mapped through `local_box`, the region box in the parent's `[−1, 1]ᴰ`; a
+# physical point through the parent's `parent_box`.
 _parent_xi(p::ParentRef, η) = reference_to_physical(p.local_box, η)
 _parent_xi(p::FacetParent, x) = physical_to_reference(p.parent_box, x)
 
@@ -1855,7 +1855,10 @@ end
 # `_refresh!` and `_state_point!` the kernel uses, on the workspace `ws`;
 # without one, `ws` is `nothing` and no basis is evaluated at all. Reached by a
 # dynamic call, which makes it the function barrier for the region and state
-# types.
+# types. Its callers build `ws` fresh (`_assembly_workspace`) on purpose rather
+# than check one out of the model's assembly pool: a walk needs one per call,
+# which costs a few microseconds, and a checkout would need a check-in in a
+# `finally` at every caller.
 function _walk(op, acc, ws, list::RegionList, state)
     for (r, region) in pairs(list.regions)
         state === nothing || _state_region!(state, _frame!(ws, region))

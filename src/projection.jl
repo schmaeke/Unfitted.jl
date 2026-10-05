@@ -383,7 +383,9 @@ end
 # target dofs (`_frame!` and `_slots!`, one table for every basis family) and
 # collects the local rhs, and the source one evaluates `u_S` as a `FormState`
 # over the source coefficients. Both refresh values only, since the integrand
-# never reads a gradient.
+# never reads a gradient. Both are built fresh, as a walk's is (see `_walk`),
+# rather than checked out of the two models' assembly pools: once per transfer,
+# a few microseconds each.
 function _transfer_rhs!(rhs, source_coefficients, source_model::Model, target_model::Model, regions)
     target = _assembly_workspace(target_model)
     source = _assembly_workspace(source_model)
