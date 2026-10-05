@@ -64,7 +64,8 @@
 #     1-based cell index along the axis; `mode ≥ 2` selects which bubble.
 #
 # Stored as a flat `UInt8 + Int + Int` rather than a sum type so the key
-# is fully isbits and hashes cheaply for the cross-cell dof reuse cache.
+# is fully isbits and, hashed field by field (the `Base.hash` methods
+# below `TensorDofKey`), cheap to look up in the cross-cell dof reuse cache.
 struct AxisDofKey
     kind::UInt8
     index::Int
@@ -83,6 +84,13 @@ struct TensorDofKey{D}
     level::Int
     axes::NTuple{D,AxisDofKey}
 end
+
+# The default hash of an isbits struct hashes its bytes through a generic
+# path that costs ~91 ns per `TensorDofKey{3}`; hashing the fields costs
+# ~10 ns, and it was 55 % of the layout's stage-1 profile. Equality stays
+# the default `===`, which these methods agree with.
+Base.hash(k::AxisDofKey, h::UInt) = hash(k.mode, hash(k.index, hash(k.kind, h)))
+Base.hash(k::TensorDofKey, h::UInt) = hash(k.axes, hash(k.level, h))
 
 """
     LinearConstraint{T}
