@@ -12,12 +12,13 @@
 #     "best" transfer in the L² sense and the correct variational move
 #     when the target's basis cannot represent the source exactly.
 #   * [`Rewire`](@ref) — direct raw-key coefficient matching. Each
-#     target dof whose `TensorDofKey` matches an active source dof
-#     inherits the source coefficient; genuinely new dofs and freshly-
-#     uncovered constraints start at zero. Lossless when the target's
-#     active basis contains the source's — typically after a monotone
-#     `activate!` — and avoids the projection cost / smoothing in that
-#     case.
+#     active target dof whose `TensorDofKey` matches a source dof
+#     inherits the source's value of that dof — its coefficient when the
+#     source leaves it free, its constrained value or pivot reconstruction
+#     when the source constrains it — and genuinely new dofs start at
+#     zero. Lossless when the target's active basis contains the source's —
+#     typically after a monotone `activate!` — and avoids the projection
+#     cost / smoothing in that case.
 
 # ── Backends and transfer regions ─────────────────────────────────────────────
 
@@ -100,14 +101,22 @@ source field:
 
   1. Look up the source's `TensorDofKey` in the target field's
      `raw_keys` table.
-  2. If a target raw matches and is active, copy the source's active
-     coefficient into the target's active slot.
-  3. If the target raw is missing (the source key has no counterpart)
-     or is constrained on the target, either raise (strict mode) or
-     skip silently (`strict = false`).
+  2. If a target raw matches and is active on the target, write the
+     source field's value of that dof into the target's active slot: the
+     source coefficient when the dof is free on the source, and otherwise
+     the value the source field carries for it — its constrained value
+     (the projected datum of a nonzero Dirichlet condition, zero for an
+     artificial-boundary or pruning elimination) or, for a
+     linear-constraint pivot, its reconstruction from the dofs it is tied
+     to. A dof the source pins to nonzero Dirichlet data and the target
+     leaves free therefore keeps that data.
+  3. If a dof that is free on the source has no target counterpart, or is
+     constrained on the target, either raise (strict mode) or skip it
+     silently (`strict = false`). A dof the source constrains is never an
+     error: without an active target counterpart it is skipped.
 
 Reconstructs the source field pointwise when the target's active basis
-*contains* the source's. The coefficients are not modified, so the
+*contains* the source's. The values are not modified, so the
 reconstruction is exact, and the smoothing of the L² backend is avoided.
 
 A moved overlay ([`moved`](@ref) / [`move!`](@ref)) does not satisfy
@@ -434,11 +443,16 @@ end
 
 # ── Rewire ────────────────────────────────────────────────────────────────────
 
-# `Rewire` implementation: walk every active source dof, find its
-# target counterpart by `TensorDofKey`, and copy the coefficient.
-# Missing target counterparts and freshly-constrained target dofs are
-# treated as errors under `strict = true` and silently skipped
-# otherwise.
+# `Rewire` implementation: walk every source dof, find its target
+# counterpart by `TensorDofKey`, and write the source field's value of it
+# into the counterpart when that is active. The value is `dof_value`'s rather
+# than the coefficient vector's, because a dof the source constrains has no
+# coefficient: skipping it left the counterpart at zero, so a target that
+# frees a face the source holds at nonzero Dirichlet data lost that data — on
+# a 4×4 order-2 square with `g = 1 + x` on the top face, nine dofs and a
+# field error of 2.0. A source-free dof with no counterpart, or with a
+# constrained one, is an error under `strict = true` and silently skipped
+# otherwise; a source-constrained dof never is.
 function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_model::Model{D,T},
                     backend::Rewire, _tolerance) where {D,T}
     # Rewire walks raw `TensorDofKey`s, never the geometry — the
@@ -467,20 +481,22 @@ function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_
             source_key = source_field.dofs.raw_keys[source_raw]
             target_raw = get(target_raw_by_key, source_key, 0)
             for c in 1:source_field.components
-                source_active = source_field.dofs.active_component[source_raw, c]
-                source_active == 0 && continue
+                source_free = source_field.dofs.active_component[source_raw, c] != 0
                 if target_raw == 0
                     backend.strict &&
+                        source_free &&
                         throw(ArgumentError("Rewire: source active dof at key $(source_key) component $c has no target counterpart; pass `Rewire(strict=false)` to skip"))
                     continue
                 end
                 target_active = target_field.dofs.active_component[target_raw, c]
                 if target_active == 0
                     backend.strict &&
+                        source_free &&
                         throw(ArgumentError("Rewire: source active dof at key $(source_key) component $c is constrained in the target"))
                     continue
                 end
-                coefficients[target_field.offset + target_active] = source_coefficients[source_field.offset + source_active]
+                u = dof_value(source_field, source_coefficients, source_raw, c)
+                coefficients[target_field.offset + target_active] = u
             end
         end
     end
