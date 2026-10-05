@@ -1621,10 +1621,11 @@ end
     @test count(dofs.physical_dirichlet) == 7
 
     # Named directly: the corner dof is on an excluded face and a kept one at
-    # once, and the selector matches it.
+    # once, and the selector matches it. A key matches a selector iff the
+    # detection pass flags its raw under a condition on that selector alone.
     folded = model.problem.space
-    level, domain, tol = folded.levels[1], folded.domain, dofs.tolerance
-    matches(key, on) = Unfitted._selector_matches(key, level, domain, on, tol)
+    flagged(on) = Unfitted._physical_dirichlet(dofs, folded, [dirichlet(0.0; on)], 1)[:, 1]
+    matches(key, on) = key in Set(dofs.raw_keys[findall(flagged(on))])
     corner = only(key
                   for key in dofs.raw_keys
                   if matches(key, boundary((axis=1, side=:upper), (axis=2, side=:lower))))

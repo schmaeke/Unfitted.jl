@@ -218,7 +218,7 @@ function boundary(selector::Symbol; except=())
     # before every other check in this method so that it stays exactly that: any
     # symbol still constructs the selector it always constructed, and one that
     # no consumer supports still fails where it always failed — at prepare time,
-    # in `_facets` / `_selector_matches`, not here.
+    # in `_facets`, not here.
     isempty(except) && return BoundarySelector(selector, Tuple{Int,Symbol}[])
     selector === :all ||
         throw(ArgumentError("except= removes faces from the whole boundary, so it applies " *

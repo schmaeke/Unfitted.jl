@@ -1,6 +1,7 @@
 # Physical Dirichlet boundary conditions: the user-facing spec types,
-# the per-key boundary-face detection used by `dof_layout` to populate
-# the `physical_dirichlet` matrix, the codim-K facet integration
+# the per-level physical-Dirichlet detection (one face-mask pass over
+# each level's raws) that fills the layout's `physical_dirichlet`
+# matrix, the codim-K facet integration
 # machinery (the per-face resolver, regions, the affine-slice
 # restriction that trims a rule to `face ∩ Ω`, tensor Gauss quadrature,
 # basis traces), and the L² boundary projection that turns nonzero
@@ -8,7 +9,7 @@
 #
 # Loads after `dofs.jl` so the dof keys and `DofLayout` it operates on
 # already exist. The `dof_layout` constructor in `dofs.jl` forward-
-# references `_has_physical_dirichlet` and `_project_dirichlet_values!`
+# references `_physical_dirichlet` and `_project_dirichlet_values!`
 # defined here — they are resolved at call time (when the user runs
 # `prepare(problem)`), by which point every source file is loaded.
 
@@ -51,8 +52,9 @@ end
 # Value semantics for `BoundarySelector`. A selector is a *description* of a
 # facet, not an object with an identity: `boundary(axis=1, side=:upper)` written
 # twice names the same face both times, and every consumer that reasons about
-# selectors — `_selector_matches`, `_facet_regions_for_selector`,
-# `update_dirichlet!`'s structural check — already compares them by value.
+# selectors — `_physical_dirichlet` and `_facet_regions_for_selector`, which read
+# one only through its `_facets` decomposition, and `update_dirichlet!`'s
+# structural check, which compares two — already treats them by value.
 #
 # The default `==` on a struct carrying a `Vector` falls back to `===`, and the
 # default `hash` to `objectid`, so without these two methods a selector is
@@ -92,36 +94,7 @@ struct DirichletCondition{F}
     component::Union{Nothing,Int}
 end
 
-# ── Physical-boundary key detection ───────────────────────────────────────────
-
-# True iff the dof key sits on the requested physical-domain face.
-# Composed from two family-aware primitives so it works for any basis
-# family that implements `_key_on_level_side`:
-#
-#   1. The key's per-axis factor must anchor on the level's mesh edge
-#      at (`axis`, `side`). Family-specific check.
-#   2. The level's mesh edge at (`axis`, `side`) must coincide with the
-#      physical-domain edge up to `tol.contain`. Pure geometry check.
-#
-# Equivalent to the previous coordinate-matching formulation for the
-# integrated Legendre family (mesh-axis-node coordinate equals
-# `mesh.axes[axis][1]` or `[end]`, and those coincide with the domain
-# edge iff `_level_side_is_physical`); the new formulation generalizes
-# to any family whose boundary-mode classification lives in
-# `_key_on_level_side`.
-function _key_on_physical_side(key::TensorDofKey{D}, level::Level{D,T}, domain::AxisBox{D,T},
-                               axis::Integer, side::Symbol, tol::GeometryTolerance{T}) where {D,T}
-    _key_on_level_side(key, level, axis, side) || return false
-    return _level_side_is_physical(level, domain, axis, side, tol)
-end
-
-# True iff the dof key sits on *any* of the 2·D codim-1 physical faces.
-# Used to decide whether a key matches a `boundary(:all)` selector.
-function _key_on_any_physical_side(key::TensorDofKey{D}, level::Level{D,T}, domain::AxisBox{D,T},
-                                   tol::GeometryTolerance{T}) where {D,T}
-    return any(_key_on_physical_side(key, level, domain, axis, side, tol) for axis in 1:D
-               for side in (:lower, :upper))
-end
+# ── Physical-Dirichlet detection ──────────────────────────────────────────────
 
 # The codim-1 faces an `:except` selector keeps: every face of the physical box
 # that its `sides` list — the *excluded* faces — does not name. The order is
@@ -150,42 +123,122 @@ function _kept_faces(excluded::Vector{Tuple{Int,Symbol}}, ::Val{D}) where {D}
     return kept
 end
 
-# True iff the dof key matches the facet picked out by a `BoundarySelector`.
-# For `:all` the predicate is "on any physical face"; for `:except` it is "on any
-# kept physical face", which is the same union over a subset; for `:sides` it is
-# "on every listed (axis, side) face" (i.e. the intersection of the listed
-# codim-1 faces).
-function _selector_matches(key::TensorDofKey{D}, level::Level{D,T}, domain::AxisBox{D,T},
-                           selector::BoundarySelector, tol::GeometryTolerance{T}) where {D,T}
-    selector.selector === :all && return _key_on_any_physical_side(key, level, domain, tol)
+# The bit that tells a face's two sides apart in a face mask (`_face_bit`): 0 for
+# `:lower`, 1 for `:upper`. It is also where an invalid side symbol is refused —
+# reachable only through a hand-built `BoundarySelector`, since `boundary`
+# validates its sides — with the message every side check in the package uses.
+function _side_bit(side::Symbol)
+    side === :lower ? 0 :
+    side === :upper ? 1 : throw(ArgumentError("boundary side must be :lower or :upper"))
+end
 
-    if selector.selector === :except
-        return any(_key_on_physical_side(key, level, domain, axis, side, tol)
-                   for (axis, side) in _kept_faces(selector.sides, Val(D)))
+# A codim-1 face of the physical box as one bit of a `UInt64`: axis `a`'s lower
+# face is bit `2(a − 1)` and its upper face the bit above. A set of faces is then
+# the OR of their bits, and "lies on every face of the set" is a subset test on
+# two words.
+_face_bit(axis::Integer, side::Symbol) = UInt64(1) << (2(axis - 1) + _side_bit(side))
+
+# The face mask of one `_facets` entry: the OR of the bits of the codim-1 faces
+# whose intersection the facet is. An empty facet — the one an empty `:sides`
+# list decomposes into — is mask 0, which every dof covers.
+_face_mask(facet) = mapreduce(((axis, side),) -> _face_bit(axis, side), |, facet; init=UInt64(0))
+
+# Physical-Dirichlet detection: `marks[raw, c]` is true iff some condition scoped
+# to component `c` (`component = nothing` scopes it to every component) selects a
+# facet that raw's basis function lies on. These are the flags the active numbering
+# skips and the Dirichlet projection solves for.
+#
+# A function lies on a facet iff it lies on every codim-1 face the facet is the
+# intersection of. So the pass finds, once per raw, the physical faces the raw lies
+# on as a face mask `on`, and a condition matches iff the mask of one of its facets
+# is a subset of `on`:
+#
+#   * `:all` and `:except` decompose into single faces, so this reads "on some
+#     (kept) physical face";
+#   * `:sides` decomposes into one facet listing every given side, so it reads "on
+#     all of them";
+#   * an empty `:sides` list is the empty mask, which every raw covers — on every
+#     level, including one with no physical side, so no level or raw may be
+#     skipped on the grounds that it touches no face.
+#
+# Selector semantics therefore live in `_facets` alone, the same decomposition the
+# projection and the facet regions integrate over, and a malformed selector raises
+# from there (or, for a side symbol only a hand-built selector can carry, from
+# `_side_bit`) with its usual message before any raw is visited, whichever
+# component it is scoped to. The masks are built once per condition: the per-key predicate
+# this pass replaced re-derived them, and re-asked the family about each face, for
+# every raw × component × condition, allocating an `:except` selector's kept faces
+# on every call.
+#
+# `t` is anything carrying `raw_keys`, `level_raws` and `tolerance` — the layout
+# build's own arrays in a named tuple, or a finished `DofLayout` — so the pass runs
+# before the layout it feeds exists. Two bits per axis in a `UInt64` hold up to
+# `D = 32`; beyond that a face's bit would shift out of the word and the face drop
+# out of its mask unnoticed, so it refuses instead.
+function _physical_dirichlet(t, V::Space{D,T}, conditions, components::Integer) where {D,T}
+    marks = zeros(Bool, length(t.raw_keys), components)
+    isempty(conditions) && return marks
+    2D <= 64 ||
+        throw(ArgumentError("physical-Dirichlet face masks hold at most 32 axes; got D = $D"))
+    # Per condition, the columns of `marks` it sets and its facets' masks — all the
+    # per-raw loop reads of it, concretely typed, since `conditions` comes from
+    # `_dirichlet_for_field` as an `Any[]`. The columns are every component for
+    # `component = nothing`, else that one, or none if the field has no such
+    # component. Resolving the scope to a range here, rather than carrying the
+    # `Union{Nothing,Int}` into the loop, keeps the entries stored inline and the
+    # loop free of a per-component test: 1.33 → 0.49 ms for this pass on a 3D 12³
+    # p3 field under `boundary(:all)` (Apple M2 Pro).
+    every = 1:components
+    masks = Tuple{UnitRange{Int},Vector{UInt64}}[(c.component === nothing ? every :
+                                                  intersect(c.component:c.component, every),
+                                                  UInt64[_face_mask(f)
+                                                         for f in _facets(c.boundary, Val(D))])
+                                                 for c in conditions]
+    for level in V.levels
+        _mark_physical_dirichlet!(marks, t, level, V.domain, masks)
     end
+    return marks
+end
 
-    if selector.selector === :sides
-        for (axis, side) in selector.sides
-            1 <= axis <= D ||
-                throw(ArgumentError("boundary axis $axis is out of bounds for dimension $D"))
-            _key_on_physical_side(key, level, domain, axis, side, tol) || return false
+# One level of `_physical_dirichlet`, behind a function barrier: `V.levels` is a
+# tuple that may mix basis families, and receiving the level as an argument
+# compiles this loop, and the family's `_key_on_level_side` inside it, for the
+# level's concrete type instead of dispatching per raw. The level's physical sides
+# — those of its mesh within `tol.contain` of the domain's — are found once, so a
+# raw only asks the family which of them its function lies on.
+function _mark_physical_dirichlet!(marks::Matrix{Bool}, t, level::Level{D}, domain::AxisBox{D},
+                                   masks::Vector{Tuple{UnitRange{Int},Vector{UInt64}}}) where {D}
+    sides = [(axis, side) for axis in 1:D
+             for side in (:lower, :upper)
+             if _level_side_is_physical(level, domain, axis, side, t.tolerance)]
+    for raw in t.level_raws[level.id]
+        on = _key_faces(t.raw_keys[raw], level, sides)
+        for (components, facets) in masks
+            _covers_a_facet(on, facets) || continue
+            for c in components
+                marks[raw, c] = true
+            end
         end
-        return true
     end
-
-    throw(ArgumentError("unsupported boundary selector $(selector.selector)"))
+    return marks
 end
 
-# True iff any of `conditions` constrains component `component` of `key`.
-# Used during `dof_layout` to fill the `physical_dirichlet` matrix.
-function _has_physical_dirichlet(key::TensorDofKey{D}, level::Level{D,T}, domain::AxisBox{D,T},
-                                 conditions, tol::GeometryTolerance{T},
-                                 component::Integer) where {D,T}
-    return any(conditions) do condition
-        (condition.component === nothing || condition.component == component) &&
-            _selector_matches(key, level, domain, condition.boundary, tol)
+# The face mask of the `sides` (`level`'s physical sides) on which the family
+# places the function `key` names. A helper with an explicit loop on purpose:
+# accumulating `on` inside the caller's loop, where `_covers_a_facet`'s closure
+# then captures a reassigned variable, boxes it — 5.0 ms and 0.8 MB against
+# 0.50 ms and nothing per raw for the pass on a 3D 12³ p3 field (Apple M2 Pro) —
+# and a `foldl` over the sides takes 1.7× as long as the loop.
+function _key_faces(key::TensorDofKey, level::Level, sides::Vector{Tuple{Int,Symbol}})
+    on = UInt64(0)
+    for (axis, side) in sides
+        _key_on_level_side(key, level, axis, side) && (on |= _face_bit(axis, side))
     end
+    return on
 end
+
+# True iff the faces in `on` include every face of one of `facets`' masks.
+_covers_a_facet(on::UInt64, facets::Vector{UInt64}) = any(f -> on & f == f, facets)
 
 # ── Boundary facet integration ────────────────────────────────────────────────
 
@@ -193,10 +246,11 @@ end
 # `:all` this is one codim-1 facet per physical face (their union is
 # `∂Ω`); for `:except` it is one per *kept* face, the same list with the
 # excluded entries removed; for `:sides` it is the single facet identified
-# by the listed `(axis, side)` constraints. Used by
-# `_project_dirichlet_values!` to iterate over the support of each Dirichlet
-# condition, and by `_facet_regions_for_selector` to assemble the region
-# union — which is why a union selector needs nothing else to integrate.
+# by the listed `(axis, side)` constraints. Used by `_physical_dirichlet` to
+# find the dofs each condition constrains, by `_project_dirichlet_values!` to
+# iterate over the support of each Dirichlet condition, and by
+# `_facet_regions_for_selector` to assemble the region union — which is why a
+# union selector needs nothing else to be detected or integrated.
 function _facets(selector::BoundarySelector, ::Val{D}) where {D}
     if selector.selector === :all
         return [Tuple{Int,Symbol}[(axis, side)] for axis in 1:D for side in (:lower, :upper)]

@@ -40,9 +40,9 @@
 # overlay-constraint detection, the pruning constraint source
 # (`_coverage_constraints`, over the masks `coverage.jl` computes), and
 # the active-enumeration constructor.
-# The physical-Dirichlet spec types, per-key Dirichlet detection, and
+# The physical-Dirichlet spec types, per-level Dirichlet detection, and
 # the L² boundary projection live in `dirichlet.jl`. `dof_layout`
-# forward-references `_has_physical_dirichlet` and
+# forward-references `_physical_dirichlet` and
 # `_project_dirichlet_values!`; the references resolve at call time
 # (when `prepare(problem)` runs, after every source file is loaded).
 # Its `facets` keyword is left unannotated for the same reason: a
@@ -360,8 +360,9 @@ _coordinate_matches(a::Real, b::Real, tol::GeometryTolerance) = abs(a - b) <= to
 # True iff the per-axis factor of `key` along `axis` anchors at the
 # level's lower (`side = :lower`) or upper (`side = :upper`) mesh edge.
 # Dispatched on the level's basis family so each family's "boundary
-# mode" convention is local to its own implementation. Used by
-# `_key_on_physical_side` and `_has_overlay_constraint` to translate
+# mode" convention is local to its own implementation. Used by the
+# physical-Dirichlet detection (`_key_faces` in `dirichlet.jl`) and by
+# `_has_overlay_constraint` to translate
 # "is this dof at a face" into a basis-family-specific predicate without
 # leaking the family's mode-index conventions into the rest of the dof
 # layer.
@@ -1044,8 +1045,10 @@ Construct the basis-aware global dof layout for a superposition
      is either the identity `[(raw, 1)]` for free raws, the empty list
      `[]` for strongly eliminated raws, or a multi-element list for
      linear-constraint pivots.
-  3. Per-component physical Dirichlet detection via
-     `_has_physical_dirichlet`.
+  3. Per-component physical Dirichlet detection: one pass per level
+     over the level's raws, matching the physical faces each raw's
+     function lies on against every condition's facets as face bitmasks
+     (`_physical_dirichlet`).
   4. Enumerate active dofs component-major (component 1 first, then
      component 2, …) skipping every (raw, component) entry that is
      either physically Dirichlet-constrained or a constraint pivot.
@@ -1163,23 +1166,12 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
         !(isempty(e) || (length(e) == 1 && e[1] == (raw, one(T))))
     end
 
-    # Stage 3: per-component physical Dirichlet detection, level by level over each
-    # level's raw range. The ranges tile the raws in level order, so this is still raw
-    # order, but the predicate gets its level handed in rather than found again per
-    # raw. Searching `V.levels` for every raw's id copied the level struct out once
-    # per raw, and that copy's cost swung with the process's memory layout: on a deep
-    # 2D ladder (6² base, depth 5) this stage took 4.7–8.1 ms per process that way
-    # and takes 3.5–4.4 ms walking the ranges.
+    # Stage 3: per-component physical Dirichlet detection, one face-mask pass per
+    # level over the level's raw range (`dirichlet.jl`). The layout does not exist
+    # yet, so the pass reads the three arrays it needs from a named tuple.
     ncomp = Int(components)
-    physical_dirichlet = falses(nraw, ncomp)
-    for level in V.levels, raw in level_raws[level.id]
-        key = raw_keys[raw]
-        for component in 1:ncomp
-            physical_dirichlet[raw, component] = _has_physical_dirichlet(key, level, V.domain,
-                                                                         dirichlet, tolerance,
-                                                                         component)
-        end
-    end
+    physical_dirichlet = _physical_dirichlet((; raw_keys, level_raws, tolerance), V, dirichlet,
+                                             ncomp)
 
     # Stage 4: enumerate active dofs component-major. For all-or-nothing
     # constraints this matches the natural block ordering; per-component

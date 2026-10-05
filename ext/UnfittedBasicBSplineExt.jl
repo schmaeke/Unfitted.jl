@@ -791,7 +791,7 @@ end
 
 # True iff the per-axis B-spline factor of `key` anchors at the level's
 # lower or upper mesh edge along `axis`. Used by the **physical
-# Dirichlet** detection in `dirichlet.jl::_key_on_physical_side`: only
+# Dirichlet** detection in `dirichlet.jl::_key_faces`: only
 # the function that is interpolatory at the boundary (index 1 at the
 # lower edge, index `dim` at the upper edge for an open clamped knot
 # vector) carries the Dirichlet value. Higher-derivative constraints
