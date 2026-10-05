@@ -295,28 +295,33 @@ end
 
 # The `u(context, xi[, field])` accessor handed to every user VTK callback: it
 # evaluates the superposed solution at the sample without the callback ever
-# touching the dof layer. The per-parent basis records it reduces over are
-# built once per integration region by the caller and refreshed in place here,
-# the same hoist `l2_error` uses — rebuilding them per sample is what used to
-# dominate the export.
+# touching the dof layer. It is the assembly's own field evaluation, the one
+# `q.state` and the quadrature-point walker read: the caller frames each
+# integration region on the workspace `ws` and reads the dof values of every
+# field on it into `state` once (`_frame!`, `_state_region!`), and each call
+# evaluates the basis at the sample (`_refresh!`, values only) and every field
+# there (`_state_point!`), then reads one field off `state` — a scalar for a
+# one-component field, an `SVector` over the components otherwise. Reading the
+# dof values once per region rather than once per sample is what keeps the
+# export cheap.
 #
-# `space` / `block_layout` are the subdomain space and field layout of the block
-# currently being written (for a single-domain model, the one space and the
-# default field). The accessor evaluates the block's field by default; a named
-# `field` is resolved on the *same* subdomain's parents (valid for several
-# fields sharing one space) and pays for its own records, since only the
-# block's are cached. To read a field on a *different* subdomain, call
-# `value(solution, model, other, x)` with the sample coordinate `x` the
-# callback also receives.
-function _vtk_value_accessor(coefficients, model::Model, space::Space, block_layout::FieldLayout,
-                             parents, field_data)
-    return (context, xi, field=nothing) -> begin
-        layout = field === nothing ? block_layout : _model_field_layout(model, field)
-        data = field === nothing ? field_data : _field_parent_data(space, layout, parents)
-        for record in data
-            _update_parent_basis_values!(record, xi.region)
-        end
-        return _superposed_value(data, layout, coefficients)
+# `default` is the field of the block being written. A callback may name another
+# `field`, but only one on the same subdomain: the region's parents are that
+# subdomain's cells, so another subdomain's field owns none of them in the frame
+# (`ws.fptr`) and has no value there, and asking for one raises. To read a
+# field on a *different* subdomain, call `value(solution, model, other, x)` with
+# the sample coordinate `x` the callback also receives.
+function _vtk_value_accessor(ws, state::FormState, region, default::Field)
+    return (context, xi, field=default) -> begin
+        f = _field_index(state.layout, field.name)
+        (ws.fptr[f] < ws.fptr[f+1] || isempty(region.parents)) ||
+            throw(ArgumentError("write_vtk: u(context, xi, field) reads only fields of the block's " *
+                                "own subdomain; evaluate $(field.name) with value(solution, " *
+                                "model, $(field.name), x)"))
+        _refresh!(ws, region, xi.region, Val(false))
+        _state_point!(state, ws, Val(false))
+        offset, C = state.offsets[f], state.layout.fields[f].components
+        return C == 1 ? state.values[offset+1] : SVector(ntuple(c -> state.values[offset+c], C))
     end
 end
 
@@ -396,9 +401,9 @@ end
 # zero-level isocontour) without the user having to wire a `phi`
 # callback themselves. A user-supplied `level_set` entry in
 # `point_data` overrides the built-in.
-function _partition_vtk_data(solution::Solution, model::Model{D,T}, space::Space{D,T},
-                             plan::IntegrationPlan{D,T}, layout::FieldLayout{D,T}, subdivisions,
-                             cut_depth::Int, point_data, cell_data) where {D,T}
+function _partition_vtk_data(solution::Solution, model::Model{D,T}, ws::AssemblyWorkspace,
+                             space::Space{D,T}, regions::Vector{VolumeRegion{D,T}}, fld::Field,
+                             subdivisions, cut_depth::Int, point_data, cell_data) where {D,T}
     point_pairs = _vtk_pairs(point_data, :point_data)
     cell_pairs = _vtk_pairs(cell_data, :cell_data)
     physical = space.physical
@@ -423,15 +428,16 @@ function _partition_vtk_data(solution::Solution, model::Model{D,T}, space::Space
     level_set_values = auto_level_set ? T[] : nothing
     # One value list per callback, filled in sample order. The callbacks run
     # here, inside the region walk, rather than against a recorded sample list:
-    # that is what lets a region's parent basis records (`_field_parent_data`,
-    # the expensive part of an evaluation) be built once and reused by every
-    # one of the region's samples.
+    # that is what lets a region's dof values (`_state_region!`, the expensive
+    # part of an evaluation) be read once and reused by every one of the
+    # region's samples.
     point_values = [Any[] for _ in point_pairs]
     cell_values = [Any[] for _ in cell_pairs]
+    state = FormState(model.dofs, _state_vector(solution, model))
 
-    for (region_id, region) in pairs(plan.regions)
-        u = _vtk_value_accessor(solution.coefficients, model, space, layout, region.parents,
-                                _field_parent_data(space, layout, region.parents))
+    for (region_id, region) in pairs(regions)
+        _state_region!(state, _frame!(ws, region))
+        u = _vtk_value_accessor(ws, state, region, fld)
         for subbox in _region_boxes(space, region, subdivisions, cut_depth, lipschitz)
             first_point = length(points) + 1
             corners = _box_corners(subbox, Val(D))
@@ -473,14 +479,13 @@ function _vtk_fields_to_write(model::Model, field)
     throw(ArgumentError("unknown field $field"))
 end
 
-# The (subdomain space, its integration plan, its dof layout) a field lives on.
-# For a single-domain model this is the one space / plan / field. Shared by the
-# VTK export and by `l2_error`, which must integrate each field over its own
-# subdomain rather than over the problem's representative space.
+# The (subdomain space, its volume region list, its dof layout) a field lives on:
+# for a single-domain model the one space, plan and field. The regions are the
+# list assembly integrates the field's volume forms over (`_region_list`), so
+# the export samples exactly the regions the solve integrated.
 function _field_context(model::Model, fld::Field)
     space = _field_space(model.problem, fld.name)
-    si = findfirst(s -> s === space, problem_spaces(model.problem))::Int
-    return space, integration_plans(model)[si], _model_field_layout(model, fld)
+    return space, _region_list(model, nothing, space).regions, _field_layout(model.dofs, fld.name)
 end
 
 # Map a level's `role` to a small integer tag for the mesh export, so ParaView
@@ -593,9 +598,12 @@ function _write_vtk_blocks!(vtm, base::AbstractString, solution::Solution, model
     multi = length(fields) > 1
     meshed = Any[]
     for (i, fld) in enumerate(fields)
-        space, plan, layout = _field_context(model, fld)
-        data = _partition_vtk_data(solution, model, space, plan, layout, subdivisions, cut_depth,
-                                   point_data, cell_data)
+        space, regions, layout = _field_context(model, fld)
+        # The workspace is built here and passed in: its basis-family parameter is
+        # not inferable from the model, and the call is the function barrier that
+        # types it, and with it the sample accessor every callback receives.
+        data = _partition_vtk_data(solution, model, _assembly_workspace(model), space, regions, fld,
+                                   subdivisions, cut_depth, point_data, cell_data)
         field_block = multiblock_add_block(vtm, string(fld.name))
         data_name = multi ? "data_$i" : "data"
         vtk = vtk_grid(_vtk_child_path(base, data_name), data.points, data.cells; ascii, append,
@@ -683,11 +691,14 @@ Keyword arguments:
     pairs. Each callback is invoked at every vertex sample as
     `f(u, context, x, xi)` and returns a per-point scalar / vector /
     tuple value. `u(context, xi[, field])` evaluates the current
-    solution at the sample. `x` is the physical coordinate and
-    `xi.region` the same point in the region's reference frame;
-    `context.parents` lists the covering parents, each with the
-    `parent_box` a callback needs to map `x` into a cell's own frame.
-    Defaults to a single `uh` entry that emits the current solution
+    solution at the sample: the block's own field by default, or another
+    `field` on the same subdomain. A field on another subdomain of a
+    coupled model raises an `ArgumentError`; evaluate it with
+    [`value`](@ref)`(solution, model, field, x)` instead. `x` is the
+    physical coordinate and `xi.region` the same point in the region's
+    reference frame; `context.parents` lists the covering parents, each
+    with the `parent_box` a callback needs to map `x` into a cell's own
+    frame. Defaults to a single `uh` entry that emits the current solution
     value.
   - `cell_data` — same shape as `point_data` but evaluated at
     per-cell sample points (the subbox center). Defaults to no
@@ -948,41 +959,12 @@ end
 
 # ── Per-parent field reconstruction ───────────────────────────────────────────
 #
-# The evaluation paths of this file — `write_vtk`'s sample accessor, `l2_error`,
-# and the point evaluations `value` / `field_gradient` — reconstruct a field one
-# covering parent at a time and sum the parents. Assembly and the
-# quadrature-point walker evaluate into a workspace's `BasisBank` instead
+# The point evaluations `value` / `field_gradient` (`_level_field`) reconstruct
+# a field one covering cell at a time and sum the cells. Every other evaluation
+# — assembly's `q.state`, the quadrature-point walker, `l2_error` and
+# `write_vtk`'s sample accessor — evaluates into a workspace's `BasisBank`
 # (`_refresh!` and `_state_point!` in `assembly.jl`), which keeps the same
-# association: per-parent partial sums, then the sum over parents.
-
-# One record per parent of `parents` on which `layout`'s field is evaluated: the
-# parent, its level's basis family and nominal order, the parent cell's own
-# basis index set and raw dofs, and fresh value and 1D-factor buffers. A caller
-# builds a region's records once and refreshes them per sample
-# (`_update_parent_basis_values!`), since building them is the expensive part of
-# an evaluation. The factor buffers are sized at the level's nominal order; the
-# index set is the cell's own minimum-rule set, which is shorter wherever a
-# per-cell order puts the cell below the nominal maximum.
-function _field_parent_data(V::Space{D,T}, layout::FieldLayout{D,T}, parents) where {D,T}
-    return map(parents) do parent
-        level = _level_by_id(V, parent.level)
-        order = nominal_order(level)
-        local_ids = cell_basis_indices(level, parent.cell)
-        return (; parent, basis=level.basis, order, local_ids,
-                values=Vector{T}(undef, length(local_ids)),
-                raw_dofs=cell_dofs(layout.dofs, parent.level, parent.cell),
-                val1d=_factor_buffers(order, T))
-    end
-end
-
-# Evaluate a parent record's basis values at the region-reference point `eta`
-# into its value buffer.
-function _update_parent_basis_values!(data, eta::SVector{D,T}) where {D,T}
-    xi = reference_to_physical(data.parent.local_box, eta)
-    _tensor_values!(data.basis, data.values, data.local_ids, data.order, xi, data.val1d,
-                    data.parent.cell)
-    return data
-end
+# association: per-cell partial sums, then the sum over cells.
 
 # The field on one parent cell: `Σᵢ u(rawᵢ, component)·φᵢ` over the cell's raw
 # dofs, with `φ` the cell's basis values (the field's value) or physical basis
@@ -998,23 +980,7 @@ function _parent_field(layout::FieldLayout{D,T}, coefficients, raw_dofs, φ,
     return result
 end
 
-# The superposed value of one component: `_parent_field` summed over the parent
-# records of an evaluation region.
-function _field_value(field_data, layout::FieldLayout{D,T}, coefficients,
-                      component::Integer) where {D,T}
-    result = zero(promote_type(T, eltype(coefficients)))
-    for data in field_data
-        result += _parent_field(layout, coefficients, data.raw_dofs, data.values, component)
-    end
-    return result
-end
-
 # ── Solution evaluation ──────────────────────────────────────────────────────
-
-# Look up the per-field layout of `field` inside the model's
-# `SystemLayout`. Thin wrapper over `_field_layout` from `dofs.jl`
-# that takes a `Field` value rather than a name symbol.
-_model_field_layout(model::Model, field::Field) = _field_layout(model.dofs, field.name)
 
 # Pick the implicit field of a single-field model. Multi-field models
 # require an explicit field argument so the caller does not silently
@@ -1042,42 +1008,23 @@ function _assert_point_in_domain(x::SVector{D,T}, domain::AxisBox{D,T},
         throw(ArgumentError("evaluation point is outside the field's domain"))
 end
 
-# One level's contribution to the superposed value at physical point
-# `x`. Returns zero if the level's mesh does not contain `x` (overlay
-# zero-extension) or if the containing cell is masked inactive.
-# Otherwise: locate the cell, map `x` to the cell's reference frame,
-# evaluate basis values there, and contract with the dof coefficients
-# through `dof_value` so constrained dofs contribute their pinned
-# values.
-function _level_value(coefficients, model::Model{D,T}, layout::FieldLayout{D,T}, level::Level{D,T},
-                      x::SVector{D,T}, component::Integer=1) where {D,T}
-    cell = locate_cell(level.mesh, x; tol=model.dofs.tolerance)
-    cell === nothing && return zero(promote_type(T, eltype(coefficients)))
-    is_active(level.mask, cell) || return zero(promote_type(T, eltype(coefficients)))
-
-    parent_box = cell_box(level.mesh, cell)
-    xi = physical_to_reference(parent_box, x)
-    values = basis_values(level, cell, xi)
-    return _parent_field(layout, coefficients, cell_dofs(layout.dofs, level.id, cell), values,
-                         component)
-end
-
-# Gradient analogue of `_level_value`. Uses
-# `physical_basis_gradients` so the chain-rule scaling `2 / h_d` for
-# the axis-aligned cell is applied automatically — the gradient
-# returned is already in physical coordinates.
-function _level_gradient(coefficients, model::Model{D,T}, layout::FieldLayout{D,T},
-                         level::Level{D,T}, x::SVector{D,T}, component::Integer=1) where {D,T}
+# One level's contribution to the field of `layout` at physical point `x`: its
+# value (`G = false`) or its physical gradient (`G = true`). Zero if the level's
+# mesh does not contain `x` (overlay zero-extension) or if the containing cell is
+# masked inactive. Otherwise: locate the cell, map `x` to the cell's reference
+# frame, evaluate the basis values there — or the physical basis gradients, which
+# `physical_basis_gradients` scales by the chain rule `2 / h_d` of the
+# axis-aligned cell — and contract them with the dof values through
+# `dof_value`, so constrained dofs contribute their pinned values.
+function _level_field(coefficients, model::Model{D,T}, layout::FieldLayout{D,T}, level::Level{D,T},
+                      x::SVector{D,T}, component::Integer, ::Val{G}) where {D,T,G}
     R = promote_type(T, eltype(coefficients))
     cell = locate_cell(level.mesh, x; tol=model.dofs.tolerance)
-    cell === nothing && return SVector{D,R}(ntuple(_ -> zero(R), D))
-    is_active(level.mask, cell) || return SVector{D,R}(ntuple(_ -> zero(R), D))
-
+    (cell === nothing || !is_active(level.mask, cell)) && return G ? zero(SVector{D,R}) : zero(R)
     parent_box = cell_box(level.mesh, cell)
     xi = physical_to_reference(parent_box, x)
-    gradients = physical_basis_gradients(level, cell, parent_box, xi)
-    return _parent_field(layout, coefficients, cell_dofs(layout.dofs, level.id, cell), gradients,
-                         component)
+    φ = G ? physical_basis_gradients(level, cell, parent_box, xi) : basis_values(level, cell, xi)
+    return _parent_field(layout, coefficients, cell_dofs(layout.dofs, level.id, cell), φ, component)
 end
 
 # Shared pre-flight for the public `value` / `field_gradient` paths:
@@ -1089,7 +1036,7 @@ function _evaluation_data(solution::Solution, model::Model{D,T}, u::Field,
     point = _point_vector(x, T)
     space = _field_space(model.problem, u.name)
     _assert_point_in_domain(point, space.domain, model.dofs.tolerance)
-    return coefficients, point, _model_field_layout(model, u)
+    return coefficients, point, _field_layout(model.dofs, u.name)
 end
 
 # Bounds-check a component argument against the field's component count.
@@ -1103,25 +1050,15 @@ end
 # reaches into field `a`'s grid.
 _field_levels(model::Model, layout::FieldLayout) = _field_space(model.problem, layout.name).levels
 
-# Sum every level's `_level_value` contribution. The overlay
-# zero-extension comes from `_level_value` returning zero when its
-# level does not cover `point`.
-function _evaluate_field_value(coefficients, model::Model{D,T}, layout::FieldLayout{D,T},
-                               point::SVector{D,T}, component::Integer=1) where {D,T}
-    result = zero(promote_type(T, eltype(coefficients)))
-    for level in _field_levels(model, layout)
-        result += _level_value(coefficients, model, layout, level, point, component)
-    end
-    return result
-end
-
-# Gradient counterpart of `_evaluate_field_value`.
-function _evaluate_field_gradient(coefficients, model::Model{D,T}, layout::FieldLayout{D,T},
-                                  point::SVector{D,T}, component::Integer=1) where {D,T}
+# Sum every level's `_level_field` contribution, the value or the gradient by
+# `G`. The overlay zero-extension comes from `_level_field` returning zero when
+# its level does not cover `point`.
+function _evaluate_field(coefficients, model::Model{D,T}, layout::FieldLayout{D,T},
+                         point::SVector{D,T}, component::Integer, ::Val{G}) where {D,T,G}
     R = promote_type(T, eltype(coefficients))
-    result = SVector{D,R}(ntuple(_ -> zero(R), D))
+    result = G ? zero(SVector{D,R}) : zero(R)
     for level in _field_levels(model, layout)
-        result += _level_gradient(coefficients, model, layout, level, point, component)
+        result += _level_field(coefficients, model, layout, level, point, component, Val(G))
     end
     return result
 end
@@ -1131,16 +1068,17 @@ end
 # `SVector` across components for vector fields. When `component` is
 # explicit: bounds-check and evaluate that one component.
 function _field_quantity(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D},
-                         component, evaluator) where {D,T}
+                         component, gradient::Val) where {D,T}
     coefficients, point, layout = _evaluation_data(solution, model, u, x)
     if component === nothing
-        layout.components == 1 && return evaluator(coefficients, model, layout, point)
-        return SVector(ntuple(c -> evaluator(coefficients, model, layout, point, c),
+        layout.components == 1 &&
+            return _evaluate_field(coefficients, model, layout, point, 1, gradient)
+        return SVector(ntuple(c -> _evaluate_field(coefficients, model, layout, point, c, gradient),
                               layout.components))
     end
 
     _check_component(layout, component)
-    return evaluator(coefficients, model, layout, point, component)
+    return _evaluate_field(coefficients, model, layout, point, component, gradient)
 end
 
 """
@@ -1173,12 +1111,12 @@ function value(solution::Solution, model::Model{D,T}, x::PointLike{D},
 end
 
 function value(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D}) where {D,T}
-    _field_quantity(solution, model, u, x, nothing, _evaluate_field_value)
+    _field_quantity(solution, model, u, x, nothing, Val(false))
 end
 
 function value(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D},
                component::Integer) where {D,T}
-    _field_quantity(solution, model, u, x, component, _evaluate_field_value)
+    _field_quantity(solution, model, u, x, component, Val(false))
 end
 
 """
@@ -1208,12 +1146,12 @@ end
 
 function field_gradient(solution::Solution, model::Model{D,T}, u::Field,
                         x::PointLike{D}) where {D,T}
-    _field_quantity(solution, model, u, x, nothing, _evaluate_field_gradient)
+    _field_quantity(solution, model, u, x, nothing, Val(true))
 end
 
 function field_gradient(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D},
                         component::Integer) where {D,T}
-    _field_quantity(solution, model, u, x, component, _evaluate_field_gradient)
+    _field_quantity(solution, model, u, x, component, Val(true))
 end
 
 # ── L² error and superposed evaluation ───────────────────────────────────────
@@ -1225,15 +1163,6 @@ end
 # dispatch at the call site.
 _squared_norm(value::Number) = abs2(value)
 _squared_norm(value) = sum(abs2, value)
-
-# Superposed value over already-evaluated per-parent records (`_field_value`).
-# Scalar fields return a scalar; component fields return an `SVector` over the
-# components.
-function _superposed_value(field_data, layout::FieldLayout, coefficients)
-    layout.components == 1 && return _field_value(field_data, layout, coefficients, 1)
-    return SVector(ntuple(c -> _field_value(field_data, layout, coefficients, c),
-                          layout.components))
-end
 
 """
     l2_error(solution, model, exact; norm=:relative) -> Real
@@ -1274,26 +1203,19 @@ end
 function l2_error(solution::Solution, model::Model{D,T}, u::Field, exact;
                   norm::Symbol=:relative) where {D,T}
     norm in (:relative, :absolute) || throw(ArgumentError("norm must be :relative or :absolute"))
-    coefficients = _checked_coefficients(solution, model)
-    space, plan, field_layout = _field_context(model, u)
-    error_squared = zero(T)
-    exact_squared = zero(T)
-
-    for region in plan.regions
-        field_data = _field_parent_data(space, field_layout, region.parents)
-        quadrature = region.quadrature
-        jacobian = _region_jacobian(region)
-
-        for (eta, weight) in zip(quadrature.points, quadrature.weights)
-            for data in field_data
-                _update_parent_basis_values!(data, eta)
-            end
-            exact_value = exact(reference_to_physical(region.box, eta))
-            diff = _superposed_value(field_data, field_layout, coefficients) - exact_value
-            qweight = weight * jacobian
-            error_squared += qweight * _squared_norm(diff)
-            exact_squared += qweight * _squared_norm(exact_value)
-        end
+    state = FormState(model.dofs, _state_vector(solution, model))
+    list = _region_list(model, nothing, _field_space(model.problem, u.name))
+    f = _field_index(model.dofs, u.name)
+    offset, C = state.offsets[f], model.dofs.fields[f].components
+    # A walk with the field's dof values, as `foreach_quadrature_point` runs one.
+    # The squared error is summed component by component, which is
+    # `_squared_norm(u_h − exact)` term for term and keeps the fold type-stable
+    # whatever the component count.
+    ws = _assembly_workspace(model)
+    error_squared, exact_squared = _walk((zero(T), zero(T)), ws, list, state) do (err, ref), q
+        exact_value = exact(q.x)
+        squared = sum(c -> abs2(q.state.values[offset+c] - exact_value[c]), 1:C)
+        return err + q.weight * squared, ref + q.weight * _squared_norm(exact_value)
     end
 
     error_norm = sqrt(error_squared)

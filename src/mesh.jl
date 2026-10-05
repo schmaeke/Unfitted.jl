@@ -124,7 +124,7 @@ snapped to the last cell along that axis so a point sitting exactly on
 
 Used by region-to-parent coverage (`_parents_covering` in
 `intersections.jl`) and by post-processing evaluation
-(`_level_value`, `_level_gradient`).
+(`_level_field`).
 """
 function locate_cell(m::CartesianMesh{D,T}, point::PointLike{D};
                      tol=GeometryTolerance(T)) where {D,T}

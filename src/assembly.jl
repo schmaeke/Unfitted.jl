@@ -942,10 +942,10 @@ end
 
 # Evaluate every field's components at the current point from the refreshed
 # bank: per parent the partial sum `Σᵢ uᵢ φᵢ` (and `Σᵢ uᵢ ∇φᵢ` when `G`), then the
-# sum over parents. That is the association of `_field_value` in
-# `postprocessing.jl`; the basis values themselves reach the two along different
-# routes, so the association is all they share. Returns `state`, which becomes
-# `q.state`.
+# sum over parents. That is also the association of the point evaluation
+# (`_parent_field` in `postprocessing.jl`), whose basis values reach it along a
+# different route, so the association is all the two share. Returns `state`,
+# which becomes `q.state`.
 function _state_point!(state::FormState{D,R}, ws::AssemblyWorkspace, ::Val{G}) where {D,R,G}
     bank = ws.bank
     for (f, fl) in pairs(ws.layout.fields), c in 1:fl.components
