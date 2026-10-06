@@ -18,9 +18,11 @@
 #
 # Both are arithmetic, so a constructor can guarantee them. [`ladder`](@ref)
 # builds a stack that satisfies them by construction — every level spans the
-# whole domain at an integer multiple of the previous level's resolution — and
-# [`adapt`](@ref) changes which cells of each level are live without touching the
-# geometry that makes the guarantee hold.
+# whole domain at an integer multiple of the previous level's resolution, and
+# `_mesh_axes` (`mesh.jl`) computes a node from the correctly rounded ratio
+# `i / n` alone, so a level's node coordinates are its parent's, bit for bit,
+# wherever the two meet — and [`adapt`](@ref) changes which cells of each level
+# are live without touching the geometry that makes the guarantee hold.
 #
 # What the ladder deliberately does NOT impose is any relation between the active
 # regions of consecutive levels. A level may be live where the level below it is
@@ -270,8 +272,9 @@ end
 #
 # The cell's own node coordinates are passed to `_axis_cells` exactly, with no
 # tolerance. That is the ladder's convention and it is not an oversight: levels
-# of a ladder share their node coordinates bit-for-bit (`_mesh_axes` builds the
-# endpoints exactly), so there is no rounding difference to absorb, and an
+# of a ladder share their node coordinates bit-for-bit (`_mesh_axes` makes a
+# node a function of the ratio `i / n` alone, and pins the last one to the
+# domain's upper corner), so there is no rounding difference to absorb, and an
 # additive epsilon would be wrong twice over — `GeometryTolerance` is absolute,
 # so on a domain far from the origin it is below one ulp and does nothing, while
 # on a domain of small extent it is larger than a whole cell and empties every
@@ -453,8 +456,11 @@ function depth_masks(V::Space{D}, depths::AbstractArray{<:Integer,D}; grade::Int
 
     d = Array{Int,D}(depths)
     grade > 0 && _grade!(d, grade)
-    return [k => overlapping_cells(V, findall(>=(k - 1), d); from=1, to=k)
-            for k in 2:length(V.levels)]
+    # The selection is a `BitArray` over the base grid, which is a cell selection
+    # in every dimension. `findall` is not: on a `Vector` it returns plain `Int`
+    # indices rather than `CartesianIndex{1}`, which `overlapping_cells` rejects,
+    # so a 1D ladder with an overlay could not take a depth map at all.
+    return [k => overlapping_cells(V, d .>= k - 1; from=1, to=k) for k in 2:length(V.levels)]
 end
 
 # Raise every depth that sits more than `by` below a neighbour, to the fixed point

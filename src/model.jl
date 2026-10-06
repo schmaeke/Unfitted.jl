@@ -234,8 +234,8 @@ Fields:
     `∫ φᵢ φⱼ ds` was positive definite, `:pseudoinverse` where `cholesky`
     reported it indefinite, and `:none` where the component had no constrained
     dof to solve for — which is also what a model prepared with homogeneous data
-    reads, constant-zero data skipping the projection at [`prepare`](@ref)
-    altogether.
+    reads, constant-zero data (a zero number, or a tuple or array whose every
+    entry is zero) skipping the projection at [`prepare`](@ref) altogether.
 
     `:pseudoinverse` is the entry worth reading: it is the only externally
     visible trace of a boundary trace space that has gone singular, and on an
@@ -254,7 +254,10 @@ Fields:
     dof whose every facet region is trimmed away is still constrained, while the
     projection has nothing left to fit it on and the pseudoinverse pins it to
     zero. Zero on a non-immersed space and on every immersed space whose
-    integrated faces stay inside `Ω`.
+    integrated faces stay inside `Ω`. Zero, too, on any model prepared with
+    homogeneous data, whatever its geometry: that model has run no trace solve,
+    so the list is empty, as `dirichlet_trace_factors` reads `:none`, until the
+    first [`update_dirichlet!`](@ref) runs one and establishes both.
 
     What such a condition *ought* to mean is an open semantic question and the
     package does not answer it here; the record exists so the answer it does give
@@ -354,83 +357,19 @@ function _inactive_cell_counts(spaces)
 end
 
 # Per-level count of raws eliminated by covered-mode pruning (`:coverage` or
-# `:dedup`), across every field of the system layout, in field-then-level
-# order. The granularity is deliberately the *field*, not the space
-# `_inactive_cell_counts` walks: covered-mode pruning is a property of a field's
-# own dof layout, and two fields over one space shed different modes. The two
-# vectors therefore line up entry-for-entry only when each space carries one
-# field.
+# `:dedup`), one entry per id of each field's level block, concatenated in field
+# order. That is the per-*field* granularity the `reduced_mode_counts` docstring
+# states, not the per-space one `_inactive_cell_counts` walks, so the two vectors
+# line up entry-for-entry only when each space carries one field. Pruning reads
+# the space alone — never a field's components or Dirichlet data — so two fields
+# over one space report the same counts, once each.
+#
+# Each level's raws are one range of the layout (`level_raws`), so a level is
+# counted from its own elimination sources without a pass over every raw.
 function _reduced_mode_counts(layout::SystemLayout)
-    counts = Int[]
-    for field in layout.fields
-        dofs = field.dofs
-        per_level = Dict{Int,Int}()
-        for raw in eachindex(dofs.raw_keys)
-            src = dofs.elimination_source[raw]
-            (src === :coverage || src === :dedup) || continue
-            lvl = dofs.raw_keys[raw].level
-            per_level[lvl] = get(per_level, lvl, 0) + 1
-        end
-        for lvl in field.level_ids
-            push!(counts, get(per_level, lvl, 0))
-        end
-    end
-    return counts
-end
-
-# Per-level counts of the functions a level *enumerated* and of those that
-# *survived*, keyed by level id and summed over every field of the system
-# layout. Both, and not only the second, because the two answer different
-# questions and the pair is what separates them:
-#
-#   raw = 0, active = 0     the level is dormant — no active cell, so nothing
-#                           was enumerated. A ladder's unwoken rungs look like
-#                           this and it is not a problem.
-#   raw > 0, active = 0     the level enumerated functions and nothing of it
-#                           reaches the system. For a maximal-continuity spline
-#                           level the usual cause is the thin case: a region `p`
-#                           cells wide or less holds no function whose whole
-#                           support fits inside it, so the level costs a mesh and
-#                           buys nothing.
-#
-# `active` is "survived every elimination", not "survived the artificial
-# boundary": it is read off `active_component`, which is zero for an
-# artificial-boundary constraint, for leaf-semantics pruning, and for a physical
-# Dirichlet condition alike. A one-cell order-1 level with Dirichlet data on all
-# four of its faces therefore reports 4 / 0 although it has no artificial boundary
-# at all, and an ordinary 4×4 order-2 Poisson level reports 49 / 81 with the 32
-# missing functions Dirichlet. The signature narrows the cause; it does not name
-# it.
-#
-# Counted per *function* rather than per unknown, because that is the quantity
-# the basis families' dof ledgers are stated in — `∏_d (n_d − p_d)` for a
-# selected spline level, say. On a field with `components > 1` a function
-# carries one unknown per component, so the entries sum to `active_unknowns`
-# only on scalar fields.
-function _level_function_counts(layout::SystemLayout)
-    raw = Dict{Int,Int}()
-    active = Dict{Int,Int}()
-    # Two fields over ONE space enumerate the same functions — `dof_layout` builds
-    # each field's raws from the space alone — so a second field over that space must
-    # not count them again. Fields over *different* spaces hold disjoint level-id
-    # blocks (`_reindex_space_levels`), so a field's block is either wholly counted or
-    # wholly new and the skip is exact rather than a heuristic. Without it a two-field
-    # problem reported every level's counts doubled, while a two-component vector
-    # field over the same space — the same dof count, spelled differently — reported
-    # them once.
-    counted = Set{Int}()
-    for field in layout.fields
-        all(in(counted), field.level_ids) && continue
-        dofs = field.dofs
-        for r in eachindex(dofs.raw_keys)
-            lvl = dofs.raw_keys[r].level
-            raw[lvl] = get(raw, lvl, 0) + 1
-            any(!iszero, @view dofs.active_component[r, :]) &&
-                (active[lvl] = get(active, lvl, 0) + 1)
-        end
-        union!(counted, field.level_ids)
-    end
-    return raw, active
+    return Int[count(s -> s === :coverage || s === :dedup,
+                     view(f.dofs.elimination_source, f.dofs.level_raws[id])) for f in layout.fields
+               for id in f.level_ids]
 end
 
 # Scan the integration plan for NNMF-fit statistics, returning
@@ -510,33 +449,47 @@ function _set_plan_stats_multi!(diag::AssemblyDiagnostics, plans)
     return diag
 end
 
-# Fold the L² Dirichlet trace solve's own verdict into a diagnostics record in
-# place, and return it so call sites can chain — the counterpart of
-# `_set_plan_stats_multi!` for the boundary-trace half of the layout.
+# Append one field's L² Dirichlet trace-solve verdicts to `factors` and
+# `unsupported`, in component order: the branch each component's solve took
+# (`_trace_branch` of its factor) and an `UnsupportedDirichletDof` record for each
+# dof that solve left undetermined. `projection` is the one the field's data were
+# just projected through, or `nothing` for a field whose data are homogeneous —
+# `prepare` skips the projection for those, so every component reads `:none` and
+# nothing is unsupported.
 #
-# Read back off the dof layouts the projection filled rather than off the
-# `DirichletProjection`s themselves, because the projection is per field and
-# transient — `prepare` builds one inside `dof_layout` and discards it, while
-# `update_dirichlet!` caches it on the model — whereas the layout is what every
-# consumer of a prepared model already holds.
+# Read off the projection because that is where the verdicts live and nowhere
+# else: the dof layout keeps no copy of them, and `prepare` drops each projection
+# it builds as soon as this has read it, so the model it returns holds none.
+# `update_dirichlet!` reads the ones it caches the same way.
+function _append_trace_stats!(factors::Vector{Symbol}, unsupported::Vector{UnsupportedDirichletDof},
+                              name::Symbol, projection, components::Integer)
+    for c in 1:components
+        push!(factors, projection === nothing ? :none : _trace_branch(projection.factors[c]))
+        projection === nothing && continue
+        append!(unsupported,
+                (UnsupportedDirichletDof(name, c, raw) for raw in projection.unsupported[c]))
+    end
+    return factors, unsupported
+end
+
+# Install the trace-solve verdicts `_append_trace_stats!` collected, over every
+# field in field order, in a diagnostics record in place, and return it so call
+# sites can chain — the counterpart of `_set_plan_stats_multi!` for the
+# boundary-trace half of the build. The unsupported dofs are self-describing
+# records rather than a flattened vector: the list is empty on every untrimmed
+# boundary, so there is no position worth counting from.
 #
 # Both quantities describe the boundary mass and not the datum, so a load
 # increment restates the same answers; the two events that move them are a
 # rebuilt layout and a *first* projection, the latter being why
 # `update_dirichlet!` calls this too. A model prepared with homogeneous data has
-# run no projection at all, and its first nonzero increment is where the branch
-# and the unsupported dofs are established.
-function _set_dirichlet_trace_stats!(diag::AssemblyDiagnostics, layout::SystemLayout)
-    diag.dirichlet_trace_factors = Symbol[branch for field in layout.fields
-                                          for branch in field.dofs.dirichlet_trace_factors]
-    # Self-describing records rather than a flattened vector: the list is empty on
-    # every untrimmed boundary, so there is no position worth counting from.
-    records = UnsupportedDirichletDof[]
-    for field in layout.fields, (component, raws) in pairs(field.dofs.unsupported_dirichlet)
-        append!(records, (UnsupportedDirichletDof(field.name, component, raw) for raw in raws))
-    end
-    diag.unsupported_dirichlet_dofs = records
-    diag.unsupported_dirichlet_dof_count = length(records)
+# run no projection at all, and its first increment is where the branch and the
+# unsupported dofs are established.
+function _set_dirichlet_trace_stats!(diag::AssemblyDiagnostics, factors::Vector{Symbol},
+                                     unsupported::Vector{UnsupportedDirichletDof})
+    diag.dirichlet_trace_factors = factors
+    diag.unsupported_dirichlet_dofs = unsupported
+    diag.unsupported_dirichlet_dof_count = length(unsupported)
     return diag
 end
 
@@ -664,7 +617,7 @@ function AssemblyCache{T}() where {T}
                             Pair{Tuple{Vector{RegionList},Bool},AssemblyPattern}[], T[], Any[])
 end
 
-# ── Model and lifecycle ───────────────────────────────────────────────────────
+# ── Model and `prepare` ───────────────────────────────────────────────────────
 
 """
     Model{D,T,P}
@@ -839,154 +792,6 @@ mutable struct Model{D,T,P}
     plan_options::NamedTuple
 end
 
-# Pick out the Dirichlet conditions that apply to the field called
-# `name` from a problem's `dirichlet` list: every unscoped condition
-# (`condition.field === nothing`) applies to the only field of a
-# single-field problem and raises on multi-field problems; named
-# conditions match by name.
-function _dirichlet_for_field(problem::Problem, name::Symbol)
-    scoped = Any[]
-    for condition in problem.dirichlet
-        if condition.field === nothing
-            length(problem.fields) == 1 ||
-                throw(ArgumentError("multi-field Dirichlet conditions must specify a field"))
-            push!(scoped, condition)
-        elseif condition.field === name
-            push!(scoped, condition)
-        end
-    end
-    return scoped
-end
-
-# Level reports for every subdomain space, flattened in the same order as
-# `_problem_levels`. Built per space because nesting is a relation between the
-# levels of one space; a coupled problem's spaces are independent stacks.
-function _level_reports(problem::Problem, tol::GeometryTolerance, layout::SystemLayout)
-    raw, active = _level_function_counts(layout)
-    out = Any[]
-    for V in problem_spaces(problem)
-        for level in V.levels
-            push!(out,
-                  _level_report(level, V, tol, get(raw, level.id, 0), get(active, level.id, 0)))
-        end
-    end
-    return out
-end
-
-# All levels across every distinct participating space, concatenated in
-# `problem_spaces` order. Because `prepare` reindexes each space's level ids
-# into a disjoint block, the concatenation has globally-unique, contiguous
-# ids `1:N` — exactly what the assembly workspace's flat level-id banks and
-# each field's dof layout agree on. For a single-domain problem this is just
-# the one space's levels.
-function _problem_levels(problem::Problem)
-    levels = Any[]
-    for V in problem_spaces(problem)
-        append!(levels, V.levels)
-    end
-    return levels
-end
-
-# Fold each distinct space against its own `PhysicalDomain` and reindex its
-# level ids into a disjoint global block, then rebuild the fields over the
-# prepared spaces. Returns the effective problem, the prepared distinct
-# spaces (in `problem_spaces` order), and the per-space classification caches
-# (each threaded into its own space's integration plan). Folding and
-# namespacing every subdomain independently is what keeps their cut-cell
-# plans, dof blocks, and workspace banks from colliding: `_reindex_space_levels`
-# gives each prepared space its own contiguous level-id block, and the fields
-# are re-homed onto the prepared copies so no consumer ever sees the pre-fold
-# spaces the caller passed in.
-function _prepare_spaces(problem::Problem{D,T}) where {D,T}
-    orig = problem_spaces(problem)
-    prepared = Vector{Space}(undef, length(orig))
-    caches = Vector{_ClassifyCache{D,T}}(undef, length(orig))
-    remap = IdDict{Space,Space}()
-    offset = 0
-    for (i, V) in pairs(orig)
-        cache = _ClassifyCache{D,T}()
-        reindexed = _reindex_space_levels(_apply_physical_fold(V, cache), offset)
-        prepared[i] = reindexed
-        caches[i] = cache
-        remap[V] = reindexed
-        offset += level_count(reindexed)
-    end
-    new_fields = map(f -> field(f.name, remap[f.space]; components=component_count(f)),
-                     problem.fields)
-    effective = Problem(new_fields; blocks=problem.blocks, loads=problem.loads,
-                        dirichlet=problem.dirichlet, symmetric=problem.symmetric)
-    return effective, prepared, caches
-end
-
-"""
-    system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), prune=true,
-                  classify_caches=IdDict{Space,_ClassifyCache{D,T}}(),
-                  facets=nothing) -> SystemLayout
-
-Build the per-field [`DofLayout`](@ref)s for every field of `problem`
-and assemble them into a [`SystemLayout`](@ref). Each field's active
-dofs are enumerated independently and then offset into a global active
-block, so fields occupy disjoint ranges of the global enumeration.
-Fields over different spaces (multi-domain coupling) each build their
-layout from their own [`Space`](@ref); the disjoint offsets make the
-global enumeration a product space `V₁ × … × Vₙ`.
-
-`classify_caches` maps a [`Space`](@ref) to the cell-classification cache
-already filled by that space's fictitious fold, so the constraint pass reuses
-those verdicts instead of re-classifying fold-boundary cells; the empty
-default just classifies on demand.
-
-`prune` is leaf semantics, forwarded to [`dof_layout`](@ref) for every field
-alike — it describes the discretisation, not one field of it. [`prepare`](@ref)
-is where a caller sets it. `prune_exempt` is the per-level escape hatch the same
-call forwards; see [`dof_layout`](@ref).
-
-`facets` is the model's `FacetResolver`, forwarded likewise, so each field's
-Dirichlet projection resolves its boundary faces through the same memo the
-assembly path and [`boundary_integral`](@ref) use. Every field of every
-subdomain shares one resolver: the memo is keyed by `(space, face)`, so fields
-over different spaces cannot collide. `nothing` gives each field's layout a
-private resolver, which is what a standalone call with no model behind it wants.
-
-Called by [`prepare`](@ref) and the in-place mutators. End users do
-not usually call this directly.
-"""
-function system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), prune::Bool=true,
-                       prune_exempt=(), classify_caches=IdDict{Space,_ClassifyCache{D,T}}(),
-                       facets=nothing) where {D,T}
-    layouts = FieldLayout{D,T}[]
-    by_name = Dict{Symbol,Int}()
-    offset = 0
-    for field in problem.fields
-        # Reuse the field's space fold cache when `prepare` / `move!` provide it,
-        # so the constraint pass never re-classifies fold-boundary cells.
-        cache = get(() -> _ClassifyCache{D,T}(), classify_caches, field.space)
-        layout = dof_layout(field.space; dirichlet=_dirichlet_for_field(problem, field.name),
-                            tolerance, components=component_count(field), prune, prune_exempt,
-                            classify_cache=cache, facets)
-        # The field's (reindexed, contiguous) level-id block — how assembly
-        # routes each region to its owning subdomain field without a `served` mask.
-        level_ids = extrema(l.id for l in field.space.levels)
-        push!(layouts,
-              FieldLayout{D,T}(field.name, component_count(field), layout, offset,
-                               level_ids[1]:level_ids[2]))
-        by_name[field.name] = length(layouts)
-        offset += active_unknowns(layout)
-    end
-    return SystemLayout{D,T}(layouts, by_name, offset, tolerance)
-end
-
-# Map each prepared subdomain space to its fold classification cache, for
-# `system_layout` to reuse. Built from the aligned `spaces`/`caches` vectors
-# `_prepare_spaces` returns (identity keys — each field's space is one of these).
-function _caches_by_space(spaces, caches::Vector{_ClassifyCache{D,T}}) where {D,T}
-    by_space = IdDict{Space,_ClassifyCache{D,T}}()
-    for i in eachindex(spaces)
-        by_space[spaces[i]] = caches[i]
-    end
-    return by_space
-end
-
 """
     prepare(problem::Problem; prune=true, tolerance=…, criterion=…) -> Model
 
@@ -1002,9 +807,10 @@ On a multi-domain (coupled) problem every distinct participating
 [`Space`](@ref) is folded, reindexed into its own level-id block, and given
 its own integration plan and moment-fit cache.
 
-`prune` is leaf semantics, on by default and applied by [`dof_layout`](@ref)
-to every field of the problem: a cell carries basis functions only where no
-finer level has taken its region over (see [`space`](@ref) for the rule).
+`prune` is leaf semantics, on by default and applied by the layout build (see
+[`dof_layout`](@ref)) to every field of the problem: a cell carries basis
+functions only where no finer level has taken its region over (see
+[`space`](@ref) for the rule).
 
 `prune = false` builds the **unreduced twin**, and it is a diagnostic rather
 than a discretisation to solve with. The twin keeps every covered mode, so on
@@ -1033,121 +839,6 @@ docstring for the full list.
 """
 function prepare(problem::Problem{D,T}; kwargs...) where {D,T}
     _prepared_model(problem, (; kwargs...), nothing)
-end
-
-# ── Discretisation pin ────────────────────────────────────────────────────────
-#
-# `Model.version` is the token a `Solution` or `QuadField` carries so a consumer
-# can ask "are you still a coefficient vector of this model's active numbering".
-# A bare counter answers that only for an in-place mutation of one model. Every
-# `prepare` used to hand back the literal `1`, so two *independently* prepared
-# models were indistinguishable — and independently prepared models are the
-# normal case, not a corner: `adapted`, `elevated`, `moved`, `estimate`'s twin
-# and every rebuild inside an adaptive or transient loop produce them. A
-# solution from one was then accepted on the other whenever the active-unknown
-# counts happened to agree, which on a ladder is ordinary, because many
-# structurally different masks give the same count. Measured: an `l2_error` of
-# 3.2615e-3 reported where the truth was 3.2095e-3, and a complete `estimate`
-# computed from the wrong coefficient vector, neither of them raising.
-#
-# So the token is SEEDED from a structural digest of the discretisation and
-# still moved on in place. Two preparations of the same discretisation get the
-# same seed, which is what a transient loop that re-prepares at an unchanged
-# space and carries its state forward needs; two different discretisations get
-# different seeds, so the carry-over raises; an in-place mutation still moves
-# the token, so every raise the counter produced before is still produced.
-#
-# WHAT GOES IN — everything the active dof numbering is a function of:
-#
-#   * per level, in order: id, role, mode, basis family name, the mesh's corner
-#     bits and cell counts, the activation mask's bits, and the order field's
-#     palette, class map and nominal;
-#   * per field: name, component count, offset, raw and active dof counts, and
-#     the `(raw, component) -> active id` map itself — which is precisely the
-#     numbering a coefficient vector indexes into, and the only thing that
-#     separates two models differing solely in *which* dofs a Dirichlet
-#     condition constrains rather than how many;
-#   * the system's active-unknown total.
-#
-# Leaf semantics (`prepare`'s `prune`) are deliberately NOT digested as a flag,
-# although they change which raws survive. They reach the digest through the
-# layout instead, and that is the sharper reading of the same question: where
-# the rule eliminates anything, the active counts and the `(raw, component) ->
-# active id` map below already differ, so the two models separate; where it
-# eliminates nothing the two layouts are byte-identical — same raws, same active
-# count, same numbering — and a coefficient vector really is interchangeable
-# between them. Folding the flag in on top would refuse that carry-over for a
-# difference no consumer can observe.
-#
-# WHAT STAYS OUT, and this boundary is the load-bearing half: anything carrying
-# object identity. Forms, closures, `Field` objects, `dirichlet` specs and their
-# data, the `PhysicalDomain`. A problem rebuilt at an unchanged discretisation
-# constructs all of them afresh every step, so digesting any of them would break
-# the same legitimate loop a bare counter breaks, only from the other side. The
-# geometry is not thereby ignored: its effect on the numbering is the fictitious
-# fold, and the folded masks are digested above. A datum change goes through
-# `update_dirichlet!`, which rewrites values over an unchanged numbering and
-# deliberately does not move the pin.
-#
-# FNV-1a over the integers themselves rather than `Base.hash`, for the reason
-# `test/test_graded_golden.jl` gives for its own digest: `Base.hash` carries no
-# stability guarantee across Julia versions, and this value is displayed, goes
-# into the reproducibility report (`postprocessing.jl`) and may be quoted back
-# in a bug report.
-const _PIN_PRIME = 0x00000100000001b3
-const _PIN_BASIS = 0xcbf29ce484222325
-
-# `x % UInt64` is modular and total, so a `UInt16` order class, a `Bool` and a
-# negative `Int` all fold without a range check.
-function _pin(h::UInt64, x::Integer)
-    v = x % UInt64
-    for shift in 0:8:56
-        h = (h ⊻ ((v >> shift) & 0xff)) * _PIN_PRIME
-    end
-    return h
-end
-_pin(h::UInt64, x::AbstractFloat) = _pin(h, reinterpret(UInt64, Float64(x)))
-_pin(h::UInt64, s::Symbol) = foldl((a, c) -> _pin(a, UInt32(c)), String(s); init=_pin(h, 0x5f))
-_pin(h::UInt64, t::Tuple) = foldl(_pin, t; init=_pin(h, length(t)))
-# A `BitArray` folds through its packed chunks rather than bit by bit: the same
-# value, 64× fewer rounds, and the size is mixed in so two masks that differ
-# only in shape cannot collide on a shared chunk pattern.
-_pin(h::UInt64, b::BitArray) = foldl(_pin, b.chunks; init=_pin(h, size(b)))
-_pin(h::UInt64, a::AbstractArray) = foldl(_pin, a; init=_pin(h, size(a)))
-
-# The digest itself. `spaces` are the *effective* (post-fold, re-indexed)
-# subdomain spaces and `layout` the dof layout built from them, so this reads
-# the discretisation as every consumer sees it rather than as the caller wrote
-# it. Returned as a non-negative `Int` so the pin prints and compares like the
-# counter it replaces, and so the `+= 1` a mutator applies cannot wrap it into
-# the sign bit.
-function _discretisation_pin(spaces, layout::SystemLayout)
-    h = _pin(_PIN_BASIS, length(spaces))
-    for V in spaces
-        h = _pin(h, level_count(V))
-        for level in V.levels
-            h = _pin(h, level.id)
-            h = _pin(h, level.role)
-            h = _pin(h, level.mode)
-            h = _pin(h, basis_name(level.basis))
-            h = _pin(h, level.mesh.domain.lower)
-            h = _pin(h, level.mesh.domain.upper)
-            h = _pin(h, level.mesh.cells)
-            h = level.mask === nothing ? _pin(h, -1) : _pin(h, level.mask.on)
-            h = _pin(h, level.orders.palette)
-            h = _pin(h, level.orders.class)
-            h = _pin(h, level.orders.nominal)
-        end
-    end
-    for f in layout.fields
-        h = _pin(h, f.name)
-        h = _pin(h, f.components)
-        h = _pin(h, f.offset)
-        h = _pin(h, length(f.dofs.raw_keys))
-        h = _pin(h, f.dofs.active_count)
-        h = _pin(h, f.dofs.active_component)
-    end
-    return Int(_pin(h, layout.active_unknowns) & 0x7fff_ffff_ffff_ffff)
 end
 
 # The body of [`prepare`](@ref), with the moment-fit caches optionally supplied.
@@ -1216,9 +907,18 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
     # the first consumer, and handing it the model's resolver is what makes the
     # projection and the operator integrate the same facet by construction rather
     # than by two call sites agreeing.
+    #
+    # The projections themselves are not kept (`_system_layout`): their trace-solve
+    # verdicts come back beside the layout and go into the diagnostics below, and
+    # `dirichlet_projections` starts empty, for `update_dirichlet!` to fill.
     facet_resolver = FacetResolver{D,T}(tolerance)
-    layout = system_layout(effective_problem; tolerance, prune, prune_exempt,
-                           classify_caches=_caches_by_space(spaces, caches), facets=facet_resolver)
+    # Each prepared subdomain space mapped to its fold classification cache, for the
+    # layout to reuse: `spaces` and `caches` are aligned (`_prepare_spaces`), and the
+    # keys are identities — each field's space is one of these.
+    classify_caches = IdDict{Space,_ClassifyCache{D,T}}(zip(spaces, caches))
+    layout, trace_factors, unsupported = _system_layout(effective_problem; tolerance, prune,
+                                                        prune_exempt, classify_caches,
+                                                        facets=facet_resolver)
     facet_regions = _resolve_facet_regions(effective_problem, facet_resolver)
     surface_regions = _resolve_surface_regions(effective_problem, tolerance)
     interface_regions = _resolve_interface_regions(effective_problem, layout)
@@ -1235,7 +935,7 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                                surface_region_count=_region_count(surface_regions),
                                interface_region_count=_region_count(interface_regions))
     _set_plan_stats_multi!(diag, space_plans)
-    _set_dirichlet_trace_stats!(diag, layout)
+    _set_dirichlet_trace_stats!(diag, trace_factors, unsupported)
     return Model{D,T,typeof(effective_problem)}(effective_problem, problem.space,
                                                 _discretisation_pin(spaces, layout), space_plans,
                                                 fit_caches, layout, nothing, nothing,
@@ -1244,6 +944,269 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                                                 Dict{Symbol,DirichletProjection{D,T}}(), diag,
                                                 AssemblyCache{T}(), plan_options)
 end
+
+# Fold each distinct space against its own `PhysicalDomain` and reindex its
+# level ids into a disjoint global block, then rebuild the fields over the
+# prepared spaces. Returns the effective problem, the prepared distinct
+# spaces (in `problem_spaces` order), and the per-space classification caches
+# (each threaded into its own space's integration plan). Folding and
+# namespacing every subdomain independently is what keeps their cut-cell
+# plans, dof blocks, and workspace banks from colliding: `_reindex_space_levels`
+# gives each prepared space its own contiguous level-id block, and the fields
+# are re-homed onto the prepared copies so no consumer ever sees the pre-fold
+# spaces the caller passed in.
+function _prepare_spaces(problem::Problem{D,T}) where {D,T}
+    orig = problem_spaces(problem)
+    prepared = Vector{Space}(undef, length(orig))
+    caches = Vector{_ClassifyCache{D,T}}(undef, length(orig))
+    remap = IdDict{Space,Space}()
+    offset = 0
+    for (i, V) in pairs(orig)
+        cache = _ClassifyCache{D,T}()
+        reindexed = _reindex_space_levels(_apply_physical_fold(V, cache), offset)
+        prepared[i] = reindexed
+        caches[i] = cache
+        remap[V] = reindexed
+        offset += level_count(reindexed)
+    end
+    new_fields = map(f -> field(f.name, remap[f.space]; components=component_count(f)),
+                     problem.fields)
+    effective = Problem(new_fields; blocks=problem.blocks, loads=problem.loads,
+                        dirichlet=problem.dirichlet, symmetric=problem.symmetric)
+    return effective, prepared, caches
+end
+
+# All levels across every distinct participating space, concatenated in
+# `problem_spaces` order. Because `prepare` reindexes each space's level ids
+# into a disjoint block, the concatenation has globally-unique, contiguous
+# ids `1:N` — exactly what the assembly workspace's flat level-id banks and
+# each field's dof layout agree on. For a single-domain problem this is just
+# the one space's levels.
+function _problem_levels(problem::Problem)
+    levels = Any[]
+    for V in problem_spaces(problem)
+        append!(levels, V.levels)
+    end
+    return levels
+end
+
+# ── Dof layouts ───────────────────────────────────────────────────────────────
+
+"""
+    dof_layout(V::Space; dirichlet=[], tolerance=GeometryTolerance(T), components=1,
+               prune=true, prune_exempt=(), classify_cache=_ClassifyCache{D,T}()) -> DofLayout
+
+Construct the basis-aware dof layout of one field over a superposition
+[`Space`](@ref). The construction proceeds in four steps:
+
+  1. **Topology.** Walk every level's cells in order and build each active
+     cell's raw dof id vector through `TensorDofKey` lookup: adjacent cells
+     share endpoint nodes, bubble (span) modes are cell-local, inactive cells
+     get an empty vector, and each level's raws come out as one contiguous
+     range (`level_raws`). Then record the artificial eliminations in an
+     [`EliminationLedger`](@ref), one level at a time: the family-dispatched
+     [`_overlay_constraints!`](@ref), then, under leaf semantics,
+     [`_coverage_constraints!`](@ref) against the masks
+     [`build_coverage`](@ref) computes, then the family's `_resolve_rows!` on
+     any linear-constraint rows the two recorded. A raw is credited to the
+     first source that eliminates it, so a raw the artificial boundary
+     eliminates keeps `:overlay` when covered-mode pruning names it too. The
+     ledger's sources become `elimination_source` and its pivot table
+     `pivots`, once every pivot is checked to be expressed over raws that
+     stay free. This step reads the space alone.
+  2. **Physical-Dirichlet detection**, per component: one pass per level
+     over the level's raws, matching the physical faces each raw's function
+     lies on against every condition's facets as face bitmasks.
+  3. **Numbering**: active ids component-major (component 1 first, then
+     component 2, …), skipping every (raw, component) entry that is either
+     physically Dirichlet-constrained or artificially eliminated.
+  4. **Projection** of nonzero Dirichlet data onto the boundary trace space,
+     into `constrained_values` (see [`DirichletProjection`](@ref)). Skipped
+     for homogeneous data, whose constrained values are zero already.
+
+Keyword arguments:
+
+  - `dirichlet` — iterable of [`DirichletCondition`](@ref)s, every one
+    applied to this layout whatever field it names. A constant tuple or
+    array datum must carry `components` entries, as [`dirichlet`](@ref)
+    documents; any other length raises `ArgumentError` before anything is
+    built. A condition's `component` is not range-checked here, there being
+    no field to check it against: one outside `1:components` constrains
+    nothing.
+  - `tolerance` — `GeometryTolerance` used by boundary detection, and the
+    tolerance of the private `FacetResolver` the projection resolves faces
+    through. A [`Model`](@ref) shares one resolver between its projections and
+    its assembly path instead, through [`prepare`](@ref).
+  - `components` — scalar channels per field (≥ 1).
+  - `prune` — leaf semantics, on by default. `false` retains every covered
+    mode and is the unreduced twin the reduction is measured against; see
+    [`prepare`](@ref), which is where a caller reaches it.
+  - `prune_exempt` — level ids this pass leaves unpruned while every other level is
+    pruned normally. It exists for [`estimate`](@ref)'s enriched twin, where a
+    co-located same-degree cover would deduplicate exactly the keys the solution is
+    about to be injected onto; turning leaf semantics off *globally* there instead was
+    measured to inflate the indicator on a covered cell of an unrelated level by 4.1×,
+    because that level's order-elevated covered modes then survive and land in the
+    complement. Empty by default, and a no-op when `prune = false`.
+  - `classify_cache` — the space's cell-classification cache (shared with the
+    `PhysicalDomain` fold). The fictitious-fold constraint predicate and the
+    coverage rule both reuse it instead of re-classifying fold-boundary cells;
+    defaults to a fresh empty cache for standalone calls.
+
+The integrated Legendre family eliminates strongly and records no rows, so
+its layout has no pivot and assembly sees only active and constrained dofs,
+and so does the B-spline family at maximal continuity. Below maximal
+continuity a B-spline level records multi-raw rows encoding the C^m
+trace-vanishing condition on artificial boundaries; assembly gives each
+pivot they resolve to a local row and column of its own and condenses them
+onto the pivot's expansion once per integration region.
+
+The projection's own verdicts — which branch each component's trace solve
+took, and which dofs it left undetermined — are not kept: they reach a user
+through [`diagnostics`](@ref) on a prepared model.
+"""
+function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
+                    components::Integer=1, prune::Bool=true, prune_exempt=(),
+                    classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
+    components > 0 || throw(ArgumentError("dof layout components must be positive"))
+    # A plain loop, not `foreach` with a closure: over the abstractly typed condition
+    # vector a mixed list of data gives, each call of the closure is dispatched at
+    # run time with the closure boxed, one 16-byte allocation per condition.
+    for condition in dirichlet
+        _check_dirichlet_datum(condition, components, condition.field)
+    end
+    t = _dof_topology(V; tolerance, prune, prune_exempt, classify_cache)
+    return first(_field_dofs(t, V, dirichlet, components, FacetResolver{D,T}(tolerance)))
+end
+
+# One field over an already built topology: steps 2 to 4 of the layout (see
+# `dofs.jl`). Detection, then numbering, then — for nonzero data only — the
+# projection, which is returned beside the layout so the caller can read its
+# trace-solve verdicts (`_append_trace_stats!`) and then let it go. Homogeneous
+# data return `nothing` in its place: their constrained values are the zeros the
+# numbering already wrote, so no boundary is walked and no mass factorised.
+function _field_dofs(t::_DofTopology{D,T}, V::Space{D,T}, conditions, components::Integer,
+                     facets::FacetResolver{D,T}) where {D,T}
+    dofs = DofLayout(t, _physical_dirichlet(t, V, conditions, components))
+    _needs_dirichlet_projection(conditions) || return dofs, nothing
+    return dofs, _project_dirichlet_values!(dofs, V, facets, conditions)
+end
+
+"""
+    system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), prune=true,
+                  prune_exempt=(), classify_caches=IdDict{Space,_ClassifyCache{D,T}}(),
+                  facets=FacetResolver{D,T}(tolerance)) -> SystemLayout
+
+Build the per-field [`DofLayout`](@ref)s for every field of `problem`
+and assemble them into a [`SystemLayout`](@ref). Each field's active
+dofs are enumerated independently and then offset into a global active
+block, so fields occupy disjoint ranges of the global enumeration.
+Fields over different spaces (multi-domain coupling) each build their
+layout from their own [`Space`](@ref); the disjoint offsets make the
+global enumeration a product space `V₁ × … × Vₙ`.
+
+Fields over one space (the same object) share that space's dof topology:
+its raw dofs, cell → raw tables, level ranges, artificial eliminations and
+pivots are built once, and every such field's [`DofLayout`](@ref) holds
+the same arrays (`===`). Each field still has its own physical-Dirichlet
+flags, active numbering and constrained values, so two fields over one
+space are numbered, constrained and updated independently.
+
+`classify_caches` maps a [`Space`](@ref) to the cell-classification cache
+already filled by that space's fictitious fold, so the constraint pass reuses
+those verdicts instead of re-classifying fold-boundary cells; the empty
+default just classifies on demand.
+
+`prune` is leaf semantics, applied to every field alike — it describes the
+discretisation, not one field of it. [`prepare`](@ref) is where a caller sets
+it. `prune_exempt` is the per-level escape hatch; see [`dof_layout`](@ref) for
+both.
+
+`facets` is the `FacetResolver` every field's Dirichlet projection resolves
+its boundary faces through, so all of them share one memo: it is keyed by
+`(space, face)`, so fields over different spaces cannot collide, and fields
+over one space resolve each face once between them. [`prepare`](@ref) hands
+in the model's own resolver, which is what makes the projection read the very
+faces the assembly path and [`boundary_integral`](@ref) read. The default is a
+fresh resolver at `tolerance`, which is what a standalone call with no model
+behind it wants; a resolver handed in must carry `tolerance` too.
+
+The trace solves' verdicts are not part of the result — `prepare` reads them
+into [`diagnostics`](@ref) from the projections as they are built, and then
+drops the projections.
+
+Called by [`prepare`](@ref) and the in-place mutators. End users do
+not usually call this directly.
+"""
+system_layout(problem::Problem; kwargs...) = first(_system_layout(problem; kwargs...))
+
+# `system_layout`, plus the Dirichlet trace-solve verdicts of the projections it
+# built: `(layout, factors, unsupported)`, with `factors` per field per component and
+# `unsupported` per field, component and raw, in that order — which is what
+# `diagnostics` reports and what `_set_dirichlet_trace_stats!` installs. Each
+# projection is read (`_append_trace_stats!`) as soon as its field is laid out and
+# then dropped, so the layout is built with at most one projection alive, and the
+# model `prepare` returns keeps none of them: `model.dirichlet_projections` is
+# filled by `update_dirichlet!` alone.
+#
+# The topology (`_dof_topology`) is built once per distinct space — keyed by object
+# identity, as `problem_spaces` keys it — and every field over that space numbers
+# itself over the one result. A topology reads only the space and this call's
+# `tolerance`, `prune` and `prune_exempt`, so building it again for a second field
+# would repeat the whole cell walk, the coverage masks and every level's
+# eliminations to produce equal arrays. The fields share them instead: their
+# layouts hold the same space-block arrays (`===`), which `DofLayout` documents as
+# never mutated, and only detection, numbering and projection run per field.
+function _system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), prune::Bool=true,
+                        prune_exempt=(), classify_caches=IdDict{Space,_ClassifyCache{D,T}}(),
+                        facets::FacetResolver{D,T}=FacetResolver{D,T}(tolerance)) where {D,T}
+    layouts = FieldLayout{D,T}[]
+    by_name = Dict{Symbol,Int}()
+    factors, unsupported = Symbol[], UnsupportedDirichletDof[]
+    topologies = IdDict{Space,_DofTopology{D,T}}()
+    offset = 0
+    for field in problem.fields
+        t = get!(topologies, field.space) do
+            # Reuse the space's fold cache when `prepare` / `move!` provide it, so
+            # the constraint pass never re-classifies fold-boundary cells.
+            cache = get(() -> _ClassifyCache{D,T}(), classify_caches, field.space)
+            _dof_topology(field.space; tolerance, prune, prune_exempt, classify_cache=cache)
+        end
+        components = component_count(field)
+        dofs, projection = _field_dofs(t, field.space, _dirichlet_for_field(problem, field.name),
+                                       components, facets)
+        _append_trace_stats!(factors, unsupported, field.name, projection, components)
+        # The field's (reindexed, contiguous) level-id block — how assembly
+        # routes each region to its owning subdomain field without a `served` mask.
+        level_ids = extrema(l.id for l in field.space.levels)
+        push!(layouts,
+              FieldLayout{D,T}(field.name, components, dofs, offset, level_ids[1]:level_ids[2]))
+        by_name[field.name] = length(layouts)
+        offset += active_unknowns(dofs)
+    end
+    return SystemLayout{D,T}(layouts, by_name, offset, tolerance), factors, unsupported
+end
+
+# Pick out the Dirichlet conditions that apply to the field called
+# `name` from a problem's `dirichlet` list: every unscoped condition
+# (`condition.field === nothing`) applies to the only field of a
+# single-field problem and raises on multi-field problems; named
+# conditions match by name.
+function _dirichlet_for_field(problem::Problem, name::Symbol)
+    scoped = Any[]
+    for condition in problem.dirichlet
+        if condition.field === nothing
+            length(problem.fields) == 1 ||
+                throw(ArgumentError("multi-field Dirichlet conditions must specify a field"))
+            push!(scoped, condition)
+        elseif condition.field === name
+            push!(scoped, condition)
+        end
+    end
+    return scoped
+end
+
+# ── Region caches ─────────────────────────────────────────────────────────────
 
 # Build the facet-region cache for a problem from every *site* that references
 # a `BoundarySelector`: Dirichlet conditions and any block/load carrying
@@ -1420,15 +1383,122 @@ function _facet_regions_for_selector(V::Space{D,T}, selector::BoundarySelector,
     return regions
 end
 
-# Rebuild `problem` over a new (adapted / elevated / moved / remasked) space,
-# reusing the field channels, forms, and Dirichlet data. Shared rebuild rule
-# behind `adapted(model, space)` and `_remodel!` (the geometry-fold rebuild goes
-# through `_prepare_spaces`, which also reindexes level ids).
-function _problem_with_space(problem::Problem, new_space::Space)
-    new_fields = map(f -> field(f.name, new_space; components=component_count(f)), problem.fields)
-    return Problem(new_fields; blocks=problem.blocks, loads=problem.loads,
-                   dirichlet=problem.dirichlet, symmetric=problem.symmetric)
+# ── Discretisation pin ────────────────────────────────────────────────────────
+#
+# `Model.version` is the token a `Solution` or `QuadField` carries so a consumer
+# can ask "are you still a coefficient vector of this model's active numbering".
+# A bare counter answers that only for an in-place mutation of one model. Every
+# `prepare` used to hand back the literal `1`, so two *independently* prepared
+# models were indistinguishable — and independently prepared models are the
+# normal case, not a corner: `adapted`, `elevated`, `moved`, `estimate`'s twin
+# and every rebuild inside an adaptive or transient loop produce them. A
+# solution from one was then accepted on the other whenever the active-unknown
+# counts happened to agree, which on a ladder is ordinary, because many
+# structurally different masks give the same count. Measured: an `l2_error` of
+# 3.2615e-3 reported where the truth was 3.2095e-3, and a complete `estimate`
+# computed from the wrong coefficient vector, neither of them raising.
+#
+# So the token is SEEDED from a structural digest of the discretisation and
+# still moved on in place. Two preparations of the same discretisation get the
+# same seed, which is what a transient loop that re-prepares at an unchanged
+# space and carries its state forward needs; two different discretisations get
+# different seeds, so the carry-over raises; an in-place mutation still moves
+# the token, so every raise the counter produced before is still produced.
+#
+# WHAT GOES IN — everything the active dof numbering is a function of:
+#
+#   * per level, in order: id, role, mode, basis family name, the mesh's corner
+#     bits and cell counts, the activation mask's bits, and the order field's
+#     palette, class map and nominal;
+#   * per field: name, component count, offset, raw and active dof counts, and
+#     the `(raw, component) -> active id` map itself — which is precisely the
+#     numbering a coefficient vector indexes into, and the only thing that
+#     separates two models differing solely in *which* dofs a Dirichlet
+#     condition constrains rather than how many;
+#   * the system's active-unknown total.
+#
+# Leaf semantics (`prepare`'s `prune`) are deliberately NOT digested as a flag,
+# although they change which raws survive. They reach the digest through the
+# layout instead, and that is the sharper reading of the same question: where
+# the rule eliminates anything, the active counts and the `(raw, component) ->
+# active id` map below already differ, so the two models separate; where it
+# eliminates nothing the two layouts are byte-identical — same raws, same active
+# count, same numbering — and a coefficient vector really is interchangeable
+# between them. Folding the flag in on top would refuse that carry-over for a
+# difference no consumer can observe.
+#
+# WHAT STAYS OUT, and this boundary is the load-bearing half: anything carrying
+# object identity. Forms, closures, `Field` objects, `dirichlet` specs and their
+# data, the `PhysicalDomain`. A problem rebuilt at an unchanged discretisation
+# constructs all of them afresh every step, so digesting any of them would break
+# the same legitimate loop a bare counter breaks, only from the other side. The
+# geometry is not thereby ignored: its effect on the numbering is the fictitious
+# fold, and the folded masks are digested above. A datum change goes through
+# `update_dirichlet!`, which rewrites values over an unchanged numbering and
+# deliberately does not move the pin.
+#
+# FNV-1a over the integers themselves rather than `Base.hash`, for the reason
+# `test/test_graded_golden.jl` gives for its own digest: `Base.hash` carries no
+# stability guarantee across Julia versions, and this value is displayed, goes
+# into the reproducibility report (`postprocessing.jl`) and may be quoted back
+# in a bug report.
+const _PIN_PRIME = 0x00000100000001b3
+const _PIN_BASIS = 0xcbf29ce484222325
+
+# `x % UInt64` is modular and total, so a `UInt16` order class, a `Bool` and a
+# negative `Int` all fold without a range check.
+function _pin(h::UInt64, x::Integer)
+    v = x % UInt64
+    for shift in 0:8:56
+        h = (h ⊻ ((v >> shift) & 0xff)) * _PIN_PRIME
+    end
+    return h
 end
+_pin(h::UInt64, x::AbstractFloat) = _pin(h, reinterpret(UInt64, Float64(x)))
+_pin(h::UInt64, s::Symbol) = foldl((a, c) -> _pin(a, UInt32(c)), String(s); init=_pin(h, 0x5f))
+_pin(h::UInt64, t::Tuple) = foldl(_pin, t; init=_pin(h, length(t)))
+# A `BitArray` folds through its packed chunks rather than bit by bit: the same
+# value, 64× fewer rounds, and the size is mixed in so two masks that differ
+# only in shape cannot collide on a shared chunk pattern.
+_pin(h::UInt64, b::BitArray) = foldl(_pin, b.chunks; init=_pin(h, size(b)))
+_pin(h::UInt64, a::AbstractArray) = foldl(_pin, a; init=_pin(h, size(a)))
+
+# The digest itself. `spaces` are the *effective* (post-fold, re-indexed)
+# subdomain spaces and `layout` the dof layout built from them, so this reads
+# the discretisation as every consumer sees it rather than as the caller wrote
+# it. Returned as a non-negative `Int` so the pin prints and compares like the
+# counter it replaces, and so the `+= 1` a mutator applies cannot wrap it into
+# the sign bit.
+function _discretisation_pin(spaces, layout::SystemLayout)
+    h = _pin(_PIN_BASIS, length(spaces))
+    for V in spaces
+        h = _pin(h, level_count(V))
+        for level in V.levels
+            h = _pin(h, level.id)
+            h = _pin(h, level.role)
+            h = _pin(h, level.mode)
+            h = _pin(h, basis_name(level.basis))
+            h = _pin(h, level.mesh.domain.lower)
+            h = _pin(h, level.mesh.domain.upper)
+            h = _pin(h, level.mesh.cells)
+            h = level.mask === nothing ? _pin(h, -1) : _pin(h, level.mask.on)
+            h = _pin(h, level.orders.palette)
+            h = _pin(h, level.orders.class)
+            h = _pin(h, level.orders.nominal)
+        end
+    end
+    for f in layout.fields
+        h = _pin(h, f.name)
+        h = _pin(h, f.components)
+        h = _pin(h, f.offset)
+        h = _pin(h, length(f.dofs.raw_keys))
+        h = _pin(h, f.dofs.active_count)
+        h = _pin(h, f.dofs.active_component)
+    end
+    return Int(_pin(h, layout.active_unknowns) & 0x7fff_ffff_ffff_ffff)
+end
+
+# ── Model display, conditioning estimates and accessors ───────────────────────
 
 function Base.show(io::IO, model::Model{D}) where {D}
     print(io, "Model(D=", D, ", pin=0x", string(model.version; base=16), ", active=",
@@ -1584,6 +1654,16 @@ function _remodel!(model::Model{D,T}, space::Space{D,T}) where {D,T}
     empty!(model.dirichlet_projections)
     model.version += 1
     return model
+end
+
+# Rebuild `problem` over a new (adapted / elevated / moved / remasked) space,
+# reusing the field channels, forms, and Dirichlet data. Shared rebuild rule
+# behind `adapted(model, space)` and `_remodel!` (the geometry-fold rebuild goes
+# through `_prepare_spaces`, which also reindexes level ids).
+function _problem_with_space(problem::Problem, new_space::Space)
+    new_fields = map(f -> field(f.name, new_space; components=component_count(f)), problem.fields)
+    return Problem(new_fields; blocks=problem.blocks, loads=problem.loads,
+                   dirichlet=problem.dirichlet, symmetric=problem.symmetric)
 end
 
 """
@@ -1942,7 +2022,7 @@ function dilate(model::Model, cells; level::Integer, by)
     return dilate(model.prefold_space, cells; level=level, by=by)
 end
 
-# ── Public: refresh Dirichlet values without rebuilding the model ────────────
+# ── Public: refresh Dirichlet values without rebuilding the model ─────────────
 
 """
     update_dirichlet!(model::Model, dirichlet) -> Model
@@ -2016,16 +2096,33 @@ reassembled and back-substituted.
 Throws `ArgumentError` if `dirichlet` is structurally incompatible
 with `model.problem.dirichlet` (different length, or any condition
 moves boundary / field / component). The error message points the
-caller at [`prepare`](@ref).
+caller at [`prepare`](@ref). Also throws `ArgumentError`, naming the
+field, if a constant tuple or array datum does not carry one entry per
+component of its field (see [`dirichlet`](@ref)). Either check runs
+before anything is touched, so a rejected call leaves the model as it
+was.
 """
 function update_dirichlet!(model::Model{D,T}, dirichlet) where {D,T}
     new_dirichlet = collect(dirichlet)
     _check_dirichlet_update_compatibility(model.problem.dirichlet, new_dirichlet)
+    # The one part of `Problem`'s check of its conditions the structural check does
+    # not cover: a value's shape. Each new condition belongs to the field its old
+    # counterpart did (`field` is pinned), so its component count is read off that
+    # field's layout. The layout's field vector is concretely typed, so this costs no
+    # allocation, where indexing the problem's field tuple at run time did: with three
+    # conditions on a scalar and a 2-component field, that added six allocations
+    # (3.3 kB) to an increment; this loop takes 0.12 µs of its 17 µs (Apple M2 Pro).
+    for condition in new_dirichlet
+        owner = condition.field === nothing ? only(model.dofs.fields) :
+                _field_layout(model.dofs, condition.field)
+        _check_dirichlet_datum(condition, owner.components, owner.name)
+    end
 
     # Replace `model.problem` (immutable) with a fresh copy carrying the
     # new dirichlet list. The inner constructor sidesteps the validation
     # walk in `Problem(fields; …)` — fields, blocks, loads, and the
-    # symmetric flag were already checked when the model was prepared.
+    # symmetric flag were already checked when the model was prepared, and
+    # the conditions have just been checked above.
     p = model.problem
     model.problem = typeof(p)(p.space, p.fields, p.blocks, p.loads, new_dirichlet, p.symmetric)
 
@@ -2042,21 +2139,25 @@ function update_dirichlet!(model::Model{D,T}, dirichlet) where {D,T}
     # `DirichletProjection` depends on, so the cached one — if this is not the
     # first update on the field — is handed straight back in and only the
     # right-hand side is rebuilt.
+    #
+    # Each projection's trace-solve verdicts are read off it as it comes back, in
+    # field then component order, exactly as `prepare` reads the ones it builds.
+    trace_factors, unsupported = Symbol[], UnsupportedDirichletDof[]
     for field_layout in model.dofs.fields
-        field_dirichlet = _dirichlet_for_field(model.problem, field_layout.name)
-        field_space = _field_space(model.problem, field_layout.name)
-        cached = get(model.dirichlet_projections, field_layout.name, nothing)
-        model.dirichlet_projections[field_layout.name] = _project_dirichlet_values!(field_layout.dofs,
-                                                                                    field_space,
-                                                                                    model.facet_resolver,
-                                                                                    field_dirichlet,
-                                                                                    cached)
+        name = field_layout.name
+        cached = get(model.dirichlet_projections, name, nothing)
+        projection = _project_dirichlet_values!(field_layout.dofs,
+                                                _field_space(model.problem, name),
+                                                model.facet_resolver,
+                                                _dirichlet_for_field(model.problem, name), cached)
+        model.dirichlet_projections[name] = projection
+        _append_trace_stats!(trace_factors, unsupported, name, projection, field_layout.components)
     end
     # A model prepared with homogeneous data has run no trace solve, so this is
-    # where a first nonzero increment establishes its branch and its unsupported
-    # dofs. Later increments restate the same two answers: both describe the
-    # boundary mass, which the structural check above pins.
-    _set_dirichlet_trace_stats!(model.diagnostics, model.dofs)
+    # where its first increment establishes the branch and the unsupported dofs.
+    # Later increments restate the same two answers: both describe the boundary
+    # mass, which the structural check above pins.
+    _set_dirichlet_trace_stats!(model.diagnostics, trace_factors, unsupported)
 
     # Clear cached operators. The RHS depends on the constrained values
     # via column elimination, so the next assembly must rebuild it. The
@@ -2094,48 +2195,37 @@ include in PR descriptions, paper figures, and regression tests.
 
 Each `levels` entry carries `id`, `role`, `cells`, `order` (the level's
 nominal per-axis maximum), `order_palette` (the distinct per-cell orders, a
-one-element vector on a uniform level), `mode`, `basis`, `domain`, and `nested`
+one-element vector on a uniform level), `mode`, `basis`, `domain`, `nested`
 — whether every higher level's nodes coincide with this level's where the two
-overlap. `nested` is the geometric half of what makes leaf semantics lossless,
-and it is reported per level because [`move!`](@ref) can void it silently; see
-[`is_nested`](@ref).
+overlap — and `raw_functions` and `active_functions`. `nested` is the geometric
+half of what makes leaf semantics lossless, and it is reported per level because
+[`move!`](@ref) can void it silently; see [`is_nested`](@ref).
+
+`raw_functions` counts the basis functions the level enumerated on its active
+cells, and `active_functions` those of them that survived every elimination: the
+artificial overlay boundary, leaf-semantics pruning and physical Dirichlet
+conditions alike. Both count functions, not unknowns; a function of a field
+with `k` components carries `k` unknowns. A level is counted once however many
+fields share its space, and both numbers are read from the first field over that
+space, so with several fields over one space `active_functions` reflects the
+Dirichlet conditions of the first of them. A dormant level, with no active cell,
+reads 0 / 0; a level that enumerated functions and kept none reads `n` / 0 and
+contributes nothing to the system.
 """
 diagnostics(model::Model) = model.diagnostics
-
-# Compact per-level reproducibility report used inside
-# `diagnostics(model, solution)`: enough to know which basis, order, mode, cell
-# count and domain a level had at solve time, plus whether it was nested under.
-#
-# `nested` is the geometric half of the condition leaf semantics want — every
-# higher level's node coordinates agree with this level's where they overlap. It
-# is reported per level rather than per space so a violation can be localised,
-# and it is worth reporting at all because it is otherwise invisible: `move!`
-# can void it on a stack that was nested when it was built, and the resulting
-# loss shows up as neither a residual nor a rank deficiency. See
-# [`is_nested`](@ref).
-function _level_report(level, V::Space, tol::GeometryTolerance, raw_functions::Int,
-                       active_functions::Int)
-    nested = all(k -> k.id <= level.id || _nested_over(level, k, tol), V.levels)
-    # `order` stays the level's nominal (maximum) per-axis order, so an existing
-    # reader keeps reading the same field with the same meaning. `order_palette`
-    # carries the distinct per-cell orders — a one-element vector on a uniform
-    # level — so a graded run is reproducible from the report without the entry's
-    # type varying from level to level.
-    order_palette = copy(level.orders.palette)
-    return (; id=level.id, role=level.role, cells=level.mesh.cells, order=nominal_order(level),
-            order_palette=order_palette, mode=level.mode, basis=basis_name(level.basis),
-            domain=level.mesh.domain, nested=nested, raw_functions=raw_functions,
-            active_functions=active_functions,)
-end
 
 function diagnostics(model::Model{D,T}, solution; exact=nothing) where {D,T}
     _checked_coefficients(solution, model)
     diag = diagnostics(model)
     error = exact === nothing ? nothing : l2_error(solution, model, exact)
     tol = get(model.plan_options, :tolerance, GeometryTolerance(T))
-    return (; dimension=diag.dimension, levels=_level_reports(model.problem, tol, model.dofs),
-            active_unknowns=diag.active_unknowns, raw_dofs=raw_dof_count(model.dofs),
-            integration_regions=diag.integration_regions,
+    # Level reports for every subdomain space, flattened in the same order as
+    # `_problem_levels`. Built per space because nesting is a relation between the
+    # levels of one space; a coupled problem's spaces are independent stacks.
+    levels = Any[_level_report(level, V, tol, model.dofs) for V in problem_spaces(model.problem)
+                 for level in V.levels]
+    return (; dimension=diag.dimension, levels=levels, active_unknowns=diag.active_unknowns,
+            raw_dofs=raw_dof_count(model.dofs), integration_regions=diag.integration_regions,
             facet_region_count=diag.facet_region_count,
             cut_facet_region_count=diag.cut_facet_region_count,
             facet_fit_failure_count=diag.facet_fit_failure_count,
@@ -2159,4 +2249,73 @@ function diagnostics(model::Model{D,T}, solution; exact=nothing) where {D,T}
             condition_estimate=diag.condition_estimate,
             scaled_condition_estimate=diag.scaled_condition_estimate, solver=diag.solver,
             residual_norm=solution.diagnostics.residual_norm, l2_error=error,)
+end
+
+# Compact per-level reproducibility report used inside
+# `diagnostics(model, solution)`: enough to know which basis, order, mode, cell
+# count and domain a level had at solve time, plus whether it was nested under.
+#
+# `nested` is the geometric half of the condition leaf semantics want — every
+# higher level's node coordinates agree with this level's where they overlap. It
+# is reported per level rather than per space so a violation can be localised,
+# and it is worth reporting at all because it is otherwise invisible: `move!`
+# can void it on a stack that was nested when it was built, and the resulting
+# loss shows up as neither a residual nor a rank deficiency. See
+# [`is_nested`](@ref).
+#
+# `raw_functions` and `active_functions` count the functions the level
+# *enumerated* and those that *survived*. Both, and not only the second, because
+# the two answer different questions and the pair is what separates them:
+#
+#   raw = 0, active = 0     the level is dormant — no active cell, so nothing
+#                           was enumerated. A ladder's unwoken rungs look like
+#                           this and it is not a problem.
+#   raw > 0, active = 0     the level enumerated functions and nothing of it
+#                           reaches the system. For a maximal-continuity spline
+#                           level the usual cause is the thin case: a region `p`
+#                           cells wide or less holds no function whose whole
+#                           support fits inside it, so the level costs a mesh and
+#                           buys nothing.
+#
+# `active` is "survived every elimination", not "survived the artificial
+# boundary": it is read off `active_component`, which is zero for an
+# artificial-boundary constraint, for leaf-semantics pruning, and for a physical
+# Dirichlet condition alike. A one-cell order-1 level with Dirichlet data on all
+# four of its faces therefore reports 4 / 0 although it has no artificial boundary
+# at all, and an ordinary 4×4 order-2 Poisson level reports 49 / 81 with the 32
+# missing functions Dirichlet. The signature narrows the cause; it does not name
+# it.
+#
+# Counted per *function* rather than per unknown, because that is the quantity
+# the basis families' dof ledgers are stated in — `∏_d (n_d − p_d)` for a
+# selected spline level, say. On a field with `components > 1` a function
+# carries one unknown per component, so the entries sum to `active_unknowns`
+# only on scalar fields.
+#
+# Both are read from the first field whose level-id block holds the level, so a
+# level is counted once however many fields share its space: summing over fields
+# reported every level doubled on a two-field problem, while a two-component
+# vector field over the same space — the same dof count, spelled differently —
+# reported it once. Fields over ONE space share its one dof topology
+# (`_system_layout`), so `raw_functions` is the same whichever of them is read;
+# `active_functions` also reflects the Dirichlet conditions of the field it is
+# read from, the first one over the space. Fields over *different* spaces hold
+# disjoint level-id blocks (`_reindex_space_levels`), so the first field holding
+# the id is a field over the level's own space. A level's functions are one range
+# of the layout (`level_raws`), so it is counted from that range alone; a dormant
+# level's range is empty and reads 0 / 0.
+function _level_report(level, V::Space, tol::GeometryTolerance, layout::SystemLayout)
+    nested = all(k -> k.id <= level.id || _nested_over(level, k, tol), V.levels)
+    dofs = layout.fields[findfirst(f -> level.id in f.level_ids, layout.fields)].dofs
+    raws = dofs.level_raws[level.id]
+    # `order` stays the level's nominal (maximum) per-axis order, so an existing
+    # reader keeps reading the same field with the same meaning. `order_palette`
+    # carries the distinct per-cell orders — a one-element vector on a uniform
+    # level — so a graded run is reproducible from the report without the entry's
+    # type varying from level to level.
+    order_palette = copy(level.orders.palette)
+    return (; id=level.id, role=level.role, cells=level.mesh.cells, order=nominal_order(level),
+            order_palette=order_palette, mode=level.mode, basis=basis_name(level.basis),
+            domain=level.mesh.domain, nested=nested, raw_functions=length(raws),
+            active_functions=count(r -> any(!iszero, view(dofs.active_component, r, :)), raws),)
 end

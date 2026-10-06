@@ -36,7 +36,7 @@
 Per-level covered-cell masks for a [`Space`](@ref). `covered[level_id]` is a
 `BitArray{D}` over the level's cells, `true` where the cell is fully covered by the
 active region of the higher-id levels. Built by [`build_coverage`](@ref) and consumed
-by the pruning constraint source `_coverage_constraints` in `dofs.jl`.
+by the pruning constraint source `_coverage_constraints!` in `dofs.jl`.
 
 The flag is only computed where that consumer can read it — on a masked level, the
 active cells and their one-cell ∞-norm halo (see `_coverage_cells`). Outside that set
@@ -98,7 +98,7 @@ end
 # Letting a fictitious cell block coverage therefore leaves a parent mode active that
 # the finer level already duplicates on Ω, and the assembled operator acquires an exact
 # null mode — a function with ‖v_h‖_{L²(Ω)} = 0, living entirely in the fictitious part.
-# This mirrors `_internal_face_is_physical` in `dofs.jl`, which draws the same
+# This mirrors `_has_overlay_constraint` in `dofs.jl`, which draws the same
 # fold-versus-user-mask distinction for the artificial overlay trace condition. With
 # `physical === nothing` there is no fictitious material and the original
 # active-cells-only rule is recovered without ever touching `cache`.
@@ -247,20 +247,20 @@ end
 
 # The cells of `level` whose coverage flag can ever be read, as a `BitArray{D}`.
 #
-# `_coverage_constraints` (in `dofs.jl`) is the consumer this set is cut for, and it
+# `_coverage_constraints!` (in `dofs.jl`) is the consumer this set is cut for, and it
 # tests `cov` exactly on `_incident_cells(key, n)` for the level's raw dof keys. Raw
-# dofs are enumerated on *active* cells only (`dof_layout`, stage 1), and a key born on
+# dofs are enumerated on *active* cells only (`_enumerate_raws`), and a key born on
 # cell `c` is incident to `c` and — through its node factors — to the cells sharing a
 # face, edge, or vertex with `c`. The read set is therefore the active set dilated by
 # one cell in the ∞-norm, and computing `cov` anywhere else is work whose answer nobody
-# looks at. The remaining `any(cov)` fast-exit in `_coverage_constraints` is unaffected:
+# looks at. The remaining `any(cov)` fast-exit in `_coverage_constraints!` is unaffected:
 # it can only lose a `true` that belonged to a cell no key is incident to, in which case
 # the loop it guards would have emitted nothing anyway.
 #
 # An unmasked level is all-active, so its dilation is the whole grid and the pass is the
 # original one.
 #
-# The B-spline family's own `_coverage_constraints` (in the extension) reads `cov` over a
+# The B-spline family's own `_coverage_constraints!` (in the extension) reads `cov` over a
 # wider stencil — a spline of degree `p` lives on up to `p + 1` cells per axis. Both
 # consumers read it only on the *active* cells of that stencil, which are the seed of the
 # dilation above, and skip the inactive ones outright: a fictitious support cell can lie
@@ -292,7 +292,7 @@ end
 # coordinates, per axis. That puts every breakpoint of `inner`'s multilinear vertex
 # functions on an `outer` cell boundary, so each is multilinear on each `outer` cell —
 # the geometric half of the linear-dedup condition. The other half belongs to `outer`'s
-# basis, which must also carry the vertex function's kink; `_coverage_constraints`
+# basis, which must also carry the vertex function's kink; `_coverage_constraints!`
 # (`dofs.jl`) tests both before deduping. The B-spline family reuses the same geometric
 # half — nesting is what puts each of its interior knots on an `outer` cell boundary —
 # and pairs it with its own span-containment test.

@@ -1288,10 +1288,8 @@ end
     # with a nonzero Dirichlet value.
     @test Unfitted.has_linear_constraints(model.dofs)
     layout = Unfitted._field_layout(model.dofs, :u).dofs
-    @test any(eachindex(layout.raw_expansion)) do raw
-        expansion = layout.raw_expansion[raw]
+    @test any(layout.pivots) do expansion
         return !isempty(expansion) &&
-               expansion != [(raw, 1.0)] &&
                any(((other, _),) -> Unfitted.constrained_value(layout, other) != 0, expansion)
     end
 

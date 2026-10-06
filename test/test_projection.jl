@@ -303,6 +303,33 @@ end
     end
 end
 
+@testset "Rewire keeps the source's Dirichlet data on a dof the target frees" begin
+    # A dof the source constrains has no coefficient, and Rewire used to skip
+    # it, which left its target counterpart at zero. Dropping the top face's
+    # nonzero Dirichlet condition between source and target therefore lost the
+    # nine dofs that carried `g = 1 + x` there, and the field by up to 2.0. The
+    # counterpart must read the source's constrained value instead, and since
+    # the target's active basis is the source's plus those nine dofs, the
+    # transfer is then exact.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    V = space(omega; cells=4, order=2)
+    bottom = dirichlet(0.0; on=boundary(axis=2, side=:lower))
+    top = dirichlet(x -> 1 + x[1]; on=boundary(axis=2, side=:upper))
+    source_model = prepare(poisson(V; source=1.0, dirichlet=[bottom, top]))
+    source_solution = solve!(source_model)
+    target_model = prepare(poisson(V; source=1.0, dirichlet=[bottom]))
+    @test Unfitted.active_unknowns(target_model.dofs) ==
+          Unfitted.active_unknowns(source_model.dofs) + 9
+
+    pts = [(x, y) for x in 0.0:0.125:1.0, y in 0.0:0.125:1.0]
+    for strict in (true, false)
+        rewired = transfer(source_solution, source_model, target_model; via=Rewire(; strict=strict))
+        @test maximum(abs(value(rewired, target_model, p) - value(source_solution, source_model, p))
+                      for p in pts) == 0.0
+        @test value(rewired, target_model, (1.0, 1.0)) ≈ 2.0
+    end
+end
+
 @testset "Rewire backend with strict=false skips missing source dofs" begin
     # Lax mode exists for source dofs the target does not carry. The honest way
     # to produce those is a mask change on the SAME mesh: deactivating a cell

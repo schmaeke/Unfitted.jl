@@ -24,7 +24,7 @@
 #     internal active/inactive cell faces of the same level when a
 #     `LevelMask` is in play — except where the inactive side is fully
 #     fictitious, since a fold face carries no physical trace to
-#     vanish on (`_internal_face_is_physical`).
+#     vanish on (`_has_overlay_constraint`).
 #   * Covered-mode pruning — under leaf semantics, the high-order modes
 #     buried under a finer level, plus the buried linear modes a nested
 #     finer level reproduces exactly. Also a strong elimination, and also
@@ -36,35 +36,57 @@
 # matches the natural block ordering, and per-component constraints
 # simply leave holes in the enumeration.
 #
-# This file owns the dof keys, the layout structs, the structural
-# overlay-constraint detection, the pruning constraint source
-# (`_coverage_constraints`, over the masks `coverage.jl` computes), and
-# the active-enumeration constructor.
-# The physical-Dirichlet spec types, per-key Dirichlet detection, and
-# the L² boundary projection live in `dirichlet.jl`. `dof_layout`
-# forward-references `_has_physical_dirichlet` and
-# `_project_dirichlet_values!`; the references resolve at call time
-# (when `prepare(problem)` runs, after every source file is loaded).
-# Its `facets` keyword is left unannotated for the same reason: a
-# `FacetResolver{D,T}` annotation is evaluated where the method is
-# *defined*, which is before `dirichlet.jl` has introduced that type, so
-# the typing is done by `_project_dirichlet_values!` at the end of the
-# forward chain instead.
+# A layout has two halves. The *space block* — the raw dofs, each level's
+# cell → raw tables and raw range, every raw's artificial elimination
+# source and the linear-constraint pivots — is a function of the space
+# alone, so it is built once per distinct space and every field over that
+# space holds the same arrays. The *field block* — the per-component
+# physical-Dirichlet flags, the active numbering and the constrained
+# values — depends on one field's components and Dirichlet data. A layout
+# is built in four steps, each reading only what the steps before it
+# produced:
+#
+#   1. Topology (`_dof_topology`, here): raw enumeration, then the
+#      artificial eliminations, recorded level by level in an
+#      `EliminationLedger` through the basis family's hooks. Its product,
+#      a `_DofTopology`, is exactly the space block.
+#   2. Physical-Dirichlet detection (`_physical_dirichlet`, `dirichlet.jl`).
+#   3. Numbering (the `DofLayout(topology, physical_dirichlet)` constructor,
+#      here).
+#   4. Projection of nonzero Dirichlet data onto the boundary trace space
+#      (`_project_dirichlet_values!`, `dirichlet.jl`).
+#
+# `model.jl` composes the four, for one field (`dof_layout(V; …)`) and for
+# every field of a problem (`system_layout`, step 1 once per space), and
+# reads the projection's statistics into the diagnostics there.
+#
+# The file is in two parts. The first is family-agnostic: the dof keys and
+# the layout structs; the elimination ledger, the raising `_resolve_rows!`
+# default and the hooks' typed context; steps 1 and 3; the boundary-side
+# geometry shared with `dirichlet.jl`; the generic defaults of the
+# artificial-boundary and pruning hooks; and the accessors. The second,
+# from the "Integrated Legendre family" divider to the end, is that
+# family's side of the dof-layer interface: its key tags and keys, its
+# boundary association, its artificial-boundary predicate, the hp minimum
+# rule, its covered-mode pruning and dedup, and the `_spans_hats` trait.
+# The fallbacks of `_tensor_dof_key` and `_spans_hats` sit beside this
+# family's methods. The B-spline family implements the same hooks in
+# `ext/UnfittedBasicBSplineExt.jl`. The file calls nothing defined in a
+# later file.
 
-# ── Dof keys and layout struct ────────────────────────────────────────────────
+# ── Dof keys and layout structs ───────────────────────────────────────────────
 
 # Per-axis component of a `TensorDofKey`. Together with the axis index it
-# uniquely identifies one factor of a tensor-product basis function:
-#
-#   * `kind = _AXIS_NODE` ⇒ an endpoint-mode contribution. `index` is the
-#     1-based node coordinate index inside the level's `mesh.axes[axis]`
-#     vector; `mode` is `0` (the endpoint contribution is the same shape
-#     function regardless of which mode triggered it).
-#   * `kind = _AXIS_SPAN` ⇒ a bubble-mode contribution. `index` is the
-#     1-based cell index along the axis; `mode ≥ 2` selects which bubble.
+# uniquely identifies one factor of a tensor-product basis function. `kind` is a
+# tag the basis family owns, and the family reads `index` and `mode` by its own
+# convention: integrated Legendre tags an endpoint factor at a node coordinate
+# and a cell-local bubble factor (`_AXIS_NODE`, `_AXIS_SPAN`, defined with the
+# family's other hooks under the "Integrated Legendre family" divider), and the
+# B-spline extension one factor per univariate B-spline (`_AXIS_BSPLINE`).
 #
 # Stored as a flat `UInt8 + Int + Int` rather than a sum type so the key
-# is fully isbits and hashes cheaply for the cross-cell dof reuse cache.
+# is fully isbits and, hashed field by field (the `Base.hash` methods
+# below `TensorDofKey`), cheap to look up in the cross-cell dof reuse cache.
 struct AxisDofKey
     kind::UInt8
     index::Int
@@ -74,40 +96,23 @@ end
 # Tensor-product dof key: one `AxisDofKey` per axis plus the source
 # level's id. Two basis functions share a raw dof iff they have the same
 # `TensorDofKey` — i.e. they live on the same level and reduce to the
-# same per-axis (kind, index, mode) along every axis. The node/span
-# distinction handles the dof reuse correctly: adjacent cells share the
-# right-endpoint of cell `i` with the left-endpoint of cell `i + 1` (both
-# resolve to the same `_AXIS_NODE, index = i + 1` factor), while bubble
-# modes are cell-local (each cell's `_AXIS_SPAN` index is unique).
+# same per-axis (kind, index, mode) along every axis. That is how adjacent
+# cells share a function: a family's key names a factor by what it is, not by
+# the cell asking, so in integrated Legendre the right endpoint of cell `i` and
+# the left endpoint of cell `i + 1` are one `_AXIS_NODE` factor at node
+# `i + 1`, while each bubble stays cell-local.
 struct TensorDofKey{D}
     level::Int
     axes::NTuple{D,AxisDofKey}
 end
 
-"""
-    LinearConstraint{T}
-
-A homogeneous linear constraint among raw dofs of one level:
-
-    Σᵢ coefficientsᵢ · u_{rawsᵢ} = 0
-
-Applies uniformly to every field component (neither constraint source
-distinguishes components). Emitted by [`_overlay_constraints`](@ref) for
-the trace-vanishing conditions at artificial boundaries and by
-[`_coverage_constraints`](@ref) for pruning eliminations; the dof
-layer resolves the resulting constraint system into a `raw_expansion`
-table via cascade elimination in [`_resolve_constraints!`](@ref).
-
-A single-raw constraint (`length(raws) == 1`, coefficient `1`) is
-strong elimination of that raw — the regime integrated Legendre uses.
-Multi-raw constraints (typical for B-splines with arbitrary masks or
-higher continuity) couple `p + 1` raws per perpendicular line per
-derivative order.
-"""
-struct LinearConstraint{T<:Real}
-    raws::Vector{Int}
-    coefficients::Vector{T}
-end
+# The default `hash` of a struct goes through `objectid`, which the runtime
+# computes generically — field by field, for these padded structs — at ~90 ns
+# per `TensorDofKey{3}`; hashing the fields directly costs ~10 ns. The default
+# was 55 % of the raw enumeration's profile. Equality stays the default `===`,
+# which these methods agree with.
+Base.hash(k::AxisDofKey, h::UInt) = hash(k.mode, hash(k.index, hash(k.kind, h)))
+Base.hash(k::TensorDofKey, h::UInt) = hash(k.axes, hash(k.level, h))
 
 """
     DofLayout{D,T}
@@ -119,114 +124,885 @@ across every level and every active cell), then constraints are detected
 and the active enumeration assigns positive ids to the unconstrained
 dofs only.
 
-Fields:
+The fields fall into two blocks. The **space block** is a function of the
+space alone, never of the field's components or Dirichlet data. It is what
+the first step of the build, the dof topology, produced: the layout holds
+the topology's arrays themselves, not copies, and nothing mutates them
+once they are built. `system_layout` builds one topology per distinct
+space, so the layouts of all fields over one space hold the *same* arrays
+(`===`) — a write through one of them would change every other field over
+the space, which is why they are never written after the build, by the
+package or by a caller. The **field block** is the field's own, never
+shared: `physical_dirichlet`, `active_component` and `constrained_values`
+are separate arrays for every field, even two over one space. Build a
+layout with [`dof_layout`](@ref) for one field, or with `system_layout`
+for every field of a problem.
 
-  - `components::Int` — number of scalar channels the field carries
-    (1 for scalar fields, > 1 for vector fields). Constraints are
-    tracked per-component so vector boundary conditions can pin
-    individual channels.
+The space block:
+
   - `cell_dofs_by_level::Vector{Array{Vector{Int},D}}` — indexed by
     level *id*, not by position in `V.levels`, so that it matches the
     `parent.level` id assembly carries; a subdomain whose ids were
-    reindexed into a higher block leaves the leading slots undefined.
+    reindexed into a higher block leaves the leading slots undefined,
+    and [`cell_dofs`](@ref) refuses them with an `ArgumentError`.
     Each entry is a `D`-dimensional array of cell-local raw dof id
     vectors, indexed by the level's `CartesianIndex`. Inactive cells
     carry an empty vector.
   - `raw_keys::Vector{TensorDofKey{D}}` — `raw_keys[i]` is the
     `TensorDofKey` that produced raw dof `i`. The inverse of the
     construction dictionary.
-  - `active_component::Matrix{Int}` — `(raw, component) → active id`.
-    Entry is `0` when component `component` of raw dof `raw` is
-    constrained.
-  - `physical_dirichlet::Matrix{Bool}` — `(raw, component) → true` iff
-    component `component` of raw dof `raw` has a physical Dirichlet
-    constraint.
+  - `level_raws::Vector{UnitRange{Int}}` — indexed by level *id*, like
+    `cell_dofs_by_level`: the raws level `id` enumerated, as one
+    contiguous range, so `raw_keys[r].level == id` exactly for the `r` in
+    `level_raws[id]`. Contiguous by construction: a key carries its level
+    id, so walking one level's cells can only create or reuse that level's
+    keys. A dormant level (no active cell) has an empty range, and an id
+    the space does not hold reads `1:0`. Every per-level pass — the
+    constraint hooks, physical-Dirichlet detection, the per-level
+    diagnostics — reads its level's raws off this range instead of
+    scanning, bucketing or looking up the level of every raw.
   - `elimination_source::Vector{Symbol}` — `raw → :free / :overlay /
     :coverage / :dedup`. `:free` iff the raw survives; otherwise the source
     that eliminated it: the artificial overlay boundary (`:overlay`) or, from
     the pruning extension, a covered high-order mode (`:coverage`) or a
     deduped covered vertex (`:dedup`). Applies to every component
-    simultaneously; derived from `raw_expansion`. Serves as both the
-    elimination flag (`!== :free`) and its provenance, read by
-    [`constraint_kind`](@ref), the active enumeration, and diagnostics.
-  - `raw_expansion::Vector{Vector{Tuple{Int,T}}}` — for each raw, the
-    list of `(other_raw, weight)` pairs that express the raw's value
-    in terms of *non-pivot* raws after constraint resolution. Three
-    regimes:
-      - free raw → `[(raw, 1)]` (identity);
-      - strongly eliminated raw (single-raw constraint, the
-        integrated-Legendre case) → `[]`;
-      - linear-constraint pivot → multi-element list; B-spline overlay
-        boundaries with continuity order `m` produce `m + 1`-element
-        lists per perpendicular line.
-    Assembly keeps a pivot's own local row and column while it
-    integrates a region and condenses them onto the pivot's active
-    branches once per region (`K ← PᵀKP`, `b ← Pᵀb − lift`); the
-    strong-elimination case (empty list) is a constrained dof like any
-    other and the free case is the identity. See
-    [`_resolve_constraints!`](@ref) for the construction algorithm.
-  - `has_linear_constraints::Bool` — `true` iff any raw has a
-    *non-trivial* expansion (neither the identity `[(raw, 1)]` nor the
-    empty strong-elimination list `[]`), i.e. a linear-constraint pivot
-    that redistributes a raw onto one or more *other* raws. The
-    integrated Legendre family and the C⁰ B-spline mesh-edge path never
-    produce such expansions, so this is `false` for them; B-spline linear
-    constraints (a mask on a level whose `continuity` is below `p − 1`) set
-    it `true`. Assembly and `dof_value` consult it per field, so a
-    layout without pivots never looks at an expansion.
+    simultaneously. It is the `source` vector of the
+    [`EliminationLedger`](@ref) the layout's artificial eliminations were
+    recorded in, so a raw is credited to the source that actually removed
+    it. Serves as both the elimination flag (`!== :free`) and its
+    provenance, read by [`constraint_kind`](@ref), the active enumeration,
+    and diagnostics.
+  - `pivots::Vector{Vector{Tuple{Int,T}}}` — the linear-constraint pivots,
+    and nothing else. A pivot is a raw that constraint resolution expressed
+    through *other* raws, `u_raw = Σᵢ wᵢ u_{rᵢ}`, and `pivots[raw]` is that
+    expansion `[(r₁, w₁), …]` in resolution order. It has depth one: every
+    `rᵢ` is free with respect to the artificial constraints, so a reader
+    never chases a chain, and the topology build checks this once. Like
+    `elimination_source`, it comes from the ledger. The table is empty when
+    the layout has no pivot, which
+    is every integrated-Legendre and every maximal-continuity B-spline
+    layout: only the multi-raw trace constraints of a B-spline level below
+    maximal continuity (on a `LevelMask` face, for instance) produce one.
+    Otherwise it holds one entry per raw, and every raw that is not a pivot
+    — free or strongly eliminated alike, which `elimination_source` tells
+    apart — shares one empty vector; like the shared empty `cell_dofs`
+    vector, it must never be pushed into. Assembly keeps a pivot's own
+    local row and column while it integrates a region and condenses them
+    onto the pivot's active branches once per region (`K ← PᵀKP`,
+    `b ← Pᵀb − lift`); [`dof_value`](@ref) reconstructs a pivot from the
+    same expansion. Both read it through `_fold_pivot`, which returns at
+    once on an empty table, so a layout without pivots never reads an
+    entry. [`has_linear_constraints`](@ref) is `!isempty(pivots)`.
+  - `tolerance::GeometryTolerance{T}` — the tolerance the topology was
+    built at and boundary detection ran at. A `FacetResolver` the layout's
+    Dirichlet data are projected through must carry the same one.
+
+The field block:
+
+  - `components::Int` — number of scalar channels the field carries
+    (1 for scalar fields, > 1 for vector fields). Constraints are
+    tracked per-component so vector boundary conditions can pin
+    individual channels.
+  - `physical_dirichlet::Matrix{Bool}` — `(raw, component) → true` iff
+    component `component` of raw dof `raw` has a physical Dirichlet
+    constraint.
+  - `active_component::Matrix{Int}` — `(raw, component) → active id`.
+    Entry is `0` when component `component` of raw dof `raw` is
+    constrained, physically or artificially.
+  - `active_count::Int` — total number of active (i.e. enumerated) dofs.
   - `constrained_values::Matrix{T}` — `(raw, component) → value` for
     constrained dofs. Filled by [`_project_dirichlet_values!`](@ref)
-    for nonzero physical Dirichlet data; zero otherwise.
-  - `dirichlet_trace_factors::Vector{Symbol}` — per component, which branch the
-    L² Dirichlet trace solve took: `:cholesky`, `:pseudoinverse` where the
-    boundary mass came out indefinite, or `:none` where the component had no
-    constrained dof to solve for.
-  - `unsupported_dirichlet::Vector{Vector{Int}}` — per component, the raw dofs
-    that solve left undetermined: constrained with no measure anywhere on their
-    facet support, hence pinned to their minimum-norm value instead of fitted.
-    See [`UnsupportedDirichletDof`](@ref). Empty on every untrimmed boundary.
+    for nonzero physical Dirichlet data; zero otherwise. The one array of
+    a layout that is rewritten after it is built: [`update_dirichlet!`](@ref)
+    re-projects into it in place.
 
-    The last two are filled by the same call that fills `constrained_values` and
-    both describe the *mesh* rather than the datum, so a load increment restates
-    them unchanged. Both read `:none` / empty until a projection has run at all,
-    homogeneous data skipping it entirely.
-  - `active_count::Int` — total number of active (i.e. enumerated) dofs.
-  - `tolerance::GeometryTolerance{T}` — tolerance used during boundary
-    detection.
-
-Use [`dof_layout`](@ref) to construct.
+What the L² Dirichlet trace solve concluded — which branch each component's
+solve took, and which dofs it left undetermined — is not part of the
+layout. Both describe the projection rather than the numbering, so
+[`diagnostics`](@ref) reports them (`dirichlet_trace_factors`,
+`unsupported_dirichlet_dofs`) from the projection that produced them.
 """
 struct DofLayout{D,T<:Real}
-    components::Int
     cell_dofs_by_level::Vector{Array{Vector{Int},D}}
     raw_keys::Vector{TensorDofKey{D}}
-    active_component::Matrix{Int}
-    physical_dirichlet::Matrix{Bool}
+    level_raws::Vector{UnitRange{Int}}
     elimination_source::Vector{Symbol}
-    raw_expansion::Vector{Vector{Tuple{Int,T}}}
-    has_linear_constraints::Bool
-    constrained_values::Matrix{T}
-    dirichlet_trace_factors::Vector{Symbol}
-    unsupported_dirichlet::Vector{Vector{Int}}
+    pivots::Vector{Vector{Tuple{Int,T}}}
+    tolerance::GeometryTolerance{T}
+    components::Int
+    physical_dirichlet::Matrix{Bool}
+    active_component::Matrix{Int}
     active_count::Int
+    constrained_values::Matrix{T}
+end
+
+# The product of the first build step, `_dof_topology`: exactly the space block of
+# `DofLayout`, as one value. Physical-Dirichlet detection and numbering both read it
+# before any layout exists, which is why it is a type of its own rather than a
+# half-built layout. It is transient — nothing keeps it past the build that made
+# it, which shares it between the fields over its space — and the numbering
+# constructor `DofLayout(topology, physical_dirichlet)` is the one place its arrays
+# are handed on, so a field added to the space block cannot reach some layouts and
+# miss others.
+struct _DofTopology{D,T<:Real}
+    cell_dofs_by_level::Vector{Array{Vector{Int},D}}
+    raw_keys::Vector{TensorDofKey{D}}
+    level_raws::Vector{UnitRange{Int}}
+    elimination_source::Vector{Symbol}
+    pivots::Vector{Vector{Tuple{Int,T}}}
     tolerance::GeometryTolerance{T}
 end
+
+"""
+    FieldLayout{D,T}(name, components, dofs, offset, level_ids)
+
+One field's slot inside a multi-field [`SystemLayout`](@ref). `dofs` is
+the field's [`DofLayout`](@ref): its field block is the field's own, and its
+space block is shared with every other field over the same space (see
+[`DofLayout`](@ref)). `offset` is the field's starting column in the global
+active-dof vector (the active dofs of all earlier fields take ids 1 through
+`offset`, and this field's active dofs take ids `offset + 1` through
+`offset + active_unknowns(dofs)`).
+
+`level_ids` is the contiguous block of (globally reindexed) level ids the
+field's [`Space`](@ref) owns. Assembly uses it to route each integration
+region to the field that owns it: a region whose parents live on a level
+outside this range belongs to another subdomain and this field skips it
+(`region_parents`). For a single-domain problem every field's range covers
+every level, so every field evaluates on every region.
+"""
+struct FieldLayout{D,T<:Real}
+    name::Symbol
+    components::Int
+    dofs::DofLayout{D,T}
+    offset::Int
+    level_ids::UnitRange{Int}
+end
+
+"""
+    SystemLayout{D,T}(fields, by_name, active_unknowns, tolerance)
+
+Top-level layout for a problem with one or more fields. `fields` lists
+the per-field [`FieldLayout`](@ref)s in declaration order; `by_name`
+maps field names to their indices in `fields`; `active_unknowns` is the
+sum of every field's active count (the global system size); `tolerance`
+is shared across the fields.
+
+Most consumers go through [`active_cell_dofs`](@ref) and friends, which
+delegate to the per-field layout transparently. Single-field problems
+take the implicit-field shortcut where the field name does not need to
+be passed.
+"""
+struct SystemLayout{D,T<:Real}
+    fields::Vector{FieldLayout{D,T}}
+    by_name::Dict{Symbol,Int}
+    active_unknowns::Int
+    tolerance::GeometryTolerance{T}
+end
+
+# ── The elimination ledger ────────────────────────────────────────────────────
+
+"""
+    EliminationLedger{T}
+
+The record a basis family's dof-layer hooks write a space's artificial
+eliminations into: per raw dof, whether it is eliminated and by which source; the
+current level's pending linear-constraint rows; and the pivot table the resolved
+rows produce. The topology build (`_dof_topology`) makes one, sized to its
+space's raw count, runs every level's hooks into it, and keeps its `source` and
+`pivots` as the topology's, hence the layout's, `elimination_source` and
+`pivots`.
+
+Fields:
+
+  - `source::Vector{Symbol}` — per raw, `:free` until something eliminates it,
+    then the source credited with the elimination: `:overlay` (the artificial
+    overlay boundary), `:coverage` (a covered high-order mode) or `:dedup` (a
+    buried function a covering level reproduces).
+  - `rows::Vector{Tuple{Vector{Int},Vector{T},Symbol}}` — the current level's
+    homogeneous linear constraints `Σᵢ cᵢ u_{rᵢ} = 0`, as `(raws, coefficients,
+    source)` in emission order. Empty between levels.
+  - `pivots::Vector{Vector{Tuple{Int,T}}}` — empty until the first pivot, then one
+    entry per raw: a pivot's depth-one expansion, and one shared empty vector for
+    every other raw, which nothing pushes into. See [`DofLayout`](@ref).
+
+A family writes through three verbs and nothing else: `_eliminate!(ledger, raw,
+source)` for a dof-wise strong elimination, `_constrain!(ledger, raws,
+coefficients, source)` for a row, and, only from a `_resolve_rows!` method,
+`_pivot!(ledger, raw, expansion, source)` for each raw the rows eliminate.
+
+The order is the core's, and it is what makes the attribution exact:
+
+  - Levels are processed one at a time, in `V.levels` order: the level's
+    `_overlay_constraints!`, then, under leaf semantics, its
+    `_coverage_constraints!`, then the family's `_resolve_rows!` on whatever rows
+    the two recorded (the core stores rows but resolves none). A row names only
+    its own level's raws, so resolving level by level is the same as resolving
+    every row of the space in one pass.
+  - Within a level, the direct eliminations from both hooks are applied as they
+    arrive, and the first writer wins: a raw is credited to the first source that
+    eliminates it. The artificial boundary is recorded first, so a raw that both
+    it and pruning remove is credited to the boundary.
+  - The level's rows are resolved *after* both hooks, against everything
+    eliminated so far; an eliminated raw contributes no term to a row. A row that
+    collapses to `0 = 0` eliminates nothing, so it is credited with nothing.
+  - A family that needs an elimination ordered *among* its rows records it as the
+    one-term row `_constrain!(ledger, [raw], [one(T)], source)`. The resolution
+    then decides whether it eliminates anything, and which row is credited. The
+    dedup of a B-spline level below maximal continuity is that case: a buried
+    function there can also be a term of a trace row, and eliminating it directly
+    would change which raws the trace rows pivot.
+"""
+struct EliminationLedger{T<:Real}
+    source::Vector{Symbol}
+    rows::Vector{Tuple{Vector{Int},Vector{T},Symbol}}
+    pivots::Vector{Vector{Tuple{Int,T}}}
+end
+
+# A ledger over `nraw` raws with nothing eliminated, no row pending and no pivot.
+function EliminationLedger{T}(nraw::Integer) where {T}
+    return EliminationLedger{T}(fill(:free, nraw), Tuple{Vector{Int},Vector{T},Symbol}[],
+                                Vector{Tuple{Int,T}}[])
+end
+
+# A dof-wise strong elimination of `raw` by `source`. The first source to eliminate a
+# raw is the one it is credited to, which is what makes the artificial boundary,
+# recorded first, win over pruning on a raw both remove.
+function _eliminate!(ledger::EliminationLedger, raw::Integer, source::Symbol)
+    ledger.source[raw] === :free && (ledger.source[raw] = source)
+    return ledger
+end
+
+# One homogeneous linear constraint Σᵢ cᵢ u_{rawsᵢ} = 0 among the current level's raws,
+# credited to `source`. It is held until both of the level's hooks have run and is then
+# handed to `_resolve_rows!`. The vectors are stored, not copied.
+function _constrain!(ledger::EliminationLedger{T}, raws::Vector{Int}, coefficients::Vector{T},
+                     source::Symbol) where {T}
+    push!(ledger.rows, (raws, coefficients, source))
+    return ledger
+end
+
+# The resolver's one write: `raw` is eliminated by the row credited `source`, either
+# strongly (`expansion` empty) or as the depth-one pivot u_raw = Σᵢ wᵢ u_{rᵢ}.
+#
+# The pivot table is allocated on the first pivot, as one shared empty vector per raw,
+# so a space without pivots, which is every integrated-Legendre and every
+# maximal-continuity B-spline space, never allocates it. A raw already eliminated is
+# refused: a resolver that pivoted it again would silently overwrite its source and,
+# for a pivot, the expansion other readers already rely on.
+function _pivot!(ledger::EliminationLedger{T}, raw::Integer, expansion::Vector{Tuple{Int,T}},
+                 source::Symbol) where {T}
+    ledger.source[raw] === :free ||
+        throw(ArgumentError("raw $raw is already eliminated; a resolver records each raw it " *
+                            "eliminates exactly once"))
+    ledger.source[raw] = source
+    isempty(expansion) && return ledger
+    if isempty(ledger.pivots)
+        none = Tuple{Int,T}[]           # shared by every non-pivot raw; never pushed into
+        fill!(resize!(ledger.pivots, length(ledger.source)), none)
+    end
+    ledger.pivots[raw] = expansion
+    return ledger
+end
+
+"""
+    _resolve_rows!(ledger::EliminationLedger, level::Level) -> ledger
+
+Resolve the linear-constraint rows `level`'s hooks recorded with `_constrain!`.
+Called once per level, after `_overlay_constraints!` and `_coverage_constraints!`,
+and only if a row is pending. A method receives `ledger.rows` in emission order,
+every row naming only `level`'s raws; a raw with `ledger.source[raw] !== :free` is
+already eliminated and contributes no term. It must record every raw the rows
+eliminate exactly once, with `_pivot!` — an empty expansion for a strong
+elimination, else a depth-one expansion over raws that remain free — credited to
+the row that eliminated it. It must not otherwise write `ledger.source`, and it
+must not clear `ledger.rows`: the caller does.
+
+The core resolves nothing itself: a family that records rows implements this, and
+this default raises. The integer-continuity B-spline family in
+`ext/UnfittedBasicBSplineExt.jl` is the only one today; its method is the cascade
+Gauss elimination `_cascade!`, which lives there with it. The default is written
+over `Level{D,T}` with both parameters free, as a family method naturally is
+(`Level{D,T,<:F} where {D,T}`): over a bare `Level`, whose `T` is bounded by
+`Real`, such a method would be ambiguous with it rather than more specific.
+"""
+function _resolve_rows!(ledger::EliminationLedger, level::Level{D,T}) where {D,T}
+    throw(ArgumentError("the $(basis_name(level.basis)) family recorded $(length(ledger.rows)) " *
+                        "linear-constraint row(s) on level $(level.id) but implements no " *
+                        "`_resolve_rows!` method to resolve them"))
+end
+
+# Every pivot must be expressed over raws that stay free: `_fold_pivot`, `dof_value`
+# and assembly's condensation read ONE level of expansion and never chase a chain. A
+# family resolver that broke this would make assembly and reconstruction silently
+# disagree, so it is checked once per build: one pass over the pivot table, a read
+# per raw and one per pivot term, and nothing at all without pivots. No shipped
+# resolver breaks the rule, so no build reaches the raise; the guard is there for a
+# family resolver yet to be written, and test_constraints.jl pins its verdict on a
+# hand-built ledger.
+function _assert_resolved(ledger::EliminationLedger)
+    for expansion in ledger.pivots, (branch, _) in expansion
+        ledger.source[branch] === :free ||
+            throw(ArgumentError("pivot branch $branch is itself eliminated: `_resolve_rows!` " *
+                                "must leave every pivot expressed over free raws"))
+    end
+    return nothing
+end
+
+# Everything a dof-layer hook may read about the level it is called for: the space,
+# its physical domain and tolerance, the space's cell-classification cache, the
+# coverage masks (empty when the build does not prune), the raw keys and the key → raw
+# map the raw enumeration built (for a family that addresses functions by
+# `(cell, mode)`), and the level's own raws.
+#
+# `P` is the CONCRETE type of `V.physical`. `Space.physical` is abstractly typed, so a
+# hook that read it off the space dispatched dynamically on every per-raw predicate
+# call it fed it to. The struct is built from the run-time value of `V.physical`,
+# which gives it the concrete `P` wherever it is built, and the hook it is handed
+# to is the function barrier: the hooks, and every predicate they call, specialise
+# on `P` instead. Measured on the integrated-Legendre artificial-boundary pass over
+# an immersed disc at 128² p2 (29 281 raws): 304 bytes per raw and 1.26 ms with
+# `P = Any`, nothing and 0.24 ms typed.
+struct _LevelContext{D,T,S<:Space{D,T},P}
+    space::S
+    physical::P
+    tolerance::GeometryTolerance{T}
+    classify_cache::_ClassifyCache{D,T}
+    coverage::Coverage{D}
+    raw_keys::Vector{TensorDofKey{D}}
+    raw_by_key::Dict{TensorDofKey{D},Int}
+    raws::UnitRange{Int}
+end
+
+# ── Topology (step 1) and numbering (step 3) ──────────────────────────────────
+
+# Step 1 of a layout: the space block, built from the space alone. Raw enumeration
+# (`_enumerate_raws`), then every level's artificial eliminations recorded in one
+# `EliminationLedger`, level by level in `V.levels` order: the family's
+# `_overlay_constraints!`, then, under leaf semantics, its `_coverage_constraints!`
+# against the masks `build_coverage` computes (so those are built first, and not at
+# all when `prune = false`), then `_resolve_rows!` on whatever linear-constraint rows
+# the two recorded — and finally the depth-one check on the pivots the rows resolved
+# to. The ledger's per-raw sources and pivot table become the topology's. The core
+# owns this order and the pruning gate (`prune`, `prune_exempt`), so no family
+# re-implements either: a family that forgot the gate would prune the unreduced twin.
+#
+# Each hook call is the function barrier its per-raw loop runs behind. The level's
+# context is built from the run-time value of `V.physical`, so its `P` is concrete
+# (see `_LevelContext`) even though the field is not, and `V.levels` may mix basis
+# families; a hook therefore runs specialised on both, and what dispatches at run
+# time is at most the context's construction and the three calls per level.
+#
+# A topology reads neither a field's components nor its Dirichlet data, so one is
+# the same for every field over the space, and `_system_layout` builds it once per
+# space and shares it between them.
+function _dof_topology(V::Space{D,T}; tolerance::GeometryTolerance{T}=GeometryTolerance(T),
+                       prune::Bool=true, prune_exempt=(),
+                       classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
+    raw_by_key, raw_keys, cell_dofs_by_level, level_raws = _enumerate_raws(V)
+    coverage = prune ? build_coverage(V, tolerance, classify_cache) :
+               Coverage{D}(Dict{Int,BitArray{D}}())
+    ledger = EliminationLedger{T}(length(raw_keys))
+    for level in V.levels
+        ctx = _LevelContext(V, V.physical, tolerance, classify_cache, coverage, raw_keys,
+                            raw_by_key, level_raws[level.id])
+        _overlay_constraints!(ledger, level, ctx)
+        prune && !(level.id in prune_exempt) && _coverage_constraints!(ledger, level, ctx)
+        isempty(ledger.rows) && continue
+        _resolve_rows!(ledger, level)
+        empty!(ledger.rows)
+    end
+    _assert_resolved(ledger)
+    return _DofTopology{D,T}(cell_dofs_by_level, raw_keys, level_raws, ledger.source, ledger.pivots,
+                             tolerance)
+end
+
+# The raw enumeration, the first half of step 1 (`_dof_topology`): walk every
+# level's cells and assign raw dofs through the `TensorDofKey` cache (cross-cell
+# endpoint sharing happens here). Levels go in `V.levels` order, cells in
+# `cell_indices` order, local functions in `cell_basis_indices` order, and a
+# raw's id is the order of its key's first appearance. Returns the key → raw
+# map, `raw_keys`, the per-level cell tables and the per-level raw ranges.
+#
+# The ranges cost one `UnitRange` per level, and every per-level pass reads its
+# level's raws off one instead of scanning or bucketing every raw. They are exact
+# because a key carries its level id: walking level L can only create or reuse
+# L's keys, so L's raws are precisely the ids appended while L is walked, and
+# visiting them is visiting them in raw order.
+function _enumerate_raws(V::Space{D}) where {D}
+    raw_by_key = Dict{TensorDofKey{D},Int}()
+    raw_keys = TensorDofKey{D}[]
+    # Indexed by level *id*, not by position: for a single-domain space the two
+    # coincide (base = 1, overlays 2, 3, …), but a subdomain of a coupled model
+    # is reindexed into a disjoint id block by `_reindex_space_levels`, so this
+    # layout's ids run over that block and match the `parent.level` id the
+    # assembly workspace and `cell_dofs` key by (leading slots below the block
+    # stay `undef` and are never addressed by this field's parents).
+    nid = maximum(l -> l.id, V.levels)
+    cell_dofs_by_level = Vector{Array{Vector{Int},D}}(undef, nid)
+    level_raws = fill(1:0, nid)
+
+    # Every inactive cell of every level shares one empty vector. A ladder makes
+    # inactive cells the overwhelming majority of the grid — measured on a
+    # depth-5 2D stack over a 6² base with one base cell refined to the bottom,
+    # 49 140 cells of which 1 400 are active — and a fresh `Int[]` per inactive
+    # cell put one heap allocation on each of them, on every rebuild, and
+    # `estimate` rebuilds. On that layout it is 74 856 allocations against
+    # 27 117. It is per call rather than a module-level constant because a
+    # `const` empty vector is one stray `push!` away from corrupting every
+    # inactive cell of every layout ever built.
+    none = Int[]
+    for level in V.levels
+        first_raw = length(raw_keys) + 1
+        level_cells = Array{Vector{Int},D}(undef, level.mesh.cells)
+        for cell in cell_indices(level.mesh)
+            level_cells[cell] = is_active(level.mask, cell) ?
+                                _build_cell_dofs!(raw_by_key, raw_keys, level, cell) : none
+        end
+        cell_dofs_by_level[level.id] = level_cells
+        level_raws[level.id] = first_raw:length(raw_keys)
+    end
+    return raw_by_key, raw_keys, cell_dofs_by_level, level_raws
+end
+
+# Build the per-cell raw dof id vector for one cell. For every local
+# basis function on the cell, compute its `TensorDofKey` and either
+# reuse the raw id already registered for that key (the cross-cell dof
+# reuse path: adjacent cells of one level share every function their keys
+# name alike, such as an endpoint node, while a key carries its level id and
+# so is never shared across levels) or register a fresh id by appending the
+# key to `raw_keys`.
+function _build_cell_dofs!(raw_by_key::Dict{TensorDofKey{D},Int}, raw_keys::Vector{TensorDofKey{D}},
+                           level::Level{D}, cell::CartesianIndex{D}) where {D}
+    local_ids = cell_basis_indices(level, cell)
+    raw_ids = Vector{Int}(undef, length(local_ids))
+
+    for (a, local_id) in pairs(local_ids)
+        key = _tensor_dof_key(level, cell, local_id)
+        raw_ids[a] = get!(raw_by_key, key) do
+            push!(raw_keys, key)
+            length(raw_keys)
+        end
+    end
+
+    return raw_ids
+end
+
+# Step 3 of a layout: number one field over a topology, given its physical-Dirichlet
+# flags (step 2, `_physical_dirichlet`). Active ids run component-major — component
+# 1 of every raw, then component 2, … — skipping every (raw, component) a physical
+# Dirichlet condition constrains or an artificial elimination removed, so an
+# all-or-nothing constraint leaves the natural block ordering and a per-component
+# one leaves holes. The constrained values start at zero, which is already the
+# answer for homogeneous data; nonzero data are projected into them afterwards
+# (step 4, `_project_dirichlet_values!`).
+#
+# The topology's arrays are handed on, not copied: the space block is never mutated
+# once built, and this is the one place a layout receives it.
+function DofLayout(t::_DofTopology{D,T}, physical_dirichlet::Matrix{Bool}) where {D,T}
+    nraw, ncomp = size(physical_dirichlet)
+    active_component = zeros(Int, nraw, ncomp)
+    active_count = 0
+    for c in 1:ncomp, raw in 1:nraw
+        (physical_dirichlet[raw, c] || t.elimination_source[raw] !== :free) && continue
+        active_component[raw, c] = (active_count += 1)
+    end
+    return DofLayout{D,T}(t.cell_dofs_by_level, t.raw_keys, t.level_raws, t.elimination_source,
+                          t.pivots, t.tolerance, ncomp, physical_dirichlet, active_component,
+                          active_count, zeros(T, nraw, ncomp))
+end
+
+# ── Geometric helpers shared with `dirichlet.jl` ──────────────────────────────
+
+# Tolerance-aware coordinate equality used throughout boundary
+# detection. Pulled out so the `<= tol.contain` convention is in one
+# place; consumed both by the overlay-constraint detection below and by
+# the physical-Dirichlet detection in `dirichlet.jl`.
+_coordinate_matches(a::Real, b::Real, tol::GeometryTolerance) = abs(a - b) <= tol.contain
+
+# True iff the level's mesh-domain boundary on the given axis-side
+# coincides with the physical-domain boundary up to `tol.contain`. Used
+# by `_has_overlay_constraint` to decide whether a mesh-boundary face is
+# a physical face (no overlay constraint) or an artificial overlay face
+# (homogeneous Dirichlet constraint).
+function _level_side_is_physical(level::Level{D,T}, domain::AxisBox{D,T}, axis::Integer,
+                                 side::Symbol, tol::GeometryTolerance{T}) where {D,T}
+    side === :lower &&
+        return _coordinate_matches(level.mesh.domain.lower[axis], domain.lower[axis], tol)
+    side === :upper &&
+        return _coordinate_matches(level.mesh.domain.upper[axis], domain.upper[axis], tol)
+    throw(ArgumentError("boundary side must be :lower or :upper"))
+end
+
+# ── The artificial-boundary and pruning hooks ─────────────────────────────────
+
+"""
+    _overlay_constraints!(ledger::EliminationLedger, level::Level, ctx::_LevelContext) -> ledger
+
+Record `level`'s artificial-overlay-boundary condition in `ledger`. Dispatched on
+the level's basis family, so each family can exploit its own boundary mode
+structure. Called once per level, before `_coverage_constraints!` (see
+[`EliminationLedger`](@ref) for the order). A method names only raws in
+`ctx.raws`, reads only `ctx` (see `_LevelContext`), and records through
+`_eliminate!` and `_constrain!`. Every method ties `{D,T}` across `Level{D,T}` and
+`_LevelContext{D,T}`, as this default does, so that no two methods are ambiguous.
+
+This default walks the level's raws, asks the family's per-raw
+`_has_overlay_constraint` predicate about each, and strongly eliminates every raw
+it accepts with `_eliminate!(ledger, raw, :overlay)`: the regime the integrated
+Legendre family relies on. The predicate consults `ctx.classify_cache`, the
+space's cell-classification cache, only to tell a fully-fictitious fold face from
+a user-mask face; the cache is untouched when the space has no physical domain.
+
+The B-spline family in the extension overrides this default. At `continuity =
+:maximal` its method is a support selection, which again eliminates strongly. At
+an integer continuity `m` it records multi-raw rows instead: the `Cᵐ`
+trace-vanishing condition along every artificial perpendicular line, `m + 1` rows
+per line per face, factored through the tensor-product structure of the basis and
+looking raw ids up by `(cell, mode)` in `ctx.raw_by_key`. That family therefore
+never reaches this default or the per-raw `_has_overlay_constraint`.
+"""
+function _overlay_constraints!(ledger::EliminationLedger, level::Level{D,T},
+                               ctx::_LevelContext{D,T}) where {D,T}
+    for raw in ctx.raws
+        _has_overlay_constraint(ctx.raw_keys[raw], level, ctx) && _eliminate!(ledger, raw, :overlay)
+    end
+    return ledger
+end
+
+# Generic fallback: no covered-mode pruning for a family that has not opted in.
+function _coverage_constraints!(ledger::EliminationLedger, ::Level{D,T},
+                                ::_LevelContext{D,T}) where {D,T}
+    ledger
+end
+
+# ── DofLayout accessors ───────────────────────────────────────────────────────
+
+"""
+    raw_dof_count(layout::DofLayout) -> Int
+
+Total number of *raw* dof slots (including constrained), counted as
+`length(raw_keys) * components`.
+"""
+raw_dof_count(layout::DofLayout) = length(layout.raw_keys) * layout.components
+
+"""
+    active_unknowns(layout::DofLayout) -> Int
+
+Number of *active* (post-constraint) dofs — the size of the global
+system the solver sees.
+"""
+active_unknowns(layout::DofLayout) = layout.active_count
+
+"""
+    cell_dofs(layout, level::Integer, cell::CartesianIndex) -> Vector{Int}
+
+Pre-constraint raw dof ids for the cell at `cell` on the level with id `level`,
+in the canonical local-basis order. Inactive cells return an empty vector.
+`layout` is a [`DofLayout`](@ref), or the `SystemLayout` of a single-field
+problem.
+
+`level` is a level *id*. For a single-domain space that is the level's position
+in `V.levels`, but each subdomain of a coupled problem has its ids reindexed
+into a block of its own, and its layout holds no cells for an id outside that
+block. Such an id, or one no level carries, raises an `ArgumentError`.
+
+The vector is the layout's own and must not be mutated: every inactive cell of
+every level shares one empty vector, so a `push!` into a returned empty result
+would reach all of them. Copy before editing.
+"""
+function cell_dofs(layout::DofLayout{D}, level::Integer, cell::CartesianIndex{D}) where {D}
+    # One `isassigned` covers both an id past the end of the table and a slot
+    # below a reindexed subdomain block, which would otherwise surface as an
+    # `UndefRefError` from inside the table. It replaces the range check rather
+    # than adding to it, so assembly's `_frame!`, which calls this once per
+    # (region, parent, field), pays one test as before, and the read after it is
+    # in bounds.
+    tables = layout.cell_dofs_by_level
+    isassigned(tables, level) ||
+        throw(ArgumentError("level id $level is not a level of this layout's space"))
+    return @inbounds(tables[level])[cell]
+end
+
+"""
+    active_cell_dofs(layout::DofLayout, level::Integer, cell::CartesianIndex, component=1) -> Vector{Int}
+    active_cell_dofs(layout::SystemLayout, level::Integer, cell::CartesianIndex, component=1) -> Vector{Int}
+    active_cell_dofs(layout::SystemLayout, field::Symbol, level::Integer, cell::CartesianIndex,
+                     component=1) -> Vector{Int}
+
+Active ids for component `component` of the cell-local raw dofs, with `0`
+standing for any dof that was eliminated by a constraint. The order matches the
+canonical local-basis ordering (same length as `cell_dofs(layout, level, cell)`),
+and `level` is a level id, as there.
+
+On a `DofLayout` the ids are the field's own, in `1:active_unknowns(layout)`. On
+a [`SystemLayout`](@ref) they are global: shifted by the field's `offset` into
+the system's active-dof vector, so they index a [`Solution`](@ref)'s
+coefficients directly. The second form reads the only field of a single-field
+problem; the third names the field.
+"""
+function active_cell_dofs(layout::DofLayout{D}, level::Integer, cell::CartesianIndex{D},
+                          component::Integer=1) where {D}
+    return [layout.active_component[raw, component] for raw in cell_dofs(layout, level, cell)]
+end
+
+"""
+    constraint_kind(layout, raw, component=1) -> Symbol
+
+Classify component `component` of a single raw dof. `layout` is a
+[`DofLayout`](@ref), or the `SystemLayout` of a single-field problem. Returns
+one of:
+
+  - `:free`       — no constraint, the dof is enumerated.
+  - `:dirichlet`  — physical Dirichlet only.
+  - `:overlay`    — artificial overlay-boundary elimination only.
+  - `:coverage`   — pruning elimination (covered high-order mode).
+  - `:dedup`      — linear-dedup elimination (covered vertex reproduced by
+                    a nested finer level).
+  - `:mixed`      — physical Dirichlet plus an elimination. The
+                    elimination wins: the dof is eliminated, and its
+                    [`constrained_value`](@ref) is zero, the homogeneous
+                    artificial constraint's, whatever the Dirichlet data.
+                    The Dirichlet projection solves only for the physical
+                    dofs no artificial elimination removed, so it never
+                    writes a value here.
+"""
+function constraint_kind(layout::DofLayout, raw::Integer, component::Integer=1)
+    physical = layout.physical_dirichlet[raw, component]
+    source = layout.elimination_source[raw]
+    physical && source != :free && return :mixed
+    physical && return :dirichlet
+    return source
+end
+
+"""
+    constrained_value(layout, raw, component=1) -> T
+
+Stored value of a constrained (raw, component). Zero for every artificial
+elimination (overlay boundary, pruning, and a `:mixed` dof, see
+[`constraint_kind`](@ref)) and for homogeneous Dirichlet conditions; the
+projected value for nonzero Dirichlet data. `layout` is a
+[`DofLayout`](@ref), or the `SystemLayout` of a single-field problem.
+"""
+function constrained_value(layout::DofLayout, raw::Integer, component::Integer=1)
+    layout.constrained_values[raw, component]
+end
+
+"""
+    has_linear_constraints(layout::DofLayout) -> Bool
+
+Whether the layout carries a linear-constraint pivot: a raw that constraint
+resolution expressed through other raws (see [`DofLayout`](@ref)'s `pivots`),
+which assembly condenses and [`dof_value`](@ref) reconstructs. `false` for every
+integrated-Legendre and every maximal-continuity B-spline layout, whose
+eliminations are all strong; assembly reads it per field and skips the pivot
+search when it is `false`.
+"""
+has_linear_constraints(d::DofLayout) = !isempty(d.pivots)
+
+# ── SystemLayout accessors (multi-field problems) ─────────────────────────────
+
+"""
+    active_unknowns(layout::SystemLayout) -> Int
+
+Total number of active dofs across every field — the size of the global
+system the solver sees.
+"""
+active_unknowns(layout::SystemLayout) = layout.active_unknowns
+
+"""
+    raw_dof_count(layout::SystemLayout) -> Int
+
+Total number of raw dof slots across every field (sum of
+`raw_dof_count(field.dofs)`).
+"""
+raw_dof_count(layout::SystemLayout) = sum(raw_dof_count(field.dofs) for field in layout.fields)
+
+# True iff any field's dof layout carries a linear-constraint pivot (a raw
+# redistributed onto other raws; see [`DofLayout`](@ref)'s `pivots`). Assembly
+# itself asks per field; this system-wide form serves tests and diagnostics.
+function has_linear_constraints(layout::SystemLayout)
+    any(field -> has_linear_constraints(field.dofs), layout.fields)
+end
+
+# Resolve the unique field of a single-field layout. Used by the
+# single-field system forms below, so a single-field problem need not
+# name its field.
+function _only_field_layout(layout::SystemLayout)
+    length(layout.fields) == 1 ||
+        throw(ArgumentError("field argument is required for multi-field layouts"))
+    return only(layout.fields)
+end
+
+# The system forms of the per-dof accessors, one method per verb, documented
+# with the `DofLayout` forms above. Without a field name they read the only
+# field of a single-field problem, so its callers need not name it; the
+# active-id form also takes a name, for a multi-field problem. Each per-component
+# form takes the same `component` as the `DofLayout` form it forwards to, and the
+# active ids come back global, shifted by the field's offset — the numbering a
+# `Solution`'s coefficients use.
+function cell_dofs(layout::SystemLayout, level::Integer, cell::CartesianIndex)
+    cell_dofs(_only_field_layout(layout).dofs, level, cell)
+end
+
+function active_cell_dofs(layout::SystemLayout, level::Integer, cell::CartesianIndex,
+                          component::Integer=1)
+    active_cell_dofs(layout, _only_field_layout(layout).name, level, cell, component)
+end
+
+function active_cell_dofs(layout::SystemLayout, name::Symbol, level::Integer, cell::CartesianIndex,
+                          component::Integer=1)
+    field = _field_layout(layout, name)
+    return [_field_component_dof(field, raw, component)
+            for raw in cell_dofs(field.dofs, level, cell)]
+end
+
+function constraint_kind(layout::SystemLayout, raw::Integer, component::Integer=1)
+    constraint_kind(_only_field_layout(layout).dofs, raw, component)
+end
+
+function constrained_value(layout::SystemLayout, raw::Integer, component::Integer=1)
+    constrained_value(_only_field_layout(layout).dofs, raw, component)
+end
+
+# Look up the per-field layout by name. Throws on unknown name.
+_field_layout(system::SystemLayout, name::Symbol) = system.fields[_field_index(system, name)]
+
+# Resolve a field name to its index inside a `SystemLayout`, raising on an
+# unknown name. How the assembly kernel's blocks and loads, an interface's region
+# build and a `FormState` read find a field in the layout's field-major data.
+function _field_index(system::SystemLayout, name::Symbol)
+    index = get(system.by_name, name, 0)
+    index == 0 && throw(ArgumentError("unknown field $name"))
+    return index
+end
+
+# Global active dof id for component `component` of raw `raw` in this
+# field, or 0 if the (raw, component) is constrained. Per-field active
+# ids are shifted by the field's `offset` so they live in disjoint
+# blocks of the global active enumeration. Read once per slot by
+# assembly's `_frame!` and per branch by `_slots!`, so it stays one table
+# read and one add.
+function _field_component_dof(layout::FieldLayout, raw::Integer, component::Integer)
+    active = layout.dofs.active_component[raw, component]
+    return active == 0 ? 0 : layout.offset + active
+end
+
+# ── Dof values and the pivot rule ─────────────────────────────────────────────
+
+"""
+    dof_value(layout::FieldLayout, coefficients, raw, component=1) -> T
+
+Recover the value of component `component` of raw dof `raw` in this field — the
+unified accessor every reconstruction path uses when a basis-function
+contribution needs the actual dof value regardless of constraint status.
+`coefficients` is the system's global active vector, a [`Solution`](@ref)'s
+coefficients, and the field's `offset` is resolved here.
+
+An active dof reads `coefficients[offset + active]`. A constrained one reads its
+[`constrained_value`](@ref) — zero for an artificial-boundary or pruning
+elimination, the projected datum for a nonzero Dirichlet condition — and, if it is
+a **linear-constraint pivot**, adds the pivot's expansion from the field's
+`pivots` table (see [`DofLayout`](@ref)):
+
+    u_raw = constrained_value(raw) + Σᵢ wᵢ · u_{rᵢ} .
+
+That pivot term is not an embellishment. A pivot is precisely the mechanism a
+basis family uses to impose C^m continuity or an arbitrary-mask trace condition,
+so reading `constrained_value` for it — which is zero — silently drops the dof's
+whole contribution from `value`, `field_gradient`, `l2_error`, `write_vtk` and
+`L2Projection`'s source reconstruction, while the *solve* is correct because
+assembly condenses every pivot through the same expansion. Measured on a
+6×6 degree-3 C¹ B-spline base under an L-masked 4×4 C¹ overlay (8 non-trivial
+expansions of 126 raws), the dropped term reached 4.79e-7 against a field of
+magnitude 7e-2 — silent, and small enough to pass a hand-written tolerance.
+
+One level of expansion is enough, because `_resolve_rows!` leaves every pivot
+expressed over raws the artificial constraints leave free, and the topology build
+checks it once (`_assert_resolved`). Such a branch may still be constrained on
+`component` by a physical Dirichlet condition, which is resolved later; it then
+contributes its constrained value rather than a coefficient.
+
+A layout without pivots — every integrated-Legendre layout — stops at the test
+for an empty table and never reads a pivot entry.
+
+The expansion is read through `_fold_pivot`, the one statement of the pivot rule
+that assembly reads as well, so a pivot cannot be reconstructed one way and
+assembled another.
+"""
+function dof_value(layout::FieldLayout, coefficients, raw::Integer, component::Integer=1)
+    global_dof = _field_component_dof(layout, raw, component)
+    global_dof == 0 || return coefficients[global_dof]
+    value, _ = _fold_pivot(_branch_value(coefficients),
+                           constrained_value(layout.dofs, raw, component), layout.dofs,
+                           (other, c) -> _field_component_dof(layout, other, c), raw, component)
+    return value
+end
+
+# The pivot rule, stated once. A linear-constraint pivot is
+#
+#     u(raw, c) = Σₖ wₖ · u(oₖ, c)
+#
+# over constraint-free raws `oₖ`: `_resolve_rows!` leaves every pivot expressed
+# at depth one, and `_assert_resolved` checks it once per build. Two readers
+# share this fold — `dof_value`, which reconstructs a pivot from it, and
+# `_slots!` in assembly, which detects a region's pivots, widens its active set
+# to their branches and records those branches for `_condense!` to fold the
+# pivot's local row and column onto. When reconstruction and emission each
+# carried their own encoding they could disagree, and a field was then solved
+# correctly but reconstructed wrong; one definition rules that out.
+#
+# `f(acc, g, w, v)` is folded over the branches in expansion order, where
+# `g = id(oₖ, c)` is the branch's active id (0 when it is constrained) and `v` its
+# constrained value when `g == 0`, zero otherwise. `id` maps `(raw, component)` to
+# the active id in whichever numbering the caller needs; both readers pass a
+# field's global one, `_field_component_dof`. Returns
+# `(acc, true)` for a pivot. A non-pivot returns `(acc, false)` without calling
+# `f`, and needs no test of its own: the `pivots` table holds pivots only, so a
+# free raw, a strongly eliminated one and a constraint-free raw a Dirichlet
+# condition eliminated on `c` all read an empty entry — or an empty table, when
+# the layout has no pivot at all.
+@inline function _fold_pivot(f::F, acc, d::DofLayout, id::I, raw::Integer, c::Integer) where {F,I}
+    isempty(d.pivots) && return acc, false
+    expansion = d.pivots[raw]
+    isempty(expansion) && return acc, false
+    for (other, w) in expansion
+        g = id(other, c)
+        acc = f(acc, g, w, g == 0 ? constrained_value(d, other, c) : zero(w))
+    end
+    return acc, true
+end
+
+# The `_fold_pivot` step of `dof_value`: add a branch's weighted value, read from
+# the coefficients when the branch is active and from its stored constrained
+# value otherwise — `value += wₖ · u(oₖ, c)`, in expansion order.
+_branch_value(coefficients) = (acc, g, w, v) -> acc + w * (g == 0 ? v : coefficients[g])
+
+# ── Integrated Legendre family ────────────────────────────────────────────────
 
 # Tag values for `AxisDofKey.kind`. `UInt8` keeps the key compact and
 # fast to hash; the values themselves are arbitrary.
 #
-#   _AXIS_NODE   — integrated Legendre endpoint mode at a cell-corner
-#                  node coordinate.
-#   _AXIS_SPAN   — integrated Legendre interior (bubble) mode, cell-local.
-#   _AXIS_BSPLINE — global 1D B-spline function index along the axis;
-#                  used by the B-spline family in
-#                  `ext/UnfittedBasicBSplineExt.jl`. Reserved here so
-#                  the integrated-Legendre keys and B-spline keys live
-#                  in disjoint tag ranges and the dof-key cache can
-#                  share its hash table across mixed-basis problems.
+#   _AXIS_NODE   — an endpoint-mode factor at a cell-corner node coordinate.
+#                  `index` is the 1-based node coordinate index inside the
+#                  level's `mesh.axes[axis]`; `mode` is `0`, the endpoint
+#                  contribution being the same shape function whichever of
+#                  the two endpoint modes produced it.
+#   _AXIS_SPAN   — an interior (bubble) factor, cell-local. `index` is the
+#                  1-based cell index along the axis; `mode ≥ 2` selects
+#                  which bubble.
+#
+# A tag need only be unique within one basis family, so each family owns
+# its tags: the B-spline extension defines its `_AXIS_BSPLINE` next to its
+# own key construction. Keys of two families can never be confused even
+# where their tags coincide. A key carries its level id and one level has
+# one family, so two keys of different families differ in their level and
+# the dof-key cache of a mixed-family space never takes one for the other;
+# and `_assert_keys_comparable` (`projection.jl`) refuses to match keys
+# across a change of family between two models. The shipped values happen
+# to be distinct (the extension's is `0x02`); nothing relies on it.
 const _AXIS_NODE = UInt8(0)
 const _AXIS_SPAN = UInt8(1)
-const _AXIS_BSPLINE = UInt8(2)
 
 # Build the per-axis dof key for cell `cell_axis` and 1D mode `mode` in
 # the integrated Legendre basis. Modes 0 and 1 are the two endpoint
@@ -257,46 +1033,16 @@ function _tensor_dof_key(level::Level{D,T,B}, cell::CartesianIndex{D},
     throw(ArgumentError("dof layout is not implemented for basis family $(basis_name(level.basis))"))
 end
 
-# Build the per-cell raw dof id vector for one cell. For every local
-# basis function on the cell, compute its `TensorDofKey` and either
-# reuse the raw id already registered for that key (the cross-cell dof
-# reuse path: adjacent cells share endpoint nodes, identical levels
-# share interior modes) or register a fresh id by appending the key to
-# `raw_keys`.
-function _build_cell_dofs!(raw_by_key::Dict{TensorDofKey{D},Int}, raw_keys::Vector{TensorDofKey{D}},
-                           level::Level{D}, cell::CartesianIndex{D}) where {D}
-    local_ids = cell_basis_indices(level, cell)
-    raw_ids = Vector{Int}(undef, length(local_ids))
-
-    for (a, local_id) in pairs(local_ids)
-        key = _tensor_dof_key(level, cell, local_id)
-        raw_ids[a] = get!(raw_by_key, key) do
-            push!(raw_keys, key)
-            length(raw_keys)
-        end
-    end
-
-    return raw_ids
-end
-
-# ── Geometric helpers shared with `dirichlet.jl` ──────────────────────────────
-
-# Tolerance-aware coordinate equality used throughout boundary
-# detection. Pulled out so the `<= tol.contain` convention is in one
-# place; consumed both by the overlay-constraint detection below and by
-# the physical-Dirichlet detection in `dirichlet.jl`.
-_coordinate_matches(a::Real, b::Real, tol::GeometryTolerance) = abs(a - b) <= tol.contain
-
-# ── Artificial overlay-boundary detection ─────────────────────────────────────
-
 # True iff the per-axis factor of `key` along `axis` anchors at the
 # level's lower (`side = :lower`) or upper (`side = :upper`) mesh edge.
 # Dispatched on the level's basis family so each family's "boundary
-# mode" convention is local to its own implementation. Used by
-# `_key_on_physical_side` and `_has_overlay_constraint` to translate
-# "is this dof at a face" into a basis-family-specific predicate without
-# leaking the family's mode-index conventions into the rest of the dof
-# layer.
+# mode" convention is local to its own implementation. Used by the
+# physical-Dirichlet detection (`_mark_physical_dirichlet!` in `dirichlet.jl`) to
+# translate "is this dof at a face" into a basis-family-specific predicate
+# without leaking the family's mode-index conventions into the rest of the
+# dof layer. The integrated-Legendre `_has_overlay_constraint` below does
+# not route through it: it already walks the key's node factors and reads
+# the mesh-edge indices (`1` and `cells[axis] + 1`) off them directly.
 #
 # Integrated Legendre: only `_AXIS_NODE` keys touch a mesh edge —
 # `_AXIS_NODE.index == 1` (lower) or `cells[axis] + 1` (upper). Bubbles
@@ -311,18 +1057,84 @@ function _key_on_level_side(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedL
     throw(ArgumentError("boundary side must be :lower or :upper"))
 end
 
-# True iff the level's mesh-domain boundary on the given axis-side
-# coincides with the physical-domain boundary up to `tol.contain`. Used
-# by `_has_overlay_constraint` to decide whether a mesh-boundary face is
-# a physical face (no overlay constraint) or an artificial overlay face
-# (homogeneous Dirichlet constraint).
-function _level_side_is_physical(level::Level{D,T}, domain::AxisBox{D,T}, axis::Integer,
-                                 side::Symbol, tol::GeometryTolerance{T}) where {D,T}
-    side === :lower &&
-        return _coordinate_matches(level.mesh.domain.lower[axis], domain.lower[axis], tol)
-    side === :upper &&
-        return _coordinate_matches(level.mesh.domain.upper[axis], domain.upper[axis], tol)
-    throw(ArgumentError("boundary side must be :lower or :upper"))
+# ── Artificial overlay-boundary detection ─────────────────────────────────────
+
+# True iff `key` sits on the artificial boundary of the level's *active
+# region* and therefore carries a homogeneous overlay constraint. The
+# active region is the union of active cells; its boundary includes
+#
+#   * the mesh-box face on every axis where the level's mesh boundary
+#     does not coincide with the physical-domain boundary (i.e. the
+#     artificial overlay boundary `Γ_o^(k) = ∂Ω^(k) \ ∂Ω`);
+#   * internal faces between active and inactive cells of the *same*
+#     level (the `LevelMask` boundary inside the level).
+#
+# With `mask === nothing` the active region equals the level's mesh
+# box, only mesh-box faces matter, and this reduces to the original
+# overlay-boundary rule from the paper.
+#
+# One walk per node axis decides it. Only an `_AXIS_NODE` factor sits on a
+# face: at node index `i` it is the face between cells `i − 1` and `i` along
+# `axis`, and the key's incidence on the other axes (`_perp_ranges`) gives
+# the perpendicular positions the face spans under the key's support. Every
+# position where activity changes across the face is a face of the active
+# region, and
+#
+#   * on a mesh-box face (`i == 1` or `i == n[axis] + 1`) the first such
+#     position settles the axis: the face constrains unless the level side
+#     lies on the physical boundary (`_level_side_is_physical`), and the rest
+#     of the face cannot say otherwise;
+#   * on an internal face, a position constrains when the inactive cell
+#     across it is not `_is_fictitious`.
+#
+# The second case is the fold exemption. The fictitious fold deactivates
+# fully-fictitious cells, so a fold face sees no material on its inactive
+# side, and its boundary modes stay active. They vanish on every physical
+# face — so they cannot break the C⁰ trace condition the overlay constraint
+# enforces — and instead carry the adjacent cut cell's approximation up to
+# ∂Ω. A cell the *user* masked out still holds material: the modes on its
+# face are non-zero on a physical face and must be eliminated to keep the
+# truncated solution continuous. With no physical domain there is no
+# fictitious material, so every internal active/inactive face constrains
+# (the original overlay/user-mask behaviour) and `ctx.classify_cache` is
+# never touched. The walk stops at the first constraining position, so a
+# fold face classifies its inactive neighbours only until one of them holds
+# material.
+#
+# This runs once per raw on every layout build, and two measured choices keep
+# it cheap: `@inline`, without which the call stays out of
+# `_overlay_constraints!`'s per-raw loop (1.1–1.8× the pass time across the
+# overlay, ladder and immersed spaces it was measured on), and the side test at
+# the first transition rather than ahead of the walk, so an internal face
+# without one pays for nothing but the walk (ahead of it: 1.2× on 2D overlays
+# and ladders).
+#
+# Integrated-Legendre-specific, because the incidence rule is. The B-spline
+# family in `ext/UnfittedBasicBSplineExt.jl` does the same job in its own
+# `_overlay_constraints!`, with a support map that spans several cells and
+# the same fold exemption (`_active_cell_at_face`).
+@inline function _has_overlay_constraint(key::TensorDofKey{D},
+                                         level::Level{D,T,<:IntegratedLegendre},
+                                         ctx::_LevelContext{D,T}) where {D,T}
+    n = level.mesh.cells
+    for axis in 1:D
+        axis_key = key.axes[axis]
+        axis_key.kind == _AXIS_NODE || continue
+        i = axis_key.index
+        for outer in CartesianIndices(_perp_ranges(key, axis, n))
+            below_active = _cell_active(level, axis, i - 1, outer.I, n)
+            below_active == _cell_active(level, axis, i, outer.I, n) && continue
+            if i == 1 || i == n[axis] + 1
+                side = i == 1 ? :lower : :upper
+                _level_side_is_physical(level, ctx.space.domain, axis, side, ctx.tolerance) && break
+                return true
+            end
+            across = below_active ? i : i - 1          # the inactive cell's axis position
+            inactive = CartesianIndex(ntuple(d -> d == axis ? across : outer[d], D))
+            _is_fictitious(level, inactive, ctx.physical, ctx.classify_cache) || return true
+        end
+    end
+    return false
 end
 
 # Cells of `level` along `axis` incident to the axis-`axis` factor of a dof key,
@@ -341,6 +1153,12 @@ function _axis_incidence(axis_key::AxisDofKey, ncells::Int)
     return max(1, axis_key.index-1):min(ncells, axis_key.index)
 end
 
+# Cells of `level` incident to the entity of `key`, from the per-axis incidence
+# rule of `_axis_incidence` applied on every axis.
+function _incident_cells(key::TensorDofKey{D}, n::NTuple{D,Int}) where {D}
+    return CartesianIndices(ntuple(d -> _axis_incidence(key.axes[d], n[d]), D))
+end
+
 # Incidence ranges of `key` on every axis *except* `axis`, which is pinned to
 # `1:1` so a `CartesianIndices` over the result enumerates the perpendicular
 # positions of a candidate face along `axis` exactly once. The `axis` slot of
@@ -352,8 +1170,10 @@ end
 
 # True iff the cell whose axis-`axis` index is `pos` (with the other-axis
 # indices drawn from `outer`, ignoring the axis-`axis` slot) is in bounds
-# and active under the level's `LevelMask`. Used by `_on_active_face` to
-# probe both sides of a candidate face for active/inactive transitions.
+# and active under the level's `LevelMask`. Used by `_has_overlay_constraint`
+# to probe both sides of a candidate face for an active/inactive transition.
+# A position off the mesh reads as inactive, so a mesh-box face is a
+# transition wherever the cell just inside it is active.
 function _cell_active(level::Level{D}, axis::Integer, pos::Integer, outer::NTuple{D,Int},
                       n::NTuple{D,Int}) where {D}
     1 <= pos <= n[axis] || return false
@@ -361,174 +1181,7 @@ function _cell_active(level::Level{D}, axis::Integer, pos::Integer, outer::NTupl
     return is_active(level.mask, CartesianIndex(cell_tuple))
 end
 
-# True iff the `_AXIS_NODE` factor of `key` at axis `axis`, node index
-# `i`, lies on a face that separates an active cell from an
-# off-mesh-or-inactive cell on the other side. The perpendicular positions
-# come from the key's own incidence (`_perp_ranges`); for each of them,
-# sample the activity of the cells immediately below (`i − 1`) and above
-# (`i`) the candidate face along `axis`. A change in activity ⇒ the face is
-# between an active and an inactive cell of the level, i.e. an
-# active-region face.
-#
-# Integrated-Legendre-specific, because the incidence rule is. The B-spline
-# family in the extension rolls its own active-face check tied to the
-# function's actual support span, which can spread across many cells.
-function _on_active_face(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
-                         axis::Integer, i::Integer, n::NTuple{D,Int}) where {D,T}
-    for outer in CartesianIndices(_perp_ranges(key, axis, n))
-        below_active = _cell_active(level, axis, i - 1, outer.I, n)
-        above_active = _cell_active(level, axis, i, outer.I, n)
-        below_active != above_active && return true
-    end
-    return false
-end
-
-# True iff `key` sits on the artificial boundary of the level's *active
-# region* and therefore carries a homogeneous overlay constraint. The
-# active region is the union of active cells; its boundary includes
-#
-#   * the mesh-box face on every axis where the level's mesh boundary
-#     does not coincide with the physical-domain boundary (i.e. the
-#     artificial overlay boundary `Γ_o^(k) = ∂Ω^(k) \ ∂Ω`);
-#   * internal faces between active and inactive cells of the *same*
-#     level (the `LevelMask` boundary inside the level).
-#
-# With `mask === nothing` the active region equals the level's mesh
-# box, only mesh-box faces matter, and this reduces to the original
-# overlay-boundary rule from the paper.
-#
-# Dispatched on the level's basis family. The integrated-Legendre body
-# below uses the family's node/span index conventions directly; the
-# B-spline overload in `ext/UnfittedBasicBSplineExt.jl` does the same
-# job with B-spline function-index conventions and the C⁰-knot
-# treatment of mask-induced internal junctions.
-function _has_overlay_constraint(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
-                                 physical, domain::AxisBox{D,T}, tol::GeometryTolerance{T},
-                                 cache::_ClassifyCache{D,T}) where {D,T}
-    n = level.mesh.cells
-    for axis in 1:D
-        axis_key = key.axes[axis]
-        axis_key.kind == _AXIS_NODE || continue
-        i = axis_key.index
-
-        # Only nodes that actually sit on an active-region face matter.
-        _on_active_face(key, level, axis, i, n) || continue
-
-        # Three cases for an active-region face along this axis:
-        #   i == 1            — mesh's lower-axis face. Physical iff the
-        #                       level's lower bound coincides with the
-        #                       physical domain's lower bound; otherwise
-        #                       artificial.
-        #   i == n[axis] + 1  — mesh's upper-axis face, symmetric.
-        #   otherwise         — internal face between active and inactive
-        #                       cells of the same level. Artificial only when it
-        #                       carries physical material: a fully-fictitious
-        #                       fold face leaves the mode active (see
-        #                       `_internal_face_is_physical`).
-        if i == 1
-            _level_side_is_physical(level, domain, axis, :lower, tol) || return true
-        elseif i == n[axis] + 1
-            _level_side_is_physical(level, domain, axis, :upper, tol) || return true
-        else
-            _internal_face_is_physical(key, level, physical, axis, i, n, cache) && return true
-        end
-    end
-    return false
-end
-
-# True iff the internal active/inactive face along `axis` at node index `i`
-# carries physical material — i.e. at least one inactive cell across the face
-# is not fully fictitious. Mirrors `_on_active_face`'s perpendicular incidence
-# so it visits exactly the cells the face separates, and classifies only the
-# inactive neighbour on each such face.
-#
-# The fictitious fold deactivates fully-fictitious cells, so a fold face sees
-# only fictitious material on its inactive side and returns `false`: its
-# boundary modes stay active. They vanish on every physical face — so they
-# cannot break the C⁰ trace condition the overlay constraint enforces — and
-# instead carry the adjacent cut cell's approximation up to ∂Ω. A user mask
-# that excludes *physical* cells returns `true`: those modes are non-zero on a
-# physical face and must be eliminated to keep the truncated solution
-# continuous. With no physical domain there is no fictitious material, so every
-# internal active/inactive face is physical (the original overlay/user-mask
-# behaviour) and the `cache` is never touched.
-function _internal_face_is_physical(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
-                                    physical, axis::Integer, i::Integer, n::NTuple{D,Int},
-                                    cache::_ClassifyCache{D,T}) where {D,T}
-    physical === nothing && return true
-    for outer in CartesianIndices(_perp_ranges(key, axis, n))
-        below_active = _cell_active(level, axis, i - 1, outer.I, n)
-        above_active = _cell_active(level, axis, i, outer.I, n)
-        below_active == above_active && continue
-        inactive_pos = below_active ? i : i - 1
-        cell = CartesianIndex(ntuple(d -> d == axis ? inactive_pos : outer[d], D))
-        classify_cell(physical, cell_box(level.mesh, cell), cache) === :fictitious || return true
-    end
-    return false
-end
-
-# ── Linear-constraint collection and resolution ──────────────────────────────
-
-"""
-    _overlay_constraints(level, V, tol, raw_by_key, level_keys, classify_cache)
-        -> Vector{LinearConstraint{T}}
-
-Produce the homogeneous linear constraints that encode `level`'s
-artificial-overlay-boundary trace condition. Dispatched on the level's
-basis family so each family can exploit its own boundary mode structure.
-A new family must implement all six arguments, in this order — the hook
-is called positionally from [`dof_layout`](@ref) stage 2.
-
-The default fallback walks `level_keys` (the `(key, raw)` pairs that
-belong to this level, pre-bucketed by [`dof_layout`](@ref) so the scan
-is `O(this level's raws)` rather than `O(all raws)` per level), asks the
-family's `_has_overlay_constraint` predicate per raw, and emits a
-*single-raw* constraint `1 · u_raw = 0` for every boundary raw. This is
-strong elimination of the boundary node — the regime the integrated
-Legendre family relies on.
-
-The B-spline family overrides this fallback (dispatching on
-`Level{…,<:BSplineFamily}`) to produce *multi-raw* constraints expressing
-the C^m trace-vanishing condition along every artificial perpendicular
-line, exploiting the tensor-product structure of the B-spline basis to
-factor `m + 1` constraints per perpendicular line at each artificial
-face. The B-spline family therefore never uses this fallback or the
-per-raw `_has_overlay_constraint`; it reaches through `raw_by_key`
-directly to look up raw ids by (cell, mode), and ignores `level_keys`.
-
-`raw_by_key` is the global `TensorDofKey` → raw-id map built in stage 1
-of [`dof_layout`](@ref). `classify_cache` is the space's
-cell-classification cache, threaded through for whatever the family
-needs it for; the fallback hands it to `_has_overlay_constraint`, which
-consults it only to tell a fully-fictitious fold face from a user-mask
-face. It is empty, and untouched, when `V.physical === nothing`.
-"""
-function _overlay_constraints(level::Level{D,T,B}, V::Space{D,T}, tol::GeometryTolerance{T},
-                              raw_by_key::AbstractDict{TensorDofKey{D},Int},
-                              level_keys::AbstractVector{Pair{TensorDofKey{D},Int}},
-                              classify_cache::_ClassifyCache{D,T}) where {D,T,B}
-    constraints = LinearConstraint{T}[]
-    # `classify_cache` is the space's fold cache: the internal-face predicate
-    # below re-classifies inactive neighbours to tell a fully-fictitious fold
-    # face (mode stays active) from a physical user-mask face (mode eliminated),
-    # and every fold-boundary cell box is already in the cache. Empty and unused
-    # when `V.physical === nothing`.
-    for (key, raw) in level_keys
-        _has_overlay_constraint(key, level, V.physical, V.domain, tol, classify_cache) || continue
-        push!(constraints, LinearConstraint{T}([raw], [one(T)]))
-    end
-    return constraints
-end
-
-# ── Pruning (coverage) constraint source ─────────────────────────────
-
-# Cells of `level` incident to the entity of `key`, from the per-axis incidence
-# rule of `_axis_incidence` applied on every axis.
-function _incident_cells(key::TensorDofKey{D}, n::NTuple{D,Int}) where {D}
-    return CartesianIndices(ntuple(d -> _axis_incidence(key.axes[d], n[d]), D))
-end
-
-# ── The minimum rule: per-cell order across a shared entity ──────────────────
+# ── The minimum rule: per-cell order across a shared entity ───────────────────
 #
 # A cell at order 5 beside a cell at order 2 generates dof keys the neighbour
 # does not. Interior bubble keys are cell-local (`_AXIS_SPAN` on every axis) and
@@ -570,7 +1223,7 @@ end
 #   * Inactive incident cells are **skipped, not minimised over**. An inactive
 #     cell generates nothing, so it cannot disagree; letting it lower the entity
 #     would delete dofs nothing replaces. That is not hypothetical: under a
-#     fictitious fold `_internal_face_is_physical` deliberately keeps the modes
+#     fictitious fold `_has_overlay_constraint` deliberately keeps the modes
 #     on a fold face free, precisely so the adjacent cut cell's approximation
 #     reaches ∂Ω.
 #
@@ -600,23 +1253,10 @@ end
 # two endpoint modes. `_build_cell_orders` in `mesh.jl` validates every palette
 # entry through `local_basis_indices` for that reason.
 
-# Whether the shared entity of `key` carries the mode `id`: every *active* cell
-# incident to it generates `id` from its own order. The generating cell is itself
-# incident, and `id` came from its own index set, so the loop is never empty and
-# the unconstrained case needs no separate answer.
-function _entity_carries(basis::BasisFamily, orders::CellOrders{D}, mask, key::TensorDofKey{D},
-                         n::NTuple{D,Int}, mode::Symbol, id::CartesianIndex{D}) where {D}
-    for ci in _incident_cells(key, n)
-        is_active(mask, ci) || continue
-        _index_admissible(basis, orders.palette[orders.class[ci]], mode, id) || return false
-    end
-    return true
-end
-
 # Integrated Legendre's method of the `_cell_modes` hook whose generic form is in
 # `mesh.jl`. It lives here, with `_entity_carries` and the `TensorDofKey` factors
 # the minimum rule is expressed over, the same way the B-spline family's
-# `_coverage_constraints` lives in its extension.
+# `_coverage_constraints!` lives in its extension.
 #
 # The per-order index sets are hoisted out of the cell loop: there are only
 # `length(palette)` distinct answers and `local_basis_indices` allocates a fresh
@@ -652,31 +1292,28 @@ function _cell_modes(basis::IntegratedLegendre, orders::CellOrders{D}, mesh::Car
     return CellModes{D}(sets, kind)
 end
 
-# Whether a family's span on a mesh contains that mesh's C⁰ multilinear vertex
-# functions — the hats. This is the basis half of the linear dedup in
-# `_coverage_constraints`; `_nested_over` (`coverage.jl`) is the geometric half, and a
-# cover must pass both before a buried hat of the level below is eliminated.
-#
-# Integrated Legendre qualifies in either mode at any per-cell order ≥ 1: it is exactly
-# C⁰ across a cell boundary, and the two endpoint modes it collapses into one node
-# factor have trunk degree 0, so Q1 is in every cell's index set. The default is `false`,
-# which is the safe direction — skipping a legitimate dedup leaves a duplicate, while
-# deduping against a span that does not contain the hat deletes part of the space.
-#
-# It is a family trait rather than a type test on the cover because smoothness is a
-# property of the family's own construction: a maximal-regularity B-spline is C^(p−1) at
-# a simple interior knot, so it carries the kink at degree 1 and at no higher degree —
-# the extension answers exactly that, and a `k.basis isa IntegratedLegendre` gate cannot.
-_spans_hats(::BasisFamily) = false
-_spans_hats(::IntegratedLegendre) = true
+# Whether the shared entity of `key` carries the mode `id`: every *active* cell
+# incident to it generates `id` from its own order. The generating cell is itself
+# incident, and `id` came from its own index set, so the loop is never empty and
+# the unconstrained case needs no separate answer.
+function _entity_carries(basis::BasisFamily, orders::CellOrders{D}, mask, key::TensorDofKey{D},
+                         n::NTuple{D,Int}, mode::Symbol, id::CartesianIndex{D}) where {D}
+    for ci in _incident_cells(key, n)
+        is_active(mask, ci) || continue
+        _index_admissible(basis, orders.palette[orders.class[ci]], mode, id) || return false
+    end
+    return true
+end
+
+# ── Pruning (coverage) constraint source ──────────────────────────────────────
 
 """
-    _coverage_constraints(level, V, coverage, tol, level_keys, classify_cache)
-        -> Vector{Tuple{LinearConstraint{T},Symbol}}
+    _coverage_constraints!(ledger::EliminationLedger, level::Level, ctx::_LevelContext) -> ledger
 
-Pruning constraint source, a peer of [`_overlay_constraints`](@ref). Under the
-leaf semantics (`dof_layout`'s `prune`, on by default), emit a single-raw
-strong elimination for
+Pruning constraint source, the peer of [`_overlay_constraints!`](@ref) and bound by
+the same contract. Called only under leaf semantics (`dof_layout`'s `prune`, on by
+default) and only on a level outside `prune_exempt`, after the level's
+`_overlay_constraints!`. This integrated-Legendre method strongly eliminates
 
   * every **buried high-order** mode (at least one bubble axis, every active incident
     cell covered by and every fictitious one reached by a single finer level) —
@@ -685,29 +1322,28 @@ strong elimination for
     mesh's hats reproduces exactly — dedup, source `:dedup`.
 
 The linear skeleton is otherwise retained, which is what makes the reduced space
-complete. Each returned pair carries its elimination source for `constraint_kind` /
-diagnostics.
+complete. Each elimination is credited with its source for `constraint_kind` /
+diagnostics, unless the artificial boundary already eliminated the raw: the first
+writer wins (see [`EliminationLedger`](@ref)), so a buried raw on `Γ_o` stays
+credited to `:overlay`.
 
 Both halves ask `_reproduced_on_domain` (`coverage.jl`), which applies the
 fictitious-fold rule on the covering level *and* on this one — a support cell folded
 away carries nothing to reproduce, so it neither has to be covered nor may veto the
-verdict. `classify_cache` is threaded through for the classification that tells a fold
-from a user mask, the same one [`build_coverage`](@ref) used.
+verdict. `ctx.classify_cache` is the classification that tells a fold from a user
+mask, the same one [`build_coverage`](@ref) used.
 
 The dedup half is not an optimisation: a mode a covering level reproduces exactly is
 linearly dependent on that level's own modes, so leaving both active makes the
 superposed operator exactly singular. The B-spline extension overrides this hook for
-the same reason, and emits nothing but dedups — that family has no bubble modes to
-shed. Every other family takes the generic fallback below and reduces nothing.
+the same reason, and records nothing but dedups — that family has no bubble modes to
+shed. Every other family takes the generic fallback above and records nothing.
 """
-function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{D,T},
-                               coverage::Coverage{D}, tol::GeometryTolerance{T},
-                               level_keys::AbstractVector{Pair{TensorDofKey{D},Int}},
-                               classify_cache::_ClassifyCache{D,T}) where {D,T}
-    out = Tuple{LinearConstraint{T},Symbol}[]
-    cov = coverage.covered[level.id]
-    any(cov) || return out
-    n = level.mesh.cells
+function _coverage_constraints!(ledger::EliminationLedger, level::Level{D,T,<:IntegratedLegendre},
+                                ctx::_LevelContext{D,T}) where {D,T}
+    cov = ctx.coverage.covered[level.id]
+    any(cov) || return ledger
+    V, tol, n = ctx.space, ctx.tolerance, level.mesh.cells
     # A buried vertex function is a C⁰ hat: multilinear on each of `level`'s cells,
     # kinked across every cell boundary. Mesh nesting (`_nested_over`) only buys the
     # multilinear half; the kink is the cover basis's half, and `_spans_hats` is where
@@ -717,7 +1353,8 @@ function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{
     nested_above = [k
                     for k in V.levels
                     if k.id > level.id && _spans_hats(k.basis) && _nested_over(level, k, tol)]
-    reproduces(k, cells) = _reproduced_on_domain(level, k, cells, V.physical, tol, classify_cache)
+    reproduces(k, cells) = _reproduced_on_domain(level, k, cells, ctx.physical, tol,
+                                                 ctx.classify_cache)
     # Covered-mode pruning asks the same *single-level* question the dedup half asks.
     # `cov[ci]` says only that *some* higher level contains cell `ci`, and a mode
     # whose incident cells are covered by two different levels is reproduced by
@@ -744,746 +1381,33 @@ function _coverage_constraints(level::Level{D,T,<:IntegratedLegendre}, V::Space{
     # the set `_coverage_cells` computed and the only set on which a `false` entry is a
     # verdict rather than a default. An inactive incident cell is settled by
     # `reproduces`: fictitious and it is skipped, user-masked and it refuses.
-    for (key, raw) in level_keys
+    for raw in ctx.raws
+        key = ctx.raw_keys[raw]
         cells = _incident_cells(key, n)
         all(ci -> !is_active(level.mask, ci) || cov[ci], cells) || continue     # buried?
         if any(a -> a.kind == _AXIS_SPAN, key.axes)                 # high-order → covered-mode pruning
-            resolves(cells) && push!(out, (LinearConstraint{T}([raw], [one(T)]), :coverage))
+            resolves(cells) && _eliminate!(ledger, raw, :coverage)
         elseif any(k -> reproduces(k, cells), nested_above)          # linear reproduced above
-            push!(out, (LinearConstraint{T}([raw], [one(T)]), :dedup))
+            _eliminate!(ledger, raw, :dedup)
         end
     end
-    return out
+    return ledger
 end
 
-# Generic fallback: no covered-mode pruning for a family that has not opted in.
-function _coverage_constraints(::Level{D,T,B}, ::Space{D,T}, ::Coverage{D}, ::GeometryTolerance{T},
-                               ::AbstractVector{Pair{TensorDofKey{D},Int}},
-                               ::_ClassifyCache{D,T}) where {D,T,B}
-    return Tuple{LinearConstraint{T},Symbol}[]
-end
-
-# Combine repeated raws in a list of `(raw, coefficient)` pairs by
-# summing the coefficients, dropping terms whose coefficient falls
-# below the working tolerance. Pure-data helper consumed by the
-# cascade resolver below; sorts in place for compactness.
+# Whether a family's span on a mesh contains that mesh's C⁰ multilinear vertex
+# functions — the hats. This is the basis half of the linear dedup in
+# `_coverage_constraints!`; `_nested_over` (`coverage.jl`) is the geometric half, and a
+# cover must pass both before a buried hat of the level below is eliminated.
 #
-# A one-term list is not a special case, and must not be short-circuited past the
-# drop test. A multi-raw constraint re-emitted after its raws were pivoted away can
-# leave exactly one surviving term whose coefficient is zero — `0·u = 0`, which
-# constrains nothing — and returning that unfiltered makes the resolver pivot on it
-# and eliminate `u` outright.
-function _combine_terms(terms::Vector{Tuple{Int,T}}) where {T}
-    isempty(terms) && return terms
-    sort!(terms; by=first)
-    write = 1
-    @inbounds for read in 2:length(terms)
-        if terms[read][1] == terms[write][1]
-            terms[write] = (terms[write][1], terms[write][2] + terms[read][2])
-        else
-            write += 1
-            terms[write] = terms[read]
-        end
-    end
-    resize!(terms, write)
-    drop_tol = sqrt(eps(T)) * maximum(t -> abs(t[2]), terms; init=one(T))
-    filter!(t -> abs(t[2]) > drop_tol, terms)
-    return terms
-end
-
-# Back-substitute a freshly created pivot's expansion into every other
-# pivot's expansion that mentions the new pivot raw. Necessary because
-# our greedy pivot ordering doesn't guarantee that a constraint's pivot
-# choice is downstream of all its references — when a later constraint
-# pivots a raw that an earlier pivot's expansion still mentions, the
-# earlier expansion needs the substitution to stay in "free raws only"
-# form.
+# Integrated Legendre qualifies in either mode at any per-cell order ≥ 1: it is exactly
+# C⁰ across a cell boundary, and the two endpoint modes it collapses into one node
+# factor have trunk degree 0, so Q1 is in every cell's index set. The default is `false`,
+# which is the safe direction — skipping a legitimate dedup leaves a duplicate, while
+# deduping against a span that does not contain the hat deletes part of the space.
 #
-# `mentions` maps a raw to the pivots whose expansion currently contains it,
-# so this visits only the expansions that can possibly need rewriting. It
-# used to scan all `nraw` expansions per constraint, which made the pass
-# `O(K · nraw)` — quadratic in the problem — while the comment here claimed
-# `O(K · D · p)`, "negligible at problem scale". It was not negligible: on a
-# covered stack the dof layout reached 98.7% of `prepare` and 2.8× the cost
-# of `assemble!`, growing ×12.7 and ×14.8 per ×4 in unknowns. The scan's
-# answer was almost always "nothing to do", because every integrated
-# Legendre elimination is a single-raw strong constraint whose pivot
-# expansion is empty and which therefore mentions no raw at all.
-#
-# The index is allowed to over-report: an expansion rewritten by an earlier
-# substitution may no longer contain the raw that registered it, so the
-# membership test below stays. It must never under-report, which is why an
-# entry is added at *every* site that writes an expansion — here and in
-# `_resolve_constraints!` step 4. The identity expansions set up before the
-# loop need no entry: a raw is skipped until it is pivoted, and pivoting
-# overwrites its expansion.
-function _back_substitute!(raw_expansion::Vector{Vector{Tuple{Int,T}}}, pivot_raw::Int,
-                           pivot_expansion::Vector{Tuple{Int,T}}, pivoted::AbstractVector{Bool},
-                           mentions::Dict{Int,Vector{Int}}) where {T}
-    holders = get(mentions, pivot_raw, nothing)
-    holders === nothing && return raw_expansion
-    @inbounds for raw in holders
-        raw == pivot_raw && continue
-        pivoted[raw] || continue
-        expansion = raw_expansion[raw]
-        # The index over-reports; this is the exact test.
-        any(t -> first(t) == pivot_raw, expansion) || continue
-        # Rebuild with substitution.
-        new_terms = Tuple{Int,T}[]
-        sizehint!(new_terms, length(expansion) + length(pivot_expansion))
-        for (other, w) in expansion
-            if other == pivot_raw
-                for (sub_other, sub_w) in pivot_expansion
-                    push!(new_terms, (sub_other, w * sub_w))
-                end
-            else
-                push!(new_terms, (other, w))
-            end
-        end
-        combined = _combine_terms(new_terms)
-        raw_expansion[raw] = combined
-        # This expansion now mentions the pivot's own references. `pivot_raw`
-        # cannot be among them — `pivot_expansion` was built excluding it — so
-        # the list being iterated is never the one appended to.
-        _register_mentions!(mentions, raw, combined)
-    end
-    return raw_expansion
-end
-
-# Record that `raw`'s expansion contains each of `terms`' raws.
-function _register_mentions!(mentions::Dict{Int,Vector{Int}}, raw::Int,
-                             terms::Vector{Tuple{Int,T}}) where {T}
-    for (other, _) in terms
-        push!(get!(() -> Int[], mentions, other), raw)
-    end
-    return mentions
-end
-
-"""
-    _resolve_constraints!(raw_expansion, constraints, nraw) -> raw_expansion
-
-Resolve a list of homogeneous linear constraints into the per-raw
-expansion table `raw_expansion`, mutated in place.
-
-After resolution every entry is either
-
-  - `[(raw, 1)]` — the raw is *free*, identity expansion,
-  - `[]` — the raw is *strongly eliminated* (single-raw constraint),
-  - `[(rᵢ, wᵢ), …]` — the raw is a *linear-constraint pivot*, expressed
-    in terms of currently-free raws via `u_raw = Σᵢ wᵢ u_rᵢ`.
-
-The algorithm is the classical sparse Gauss elimination, adapted to
-exploit the small constraint matrix's structure:
-
-  1. For each constraint, substitute already-resolved pivot expressions
-     into the constraint's terms (so the constraint is in free-raws +
-     yet-to-resolve raws).
-  2. Combine like terms and drop near-zeros; skip the constraint
-     entirely if it collapses to `0 = 0`.
-  3. Pick a pivot by largest absolute coefficient (numerical stability).
-  4. Express the pivot as a linear combination of the remaining
-     coefficients' raws.
-  5. Back-substitute the pivot into every earlier pivot's expansion
-     that mentions the new pivot raw.
-
-Step 5 keeps the invariant: at any point after a constraint has been
-processed, *every pivot's expansion is in terms of currently-free raws
-only*. Assembly emission then never needs to chase chains.
-
-The cascade depth of overlay-boundary constraints is bounded by the
-spatial dimension `D` — a corner raw of the active region touches at
-most `D` boundary axes — so total resolution cost is `O(K · D · p)`
-where `K` is the constraint count and `p` is the per-constraint raw
-count.
-"""
-function _resolve_constraints!(raw_expansion::Vector{Vector{Tuple{Int,T}}},
-                               constraints::Vector{LinearConstraint{T}}, nraw::Int) where {T}
-    # Identity start: every raw is its own expansion.
-    for raw in 1:nraw
-        raw_expansion[raw] = [(raw, one(T))]
-    end
-    pivoted = falses(nraw)
-    # raw -> the pivots whose expansion mentions it. Empty for every
-    # single-raw strong elimination, which is all of them for integrated
-    # Legendre, so this costs nothing on the common path.
-    mentions = Dict{Int,Vector{Int}}()
-
-    for constraint in constraints
-        # 1) Substitute already-pivoted raws.
-        terms = Tuple{Int,T}[]
-        sizehint!(terms, length(constraint.raws))
-        for (raw, coeff) in zip(constraint.raws, constraint.coefficients)
-            for (other, w) in raw_expansion[raw]
-                push!(terms, (other, coeff * w))
-            end
-        end
-
-        # 2) Combine like terms; trivially satisfied constraints fall away.
-        combined = _combine_terms(terms)
-        isempty(combined) && continue
-
-        # 3) Pick pivot by largest |coefficient| (numerical stability).
-        _, pivot_pos = findmax(t -> abs(t[2]), combined)
-        pivot_raw, pivot_coeff = combined[pivot_pos]
-
-        # 4) Build the pivot expansion (in terms of remaining raws).
-        new_expansion = Tuple{Int,T}[(raw, -c / pivot_coeff)
-                                     for (k, (raw, c)) in pairs(combined) if k != pivot_pos]
-
-        raw_expansion[pivot_raw] = new_expansion
-        pivoted[pivot_raw] = true
-        _register_mentions!(mentions, pivot_raw, new_expansion)
-
-        # 5) Back-substitute into earlier pivots that mention this raw.
-        _back_substitute!(raw_expansion, pivot_raw, new_expansion, pivoted, mentions)
-    end
-    return raw_expansion
-end
-
-# ── DofLayout construction and accessors ──────────────────────────────────────
-
-# Active global id of component `component` of raw dof `raw`, or 0 if
-# the (raw, component) is constrained.
-function _active_component_dof(layout::DofLayout, raw::Integer, component::Integer)
-    layout.active_component[raw, component]
-end
-
-"""
-    dof_layout(V::Space; dirichlet=[], tolerance=GeometryTolerance(T), components=1,
-                         prune=true, classify_cache=_ClassifyCache{D,T}(),
-                         facets=nothing) -> DofLayout
-
-Construct the basis-aware global dof layout for a superposition
-[`Space`](@ref). The construction proceeds in four stages:
-
-  1. Walk every level's cells in order and build the cell-local raw dof
-     id vector through `TensorDofKey` lookup. Adjacent cells share
-     endpoint nodes; bubble (span) modes are cell-local. Inactive cells
-     get an empty vector.
-  2. Collect homogeneous linear constraints from every level, from two
-     sources: the family-dispatched [`_overlay_constraints`](@ref) hook
-     on every level, and [`_coverage_constraints`](@ref) on every level
-     under leaf semantics (which needs the per-level masks
-     [`build_coverage`](@ref) computes, so those are built first, and
-     skipped entirely when `prune = false`). A raw the overlay condition already eliminates
-     is not re-constrained by covered-mode pruning, so `elimination_source`
-     credits it to the source that actually removed it. Resolve the
-     collected constraints into the per-raw expansion table via
-     [`_resolve_constraints!`](@ref). The resulting `raw_expansion[raw]`
-     is either the identity `[(raw, 1)]` for free raws, the empty list
-     `[]` for strongly eliminated raws, or a multi-element list for
-     linear-constraint pivots.
-  3. Per-component physical Dirichlet detection via
-     `_has_physical_dirichlet`.
-  4. Enumerate active dofs component-major (component 1 first, then
-     component 2, …) skipping every (raw, component) entry that is
-     either physically Dirichlet-constrained or a constraint pivot.
-     Project nonzero Dirichlet data onto the boundary trace space via
-     [`_project_dirichlet_values!`](@ref).
-
-Keyword arguments:
-
-  - `dirichlet` — iterable of [`DirichletCondition`](@ref)s.
-  - `tolerance` — `GeometryTolerance` used by boundary detection.
-  - `components` — scalar channels per field (≥ 1).
-  - `prune_exempt` — level ids this pass leaves unpruned while every other level is
-    pruned normally. It exists for [`estimate`](@ref)'s enriched twin, where a
-    co-located same-degree cover would deduplicate exactly the keys the solution is
-    about to be injected onto; turning leaf semantics off *globally* there instead was
-    measured to inflate the indicator on a covered cell of an unrelated level by 4.1×,
-    because that level's order-elevated covered modes then survive and land in the
-    complement. Empty by default, and a no-op when `prune = false`.
-  - `prune` — leaf semantics, on by default. `false` retains every covered
-    mode and is the unreduced twin the reduction is measured against; see
-    [`prepare`](@ref), which is where a caller reaches it.
-  - `classify_cache` — the space's cell-classification cache (shared with the
-    `PhysicalDomain` fold). The fictitious-fold constraint predicate and the
-    coverage rule both reuse it instead of re-classifying fold-boundary cells;
-    defaults to a fresh empty cache for standalone calls.
-  - `facets` — the model's `FacetResolver`, through which stage 4b resolves the
-    boundary faces it projects the Dirichlet datum over. Sharing it is what makes
-    the projection read the very faces the assembly path and
-    [`boundary_integral`](@ref) read, at one resolution per `(space, face)`
-    rather than one per consumer. `nothing` (the default) gives this call a
-    private resolver at `tolerance`, which is what a standalone `dof_layout` with
-    no model behind it wants. Its tolerance must match `tolerance`.
-
-The integrated Legendre family produces single-raw constraints,
-reducing the resolved expansion to strong elimination (`raw_expansion =
-[]` for the pivoted raw), so assembly sees only active and constrained
-dofs. B-spline families produce multi-raw constraints encoding the C^m
-trace-vanishing condition on artificial boundaries; assembly gives each
-pivot a local row and column of its own and condenses them onto the
-pivot's expansion once per integration region.
-"""
-function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
-                    components::Integer=1, prune::Bool=true, prune_exempt=(),
-                    classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}(),
-                    facets=nothing) where {D,T}
-    components > 0 || throw(ArgumentError("dof layout components must be positive"))
-    raw_by_key = Dict{TensorDofKey{D},Int}()
-    raw_keys = TensorDofKey{D}[]
-    # Indexed by level *id*, not by position: for a single-domain space the two
-    # coincide (base = 1, overlays 2, 3, …), but a subdomain of a coupled model
-    # is reindexed into a disjoint id block by `_reindex_space_levels`, so this
-    # layout's ids run over that block and match the `parent.level` id the
-    # assembly workspace and `cell_dofs` key by (leading slots below the block
-    # stay `undef` and are never addressed by this field's parents).
-    cell_dofs_by_level = Vector{Array{Vector{Int},D}}(undef, maximum(l -> l.id, V.levels))
-
-    # Stage 1: walk every level's cells and assign raw dofs through the
-    # `TensorDofKey` cache (cross-cell endpoint sharing happens here).
-    #
-    # Every inactive cell of every level shares one empty vector. A ladder makes
-    # inactive cells the overwhelming majority of the grid — measured on a
-    # depth-5 2D stack over a 6² base with one base cell refined to the bottom,
-    # 49 140 cells of which 1 400 are active — and a fresh `Int[]` per inactive
-    # cell put one heap allocation on each of them, on every rebuild, and
-    # `estimate` rebuilds. On that layout it is 74 856 allocations against
-    # 27 117. It is per call rather than a module-level constant because a
-    # `const` empty vector is one stray `push!` away from corrupting every
-    # inactive cell of every layout ever built.
-    none = Int[]
-    for level in V.levels
-        level_cells = Array{Vector{Int},D}(undef, level.mesh.cells)
-        for cell in cell_indices(level.mesh)
-            level_cells[cell] = is_active(level.mask, cell) ?
-                                _build_cell_dofs!(raw_by_key, raw_keys, level, cell) : none
-        end
-        cell_dofs_by_level[level.id] = level_cells
-    end
-
-    # Stage 2: collect linear constraints per level and resolve to expansions.
-    # Bucket the raw keys by level once so each level's constraint hook
-    # scans only its own raws (O(total raws) overall, not O(levels × raws)).
-    nraw = length(raw_keys)
-    keys_by_level = Dict{Int,Vector{Pair{TensorDofKey{D},Int}}}()
-    for (key, raw) in raw_by_key
-        push!(get!(() -> Pair{TensorDofKey{D},Int}[], keys_by_level, key.level), key => raw)
-    end
-    empty_keys = Pair{TensorDofKey{D},Int}[]
-    constraints = LinearConstraint{T}[]
-    # Track only the COVERAGE/DEDUP elimination sources, so `constraint_kind` /
-    # diagnostics can pick a pruned or deduped raw out. Overlay-boundary
-    # (and multi-raw B-spline) eliminations are not recorded here — they fall
-    # through to the `:overlay` default when `elimination_source` is built below.
-    # The loop below keeps that split honest: a raw the overlay condition already
-    # eliminates never reaches this map, whichever source names it second.
-    source_of = Dict{Int,Symbol}()
-    coverage = prune ? build_coverage(V, tolerance, classify_cache) :
-               Coverage{D}(Dict{Int,BitArray{D}}())
-    for level in V.levels
-        level_keys = get(keys_by_level, level.id, empty_keys)
-        # Source 1: the artificial-overlay-boundary trace condition (every family).
-        overlay_constraints = _overlay_constraints(level, V, tolerance, raw_by_key, level_keys,
-                                                   classify_cache)
-        append!(constraints, overlay_constraints)
-        # Source 2: covered-mode pruning in covered regions (opt-in per level).
-        #
-        # A raw on Γ_o that is also buried carries both constraints. The overlay
-        # one is queued first and strongly eliminates the raw, which leaves the
-        # coverage constraint trivially satisfied — so recording it as the
-        # elimination source would credit covered-mode pruning with a raw it did not
-        # save, and `reduced_mode_counts` would over-report. Skipping the
-        # redundant constraint leaves `raw_expansion` untouched:
-        # `_resolve_constraints!` substitutes the already-eliminated raw, gets an
-        # empty term list, and drops the constraint anyway. Only single-raw
-        # overlay constraints eliminate a named raw outright; a multi-raw
-        # (B-spline) constraint picks its pivot during resolution, and that
-        # family emits no coverage constraints at all.
-        if prune && !(level.id in prune_exempt)
-            reductions = _coverage_constraints(level, V, coverage, tolerance, level_keys,
-                                               classify_cache)
-            overlay_raws = isempty(reductions) ? Set{Int}() :
-                           Set{Int}(c.raws[1] for c in overlay_constraints if length(c.raws) == 1)
-            for (c, src) in reductions
-                c.raws[1] in overlay_raws && continue
-                push!(constraints, c)
-                source_of[c.raws[1]] = src
-            end
-        end
-    end
-    raw_expansion = Vector{Vector{Tuple{Int,T}}}(undef, nraw)
-    _resolve_constraints!(raw_expansion, constraints, nraw)
-    # A raw is "pivoted" (eliminated) iff its resolved expansion is anything other
-    # than the trivial identity `[(raw, 1)]`. This local vector is construction
-    # scratch for the active enumeration and for `elimination_source` below; the
-    # layout exposes elimination only through `elimination_source` (`!== :free`).
-    eliminated = [length(e) != 1 || e[1] != (raw, one(T)) for (raw, e) in pairs(raw_expansion)]
-    # Per-raw elimination source: the tracked coverage/dedup source, `:overlay` for
-    # any other eliminated raw (overlay boundary; multi-raw B-spline pivots), and
-    # `:free` when the raw survives. This doubles as the elimination flag.
-    elimination_source = Symbol[eliminated[raw] ? get(source_of, raw, :overlay) : :free
-                                for raw in 1:nraw]
-    # A raw is "simple" if its expansion is either the identity
-    # `[(raw, 1)]` (free) or empty `[]` (strongly eliminated) — both of
-    # which assembly's slot table holds directly, as an active or a
-    # constrained local slot. Any other expansion (a redirect onto other
-    # raws) is a genuine linear constraint: assembly gives it a pivot slot
-    # of its own and condenses it once per region, K ← PᵀKP, b ← Pᵀb − lift.
-    has_linear_constraints = any(pairs(raw_expansion)) do (raw, e)
-        !(isempty(e) || (length(e) == 1 && e[1] == (raw, one(T))))
-    end
-
-    # Stage 3: per-component physical Dirichlet detection.
-    ncomp = Int(components)
-    physical_dirichlet = falses(nraw, ncomp)
-    for (raw, key) in pairs(raw_keys)
-        level = _level_by_id(V, key.level)
-        for component in 1:ncomp
-            physical_dirichlet[raw, component] = _has_physical_dirichlet(key, level, V.domain,
-                                                                         dirichlet, tolerance,
-                                                                         component)
-        end
-    end
-
-    # Stage 4: enumerate active dofs component-major. For all-or-nothing
-    # constraints this matches the natural block ordering; per-component
-    # constraints simply leave holes in the enumeration.
-    active_component = zeros(Int, nraw, ncomp)
-    active_count = 0
-    for component in 1:ncomp, raw in 1:nraw
-        if !(physical_dirichlet[raw, component] || eliminated[raw])
-            active_count += 1
-            active_component[raw, component] = active_count
-        end
-    end
-
-    layout = DofLayout{D,T}(ncomp, cell_dofs_by_level, raw_keys, active_component,
-                            physical_dirichlet, elimination_source, raw_expansion,
-                            has_linear_constraints, zeros(T, nraw, ncomp), fill(:none, ncomp),
-                            [Int[] for _ in 1:ncomp], active_count, tolerance)
-
-    # Stage 4b: project nonzero Dirichlet data onto the boundary trace
-    # space. Zero-only conditions skip this — `constrained_values` is
-    # already zero from the construction above.
-    _needs_dirichlet_projection(dirichlet) &&
-        _project_dirichlet_values!(layout, V, facets, dirichlet)
-    return layout
-end
-
-"""
-    raw_dof_count(layout::DofLayout) -> Int
-
-Total number of *raw* dof slots (including constrained), counted as
-`length(raw_keys) * components`.
-"""
-raw_dof_count(layout::DofLayout) = length(layout.raw_keys) * layout.components
-
-"""
-    active_unknowns(layout::DofLayout) -> Int
-
-Number of *active* (post-constraint) dofs — the size of the global
-system the solver sees.
-"""
-active_unknowns(layout::DofLayout) = layout.active_count
-
-"""
-    cell_dofs(layout, level::Integer, cell::CartesianIndex) -> Vector{Int}
-
-Pre-constraint raw dof ids for the cell at `cell` on level `level`, in
-the canonical local-basis order. Inactive cells return an empty vector.
-
-The vector is the layout's own and must not be mutated: every inactive cell of
-every level shares one empty vector, so a `push!` into a returned empty result
-would reach all of them. Copy before editing.
-"""
-function cell_dofs(layout::DofLayout{D}, level::Integer, cell::CartesianIndex{D}) where {D}
-    1 <= level <= length(layout.cell_dofs_by_level) ||
-        throw(ArgumentError("unknown level id $level"))
-    return layout.cell_dofs_by_level[level][cell]
-end
-
-"""
-    active_cell_dofs(layout, level::Integer, cell::CartesianIndex, component=1) -> Vector{Int}
-
-Active global ids for component `component` of the cell-local raw dofs,
-with `0` standing for any dof that was eliminated by a constraint. The
-order matches the canonical local-basis ordering (same length as
-`cell_dofs(layout, level, cell)`).
-"""
-function active_cell_dofs(layout::DofLayout{D}, level::Integer, cell::CartesianIndex{D},
-                          component::Integer=1) where {D}
-    return [_active_component_dof(layout, raw, component) for raw in cell_dofs(layout, level, cell)]
-end
-
-"""
-    constraint_kind(layout::DofLayout, raw, component=1) -> Symbol
-
-Classify a single raw dof. Returns one of:
-
-  - `:free`       — no constraint, the dof is enumerated.
-  - `:dirichlet`  — physical Dirichlet only.
-  - `:overlay`    — artificial overlay-boundary elimination only.
-  - `:coverage`   — pruning elimination (covered high-order mode).
-  - `:dedup`      — linear-dedup elimination (covered vertex reproduced by
-                    a nested finer level).
-  - `:mixed`      — physical Dirichlet plus an elimination. The
-                    elimination wins (the dof is eliminated and its value
-                    is held in `constrained_values` from the Dirichlet
-                    projection).
-"""
-function constraint_kind(layout::DofLayout, raw::Integer, component::Integer=1)
-    physical = layout.physical_dirichlet[raw, component]
-    source = layout.elimination_source[raw]
-    physical && source != :free && return :mixed
-    physical && return :dirichlet
-    return source
-end
-
-"""
-    constrained_value(layout::DofLayout, raw, component=1) -> T
-
-Stored value of a constrained (raw, component). Zero for overlay
-constraints and homogeneous Dirichlet conditions; the projected value
-for nonzero Dirichlet data.
-"""
-function constrained_value(layout::DofLayout, raw::Integer, component::Integer=1)
-    layout.constrained_values[raw, component]
-end
-
-"""
-    dof_value(layout::DofLayout, coefficients, raw, component=1) -> T
-
-Recover the value of component `component` of raw dof `raw` — the unified
-accessor every reconstruction path uses when a basis-function contribution needs
-the actual dof value regardless of constraint status.
-
-Three regimes, matching the three shapes of `raw_expansion` (see
-[`DofLayout`](@ref)): a free dof reads `coefficients[active]`; a dof with no
-pivot expansion reads its [`constrained_value`](@ref), which is zero for an
-artificial-boundary or pruning elimination and the projected datum for a nonzero
-Dirichlet condition — including on a raw the constraint system left free, which is
-why the identity expansion is tested for and not only the empty one; and a
-**linear-constraint pivot** is reassembled from its expansion,
-
-    u_raw = constrained_value(raw) + Σᵢ wᵢ · u_{rᵢ} .
-
-That third branch is not an embellishment. A pivot is precisely the mechanism a
-basis family uses to impose C^m continuity or an arbitrary-mask trace condition,
-so reading `constrained_value` for it — which is zero — silently drops the dof's
-whole contribution from `value`, `field_gradient`, `l2_error`, `write_vtk` and
-`L2Projection`'s source reconstruction, while the *solve* is correct because
-assembly condenses every pivot through the same expansion. Measured on a
-6×6 degree-3 C¹ B-spline base under an L-masked 4×4 C¹ overlay (8 non-trivial
-expansions of 126 raws), the dropped term reached 4.79e-7 against a field of
-magnitude 7e-2 — silent, and small enough to pass a hand-written tolerance.
-
-One level of expansion is enough on a resolved layout, because
-[`_resolve_constraints!`](@ref) leaves every pivot expressed in
-constraint-*free* raws only. The identity-expansion test is what makes that
-robust rather than assumed: physical Dirichlet elimination happens in a later
-stage than constraint resolution, so a raw that is free with respect to the
-constraint system can still be eliminated on one component, and it carries the
-identity expansion `[(raw, 1)]` rather than an empty one.
-
-The `has_linear_constraints` short-circuit keeps the integrated-Legendre path to
-one extra field load and one extra branch per call, which is not free: measured on
-a reconstruction-heavy loop it costs about 1.36× the previous two-line body. The
-alternative is a silently wrong field, so it is paid.
-
-The expansion is read through `_fold_pivot`, the one statement of the pivot rule
-that assembly reads as well, so a pivot cannot be reconstructed one way and
-assembled another.
-"""
-function dof_value(layout::DofLayout, coefficients, raw::Integer, component::Integer=1)
-    active = _active_component_dof(layout, raw, component)
-    active == 0 || return coefficients[active]
-    value, _ = _fold_pivot(_branch_value(coefficients), constrained_value(layout, raw, component),
-                           layout, (other, c) -> _active_component_dof(layout, other, c), raw,
-                           component)
-    return value
-end
-
-# The pivot rule, stated once. A linear-constraint pivot is
-#
-#     u(raw, c) = Σₖ wₖ · u(oₖ, c)
-#
-# over constraint-free raws `oₖ`: `_resolve_constraints!` leaves every pivot
-# expressed at depth one. Two readers share this fold — `dof_value`, which
-# reconstructs a pivot from it, and `_slots!` in assembly, which detects a
-# region's pivots, widens its active set to their branches and records those
-# branches for `_condense!` to fold the pivot's local row and column onto. When
-# reconstruction and emission each carried their own encoding they could
-# disagree, and a field was then solved correctly but reconstructed wrong; one
-# definition rules that out.
-#
-# `f(acc, g, w, v)` is folded over the branches in expansion order, where
-# `g = id(oₖ, c)` is the branch's active id (0 when it is constrained) and `v` its
-# constrained value when `g == 0`, zero otherwise. `id` maps `(raw, component)` to
-# the active id in whichever numbering the caller needs: a bare `DofLayout`'s, or
-# a `FieldLayout`'s, which shifts it into the global system. Returns
-# `(acc, true)` for a pivot. A non-pivot returns `(acc, false)` without calling
-# `f`: a free raw, a strongly eliminated one (empty expansion), and a raw that is
-# free with respect to the constraint system but that a later Dirichlet stage
-# eliminated on `c` (identity expansion `[(raw, 1)]`). Testing for the identity
-# is what keeps the depth-one property robust rather than assumed.
-@inline function _fold_pivot(f::F, acc, d::DofLayout, id::I, raw::Integer, c::Integer) where {F,I}
-    d.has_linear_constraints || return acc, false
-    expansion = d.raw_expansion[raw]
-    (isempty(expansion) || (length(expansion) == 1 && first(expansion[1]) == raw)) &&
-        return acc, false
-    for (other, w) in expansion
-        g = id(other, c)
-        acc = f(acc, g, w, g == 0 ? constrained_value(d, other, c) : zero(w))
-    end
-    return acc, true
-end
-
-# The `_fold_pivot` step of `dof_value`: add a branch's weighted value, read from
-# the coefficients when the branch is active and from its stored constrained
-# value otherwise — `value += wₖ · u(oₖ, c)`, in expansion order.
-_branch_value(coefficients) = (acc, g, w, v) -> acc + w * (g == 0 ? v : coefficients[g])
-
-# ── FieldLayout and SystemLayout (multi-field problems) ───────────────────────
-
-"""
-    FieldLayout{D,T}(name, components, dofs, offset, level_ids)
-
-One field's slot inside a multi-field [`SystemLayout`](@ref). `dofs` is
-the field's own [`DofLayout`](@ref); `offset` is the field's starting
-column in the global active-dof vector (the active dofs of all earlier
-fields take ids 1 through `offset`, and this field's active dofs take
-ids `offset + 1` through `offset + active_unknowns(dofs)`).
-
-`level_ids` is the contiguous block of (globally reindexed) level ids the
-field's [`Space`](@ref) owns. Assembly uses it to route each integration
-region to the field that owns it: a region whose parents live on a level
-outside this range belongs to another subdomain and this field skips it
-(`region_parents`). For a single-domain problem every field's range covers
-every level, so every field evaluates on every region.
-"""
-struct FieldLayout{D,T<:Real}
-    name::Symbol
-    components::Int
-    dofs::DofLayout{D,T}
-    offset::Int
-    level_ids::UnitRange{Int}
-end
-
-"""
-    SystemLayout{D,T}(fields, by_name, active_unknowns, tolerance)
-
-Top-level layout for a problem with one or more fields. `fields` lists
-the per-field [`FieldLayout`](@ref)s in declaration order; `by_name`
-maps field names to their indices in `fields`; `active_unknowns` is the
-sum of every field's active count (the global system size); `tolerance`
-is shared across the fields.
-
-Most consumers go through [`active_cell_dofs`](@ref) and friends, which
-delegate to the per-field layout transparently. Single-field problems
-take the implicit-field shortcut where the field name does not need to
-be passed.
-"""
-struct SystemLayout{D,T<:Real}
-    fields::Vector{FieldLayout{D,T}}
-    by_name::Dict{Symbol,Int}
-    active_unknowns::Int
-    tolerance::GeometryTolerance{T}
-end
-
-# Resolve a field name to its index inside a `SystemLayout`, raising on an
-# unknown name. How the assembly kernel's blocks and loads, an interface's region
-# build and a `FormState` read find a field in the layout's field-major data.
-function _field_index(system::SystemLayout, name::Symbol)
-    index = get(system.by_name, name, 0)
-    index == 0 && throw(ArgumentError("unknown field $name"))
-    return index
-end
-
-# Look up the per-field layout by name. Throws on unknown name.
-_field_layout(system::SystemLayout, name::Symbol) = system.fields[_field_index(system, name)]
-
-# Global active dof id for component `component` of raw `raw` in this
-# field, or 0 if the (raw, component) is constrained. Per-field active
-# ids are shifted by the field's `offset` so they live in disjoint
-# blocks of the global active enumeration.
-function _field_component_dof(layout::FieldLayout, raw::Integer, component::Integer)
-    (active=_active_component_dof(layout.dofs, raw, component);
-     active == 0 ? 0 : layout.offset + active)
-end
-
-"""
-    dof_value(layout::FieldLayout, coefficients, raw, component=1) -> T
-
-Recover the value of component `component` of raw `raw` in this field,
-using the global active enumeration. Equivalent to the
-[`DofLayout`](@ref) version — including its reassembly of a
-linear-constraint pivot from `raw_expansion` — but resolves the per-field
-offset so `coefficients` is the global active vector.
-"""
-function dof_value(layout::FieldLayout, coefficients, raw::Integer, component::Integer=1)
-    global_dof = _field_component_dof(layout, raw, component)
-    global_dof == 0 || return coefficients[global_dof]
-    value, _ = _fold_pivot(_branch_value(coefficients),
-                           constrained_value(layout.dofs, raw, component), layout.dofs,
-                           (other, c) -> _field_component_dof(layout, other, c), raw, component)
-    return value
-end
-
-"""
-    active_unknowns(layout::SystemLayout) -> Int
-
-Total number of active dofs across every field — the size of the global
-system the solver sees.
-"""
-active_unknowns(layout::SystemLayout) = layout.active_unknowns
-
-"""
-    raw_dof_count(layout::SystemLayout) -> Int
-
-Total number of raw dof slots across every field (sum of
-`raw_dof_count(field.dofs)`).
-"""
-raw_dof_count(layout::SystemLayout) = sum(raw_dof_count(field.dofs) for field in layout.fields)
-
-# True iff any field's dof layout carries a non-trivial linear
-# constraint (a [`DofLayout`](@ref) `raw_expansion` that redistributes a
-# raw onto other raws). Assembly itself reads the per-field flag; this
-# system-wide form serves tests and diagnostics.
-function has_linear_constraints(layout::SystemLayout)
-    any(field -> field.dofs.has_linear_constraints, layout.fields)
-end
-
-# Resolve the unique field of a single-field layout. Used by the
-# `*_dofs` delegates below so single-field problems do not have to
-# carry a field name argument.
-function _only_field_layout(layout::SystemLayout)
-    length(layout.fields) == 1 ||
-        throw(ArgumentError("field argument is required for multi-field layouts"))
-    return only(layout.fields)
-end
-
-# `cell_dofs`/`active_cell_dofs`/`constraint_kind`/`constrained_value`
-# delegates that thread through `_only_field_layout` for single-field
-# problems or through `_field_layout(name)` for the multi-field call
-# forms. The explicit overloads keep grep-friendly call sites and
-# preserve the per-field offset translation.
-
-function cell_dofs(layout::SystemLayout, level::Integer, cell::CartesianIndex)
-    cell_dofs(_only_field_layout(layout).dofs, level, cell)
-end
-function active_cell_dofs(layout::SystemLayout, level::Integer, cell::CartesianIndex)
-    active_cell_dofs(_only_field_layout(layout).dofs, level, cell)
-end
-
-function active_cell_dofs(layout::SystemLayout, level::Integer, cell::CartesianIndex,
-                          component::Integer)
-    field = _only_field_layout(layout)
-    return [_field_component_dof(field, raw, component)
-            for raw in cell_dofs(field.dofs, level, cell)]
-end
-
-function active_cell_dofs(layout::SystemLayout, field_name::Symbol, level::Integer,
-                          cell::CartesianIndex, component::Integer=1)
-    field = _field_layout(layout, field_name)
-    return [_field_component_dof(field, raw, component)
-            for raw in cell_dofs(field.dofs, level, cell)]
-end
-
-function constraint_kind(layout::SystemLayout, raw::Integer)
-    constraint_kind(_only_field_layout(layout).dofs, raw)
-end
-function constrained_value(layout::SystemLayout, raw::Integer, component::Integer=1)
-    constrained_value(_only_field_layout(layout).dofs, raw, component)
-end
+# It is a family trait rather than a type test on the cover because smoothness is a
+# property of the family's own construction: a maximal-regularity B-spline is C^(p−1) at
+# a simple interior knot, so it carries the kink at degree 1 and at no higher degree —
+# the extension answers exactly that, and a `k.basis isa IntegratedLegendre` gate cannot.
+_spans_hats(::BasisFamily) = false
+_spans_hats(::IntegratedLegendre) = true

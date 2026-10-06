@@ -218,7 +218,7 @@ function boundary(selector::Symbol; except=())
     # before every other check in this method so that it stays exactly that: any
     # symbol still constructs the selector it always constructed, and one that
     # no consumer supports still fails where it always failed — at prepare time,
-    # in `_facets` / `_selector_matches`, not here.
+    # in `_facets`, not here.
     isempty(except) && return BoundarySelector(selector, Tuple{Int,Symbol}[])
     selector === :all ||
         throw(ArgumentError("except= removes faces from the whole boundary, so it applies " *
@@ -295,10 +295,19 @@ end
 
 Create a physical Dirichlet condition.
 
-  - `value` — Dirichlet datum. Scalar (applied everywhere on the
-    selected facet), indexable component value (one entry per
-    component for vector fields), or callback `value(x)` evaluated at
-    physical coordinates.
+  - `value` — Dirichlet datum, applied everywhere on the selected
+    facet: a scalar, which every constrained component takes; a tuple
+    or array (`SVector`, `Tuple`, `Vector`) with exactly one entry per
+    component of the field, entry `c` being component `c`'s value —
+    under `component` too, which reads its own entry; or a callback
+    `value(x)` evaluated at physical coordinates and returning either.
+    A tuple or array of any other length raises `ArgumentError`, naming
+    the field and the length it needs, as soon as the owning field is
+    known — here when `field` is a [`Field`](@ref), otherwise at
+    [`Problem`](@ref) construction — and in [`update_dirichlet!`](@ref)
+    and a standalone [`dof_layout`](@ref) before either changes or
+    builds anything. A callback's result is not checked ahead of time:
+    only evaluating it could say what it returns.
   - `on::BoundarySelector` — the facet to constrain. Build via
     [`boundary`](@ref).
   - `field` — field to constrain. Pass `nothing` for single-field
@@ -313,8 +322,8 @@ Create a physical Dirichlet condition.
 
 Nonzero `value` data are projected onto the boundary trace space
 before strong elimination so the constrained dof values reflect the
-correct trace. Homogeneous (constant-zero) data skip the projection
-entirely.
+correct trace. Homogeneous data — a zero number, or a tuple or array
+whose every entry is zero — skip the projection entirely.
 
 On an immersed space, that projection is taken over `face ∩ Ω`: where `∂Ω`
 cuts the selected face, the mass matrix `∫ φᵢ φⱼ ds` and the right-hand
@@ -362,8 +371,10 @@ function dirichlet(value; on::BoundarySelector, field=nothing, component=nothing
         component isa Integer ||
         throw(ArgumentError("Dirichlet component must be an integer or nothing"))
     field isa Field && _check_component(component, field)
-    return DirichletCondition(value, on, field_name,
-                              component === nothing ? nothing : Int(component))
+    condition = DirichletCondition(value, on, field_name,
+                                   component === nothing ? nothing : Int(component))
+    field isa Field && _check_dirichlet_datum(condition, component_count(field), field.name)
+    return condition
 end
 
 # ── Canonical weak forms ──────────────────────────────────────────────────────

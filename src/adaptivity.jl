@@ -526,9 +526,18 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     # A dof is incident to several cells; its contribution is split equally among
     # them, so a cell is never charged for a neighbour's error. Raw ids are
     # contiguous, so this is a dense vector rather than a `Dict`.
+    #
+    # Both sweeps address a level's cell tables by its level *id*, as `cell_dofs`
+    # is keyed; the attribution sweep keeps the position `k` for `cells`, which
+    # follows `enriched.levels`. The two coincide on a single-domain space, the
+    # only kind `estimate` accepts, but only the id is the table's key. The id is
+    # read once per level: the enriched space is built at run time, so `level` is
+    # not concretely typed here, and reading `level.id` per cell cost one
+    # allocation per cell (measured +6 020 on a depth-5 ladder).
     incidence = zeros(Int, length(plus_keys))
-    for k in 1:length(enriched.levels), cell in _live_cells(enriched.levels[k])
-        for raw in cell_dofs(plus.dofs, k, cell)
+    for level in enriched.levels
+        id = level.id
+        for cell in _live_cells(level), raw in cell_dofs(plus_field.dofs, id, cell)
             incidence[raw] += 1
         end
     end
@@ -536,14 +545,18 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     # The attribution sweep. `counted` is indexed by ACTIVE id, not by raw:
     # active ids are unique across components, so a vector-valued field's
     # `(raw, component)` slots are each counted once into the V/W split while
-    # every one of them is charged to its cell.
+    # every one of them is charged to its cell. A slot's active id is read
+    # straight from the field's table, so the sweep allocates nothing per
+    # (cell, component).
     cells = [zeros(T, level.mesh.cells) for level in enriched.levels]
     counted = falses(length(residual))
     residual_V = residual_W = zero(T)
-    for k in 1:length(enriched.levels), cell in _live_cells(enriched.levels[k])
-        raws = cell_dofs(plus.dofs, k, cell)
-        for component in 1:plus_field.components
-            for (raw, active) in zip(raws, active_cell_dofs(plus.dofs, k, cell, component))
+    for (k, level) in enumerate(enriched.levels)
+        id = level.id
+        for cell in _live_cells(level)
+            raws = cell_dofs(plus_field.dofs, id, cell)
+            for component in 1:plus_field.components, raw in raws
+                active = _field_component_dof(plus_field, raw, component)
                 active == 0 && continue                   # constrained away
                 if !counted[active]
                     counted[active] = true

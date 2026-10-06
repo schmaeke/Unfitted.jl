@@ -176,6 +176,64 @@ end
     end
 end
 
+@testset "levels share their node coordinates on a non-dyadic domain" begin
+    # The cross-level map compares node coordinates with no tolerance, so a
+    # ladder is only nested if its levels share their nodes bit for bit. On an
+    # extent that is not a power of two they did not: `_mesh_axes` scaled before
+    # dividing, so each level rounded a different product, and on [0, 0.7] in
+    # three cells refined by three the base axis ended one ulp short of 0.7 and
+    # its cells claimed 4, 4 and 3 fine cells instead of 3 each.
+    V = ladder(box((0.0,), (0.7,)); cells=3, depth=1, splits=3)
+    @test V.levels[1].mesh.axes[1][end] == 0.7
+    @test [Unfitted._cell_block(V, 1, 2, CartesianIndex(i)) for i in 1:3] ==
+          [CartesianIndices((1:3,)), CartesianIndices((4:6,)), CartesianIndices((7:9,))]
+
+    # Every node of a level is a node of the level above it, bit for bit, every
+    # axis ends exactly on the domain's corners, and the cross-level map gives
+    # each coarse cell exactly its `splits` block and each fine cell exactly one
+    # parent.
+    function nests_exactly(V::Unfitted.Space{D}) where {D}
+        ok = true
+        for level in V.levels, d in 1:D
+            axis, domain = level.mesh.axes[d], level.mesh.domain
+            ok &= first(axis) == domain.lower[d] && last(axis) == domain.upper[d]
+        end
+        for k in 2:length(V.levels)
+            coarse, fine = V.levels[k - 1].mesh, V.levels[k].mesh
+            s = fine.cells .÷ coarse.cells
+            for d in 1:D
+                ok &= fine.axes[d][1:s[d]:end] == coarse.axes[d]
+            end
+            for c in cell_indices(V; level=k - 1)
+                ok &= size(Unfitted._cell_block(V, k - 1, k, c)) == s
+            end
+            for c in cell_indices(V; level=k)
+                ok &= length(Unfitted._cell_block(V, k, k - 1, c)) == 1
+            end
+        end
+        return ok
+    end
+
+    # A sweep over offsets, extents, base counts and split factors in 1D, where
+    # the scale-first order mis-nested a large share of the combinations.
+    failures = 0
+    for lo in (0.0, 0.1, -0.3), extent in (0.7, 0.3, 1.1), cells in 1:4, splits in 2:5
+        failures += !nests_exactly(ladder(box((lo,), (lo + extent,)); cells=cells, depth=2,
+                                          splits=splits))
+    end
+    @test failures == 0
+
+    # Anisotropic and per-level in 2D, and what a user sees: a depth map refines
+    # a base cell across exactly its own child blocks.
+    V2 = ladder(box((0.1, -0.3), (0.8, 2.6)); cells=(3, 5), depth=2, splits=[(3, 2), (2, 3)])
+    @test nests_exactly(V2)
+    d = zeros(Int, 3, 5)
+    d[2, 3] = 2
+    W2 = adapt(V2, d)
+    @test count(active_cells(W2; level=2)) == 3 * 2
+    @test count(active_cells(W2; level=3)) == (3 * 2) * (2 * 3)
+end
+
 @testset "adapt: pair form sets, leaves others alone, does not alias" begin
     V = ladder(LADDER_OMEGA; cells=8, order=2, depth=2, splits=2)
     m = falses(32, 32)
@@ -274,6 +332,21 @@ end
     @test count(active_cells(adapt(V, near; grade=1); level=2)) ==
           count(active_cells(adapt(V, far; grade=1); level=2))
     @test_throws ArgumentError adapt(V, d; grade=-1)
+end
+
+@testset "adapt takes a depth map in 1D" begin
+    # `depth_masks` used to select the base cells with `findall`, which on a
+    # `Vector` returns plain `Int` indices rather than `CartesianIndex{1}`, and
+    # `overlapping_cells` rejected them: the array form threw on every 1D ladder.
+    V = ladder(box((0.0,), (1.0,)); cells=4, order=2, depth=2, splits=2)
+    W = adapt(V, [0, 1, 2, 0])
+    @test active_cells(W; level=1) == trues(4)               # the base is left alone
+    @test findall(active_cells(W; level=2)) == 3:6           # base cells 2 and 3
+    @test findall(active_cells(W; level=3)) == 9:12          # base cell 3
+    # grading runs in 1D too: the neighbours of a depth-2 cell rise to depth 1
+    graded = adapt(V, [0, 0, 2, 0]; grade=1)
+    @test findall(active_cells(graded; level=2)) == 3:8
+    @test findall(active_cells(graded; level=3)) == 9:12
 end
 
 @testset "depth_masks pairs splat into adapt, and an all-active mask is no mask" begin
@@ -460,7 +533,7 @@ end
 
 @testset "ladder composes with B-splines" begin
     # The B-spline family reaches covered-mode pruning through its own
-    # `_coverage_constraints`, which dedups rather than sheds bubbles; a nested
+    # `_coverage_constraints!`, which dedups rather than sheds bubbles; a nested
     # stack is non-singular only because that dedup fires. `lossless` compares
     # against the unreduced twin, which for this family is rank-deficient by
     # exactly the deduped modes, so it is the right check here too.

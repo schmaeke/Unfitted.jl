@@ -147,8 +147,8 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `intersections.jl`| admissible integration regions for non-matching meshes; cut/fictitious region-quadrature dispatch |
 | `coverage.jl`     | per-level covered-cell masks (`Coverage`, `build_coverage`); the mask-aware, fictitious-fold-aware covering rule behind covered-mode pruning |
 | `ladder.jl`       | nested refinement ladders: `ladder` declaration, the depth-map form of `adapt` and the `depth_masks` grading behind it, cross-level cell mapping (`overlapping_cells`), the `is_nested` predicate |
-| `dofs.jl`         | dof layout, raw/active enumeration, overlay/boundary-constraint detection, the hp minimum rule across an order jump, and the leaf-semantics eliminations (`_coverage_constraints`) |
-| `dirichlet.jl`    | physical Dirichlet conditions and boundary selectors, the per-key boundary-face detection `dof_layout` eliminates on, codim-K facet regions and quadrature, and the L² boundary projection for nonzero data |
+| `dofs.jl`         | dof keys; the per-space dof topology (raw enumeration, the elimination ledger, the pivot table) and per-field numbering and accessors; the integrated-Legendre family's dof hooks (artificial boundary, leaf-semantics pruning, the hp minimum rule) |
+| `dirichlet.jl`    | physical Dirichlet conditions and boundary selectors, per-level physical-Dirichlet detection, codim-K facet regions and quadrature, and the L² boundary projection for nonzero data |
 | `surface.jl`      | immersed-boundary surface meshes (`BoundaryMesh`) and surface-region integration |
 | `problems.jl`     | `Field`, weak-form channels and blocks (`BlockForm`/`LoadForm`/`WeakForm`), `Problem` |
 | `coupling.jl`     | multi-domain interface coupling: the `Interface` `on=` tag, two-sided `InterfaceRegion` construction, `InterfaceForm`, and the four-block `couple` jump expansion |
@@ -304,10 +304,11 @@ boundary*:
 
 — i.e. the part of the overlay's boundary that does not coincide with the
 physical boundary `∂Ω`. These artificial constraints are imposed
-strongly (eliminated dofs for the integrated Legendre basis, homogeneous
-linear constraints for general basis families). They are kept strictly
-separate from *physical* boundary conditions on `∂Ω`: mixing the two is
-explicitly disallowed.
+strongly (eliminated dofs for the integrated Legendre basis and
+maximal-continuity B-splines; homogeneous linear constraints, resolved by
+the basis family that emits them, for integer-continuity B-splines). They
+are kept strictly separate from *physical* boundary conditions on `∂Ω`:
+mixing the two is explicitly disallowed.
 
 ### Dimension independence
 
@@ -356,7 +357,14 @@ interface:
   - boundary or entity association information needed for physical
     Dirichlet conditions and artificial overlay constraints;
   - quadrature-order recommendations when exactness depends on the
-    family and polynomial degree.
+    family and polynomial degree;
+  - the dof-layer hooks: `_tensor_dof_key`, `_key_on_level_side`,
+    `_overlay_constraints!` (whose default eliminates each raw the per-raw
+    `_has_overlay_constraint` predicate accepts) and, for leaf semantics,
+    `_coverage_constraints!` — each reading a typed per-level context and
+    writing into the elimination ledger — plus `_resolve_rows!` if the
+    family records linear-constraint rows (see *Degree-of-freedom
+    enumeration and constraints*).
 
 The integrated Legendre implementation uses 1D hierarchical endpoint and
 interior modes, then builds `D`-dimensional tensor-product bases from
@@ -392,7 +400,7 @@ deduplicated. Coverage is mask-aware — a user-masked cell blocks
 coverage, a fictitious fold does not.
 
 Covered-mode pruning is a basis-family-specific feature, and
-`_coverage_constraints` is where a family implements it. The
+`_coverage_constraints!` is where a family implements it. The
 `Level{D,T,<:IntegratedLegendre}` method does both eliminations above.
 The B-spline extension overrides the hook too, but only for the dedup:
 that family has no bubble/skeleton split, so its one reducible mode is
@@ -405,12 +413,12 @@ function the buried one is a combination of survived the cover's own
 support selection, which is necessary as well as sufficient because the
 subdivision coefficients are strictly positive and its representation is
 unique. Any further
-family hits the generic fallback that returns an empty constraint list,
-so on such a space leaf semantics eliminate nothing. `prepare(problem;
+family takes the generic fallback, which records nothing, so on such a
+space leaf semantics eliminate nothing. `prepare(problem;
 prune = false)` is the one way to build a space's unreduced twin; it is
 a diagnostic — exactly singular on a nested stack — rather than a
 discretisation to solve with. See `src/coverage.jl` and
-`_coverage_constraints` in `src/dofs.jl`;
+`_coverage_constraints!` in `src/dofs.jl`;
 `diagnostics(...).reduced_mode_counts` reports the count per level,
 concatenated field-by-field (one entry per level of each field, in
 declaration order).
@@ -420,17 +428,40 @@ per-cell `LevelMask`. See *Selective activation* below.
 
 ### Degree-of-freedom enumeration and constraints
 
-Physical boundary conditions and overlay constraints are assigned before
-final global dof enumeration. Constrained and active dofs are kept
-explicitly distinguishable. The dof layer:
+Physical boundary conditions and artificial constraints are assigned
+before the final global dof enumeration, and constrained and active dofs
+are kept explicitly distinguishable. A layout is built in four steps:
 
-  - eliminates homogeneous overlay constraints directly when the basis
-    family supplies dof-wise constraints;
-  - applies nonzero physical Dirichlet data via consistent RHS updates
-    when columns are eliminated;
-  - if a basis family needs homogeneous linear constraints rather than
-    dof-wise elimination, keeps that logic in the constraint/dof layer
-    and tests it separately.
+  1. **Topology, once per space** — raw dofs enumerated level by level
+     from the family's `TensorDofKey`s (each level's raws a contiguous
+     range), and the artificial eliminations: the artificial overlay
+     boundary and, under leaf semantics, covered-mode pruning. It depends
+     on the space alone, so every field over one space shares it, and it
+     is never mutated.
+  2. **Physical Dirichlet detection, per field** — from the family's
+     boundary association (`_key_on_level_side`) and each selector's
+     facets.
+  3. **Numbering, per field** — component-major active ids over the dofs
+     neither step eliminated.
+  4. **Projection, per field** — nonzero Dirichlet data are projected
+     onto the boundary trace space and applied through consistent
+     right-hand-side updates when columns are eliminated.
+
+A basis family records its artificial constraints in an
+`EliminationLedger`: `_eliminate!(ledger, raw, source)` for a dof-wise
+strong elimination (the first source to eliminate a raw is the one it is
+credited to), and `_constrain!(ledger, raws, coefficients, source)` for a
+homogeneous linear constraint `Σᵢ cᵢ u_{rᵢ} = 0` among one level's raws.
+The core stores a level's rows but does not resolve them: a family that
+records rows implements `_resolve_rows!`, which receives them in emission
+order after the level's hooks have run and records each raw it eliminates
+with `_pivot!` — strongly, or as a depth-one pivot `u_r = Σᵢ wᵢ u_{rᵢ}`
+over raws that stay free. The core default raises. Integer-continuity
+B-splines are the only such family today, so the cascade resolver lives
+in `ext/UnfittedBasicBSplineExt.jl` and is tested in
+`test/test_basis_bspline.jl`. Pivots are stored once per topology, and
+assembly (`_slots!`, `_condense!`) and `dof_value` read them through one
+rule, `_fold_pivot`.
 
 Tests must check that overlay contributions vanish on artificial overlay
 boundaries and that physical boundary conditions are not accidentally
@@ -664,7 +695,7 @@ features evolve.
     cell of the same level is an artificial overlay constraint, analogous
     to a mesh-box-face constraint — unless every inactive cell across it
     was folded away as fictitious rather than masked by the user, in
-    which case the modes stay free (`_internal_face_is_physical`). A
+    which case the modes stay free (`_has_overlay_constraint`). A
     fictitious fold covers; a user mask does not. Span-mode dofs of
     inactive cells are not enumerated.
 

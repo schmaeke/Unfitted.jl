@@ -524,17 +524,23 @@ function _check_form_fields(forms, names)
     end
 end
 
-# Range-check each Dirichlet condition's `component` against the field it
-# names, so an index no component carries is rejected here rather than
-# silently leaving its boundary free. A condition left unscoped
-# (`field === nothing`) on a multi-field problem names no field to check
-# against; `_dirichlet_for_field` resolves those at `prepare` time.
+# Check each Dirichlet condition against the field it names: its `component`
+# must be one the field carries, so an index no component carries is rejected
+# here rather than silently leaving its boundary free, and a constant tuple or
+# array datum must carry one entry per component (`_check_dirichlet_datum`). A
+# condition left unscoped (`field === nothing`) on a multi-field problem names
+# no field to check against; `_dirichlet_for_field` rejects those at `prepare`
+# time. `update_dirichlet!` checks its new conditions' data against the model's
+# field layouts instead (its structural check already pins `component`).
 function _check_dirichlet(dirichlet, fields::Tuple)
     for condition in dirichlet
         name = condition.field
         index = name === nothing ? (length(fields) == 1 ? 1 : nothing) :
                 findfirst(f -> f.name === name, fields)
-        index === nothing || _check_component(condition.component, fields[index])
+        index === nothing && continue
+        owner = fields[index]
+        _check_component(condition.component, owner)
+        _check_dirichlet_datum(condition, component_count(owner), owner.name)
     end
 end
 

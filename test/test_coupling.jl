@@ -63,6 +63,28 @@ using Test
     @test s.coefficients[(n1+1):end] ≈ s2.coefficients
 end
 
+@testset "a subdomain's layout refuses a level id outside its block" begin
+    # The second subdomain's level is reindexed to id 2, after the first's, and
+    # its layout's cell tables are keyed by id, so the slot for id 1 is never
+    # filled. Asking for it is a caller error and must say so with an
+    # `ArgumentError`, as an id past the end does, rather than escape as an
+    # `UndefRefError` from inside the table.
+    V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=2, order=1)
+    V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=2, order=1)
+    u1, u2 = field(:u1, V1), field(:u2, V2)
+    model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2))))
+    second = Unfitted._field_layout(model.dofs, :u2)
+
+    @test second.level_ids == 2:2
+    @test length(Unfitted.cell_dofs(second.dofs, 2, CartesianIndex(1, 1))) == 4
+    @test_throws ArgumentError Unfitted.cell_dofs(second.dofs, 1, CartesianIndex(1, 1))
+    @test_throws ArgumentError Unfitted.cell_dofs(second.dofs, 3, CartesianIndex(1, 1))
+    @test_throws ArgumentError Unfitted.active_cell_dofs(model.dofs, :u2, 1, CartesianIndex(1, 1))
+    # The id the first subdomain owns still reads that subdomain's own table.
+    first_field = Unfitted._field_layout(model.dofs, :u1)
+    @test length(Unfitted.cell_dofs(first_field.dofs, 1, CartesianIndex(1, 1))) == 4
+end
+
 @testset "fields sharing one space keep the single-domain path" begin
     # A two-field problem over ONE space must still behave as before: one
     # integration plan, one level-id block, and the existing same-space

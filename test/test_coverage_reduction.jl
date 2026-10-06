@@ -276,7 +276,7 @@ end
     #
     #   xhi = 1.5 — the cover's face lands *inside* the folded base cell [1, 2]. That
     #     cell is fictitious, so the base's modes on the x = 1 fold face stay free
-    #     (`_internal_face_is_physical`); on the cover the same face is interior, so
+    #     (`_has_overlay_constraint`); on the cover the same face is interior, so
     #     the cover's copies are free too; and under nesting the cover reproduces them
     #     exactly on Ω. Both copies used to survive — the burial test asked
     #     `is_inside(cell, cover.domain)` of the fictitious cell, which a cover ending
