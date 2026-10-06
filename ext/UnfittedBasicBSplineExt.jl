@@ -605,7 +605,7 @@ function Unfitted._fill_factor_tables!(family::BSplineFamily{D,T,S,DS}, val1d, d
     return nothing
 end
 
-# ── Dof key construction ──────────────────────────────────────────────────────
+# ── Dof keys and boundary association ─────────────────────────────────────────
 
 # The `AxisDofKey.kind` tag of a B-spline factor: its `index` is a global 1D
 # function index along the axis, and its `mode` is unused (0). A tag need only be
@@ -613,6 +613,13 @@ end
 # the family. Its value differs from the integrated-Legendre tags although nothing
 # requires it to.
 const _AXIS_BSPLINE = UInt8(2)
+
+function Unfitted._tensor_dof_key(level::Level{D,T,<:BSplineFamily}, cell::CartesianIndex{D},
+                                  local_id::CartesianIndex{D}) where {D,T}
+    family = level.basis
+    axes = ntuple(d -> _bspline_axis_dof_key(family, d, cell.I[d], local_id.I[d]), D)
+    return TensorDofKey{D}(level.id, axes)
+end
 
 # Build the per-axis dof key for the B-spline family. A cell-local 1D
 # mode `m ∈ 0:p_d` on cell `c` maps to the global 1D function index
@@ -625,11 +632,24 @@ const _AXIS_BSPLINE = UInt8(2)
     return AxisDofKey(_AXIS_BSPLINE, family.cell_to_span[axis][cell_axis] + mode, 0)
 end
 
-function Unfitted._tensor_dof_key(level::Level{D,T,<:BSplineFamily}, cell::CartesianIndex{D},
-                                  local_id::CartesianIndex{D}) where {D,T}
+# True iff the per-axis B-spline factor of `key` anchors at the level's
+# lower or upper mesh edge along `axis`. Used by the **physical
+# Dirichlet** detection in `dirichlet.jl::_mark_physical_dirichlet!`: only
+# the function that is interpolatory at the boundary (index 1 at the
+# lower edge, index `dim` at the upper edge for an open clamped knot
+# vector) carries the Dirichlet value. Higher-derivative constraints
+# (`continuity ≥ 1`) at the **overlay-artificial** boundary are
+# imposed by the linear-constraint rows
+# [`_overlay_constraints!`](@ref) records, not through this predicate.
+function Unfitted._key_on_level_side(key::TensorDofKey{D}, level::Level{D,T,<:BSplineFamily},
+                                     axis::Integer, side::Symbol) where {D,T}
+    axis_key = key.axes[axis]
+    axis_key.kind == _AXIS_BSPLINE || return false
     family = level.basis
-    axes = ntuple(d -> _bspline_axis_dof_key(family, d, cell.I[d], local_id.I[d]), D)
-    return TensorDofKey{D}(level.id, axes)
+    n = dim(family.spaces[axis])
+    side === :lower && return axis_key.index == 1
+    side === :upper && return axis_key.index == n
+    throw(ArgumentError("boundary side must be :lower or :upper"))
 end
 
 # ── Support selection: the admissible region and the functions inside it ──────
@@ -698,15 +718,61 @@ function _admissibility(level::Level{D,T,S}, ctx::_LevelContext{D,T}) where {D,T
                                                       ctx.classify_cache)
 end
 
-# The box of cell `c` of the level's grid, for a `c` that may lie outside
-# `1 … n`. The mesh is uniform by construction (`_mesh_axes`), so the grid
-# continues past the box with the same width, and that continuation is exactly
-# what a function reaching past the level's own face is supported on.
-function _virtual_cell_box(a::_Admissibility{D,T}, c::CartesianIndex{D}) where {D,T}
-    mesh = a.level.mesh
-    lower = SVector{D,T}(ntuple(d -> mesh.domain.lower[d] + (c.I[d] - 1) * a.width[d], D))
-    upper = SVector{D,T}(ntuple(d -> mesh.domain.lower[d] + c.I[d] * a.width[d], D))
-    return AxisBox{D,T}(lower, upper)
+# `_overlay_constraints!` at `continuity = :maximal`: one strong elimination per
+# function whose support is not admissible, and nothing else.
+#
+# This is the whole artificial-boundary treatment for a maximal-continuity level,
+# and it is a *selection* rather than a constraint system. The functions that
+# survive are already globally `C^{p−1}` and identically zero outside their
+# support, so their extension by zero is `C^{p−1}` with no equation to impose;
+# the ones that do not survive are removed outright. Three consequences follow
+# from that and none of them is incidental:
+#
+#   * `has_linear_constraints` stays `false`, so assembly never searches a
+#     region for pivots and never condenses one: every slot is a plain active or
+#     constrained dof.
+#   * There are no pivots, so the reconstruction path cannot mis-read one. The
+#     defect that `dof_value` used to carry is unreachable here by construction
+#     rather than by repair.
+#   * The cascade resolver never runs on a chain, so it cannot fill in, cannot
+#     lose a term to a relative drop tolerance, and cannot cost `O(n²)` in the
+#     chain length.
+#
+# Arbitrary mask geometries are handled without a special case, because
+# containment is a per-function test and knows nothing about the shape of the
+# region it tests against.
+function _selection_constraints!(ledger::EliminationLedger, level::Level{D,T,<:BSplineFamily},
+                                 ctx::_LevelContext{D,T}) where {D,T}
+    admissibility = _admissibility(level, ctx)
+    for raw in ctx.raws
+        _support_admissible(admissibility, ctx.raw_keys[raw]) || _eliminate!(ledger, raw, :overlay)
+    end
+    return ledger
+end
+
+# Whether the tensor B-spline named by `key` may stay: its full, unclipped support
+# must be admissible.
+function _support_admissible(a::_Admissibility{D,T,P,<:BSplineFamily},
+                             key::TensorDofKey{D}) where {D,T,P}
+    lo, hi = _support_block(a.level.basis, ntuple(d -> key.axes[d].index, D))
+    return _block_admissible(a, lo, hi)
+end
+
+# The unclipped support block of the level's 1D function indices `i`: per axis the
+# function with global index `i_d` is supported on cells `i_d − p_d … i_d`.
+function _support_block(family::BSplineFamily{D}, index::NTuple{D,Int}) where {D}
+    return ntuple(d -> index[d] - degree(family.spaces[d]), D), index
+end
+
+# Whether every cell of the block `lo … hi` is admissible — the one predicate both
+# the selection rule and the burial test are expressed over. `lo`/`hi` are
+# unclipped: an index outside `1 … n` is exactly the signal that the block reaches
+# past the level's own box.
+function _block_admissible(a::_Admissibility{D}, lo::NTuple{D,Int}, hi::NTuple{D,Int}) where {D}
+    for c in CartesianIndices(ntuple(d -> lo[d]:hi[d], D))
+        _cell_admissible(a, c) || return false
+    end
+    return true
 end
 
 # Whether cell `c` — which may lie outside the level's own grid — is admissible:
@@ -747,84 +813,18 @@ function _cell_admissible(a::_Admissibility{D}, c::CartesianIndex{D}) where {D}
     return classify_cell(a.physical, _virtual_cell_box(a, c), a.cache) === :fictitious
 end
 
-# Whether every cell of the block `lo … hi` is admissible — the one predicate both
-# the selection rule and the burial test are expressed over. `lo`/`hi` are
-# unclipped: an index outside `1 … n` is exactly the signal that the block reaches
-# past the level's own box.
-function _block_admissible(a::_Admissibility{D}, lo::NTuple{D,Int}, hi::NTuple{D,Int}) where {D}
-    for c in CartesianIndices(ntuple(d -> lo[d]:hi[d], D))
-        _cell_admissible(a, c) || return false
-    end
-    return true
+# The box of cell `c` of the level's grid, for a `c` that may lie outside
+# `1 … n`. The mesh is uniform by construction (`_mesh_axes`), so the grid
+# continues past the box with the same width, and that continuation is exactly
+# what a function reaching past the level's own face is supported on.
+function _virtual_cell_box(a::_Admissibility{D,T}, c::CartesianIndex{D}) where {D,T}
+    mesh = a.level.mesh
+    lower = SVector{D,T}(ntuple(d -> mesh.domain.lower[d] + (c.I[d] - 1) * a.width[d], D))
+    upper = SVector{D,T}(ntuple(d -> mesh.domain.lower[d] + c.I[d] * a.width[d], D))
+    return AxisBox{D,T}(lower, upper)
 end
 
-# The unclipped support block of the level's 1D function indices `i`: per axis the
-# function with global index `i_d` is supported on cells `i_d − p_d … i_d`.
-function _support_block(family::BSplineFamily{D}, index::NTuple{D,Int}) where {D}
-    return ntuple(d -> index[d] - degree(family.spaces[d]), D), index
-end
-
-# Whether the tensor B-spline named by `key` may stay: its full, unclipped support
-# must be admissible.
-function _support_admissible(a::_Admissibility{D,T,P,<:BSplineFamily},
-                             key::TensorDofKey{D}) where {D,T,P}
-    lo, hi = _support_block(a.level.basis, ntuple(d -> key.axes[d].index, D))
-    return _block_admissible(a, lo, hi)
-end
-
-# `_overlay_constraints!` at `continuity = :maximal`: one strong elimination per
-# function whose support is not admissible, and nothing else.
-#
-# This is the whole artificial-boundary treatment for a maximal-continuity level,
-# and it is a *selection* rather than a constraint system. The functions that
-# survive are already globally `C^{p−1}` and identically zero outside their
-# support, so their extension by zero is `C^{p−1}` with no equation to impose;
-# the ones that do not survive are removed outright. Three consequences follow
-# from that and none of them is incidental:
-#
-#   * `has_linear_constraints` stays `false`, so assembly never searches a
-#     region for pivots and never condenses one: every slot is a plain active or
-#     constrained dof.
-#   * There are no pivots, so the reconstruction path cannot mis-read one. The
-#     defect that `dof_value` used to carry is unreachable here by construction
-#     rather than by repair.
-#   * The cascade resolver never runs on a chain, so it cannot fill in, cannot
-#     lose a term to a relative drop tolerance, and cannot cost `O(n²)` in the
-#     chain length.
-#
-# Arbitrary mask geometries are handled without a special case, because
-# containment is a per-function test and knows nothing about the shape of the
-# region it tests against.
-function _selection_constraints!(ledger::EliminationLedger, level::Level{D,T,<:BSplineFamily},
-                                 ctx::_LevelContext{D,T}) where {D,T}
-    admissibility = _admissibility(level, ctx)
-    for raw in ctx.raws
-        _support_admissible(admissibility, ctx.raw_keys[raw]) || _eliminate!(ledger, raw, :overlay)
-    end
-    return ledger
-end
-
-# ── Boundary classification and Dirichlet trace ───────────────────────────────
-
-# True iff the per-axis B-spline factor of `key` anchors at the level's
-# lower or upper mesh edge along `axis`. Used by the **physical
-# Dirichlet** detection in `dirichlet.jl::_mark_physical_dirichlet!`: only
-# the function that is interpolatory at the boundary (index 1 at the
-# lower edge, index `dim` at the upper edge for an open clamped knot
-# vector) carries the Dirichlet value. Higher-derivative constraints
-# (`continuity ≥ 1`) at the **overlay-artificial** boundary are
-# imposed by the linear-constraint rows
-# [`_overlay_constraints!`](@ref) records, not through this predicate.
-function Unfitted._key_on_level_side(key::TensorDofKey{D}, level::Level{D,T,<:BSplineFamily},
-                                     axis::Integer, side::Symbol) where {D,T}
-    axis_key = key.axes[axis]
-    axis_key.kind == _AXIS_BSPLINE || return false
-    family = level.basis
-    n = dim(family.spaces[axis])
-    side === :lower && return axis_key.index == 1
-    side === :upper && return axis_key.index == n
-    throw(ArgumentError("boundary side must be :lower or :upper"))
-end
+# ── The artificial-boundary hook: clamped trace rows ──────────────────────────
 
 # The B-spline `_overlay_constraints!`. At `continuity = :maximal` it is the
 # support selection above. Below it, it records the homogeneous linear
@@ -997,153 +997,7 @@ function _active_cell_at_face(level::Level{D}, d::Int, j::Int, perp_cell::Cartes
     return a_j ? (cell_j, j) : (cell_jp1, j + 1)
 end
 
-# ── Covered-mode pruning: dedup of what a covering level already contains ──────────
-
-# The cells this level's axis-`d` 1D function with global index `i` is supported
-# on. Cell `c` carries the global indices `c … c + p` (uniform knots,
-# `cell_to_span` the identity), so function `i` lives on
-# `max(1, i − p) … min(ncells, i)` — up to `p + 1` cells. The core's
-# `_axis_incidence` cannot answer this: it is written for the integrated-Legendre
-# node / span keys and reports a single cell for any other tag.
-@inline _axis_support(i::Integer, p::Integer, ncells::Integer) = max(1, i-p):min(ncells, i)
-
-function _support_cells(key::TensorDofKey{D}, family::BSplineFamily{D}, n::NTuple{D,Int}) where {D}
-    return CartesianIndices(ntuple(d -> _axis_support(key.axes[d].index, degree(family.spaces[d]),
-                                                      n[d]), D))
-end
-
-# True iff level `k`, standing above a B-spline level of per-axis degree `p`,
-# reproduces that level's buried functions exactly — given the meshes nest, which
-# the caller tests separately with `_nested_over`.
-#
-# A buried function's support lies inside `k`'s active region, and it vanishes
-# there to order `p − 1` (its own end knots are simple), so `k`'s trace conditions
-# — orders `0 … m ≤ p − 1` — never exclude it. What is left is a question about
-# the two spans:
-#
-#   * a B-spline `k` of the *same* degree. Interior knots are simple on both
-#     sides, so `k` is `C^{p−1}` exactly where the buried function kinks and,
-#     under nesting, that function is one of `k`'s own splines. A *higher* degree
-#     does not help — at a shared simple knot `k` would be `C^p`, too smooth to
-#     carry the kink — and a lower one cannot carry the polynomial degree.
-#   * an integrated-Legendre `k` in `:tensor` mode of order ≥ `p`. Its span is
-#     every `C⁰` tensor polynomial of that degree on its cells, which contains a
-#     `C^{p−1}` spline of degree `p`. `:trunk` drops the mixed high-order terms,
-#     so it does not.
-#
-# Every other family answers `false`. That is the safe direction: skipping a
-# legitimate dedup leaves a rank-deficient operator, whereas deduping a function
-# nothing reproduces would delete part of the space.
-function _reproduces(k::Level{D}, p::NTuple{D,Int}) where {D}
-    family = k.basis
-    family isa BSplineFamily && return all(d -> degree(family.spaces[d]) == p[d], 1:D)
-    family isa IntegratedLegendre || return false
-    k.mode === :tensor || return false
-    # `nominal_order(k)` is the level's per-axis maximum, which is not enough when `k` carries
-    # a per-cell order: a single cell below `p` anywhere under the buried function's
-    # support cannot reproduce it. Requiring every palette entry to clear `p` is the
-    # conservative reading — it can only skip a legitimate dedup, never delete a
-    # function nothing reproduces.
-    return all(o -> all(d -> o[d] >= p[d], 1:D), k.orders.palette)
-end
-
-# The reverse direction of `_reproduces`: whether *this* family, standing above an
-# integrated-Legendre level, spans that level's C⁰ hats and may therefore deduplicate
-# them. At degree 1 the open knot vector is the Q1 hat basis outright — simple interior
-# knots give exactly C⁰, the clamped ends give the two boundary hats — so on a nested
-# mesh the buried hat is one of this level's own functions. Any axis at degree ≥ 2 is
-# C^(p−1) with p − 1 ≥ 1 at a simple interior knot, too smooth to carry the kink, and
-# the whole tensor product goes with it. Answering per axis rather than per level is
-# what makes this a mixed-family question: a degree-1 B-spline cover over an
-# integrated-Legendre base is the C⁰ hat space and was previously refused the dedup by a
-# family type test, leaving the stack exactly singular.
-Unfitted._spans_hats(f::BSplineFamily{D}) where {D} = all(d -> degree(f.spaces[d]) == 1, 1:D)
-
-# A degree-`p_d` B-spline spans `p_d + 1` cells along axis `d`, so a marked region
-# has to be dilated by `p_d` cells per side before the level carries the functions
-# the marking meant to wake. Read by `support_extension`; the `::BasisFamily`
-# default of zero would silently leave an adaptive loop marking regions that
-# generate no unknowns at all.
-#
-# The radius comes from the family's own degrees rather than from the `order`
-# argument, which on this family is the same number — a B-spline level's degree
-# belongs to its knot vectors, so there is one degree per axis and no per-cell
-# field to disagree with.
-function Unfitted._support_radius(family::BSplineFamily{D}, ::NTuple{D,Int}) where {D}
-    # The radius belongs to the SELECTING mechanism. A level clamped at an integer
-    # `continuity` keeps `n + p − 2(m + 1)` functions per axis and carries some on a
-    # region one cell wide, so it needs no room made for it and a nonzero radius here
-    # would make `refine` wake cells nothing asked for.
-    _selects_by_support(family) || return ntuple(_ -> 0, D)
-    return ntuple(d -> degree(family.spaces[d]), D)
-end
-
-# The cells of `k`'s grid — virtual indices included — whose closure lies inside
-# the coordinate box `lo … hi`. Used to turn a buried function's support, which is
-# stated in the *coarse* level's cells, into the fine cell block the subdivision
-# lives on.
-#
-# The meshes nest (the caller has already asked `_nested_over`), so every
-# coordinate involved lands on one of `k`'s knot lines and the division is exact
-# up to floating point; rounding to the nearest integer is therefore the right
-# reading rather than a tolerance choice, and it extends past `k`'s own box
-# because the grid does.
-function _fine_cell_range(a::_Admissibility{D,T}, lower::SVector{D,T},
-                          upper::SVector{D,T}) where {D,T}
-    origin = a.level.mesh.domain.lower
-    lo = ntuple(d -> round(Int, (lower[d] - origin[d]) / a.width[d]) + 1, D)
-    hi = ntuple(d -> round(Int, (upper[d] - origin[d]) / a.width[d]), D)
-    return lo, hi
-end
-
-# True iff the covering level `k` reproduces, on Ω, the function of `level` named
-# by `key` — the burial test in the form support selection makes available, and
-# the one that is **exact** rather than conservative.
-#
-# Subdivision is the whole argument. On nested meshes of equal degree a B-spline
-# of the coarse level is a combination, with strictly positive coefficients, of
-# exactly those fine B-splines whose support lies inside its own, and that
-# representation is unique. So the coarse function is reproduced **iff every one
-# of those fine functions is itself kept by `k`** — sufficiency because the
-# combination is then available verbatim, necessity because a dropped term cannot
-# be replaced: a fine-space function vanishing on Ω has no coefficient on any fine
-# function whose support meets Ω, so the coefficients of the live terms are forced.
-#
-# Both halves are decided by one predicate, `_block_admissible` on `k`, which is
-# the same predicate `k` used to select its own functions. That is what makes the
-# test exact rather than a geometric approximation of it, and it is why the
-# fictitious-fold cases need no special handling here: a fine function supported
-# entirely in fictitious material is admissible on `k` for the same reason it
-# contributes nothing, so it can neither block the dedup nor be missed by it.
-#
-# This is what the clamped path cannot say. There, `k` keeps functions that do not
-# vanish on its own box face, so its span near that face is larger than any
-# statement about supports describes, and it can reproduce a *combination* of two
-# buried functions without reproducing either — a dependency a per-function dedup
-# cannot see, and one exact null mode per combination in the assembled operator.
-function _reproduced_by_selection(level::Level{D,T,<:BSplineFamily}, key::TensorDofKey{D},
-                                  cover::_Admissibility{D,T,P,<:BSplineFamily}) where {D,T,P}
-    coarse = level.basis
-    index = ntuple(d -> key.axes[d].index, D)
-    clo, chi = _support_block(coarse, index)
-    # The support as coordinates on the coarse grid, continued past its own box the
-    # same way the grid is.
-    mesh = level.mesh
-    width = ntuple(d -> (mesh.domain.upper[d] - mesh.domain.lower[d]) / mesh.cells[d], D)
-    lower = SVector{D,T}(ntuple(d -> mesh.domain.lower[d] + (clo[d] - 1) * width[d], D))
-    upper = SVector{D,T}(ntuple(d -> mesh.domain.lower[d] + chi[d] * width[d], D))
-    flo, fhi = _fine_cell_range(cover, lower, upper)
-    fine = cover.level.basis
-    # "Every fine function whose own support fits inside the block is admissible" is
-    # the same statement as "every cell of the block is admissible", because those
-    # functions' supports tile it exactly: as `m` sweeps `flo + p … fhi`, the union of
-    # `m − p … m` is `flo … fhi`, no more and no less. Asking it per function re-tests
-    # each cell up to `(p + 1)^D` times for an identical answer, so it is asked once.
-    # The emptiness guard is the one case where the two differ — a block too narrow to
-    # hold a single fine function reproduces nothing — and `false` is the answer there.
-    any(d -> fhi[d] < flo[d] + degree(fine.spaces[d]), 1:D) && return false
-    return _block_admissible(cover, flo, fhi)
-end
+# ── Covered-mode pruning: dedup of what a covering level already contains ─────
 
 # `_coverage_constraints!` for a B-spline level — the dedup half only, and it is
 # the whole of covered-mode pruning for this family.
@@ -1239,6 +1093,54 @@ function Unfitted._coverage_constraints!(ledger::EliminationLedger,
     return ledger
 end
 
+# True iff level `k`, standing above a B-spline level of per-axis degree `p`,
+# reproduces that level's buried functions exactly — given the meshes nest, which
+# the caller tests separately with `_nested_over`.
+#
+# A buried function's support lies inside `k`'s active region, and it vanishes
+# there to order `p − 1` (its own end knots are simple), so `k`'s trace conditions
+# — orders `0 … m ≤ p − 1` — never exclude it. What is left is a question about
+# the two spans:
+#
+#   * a B-spline `k` of the *same* degree. Interior knots are simple on both
+#     sides, so `k` is `C^{p−1}` exactly where the buried function kinks and,
+#     under nesting, that function is one of `k`'s own splines. A *higher* degree
+#     does not help — at a shared simple knot `k` would be `C^p`, too smooth to
+#     carry the kink — and a lower one cannot carry the polynomial degree.
+#   * an integrated-Legendre `k` in `:tensor` mode of order ≥ `p`. Its span is
+#     every `C⁰` tensor polynomial of that degree on its cells, which contains a
+#     `C^{p−1}` spline of degree `p`. `:trunk` drops the mixed high-order terms,
+#     so it does not.
+#
+# Every other family answers `false`. That is the safe direction: skipping a
+# legitimate dedup leaves a rank-deficient operator, whereas deduping a function
+# nothing reproduces would delete part of the space.
+function _reproduces(k::Level{D}, p::NTuple{D,Int}) where {D}
+    family = k.basis
+    family isa BSplineFamily && return all(d -> degree(family.spaces[d]) == p[d], 1:D)
+    family isa IntegratedLegendre || return false
+    k.mode === :tensor || return false
+    # `nominal_order(k)` is the level's per-axis maximum, which is not enough when `k` carries
+    # a per-cell order: a single cell below `p` anywhere under the buried function's
+    # support cannot reproduce it. Requiring every palette entry to clear `p` is the
+    # conservative reading — it can only skip a legitimate dedup, never delete a
+    # function nothing reproduces.
+    return all(o -> all(d -> o[d] >= p[d], 1:D), k.orders.palette)
+end
+
+function _support_cells(key::TensorDofKey{D}, family::BSplineFamily{D}, n::NTuple{D,Int}) where {D}
+    return CartesianIndices(ntuple(d -> _axis_support(key.axes[d].index, degree(family.spaces[d]),
+                                                      n[d]), D))
+end
+
+# The cells this level's axis-`d` 1D function with global index `i` is supported
+# on. Cell `c` carries the global indices `c … c + p` (uniform knots,
+# `cell_to_span` the identity), so function `i` lives on
+# `max(1, i − p) … min(ncells, i)` — up to `p + 1` cells. The core's
+# `_axis_incidence` cannot answer this: it is written for the integrated-Legendre
+# node / span keys and reports a single cell for any other tag.
+@inline _axis_support(i::Integer, p::Integer, ncells::Integer) = max(1, i-p):min(ncells, i)
+
 # Mark every candidate of `level` that the covering level `k` reproduces and no
 # earlier cover did: by subdivision against `cover`, `k`'s admissibility record, when
 # `k` selects by support, and by `_reproduced_on_domain` when `cover` is `nothing`.
@@ -1265,6 +1167,73 @@ function _mark_reproduced!(reproduced::BitVector, candidates::Vector{Int},
                         _reproduced_by_selection(level, key, cover)
     end
     return reproduced
+end
+
+# True iff the covering level `k` reproduces, on Ω, the function of `level` named
+# by `key` — the burial test in the form support selection makes available, and
+# the one that is **exact** rather than conservative.
+#
+# Subdivision is the whole argument. On nested meshes of equal degree a B-spline
+# of the coarse level is a combination, with strictly positive coefficients, of
+# exactly those fine B-splines whose support lies inside its own, and that
+# representation is unique. So the coarse function is reproduced **iff every one
+# of those fine functions is itself kept by `k`** — sufficiency because the
+# combination is then available verbatim, necessity because a dropped term cannot
+# be replaced: a fine-space function vanishing on Ω has no coefficient on any fine
+# function whose support meets Ω, so the coefficients of the live terms are forced.
+#
+# Both halves are decided by one predicate, `_block_admissible` on `k`, which is
+# the same predicate `k` used to select its own functions. That is what makes the
+# test exact rather than a geometric approximation of it, and it is why the
+# fictitious-fold cases need no special handling here: a fine function supported
+# entirely in fictitious material is admissible on `k` for the same reason it
+# contributes nothing, so it can neither block the dedup nor be missed by it.
+#
+# This is what the clamped path cannot say. There, `k` keeps functions that do not
+# vanish on its own box face, so its span near that face is larger than any
+# statement about supports describes, and it can reproduce a *combination* of two
+# buried functions without reproducing either — a dependency a per-function dedup
+# cannot see, and one exact null mode per combination in the assembled operator.
+function _reproduced_by_selection(level::Level{D,T,<:BSplineFamily}, key::TensorDofKey{D},
+                                  cover::_Admissibility{D,T,P,<:BSplineFamily}) where {D,T,P}
+    coarse = level.basis
+    index = ntuple(d -> key.axes[d].index, D)
+    clo, chi = _support_block(coarse, index)
+    # The support as coordinates on the coarse grid, continued past its own box the
+    # same way the grid is.
+    mesh = level.mesh
+    width = ntuple(d -> (mesh.domain.upper[d] - mesh.domain.lower[d]) / mesh.cells[d], D)
+    lower = SVector{D,T}(ntuple(d -> mesh.domain.lower[d] + (clo[d] - 1) * width[d], D))
+    upper = SVector{D,T}(ntuple(d -> mesh.domain.lower[d] + chi[d] * width[d], D))
+    flo, fhi = _fine_cell_range(cover, lower, upper)
+    fine = cover.level.basis
+    # "Every fine function whose own support fits inside the block is admissible" is
+    # the same statement as "every cell of the block is admissible", because those
+    # functions' supports tile it exactly: as `m` sweeps `flo + p … fhi`, the union of
+    # `m − p … m` is `flo … fhi`, no more and no less. Asking it per function re-tests
+    # each cell up to `(p + 1)^D` times for an identical answer, so it is asked once.
+    # The emptiness guard is the one case where the two differ — a block too narrow to
+    # hold a single fine function reproduces nothing — and `false` is the answer there.
+    any(d -> fhi[d] < flo[d] + degree(fine.spaces[d]), 1:D) && return false
+    return _block_admissible(cover, flo, fhi)
+end
+
+# The cells of `k`'s grid — virtual indices included — whose closure lies inside
+# the coordinate box `lo … hi`. Used to turn a buried function's support, which is
+# stated in the *coarse* level's cells, into the fine cell block the subdivision
+# lives on.
+#
+# The meshes nest (the caller has already asked `_nested_over`), so every
+# coordinate involved lands on one of `k`'s knot lines and the division is exact
+# up to floating point; rounding to the nearest integer is therefore the right
+# reading rather than a tolerance choice, and it extends past `k`'s own box
+# because the grid does.
+function _fine_cell_range(a::_Admissibility{D,T}, lower::SVector{D,T},
+                          upper::SVector{D,T}) where {D,T}
+    origin = a.level.mesh.domain.lower
+    lo = ntuple(d -> round(Int, (lower[d] - origin[d]) / a.width[d]) + 1, D)
+    hi = ntuple(d -> round(Int, (upper[d] - origin[d]) / a.width[d]), D)
+    return lo, hi
 end
 
 # The dedup is a strong elimination on a selecting level, but a one-term ROW on a
@@ -1321,78 +1290,6 @@ function _combine_terms(terms::Vector{Tuple{Int,T}}) where {T}
     drop_tol = sqrt(eps(T)) * maximum(t -> abs(t[2]), terms; init=one(T))
     filter!(t -> abs(t[2]) > drop_tol, terms)
     return terms
-end
-
-# Back-substitute a freshly created pivot's expansion into every other
-# pivot's expansion that mentions the new pivot raw. Necessary because
-# our greedy pivot ordering doesn't guarantee that a constraint's pivot
-# choice is downstream of all its references — when a later constraint
-# pivots a raw that an earlier pivot's expansion still mentions, the
-# earlier expansion needs the substitution to stay in "free raws only"
-# form.
-#
-# `mentions` lists, per raw, the pivots whose expansion currently contains it,
-# so this visits only the expansions that can possibly need rewriting. It
-# used to scan all `nraw` expansions per constraint, which made the pass
-# `O(K · nraw)` — quadratic in the problem — while the comment here claimed
-# `O(K · D · p)`, "negligible at problem scale". It was not negligible: on a
-# covered stack the dof layout reached 98.7% of `prepare` and 2.8× the cost
-# of `assemble!`, growing ×12.7 and ×14.8 per ×4 in unknowns. The scan's
-# answer was almost always "nothing to do", because every integrated
-# Legendre elimination was then a single-raw strong constraint whose pivot
-# expansion is empty and which therefore mentions no raw at all. (Those are
-# direct `_eliminate!` calls now and never reach the resolver.)
-#
-# The index is allowed to over-report: an expansion rewritten by an earlier
-# substitution may no longer contain the raw that registered it, so the
-# membership test below stays. It must never under-report, which is why an
-# entry is added at *every* site that writes an expansion — here and in
-# `_cascade!` step 4. Every holder it lists is a pivot, since only a pivot's
-# expansion is ever registered, so each one has an assigned `expansions` entry.
-#
-# Both tables are `_cascade!`'s level-local ones: entry `raw - offset` belongs to
-# `raw`, and an entry stays unassigned until something is written to it.
-function _back_substitute!(expansions::Vector{Vector{Tuple{Int,T}}}, mentions::Vector{Vector{Int}},
-                           offset::Int, pivot_raw::Int,
-                           pivot_expansion::Vector{Tuple{Int,T}}) where {T}
-    isassigned(mentions, pivot_raw - offset) || return expansions
-    @inbounds for raw in mentions[pivot_raw - offset]
-        raw == pivot_raw && continue
-        expansion = expansions[raw - offset]
-        # The index over-reports; this is the exact test.
-        any(t -> first(t) == pivot_raw, expansion) || continue
-        # Rebuild with substitution.
-        new_terms = Tuple{Int,T}[]
-        sizehint!(new_terms, length(expansion) + length(pivot_expansion))
-        for (other, w) in expansion
-            if other == pivot_raw
-                for (sub_other, sub_w) in pivot_expansion
-                    push!(new_terms, (sub_other, w * sub_w))
-                end
-            else
-                push!(new_terms, (other, w))
-            end
-        end
-        combined = _combine_terms(new_terms)
-        expansions[raw - offset] = combined
-        # This expansion now mentions the pivot's own references. `pivot_raw`
-        # cannot be among them — `pivot_expansion` was built excluding it — so
-        # the list being iterated is never the one appended to.
-        _register_mentions!(mentions, offset, raw, combined)
-    end
-    return expansions
-end
-
-# Record that `raw`'s expansion contains each of `terms`' raws, in the level-local
-# `mentions` table of `_back_substitute!`. A raw's list is allocated by its first
-# mention, so a level whose pivots are all strong eliminations allocates none.
-function _register_mentions!(mentions::Vector{Vector{Int}}, offset::Int, raw::Int,
-                             terms::Vector{Tuple{Int,T}}) where {T}
-    for (other, _) in terms
-        k = other - offset
-        isassigned(mentions, k) ? push!(mentions[k], raw) : (mentions[k] = [raw])
-    end
-    return mentions
 end
 
 """
@@ -1489,6 +1386,111 @@ function _cascade!(ledger::EliminationLedger{T}) where {T}
         source === :free || _pivot!(ledger, k + offset, expansions[k], source)
     end
     return ledger
+end
+
+# Back-substitute a freshly created pivot's expansion into every other
+# pivot's expansion that mentions the new pivot raw. Necessary because
+# our greedy pivot ordering doesn't guarantee that a constraint's pivot
+# choice is downstream of all its references — when a later constraint
+# pivots a raw that an earlier pivot's expansion still mentions, the
+# earlier expansion needs the substitution to stay in "free raws only"
+# form.
+#
+# `mentions` lists, per raw, the pivots whose expansion currently contains it,
+# so this visits only the expansions that can possibly need rewriting. It
+# used to scan all `nraw` expansions per constraint, which made the pass
+# `O(K · nraw)` — quadratic in the problem — while the comment here claimed
+# `O(K · D · p)`, "negligible at problem scale". It was not negligible: on a
+# covered stack the dof layout reached 98.7% of `prepare` and 2.8× the cost
+# of `assemble!`, growing ×12.7 and ×14.8 per ×4 in unknowns. The scan's
+# answer was almost always "nothing to do", because every integrated
+# Legendre elimination was then a single-raw strong constraint whose pivot
+# expansion is empty and which therefore mentions no raw at all. (Those are
+# direct `_eliminate!` calls now and never reach the resolver.)
+#
+# The index is allowed to over-report: an expansion rewritten by an earlier
+# substitution may no longer contain the raw that registered it, so the
+# membership test below stays. It must never under-report, which is why an
+# entry is added at *every* site that writes an expansion — here and in
+# `_cascade!` step 4. Every holder it lists is a pivot, since only a pivot's
+# expansion is ever registered, so each one has an assigned `expansions` entry.
+#
+# Both tables are `_cascade!`'s level-local ones: entry `raw - offset` belongs to
+# `raw`, and an entry stays unassigned until something is written to it.
+function _back_substitute!(expansions::Vector{Vector{Tuple{Int,T}}}, mentions::Vector{Vector{Int}},
+                           offset::Int, pivot_raw::Int,
+                           pivot_expansion::Vector{Tuple{Int,T}}) where {T}
+    isassigned(mentions, pivot_raw - offset) || return expansions
+    @inbounds for raw in mentions[pivot_raw - offset]
+        raw == pivot_raw && continue
+        expansion = expansions[raw - offset]
+        # The index over-reports; this is the exact test.
+        any(t -> first(t) == pivot_raw, expansion) || continue
+        # Rebuild with substitution.
+        new_terms = Tuple{Int,T}[]
+        sizehint!(new_terms, length(expansion) + length(pivot_expansion))
+        for (other, w) in expansion
+            if other == pivot_raw
+                for (sub_other, sub_w) in pivot_expansion
+                    push!(new_terms, (sub_other, w * sub_w))
+                end
+            else
+                push!(new_terms, (other, w))
+            end
+        end
+        combined = _combine_terms(new_terms)
+        expansions[raw - offset] = combined
+        # This expansion now mentions the pivot's own references. `pivot_raw`
+        # cannot be among them — `pivot_expansion` was built excluding it — so
+        # the list being iterated is never the one appended to.
+        _register_mentions!(mentions, offset, raw, combined)
+    end
+    return expansions
+end
+
+# Record that `raw`'s expansion contains each of `terms`' raws, in the level-local
+# `mentions` table of `_back_substitute!`. A raw's list is allocated by its first
+# mention, so a level whose pivots are all strong eliminations allocates none.
+function _register_mentions!(mentions::Vector{Vector{Int}}, offset::Int, raw::Int,
+                             terms::Vector{Tuple{Int,T}}) where {T}
+    for (other, _) in terms
+        k = other - offset
+        isassigned(mentions, k) ? push!(mentions[k], raw) : (mentions[k] = [raw])
+    end
+    return mentions
+end
+
+# ── Family traits ─────────────────────────────────────────────────────────────
+
+# The reverse direction of `_reproduces`: whether *this* family, standing above an
+# integrated-Legendre level, spans that level's C⁰ hats and may therefore deduplicate
+# them. At degree 1 the open knot vector is the Q1 hat basis outright — simple interior
+# knots give exactly C⁰, the clamped ends give the two boundary hats — so on a nested
+# mesh the buried hat is one of this level's own functions. Any axis at degree ≥ 2 is
+# C^(p−1) with p − 1 ≥ 1 at a simple interior knot, too smooth to carry the kink, and
+# the whole tensor product goes with it. Answering per axis rather than per level is
+# what makes this a mixed-family question: a degree-1 B-spline cover over an
+# integrated-Legendre base is the C⁰ hat space and was previously refused the dedup by a
+# family type test, leaving the stack exactly singular.
+Unfitted._spans_hats(f::BSplineFamily{D}) where {D} = all(d -> degree(f.spaces[d]) == 1, 1:D)
+
+# A degree-`p_d` B-spline spans `p_d + 1` cells along axis `d`, so a marked region
+# has to be dilated by `p_d` cells per side before the level carries the functions
+# the marking meant to wake. Read by `support_extension`; the `::BasisFamily`
+# default of zero would silently leave an adaptive loop marking regions that
+# generate no unknowns at all.
+#
+# The radius comes from the family's own degrees rather than from the `order`
+# argument, which on this family is the same number — a B-spline level's degree
+# belongs to its knot vectors, so there is one degree per axis and no per-cell
+# field to disagree with.
+function Unfitted._support_radius(family::BSplineFamily{D}, ::NTuple{D,Int}) where {D}
+    # The radius belongs to the SELECTING mechanism. A level clamped at an integer
+    # `continuity` keeps `n + p − 2(m + 1)` functions per axis and carries some on a
+    # region one cell wide, so it needs no room made for it and a nonzero radius here
+    # would make `refine` wake cells nothing asked for.
+    _selects_by_support(family) || return ntuple(_ -> 0, D)
+    return ntuple(d -> degree(family.spaces[d]), D)
 end
 
 end # module UnfittedBasicBSplineExt
