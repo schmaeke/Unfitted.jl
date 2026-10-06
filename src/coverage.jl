@@ -1,4 +1,5 @@
-# Per-level coverage of the superposition stack.
+# Per-level coverage of the superposition stack, and the material oracle that coverage
+# and the dof layer consult about inactive cells.
 #
 # The pruning rule sheds a level's high-order modes wherever a finer level
 # fully covers it, keeping only its linear skeleton:
@@ -12,23 +13,150 @@
 #
 # Coverage is mask-aware, so a deactivated overlay does not cover — which is what keeps
 # "a fully-deactivated overlay behaves like no overlay" true under covered-mode pruning. The
-# one deactivation that still covers is the fictitious fold, because a cell outside Ω
-# carries no material at all; see the comment on `_covered_by_level`.
+# one inactive cell that still covers is one that holds no material at all: every cell the
+# fictitious fold switched off, and a user-masked cell lying entirely outside Ω. See the
+# comment on `_covered_by_level`.
 #
-# The fold is exempt on *both* sides of the question, and the two exemptions are
-# separate functions:
+# A cell without material is exempt on *both* sides of the question, and the two
+# exemptions are separate functions:
 #
-#   * on the covering level, a fictitious cell of the cover does not stop it covering
-#     (`_covered_by_level`);
-#   * on the level being pruned, a fictitious cell of the *support* neither has to be
-#     covered nor may block the verdict, because nothing is integrated there and the
-#     function the level assembles is the same on Ω with it or without it
+#   * on the covering level, an inactive cell of the cover that holds no material does
+#     not stop it covering (`_covered_by_level`);
+#   * on the level being pruned, an inactive *support* cell that holds no material
+#     neither has to be covered nor may block the verdict, because nothing is integrated
+#     there and the function the level assembles is the same on Ω with it or without it
 #     (`_reproduced_on_domain`).
 #
 # Reading the rule with only the first exemption in mind is how a nested cover ending
 # inside a folded coarse cell came to leave both copies of an exactly reproduced mode
 # active; `_reproduced_on_domain` is the shared answer, used by the pruning rule in
 # `dofs.jl` and by the B-spline family's own in the extension.
+#
+# Both exemptions, and the artificial-face tests of the dof layer, ask one question of an
+# inactive cell — does it hold material? — and `_Fold` below is the one value that
+# answers it.
+
+# ── The material oracle ───────────────────────────────────────────────────────
+
+# Whether a cell holds material, answered for one dof-layout build.
+#
+# A `LevelMask` merges two deactivations, the caller's `active =` selection and the
+# fictitious fold (`_apply_physical_fold`, `mesh.jl`). Every site of the dof layer that
+# looks behind an inactive cell — coverage, the burial test's level side, the
+# integrated-Legendre artificial face, the B-spline admissible region and trace faces —
+# asks the same question of it: does it hold material? A cell without any carries
+# nothing to represent and no trace to keep continuous; a cell with some is represented
+# by a coarser level only. The answer is a fact about the geometry and the cell box —
+# `classify_cell` reports the box `:fictitious` — and not about which mask switched the
+# cell off: every folded cell is void, and so is a user-masked cell lying entirely
+# outside Ω.
+#
+# Fields:
+#
+#   * `physical` — the space's physical domain under its CONCRETE type `P` (`Nothing`
+#     without one). `Space.physical` is abstractly typed; building a `_Fold` from its
+#     run-time value is the function barrier behind which every query below is a static
+#     call, and with `P = Nothing` every query is a compile-time constant that touches
+#     neither field below.
+#   * `boxes` — the box memo `classify_cell` fills, keyed by the box corners. It is the
+#     caller's: `prepare` hands in the one its fold filled and its integration plan read,
+#     so a cell the fold classified costs a lookup here; a standalone call passes a fresh
+#     one.
+#   * `cells` — per level id, a per-cell verdict table (`0x00` not asked yet, `0x01`
+#     void, `0x02` material), allocated on the level's first query. A build asks about
+#     the same cell many times — per buried function, per cover, per face position — and
+#     a table read is cheaper than hashing the box into `boxes` again. Level ids are
+#     unique within the space the fold was built for, the only space it is asked about.
+#
+# The verdicts are exactly `classify_cell`'s: a table miss makes the same
+# `classify_cell(physical, cell_box(mesh, c), boxes)` call with the same box and memo, a
+# hit returns the stored result of that call, and the call is a pure function of the
+# geometry and the box. Only how often a cell is asked changes.
+#
+# A `_Fold` is built by `_dof_topology` or `build_coverage` and lives for that one call:
+# no `Space`, `Model` or layout keeps it, so its tables are never shared between two
+# public calls, and the box memo keeps the owner it has without it.
+#
+# It lives here rather than beside `_ClassifyCache` in `physical.jl` because its queries
+# are about level grids (`Level`, `cell_box`), which load after `physical.jl`, and its
+# users are this file, `dofs.jl` and the B-spline extension.
+struct _Fold{D,T<:Real,P}
+    physical::P
+    boxes::_ClassifyCache{D,T}
+    cells::Vector{Array{UInt8,D}}
+end
+
+function _Fold(V::Space{D,T}, boxes::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T<:Real}
+    return _Fold{D,T,typeof(V.physical)}(V.physical, boxes, Array{UInt8,D}[])
+end
+
+# Whether `box`, an arbitrary axis-aligned box, holds no material: the box memo alone,
+# with no table, for a box that is not a cell of one of the space's grids — a B-spline
+# level's virtual cell past its own face.
+_fictitious(::_Fold{D,T,Nothing}, ::AxisBox{D,T}) where {D,T<:Real} = false
+function _fictitious(f::_Fold{D,T}, box::AxisBox{D,T}) where {D,T<:Real}
+    return classify_cell(f.physical, box, f.boxes) === :fictitious
+end
+
+# The verdict table of `level`, allocated with every cell "not asked yet" on its first
+# use. A caller that asks one level about many cells resolves it once and hands it to
+# the four-argument `_is_void`. Without a physical domain nothing is ever recorded, and
+# a zero-size table stands in for it.
+function _void_table(::_Fold{D,T,Nothing}, ::Level{D,T}) where {D,T<:Real}
+    return Array{UInt8,D}(undef, ntuple(_ -> 0, D))
+end
+function _void_table(f::_Fold{D,T}, level::Level{D,T}) where {D,T<:Real}
+    tables, id = f.cells, level.id
+    length(tables) < id && resize!(tables, id)
+    isassigned(tables, id) && return tables[id]
+    return tables[id] = zeros(UInt8, level.mesh.cells)
+end
+
+# Whether cell `c` of `level` holds no material: its box lies entirely outside Ω. A
+# fact about the geometry and the box, whatever the cell's activity. The three-argument
+# form looks the level's table up; the four-argument form takes the table the caller
+# resolved once (`_void_table`).
+_is_void(::_Fold{D,T,Nothing}, ::Level{D,T}, ::CartesianIndex{D}) where {D,T<:Real} = false
+function _is_void(f::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}) where {D,T<:Real}
+    return _is_void(f, _void_table(f, level), level, c)
+end
+function _is_void(::_Fold{D,T,Nothing}, ::Array{UInt8,D}, ::Level{D,T},
+                  ::CartesianIndex{D}) where {D,T<:Real}
+    return false
+end
+@inline function _is_void(f::_Fold{D,T}, table::Array{UInt8,D}, level::Level{D,T},
+                          c::CartesianIndex{D}) where {D,T<:Real}
+    verdict = table[c]
+    verdict == 0x00 || return verdict == 0x01
+    return _classify_void!(f, table, level, c)
+end
+
+# A table miss: classify the cell box through the box memo and record the verdict. Out
+# of line, so the hit path a per-cell loop inlines stays a load and a compare.
+@noinline function _classify_void!(f::_Fold{D,T}, table::Array{UInt8,D}, level::Level{D,T},
+                                   c::CartesianIndex{D}) where {D,T<:Real}
+    void = classify_cell(f.physical, cell_box(level.mesh, c), f.boxes) === :fictitious
+    table[c] = void ? 0x01 : 0x02
+    return void
+end
+
+# Whether cell `c` of `level` is inactive and holds no material: every cell the fold
+# switched off, and a user-masked cell lying entirely outside Ω. An inactive cell for
+# which this is false holds material that only a coarser level represents.
+function _is_fictitious(f::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}) where {D,T<:Real}
+    is_active(level.mask, c) && return false
+    return _is_void(f, level, c)
+end
+
+# The cheap half of `_covered_by_level`: whether a centre sample proves that `box` holds
+# material. `:fictitious` means no point of the box lies in Ω, so a centre inside Ω rules
+# that verdict out. Without a physical domain every cell holds material.
+_material_at_centre(::_Fold{D,T,Nothing}, ::AxisBox{D,T}) where {D,T<:Real} = true
+function _material_at_centre(f::_Fold{D,T}, box::AxisBox{D,T}) where {D,T<:Real}
+    return _inside(f.physical.geometry, center(box))
+end
+
+# ── Coverage ──────────────────────────────────────────────────────────────────
 
 """
     Coverage{D}
@@ -81,113 +209,102 @@ end
 
 # True iff `box` (a coarser-level cell) lies inside the covering region of the single
 # level `k`: inside k's domain, and — when k is masked — with every k-cell it overlaps
-# either active or fully outside Ω. The unmasked fast path is a single box-containment
-# test.
+# either active or holding no material at all. The unmasked fast path is a single
+# box-containment test.
 #
-# Why an inactive cell outside Ω still counts as covering. A `LevelMask` merges two
-# deactivation sources (`_apply_physical_fold` in `mesh.jl`): the user's `active =`
-# selection, and the fictitious fold that drops cells lying entirely outside Ω. Here
-# they mean opposite things.
+# Why an inactive cell without material still counts as covering. A `LevelMask` merges
+# two deactivation sources (`_apply_physical_fold` in `mesh.jl`): the user's `active =`
+# selection, and the fictitious fold that drops cells lying entirely outside Ω. What
+# decides here is not which source switched a cell off but whether the cell holds
+# material, which `fold` answers (`_Fold`).
 #
-#   * A *user-masked* cell still holds real material. Only the coarser level
-#     represents it, so it blocks coverage and the parent keeps its high-order modes.
-#   * A *fictitious* cell holds no material at all. Nothing is integrated over it, so
-#     there is nothing there for the parent to represent, and on Ω the parent's
-#     high-order modes over that cell are reproduced exactly by the finer level.
+#   * A cell that holds material — a user mask inside Ω — is represented only by the
+#     coarser level, so it blocks coverage and the parent keeps its high-order modes.
+#   * A cell that holds none — every folded cell, and a user mask lying entirely outside
+#     Ω — has nothing integrated over it, so there is nothing there for the parent to
+#     represent, and on Ω the parent's high-order modes over that cell are reproduced
+#     exactly by the finer level.
 #
-# Letting a fictitious cell block coverage therefore leaves a parent mode active that
-# the finer level already duplicates on Ω, and the assembled operator acquires an exact
-# null mode — a function with ‖v_h‖_{L²(Ω)} = 0, living entirely in the fictitious part.
-# This mirrors `_has_overlay_constraint` in `dofs.jl`, which draws the same
-# fold-versus-user-mask distinction for the artificial overlay trace condition. With
-# `physical === nothing` there is no fictitious material and the original
-# active-cells-only rule is recovered without ever touching `cache`.
+# Letting a void cell block coverage therefore leaves a parent mode active that the
+# finer level already duplicates on Ω, and the assembled operator acquires an exact null
+# mode — a function with ‖v_h‖_{L²(Ω)} = 0, living entirely in the fictitious part.
+# This mirrors `_has_overlay_constraint` in `dofs.jl`, which asks the same material
+# question for the artificial overlay trace condition. With no physical domain every
+# inactive cell holds material and the original active-cells-only rule is recovered
+# without classifying anything.
 #
 # For the masked case we do NOT scan all of k's cells: `_cells_under_box` resolves the
 # axis-aligned block by binary search.
-function _covered_by_level(box::AxisBox{D,T}, k::Level{D,T}, tol::GeometryTolerance{T}, physical,
-                           cache::_ClassifyCache{D,T}) where {D,T}
+function _covered_by_level(box::AxisBox{D,T}, k::Level{D,T}, tol::GeometryTolerance{T},
+                           fold::_Fold{D,T}) where {D,T}
     is_inside(box, k.mesh.domain, tol) || return false
     k.mask === nothing && return true
     cells = _cells_under_box(k.mesh, box, tol)
 
-    # Pass 1 — one centre sample per inactive cell. `:fictitious` means *no* point of the
-    # cell lies in Ω, so a centre inside Ω rules that verdict out, and this is the
-    # overwhelmingly common case: a coarse cell abutting a sparsely-populated overlay
-    # meets that overlay's user-masked (material-carrying) cells, not its folded ones.
+    # Pass 1 — one centre sample per inactive cell. A void cell has *no* point in Ω, so a
+    # centre inside Ω rules that verdict out, and this is the overwhelmingly common case:
+    # a coarse cell abutting a sparsely-populated overlay meets that overlay's user-masked
+    # (material-carrying) cells, not its folded ones.
     for kc in cells
         is_active(k.mask, kc) && continue                       # an inactive overlapped cell
-        physical === nothing && return false
-        _inside(physical.geometry, center(cell_box(k.mesh, kc))) && return false
+        _material_at_centre(fold, cell_box(k.mesh, kc)) && return false
     end
 
     # Pass 2 — the exact verdict, for the blocks pass 1 could not settle. Splitting the
     # passes matters because `classify_cell` is not a lookup: the Lipschitz certificate
     # cannot certify a cell as outside Ω once the cell's half-diagonal exceeds the
     # feature it sits in, and the classifier then walks its subdivision budget to the
-    # bottom. Interleaved, a block whose leading cells are fictitious would pay that walk
-    # for each of them before reaching the material cell that decides the answer; here
-    # the cheap pass reaches it first, for at most one classification's worth of samples.
+    # bottom. Interleaved, a block whose leading cells are void would pay that walk for
+    # each of them before reaching the material cell that decides the answer; here the
+    # cheap pass reaches it first, for at most one classification's worth of samples.
     for kc in cells
         is_active(k.mask, kc) && continue
-        classify_cell(physical, cell_box(k.mesh, kc), cache) === :fictitious || return false
+        _is_void(fold, k, kc) || return false
     end
     return true
-end
-
-# True iff cell `ci` of `level` was deactivated by the fictitious fold rather than by
-# the user's `active =` selection: inactive, and holding no material at all. The two
-# sources are merged into one `LevelMask` by `_apply_physical_fold` (`mesh.jl`) and mean
-# opposite things everywhere the dof layer looks at them; this is the one test that
-# separates them again. With `physical === nothing` there is no fold, so every inactive
-# cell is a user mask and `cache` is never touched.
-function _is_fictitious(level::Level{D,T}, ci::CartesianIndex{D}, physical,
-                        cache::_ClassifyCache{D,T}) where {D,T}
-    is_active(level.mask, ci) && return false
-    physical === nothing && return false
-    return classify_cell(physical, cell_box(level.mesh, ci), cache) === :fictitious
 end
 
 # True iff `k` reproduces on Ω the function `level` assembles from the contiguous cell
 # block `cells` — the support of one of `level`'s dofs. Nesting and the span-containment
 # question ("does k's basis carry this shape at all?") belong to the caller; what is
 # settled here is geometric: does what `k` is *allowed* to represent still contain the
-# function, once the fold has been accounted for on both levels.
+# function, once the cells holding no material have been accounted for on both levels.
 #
 # Three conditions, and each is a separate failure mode:
 #
-#   1. Every *material* (active) cell of the support is covered by `k` alone. `level`
-#      integrates there, so `k` must reach there — and `_covered_by_level` already
-#      applies the fold rule to `k`'s own mask.
-#   2. Every inactive cell of the support is fictitious. An inactive cell generates
+#   1. Every *active* cell of the support is covered by `k` alone. `level` integrates
+#      there, so `k` must reach there — and `_covered_by_level` already applies the
+#      material rule to `k`'s own mask.
+#   2. Every inactive cell of the support holds no material. An inactive cell generates
 #      nothing, so what `level` assembles is the function truncated to its active
-#      cells. For a fold that truncation is invisible on Ω — nothing is integrated
-#      outside Ω — and the two functions agree where it matters. For a *user*-masked
-#      cell it is not: material there is carried by `level` alone, the truncated
-#      function has a jump `k` does not reproduce, and the dedup must not fire.
+#      cells. Over a void cell — a folded one, or a user mask entirely outside Ω — that
+#      truncation is invisible on Ω, since nothing is integrated outside Ω, and the two
+#      functions agree where it matters. Over a cell that holds material it is not:
+#      material there is carried by `level` alone, the truncated function has a jump
+#      `k` does not reproduce, and the dedup must not fire.
 #   3. No face of `k`'s box that cuts the interior of the support carries a trace
 #      condition. `k` is clamped to zero on its artificial boundary — but only where
-#      its boundary cells are *active*, since a fold face emits no constraint
-#      (`_has_overlay_constraint` / `_active_cell_at_face`). A face strictly inside the
-#      support hull is a face the function is generally non-zero on, so one active
-#      boundary cell of `k` along it puts the function outside `k`'s constrained span.
-#      Faces at or outside the hull are harmless: the function vanishes there.
-#      A mesh-box face lying on ∂Ω_global needs no exemption here even though it too
-#      emits nothing — it can never cut the hull, because the hull lies inside the
-#      level's own domain, which lies inside the global one.
+#      its boundary cells are *active*, since a face whose inactive side is void emits
+#      no constraint (`_has_overlay_constraint` / `_active_cell_at_face`). A face
+#      strictly inside the support hull is a face the function is generally non-zero
+#      on, so one active boundary cell of `k` along it puts the function outside `k`'s
+#      constrained span. Faces at or outside the hull are harmless: the function
+#      vanishes there. A mesh-box face lying on ∂Ω_global needs no exemption here even
+#      though it too emits nothing — it can never cut the hull, because the hull lies
+#      inside the level's own domain, which lies inside the global one.
 #
 # Condition 3 is vacuous whenever every support cell is active: condition 1 then puts
 # the whole (contiguous, hence hull-filling) block inside `k`'s domain, so no face of
-# `k` is strictly inside the hull. It is the fold that makes the rule bite — a support
-# whose material part `k` covers while its fictitious part sticks out past `k`'s box.
+# `k` is strictly inside the hull. It is the void cells that make the rule bite — a
+# support whose material part `k` covers while its fictitious part sticks out past `k`'s
+# box.
 function _reproduced_on_domain(level::Level{D,T}, k::Level{D,T}, cells::CartesianIndices{D},
-                               physical, tol::GeometryTolerance{T},
-                               cache::_ClassifyCache{D,T}) where {D,T}
+                               tol::GeometryTolerance{T}, fold::_Fold{D,T}) where {D,T}
     for ci in cells
         if is_active(level.mask, ci)
-            _covered_by_level(cell_box(level.mesh, ci), k, tol, physical, cache) || return false
+            _covered_by_level(cell_box(level.mesh, ci), k, tol, fold) || return false
         else
-            _is_fictitious(level, ci, physical, cache) || return false
+            _is_void(fold, level, ci) || return false
         end
     end
     hull = AxisBox{D,T}(cell_box(level.mesh, first(cells)).lower,
@@ -206,7 +323,7 @@ end
 
 """
     build_coverage(V::Space, tol) -> Coverage
-    build_coverage(V::Space, tol, classify_cache) -> Coverage
+    build_coverage(V::Space, tol, fold) -> Coverage
 
 Compute, for every level of `V`, the cells a higher-id level's active region contains.
 Containment is tested one covering level at a time (a cell counts as covered when a
@@ -214,19 +331,23 @@ single level above contains it); a cell covered only by the *union* of two abutt
 overlays is treated as uncovered — a conservative, safe choice, since its high-order
 modes then stay active.
 
-`classify_cache` is the space's cell-classification cache. It is consulted only for
-inactive overlapped cells of a masked level, to tell a fictitious fold (which covers)
-from a user mask (which does not) — see `_covered_by_level`. Pass the cache `prepare`
-already filled during the fold so no cell box is classified twice; the default
-allocates a fresh one for standalone calls, and it stays empty and unused when
-`V.physical === nothing`.
+`fold` is the material oracle of `V` (`_Fold`, built over a cell-classification
+cache). It is consulted only for inactive overlapped cells of a masked level, to tell
+one that holds no material (which covers) from one that does (which does not) — see
+`_covered_by_level`. The dof layer passes the oracle it built over the cache `prepare`
+already filled during the fold, so no cell box is classified twice; the two-argument
+form builds one over a fresh cache for a standalone call, and nothing is classified
+when `V.physical === nothing`.
 
 Only the cells `_coverage_cells` selects are evaluated; the rest keep the `false`
 default, which the pruning rule never reads. On a masked level that is what
 keeps the pass proportional to the *active* region rather than to the level's grid.
 """
-function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T},
-                        classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
+function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T}) where {D,T}
+    build_coverage(V, tol, _Fold(V))
+end
+
+function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T}, fold::_Fold{D,T}) where {D,T}
     covered = Dict{Int,BitArray{D}}()
     for level in V.levels
         cov = falses(level.mesh.cells)
@@ -236,8 +357,7 @@ function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T},
             for ci in cell_indices(level.mesh)
                 wanted[ci] || continue
                 box = cell_box(level.mesh, ci)
-                cov[ci] = any(k -> _covered_by_level(box, k, tol, V.physical, classify_cache),
-                              above)
+                cov[ci] = any(k -> _covered_by_level(box, k, tol, fold), above)
             end
         end
         covered[level.id] = cov

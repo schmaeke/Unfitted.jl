@@ -450,24 +450,26 @@ function _assert_resolved(ledger::EliminationLedger)
 end
 
 # Everything a dof-layer hook may read about the level it is called for: the space,
-# its physical domain and tolerance, the space's cell-classification cache, the
-# coverage masks (empty when the build does not prune), the raw keys and the key → raw
-# map the raw enumeration built (for a family that addresses functions by
-# `(cell, mode)`), and the level's own raws.
+# the build's material oracle (`_Fold` in `coverage.jl`, which answers whether a cell
+# holds material), the tolerance, the coverage masks (empty when the build does not
+# prune), the raw keys and the key → raw map the raw enumeration built (for a family
+# that addresses functions by `(cell, mode)`), and the level's own raws. One oracle
+# serves every level of the build, so a cell is classified at most once per build
+# whichever hook asks.
 #
-# `P` is the CONCRETE type of `V.physical`. `Space.physical` is abstractly typed, so a
-# hook that read it off the space dispatched dynamically on every per-raw predicate
-# call it fed it to. The struct is built from the run-time value of `V.physical`,
-# which gives it the concrete `P` wherever it is built, and the hook it is handed
-# to is the function barrier: the hooks, and every predicate they call, specialise
-# on `P` instead. Measured on the integrated-Legendre artificial-boundary pass over
-# an immersed disc at 128² p2 (29 281 raws): 304 bytes per raw and 1.26 ms with
-# `P = Any`, nothing and 0.24 ms typed.
-struct _LevelContext{D,T,S<:Space{D,T},P}
+# `F` is the CONCRETE type of the oracle, whose own parameter is the run-time type of
+# `V.physical`. `Space.physical` is abstractly typed, so a hook that read it off the
+# space dispatched dynamically on every per-raw predicate call it fed it to. The oracle
+# is built from the run-time value of `V.physical`, which gives it, and this struct, a
+# concrete type wherever they are built, and the hook the context is handed to is the
+# function barrier: the hooks, and every predicate they call, specialise on it instead.
+# Measured on the integrated-Legendre artificial-boundary pass over an immersed disc at
+# 128² p2 (29 281 raws): 304 bytes per raw and 1.26 ms with the physical domain typed
+# `Any`, nothing and 0.24 ms typed.
+struct _LevelContext{D,T,S<:Space{D,T},F<:_Fold{D,T}}
     space::S
-    physical::P
+    fold::F
     tolerance::GeometryTolerance{T}
-    classify_cache::_ClassifyCache{D,T}
     coverage::Coverage{D}
     raw_keys::Vector{TensorDofKey{D}}
     raw_by_key::Dict{TensorDofKey{D},Int}
@@ -487,11 +489,17 @@ end
 # owns this order and the pruning gate (`prune`, `prune_exempt`), so no family
 # re-implements either: a family that forgot the gate would prune the unreduced twin.
 #
-# Each hook call is the function barrier its per-raw loop runs behind. The level's
-# context is built from the run-time value of `V.physical`, so its `P` is concrete
-# (see `_LevelContext`) even though the field is not, and `V.levels` may mix basis
-# families; a hook therefore runs specialised on both, and what dispatches at run
-# time is at most the context's construction and the three calls per level.
+# The material oracle (`_Fold`) is built here, once, over `classify_cache` — the
+# cache `prepare` filled during the fold, or a fresh one for a standalone call — and
+# every consumer of the build reads it: `build_coverage` and every level's context. It
+# lives for this call only.
+#
+# Each hook call is the function barrier its per-raw loop runs behind. The oracle is
+# built from the run-time value of `V.physical`, so its type, and with it the level's
+# context, is concrete (see `_LevelContext`) even though the field is not, and
+# `V.levels` may mix basis families; a hook therefore runs specialised on both, and
+# what dispatches at run time is at most the context's construction and the three
+# calls per level.
 #
 # A topology reads neither a field's components nor its Dirichlet data, so one is
 # the same for every field over the space, and `_system_layout` builds it once per
@@ -500,12 +508,12 @@ function _dof_topology(V::Space{D,T}; tolerance::GeometryTolerance{T}=GeometryTo
                        prune::Bool=true, prune_exempt=(),
                        classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
     raw_by_key, raw_keys, cell_dofs_by_level, level_raws = _enumerate_raws(V)
-    coverage = prune ? build_coverage(V, tolerance, classify_cache) :
-               Coverage{D}(Dict{Int,BitArray{D}}())
+    fold = _Fold(V, classify_cache)
+    coverage = prune ? build_coverage(V, tolerance, fold) : Coverage{D}(Dict{Int,BitArray{D}}())
     ledger = EliminationLedger{T}(length(raw_keys))
     for level in V.levels
-        ctx = _LevelContext(V, V.physical, tolerance, classify_cache, coverage, raw_keys,
-                            raw_by_key, level_raws[level.id])
+        ctx = _LevelContext(V, fold, tolerance, coverage, raw_keys, raw_by_key,
+                            level_raws[level.id])
         _overlay_constraints!(ledger, level, ctx)
         prune && !(level.id in prune_exempt) && _coverage_constraints!(ledger, level, ctx)
         isempty(ledger.rows) && continue
@@ -650,9 +658,9 @@ structure. Called once per level, before `_coverage_constraints!` (see
 This default walks the level's raws, asks the family's per-raw
 `_has_overlay_constraint` predicate about each, and strongly eliminates every raw
 it accepts with `_eliminate!(ledger, raw, :overlay)`: the regime the integrated
-Legendre family relies on. The predicate consults `ctx.classify_cache`, the
-space's cell-classification cache, only to tell a fully-fictitious fold face from
-a user-mask face; the cache is untouched when the space has no physical domain.
+Legendre family relies on. The predicate consults `ctx.fold`, the build's material
+oracle, only to ask whether the inactive cell across an internal face holds
+material; nothing is classified when the space has no physical domain.
 
 The B-spline family in the extension overrides this default. At `continuity =
 :maximal` its method is a support selection, which again eliminates strongly. At
@@ -1085,21 +1093,22 @@ end
 #     lies on the physical boundary (`_level_side_is_physical`), and the rest
 #     of the face cannot say otherwise;
 #   * on an internal face, a position constrains when the inactive cell
-#     across it is not `_is_fictitious`.
+#     across it holds material (it is not `_is_fictitious`).
 #
-# The second case is the fold exemption. The fictitious fold deactivates
-# fully-fictitious cells, so a fold face sees no material on its inactive
-# side, and its boundary modes stay active. They vanish on every physical
+# The second case is the material exemption. A face whose inactive side holds
+# no material — every cell the fictitious fold switched off, and a user-masked
+# cell lying entirely outside Ω — has nothing on that side to stay continuous
+# with, and its boundary modes stay active. They vanish on every physical
 # face — so they cannot break the C⁰ trace condition the overlay constraint
 # enforces — and instead carry the adjacent cut cell's approximation up to
-# ∂Ω. A cell the *user* masked out still holds material: the modes on its
-# face are non-zero on a physical face and must be eliminated to keep the
-# truncated solution continuous. With no physical domain there is no
-# fictitious material, so every internal active/inactive face constrains
-# (the original overlay/user-mask behaviour) and `ctx.classify_cache` is
-# never touched. The walk stops at the first constraining position, so a
-# fold face classifies its inactive neighbours only until one of them holds
-# material.
+# ∂Ω. An inactive cell that holds material — a user mask inside Ω — is
+# represented by a coarser level only: the modes on its face are non-zero on
+# a physical face and must be eliminated to keep the truncated solution
+# continuous. With no physical domain every inactive cell holds material, so
+# every internal active/inactive face constrains (the original overlay/user-mask
+# behaviour) and `ctx.fold` classifies nothing. The walk stops at the first
+# constraining position, so a face classifies its inactive neighbours only
+# until one of them holds material.
 #
 # This runs once per raw on every layout build, and two measured choices keep
 # it cheap: `@inline`, without which the call stays out of
@@ -1112,7 +1121,7 @@ end
 # Integrated-Legendre-specific, because the incidence rule is. The B-spline
 # family in `ext/UnfittedBasicBSplineExt.jl` does the same job in its own
 # `_overlay_constraints!`, with a support map that spans several cells and
-# the same fold exemption (`_active_cell_at_face`).
+# the same material exemption (`_active_cell_at_face`).
 @inline function _has_overlay_constraint(key::TensorDofKey{D},
                                          level::Level{D,T,<:IntegratedLegendre},
                                          ctx::_LevelContext{D,T}) where {D,T}
@@ -1131,7 +1140,7 @@ end
             end
             across = below_active ? i : i - 1          # the inactive cell's axis position
             inactive = CartesianIndex(ntuple(d -> d == axis ? across : outer[d], D))
-            _is_fictitious(level, inactive, ctx.physical, ctx.classify_cache) || return true
+            _is_fictitious(ctx.fold, level, inactive) || return true
         end
     end
     return false
@@ -1327,11 +1336,11 @@ diagnostics, unless the artificial boundary already eliminated the raw: the firs
 writer wins (see [`EliminationLedger`](@ref)), so a buried raw on `Γ_o` stays
 credited to `:overlay`.
 
-Both halves ask `_reproduced_on_domain` (`coverage.jl`), which applies the
-fictitious-fold rule on the covering level *and* on this one — a support cell folded
-away carries nothing to reproduce, so it neither has to be covered nor may veto the
-verdict. `ctx.classify_cache` is the classification that tells a fold from a user
-mask, the same one [`build_coverage`](@ref) used.
+Both halves ask `_reproduced_on_domain` (`coverage.jl`), which applies the material
+rule on the covering level *and* on this one — an inactive support cell that holds no
+material (a folded cell, or a user mask entirely outside Ω) carries nothing to
+reproduce, so it neither has to be covered nor may veto the verdict. `ctx.fold` is the
+material oracle that answers it, the same one [`build_coverage`](@ref) used.
 
 The dedup half is not an optimisation: a mode a covering level reproduces exactly is
 linearly dependent on that level's own modes, so leaving both active makes the
@@ -1353,8 +1362,7 @@ function _coverage_constraints!(ledger::EliminationLedger, level::Level{D,T,<:In
     nested_above = [k
                     for k in V.levels
                     if k.id > level.id && _spans_hats(k.basis) && _nested_over(level, k, tol)]
-    reproduces(k, cells) = _reproduced_on_domain(level, k, cells, ctx.physical, tol,
-                                                 ctx.classify_cache)
+    reproduces(k, cells) = _reproduced_on_domain(level, k, cells, tol, ctx.fold)
     # Covered-mode pruning asks the same *single-level* question the dedup half asks.
     # `cov[ci]` says only that *some* higher level contains cell `ci`, and a mode
     # whose incident cells are covered by two different levels is reproduced by
@@ -1380,7 +1388,8 @@ function _coverage_constraints!(ledger::EliminationLedger, level::Level{D,T,<:In
     # The `cov` prefilter is a fast path over the *active* support only, which is both
     # the set `_coverage_cells` computed and the only set on which a `false` entry is a
     # verdict rather than a default. An inactive incident cell is settled by
-    # `reproduces`: fictitious and it is skipped, user-masked and it refuses.
+    # `reproduces`: holding no material and it is skipped, holding material and it
+    # refuses.
     for raw in ctx.raws
         key = ctx.raw_keys[raw]
         cells = _incident_cells(key, n)

@@ -246,8 +246,8 @@ end
     @test Unfitted._inside(m.problem.fields[1].space.physical.geometry,
                            Unfitted.center(Unfitted.cell_box(base.mesh, cell)))
     @test Unfitted._covered_by_level(Unfitted.cell_box(base.mesh, cell), fine,
-                                     GeometryTolerance(Float64), m.problem.fields[1].space.physical,
-                                     Unfitted._ClassifyCache{2,Float64}())
+                                     GeometryTolerance(Float64),
+                                     Unfitted._Fold(m.problem.fields[1].space))
     @test count(==(:coverage), l.elimination_source) == 8
 
     # …so no exact kernel, exactly as in the wide-hole case above.
@@ -256,6 +256,113 @@ end
     @test count(<=(1e-13 * maximum(lam)), lam) == 0
     @test minimum(lam) > 0
     @test isposdef(M)
+end
+
+# The material test written out, as the dof layer states it independently of the
+# oracle under test: a cell is void when the classifier, asked without a memo, reports
+# its box entirely outside Ω.
+function _void_by_classifier(physical, level, c)
+    physical !== nothing && classify_cell(physical, cell_box(level.mesh, c)) === :fictitious
+end
+
+# Bytes the material oracle's queries allocate over every cell of `level`, measured
+# inside a function so that only the calls themselves are counted.
+function _oracle_query_bytes(fold, level, probe)
+    bytes = @allocated Unfitted._fictitious(fold, probe)
+    for c in cell_indices(level.mesh)
+        bytes += @allocated Unfitted._is_void(fold, level, c)
+        bytes += @allocated Unfitted._is_fictitious(fold, level, c)
+    end
+    return bytes
+end
+
+@testset "the material oracle answers the classifier's verdict on every cell" begin
+    # Every site of the dof layer that asks whether an inactive cell holds material —
+    # coverage, the burial test's level side, the artificial-face tests, the B-spline
+    # admissible region — asks one `_Fold` per layout build, which memoises
+    # `classify_cell` per level in a verdict table over the caller's box memo. The
+    # question is geometric: a cell is void when its box lies entirely outside Ω,
+    # whichever mask switched it off. So the oracle must give the classifier's verdict
+    # on every cell — a folded one, a user mask entirely outside Ω, a user mask over
+    # material, an active one — on the first ask (the table miss, through the memo)
+    # and on every later one (the hit), with either form of the query, and under
+    # `keep_fictitious`, where no fold runs and every inactive cell is the user's.
+    disc(; kw...) = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.3; lipschitz=1.0,
+                                    subcell_length_scale=1 / 64, max_depth=4, kw...)
+    # Each level masks one cell entirely outside the disc and one entirely inside it.
+    basemask = trues(8, 8)
+    basemask[1, 1] = basemask[4, 4] = false
+    overlaymask = trues(8, 16)
+    overlaymask[1, 16] = overlaymask[7, 8] = false
+    masked_stack(physical) = overlay(space(_OMEGA_CR; cells=8, order=2, physical=physical,
+                                           active=basemask), box((0.0, 0.0), (0.5, 1.0));
+                                     cells=(8, 16), order=2, active=overlaymask)
+    void_masked = ((1, CartesianIndex(1, 1)), (2, CartesianIndex(1, 16)))
+    material_masked = ((1, CartesianIndex(4, 4)), (2, CartesianIndex(7, 8)))
+    probes = (box((1.0, 0.0), (1.125, 0.125)), box((0.45, 0.45), (0.55, 0.55)),
+              box((0.75, 0.4), (0.85, 0.6)))
+    for physical in (disc(), disc(; alpha=1e-3, keep_fictitious=true))
+        # The prepared space and its warm memo, exactly as the layout build gets them.
+        _, spaces, caches = Unfitted._prepare_spaces(mass(masked_stack(physical)))
+        V, cache = only(spaces), only(caches)
+        expected = Dict(level.id => [_void_by_classifier(physical, level, c)
+                                     for c in cell_indices(level.mesh)] for level in V.levels)
+        inactive(level) = [!Unfitted.is_active(level.mask, c) for c in cell_indices(level.mesh)]
+        # Non-vacuity: the fold switched cells off (unless kept), and both kinds of user
+        # mask are there, each inactive and of the kind it was placed to be.
+        folded = sum(level -> count(inactive(level)), V.levels) - 4
+        @test physical.keep_fictitious ? folded == 0 : folded > 0
+        for (id, c) in void_masked
+            @test inactive(V.levels[id])[c] && expected[id][c]
+        end
+        for (id, c) in material_masked
+            @test inactive(V.levels[id])[c] && !expected[id][c]
+        end
+
+        # Each form of the void query first, on a fresh oracle, so it takes every miss;
+        # then both forms and the inactive-and-void query again, all hits.
+        for hot in (false, true)
+            fold = Unfitted._Fold(V, cache)
+            @test fold isa Unfitted._Fold{2,Float64,typeof(V.physical)}
+            @test isempty(fold.cells)
+            for pass in 1:2, level in V.levels
+                cells = cell_indices(level.mesh)
+                table = Unfitted._void_table(fold, level)
+                void = hot ? [Unfitted._is_void(fold, table, level, c) for c in cells] :
+                       [Unfitted._is_void(fold, level, c) for c in cells]
+                @test void == expected[level.id]
+                @test [Unfitted._is_fictitious(fold, level, c) for c in cells] ==
+                      inactive(level) .& expected[level.id]
+            end
+            # Every verdict the tables hold is the one the box memo holds for that box.
+            for level in V.levels
+                memo = [cache[(b.lower, b.upper)]
+                        for b in (cell_box(level.mesh, c) for c in cell_indices(level.mesh))]
+                @test fold.cells[level.id] == [m === :fictitious ? 0x01 : 0x02 for m in memo]
+            end
+            for b in probes
+                @test Unfitted._fictitious(fold, b) == (classify_cell(physical, b) === :fictitious)
+                @test Unfitted._material_at_centre(fold, b) ==
+                      Unfitted._inside(physical.geometry, center(b))
+            end
+        end
+    end
+
+    # Without a physical domain every cell holds material: each query is a constant,
+    # nothing is classified, no table is allocated and no query allocates.
+    V = masked_stack(nothing)
+    fold = Unfitted._Fold(V)
+    @test fold isa Unfitted._Fold{2,Float64,Nothing}
+    for level in V.levels
+        cells = cell_indices(level.mesh)
+        @test !any(c -> Unfitted._is_void(fold, level, c) || Unfitted._is_fictitious(fold, level, c),
+                   cells)
+        _oracle_query_bytes(fold, level, probes[1])                 # compile once
+        @test _oracle_query_bytes(fold, level, probes[1]) == 0
+    end
+    @test all(b -> !Unfitted._fictitious(fold, b) && Unfitted._material_at_centre(fold, b), probes)
+    Unfitted.build_coverage(V, GeometryTolerance(Float64), fold)
+    @test isempty(fold.cells) && isempty(fold.boxes)
 end
 
 # Ω = {x₁ ≤ 0.9} inside [-1, 2]², so a 3×3 base folds its whole right column away as

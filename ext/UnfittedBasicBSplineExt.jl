@@ -124,8 +124,8 @@ using Unfitted
 using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, LevelMask, AxisDofKey,
                 TensorDofKey, EliminationLedger, _LevelContext, _eliminate!, _constrain!, _pivot!,
                 cell_indices, is_active, AxisBox, _check_basis_mode, _level_side_is_physical,
-                _tensor_dof_key, _ClassifyCache, _is_fictitious, _nested_over,
-                _reproduced_on_domain, classify_cell
+                _tensor_dof_key, _Fold, _fictitious, _is_fictitious, _nested_over,
+                _reproduced_on_domain
 using StaticArrays: SVector
 using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim
 
@@ -655,28 +655,30 @@ end
 # ── Support selection: the admissible region and the functions inside it ──────
 
 # The cells of `level` over which its functions may live: the active ones, plus
-# the ones a fictitious fold switched off.
+# the inactive ones that hold no material.
 #
-# The two are merged into one `LevelMask` by `_apply_physical_fold` and mean
-# opposite things here. A *user*-masked cell carries material that only the
-# coarser level represents, so a function reaching into it would be truncated at
-# a face where it does not vanish, and the superposition would lose its
-# continuity there. A *fictitious* cell carries no material at all: nothing is
-# integrated there, so the truncated and untruncated functions agree on Ω and the
-# function may stay. That single distinction is the whole of this family's
-# finite-cell compatibility — it is what keeps a cut cell's modes alive instead of
-# constraining them away — and it costs one classification per inactive cell. The
-# fold classifies only the cells that were active before it, so that is a cache hit
-# for a cell the fold switched off and a fresh classification for a user-masked one.
+# A `LevelMask` merges two deactivations (`_apply_physical_fold`), and what decides
+# here is not which one switched a cell off but whether the cell holds material. An
+# inactive cell that does — a user mask inside Ω — carries material that only the
+# coarser level represents, so a function reaching into it would be truncated at a
+# face where it does not vanish, and the superposition would lose its continuity
+# there. An inactive cell that holds none — every cell the fictitious fold switched
+# off, and a user mask entirely outside Ω — has nothing integrated over it, so the
+# truncated and untruncated functions agree on Ω and the function may stay. That
+# single distinction is the whole of this family's finite-cell compatibility — it is
+# what keeps a cut cell's modes alive instead of constraining them away — and it costs
+# one query of the build's material oracle (`ctx.fold`) per inactive cell. The fold
+# classifies only the cells that were active before it, so that is a box-memo hit for
+# a cell the fold switched off and a fresh classification for a user-masked one.
 #
 # Materialised as a dense `Array{Bool,D}` rather than asked per function because
 # a degree-`p` function's support meets `(p + 1)^D` cells and every cell is
 # asked about by up to `(p + 1)^D` functions; the array turns that
 # `O(raws · (p+1)^D)` classification budget into `O(cells)`.
-function _admissible_cells(level::Level{D,T}, physical, cache::_ClassifyCache{D,T}) where {D,T}
+function _admissible_cells(level::Level{D,T}, fold::_Fold{D,T}) where {D,T}
     admissible = Array{Bool,D}(undef, level.mesh.cells)
     for ci in cell_indices(level.mesh)
-        admissible[ci] = is_active(level.mask, ci) || _is_fictitious(level, ci, physical, cache)
+        admissible[ci] = is_active(level.mask, ci) || _is_fictitious(fold, level, ci)
     end
     return admissible
 end
@@ -684,38 +686,33 @@ end
 # Everything a level's admissibility question needs, gathered once per level: the
 # per-cell table above, which of the level's box faces are physical, the level's
 # uniform per-axis cell width (for the virtual cells outside the mesh), and the
-# space's physical domain and its classification cache.
+# build's material oracle, which answers for those virtual cells.
 #
 # A struct rather than five arguments because both the selection rule and the
 # burial test ask the same question of the same level, and the burial test asks it
 # of a *second* level as well.
-struct _Admissibility{D,T,P,S}
+struct _Admissibility{D,T,S,F}
     level::Level{D,T,S}
     cells::Array{Bool,D}
     lower_physical::NTuple{D,Bool}
     upper_physical::NTuple{D,Bool}
     width::NTuple{D,T}
-    physical::P
-    cache::_ClassifyCache{D,T}
+    fold::F
 end
 
 # The admissibility record of `level`, read off the hook context of the level being
 # processed. `level` may be another level of the same space — the burial test builds
 # one for each covering level — because everything it takes from `ctx` (the domain,
-# the physical domain, the tolerance and the classification cache) is space-wide.
-# `ctx.physical` is concretely typed, so `P` is too, and every admissibility query
-# specialises on it.
+# the tolerance and the material oracle) is space-wide. `ctx.fold` is concretely
+# typed, so `F` is too, and every admissibility query specialises on it.
 function _admissibility(level::Level{D,T,S}, ctx::_LevelContext{D,T}) where {D,T,S}
     mesh = level.mesh
     width = ntuple(d -> (mesh.domain.upper[d] - mesh.domain.lower[d]) / mesh.cells[d], D)
-    domain, tol = ctx.space.domain, ctx.tolerance
+    domain, tol, fold = ctx.space.domain, ctx.tolerance, ctx.fold
     lower = ntuple(d -> _level_side_is_physical(level, domain, d, :lower, tol), D)
     upper = ntuple(d -> _level_side_is_physical(level, domain, d, :upper, tol), D)
-    return _Admissibility{D,T,typeof(ctx.physical),S}(level,
-                                                      _admissible_cells(level, ctx.physical,
-                                                                        ctx.classify_cache), lower,
-                                                      upper, width, ctx.physical,
-                                                      ctx.classify_cache)
+    return _Admissibility{D,T,S,typeof(fold)}(level, _admissible_cells(level, fold), lower, upper,
+                                              width, fold)
 end
 
 # `_overlay_constraints!` at `continuity = :maximal`: one strong elimination per
@@ -752,8 +749,8 @@ end
 
 # Whether the tensor B-spline named by `key` may stay: its full, unclipped support
 # must be admissible.
-function _support_admissible(a::_Admissibility{D,T,P,<:BSplineFamily},
-                             key::TensorDofKey{D}) where {D,T,P}
+function _support_admissible(a::_Admissibility{D,T,<:BSplineFamily},
+                             key::TensorDofKey{D}) where {D,T}
     lo, hi = _support_block(a.level.basis, ntuple(d -> key.axes[d].index, D))
     return _block_admissible(a, lo, hi)
 end
@@ -782,8 +779,8 @@ end
 # Three cases, and the third is the one that makes this family work under an
 # immersed geometry:
 #
-#   1. Inside the grid. The precomputed table answers: active, or folded away as
-#      fictitious.
+#   1. Inside the grid. The precomputed table answers: active, or inactive and
+#      holding no material.
 #   2. Outside the grid across a face that coincides with the space's own
 #      boundary. There is no artificial boundary there and nothing beyond it is
 #      part of the discretised domain, so the question is vacuous and the answer
@@ -793,9 +790,9 @@ end
 #      truncated at that face, so it may stay only if the material beyond carries
 #      nothing: if the cell is fictitious, the truncated and untruncated functions
 #      agree on Ω and the extension is smooth *where it is integrated*. This is the
-#      same fold exemption as case 1's second half, applied past the level's own
-#      box, and without it a level whose face sits in fictitious material loses the
-#      functions that reach ∂Ω — the ones the cut cells there need most.
+#      same material exemption as case 1's second half, applied past the level's
+#      own box, and without it a level whose face sits in fictitious material loses
+#      the functions that reach ∂Ω — the ones the cut cells there need most.
 function _cell_admissible(a::_Admissibility{D}, c::CartesianIndex{D}) where {D}
     n = a.level.mesh.cells
     inside = true
@@ -809,8 +806,7 @@ function _cell_admissible(a::_Admissibility{D}, c::CartesianIndex{D}) where {D}
         end
     end
     inside && return a.cells[c]
-    a.physical === nothing && return false
-    return classify_cell(a.physical, _virtual_cell_box(a, c), a.cache) === :fictitious
+    return _fictitious(a.fold, _virtual_cell_box(a, c))
 end
 
 # The box of cell `c` of the level's grid, for a `c` that may lie outside
@@ -879,9 +875,9 @@ function Unfitted._overlay_constraints!(ledger::EliminationLedger,
     # The clamped path does not walk `ctx.raws`: the trace generator walks the
     # mesh face/perp grids and looks raws up through `ctx.raw_by_key`, and every
     # key it builds carries `level.id`, so its rows name only this level's raws.
-    # `ctx.classify_cache` goes to `_active_cell_at_face`, which reads it to tell
-    # a fictitious fold face from a user-mask face; with no physical domain it
-    # is never touched.
+    # `ctx.fold` goes to `_active_cell_at_face`, which asks it whether the inactive
+    # side of an internal face holds material; with no physical domain it classifies
+    # nothing.
     family = level.basis
     m = family.continuity
     n_cells = level.mesh.cells
@@ -916,8 +912,7 @@ function Unfitted._overlay_constraints!(ledger::EliminationLedger,
             coeffs_lower, coeffs_upper = _trace_coeffs(P_d, lower_span, upper_span, t_star, Val(m))
 
             for perp_cell in perp_cells
-                located = _active_cell_at_face(level, d, j, perp_cell, n_cells, Val(D),
-                                               ctx.physical, ctx.classify_cache)
+                located = _active_cell_at_face(level, d, j, perp_cell, n_cells, Val(D), ctx.fold)
                 located === nothing && continue
                 active_cell, span = located
                 coeffs_for_span = span == lower_span ? coeffs_lower : coeffs_upper
@@ -970,19 +965,20 @@ end
 # internal faces, it's "the two adjacent cells differ in activity".
 #
 # With one exemption, and it is what lets this family carry an immersed
-# `PhysicalDomain`. A `LevelMask` merges two deactivations that mean opposite
-# things: a *user-masked* cell holds material only the coarser level represents,
+# `PhysicalDomain`. What decides an internal face is whether its inactive cell
+# holds material, not which deactivation switched it off: an inactive cell that
+# does — a user mask inside Ω — holds material only the coarser level represents,
 # so the face between it and the active side is a real artificial boundary and
-# the trace must vanish there; a *fictitious* cell holds no material at all, so
-# there is no trace to vanish on, and constraining it would delete the cut cell's
-# boundary modes — the very over-constraint the FCM solution must not suffer.
-# `_has_overlay_constraint` in `src/dofs.jl` draws the same line for the
-# integrated-Legendre family, and both read it from `_is_fictitious` in
-# `src/coverage.jl`. With `physical === nothing` there is no fold and `cache` is
-# never touched.
+# the trace must vanish there; one that holds none — every cell the fictitious
+# fold switched off, and a user mask entirely outside Ω — leaves no trace to
+# vanish on, and constraining it would delete the cut cell's boundary modes — the
+# very over-constraint the FCM solution must not suffer. `_has_overlay_constraint`
+# in `src/dofs.jl` draws the same line for the integrated-Legendre family, and
+# both ask it of `_is_fictitious` (`src/coverage.jl`) on the build's material
+# oracle `fold`. With no physical domain every inactive cell holds material and
+# nothing is classified.
 function _active_cell_at_face(level::Level{D}, d::Int, j::Int, perp_cell::CartesianIndex{D},
-                              n_cells::NTuple{D,Int}, ::Val{D}, physical,
-                              cache::_ClassifyCache{D}) where {D}
+                              n_cells::NTuple{D,Int}, ::Val{D}, fold::_Fold{D}) where {D}
     if j == 0 || j == n_cells[d]
         axis_d_idx = j == 0 ? 1 : n_cells[d]
         cell = CartesianIndex(ntuple(e -> e == d ? axis_d_idx : perp_cell[e], D))
@@ -993,7 +989,7 @@ function _active_cell_at_face(level::Level{D}, d::Int, j::Int, perp_cell::Cartes
     a_j = is_active(level.mask, cell_j)
     a_jp1 = is_active(level.mask, cell_jp1)
     a_j == a_jp1 && return nothing
-    _is_fictitious(level, a_j ? cell_jp1 : cell_j, physical, cache) && return nothing
+    _is_fictitious(fold, level, a_j ? cell_jp1 : cell_j) && return nothing
     return a_j ? (cell_j, j) : (cell_jp1, j + 1)
 end
 
@@ -1028,7 +1024,7 @@ function Unfitted._coverage_constraints!(ledger::EliminationLedger,
     family = level.basis
     n = level.mesh.cells
     p = ntuple(d -> degree(family.spaces[d]), D)
-    physical, tol, cache = ctx.physical, ctx.tolerance, ctx.classify_cache
+    fold, tol = ctx.fold, ctx.tolerance
     above = [k
              for k in ctx.space.levels
              if k.id > level.id && _reproduces(k, p) && _nested_over(level, k, tol)]
@@ -1053,26 +1049,26 @@ function Unfitted._coverage_constraints!(ledger::EliminationLedger,
     candidates = Int[]
     for raw in ctx.raws
         cells = _support_cells(ctx.raw_keys[raw], family, n)
-        # The level-side half, and it holds for BOTH mechanisms. A *user-masked*
-        # support cell blocks: what a masked level assembles is the function truncated
-        # to its own active cells, which is not the function the cover reproduces. A
-        # *fictitious* one does not: nothing is integrated there, so the truncation is
-        # invisible on Ω. Leaving this to the covering predicate was wrong — the
-        # subdivision walk looks only at the cover — and what it deleted was real
-        # approximation rather than a null mode: measured on a `continuity = 0` base of
-        # 4² masked at one interior cell under a nested maximal-continuity 6² cover, the
-        # pruned space carried 58 unknowns against an unreduced rank of 59.
-        all(ci -> is_active(level.mask, ci) || _is_fictitious(level, ci, physical, cache), cells) ||
-            continue
+        # The level-side half, and it holds for BOTH mechanisms. An inactive support
+        # cell that holds material (a user mask inside Ω) blocks: what a masked level
+        # assembles is the function truncated to its own active cells, which is not the
+        # function the cover reproduces. One that holds none (a folded cell, or a user
+        # mask entirely outside Ω) does not: nothing is integrated there, so the
+        # truncation is invisible on Ω. Leaving this to the covering predicate was
+        # wrong — the subdivision walk looks only at the cover — and what it deleted was
+        # real approximation rather than a null mode: measured on a `continuity = 0`
+        # base of 4² masked at one interior cell under a nested maximal-continuity 6²
+        # cover, the pruned space carried 58 unknowns against an unreduced rank of 59.
+        all(ci -> is_active(level.mask, ci) || _is_fictitious(fold, level, ci), cells) || continue
         if clamped_only
             # Buried, and buried as a whole function — but the two halves of "whole"
-            # are not the same test. A *user-masked* support cell blocks: what a masked
-            # level assembles is the function truncated to its own active cells, which
-            # is not the function `k` reproduces. A *fictitious* one does not: nothing
-            # is integrated there, so the truncation is invisible on Ω. It must also
-            # bypass `cov`, which is computed only on the active cells dilated by one
-            # (`_coverage_cells`) — a support cell two cells past the active front holds
-            # the `false` default, not a verdict.
+            # are not the same test. An inactive support cell holding material blocks:
+            # what a masked level assembles is the function truncated to its own active
+            # cells, which is not the function `k` reproduces. One holding none does
+            # not: nothing is integrated there, so the truncation is invisible on Ω. It
+            # must also bypass `cov`, which is computed only on the active cells dilated
+            # by one (`_coverage_cells`) — a support cell two cells past the active front
+            # holds the `false` default, not a verdict.
             all(ci -> !is_active(level.mask, ci) || cov[ci], cells) || continue
         end
         push!(candidates, raw)
@@ -1163,7 +1159,7 @@ function _mark_reproduced!(reproduced::BitVector, candidates::Vector{Int},
         key = ctx.raw_keys[raw]
         reproduced[i] = cover === nothing ?
                         _reproduced_on_domain(level, k, _support_cells(key, family, n),
-                                              ctx.physical, ctx.tolerance, ctx.classify_cache) :
+                                              ctx.tolerance, ctx.fold) :
                         _reproduced_by_selection(level, key, cover)
     end
     return reproduced
@@ -1195,7 +1191,7 @@ end
 # buried functions without reproducing either — a dependency a per-function dedup
 # cannot see, and one exact null mode per combination in the assembled operator.
 function _reproduced_by_selection(level::Level{D,T,<:BSplineFamily}, key::TensorDofKey{D},
-                                  cover::_Admissibility{D,T,P,<:BSplineFamily}) where {D,T,P}
+                                  cover::_Admissibility{D,T,<:BSplineFamily}) where {D,T}
     coarse = level.basis
     index = ntuple(d -> key.axes[d].index, D)
     clo, chi = _support_block(coarse, index)

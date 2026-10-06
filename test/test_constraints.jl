@@ -834,13 +834,13 @@ end
 
     layout = Unfitted.dof_layout(V)
     tol = layout.tolerance
-    cache = Unfitted._ClassifyCache{2,Float64}()
-    coverage = Unfitted.build_coverage(V, tol, cache)
+    fold = Unfitted._Fold(V)
+    coverage = Unfitted.build_coverage(V, tol, fold)
     middle = V.levels[2]
     # The pruning hook alone, on a fresh ledger: every raw it eliminates is a
     # pruning candidate, whether or not the overlay condition also names it.
     ledger = Unfitted.EliminationLedger{Float64}(length(layout.raw_keys))
-    ctx = Unfitted._LevelContext(V, V.physical, tol, cache, coverage, layout.raw_keys,
+    ctx = Unfitted._LevelContext(V, fold, tol, coverage, layout.raw_keys,
                                  Dict(k => r for (r, k) in pairs(layout.raw_keys)),
                                  layout.level_raws[middle.id])
     Unfitted._coverage_constraints!(ledger, middle, ctx)
@@ -868,31 +868,37 @@ function _overlay_pass_bytes(ledger, level, ctx)
 end
 
 @testset "the artificial-boundary pass over an immersed level does not allocate per raw" begin
-    # `Space.physical` is abstractly typed. The dof-layer hooks read it from a
-    # `_LevelContext` built from its run-time value; each hook call is the function
-    # barrier, so the per-raw predicate `_has_overlay_constraint` — which classifies
-    # the inactive neighbour of every fold face — specialises on the concrete
-    # physical domain. Read off the space instead, it dispatched dynamically on every
-    # raw and boxed its arguments, which is an allocation per raw on every layout
-    # build of an immersed space.
+    # `Space.physical` is abstractly typed. The dof-layer hooks read it through the
+    # material oracle (`_Fold`) of a `_LevelContext`, both built from its run-time
+    # value; each hook call is the function barrier, so the per-raw predicate
+    # `_has_overlay_constraint` — which asks whether the inactive neighbour of every
+    # fold face holds material — specialises on the concrete physical domain. Read off
+    # the space instead, it dispatched dynamically on every raw and boxed its
+    # arguments, which is an allocation per raw on every layout build of an immersed
+    # space.
     disc = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.37; lipschitz=1.0,
                            subcell_length_scale=1 / 128, max_depth=3)
     for n in (16, 32)
         problem = mass(space(box((0.0, 0.0), (1.0, 1.0)); cells=n, order=2, physical=disc))
         # The folded space and its warm classification cache, exactly as `prepare`
-        # hands them to the layout build.
+        # hands them to the layout build, which builds its material oracle over it.
         _, spaces, caches = Unfitted._prepare_spaces(problem)
         V, cache = only(spaces), only(caches)
         level = only(V.levels)
         raw_by_key, raw_keys, _, level_raws = Unfitted._enumerate_raws(V)
-        ctx = Unfitted._LevelContext(V, V.physical, Unfitted.GeometryTolerance(Float64), cache,
+        ctx = Unfitted._LevelContext(V, Unfitted._Fold(V, cache),
+                                     Unfitted.GeometryTolerance(Float64),
                                      Unfitted.Coverage{2}(Dict{Int,BitArray{2}}()), raw_keys,
                                      raw_by_key, level_raws[level.id])
-        @test ctx isa Unfitted._LevelContext{2,Float64,typeof(V),typeof(V.physical)}
+        @test ctx isa Unfitted._LevelContext{2,Float64,typeof(V),
+                                             Unfitted._Fold{2,Float64,typeof(V.physical)}}
         # Non-vacuity: the fold deactivated cells, so the pass walks fold faces.
         @test count(!, level.mask.on) > 0
         ledger() = Unfitted.EliminationLedger{Float64}(length(raw_keys))
-        Unfitted._overlay_constraints!(ledger(), level, ctx)      # compile once
+        # Compile once. The measured call below shares `ctx`, and with it the oracle's
+        # verdict table for this level, which this first call allocates: a layout build
+        # allocates it once too, and the bound is about what the pass allocates per raw.
+        Unfitted._overlay_constraints!(ledger(), level, ctx)
         fresh = ledger()
         @test _overlay_pass_bytes(fresh, level, ctx) <= 1024
         # The fold exemption: a fold face carries no physical trace, so no mode is

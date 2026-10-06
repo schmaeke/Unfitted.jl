@@ -1524,7 +1524,7 @@ end
 # unless `keep_fictitious` asks for the classic α-FCM fill instead.
 #
 # Only cells the level's own mask already keeps active are classified. The fold
-# below combines the two masks with `active .& .!fictitious` (`_fold_fictitious`),
+# below clears every fictitious cell out of the user's mask (`_fold_fictitious`),
 # so a cell the user already deactivated stays deactivated whatever the classifier
 # would say about it: `false & x == false`. Leaving `fict` at its `false` default
 # there is therefore bit-identical to classifying it, and the guard turns the pass
@@ -1537,13 +1537,13 @@ end
 # cheap: it walks a bounded octree whenever the Lipschitz certificate cannot
 # settle the box from its centre sample.
 #
-# The classification verdicts of *inactive* cells are still needed further down
-# the pipeline — `_covered_by_level` in `coverage.jl` and `_has_overlay_constraint`
-# in `dofs.jl` both have to tell a fictitious fold from a user mask — but each asks
-# only about the cells on its own fold/mask boundary, and each goes through the same
-# `cache`. Skipping them here turns those queries from cache hits into cache misses;
-# it does not change a single verdict, because `classify_cell` is a pure function of
-# the box and the geometry.
+# Whether an *inactive* cell holds material is still needed further down the
+# pipeline — coverage (`_covered_by_level`, `coverage.jl`) and the artificial-face
+# tests of the dof layer (`_has_overlay_constraint`, `dofs.jl`) all ask it — but
+# each asks only about the cells it meets, through the dof layer's material oracle
+# (`_Fold`, `coverage.jl`) over the same `cache`. Skipping them here turns those
+# queries from cache hits into cache misses; it does not change a single verdict,
+# because `classify_cell` is a pure function of the box and the geometry.
 function _level_fictitious_cells(level::Level{D,T}, physical::PhysicalDomain,
                                  cache::_ClassifyCache{D,T}) where {D,T}
     fict = falses(level.mesh.cells)
@@ -1560,16 +1560,23 @@ end
 # deactivated when *either* source asks for it: the user explicitly
 # excluded it via `active=`, or the geometry classifier reports the cell
 # entirely outside Ω. A `nothing` user mask is treated as "all active".
-# The result collapses back to `nothing` when the fold leaves every cell
-# active, preserving the no-mask hot path.
-function _fold_fictitious(::Nothing, fictitious::BitArray{D}) where {D}
-    any(fictitious) || return nothing
-    return LevelMask{D}(.!fictitious)
-end
-
-function _fold_fictitious(user::LevelMask{D}, fictitious::BitArray{D}) where {D}
-    !any(fictitious) && return user
-    return LevelMask{D}(user.on .& .!fictitious)
+#
+# Called only for a level with at least one fictitious cell: `_apply_physical_fold`
+# keeps every other level as it is, and that is what preserves a `nothing` mask —
+# the no-mask hot path — wherever the fold switches nothing off. A fictitious cell is
+# one the user left active, so the result here always deactivates at least one cell
+# more than `user` does and never collapses to `nothing`.
+#
+# Loops rather than the BitArray broadcast `user.on .& .!fictitious`: the fused
+# broadcast compiles a kernel of its own on an immersed space's first `prepare`
+# (about 100 ms of code generation, against about 20 ms for the loops), and the
+# resulting mask is bit for bit the same.
+function _fold_fictitious(user::Union{Nothing,LevelMask{D}}, fictitious::BitArray{D}) where {D}
+    on = user === nothing ? trues(size(fictitious)) : copy(user.on)
+    @inbounds for i in eachindex(on, fictitious)
+        fictitious[i] && (on[i] = false)
+    end
+    return LevelMask{D}(on)
 end
 
 # Apply the PhysicalDomain fold to `V`. For each level, classifies cells
