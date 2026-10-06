@@ -124,8 +124,8 @@ using Unfitted
 using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, LevelMask, AxisDofKey,
                 TensorDofKey, EliminationLedger, _LevelContext, _eliminate!, _constrain!, _pivot!,
                 cell_indices, is_active, AxisBox, _check_basis_mode, _level_side_is_physical,
-                _tensor_dof_key, _Fold, _fictitious, _is_fictitious, _nested_over,
-                _reproduced_on_domain
+                _tensor_dof_key, _Fold, _fictitious, _is_fictitious, _is_void, _void_table,
+                _nested_over, _reproduced_on_domain
 using StaticArrays: SVector
 using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim
 
@@ -654,8 +654,8 @@ end
 
 # ── Support selection: the admissible region and the functions inside it ──────
 
-# The cells of `level` over which its functions may live: the active ones, plus
-# the inactive ones that hold no material.
+# The cells of a level over which its functions may live — its *admissible region* —
+# are the active ones, plus the inactive ones that hold no material.
 #
 # A `LevelMask` merges two deactivations (`_apply_physical_fold`), and what decides
 # here is not which one switched a cell off but whether the cell holds material. An
@@ -666,34 +666,40 @@ end
 # off, and a user mask entirely outside Ω — has nothing integrated over it, so the
 # truncated and untruncated functions agree on Ω and the function may stay. That
 # single distinction is the whole of this family's finite-cell compatibility — it is
-# what keeps a cut cell's modes alive instead of constraining them away — and it costs
-# one query of the build's material oracle (`ctx.fold`) per inactive cell. The fold
-# classifies only the cells that were active before it, so that is a box-memo hit for
-# a cell the fold switched off and a fresh classification for a user-masked one.
+# what keeps a cut cell's modes alive instead of constraining them away.
 #
-# Materialised as a dense `Array{Bool,D}` rather than asked per function because
-# a degree-`p` function's support meets `(p + 1)^D` cells and every cell is
-# asked about by up to `(p + 1)^D` functions; the array turns that
-# `O(raws · (p+1)^D)` classification budget into `O(cells)`.
-function _admissible_cells(level::Level{D,T}, fold::_Fold{D,T}) where {D,T}
-    admissible = Array{Bool,D}(undef, level.mesh.cells)
-    for ci in cell_indices(level.mesh)
-        admissible[ci] = is_active(level.mask, ci) || _is_fictitious(fold, level, ci)
-    end
-    return admissible
-end
-
-# Everything a level's admissibility question needs, gathered once per level: the
-# per-cell table above, which of the level's box faces are physical, the level's
+# The region is read lazily, cell by cell, off the build's material oracle
+# (`ctx.fold`): its verdict table for the level answers whether an inactive cell is
+# void, classifying the cell on its first ask and reading the stored verdict on every
+# later one. The table, rather than a fresh classification per ask, because a
+# degree-`p` function's support meets `(p + 1)^D` cells and every cell is asked about
+# by up to `(p + 1)^D` functions. Lazily, rather than as a dense per-level table
+# filled up front, because most inactive cells of a level lie farther than `p` cells
+# from every active one, where no function's support reaches. A dense table
+# classified all of them, once per record — for the selection and again for every
+# burial test that asks this level as a cover. Measured on an 8² base under five
+# band-shaped overlays around a hole, that was 82 % of the layout and 79 824
+# classifications, against the 1 092 integrated Legendre's coverage asks on the same
+# stack; read lazily, the B-spline layout classifies 5 177 cells.
+#
+# The table is the build's one table for the level, shared rather than owned here:
+# the selection, every burial test that builds a record on this level as a cover,
+# the clamped trace faces (`_active_cell_at_face`), the burial's level-side test and
+# the coverage pass all ask the same oracle. A grid cell is therefore classified at
+# most once per layout build, whichever of them asks first, and only if one of them
+# asks at all; a cell the fold already classified costs a lookup in the box memo
+# behind the oracle.
+#
+# Everything a level's admissibility question needs is gathered here once per
+# record: the level, its verdict table, which of its box faces are physical, its
 # uniform per-axis cell width (for the virtual cells outside the mesh), and the
-# build's material oracle, which answers for those virtual cells.
-#
-# A struct rather than five arguments because both the selection rule and the
-# burial test ask the same question of the same level, and the burial test asks it
-# of a *second* level as well.
+# oracle, which answers for those virtual cells through its box memo. A struct rather
+# than six arguments because both the selection rule and the burial test ask the
+# same question of the same level, and the burial test asks it of a *second* level
+# as well.
 struct _Admissibility{D,T,S,F}
     level::Level{D,T,S}
-    cells::Array{Bool,D}
+    table::Array{UInt8,D}
     lower_physical::NTuple{D,Bool}
     upper_physical::NTuple{D,Bool}
     width::NTuple{D,T}
@@ -705,14 +711,20 @@ end
 # one for each covering level — because everything it takes from `ctx` (the domain,
 # the tolerance and the material oracle) is space-wide. `ctx.fold` is concretely
 # typed, so `F` is too, and every admissibility query specialises on it.
+#
+# O(1): nothing is classified here. The verdict table is resolved only for a level
+# with an inactive cell; an all-active level (a `nothing` mask) never reads one,
+# because `_cell_admissible` stops at `is_active`, so it gets an empty stand-in
+# instead of a table of its whole grid that nothing would ever fill.
 function _admissibility(level::Level{D,T,S}, ctx::_LevelContext{D,T}) where {D,T,S}
     mesh = level.mesh
     width = ntuple(d -> (mesh.domain.upper[d] - mesh.domain.lower[d]) / mesh.cells[d], D)
     domain, tol, fold = ctx.space.domain, ctx.tolerance, ctx.fold
     lower = ntuple(d -> _level_side_is_physical(level, domain, d, :lower, tol), D)
     upper = ntuple(d -> _level_side_is_physical(level, domain, d, :upper, tol), D)
-    return _Admissibility{D,T,S,typeof(fold)}(level, _admissible_cells(level, fold), lower, upper,
-                                              width, fold)
+    table = level.mask === nothing ? Array{UInt8,D}(undef, ntuple(_ -> 0, D)) :
+            _void_table(fold, level)
+    return _Admissibility{D,T,S,typeof(fold)}(level, table, lower, upper, width, fold)
 end
 
 # `_overlay_constraints!` at `continuity = :maximal`: one strong elimination per
@@ -779,8 +791,10 @@ end
 # Three cases, and the third is the one that makes this family work under an
 # immersed geometry:
 #
-#   1. Inside the grid. The precomputed table answers: active, or inactive and
-#      holding no material.
+#   1. Inside the grid: active, or inactive and holding no material. The mask
+#      answers the first half; the second is asked of the build's material oracle
+#      only for an inactive cell, through the level's verdict table (see
+#      `_Admissibility`).
 #   2. Outside the grid across a face that coincides with the space's own
 #      boundary. There is no artificial boundary there and nothing beyond it is
 #      part of the discretised domain, so the question is vacuous and the answer
@@ -805,7 +819,7 @@ function _cell_admissible(a::_Admissibility{D}, c::CartesianIndex{D}) where {D}
             inside = false
         end
     end
-    inside && return a.cells[c]
+    inside && return is_active(a.level.mask, c) || _is_void(a.fold, a.table, a.level, c)
     return _fictitious(a.fold, _virtual_cell_box(a, c))
 end
 

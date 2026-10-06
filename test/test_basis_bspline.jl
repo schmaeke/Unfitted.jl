@@ -366,6 +366,113 @@ end
     @test count(==(:overlay), lm.elimination_source) > 0
 end
 
+# Whether cell `c` of `level` (which may lie outside the grid) is admissible, stated
+# the way the dense per-level table filled up front stated it, and independently of
+# the lazy record under test: inside the grid, active or else void by the classifier;
+# past a box face on the space's own boundary, admissible; past an artificial face,
+# void by the classifier on the virtual cell the uniform grid continues into.
+function _dense_admissible(V, level, c::CartesianIndex{D}, tol) where {D}
+    mesh, n = level.mesh, level.mesh.cells
+    inside = true
+    for d in 1:D
+        1 <= c[d] <= n[d] && continue
+        side = c[d] < 1 ? :lower : :upper
+        Unfitted._level_side_is_physical(level, V.domain, d, side, tol) && return true
+        inside = false
+    end
+    inside && return Unfitted.is_active(level.mask, c) || _void_by_classifier(V.physical, level, c)
+    width = ntuple(d -> (mesh.domain.upper[d] - mesh.domain.lower[d]) / n[d], D)
+    virtual = box(ntuple(d -> mesh.domain.lower[d] + (c[d] - 1) * width[d], D),
+                  ntuple(d -> mesh.domain.lower[d] + c[d] * width[d], D))
+    return classify_cell(V.physical, virtual) === :fictitious
+end
+
+@testset "BSpline extension: the admissible region is read lazily, with the dense answers" begin
+    # `_cell_admissible` asks whether an inactive grid cell is void through the build's
+    # material oracle — the level's verdict table, which classifies a cell on its first
+    # ask — instead of reading a dense per-level table classified up front. Its answers
+    # must be the dense table's on every cell a function's support can reach, the
+    # level's grid dilated by `p`, whatever the cell is: active, folded, user-masked
+    # over void or over material, past the space's boundary, or past an artificial face
+    # into void or into material. Checked on a selecting stack, whose records the
+    # selection and the burial build, and on a clamped one, whose trace faces and burial
+    # read the same tables, each with and without `keep_fictitious` (where no fold runs
+    # and every inactive cell is the user's).
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    hole(; kw...) = physical_domain(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0,
+                                    subcell_length_scale=1 / 64, max_depth=6, kw...)
+    p = 2
+    # The base and the first overlay each mask one cell entirely inside the hole (void)
+    # and one in the material. The first overlay's x₁ = ½ face is artificial and crosses
+    # the hole, so its virtual cells past it are void near x₂ = ½ and material near
+    # x₂ = 0 and 1. The second overlay lies in the material and keeps a `nothing` mask.
+    basemask = trues(8, 8)
+    basemask[4, 4] = basemask[2, 6] = false
+    overlaymask = trues(8, 16)
+    overlaymask[8, 8] = overlaymask[3, 12] = false
+    function stack(continuity, physical)
+        basis = bspline(; continuity)
+        V = space(omega; cells=8, order=p, basis, physical, active=basemask)
+        V = overlay(V, box((0.0, 0.0), (0.5, 1.0)); cells=(8, 16), order=p, basis,
+                    active=overlaymask)
+        return overlay(V, box((0.0, 0.0), (0.25, 0.25)); cells=(4, 4), order=p, basis)
+    end
+    tol = GeometryTolerance(Float64)
+    for continuity in (:maximal, 0), physical in (hole(), hole(; alpha=1e-3, keep_fictitious=true))
+        # The prepared space and its warm memo, exactly as the layout build gets them.
+        _, spaces, caches = Unfitted._prepare_spaces(mass(stack(continuity, physical)))
+        V, cache = only(spaces), only(caches)
+        masked, unmasked = V.levels[1:2], V.levels[3]
+        @test all(level -> level.mask !== nothing, masked) && unmasked.mask === nothing
+
+        # A layout build classifies through the caller's box memo, so a second build on
+        # the same memo classifies nothing new: every grid cell a verdict table asks
+        # about and every virtual cell past an artificial face is already there. The
+        # first build does classify — the user-masked cells and the virtual cells, which
+        # the fold never asks about.
+        before = length(cache)
+        Unfitted.dof_layout(V; classify_cache=cache)
+        after_first = length(cache)
+        Unfitted.dof_layout(V; classify_cache=cache)
+        @test after_first > before
+        @test length(cache) == after_first
+
+        raw_by_key, raw_keys, _, level_raws = Unfitted._enumerate_raws(V)
+        fold = Unfitted._Fold(V, cache)
+        nocoverage = Unfitted.Coverage{2}(Dict{Int,BitArray{2}}())
+        for level in V.levels
+            ctx = Unfitted._LevelContext(V, fold, tol, nocoverage, raw_keys, raw_by_key,
+                                         level_raws[level.id])
+            a = BSExt._admissibility(level, ctx)
+            # O(1) to build: nothing is classified, and the record reads the oracle's own
+            # table for the level — the one every other site of the build asks — or, for
+            # an all-active level, which never reads one, an empty stand-in.
+            @test all(iszero, a.table)
+            @test level.mask === nothing ? isempty(a.table) :
+                  a.table === Unfitted._void_table(fold, level)
+            grid = CartesianIndices(ntuple(d -> (1-p):(level.mesh.cells[d]+p), 2))
+            dense = Dict(c => _dense_admissible(V, level, c, tol) for c in grid)
+            @test [c for c in grid if BSExt._cell_admissible(a, c) != dense[c]] ==
+                  CartesianIndex{2}[]
+            # Only inactive grid cells are ever looked up in the table.
+            @test all(c -> iszero(a.table[c]) || !Unfitted.is_active(level.mask, c),
+                      CartesianIndices(a.table))
+            # Non-vacuity on the overlay: every kind of cell is there and answers as its
+            # kind must.
+            if level.id == V.levels[2].id
+                inactive = filter(c -> !Unfitted.is_active(level.mask, c), cell_indices(level.mesh))
+                @test any(c -> dense[c], inactive) && any(c -> !dense[c], inactive)
+                past_face = [c for c in grid if c[1] > level.mesh.cells[1] && 1 <= c[2] <= 16]
+                @test any(c -> dense[c], past_face) && any(c -> !dense[c], past_face)
+                @test all(c -> dense[c], [c for c in grid if c[2] < 1 || c[2] > 16])
+            end
+        end
+        # An all-active level's grid was never classified into a table of its own.
+        id = unmasked.id
+        @test length(fold.cells) < id || !isassigned(fold.cells, id)
+    end
+end
+
 @testset "BSpline extension: an immersed spline system is Jacobi-conditionable" begin
     # The cut-cell conditioning hazard, and the half of it that is about the basis
     # rather than about the diagonal. `cond(A)` on an immersed system is dominated
