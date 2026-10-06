@@ -392,8 +392,8 @@ end
 # stays the dependency map.
 #
 # A family that declares `_supports_cell_order` supplies its own method where its
-# dof-key incidence machinery lives, exactly as a family supplies its own
-# `_coverage_constraints!`: integrated Legendre's is in `dofs.jl`, next to
+# dof-key incidence machinery lives, exactly as a family supplies its own burial
+# hooks for `_coverage_constraints!`: integrated Legendre's is in `dofs.jl`, next to
 # `_entity_carries` and the `TensorDofKey` factors it is expressed over, and the
 # B-spline family's would live in its extension. A family that has not supplied
 # one may only be handed a single-entry palette, and the refusal below is loud on
@@ -1019,7 +1019,7 @@ mode be *buried* — every cell it is incident to covered by one finer level:
   * a buried **linear** mode is dropped when one finer level reproduces it
     exactly, which takes both halves of a test: that level's mesh must refine
     this one's (`_nested_over` in `src/coverage.jl`) *and* its basis must span
-    that mesh's hats (`_spans_hats` in `src/dofs.jl`). A buried vertex function
+    that mesh's hats (`_reproduces` in `src/dofs.jl`). A buried vertex function
     is a C⁰ hat, and a basis smoother than C⁰ across its own cell boundaries — a
     B-spline of degree ≥ 2 — carries nothing that reproduces the kink.
 
@@ -1040,9 +1040,9 @@ A B-spline level has no bubble/skeleton split and so has only the second
 elimination: a buried function is dropped exactly when a nested level above
 reproduces it, which for that family is not an accuracy trade at all but the
 thing that keeps a nested stack non-singular — see `bspline` in the
-`BasicBSpline` extension. Any further family takes the generic
-`_coverage_constraints!` fallback, which records nothing, so on such a
-space leaf semantics eliminate nothing. See `src/coverage.jl` and
+`BasicBSpline` extension. Any further family takes no part in the burial
+test of `_coverage_constraints!` unless it opts in, so on such a space leaf
+semantics eliminate nothing. See `src/coverage.jl` and
 `_coverage_constraints!` in `src/dofs.jl`;
 `diagnostics(...).reduced_mode_counts` reports the per-level count.
 """

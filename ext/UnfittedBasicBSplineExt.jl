@@ -88,9 +88,12 @@ global 1D function index via the `_AXIS_BSPLINE` tag.
     / mask face as linear-constraint rows (`_constrain!`), which the
     `_resolve_rows!` overload below turns into pivots. Masked levels of any
     geometry are eliminable either way.
-  - A `_coverage_constraints!` overload. Covered-mode pruning for this family is
-    the dedup and nothing else: a buried function a covering level's span
-    already contains exactly is eliminated, because the two are linearly
+  - The burial hooks of the dof layer's one pruning driver,
+    `_coverage_constraints!`: `_buries`, `_burial_cells`, `_burial_candidate`,
+    `_cover_test` with its exact test `_reproduced_by`, `_dedup!`, and the rows of
+    the `_reproduces` trait that have a B-spline side. Covered-mode pruning for this
+    family is the dedup and nothing else: a buried function a covering level's
+    span already contains exactly is eliminated, because the two are linearly
     dependent and the superposition is otherwise singular. Under selection the
     burial test is an *exact* containment rather than a conservative one; see
     [`bspline`](@ref) under "Nested levels". On a clamped level the dedup is a
@@ -124,8 +127,7 @@ using Unfitted
 using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, LevelMask, AxisDofKey,
                 TensorDofKey, EliminationLedger, _LevelContext, _eliminate!, _constrain!, _pivot!,
                 cell_indices, is_active, AxisBox, _check_basis_mode, _level_side_is_physical,
-                _tensor_dof_key, _Fold, _fictitious, _is_fictitious, _is_void, _void_table,
-                _nested_over, _reproduced_on_domain
+                _tensor_dof_key, _Fold, _fictitious, _is_fictitious, _is_void, _void_table
 using StaticArrays: SVector
 using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim
 
@@ -1018,8 +1020,9 @@ end
 
 # ── Covered-mode pruning: dedup of what a covering level already contains ─────
 
-# `_coverage_constraints!` for a B-spline level — the dedup half only, and it is
-# the whole of covered-mode pruning for this family.
+# This family's side of the dof layer's one pruning driver, `_coverage_constraints!`
+# (`src/dofs.jl`, whose docstring states the hooks' contract) — the dedup half only, and
+# it is the whole of covered-mode pruning for this family.
 #
 # Integrated Legendre splits into a linear skeleton plus bubble modes, so it can
 # shed the bubbles of a covered cell on their own and trade accuracy for dofs. A
@@ -1031,7 +1034,9 @@ end
 # therefore unconditional here as everywhere: the only stack that keeps both
 # copies is the unreduced twin `prepare(problem; prune = false)` builds, which
 # opts out of the repair along with the reduction, exactly as it does for
-# integrated Legendre.
+# integrated Legendre. The family sheds nothing, so it keeps the driver's `_sheds_any`
+# / `_sheds` defaults, and a level that no cover above may dedup (`_reproduces`,
+# `_nested_over`) is done before a candidate is looked at.
 #
 # This is also the coarse half of the hierarchical selection rule: what it
 # removes is exactly `{β : supp β ⊆ Ω^{k}}`, the functions Kraft's construction
@@ -1039,112 +1044,111 @@ end
 # Speleers, Comput. Aided Geom. Design 29 (2012) 485–498, Definition 1(I)). The
 # fine half is the support selection in `_selection_constraints!`; together they
 # are the hierarchical spline basis, stated for superposed independent grids.
-function Unfitted._coverage_constraints!(ledger::EliminationLedger,
-                                         level::Level{D,T,<:BSplineFamily},
-                                         ctx::_LevelContext{D,T}) where {D,T}
-    cov = ctx.coverage.covered[level.id]
-    any(cov) || return ledger
-    family = level.basis
-    n = level.mesh.cells
-    p = ntuple(d -> degree(family.spaces[d]), D)
-    fold, tol = ctx.fold, ctx.tolerance
-    above = [k
-             for k in ctx.space.levels
-             if k.id > level.id && _reproduces(k, p) && _nested_over(level, k, tol)]
-    isempty(above) && return ledger
-    # One reproduction predicate per covering level, chosen by what that cover
-    # actually is. A cover that selects by support answers the question *exactly*,
-    # by walking the subdivision and asking whether every fine function in it
-    # survived its own selection; it therefore needs that cover's admissibility
-    # record, built once per cover rather than once per buried function. Any other
-    # cover — an integrated-Legendre overlay, or a B-spline level below maximal
-    # continuity — is *clamped* on its artificial boundary, so its span near that
-    # boundary is not described by any statement about supports, and the
-    # conservative geometric predicate `_reproduced_on_domain` is the right one.
-    selecting(k) = k.basis isa BSplineFamily && _selects_by_support(k.basis)
-    # `coverage`'s per-cell verdict is a prefilter for the clamped path only. It
-    # tests the *whole* cell box against the cover's box, which under an immersed
-    # geometry can reject a cell whose material part the cover does reach — the rest
-    # of it being fictitious — and that would silently under-deduplicate. The exact
-    # path needs no prefilter: its first block test fails immediately for a function
-    # nowhere near the cover, which is what keeps the walk off the level's bulk.
-    clamped_only = !any(selecting, above)
-    candidates = Int[]
-    for raw in ctx.raws
-        cells = _support_cells(ctx.raw_keys[raw], family, n)
-        # The level-side half, and it holds for BOTH mechanisms. An inactive support
-        # cell that holds material (a user mask inside Ω) blocks: what a masked level
-        # assembles is the function truncated to its own active cells, which is not the
-        # function the cover reproduces. One that holds none (a folded cell, or a user
-        # mask entirely outside Ω) does not: nothing is integrated there, so the
-        # truncation is invisible on Ω. Leaving this to the covering predicate was
-        # wrong — the subdivision walk looks only at the cover — and what it deleted was
-        # real approximation rather than a null mode: measured on a `continuity = 0`
-        # base of 4² masked at one interior cell under a nested maximal-continuity 6²
-        # cover, the pruned space carried 58 unknowns against an unreduced rank of 59.
-        all(ci -> is_active(level.mask, ci) || _is_fictitious(fold, level, ci), cells) || continue
-        if clamped_only
-            # Buried, and buried as a whole function — but the two halves of "whole"
-            # are not the same test. An inactive support cell holding material blocks:
-            # what a masked level assembles is the function truncated to its own active
-            # cells, which is not the function `k` reproduces. One holding none does
-            # not: nothing is integrated there, so the truncation is invisible on Ω. It
-            # must also bypass `cov`, which is computed only on the active cells dilated
-            # by one (`_coverage_cells`) — a support cell two cells past the active front
-            # holds the `false` default, not a verdict.
-            all(ci -> !is_active(level.mask, ci) || cov[ci], cells) || continue
-        end
-        push!(candidates, raw)
-    end
-    # The covers are asked one at a time, each about the candidates no earlier cover
-    # reproduced: every candidate meets its covers in `above` order up to the first
-    # that reproduces it, exactly as a per-function loop over the covers would ask
-    # them. The dedups are then recorded in raw order, which is the order the rows of
-    # a clamped level must keep (see `_dedup!`).
-    reproduced = falses(length(candidates))
-    for k in above
-        cover = selecting(k) ? _admissibility(k, ctx) : nothing
-        _mark_reproduced!(reproduced, candidates, level, k, cover, ctx)
-    end
-    for (i, raw) in pairs(candidates)
-        reproduced[i] && _dedup!(ledger, level, raw)
-    end
-    return ledger
+Unfitted._buries(::BSplineFamily) = true
+
+function Unfitted._burial_cells(level::Level{D,T,<:BSplineFamily},
+                                key::TensorDofKey{D}) where {D,T<:Real}
+    return _support_cells(key, level.basis, level.mesh.cells)
 end
 
-# True iff level `k`, standing above a B-spline level of per-axis degree `p`,
-# reproduces that level's buried functions exactly — given the meshes nest, which
-# the caller tests separately with `_nested_over`.
+# The candidate test: whether the function on `cells`, its support, is buried — and the
+# two halves of "buried as a whole function" are not the same test.
 #
-# A buried function's support lies inside `k`'s active region, and it vanishes
-# there to order `p − 1` (its own end knots are simple), so `k`'s trace conditions
-# — orders `0 … m ≤ p − 1` — never exclude it. What is left is a question about
-# the two spans:
+# The level-side half holds for BOTH mechanisms. An inactive support cell that holds
+# material (a user mask inside Ω) blocks: what a masked level assembles is the function
+# truncated to its own active cells, which is not the function the cover reproduces.
+# One that holds none (a folded cell, or a user mask entirely outside Ω) does not:
+# nothing is integrated there, so the truncation is invisible on Ω. Leaving this to the
+# covering predicate was wrong — the subdivision walk looks only at the cover — and what
+# it deleted was real approximation rather than a null mode: measured on a
+# `continuity = 0` base of 4² masked at one interior cell under a nested
+# maximal-continuity 6² cover, the pruned space carried 58 unknowns against an
+# unreduced rank of 59.
 #
-#   * a B-spline `k` of the *same* degree. Interior knots are simple on both
-#     sides, so `k` is `C^{p−1}` exactly where the buried function kinks and,
-#     under nesting, that function is one of `k`'s own splines. A *higher* degree
-#     does not help — at a shared simple knot `k` would be `C^p`, too smooth to
-#     carry the kink — and a lower one cannot carry the polynomial degree.
-#   * an integrated-Legendre `k` in `:tensor` mode of order ≥ `p`. Its span is
-#     every `C⁰` tensor polynomial of that degree on its cells, which contains a
-#     `C^{p−1}` spline of degree `p`. `:trunk` drops the mixed high-order terms,
-#     so it does not.
+# The coverage half — every active support cell covered by some level above — is a
+# prefilter for the geometric test only, and applies only when every cover that may
+# dedup this level is judged geometrically (`geometric`). It tests the *whole* cell box
+# against the cover's box, which under an immersed geometry can reject a cell whose
+# material part the cover does reach — the rest of it being fictitious — and for the
+# exact test of a selecting cover that would silently under-deduplicate. The exact path
+# needs no prefilter: its first block test fails immediately for a function nowhere near
+# the cover, which is what keeps the walk off the level's bulk. The half reads `cov` on
+# the active support cells only, the ones `_coverage_cells` computed: a support cell two
+# cells past the active front holds the `false` default, not a verdict.
+function Unfitted._burial_candidate(level::Level{D,T,<:BSplineFamily}, cells::CartesianIndices{D},
+                                    cov::BitArray{D}, ctx::_LevelContext{D,T},
+                                    geometric::Bool) where {D,T<:Real}
+    fold = ctx.fold
+    all(ci -> is_active(level.mask, ci) || _is_fictitious(fold, level, ci), cells) || return false
+    geometric || return true
+    return all(ci -> !is_active(level.mask, ci) || cov[ci], cells)
+end
+
+# One reproduction test per covering level, chosen by what that cover actually is. A
+# cover that selects by support answers the question *exactly*, by walking the
+# subdivision and asking whether every fine function in it survived its own selection;
+# it therefore needs that cover's admissibility record, which the driver asks for once
+# per cover rather than once per buried function. Any other cover — an
+# integrated-Legendre overlay, or a B-spline level below maximal continuity — is
+# *clamped* on its artificial boundary, so its span near that boundary is not described
+# by any statement about supports, and the conservative geometric predicate
+# `_reproduced_on_domain` is the right one: it keeps the driver's `nothing` default,
+# as does every cover of an integrated-Legendre level, a degree-1 selecting one
+# included.
+function Unfitted._cover_test(::Level{D,T,<:BSplineFamily}, k::Level{D,T,<:BSplineFamily},
+                              ctx::_LevelContext{D,T}) where {D,T<:Real}
+    return _selects_by_support(k.basis) ? _admissibility(k, ctx) : nothing
+end
+
+# The rows of the `_reproduces` trait (`src/dofs.jl`) with a B-spline side.
 #
-# Every other family answers `false`. That is the safe direction: skipping a
-# legitimate dedup leaves a rank-deficient operator, whereas deduping a function
-# nothing reproduces would delete part of the space.
-function _reproduces(k::Level{D}, p::NTuple{D,Int}) where {D}
-    family = k.basis
-    family isa BSplineFamily && return all(d -> degree(family.spaces[d]) == p[d], 1:D)
-    family isa IntegratedLegendre || return false
+# Above a B-spline level of per-axis degree `p`, given the meshes nest: a buried
+# function's support lies inside `k`'s active region, and it vanishes there to order
+# `p − 1` (its own end knots are simple), so `k`'s trace conditions — orders
+# `0 … m ≤ p − 1` — never exclude it. What is left is a question about the two spans:
+#
+#   * a B-spline `k` of the *same* degree. Interior knots are simple on both sides,
+#     so `k` is `C^{p−1}` exactly where the buried function kinks and, under nesting,
+#     that function is one of `k`'s own splines. A *higher* degree does not help — at a
+#     shared simple knot `k` would be `C^p`, too smooth to carry the kink — and a lower
+#     one cannot carry the polynomial degree.
+#   * an integrated-Legendre `k` in `:tensor` mode of order ≥ `p`. Its span is every
+#     `C⁰` tensor polynomial of that degree on its cells, which contains a `C^{p−1}`
+#     spline of degree `p`. `:trunk` drops the mixed high-order terms, so it does not.
+#
+# Every other family answers `false` (the trait's default). That is the safe direction:
+# skipping a legitimate dedup leaves a rank-deficient operator, whereas deduping a
+# function nothing reproduces would delete part of the space.
+function Unfitted._reproduces(k::Level{D,T,<:BSplineFamily},
+                              level::Level{D,T,<:BSplineFamily}) where {D,T<:Real}
+    return all(d -> degree(k.basis.spaces[d]) == degree(level.basis.spaces[d]), 1:D)
+end
+
+function Unfitted._reproduces(k::Level{D,T,<:IntegratedLegendre},
+                              level::Level{D,T,<:BSplineFamily}) where {D,T<:Real}
     k.mode === :tensor || return false
+    p = ntuple(d -> degree(level.basis.spaces[d]), D)
     # `nominal_order(k)` is the level's per-axis maximum, which is not enough when `k` carries
     # a per-cell order: a single cell below `p` anywhere under the buried function's
     # support cannot reproduce it. Requiring every palette entry to clear `p` is the
     # conservative reading — it can only skip a legitimate dedup, never delete a
     # function nothing reproduces.
     return all(o -> all(d -> o[d] >= p[d], 1:D), k.orders.palette)
+end
+
+# The reverse direction: whether a B-spline `k`, standing above an integrated-Legendre
+# level, spans that level's C⁰ hats and may therefore deduplicate them. At degree 1 the
+# open knot vector is the Q1 hat basis outright — simple interior knots give exactly C⁰,
+# the clamped ends give the two boundary hats — so on a nested mesh the buried hat is
+# one of `k`'s own functions. Any axis at degree ≥ 2 is C^(p−1) with p − 1 ≥ 1 at a
+# simple interior knot, too smooth to carry the kink, and the whole tensor product goes
+# with it. Answering per axis rather than per level is what makes this a mixed-family
+# question: a degree-1 B-spline cover over an integrated-Legendre base is the C⁰ hat
+# space and was previously refused the dedup by a family type test, leaving the stack
+# exactly singular.
+function Unfitted._reproduces(k::Level{D,T,<:BSplineFamily},
+                              ::Level{D,T,<:IntegratedLegendre}) where {D,T<:Real}
+    return all(d -> degree(k.basis.spaces[d]) == 1, 1:D)
 end
 
 function _support_cells(key::TensorDofKey{D}, family::BSplineFamily{D}, n::NTuple{D,Int}) where {D}
@@ -1160,37 +1164,10 @@ end
 # node / span keys and reports a single cell for any other tag.
 @inline _axis_support(i::Integer, p::Integer, ncells::Integer) = max(1, i-p):min(ncells, i)
 
-# Mark every candidate of `level` that the covering level `k` reproduces and no
-# earlier cover did: by subdivision against `cover`, `k`'s admissibility record, when
-# `k` selects by support, and by `_reproduced_on_domain` when `cover` is `nothing`.
-#
-# A function of its own, with the cover's record a local of the caller rather than an
-# element of a per-level vector. A `Vector{Union{Nothing, _Admissibility}}` is built by
-# `collect`'s element-type widening, which is compiled for every element type it passes
-# through, and inference reaches it on every B-spline space, including a one-level one
-# whose burial test never runs; and each record read back out of it was re-boxed for
-# the call, 272 bytes per candidate (measured on a 48² degree-3 level under a nested
-# maximal-continuity cover). The barrier also keeps this per-raw loop specialised on
-# `k` and `cover` when the space mixes basis families and `above` is abstractly
-# typed: the call then dispatches once per cover rather than once per raw.
-function _mark_reproduced!(reproduced::BitVector, candidates::Vector{Int},
-                           level::Level{D,T,<:BSplineFamily}, k::Level{D,T}, cover,
-                           ctx::_LevelContext{D,T}) where {D,T}
-    family, n = level.basis, level.mesh.cells
-    for (i, raw) in pairs(candidates)
-        reproduced[i] && continue
-        key = ctx.raw_keys[raw]
-        reproduced[i] = cover === nothing ?
-                        _reproduced_on_domain(level, k, _support_cells(key, family, n),
-                                              ctx.tolerance, ctx.fold) :
-                        _reproduced_by_selection(level, key, cover)
-    end
-    return reproduced
-end
-
-# True iff the covering level `k` reproduces, on Ω, the function of `level` named
-# by `key` — the burial test in the form support selection makes available, and
-# the one that is **exact** rather than conservative.
+# True iff the covering level `k`, whose admissibility record is `cover`, reproduces
+# on Ω the function of `level` named by `key` — the burial test in the form support
+# selection makes available (the driver's exact test, `_cover_test`), and the one that
+# is **exact** rather than conservative.
 #
 # Subdivision is the whole argument. On nested meshes of equal degree a B-spline
 # of the coarse level is a combination, with strictly positive coefficients, of
@@ -1213,8 +1190,9 @@ end
 # statement about supports describes, and it can reproduce a *combination* of two
 # buried functions without reproducing either — a dependency a per-function dedup
 # cannot see, and one exact null mode per combination in the assembled operator.
-function _reproduced_by_selection(level::Level{D,T,<:BSplineFamily}, key::TensorDofKey{D},
-                                  cover::_Admissibility{D,T,<:BSplineFamily}) where {D,T}
+function Unfitted._reproduced_by(cover::_Admissibility{D,T,<:BSplineFamily},
+                                 level::Level{D,T,<:BSplineFamily},
+                                 key::TensorDofKey{D}) where {D,T<:Real}
     coarse = level.basis
     index = ntuple(d -> key.axes[d].index, D)
     clo, chi = _support_block(coarse, index)
@@ -1242,7 +1220,7 @@ end
 # stated in the *coarse* level's cells, into the fine cell block the subdivision
 # lives on.
 #
-# The meshes nest (the caller has already asked `_nested_over`), so every
+# The meshes nest (the driver has already asked `_nested_over`), so every
 # coordinate involved lands on one of `k`'s knot lines and the division is exact
 # up to floating point; rounding to the nearest integer is therefore the right
 # reading rather than a tolerance choice, and it extends past `k`'s own box
@@ -1262,8 +1240,8 @@ end
 # credited to `:overlay`, and its dedup row collapses to `0 = 0`. Eliminating it
 # directly instead would remove it *before* the trace rows are resolved and change
 # which raws they pivot (see `EliminationLedger`).
-function _dedup!(ledger::EliminationLedger{T}, level::Level{D,T,<:BSplineFamily},
-                 raw::Int) where {D,T}
+function Unfitted._dedup!(ledger::EliminationLedger{T}, level::Level{D,T,<:BSplineFamily},
+                          raw::Int) where {D,T<:Real}
     _selects_by_support(level.basis) && return _eliminate!(ledger, raw, :dedup)
     return _constrain!(ledger, [raw], [one(T)], :dedup)
 end
@@ -1480,18 +1458,6 @@ function _register_mentions!(mentions::Vector{Vector{Int}}, offset::Int, raw::In
 end
 
 # ── Family traits ─────────────────────────────────────────────────────────────
-
-# The reverse direction of `_reproduces`: whether *this* family, standing above an
-# integrated-Legendre level, spans that level's C⁰ hats and may therefore deduplicate
-# them. At degree 1 the open knot vector is the Q1 hat basis outright — simple interior
-# knots give exactly C⁰, the clamped ends give the two boundary hats — so on a nested
-# mesh the buried hat is one of this level's own functions. Any axis at degree ≥ 2 is
-# C^(p−1) with p − 1 ≥ 1 at a simple interior knot, too smooth to carry the kink, and
-# the whole tensor product goes with it. Answering per axis rather than per level is
-# what makes this a mixed-family question: a degree-1 B-spline cover over an
-# integrated-Legendre base is the C⁰ hat space and was previously refused the dedup by a
-# family type test, leaving the stack exactly singular.
-Unfitted._spans_hats(f::BSplineFamily{D}) where {D} = all(d -> degree(f.spaces[d]) == 1, 1:D)
 
 # A degree-`p_d` B-spline spans `p_d + 1` cells along axis `d`, so a marked region
 # has to be dilated by `p_d` cells per side before the level carries the functions

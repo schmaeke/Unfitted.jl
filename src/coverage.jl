@@ -29,8 +29,9 @@
 #
 # Reading the rule with only the first exemption in mind is how a nested cover ending
 # inside a folded coarse cell came to leave both copies of an exactly reproduced mode
-# active; `_reproduced_on_domain` is the shared answer, used by the pruning rule in
-# `dofs.jl` and by the B-spline family's own in the extension.
+# active; `_reproduced_on_domain` is the shared answer, which the burial driver in
+# `dofs.jl` (`_coverage_constraints!`) asks for every family and every cover it judges
+# geometrically.
 #
 # Both exemptions, and the artificial-face tests of the dof layer, ask one question of an
 # inactive cell — does it hold material? — and `_Fold` below is the one value that
@@ -173,10 +174,33 @@ the cell is uncovered. The VTK mesh export (`_mesh_vtk_data` in `postprocessing.
 also reads the flag, for *every* cell of a level, so its `covered` cell array shows
 `0` on the masked level's far-away inactive cells whatever their true coverage; read
 it alongside the `active` array it is written next to.
+
+The remaining fields are the memo behind those flags, private to the build that made
+the value. `covered[level_id]` asks, per cell, whether *some* level above covers it;
+the burial test of `_coverage_constraints!` asks the narrower question whether *one
+given* level does (`_reproduced_on_domain`), once per buried function per cover, about
+cells `build_coverage` has already answered. Both are `_covered_by_level` of the same
+cell box, cover, tolerance and material oracle, so `build_coverage` records each
+answer it computes and the burial test reads it back (`_covered_by!`):
+
+  - `by` — one table per (level, cover) pair, a `UInt8` per cell of the level (`0x00`
+    not asked yet, `0x01` covered, `0x02` not), allocated on the pair's first ask.
+    An unmasked cover gets none: its answer is a single box test.
+  - `first`, `stride` — the pair `(level, k)` owns slot
+    `(level.id − first)·stride + (k.id − first) + 1` of `by`, where `first` is the
+    space's smallest level id and `stride` the width of its id range.
+
+A `Coverage` built from the `covered` dictionary alone has an empty memo; it is the
+value of a build that does not prune, which never asks.
 """
 struct Coverage{D}
     covered::Dict{Int,BitArray{D}}
+    by::Vector{Array{UInt8,D}}
+    first::Int
+    stride::Int
 end
+
+Coverage{D}(covered::Dict{Int,BitArray{D}}) where {D} = Coverage{D}(covered, Array{UInt8,D}[], 0, 0)
 
 # The cells of `mesh` that `box` overlaps, as an axis-aligned block. `_axis_cells`
 # (`mesh.jl`) does the per-axis binary search, so the cost is O(D·log N +
@@ -264,6 +288,31 @@ function _covered_by_level(box::AxisBox{D,T}, k::Level{D,T}, tol::GeometryTolera
     return true
 end
 
+# `_covered_by_level` of cell `c` of `level` against the single level `k`, through the
+# memo in `coverage` (see `Coverage`). The answer is a pure function of the cell box,
+# `k`, the tolerance and the material oracle, all fixed for the build `coverage`
+# belongs to, so a stored verdict is the one a fresh call returns. `build_coverage`
+# fills the memo as it decides its flags, and the burial test's condition 1
+# (`_reproduced_on_domain`) asks the same (cell, cover) pairs again once per buried
+# function and cover: on an integrated-Legendre depth-5 ladder (8² p2) over an immersed
+# disc the memo cut the `_covered_by_level` evaluations of one layout from 88 440 to
+# 10 492, and on a base under five band-shaped overlays around a hole from 13 204 to
+# 5 092.
+#
+# The pair's table is allocated, every cell "not asked yet", on the pair's first ask.
+function _covered_by!(coverage::Coverage{D}, level::Level{D,T}, c::CartesianIndex{D}, k::Level{D,T},
+                      tol::GeometryTolerance{T}, fold::_Fold{D,T}) where {D,T}
+    k.mask === nothing && return _covered_by_level(cell_box(level.mesh, c), k, tol, fold)
+    slot = (level.id - coverage.first) * coverage.stride + (k.id - coverage.first) + 1
+    isassigned(coverage.by, slot) || (coverage.by[slot] = zeros(UInt8, level.mesh.cells))
+    table = coverage.by[slot]
+    verdict = table[c]
+    verdict == 0x00 || return verdict == 0x01
+    covered = _covered_by_level(cell_box(level.mesh, c), k, tol, fold)
+    table[c] = covered ? 0x01 : 0x02
+    return covered
+end
+
 # True iff `k` reproduces on Ω the function `level` assembles from the contiguous cell
 # block `cells` — the support of one of `level`'s dofs. Nesting and the span-containment
 # question ("does k's basis carry this shape at all?") belong to the caller; what is
@@ -298,27 +347,42 @@ end
 # `k` is strictly inside the hull. It is the void cells that make the rule bite — a
 # support whose material part `k` covers while its fictitious part sticks out past `k`'s
 # box.
+#
+# Condition 1 reads `coverage`'s memo (`_covered_by!`), which `build_coverage` filled
+# with the same `_covered_by_level` answers. Condition 3 needs `k`'s cells across the
+# hull, which depend only on `k`, the hull and the tolerance, so they are found once per
+# call, at the first face that cuts the hull — and not at all on the common path, where
+# none does.
 function _reproduced_on_domain(level::Level{D,T}, k::Level{D,T}, cells::CartesianIndices{D},
-                               tol::GeometryTolerance{T}, fold::_Fold{D,T}) where {D,T}
+                               tol::GeometryTolerance{T}, fold::_Fold{D,T},
+                               coverage::Coverage{D}) where {D,T}
     for ci in cells
         if is_active(level.mask, ci)
-            _covered_by_level(cell_box(level.mesh, ci), k, tol, fold) || return false
+            _covered_by!(coverage, level, ci, k, tol, fold) || return false
         else
             _is_void(fold, level, ci) || return false
         end
     end
     hull = AxisBox{D,T}(cell_box(level.mesh, first(cells)).lower,
                         cell_box(level.mesh, last(cells)).upper)
+    perp = nothing
     for d in 1:D
         faces = ((1, k.mesh.domain.lower[d]), (k.mesh.cells[d], k.mesh.domain.upper[d]))
         for (j, x) in faces                                     # k's two box faces on axis d
             hull.lower[d] + tol.contain < x < hull.upper[d] - tol.contain || continue
-            perp = _cells_under_box(k.mesh, hull, tol)
-            layer = CartesianIndices(ntuple(e -> e == d ? (j:j) : perp.indices[e], D))
-            any(kc -> is_active(k.mask, kc), layer) && return false
+            if perp === nothing
+                perp = _cells_under_box(k.mesh, hull, tol)
+            end
+            any(kc -> is_active(k.mask, kc), _face_layer(perp, d, j)) && return false
         end
     end
     return true
+end
+
+# The cells of `perp` in layer `j` along axis `d`: `k`'s boundary cells on one of its
+# box faces, across the extent of a support hull.
+function _face_layer(perp::CartesianIndices{D}, d::Int, j::Int) where {D}
+    return CartesianIndices(ntuple(e -> e == d ? (j:j) : perp.indices[e], D))
 end
 
 """
@@ -342,13 +406,19 @@ when `V.physical === nothing`.
 Only the cells `_coverage_cells` selects are evaluated; the rest keep the `false`
 default, which the pruning rule never reads. On a masked level that is what
 keeps the pass proportional to the *active* region rather than to the level's grid.
+
+Every per-cover answer computed on the way is kept in the returned value's memo (see
+[`Coverage`](@ref)), which the burial test of the same build reads back.
 """
 function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T}) where {D,T}
     build_coverage(V, tol, _Fold(V))
 end
 
 function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T}, fold::_Fold{D,T}) where {D,T}
-    covered = Dict{Int,BitArray{D}}()
+    lo, hi = extrema(level -> level.id, V.levels)
+    stride = hi - lo + 1
+    coverage = Coverage{D}(Dict{Int,BitArray{D}}(), Vector{Array{UInt8,D}}(undef, stride^2), lo,
+                           stride)
     for level in V.levels
         cov = falses(level.mesh.cells)
         above = [k for k in V.levels if k.id > level.id]
@@ -356,19 +426,19 @@ function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T}, fold::_Fold{D,
             wanted = _coverage_cells(level)
             for ci in cell_indices(level.mesh)
                 wanted[ci] || continue
-                box = cell_box(level.mesh, ci)
-                cov[ci] = any(k -> _covered_by_level(box, k, tol, fold), above)
+                cov[ci] = any(k -> _covered_by!(coverage, level, ci, k, tol, fold), above)
             end
         end
-        covered[level.id] = cov
+        coverage.covered[level.id] = cov
     end
-    return Coverage{D}(covered)
+    return coverage
 end
 
 # The cells of `level` whose coverage flag can ever be read, as a `BitArray{D}`.
 #
-# `_coverage_constraints!` (in `dofs.jl`) is the consumer this set is cut for, and it
-# tests `cov` exactly on `_incident_cells(key, n)` for the level's raw dof keys. Raw
+# `_coverage_constraints!` (in `dofs.jl`) is the consumer this set is cut for: its
+# integrated-Legendre candidate test (`_burial_candidate`) reads `cov` exactly on
+# `_incident_cells(key, n)` for the level's raw dof keys. Raw
 # dofs are enumerated on *active* cells only (`_enumerate_raws`), and a key born on
 # cell `c` is incident to `c` and — through its node factors — to the cells sharing a
 # face, edge, or vertex with `c`. The read set is therefore the active set dilated by
@@ -380,8 +450,8 @@ end
 # An unmasked level is all-active, so its dilation is the whole grid and the pass is the
 # original one.
 #
-# The B-spline family's own `_coverage_constraints!` (in the extension) reads `cov` over a
-# wider stencil — a spline of degree `p` lives on up to `p + 1` cells per axis. Both
+# The B-spline family's candidate test (`_burial_candidate`, in the extension) reads `cov`
+# over a wider stencil — a spline of degree `p` lives on up to `p + 1` cells per axis. Both
 # consumers read it only on the *active* cells of that stencil, which are the seed of the
 # dilation above, and skip the inactive ones outright: a fictitious support cell can lie
 # several cells past the active front, where the entry is the uninformative `false`
@@ -413,16 +483,31 @@ end
 # functions on an `outer` cell boundary, so each is multilinear on each `outer` cell —
 # the geometric half of the linear-dedup condition. The other half belongs to `outer`'s
 # basis, which must also carry the vertex function's kink; `_coverage_constraints!`
-# (`dofs.jl`) tests both before deduping. The B-spline family reuses the same geometric
-# half — nesting is what puts each of its interior knots on an `outer` cell boundary —
-# and pairs it with its own span-containment test.
+# (`dofs.jl`) tests both before deduping, the basis half as `_reproduces`. The B-spline
+# family reuses the same geometric half — nesting is what puts each of its interior knots
+# on an `outer` cell boundary — and pairs it with its own span-containment answer.
+#
+# Each node is looked up by binary search (`_has_node`) rather than against every node
+# of `outer`'s axis, which made the test O(N_inner · N_outer).
 function _nested_over(inner::Level{D,T}, outer::Level{D,T}, tol::GeometryTolerance{T}) where {D,T}
     for d in 1:D
         lo, hi = outer.mesh.domain.lower[d], outer.mesh.domain.upper[d]
         for x in inner.mesh.axes[d]
             (lo - tol.contain <= x <= hi + tol.contain) || continue
-            any(y -> abs(x - y) <= tol.merge, outer.mesh.axes[d]) || return false
+            _has_node(outer.mesh.axes[d], x, tol.merge) || return false
         end
     end
     return true
+end
+
+# Whether the sorted `axis` holds a node `y` with `abs(x − y) ≤ merge` — the same
+# predicate as a scan of the whole axis, asked of two nodes only. Floating-point
+# subtraction is monotone and sign-symmetric, so over the nodes `y ≥ x` the computed
+# `abs(x − y)` grows with `y` and over the nodes `y < x` it shrinks; its minimum is
+# therefore attained at one of the two nodes around `x`'s insertion point, and testing
+# those two gives the scan's Boolean with the scan's own comparison.
+function _has_node(axis::Vector{T}, x::T, merge::T) where {T}
+    i = searchsortedfirst(axis, x)
+    i <= length(axis) && abs(x - axis[i]) <= merge && return true
+    return i > 1 && abs(x - axis[i-1]) <= merge
 end

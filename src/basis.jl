@@ -79,14 +79,14 @@ about them deliberately:
     solution. Both shipped families answer `true`: the fold exemption is the one
     thing a family must supply, and it is a single test on the inactive
     neighbour of a face.
-  - `_coverage_constraints!` (`src/dofs.jl`) — the generic method records
-    nothing, so on a family that does not override it the space's leaf
-    semantics stay on and do nothing. Overriding it is not only about
+  - The burial hooks of `_coverage_constraints!` (`src/dofs.jl`), starting with
+    `_buries(::F)` — `false` by default, so on a family that does not opt in the
+    space's leaf semantics stay on and do nothing. Opting in is not only about
     shedding dofs: where a covering level's span *contains* one of this level's
     functions, the two are linearly dependent and the superposed operator is
-    exactly singular until one of them is eliminated here. Both shipped
-    families override it — integrated Legendre in `src/dofs.jl`, B-splines in
-    the extension.
+    exactly singular until one of them is eliminated there. Both shipped
+    families opt in — integrated Legendre in `src/dofs.jl`, B-splines in the
+    extension.
 
 The integrated Legendre family (this file) and the B-spline extension are the
 two worked examples.

@@ -361,10 +361,11 @@ interface:
   - the dof-layer hooks: `_tensor_dof_key`, `_key_on_level_side`,
     `_overlay_constraints!` (whose default eliminates each raw the per-raw
     `_has_overlay_constraint` predicate accepts) and, for leaf semantics,
-    `_coverage_constraints!` — each reading a typed per-level context and
-    writing into the elimination ledger — plus `_resolve_rows!` if the
-    family records linear-constraint rows (see *Degree-of-freedom
-    enumeration and constraints*).
+    the burial hooks of the one pruning driver `_coverage_constraints!`
+    (`_buries`, `_burial_cells`, `_burial_candidate`, …) — each reading a
+    typed per-level context and writing into the elimination ledger — plus
+    `_resolve_rows!` if the family records linear-constraint rows (see
+    *Degree-of-freedom enumeration and constraints*).
 
 The integrated Legendre implementation uses 1D hierarchical endpoint and
 interior modes, then builds `D`-dimensional tensor-product bases from
@@ -399,10 +400,10 @@ buried linear mode that a *nested* finer level reproduces exactly is
 deduplicated. Coverage is mask-aware — a user-masked cell blocks
 coverage, a fictitious fold does not.
 
-Covered-mode pruning is a basis-family-specific feature, and
-`_coverage_constraints!` is where a family implements it. The
-`Level{D,T,<:IntegratedLegendre}` method does both eliminations above.
-The B-spline extension overrides the hook too, but only for the dedup:
+Covered-mode pruning is a basis-family-specific feature, run by one
+generic driver, `_coverage_constraints!` in `src/dofs.jl`, through which a
+family takes part by its burial hooks. Integrated Legendre's hooks give
+both eliminations above. The B-spline extension's give only the dedup:
 that family has no bubble/skeleton split, so its one reducible mode is
 the one a covering level reproduces exactly — and eliminating it is not
 an accuracy trade but the thing that keeps a nested B-spline stack
@@ -413,8 +414,8 @@ function the buried one is a combination of survived the cover's own
 support selection, which is necessary as well as sufficient because the
 subdivision coefficients are strictly positive and its representation is
 unique. Any further
-family takes the generic fallback, which records nothing, so on such a
-space leaf semantics eliminate nothing. `prepare(problem;
+family takes no part unless it opts in (`_buries`), so on such a space
+leaf semantics eliminate nothing. `prepare(problem;
 prune = false)` is the one way to build a space's unreduced twin; it is
 a diagnostic — exactly singular on a nested stack — rather than a
 discretisation to solve with. See `src/coverage.jl` and

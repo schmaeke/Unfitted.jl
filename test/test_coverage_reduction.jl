@@ -365,6 +365,117 @@ end
     @test isempty(fold.cells) && isempty(fold.boxes)
 end
 
+@testset "the coverage memo answers what a fresh coverage test does" begin
+    # `build_coverage` keeps every per-cover answer it computes (`Coverage.by`), and the
+    # burial test reads them back through `_covered_by!` instead of asking
+    # `_covered_by_level` again. On an immersed three-level stack — a middle overlay the
+    # fold and a user mask over material both switch cells off, under an unmasked inner
+    # one — every flag, every stored answer and every answer asked through the memo,
+    # first as a miss and then as a hit, must be the one `_covered_by_level` computes on
+    # a fresh oracle with no memo at all.
+    disc = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.3; lipschitz=1.0,
+                           subcell_length_scale=1 / 64, max_depth=4)
+    # The user hole lies inside the disc, under base cells 5…6 along each axis.
+    hole = trues(12, 12)
+    hole[8:9, 8:9] .= false
+    stack = overlay(overlay(space(_OMEGA_CR; cells=8, order=2, physical=disc),
+                            box((0.125, 0.125), (0.875, 0.875)); cells=12, order=2, active=hole),
+                    box((0.375, 0.375), (0.625, 0.625)); cells=4, order=2)
+    _, spaces, caches = Unfitted._prepare_spaces(mass(stack))
+    V, cache = only(spaces), only(caches)
+    tol = GeometryTolerance(Float64)
+    fold = Unfitted._Fold(V, cache)
+    coverage = Unfitted.build_coverage(V, tol, fold)
+    reference = Unfitted._Fold(V)
+    fresh(level, c, k) = Unfitted._covered_by_level(cell_box(level.mesh, c), k, tol, reference)
+    slot(level, k) = (level.id - coverage.first) * coverage.stride + (k.id - coverage.first) + 1
+    middle, inner = V.levels[2], V.levels[3]
+    # Non-vacuity: the middle cover is masked (by the fold and by the user), the inner
+    # one is not.
+    @test middle.mask !== nothing && count(!, middle.mask.on) > 4
+    @test inner.mask === nothing
+    stored = UInt8[]
+    for level in V.levels
+        cells = cell_indices(level.mesh)
+        above = [k for k in V.levels if k.id > level.id]
+        wanted = Unfitted._coverage_cells(level)
+        @test coverage.covered[level.id] ==
+              [!isempty(above) && wanted[c] && any(k -> fresh(level, c, k), above) for c in cells]
+        for k in above
+            # A masked cover's answers are stored as they were computed, and nowhere else;
+            # an unmasked one's are never stored.
+            if k.mask === nothing
+                @test !isassigned(coverage.by, slot(level, k))
+            elseif isassigned(coverage.by, slot(level, k))
+                table = coverage.by[slot(level, k)]
+                @test all(c -> table[c] == 0x00 || (table[c] == 0x01) == fresh(level, c, k), cells)
+                append!(stored, table)
+            end
+            for pass in 1:2
+                @test [Unfitted._covered_by!(coverage, level, c, k, tol, fold) for c in cells] ==
+                      [fresh(level, c, k) for c in cells]
+            end
+        end
+    end
+    # Non-vacuity: `build_coverage` stored both verdicts, and left cells unasked.
+    @test 0x00 in stored && 0x01 in stored && 0x02 in stored
+end
+
+# `_nested_over` written as a scan of every node of the outer axis — the definition its
+# binary search must reproduce.
+function _nested_by_scan(inner, outer, tol)
+    for d in eachindex(inner.mesh.axes)
+        lo, hi = outer.mesh.domain.lower[d], outer.mesh.domain.upper[d]
+        for x in inner.mesh.axes[d]
+            (lo - tol.contain <= x <= hi + tol.contain) || continue
+            any(y -> abs(x - y) <= tol.merge, outer.mesh.axes[d]) || return false
+        end
+    end
+    return true
+end
+
+@testset "nesting by binary search answers what a scan of the axis does" begin
+    # `_nested_over` asks, of every inner node inside the outer box widened by
+    # `tol.contain`, whether some outer node lies within `tol.merge` of it. It finds the
+    # node by binary search and tests only the two outer nodes around it, which gives
+    # the scan's Boolean because the computed `abs(x − y)` is monotone on either side of
+    # `x`. The probes sit exactly at the tolerance edges — `merge` either side of an
+    # outer node, `contain` past either end of the outer box — and one rounding step
+    # either side of each edge. All are exact binary fractions, so the edges are hit
+    # exactly.
+    tol = GeometryTolerance{Float64}(2.0^-6, 2.0^-4, 2.0^-6)
+    m, c = tol.merge, tol.contain
+    outer = space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=1).levels[1]
+    axis = outer.mesh.axes[1]
+    @test axis == [0.0, 0.25, 0.5, 0.75, 1.0]
+    probes = Float64[]
+    for y in axis, δ in (0.0, m, -m), step in (identity, prevfloat, nextfloat)
+        push!(probes, step(y + δ))
+    end
+    for edge in (-c, 1 + c), step in (identity, prevfloat, nextfloat)
+        push!(probes, step(edge))
+    end
+    append!(probes, (-0.0, 0.125, 0.3, -1.0, 2.0))
+    for x in probes
+        @test Unfitted._has_node(axis, x, m) == any(y -> abs(x - y) <= m, axis)
+    end
+    # Both answers occur, at the edge itself and one rounding step past it.
+    @test Unfitted._has_node(axis, 0.25 + m, m) && Unfitted._has_node(axis, 0.25 - m, m)
+    @test !Unfitted._has_node(axis, nextfloat(0.25 + m), m)
+    @test !Unfitted._has_node(axis, prevfloat(0.25 - m), m)
+
+    # The same probes as the one interior node of a one-cell inner level, whose two
+    # axis-1 nodes are the probe and an end of the outer box (a one-cell axis is exactly
+    # its two corners).
+    probe_level(x) = space(x < 1 ? box((x, 0.0), (1.0, 1.0)) : box((0.0, 0.0), (x, 1.0)); cells=1,
+                           order=1).levels[1]
+    nested = [Unfitted._nested_over(probe_level(x), outer, tol) for x in probes]
+    @test nested == [_nested_by_scan(probe_level(x), outer, tol) for x in probes]
+    @test any(nested) && !all(nested)
+    @test !Unfitted._nested_over(probe_level(-c), outer, tol)            # inside the widened box
+    @test Unfitted._nested_over(probe_level(prevfloat(-c)), outer, tol)  # outside it: not asked
+end
+
 # Ω = {x₁ ≤ 0.9} inside [-1, 2]², so a 3×3 base folds its whole right column away as
 # fictitious and the fold face sits at x = 1. The cover is a sub-box overlay, never a
 # `ladder`: a ladder spans the level below, `is_inside` passes, and the fold is settled

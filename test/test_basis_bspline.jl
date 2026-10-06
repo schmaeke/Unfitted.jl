@@ -1081,7 +1081,7 @@ end
     # because `p − 1 = 0` makes the two mechanisms the same rule.
     for (deg, dedup, unknowns) in ((1, 1, 81), (2, 0, 77))
         V = overlay(base(), B; cells=4, order=deg, basis=bspline())
-        @test Unfitted._spans_hats(V.levels[2].basis) == (deg == 1)
+        @test Unfitted._reproduces(V.levels[2], V.levels[1]) == (deg == 1)
         m, l = _gram(V)
         @test count(==(:dedup), l.elimination_source) == dedup
         @test count(==(:coverage), l.elimination_source) == 8
@@ -1122,6 +1122,57 @@ end
         @test count(==(:dedup), l.elimination_source) == expected
         @test rank(Symmetric(Matrix(m.matrix))) == active_unknowns(l)
     end
+end
+
+# The span half of the dedup as two family traits once answered it, written out here so
+# the one trait that replaced them is checked against their definitions: above an
+# integrated-Legendre level the cover's `_spans_hats` (`true` for integrated Legendre in
+# either mode, every axis of degree 1 for a B-spline, `false` otherwise); above a
+# B-spline level of degree `p` the extension's `_reproduces(k, p)` (the same degree for
+# a B-spline cover, `:tensor` with every palette entry ≥ `p` for an integrated-Legendre
+# one, `false` otherwise).
+function _span_contains_by_definition(k, level)
+    if level.basis isa Unfitted.IntegratedLegendre
+        k.basis isa BSExt.BSplineFamily && return all(d -> degree(k.basis.spaces[d]) == 1, 1:2)
+        return k.basis isa Unfitted.IntegratedLegendre
+    end
+    p = ntuple(d -> degree(level.basis.spaces[d]), 2)
+    k.basis isa BSExt.BSplineFamily && return all(d -> degree(k.basis.spaces[d]) == p[d], 1:2)
+    k.basis isa Unfitted.IntegratedLegendre || return false
+    k.mode === :tensor || return false
+    return all(o -> all(d -> o[d] >= p[d], 1:2), k.orders.palette)
+end
+
+@testset "BSpline extension: the span trait answers both directions, every family pair" begin
+    # `_reproduces(k, level)` — whether the cover `k`'s span contains `level`'s buried
+    # functions — is dispatched on both families. Every ordered pair of the levels below
+    # is asked, in both directions: integrated Legendre in `:tensor` and `:trunk` mode
+    # with uniform and graded orders (palettes above, straddling and below a B-spline's
+    # degree), and B-splines of degree 1, 2, 3 and anisotropic, maximal and clamped.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    graded(lo, hi) = [isodd(i + j) ? lo : hi for i in 1:4, j in 1:4]
+    il(order; mode=:tensor) = space(Ω; cells=4, order=order, mode=mode).levels[1]
+    bs(order; kw...) = space(Ω; cells=4, order=order, basis=bspline(; kw...)).levels[1]
+    levels = [il(1), il(2), il(3), il(4), il(3; mode=:trunk), il(4; mode=:trunk), il(graded(2, 3)),
+              il(graded(3, 4)), il(graded(3, 4); mode=:trunk), il((3, 2)), bs(1), bs(2), bs(3),
+              bs((1, 2)), bs((2, 3)), bs((3, 2)), bs(2; continuity=0), bs(3; continuity=0),
+              bs(3; continuity=1)]
+    for k in levels, level in levels
+        @test Unfitted._reproduces(k, level) == _span_contains_by_definition(k, level)
+    end
+
+    # Spot checks, so the table above is not checked only against itself.
+    @test Unfitted._reproduces(il(1), il(4; mode=:trunk))          # any IL cover spans the hats
+    @test Unfitted._reproduces(bs(1), il(3))                        # a degree-1 cover is the hats
+    @test !Unfitted._reproduces(bs((1, 2)), il(3))                  # … on every axis
+    @test Unfitted._reproduces(il(3), bs(3; continuity=1))          # `:tensor`, order ≥ p
+    @test !Unfitted._reproduces(il(3; mode=:trunk), bs(3))          # `:trunk` drops mixed terms
+    @test !Unfitted._reproduces(il(graded(2, 3)), bs(3))            # one cell below p is enough
+    @test Unfitted._reproduces(il(graded(3, 4)), bs(3))
+    @test !Unfitted._reproduces(il((3, 2)), bs((2, 3)))             # componentwise
+    @test Unfitted._reproduces(bs(2; continuity=0), bs(2))          # equal degree, any continuity
+    @test !Unfitted._reproduces(bs(3), bs(2))                       # too smooth at a shared knot
+    @test !Unfitted._reproduces(bs((3, 2)), bs((2, 3)))
 end
 
 @testset "BSpline extension: nested dedup in 3D" begin
