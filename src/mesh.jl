@@ -1567,9 +1567,8 @@ end
 # one the user left active, so the result here always deactivates at least one cell
 # more than `user` does and never collapses to `nothing`.
 #
-# Loops rather than the BitArray broadcast `user.on .& .!fictitious`: the fused
-# broadcast compiles a kernel of its own on an immersed space's first `prepare`
-# (about 100 ms of code generation, against about 20 ms for the loops), and the
+# One loop that clears every fictitious cell of a copy of the user's mask, the merge
+# stated directly rather than as the broadcast `user.on .& .!fictitious`; the
 # resulting mask is bit for bit the same.
 function _fold_fictitious(user::Union{Nothing,LevelMask{D}}, fictitious::BitArray{D}) where {D}
     on = user === nothing ? trues(size(fictitious)) : copy(user.on)
