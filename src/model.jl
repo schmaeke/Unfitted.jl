@@ -946,7 +946,12 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
                     components::Integer=1, prune::Bool=true, prune_exempt=(),
                     classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
     components > 0 || throw(ArgumentError("dof layout components must be positive"))
-    foreach(c -> _check_dirichlet_datum(c, components, c.field), dirichlet)
+    # A plain loop, not `foreach` with a closure: over the abstractly typed condition
+    # vector a mixed list of data gives, each call of the closure is dispatched at
+    # run time with the closure boxed, one 16-byte allocation per condition.
+    for condition in dirichlet
+        _check_dirichlet_datum(condition, components, condition.field)
+    end
     t = _dof_topology(V; tolerance, prune, prune_exempt, classify_cache)
     return first(_field_dofs(t, V, dirichlet, components, FacetResolver{D,T}(tolerance)))
 end
