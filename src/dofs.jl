@@ -766,11 +766,16 @@ function _coverage_constraints!(ledger::EliminationLedger, level::Level{D,T},
     for k in ctx.space.levels
         k.id > level.id && push!(covers, k)
     end
-    # `inferencebarrier` hides the level's type from inference, so the burial test is
-    # compiled when a level first reaches it and not before. A level whose coverage
-    # flags are all false — every level of a single-level space — never does, so a
-    # build in which nothing is covered compiles none of it.
-    _bury!(ledger, Base.inferencebarrier(level), ctx, covers)
+    # `inferencebarrier` hides the callee from inference: the call is resolved at run
+    # time, on the level's concrete type, so the burial test is inferred and compiled
+    # when a level first reaches it and not before. A level whose coverage flags are all
+    # false — every level of a single-level space — never does, so a build in which
+    # nothing is covered compiles none of it. Hiding the level's type instead is not
+    # enough: `_bury!` is the only method that can match, so inference still descends
+    # into it with the level widened to an abstract `Level` and infers every family's
+    # hooks there — measured on the first `prepare` of an immersed single-level plate,
+    # 146 ms of inference in a `_bury!` that never runs.
+    Base.inferencebarrier(_bury!)(ledger, level, ctx, covers)
     return ledger
 end
 
@@ -795,11 +800,13 @@ end
 # that record is O(1) to build.
 function _bury!(ledger::EliminationLedger, level::Level{D,T}, ctx::_LevelContext{D,T},
                 covers::Vector{Level}) where {D,T<:Real}
-    tol = ctx.tolerance
-    dedups = Bool[_reproduces(k, level) && _nested_over(level, k, tol) for k in covers]
+    dedups = falses(length(covers))
+    geometric = true
+    for (i, k) in pairs(covers)
+        dedups[i] = _reproduces(k, level) && _nested_over(level, k, ctx.tolerance)
+        geometric && dedups[i] && (geometric = _cover_test(level, k, ctx) === nothing)
+    end
     _sheds_any(level) || any(dedups) || return ledger
-    geometric = !any(i -> dedups[i] && _cover_test(level, covers[i], ctx) !== nothing,
-                     eachindex(covers))
     marks = _BurialMarks(level, ctx, geometric)
     for (k, dedup) in zip(covers, dedups)
         # A pass that can decide nothing is skipped before the cover's record is built.
@@ -809,11 +816,14 @@ function _bury!(ledger::EliminationLedger, level::Level{D,T}, ctx::_LevelContext
     return _record_burial!(ledger, level, marks)
 end
 
-# The burial test's working set: the candidate raws in raw order, whether each is a
-# mode to shed (`:coverage`) rather than a function to dedup, and whether a cover has
-# decided it yet.
+# The burial test's working set, one bit per raw of the level, in raw order: whether the
+# raw is a candidate, whether it is a mode to shed (`:coverage`) rather than a function
+# to dedup, and whether a cover has decided it yet. Bits over the level's raw range
+# rather than a list of the candidates, so the set costs the same few allocations
+# whatever the number of candidates.
 struct _BurialMarks
-    raws::Vector{Int}
+    raws::UnitRange{Int}
+    candidate::BitVector
     sheds::BitVector
     done::BitVector
 end
@@ -821,21 +831,22 @@ end
 # The candidates of `level` (step 1 of `_coverage_constraints!`): every raw whose
 # support the family's candidate test accepts.
 function _BurialMarks(level::Level{D,T}, ctx::_LevelContext{D,T}, geometric::Bool) where {D,T<:Real}
-    cov = ctx.coverage.covered[level.id]
-    raws, sheds = Int[], falses(0)
-    for raw in ctx.raws
+    cov, n = ctx.coverage.covered[level.id], length(ctx.raws)
+    candidate, sheds = falses(n), falses(n)
+    for (i, raw) in enumerate(ctx.raws)
         key = ctx.raw_keys[raw]
         _burial_candidate(level, _burial_cells(level, key), cov, ctx, geometric) || continue
-        push!(raws, raw)
-        push!(sheds, _sheds(level, key))
+        candidate[i] = true
+        sheds[i] = _sheds(level, key)
     end
-    return _BurialMarks(raws, sheds, falses(length(raws)))
+    return _BurialMarks(ctx.raws, candidate, sheds, falses(n))
 end
 
 # Whether a pass over a cover can decide anything: an undecided shed mode, or, when the
 # cover may dedup, any undecided candidate.
 function _decides(marks::_BurialMarks, dedup::Bool)
-    any(i -> !marks.done[i] && (dedup || marks.sheds[i]), eachindex(marks.raws))
+    any(i -> marks.candidate[i] && !marks.done[i] && (dedup || marks.sheds[i]),
+        eachindex(marks.done))
 end
 
 # One cover's pass (step 2 of `_coverage_constraints!`): mark every undecided candidate
@@ -863,8 +874,8 @@ end
 # against 9.95e-4 and 7.03e-4 without it.
 function _mark_buried!(marks::_BurialMarks, level::Level{D,T}, k::Level{D,T}, test, dedup::Bool,
                        ctx::_LevelContext{D,T}) where {D,T<:Real}
-    for (i, raw) in pairs(marks.raws)
-        marks.done[i] && continue
+    for (i, raw) in enumerate(marks.raws)
+        marks.candidate[i] && !marks.done[i] || continue
         shed = marks.sheds[i]
         shed || dedup || continue
         key = ctx.raw_keys[raw]
@@ -885,7 +896,7 @@ end
 # must keep (see `_dedup!` in the extension).
 function _record_burial!(ledger::EliminationLedger, level::Level{D,T},
                          marks::_BurialMarks) where {D,T<:Real}
-    for (i, raw) in pairs(marks.raws)
+    for (i, raw) in enumerate(marks.raws)
         marks.done[i] || continue
         marks.sheds[i] ? _eliminate!(ledger, raw, :coverage) : _dedup!(ledger, level, raw)
     end

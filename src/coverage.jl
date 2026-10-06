@@ -422,16 +422,29 @@ function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T}, fold::_Fold{D,
     for level in V.levels
         cov = falses(level.mesh.cells)
         above = [k for k in V.levels if k.id > level.id]
-        if !isempty(above)
-            wanted = _coverage_cells(level)
-            for ci in cell_indices(level.mesh)
-                wanted[ci] || continue
-                cov[ci] = any(k -> _covered_by!(coverage, level, ci, k, tol, fold), above)
-            end
-        end
+        # Behind a barrier, like the burial test (`_coverage_constraints!`): the per-cell
+        # pass is inferred and compiled when a level with something above it first
+        # reaches it, so a single-level space compiles none of the coverage test —
+        # measured on the first `prepare` of an immersed single-level plate, 84 ms of
+        # codegen that never runs there (`_covered_by!`, `_covered_by_level`,
+        # `_coverage_cells` and the loop).
+        isempty(above) ||
+            Base.inferencebarrier(_cover_cells!)(cov, coverage, level, above, tol, fold)
         coverage.covered[level.id] = cov
     end
     return coverage
+end
+
+# The coverage flags of `level` against the levels `above` it, on the cells
+# `_coverage_cells` selects; every per-cover answer goes into `coverage`'s memo.
+function _cover_cells!(cov::BitArray{D}, coverage::Coverage{D}, level::Level{D,T}, above,
+                       tol::GeometryTolerance{T}, fold::_Fold{D,T}) where {D,T}
+    wanted = _coverage_cells(level)
+    for ci in cell_indices(level.mesh)
+        wanted[ci] || continue
+        cov[ci] = any(k -> _covered_by!(coverage, level, ci, k, tol, fold), above)
+    end
+    return cov
 end
 
 # The cells of `level` whose coverage flag can ever be read, as a `BitArray{D}`.
