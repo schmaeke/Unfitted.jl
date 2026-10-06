@@ -123,9 +123,9 @@ using Unfitted
 # how far the extension reaches into the package.
 using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, LevelMask, AxisDofKey,
                 TensorDofKey, EliminationLedger, _LevelContext, _eliminate!, _constrain!, _pivot!,
-                cell_box, cell_indices, is_active, AxisBox, _check_basis_mode,
-                _level_side_is_physical, _tensor_dof_key, _ClassifyCache, _is_fictitious,
-                _nested_over, _reproduced_on_domain, classify_cell
+                cell_indices, is_active, AxisBox, _check_basis_mode, _level_side_is_physical,
+                _tensor_dof_key, _ClassifyCache, _is_fictitious, _nested_over,
+                _reproduced_on_domain, classify_cell
 using StaticArrays: SVector
 using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim
 
@@ -977,8 +977,9 @@ end
 # there is no trace to vanish on, and constraining it would delete the cut cell's
 # boundary modes — the very over-constraint the FCM solution must not suffer.
 # `_has_overlay_constraint` in `src/dofs.jl` draws the same line for the
-# integrated-Legendre family. With `physical === nothing` there is no fold and
-# `cache` is never touched.
+# integrated-Legendre family, and both read it from `_is_fictitious` in
+# `src/coverage.jl`. With `physical === nothing` there is no fold and `cache` is
+# never touched.
 function _active_cell_at_face(level::Level{D}, d::Int, j::Int, perp_cell::CartesianIndex{D},
                               n_cells::NTuple{D,Int}, ::Val{D}, physical,
                               cache::_ClassifyCache{D}) where {D}
@@ -992,11 +993,7 @@ function _active_cell_at_face(level::Level{D}, d::Int, j::Int, perp_cell::Cartes
     a_j = is_active(level.mask, cell_j)
     a_jp1 = is_active(level.mask, cell_jp1)
     a_j == a_jp1 && return nothing
-    inactive = a_j ? cell_jp1 : cell_j
-    if physical !== nothing &&
-       classify_cell(physical, cell_box(level.mesh, inactive), cache) === :fictitious
-        return nothing
-    end
+    _is_fictitious(level, a_j ? cell_jp1 : cell_j, physical, cache) && return nothing
     return a_j ? (cell_j, j) : (cell_jp1, j + 1)
 end
 
