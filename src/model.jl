@@ -369,65 +369,6 @@ function _reduced_mode_counts(layout::SystemLayout)
                for id in f.level_ids]
 end
 
-# Per-level counts of the functions a level *enumerated* and of those that
-# *survived*, keyed by level id over every field of the system layout, each
-# level counted once however many fields share its space. Both, and not only
-# the second, because the two answer different questions and the pair is what
-# separates them:
-#
-#   raw = 0, active = 0     the level is dormant — no active cell, so nothing
-#                           was enumerated. A ladder's unwoken rungs look like
-#                           this and it is not a problem.
-#   raw > 0, active = 0     the level enumerated functions and nothing of it
-#                           reaches the system. For a maximal-continuity spline
-#                           level the usual cause is the thin case: a region `p`
-#                           cells wide or less holds no function whose whole
-#                           support fits inside it, so the level costs a mesh and
-#                           buys nothing.
-#
-# `active` is "survived every elimination", not "survived the artificial
-# boundary": it is read off `active_component`, which is zero for an
-# artificial-boundary constraint, for leaf-semantics pruning, and for a physical
-# Dirichlet condition alike. A one-cell order-1 level with Dirichlet data on all
-# four of its faces therefore reports 4 / 0 although it has no artificial boundary
-# at all, and an ordinary 4×4 order-2 Poisson level reports 49 / 81 with the 32
-# missing functions Dirichlet. The signature narrows the cause; it does not name
-# it.
-#
-# Counted per *function* rather than per unknown, because that is the quantity
-# the basis families' dof ledgers are stated in — `∏_d (n_d − p_d)` for a
-# selected spline level, say. On a field with `components > 1` a function
-# carries one unknown per component, so the entries sum to `active_unknowns`
-# only on scalar fields.
-function _level_function_counts(layout::SystemLayout)
-    raw = Dict{Int,Int}()
-    active = Dict{Int,Int}()
-    # Two fields over ONE space enumerate the same functions — they share that
-    # space's one dof topology (`_system_layout`) — so a second field over it must
-    # not count them again. Fields over *different* spaces hold disjoint level-id
-    # blocks (`_reindex_space_levels`), so a field's block is either wholly counted or
-    # wholly new and the skip is exact rather than a heuristic. Without it a two-field
-    # problem reported every level's counts doubled, while a two-component vector
-    # field over the same space — the same dof count, spelled differently — reported
-    # them once.
-    #
-    # A level's functions are one range of the layout (`level_raws`), so each id is
-    # counted from that range alone. A dormant level reads an explicit 0, which the
-    # consumer's `get(raw, id, 0)` already assumed for it.
-    counted = Set{Int}()
-    for field in layout.fields
-        all(in(counted), field.level_ids) && continue
-        dofs = field.dofs
-        for id in field.level_ids
-            raws = dofs.level_raws[id]
-            raw[id] = length(raws)
-            active[id] = count(r -> any(!iszero, view(dofs.active_component, r, :)), raws)
-        end
-        union!(counted, field.level_ids)
-    end
-    return raw, active
-end
-
 # Scan the integration plan for NNMF-fit statistics, returning
 # `(cut, failed, fallback, fallback_points)`. `:cut_fitted` are successful
 # fits; `:cut_fallback` (the raw Saye volume rule), `:cut_failed` (empty
@@ -865,21 +806,6 @@ function _dirichlet_for_field(problem::Problem, name::Symbol)
         end
     end
     return scoped
-end
-
-# Level reports for every subdomain space, flattened in the same order as
-# `_problem_levels`. Built per space because nesting is a relation between the
-# levels of one space; a coupled problem's spaces are independent stacks.
-function _level_reports(problem::Problem, tol::GeometryTolerance, layout::SystemLayout)
-    raw, active = _level_function_counts(layout)
-    out = Any[]
-    for V in problem_spaces(problem)
-        for level in V.levels
-            push!(out,
-                  _level_report(level, V, tol, get(raw, level.id, 0), get(active, level.id, 0)))
-        end
-    end
-    return out
 end
 
 # All levels across every distinct participating space, concatenated in
@@ -2249,9 +2175,52 @@ diagnostics(model::Model) = model.diagnostics
 # can void it on a stack that was nested when it was built, and the resulting
 # loss shows up as neither a residual nor a rank deficiency. See
 # [`is_nested`](@ref).
-function _level_report(level, V::Space, tol::GeometryTolerance, raw_functions::Int,
-                       active_functions::Int)
+#
+# `raw_functions` and `active_functions` count the functions the level
+# *enumerated* and those that *survived*. Both, and not only the second, because
+# the two answer different questions and the pair is what separates them:
+#
+#   raw = 0, active = 0     the level is dormant — no active cell, so nothing
+#                           was enumerated. A ladder's unwoken rungs look like
+#                           this and it is not a problem.
+#   raw > 0, active = 0     the level enumerated functions and nothing of it
+#                           reaches the system. For a maximal-continuity spline
+#                           level the usual cause is the thin case: a region `p`
+#                           cells wide or less holds no function whose whole
+#                           support fits inside it, so the level costs a mesh and
+#                           buys nothing.
+#
+# `active` is "survived every elimination", not "survived the artificial
+# boundary": it is read off `active_component`, which is zero for an
+# artificial-boundary constraint, for leaf-semantics pruning, and for a physical
+# Dirichlet condition alike. A one-cell order-1 level with Dirichlet data on all
+# four of its faces therefore reports 4 / 0 although it has no artificial boundary
+# at all, and an ordinary 4×4 order-2 Poisson level reports 49 / 81 with the 32
+# missing functions Dirichlet. The signature narrows the cause; it does not name
+# it.
+#
+# Counted per *function* rather than per unknown, because that is the quantity
+# the basis families' dof ledgers are stated in — `∏_d (n_d − p_d)` for a
+# selected spline level, say. On a field with `components > 1` a function
+# carries one unknown per component, so the entries sum to `active_unknowns`
+# only on scalar fields.
+#
+# Both are read from the first field whose level-id block holds the level, so a
+# level is counted once however many fields share its space: summing over fields
+# reported every level doubled on a two-field problem, while a two-component
+# vector field over the same space — the same dof count, spelled differently —
+# reported it once. Fields over ONE space share its one dof topology
+# (`_system_layout`), so `raw_functions` is the same whichever of them is read;
+# `active_functions` also reflects the Dirichlet conditions of the field it is
+# read from, the first one over the space. Fields over *different* spaces hold
+# disjoint level-id blocks (`_reindex_space_levels`), so the first field holding
+# the id is a field over the level's own space. A level's functions are one range
+# of the layout (`level_raws`), so it is counted from that range alone; a dormant
+# level's range is empty and reads 0 / 0.
+function _level_report(level, V::Space, tol::GeometryTolerance, layout::SystemLayout)
     nested = all(k -> k.id <= level.id || _nested_over(level, k, tol), V.levels)
+    dofs = layout.fields[findfirst(f -> level.id in f.level_ids, layout.fields)].dofs
+    raws = dofs.level_raws[level.id]
     # `order` stays the level's nominal (maximum) per-axis order, so an existing
     # reader keeps reading the same field with the same meaning. `order_palette`
     # carries the distinct per-cell orders — a one-element vector on a uniform
@@ -2260,8 +2229,8 @@ function _level_report(level, V::Space, tol::GeometryTolerance, raw_functions::I
     order_palette = copy(level.orders.palette)
     return (; id=level.id, role=level.role, cells=level.mesh.cells, order=nominal_order(level),
             order_palette=order_palette, mode=level.mode, basis=basis_name(level.basis),
-            domain=level.mesh.domain, nested=nested, raw_functions=raw_functions,
-            active_functions=active_functions,)
+            domain=level.mesh.domain, nested=nested, raw_functions=length(raws),
+            active_functions=count(r -> any(!iszero, view(dofs.active_component, r, :)), raws),)
 end
 
 function diagnostics(model::Model{D,T}, solution; exact=nothing) where {D,T}
@@ -2269,9 +2238,13 @@ function diagnostics(model::Model{D,T}, solution; exact=nothing) where {D,T}
     diag = diagnostics(model)
     error = exact === nothing ? nothing : l2_error(solution, model, exact)
     tol = get(model.plan_options, :tolerance, GeometryTolerance(T))
-    return (; dimension=diag.dimension, levels=_level_reports(model.problem, tol, model.dofs),
-            active_unknowns=diag.active_unknowns, raw_dofs=raw_dof_count(model.dofs),
-            integration_regions=diag.integration_regions,
+    # Level reports for every subdomain space, flattened in the same order as
+    # `_problem_levels`. Built per space because nesting is a relation between the
+    # levels of one space; a coupled problem's spaces are independent stacks.
+    levels = Any[_level_report(level, V, tol, model.dofs) for V in problem_spaces(model.problem)
+                 for level in V.levels]
+    return (; dimension=diag.dimension, levels=levels, active_unknowns=diag.active_unknowns,
+            raw_dofs=raw_dof_count(model.dofs), integration_regions=diag.integration_regions,
             facet_region_count=diag.facet_region_count,
             cut_facet_region_count=diag.cut_facet_region_count,
             facet_fit_failure_count=diag.facet_fit_failure_count,
