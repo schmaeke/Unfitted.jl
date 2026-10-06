@@ -528,6 +528,13 @@ end
     end
 end
 
+# The functions of level `id` in `dofs` that survive every elimination in at least
+# one component: what a level report states as `active_functions`, counted here
+# straight from the field's layout.
+function _level_active_functions(dofs, id)
+    count(r -> any(!iszero, view(dofs.active_component, r, :)), dofs.level_raws[id])
+end
+
 @testset "fields over one space share its dof topology and nothing else" begin
     # `system_layout` builds a space's dof topology once and hands the same arrays
     # to every field over that space: the raw keys, the cell → raw tables, the level
@@ -593,6 +600,32 @@ end
     @test sum(level.raw_functions for level in report.levels) == length(ud.raw_keys)
     reduced = diagnostics(model).reduced_mode_counts
     @test length(reduced) == 4 && reduced[1:2] == reduced[3:4]
+
+    # The active counts are read from the first field over the space, u. They carry
+    # u's Dirichlet eliminations, which are not v's, so the second assertion keeps
+    # the first from passing whichever field is read.
+    active = [level.active_functions for level in report.levels]
+    @test active == [_level_active_functions(ud, level.id) for level in report.levels]
+    @test active != [_level_active_functions(vd, level.id) for level in report.levels]
+end
+
+@testset "a level report reads its level from the field over its own space" begin
+    # Fields over different spaces hold disjoint level-id blocks, so exactly one
+    # field holds each level, and the report must read that field's layout: any
+    # other field — the first one, say — has no range for the level, or a range of
+    # another space. The two spaces differ in size and order and only u1 carries
+    # Dirichlet data, so each level's raw and active counts are its own.
+    V1 = space(box((0.0, 0.0), (1.0, 0.5)); cells=(4, 2), order=2)
+    V2 = space(box((0.0, 0.5), (1.0, 1.0)); cells=(3, 2), order=3)
+    u1, u2 = field(:u1, V1), field(:u2, V2)
+    model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
+                            loads=(source_load(u1; source=1.0), source_load(u2; source=1.0)),
+                            dirichlet=[dirichlet(0.0; on=boundary(axis=2, side=:lower), field=:u1)]))
+    report = diagnostics(model, solution(model, zeros(active_unknowns(model))))
+    own = [(f.dofs, id) for f in Unfitted.dof_layout(model).fields for id in f.level_ids]
+    @test length(own) == 2
+    @test [(level.raw_functions, level.active_functions) for level in report.levels] ==
+          [(length(dofs.level_raws[id]), _level_active_functions(dofs, id)) for (dofs, id) in own]
 end
 
 # Structural checks: anything beyond a value-only change must throw.
