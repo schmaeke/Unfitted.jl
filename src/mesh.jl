@@ -1569,7 +1569,10 @@ end
 #
 # One loop that clears every fictitious cell of a copy of the user's mask, the merge
 # stated directly rather than as the broadcast `user.on .& .!fictitious`; the
-# resulting mask is bit for bit the same.
+# resulting mask is bit for bit the same. The loop is also the cheaper form to
+# compile: with the broadcast instead, a fresh process's first `prepare` measured
+# 0.3–1 % slower, both on spaces that compile this function without running it (a
+# two-level overlay, a masked clamped B-spline space) and on an immersed FCM plate.
 function _fold_fictitious(user::Union{Nothing,LevelMask{D}}, fictitious::BitArray{D}) where {D}
     on = user === nothing ? trues(size(fictitious)) : copy(user.on)
     @inbounds for i in eachindex(on, fictitious)
