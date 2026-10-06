@@ -1073,6 +1073,12 @@ function _axis_incidence(axis_key::AxisDofKey, ncells::Int)
     return max(1, axis_key.index-1):min(ncells, axis_key.index)
 end
 
+# Cells of `level` incident to the entity of `key`, from the per-axis incidence
+# rule of `_axis_incidence` applied on every axis.
+function _incident_cells(key::TensorDofKey{D}, n::NTuple{D,Int}) where {D}
+    return CartesianIndices(ntuple(d -> _axis_incidence(key.axes[d], n[d]), D))
+end
+
 # Incidence ranges of `key` on every axis *except* `axis`, which is pinned to
 # `1:1` so a `CartesianIndices` over the result enumerates the perpendicular
 # positions of a candidate face along `axis` exactly once. The `axis` slot of
@@ -1171,14 +1177,6 @@ end
         end
     end
     return false
-end
-
-# ── Pruning (coverage) constraint source ──────────────────────────────────────
-
-# Cells of `level` incident to the entity of `key`, from the per-axis incidence
-# rule of `_axis_incidence` applied on every axis.
-function _incident_cells(key::TensorDofKey{D}, n::NTuple{D,Int}) where {D}
-    return CartesianIndices(ntuple(d -> _axis_incidence(key.axes[d], n[d]), D))
 end
 
 # ── The minimum rule: per-cell order across a shared entity ───────────────────
@@ -1304,6 +1302,8 @@ function _cell_modes(basis::IntegratedLegendre, orders::CellOrders{D}, mesh::Car
     end
     return CellModes{D}(sets, kind)
 end
+
+# ── Pruning (coverage) constraint source ──────────────────────────────────────
 
 # Whether a family's span on a mesh contains that mesh's C⁰ multilinear vertex
 # functions — the hats. This is the basis half of the linear dedup in
