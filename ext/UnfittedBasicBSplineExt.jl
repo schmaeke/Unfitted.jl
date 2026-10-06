@@ -895,9 +895,9 @@ function Unfitted._overlay_constraints!(ledger::EliminationLedger,
         perp_modes = CartesianIndices(ntuple(e -> e == d ? (0:0) : (0:degree(family.spaces[e])), D))
 
         for j in 0:n_cells[d]
-            # Skip physical-boundary edges — the physical-Dirichlet
-            # branch in `dof_layout` handles them, not the overlay
-            # constraint.
+            # Skip physical-boundary edges — physical-Dirichlet
+            # detection (`_physical_dirichlet`) handles them, not the
+            # overlay constraint.
             j == 0 && _level_side_is_physical(level, domain, d, :lower, tol) && continue
             j == n_cells[d] && _level_side_is_physical(level, domain, d, :upper, tol) && continue
 

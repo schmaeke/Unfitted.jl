@@ -771,8 +771,8 @@ end
     # `_fold_pivot`, `dof_value` and assembly's condensation read one level of
     # expansion and never chase a chain, so every pivot must be expressed over
     # raws that stay free. A resolver that left a branch eliminated would make
-    # assembly and reconstruction disagree silently; the depth-one guard
-    # `dof_layout` runs once per build is what turns that into an error.
+    # assembly and reconstruction disagree silently; the depth-one guard the
+    # topology build (`_dof_topology`) runs once is what turns that into an error.
     ledger = Unfitted.EliminationLedger{Float64}(3)
     Unfitted._pivot!(ledger, 3, [(1, 0.5)], :overlay)
     @test Unfitted._assert_resolved(ledger) === nothing
@@ -1145,7 +1145,7 @@ end
     @test Set(keys(resolver.faces)) == Set(keys(before))
 
     # The same hand-off on the `prepare` side, which runs one level further down:
-    # `system_layout` forwards the resolver through `dof_layout` into the
+    # `system_layout` forwards the resolver through `_field_dofs` into the
     # projection, so a resolver handed to the layout *alone* comes back carrying
     # the conditions' faces. That is the half of the thread the step above cannot
     # reach, and the order is the whole point again — at `prepare` this walk

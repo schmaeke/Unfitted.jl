@@ -43,7 +43,10 @@ A new family `F <: BasisFamily` must provide:
     `src/dofs.jl`), plus `_resolve_rows!` if the family records
     linear-constraint rows: the dof layer stores rows but resolves none itself,
     and its default raises. The B-spline extension's cascade is the one shipped
-    resolver.
+    resolver. A key `_tensor_dof_key(level, …)` returns must carry `level.id`
+    (`TensorDofKey(level.id, …)`): no key is then shared between two levels,
+    which is what lets the dof layer hold each level's raw dofs as one
+    contiguous range and run every per-level pass over that range alone.
   - `instantiate_basis(::F, mesh, order, mode, mask)` — only when the concrete
     family depends on the level's mesh. The `::BasisFamily` default returns the
     family unchanged; see [`instantiate_basis`](@ref) for the five-argument

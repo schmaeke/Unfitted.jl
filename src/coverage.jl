@@ -249,7 +249,7 @@ end
 #
 # `_coverage_constraints!` (in `dofs.jl`) is the consumer this set is cut for, and it
 # tests `cov` exactly on `_incident_cells(key, n)` for the level's raw dof keys. Raw
-# dofs are enumerated on *active* cells only (`dof_layout`, stage 1), and a key born on
+# dofs are enumerated on *active* cells only (`_enumerate_raws`), and a key born on
 # cell `c` is incident to `c` and — through its node factors — to the cells sharing a
 # face, edge, or vertex with `c`. The read set is therefore the active set dilated by
 # one cell in the ∞-norm, and computing `cov` anywhere else is work whose answer nobody

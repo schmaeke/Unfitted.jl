@@ -1061,9 +1061,10 @@ On a multi-domain (coupled) problem every distinct participating
 [`Space`](@ref) is folded, reindexed into its own level-id block, and given
 its own integration plan and moment-fit cache.
 
-`prune` is leaf semantics, on by default and applied by [`dof_layout`](@ref)
-to every field of the problem: a cell carries basis functions only where no
-finer level has taken its region over (see [`space`](@ref) for the rule).
+`prune` is leaf semantics, on by default and applied by the layout build (see
+[`dof_layout`](@ref)) to every field of the problem: a cell carries basis
+functions only where no finer level has taken its region over (see
+[`space`](@ref) for the rule).
 
 `prune = false` builds the **unreduced twin**, and it is a diagnostic rather
 than a discretisation to solve with. The twin keeps every covered mode, so on

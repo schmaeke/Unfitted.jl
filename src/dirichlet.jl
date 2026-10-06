@@ -183,10 +183,10 @@ _face_mask(facet) = mapreduce(((axis, side),) -> _face_bit(axis, side), |, facet
 # Selector semantics therefore live in `_facets` alone, the same decomposition the
 # projection and the facet regions integrate over, and a malformed selector raises
 # from there with its usual message before any raw is visited, whichever
-# component it is scoped to. The masks are built once per condition: the per-key predicate
-# this pass replaced re-derived them, and re-asked the family about each face, for
-# every raw × component × condition, allocating an `:except` selector's kept faces
-# on every call.
+# component it is scoped to. The masks are built once per condition, so the per-raw
+# loop does no selector work: it decomposes no facet, allocates nothing, and asks the
+# family about each of the level's physical sides once per raw rather than once per
+# raw, component and condition.
 #
 # `t` is anything carrying `raw_keys`, `level_raws` and `tolerance` — the build's
 # `_DofTopology`, or a finished `DofLayout` — so the pass runs before the layout it

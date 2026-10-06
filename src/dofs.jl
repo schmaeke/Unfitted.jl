@@ -77,14 +77,12 @@
 # ── Dof keys and layout struct ────────────────────────────────────────────────
 
 # Per-axis component of a `TensorDofKey`. Together with the axis index it
-# uniquely identifies one factor of a tensor-product basis function:
-#
-#   * `kind = _AXIS_NODE` ⇒ an endpoint-mode contribution. `index` is the
-#     1-based node coordinate index inside the level's `mesh.axes[axis]`
-#     vector; `mode` is `0` (the endpoint contribution is the same shape
-#     function regardless of which mode triggered it).
-#   * `kind = _AXIS_SPAN` ⇒ a bubble-mode contribution. `index` is the
-#     1-based cell index along the axis; `mode ≥ 2` selects which bubble.
+# uniquely identifies one factor of a tensor-product basis function. `kind` is a
+# tag the basis family owns, and the family reads `index` and `mode` by its own
+# convention: integrated Legendre tags an endpoint factor at a node coordinate
+# and a cell-local bubble factor (`_AXIS_NODE`, `_AXIS_SPAN`, defined with the
+# family's other hooks under the "Integrated Legendre family" divider), and the
+# B-spline extension one factor per univariate B-spline (`_AXIS_BSPLINE`).
 #
 # Stored as a flat `UInt8 + Int + Int` rather than a sum type so the key
 # is fully isbits and, hashed field by field (the `Base.hash` methods
@@ -98,20 +96,21 @@ end
 # Tensor-product dof key: one `AxisDofKey` per axis plus the source
 # level's id. Two basis functions share a raw dof iff they have the same
 # `TensorDofKey` — i.e. they live on the same level and reduce to the
-# same per-axis (kind, index, mode) along every axis. The node/span
-# distinction handles the dof reuse correctly: adjacent cells share the
-# right-endpoint of cell `i` with the left-endpoint of cell `i + 1` (both
-# resolve to the same `_AXIS_NODE, index = i + 1` factor), while bubble
-# modes are cell-local (each cell's `_AXIS_SPAN` index is unique).
+# same per-axis (kind, index, mode) along every axis. That is how adjacent
+# cells share a function: a family's key names a factor by what it is, not by
+# the cell asking, so in integrated Legendre the right endpoint of cell `i` and
+# the left endpoint of cell `i + 1` are one `_AXIS_NODE` factor at node
+# `i + 1`, while each bubble stays cell-local.
 struct TensorDofKey{D}
     level::Int
     axes::NTuple{D,AxisDofKey}
 end
 
-# The default hash of an isbits struct hashes its bytes through a generic
-# path that costs ~91 ns per `TensorDofKey{3}`; hashing the fields costs
-# ~10 ns, and it was 55 % of the layout's stage-1 profile. Equality stays
-# the default `===`, which these methods agree with.
+# The default `hash` of a struct goes through `objectid`, which the runtime
+# computes generically — field by field, for these padded structs — at ~90 ns
+# per `TensorDofKey{3}`; hashing the fields directly costs ~10 ns. The default
+# was 55 % of the raw enumeration's profile. Equality stays the default `===`,
+# which these methods agree with.
 Base.hash(k::AxisDofKey, h::UInt) = hash(k.mode, hash(k.index, hash(k.kind, h)))
 Base.hash(k::TensorDofKey, h::UInt) = hash(k.axes, hash(k.level, h))
 
@@ -389,8 +388,11 @@ end
 # Every pivot must be expressed over raws that stay free: `_fold_pivot`, `dof_value`
 # and assembly's condensation read ONE level of expansion and never chase a chain. A
 # family resolver that broke this would make assembly and reconstruction silently
-# disagree, so it is checked once per build. The cost is one read per pivot term, and
-# nothing at all without pivots.
+# disagree, so it is checked once per build: one pass over the pivot table, a read
+# per raw and one per pivot term, and nothing at all without pivots. No shipped
+# resolver breaks the rule, so no build reaches the raise; the guard is there for a
+# family resolver yet to be written, and test_constraints.jl pins its verdict on a
+# hand-built ledger.
 function _assert_resolved(ledger::EliminationLedger)
     for expansion in ledger.pivots, (branch, _) in expansion
         ledger.source[branch] === :free ||
@@ -403,8 +405,8 @@ end
 # Everything a dof-layer hook may read about the level it is called for: the space,
 # its physical domain and tolerance, the space's cell-classification cache, the
 # coverage masks (empty when the build does not prune), the raw keys and the key → raw
-# map of stage 1 (for a family that addresses functions by `(cell, mode)`), and the
-# level's own raws.
+# map the raw enumeration built (for a family that addresses functions by
+# `(cell, mode)`), and the level's own raws.
 #
 # `P` is the CONCRETE type of `V.physical`. `Space.physical` is abstractly typed, so a
 # hook that read it off the space dispatched dynamically on every per-raw predicate
@@ -430,9 +432,10 @@ end
 # Build the per-cell raw dof id vector for one cell. For every local
 # basis function on the cell, compute its `TensorDofKey` and either
 # reuse the raw id already registered for that key (the cross-cell dof
-# reuse path: adjacent cells share endpoint nodes, identical levels
-# share interior modes) or register a fresh id by appending the key to
-# `raw_keys`.
+# reuse path: adjacent cells of one level share every function their keys
+# name alike, such as an endpoint node, while a key carries its level id and
+# so is never shared across levels) or register a fresh id by appending the
+# key to `raw_keys`.
 function _build_cell_dofs!(raw_by_key::Dict{TensorDofKey{D},Int}, raw_keys::Vector{TensorDofKey{D}},
                            level::Level{D}, cell::CartesianIndex{D}) where {D}
     local_ids = cell_basis_indices(level, cell)
@@ -449,19 +452,18 @@ function _build_cell_dofs!(raw_by_key::Dict{TensorDofKey{D},Int}, raw_keys::Vect
     return raw_ids
 end
 
-# Stage 1 of the layout: walk every level's cells and assign raw dofs through
-# the `TensorDofKey` cache (cross-cell endpoint sharing happens here). Levels go
-# in `V.levels` order, cells in `cell_indices` order, local functions in
-# `cell_basis_indices` order, and a raw's id is the order of its key's first
-# appearance. Returns the key → raw map, `raw_keys`, the per-level cell tables
-# and the per-level raw ranges.
+# The raw enumeration, the first half of step 1 (`_dof_topology`): walk every
+# level's cells and assign raw dofs through the `TensorDofKey` cache (cross-cell
+# endpoint sharing happens here). Levels go in `V.levels` order, cells in
+# `cell_indices` order, local functions in `cell_basis_indices` order, and a
+# raw's id is the order of its key's first appearance. Returns the key → raw
+# map, `raw_keys`, the per-level cell tables and the per-level raw ranges.
 #
-# The ranges cost one `UnitRange` per level and replace a pass that bucketed
-# every key by level through a `Dict` — in that `Dict`'s hash order, which is
-# also the order the constraint hooks then visited a level's raws in. They are
-# exact because a key carries its level id: walking level L can only create or
-# reuse L's keys, so L's raws are precisely the ids appended while L is walked,
-# and visiting them is visiting them in raw order.
+# The ranges cost one `UnitRange` per level, and every per-level pass reads its
+# level's raws off one instead of scanning or bucketing every raw. They are exact
+# because a key carries its level id: walking level L can only create or reuse
+# L's keys, so L's raws are precisely the ids appended while L is walked, and
+# visiting them is visiting them in raw order.
 function _enumerate_raws(V::Space{D}) where {D}
     raw_by_key = Dict{TensorDofKey{D},Int}()
     raw_keys = TensorDofKey{D}[]
@@ -796,10 +798,12 @@ _branch_value(coefficients) = (acc, g, w, v) -> acc + w * (g == 0 ? v : coeffici
     FieldLayout{D,T}(name, components, dofs, offset, level_ids)
 
 One field's slot inside a multi-field [`SystemLayout`](@ref). `dofs` is
-the field's own [`DofLayout`](@ref); `offset` is the field's starting
-column in the global active-dof vector (the active dofs of all earlier
-fields take ids 1 through `offset`, and this field's active dofs take
-ids `offset + 1` through `offset + active_unknowns(dofs)`).
+the field's [`DofLayout`](@ref): its field block is the field's own, and its
+space block is shared with every other field over the same space (see
+[`DofLayout`](@ref)). `offset` is the field's starting column in the global
+active-dof vector (the active dofs of all earlier fields take ids 1 through
+`offset`, and this field's active dofs take ids `offset + 1` through
+`offset + active_unknowns(dofs)`).
 
 `level_ids` is the contiguous block of (globally reindexed) level ids the
 field's [`Space`](@ref) owns. Assembly uses it to route each integration
@@ -894,7 +898,7 @@ checks it once (`_assert_resolved`). Such a branch may still be constrained on
 contributes its constrained value rather than a coefficient.
 
 A layout without pivots — every integrated-Legendre layout — stops at the test
-for an empty table, before any per-raw read.
+for an empty table and never reads a pivot entry.
 
 The expansion is read through `_fold_pivot`, the one statement of the pivot rule
 that assembly reads as well, so a pivot cannot be reconstructed one way and
@@ -933,8 +937,8 @@ function has_linear_constraints(layout::SystemLayout)
 end
 
 # Resolve the unique field of a single-field layout. Used by the
-# `*_dofs` delegates below so single-field problems do not have to
-# carry a field name argument.
+# single-field system forms below, so a single-field problem need not
+# name its field.
 function _only_field_layout(layout::SystemLayout)
     length(layout.fields) == 1 ||
         throw(ArgumentError("field argument is required for multi-field layouts"))
@@ -944,9 +948,9 @@ end
 # The system forms of the per-dof accessors, one method per verb, documented
 # with the `DofLayout` forms above. Without a field name they read the only
 # field of a single-field problem, so its callers need not name it; the
-# active-id form also takes a name, for a multi-field problem. Each takes the
-# same `component` as the `DofLayout` form it forwards to, and the active ids
-# come back global, shifted by the field's offset — the numbering a
+# active-id form also takes a name, for a multi-field problem. Each per-component
+# form takes the same `component` as the `DofLayout` form it forwards to, and the
+# active ids come back global, shifted by the field's offset — the numbering a
 # `Solution`'s coefficients use.
 function cell_dofs(layout::SystemLayout, level::Integer, cell::CartesianIndex)
     cell_dofs(_only_field_layout(layout).dofs, level, cell)
@@ -977,9 +981,14 @@ end
 # Tag values for `AxisDofKey.kind`. `UInt8` keeps the key compact and
 # fast to hash; the values themselves are arbitrary.
 #
-#   _AXIS_NODE   — integrated Legendre endpoint mode at a cell-corner
-#                  node coordinate.
-#   _AXIS_SPAN   — integrated Legendre interior (bubble) mode, cell-local.
+#   _AXIS_NODE   — an endpoint-mode factor at a cell-corner node coordinate.
+#                  `index` is the 1-based node coordinate index inside the
+#                  level's `mesh.axes[axis]`; `mode` is `0`, the endpoint
+#                  contribution being the same shape function whichever of
+#                  the two endpoint modes produced it.
+#   _AXIS_SPAN   — an interior (bubble) factor, cell-local. `index` is the
+#                  1-based cell index along the axis; `mode ≥ 2` selects
+#                  which bubble.
 #
 # A tag need only be unique within one basis family, so each family owns
 # its tags: the B-spline extension defines its `_AXIS_BSPLINE` next to its
@@ -1128,12 +1137,13 @@ end
 # fold face classifies its inactive neighbours only until one of them holds
 # material.
 #
-# This runs once per raw on every layout build, so two measured choices keep
-# it as cheap as the two-walk predicate it replaced: `@inline`, without which
-# the call stays out of `_overlay_constraints!`'s per-raw loop (1.1–1.8× the
-# pass time on the layout probe's spaces), and the side test at the first
-# transition rather than ahead of the walk, so an internal face without one
-# pays for nothing but the walk (ahead of it: 1.2× on 2D overlays and ladders).
+# This runs once per raw on every layout build, and two measured choices keep
+# it cheap: `@inline`, without which the call stays out of
+# `_overlay_constraints!`'s per-raw loop (1.1–1.8× the pass time across the
+# overlay, ladder and immersed spaces it was measured on), and the side test at
+# the first transition rather than ahead of the walk, so an internal face
+# without one pays for nothing but the walk (ahead of it: 1.2× on 2D overlays
+# and ladders).
 #
 # Integrated-Legendre-specific, because the incidence rule is. The B-spline
 # family in `ext/UnfittedBasicBSplineExt.jl` does the same job in its own

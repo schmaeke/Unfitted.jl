@@ -587,10 +587,11 @@ end
 end
 
 # Direct unit test of the cascade resolver `_cascade!`, this family's
-# `_resolve_rows!` method, on hand-built rows. Outside this test the resolver is
-# exercised only transitively through the B-spline Cᵐ overlay path, so this
-# guards the Gauss-elimination + back-substitution machinery on its own,
-# independent of the trace generator. The hand-built rows are engineered so that:
+# `_resolve_rows!` method, on hand-built rows. Together with the testsets below,
+# this drives the resolver directly; elsewhere it is exercised only through the
+# B-spline Cᵐ trace generator. This one guards the Gauss-elimination +
+# back-substitution machinery on its own, independent of the trace generator.
+# The hand-built rows are engineered so that:
 #   * a later row pivots a raw that an EARLIER pivot's expansion still
 #     mentions (row B pivots raw 2, which row A's pivot expansion
 #     references), forcing step-5 back-substitution into the earlier pivot;
