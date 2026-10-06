@@ -1110,17 +1110,6 @@ function _system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), p
     return SystemLayout{D,T}(layouts, by_name, offset, tolerance), factors, unsupported
 end
 
-# Map each prepared subdomain space to its fold classification cache, for
-# `system_layout` to reuse. Built from the aligned `spaces`/`caches` vectors
-# `_prepare_spaces` returns (identity keys — each field's space is one of these).
-function _caches_by_space(spaces, caches::Vector{_ClassifyCache{D,T}}) where {D,T}
-    by_space = IdDict{Space,_ClassifyCache{D,T}}()
-    for i in eachindex(spaces)
-        by_space[spaces[i]] = caches[i]
-    end
-    return by_space
-end
-
 """
     prepare(problem::Problem; prune=true, tolerance=…, criterion=…) -> Model
 
@@ -1355,7 +1344,10 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
     # verdicts come back beside the layout and go into the diagnostics below, and
     # `dirichlet_projections` starts empty, for `update_dirichlet!` to fill.
     facet_resolver = FacetResolver{D,T}(tolerance)
-    classify_caches = _caches_by_space(spaces, caches)
+    # Each prepared subdomain space mapped to its fold classification cache, for the
+    # layout to reuse: `spaces` and `caches` are aligned (`_prepare_spaces`), and the
+    # keys are identities — each field's space is one of these.
+    classify_caches = IdDict{Space,_ClassifyCache{D,T}}(zip(spaces, caches))
     layout, trace_factors, unsupported = _system_layout(effective_problem; tolerance, prune,
                                                         prune_exempt, classify_caches,
                                                         facets=facet_resolver)
