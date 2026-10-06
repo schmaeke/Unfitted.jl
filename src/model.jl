@@ -2182,11 +2182,22 @@ include in PR descriptions, paper figures, and regression tests.
 
 Each `levels` entry carries `id`, `role`, `cells`, `order` (the level's
 nominal per-axis maximum), `order_palette` (the distinct per-cell orders, a
-one-element vector on a uniform level), `mode`, `basis`, `domain`, and `nested`
+one-element vector on a uniform level), `mode`, `basis`, `domain`, `nested`
 — whether every higher level's nodes coincide with this level's where the two
-overlap. `nested` is the geometric half of what makes leaf semantics lossless,
-and it is reported per level because [`move!`](@ref) can void it silently; see
-[`is_nested`](@ref).
+overlap — and `raw_functions` and `active_functions`. `nested` is the geometric
+half of what makes leaf semantics lossless, and it is reported per level because
+[`move!`](@ref) can void it silently; see [`is_nested`](@ref).
+
+`raw_functions` counts the basis functions the level enumerated on its active
+cells, and `active_functions` those of them that survived every elimination: the
+artificial overlay boundary, leaf-semantics pruning and physical Dirichlet
+conditions alike. Both count functions, not unknowns; a function of a field
+with `k` components carries `k` unknowns. A level is counted once however many
+fields share its space, and both numbers are read from the first field over that
+space, so with several fields over one space `active_functions` reflects the
+Dirichlet conditions of the first of them. A dormant level, with no active cell,
+reads 0 / 0; a level that enumerated functions and kept none reads `n` / 0 and
+contributes nothing to the system.
 """
 diagnostics(model::Model) = model.diagnostics
 
