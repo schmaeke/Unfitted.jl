@@ -322,7 +322,7 @@ Create a physical Dirichlet condition.
 
 Nonzero `value` data are projected onto the boundary trace space
 before strong elimination so the constrained dof values reflect the
-correct trace. Homogeneous data — a zero scalar, or a component value
+correct trace. Homogeneous data — a zero number, or a tuple or array
 whose every entry is zero — skip the projection entirely.
 
 On an immersed space, that projection is taken over `face ∩ Ω`: where `∂Ω`

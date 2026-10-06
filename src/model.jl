@@ -234,9 +234,8 @@ Fields:
     `∫ φᵢ φⱼ ds` was positive definite, `:pseudoinverse` where `cholesky`
     reported it indefinite, and `:none` where the component had no constrained
     dof to solve for — which is also what a model prepared with homogeneous data
-    reads, constant-zero data (a zero number, or a per-component value whose
-    every entry is zero) skipping the projection at [`prepare`](@ref)
-    altogether.
+    reads, constant-zero data (a zero number, or a tuple or array whose every
+    entry is zero) skipping the projection at [`prepare`](@ref) altogether.
 
     `:pseudoinverse` is the entry worth reading: it is the only externally
     visible trace of a boundary trace space that has gone singular, and on an
@@ -255,7 +254,10 @@ Fields:
     dof whose every facet region is trimmed away is still constrained, while the
     projection has nothing left to fit it on and the pseudoinverse pins it to
     zero. Zero on a non-immersed space and on every immersed space whose
-    integrated faces stay inside `Ω`.
+    integrated faces stay inside `Ω`. Zero, too, on any model prepared with
+    homogeneous data, whatever its geometry: that model has run no trace solve,
+    so the list is empty, as `dirichlet_trace_factors` reads `:none`, until the
+    first [`update_dirichlet!`](@ref) runs one and establishes both.
 
     What such a condition *ought* to mean is an open semantic question and the
     package does not answer it here; the record exists so the answer it does give

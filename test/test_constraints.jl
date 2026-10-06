@@ -1384,6 +1384,20 @@ end
               for axes in
                   ((node, Unfitted._axis_dof_key(4, 1)), (node, Unfitted._axis_dof_key(4, 2))))
 
+    # The geometry is not what the list reports on its own: it reports a trace solve,
+    # and homogeneous data run none at `prepare` — a per-component zero no more than a
+    # scalar one. On the same face, which leaves two dofs per component unsupported,
+    # both verdicts read their "nothing has happened" value until an increment runs
+    # the solve, which then finds the fallback on each component.
+    pair_on_plane = field(:u, Vplane; components=2)
+    zero_cut = prepare(poisson(pair_on_plane; source=SVector(0.0, 0.0),
+                               dirichlet=[dirichlet(SVector(0.0, 0.0); on=face)]))
+    @test diagnostics(zero_cut).dirichlet_trace_factors == [:none, :none]
+    @test diagnostics(zero_cut).unsupported_dirichlet_dof_count == 0
+    update_dirichlet!(zero_cut, [dirichlet(x -> SVector(1 + x[2], 2x[2]); on=face)])
+    @test diagnostics(zero_cut).dirichlet_trace_factors == [:pseudoinverse, :pseudoinverse]
+    @test [r.component for r in diagnostics(zero_cut).unsupported_dirichlet_dofs] == [1, 1, 2, 2]
+
     # Two controls. A non-immersed face has nothing to trim, so the solve is a
     # Cholesky and the list is empty; and a homogeneous condition runs no projection
     # at all, so both read their "nothing has happened" value until a nonzero
