@@ -408,11 +408,12 @@ end
 #
 # `P` is the CONCRETE type of `V.physical`. `Space.physical` is abstractly typed, so a
 # hook that read it off the space dispatched dynamically on every per-raw predicate
-# call it fed it to. Building this struct inside a function that received `physical`
-# as an argument is the function barrier: the hooks, and every predicate they call,
-# specialise on `P` instead. Measured on the integrated-Legendre artificial-boundary
-# pass over an immersed disc at 128² p2 (29 281 raws): 304 bytes per raw and 1.26 ms
-# with `P = Any`, nothing and 0.24 ms typed.
+# call it fed it to. The struct is built from the run-time value of `V.physical`,
+# which gives it the concrete `P` wherever it is built, and the hook it is handed
+# to is the function barrier: the hooks, and every predicate they call, specialise
+# on `P` instead. Measured on the integrated-Legendre artificial-boundary pass over
+# an immersed disc at 128² p2 (29 281 raws): 304 bytes per raw and 1.26 ms with
+# `P = Any`, nothing and 0.24 ms typed.
 struct _LevelContext{D,T,S<:Space{D,T},P}
     space::S
     physical::P
@@ -499,18 +500,24 @@ end
 
 # Step 1 of a layout: the space block, built from the space alone. Raw enumeration
 # (`_enumerate_raws`), then every level's artificial eliminations recorded in one
-# `EliminationLedger` — the family's `_overlay_constraints!`, then, under leaf
-# semantics, its `_coverage_constraints!` against the masks `build_coverage`
-# computes (so those are built first, and not at all when `prune = false`), then
-# `_resolve_rows!` on whatever linear-constraint rows the two recorded — and finally
-# the depth-one check on the pivots the rows resolved to. The ledger's per-raw
-# sources and pivot table become the topology's.
+# `EliminationLedger`, level by level in `V.levels` order: the family's
+# `_overlay_constraints!`, then, under leaf semantics, its `_coverage_constraints!`
+# against the masks `build_coverage` computes (so those are built first, and not at
+# all when `prune = false`), then `_resolve_rows!` on whatever linear-constraint rows
+# the two recorded — and finally the depth-one check on the pivots the rows resolved
+# to. The ledger's per-raw sources and pivot table become the topology's. The core
+# owns this order and the pruning gate (`prune`, `prune_exempt`), so no family
+# re-implements either: a family that forgot the gate would prune the unreduced twin.
+#
+# Each hook call is the function barrier its per-raw loop runs behind. The level's
+# context is built from the run-time value of `V.physical`, so its `P` is concrete
+# (see `_LevelContext`) even though the field is not, and `V.levels` may mix basis
+# families; a hook therefore runs specialised on both, and what dispatches at run
+# time is at most the context's construction and the three calls per level.
 #
 # A topology reads neither a field's components nor its Dirichlet data, so one is
 # the same for every field over the space, and `_system_layout` builds it once per
-# space and shares it between them. `V.physical` is passed to
-# `_record_eliminations!` as an argument rather than read there, which is the
-# function barrier that types the hooks' context (see `_LevelContext`).
+# space and shares it between them.
 function _dof_topology(V::Space{D,T}; tolerance::GeometryTolerance{T}=GeometryTolerance(T),
                        prune::Bool=true, prune_exempt=(),
                        classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
@@ -518,45 +525,18 @@ function _dof_topology(V::Space{D,T}; tolerance::GeometryTolerance{T}=GeometryTo
     coverage = prune ? build_coverage(V, tolerance, classify_cache) :
                Coverage{D}(Dict{Int,BitArray{D}}())
     ledger = EliminationLedger{T}(length(raw_keys))
-    _record_eliminations!(ledger, V, V.physical, tolerance, classify_cache, coverage, raw_keys,
-                          raw_by_key, level_raws, prune, prune_exempt)
+    for level in V.levels
+        ctx = _LevelContext(V, V.physical, tolerance, classify_cache, coverage, raw_keys,
+                            raw_by_key, level_raws[level.id])
+        _overlay_constraints!(ledger, level, ctx)
+        prune && !(level.id in prune_exempt) && _coverage_constraints!(ledger, level, ctx)
+        isempty(ledger.rows) && continue
+        _resolve_rows!(ledger, level)
+        empty!(ledger.rows)
+    end
     _assert_resolved(ledger)
     return _DofTopology{D,T}(cell_dofs_by_level, raw_keys, level_raws, ledger.source, ledger.pivots,
                              tolerance)
-end
-
-# Stage 2 of the layout: every level's artificial eliminations, recorded into `ledger`
-# one level at a time (`_level_eliminations!`). `physical` is `V.physical`, passed
-# separately on purpose: receiving it as an argument is the function barrier that hands
-# every hook a context whose `physical` is concretely typed (see `_LevelContext`). The
-# loop over a heterogeneous `V.levels` tuple then dispatches once per level, which is
-# the second barrier: each level's hooks run specialised on its basis family.
-function _record_eliminations!(ledger::EliminationLedger{T}, V::Space{D,T}, physical,
-                               tolerance::GeometryTolerance{T}, classify_cache::_ClassifyCache{D,T},
-                               coverage::Coverage{D}, raw_keys::Vector{TensorDofKey{D}},
-                               raw_by_key::Dict{TensorDofKey{D},Int},
-                               level_raws::Vector{UnitRange{Int}}, prune::Bool,
-                               prune_exempt) where {D,T}
-    for level in V.levels
-        ctx = _LevelContext(V, physical, tolerance, classify_cache, coverage, raw_keys, raw_by_key,
-                            level_raws[level.id])
-        _level_eliminations!(ledger, level, ctx, prune && !(level.id in prune_exempt))
-    end
-    return ledger
-end
-
-# One level: its artificial boundary, then, under leaf semantics, its pruning, then
-# the resolution of whatever linear-constraint rows the two recorded. The core owns
-# this order and the pruning gate (`prune`, `prune_exempt`), so no family
-# re-implements either: a family that forgot the gate would prune the unreduced twin.
-function _level_eliminations!(ledger::EliminationLedger, level::Level, ctx::_LevelContext,
-                              pruned::Bool)
-    _overlay_constraints!(ledger, level, ctx)
-    pruned && _coverage_constraints!(ledger, level, ctx)
-    isempty(ledger.rows) && return ledger
-    _resolve_rows!(ledger, level)
-    empty!(ledger.rows)
-    return ledger
 end
 
 # Step 3 of a layout: number one field over a topology, given its physical-Dirichlet

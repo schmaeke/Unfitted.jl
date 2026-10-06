@@ -731,11 +731,12 @@ end
 
 @testset "the artificial-boundary pass over an immersed level does not allocate per raw" begin
     # `Space.physical` is abstractly typed. The dof-layer hooks read it from a
-    # `_LevelContext` built behind a function barrier, so the per-raw predicate
-    # `_has_overlay_constraint` — which classifies the inactive neighbour of every
-    # fold face — specialises on the concrete physical domain. Read off the space
-    # instead, it dispatched dynamically on every raw and boxed its arguments, which
-    # is an allocation per raw on every layout build of an immersed space.
+    # `_LevelContext` built from its run-time value; each hook call is the function
+    # barrier, so the per-raw predicate `_has_overlay_constraint` — which classifies
+    # the inactive neighbour of every fold face — specialises on the concrete
+    # physical domain. Read off the space instead, it dispatched dynamically on every
+    # raw and boxed its arguments, which is an allocation per raw on every layout
+    # build of an immersed space.
     disc = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.37; lipschitz=1.0,
                            subcell_length_scale=1 / 128, max_depth=3)
     for n in (16, 32)
