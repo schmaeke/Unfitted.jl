@@ -124,44 +124,6 @@ end
 
 # ── Physical-Dirichlet detection ──────────────────────────────────────────────
 
-# The codim-1 faces an `:except` selector keeps: every face of the physical box
-# that its `sides` list — the *excluded* faces — does not name. The order is
-# `boundary(:all)`'s own, axis-major with `:lower` before `:upper`, so an
-# `:except` selector enumerates its facets in exactly the order the whole
-# boundary would, minus the dropped entries. That is what makes the Dirichlet
-# projection through one `:except` condition bit-identical to the same faces
-# written out individually in that order, rather than merely equal to roundoff:
-# the projection accumulates its mass and right-hand side facet by facet in this
-# walk's order, and floating-point addition is not associative.
-#
-# Both checks need `D` and so cannot live in `boundary`, which builds a selector
-# without reference to a space — exactly as the bound check on
-# `boundary(axis=4, side=:lower)` waits for one. Excluding every face is an
-# error, not an empty facet list: nothing selected is never what a caller meant,
-# and silently constraining nothing is the failure mode this selector exists to
-# prevent.
-function _kept_faces(excluded::Vector{Tuple{Int,Symbol}}, ::Val{D}) where {D}
-    for (axis, _) in excluded
-        1 <= axis <= D ||
-            throw(ArgumentError("boundary axis $axis is out of bounds for dimension $D"))
-    end
-    kept = [(axis, side) for axis in 1:D for side in (:lower, :upper) if (axis, side) ∉ excluded]
-    isempty(kept) && throw(ArgumentError("boundary(:all; except=…) excludes all $(2D) faces of " *
-                                         "the physical boundary in $(D)D, selecting nothing"))
-    return kept
-end
-
-# A codim-1 face of the physical box as one bit of a `UInt64`: axis `a`'s lower
-# face is bit `2(a − 1)` and its upper face the bit above. A set of faces is then
-# the OR of their bits, and "lies on every face of the set" is a subset test on
-# two words. `side` is `:lower` or `:upper`: `_facets` has refused any other.
-_face_bit(axis::Integer, side::Symbol) = UInt64(1) << (2(axis - 1) + (side === :upper))
-
-# The face mask of one `_facets` entry: the OR of the bits of the codim-1 faces
-# whose intersection the facet is. An empty facet — the one an empty `:sides`
-# list decomposes into — is mask 0, which every dof covers.
-_face_mask(facet) = mapreduce(((axis, side),) -> _face_bit(axis, side), |, facet; init=UInt64(0))
-
 # Physical-Dirichlet detection: `marks[raw, c]` is true iff some condition scoped
 # to component `c` (`component = nothing` scopes it to every component) selects a
 # facet that raw's basis function lies on. These are the flags the active numbering
@@ -218,6 +180,74 @@ function _physical_dirichlet(t, V::Space{D,T}, conditions, components::Integer) 
     return marks
 end
 
+# Decompose a `BoundarySelector` into the list of facets it covers. For
+# `:all` this is one codim-1 facet per physical face (their union is
+# `∂Ω`); for `:except` it is one per *kept* face, the same list with the
+# excluded entries removed; for `:sides` it is the single facet identified
+# by the listed `(axis, side)` constraints. Used by `_physical_dirichlet` to
+# find the dofs each condition constrains, by `_project_dirichlet_values!` to
+# iterate over the support of each Dirichlet condition, and by
+# `_facet_regions_for_selector` to assemble the region union — which is why a
+# union selector needs nothing else to be detected or integrated.
+function _facets(selector::BoundarySelector, ::Val{D}) where {D}
+    if selector.selector === :all
+        return [Tuple{Int,Symbol}[(axis, side)] for axis in 1:D for side in (:lower, :upper)]
+    elseif selector.selector === :except
+        return [Tuple{Int,Symbol}[face] for face in _kept_faces(selector.sides, Val(D))]
+    elseif selector.selector === :sides
+        for (axis, side) in selector.sides
+            1 <= axis <= D ||
+                throw(ArgumentError("boundary axis $axis is out of bounds for dimension $D"))
+            # Reachable only through a hand-built `BoundarySelector`: `boundary`
+            # validates its sides. Refused here, where every consumer decomposes a
+            # selector, with the message every side check in the package uses.
+            side in (:lower, :upper) ||
+                throw(ArgumentError("boundary side must be :lower or :upper"))
+        end
+        return [selector.sides]
+    end
+
+    throw(ArgumentError("unsupported boundary selector $(selector.selector)"))
+end
+
+# The codim-1 faces an `:except` selector keeps: every face of the physical box
+# that its `sides` list — the *excluded* faces — does not name. The order is
+# `boundary(:all)`'s own, axis-major with `:lower` before `:upper`, so an
+# `:except` selector enumerates its facets in exactly the order the whole
+# boundary would, minus the dropped entries. That is what makes the Dirichlet
+# projection through one `:except` condition bit-identical to the same faces
+# written out individually in that order, rather than merely equal to roundoff:
+# the projection accumulates its mass and right-hand side facet by facet in this
+# walk's order, and floating-point addition is not associative.
+#
+# Both checks need `D` and so cannot live in `boundary`, which builds a selector
+# without reference to a space — exactly as the bound check on
+# `boundary(axis=4, side=:lower)` waits for one. Excluding every face is an
+# error, not an empty facet list: nothing selected is never what a caller meant,
+# and silently constraining nothing is the failure mode this selector exists to
+# prevent.
+function _kept_faces(excluded::Vector{Tuple{Int,Symbol}}, ::Val{D}) where {D}
+    for (axis, _) in excluded
+        1 <= axis <= D ||
+            throw(ArgumentError("boundary axis $axis is out of bounds for dimension $D"))
+    end
+    kept = [(axis, side) for axis in 1:D for side in (:lower, :upper) if (axis, side) ∉ excluded]
+    isempty(kept) && throw(ArgumentError("boundary(:all; except=…) excludes all $(2D) faces of " *
+                                         "the physical boundary in $(D)D, selecting nothing"))
+    return kept
+end
+
+# The face mask of one `_facets` entry: the OR of the bits of the codim-1 faces
+# whose intersection the facet is. An empty facet — the one an empty `:sides`
+# list decomposes into — is mask 0, which every dof covers.
+_face_mask(facet) = mapreduce(((axis, side),) -> _face_bit(axis, side), |, facet; init=UInt64(0))
+
+# A codim-1 face of the physical box as one bit of a `UInt64`: axis `a`'s lower
+# face is bit `2(a − 1)` and its upper face the bit above. A set of faces is then
+# the OR of their bits, and "lies on every face of the set" is a subset test on
+# two words. `side` is `:lower` or `:upper`: `_facets` has refused any other.
+_face_bit(axis::Integer, side::Symbol) = UInt64(1) << (2(axis - 1) + (side === :upper))
+
 # One level of `_physical_dirichlet`, behind a function barrier: `V.levels` is a
 # tuple that may mix basis families, and receiving the level as an argument
 # compiles this loop, and the family's `_key_on_level_side` inside it, for the
@@ -255,36 +285,6 @@ end
 _covers_a_facet(on::UInt64, facets::Vector{UInt64}) = any(f -> on & f == f, facets)
 
 # ── Boundary facet integration ────────────────────────────────────────────────
-
-# Decompose a `BoundarySelector` into the list of facets it covers. For
-# `:all` this is one codim-1 facet per physical face (their union is
-# `∂Ω`); for `:except` it is one per *kept* face, the same list with the
-# excluded entries removed; for `:sides` it is the single facet identified
-# by the listed `(axis, side)` constraints. Used by `_physical_dirichlet` to
-# find the dofs each condition constrains, by `_project_dirichlet_values!` to
-# iterate over the support of each Dirichlet condition, and by
-# `_facet_regions_for_selector` to assemble the region union — which is why a
-# union selector needs nothing else to be detected or integrated.
-function _facets(selector::BoundarySelector, ::Val{D}) where {D}
-    if selector.selector === :all
-        return [Tuple{Int,Symbol}[(axis, side)] for axis in 1:D for side in (:lower, :upper)]
-    elseif selector.selector === :except
-        return [Tuple{Int,Symbol}[face] for face in _kept_faces(selector.sides, Val(D))]
-    elseif selector.selector === :sides
-        for (axis, side) in selector.sides
-            1 <= axis <= D ||
-                throw(ArgumentError("boundary axis $axis is out of bounds for dimension $D"))
-            # Reachable only through a hand-built `BoundarySelector`: `boundary`
-            # validates its sides. Refused here, where every consumer decomposes a
-            # selector, with the message every side check in the package uses.
-            side in (:lower, :upper) ||
-                throw(ArgumentError("boundary side must be :lower or :upper"))
-        end
-        return [selector.sides]
-    end
-
-    throw(ArgumentError("unsupported boundary selector $(selector.selector)"))
-end
 
 # Component extraction from a Dirichlet value: scalars apply to every
 # component, anything indexable supplies one entry per component.
@@ -1299,10 +1299,81 @@ struct DirichletProjection{D,T<:Real}
     samples::Vector{FacetTraceSamples{D,T}}
 end
 
-# True iff `condition` constrains `component`: an unscoped condition
-# constrains every component of its field, a scoped one only its own.
-function _constrains(condition::DirichletCondition, component::Integer)
-    return condition.component === nothing || condition.component == component
+# True iff `dirichlet` carries at least one nonzero condition. The homogeneous case
+# skips the projection: every constrained value already equals zero from the
+# layout's zero-initialised `constrained_values` matrix, and projecting zero data
+# walks the boundary and factorises the mass only to write those zeros again: a
+# 3-component 8³ p3 `dof_layout` under `SVector` zero data took 369 ms with the
+# projection and 2.8 ms without it (Ryzen 9 9950X).
+_needs_dirichlet_projection(dirichlet) = !all(c -> _is_zero_datum(c.value), dirichlet)
+
+# A Dirichlet datum that is zero everywhere: a zero number, or a per-component
+# value (`SVector`, `Tuple`, vector) whose every entry is zero. `SVector(0.0, 0.0)`
+# names the same homogeneous condition as `0.0`; any other datum — a function above
+# all — is taken to be nonzero, since only evaluating it could say otherwise.
+function _is_zero_datum(value)
+    value isa Number ? iszero(value) : value isa Union{Tuple,AbstractArray} && all(iszero, value)
+end
+
+# Refill `layout.constrained_values` from `dirichlet`, returning the
+# [`DirichletProjection`](@ref) used. The caller reads the trace solve's verdicts —
+# `_trace_branch` of each factor and the `unsupported` dofs — off the returned
+# projection, which is the only place they live, and a caller that re-projects the
+# same layout can hand it back and skip the boundary walk. `projection` is reused
+# when given; the facet-count check is a cheap guard for a caller that reaches
+# past `update_dirichlet!`'s structural check, which is what actually
+# establishes that a cached projection still matches the condition list.
+#
+# `facets` is the resolver the boundary walk resolves faces through: the model's
+# under `prepare` and `update_dirichlet!`, a private one for a standalone
+# `dof_layout`. It must carry the layout's tolerance, checked before a projection is
+# built.
+function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T},
+                                    facets::FacetResolver{D,T}, dirichlet,
+                                    projection::Union{Nothing,DirichletProjection{D,T}}=nothing) where {D,
+                                                                                                        T}
+    ncomp = layout.components
+    plan = if projection === nothing ||
+              projection.facet_count != _dirichlet_facet_count(dirichlet, Val(D))
+        # A tolerance mismatch is a caller bug and is raised as one. A memo's entries
+        # were merged against *its* tolerance, so reading them with a layout built at
+        # another one would project the datum over a different partition of ∂Ω than
+        # the one the layout's constrained dofs were detected on. Quietly substituting
+        # a fresh resolver instead would hide that behind a second resolution of every
+        # face — exactly the cost sharing the resolver exists to remove.
+        facets.tolerance == layout.tolerance ||
+            throw(ArgumentError("facet resolver tolerance $(facets.tolerance) does not match " *
+                                "the dof layout's $(layout.tolerance); a layout and the " *
+                                "resolver it projects through must come from the same prepare"))
+        _dirichlet_projection(layout, V, facets, dirichlet)
+    else
+        projection
+    end
+    # Only now clear the old values. Everything that can reject the call — the
+    # resolver's tolerance above all — has happened, so a rejected call leaves the
+    # layout exactly as it found it instead of zeroed and unprojected.
+    fill!(layout.constrained_values, zero(T))
+    all(isempty, plan.unknowns) && return plan
+
+    rhs = [zeros(T, length(plan.unknowns[c])) for c in 1:ncomp]
+    facet = 0
+    for condition in dirichlet
+        for _ in _facets(condition.boundary, Val(D))
+            facet += 1
+            _accumulate_dirichlet_rhs!(rhs, plan.samples[facet], condition, ncomp)
+        end
+    end
+
+    for component in 1:ncomp
+        factor = plan.factors[component]
+        factor === nothing && continue
+        projected = factor isa Cholesky ? factor \ rhs[component] : factor * rhs[component]
+        for (i, raw) in pairs(plan.unknowns[component])
+            layout.constrained_values[raw, component] = projected[i]
+        end
+    end
+
+    return plan
 end
 
 # Number of (condition, facet) pairs a Dirichlet list covers. Recorded on a
@@ -1484,6 +1555,12 @@ function _sample_dirichlet_facet!(mass::Vector{Matrix{T}}, index::Vector{Dict{In
     return FacetTraceSamples{D,T}(points, weights, offsets, values, rows)
 end
 
+# True iff `condition` constrains `component`: an unscoped condition
+# constrains every component of its field, a scoped one only its own.
+function _constrains(condition::DirichletCondition, component::Integer)
+    return condition.component === nothing || condition.component == component
+end
+
 # Accumulate one facet's contribution to the per-component right-hand sides
 # `b_i = ∫_∂Ω g φ_i dx`. `condition` is deliberately left to dispatch: the
 # Dirichlet list is heterogeneous (each condition carries its own value type),
@@ -1516,83 +1593,6 @@ function _accumulate_dirichlet_rhs!(rhs::Vector{Vector{T}}, samples::FacetTraceS
     end
     return rhs
 end
-
-# Refill `layout.constrained_values` from `dirichlet`, returning the
-# [`DirichletProjection`](@ref) used. The caller reads the trace solve's verdicts —
-# `_trace_branch` of each factor and the `unsupported` dofs — off the returned
-# projection, which is the only place they live, and a caller that re-projects the
-# same layout can hand it back and skip the boundary walk. `projection` is reused
-# when given; the facet-count check is a cheap guard for a caller that reaches
-# past `update_dirichlet!`'s structural check, which is what actually
-# establishes that a cached projection still matches the condition list.
-#
-# `facets` is the resolver the boundary walk resolves faces through: the model's
-# under `prepare` and `update_dirichlet!`, a private one for a standalone
-# `dof_layout`. It must carry the layout's tolerance, checked before a projection is
-# built.
-function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T},
-                                    facets::FacetResolver{D,T}, dirichlet,
-                                    projection::Union{Nothing,DirichletProjection{D,T}}=nothing) where {D,
-                                                                                                        T}
-    ncomp = layout.components
-    plan = if projection === nothing ||
-              projection.facet_count != _dirichlet_facet_count(dirichlet, Val(D))
-        # A tolerance mismatch is a caller bug and is raised as one. A memo's entries
-        # were merged against *its* tolerance, so reading them with a layout built at
-        # another one would project the datum over a different partition of ∂Ω than
-        # the one the layout's constrained dofs were detected on. Quietly substituting
-        # a fresh resolver instead would hide that behind a second resolution of every
-        # face — exactly the cost sharing the resolver exists to remove.
-        facets.tolerance == layout.tolerance ||
-            throw(ArgumentError("facet resolver tolerance $(facets.tolerance) does not match " *
-                                "the dof layout's $(layout.tolerance); a layout and the " *
-                                "resolver it projects through must come from the same prepare"))
-        _dirichlet_projection(layout, V, facets, dirichlet)
-    else
-        projection
-    end
-    # Only now clear the old values. Everything that can reject the call — the
-    # resolver's tolerance above all — has happened, so a rejected call leaves the
-    # layout exactly as it found it instead of zeroed and unprojected.
-    fill!(layout.constrained_values, zero(T))
-    all(isempty, plan.unknowns) && return plan
-
-    rhs = [zeros(T, length(plan.unknowns[c])) for c in 1:ncomp]
-    facet = 0
-    for condition in dirichlet
-        for _ in _facets(condition.boundary, Val(D))
-            facet += 1
-            _accumulate_dirichlet_rhs!(rhs, plan.samples[facet], condition, ncomp)
-        end
-    end
-
-    for component in 1:ncomp
-        factor = plan.factors[component]
-        factor === nothing && continue
-        projected = factor isa Cholesky ? factor \ rhs[component] : factor * rhs[component]
-        for (i, raw) in pairs(plan.unknowns[component])
-            layout.constrained_values[raw, component] = projected[i]
-        end
-    end
-
-    return plan
-end
-
-# A Dirichlet datum that is zero everywhere: a zero number, or a per-component
-# value (`SVector`, `Tuple`, vector) whose every entry is zero. `SVector(0.0, 0.0)`
-# names the same homogeneous condition as `0.0`; any other datum — a function above
-# all — is taken to be nonzero, since only evaluating it could say otherwise.
-function _is_zero_datum(value)
-    value isa Number ? iszero(value) : value isa Union{Tuple,AbstractArray} && all(iszero, value)
-end
-
-# True iff `dirichlet` carries at least one nonzero condition. The homogeneous case
-# skips the projection: every constrained value already equals zero from the
-# layout's zero-initialised `constrained_values` matrix, and projecting zero data
-# walks the boundary and factorises the mass only to write those zeros again: a
-# 3-component 8³ p3 `dof_layout` under `SVector` zero data took 369 ms with the
-# projection and 2.8 ms without it (Ryzen 9 9950X).
-_needs_dirichlet_projection(dirichlet) = !all(c -> _is_zero_datum(c.value), dirichlet)
 
 # Cheap structural compatibility check. Re-projecting Dirichlet values
 # in place is only valid when the *set* of constrained dofs is
