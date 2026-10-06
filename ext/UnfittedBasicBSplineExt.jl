@@ -807,7 +807,16 @@ end
 #      same material exemption as case 1's second half, applied past the level's
 #      own box, and without it a level whose face sits in fictitious material loses
 #      the functions that reach ∂Ω — the ones the cut cells there need most.
-function _cell_admissible(a::_Admissibility{D}, c::CartesianIndex{D}) where {D}
+#
+# `@inline` because it is the body of `_block_admissible`'s per-cell loop, which every
+# function's selection and every burial test runs over `(p + 1)^D` cells or more.
+# Reading the mask and then the verdict table made it too large for the compiler to
+# inline on its own, and a call per cell cost more than laziness saves on a small
+# stack. Measured as the minimum of 400 `system_layout` builds of a 16² p3 plate
+# around a hole under a nested 24² overlay: 0.38 ms with the call, 0.28 ms inlined,
+# which is what the dense table took; and on the five-overlay band stack 4.3 ms with
+# the call against 3.1 ms inlined.
+@inline function _cell_admissible(a::_Admissibility{D}, c::CartesianIndex{D}) where {D}
     n = a.level.mesh.cells
     inside = true
     for d in 1:D
