@@ -683,6 +683,29 @@ end
         @test values_of(model) == before
     end
 
+    # With several fields, an increment checks each condition against the field it
+    # names, not against the model's first field. The scalar field `s` comes first
+    # here, so reading its count for the condition on `u` would refuse a correct
+    # datum there and let a short one through to the projection, after the
+    # conditions had been replaced; a datum on `s` is held to its own count.
+    s = field(:s, V)
+    pair(u_value, s_value=0.1) = [dirichlet(s_value; on=top, field=:s),
+                                  dirichlet(u_value; on=top, field=:u)]
+    pair_model(bcs) = prepare(Problem((s, u); blocks=(stiffness_block(s), stiffness_block(u)),
+                                      dirichlet=bcs))
+    pair_values(model) = [copy(f.dofs.constrained_values) for f in model.dofs.fields]
+    paired = pair_model(pair(SVector(0.2, 0.5)))
+    @test update_dirichlet!(paired, pair(SVector(0.3, 0.6), 0.4)) === paired
+    @test pair_values(paired) == pair_values(pair_model(pair(SVector(0.3, 0.6), 0.4)))
+    before, conditions = pair_values(paired), paired.problem.dirichlet
+    for (bcs, needs) in ((pair(SVector(0.3)), "of field u, 2, but this one has length 1"),
+                         (pair((0.3, 0.6, 0.9)), "of field u, 2, but this one has length 3"),
+                         (pair(SVector(0.3, 0.6), (0.4, 0.4)), "of field s, 1, but this one has length 2"))
+        @test_throws needs update_dirichlet!(paired, bcs)
+        @test paired.problem.dirichlet === conditions
+        @test pair_values(paired) == before
+    end
+
     # The shapes that were always meant: one entry per component, of any container,
     # scoped or not, zero or not — and an entry reaches its own component only.
     for value in (SVector(0.2, 0.5), (0.2, 0.5), [0.2, 0.5])
