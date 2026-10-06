@@ -901,7 +901,10 @@ Construct the basis-aware dof layout of one field over a superposition
 
 Keyword arguments:
 
-  - `dirichlet` — iterable of [`DirichletCondition`](@ref)s.
+  - `dirichlet` — iterable of [`DirichletCondition`](@ref)s, every one
+    applied to this layout. A constant tuple or array datum must carry
+    `components` entries, as [`dirichlet`](@ref) documents; any other
+    length raises `ArgumentError` before anything is built.
   - `tolerance` — `GeometryTolerance` used by boundary detection, and the
     tolerance of the private `FacetResolver` the projection resolves faces
     through. A [`Model`](@ref) shares one resolver between its projections and
@@ -938,6 +941,9 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
                     components::Integer=1, prune::Bool=true, prune_exempt=(),
                     classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
     components > 0 || throw(ArgumentError("dof layout components must be positive"))
+    for condition in dirichlet
+        _check_dirichlet_datum(condition, components, condition.field)
+    end
     t = _dof_topology(V; tolerance, prune, prune_exempt, classify_cache)
     return first(_field_dofs(t, V, dirichlet, components, FacetResolver{D,T}(tolerance)))
 end
@@ -2075,16 +2081,33 @@ reassembled and back-substituted.
 Throws `ArgumentError` if `dirichlet` is structurally incompatible
 with `model.problem.dirichlet` (different length, or any condition
 moves boundary / field / component). The error message points the
-caller at [`prepare`](@ref).
+caller at [`prepare`](@ref). Also throws `ArgumentError`, naming the
+field, if a constant tuple or array datum does not carry one entry per
+component of its field (see [`dirichlet`](@ref)). Either check runs
+before anything is touched, so a rejected call leaves the model as it
+was.
 """
 function update_dirichlet!(model::Model{D,T}, dirichlet) where {D,T}
     new_dirichlet = collect(dirichlet)
     _check_dirichlet_update_compatibility(model.problem.dirichlet, new_dirichlet)
+    # The one part of `Problem`'s check of its conditions the structural check does
+    # not cover: a value's shape. Each new condition belongs to the field its old
+    # counterpart did (`field` is pinned), so its component count is read off that
+    # field's layout. The layout's field vector is concretely typed, so this costs no
+    # allocation, where indexing the problem's field tuple at run time did: with three
+    # conditions on a scalar and a 2-component field, that added six allocations
+    # (3.3 kB) to an increment; this loop takes 0.12 µs of its 17 µs (Apple M2 Pro).
+    for condition in new_dirichlet
+        owner = condition.field === nothing ? only(model.dofs.fields) :
+                _field_layout(model.dofs, condition.field)
+        _check_dirichlet_datum(condition, owner.components, owner.name)
+    end
 
     # Replace `model.problem` (immutable) with a fresh copy carrying the
     # new dirichlet list. The inner constructor sidesteps the validation
     # walk in `Problem(fields; …)` — fields, blocks, loads, and the
-    # symmetric flag were already checked when the model was prepared.
+    # symmetric flag were already checked when the model was prepared, and
+    # the conditions have just been checked above.
     p = model.problem
     model.problem = typeof(p)(p.space, p.fields, p.blocks, p.loads, new_dirichlet, p.symmetric)
 

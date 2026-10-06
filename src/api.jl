@@ -295,10 +295,19 @@ end
 
 Create a physical Dirichlet condition.
 
-  - `value` — Dirichlet datum. Scalar (applied everywhere on the
-    selected facet), indexable component value (one entry per
-    component for vector fields), or callback `value(x)` evaluated at
-    physical coordinates.
+  - `value` — Dirichlet datum, applied everywhere on the selected
+    facet: a scalar, which every constrained component takes; a tuple
+    or array (`SVector`, `Tuple`, `Vector`) with exactly one entry per
+    component of the field, entry `c` being component `c`'s value —
+    under `component` too, which reads its own entry; or a callback
+    `value(x)` evaluated at physical coordinates and returning either.
+    A tuple or array of any other length raises `ArgumentError`, naming
+    the field and the length it needs, as soon as the owning field is
+    known — here when `field` is a [`Field`](@ref), otherwise at
+    [`Problem`](@ref) construction — and in [`update_dirichlet!`](@ref)
+    and a standalone [`dof_layout`](@ref) before either changes or
+    builds anything. A callback's result is not checked ahead of time:
+    only evaluating it could say what it returns.
   - `on::BoundarySelector` — the facet to constrain. Build via
     [`boundary`](@ref).
   - `field` — field to constrain. Pass `nothing` for single-field
@@ -362,8 +371,10 @@ function dirichlet(value; on::BoundarySelector, field=nothing, component=nothing
         component isa Integer ||
         throw(ArgumentError("Dirichlet component must be an integer or nothing"))
     field isa Field && _check_component(component, field)
-    return DirichletCondition(value, on, field_name,
-                              component === nothing ? nothing : Int(component))
+    condition = DirichletCondition(value, on, field_name,
+                                   component === nothing ? nothing : Int(component))
+    field isa Field && _check_dirichlet_datum(condition, component_count(field), field.name)
+    return condition
 end
 
 # ── Canonical weak forms ──────────────────────────────────────────────────────

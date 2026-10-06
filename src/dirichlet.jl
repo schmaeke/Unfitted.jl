@@ -77,9 +77,9 @@ end
 
 One physical Dirichlet condition. Built by [`dirichlet`](@ref):
 
-  - `value` — Dirichlet datum. Either a scalar / indexable value applied
-    everywhere on the selected facet, or a callback `value(x)` evaluated
-    at physical coordinates.
+  - `value` — Dirichlet datum, applied everywhere on the selected facet:
+    a scalar, a tuple or array with one entry per component of the field,
+    or a callback `value(x)` evaluated at physical coordinates.
   - `boundary::BoundarySelector` — the facet to constrain.
   - `field::Union{Nothing,Symbol}` — name of the field this condition
     applies to. `nothing` applies it to the only field of a single-field
@@ -93,6 +93,33 @@ struct DirichletCondition{F}
     boundary::BoundarySelector
     field::Union{Nothing,Symbol}
     component::Union{Nothing,Int}
+end
+
+# Reject a constant per-component datum — a tuple or array — whose length is not
+# `components`, the component count of the field `name` the condition constrains.
+# The projection reads entry `c` of such a datum for component `c`
+# (`_component_value`), and does so under `component = c` too, so the datum
+# carries one entry per component whether or not the condition is scoped to one.
+# Unchecked, a wrong length went three ways, none of them an error naming the
+# mistake: a short all-zero datum passed silently, because homogeneous data are
+# never projected (`_needs_dirichlet_projection`) and so never indexed; a short
+# nonzero one failed inside the projection with an incidental `BoundsError`, or
+# not at all when every entry it read was in range; and a long one was accepted
+# with its extra entries ignored. A callback is not checked: only evaluating it
+# could say what it returns. The condition, rather than its datum, is the
+# argument, so a caller walking an abstractly typed condition list dispatches
+# once per condition and never boxes an isbits datum to pass it on.
+function _check_dirichlet_datum(condition::DirichletCondition, components::Integer,
+                                name::Union{Nothing,Symbol})
+    value = condition.value
+    (value isa Union{Tuple,AbstractArray} && length(value) != components) || return nothing
+    owner = name === nothing ? "its field" : "field $name"
+    scoped = condition.component === nothing ? "" :
+             "; a condition scoped to component $(condition.component) still reads entry " *
+             "$(condition.component) of a per-component value, or takes a scalar"
+    throw(ArgumentError("a constant tuple or array Dirichlet datum carries one entry per " *
+                        "component of $owner, $components, but this one has length " *
+                        "$(length(value))$scoped"))
 end
 
 # ── Physical-Dirichlet detection ──────────────────────────────────────────────

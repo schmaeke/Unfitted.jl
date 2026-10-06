@@ -646,6 +646,71 @@ end
                                                   dirichlet(0.3; on=boundary(axis=1, side=:lower))])
 end
 
+# A constant tuple or array datum carries exactly one entry per component of its
+# field — under `component = c` too, which reads entry `c` of it. Unchecked, a
+# wrong length was never an error that named it: a short all-zero datum passed
+# silently, homogeneous data being skipped by the projection and so never indexed;
+# a short nonzero one failed inside the projection with a `BoundsError`, or not at
+# all when every entry it read was in range; a long one lost its extra entries.
+# Every entry point that sees the component count now refuses it, naming the field
+# and the length it needs, before anything is built or overwritten.
+@testset "a constant Dirichlet datum carries one entry per component" begin
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2)
+    u = field(:u, V; components=2)
+    top = boundary(axis=2, side=:upper)
+    vector_model(bcs) = prepare(poisson(u; source=SVector(1.0, 1.0), dirichlet=bcs))
+    values_of(model) = only(model.dofs.fields).dofs.constrained_values
+
+    for value in (SVector(0.0), SVector(0.0, 0.0, 0.0), SVector(1.0), (1.0, 2.0, 3.0), [1.0], ()),
+        component in (nothing, 1, 2)
+
+        needs = "of field u, 2, but this one has length $(length(value))"
+        unscoped = dirichlet(value; on=top, component)
+        # A `Field` names the count at once, a `Symbol` or an unscoped condition at
+        # `Problem` construction, so `prepare` never sees the datum; a standalone
+        # layout has no field to name.
+        @test_throws needs dirichlet(value; on=top, field=u, component)
+        @test_throws needs vector_model([dirichlet(value; on=top, field=:u, component)])
+        @test_throws needs vector_model([unscoped])
+        unnamed = "of its field, 2, but this one has length $(length(value))"
+        @test_throws unnamed Unfitted.dof_layout(V; dirichlet=[unscoped], components=2)
+
+        # An increment is refused before it replaces the conditions or a value.
+        model = vector_model([dirichlet(SVector(0.2, 0.5); on=top, component)])
+        before, conditions = copy(values_of(model)), model.problem.dirichlet
+        @test_throws needs update_dirichlet!(model, [unscoped])
+        @test model.problem.dirichlet === conditions
+        @test values_of(model) == before
+    end
+
+    # The shapes that were always meant: one entry per component, of any container,
+    # scoped or not, zero or not — and an entry reaches its own component only.
+    for value in (SVector(0.2, 0.5), (0.2, 0.5), [0.2, 0.5])
+        @test values_of(vector_model([dirichlet(value; on=top)])) ==
+              values_of(vector_model([dirichlet(0.2; on=top, component=1),
+                                      dirichlet(0.5; on=top, component=2)]))
+        @test values_of(vector_model([dirichlet(value; on=top, component=2)])) ==
+              values_of(vector_model([dirichlet(0.5; on=top, component=2)]))
+    end
+    @test diagnostics(vector_model([dirichlet((0.0, 0.0); on=top)])).dirichlet_trace_factors ==
+          [:none, :none]
+
+    # A scalar is still every constrained component's value, and zero still skips the
+    # projection; a scalar field takes a one-entry datum and refuses a two-entry one.
+    @test values_of(vector_model([dirichlet(0.5; on=top)])) ==
+          values_of(vector_model([dirichlet(SVector(0.5, 0.5); on=top)]))
+    @test diagnostics(vector_model([dirichlet(0.5; on=top)])).dirichlet_trace_factors ==
+          [:cholesky, :cholesky]
+    @test diagnostics(vector_model([dirichlet(0.0; on=top)])).dirichlet_trace_factors ==
+          [:none, :none]
+    scalar_model(value) = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(value; on=top)]))
+    @test values_of(scalar_model((0.5,))) == values_of(scalar_model(0.5))
+    @test_throws "of field u, 1, but this one has length 2" scalar_model((0.5, 0.5))
+
+    # A callback is not evaluated ahead of time, so its result is not checked here.
+    @test dirichlet(x -> SVector(1.0); on=top, field=u) isa Unfitted.DirichletCondition
+end
+
 # Function-valued Dirichlet must also refresh correctly. A constant
 # callback `x -> c` must give the same answer as the scalar `c`.
 @testset "update_dirichlet! handles function-valued data" begin
