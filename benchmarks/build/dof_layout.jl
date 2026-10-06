@@ -18,7 +18,8 @@ using Unfitted
 #
 # The four problems:
 #
-#   * 3D 12³ p3 with boundary(:all): a large layout dominated by detection;
+#   * 3D 12³ p3 with boundary(:all): one large level, every boundary raw of it
+#     physical Dirichlet, under zero data, so detection runs and no projection does;
 #   * a 2D 32² + 32² p3 corner overlay with nonzero data on every face: two levels
 #     and the boundary projection;
 #   * a deep 2D ladder, 6² depth 5 p2, with one base cell refined to the bottom rung:
@@ -31,9 +32,8 @@ using Unfitted
 # which reuse it) on the overlay, `activate!` / `deactivate!` on the ladder, and
 # `estimate`, which builds an enriched twin layout, on a tanh-front ladder.
 #
-# The problems are those of the dof-layout rewrite's build probes, so numbers from the
-# two can be compared. Only entry points that every representation of the layout
-# keeps are called.
+# Only entry points that every representation of the layout keeps are called, so the
+# same four problems serve as a before/after reference for changes to the dof layer.
 group = SUITE["build"]["dof_layout"] = BenchmarkGroup()
 
 let
