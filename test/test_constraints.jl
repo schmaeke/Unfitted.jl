@@ -901,6 +901,37 @@ end
     end
 end
 
+@testset "an immersed integrated-Legendre level still constrains a user-masked face" begin
+    # The other half of the fold exemption. The fictitious fold and the user's
+    # `active =` mask both deactivate cells, and only the fold's cells are empty: a
+    # cell the user masked out still holds material, so the modes on its face are
+    # nonzero on a physical face and must vanish there as on any artificial
+    # boundary. `_has_overlay_constraint` tells the two apart through
+    # `_is_fictitious`; exempting every inactive neighbour on an immersed level
+    # instead would leave the masked face free and the truncated solution
+    # discontinuous, and only an estimator inequality elsewhere would notice. The
+    # B-spline family's counterpart is in test_basis_bspline.jl.
+    hole = physical_domain(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0, subcell_length_scale=1 / 64,
+                           max_depth=6)
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    folded = prepare(mass(space(omega; cells=8, order=2, physical=hole)))
+    # Non-vacuity: the fold deactivated the cells inside the hole, so there are fold
+    # faces, and none of them constrains.
+    @test count(!, only(folded.problem.space.levels).mask.on) > 0
+    @test !any(==(:overlay), only(folded.dofs.fields).dofs.elimination_source)
+
+    # A corner block of material cells, masked out by hand: the internal faces at
+    # node index 7 bound it, and they constrain — and nothing else does.
+    mask = trues(8, 8)
+    mask[7:8, 7:8] .= false
+    masked = space(omega; cells=8, order=2, physical=hole, active=mask)
+    layout = only(prepare(mass(masked)).dofs.fields).dofs
+    constrained = findall(==(:overlay), layout.elimination_source)
+    @test !isempty(constrained)
+    @test all(r -> any(a -> a.kind == Unfitted._AXIS_NODE && a.index == 7, layout.raw_keys[r].axes),
+              constrained)
+end
+
 @testset "a dormant level does not change the base space's Dirichlet lift" begin
     # Every level of a `ladder` spans the whole domain, so every level's mesh
     # faces coincide with the physical boundary. Before the boundary partition
