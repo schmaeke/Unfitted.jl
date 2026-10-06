@@ -223,14 +223,19 @@ end
 # compiles this loop, and the family's `_key_on_level_side` inside it, for the
 # level's concrete type instead of dispatching per raw. The level's physical sides
 # — those of its mesh within `tol.contain` of the domain's — are found once, so a
-# raw only asks the family which of them its function lies on.
+# raw only asks the family which of them its function lies on, and the answers
+# accumulate into the raw's face mask `on` in an explicit loop (a `foldl` over the
+# sides takes 1.7× as long).
 function _mark_physical_dirichlet!(marks::Matrix{Bool}, t, level::Level{D}, domain::AxisBox{D},
                                    masks::Vector{Tuple{UnitRange{Int},Vector{UInt64}}}) where {D}
     sides = [(axis, side) for axis in 1:D
              for side in (:lower, :upper)
              if _level_side_is_physical(level, domain, axis, side, t.tolerance)]
     for raw in t.level_raws[level.id]
-        on = _key_faces(t.raw_keys[raw], level, sides)
+        key, on = t.raw_keys[raw], UInt64(0)
+        for (axis, side) in sides
+            _key_on_level_side(key, level, axis, side) && (on |= _face_bit(axis, side))
+        end
         for (components, facets) in masks
             _covers_a_facet(on, facets) || continue
             for c in components
@@ -241,21 +246,12 @@ function _mark_physical_dirichlet!(marks::Matrix{Bool}, t, level::Level{D}, doma
     return marks
 end
 
-# The face mask of the `sides` (`level`'s physical sides) on which the family
-# places the function `key` names. A helper with an explicit loop on purpose:
-# accumulating `on` inside the caller's loop, where `_covers_a_facet`'s closure
-# then captures a reassigned variable, boxes it — 5.0 ms and 0.8 MB against
-# 0.50 ms and nothing per raw for the pass on a 3D 12³ p3 field (Apple M2 Pro) —
-# and a `foldl` over the sides takes 1.7× as long as the loop.
-function _key_faces(key::TensorDofKey, level::Level, sides::Vector{Tuple{Int,Symbol}})
-    on = UInt64(0)
-    for (axis, side) in sides
-        _key_on_level_side(key, level, axis, side) && (on |= _face_bit(axis, side))
-    end
-    return on
-end
-
-# True iff the faces in `on` include every face of one of `facets`' masks.
+# True iff the faces in `on` include every face of one of `facets`' masks. A function
+# of its own on purpose: its closure captures this function's argument, which nothing
+# reassigns. Written inline in `_mark_physical_dirichlet!`'s per-raw loop, the closure
+# would capture that loop's `on`, which the loop reassigns, and box it — 4.9 ms and
+# 0.8 MB against 0.49 ms and nothing per raw for the pass on a 3D 12³ p3 field under
+# `boundary(:all)` (Apple M2 Pro).
 _covers_a_facet(on::UInt64, facets::Vector{UInt64}) = any(f -> on & f == f, facets)
 
 # ── Boundary facet integration ────────────────────────────────────────────────
@@ -1521,21 +1517,6 @@ function _accumulate_dirichlet_rhs!(rhs::Vector{Vector{T}}, samples::FacetTraceS
     return rhs
 end
 
-# Check that `facets` may resolve the faces `layout`'s Dirichlet data are projected
-# over, and return it. A tolerance mismatch is a caller bug and is raised as one. A
-# memo's entries were merged against *its* tolerance, so reading them with a layout
-# built at another one would project the datum over a different partition of ∂Ω
-# than the one the layout's constrained dofs were detected on. Quietly substituting
-# a fresh resolver instead would hide that behind a second resolution of every face
-# — exactly the cost sharing the resolver exists to remove.
-function _dirichlet_resolver(layout::DofLayout{D,T}, facets::FacetResolver{D,T}) where {D,T}
-    facets.tolerance == layout.tolerance ||
-        throw(ArgumentError("facet resolver tolerance $(facets.tolerance) does not match the dof " *
-                            "layout's $(layout.tolerance); a layout and the resolver it projects " *
-                            "through must come from the same prepare"))
-    return facets
-end
-
 # Refill `layout.constrained_values` from `dirichlet`, returning the
 # [`DirichletProjection`](@ref) used. The caller reads the trace solve's verdicts —
 # `_trace_branch` of each factor and the `unsupported` dofs — off the returned
@@ -1547,7 +1528,8 @@ end
 #
 # `facets` is the resolver the boundary walk resolves faces through: the model's
 # under `prepare` and `update_dirichlet!`, a private one for a standalone
-# `dof_layout`. See `_dirichlet_resolver` for the tolerance it must share.
+# `dof_layout`. It must carry the layout's tolerance, checked before a projection is
+# built.
 function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T},
                                     facets::FacetResolver{D,T}, dirichlet,
                                     projection::Union{Nothing,DirichletProjection{D,T}}=nothing) where {D,
@@ -1555,7 +1537,17 @@ function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T},
     ncomp = layout.components
     plan = if projection === nothing ||
               projection.facet_count != _dirichlet_facet_count(dirichlet, Val(D))
-        _dirichlet_projection(layout, V, _dirichlet_resolver(layout, facets), dirichlet)
+        # A tolerance mismatch is a caller bug and is raised as one. A memo's entries
+        # were merged against *its* tolerance, so reading them with a layout built at
+        # another one would project the datum over a different partition of ∂Ω than
+        # the one the layout's constrained dofs were detected on. Quietly substituting
+        # a fresh resolver instead would hide that behind a second resolution of every
+        # face — exactly the cost sharing the resolver exists to remove.
+        facets.tolerance == layout.tolerance ||
+            throw(ArgumentError("facet resolver tolerance $(facets.tolerance) does not match " *
+                                "the dof layout's $(layout.tolerance); a layout and the " *
+                                "resolver it projects through must come from the same prepare"))
+        _dirichlet_projection(layout, V, facets, dirichlet)
     else
         projection
     end

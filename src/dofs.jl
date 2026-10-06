@@ -1035,7 +1035,7 @@ end
 # level's lower (`side = :lower`) or upper (`side = :upper`) mesh edge.
 # Dispatched on the level's basis family so each family's "boundary
 # mode" convention is local to its own implementation. Used by the
-# physical-Dirichlet detection (`_key_faces` in `dirichlet.jl`) to
+# physical-Dirichlet detection (`_mark_physical_dirichlet!` in `dirichlet.jl`) to
 # translate "is this dof at a face" into a basis-family-specific predicate
 # without leaking the family's mode-index conventions into the rest of the
 # dof layer. The integrated-Legendre `_has_overlay_constraint` below does
