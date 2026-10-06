@@ -73,6 +73,24 @@ end
     @test value(solution, per_component, (0.5, 0.0), 1) ≈ 0.0 atol = 1.0e-10   # u_x fixed on bottom
 end
 
+@testset "a standalone layout constrains nothing on a component it does not carry" begin
+    # `Problem` and `dirichlet(…; field=::Field)` refuse a component outside the
+    # field's `1:components`. A standalone `dof_layout` has no field to refuse it
+    # against, and its detection scopes such a condition to the components the layout
+    # carries — none of them — rather than indexing past the flag matrix: the
+    # condition constrains nothing, under zero and nonzero data alike, and the layout
+    # numbers exactly as one built without it.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2)
+    plain = Unfitted.dof_layout(V; components=2)
+    for component in (0, 3), value in (0.0, 0.5, SVector(0.5, 0.25))
+        layout = Unfitted.dof_layout(V; dirichlet=[dirichlet(value; on=boundary(:all), component)],
+                                     components=2)
+        @test !any(layout.physical_dirichlet)
+        @test layout.active_component == plain.active_component
+        @test all(iszero, layout.constrained_values)
+    end
+end
+
 @testset "a system layout's per-dof accessors honour the component" begin
     # A roller on the top face pins u_y there and leaves u_x free, so the two
     # components of one raw are constrained differently. The single-field system

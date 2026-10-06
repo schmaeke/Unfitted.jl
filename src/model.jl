@@ -904,9 +904,12 @@ Construct the basis-aware dof layout of one field over a superposition
 Keyword arguments:
 
   - `dirichlet` — iterable of [`DirichletCondition`](@ref)s, every one
-    applied to this layout. A constant tuple or array datum must carry
-    `components` entries, as [`dirichlet`](@ref) documents; any other
-    length raises `ArgumentError` before anything is built.
+    applied to this layout whatever field it names. A constant tuple or
+    array datum must carry `components` entries, as [`dirichlet`](@ref)
+    documents; any other length raises `ArgumentError` before anything is
+    built. A condition's `component` is not range-checked here, there being
+    no field to check it against: one outside `1:components` constrains
+    nothing.
   - `tolerance` — `GeometryTolerance` used by boundary detection, and the
     tolerance of the private `FacetResolver` the projection resolves faces
     through. A [`Model`](@ref) shares one resolver between its projections and
@@ -943,9 +946,7 @@ function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
                     components::Integer=1, prune::Bool=true, prune_exempt=(),
                     classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
     components > 0 || throw(ArgumentError("dof layout components must be positive"))
-    for condition in dirichlet
-        _check_dirichlet_datum(condition, components, condition.field)
-    end
+    foreach(c -> _check_dirichlet_datum(c, components, c.field), dirichlet)
     t = _dof_topology(V; tolerance, prune, prune_exempt, classify_cache)
     return first(_field_dofs(t, V, dirichlet, components, FacetResolver{D,T}(tolerance)))
 end
