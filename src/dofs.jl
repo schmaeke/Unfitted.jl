@@ -616,9 +616,7 @@ never reaches this default or the per-raw `_has_overlay_constraint`.
 function _overlay_constraints!(ledger::EliminationLedger, level::Level{D,T},
                                ctx::_LevelContext{D,T}) where {D,T}
     for raw in ctx.raws
-        _has_overlay_constraint(ctx.raw_keys[raw], level, ctx.physical, ctx.space.domain,
-                                ctx.tolerance, ctx.classify_cache) &&
-            _eliminate!(ledger, raw, :overlay)
+        _has_overlay_constraint(ctx.raw_keys[raw], level, ctx) && _eliminate!(ledger, raw, :overlay)
     end
     return ledger
 end
@@ -1125,9 +1123,10 @@ end
 # face are non-zero on a physical face and must be eliminated to keep the
 # truncated solution continuous. With no physical domain there is no
 # fictitious material, so every internal active/inactive face constrains
-# (the original overlay/user-mask behaviour) and `cache` is never touched.
-# The walk stops at the first constraining position, so a fold face
-# classifies its inactive neighbours only until one of them holds material.
+# (the original overlay/user-mask behaviour) and `ctx.classify_cache` is
+# never touched. The walk stops at the first constraining position, so a
+# fold face classifies its inactive neighbours only until one of them holds
+# material.
 #
 # This runs once per raw on every layout build, so two measured choices keep
 # it as cheap as the two-walk predicate it replaced: `@inline`, without which
@@ -1141,9 +1140,8 @@ end
 # `_overlay_constraints!`, with a support map that spans several cells and
 # the same fold exemption (`_active_cell_at_face`).
 @inline function _has_overlay_constraint(key::TensorDofKey{D},
-                                         level::Level{D,T,<:IntegratedLegendre}, physical,
-                                         domain::AxisBox{D,T}, tol::GeometryTolerance{T},
-                                         cache::_ClassifyCache{D,T}) where {D,T}
+                                         level::Level{D,T,<:IntegratedLegendre},
+                                         ctx::_LevelContext{D,T}) where {D,T}
     n = level.mesh.cells
     for axis in 1:D
         axis_key = key.axes[axis]
@@ -1154,12 +1152,12 @@ end
             below_active == _cell_active(level, axis, i, outer.I, n) && continue
             if i == 1 || i == n[axis] + 1
                 side = i == 1 ? :lower : :upper
-                _level_side_is_physical(level, domain, axis, side, tol) && break
+                _level_side_is_physical(level, ctx.space.domain, axis, side, ctx.tolerance) && break
                 return true
             end
             across = below_active ? i : i - 1          # the inactive cell's axis position
             inactive = CartesianIndex(ntuple(d -> d == axis ? across : outer[d], D))
-            _is_fictitious(level, inactive, physical, cache) || return true
+            _is_fictitious(level, inactive, ctx.physical, ctx.classify_cache) || return true
         end
     end
     return false

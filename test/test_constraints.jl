@@ -707,8 +707,7 @@ end
     Unfitted._coverage_constraints!(ledger, middle, ctx)
     candidates = [r for r in ctx.raws if ledger.source[r] !== :free]
 
-    on_gamma_o(raw) = Unfitted._has_overlay_constraint(layout.raw_keys[raw], middle, V.physical,
-                                                       V.domain, tol, cache)
+    on_gamma_o(raw) = Unfitted._has_overlay_constraint(layout.raw_keys[raw], middle, ctx)
     collisions = count(on_gamma_o, candidates)
     # Non-vacuity: this stack really does produce raws carrying both constraints.
     @test collisions > 0
