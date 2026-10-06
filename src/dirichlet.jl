@@ -124,20 +124,11 @@ function _kept_faces(excluded::Vector{Tuple{Int,Symbol}}, ::Val{D}) where {D}
     return kept
 end
 
-# The bit that tells a face's two sides apart in a face mask (`_face_bit`): 0 for
-# `:lower`, 1 for `:upper`. It is also where an invalid side symbol is refused —
-# reachable only through a hand-built `BoundarySelector`, since `boundary`
-# validates its sides — with the message every side check in the package uses.
-function _side_bit(side::Symbol)
-    side === :lower ? 0 :
-    side === :upper ? 1 : throw(ArgumentError("boundary side must be :lower or :upper"))
-end
-
 # A codim-1 face of the physical box as one bit of a `UInt64`: axis `a`'s lower
 # face is bit `2(a − 1)` and its upper face the bit above. A set of faces is then
 # the OR of their bits, and "lies on every face of the set" is a subset test on
-# two words.
-_face_bit(axis::Integer, side::Symbol) = UInt64(1) << (2(axis - 1) + _side_bit(side))
+# two words. `side` is `:lower` or `:upper`: `_facets` has refused any other.
+_face_bit(axis::Integer, side::Symbol) = UInt64(1) << (2(axis - 1) + (side === :upper))
 
 # The face mask of one `_facets` entry: the OR of the bits of the codim-1 faces
 # whose intersection the facet is. An empty facet — the one an empty `:sides`
@@ -164,8 +155,7 @@ _face_mask(facet) = mapreduce(((axis, side),) -> _face_bit(axis, side), |, facet
 #
 # Selector semantics therefore live in `_facets` alone, the same decomposition the
 # projection and the facet regions integrate over, and a malformed selector raises
-# from there (or, for a side symbol only a hand-built selector can carry, from
-# `_side_bit`) with its usual message before any raw is visited, whichever
+# from there with its usual message before any raw is visited, whichever
 # component it is scoped to. The masks are built once per condition: the per-key predicate
 # this pass replaced re-derived them, and re-asked the family about each face, for
 # every raw × component × condition, allocating an `:except` selector's kept faces
@@ -258,9 +248,14 @@ function _facets(selector::BoundarySelector, ::Val{D}) where {D}
     elseif selector.selector === :except
         return [Tuple{Int,Symbol}[face] for face in _kept_faces(selector.sides, Val(D))]
     elseif selector.selector === :sides
-        for (axis, _) in selector.sides
+        for (axis, side) in selector.sides
             1 <= axis <= D ||
                 throw(ArgumentError("boundary axis $axis is out of bounds for dimension $D"))
+            # Reachable only through a hand-built `BoundarySelector`: `boundary`
+            # validates its sides. Refused here, where every consumer decomposes a
+            # selector, with the message every side check in the package uses.
+            side in (:lower, :upper) ||
+                throw(ArgumentError("boundary side must be :lower or :upper"))
         end
         return [selector.sides]
     end

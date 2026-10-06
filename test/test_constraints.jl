@@ -1771,6 +1771,11 @@ end
     everything = boundary(:all; except=((axis=1,), (axis=2,)))
     @test_throws ArgumentError Unfitted._facets(everything, Val(2))
     @test_throws ArgumentError Unfitted._facets(boundary(:all; except=(axis=3,)), Val(2))
+    # A side symbol `boundary` would have refused can still arrive in a hand-built
+    # selector, and `_facets` — where every consumer decomposes a selector — refuses
+    # it with the message every side check uses, whichever consumer asks first.
+    bogus = Unfitted.BoundarySelector(:sides, [(1, :bogus)])
+    @test_throws "boundary side must be :lower or :upper" Unfitted._facets(bogus, Val(2))
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
     @test_throws ArgumentError prepare(poisson(V; source=0.0,
                                                dirichlet=[dirichlet(0.0; on=everything)]))
