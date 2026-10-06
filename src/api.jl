@@ -313,8 +313,8 @@ Create a physical Dirichlet condition.
 
 Nonzero `value` data are projected onto the boundary trace space
 before strong elimination so the constrained dof values reflect the
-correct trace. Homogeneous (constant-zero) data skip the projection
-entirely.
+correct trace. Homogeneous data — a zero scalar, or a component value
+whose every entry is zero — skip the projection entirely.
 
 On an immersed space, that projection is taken over `face ∩ Ω`: where `∂Ω`
 cuts the selected face, the mass matrix `∫ φᵢ φⱼ ds` and the right-hand

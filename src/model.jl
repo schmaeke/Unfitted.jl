@@ -234,7 +234,8 @@ Fields:
     `∫ φᵢ φⱼ ds` was positive definite, `:pseudoinverse` where `cholesky`
     reported it indefinite, and `:none` where the component had no constrained
     dof to solve for — which is also what a model prepared with homogeneous data
-    reads, constant-zero data skipping the projection at [`prepare`](@ref)
+    reads, constant-zero data (a zero number, or a per-component value whose
+    every entry is zero) skipping the projection at [`prepare`](@ref)
     altogether.
 
     `:pseudoinverse` is the entry worth reading: it is the only externally

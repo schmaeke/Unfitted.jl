@@ -1279,6 +1279,18 @@ end
     update_dirichlet!(quiet, [dirichlet(x -> 1 + x[1]; on=boundary(:all))])
     @test diagnostics(quiet).dirichlet_trace_factors == [:cholesky]
 
+    # A per-component zero is the same homogeneous condition as a scalar one, so it
+    # skips the projection too: no trace solve, and zero constrained values, until a
+    # nonzero increment establishes the verdicts for every component.
+    pair = field(:u, Vplain; components=2)
+    zero_pair = prepare(poisson(pair; source=SVector(1.0, 1.0),
+                                dirichlet=[dirichlet(SVector(0.0, 0.0); on=boundary(:all))]))
+    @test diagnostics(zero_pair).dirichlet_trace_factors == [:none, :none]
+    @test diagnostics(zero_pair).unsupported_dirichlet_dof_count == 0
+    @test all(iszero, only(zero_pair.dofs.fields).dofs.constrained_values)
+    update_dirichlet!(zero_pair, [dirichlet(x -> SVector(1 + x[1], x[2]); on=boundary(:all))])
+    @test diagnostics(zero_pair).dirichlet_trace_factors == [:cholesky, :cholesky]
+
     # Per component, because the trace solve is: a condition scoped to one channel
     # integrates only its own facets, so the other channel has no unknown to solve
     # for and reports `:none` beside the fallback. Here u₁ is pinned on the x₁ = 0
