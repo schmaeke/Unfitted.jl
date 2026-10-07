@@ -108,11 +108,11 @@ global 1D function index via the `_AXIS_BSPLINE` tag.
   - The material exemption, which appears once in each mechanism: an inactive
     cell that holds no material (every cell the fictitious fold switched off,
     and a user-masked cell lying entirely outside Ω) is admissible for the
-    selection rule, and a face whose inactive side holds none carries no trace
-    to vanish on and emits no constraint, while an inactive cell that holds
-    material (a user mask inside Ω) blocks in both. That one distinction is all
-    the family needs to carry an immersed [`PhysicalDomain`](@ref), so the
-    finite-cell workflow is open to it.
+    selection rule, and an internal face whose inactive cell holds none
+    carries no trace to vanish on and emits no constraint, while an inactive
+    cell that holds material (a user mask inside Ω) blocks in both. That one
+    distinction is all the family needs to carry an immersed
+    [`PhysicalDomain`](@ref), so the finite-cell workflow is open to it.
 
 The hot loops in `src/assembly.jl` and `src/projection.jl` are
 unchanged — they dispatch on `level.basis` (via the `bases` vector of

@@ -80,11 +80,20 @@ Both shipped families opt in — integrated Legendre in `src/dofs.jl`, B-splines
 in the extension.
 
 Nothing gates an immersed [`PhysicalDomain`](@ref) by family, so a family's
-overlay constraints owe it one exemption: a face whose inactive side holds no
-material (`_is_fictitious`, `src/coverage.jl`) has no trace to vanish on, and
-constraining it would over-constrain the adjacent cut cell's modes. It is a
-single test on the inactive neighbour of a face, and both shipped families make
-it.
+overlay constraints owe it one exemption, on internal faces: a face between an
+active and an inactive cell of the level's own grid, whose inactive cell holds
+no material (`_is_fictitious`, `src/coverage.jl`), has no trace to vanish on,
+and constraining it would over-constrain the adjacent cut cell's modes. It is a
+single test on the inactive neighbour of the face, and both shipped families
+make it (`_has_overlay_constraint` in `src/dofs.jl`; `_active_cell_at_face` in
+the extension, and `_cell_admissible` at `:maximal` continuity). A level's own
+box face follows the box-face rule instead: next to an active cell it is
+constrained unless that side of the level lies on the boundary of the space's
+domain (`_level_side_is_physical`), whatever lies beyond it. That holds for
+integrated Legendre and for B-splines below `:maximal` continuity; the
+`:maximal` B-spline support selection asks the material question past the box
+face too (`_cell_admissible`, case 3), and keeps a function whose support
+reaches beyond an artificial box face only into cells that hold no material.
 
 The integrated Legendre family (this file) and the B-spline extension are the
 two worked examples.
