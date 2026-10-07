@@ -105,13 +105,14 @@ global 1D function index via the `_AXIS_BSPLINE` tag.
     `_cascade!` — pivoting on the largest coefficient, dropping terms below a
     relative tolerance, back-substituting each new pivot into the earlier ones —
     which leaves every pivot a depth-one expansion over raws that stay free.
-  - The fictitious-fold exemption, which appears once in each mechanism: a
-    fold-deactivated cell is admissible for the selection rule, and a face whose
-    inactive side is fully fictitious carries no trace to vanish on and emits no
-    constraint, while a user-masked cell or face blocks in both. That one
-    distinction is all the family needs to take the `true` default of
-    `_supports_physical_domain` and carry an immersed [`PhysicalDomain`](@ref),
-    so the finite-cell workflow is open to it.
+  - The material exemption, which appears once in each mechanism: an inactive
+    cell that holds no material (every cell the fictitious fold switched off,
+    and a user-masked cell lying entirely outside Ω) is admissible for the
+    selection rule, and a face whose inactive side holds none carries no trace
+    to vanish on and emits no constraint, while an inactive cell that holds
+    material (a user mask inside Ω) blocks in both. That one distinction is all
+    the family needs to carry an immersed [`PhysicalDomain`](@ref), so the
+    finite-cell workflow is open to it.
 
 The hot loops in `src/assembly.jl` and `src/projection.jl` are
 unchanged — they dispatch on `level.basis` (via the `bases` vector of
@@ -124,10 +125,10 @@ using Unfitted
 # installs on an Unfitted function is written `Unfitted.f(...)` at its
 # definition, which needs no import. The list is therefore an honest measure of
 # how far the extension reaches into the package.
-using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, LevelMask, AxisDofKey,
-                TensorDofKey, EliminationLedger, _LevelContext, _eliminate!, _constrain!, _pivot!,
-                cell_indices, is_active, AxisBox, _check_basis_mode, _level_side_is_physical,
-                _tensor_dof_key, _Fold, _fictitious, _is_fictitious, _is_void, _void_table
+using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, AxisDofKey, TensorDofKey,
+                EliminationLedger, _LevelContext, _eliminate!, _constrain!, _pivot!, cell_indices,
+                is_active, AxisBox, _check_basis_mode, _level_side_is_physical, _tensor_dof_key,
+                _Fold, _fictitious, _is_fictitious, _is_void, _void_table
 using StaticArrays: SVector
 using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim
 
@@ -374,16 +375,6 @@ end
 # is stored rather than what it means.
 _selects_by_support(family::BSplineFamily) = family.continuity == _MAXIMAL_CONTINUITY
 
-# The per-axis smoothness the level actually carries across its artificial
-# boundary, with the `:maximal` sentinel resolved against the degree. Used by
-# the diagnostics-facing accessors and by the validation below; the constraint
-# generator reads `family.continuity` directly because it only runs when the
-# sentinel is absent.
-function _continuity_orders(family::BSplineFamily{D}) where {D}
-    return ntuple(d -> _selects_by_support(family) ? degree(family.spaces[d]) - 1 :
-                       family.continuity, D)
-end
-
 # ── Knot-vector construction ──────────────────────────────────────────────────
 
 # Build a clamped open uniform knot vector for one axis from the mesh's
@@ -438,13 +429,14 @@ end
 
 # `instantiate_basis` hook for the deferred `_BSplineSpec`. Invoked by
 # the core `space` / `overlay` / `moved_space` / mask-mutator paths once
-# the level's mesh, order, and mask are known. Validates the request and
+# the level's mesh and order are known. Validates the request and
 # materialises the concrete `BSplineFamily` from the mesh axes; the spec
 # itself only ever exists between `bspline(...)` and this call, so every
 # downstream method dispatches on the concrete family type.
 #
-# Arbitrary `LevelMask` geometries are accepted under either mechanism: the
-# support-selection rule is a per-function containment test and the
+# The mask is not an argument, because the family does not depend on it:
+# arbitrary `LevelMask` geometries are handled by either mechanism in the dof
+# layer — the support-selection rule is a per-function containment test and the
 # trace-vanishing constraints are assembled face by face, so neither needs the
 # mask to be separable.
 #
@@ -455,8 +447,7 @@ end
 # integer spelling through the cheaper mechanism costs the caller nothing and
 # saves the dof layer a pass.
 function Unfitted.instantiate_basis(spec::_BSplineSpec, mesh::CartesianMesh{D,T},
-                                    order::NTuple{D,Int}, mode::Symbol,
-                                    mask::Union{Nothing,LevelMask{D}}) where {D,T<:Real}
+                                    order::NTuple{D,Int}, mode::Symbol) where {D,T<:Real}
     _check_basis_mode(spec, mode, order)
     all(p -> p >= 1, order) ||
         throw(ArgumentError("bspline order (per-axis polynomial degree) must be ≥ 1"))
@@ -499,8 +490,7 @@ end
 # both cases, so the thinness / continuity validation already passed at
 # first construction and is not repeated.
 function Unfitted.instantiate_basis(family::BSplineFamily, mesh::CartesianMesh{D,T},
-                                    order::NTuple{D,Int}, mode::Symbol,
-                                    mask::Union{Nothing,LevelMask{D}}) where {D,T<:Real}
+                                    order::NTuple{D,Int}, mode::Symbol) where {D,T<:Real}
     _check_basis_mode(family, mode, order)
     return _materialize(_BSplineSpec(family.continuity), mesh, order)
 end

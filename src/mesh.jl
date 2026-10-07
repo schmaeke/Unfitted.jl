@@ -844,7 +844,7 @@ end
 # ── Basis-family hooks ────────────────────────────────────────────────────────
 
 """
-    instantiate_basis(basis, mesh, order, mode, mask) -> BasisFamily
+    instantiate_basis(basis, mesh, order, mode) -> BasisFamily
 
 Finalize a basis family for a concrete level, just before the
 [`Level`](@ref) is built. The default returns `basis` unchanged: most
@@ -868,28 +868,13 @@ copy of an existing one ([`moved_space`](@ref), [`adapt`](@ref), the mask
 mutators, the fictitious fold, level-id reindexing) — so a mesh-dependent
 family is rebuilt whenever the mesh changes (e.g. an overlay move) and is
 validated against the level's `order` and `mode` at construction time.
-`mask` is the normalised [`LevelMask`](@ref) (`nothing` for an all-active
-level); it is passed so a family whose concrete form depends on where the
-active region ends can use it, and the shipped B-spline family — which
-handles arbitrary mask geometry through linear constraints instead —
-accepts every mask.
+The level's activation mask is not an argument: a mask face selects or
+constrains functions in the dof layer rather than changing the family, which is
+how the shipped B-spline family handles every mask geometry.
 """
 function instantiate_basis(basis::BasisFamily, mesh::CartesianMesh{D,T}, order::NTuple{D,Int},
-                           mode::Symbol, mask) where {D,T}
+                           mode::Symbol) where {D,T}
     basis
-end
-
-# Reject a `PhysicalDomain` on a basis family that cannot integrate it yet.
-# The trait it consults, `_supports_physical_domain`, is declared with the rest
-# of the family interface in `basis.jl`; this is the space-construction guard.
-# Called from every space-building entry point once the concrete family exists.
-function _check_physical_basis(family::BasisFamily, physical)
-    physical === nothing ||
-        _supports_physical_domain(family) ||
-        throw(ArgumentError("the $(basis_name(family)) basis family does not yet support an immersed physical " *
-                            "domain (finite-cell method): its overlay constraints would over-constrain cut-cell " *
-                            "modes on fold faces. Use the default integrated-Legendre basis for FCM problems."))
-    return nothing
 end
 
 # ── Space construction ────────────────────────────────────────────────────────
@@ -906,9 +891,8 @@ end
 # is not a family yet and `_supports_cell_order` has to be asked of the concrete
 # one.
 function _new_level(id::Int, role::Symbol, mesh::CartesianMesh{D,T}, basis, field, mode::Symbol,
-                    mask, physical) where {D,T}
-    family = instantiate_basis(basis, mesh, _nominal_order(field), mode, mask)
-    _check_physical_basis(family, physical)
+                    mask) where {D,T}
+    family = instantiate_basis(basis, mesh, _nominal_order(field), mode)
     orders = _build_cell_orders(family, field, mesh, mode)
     return Level{D,T,typeof(family)}(id, role, mesh, family, orders, mode, mask)
 end
@@ -919,16 +903,17 @@ end
 #
 # The family is re-instantiated unconditionally. That is behaviour-preserving
 # rather than merely convenient: `instantiate_basis` consumes the mesh, the
-# nominal order, the mode and the mask, the first two of which are the only ones
-# a family's concrete form can depend on here — integrated Legendre returns
-# itself, and the B-spline hook rebuilds knot vectors from the mesh axes and the
-# degree, with "a mask changes nothing about the knot vectors" stated in the
-# extension. Before this helper the sites disagreed about it — `moved_space` and
-# the mask rebuilds re-instantiated while the fold and the reindex did not — and
-# the disagreement was invisible because the answers coincide.
+# nominal order and the mode, the first two of which are the only ones a
+# family's concrete form can depend on — integrated Legendre returns itself, and
+# the B-spline hook rebuilds knot vectors from the mesh axes and the degree — so
+# a rebuild that keeps the mesh and the order, such as a mask update,
+# re-instantiates the identical family. Before this helper the sites disagreed
+# about it — `moved_space` and the mask rebuilds re-instantiated while the fold
+# and the reindex did not — and the disagreement was invisible because the
+# answers coincide.
 function _level(old::Level{D,T}; id=old.id, mesh=old.mesh, orders=old.orders,
                 mask=old.mask) where {D,T}
-    family = instantiate_basis(old.basis, mesh, orders.nominal, old.mode, mask)
+    family = instantiate_basis(old.basis, mesh, orders.nominal, old.mode)
     return Level{D,T,typeof(family)}(id, old.role, mesh, family, orders, old.mode, mask)
 end
 
@@ -992,10 +977,8 @@ Keyword arguments:
     artificial overlay boundary; see [`LevelMask`](@ref).
   - `physical` — optional [`PhysicalDomain`](@ref) describing an
     immersed `Ω ⊂ domain`. With `nothing` (default) the bounding box is
-    the physical domain. Not every basis family can integrate one: the
-    call raises `ArgumentError` for a family that declares
-    `_supports_physical_domain` false. Both shipped families declare it
-    true.
+    the physical domain. Both shipped basis families support an immersed
+    domain.
 
 # Leaf semantics
 
@@ -1050,7 +1033,7 @@ function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(),
                mode::Symbol=:tensor, active=nothing, physical=nothing) where {D,T}
     base_mesh = CartesianMesh(domain; cells)
     base_level = _new_level(1, :base, base_mesh, basis, _normalize_order(order, base_mesh), mode,
-                            _normalize_mask(active, base_mesh), physical)
+                            _normalize_mask(active, base_mesh))
     return Space{D,T,Tuple{typeof(base_level)}}(domain, (base_level,), physical)
 end
 
@@ -1099,7 +1082,7 @@ function overlay(V::Space{D,T}, domain::AxisBox{D,T}; cells, order=nominal_order
     overlay_mesh = CartesianMesh(domain; cells)
     level = _new_level(length(V.levels) + 1, :overlay, overlay_mesh, basis,
                        _normalize_order(order, overlay_mesh), mode,
-                       _normalize_mask(active, overlay_mesh), V.physical)
+                       _normalize_mask(active, overlay_mesh))
     return _with_levels(V, (V.levels..., level))
 end
 
@@ -1425,8 +1408,7 @@ function _reordered_space(V::Space, level_index::Integer, spec)
     old = V.levels[k]
     field = _normalize_order(_normalize_elevate_spec(V, k, spec), old.mesh)
     return _with_level(V, k,
-                       _new_level(old.id, old.role, old.mesh, old.basis, field, old.mode, old.mask,
-                                  V.physical))
+                       _new_level(old.id, old.role, old.mesh, old.basis, field, old.mode, old.mask))
 end
 
 """
@@ -1611,11 +1593,6 @@ function _apply_physical_fold(V::Space{D,T}, cache::_ClassifyCache{D,T}) where {
     end
     return _with_levels(V, new_levels)
 end
-
-# Convenience overload: allocate a one-shot classification cache, fold
-# once, discard. Used by `space(...)` and the activation mutators when
-# nobody is going to reuse the cache.
-_apply_physical_fold(V::Space{D,T}) where {D,T} = _apply_physical_fold(V, _ClassifyCache{D,T}())
 
 # ── Level-id reindexing ───────────────────────────────────────────────────────
 
