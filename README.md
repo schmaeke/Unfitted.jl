@@ -88,10 +88,11 @@ The method is described in
   when every cell it touches is covered, so an edge or face mode
   straddling the boundary of the covered region survives — and a buried
   linear mode that a *nested* finer level reproduces exactly is
-  deduplicated. Coverage is mask-aware — a user-deactivated overlay cell
-  does not cover, so a fully deactivated overlay still behaves like no
-  overlay — while a cell folded away as fictitious does cover, because
-  it carries no material. Shedding high-order modes is
+  deduplicated. Coverage is mask-aware — a deactivated overlay cell that
+  carries material does not cover, so a fully deactivated overlay still
+  behaves like no overlay — while one that carries none does cover: every
+  cell folded away as fictitious, and a user-deactivated cell lying
+  entirely outside Ω. Shedding high-order modes is
   integrated-Legendre only; the deduplication also runs on a B-spline
   level, where it is what keeps a nested stack non-singular rather than
   an accuracy trade — the duplicate it removes is reproduced exactly by

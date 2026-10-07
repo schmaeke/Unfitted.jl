@@ -217,13 +217,15 @@ as artificial overlay constraints (analogous to faces between the level
 and its physical-domain complement). Span-mode dofs whose support is
 entirely inside inactive cells are not enumerated.
 
-One exception, and it is a physical one: when the inactive side of such a
-face is inactive only because the finite-cell fold found it *fully
-fictitious*, the face carries no physical material and the modes on it stay
-active — they vanish on every physical face anyway and instead carry the
-adjacent cut cell's approximation up to `∂Ω`. A cell the *user* masked out
-is treated as physical and does constrain. See `_has_overlay_constraint`
-in `src/dofs.jl`.
+One exception, and it is a physical one: when the inactive cell across such
+a face holds no material — the classifier finds its box *fully fictitious*,
+entirely outside `Ω` — the face carries no physical material and the modes
+on it stay active: they vanish on every physical face anyway and instead
+carry the adjacent cut cell's approximation up to `∂Ω`. Every cell the
+finite-cell fold switched off is such a cell. A cell the *user* masked out
+constrains when it holds material, which is the case unless it lies entirely
+outside `Ω` (always, without a [`PhysicalDomain`](@ref)). See
+`_has_overlay_constraint` in `src/dofs.jl`.
 """
 struct LevelMask{D}
     on::BitArray{D}

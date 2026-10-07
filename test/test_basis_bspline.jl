@@ -1126,11 +1126,11 @@ end
 
 # The span half of the dedup as two family traits once answered it, written out here so
 # the one trait that replaced them is checked against their definitions: above an
-# integrated-Legendre level the cover's `_spans_hats` (`true` for integrated Legendre in
-# either mode, every axis of degree 1 for a B-spline, `false` otherwise); above a
-# B-spline level of degree `p` the extension's `_reproduces(k, p)` (the same degree for
-# a B-spline cover, `:tensor` with every palette entry ≥ `p` for an integrated-Legendre
-# one, `false` otherwise).
+# integrated-Legendre level whether the cover spans the level's hats (`true` for
+# integrated Legendre in either mode, every axis of degree 1 for a B-spline, `false`
+# otherwise); above a B-spline level of degree `p` the extension's `_reproduces(k, p)`
+# (the same degree for a B-spline cover, `:tensor` with every palette entry ≥ `p` for an
+# integrated-Legendre one, `false` otherwise).
 function _span_contains_by_definition(k, level)
     if level.basis isa Unfitted.IntegratedLegendre
         k.basis isa BSExt.BSplineFamily && return all(d -> degree(k.basis.spaces[d]) == 1, 1:2)

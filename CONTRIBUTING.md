@@ -397,8 +397,10 @@ per-mode, not per-cell: a mode is shed only when *every* cell it is
 incident to is covered, so an edge or face mode straddling the boundary
 of the covered region survives even though its own cell is covered. A
 buried linear mode that a *nested* finer level reproduces exactly is
-deduplicated. Coverage is mask-aware — a user-masked cell blocks
-coverage, a fictitious fold does not.
+deduplicated. Coverage is mask-aware — an inactive cell blocks coverage
+when it holds material (a user-masked cell reaching into Ω), and one that
+holds none (every folded cell, and a user-masked cell lying entirely
+outside Ω) does not.
 
 Covered-mode pruning is a basis-family-specific feature, run by one
 generic driver, `_coverage_constraints!` in `src/dofs.jl`, through which a
@@ -695,10 +697,12 @@ features evolve.
   - **Dof layer treatment**: a face between an active and an inactive
     cell of the same level is an artificial overlay constraint, analogous
     to a mesh-box-face constraint — unless every inactive cell across it
-    was folded away as fictitious rather than masked by the user, in
-    which case the modes stay free (`_has_overlay_constraint`). A
-    fictitious fold covers; a user mask does not. Span-mode dofs of
-    inactive cells are not enumerated.
+    holds no material (folded away as fictitious, or user-masked but
+    lying entirely outside Ω), in which case the modes stay free
+    (`_has_overlay_constraint`). Coverage asks the same question: an
+    inactive cell that holds no material covers; one that holds material
+    (a user mask reaching into Ω) does not. Span-mode dofs of inactive
+    cells are not enumerated.
 
 All masking lives at cell granularity; sub-cell activation is out of
 scope and would require a different abstraction.
@@ -1440,9 +1444,10 @@ demos.
     side has no active cover is unexercised.
   - Covered-mode pruning: covered high-order modes eliminated and buried
     linear modes deduplicated only under a nested finer level;
-    `reduced_mode_counts` matches the eliminated set. No test in
-    `test_coverage_reduction.jl` builds a masked overlay; the fully
-    deactivated case is pinned indirectly by test_activation.jl's
+    `reduced_mode_counts` matches the eliminated set. The masked overlays
+    `test_coverage_reduction.jl` builds check the material oracle and the
+    coverage memo against a direct recomputation, not a pruned space; the
+    fully deactivated case is pinned indirectly by test_activation.jl's
     "fully-deactivated overlay equals no overlay", which compares
     active-unknown counts against an overlay-free space; masked coverage
     under a ladder — split cover retained, single cover shed, lossless by
