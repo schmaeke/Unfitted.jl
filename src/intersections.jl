@@ -408,7 +408,7 @@ function _intervals_from_coordinates(coords::Vector{T}, tol::GeometryTolerance{T
 end
 
 # The cells one level may parent in a partition — its slot of `_partition`'s `cells` tuple: every cell of the level
-# (`_AllCells`: the volume plan, the transfer and the surface grid lines), the cells with a face on a boundary facet
+# (`_AllCells`: the volume plan, the transfer and the immersed simplices), the cells with a face on a boundary facet
 # (`_side_cells` in `dirichlet.jl`), or none at all (an empty range: a level whose mesh does not reach that facet).
 # `_AllCells` is a singleton so that the membership tests below fold to `true` at compile time wherever every cell is
 # eligible.
@@ -468,7 +468,7 @@ end
 # Per-axis merged element-boundary coordinates: gather each axis's live element-boundary coordinates from every level
 # (`_live_axis_coordinates`, over that level's slot of `cells`) and canonicalise them with `merge_coordinates`, so two
 # meshes' nearly-coincident boundaries collapse to a single shared coordinate. Shared by the partition engine
-# (`_partition`) and the surface grid lines (`_grid_lines_for_levels` in surface.jl).
+# (`_partition`) and the lines immersed simplices are split at (`_simplex_regions` in surface.jl).
 function _merged_axis_coordinates(levels, ::Val{D}, tol::GeometryTolerance{T},
                                   cells=map(_ -> _AllCells(), levels)) where {D,T}
     per_level = map((level, eligible) -> _live_axis_coordinates(level, Val(D), eligible), levels, cells)
@@ -654,8 +654,15 @@ end
 #
 # A `for` loop that pushes, not a `map` over the levels: a `map` yields a tuple of `Union{Nothing,Parent}` that is
 # boxed per level, which once made a 3D overlay plan 1.8× slower to build.
+#
+# `_parents!` appends to an existing list instead: a two-sided interface sub-cell decodes both sides' signatures into
+# one parent list, side `a` first (`_simplex_regions` in `surface.jl`).
 function _parents(levels::Tuple, sig::Tuple, lower::SVector{D,T}, upper::SVector{D,T}) where {D,T}
-    parents = Parent{D,T}[]
+    return _parents!(Parent{D,T}[], levels, sig, lower, upper)
+end
+
+function _parents!(parents::Vector{Parent{D,T}}, levels::Tuple, sig::Tuple, lower::SVector{D,T},
+                   upper::SVector{D,T}) where {D,T}
     for (level, index) in zip(levels, sig)
         index == 0 && continue
         push!(parents, Parent(level, CartesianIndices(level.mesh.cells)[index], lower, upper))

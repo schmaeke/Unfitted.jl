@@ -400,9 +400,9 @@ end
 #
 # Sizing a quadrature rule from it is always SAFE, because it bounds every cell of the level from above and
 # over-integrating costs points rather than accuracy. Safe is not the same as right, though, and the consumers have
-# since split on that: `_axis_max` (tensor counts and moment orders, volume and facet) and `_subdivision_counts` each
-# size from the parent CELL's own order, so one loud cell no longer sets the rule for the level;
-# `_surface_quadrature_order` still sizes from the level, where the region is not owned by a single parent cell.
+# since split on that: `_axis_max` (tensor counts and moment orders, volume, facet and immersed simplex) and
+# `_subdivision_counts` each size from the parent CELL's own order, so one loud cell no longer sets the rule for the
+# level.
 _nominal_order(o::NTuple{D,Int}) where {D} = o
 
 function _nominal_order(entries::Vector{NTuple{D,Int}}) where {D}

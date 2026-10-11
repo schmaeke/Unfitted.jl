@@ -1,22 +1,24 @@
-# User-supplied immersed surface meshes and the surface-region machinery that integrates against them. The user owns the
-# geometry: they hand us a list of simplices (points / segments / triangles) and we map each cell's reference quadrature
-# onto its physical extent, locate covering parent cells on every level, and emit a `SimplexRegion` per cell. The
-# strict parent-uniqueness contract (every region's parent set is constant within the cell) is enforced by an automatic
-# subdivision pass against the cartesian level grids, so users never need to align their mesh with the discretization.
+# User-supplied immersed surface meshes and the simplex-region machinery that integrates against them. The user owns
+# the geometry: they hand us a list of simplices (points / segments / triangles) and we split each one at the cartesian
+# level grids, locate the covering parent cells of every piece on every level, and map a unit-simplex rule onto it,
+# emitting one `SimplexRegion` per piece. The strict parent-uniqueness contract (every region's parent set is constant
+# within the cell) is enforced by that automatic subdivision, so users never need to align their mesh with the
+# discretization.
 #
 # What this file owns:
 #
 #   * `BoundaryMesh{D,T,K}` — the user-facing typed payload.
 #   * `segment_mesh`, `polyline_mesh`, `triangle_mesh`, `points_mesh` — helper constructors that accept the common input
 #     shapes (vertex lists, face index tables, point clouds).
-#   * Per-K simplex geometry: cell measure, default normal, reference-to-physical maps, and reference quadrature rules.
+#   * Simplex geometry, one affine map `x = v₁ + E·λ` for every simplex dimension `K`: the measure, the default normal
+#     and the unit-simplex quadrature rules.
 #   * Automatic subdivision of user cells against every level's grid (segments via per-axis parameter crossings,
 #     triangles via Sutherland–Hodgman half-space clipping + fan triangulation).
 #   * `SimplexRegion{D,T}` — one per sub-cell: the region record of `intersections.jl` in the sub-cell's bounding-box
-#     frame, carrying the mapped Gauss rule, the sub-cell's normal and the constant covering-parent list (the two-sided
-#     interface regions of `coupling.jl` are the same record).
-#   * `_surface_regions_for_mesh` — the construction-time builder that ties subdivision + quadrature + parent
-#     classification together.
+#     frame, carrying the mapped rule, the sub-cell's normal and the constant covering-parent list.
+#   * `_simplex_regions` — the one builder that ties subdivision + quadrature + parent classification together, for an
+#     immersed surface (`_surface_regions_for_mesh`, one-sided) and for the two-sided regions of a coupling interface
+#     (`_interface_regions` in `coupling.jl`) alike.
 #
 # What lives elsewhere:
 #
@@ -156,164 +158,96 @@ function points_mesh(points::AbstractVector{SVector{D,T}}; normals::AbstractVect
     return BoundaryMesh{D,T,0}(cells, collect(normals))
 end
 
-# ── Per-K simplex geometry ───────────────────────────────────────────────────
+# ── Simplex geometry ──────────────────────────────────────────────────────────
 #
-# For each simplex dimension K, the package owns four pieces:
+# A K-simplex with vertices v₁ … v_{K+1} in ℝᴰ is the image of the unit simplex Δᴷ = {λ ∈ ℝᴷ : λ ≥ 0, Σ λ ≤ 1} under
+# one affine map,
 #
-#   * `_simplex_measure(cell)` — physical volume of the cell (1 for K=0, length for K=1, area for K=2). The Jacobian
-#     baked into each Q-point weight is uniformly `measure / _reference_area(Val(K))`, and the reference areas differ
-#     per K: 1 for the K=0 point, 2 for the K=1 segment on `[−1, 1]`, and 1/2 for the K=2 standard 2-simplex. So the K=2
-#     Jacobian is `2 · area`, not a power of 1/2.
-#   * `_default_normal(cell)` — the geometric outward unit normal derived from cell geometry. Only defined for K=1 in 2D
-#     and K=2 in 3D — the cases where a unique normal exists; K=0 requires the user to supply one.
-#   * `_simplex_reference_quadrature(n)` — `(eta, weight)` pairs in the cell's reference frame, for an `n`-point Gauss
-#     rule per reference axis. `n` comes from the recommended quadrature order of the cell's own covering parents, so
-#     the argument is the scalar point count rather than a per-axis tuple: a simplex has no axes of the embedding to
-#     keep apart.
-#   * `_reference_to_physical_simplex(cell, eta)` — the affine map from the reference cell to the physical cell at a
-#     reference point `eta`.
+#     x = v₁ + E·λ,    E = [v₂ − v₁  ⋯  v_{K+1} − v₁]   (D × K, the edge matrix),
+#
+# so a single set of formulas serves points, segments and triangles in every `D`. The map's Jacobian is the K-volume of
+# the parallelotope the edges span, the norm of the wedge `e₁ ∧ ⋯ ∧ e_K`: 1 for a point, `‖e₁‖` for a segment, and for a
+# triangle `√Σ_{i<j} (e₁ᵢ e₂ⱼ − e₁ⱼ e₂ᵢ)²`, the root of a sum of squared 2 × 2 minors — `|det E|` in 2D, the norm of the
+# cross product in 3D. It never forms the Gram determinant `‖e₁‖²‖e₂‖² − (e₁·e₂)²`, whose cancellation would cost a
+# thin triangle its digits. `Δᴷ` has measure `1/K!`, so the simplex's measure is the Jacobian over `K!`, and a
+# unit-simplex rule (`_simplex_rule`) becomes the cell's rule by scaling its weights with the Jacobian.
 
-# K = 0: point cell. The single "Q-point" is the point itself with weight 1. No reference frame.
-_simplex_measure(cell::NTuple{1,SVector{D,T}}) where {D,T} = one(T)
-
-# K = 1: segment cell. Length is the Euclidean norm of the edge vector. Reference frame is `[−1, 1]`, so the Jacobian is
-# `length / 2`.
-_simplex_measure(cell::NTuple{2,SVector{D,T}}) where {D,T} = norm(cell[2] - cell[1])
-
-# K = 2: triangle cell. Area via the cross-product norm of two edges (in 2D the cross is a scalar; in 3D it is a
-# vector). Reference frame is the standard 2-simplex with vertices `(0,0)`, `(1,0)`, `(0,1)` and area 1/2, so the
-# Jacobian is `area / (1/2) = 2 area` for our Gauss rule below — see `_simplex_reference_quadrature`.
-function _simplex_measure(cell::NTuple{3,SVector{2,T}}) where {T}
-    e1 = cell[2] - cell[1]
-    e2 = cell[3] - cell[1]
-    # 2D cross = scalar; area = |e1 × e2| / 2.
-    return abs(e1[1] * e2[2] - e1[2] * e2[1]) / 2
+# The edge matrix `E` of a simplex; `D × 0` for a point, whose map is the constant `v₁`.
+function _edge_matrix(cell::NTuple{KP,SVector{D,T}}) where {KP,D,T}
+    return SMatrix{D,KP - 1,T}(ntuple(i -> cell[(i-1)÷D+2][(i-1)%D+1] - cell[1][(i-1)%D+1], Val(D * (KP - 1))))
 end
 
-_simplex_measure(cell::NTuple{3,SVector{3,T}}) where {T} = norm(cross(cell[2] - cell[1], cell[3] - cell[1])) / 2
-
-# Geometric default normal. Throws for K=0 (no normal exists from geometry alone).
-function _default_normal(cell::NTuple{1,SVector{D,T}}) where {D,T}
-    throw(ArgumentError("a K=0 point cell has no geometric normal — supply normals explicitly"))
+# The Jacobian `‖e₁ ∧ ⋯ ∧ e_K‖` of a simplex's map from `Δᴷ` (see above). On a 2D triangle the single minor's
+# `√(x²)` is `|x|` exactly.
+function _simplex_jacobian(cell::NTuple{KP,SVector{D,T}}) where {KP,D,T}
+    E = _edge_matrix(cell)
+    KP == 1 && return one(T)
+    KP == 2 && return norm(E[:, 1])
+    squares = zero(T)
+    for j in 2:D, i in 1:(j-1)
+        squares += abs2(E[i, 1] * E[j, 2] - E[j, 1] * E[i, 2])
+    end
+    return sqrt(squares)
 end
 
-# K=1 in 2D: outward normal is 90° clockwise from the cell direction `cell[2] − cell[1]`, normalised. The clockwise
-# convention treats the polyline as the oriented boundary of a region to its left.
+# The K-dimensional measure of a simplex: 1 for a point, the length of a segment, the area of a triangle. Read by the
+# MeshIO extension under this name.
+_simplex_measure(cell::NTuple{KP}) where {KP} = _simplex_jacobian(cell) / factorial(KP - 1)
+
+# The geometric unit normal of a codim-1 simplex, from its vertex order: a 2D segment's direction `v₂ − v₁` turned 90°
+# clockwise (the polyline is the oriented boundary of the region to its left), a 3D triangle's right-hand cross product.
+# No other simplex has one to derive — a point carries no direction, a segment in 3D has a circle of normals, a
+# codim-0 simplex fills its embedding — so the user supplies its normals.
 function _default_normal(cell::NTuple{2,SVector{2,T}}) where {T}
     e = cell[2] - cell[1]
     return normalize(SVector{2,T}(e[2], -e[1]))
 end
 
-# K=1 in 3D: a segment in 3D has no canonical normal (the cross product needs two non-collinear vectors). Require the
-# user to supply one.
-function _default_normal(cell::NTuple{2,SVector{3,T}}) where {T}
-    throw(ArgumentError("a K=1 segment in 3D has no canonical normal — supply normals explicitly"))
-end
-
-# K=2 in 3D: unit cross product of two edges (right-hand rule on the vertex ordering).
 _default_normal(cell::NTuple{3,SVector{3,T}}) where {T} = normalize(cross(cell[2] - cell[1], cell[3] - cell[1]))
 
-# K=2 in 2D: degenerate (a triangle filling a 2D region carries the whole plane in its tangent space). Throws — the user
-# should not be passing a K=2 mesh in 2D in the first place.
-function _default_normal(cell::NTuple{3,SVector{2,T}}) where {T}
-    throw(ArgumentError("a K=2 triangle in 2D fills its embedding — supply normals explicitly"))
+function _default_normal(::NTuple{KP,SVector{D}}) where {KP,D}
+    throw(ArgumentError("a $(KP - 1)-simplex in $(D)D has no geometric normal — supply normals explicitly"))
 end
 
-# Reference quadrature rules per K. Each returns `Vector{Tuple{eta, w_reference}}` where `eta` is the reference
-# coordinate inside the simplex and `w_reference` the reference-frame weight. The physical weight is
-# `w_reference × measure / reference_area`.
+# Midpoint (vertex average) of a simplex: the point a sub-cell is located by. Read by the MeshIO extension under this
+# name.
+_cell_midpoint(cell::NTuple{KP,SVector{D,T}}) where {KP,D,T} = sum(cell) / KP
 
-# K=0: one sample, weight 1 (identity).
-_simplex_reference_quadrature(::Val{0}, ::Int, ::Type{T}) where {T} = [(zero(T), one(T))]
+# A sub-cell's bounding box: the frame of its region. An axis along which the simplex is flat is degenerate in it.
+_simplex_frame(cell) = (reduce((a, b) -> min.(a, b), cell), reduce((a, b) -> max.(a, b), cell))
 
-# K=1: 1D Gauss-Legendre on [−1, 1] with `n` points, `n` being the largest per-axis `recommended_quadrature_order` over
-# the cell's covering parents.
-function _simplex_reference_quadrature(::Val{1}, n::Int, ::Type{T}) where {T}
-    points, weights = gausslegendre(n)
-    return [(T(p), T(w)) for (p, w) in zip(points, weights)]
-end
-
-# K=2: Duffy-mapped tensor Gauss on the standard 2-simplex `{(u, v) : u, v ≥ 0, u + v ≤ 1}`. Uses an `n × n` tensor
-# Gauss rule on `[0, 1]²`, mapped via `u = ξ`, `v = η(1 − ξ)` with Jacobian `(1 − ξ)`. Each Duffy axis carries an
-# `n`-point Gauss rule, exact to degree `2n − 1`, but the Jacobian raises the ξ-degree of a triangle polynomial by one:
-# a total-degree-`p` integrand maps to degree `p + 1` in ξ. The rule is therefore exact over the triangle up to total
-# degree `2n − 2`, one less than the per-axis figure.
-function _simplex_reference_quadrature(::Val{2}, n::Int, ::Type{T}) where {T}
-    pts1d, wts1d = gausslegendre(n)
-    # Shift to [0, 1].
-    pts01 = [T((p + 1) / 2) for p in pts1d]
-    wts01 = [T(w / 2) for w in wts1d]
-    samples = Tuple{NTuple{2,T},T}[]
-    for i in 1:n, j in 1:n
-        xi = pts01[i]
-        eta = pts01[j]
-        u = xi
-        v = eta * (one(T) - xi)
-        jacobian = one(T) - xi
-        push!(samples, ((u, v), wts01[i] * wts01[j] * jacobian))
-    end
-    return samples
-end
-
-# Reference-area normalisers: the reference cell's volume. The Jacobian baked into each physical Q-point's weight is
-# `measure / reference_area`, so the reference quadrature weights sum to the physical measure when multiplied by
-# `measure / reference_area`.
-_reference_area(::Val{0}) = 1
-_reference_area(::Val{1}) = 2          # length of [-1, 1]
-_reference_area(::Val{2}) = 1 // 2     # area of the standard 2-simplex
-
-# Affine maps from the reference cell to a physical cell. K=0 collapses to the vertex; K=1 linearly interpolates between
-# the two endpoints; K=2 is a standard barycentric interpolation.
-_reference_to_physical_simplex(cell::NTuple{1,SVector{D,T}}, eta) where {D,T} = cell[1]
-
-function _reference_to_physical_simplex(cell::NTuple{2,SVector{D,T}}, eta::T) where {D,T}
-    return cell[1] + ((eta + one(T)) / 2) * (cell[2] - cell[1])
-end
-
-function _reference_to_physical_simplex(cell::NTuple{3,SVector{D,T}}, eta::NTuple{2,T}) where {D,T}
-    u, v = eta
-    lambda0 = one(T) - u - v
-    return lambda0 * cell[1] + u * cell[2] + v * cell[3]
+# An `m`-points-per-axis rule on the unit simplex `Δᴷ` as `(λ points, weights)`, from the tensor Gauss rule on
+# `[−1, 1]ᴷ` (`_tensor_gauss_rule`) moved to `[0, 1]ᴷ`, `s = (η + 1) / 2` with weight `w / 2ᴷ`:
+#
+#   - K = 0: the single point, weight 1;
+#   - K = 1: `s` itself, the m-point Gauss rule on [0, 1], exact to degree 2m − 1;
+#   - K = 2: the Duffy collapse `λ = (s₂, s₁(1 − s₂))` with weight `w (1 − s₂) / 4`, exact to total degree 2m − 2: a
+#     polynomial of total degree q on the triangle pulls back to degree ≤ q in s₁ and ≤ q + 1 in s₂ (the collapse's
+#     Jacobian `1 − s₂`), and m points per axis integrate degree 2m − 1.
+#
+# Built once per point count by each builder call (`_simplex_regions`), never on the hot path.
+function _simplex_rule(::Val{K}, m::Int, ::Type{T}) where {K,T}
+    K == 0 && return [zero(SVector{0,T})], [one(T)]
+    rule = _tensor_gauss_rule(ntuple(_ -> m, Val(K)), T)
+    s = [(η .+ 1) ./ 2 for η in rule.points]
+    K == 1 && return s, rule.weights ./ 2
+    return [SVector(t[2], t[1] * (1 - t[2])) for t in s], [w * (1 - t[2]) / 4 for (t, w) in zip(s, rule.weights)]
 end
 
 # ── Subdivision against level grids ──────────────────────────────────────────
 #
-# The strict parent-uniqueness contract on `BoundaryMesh` requires every cell to lie inside exactly one parent cell per
-# level — i.e., not straddle any grid line. Rather than ask users to pre-split their mesh, the package subdivides every
-# input cell against the union of all level grids before building surface regions.
+# A region's parent set must be constant over it, so every simplex is split at the grid lines of every level it is
+# integrated against before any region is built; a user mesh need not be aligned with the discretization. The lines are
+# per axis, merged across the levels (`_merged_axis_coordinates`), so a piece that respects them lies in one cell of
+# every level at once. Per simplex dimension:
 #
-# Per simplex dimension:
-#
-#   * `K = 0` (points)          — trivial, no subdivision needed.
-#   * `K = 1` (segments)        — per-axis parameter-value crossings,
-#                                 sorted, then cut at each one exactly.
-#                                 The sub-segments partition the input:
-#                                 an endpoint may land on a grid line,
-#                                 and the sub-segment's *interior* —
-#                                 which is what the midpoint
-#                                 classification sees — lies in one
-#                                 cell. Works in any `D`.
-#   * `K = 2` (triangles in 3D) — Sutherland–Hodgman clipping against
-#                                 the six axis-aligned half-spaces of
-#                                 every cell the triangle overlaps,
-#                                 followed by fan triangulation of the
-#                                 resulting convex polygon.
-#
-# Every other `(D, K)` combination passes through unchanged — the reachable one is `K = 2` in `D = 2`, a codim-0
-# integration that is out of scope for boundary integration. `K = 1` is *not* among them: a segment mesh is subdivided
-# at every `D`, the codim-0 `D = 1` case included.
-
-# Per-axis sorted unique grid coordinates across an arbitrary level collection. A cell that respects this union
-# automatically respects every individual level grid, so the contract holds simultaneously. The two-space interface
-# builder feeds the *concatenation* of both subdomains' levels here so a segment/triangle is split at the merged trace
-# of both grids (each sub-cell then lies inside one cut cell of each subdomain — the non-matching segment-merge of the
-# references).
-function _grid_lines_for_levels(levels, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
-    return _merged_axis_coordinates(levels, Val(D), tol)
-end
-
-# Per-axis sorted unique grid coordinates across every level of `V`.
-_level_grid_lines(V::Space{D,T}, tol::GeometryTolerance{T}) where {D,T} = _grid_lines_for_levels(V.levels, Val(D), tol)
+#   * `K = 0` (points)      — nothing to split.
+#   * `K = 1` (segments)    — per-axis parameter-value crossings, sorted, then cut at each one exactly. The sub-segments
+#                             partition the input: an endpoint may land on a grid line, and the sub-segment's *interior*
+#                             — which is what the midpoint classification sees — lies in one cell. Works in any `D`.
+#   * `K = 2` (triangles)   — in 3D, Sutherland–Hodgman clipping against the six axis-aligned half-spaces of every cell
+#                             the triangle overlaps, followed by fan triangulation of the resulting convex polygon. A 2D
+#                             triangle (a codim-0 simplex) is passed through unsplit.
 
 """
     _subdivide_segment(p1, p2, grid_lines, nudge)
@@ -351,9 +285,9 @@ function _subdivide_segment(p1::SVector{D,T}, p2::SVector{D,T}, grid_lines::NTup
     # sorted every later root is too (`break`) — the closing `push!` then terminates the chain on the exact `p2`.
     #
     # A cut point may therefore land exactly on a grid line, where `locate_cell` cannot say which side owns it. That is
-    # deliberate and matches the K=2 clipping path: parent-uniqueness is a statement about a sub-segment's *interior*,
-    # which lies strictly inside one cell precisely because every crossing became a cut. The region builder classifies
-    # by the midpoint (see `_surface_cell_parents`), so the ambiguity at the shared endpoint is never consulted.
+    # deliberate and matches the triangle path: parent-uniqueness is a statement about a sub-segment's *interior*, which
+    # lies strictly inside one cell precisely because every crossing became a cut. The region builder classifies by the
+    # midpoint (see `_simplex_regions`), so the ambiguity at the shared endpoint is never consulted.
     segments = NTuple{2,SVector{D,T}}[]
     a = p1
     t_prev = zero(T)
@@ -474,67 +408,34 @@ function _subdivide_triangle(v1::SVector{3,T}, v2::SVector{3,T}, v3::SVector{3,T
     return sub_triangles
 end
 
-"""
-    _subdivide_mesh(mesh::BoundaryMesh, V::Space, tolerance) -> BoundaryMesh
-    _subdivide_mesh(mesh::BoundaryMesh, grid_lines::NTuple{D,Vector{T}}, tolerance) -> BoundaryMesh
+# One input cell's pieces, each inside a single cell of every level the `lines` come from, appended to `cells` (see
+# above). The tolerances are the subdividers' own: `_subdivide_segment` reads a dimensionless crossing parameter.
+_split_cell!(cells, cell::NTuple{1}, _) = push!(cells, cell)
+function _split_cell!(cells, (a, b)::NTuple{2,SVector{D,T}}, lines) where {D,T}
+    append!(cells, _subdivide_segment(a, b, lines, sqrt(eps(T))))
+end
+function _split_cell!(cells, (a, b, c)::NTuple{3,SVector{3,T}}, lines) where {T}
+    append!(cells, _subdivide_triangle(a, b, c, lines, sqrt(eps(T))))
+end
+_split_cell!(cells, cell::NTuple{3,SVector{2}}, _) = push!(cells, cell)
 
-Return a new `BoundaryMesh` whose cells respect the strict parent- uniqueness contract. Per-cell normals are inherited
-by every sub-cell.
-
-The `Space` form splits against that space's own merged grid lines. The `grid_lines` form takes the lines directly,
-which is how the two-sided interface builder in `coupling.jl` splits one mesh against the *union* of two subdomains'
-grids; it is defined only for the segment (`K = 1`) and 3D triangle (`K = 2`) subdividers, so the pass-through cases
-below belong to the `Space` form alone.
-
-No-op for `K = 0` meshes (points trivially satisfy the contract) and for `(D, K)` combinations not covered by the
-segment / triangle subdividers — the surface-region builder's midpoint classification then handles those directly.
-"""
-_subdivide_mesh(mesh::BoundaryMesh{D,T,0}, ::Space{D,T}, ::GeometryTolerance{T}) where {D,T} = mesh
-
-function _subdivide_mesh(mesh::BoundaryMesh{D,T,1}, grid_lines::NTuple{D,Vector{T}}, ::GeometryTolerance{T}) where {D,T}
-    nudge = sqrt(eps(T))
-    cells = NTuple{2,SVector{D,T}}[]
-    normals = mesh.normals === nothing ? nothing : SVector{D,T}[]
+# The sub-cells of `mesh` split at the per-axis `lines` (`_split_cell!`), as `(; cells, normals)` with one unit normal
+# per sub-cell: its input cell's, from the mesh's own override (normalised) or else the geometric `_default_normal` of
+# the input cell. Taking the normal from the input cell rather than from each piece keeps a sliver from carrying a
+# normal its few surviving digits define, and computes it once per input cell.
+function _subdivide_mesh(mesh::BoundaryMesh{D,T}, lines::NTuple{D,Vector{T}}) where {D,T}
+    cells = eltype(mesh.cells)[]
+    normals = SVector{D,T}[]
     for (i, cell) in pairs(mesh.cells)
-        subs = _subdivide_segment(cell[1], cell[2], grid_lines, nudge)
-        append!(cells, subs)
-        if normals !== nothing
-            n = mesh.normals[i]
-            for _ in 1:length(subs)
-                push!(normals, n)
-            end
+        count = length(cells)
+        _split_cell!(cells, cell, lines)
+        normal = mesh.normals === nothing ? _default_normal(cell) : mesh.normals[i] / sqrt(sum(abs2, mesh.normals[i]))
+        for _ in (count+1):length(cells)
+            push!(normals, normal)
         end
     end
-    return BoundaryMesh{D,T,1}(cells, normals)
+    return (; cells, normals)
 end
-
-function _subdivide_mesh(mesh::BoundaryMesh{3,T,2}, grid_lines::NTuple{3,Vector{T}}, ::GeometryTolerance{T}) where {T}
-    nudge = sqrt(eps(T))
-    cells = NTuple{3,SVector{3,T}}[]
-    normals = mesh.normals === nothing ? nothing : SVector{3,T}[]
-    for (i, cell) in pairs(mesh.cells)
-        subs = _subdivide_triangle(cell[1], cell[2], cell[3], grid_lines, nudge)
-        append!(cells, subs)
-        if normals !== nothing
-            n = mesh.normals[i]
-            for _ in 1:length(subs)
-                push!(normals, n)
-            end
-        end
-    end
-    return BoundaryMesh{3,T,2}(cells, normals)
-end
-
-# `Space` wrappers: subdivide against one space's own merged grid lines.
-function _subdivide_mesh(mesh::BoundaryMesh{D,T,1}, V::Space{D,T}, tol::GeometryTolerance{T}) where {D,T}
-    _subdivide_mesh(mesh, _level_grid_lines(V, tol), tol)
-end
-function _subdivide_mesh(mesh::BoundaryMesh{3,T,2}, V::Space{3,T}, tol::GeometryTolerance{T}) where {T}
-    _subdivide_mesh(mesh, _level_grid_lines(V, tol), tol)
-end
-
-# Fallback: combinations not covered above (e.g. `K = 2` in `D = 2`, a codim-0 mesh) pass through unchanged.
-_subdivide_mesh(mesh::BoundaryMesh{D,T,K}, ::Space{D,T}, ::GeometryTolerance{T}) where {D,T,K} = mesh
 
 # ── SimplexRegion and builder ─────────────────────────────────────────────────
 
@@ -553,9 +454,9 @@ What its fields hold on a sub-cell:
     interface, `parents[1:split]` lie in `field_a`'s subdomain and the rest in `field_b`'s, so the two fields are
     evaluated in their own cut cells at the shared point; `fields = (field_a, field_b)` holds the coupled fields' global
     indices. A surface region is one-sided: `split = length(parents)`, `fields = (0, 0)`.
-  - `normal::SVector{D,T}` — the sub-cell's unit normal: the mesh's own normal of the input cell when given, else the
-    geometric default (`_default_normal`), oriented from side `a` to side `b` on an interface. It is constant over the
-    sub-cell, which is flat.
+  - `normal::SVector{D,T}` — the unit normal of the input cell the sub-cell was split from: the mesh's own normal when
+    given, else the geometric default (`_default_normal`), oriented from side `a` to side `b` on an interface. It is
+    constant over the sub-cell, which is flat.
   - `sides` is `nothing`: an immersed cell sits in the interior of a mesh cell and has no `(axis, side)` facet identity,
     so consumers see `q.sides === nothing`.
   - `residual` is zero: a sub-cell's geometry is stated by the user and already *is* a piece of `∂Ω` (or of `Γ`), so
@@ -563,124 +464,79 @@ What its fields hold on a sub-cell:
 """
 const SimplexRegion{D,T} = Region{D,T,SVector{D,T},Nothing}
 
-# A sub-cell's bounding box: the frame of its region. An axis along which the simplex is flat is degenerate in it.
-_simplex_frame(cell) = (reduce((a, b) -> min.(a, b), cell), reduce((a, b) -> max.(a, b), cell))
-
-# The rule of one sub-cell of a subdivided `BoundaryMesh` in its bounding-box frame `lower`–`upper`: the
-# reference-simplex rule mapped into physical space (`_reference_to_physical_simplex`) and from there into the frame
-# (`_frame_point`), its weights scaled by the simplex Jacobian `measure / reference_area` and divided by the frame
-# Jacobian, and the sub-cell's unit normal (the mesh's own normal at `cell_index` when present, else the geometric
-# `_default_normal`). Shared by the single-sided surface-region builder and the two-sided interface-region builder — the
-# only per-consumer difference is parent classification. A K=0 point cell has `measure = 1` and
-# `_reference_area(Val(0)) = 1`, so it needs no special case.
-function _simplex_cell_quadrature(cell, cell_index::Integer, mesh_normals, reference_samples, reference_area,
-                                  lower::SVector{D,T}, upper::SVector{D,T}, ::Val{K}) where {D,T,K}
-    jacobian = _simplex_measure(cell) / convert(T, reference_area) / _frame_jacobian(lower, upper)
-    normal = if mesh_normals === nothing
-        _default_normal(cell)
-    else
-        n = mesh_normals[cell_index]
-        n / sqrt(sum(x -> x * x, n))
-    end
-    points = SVector{D,T}[]
-    weights = T[]
-    for (eta, w_ref) in reference_samples
-        push!(points, _frame_point(lower, upper, _reference_to_physical_simplex(cell, eta)))
-        push!(weights, w_ref * jacobian)
-    end
-    return points, weights, normal
-end
-
-# Build the full list of surface regions for one `BoundaryMesh` against a given space. Subdivides the user mesh against
-# the cartesian level grids so each emitted cell lies inside one parent per level, then walks the resulting sub-cells to
-# emit one `SimplexRegion` per cell with its framed quadrature, normal, and constant parent set.
+# Every `SimplexRegion` of `mesh` integrated against `spaces`: one space for an immersed surface (`fields = (0, 0)`,
+# kind `:surface`), the two subdomain spaces of a coupling interface (`fields = (field_a, field_b)`, their global field
+# indices; kind `:interface`). The mesh is split at the merged grid lines of every level of every space
+# (`_subdivide_mesh`), so each sub-cell lies inside one cell of every level on both sides — on an interface, one cut
+# cell of one subdomain may face several of the other (the non-matching segment-merge of the references). Per sub-cell:
 #
-# The rule is sized per sub-cell from that cell's own covering parents (`_axis_max` of `_gauss_counts`, the same helper
-# the volume regions and the projection path use). Every rule a sub-cell can ask for is precomputed once into `rules`,
-# indexed by point count and bounded above by `_surface_quadrature_order`, so a mesh of many cells over a handful of
-# distinct orders builds a handful of `gausslegendre` tables rather than one per cell.
-function _surface_regions_for_mesh(V::Space{D,T}, mesh::BoundaryMesh{D,T,K},
-                                   tolerance::GeometryTolerance{T}) where {D,T,K}
-    subdivided = _subdivide_mesh(mesh, V, tolerance)
-    rules = [_simplex_reference_quadrature(Val(K), n, T) for n in 1:maximum(_surface_quadrature_order(V))]
-    reference_area = _reference_area(Val(K))
-
+#   1. its midpoint's coverage signature per space (`_signature`, the locator of the volume partition), all levels
+#      eligible;
+#   2. a surface keeps `BoundaryMesh`'s strict contract and raises where a sub-cell misses every level or lands in an
+#      inactive cell (`_check_surface_cover`); an interface skips a sub-cell either side does not cover — the trace
+#      there lies outside that subdomain's active region;
+#   3. the parents decoded from the signatures into one list, side `a` first (`_parents!`), each with its map from the
+#      sub-cell's bounding-box frame (`_simplex_frame`);
+#   4. the rule size from those parents (`_axis_max` of `_gauss_counts` per side, the larger per axis on an interface,
+#      whose integrand multiplies one trace from each side) — per sub-cell, so one high-p cell elsewhere raises no rule
+#      here; each side reads its own space, whose level ids are numbered independently of the other's;
+#   5. the unit-simplex rule of that size (`_simplex_rule`, built once per size) mapped through `x = v₁ + E·λ` into the
+#      frame, its weights scaled by the simplex Jacobian over the frame Jacobian, so the region accessors recover the
+#      physical points and weights.
+function _simplex_regions(mesh::BoundaryMesh{D,T,K}, spaces::Tuple, fields::NTuple{2,Int},
+                          tol::GeometryTolerance{T}) where {D,T,K}
+    levels = map(V -> V.levels, spaces)
+    sub = _subdivide_mesh(mesh, _merged_axis_coordinates(reduce((a, b) -> (a..., b...), levels), Val(D), tol))
+    linmaps = map(side -> map(level -> LinearIndices(level.mesh.cells), side), levels)
+    eligible = map(side -> map(_ -> _AllCells(), side), levels)
+    kind = length(spaces) == 1 ? :surface : :interface
+    rules = Dict{Int,Tuple{Vector{SVector{K,T}},Vector{T}}}()
     regions = SimplexRegion{D,T}[]
-    for (cell_index, cell) in pairs(subdivided.cells)
+    for (index, cell) in pairs(sub.cells)
+        x = _cell_midpoint(cell)
+        sigs = map((side, linmap, cells) -> _signature(side, linmap, cells, x, tol), levels, linmaps, eligible)
+        if length(spaces) == 1
+            _check_surface_cover(levels[1], sigs[1], x, tol, index)
+        elseif any(sig -> all(iszero, sig), sigs)
+            continue
+        end
         lower, upper = _simplex_frame(cell)
-        parents = _surface_cell_parents(V, cell, cell_index, lower, upper, tolerance)
-        isempty(parents) && throw(ArgumentError("BoundaryMesh cell #$cell_index lies entirely outside the " *
-                                                "discretization — no covering parent found on any level"))
-        counts = _axis_max(_gauss_counts, V, parents)
-        points, weights, normal = _simplex_cell_quadrature(cell, cell_index, subdivided.normals, rules[maximum(counts)],
-                                                           reference_area, lower, upper, Val(K))
-        push!(regions, Region(lower, upper, parents, :surface, points, weights; normal))
+        parents = Parent{D,T}[]
+        sides = map(levels, sigs) do side, sig
+            start = length(parents) + 1
+            _parents!(parents, side, sig, lower, upper)
+            return start:length(parents)
+        end
+        counts = map((V, side) -> _axis_max(_gauss_counts, V, view(parents, side)), spaces, sides)
+        m = maximum(reduce((a, b) -> max.(a, b), counts))
+        λ, w = get!(() -> _simplex_rule(Val(K), m, T), rules, m)
+        E = _edge_matrix(cell)
+        scale = _simplex_jacobian(cell) / _frame_jacobian(lower, upper)
+        points = [_frame_point(lower, upper, cell[1] + E * l) for l in λ]
+        push!(regions,
+              Region(lower, upper, parents, kind, points, w .* scale; split=last(sides[1]), fields,
+                     normal=sub.normals[index]))
     end
-
     return regions
 end
 
-# Upper bound on the per-axis Gauss-Legendre point count any surface or interface region over `V` can ask for: the
-# per-axis maximum of `recommended_quadrature_order(level.basis, nominal_order(level))` across every level. It sizes the
-# precomputed rule table in `_surface_regions_for_mesh` and `_interface_regions`, and nothing else — the rule an
-# individual sub-cell uses comes from that cell's own covering parents, so one high-p cell no longer raises the rule on
-# every region of the mesh.
-#
-# `nominal_order` is the level's per-axis *maximum* over its cells, which is the right question here and only here:
-# over-sizing a table of rules costs a few `gausslegendre` calls, while over-sizing a rule costs every Q-point of every
-# region that uses it.
-function _surface_quadrature_order(V::Space{D,T}) where {D,T}
-    base = ntuple(_ -> 1, D)
-    for level in V.levels
-        per_axis = recommended_quadrature_order(level.basis, nominal_order(level))
-        base = ntuple(d -> max(base[d], per_axis[d]), D)
+# `BoundaryMesh`'s contract for a surface sub-cell (the `index`-th of the subdivided mesh): its midpoint `x` lies in at
+# least one level's mesh, and in an active cell of every level whose mesh holds it. `sig` is `x`'s coverage signature
+# over `levels`, so a zero slot is a level that misses `x` or holds it in an inactive cell, and containment tells the
+# two apart.
+function _check_surface_cover(levels::Tuple, sig::Tuple, x, tol, index::Int)
+    map(levels, sig) do level, slot
+        slot == 0 &&
+            contains_point(x, level.mesh.domain, tol) &&
+            throw(ArgumentError("BoundaryMesh cell #$index midpoint $x falls inside an inactive cell on level " *
+                                "$(level.id)"))
     end
-    return base
+    all(iszero, sig) && throw(ArgumentError("BoundaryMesh cell #$index lies entirely outside the discretization — " *
+                                            "no covering parent found on any level"))
+    return nothing
 end
 
-# Look up the parent cell per level for one `BoundaryMesh` sub-cell, each with its map from the sub-cell's frame
-# `lower`–`upper`. The cell's midpoint determines the parent on every level whose mesh contains it; vertices are not
-# re-verified — `_subdivide_mesh` is responsible for ensuring each cell lies inside one parent per level, and
-# clipping-produced vertices may legitimately sit on grid lines (where `locate_cell` would snap them into the adjacent
-# cell). Returns the list of covering parents.
-function _surface_cell_parents(V::Space{D,T}, cell::NTuple{KP,SVector{D,T}}, cell_index::Int, lower::SVector{D,T},
-                               upper::SVector{D,T}, tolerance::GeometryTolerance{T}) where {D,T,KP}
-    midpoint = _cell_midpoint(cell)
-    parents = Parent{D,T}[]
-    for level in V.levels
-        midpoint_cell = locate_cell(level.mesh, midpoint; tol=tolerance)
-        midpoint_cell === nothing && continue
-        is_active(level.mask, midpoint_cell) ||
-            throw(ArgumentError("BoundaryMesh cell #$cell_index midpoint $midpoint falls inside " *
-                                "an inactive cell on level $(level.id)"))
-        push!(parents, Parent(level, midpoint_cell, lower, upper))
-    end
-    return parents
-end
-
-# Push the active covering parents of a physical point across every level of `V` onto `parents`, each with its map from
-# the frame `lower`–`upper`: one per level whose mesh contains the point in an *active* cell. Unlike
-# `_surface_cell_parents` this never throws — a point outside `V`, or inside a level's inactive (fictitious / masked)
-# cell, simply contributes no parent from that level. The two-sided interface builder runs it once per side into one
-# list, side `a` first, and skips a sub-cell whose midpoint has no active cover on one of the two subdomains (the
-# interface trace there lies outside that subdomain's active region). Returns the number of parents pushed.
-function _active_cover_parents!(parents::Vector{Parent{D,T}}, V::Space{D,T}, point::SVector{D,T}, lower::SVector{D,T},
-                                upper::SVector{D,T}, tol::GeometryTolerance{T}) where {D,T}
-    count = length(parents)
-    for level in V.levels
-        cell = locate_cell(level.mesh, point; tol)
-        cell === nothing && continue
-        is_active(level.mask, cell) || continue
-        push!(parents, Parent(level, cell, lower, upper))
-    end
-    return length(parents) - count
-end
-
-# Midpoint of a simplex cell (average of vertices).
-function _cell_midpoint(cell::NTuple{KP,SVector{D,T}}) where {D,T,KP}
-    acc = MVector{D,T}(ntuple(_ -> zero(T), D))
-    for v in cell
-        acc .+= v
-    end
-    return SVector{D,T}(acc ./ KP)
+# Build the full list of surface regions for one `BoundaryMesh` against a given space (`_simplex_regions`, one-sided).
+function _surface_regions_for_mesh(V::Space{D,T}, mesh::BoundaryMesh{D,T}, tol::GeometryTolerance{T}) where {D,T}
+    _simplex_regions(mesh, (V,), (0, 0), tol)
 end

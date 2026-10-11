@@ -212,7 +212,7 @@ end
     # sub-segments.
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(4, 4), order=1)
-    grid_lines = Unfitted._level_grid_lines(V, GeometryTolerance(Float64))
+    grid_lines = Unfitted._merged_axis_coordinates(V.levels, Val(2), GeometryTolerance(Float64))
     p1 = SVector(0.05, 0.10)
     p2 = SVector(0.85, 0.40)
     subs = Unfitted._subdivide_segment(p1, p2, grid_lines, sqrt(eps(Float64)))
@@ -244,7 +244,7 @@ end
     # few ulp. They must collapse to a single cut — not to a zero-length sliver straddling the corner, and not to a gap.
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(4, 4), order=1)
-    grid_lines = Unfitted._level_grid_lines(V, GeometryTolerance(Float64))
+    grid_lines = Unfitted._merged_axis_coordinates(V.levels, Val(2), GeometryTolerance(Float64))
     nudge = sqrt(eps(Float64))
 
     corner = Unfitted._subdivide_segment(SVector(0.05, 0.05), SVector(0.45, 0.45), grid_lines, nudge)
@@ -271,7 +271,7 @@ end
     # sub-triangle inside one cell of every level.
     omega = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
     V = space(omega; cells=(2, 2, 2), order=1)
-    grid_lines = Unfitted._level_grid_lines(V, GeometryTolerance(Float64))
+    grid_lines = Unfitted._merged_axis_coordinates(V.levels, Val(3), GeometryTolerance(Float64))
     v1 = SVector(0.1, 0.1, 0.3)
     v2 = SVector(0.9, 0.1, 0.3)
     v3 = SVector(0.5, 0.9, 0.3)
@@ -305,9 +305,16 @@ end
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(4, 4), order=1)
     mesh = segment_mesh([(SVector(0.1, 0.1), SVector(0.6, 0.2))]; normals=[SVector(0.0, 1.0)])
-    sub = Unfitted._subdivide_mesh(mesh, V, GeometryTolerance(Float64))
+    sub = Unfitted._subdivide_mesh(mesh,
+                                   Unfitted._merged_axis_coordinates(V.levels, Val(2), GeometryTolerance(Float64)))
     @test length(sub.cells) > 1
     @test all(n == SVector(0.0, 1.0) for n in sub.normals)
+    # The regions carry it, and so does every sub-cell of a mesh without an override: the input cell's geometric normal.
+    tol = GeometryTolerance(Float64)
+    @test all(r.normal == SVector(0.0, 1.0) for r in Unfitted._surface_regions_for_mesh(V, mesh, tol))
+    plain = Unfitted._surface_regions_for_mesh(V, segment_mesh([(SVector(0.1, 0.1), SVector(0.6, 0.2))]), tol)
+    @test length(plain) > 1
+    @test all(r.normal == Unfitted._default_normal((SVector(0.1, 0.1), SVector(0.6, 0.2))) for r in plain)
 end
 
 @testset "BoundaryMesh in 3D: triangle area integrates correctly" begin
@@ -325,10 +332,9 @@ end
 end
 
 @testset "the surface rule is sized from the sub-cell's own parents" begin
-    # `_surface_quadrature_order` is now only the upper bound that sizes the rule table; the rule a sub-cell uses comes
-    # from the cells covering it. A high-order level elsewhere must not raise the point count of a segment it does not
-    # cover — which is what the level-wide maximum did, and the reason the immersed-surface path was the one quadrature
-    # consumer that a per-cell order made more expensive rather than less.
+    # The rule a sub-cell uses comes from the cells covering it. A high-order level elsewhere must not raise the point
+    # count of a segment it does not cover — which is what the level-wide maximum did, and the reason the
+    # immersed-surface path was the one quadrature consumer that a per-cell order made more expensive rather than less.
     omega = box((0.0, 0.0), (1.0, 1.0))
     tol = GeometryTolerance(Float64)
     V = overlay(space(omega; cells=(4, 4), order=1), box((0.5, 0.5), (1.0, 1.0)); cells=(2, 2), order=3)

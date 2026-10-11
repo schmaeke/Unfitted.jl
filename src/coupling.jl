@@ -7,8 +7,9 @@
 #   * the interface regions — two-sided `SimplexRegion`s (`kind = :interface`): one rule and normal per sub-cell, like
 #     a surface region, with the covering parents of *both* subdomains, side `a`'s first (`split`), so field `a` is
 #     evaluated in its own subdomain's cut cell and field `b` in its subdomain's cut cell at the *same* physical point.
-#     The builder subdivides `Γ` against the merged trace of *both* grids (the non-matching segment-merge of the
-#     references), so one cut cell of one subdomain may face several of the other.
+#     They come from the immersed surface's builder (`_simplex_regions` in `surface.jl`), which subdivides `Γ` against
+#     the merged trace of *both* grids (the non-matching segment-merge of the references), so one cut cell of one
+#     subdomain may face several of the other.
 #   * `couple` — the public verb. Following the library's "supply the integration primitives, not the constitutive
 #     choice" rule, it does not bake in any penalty / Nitsche / cohesive law: it takes the user's bilinear interface
 #     form `a(trial, test)` and expands the jump coupling `∫_Γ a([u], [v]) dΓ`, `[u] = uₐ − u_b`, into the four field
@@ -62,52 +63,15 @@ interface(u_a::Field, u_b::Field, geometry::BoundaryMesh) = Interface(u_a.name, 
 
 # ── Interface region ──────────────────────────────────────────────────────────
 
-# Build every interface region for one interface. The interface mesh is subdivided against the *merged* grid lines of
-# both subdomains, so each sub-cell lies inside a single cut cell of each subdomain; the covering parents are then
-# classified per side. A sub-cell whose midpoint has no active cover on one side (its trace lies outside that
-# subdomain's active region) is skipped. `field_a` / `field_b` are the resolved global field indices.
-function _interface_regions(iface::Interface, V_a::Space{D,T}, V_b::Space{D,T}, field_a::Int, field_b::Int,
-                            tol::GeometryTolerance{T}) where {D,T}
-    merged = _grid_lines_for_levels((V_a.levels..., V_b.levels...), Val(D), tol)
-    subdivided = _subdivide_mesh(iface.geometry, merged, tol)
-    return _emit_interface_regions(subdivided, V_a, V_b, field_a, field_b, tol)
-end
-
 # The regions of `iface` across the two subdomains of `problem`, with the coupled fields' global indices taken from
 # `layout`: how `prepare` builds the regions of every interface a form names, and how assembly builds them for an
-# interface `prepare` did not see.
+# interface `prepare` did not see. The builder is the immersed surface's (`_simplex_regions` in `surface.jl`), run over
+# both subdomain spaces: the mesh is split at the merged grid lines of both, and each sub-cell carries the covering
+# parents of both sides, side `a`'s first.
 function _interface_regions(iface::Interface, problem::Problem, layout::SystemLayout)
-    return _interface_regions(iface, _field_space(problem, iface.field_a), _field_space(problem, iface.field_b),
-                              _field_index(layout, iface.field_a), _field_index(layout, iface.field_b),
-                              layout.tolerance)
-end
-
-# The rule is sized per sub-cell from the cells that actually cover it, on both sides: the interface integrand is a
-# product of one trace from each subdomain, so the count that integrates it is the larger of the two sides' own counts.
-# The two `_axis_max` lookups have to stay separate because the level ids of `V_a` and `V_b` are
-# independently numbered and a parent from one side would resolve to the wrong level through the other's lookup. `rules`
-# precomputes every rule the sweep can reach, bounded by the larger of the two spaces' nominal-order bounds.
-function _emit_interface_regions(subdivided::BoundaryMesh{D,T,K}, V_a::Space{D,T}, V_b::Space{D,T}, field_a::Int,
-                                 field_b::Int, tol::GeometryTolerance{T}) where {D,T,K}
-    bound = max(maximum(_surface_quadrature_order(V_a)), maximum(_surface_quadrature_order(V_b)))
-    rules = [_simplex_reference_quadrature(Val(K), n, T) for n in 1:bound]
-    reference_area = _reference_area(Val(K))
-    regions = SimplexRegion{D,T}[]
-    for (cell_index, cell) in pairs(subdivided.cells)
-        midpoint = _cell_midpoint(cell)
-        lower, upper = _simplex_frame(cell)
-        parents = Parent{D,T}[]
-        split = _active_cover_parents!(parents, V_a, midpoint, lower, upper, tol)
-        (split == 0 || _active_cover_parents!(parents, V_b, midpoint, lower, upper, tol) == 0) && continue
-
-        sides = (view(parents, 1:split), view(parents, (split+1):length(parents)))
-        n = max(maximum(_axis_max(_gauss_counts, V_a, sides[1])), maximum(_axis_max(_gauss_counts, V_b, sides[2])))
-        points, weights, normal = _simplex_cell_quadrature(cell, cell_index, subdivided.normals, rules[n],
-                                                           reference_area, lower, upper, Val(K))
-        push!(regions,
-              Region(lower, upper, parents, :interface, points, weights; split, fields=(field_a, field_b), normal))
-    end
-    return regions
+    spaces = (_field_space(problem, iface.field_a), _field_space(problem, iface.field_b))
+    fields = (_field_index(layout, iface.field_a), _field_index(layout, iface.field_b))
+    return _simplex_regions(iface.geometry, spaces, fields, layout.tolerance)
 end
 
 # ── Interface-kernel sugar ────────────────────────────────────────────────────

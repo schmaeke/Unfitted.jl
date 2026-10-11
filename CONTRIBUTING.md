@@ -778,16 +778,15 @@ superposition idea for its own enrichment.
     uniform level is a palette of one and not a special case.
     `cell_order(level, cell)` is the question anything that integrates,
     evaluates or subdivides must ask, and every quadrature consumer does:
-    the region rule, the moment-fit order, the facet rule and the VTK
-    subdivision all size from the parent *cell*. `nominal_order(level)` is
-    the per-axis maximum over the palette, and it is a sizing and default
-    quantity — workspace banks and 1D factor buffers, where over-sizing is
-    safe; `_surface_quadrature_order`, which sizes one table of rules for
-    regions that no single parent cell owns and says so; and the order a
-    new `overlay` or a re-instantiated basis family inherits. `Level.modes`
-    is the derived minimum-rule table (`CellModes`), computed by `Level`'s
-    inner constructor from the orders, the mesh, the mode and the mask, and
-    never supplied by a caller.
+    the region rule, the moment-fit order, the facet rule, the immersed
+    simplex rule and the VTK subdivision all size from the parent *cell*.
+    `nominal_order(level)` is the per-axis maximum over the palette, and it
+    is a sizing and default quantity — workspace banks and 1D factor
+    buffers, where over-sizing is safe; and the order a new `overlay` or a
+    re-instantiated basis family inherits. `Level.modes` is the derived
+    minimum-rule table (`CellModes`), computed by `Level`'s inner
+    constructor from the orders, the mesh, the mode and the mask, and never
+    supplied by a caller.
   - **Order ≥ 1 per cell** is enforced per palette entry at construction, and
     `mode = :trunk` requires isotropy per cell. Neither can be expressed by
     the minimum rule: the dof key collapses the two endpoint modes into one
