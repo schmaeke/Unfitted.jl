@@ -1,0 +1,7 @@
+# Commits that only reformat, for `git blame --ignore-revs-file .git-blame-ignore-revs`
+# (or `git config blame.ignoreRevsFile .git-blame-ignore-revs`). GitHub reads this file by name.
+
+# style: reformat code at the 120-character margin (JuliaFormatter output, nothing else)
+24f7980c1327b9ae5b7c11e21ab8be6ec0f7eced
+# style: fill comment and docstring prose to 120 characters (prose refill, no word changed)
+c3c2426b0b37208a232d2a52ed9dd00a222884bf

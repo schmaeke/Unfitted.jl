@@ -1,6 +1,5 @@
-# Top-level BenchmarkTools suite for Unfitted. Defines `SUITE::BenchmarkGroup`
-# and is included by `runbenchmarks.jl` (and by any future PkgBenchmark entry
-# point). Each included case file mutates `SUITE` directly under its own group.
+# Top-level BenchmarkTools suite for Unfitted. Defines `SUITE::BenchmarkGroup` and is included by `runbenchmarks.jl`
+# (and by any future PkgBenchmark entry point). Each included case file mutates `SUITE` directly under its own group.
 #
 # Usage:
 #     julia --project=benchmarks benchmarks/runbenchmarks.jl

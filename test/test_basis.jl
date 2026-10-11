@@ -20,8 +20,7 @@ end
 
         ξ = -0.7 + 1.4 * (i - 2) / 6
         h = 1.0e-6
-        fd = (Unfitted.integrated_legendre_value(i, ξ + h) -
-              Unfitted.integrated_legendre_value(i, ξ - h)) / (2h)
+        fd = (Unfitted.integrated_legendre_value(i, ξ + h) - Unfitted.integrated_legendre_value(i, ξ - h)) / (2h)
         @test Unfitted.integrated_legendre_derivative(i, ξ) ≈ fd rtol = 1.0e-7 atol = 1.0e-8
     end
 end
@@ -30,21 +29,19 @@ end
     basis = IntegratedLegendre()
 
     @test Unfitted.local_basis_indices(basis, (1, 2)) ==
-          [CartesianIndex(0, 0), CartesianIndex(1, 0), CartesianIndex(0, 1), CartesianIndex(1, 1),
-           CartesianIndex(0, 2), CartesianIndex(1, 2)]
+          [CartesianIndex(0, 0), CartesianIndex(1, 0), CartesianIndex(0, 1), CartesianIndex(1, 1), CartesianIndex(0, 2),
+           CartesianIndex(1, 2)]
 
-    # `basis_values` carries the parent cell in its signature for every family;
-    # integrated Legendre ignores it, so any in-bounds index does here.
+    # `basis_values` carries the parent cell in its signature for every family; integrated Legendre ignores it, so any
+    # in-bounds index does here.
     values = Unfitted.basis_values(basis, (1, 1), :tensor, (0.25, -0.5), CartesianIndex(1, 1))
     @test length(values) == 4
     @test sum(values) ≈ 1.0
 
-    values3 = Unfitted.basis_values(basis, (1, 2, 1), :tensor, (0.0, 0.25, -0.25),
-                                    CartesianIndex(1, 1, 1))
+    values3 = Unfitted.basis_values(basis, (1, 2, 1), :tensor, (0.0, 0.25, -0.25), CartesianIndex(1, 1, 1))
     @test length(values3) == 12
 
-    values4 = Unfitted.basis_values(basis, (1, 1, 1, 1), :tensor, (0.0, 0.1, -0.2, 0.3),
-                                    CartesianIndex(1, 1, 1, 1))
+    values4 = Unfitted.basis_values(basis, (1, 1, 1, 1), :tensor, (0.0, 0.1, -0.2, 0.3), CartesianIndex(1, 1, 1, 1))
     @test length(values4) == 16
     @test sum(values4) ≈ 1.0
 end
@@ -52,19 +49,17 @@ end
 @testset "trunk basis filtering" begin
     basis = IntegratedLegendre()
 
-    # 2D counts: trunk trims only the interior, so p=2 (no interior modes
-    # yet) matches tensor minus the single (2,2) interior mode.
+    # 2D counts: trunk trims only the interior, so p=2 (no interior modes yet) matches tensor minus the single (2,2)
+    # interior mode.
     @test Unfitted.local_basis_count(basis, (2, 2), :trunk) == 8
     @test Unfitted.local_basis_count(basis, (3, 3), :trunk) == 12
-    # 3D is where trunk pays off: the interior face/volume modes are the
-    # bulk of the tensor count at moderate order.
+    # 3D is where trunk pays off: the interior face/volume modes are the bulk of the tensor count at moderate order.
     @test Unfitted.local_basis_count(basis, (2, 2, 2), :trunk) == 20
     @test Unfitted.local_basis_count(basis, (3, 3, 3), :trunk) == 32
     @test Unfitted.local_basis_count(basis, (4, 4, 4), :trunk) == 50
 
-    # Edge modes survive up to degree p; interior modes only while their
-    # bubble degrees sum to ≤ p, so (2,2) is dropped at p=3 and reappears
-    # at p=4.
+    # Edge modes survive up to degree p; interior modes only while their bubble degrees sum to ≤ p, so (2,2) is dropped
+    # at p=3 and reappears at p=4.
     @test CartesianIndex(2, 2) ∉ Unfitted.local_basis_indices(basis, (2, 2), :trunk)
     @test CartesianIndex(3, 1) ∈ Unfitted.local_basis_indices(basis, (3, 3), :trunk)
     @test CartesianIndex(2, 2) ∉ Unfitted.local_basis_indices(basis, (3, 3), :trunk)
@@ -75,10 +70,9 @@ end
     @test length(values) == 4
     @test sum(values) ≈ 1.0
 
-    # Mode validation is family-aware: integrated Legendre is the family that
-    # declares `:trunk`, and a mode name no family defines is rejected by the
-    # family-blind gate the family-aware form delegates to. The B-spline suite
-    # covers the other branch — a defined mode a family does not carry.
+    # Mode validation is family-aware: integrated Legendre is the family that declares `:trunk`, and a mode name no
+    # family defines is rejected by the family-blind gate the family-aware form delegates to. The B-spline suite covers
+    # the other branch — a defined mode a family does not carry.
     @test Unfitted._supported_modes(basis) == (:tensor, :trunk)
     @test Unfitted._check_basis_mode(basis, :trunk, (2, 2)) === :trunk
     @test_throws ArgumentError Unfitted._check_basis_mode(basis, :serendipity, (2, 2))
@@ -90,12 +84,10 @@ end
 
 @testset "tensor basis gradients" begin
     basis = IntegratedLegendre()
-    # A cell whose edge length is 2 in every axis *is* the reference cell, so
-    # its chain-rule factor `2 / h_d` is 1 and the physical gradient the single
-    # entry point returns is the bare reference gradient ∂N_α/∂ξ.
+    # A cell whose edge length is 2 in every axis *is* the reference cell, so its chain-rule factor `2 / h_d` is 1 and
+    # the physical gradient the single entry point returns is the bare reference gradient ∂N_α/∂ξ.
     reference1 = box((-1.0,), (1.0,))
-    gradients1 = Unfitted.physical_basis_gradients(basis, (2,), :tensor, reference1, (0.25,),
-                                                   CartesianIndex(1))
+    gradients1 = Unfitted.physical_basis_gradients(basis, (2,), :tensor, reference1, (0.25,), CartesianIndex(1))
     @test length(gradients1) == 3
     @test gradients1[1][1] ≈ -0.5
     @test gradients1[2][1] ≈ 0.5
@@ -118,8 +110,8 @@ end
     @test physical[1] ≈ gradients[1] .* (2 ./ Unfitted.edge_lengths(cell))
 
     reference3 = box((-1.0, -1.0, -1.0), (1.0, 1.0, 1.0))
-    gradients3 = Unfitted.physical_basis_gradients(basis, (1, 1, 1), :tensor, reference3,
-                                                   (0.2, -0.1, 0.4), CartesianIndex(1, 1, 1))
+    gradients3 = Unfitted.physical_basis_gradients(basis, (1, 1, 1), :tensor, reference3, (0.2, -0.1, 0.4),
+                                                   CartesianIndex(1, 1, 1))
     @test length(gradients3) == 8
     @test length(gradients3[1]) == 3
 end

@@ -1,19 +1,15 @@
 # Per-quadrature-point material data and its mesh-change transfer.
 #
-# `QuadField` is the natural container for per-quadrature-point internal
-# state — phase-field damage `H`, plastic strain, predeformation
-# gradient, history variables for an inelastic constitutive law — that
-# the assembly callbacks consult through `q.point` indexing.
+# `QuadField` is the natural container for per-quadrature-point internal state — phase-field damage `H`, plastic strain,
+# predeformation gradient, history variables for an inelastic constitutive law — that the assembly callbacks consult
+# through `q.point` indexing.
 #
-# Moving the underlying mesh (overlay activation/deactivation, geometry
-# updates, h-/p- refinement) changes the quadrature-point cloud, so a
-# `QuadField` belonging to the old model becomes meaningless on the new
-# one. `transfer` rebuilds the field on the target model's quadrature
-# points via a point-based interpolation scheme. [`RBFP0`](@ref) — an
-# inverse-multiquadric RBF with a constant polynomial extension — is the
-# only scheme today; `transfer`'s `via` keyword is typed to it. It moves
-# one scalar per point, so a component-valued state travels as one
-# `QuadField` per component.
+# Moving the underlying mesh (overlay activation/deactivation, geometry updates, h-/p- refinement) changes the
+# quadrature-point cloud, so a `QuadField` belonging to the old model becomes meaningless on the new one. `transfer`
+# rebuilds the field on the target model's quadrature points via a point-based interpolation scheme. [`RBFP0`](@ref) —
+# an inverse-multiquadric RBF with a constant polynomial extension — is the only scheme today; `transfer`'s `via`
+# keyword is typed to it. It moves one scalar per point, so a component-valued state travels as one `QuadField` per
+# component.
 
 # ── QuadField ────────────────────────────────────────────────────────────────
 
@@ -21,46 +17,33 @@
     QuadField{T}(model; init = q -> zero(T))
     QuadField(data::AbstractVector{T}, model::Model)
 
-`T`-valued data indexed by `q.point` over a `Model`'s quadrature points.
-Carries the `model.version` pin at construction time so reuse against a
-mutated model, or against a model of a different discretisation, raises —
-the same contract [`Solution`](@ref) uses for solution coefficients, and
-for the same reason: the pin is a digest of the discretisation, so two
-models prepared from the same one share it and two different ones do not.
+`T`-valued data indexed by `q.point` over a `Model`'s quadrature points. Carries the `model.version` pin at construction
+time so reuse against a mutated model, or against a model of a different discretisation, raises — the same contract
+[`Solution`](@ref) uses for solution coefficients, and for the same reason: the pin is a digest of the discretisation,
+so two models prepared from the same one share it and two different ones do not.
 
 Constructors:
 
-  - `QuadField{T}(model; init)` — allocate a fresh field and fill it by
-    calling `init(q)` at every quadrature point. The default
-    `init = q -> zero(T)` produces an all-zero field.
-  - `QuadField(data, model)` — wrap a pre-built vector. The vector
-    length must equal `nquadpoints(model)`; the data is copied so the
-    caller can mutate its source vector without leaking into the
-    `QuadField`.
+  - `QuadField{T}(model; init)` — allocate a fresh field and fill it by calling `init(q)` at every quadrature point. The
+    default `init = q -> zero(T)` produces an all-zero field.
+  - `QuadField(data, model)` — wrap a pre-built vector. The vector length must equal `nquadpoints(model)`; the data is
+    copied so the caller can mutate its source vector without leaking into the `QuadField`.
 
-Material-state history variables (phase-field `H`, plastic strain,
-predeformation gradient, …) are the natural use case. Move them across
-model changes with [`transfer`](@ref), which reconstructs the field on the
-new model's quadrature points through an [`RBFP0`](@ref) interpolation.
-The container places no restriction on `T`, but that transfer does: it
-takes a `QuadField{T}` on a `Model{D,T}` and nothing else, so a
-component-valued state is carried one component per `QuadField`.
+Material-state history variables (phase-field `H`, plastic strain, predeformation gradient, …) are the natural use case.
+Move them across model changes with [`transfer`](@ref), which reconstructs the field on the new model's quadrature
+points through an [`RBFP0`](@ref) interpolation. The container places no restriction on `T`, but that transfer does: it
+takes a `QuadField{T}` on a `Model{D,T}` and nothing else, so a component-valued state is carried one component per
+`QuadField`.
 
-Indexing is guarded while a verb re-evaluates the problem's forms on a cloud
-this field does not belong to. [`estimate`](@ref) is that verb: it assembles
-the same blocks and loads on an order-elevated twin, whose `q.point` numbers a
-different and larger set of points, so a `qf[q.point]` there would read out of
-range or — worse — silently at the wrong point. Such a read raises, and
-`estimate` refuses outright when it can see the field among a form's captures.
-Ordinary assembly, and every read against the model the field was built on, is
-unaffected.
+Indexing is guarded while a verb re-evaluates the problem's forms on a cloud this field does not belong to.
+[`estimate`](@ref) is that verb: it assembles the same blocks and loads on an order-elevated twin, whose `q.point`
+numbers a different and larger set of points, so a `qf[q.point]` there would read out of range or — worse — silently at
+the wrong point. Such a read raises, and `estimate` refuses outright when it can see the field among a form's captures.
+Ordinary assembly, and every read against the model the field was built on, is unaffected.
 
-`QuadField{T}(model; init)` walks the volume through
-[`foreach_quadrature_point`](@ref) and is single-domain only — on a coupled
-model it raises. Sizing against `nquadpoints(model)`, as the
-`QuadField(data, model)` form does, is not enough there: `q.point` restarts
-at 1 for each subdomain, so one flat array would alias the subdomains onto
-each other.
+`QuadField{T}(model; init)` walks the volume through [`foreach_quadrature_point`](@ref) and is single-domain only — on a
+coupled model it raises. Sizing against `nquadpoints(model)`, as the `QuadField(data, model)` form does, is not enough
+there: `q.point` restarts at 1 for each subdomain, so one flat array would alias the subdomains onto each other.
 """
 mutable struct QuadField{T}
     data::Vector{T}
@@ -69,7 +52,8 @@ end
 
 function QuadField(data::AbstractVector{T}, model::Model) where {T}
     length(data) == nquadpoints(model) ||
-        throw(DimensionMismatch("QuadField data length $(length(data)) does not match nquadpoints(model) = $(nquadpoints(model))"))
+        throw(DimensionMismatch("QuadField data length $(length(data)) does not match " *
+                                "nquadpoints(model) = $(nquadpoints(model))"))
     return QuadField{T}(collect(data), model.version)
 end
 
@@ -83,16 +67,14 @@ function QuadField{T}(model::Model; init=_ -> zero(T)) where {T}
     return QuadField{T}(data, model.version)
 end
 
-# The pin of the quadrature cloud currently being walked by a verb that is
-# re-evaluating forms it did not write, or 0 — which is every ordinary
-# assembly, and the value `getindex` below reads. See "Detecting point-keyed
-# state" further down for what the pair guards and what it costs.
+# The pin of the quadrature cloud currently being walked by a verb that is re-evaluating forms it did not write, or 0 —
+# which is every ordinary assembly, and the value `getindex` below reads. See "Detecting point-keyed state" further down
+# for what the pair guards and what it costs.
 const _FOREIGN_CLOUD = Ref(0)
 
-# Run `f` with the foreign-cloud pin set to `version`, restoring whatever was
-# set before. Nesting is honoured; a `throw` inside `f` still restores. The
-# write happens outside the threaded region `f` starts — `estimate` wraps a
-# whole `assemble!` — so the worker threads only ever read it.
+# Run `f` with the foreign-cloud pin set to `version`, restoring whatever was set before. Nesting is honoured; a `throw`
+# inside `f` still restores. The write happens outside the threaded region `f` starts — `estimate` wraps a whole
+# `assemble!` — so the worker threads only ever read it.
 function _on_foreign_cloud(f, version::Integer)
     previous = _FOREIGN_CLOUD[]
     _FOREIGN_CLOUD[] = Int(version)
@@ -103,9 +85,8 @@ function _on_foreign_cloud(f, version::Integer)
     end
 end
 
-# Forwarding to the underlying data vector. `setindex!` returns the
-# `QuadField` itself so chained updates work; `copy` makes a defensive
-# copy of the data and preserves the version pin.
+# Forwarding to the underlying data vector. `setindex!` returns the `QuadField` itself so chained updates work; `copy`
+# makes a defensive copy of the data and preserves the version pin.
 Base.length(qf::QuadField) = length(qf.data)
 Base.eltype(::Type{QuadField{T}}) where {T} = T
 Base.eltype(qf::QuadField) = eltype(typeof(qf))
@@ -122,10 +103,9 @@ end
 Base.setindex!(qf::QuadField, v, i::Integer) = (qf.data[i]=v; qf)
 Base.copy(qf::QuadField{T}) where {T} = QuadField{T}(copy(qf.data), qf.model_version)
 
-# Stale-QuadField check used by `transfer` and any consumer that reads
-# a `QuadField` against a `Model`. Same contract as
-# `_checked_coefficients` in `solvers.jl`: returns the data vector when
-# the pin and the length agree, raises a clear error otherwise.
+# Stale-QuadField check used by `transfer` and any consumer that reads a `QuadField` against a `Model`. Same contract as
+# `_checked_coefficients` in `solvers.jl`: returns the data vector when the pin and the length agree, raises a clear
+# error otherwise.
 function _checked_quadfield(qf::QuadField, model::Model)
     qf.model_version == model.version ||
         throw(ArgumentError("this QuadField was built on a different discretisation, or on this model " *
@@ -133,60 +113,50 @@ function _checked_quadfield(qf::QuadField, model::Model)
                             "model pin 0x$(string(model.version; base=16))); carry it across with " *
                             "`transfer`"))
     length(qf.data) == nquadpoints(model) ||
-        throw(DimensionMismatch("QuadField length $(length(qf.data)) does not match nquadpoints(model) = $(nquadpoints(model))"))
+        throw(DimensionMismatch("QuadField length $(length(qf.data)) does not match " *
+                                "nquadpoints(model) = $(nquadpoints(model))"))
     return qf.data
 end
 
 function Base.show(io::IO, qf::QuadField{T}) where {T}
-    print(io, "QuadField{", T, "}(npoints=", length(qf.data), ", pin=0x",
-          string(qf.model_version; base=16), ")")
+    print(io, "QuadField{", T, "}(npoints=", length(qf.data), ", pin=0x", string(qf.model_version; base=16), ")")
 end
 
 # ── Detecting point-keyed state ──────────────────────────────────────────────
 #
-# `q.point` is an index into ONE model's quadrature cloud. A verb that
-# re-evaluates forms it did not write, on a second cloud — `estimate`, which
-# assembles the caller's own blocks and loads on an order-elevated twin —
-# therefore hands a form built for `model` the twin's indices: out of range
-# where the base plan is the smaller of the two, and silently at the wrong
-# points where it is not. The `QuadField` pin already separates the two models,
-# and has since the pin became a digest of the discretisation rather than a
-# counter. What it could not do is reach the indexing site: `qf[q.point]` is an
-# ordinary `getindex` on a vector, and the form owns the call.
+# `q.point` is an index into ONE model's quadrature cloud. A verb that re-evaluates forms it did not write, on a second
+# cloud — `estimate`, which assembles the caller's own blocks and loads on an order-elevated twin — therefore hands a
+# form built for `model` the twin's indices: out of range where the base plan is the smaller of the two, and silently at
+# the wrong points where it is not. The `QuadField` pin already separates the two models, and has since the pin became a
+# digest of the discretisation rather than a counter. What it could not do is reach the indexing site: `qf[q.point]` is
+# an ordinary `getindex` on a vector, and the form owns the call.
 #
-# Two layers bring the identity there, and they cover different cases because
-# a form can hold its state in two different ways.
+# Two layers bring the identity there, and they cover different cases because a form can hold its state in two different
+# ways.
 #
-# The first is this walk, run once by `estimate` before it builds anything. It
-# looks for a `QuadField` among the form's own captures, which is where the
-# documented mechanism puts it: `conduction(chi)` returning a closure over
-# `chi` is the shape `examples/applications/thermal_curing_2d` uses and the one
-# the `QuadField` docstring describes. Finding it there costs one reflective
-# walk per `estimate` call, nothing per point, and lets the refusal name the
-# field and both pins before the expensive half of the call.
+# The first is this walk, run once by `estimate` before it builds anything. It looks for a `QuadField` among the form's
+# own captures, which is where the documented mechanism puts it: `conduction(chi)` returning a closure over `chi` is the
+# shape `examples/applications/thermal_curing_2d` uses and the one the `QuadField` docstring describes. Finding it there
+# costs one reflective walk per `estimate` call, nothing per point, and lets the refusal name the field and both pins
+# before the expensive half of the call.
 #
-# The walk is bounded rather than exhaustive: it follows struct fields and the
-# elements of tuples, named tuples, arrays and dictionaries to `depth` levels,
-# skipping arrays of bits types (coefficient vectors, masks, meshes), and
-# returns the first field it finds. Missing one is a false negative and never a
-# false alarm, which is the safe direction for a guard that raises.
+# The walk is bounded rather than exhaustive: it follows struct fields and the elements of tuples, named tuples, arrays
+# and dictionaries to `depth` levels, skipping arrays of bits types (coefficient vectors, masks, meshes), and returns
+# the first field it finds. Missing one is a false negative and never a false alarm, which is the safe direction for a
+# guard that raises.
 #
-# The second layer is `_FOREIGN_CLOUD` and the branch in `getindex`, and it
-# exists because the first has one blind spot that reflection cannot close: a
-# form written at top level reads a *global* binding rather than capturing it,
-# so its closure has no fields at all and carries no evidence of the state it
-# reads. Scoping the pin over the foreign assembly catches that at the read
-# instead, and cannot raise on anything legitimate — the twin is built fresh
-# inside the call, so no field in existence can carry its pin.
+# The second layer is `_FOREIGN_CLOUD` and the branch in `getindex`, and it exists because the first has one blind spot
+# that reflection cannot close: a form written at top level reads a *global* binding rather than capturing it, so its
+# closure has no fields at all and carries no evidence of the state it reads. Scoping the pin over the foreign assembly
+# catches that at the read instead, and cannot raise on anything legitimate — the twin is built fresh inside the call,
+# so no field in existence can carry its pin.
 #
-# What the branch costs, measured on helios (`assemble_matrix` of a stiffness
-# form whose integrand reads `chi[q.point]`, four threads, min of seven per
-# run, three runs each way): at 36 864 quadrature points, 7.57/7.70/8.05 ms
-# with the branch against 7.64/7.56/8.16 ms without it at `-O2`, and
-# 44.0/47.6 ms against 44.0/44.7 at `-O0` — a difference the noise swallows. At
-# 9 216 points, 0.95/1.09/0.98 ms against 0.91/0.88/0.94 at `-O2`: at most a
-# tenth of a millisecond, and only forms that actually read a `QuadField` pay
-# any of it. Forms that carry no per-point state never reach this code.
+# What the branch costs, measured on helios (`assemble_matrix` of a stiffness form whose integrand reads `chi[q.point]`,
+# four threads, min of seven per run, three runs each way): at 36 864 quadrature points, 7.57/7.70/8.05 ms with the
+# branch against 7.64/7.56/8.16 ms without it at `-O2`, and 44.0/47.6 ms against 44.0/44.7 at `-O0` — a difference the
+# noise swallows. At 9 216 points, 0.95/1.09/0.98 ms against 0.91/0.88/0.94 at `-O2`: at most a tenth of a millisecond,
+# and only forms that actually read a `QuadField` pay any of it. Forms that carry no per-point state never reach this
+# code.
 function _captured_quadfield(x, depth::Int=6)
     x isa QuadField && return x
     depth <= 0 && return nothing
@@ -207,10 +177,9 @@ function _captured_quadfield(x, depth::Int=6)
     return nothing
 end
 
-# Refuse `verb` on a problem whose forms carry per-quadrature-point state. The
-# message names the field's own pin, which is what identifies the model its
-# `q.point` numbering belongs to. Called by `estimate` (`adaptivity.jl`), whose
-# name it takes as `verb`.
+# Refuse `verb` on a problem whose forms carry per-quadrature-point state. The message names the field's own pin, which
+# is what identifies the model its `q.point` numbering belongs to. Called by `estimate` (`adaptivity.jl`), whose name it
+# takes as `verb`.
 function _assert_no_point_keyed_state(problem, verb::AbstractString)
     for form in Iterators.flatten((problem.blocks, problem.loads))
         qf = _captured_quadfield(form.form)
@@ -232,72 +201,57 @@ end
 """
     RBFP0(; neighbors=10)
 
-Inverse-multiquadric radial basis function interpolation with a
-constant polynomial extension. The interpolant at a target point `x`
-is
+Inverse-multiquadric radial basis function interpolation with a constant polynomial extension. The interpolant at a
+target point `x` is
 
     f̂(x) = Σ_{i=1}^{K} wᵢ · ψ(‖xᵢ − x‖ / r̄) + α,
 
-with `xᵢ` the `K` nearest source neighbours (`K = neighbors`),
-`ψ(r) = 1 / √(1 + r²)` the inverse-multiquadric kernel, `r̄` the mean
-pairwise neighbour distance (rescaling so the kernel argument is
-dimensionless), and `(w, α)` solved from the `(K+1) × (K+1)` system
+with `xᵢ` the `K` nearest source neighbours (`K = neighbors`), `ψ(r) = 1 / √(1 + r²)` the inverse-multiquadric kernel,
+`r̄` the mean pairwise neighbour distance (rescaling so the kernel argument is dimensionless), and `(w, α)` solved from
+the `(K+1) × (K+1)` system
 
     [ A  1 ] [ w ]   [ fᵢ ]
     [ 1ᵀ 0 ] [ α ] = [ 0  ],   Aᵢⱼ = ψ(‖xᵢ − xⱼ‖ / r̄).
 
-The polynomial extension makes the scheme exact for constant fields by
-construction and approximately linear-exact for smooth fields. It is
-robust at element boundaries (no element-mapping inversion required)
-and matches Sartorti & Düster's recommendation for point-based
-history-data transfer:
+The polynomial extension makes the scheme exact for constant fields by construction and approximately linear-exact for
+smooth fields. It is robust at element boundaries (no element-mapping inversion required) and matches Sartorti &
+Düster's recommendation for point-based history-data transfer:
 
-> R. Sartorti, A. Düster, "Data transfer within a finite cell remeshing
-> approach applied to large deformation problems", Comput. Mech. 77 (2026),
-> [doi:10.1007/s00466-024-02486-0](https://doi.org/10.1007/s00466-024-02486-0).
+> R. Sartorti, A. Düster, "Data transfer within a finite cell remeshing approach applied to large deformation problems",
+> Comput. Mech. 77 (2026), [doi:10.1007/s00466-024-02486-0](https://doi.org/10.1007/s00466-024-02486-0).
 
-(See Sec. 3.3.1 of that work for an analysis of why the RBF + P0 scheme
-outperforms element-local interpolation in their hyperelastic FCM
-remeshing study.)
+(See Sec. 3.3.1 of that work for an analysis of why the RBF + P0 scheme outperforms element-local interpolation in their
+hyperelastic FCM remeshing study.)
 
-Neighbour counts up to `_RBFP0_MAX_NEIGHBORS = 16` use a
-`StaticArrays.SMatrix` solve and stay BLAS-free; larger counts are not
-currently supported.
+Neighbour counts up to `_RBFP0_MAX_NEIGHBORS = 16` use a `StaticArrays.SMatrix` solve and stay BLAS-free; larger counts
+are not currently supported.
 """
 struct RBFP0
     neighbors::Int
 end
 RBFP0(; neighbors::Int=10) = RBFP0(neighbors)
 
-# Maximum supported neighbour count for `RBFP0`. The local solve is a
-# `(K+1) × (K+1)` SMatrix system; the cap keeps the static-array path
-# performant and the per-target memory footprint tight.
+# Maximum supported neighbour count for `RBFP0`. The local solve is a `(K+1) × (K+1)` SMatrix system; the cap keeps the
+# static-array path performant and the per-target memory footprint tight.
 const _RBFP0_MAX_NEIGHBORS = 16
 
-# Inverse-multiquadric kernel `ψ(r) = 1 / √(1 + r²)`. Monotone
-# decreasing, positive, bounded by 1 at `r = 0`.
+# Inverse-multiquadric kernel `ψ(r) = 1 / √(1 + r²)`. Monotone decreasing, positive, bounded by 1 at `r = 0`.
 _rbf_invmq(r) = inv(sqrt(1 + r * r))
 
-# Build and solve the (K+1) × (K+1) RBF + P0 system as a static
-# `SMatrix`. Returns the solution `SVector` (length `K + 1`: K kernel
-# weights followed by the constant `α`) plus the `mean_r` rescaling
-# used so the evaluation path can reproduce it.
+# Build and solve the (K+1) × (K+1) RBF + P0 system as a static `SMatrix`. Returns the solution `SVector` (length
+# `K + 1`: K kernel weights followed by the constant `α`) plus the `mean_r` rescaling used so the evaluation path can
+# reproduce it.
 #
 # The system has the bordered form
 #
 #     [ A  1 ] [ w ]   [ fᵢ ]
 #     [ 1ᵀ 0 ] [ α ] = [ 0  ],   Aᵢⱼ = ψ(‖xᵢ − xⱼ‖ / r̄),
 #
-# where the bottom row enforces `Σ wᵢ = 0` (the standard polynomial
-# orthogonality condition). `r̄ = mean ‖xᵢ − xⱼ‖` is the natural
-# length scale; it is floored at `eps(T)` so a cluster of coincident
-# neighbours cannot divide by zero, and falls back to `1` at `K = 1`,
-# where there is no pair to average. The fallback value is arbitrary
-# there: the `K = 1` system is `[1 1; 1 0] [w; α] = [f₁; 0]`, whose
-# solution `w = 0`, `α = f₁` is nearest-neighbour extension at any
-# scale.
-function _rbfp0_static_solve(local_sources::NTuple{K,SVector{D,T}},
-                             local_values::NTuple{K,T}) where {K,D,T}
+# where the bottom row enforces `Σ wᵢ = 0` (the standard polynomial orthogonality condition). `r̄ = mean ‖xᵢ − xⱼ‖` is
+# the natural length scale; it is floored at `eps(T)` so a cluster of coincident neighbours cannot divide by zero, and
+# falls back to `1` at `K = 1`, where there is no pair to average. The fallback value is arbitrary there: the `K = 1`
+# system is `[1 1; 1 0] [w; α] = [f₁; 0]`, whose solution `w = 0`, `α = f₁` is nearest-neighbour extension at any scale.
+function _rbfp0_static_solve(local_sources::NTuple{K,SVector{D,T}}, local_values::NTuple{K,T}) where {K,D,T}
     mean_r = zero(T)
     pairs = 0
     @inbounds for i in 1:K, j in (i+1):K
@@ -324,10 +278,8 @@ function _rbfp0_static_solve(local_sources::NTuple{K,SVector{D,T}},
     return SMatrix(A) \ SVector(rhs), mean_r
 end
 
-# Evaluate the RBF + P0 interpolant at `x` given the local solve
-# returned by `_rbfp0_static_solve`. Same kernel `ψ(r) = 1 / √(1 + r²)`
-# and the same `mean_r` rescaling; the constant `sol[M]` is the
-# polynomial extension `α`.
+# Evaluate the RBF + P0 interpolant at `x` given the local solve returned by `_rbfp0_static_solve`. Same kernel
+# `ψ(r) = 1 / √(1 + r²)` and the same `mean_r` rescaling; the constant `sol[M]` is the polynomial extension `α`.
 function _rbfp0_evaluate(x::SVector{D,T}, local_sources::NTuple{K,SVector{D,T}}, sol::SVector{M,T},
                          mean_r::T) where {K,D,T,M}
     K + 1 == M || throw(ArgumentError("solution length $M does not match K + 1 = $(K + 1)"))
@@ -338,10 +290,9 @@ function _rbfp0_evaluate(x::SVector{D,T}, local_sources::NTuple{K,SVector{D,T}},
     return result
 end
 
-# Materialise the source quadrature-point cloud in two complementary
-# layouts: a `D × N` `Matrix{T}` for `NearestNeighbors.KDTree`
-# compatibility (it indexes points by column) and a
-# `Vector{SVector{D,T}}` for the small RBF solve below.
+# Materialise the source quadrature-point cloud in two complementary layouts: a `D × N` `Matrix{T}` for
+# `NearestNeighbors.KDTree` compatibility (it indexes points by column) and a `Vector{SVector{D,T}}` for the small RBF
+# solve below.
 function _collect_source_cloud(source_model::Model{D,T}) where {D,T}
     n = nquadpoints(source_model)
     points = Matrix{T}(undef, D, n)
@@ -361,41 +312,30 @@ end
 """
     transfer(source::QuadField, source_model, target_model; via=RBFP0(), threaded=true) -> QuadField
 
-Reconstruct `source` on `target_model`'s quadrature-point cloud with the
-[`RBFP0`](@ref) scheme `via`. Returns a fresh [`QuadField`](@ref) bound to
-`target_model`. The same verb `transfer` moves a [`Solution`](@ref) when given
-one.
+Reconstruct `source` on `target_model`'s quadrature-point cloud with the [`RBFP0`](@ref) scheme `via`. Returns a fresh
+[`QuadField`](@ref) bound to `target_model`. The same verb `transfer` moves a [`Solution`](@ref) when given one.
 
-`source` must be a `QuadField{T}` over the models' own scalar type `T`: the
-local solve carries neighbour coordinates and neighbour values in one type,
-so a component-valued state is transferred one component at a time. That one
-is not an argument check — a mismatched element type surfaces as a
-`MethodError` from the local solve. Two
-`ArgumentError`s guard the neighbour count — `1 ≤ via.neighbors ≤ 16` (the
-static-solve cap documented on [`RBFP0`](@ref)) and at least `via.neighbors`
-quadrature points on the source model.
+`source` must be a `QuadField{T}` over the models' own scalar type `T`: the local solve carries neighbour coordinates
+and neighbour values in one type, so a component-valued state is transferred one component at a time. That one is not an
+argument check — a mismatched element type surfaces as a `MethodError` from the local solve. Two `ArgumentError`s guard
+the neighbour count — `1 ≤ via.neighbors ≤ 16` (the static-solve cap documented on [`RBFP0`](@ref)) and at least
+`via.neighbors` quadrature points on the source model.
 
-Algorithm: build a `KDTree` over the source cloud; for each target
-quadrature point find the `via.neighbors` nearest source neighbours,
-run the local RBF + P0 solve on them, and evaluate the interpolant at
-the target point.
+Algorithm: build a `KDTree` over the source cloud; for each target quadrature point find the `via.neighbors` nearest
+source neighbours, run the local RBF + P0 solve on them, and evaluate the interpolant at the target point.
 
-The outer loop over target points is embarrassingly parallel: each
-target's small solve is independent and uses pure-Julia
-`StaticArrays` operations, so the result is bit-identical regardless
-of thread count for a fixed neighbour set. `threaded = true` is the
-default; `threaded = false` runs the same loop serially, which is how the
-suite asserts that the two paths agree bit for bit.
+The outer loop over target points is embarrassingly parallel: each target's small solve is independent and uses
+pure-Julia `StaticArrays` operations, so the result is bit-identical regardless of thread count for a fixed neighbour
+set. `threaded = true` is the default; `threaded = false` runs the same loop serially, which is how the suite asserts
+that the two paths agree bit for bit.
 """
-function transfer(source::QuadField, source_model::Model{D,T}, target_model::Model{D,T};
-                  via::RBFP0=RBFP0(), threaded::Bool=true) where {D,T}
+function transfer(source::QuadField, source_model::Model{D,T}, target_model::Model{D,T}; via::RBFP0=RBFP0(),
+                  threaded::Bool=true) where {D,T}
     source_data = _checked_quadfield(source, source_model)
     k = via.neighbors
-    1 <= k <= _RBFP0_MAX_NEIGHBORS ||
-        throw(ArgumentError("RBFP0 supports 1..$_RBFP0_MAX_NEIGHBORS neighbours; got $k"))
+    1 <= k <= _RBFP0_MAX_NEIGHBORS || throw(ArgumentError("RBFP0 supports 1..$_RBFP0_MAX_NEIGHBORS neighbours; got $k"))
     nsrc = length(source_data)
-    nsrc >= k ||
-        throw(ArgumentError("RBFP0 needs ≥ neighbors=$k source quadrature points, model only has $nsrc"))
+    nsrc >= k || throw(ArgumentError("RBFP0 needs ≥ neighbors=$k source quadrature points, model only has $nsrc"))
 
     # Source cloud + KD-tree built once; target points collected once.
     cloud_matrix, cloud_svecs = _collect_source_cloud(source_model)
@@ -408,9 +348,8 @@ function transfer(source::QuadField, source_model::Model{D,T}, target_model::Mod
         target_points[q.point] = q.x
     end
 
-    # Per-target work: K-nearest-neighbour query + local RBF + P0 solve.
-    # Pulled into a named closure so the threaded and serial branches
-    # below share the body.
+    # Per-target work: K-nearest-neighbour query + local RBF + P0 solve. Pulled into a named closure so the threaded and
+    # serial branches below share the body.
     function process(i)
         x = target_points[i]
         idxs, _ = knn(tree, x, k, true)
@@ -430,14 +369,11 @@ function transfer(source::QuadField, source_model::Model{D,T}, target_model::Mod
     return QuadField{T}(target_data, target_model.version)
 end
 
-# Materialise the `k` source neighbours' coordinates and values as
-# `NTuple`s so the small RBF + P0 solve runs on `SMatrix` / `SVector`.
-# The `Val(k)` closure keeps the body type-stable: every distinct
-# `k ∈ 1:_RBFP0_MAX_NEIGHBORS` produces its own specialised method.
-# An explicit `@generated` version would shave the dispatch overhead
-# slightly but is not necessary at the current `K ≤ 16` cap.
-@inline function _rbfp0_resolve(::Val{K}, x::SVector{D,T}, idxs::AbstractVector{Int},
-                                cloud::Vector{SVector{D,T}},
+# Materialise the `k` source neighbours' coordinates and values as `NTuple`s so the small RBF + P0 solve runs on
+# `SMatrix` / `SVector`. The `Val(k)` closure keeps the body type-stable: every distinct `k ∈ 1:_RBFP0_MAX_NEIGHBORS`
+# produces its own specialised method. An explicit `@generated` version would shave the dispatch overhead slightly but
+# is not necessary at the current `K ≤ 16` cap.
+@inline function _rbfp0_resolve(::Val{K}, x::SVector{D,T}, idxs::AbstractVector{Int}, cloud::Vector{SVector{D,T}},
                                 source_data::AbstractVector{T}) where {K,D,T}
     local_sources = ntuple(j -> cloud[idxs[j]], Val(K))
     local_values = ntuple(j -> source_data[idxs[j]], Val(K))

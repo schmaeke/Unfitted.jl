@@ -1,9 +1,8 @@
 using BenchmarkTools
 using Unfitted
 
-# Smaller version of examples/reproductions/singular_square_2d/ (4 refinements instead of 8
-# to keep bench wall time reasonable). Nested overlays stress `_merged_boxes`
-# and the per-region triplet emit.
+# Smaller version of examples/reproductions/singular_square_2d/ (4 refinements instead of 8 to keep bench wall time
+# reasonable). Nested overlays stress `_merged_boxes` and the per-region triplet emit.
 group = SUITE["scenarios"]["singular_corner"] = BenchmarkGroup()
 
 let
@@ -21,8 +20,7 @@ let
     V = space(omega; cells=base_cells, order=max_order)
     for i in 1:no_refinements
         side = overlay_ratio^i
-        V = overlay(V, box((0.0, 0.0), (side, side)); cells=overlay_cells,
-                    order=max(1, max_order - i))
+        V = overlay(V, box((0.0, 0.0), (side, side)); cells=overlay_cells, order=max(1, max_order - i))
     end
 
     problem = poisson(V; source,

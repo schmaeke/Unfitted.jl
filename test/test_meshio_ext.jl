@@ -1,21 +1,19 @@
 using StaticArrays
 using LinearAlgebra
 using Random
-# Loading FileIO + MeshIO activates `UnfittedMeshIOExt` (GeometryBasics, the
-# third trigger, comes transitively as MeshIO's dependency). It is deliberately
-# *not* imported here: GeometryBasics also exports `triangle_mesh`, which would
+# Loading FileIO + MeshIO activates `UnfittedMeshIOExt` (GeometryBasics, the third trigger, comes transitively as
+# MeshIO's dependency). It is deliberately *not* imported here: GeometryBasics also exports `triangle_mesh`, which would
 # shadow Unfitted's.
 using FileIO
 using MeshIO
 
 # ── 3D cube (triangle surface) ────────────────────────────────────────────────
 
-# A cube [lo,hi]³ as an outward-oriented triangle mesh (8 vertices, 12
-# triangles). Cube faces are planar, so each cut cell sees a linear signed
-# distance and the volume integrates exactly.
+# A cube [lo,hi]³ as an outward-oriented triangle mesh (8 vertices, 12 triangles). Cube faces are planar, so each cut
+# cell sees a linear signed distance and the volume integrates exactly.
 function _cube_mesh(lo, hi)
-    v = [SVector(lo, lo, lo), SVector(hi, lo, lo), SVector(hi, hi, lo), SVector(lo, hi, lo),
-         SVector(lo, lo, hi), SVector(hi, lo, hi), SVector(hi, hi, hi), SVector(lo, hi, hi)]
+    v = [SVector(lo, lo, lo), SVector(hi, lo, lo), SVector(hi, hi, lo), SVector(lo, hi, lo), SVector(lo, lo, hi),
+         SVector(hi, lo, hi), SVector(hi, hi, hi), SVector(lo, hi, hi)]
     quads = [(1, 4, 3, 2), (5, 6, 7, 8), (1, 2, 6, 5), (2, 3, 7, 6), (3, 4, 8, 7), (4, 1, 5, 8)]
     faces = NTuple{3,Int}[]
     for (a, b, c, d) in quads
@@ -50,18 +48,17 @@ function _write_ascii_stl(path, v, faces)
     return path
 end
 
-# Analytic membership for a 3D L-shaped prism (reflex edge + vertices), where an
-# equal-weight pseudonormal would mis-sign the reflex Voronoi cone.
+# Analytic membership for a 3D L-shaped prism (reflex edge + vertices), where an equal-weight pseudonormal would
+# mis-sign the reflex Voronoi cone.
 function _inside_L3(p)
     (-1e-9 <= p[3] <= 1 + 1e-9) && (((-1e-9 <= p[1] <= 2 + 1e-9) && (-1e-9 <= p[2] <= 1 + 1e-9)) ||
                                     ((-1e-9 <= p[1] <= 1 + 1e-9) && (-1e-9 <= p[2] <= 2 + 1e-9)))
 end
 
-# L-prism as a watertight triangle mesh, auto-oriented outward via `_inside_L3`.
-# Both caps are fanned from the reflex vertex (1,1) — vertex 4 below, 11 above.
-# Any other hub spans the three collinear vertices at y = 1 with a single edge
-# and leaves a T-junction at (1,1), i.e. a cap edge with no matching partner in
-# the wall, which `mesh_levelset` rejects as an unclosed mesh.
+# L-prism as a watertight triangle mesh, auto-oriented outward via `_inside_L3`. Both caps are fanned from the reflex
+# vertex (1,1) — vertex 4 below, 11 above. Any other hub spans the three collinear vertices at y = 1 with a single edge
+# and leaves a T-junction at (1,1), i.e. a cap edge with no matching partner in the wall, which `mesh_levelset` rejects
+# as an unclosed mesh.
 function _lprism_mesh()
     poly = [(0.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0), (1.0, 2.0), (0.0, 2.0), (0.0, 1.0)]
     n = length(poly)
@@ -72,8 +69,8 @@ function _lprism_mesh()
     for (x, y) in poly
         push!(verts, SVector(x, y, 1.0))
     end
-    faces = NTuple{3,Int}[(4, 5, 6), (4, 6, 7), (4, 7, 1), (4, 1, 2), (4, 2, 3), (11, 12, 13),
-                          (11, 13, 14), (11, 14, 8), (11, 8, 9), (11, 9, 10)]
+    faces = NTuple{3,Int}[(4, 5, 6), (4, 6, 7), (4, 7, 1), (4, 1, 2), (4, 2, 3), (11, 12, 13), (11, 13, 14),
+                          (11, 14, 8), (11, 8, 9), (11, 9, 10)]
     for i in 1:n
         j = i % n + 1
         push!(faces, (i, j, j + n))
@@ -87,9 +84,8 @@ function _lprism_mesh()
     return verts, faces
 end
 
-# Point-to-triangle distance, independent of the extension's Voronoi-region
-# routine: the in-plane projection when it lands inside the triangle, else the
-# nearest point on an edge.
+# Point-to-triangle distance, independent of the extension's Voronoi-region routine: the in-plane projection when it
+# lands inside the triangle, else the nearest point on an edge.
 function _segment_distance(a, b, p)
     ab = b - a
     return norm(p - (a + clamp(dot(p - a, ab) / dot(ab, ab), 0, 1) * ab))
@@ -110,8 +106,7 @@ _square_poly(lo, hi) = [SVector(lo, lo), SVector(hi, lo), SVector(hi, hi), SVect
 
 # CCW L-polygon with a reflex vertex at (1,1), and its analytic membership.
 function _lpoly2d()
-    [SVector(0.0, 0.0), SVector(2.0, 0.0), SVector(2.0, 1.0), SVector(1.0, 1.0), SVector(1.0, 2.0),
-     SVector(0.0, 2.0)]
+    [SVector(0.0, 0.0), SVector(2.0, 0.0), SVector(2.0, 1.0), SVector(1.0, 1.0), SVector(1.0, 2.0), SVector(0.0, 2.0)]
 end
 function _inside_L2(p)
     ((-1e-9 <= p[1] <= 2 + 1e-9) && (-1e-9 <= p[2] <= 1 + 1e-9)) ||
@@ -122,8 +117,7 @@ end
 function _mesh_volume(geom, region; gp=4, ms=3)
     leaves = Any[l.f for l in Unfitted._leaves(geom)]
     membership = x -> Unfitted._inside(geom, x)
-    pts, wts = Unfitted.implicit_volume_quadrature(leaves, membership, region; gauss_points=gp,
-                                                   max_subdiv=ms)
+    pts, wts = Unfitted.implicit_volume_quadrature(leaves, membership, region; gauss_points=gp, max_subdiv=ms)
     return sum(wts; init=0.0)
 end
 
@@ -202,8 +196,8 @@ end
     v, f = _cube_mesh(0.2, 0.8)
     push!(v, SVector(0.5, 0.5, 0.5))
     nv = length(v)
-    # A zero-area triangle (repeated vertex) and a collinear sliver. v[1] and
-    # v[2] are (0.2,0.2,0.2) and (0.8,0.2,0.2); the midpoint is collinear.
+    # A zero-area triangle (repeated vertex) and a collinear sliver. v[1] and v[2] are (0.2,0.2,0.2) and (0.8,0.2,0.2);
+    # the midpoint is collinear.
     push!(v, SVector(0.5, 0.2, 0.2))
     bad_faces = vcat(f, [(nv, nv, nv), (1, 2, nv + 1)])
     sdf = Unfitted._leaves(mesh_levelset(triangle_mesh(v, bad_faces)))[1].f
@@ -212,22 +206,17 @@ end
 end
 
 @testset "MeshIO ext — an unclosed or inside-out mesh is rejected, not answered" begin
-    # Each of these used to return a plausible distance with the sign inverted
-    # over part of space. The pseudonormal is exact only on a closed, outward
-    # mesh, so anything else must fail at construction.
+    # Each of these used to return a plausible distance with the sign inverted over part of space. The pseudonormal is
+    # exact only on a closed, outward mesh, so anything else must fail at construction.
     v, f = _cube_mesh(0.2, 0.8)
     @test_throws ArgumentError mesh_levelset(triangle_mesh(v, f[1:(end-2)]))     # a hole
     flipped = [i == 1 ? (f[1][1], f[1][3], f[1][2]) : f[i] for i in eachindex(f)]
     @test_throws ArgumentError mesh_levelset(triangle_mesh(v, flipped))          # one facet
     @test_throws ArgumentError mesh_levelset(triangle_mesh(v, [(a, c, b) for (a, b, c) in f]))
     @test_throws ArgumentError mesh_levelset(polyline_mesh(_square_poly(0.2, 0.8)))   # open 2D
-    @test_throws ArgumentError mesh_levelset(polyline_mesh(reverse(_square_poly(0.2, 0.8));
-                                                           closed=true))              # clockwise
-    # A zero normal normalises to NaN, under which every sign test is false and
-    # the whole space reads as inside.
-    @test_throws ArgumentError mesh_levelset(triangle_mesh(v, f;
-                                                           normals=[SVector(0.0, 0.0, 0.0)
-                                                                    for _ in f]))
+    @test_throws ArgumentError mesh_levelset(polyline_mesh(reverse(_square_poly(0.2, 0.8)); closed=true))   # clockwise
+    # A zero normal normalises to NaN, under which every sign test is false and the whole space reads as inside.
+    @test_throws ArgumentError mesh_levelset(triangle_mesh(v, f; normals=[SVector(0.0, 0.0, 0.0) for _ in f]))
     empty_stl = tempname() * ".stl"
     write(empty_stl, "solid s\nendsolid s\n")
     @test_throws ArgumentError stl_levelset(empty_stl)
@@ -235,10 +224,9 @@ end
 end
 
 @testset "MeshIO ext — vertex welding absorbs an STL's Float32 corners" begin
-    # The closedness check pairs cell faces through welded vertices, and an STL
-    # stores every facet's corners separately in Float32: one corner reached
-    # through two facets can differ by an ulp. Such a mesh is sound, and welding
-    # tighter than that ulp would report it as full of holes.
+    # The closedness check pairs cell faces through welded vertices, and an STL stores every facet's corners separately
+    # in Float32: one corner reached through two facets can differ by an ulp. Such a mesh is sound, and welding tighter
+    # than that ulp would report it as full of holes.
     v, f = _cube_mesh(200.0, 800.0)
     rng = MersenneTwister(23)
     verts = SVector{3,Float64}[]
@@ -254,9 +242,8 @@ end
 end
 
 @testset "MeshIO ext — winding mode takes the meshes pseudonormal rejects" begin
-    # The documented recourse for an imperfect mesh: an open box still signs
-    # correctly away from the hole, and its Lipschitz declaration drops to Inf
-    # because the sign jumps across the gap at a positive distance from any cell.
+    # The documented recourse for an imperfect mesh: an open box still signs correctly away from the hole, and its
+    # Lipschitz declaration drops to Inf because the sign jumps across the gap at a positive distance from any cell.
     v, f = _cube_mesh(0.2, 0.8)
     ls = mesh_levelset(triangle_mesh(v, f[1:(end-2)]); orientation=:winding)
     @test Unfitted._leaves(ls)[1].lipschitz == Inf
@@ -273,11 +260,10 @@ end
 end
 
 @testset "MeshIO ext — nearest-cell search is exact and the distance is 1-Lipschitz" begin
-    # The KD-tree is keyed on cell midpoints, and the nearest midpoint is not
-    # the nearest cell; the candidate radius `nearest + maxcr` is what makes the
-    # search exact. Checked against an independent brute force over every cell —
-    # and with the search exact and the mesh closed, the leaf is a true signed
-    # distance, which is the `lipschitz = 1.0` the extension declares.
+    # The KD-tree is keyed on cell midpoints, and the nearest midpoint is not the nearest cell; the candidate radius
+    # `nearest + maxcr` is what makes the search exact. Checked against an independent brute force over every cell — and
+    # with the search exact and the mesh closed, the leaf is a true signed distance, which is the `lipschitz = 1.0` the
+    # extension declares.
     verts, faces = _lprism_mesh()
     mesh = triangle_mesh(verts, faces)
     cells = [map(x -> SVector{3,Float64}(x), c) for c in mesh.cells]
@@ -310,8 +296,8 @@ end
 end
 
 @testset "MeshIO ext — sign is scale-free" begin
-    # The pseudonormal sign tolerances scale with the mesh, so the sign is
-    # correct on meshes in physical units far from O(1) (µm, km, …).
+    # The pseudonormal sign tolerances scale with the mesh, so the sign is correct on meshes in physical units far from
+    # O(1) (µm, km, …).
     for S in (1.0e-6, 1.0e6)
         v, f = _cube_mesh(0.2 * S, 0.8 * S)
         sdf = Unfitted._leaves(mesh_levelset(triangle_mesh(v, f)))[1].f
@@ -321,9 +307,8 @@ end
 end
 
 @testset "MeshIO ext — non-axis-aligned mesh signs correctly" begin
-    # All other 3D fixtures have grid-aligned facets; a rotated cube exercises
-    # tilted facets (the case the per-fiber Gauss order must handle) and a
-    # non-trivial pseudonormal. Validate the sign against the analytic membership
+    # All other 3D fixtures have grid-aligned facets; a rotated cube exercises tilted facets (the case the per-fiber
+    # Gauss order must handle) and a non-trivial pseudonormal. Validate the sign against the analytic membership
     # obtained by rotating the query back into the cube frame.
     θ, ψ = 0.6, 0.4
     Rz = SMatrix{3,3}(cos(θ), sin(θ), 0.0, -sin(θ), cos(θ), 0.0, 0.0, 0.0, 1.0)
@@ -364,9 +349,8 @@ end
 end
 
 @testset "MeshIO ext — 2D non-convex polygon signs correctly" begin
-    # The L-polygon has a reflex vertex at (1,1). In 2D the plain n₁+n₂ vertex
-    # pseudonormal is already correct, so the sign must match the analytic
-    # membership everywhere.
+    # The L-polygon has a reflex vertex at (1,1). In 2D the plain n₁+n₂ vertex pseudonormal is already correct, so the
+    # sign must match the analytic membership everywhere.
     sdf = Unfitted._leaves(mesh_levelset(polyline_mesh(_lpoly2d(); closed=true)))[1].f
     rng = MersenneTwister(11)
     tested = 0
@@ -381,16 +365,13 @@ end
     @test tested > 5000
     @test bad == 0
     # Winding mode agrees, including in the reentrant notch.
-    sw = Unfitted._leaves(mesh_levelset(polyline_mesh(_lpoly2d(); closed=true);
-                                        orientation=:winding))[1].f
+    sw = Unfitted._leaves(mesh_levelset(polyline_mesh(_lpoly2d(); closed=true); orientation=:winding))[1].f
     @test (sw(SVector(1.5, 1.5)) < 0) == _inside_L2(SVector(1.5, 1.5))
     @test (sw(SVector(0.5, 0.5)) < 0) == _inside_L2(SVector(0.5, 0.5))
 end
 
 @testset "MeshIO ext — mesh_levelset rejects unsupported simplex dimensions" begin
-    # K=1 segments in 3D (a curve, no enclosed region) and K=2 triangles in 2D
-    # are not closed-boundary cases.
-    seg3d = segment_mesh([(SVector(0.0, 0.0, 0.0), SVector(1.0, 0.0, 0.0))];
-                         normals=[SVector(0.0, 1.0, 0.0)])
+    # K=1 segments in 3D (a curve, no enclosed region) and K=2 triangles in 2D are not closed-boundary cases.
+    seg3d = segment_mesh([(SVector(0.0, 0.0, 0.0), SVector(1.0, 0.0, 0.0))]; normals=[SVector(0.0, 1.0, 0.0)])
     @test_throws ArgumentError mesh_levelset(seg3d)
 end

@@ -27,8 +27,7 @@ end
     base_coefficients = copy(coefficients)
     base_coefficients[overlay_dofs[3]] = 0.0
     solution = Solution(coefficients, model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
-    base_solution = Solution(base_coefficients, model.version,
-                             Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    base_solution = Solution(base_coefficients, model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
     @test value(solution, model, (0.1,)) ≈ value(base_solution, model, (0.1,))
 
@@ -50,14 +49,11 @@ end
 end
 
 @testset "l2_error pins the integration measure absolutely" begin
-    # ‖c‖_{L²(Ω)} = |c|·√|Ω| in closed form, so a constant field measured
-    # against a zero reference fixes the quadrature measure by its absolute
-    # value. Every other l2_error assertion in the suite is `< tiny` or a
-    # ratio, and no positive rescaling of the measure — a dropped 2⁻ᴰ box
-    # Jacobian, say — can violate one of those. The 2D/3D pair pins the
-    # exponent of such a factor, not merely its presence. Order 1 is a
-    # partition of unity, so a uniform coefficient vector is exactly the
-    # constant field, and `value` re-checks that at an off-grid point.
+    # ‖c‖_{L²(Ω)} = |c|·√|Ω| in closed form, so a constant field measured against a zero reference fixes the quadrature
+    # measure by its absolute value. Every other l2_error assertion in the suite is `< tiny` or a ratio, and no positive
+    # rescaling of the measure — a dropped 2⁻ᴰ box Jacobian, say — can violate one of those. The 2D/3D pair pins the
+    # exponent of such a factor, not merely its presence. Order 1 is a partition of unity, so a uniform coefficient
+    # vector is exactly the constant field, and `value` re-checks that at an off-grid point.
 
     # 2D: |Ω| = 2·2 = 4, c = 3 ⇒ ‖c‖ = 3·√4 = 6.
     omega = box((0.0, 0.0), (2.0, 2.0))
@@ -67,8 +63,7 @@ end
 
     @test value(solution, model, (0.7, 1.3)) ≈ 3.0
     @test l2_error(solution, model, x -> 0.0; norm=:absolute) ≈ 6.0 rtol = 1.0e-14
-    # A zero reference has no norm to divide by, so the relative form
-    # documents a fall back to the absolute one.
+    # A zero reference has no norm to divide by, so the relative form documents a fall back to the absolute one.
     @test l2_error(solution, model, x -> 0.0) ≈ 6.0 rtol = 1.0e-14
 
     # 3D: |Ω| = 3·3·1 = 9, c = 5 ⇒ ‖c‖ = 5·√9 = 15.
@@ -90,10 +85,8 @@ end
 
     @test_throws ArgumentError value(solution, model, (0.5,))
     @test_throws ArgumentError l2_error(solution, model, x -> 0.0)
-    @test_throws ArgumentError value(Solution(ones(Unfitted.active_unknowns(model.dofs)),
-                                              model.version,
-                                              Unfitted.SolverDiagnostics(:manual, 0.0, true)),
-                                     model, (1.5,))
+    @test_throws ArgumentError value(Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
+                                              Unfitted.SolverDiagnostics(:manual, 0.0, true)), model, (1.5,))
 end
 
 @testset "active_unknowns(model) public accessor" begin
@@ -113,9 +106,8 @@ end
 
     @test cell_indices(m) == CartesianIndices((4, 2))
 
-    # Each cell box's center sits on the midpoint of its axis-aligned grid
-    # interval; collecting them should reproduce the tensor product of
-    # per-axis interval midpoints (−0.75, −0.25, 0.25, 0.75) × (−0.5, 0.5).
+    # Each cell box's center sits on the midpoint of its axis-aligned grid interval; collecting them should reproduce
+    # the tensor product of per-axis interval midpoints (−0.75, −0.25, 0.25, 0.75) × (−0.5, 0.5).
     centers = [center(cell_box(m, ci)) for ci in cell_indices(m)]
     @test centers[CartesianIndex(1, 1)] ≈ [-0.75, -0.5]
     @test centers[CartesianIndex(4, 2)] ≈ [0.75, 0.5]
@@ -137,8 +129,8 @@ end
     @test boundary_integral(q -> 1.0, model; on=boundary(:all)) ≈ 4.0
     @test boundary_integral(q -> 1.0, model; on=boundary(axis=1, side=:lower)) ≈ 1.0
     @test boundary_integral(q -> 1.0, model; on=boundary(axis=2, side=:upper)) ≈ 1.0
-    @test boundary_integral(q -> 1.0, model;
-                            on=boundary((axis=1, side=:lower), (axis=2, side=:lower))) ≈ 1.0  # codim-2 point
+    # codim-2 point
+    @test boundary_integral(q -> 1.0, model; on=boundary((axis=1, side=:lower), (axis=2, side=:lower))) ≈ 1.0
 
     # 3D unit cube: ∫_∂Ω 1 ds == 6 (six unit faces), per-face == 1.
     cube = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
@@ -150,18 +142,16 @@ end
 end
 
 @testset "boundary_integral: analytic trace on a solved Laplace problem" begin
-    # Solve −Δu = 0 on (0,1)² with the manufactured u(x,y) = x y. The
-    # space resolves this exactly at p = 1, so the trace on y = 1 is
-    # u(x,1) = x and ∫₀¹ x dx = 1/2, while the gradient on x = 1 is
-    # ∇u = (y, x) so ∫₀¹ ∂u/∂n ds = ∫₀¹ y dy = 1/2.
+    # Solve −Δu = 0 on (0,1)² with the manufactured u(x,y) = x y. The space resolves this exactly at p = 1, so the trace
+    # on y = 1 is u(x,1) = x and ∫₀¹ x dx = 1/2, while the gradient on x = 1 is ∇u = (y, x) so ∫₀¹ ∂u/∂n ds = ∫₀¹ y dy =
+    # 1/2.
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(2, 2), order=2)
     exact_value(x) = x[1] * x[2]
     model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(exact_value; on=boundary(:all))]))
     sol = solve!(model)
 
-    top_trace = boundary_integral(q -> value(sol, model, q.x), model;
-                                  on=boundary(axis=2, side=:upper))
+    top_trace = boundary_integral(q -> value(sol, model, q.x), model; on=boundary(axis=2, side=:upper))
     @test top_trace ≈ 0.5 atol = 1.0e-10
 
     right_flux = boundary_integral(model; on=boundary(axis=1, side=:upper)) do q
@@ -171,11 +161,9 @@ end
 end
 
 @testset "boundary_integral: overlay coverage on a shared face" begin
-    # An overlay whose own face coincides with the physical face should
-    # contribute to the boundary integral; the integral of `1` over that
-    # face must still equal its physical length (the helper does not
-    # double-count overlapping parents — it sums Jacobian × Gauss
-    # weights once per admissible region).
+    # An overlay whose own face coincides with the physical face should contribute to the boundary integral; the
+    # integral of `1` over that face must still equal its physical length (the helper does not double-count overlapping
+    # parents — it sums Jacobian × Gauss weights once per admissible region).
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(2, 2), order=1)
     V = overlay(V, box((0.0, 0.0), (0.5, 0.5)); cells=(1, 1), order=2)
@@ -206,16 +194,14 @@ end
     @test first_normal(boundary(axis=2, side=:lower)) ≈ [0.0, -1.0]
     @test first_normal(boundary(axis=2, side=:upper)) ≈ [0.0, 1.0]
 
-    # Codim-2 corner (vertex in 2D): unit average of the constrained
-    # face normals; well-defined and finite.
+    # Codim-2 corner (vertex in 2D): unit average of the constrained face normals; well-defined and finite.
     n_corner = first_normal(boundary((axis=1, side=:lower), (axis=2, side=:lower)))
     @test n_corner ≈ [-1.0, -1.0] / sqrt(2.0)
 end
 
 @testset "boundary_integral on a coupled model needs a field and honours it" begin
-    # Two disjoint unit squares. Each has perimeter 4, so ∂Ω of the pair is 8.
-    # Without `field=`, `boundary_integral` used to resolve `boundary(:all)` to
-    # whichever subdomain a form referenced first and return 4.0 — a plausible
+    # Two disjoint unit squares. Each has perimeter 4, so ∂Ω of the pair is 8. Without `field=`, `boundary_integral`
+    # used to resolve `boundary(:all)` to whichever subdomain a form referenced first and return 4.0 — a plausible
     # number for the wrong domain, with nothing to signal the omission.
     V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
     V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(3, 3), order=1)
@@ -225,8 +211,8 @@ end
                             dirichlet=[dirichlet(0.0; on=boundary(:all), field=:u1),
                                        dirichlet(0.0; on=boundary(:all), field=:u2)]))
 
-    # Naming the subdomain gives that subdomain's boundary — including the
-    # second one, whose facets the shared cache entry never held.
+    # Naming the subdomain gives that subdomain's boundary — including the second one, whose facets the shared cache
+    # entry never held.
     @test boundary_integral(q -> 1.0, model; on=boundary(:all), field=:u1) ≈ 4.0
     @test boundary_integral(q -> 1.0, model; on=boundary(:all), field=:u2) ≈ 4.0
 
@@ -253,24 +239,22 @@ end
     # An unknown field name is still an error, not a silent fallback.
     @test_throws ArgumentError boundary_integral(q -> 1.0, model; on=boundary(:all), field=:nope)
 
-    # Single-domain models are unaffected: `field` is optional and, when given,
-    # agrees with the default exactly.
+    # Single-domain models are unaffected: `field` is optional and, when given, agrees with the default exactly.
     single = prepare(poisson(V1; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     @test boundary_integral(q -> 1.0, single; on=boundary(:all)) ==
           boundary_integral(q -> 1.0, single; on=boundary(:all), field=:u)
 end
 
 @testset "l2_error takes a field and measures that subdomain only" begin
-    # Two disjoint squares carrying different L² projections. Without a field
-    # argument `l2_error` could only reach `_default_field`, which raises on any
-    # multi-field problem — so the package's own coupled workflow had no L²
-    # error report at all.
+    # Two disjoint squares carrying different L² projections. Without a field argument `l2_error` could only reach
+    # `_default_field`, which raises on any multi-field problem — so the package's own coupled workflow had no L² error
+    # report at all.
     V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
     V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(3, 3), order=1)
     u1 = field(:u1, V1)
     u2 = field(:u2, V2)
-    # Both data are bilinear, hence exactly representable in the order-1 tensor
-    # space, so each projection reproduces its own datum to round-off.
+    # Both data are bilinear, hence exactly representable in the order-1 tensor space, so each projection reproduces its
+    # own datum to round-off.
     f1 = x -> x[1]
     f2 = x -> 2 * x[2]
     model = prepare(Problem((u1, u2); blocks=(mass_block(u1), mass_block(u2)),
@@ -280,27 +264,25 @@ end
     @test l2_error(sol, model, u1, f1; norm=:absolute) < 1.0e-10
     @test l2_error(sol, model, u2, f2; norm=:absolute) < 1.0e-10
 
-    # Swapping the datum is a large error, so the field argument really selects
-    # which subdomain is integrated rather than being ignored.
+    # Swapping the datum is a large error, so the field argument really selects which subdomain is integrated rather
+    # than being ignored.
     @test l2_error(sol, model, u1, f2; norm=:absolute) > 0.1
     @test l2_error(sol, model, u2, f1; norm=:absolute) > 0.1
 
-    # Omitting the field still raises on a multi-field model, and an unknown
-    # field name is an error rather than a silent fallback.
+    # Omitting the field still raises on a multi-field model, and an unknown field name is an error rather than a silent
+    # fallback.
     @test_throws ArgumentError l2_error(sol, model, f1)
     @test_throws ArgumentError l2_error(sol, model, field(:nope, V1), f1)
     @test_throws ArgumentError l2_error(sol, model, u1, f1; norm=:bogus)
 
-    # Single-domain models are unaffected: the field is optional and, when
-    # given, produces the identical number.
+    # Single-domain models are unaffected: the field is optional and, when given, produces the identical number.
     V = space(box((0.0,), (1.0,)); cells=1, order=2)
     single = prepare(poisson(V; source=2.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     u = single.problem.fields[1]
     ss = solve!(single)
     exact = x -> x[1] * (1 - x[1])
     @test l2_error(ss, single, exact) === l2_error(ss, single, u, exact)
-    @test l2_error(ss, single, exact; norm=:absolute) ===
-          l2_error(ss, single, u, exact; norm=:absolute)
+    @test l2_error(ss, single, exact; norm=:absolute) === l2_error(ss, single, u, exact; norm=:absolute)
 end
 
 @testset "model.facet_regions caches one entry per Dirichlet selector" begin
@@ -314,8 +296,8 @@ end
     @test nquadpoints(plain; kind=:facet) == 0
     @test nquadpoints(plain) == nquadpoints(plain; kind=:volume)  # default unchanged
 
-    # boundary(:all) → one cached selector. Region count and q-point
-    # count match what boundary_integral sees on the same model.
+    # boundary(:all) → one cached selector. Region count and q-point count match what boundary_integral sees on the same
+    # model.
     with_dirichlet = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     @test length(with_dirichlet.facet_regions) == 1
     selector_count = sum(length, values(with_dirichlet.facet_regions))
@@ -340,14 +322,12 @@ end
 
     before_count = diagnostics(model).facet_region_count
     move!(model; level=2, to=box((0.3, 0.3), (0.8, 0.8)))
-    # The overlay box did not coincide with the physical boundary
-    # before or after the move, so the cached facet region list must
-    # still be populated and consistent with the post-move space.
+    # The overlay box did not coincide with the physical boundary before or after the move, so the cached facet region
+    # list must still be populated and consistent with the post-move space.
     @test !isempty(model.facet_regions)
     @test diagnostics(model).facet_region_count == before_count
-    # The facet-region cache contents must now reflect the new space:
-    # at least one parent in each region's list must be from level 1
-    # (the base — overlays inside Ω cannot touch ∂Ω).
+    # The facet-region cache contents must now reflect the new space: at least one parent in each region's list must be
+    # from level 1 (the base — overlays inside Ω cannot touch ∂Ω).
     for (_, list) in model.facet_regions
         for region in list
             @test all(parent.level == 1 for parent in region.parents)
@@ -357,10 +337,9 @@ end
 
 @testset "boundary_integral: empty selection raises" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
-    # Mask out both cells of the bottom row of the base level (those
-    # whose y-index is 1) so no covering parent remains on the y = 0
-    # face. The base is the only level that touches the lower face, so
-    # the selector finds no admissible region and must raise.
+    # Mask out both cells of the bottom row of the base level (those whose y-index is 1) so no covering parent remains
+    # on the y = 0 face. The base is the only level that touches the lower face, so the selector finds no admissible
+    # region and must raise.
     mask = trues(2, 2)
     mask[:, 1] .= false   # cell (·, y=1) → inactive on the lower row
     V = space(omega; cells=(2, 2), order=1, active=BitArray(mask))
@@ -368,8 +347,7 @@ end
 
     @test_throws ArgumentError boundary_integral(q -> 1.0, model; on=boundary(axis=2, side=:lower))
 
-    # The upper face is still fully covered, so a valid selector on
-    # the same model still works — confirming the throw above is from
-    # missing facet coverage, not from a wrong-axis check upstream.
+    # The upper face is still fully covered, so a valid selector on the same model still works — confirming the throw
+    # above is from missing facet coverage, not from a wrong-axis check upstream.
     @test boundary_integral(q -> 1.0, model; on=boundary(axis=2, side=:upper)) ≈ 1.0
 end
