@@ -1010,7 +1010,7 @@ indicator representations are intentionally not supported.
 
   - **Moment-fit defaults**: moment-fit basis order = `moment_order_factor
     × max(cell_order)` per axis over the region's parent cells, the factor
-    defaulting to `1`; exact tensor Legendre moments from the Saye volume
+    defaulting to `2`; exact tensor Legendre moments from the Saye volume
     rule; a single Lawson–Hanson NNLS solve (`NonNegLeastSquares.jl`) selects
     ≤ `nbasis` non-negative weights from a candidate cloud drawn by even
     fractional spacing over the volume rule (an integer stride aliases
@@ -1019,9 +1019,11 @@ indicator representations are intentionally not supported.
     wider cone and so admits a non-negative exact solution the smaller one
     did not — never with more subdivision; `target_residual` bounds that
     retry and is **relative** to `‖m‖`, since the residual carries the units
-    of a moment; if no attempt fits, the raw volume rule is used as a
-    fallback rather than dropping the cell. Rules are cached by canonicalized
-    region bounds + moment order.
+    of a moment; if no attempt comes within the failure threshold
+    `_FIT_FAILURE_RESIDUAL · ‖m‖` (1e-2, relative for the same reason, so
+    whether a cell falls back never depends on its size), the raw volume
+    rule is used as a fallback rather than dropping the cell. Rules are
+    cached by canonicalized region bounds + moment order.
 
   - **Diagnostics**: the FCM statistics on `diagnostics(model, solution)`
     are `cut_region_count`, `fit_failure_count`,

@@ -167,9 +167,15 @@ end
 # under a rescaling of the geometry.
 const _NNLS_WEIGHT_TOL = 1.0e-12
 
-# Catastrophic failure threshold for the moment-fit residual. A residual above this value indicates the NNLS could not
-# come anywhere near reproducing the moments; `moment_fit_rule` then returns the raw Saye volume rule instead of the
-# fitted one, and the integration-plan dispatcher tags such a region `:cut_fallback`.
+# Catastrophic failure threshold for the moment-fit residual, RELATIVE to the moment vector's norm `‖m‖` exactly as
+# `target_residual` is. A residual above `_FIT_FAILURE_RESIDUAL · ‖m‖` means the NNLS could not come anywhere near
+# reproducing the moments; `moment_fit_rule` then returns the raw Saye volume rule instead of the fitted one, and the
+# integration-plan dispatcher tags such a region `:cut_fallback`.
+#
+# It is dimensionless for the reason `_NNLS_WEIGHT_TOL` is: the residual carries the units of a moment, (length)ᴰ. An
+# absolute threshold made the verdict a statement about the cell's size — the same four-holes Float32 cell, fitted to
+# the same 1e-7 relative residual, came back `:fitted` at a cell extent of 1 and `:fallback` at 2000, where
+# `1e-7 · ‖m‖ ≈ 0.35` exceeds 1e-2.
 const _FIT_FAILURE_RESIDUAL = 1.0e-2
 
 # Assemble the moment-fit design matrix
@@ -379,10 +385,11 @@ which overrides the `1e-10` default here.
 `status` reports which rule came back, and the integration-region dispatcher in `intersections.jl` turns it into the
 region's quadrature kind:
 
-  - `:fitted` — the moment fit met `_FIT_FAILURE_RESIDUAL`; `points`/`weights` are the compressed O(nbasis) fitted rule.
-    Region kind `:cut_fitted`.
-  - `:fallback` — no attempt met `_FIT_FAILURE_RESIDUAL`, so the returned rule is the highest-order attempt's *raw Saye
-    volume rule* — the very data the moments were computed from, uncompressed. Region kind `:cut_fallback`.
+  - `:fitted` — the best fit's residual is within the failure threshold `_FIT_FAILURE_RESIDUAL · ‖m‖` (1e-2, relative to
+    the moment vector like `target_residual`, so the verdict does not depend on the cell's size); `points`/`weights`
+    are the compressed O(nbasis) fitted rule. Region kind `:cut_fitted`.
+  - `:fallback` — no attempt came within the failure threshold, so the returned rule is the highest-order attempt's
+    *raw Saye volume rule* — the very data the moments were computed from, uncompressed. Region kind `:cut_fallback`.
   - `:empty` — `Ω ∩ region_box` carries no volume rule at all, or every fitted weight falls below the
     cut-volume-relative truncation cutoff so the compressed rule would hold no points; `points` and `weights` are empty
     and `residual` is zero. Region kind `:cut_failed` (`:cut_alpha_failed` under α-FCM).
@@ -402,7 +409,15 @@ fired and what it cost.
 """
 function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T}, moment_order::NTuple{D,Int};
                          target_residual::Real=1.0e-10) where {D,T}
-    target = T(target_residual)
+    return _moment_fit_rule(physical, region_box, moment_order, T(target_residual), _MAX_IMPLICIT_ATTEMPTS)
+end
+
+# The body of `moment_fit_rule`, with the number of attempts exposed. The public entry point always runs the full
+# `_MAX_IMPLICIT_ATTEMPTS`; a smaller count is the lever a test needs to reach the `:fallback` branch on purpose,
+# since the retry fits essentially every reachable cut cell — one attempt on a many-feature cell is the starved first
+# attempt `_candidate_budget` describes.
+function _moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T}, moment_order::NTuple{D,Int}, target::T,
+                          attempts::Int) where {D,T}
     q0 = _implicit_gauss_points(moment_order)
     max_subdiv = _effective_subcell_depth(physical, region_box)
     # Hand the kernel each leaf's Lipschitz constant, not just its callback: the region box is a whole mesh cell, which
@@ -424,7 +439,7 @@ function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T}, mom
     # L² norm of the moment vector of the attempt last run — the scale both residual thresholds below are taken relative
     # to. It outlives the loop for the same reason the raw rule does.
     moment_scale = zero(T)
-    for attempt in 1:_MAX_IMPLICIT_ATTEMPTS
+    for attempt in 1:attempts
         # Exact moments at q0; denser candidate clouds on retry improve NNLS conditioning without changing the (already
         # exact) moments. Density comes from both knobs at once — a higher fiber Gauss order emits more rule points, a
         # larger budget lets more of them past `_cap_candidates`.
@@ -459,8 +474,8 @@ function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T}, mom
         best_res <= target * moment_scale && return best_pts, best_ws, best_res, :fitted
     end
     # Short of `target` but inside the failure threshold, the compressed fit is still the rule to use — that band is
-    # ordinary approximation error on a curved cut, not a broken fit.
-    best_res <= _FIT_FAILURE_RESIDUAL && return best_pts, best_ws, best_res, :fitted
+    # ordinary approximation error on a curved cut, not a broken fit. Both thresholds are relative to `‖m‖`.
+    best_res <= _FIT_FAILURE_RESIDUAL * moment_scale && return best_pts, best_ws, best_res, :fitted
     # Beyond it the fit is not usable at any price. Hand back the volume rule the moments themselves were summed from:
     # correct and non-negative by construction, merely uncompressed. Returning an empty rule here instead — the
     # pre-fallback behaviour — dropped the cell's entire contribution.
