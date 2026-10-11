@@ -109,7 +109,11 @@ end
 #
 # `lower` / `upper`, when given, are the region's corners: an axis on which they coincide — a boundary facet's pinned
 # axis — carries no extent to integrate along and gets 0.
-function _axis_max(f, V::Space{D}, parents, lower=nothing, upper=nothing) where {D}
+#
+# `f::F` is a type parameter on purpose: `f` is only passed into a closure here, never called directly, and Julia does
+# not specialise a method on a function argument it merely passes along — the helper then ran on `f::Function` and
+# dispatched dynamically for every parent and axis, boxing each per-cell tuple it returned.
+function _axis_max(f::F, V::Space{D}, parents, lower=nothing, upper=nothing) where {F,D}
     return ntuple(Val(D)) do d
         lower !== nothing && lower[d] == upper[d] && return 0
         return maximum(parent -> f(_level_by_id(V, parent.level), parent.cell)[d], parents)
