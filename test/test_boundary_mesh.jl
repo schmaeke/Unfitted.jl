@@ -356,4 +356,68 @@ end
     @test length(only(quiet).points) == 2
     loud = Unfitted._surface_regions_for_mesh(W, segment_mesh([(SVector(0.80, 0.85), SVector(0.95, 0.85))]), tol)
     @test length(only(loud).points) == 5                  # p = 4 → 5 Gauss points
+
+    # An oblique segment crosses both axes, and each adds its own degree: 1 + p + p points, from the same parents.
+    oblique(V, a, b) = length(only(Unfitted._surface_regions_for_mesh(V, segment_mesh([(a, b)]), tol)).points)
+    @test oblique(V, SVector(0.05, 0.10), SVector(0.20, 0.15)) == 3     # base p = 1
+    @test oblique(V, SVector(0.55, 0.60), SVector(0.70, 0.65)) == 7     # max p = 3
+    @test oblique(W, SVector(0.80, 0.80), SVector(0.95, 0.85)) == 9     # p = 4
+end
+
+# The surface mass and stiffness matrices of `Γ` on the one-cell space `V` (p = 2), and the same matrices from an
+# independent reference: the basis functions evaluated one at a time through the public point evaluation
+# (`value` / `field_gradient` of the unit coefficient vectors) and integrated with a high-order rule `(points, weights)`
+# that the caller lays on `Γ` itself. On one cell the integrands are polynomials, so the reference is exact.
+function _surface_operators_against_reference(V, Γ, points, weights)
+    u = field(:u, V)
+    model = prepare(Problem((u,); blocks=(block(u, u, mass_form(); on=Γ),)))
+    M = Matrix(assemble_matrix(model, block(u, u, mass_form(); on=Γ); threaded=false))
+    K = Matrix(assemble_matrix(model, block(u, u, stiffness_form(); on=Γ); threaded=false))
+    n = active_unknowns(model)
+    basis = [solution(model, [Float64(i == j) for j in 1:n]) for i in 1:n]
+    φ = [value(b, model, x) for b in basis, x in points]
+    ∇φ = [field_gradient(b, model, x) for b in basis, x in points]
+    M_ref = [sum(weights[k] * φ[i, k] * φ[j, k] for k in eachindex(weights)) for i in 1:n, j in 1:n]
+    K_ref = [sum(weights[k] * dot(∇φ[i, k], ∇φ[j, k]) for k in eachindex(weights)) for i in 1:n, j in 1:n]
+    return maximum(abs, M - M_ref) / maximum(abs, M_ref), maximum(abs, K - K_ref) / maximum(abs, K_ref),
+           nquadpoints(model; on=Γ)
+end
+
+@testset "simplex rules integrate trace products exactly on oblique segments and triangles" begin
+    # Regression (F2). Surface and interface rules took their point count from the parents' per-axis Gauss count
+    # alone — `p + 1` points on a segment, a (p + 1) × (p + 1) Duffy rule on a triangle — which is exact only where the
+    # simplex runs along a coordinate axis or plane. Along an oblique simplex a product of two basis functions of
+    # per-axis degree p has total degree 2p *per axis it crosses*, so main's rules were off by 2e-3 to 4e-3 of the
+    # largest entry here. The rule now takes `1 + Σ_d p_d` points per axis, summed over the axes the simplex extends
+    # along.
+    ξ, ω = Unfitted.gausslegendre(16)
+    s, w = (ξ .+ 1) ./ 2, ω ./ 2                         # 16-point Gauss on [0, 1], exact to degree 31
+
+    # A 2D segment oblique to both axes: 1 + 2 + 2 = 5 points (a horizontal one keeps 3).
+    a, b = SVector(0.12, 0.31), SVector(0.83, 0.67)
+    seg = segment_mesh([(a, b)])
+    V2 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(1, 1), order=2)
+    mass_err, stiffness_err, count = _surface_operators_against_reference(V2, seg, [a + t * (b - a) for t in s],
+                                                                          w .* norm(b - a))
+    @test mass_err < 1.0e-13
+    @test stiffness_err < 1.0e-13
+    @test count == 5
+
+    # A 3D triangle oblique to all three axes: (1 + 2 + 2 + 2)² = 49 points. The reference is a 16 × 16 Duffy rule,
+    # written out here rather than taken from the package.
+    v1, v2, v3 = SVector(0.12, 0.21, 0.33), SVector(0.81, 0.17, 0.52), SVector(0.37, 0.88, 0.71)
+    tri = triangle_mesh([v1, v2, v3], [(1, 2, 3)])
+    jacobian = norm(cross(v2 - v1, v3 - v1))
+    points = [v1 + s[j] * (v2 - v1) + s[i] * (1 - s[j]) * (v3 - v1) for i in eachindex(s) for j in eachindex(s)]
+    weights = [w[i] * w[j] * (1 - s[j]) * jacobian for i in eachindex(s) for j in eachindex(s)]
+    V3 = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(1, 1, 1), order=2)
+    mass_err, stiffness_err, count = _surface_operators_against_reference(V3, tri, points, weights)
+    @test mass_err < 1.0e-13
+    @test stiffness_err < 1.0e-13
+    @test count == 49
+
+    # A triangle in a coordinate plane extends along two axes: (1 + 2 + 2)² = 25 points.
+    flat = triangle_mesh([SVector(0.12, 0.21, 0.4), SVector(0.81, 0.17, 0.4), SVector(0.37, 0.88, 0.4)], [(1, 2, 3)])
+    u = field(:u, V3)
+    @test nquadpoints(prepare(Problem((u,); blocks=(block(u, u, mass_form(); on=flat),))); on=flat) == 25
 end

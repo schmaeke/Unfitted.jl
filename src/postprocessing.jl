@@ -1038,7 +1038,8 @@ Integrate a user callback over a portion of the boundary or over a coupling inte
     it fails. A selector every one of whose faces lies outside `Ω` carries no quadrature at all under `α = 0` and
     raises, exactly as a selector no active cell reaches does.
   - A [`BoundaryMesh`](@ref) — a user-supplied immersed-boundary mesh (segments in 2D, triangles in 3D, points in any
-    D). The package walks the precomputed per-cell quadrature rules.
+    D). The package walks the precomputed per-cell quadrature rules, which integrate any product of two basis functions
+    of the covering cells exactly on every sub-cell, oblique or axis-aligned.
   - An [`Interface`](@ref) — the two-sided interface of a coupled model, which spans both its subdomains and ignores
     `field`.
 

@@ -584,4 +584,16 @@ end
         x = (region.lower[1] + region.upper[1]) / 2   # the sub-segment's midpoint
         @test length(region.points) == (x < 0.5 ? 3 : 4)
     end
+
+    # An oblique interface crosses both axes, so each adds its own degree: 1 + 2(n − 1) points from the same per-axis
+    # count n — 5 against the base (n = 3, from V2′'s side), 7 under the overlay (n = 4). V2′ overlaps V1, so the
+    # oblique trace lies in both subdomains.
+    V2′ = space(box((0.0, 0.0), (1.0, 0.5)); cells=(3, 2), order=2)
+    oblique = polyline_mesh([SVector(0.05, 0.05), SVector(0.95, 0.40)])
+    counts = map(Unfitted._simplex_regions(oblique, (V1, V2′), (1, 2), tol)) do region
+        x = (region.lower + region.upper) / 2   # the sub-segment's midpoint
+        @test length(region.points) == (x[1] > 0.5 && x[2] > 0.25 ? 7 : 5)
+        return length(region.points)
+    end
+    @test sort(unique(counts)) == [5, 7]
 end

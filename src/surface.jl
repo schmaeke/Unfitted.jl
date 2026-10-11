@@ -450,6 +450,9 @@ weights are divided by the frame Jacobian, so the region accessors return the ph
 
 What its fields hold on a sub-cell:
 
+  - `points` / `weights` — a unit-simplex rule exact for every product of two of its parents' basis functions: its size
+    follows the total degree such a product reaches along the sub-cell, so an oblique segment or triangle takes more
+    points than an axis-aligned one (`_simplex_regions`).
   - `parents` — one parent per level whose active cell contains the sub-cell, each with its map from the frame. On an
     interface, `parents[1:split]` lie in `field_a`'s subdomain and the rest in `field_b`'s, so the two fields are
     evaluated in their own cut cells at the shared point; `fields = (field_a, field_b)` holds the coupled fields' global
@@ -477,12 +480,21 @@ const SimplexRegion{D,T} = Region{D,T,SVector{D,T},Nothing}
 #      there lies outside that subdomain's active region;
 #   3. the parents decoded from the signatures into one list, side `a` first (`_parents!`), each with its map from the
 #      sub-cell's bounding-box frame (`_simplex_frame`);
-#   4. the rule size from those parents (`_axis_max` of `_gauss_counts` per side, the larger per axis on an interface,
-#      whose integrand multiplies one trace from each side) — per sub-cell, so one high-p cell elsewhere raises no rule
-#      here; each side reads its own space, whose level ids are numbered independently of the other's;
+#   4. the rule size from those parents, below;
 #   5. the unit-simplex rule of that size (`_simplex_rule`, built once per size) mapped through `x = v₁ + E·λ` into the
 #      frame, its weights scaled by the simplex Jacobian over the frame Jacobian, so the region accessors recover the
 #      physical points and weights.
+#
+# **Rule size.** A product of two of the parents' basis functions (on an interface, one trace from each side) has
+# per-axis degree `2(n_d − 1)`, where `n_d` is the parents' per-axis Gauss count (`_axis_max` of `_gauss_counts`: per
+# sub-cell, so one high-p cell elsewhere raises no rule here; per side, since each side's level ids are numbered in its
+# own space; the larger per axis). Along the simplex `x = v₁ + E·λ` that product is a polynomial in `λ` of TOTAL degree
+# `Q = 2 Σ_d (n_d − 1)` over the axes the sub-cell extends along — a flat axis has `x_d` constant and adds nothing — so
+# the rule takes `m = 1 + Σ_d (n_d − 1)` points per axis: Gauss on a segment is exact to `2m − 1 > Q`, the Duffy rule
+# on a triangle to `2m − 2 = Q`. An axis-aligned segment keeps the `n_d` points of a tensor rule along its own axis; an
+# oblique one needs more, because each axis contributes its own degree: a p = 2 segment across both axes of a 2D cell
+# takes 5 points, a p = 2 triangle oblique to all three axes 7 × 7. A rule sized by one axis's count alone is exact
+# only on the axis-aligned simplices.
 function _simplex_regions(mesh::BoundaryMesh{D,T,K}, spaces::Tuple, fields::NTuple{2,Int},
                           tol::GeometryTolerance{T}) where {D,T,K}
     levels = map(V -> V.levels, spaces)
@@ -507,8 +519,8 @@ function _simplex_regions(mesh::BoundaryMesh{D,T,K}, spaces::Tuple, fields::NTup
             _parents!(parents, side, sig, lower, upper)
             return start:length(parents)
         end
-        counts = map((V, side) -> _axis_max(_gauss_counts, V, view(parents, side)), spaces, sides)
-        m = maximum(reduce((a, b) -> max.(a, b), counts))
+        counts = map((V, side) -> _axis_max(_gauss_counts, V, view(parents, side), lower, upper), spaces, sides)
+        m = 1 + sum(n -> max(n - 1, 0), reduce((a, b) -> max.(a, b), counts))
         λ, w = get!(() -> _simplex_rule(Val(K), m, T), rules, m)
         E = _edge_matrix(cell)
         scale = _simplex_jacobian(cell) / _frame_jacobian(lower, upper)
