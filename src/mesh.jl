@@ -221,11 +221,11 @@ One exception, and it is a physical one: when the inactive cell across such
 a face holds no material — the classifier finds its box *fully fictitious*,
 entirely outside `Ω` — the face carries no physical material and the modes
 on it stay active: they vanish on every physical face anyway and instead
-carry the adjacent cut cell's approximation up to `∂Ω`. Every cell the
-finite-cell fold switched off is such a cell. A cell the *user* masked out
-constrains when it holds material, which is the case unless it lies entirely
-outside `Ω` (always, without a [`PhysicalDomain`](@ref)). See
-`_has_overlay_constraint` in `src/dofs.jl`.
+carry the adjacent active cell's approximation — a cut cell's, up to `∂Ω`,
+whenever the fold runs. Every cell the finite-cell fold switched off is such
+a cell. A cell the *user* masked out constrains when it holds material,
+which is the case unless it lies entirely outside `Ω` (always, without a
+[`PhysicalDomain`](@ref)). See `_has_overlay_constraint` in `src/dofs.jl`.
 """
 struct LevelMask{D}
     on::BitArray{D}

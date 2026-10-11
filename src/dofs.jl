@@ -1382,15 +1382,15 @@ end
 # cell lying entirely outside Ω — has nothing on that side to stay continuous
 # with, and its boundary modes stay active. They vanish on every physical
 # face — so they cannot break the C⁰ trace condition the overlay constraint
-# enforces — and instead carry the adjacent cut cell's approximation up to
-# ∂Ω. An inactive cell that holds material — a user mask inside Ω — is
-# represented by a coarser level only: the modes on its face are non-zero on
-# a physical face and must be eliminated to keep the truncated solution
-# continuous. With no physical domain every inactive cell holds material, so
-# every internal active/inactive face constrains (the original overlay/user-mask
-# behaviour) and `ctx.fold` classifies nothing. The walk stops at the first
-# constraining position, so a face classifies its inactive neighbours only
-# until one of them holds material.
+# enforces — and instead carry the adjacent active cell's approximation (a cut
+# cell's, up to ∂Ω, whenever the fold runs). An inactive cell that holds
+# material — a user mask reaching into Ω — is represented by a coarser level
+# only: the modes on its face are non-zero on a physical face and must be
+# eliminated to keep the truncated solution continuous. With no physical
+# domain every inactive cell holds material, so every internal active/inactive
+# face constrains (the original overlay/user-mask behaviour) and `ctx.fold`
+# classifies nothing. The walk stops at the first constraining position, so a
+# face classifies its inactive neighbours only until one of them holds material.
 #
 # This runs once per raw on every layout build, and two measured choices keep
 # it cheap: `@inline`, without which the call stays out of

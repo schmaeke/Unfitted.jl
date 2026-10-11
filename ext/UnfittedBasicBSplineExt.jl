@@ -28,15 +28,16 @@ two mechanisms.
 
 At `continuity = :maximal`, the default, the level keeps exactly the functions
 whose full `(p_d + 1)`-cell support lies inside its admissible region — its
-active cells, the cells a fictitious fold switched off, and everything beyond a
-box face that coincides with the boundary of the space's own domain — that
-face is not artificial, and what lies past it is not part of the discretised
-domain at all. Such a function is already globally
-`C^{p_d − 1}` and identically zero outside its support, so its extension by zero
-is `C^{p_d − 1}` for free, under any mask geometry and with no constraint
-equation anywhere. This is Kraft's hierarchical-spline selection rule stated for
-superposed independent grids; the full statement, its maximality proof and the
-citations are in [`bspline`](@ref).
+active cells, the cells that hold no material (every cell the fictitious fold
+switched off, a user-masked cell lying entirely outside Ω, and a cell past an
+artificial box face lying entirely outside Ω), and everything beyond a box face
+that coincides with the boundary of the space's own domain — that face is not
+artificial, and what lies past it is not part of the discretised domain at all.
+Such a function is already globally `C^{p_d − 1}` and identically zero outside
+its support, so its extension by zero is `C^{p_d − 1}` for free, under any mask
+geometry and with no constraint equation anywhere. This is Kraft's
+hierarchical-spline selection rule stated for superposed independent grids; the
+full statement, its maximality proof and the citations are in [`bspline`](@ref).
 
 At an integer `continuity = m < p_d − 1` the level is instead clamped at its
 artificial faces and the trace and its derivatives `k = 0 … m` are constrained
@@ -110,8 +111,8 @@ global 1D function index via the `_AXIS_BSPLINE` tag.
     and a user-masked cell lying entirely outside Ω) is admissible for the
     selection rule, and an internal face whose inactive cell holds none
     carries no trace to vanish on and emits no constraint, while an inactive
-    cell that holds material (a user mask inside Ω) blocks in both. That one
-    distinction is all the family needs to carry an immersed
+    cell that holds material (a user mask reaching into Ω) blocks in both. That
+    one distinction is all the family needs to carry an immersed
     [`PhysicalDomain`](@ref), so the finite-cell workflow is open to it.
 
 The hot loops in `src/assembly.jl` and `src/projection.jl` are
@@ -160,11 +161,14 @@ V = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3, basis=bspline())
 
 # What a level contributes, and the one theorem behind it
 
-Write `Â` for the level's **admissible region**: its active cells, plus the
-cells a fictitious fold switched off (nothing is integrated there, so a
-truncation there is invisible on Ω), plus everything beyond a box face that
-coincides with the boundary of the space's own domain (that face is not artificial, so
-nothing has to vanish on it). At `:maximal` the level generates exactly
+Write `Â` for the level's **admissible region**: its active cells, plus every
+cell that holds no material — an inactive cell lying entirely outside Ω, which
+every cell the fictitious fold switched off is and a user-masked cell may be, and
+a cell of the grid continued past an artificial box face lying entirely outside
+Ω (nothing is integrated there, so a truncation there is invisible on Ω) — plus
+everything beyond a box face that coincides with the boundary of the space's own
+domain (that face is not artificial, so nothing has to vanish on it). At
+`:maximal` the level generates exactly
 
     W = span { B_α : supp B_α ⊆ Â }
 
@@ -651,9 +655,9 @@ end
 #
 # A `LevelMask` merges two deactivations (`_apply_physical_fold`), and what decides
 # here is not which one switched a cell off but whether the cell holds material. An
-# inactive cell that does — a user mask inside Ω — carries material that only the
-# coarser level represents, so a function reaching into it would be truncated at a
-# face where it does not vanish, and the superposition would lose its continuity
+# inactive cell that does — a user mask reaching into Ω — carries material that only
+# the coarser level represents, so a function reaching into it would be truncated at
+# a face where it does not vanish, and the superposition would lose its continuity
 # there. An inactive cell that holds none — every cell the fictitious fold switched
 # off, and a user mask entirely outside Ω — has nothing integrated over it, so the
 # truncated and untruncated functions agree on Ω and the function may stay. That
@@ -978,16 +982,16 @@ end
 # With one exemption, and it is what lets this family carry an immersed
 # `PhysicalDomain`. What decides an internal face is whether its inactive cell
 # holds material, not which deactivation switched it off: an inactive cell that
-# does — a user mask inside Ω — holds material only the coarser level represents,
-# so the face between it and the active side is a real artificial boundary and
-# the trace must vanish there; one that holds none — every cell the fictitious
-# fold switched off, and a user mask entirely outside Ω — leaves no trace to
-# vanish on, and constraining it would delete the cut cell's boundary modes — the
-# very over-constraint the FCM solution must not suffer. `_has_overlay_constraint`
-# in `src/dofs.jl` draws the same line for the integrated-Legendre family, and
-# both ask it of `_is_fictitious` (`src/coverage.jl`) on the build's material
-# oracle `fold`. With no physical domain every inactive cell holds material and
-# nothing is classified.
+# does — a user mask reaching into Ω — holds material only the coarser level
+# represents, so the face between it and the active side is a real artificial
+# boundary and the trace must vanish there; one that holds none — every cell the
+# fictitious fold switched off, and a user mask entirely outside Ω — leaves no
+# trace to vanish on, and constraining it would delete the cut cell's boundary
+# modes — the very over-constraint the FCM solution must not suffer.
+# `_has_overlay_constraint` in `src/dofs.jl` draws the same line for the
+# integrated-Legendre family, and both ask it of `_is_fictitious`
+# (`src/coverage.jl`) on the build's material oracle `fold`. With no physical
+# domain every inactive cell holds material and nothing is classified.
 function _active_cell_at_face(level::Level{D}, d::Int, j::Int, perp_cell::CartesianIndex{D},
                               n_cells::NTuple{D,Int}, ::Val{D}, fold::_Fold{D}) where {D}
     if j == 0 || j == n_cells[d]

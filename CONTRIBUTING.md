@@ -145,7 +145,7 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `fcm.jl`          | finite-cell-method cut-cell quadrature: exact moments from `implicit.jl`, non-negative (NNLS) moment fit |
 | `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks (`LevelMask`) and per-cell polynomial order (`CellOrders` / `CellModes`); the `space` / `overlay` / `adapt` / `elevate` verbs |
 | `intersections.jl`| admissible integration regions for non-matching meshes; cut/fictitious region-quadrature dispatch |
-| `coverage.jl`     | per-level covered-cell masks (`Coverage`, `build_coverage`); the mask-aware, fictitious-fold-aware covering rule behind covered-mode pruning |
+| `coverage.jl`     | per-level covered-cell masks (`Coverage`, `build_coverage`); the mask- and material-aware covering rule behind covered-mode pruning; the material oracle (`_Fold`) the dof layer asks whether an inactive cell holds material |
 | `ladder.jl`       | nested refinement ladders: `ladder` declaration, the depth-map form of `adapt` and the `depth_masks` grading behind it, cross-level cell mapping (`overlapping_cells`), the `is_nested` predicate |
 | `dofs.jl`         | dof keys; the per-space dof topology (raw enumeration, the elimination ledger, the pivot table) and per-field numbering and accessors; the integrated-Legendre family's dof hooks (artificial boundary, leaf-semantics pruning, the hp minimum rule) |
 | `dirichlet.jl`    | physical Dirichlet conditions and boundary selectors, per-level physical-Dirichlet detection, codim-K facet regions and quadrature, and the L² boundary projection for nonzero data |
@@ -1444,15 +1444,16 @@ demos.
     side has no active cover is unexercised.
   - Covered-mode pruning: covered high-order modes eliminated and buried
     linear modes deduplicated only under a nested finer level;
-    `reduced_mode_counts` matches the eliminated set. The masked overlays
-    `test_coverage_reduction.jl` builds check the material oracle and the
-    coverage memo against a direct recomputation, not a pruned space; the
-    fully deactivated case is pinned indirectly by test_activation.jl's
-    "fully-deactivated overlay equals no overlay", which compares
-    active-unknown counts against an overlay-free space; masked coverage
-    under a ladder — split cover retained, single cover shed, lossless by
-    rank against the unreduced twin — is pinned in `test_ladder.jl`
-    ("covered-mode pruning on a ladder is lossless", with the rank witness).
+    `reduced_mode_counts` matches the eliminated set. The user-masked
+    (`active =`) overlays `test_coverage_reduction.jl` builds check the
+    material oracle and the coverage memo against a direct recomputation,
+    not a pruned space; the fully deactivated case is pinned indirectly by
+    test_activation.jl's "fully-deactivated overlay equals no overlay",
+    which compares active-unknown counts against an overlay-free space;
+    masked coverage under a ladder — split cover retained, single cover
+    shed, lossless by rank against the unreduced twin — is pinned in
+    `test_ladder.jl` ("covered-mode pruning on a ladder is lossless", with
+    the rank witness).
   - Per-cell polynomial order: C⁰ conformity across an order jump, asserted
     as a per-basis-function one-sided trace jump `== 0`; the minimum rule's
     shape, and its set-membership form under `:trunk` where a per-axis

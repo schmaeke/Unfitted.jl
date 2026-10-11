@@ -204,8 +204,8 @@ end
 # decides here is not which source switched a cell off but whether the cell holds
 # material, which `fold` answers (`_Fold`).
 #
-#   * A cell that holds material — a user mask inside Ω — is represented only by the
-#     coarser level, so it blocks coverage and the parent keeps its high-order modes.
+#   * A cell that holds material — a user mask reaching into Ω — is represented only by
+#     the coarser level, so it blocks coverage and the parent keeps its high-order modes.
 #   * A cell that holds none — every folded cell, and a user mask lying entirely outside
 #     Ω — has nothing integrated over it, so there is nothing there for the parent to
 #     represent, and on Ω the parent's high-order modes over that cell are reproduced
