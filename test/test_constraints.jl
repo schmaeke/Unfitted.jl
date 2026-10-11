@@ -892,7 +892,7 @@ end
             for p in region.parents
                 level = Unfitted._level_by_id(V, p.level)
                 @test Unfitted.is_active(level.mask, p.cell)
-                @test Unfitted._cell_on_side(level, p.cell, axis, side)
+                @test p.cell in Unfitted._side_cells(level, [(axis, side)])
                 # Every Q-point lies inside every parent's own cell: the contract the merge has to preserve, and the
                 # reason the rule below is still exact on a fused region.
                 for x in region.points

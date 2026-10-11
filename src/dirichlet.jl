@@ -238,14 +238,6 @@ function _condition_value(condition::DirichletCondition, x, component::Integer=1
     return _component_value(value, component)
 end
 
-# True iff `cell` sits on the requested mesh-boundary side of `level` along `axis`. Used to filter the parent cells of a
-# boundary facet region to only the ones whose own face along the constrained axis coincides with the facet.
-function _cell_on_side(level::Level, cell::CartesianIndex, axis::Integer, side::Symbol)
-    side === :lower && return cell.I[axis] == 1
-    side === :upper && return cell.I[axis] == level.mesh.cells[axis]
-    throw(ArgumentError("boundary side must be :lower or :upper"))
-end
-
 """
     FacetParent{D,T}(level, cell, parent_box)
 
@@ -418,15 +410,6 @@ function _facet_fixed_coord(domain::AxisBox{D,T}, sides::AbstractVector{<:Tuple{
     return zero(T)
 end
 
-# Per-free-axis Gauss-Legendre point counts for a boundary sub-rectangle. Takes the per-axis maximum recommended
-# quadrature order over the covering parents so the trace integration is exact for every covering parent simultaneously.
-function _facet_quadrature_counts(V::Space{D,T}, parents::Vector{FacetParent{D,T}}, free_axes::Vector{Int}) where {D,T}
-    return [maximum(parents) do parent
-                level = _level_by_id(V, parent.level)
-                recommended_quadrature_order(level.basis, cell_order(level, parent.cell))[d]
-            end for d in free_axes]
-end
-
 # Tensor Gauss quadrature on the free axes of a facet sub-rectangle. The returned samples are
 # `(reference_eta_on_free_axes, weight)` pairs in the facet's reference frame `[−1, 1]^(D−K)`. The codim-D vertex case
 # (`isempty(counts)`) collapses to a single sample with unit weight, an empty reference vector, and the boundary
@@ -468,9 +451,10 @@ function _facet_outward_normal(sides::AbstractVector{<:Tuple{Integer,Symbol}}, :
 end
 
 # The cells of `level` whose own faces all lie on `sides`: index `1` or the last index on each constrained axis, the
-# whole range on the free ones. These are the only cells `_facet_signature` can accept as parents, so restricting the
-# coordinate projection to them makes the facet partition follow the *active boundary layer* rather than the level's
-# whole active region — an overlay live deep in the interior then contributes nothing to a facet it never touches.
+# whole range on the free ones. These are the only cells that carry trace dofs on the facet, so they are the level's
+# eligible cells in the facet's partition (`_partition`): its signature accepts no other parent, and its coordinate
+# projection follows the *active boundary layer* rather than the level's whole active region — an overlay live deep in
+# the interior then contributes nothing to a facet it never touches.
 function _side_cells(level::Level{D}, sides::Vector{Tuple{Int,Symbol}}) where {D}
     counts = level.mesh.cells
     return CartesianIndices(ntuple(D) do d
@@ -509,30 +493,29 @@ end
 # `(V, sides, tol)` — which is what lets the per-face memo of a [`FacetResolver`](@ref) key on those three alone and
 # what keeps the two consumers above reading the same faces automatically.
 #
-# The algorithm mirrors the volume-region construction in `intersections.jl`, restricted to the facet:
+# The partition is the volume plan's own engine (`_partition` in `intersections.jl`) restricted to the facet:
 #
-#   1. Identify the levels whose own mesh face on `sides` coincides with the physical-domain face — only these levels
-#      contribute boundary trace dofs on this facet.
-#   2. Per free axis, collect every touching level's boundary coordinates along that axis that bound an *active* cell
-#      whose own face lies on `sides` — the only cells that can become parents here — merge them, and form
-#      non-degenerate intervals. An unmasked level contributes its whole grid, since every cell of it is active.
-#   3. Take the Cartesian product of the intervals to enumerate the candidate sub-rectangles. Fix the constrained-axis
-#      coordinates to the facet's coordinates.
-#   4. For each candidate, compute the per-level *signature* at its midpoint: the linear index of the touching level's
-#      on-side active cell containing it, or `0` where the level contributes nothing — a cell off the side, or one the
-#      `LevelMask` deactivated, has no dofs to constrain. Drop candidates whose signature is all zero.
-#   5. Greedily merge axis-adjacent candidates that share a signature, exactly as `_partition` does over the volume
-#      (steps 3–4 there, through the same `_extend_axis`). Every point of a merged region still lies inside one cell of
-#      every parent level, so a product of boundary traces is still polynomial on it and the rule below is still exact
-#      for it.
-#   6. Restrict the space's level set to the facet's affine slice, classify each region's own face box against it
-#      (`:full`, `:cut`, `:fictitious`), and build the rule that verdict calls for: the full-face tensor Gauss rule, an
-#      α-scaled copy of it, or the moment fit on the slice lifted back to ℝᴰ. This is the facet counterpart of the
-#      volume path's step 7 (`CONTRIBUTING.md`, "Integration regions"), sharing its dispatch, its α-FCM blend and its
-#      kind vocabulary one dimension down. The returned `FacetRegion` is ready for direct consumption — every Q-point is
-#      in physical coordinates with the physical-frame weight already applied.
+#   1. The facet's free axes are the engine's free axes, and its pinned coordinates ride in the anchor, so every
+#      candidate midpoint lies on the facet. The codim-`D` vertex facet has no free axis at all: its candidate grid is
+#      the single empty index, and its region is the point evaluation such a facet should be.
+#   2. Per level, the eligible cells are those whose own face lies on `sides` (`_side_cells`) — the only cells that
+#      carry trace dofs here — and none at all on a level whose own mesh face does not coincide with the physical-domain
+#      face (`_level_side_is_physical`). Each free axis's coordinates are those that bound an *active* eligible cell,
+#      and a candidate's signature is `0` on every level that contributes nothing there: a cell off the side, or one
+#      the `LevelMask` deactivated, has no dofs to constrain. A candidate no level covers seeds no region.
+#   3. The greedy merge fuses axis-adjacent candidates that share a signature, exactly as over the volume. Every point
+#      of a merged region still lies inside one cell of every parent level, so a product of boundary traces is still
+#      polynomial on it and the rule below is still exact for it. The parents are decoded from the signature
+#      (`_facet_parents`).
+#   4. Restrict the space's level set to the facet's affine slice, classify each region's own face box against it
+#      (`:full`, `:cut`, `:fictitious`), and build the rule that verdict calls for (`_facet_region`): the full-face
+#      tensor Gauss rule, an α-scaled copy of it, or the moment fit on the slice lifted back to ℝᴰ. This is the facet
+#      counterpart of the volume path's step 7 (`CONTRIBUTING.md`, "Integration regions"), sharing its rule builder
+#      (`_trimmed_rule`), its α-FCM blend and its kind vocabulary one dimension down. The returned `FacetRegion` is
+#      ready for direct consumption — every Q-point is in physical coordinates with the physical-frame weight already
+#      applied.
 #
-# Steps 2 and 5 together make the facet partition follow the *active* cells on the boundary rather than the finest
+# Steps 2 and 3 together make the facet partition follow the *active* cells on the boundary rather than the finest
 # touching level's background grid. One consequence is worth stating plainly, because it is the one thing the merge
 # changes rather than merely makes cheaper. The exactness argument covers products of boundary traces: the Dirichlet
 # mass matrix, and the Neumann / `boundary_integral` terms. It does not cover a *non-polynomial* datum `g` in the
@@ -542,11 +525,11 @@ end
 # therefore move at the boundary-quadrature-error level, not at roundoff.
 #
 # On a *cut* face the exactness argument is the moment fit's rather than tensor Gauss's, and it reaches the same degree
-# by construction: the order is the volume path's own `_moment_orders` read over the free axes, so with the
-# default `moment_order_factor = 2` the fitted rule reproduces the moments of products of traces. The maximum over
-# parents that primitive takes is exactly what a merged region needs, for the same reason `_facet_quadrature_counts`
-# takes one — `adapt` and per-cell order let a region span cells of different orders, and anything less would
-# under-integrate the finest of them.
+# by construction: the order is the volume path's own `_moment_orders` read over the free axes, so with the default
+# `moment_order_factor = 2` the fitted rule reproduces the moments of products of traces. The maximum over parents
+# `_axis_max` takes is exactly what a merged region needs, for the same reason the tensor counts take one — `adapt` and
+# per-cell order let a region span cells of different orders, and anything less would under-integrate the finest of
+# them.
 #
 # That makes the rule exact where the restricted level set is a single affine function, and accurate to the reported
 # residual where it curves — never exact on a curved cut, which is why nothing here promises exactness. Nor is it exact
@@ -556,110 +539,41 @@ end
 # the fit's own residual at 3.5e-16. That is a pre-existing property of the kernel, shared by volume integration;
 # `boundary`'s docstring states the condition for the public reader.
 function _boundary_facet_regions(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}, tol::GeometryTolerance{T}) where {D,T}
-    touching_levels = [level
-                       for level in V.levels
-                       if all(_level_side_is_physical(level, V.domain, axis, side, tol) for (axis, side) in sides)]
-    isempty(touching_levels) && return FacetRegion{D,T}[]
-
     free_axes = _free_axes(sides, Val(D))
-
-    # Per-axis intervals along the free axes, as `_partition` (intersections.jl) forms them, but scanning only the
-    # cells that can parent a region here (`_side_cells`).
-    merged = _merged_axis_coordinates(touching_levels, Val(D), tol,
-                                      map(level -> _side_cells(level, sides), touching_levels))
-    intervals = map(d -> _intervals_from_coordinates(merged[d], tol), free_axes)
-    any(isempty, intervals) && return FacetRegion{D,T}[]
-
-    return _merged_facet_regions(V, touching_levels, sides, free_axes, intervals, tol, Val(length(free_axes)))
+    return _boundary_facet_regions(V, sides, free_axes, tol, Val(length(free_axes)))
 end
 
-# Physical corners of the facet sub-rectangle spanned by the candidate index range `start:hi`: the facet's own
-# coordinate on every constrained axis, the interval endpoints on the free axes. `start == hi` gives one candidate.
-function _facet_corners(domain::AxisBox{D,T}, sides, free_axes, intervals, start::NTuple{F,Int},
-                        hi::NTuple{F,Int}) where {D,T,F}
-    lower = MVector{D,T}(ntuple(d -> _facet_fixed_coord(domain, sides, d), D))
-    upper = MVector{D,T}(ntuple(d -> _facet_fixed_coord(domain, sides, d), D))
-    for (j, d) in pairs(free_axes)
-        lower[d] = intervals[j][start[j]][1]
-        upper[d] = intervals[j][hi[j]][2]
+# The partition and the regions of one facet, behind a `Val(F)` barrier on its number of free axes. `F` is a property of
+# the facet's codimension and so a runtime value at the call site; the barrier is what makes the engine's candidate
+# grid, signature grid and `visited` bitmap concretely typed, which its inner slab test needs to stay a static dispatch.
+function _boundary_facet_regions(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}, free_axes::Vector{Int},
+                                 tol::GeometryTolerance{T}, ::Val{F}) where {D,T,F}
+    anchor = SVector{D,T}(ntuple(d -> _facet_fixed_coord(V.domain, sides, d), Val(D)))
+    cells = map(V.levels) do level
+        touching = all(_level_side_is_physical(level, V.domain, axis, side, tol) for (axis, side) in sides)
+        return touching ? _side_cells(level, sides) : CartesianIndices(ntuple(_ -> 1:0, Val(D)))
     end
-    return SVector{D,T}(lower), SVector{D,T}(upper)
-end
-
-# On-side coverage signature at a facet point: per touching level, the linear index of the active cell whose own face on
-# `sides` contains the point, and `0` where the level contributes no boundary dof there. The facet counterpart of
-# `_signature` (intersections.jl), with that one's "off the mesh or inactive" rule widened by the side filter,
-# and it carries everything the parent list does — `_facet_parents` decodes it once per *emitted* region instead of
-# building a parent list once per candidate.
-function _facet_signature(levels, linmaps, sides, point::SVector{D,T}, tol::GeometryTolerance{T}) where {D,T}
-    sig = zeros(Int, length(levels))
-    for (i, level) in pairs(levels)
-        cell = locate_cell(level.mesh, point; tol)
-        cell === nothing && continue
-        all(_cell_on_side(level, cell, axis, side) for (axis, side) in sides) || continue
-        is_active(level.mask, cell) || continue
-        sig[i] = linmaps[i][cell]
-    end
-    return sig
-end
-
-# The parents a signature stands for, in `touching_levels` order.
-function _facet_parents(levels, sig::Vector{Int}, ::Val{D}, ::Type{T}) where {D,T}
-    parents = FacetParent{D,T}[]
-    for (i, level) in pairs(levels)
-        sig[i] == 0 && continue
-        cell = CartesianIndices(level.mesh.cells)[sig[i]]
-        push!(parents, FacetParent{D,T}(level.id, cell, cell_box(level.mesh, cell)))
-    end
-    return parents
-end
-
-# Candidate enumeration, greedy merge and quadrature for one facet, behind a `Val(F)` barrier on the number of free
-# axes. `F` is a property of the facet's codimension and so a runtime value at the call site; the barrier is what makes
-# `ranges`, the signature grid and the `visited` bitmap concretely typed, which the merge's inner slab test
-# (`_extend_axis`) needs to stay a static dispatch. The codim-`D` vertex facet is `F = 0`, where the grid degenerates to
-# the single candidate `CartesianIndex()`, no axis is ever extended, and the region is the point evaluation such a facet
-# should be.
-function _merged_facet_regions(V::Space{D,T}, touching_levels, sides::Vector{Tuple{Int,Symbol}}, free_axes::Vector{Int},
-                               intervals, tol::GeometryTolerance{T}, ::Val{F}) where {D,T,F}
-    axis_intervals = ntuple(j -> intervals[j], Val(F))
-    ranges = ntuple(j -> length(axis_intervals[j]), Val(F))
     normal = _facet_outward_normal(sides, Val(D), T)
-    linmaps = [LinearIndices(level.mesh.cells) for level in touching_levels]
     # Ω restricted to this facet's affine slice, built once per face rather than once per region: the pinned coordinates
     # are the face's own, so every region on the face is classified and integrated against the same restricted tree, and
     # lifted back to ℝᴰ through the same pins.
     pins = _facet_pins(V.domain, sides)
     slice = V.physical === nothing ? nothing : _restrict_domain(V.physical, pins)
+    return FacetRegion{D,T}[_facet_region(V, sides, _facet_parents(V.levels, sig, Val(D), T), free_axes, lower, upper,
+                                          normal, slice, pins, Val(F))
+                            for (lower, upper, sig) in
+                                _partition(V.levels, ntuple(j -> free_axes[j], Val(F)), anchor, tol, cells)]
+end
 
-    sigs = map(CartesianIndices(ranges)) do index
-        lower, upper = _facet_corners(V.domain, sides, free_axes, axis_intervals, index.I, index.I)
-        midpoint = SVector{D,T}(ntuple(d -> (lower[d] + upper[d]) / 2, D))
-        _facet_signature(touching_levels, linmaps, sides, midpoint, tol)
+# The parents a facet region's signature stands for, in level order: per non-zero slot, the level's cell with that
+# linear index and the cell's physical box.
+function _facet_parents(levels::Tuple, sig::Tuple, ::Val{D}, ::Type{T}) where {D,T}
+    found = map(levels, sig) do level, index
+        index == 0 && return nothing
+        cell = CartesianIndices(level.mesh.cells)[index]
+        return FacetParent{D,T}(level.id, cell, cell_box(level.mesh, cell))
     end
-
-    visited = falses(ranges)
-    regions = FacetRegion{D,T}[]
-    for start in CartesianIndices(ranges)
-        visited[start] && continue
-        sig = sigs[start]
-        # No active on-side cell anywhere: nothing to constrain, and nothing a neighbouring region may absorb either,
-        # since a merged region must share this candidate's (empty) parent set.
-        all(iszero, sig) && continue
-
-        hi = start.I
-        for j in 1:F
-            hi = _extend_axis(sigs, visited, ranges, start.I, hi, sig, j)
-        end
-        for c in CartesianIndices(ntuple(e -> start.I[e]:hi[e], Val(F)))
-            visited[c] = true
-        end
-
-        lower, upper = _facet_corners(V.domain, sides, free_axes, axis_intervals, start.I, hi)
-        parents = _facet_parents(touching_levels, sig, Val(D), T)
-        push!(regions, _facet_region(V, sides, parents, free_axes, lower, upper, normal, slice, pins, Val(F)))
-    end
-    return regions
+    return FacetParent{D,T}[parent for parent in found if parent !== nothing]
 end
 
 # ── Facet slices ──────────────────────────────────────────────────────────────
@@ -715,15 +629,16 @@ end
 
 # The whole-face tensor Gauss rule of one merged facet region, in physical coordinates. The Jacobian for a codim-K facet
 # sub-rectangle is `vol_free / 2^(D-K)`, matching the volume convention `vol / 2^D` from `reference_to_physical`. The
-# rule is sized from the region's own parents through `_facet_quadrature_counts`, exactly as it was per candidate — a
-# merged region carries the parent set its candidates shared, so the merge changes which points exist, never how they
-# are sized.
+# rule is sized on the free axes from the region's own parents (`_axis_max` of `_gauss_counts`, 0 on the pinned axes),
+# exactly as it was per candidate — a merged region carries the parent set its candidates shared, so the merge changes
+# which points exist, never how they are sized.
 #
 # This is the base rule the dispatch below trims: exact on a `:full` face, the carrier of the α-FCM term on every other
 # kind, and never by itself the rule a region on a cut face ends up with.
 function _facet_tensor_rule(V::Space{D,T}, parents::Vector{FacetParent{D,T}}, free_axes::Vector{Int},
                             lower::SVector{D,T}, upper::SVector{D,T}) where {D,T}
-    counts = _facet_quadrature_counts(V, parents, free_axes)
+    face_counts = _axis_max(_gauss_counts, V, parents, lower, upper)
+    counts = [face_counts[d] for d in free_axes]
     jacobian = if isempty(free_axes)
         one(T)
     else
@@ -745,39 +660,24 @@ function _facet_tensor_rule(V::Space{D,T}, parents::Vector{FacetParent{D,T}}, fr
     return points, weights
 end
 
-# One merged facet region: the classification of its face, and the rule that verdict calls for. This is the facet
-# counterpart of `_trimmed_rule` (`intersections.jl`) — the same three-way dispatch, the same α-FCM blend,
-# the same `kind` vocabulary — taken one dimension down, on the facet's own affine slice of Ω and its own
-# `(D − K)`-dimensional face box.
+# One merged facet region: the classification of its face, and the rule that verdict calls for (`_trimmed_rule` in
+# `intersections.jl`) — the same three-way dispatch, the same α-FCM blend, the same `kind` vocabulary as a volume
+# region's, taken one dimension down, on the facet's own affine slice of Ω and its own `(D − K)`-dimensional face box.
+# The base tensor rule is the whole face's, and on a `:cut` verdict the moment fit on the slice is lifted back to ℝᴰ
+# first, so both are in the physical frame `_trimmed_rule` blends them in. `:full` aliases the tensor rule rather than
+# copying it: that is the overwhelming majority of regions — 28 of kirsch's 30 cached ones, 44 of the 54 on the
+# space-time cavity's six faces at `SC_CELLS = 3`.
 #
-#   - `:full`                      → the tensor rule, ALIASED not copied. This is
-#                                    the overwhelming majority of regions — 28 of
-#                                    kirsch's 30 cached ones, 44 of the 54 on the
-#                                    space-time cavity's six faces at
-#                                    `SC_CELLS = 3` — so the copy is worth not
-#                                    making.
-#   - `:fictitious`, `α = 0`       → the empty rule. The region stays in the list:
-#                                    its parents carry trace dofs the dof layer
-#                                    constrains on the same grid-aligned test, and
-#                                    dropping it would move `facet_region_count`
-#                                    without changing one integral.
-#   - `:fictitious`, `α > 0`       → `:fictitious_alpha`, α-scaled tensor rule.
-#   - `:cut`                       → `:cut_fitted` / `:cut_fallback`, the moment
-#                                    fit on the slice, lifted back to ℝᴰ; under
-#                                    `α > 0` concatenated with the α-scaled tensor
-#                                    rule exactly as the volume blend is, from
-#                                    `∫_face α(x) f = (1−α)∫_{face∩Ω} f + α∫_face f`.
-#   - `:cut`, no rule on the slice → `:cut_failed` / `:cut_alpha_failed`.
+# The base tensor rule is built for every region, kind regardless: three of the five outcomes carry it or an α-scaled
+# copy of it, and on the other two it is a handful of `push!`es against an NNLS solve. So no region pays more here than
+# it paid before trimming, except for the fit itself on a cut face — which is the work the trimming *is*.
 #
-# The base tensor rule is built for every region, kind regardless, exactly as it always was: three of the five outcomes
-# carry it or an α-scaled copy of it, and on the other two it is a handful of `push!`es against an NNLS solve. So no
-# region pays more here than it paid before trimming, except for the fit itself on a cut face — which is the work the
-# fix *is*.
-#
-# Two deliberate departures from the volume dispatch. A zero-measure region is kept rather than dropped, for the
-# dof-support reason above. And the domain's `cut_quadrature` is **not** consulted: it is documented as a rule on a cell
-# box in the model's own dimension, so handing a user's callable a face box one dimension down would silently change
-# what it is being asked for — a facet cut region always goes through the package's own `moment_fit_rule`.
+# Two deliberate departures from the volume plan. A zero-measure region — `:fictitious` under strict `α = 0`, or
+# `:cut_failed` — is kept rather than dropped: its parents carry trace dofs the dof layer constrains on the same
+# grid-aligned test, and dropping it would move `facet_region_count` without changing one integral. And the domain's
+# `cut_quadrature` is **not** consulted: it is documented as a rule on a cell box in the model's own dimension, so
+# handing a user's callable a face box one dimension down would silently change what it is being asked for — a facet
+# cut region always goes through the package's own `moment_fit_rule`.
 #
 # The codim-`D` vertex facet (`F = 0`) never reaches the cut branch: `_classify_facet` decides a single point by
 # membership, so its verdict is `:full` or `:fictitious` and there is no degenerate box for the fit to see.
@@ -786,30 +686,22 @@ function _facet_region(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}, parents:
                        slice::Union{Nothing,PhysicalDomain}, pins, ::Val{F}) where {D,T,F}
     state = _classify_facet(slice, lower, upper, free_axes, Val(F))
     base_points, base_weights = _facet_tensor_rule(V, parents, free_axes, lower, upper)
-    built(kind, points, weights, residual) = FacetRegion{D,T}(sides, lower, upper, parents, kind, points, weights,
-                                                              normal, residual)
+    alpha = state === :full ? zero(T) : slice.alpha
+    alpha_weights = state === :full || iszero(alpha) ? base_weights : base_weights .* alpha
+    fit = state === :cut ? _facet_fit(V, slice, parents, free_axes, lower, upper, pins, Val(F)) : nothing
+    kind, points, weights, residual = _trimmed_rule(state, base_points, base_weights, alpha, alpha_weights, fit, false)
+    return FacetRegion{D,T}(sides, lower, upper, parents, kind, points, weights, normal, residual)
+end
 
-    state === :full && return built(:full, base_points, base_weights, zero(T))
-    alpha = slice.alpha
-    if state === :fictitious
-        iszero(alpha) && return built(:fictitious, SVector{D,T}[], T[], zero(T))
-        return built(:fictitious_alpha, base_points, base_weights .* alpha, zero(T))
-    end
-
-    box = _facet_box(lower, upper, free_axes, Val(F))
-    full_order = _axis_max(_moment_orders(V.physical.moment_order_factor), V, parents, lower, upper)
-    moment_order = ntuple(j -> full_order[free_axes[j]], Val(F))
-    fit_points, fit_weights, residual, status = moment_fit_rule(slice, box, moment_order;
-                                                                target_residual=slice.target_residual)
-    if status === :empty
-        iszero(alpha) && return built(:cut_failed, SVector{D,T}[], T[], residual)
-        return built(:cut_alpha_failed, base_points, base_weights .* alpha, residual)
-    end
-    kind = status === :fallback ? :cut_fallback : :cut_fitted
-    points = SVector{D,T}[_lift(p, pins) for p in fit_points]
-    iszero(alpha) && return built(kind, points, fit_weights, residual)
-    return built(kind, vcat(points, base_points), vcat(fit_weights .* (one(T) - alpha), base_weights .* alpha),
-                 residual)
+# The moment fit of a cut facet region on the slice, at the volume path's moment order read over the free axes, its
+# points lifted back to ℝᴰ.
+function _facet_fit(V::Space{D,T}, slice::PhysicalDomain, parents::Vector{FacetParent{D,T}}, free_axes::Vector{Int},
+                    lower::SVector{D,T}, upper::SVector{D,T}, pins, ::Val{F}) where {D,T,F}
+    order = _axis_max(_moment_orders(slice.moment_order_factor), V, parents, lower, upper)
+    points, weights, residual, status = moment_fit_rule(slice, _facet_box(lower, upper, free_axes, Val(F)),
+                                                        ntuple(j -> order[free_axes[j]], Val(F));
+                                                        target_residual=slice.target_residual)
+    return SVector{D,T}[_lift(p, pins) for p in points], weights, residual, status
 end
 
 # The measure of a facet region's own face — its full `(D − K)`-dimensional extent, physical part and fictitious part
