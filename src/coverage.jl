@@ -449,28 +449,13 @@ end
 # (`dofs.jl`) tests both before deduping, the basis half as `_reproduces`. The B-spline
 # family reuses the same geometric half — nesting is what puts each of its interior knots
 # on an `outer` cell boundary — and pairs it with its own span-containment answer.
-#
-# Each node is looked up by binary search (`_has_node`) rather than against every node
-# of `outer`'s axis, which made the test O(N_inner · N_outer).
 function _nested_over(inner::Level{D,T}, outer::Level{D,T}, tol::GeometryTolerance{T}) where {D,T}
     for d in 1:D
         lo, hi = outer.mesh.domain.lower[d], outer.mesh.domain.upper[d]
         for x in inner.mesh.axes[d]
             (lo - tol.contain <= x <= hi + tol.contain) || continue
-            _has_node(outer.mesh.axes[d], x, tol.merge) || return false
+            any(y -> abs(x - y) <= tol.merge, outer.mesh.axes[d]) || return false
         end
     end
     return true
-end
-
-# Whether the sorted `axis` holds a node `y` with `abs(x − y) ≤ merge` — the same
-# predicate as a scan of the whole axis, asked of two nodes only. Floating-point
-# subtraction is monotone and sign-symmetric, so over the nodes `y ≥ x` the computed
-# `abs(x − y)` grows with `y` and over the nodes `y < x` it shrinks; its minimum is
-# therefore attained at one of the two nodes around `x`'s insertion point, and testing
-# those two gives the scan's Boolean with the scan's own comparison.
-function _has_node(axis::Vector{T}, x::T, merge::T) where {T}
-    i = searchsortedfirst(axis, x)
-    i <= length(axis) && abs(x - axis[i]) <= merge && return true
-    return i > 1 && abs(x - axis[i-1]) <= merge
 end

@@ -414,8 +414,8 @@ end
     @test 0x00 in stored && 0x01 in stored && 0x02 in stored
 end
 
-# `_nested_over` written as a scan of every node of the outer axis — the definition its
-# binary search must reproduce.
+# `_nested_over`'s definition written out in the test, independently of the code under
+# test: a scan of every node of the outer axis.
 function _nested_by_scan(inner, outer, tol)
     for d in eachindex(inner.mesh.axes)
         lo, hi = outer.mesh.domain.lower[d], outer.mesh.domain.upper[d]
@@ -427,15 +427,12 @@ function _nested_by_scan(inner, outer, tol)
     return true
 end
 
-@testset "nesting by binary search answers what a scan of the axis does" begin
+@testset "nesting is decided at the tolerance edges as a scan of the axis decides it" begin
     # `_nested_over` asks, of every inner node inside the outer box widened by
-    # `tol.contain`, whether some outer node lies within `tol.merge` of it. It finds the
-    # node by binary search and tests only the two outer nodes around it, which gives
-    # the scan's Boolean because the computed `abs(x − y)` is monotone on either side of
-    # `x`. The probes sit exactly at the tolerance edges — `merge` either side of an
-    # outer node, `contain` past either end of the outer box — and one rounding step
-    # either side of each edge. All are exact binary fractions, so the edges are hit
-    # exactly.
+    # `tol.contain`, whether some outer node lies within `tol.merge` of it. The probes
+    # sit exactly at the tolerance edges — `merge` either side of an outer node,
+    # `contain` past either end of the outer box — and one rounding step either side of
+    # each edge. All are exact binary fractions, so the edges are hit exactly.
     tol = GeometryTolerance{Float64}(2.0^-6, 2.0^-4, 2.0^-6)
     m, c = tol.merge, tol.contain
     outer = space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=1).levels[1]
@@ -449,15 +446,8 @@ end
         push!(probes, step(edge))
     end
     append!(probes, (-0.0, 0.125, 0.3, -1.0, 2.0))
-    for x in probes
-        @test Unfitted._has_node(axis, x, m) == any(y -> abs(x - y) <= m, axis)
-    end
-    # Both answers occur, at the edge itself and one rounding step past it.
-    @test Unfitted._has_node(axis, 0.25 + m, m) && Unfitted._has_node(axis, 0.25 - m, m)
-    @test !Unfitted._has_node(axis, nextfloat(0.25 + m), m)
-    @test !Unfitted._has_node(axis, prevfloat(0.25 - m), m)
 
-    # The same probes as the one interior node of a one-cell inner level, whose two
+    # Each probe as the one interior node of a one-cell inner level, whose two
     # axis-1 nodes are the probe and an end of the outer box (a one-cell axis is exactly
     # its two corners).
     probe_level(x) = space(x < 1 ? box((x, 0.0), (1.0, 1.0)) : box((0.0, 0.0), (x, 1.0)); cells=1,
@@ -465,6 +455,11 @@ end
     nested = [Unfitted._nested_over(probe_level(x), outer, tol) for x in probes]
     @test nested == [_nested_by_scan(probe_level(x), outer, tol) for x in probes]
     @test any(nested) && !all(nested)
+    # Both answers occur at the `merge` edge itself and one rounding step past it.
+    @test Unfitted._nested_over(probe_level(0.25 + m), outer, tol)
+    @test Unfitted._nested_over(probe_level(0.25 - m), outer, tol)
+    @test !Unfitted._nested_over(probe_level(nextfloat(0.25 + m)), outer, tol)
+    @test !Unfitted._nested_over(probe_level(prevfloat(0.25 - m)), outer, tol)
     @test !Unfitted._nested_over(probe_level(-c), outer, tol)            # inside the widened box
     @test Unfitted._nested_over(probe_level(prevfloat(-c)), outer, tol)  # outside it: not asked
 end
