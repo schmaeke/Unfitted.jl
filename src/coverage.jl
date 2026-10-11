@@ -314,10 +314,7 @@ end
 # box.
 #
 # Condition 1 reads the oracle's coverage memo (`_covered_by!`), which `build_coverage`
-# filled with the same `_covered_by_level` answers. Condition 3 needs `k`'s cells across the
-# hull, which depend only on `k`, the hull and the tolerance, so they are found once per
-# call, at the first face that cuts the hull — and not at all on the common path, where
-# none does.
+# filled with the same `_covered_by_level` answers.
 function _reproduced_on_domain(level::Level{D,T}, k::Level{D,T}, cells::CartesianIndices{D},
                                tol::GeometryTolerance{T}, fold::_Fold{D,T}) where {D,T}
     for ci in cells
@@ -329,24 +326,16 @@ function _reproduced_on_domain(level::Level{D,T}, k::Level{D,T}, cells::Cartesia
     end
     hull = AxisBox{D,T}(cell_box(level.mesh, first(cells)).lower,
                         cell_box(level.mesh, last(cells)).upper)
-    perp = nothing
     for d in 1:D
         faces = ((1, k.mesh.domain.lower[d]), (k.mesh.cells[d], k.mesh.domain.upper[d]))
         for (j, x) in faces                                     # k's two box faces on axis d
             hull.lower[d] + tol.contain < x < hull.upper[d] - tol.contain || continue
-            if perp === nothing
-                perp = _cells_under_box(k.mesh, hull, tol)
-            end
-            any(kc -> is_active(k.mask, kc), _face_layer(perp, d, j)) && return false
+            perp = _cells_under_box(k.mesh, hull, tol)
+            layer = CartesianIndices(ntuple(e -> e == d ? (j:j) : perp.indices[e], D))
+            any(kc -> is_active(k.mask, kc), layer) && return false
         end
     end
     return true
-end
-
-# The cells of `perp` in layer `j` along axis `d`: `k`'s boundary cells on one of its
-# box faces, across the extent of a support hull.
-function _face_layer(perp::CartesianIndices{D}, d::Int, j::Int) where {D}
-    return CartesianIndices(ntuple(e -> e == d ? (j:j) : perp.indices[e], D))
 end
 
 """
