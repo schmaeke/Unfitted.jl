@@ -364,11 +364,8 @@ Every answer computed on the way against a masked cover is kept in `fold`'s cove
 memo, which the burial test of the same build reads back; an unmasked cover's answer
 is a single box test and is not stored.
 """
-function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T}) where {D,T}
-    build_coverage(V, tol, _Fold(V))
-end
-
-function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T}, fold::_Fold{D,T}) where {D,T}
+function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T},
+                        fold::_Fold{D,T}=_Fold(V)) where {D,T}
     covered = Dict{Int,BitArray{D}}()
     for level in V.levels
         cov = falses(level.mesh.cells)
