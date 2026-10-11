@@ -252,7 +252,7 @@ function _transfer_regions(source_model::Model{D,T}, target_model::Model{D,T};
                            tolerance=target_model.dofs.tolerance) where {D,T}
     source_levels, target_levels = source_model.problem.space.levels, target_model.problem.space.levels
     regions = Tuple{VolumeRegion{D,T},VolumeRegion{D,T}}[]
-    quadrature_cache = Dict{NTuple{D,Int},TensorQuadrature{D,T}}()
+    quadrature_cache = _TensorRuleCache{D,T}()
     levels = (source_levels..., target_levels...)
     _partition(levels, ntuple(identity, Val(D)), zero(SVector{D,T}), tolerance) do lower, upper, sig
         source_sig, target_sig = _split_signature(sig, source_levels)

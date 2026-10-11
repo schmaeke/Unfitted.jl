@@ -11,6 +11,13 @@ using SparseArrays
 using StaticArrays
 using Test
 
+# A facet region's quadrature points in physical coordinates, as the region accessors hand them to every consumer (a
+# region stores its rule in its own frame, `0` on the facet's pinned axes).
+function coupled_facet_points(region)
+    jacobian = Unfitted._region_jacobian(region)
+    return [first(Unfitted._region_point(region, k, jacobian)) for k in 1:Unfitted._region_qpoint_count(region)]
+end
+
 @testset "product space of disjoint domains == block diagonal" begin
     # Two disjoint unit squares, deliberately different resolutions, orders, and even source terms, so nothing about the
     # two discretisations lines up.
@@ -238,7 +245,7 @@ end
     for ((on, key_space), regions) in model.facet_regions
         @test !isempty(regions)
         expected = on.sides == [(1, :upper)] ? key_space.domain.upper[1] : key_space.domain.lower[1]
-        for region in regions, x in region.points
+        for region in regions, x in coupled_facet_points(region)
             @test x[1] ≈ expected
         end
     end
@@ -246,7 +253,7 @@ end
     # Both faces of both subdomains are represented: x = 0 and 1 (subdomain 1), x = 2 and 3 (subdomain 2). Before the
     # fix only 0 and 1 ever appeared.
     faces = sort(unique(round(x[1]; digits=12) for regions in values(model.facet_regions) for region in regions
-                        for x in region.points))
+                        for x in coupled_facet_points(region)))
     @test faces == [0.0, 1.0, 2.0, 3.0]
 end
 

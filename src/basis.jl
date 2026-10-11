@@ -130,27 +130,30 @@ struct TensorQuadrature{D,T<:Real}
     weights::Vector{T}
 end
 
-# Build a fresh tensor Gauss–Legendre rule with `counts[d]` points along axis `d`. The per-axis 1D rules come from
-# FastGaussQuadrature; we then enumerate `CartesianIndices(counts)` to build the `prod(counts)` tensor points and the
-# corresponding product weights. Always called through the cache in `intersections.jl`, never on the hot path.
-function _tensor_gauss_rule(counts::NTuple{D,Int}, ::Type{T}) where {D,T<:Real}
-    axes = ntuple(D) do d
-        points, weights = gausslegendre(counts[d])
-        (T.(points), T.(weights))
+# The tensor product of per-axis 1D rules, `axis_rules[d] = (nodes, weights)`: the points in `CartesianIndices` order
+# (axis 1 fastest) and each weight the left-fold product of its per-axis weights. The one tensor-rule constructor; the
+# Gauss rule below and every rule built from per-axis pieces go through it.
+function _tensor_rule(axis_rules::NTuple{D,Tuple{Vector{T},Vector{T}}}) where {D,T}
+    counts = map(rule -> length(first(rule)), axis_rules)
+    points = Vector{SVector{D,T}}(undef, prod(counts))
+    weights = Vector{T}(undef, prod(counts))
+    for (k, index) in enumerate(CartesianIndices(counts))
+        points[k] = SVector{D,T}(ntuple(d -> axis_rules[d][1][index.I[d]], D))
+        weights[k] = prod(axis_rules[d][2][index.I[d]] for d in 1:D)
     end
-
-    npoints = prod(counts)
-    points = Vector{SVector{D,T}}(undef, npoints)
-    weights = Vector{T}(undef, npoints)
-    counter = 1
-
-    for index in CartesianIndices(counts)
-        points[counter] = SVector{D,T}(ntuple(d -> axes[d][1][index.I[d]], D))
-        weights[counter] = prod(axes[d][2][index.I[d]] for d in 1:D)
-        counter += 1
-    end
-
     return TensorQuadrature{D,T}(points, weights)
+end
+
+# A fresh tensor Gauss–Legendre rule with `counts[d]` points along axis `d` (FastGaussQuadrature's 1D rules). A count of
+# 0 is an axis the rule does not extend along — a boundary facet's pinned axis — and carries the single node 0 with
+# weight 1, so a facet's rule lives in the full `D`-dimensional frame with the free-axis points and weights unchanged.
+# Always called through a cache (`_cached_tensor_quadrature!`), never on the hot path.
+function _tensor_gauss_rule(counts::NTuple{D,Int}, ::Type{T}) where {D,T<:Real}
+    return _tensor_rule(ntuple(D) do d
+                            counts[d] == 0 && return (T[0], T[1])
+                            points, weights = gausslegendre(counts[d])
+                            return (T.(points), T.(weights))
+                        end)
 end
 
 """

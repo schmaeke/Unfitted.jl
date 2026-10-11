@@ -241,13 +241,9 @@ end
 """
     FacetParent{D,T}(level, cell, parent_box)
 
-Reference to one parent cell touching a boundary facet. `level` and `cell` identify the cell; `parent_box` is the cell's
-physical box, cached at region construction so the consumer's per-quadrature-point inner loop never re-derives it from
-`level.mesh`.
-
-The facet's side specification (the `(axis, side)` constraints picking out which basis modes are facet-incident) lives
-on the enclosing [`FacetRegion`](@ref) — every parent in a region shares the same sides, so storing them per-parent
-would be redundant.
+Reference to one parent cell of an immersed [`SurfaceRegion`](@ref) or an [`InterfaceRegion`](@ref). `level` and `cell`
+identify the cell; `parent_box` is the cell's physical box, through which the assembly kernel maps each physical
+quadrature point into the cell's reference frame.
 """
 struct FacetParent{D,T<:Real}
     level::Int
@@ -256,14 +252,15 @@ struct FacetParent{D,T<:Real}
 end
 
 """
-    FacetRegion{D,T}(sides, lower, upper, parents, kind, points, weights, normal, residual)
+    FacetRegion{D,T} = Region{D,T,SVector{D,T},Vector{Tuple{Int,Symbol}}}
 
-One admissible integration region on a codim-`K` facet of the physical domain (where `K = length(sides)`). The region
-carries the precomputed physical-frame rule over `face ∩ Ω`, the constant covering-parent list, and the facet's outward
-normal — all consumers (the Dirichlet projection, [`boundary_integral`](@ref), and the assembly path) iterate this
-precomputed data directly rather than re-deriving Jacobians and reference-to-physical maps per quadrature point.
+One admissible integration region on a codim-`K` facet of the physical domain (where `K = length(sides)`): a
+[`Region`](@ref) whose frame is the region's own face box, degenerate on the `K` pinned axes. It carries the rule over
+`face ∩ Ω`, the constant covering-parent list and the facet's outward normal, and every consumer — the Dirichlet
+projection, [`boundary_integral`](@ref) and the assembly path — reads it through the region accessors, which map the
+frame rule to physical points and weights.
 
-Fields:
+What its fields hold on a facet:
 
   - `sides::Vector{Tuple{Int,Symbol}}` — the codim-`K` facet identifier (one `(axis, side)` pair per constrained axis).
     For codim-1 facets this is a single pair; for codim-`K > 1` facets the intersection of `K` codim-1 faces. Used by
@@ -275,16 +272,16 @@ Fields:
     intersection of its parents' cell faces, so a consumer that needs the region's geometry — rather than a bound on it
     — has to read them here. Held as a corner pair rather than an [`AxisBox`](@ref) because a facet box is degenerate on
     its constrained axes and `AxisBox` requires strictly positive extent on every axis.
-  - `parents::Vector{FacetParent{D,T}}` — every level cell whose own facet on `sides` coincides with this region. The
-    parent set is constant across the region's quadrature points (the contract that makes "evaluate basis values once
-    per parent" amortizable).
-  - `kind::Symbol` — which rule `points` / `weights` carry, in the same vocabulary a volume region's
-    [`Region`](@ref)`.kind` uses (`CONTRIBUTING.md`, "Region quadrature kinds"): `:full` (tensor Gauss over the whole
-    face, because the whole face is in `Ω`), `:fictitious` (the face is outside `Ω`, and under strict `α = 0` the rule
-    is empty), `:fictitious_alpha` (the same face under `α > 0`, α-scaled tensor Gauss), `:cut_fitted` / `:cut_fallback`
-    (`∂Ω` crosses the face and the moment fit on the facet's affine slice succeeded / fell back to the raw Saye rule),
-    `:cut_failed` / `:cut_alpha_failed` (the slice carries no rule at all, under `α = 0` / `α > 0` — a face `∂Ω` is
-    merely tangent to, or one it crosses in a sliver too thin for the kernel to resolve).
+  - `parents::Vector{Parent{D,T}}` — every level cell whose own facet on `sides` coincides with this region, each with
+    its map from the region's frame, constant (`dξ = 0`) on the pinned axes. The parent set is constant across the
+    region's quadrature points (the contract that makes "evaluate basis values once per parent" amortizable).
+  - `kind::Symbol` — which rule `points` / `weights` carry, in the vocabulary every region's `kind` uses
+    (`CONTRIBUTING.md`, "Region quadrature kinds"): `:full` (tensor Gauss over the whole face, because the whole face is
+    in `Ω`), `:fictitious` (the face is outside `Ω`, and under strict `α = 0` the rule is empty), `:fictitious_alpha`
+    (the same face under `α > 0`, α-scaled tensor Gauss), `:cut_fitted` / `:cut_fallback` (`∂Ω` crosses the face and
+    the moment fit on the facet's affine slice succeeded / fell back to the raw Saye rule), `:cut_failed` /
+    `:cut_alpha_failed` (the slice carries no rule at all, under `α = 0` / `α > 0` — a face `∂Ω` is merely tangent to,
+    or one it crosses in a sliver too thin for the kernel to resolve).
 
     The geometry is readable straight off it, because the kind is the classifier's own verdict refined by what the fit
     returned: `:full` is a face inside `Ω`, any `:fictitious*` kind a face outside it, any `:cut_*` kind a face `∂Ω`
@@ -295,31 +292,22 @@ Fields:
     invisible here exactly as it is to the cell classification behind the face. A space carrying no
     [`PhysicalDomain`](@ref) has nothing outside `Ω`, so every region of it is `:full`, and
     `AssemblyDiagnostics.cut_facet_region_count` counts the regions whose kind is not `:full`.
-  - `points::Vector{SVector{D,T}}` — physical-frame quadrature coordinates on the facet, covering `face ∩ Ω` rather than
-    the whole face and so lying inside `Ω` — up to the α-FCM blend when `α > 0`, which appends the full-face tensor
-    points to every trimmed kind and is the one configuration in which a point of a facet rule lies outside `Ω`.
-    **Empty** on a zero-measure region: such a region is kept in the list because its parents still carry the trace dofs
-    the dof layer constrains, so `points` is not a proxy for the region's extent — read `lower` / `upper` for that.
-  - `weights::Vector{T}` — physical-frame quadrature weights, already multiplied by the facet's reference-to-physical
-    Jacobian (`vol(facet) / 2^(D-K)`) on the tensor-Gauss kinds and carrying the moment fit's own physical weights on
-    the cut ones. They sum to the measure of `face ∩ Ω`, up to the α-FCM blend when `α > 0`.
+  - `points::Vector{SVector{D,T}}`, `weights::Vector{T}` — the rule in the region's frame, `0` on every pinned axis; the
+    physical weight is `weights[k] · J` with `J = vol(face) / 2^(D−K)` (1 on the codim-`D` vertex), the frame
+    convention of every region. The rule covers `face ∩ Ω` rather than the whole face, so its physical points lie inside
+    `Ω` and its weights sum to the measure of `face ∩ Ω` — up to the α-FCM blend when `α > 0`, which appends the
+    full-face tensor points to every trimmed kind and is the one configuration in which a point of a facet rule lies
+    outside `Ω`. A `:full` region aliases its resolver's cached tensor rule, and the α-scaled kinds of one face share
+    one α-scaled weight vector. **Empty** on a zero-measure region: such a region is kept in the list because its
+    parents still carry the trace dofs the dof layer constrains, so `points` is not a proxy for the region's extent —
+    read `lower` / `upper` for that.
   - `normal::SVector{D,T}` — outward normal to the facet. For a codim-1 face this is `±eₐ` with the sign set by `side`.
     For codim-`K > 1` facets it is the unit average of the constrained-face outward normals — well-defined and finite,
     though not geometrically as sharp as the codim-1 case.
   - `residual::T` — the moment-fit L² residual on a `:cut_*` region, zero on every kind where no fit ran. Reported
     through `AssemblyDiagnostics.facet_moment_fit_residual_max`.
 """
-struct FacetRegion{D,T<:Real}
-    sides::Vector{Tuple{Int,Symbol}}
-    lower::SVector{D,T}
-    upper::SVector{D,T}
-    parents::Vector{FacetParent{D,T}}
-    kind::Symbol
-    points::Vector{SVector{D,T}}
-    weights::Vector{T}
-    normal::SVector{D,T}
-    residual::T
-end
+const FacetRegion{D,T} = Region{D,T,SVector{D,T},Vector{Tuple{Int,Symbol}}}
 
 # Key of the per-*face* memo a `FacetResolver` holds: one entry per `(space, facet)` pair, where the facet is the
 # `(axis, side)` list a `BoundarySelector` decomposes into (`_facets`). This is one level below `RegionKey`
@@ -340,10 +328,11 @@ const FacetKey = Tuple{Any,Vector{Tuple{Int,Symbol}}}
 
 """
     FacetResolver{D,T}(tolerance)
-    FacetResolver{D,T}(tolerance, faces)
+    FacetResolver{D,T}(tolerance, faces, rules)
 
 The package's one route from a boundary face to its [`FacetRegion`](@ref)s: the geometry tolerance the resolution runs
-at, together with the per-face memo (`FacetKey` → region list) it fills as faces are asked for.
+at, together with the per-face memo (`FacetKey` → region list) it fills as faces are asked for and the tensor rules
+those regions share.
 
 One resolver belongs to a [`Model`](@ref) and lives as long as it does, so every consumer of grid-aligned boundary
 integration shares one resolution per `(space, face)` pair — the per-selector cache `prepare` builds
@@ -370,14 +359,19 @@ Fields:
     a mask flip. Within one space the memo is bounded by construction: a `BoundarySelector` decomposes into codim-`K`
     facets of the background box, of which there are at most `3^D − 1` (each axis is unconstrained, pinned low, or
     pinned high), so no sequence of one-shot lookups can grow it without limit.
+  - `rules::Dict{NTuple{D,Int},TensorQuadrature{D,T}}` — the tensor Gauss rules of the resolved regions, keyed by their
+    per-axis counts (0 on a pinned axis). Every `:full` region aliases its rule from here, so a boundary of many faces
+    holds one array per distinct order rather than one per region. The rules depend on the counts alone, so the cache
+    is shared by every face and space the resolver serves and is bounded by the distinct orders they reach.
 """
 struct FacetResolver{D,T<:Real}
     tolerance::GeometryTolerance{T}
     faces::Dict{FacetKey,Vector{FacetRegion{D,T}}}
+    rules::_TensorRuleCache{D,T}
 end
 
 function FacetResolver{D,T}(tolerance::GeometryTolerance{T}) where {D,T<:Real}
-    return FacetResolver{D,T}(tolerance, Dict{FacetKey,Vector{FacetRegion{D,T}}}())
+    return FacetResolver{D,T}(tolerance, Dict{FacetKey,Vector{FacetRegion{D,T}}}(), _TensorRuleCache{D,T}())
 end
 
 # Resolve one face of `V` through `facets`, building it with `_boundary_facet_regions` (defined below) on a miss. This
@@ -385,7 +379,7 @@ end
 # face) per model lifetime" a property of the code rather than a convention several independent call sites happen to
 # honour.
 function _resolve_face(facets::FacetResolver{D,T}, V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}) where {D,T}
-    return get!(() -> _boundary_facet_regions(V, sides, facets.tolerance), facets.faces, (V, sides))
+    return get!(() -> _boundary_facet_regions(V, sides, facets.tolerance, facets.rules), facets.faces, (V, sides))
 end
 
 # Axes *not* constrained by `sides`. Each codim-1 face has `D − 1` free axes; a codim-D vertex has zero free axes. Used
@@ -408,30 +402,6 @@ function _facet_fixed_coord(domain::AxisBox{D,T}, sides::AbstractVector{<:Tuple{
         return side === :lower ? domain.lower[axis] : domain.upper[axis]
     end
     return zero(T)
-end
-
-# Tensor Gauss quadrature on the free axes of a facet sub-rectangle. The returned samples are
-# `(reference_eta_on_free_axes, weight)` pairs in the facet's reference frame `[−1, 1]^(D−K)`. The codim-D vertex case
-# (`isempty(counts)`) collapses to a single sample with unit weight, an empty reference vector, and the boundary
-# "integration" reduces to a point evaluation.
-function _facet_reference_quadrature(counts::Vector{Int}, ::Type{T}) where {T}
-    if isempty(counts)
-        return [(T[], one(T))]
-    end
-
-    axes_rules = map(counts) do n
-        points, weights = gausslegendre(n)
-        (T.(points), T.(weights))
-    end
-    samples = Tuple{Vector{T},T}[]
-
-    for index in CartesianIndices(Tuple(counts))
-        eta = T[axes_rules[j][1][index.I[j]] for j in eachindex(counts)]
-        weight = prod(axes_rules[j][2][index.I[j]] for j in eachindex(counts))
-        push!(samples, (eta, weight))
-    end
-
-    return samples
 end
 
 # Outward unit normal of a facet identified by `sides`. For codim-1 facets this is `±eₐ` with the sign set by the single
@@ -491,7 +461,8 @@ end
 #
 # The geometry arrives through `V`, not through an argument of its own, so this stays a pure function of
 # `(V, sides, tol)` — which is what lets the per-face memo of a [`FacetResolver`](@ref) key on those three alone and
-# what keeps the two consumers above reading the same faces automatically.
+# what keeps the two consumers above reading the same faces automatically. `rules` is the resolver's tensor-rule cache,
+# which only decides whether a region's rule is a shared array or a fresh one with the same values.
 #
 # The partition is the volume plan's own engine (`_partition` in `intersections.jl`) restricted to the facet:
 #
@@ -506,14 +477,14 @@ end
 #   3. The greedy merge fuses axis-adjacent candidates that share a signature, exactly as over the volume. Every point
 #      of a merged region still lies inside one cell of every parent level, so a product of boundary traces is still
 #      polynomial on it and the rule below is still exact for it. The parents are decoded from the signature
-#      (`_facet_parents`).
+#      (`_parents`), each with its map from the region's frame, the face box.
 #   4. Restrict the space's level set to the facet's affine slice, classify each region's own face box against it
-#      (`:full`, `:cut`, `:fictitious`), and build the rule that verdict calls for (`_facet_region`): the full-face
-#      tensor Gauss rule, an α-scaled copy of it, or the moment fit on the slice lifted back to ℝᴰ. This is the facet
-#      counterpart of the volume path's step 7 (`CONTRIBUTING.md`, "Integration regions"), sharing its rule builder
-#      (`_trimmed_rule`), its α-FCM blend and its kind vocabulary one dimension down. The returned `FacetRegion` is
-#      ready for direct consumption — every Q-point is in physical coordinates with the physical-frame weight already
-#      applied.
+#      (`:full`, `:cut`, `:fictitious`), and build the rule that verdict calls for (`_facet_regions`): the full-face
+#      tensor Gauss rule, an α-scaled copy of it, or the moment fit on the slice, all of the face's fits at once on
+#      every thread. This is the facet counterpart of the volume path's step 7 (`CONTRIBUTING.md`, "Integration
+#      regions"), sharing its records (`_region_record`), its rule builder (`_trimmed_rule`), its α-FCM blend and its
+#      kind vocabulary one dimension down. Every rule lives in the region's own frame — the face box, `0` on the pinned
+#      axes — as every region's does, so the region accessors give its consumers physical points and weights.
 #
 # Steps 2 and 3 together make the facet partition follow the *active* cells on the boundary rather than the finest
 # touching level's background grid. One consequence is worth stating plainly, because it is the one thing the merge
@@ -538,46 +509,84 @@ end
 # slightly wrong and the residual cannot see it — measured 3.6e-4 on a face cut by two planes meeting inside it, with
 # the fit's own residual at 3.5e-16. That is a pre-existing property of the kernel, shared by volume integration;
 # `boundary`'s docstring states the condition for the public reader.
-function _boundary_facet_regions(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}, tol::GeometryTolerance{T}) where {D,T}
+function _boundary_facet_regions(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}, tol::GeometryTolerance{T},
+                                 rules::_TensorRuleCache{D,T}=_TensorRuleCache{D,T}()) where {D,T}
     free_axes = _free_axes(sides, Val(D))
-    return _boundary_facet_regions(V, sides, free_axes, tol, Val(length(free_axes)))
+    return _boundary_facet_regions(V, sides, free_axes, tol, rules, Val(length(free_axes)))
 end
 
-# The partition and the regions of one facet, behind a `Val(F)` barrier on its number of free axes. `F` is a property of
+# The partition and the records of one facet, behind a `Val(F)` barrier on its number of free axes. `F` is a property of
 # the facet's codimension and so a runtime value at the call site; the barrier is what makes the engine's candidate
 # grid, signature grid and `visited` bitmap concretely typed, which its inner slab test needs to stay a static dispatch.
 function _boundary_facet_regions(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}, free_axes::Vector{Int},
-                                 tol::GeometryTolerance{T}, ::Val{F}) where {D,T,F}
+                                 tol::GeometryTolerance{T}, rules::_TensorRuleCache{D,T}, ::Val{F}) where {D,T,F}
     anchor = SVector{D,T}(ntuple(d -> _facet_fixed_coord(V.domain, sides, d), Val(D)))
     cells = map(V.levels) do level
         touching = all(_level_side_is_physical(level, V.domain, axis, side, tol) for (axis, side) in sides)
         return touching ? _side_cells(level, sides) : CartesianIndices(ntuple(_ -> 1:0, Val(D)))
     end
-    normal = _facet_outward_normal(sides, Val(D), T)
     # Ω restricted to this facet's affine slice, built once per face rather than once per region: the pinned coordinates
-    # are the face's own, so every region on the face is classified and integrated against the same restricted tree, and
-    # lifted back to ℝᴰ through the same pins.
+    # are the face's own, so every region on the face is classified and integrated against the same restricted tree.
     pins = _facet_pins(V.domain, sides)
     slice = V.physical === nothing ? nothing : _restrict_domain(V.physical, pins)
-    regions = FacetRegion{D,T}[]
+    records = _RegionRecord{D,T}[]
     _partition(V.levels, ntuple(j -> free_axes[j], Val(F)), anchor, tol, cells) do lower, upper, sig
-        parents = _facet_parents(V.levels, sig, Val(D), T)
-        push!(regions, _facet_region(V, sides, parents, free_axes, lower, upper, normal, slice, pins, Val(F)))
+        verdict = _classify_facet(slice, lower, upper, free_axes, Val(F))
+        push!(records, _region_record(V, lower, upper, _parents(V.levels, sig, lower, upper), verdict))
         return nothing
     end
-    return regions
+    return _facet_regions(records, slice, sides, free_axes, pins, rules, Val(F))
 end
 
-# The parents a facet region's signature stands for, in level order: per non-zero slot, the level's cell with that
-# linear index and the cell's physical box.
-function _facet_parents(levels::Tuple, sig::Tuple, ::Val{D}, ::Type{T}) where {D,T}
-    parents = FacetParent{D,T}[]
-    for (level, index) in zip(levels, sig)
-        index == 0 && continue
-        cell = CartesianIndices(level.mesh.cells)[index]
-        push!(parents, FacetParent{D,T}(level.id, cell, cell_box(level.mesh, cell)))
+# The regions of one face's records: every cut region's moment fit on the slice, then each record's rule through
+# `_trimmed_rule` (`intersections.jl`). A function barrier on `slice`, which is not concretely typed where it is built,
+# so the per-region rule dispatch below is static.
+#
+#   - The base tensor rule comes from the resolver's cache, so a `:full` region — the overwhelming majority: 28 of
+#     kirsch's 30 cached ones, 44 of the 54 on the space-time cavity's six faces at `SC_CELLS = 3` — aliases it and
+#     costs no allocation. Its counts are 0 on the pinned axes, so its points are the free-axis Gauss points with 0 on
+#     every pinned axis and its weights the free-axis weight products, unchanged.
+#   - The α-scaled weights are cached per face, not per resolver: one resolver serves every space of a model, and two
+#     spaces may carry different `α`.
+#   - The fits run through `_fit_rules`, on every thread, and come back in the face box's own reference frame; a `0` on
+#     each pinned axis embeds them in the region's frame. The domain's `cut_quadrature` is **not** consulted: it is
+#     documented as a rule on a cell box in the model's own dimension, so handing a user's callable a face box one
+#     dimension down would silently change what it is being asked for — a facet cut region always goes through the
+#     package's own `moment_fit_rule`.
+#
+# One deliberate departure from the volume plan: a zero-measure region — `:fictitious` under strict `α = 0`, or
+# `:cut_failed` — is kept rather than dropped. Its parents carry trace dofs the dof layer constrains on the same
+# grid-aligned test, and dropping it would move `facet_region_count` without changing one integral. The codim-`D` vertex
+# facet (`F = 0`) never reaches the cut branch: `_classify_facet` decides a single point by membership.
+function _facet_regions(records::Vector{_RegionRecord{D,T}}, slice, sides::Vector{Tuple{Int,Symbol}},
+                        free_axes::Vector{Int}, pins, rules::_TensorRuleCache{D,T}, ::Val{F}) where {D,T,F}
+    function key(record)
+        face = _facet_box(record.lower, record.upper, free_axes, Val(F))
+        return (face.lower, face.upper, ntuple(j -> record.order[free_axes[j]], Val(F)))
     end
-    return parents
+    keys = _MomentFitKey{F,T}[key(record) for record in records if record.verdict === :cut]
+    fits = isempty(keys) ? _MomentFitValue{F,T}[] : _fit_rules(slice, keys, false)
+    frame_pins = [(axis, zero(T)) for (axis, _) in pins]
+    alpha = slice === nothing ? zero(T) : slice.alpha
+    alpha_cache = Dict{NTuple{D,Int},Vector{T}}()
+    normal = _facet_outward_normal(sides, Val(D), T)
+    regions = FacetRegion{D,T}[]
+    next = 0
+    for record in records
+        base = _cached_tensor_quadrature!(rules, record.counts, T)
+        alpha_weights = record.verdict === :full || iszero(alpha) ? base.weights :
+                        _cached_alpha_weights!(alpha_cache, record.counts, base.weights, alpha)
+        fit = nothing
+        if record.verdict === :cut
+            points, weights, residual, status = fits[next += 1]
+            fit = (SVector{D,T}[_lift(p, frame_pins) for p in points], weights, residual, status)
+        end
+        kind, points, weights, residual = _trimmed_rule(record.verdict, base.points, base.weights, alpha, alpha_weights,
+                                                        fit, false)
+        push!(regions,
+              Region(record.lower, record.upper, record.parents, kind, points, weights; normal, sides, residual))
+    end
+    return regions
 end
 
 # ── Facet slices ──────────────────────────────────────────────────────────────
@@ -605,14 +614,15 @@ function _facet_box(lower::SVector{D,T}, upper::SVector{D,T}, free_axes::Vector{
 end
 
 # Splice the pinned coordinates back into a point of the slice, the inverse of the free-axis selection above and the map
-# that returns anything built on the slice to the coordinates a facet's consumers work in. The pins are consumed in
+# that returns anything built on the slice to `D` coordinates — the region's frame when the pins carry the frame
+# coordinate `0` (`_facet_regions`), physical space when they carry the face's own. The pins are consumed in
 # ASCENDING axis order — `_facet_pins` holds them descending, hence the reverse — because an insertion at index `k`
 # lands on axis `k` of the result only once every axis below `k` is already in place.
 _lift(x::SVector, pins) = foldl((y, pin) -> _insert_axis(y, pin[1], pin[2]), Iterators.reverse(pins); init=x)
 
 # How Ω meets one facet region's own face: `:full`, `:cut` or `:fictitious`, the same three verdicts `classify_cell`
-# returns on a cell box, reached on the region's face box against `slice`. `_facet_region` below turns the verdict into
-# the rule it calls for, and into the finer `kind` that names which rule came back. It is the classifier's verdict with
+# returns on a cell box, reached on the region's face box against `slice`. `_facet_regions` turns the verdict into the
+# rule it calls for, and into the finer `kind` that names which rule came back. It is the classifier's verdict with
 # exactly the classifier's resolution — the Lipschitz certificate where a leaf carries a constant, octree-bounded corner
 # sampling where it does not — and in particular it is not a sampling of the *rule* on the region. `FacetRegion.kind`'s
 # own docstring states what that resolution does and does not see.
@@ -631,87 +641,10 @@ function _classify_facet(slice::PhysicalDomain, ::SVector{D,T}, ::SVector{D,T}, 
     return _inside(slice.geometry, SVector{0,T}()) ? :full : :fictitious
 end
 
-# The whole-face tensor Gauss rule of one merged facet region, in physical coordinates. The Jacobian for a codim-K facet
-# sub-rectangle is `vol_free / 2^(D-K)`, matching the volume convention `vol / 2^D` from `reference_to_physical`. The
-# rule is sized on the free axes from the region's own parents (`_axis_max` of `_gauss_counts`, 0 on the pinned axes),
-# exactly as it was per candidate — a merged region carries the parent set its candidates shared, so the merge changes
-# which points exist, never how they are sized.
-#
-# This is the base rule the dispatch below trims: exact on a `:full` face, the carrier of the α-FCM term on every other
-# kind, and never by itself the rule a region on a cut face ends up with.
-function _facet_tensor_rule(V::Space{D,T}, parents::Vector{FacetParent{D,T}}, free_axes::Vector{Int},
-                            lower::SVector{D,T}, upper::SVector{D,T}) where {D,T}
-    face_counts = _axis_max(_gauss_counts, V, parents, lower, upper)
-    counts = [face_counts[d] for d in free_axes]
-    jacobian = if isempty(free_axes)
-        one(T)
-    else
-        prod(upper[d] - lower[d] for d in free_axes) / convert(T, 2^length(free_axes))
-    end
-
-    points = SVector{D,T}[]
-    weights = T[]
-    for (eta, weight) in _facet_reference_quadrature(counts, T)
-        x = MVector{D,T}(lower)
-        for (j, d) in pairs(free_axes)
-            axis_mid = (lower[d] + upper[d]) / 2
-            axis_half = (upper[d] - lower[d]) / 2
-            x[d] = axis_mid + axis_half * eta[j]
-        end
-        push!(points, SVector{D,T}(x))
-        push!(weights, weight * jacobian)
-    end
-    return points, weights
-end
-
-# One merged facet region: the classification of its face, and the rule that verdict calls for (`_trimmed_rule` in
-# `intersections.jl`) — the same three-way dispatch, the same α-FCM blend, the same `kind` vocabulary as a volume
-# region's, taken one dimension down, on the facet's own affine slice of Ω and its own `(D − K)`-dimensional face box.
-# The base tensor rule is the whole face's, and on a `:cut` verdict the moment fit on the slice is lifted back to ℝᴰ
-# first, so both are in the physical frame `_trimmed_rule` blends them in. `:full` aliases the tensor rule rather than
-# copying it: that is the overwhelming majority of regions — 28 of kirsch's 30 cached ones, 44 of the 54 on the
-# space-time cavity's six faces at `SC_CELLS = 3`.
-#
-# The base tensor rule is built for every region, kind regardless: three of the five outcomes carry it or an α-scaled
-# copy of it, and on the other two it is a handful of `push!`es against an NNLS solve. So no region pays more here than
-# it paid before trimming, except for the fit itself on a cut face — which is the work the trimming *is*.
-#
-# Two deliberate departures from the volume plan. A zero-measure region — `:fictitious` under strict `α = 0`, or
-# `:cut_failed` — is kept rather than dropped: its parents carry trace dofs the dof layer constrains on the same
-# grid-aligned test, and dropping it would move `facet_region_count` without changing one integral. And the domain's
-# `cut_quadrature` is **not** consulted: it is documented as a rule on a cell box in the model's own dimension, so
-# handing a user's callable a face box one dimension down would silently change what it is being asked for — a facet
-# cut region always goes through the package's own `moment_fit_rule`.
-#
-# The codim-`D` vertex facet (`F = 0`) never reaches the cut branch: `_classify_facet` decides a single point by
-# membership, so its verdict is `:full` or `:fictitious` and there is no degenerate box for the fit to see.
-function _facet_region(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}, parents::Vector{FacetParent{D,T}},
-                       free_axes::Vector{Int}, lower::SVector{D,T}, upper::SVector{D,T}, normal::SVector{D,T},
-                       slice::Union{Nothing,PhysicalDomain}, pins, ::Val{F}) where {D,T,F}
-    state = _classify_facet(slice, lower, upper, free_axes, Val(F))
-    base_points, base_weights = _facet_tensor_rule(V, parents, free_axes, lower, upper)
-    alpha = state === :full ? zero(T) : slice.alpha
-    alpha_weights = state === :full || iszero(alpha) ? base_weights : base_weights .* alpha
-    fit = state === :cut ? _facet_fit(V, slice, parents, free_axes, lower, upper, pins, Val(F)) : nothing
-    kind, points, weights, residual = _trimmed_rule(state, base_points, base_weights, alpha, alpha_weights, fit, false)
-    return FacetRegion{D,T}(sides, lower, upper, parents, kind, points, weights, normal, residual)
-end
-
-# The moment fit of a cut facet region on the slice, at the volume path's moment order read over the free axes, its
-# points lifted back to ℝᴰ.
-function _facet_fit(V::Space{D,T}, slice::PhysicalDomain, parents::Vector{FacetParent{D,T}}, free_axes::Vector{Int},
-                    lower::SVector{D,T}, upper::SVector{D,T}, pins, ::Val{F}) where {D,T,F}
-    order = _axis_max(_moment_orders(slice.moment_order_factor), V, parents, lower, upper)
-    points, weights, residual, status = moment_fit_rule(slice, _facet_box(lower, upper, free_axes, Val(F)),
-                                                        ntuple(j -> order[free_axes[j]], Val(F));
-                                                        target_residual=slice.target_residual)
-    return SVector{D,T}[_lift(p, pins) for p in points], weights, residual, status
-end
-
 # The measure of a facet region's own face — its full `(D − K)`-dimensional extent, physical part and fictitious part
 # together. The pinned axes are exactly the degenerate ones, so the product over the non-degenerate ones needs no
 # `sides` and is right in every codimension; the codim-`D` vertex is the empty product, 1, which is the weight its point
-# evaluation carries. Compared against the region's own weight sum it gives the fraction of the face the rule
+# evaluation carries. Compared against the region's own physical weight sum it gives the fraction of the face the rule
 # integrates, which is what `min_relative_facet_measure` reports.
 function _face_measure(region::FacetRegion{D,T}) where {D,T}
     extent(d) = region.upper[d] - region.lower[d]
@@ -1090,10 +1023,9 @@ function _sample_dirichlet_facet!(mass::Vector{Matrix{T}}, index::Vector{Dict{In
         # Everything about a parent's trace except the point: the level lookup, the cell's dof list, and the
         # facet-incident subset of its local basis. `region.parents` is constant across the region's quadrature points
         # by the `FacetRegion` contract, and the subset depends only on `(level, sides)`, so all of it is resolved once
-        # here instead of at every point below. `box` is the parent's precomputed physical box, so the only per-Q-point
-        # geometry work left is the affine `physical_to_reference`. The levels stay in their own vector: a space may mix
-        # basis families across levels, and holding one in the record would make the record type — and with it the mass
-        # double loop below, which reads nothing family-specific — vary per parent.
+        # here instead of at every point below. The levels stay in their own vector: a space may mix basis families
+        # across levels, and holding one in the record would make the record type — and with it the mass double loop
+        # below, which reads nothing family-specific — vary per parent.
         levels = map(parent -> _level_by_id(V, parent.level), region.parents)
         traces = map(levels, region.parents) do level, parent
             all_raw_dofs = cell_dofs(layout, parent.level, parent.cell)
@@ -1101,8 +1033,14 @@ function _sample_dirichlet_facet!(mass::Vector{Matrix{T}}, index::Vector{Dict{In
              boundary_trace_indices(level, parent.cell, all_raw_dofs, sides)...)
         end
 
-        for (qp, x) in pairs(region.points)
-            qweight = region.weights[qp]
+        # The physical point and weight come from the region accessor every consumer reads (`_region_point`), and each
+        # trace is evaluated at that point mapped through its parent's own box, `physical_to_reference(box, x)`, rather
+        # than through the parent's frame map: the projected Dirichlet values are a property of the dof layer, and on an
+        # uncut face the accessor's point and weight are exactly the tensor rule's, so they stay independent of how the
+        # region stores its rule.
+        jacobian = _region_jacobian(region)
+        for k in 1:_region_qpoint_count(region)
+            x, qweight, _ = _region_point(region, k, jacobian)
 
             # Refresh every parent's trace values at this point. The buffers live on `traces`, so the sample record and
             # the mass double loop below all read the same point from every parent.

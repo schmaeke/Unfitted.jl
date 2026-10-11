@@ -1054,7 +1054,8 @@ function _facet_region_stats(regions::Dict{RegionKey,Vector{FacetRegion{D,T}}}) 
             fit_failures=count(r -> r.kind in (:cut_fallback, :cut_failed, :cut_alpha_failed), trimmed),
             fallbacks=count(r -> r.kind === :cut_fallback, trimmed),
             residual_max=maximum(r -> Float64(r.residual), trimmed; init=0.0),
-            min_relative_measure=minimum(r -> Float64(sum(r.weights) / _face_measure(r)), trimmed; init=1.0),)
+            min_relative_measure=minimum(r -> Float64(_region_jacobian(r) * sum(r.weights) / _face_measure(r)), trimmed;
+                                         init=1.0),)
 end
 
 # Resolve one selector into its full list of `FacetRegion`s (the union of regions across every facet the selector

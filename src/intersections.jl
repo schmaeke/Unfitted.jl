@@ -97,11 +97,11 @@ struct Region{D,T<:Real,N,S}
     residual::T
 end
 
-function Region(lower::SVector{D,T}, upper::SVector{D,T}, parents::Vector{Parent{D,T}}, kind::Symbol,
-                points::Vector{SVector{D,T}}, weights::Vector{T}; split::Int=length(parents),
-                fields::NTuple{2,Int}=(0, 0), normal=nothing, sides=nothing, residual=zero(T)) where {D,T}
+function Region(lower::SVector{D,T}, upper::SVector{D,T}, parents::Vector{Parent{D,T}}, kind::Symbol, points, weights;
+                split::Int=length(parents), fields::NTuple{2,Int}=(0, 0), normal=nothing, sides=nothing,
+                residual=zero(T)) where {D,T}
     return Region{D,T,typeof(normal),typeof(sides)}(lower, upper, parents, split, fields, kind, points, weights, normal,
-                                                    sides, T(residual))
+                                                    sides, residual)
 end
 
 const VolumeRegion{D,T} = Region{D,T,Nothing,Nothing}
@@ -209,7 +209,7 @@ _gauss_counts(level, cell) = recommended_quadrature_order(level.basis, cell_orde
 # plate, factor 1 stops converging after `p = 2` and by `p = 7` is three times worse than first order while the fit
 # residual stays at ~1e-16. `physical_domain`'s docstring carries that table.
 #
-# The convention is per axis, so a boundary facet reads it on its free axes alone (`_facet_region` in `dirichlet.jl`):
+# The convention is per axis, so a boundary facet reads it on its free axes alone (`_facet_regions` in `dirichlet.jl`):
 # reading it from here rather than restating it is what keeps a cut face and the cells behind it integrating products of
 # traces to the same degree.
 _moment_orders(factor::Int) = (level, cell) -> factor .* cell_order(level, cell)
@@ -219,8 +219,9 @@ _moment_orders(factor::Int) = (level, cell) -> factor .* cell_order(level, cell)
 # Tensor Gauss rule cache, keyed by per-axis count tuple. Built lazily and shared across every `:full` region that needs
 # the same per-axis count. `:full` regions then alias the cached `points`/`weights` arrays directly, so they cost only
 # the assembly-loop iteration time — no allocation per region.
-function _cached_tensor_quadrature!(cache::Dict{NTuple{D,Int},TensorQuadrature{D,T}}, counts::NTuple{D,Int},
-                                    ::Type{T}) where {D,T}
+const _TensorRuleCache{D,T} = Dict{NTuple{D,Int},TensorQuadrature{D,T}}
+
+function _cached_tensor_quadrature!(cache::_TensorRuleCache{D,T}, counts::NTuple{D,Int}, ::Type{T}) where {D,T}
     return get!(() -> _tensor_gauss_rule(counts, T), cache, counts)
 end
 
@@ -263,7 +264,7 @@ const _MomentFitCache{D,T} = Dict{_MomentFitKey{D,T},_MomentFitValue{D,T}}
 # the moment fit, in the same 4-tuple shape and the same *physical*-frame convention. Placing it here puts a custom rule
 # under the same per-box memoisation, the same reference-frame mapping, and the same α-FCM blend as the fit, so swapping
 # the rule changes exactly one thing. `custom` is the caller's, not the field's, because a caller may decline the rule:
-# a boundary facet never consults it (see `_facet_region` in `dirichlet.jl`).
+# a boundary facet never consults it (see `_facet_regions` in `dirichlet.jl`).
 #
 # A pure function of its arguments, which is what lets `_fit_rules` run it on any thread.
 function _fit_rule(physical::PhysicalDomain, lower::SVector{D,T}, upper::SVector{D,T}, order::NTuple{D,Int},
@@ -303,7 +304,7 @@ end
 #   - `:full`                         → `:full`, the base tensor rule, ALIASED
 #   - `:fictitious`, `α == 0`         → `:fictitious`, the empty rule (the volume plan
 #                                       drops such a region before asking; a facet
-#                                       keeps it, see `_facet_region`)
+#                                       keeps it, see `_facet_regions`)
 #   - `:fictitious`, `α > 0`          → `:fictitious_alpha`, the α-scaled base rule
 #   - `:cut`, a fitted rule           → `:cut_fitted`
 #     (α > 0 appends the α-scaled base rule for stabilisation)
@@ -658,22 +659,20 @@ end
 
 # ── Plan construction ─────────────────────────────────────────────────────────
 
-# One kept region of a volume plan before its rule is built: its corners and parents, and what sizing and classification
-# decided about it, computed once per region (`_region_record`) and read by both the prefit and the rule loop. `order`
-# is the moment-fit order on a `:cut` verdict and repeats `counts` otherwise, where nothing reads it.
+# One kept region of a volume plan or a boundary facet before its rule is built: its corners and parents, and what
+# sizing and classification decided about it, computed once per region (`_region_record`) and read by both the fits and
+# the rule loop. `order` is the moment-fit order on a `:cut` verdict and repeats `counts` otherwise, where nothing reads
+# it.
 const _RegionRecord{D,T} = @NamedTuple{lower::SVector{D,T}, upper::SVector{D,T}, parents::Vector{Parent{D,T}},
                                        verdict::Symbol, counts::NTuple{D,Int}, order::NTuple{D,Int}}
 
-# The record of one kept box: tensor counts from its parents, the `PhysicalDomain` classification (`:full` without one),
-# and on a `:cut` verdict the moment-fit order. `classify_cache` is shared with `_apply_physical_fold` in `mesh.jl`, so
-# a box that coincides with a previously classified cell box (the common no-overlay case) reuses the fold's verdict
-# instead of re-walking the octree.
+# The record of one kept region from its classifier `verdict`: the tensor counts from its parents (`0` on an axis the
+# region does not extend along) and, on a `:cut` verdict, the moment-fit order. The facet slice of a `PhysicalDomain`
+# carries the domain's own `moment_order_factor`, so reading it off `V` sizes a cut face and the cells behind it alike.
 function _region_record(V::Space{D,T}, lower::SVector{D,T}, upper::SVector{D,T}, parents::Vector{Parent{D,T}},
-                        classify_cache::_ClassifyCache{D,T}) where {D,T}
-    physical = V.physical
+                        verdict::Symbol) where {D,T}
     counts = _axis_max(_gauss_counts, V, parents, lower, upper)
-    verdict = physical === nothing ? :full : classify_cell(physical, AxisBox{D,T}(lower, upper), classify_cache)
-    order = verdict === :cut ? _axis_max(_moment_orders(physical.moment_order_factor), V, parents, lower, upper) :
+    order = verdict === :cut ? _axis_max(_moment_orders(V.physical.moment_order_factor), V, parents, lower, upper) :
             counts
     return _RegionRecord{D,T}((lower, upper, parents, verdict, counts, order))
 end
@@ -735,7 +734,7 @@ function _plan_regions(records::Vector{_RegionRecord{D,T}}, fits::_MomentFitCach
                        tolerance::GeometryTolerance{T}, domain_volume::T) where {D,T}
     regions = VolumeRegion{D,T}[]
     small_overlaps = SmallOverlap{T}[]
-    tensor_cache = Dict{NTuple{D,Int},TensorQuadrature{D,T}}()
+    tensor_cache = _TensorRuleCache{D,T}()
     alpha_cache = Dict{NTuple{D,Int},Vector{T}}()
     residual_max = 0.0
     for record in records
@@ -828,15 +827,18 @@ function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criteri
 
     # Parents and the keep-criterion first, then one record per kept box with its sizing and classification, before
     # touching the (potentially expensive) rules; then every cut rule up front (`_prefit!`), so the rule loop walks the
-    # records in partition order on nothing but cache hits.
+    # records in partition order on nothing but cache hits. `classify_cache` is shared with `_apply_physical_fold` in
+    # `mesh.jl`, so a box that coincides with a previously classified cell box (the common no-overlay case) reuses the
+    # fold's verdict instead of re-walking the octree.
+    physical = V.physical
     records = _RegionRecord{D,T}[]
     _partition(V.levels, ntuple(identity, Val(D)), zero(SVector{D,T}), tolerance) do lower, upper, sig
         parents = _parents(V.levels, sig, lower, upper)
-        _criterion_satisfied(parents, length(V.levels), criterion) &&
-            push!(records, _region_record(V, lower, upper, parents, classify_cache))
+        _criterion_satisfied(parents, length(V.levels), criterion) || return nothing
+        verdict = physical === nothing ? :full : classify_cell(physical, AxisBox{D,T}(lower, upper), classify_cache)
+        push!(records, _region_record(V, lower, upper, parents, verdict))
         return nothing
     end
-    physical = V.physical
     _prefit!(moment_fit_cache, physical, records)
 
     alpha = physical === nothing ? zero(T) : physical.alpha

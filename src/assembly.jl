@@ -1269,9 +1269,9 @@ end
 # Volume, facet, surface and interface regions share one kernel, `_integrate!` above. Only these small accessors differ
 # per region kind, and they dispatch statically on the region type.
 
-# The region kinds that store their quadrature points and weights in the physical frame, one entry per point: facets,
-# immersed surfaces and interfaces. A `Region` instead carries its rule in its own frame (`intersections.jl`).
-const _PhysicalRegion = Union{FacetRegion,SurfaceRegion,InterfaceRegion}
+# The region kinds that store their quadrature points and weights in the physical frame, one entry per point: immersed
+# surfaces and interfaces. A `Region` instead carries its rule in its own frame (`intersections.jl`).
+const _PhysicalRegion = Union{SurfaceRegion,InterfaceRegion}
 
 # Number of quadrature points of a region, which sizes its `q.point` range (`RegionList`) and drives the kernel's point
 # loop.
@@ -1279,7 +1279,7 @@ _region_qpoint_count(region) = length(region.weights)
 
 # Frame→physical Jacobian for the region's weights. A `Region`'s is `∏ (upper[d] − lower[d]) / 2` over the axes it
 # extends along, a left fold of exact halvings, so on a volume box it is bit for bit `vol(box) / 2ᴰ`, the factor
-# `reference_to_physical` implies. Facet, surface, and interface regions store physical weights, so theirs is one.
+# `reference_to_physical` implies. Surface and interface regions store physical weights, so theirs is one.
 function _region_jacobian(region::Region{D,T}) where {D,T}
     half = (region.upper - region.lower) / 2
     jacobian = one(T)
@@ -1305,8 +1305,8 @@ end
 # Quadrature point `k` of `region` as `(x, weight, ref)`: the physical point, the physical weight, and the reference
 # each parent maps to its own frame (`_parent_xi`). A `Region` iterates points `p` of its own frame, so `ref = p` and
 # every parent maps it through its `ξ0 + dξ ∘ p`; `x` is the frame map written exactly as `reference_to_physical` writes
-# it, so a volume region's points are those of its box bit for bit. Facet, surface and interface regions carry physical
-# points and weights, and each parent maps the physical point through its own `parent_box`.
+# it, so a volume region's points are those of its box bit for bit. Surface and interface regions carry physical points
+# and weights, and each parent maps the physical point through its own `parent_box`.
 @inline function _region_point(region::Region, k::Int, jacobian)
     p = region.points[k]
     x = (region.lower + region.upper) / 2 + (region.upper - region.lower) .* p / 2
@@ -1320,10 +1320,10 @@ end
 # `q`-tuple extras the form callbacks read: the outward unit normal at the point (`nothing` for a volume region; the
 # constant face normal for a facet; the per-point normal for an immersed surface or an interface, oriented from side `a`
 # to side `b` there) and the codim-`K` facet identifier `q.sides` (only a facet carries one).
-_region_normal(region::Union{Region,FacetRegion}, ::Int) = region.normal
+_region_normal(region::Region, ::Int) = region.normal
 _region_normal(region::Union{SurfaceRegion,InterfaceRegion}, k::Int) = region.normals[k]
 _region_sides(::Union{SurfaceRegion,InterfaceRegion}) = nothing
-_region_sides(region::Union{Region,FacetRegion}) = region.sides
+_region_sides(region::Region) = region.sides
 
 # Evaluate every parent's basis at the current point into the bank: values and physical gradients (`Val(true)`), or
 # values only (`Val(false)`, for the L² transfer rhs, whose integrand never reads a gradient). The gradient scale is the
