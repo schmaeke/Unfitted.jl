@@ -90,6 +90,28 @@ end
     @test diagnostics(mover).integration_regions == diagnostics(direct).integration_regions
 end
 
+@testset "a callable criterion never sees a region no level covers" begin
+    # Regression. Where no level is active — the base cell (2, 2) and the overlay cell over it are both masked off — the
+    # partition still forms a candidate box, which carries no parent. `:any_parent` and `:all_levels` reject it by
+    # definition, but a callable criterion used to be handed the empty parent list, and one returning `true` kept the
+    # region and crashed sizing its rule (`maximum` over no parents). Parentless boxes are now dropped before any
+    # criterion runs, so `_ -> true` is `:any_parent`.
+    base_mask = trues(3, 3)
+    base_mask[2, 2] = false
+    over_mask = trues(2, 2)
+    over_mask[1, 1] = false
+    V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=1, active=base_mask),
+                box((1 / 3, 1 / 3), (1.0, 1.0)); cells=(2, 2), order=1, active=over_mask)
+    saw_empty = Ref(false)
+    keep_all = parents -> (isempty(parents) && (saw_empty[] = true); true)
+    plan = Unfitted.integration_plan(V; criterion=keep_all)
+    @test !saw_empty[]
+    reference = Unfitted.integration_plan(V)
+    @test [r.box for r in plan.regions] == [r.box for r in reference.regions]
+    @test [r.parents for r in plan.regions] == [r.parents for r in reference.regions]
+    @test sum(Unfitted.volume(r.box) for r in plan.regions) ≈ 1 - 1 / 9
+end
+
 # `tolerance.merge` is an absolute length. A mesh whose spacing on some axis falls at or below it would have that axis's
 # own element boundaries collapsed by `merge_coordinates`, leaving integration regions that straddle two cells —
 # silently, since nothing downstream can see it. `integration_plan` rejects the combination instead. The threshold is

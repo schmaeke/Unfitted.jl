@@ -565,6 +565,10 @@ end
 #                      do not express; no in-tree caller uses it, and it
 #                      reaches the plan through `prepare(problem;
 #                      criterion = …)`.
+#
+# `parents` is never empty here: `integration_plan` drops a box no level covers before asking, because such a box has no
+# basis function to integrate and no parent order to size a rule from. Handing it to a callable criterion used to let
+# one that answers `true` keep the box and then crash building its rule.
 function _criterion_satisfied(parents, level_count::Int, criterion)
     if criterion === :any_parent
         return !isempty(parents)
@@ -668,8 +672,9 @@ The construction follows the recipe in `CONTRIBUTING.md`'s "Integration regions"
   2. Form the Cartesian product of the resulting intervals to get candidate boxes; greedily merge axis-adjacent
      candidates that share a coverage signature (every cell inside the merged box lies inside the same cell of every
      active level).
-  3. For each kept candidate, identify the covering parent cells via midpoint containment, build the box's geometry in
-     each parent's reference frame, and check the `criterion`.
+  3. For each kept candidate, identify the covering parent cells via midpoint containment and build the box's geometry
+     in each parent's reference frame. A box no level covers is dropped; every other box is checked against the
+     `criterion`.
   4. Dispatch on the `PhysicalDomain` classification to pick the region quadrature: tensor Gauss for `:full`, α-scaled
      tensor Gauss for `:fictitious + alpha > 0`, and on `:cut` the NNMF moment-fit — or the domain's `cut_quadrature`
      callable, when it supplies one, in the fit's place. Drop the region entirely under strict-α (`alpha = 0` and
@@ -685,7 +690,8 @@ Keyword arguments:
   - `criterion` — `:any_parent` (default), `:all_levels`, or a function `parents -> Bool`. See `_criterion_satisfied`
     for the semantics. The predicate form is an escape hatch for a coverage rule the two symbols do not express; it is
     reached through `prepare(problem; criterion = …)` and, like every plan option, survives `move!` and `activate!`
-    because [`Model`](@ref) replays its captured `plan_options`.
+    because [`Model`](@ref) replays its captured `plan_options`. It is only ever called with a non-empty parent list:
+    a box no level covers is no region under any criterion.
   - `classify_cache` — optional classification cache shared with the cell-level fictitious fold. Pass the same cache
     through `_apply_physical_fold` so the per-cell verdicts computed there can be reused at the region level.
   - `moment_fit_cache` — optional cut-region rule cache, keyed by region bounds and moment order. Pass the same cache
@@ -724,6 +730,8 @@ function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criteri
     admissible = Tuple{AxisBox{D,T},Vector{ParentRef{D,T}}}[]
     for box in _merged_boxes(V.levels, Val(D), tolerance)
         parents = _parents_covering(V.levels, box, tolerance)
+        # A box no level covers — where every level is inactive — is no region of any plan, whatever the criterion.
+        isempty(parents) && continue
         _criterion_satisfied(parents, length(V.levels), criterion) && push!(admissible, (box, parents))
     end
     _prefit_cut_rules!(moment_fit_cache, V, admissible, classify_cache)
