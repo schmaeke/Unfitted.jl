@@ -239,19 +239,6 @@ function _condition_value(condition::DirichletCondition, x, component::Integer=1
 end
 
 """
-    FacetParent{D,T}(level, cell, parent_box)
-
-Reference to one parent cell of an immersed [`SurfaceRegion`](@ref) or an [`InterfaceRegion`](@ref). `level` and `cell`
-identify the cell; `parent_box` is the cell's physical box, through which the assembly kernel maps each physical
-quadrature point into the cell's reference frame.
-"""
-struct FacetParent{D,T<:Real}
-    level::Int
-    cell::CartesianIndex{D}
-    parent_box::AxisBox{D,T}
-end
-
-"""
     FacetRegion{D,T} = Region{D,T,SVector{D,T},Vector{Tuple{Int,Symbol}}}
 
 One admissible integration region on a codim-`K` facet of the physical domain (where `K = length(sides)`): a

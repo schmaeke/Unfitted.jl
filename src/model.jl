@@ -179,10 +179,10 @@ Fields:
     What such a condition *ought* to mean is an open semantic question and the package does not answer it here; the
     record exists so the answer it does give is not silent. [`UnsupportedDirichletDof`](@ref) has the measured instance
     and the alternative.
-  - `surface_region_count::Int` — total number of [`SurfaceRegion`](@ref)s cached on the model, summed across every
-    cached [`BoundaryMesh`](@ref). Zero for problems with no immersed-boundary integration.
-  - `interface_region_count::Int` — total number of [`InterfaceRegion`](@ref)s cached on the model, summed across every
-    cached coupling [`Interface`](@ref). Zero for problems with no multi-domain interface coupling.
+  - `surface_region_count::Int` — total number of immersed-surface [`SimplexRegion`](@ref)s cached on the model, summed
+    across every cached [`BoundaryMesh`](@ref). Zero for problems with no immersed-boundary integration.
+  - `interface_region_count::Int` — total number of interface [`SimplexRegion`](@ref)s cached on the model, summed
+    across every cached coupling [`Interface`](@ref). Zero for problems with no multi-domain interface coupling.
 """
 mutable struct AssemblyDiagnostics
     dimension::Int
@@ -381,9 +381,9 @@ end
 
 # ── Single-sided region-cache keys ────────────────────────────────────────────
 #
-# A single-sided region list (`FacetRegion`s for a `BoundarySelector`, `SurfaceRegion`s for a `BoundaryMesh`) is built
+# A single-sided region list (`FacetRegion`s for a `BoundarySelector`, `SimplexRegion`s for a `BoundaryMesh`) is built
 # against exactly *one* subdomain space: its parents live on that space's level-id block, so only that space's fields
-# ever evaluate on it (`region_parents`). On a coupled problem the same `on=` target may legitimately be named by fields
+# ever evaluate on it (`_parent_range`). On a coupled problem the same `on=` target may legitimately be named by fields
 # on different subdomains — `boundary(axis=1, side=:upper)` is a face of every subdomain that has one — and those are
 # different sets of facets. The cache key is therefore the *pair* `(on, space)`, not the target alone.
 #
@@ -508,7 +508,7 @@ value through. Fields:
     in the first-appearance order of `problem_spaces``(problem)`. A single-domain problem carries one plan; a
     multi-domain (coupled) problem carries one per subdomain space, each built against that space's own physical fold.
     Populated by `prepare` and refreshed by every mutator. The field-to-plan routing is intrinsic: each field owns the
-    regions on its space's level-id block (see `FieldLayout.level_ids` and `region_parents`), so no per-plan routing
+    regions on its space's level-id block (see `FieldLayout.level_ids` and `_parent_range`), so no per-plan routing
     table is stored.
   - `moment_fit_caches::Vector{_MomentFitCache{D,T}}` — one cut-region moment-fit rule cache per distinct participating
     space, aligned with `space_plans`. Every mutator threads it back into `integration_plan`, so a cut region a `move!`
@@ -549,13 +549,13 @@ value through. Fields:
     whether through a Dirichlet condition or a `block`/`loadform` carrying `on::BoundarySelector`. The space is part of
     the key because a region list lives on one space's level-id block: two subdomains naming a value-equal selector own
     different facets and must not share an entry. Populated at `prepare` and refreshed by every mutator.
-  - `surface_regions::Dict{RegionKey,Vector{SurfaceRegion{D,T}}}` — cache of immersed-boundary [`SurfaceRegion`](@ref)s,
-    keyed the same way by `(mesh, space)`. One entry per [`BoundaryMesh`](@ref) per subdomain space naming it through a
-    `block`/`loadform` carrying `on::BoundaryMesh`. The mesh half of the key matches by object identity (the
-    `BoundaryMesh` value carries no canonical hash; identity match prevents two structurally-equal but distinct meshes
-    from accidentally sharing a cache entry).
-  - `interface_regions::IdDict{Any,Vector{InterfaceRegion{D,T}}}` — per-interface cache of two-sided
-    [`InterfaceRegion`](@ref)s. One entry per [`Interface`](@ref) referenced by a coupling `block` (`couple`'s four
+  - `surface_regions::Dict{RegionKey,Vector{SimplexRegion{D,T}}}` — cache of immersed-boundary
+    [`SimplexRegion`](@ref)s, keyed the same way by `(mesh, space)`. One entry per [`BoundaryMesh`](@ref) per subdomain
+    space naming it through a `block`/`loadform` carrying `on::BoundaryMesh`. The mesh half of the key matches by object
+    identity (the `BoundaryMesh` value carries no canonical hash; identity match prevents two structurally-equal but
+    distinct meshes from accidentally sharing a cache entry).
+  - `interface_regions::IdDict{Any,Vector{SimplexRegion{D,T}}}` — per-interface cache of two-sided
+    [`SimplexRegion`](@ref)s. One entry per [`Interface`](@ref) referenced by a coupling `block` (`couple`'s four
     blocks share one `Interface` object). Keyed by object identity, as for `surface_regions`.
   - `dirichlet_projections::Dict{Symbol,DirichletProjection{D,T}}` — per-field cache of the datum-independent half of
     the L² Dirichlet projection (see [`DirichletProjection`](@ref)). Empty at `prepare` and filled by the first
@@ -588,8 +588,8 @@ mutable struct Model{D,T,P}
     rhs::Union{Nothing,Vector{T}}
     facet_resolver::FacetResolver{D,T}
     facet_regions::Dict{RegionKey,Vector{FacetRegion{D,T}}}
-    surface_regions::Dict{RegionKey,Vector{SurfaceRegion{D,T}}}
-    interface_regions::IdDict{Any,Vector{InterfaceRegion{D,T}}}
+    surface_regions::Dict{RegionKey,Vector{SimplexRegion{D,T}}}
+    interface_regions::IdDict{Any,Vector{SimplexRegion{D,T}}}
     dirichlet_projections::Dict{Symbol,DirichletProjection{D,T}}
     diagnostics::AssemblyDiagnostics
     assembly::AssemblyCache{T}
@@ -977,7 +977,7 @@ end
 # space half likewise. One mesh named by fields on two subdomains yields two entries, each cut against its own grid; a
 # genuine *two-sided* coupling across a mesh is an [`Interface`](@ref), which carries both sides in one region.
 function _resolve_surface_regions(problem::Problem{D,T}, tolerance::GeometryTolerance{T}) where {D,T}
-    regions = Dict{RegionKey,Vector{SurfaceRegion{D,T}}}()
+    regions = Dict{RegionKey,Vector{SimplexRegion{D,T}}}()
     for (mesh, space) in _referenced_boundary_mesh_sites(problem)
         key = (mesh, space)
         haskey(regions, key) && continue
@@ -1000,7 +1000,7 @@ end
 # subdividing the interface mesh against the merged trace of both grids. Keyed by `IdDict` (object identity), as for the
 # surface cache.
 function _resolve_interface_regions(problem::Problem{D,T}, layout::SystemLayout{D,T}) where {D,T}
-    regions = IdDict{Any,Vector{InterfaceRegion{D,T}}}()
+    regions = IdDict{Any,Vector{SimplexRegion{D,T}}}()
     for iface in _referenced_interfaces(problem)
         haskey(regions, iface) || (regions[iface] = _interface_regions(iface, problem, layout))
     end
@@ -1226,7 +1226,7 @@ integration_plan(model::Model) = first(model.space_plans)
     integration_plans(model::Model) -> Vector{IntegrationPlan}
 
 Every subdomain's cached [`IntegrationPlan`](@ref), in `problem_spaces` order. The assembly volume pass iterates these;
-each region is owned by the fields on its subdomain intrinsically (`region_parents` via `FieldLayout.level_ids`). For a
+each region is owned by the fields on its subdomain intrinsically (`_parent_range` via `FieldLayout.level_ids`). For a
 single-domain model this is a one-element vector whose only element is what [`integration_plan`](@ref) returns.
 """
 integration_plans(model::Model) = model.space_plans

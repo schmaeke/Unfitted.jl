@@ -111,6 +111,25 @@ const VolumeRegion{D,T} = Region{D,T,Nothing,Nothing}
 # bookkeeping — build it here.
 _region_box(region::Region) = AxisBox(region.lower, region.upper)
 
+# The Jacobian of the frame `lower`–`upper`: `∏ (upper[d] − lower[d]) / 2` over the axes it extends along, a left fold
+# of exact halvings, so on a box it is bit for bit `vol / 2ᴰ`, the factor `reference_to_physical` implies, and on a
+# point it is 1.
+function _frame_jacobian(lower::SVector{D,T}, upper::SVector{D,T}) where {D,T}
+    half = (upper - lower) / 2
+    jacobian = one(T)
+    for d in 1:D
+        iszero(half[d]) || (jacobian *= half[d])
+    end
+    return jacobian
+end
+
+# The frame coordinate of a physical point `x` of the frame `lower`–`upper`: the inverse of the frame map,
+# `physical_to_reference` on every axis the frame extends along and `0` on a degenerate one.
+function _frame_point(lower::SVector{D,T}, upper::SVector{D,T}, x::SVector{D,T}) where {D,T}
+    return SVector{D,T}(ntuple(d -> lower[d] == upper[d] ? zero(T) :
+                                    (2 * x[d] - lower[d] - upper[d]) / (upper[d] - lower[d]), Val(D)))
+end
+
 """
     SmallOverlap{T}(region, volume, relative_volume, cover_count)
 

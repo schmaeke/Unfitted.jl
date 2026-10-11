@@ -583,7 +583,7 @@ end
     # global rule would print 4 twice.
     @test sort(unique(counts)) == [3, 4]
     for region in regions
-        x = sum(p[1] for p in region.points) / length(region.points)
+        x = (region.lower[1] + region.upper[1]) / 2   # the sub-segment's midpoint
         @test length(region.points) == (x < 0.5 ? 3 : 4)
     end
 end

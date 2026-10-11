@@ -390,7 +390,7 @@ function _assemble(@nospecialize(model::Model), @nospecialize(blocks), @nospecia
             filter_pass = pass.key[1] === nothing ? region_filter : nothing
             if threaded
                 # Every pass — volume, facet, surface, and two-sided interface — runs threaded. One unexplained
-                # observation stands against that: a two-sided `InterfaceRegion` pass for a vector coupling, under
+                # observation stands against that: a two-sided interface pass for a vector coupling, under
                 # `--code-coverage` at ≥2 threads, was nondeterministically corrupted on both x86 and ARM. Never seen
                 # outside coverage, not reproduced since across ~30,000 bit-exact comparisons, mechanism not established
                 # (see the `couple` docstring); the parallel path ships and `threaded=false` is the escape hatch.
@@ -421,7 +421,7 @@ _scalar(::SystemLayout{D,T}) where {D,T} = T
 #      `isequal` — value-equal selectors are one target, meshes and interfaces match by identity;
 #   2. each target split per subdomain space, in `problem_spaces` order, a pass taking the forms whose test field lives
 #      on that space. A region list is built on one space's level block and only that space's fields evaluate on it
-#      (`region_parents`), so a target named on two subdomains is two independent passes, and a volume form runs on its
+#      (`_parent_range`), so a target named on two subdomains is two independent passes, and a volume form runs on its
 #      own subdomain's plan only;
 #   3. except an `Interface`, which is one pass: its regions carry both sides' parents, and the four blocks of a
 #      `couple` alternate their test field between the two subdomains.
@@ -976,19 +976,20 @@ end
 # column-major array whose leading `n × n` block is the active part (`m = n + length(ws.pivots)`). This is the assembly
 # hot loop.
 #
-# One method serves all four region kinds; only the accessors below differ:
+# One method serves all four region kinds, which share one record (`Region`): each iterates its rule in its own frame,
+# maps every point and weight to physical ones and every parent's reference coordinate through the region accessors
+# below, and differs from the others only in what it carries for the forms:
 #
-#   * a **volume** region iterates reference-frame points and scales each weight by `vol(box)/2ᴰ`; `q.normal` and
-#     `q.sides` are `nothing`;
-#   * a **facet** region iterates precomputed physical points and carries the face's outward normal `q.normal` and
-#     codim-`K` identifier `q.sides`, so forms can express Neumann, Robin and Nitsche contributions;
-#   * a **surface** (immersed-boundary) region is a facet with a per-point `q.normal` and no `q.sides`;
+#   * a **volume** region: `q.normal` and `q.sides` are `nothing`;
+#   * a **facet** region: the face's outward normal `q.normal` and codim-`K` identifier `q.sides`, so forms can express
+#     Neumann, Robin and Nitsche contributions;
+#   * a **surface** (immersed-boundary) region: the sub-cell's normal and no `q.sides`;
 #   * an **interface** region is two-sided: it refreshes both subdomains' bases at the shared point and carries the
-#     per-point normal oriented from side `a` to side `b`.
+#     sub-cell's normal oriented from side `a` to side `b`.
 #
 # Every active local basis function of every parent participates. In particular `is_facet_basis` is not applied on the
-# physical-frame kinds: a function with zero *value* on a face can carry a nonzero *gradient*, which Nitsche-style forms
-# rely on.
+# boundary kinds: a function with zero *value* on a face can carry a nonzero *gradient*, which Nitsche-style forms rely
+# on.
 #
 # Per point the kernel refreshes the bases, evaluates the state when there is one, and composes `q` (`_payload!`), with
 # `point = offset + k` the stable index `nquadpoints` sizes and `foreach_quadrature_point` shares. Loads are evaluated
@@ -1175,9 +1176,8 @@ function _frame!(ws::AssemblyWorkspace, region)
     empty!(ws.slots)
     for (f, fl) in pairs(ws.layout.fields)
         ws.fptr[f] = length(ws.parents) + 1
-        parents = region_parents(region, f, fl)
-        parents === nothing && continue
-        for p in parents
+        for i in _parent_range(region, f, fl)
+            p = region.parents[i]
             raw = cell_dofs(fl.dofs, p.level, p.cell)
             length(raw) <= length(ws.bank.values[p.level]) ||
                 throw(DimensionMismatch("cell $(p.cell) of level $(p.level) has $(length(raw)) raw " *
@@ -1191,22 +1191,6 @@ function _frame!(ws::AssemblyWorkspace, region)
     end
     ws.fptr[end] = length(ws.parents) + 1
     return ws
-end
-
-# Parents of `region` on which field `fl` (global index `f`) is evaluated, or `nothing` when the field does not live
-# there. Subdomain ownership is intrinsic: a single-space region hands its parents only to a field whose level-id block
-# contains the region's level, so a region built on one subdomain's plan is owned exactly by the fields on that
-# subdomain. On a single-domain model every field's block covers every level and every field gets the parents. `nothing`
-# rather than an empty vector keeps the frame allocation-free.
-function region_parents(region, ::Int, fl::FieldLayout)
-    (isempty(region.parents) || first(region.parents).level in fl.level_ids) ? region.parents : nothing
-end
-
-# Two-sided: each coupled field is evaluated on its own subdomain's parents and every other field on none, so an
-# interface pass emits into exactly the four field blocks Kₐₐ, K_ab, K_ba, K_bb. Keyed on the field *index* (the
-# interface stores its two sides' global field indices), not on the level block.
-function region_parents(region::InterfaceRegion, f::Int, ::FieldLayout)
-    f == region.field_a ? region.parents_a : f == region.field_b ? region.parents_b : nothing
 end
 
 # Number the region's dofs locally and give every slot its role. Returns `n`, the number of active local indices.
@@ -1264,31 +1248,19 @@ function _push_branch(ws::AssemblyWorkspace, g, w, v)
     return ws
 end
 
-# ── Per-region-kind quadrature accessors ──────────────────────────────────────
+# ── Region accessors ──────────────────────────────────────────────────────────
 #
-# Volume, facet, surface and interface regions share one kernel, `_integrate!` above. Only these small accessors differ
-# per region kind, and they dispatch statically on the region type.
-
-# The region kinds that store their quadrature points and weights in the physical frame, one entry per point: immersed
-# surfaces and interfaces. A `Region` instead carries its rule in its own frame (`intersections.jl`).
-const _PhysicalRegion = Union{SurfaceRegion,InterfaceRegion}
+# Volume, facet, surface and interface regions share one kernel, `_integrate!` above, and one record, `Region`
+# (`intersections.jl`). These accessors are the only place the kernel reads a region; each has one method, and the
+# region kinds differ only in the `normal` / `sides` types they carry.
 
 # Number of quadrature points of a region, which sizes its `q.point` range (`RegionList`) and drives the kernel's point
 # loop.
-_region_qpoint_count(region) = length(region.weights)
+_region_qpoint_count(region::Region) = length(region.weights)
 
-# Frame→physical Jacobian for the region's weights. A `Region`'s is `∏ (upper[d] − lower[d]) / 2` over the axes it
-# extends along, a left fold of exact halvings, so on a volume box it is bit for bit `vol(box) / 2ᴰ`, the factor
-# `reference_to_physical` implies. Surface and interface regions store physical weights, so theirs is one.
-function _region_jacobian(region::Region{D,T}) where {D,T}
-    half = (region.upper - region.lower) / 2
-    jacobian = one(T)
-    for d in 1:D
-        iszero(half[d]) || (jacobian *= half[d])
-    end
-    return jacobian
-end
-_region_jacobian(region::_PhysicalRegion) = one(eltype(region.weights))
+# Frame→physical Jacobian of the region's weights (`_frame_jacobian`): `vol(box) / 2ᴰ` bit for bit on a volume box, the
+# free-axis factor on a facet, 1 on a point.
+_region_jacobian(region::Region) = _frame_jacobian(region.lower, region.upper)
 
 # The per-point step shared by the kernel and the walker: the `q` payload of point `k` of `region`, whose index in its
 # list is `point`, `(; x, weight, point, state, normal, sides)`. With a workspace `ws` the basis is refreshed at the
@@ -1296,66 +1268,66 @@ _region_jacobian(region::_PhysicalRegion) = one(eltype(region.weights))
 # evaluates nothing. The kernel hands the payload to every form callback and the walker (`_walk`) to its caller, so a
 # form and a walk over the same list see the same payload at the same point by construction.
 @inline function _payload!(ws, region, k::Int, jacobian, point::Int, state)
-    x, weight, ref = _region_point(region, k, jacobian)
-    ws === nothing || _refresh!(ws, region, ref, Val(true))
+    x, weight, p = _region_point(region, k, jacobian)
+    ws === nothing || _refresh!(ws, region, p, Val(true))
     state = state === nothing ? nothing : _state_point!(state, ws, Val(true))
     return (; x, weight, point, state, normal=_region_normal(region, k), sides=_region_sides(region))
 end
 
-# Quadrature point `k` of `region` as `(x, weight, ref)`: the physical point, the physical weight, and the reference
-# each parent maps to its own frame (`_parent_xi`). A `Region` iterates points `p` of its own frame, so `ref = p` and
-# every parent maps it through its `ξ0 + dξ ∘ p`; `x` is the frame map written exactly as `reference_to_physical` writes
-# it, so a volume region's points are those of its box bit for bit. Surface and interface regions carry physical points
-# and weights, and each parent maps the physical point through its own `parent_box`.
+# Quadrature point `k` of `region` as `(x, weight, p)`: the physical point, the physical weight, and the frame point `p`
+# every parent maps to its own reference frame (`_refresh!`). `x` is the frame map written exactly as
+# `reference_to_physical` writes it, so a volume region's points are those of its box bit for bit; on a degenerate axis
+# `p` is 0 and `x` the region's own coordinate.
 @inline function _region_point(region::Region, k::Int, jacobian)
     p = region.points[k]
     x = (region.lower + region.upper) / 2 + (region.upper - region.lower) .* p / 2
     return x, region.weights[k] * jacobian, p
 end
-@inline function _region_point(region::_PhysicalRegion, k::Int, _)
-    x = region.points[k]
-    return x, region.weights[k], x
-end
 
-# `q`-tuple extras the form callbacks read: the outward unit normal at the point (`nothing` for a volume region; the
-# constant face normal for a facet; the per-point normal for an immersed surface or an interface, oriented from side `a`
-# to side `b` there) and the codim-`K` facet identifier `q.sides` (only a facet carries one).
+# `q`-tuple extras the form callbacks read: the unit normal (`nothing` for a volume region; the outward face normal for
+# a facet; the sub-cell's normal for an immersed surface or an interface, oriented from side `a` to side `b` there) and
+# the codim-`K` facet identifier `q.sides` (only a facet carries one).
 _region_normal(region::Region, ::Int) = region.normal
-_region_normal(region::Union{SurfaceRegion,InterfaceRegion}, k::Int) = region.normals[k]
-_region_sides(::Union{SurfaceRegion,InterfaceRegion}) = nothing
 _region_sides(region::Region) = region.sides
 
-# Evaluate every parent's basis at the current point into the bank: values and physical gradients (`Val(true)`), or
-# values only (`Val(false)`, for the L² transfer rhs, whose integrand never reads a gradient). The gradient scale is the
-# axis-aligned chain rule `2 / edge_lengths(parent_box)` of `physical_basis_gradients` in `basis.jl`. One basis
-# evaluation per parent per point; a region's parents have distinct levels, so their bank slots never collide.
-@noinline function _refresh!(ws::AssemblyWorkspace{D,T}, region, ref, ::Val{G}) where {D,T,G}
+# The range of `region.parents` field `fl` (global index `f`) is evaluated on, empty when the field does not live
+# there. Subdomain ownership is intrinsic. A one-sided region (`fields == (0, 0)`) hands its parents only to a field
+# whose level-id block contains the region's level, so a region built on one subdomain's plan is owned exactly by the
+# fields on that subdomain; on a single-domain model every field's block covers every level and every field gets the
+# parents. A two-sided interface region evaluates each coupled field on its own side's parents — `1:split` for
+# `field_a`, the rest for `field_b` — and every other field on none, so an interface pass emits into exactly the four
+# field blocks Kₐₐ, K_ab, K_ba, K_bb. It is keyed on the field *index* (the region stores its two sides' global field
+# indices), not on the level block.
+function _parent_range(region::Region, f::Int, fl::FieldLayout)
+    a, b = region.fields
+    n = length(region.parents)
+    a == 0 && return (n == 0 || first(region.parents).level in fl.level_ids) ? (1:n) : (1:0)
+    return f == a ? (1:region.split) : f == b ? ((region.split+1):n) : (1:0)
+end
+
+# Evaluate every parent's basis at the current frame point `p` into the bank: values and physical gradients
+# (`Val(true)`), or values only (`Val(false)`, for the L² transfer rhs, whose integrand never reads a gradient). Each
+# parent maps `p` into its own reference frame through `ξ0 + dξ ∘ p` (`Parent`), with no division. The gradient scale is
+# the axis-aligned chain rule `2 / edge_lengths(parent_box)` of `physical_basis_gradients` in `basis.jl`. One basis
+# evaluation per parent per point. A one-sided region's parents have distinct levels, so their bank slots never
+# collide; an interface region's two sides live in the two subdomains' disjoint level banks, so the kernel reads field
+# `a` from `a`'s cut cell and field `b` from `b`'s at the same physical point.
+@noinline function _refresh!(ws::AssemblyWorkspace{D,T}, region::Region, p, ::Val{G}) where {D,T,G}
     bank = ws.bank
-    for parents in _parent_lists(region), p in parents
-        l = p.level
-        ids = bank.modes[l].sets[bank.modes[l].kind[p.cell]]
-        xi = _parent_xi(p, ref)
+    for parent in region.parents
+        l = parent.level
+        ids = bank.modes[l].sets[bank.modes[l].kind[parent.cell]]
+        xi = parent.ξ0 + parent.dξ .* p
         if G
-            scale = SVector{D,T}(2 .* inv.(edge_lengths(p.parent_box)))
+            scale = SVector{D,T}(2 .* inv.(edge_lengths(parent.parent_box)))
             _tensor_values_grads!(bank.bases[l], bank.values[l], bank.gradients[l], ids, bank.orders[l], xi, scale,
-                                  bank.val1d[l], bank.der1d[l], p.cell)
+                                  bank.val1d[l], bank.der1d[l], parent.cell)
         else
-            _tensor_values!(bank.bases[l], bank.values[l], ids, bank.orders[l], xi, bank.val1d[l], p.cell)
+            _tensor_values!(bank.bases[l], bank.values[l], ids, bank.orders[l], xi, bank.val1d[l], parent.cell)
         end
     end
     return nothing
 end
-
-# The parent lists refreshed at every point: a region's one list, or both sides of an interface, whose parents live in
-# the two subdomains' disjoint level banks, so the kernel reads field `a` from `a`'s cut cell and field `b` from `b`'s
-# at the same physical point.
-_parent_lists(region) = (region.parents,)
-_parent_lists(region::InterfaceRegion) = (region.parents_a, region.parents_b)
-
-# A parent's own reference coordinate of the current point: a frame point `p` through the parent's affine map
-# `ξ0 + dξ ∘ p`; a physical point through the parent's `parent_box`.
-_parent_xi(parent::Parent, p) = parent.ξ0 + parent.dξ .* p
-_parent_xi(parent::FacetParent, x) = physical_to_reference(parent.parent_box, x)
 
 # ── FormState: evaluation and accessors ───────────────────────────────────────
 
@@ -1468,8 +1440,8 @@ diagnostics:
     at all for a face wholly outside `Ω` under strict `α = 0`. `α > 0` appends the full-face tensor rule to each of
     those. The count therefore moves with the geometry, and `cut_facet_region_count` says how many regions are in that
     regime.
-  - `:surface` — every cached immersed [`SurfaceRegion`](@ref) ([`BoundaryMesh`](@ref) integration).
-  - `:interface` — every cached multi-domain [`InterfaceRegion`](@ref).
+  - `:surface` — every cached immersed-surface [`SimplexRegion`](@ref) ([`BoundaryMesh`](@ref) integration).
+  - `:interface` — every cached multi-domain interface [`SimplexRegion`](@ref).
 
 `q.point` is numbered **per region list**, not per kind: it restarts at 1 for each distinct `on=` value and, on a
 coupled model, for each subdomain naming that value. So the aggregate exceeds the `q.point` range whenever the model

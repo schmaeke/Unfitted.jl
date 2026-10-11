@@ -1,6 +1,10 @@
 using LinearAlgebra
 using StaticArrays
 
+# The physical weights of a surface region's rule, as the region accessors hand them to every consumer: a region stores
+# its rule in its sub-cell's bounding-box frame, so its `weights` are frame weights.
+surface_weights(region) = region.weights .* Unfitted._region_jacobian(region)
+
 @testset "BoundaryMesh constructors enforce shape and dimension rules" begin
     # K=0 requires explicit normals; empty `normals` is a dimension mismatch against a non-empty `points`.
     pts = [SVector(0.0, 0.0), SVector(0.5, 0.5)]
@@ -54,7 +58,7 @@ end
     @test_throws ArgumentError Unfitted._default_normal(pt)
 end
 
-@testset "SurfaceRegion builder: simple 2D segment inside one cell" begin
+@testset "surface region builder: simple 2D segment inside one cell" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(4, 4), order=2)
     # A short segment fully inside cell (1,1) (the cell covers x ∈ [0, 0.25], y ∈ [0, 0.25]).
@@ -65,12 +69,13 @@ end
     region = regions[1]
     @test length(region.parents) == 1
     @test region.parents[1].level == 1
-    @test sum(region.weights) ≈ 0.15 atol = 1.0e-12
+    @test region.kind === :surface
+    @test sum(surface_weights(region)) ≈ 0.15 atol = 1.0e-12
     expected_normal = Unfitted._default_normal((SVector(0.05, 0.10), SVector(0.20, 0.10)))
-    @test all(n ≈ expected_normal for n in region.normals)
+    @test region.normal ≈ expected_normal
 end
 
-@testset "SurfaceRegion builder: straddling segment is subdivided against the grid" begin
+@testset "surface region builder: straddling segment is subdivided against the grid" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(4, 4), order=1)
     # Segment crossing the y = 0.25 grid line. With subdivision the builder produces two sub-segments — one in cell (1,
@@ -81,7 +86,7 @@ end
 
     # Subdivision partitions the segment, so the sub-segment quadrature weights sum to the original length at round-off
     # — there is no tolerance floor to leave room for.
-    total_length = sum(sum(r.weights) for r in regions)
+    total_length = sum(sum(surface_weights(r)) for r in regions)
     @test total_length ≈ 0.1 rtol = 1.0e-14
 
     # The two sub-segments live on different cells of level 1.

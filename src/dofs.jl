@@ -195,7 +195,7 @@ is the field's own, and its space block is shared with every other field over th
 
 `level_ids` is the contiguous block of (globally reindexed) level ids the field's [`Space`](@ref) owns. Assembly uses it
 to route each integration region to the field that owns it: a region whose parents live on a level outside this range
-belongs to another subdomain and this field skips it (`region_parents`). For a single-domain problem every field's range
+belongs to another subdomain and this field skips it (`_parent_range`). For a single-domain problem every field's range
 covers every level, so every field evaluates on every region.
 """
 struct FieldLayout{D,T<:Real}

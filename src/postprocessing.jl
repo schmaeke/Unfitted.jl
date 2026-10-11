@@ -1022,8 +1022,8 @@ _squared_norm(value) = sum(abs2, value)
 # Quadrature-only postprocessing on a portion of the boundary. It is a sum over the quadrature-point walker (`_walk` in
 # `assembly.jl`), so it integrates over the region list assembly resolves for the same `on=` target, visits the points
 # in the serial assembly order and hands the integrand the payload a form sees. Physical [`FacetRegion`](@ref)s,
-# immersed [`SurfaceRegion`](@ref)s and two-sided [`InterfaceRegion`](@ref)s take one path, and no per-point geometry
-# work happens in it — every region carries precomputed physical-frame points and weights.
+# immersed-surface and two-sided interface [`SimplexRegion`](@ref)s take one path, the region accessors', which map
+# each region's frame rule to physical points and weights.
 
 """
     boundary_integral(integrand, model::Model; on, field=nothing) -> result

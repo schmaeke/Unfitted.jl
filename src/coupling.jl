@@ -4,18 +4,18 @@
 #   * `Interface` — the `on=` tag that names the two coupled fields and the interface geometry (a user-supplied
 #     `BoundaryMesh`). It sits beside `BoundarySelector` and `BoundaryMesh` as a third `BlockForm.on` kind and is
 #     grouped into its own assembly pass by `_passes`.
-#   * `InterfaceRegion` — a two-sided integration region: shared physical quadrature points / weights / per-point
-#     normals (like `SurfaceRegion`), plus a *separate* covering-parent list per side, so field `a` is evaluated in its
-#     own subdomain's cut cell and field `b` in its subdomain's cut cell at the *same* physical point. The builder
-#     subdivides `Γ` against the merged trace of *both* grids (the non-matching segment-merge of the references), so one
-#     cut cell of one subdomain may face several of the other.
+#   * the interface regions — two-sided `SimplexRegion`s (`kind = :interface`): one rule and normal per sub-cell, like
+#     a surface region, with the covering parents of *both* subdomains, side `a`'s first (`split`), so field `a` is
+#     evaluated in its own subdomain's cut cell and field `b` in its subdomain's cut cell at the *same* physical point.
+#     The builder subdivides `Γ` against the merged trace of *both* grids (the non-matching segment-merge of the
+#     references), so one cut cell of one subdomain may face several of the other.
 #   * `couple` — the public verb. Following the library's "supply the integration primitives, not the constitutive
 #     choice" rule, it does not bake in any penalty / Nitsche / cohesive law: it takes the user's bilinear interface
 #     form `a(trial, test)` and expands the jump coupling `∫_Γ a([u], [v]) dΓ`, `[u] = uₐ − u_b`, into the four field
 #     blocks `Kₐₐ, K_ab, K_ba, K_bb` with the exact `+ − − +` sign pattern. The constitutive content (β, flux weights,
 #     cohesive traction) lives entirely in `a`, written by the user from ordinary `WeakForm`s.
 #
-# The region assembly accessors (`_region_point`, `_refresh!`, `_region_normal`, …) and the `on`-resolution live with
+# The region assembly accessors (`_region_point`, `_refresh!`, `_parent_range`, …) and the `on`-resolution live with
 # the other region kinds in `assembly.jl`; the per-model region cache lives on the `Model` in `model.jl`.
 
 # ── Interface tag ─────────────────────────────────────────────────────────────
@@ -62,26 +62,7 @@ interface(u_a::Field, u_b::Field, geometry::BoundaryMesh) = Interface(u_a.name, 
 
 # ── Interface region ──────────────────────────────────────────────────────────
 
-"""
-    InterfaceRegion{D,T}
-
-One two-sided integration region on a sub-cell of a coupling interface. Mirrors [`SurfaceRegion`](@ref) — precomputed
-physical quadrature points, physical-frame weights, and a per-point normal — but carries a *separate* covering-parent
-list for each side (`parents_a` in `field_a`'s subdomain, `parents_b` in `field_b`'s) so the two fields are evaluated in
-their own cut cells at the shared point. `field_a` / `field_b` are the global field indices the assembly hot loop keys
-on through `region_parents`.
-"""
-struct InterfaceRegion{D,T<:Real}
-    field_a::Int
-    field_b::Int
-    parents_a::Vector{FacetParent{D,T}}
-    parents_b::Vector{FacetParent{D,T}}
-    points::Vector{SVector{D,T}}
-    weights::Vector{T}
-    normals::Vector{SVector{D,T}}
-end
-
-# Build every `InterfaceRegion` for one interface. The interface mesh is subdivided against the *merged* grid lines of
+# Build every interface region for one interface. The interface mesh is subdivided against the *merged* grid lines of
 # both subdomains, so each sub-cell lies inside a single cut cell of each subdomain; the covering parents are then
 # classified per side. A sub-cell whose midpoint has no active cover on one side (its trace lies outside that
 # subdomain's active region) is skipped. `field_a` / `field_b` are the resolved global field indices.
@@ -111,17 +92,20 @@ function _emit_interface_regions(subdivided::BoundaryMesh{D,T,K}, V_a::Space{D,T
     bound = max(maximum(_surface_quadrature_order(V_a)), maximum(_surface_quadrature_order(V_b)))
     rules = [_simplex_reference_quadrature(Val(K), n, T) for n in 1:bound]
     reference_area = _reference_area(Val(K))
-    regions = InterfaceRegion{D,T}[]
+    regions = SimplexRegion{D,T}[]
     for (cell_index, cell) in pairs(subdivided.cells)
         midpoint = _cell_midpoint(cell)
-        parents_a = _active_cover_parents(V_a, midpoint, tol)
-        parents_b = _active_cover_parents(V_b, midpoint, tol)
-        (isempty(parents_a) || isempty(parents_b)) && continue
+        lower, upper = _simplex_frame(cell)
+        parents = Parent{D,T}[]
+        split = _active_cover_parents!(parents, V_a, midpoint, lower, upper, tol)
+        (split == 0 || _active_cover_parents!(parents, V_b, midpoint, lower, upper, tol) == 0) && continue
 
-        n = max(maximum(_axis_max(_gauss_counts, V_a, parents_a)), maximum(_axis_max(_gauss_counts, V_b, parents_b)))
-        points, weights, normals = _simplex_cell_quadrature(cell, cell_index, subdivided.normals, rules[n],
-                                                            reference_area, Val(K))
-        push!(regions, InterfaceRegion{D,T}(field_a, field_b, parents_a, parents_b, points, weights, normals))
+        sides = (view(parents, 1:split), view(parents, (split+1):length(parents)))
+        n = max(maximum(_axis_max(_gauss_counts, V_a, sides[1])), maximum(_axis_max(_gauss_counts, V_b, sides[2])))
+        points, weights, normal = _simplex_cell_quadrature(cell, cell_index, subdivided.normals, rules[n],
+                                                           reference_area, lower, upper, Val(K))
+        push!(regions,
+              Region(lower, upper, parents, :interface, points, weights; split, fields=(field_a, field_b), normal))
     end
     return regions
 end
