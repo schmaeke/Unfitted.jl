@@ -244,7 +244,7 @@ rule reproducible. The package does not run a custom rule on several threads, un
 
 A region built from a custom rule is tagged `:cut_custom` (see `_trimmed_rule` in `src/intersections.jl`) —
 one kind for every custom rule, whatever status symbol it returns, `:empty` excepted as in point 3 above.
-`_cut_region_stats` counts `:cut_custom` as a cut region and **not** as a fit failure, since there is no fit to fail.
+`_kind_stats` counts `:cut_custom` as a cut region and **not** as a fit failure, since there is no fit to fail.
 The rule is stored on the domain rather than in a global, so two models in one session can use different rules and
 nothing about the choice is process-wide or thread-shared.
 

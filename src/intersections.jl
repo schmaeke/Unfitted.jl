@@ -39,49 +39,56 @@ end
     Region{D,T,N,S}(lower, upper, parents, split, fields, kind, points, weights, normal, sides, residual)
     Region(lower, upper, parents, kind, points, weights; split, fields, normal, sides, residual)
 
-One admissible integration region: a piece of the domain that lies inside a single cell of every parent level, so that
-any product of the parents' basis functions is smooth (`C^∞`) on it and the region's rule integrates it to the rule's
-own exactness. The aliases name its shapes:
+One admissible integration region: a piece of the domain, of a boundary facet or of an immersed simplex that lies
+inside a single cell of every parent level, so that any product of the parents' basis functions is smooth (`C^∞`) on it
+and the region's rule integrates it to the rule's own exactness. Every region the assembly kernel walks is one of
+these, and the aliases name its three shapes:
 
   - `VolumeRegion{D,T} = Region{D,T,Nothing,Nothing}` — a box of an [`IntegrationPlan`](@ref), and each side of an L²
-    transfer region pair.
+    transfer region pair;
+  - [`FacetRegion`](@ref)`{D,T}` — a piece of a grid-aligned boundary facet: `normal` is the facet's outward unit normal
+    and `sides` its codim-`K` identifier;
+  - [`SimplexRegion`](@ref)`{D,T}` — a sub-cell of an immersed [`BoundaryMesh`](@ref) or of a coupling interface:
+    `normal` is the sub-cell's unit normal and `sides` is `nothing`.
 
 **The frame.** A region's `lower` / `upper` corners are both its extent and its frame: a frame point `p ∈ [−1, 1]ᴰ` is
 the physical point
 
     x = (lower + upper) / 2 + (upper − lower) ∘ p / 2,
 
-the expression of [`reference_to_physical`](@ref). An axis may be degenerate (`lower[d] == upper[d]`); a rule then has
-`p[d] = 0` there and `x[d]` is the region's coordinate. `points` / `weights` are the rule in that frame, and the
-physical weight of point `k` is `weights[k] · J` with `J = ∏ (upper[d] − lower[d]) / 2` over the non-degenerate axes —
-`vol / 2ᴰ` on a volume box.
+the expression of [`reference_to_physical`](@ref). An axis may be degenerate (`lower[d] == upper[d]`: a facet's pinned
+axis, an axis along which a simplex is flat); a rule then has `p[d] = 0` there and `x[d]` is the region's coordinate.
+`points` / `weights` are the rule in that frame, and the physical weight of point `k` is `weights[k] · J` with
+`J = ∏ (upper[d] − lower[d]) / 2` over the non-degenerate axes — `vol / 2ᴰ` on a volume box, 1 on a point.
 
 Fields:
 
-  - `lower::SVector{D,T}`, `upper::SVector{D,T}` — the region's corners; a volume region's are its box (`_region_box`
-    builds the [`AxisBox`](@ref)).
+  - `lower::SVector{D,T}`, `upper::SVector{D,T}` — the region's corners. A volume region's are its box (`_region_box`
+    builds the [`AxisBox`](@ref)); a facet region's are the facet's coordinate on every pinned axis and its merged
+    interval on every free one; a simplex region's are its sub-cell's bounding box.
   - `parents::Vector{Parent{D,T}}` — the cells evaluated on the region, at most one per level and side, each with its
     map from the region's frame ([`Parent`](@ref)). The set is constant over the region.
-  - `split::Int` — `parents[1:split]` are side `a` of a two-sided region and the rest side `b`; `length(parents)` on
+  - `split::Int` — `parents[1:split]` are side `a` of an interface region and the rest side `b`; `length(parents)` on
     every one-sided region.
   - `fields::NTuple{2,Int}` — `(0, 0)` on a one-sided region, which belongs to the fields whose level-id block holds its
-    parents' levels; `(field_a, field_b)`, the coupled fields' global indices, on a two-sided one.
+    parents' levels; `(field_a, field_b)`, the coupled fields' global indices, on an interface region.
   - `kind::Symbol` — which rule the region carries, a closed vocabulary (`CONTRIBUTING.md`, "Region quadrature kinds"):
     `:full` (tensor Gauss over the whole region: it lies in Ω, or no [`PhysicalDomain`](@ref) is attached),
-    `:fictitious_alpha` (outside Ω under `α > 0`: the α-scaled tensor rule), `:cut_fitted` (∂Ω crosses it: the
-    moment-fit rule, `src/fcm.jl`), `:cut_fallback` (the fit failed, so the raw Saye volume rule the moments were summed
-    from — correct and non-negative, but with 50–200× the points), `:cut_custom` (the domain's own `cut_quadrature`
-    supplied the rule), `:cut_failed` (`Ω ∩ region` carries no rule at all, under `α = 0`: an empty rule) and
-    `:cut_alpha_failed` (the same under `α > 0`: the α-scaled tensor rule alone, so the cell's dofs stay
-    α-stabilised). Under `α > 0` every other cut kind carries `(1 − α)·rule ∪ α·tensor`, rule first.
+    `:fictitious` (a facet region outside Ω under `α = 0`, kept with an empty rule), `:fictitious_alpha` (outside Ω
+    under `α > 0`: the α-scaled tensor rule), `:cut_fitted` (∂Ω crosses it: the moment-fit rule, `src/fcm.jl`),
+    `:cut_fallback` (the fit failed, so the raw Saye volume rule the moments were summed from — correct and
+    non-negative, but with 50–200× the points), `:cut_custom` (the domain's own `cut_quadrature` supplied the rule),
+    `:cut_failed` (`Ω ∩ region` carries no rule at all, under `α = 0`: an empty rule) and `:cut_alpha_failed` (the same
+    under `α > 0`: the α-scaled tensor rule alone, so the cell's dofs stay α-stabilised), and on simplices `:surface`
+    and `:interface`. Under `α > 0` every other cut kind carries `(1 − α)·rule ∪ α·tensor`, rule first.
   - `points::Vector{SVector{D,T}}`, `weights::Vector{T}` — the rule in the region's frame (see above). The `:full` and
     the α-scaled kinds alias one cached array per distinct rule, so they cost no allocation per region.
-  - `normal::N` — `nothing` on a volume region.
-  - `sides::S` — `nothing` on a volume region.
+  - `normal::N` — `nothing` on a volume region, else the region's constant unit normal.
+  - `sides::S` — `nothing`, or a facet region's `Vector{Tuple{Int,Symbol}}` identifier.
   - `residual::T` — the moment-fit residual on a `:cut_*` kind, zero otherwise.
 
-The assembly kernel reads a region only through its accessors (`_region_point`, `_refresh!`, …, `assembly.jl`), which
-dispatch on nothing but these fields.
+The assembly kernel reads a region only through its accessors (`_region_point`, `_refresh!`, `_parent_range`, …,
+`assembly.jl`), one method each, so every kind runs the same compiled loop up to the `normal` / `sides` types.
 """
 struct Region{D,T<:Real,N,S}
     lower::SVector{D,T}
@@ -123,6 +130,14 @@ function _frame_jacobian(lower::SVector{D,T}, upper::SVector{D,T}) where {D,T}
     return jacobian
 end
 
+# The measure of a region's own extent: the product of its extents over the axes it extends along — a volume region's
+# box volume, a facet region's face measure (physical part and fictitious part together), 1 on a point. Compared with
+# the region's physical weight sum it gives the fraction of the region its rule integrates.
+function _region_measure(region::Region{D,T}) where {D,T}
+    extent = region.upper - region.lower
+    return prod(d -> iszero(extent[d]) ? one(T) : extent[d], 1:D)
+end
+
 # The frame coordinate of a physical point `x` of the frame `lower`–`upper`: the inverse of the frame map,
 # `physical_to_reference` on every axis the frame extends along and `0` on a degenerate one.
 function _frame_point(lower::SVector{D,T}, upper::SVector{D,T}, x::SVector{D,T}) where {D,T}
@@ -158,11 +173,10 @@ diagnostics that the assembly path forwards to the user.
 
 Fields:
 
-  - `regions::Vector{VolumeRegion{D,T}}` — every region the assembly will see, in construction order.
-  - `tolerance::GeometryTolerance{T}` — the tolerance used to build this plan, retained for traceability.
-  - `small_overlap_count::Int` — `length(small_overlaps)`.
-  - `small_overlaps::Vector{SmallOverlap{T}}` — diagnostic records for every region whose volume fell below
-    `tolerance.small_volume`.
+  - `regions::Vector{VolumeRegion{D,T}}` — every region the assembly will see, in construction order (see
+    [`Region`](@ref): each carries its box corners, its parents, its `kind` and its rule).
+  - `small_overlaps::Vector{SmallOverlap{T}}` — diagnostic records for every region whose volume fell below the
+    plan's `tolerance.small_volume`; [`AssemblyDiagnostics`](@ref) reports their number as `small_overlap_count`.
   - `min_volume::T` — the smallest region volume in `regions`, or zero if `regions` is empty.
   - `min_relative_volume::T` — `min_volume / volume(V.domain)`.
   - `moment_fit_residual_max::Float64` — the largest NNMF moment-fit residual observed across all `:cut_fitted`,
@@ -172,8 +186,6 @@ Fields:
 """
 struct IntegrationPlan{D,T<:Real}
     regions::Vector{VolumeRegion{D,T}}
-    tolerance::GeometryTolerance{T}
-    small_overlap_count::Int
     small_overlaps::Vector{SmallOverlap{T}}
     min_volume::T
     min_relative_volume::T
@@ -315,6 +327,12 @@ function _fit_rules(physical::PhysicalDomain, keys::Vector{_MomentFitKey{D,T}}, 
     end
     return fitted
 end
+
+# The kinds `_trimmed_rule` gives a region `∂Ω` crosses, whatever rule it ended up with, and the subset on which the
+# moment fit failed (a custom rule never fails a fit: no fit ran). The diagnostics count both (`_kind_stats` in
+# `model.jl`), and the VTK writer refines exactly the first.
+const _CUT_KINDS = (:cut_fitted, :cut_custom, :cut_fallback, :cut_failed, :cut_alpha_failed)
+const _FAILED_KINDS = (:cut_fallback, :cut_failed, :cut_alpha_failed)
 
 # The rule one admissible region carries, from the classifier's `verdict` on it: the single home of the dispatch the
 # volume plan and the boundary facets share, of the α-FCM blend, and of the closed `kind` vocabulary (`CONTRIBUTING.md`,
@@ -800,8 +818,8 @@ The construction follows the recipe in `CONTRIBUTING.md`'s "Integration regions"
      signature — per level, the active cell containing its midpoint — and greedily merge axis-adjacent candidates that
      share it (every cell inside the merged box lies inside the same cell of every active level). A box no level covers
      is no region of the plan.
-  3. Decode each box's parents from its signature, building the box's geometry in each parent's reference frame, and
-     check the `criterion`.
+  3. Decode each box's parents from its signature, building each parent's map from the box's frame into its own
+     reference frame ([`Parent`](@ref)), and check the `criterion`.
   4. Dispatch on the `PhysicalDomain` classification to pick the region quadrature: tensor Gauss for `:full`, α-scaled
      tensor Gauss for `:fictitious + alpha > 0`, and on `:cut` the NNMF moment-fit — or the domain's `cut_quadrature`
      callable, when it supplies one, in the fit's place. Drop the region entirely under strict-α (`alpha = 0` and
@@ -867,6 +885,5 @@ function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criteri
                                                           domain_volume)
     min_volume = isempty(regions) ? zero(T) : minimum(volume(_region_box(region)) for region in regions)
     min_relative_volume = iszero(domain_volume) ? zero(T) : min_volume / domain_volume
-    return IntegrationPlan{D,T}(regions, tolerance, length(small_overlaps), small_overlaps, min_volume,
-                                min_relative_volume, residual_max)
+    return IntegrationPlan{D,T}(regions, small_overlaps, min_volume, min_relative_volume, residual_max)
 end

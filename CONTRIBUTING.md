@@ -144,14 +144,14 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `basis.jl`        | basis-family interface and capability traits, integrated Legendre default, the `:tensor` / `:trunk` index sets and the `_index_admissible` filter the minimum rule is expressed over, tensor-product evaluation |
 | `fcm.jl`          | finite-cell-method cut-cell quadrature: exact moments from `implicit.jl`, non-negative (NNLS) moment fit |
 | `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks (`LevelMask`) and per-cell polynomial order (`CellOrders` / `CellModes`); the `space` / `overlay` / `adapt` / `elevate` verbs |
-| `intersections.jl`| admissible integration regions for non-matching meshes; cut/fictitious region-quadrature dispatch |
+| `intersections.jl`| the integration-region record (`Region`, `Parent`) and admissible integration regions for non-matching meshes; cut/fictitious region-quadrature dispatch |
 | `coverage.jl`     | per-level covered-cell masks (`Coverage`, `build_coverage`); the mask- and material-aware covering rule behind covered-mode pruning; the material oracle (`_Fold`) the dof layer asks whether an inactive cell holds material |
 | `ladder.jl`       | nested refinement ladders: `ladder` declaration, the depth-map form of `adapt` and the `depth_masks` grading behind it, cross-level cell mapping (`overlapping_cells`), the `is_nested` predicate |
 | `dofs.jl`         | dof keys; the per-space dof topology (raw enumeration, the elimination ledger, the pivot table) and per-field numbering and accessors; the integrated-Legendre family's dof hooks (artificial boundary, leaf-semantics pruning, the hp minimum rule) |
 | `dirichlet.jl`    | physical Dirichlet conditions and boundary selectors, per-level physical-Dirichlet detection, codim-K facet regions and quadrature, and the L² boundary projection for nonzero data |
 | `surface.jl`      | immersed-boundary surface meshes (`BoundaryMesh`) and surface-region integration |
 | `problems.jl`     | `Field`, weak-form channels and blocks (`BlockForm`/`LoadForm`/`WeakForm`), `Problem` |
-| `coupling.jl`     | multi-domain interface coupling: the `Interface` `on=` tag, two-sided `InterfaceRegion` construction, `InterfaceForm`, and the four-block `couple` jump expansion |
+| `coupling.jl`     | multi-domain interface coupling: the `Interface` `on=` tag, two-sided interface-region construction, `InterfaceForm`, and the four-block `couple` jump expansion |
 | `model.jl`        | `Model` lifecycle: `prepare`, `move!`/`moved`, `activate!`/`deactivate!`, the non-mutating `adapted` / `elevated` rebuilds, `active_cells` / `cell_orders` on a model, the discretisation pin, diagnostics |
 | `assembly.jl`     | coupled Galerkin assembly: channel calculus, cached symbolic-scatter (Gustavson) pattern, serial scatter + two-phase compute→gather threaded path |
 | `solvers.jl`      | `Solution` / `SolverDiagnostics`, the default direct sparse solve, and the `linear_solver` hook for external Krylov or preconditioned solvers |
@@ -526,14 +526,24 @@ constructed as follows:
      the domain's `cut_quadrature` callable in its place, see *Region
      quadrature kinds* below); a `:fictitious` region under strict α
      (`α = 0`) is dropped outright.
-  8. Store each contributing parent element with the box mapped into
-     that element's local coordinates, record a `SmallOverlap` for every
-     region below `tolerance.small_volume`, and track the largest
-     moment-fit residual seen.
+  8. Store each contributing parent element with the affine map from the
+     box's frame into that element's reference frame, record a
+     `SmallOverlap` for every region below `tolerance.small_volume`, and
+     track the largest moment-fit residual seen.
 
 The integrand of a basis-function product is smooth (`C^∞`) inside such
 an admissible box. Do not integrate a product of basis functions across
 an element-boundary kink without partitioning the region first.
+
+Every region the assembly kernel walks — a volume box, a piece of a
+boundary facet, a sub-cell of an immersed `BoundaryMesh` or of a coupling
+interface — is one record, `Region`: its corners `lower` / `upper` are
+both its extent and its frame (degenerate on an axis it does not extend
+along: a facet's pinned axes, a flat axis of a simplex), its rule lives
+in that frame, and each `Parent` carries the map `ξ = ξ0 + dξ ∘ η` from
+the frame into its cell. Boundary facets are partitioned by the same
+engine restricted to the facet's free axes, so the steps above apply to
+them one dimension down.
 
 ### Moving overlays and state transfer
 
@@ -974,7 +984,7 @@ indicator representations are intentionally not supported.
     `stl_levelset("part.stl")` reads an STL into one. Both compose with the
     CSG combinators (see `ext/UnfittedMeshIOExt.jl`).
 
-  - **Region quadrature kinds** (visible via `region.quadrature.kind`):
+  - **Region quadrature kinds** (visible via `region.kind`):
     `:full` (tensor Gauss), `:fictitious_alpha` (α-scaled tensor Gauss),
     `:cut_fitted` (NNLS moment-fit rule; under `α > 0` the rule is the
     concatenation `(1 − α)·moment-fit ∪ α·full-cell tensor Gauss`, from
@@ -1258,9 +1268,11 @@ not have to re-derive them:
   - **Physical coordinates** `x ∈ Ω ⊂ ℝᴰ`: the user-facing world frame.
   - **Reference cell coordinates** `ξ ∈ [−1, 1]ᴰ`: per-cell reference
     frame used by basis evaluation and quadrature.
-  - **Region-local sub-box coordinates** `η ∈ [−1, 1]ᴰ`: per-region
-    reference frame used by integration; each parent cell's local frame
-    is recovered via `reference_to_physical(parent.local_box, η)`.
+  - **Region frame coordinates** `η ∈ [−1, 1]ᴰ`: the frame of an
+    integration region's corners, `x = (lower + upper)/2 + (upper −
+    lower) ∘ η / 2`, with `η = 0` on an axis the region does not extend
+    along; each parent cell's reference coordinate is
+    `ξ = parent.ξ0 + parent.dξ ∘ η`.
   - **Tensor-product basis ordering**: lexicographic over
     `CartesianIndices(ntuple(d -> 0:order[d], D))`, with the dimension-1
     axis varying fastest.

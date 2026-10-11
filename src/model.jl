@@ -269,39 +269,65 @@ function _reduced_mode_counts(layout::SystemLayout)
                for f in layout.fields for id in f.level_ids]
 end
 
-# Scan the integration plan for NNMF-fit statistics, returning `(cut, failed, fallback, fallback_points)`. `:cut_fitted`
-# are successful fits; `:cut_fallback` (the raw Saye volume rule), `:cut_failed` (empty Ω ∩ box at α = 0) and
-# `:cut_alpha_failed` (the same at α > 0) all failed to fit. Every kind counts as a "cut" region, and every non-fitted
-# kind counts as a fit failure — so `fit_failure_count` keeps meaning "the moment fit did not reach
-# `_FIT_FAILURE_RESIDUAL`" regardless of which rule the region ended up carrying.
+# Everything the diagnostics report about the rules of a region list, read off the regions' `kind`s and returned as
+# `(cut, trimmed, failed, fallbacks, fallback_points, residual_max, min_relative_measure)`. The plan statistics and the
+# facet statistics both compose from it; the two count "cut" differently, and both counts are here:
 #
-# `:cut_custom` — a region integrated by the domain's own `cut_quadrature` rule instead of the fit (see
-# `PhysicalDomain`) — is a cut region but never a fit failure: no fit ran, so there is nothing for the residual-based
-# counter to report. A custom rule that wants to be counted as a failure says so by returning `status === :empty`, which
-# lands the region in `:cut_failed` / `:cut_alpha_failed` instead.
+#   - `cut` — the regions `∂Ω` crosses (`_CUT_KINDS`), the volume plan's `cut_region_count`. `:cut_fitted` are
+#     successful fits; `:cut_fallback` (the raw Saye volume rule), `:cut_failed` (empty Ω ∩ box at α = 0) and
+#     `:cut_alpha_failed` (the same at α > 0) all failed to fit, and are `failed` (`_FAILED_KINDS`) too — so
+#     `fit_failure_count` keeps meaning "the moment fit did not succeed" whichever rule the region ended up carrying.
+#     `:cut_custom` — a region integrated by the domain's own `cut_quadrature` rule instead of the fit (see
+#     `PhysicalDomain`) — is a cut region but never a fit failure: no fit ran, so there is nothing for the
+#     residual-based counter to report. A custom rule that wants to be counted as a failure says so by returning
+#     `status === :empty`, which lands the region in `:cut_failed` / `:cut_alpha_failed` instead.
+#   - `trimmed` — every region that is not `:full`, the facet statistics' `cut_facet_region_count`: a face part of whose
+#     area falls outside Ω, `:fictitious*` faces included.
+#   - `fallbacks` and `fallback_points` — the `:cut_fallback` regions and their quadrature points. That is the assembly
+#     cost of the safety net, and the number a caller should watch: it is bounded only by the volume rule's own point
+#     count, not by nbasis.
+#   - `residual_max` and `min_relative_measure` — over the `trimmed` regions, the largest moment-fit residual and the
+#     smallest fraction of a region's own measure its rule integrates (`_region_measure`). A list that trims nothing
+#     reports 0 and exactly 1 rather than a Gauss weight sum's last bit.
 #
-# `fallback_points` sums the quadrature points of the `:cut_fallback` regions. That is the assembly cost of the safety
-# net, and the number a caller should watch: it is bounded only by the volume rule's own point count, not by nbasis.
-function _cut_region_stats(plan::IntegrationPlan)
-    cut = 0
-    failed = 0
-    fallback = 0
-    fallback_points = 0
-    for region in plan.regions
+# Reading the kind rather than re-deriving a test from the rule is what makes the facet counts as sharp as the
+# classifier behind the kind and no sharper — `FacetRegion`'s docstring states what that sharpness does and does not
+# see — and independent of the rule itself, which is no longer a plain tensor product exactly on the faces it reports.
+#
+# Why the facet count is worth reporting at all (`trimmed`, summed over every cached selector, so a region two selectors
+# share is counted once per selector, exactly as `facet_region_count` is). The grid-aligned facet
+# *partition* is level-set-blind: `_boundary_facet_regions` selects its contributing levels with
+# `_level_side_is_physical` — pure mesh-edge versus domain-edge geometry — and partitions the face over `_side_cells`.
+# A `FacetRegion` is therefore the *whole* grid-aligned face of its parent cells, and where that face leaves Ω the rule
+# on it is the moment fit on the facet's affine slice of Ω rather than an exact tensor product. Every consumer of a
+# facet region inherits that: the L² Dirichlet mass and right-hand side, a Neumann / Robin / Nitsche term placed with
+# `on = boundary(…)`, and `boundary_integral`. That fit is machine-exact only where the restricted level set is a
+# single affine function (`boundary`'s docstring states the condition and both ways it fails), so the count says how
+# much of a model's boundary integration rests on a fitted rule, and `residual_max` says how well those fits reproduced
+# the moments they were given — not how right those moments were.
+#
+# The classification is of the region's own *face*, not of its parent cells, and the distinction is not academic: a cut
+# cell can have a face lying wholly inside Ω, and no trimming is needed there. Classifying the cells would make the
+# number a loose upper bound — on the space-time cavity example at `SC_CELLS = 3` it reads 61 of 81 against a true 1,
+# because the growing cavity cuts nearly every cell while touching only the `t = 0` and `t = T` faces.
+function _kind_stats(regions)
+    cut, trimmed, failed, fallbacks, fallback_points = 0, 0, 0, 0, 0
+    residual_max, min_relative_measure = 0.0, 1.0
+    for region in regions
         kind = region.kind
-        if kind === :cut_fitted || kind === :cut_custom
-            cut += 1
-        elseif kind === :cut_fallback
-            cut += 1
-            failed += 1
-            fallback += 1
+        kind === :full && continue
+        trimmed += 1
+        cut += kind in _CUT_KINDS
+        failed += kind in _FAILED_KINDS
+        if kind === :cut_fallback
+            fallbacks += 1
             fallback_points += length(region.weights)
-        elseif kind === :cut_failed || kind === :cut_alpha_failed
-            cut += 1
-            failed += 1
         end
+        residual_max = max(residual_max, Float64(region.residual))
+        relative = _region_jacobian(region) * sum(region.weights) / _region_measure(region)
+        min_relative_measure = min(min_relative_measure, Float64(relative))
     end
-    return cut, failed, fallback, fallback_points
+    return (; cut, trimmed, failed, fallbacks, fallback_points, residual_max, min_relative_measure)
 end
 
 # Fold every plan-level statistic into a diagnostics record in place, and return it so call sites can chain. Shared by
@@ -313,26 +339,16 @@ end
 # offending regions are reported.
 function _set_plan_stats_multi!(diag::AssemblyDiagnostics, plans)
     diag.integration_regions = sum(length(p.regions) for p in plans; init=0)
-    diag.small_overlap_count = sum(p.small_overlap_count for p in plans; init=0)
+    diag.small_overlap_count = sum(length(p.small_overlaps) for p in plans; init=0)
     diag.small_overlaps = reduce(vcat, (_float_small_overlaps(p.small_overlaps) for p in plans);
                                  init=SmallOverlap{Float64}[])
     diag.min_integration_volume = minimum(Float64(p.min_volume) for p in plans)
     diag.min_relative_integration_volume = minimum(Float64(p.min_relative_volume) for p in plans)
-    cut = 0
-    failed = 0
-    fallback = 0
-    fallback_points = 0
-    for p in plans
-        c, f, b, bp = _cut_region_stats(p)
-        cut += c
-        failed += f
-        fallback += b
-        fallback_points += bp
-    end
-    diag.cut_region_count = cut
-    diag.fit_failure_count = failed
-    diag.cut_fallback_count = fallback
-    diag.cut_fallback_points = fallback_points
+    stats = [_kind_stats(p.regions) for p in plans]
+    diag.cut_region_count = sum(s.cut for s in stats; init=0)
+    diag.fit_failure_count = sum(s.failed for s in stats; init=0)
+    diag.cut_fallback_count = sum(s.fallbacks for s in stats; init=0)
+    diag.cut_fallback_points = sum(s.fallback_points for s in stats; init=0)
     diag.moment_fit_residual_max = maximum(p.moment_fit_residual_max for p in plans; init=0.0)
     return diag
 end
@@ -696,12 +712,12 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
     facet_regions = _resolve_facet_regions(effective_problem, facet_resolver)
     surface_regions = _resolve_surface_regions(effective_problem, tolerance)
     interface_regions = _resolve_interface_regions(effective_problem, layout)
-    facet_stats = _facet_region_stats(facet_regions)
+    facet_stats = _kind_stats(region for list in values(facet_regions) for region in list)
     diag = AssemblyDiagnostics(dimension=D, active_unknowns=active_unknowns(layout),
                                inactive_cell_counts=_inactive_cell_counts(spaces),
                                reduced_mode_counts=_reduced_mode_counts(layout),
-                               facet_region_count=_region_count(facet_regions), cut_facet_region_count=facet_stats.cut,
-                               facet_fit_failure_count=facet_stats.fit_failures,
+                               facet_region_count=_region_count(facet_regions),
+                               cut_facet_region_count=facet_stats.trimmed, facet_fit_failure_count=facet_stats.failed,
                                facet_cut_fallback_count=facet_stats.fallbacks,
                                facet_moment_fit_residual_max=facet_stats.residual_max,
                                min_relative_facet_measure=facet_stats.min_relative_measure,
@@ -1016,47 +1032,6 @@ end
 # the facet, surface, or interface caches; used for the diagnostics `facet_region_count` / `surface_region_count` /
 # `interface_region_count` fields.
 _region_count(regions::AbstractDict) = sum(length, values(regions); init=0)
-
-# Everything the diagnostics report about the resolved facet regions' rules:
-# `(cut, fit_failures, fallbacks, residual_max, min_relative_measure)`, the facet counterparts of what
-# `_cut_region_stats` reads off an integration plan. Counted the same way `facet_region_count` is — summed over every
-# cached selector, so a region two selectors share is counted once per selector, exactly as the total is.
-#
-# Why the cut count is worth reporting at all. The grid-aligned facet *partition* is level-set-blind:
-# `_boundary_facet_regions` selects its contributing levels with `_level_side_is_physical` — pure mesh-edge versus
-# domain-edge geometry — and partitions the face over `_side_cells`. A `FacetRegion` is therefore the *whole*
-# grid-aligned face of its parent cells, and where that face leaves Ω the rule on it is the moment fit on the facet's
-# affine slice of Ω rather than an exact tensor product. Every consumer of a facet region inherits that: the L²
-# Dirichlet mass and right-hand side, a Neumann / Robin / Nitsche term placed with `on = boundary(…)`, and
-# `boundary_integral`. That fit is machine-exact only where the restricted level set is a single affine function
-# (`boundary`'s docstring states the condition and both ways it fails), so the count says how much of a model's boundary
-# integration rests on a fitted rule, and `residual_max` says how well those fits reproduced the moments they were given
-# — not how right those moments were.
-#
-# It reads `FacetRegion.kind` and counts everything that is not `:full`. Two properties come from reading the kind
-# rather than re-deriving a test here. It is **as sharp as the classifier** behind that kind and no sharper, where a
-# sampled test could only ever report a lower bound; `FacetRegion.kind`'s docstring states what that sharpness does and
-# does not see. And it is **independent of the rule** on the region, which is what lets it keep describing the face now
-# that the rule over a cut face is no longer a plain full-face tensor product — a diagnostic that sampled the rule it is
-# meant to describe would extinguish itself exactly when it started to matter.
-#
-# The classification is of the region's own *face*, not of its parent cells, and the distinction is not academic: a cut
-# cell can have a face lying wholly inside Ω, and no trimming is needed there. Classifying the cells would make the
-# number a loose upper bound — on the space-time cavity example at `SC_CELLS = 3` it reads 61 of 81 against a true 1,
-# because the growing cavity cuts nearly every cell while touching only the `t = 0` and `t = T` faces.
-#
-# The `:full` regions are filtered out first and so contribute to nothing: a model that trims no face reports
-# `min_relative_measure` as exactly 1 rather than as a Gauss weight sum's last bit, and the four reductions below each
-# run over the handful of regions they describe.
-function _facet_region_stats(regions::Dict{RegionKey,Vector{FacetRegion{D,T}}}) where {D,T}
-    trimmed = [region for list in values(regions) for region in list if region.kind !== :full]
-    return (; cut=length(trimmed),
-            fit_failures=count(r -> r.kind in (:cut_fallback, :cut_failed, :cut_alpha_failed), trimmed),
-            fallbacks=count(r -> r.kind === :cut_fallback, trimmed),
-            residual_max=maximum(r -> Float64(r.residual), trimmed; init=0.0),
-            min_relative_measure=minimum(r -> Float64(_region_jacobian(r) * sum(r.weights) / _face_measure(r)), trimmed;
-                                         init=1.0),)
-end
 
 # Resolve one selector into its full list of `FacetRegion`s (the union of regions across every facet the selector
 # covers). Used by `_resolve_facet_regions` and reused by consumers that need to look up a selector that was not

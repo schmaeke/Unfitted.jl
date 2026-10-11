@@ -603,7 +603,7 @@ function _region_boxes(space::Space{D,T}, region::VolumeRegion{D,T}, subdivision
                        lipschitz::Float64) where {D,T}
     base = _subboxes(_region_box(region), _subdivision_counts(space, region, subdivisions))
     physical = space.physical
-    (depth == 0 || physical === nothing || !_is_cut_region(region)) && return base
+    (depth == 0 || physical === nothing || !(region.kind in _CUT_KINDS)) && return base
 
     boxes = AxisBox{D,T}[]
     for b in base
@@ -656,13 +656,6 @@ function _subboxes(b::AxisBox{D,T}, counts::NTuple{D,Int}) where {D,T}
     end
     return boxes
 end
-
-# Does ∂Ω pass through this region? `:full` is entirely physical and `:fictitious_alpha` entirely fictitious; every
-# other kind the quadrature builder produces — `:cut_fitted`, `:cut_custom`, `:cut_fallback`, `:cut_failed`,
-# `:cut_alpha_failed` — is a region the boundary crosses. Naming the two non-cut kinds rather than the five cut ones
-# keeps a future cut kind on the correct side by default. Without a `PhysicalDomain` every region is `:full`, so this is
-# uniformly `false`.
-_is_cut_region(region::VolumeRegion) = region.kind !== :full && region.kind !== :fictitious_alpha
 
 # Collect the leaves of the cut tree rooted at `b` into `boxes`. Descend only into marked boxes, and descend every
 # marked box the full `depth`, so every leaf that ∂Ω passes through comes out at the same size. That uniformity is

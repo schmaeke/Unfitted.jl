@@ -252,9 +252,10 @@ block — none given, or none whose target has a region — `A` is the empty `n 
   - `state` — a [`Solution`](@ref) or an active coefficient vector, exposed to every form as `q.state` and read through
     [`value`](@ref) and [`field_gradient`](@ref): how a Newton tangent and residual see the current iterate. With the
     default `nothing`, a form that reads `q.state` raises.
-  - `region_filter` — a predicate on integration regions; a volume region it rejects is skipped. It serves compactly
-    supported loads, such as a moving point source, whose cost should scale with their support, and applies to volume
-    terms only: boundary, surface and interface terms always integrate in full.
+  - `region_filter` — a predicate on integration regions; a volume region it rejects is skipped. It is called with a
+    [`Region`](@ref), whose box corners are `region.lower` and `region.upper`. It serves compactly supported loads, such
+    as a moving point source, whose cost should scale with their support, and applies to volume terms only: boundary,
+    surface and interface terms always integrate in full.
 
 What assembly derives from the structure — the region lists, every region's active dofs, the sparsity patterns — is
 cached on the model and reused by every later call over the same targets, through any of the entry points, until a

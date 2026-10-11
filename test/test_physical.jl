@@ -747,13 +747,12 @@ end
     @test !isempty(afail.weights)          # α fallback is a nonzero rule …
     @test isempty(strict.weights)          # … the strict failure is empty
     plan = Unfitted.IntegrationPlan{1,Float64}([region(:cut_fitted, [SVector(0.5)], [1.0]), strict, afail, back],
-                                               GeometryTolerance(Float64), 0, Unfitted.SmallOverlap{Float64}[], 1.0,
-                                               1.0, 0.0)
-    cut, failed, fallback, fallback_points = Unfitted._cut_region_stats(plan)
-    @test cut == 4
-    @test failed == 3
-    @test fallback == 1
-    @test fallback_points == 2
+                                               Unfitted.SmallOverlap{Float64}[], 1.0, 1.0, 0.0)
+    stats = Unfitted._kind_stats(plan.regions)
+    @test stats.cut == 4
+    @test stats.failed == 3
+    @test stats.fallbacks == 1
+    @test stats.fallback_points == 2
 end
 
 @testset "custom cut_quadrature rule replaces the moment fit on cut regions" begin
@@ -809,11 +808,11 @@ end
 
     # A custom region is a cut region but never a fit failure: no fit ran, so there is no residual for
     # `fit_failure_count` to report on.
-    cut, failed, fallback, fallback_points = Unfitted._cut_region_stats(plan_custom)
-    @test cut == count(==(:cut_custom), kinds(plan_custom))
-    @test failed == 0
-    @test fallback == 0
-    @test fallback_points == 0
+    stats = Unfitted._kind_stats(plan_custom.regions)
+    @test stats.cut == count(==(:cut_custom), kinds(plan_custom))
+    @test stats.failed == 0
+    @test stats.fallbacks == 0
+    @test stats.fallback_points == 0
 
     # α blends the custom rule exactly as it blends a fit: the region carries `(1 − α)·custom ∪ α·tensor`, so the custom
     # part is scaled, not replaced.

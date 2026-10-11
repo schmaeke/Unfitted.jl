@@ -944,6 +944,40 @@ end
     @test sum(facet_measure(r) for r in regions) ≈ 1.0 rtol = 1.0e-14
 end
 
+@testset "facet regions alias their tensor rules" begin
+    # A facet region keeps its rule in its own frame — the face box, 0 on the pinned axes — so an uncut face's rule is
+    # the resolver's cached tensor rule itself (counts 0 on the pinned axes), never a copy: a boundary of many faces
+    # holds one array per distinct order, and every `:full` region of that order points at it.
+    tol = GeometryTolerance(Float64)
+    V = ladder(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=2, order=2, depth=1, splits=2)
+    V = adapt(V, 2 => [CartesianIndex(1, 1, 1)])
+    facets = Unfitted.FacetResolver{3,Float64}(tol)
+    regions = Unfitted._facet_regions_for_selector(V, boundary(:all), facets)
+    @test all(r -> r.kind === :full, regions)
+    @test length(facets.rules) < length(regions)
+    for region in regions
+        counts = Unfitted._axis_max(Unfitted._gauss_counts, V, region.parents, region.lower, region.upper)
+        rule = facets.rules[counts]
+        @test region.points === rule.points && region.weights === rule.weights
+        ((axis, _),) = region.sides
+        @test counts[axis] == 0 && all(p -> p[axis] == 0, region.points)
+        @test all(p -> p.dξ[axis] == 0, region.parents)
+    end
+    # The physical rule is still the face's: its weights sum to the face's area, its points lie on the face.
+    @test sum(facet_measure(r) for r in regions) ≈ 6.0 rtol = 1.0e-14
+    @test all(x[a] == r.lower[a] for r in regions for x in facet_points(r) for (a, _) in r.sides)
+
+    # The α-scaled rule of a face is shared the same way, per face: every `:fictitious_alpha` region of one order on it
+    # points at one scaled copy of that order's tensor weights. Here the x₁ = 0 face lies wholly outside Ω.
+    outside = physical_domain(leaf(x -> 0.3 - x[1]; lipschitz=1.0); alpha=0.1, keep_fictitious=true,
+                              subcell_length_scale=0.0625)
+    W = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=outside)
+    face = Unfitted._boundary_facet_regions(W, [(1, :lower)], tol)
+    @test length(face) == 4 && all(r -> r.kind === :fictitious_alpha, face)
+    @test all(r -> r.weights === first(face).weights, face)
+    @test sum(facet_measure(r) for r in face) ≈ 0.1 rtol = 1.0e-14
+end
+
 @testset "facet regions are memoised per face, not per selector" begin
     # `_resolve_facet_regions` keys the cache it *retains* on (selector, space), but resolution itself runs through a
     # per-face memo. The two are not the same granularity: `boundary(:all)` and `boundary(axis=1, side=:lower)` are not
@@ -1811,7 +1845,7 @@ end
 #
 # What this guards is the trimming of a cut face's rule to its physical part — the regions `cut_facet_region_count`
 # reports. See the testset "cut_facet_region_count reports the facet regions whose face leaves Ω" above, and
-# `_facet_region_stats` in src/model.jl. That trimming has to land on BOTH paths at once. On the operator path alone,
+# `_kind_stats` in src/model.jl. That trimming has to land on BOTH paths at once. On the operator path alone,
 # the Dirichlet datum would be fitted over the whole face while the operator integrates only the physical part: a clean
 # residual, a converging solve, and boundary data fitted over area that is not in Ω. On the projection path alone, the
 # mirror image. Neither shows up in a norm.

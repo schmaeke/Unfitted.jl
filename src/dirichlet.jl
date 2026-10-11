@@ -628,16 +628,6 @@ function _classify_facet(slice::PhysicalDomain, ::SVector{D,T}, ::SVector{D,T}, 
     return _inside(slice.geometry, SVector{0,T}()) ? :full : :fictitious
 end
 
-# The measure of a facet region's own face — its full `(D − K)`-dimensional extent, physical part and fictitious part
-# together. The pinned axes are exactly the degenerate ones, so the product over the non-degenerate ones needs no
-# `sides` and is right in every codimension; the codim-`D` vertex is the empty product, 1, which is the weight its point
-# evaluation carries. Compared against the region's own physical weight sum it gives the fraction of the face the rule
-# integrates, which is what `min_relative_facet_measure` reports.
-function _face_measure(region::FacetRegion{D,T}) where {D,T}
-    extent(d) = region.upper[d] - region.lower[d]
-    return prod(d -> iszero(extent(d)) ? one(T) : extent(d), 1:D)
-end
-
 # ── Boundary trace evaluation ─────────────────────────────────────────────────
 
 """
