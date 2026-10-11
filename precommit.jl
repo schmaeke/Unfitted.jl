@@ -1,15 +1,16 @@
 #!/usr/bin/env julia
 
 # Pre-commit entry point: format every `.jl` file under the project root
-# (or verify formatting in `--check` mode) and print a code-statistics
-# summary. Discovery is a filesystem walk, not a git query, so untracked
-# and git-ignored sources are included unless their directory is listed in
+# (or verify formatting in `--check` mode), check that no line is longer
+# than the formatter's margin, and print a code-statistics summary.
+# Discovery is a filesystem walk, not a git query, so untracked and
+# git-ignored sources are included unless their directory is listed in
 # `SKIP_DIRECTORIES`.
 #
 # Usage:
-#   julia precommit.jl          # format in place + print stats
-#   julia precommit.jl --check  # verify formatting (non-zero exit if any
-#                            # file would change) + print stats
+#   julia precommit.jl          # format in place + check line length + print stats
+#   julia precommit.jl --check  # verify formatting and line length (non-zero exit
+#                               # if a file would change or a line is too long) + print stats
 #   julia precommit.jl --stats  # stats only; JuliaFormatter is not required
 #
 # Formatting honours `.JuliaFormatter.toml` at the project root via
@@ -20,11 +21,20 @@
 # without it makes the check report every file as clean.
 # `SKIP_DIRECTORIES` excludes generated and output trees, and `.claude`,
 # which holds git worktrees during agent-assisted work.
+#
+# The line-length limit is the `margin` of `.JuliaFormatter.toml`, read from
+# that file so the two cannot drift apart. It applies to every line, code,
+# comments and docstrings alike. The formatter enforces it on code it can
+# break, but it never rewraps a comment, a docstring or a string literal, so
+# a long line there passes the formatter; the length check is what catches
+# it, in both the default and the `--check` mode.
 
 using Printf
+using TOML
 
 const PROJECT_ROOT = @__DIR__
 const SKIP_DIRECTORIES = Set([".git", ".claude", "old", "tmp", "output", "refs"])
+const MAX_LINE_LENGTH = TOML.parsefile(joinpath(PROJECT_ROOT, ".JuliaFormatter.toml"))["margin"]
 const _FORMATTER_ERROR = Ref{Any}(nothing)
 const _FORMATTER_AVAILABLE = try
     @eval using JuliaFormatter
@@ -88,6 +98,32 @@ function _report_failure(stage::AbstractString, path::AbstractString, err)
     println(stderr, stage, " failed for ", relpath(path, PROJECT_ROOT), ":")
     showerror(stderr, err)
     println(stderr)
+end
+
+# ── Line length ───────────────────────────────────────────────────────────────
+
+# Every line of `files` longer than `MAX_LINE_LENGTH`, as `(path, line number,
+# length)` in file and line order. Length is counted in characters (`length`),
+# not bytes: the sources use `─`, `∂Ω`, `‖·‖` and other multi-byte characters,
+# and the limit is about the width a reader sees, which a byte count would
+# overstate.
+function _long_lines(files)
+    long = Tuple{String,Int,Int}[]
+    for path in files, (number, line) in enumerate(eachline(path))
+        width = length(line)
+        width > MAX_LINE_LENGTH && push!(long, (path, number, width))
+    end
+    return long
+end
+
+function _report_long_lines(long)
+    isempty(long) && return nothing
+    println(stderr, "The following lines are longer than ", MAX_LINE_LENGTH, " characters:")
+    for (path, number, width) in long
+        println(stderr, "  ", relpath(path, PROJECT_ROOT), ":", number, " (", width, " characters)")
+    end
+    println(stderr, "Wrap them by hand; the formatter does not rewrap comments, docstrings or strings.")
+    return nothing
 end
 
 # ── Code statistics ───────────────────────────────────────────────────────────
@@ -283,6 +319,7 @@ function main()
         end
     end
 
+    long = _long_lines(files)
     _print_stats(files)
 
     if mode === :check
@@ -294,18 +331,21 @@ function main()
             println(stderr, "Run `julia precommit.jl` to format the project.")
         end
 
+        _report_long_lines(long)
+
         if errors > 0
             println(stderr, errors, " file(s) raised errors during check.")
         end
 
-        (isempty(unformatted) && errors == 0) || return 1
-        println("Formatting check passed.")
+        (isempty(unformatted) && isempty(long) && errors == 0) || return 1
+        println("Formatting and line-length check passed.")
         return 0
     end
 
     processed = length(files) - errors
     println("Formatted $processed file(s); $changed changed, $(processed - changed) already clean.")
-    return errors == 0 ? 0 : 1
+    _report_long_lines(long)
+    return errors == 0 && isempty(long) ? 0 : 1
 end
 
 exit(main())

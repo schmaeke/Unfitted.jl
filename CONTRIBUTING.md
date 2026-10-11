@@ -120,7 +120,7 @@ README.md                     public landing page
 CLAUDE.md                     agent-instruction pointer documents
 CONTRIBUTING.md               this file — contributor + agent guide
 CITATION.cff                  machine-readable citation metadata
-.JuliaFormatter.toml          repo-wide formatting config (yas style, indent 4)
+.JuliaFormatter.toml          repo-wide formatting config (yas style, indent 4, margin 120)
 precommit.jl                  formatter wrapper + SLOC/comment/docstring stats
 src/                          library source
 ext/                          package extensions (BasicBSpline, FileIO+MeshIO+GeometryBasics, Tensors)
@@ -236,8 +236,8 @@ The repository root ships `precommit.jl`, a thin wrapper around
 docstring statistics. Three modes:
 
 ```bash
-julia precommit.jl          # format every .jl file in place + print stats
-julia precommit.jl --check  # verify formatting; non-zero exit if anything would change
+julia precommit.jl          # format every .jl file in place + check line length + print stats
+julia precommit.jl --check  # verify formatting and line length; non-zero exit if either fails
 julia precommit.jl --stats  # stats only; does not require JuliaFormatter installed
 ```
 
@@ -1234,6 +1234,18 @@ below so the codebase converges over time.
   - **Math and citations** inside docstrings and comments follow the
     same rules as the surrounding prose: unicode math, full citations
     with DOI, no references to local working directories.
+
+  - **Line length.** No line of a `.jl` file is longer than 120
+    characters — code, comments and docstrings alike, indentation
+    included, counted in characters rather than bytes. Prose paragraphs
+    in comments and docstrings are filled to that width rather than
+    wrapped early; preformatted material (signature lines, code blocks,
+    tables, aligned columns, math displays, section dividers) keeps its
+    own layout. `.JuliaFormatter.toml` sets `margin = 120` for code, and
+    `julia precommit.jl --check` fails on any longer line, which is what
+    catches the comments, docstrings and string literals the formatter
+    does not rewrap. Split an over-long string literal into pieces
+    joined with `*`, keeping its text unchanged.
 
 ### Coordinate conventions
 
