@@ -274,15 +274,16 @@ function _transfer_regions(source_model::Model{D,T}, target_model::Model{D,T};
     source_levels, target_levels = source_model.problem.space.levels, target_model.problem.space.levels
     regions = TransferRegion{D,T}[]
     quadrature_cache = Dict{NTuple{D,Int},TensorQuadrature{D,T}}()
-    for (lower, upper, sig) in
-        _partition((source_levels..., target_levels...), ntuple(identity, Val(D)), zero(SVector{D,T}), tolerance)
+    levels = (source_levels..., target_levels...)
+    _partition(levels, ntuple(identity, Val(D)), zero(SVector{D,T}), tolerance) do lower, upper, sig
         source_sig, target_sig = _split_signature(sig, source_levels)
-        all(iszero, target_sig) && continue
+        all(iszero, target_sig) && return nothing
         target_parents = _parents(target_levels, target_sig, lower, upper)
         source_parents = _parents(source_levels, source_sig, lower, upper)
         counts = _transfer_quadrature_counts(source_model, target_model, target_parents, source_parents)
         quadrature = _cached_tensor_quadrature!(quadrature_cache, counts, T)
         push!(regions, TransferRegion{D,T}(AxisBox{D,T}(lower, upper), target_parents, source_parents, quadrature))
+        return nothing
     end
     return regions
 end

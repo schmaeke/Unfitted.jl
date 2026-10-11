@@ -194,11 +194,12 @@ function full_grid_boxes(levels::Tuple, ::Val{D}, tol::GeometryTolerance{T}; unc
     return boxes
 end
 
-# The corners of the engine's volume partition of `levels`.
+# The corners of the engine's volume partition of `levels`, in emission order.
 function partition_boxes(levels::Tuple, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
-    return [(lower, upper)
-            for (lower, upper, _) in
-                Unfitted._partition(levels, ntuple(identity, Val(D)), zero(Unfitted.SVector{D,T}), tol)]
+    boxes = Tuple{Unfitted.SVector{D,T},Unfitted.SVector{D,T}}[]
+    Unfitted._partition((lower, upper, _) -> push!(boxes, (lower, upper)), levels, ntuple(identity, Val(D)),
+                        zero(Unfitted.SVector{D,T}), tol)
+    return boxes
 end
 
 @testset "the active-cell projection leaves the box partition unchanged" begin

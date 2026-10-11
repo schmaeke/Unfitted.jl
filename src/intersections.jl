@@ -385,9 +385,10 @@ function _signature(levels::Tuple, linmaps::Tuple, cells::Tuple, x::SVector{D,T}
 end
 
 # The admissible-box partition engine: the boxes of `levels` spanned on the `free` axes through the point `anchor`,
-# whose other coordinates are held fixed, as `(lower, upper, sig)` records in emission order, `sig` the box's coverage
-# signature. It is the box-partition half of the recipe documented in `CONTRIBUTING.md`'s "Integration regions" section,
-# and every partition the package builds runs through it:
+# whose other coordinates are held fixed, each handed to `emit(lower, upper, sig)` in emission order, `sig` the box's
+# coverage signature. Every consumer turns a box into its own record on the spot, so the engine materialises no box list
+# of its own. It is the box-partition half of the recipe documented in `CONTRIBUTING.md`'s "Integration regions"
+# section, and every partition the package builds runs through it:
 #
 #   - the volume plan (`integration_plan`): every axis free, every cell eligible;
 #   - a boundary facet (`_boundary_facet_regions` in `dirichlet.jl`): the facet's free axes, the anchor carrying the
@@ -459,13 +460,12 @@ function _corners(anchor::SVector{D,T}, slot::NTuple{D,Int}, intervals, lo, hi) 
     return lower, upper
 end
 
-function _partition(levels::NTuple{N,Any}, free::NTuple{F,Int}, anchor::SVector{D,T}, tol::GeometryTolerance{T},
-                    cells::Tuple=map(_ -> _AllCells(), levels)) where {N,F,D,T}
+function _partition(emit, levels::Tuple, free::NTuple{F,Int}, anchor::SVector{D,T}, tol::GeometryTolerance{T},
+                    cells::Tuple=map(_ -> _AllCells(), levels)) where {F,D,T}
     coords = _merged_axis_coordinates(levels, Val(D), tol, cells)
     intervals = ntuple(j -> _intervals_from_coordinates(coords[free[j]], tol), Val(F))
     ranges = ntuple(j -> length(intervals[j]), Val(F))
-    out = Tuple{SVector{D,T},SVector{D,T},NTuple{N,Int}}[]
-    any(==(0), ranges) && return out
+    any(==(0), ranges) && return nothing
 
     # The per-level linear cell index maps once, and the coverage signature once per candidate: both are reused inside
     # the greedy merge, where signature equality is the hot inner check.
@@ -487,10 +487,13 @@ function _partition(levels::NTuple{N,Any}, free::NTuple{F,Int}, anchor::SVector{
         for j in 1:F
             hi = _extend_axis(sigs, visited, ranges, start.I, hi, sig, j)
         end
-        fill!(view(visited, map(:, start.I, hi)...), true)
-        push!(out, (_corners(anchor, slot, intervals, start.I, hi)..., sig))
+        for c in CartesianIndices(map(:, start.I, hi))
+            visited[c] = true
+        end
+        lower, upper = _corners(anchor, slot, intervals, start.I, hi)
+        emit(lower, upper, sig)
     end
-    return out
+    return nothing
 end
 
 # ── Merge tolerance vs. mesh spacing ──────────────────────────────────────────
@@ -535,14 +538,15 @@ end
 # partition merged into the box shares the signature, so the whole box lies in each of these cells — the contract the
 # smooth-integrand argument needs — and decoding the signature is all it takes to find them.
 function _parents(levels::Tuple, sig::Tuple, lower::SVector{D,T}, upper::SVector{D,T}) where {D,T}
-    found = map(levels, sig) do level, index
-        index == 0 && return nothing
+    parents = ParentRef{D,T}[]
+    for (level, index) in zip(levels, sig)
+        index == 0 && continue
         cell = CartesianIndices(level.mesh.cells)[index]
         parent_box = cell_box(level.mesh, cell)
         local_box = AxisBox{D,T}(physical_to_reference(parent_box, lower), physical_to_reference(parent_box, upper))
-        return ParentRef{D,T}(level.id, cell, local_box, parent_box)
+        push!(parents, ParentRef{D,T}(level.id, cell, local_box, parent_box))
     end
-    return ParentRef{D,T}[parent for parent in found if parent !== nothing]
+    return parents
 end
 
 # Keep-or-drop predicate for an admissible region. Three accepted shapes:
@@ -750,10 +754,11 @@ function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criteri
     # touching the (potentially expensive) rules; then every cut rule up front (`_prefit!`), so the rule loop walks the
     # records in partition order on nothing but cache hits.
     records = _RegionRecord{D,T}[]
-    for (lower, upper, sig) in _partition(V.levels, ntuple(identity, Val(D)), zero(SVector{D,T}), tolerance)
+    _partition(V.levels, ntuple(identity, Val(D)), zero(SVector{D,T}), tolerance) do lower, upper, sig
         parents = _parents(V.levels, sig, lower, upper)
-        _criterion_satisfied(parents, length(V.levels), criterion) || continue
-        push!(records, _region_record(V, lower, upper, parents, classify_cache))
+        _criterion_satisfied(parents, length(V.levels), criterion) &&
+            push!(records, _region_record(V, lower, upper, parents, classify_cache))
+        return nothing
     end
     physical = V.physical
     _prefit!(moment_fit_cache, physical, records)

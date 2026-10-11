@@ -559,21 +559,25 @@ function _boundary_facet_regions(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}
     # lifted back to ℝᴰ through the same pins.
     pins = _facet_pins(V.domain, sides)
     slice = V.physical === nothing ? nothing : _restrict_domain(V.physical, pins)
-    return FacetRegion{D,T}[_facet_region(V, sides, _facet_parents(V.levels, sig, Val(D), T), free_axes, lower, upper,
-                                          normal, slice, pins, Val(F))
-                            for (lower, upper, sig) in
-                                _partition(V.levels, ntuple(j -> free_axes[j], Val(F)), anchor, tol, cells)]
+    regions = FacetRegion{D,T}[]
+    _partition(V.levels, ntuple(j -> free_axes[j], Val(F)), anchor, tol, cells) do lower, upper, sig
+        parents = _facet_parents(V.levels, sig, Val(D), T)
+        push!(regions, _facet_region(V, sides, parents, free_axes, lower, upper, normal, slice, pins, Val(F)))
+        return nothing
+    end
+    return regions
 end
 
 # The parents a facet region's signature stands for, in level order: per non-zero slot, the level's cell with that
 # linear index and the cell's physical box.
 function _facet_parents(levels::Tuple, sig::Tuple, ::Val{D}, ::Type{T}) where {D,T}
-    found = map(levels, sig) do level, index
-        index == 0 && return nothing
+    parents = FacetParent{D,T}[]
+    for (level, index) in zip(levels, sig)
+        index == 0 && continue
         cell = CartesianIndices(level.mesh.cells)[index]
-        return FacetParent{D,T}(level.id, cell, cell_box(level.mesh, cell))
+        push!(parents, FacetParent{D,T}(level.id, cell, cell_box(level.mesh, cell)))
     end
-    return FacetParent{D,T}[parent for parent in found if parent !== nothing]
+    return parents
 end
 
 # ── Facet slices ──────────────────────────────────────────────────────────────
