@@ -1,21 +1,15 @@
 # Two concerns share this file:
 #
-#   * **VTK export.** [`write_vtk`](@ref) produces a ParaView multiblock
-#     bundle from a `(solution, model)` pair; [`vtk_series`](@ref) collects a
-#     sequence of those bundles into a ParaView `.pvd` collection, so a feature
-#     that moves — and the mesh that follows it — can be watched over time;
-#     [`write_quadrature_vtm`](@ref) produces a quadrature-point cloud bundle
-#     for inspecting where the integration regions land. All three rely on
-#     `WriteVTK.jl`.
-#   * **Solution evaluation.** [`value`](@ref) and [`field_gradient`](@ref)
-#     evaluate the superposed solution at arbitrary physical points;
-#     [`l2_error`](@ref) computes an analytic / manufactured-solution
-#     error using the model's own integration plan.
+#   * **VTK export.** [`write_vtk`](@ref) produces a ParaView multiblock bundle from a `(solution, model)` pair;
+#     [`vtk_series`](@ref) collects a sequence of those bundles into a ParaView `.pvd` collection, so a feature that
+#     moves — and the mesh that follows it — can be watched over time; [`write_quadrature_vtm`](@ref) produces a
+#     quadrature-point cloud bundle for inspecting where the integration regions land. All three rely on `WriteVTK.jl`.
+#   * **Solution evaluation.** [`value`](@ref) and [`field_gradient`](@ref) evaluate the superposed solution at
+#     arbitrary physical points; [`l2_error`](@ref) computes an analytic / manufactured-solution error using the model's
+#     own integration plan.
 #
-# Both subsystems share the same overlay-zero-extension convention: a
-# level whose mesh does not cover the evaluation point contributes
-# zero. That mirrors the assembly contract from
-# `CONTRIBUTING.md`'s "The superposition model" section.
+# Both subsystems share the same overlay-zero-extension convention: a level whose mesh does not cover the evaluation
+# point contributes zero. That mirrors the assembly contract from `CONTRIBUTING.md`'s "The superposition model" section.
 
 # ── Public VTK export ─────────────────────────────────────────────────────────
 
@@ -24,119 +18,86 @@
               field=nothing, subdivisions=:degree, cut_depth=3, point_data, cell_data,
               level_meshes=true, ascii=false, append=true, compress=true)
 
-Write a ParaView bundle rooted at `path`. The top-level file is a `.vtm`
-multiblock dataset with **one block per field**, each named after the field and
-grouping that field's data with its own mesh as sibling leaf datasets so it is a
+Write a ParaView bundle rooted at `path`. The top-level file is a `.vtm` multiblock dataset with **one block per
+field**, each named after the field and grouping that field's data with its own mesh as sibling leaf datasets so it is a
 self-contained, independently-toggled unit — `<field> → { data_<i>, level_… }`:
 
-  - `data_<i>` — the `i`-th field's partitioned solution `.vtu`, whose cells are
-    that field's admissible integration regions optionally subdivided into
-    smaller sub-cells (see `subdivisions`), with per-cell `region_id` /
-    `cover_count`, per-point user-defined arrays, and (with a
-    [`PhysicalDomain`](@ref)) the field's own `level_set`. A single-field model
-    names it simply `data`;
-  - `level_<id>_<role>` — optionally, one solid-cell `.vtu` per level of the
-    field's subdomain: every mesh cell with per-cell `active`, `covered`,
-    `active_dofs`, `reduced_dofs` (plus `level_id` / `role_id` / `order_max` /
-    `cell_id`), so ParaView can colour the mesh by coverage and covered-mode pruning.
+  - `data_<i>` — the `i`-th field's partitioned solution `.vtu`, whose cells are that field's admissible integration
+    regions optionally subdivided into smaller sub-cells (see `subdivisions`), with per-cell `region_id` /
+    `cover_count`, per-point user-defined arrays, and (with a [`PhysicalDomain`](@ref)) the field's own `level_set`. A
+    single-field model names it simply `data`;
+  - `level_<id>_<role>` — optionally, one solid-cell `.vtu` per level of the field's subdomain: every mesh cell with
+    per-cell `active`, `covered`, `active_dofs`, `reduced_dofs` (plus `level_id` / `role_id` / `order_max` / `cell_id`),
+    so ParaView can colour the mesh by coverage and covered-mode pruning.
 
-A single-field model is the one-block case of this shape. Fields sharing one
-space emit that space's meshes once, under the first such field. The tree is
-homogeneous (a field block holds only leaf datasets) and every leaf's
-disambiguating name is **ASCII** — the field *index* `i` for `data_<i>`, the
-level *id* for the meshes — so ParaView's Extract Block (whose data-assembly
-node names keep only ASCII identifier characters) resolves each leaf on its own
-even when the field names themselves are Unicode (`θ₁`, `θ₂`).
+A single-field model is the one-block case of this shape. Fields sharing one space emit that space's meshes once, under
+the first such field. The tree is homogeneous (a field block holds only leaf datasets) and every leaf's disambiguating
+name is **ASCII** — the field *index* `i` for `data_<i>`, the level *id* for the meshes — so ParaView's Extract Block
+(whose data-assembly node names keep only ASCII identifier characters) resolves each leaf on its own even when the field
+names themselves are Unicode (`θ₁`, `θ₂`).
 
 Keyword arguments:
 
-  - `field` — restrict the output to a single [`Field`](@ref) (or its
-    name `Symbol`); defaults to every field of the model.
-  - `subdivisions` — per-region subdivision count, sized to resolve the
-    *solution*. `:degree` (default) uses each region's parent polynomial
-    order; `:none` keeps one cell per region; a positive integer uses an
-    isotropic count; an `NTuple{D,Int}` uses explicit per-axis counts.
-  - `cut_depth` — extra bisections applied to the sub-cells that `∂Ω` passes
-    through, sized to resolve the *geometry*. `3` by default, `:none` to
-    disable, or an integer in `0:8`. Only regions crossed by the boundary are
-    refined, and a model without a [`PhysicalDomain`](@ref) is untouched, so
-    the cost is that of the boundary rather than of the volume: in 3D the leaf
-    count grows as `8ᵏ` under `subdivisions` but only as `4ᵏ` under
-    `cut_depth`. See "Resolving the immersed boundary" below.
-  - `point_data` — `NamedTuple` / `Dict` / `Tuple` of `name => callback`
-    pairs. Each callback is invoked at every vertex sample as
-    `f(u, context, x, xi)` and returns a per-point scalar / vector /
-    tuple value. `u(context, xi[, field])` evaluates the current
-    solution at the sample: the block's own field by default, or another
-    `field` on the same subdomain. A field on another subdomain of a
-    coupled model raises an `ArgumentError`; evaluate it with
-    [`value`](@ref)`(solution, model, field, x)` instead. `x` is the
-    physical coordinate and `xi.region` the same point in the region's
-    reference frame; `context.parents` lists the covering parents, each
-    with the `parent_box` a callback needs to map `x` into a cell's own
-    frame. Defaults to a single `uh` entry that emits the current solution
-    value.
-  - `cell_data` — same shape as `point_data` but evaluated at
-    per-cell sample points (the subbox center). Defaults to no
-    user-defined cell data; the bundle always includes `region_id`
-    and `cover_count` as built-in cell arrays.
-  - `level_meshes` — emit one solid-cell `.vtu` per level when `true`
-    (default), each cell carrying per-cell `active` / `covered` /
-    `active_dofs` / `reduced_dofs` data.
-  - `ascii` / `append` / `compress` — pass-through to `WriteVTK`'s `vtk_grid`
-    constructor, with its own defaults: binary, appended and **compressed**.
-    Compression is the cheapest lever this writer has — measured on a 3D 5×5×5
-    order-2 sphere at `subdivisions = 10`, it takes the bundle from 31.60 MB to
-    3.81 MB, an 8.3× saving for 1.7× the write time — and it costs the reader
-    nothing, since ParaView decompresses transparently. Turn it off together
-    with `ascii = true, append = false` when a test or a diff needs the arrays
-    as parsable text.
+  - `field` — restrict the output to a single [`Field`](@ref) (or its name `Symbol`); defaults to every field of the
+    model.
+  - `subdivisions` — per-region subdivision count, sized to resolve the *solution*. `:degree` (default) uses each
+    region's parent polynomial order; `:none` keeps one cell per region; a positive integer uses an isotropic count; an
+    `NTuple{D,Int}` uses explicit per-axis counts.
+  - `cut_depth` — extra bisections applied to the sub-cells that `∂Ω` passes through, sized to resolve the *geometry*.
+    `3` by default, `:none` to disable, or an integer in `0:8`. Only regions crossed by the boundary are refined, and a
+    model without a [`PhysicalDomain`](@ref) is untouched, so the cost is that of the boundary rather than of the
+    volume: in 3D the leaf count grows as `8ᵏ` under `subdivisions` but only as `4ᵏ` under `cut_depth`. See "Resolving
+    the immersed boundary" below.
+  - `point_data` — `NamedTuple` / `Dict` / `Tuple` of `name => callback` pairs. Each callback is invoked at every vertex
+    sample as `f(u, context, x, xi)` and returns a per-point scalar / vector / tuple value. `u(context, xi[, field])`
+    evaluates the current solution at the sample: the block's own field by default, or another `field` on the same
+    subdomain. A field on another subdomain of a coupled model raises an `ArgumentError`; evaluate it with
+    [`value`](@ref)`(solution, model, field, x)` instead. `x` is the physical coordinate and `xi.region` the same point
+    in the region's reference frame; `context.parents` lists the covering parents, each with the `parent_box` a callback
+    needs to map `x` into a cell's own frame. Defaults to a single `uh` entry that emits the current solution value.
+  - `cell_data` — same shape as `point_data` but evaluated at per-cell sample points (the subbox center). Defaults to no
+    user-defined cell data; the bundle always includes `region_id` and `cover_count` as built-in cell arrays.
+  - `level_meshes` — emit one solid-cell `.vtu` per level when `true` (default), each cell carrying per-cell `active` /
+    `covered` / `active_dofs` / `reduced_dofs` data.
+  - `ascii` / `append` / `compress` — pass-through to `WriteVTK`'s `vtk_grid` constructor, with its own defaults:
+    binary, appended and **compressed**. Compression is the cheapest lever this writer has — measured on a 3D 5×5×5
+    order-2 sphere at `subdivisions = 10`, it takes the bundle from 31.60 MB to 3.81 MB, an 8.3× saving for 1.7× the
+    write time — and it costs the reader nothing, since ParaView decompresses transparently. Turn it off together with
+    `ascii = true, append = false` when a test or a diff needs the arrays as parsable text.
 
-For models whose [`Space`](@ref) carries a [`PhysicalDomain`](@ref),
-the per-vertex level-set values `φ(x)` are automatically attached as a
-built-in `level_set` point array — convenient for visualising `∂Ω`
-as a zero-level isocontour or for filtering cut / full / fictitious
-regions in ParaView. Pass a `level_set` entry in `point_data` to
+For models whose [`Space`](@ref) carries a [`PhysicalDomain`](@ref), the per-vertex level-set values `φ(x)` are
+automatically attached as a built-in `level_set` point array — convenient for visualising `∂Ω` as a zero-level
+isocontour or for filtering cut / full / fictitious regions in ParaView. Pass a `level_set` entry in `point_data` to
 override or rename it.
 
 ## Resolving the immersed boundary
 
-ParaView reconstructs `∂Ω` from the `level_set` array by interpolating it
-linearly along each cell's edges, so the surface a Clip draws is a facetisation
-at the size of the emitted cell — neither `φ`'s own accuracy nor the solution
-order improves it. Resolving `∂Ω` therefore means emitting small cells where it
-runs, which is what `cut_depth` does and what `subdivisions` cannot: raising
-`subdivisions` refines every region uniformly, at `2^(D·k)` cells, while
-`cut_depth` refines only the sub-cells the boundary crosses, at `2^((D−1)·k)`.
-Measured on a 3D 5×5×5 order-2 sphere with 81 regions: 5 723 cells against
-41 472 at 8 sub-cells per axis across `∂Ω`, and 95 891 against 2 654 208 at 32.
+ParaView reconstructs `∂Ω` from the `level_set` array by interpolating it linearly along each cell's edges, so the
+surface a Clip draws is a facetisation at the size of the emitted cell — neither `φ`'s own accuracy nor the solution
+order improves it. Resolving `∂Ω` therefore means emitting small cells where it runs, which is what `cut_depth` does and
+what `subdivisions` cannot: raising `subdivisions` refines every region uniformly, at `2^(D·k)` cells, while `cut_depth`
+refines only the sub-cells the boundary crosses, at `2^((D−1)·k)`. Measured on a 3D 5×5×5 order-2 sphere with 81
+regions: 5 723 cells against 41 472 at 8 sub-cells per axis across `∂Ω`, and 95 891 against 2 654 208 at 32.
 
-A sub-cell is refined when `|φ(c)| ≤ L·r`, with `c` its center, `r` its
-half-diagonal, and `L` the largest Lipschitz constant declared by any leaf of
-the geometry. That is the exact negation of the uniform-sign certificate the
-cell classifier uses, so an unrefined sub-cell provably holds one sign of `φ`
-throughout, contributes no cut surface, and cannot disagree with a finer
-neighbour across a shared face — the clipped surface is watertight. Every
-refined sub-cell bottoms out at the same depth, so neighbouring cut cells carry
-identical corner coordinates and their facets meet exactly.
+A sub-cell is refined when `|φ(c)| ≤ L·r`, with `c` its center, `r` its half-diagonal, and `L` the largest Lipschitz
+constant declared by any leaf of the geometry. That is the exact negation of the uniform-sign certificate the cell
+classifier uses, so an unrefined sub-cell provably holds one sign of `φ` throughout, contributes no cut surface, and
+cannot disagree with a finer neighbour across a shared face — the clipped surface is watertight. Every refined sub-cell
+bottoms out at the same depth, so neighbouring cut cells carry identical corner coordinates and their facets meet
+exactly.
 
-When **no** leaf declares a constant — `leaf(f)` defaults to `lipschitz = Inf` —
-no such certificate exists and refinement falls back to the corner signs of `φ`,
-the same evidence ParaView's own clip works from. A feature of `Ω` smaller than
-a sub-cell and missing every corner is then invisible, and the write emits one
-warning saying so; `leaf(f; lipschitz = L)` (`1.0` for a signed distance
-function) restores the guarantee.
+When **no** leaf declares a constant — `leaf(f)` defaults to `lipschitz = Inf` — no such certificate exists and
+refinement falls back to the corner signs of `φ`, the same evidence ParaView's own clip works from. A feature of `Ω`
+smaller than a sub-cell and missing every corner is then invisible, and the write emits one warning saying so;
+`leaf(f; lipschitz = L)` (`1.0` for a signed distance function) restores the guarantee.
 
-Two limits are worth stating plainly. The clip surface is piecewise planar per
-cell at every depth, so `cut_depth` buys a finer staircase rather than a smooth
-surface. And at a CSG crease — an edge or corner where two leaves meet —
-`levelset_value` is only `C⁰`, so the clip converges there at first order in the
-sub-cell size against second order on a smooth face; an `∩`-corner stays
-comparatively more faceted at any given depth.
+Two limits are worth stating plainly. The clip surface is piecewise planar per cell at every depth, so `cut_depth` buys
+a finer staircase rather than a smooth surface. And at a CSG crease — an edge or corner where two leaves meet —
+`levelset_value` is only `C⁰`, so the clip converges there at first order in the sub-cell size against second order on a
+smooth face; an `∩`-corner stays comparatively more faceted at any given depth.
 
-To write a *sequence* of these bundles as one animation — a moving overlay, an
-adaptive ladder, a time-dependent solution — open a [`vtk_series`](@ref) and
-call this function with it in place of a path.
+To write a *sequence* of these bundles as one animation — a moving overlay, an adaptive ladder, a time-dependent
+solution — open a [`vtk_series`](@ref) and call this function with it in place of a path.
 """
 function write_vtk(path::AbstractString, solution::Solution, model::Model{D,T}; field=nothing, subdivisions=:degree,
                    cut_depth=3, point_data=_default_vtk_point_data(), cell_data=NamedTuple(), level_meshes::Bool=true,
@@ -152,10 +113,9 @@ end
 """
     VTKSeries
 
-Handle for a ParaView collection (`.pvd`) being written frame by frame. Opened
-by [`vtk_series`](@ref), extended by `write_vtk(series, time, solution, model)`,
-and finished by `close(series)`. It carries the open collection, the directory
-its frame bundles are written into, and the number of frames written so far.
+Handle for a ParaView collection (`.pvd`) being written frame by frame. Opened by [`vtk_series`](@ref), extended by
+`write_vtk(series, time, solution, model)`, and finished by `close(series)`. It carries the open collection, the
+directory its frame bundles are written into, and the number of frames written so far.
 """
 struct VTKSeries
     collection::WriteVTK.CollectionFile
@@ -166,9 +126,8 @@ end
 """
     vtk_series(path; frames=nothing) -> VTKSeries
 
-Open a ParaView collection at `path` for a sequence of solution bundles — the
-transient sibling of [`write_vtk`](@ref). Write one frame per call, then
-`close` the series to write the collection file:
+Open a ParaView collection at `path` for a sequence of solution bundles — the transient sibling of [`write_vtk`](@ref).
+Write one frame per call, then `close` the series to write the collection file:
 
 ```julia
 series = vtk_series("output/laser")
@@ -179,40 +138,32 @@ end
 close(series)                                  # → "output/laser.pvd"
 ```
 
-Opening `laser.pvd` in ParaView plays the sequence: the time slider carries the
-times the frames were written at, and the animation shows the solution *and*
-the mesh that produced it.
+Opening `laser.pvd` in ParaView plays the sequence: the time slider carries the times the frames were written at, and
+the animation shows the solution *and* the mesh that produced it.
 
   - `path` — the collection file, with or without the `.pvd` extension.
-  - `frames` — the directory the frame bundles go into. Defaults to
-    `<path>_frames`, a sibling of the collection. The collection references
-    each frame by a path relative to itself, so collection and frames move
-    together as one directory tree.
+  - `frames` — the directory the frame bundles go into. Defaults to `<path>_frames`, a sibling of the collection. The
+    collection references each frame by a path relative to itself, so collection and frames move together as one
+    directory tree.
 
-Four properties are worth stating explicitly, because they are what makes this
-usable for a moving feature rather than merely for a fixed mesh in time:
+Four properties are worth stating explicitly, because they are what makes this usable for a moving feature rather than
+merely for a fixed mesh in time:
 
-  - **Every frame is a full bundle** — the data grid *and* the per-level meshes
-    — written under its own base name `frame_<n>`, with `n` counted from one
-    and zero-padded so a directory listing sorts. On a moving overlay or an
-    adaptive ladder the mesh differs from frame to frame, and that is usually
-    the thing one wants to see; a series that emitted the mesh once could not
-    show it.
-  - **Keywords are per frame.** Every keyword of [`write_vtk`](@ref) is
-    accepted on each call, with the same meaning and the same default, because
-    both the sampled data and the model change as a run proceeds.
-  - **The collection records each frame's own physical time**, exactly as it is
-    given and in the order given, so a run with an adaptive Δt is never forced
-    onto a uniform frame grid.
-  - **Nothing is deleted.** A re-run that writes fewer frames than the previous
-    one leaves the surplus frame files in place, unreferenced by the new
-    collection — invisible in ParaView, visible in a directory listing.
-    Clearing the frames directory first, if that matters, is the caller's
-    decision; a library that removed files a user might want is not one.
+  - **Every frame is a full bundle** — the data grid *and* the per-level meshes — written under its own base name
+    `frame_<n>`, with `n` counted from one and zero-padded so a directory listing sorts. On a moving overlay or an
+    adaptive ladder the mesh differs from frame to frame, and that is usually the thing one wants to see; a series that
+    emitted the mesh once could not show it.
+  - **Keywords are per frame.** Every keyword of [`write_vtk`](@ref) is accepted on each call, with the same meaning and
+    the same default, because both the sampled data and the model change as a run proceeds.
+  - **The collection records each frame's own physical time**, exactly as it is given and in the order given, so a run
+    with an adaptive Δt is never forced onto a uniform frame grid.
+  - **Nothing is deleted.** A re-run that writes fewer frames than the previous one leaves the surplus frame files in
+    place, unreferenced by the new collection — invisible in ParaView, visible in a directory listing. Clearing the
+    frames directory first, if that matters, is the caller's decision; a library that removed files a user might want is
+    not one.
 
-The series deliberately has no schedule of its own — no `every`, no `times`.
-Which steps of a time loop deserve a picture is a property of the loop, not of
-the writer, and a frame costs what a `write_vtk` call costs.
+The series deliberately has no schedule of its own — no `every`, no `times`. Which steps of a time loop deserve a
+picture is a property of the loop, not of the writer, and a frame costs what a `write_vtk` call costs.
 """
 function vtk_series(path::AbstractString; frames=nothing)
     base = _vtk_base_path(path)
@@ -225,15 +176,13 @@ end
 """
     write_vtk(series::VTKSeries, time, solution, model; kwargs...) -> String
 
-Write one frame of a [`vtk_series`](@ref) and register it in the collection at
-physical `time`. Returns the path of the frame's `.vtm`.
+Write one frame of a [`vtk_series`](@ref) and register it in the collection at physical `time`. Returns the path of the
+frame's `.vtm`.
 
-The frame is exactly the bundle `write_vtk(path, solution, model; …)` writes,
-under a name the series chooses (`frame_<n>` in the series' frames directory),
-and every keyword of that method is accepted here unchanged — see
-[`vtk_series`](@ref) for what the series does and does not do with the frames
-it is handed. `time` is recorded in the collection and is otherwise unused: it
-need not be a step index, a multiple of anything, or evenly spaced.
+The frame is exactly the bundle `write_vtk(path, solution, model; …)` writes, under a name the series chooses
+(`frame_<n>` in the series' frames directory), and every keyword of that method is accepted here unchanged — see
+[`vtk_series`](@ref) for what the series does and does not do with the frames it is handed. `time` is recorded in the
+collection and is otherwise unused: it need not be a step index, a multiple of anything, or evenly spaced.
 """
 function write_vtk(series::VTKSeries, time::Real, solution::Solution, model::Model{D,T}; field=nothing,
                    subdivisions=:degree, cut_depth=3, point_data=_default_vtk_point_data(), cell_data=NamedTuple(),
@@ -244,10 +193,9 @@ function write_vtk(series::VTKSeries, time::Real, solution::Solution, model::Mod
     vtm = vtk_multiblock(base)
     _write_vtk_blocks!(vtm, base, solution, model; field, subdivisions, cut_depth=budget, point_data, cell_data,
                        level_meshes, ascii, append, compress)
-    # Hands the *open* multiblock over: the collection closes it — which is what
-    # writes the frame's files — and records its path, relative to the `.pvd`,
-    # against `time`. The counter advances only once that has succeeded, so a
-    # rejected frame does not burn a frame number.
+    # Hands the *open* multiblock over: the collection closes it — which is what writes the frame's files — and records
+    # its path, relative to the `.pvd`, against `time`. The counter advances only once that has succeeded, so a rejected
+    # frame does not burn a frame number.
     collection_add_timestep(series.collection, vtm, time)
     series.count[] = n
     return vtm.path
@@ -256,9 +204,8 @@ end
 """
     close(series::VTKSeries) -> String
 
-Write the ParaView collection file of `series` and return its path. The frame
-bundles are already on disk — each is written as it is handed over — so this
-writes only the `.pvd` index over them. Calling it a second time writes nothing
+Write the ParaView collection file of `series` and return its path. The frame bundles are already on disk — each is
+written as it is handed over — so this writes only the `.pvd` index over them. Calling it a second time writes nothing
 and returns the same path.
 """
 function Base.close(series::VTKSeries)
@@ -269,37 +216,31 @@ end
 """
     write_quadrature_vtm(path, model)
 
-Write a ParaView multiblock bundle of the model's quadrature-point
-cloud. One `.vtp` block is emitted per *distinct combination of
-covering parent levels*: every region of every subdomain integration
-plan is keyed by `sort([parent.level for parent in region.parents])`
-and regions with the same level signature land in the same block.
-Level ids are unique across subdomains, so a coupled model's
-subdomains land in different blocks and all of them are written. Each
-block stores the physical quadrature-point coordinates and per-point
-physical weight (`weight = w × jacobian`) as point data.
+Write a ParaView multiblock bundle of the model's quadrature-point cloud. One `.vtp` block is emitted per *distinct
+combination of covering parent levels*: every region of every subdomain integration plan is keyed by
+`sort([parent.level for parent in region.parents])` and regions with the same level signature land in the same block.
+Level ids are unique across subdomains, so a coupled model's subdomains land in different blocks and all of them are
+written. Each block stores the physical quadrature-point coordinates and per-point physical weight
+(`weight = w × jacobian`) as point data.
 
-Useful for inspecting where the integration regions actually land in
-ParaView (the regions / cuts / α-FCM weights are not visible from the
-solution VTK alone) and for diagnosing small-overlap warnings — the
-small regions show up as point clusters with tiny weights.
+Useful for inspecting where the integration regions actually land in ParaView (the regions / cuts / α-FCM weights are
+not visible from the solution VTK alone) and for diagnosing small-overlap warnings — the small regions show up as point
+clusters with tiny weights.
 """
 function write_quadrature_vtm(path::AbstractString, model::Model{D,T}) where {D,T}
     _check_vtk_dimension(Val(D))
     base = _vtk_base_path(path)
     mkpath(dirname(base))
 
-    # Regions of EVERY subdomain integration plan. The reindexed level ids are
-    # globally unique, so a region's covering-level signature already separates
-    # subdomains into distinct blocks — a coupled model shows every subdomain's
-    # quadrature cloud, not just the first.
+    # Regions of EVERY subdomain integration plan. The reindexed level ids are globally unique, so a region's
+    # covering-level signature already separates subdomains into distinct blocks — a coupled model shows every
+    # subdomain's quadrature cloud, not just the first.
     all_regions = VolumeRegion{D,T}[]
     for plan in integration_plans(model)
         append!(all_regions, plan.regions)
     end
 
-    # Group regions by the sorted list of covering parent-level ids,
-    # then emit one VTP block per group.
+    # Group regions by the sorted list of covering parent-level ids, then emit one VTP block per group.
     groups = Dict{Vector{Int},Vector{Int}}()
     for (i, region) in enumerate(all_regions)
         sig = sort!([p.level for p in region.parents])
@@ -332,33 +273,27 @@ end
 
 # ── One VTK bundle ────────────────────────────────────────────────────────────
 
-# Default point-data callback for `write_vtk`: one entry named `uh`
-# that evaluates the current solution at the sample point. Callbacks
-# are called as `f(u, context, x, xi)` and may produce any per-point
-# scalar, vector, or tuple value; the `u` closure is the access path
-# back to the solution evaluation kernel.
+# Default point-data callback for `write_vtk`: one entry named `uh` that evaluates the current solution at the sample
+# point. Callbacks are called as `f(u, context, x, xi)` and may produce any per-point scalar, vector, or tuple value;
+# the `u` closure is the access path back to the solution evaluation kernel.
 _default_vtk_point_data() = (uh=(u, c, x, xi) -> u(c, xi),)
 
-# Resolve the `cut_depth` keyword to a non-negative bisection budget. Called by
-# the public entry points *before* `_vtk_bundle_base` opens anything, so a
-# rejected value leaves no directory and no half-written bundle behind — the
+# Resolve the `cut_depth` keyword to a non-negative bisection budget. Called by the public entry points *before*
+# `_vtk_bundle_base` opens anything, so a rejected value leaves no directory and no half-written bundle behind — the
 # same contract the dimension and coefficient checks there already keep.
 #
-# The cap is
-# 8 rather than a larger round number because the leaf count grows as
-# 2^((D−1)k): at D = 3 and the measured ~400 B per emitted cell, depth 8 is
-# already of order 10⁷ cells and a gigabyte, which is a limit rather than a
-# safety net.
+# The cap is 8 rather than a larger round number because the leaf count grows as 2^((D−1)k): at D = 3 and the measured
+# ~400 B per emitted cell, depth 8 is already of order 10⁷ cells and a gigabyte, which is a limit rather than a safety
+# net.
 function _cut_depth_budget(cut_depth)
     cut_depth === :none && return 0
     cut_depth isa Integer && 0 <= cut_depth <= 8 && return Int(cut_depth)
     throw(ArgumentError("cut_depth must be :none or an integer in 0:8; got $(repr(cut_depth))"))
 end
 
-# Shared prologue of every bundle writer: reject a dimension VTK has no cell
-# type for, and a solution the model did not produce, *before* any file handle
-# exists — a rejected call must leave no half-written bundle behind — then make
-# the output directory and hand back the extension-free base name.
+# Shared prologue of every bundle writer: reject a dimension VTK has no cell type for, and a solution the model did not
+# produce, *before* any file handle exists — a rejected call must leave no half-written bundle behind — then make the
+# output directory and hand back the extension-free base name.
 function _vtk_bundle_base(path::AbstractString, solution::Solution, model::Model{D}) where {D}
     _check_vtk_dimension(Val(D))
     _checked_coefficients(solution, model)
@@ -367,54 +302,41 @@ function _vtk_bundle_base(path::AbstractString, solution::Solution, model::Model
     return base
 end
 
-# Strip a `.vtm` / `.vtu` / `.vtp` / `.pvd` extension from `path` so callers
-# can pass either `"out"` or `"out.vtm"` interchangeably. `WriteVTK` adds the
-# extension automatically — and warns if it finds a different one already
-# there, which is why the collection extension is on the list too.
+# Strip a `.vtm` / `.vtu` / `.vtp` / `.pvd` extension from `path` so callers can pass either `"out"` or `"out.vtm"`
+# interchangeably. `WriteVTK` adds the extension automatically — and warns if it finds a different one already there,
+# which is why the collection extension is on the list too.
 function _vtk_base_path(path::AbstractString)
     base, ext = splitext(String(path))
     return ext in (".vtm", ".vtu", ".vtp", ".pvd") ? base : String(path)
 end
 
-# VTK supports cells in 1D, 2D, and 3D natively. Higher-dimensional
-# spaces have no corresponding VTK cell type and are rejected at the
-# top of the public entry points so the user sees the dimension
-# limitation up front.
+# VTK supports cells in 1D, 2D, and 3D natively. Higher-dimensional spaces have no corresponding VTK cell type and are
+# rejected at the top of the public entry points so the user sees the dimension limitation up front.
 function _check_vtk_dimension(::Val{D}) where {D}
     D <= 3 || throw(ArgumentError("VTK export supports dimensions 1, 2, and 3; got D=$D"))
 end
 
-# The contents of one bundle, written into an already-open multiblock `vtm`
-# whose children are named after `base`.
+# The contents of one bundle, written into an already-open multiblock `vtm` whose children are named after `base`.
 #
-# This is split out of `write_vtk` for one reason: so that the caller owns the
-# multiblock handle. The single-shot writer opens one, fills it here and closes
-# it; the series writer fills one the same way and hands it to a ParaView
-# collection, which closes it and records its path against a physical time.
-# Nothing else differs between the two, so a frame of a series is byte-for-byte
-# the bundle `write_vtk` writes to the same base name.
+# This is split out of `write_vtk` for one reason: so that the caller owns the multiblock handle. The single-shot writer
+# opens one, fills it here and closes it; the series writer fills one the same way and hands it to a ParaView
+# collection, which closes it and records its path against a physical time. Nothing else differs between the two, so a
+# frame of a series is byte-for-byte the bundle `write_vtk` writes to the same base name.
 #
-# One grid block per field, each sampled over its own subdomain space. A
-# single-domain model has one field → a single `data` grid; a coupled model
-# writes one block per subdomain into the same multiblock file, so opening it
-# shows every coupled field.
+# One grid block per field, each sampled over its own subdomain space. A single-domain model has one field → a single
+# `data` grid; a coupled model writes one block per subdomain into the same multiblock file, so opening it shows every
+# coupled field.
 #
-# Each field block groups the field's `data` grid with its own subdomain
-# mesh(es) so each coupled field is a self-contained, independently-toggled
-# unit in ParaView: `<field> → { data, level_… }`. The children of a field
-# block are all *leaf* datasets — never a mix of a leaf and a sub-block, which
-# breaks ParaView's Extract-Block resolution.
+# Each field block groups the field's `data` grid with its own subdomain mesh(es) so each coupled field is a
+# self-contained, independently-toggled unit in ParaView: `<field> → { data, level_… }`. The children of a field block
+# are all *leaf* datasets — never a mix of a leaf and a sub-block, which breaks ParaView's Extract-Block resolution.
 #
-# Crucially, every leaf's *disambiguating* name part is ASCII. ParaView derives
-# its Extract-Block data-assembly node names from the dataset names and keeps
-# only ASCII identifier characters, so a Unicode field name (`θ₁`, `θ₂`) or a
-# name disambiguated only by Unicode digits collapses to a single node and the
-# blocks become indistinguishable. The meshes are keyed by ASCII level id
-# (`level_<id>_<role>`); the data leaf is likewise keyed by the ASCII field
-# index (`data_<i>`), NOT by the field name. The field name is still the (only)
-# block label, where a Unicode collision is harmless — the user extracts leaves.
-# `meshed` dedups the meshes of a space shared by several fields onto its
-# first.
+# Crucially, every leaf's *disambiguating* name part is ASCII. ParaView derives its Extract-Block data-assembly node
+# names from the dataset names and keeps only ASCII identifier characters, so a Unicode field name (`θ₁`, `θ₂`) or a
+# name disambiguated only by Unicode digits collapses to a single node and the blocks become indistinguishable. The
+# meshes are keyed by ASCII level id (`level_<id>_<role>`); the data leaf is likewise keyed by the ASCII field index
+# (`data_<i>`), NOT by the field name. The field name is still the (only) block label, where a Unicode collision is
+# harmless — the user extracts leaves. `meshed` dedups the meshes of a space shared by several fields onto its first.
 function _write_vtk_blocks!(vtm, base::AbstractString, solution::Solution, model::Model; field, subdivisions, cut_depth,
                             point_data, cell_data, level_meshes, ascii, append, compress)
     fields = _vtk_fields_to_write(model, field)
@@ -422,9 +344,8 @@ function _write_vtk_blocks!(vtm, base::AbstractString, solution::Solution, model
     meshed = Any[]
     for (i, fld) in enumerate(fields)
         space, regions, layout = _field_context(model, fld)
-        # The workspace is built here and passed in: its basis-family parameter is
-        # not inferable from the model, and the call is the function barrier that
-        # types it, and with it the sample accessor every callback receives.
+        # The workspace is built here and passed in: its basis-family parameter is not inferable from the model, and the
+        # call is the function barrier that types it, and with it the sample accessor every callback receives.
         data = _partition_vtk_data(solution, model, _assembly_workspace(model), space, regions, fld, subdivisions,
                                    cut_depth, point_data, cell_data)
         field_block = multiblock_add_block(vtm, string(fld.name))
@@ -464,9 +385,8 @@ function _write_vtk_blocks!(vtm, base::AbstractString, solution::Solution, model
     return vtm
 end
 
-# The fields a VTK write covers: a single explicit `field` (a `Field` or its
-# name `Symbol`) if given, otherwise every field of the model — one grid block
-# each. A single-domain model has exactly one field, reproducing the historical
+# The fields a VTK write covers: a single explicit `field` (a `Field` or its name `Symbol`) if given, otherwise every
+# field of the model — one grid block each. A single-domain model has exactly one field, reproducing the historical
 # single-block output.
 function _vtk_fields_to_write(model::Model, field)
     field === nothing && return collect(model.problem.fields)
@@ -477,36 +397,29 @@ function _vtk_fields_to_write(model::Model, field)
     throw(ArgumentError("unknown field $field"))
 end
 
-# The (subdomain space, its volume region list, its dof layout) a field lives on:
-# for a single-domain model the one space, plan and field. The regions are the
-# list assembly integrates the field's volume forms over (`_region_list`), so
+# The (subdomain space, its volume region list, its dof layout) a field lives on: for a single-domain model the one
+# space, plan and field. The regions are the list assembly integrates the field's volume forms over (`_region_list`), so
 # the export samples exactly the regions the solve integrated.
 function _field_context(model::Model, fld::Field)
     space = _field_space(model.problem, fld.name)
     return space, _region_list(model, nothing, space).regions, _field_layout(model.dofs, fld.name)
 end
 
-# Compose the file path for a child VTK block by suffixing the base
-# name. Used by the multiblock writer to derive paths for the solution
-# `.vtu` and the per-level mesh `.vtu`s.
+# Compose the file path for a child VTK block by suffixing the base name. Used by the multiblock writer to derive paths
+# for the solution `.vtu` and the per-level mesh `.vtu`s.
 _vtk_child_path(base::AbstractString, suffix::AbstractString) = joinpath(dirname(base), basename(base) * "_" * suffix)
 
 # ── VTK partition and samples ─────────────────────────────────────────────────
 
-# Build the partitioned solution dataset: walk every integration
-# region of the model, subdivide each into `_subboxes`, emit one VTK
-# cell per subbox (with its 2ᴰ corners as VTK points), record
-# `region_id` and `cover_count` per cell, and collect point-sample
-# records for the user-supplied callbacks. The result is a
-# `NamedTuple` ready for `vtk_grid` consumption.
+# Build the partitioned solution dataset: walk every integration region of the model, subdivide each into `_subboxes`,
+# emit one VTK cell per subbox (with its 2ᴰ corners as VTK points), record `region_id` and `cover_count` per cell, and
+# collect point-sample records for the user-supplied callbacks. The result is a `NamedTuple` ready for `vtk_grid`
+# consumption.
 #
-# When the model carries a `PhysicalDomain`, the per-vertex level-set
-# values `φ(x)` are collected as a built-in `level_set` point array —
-# emitted alongside `region_id` / `cover_count` so cut, full, and
-# fictitious regions are always identifiable in ParaView (e.g. as a
-# zero-level isocontour) without the user having to wire a `phi`
-# callback themselves. A user-supplied `level_set` entry in
-# `point_data` overrides the built-in.
+# When the model carries a `PhysicalDomain`, the per-vertex level-set values `φ(x)` are collected as a built-in
+# `level_set` point array — emitted alongside `region_id` / `cover_count` so cut, full, and fictitious regions are
+# always identifiable in ParaView (e.g. as a zero-level isocontour) without the user having to wire a `phi` callback
+# themselves. A user-supplied `level_set` entry in `point_data` overrides the built-in.
 function _partition_vtk_data(solution::Solution, model::Model{D,T}, ws::AssemblyWorkspace, space::Space{D,T},
                              regions::Vector{VolumeRegion{D,T}}, fld::Field, subdivisions, cut_depth::Int, point_data,
                              cell_data) where {D,T}
@@ -514,8 +427,8 @@ function _partition_vtk_data(solution::Solution, model::Model{D,T}, ws::Assembly
     cell_pairs = _vtk_pairs(cell_data, :cell_data)
     physical = space.physical
     auto_level_set = physical !== nothing && !any(p -> first(p) == "level_set", point_pairs)
-    # One certificate lookup per write, not per region: the constant is a
-    # property of the geometry tree, which does not change across the walk.
+    # One certificate lookup per write, not per region: the constant is a property of the geometry tree, which does not
+    # change across the walk.
     lipschitz = physical === nothing ? Inf : _levelset_lipschitz(physical.geometry)
     if cut_depth > 0 && physical !== nothing && !isfinite(lipschitz)
         @warn("cut_depth is refining on corner signs alone: no leaf of this PhysicalDomain " *
@@ -531,11 +444,9 @@ function _partition_vtk_data(solution::Solution, model::Model{D,T}, ws::Assembly
     region_ids = Int[]
     cover_counts = Int[]
     level_set_values = auto_level_set ? T[] : nothing
-    # One value list per callback, filled in sample order. The callbacks run
-    # here, inside the region walk, rather than against a recorded sample list:
-    # that is what lets a region's dof values (`_state_region!`, the expensive
-    # part of an evaluation) be read once and reused by every one of the
-    # region's samples.
+    # One value list per callback, filled in sample order. The callbacks run here, inside the region walk, rather than
+    # against a recorded sample list: that is what lets a region's dof values (`_state_region!`, the expensive part of
+    # an evaluation) be read once and reused by every one of the region's samples.
     point_values = [Any[] for _ in point_pairs]
     cell_values = [Any[] for _ in cell_pairs]
     state = FormState(model.dofs, _state_vector(solution, model))
@@ -570,12 +481,10 @@ function _partition_vtk_data(solution::Solution, model::Model{D,T}, ws::Assembly
     return (; points, cells, point_arrays, cell_arrays, region_ids, cover_counts, level_set_values)
 end
 
-# Normalise the `point_data` / `cell_data` keyword argument to a list
-# of `String => callback` pairs. Three accepted user-facing shapes:
-# `NamedTuple` (the most ergonomic; `(uh = …, σ = …)`),
-# `AbstractDict` (programmatic construction), and `Tuple` of `Pair`s
-# (explicit construction). The fallback raises with the offending
-# parameter name (`:point_data` or `:cell_data`) embedded.
+# Normalise the `point_data` / `cell_data` keyword argument to a list of `String => callback` pairs. Three accepted
+# user-facing shapes: `NamedTuple` (the most ergonomic; `(uh = …, σ = …)`), `AbstractDict` (programmatic construction),
+# and `Tuple` of `Pair`s (explicit construction). The fallback raises with the offending parameter name (`:point_data`
+# or `:cell_data`) embedded.
 function _vtk_pairs(data, name::Symbol)
     if data isa NamedTuple || data isa AbstractDict
         return [String(k) => v for (k, v) in pairs(data)]
@@ -586,24 +495,18 @@ function _vtk_pairs(data, name::Symbol)
     throw(ArgumentError("$name must be a NamedTuple, Dict, or tuple of Pairs"))
 end
 
-# The `u(context, xi[, field])` accessor handed to every user VTK callback: it
-# evaluates the superposed solution at the sample without the callback ever
-# touching the dof layer. It is the assembly's own field evaluation, the one
-# `q.state` and the quadrature-point walker read: the caller frames each
-# integration region on the workspace `ws` and reads the dof values of every
-# field on it into `state` once (`_frame!`, `_state_region!`), and each call
-# evaluates the basis at the sample (`_refresh!`, values only) and every field
-# there (`_state_point!`), then reads one field off `state` — a scalar for a
-# one-component field, an `SVector` over the components otherwise. Reading the
-# dof values once per region rather than once per sample is what keeps the
-# export cheap.
+# The `u(context, xi[, field])` accessor handed to every user VTK callback: it evaluates the superposed solution at the
+# sample without the callback ever touching the dof layer. It is the assembly's own field evaluation, the one `q.state`
+# and the quadrature-point walker read: the caller frames each integration region on the workspace `ws` and reads the
+# dof values of every field on it into `state` once (`_frame!`, `_state_region!`), and each call evaluates the basis at
+# the sample (`_refresh!`, values only) and every field there (`_state_point!`), then reads one field off `state` — a
+# scalar for a one-component field, an `SVector` over the components otherwise. Reading the dof values once per region
+# rather than once per sample is what keeps the export cheap.
 #
-# `default` is the field of the block being written. A callback may name another
-# `field`, but only one on the same subdomain: the region's parents are that
-# subdomain's cells, so another subdomain's field owns none of them in the frame
-# (`ws.fptr`) and has no value there, and asking for one raises. To read a
-# field on a *different* subdomain, call `value(solution, model, other, x)` with
-# the sample coordinate `x` the callback also receives.
+# `default` is the field of the block being written. A callback may name another `field`, but only one on the same
+# subdomain: the region's parents are that subdomain's cells, so another subdomain's field owns none of them in the
+# frame (`ws.fptr`) and has no value there, and asking for one raises. To read a field on a *different* subdomain, call
+# `value(solution, model, other, x)` with the sample coordinate `x` the callback also receives.
 function _vtk_value_accessor(ws, state::FormState, region, default::Field)
     return (context, xi, field=default) -> begin
         f = _field_index(state.layout, field.name)
@@ -618,49 +521,39 @@ function _vtk_value_accessor(ws, state::FormState, region, default::Field)
     end
 end
 
-# Build the `(context, x, xi)` triple passed to a user VTK callback.
-# `context` carries the integration region's identity, the subbox
-# being sampled, the covering parents, and the model version (so a
-# stale solution can be detected if needed). `location` is `:point`
-# for vertex samples and `:cell` for cell-center samples. `xi` carries
-# the sample's region-reference coordinate, which is what the `u`
-# accessor evaluates the solution at.
+# Build the `(context, x, xi)` triple passed to a user VTK callback. `context` carries the integration region's
+# identity, the subbox being sampled, the covering parents, and the model version (so a stale solution can be detected
+# if needed). `location` is `:point` for vertex samples and `:cell` for cell-center samples. `xi` carries the sample's
+# region-reference coordinate, which is what the `u` accessor evaluates the solution at.
 function _vtk_sample(model::Model{D,T}, region_id::Int, region::VolumeRegion{D,T}, box::AxisBox{D,T}, x::SVector{D,T},
                      location::Symbol) where {D,T}
     context = (; location, region_id, region=region.box, cell=box, parents=region.parents, model_version=model.version,)
     return (; context, x, xi=(; region=physical_to_reference(region.box, x)))
 end
 
-# Pair each `name => callback` entry with a typed array of the values that
-# callback returned, ready for `WriteVTK` attachment. `values[i]` is the
-# collected output of `pairs[i]`, in sample order.
+# Pair each `name => callback` entry with a typed array of the values that callback returned, ready for `WriteVTK`
+# attachment. `values[i]` is the collected output of `pairs[i]`, in sample order.
 _vtk_data_arrays(pairs, values) = Pair{String,Any}[first(p) => _vtk_data_array(v) for (p, v) in zip(pairs, values)]
 
-# Coerce a `Vector{Any}` of callback returns to a typed array suitable
-# for `WriteVTK`. Three accepted patterns:
+# Coerce a `Vector{Any}` of callback returns to a typed array suitable for `WriteVTK`. Three accepted patterns:
 #
 #   * all-`Number` → `Vector{T}` with `T = promote_type(typeof.(v))`;
-#   * all-`SVector` → typed vector of the first element's `SVector`
-#     type (with conversion of each entry, in case widths or eltypes
-#     differ slightly);
-#   * all-`Tuple` of the same length → `Vector{SVector{N,T}}` with
-#     `N` inferred from the first element and `T` promoted from every
-#     component of every entry.
+#   * all-`SVector` → typed vector of the first element's `SVector` type (with conversion of each entry, in case widths
+#     or eltypes differ slightly);
+#   * all-`Tuple` of the same length → `Vector{SVector{N,T}}` with `N` inferred from the first element and `T` promoted
+#     from every component of every entry.
 #
-# Both vector patterns pass through `_vtk_vector_array`, so a 2-component
-# result reaches ParaView as a VTK vector. The fallback returns the input
-# untouched, and `WriteVTK` then rejects the `Vector{Any}` with
-# `data type not supported by VTK: Any` — an error that names the type but not
-# the offending `name => callback` entry.
+# Both vector patterns pass through `_vtk_vector_array`, so a 2-component result reaches ParaView as a VTK vector. The
+# fallback returns the input untouched, and `WriteVTK` then rejects the `Vector{Any}` with
+# `data type not supported by VTK: Any` — an error that names the type but not the offending `name => callback` entry.
 function _vtk_data_array(values::Vector{Any})
     isempty(values) && return Float64[]
     first_value = first(values)
 
     if all(v -> v isa Number, values)
-        # Reduce the element types pairwise rather than splatting them into
-        # `promote_type`: a `Vector{Any}` of thousands of samples would splat
-        # thousands of type arguments and overflow the stack, because
-        # variadic `promote_type` recurses one level per argument.
+        # Reduce the element types pairwise rather than splatting them into `promote_type`: a `Vector{Any}` of thousands
+        # of samples would splat thousands of type arguments and overflow the stack, because variadic `promote_type`
+        # recurses one level per argument.
         T = mapreduce(typeof, promote_type, values)
         return T[values...]
     elseif all(v -> v isa SVector, values)
@@ -675,14 +568,12 @@ function _vtk_data_array(values::Vector{Any})
     return values
 end
 
-# Widen a two-component vector array to three components with a trailing zero.
-# VTK gives a point/cell data array a meaning by its component count — 1 is a
-# scalar, 3 a vector, 9 a tensor — and a 2-component array is none of those: it
-# is stored and displayed component-wise, but `vtkDataSetAttributes::SetVectors`
-# rejects it, so ParaView's Glyph, Warp By Vector and Stream Tracer cannot read
-# a 2-D vector field emitted at its natural width. Padding mirrors `_vtk_point`,
-# which pads the geometry of the same 2-D dataset to three coordinates, so the
-# vectors and the points a reader associates them with now agree.
+# Widen a two-component vector array to three components with a trailing zero. VTK gives a point/cell data array a
+# meaning by its component count — 1 is a scalar, 3 a vector, 9 a tensor — and a 2-component array is none of those: it
+# is stored and displayed component-wise, but `vtkDataSetAttributes::SetVectors` rejects it, so ParaView's Glyph, Warp
+# By Vector and Stream Tracer cannot read a 2-D vector field emitted at its natural width. Padding mirrors `_vtk_point`,
+# which pads the geometry of the same 2-D dataset to three coordinates, so the vectors and the points a reader
+# associates them with now agree.
 function _vtk_vector_array(array::Vector{SVector{2,T}}) where {T}
     return SVector{3,T}[SVector{3,T}(v[1], v[2], zero(T)) for v in array]
 end
@@ -690,30 +581,23 @@ _vtk_vector_array(array::Vector) = array
 
 # ── Cut-cell refinement ───────────────────────────────────────────────────────
 #
-# ParaView's Clip reconstructs ∂Ω from the `level_set` point array by linear
-# interpolation along each cell's edges, so the cut surface it draws is a
-# facetisation at the size of the emitted cell and at nothing else — neither φ's
-# own accuracy nor the solution order enters. Resolving ∂Ω therefore means
-# emitting small cells where ∂Ω runs, and only there: the boundary is
-# codimension one, so refining toward it costs O(2^((D−1)k)) against the
-# O(2^(Dk)) of refining the whole region. Measured on a 3D 5×5×5 order-2 sphere,
-# 81 regions: 5 723 cells against 41 472 at 8 sub-cells per axis across ∂Ω,
-# 23 543 against 331 776 at 16, 95 891 against 2 654 208 at 32.
+# ParaView's Clip reconstructs ∂Ω from the `level_set` point array by linear interpolation along each cell's edges, so
+# the cut surface it draws is a facetisation at the size of the emitted cell and at nothing else — neither φ's own
+# accuracy nor the solution order enters. Resolving ∂Ω therefore means emitting small cells where ∂Ω runs, and only
+# there: the boundary is codimension one, so refining toward it costs O(2^((D−1)k)) against the O(2^(Dk)) of refining
+# the whole region. Measured on a 3D 5×5×5 order-2 sphere, 81 regions: 5 723 cells against 41 472 at 8 sub-cells per
+# axis across ∂Ω, 23 543 against 331 776 at 16, 95 891 against 2 654 208 at 32.
 #
-# The structure is QuESo's two-level budget (`Octree::Node::Refine(MinLevel,
-# MaxLevel)`, M. Meßmer et al., Comput. Methods Appl. Mech. Engrg. 400 (2022)
-# 115584): `subdivisions` is the floor applied to every region and sized by
-# polynomial order, because its job is to resolve the *solution*; `cut_depth` is
-# the ceiling applied only to boxes ∂Ω passes through, because its job is to
-# resolve the *geometry*. The two knobs are independent and neither can express
+# The structure is QuESo's two-level budget (`Octree::Node::Refine(MinLevel, MaxLevel)`, M. Meßmer et al., Comput.
+# Methods Appl. Mech. Engrg. 400 (2022) 115584): `subdivisions` is the floor applied to every region and sized by
+# polynomial order, because its job is to resolve the *solution*; `cut_depth` is the ceiling applied only to boxes ∂Ω
+# passes through, because its job is to resolve the *geometry*. The two knobs are independent and neither can express
 # the other.
 
-# The sub-boxes one region contributes to the VTK dataset: the `subdivisions`
-# lattice, with each of its boxes replaced by its cut tree when the region is
-# one ∂Ω crosses. The uncut path returns the lattice vector itself, so a model
-# with no `PhysicalDomain`, a region the boundary misses, and `cut_depth = 0`
-# are all byte-identical to the unrefined writer by construction rather than by
-# care.
+# The sub-boxes one region contributes to the VTK dataset: the `subdivisions` lattice, with each of its boxes replaced
+# by its cut tree when the region is one ∂Ω crosses. The uncut path returns the lattice vector itself, so a model with
+# no `PhysicalDomain`, a region the boundary misses, and `cut_depth = 0` are all byte-identical to the unrefined writer
+# by construction rather than by care.
 function _region_boxes(space::Space{D,T}, region::VolumeRegion{D,T}, subdivisions, depth::Int,
                        lipschitz::Float64) where {D,T}
     base = _subboxes(region.box, _subdivision_counts(space, region, subdivisions))
@@ -727,8 +611,7 @@ function _region_boxes(space::Space{D,T}, region::VolumeRegion{D,T}, subdivision
     return boxes
 end
 
-# Per-axis subbox count for one integration region. Four user-facing
-# shapes:
+# Per-axis subbox count for one integration region. Four user-facing shapes:
 #
 #   * `:degree`           — `max(1, polynomial_order)` per axis,
 #                           computed as the per-axis maximum over the
@@ -742,11 +625,9 @@ end
 #   * `NTuple{D,Int}`     — explicit per-axis counts.
 function _subdivision_counts(space::Space{D,T}, region::VolumeRegion{D,T}, subdivisions) where {D,T}
     if subdivisions === :degree
-        # Per parent CELL, not per level: the level's nominal order
-        # (`nominal_order`) is the per-axis maximum over its cells, so sizing
-        # from it subdivides every region at the order of the loudest cell
-        # anywhere on the level. Measured on a 3D 8³ level at p=1 with a single
-        # p=6 cell, the default `write_vtk` path emitted 110 592 subcells
+        # Per parent CELL, not per level: the level's nominal order (`nominal_order`) is the per-axis maximum over its
+        # cells, so sizing from it subdivides every region at the order of the loudest cell anywhere on the level.
+        # Measured on a 3D 8³ level at p=1 with a single p=6 cell, the default `write_vtk` path emitted 110 592 subcells
         # against 512 and 221.9 MB against 2.50 MB.
         return ntuple(D) do d
             maximum(parent -> max(1, cell_order(_level_by_id(space, parent.level), parent.cell)[d]), region.parents)
@@ -763,11 +644,9 @@ function _subdivision_counts(space::Space{D,T}, region::VolumeRegion{D,T}, subdi
     throw(ArgumentError("subdivisions must be :degree, :none, a positive integer, or an NTuple{$D,Int}"))
 end
 
-# Split an axis-aligned box into a `counts[1] × counts[2] × … × counts[D]`
-# uniform grid of sub-boxes. Used to refine the VTK output beyond the
-# raw admissible-box partition — a single high-order region gets
-# subdivided so the linear ParaView cells can resolve the higher-order
-# solution faithfully.
+# Split an axis-aligned box into a `counts[1] × counts[2] × … × counts[D]` uniform grid of sub-boxes. Used to refine the
+# VTK output beyond the raw admissible-box partition — a single high-order region gets subdivided so the linear ParaView
+# cells can resolve the higher-order solution faithfully.
 function _subboxes(b::AxisBox{D,T}, counts::NTuple{D,Int}) where {D,T}
     boxes = AxisBox{D,T}[]
     h = edge_lengths(b)
@@ -779,22 +658,18 @@ function _subboxes(b::AxisBox{D,T}, counts::NTuple{D,Int}) where {D,T}
     return boxes
 end
 
-# Does ∂Ω pass through this region? `:full` is entirely physical and
-# `:fictitious_alpha` entirely fictitious; every other kind the quadrature
-# builder produces — `:cut_fitted`, `:cut_custom`, `:cut_fallback`,
-# `:cut_failed`, `:cut_alpha_failed` — is a region the boundary crosses. Naming
-# the two non-cut kinds rather than the five cut ones keeps a future cut kind on
-# the correct side by default. Without a `PhysicalDomain` every region is
-# `:full`, so this is uniformly `false`.
+# Does ∂Ω pass through this region? `:full` is entirely physical and `:fictitious_alpha` entirely fictitious; every
+# other kind the quadrature builder produces — `:cut_fitted`, `:cut_custom`, `:cut_fallback`, `:cut_failed`,
+# `:cut_alpha_failed` — is a region the boundary crosses. Naming the two non-cut kinds rather than the five cut ones
+# keeps a future cut kind on the correct side by default. Without a `PhysicalDomain` every region is `:full`, so this is
+# uniformly `false`.
 _is_cut_region(region::VolumeRegion) = region.quadrature.kind !== :full && region.quadrature.kind !== :fictitious_alpha
 
-# Collect the leaves of the cut tree rooted at `b` into `boxes`. Descend only
-# into marked boxes, and descend every marked box the full `depth`, so every
-# leaf that ∂Ω passes through comes out at the same size. That uniformity is
-# load-bearing: two finest leaves sharing a face see identical corner
-# coordinates and therefore identical φ, so their clip surfaces meet exactly,
-# and every coarser leaf is unmarked and contributes no clip surface at all.
-# A variable-depth rule would buy fewer cells and lose both properties.
+# Collect the leaves of the cut tree rooted at `b` into `boxes`. Descend only into marked boxes, and descend every
+# marked box the full `depth`, so every leaf that ∂Ω passes through comes out at the same size. That uniformity is
+# load-bearing: two finest leaves sharing a face see identical corner coordinates and therefore identical φ, so their
+# clip surfaces meet exactly, and every coarser leaf is unmarked and contributes no clip surface at all. A
+# variable-depth rule would buy fewer cells and lose both properties.
 function _cut_leaves!(boxes::Vector{AxisBox{D,T}}, physical::PhysicalDomain, b::AxisBox{D,T}, depth::Int,
                       lipschitz::Float64) where {D,T}
     if depth == 0 || !_cut_marked(physical, b, lipschitz)
@@ -812,25 +687,20 @@ function _cut_leaves!(boxes::Vector{AxisBox{D,T}}, physical::PhysicalDomain, b::
     return boxes
 end
 
-# Should this sub-box be bisected? Two regimes, and which one applies is decided
-# by whether the geometry declares a Lipschitz constant.
+# Should this sub-box be bisected? Two regimes, and which one applies is decided by whether the geometry declares a
+# Lipschitz constant.
 #
-#   * finite `L` — mark iff `|φ(c)| ≤ L·r` with `r` the half-diagonal. This is
-#     the exact negation of the package's own uniform-sign certificate in
-#     `_tri`: an *unmarked* box provably has one sign of φ over its whole closed
-#     box, so it contains no part of ∂Ω and emits no cut surface, and no
-#     hanging node on its faces can disagree with a finer neighbour. That is
-#     what makes the output crack-free rather than merely crack-free in
-#     practice. One φ evaluation per box.
-#   * `L = Inf` (the default from `leaf(f)`) — no certificate exists, so fall
-#     back to the corner signs, which is the same evidence ParaView's own clip
-#     works from. 2ᴰ evaluations, and a feature of Ω smaller than the box and
-#     missing every corner is invisible; the remedy is to declare the constant
-#     on the leaf.
+#   * finite `L` — mark iff `|φ(c)| ≤ L·r` with `r` the half-diagonal. This is the exact negation of the package's own
+#     uniform-sign certificate in `_tri`: an *unmarked* box provably has one sign of φ over its whole closed box, so it
+#     contains no part of ∂Ω and emits no cut surface, and no hanging node on its faces can disagree with a finer
+#     neighbour. That is what makes the output crack-free rather than merely crack-free in practice. One φ evaluation
+#     per box.
+#   * `L = Inf` (the default from `leaf(f)`) — no certificate exists, so fall back to the corner signs, which is the
+#     same evidence ParaView's own clip works from. 2ᴰ evaluations, and a feature of Ω smaller than the box and missing
+#     every corner is invisible; the remedy is to declare the constant on the leaf.
 #
-# Deliberately *not* used: a secant bound `max|φ(vᵢ) − φ(c)|` in place of `L·r`.
-# It is identically zero whenever φ is symmetric about the box center — two
-# parallel plates straddling it, say — and the box then goes unmarked at every
+# Deliberately *not* used: a secant bound `max|φ(vᵢ) − φ(c)|` in place of `L·r`. It is identically zero whenever φ is
+# symmetric about the box center — two parallel plates straddling it, say — and the box then goes unmarked at every
 # threshold, which is exactly the configuration that tears.
 function _cut_marked(physical::PhysicalDomain, b::AxisBox{D,T}, lipschitz::Float64) where {D,T}
     if isfinite(lipschitz)
@@ -843,9 +713,8 @@ end
 
 # ── Level meshes ──────────────────────────────────────────────────────────────
 
-# Build the solid-cell VTK dataset for one level: one `VTK_QUAD` / `VTK_HEXAHEDRON`
-# per mesh cell — *all* cells, active or not — with per-cell scalar fields that make
-# the pruning behaviour visible in ParaView:
+# Build the solid-cell VTK dataset for one level: one `VTK_QUAD` / `VTK_HEXAHEDRON` per mesh cell — *all* cells, active
+# or not — with per-cell scalar fields that make the pruning behaviour visible in ParaView:
 #
 #   * `level_id`, `role_id`, `order_max`, `cell_id` — structural tags;
 #   * `active`      — 1 iff the cell survives the `LevelMask` (user mask + fold);
@@ -853,8 +722,8 @@ end
 #   * `active_dofs` — basis modes on the cell with at least one active component;
 #   * `reduced_dofs`— modes eliminated by covered-mode pruning (`:coverage` / `:dedup`).
 #
-# Rendered "Surface With Edges" this doubles as the old wireframe while carrying the
-# per-cell data a line mesh could not.
+# Rendered "Surface With Edges" this doubles as the old wireframe while carrying the per-cell data a line mesh could
+# not.
 function _mesh_vtk_data(level::Level{D,T}, dofs::DofLayout{D}, coverage::Coverage{D}) where {D,T}
     points = SVector{3,T}[]
     cell_type = _vtk_cell_type(Val(D))
@@ -892,25 +761,22 @@ function _mesh_vtk_data(level::Level{D,T}, dofs::DofLayout{D}, coverage::Coverag
     return (; points, cells, level_ids, role_ids, order_max, cell_ids, active, covered, active_dofs, reduced_dofs)
 end
 
-# Map a level's `role` to a small integer tag for the mesh export, so ParaView
-# filters can colour-by-`role_id` to distinguish base levels from overlays.
-# `Level.role` is `:base` or `:overlay` and nothing else: the two literals are
-# written in `space` and `overlay` respectively, every other `Level` constructor
-# copies the field, and `Level` is not exported.
+# Map a level's `role` to a small integer tag for the mesh export, so ParaView filters can colour-by-`role_id` to
+# distinguish base levels from overlays. `Level.role` is `:base` or `:overlay` and nothing else: the two literals are
+# written in `space` and `overlay` respectively, every other `Level` constructor copies the field, and `Level` is not
+# exported.
 _role_id(role::Symbol) = role === :base ? 0 : 1
 
 # ── VTK cell geometry ─────────────────────────────────────────────────────────
 
-# VTK cell type for a `D`-cube. `D = 1` is a line segment, `D = 2` is
-# a four-vertex quad, `D = 3` is an eight-vertex hexahedron. Dispatched
-# on `Val(D)` so the value is constant-folded into the cell
-# construction.
+# VTK cell type for a `D`-cube. `D = 1` is a line segment, `D = 2` is a four-vertex quad, `D = 3` is an eight-vertex
+# hexahedron. Dispatched on `Val(D)` so the value is constant-folded into the cell construction.
 _vtk_cell_type(::Val{1}) = VTKCellTypes.VTK_LINE
 _vtk_cell_type(::Val{2}) = VTKCellTypes.VTK_QUAD
 _vtk_cell_type(::Val{3}) = VTKCellTypes.VTK_HEXAHEDRON
 
-# Collect the 2ᴰ corner coordinates of `b` in VTK canonical order.
-# Used for the solution cells and the per-level mesh cells alike.
+# Collect the 2ᴰ corner coordinates of `b` in VTK canonical order. Used for the solution cells and the per-level mesh
+# cells alike.
 function _box_corners(b::AxisBox{D,T}, ::Val{D}) where {D,T}
     return ntuple(Val(2^D)) do i
         bits = _vtk_corner_bits(Val(D))[i]
@@ -918,52 +784,40 @@ function _box_corners(b::AxisBox{D,T}, ::Val{D}) where {D,T}
     end
 end
 
-# Corner-bit pattern in VTK's canonical vertex ordering for a `D`-cube.
-# For each vertex `i ∈ 1:2ᴰ`, `_vtk_corner_bits(Val(D))[i]` is a tuple
-# of `D` bits selecting `box.lower[d]` (bit 0) or `box.upper[d]`
-# (bit 1) on axis `d`. The ordering follows the VTK convention
-# (counterclockwise around each face, lower face before upper face)
-# rather than a plain Cartesian iteration so the resulting `MeshCell`s
-# orient correctly in ParaView.
+# Corner-bit pattern in VTK's canonical vertex ordering for a `D`-cube. For each vertex `i ∈ 1:2ᴰ`,
+# `_vtk_corner_bits(Val(D))[i]` is a tuple of `D` bits selecting `box.lower[d]` (bit 0) or `box.upper[d]` (bit 1) on
+# axis `d`. The ordering follows the VTK convention (counterclockwise around each face, lower face before upper face)
+# rather than a plain Cartesian iteration so the resulting `MeshCell`s orient correctly in ParaView.
 _vtk_corner_bits(::Val{1}) = ((0,), (1,))
 _vtk_corner_bits(::Val{2}) = ((0, 0), (1, 0), (1, 1), (0, 1))
 _vtk_corner_bits(::Val{3}) = ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1))
 
-# Pad a `D`-dimensional physical point with trailing zeros to three
-# coordinates: ParaView point arrays are always 3D regardless of the
-# data's actual dimension. The padded zeros are inert (ParaView
-# accepts them) and let 1D / 2D problems render in the same viewer
-# pipeline as 3D ones.
+# Pad a `D`-dimensional physical point with trailing zeros to three coordinates: ParaView point arrays are always 3D
+# regardless of the data's actual dimension. The padded zeros are inert (ParaView accepts them) and let 1D / 2D problems
+# render in the same viewer pipeline as 3D ones.
 _vtk_point(x::SVector{D,T}) where {D,T} = SVector{3,T}(ntuple(i -> i <= D ? x[i] : zero(T), 3))
 
 # ── Solution evaluation ───────────────────────────────────────────────────────
 #
-# The point evaluations `value` / `field_gradient` (`_level_field`) reconstruct
-# a field one covering cell at a time and sum the cells. Every other evaluation
-# — assembly's `q.state`, the quadrature-point walker, `l2_error` and
-# `write_vtk`'s sample accessor — evaluates into a workspace's `BasisBank`
-# (`_refresh!` and `_state_point!` in `assembly.jl`), which keeps the same
-# association: per-cell partial sums, then the sum over cells.
+# The point evaluations `value` / `field_gradient` (`_level_field`) reconstruct a field one covering cell at a time and
+# sum the cells. Every other evaluation — assembly's `q.state`, the quadrature-point walker, `l2_error` and
+# `write_vtk`'s sample accessor — evaluates into a workspace's `BasisBank` (`_refresh!` and `_state_point!` in
+# `assembly.jl`), which keeps the same association: per-cell partial sums, then the sum over cells.
 
 """
     value(solution, model, x)
     value(solution, model, x, component)
     value(solution, model, u::Field, x[, component])
 
-Evaluate the superposed solution at physical point `x`. Scalar fields
-return a scalar; component fields return an `SVector` across
-components unless a single `component` is requested. Overlay levels
-are extended by zero — only levels whose mesh contains `x` (and
-whose covering cell is active) contribute. Throws if `x` lies outside
-the evaluated field's own subdomain box, at the model's containment
-tolerance. That box is the embedding domain, not `Ω`: with a
-[`PhysicalDomain`](@ref) in play a point outside `Ω` does not raise. It
-evaluates the polynomial extension inside a cut cell, and zero inside a
-cell the fictitious fold deactivated.
+Evaluate the superposed solution at physical point `x`. Scalar fields return a scalar; component fields return an
+`SVector` across components unless a single `component` is requested. Overlay levels are extended by zero — only levels
+whose mesh contains `x` (and whose covering cell is active) contribute. Throws if `x` lies outside the evaluated field's
+own subdomain box, at the model's containment tolerance. That box is the embedding domain, not `Ω`: with a
+[`PhysicalDomain`](@ref) in play a point outside `Ω` does not raise. It evaluates the polynomial extension inside a cut
+cell, and zero inside a cell the fictitious fold deactivated.
 
-`x` accepts `NTuple{D,<:Real}` or `SVector{D,<:Real}`. Multi-field
-models require the `u::Field` form so the field to evaluate is
-unambiguous.
+`x` accepts `NTuple{D,<:Real}` or `SVector{D,<:Real}`. Multi-field models require the `u::Field` form so the field to
+evaluate is unambiguous.
 """
 function value(solution::Solution, model::Model{D,T}, x::PointLike{D}) where {D,T}
     return value(solution, model, _default_field(model), x)
@@ -986,16 +840,13 @@ end
     field_gradient(solution, model, x, component)
     field_gradient(solution, model, u::Field, x[, component])
 
-Evaluate the physical gradient of the superposed solution at physical
-point `x`. Scalar fields return one `SVector{D}` gradient; component
-fields return an `SVector` of component gradients unless a single
-`component` is requested. Overlay levels are extended by zero, same
-as [`value`](@ref). The leading `field_` avoids colliding with
-`Tensors.gradient` when both packages are loaded together.
+Evaluate the physical gradient of the superposed solution at physical point `x`. Scalar fields return one `SVector{D}`
+gradient; component fields return an `SVector` of component gradients unless a single `component` is requested. Overlay
+levels are extended by zero, same as [`value`](@ref). The leading `field_` avoids colliding with `Tensors.gradient` when
+both packages are loaded together.
 
-The gradient is the physical gradient (chain-rule scaled by
-`2 / edge_lengths(parent_box)` per axis), not the reference-frame
-gradient.
+The gradient is the physical gradient (chain-rule scaled by `2 / edge_lengths(parent_box)` per axis), not the
+reference-frame gradient.
 """
 function field_gradient(solution::Solution, model::Model{D,T}, x::PointLike{D}) where {D,T}
     return field_gradient(solution, model, _default_field(model), x)
@@ -1014,10 +865,9 @@ function field_gradient(solution::Solution, model::Model{D,T}, u::Field, x::Poin
     _field_quantity(solution, model, u, x, component, Val(true))
 end
 
-# Component dispatch shared by `value` and `field_gradient`. When `component
-# === nothing`: return a scalar for single-component fields and an
-# `SVector` across components for vector fields. When `component` is
-# explicit: bounds-check and evaluate that one component.
+# Component dispatch shared by `value` and `field_gradient`. When `component === nothing`: return a scalar for
+# single-component fields and an `SVector` across components for vector fields. When `component` is explicit:
+# bounds-check and evaluate that one component.
 function _field_quantity(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D}, component,
                          gradient::Val) where {D,T}
     coefficients, point, layout = _evaluation_data(solution, model, u, x)
@@ -1030,18 +880,15 @@ function _field_quantity(solution::Solution, model::Model{D,T}, u::Field, x::Poi
     return _evaluate_field(coefficients, model, layout, point, component, gradient)
 end
 
-# Pick the implicit field of a single-field model. Multi-field models
-# require an explicit field argument so the caller does not silently
-# evaluate the wrong field; this raises with a clear message in that
-# case.
+# Pick the implicit field of a single-field model. Multi-field models require an explicit field argument so the caller
+# does not silently evaluate the wrong field; this raises with a clear message in that case.
 function _default_field(model::Model)
     length(model.problem.fields) == 1 ? first(model.problem.fields) :
     throw(ArgumentError("field argument is required for multi-field models"))
 end
 
-# Shared pre-flight for the public `value` / `field_gradient` paths:
-# coefficient check, point coercion, in-domain check, field-layout
-# lookup. Returns the triple every evaluator needs.
+# Shared pre-flight for the public `value` / `field_gradient` paths: coefficient check, point coercion, in-domain check,
+# field-layout lookup. Returns the triple every evaluator needs.
 function _evaluation_data(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D}) where {D,T}
     coefficients = _checked_coefficients(solution, model)
     point = _point_vector(x, T)
@@ -1050,17 +897,13 @@ function _evaluation_data(solution::Solution, model::Model{D,T}, u::Field, x::Po
     return coefficients, point, _field_layout(model.dofs, u.name)
 end
 
-# Convert a `PointLike` user input (NTuple or SVector) to a typed
-# `SVector{D,T}` matching the model's scalar type. Used at the top of
-# every public evaluation path so the downstream kernels see a single
-# canonical point representation.
+# Convert a `PointLike` user input (NTuple or SVector) to a typed `SVector{D,T}` matching the model's scalar type. Used
+# at the top of every public evaluation path so the downstream kernels see a single canonical point representation.
 _point_vector(x::PointLike{D}, ::Type{T}) where {D,T} = SVector{D,T}(x)
 
-# Reject evaluation points outside a field's own subdomain box, at the model's
-# geometry tolerance so points on the boundary (up to `tol.contain`) are
-# accepted. The domain is always passed in by the caller, never taken from the
-# problem's representative space: on a coupled model each field is bounded by
-# its own subdomain, not by subdomain 1's.
+# Reject evaluation points outside a field's own subdomain box, at the model's geometry tolerance so points on the
+# boundary (up to `tol.contain`) are accepted. The domain is always passed in by the caller, never taken from the
+# problem's representative space: on a coupled model each field is bounded by its own subdomain, not by subdomain 1's.
 function _assert_point_in_domain(x::SVector{D,T}, domain::AxisBox{D,T}, tol::GeometryTolerance{T}) where {D,T}
     contains_point(x, domain, tol) || throw(ArgumentError("evaluation point is outside the field's domain"))
 end
@@ -1070,9 +913,8 @@ function _check_component(layout::FieldLayout, component::Integer)
     1 <= component <= layout.components || throw(ArgumentError("field component out of bounds"))
 end
 
-# Sum every level's `_level_field` contribution, the value or the gradient by
-# `G`. The overlay zero-extension comes from `_level_field` returning zero when
-# its level does not cover `point`.
+# Sum every level's `_level_field` contribution, the value or the gradient by `G`. The overlay zero-extension comes from
+# `_level_field` returning zero when its level does not cover `point`.
 function _evaluate_field(coefficients, model::Model{D,T}, layout::FieldLayout{D,T}, point::SVector{D,T},
                          component::Integer, ::Val{G}) where {D,T,G}
     R = promote_type(T, eltype(coefficients))
@@ -1083,20 +925,17 @@ function _evaluate_field(coefficients, model::Model{D,T}, layout::FieldLayout{D,
     return result
 end
 
-# Levels of the space owning `layout`'s field. For a single-domain model this
-# is the one space's levels; for a coupled model it routes each field to its
-# own subdomain's (reindexed) levels, so a point evaluation of field `b` never
-# reaches into field `a`'s grid.
+# Levels of the space owning `layout`'s field. For a single-domain model this is the one space's levels; for a coupled
+# model it routes each field to its own subdomain's (reindexed) levels, so a point evaluation of field `b` never reaches
+# into field `a`'s grid.
 _field_levels(model::Model, layout::FieldLayout) = _field_space(model.problem, layout.name).levels
 
-# One level's contribution to the field of `layout` at physical point `x`: its
-# value (`G = false`) or its physical gradient (`G = true`). Zero if the level's
-# mesh does not contain `x` (overlay zero-extension) or if the containing cell is
-# masked inactive. Otherwise: locate the cell, map `x` to the cell's reference
-# frame, evaluate the basis values there — or the physical basis gradients, which
-# `physical_basis_gradients` scales by the chain rule `2 / h_d` of the
-# axis-aligned cell — and contract them with the dof values through
-# `dof_value`, so constrained dofs contribute their pinned values.
+# One level's contribution to the field of `layout` at physical point `x`: its value (`G = false`) or its physical
+# gradient (`G = true`). Zero if the level's mesh does not contain `x` (overlay zero-extension) or if the containing
+# cell is masked inactive. Otherwise: locate the cell, map `x` to the cell's reference frame, evaluate the basis values
+# there — or the physical basis gradients, which `physical_basis_gradients` scales by the chain rule `2 / h_d` of the
+# axis-aligned cell — and contract them with the dof values through `dof_value`, so constrained dofs contribute their
+# pinned values.
 function _level_field(coefficients, model::Model{D,T}, layout::FieldLayout{D,T}, level::Level{D,T}, x::SVector{D,T},
                       component::Integer, ::Val{G}) where {D,T,G}
     R = promote_type(T, eltype(coefficients))
@@ -1108,11 +947,10 @@ function _level_field(coefficients, model::Model{D,T}, layout::FieldLayout{D,T},
     return _parent_field(layout, coefficients, cell_dofs(layout.dofs, level.id, cell), φ, component)
 end
 
-# The field on one parent cell: `Σᵢ u(rawᵢ, component)·φᵢ` over the cell's raw
-# dofs, with `φ` the cell's basis values (the field's value) or physical basis
-# gradients (its gradient). `dof_value` reads `u`, so a constrained dof
-# contributes its pinned value and a linear-constraint pivot its expansion. The
-# number type is the coefficients' promoted with the model's.
+# The field on one parent cell: `Σᵢ u(rawᵢ, component)·φᵢ` over the cell's raw dofs, with `φ` the cell's basis values
+# (the field's value) or physical basis gradients (its gradient). `dof_value` reads `u`, so a constrained dof
+# contributes its pinned value and a linear-constraint pivot its expansion. The number type is the coefficients'
+# promoted with the model's.
 function _parent_field(layout::FieldLayout{D,T}, coefficients, raw_dofs, φ, component::Integer) where {D,T}
     result = zero(promote_type(T, eltype(coefficients))) * zero(eltype(φ))
     for i in eachindex(raw_dofs)
@@ -1127,35 +965,26 @@ end
     l2_error(solution, model, exact; norm=:relative) -> Real
     l2_error(solution, model, u::Field, exact; norm=:relative) -> Real
 
-Compute the L² error of `solution` against an analytic / manufactured
-solution `exact(x)`:
+Compute the L² error of `solution` against an analytic / manufactured solution `exact(x)`:
 
-  - `norm = :relative` (default) returns
-    `sqrt(∫ ‖u_h − u_exact‖² dx) / sqrt(∫ ‖u_exact‖² dx)`;
+  - `norm = :relative` (default) returns `sqrt(∫ ‖u_h − u_exact‖² dx) / sqrt(∫ ‖u_exact‖² dx)`;
   - `norm = :absolute` returns just the numerator;
-  - if `‖u_exact‖_L² = 0`, the relative form falls back to the
-    absolute error so it stays meaningful for zero-reference checks
-    (e.g. a fabricated test where `exact(x) ≡ 0`).
+  - if `‖u_exact‖_L² = 0`, the relative form falls back to the absolute error so it stays meaningful for zero-reference
+    checks (e.g. a fabricated test where `exact(x) ≡ 0`).
 
-`exact(x)` returns a scalar for a scalar field, or an indexable value with
-one entry per component (an `SVector`, a tuple or a vector) for a vector
-field; the pointwise error is summed component by component,
+`exact(x)` returns a scalar for a scalar field, or an indexable value with one entry per component (an `SVector`, a
+tuple or a vector) for a vector field; the pointwise error is summed component by component,
 `‖u_h − u_exact‖² = Σ_c (u_h[c] − u_exact[c])²`.
 
-`u` names the field to measure, exactly as for [`value`](@ref) and
-[`field_gradient`](@ref). The error is integrated over that field's own
-subdomain — its space, its integration plan, its dof layout — so on a
-coupled model it is each subdomain's own error, and there is no single
-number for the union: an interface shared by two subdomains would be
-integrated twice. Omitting `u` picks the implied field of a single-field
-model and raises on a multi-field one, which is why the multi-field and
-coupled workflows had no L² error report before this overload existed.
+`u` names the field to measure, exactly as for [`value`](@ref) and [`field_gradient`](@ref). The error is integrated
+over that field's own subdomain — its space, its integration plan, its dof layout — so on a coupled model it is each
+subdomain's own error, and there is no single number for the union: an interface shared by two subdomains would be
+integrated twice. Omitting `u` picks the implied field of a single-field model and raises on a multi-field one, which is
+why the multi-field and coupled workflows had no L² error report before this overload existed.
 
-The integration uses the model's own integration plan — the same
-admissible regions assembly walks — so the error is consistent with
-what the solver actually integrated. For SPD model problems this is
-the natural convergence-study metric: monotonic decrease as you
-refine, with the rate matching the basis order.
+The integration uses the model's own integration plan — the same admissible regions assembly walks — so the error is
+consistent with what the solver actually integrated. For SPD model problems this is the natural convergence-study
+metric: monotonic decrease as you refine, with the rate matching the basis order.
 """
 function l2_error(solution::Solution, model::Model, exact; norm::Symbol=:relative)
     return l2_error(solution, model, _default_field(model), exact; norm)
@@ -1167,10 +996,9 @@ function l2_error(solution::Solution, model::Model{D,T}, u::Field, exact; norm::
     list = _region_list(model, nothing, _field_space(model.problem, u.name))
     f = _field_index(model.dofs, u.name)
     offset, C = state.offsets[f], model.dofs.fields[f].components
-    # A walk with the field's dof values, as `foreach_quadrature_point` runs one.
-    # The squared error is summed component by component, which is
-    # `_squared_norm(u_h − exact)` term for term and keeps the fold type-stable
-    # whatever the component count.
+    # A walk with the field's dof values, as `foreach_quadrature_point` runs one. The squared error is summed component
+    # by component, which is `_squared_norm(u_h − exact)` term for term and keeps the fold type-stable whatever the
+    # component count.
     ws = _assembly_workspace(model)
     error_squared, exact_squared = _walk((zero(T), zero(T)), ws, list, state) do (err, ref), q
         exact_value = exact(q.x)
@@ -1185,111 +1013,81 @@ function l2_error(solution::Solution, model::Model{D,T}, u::Field, exact; norm::
     return iszero(exact_norm) ? error_norm : error_norm / exact_norm
 end
 
-# The squared magnitude `‖u_exact‖²` of an exact value, scalar (`abs2`) or
-# component-indexable (`sum(abs2, …)`): the integrand of `l2_error`'s reference
-# norm. The error itself is summed component by component in `l2_error`.
+# The squared magnitude `‖u_exact‖²` of an exact value, scalar (`abs2`) or component-indexable (`sum(abs2, …)`): the
+# integrand of `l2_error`'s reference norm. The error itself is summed component by component in `l2_error`.
 _squared_norm(value::Number) = abs2(value)
 _squared_norm(value) = sum(abs2, value)
 
 # ── Boundary integration ──────────────────────────────────────────────────────
 #
-# Quadrature-only postprocessing on a portion of the boundary. It is a sum over
-# the quadrature-point walker (`_walk` in `assembly.jl`), so it integrates over
-# the region list assembly resolves for the same `on=` target, visits the points
-# in the serial assembly order and hands the integrand the payload a form sees.
-# Physical [`FacetRegion`](@ref)s, immersed [`SurfaceRegion`](@ref)s and
-# two-sided [`InterfaceRegion`](@ref)s take one path, and no per-point geometry
-# work happens in it — every region carries precomputed physical-frame points
-# and weights.
+# Quadrature-only postprocessing on a portion of the boundary. It is a sum over the quadrature-point walker (`_walk` in
+# `assembly.jl`), so it integrates over the region list assembly resolves for the same `on=` target, visits the points
+# in the serial assembly order and hands the integrand the payload a form sees. Physical [`FacetRegion`](@ref)s,
+# immersed [`SurfaceRegion`](@ref)s and two-sided [`InterfaceRegion`](@ref)s take one path, and no per-point geometry
+# work happens in it — every region carries precomputed physical-frame points and weights.
 
 """
     boundary_integral(integrand, model::Model; on, field=nothing) -> result
 
-Integrate a user callback over a portion of the boundary or over a coupling
-interface.
+Integrate a user callback over a portion of the boundary or over a coupling interface.
 
 `on` selects the integration region:
 
-  - `boundary(:all)`, `boundary(axis=d, side=s)`,
-    `boundary((axis=…, side=…), …)` — the physical boundary `∂Ω`. The
-    Gauss rule per region is the per-axis maximum
-    `recommended_quadrature_order(level.basis, cell_order(level, cell))`
-    over the region's covering parent cells. Overlay levels whose own mesh face
-    coincides with the selected facet contribute their own segment;
-    level masking is respected. On an immersed [`PhysicalDomain`](@ref) the
-    integral runs over `face ∩ Ω` (see [`boundary`](@ref)): at the default
-    `α = 0`, `boundary_integral(q -> 1.0, model; on=boundary(axis=d, side=s))`
-    returns the measure of the face's physical part and `integrand` is called
-    only at points inside `Ω`, while `α > 0` blends the full face back in and
-    forfeits both. The `cut_facet_region_count` field of
-    [`AssemblyDiagnostics`](@ref) counts how many of the integrated regions
-    needed trimming, and `facet_moment_fit_residual_max` how well their fits
-    went — accurate rather than exact wherever the restricted level set is not
-    one affine function, for which [`boundary`](@ref) gives the condition and
-    the two ways it fails. A selector every one of whose faces lies outside `Ω`
-    carries no quadrature at all under `α = 0` and raises, exactly as a
-    selector no active cell reaches does.
-  - A [`BoundaryMesh`](@ref) — a user-supplied immersed-boundary mesh
-    (segments in 2D, triangles in 3D, points in any D). The package
-    walks the precomputed per-cell quadrature rules.
-  - An [`Interface`](@ref) — the two-sided interface of a coupled model, which
-    spans both its subdomains and ignores `field`.
+  - `boundary(:all)`, `boundary(axis=d, side=s)`, `boundary((axis=…, side=…), …)` — the physical boundary `∂Ω`. The
+    Gauss rule per region is the per-axis maximum `recommended_quadrature_order(level.basis, cell_order(level, cell))`
+    over the region's covering parent cells. Overlay levels whose own mesh face coincides with the selected facet
+    contribute their own segment; level masking is respected. On an immersed [`PhysicalDomain`](@ref) the integral runs
+    over `face ∩ Ω` (see [`boundary`](@ref)): at the default `α = 0`,
+    `boundary_integral(q -> 1.0, model; on=boundary(axis=d, side=s))` returns the measure of the face's physical part
+    and `integrand` is called only at points inside `Ω`, while `α > 0` blends the full face back in and forfeits both.
+    The `cut_facet_region_count` field of [`AssemblyDiagnostics`](@ref) counts how many of the integrated regions needed
+    trimming, and `facet_moment_fit_residual_max` how well their fits went — accurate rather than exact wherever the
+    restricted level set is not one affine function, for which [`boundary`](@ref) gives the condition and the two ways
+    it fails. A selector every one of whose faces lies outside `Ω` carries no quadrature at all under `α = 0` and
+    raises, exactly as a selector no active cell reaches does.
+  - A [`BoundaryMesh`](@ref) — a user-supplied immersed-boundary mesh (segments in 2D, triangles in 3D, points in any
+    D). The package walks the precomputed per-cell quadrature rules.
+  - An [`Interface`](@ref) — the two-sided interface of a coupled model, which spans both its subdomains and ignores
+    `field`.
 
-The first two cases are the two halves of `∂Ω` and they are disjoint, which
-is worth stating as an identity: for an immersed model whose `BoundaryMesh`
-carries the whole immersed part of `∂Ω`, the grid-aligned integrals summed
-over `boundary(:all)` plus the mesh integral is an integral over the closed
-surface `∂Ω`, so `∮ n dS = 0` and `∮ x·n dS = D·|Ω|` hold up to the
-quadrature error of the two rules. `test_constraints.jl` pins both.
+The first two cases are the two halves of `∂Ω` and they are disjoint, which is worth stating as an identity: for an
+immersed model whose `BoundaryMesh` carries the whole immersed part of `∂Ω`, the grid-aligned integrals summed over
+`boundary(:all)` plus the mesh integral is an integral over the closed surface `∂Ω`, so `∮ n dS = 0` and
+`∮ x·n dS = D·|Ω|` hold up to the quadrature error of the two rules. `test_constraints.jl` pins both.
 
-`integrand(q)` is called at every quadrature point with the payload a form
-tagged with the same `on=` sees during assembly, and that
-[`foreach_quadrature_point`](@ref) passes:
+`integrand(q)` is called at every quadrature point with the payload a form tagged with the same `on=` sees during
+assembly, and that [`foreach_quadrature_point`](@ref) passes:
 
   - `q.x::SVector{D,T}` — physical coordinate.
   - `q.weight::T` — physical-frame weight (Gauss × measure Jacobian).
   - `q.point::Int` — the point's index in `1:nquadpoints(model; on, field)`.
-  - `q.state` — always `nothing`; the integrand reads a solution through
-    [`value`](@ref) at `q.x`.
-  - `q.normal::SVector{D,T}` — outward unit normal (facet's outward
-    normal for `BoundarySelector` `on`; cell-geometry / user-supplied
-    normal for `BoundaryMesh`; the normal from side `a` toward side `b` on
-    an `Interface`).
-  - `q.sides::Union{Nothing,Vector{Tuple{Int,Symbol}}}` — the codim-`K`
-    facet identifier on a `BoundarySelector` integration; `nothing` on
-    a `BoundaryMesh` or `Interface` integration (no facet `(axis, side)`
-    exists).
+  - `q.state` — always `nothing`; the integrand reads a solution through [`value`](@ref) at `q.x`.
+  - `q.normal::SVector{D,T}` — outward unit normal (facet's outward normal for `BoundarySelector` `on`; cell-geometry /
+    user-supplied normal for `BoundaryMesh`; the normal from side `a` toward side `b` on an `Interface`).
+  - `q.sides::Union{Nothing,Vector{Tuple{Int,Symbol}}}` — the codim-`K` facet identifier on a `BoundarySelector`
+    integration; `nothing` on a `BoundaryMesh` or `Interface` integration (no facet `(axis, side)` exists).
 
-`field` names the subdomain to integrate over on a multi-domain
-(coupled) model. Each subdomain carries its own discretisation and its
-own boundary, so `on` alone does not identify a set of facets there:
-`boundary(axis=1, side=:upper)` is a face of every subdomain that has
-one. Naming a field selects that field's space and integrates over its
-boundary. On a single-domain model `field` is unnecessary and defaults
-to the only space.
+`field` names the subdomain to integrate over on a multi-domain (coupled) model. Each subdomain carries its own
+discretisation and its own boundary, so `on` alone does not identify a set of facets there:
+`boundary(axis=1, side=:upper)` is a face of every subdomain that has one. Naming a field selects that field's space and
+integrates over its boundary. On a single-domain model `field` is unnecessary and defaults to the only space.
 
-Omitting `field` on a multi-domain model raises. The alternative
-defaults are both wrong rather than merely inconvenient: returning one
-subdomain's answer is silent and arbitrary (it depends on which form
-happens to reference the selector first), and summing the subdomains
-does not give `∂Ω` either — an interface shared by two subdomains lies
-in both `∂Ω₁` and `∂Ω₂` while belonging to neither's physical boundary,
-so the sum double-counts what it should omit. This matches the package's
-existing policy for entry points whose meaning needs a subdomain
-([`move!`](@ref), [`activate!`](@ref), [`foreach_quadrature_point`](@ref)).
+Omitting `field` on a multi-domain model raises. The alternative defaults are both wrong rather than merely
+inconvenient: returning one subdomain's answer is silent and arbitrary (it depends on which form happens to reference
+the selector first), and summing the subdomains does not give `∂Ω` either — an interface shared by two subdomains lies
+in both `∂Ω₁` and `∂Ω₂` while belonging to neither's physical boundary, so the sum double-counts what it should omit.
+This matches the package's existing policy for entry points whose meaning needs a subdomain ([`move!`](@ref),
+[`activate!`](@ref), [`foreach_quadrature_point`](@ref)).
 
-The accumulator is `result += q.weight * integrand(q)`; the result
-type is whatever `q.weight * integrand(q)` yields on the first
-sample. Throws `ArgumentError` if no admissible region exists on the
-selected portion of the boundary.
+The accumulator is `result += q.weight * integrand(q)`; the result type is whatever `q.weight * integrand(q)` yields on
+the first sample. Throws `ArgumentError` if no admissible region exists on the selected portion of the boundary.
 """
 function boundary_integral(integrand, model::Model; on::Union{BoundarySelector,BoundaryMesh,Interface},
                            field::Union{Nothing,Symbol}=nothing)
     list = _region_list(model, on, _target_space(model, on, field))
-    # A third cause joins "no such facet" and "every cell masked out" now that a
-    # facet rule is trimmed: a selector all of whose faces lie outside Ω resolves to
-    # regions that carry no quadrature. Naming it here is the difference between a
-    # user checking their selector and a user checking their geometry.
+    # A third cause joins "no such facet" and "every cell masked out" now that a facet rule is trimmed: a selector all
+    # of whose faces lie outside Ω resolves to regions that carry no quadrature. Naming it here is the difference
+    # between a user checking their selector and a user checking their geometry.
     list.offsets[end] == 0 && throw(ArgumentError("no admissible boundary quadrature for on=$(on); check the " *
                                                   "selector or mesh, any level masks, and whether the selected " *
                                                   "faces lie outside Ω"))

@@ -1,41 +1,30 @@
-# Coordinate alias used across geometry, mesh, basis, and evaluation signatures.
-# `NTuple` for raw user input; `SVector` for stored coordinates and downstream
-# kernels. Both round-trip cheaply via `SVector{D}(…)`.
+# Coordinate alias used across geometry, mesh, basis, and evaluation signatures. `NTuple` for raw user input; `SVector`
+# for stored coordinates and downstream kernels. Both round-trip cheaply via `SVector{D}(…)`.
 const PointLike{D} = Union{NTuple{D,<:Real},SVector{D,<:Real}}
 
 """
     GeometryTolerance([T=Float64]; merge, contain, small_volume)
 
-Coordinate tolerances driving geometry construction, intersection building,
-and conditioning diagnostics. Three thresholds, all positive and expressed
-in the same units as physical-domain coordinates:
+Coordinate tolerances driving geometry construction, intersection building, and conditioning diagnostics. Three
+thresholds, all positive and expressed in the same units as physical-domain coordinates:
 
-  - `merge` — coordinates closer than this in a given axis are
-    canonicalised to the same value. Drives [`merge_coordinates`](@ref)
-    and therefore the admissible-box construction in
-    `intersections.jl`, so it sets the smallest distinguishable
-    mesh-coordinate increment. Being an absolute length, it has to be
-    read against the geometry it is applied to: a mesh whose spacing on
-    some axis is at or below `merge` would have that axis's own cell
-    boundaries collapsed. [`integration_plan`](@ref) rejects that
-    combination outright instead of integrating a decimated grid.
-  - `contain` — slack on point-in-box queries
-    ([`contains_point`](@ref), [`is_inside`](@ref), `locate_cell`).
-    Containment is conservative: a point counts as inside when
-    `lower − contain ≤ x ≤ upper + contain` on every axis.
-  - `small_volume` — reporting threshold for tiny integration regions.
-    Regions with volume below this are recorded as `SmallOverlap`
-    entries in the assembly diagnostics; they are *not* silently
-    dropped — small-overlap conditioning is made visible instead of
-    hidden.
+  - `merge` — coordinates closer than this in a given axis are canonicalised to the same value. Drives
+    [`merge_coordinates`](@ref) and therefore the admissible-box construction in `intersections.jl`, so it sets the
+    smallest distinguishable mesh-coordinate increment. Being an absolute length, it has to be read against the geometry
+    it is applied to: a mesh whose spacing on some axis is at or below `merge` would have that axis's own cell
+    boundaries collapsed. [`integration_plan`](@ref) rejects that combination outright instead of integrating a
+    decimated grid.
+  - `contain` — slack on point-in-box queries ([`contains_point`](@ref), [`is_inside`](@ref), `locate_cell`).
+    Containment is conservative: a point counts as inside when `lower − contain ≤ x ≤ upper + contain` on every axis.
+  - `small_volume` — reporting threshold for tiny integration regions. Regions with volume below this are recorded as
+    `SmallOverlap` entries in the assembly diagnostics; they are *not* silently dropped — small-overlap conditioning is
+    made visible instead of hidden.
 
-The keyword constructor accepts any positive value per field. Defaults are
-`merge = √eps(T)` and `contain = small_volume = merge`. The defaults are
-calibrated for coordinates of order one; on geometry at a markedly
-different length scale, pass `merge` scaled to that geometry — e.g.
-`√eps(T) · L` for a domain of extent `L`. Tighten `merge` also when the
-geometry is known to need finer canonicalisation; loosen `contain` only
-at integration tests that genuinely require it.
+The keyword constructor accepts any positive value per field. Defaults are `merge = √eps(T)` and
+`contain = small_volume = merge`. The defaults are calibrated for coordinates of order one; on geometry at a markedly
+different length scale, pass `merge` scaled to that geometry — e.g. `√eps(T) · L` for a domain of extent `L`. Tighten
+`merge` also when the geometry is known to need finer canonicalisation; loosen `contain` only at integration tests that
+genuinely require it.
 """
 struct GeometryTolerance{T<:Real}
     merge::T
@@ -50,26 +39,21 @@ end
 """
     merge_coordinates(values, tol::GeometryTolerance{T}) -> Vector{T}
 
-Sort `values` and return a `Vector{T}` in which neighbouring entries
-differing by at most `tol.merge` have been collapsed to their first
-representative. The result is the canonical per-axis coordinate set used
-to build admissible integration intervals in `intersections.jl`: two
-participating meshes' element-boundary coordinates that are
-indistinguishable up to `tol.merge` produce a single shared interval
-rather than a sliver.
+Sort `values` and return a `Vector{T}` in which neighbouring entries differing by at most `tol.merge` have been
+collapsed to their first representative. The result is the canonical per-axis coordinate set used to build admissible
+integration intervals in `intersections.jl`: two participating meshes' element-boundary coordinates that are
+indistinguishable up to `tol.merge` produce a single shared interval rather than a sliver.
 
-Stable, allocation-light, single-pass after the sort. `values` may be any
-iterable of reals; the sorted working copy is the only allocation — the
-merge dedups in place into its own prefix.
+Stable, allocation-light, single-pass after the sort. `values` may be any iterable of reals; the sorted working copy is
+the only allocation — the merge dedups in place into its own prefix.
 """
 function merge_coordinates(values, tol::GeometryTolerance{T}) where {T}
     sorted = sort!(T[convert(T, value) for value in values])
     isempty(sorted) && return sorted
 
-    # Dedup ascending neighbours in place: keep `sorted[i]` only when it
-    # separates from the last kept representative `sorted[n]` by more than
-    # `tol.merge`. `sorted` is ascending, so the gap is already non-negative
-    # and no `abs` is needed. Survivors are packed into the prefix `1:n`.
+    # Dedup ascending neighbours in place: keep `sorted[i]` only when it separates from the last kept representative
+    # `sorted[n]` by more than `tol.merge`. `sorted` is ascending, so the gap is already non-negative and no `abs` is
+    # needed. Survivors are packed into the prefix `1:n`.
     n = 1
     @inbounds for i in 2:length(sorted)
         if sorted[i] - sorted[n] > tol.merge
@@ -85,27 +69,21 @@ end
     box(lower, upper)
     box(center; halfwidth)
 
-Axis-aligned physical box in `D` dimensions, represented by its lower and
-upper corner coordinates. Coordinates are stored as `SVector{D,T}` and the
-constructor enforces the non-degenerate invariant `lower[i] < upper[i]`
-on every axis — every region the assembly hot loop sees is a proper
-`D`-cube with positive volume.
+Axis-aligned physical box in `D` dimensions, represented by its lower and upper corner coordinates. Coordinates are
+stored as `SVector{D,T}` and the constructor enforces the non-degenerate invariant `lower[i] < upper[i]` on every axis —
+every region the assembly hot loop sees is a proper `D`-cube with positive volume.
 
 Constructors:
 
-  - `box(lower, upper)` — corner-to-corner. Accepts `NTuple{D,<:Real}`
-    or `SVector{D,<:Real}` corners; the scalar type is promoted from
-    the inputs.
-  - `box(center; halfwidth)` — centered form. `center` is a point;
-    `halfwidth` may be a scalar (isotropic) or a `D`-tuple / `SVector`
-    (anisotropic) of half-edge-lengths. Equivalent to
+  - `box(lower, upper)` — corner-to-corner. Accepts `NTuple{D,<:Real}` or `SVector{D,<:Real}` corners; the scalar type
+    is promoted from the inputs.
+  - `box(center; halfwidth)` — centered form. `center` is a point; `halfwidth` may be a scalar (isotropic) or a
+    `D`-tuple / `SVector` (anisotropic) of half-edge-lengths. Equivalent to
     `box(center − halfwidth, center + halfwidth)`.
 
-Geometry consumers never reach into boxes through `x`/`y`/`z` field names;
-they iterate over `1:D` and rely on the dimension-generic
-[`dimension`](@ref), [`edge_lengths`](@ref), [`volume`](@ref),
-[`center`](@ref), [`contains_point`](@ref), and
-[`reference_to_physical`](@ref) / [`physical_to_reference`](@ref) maps.
+Geometry consumers never reach into boxes through `x`/`y`/`z` field names; they iterate over `1:D` and rely on the
+dimension-generic [`dimension`](@ref), [`edge_lengths`](@ref), [`volume`](@ref), [`center`](@ref),
+[`contains_point`](@ref), and [`reference_to_physical`](@ref) / [`physical_to_reference`](@ref) maps.
 """
 struct AxisBox{D,T<:Real}
     lower::SVector{D,T}
@@ -127,17 +105,15 @@ end
     box(lower, upper) -> AxisBox
     box(center; halfwidth) -> AxisBox
 
-Construct an [`AxisBox`](@ref), the dimension-generic axis-aligned box used
-throughout the package.
+Construct an [`AxisBox`](@ref), the dimension-generic axis-aligned box used throughout the package.
 
-  - `box(lower, upper)` takes corner coordinates as an `NTuple{D,<:Real}` or
-    `SVector{D,<:Real}`; the scalar type is promoted from the inputs.
-  - `box(center; halfwidth)` takes a center point and a `halfwidth` that is
-    either a scalar (isotropic) or a `D`-tuple / `SVector` (anisotropic). It
-    is equivalent to `box(center .- halfwidth, center .+ halfwidth)`.
+  - `box(lower, upper)` takes corner coordinates as an `NTuple{D,<:Real}` or `SVector{D,<:Real}`; the scalar type is
+    promoted from the inputs.
+  - `box(center; halfwidth)` takes a center point and a `halfwidth` that is either a scalar (isotropic) or a `D`-tuple /
+    `SVector` (anisotropic). It is equivalent to `box(center .- halfwidth, center .+ halfwidth)`.
 
-See [`AxisBox`](@ref) for the stored representation and the non-degenerate
-`lower[i] < upper[i]` invariant the constructor enforces.
+See [`AxisBox`](@ref) for the stored representation and the non-degenerate `lower[i] < upper[i]` invariant the
+constructor enforces.
 """
 box(lower::NTuple{D,<:Real}, upper::NTuple{D,<:Real}) where {D} = box(SVector(lower), SVector(upper))
 
@@ -155,49 +131,43 @@ end
 """
     dimension(b::AxisBox) -> Int
 
-Spatial dimension `D` of the box, recovered from its static type so the
-result is a compile-time constant whenever `D` is statically known.
+Spatial dimension `D` of the box, recovered from its static type so the result is a compile-time constant whenever `D`
+is statically known.
 """
 dimension(::AxisBox{D}) where {D} = D
 
 """
     edge_lengths(b::AxisBox) -> SVector{D,T}
 
-Per-axis edge lengths, `b.upper − b.lower`. Stored as an `SVector` so
-downstream Jacobian and gradient-scaling computations stay stack-allocated.
+Per-axis edge lengths, `b.upper − b.lower`. Stored as an `SVector` so downstream Jacobian and gradient-scaling
+computations stay stack-allocated.
 """
 edge_lengths(b::AxisBox{D,T}) where {D,T} = b.upper - b.lower
 
 """
     volume(b::AxisBox) -> T
 
-Geometric measure of the box: product of the per-axis edge lengths. In
-`D` dimensions this is the `D`-cube volume. Used by the reference-to-
-physical Jacobian `vol(b) / 2ᴰ` and by the small-overlap diagnostics in
-`intersections.jl`.
+Geometric measure of the box: product of the per-axis edge lengths. In `D` dimensions this is the `D`-cube volume. Used
+by the reference-to- physical Jacobian `vol(b) / 2ᴰ` and by the small-overlap diagnostics in `intersections.jl`.
 """
 volume(b::AxisBox) = prod(edge_lengths(b))
 
 """
     center(b::AxisBox) -> SVector{D}
 
-Geometric center of the box, `(b.lower + b.upper) / 2`. Used to construct
-midpoint coverage queries (see `_parents_covering` in `intersections.jl`)
-and to build the reference-to-physical affine map below.
+Geometric center of the box, `(b.lower + b.upper) / 2`. Used to construct midpoint coverage queries (see
+`_parents_covering` in `intersections.jl`) and to build the reference-to-physical affine map below.
 """
 center(b::AxisBox) = (b.lower + b.upper) / 2
 
-# The 2ᴰ children of one bisection of `b` on every axis, ordered by the
-# lexicographic bit pattern that selects `lower` (bit 0) or the center (bit 1)
-# per axis — the same enumeration shape `_classify_box` and the implicit
-# kernel's subdivision use, hoisted here so a third consumer need not repeat it.
+# The 2ᴰ children of one bisection of `b` on every axis, ordered by the lexicographic bit pattern that selects `lower`
+# (bit 0) or the center (bit 1) per axis — the same enumeration shape `_classify_box` and the implicit kernel's
+# subdivision use, hoisted here so a third consumer need not repeat it.
 #
-# Returns `nothing` when the bisection would be degenerate. On a box whose
-# extent has reached the floating-point floor the midpoint coincides with a
-# bound on some axis, and `AxisBox`'s strict `lower[i] < upper[i]` invariant
-# would reject the child; the caller stops subdividing instead. The guard
-# mirrors `_bisect` in `implicit.jl`, which halts on the same condition rather
-# than looping on a midpoint that no longer moves.
+# Returns `nothing` when the bisection would be degenerate. On a box whose extent has reached the floating-point floor
+# the midpoint coincides with a bound on some axis, and `AxisBox`'s strict `lower[i] < upper[i]` invariant would reject
+# the child; the caller stops subdividing instead. The guard mirrors `_bisect` in `implicit.jl`, which halts on the same
+# condition rather than looping on a midpoint that no longer moves.
 function _box_children(b::AxisBox{D,T}) where {D,T}
     c = center(b)
     all(d -> b.lower[d] < c[d] < b.upper[d], 1:D) || return nothing
@@ -209,9 +179,8 @@ function _box_children(b::AxisBox{D,T}) where {D,T}
     end
 end
 
-# Strict containment without tolerance: a point lies in the box iff every
-# coordinate satisfies `lower[i] ≤ x[i] ≤ upper[i]`. Use `contains_point`
-# instead when the query is geometrically motivated and a positive
+# Strict containment without tolerance: a point lies in the box iff every coordinate satisfies
+# `lower[i] ≤ x[i] ≤ upper[i]`. Use `contains_point` instead when the query is geometrically motivated and a positive
 # `GeometryTolerance.contain` is in scope.
 Base.in(point::PointLike{D}, b::AxisBox{D,T}) where {D,T} = all(b.lower[i] <= point[i] <= b.upper[i] for i in 1:D)
 
@@ -219,31 +188,26 @@ Base.in(point::PointLike{D}, b::AxisBox{D,T}) where {D,T} = all(b.lower[i] <= po
     contains_point(point, b::AxisBox, tol::GeometryTolerance) -> Bool
 
 Tolerance-aware point-in-box query: `point` is considered inside `b` when
-`b.lower[i] − tol.contain ≤ point[i] ≤ b.upper[i] + tol.contain` on every
-axis. Used by cell lookup and integration-region construction to absorb
-floating-point noise at element boundaries. For an exact (tolerance-free)
+`b.lower[i] − tol.contain ≤ point[i] ≤ b.upper[i] + tol.contain` on every axis. Used by cell lookup and
+integration-region construction to absorb floating-point noise at element boundaries. For an exact (tolerance-free)
 query use `point in b`.
 """
 function contains_point(point::PointLike{D}, b::AxisBox{D,T}, tol::GeometryTolerance{T}) where {D,T}
     return all(b.lower[i] - tol.contain <= point[i] <= b.upper[i] + tol.contain for i in 1:D)
 end
 
-# Structural equality on the corner coordinates. Floating-point exactness is
-# acceptable here because every box this is asked about carries coordinates
-# reproduced bit-for-bit by one deterministic construction — the same
-# user-supplied corners, the mesh axes of `_mesh_axes` in `mesh.jl`, or the
-# canonicalised region coordinates of `merge_coordinates` — never two
-# independently rounded paths to the "same" corner.
+# Structural equality on the corner coordinates. Floating-point exactness is acceptable here because every box this is
+# asked about carries coordinates reproduced bit-for-bit by one deterministic construction — the same user-supplied
+# corners, the mesh axes of `_mesh_axes` in `mesh.jl`, or the canonicalised region coordinates of `merge_coordinates` —
+# never two independently rounded paths to the "same" corner.
 Base.:(==)(a::AxisBox{D}, b::AxisBox{D}) where {D} = a.lower == b.lower && a.upper == b.upper
 
 """
     box_intersection(a::AxisBox{D,T}, b::AxisBox{D,T}) -> Union{AxisBox{D,T},Nothing}
 
-Component-wise intersection of two boxes: per-axis `max(a.lower, b.lower)`
-and `min(a.upper, b.upper)`. Returns the resulting box when the
-intersection has strictly positive measure on every axis, and `nothing`
-otherwise — degenerate (zero-volume) intersections are reported as "no
-overlap" rather than as a flat box. This mirrors the constructor's
+Component-wise intersection of two boxes: per-axis `max(a.lower, b.lower)` and `min(a.upper, b.upper)`. Returns the
+resulting box when the intersection has strictly positive measure on every axis, and `nothing` otherwise — degenerate
+(zero-volume) intersections are reported as "no overlap" rather than as a flat box. This mirrors the constructor's
 non-degeneracy invariant on `AxisBox`.
 """
 function box_intersection(a::AxisBox{D,T}, b::AxisBox{D,T}) where {D,T}
@@ -255,11 +219,9 @@ end
 """
     is_inside(inner::AxisBox{D,T}, outer::AxisBox{D,T}, tol=GeometryTolerance(T)) -> Bool
 
-Tolerance-aware containment of one box inside another: every corner of
-`inner` lies inside `outer` up to `tol.contain` on each axis. Used to
-validate overlay placement, since the `overlay(...)` constructor requires
-the overlay domain to lie inside the space's bounding box `V.domain` (not
-inside an immersed `Ω` — an overlay may cover fictitious material).
+Tolerance-aware containment of one box inside another: every corner of `inner` lies inside `outer` up to `tol.contain`
+on each axis. Used to validate overlay placement, since the `overlay(...)` constructor requires the overlay domain to
+lie inside the space's bounding box `V.domain` (not inside an immersed `Ω` — an overlay may cover fictitious material).
 """
 function is_inside(inner::AxisBox{D,T}, outer::AxisBox{D,T}, tol::GeometryTolerance{T}=GeometryTolerance(T)) where {D,T}
     return all(inner.lower[i] >= outer.lower[i] - tol.contain && inner.upper[i] <= outer.upper[i] + tol.contain
@@ -269,14 +231,12 @@ end
 """
     reference_to_physical(b::AxisBox{D,T}, ξ) -> SVector{D,T}
 
-Map a reference-cube coordinate `ξ ∈ [−1, 1]ᴰ` to the corresponding
-physical point in `b` via the affine map
+Map a reference-cube coordinate `ξ ∈ [−1, 1]ᴰ` to the corresponding physical point in `b` via the affine map
 
     x = (b.lower + b.upper) / 2 + (b.upper − b.lower) / 2 ∘ ξ
 
-with `∘` the per-axis (Hadamard) product. The constant Jacobian determinant
-is `vol(b) / 2ᴰ`, which is the factor every region quadrature rule
-multiplies its reference weights by in the assembly hot loop.
+with `∘` the per-axis (Hadamard) product. The constant Jacobian determinant is `vol(b) / 2ᴰ`, which is the factor every
+region quadrature rule multiplies its reference weights by in the assembly hot loop.
 """
 function reference_to_physical(b::AxisBox{D,T}, xi::PointLike{D}) where {D,T}
     xi_vec = SVector{D,T}(xi)
@@ -286,14 +246,13 @@ end
 """
     physical_to_reference(b::AxisBox{D,T}, x) -> SVector{D,T}
 
-Inverse of [`reference_to_physical`](@ref): map a physical point `x ∈ b`
-back to its reference-cube coordinate `ξ ∈ [−1, 1]ᴰ`,
+Inverse of [`reference_to_physical`](@ref): map a physical point `x ∈ b` back to its reference-cube coordinate
+`ξ ∈ [−1, 1]ᴰ`,
 
     ξ = (2 x − b.lower − b.upper) / (b.upper − b.lower)
 
-with the division taken per axis. Used to rebase region boxes into parent
-reference frames during integration-region construction and to evaluate
-basis functions at arbitrary physical points during post-processing.
+with the division taken per axis. Used to rebase region boxes into parent reference frames during integration-region
+construction and to evaluate basis functions at arbitrary physical points during post-processing.
 """
 function physical_to_reference(b::AxisBox{D,T}, x::PointLike{D}) where {D,T}
     x_vec = SVector{D,T}(x)

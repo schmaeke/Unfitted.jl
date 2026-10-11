@@ -1,13 +1,10 @@
-# Tests for nested refinement ladders: declaration, per-level activation, and
-# cross-level cell mapping.
+# Tests for nested refinement ladders: declaration, per-level activation, and cross-level cell mapping.
 #
-# The property the ladder exists to guarantee is that covered-mode pruning is
-# *lossless* — that the reduced stack spans exactly what the unreduced one
-# spans. Rank alone cannot see the failure: off the nested manifold the reduced
-# operator is still full rank at a healthy condition number, which is what makes
-# the failure silent in the first place. Every losslessness check below therefore
-# compares against the same geometry with leaf semantics switched off,
-# and asserts `size(A_reduced, 1) == rank(A_unreduced)`.
+# The property the ladder exists to guarantee is that covered-mode pruning is *lossless* — that the reduced stack spans
+# exactly what the unreduced one spans. Rank alone cannot see the failure: off the nested manifold the reduced operator
+# is still full rank at a healthy condition number, which is what makes the failure silent in the first place. Every
+# losslessness check below therefore compares against the same geometry with leaf semantics switched off, and asserts
+# `size(A_reduced, 1) == rank(A_unreduced)`.
 
 using BasicBSpline
 using LinearAlgebra
@@ -15,11 +12,10 @@ using LinearAlgebra
 const LADDER_OMEGA = box((0.0, 0.0), (1.0, 1.0))
 ladder_bc() = [dirichlet(0.0; on=boundary(:all))]
 
-# Gram matrix of the active basis: rank equals the number of active dofs iff the
-# retained functions are linearly independent. `prune = false` is `prepare`'s
-# documented diagnostic — the same geometry with leaf semantics switched off,
-# which is what the reduced space is supposed to span, and what this file
-# measures every losslessness claim against.
+# Gram matrix of the active basis: rank equals the number of active dofs iff the retained functions are linearly
+# independent. `prune = false` is `prepare`'s documented diagnostic — the same geometry with leaf semantics switched
+# off, which is what the reduced space is supposed to span, and what this file measures every losslessness claim
+# against.
 function gram(V; prune::Bool=true)
     m = prepare(mass(V); prune=prune)
     assemble!(m)
@@ -51,8 +47,8 @@ end
 end
 
 @testset "covered-mode pruning on a ladder is lossless" begin
-    # The feature, in one assertion. A ladder refined over a block of base cells
-    # sheds modes; the reduced space must still span the unreduced one.
+    # The feature, in one assertion. A ladder refined over a block of base cells sheds modes; the reduced space must
+    # still span the unreduced one.
     for depth in 1:3
         V = ladder(LADDER_OMEGA; cells=4, order=3, depth=depth, splits=2)
         spec = [k => overlapping_cells(V, [CartesianIndex(1, 1), CartesianIndex(2, 2)]; from=1, to=k)
@@ -65,8 +61,8 @@ end
 end
 
 @testset "a non-nested stack is NOT lossless — the failure the ladder prevents" begin
-    # 3 overlay cells over a 2-base-cell span is not an integer multiple, so the
-    # levels do not nest and `:coverage` removes modes nothing reproduces.
+    # 3 overlay cells over a 2-base-cell span is not an integer multiple, so the levels do not nest and `:coverage`
+    # removes modes nothing reproduces.
     V = overlay(space(LADDER_OMEGA; cells=4, order=3), box((0.25, 0.25), (0.75, 0.75)); cells=3)
     @test !is_nested(V)
     @test size(gram(V), 1) < rank(gram(V; prune=false))
@@ -77,8 +73,8 @@ end
 end
 
 @testset "a mode covered by two different levels is retained" begin
-    # Split cover: two levels each cover part of a mode's stencil, so neither
-    # reproduces it. `:coverage` must not fire on the union.
+    # Split cover: two levels each cover part of a mode's stencil, so neither reproduces it. `:coverage` must not fire
+    # on the union.
     V = ladder(LADDER_OMEGA; cells=4, order=3, depth=2, splits=2)
     left = falses(8, 8)
     left[1:4, 1:4] .= true                                 # level 2 over base (1:2, 1:2)
@@ -89,26 +85,23 @@ end
 end
 
 @testset "a lower-order cover still sheds — that is the point of the rule" begin
-    # Covered-mode pruning is not a claim that the cover reproduces what it removes;
-    # that is the dedup half's job. It is an opt-in trade: over a region a finer
-    # level resolves, the coarse cell's high-order modes buy almost nothing in L²
-    # and carry the oscillation. A high-order base under a low-order fine overlay
-    # is the configuration the rule exists for, so it must still fire there.
+    # Covered-mode pruning is not a claim that the cover reproduces what it removes; that is the dedup half's job. It is
+    # an opt-in trade: over a region a finer level resolves, the coarse cell's high-order modes buy almost nothing in L²
+    # and carry the oscillation. A high-order base under a low-order fine overlay is the configuration the rule exists
+    # for, so it must still fire there.
     coarse_cover = overlay(space(LADDER_OMEGA; cells=4, order=3), LADDER_OMEGA; cells=8, order=1)
     @test is_nested(coarse_cover)
     @test diagnostics(prepare(mass(coarse_cover))).reduced_mode_counts[1] > 0
     equal_order = overlay(space(LADDER_OMEGA; cells=4, order=3), LADDER_OMEGA; cells=8, order=3)
     @test diagnostics(prepare(mass(equal_order))).reduced_mode_counts[1] > 0
-    # At equal order the cover does reproduce what it displaces, so the reduction
-    # is lossless. At lower order it is not, and that is the documented trade —
-    # `prepare(mass(V); prune=false)` is how this file switches it off.
+    # At equal order the cover does reproduce what it displaces, so the reduction is lossless. At lower order it is not,
+    # and that is the documented trade — `prepare(mass(V); prune=false)` is how this file switches it off.
     @test lossless(equal_order)
 end
 
 @testset "activation is unconstrained between levels" begin
-    # None of these is required to be hierarchy-consistent, and all are
-    # admissible. Rank is asserted; conditioning is not, because a mask boundary
-    # that cuts across the level below legitimately degrades it.
+    # None of these is required to be hierarchy-consistent, and all are admissible. Rank is asserted; conditioning is
+    # not, because a mask boundary that cuts across the level below legitimately degrades it.
     V = ladder(LADDER_OMEGA; cells=8, order=3, depth=3, splits=2)
     skip = falses(64, 64)
     skip[29:36, 29:36] .= true                             # level 4 alone, 2 and 3 dormant
@@ -143,8 +136,8 @@ end
 end
 
 @testset "overlapping_cells respects a level that does not span the domain" begin
-    # A sub-box overlay: cells of the base outside the overlay must map to
-    # nothing, not be credited to the overlay's edge cell.
+    # A sub-box overlay: cells of the base outside the overlay must map to nothing, not be credited to the overlay's
+    # edge cell.
     V = overlay(space(LADDER_OMEGA; cells=8, order=3), box((0.25, 0.25), (0.75, 0.75)); cells=8)
     corner = falses(8, 8)
     corner[1, 1] = true                                    # base cell [0, 0.125]², outside
@@ -159,9 +152,8 @@ end
 end
 
 @testset "cell mapping is exact away from the unit scale" begin
-    # The mapping must not depend on an absolute tolerance: a domain far from the
-    # origin has ulps larger than one, and a domain of small extent has cells
-    # smaller than the geometry tolerance.
+    # The mapping must not depend on an absolute tolerance: a domain far from the origin has ulps larger than one, and a
+    # domain of small extent has cells smaller than the geometry tolerance.
     for dom in
         (box((1e10, 1e10), (1e10 + 1.0, 1e10 + 1.0)), box((0.0, 0.0), (1e-7, 1e-7)), box((-3.0, -7.0), (-1.0, -5.0)))
         V = ladder(dom; cells=4, order=2, depth=2, splits=2, tolerance=GeometryTolerance(Float64; merge=1e-30))
@@ -175,20 +167,17 @@ end
 end
 
 @testset "levels share their node coordinates on a non-dyadic domain" begin
-    # The cross-level map compares node coordinates with no tolerance, so a
-    # ladder is only nested if its levels share their nodes bit for bit. On an
-    # extent that is not a power of two they did not: `_mesh_axes` scaled before
-    # dividing, so each level rounded a different product, and on [0, 0.7] in
-    # three cells refined by three the base axis ended one ulp short of 0.7 and
-    # its cells claimed 4, 4 and 3 fine cells instead of 3 each.
+    # The cross-level map compares node coordinates with no tolerance, so a ladder is only nested if its levels share
+    # their nodes bit for bit. On an extent that is not a power of two they did not: `_mesh_axes` scaled before
+    # dividing, so each level rounded a different product, and on [0, 0.7] in three cells refined by three the base axis
+    # ended one ulp short of 0.7 and its cells claimed 4, 4 and 3 fine cells instead of 3 each.
     V = ladder(box((0.0,), (0.7,)); cells=3, depth=1, splits=3)
     @test V.levels[1].mesh.axes[1][end] == 0.7
     @test [Unfitted._cell_block(V, 1, 2, CartesianIndex(i)) for i in 1:3] ==
           [CartesianIndices((1:3,)), CartesianIndices((4:6,)), CartesianIndices((7:9,))]
 
-    # Every node of a level is a node of the level above it, bit for bit, every
-    # axis ends exactly on the domain's corners, and the cross-level map gives
-    # each coarse cell exactly its `splits` block and each fine cell exactly one
+    # Every node of a level is a node of the level above it, bit for bit, every axis ends exactly on the domain's
+    # corners, and the cross-level map gives each coarse cell exactly its `splits` block and each fine cell exactly one
     # parent.
     function nests_exactly(V::Unfitted.Space{D}) where {D}
         ok = true
@@ -212,16 +201,16 @@ end
         return ok
     end
 
-    # A sweep over offsets, extents, base counts and split factors in 1D, where
-    # the scale-first order mis-nested a large share of the combinations.
+    # A sweep over offsets, extents, base counts and split factors in 1D, where the scale-first order mis-nested a large
+    # share of the combinations.
     failures = 0
     for lo in (0.0, 0.1, -0.3), extent in (0.7, 0.3, 1.1), cells in 1:4, splits in 2:5
         failures += !nests_exactly(ladder(box((lo,), (lo + extent,)); cells=cells, depth=2, splits=splits))
     end
     @test failures == 0
 
-    # Anisotropic and per-level in 2D, and what a user sees: a depth map refines
-    # a base cell across exactly its own child blocks.
+    # Anisotropic and per-level in 2D, and what a user sees: a depth map refines a base cell across exactly its own
+    # child blocks.
     V2 = ladder(box((0.1, -0.3), (0.8, 2.6)); cells=(3, 5), depth=2, splits=[(3, 2), (2, 3)])
     @test nests_exactly(V2)
     d = zeros(Int, 3, 5)
@@ -255,11 +244,9 @@ end
 end
 
 @testset "documented shapes: base active=, selection shapes, array over pair, vacuous nesting" begin
-    # Four shapes the docstrings promise and nothing exercised. The base-level
-    # `active =` one is why `depth_masks` names only the overlay levels: a base
-    # cell at depth 0 is one no overlay refines, not one the base drops, and an
-    # array form that spoke for the base at all would activate the very cells the
-    # caller deactivated.
+    # Four shapes the docstrings promise and nothing exercised. The base-level `active =` one is why `depth_masks` names
+    # only the overlay levels: a base cell at depth 0 is one no overlay refines, not one the base drops, and an array
+    # form that spoke for the base at all would activate the very cells the caller deactivated.
     m = trues(4, 4)
     m[1, 1] = false
     V = ladder(LADDER_OMEGA; cells=4, order=2, depth=1, splits=2, active=m)
@@ -280,18 +267,16 @@ end
     P = adapt(L, 2 => trues(8, 8))
     @test !any(active_cells(adapt(P, zeros(Int, 4, 4)); level=2))
 
-    # `is_nested` passes vacuously where the finer level's box contains no node
-    # of the level below, which its docstring states and no test asserted.
+    # `is_nested` passes vacuously where the finer level's box contains no node of the level below, which its docstring
+    # states and no test asserted.
     @test is_nested(overlay(space(LADDER_OMEGA; cells=4, order=2), box((0.3, 0.3), (0.45, 0.45)); cells=3))
 end
 
 @testset "the per-cell block and the whole-level map are the same rule" begin
-    # `overlapping_cells` answers for a selection by walking the destination
-    # level; `_cell_block` answers for one cell by binary search, which is what
-    # the adaptivity verbs ask and what makes a mark cost microseconds instead of
-    # milliseconds. The two must agree everywhere, in both directions, including
-    # on a stack that is neither nested nor aligned nor isotropic — and including
-    # the empty answer a level whose box misses the cell must give.
+    # `overlapping_cells` answers for a selection by walking the destination level; `_cell_block` answers for one cell
+    # by binary search, which is what the adaptivity verbs ask and what makes a mark cost microseconds instead of
+    # milliseconds. The two must agree everywhere, in both directions, including on a stack that is neither nested nor
+    # aligned nor isotropic — and including the empty answer a level whose box misses the cell must give.
     V = overlay(overlay(space(LADDER_OMEGA; cells=4, order=2), box((0.3, 0.1), (0.8, 0.9)); cells=3),
                 box((0.15, 0.55), (0.65, 0.95)); cells=5)
     @test !is_nested(V)
@@ -330,9 +315,8 @@ end
 end
 
 @testset "adapt takes a depth map in 1D" begin
-    # `depth_masks` used to select the base cells with `findall`, which on a
-    # `Vector` returns plain `Int` indices rather than `CartesianIndex{1}`, and
-    # `overlapping_cells` rejected them: the array form threw on every 1D ladder.
+    # `depth_masks` used to select the base cells with `findall`, which on a `Vector` returns plain `Int` indices rather
+    # than `CartesianIndex{1}`, and `overlapping_cells` rejected them: the array form threw on every 1D ladder.
     V = ladder(box((0.0,), (1.0,)); cells=4, order=2, depth=2, splits=2)
     W = adapt(V, [0, 1, 2, 0])
     @test active_cells(W; level=1) == trues(4)               # the base is left alone
@@ -345,9 +329,8 @@ end
 end
 
 @testset "depth_masks pairs splat into adapt, and an all-active mask is no mask" begin
-    # `depth_masks` is the internal behind `adapt`'s array form and its result is
-    # documented as splatting straight into the pair form. That identity is the
-    # whole contract, so assert it rather than the shape.
+    # `depth_masks` is the internal behind `adapt`'s array form and its result is documented as splatting straight into
+    # the pair form. That identity is the whole contract, so assert it rather than the shape.
     V = ladder(LADDER_OMEGA; cells=4, order=2, depth=2, splits=2)
     d = zeros(Int, 4, 4)
     d[2, 3] = 2
@@ -355,14 +338,13 @@ end
     by_pairs = adapt(V, Unfitted.depth_masks(V, d)...)
     @test all(k -> active_cells(by_array; level=k) == active_cells(by_pairs; level=k), 1:3)
 
-    # A ladder with no overlay names no level, and the array form is then the
-    # identity rather than an error.
+    # A ladder with no overlay names no level, and the array form is then the identity rather than an error.
     flat = ladder(LADDER_OMEGA; cells=4, order=2, depth=0)
     @test isempty(Unfitted.depth_masks(flat, zeros(Int, 4, 4)))
     @test active_cells(adapt(flat, zeros(Int, 4, 4)); level=1) == trues(4, 4)
 
-    # An all-active selection is stored as the no-mask default, whichever route
-    # it arrives by, so the coverage and dof fast paths survive a round trip.
+    # An all-active selection is stored as the no-mask default, whichever route it arrives by, so the coverage and dof
+    # fast paths survive a round trip.
     @test space(LADDER_OMEGA; cells=4, order=2, active=trues(4, 4)).levels[1].mask === nothing
     @test adapt(V, 2 => trues(8, 8)).levels[2].mask === nothing
     @test adapt(V, 2 => cell_indices(V; level=2)).levels[2].mask === nothing
@@ -412,9 +394,8 @@ end
     m3 = falses(32, 32)
     m3[13:20, 13:20] .= true
     target = adapted(model, 2 => m2, 3 => m3)
-    # Refining deepens coverage, so the parent's modes are eliminated in the
-    # target: the target basis is not a superset of the source's and `Rewire`
-    # has no counterpart to copy into.
+    # Refining deepens coverage, so the parent's modes are eliminated in the target: the target basis is not a superset
+    # of the source's and `Rewire` has no counterpart to copy into.
     @test_throws ArgumentError transfer(u, model, target; via=Rewire())
     moved_u = transfer(u, model, target; via=L2Projection())
     pts = [(x, y) for x in 0.05:0.1:0.95 for y in 0.05:0.1:0.95]
@@ -426,8 +407,8 @@ end
     V = ladder(box((-1.0, -1.0), (1.0, 1.0)); cells=8, order=2, depth=2, splits=2, physical=disc)
     model = prepare(mass(adapt(V, 3 => trues(32, 32))))
     before = diagnostics(model)
-    # Reading the pre-fold mask and writing it back must change nothing. Reading
-    # the *effective* mask would record the fictitious fold as user intent.
+    # Reading the pre-fold mask and writing it back must change nothing. Reading the *effective* mask would record the
+    # fictitious fold as user intent.
     same = adapted(model, 3 => active_cells(model; level=3, effective=false))
     @test diagnostics(same).active_unknowns == before.active_unknowns
     @test diagnostics(same).inactive_cell_counts == before.inactive_cell_counts
@@ -437,12 +418,10 @@ end
     @test diagnostics(model, solve!(model)).fit_failure_count == 0
 end
 
-# A cut-cell rule that counts the times it is asked for one. `cut_quadrature` is
-# the documented extension point (`physical_domain`), it sits behind exactly the
-# per-`(box, moment order)` memoisation the moment fit does, and the plan builds
-# it serially, so a plain `Ref` counter sees every fit and nothing else. The rule
-# returned is the region box's own tensor Gauss — the cheapest thing that
-# honours the contract, which is all a counting test needs.
+# A cut-cell rule that counts the times it is asked for one. `cut_quadrature` is the documented extension point
+# (`physical_domain`), it sits behind exactly the per-`(box, moment order)` memoisation the moment fit does, and the
+# plan builds it serially, so a plain `Ref` counter sees every fit and nothing else. The rule returned is the region
+# box's own tensor Gauss — the cheapest thing that honours the contract, which is all a counting test needs.
 function counting_cut_rule(fits::Ref{Int})
     return function (physical, region_box::Unfitted.AxisBox{D,T}, moment_order::NTuple{D,Int}) where {D,T}
         fits[] += 1
@@ -454,10 +433,9 @@ function counting_cut_rule(fits::Ref{Int})
 end
 
 @testset "derived models reuse the source's cut rules without evicting them" begin
-    # Cache *identity* is the wrong pin: a fork that shares its source's cache
-    # evicts the source's rules when it builds its own plan, which is the bug
-    # this asserts the absence of. What is observable — and what the reuse
-    # exists for — is that no derivation refits a rule the source already holds.
+    # Cache *identity* is the wrong pin: a fork that shares its source's cache evicts the source's rules when it builds
+    # its own plan, which is the bug this asserts the absence of. What is observable — and what the reuse exists for —
+    # is that no derivation refits a rule the source already holds.
     fits = Ref(0)
     disc = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.7; subcell_length_scale=0.25,
                            cut_quadrature=counting_cut_rule(fits))
@@ -468,16 +446,15 @@ end
     fits[] = 0
     target = adapted(model, 2 => trues(16, 16))
     @test fits[] == 0
-    # Its own cache, holding everything the source's does: both models are live
-    # from here, so neither may reduce the other's.
+    # Its own cache, holding everything the source's does: both models are live from here, so neither may reduce the
+    # other's.
     @test only(target.moment_fit_caches) !== only(model.moment_fit_caches)
     @test length(only(target.moment_fit_caches)) == length(only(model.moment_fit_caches))
 
-    # The alternation an hp loop runs. `estimate` builds an order-elevated twin,
-    # which needs a *second* moment order at the very same region boxes; the step
-    # that follows needs the first one back. Evicting a cache to exactly one
-    # plan's keys makes the two orders evict each other, so both refit every
-    # cycle — the cost the reuse was introduced to avoid.
+    # The alternation an hp loop runs. `estimate` builds an order-elevated twin, which needs a *second* moment order at
+    # the very same region boxes; the step that follows needs the first one back. Evicting a cache to exactly one plan's
+    # keys makes the two orders evict each other, so both refit every cycle — the cost the reuse was introduced to
+    # avoid.
     u = solve!(model)
     fits[] = 0
     estimate(model, u)
@@ -491,11 +468,10 @@ end
 end
 
 @testset "moved reuses the source's cut rules" begin
-    # `moved` is the third non-mutating derivation and goes through the same
-    # builder as `adapted` and `elevated`, so it reuses rules on the same terms:
-    # the boxes the move leaves bit-identical cost nothing, and the source keeps
-    # every rule it had. Ω = {x ≤ 0.55} cuts the x ∈ [0.5, 0.75] column of the
-    # base, which the one-cell overlay never touches at either position.
+    # `moved` is the third non-mutating derivation and goes through the same builder as `adapted` and `elevated`, so it
+    # reuses rules on the same terms: the boxes the move leaves bit-identical cost nothing, and the source keeps every
+    # rule it had. Ω = {x ≤ 0.55} cuts the x ∈ [0.5, 0.75] column of the base, which the one-cell overlay never touches
+    # at either position.
     fits = Ref(0)
     half = physical_domain(x -> x[1] - 0.55; lipschitz=1.0, subcell_length_scale=1.0e-3, max_depth=3,
                            cut_quadrature=counting_cut_rule(fits))
@@ -525,11 +501,10 @@ end
 end
 
 @testset "ladder composes with B-splines" begin
-    # The B-spline family reaches covered-mode pruning through its burial hooks for
-    # `_coverage_constraints!`, which dedup rather than shed bubbles; a nested
-    # stack is non-singular only because that dedup fires. `lossless` compares
-    # against the unreduced twin, which for this family is rank-deficient by
-    # exactly the deduped modes, so it is the right check here too.
+    # The B-spline family reaches covered-mode pruning through its burial hooks for `_coverage_constraints!`, which
+    # dedup rather than shed bubbles; a nested stack is non-singular only because that dedup fires. `lossless` compares
+    # against the unreduced twin, which for this family is rank-deficient by exactly the deduped modes, so it is the
+    # right check here too.
     V = ladder(LADDER_OMEGA; cells=8, order=3, depth=2, splits=2, basis=bspline())
     W = adapt(V, 2 => trues(16, 16))
     @test is_nested(W)

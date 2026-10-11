@@ -5,41 +5,32 @@ using Unfitted: cell_dofs, constraint_kind, is_active
 
 # Golden values for the dof layout of seven small configurations.
 #
-# WHY THIS FILE EXISTS. The dof layer — raw enumeration, the artificial boundary,
-# leaf-semantics pruning, physical-Dirichlet detection, the active numbering and the
-# linear-constraint pivots — is the object a rewrite of its data model must keep
-# exactly. The suite's other tests check properties of it (a count, a symmetry, an
-# error), and an aggregate such as an unknown count or an error norm can absorb a
-# renumbered, relabelled or re-pivoted dof and stay plausible. This instrument sees
-# the layout itself, integer by integer.
+# WHY THIS FILE EXISTS. The dof layer — raw enumeration, the artificial boundary, leaf-semantics pruning,
+# physical-Dirichlet detection, the active numbering and the linear-constraint pivots — is the object a rewrite of its
+# data model must keep exactly. The suite's other tests check properties of it (a count, a symmetry, an error), and an
+# aggregate such as an unknown count or an error norm can absorb a renumbered, relabelled or re-pivoted dof and stay
+# plausible. This instrument sees the layout itself, integer by integer.
 #
-# WHAT IT LOCKS. Per configuration, through the public accessors and the one pivot
-# rule assembly and `dof_value` share, and through nothing that names how a layout is
-# stored: every field's name, component count, offset and raw count; every raw key's
-# integers; every active cell's raw ids (`cell_dofs`), in local-basis order; the active
-# id of every (raw, component); the `constraint_kind` of every (raw, component); every
-# linear-constraint pivot's branches and weights, read through `_fold_pivot` with the
-# identity id map; and the model's `reduced_mode_counts` and active unknowns. A
-# rewrite that keeps the layout keeps this digest whatever it stores.
+# WHAT IT LOCKS. Per configuration, through the public accessors and the one pivot rule assembly and `dof_value` share,
+# and through nothing that names how a layout is stored: every field's name, component count, offset and raw count;
+# every raw key's integers; every active cell's raw ids (`cell_dofs`), in local-basis order; the active id of every
+# (raw, component); the `constraint_kind` of every (raw, component); every linear-constraint pivot's branches and
+# weights, read through `_fold_pivot` with the identity id map; and the model's `reduced_mode_counts` and active
+# unknowns. A rewrite that keeps the layout keeps this digest whatever it stores.
 #
-# WHAT IT LEAVES OUT. Constrained values: they come out of a LAPACK factorisation,
-# which is not bit-reproducible across machines. Pivot weights are quantised to
-# `round(Int64, w · 2³²)` for the same reason — a clamped trace row's weights are
-# floating-point quotients — while still separating any two weights that differ in a
-# meaningful digit.
+# WHAT IT LEAVES OUT. Constrained values: they come out of a LAPACK factorisation, which is not bit-reproducible across
+# machines. Pivot weights are quantised to `round(Int64, w · 2³²)` for the same reason — a clamped trace row's weights
+# are floating-point quotients — while still separating any two weights that differ in a meaningful digit.
 #
-# HOW IT LOCKS IT. A 64-bit FNV-1a checksum over the integers themselves, as in
-# `test_graded_golden.jl`, not through `Base.hash`, whose value carries no stability
-# guarantee across Julia versions. The helpers carry a `_dl_` prefix so the
-# single-process `Pkg.test` sees no redefinition of that file's `_mix`.
+# HOW IT LOCKS IT. A 64-bit FNV-1a checksum over the integers themselves, as in `test_graded_golden.jl`, not through
+# `Base.hash`, whose value carries no stability guarantee across Julia versions. The helpers carry a `_dl_` prefix so
+# the single-process `Pkg.test` sees no redefinition of that file's `_mix`.
 #
-# WHEN IT FAILS. Each configuration is its own testset, and its named assertions
-# (unknowns, pivots, reduced modes) run before its digest, so a failure names the
-# configuration and usually the quantity that moved. A moved digest with unchanged
-# named assertions means a key, a cell table, the numbering or a classification
-# moved. The values were written at the start of the dof-layout rewrite and are not
-# values to update casually: a change here is either the defect being hunted or a
-# deliberate change of the discrete space, and the commit that makes it says which.
+# WHEN IT FAILS. Each configuration is its own testset, and its named assertions (unknowns, pivots, reduced modes) run
+# before its digest, so a failure names the configuration and usually the quantity that moved. A moved digest with
+# unchanged named assertions means a key, a cell table, the numbering or a classification moved. The values were written
+# at the start of the dof-layout rewrite and are not values to update casually: a change here is either the defect being
+# hunted or a deliberate change of the discrete space, and the commit that makes it says which.
 
 const _DL_FNV_PRIME = 0x00000100000001b3
 const _DL_FNV_BASIS = 0xcbf29ce484222325
@@ -53,8 +44,8 @@ function _dl_mix(h::UInt64, x::Integer)
     return h
 end
 
-# `constraint_kind` as an integer. An unknown kind raises rather than hashing to an
-# arbitrary code, so a new classification cannot slip through as a digest change.
+# `constraint_kind` as an integer. An unknown kind raises rather than hashing to an arbitrary code, so a new
+# classification cannot slip through as a digest change.
 const _DL_KINDS = (:free, :dirichlet, :overlay, :coverage, :dedup, :mixed)
 function _dl_kind_code(kind::Symbol)
     code = findfirst(==(kind), _DL_KINDS)
@@ -62,19 +53,18 @@ function _dl_kind_code(kind::Symbol)
     return code
 end
 
-# The pivot of `raw`, if it is one, as `[(branch raw, weight)]` in expansion order.
-# The identity id map makes `_fold_pivot` hand back raw ids rather than active ids, so
-# the read is independent of the numbering and never touches a constrained value.
+# The pivot of `raw`, if it is one, as `[(branch raw, weight)]` in expansion order. The identity id map makes
+# `_fold_pivot` hand back raw ids rather than active ids, so the read is independent of the numbering and never touches
+# a constrained value.
 function _dl_pivot(dofs, raw::Integer)
     branches, pivot = Unfitted._fold_pivot((acc, g, w, v) -> push!(acc, (g, w)), Tuple{Int,Float64}[], dofs,
                                            (o, c) -> o, raw, 1)
     return pivot ? branches : nothing
 end
 
-# The digest of one prepared model, and the quantities its named assertions read.
-# Fields are visited in the system's order and each field's levels in its space's
-# order; `spaces` maps a field name to the space the field was prepared over, whose
-# level masks say which cells are active.
+# The digest of one prepared model, and the quantities its named assertions read. Fields are visited in the system's
+# order and each field's levels in its space's order; `spaces` maps a field name to the space the field was prepared
+# over, whose level masks say which cells are active.
 function _dl_digest(model)
     h = _DL_FNV_BASIS
     pivots = 0
@@ -136,9 +126,8 @@ end
 # The seven configurations: each a different way for the layout to be non-trivial.
 const _DL_U2 = box((0.0, 0.0), (1.0, 1.0))
 function _dl_configurations()
-    # 1. IL overlay with nonzero data on all faces but one. The overlay sits on the
-    #    corner where a Dirichlet face meets the excepted one, so detection must keep
-    #    the excepted face natural on both levels.
+    # 1. IL overlay with nonzero data on all faces but one. The overlay sits on the corner where a Dirichlet face meets
+    #    the excepted one, so detection must keep the excepted face natural on both levels.
     c1 = _dl_problem(overlay(space(_DL_U2; cells=6, order=3), box((0.0, 2 / 3), (1 / 3, 1.0)); cells=4, order=2),
                      [dirichlet(x -> 1.0 + x[1] * x[2]; on=boundary(:all; except=(axis=2, side=:upper)))])
     # 2. An adapted IL ladder: a corner refined to the bottom rung, graded.
@@ -150,19 +139,18 @@ function _dl_configurations()
     c3 = _dl_problem(overlay(space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=3, order=2),
                              box((0.0, 0.0, 0.0), (1 / 3, 1 / 3, 1 / 3)); cells=2, order=2),
                      [dirichlet(0.0; on=boundary(:all))])
-    # 4. A 2-component IL field: an `:except` condition on both components and a
-    #    component-2 condition on the excepted face, over an overlay on that face.
+    # 4. A 2-component IL field: an `:except` condition on both components and a component-2 condition on the excepted
+    #    face, over an overlay on that face.
     c4 = _dl_problem(overlay(space(_DL_U2; cells=4, order=2), box((0.5, 0.25), (1.0, 0.75)); cells=2, order=3),
                      [dirichlet(SVector(0.0, 0.0); on=boundary(:all; except=(axis=1, side=:upper))),
                       dirichlet(x -> 1.0 + x[2]; on=boundary(axis=1, side=:upper), component=2)]; components=2)
-    # 5. A clamped C¹ B-spline level under an L mask: the masked faces' trace rows
-    #    leave linear-constraint pivots.
+    # 5. A clamped C¹ B-spline level under an L mask: the masked faces' trace rows leave linear-constraint pivots.
     mask = trues(8, 8)
     mask[5:8, 5:8] .= false
     c5 = _dl_problem(space(_DL_U2; cells=8, order=3, basis=bspline(; continuity=1), active=mask),
                      [dirichlet(0.0; on=boundary(:all))])
-    # 6. A maximal B-spline base under a nested maximal cover: support selection on
-    #    the overlay, the B-spline dedup on the base.
+    # 6. A maximal B-spline base under a nested maximal cover: support selection on the overlay, the B-spline dedup on
+    #    the base.
     c6 = _dl_problem(overlay(space(_DL_U2; cells=8, order=3, basis=bspline()), box((0.25, 0.25), (0.75, 0.75)); cells=8,
                              order=3, basis=bspline()), [dirichlet(0.0; on=boundary(:all))])
     # 7. A 1D IL overlay with nonzero data at both ends.

@@ -1,8 +1,7 @@
 #!/usr/bin/env julia
-# Driver for the Unfitted BenchmarkTools suite. Activates the bench env, pins
-# OpenBLAS to one thread (so `Threads.@spawn` assembly workers do not contend
-# with BLAS), loads `suite.jl`, tunes once with a cached parameter file, runs
-# the suite, and dumps a timestamped JSON to `benchmarks/output/`.
+# Driver for the Unfitted BenchmarkTools suite. Activates the bench env, pins OpenBLAS to one thread (so
+# `Threads.@spawn` assembly workers do not contend with BLAS), loads `suite.jl`, tunes once with a cached parameter
+# file, runs the suite, and dumps a timestamped JSON to `benchmarks/output/`.
 #
 # Filter to a sub-tree with `UNFITTEDHP_BENCH_FILTER`, e.g.:
 #     UNFITTEDHP_BENCH_FILTER=scenarios/fcm_disk_small \

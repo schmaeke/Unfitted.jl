@@ -10,13 +10,13 @@ using LinearAlgebra
     @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1, max_depth=-1)
     @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1, target_residual=0.0)
     @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1, target_residual=-1.0)
-    # keep_fictitious keeps fully-fictitious cells active, so it needs α > 0 to
-    # give them quadrature; pairing it with the strict-cut path is singular.
+    # keep_fictitious keeps fully-fictitious cells active, so it needs α > 0 to give them quadrature; pairing it with
+    # the strict-cut path is singular.
     @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1, keep_fictitious=true, alpha=0.0)
     @test physical_domain(x -> x[1]; subcell_length_scale=0.1, keep_fictitious=true, alpha=1.0e-6).keep_fictitious
 
-    # A bare callable is auto-wrapped as a single leaf carrying the `lipschitz`
-    # keyword; the domain-level integration knobs live on the PhysicalDomain.
+    # A bare callable is auto-wrapped as a single leaf carrying the `lipschitz` keyword; the domain-level integration
+    # knobs live on the PhysicalDomain.
     p = physical_domain(x -> x[1]; lipschitz=1.0, subcell_length_scale=0.0625)
     @test p.geometry isa Unfitted.Leaf
     @test p.geometry.lipschitz == 1.0
@@ -36,18 +36,15 @@ using LinearAlgebra
 end
 
 @testset "physical_domain rejects a Lipschitz constant it cannot apply" begin
-    # Regression. `physical_domain(tree; lipschitz=L)` used to drop `L` on the
-    # floor: the keyword only ever reached the auto-wrap of a bare callable, so
-    # with a `LevelSet` argument it was neither applied nor validated. The leaf
-    # then ran uncertified, the kernel pruned it on any cell box whose corners
-    # miss its feature, and a hole smaller than the cell integrated away in
-    # silence — `:cut` classification, round-off fit residual, and 8 % too much
-    # volume (the certified/uncertified split itself is pinned in test_fcm.jl).
+    # Regression. `physical_domain(tree; lipschitz=L)` used to drop `L` on the floor: the keyword only ever reached the
+    # auto-wrap of a bare callable, so with a `LevelSet` argument it was neither applied nor validated. The leaf then
+    # ran uncertified, the kernel pruned it on any cell box whose corners miss its feature, and a hole smaller than the
+    # cell integrated away in silence — `:cut` classification, round-off fit residual, and 8 % too much volume (the
+    # certified/uncertified split itself is pinned in test_fcm.jl).
     phi = x -> 0.16 - hypot(x[1] - 0.25, x[2] - 0.25)   # Ω = the square minus a disc
 
-    # The combination that loses the certificate — a constant supplied for a
-    # tree with a leaf that carries none — is rejected, and the message names
-    # the remedy rather than the mistake.
+    # The combination that loses the certificate — a constant supplied for a tree with a leaf that carries none — is
+    # rejected, and the message names the remedy rather than the mistake.
     err = try
         physical_domain(leaf(phi); lipschitz=1.0, subcell_length_scale=0.1)
     catch e
@@ -59,18 +56,18 @@ end
     @test_throws ArgumentError physical_domain(setdiff(leaf(x -> hypot(x...) - 0.45; lipschitz=1.0), leaf(phi));
                                                lipschitz=1.0, subcell_length_scale=0.1)
 
-    # Positivity is checked on every path now, not only on the auto-wrap: the
-    # tree path used to accept a constant the callable path throws on.
+    # Positivity is checked on every path now, not only on the auto-wrap: the tree path used to accept a constant the
+    # callable path throws on.
     @test_throws ArgumentError physical_domain(leaf(phi); lipschitz=0.0, subcell_length_scale=0.1)
     @test_throws ArgumentError physical_domain(leaf(phi); lipschitz=-1.0, subcell_length_scale=0.1)
 
-    # What stays legal, because no information is lost. A tree whose leaves all
-    # carry their own constant is simply unaffected by the keyword…
+    # What stays legal, because no information is lost. A tree whose leaves all carry their own constant is simply
+    # unaffected by the keyword…
     both = intersect(leaf(x -> x[1] - 0.5; lipschitz=1.0), leaf(x -> x[2] - 0.5; lipschitz=2.0))
     @test physical_domain(both; lipschitz=1.0, subcell_length_scale=0.1).geometry === both
     @test physical_domain(leaf(phi; lipschitz=1.0); lipschitz=1.0, subcell_length_scale=0.1).geometry.lipschitz == 1.0
-    # …and the default `Inf` on an uncertified tree is the documented
-    # corner-sampling path, so it must not be caught by the new check.
+    # …and the default `Inf` on an uncertified tree is the documented corner-sampling path, so it must not be caught by
+    # the new check.
     @test isinf(physical_domain(leaf(phi); subcell_length_scale=0.1).geometry.lipschitz)
     @test isinf(physical_domain(leaf(phi); lipschitz=Inf, subcell_length_scale=0.1).geometry.lipschitz)
 end
@@ -105,8 +102,7 @@ end
 end
 
 @testset "classify_cell — CSG combinations" begin
-    # Annulus r ∈ [0.2, 0.45] about the origin: full in the ring, fictitious in
-    # the hole, cut across either rim.
+    # Annulus r ∈ [0.2, 0.45] about the origin: full in the ring, fictitious in the hole, cut across either rim.
     ann = setdiff(leaf(x -> hypot(x...) - 0.45; lipschitz=1.0), leaf(x -> hypot(x...) - 0.2; lipschitz=1.0))
     p = physical_domain(ann; subcell_length_scale=0.02)
     @test classify_cell(p, box((0.30, 0.0), (0.32, 0.02))) === :full
@@ -114,8 +110,8 @@ end
     @test classify_cell(p, box((0.44, 0.0), (0.50, 0.06))) === :cut
     @test classify_cell(p, box((0.18, 0.0), (0.24, 0.06))) === :cut
 
-    # Union: a box inside one disk classifies :full even where the other leaf is
-    # uncertain (the three-valued certificate short-circuits the union).
+    # Union: a box inside one disk classifies :full even where the other leaf is uncertain (the three-valued certificate
+    # short-circuits the union).
     uni = union(leaf(x -> hypot(x[1] - 0.3, x[2] - 0.3) - 0.2; lipschitz=1.0),
                 leaf(x -> hypot(x[1] - 0.7, x[2] - 0.7) - 0.2; lipschitz=1.0))
     pu = physical_domain(uni; subcell_length_scale=0.02)
@@ -124,9 +120,8 @@ end
 end
 
 @testset "CSG — levelset_value agrees in sign with membership (VTK contour)" begin
-    # The VTK level_set field uses levelset_value; a contour at 0 reproduces ∂Ω
-    # only if (levelset_value ≤ 0) ⇔ inside Ω for every CSG node — i.e. max/min/
-    # negate are the De Morgan duals of all/any/not. Check on a grid for union,
+    # The VTK level_set field uses levelset_value; a contour at 0 reproduces ∂Ω only if (levelset_value ≤ 0) ⇔ inside Ω
+    # for every CSG node — i.e. max/min/ negate are the De Morgan duals of all/any/not. Check on a grid for union,
     # complement, difference, and a nested tree.
     a = leaf(x -> hypot(x[1] - 0.35, x[2] - 0.5) - 0.25)
     b = leaf(x -> hypot(x[1] - 0.65, x[2] - 0.5) - 0.25)
@@ -138,17 +133,16 @@ end
         for i in 0:24, j in 0:24
             x = SVector(i / 24, j / 24)
             v = levelset_value(p, x)
-            # Agreement holds away from ∂Ω; exactly on a constituent boundary
-            # (value == 0, e.g. the y = 0.5 grid line) the contour and the
-            # strict `≤ 0` membership legitimately coincide in measure zero.
+            # Agreement holds away from ∂Ω; exactly on a constituent boundary (value == 0, e.g. the y = 0.5 grid line)
+            # the contour and the strict `≤ 0` membership legitimately coincide in measure zero.
             abs(v) > 1e-9 && @test (v <= 0) == Unfitted._inside(tree, x)
         end
     end
 end
 
 @testset "CSG — classify: union dominance, complement, n-ary intersection" begin
-    # Union short-circuit: a box that is certainly inside A but straddles B's rim
-    # (B uncertain) must still classify :full via AnyOf — the headline case.
+    # Union short-circuit: a box that is certainly inside A but straddles B's rim (B uncertain) must still classify
+    # :full via AnyOf — the headline case.
     a = leaf(x -> hypot(x[1] - 0.4, x[2] - 0.5) - 0.45; lipschitz=1.0)
     b = leaf(x -> hypot(x[1] - 0.6, x[2] - 0.5) - 0.3; lipschitz=1.0)
     pu = physical_domain(union(a, b); subcell_length_scale=0.02)
@@ -168,13 +162,11 @@ end
 end
 
 @testset "PhysicalDomain.target_residual drives integration_plan moment-fit" begin
-    # The default 1.0e-6 is a loose bound on the moment fit. The Saye kernel's
-    # moments are exact on graph-like cut cells and high-order on curved ones,
-    # so the achieved residual is set by the kernel, not by the target: a
-    # tighter target only triggers extra conditioning retries that cannot beat
-    # the kernel's curved-boundary approximation floor. The 2×2 base box
-    # [−1, 1]² is split 8×8 into 0.25-wide cells; subcell_length_scale here
-    # only bounds classifier/fallback subdivision, not moment accuracy.
+    # The default 1.0e-6 is a loose bound on the moment fit. The Saye kernel's moments are exact on graph-like cut cells
+    # and high-order on curved ones, so the achieved residual is set by the kernel, not by the target: a tighter target
+    # only triggers extra conditioning retries that cannot beat the kernel's curved-boundary approximation floor. The
+    # 2×2 base box [−1, 1]² is split 8×8 into 0.25-wide cells; subcell_length_scale here only bounds classifier/fallback
+    # subdivision, not moment accuracy.
     phi(x) = sqrt(x[1]^2 + x[2]^2) - 0.7
     omega = box((-1.0, -1.0), (1.0, 1.0))
 
@@ -193,8 +185,8 @@ end
     cut_tight = count(r -> r.quadrature.kind === :cut_fitted, plan_tight.regions)
     @test cut_loose == cut_tight > 0
 
-    # Both targets reach the same residual floor: it is set by the kernel's
-    # approximation of the curved boundary, which a tighter target cannot beat.
+    # Both targets reach the same residual floor: it is set by the kernel's approximation of the curved boundary, which
+    # a tighter target cannot beat.
     @test plan_loose.moment_fit_residual_max < 1.0e-5
     @test plan_tight.moment_fit_residual_max < 1.0e-5
 end
@@ -217,9 +209,8 @@ end
 @testset "classify_cell — corner sampling fallback" begin
     # phi(x) = x[1] − 0.5; Ω = left half.
     p = physical_domain(x -> x[1] - 0.5; lipschitz=Inf, subcell_length_scale=10.0, max_depth=0)
-    # With lipschitz=Inf the certificate never fires; sampling decides at depth 0.
-    # `subcell_length_scale=10` is far larger than the unit boxes used below, so
-    # the length-scale check never asks for subdivision either.
+    # With lipschitz=Inf the certificate never fires; sampling decides at depth 0. `subcell_length_scale=10` is far
+    # larger than the unit boxes used below, so the length-scale check never asks for subdivision either.
     @test classify_cell(p, box((0.0, 0.0), (0.4, 1.0))) === :full
     @test classify_cell(p, box((0.6, 0.0), (1.0, 1.0))) === :fictitious
     @test classify_cell(p, box((0.4, 0.0), (0.6, 1.0))) === :cut
@@ -263,10 +254,9 @@ end
 
 @testset "interior hole drops the expected cells" begin
     # 10×10 mesh of width 0.1 each. Disk hole at (0.5, 0.5) radius 0.2.
-    # Cells (5,5), (5,6), (6,5), (6,6) sit entirely inside the disk and
-    # should be classified :fictitious. Uses subcell_length_scale=1.0e-6, max_depth=2 + order=1 to
-    # keep the NNMF cost on the surrounding cut cells small — this test is
-    # about cell classification, not cut-quadrature accuracy.
+    # Cells (5,5), (5,6), (6,5), (6,6) sit entirely inside the disk and should be classified :fictitious. Uses
+    # subcell_length_scale=1.0e-6, max_depth=2 + order=1 to keep the NNMF cost on the surrounding cut cells small — this
+    # test is about cell classification, not cut-quadrature accuracy.
     omega = box((0.0, 0.0), (1.0, 1.0))
     hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0, subcell_length_scale=1.0e-6,
                            max_depth=2)
@@ -284,17 +274,14 @@ end
 end
 
 @testset "fictitious-cell fold drops the same cells as a manual mask" begin
-    # The cell-level fictitious fold deactivates exactly the cells a manual
-    # `active=…` mask would (same `active_cells`). The dof layouts differ by
-    # design, though. A geometry-blind mask eliminates every boundary mode on
-    # the active/inactive interface (the C⁰ overlay-constraint trace). The
-    # physical fold instead keeps the modes whose interface face is *fully
-    # fictitious*: they vanish on every physical face — so they cannot break
-    # continuity — and carry the surrounding cut cells' approximation up to ∂Ω.
-    # The fold therefore retains strictly more unknowns: here the 8 perimeter
-    # nodes around the 2×2 hole (a 3×3 node patch minus its interior node,
-    # which neither variant enumerates). (Matrix values differ regardless: cut
-    # cells use moment-fitted quadrature, the manual variant standard Gauss.)
+    # The cell-level fictitious fold deactivates exactly the cells a manual `active=…` mask would (same `active_cells`).
+    # The dof layouts differ by design, though. A geometry-blind mask eliminates every boundary mode on the
+    # active/inactive interface (the C⁰ overlay-constraint trace). The physical fold instead keeps the modes whose
+    # interface face is *fully fictitious*: they vanish on every physical face — so they cannot break continuity — and
+    # carry the surrounding cut cells' approximation up to ∂Ω. The fold therefore retains strictly more unknowns: here
+    # the 8 perimeter nodes around the 2×2 hole (a 3×3 node patch minus its interior node, which neither variant
+    # enumerates). (Matrix values differ regardless: cut cells use moment-fitted quadrature, the manual variant standard
+    # Gauss.)
     bc = dirichlet(0.0; on=boundary(:all))
     src = x -> sin(pi * x[1]) * sin(pi * x[2])
     omega = box((0.0, 0.0), (1.0, 1.0))
@@ -313,15 +300,14 @@ end
 end
 
 @testset "physical fold combines with user mask on overlay" begin
-    # User deactivates one overlay row; the physical fold drops cells fully
-    # outside Ω. The effective mask should be the intersection.
+    # User deactivates one overlay row; the physical fold drops cells fully outside Ω. The effective mask should be the
+    # intersection.
     bc = dirichlet(0.0; on=boundary(:all))
     omega = box((0.0, 0.0), (1.0, 1.0))
 
-    # phi(x) = x[1] − 0.495. Cells whose entire x-range is ≥ 0.495 become
-    # fictitious. Overlay cells of width 0.1 at axis-1 indices 3 and 4
-    # (covering 0.5–0.6 and 0.6–0.7) are entirely outside Ω; index 2
-    # (0.4–0.5) is :cut and kept active by the classifier.
+    # phi(x) = x[1] − 0.495. Cells whose entire x-range is ≥ 0.495 become fictitious. Overlay cells of width 0.1 at
+    # axis-1 indices 3 and 4 (covering 0.5–0.6 and 0.6–0.7) are entirely outside Ω; index 2 (0.4–0.5) is :cut and kept
+    # active by the classifier.
     p = physical_domain(x -> x[1] - 0.495; lipschitz=1.0, subcell_length_scale=1.0e-6, max_depth=2)
 
     V = overlay(space(omega; cells=(8, 8), order=1, physical=p), box((0.3, 0.3), (0.7, 0.7)); cells=(4, 4), order=1,
@@ -368,24 +354,20 @@ end
 end
 
 @testset "move! folds the user mask, not the mask the previous fold produced" begin
-    # The fictitious fold is an intersection (`active .& .!fictitious`), so
-    # applying it to its own output can only ever *shrink* the active set: a
-    # cell dropped because the overlay's old position put it outside Ω would
-    # stay dropped after a move that puts it wholly inside. `move!` therefore
-    # has to re-derive from the pre-fold problem, and the moved model must be
-    # indistinguishable from a fresh `prepare` at the destination box.
+    # The fictitious fold is an intersection (`active .& .!fictitious`), so applying it to its own output can only ever
+    # *shrink* the active set: a cell dropped because the overlay's old position put it outside Ω would stay dropped
+    # after a move that puts it wholly inside. `move!` therefore has to re-derive from the pre-fold problem, and the
+    # moved model must be indistinguishable from a fresh `prepare` at the destination box.
     #
-    # The geometry is chosen so the fold verdict genuinely differs between the
-    # two positions: Ω is a disk in the lower-left corner, `outside` misses it
-    # entirely and `inside` meets every overlay cell. Moving between two boxes
-    # that both overlap Ω shows nothing, because there the stale mask happens
-    # to be right at both ends.
+    # The geometry is chosen so the fold verdict genuinely differs between the two positions: Ω is a disk in the
+    # lower-left corner, `outside` misses it entirely and `inside` meets every overlay cell. Moving between two boxes
+    # that both overlap Ω shows nothing, because there the stale mask happens to be right at both ends.
     p = physical_domain(x -> hypot(x[1] - 0.25, x[2] - 0.25) - 0.28; lipschitz=1.0, subcell_length_scale=1 / 32,
                         max_depth=4)
     outside = box((0.55, 0.55), (0.95, 0.95))
     inside = box((0.05, 0.05), (0.45, 0.45))
-    # Stiffness + mass, so the operator is nonsingular without a Dirichlet
-    # condition and the comparison is over the raw assembled system.
+    # Stiffness + mass, so the operator is nonsingular without a Dirichlet condition and the comparison is over the raw
+    # assembled system.
     build = target -> begin
         V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=p), target; cells=(2, 2),
                     order=2)
@@ -399,8 +381,8 @@ end
     move!(model; level=2, to=inside)
     direct = build(inside)
 
-    # Guards the guard: if the destination did not free any overlay cell the
-    # assertions below would hold for the wrong reason.
+    # Guards the guard: if the destination did not free any overlay cell the assertions below would hold for the wrong
+    # reason.
     @test all(active_cells(direct; level=2))
     @test active_cells(model; level=2) == active_cells(direct; level=2)
     @test active_unknowns(model) == active_unknowns(direct)
@@ -416,9 +398,8 @@ end
 # --- Region-level classification and α-FCM ---
 
 @testset "α=1 + all-fictitious matches no-physical baseline" begin
-    # 1D, single cell, Ω = ∅ (phi=1 everywhere). With α=1 the region is
-    # :fictitious_alpha but the weight scale is 1, so the matrix matches the
-    # plain (no physical_domain) assembly.
+    # 1D, single cell, Ω = ∅ (phi=1 everywhere). With α=1 the region is :fictitious_alpha but the weight scale is 1, so
+    # the matrix matches the plain (no physical_domain) assembly.
     omega = box((0.0,), (1.0,))
     bc = dirichlet(0.0; on=boundary(:all))
 
@@ -456,16 +437,14 @@ end
 end
 
 @testset "α-FCM: cut-cell enrichment, and fictitious cells dropped by default" begin
-    # Ω = {x₁ ≤ 0.5}: the middle column of cells is CUT, the right column is
-    # fully fictitious.
+    # Ω = {x₁ ≤ 0.5}: the middle column of cells is CUT, the right column is fully fictitious.
     omega = box((0.0, 0.0), (1.0, 1.0))
     cut = leaf(x -> x[1] - 0.5; lipschitz=1.0)
     bc = dirichlet(0.0; on=boundary(:all))
     V_none = space(omega; cells=(3, 3), order=3)
 
-    # (1) keep_fictitious + α=1: every cell integrated at full weight, so the
-    #     assembly matches a plain no-physical model. This exercises the cut-cell
-    #     rule (1−α)·moment-fit ∪ α·tensor, which at α=1 must collapse to the
+    # (1) keep_fictitious + α=1: every cell integrated at full weight, so the assembly matches a plain no-physical
+    #     model. This exercises the cut-cell rule (1−α)·moment-fit ∪ α·tensor, which at α=1 must collapse to the
     #     full-cell tensor — a broken cut-cell α term would zero the cut column.
     V_keep = space(omega; cells=(3, 3), order=3,
                    physical=physical_domain(cut; lipschitz=1.0, alpha=1.0, keep_fictitious=true,
@@ -477,9 +456,8 @@ end
     @test Unfitted.active_unknowns(m_none.dofs) == Unfitted.active_unknowns(m_keep.dofs)
     @test m_none.matrix ≈ m_keep.matrix
 
-    # (2) default (keep_fictitious = false) with α > 0 STILL drops the fully-
-    #     fictitious right column — α stabilises cut cells, not whole fictitious
-    #     cells — so the active dof count is strictly smaller.
+    # (2) default (keep_fictitious = false) with α > 0 STILL drops the fully- fictitious right column — α stabilises cut
+    #     cells, not whole fictitious cells — so the active dof count is strictly smaller.
     V_drop = space(omega; cells=(3, 3), order=3,
                    physical=physical_domain(cut; lipschitz=1.0, alpha=1.0e-6, subcell_length_scale=0.05, max_depth=4))
     m_drop = prepare(stiffness(V_drop; dirichlet=[bc]))
@@ -490,9 +468,8 @@ end
     omega = box((0.0,), (1.0,))
     bc = dirichlet(0.0; on=boundary(:all))
 
-    # phi(x) = 1 ⇒ Ω = ∅. The fictitious fold deactivates every cell at the
-    # cell level (so dof enumeration is empty); the integration plan correctly
-    # produces no regions.
+    # phi(x) = 1 ⇒ Ω = ∅. The fictitious fold deactivates every cell at the cell level (so dof enumeration is empty);
+    # the integration plan correctly produces no regions.
     V = space(omega; cells=1, order=2, physical=physical_domain(x -> 1.0; lipschitz=1.0, subcell_length_scale=1.0))
     m = prepare(stiffness(V; dirichlet=[bc]))
     plan = Unfitted.integration_plan(m)
@@ -505,11 +482,10 @@ end
 end
 
 @testset "region quadrature kinds" begin
-    # Mixed configuration: a disk hole on a 10×10 mesh. Boundary cells produce
-    # `:cut_fitted` regions via the moment fit; cells fully inside Ω stay
-    # `:full`; fictitious cells are already dropped at the cell level by the
-    # fold. Uses subcell_length_scale=1.0e-6, max_depth=2 + order=1 to keep the
-    # moment-fit cost on the surrounding cut cells bounded.
+    # Mixed configuration: a disk hole on a 10×10 mesh. Boundary cells produce `:cut_fitted` regions via the moment fit;
+    # cells fully inside Ω stay `:full`; fictitious cells are already dropped at the cell level by the fold. Uses
+    # subcell_length_scale=1.0e-6, max_depth=2 + order=1 to keep the moment-fit cost on the surrounding cut cells
+    # bounded.
     omega = box((0.0, 0.0), (1.0, 1.0))
     hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0, subcell_length_scale=1.0e-6,
                            max_depth=2)
@@ -523,9 +499,8 @@ end
 end
 
 @testset "α-FCM weight cache shares the scaled vector" begin
-    # Two regions of the same tensor order in the same plan should reference
-    # the same α-scaled weights vector (cache hit), preserving the
-    # "shared underlying array" invariant the α-FCM weight cache documents.
+    # Two regions of the same tensor order in the same plan should reference the same α-scaled weights vector (cache
+    # hit), preserving the "shared underlying array" invariant the α-FCM weight cache documents.
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(2, 2), order=2,
               physical=physical_domain(x -> 1.0; lipschitz=1.0, alpha=0.5, keep_fictitious=true,
@@ -542,8 +517,8 @@ end
 # --- Moment-fit quadrature in the integration plan ---
 
 @testset "1D cut mass matrix matches analytic integral" begin
-    # Cell (0, 1), order 2, Ω = (0, 0.7). Mass entry M[1,1] for the
-    # endpoint mode N_0(x) = 1 − x: ∫_0^0.7 (1 − x)^2 dx = (1 − 0.3^3) / 3.
+    # Cell (0, 1), order 2, Ω = (0, 0.7). Mass entry M[1,1] for the endpoint mode N_0(x) = 1 − x: ∫_0^0.7 (1 − x)^2 dx =
+    # (1 − 0.3^3) / 3.
     omega = box((0.0,), (1.0,))
     p = physical_domain(x -> x[1] - 0.7; lipschitz=1.0, subcell_length_scale=1.0 / 2^10, max_depth=10)
     V = space(omega; cells=1, order=2, physical=p)
@@ -557,9 +532,8 @@ end
 end
 
 @testset "2D Poisson on a cut disk solves and is SPD" begin
-    # End-to-end smoke: PhysicalDomain set, system assembles, matrix SPD,
-    # solver returns a finite solution. Uses moderate accuracy parameters
-    # for a fast test.
+    # End-to-end smoke: PhysicalDomain set, system assembles, matrix SPD, solver returns a finite solution. Uses
+    # moderate accuracy parameters for a fast test.
     omega = box((0.0, 0.0), (1.0, 1.0))
     hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0, subcell_length_scale=1.0e-6,
                            max_depth=2)
@@ -573,11 +547,9 @@ end
 end
 
 @testset "3D immersed Poisson on a cut sphere — exact-moment kernel, O(nbasis), no OOM" begin
-    # A 3D FCM problem assembles and solves with the exact implicit-kernel
-    # moments. The moment-fit residual reaches machine precision (the exact
-    # Saye kernel path is taken), every cut cell carries O(nbasis) quadrature
-    # points rather than the 8^depth cloud a stair-step octree would need, and
-    # the system stays SPD.
+    # A 3D FCM problem assembles and solves with the exact implicit-kernel moments. The moment-fit residual reaches
+    # machine precision (the exact Saye kernel path is taken), every cut cell carries O(nbasis) quadrature points rather
+    # than the 8^depth cloud a stair-step octree would need, and the system stays SPD.
     omega = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
     hole = physical_domain(x -> 0.3 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2 + (x[3] - 0.5)^2); lipschitz=1.0,
                            subcell_length_scale=0.1)
@@ -595,9 +567,8 @@ end
     # Exact kernel ⇒ residual at machine precision, far below any stair-step floor.
     @test diag.moment_fit_residual_max < 1e-8
 
-    # Every cut-cell rule is O(nbasis): a single NNLS solve keeps at most
-    # nbasis = (order·factor + 1)^D = 3³ = 27 points; a stair-step octree
-    # would have produced thousands here.
+    # Every cut-cell rule is O(nbasis): a single NNLS solve keeps at most nbasis = (order·factor + 1)^D = 3³ = 27
+    # points; a stair-step octree would have produced thousands here.
     plan = Unfitted.integration_plan(m)
     cut_regions = [r for r in plan.regions if r.quadrature.kind === :cut_fitted]
     @test maximum(length(r.quadrature.points) for r in cut_regions) <= 27
@@ -620,21 +591,17 @@ end
 end
 
 @testset "moment-fit cache is the model's and is bounded by the current plan" begin
-    # The cut-region rule cache is keyed by region bounds and moment order and
-    # is owned by the `Model`, so it has two observable properties, and both are
-    # asserted here because both are load-bearing:
+    # The cut-region rule cache is keyed by region bounds and moment order and is owned by the `Model`, so it has two
+    # observable properties, and both are asserted here because both are load-bearing:
     #
-    #   * it survives a `move!` — a cut region whose box the move left untouched
-    #     must reuse its fitted rule, not be refitted, which shows up as the
-    #     cached rule still being the *same object*; and
-    #   * it does not accumulate — after any lifecycle event it holds exactly
-    #     the current plan's cut regions, so a long `move!` sweep costs one
-    #     plan's rules, not the sweep's.
+    #   * it survives a `move!` — a cut region whose box the move left untouched must reuse its fitted rule, not be
+    #     refitted, which shows up as the cached rule still being the *same object*; and
+    #   * it does not accumulate — after any lifecycle event it holds exactly the current plan's cut regions, so a long
+    #     `move!` sweep costs one plan's rules, not the sweep's.
     #
-    # Ω = {x ≤ 0.55} on a 4×4 base cuts the x ∈ [0.5, 0.75] column. The overlay
-    # is one cell wide on the base grid and is moved by exactly one base cell,
-    # so both configurations canonicalise to the base's own coordinates and the
-    # cut column's region boxes come out bit-identical either side of the move.
+    # Ω = {x ≤ 0.55} on a 4×4 base cuts the x ∈ [0.5, 0.75] column. The overlay is one cell wide on the base grid and is
+    # moved by exactly one base cell, so both configurations canonicalise to the base's own coordinates and the cut
+    # column's region boxes come out bit-identical either side of the move.
     omega = box((0.0, 0.0), (1.0, 1.0))
     p = physical_domain(x -> x[1] - 0.55; lipschitz=1.0, subcell_length_scale=1.0e-3, max_depth=3)
     V = overlay(space(omega; cells=(4, 4), order=1, physical=p), box((0.0, 0.0), (0.25, 0.25)); cells=(1, 1), order=1)
@@ -644,8 +611,7 @@ end
     cut_regions(m) = [r for r in Unfitted.integration_plan(m).regions if r.quadrature.kind === :cut_fitted]
     before = cut_regions(model)
     @test !isempty(before)
-    # Bounded: one entry per cut region, and each region aliases its cached
-    # rule rather than owning a copy of it.
+    # Bounded: one entry per cut region, and each region aliases its cached rule rather than owning a copy of it.
     @test length(cache) == length(before)
     cached_weights = Set(objectid(value[2]) for value in values(cache))
     @test all(r -> objectid(r.quadrature.weights) in cached_weights, before)
@@ -654,15 +620,15 @@ end
     move!(model; level=2, to=box((0.25, 0.0), (0.5, 0.25)))
     after = cut_regions(model)
     @test length(cache) == length(after)
-    # Every key the move carried over kept its rule object: it was reused, not
-    # refitted. The cut column is untouched by the move, so some key does.
+    # Every key the move carried over kept its rule object: it was reused, not refitted. The cut column is untouched by
+    # the move, so some key does.
     @test count(key -> haskey(cache, key), keys(kept)) > 0
     @test all(key -> !haskey(cache, key) || cache[key] === kept[key], keys(kept))
 end
 
 @testset "cut region integrates the volume to better than stair-step" begin
-    # Sanity: the moment-fit rule on a 1D cut cell integrates `1` (i.e., the
-    # 0th moment) more accurately than full-cell tensor Gauss would.
+    # Sanity: the moment-fit rule on a 1D cut cell integrates `1` (i.e., the 0th moment) more accurately than full-cell
+    # tensor Gauss would.
     omega = box((0.0,), (1.0,))
     p = physical_domain(x -> x[1] - 0.7; lipschitz=1.0, subcell_length_scale=1.0 / 2^8, max_depth=8)
     V = space(omega; cells=1, order=2, physical=p)
@@ -676,25 +642,22 @@ end
 end
 
 @testset "starved linear cut stays :cut_fitted, not :cut_failed" begin
-    # A tiny Ω with subdivision disabled (max_depth=0) leaves the moment fit
-    # very little to work with on the single depth-0 cut cell.
+    # A tiny Ω with subdivision disabled (max_depth=0) leaves the moment fit very little to work with on the single
+    # depth-0 cut cell.
     omega = box((0.0,), (1.0,))
-    # At subcell_length_scale=10.0, max_depth=0 the classifier emits the whole
-    # region as :cut (corners of [0,1] straddle phi=0), and the NNLS fit must
-    # work with the moments of that single undivided cut cell.
+    # At subcell_length_scale=10.0, max_depth=0 the classifier emits the whole region as :cut (corners of [0,1] straddle
+    # phi=0), and the NNLS fit must work with the moments of that single undivided cut cell.
     p = physical_domain(x -> x[1] - 0.001; lipschitz=1.0, subcell_length_scale=10.0, max_depth=0)
     V = space(omega; cells=1, order=2, physical=p)
     plan = Unfitted.integration_plan(V)
-    # :cut_failed (empty Ω∩R) and :cut_fallback (residual >
-    # _FIT_FAILURE_RESIDUAL) are both defensive tags. The leaf here is linear, so
-    # the Saye moments are exact and a zero-residual non-negative fit exists: the
-    # region is :cut_fitted, neither of the two, and the max residual stays far
-    # below the failure threshold.
+    # :cut_failed (empty Ω∩R) and :cut_fallback (residual > _FIT_FAILURE_RESIDUAL) are both defensive tags. The leaf
+    # here is linear, so the Saye moments are exact and a zero-residual non-negative fit exists: the region is
+    # :cut_fitted, neither of the two, and the max residual stays far below the failure threshold.
     failed = count(r -> r.quadrature.kind in (:cut_fallback, :cut_failed, :cut_alpha_failed), plan.regions)
     @test failed == 0
     @test plan.moment_fit_residual_max < Unfitted._FIT_FAILURE_RESIDUAL
-    # Diagnostics counts must agree with the plan tags — guarding the flagging
-    # logic that the old `failed >= 0` placeholder did not.
+    # Diagnostics counts must agree with the plan tags — guarding the flagging logic that the old `failed >= 0`
+    # placeholder did not.
     m = prepare(stiffness(V; dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     @test diagnostics(m).fit_failure_count == failed
 end
@@ -702,8 +665,8 @@ end
 # --- Space.physical forwarding and moment-fit knobs ---
 
 @testset "moved_space preserves Space.physical" begin
-    # Forward an immersed-domain Space through `moved_space` and assert the
-    # `physical` field is preserved on the new Space.
+    # Forward an immersed-domain Space through `moved_space` and assert the `physical` field is preserved on the new
+    # Space.
     bc = dirichlet(0.0; on=boundary(:all))
     omega = box((0.0, 0.0), (1.0, 1.0))
     p = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=1.0e-6, max_depth=2)
@@ -713,8 +676,7 @@ end
 end
 
 @testset "overlay forwards Space.physical" begin
-    # Adding an overlay to a Space with a physical_domain must keep the
-    # physical_domain on the resulting Space.
+    # Adding an overlay to a Space with a physical_domain must keep the physical_domain on the resulting Space.
     omega = box((0.0, 0.0), (1.0, 1.0))
     p = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=1.0e-6, max_depth=2)
     V_base = space(omega; cells=(4, 4), order=1, physical=p)
@@ -723,9 +685,8 @@ end
 end
 
 @testset "NNMF on a region with multi-level parents" begin
-    # A cut base cell that is also covered by a cut overlay cell — exercises
-    # `_moment_order_for_region`'s max-over-parents logic. Use orders that
-    # differ between levels so the chosen moment_order is meaningful.
+    # A cut base cell that is also covered by a cut overlay cell — exercises `_moment_order_for_region`'s
+    # max-over-parents logic. Use orders that differ between levels so the chosen moment_order is meaningful.
     bc = dirichlet(0.0; on=boundary(:all))
     omega = box((0.0,), (1.0,))
     p = physical_domain(x -> x[1] - 0.45; lipschitz=1.0, subcell_length_scale=1.0e-6, max_depth=4)
@@ -751,24 +712,20 @@ end
     V_che = space(omega; cells=1, order=2, physical=p_cheap)
 
     parents = Unfitted._parents_covering(V_def.levels, box((0.0,), (1.0,)), GeometryTolerance(Float64))
-    # The default spans degree `2p`, which is what makes trial × test products
-    # exact on the moment basis.
+    # The default spans degree `2p`, which is what makes trial × test products exact on the moment basis.
     @test p_default.moment_order_factor == 2
     @test Unfitted._moment_order_for_region(V_def, parents) == (4,)
-    # Factor 1 spans degree `p` only: `∏(p+1)` weights, the tensor Gauss count on
-    # an uncut cell, exact for linear functionals but — see `physical_domain`'s
-    # docstring — for a stiffness form only up to `p = 2`.
+    # Factor 1 spans degree `p` only: `∏(p+1)` weights, the tensor Gauss count on an uncut cell, exact for linear
+    # functionals but — see `physical_domain`'s docstring — for a stiffness form only up to `p = 2`.
     @test Unfitted._moment_order_for_region(V_che, parents) == (2,)
 
     @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1, moment_order_factor=0)
 end
 
 @testset "high moment order on a starved cut still fits below the failure threshold" begin
-    # A high moment order (20) against a coarse, undivided cut cell stresses the
-    # moment fit. The leaf is linear, so the Saye moments are exact and a single
-    # NNLS solve stays well below the failure threshold — the residual branch
-    # that would tag a region :cut_failed is not reached through the public path
-    # with the exact kernel.
+    # A high moment order (20) against a coarse, undivided cut cell stresses the moment fit. The leaf is linear, so the
+    # Saye moments are exact and a single NNLS solve stays well below the failure threshold — the residual branch that
+    # would tag a region :cut_failed is not reached through the public path with the exact kernel.
     p = physical_domain(x -> 0.5 - x[1]; lipschitz=1.0, subcell_length_scale=10.0, max_depth=0)
     region_box = box((0.0,), (1.0,))
     pts, ws, res = Unfitted.moment_fit_rule(p, region_box, (20,); target_residual=1.0e-14)
@@ -777,13 +734,11 @@ end
 end
 
 @testset "α-FCM fit failure is :cut_alpha_failed and counts as a failure" begin
-    # The empty-Ω∩R branches are defensive (unreachable via the public path with
-    # exact kernels), so pin their contract directly. Unlike the empty strict-cut
-    # `:cut_failed`, `:cut_alpha_failed` carries a NONZERO α-scaled rule so the
-    # cell's dofs stay α-stabilised. `:cut_fallback` carries the raw Saye volume
-    # rule — a full, correct rule with many more points than a fit. All three
-    # non-fitted kinds feed the fit-failure count, all four count as cut regions,
-    # and only `:cut_fallback` contributes to the fallback point budget.
+    # The empty-Ω∩R branches are defensive (unreachable via the public path with exact kernels), so pin their contract
+    # directly. Unlike the empty strict-cut `:cut_failed`, `:cut_alpha_failed` carries a NONZERO α-scaled rule so the
+    # cell's dofs stay α-stabilised. `:cut_fallback` carries the raw Saye volume rule — a full, correct rule with many
+    # more points than a fit. All three non-fitted kinds feed the fit-failure count, all four count as cut regions, and
+    # only `:cut_fallback` contributes to the fallback point budget.
     RQ = Unfitted.RegionQuadrature{1,Float64}
     VR = Unfitted.VolumeRegion{1,Float64}
     b = box((0.0,), (1.0,))
@@ -805,13 +760,11 @@ end
 end
 
 @testset "custom cut_quadrature rule replaces the moment fit on cut regions" begin
-    # `PhysicalDomain.cut_quadrature` is the public extension point for
-    # integrating cut cells by some other scheme. The rule below is the
-    # plainest one honouring the documented contract: the full-cell tensor
-    # Gauss rule of the region box, in *physical* coordinates, with strictly
-    # positive weights. It ignores Ω on purpose, so `Σ w_q = vol(box)` exactly
-    # — a value no moment fit could return on a cut cell, which is what makes
-    # "the rule was actually used" checkable without re-deriving a fit.
+    # `PhysicalDomain.cut_quadrature` is the public extension point for integrating cut cells by some other scheme. The
+    # rule below is the plainest one honouring the documented contract: the full-cell tensor Gauss rule of the region
+    # box, in *physical* coordinates, with strictly positive weights. It ignores Ω on purpose, so `Σ w_q = vol(box)`
+    # exactly — a value no moment fit could return on a cut cell, which is what makes "the rule was actually used"
+    # checkable without re-deriving a fit.
     calls = Ref(0)
     function tensor_rule(physical, region_box::Unfitted.AxisBox{D,T}, moment_order::NTuple{D,Int}) where {D,T}
         calls[] += 1
@@ -827,8 +780,8 @@ end
     fitted = physical_domain(geometry; settings...)
     custom = physical_domain(geometry; settings..., cut_quadrature=tensor_rule)
 
-    # `Q === Nothing` on the default keeps the struct concrete, which is the
-    # reason the rule is a field rather than a boxed global.
+    # `Q === Nothing` on the default keeps the struct concrete, which is the reason the rule is a field rather than a
+    # boxed global.
     @test fitted.cut_quadrature === nothing
     @test typeof(fitted).parameters[3] === Nothing
     @test isconcretetype(typeof(fitted))
@@ -840,16 +793,15 @@ end
     kinds(plan) = [r.quadrature.kind for r in plan.regions]
     @test :cut_fitted in kinds(plan_fitted)
     @test !(:cut_custom in kinds(plan_fitted))
-    # The rule replaces exactly the cut regions: same region boxes, same
-    # `:full` regions, `:cut_fitted` swapped for `:cut_custom` one for one.
+    # The rule replaces exactly the cut regions: same region boxes, same `:full` regions, `:cut_fitted` swapped for
+    # `:cut_custom` one for one.
     @test [r.box for r in plan_custom.regions] == [r.box for r in plan_fitted.regions]
     @test count(==(:full), kinds(plan_custom)) == count(==(:full), kinds(plan_fitted))
     @test count(==(:cut_custom), kinds(plan_custom)) == count(==(:cut_fitted), kinds(plan_fitted)) > 0
     @test calls[] == count(==(:cut_custom), kinds(plan_custom))
 
-    # Points come back in the region's reference frame with the standard
-    # Jacobian folded out, so `Σ w_q · vol(box) / 2ᴰ` is the physical measure
-    # the rule integrates — here the whole box, since the rule ignores Ω.
+    # Points come back in the region's reference frame with the standard Jacobian folded out, so `Σ w_q · vol(box) / 2ᴰ`
+    # is the physical measure the rule integrates — here the whole box, since the rule ignores Ω.
     for region in plan_custom.regions
         region.quadrature.kind === :cut_custom || continue
         jacobian = Unfitted.volume(region.box) / 4
@@ -857,16 +809,16 @@ end
         @test all(>=(0), region.quadrature.weights)
     end
 
-    # A custom region is a cut region but never a fit failure: no fit ran, so
-    # there is no residual for `fit_failure_count` to report on.
+    # A custom region is a cut region but never a fit failure: no fit ran, so there is no residual for
+    # `fit_failure_count` to report on.
     cut, failed, fallback, fallback_points = Unfitted._cut_region_stats(plan_custom)
     @test cut == count(==(:cut_custom), kinds(plan_custom))
     @test failed == 0
     @test fallback == 0
     @test fallback_points == 0
 
-    # α blends the custom rule exactly as it blends a fit: the region carries
-    # `(1 − α)·custom ∪ α·tensor`, so the custom part is scaled, not replaced.
+    # α blends the custom rule exactly as it blends a fit: the region carries `(1 − α)·custom ∪ α·tensor`, so the custom
+    # part is scaled, not replaced.
     alpha = 0.25
     blended = physical_domain(geometry; settings..., alpha=alpha, cut_quadrature=tensor_rule)
     plan_blended = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2, physical=blended))
@@ -880,13 +832,11 @@ end
 end
 
 @testset "an affine slice of the CSG tree is the geometry one dimension down" begin
-    # A codim-K facet of the background box is the affine slice ⋂ⱼ {x_{kⱼ} = vⱼ},
-    # so the geometry *on* that facet is Ω restricted to the slice.
-    # `_restrict_domain` walks the tree, restricts each leaf's callback through
-    # `_restrict` and rebuilds the Boolean structure around the results, giving a
-    # `PhysicalDomain` of dimension D − K. `PhysicalDomain` carries no dimension
-    # parameter, so every consumer that takes its `D` from the box it is handed
-    # works on the slice with no further arrangement.
+    # A codim-K facet of the background box is the affine slice ⋂ⱼ {x_{kⱼ} = vⱼ}, so the geometry *on* that facet is Ω
+    # restricted to the slice. `_restrict_domain` walks the tree, restricts each leaf's callback through `_restrict` and
+    # rebuilds the Boolean structure around the results, giving a `PhysicalDomain` of dimension D − K. `PhysicalDomain`
+    # carries no dimension parameter, so every consumer that takes its `D` from the box it is handed works on the slice
+    # with no further arrangement.
     plate = leaf(x -> x[2] - x[1] - 0.55; lipschitz=sqrt(2.0))
     slant = leaf(x -> x[1] - x[2] - 0.8; lipschitz=sqrt(2.0))
     hole = leaf(x -> 0.1 - hypot(x[1] - 0.2, x[2] - 0.5); lipschitz=1.0)
@@ -895,32 +845,27 @@ end
     p2 = physical_domain(tree; subcell_length_scale=0.0625)
     sliced = Unfitted._restrict_domain(p2, [(1, 0.0)])
 
-    # The Boolean structure survives node for node, and every leaf keeps its own
-    # Lipschitz constant: the slice is an isometric embedding of the base into ℝᴰ,
-    # so a constant of the parent callback bounds the restriction just as tightly.
-    # Losing it here would be invisible in the shape of the result and fatal to a
-    # sub-cell feature, which only the certificate can see (below).
+    # The Boolean structure survives node for node, and every leaf keeps its own Lipschitz constant: the slice is an
+    # isometric embedding of the base into ℝᴰ, so a constant of the parent callback bounds the restriction just as
+    # tightly. Losing it here would be invisible in the shape of the result and fatal to a sub-cell feature, which only
+    # the certificate can see (below).
     @test sliced.geometry isa Unfitted.AllOf
     @test sliced.geometry.parts[1] isa Unfitted.AnyOf
     @test sliced.geometry.parts[2] isa Unfitted.Not
     @test [l.lipschitz for l in Unfitted._leaves(sliced.geometry)] == [l.lipschitz for l in Unfitted._leaves(tree)]
 
-    # Membership on the slice is membership on the parent at the lifted point,
-    # which is the one property the whole construction has to have.
+    # Membership on the slice is membership on the parent at the lifted point, which is the one property the whole
+    # construction has to have.
     @test all(Unfitted._inside(sliced.geometry, SVector(y)) == Unfitted._inside(tree, SVector(0.0, y))
               for y in 0.0:0.025:1.0)
 
-    # And the slice is not merely *equivalent* to the same geometry written in one
-    # dimension fewer — it is bit-identical to it. The restricted closure evaluates
-    # the parent callback at the lifted point, so with the pinned coordinate
-    # contributing exactly (x₁ = 0 here) the two leaves agree to the last bit, and
-    # with them the kernel's root finding, its base partition and the fitted rule.
-    # Hence `==` and not `≈`: a restriction that perturbed the geometry at all
-    # would be a different geometry, and the facet rule built on it would no longer
-    # be the rule the cells behind the face are integrated with. Swept over the
-    # moment order (the kernel's fiber Gauss order), `subcell_length_scale` (its
-    # subdivision budget) and the box, because each of the three enters the rule
-    # by a different route.
+    # And the slice is not merely *equivalent* to the same geometry written in one dimension fewer — it is bit-identical
+    # to it. The restricted closure evaluates the parent callback at the lifted point, so with the pinned coordinate
+    # contributing exactly (x₁ = 0 here) the two leaves agree to the last bit, and with them the kernel's root finding,
+    # its base partition and the fitted rule. Hence `==` and not `≈`: a restriction that perturbed the geometry at all
+    # would be a different geometry, and the facet rule built on it would no longer be the rule the cells behind the
+    # face are integrated with. Swept over the moment order (the kernel's fiber Gauss order), `subcell_length_scale`
+    # (its subdivision budget) and the box, because each of the three enters the rule by a different route.
     identical = 0
     for scale in (0.0625, 0.25), order in (2, 4, 6), bounds in ((0.0, 1.0), (0.4, 0.8), (0.5, 0.6), (0.25, 0.75))
         here = Unfitted._restrict_domain(physical_domain(plate; subcell_length_scale=scale), [(1, 0.0)])
@@ -936,18 +881,15 @@ end
     end
     @test identical == 24
 
-    # The upper face pins at a coordinate that does not vanish, where the
-    # restricted arithmetic is its own: Ω reaches x₂ ≤ 1.55 there, so the whole
-    # face is physical and the slice classifies `:full`.
+    # The upper face pins at a coordinate that does not vanish, where the restricted arithmetic is its own: Ω reaches x₂
+    # ≤ 1.55 there, so the whole face is physical and the slice classifies `:full`.
     upper = Unfitted._restrict_domain(physical_domain(plate; subcell_length_scale=0.0625), [(1, 1.0)])
     @test classify_cell(upper, box((0.0,), (1.0,))) === :full
     @test sum(Unfitted.moment_fit_rule(upper, box((0.0,), (1.0,)), (4,))[2]) ≈ 1.0 rtol = 1.0e-14
 
-    # Codimension 2: two pins consumed in descending axis order, which is what
-    # keeps every remaining pin's index the one the caller named. Consuming them
-    # the other way round would renumber the axes that survive the first
-    # restriction under the pins still to come — here the pin on axis 3 would
-    # address a slot the two-coordinate slice no longer has.
+    # Codimension 2: two pins consumed in descending axis order, which is what keeps every remaining pin's index the one
+    # the caller named. Consuming them the other way round would renumber the axes that survive the first restriction
+    # under the pins still to come — here the pin on axis 3 would address a slot the two-coordinate slice no longer has.
     ball = leaf(x -> 0.3 - sqrt(x[1]^2 + x[2]^2 + x[3]^2); lipschitz=1.0)
     p3 = physical_domain(ball; subcell_length_scale=0.0625)
     edge = Unfitted._restrict_domain(p3, [(3, 0.0), (1, 0.0)])
@@ -955,20 +897,18 @@ end
     @test classify_cell(edge, box((0.0,), (0.25,))) === :fictitious   # inside the ball
     @test classify_cell(edge, box((0.25,), (0.5,))) === :cut          # ∂Ω crosses at 0.3
     @test classify_cell(edge, box((0.5,), (1.0,))) === :full
-    # Codimension 3 leaves no axis at all, and the lone point of ℝ⁰ is the
-    # facet's own corner: membership is the whole verdict.
+    # Codimension 3 leaves no axis at all, and the lone point of ℝ⁰ is the facet's own corner: membership is the whole
+    # verdict.
     vertex = Unfitted._restrict_domain(p3, [(3, 0.0), (2, 0.0), (1, 0.0)])
     @test !Unfitted._inside(vertex.geometry, SVector{0,Float64}())
 end
 
 @testset "a slice preserves every field of the domain it slices" begin
-    # Built by direct struct construction precisely so that all eight fields come
-    # along: a face and the cells behind it then resolve the same geometry at the
-    # same accuracy, with the same α treatment and the same cut-cell rule. Routing
-    # through `physical_domain` instead would mean re-passing seven keywords and
-    # submitting the slice to argument validation that is about what a *caller* may
-    # ask for — its uncertified-leaf rejection, in particular, would fire on a tree
-    # the caller never wrote.
+    # Built by direct struct construction precisely so that all eight fields come along: a face and the cells behind it
+    # then resolve the same geometry at the same accuracy, with the same α treatment and the same cut-cell rule. Routing
+    # through `physical_domain` instead would mean re-passing seven keywords and submitting the slice to argument
+    # validation that is about what a *caller* may ask for — its uncertified-leaf rejection, in particular, would fire
+    # on a tree the caller never wrote.
     rule = (physical, region_box, moment_order) -> (SVector{1,Float64}[], Float64[], 0.0, :empty)
     p = physical_domain(leaf(x -> x[2] - 0.5; lipschitz=1.0); alpha=1.0e-3, keep_fictitious=true,
                         subcell_length_scale=0.0125, max_depth=5, moment_order_factor=3, target_residual=1.0e-9,
@@ -984,24 +924,22 @@ end
 end
 
 @testset "the facet frame and the lift back to ℝᴰ are inverse" begin
-    # The two coordinate maps a slice needs: `_facet_box` drops the pinned axes
-    # from the region's corner pair (selecting the free ones, since the
-    # intermediate box of a multi-axis drop is degenerate and `AxisBox` rejects
-    # that), and `_lift` splices the pinned coordinates back in. A rule built on
-    # the slice reaches its consumers through the second map, so a disagreement
-    # between them would place every quadrature point on the wrong facet.
+    # The two coordinate maps a slice needs: `_facet_box` drops the pinned axes from the region's corner pair (selecting
+    # the free ones, since the intermediate box of a multi-axis drop is degenerate and `AxisBox` rejects that), and
+    # `_lift` splices the pinned coordinates back in. A rule built on the slice reaches its consumers through the second
+    # map, so a disagreement between them would place every quadrature point on the wrong facet.
     x = SVector(0.1, 0.2, 0.3, 0.4)
     for pins in
         ([(4, 0.4)], [(3, 0.3), (1, 0.1)], [(4, 0.4), (3, 0.3), (2, 0.2)], [(4, 0.4), (3, 0.3), (2, 0.2), (1, 0.1)])
-        # `pins` are descending, which is the order the restriction consumes them
-        # in; the drop below follows the same order for the same reason.
+        # `pins` are descending, which is the order the restriction consumes them in; the drop below follows the same
+        # order for the same reason.
         reduced = foldl((y, pin) -> Unfitted._remove_axis(y, pin[1]), pins; init=x)
         @test length(reduced) == 4 - length(pins)
         @test Unfitted._lift(reduced, pins) == x
     end
 
-    # Through the facet's own helpers: the free-axis box of a codim-2 facet of the
-    # unit cube, and the lift of one of its points.
+    # Through the facet's own helpers: the free-axis box of a codim-2 facet of the unit cube, and the lift of one of its
+    # points.
     sides = [(1, :lower), (3, :upper)]
     domain = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
     pins = Unfitted._facet_pins(domain, sides)
@@ -1012,17 +950,14 @@ end
 end
 
 @testset "restricting the leaves beats restricting the collapsed level set" begin
-    # Ω = {x₂ ≤ x₁ + 0.25} ∩ {x₂ ≤ 1.25 − x₁} is a wedge whose two faces meet at
-    # (0.5, 0.75) — strictly inside the unit square, and independent of x₃, so
-    # every slice x₃ = c cuts the same plane figure of area exactly 0.5.
+    # Ω = {x₂ ≤ x₁ + 0.25} ∩ {x₂ ≤ 1.25 − x₁} is a wedge whose two faces meet at (0.5, 0.75) — strictly inside the unit
+    # square, and independent of x₃, so every slice x₃ = c cuts the same plane figure of area exactly 0.5.
     #
-    # Restricting leaf by leaf keeps those two faces as two smooth leaves, which is
-    # what the quadrature kernel's multi-component construction needs. Restricting
-    # `levelset_value` instead — the tree collapsed to max/min — hands the kernel a
-    # single leaf with a crease along the ridge, exactly the representation that
-    # function's own docstring warns against for integration. Measured at moment
-    # order 4 on the slice: 3.63e-4 leaf-wise against 4.97e-3 collapsed, 13.7×
-    # worse, and the gap persists at orders 6 and 8 (2.2× and 2.5×).
+    # Restricting leaf by leaf keeps those two faces as two smooth leaves, which is what the quadrature kernel's
+    # multi-component construction needs. Restricting `levelset_value` instead — the tree collapsed to max/min — hands
+    # the kernel a single leaf with a crease along the ridge, exactly the representation that function's own docstring
+    # warns against for integration. Measured at moment order 4 on the slice: 3.63e-4 leaf-wise against 4.97e-3
+    # collapsed, 13.7× worse, and the gap persists at orders 6 and 8 (2.2× and 2.5×).
     wedge = intersect(leaf(x -> x[2] - x[1] - 0.25; lipschitz=sqrt(2.0)),
                       leaf(x -> x[2] + x[1] - 1.25; lipschitz=sqrt(2.0)))
     p3 = physical_domain(wedge; subcell_length_scale=0.25)
@@ -1031,8 +966,8 @@ end
     leafwise = Unfitted._restrict_domain(p3, [(3, 0.5)])
     collapsed = physical_domain(leaf(y -> levelset_value(p3, SVector(y[1], y[2], 0.5)); lipschitz=sqrt(2.0));
                                 subcell_length_scale=0.25)
-    # Same sign everywhere, so the two describe the same set and differ only in
-    # how smooth the kernel can take its boundary to be.
+    # Same sign everywhere, so the two describe the same set and differ only in how smooth the kernel can take its
+    # boundary to be.
     @test all(Unfitted._inside(leafwise.geometry, SVector(a, b)) == (levelset_value(collapsed, SVector(a, b)) <= 0)
               for a in 0.05:0.1:0.95, b in 0.05:0.1:0.95)
 
@@ -1042,20 +977,16 @@ end
 end
 
 @testset "a feature on a face needs its leaf's Lipschitz constant" begin
-    # The certificate is load-bearing on a slice, not a formality. A ball of radius
-    # 0.02 centred on the x₃ = 0 face cuts that face in a disc of the same radius,
-    # placed so that the disc holds neither the face box's centre nor any of its four
-    # corners. With `lipschitz = 1.0` the bound |f(c)| > L·r holds f over the whole
-    # box, so the leaf is never pruned and the kernel's own subdivision gets to
-    # resolve the disc — the face measure comes back 3.8e-7 from analytic. With the
-    # `leaf` default `Inf` every one of those five samples reports the same sign,
-    # `_sample_sign` prunes the only leaf on the *top* box, and a box with no leaf
-    # left is taken to be uniform — so the kernel never bisects at all and hands back
-    # the full-face tensor rule, the whole measure to round-off, at every subdivision
-    # budget rather than merely a coarse one. The disc is 1.26e-3 of the face, three
-    # orders above that round-off, so the two readings are never in doubt. This is
-    # the blind spot the constant exists to close, and it survives the restriction
-    # only because `_restrict` carries the constant through.
+    # The certificate is load-bearing on a slice, not a formality. A ball of radius 0.02 centred on the x₃ = 0 face cuts
+    # that face in a disc of the same radius, placed so that the disc holds neither the face box's centre nor any of its
+    # four corners. With `lipschitz = 1.0` the bound |f(c)| > L·r holds f over the whole box, so the leaf is never
+    # pruned and the kernel's own subdivision gets to resolve the disc — the face measure comes back 3.8e-7 from
+    # analytic. With the `leaf` default `Inf` every one of those five samples reports the same sign, `_sample_sign`
+    # prunes the only leaf on the *top* box, and a box with no leaf left is taken to be uniform — so the kernel never
+    # bisects at all and hands back the full-face tensor rule, the whole measure to round-off, at every subdivision
+    # budget rather than merely a coarse one. The disc is 1.26e-3 of the face, three orders above that round-off, so the
+    # two readings are never in doubt. This is the blind spot the constant exists to close, and it survives the
+    # restriction only because `_restrict` carries the constant through.
     face = box((0.0, 0.0), (1.0, 1.0))
     measure(L, scale) =
         let ball = leaf(x -> 0.02 - sqrt((x[1] - 0.31337)^2 + (x[2] - 0.43731)^2 + x[3]^2); lipschitz=L),

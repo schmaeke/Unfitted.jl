@@ -2,38 +2,33 @@ using BasicBSpline   # switches on the B-spline extension for the clamped case
 using BenchmarkTools
 using Unfitted
 
-# The build cost of the dof layer: what it costs to construct a layout, to prepare a
-# model around one, and to rebuild or update a model in place.
+# The build cost of the dof layer: what it costs to construct a layout, to prepare a model around one, and to rebuild or
+# update a model in place.
 #
-# The layout is built on every `prepare` and on every structural mutation. Unlike
-# assembly, nothing amortises it over a solve, so in an adaptive or moving-overlay loop
-# its build cost is paid on every step. Three entry points are timed on each of four
-# problems, chosen so that each stresses a different part of the layer:
+# The layout is built on every `prepare` and on every structural mutation. Unlike assembly, nothing amortises it over a
+# solve, so in an adaptive or moving-overlay loop its build cost is paid on every step. Three entry points are timed on
+# each of four problems, chosen so that each stresses a different part of the layer:
 #
-#   * `dof_layout`, the standalone layout of one field over a space: enumeration,
-#     artificial eliminations, physical-Dirichlet detection, numbering and, for
-#     nonzero data, the boundary projection;
+#   * `dof_layout`, the standalone layout of one field over a space: enumeration, artificial eliminations,
+#     physical-Dirichlet detection, numbering and, for nonzero data, the boundary projection;
 #   * `system_layout`, every field of a problem as `prepare` builds them;
 #   * `prepare`, the whole model, layout included.
 #
 # The four problems:
 #
-#   * 3D 12³ p3 with boundary(:all): one large level, every boundary raw of it
-#     physical Dirichlet, under zero data, so detection runs and no projection does;
-#   * a 2D 32² + 32² p3 corner overlay with nonzero data on every face: two levels
-#     and the boundary projection;
-#   * a deep 2D ladder, 6² depth 5 p2, with one base cell refined to the bottom rung:
-#     six levels and their coverage pruning;
-#   * a clamped C¹ p3 B-spline, 64², under an L mask: the linear-constraint rows and
-#     their pivots.
+#   * 3D 12³ p3 with boundary(:all): one large level, every boundary raw of it physical Dirichlet, under zero data, so
+#     detection runs and no projection does;
+#   * a 2D 32² + 32² p3 corner overlay with nonzero data on every face: two levels and the boundary projection;
+#   * a deep 2D ladder, 6² depth 5 p2, with one base cell refined to the bottom rung: six levels and their coverage
+#     pruning;
+#   * a clamped C¹ p3 B-spline, 64², under an L mask: the linear-constraint rows and their pivots.
 #
-# Then come the verbs that rebuild or update a prepared model: `move!` and
-# `update_dirichlet!` (first increment, which builds the projection, and later ones,
-# which reuse it) on the overlay, `activate!` / `deactivate!` on the ladder, and
+# Then come the verbs that rebuild or update a prepared model: `move!` and `update_dirichlet!` (first increment, which
+# builds the projection, and later ones, which reuse it) on the overlay, `activate!` / `deactivate!` on the ladder, and
 # `estimate`, which builds an enriched twin layout, on a tanh-front ladder.
 #
-# Only entry points that every representation of the layout keeps are called, so the
-# same four problems serve as a before/after reference for changes to the dof layer.
+# Only entry points that every representation of the layout keeps are called, so the same four problems serve as a
+# before/after reference for changes to the dof layer.
 group = SUITE["build"]["dof_layout"] = BenchmarkGroup()
 
 let
@@ -53,9 +48,8 @@ let
         cases["prepare"] = @benchmarkable prepare($problem)
         return cases, problem
     end
-    # An in-place verb that switches a model between two equivalent states, so every
-    # evaluation is one real rebuild from a valid model and no untimed re-prepare is
-    # needed between samples.
+    # An in-place verb that switches a model between two equivalent states, so every evaluation is one real rebuild from
+    # a valid model and no untimed re-prepare is needed between samples.
     function toggler(on, off)
         state = Ref(false)
         return function ()
@@ -76,8 +70,7 @@ let
         overlay_cases["move!"] = @benchmarkable $move()
     end
     let increment = data(2.0)
-        # A fresh model per sample: `prepare` keeps no projection, so the first
-        # increment always builds one.
+        # A fresh model per sample: `prepare` keeps no projection, so the first increment always builds one.
         overlay_cases["update_dirichlet! first"] = @benchmarkable(update_dirichlet!(m, $increment),
                                                                   setup=(m = prepare($overlay_problem)), evals=1)
     end
@@ -103,13 +96,12 @@ let
                  space(Ω2; cells=64, order=3, basis=bspline(; continuity=1), active=mask),
                  [dirichlet(0.0; on=boundary(:all))])
 
-    # A tanh front (λ = 30) along a sine, refined along the front, with its exact
-    # solution as the Dirichlet datum and the matching source.
+    # A tanh front (λ = 30) along a sine, refined along the front, with its exact solution as the Dirichlet datum and
+    # the matching source.
     let λ = 30.0
         exact(x) = tanh(λ * (x[2] - (0.5 + 0.25 * sinpi(2 * x[1]))))
-        # `t`, not `u`: a nested function's assignment to a name the enclosing `let`
-        # also binds rebinds that local, which would box the field `u` below and put
-        # an allocation in every source evaluation.
+        # `t`, not `u`: a nested function's assignment to a name the enclosing `let` also binds rebinds that local,
+        # which would box the field `u` below and put an allocation in every source evaluation.
         function source(x)
             t = exact(x)
             s′ = 0.5π * cospi(2 * x[1])

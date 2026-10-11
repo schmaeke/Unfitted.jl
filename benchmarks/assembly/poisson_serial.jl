@@ -3,8 +3,8 @@ using Unfitted
 
 group = SUITE["assembly"]["poisson_serial"] = BenchmarkGroup()
 
-# Build a Poisson model with optional single overlay. Model construction stays
-# outside the timing — only `assemble!` is measured.
+# Build a Poisson model with optional single overlay. Model construction stays outside the timing — only `assemble!` is
+# measured.
 function _build_poisson_model(domain, cells, order; overlay_box=nothing, overlay_cells=nothing, overlay_order=nothing)
     V = space(domain; cells, order)
     if overlay_box !== nothing

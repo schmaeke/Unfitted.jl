@@ -1,8 +1,7 @@
 # ── Characterization harness — a REVIEW INSTRUMENT, not a test ────────────────
 #
-# This script is deliberately NOT included from `test/runtests.jl`. It asserts
-# nothing. It prints a deterministic, diffable report of golden values over a
-# matrix of configurations, so that a batch of correctness fixes can be judged
+# This script is deliberately NOT included from `test/runtests.jl`. It asserts nothing. It prints a deterministic,
+# diffable report of golden values over a matrix of configurations, so that a batch of correctness fixes can be judged
 # by what it moves and what it leaves alone:
 #
 #     julia --project=. test/characterize.jl > before.txt
@@ -10,24 +9,19 @@
 #     julia --project=. test/characterize.jl > after.txt
 #     diff before.txt after.txt
 #
-# WHAT THIS INSTRUMENT DOES NOT COVER. Every `order =` argument below is a
-# scalar, so no case here builds a level with a PER-CELL polynomial order. The
-# report was measured byte-identical against five deliberately broken minimum
-# rules — the rule deleted outright, a per-axis test in place of set membership,
-# inactive cells minimised over, a maximum rule, and a truncated incidence walk —
-# so a matching hash says nothing at all about the graded kernel. That kernel has
-# its own instrument: `test/test_graded_golden.jl`, which locks the per-cell mode
-# sets directly and moves under all five of those controls.
+# WHAT THIS INSTRUMENT DOES NOT COVER. Every `order =` argument below is a scalar, so no case here builds a level with a
+# PER-CELL polynomial order. The report was measured byte-identical against five deliberately broken minimum rules — the
+# rule deleted outright, a per-axis test in place of set membership, inactive cells minimised over, a maximum rule, and
+# a truncated incidence walk — so a matching hash says nothing at all about the graded kernel. That kernel has its own
+# instrument: `test/test_graded_golden.jl`, which locks the per-cell mode sets directly and moves under all five of
+# those controls.
 #
-# A DELIBERATE MOVE, so a diff against an older `before.txt` is not misread.
-# The B-spline family's default changed from `continuity_order = 0` to
-# `continuity = :maximal`, and with it the mechanism: a level now *selects* the
-# functions whose whole support lies inside its active region instead of clamping
-# and constraining its artificial faces. Every `bspline` case below therefore
-# moves — cases 3, 8, 9, 23 and 30 — and the move is the feature, not collateral
-# damage. Their `MUST-NOT-CHANGE` marking is about correctness fixes and still
-# means what it says for any *later* change; re-baseline against a run made on
-# this commit or newer.
+# A DELIBERATE MOVE, so a diff against an older `before.txt` is not misread. The B-spline family's default changed from
+# `continuity_order = 0` to `continuity = :maximal`, and with it the mechanism: a level now *selects* the functions
+# whose whole support lies inside its active region instead of clamping and constraining its artificial faces. Every
+# `bspline` case below therefore moves — cases 3, 8, 9, 23 and 30 — and the move is the feature, not collateral damage.
+# Their `MUST-NOT-CHANGE` marking is about correctness fixes and still means what it says for any *later* change;
+# re-baseline against a run made on this commit or newer.
 #
 # Every case carries one of two markings:
 #
@@ -43,29 +37,23 @@
 #
 # Determinism rules obeyed here, because a diff is the whole product:
 #   * fixed case order, fixed key order, no timings, no addresses, no paths;
-#   * `Dict` / `IdDict` iteration order is never observable — the two
-#     identity-keyed region caches are read through the objects that key them,
-#     and every derived multiset is sorted before printing;
-#   * floating-point values print through `repr`, i.e. shortest-round-trip full
-#     precision, so a change in the last bit shows up as a diff.
+#   * `Dict` / `IdDict` iteration order is never observable — the two identity-keyed region caches are read through the
+#     objects that key them, and every derived multiset is sorted before printing;
+#   * floating-point values print through `repr`, i.e. shortest-round-trip full precision, so a change in the last bit
+#     shows up as a diff.
 #
-# Run it twice; the output must be byte-identical. Compare only runs made with
-# the same Julia version, the same command-line flags and the same thread count:
-# the report is exact to the last bit, and optimisation level or thread count can
-# legitimately reorder a floating-point reduction. The header echoes version and
-# thread count so a mismatched pair is visible in the diff itself.
+# Run it twice; the output must be byte-identical. Compare only runs made with the same Julia version, the same
+# command-line flags and the same thread count: the report is exact to the last bit, and optimisation level or thread
+# count can legitimately reorder a floating-point reduction. The header echoes version and thread count so a mismatched
+# pair is visible in the diff itself.
 #
-# Cost is one-time JIT compilation of the configuration matrix, not arithmetic:
-# the numerical work is well under a second, the process is ~75 s at the default
-# `-O2` and ~55 s at `-O1` (verified byte-identical to `-O2` here). Each level
-# is deterministic within itself, but `-O0` does NOT agree with `-O2` — it
-# reorders reductions — so a report is only comparable against one produced at
-# the same level. The reference baseline is generated at `-O0`, which is also the
-# level `CONTRIBUTING.md` documents for the test suite; keep it there. Nothing is
-# checked in — the report is a hand-run before/after pair, as the recipe above
-# says, so a baseline is only ever as good as the commit it was taken on. Take a
-# fresh one whenever a case is added, because an older baseline has no lines to
-# diff the new case against.
+# Cost is one-time JIT compilation of the configuration matrix, not arithmetic: the numerical work is well under a
+# second, the process is ~75 s at the default `-O2` and ~55 s at `-O1` (verified byte-identical to `-O2` here). Each
+# level is deterministic within itself, but `-O0` does NOT agree with `-O2` — it reorders reductions — so a report is
+# only comparable against one produced at the same level. The reference baseline is generated at `-O0`, which is also
+# the level `CONTRIBUTING.md` documents for the test suite; keep it there. Nothing is checked in — the report is a
+# hand-run before/after pair, as the recipe above says, so a baseline is only ever as good as the commit it was taken
+# on. Take a fresh one whenever a case is added, because an older baseline has no lines to diff the new case against.
 #
 # Findings this instrument is aimed at:
 #   #1  facet/surface region resolution is not subdomain-aware
@@ -78,34 +66,25 @@
 #   #T4 grid-aligned facet integration is not level-set-aware (FIXED; cases 32-33
 #       now pin the fix rather than the defect)
 #
-# WHY #T4 NEEDED TWO NEW CASES, and what the 31 before them do NOT say about it.
-# Grid-aligned facet integration used to take no `PhysicalDomain`: a `FacetRegion`
-# is the whole face of its parent cells, and the rule on it covered all of that
-# face, so where `∂Ω` crossed it the rule spent weight on area Ω does not
-# contain. Cases 32 and 33 are the only cases that can see it, and the gap they
-# closed was not an oversight but a property of the
-# matrix: the two ingredients #T4 needs never co-occurred. The immersed cases
-# (12, 13, 22, 28) carry no boundary selector at all, so they resolve no facet
-# region whatsoever; the facet cases (14, 15, 16, 21) are not immersed, so no face
-# of theirs can leave Ω. Nor are cases 17, 26 and 27, the ones that look immersed:
-# their curved geometry is a user-supplied `BoundaryMesh` or interface, which is
-# cut against the grid already and is out of #T4's scope on principle — the
-# package must decide which part of a face it inherited from the mesh lies in Ω,
-# but must not second-guess geometry the user stated. Every
-# `cut_facet_region_count` those cases print is therefore 0,
-# and the landed fix left all 31 of them byte-identical, sha256 of the first 2029
-# lines 23a0cc2410cd9cc930f29332d7bd905f257c129ec3c5830a0b0a3243c627a811. Read
-# their stability under a facet-integration change as an artifact of the matrix,
-# not as evidence about the change.
+# WHY #T4 NEEDED TWO NEW CASES, and what the 31 before them do NOT say about it. Grid-aligned facet integration used to
+# take no `PhysicalDomain`: a `FacetRegion` is the whole face of its parent cells, and the rule on it covered all of
+# that face, so where `∂Ω` crossed it the rule spent weight on area Ω does not contain. Cases 32 and 33 are the only
+# cases that can see it, and the gap they closed was not an oversight but a property of the matrix: the two
+# ingredients #T4 needs never co-occurred. The immersed cases (12, 13, 22, 28) carry no boundary selector at all, so
+# they resolve no facet region whatsoever; the facet cases (14, 15, 16, 21) are not immersed, so no face of theirs can
+# leave Ω. Nor are cases 17, 26 and 27, the ones that look immersed: their curved geometry is a user-supplied
+# `BoundaryMesh` or interface, which is cut against the grid already and is out of #T4's scope on principle — the
+# package must decide which part of a face it inherited from the mesh lies in Ω, but must not second-guess geometry the
+# user stated. Every `cut_facet_region_count` those cases print is therefore 0, and the landed fix left all 31 of them
+# byte-identical, sha256 of the first 2029 lines 23a0cc2410cd9cc930f29332d7bd905f257c129ec3c5830a0b0a3243c627a811. Read
+# their stability under a facet-integration change as an artifact of the matrix, not as evidence about the change.
 
 # ── Environment ───────────────────────────────────────────────────────────────
 #
-# The B-spline cases need the BasicBSpline extension, which the package's own
-# `--project=.` environment cannot load (it is a weak dependency). If the active
-# project cannot see BasicBSpline, fall back to a dedicated, persistent
-# environment in the depot that devs this repository and adds it. Building that
-# environment happens at most once, and every Pkg message is muted so it can
-# never reach the report.
+# The B-spline cases need the BasicBSpline extension, which the package's own `--project=.` environment cannot load (it
+# is a weak dependency). If the active project cannot see BasicBSpline, fall back to a dedicated, persistent environment
+# in the depot that devs this repository and adds it. Building that environment happens at most once, and every Pkg
+# message is muted so it can never reach the report.
 
 import Pkg
 
@@ -114,12 +93,10 @@ if Base.identify_package("BasicBSpline") === nothing
         repo = normpath(joinpath(@__DIR__, ".."))
 
         Pkg.activate(env; io=devnull)
-        # The environment is persistent and shared across checkouts, so a stale
-        # one may still `dev` a DIFFERENT tree than the one being measured — the
-        # main checkout, say, while this script runs from a git worktree. That
-        # failure is silent and total: the report then describes source the run
-        # never touched, and a fix under test shows up as byte-identical. Re-`dev`
-        # whenever the recorded path is not this repository.
+        # The environment is persistent and shared across checkouts, so a stale one may still `dev` a DIFFERENT tree
+        # than the one being measured — the main checkout, say, while this script runs from a git worktree. That failure
+        # is silent and total: the report then describes source the run never touched, and a fix under test shows up as
+        # byte-identical. Re-`dev` whenever the recorded path is not this repository.
         needs_dev = !isfile(joinpath(env, "Project.toml"))
         if !needs_dev
             manifest = joinpath(env, "Manifest.toml")
@@ -134,9 +111,8 @@ if Base.identify_package("BasicBSpline") === nothing
     end
 end
 
-# Precompile with output muted. Otherwise the first run after any `src/` edit
-# interleaves Julia's precompilation chatter into the report, which reads as a
-# spurious diff in whichever case happened to be printing at the time.
+# Precompile with output muted. Otherwise the first run after any `src/` edit interleaves Julia's precompilation chatter
+# into the report, which reads as a spurious diff in whichever case happened to be printing at the time.
 Pkg.precompile(; io=devnull)
 
 using Unfitted
@@ -149,8 +125,8 @@ using Unfitted: SVector, SMatrix, active_unknowns, raw_dof_count, volume, proble
 
 # ── Formatting ────────────────────────────────────────────────────────────────
 #
-# One key per line, fixed column, value through `fmtval`. Floats print at full
-# precision on purpose: this instrument exists to see the last bit move.
+# One key per line, fixed column, value through `fmtval`. Floats print at full precision on purpose: this instrument
+# exists to see the last bit move.
 
 const KEYPAD = 34
 
@@ -167,16 +143,16 @@ fmtval(x::AbstractVector) = "[" * join(map(fmtval, x), ", ") * "]"
 
 emit(key::AbstractString, value) = println("  ", rpad(key, KEYPAD), " = ", fmtval(value))
 
-# Same column, no indent: the environment lines above the first case. They are
-# not case values, and a diff in them explains a diff in everything below.
+# Same column, no indent: the environment lines above the first case. They are not case values, and a diff in them
+# explains a diff in everything below.
 emit_env(key::AbstractString, value) = println(rpad(key, KEYPAD + 2), " = ", value)
 
-# Compact, order-preserving rendering of a boolean cell mask: column-major
-# scan, one character per cell. Deterministic and short enough to diff by eye.
+# Compact, order-preserving rendering of a boolean cell mask: column-major scan, one character per cell. Deterministic
+# and short enough to diff by eye.
 maskstr(a::AbstractArray{Bool}) = String([b ? '1' : '0' for b in vec(a)])
 
-# Point label for a sample-value key, e.g. "(0.5, 0.5)". Coordinates are picked
-# to have exact short decimal forms, so the key text stays stable.
+# Point label for a sample-value key, e.g. "(0.5, 0.5)". Coordinates are picked to have exact short decimal forms, so
+# the key text stays stable.
 pointlabel(p) = "(" * join((repr(Float64(c)) for c in p), ", ") * ")"
 
 const CASE_MARKS = String[]
@@ -192,11 +168,10 @@ end
 
 # ── Metric kernels ────────────────────────────────────────────────────────────
 
-# Checksum of a sparse matrix that is sensitive to value *and* position: the
-# index-weighted sum moves if any stored value changes or if the same values
-# are stored in a different order, the row/colptr checksums move if the sparsity
-# pattern shifts without changing the values, and the extremal entries pin the
-# two ends of the value range together with where they sit.
+# Checksum of a sparse matrix that is sensitive to value *and* position: the index-weighted sum moves if any stored
+# value changes or if the same values are stored in a different order, the row/colptr checksums move if the sparsity
+# pattern shifts without changing the values, and the extremal entries pin the two ends of the value range together with
+# where they sit.
 function emit_matrix(prefix::AbstractString, A)
     if A === nothing
         emit(prefix * ".state", "unassembled")
@@ -239,8 +214,7 @@ function emit_matrix(prefix::AbstractString, A)
     return nothing
 end
 
-# Same discipline for a dense vector: position-sensitive checksum, magnitude,
-# and the two extremes with their indices.
+# Same discipline for a dense vector: position-sensitive checksum, magnitude, and the two extremes with their indices.
 function emit_vector(prefix::AbstractString, b)
     if b === nothing
         emit(prefix * ".state", "unassembled")
@@ -272,8 +246,8 @@ function emit_vector(prefix::AbstractString, b)
     return nothing
 end
 
-# Sorted multiset of region-kind tags across every subdomain plan, e.g.
-# "cut_fitted=12 full=4". Sorted so the string never depends on Dict order.
+# Sorted multiset of region-kind tags across every subdomain plan, e.g. "cut_fitted=12 full=4". Sorted so the string
+# never depends on Dict order.
 function region_kinds(model)
     counts = Dict{Symbol,Int}()
     for plan in model.space_plans, region in plan.regions
@@ -282,8 +256,8 @@ function region_kinds(model)
     return join((string(k, "=", counts[k]) for k in sort!(collect(keys(counts)))), " ")
 end
 
-# Sorted multiset of per-region cover counts (how many levels cover a region),
-# e.g. "1=12 2=4". A change here means the multi-level intersection moved.
+# Sorted multiset of per-region cover counts (how many levels cover a region), e.g. "1=12 2=4". A change here means the
+# multi-level intersection moved.
 function cover_histogram(model)
     counts = Dict{Int,Int}()
     for plan in model.space_plans, region in plan.regions
@@ -293,9 +267,8 @@ function cover_histogram(model)
     return join((string(k, "=", counts[k]) for k in sort!(collect(keys(counts)))), " ")
 end
 
-# ∫_Ω 1 dx as the model's own quadrature sees it: every region's reference-frame
-# weights times its box jacobian, exactly the `l2_error` convention. This is the
-# single most sensitive scalar in the report — it moves if a cut rule empties
+# ∫_Ω 1 dx as the model's own quadrature sees it: every region's reference-frame weights times its box jacobian, exactly
+# the `l2_error` convention. This is the single most sensitive scalar in the report — it moves if a cut rule empties
 # (#2), if the grid is decimated (#3), or if a region box changes at all.
 function domain_measure(model)
     D = diagnostics(model).dimension
@@ -311,8 +284,8 @@ function domain_measure(model)
     return total
 end
 
-# Number of regions carrying no quadrature point at all. A nonzero count is the
-# silent-zero-stiffness condition described in the `PhysicalDomain` docstring.
+# Number of regions carrying no quadrature point at all. A nonzero count is the silent-zero-stiffness condition
+# described in the `PhysicalDomain` docstring.
 function empty_region_count(model)
     n = 0
     for plan in model.space_plans, region in plan.regions
@@ -321,8 +294,7 @@ function empty_region_count(model)
     return n
 end
 
-# The whole diagnostics record, in a fixed order, plus the plan-derived
-# quantities the record does not carry.
+# The whole diagnostics record, in a fixed order, plus the plan-derived quantities the record does not carry.
 function emit_model(model)
     d = diagnostics(model)
     emit("dimension", d.dimension)
@@ -360,9 +332,8 @@ function emit_model(model)
     return nothing
 end
 
-# `prefix` namespaces every key, so a case reporting more than one solved model
-# keeps its key set unambiguous. The default is empty and prints exactly the
-# unprefixed keys.
+# `prefix` namespaces every key, so a case reporting more than one solved model keeps its key set unambiguous. The
+# default is empty and prints exactly the unprefixed keys.
 function emit_solution(model, solution; exact=nothing, points=(), fields=(), prefix="")
     emit(prefix * "solver.method", solution.diagnostics.method)
     emit(prefix * "solver.residual_norm", solution.diagnostics.residual_norm)
@@ -384,20 +355,17 @@ function emit_solution(model, solution; exact=nothing, points=(), fields=(), pre
     return nothing
 end
 
-# The L² Dirichlet trace projection's own record, for the cases whose subject is
-# the facet rule that projection is built on: how many of the model's constrained
-# values came out nonzero, which branch the per-component trace solve took, and
-# which dofs it had no measure to fit. The last two come off the diagnostics
-# record, where the package reports them itself — this used to re-apply the
-# condition list through `update_dirichlet!` purely to get at the discarded
-# `DirichletProjection` and read its factor types, which also dropped the cached
-# operators and so had to run after `emit_model`. Neither constraint survives.
+# The L² Dirichlet trace projection's own record, for the cases whose subject is the facet rule that projection is built
+# on: how many of the model's constrained values came out nonzero, which branch the per-component trace solve took, and
+# which dofs it had no measure to fit. The last two come off the diagnostics record, where the package reports them
+# itself — this used to re-apply the condition list through `update_dirichlet!` purely to get at the discarded
+# `DirichletProjection` and read its factor types, which also dropped the cached operators and so had to run after
+# `emit_model`. Neither constraint survives.
 #
-# `only` on the field layouts keeps the first key inside the determinism rules
-# rather than beside them: a single-field model carries one entry, so no iteration
-# order is observable, and `only` throws rather than printing an arbitrary one if
-# a later case is multi-field. The diagnostics quantities need no such care —
-# both are ordered by the layout's own field and component order.
+# `only` on the field layouts keeps the first key inside the determinism rules rather than beside them: a single-field
+# model carries one entry, so no iteration order is observable, and `only` throws rather than printing an arbitrary one
+# if a later case is multi-field. The diagnostics quantities need no such care — both are ordered by the layout's own
+# field and component order.
 function emit_dirichlet_projection(model)
     d = diagnostics(model)
     emit("dirichlet.nonzero_value_count", count(!iszero, only(model.dofs.fields).dofs.constrained_values))
@@ -407,15 +375,12 @@ function emit_dirichlet_projection(model)
     return nothing
 end
 
-# The facet rule's own statistics, for the two cases whose subject is that rule.
-# Emitted here rather than from `emit_model` on purpose: every case would then
-# grow four lines, and the 31 cases that came before #T4 have to stay byte-
-# identical for the diff to mean anything. The first three are the facet
-# analogues of the cut-cell fit statistics and say how the moment fit on each
-# cut face's affine slice went; the fourth is the smallest integrated-to-
-# geometric measure ratio over the regions, which is the conditioning warning a
-# trimmed Dirichlet condition needs and reads exactly 0 where a face lies wholly
-# outside Ω at α = 0.
+# The facet rule's own statistics, for the two cases whose subject is that rule. Emitted here rather than from
+# `emit_model` on purpose: every case would then grow four lines, and the 31 cases that came before #T4 have to stay
+# byte- identical for the diff to mean anything. The first three are the facet analogues of the cut-cell fit statistics
+# and say how the moment fit on each cut face's affine slice went; the fourth is the smallest integrated-to- geometric
+# measure ratio over the regions, which is the conditioning warning a trimmed Dirichlet condition needs and reads
+# exactly 0 where a face lies wholly outside Ω at α = 0.
 function emit_facet_rule(model)
     d = diagnostics(model)
     emit("facet_fit_failure_count", d.facet_fit_failure_count)
@@ -425,9 +390,8 @@ function emit_facet_rule(model)
     return nothing
 end
 
-# Run `f`, reporting either its value or the type of the exception it raised.
-# Used wherever a fix is expected to convert silent-wrong into a loud error, so
-# the report keeps its shape across that transition.
+# Run `f`, reporting either its value or the type of the exception it raised. Used wherever a fix is expected to convert
+# silent-wrong into a loud error, so the report keeps its shape across that transition.
 attempt(label::AbstractString, f) =
     try
         v = f()
@@ -440,8 +404,8 @@ attempt(label::AbstractString, f) =
 
 # ── Shared fixtures ───────────────────────────────────────────────────────────
 
-# Manufactured solutions that the shipped orders represent exactly, so the
-# printed `l2_error` sits at round-off and any real change is unmissable.
+# Manufactured solutions that the shipped orders represent exactly, so the printed `l2_error` sits at round-off and any
+# real change is unmissable.
 u1d(x) = x[1] * (1 - x[1])
 f1d(x) = 2.0
 u2d(x) = x[1] * (1 - x[1]) * x[2] * (1 - x[2])
@@ -469,10 +433,9 @@ function poisson_case(V, source, exact, points)
     return model, solution
 end
 
-# One prepared + solved model whose only block is `stiffness_block(u; diffusion)`,
-# driven by `source` under zero Dirichlet data on ∂Ω. Split out so the several
-# spellings of `diffusion` reach the assembler through one identical path and a
-# difference between them can only come from `_diffusion_flux`.
+# One prepared + solved model whose only block is `stiffness_block(u; diffusion)`, driven by `source` under zero
+# Dirichlet data on ∂Ω. Split out so the several spellings of `diffusion` reach the assembler through one identical path
+# and a difference between them can only come from `_diffusion_flux`.
 function diffusion_case(V, diffusion, source)
     u = field(:u, V)
     model = prepare(Problem((u,); blocks=(stiffness_block(u; diffusion),), loads=(source_load(u; source),),
@@ -650,8 +613,8 @@ function main()
         V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(3, 3), order=2),
         u1 = field(:u1, V1),
         u2 = field(:u2, V2),
-        # Harmonic and linear, so each subdomain solution is the Dirichlet lift
-        # alone and any error in the lift shows at every sample point.
+        # Harmonic and linear, so each subdomain solution is the Dirichlet lift alone and any error in the lift shows at
+        # every sample point.
         g = x -> 1 + x[1]
 
         model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
@@ -772,9 +735,8 @@ function main()
         u1 = field(:u1, V1),
         u2 = field(:u2, V2)
 
-        # u = x − x₀ on each subdomain: Δu = 0, u = 0 on the lower-x face,
-        # ∂u/∂n = 1 on the upper-x face. The two selectors are separately
-        # constructed and value-equal — the shape the finding names.
+        # u = x − x₀ on each subdomain: Δu = 0, u = 0 on the lower-x face, ∂u/∂n = 1 on the upper-x face. The two
+        # selectors are separately constructed and value-equal — the shape the finding names.
         model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
                                 loads=(neumann(u1, 1.0; on=boundary(axis=1, side=:upper)),
                                        neumann(u2, 1.0; on=boundary(axis=1, side=:upper))),
@@ -893,10 +855,9 @@ function main()
             emit(tag * ".error_vs_exact", total - exact_area)
         end
         emit("exact_area", exact_area)
-        # The discarding combination is what #8 rejects, so this one is built
-        # under `attempt`: before the fix it constructs and reports the wrong
-        # integral below, after the fix it throws and there is nothing to report.
-        # Every other configuration here is legal on both sides of the fix.
+        # The discarding combination is what #8 rejects, so this one is built under `attempt`: before the fix it
+        # constructs and reports the wrong integral below, after the fix it throws and there is nothing to report. Every
+        # other configuration here is legal on both sides of the fix.
         kwarg_on_tree = attempt("kwarg_on_tree.construct",
                                 () -> physical_domain(leaf(phi); lipschitz=1.0, subcell_length_scale=0.1))
         kwarg_on_tree === nothing || report("kwarg_on_tree", kwarg_on_tree)
@@ -966,10 +927,9 @@ function main()
                                            dirichlet(0.0; on=boundary(axis=1, side=:lower), field=:u2),
                                            dirichlet(0.0; on=boundary(axis=1, side=:upper), field=:u2)]))
         solution = solve!(model)
-        # Read the interface-region cache through the very object that keys it:
-        # the cache is an `IdDict`, so iterating it would expose identity-hash
-        # order to the report. `prepare` pre-resolves every referenced interface,
-        # so a `KeyError` here would itself be a finding.
+        # Read the interface-region cache through the very object that keys it: the cache is an `IdDict`, so iterating
+        # it would expose identity-hash order to the report. `prepare` pre-resolves every referenced interface, so a
+        # `KeyError` here would itself be a finding.
         regions = model.interface_regions[cpl[1].on]
         measure = 0.0
         for region in regions, w in region.weights
@@ -1122,18 +1082,16 @@ function main()
     let V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2),
         dense = [2.0 0.75; 0.75 3.0],
         static = SMatrix{2,2}(dense),
-        # −∇·(A ∇u) for u = u2d and this constant symmetric A. u2d is degree 2
-        # per axis, so `order = 2` reproduces it and l2_error sits at round-off.
+        # −∇·(A ∇u) for u = u2d and this constant symmetric A. u2d is degree 2 per axis, so `order = 2` reproduces it
+        # and l2_error sits at round-off.
         f_tensor = x -> (2 * dense[1, 1] * x[2] * (1 - x[2]) + 2 * dense[2, 2] * x[1] * (1 - x[1]) -
                          (dense[1, 2] + dense[2, 1]) * (1 - 2 * x[1]) * (1 - 2 * x[2]))
 
         emit("tensor", (dense[1, 1], dense[1, 2], dense[2, 1], dense[2, 2]))
 
-        # The contraction on its own, against a non-symmetric tensor. The
-        # solved model below carries a symmetric A, where swapping A for Aᵀ is
-        # invisible; here it moves these numbers, as does landing on the wrong
-        # branch of `_diffusion_flux`. A change of rounding alone does not move
-        # them at the -O0 this baseline is generated at.
+        # The contraction on its own, against a non-symmetric tensor. The solved model below carries a symmetric A,
+        # where swapping A for Aᵀ is invisible; here it moves these numbers, as does landing on the wrong branch of
+        # `_diffusion_flux`. A change of rounding alone does not move them at the -O0 this baseline is generated at.
         let skew = [2.0 0.75; 0.25 3.0], g = SVector(0.3, -0.7)
             emit("flux.dense", Tuple(_diffusion_flux(skew, g)))
             emit("flux.static", Tuple(_diffusion_flux(SMatrix{2,2}(skew), g)))
@@ -1152,8 +1110,8 @@ function main()
         emit("dense_equals_static.matrix", model.matrix == static_model.matrix)
         emit("dense_equals_static.coefficients", solution.coefficients == static_solution.coefficients)
 
-        # The isotropic branch at a non-unit coefficient, which no other case
-        # reaches: 2.5 f2d is the source that keeps u2d exact for diffusion 2.5.
+        # The isotropic branch at a non-unit coefficient, which no other case reaches: 2.5 f2d is the source that keeps
+        # u2d exact for diffusion 2.5.
         scalar_model, scalar_solution = diffusion_case(V, 2.5, x -> 2.5 * f2d(x))
         emit_matrix("scalar.matrix", scalar_model.matrix)
         emit_solution(scalar_model, scalar_solution; exact=u2d, points=P2, prefix="scalar.")
@@ -1196,17 +1154,14 @@ function main()
         emit_facet_rule(model)
         emit("facet_measure.x_lower", boundary_integral(q -> 1.0, model; on=face))
         emit("facet_measure_exact.x_lower", 0.55)
-        # The trimmed FLUX, which nothing else in the repository measures — no
-        # shipped example puts a Neumann or Robin term on a face that ∂Ω cuts. The
-        # outward normal here is the constant −e₁, so this integral is exactly
-        # minus the measure above and moves with it; a flux is the consumer a wrong
-        # face measure corrupts most directly, since a reaction force or a heat
-        # flow *is* this integral rather than merely being fitted over it.
+        # The trimmed FLUX, which nothing else in the repository measures — no shipped example puts a Neumann or Robin
+        # term on a face that ∂Ω cuts. The outward normal here is the constant −e₁, so this integral is exactly minus
+        # the measure above and moves with it; a flux is the consumer a wrong face measure corrupts most directly, since
+        # a reaction force or a heat flow *is* this integral rather than merely being fitted over it.
         emit("facet_flux.x_lower", boundary_integral(q -> q.normal[1], model; on=face))
         emit("facet_flux_exact.x_lower", -0.55)
-        # No manufactured solution: g is harmonic, but the immersed cut carries the
-        # natural condition rather than g, so the solution is not g anywhere. These
-        # are diffable sample values, not an accuracy claim.
+        # No manufactured solution: g is harmonic, but the immersed cut carries the natural condition rather than g, so
+        # the solution is not g anywhere. These are diffable sample values, not an accuracy claim.
         emit_solution(model, solution; points=P2)
         emit_dirichlet_projection(model)
     end
@@ -1241,11 +1196,10 @@ function main()
               "is an open semantic question rather than a defect in the rule.")
     let disc = leaf(x -> 0.3 - hypot(x[1], x[2]); lipschitz=1.0),
         p = physical_domain(disc; subcell_length_scale=0.0625),
-        # −Δ sin(x₁ + 2x₂) = 5 sin(x₁ + 2x₂), so g is the manufactured solution of
-        # the box problem. It is NOT the solution here: the immersed hole carries
-        # the natural condition, which g does not satisfy, so l2_error.* reads a
-        # few percent and is a diffable scalar rather than an accuracy claim. It
-        # earns its place by being global — it moves if the trace fit moves at all.
+        # −Δ sin(x₁ + 2x₂) = 5 sin(x₁ + 2x₂), so g is the manufactured solution of the box problem. It is NOT the
+        # solution here: the immersed hole carries the natural condition, which g does not satisfy, so l2_error.* reads
+        # a few percent and is a diffable scalar rather than an accuracy claim. It earns its place by being global — it
+        # moves if the trace fit moves at all.
         g = x -> sin(x[1] + 2x[2])
 
         V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=p)
@@ -1258,16 +1212,13 @@ function main()
         emit("facet_measure.x_upper", measure(boundary(axis=1, side=:upper)))
         emit("facet_measure.y_lower", measure(boundary(axis=2, side=:lower)))
         emit("facet_measure.y_upper", measure(boundary(axis=2, side=:upper)))
-        # Only the two faces the disc reaches are wrong; the upper two already read
-        # their physical measure of 1.0, and that they keep reading it is half the
-        # point of printing all four.
+        # Only the two faces the disc reaches are wrong; the upper two already read their physical measure of 1.0, and
+        # that they keep reading it is half the point of printing all four.
         emit("facet_measure_exact.x_lower", 1 - 0.3)
         emit("facet_measure_exact.y_lower", 1 - 0.3)
-        # The hazard, pinned so it cannot quietly stop being the hazard: were the
-        # corner cell ever to classify fictitious, the whole-cell fold would drop
-        # its faces and the `pinv` transition above would not be reachable here.
-        # The two faces are mirror images through x₁ ↔ x₂ and `hypot` is symmetric,
-        # so one φ reading covers both.
+        # The hazard, pinned so it cannot quietly stop being the hazard: were the corner cell ever to classify
+        # fictitious, the whole-cell fold would drop its faces and the `pinv` transition above would not be reachable
+        # here. The two faces are mirror images through x₁ ↔ x₂ and `hypot` is symmetric, so one φ reading covers both.
         emit("corner_cell.classification", classify_cell(p, cell_box(V, CartesianIndex(1, 1); level=1)))
         emit("corner_cell.active", active_cells(model; level=1)[1, 1])
         emit("corner_cell.face_phi_at_far_end", levelset_value(p, SVector(0.0, 0.25)))

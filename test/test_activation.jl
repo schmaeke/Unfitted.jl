@@ -15,8 +15,8 @@ using SparseArrays
     @test !mask.on[1, 1]
     @test mask.on[2, 2]
 
-    # Pre-built LevelMask passes through as a copy (caller mutations of the
-    # original BitArray must not leak into the model).
+    # Pre-built LevelMask passes through as a copy (caller mutations of the original BitArray must not leak into the
+    # model).
     passed = Unfitted._normalize_mask(mask, mesh)
     @test passed isa Unfitted.LevelMask{2}
     @test passed.on == mask.on
@@ -47,9 +47,8 @@ end
     @test !Unfitted.is_active(mask, CartesianIndex(2, 2))
 end
 
-# Standard "safe" overlay configuration used across tests: base order=2 with an
-# overlay box misaligned with the base mesh and overlay order=3, avoiding the
-# rank-deficient case of a same-order overlay whose cells exactly coincide with
+# Standard "safe" overlay configuration used across tests: base order=2 with an overlay box misaligned with the base
+# mesh and overlay order=3, avoiding the rank-deficient case of a same-order overlay whose cells exactly coincide with
 # base cells.
 const _OMEGA = box((0.0, 0.0), (1.0, 1.0))
 function _safe_overlay(; overlay_cells=(4, 4), active=nothing)
@@ -94,11 +93,10 @@ end
 end
 
 @testset "half-mask matches geometrically smaller overlay" begin
-    # Partial: overlay (0.3,0.7)x(0.3,0.7) with cells=(4,4), order=3; cells with
-    # axis-1 index <= 2 active -> active region is (0.3,0.5)x(0.3,0.7) with 2x4
-    # cells of width 0.1.
-    # Reference: overlay (0.3,0.5)x(0.3,0.7) with cells=(2,4), order=3 of width 0.1.
-    # Both overlays are misaligned with the (1/8-cell-width) base mesh.
+    # Partial: overlay (0.3,0.7)x(0.3,0.7) with cells=(4,4), order=3; cells with axis-1 index <= 2 active -> active
+    # region is (0.3,0.5)x(0.3,0.7) with 2x4 cells of width 0.1.
+    # Reference: overlay (0.3,0.5)x(0.3,0.7) with cells=(2,4), order=3 of width 0.1. Both overlays are misaligned with
+    # the (1/8-cell-width) base mesh.
     bc = dirichlet(0.0; on=boundary(:all))
     src = x -> sin(pi * x[1]) * sin(pi * x[2])
 
@@ -121,9 +119,8 @@ end
 end
 
 @testset "interior active/inactive face introduces artificial constraint" begin
-    # Overlay 3x3 cells (axis indices 1..3) over (0.3,0.7)x(0.3,0.7); deactivate
-    # cell (1,1). The NODE-NODE dof at overlay axis indices (2,2) lies on the
-    # interior face between active and inactive cells -> artificial constraint.
+    # Overlay 3x3 cells (axis indices 1..3) over (0.3,0.7)x(0.3,0.7); deactivate cell (1,1). The NODE-NODE dof at
+    # overlay axis indices (2,2) lies on the interior face between active and inactive cells -> artificial constraint.
     # The NODE-NODE dof at (3,2) is fully enclosed by active cells -> free.
     bc = dirichlet(0.0; on=boundary(:all))
     inactive_one = setdiff(vec([CartesianIndex(i, j) for i in 1:3, j in 1:3]), [CartesianIndex(1, 1)])
@@ -174,8 +171,7 @@ end
     assemble!(m_serial; threaded=false)
     assemble!(m_threaded; threaded=true)
 
-    # Threaded assembly may reassociate region contributions; differences must
-    # stay at roundoff scale.
+    # Threaded assembly may reassociate region contributions; differences must stay at roundoff scale.
     @test m_serial.matrix ≈ m_threaded.matrix
     @test m_serial.rhs ≈ m_threaded.rhs
 
@@ -188,8 +184,8 @@ end
     bc = dirichlet(0.0; on=boundary(:all))
     src = x -> sin(pi * x[1]) * sin(pi * x[2])
 
-    # Only cell (1,1) of the 4x4 overlay is active. Point (0.6, 0.6) sits well
-    # inside the inactive region -> overlay contribution must be exactly zero.
+    # Only cell (1,1) of the 4x4 overlay is active. Point (0.6, 0.6) sits well inside the inactive region -> overlay
+    # contribution must be exactly zero.
     V = overlay(space(_OMEGA; cells=(8, 8), order=2), box((0.3, 0.3), (0.7, 0.7)); cells=(4, 4), order=3,
                 active=[CartesianIndex(1, 1)])
     model = prepare(poisson(V; source=src, dirichlet=[bc]))
@@ -274,9 +270,8 @@ end
 end
 
 @testset "move! carries the caller's mask flips across" begin
-    # `move!` re-derives from the pre-fold problem, so the flips `activate!` /
-    # `deactivate!` recorded have to be recorded there too — otherwise moving
-    # one overlay silently reverts the caller's mask everywhere, including on
+    # `move!` re-derives from the pre-fold problem, so the flips `activate!` / `deactivate!` recorded have to be
+    # recorded there too — otherwise moving one overlay silently reverts the caller's mask everywhere, including on
     # levels the move does not touch.
     bc = dirichlet(0.0; on=boundary(:all))
     V = overlay(overlay(space(_OMEGA; cells=(8, 8), order=2), box((0.1, 0.1), (0.5, 0.5)); cells=(4, 4), order=2),
@@ -365,12 +360,10 @@ end
 end
 
 @testset "activating a fold-deactivated cell does not override the geometry" begin
-    # The fictitious fold and the user's `active =` selection are merged into one
-    # `LevelMask`, and only one of them is the caller's to set. A cell the
-    # classifier found entirely outside Ω carries no material, has no quadrature
-    # rule and contributes nothing, so `activate!` on it is a no-op on the
-    # effective space — while staying visible in the pre-fold record, which is
-    # what a later `move!` or a geometry change re-derives from.
+    # The fictitious fold and the user's `active =` selection are merged into one `LevelMask`, and only one of them is
+    # the caller's to set. A cell the classifier found entirely outside Ω carries no material, has no quadrature rule
+    # and contributes nothing, so `activate!` on it is a no-op on the effective space — while staying visible in the
+    # pre-fold record, which is what a later `move!` or a geometry change re-derives from.
     disc = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.4; lipschitz=1.0, subcell_length_scale=0.05)
     V = space(box((-1.0, -1.0), (1.0, 1.0)); cells=(4, 4), order=1, physical=disc)
     model = prepare(mass(V; coefficient=1.0))

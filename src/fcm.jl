@@ -1,5 +1,4 @@
-# Finite-cell-method (FCM) machinery: non-negative moment-fitted quadrature
-# for cells crossed by ∂Ω.
+# Finite-cell-method (FCM) machinery: non-negative moment-fitted quadrature for cells crossed by ∂Ω.
 #
 # Algorithm
 #
@@ -7,23 +6,19 @@
 #
 #     mₐ = ∫_{Ω ∩ R} ψₐ(ξ(x)) dx,
 #
-#   are computed exactly by the Saye dimension-reduction implicit-quadrature
-#   kernel in `src/implicit.jl` (the CSG level set in
-#   `src/physical.jl` supplies the leaves and the membership predicate). A
-#   non-negative least-squares (NNLS) moment fit then selects quadrature
-#   weights at the kernel's volume-rule points so the weighted point rule
-#   reproduces the moments — the moment-fitting idea of
+#   are computed exactly by the Saye dimension-reduction implicit-quadrature kernel in `src/implicit.jl` (the CSG level
+#   set in `src/physical.jl` supplies the leaves and the membership predicate). A non-negative least-squares (NNLS)
+#   moment fit then selects quadrature weights at the kernel's volume-rule points so the weighted point rule reproduces
+#   the moments — the moment-fitting idea of
 #
 #     B. Müller, F. Kummer, M. Oberlack, "Highly accurate surface and volume
 #     integration on implicit domains by means of moment-fitting", Int. J.
 #     Numer. Methods Engng. 96 (2013) 512–528, doi:10.1002/nme.4569.
 #
-#   The NNLS moment-fit structure follows QuESo's `QuadratureTrimmedElement`
-#   (M. Meßmer et al., Comput. Methods Appl. Mech. Engrg. 400 (2022) 115584,
-#   doi:10.1016/j.cma.2022.115584; https://github.com/manuelmessmer/QuESo,
-#   BSD-4-Clause). The Lawson–Hanson NNLS solver wrapped by `nnls` is the
-#   classical C. L. Lawson, R. J. Hanson, "Solving Least Squares Problems",
-#   Prentice-Hall (1974), Ch. 23 (SIAM reprint doi:10.1137/1.9781611971217).
+#   The NNLS moment-fit structure follows QuESo's `QuadratureTrimmedElement` (M. Meßmer et al., Comput. Methods Appl.
+#   Mech. Engrg. 400 (2022) 115584, doi:10.1016/j.cma.2022.115584; https://github.com/manuelmessmer/QuESo,
+#   BSD-4-Clause). The Lawson–Hanson NNLS solver wrapped by `nnls` is the classical C. L. Lawson, R. J. Hanson, "Solving
+#   Least Squares Problems", Prentice-Hall (1974), Ch. 23 (SIAM reprint doi:10.1137/1.9781611971217).
 #
 # Deviations from QuESo
 #
@@ -40,27 +35,23 @@
 #   Non-graph-like cells (high curvature relative to the cell) are handled by the
 #   kernel's bounded subdivision, so no separate fallback path is needed.
 #
-#   `moment_fit_rule` does carry an outer retry of its own, and it is a different
-#   mechanism from QuESo's: a bounded three-attempt densification of the NNLS
-#   candidate cloud, there purely for the conditioning of the least-squares
-#   solve. It never searches for points to eliminate from a fitted rule, and
-#   never deepens the subdivision the kernel is allowed.
+#   `moment_fit_rule` does carry an outer retry of its own, and it is a different mechanism from QuESo's: a bounded
+#   three-attempt densification of the NNLS candidate cloud, there purely for the conditioning of the least-squares
+#   solve. It never searches for points to eliminate from a fitted rule, and never deepens the subdivision the kernel is
+#   allowed.
 #
 # Pipeline summary
 #
 #   1. NNLS wrapper around `NonNegLeastSquares.nonneg_lsq` (Lawson–Hanson).
 #   2. Saye implicit volume rule (`implicit_volume_quadrature`) over Ω ∩ R.
-#   3. Exact moments by `mₐ = Σ_q w_q ψₐ(x_q)`; the rule's points are the
-#      moment-fit candidates, capped at a multiple of nbasis that grows with the
-#      retry index.
-#   4. A single NNLS moment fit (Lawson–Hanson naturally yields ≤ nbasis
-#      non-negative weights; the volume rule of step 2 is itself a zero-residual
-#      non-negative solution, so one solve on a candidate cloud that retains
-#      enough of it reaches machine-level residual), then a truncation of the
-#      near-zero weights at a cutoff relative to the cut volume, with the
-#      residual re-measured on the weights that survive it.
-#   5. If no attempt fits, fall back to the volume rule of step 2 itself — the
-#      moments' own source data, correct but uncompressed.
+#   3. Exact moments by `mₐ = Σ_q w_q ψₐ(x_q)`; the rule's points are the moment-fit candidates, capped at a multiple of
+#      nbasis that grows with the retry index.
+#   4. A single NNLS moment fit (Lawson–Hanson naturally yields ≤ nbasis non-negative weights; the volume rule of step 2
+#      is itself a zero-residual non-negative solution, so one solve on a candidate cloud that retains enough of it
+#      reaches machine-level residual), then a truncation of the near-zero weights at a cutoff relative to the cut
+#      volume, with the residual re-measured on the weights that survive it.
+#   5. If no attempt fits, fall back to the volume rule of step 2 itself — the moments' own source data, correct but
+#      uncompressed.
 #
 #   Public entry point: `moment_fit_rule(physical, region_box, moment_order)`.
 
@@ -75,43 +66,32 @@ Solve the non-negativity-constrained linear least-squares problem
 
 returning the solution vector and the L² residual `‖A x − b‖₂`.
 
-Wraps `NonNegLeastSquares.nonneg_lsq` with `alg = :nnls`, the classical
-Lawson–Hanson (1974) active-set algorithm. It operates directly on the
-`nbasis × npoints` design matrix and converges in roughly `nbasis` outer
-iterations, each solving a small `|P| × |P|` linear system with `|P| ≤ nbasis`.
-The moment-fit matrix is short and wide (`nbasis ≪ npoints`), so the matrix the
-algorithm walks IS the small one.
+Wraps `NonNegLeastSquares.nonneg_lsq` with `alg = :nnls`, the classical Lawson–Hanson (1974) active-set algorithm. It
+operates directly on the `nbasis × npoints` design matrix and converges in roughly `nbasis` outer iterations, each
+solving a small `|P| × |P|` linear system with `|P| ≤ nbasis`. The moment-fit matrix is short and wide
+(`nbasis ≪ npoints`), so the matrix the algorithm walks IS the small one.
 
-The Bro & de Jong (1997) Fast NNLS variant (`alg = :fnnls`) works on the
-`npoints × npoints` Gram matrix instead, which is the wrong shape here: our
-candidate cloud is `6 · nbasis` wide, so the Gram matrix is the large one.
-Measured on one cut cell of the space-time cavity geometry, `:fnnls` against
-`:nnls` at a candidate count of 162 / 750 / 2058: 0.000 s vs 0.004 s,
-0.014 s vs 0.005 s, and 29.7 s vs 0.124 s — it wins only on the smallest cloud
-and is 240× slower by `nbasis = 343`. It is also markedly less accurate, the
-relative moment residual running 2.7e-15 / 6.2e-05 / 1.4e-03 against
-`:nnls`'s uniform ~1e-15, so the Gram formulation loses the conditioning the
-Householder walk keeps. `:nnls` is the right choice on both counts.
+The Bro & de Jong (1997) Fast NNLS variant (`alg = :fnnls`) works on the `npoints × npoints` Gram matrix instead, which
+is the wrong shape here: our candidate cloud is `6 · nbasis` wide, so the Gram matrix is the large one. Measured on one
+cut cell of the space-time cavity geometry, `:fnnls` against `:nnls` at a candidate count of 162 / 750 / 2058: 0.000 s
+vs 0.004 s, 0.014 s vs 0.005 s, and 29.7 s vs 0.124 s — it wins only on the smallest cloud and is 240× slower by
+`nbasis = 343`. It is also markedly less accurate, the relative moment residual running 2.7e-15 / 6.2e-05 / 1.4e-03
+against `:nnls`'s uniform ~1e-15, so the Gram formulation loses the conditioning the Householder walk keeps. `:nnls` is
+the right choice on both counts.
 
-`max_iter` is raised to `10 · npoints` from the library default of
-`3 · npoints`. It counts the algorithm's *inner* iterations, not its outer ones
-(`NonNegLeastSquares/src/nnls.jl`), so it is not a bound on the `nbasis` columns
-the active set accepts. Lawson–Hanson stays feasible at every step, so reaching
-the cap is not a wrong answer — but the library announces it by printing
-`NNLS quitting on iteration count` to stdout, and a library call has no business
-writing there. Raising a cap cannot change a solve that converged under the old
-one: the cap only ever truncates.
+`max_iter` is raised to `10 · npoints` from the library default of `3 · npoints`. It counts the algorithm's *inner*
+iterations, not its outer ones (`NonNegLeastSquares/src/nnls.jl`), so it is not a bound on the `nbasis` columns the
+active set accepts. Lawson–Hanson stays feasible at every step, so reaching the cap is not a wrong answer — but the
+library announces it by printing `NNLS quitting on iteration count` to stdout, and a library call has no business
+writing there. Raising a cap cannot change a solve that converged under the old one: the cap only ever truncates.
 
-How far cells overrun is not a few percent. At moment order `(8, 8, 8)` on the
-space-time cavity geometry the cap is still reached, at ten times the library
-default, on cells whose candidate cloud is degenerate enough to make the walk
-cycle. Those are the cells `_cap_candidates` used to manufacture with an integer
-stride; the fractional spacing it now uses removes most of them, and the ones
-that remain are a signal that the cell is under-resolved for its geometric
+How far cells overrun is not a few percent. At moment order `(8, 8, 8)` on the space-time cavity geometry the cap is
+still reached, at ten times the library default, on cells whose candidate cloud is degenerate enough to make the walk
+cycle. Those are the cells `_cap_candidates` used to manufacture with an integer stride; the fractional spacing it now
+uses removes most of them, and the ones that remain are a signal that the cell is under-resolved for its geometric
 complexity rather than evidence the cap is too small.
 
-Allocations are owned by `NonNegLeastSquares.jl`; `A` and `b` are not mutated,
-so the name carries no `!`.
+Allocations are owned by `NonNegLeastSquares.jl`; `A` and `b` are not mutated, so the name carries no `!`.
 """
 function nnls(A::AbstractMatrix{T}, b::AbstractVector{T}) where {T<:Real}
     x = vec(nonneg_lsq(A, b; alg=:nnls, max_iter=10 * size(A, 2)))
@@ -121,9 +101,8 @@ end
 
 # ── 2. Tensor Legendre basis on a region box ──────────────────────────────────
 
-# Flat lexicographic ordering of tensor-product Legendre indices up to
-# `moment_order` per axis: `vec(CartesianIndices(0:p₁, …, 0:p_D))`. The
-# resulting `Vector{CartesianIndex{D}}` is the moment-basis index list
+# Flat lexicographic ordering of tensor-product Legendre indices up to `moment_order` per axis:
+# `vec(CartesianIndices(0:p₁, …, 0:p_D))`. The resulting `Vector{CartesianIndex{D}}` is the moment-basis index list
 # `α = (α₁, …, α_D)` used by the moment vector and the moment-fit matrix.
 function _moment_basis_indices(moment_order::NTuple{D,Int}) where {D}
     return vec(collect(CartesianIndices(ntuple(d -> 0:moment_order[d], D))))
@@ -132,13 +111,13 @@ end
 # Cardinality of the tensor-product moment basis, `prod(moment_order .+ 1)`.
 _moment_basis_count(moment_order::NTuple{D,Int}) where {D} = prod(moment_order .+ 1)
 
-# Fill caller-owned per-axis 1D Legendre value tables for the point `x` mapped
-# into the region's reference frame `[−1, 1]ᴰ`:
+# Fill caller-owned per-axis 1D Legendre value tables for the point `x` mapped into the region's reference frame
+# `[−1, 1]ᴰ`:
 #
 #     factors[d][p + 1] = L_p(ξ_d),    ξ_d = (2 x[d] − lower[d] − upper[d]) / (upper[d] − lower[d]),
 #
-# via one Legendre three-term recurrence per axis, so the per-point cost is
-# `D · (order + 1)` instead of `D · (order + 1)^D`.
+# via one Legendre three-term recurrence per axis, so the per-point cost is `D · (order + 1)` instead of
+# `D · (order + 1)^D`.
 function _fill_legendre_factors!(factors, x::SVector{D,T}, lower::SVector{D,T}, upper::SVector{D,T},
                                  moment_order::NTuple{D,Int}) where {D,T}
     @inbounds for d in 1:D
@@ -160,15 +139,14 @@ function _fill_legendre_factors!(factors, x::SVector{D,T}, lower::SVector{D,T}, 
     return nothing
 end
 
-# Caller-owned per-axis 1D scratch buffers used by `_fill_legendre_factors!` and
-# the tensor-product evaluation: one `Vector{T}` per axis, length
-# `moment_order[d] + 1`. Allocated once per call, then reused across points.
+# Caller-owned per-axis 1D scratch buffers used by `_fill_legendre_factors!` and the tensor-product evaluation: one
+# `Vector{T}` per axis, length `moment_order[d] + 1`. Allocated once per call, then reused across points.
 function _legendre_factor_buffers(moment_order::NTuple{D,Int}, ::Type{T}) where {D,T}
     return ntuple(d -> Vector{T}(undef, moment_order[d] + 1), D)
 end
 
-# Tensor-product basis value at the point whose per-axis Legendre factors are
-# loaded into `factors`: `ψ_α(ξ) = ∏_d L_{α_d}(ξ_d) = ∏_d factors[d][α_d + 1]`.
+# Tensor-product basis value at the point whose per-axis Legendre factors are loaded into `factors`:
+# `ψ_α(ξ) = ∏_d L_{α_d}(ξ_d) = ∏_d factors[d][α_d + 1]`.
 function _tensor_legendre_value(factors, idx::CartesianIndex{D}) where {D}
     v = factors[1][idx.I[1] + 1]
     @inbounds for d in 2:D
@@ -179,34 +157,27 @@ end
 
 # ── 3. Moment-fit matrix and single solve ─────────────────────────────────────
 
-# Drop a candidate weight when its NNLS solution falls below this threshold
-# (numerical noise around true zeros). The number is dimensionless: a quadrature
-# weight carries the units of a volume, so the cutoff is taken *relative to the
-# cut volume* `∫_{Ω∩R} 1 dx` in `_solve_moment_fit` below. Every weight scales as
-# (length scale)ᴰ, so an absolute constant instead keeps every weight on a
-# geometry of unit size and empties the rule on a small one: at a domain length
-# scale of 1e-5 in 3D the whole cut volume is ~1e-15 — three orders of magnitude
-# *under* a 1e-12 cutoff — so a perfectly good rule truncates to nothing.
-# The breakpoint tolerance of `src/implicit.jl` and the mesh-SDF length
-# tolerance of `ext/UnfittedMeshIOExt.jl` are scaled the same way, and for the
-# same reason: the kernel has to behave identically under a rescaling of the
-# geometry.
+# Drop a candidate weight when its NNLS solution falls below this threshold (numerical noise around true zeros). The
+# number is dimensionless: a quadrature weight carries the units of a volume, so the cutoff is taken *relative to the
+# cut volume* `∫_{Ω∩R} 1 dx` in `_solve_moment_fit` below. Every weight scales as (length scale)ᴰ, so an absolute
+# constant instead keeps every weight on a geometry of unit size and empties the rule on a small one: at a domain length
+# scale of 1e-5 in 3D the whole cut volume is ~1e-15 — three orders of magnitude *under* a 1e-12 cutoff — so a perfectly
+# good rule truncates to nothing. The breakpoint tolerance of `src/implicit.jl` and the mesh-SDF length tolerance of
+# `ext/UnfittedMeshIOExt.jl` are scaled the same way, and for the same reason: the kernel has to behave identically
+# under a rescaling of the geometry.
 const _NNLS_WEIGHT_TOL = 1.0e-12
 
-# Catastrophic failure threshold for the moment-fit residual. A residual above
-# this value indicates the NNLS could not come anywhere near reproducing the
-# moments; `moment_fit_rule` then returns the raw Saye volume rule instead of the
-# fitted one, and the integration-plan dispatcher tags such a region
-# `:cut_fallback`.
+# Catastrophic failure threshold for the moment-fit residual. A residual above this value indicates the NNLS could not
+# come anywhere near reproducing the moments; `moment_fit_rule` then returns the raw Saye volume rule instead of the
+# fitted one, and the integration-plan dispatcher tags such a region `:cut_fallback`.
 const _FIT_FAILURE_RESIDUAL = 1.0e-2
 
 # Assemble the moment-fit design matrix
 #
 #     A[a, j] = ψ_α_a(ξ(x_j)),
 #
-# columns indexed by candidate points `x_j`, rows by moment-basis multi-indices
-# `α_a`. One Legendre table fill per point, then a tensor-product evaluation per
-# (point, basis-index) pair. The matrix is `nbasis × npoints`.
+# columns indexed by candidate points `x_j`, rows by moment-basis multi-indices `α_a`. One Legendre table fill per
+# point, then a tensor-product evaluation per (point, basis-index) pair. The matrix is `nbasis × npoints`.
 function _build_moment_matrix(points::Vector{SVector{D,T}}, region_box::AxisBox{D,T},
                               moment_order::NTuple{D,Int}) where {D,T}
     indices = _moment_basis_indices(moment_order)
@@ -222,29 +193,24 @@ function _build_moment_matrix(points::Vector{SVector{D,T}}, region_box::AxisBox{
     return A
 end
 
-# One NNLS solve against the design matrix above, followed by the truncation of
-# the near-zero weights: returns `(kept, weights, residual)` — the indices into
-# `points` that survive the truncation, the weights at those points, and the L²
-# moment residual *of that truncated rule*.
+# One NNLS solve against the design matrix above, followed by the truncation of the near-zero weights: returns
+# `(kept, weights, residual)` — the indices into `points` that survive the truncation, the weights at those points, and
+# the L² moment residual *of that truncated rule*.
 #
-# `cut_volume` is the measure of `Ω ∩ region_box`, the scale the weight cutoff is
-# taken relative to (see `_NNLS_WEIGHT_TOL`). It is deliberately not
-# `volume(region_box)`: on a sliver cut the bounding box and the cut region differ
-# by orders of magnitude, and only the latter tracks the weights being tested.
+# `cut_volume` is the measure of `Ω ∩ region_box`, the scale the weight cutoff is taken relative to (see
+# `_NNLS_WEIGHT_TOL`). It is deliberately not `volume(region_box)`: on a sliver cut the bounding box and the cut region
+# differ by orders of magnitude, and only the latter tracks the weights being tested.
 #
-# The residual is re-measured after the truncation because what `nnls` reports
-# describes the untruncated weight vector, which is not the rule handed back — a
-# rule truncated to nothing kept a machine-zero residual and read as a perfect
-# fit. Zeroing the dropped entries in place, rather than slicing the matrix down
-# to `kept`, keeps that re-measurement bit-identical to the NNLS residual in the
-# ordinary case, where the truncation drops only the exact zeros of the
+# The residual is re-measured after the truncation because what `nnls` reports describes the untruncated weight vector,
+# which is not the rule handed back — a rule truncated to nothing kept a machine-zero residual and read as a perfect
+# fit. Zeroing the dropped entries in place, rather than slicing the matrix down to `kept`, keeps that re-measurement
+# bit-identical to the NNLS residual in the ordinary case, where the truncation drops only the exact zeros of the
 # Lawson–Hanson inactive set.
 #
-# "In place" is literal: the zeroing happens in the NNLS solution vector itself.
-# `nnls` returns a vector nothing else holds a reference to, and the surviving
-# entries are copied out before the loop runs, so no second full-length array is
-# needed — which matters, because the candidate cloud is thousands of points
-# wide while the rule handed back is `nbasis` wide.
+# "In place" is literal: the zeroing happens in the NNLS solution vector itself. `nnls` returns a vector nothing else
+# holds a reference to, and the surviving entries are copied out before the loop runs, so no second full-length array is
+# needed — which matters, because the candidate cloud is thousands of points wide while the rule handed back is `nbasis`
+# wide.
 function _solve_moment_fit(moments::Vector{T}, points::Vector{SVector{D,T}}, region_box::AxisBox{D,T},
                            moment_order::NTuple{D,Int}, cut_volume::T) where {D,T}
     A = _build_moment_matrix(points, region_box, moment_order)
@@ -262,8 +228,8 @@ end
 
 # ── 4. Exact moments and candidates from the implicit kernel ──────────────────
 
-# Tensor Legendre moments mₐ = ∫_{Ω∩R} ψₐ dx recovered from an implicit volume
-# rule by direct summation; reuses the per-axis Legendre tables of section 2.
+# Tensor Legendre moments mₐ = ∫_{Ω∩R} ψₐ dx recovered from an implicit volume rule by direct summation; reuses the
+# per-axis Legendre tables of section 2.
 function _moments_from_rule(points::Vector{SVector{D,T}}, weights::Vector{T}, region_box::AxisBox{D,T},
                             moment_order::NTuple{D,Int}) where {D,T}
     indices = _moment_basis_indices(moment_order)
@@ -281,214 +247,168 @@ end
 
 # Per-fiber Gauss count for the implicit moment rule, the maximum of two needs:
 #
-#   1. Exactness on a *tilted* linear cut. The inside-interval endpoints are then
-#      linear in the base coordinates, so each of the D fiber integrations raises
-#      the accumulated polynomial degree by one; the worst case (a corner beveled
-#      by a linear leaf, e.g. the simplex Σx ≤ 1) reaches total degree
-#      `sum(moment_order) + D` at the innermost fiber, needing
-#      `q ≥ (sum(moment_order) + D) / 2`. An axis-aligned cut needs only
-#      `⌈(maxorder+1)/2⌉`, but the default must serve the worst case — a constant
-#      offset silently undershoots tilted high-order 3D cuts by ~1e-5. (Verified
-#      against tilted simplices in 2D–4D as the smallest exact q.)
-#   2. Accuracy on a *curved* cut. A curved boundary is never polynomial, so the
-#      moments are approximated, not exact; a generous floor of `maxorder + 2`
-#      keeps that high-order approximation sharp (it also dominates (1) in 2D).
+#   1. Exactness on a *tilted* linear cut. The inside-interval endpoints are then linear in the base coordinates, so
+#      each of the D fiber integrations raises the accumulated polynomial degree by one; the worst case (a corner
+#      beveled by a linear leaf, e.g. the simplex Σx ≤ 1) reaches total degree `sum(moment_order) + D` at the innermost
+#      fiber, needing `q ≥ (sum(moment_order) + D) / 2`. An axis-aligned cut needs only `⌈(maxorder+1)/2⌉`, but the
+#      default must serve the worst case — a constant offset silently undershoots tilted high-order 3D cuts by ~1e-5.
+#      (Verified against tilted simplices in 2D–4D as the smallest exact q.)
+#   2. Accuracy on a *curved* cut. A curved boundary is never polynomial, so the moments are approximated, not exact; a
+#      generous floor of `maxorder + 2` keeps that high-order approximation sharp (it also dominates (1) in 2D).
 function _implicit_gauss_points(moment_order::NTuple{D,Int}) where {D}
     max(cld(sum(moment_order) + D, 2), maximum(moment_order) + 2)
 end
 
-# Ceiling on the NNLS design matrix, in entries (`nbasis × ncandidates`).
-# Lawson–Hanson sweeps the whole matrix once per accepted column, so a solve's
-# memory is proportional to this product and its time to the product times the
-# number of accepted columns (≤ nbasis). 6·10⁶ entries is 48 MB — and nothing
-# like a fraction of a second at the top of the range. Measured serially at
-# `-O2` on the space-time cavity geometry, one cut cell's fit takes 0.2 ms at
-# `nbasis = 27`, 7 ms at 125, 215 ms at 343 and ≈ 2.4 s (median; 17 s worst) at
-# 729, where the matrix is 729 × 4374 = 3.2·10⁶ entries, 25 MB. The growth is
-# steeper than the `nbasis³` the flop count predicts because past ~10 MB the
-# matrix no longer fits in per-core cache and the sweep becomes
-# bandwidth-bound rather than compute-bound. Because the candidate budget below
-# is a multiple of `nbasis`, the entry count grows as `budget · nbasis²` —
-# quadratically in the basis size — so the retry needs an absolute ceiling and
-# not just a relative one. It binds retries only (the `max` in `_cap_candidates`
-# keeps the first attempt exempt), and there only once `nbasis` exceeds
-# `√(_MAX_FIT_MATRIX_ENTRIES / budget)`: ≈ 354 on the second attempt, ≈ 126 on
-# the third.
+# Ceiling on the NNLS design matrix, in entries (`nbasis × ncandidates`). Lawson–Hanson sweeps the whole matrix once per
+# accepted column, so a solve's memory is proportional to this product and its time to the product times the number of
+# accepted columns (≤ nbasis). 6·10⁶ entries is 48 MB — and nothing like a fraction of a second at the top of the range.
+# Measured serially at `-O2` on the space-time cavity geometry, one cut cell's fit takes 0.2 ms at `nbasis = 27`, 7 ms
+# at 125, 215 ms at 343 and ≈ 2.4 s (median; 17 s worst) at 729, where the matrix is 729 × 4374 = 3.2·10⁶ entries, 25
+# MB. The growth is steeper than the `nbasis³` the flop count predicts because past ~10 MB the matrix no longer fits in
+# per-core cache and the sweep becomes bandwidth-bound rather than compute-bound. Because the candidate budget below is
+# a multiple of `nbasis`, the entry count grows as `budget · nbasis²` — quadratically in the basis size — so the retry
+# needs an absolute ceiling and not just a relative one. It binds retries only (the `max` in `_cap_candidates` keeps the
+# first attempt exempt), and there only once `nbasis` exceeds `√(_MAX_FIT_MATRIX_ENTRIES / budget)`: ≈ 354 on the second
+# attempt, ≈ 126 on the third.
 const _MAX_FIT_MATRIX_ENTRIES = 6_000_000
 
-# Cap the candidate cloud so the NNLS design matrix stays bounded regardless of
-# the volume rule's point count: at most `budget · nbasis` candidates, and never
-# more than `_MAX_FIT_MATRIX_ENTRIES` matrix entries.
+# Cap the candidate cloud so the NNLS design matrix stays bounded regardless of the volume rule's point count: at most
+# `budget · nbasis` candidates, and never more than `_MAX_FIT_MATRIX_ENTRIES` matrix entries.
 #
-# The survivors are `cap` indices spread across the rule by FRACTIONAL spacing,
-# `(n − 1) / (cap − 1)`, rather than by an integer stride. The integer stride this
-# replaces carried two separate defects, both measured on the space-time cone
+# The survivors are `cap` indices spread across the rule by FRACTIONAL spacing, `(n − 1) / (cap − 1)`, rather than by an
+# integer stride. The integer stride this replaces carried two separate defects, both measured on the space-time cone
 # fixture of `examples/applications/spacetime_cavity_2d` at cells (8, 8, 8):
 #
-#   1. It drew the wrong NUMBER of points. `cld(n, cap)` rounds the stride up, so
-#      the draw retained `cld(n, stride)` candidates and not `cap` — 2744 of an
-#      allowed 4374 on a 5488-point rule, throwing away 37% of a budget the solve
+#   1. It drew the wrong NUMBER of points. `cld(n, cap)` rounds the stride up, so the draw retained `cld(n, stride)`
+#      candidates and not `cap` — 2744 of an allowed 4374 on a 5488-point rule, throwing away 37% of a budget the solve
 #      was already sized for.
-#   2. It aliased. The volume rule emits its points fiber by fiber in blocks of
-#      `gauss_points`, so an integer stride sharing a factor with that block
-#      length reaches only `gauss_points / gcd` of the per-fiber node positions.
-#      At moment order (8, 8, 8) the fiber count is 14, and the 5488- and
-#      8232-point rules both take stride 2: 82 of 146 cut cells then fitted to a
-#      relative residual above 1e-12 and 57 of them above 1e-3. Drawn without the
-#      stride at the *same* candidate count, those cells reach ~2e-15. Shifting
-#      the stride's starting index does not help, so what matters is the
-#      periodicity and not its phase.
+#   2. It aliased. The volume rule emits its points fiber by fiber in blocks of `gauss_points`, so an integer stride
+#      sharing a factor with that block length reaches only `gauss_points / gcd` of the per-fiber node positions. At
+#      moment order (8, 8, 8) the fiber count is 14, and the 5488- and 8232-point rules both take stride 2: 82 of 146
+#      cut cells then fitted to a relative residual above 1e-12 and 57 of them above 1e-3. Drawn without the stride at
+#      the *same* candidate count, those cells reach ~2e-15. Shifting the stride's starting index does not help, so what
+#      matters is the periodicity and not its phase.
 #
-# Fractional spacing addresses both at once: it spends the whole budget, and its
-# step is not an integer, so successive indices sweep the per-fiber positions
-# instead of locking onto a fixed subset of them. It is deterministic, which
-# everything in this path owes `test/characterize.jl`, and it is
-# dimension-generic — the rule is a flat `Vector{SVector{D,T}}` and nothing here
-# inspects `D`.
+# Fractional spacing addresses both at once: it spends the whole budget, and its step is not an integer, so successive
+# indices sweep the per-fiber positions instead of locking onto a fixed subset of them. It is deterministic, which
+# everything in this path owes `test/characterize.jl`, and it is dimension-generic — the rule is a flat
+# `Vector{SVector{D,T}}` and nothing here inspects `D`.
 #
-# `budget` comes from `_candidate_budget(attempt)` and grows with the retry, so
-# each attempt draws a genuinely denser cloud. The `max` keeps the first
-# attempt's `6 · nbasis` budget exempt from the ceiling, so the entry point of
-# the pipeline behaves identically at every moment order.
+# `budget` comes from `_candidate_budget(attempt)` and grows with the retry, so each attempt draws a genuinely denser
+# cloud. The `max` keeps the first attempt's `6 · nbasis` budget exempt from the ceiling, so the entry point of the
+# pipeline behaves identically at every moment order.
 function _cap_candidates(points::Vector{SVector{D,T}}, moment_order::NTuple{D,Int}, budget::Int) where {D,T}
     nbasis = _moment_basis_count(moment_order)
     cap = min(budget * nbasis, max(6 * nbasis, cld(_MAX_FIT_MATRIX_ENTRIES, nbasis)))
     n = length(points)
     n <= cap && return points
-    # `n > cap` holds here, so the spacing exceeds 1 and the rounded indices are
-    # strictly increasing: the draw cannot repeat a candidate.
+    # `n > cap` holds here, so the spacing exceeds 1 and the rounded indices are strictly increasing: the draw cannot
+    # repeat a candidate.
     return points[round.(Int, range(1, n; length=cap))]
 end
 
 # ── 5. Public moment-fit rule ─────────────────────────────────────────────────
 
-# Number of attempts. With exact moments the retry exists only for NNLS
-# conditioning (a denser candidate cloud), never for moment accuracy.
+# Number of attempts. With exact moments the retry exists only for NNLS conditioning (a denser candidate cloud), never
+# for moment accuracy.
 const _MAX_IMPLICIT_ATTEMPTS = 3
 
-# Candidate-cloud budget of `attempt`, as a multiple of the moment-basis size
-# `nbasis`: 6·nbasis on the first attempt, eight times that on each retry.
+# Candidate-cloud budget of `attempt`, as a multiple of the moment-basis size `nbasis`: 6·nbasis on the first attempt,
+# eight times that on each retry.
 #
-# The budget has to grow for the retry to mean anything, and what it buys is cone
-# membership rather than conditioning. Lawson–Hanson is greedy and terminates as
-# soon as its passive set holds `nbasis` columns (`nsetp ≥ m` in the classical
-# algorithm), so the fit it returns is decided by which candidates the walk was
-# offered — but what decides whether a zero-residual non-negative fit EXISTS over
-# those candidates is narrower: the moments admit one only if `m` lies in the
-# convex cone spanned by the selected columns' moment vectors. The full volume
-# rule always satisfies that by construction, its own positive weights being such
-# a solution. A subset need not, and a subset that does not cannot be rescued by
-# any solver, however well conditioned.
+# The budget has to grow for the retry to mean anything, and what it buys is cone membership rather than conditioning.
+# Lawson–Hanson is greedy and terminates as soon as its passive set holds `nbasis` columns (`nsetp ≥ m` in the classical
+# algorithm), so the fit it returns is decided by which candidates the walk was offered — but what decides whether a
+# zero-residual non-negative fit EXISTS over those candidates is narrower: the moments admit one only if `m` lies in the
+# convex cone spanned by the selected columns' moment vectors. The full volume rule always satisfies that by
+# construction, its own positive weights being such a solution. A subset need not, and a subset that does not cannot be
+# rescued by any solver, however well conditioned.
 #
-# That distinction is measurable, and the measurement picks cone membership. At
-# moment order (8,8,8) on the space-time cone geometry, with the draw held
-# non-degenerate so that only the COUNT varies, the relative residual runs 1.9e-2
-# at 1.5·nbasis candidates, 9.2e-3 at 2·nbasis and 1.9e-3 at 3·nbasis, then falls
-# to 3.1e-15 at the 6·nbasis the first attempt uses. A ×2 change in count moves
-# the residual by orders of magnitude while leaving the conditioning of any one
-# selection untouched — the signature of the cone widening, not of a triangular
-# solve improving. The first attempt's 6·nbasis is therefore load-bearing and
-# cannot be trimmed to buy speed.
+# That distinction is measurable, and the measurement picks cone membership. At moment order (8,8,8) on the space-time
+# cone geometry, with the draw held non-degenerate so that only the COUNT varies, the relative residual runs 1.9e-2 at
+# 1.5·nbasis candidates, 9.2e-3 at 2·nbasis and 1.9e-3 at 3·nbasis, then falls to 3.1e-15 at the 6·nbasis the first
+# attempt uses. A ×2 change in count moves the residual by orders of magnitude while leaving the conditioning of any one
+# selection untouched — the signature of the cone widening, not of a triangular solve improving. The first attempt's
+# 6·nbasis is therefore load-bearing and cannot be trimmed to buy speed.
 #
-# An earlier measurement of the same effect, on a cell carrying many distinct
-# boundary pieces (nbasis = 125, 25216 rule points, the moments held fixed): 742
-# candidates → residual 4.7e-2, 1484 → 2.8e-2, 2802 → 3.0e-2, but 5044 → 3e-16
-# and 8406 → 6e-16. Holding the budget at 6·nbasis for every attempt made all
-# three draw a cloud of the same size, so they failed together and the "denser
-# candidate cloud" the retry promises never materialised.
+# An earlier measurement of the same effect, on a cell carrying many distinct boundary pieces (nbasis = 125, 25216 rule
+# points, the moments held fixed): 742 candidates → residual 4.7e-2, 1484 → 2.8e-2, 2802 → 3.0e-2, but 5044 → 3e-16 and
+# 8406 → 6e-16. Holding the budget at 6·nbasis for every attempt made all three draw a cloud of the same size, so they
+# failed together and the "denser candidate cloud" the retry promises never materialised.
 #
-# The growth factor is large on purpose: a ×8 step moves each retry to a plainly
-# different scale, so a cell whose cone was too narrow gets a materially wider one
-# instead of another draw of much the same extent. Before `_cap_candidates`
-# selected by even fractional spacing the step also had to escape the aliasing of
-# an integer stride, which a modest bump could not reliably do; that failure mode
-# is gone, but the cone argument for a large step is not.
+# The growth factor is large on purpose: a ×8 step moves each retry to a plainly different scale, so a cell whose cone
+# was too narrow gets a materially wider one instead of another draw of much the same extent. Before `_cap_candidates`
+# selected by even fractional spacing the step also had to escape the aliasing of an integer stride, which a modest bump
+# could not reliably do; that failure mode is gone, but the cone argument for a large step is not.
 #
-# The first attempt's budget is deliberately unchanged, so every cell that
-# already fits keeps its rule unchanged and pays nothing extra; only cells that
-# fail reach the larger solves.
+# The first attempt's budget is deliberately unchanged, so every cell that already fits keeps its rule unchanged and
+# pays nothing extra; only cells that fail reach the larger solves.
 _candidate_budget(attempt::Int) = 6 * 8^(attempt - 1)
 
 """
     moment_fit_rule(physical, region_box, moment_order; target_residual=1e-10)
         -> (points, weights, residual, status)
 
-Build a non-negative tensor-Legendre moment-fitted quadrature rule on
-`region_box ∩ Ω`. The rule reproduces the tensor Legendre moments
+Build a non-negative tensor-Legendre moment-fitted quadrature rule on `region_box ∩ Ω`. The rule reproduces the tensor
+Legendre moments
 
     m_α = ∫_{region_box ∩ Ω} ψ_α(ξ(x)) dx,    α ∈ {0,…,p₁} × … × {0,…,p_D}
 
 to within the returned residual.
 
-The moments and candidate points come from the Saye implicit-quadrature kernel
-([`implicit_volume_quadrature`](@ref)) applied to `physical`'s CSG level set:
-the moments are exact (machine precision for linear leaves and polytope
-corners) and octree-depth-independent, and the volume-rule points serve as the
-candidate cloud. Each leaf's Lipschitz constant is forwarded to the kernel, so a
-geometric feature smaller than `region_box` is certified rather than sampled
-for — leaves left at the `leaf` default `Inf` keep the kernel's point-sampling
-heuristic and its sub-cell blind spot.
+The moments and candidate points come from the Saye implicit-quadrature kernel ([`implicit_volume_quadrature`](@ref))
+applied to `physical`'s CSG level set: the moments are exact (machine precision for linear leaves and polytope corners)
+and octree-depth-independent, and the volume-rule points serve as the candidate cloud. Each leaf's Lipschitz constant is
+forwarded to the kernel, so a geometric feature smaller than `region_box` is certified rather than sampled for — leaves
+left at the `leaf` default `Inf` keep the kernel's point-sampling heuristic and its sub-cell blind spot.
 
-A single Lawson–Hanson NNLS solve then picks the non-negative
-weights — its active-set solution carries at most `nbasis` non-zeros, so the
-rule is already compressed to O(nbasis) points. The volume rule reproduces the
-moments with strictly positive weights, so a zero-residual non-negative solution
-exists over its *full* point set and one solve normally reaches machine-level
-residual; the candidate cloud is a strided subset of that point set, which is
-why a solve can nevertheless come back ill-conditioned and why the retry below
-densifies the cloud (`_candidate_budget` carries the measurements).
+A single Lawson–Hanson NNLS solve then picks the non-negative weights — its active-set solution carries at most `nbasis`
+non-zeros, so the rule is already compressed to O(nbasis) points. The volume rule reproduces the moments with strictly
+positive weights, so a zero-residual non-negative solution exists over its *full* point set and one solve normally
+reaches machine-level residual; the candidate cloud is a strided subset of that point set, which is why a solve can
+nevertheless come back ill-conditioned and why the retry below densifies the cloud (`_candidate_budget` carries the
+measurements).
 
-`target_residual` bounds a small conditioning retry — up to
-`_MAX_IMPLICIT_ATTEMPTS` attempts, each with a denser candidate cloud, never with
-more octree depth. Both retry knobs act on the cloud alone: the fiber Gauss order
-rises by one per attempt, emitting more volume-rule points, and the candidate
-budget of `_candidate_budget` grows by a factor of eight per attempt, letting
-more of them past the cap. The best (lowest-residual) fit observed is the one
-returned. In the assembly pipeline this function is called with
-`physical.target_residual` (the `physical_domain` default is `1e-6`), which
-overrides the `1e-10` default here.
+`target_residual` bounds a small conditioning retry — up to `_MAX_IMPLICIT_ATTEMPTS` attempts, each with a denser
+candidate cloud, never with more octree depth. Both retry knobs act on the cloud alone: the fiber Gauss order rises by
+one per attempt, emitting more volume-rule points, and the candidate budget of `_candidate_budget` grows by a factor of
+eight per attempt, letting more of them past the cap. The best (lowest-residual) fit observed is the one returned. In
+the assembly pipeline this function is called with `physical.target_residual` (the `physical_domain` default is `1e-6`),
+which overrides the `1e-10` default here.
 
-`status` reports which rule came back, and the integration-region dispatcher in
-`intersections.jl` turns it into the region's quadrature kind:
+`status` reports which rule came back, and the integration-region dispatcher in `intersections.jl` turns it into the
+region's quadrature kind:
 
-  - `:fitted` — the moment fit met `_FIT_FAILURE_RESIDUAL`; `points`/`weights`
-    are the compressed O(nbasis) fitted rule. Region kind `:cut_fitted`.
-  - `:fallback` — no attempt met `_FIT_FAILURE_RESIDUAL`, so the returned rule is
-    the highest-order attempt's *raw Saye volume rule* — the very data the
-    moments were computed from, uncompressed. Region kind `:cut_fallback`.
-  - `:empty` — `Ω ∩ region_box` carries no volume rule at all, or every fitted
-    weight falls below the cut-volume-relative truncation cutoff so the
-    compressed rule would hold no points; `points` and `weights` are empty and
-    `residual` is zero. Region kind `:cut_failed` (`:cut_alpha_failed` under
-    α-FCM).
+  - `:fitted` — the moment fit met `_FIT_FAILURE_RESIDUAL`; `points`/`weights` are the compressed O(nbasis) fitted rule.
+    Region kind `:cut_fitted`.
+  - `:fallback` — no attempt met `_FIT_FAILURE_RESIDUAL`, so the returned rule is the highest-order attempt's *raw Saye
+    volume rule* — the very data the moments were computed from, uncompressed. Region kind `:cut_fallback`.
+  - `:empty` — `Ω ∩ region_box` carries no volume rule at all, or every fitted weight falls below the
+    cut-volume-relative truncation cutoff so the compressed rule would hold no points; `points` and `weights` are empty
+    and `residual` is zero. Region kind `:cut_failed` (`:cut_alpha_failed` under α-FCM).
 
-The returned `residual` measures the rule that is returned: it is taken after the
-near-zero weights have been truncated away, so it never describes a denser rule
-than the caller receives.
+The returned `residual` measures the rule that is returned: it is taken after the near-zero weights have been truncated
+away, so it never describes a denser rule than the caller receives.
 
-The fallback loses no accuracy: on a cell where the fit fails, the volume rule is
-by construction at least as accurate as a successful fit would have been, and its
-weights are non-negative for the same reason the fit's are — each is a product of
-a positive Gauss weight, a positive fiber half-length and a positive base weight
-(see `_emit_fiber!` in `src/implicit.jl`). What it costs is points: the failing
-cells measured on a 96-hole plate carry 7·10³–2.5·10⁴ volume-rule points where a
-successful fit yields ≈ nbasis ≈ 125, a 50–200× per-cell blow-up in assembly
-work. A fired fallback is therefore a signal that the cell is under-resolved for
-its geometric complexity and is the condition that should drive refinement — it
-is a safety net against the silently wrong answer an empty rule would give, not a
-substitute for an adequate mesh. `AssemblyDiagnostics.cut_fallback_count` and
-`cut_fallback_points` report how often it fired and what it cost.
+The fallback loses no accuracy: on a cell where the fit fails, the volume rule is by construction at least as accurate
+as a successful fit would have been, and its weights are non-negative for the same reason the fit's are — each is a
+product of a positive Gauss weight, a positive fiber half-length and a positive base weight (see `_emit_fiber!` in
+`src/implicit.jl`). What it costs is points: the failing cells measured on a 96-hole plate carry 7·10³–2.5·10⁴
+volume-rule points where a successful fit yields ≈ nbasis ≈ 125, a 50–200× per-cell blow-up in assembly work. A fired
+fallback is therefore a signal that the cell is under-resolved for its geometric complexity and is the condition that
+should drive refinement — it is a safety net against the silently wrong answer an empty rule would give, not a
+substitute for an adequate mesh. `AssemblyDiagnostics.cut_fallback_count` and `cut_fallback_points` report how often it
+fired and what it cost.
 """
 function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T}, moment_order::NTuple{D,Int};
                          target_residual::Real=1.0e-10) where {D,T}
     target = T(target_residual)
     q0 = _implicit_gauss_points(moment_order)
     max_subdiv = _effective_subcell_depth(physical, region_box)
-    # Hand the kernel each leaf's Lipschitz constant, not just its callback: the
-    # region box is a whole mesh cell, which may be much coarser than the
-    # geometry, and only the certificate keeps a sub-cell feature (a hole well
-    # inside the cell) from being pruned away and the cell integrated as solid.
-    # Leaves built with the `leaf` default `Inf` fall back to point sampling.
+    # Hand the kernel each leaf's Lipschitz constant, not just its callback: the region box is a whole mesh cell, which
+    # may be much coarser than the geometry, and only the certificate keeps a sub-cell feature (a hole well inside the
+    # cell) from being pruned away and the cell integrated as solid. Leaves built with the `leaf` default `Inf` fall
+    # back to point sampling.
     leaves = _leaves(physical.geometry)
     leaf_fs = Any[l.f for l in leaves]
     leaf_ls = Float64[l.lipschitz for l in leaves]
@@ -497,64 +417,52 @@ function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T}, mom
     best_pts = SVector{D,T}[]
     best_ws = T[]
     best_res = T(Inf)
-    # The raw volume rule of the attempt last run. It has to outlive the loop
-    # because it is the fallback below, and keeping the *last* attempt's rule
-    # keeps the highest fiber Gauss order — the most accurate of the three.
+    # The raw volume rule of the attempt last run. It has to outlive the loop because it is the fallback below, and
+    # keeping the *last* attempt's rule keeps the highest fiber Gauss order — the most accurate of the three.
     saye_pts = SVector{D,T}[]
     saye_ws = T[]
-    # L² norm of the moment vector of the attempt last run — the scale both
-    # residual thresholds below are taken relative to. It outlives the loop for the
-    # same reason the raw rule does.
+    # L² norm of the moment vector of the attempt last run — the scale both residual thresholds below are taken relative
+    # to. It outlives the loop for the same reason the raw rule does.
     moment_scale = zero(T)
     for attempt in 1:_MAX_IMPLICIT_ATTEMPTS
-        # Exact moments at q0; denser candidate clouds on retry improve NNLS
-        # conditioning without changing the (already exact) moments. Density
-        # comes from both knobs at once — a higher fiber Gauss order emits more
-        # rule points, a larger budget lets more of them past `_cap_candidates`.
+        # Exact moments at q0; denser candidate clouds on retry improve NNLS conditioning without changing the (already
+        # exact) moments. Density comes from both knobs at once — a higher fiber Gauss order emits more rule points, a
+        # larger budget lets more of them past `_cap_candidates`.
         q = q0 + (attempt - 1)
         saye_pts, saye_ws = implicit_volume_quadrature(leaf_fs, membership, region_box; gauss_points=q,
                                                        max_subdiv=max_subdiv, lipschitz=leaf_ls)
         isempty(saye_pts) && return SVector{D,T}[], T[], zero(T), :empty
         moments = _moments_from_rule(saye_pts, saye_ws, region_box, moment_order)
-        # `target_residual` is a RELATIVE tolerance, so the comparison needs the
-        # scale of the right-hand side. `‖A w − m‖` carries the units of a moment,
-        # and `m₀ = ∫_{Ω∩R} 1 dx` is the cut volume, so a bare absolute constant is
-        # not a tolerance at all but a statement about the size of the cell: at a
-        # cell extent of 0.125 in 3D, `‖m‖ ≈ 1e-3`, and a 1e-6 absolute target
-        # accepts a 1e-3 *relative* error. Measured consequence, on the space-time
-        # cone fixture at moment order (8,8,8): a degenerate candidate cloud fitted
-        # to 5.2e-4 relative and was accepted as `:fitted`, because 5.2e-4 × 1.4e-3
-        # = 7.3e-7 slips under 1e-6. `_NNLS_WEIGHT_TOL` is scaled for exactly this
-        # reason, and `test/test_fcm.jl`'s cut-volume-relative weight-cutoff test is
-        # the same contract one level down.
+        # `target_residual` is a RELATIVE tolerance, so the comparison needs the scale of the right-hand side.
+        # `‖A w − m‖` carries the units of a moment, and `m₀ = ∫_{Ω∩R} 1 dx` is the cut volume, so a bare absolute
+        # constant is not a tolerance at all but a statement about the size of the cell: at a cell extent of 0.125 in
+        # 3D, `‖m‖ ≈ 1e-3`, and a 1e-6 absolute target accepts a 1e-3 *relative* error. Measured consequence, on the
+        # space-time cone fixture at moment order (8,8,8): a degenerate candidate cloud fitted to 5.2e-4 relative and
+        # was accepted as `:fitted`, because 5.2e-4 × 1.4e-3 = 7.3e-7 slips under 1e-6. `_NNLS_WEIGHT_TOL` is scaled for
+        # exactly this reason, and `test/test_fcm.jl`'s cut-volume-relative weight-cutoff test is the same contract one
+        # level down.
         #
-        # Every kernel weight is a product of a positive Gauss weight, a positive
-        # fiber half-length and a positive base weight, so `m₀ > 0` and this is
-        # strictly positive on a non-empty rule. Were it ever zero the comparisons
-        # below would simply fail and the cell would take the `:fallback` path,
-        # which is the safe direction.
+        # Every kernel weight is a product of a positive Gauss weight, a positive fiber half-length and a positive base
+        # weight, so `m₀ > 0` and this is strictly positive on a non-empty rule. Were it ever zero the comparisons below
+        # would simply fail and the cell would take the `:fallback` path, which is the safe direction.
         moment_scale = norm(moments)
         candidates = _cap_candidates(saye_pts, moment_order, _candidate_budget(attempt))
         kept, kept_ws, residual = _solve_moment_fit(moments, candidates, region_box, moment_order, sum(saye_ws))
-        # A fit whose every weight falls under the truncation cutoff is no rule at
-        # all: hand back the same `:empty` an empty kernel rule returns, so the
-        # caller drops the region (or keeps its α-stabilised tensor part) instead
-        # of consuming a zero-point rule as a successful fit. A denser candidate
-        # cloud cannot resurrect a fit that collapsed to zero, so there is nothing
-        # for the retry to do here.
+        # A fit whose every weight falls under the truncation cutoff is no rule at all: hand back the same `:empty` an
+        # empty kernel rule returns, so the caller drops the region (or keeps its α-stabilised tensor part) instead of
+        # consuming a zero-point rule as a successful fit. A denser candidate cloud cannot resurrect a fit that
+        # collapsed to zero, so there is nothing for the retry to do here.
         isempty(kept) && return SVector{D,T}[], T[], zero(T), :empty
         if residual < best_res
             best_pts, best_ws, best_res = candidates[kept], kept_ws, residual
         end
         best_res <= target * moment_scale && return best_pts, best_ws, best_res, :fitted
     end
-    # Short of `target` but inside the failure threshold, the compressed fit is
-    # still the rule to use — that band is ordinary approximation error on a
-    # curved cut, not a broken fit.
+    # Short of `target` but inside the failure threshold, the compressed fit is still the rule to use — that band is
+    # ordinary approximation error on a curved cut, not a broken fit.
     best_res <= _FIT_FAILURE_RESIDUAL && return best_pts, best_ws, best_res, :fitted
-    # Beyond it the fit is not usable at any price. Hand back the volume rule the
-    # moments themselves were summed from: correct and non-negative by
-    # construction, merely uncompressed. Returning an empty rule here instead —
-    # the pre-fallback behaviour — dropped the cell's entire contribution.
+    # Beyond it the fit is not usable at any price. Hand back the volume rule the moments themselves were summed from:
+    # correct and non-negative by construction, merely uncompressed. Returning an empty rule here instead — the
+    # pre-fallback behaviour — dropped the cell's entire contribution.
     return saye_pts, saye_ws, best_res, :fallback
 end

@@ -1,41 +1,34 @@
 # ── CSG level-set tree ────────────────────────────────────────────────────────
 #
-# An immersed domain Ω is described by a Boolean combination of smooth level
-# sets ("leaves"), rather than a single scalar φ. Carrying the constituent
-# leaves separately keeps every boundary piece smooth, so the implicit
-# quadrature kernel (`src/implicit.jl`) stays high-order across
-# creases and corners that a single `max`/`min` level set would turn into a
-# non-differentiable kink (Saye's multi-component construction: R. I. Saye,
-# "High-order quadrature on multi-component domains implicitly defined by
-# multivariate polynomials", J. Comput. Phys. 448 (2022) 110720).
+# An immersed domain Ω is described by a Boolean combination of smooth level sets ("leaves"), rather than a single
+# scalar φ. Carrying the constituent leaves separately keeps every boundary piece smooth, so the implicit quadrature
+# kernel (`src/implicit.jl`) stays high-order across creases and corners that a single `max`/`min` level set would turn
+# into a non-differentiable kink (Saye's multi-component construction: R. I. Saye, "High-order quadrature on
+# multi-component domains implicitly defined by multivariate polynomials", J. Comput. Phys. 448 (2022) 110720).
 
 """
     LevelSet
 
-Abstract supertype of the CSG nodes describing an immersed domain Ω. The
-concrete nodes are a [`leaf`](@ref) (a single smooth level set with
-`Ω = {f ≤ 0}`) and the Boolean combinators built by `intersect`, `union`,
-`setdiff`, and [`complement`](@ref). A `LevelSet` is passed to
-[`physical_domain`](@ref).
+Abstract supertype of the CSG nodes describing an immersed domain Ω. The concrete nodes are a [`leaf`](@ref) (a single
+smooth level set with `Ω = {f ≤ 0}`) and the Boolean combinators built by `intersect`, `union`, `setdiff`, and
+[`complement`](@ref). A `LevelSet` is passed to [`physical_domain`](@ref).
 """
 abstract type LevelSet end
 
 """
     Leaf(f, lipschitz)
 
-A single smooth level set `f` with `Ω_leaf = { x : f(x) ≤ 0 }`. `lipschitz` is
-a Lipschitz constant `L` of `f` (`|f(x) − f(y)| ≤ L‖x − y‖`); `Inf` disables
-the cheap sign certificate in the cell classifier and in the implicit
-quadrature kernel, and forces corner sampling in both. Construct with
-[`leaf`](@ref).
+A single smooth level set `f` with `Ω_leaf = { x : f(x) ≤ 0 }`. `lipschitz` is a Lipschitz constant `L` of `f`
+(`|f(x) − f(y)| ≤ L‖x − y‖`); `Inf` disables the cheap sign certificate in the cell classifier and in the implicit
+quadrature kernel, and forces corner sampling in both. Construct with [`leaf`](@ref).
 """
 struct Leaf{F} <: LevelSet
     f::F
     lipschitz::Float64
 end
 
-# n-ary intersection (Ω = ⋂ parts; membership = inside *all* parts) and union
-# (Ω = ⋃ parts; membership = inside *any* part). `Not` is set complement.
+# n-ary intersection (Ω = ⋂ parts; membership = inside *all* parts) and union (Ω = ⋃ parts; membership = inside *any*
+# part). `Not` is set complement.
 struct AllOf{C<:Tuple} <: LevelSet
     parts::C
 end
@@ -49,19 +42,15 @@ end
 """
     leaf(f; lipschitz = Inf) -> Leaf
 
-Wrap a scalar level-set callback `f` (on `SVector{D,T}` coordinates) as a CSG
-leaf with `Ω_leaf = { x : f(x) ≤ 0 }`. `f` must accept `ForwardDiff.Dual`
-arguments so the quadrature kernel can take its gradient: the finite-cell path
-(`physical_domain` → `moment_fit_rule`) installs no gradient override, and the
-`grad` keyword of [`implicit_volume_quadrature`](@ref) is reachable only by
-calling that kernel directly.
+Wrap a scalar level-set callback `f` (on `SVector{D,T}` coordinates) as a CSG leaf with `Ω_leaf = { x : f(x) ≤ 0 }`. `f`
+must accept `ForwardDiff.Dual` arguments so the quadrature kernel can take its gradient: the finite-cell path
+(`physical_domain` → `moment_fit_rule`) installs no gradient override, and the `grad` keyword of
+[`implicit_volume_quadrature`](@ref) is reachable only by calling that kernel directly.
 
-`lipschitz` is the Lipschitz constant used by the sign certificate of both the
-cell classifier and the implicit quadrature kernel; `1.0` for a true
-signed-distance leaf, `Inf` to rely on corner sampling. Supplying it is what
-lets a feature smaller than a mesh cell survive: under `Inf` the kernel can
-prune such a leaf on the cell box and integrate the cut cell as if it were
-entirely inside Ω.
+`lipschitz` is the Lipschitz constant used by the sign certificate of both the cell classifier and the implicit
+quadrature kernel; `1.0` for a true signed-distance leaf, `Inf` to rely on corner sampling. Supplying it is what lets a
+feature smaller than a mesh cell survive: under `Inf` the kernel can prune such a leaf on the cell box and integrate the
+cut cell as if it were entirely inside Ω.
 """
 function leaf(f; lipschitz::Real=Inf)
     lipschitz > 0 || throw(ArgumentError("lipschitz must be positive; got $lipschitz"))
@@ -78,12 +67,10 @@ _as_levelset(f) = leaf(f)
     setdiff(a::LevelSet, b) -> LevelSet
     complement(a) -> LevelSet
 
-CSG combinators on level sets (the `Base` set operations are extended for the
-[`LevelSet`](@ref) type). `intersect` builds `Ω = ⋂ {fᵢ ≤ 0}`, `union` builds
-`Ω = ⋃ {fᵢ ≤ 0}`, `setdiff(a, b) = a ∩ complement(b)` (e.g. an annulus as a
-disk minus a disk), and `complement` flips inside and outside. Bare callable
-arguments are auto-wrapped as default [`leaf`](@ref)s. The first argument must
-be a `LevelSet`, so wrap at least one operand with `leaf` (e.g.
+CSG combinators on level sets (the `Base` set operations are extended for the [`LevelSet`](@ref) type). `intersect`
+builds `Ω = ⋂ {fᵢ ≤ 0}`, `union` builds `Ω = ⋃ {fᵢ ≤ 0}`, `setdiff(a, b) = a ∩ complement(b)` (e.g. an annulus as a disk
+minus a disk), and `complement` flips inside and outside. Bare callable arguments are auto-wrapped as default
+[`leaf`](@ref)s. The first argument must be a `LevelSet`, so wrap at least one operand with `leaf` (e.g.
 `intersect(leaf(f), g)`).
 """
 Base.intersect(a::LevelSet) = a
@@ -92,11 +79,9 @@ Base.intersect(a::LevelSet, b, rest...) = AllOf((a, _as_levelset(b), map(_as_lev
 """
     union(a::LevelSet, b...) -> LevelSet
 
-CSG union of level sets: `Ω = ⋃ {fᵢ ≤ 0}`, the region inside *any* part. Bare
-callable arguments are auto-wrapped as default [`leaf`](@ref)s, so only the
-first argument has to be a `LevelSet` (e.g. `union(leaf(f), g)`). One of the
-four combinators documented together under `intersect`; pass the result to
-[`physical_domain`](@ref).
+CSG union of level sets: `Ω = ⋃ {fᵢ ≤ 0}`, the region inside *any* part. Bare callable arguments are auto-wrapped as
+default [`leaf`](@ref)s, so only the first argument has to be a `LevelSet` (e.g. `union(leaf(f), g)`). One of the four
+combinators documented together under `intersect`; pass the result to [`physical_domain`](@ref).
 """
 Base.union(a::LevelSet) = a
 Base.union(a::LevelSet, b, rest...) = AnyOf((a, _as_levelset(b), map(_as_levelset, rest)...))
@@ -104,9 +89,8 @@ Base.union(a::LevelSet, b, rest...) = AnyOf((a, _as_levelset(b), map(_as_levelse
 """
     setdiff(a::LevelSet, b) -> LevelSet
 
-CSG difference of level sets: `setdiff(a, b) = a ∩ complement(b)`, e.g. an
-annulus as a disk minus a disk. `b` may be a bare callable, auto-wrapped as a
-default [`leaf`](@ref). One of the four combinators documented together under
+CSG difference of level sets: `setdiff(a, b) = a ∩ complement(b)`, e.g. an annulus as a disk minus a disk. `b` may be a
+bare callable, auto-wrapped as a default [`leaf`](@ref). One of the four combinators documented together under
 `intersect`; pass the result to [`physical_domain`](@ref).
 """
 Base.setdiff(a::LevelSet, b) = AllOf((a, Not(_as_levelset(b))))
@@ -114,35 +98,32 @@ Base.setdiff(a::LevelSet, b) = AllOf((a, Not(_as_levelset(b))))
 """
     complement(a) -> LevelSet
 
-Set complement of a level set: inside and outside are swapped
-(`Ω ↦ ℝᴰ ∖ Ω`). `a` is a [`LevelSet`](@ref) or a bare callable (auto-wrapped as
-a default [`leaf`](@ref)). One of the CSG combinators alongside `intersect`,
-`union`, and `setdiff`; pass the result to [`physical_domain`](@ref).
+Set complement of a level set: inside and outside are swapped (`Ω ↦ ℝᴰ ∖ Ω`). `a` is a [`LevelSet`](@ref) or a bare
+callable (auto-wrapped as a default [`leaf`](@ref)). One of the CSG combinators alongside `intersect`, `union`, and
+`setdiff`; pass the result to [`physical_domain`](@ref).
 """
 complement(a) = Not(_as_levelset(a))
 
 # ── Tree evaluation ───────────────────────────────────────────────────────────
 
-# Membership test x ∈ Ω. A leaf is inside where f ≤ 0; intersection/union/
-# complement combine with all/any/not. Short-circuiting is fine here (no
-# index bookkeeping), unlike the classifier's three-valued walk below.
+# Membership test x ∈ Ω. A leaf is inside where f ≤ 0; intersection/union/ complement combine with all/any/not.
+# Short-circuiting is fine here (no index bookkeeping), unlike the classifier's three-valued walk below.
 _inside(l::Leaf, x) = l.f(x) <= 0
 _inside(n::AllOf, x) = all(p -> _inside(p, x), n.parts)
 _inside(n::AnyOf, x) = any(p -> _inside(p, x), n.parts)
 _inside(n::Not, x) = !_inside(n.part, x)
 
-# A single scalar that is ≤ 0 exactly on Ω, reconstructed from the tree
-# (intersection → max, union → min, complement → negate). This is the
-# representation the kernel deliberately avoids for *integration* (its kinks
-# are why we carry leaves separately), but it is the right thing to *display*:
-# a contour at 0 reproduces ∂Ω. Used by VTK export and nowhere in the hot path.
+# A single scalar that is ≤ 0 exactly on Ω, reconstructed from the tree (intersection → max, union → min, complement →
+# negate). This is the representation the kernel deliberately avoids for *integration* (its kinks are why we carry
+# leaves separately), but it is the right thing to *display*: a contour at 0 reproduces ∂Ω. Used by VTK export and
+# nowhere in the hot path.
 _value(l::Leaf, x) = l.f(x)
 _value(n::AllOf, x) = maximum(p -> _value(p, x), n.parts)
 _value(n::AnyOf, x) = minimum(p -> _value(p, x), n.parts)
 _value(n::Not, x) = -_value(n.part, x)
 
-# Collect the leaves in a stable depth-first order; the quadrature kernel
-# partitions by these and the classifier certifies each one's sign.
+# Collect the leaves in a stable depth-first order; the quadrature kernel partitions by these and the classifier
+# certifies each one's sign.
 _collect_leaves!(acc, l::Leaf) = (push!(acc, l); acc)
 _collect_leaves!(acc, n::AllOf) = (foreach(p -> _collect_leaves!(acc, p), n.parts); acc)
 _collect_leaves!(acc, n::AnyOf) = (foreach(p -> _collect_leaves!(acc, p), n.parts); acc)
@@ -156,74 +137,55 @@ _leaves(g::LevelSet) = _collect_leaves!(Leaf[], g)
                           moment_order_factor, target_residual, keep_fictitious,
                           cut_quadrature)
 
-CSG level-set description of a physical domain Ω for finite-cell-style immersed
-integration. `Ω = { x : x ∈ geometry }`, where `geometry` is a
-[`LevelSet`](@ref) tree of smooth leaves combined by `intersect`/`union`/
-`setdiff`/`complement` (a single [`leaf`](@ref) is the degenerate case, with
-the familiar `Ω = {φ ≤ 0}`).
+CSG level-set description of a physical domain Ω for finite-cell-style immersed integration. `Ω = { x : x ∈ geometry }`,
+where `geometry` is a [`LevelSet`](@ref) tree of smooth leaves combined by `intersect`/`union`/ `setdiff`/`complement`
+(a single [`leaf`](@ref) is the degenerate case, with the familiar `Ω = {φ ≤ 0}`).
 
 Fields:
 
-  - `geometry::G`: the CSG level-set tree. Each leaf carries its own Lipschitz
-    constant; the tree's Boolean structure defines membership.
-  - `alpha::T`: fictitious-region stabilization weight (α-FCM). `0` is the
-    strict cut path; `> 0` enriches every **cut** cell's quadrature with the
-    α-scaled full-cell rule, so cut-cell dofs whose basis support lies in the
-    fictitious part still get a well-posed contribution (see
-    `_build_region_quadrature` in `intersections.jl`). It is honoured one
-    dimension down on a boundary **face** in exactly the same way — on the level
-    set restricted to that face's affine slice (`_facet_region` in
-    `dirichlet.jl`) — which is what lets α stabilise a thin physical sliver of
-    face; the price there is that the rule then carries points outside Ω, so a
-    datum defined only on Ω needs `alpha = 0` (see [`boundary`](@ref)).
-    Fully-fictitious cells (support entirely outside Ω) are **dropped from the
-    dof layout** unless `keep_fictitious` says otherwise; α alone never keeps
-    them, because the α term stabilizes cuts, not whole fictitious cells.
-  - `keep_fictitious::Bool`: opt into the classic α-FCM treatment where
-    fully-fictitious cells are *kept* active with α-scaled full-cell quadrature
-    instead of being dropped. `false` (default) drops them, which keeps the
-    system lean and the physical domain clean for post-processing; `true`
-    requires `alpha > 0`, and [`physical_domain`](@ref) raises an
-    `ArgumentError` on the `alpha = 0` pairing rather than building a domain
-    whose kept cells carry no quadrature.
-  - `subcell_length_scale::T`: target box size, in physical units, for the
-    binary subdivision both the classifier and the moment-fit kernel share. A
-    box is bisected until its largest axis extent is `≤ subcell_length_scale`
-    (capped by `max_depth`); `_effective_subcell_depth` turns the two into a
-    single depth budget. It feeds exactly two consumers, both subdivision
-    budgets — not an octree moment grid:
-    (1) the cut/full/fictitious classifier, which bisects only when the
-    Lipschitz certificate and corner sampling cannot decide a box, so this is a
-    geometry-*robustness* knob (resolving thin or near-tangent features); and
-    (2) the implicit-quadrature kernel's fallback subdivision on *non-graph-like*
-    cut cells (a leaf with a turning point / multiple roots inside the box).
-    Smooth, graph-like cut cells get exact, depth-independent moments from the
-    kernel (see `src/fcm.jl`) and are never subdivided, so on those cells moment
-    accuracy does not depend on this scale at all. Pick it relative to the
-    smallest geometric feature you must classify cleanly.
+  - `geometry::G`: the CSG level-set tree. Each leaf carries its own Lipschitz constant; the tree's Boolean structure
+    defines membership.
+  - `alpha::T`: fictitious-region stabilization weight (α-FCM). `0` is the strict cut path; `> 0` enriches every **cut**
+    cell's quadrature with the α-scaled full-cell rule, so cut-cell dofs whose basis support lies in the fictitious part
+    still get a well-posed contribution (see `_build_region_quadrature` in `intersections.jl`). It is honoured one
+    dimension down on a boundary **face** in exactly the same way — on the level set restricted to that face's affine
+    slice (`_facet_region` in `dirichlet.jl`) — which is what lets α stabilise a thin physical sliver of face; the price
+    there is that the rule then carries points outside Ω, so a datum defined only on Ω needs `alpha = 0` (see
+    [`boundary`](@ref)). Fully-fictitious cells (support entirely outside Ω) are **dropped from the dof layout** unless
+    `keep_fictitious` says otherwise; α alone never keeps them, because the α term stabilizes cuts, not whole fictitious
+    cells.
+  - `keep_fictitious::Bool`: opt into the classic α-FCM treatment where fully-fictitious cells are *kept* active with
+    α-scaled full-cell quadrature instead of being dropped. `false` (default) drops them, which keeps the system lean
+    and the physical domain clean for post-processing; `true` requires `alpha > 0`, and [`physical_domain`](@ref) raises
+    an `ArgumentError` on the `alpha = 0` pairing rather than building a domain whose kept cells carry no quadrature.
+  - `subcell_length_scale::T`: target box size, in physical units, for the binary subdivision both the classifier and
+    the moment-fit kernel share. A box is bisected until its largest axis extent is `≤ subcell_length_scale` (capped by
+    `max_depth`); `_effective_subcell_depth` turns the two into a single depth budget. It feeds exactly two consumers,
+    both subdivision budgets — not an octree moment grid:
+    (1) the cut/full/fictitious classifier, which bisects only when the Lipschitz certificate and corner sampling cannot
+    decide a box, so this is a geometry-*robustness* knob (resolving thin or near-tangent features); and
+    (2) the implicit-quadrature kernel's fallback subdivision on *non-graph-like* cut cells (a leaf with a turning point
+    / multiple roots inside the box). Smooth, graph-like cut cells get exact, depth-independent moments from the kernel
+    (see `src/fcm.jl`) and are never subdivided, so on those cells moment accuracy does not depend on this scale at all.
+    Pick it relative to the smallest geometric feature you must classify cleanly.
   - `max_depth::Int`: hard cap on the subdivision depth of both consumers above.
-  - `moment_order_factor::Int`: multiplier on the NNMF moment-fit basis order
-    per axis (`factor × max(cell_order)` over the region's parent cells).
+  - `moment_order_factor::Int`: multiplier on the NNMF moment-fit basis order per axis (`factor × max(cell_order)` over
+    the region's parent cells).
 
-    `2` (the default) spans degree `2p`, so the fit solves for `∏(2p+1)`
-    weights and trial × test *products* integrate exactly — matching on cut
-    regions what tensor Gauss already delivers on `:full` ones.
+    `2` (the default) spans degree `2p`, so the fit solves for `∏(2p+1)` weights and trial × test *products* integrate
+    exactly — matching on cut regions what tensor Gauss already delivers on `:full` ones.
 
-    `1` spans degree `p` and solves for `∏(p+1)` weights, the same point count
-    tensor Gauss uses on an uncut cell. It is the convention of much of the
-    moment-fitting literature and of QuESo, whose trimmed-element rules
-    likewise carry `n ≤ ∏(p+1)` points, and it is dramatically cheaper: the
-    fit costs roughly the cube of the weight count, so over the 146 cut cells
-    of the space-time cavity geometry at cells `(8,8,8)` it runs 1.1 s at
-    `∏(p+1) = 125` against ≈ 500 s at `∏(2p+1) = 729`.
+    `1` spans degree `p` and solves for `∏(p+1)` weights, the same point count tensor Gauss uses on an uncut cell. It is
+    the convention of much of the moment-fitting literature and of QuESo, whose trimmed-element rules likewise carry
+    `n ≤ ∏(p+1)` points, and it is dramatically cheaper: the fit costs roughly the cube of the weight count, so over the
+    146 cut cells of the space-time cavity geometry at cells `(8,8,8)` it runs 1.1 s at `∏(p+1) = 125` against ≈ 500 s
+    at `∏(2p+1) = 729`.
 
-    It is not, however, a free choice, and the condition is sharp. A stiffness
-    integrand `∇u·∇v` has degree `2(p−1)`, so exactness needs the moment basis
-    to span `2p − 2`, i.e. `factor ≥ 2 − 2/p` — which `1` satisfies only up to
-    `p = 2`. Linear functionals (sources, loads) are degree `p` and are exact
-    at `1` for any order. Measured on `examples/applications/kirsch_plate_2d`,
-    a plane-stress plate swept over orders 1–7, relative L² error at factor
-    `1` against factor `2`:
+    It is not, however, a free choice, and the condition is sharp. A stiffness integrand `∇u·∇v` has degree `2(p−1)`, so
+    exactness needs the moment basis to span `2p − 2`, i.e. `factor ≥ 2 − 2/p` — which `1` satisfies only up to `p = 2`.
+    Linear functionals (sources, loads) are degree `p` and are exact at `1` for any order. Measured on
+    `examples/applications/kirsch_plate_2d`, a plane-stress plate swept over orders 1–7, relative L² error at factor `1`
+    against factor `2`:
 
         order 1   2.41e-2    2.19e-2
         order 2   1.12e-3    1.11e-3
@@ -231,81 +193,60 @@ Fields:
         order 4   3.39e-4    9.39e-6
         order 7   7.33e-2    < 1e-6
 
-    At factor `1` the sequence stops converging after `p = 2` and then
-    diverges, ending three times worse than first order, while the moment-fit
-    residual holds at ~1e-16 throughout — the fit is exact for what it fits,
-    and what it fits is too little. Use `1` for low-order work or when only
-    linear functionals are integrated over cut cells; keep `2` whenever
-    high-order convergence on cut cells is the point.
-  - `target_residual::T`: NNMF L² residual the moment-fit aims for in cut
-    regions. Default `1e-6`; the exact kernel reaches far below it, so this
-    only bounds the conditioning retry.
-  - `cut_quadrature::Q`: the cut-cell quadrature rule. `nothing` (the default,
-    `Q === Nothing`) is the package's own non-negative moment fit; any other
-    value is a callable that replaces it on **cut** regions only. See
-    "Custom cut-cell quadrature" below for the contract it must honour.
+    At factor `1` the sequence stops converging after `p = 2` and then diverges, ending three times worse than first
+    order, while the moment-fit residual holds at ~1e-16 throughout — the fit is exact for what it fits, and what it
+    fits is too little. Use `1` for low-order work or when only linear functionals are integrated over cut cells; keep
+    `2` whenever high-order convergence on cut cells is the point.
+  - `target_residual::T`: NNMF L² residual the moment-fit aims for in cut regions. Default `1e-6`; the exact kernel
+    reaches far below it, so this only bounds the conditioning retry.
+  - `cut_quadrature::Q`: the cut-cell quadrature rule. `nothing` (the default, `Q === Nothing`) is the package's own
+    non-negative moment fit; any other value is a callable that replaces it on **cut** regions only. See "Custom
+    cut-cell quadrature" below for the contract it must honour.
 
 # Custom cut-cell quadrature
 
-`cut_quadrature` is the extension point for integrating a cut cell by some
-other scheme — a space-tree/octree rule, a tessellation, a rule read from a
-file. It is called once per distinct `(region box, moment order)` pair (see the
+`cut_quadrature` is the extension point for integrating a cut cell by some other scheme — a space-tree/octree rule, a
+tessellation, a rule read from a file. It is called once per distinct `(region box, moment order)` pair (see the
 memoisation note below), with the signature
 
     (physical, box, moment_order) -> (points, weights, residual, status)
 
-and must return the same 4-tuple [`moment_fit_rule`](@ref) returns:
-`points::Vector{SVector{D,T}}`, `weights::Vector{T}`, a scalar `residual`,
-and a `Symbol` status (report `residual = 0` when a rule has no notion of a fit
-residual). Only `:full`, `:fictitious`, and the fictitious fold are unaffected
-— every other part of the pipeline treats the returned rule exactly as it
-treats a fitted one. Four properties of that pipeline are the caller's
+and must return the same 4-tuple [`moment_fit_rule`](@ref) returns: `points::Vector{SVector{D,T}}`,
+`weights::Vector{T}`, a scalar `residual`, and a `Symbol` status (report `residual = 0` when a rule has no notion of a
+fit residual). Only `:full`, `:fictitious`, and the fictitious fold are unaffected — every other part of the pipeline
+treats the returned rule exactly as it treats a fitted one. Four properties of that pipeline are the caller's
 responsibility:
 
- 1. **Points are in physical coordinates.** `points[q] ∈ box ⊂ ℝᴰ` and
-    `weights[q]` is its physical weight, so `Σ w_q ≈ vol(box ∩ Ω)` — the same
-    convention [`moment_fit_rule`](@ref) returns. The per-box rule cache and
-    the mapping into the region's `[−1, 1]ᴰ` reference frame downstream both
-    assume it; handing back reference-frame points silently integrates the
-    wrong geometry.
- 2. **Weights must be non-negative.** The α-FCM blend below and the
-    fictitious fold in `src/mesh.jl` both assume `w_q ≥ 0`, and a negative
-    weight can make an otherwise SPD form indefinite. The moment fit
-    guarantees this by construction (NNLS); a custom rule must guarantee it
-    itself.
- 3. **An empty rule produces silent zero stiffness.** A rule that returns no
-    points for a sliver cell contributes nothing to the tangent, and *no
-    diagnostic is raised*: the region is kept, tagged, and integrates to
-    zero, so every dof supported only there ends up with a zero row and the
-    system is singular. This is not hypothetical — it is what makes an
-    aggressive space-tree configuration singular at `alpha = 0`. A rule that
-    knows it found nothing should return `status === :empty`, which routes
-    the region to `:cut_failed` (α = 0) or `:cut_alpha_failed` (α > 0) exactly
-    as an empty moment fit would, and so at least reaches
-    `diagnostics(...).fit_failure_count`.
- 4. **α blending still applies**, downstream of the rule. Under `alpha > 0` a
-    cut region carries `(1 − α)·(custom rule) ∪ α·(full-cell tensor rule)`,
-    just as it would with the moment fit, so a custom rule inherits α-FCM
-    rather than replacing it.
+ 1. **Points are in physical coordinates.** `points[q] ∈ box ⊂ ℝᴰ` and `weights[q]` is its physical weight, so
+    `Σ w_q ≈ vol(box ∩ Ω)` — the same convention [`moment_fit_rule`](@ref) returns. The per-box rule cache and the
+    mapping into the region's `[−1, 1]ᴰ` reference frame downstream both assume it; handing back reference-frame points
+    silently integrates the wrong geometry.
+ 2. **Weights must be non-negative.** The α-FCM blend below and the fictitious fold in `src/mesh.jl` both assume
+    `w_q ≥ 0`, and a negative weight can make an otherwise SPD form indefinite. The moment fit guarantees this by
+    construction (NNLS); a custom rule must guarantee it itself.
+ 3. **An empty rule produces silent zero stiffness.** A rule that returns no points for a sliver cell contributes
+    nothing to the tangent, and *no diagnostic is raised*: the region is kept, tagged, and integrates to zero, so every
+    dof supported only there ends up with a zero row and the system is singular. This is not hypothetical — it is what
+    makes an aggressive space-tree configuration singular at `alpha = 0`. A rule that knows it found nothing should
+    return `status === :empty`, which routes the region to `:cut_failed` (α = 0) or `:cut_alpha_failed` (α > 0) exactly
+    as an empty moment fit would, and so at least reaches `diagnostics(...).fit_failure_count`.
+ 4. **α blending still applies**, downstream of the rule. Under `alpha > 0` a cut region carries
+    `(1 − α)·(custom rule) ∪ α·(full-cell tensor rule)`, just as it would with the moment fit, so a custom rule inherits
+    α-FCM rather than replacing it.
 
-The rule must also be a deterministic function of its three arguments: results
-are memoised per `(region box, moment order)` in a cache the [`Model`](@ref)
-owns per participating space and threads back through every plan rebuild, so a
-rule reading mutable state outside its arguments is captured at its first answer
-for a box and silently reused — across rebuilds, not merely within one. Put
-every knob in the callable itself; that is what makes the rule reproducible.
-The package does not run a custom rule on several threads, unlike its own fit:
-`_prefit_cut_rules!` in `src/intersections.jl` fits custom rules serially,
-because they are caller code under no thread-safety contract. `residual` is
-reported verbatim through `diagnostics(model).moment_fit_residual_max`.
+The rule must also be a deterministic function of its three arguments: results are memoised per
+`(region box, moment order)` in a cache the [`Model`](@ref) owns per participating space and threads back through every
+plan rebuild, so a rule reading mutable state outside its arguments is captured at its first answer for a box and
+silently reused — across rebuilds, not merely within one. Put every knob in the callable itself; that is what makes the
+rule reproducible. The package does not run a custom rule on several threads, unlike its own fit: `_prefit_cut_rules!`
+in `src/intersections.jl` fits custom rules serially, because they are caller code under no thread-safety contract.
+`residual` is reported verbatim through `diagnostics(model).moment_fit_residual_max`.
 
-A region built from a custom rule is tagged `:cut_custom` (see
-`_build_region_quadrature` in `src/intersections.jl`) — one kind for every
-custom rule, whatever status symbol it returns, `:empty` excepted as in point
-3 above. `_cut_region_stats` counts `:cut_custom` as a cut region and **not**
-as a fit failure, since there is no fit to fail. The rule is stored on the domain
-rather than in a global, so two models in one session can use different rules
-and nothing about the choice is process-wide or thread-shared.
+A region built from a custom rule is tagged `:cut_custom` (see `_build_region_quadrature` in `src/intersections.jl`) —
+one kind for every custom rule, whatever status symbol it returns, `:empty` excepted as in point 3 above.
+`_cut_region_stats` counts `:cut_custom` as a cut region and **not** as a fit failure, since there is no fit to fail.
+The rule is stored on the domain rather than in a global, so two models in one session can use different rules and
+nothing about the choice is process-wide or thread-shared.
 
 Construct via [`physical_domain`](@ref).
 """
@@ -325,40 +266,31 @@ end
                     subcell_length_scale, max_depth=8, moment_order_factor=2,
                     target_residual=1e-6, cut_quadrature=nothing)
 
-Construct a [`PhysicalDomain`](@ref). `geometry` is either a [`LevelSet`](@ref)
-CSG tree (built from [`leaf`](@ref) and `intersect`/`union`/`setdiff`/
-[`complement`](@ref)) or a bare scalar callable `φ`, which is auto-wrapped as a
-single leaf with `Ω = {φ ≤ 0}` — preserving the single-level-set ergonomics
-`physical_domain(φ; lipschitz=…)`. The `lipschitz` keyword applies only to that
-auto-wrapped single leaf; a CSG tree carries one constant per leaf, so set it on
-the `leaf(...)` call instead. Passing a finite `lipschitz` together with a tree
-that has a leaf without its own constant is **rejected**, rather than silently
-ignored: the certificate the caller asked for would never be installed, and the
+Construct a [`PhysicalDomain`](@ref). `geometry` is either a [`LevelSet`](@ref) CSG tree (built from [`leaf`](@ref) and
+`intersect`/`union`/`setdiff`/ [`complement`](@ref)) or a bare scalar callable `φ`, which is auto-wrapped as a single
+leaf with `Ω = {φ ≤ 0}` — preserving the single-level-set ergonomics `physical_domain(φ; lipschitz=…)`. The `lipschitz`
+keyword applies only to that auto-wrapped single leaf; a CSG tree carries one constant per leaf, so set it on the
+`leaf(...)` call instead. Passing a finite `lipschitz` together with a tree that has a leaf without its own constant is
+**rejected**, rather than silently ignored: the certificate the caller asked for would never be installed, and the
 uncertified leaf would then be integrated as if its feature were not there.
 
-`subcell_length_scale` is the **required** classifier accuracy / subdivision
-scale (see the [`PhysicalDomain`](@ref) docstring). `alpha = 0` is the
-strict-cut path; `alpha > 0` enables α-FCM. `keep_fictitious = true` retains
-fully-fictitious cells as active dofs (the classic α-FCM fill) and therefore
-requires `alpha > 0` — pairing it with `alpha = 0` leaves those cells without
-quadrature and is rejected. `moment_order_factor` and `target_residual` tune
-the NNMF moment fit.
+`subcell_length_scale` is the **required** classifier accuracy / subdivision scale (see the [`PhysicalDomain`](@ref)
+docstring). `alpha = 0` is the strict-cut path; `alpha > 0` enables α-FCM. `keep_fictitious = true` retains
+fully-fictitious cells as active dofs (the classic α-FCM fill) and therefore requires `alpha > 0` — pairing it with
+`alpha = 0` leaves those cells without quadrature and is rejected. `moment_order_factor` and `target_residual` tune the
+NNMF moment fit.
 
-`cut_quadrature = nothing` (default) integrates cut cells with the package's
-non-negative moment fit. Passing a callable
-`(physical, box, moment_order) -> (points, weights, residual, status)`
-replaces that rule on cut regions and nothing else; the contract it must
-honour — physical-frame points, non-negative weights, the silent-zero-stiffness
-hazard of an empty rule, and the α blend that still applies downstream — is
-spelled out under "Custom cut-cell quadrature" in the [`PhysicalDomain`](@ref)
-docstring.
+`cut_quadrature = nothing` (default) integrates cut cells with the package's non-negative moment fit. Passing a callable
+`(physical, box, moment_order) -> (points, weights, residual, status)` replaces that rule on cut regions and nothing
+else; the contract it must honour — physical-frame points, non-negative weights, the silent-zero-stiffness hazard of an
+empty rule, and the α blend that still applies downstream — is spelled out under "Custom cut-cell quadrature" in the
+[`PhysicalDomain`](@ref) docstring.
 """
 function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0, keep_fictitious::Bool=false,
                          subcell_length_scale::Real, max_depth::Integer=8, moment_order_factor::Integer=2,
                          target_residual::Real=1.0e-6, cut_quadrature=nothing)
-    # Validated here rather than only inside `leaf`, so the constraint holds on
-    # every path: with a tree argument the auto-wrap never runs, and `lipschitz`
-    # would otherwise reach no check at all.
+    # Validated here rather than only inside `leaf`, so the constraint holds on every path: with a tree argument the
+    # auto-wrap never runs, and `lipschitz` would otherwise reach no check at all.
     lipschitz > 0 || throw(ArgumentError("lipschitz must be positive; got $lipschitz"))
     alpha >= 0 || throw(ArgumentError("alpha must be ≥ 0; got $alpha"))
     !(keep_fictitious && iszero(alpha)) ||
@@ -369,22 +301,17 @@ function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0, keep_fi
     max_depth >= 0 || throw(ArgumentError("max_depth must be ≥ 0; got $max_depth"))
     moment_order_factor >= 1 || throw(ArgumentError("moment_order_factor must be ≥ 1; got $moment_order_factor"))
     target_residual > 0 || throw(ArgumentError("target_residual must be positive; got $target_residual"))
-    # A bare callable becomes a single leaf, honouring the `lipschitz` keyword;
-    # an explicit CSG tree carries per-leaf Lipschitz constants already, so the
-    # keyword has nowhere to go there. Only the combination that actually loses
-    # information is rejected — a finite constant supplied alongside a tree with
-    # a leaf that carries none — because that is the case where the caller asked
-    # for a certificate and would get none: the classifier and the quadrature
-    # kernel then fall back to corner sampling, prune the uncertified leaf on any
-    # box whose corners miss its feature, and integrate the cell as if the
-    # feature were not there, all while reporting `:cut` and a round-off fit
-    # residual. Rejecting is preferred over applying `L` to the leaves that lack
-    # one: a single constant is not generally valid for every leaf (scaling one
-    # leaf by 10 scales its constant by 10), and a constant that is too small
-    # certifies a uniform sign that does not hold — the same silent
-    # over-integration, now with the package's fingerprints on it. A tree whose
-    # leaves all carry their own constants is unaffected by the keyword, so
-    # passing one alongside such a tree stays legal.
+    # A bare callable becomes a single leaf, honouring the `lipschitz` keyword; an explicit CSG tree carries per-leaf
+    # Lipschitz constants already, so the keyword has nowhere to go there. Only the combination that actually loses
+    # information is rejected — a finite constant supplied alongside a tree with a leaf that carries none — because that
+    # is the case where the caller asked for a certificate and would get none: the classifier and the quadrature kernel
+    # then fall back to corner sampling, prune the uncertified leaf on any box whose corners miss its feature, and
+    # integrate the cell as if the feature were not there, all while reporting `:cut` and a round-off fit residual.
+    # Rejecting is preferred over applying `L` to the leaves that lack one: a single constant is not generally valid for
+    # every leaf (scaling one leaf by 10 scales its constant by 10), and a constant that is too small certifies a
+    # uniform sign that does not hold — the same silent over-integration, now with the package's fingerprints on it. A
+    # tree whose leaves all carry their own constants is unaffected by the keyword, so passing one alongside such a tree
+    # stays legal.
     if geometry isa LevelSet && !isinf(lipschitz)
         ls = _leaves(geometry)
         bare = count(l -> isinf(l.lipschitz), ls)
@@ -402,39 +329,34 @@ end
 """
     levelset_value(physical, x) -> Real
 
-Scalar reconstruction of the domain's level set at `x` that is `≤ 0` exactly on
-Ω (intersection → max of children, union → min, complement → negate, leaf →
-`f(x)`). Intended for visualization — a contour at level 0 reproduces ∂Ω — not
-for integration, which uses the separate leaves.
+Scalar reconstruction of the domain's level set at `x` that is `≤ 0` exactly on Ω (intersection → max of children, union
+→ min, complement → negate, leaf → `f(x)`). Intended for visualization — a contour at level 0 reproduces ∂Ω — not for
+integration, which uses the separate leaves.
 """
 levelset_value(physical::PhysicalDomain, x) = _value(physical.geometry, x)
 
 # ── Box certificates ──────────────────────────────────────────────────────────
 
-# Number of binary-subdivision levels needed to drive `box`'s largest axis
-# extent down to `physical.subcell_length_scale`, capped at `physical.max_depth`.
-# Shared by the classifier and the quadrature kernel's subdivision budget so the
-# resolution contract is uniform. Boxes already at or below the scale return 0.
+# Number of binary-subdivision levels needed to drive `box`'s largest axis extent down to
+# `physical.subcell_length_scale`, capped at `physical.max_depth`. Shared by the classifier and the quadrature kernel's
+# subdivision budget so the resolution contract is uniform. Boxes already at or below the scale return 0.
 function _effective_subcell_depth(physical::PhysicalDomain, box::AxisBox)
     max_extent = maximum(box.upper - box.lower)
     max_extent <= physical.subcell_length_scale && return 0
     return min(physical.max_depth, ceil(Int, log2(max_extent / physical.subcell_length_scale)))
 end
 
-# Half-diagonal of an axis-aligned box — the radius of the smallest enclosing
-# ball. Used by the per-leaf Lipschitz certificate: for a Lipschitz `f` and any
-# point `y` in the box, |f(y) − f(c)| ≤ L·r with `c` the center and `r` this
+# Half-diagonal of an axis-aligned box — the radius of the smallest enclosing ball. Used by the per-leaf Lipschitz
+# certificate: for a Lipschitz `f` and any point `y` in the box, |f(y) − f(c)| ≤ L·r with `c` the center and `r` this
 # radius, so a center sign whose magnitude exceeds `L·r` is uniform on the box.
 _half_diagonal(b::AxisBox) = norm(b.upper - b.lower) / 2
 
-# Largest Lipschitz constant declared anywhere in the tree, or `Inf` if any leaf
-# declines to declare one. `levelset_value` collapses the tree with max / min /
-# negate, and each of those is non-expansive in its arguments, so the collapsed
-# scalar is itself Lipschitz with this constant. That is what the VTK export's
-# cut refinement needs: it bands on the collapsed φ rather than on the separate
-# leaves, so it needs a constant for φ, not one per leaf. `Inf` propagates — one
-# undeclared leaf leaves the whole tree uncertified, exactly as it does for
-# `_tri`, and the export then falls back to corner signs.
+# Largest Lipschitz constant declared anywhere in the tree, or `Inf` if any leaf declines to declare one.
+# `levelset_value` collapses the tree with max / min / negate, and each of those is non-expansive in its arguments, so
+# the collapsed scalar is itself Lipschitz with this constant. That is what the VTK export's cut refinement needs: it
+# bands on the collapsed φ rather than on the separate leaves, so it needs a constant for φ, not one per leaf. `Inf`
+# propagates — one undeclared leaf leaves the whole tree uncertified, exactly as it does for `_tri`, and the export then
+# falls back to corner signs.
 _levelset_lipschitz(l::Leaf) = float(l.lipschitz)
 _levelset_lipschitz(n::AllOf) = maximum(_levelset_lipschitz, n.parts)
 _levelset_lipschitz(n::AnyOf) = maximum(_levelset_lipschitz, n.parts)
@@ -442,14 +364,11 @@ _levelset_lipschitz(n::Not) = _levelset_lipschitz(n.part)
 
 # ── Cell classifier ───────────────────────────────────────────────────────────
 
-# Three-valued (Kleene) membership certificate over the CSG tree: returns
-# `+1` if the box is certainly inside Ω, `-1` if certainly outside, `0` if
-# undetermined. Each leaf is certified by its Lipschitz bound (|f(c)| > L·r ⇒
-# uniform sign); the Boolean combinators propagate certainty without
-# enumerating sign patterns — e.g. a union is certainly inside as soon as one
-# part is, certainly outside only if every part is. This is what lets a cut
-# cell of one component be classified `:full`/`:fictitious` when another
-# component dominates it.
+# Three-valued (Kleene) membership certificate over the CSG tree: returns `+1` if the box is certainly inside Ω, `-1` if
+# certainly outside, `0` if undetermined. Each leaf is certified by its Lipschitz bound (|f(c)| > L·r ⇒ uniform sign);
+# the Boolean combinators propagate certainty without enumerating sign patterns — e.g. a union is certainly inside as
+# soon as one part is, certainly outside only if every part is. This is what lets a cut cell of one component be
+# classified `:full`/`:fictitious` when another component dominates it.
 function _tri(l::Leaf, box::AxisBox)
     fc = l.f(center(box))
     thr = l.lipschitz * _half_diagonal(box)
@@ -475,10 +394,9 @@ function _tri(n::AnyOf, box::AxisBox)
 end
 _tri(n::Not, box::AxisBox) = -_tri(n.part, box)
 
-# Tally Ω-membership at the box center and its 2ᴰ corners. Mixed counts prove
-# ∂Ω crosses the box; corners — rather than interior points — are the natural
-# sample set for an axis-aligned box and double as the child vertices when the
-# octree recurses.
+# Tally Ω-membership at the box center and its 2ᴰ corners. Mixed counts prove ∂Ω crosses the box; corners — rather than
+# interior points — are the natural sample set for an axis-aligned box and double as the child vertices when the octree
+# recurses.
 function _corner_membership(geometry::LevelSet, box::AxisBox{D,T}) where {D,T}
     inside = _inside(geometry, center(box)) ? 1 : 0
     outside = 1 - inside
@@ -489,19 +407,16 @@ function _corner_membership(geometry::LevelSet, box::AxisBox{D,T}) where {D,T}
     return inside, outside
 end
 
-# Recursive classifier returning one of `:full`, `:cut`, `:fictitious`.
-# Strategy, cheapest first:
+# Recursive classifier returning one of `:full`, `:cut`, `:fictitious`. Strategy, cheapest first:
 #
-#   1. Three-valued Lipschitz certificate on the CSG tree. A definite verdict
-#      settles `:full`/`:fictitious` with no sampling.
+#   1. Three-valued Lipschitz certificate on the CSG tree. A definite verdict settles `:full`/`:fictitious` with no
+#      sampling.
 #   2. Corner membership. Mixed inside/outside proves ∂Ω crosses the box.
-#   3. Octree recursion. Signs agree but the certificate did not fire; bisect
-#      into 2ᴰ children and recurse. Any `:cut` child, or any disagreement
-#      between `:full`/`:fictitious` children, makes the parent `:cut`.
+#   3. Octree recursion. Signs agree but the certificate did not fire; bisect into 2ᴰ children and recurse. Any `:cut`
+#      child, or any disagreement between `:full`/`:fictitious` children, makes the parent `:cut`.
 #   4. Depth budget exhausted with agreeing samples: trust the consensus.
 #
-# The single-leaf case reduces exactly to the Lipschitz-then-corner strategy
-# the package used before CSG.
+# The single-leaf case reduces exactly to the Lipschitz-then-corner strategy the package used before CSG.
 function _classify_box(geometry::LevelSet, box::AxisBox{D,T}, depth::Integer, max_depth::Integer) where {D,T}
     t = _tri(geometry, box)
     t == 1 && return :full
@@ -533,15 +448,12 @@ end
     classify_cell(physical, box) -> Symbol
     classify_cell(physical, box, cache) -> Symbol
 
-Classify an axis-aligned `box` against `physical`'s CSG level set. Returns one
-of `:full` (entirely inside Ω), `:cut` (crossed by ∂Ω), or `:fictitious`
-(entirely outside Ω). Uses the three-valued Lipschitz certificate first and
-falls back to octree-bounded corner sampling; see the comment block on
-`_classify_box` for the full strategy.
+Classify an axis-aligned `box` against `physical`'s CSG level set. Returns one of `:full` (entirely inside Ω), `:cut`
+(crossed by ∂Ω), or `:fictitious` (entirely outside Ω). Uses the three-valued Lipschitz certificate first and falls back
+to octree-bounded corner sampling; see the comment block on `_classify_box` for the full strategy.
 
-The 3-arg form memoizes the result by `(box.lower, box.upper)` in a
-caller-owned `Dict`, shared between the cell-level fold and the per-region
-integration dispatch.
+The 3-arg form memoizes the result by `(box.lower, box.upper)` in a caller-owned `Dict`, shared between the cell-level
+fold and the per-region integration dispatch.
 """
 function classify_cell(physical::PhysicalDomain, box::AxisBox)
     return _classify_box(physical.geometry, box, 0, _effective_subcell_depth(physical, box))
@@ -558,44 +470,35 @@ end
 
 # ── Affine slices ─────────────────────────────────────────────────────────────
 
-# Restrict a CSG tree to the affine slice `{x_k = v}`, one dimension down. Each
-# leaf's callback is restricted by the callback-level `_restrict` in
-# `src/implicit.jl` — which carries the leaf's Lipschitz constant through
-# unchanged, the slice being an isometric embedding of the base into ℝᴰ — and the
-# Boolean structure is rebuilt around the restricted leaves.
+# Restrict a CSG tree to the affine slice `{x_k = v}`, one dimension down. Each leaf's callback is restricted by the
+# callback-level `_restrict` in `src/implicit.jl` — which carries the leaf's Lipschitz constant through unchanged, the
+# slice being an isometric embedding of the base into ℝᴰ — and the Boolean structure is rebuilt around the restricted
+# leaves.
 #
-# Restricting the *leaves* rather than the scalar reconstruction is the whole
-# point. `levelset_value` collapses the tree to max/min, which creases ∂Ω wherever
-# two components meet, and a crease inside the sliced box costs the quadrature
-# kernel its high order exactly as that function's docstring warns: on a wedge
-# whose two faces meet strictly inside the sliced box, the leaf-wise slice
-# integrates the area to 3.6e-4 at moment order 4 where the collapsed one reaches
-# only 5.0e-3, 13× worse. `test_physical.jl` pins that comparison.
+# Restricting the *leaves* rather than the scalar reconstruction is the whole point. `levelset_value` collapses the tree
+# to max/min, which creases ∂Ω wherever two components meet, and a crease inside the sliced box costs the quadrature
+# kernel its high order exactly as that function's docstring warns: on a wedge whose two faces meet strictly inside the
+# sliced box, the leaf-wise slice integrates the area to 3.6e-4 at moment order 4 where the collapsed one reaches only
+# 5.0e-3, 13× worse. `test_physical.jl` pins that comparison.
 _restrict(l::Leaf, k::Int, v) = Leaf(_restrict(l.f, k, v), l.lipschitz)
 _restrict(n::AllOf, k::Int, v) = AllOf(map(p -> _restrict(p, k, v), n.parts))
 _restrict(n::AnyOf, k::Int, v) = AnyOf(map(p -> _restrict(p, k, v), n.parts))
 _restrict(n::Not, k::Int, v) = Not(_restrict(n.part, k, v))
 
-# Ω restricted to the affine slice `⋂ⱼ {x_{kⱼ} = vⱼ}` named by `pins`, as a
-# `PhysicalDomain` of dimension `D − length(pins)`. The struct carries no
-# dimension parameter, so a slice is the same domain with a restricted tree, and
-# every consumer that takes its `D` from the box it is handed — `classify_cell`,
-# `_effective_subcell_depth`, [`moment_fit_rule`](@ref) — works on the slice
-# unchanged. The integration knobs come along with it, which is what makes a face
-# and the cells behind it resolve the same geometry at the same accuracy.
+# Ω restricted to the affine slice `⋂ⱼ {x_{kⱼ} = vⱼ}` named by `pins`, as a `PhysicalDomain` of dimension
+# `D − length(pins)`. The struct carries no dimension parameter, so a slice is the same domain with a restricted tree,
+# and every consumer that takes its `D` from the box it is handed — `classify_cell`, `_effective_subcell_depth`,
+# [`moment_fit_rule`](@ref) — works on the slice unchanged. The integration knobs come along with it, which is what
+# makes a face and the cells behind it resolve the same geometry at the same accuracy.
 #
-# `pins` are `(axis, coordinate)` pairs in DESCENDING axis order, and the order is
-# load-bearing: each restriction drops its axis from the coordinate vector, so an
-# axis index stays the one the caller named only while no lower-numbered axis has
-# been dropped before it.
+# `pins` are `(axis, coordinate)` pairs in DESCENDING axis order, and the order is load-bearing: each restriction drops
+# its axis from the coordinate vector, so an axis index stays the one the caller named only while no lower-numbered axis
+# has been dropped before it.
 #
-# Built by direct struct construction rather than through `physical_domain`, so
-# that all eight fields survive verbatim — `keep_fictitious` and `cut_quadrature`
-# included — with no keyword round-trip, and so that the slice never meets that
-# constructor's argument validation, which is about what a caller may *ask* for
-# and has nothing to say about a slice of an already-valid domain (its
-# uncertified-leaf rejection, in particular, would fire on a tree the caller never
-# wrote).
+# Built by direct struct construction rather than through `physical_domain`, so that all eight fields survive verbatim —
+# `keep_fictitious` and `cut_quadrature` included — with no keyword round-trip, and so that the slice never meets that
+# constructor's argument validation, which is about what a caller may *ask* for and has nothing to say about a slice of
+# an already-valid domain (its uncertified-leaf rejection, in particular, would fire on a tree the caller never wrote).
 function _restrict_domain(physical::PhysicalDomain{G,T,Q}, pins) where {G,T,Q}
     geometry = foldl((g, pin) -> _restrict(g, pin[1], pin[2]), pins; init=physical.geometry)
     return PhysicalDomain{typeof(geometry),T,Q}(geometry, physical.alpha, physical.subcell_length_scale,

@@ -2,12 +2,9 @@ using BenchmarkTools
 using LinearAlgebra
 using Unfitted
 
-# Reduced version of
-# the traveling heat-source study this benchmark was derived from.
-# Covers the per-step
-# hot ops of a theta-step (mass + stiffness reassembly, compactly supported
-# load) and one variational transfer between two overlay configurations,
-# both with and without the cached target mass + factor used by the example.
+# Reduced version of the traveling heat-source study this benchmark was derived from. Covers the per-step hot ops of a
+# theta-step (mass + stiffness reassembly, compactly supported load) and one variational transfer between two overlay
+# configurations, both with and without the cached target mass + factor used by the example.
 group = SUITE["scenarios"]["heat_overlay_step"] = BenchmarkGroup()
 
 let
@@ -47,13 +44,10 @@ let
     src_coeffs = [sin(0.01 * i) for i in 1:Unfitted.active_unknowns(model_src.dofs)]
     src_solution = solution(model_src, src_coeffs; method=:synthetic)
 
-    # Cached target operators — mirror
-    # the traveling heat-source study this benchmark was derived from.
-    # The cached path threads the precomputed mass + factor in through the
-    # `L2Projection(matrix; factor)` backend so the transfer skips both the
-    # target-side mass assembly and its factorisation. The uncached bench
-    # uses the default `L2Projection()` backend (no cache) so the assembly
-    # and factorisation costs are visible side-by-side.
+    # Cached target operators — mirror the traveling heat-source study this benchmark was derived from. The cached path
+    # threads the precomputed mass + factor in through the `L2Projection(matrix; factor)` backend so the transfer skips
+    # both the target-side mass assembly and its factorisation. The uncached bench uses the default `L2Projection()`
+    # backend (no cache) so the assembly and factorisation costs are visible side-by-side.
     mass_tgt = assemble_matrix(model_tgt, mass_block(temp_tgt))
     mass_tgt_factor = factorize(mass_tgt)
     cached_backend = L2Projection(mass_tgt; factor=mass_tgt_factor)

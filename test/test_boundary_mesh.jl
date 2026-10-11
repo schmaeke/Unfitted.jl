@@ -2,8 +2,7 @@ using LinearAlgebra
 using StaticArrays
 
 @testset "BoundaryMesh constructors enforce shape and dimension rules" begin
-    # K=0 requires explicit normals; empty `normals` is a dimension
-    # mismatch against a non-empty `points`.
+    # K=0 requires explicit normals; empty `normals` is a dimension mismatch against a non-empty `points`.
     pts = [SVector(0.0, 0.0), SVector(0.5, 0.5)]
     @test_throws DimensionMismatch points_mesh(pts; normals=SVector{2,Float64}[])
     pmesh = points_mesh(pts; normals=[SVector(1.0, 0.0), SVector(0.0, 1.0)])
@@ -58,8 +57,7 @@ end
 @testset "SurfaceRegion builder: simple 2D segment inside one cell" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(4, 4), order=2)
-    # A short segment fully inside cell (1,1) (the cell covers
-    # x ∈ [0, 0.25], y ∈ [0, 0.25]).
+    # A short segment fully inside cell (1,1) (the cell covers x ∈ [0, 0.25], y ∈ [0, 0.25]).
     mesh = segment_mesh([(SVector(0.05, 0.10), SVector(0.20, 0.10))])
     regions = Unfitted._surface_regions_for_mesh(V, mesh, GeometryTolerance(Float64))
 
@@ -75,16 +73,14 @@ end
 @testset "SurfaceRegion builder: straddling segment is subdivided against the grid" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(4, 4), order=1)
-    # Segment crossing the y = 0.25 grid line. With subdivision the
-    # builder produces two sub-segments — one in cell (1, 1), one in
-    # cell (1, 2) — instead of throwing.
+    # Segment crossing the y = 0.25 grid line. With subdivision the builder produces two sub-segments — one in cell (1,
+    # 1), one in cell (1, 2) — instead of throwing.
     straddling = segment_mesh([(SVector(0.1, 0.20), SVector(0.1, 0.30))])
     regions = Unfitted._surface_regions_for_mesh(V, straddling, GeometryTolerance(Float64))
     @test length(regions) == 2
 
-    # Subdivision partitions the segment, so the sub-segment quadrature
-    # weights sum to the original length at round-off — there is no
-    # tolerance floor to leave room for.
+    # Subdivision partitions the segment, so the sub-segment quadrature weights sum to the original length at round-off
+    # — there is no tolerance floor to leave room for.
     total_length = sum(sum(r.weights) for r in regions)
     @test total_length ≈ 0.1 rtol = 1.0e-14
 
@@ -94,10 +90,8 @@ end
 end
 
 @testset "boundary_integral on BoundaryMesh: closed square perimeter is exact" begin
-    # Pick a square whose every edge lies strictly inside one grid cell.
-    # cells=(4,4) on [0,1]² → grid lines at multiples of 0.25.
-    # A 0.1 × 0.1 square inside cell (1,1) has all four edges within
-    # one cell.
+    # Pick a square whose every edge lies strictly inside one grid cell. cells=(4,4) on [0,1]² → grid lines at multiples
+    # of 0.25. A 0.1 × 0.1 square inside cell (1,1) has all four edges within one cell.
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(4, 4), order=2)
     p = [SVector(0.05, 0.05), SVector(0.20, 0.05), SVector(0.20, 0.20), SVector(0.05, 0.20)]
@@ -126,8 +120,7 @@ end
     @test all(n ≈ SVector(0.0, -1.0) for n in normals_seen)
 end
 
-# Allocation count of one warm `boundary_integral` call, behind a function
-# barrier so the count is the call's own.
+# Allocation count of one warm `boundary_integral` call, behind a function barrier so the count is the call's own.
 function _warm_boundary_allocations(integrand, model, on)
     boundary_integral(integrand, model; on)
     boundary_integral(integrand, model; on)
@@ -135,13 +128,11 @@ function _warm_boundary_allocations(integrand, model, on)
 end
 
 @testset "boundary_integral allocates nothing per quadrature point" begin
-    # `boundary_integral` folds over the quadrature-point walker, whose point loop
-    # runs behind a function barrier on the concrete region type. A loop over the
-    # untyped region list instead dispatches, and allocates, at every point: an
-    # earlier version did, and on the 16 × 16 fixture below took 6 570
-    # allocations and 655 µs for the ring where this one takes 12 and about
-    # 1 µs. A warm call's allocation count must not grow with the number of
-    # points, on an immersed surface and on a physical facet target alike.
+    # `boundary_integral` folds over the quadrature-point walker, whose point loop runs behind a function barrier on the
+    # concrete region type. A loop over the untyped region list instead dispatches, and allocates, at every point: an
+    # earlier version did, and on the 16 × 16 fixture below took 6 570 allocations and 655 µs for the ring where this
+    # one takes 12 and about 1 µs. A warm call's allocation count must not grow with the number of points, on an
+    # immersed surface and on a physical facet target alike.
     function ring_model(c)
         V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(c, c), order=2)
         θ = range(0, 2π; length=8c + 1)[1:(end-1)]
@@ -166,9 +157,8 @@ end
     load = loadform(u, source_form(source=0.0); on=mesh)
     model = prepare(Problem((u,); loads=(load,)))
 
-    # One entry, keyed on (mesh, space): the mesh half matches by object
-    # identity, the space half is the subdomain the regions were cut against —
-    # here the model's only space.
+    # One entry, keyed on (mesh, space): the mesh half matches by object identity, the space half is the subdomain the
+    # regions were cut against — here the model's only space.
     @test length(model.surface_regions) == 1
     on, key_space = only(keys(model.surface_regions))
     @test on === mesh
@@ -176,16 +166,14 @@ end
     @test haskey(model.surface_regions, (mesh, model.problem.space))
     @test diagnostics(model).surface_region_count == length(model.surface_regions[(mesh, model.problem.space)])
     @test nquadpoints(model; kind=:surface) > 0
-    # With one cached mesh the aggregate and the per-`on=` count coincide; the
-    # `on=` form is the one that stays equal to the `q.point` range once a
-    # second mesh is cached.
+    # With one cached mesh the aggregate and the per-`on=` count coincide; the `on=` form is the one that stays equal to
+    # the `q.point` range once a second mesh is cached.
     @test nquadpoints(model; on=mesh) == nquadpoints(model; kind=:surface)
 end
 
 @testset "block(...; on=BoundaryMesh) contributes to the assembled matrix" begin
-    # A surface mass operator added on a segment perturbs the volume
-    # stiffness system. Use cells=(4,4) so the segment fits in one
-    # cell.
+    # A surface mass operator added on a segment perturbs the volume stiffness system. Use cells=(4,4) so the segment
+    # fits in one cell.
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(4, 4), order=2)
     seg = segment_mesh([(SVector(0.05, 0.50), SVector(0.20, 0.50))])  # fully in cell (1,2)
@@ -202,12 +190,10 @@ end
 end
 
 @testset "BoundaryMesh contribution matches an equivalent volume mass-integral" begin
-    # A horizontal segment fully inside one grid cell. We verify the
-    # surface mass contribution `∫_seg φᵢ φⱼ ds` equals what a brute-
-    # force 1D Gauss sum gives, by integrating `(boundary_integral on
-    # the cell's segment) of the constant 1` against the assembled
-    # weight pattern. Cleaner check: integrate `∫_seg 1 ds` and
-    # confirm it equals the segment length precisely.
+    # A horizontal segment fully inside one grid cell. We verify the surface mass contribution `∫_seg φᵢ φⱼ ds` equals
+    # what a brute- force 1D Gauss sum gives, by integrating
+    # `(boundary_integral on the cell's segment) of the constant 1` against the assembled weight pattern. Cleaner check:
+    # integrate `∫_seg 1 ds` and confirm it equals the segment length precisely.
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(4, 4), order=2)
     seg = segment_mesh([(SVector(0.10, 0.10), SVector(0.20, 0.10))])
@@ -217,8 +203,8 @@ end
 end
 
 @testset "_subdivide_segment: segment crossing multiple grid lines" begin
-    # Segment from (0.05, 0.10) to (0.85, 0.40). Crosses x = 0.25, 0.5, 0.75
-    # and y = 0.25 — four crossings, so five sub-segments.
+    # Segment from (0.05, 0.10) to (0.85, 0.40). Crosses x = 0.25, 0.5, 0.75 and y = 0.25 — four crossings, so five
+    # sub-segments.
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(4, 4), order=1)
     grid_lines = Unfitted._level_grid_lines(V, GeometryTolerance(Float64))
@@ -227,10 +213,9 @@ end
     subs = Unfitted._subdivide_segment(p1, p2, grid_lines, sqrt(eps(Float64)))
     @test length(subs) == 5
 
-    # The sub-segments *partition* the input: they start at `p1`, end at
-    # `p2`, and each one begins exactly where the last ended. No arc
-    # length may be discarded at a crossing, so the lengths sum back to
-    # the whole at round-off — not at some tolerance floor.
+    # The sub-segments *partition* the input: they start at `p1`, end at `p2`, and each one begins exactly where the
+    # last ended. No arc length may be discarded at a crossing, so the lengths sum back to the whole at round-off — not
+    # at some tolerance floor.
     @test subs[1][1] == p1
     @test subs[end][2] == p2
     @test all(subs[i][2] == subs[i + 1][1] for i in 1:(length(subs)-1))
@@ -238,12 +223,10 @@ end
     total = sum(norm(sub[2] - sub[1]) for sub in subs)
     @test total ≈ original_length rtol = 1.0e-14
 
-    # Parent-uniqueness is a statement about each sub-segment's
-    # *interior*: the whole open sub-segment lies in one cell, which is
-    # what lets the region builder attribute it to a parent by midpoint.
-    # The shared endpoints deliberately sit *on* grid lines, where
-    # `locate_cell` snaps to one side and cannot classify them — exactly
-    # as for the K=2 clipping path below.
+    # Parent-uniqueness is a statement about each sub-segment's *interior*: the whole open sub-segment lies in one cell,
+    # which is what lets the region builder attribute it to a parent by midpoint. The shared endpoints deliberately sit
+    # *on* grid lines, where `locate_cell` snaps to one side and cannot classify them — exactly as for the K=2 clipping
+    # path below.
     for sub in subs
         cells = [Unfitted.locate_cell(V.levels[1].mesh, sub[1] + f * (sub[2] - sub[1]))
                  for f in (0.1, 0.25, 0.5, 0.75, 0.9)]
@@ -252,10 +235,8 @@ end
 end
 
 @testset "_subdivide_segment: corner crossing and degenerate splits" begin
-    # A segment through a grid *intersection* produces one crossing per
-    # axis at the same parameter, agreeing only to a few ulp. They must
-    # collapse to a single cut — not to a zero-length sliver straddling
-    # the corner, and not to a gap.
+    # A segment through a grid *intersection* produces one crossing per axis at the same parameter, agreeing only to a
+    # few ulp. They must collapse to a single cut — not to a zero-length sliver straddling the corner, and not to a gap.
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(4, 4), order=1)
     grid_lines = Unfitted._level_grid_lines(V, GeometryTolerance(Float64))
@@ -266,26 +247,23 @@ end
     @test corner[1][2] == corner[2][1]
     @test sum(norm(s[2] - s[1]) for s in corner) ≈ norm(SVector(0.40, 0.40)) rtol = 1.0e-14
 
-    # Endpoints sitting exactly on grid lines are crossings at t = 0 and
-    # t = 1. Neither may spawn a degenerate sub-segment, and neither may
-    # cost any length.
+    # Endpoints sitting exactly on grid lines are crossings at t = 0 and t = 1. Neither may spawn a degenerate
+    # sub-segment, and neither may cost any length.
     on_lines = Unfitted._subdivide_segment(SVector(0.25, 0.25), SVector(0.75, 0.75), grid_lines, nudge)
     @test all(norm(s[2] - s[1]) > nudge for s in on_lines)
     @test on_lines[1][1] == SVector(0.25, 0.25)
     @test on_lines[end][2] == SVector(0.75, 0.75)
     @test sum(norm(s[2] - s[1]) for s in on_lines) ≈ norm(SVector(0.50, 0.50)) rtol = 1.0e-14
 
-    # A segment lying *along* a grid line still splits across the other
-    # axis and still conserves its length exactly.
+    # A segment lying *along* a grid line still splits across the other axis and still conserves its length exactly.
     along = Unfitted._subdivide_segment(SVector(0.05, 0.25), SVector(0.95, 0.25), grid_lines, nudge)
     @test length(along) == 4
     @test sum(norm(s[2] - s[1]) for s in along) ≈ 0.90 rtol = 1.0e-14
 end
 
 @testset "_subdivide_triangle: triangle clipped against 3D grid" begin
-    # A triangle in 3D crossing two grid planes. Its sub-triangles
-    # should sum to the original area, with every sub-triangle inside
-    # one cell of every level.
+    # A triangle in 3D crossing two grid planes. Its sub-triangles should sum to the original area, with every
+    # sub-triangle inside one cell of every level.
     omega = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
     V = space(omega; cells=(2, 2, 2), order=1)
     grid_lines = Unfitted._level_grid_lines(V, GeometryTolerance(Float64))
@@ -307,10 +285,9 @@ end
     @test total_area ≈ expected_area atol = 1.0e-9
     @test length(subs) >= 3
 
-    # The midpoint of every sub-triangle lies inside exactly one cell;
-    # vertices may sit on grid planes (where they cannot be classified
-    # uniquely by `locate_cell`), which is fine — the surface-region
-    # builder uses the midpoint to assign the parent.
+    # The midpoint of every sub-triangle lies inside exactly one cell; vertices may sit on grid planes (where they
+    # cannot be classified uniquely by `locate_cell`), which is fine — the surface-region builder uses the midpoint to
+    # assign the parent.
     for tri in subs
         mid = (tri[1] + tri[2] + tri[3]) / 3
         @test Unfitted.locate_cell(V.levels[1].mesh, mid) !== nothing
@@ -318,9 +295,8 @@ end
 end
 
 @testset "BoundaryMesh: subdivision preserves per-cell normals" begin
-    # User-supplied normal on a single segment that gets split by the
-    # subdivision into multiple sub-segments. Every sub-segment must
-    # inherit the original normal.
+    # User-supplied normal on a single segment that gets split by the subdivision into multiple sub-segments. Every
+    # sub-segment must inherit the original normal.
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(4, 4), order=1)
     mesh = segment_mesh([(SVector(0.1, 0.1), SVector(0.6, 0.2))]; normals=[SVector(0.0, 1.0)])
@@ -344,12 +320,10 @@ end
 end
 
 @testset "the surface rule is sized from the sub-cell's own parents" begin
-    # `_surface_quadrature_order` is now only the upper bound that sizes the
-    # rule table; the rule a sub-cell uses comes from the cells covering it.
-    # A high-order level elsewhere must not raise the point count of a segment
-    # it does not cover — which is what the level-wide maximum did, and the
-    # reason the immersed-surface path was the one quadrature consumer that a
-    # per-cell order made more expensive rather than less.
+    # `_surface_quadrature_order` is now only the upper bound that sizes the rule table; the rule a sub-cell uses comes
+    # from the cells covering it. A high-order level elsewhere must not raise the point count of a segment it does not
+    # cover — which is what the level-wide maximum did, and the reason the immersed-surface path was the one quadrature
+    # consumer that a per-cell order made more expensive rather than less.
     omega = box((0.0, 0.0), (1.0, 1.0))
     tol = GeometryTolerance(Float64)
     V = overlay(space(omega; cells=(4, 4), order=1), box((0.5, 0.5), (1.0, 1.0)); cells=(2, 2), order=3)
@@ -362,8 +336,8 @@ end
     @test length(only(far).parents) == 2
     @test length(only(far).points) == 4                   # max p = 3 → 4 Gauss points
 
-    # The same question on a level carrying a per-cell order, where there is no
-    # per-level order to read even in principle.
+    # The same question on a level carrying a per-cell order, where there is no per-level order to read even in
+    # principle.
     orders = fill(1, 4, 4)
     orders[4, 4] = 4
     W = space(omega; cells=(4, 4), order=orders)

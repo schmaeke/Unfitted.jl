@@ -17,9 +17,8 @@ for (D, p) in ((1, 4), (2, 2), (2, 4), (3, 2), (3, 3))
     values = Vector{Float64}(undef, length(indices))
     grads = Vector{SVector{D,Float64}}(undef, length(indices))
     qcounts = recommended_quadrature_order(basis, order)
-    # Basis-family dispatch and the owning cell index are part of the kernel
-    # signature: a family with per-cell state (B-splines and their knot spans)
-    # needs both. The all-ones index is what the reference-frame entry points in
+    # Basis-family dispatch and the owning cell index are part of the kernel signature: a family with per-cell state
+    # (B-splines and their knot spans) needs both. The all-ones index is what the reference-frame entry points in
     # `src/basis.jl` pass when the evaluation is cell-independent.
     cell = CartesianIndex(ntuple(_ -> 1, D))
 

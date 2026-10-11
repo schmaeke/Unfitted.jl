@@ -38,17 +38,16 @@ end
                                    dirichlet=[dirichlet(exact; on=boundary(:all))]))
     source_solution = solve!(source_model)
 
-    # The default L2 path must assemble the Dirichlet lift, so the projection
-    # reproduces u = 1 + x exactly — including the free interior dof at x = 0.5.
-    # Without the lift the interior coefficient is wrong (the bug this guards).
+    # The default L2 path must assemble the Dirichlet lift, so the projection reproduces u = 1 + x exactly — including
+    # the free interior dof at x = 0.5. Without the lift the interior coefficient is wrong (the bug this guards).
     target_model = prepare(poisson(space(omega; cells=2, order=2); source=0.0,
                                    dirichlet=[dirichlet(exact; on=boundary(:all))]))
     target_solution = transfer(source_solution, source_model, target_model)
     @test l2_error(target_solution, target_model, exact; norm=:absolute) < 1.0e-10
     @test value(target_solution, target_model, (0.5,)) ≈ 1.5 atol = 1.0e-10
 
-    # The cached-matrix path omits the lift, so it must reject this target
-    # rather than silently return wrong interior coefficients.
+    # The cached-matrix path omits the lift, so it must reject this target rather than silently return wrong interior
+    # coefficients.
     target_mass = assemble_matrix(target_model, mass_block(first(target_model.problem.fields)))
     @test_throws ArgumentError transfer(source_solution, source_model, target_model; via=L2Projection(target_mass))
 end
@@ -164,22 +163,19 @@ end
 end
 
 @testset "L2 transfer between B-spline models across a masked overlay" begin
-    # The package promises a projection test per basis family, and `transfer` had never
-    # run on the second one. A masked B-spline overlay *below maximal continuity*
-    # resolves its artificial boundary into multi-raw pivots, so the transfer rhs has
-    # pivot rows to condense onto their branches; the `has_linear_constraints` flag is
-    # asserted so the test cannot drift off the path it exists to cover. Maximal
-    # continuity is the default and has no pivot, because selection emits single-raw
-    # eliminations only — that path is covered by the integrated-Legendre transfers
-    # above, so the reduced continuity here is deliberate.
-    # The target space contains the source space, so the projection is the identity
-    # there and both the linear-solve residual and the reproduction error must sit at
-    # round-off, not merely be finite.
+    # The package promises a projection test per basis family, and `transfer` had never run on the second one. A masked
+    # B-spline overlay *below maximal continuity* resolves its artificial boundary into multi-raw pivots, so the
+    # transfer rhs has pivot rows to condense onto their branches; the `has_linear_constraints` flag is asserted so the
+    # test cannot drift off the path it exists to cover. Maximal continuity is the default and has no pivot, because
+    # selection emits single-raw eliminations only — that path is covered by the integrated-Legendre transfers above, so
+    # the reduced continuity here is deliberate.
+    # The target space contains the source space, so the projection is the identity there and both the linear-solve
+    # residual and the reproduction error must sit at round-off, not merely be finite.
     omega = box((0.0, 0.0), (1.0, 1.0))
     source_space = space(omega; cells=(4, 4), order=2, basis=bspline(; continuity=0))
     mask = BitArray([true true; true false])
-    # Overlay faces at 0.3 / 0.7 fall inside base cells, so no base combination can
-    # vanish outside the overlay and the superposed mass stays non-singular.
+    # Overlay faces at 0.3 / 0.7 fall inside base cells, so no base combination can vanish outside the overlay and the
+    # superposed mass stays non-singular.
     target_space = overlay(source_space, box((0.3, 0.3), (0.7, 0.7)); cells=(2, 2), order=2,
                            basis=bspline(; continuity=0), active=mask)
 
@@ -195,11 +191,10 @@ end
 end
 
 @testset "L2 transfer between B-spline models at the default continuity" begin
-    # The reduced-continuity case above covers a target with pivots; this one covers
-    # the configuration a user actually gets from `bspline()`, where the artificial
-    # boundary resolves to strong eliminations and there is no pivot. Both are
-    # wanted: `CONTRIBUTING` asks for a projection test per basis family, and the
-    # default spelling of that family is this one.
+    # The reduced-continuity case above covers a target with pivots; this one covers the configuration a user actually
+    # gets from `bspline()`, where the artificial boundary resolves to strong eliminations and there is no pivot. Both
+    # are wanted: `CONTRIBUTING` asks for a projection test per basis family, and the default spelling of that family is
+    # this one.
     omega = box((0.0, 0.0), (1.0, 1.0))
     source_space = space(omega; cells=(8, 8), order=2, basis=bspline())
     target_space = overlay(source_space, box((0.3, 0.3), (0.7, 0.7)); cells=(5, 5), order=2, basis=bspline())
@@ -209,9 +204,8 @@ end
     target_model = prepare(poisson(target_space; source=0.0))
     @test !Unfitted.has_linear_constraints(target_model.dofs)
 
-    # The target contains the source — the overlay only adds — so the projection is
-    # the identity there and both the solve residual and the reproduction error sit at
-    # round-off rather than merely being finite.
+    # The target contains the source — the overlay only adds — so the projection is the identity there and both the
+    # solve residual and the reproduction error sit at round-off rather than merely being finite.
     target_solution = transfer(source_solution, source_model, target_model)
     @test target_solution.diagnostics.residual_norm < 1.0e-12
     @test l2_error(target_solution, target_model, x -> value(source_solution, source_model, x); norm=:relative) <
@@ -285,13 +279,11 @@ end
 end
 
 @testset "Rewire keeps the source's Dirichlet data on a dof the target frees" begin
-    # A dof the source constrains has no coefficient, and Rewire used to skip
-    # it, which left its target counterpart at zero. Dropping the top face's
-    # nonzero Dirichlet condition between source and target therefore lost the
-    # nine dofs that carried `g = 1 + x` there, and the field by up to 2.0. The
-    # counterpart must read the source's constrained value instead, and since
-    # the target's active basis is the source's plus those nine dofs, the
-    # transfer is then exact.
+    # A dof the source constrains has no coefficient, and Rewire used to skip it, which left its target counterpart at
+    # zero. Dropping the top face's nonzero Dirichlet condition between source and target therefore lost the nine dofs
+    # that carried `g = 1 + x` there, and the field by up to 2.0. The counterpart must read the source's constrained
+    # value instead, and since the target's active basis is the source's plus those nine dofs, the transfer is then
+    # exact.
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=4, order=2)
     bottom = dirichlet(0.0; on=boundary(axis=2, side=:lower))
@@ -311,9 +303,8 @@ end
 end
 
 @testset "Rewire backend with strict=false skips missing source dofs" begin
-    # Lax mode exists for source dofs the target does not carry. The honest way
-    # to produce those is a mask change on the SAME mesh: deactivating a cell
-    # removes its dofs while every surviving key still names the same function.
+    # Lax mode exists for source dofs the target does not carry. The honest way to produce those is a mask change on the
+    # SAME mesh: deactivating a cell removes its dofs while every surviving key still names the same function.
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=4, order=1)
     source_model = prepare(poisson(V; source=0.0))
@@ -329,12 +320,10 @@ end
 end
 
 @testset "Rewire refuses a mesh or basis change in either strict mode" begin
-    # `Rewire` matches by dof key, and a key only names the same function while
-    # both sides index the same mesh with the same basis. A 2-cell source and a
-    # 1-cell target share the key for "level 1, cell 1, left node", but that is a
-    # hat on [0, ½] against a hat on [0, 1] — copying between them is the silent
-    # wrong answer the guard exists to stop, so `strict = false` must not "drop"
-    # its way past it either.
+    # `Rewire` matches by dof key, and a key only names the same function while both sides index the same mesh with the
+    # same basis. A 2-cell source and a 1-cell target share the key for "level 1, cell 1, left node", but that is a hat
+    # on [0, ½] against a hat on [0, 1] — copying between them is the silent wrong answer the guard exists to stop, so
+    # `strict = false` must not "drop" its way past it either.
     omega = box((0.0,), (1.0,))
     src = prepare(poisson(space(omega; cells=2, order=1); source=0.0))
     tgt = prepare(poisson(space(omega; cells=1, order=1); source=0.0))
@@ -346,11 +335,9 @@ end
 end
 
 @testset "Rewire refuses a moved overlay in either strict mode" begin
-    # The failure a cell-count test cannot see. `moved` keeps every dof key —
-    # same level, same cell grid, same basis — and moves the function each key
-    # names, so every lookup succeeds, `strict = true` raises nothing, and the
-    # source's coefficients land on functions somewhere else. Only the level's
-    # mesh box tells the two apart.
+    # The failure a cell-count test cannot see. `moved` keeps every dof key — same level, same cell grid, same basis —
+    # and moves the function each key names, so every lookup succeeds, `strict = true` raises nothing, and the source's
+    # coefficients land on functions somewhere else. Only the level's mesh box tells the two apart.
     omega = box((0.0,), (1.0,))
     V = overlay(space(omega; cells=4, order=2), box((0.25,), (0.75,)); cells=2, order=2)
     src = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
@@ -361,8 +348,8 @@ end
         @test_throws ArgumentError transfer(sol, src, shifted; via=Rewire(; strict=strict))
     end
 
-    # The control: a move that is not a move leaves every mesh where it was, so
-    # the keys really do name the same functions and the rewire is exact.
+    # The control: a move that is not a move leaves every mesh where it was, so the keys really do name the same
+    # functions and the rewire is exact.
     same = moved(src; level=2, to=box((0.25,), (0.75,)))
     rewired = transfer(sol, src, same; via=Rewire())
     pts = [(x,) for x in 0.05:0.05:0.95]
@@ -370,12 +357,10 @@ end
 end
 
 @testset "L2 transfer onto an FCM (physical_domain) target is rejected" begin
-    # The default path takes the target mass from the FCM-aware standard
-    # assembler (restricted to Ω) but the source-driven rhs over full mesh boxes,
-    # so an immersed target pairs an Ω-mass with a full-box rhs and must error
-    # rather than silently mis-project. (FCM-aware transfer is a tracked
-    # follow-up.) The guard fires before the source coefficients are read, so a
-    # trivial source solution suffices.
+    # The default path takes the target mass from the FCM-aware standard assembler (restricted to Ω) but the
+    # source-driven rhs over full mesh boxes, so an immersed target pairs an Ω-mass with a full-box rhs and must error
+    # rather than silently mis-project. (FCM-aware transfer is a tracked follow-up.) The guard fires before the source
+    # coefficients are read, so a trivial source solution suffices.
     omega = box((-1.0, -1.0), (1.0, 1.0))
     disk = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.7; lipschitz=1.0, subcell_length_scale=0.5)
     source_model = prepare(poisson(space(omega; cells=(2, 2), order=1); source=0.0))
