@@ -7,9 +7,9 @@ using LinearAlgebra: Symmetric, eigvals, isposdef, norm, pinv, rank
 # and add B-spline-specific tests for the dof-key sharing and mask
 # handling.
 #
-# Several testsets below reuse `_gram` / `_proj_residual` and the `_one` / `_x1` /
-# `_INT_*` constants from `test_coverage_reduction.jl`, which `runtests.jl`
-# includes first; this file does not stand alone.
+# Several testsets below reuse `_gram` / `_proj_residual` / `_void_by_classifier` and
+# the `_one` / `_x1` / `_INT_*` constants from `test_coverage_reduction.jl`, which
+# `runtests.jl` includes first; this file does not stand alone.
 
 # The extension module, for the internals it alone defines: the cascade resolver
 # of linear-constraint rows (`_cascade!`, `_combine_terms`) lives there, not in
@@ -1131,9 +1131,9 @@ end
 # the one trait that replaced them is checked against their definitions: above an
 # integrated-Legendre level whether the cover spans the level's hats (`true` for
 # integrated Legendre in either mode, every axis of degree 1 for a B-spline, `false`
-# otherwise); above a B-spline level of degree `p` the extension's `_reproduces(k, p)`
-# (the same degree for a B-spline cover, `:tensor` with every palette entry ≥ `p` for an
-# integrated-Legendre one, `false` otherwise).
+# otherwise); above a B-spline level of degree `p` whether the cover reproduces degree
+# `p` (the same degree for a B-spline cover, `:tensor` with every palette entry ≥ `p`
+# for an integrated-Legendre one, `false` otherwise).
 function _span_contains_by_definition(k, level)
     if level.basis isa Unfitted.IntegratedLegendre
         k.basis isa BSExt.BSplineFamily && return all(d -> degree(k.basis.spaces[d]) == 1, 1:2)

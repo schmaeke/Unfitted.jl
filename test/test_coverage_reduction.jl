@@ -188,9 +188,9 @@ end
     # still count as *covering*: were it to block coverage, the base cells straddling
     # ∂Ω would keep high-order modes the overlay already reproduces exactly on Ω, and
     # the Gram would acquire exact null modes — functions with ‖v_h‖_{L²(Ω)} = 0,
-    # supported entirely in the fictitious part. A user mask is the opposite case and
-    # still blocks coverage; the two are told apart by `classify_cell` in
-    # `_covered_by_level`.
+    # supported entirely in the fictitious part. A user mask over material is the
+    # opposite case and still blocks coverage; the two are told apart by `classify_cell`,
+    # through the material oracle, in `_covered_by_level`.
     #
     # The overlay is deliberately wider than the hole, so every base cell the fold
     # touches lies strictly inside it and the check is not entangled with the
@@ -289,14 +289,19 @@ end
     # and every inactive cell is the user's.
     disc(; kw...) = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.3; lipschitz=1.0,
                                     subcell_length_scale=1 / 64, max_depth=4, kw...)
-    # Each level masks one cell entirely outside the disc and one entirely inside it.
+    # The base and the first overlay each mask one cell entirely outside the disc and one
+    # entirely inside it. The second overlay masks nothing and has the first's grid,
+    # mirrored across x₁ = ½, so the two hold different verdicts at the same cell index:
+    # a verdict table keyed by anything coarser than the level id — the grid size, say —
+    # would hand one of them the other's answers.
     basemask = trues(8, 8)
     basemask[1, 1] = basemask[4, 4] = false
     overlaymask = trues(8, 16)
     overlaymask[1, 16] = overlaymask[7, 8] = false
-    masked_stack(physical) = overlay(space(_OMEGA_CR; cells=8, order=2, physical=physical,
-                                           active=basemask), box((0.0, 0.0), (0.5, 1.0));
-                                     cells=(8, 16), order=2, active=overlaymask)
+    masked_stack(physical) = overlay(overlay(space(_OMEGA_CR; cells=8, order=2, physical=physical,
+                                                   active=basemask), box((0.0, 0.0), (0.5, 1.0));
+                                             cells=(8, 16), order=2, active=overlaymask),
+                                     box((0.5, 0.0), (1.0, 1.0)); cells=(8, 16), order=2)
     void_masked = ((1, CartesianIndex(1, 1)), (2, CartesianIndex(1, 16)))
     material_masked = ((1, CartesianIndex(4, 4)), (2, CartesianIndex(7, 8)))
     probes = (box((1.0, 0.0), (1.125, 0.125)), box((0.45, 0.45), (0.55, 0.55)),
@@ -318,6 +323,7 @@ end
         for (id, c) in material_masked
             @test inactive(V.levels[id])[c] && !expected[id][c]
         end
+        @test V.levels[2].mesh.cells == V.levels[3].mesh.cells && expected[2] != expected[3]
 
         # The void query first, on a fresh oracle, so it takes every miss; then it and
         # the inactive-and-void query again, all hits.

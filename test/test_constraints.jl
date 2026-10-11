@@ -908,12 +908,13 @@ end
 end
 
 @testset "an immersed integrated-Legendre level still constrains a user-masked face" begin
-    # The other half of the fold exemption. The fictitious fold and the user's
-    # `active =` mask both deactivate cells, and only the fold's cells are empty: a
-    # cell the user masked out still holds material, so the modes on its face are
-    # nonzero on a physical face and must vanish there as on any artificial
-    # boundary. `_has_overlay_constraint` tells the two apart through
-    # `_is_fictitious`; exempting every inactive neighbour on an immersed level
+    # The other half of the material exemption. The fictitious fold and the user's
+    # `active =` mask both deactivate cells, and every cell the fold switched off is
+    # empty, while a cell the user masked out over material (as the corner block here
+    # is) still holds material, so the modes on its face are nonzero on a physical
+    # face and must vanish there as on any artificial boundary.
+    # `_has_overlay_constraint` asks whether the inactive cell holds material
+    # (`_is_fictitious`); exempting every inactive neighbour on an immersed level
     # instead would leave the masked face free and the truncated solution
     # discontinuous, and only an estimator inequality elsewhere would notice. The
     # B-spline family's counterpart is in test_basis_bspline.jl.
