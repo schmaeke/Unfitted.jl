@@ -172,180 +172,6 @@ struct Coverage{D}
     covered::Dict{Int,BitArray{D}}
 end
 
-# The cells of `mesh` that `box` overlaps, as an axis-aligned block. `_axis_cells`
-# (`mesh.jl`) does the per-axis binary search, so the cost is O(D·log N +
-# overlapping cells) rather than O(N), and the exactness convention is stated
-# once, there.
-#
-# What belongs here is the ± tol.contain nudge. `box` comes from *another*
-# level's mesh, and an `overlay` box whose axes `_mesh_axes` built from its own
-# corners does not reproduce a coarser level's node coordinates bit-for-bit, so
-# a face that should land on a node can land a rounding step either side of it.
-# Pulling the interval inward by `tol.contain` keeps a box whose face merely
-# touches a cell boundary — or misses it by a rounding step — from claiming the
-# neighbouring cell. The ladder's own cross-level map passes its endpoints
-# exactly for the opposite reason; see `overlapping_cells` in `ladder.jl`.
-#
-# The name is deliberately not `_overlapping_cells`: that was one underscore
-# from `overlapping_cells`, a public function with a different contract (which
-# cells of one *level* overlap a selection on another, tolerance-free).
-#
-# Used by `_covered_by_level` below, which asks whether every overlapped cell of
-# a masked covering level is active or fictitious — the "for every cell of the
-# finer level under this coarser cell" question the block resolution answers —
-# and by `_reproduced_on_domain`, which asks it of a support hull that may stick
-# out past the covering level's box.
-function _cells_under_box(mesh::CartesianMesh{D,T}, box::AxisBox{D,T},
-                          tol::GeometryTolerance{T}) where {D,T}
-    return CartesianIndices(ntuple(d -> _axis_cells(mesh.axes[d], box.lower[d] + tol.contain,
-                                                    box.upper[d] - tol.contain), D))
-end
-
-# True iff `box` (a coarser-level cell) lies inside the covering region of the single
-# level `k`: inside k's domain, and — when k is masked — with every k-cell it overlaps
-# either active or holding no material at all. The unmasked fast path is a single
-# box-containment test.
-#
-# Why an inactive cell without material still counts as covering. A `LevelMask` merges
-# two deactivation sources (`_apply_physical_fold` in `mesh.jl`): the user's `active =`
-# selection, and the fictitious fold that drops cells lying entirely outside Ω. What
-# decides here is not which source switched a cell off but whether the cell holds
-# material, which `fold` answers (`_Fold`).
-#
-#   * A cell that holds material — a user mask reaching into Ω — is represented only by
-#     the coarser level, so it blocks coverage and the parent keeps its high-order modes.
-#   * A cell that holds none — every folded cell, and a user mask lying entirely outside
-#     Ω — has nothing integrated over it, so there is nothing there for the parent to
-#     represent, and on Ω the parent's high-order modes over that cell are reproduced
-#     exactly by the finer level.
-#
-# Letting a void cell block coverage therefore leaves a parent mode active that the
-# finer level already duplicates on Ω, and the assembled operator acquires an exact null
-# mode — a function with ‖v_h‖_{L²(Ω)} = 0, living entirely in the fictitious part.
-# This mirrors `_has_overlay_constraint` in `dofs.jl`, which asks the same material
-# question for the artificial overlay trace condition. With no physical domain every
-# inactive cell holds material and the original active-cells-only rule is recovered
-# without classifying anything.
-#
-# For the masked case we do NOT scan all of k's cells: `_cells_under_box` resolves the
-# axis-aligned block by binary search.
-function _covered_by_level(box::AxisBox{D,T}, k::Level{D,T}, tol::GeometryTolerance{T},
-                           fold::_Fold{D,T}) where {D,T}
-    is_inside(box, k.mesh.domain, tol) || return false
-    k.mask === nothing && return true
-    cells = _cells_under_box(k.mesh, box, tol)
-
-    # Pass 1 — one centre sample per inactive cell. A void cell has *no* point in Ω, so a
-    # centre inside Ω rules that verdict out, and this is the overwhelmingly common case:
-    # a coarse cell abutting a sparsely-populated overlay meets that overlay's user-masked
-    # (material-carrying) cells, not its folded ones. Without a physical domain every
-    # inactive cell holds material, and the first one decides.
-    for kc in cells
-        is_active(k.mask, kc) && continue                       # an inactive overlapped cell
-        fold.physical === nothing && return false
-        _inside(fold.physical.geometry, center(cell_box(k.mesh, kc))) && return false
-    end
-
-    # Pass 2 — the exact verdict, for the blocks pass 1 could not settle. Splitting the
-    # passes matters because `classify_cell` is not a lookup: the Lipschitz certificate
-    # cannot certify a cell as outside Ω once the cell's half-diagonal exceeds the
-    # feature it sits in, and the classifier then walks its subdivision budget to the
-    # bottom. Interleaved, a block whose leading cells are void would pay that walk for
-    # each of them before reaching the material cell that decides the answer; here the
-    # cheap pass reaches it first, for at most one classification's worth of samples.
-    for kc in cells
-        is_active(k.mask, kc) && continue
-        _is_void(fold, k, kc) || return false
-    end
-    return true
-end
-
-# `_covered_by_level` of cell `c` of `level` against the single level `k`, through the
-# oracle's `covered_by` memo (see `_Fold`). The answer is a pure function of the cell
-# box, `k`, the tolerance and the oracle's verdicts, all fixed for the build the oracle
-# serves, so a stored verdict is the one a fresh call returns. `build_coverage` fills
-# the memo as it decides its flags, and the burial test's condition 1
-# (`_reproduced_on_domain`) asks the same (cell, cover) pairs again once per buried
-# function and cover: on an integrated-Legendre depth-5 ladder (8² p2) over an immersed
-# disc the memo cut the `_covered_by_level` evaluations of one layout from 88 440 to
-# 10 492, and on a base under five band-shaped overlays around a hole from 13 204 to
-# 5 092.
-#
-# The pair's table is allocated, every cell "not asked yet", on the pair's first ask. An
-# unmasked cover gets none: its answer is a single box test.
-function _covered_by!(fold::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}, k::Level{D,T},
-                      tol::GeometryTolerance{T}) where {D,T}
-    k.mask === nothing && return _covered_by_level(cell_box(level.mesh, c), k, tol, fold)
-    memo = fold.covered_by
-    isassigned(memo, level.id, k.id) || (memo[level.id, k.id] = zeros(UInt8, level.mesh.cells))
-    table = memo[level.id, k.id]
-    verdict = table[c]
-    verdict == 0x00 || return verdict == 0x01
-    covered = _covered_by_level(cell_box(level.mesh, c), k, tol, fold)
-    table[c] = covered ? 0x01 : 0x02
-    return covered
-end
-
-# True iff `k` reproduces on Ω the function `level` assembles from the contiguous cell
-# block `cells` — the support of one of `level`'s dofs. Nesting and the span-containment
-# question ("does k's basis carry this shape at all?") belong to the caller; what is
-# settled here is geometric: does what `k` is *allowed* to represent still contain the
-# function, once the cells holding no material have been accounted for on both levels.
-#
-# Three conditions, and each is a separate failure mode:
-#
-#   1. Every *active* cell of the support is covered by `k` alone. `level` integrates
-#      there, so `k` must reach there — and `_covered_by_level` already applies the
-#      material rule to `k`'s own mask.
-#   2. Every inactive cell of the support holds no material. An inactive cell generates
-#      nothing, so what `level` assembles is the function truncated to its active
-#      cells. Over a void cell — a folded one, or a user mask entirely outside Ω — that
-#      truncation is invisible on Ω, since nothing is integrated outside Ω, and the two
-#      functions agree where it matters. Over a cell that holds material it is not:
-#      material there is carried by `level` alone, the truncated function has a jump
-#      `k` does not reproduce, and the dedup must not fire.
-#   3. No face of `k`'s box that cuts the interior of the support carries a trace
-#      condition. `k` is clamped to zero on its artificial boundary — but only where
-#      its boundary cells are *active*, since a face whose inactive side is void emits
-#      no constraint (`_has_overlay_constraint` / `_active_cell_at_face`). A face
-#      strictly inside the support hull is a face the function is generally non-zero
-#      on, so one active boundary cell of `k` along it puts the function outside `k`'s
-#      constrained span. Faces at or outside the hull are harmless: the function
-#      vanishes there. A mesh-box face lying on ∂Ω_global needs no exemption here even
-#      though it too emits nothing — it can never cut the hull, because the hull lies
-#      inside the level's own domain, which lies inside the global one.
-#
-# Condition 3 is vacuous whenever every support cell is active: condition 1 then puts
-# the whole (contiguous, hence hull-filling) block inside `k`'s domain, so no face of
-# `k` is strictly inside the hull. It is the void cells that make the rule bite — a
-# support whose material part `k` covers while its fictitious part sticks out past `k`'s
-# box.
-#
-# Condition 1 reads the oracle's coverage memo (`_covered_by!`), which `build_coverage`
-# filled with the same `_covered_by_level` answers.
-function _reproduced_on_domain(level::Level{D,T}, k::Level{D,T}, cells::CartesianIndices{D},
-                               tol::GeometryTolerance{T}, fold::_Fold{D,T}) where {D,T}
-    for ci in cells
-        if is_active(level.mask, ci)
-            _covered_by!(fold, level, ci, k, tol) || return false
-        else
-            _is_void(fold, level, ci) || return false
-        end
-    end
-    hull = AxisBox{D,T}(cell_box(level.mesh, first(cells)).lower,
-                        cell_box(level.mesh, last(cells)).upper)
-    for d in 1:D
-        faces = ((1, k.mesh.domain.lower[d]), (k.mesh.cells[d], k.mesh.domain.upper[d]))
-        for (j, x) in faces                                     # k's two box faces on axis d
-            hull.lower[d] + tol.contain < x < hull.upper[d] - tol.contain || continue
-            perp = _cells_under_box(k.mesh, hull, tol)
-            layer = CartesianIndices(ntuple(e -> e == d ? (j:j) : perp.indices[e], D))
-            any(kc -> is_active(k.mask, kc), layer) && return false
-        end
-    end
-    return true
-end
-
 """
     build_coverage(V::Space, tol) -> Coverage
     build_coverage(V::Space, tol, fold) -> Coverage
@@ -445,6 +271,182 @@ function _coverage_cells(level::Level{D}) where {D}
         end
     end
     return wanted
+end
+
+# `_covered_by_level` of cell `c` of `level` against the single level `k`, through the
+# oracle's `covered_by` memo (see `_Fold`). The answer is a pure function of the cell
+# box, `k`, the tolerance and the oracle's verdicts, all fixed for the build the oracle
+# serves, so a stored verdict is the one a fresh call returns. `build_coverage` fills
+# the memo as it decides its flags, and the burial test's condition 1
+# (`_reproduced_on_domain`) asks the same (cell, cover) pairs again once per buried
+# function and cover: on an integrated-Legendre depth-5 ladder (8² p2) over an immersed
+# disc the memo cut the `_covered_by_level` evaluations of one layout from 88 440 to
+# 10 492, and on a base under five band-shaped overlays around a hole from 13 204 to
+# 5 092.
+#
+# The pair's table is allocated, every cell "not asked yet", on the pair's first ask. An
+# unmasked cover gets none: its answer is a single box test.
+function _covered_by!(fold::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}, k::Level{D,T},
+                      tol::GeometryTolerance{T}) where {D,T}
+    k.mask === nothing && return _covered_by_level(cell_box(level.mesh, c), k, tol, fold)
+    memo = fold.covered_by
+    isassigned(memo, level.id, k.id) || (memo[level.id, k.id] = zeros(UInt8, level.mesh.cells))
+    table = memo[level.id, k.id]
+    verdict = table[c]
+    verdict == 0x00 || return verdict == 0x01
+    covered = _covered_by_level(cell_box(level.mesh, c), k, tol, fold)
+    table[c] = covered ? 0x01 : 0x02
+    return covered
+end
+
+# The cells of `mesh` that `box` overlaps, as an axis-aligned block. `_axis_cells`
+# (`mesh.jl`) does the per-axis binary search, so the cost is O(D·log N +
+# overlapping cells) rather than O(N), and the exactness convention is stated
+# once, there.
+#
+# What belongs here is the ± tol.contain nudge. `box` comes from *another*
+# level's mesh, and an `overlay` box whose axes `_mesh_axes` built from its own
+# corners does not reproduce a coarser level's node coordinates bit-for-bit, so
+# a face that should land on a node can land a rounding step either side of it.
+# Pulling the interval inward by `tol.contain` keeps a box whose face merely
+# touches a cell boundary — or misses it by a rounding step — from claiming the
+# neighbouring cell. The ladder's own cross-level map passes its endpoints
+# exactly for the opposite reason; see `overlapping_cells` in `ladder.jl`.
+#
+# The name is deliberately not `_overlapping_cells`: that was one underscore
+# from `overlapping_cells`, a public function with a different contract (which
+# cells of one *level* overlap a selection on another, tolerance-free).
+#
+# Used by `_covered_by_level` below, which asks whether every overlapped cell of
+# a masked covering level is active or fictitious — the "for every cell of the
+# finer level under this coarser cell" question the block resolution answers —
+# and by `_reproduced_on_domain`, which asks it of a support hull that may stick
+# out past the covering level's box.
+function _cells_under_box(mesh::CartesianMesh{D,T}, box::AxisBox{D,T},
+                          tol::GeometryTolerance{T}) where {D,T}
+    return CartesianIndices(ntuple(d -> _axis_cells(mesh.axes[d], box.lower[d] + tol.contain,
+                                                    box.upper[d] - tol.contain), D))
+end
+
+# True iff `box` (a coarser-level cell) lies inside the covering region of the single
+# level `k`: inside k's domain, and — when k is masked — with every k-cell it overlaps
+# either active or holding no material at all. The unmasked fast path is a single
+# box-containment test.
+#
+# Why an inactive cell without material still counts as covering. A `LevelMask` merges
+# two deactivation sources (`_apply_physical_fold` in `mesh.jl`): the user's `active =`
+# selection, and the fictitious fold that drops cells lying entirely outside Ω. What
+# decides here is not which source switched a cell off but whether the cell holds
+# material, which `fold` answers (`_Fold`).
+#
+#   * A cell that holds material — a user mask reaching into Ω — is represented only by
+#     the coarser level, so it blocks coverage and the parent keeps its high-order modes.
+#   * A cell that holds none — every folded cell, and a user mask lying entirely outside
+#     Ω — has nothing integrated over it, so there is nothing there for the parent to
+#     represent, and on Ω the parent's high-order modes over that cell are reproduced
+#     exactly by the finer level.
+#
+# Letting a void cell block coverage therefore leaves a parent mode active that the
+# finer level already duplicates on Ω, and the assembled operator acquires an exact null
+# mode — a function with ‖v_h‖_{L²(Ω)} = 0, living entirely in the fictitious part.
+# This mirrors `_has_overlay_constraint` in `dofs.jl`, which asks the same material
+# question for the artificial overlay trace condition. With no physical domain every
+# inactive cell holds material and the original active-cells-only rule is recovered
+# without classifying anything.
+#
+# For the masked case we do NOT scan all of k's cells: `_cells_under_box` resolves the
+# axis-aligned block by binary search.
+function _covered_by_level(box::AxisBox{D,T}, k::Level{D,T}, tol::GeometryTolerance{T},
+                           fold::_Fold{D,T}) where {D,T}
+    is_inside(box, k.mesh.domain, tol) || return false
+    k.mask === nothing && return true
+    cells = _cells_under_box(k.mesh, box, tol)
+
+    # Pass 1 — one centre sample per inactive cell. A void cell has *no* point in Ω, so a
+    # centre inside Ω rules that verdict out, and this is the overwhelmingly common case:
+    # a coarse cell abutting a sparsely-populated overlay meets that overlay's user-masked
+    # (material-carrying) cells, not its folded ones. Without a physical domain every
+    # inactive cell holds material, and the first one decides.
+    for kc in cells
+        is_active(k.mask, kc) && continue                       # an inactive overlapped cell
+        fold.physical === nothing && return false
+        _inside(fold.physical.geometry, center(cell_box(k.mesh, kc))) && return false
+    end
+
+    # Pass 2 — the exact verdict, for the blocks pass 1 could not settle. Splitting the
+    # passes matters because `classify_cell` is not a lookup: the Lipschitz certificate
+    # cannot certify a cell as outside Ω once the cell's half-diagonal exceeds the
+    # feature it sits in, and the classifier then walks its subdivision budget to the
+    # bottom. Interleaved, a block whose leading cells are void would pay that walk for
+    # each of them before reaching the material cell that decides the answer; here the
+    # cheap pass reaches it first, for at most one classification's worth of samples.
+    for kc in cells
+        is_active(k.mask, kc) && continue
+        _is_void(fold, k, kc) || return false
+    end
+    return true
+end
+
+# ── The burial test's geometric questions ─────────────────────────────────────
+
+# True iff `k` reproduces on Ω the function `level` assembles from the contiguous cell
+# block `cells` — the support of one of `level`'s dofs. Nesting and the span-containment
+# question ("does k's basis carry this shape at all?") belong to the caller; what is
+# settled here is geometric: does what `k` is *allowed* to represent still contain the
+# function, once the cells holding no material have been accounted for on both levels.
+#
+# Three conditions, and each is a separate failure mode:
+#
+#   1. Every *active* cell of the support is covered by `k` alone. `level` integrates
+#      there, so `k` must reach there — and `_covered_by_level` already applies the
+#      material rule to `k`'s own mask.
+#   2. Every inactive cell of the support holds no material. An inactive cell generates
+#      nothing, so what `level` assembles is the function truncated to its active
+#      cells. Over a void cell — a folded one, or a user mask entirely outside Ω — that
+#      truncation is invisible on Ω, since nothing is integrated outside Ω, and the two
+#      functions agree where it matters. Over a cell that holds material it is not:
+#      material there is carried by `level` alone, the truncated function has a jump
+#      `k` does not reproduce, and the dedup must not fire.
+#   3. No face of `k`'s box that cuts the interior of the support carries a trace
+#      condition. `k` is clamped to zero on its artificial boundary — but only where
+#      its boundary cells are *active*, since a face whose inactive side is void emits
+#      no constraint (`_has_overlay_constraint` / `_active_cell_at_face`). A face
+#      strictly inside the support hull is a face the function is generally non-zero
+#      on, so one active boundary cell of `k` along it puts the function outside `k`'s
+#      constrained span. Faces at or outside the hull are harmless: the function
+#      vanishes there. A mesh-box face lying on ∂Ω_global needs no exemption here even
+#      though it too emits nothing — it can never cut the hull, because the hull lies
+#      inside the level's own domain, which lies inside the global one.
+#
+# Condition 3 is vacuous whenever every support cell is active: condition 1 then puts
+# the whole (contiguous, hence hull-filling) block inside `k`'s domain, so no face of
+# `k` is strictly inside the hull. It is the void cells that make the rule bite — a
+# support whose material part `k` covers while its fictitious part sticks out past `k`'s
+# box.
+#
+# Condition 1 reads the oracle's coverage memo (`_covered_by!`), which `build_coverage`
+# filled with the same `_covered_by_level` answers.
+function _reproduced_on_domain(level::Level{D,T}, k::Level{D,T}, cells::CartesianIndices{D},
+                               tol::GeometryTolerance{T}, fold::_Fold{D,T}) where {D,T}
+    for ci in cells
+        if is_active(level.mask, ci)
+            _covered_by!(fold, level, ci, k, tol) || return false
+        else
+            _is_void(fold, level, ci) || return false
+        end
+    end
+    hull = AxisBox{D,T}(cell_box(level.mesh, first(cells)).lower,
+                        cell_box(level.mesh, last(cells)).upper)
+    for d in 1:D
+        faces = ((1, k.mesh.domain.lower[d]), (k.mesh.cells[d], k.mesh.domain.upper[d]))
+        for (j, x) in faces                                     # k's two box faces on axis d
+            hull.lower[d] + tol.contain < x < hull.upper[d] - tol.contain || continue
+            perp = _cells_under_box(k.mesh, hull, tol)
+            layer = CartesianIndices(ntuple(e -> e == d ? (j:j) : perp.indices[e], D))
+            any(kc -> is_active(k.mask, kc), layer) && return false
+        end
+    end
+    return true
 end
 
 # True iff `inner`'s mesh is nested inside `outer`'s over their overlap: every `inner`
