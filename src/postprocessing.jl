@@ -256,11 +256,11 @@ function write_quadrature_vtm(path::AbstractString, model::Model{D,T}) where {D,
             for i in region_indices
                 region = all_regions[i]
                 jacobian = _region_jacobian(region)
-                for (eta, w) in zip(region.quadrature.points, region.quadrature.weights)
-                    x = reference_to_physical(region.box, eta)
+                for k in 1:_region_qpoint_count(region)
+                    x, weight, _ = _region_point(region, k, jacobian)
                     push!(points, _vtk_point(x))
                     push!(verts, MeshCell(PolyData.Verts(), SVector{1,Int}(length(points))))
-                    push!(weights, w * jacobian)
+                    push!(weights, weight)
                 end
             end
             suffix = isempty(sig) ? "none" : join(sig, "_")
@@ -527,8 +527,9 @@ end
 # region-reference coordinate, which is what the `u` accessor evaluates the solution at.
 function _vtk_sample(model::Model{D,T}, region_id::Int, region::VolumeRegion{D,T}, box::AxisBox{D,T}, x::SVector{D,T},
                      location::Symbol) where {D,T}
-    context = (; location, region_id, region=region.box, cell=box, parents=region.parents, model_version=model.version,)
-    return (; context, x, xi=(; region=physical_to_reference(region.box, x)))
+    region_box = _region_box(region)
+    context = (; location, region_id, region=region_box, cell=box, parents=region.parents, model_version=model.version,)
+    return (; context, x, xi=(; region=physical_to_reference(region_box, x)))
 end
 
 # Pair each `name => callback` entry with a typed array of the values that callback returned, ready for `WriteVTK`
@@ -600,7 +601,7 @@ _vtk_vector_array(array::Vector) = array
 # by construction rather than by care.
 function _region_boxes(space::Space{D,T}, region::VolumeRegion{D,T}, subdivisions, depth::Int,
                        lipschitz::Float64) where {D,T}
-    base = _subboxes(region.box, _subdivision_counts(space, region, subdivisions))
+    base = _subboxes(_region_box(region), _subdivision_counts(space, region, subdivisions))
     physical = space.physical
     (depth == 0 || physical === nothing || !_is_cut_region(region)) && return base
 
@@ -661,7 +662,7 @@ end
 # `:cut_alpha_failed` — is a region the boundary crosses. Naming the two non-cut kinds rather than the five cut ones
 # keeps a future cut kind on the correct side by default. Without a `PhysicalDomain` every region is `:full`, so this is
 # uniformly `false`.
-_is_cut_region(region::VolumeRegion) = region.quadrature.kind !== :full && region.quadrature.kind !== :fictitious_alpha
+_is_cut_region(region::VolumeRegion) = region.kind !== :full && region.kind !== :fictitious_alpha
 
 # Collect the leaves of the cut tree rooted at `b` into `boxes`. Descend only into marked boxes, and descend every
 # marked box the full `depth`, so every leaf that ∂Ω passes through comes out at the same size. That uniformity is

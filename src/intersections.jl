@@ -1,43 +1,115 @@
 # ── Types ─────────────────────────────────────────────────────────────────────
 
 """
-    ParentRef{D,T}(level, cell, local_box, parent_box)
+    Parent{D,T}(level, cell, parent_box, ξ0, dξ)
+    Parent(level::Level, cell, lower, upper)
 
-Reference to one parent cell of a [`VolumeRegion`](@ref). Carries both the parent's identity and the integration box's
-geometry in the parent's reference frame, so the assembly hot loop never re-derives either:
+One parent cell of an integration [`Region`](@ref): a cell whose basis functions are evaluated on the region, with the
+affine map from the region's frame into the cell's own reference frame, so the assembly hot loop re-derives neither.
 
   - `level::Int` — id of the parent level.
   - `cell::CartesianIndex{D}` — parent cell index inside that level's mesh.
-  - `local_box::AxisBox{D,T}` — the integration region's box mapped into the parent cell's reference frame `[−1, 1]ᴰ`,
-    via [`physical_to_reference`](@ref). Used to map region quadrature points into the parent's reference frame for
-    basis evaluation.
-  - `parent_box::AxisBox{D,T}` — the parent cell's physical box. Used to compute the per-axis gradient scaling factor
-    `2 / edge_lengths` needed when pulling basis gradients back to physical coordinates.
+  - `parent_box::AxisBox{D,T}` — the parent cell's physical box. Read for the per-axis gradient scale
+    `2 / edge_lengths` that pulls basis gradients back to physical coordinates, and by the `write_vtk` callbacks
+    (`context.parents[i].parent_box`).
+  - `ξ0::SVector{D,T}`, `dξ::SVector{D,T}` — the map from a region-frame point `p ∈ [−1, 1]ᴰ` to the cell's reference
+    coordinate, `ξ = ξ0 + dξ ∘ p` (`∘` the per-axis product). On an axis where the region is degenerate
+    (`lower[d] == upper[d]`), `dξ = 0` and `ξ0` is the region's own coordinate there.
+
+The four-argument constructor builds the map from the region's corners `lower` / `upper`: with `l` and `u` the corners
+in the cell's reference frame ([`physical_to_reference`](@ref)), `ξ0 = (l + u) / 2` and `dξ = (u − l) / 2`. Halving is
+exact in floating point, so `ξ0 + dξ ∘ p` is bit for bit [`reference_to_physical`](@ref) of the box `l`–`u` at `p` —
+the parent coordinate a volume region has always produced.
 """
-struct ParentRef{D,T<:Real}
+struct Parent{D,T<:Real}
     level::Int
     cell::CartesianIndex{D}
-    local_box::AxisBox{D,T}
     parent_box::AxisBox{D,T}
+    ξ0::SVector{D,T}
+    dξ::SVector{D,T}
+end
+
+function Parent(level, cell::CartesianIndex{D}, lower::SVector{D,T}, upper::SVector{D,T}) where {D,T}
+    parent_box = cell_box(level.mesh, cell)
+    l, u = physical_to_reference(parent_box, lower), physical_to_reference(parent_box, upper)
+    return Parent{D,T}(level.id, cell, parent_box, (l + u) / 2, (u - l) / 2)
 end
 
 """
-    VolumeRegion{D,T}(box, parents, quadrature)
+    Region{D,T,N,S}(lower, upper, parents, split, fields, kind, points, weights, normal, sides, residual)
+    Region(lower, upper, parents, kind, points, weights; split, fields, normal, sides, residual)
 
-One admissible integration region — an axis-aligned box that lies inside a single cell of every covering parent level.
-`box` is the region's physical-frame extent, `parents` is the list of parents covering it (typically one per active
-level), and `quadrature` is the [`RegionQuadrature`](@ref) the assembly hot loop iterates.
+One admissible integration region: a piece of the domain that lies inside a single cell of every parent level, so that
+any product of the parents' basis functions is smooth (`C^∞`) on it and the region's rule integrates it to the rule's
+own exactness. The aliases name its shapes:
 
-Because every parent cell sees `box` as a smooth (C∞) sub-rectangle of its own reference frame, the integrand of any
-basis-function product is smooth throughout `box`, and the tensor Gauss rule integrates it exactly to the recommended
-order. Cut regions replace the tensor Gauss rule with a moment-fit rule from `src/fcm.jl`; fictitious-α regions reuse
-the tensor Gauss points with α-scaled weights.
+  - `VolumeRegion{D,T} = Region{D,T,Nothing,Nothing}` — a box of an [`IntegrationPlan`](@ref), and each side of an L²
+    transfer region pair.
+
+**The frame.** A region's `lower` / `upper` corners are both its extent and its frame: a frame point `p ∈ [−1, 1]ᴰ` is
+the physical point
+
+    x = (lower + upper) / 2 + (upper − lower) ∘ p / 2,
+
+the expression of [`reference_to_physical`](@ref). An axis may be degenerate (`lower[d] == upper[d]`); a rule then has
+`p[d] = 0` there and `x[d]` is the region's coordinate. `points` / `weights` are the rule in that frame, and the
+physical weight of point `k` is `weights[k] · J` with `J = ∏ (upper[d] − lower[d]) / 2` over the non-degenerate axes —
+`vol / 2ᴰ` on a volume box.
+
+Fields:
+
+  - `lower::SVector{D,T}`, `upper::SVector{D,T}` — the region's corners; a volume region's are its box (`_region_box`
+    builds the [`AxisBox`](@ref)).
+  - `parents::Vector{Parent{D,T}}` — the cells evaluated on the region, at most one per level and side, each with its
+    map from the region's frame ([`Parent`](@ref)). The set is constant over the region.
+  - `split::Int` — `parents[1:split]` are side `a` of a two-sided region and the rest side `b`; `length(parents)` on
+    every one-sided region.
+  - `fields::NTuple{2,Int}` — `(0, 0)` on a one-sided region, which belongs to the fields whose level-id block holds its
+    parents' levels; `(field_a, field_b)`, the coupled fields' global indices, on a two-sided one.
+  - `kind::Symbol` — which rule the region carries, a closed vocabulary (`CONTRIBUTING.md`, "Region quadrature kinds"):
+    `:full` (tensor Gauss over the whole region: it lies in Ω, or no [`PhysicalDomain`](@ref) is attached),
+    `:fictitious_alpha` (outside Ω under `α > 0`: the α-scaled tensor rule), `:cut_fitted` (∂Ω crosses it: the
+    moment-fit rule, `src/fcm.jl`), `:cut_fallback` (the fit failed, so the raw Saye volume rule the moments were summed
+    from — correct and non-negative, but with 50–200× the points), `:cut_custom` (the domain's own `cut_quadrature`
+    supplied the rule), `:cut_failed` (`Ω ∩ region` carries no rule at all, under `α = 0`: an empty rule) and
+    `:cut_alpha_failed` (the same under `α > 0`: the α-scaled tensor rule alone, so the cell's dofs stay
+    α-stabilised). Under `α > 0` every other cut kind carries `(1 − α)·rule ∪ α·tensor`, rule first.
+  - `points::Vector{SVector{D,T}}`, `weights::Vector{T}` — the rule in the region's frame (see above). The `:full` and
+    the α-scaled kinds alias one cached array per distinct rule, so they cost no allocation per region.
+  - `normal::N` — `nothing` on a volume region.
+  - `sides::S` — `nothing` on a volume region.
+  - `residual::T` — the moment-fit residual on a `:cut_*` kind, zero otherwise.
+
+The assembly kernel reads a region only through its accessors (`_region_point`, `_refresh!`, …, `assembly.jl`), which
+dispatch on nothing but these fields.
 """
-struct VolumeRegion{D,T<:Real}
-    box::AxisBox{D,T}
-    parents::Vector{ParentRef{D,T}}
-    quadrature::RegionQuadrature{D,T}
+struct Region{D,T<:Real,N,S}
+    lower::SVector{D,T}
+    upper::SVector{D,T}
+    parents::Vector{Parent{D,T}}
+    split::Int
+    fields::NTuple{2,Int}
+    kind::Symbol
+    points::Vector{SVector{D,T}}
+    weights::Vector{T}
+    normal::N
+    sides::S
+    residual::T
 end
+
+function Region(lower::SVector{D,T}, upper::SVector{D,T}, parents::Vector{Parent{D,T}}, kind::Symbol,
+                points::Vector{SVector{D,T}}, weights::Vector{T}; split::Int=length(parents),
+                fields::NTuple{2,Int}=(0, 0), normal=nothing, sides=nothing, residual=zero(T)) where {D,T}
+    return Region{D,T,typeof(normal),typeof(sides)}(lower, upper, parents, split, fields, kind, points, weights, normal,
+                                                    sides, T(residual))
+end
+
+const VolumeRegion{D,T} = Region{D,T,Nothing,Nothing}
+
+# A volume region's box. A region stores its corners rather than an `AxisBox` because a frame may be degenerate on some
+# axis, which `AxisBox` rejects; the volume consumers that want a box — the VTK writers and the plan's volume
+# bookkeeping — build it here.
+_region_box(region::Region) = AxisBox(region.lower, region.upper)
 
 """
     SmallOverlap{T}(region, volume, relative_volume, cover_count)
@@ -145,8 +217,8 @@ _moment_orders(factor::Int) = (level, cell) -> factor .* cell_order(level, cell)
 # ── Region rules ──────────────────────────────────────────────────────────────
 
 # Tensor Gauss rule cache, keyed by per-axis count tuple. Built lazily and shared across every `:full` region that needs
-# the same per-axis count. `:full` regions then alias the cached `points`/`weights` arrays directly in their
-# `RegionQuadrature`, so they cost only the assembly-loop iteration time — no allocation per region.
+# the same per-axis count. `:full` regions then alias the cached `points`/`weights` arrays directly, so they cost only
+# the assembly-loop iteration time — no allocation per region.
 function _cached_tensor_quadrature!(cache::Dict{NTuple{D,Int},TensorQuadrature{D,T}}, counts::NTuple{D,Int},
                                     ::Type{T}) where {D,T}
     return get!(() -> _tensor_gauss_rule(counts, T), cache, counts)
@@ -538,17 +610,17 @@ end
 # ── Region parents ────────────────────────────────────────────────────────────
 
 # The parents a box's coverage signature stands for, in level order: per non-zero slot, the level's cell with that
-# linear index, the cell's physical box, and the region's corners in that cell's reference frame. Every candidate the
-# partition merged into the box shares the signature, so the whole box lies in each of these cells — the contract the
-# smooth-integrand argument needs — and decoding the signature is all it takes to find them.
+# linear index and the map from the region's frame `lower`–`upper` into the cell's reference frame (`Parent`). Every
+# candidate the partition merged into the box shares the signature, so the whole box lies in each of these cells — the
+# contract the smooth-integrand argument needs — and decoding the signature is all it takes to find them.
+#
+# A `for` loop that pushes, not a `map` over the levels: a `map` yields a tuple of `Union{Nothing,Parent}` that is
+# boxed per level, which once made a 3D overlay plan 1.8× slower to build.
 function _parents(levels::Tuple, sig::Tuple, lower::SVector{D,T}, upper::SVector{D,T}) where {D,T}
-    parents = ParentRef{D,T}[]
+    parents = Parent{D,T}[]
     for (level, index) in zip(levels, sig)
         index == 0 && continue
-        cell = CartesianIndices(level.mesh.cells)[index]
-        parent_box = cell_box(level.mesh, cell)
-        local_box = AxisBox{D,T}(physical_to_reference(parent_box, lower), physical_to_reference(parent_box, upper))
-        push!(parents, ParentRef{D,T}(level.id, cell, local_box, parent_box))
+        push!(parents, Parent(level, CartesianIndices(level.mesh.cells)[index], lower, upper))
     end
     return parents
 end
@@ -589,14 +661,14 @@ end
 # One kept region of a volume plan before its rule is built: its corners and parents, and what sizing and classification
 # decided about it, computed once per region (`_region_record`) and read by both the prefit and the rule loop. `order`
 # is the moment-fit order on a `:cut` verdict and repeats `counts` otherwise, where nothing reads it.
-const _RegionRecord{D,T} = @NamedTuple{lower::SVector{D,T}, upper::SVector{D,T}, parents::Vector{ParentRef{D,T}},
+const _RegionRecord{D,T} = @NamedTuple{lower::SVector{D,T}, upper::SVector{D,T}, parents::Vector{Parent{D,T}},
                                        verdict::Symbol, counts::NTuple{D,Int}, order::NTuple{D,Int}}
 
 # The record of one kept box: tensor counts from its parents, the `PhysicalDomain` classification (`:full` without one),
 # and on a `:cut` verdict the moment-fit order. `classify_cache` is shared with `_apply_physical_fold` in `mesh.jl`, so
 # a box that coincides with a previously classified cell box (the common no-overlay case) reuses the fold's verdict
 # instead of re-walking the octree.
-function _region_record(V::Space{D,T}, lower::SVector{D,T}, upper::SVector{D,T}, parents::Vector{ParentRef{D,T}},
+function _region_record(V::Space{D,T}, lower::SVector{D,T}, upper::SVector{D,T}, parents::Vector{Parent{D,T}},
                         classify_cache::_ClassifyCache{D,T}) where {D,T}
     physical = V.physical
     counts = _axis_max(_gauss_counts, V, parents, lower, upper)
@@ -675,9 +747,9 @@ function _plan_regions(records::Vector{_RegionRecord{D,T}}, fits::_MomentFitCach
         kind, points, weights, residual = _trimmed_rule(record.verdict, base.points, base.weights, alpha, alpha_weights,
                                                         fit, custom)
         residual > residual_max && (residual_max = Float64(residual))
-        box = AxisBox{D,T}(record.lower, record.upper)
-        region_volume = volume(box)
-        push!(regions, VolumeRegion{D,T}(box, record.parents, RegionQuadrature{D,T}(kind, points, weights)))
+        region = Region(record.lower, record.upper, record.parents, kind, points, weights; residual)
+        region_volume = volume(_region_box(region))
+        push!(regions, region)
         if region_volume <= tolerance.small_volume
             relative_volume = iszero(domain_volume) ? zero(T) : region_volume / domain_volume
             push!(small_overlaps,
@@ -772,7 +844,7 @@ function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criteri
     domain_volume = volume(V.domain)
     regions, small_overlaps, residual_max = _plan_regions(records, moment_fit_cache, alpha, custom, tolerance,
                                                           domain_volume)
-    min_volume = isempty(regions) ? zero(T) : minimum(volume(region.box) for region in regions)
+    min_volume = isempty(regions) ? zero(T) : minimum(volume(_region_box(region)) for region in regions)
     min_relative_volume = iszero(domain_volume) ? zero(T) : min_volume / domain_volume
     return IntegrationPlan{D,T}(regions, tolerance, length(small_overlaps), small_overlaps, min_volume,
                                 min_relative_volume, residual_max)

@@ -251,7 +251,7 @@ end
 function region_kinds(model)
     counts = Dict{Symbol,Int}()
     for plan in model.space_plans, region in plan.regions
-        counts[region.quadrature.kind] = get(counts, region.quadrature.kind, 0) + 1
+        counts[region.kind] = get(counts, region.kind, 0) + 1
     end
     return join((string(k, "=", counts[k]) for k in sort!(collect(keys(counts)))), " ")
 end
@@ -276,10 +276,10 @@ function domain_measure(model)
     total = 0.0
     for plan in model.space_plans, region in plan.regions
         w = 0.0
-        for weight in region.quadrature.weights
+        for weight in region.weights
             w += weight
         end
-        total += volume(region.box) * jacobian_scale * w
+        total += volume(Unfitted._region_box(region)) * jacobian_scale * w
     end
     return total
 end
@@ -289,7 +289,7 @@ end
 function empty_region_count(model)
     n = 0
     for plan in model.space_plans, region in plan.regions
-        isempty(region.quadrature.weights) && (n += 1)
+        isempty(region.weights) && (n += 1)
     end
     return n
 end

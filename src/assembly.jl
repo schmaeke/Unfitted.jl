@@ -1270,17 +1270,24 @@ end
 # per region kind, and they dispatch statically on the region type.
 
 # The region kinds that store their quadrature points and weights in the physical frame, one entry per point: facets,
-# immersed surfaces and interfaces. A volume region instead carries a reference rule on its box.
+# immersed surfaces and interfaces. A `Region` instead carries its rule in its own frame (`intersections.jl`).
 const _PhysicalRegion = Union{FacetRegion,SurfaceRegion,InterfaceRegion}
 
 # Number of quadrature points of a region, which sizes its `q.point` range (`RegionList`) and drives the kernel's point
 # loop.
-_region_qpoint_count(region::VolumeRegion) = length(region.quadrature.weights)
-_region_qpoint_count(region::_PhysicalRegion) = length(region.weights)
+_region_qpoint_count(region) = length(region.weights)
 
-# Reference→physical Jacobian for the region's weights: `vol(box)/2ᴰ` for a volume region (whose weights are
-# reference-frame), one for facet, surface, and interface regions (whose weights are already physical-frame).
-_region_jacobian(region::VolumeRegion{D,T}) where {D,T} = volume(region.box) / convert(T, 2^D)
+# Frame→physical Jacobian for the region's weights. A `Region`'s is `∏ (upper[d] − lower[d]) / 2` over the axes it
+# extends along, a left fold of exact halvings, so on a volume box it is bit for bit `vol(box) / 2ᴰ`, the factor
+# `reference_to_physical` implies. Facet, surface, and interface regions store physical weights, so theirs is one.
+function _region_jacobian(region::Region{D,T}) where {D,T}
+    half = (region.upper - region.lower) / 2
+    jacobian = one(T)
+    for d in 1:D
+        iszero(half[d]) || (jacobian *= half[d])
+    end
+    return jacobian
+end
 _region_jacobian(region::_PhysicalRegion) = one(eltype(region.weights))
 
 # The per-point step shared by the kernel and the walker: the `q` payload of point `k` of `region`, whose index in its
@@ -1296,13 +1303,14 @@ _region_jacobian(region::_PhysicalRegion) = one(eltype(region.weights))
 end
 
 # Quadrature point `k` of `region` as `(x, weight, ref)`: the physical point, the physical weight, and the reference
-# each parent maps to its own frame (`_parent_xi`). A volume region iterates reference points `η` of its box, so
-# `ref = η` and every parent maps it through its `local_box`. Facet, surface and interface regions carry physical points
-# and weights, and each parent maps the physical point through its own `parent_box`: a facet region has no single
-# reference frame shared by every parent, since its free-axis coordinates run across several cells per level.
-@inline function _region_point(region::VolumeRegion, k::Int, jacobian)
-    η = region.quadrature.points[k]
-    return reference_to_physical(region.box, η), region.quadrature.weights[k] * jacobian, η
+# each parent maps to its own frame (`_parent_xi`). A `Region` iterates points `p` of its own frame, so `ref = p` and
+# every parent maps it through its `ξ0 + dξ ∘ p`; `x` is the frame map written exactly as `reference_to_physical` writes
+# it, so a volume region's points are those of its box bit for bit. Facet, surface and interface regions carry physical
+# points and weights, and each parent maps the physical point through its own `parent_box`.
+@inline function _region_point(region::Region, k::Int, jacobian)
+    p = region.points[k]
+    x = (region.lower + region.upper) / 2 + (region.upper - region.lower) .* p / 2
+    return x, region.weights[k] * jacobian, p
 end
 @inline function _region_point(region::_PhysicalRegion, k::Int, _)
     x = region.points[k]
@@ -1312,11 +1320,10 @@ end
 # `q`-tuple extras the form callbacks read: the outward unit normal at the point (`nothing` for a volume region; the
 # constant face normal for a facet; the per-point normal for an immersed surface or an interface, oriented from side `a`
 # to side `b` there) and the codim-`K` facet identifier `q.sides` (only a facet carries one).
-_region_normal(::VolumeRegion, ::Int) = nothing
-_region_normal(region::FacetRegion, ::Int) = region.normal
+_region_normal(region::Union{Region,FacetRegion}, ::Int) = region.normal
 _region_normal(region::Union{SurfaceRegion,InterfaceRegion}, k::Int) = region.normals[k]
-_region_sides(::Union{VolumeRegion,SurfaceRegion,InterfaceRegion}) = nothing
-_region_sides(region::FacetRegion) = region.sides
+_region_sides(::Union{SurfaceRegion,InterfaceRegion}) = nothing
+_region_sides(region::Union{Region,FacetRegion}) = region.sides
 
 # Evaluate every parent's basis at the current point into the bank: values and physical gradients (`Val(true)`), or
 # values only (`Val(false)`, for the L² transfer rhs, whose integrand never reads a gradient). The gradient scale is the
@@ -1345,10 +1352,10 @@ end
 _parent_lists(region) = (region.parents,)
 _parent_lists(region::InterfaceRegion) = (region.parents_a, region.parents_b)
 
-# A parent's own reference coordinate of the current point: a volume region's `η` mapped through `local_box`, the region
-# box in the parent's `[−1, 1]ᴰ`; a physical point through the parent's `parent_box`.
-_parent_xi(p::ParentRef, η) = reference_to_physical(p.local_box, η)
-_parent_xi(p::FacetParent, x) = physical_to_reference(p.parent_box, x)
+# A parent's own reference coordinate of the current point: a frame point `p` through the parent's affine map
+# `ξ0 + dξ ∘ p`; a physical point through the parent's `parent_box`.
+_parent_xi(parent::Parent, p) = parent.ξ0 + parent.dξ .* p
+_parent_xi(parent::FacetParent, x) = physical_to_reference(parent.parent_box, x)
 
 # ── FormState: evaluation and accessors ───────────────────────────────────────
 

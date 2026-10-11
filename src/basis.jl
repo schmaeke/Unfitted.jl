@@ -123,46 +123,9 @@ basis_name(::IntegratedLegendre) = :integrated_legendre
 
 Tensor-product Gauss–Legendre quadrature on the reference cube `[−1, 1]ᴰ`. Built once per `(per_axis_counts, T)` pair by
 `_tensor_gauss_rule` and cached, so all `:full` regions of the same per-axis order share the same `points`/`weights`
-arrays.
+arrays (see [`Region`](@ref)).
 """
 struct TensorQuadrature{D,T<:Real}
-    points::Vector{SVector{D,T}}
-    weights::Vector{T}
-end
-
-"""
-    RegionQuadrature{D,T}(kind, points, weights)
-
-Per-region quadrature rule consumed by the assembly hot loop. `kind` is an informational tag set by the
-integration-region dispatcher in `intersections.jl`:
-
-  - `:full` — region is entirely inside Ω (or no `PhysicalDomain` is attached). `points`/`weights` alias the shared
-    cached tensor Gauss rule; no copy is made.
-  - `:fictitious_alpha` — region is entirely outside Ω under α-FCM; weights are the tensor Gauss weights pre-multiplied
-    by `α` and shared across regions of the same per-axis order via a per-plan cache.
-  - `:cut_fitted` — region is crossed by ∂Ω; weights come from the NNMF moment-fit rule (see `src/fcm.jl`) and are
-    unique per region. Under α-FCM (`α > 0`) the rule additionally carries the α-scaled full-cell tensor part
-    (`(1−α)·moment-fit ∪ α·tensor`).
-  - `:cut_fallback` — the moment-fit residual exceeded the catastrophic threshold, so the region carries the raw Saye
-    volume rule the moments were summed from (see [`moment_fit_rule`](@ref)) instead of a fitted one: correct and
-    non-negative, but with 50–200× the points. Under α-FCM the α-scaled tensor part is appended as for `:cut_fitted`.
-  - `:cut_failed` — strict-cut (`α = 0`) region whose `Ω ∩ box` carries no volume rule at all; the region was emitted
-    with empty `points`/`weights` so it contributes zero quadrature.
-  - `:cut_alpha_failed` — same under α-FCM (`α > 0`); the physical part is empty but the region carries the α-scaled
-    tensor rule alone so the cell's dofs stay α-stabilised rather than singular.
-  - `:cut_custom` — region is crossed by ∂Ω and its rule came from the domain's own `cut_quadrature` callable instead of
-    the moment fit (see the [`PhysicalDomain`](@ref) docstring). Under α-FCM the α-scaled tensor part is appended as for
-    `:cut_fitted`.
-
-All three non-fitted kinds are reported in `AssemblyDiagnostics.fit_failure_count`; `:cut_fallback` is additionally
-counted, with its point cost, in `cut_fallback_count` and `cut_fallback_points`. `:cut_custom` is not among them — no
-fit ran, so there is no residual to report on.
-
-Assembly iterates `zip(points, weights)` without dispatching on `kind`, so the hot loop's cost is the same regardless of
-the quadrature source.
-"""
-struct RegionQuadrature{D,T<:Real}
-    kind::Symbol
     points::Vector{SVector{D,T}}
     weights::Vector{T}
 end

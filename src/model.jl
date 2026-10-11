@@ -288,14 +288,14 @@ function _cut_region_stats(plan::IntegrationPlan)
     fallback = 0
     fallback_points = 0
     for region in plan.regions
-        kind = region.quadrature.kind
+        kind = region.kind
         if kind === :cut_fitted || kind === :cut_custom
             cut += 1
         elseif kind === :cut_fallback
             cut += 1
             failed += 1
             fallback += 1
-            fallback_points += length(region.quadrature.weights)
+            fallback_points += length(region.weights)
         elseif kind === :cut_failed || kind === :cut_alpha_failed
             cut += 1
             failed += 1

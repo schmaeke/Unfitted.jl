@@ -279,7 +279,7 @@ Fields:
     parent set is constant across the region's quadrature points (the contract that makes "evaluate basis values once
     per parent" amortizable).
   - `kind::Symbol` — which rule `points` / `weights` carry, in the same vocabulary a volume region's
-    `RegionQuadrature.kind` uses (`CONTRIBUTING.md`, "Region quadrature kinds"): `:full` (tensor Gauss over the whole
+    [`Region`](@ref)`.kind` uses (`CONTRIBUTING.md`, "Region quadrature kinds"): `:full` (tensor Gauss over the whole
     face, because the whole face is in `Ω`), `:fictitious` (the face is outside `Ω`, and under strict `α = 0` the rule
     is empty), `:fictitious_alpha` (the same face under `α > 0`, α-scaled tensor Gauss), `:cut_fitted` / `:cut_fallback`
     (`∂Ω` crosses the face and the moment fit on the facet's affine slice succeeded / fell back to the raw Saye rule),

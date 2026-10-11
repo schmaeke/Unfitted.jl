@@ -181,8 +181,8 @@ end
 
     # Identical region structure regardless of fit tolerance.
     @test length(plan_loose.regions) == length(plan_tight.regions)
-    cut_loose = count(r -> r.quadrature.kind === :cut_fitted, plan_loose.regions)
-    cut_tight = count(r -> r.quadrature.kind === :cut_fitted, plan_tight.regions)
+    cut_loose = count(r -> r.kind === :cut_fitted, plan_loose.regions)
+    cut_tight = count(r -> r.kind === :cut_fitted, plan_tight.regions)
     @test cut_loose == cut_tight > 0
 
     # Both targets reach the same residual floor: it is set by the kernel's approximation of the curved boundary, which
@@ -493,7 +493,7 @@ end
     m = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     plan = Unfitted.integration_plan(m)
-    kinds = Set(region.quadrature.kind for region in plan.regions)
+    kinds = Set(region.kind for region in plan.regions)
     @test :full in kinds
     @test :cut_fitted in kinds
 end
@@ -507,11 +507,11 @@ end
                                        subcell_length_scale=1.0))
     plan = Unfitted.integration_plan(V)
 
-    fict_regions = [r for r in plan.regions if r.quadrature.kind === :fictitious_alpha]
+    fict_regions = [r for r in plan.regions if r.kind === :fictitious_alpha]
     @test length(fict_regions) >= 2
     # All :fictitious_alpha regions share weights vector identity (cache hit).
-    w = fict_regions[1].quadrature.weights
-    @test all(r.quadrature.weights === w for r in fict_regions)
+    w = fict_regions[1].weights
+    @test all(r.weights === w for r in fict_regions)
 end
 
 # --- Moment-fit quadrature in the integration plan ---
@@ -570,8 +570,8 @@ end
     # Every cut-cell rule is O(nbasis): a single NNLS solve keeps at most nbasis = (order·factor + 1)^D = 3³ = 27
     # points; a stair-step octree would have produced thousands here.
     plan = Unfitted.integration_plan(m)
-    cut_regions = [r for r in plan.regions if r.quadrature.kind === :cut_fitted]
-    @test maximum(length(r.quadrature.points) for r in cut_regions) <= 27
+    cut_regions = [r for r in plan.regions if r.kind === :cut_fitted]
+    @test maximum(length(r.points) for r in cut_regions) <= 27
 end
 
 @testset "diagnostics report cut_region_count" begin
@@ -583,8 +583,7 @@ end
 
     diag = diagnostics(m)
     plan = Unfitted.integration_plan(m)
-    expected = count(r -> r.quadrature.kind in (:cut_fitted, :cut_fallback, :cut_failed, :cut_alpha_failed),
-                     plan.regions)
+    expected = count(r -> r.kind in (:cut_fitted, :cut_fallback, :cut_failed, :cut_alpha_failed), plan.regions)
     @test diag.cut_region_count == expected
     @test diag.cut_region_count > 0
     @test diag.fit_failure_count == 0   # no failures expected on this smooth Ω
@@ -608,13 +607,13 @@ end
     model = prepare(mass(V; coefficient=1.0))
 
     cache = only(model.moment_fit_caches)
-    cut_regions(m) = [r for r in Unfitted.integration_plan(m).regions if r.quadrature.kind === :cut_fitted]
+    cut_regions(m) = [r for r in Unfitted.integration_plan(m).regions if r.kind === :cut_fitted]
     before = cut_regions(model)
     @test !isempty(before)
     # Bounded: one entry per cut region, and each region aliases its cached rule rather than owning a copy of it.
     @test length(cache) == length(before)
     cached_weights = Set(objectid(value[2]) for value in values(cache))
-    @test all(r -> objectid(r.quadrature.weights) in cached_weights, before)
+    @test all(r -> objectid(r.weights) in cached_weights, before)
 
     kept = Dict(key => value for (key, value) in cache)
     move!(model; level=2, to=box((0.25, 0.0), (0.5, 0.25)))
@@ -635,9 +634,9 @@ end
     plan = Unfitted.integration_plan(V)
 
     region = plan.regions[1]
-    @test region.quadrature.kind === :cut_fitted
-    jac = Unfitted.volume(region.box) / 2.0   # 1D
-    integral = sum(w * jac for w in region.quadrature.weights)
+    @test region.kind === :cut_fitted
+    jac = Unfitted.volume(Unfitted._region_box(region)) / 2.0   # 1D
+    integral = sum(w * jac for w in region.weights)
     @test integral ≈ 0.7 atol = 1.0e-3
 end
 
@@ -653,7 +652,7 @@ end
     # :cut_failed (empty Ω∩R) and :cut_fallback (residual > _FIT_FAILURE_RESIDUAL) are both defensive tags. The leaf
     # here is linear, so the Saye moments are exact and a zero-residual non-negative fit exists: the region is
     # :cut_fitted, neither of the two, and the max residual stays far below the failure threshold.
-    failed = count(r -> r.quadrature.kind in (:cut_fallback, :cut_failed, :cut_alpha_failed), plan.regions)
+    failed = count(r -> r.kind in (:cut_fallback, :cut_failed, :cut_alpha_failed), plan.regions)
     @test failed == 0
     @test plan.moment_fit_residual_max < Unfitted._FIT_FAILURE_RESIDUAL
     # Diagnostics counts must agree with the plan tags — guarding the flagging logic that the old `failed >= 0`
@@ -694,7 +693,7 @@ end
     plan = Unfitted.integration_plan(V)
 
     # At least one cut-fitted region with two parents (base + overlay).
-    multi_parent_cuts = [r for r in plan.regions if r.quadrature.kind === :cut_fitted && length(r.parents) == 2]
+    multi_parent_cuts = [r for r in plan.regions if r.kind === :cut_fitted && length(r.parents) == 2]
     @test !isempty(multi_parent_cuts)
     # moment_order for such a region = 2 × max(base.order, overlay.order) = 2 × 2 = 4.
     region = multi_parent_cuts[1]
@@ -740,19 +739,16 @@ end
     # cell's dofs stay α-stabilised. `:cut_fallback` carries the raw Saye volume rule — a full, correct rule with many
     # more points than a fit. All three non-fitted kinds feed the fit-failure count, all four count as cut regions, and
     # only `:cut_fallback` contributes to the fallback point budget.
-    RQ = Unfitted.RegionQuadrature{1,Float64}
-    VR = Unfitted.VolumeRegion{1,Float64}
-    b = box((0.0,), (1.0,))
-    noparents = Unfitted.ParentRef{1,Float64}[]
-    afail = RQ(:cut_alpha_failed, [SVector(0.5)], [0.3])
-    strict = RQ(:cut_failed, SVector{1,Float64}[], Float64[])
-    back = RQ(:cut_fallback, [SVector(0.25), SVector(0.75)], [0.5, 0.5])
+    region(kind, points, weights) = Unfitted.Region(SVector(0.0), SVector(1.0), Unfitted.Parent{1,Float64}[], kind,
+                                                    points, weights)
+    afail = region(:cut_alpha_failed, [SVector(0.5)], [0.3])
+    strict = region(:cut_failed, SVector{1,Float64}[], Float64[])
+    back = region(:cut_fallback, [SVector(0.25), SVector(0.75)], [0.5, 0.5])
     @test !isempty(afail.weights)          # α fallback is a nonzero rule …
     @test isempty(strict.weights)          # … the strict failure is empty
-    plan = Unfitted.IntegrationPlan{1,Float64}([VR(b, noparents, RQ(:cut_fitted, [SVector(0.5)], [1.0])),
-                                                VR(b, noparents, strict), VR(b, noparents, afail),
-                                                VR(b, noparents, back)], GeometryTolerance(Float64), 0,
-                                               Unfitted.SmallOverlap{Float64}[], 1.0, 1.0, 0.0)
+    plan = Unfitted.IntegrationPlan{1,Float64}([region(:cut_fitted, [SVector(0.5)], [1.0]), strict, afail, back],
+                                               GeometryTolerance(Float64), 0, Unfitted.SmallOverlap{Float64}[], 1.0,
+                                               1.0, 0.0)
     cut, failed, fallback, fallback_points = Unfitted._cut_region_stats(plan)
     @test cut == 4
     @test failed == 3
@@ -791,12 +787,12 @@ end
     plan_fitted = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2, physical=fitted))
     plan_custom = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2, physical=custom))
 
-    kinds(plan) = [r.quadrature.kind for r in plan.regions]
+    kinds(plan) = [r.kind for r in plan.regions]
     @test :cut_fitted in kinds(plan_fitted)
     @test !(:cut_custom in kinds(plan_fitted))
     # The rule replaces exactly the cut regions: same region boxes, same `:full` regions, `:cut_fitted` swapped for
     # `:cut_custom` one for one.
-    @test [r.box for r in plan_custom.regions] == [r.box for r in plan_fitted.regions]
+    @test [(r.lower, r.upper) for r in plan_custom.regions] == [(r.lower, r.upper) for r in plan_fitted.regions]
     @test count(==(:full), kinds(plan_custom)) == count(==(:full), kinds(plan_fitted))
     @test count(==(:cut_custom), kinds(plan_custom)) == count(==(:cut_fitted), kinds(plan_fitted)) > 0
     @test calls[] == count(==(:cut_custom), kinds(plan_custom))
@@ -804,10 +800,11 @@ end
     # Points come back in the region's reference frame with the standard Jacobian folded out, so `Σ w_q · vol(box) / 2ᴰ`
     # is the physical measure the rule integrates — here the whole box, since the rule ignores Ω.
     for region in plan_custom.regions
-        region.quadrature.kind === :cut_custom || continue
-        jacobian = Unfitted.volume(region.box) / 4
-        @test sum(region.quadrature.weights) * jacobian ≈ Unfitted.volume(region.box)
-        @test all(>=(0), region.quadrature.weights)
+        region.kind === :cut_custom || continue
+        region_box = Unfitted._region_box(region)
+        jacobian = Unfitted.volume(region_box) / 4
+        @test sum(region.weights) * jacobian ≈ Unfitted.volume(region_box)
+        @test all(>=(0), region.weights)
     end
 
     # A custom region is a cut region but never a fit failure: no fit ran, so there is no residual for
@@ -823,13 +820,15 @@ end
     alpha = 0.25
     blended = physical_domain(geometry; settings..., alpha=alpha, cut_quadrature=tensor_rule)
     plan_blended = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2, physical=blended))
-    strict = first(r for r in plan_custom.regions if r.quadrature.kind === :cut_custom)
-    mixed = first(r for r in plan_blended.regions if r.quadrature.kind === :cut_custom && r.box == strict.box)
-    n = length(strict.quadrature.weights)
-    @test length(mixed.quadrature.weights) > n
-    @test mixed.quadrature.points[1:n] == strict.quadrature.points
-    @test mixed.quadrature.weights[1:n] ≈ strict.quadrature.weights .* (1 - alpha)
-    @test all(>=(0), mixed.quadrature.weights)
+    strict = first(r for r in plan_custom.regions if r.kind === :cut_custom)
+    mixed = first(r
+                  for r in plan_blended.regions
+                  if r.kind === :cut_custom && (r.lower, r.upper) == (strict.lower, strict.upper))
+    n = length(strict.weights)
+    @test length(mixed.weights) > n
+    @test mixed.points[1:n] == strict.points
+    @test mixed.weights[1:n] ≈ strict.weights .* (1 - alpha)
+    @test all(>=(0), mixed.weights)
 end
 
 @testset "an affine slice of the CSG tree is the geometry one dimension down" begin
@@ -1006,9 +1005,10 @@ end
 function _plan_integral(plan, g)
     total = 0.0
     for region in plan.regions
-        jacobian = Unfitted.volume(region.box) / 2^length(region.box.lower)
-        for (η, w) in zip(region.quadrature.points, region.quadrature.weights)
-            total += w * jacobian * g(Unfitted.reference_to_physical(region.box, η))
+        region_box = Unfitted._region_box(region)
+        jacobian = Unfitted.volume(region_box) / 2^length(region.lower)
+        for (η, w) in zip(region.points, region.weights)
+            total += w * jacobian * g(Unfitted.reference_to_physical(region_box, η))
         end
     end
     return total
@@ -1096,7 +1096,7 @@ end
               physical=physical_domain(intersect(edge(A, B), edge(B, C), edge(C, A)); subcell_length_scale=1 / 96,
                                        max_depth=4))
     plan = Unfitted.integration_plan(V)
-    pieces = filter(c -> length(c) >= 3, [_clip_to_box([A, B, C], r.box.lower, r.box.upper) for r in plan.regions])
+    pieces = filter(c -> length(c) >= 3, [_clip_to_box([A, B, C], r.lower, r.upper) for r in plan.regions])
     @test sum(_shoelace(c) for c in pieces) ≈ _shoelace([A, B, C]) rtol = 1.0e-14   # nothing lost to the classifier
     worst = 0.0
     for a in 0:(2p), b in 0:(2p-a)
@@ -1116,13 +1116,13 @@ end
     phys = physical_domain(leaf(x -> n[1] * (x[1] - p0[1]) + n[2] * (x[2] - p0[2]); lipschitz=1.0); alpha=α,
                            keep_fictitious=true, subcell_length_scale=1 / 80, max_depth=4)
     plan = Unfitted.integration_plan(space(box((0.0, 0.0), (1.0, 1.0)); cells=(5, 5), order=2, physical=phys))
-    @test Set(r.quadrature.kind for r in plan.regions) == Set([:full, :cut_fitted, :fictitious_alpha])
+    @test Set(r.kind for r in plan.regions) == Set([:full, :cut_fitted, :fictitious_alpha])
     for region in plan.regions
-        lo, hi = region.box.lower, region.box.upper
-        boxvol = Unfitted.volume(region.box)
+        lo, hi = region.lower, region.upper
+        boxvol = Unfitted.volume(Unfitted._region_box(region))
         inside = _clip([lo, SVector(hi[1], lo[2]), hi, SVector(lo[1], hi[2])], x -> -dot(n, x - p0))
         expected = (1 - α) * (length(inside) >= 3 ? _shoelace(inside) : 0.0) + α * boxvol
-        @test boxvol / 4 * sum(region.quadrature.weights) ≈ expected atol = 1.0e-13 * boxvol
+        @test boxvol / 4 * sum(region.weights) ≈ expected atol = 1.0e-13 * boxvol
     end
 end
 

@@ -3,22 +3,24 @@
     @test isdefined(Unfitted, :IntegrationPlan)
 end
 
+# Every parent's frame map sends the region's frame corners `p = ∓1` — through `ξ = ξ0 ∓ dξ` in the cell's reference
+# frame — back onto the region's own physical corners.
 function assert_parent_maps(V, plan)
     for region in plan.regions
         for parent in region.parents
             parent_box = Unfitted.cell_box(V.levels[parent.level].mesh, parent.cell)
             @test parent.parent_box == parent_box
-            lower = Unfitted.reference_to_physical(parent_box, parent.local_box.lower)
-            upper = Unfitted.reference_to_physical(parent_box, parent.local_box.upper)
+            lower = Unfitted.reference_to_physical(parent_box, parent.ξ0 - parent.dξ)
+            upper = Unfitted.reference_to_physical(parent_box, parent.ξ0 + parent.dξ)
 
-            @test all(isapprox(lower[i], region.box.lower[i]; atol=1.0e-12) for i in eachindex(lower))
-            @test all(isapprox(upper[i], region.box.upper[i]; atol=1.0e-12) for i in eachindex(upper))
+            @test all(isapprox(lower[i], region.lower[i]; atol=1.0e-12) for i in eachindex(lower))
+            @test all(isapprox(upper[i], region.upper[i]; atol=1.0e-12) for i in eachindex(upper))
         end
-        @test !isempty(region.quadrature.points)
-        @test length(region.quadrature.points) == length(region.quadrature.weights)
+        @test !isempty(region.points)
+        @test length(region.points) == length(region.weights)
     end
     # merged regions must still partition the domain exactly (no lost coverage)
-    @test sum(Unfitted.volume(region.box) for region in plan.regions) ≈ Unfitted.volume(V.domain)
+    @test sum(Unfitted.volume(Unfitted._region_box(region)) for region in plan.regions) ≈ Unfitted.volume(V.domain)
 end
 
 @testset "integration regions" begin
@@ -64,7 +66,7 @@ end
     base = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2)
     V = overlay(base, box((0.2, 0.3), (0.6, 0.7)); cells=(2, 2), order=2)
     both = parents -> length(parents) >= 2
-    boxes(plan) = [region.box for region in plan.regions]
+    boxes(plan) = [Unfitted._region_box(region) for region in plan.regions]
 
     any_plan = Unfitted.integration_plan(V)
     all_plan = Unfitted.integration_plan(V; criterion=:all_levels)
@@ -107,9 +109,9 @@ end
     plan = Unfitted.integration_plan(V; criterion=keep_all)
     @test !saw_empty[]
     reference = Unfitted.integration_plan(V)
-    @test [r.box for r in plan.regions] == [r.box for r in reference.regions]
+    @test [Unfitted._region_box(r) for r in plan.regions] == [Unfitted._region_box(r) for r in reference.regions]
     @test [r.parents for r in plan.regions] == [r.parents for r in reference.regions]
-    @test sum(Unfitted.volume(r.box) for r in plan.regions) ≈ 1 - 1 / 9
+    @test sum(Unfitted.volume(Unfitted._region_box(r)) for r in plan.regions) ≈ 1 - 1 / 9
 end
 
 # `tolerance.merge` is an absolute length. A mesh whose spacing on some axis falls at or below it would have that axis's
