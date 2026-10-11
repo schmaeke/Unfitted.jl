@@ -57,17 +57,18 @@
 #   * `physical` — the space's physical domain under its CONCRETE type `P` (`Nothing`
 #     without one). `Space.physical` is abstractly typed; building a `_Fold` from its
 #     run-time value is the function barrier behind which every query below is a static
-#     call, and with `P = Nothing` every query is a compile-time constant that touches
-#     neither field below.
+#     call, and with `P = Nothing` every query's `physical === nothing` test is a
+#     compile-time constant, so it answers without touching the fields below.
 #   * `boxes` — the box memo `classify_cell` fills, keyed by the box corners. It is the
 #     caller's: `prepare` hands in the one its fold filled and its integration plan read,
 #     so a cell the fold classified costs a lookup here; a standalone call passes a fresh
 #     one.
 #   * `cells` — per level id, a per-cell verdict table (`0x00` not asked yet, `0x01`
-#     void, `0x02` material), allocated on the level's first query. A build asks about
+#     void, `0x02` material), allocated on the level's first miss. A build asks about
 #     the same cell many times — per buried function, per cover, per face position — and
 #     a table read is cheaper than hashing the box into `boxes` again. Level ids are
-#     unique within the space the fold was built for, the only space it is asked about.
+#     unique within the space the fold was built for, the only space it is asked about,
+#     and bounded by the largest of them, which sizes the vector up front.
 #
 # The verdicts are exactly `classify_cell`'s: a table miss makes the same
 # `classify_cell(physical, cell_box(mesh, c), boxes)` call with the same box and memo, a
@@ -88,56 +89,38 @@ struct _Fold{D,T<:Real,P}
 end
 
 function _Fold(V::Space{D,T}, boxes::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T<:Real}
-    return _Fold{D,T,typeof(V.physical)}(V.physical, boxes, Array{UInt8,D}[])
+    n = maximum(level -> level.id, V.levels)
+    return _Fold{D,T,typeof(V.physical)}(V.physical, boxes, Vector{Array{UInt8,D}}(undef, n))
 end
 
 # Whether `box`, an arbitrary axis-aligned box, holds no material: the box memo alone,
 # with no table, for a box that is not a cell of one of the space's grids — a B-spline
 # level's virtual cell past its own face.
-_fictitious(::_Fold{D,T,Nothing}, ::AxisBox{D,T}) where {D,T<:Real} = false
 function _fictitious(f::_Fold{D,T}, box::AxisBox{D,T}) where {D,T<:Real}
+    f.physical === nothing && return false
     return classify_cell(f.physical, box, f.boxes) === :fictitious
 end
 
-# The verdict table of `level`, allocated with every cell "not asked yet" on its first
-# use. A caller that asks one level about many cells resolves it once and hands it to
-# the four-argument `_is_void`. Without a physical domain nothing is ever recorded, and
-# a zero-size table stands in for it.
-function _void_table(::_Fold{D,T,Nothing}, ::Level{D,T}) where {D,T<:Real}
-    return Array{UInt8,D}(undef, ntuple(_ -> 0, D))
-end
-function _void_table(f::_Fold{D,T}, level::Level{D,T}) where {D,T<:Real}
-    tables, id = f.cells, level.id
-    length(tables) < id && resize!(tables, id)
-    isassigned(tables, id) && return tables[id]
-    return tables[id] = zeros(UInt8, level.mesh.cells)
-end
-
 # Whether cell `c` of `level` holds no material: its box lies entirely outside Ω. A
-# fact about the geometry and the box, whatever the cell's activity. The three-argument
-# form looks the level's table up; the four-argument form takes the table the caller
-# resolved once (`_void_table`).
-_is_void(::_Fold{D,T,Nothing}, ::Level{D,T}, ::CartesianIndex{D}) where {D,T<:Real} = false
-function _is_void(f::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}) where {D,T<:Real}
-    return _is_void(f, _void_table(f, level), level, c)
-end
-function _is_void(::_Fold{D,T,Nothing}, ::Array{UInt8,D}, ::Level{D,T},
-                  ::CartesianIndex{D}) where {D,T<:Real}
-    return false
-end
-@inline function _is_void(f::_Fold{D,T}, table::Array{UInt8,D}, level::Level{D,T},
-                          c::CartesianIndex{D}) where {D,T<:Real}
-    verdict = table[c]
+# fact about the geometry and the box, whatever the cell's activity. Inlined, so the
+# hit path a per-cell loop runs — the B-spline admissibility walk above all — is two
+# loads and a compare; a level's table is allocated on its first miss, so a level
+# nobody asks about, and every level of a space without a physical domain, gets none.
+@inline function _is_void(f::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}) where {D,T<:Real}
+    f.physical === nothing && return false
+    isassigned(f.cells, level.id) || return _classify_void!(f, level, c)
+    verdict = f.cells[level.id][c]
     verdict == 0x00 || return verdict == 0x01
-    return _classify_void!(f, table, level, c)
+    return _classify_void!(f, level, c)
 end
 
 # A table miss: classify the cell box through the box memo and record the verdict. Out
 # of line, so the hit path a per-cell loop inlines stays a load and a compare.
-@noinline function _classify_void!(f::_Fold{D,T}, table::Array{UInt8,D}, level::Level{D,T},
+@noinline function _classify_void!(f::_Fold{D,T}, level::Level{D,T},
                                    c::CartesianIndex{D}) where {D,T<:Real}
+    isassigned(f.cells, level.id) || (f.cells[level.id] = zeros(UInt8, level.mesh.cells))
     void = classify_cell(f.physical, cell_box(level.mesh, c), f.boxes) === :fictitious
-    table[c] = void ? 0x01 : 0x02
+    f.cells[level.id][c] = void ? 0x01 : 0x02
     return void
 end
 
@@ -147,14 +130,6 @@ end
 function _is_fictitious(f::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}) where {D,T<:Real}
     is_active(level.mask, c) && return false
     return _is_void(f, level, c)
-end
-
-# The cheap half of `_covered_by_level`: whether a centre sample proves that `box` holds
-# material. `:fictitious` means no point of the box lies in Ω, so a centre inside Ω rules
-# that verdict out. Without a physical domain every cell holds material.
-_material_at_centre(::_Fold{D,T,Nothing}, ::AxisBox{D,T}) where {D,T<:Real} = true
-function _material_at_centre(f::_Fold{D,T}, box::AxisBox{D,T}) where {D,T<:Real}
-    return _inside(f.physical.geometry, center(box))
 end
 
 # ── Coverage ──────────────────────────────────────────────────────────────────
@@ -268,10 +243,12 @@ function _covered_by_level(box::AxisBox{D,T}, k::Level{D,T}, tol::GeometryTolera
     # Pass 1 — one centre sample per inactive cell. A void cell has *no* point in Ω, so a
     # centre inside Ω rules that verdict out, and this is the overwhelmingly common case:
     # a coarse cell abutting a sparsely-populated overlay meets that overlay's user-masked
-    # (material-carrying) cells, not its folded ones.
+    # (material-carrying) cells, not its folded ones. Without a physical domain every
+    # inactive cell holds material, and the first one decides.
     for kc in cells
         is_active(k.mask, kc) && continue                       # an inactive overlapped cell
-        _material_at_centre(fold, cell_box(k.mesh, kc)) && return false
+        fold.physical === nothing && return false
+        _inside(fold.physical.geometry, center(cell_box(k.mesh, kc))) && return false
     end
 
     # Pass 2 — the exact verdict, for the blocks pass 1 could not settle. Splitting the

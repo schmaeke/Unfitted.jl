@@ -128,7 +128,7 @@ using Unfitted
 using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, AxisDofKey, TensorDofKey,
                 EliminationLedger, _LevelContext, _eliminate!, _constrain!, _pivot!, cell_indices,
                 is_active, AxisBox, _check_basis_mode, _level_side_is_physical, _tensor_dof_key,
-                _Fold, _fictitious, _is_fictitious, _is_void, _void_table
+                _Fold, _fictitious, _is_fictitious, _is_void
 using StaticArrays: SVector
 using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim
 
@@ -683,15 +683,14 @@ end
 # behind the oracle.
 #
 # Everything a level's admissibility question needs is gathered here once per
-# record: the level, its verdict table, which of its box faces are physical, its
-# uniform per-axis cell width (for the virtual cells outside the mesh), and the
-# oracle, which answers for those virtual cells through its box memo. A struct rather
-# than six arguments because both the selection rule and the burial test ask the
-# same question of the same level, and the burial test asks it of a *second* level
-# as well.
+# record: the level, which of its box faces are physical, its uniform per-axis cell
+# width (for the virtual cells outside the mesh), and the oracle, which answers for
+# the level's inactive cells through its verdict table and for those virtual cells
+# through its box memo. A struct rather than five arguments because both the
+# selection rule and the burial test ask the same question of the same level, and
+# the burial test asks it of a *second* level as well.
 struct _Admissibility{D,T,S,F}
     level::Level{D,T,S}
-    table::Array{UInt8,D}
     lower_physical::NTuple{D,Bool}
     upper_physical::NTuple{D,Bool}
     width::NTuple{D,T}
@@ -704,19 +703,16 @@ end
 # the tolerance and the material oracle) is space-wide. `ctx.fold` is concretely
 # typed, so `F` is too, and every admissibility query specialises on it.
 #
-# O(1): nothing is classified here. The verdict table is resolved only for a level
-# with an inactive cell; an all-active level (a `nothing` mask) never reads one,
-# because `_cell_admissible` stops at `is_active`, so it gets an empty stand-in
-# instead of a table of its whole grid that nothing would ever fill.
+# Nothing is classified or allocated here: the oracle allocates the level's verdict
+# table on its first miss, so an all-active level (a `nothing` mask), whose cells
+# `_cell_admissible` never asks it about, gets none.
 function _admissibility(level::Level{D,T,S}, ctx::_LevelContext{D,T}) where {D,T,S}
     mesh = level.mesh
     width = ntuple(d -> (mesh.domain.upper[d] - mesh.domain.lower[d]) / mesh.cells[d], D)
     domain, tol, fold = ctx.space.domain, ctx.tolerance, ctx.fold
     lower = ntuple(d -> _level_side_is_physical(level, domain, d, :lower, tol), D)
     upper = ntuple(d -> _level_side_is_physical(level, domain, d, :upper, tol), D)
-    table = level.mask === nothing ? Array{UInt8,D}(undef, ntuple(_ -> 0, D)) :
-            _void_table(fold, level)
-    return _Admissibility{D,T,S,typeof(fold)}(level, table, lower, upper, width, fold)
+    return _Admissibility{D,T,S,typeof(fold)}(level, lower, upper, width, fold)
 end
 
 # `_overlay_constraints!` at `continuity = :maximal`: one strong elimination per
@@ -820,7 +816,7 @@ end
             inside = false
         end
     end
-    inside && return is_active(a.level.mask, c) || _is_void(a.fold, a.table, a.level, c)
+    inside && return is_active(a.level.mask, c) || _is_void(a.fold, a.level, c)
     return _fictitious(a.fold, _virtual_cell_box(a, c))
 end
 

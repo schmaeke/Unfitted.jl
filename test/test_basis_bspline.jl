@@ -444,19 +444,23 @@ end
             ctx = Unfitted._LevelContext(V, fold, tol, nocoverage, raw_keys, raw_by_key,
                                          level_raws[level.id])
             a = BSExt._admissibility(level, ctx)
-            # O(1) to build: nothing is classified, and the record reads the oracle's own
-            # table for the level — the one every other site of the build asks — or, for
-            # an all-active level, which never reads one, an empty stand-in.
-            @test all(iszero, a.table)
-            @test level.mask === nothing ? isempty(a.table) :
-                  a.table === Unfitted._void_table(fold, level)
+            # Nothing is classified or allocated to build the record: the oracle's table
+            # for the level — the one every other site of the build asks — does not exist
+            # until the first inactive cell is asked about.
+            @test !isassigned(fold.cells, level.id)
             grid = CartesianIndices(ntuple(d -> (1-p):(level.mesh.cells[d]+p), 2))
             dense = Dict(c => _dense_admissible(V, level, c, tol) for c in grid)
             @test [c for c in grid if BSExt._cell_admissible(a, c) != dense[c]] ==
                   CartesianIndex{2}[]
-            # Only inactive grid cells are ever looked up in the table.
-            @test all(c -> iszero(a.table[c]) || !Unfitted.is_active(level.mask, c),
-                      CartesianIndices(a.table))
+            # The sweep reaches every grid cell, and the record read the oracle's table:
+            # exactly the inactive grid cells hold a verdict there, so only they were ever
+            # looked up, and every one of them was. An all-active level never asks.
+            if level.mask === nothing
+                @test !isassigned(fold.cells, level.id)
+            else
+                @test [!iszero(fold.cells[level.id][c]) for c in cell_indices(level.mesh)] ==
+                      [!Unfitted.is_active(level.mask, c) for c in cell_indices(level.mesh)]
+            end
             # Non-vacuity on the overlay: every kind of cell is there and answers as its
             # kind must.
             if level.id == V.levels[2].id
@@ -468,8 +472,7 @@ end
             end
         end
         # An all-active level's grid was never classified into a table of its own.
-        id = unmasked.id
-        @test length(fold.cells) < id || !isassigned(fold.cells, id)
+        @test !isassigned(fold.cells, unmasked.id)
     end
 end
 

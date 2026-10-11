@@ -285,8 +285,8 @@ end
     # whichever mask switched it off. So the oracle must give the classifier's verdict
     # on every cell — a folded one, a user mask entirely outside Ω, a user mask over
     # material, an active one — on the first ask (the table miss, through the memo)
-    # and on every later one (the hit), with either form of the query, and under
-    # `keep_fictitious`, where no fold runs and every inactive cell is the user's.
+    # and on every later one (the hit), and under `keep_fictitious`, where no fold runs
+    # and every inactive cell is the user's.
     disc(; kw...) = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.3; lipschitz=1.0,
                                     subcell_length_scale=1 / 64, max_depth=4, kw...)
     # Each level masks one cell entirely outside the disc and one entirely inside it.
@@ -319,32 +319,25 @@ end
             @test inactive(V.levels[id])[c] && !expected[id][c]
         end
 
-        # Each form of the void query first, on a fresh oracle, so it takes every miss;
-        # then both forms and the inactive-and-void query again, all hits.
-        for hot in (false, true)
-            fold = Unfitted._Fold(V, cache)
-            @test fold isa Unfitted._Fold{2,Float64,typeof(V.physical)}
-            @test isempty(fold.cells)
-            for pass in 1:2, level in V.levels
-                cells = cell_indices(level.mesh)
-                table = Unfitted._void_table(fold, level)
-                void = hot ? [Unfitted._is_void(fold, table, level, c) for c in cells] :
-                       [Unfitted._is_void(fold, level, c) for c in cells]
-                @test void == expected[level.id]
-                @test [Unfitted._is_fictitious(fold, level, c) for c in cells] ==
-                      inactive(level) .& expected[level.id]
-            end
-            # Every verdict the tables hold is the one the box memo holds for that box.
-            for level in V.levels
-                memo = [cache[(b.lower, b.upper)]
-                        for b in (cell_box(level.mesh, c) for c in cell_indices(level.mesh))]
-                @test fold.cells[level.id] == [m === :fictitious ? 0x01 : 0x02 for m in memo]
-            end
-            for b in probes
-                @test Unfitted._fictitious(fold, b) == (classify_cell(physical, b) === :fictitious)
-                @test Unfitted._material_at_centre(fold, b) ==
-                      Unfitted._inside(physical.geometry, center(b))
-            end
+        # The void query first, on a fresh oracle, so it takes every miss; then it and
+        # the inactive-and-void query again, all hits.
+        fold = Unfitted._Fold(V, cache)
+        @test fold isa Unfitted._Fold{2,Float64,typeof(V.physical)}
+        @test !any(id -> isassigned(fold.cells, id), eachindex(fold.cells))
+        for pass in 1:2, level in V.levels
+            cells = cell_indices(level.mesh)
+            @test [Unfitted._is_void(fold, level, c) for c in cells] == expected[level.id]
+            @test [Unfitted._is_fictitious(fold, level, c) for c in cells] ==
+                  inactive(level) .& expected[level.id]
+        end
+        # Every verdict the tables hold is the one the box memo holds for that box.
+        for level in V.levels
+            memo = [cache[(b.lower, b.upper)]
+                    for b in (cell_box(level.mesh, c) for c in cell_indices(level.mesh))]
+            @test fold.cells[level.id] == [m === :fictitious ? 0x01 : 0x02 for m in memo]
+        end
+        for b in probes
+            @test Unfitted._fictitious(fold, b) == (classify_cell(physical, b) === :fictitious)
         end
     end
 
@@ -360,9 +353,9 @@ end
         _oracle_query_bytes(fold, level, probes[1])                 # compile once
         @test _oracle_query_bytes(fold, level, probes[1]) == 0
     end
-    @test all(b -> !Unfitted._fictitious(fold, b) && Unfitted._material_at_centre(fold, b), probes)
+    @test !any(b -> Unfitted._fictitious(fold, b), probes)
     Unfitted.build_coverage(V, GeometryTolerance(Float64), fold)
-    @test isempty(fold.cells) && isempty(fold.boxes)
+    @test !any(id -> isassigned(fold.cells, id), eachindex(fold.cells)) && isempty(fold.boxes)
 end
 
 @testset "the coverage memo answers what a fresh coverage test does" begin
