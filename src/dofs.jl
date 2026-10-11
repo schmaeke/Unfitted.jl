@@ -642,7 +642,7 @@ function _level_side_is_physical(level::Level{D,T}, domain::AxisBox{D,T}, axis::
     throw(ArgumentError("boundary side must be :lower or :upper"))
 end
 
-# ── The artificial-boundary and pruning hooks ─────────────────────────────────
+# ── The artificial-boundary hook ──────────────────────────────────────────────
 
 """
     _overlay_constraints!(ledger::EliminationLedger, level::Level, ctx::_LevelContext) -> ledger
