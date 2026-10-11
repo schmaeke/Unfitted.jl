@@ -881,44 +881,6 @@ end
 
 # ── Space construction ────────────────────────────────────────────────────────
 
-# A brand-new `Level` from a user-facing specification: the normalise → check →
-# instantiate → derive pipeline `space`, `overlay` and `_reordered_space` each
-# used to spell out. `field` is the already-normalised order (a tuple or a
-# per-cell vector) and `mask` the already-normalised activation, because
-# `_reordered_space` reuses the level's stored mask and `_normalize_mask` would
-# copy it for nothing.
-#
-# The step order matters and is not free to rearrange: `instantiate_basis` must
-# run before `_build_cell_orders`, because a deferred family (the B-spline spec)
-# is not a family yet and `_supports_cell_order` has to be asked of the concrete
-# one.
-function _new_level(id::Int, role::Symbol, mesh::CartesianMesh{D,T}, basis, field, mode::Symbol,
-                    mask) where {D,T}
-    family = instantiate_basis(basis, mesh, _nominal_order(field), mode)
-    orders = _build_cell_orders(family, field, mesh, mode)
-    return Level{D,T,typeof(family)}(id, role, mesh, family, orders, mode, mask)
-end
-
-# A copy of an existing `Level` with one thing changed, by keyword. Every rebuild
-# in this file is one of these: a move changes the mesh, `activate!` the mask,
-# `_apply_physical_fold` the mask, coupling the id.
-#
-# The family is re-instantiated unconditionally. That is behaviour-preserving
-# rather than merely convenient: `instantiate_basis` consumes the mesh, the
-# nominal order and the mode, the first two of which are the only ones a
-# family's concrete form can depend on — integrated Legendre returns itself, and
-# the B-spline hook rebuilds knot vectors from the mesh axes and the degree — so
-# a rebuild that keeps the mesh and the order, such as a mask update,
-# re-instantiates an equal family (for B-splines the same knot vectors,
-# rebuilt). Before this helper the sites disagreed about it — `moved_space` and
-# the mask rebuilds re-instantiated while the fold and the reindex did not — and
-# the disagreement was invisible because the answers coincide.
-function _level(old::Level{D,T}; id=old.id, mesh=old.mesh, orders=old.orders,
-                mask=old.mask) where {D,T}
-    family = instantiate_basis(old.basis, mesh, orders.nominal, old.mode)
-    return Level{D,T,typeof(family)}(id, old.role, mesh, family, orders, old.mode, mask)
-end
-
 """
     space(domain::AxisBox; cells, order=1, basis=IntegratedLegendre(),
                           mode=:tensor, active=nothing, physical=nothing) -> Space
@@ -1088,6 +1050,24 @@ function overlay(V::Space{D,T}, domain::AxisBox{D,T}; cells, order=nominal_order
     return _with_levels(V, (V.levels..., level))
 end
 
+# A brand-new `Level` from a user-facing specification: the normalise → check →
+# instantiate → derive pipeline `space`, `overlay` and `_reordered_space` each
+# used to spell out. `field` is the already-normalised order (a tuple or a
+# per-cell vector) and `mask` the already-normalised activation, because
+# `_reordered_space` reuses the level's stored mask and `_normalize_mask` would
+# copy it for nothing.
+#
+# The step order matters and is not free to rearrange: `instantiate_basis` must
+# run before `_build_cell_orders`, because a deferred family (the B-spline spec)
+# is not a family yet and `_supports_cell_order` has to be asked of the concrete
+# one.
+function _new_level(id::Int, role::Symbol, mesh::CartesianMesh{D,T}, basis, field, mode::Symbol,
+                    mask) where {D,T}
+    family = instantiate_basis(basis, mesh, _nominal_order(field), mode)
+    orders = _build_cell_orders(family, field, mesh, mode)
+    return Level{D,T,typeof(family)}(id, role, mesh, family, orders, mode, mask)
+end
+
 """
     moved_space(V::Space; level, to, tolerance=GeometryTolerance(T)) -> Space
 
@@ -1122,6 +1102,26 @@ end
 function _remasked_space(V::Space, level_index::Integer, mask)
     k = _check_level(V, level_index)
     return _with_level(V, k, _level(V.levels[k]; mask=mask))
+end
+
+# A copy of an existing `Level` with one thing changed, by keyword. Every rebuild
+# in this file is one of these: a move changes the mesh, `activate!` the mask,
+# `_apply_physical_fold` the mask, coupling the id.
+#
+# The family is re-instantiated unconditionally. That is behaviour-preserving
+# rather than merely convenient: `instantiate_basis` consumes the mesh, the
+# nominal order and the mode, the first two of which are the only ones a
+# family's concrete form can depend on — integrated Legendre returns itself, and
+# the B-spline hook rebuilds knot vectors from the mesh axes and the degree — so
+# a rebuild that keeps the mesh and the order, such as a mask update,
+# re-instantiates an equal family (for B-splines the same knot vectors,
+# rebuilt). Before this helper the sites disagreed about it — `moved_space` and
+# the mask rebuilds re-instantiated while the fold and the reindex did not — and
+# the disagreement was invisible because the answers coincide.
+function _level(old::Level{D,T}; id=old.id, mesh=old.mesh, orders=old.orders,
+                mask=old.mask) where {D,T}
+    family = instantiate_basis(old.basis, mesh, orders.nominal, old.mode)
+    return Level{D,T,typeof(family)}(id, old.role, mesh, family, orders, old.mode, mask)
 end
 
 # ── Reading a level ───────────────────────────────────────────────────────────
@@ -1499,6 +1499,37 @@ end
 
 # ── Fictitious-cell fold ──────────────────────────────────────────────────────
 
+# Apply the PhysicalDomain fold to `V`. For each level, classifies cells
+# against `V.physical` and merges the resulting fictitious mask into the
+# level's user mask, so cells fully outside Ω are dropped from the dof layout.
+# This happens *regardless of α* — the α-FCM stabilization enriches cut-cell
+# quadrature (in `intersections.jl`), it does not keep whole fictitious cells
+# around. Returns `V` unchanged only when there is no physical domain, or when
+# `keep_fictitious` opts into the classic α-FCM treatment (fully-fictitious
+# cells kept active with α-scaled quadrature). The `_ClassifyCache` carries the
+# per-box classification verdicts so the region-level dispatcher in
+# `intersections.jl` can reuse them.
+#
+# Contract: `V` must be a *pre-fold* space — one whose level masks still mean
+# "what the caller asked for". The fold is an intersection
+# (`active .& .!fictitious`) and is not invertible, so applying it to its own
+# output can only remove cells: a cell dropped as fictitious at one overlay
+# position stays dropped after the overlay moves somewhere it would be inside
+# Ω. Callers that fold repeatedly over a model's lifetime must therefore keep
+# the pre-fold space and re-derive from it — see `Model.prefold_space` and
+# `_remodel!` in `model.jl`.
+function _apply_physical_fold(V::Space{D,T}, cache::_ClassifyCache{D,T}) where {D,T}
+    V.physical === nothing && return V
+    V.physical.keep_fictitious && return V
+
+    new_levels = ntuple(length(V.levels)) do i
+        level = V.levels[i]
+        mask = _folded_mask(level, V.physical, cache)
+        mask === nothing ? level : _level(level; mask)
+    end
+    return _with_levels(V, new_levels)
+end
+
 # The fold of one level: its user mask with every cell the classifier reports as
 # fully outside Ω (`:fictitious`) switched off as well, or `nothing` when the
 # classifier reports none. A cell is deactivated when *either* source asks for it:
@@ -1552,37 +1583,6 @@ function _folded_mask(level::Level{D,T}, physical::PhysicalDomain,
         folded = true
     end
     return folded ? LevelMask{D}(on) : nothing
-end
-
-# Apply the PhysicalDomain fold to `V`. For each level, classifies cells
-# against `V.physical` and merges the resulting fictitious mask into the
-# level's user mask, so cells fully outside Ω are dropped from the dof layout.
-# This happens *regardless of α* — the α-FCM stabilization enriches cut-cell
-# quadrature (in `intersections.jl`), it does not keep whole fictitious cells
-# around. Returns `V` unchanged only when there is no physical domain, or when
-# `keep_fictitious` opts into the classic α-FCM treatment (fully-fictitious
-# cells kept active with α-scaled quadrature). The `_ClassifyCache` carries the
-# per-box classification verdicts so the region-level dispatcher in
-# `intersections.jl` can reuse them.
-#
-# Contract: `V` must be a *pre-fold* space — one whose level masks still mean
-# "what the caller asked for". The fold is an intersection
-# (`active .& .!fictitious`) and is not invertible, so applying it to its own
-# output can only remove cells: a cell dropped as fictitious at one overlay
-# position stays dropped after the overlay moves somewhere it would be inside
-# Ω. Callers that fold repeatedly over a model's lifetime must therefore keep
-# the pre-fold space and re-derive from it — see `Model.prefold_space` and
-# `_remodel!` in `model.jl`.
-function _apply_physical_fold(V::Space{D,T}, cache::_ClassifyCache{D,T}) where {D,T}
-    V.physical === nothing && return V
-    V.physical.keep_fictitious && return V
-
-    new_levels = ntuple(length(V.levels)) do i
-        level = V.levels[i]
-        mask = _folded_mask(level, V.physical, cache)
-        mask === nothing ? level : _level(level; mask)
-    end
-    return _with_levels(V, new_levels)
 end
 
 # ── Level-id reindexing ───────────────────────────────────────────────────────
