@@ -142,8 +142,8 @@ end
 # `:full` regions then alias the cached `points`/`weights` arrays directly
 # in their `RegionQuadrature`, so they cost only the assembly-loop
 # iteration time — no allocation per region.
-function _cached_tensor_quadrature!(cache::Dict{NTuple{D,Int},TensorQuadrature{D,T}},
-                                    counts::NTuple{D,Int}, ::Type{T}) where {D,T}
+function _cached_tensor_quadrature!(cache::Dict{NTuple{D,Int},TensorQuadrature{D,T}}, counts::NTuple{D,Int},
+                                    ::Type{T}) where {D,T}
     return get!(cache, counts) do
         _tensor_gauss_rule(counts, T)
     end
@@ -153,8 +153,8 @@ end
 # per-axis quadrature counts. The PhysicalDomain (and so `alpha`) is
 # constant for the duration of one `integration_plan` call, so `alpha`
 # need not be part of the cache key.
-function _cached_alpha_weights!(cache::Dict{NTuple{D,Int},Vector{T}}, counts::NTuple{D,Int},
-                                base_weights::Vector{T}, alpha::T) where {D,T}
+function _cached_alpha_weights!(cache::Dict{NTuple{D,Int},Vector{T}}, counts::NTuple{D,Int}, base_weights::Vector{T},
+                                alpha::T) where {D,T}
     return get!(cache, counts) do
         base_weights .* alpha
     end
@@ -242,8 +242,7 @@ const _MomentFitCache{D,T} = Dict{_MomentFitKey{D,T},_MomentFitValue{D,T}}
 # `cut_quadrature`) followed by the reference-frame mapping described above.
 # Split out of `_cached_moment_fit!` so `_prefit_cut_rules!` can run the very
 # same conversion from another thread, with no `Dict` in reach.
-function _fit_moment_rule(physical::PhysicalDomain, box::AxisBox{D,T},
-                          moment_order::NTuple{D,Int}) where {D,T}
+function _fit_moment_rule(physical::PhysicalDomain, box::AxisBox{D,T}, moment_order::NTuple{D,Int}) where {D,T}
     rule = physical.cut_quadrature
     phys_pts, phys_ws, residual, status = rule === nothing ?
                                           moment_fit_rule(physical, box, moment_order;
@@ -255,10 +254,9 @@ function _fit_moment_rule(physical::PhysicalDomain, box::AxisBox{D,T},
     return (ref_pts, ref_ws, T(residual), status)
 end
 
-function _cached_moment_fit!(cache::_MomentFitCache{D,T}, physical::PhysicalDomain,
-                             box::AxisBox{D,T}, moment_order::NTuple{D,Int}) where {D,T}
-    return get!(() -> _fit_moment_rule(physical, box, moment_order), cache,
-                (box.lower, box.upper, moment_order))
+function _cached_moment_fit!(cache::_MomentFitCache{D,T}, physical::PhysicalDomain, box::AxisBox{D,T},
+                             moment_order::NTuple{D,Int}) where {D,T}
+    return get!(() -> _fit_moment_rule(physical, box, moment_order), cache, (box.lower, box.upper, moment_order))
 end
 
 # Build the region quadrature for one admissible box, dispatching on the
@@ -288,8 +286,7 @@ end
 # re-walking the octree.
 function _build_region_quadrature(V::Space{D,T}, box::AxisBox{D,T}, parents,
                                   tensor_cache::Dict{NTuple{D,Int},TensorQuadrature{D,T}},
-                                  alpha_cache::Dict{NTuple{D,Int},Vector{T}},
-                                  moment_fit_cache::_MomentFitCache{D,T},
+                                  alpha_cache::Dict{NTuple{D,Int},Vector{T}}, moment_fit_cache::_MomentFitCache{D,T},
                                   classify_cache::_ClassifyCache{D,T}) where {D,T}
     counts = _parent_quadrature_counts(Val(D), parents, id -> _level_by_id(V, id))
     base_rule = _cached_tensor_quadrature!(tensor_cache, counts, T)
@@ -308,8 +305,7 @@ function _build_region_quadrature(V::Space{D,T}, box::AxisBox{D,T}, parents,
         return RegionQuadrature{D,T}(:fictitious_alpha, base_rule.points, scaled), zero(T)
     else  # `:cut` — moment-fit pipeline from `src/fcm.jl`.
         moment_order = _moment_order_for_region(V, parents)
-        ref_pts, ref_ws, residual, status = _cached_moment_fit!(moment_fit_cache, physical, box,
-                                                                moment_order)
+        ref_pts, ref_ws, residual, status = _cached_moment_fit!(moment_fit_cache, physical, box, moment_order)
         # A `:fallback` rule is the Saye volume rule itself, so it is a valid
         # non-negative physical rule and is consumed exactly like a fit — only
         # with 50–200× the points. The distinct kind is what makes that cost
@@ -320,11 +316,9 @@ function _build_region_quadrature(V::Space{D,T}, box::AxisBox{D,T}, parents,
         # diagnostic vocabulary stays closed rather than growing one kind per
         # user rule. `:empty` is the one status a custom rule shares with the
         # fit, and it still routes to `:cut_failed` / `:cut_alpha_failed` below.
-        kind = physical.cut_quadrature !== nothing ? :cut_custom :
-               status === :fallback ? :cut_fallback : :cut_fitted
+        kind = physical.cut_quadrature !== nothing ? :cut_custom : status === :fallback ? :cut_fallback : :cut_fitted
         if iszero(physical.alpha)
-            status === :empty &&
-                return RegionQuadrature{D,T}(:cut_failed, SVector{D,T}[], T[]), residual
+            status === :empty && return RegionQuadrature{D,T}(:cut_failed, SVector{D,T}[], T[]), residual
             return RegionQuadrature{D,T}(kind, ref_pts, ref_ws), residual
         end
 
@@ -344,8 +338,7 @@ function _build_region_quadrature(V::Space{D,T}, box::AxisBox{D,T}, parents,
         # cell's dofs are α-stabilised rather than left singular.
         alpha_weights = base_rule.weights .* physical.alpha
         if status === :empty
-            return RegionQuadrature{D,T}(:cut_alpha_failed, base_rule.points, alpha_weights),
-                   residual
+            return RegionQuadrature{D,T}(:cut_alpha_failed, base_rule.points, alpha_weights), residual
         end
         points = vcat(ref_pts, base_rule.points)
         weights = vcat(ref_ws .* (one(T) - physical.alpha), alpha_weights)
@@ -445,8 +438,7 @@ end
 # integration-region partition (`_axis_intervals`), the physical-facet partition
 # (`_boundary_facet_regions` in dirichlet.jl) and the surface grid lines
 # (`_grid_lines_for_levels` in surface.jl).
-function _merged_axis_coordinates(levels, ::Val{D}, tol::GeometryTolerance{T},
-                                  cells=_all_level_cells) where {D,T}
+function _merged_axis_coordinates(levels, ::Val{D}, tol::GeometryTolerance{T}, cells=_all_level_cells) where {D,T}
     per_level = map(level -> _live_axis_coordinates(level, Val(D), cells(level)), levels)
     return ntuple(D) do d
         merged = T[]
@@ -477,8 +469,7 @@ end
 # `Vector{Int}` so the equality comparison in `_merged_boxes` stays on
 # the stack. The previous `Vector{Int}` allocation per candidate box was
 # the largest single allocation source in `integration_plan`.
-function _coverage_signature(levels::Tuple, linmaps::Tuple, point::SVector{D,T},
-                             tol::GeometryTolerance{T}) where {D,T}
+function _coverage_signature(levels::Tuple, linmaps::Tuple, point::SVector{D,T}, tol::GeometryTolerance{T}) where {D,T}
     return map(levels, linmaps) do level, linmap
         cell = locate_cell(level.mesh, point; tol)
         cell === nothing || !is_active(level.mask, cell) ? 0 : linmap[cell]
@@ -539,15 +530,14 @@ end
 # Does the candidate slab one step past `hi` along axis `d` join the box
 # seeded at `start`? It does when every candidate in the slab is unvisited
 # and carries the seed signature `sig0`.
-function _slab_matches(sigs, visited, start::NTuple{D,Int}, hi::NTuple{D,Int}, sig0, d::Int,
-                       next::Int) where {D}
+function _slab_matches(sigs, visited, start::NTuple{D,Int}, hi::NTuple{D,Int}, sig0, d::Int, next::Int) where {D}
     slab = CartesianIndices(ntuple(e -> e == d ? (next:next) : (start[e]:hi[e]), D))
     return all(c -> !visited[c] && sigs[c] == sig0, slab)
 end
 
 # Extend `hi` along axis `d` for as long as successive slabs keep matching.
-function _extend_axis(sigs, visited, ranges::NTuple{D,Int}, start::NTuple{D,Int}, hi::NTuple{D,Int},
-                      sig0, d::Int) where {D}
+function _extend_axis(sigs, visited, ranges::NTuple{D,Int}, start::NTuple{D,Int}, hi::NTuple{D,Int}, sig0,
+                      d::Int) where {D}
     while hi[d] < ranges[d]
         next = hi[d] + 1
         _slab_matches(sigs, visited, start, hi, sig0, d, next) || break
@@ -580,8 +570,7 @@ function _merged_boxes(levels, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
     # greedy merge loop, where signature equality is the hot inner check.
     linmaps = map(level -> LinearIndices(level.mesh.cells), levels)
     sigs = map(CartesianIndices(ranges)) do index
-        mid = SVector{D,T}(ntuple(d -> (intervals[d][index.I[d]][1] + intervals[d][index.I[d]][2]) /
-                                       2, D))
+        mid = SVector{D,T}(ntuple(d -> (intervals[d][index.I[d]][1] + intervals[d][index.I[d]][2]) / 2, D))
         _coverage_signature(levels, linmaps, mid, tol)
     end
 
@@ -866,8 +855,7 @@ admissible-box partition (`_merged_boxes`, `_parents_covering`) directly and
 keeps every box the target covers, without a `criterion`.
 """
 function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criterion=:any_parent,
-                          classify_cache=_ClassifyCache{D,T}(),
-                          moment_fit_cache=_MomentFitCache{D,T}()) where {D,T}
+                          classify_cache=_ClassifyCache{D,T}(), moment_fit_cache=_MomentFitCache{D,T}()) where {D,T}
     # Reject a merge tolerance that cannot resolve the meshes it is about to
     # canonicalise, before a single region is built. See `_check_axis_spacing`.
     _check_axis_spacing(V.levels, Val(D), tolerance)
@@ -887,16 +875,15 @@ function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criteri
     admissible = Tuple{AxisBox{D,T},Vector{ParentRef{D,T}}}[]
     for box in _merged_boxes(V.levels, Val(D), tolerance)
         parents = _parents_covering(V.levels, box, tolerance)
-        _criterion_satisfied(parents, length(V.levels), criterion) &&
-            push!(admissible, (box, parents))
+        _criterion_satisfied(parents, length(V.levels), criterion) && push!(admissible, (box, parents))
     end
     _prefit_cut_rules!(moment_fit_cache, V, admissible, classify_cache)
 
     for (box, parents) in admissible
         # Dispatch on PhysicalDomain classification; a `nothing`
         # quadrature signals a strict-α fictitious drop.
-        quadrature, residual = _build_region_quadrature(V, box, parents, tensor_cache, alpha_cache,
-                                                        moment_fit_cache, classify_cache)
+        quadrature, residual = _build_region_quadrature(V, box, parents, tensor_cache, alpha_cache, moment_fit_cache,
+                                                        classify_cache)
         quadrature === nothing && continue
         residual > residual_max && (residual_max = Float64(residual))
 
@@ -907,13 +894,12 @@ function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criteri
         push!(regions, VolumeRegion{D,T}(box, parents, quadrature))
         if region_volume <= tolerance.small_volume
             relative_volume = iszero(domain_volume) ? zero(T) : region_volume / domain_volume
-            push!(small_overlaps,
-                  SmallOverlap{T}(length(regions), region_volume, relative_volume, length(parents)))
+            push!(small_overlaps, SmallOverlap{T}(length(regions), region_volume, relative_volume, length(parents)))
         end
     end
 
     min_volume = isempty(regions) ? zero(T) : minimum(volume(region.box) for region in regions)
     min_relative_volume = iszero(domain_volume) ? zero(T) : min_volume / domain_volume
-    return IntegrationPlan{D,T}(regions, tolerance, length(small_overlaps), small_overlaps,
-                                min_volume, min_relative_volume, residual_max)
+    return IntegrationPlan{D,T}(regions, tolerance, length(small_overlaps), small_overlaps, min_volume,
+                                min_relative_volume, residual_max)
 end

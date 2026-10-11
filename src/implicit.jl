@@ -76,9 +76,7 @@ end
 end
 
 # Project a box onto the base obtained by removing the height axis `k`.
-function _remove_axis(b::AxisBox{M,T}, k::Int) where {M,T}
-    return AxisBox{M - 1,T}(_remove_axis(b.lower, k), _remove_axis(b.upper, k))
-end
+_remove_axis(b::AxisBox{M,T}, k::Int) where {M,T} = AxisBox{M - 1,T}(_remove_axis(b.lower, k), _remove_axis(b.upper, k))
 
 # ── Kernel context and gradient ────────────────────────────────────────────────
 
@@ -204,9 +202,7 @@ end
 # so a Lipschitz constant of `f` bounds the restriction just as tightly and is
 # carried through unchanged.
 _restrict(g, k::Int, v) = x -> g(_insert_axis(x, k, v))
-function _restrict(g::_LipschitzLeaf, k::Int, v)
-    return _LipschitzLeaf(x -> g.f(_insert_axis(x, k, v)), g.lipschitz)
-end
+_restrict(g::_LipschitzLeaf, k::Int, v) = _LipschitzLeaf(x -> g.f(_insert_axis(x, k, v)), g.lipschitz)
 
 # Pick a height axis and report whether it is certifiably graph-like. For each
 # axis k, every leaf is classified by sampling ∂g/∂x_k at the box center and
@@ -321,8 +317,8 @@ end
 # Place 1D Gauss rules on the parts of one fiber that lie in Ω and append the
 # lifted points/weights (scaled by the base weight `wbase`). `embed(t)` lifts a
 # fiber coordinate to the full D-dimensional point; `membership` is the Ω test.
-function _emit_fiber!(pts::Vector{SVector{D,T}}, wts::Vector{T}, lsets, embed, lo::T, hi::T,
-                      wbase::T, membership, ctx::_QuadCtx) where {D,T}
+function _emit_fiber!(pts::Vector{SVector{D,T}}, wts::Vector{T}, lsets, embed, lo::T, hi::T, wbase::T, membership,
+                      ctx::_QuadCtx) where {D,T}
     breaks = _fiber_breaks(lsets, embed, lo, hi, ctx)
     nodes, gw = ctx.nodes, ctx.weights
     for i in 1:(length(breaks)-1)
@@ -411,15 +407,13 @@ function _implicit_quad(lsets, membership, U::AxisBox{D,T}, ctx::_QuadCtx, depth
     if D == 1
         pts = SVector{1,T}[]
         wts = T[]
-        _emit_fiber!(pts, wts, active, t -> SVector{1,T}(t), U.lower[1], U.upper[1], one(T),
-                     membership, ctx)
+        _emit_fiber!(pts, wts, active, t -> SVector{1,T}(t), U.lower[1], U.upper[1], one(T), membership, ctx)
         return pts, wts
     end
 
     k, usable = _choose_axis(active, U, ctx)
     if !usable && depth < ctx.max_subdiv
-        return _subdivide_and_collect((box, d) -> _implicit_quad(active, membership, box, ctx, d),
-                                      U, depth)
+        return _subdivide_and_collect((box, d) -> _implicit_quad(active, membership, box, ctx, d), U, depth)
     end
 
     # Reduce one dimension: partition-only base, then a fiber rule per base node.
@@ -436,8 +430,7 @@ function _implicit_quad(lsets, membership, U::AxisBox{D,T}, ctx::_QuadCtx, depth
     wts = T[]
     for n in eachindex(bpts)
         xb, wb = bpts[n], bwts[n]
-        _emit_fiber!(pts, wts, active, t -> _insert_axis(xb, k, t), facelo, facehi, wb, membership,
-                     ctx)
+        _emit_fiber!(pts, wts, active, t -> _insert_axis(xb, k, t), facelo, facehi, wb, membership, ctx)
     end
     return pts, wts
 end
@@ -522,16 +515,14 @@ scan resolution is unaffected. The certificate is the *only* thing that makes th
 kernel safe on a `region` coarser than the geometry, at the cost of keeping more
 leaves active per box.
 """
-function implicit_volume_quadrature(leaves::AbstractVector, membership, region::AxisBox{D,T};
-                                    gauss_points::Int, grad=nothing, max_subdiv::Int=4,
-                                    lipschitz=nothing) where {D,T}
+function implicit_volume_quadrature(leaves::AbstractVector, membership, region::AxisBox{D,T}; gauss_points::Int,
+                                    grad=nothing, max_subdiv::Int=4, lipschitz=nothing) where {D,T}
     ctx = _quad_ctx(T, gauss_points, grad, max_subdiv, maximum(region.upper - region.lower))
     return _implicit_quad(_certified_leaves(leaves, lipschitz), membership, region, ctx, 0)
 end
 
-function implicit_volume_quadrature(phi, region::AxisBox{D,T}; gauss_points::Int, grad=nothing,
-                                    max_subdiv::Int=4, lipschitz=nothing) where {D,T}
-    return implicit_volume_quadrature(Any[phi], x -> phi(x) <= 0, region; gauss_points, grad,
-                                      max_subdiv,
+function implicit_volume_quadrature(phi, region::AxisBox{D,T}; gauss_points::Int, grad=nothing, max_subdiv::Int=4,
+                                    lipschitz=nothing) where {D,T}
+    return implicit_volume_quadrature(Any[phi], x -> phi(x) <= 0, region; gauss_points, grad, max_subdiv,
                                       lipschitz=lipschitz === nothing ? nothing : Any[lipschitz])
 end

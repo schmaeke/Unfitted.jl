@@ -309,41 +309,33 @@ end
 # integration plan carries them in the model's scalar type `T`; widening
 # to `Float64` here keeps `AssemblyDiagnostics` `T`-agnostic.
 function _float_small_overlaps(records)
-    return [SmallOverlap{Float64}(record.region, Float64(record.volume),
-                                  Float64(record.relative_volume), record.cover_count)
-            for record in records]
+    return [SmallOverlap{Float64}(record.region, Float64(record.volume), Float64(record.relative_volume),
+                                  record.cover_count) for record in records]
 end
 
-function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regions=0,
-                             small_overlap_count=0, min_integration_volume=NaN,
-                             min_relative_integration_volume=NaN, symmetry_residual=NaN,
+function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regions=0, small_overlap_count=0,
+                             min_integration_volume=NaN, min_relative_integration_volume=NaN, symmetry_residual=NaN,
                              condition_estimate=NaN, scaled_condition_estimate=NaN, solver=:none,
                              small_overlaps=SmallOverlap{Float64}[], inactive_cell_counts=Int[],
                              reduced_mode_counts=Int[], cut_region_count=0, fit_failure_count=0,
-                             moment_fit_residual_max=0.0, cut_fallback_count=0,
-                             cut_fallback_points=0, facet_region_count=0, cut_facet_region_count=0,
-                             facet_fit_failure_count=0, facet_cut_fallback_count=0,
-                             facet_moment_fit_residual_max=0.0, min_relative_facet_measure=1.0,
-                             dirichlet_trace_factors=Symbol[],
-                             unsupported_dirichlet_dofs=UnsupportedDirichletDof[],
-                             surface_region_count=0, interface_region_count=0)
-    return AssemblyDiagnostics(Int(dimension), Int(active_unknowns), Int(integration_regions),
-                               Int(small_overlap_count), _float_small_overlaps(small_overlaps),
-                               Float64(min_integration_volume),
+                             moment_fit_residual_max=0.0, cut_fallback_count=0, cut_fallback_points=0,
+                             facet_region_count=0, cut_facet_region_count=0, facet_fit_failure_count=0,
+                             facet_cut_fallback_count=0, facet_moment_fit_residual_max=0.0,
+                             min_relative_facet_measure=1.0, dirichlet_trace_factors=Symbol[],
+                             unsupported_dirichlet_dofs=UnsupportedDirichletDof[], surface_region_count=0,
+                             interface_region_count=0)
+    return AssemblyDiagnostics(Int(dimension), Int(active_unknowns), Int(integration_regions), Int(small_overlap_count),
+                               _float_small_overlaps(small_overlaps), Float64(min_integration_volume),
                                Float64(min_relative_integration_volume), Float64(symmetry_residual),
-                               Float64(condition_estimate), Float64(scaled_condition_estimate),
-                               Symbol(solver), Int[inactive_cell_counts...],
-                               Int[reduced_mode_counts...], Int(cut_region_count),
-                               Int(fit_failure_count), Float64(moment_fit_residual_max),
-                               Int(cut_fallback_count), Int(cut_fallback_points),
-                               Int(facet_region_count), Int(cut_facet_region_count),
+                               Float64(condition_estimate), Float64(scaled_condition_estimate), Symbol(solver),
+                               Int[inactive_cell_counts...], Int[reduced_mode_counts...], Int(cut_region_count),
+                               Int(fit_failure_count), Float64(moment_fit_residual_max), Int(cut_fallback_count),
+                               Int(cut_fallback_points), Int(facet_region_count), Int(cut_facet_region_count),
                                Int(facet_fit_failure_count), Int(facet_cut_fallback_count),
-                               Float64(facet_moment_fit_residual_max),
-                               Float64(min_relative_facet_measure),
-                               Symbol[dirichlet_trace_factors...],
-                               length(unsupported_dirichlet_dofs),
-                               UnsupportedDirichletDof[unsupported_dirichlet_dofs...],
-                               Int(surface_region_count), Int(interface_region_count))
+                               Float64(facet_moment_fit_residual_max), Float64(min_relative_facet_measure),
+                               Symbol[dirichlet_trace_factors...], length(unsupported_dirichlet_dofs),
+                               UnsupportedDirichletDof[unsupported_dirichlet_dofs...], Int(surface_region_count),
+                               Int(interface_region_count))
 end
 
 # Per-level count of cells deactivated by a `LevelMask` (mask and
@@ -352,8 +344,7 @@ end
 # run. One entry per level, `0` for an unmasked level. Reported by
 # `diagnostics` so the user can see how many cells each level dropped.
 function _inactive_cell_counts(spaces)
-    return Int[level.mask === nothing ? 0 : count(!, level.mask.on) for V in spaces
-               for level in V.levels]
+    return Int[level.mask === nothing ? 0 : count(!, level.mask.on) for V in spaces for level in V.levels]
 end
 
 # Per-level count of raws eliminated by covered-mode pruning (`:coverage` or
@@ -367,9 +358,8 @@ end
 # Each level's raws are one range of the layout (`level_raws`), so a level is
 # counted from its own elimination sources without a pass over every raw.
 function _reduced_mode_counts(layout::SystemLayout)
-    return Int[count(s -> s === :coverage || s === :dedup,
-                     view(f.dofs.elimination_source, f.dofs.level_raws[id])) for f in layout.fields
-               for id in f.level_ids]
+    return Int[count(s -> s === :coverage || s === :dedup, view(f.dofs.elimination_source, f.dofs.level_raws[id]))
+               for f in layout.fields for id in f.level_ids]
 end
 
 # Scan the integration plan for NNMF-fit statistics, returning
@@ -461,13 +451,12 @@ end
 # else: the dof layout keeps no copy of them, and `prepare` drops each projection
 # it builds as soon as this has read it, so the model it returns holds none.
 # `update_dirichlet!` reads the ones it caches the same way.
-function _append_trace_stats!(factors::Vector{Symbol}, unsupported::Vector{UnsupportedDirichletDof},
-                              name::Symbol, projection, components::Integer)
+function _append_trace_stats!(factors::Vector{Symbol}, unsupported::Vector{UnsupportedDirichletDof}, name::Symbol,
+                              projection, components::Integer)
     for c in 1:components
         push!(factors, projection === nothing ? :none : _trace_branch(projection.factors[c]))
         projection === nothing && continue
-        append!(unsupported,
-                (UnsupportedDirichletDof(name, c, raw) for raw in projection.unsupported[c]))
+        append!(unsupported, (UnsupportedDirichletDof(name, c, raw) for raw in projection.unsupported[c]))
     end
     return factors, unsupported
 end
@@ -494,9 +483,9 @@ function _set_dirichlet_trace_stats!(diag::AssemblyDiagnostics, factors::Vector{
 end
 
 function Base.show(io::IO, diagnostics::AssemblyDiagnostics)
-    print(io, "AssemblyDiagnostics(D=", diagnostics.dimension, ", active=",
-          diagnostics.active_unknowns, ", regions=", diagnostics.integration_regions, ", small=",
-          diagnostics.small_overlap_count, ", solver=:", diagnostics.solver, ")")
+    print(io, "AssemblyDiagnostics(D=", diagnostics.dimension, ", active=", diagnostics.active_unknowns, ", regions=",
+          diagnostics.integration_regions, ", small=", diagnostics.small_overlap_count, ", solver=:",
+          diagnostics.solver, ")")
 end
 
 # ── Single-sided region-cache keys ────────────────────────────────────────────
@@ -612,8 +601,7 @@ mutable struct AssemblyCache{T}
     const workspaces::Vector{Any}
 end
 function AssemblyCache{T}() where {T}
-    return AssemblyCache{T}(ReentrantLock(), Pair{RegionKey,RegionList}[],
-                            Pair{RegionKey,RegionList}[],
+    return AssemblyCache{T}(ReentrantLock(), Pair{RegionKey,RegionList}[], Pair{RegionKey,RegionList}[],
                             Pair{Tuple{Vector{RegionList},Bool},AssemblyPattern}[], T[], Any[])
 end
 
@@ -837,9 +825,7 @@ through [`move!`](@ref), [`activate!`](@ref) and every derivation.
 The remaining keyword arguments are forwarded to `integration_plan`; see its
 docstring for the full list.
 """
-function prepare(problem::Problem{D,T}; kwargs...) where {D,T}
-    _prepared_model(problem, (; kwargs...), nothing)
-end
+prepare(problem::Problem{D,T}; kwargs...) where {D,T} = _prepared_model(problem, (; kwargs...), nothing)
 
 # The body of [`prepare`](@ref), with the moment-fit caches optionally supplied.
 #
@@ -898,10 +884,8 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                                 "got $(length(reuse)) for $(length(spaces))"))
         reuse
     end
-    space_plans = IntegrationPlan{D,T}[integration_plan(spaces[i]; integration_options...,
-                                                        classify_cache=caches[i],
-                                                        moment_fit_cache=fit_caches[i])
-                                       for i in eachindex(spaces)]
+    space_plans = IntegrationPlan{D,T}[integration_plan(spaces[i]; integration_options..., classify_cache=caches[i],
+                                                        moment_fit_cache=fit_caches[i]) for i in eachindex(spaces)]
     # The facet resolver is built before the dof layout, not after the region
     # caches, because the layout's Dirichlet projection resolves faces too: it is
     # the first consumer, and handing it the model's resolver is what makes the
@@ -916,9 +900,8 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
     # layout to reuse: `spaces` and `caches` are aligned (`_prepare_spaces`), and the
     # keys are identities — each field's space is one of these.
     classify_caches = IdDict{Space,_ClassifyCache{D,T}}(zip(spaces, caches))
-    layout, trace_factors, unsupported = _system_layout(effective_problem; tolerance, prune,
-                                                        prune_exempt, classify_caches,
-                                                        facets=facet_resolver)
+    layout, trace_factors, unsupported = _system_layout(effective_problem; tolerance, prune, prune_exempt,
+                                                        classify_caches, facets=facet_resolver)
     facet_regions = _resolve_facet_regions(effective_problem, facet_resolver)
     surface_regions = _resolve_surface_regions(effective_problem, tolerance)
     interface_regions = _resolve_interface_regions(effective_problem, layout)
@@ -926,8 +909,7 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
     diag = AssemblyDiagnostics(dimension=D, active_unknowns=active_unknowns(layout),
                                inactive_cell_counts=_inactive_cell_counts(spaces),
                                reduced_mode_counts=_reduced_mode_counts(layout),
-                               facet_region_count=_region_count(facet_regions),
-                               cut_facet_region_count=facet_stats.cut,
+                               facet_region_count=_region_count(facet_regions), cut_facet_region_count=facet_stats.cut,
                                facet_fit_failure_count=facet_stats.fit_failures,
                                facet_cut_fallback_count=facet_stats.fallbacks,
                                facet_moment_fit_residual_max=facet_stats.residual_max,
@@ -936,13 +918,11 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                                interface_region_count=_region_count(interface_regions))
     _set_plan_stats_multi!(diag, space_plans)
     _set_dirichlet_trace_stats!(diag, trace_factors, unsupported)
-    return Model{D,T,typeof(effective_problem)}(effective_problem, problem.space,
-                                                _discretisation_pin(spaces, layout), space_plans,
-                                                fit_caches, layout, nothing, nothing,
-                                                facet_resolver, facet_regions, surface_regions,
-                                                interface_regions,
-                                                Dict{Symbol,DirichletProjection{D,T}}(), diag,
-                                                AssemblyCache{T}(), plan_options)
+    return Model{D,T,typeof(effective_problem)}(effective_problem, problem.space, _discretisation_pin(spaces, layout),
+                                                space_plans, fit_caches, layout, nothing, nothing, facet_resolver,
+                                                facet_regions, surface_regions, interface_regions,
+                                                Dict{Symbol,DirichletProjection{D,T}}(), diag, AssemblyCache{T}(),
+                                                plan_options)
 end
 
 # Fold each distinct space against its own `PhysicalDomain` and reindex its
@@ -969,10 +949,9 @@ function _prepare_spaces(problem::Problem{D,T}) where {D,T}
         remap[V] = reindexed
         offset += level_count(reindexed)
     end
-    new_fields = map(f -> field(f.name, remap[f.space]; components=component_count(f)),
-                     problem.fields)
-    effective = Problem(new_fields; blocks=problem.blocks, loads=problem.loads,
-                        dirichlet=problem.dirichlet, symmetric=problem.symmetric)
+    new_fields = map(f -> field(f.name, remap[f.space]; components=component_count(f)), problem.fields)
+    effective = Problem(new_fields; blocks=problem.blocks, loads=problem.loads, dirichlet=problem.dirichlet,
+                        symmetric=problem.symmetric)
     return effective, prepared, caches
 end
 
@@ -1065,8 +1044,8 @@ The projection's own verdicts — which branch each component's trace solve
 took, and which dofs it left undetermined — are not kept: they reach a user
 through [`diagnostics`](@ref) on a prepared model.
 """
-function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T),
-                    components::Integer=1, prune::Bool=true, prune_exempt=(),
+function dof_layout(V::Space{D,T}; dirichlet=[], tolerance=GeometryTolerance(T), components::Integer=1,
+                    prune::Bool=true, prune_exempt=(),
                     classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
     components > 0 || throw(ArgumentError("dof layout components must be positive"))
     # A plain loop, not `foreach` with a closure: over the abstractly typed condition
@@ -1157,8 +1136,8 @@ system_layout(problem::Problem; kwargs...) = first(_system_layout(problem; kwarg
 # eliminations to produce equal arrays. The fields share them instead: their
 # layouts hold the same space-block arrays (`===`), which `DofLayout` documents as
 # never mutated, and only detection, numbering and projection run per field.
-function _system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), prune::Bool=true,
-                        prune_exempt=(), classify_caches=IdDict{Space,_ClassifyCache{D,T}}(),
+function _system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), prune::Bool=true, prune_exempt=(),
+                        classify_caches=IdDict{Space,_ClassifyCache{D,T}}(),
                         facets::FacetResolver{D,T}=FacetResolver{D,T}(tolerance)) where {D,T}
     layouts = FieldLayout{D,T}[]
     by_name = Dict{Symbol,Int}()
@@ -1173,14 +1152,12 @@ function _system_layout(problem::Problem{D,T}; tolerance=GeometryTolerance(T), p
             _dof_topology(field.space; tolerance, prune, prune_exempt, classify_cache=cache)
         end
         components = component_count(field)
-        dofs, projection = _field_dofs(t, field.space, _dirichlet_for_field(problem, field.name),
-                                       components, facets)
+        dofs, projection = _field_dofs(t, field.space, _dirichlet_for_field(problem, field.name), components, facets)
         _append_trace_stats!(factors, unsupported, field.name, projection, components)
         # The field's (reindexed, contiguous) level-id block — how assembly
         # routes each region to its owning subdomain field without a `served` mask.
         level_ids = extrema(l.id for l in field.space.levels)
-        push!(layouts,
-              FieldLayout{D,T}(field.name, components, dofs, offset, level_ids[1]:level_ids[2]))
+        push!(layouts, FieldLayout{D,T}(field.name, components, dofs, offset, level_ids[1]:level_ids[2]))
         by_name[field.name] = length(layouts)
         offset += active_unknowns(dofs)
     end
@@ -1196,8 +1173,7 @@ function _dirichlet_for_field(problem::Problem, name::Symbol)
     scoped = Any[]
     for condition in problem.dirichlet
         if condition.field === nothing
-            length(problem.fields) == 1 ||
-                throw(ArgumentError("multi-field Dirichlet conditions must specify a field"))
+            length(problem.fields) == 1 || throw(ArgumentError("multi-field Dirichlet conditions must specify a field"))
             push!(scoped, condition)
         elseif condition.field === name
             push!(scoped, condition)
@@ -1242,8 +1218,7 @@ end
 # (only legal on a single-field problem) and a form on a single-domain problem
 # both land on the one representative space, which is that problem's only one.
 function _referenced_facet_sites(problem::Problem)
-    return Iterators.flatten((((c.boundary, _condition_space(problem, c))
-                               for c in problem.dirichlet),
+    return Iterators.flatten((((c.boundary, _condition_space(problem, c)) for c in problem.dirichlet),
                               ((b.on, _field_space(problem, b.test_name))
                                for b in problem.blocks if b.on isa BoundarySelector),
                               ((l.on, _field_space(problem, l.test_name))
@@ -1265,8 +1240,7 @@ end
 # One mesh named by fields on two subdomains yields two entries, each cut
 # against its own grid; a genuine *two-sided* coupling across a mesh is an
 # [`Interface`](@ref), which carries both sides in one region.
-function _resolve_surface_regions(problem::Problem{D,T},
-                                  tolerance::GeometryTolerance{T}) where {D,T}
+function _resolve_surface_regions(problem::Problem{D,T}, tolerance::GeometryTolerance{T}) where {D,T}
     regions = Dict{RegionKey,Vector{SurfaceRegion{D,T}}}()
     for (mesh, space) in _referenced_boundary_mesh_sites(problem)
         key = (mesh, space)
@@ -1355,11 +1329,10 @@ _region_count(regions::AbstractDict) = sum(length, values(regions); init=0)
 function _facet_region_stats(regions::Dict{RegionKey,Vector{FacetRegion{D,T}}}) where {D,T}
     trimmed = [region for list in values(regions) for region in list if region.kind !== :full]
     return (; cut=length(trimmed),
-            fit_failures=count(r -> r.kind in (:cut_fallback, :cut_failed, :cut_alpha_failed),
-                               trimmed), fallbacks=count(r -> r.kind === :cut_fallback, trimmed),
+            fit_failures=count(r -> r.kind in (:cut_fallback, :cut_failed, :cut_alpha_failed), trimmed),
+            fallbacks=count(r -> r.kind === :cut_fallback, trimmed),
             residual_max=maximum(r -> Float64(r.residual), trimmed; init=0.0),
-            min_relative_measure=minimum(r -> Float64(sum(r.weights) / _face_measure(r)), trimmed;
-                                         init=1.0),)
+            min_relative_measure=minimum(r -> Float64(sum(r.weights) / _face_measure(r)), trimmed; init=1.0),)
 end
 
 # Resolve one selector into its full list of `FacetRegion`s (the union
@@ -1374,8 +1347,7 @@ end
 # `(V, sides, tolerance)`, so the memo returns exactly what a fresh resolution
 # would: the same regions, in the same order, region objects shared instead of
 # duplicated.
-function _facet_regions_for_selector(V::Space{D,T}, selector::BoundarySelector,
-                                     facets::FacetResolver{D,T}) where {D,T}
+function _facet_regions_for_selector(V::Space{D,T}, selector::BoundarySelector, facets::FacetResolver{D,T}) where {D,T}
     regions = FacetRegion{D,T}[]
     for sides in _facets(selector, Val(D))
         append!(regions, _resolve_face(facets, V, sides))
@@ -1501,9 +1473,8 @@ end
 # ── Model display, conditioning estimates and accessors ───────────────────────
 
 function Base.show(io::IO, model::Model{D}) where {D}
-    print(io, "Model(D=", D, ", pin=0x", string(model.version; base=16), ", active=",
-          active_unknowns(model.dofs), ", regions=", diagnostics(model).integration_regions,
-          ", assembled=", model.matrix !== nothing, ")")
+    print(io, "Model(D=", D, ", pin=0x", string(model.version; base=16), ", active=", active_unknowns(model.dofs),
+          ", regions=", diagnostics(model).integration_regions, ", assembled=", model.matrix !== nothing, ")")
 end
 
 # Condition-number estimator for small assembled matrices. Returns `NaN`
@@ -1636,8 +1607,7 @@ end
 # entry resolved on the space this rebuild has just superseded, instead of
 # carrying them forward as ballast no lookup can reach.
 function _remodel!(model::Model{D,T}, space::Space{D,T}) where {D,T}
-    fresh = _prepared_model(_problem_with_space(model.problem, space), model.plan_options,
-                            model.moment_fit_caches)
+    fresh = _prepared_model(_problem_with_space(model.problem, space), model.plan_options, model.moment_fit_caches)
     model.problem = fresh.problem
     model.prefold_space = fresh.prefold_space
     model.space_plans = fresh.space_plans
@@ -1662,8 +1632,8 @@ end
 # through `_prepare_spaces`, which also reindexes level ids).
 function _problem_with_space(problem::Problem, new_space::Space)
     new_fields = map(f -> field(f.name, new_space; components=component_count(f)), problem.fields)
-    return Problem(new_fields; blocks=problem.blocks, loads=problem.loads,
-                   dirichlet=problem.dirichlet, symmetric=problem.symmetric)
+    return Problem(new_fields; blocks=problem.blocks, loads=problem.loads, dirichlet=problem.dirichlet,
+                   symmetric=problem.symmetric)
 end
 
 """
@@ -1796,9 +1766,7 @@ and makes the system singular, which is why `keep_fictitious = true` requires
 `alpha > 0` — and it would survive only until the next re-fold, since nothing
 a rebuild reads records it.
 """
-function activate!(model::Model{D,T}; level::Integer, cells) where {D,T}
-    return _update_mask!(model, level, cells, true)
-end
+activate!(model::Model{D,T}; level::Integer, cells) where {D,T} = _update_mask!(model, level, cells, true)
 
 """
     deactivate!(model; level, cells) -> Model
@@ -1807,9 +1775,7 @@ Mark `cells` on `level` as inactive in place. See [`activate!`](@ref)
 for the accepted shapes of `cells`, the invalidation contract, and the
 interaction with a model's `physical_domain`.
 """
-function deactivate!(model::Model{D,T}; level::Integer, cells) where {D,T}
-    return _update_mask!(model, level, cells, false)
-end
+deactivate!(model::Model{D,T}; level::Integer, cells) where {D,T} = _update_mask!(model, level, cells, false)
 
 """
     adapted(model::Model, level => cells, ...) -> Model
@@ -2006,9 +1972,7 @@ alone, so this reads the pre-fold space and the answer is the one to hand back t
 [`adapt`](@ref) or [`activate!`](@ref) — neither of which may be fed a laundered
 fold (see [`active_cells`](@ref)).
 """
-function support_extension(model::Model, cells; level::Integer)
-    return support_extension(model.prefold_space, cells; level)
-end
+support_extension(model::Model, cells; level::Integer) = support_extension(model.prefold_space, cells; level)
 
 """
     dilate(model::Model, cells; level, by) -> BitArray{D}
@@ -2018,9 +1982,7 @@ pre-fold space for the same reason [`support_extension`](@ref) does: the result
 is going back to [`adapt`](@ref) or [`activate!`](@ref), and neither may be fed a
 mask the fictitious fold has already written over.
 """
-function dilate(model::Model, cells; level::Integer, by)
-    return dilate(model.prefold_space, cells; level=level, by=by)
-end
+dilate(model::Model, cells; level::Integer, by) = dilate(model.prefold_space, cells; level=level, by=by)
 
 # ── Public: refresh Dirichlet values without rebuilding the model ─────────────
 
@@ -2113,8 +2075,7 @@ function update_dirichlet!(model::Model{D,T}, dirichlet) where {D,T}
     # conditions on a scalar and a 2-component field, that added six allocations
     # (3.3 kB) to an increment; this loop takes 0.12 µs of its 17 µs (Apple M2 Pro).
     for condition in new_dirichlet
-        owner = condition.field === nothing ? only(model.dofs.fields) :
-                _field_layout(model.dofs, condition.field)
+        owner = condition.field === nothing ? only(model.dofs.fields) : _field_layout(model.dofs, condition.field)
         _check_dirichlet_datum(condition, owner.components, owner.name)
     end
 
@@ -2146,10 +2107,8 @@ function update_dirichlet!(model::Model{D,T}, dirichlet) where {D,T}
     for field_layout in model.dofs.fields
         name = field_layout.name
         cached = get(model.dirichlet_projections, name, nothing)
-        projection = _project_dirichlet_values!(field_layout.dofs,
-                                                _field_space(model.problem, name),
-                                                model.facet_resolver,
-                                                _dirichlet_for_field(model.problem, name), cached)
+        projection = _project_dirichlet_values!(field_layout.dofs, _field_space(model.problem, name),
+                                                model.facet_resolver, _dirichlet_for_field(model.problem, name), cached)
         model.dirichlet_projections[name] = projection
         _append_trace_stats!(trace_factors, unsupported, name, projection, field_layout.components)
     end
@@ -2222,33 +2181,26 @@ function diagnostics(model::Model{D,T}, solution; exact=nothing) where {D,T}
     # Level reports for every subdomain space, flattened in the same order as
     # `_problem_levels`. Built per space because nesting is a relation between the
     # levels of one space; a coupled problem's spaces are independent stacks.
-    levels = Any[_level_report(level, V, tol, model.dofs) for V in problem_spaces(model.problem)
-                 for level in V.levels]
+    levels = Any[_level_report(level, V, tol, model.dofs) for V in problem_spaces(model.problem) for level in V.levels]
     return (; dimension=diag.dimension, levels=levels, active_unknowns=diag.active_unknowns,
             raw_dofs=raw_dof_count(model.dofs), integration_regions=diag.integration_regions,
-            facet_region_count=diag.facet_region_count,
-            cut_facet_region_count=diag.cut_facet_region_count,
+            facet_region_count=diag.facet_region_count, cut_facet_region_count=diag.cut_facet_region_count,
             facet_fit_failure_count=diag.facet_fit_failure_count,
             facet_cut_fallback_count=diag.facet_cut_fallback_count,
             facet_moment_fit_residual_max=diag.facet_moment_fit_residual_max,
             min_relative_facet_measure=diag.min_relative_facet_measure,
             dirichlet_trace_factors=diag.dirichlet_trace_factors,
             unsupported_dirichlet_dof_count=diag.unsupported_dirichlet_dof_count,
-            unsupported_dirichlet_dofs=diag.unsupported_dirichlet_dofs,
-            surface_region_count=diag.surface_region_count,
-            interface_region_count=diag.interface_region_count,
-            small_overlap_count=diag.small_overlap_count, small_overlaps=diag.small_overlaps,
-            min_integration_volume=diag.min_integration_volume,
+            unsupported_dirichlet_dofs=diag.unsupported_dirichlet_dofs, surface_region_count=diag.surface_region_count,
+            interface_region_count=diag.interface_region_count, small_overlap_count=diag.small_overlap_count,
+            small_overlaps=diag.small_overlaps, min_integration_volume=diag.min_integration_volume,
             min_relative_integration_volume=diag.min_relative_integration_volume,
-            inactive_cell_counts=diag.inactive_cell_counts,
-            reduced_mode_counts=diag.reduced_mode_counts, cut_region_count=diag.cut_region_count,
-            fit_failure_count=diag.fit_failure_count,
-            moment_fit_residual_max=diag.moment_fit_residual_max,
-            cut_fallback_count=diag.cut_fallback_count,
+            inactive_cell_counts=diag.inactive_cell_counts, reduced_mode_counts=diag.reduced_mode_counts,
+            cut_region_count=diag.cut_region_count, fit_failure_count=diag.fit_failure_count,
+            moment_fit_residual_max=diag.moment_fit_residual_max, cut_fallback_count=diag.cut_fallback_count,
             cut_fallback_points=diag.cut_fallback_points, symmetry_residual=diag.symmetry_residual,
-            condition_estimate=diag.condition_estimate,
-            scaled_condition_estimate=diag.scaled_condition_estimate, solver=diag.solver,
-            residual_norm=solution.diagnostics.residual_norm, l2_error=error,)
+            condition_estimate=diag.condition_estimate, scaled_condition_estimate=diag.scaled_condition_estimate,
+            solver=diag.solver, residual_norm=solution.diagnostics.residual_norm, l2_error=error,)
 end
 
 # Compact per-level reproducibility report used inside
@@ -2315,7 +2267,7 @@ function _level_report(level, V::Space, tol::GeometryTolerance, layout::SystemLa
     # type varying from level to level.
     order_palette = copy(level.orders.palette)
     return (; id=level.id, role=level.role, cells=level.mesh.cells, order=nominal_order(level),
-            order_palette=order_palette, mode=level.mode, basis=basis_name(level.basis),
-            domain=level.mesh.domain, nested=nested, raw_functions=length(raws),
+            order_palette=order_palette, mode=level.mode, basis=basis_name(level.basis), domain=level.mesh.domain,
+            nested=nested, raw_functions=length(raws),
             active_functions=count(r -> any(!iszero, view(dofs.active_component, r, :)), raws),)
 end

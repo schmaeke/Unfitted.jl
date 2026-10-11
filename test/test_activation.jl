@@ -32,8 +32,7 @@ using SparseArrays
     @test !iter_mask.on[1, 2] && !iter_mask.on[2, 1]
 
     @test_throws DimensionMismatch Unfitted._normalize_mask(trues(3, 3), mesh)
-    @test_throws DimensionMismatch Unfitted._normalize_mask(Unfitted.LevelMask{2}(trues(3, 3)),
-                                                            mesh)
+    @test_throws DimensionMismatch Unfitted._normalize_mask(Unfitted.LevelMask{2}(trues(3, 3)), mesh)
     @test_throws ArgumentError Unfitted._normalize_mask([CartesianIndex(5, 5)], mesh)
     @test_throws ArgumentError Unfitted._normalize_mask([(1, 1)], mesh)
 end
@@ -54,8 +53,8 @@ end
 # base cells.
 const _OMEGA = box((0.0, 0.0), (1.0, 1.0))
 function _safe_overlay(; overlay_cells=(4, 4), active=nothing)
-    overlay(space(_OMEGA; cells=(8, 8), order=2), box((0.3, 0.3), (0.7, 0.7)); cells=overlay_cells,
-            order=3, active=active)
+    overlay(space(_OMEGA; cells=(8, 8), order=2), box((0.3, 0.3), (0.7, 0.7)); cells=overlay_cells, order=3,
+            active=active)
 end
 
 @testset "no-mask path identical to today" begin
@@ -104,10 +103,9 @@ end
     src = x -> sin(pi * x[1]) * sin(pi * x[2])
 
     active_cells = [CartesianIndex(i, j) for i in 1:2, j in 1:4]
-    V_partial = overlay(space(_OMEGA; cells=(8, 8), order=2), box((0.3, 0.3), (0.7, 0.7));
-                        cells=(4, 4), order=3, active=active_cells)
-    V_small = overlay(space(_OMEGA; cells=(8, 8), order=2), box((0.3, 0.3), (0.5, 0.7));
-                      cells=(2, 4), order=3)
+    V_partial = overlay(space(_OMEGA; cells=(8, 8), order=2), box((0.3, 0.3), (0.7, 0.7)); cells=(4, 4), order=3,
+                        active=active_cells)
+    V_small = overlay(space(_OMEGA; cells=(8, 8), order=2), box((0.3, 0.3), (0.5, 0.7)); cells=(2, 4), order=3)
 
     m_partial = prepare(poisson(V_partial; source=src, dirichlet=[bc]))
     m_small = prepare(poisson(V_small; source=src, dirichlet=[bc]))
@@ -119,8 +117,7 @@ end
     sol_partial = solve!(m_partial)
     sol_small = solve!(m_small)
 
-    @test l2_error(sol_partial, m_partial, x -> value(sol_small, m_small, x); norm=:absolute) <
-          1e-10
+    @test l2_error(sol_partial, m_partial, x -> value(sol_small, m_small, x); norm=:absolute) < 1e-10
 end
 
 @testset "interior active/inactive face introduces artificial constraint" begin
@@ -129,10 +126,9 @@ end
     # interior face between active and inactive cells -> artificial constraint.
     # The NODE-NODE dof at (3,2) is fully enclosed by active cells -> free.
     bc = dirichlet(0.0; on=boundary(:all))
-    inactive_one = setdiff(vec([CartesianIndex(i, j) for i in 1:3, j in 1:3]),
-                           [CartesianIndex(1, 1)])
-    V = overlay(space(_OMEGA; cells=(8, 8), order=2), box((0.3, 0.3), (0.7, 0.7)); cells=(3, 3),
-                order=3, active=inactive_one)
+    inactive_one = setdiff(vec([CartesianIndex(i, j) for i in 1:3, j in 1:3]), [CartesianIndex(1, 1)])
+    V = overlay(space(_OMEGA; cells=(8, 8), order=2), box((0.3, 0.3), (0.7, 0.7)); cells=(3, 3), order=3,
+                active=inactive_one)
 
     model = prepare(poisson(V; source=1.0, dirichlet=[bc]))
     layout = Unfitted._field_layout(model.dofs, :u).dofs
@@ -194,17 +190,16 @@ end
 
     # Only cell (1,1) of the 4x4 overlay is active. Point (0.6, 0.6) sits well
     # inside the inactive region -> overlay contribution must be exactly zero.
-    V = overlay(space(_OMEGA; cells=(8, 8), order=2), box((0.3, 0.3), (0.7, 0.7)); cells=(4, 4),
-                order=3, active=[CartesianIndex(1, 1)])
+    V = overlay(space(_OMEGA; cells=(8, 8), order=2), box((0.3, 0.3), (0.7, 0.7)); cells=(4, 4), order=3,
+                active=[CartesianIndex(1, 1)])
     model = prepare(poisson(V; source=src, dirichlet=[bc]))
     assemble!(model)
     sol = solve!(model)
 
     x_inactive = SVector(0.6, 0.6)
     overlay_level = V.levels[2]
-    overlay_value = Unfitted._level_field(sol.coefficients, model,
-                                          Unfitted._field_layout(model.dofs, :u), overlay_level,
-                                          x_inactive, 1, Val(false))
+    overlay_value = Unfitted._level_field(sol.coefficients, model, Unfitted._field_layout(model.dofs, :u),
+                                          overlay_level, x_inactive, 1, Val(false))
     @test overlay_value == 0.0
 end
 
@@ -218,14 +213,12 @@ end
 
 @testset "active_cells query" begin
     V_clean = _safe_overlay()
-    model_clean = prepare(poisson(V_clean; source=1.0,
-                                  dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    model_clean = prepare(poisson(V_clean; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     @test active_cells(model_clean; level=1) == trues(8, 8)
     @test active_cells(model_clean; level=2) == trues(4, 4)
 
     V_partial = _safe_overlay(active=(b, i) -> i.I[1] <= 2)
-    model_partial = prepare(poisson(V_partial; source=1.0,
-                                    dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    model_partial = prepare(poisson(V_partial; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     bits = active_cells(model_partial; level=2)
     @test bits == [i <= 2 for i in 1:4, _ in 1:4]
 
@@ -286,8 +279,8 @@ end
     # one overlay silently reverts the caller's mask everywhere, including on
     # levels the move does not touch.
     bc = dirichlet(0.0; on=boundary(:all))
-    V = overlay(overlay(space(_OMEGA; cells=(8, 8), order=2), box((0.1, 0.1), (0.5, 0.5));
-                        cells=(4, 4), order=2), box((0.5, 0.5), (0.9, 0.9)); cells=(4, 4), order=2)
+    V = overlay(overlay(space(_OMEGA; cells=(8, 8), order=2), box((0.1, 0.1), (0.5, 0.5)); cells=(4, 4), order=2),
+                box((0.5, 0.5), (0.9, 0.9)); cells=(4, 4), order=2)
     model = prepare(poisson(V; source=1.0, dirichlet=[bc]))
 
     deactivate!(model; level=2, cells=[CartesianIndex(1, 1)])
@@ -378,8 +371,7 @@ end
     # rule and contributes nothing, so `activate!` on it is a no-op on the
     # effective space — while staying visible in the pre-fold record, which is
     # what a later `move!` or a geometry change re-derives from.
-    disc = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.4; lipschitz=1.0,
-                           subcell_length_scale=0.05)
+    disc = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.4; lipschitz=1.0, subcell_length_scale=0.05)
     V = space(box((-1.0, -1.0), (1.0, 1.0)); cells=(4, 4), order=1, physical=disc)
     model = prepare(mass(V; coefficient=1.0))
     outside = findfirst(!, active_cells(model; level=1))

@@ -80,8 +80,8 @@ println("cells   h_overlay   nested   unknowns   relative L² error")
 for overlay_cells in (8, 9, 10, 11, 12, 16)
     V = overlay(space(omega; cells=8, order=3), refined_region; cells=overlay_cells)
     report = run_case(V)
-    println(rpad(overlay_cells, 8), rpad(round(0.5 / overlay_cells; sigdigits=3), 12),
-            rpad(is_nested(V), 9), rpad(report.active_unknowns, 11), report.l2_error)
+    println(rpad(overlay_cells, 8), rpad(round(0.5 / overlay_cells; sigdigits=3), 12), rpad(is_nested(V), 9),
+            rpad(report.active_unknowns, 11), report.l2_error)
 end
 println()
 
@@ -109,14 +109,12 @@ function gram_size_and_rank(V; prune=true)
 end
 
 for overlay_cells in (8, 9)
-    reduced, _ = gram_size_and_rank(overlay(space(omega; cells=8, order=3), refined_region;
-                                            cells=overlay_cells))
-    _, unreduced_rank = gram_size_and_rank(overlay(space(omega; cells=8, order=3), refined_region;
-                                                   cells=overlay_cells); prune=false)
-    println("Overlay of ", overlay_cells, " cells: reduced space spans ", reduced,
-            ", the unreduced one spans ", unreduced_rank,
-            reduced == unreduced_rank ? "  — free" :
-            "  — $(unreduced_rank - reduced) dimensions destroyed")
+    reduced, _ = gram_size_and_rank(overlay(space(omega; cells=8, order=3), refined_region; cells=overlay_cells))
+    _, unreduced_rank = gram_size_and_rank(overlay(space(omega; cells=8, order=3), refined_region; cells=overlay_cells);
+                                           prune=false)
+    println("Overlay of ", overlay_cells, " cells: reduced space spans ", reduced, ", the unreduced one spans ",
+            unreduced_rank,
+            reduced == unreduced_rank ? "  — free" : "  — $(unreduced_rank - reduced) dimensions destroyed")
 end
 println()
 
@@ -188,10 +186,8 @@ for r2 in (0.02, 0.05, 0.10)
             rpad(round(report.l2_error; sigdigits=4), 12), exp(-ALPHA * r2))
 end
 println()
-println("Both levels, block  : ", report_block.active_unknowns, " unknowns, error ",
-        report_block.l2_error)
-println("Level 3 only, r² < 0.05: ", report_sparse.active_unknowns, " unknowns, error ",
-        report_sparse.l2_error)
+println("Both levels, block  : ", report_block.active_unknowns, " unknowns, error ", report_block.l2_error)
+println("Level 3 only, r² < 0.05: ", report_sparse.active_unknowns, " unknowns, error ", report_sparse.l2_error)
 println()
 
 #=
@@ -222,8 +218,7 @@ function cell_indicator(u, model, V, ci)
     return sqrt(sum(abs2, g))
 end
 
-indicator = map(ci -> cell_indicator(u_coarse, coarse, V_ladder, ci),
-                cell_indices(V_ladder; level=1))
+indicator = map(ci -> cell_indicator(u_coarse, coarse, V_ladder, ci), cell_indices(V_ladder; level=1))
 threshold = 0.5 * maximum(indicator)
 marked = [ci for ci in cell_indices(V_ladder; level=1) if indicator[ci] >= threshold]
 
@@ -232,8 +227,7 @@ transfer(u_coarse, coarse, target; via=L2Projection())
 report_marked = diagnostics(target, solve!(target); exact=exact)
 
 println("Marked base cells        : ", length(marked), " of ", 8^D)
-println("Unknowns, coarse → refined: ", diagnostics(coarse).active_unknowns, " → ",
-        report_marked.active_unknowns)
+println("Unknowns, coarse → refined: ", diagnostics(coarse).active_unknowns, " → ", report_marked.active_unknowns)
 println("Error,    coarse → refined: ", diagnostics(coarse, u_coarse; exact=exact).l2_error, " → ",
         report_marked.l2_error)
 println()
@@ -263,6 +257,5 @@ because it is the step a transient run cannot skip.
 =#
 
 print_run_report("Tutorial 5 — summary of the per-cell refined ladder", report_sparse;
-                 parameters=(:base_cells => V_ladder.levels[1].mesh.cells,
-                             :depth => length(V_ladder.levels) - 1, :splits => 2,
-                             :mask => "level 3 where r² < 0.05, level 2 dormant"))
+                 parameters=(:base_cells => V_ladder.levels[1].mesh.cells, :depth => length(V_ladder.levels) - 1,
+                             :splits => 2, :mask => "level 3 where r² < 0.05, level 2 dormant"))

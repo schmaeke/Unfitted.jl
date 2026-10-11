@@ -11,10 +11,8 @@ function assert_parent_maps(V, plan)
             lower = Unfitted.reference_to_physical(parent_box, parent.local_box.lower)
             upper = Unfitted.reference_to_physical(parent_box, parent.local_box.upper)
 
-            @test all(isapprox(lower[i], region.box.lower[i]; atol=1.0e-12)
-                      for i in eachindex(lower))
-            @test all(isapprox(upper[i], region.box.upper[i]; atol=1.0e-12)
-                      for i in eachindex(upper))
+            @test all(isapprox(lower[i], region.box.lower[i]; atol=1.0e-12) for i in eachindex(lower))
+            @test all(isapprox(upper[i], region.box.upper[i]; atol=1.0e-12) for i in eachindex(upper))
         end
         @test !isempty(region.quadrature.points)
         @test length(region.quadrature.points) == length(region.quadrature.weights)
@@ -51,8 +49,7 @@ end
     assert_parent_maps(V3, plan3)
 
     V4 = space(box((0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0, 1.0)); cells=(1, 1, 1, 1), order=1)
-    V4 = overlay(V4, box((0.25, 0.25, 0.25, 0.25), (0.75, 0.75, 0.75, 0.75)); cells=(1, 1, 1, 1),
-                 order=1)
+    V4 = overlay(V4, box((0.25, 0.25, 0.25, 0.25), (0.75, 0.75, 0.75, 0.75)); cells=(1, 1, 1, 1), order=1)
     plan4 = Unfitted.integration_plan(V4)
     @test length(plan4.regions) == 9    # merged (was 81 unmerged)
     @test count(region -> length(region.parents) == 2, plan4.regions) == 1
@@ -93,8 +90,8 @@ end
     @test length(Unfitted.integration_plan(Vbad; tolerance=scaled).regions) == 4 * 8
 
     # A too-fine overlay is caught on the overlay level, named by its own id.
-    Vfine = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1),
-                    box((0.4, 0.4), (0.4 + 1.0e-8, 0.6)); cells=(2, 2), order=1)
+    Vfine = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1), box((0.4, 0.4), (0.4 + 1.0e-8, 0.6));
+                    cells=(2, 2), order=1)
     err2 = try
         Unfitted.integration_plan(Vfine)
     catch e
@@ -124,8 +121,7 @@ function full_grid_boxes(levels::Tuple, ::Val{D}, tol::GeometryTolerance{T}) whe
     any(==(0), ranges) && return boxes
     linmaps = map(level -> LinearIndices(level.mesh.cells), levels)
     sigs = map(CartesianIndices(ranges)) do index
-        mid = Unfitted.SVector{D,T}(ntuple(d -> (intervals[d][index.I[d]][1] +
-                                                 intervals[d][index.I[d]][2]) / 2, D))
+        mid = Unfitted.SVector{D,T}(ntuple(d -> (intervals[d][index.I[d]][1] + intervals[d][index.I[d]][2]) / 2, D))
         Unfitted._coverage_signature(levels, linmaps, mid, tol)
     end
     visited = falses(ranges)
@@ -142,9 +138,7 @@ end
 
 # The boxes of a partition that any level actually covers — the only ones any
 # consumer of `_merged_boxes` keeps.
-function covered_boxes(levels::Tuple, boxes, tol)
-    return filter(b -> !isempty(Unfitted._parents_covering(levels, b, tol)), boxes)
-end
+covered_boxes(levels::Tuple, boxes, tol) = filter(b -> !isempty(Unfitted._parents_covering(levels, b, tol)), boxes)
 
 @testset "the active-cell projection leaves the box partition unchanged" begin
     # A candidate coordinate the projection drops is the face of no active cell
@@ -177,12 +171,11 @@ end
             m[CartesianIndices(ntuple(_ -> 1:2, D))] .= true
             V = adapt(V, k => m)
         end
-        @test Unfitted._merged_boxes(V.levels, Val(D), tol) ==
-              full_grid_boxes(V.levels, Val(D), tol)
+        @test Unfitted._merged_boxes(V.levels, Val(D), tol) == full_grid_boxes(V.levels, Val(D), tol)
         # Non-vacuity: the projection really did shrink the candidate grid.
         @test length(Unfitted._merged_axis_coordinates(V.levels, Val(D), tol)[1]) <
-              length(Unfitted.merge_coordinates(vcat((Unfitted.boundary_coordinates(l.mesh)[1]
-                                                      for l in V.levels)...), tol))
+              length(Unfitted.merge_coordinates(vcat((Unfitted.boundary_coordinates(l.mesh)[1] for l in V.levels)...),
+                                                tol))
     end
 
     # A masked, *non-nested* overlay over a masked base level: nothing here

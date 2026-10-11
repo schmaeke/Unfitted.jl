@@ -25,11 +25,9 @@ const BSExt = Base.get_extension(Unfitted, :UnfittedBasicBSplineExt)
     # minimum rule to act on. The request must raise rather than be silently
     # dropped.
     Ω = box((0.0, 0.0), (1.0, 1.0))
-    @test_throws ArgumentError space(Ω; cells=4, order=[2 + (i + j) % 2 for i in 1:4, j in 1:4],
-                                     basis=bspline())
+    @test_throws ArgumentError space(Ω; cells=4, order=[2 + (i + j) % 2 for i in 1:4, j in 1:4], basis=bspline())
     V = space(Ω; cells=4, order=2, basis=bspline())
-    @test_throws ArgumentError overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=2,
-                                       order=[2 3; 3 2], basis=bspline())
+    @test_throws ArgumentError overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=2, order=[2 3; 3 2], basis=bspline())
     # The trait triggers on non-uniformity, not on the shape: a per-cell field
     # that happens to be flat is a perfectly well defined B-spline level.
     W = space(Ω; cells=4, order=fill(3, 4, 4), basis=bspline())
@@ -54,8 +52,7 @@ end
     # tensor defaults: an open-knot span carries the full ∏_d {0, …, p_d} set,
     # so the family adds nothing of its own here.
     @test Unfitted.local_basis_indices(fam, (1, 2))[1] == CartesianIndex(0, 0)
-    @test Unfitted.local_basis_indices(fam, (1, 2)) ==
-          Unfitted.local_basis_indices(fam, (1, 2), :tensor)
+    @test Unfitted.local_basis_indices(fam, (1, 2)) == Unfitted.local_basis_indices(fam, (1, 2), :tensor)
     @test Unfitted.local_basis_count(fam, (3, 3), :tensor) == 16
     # `dim` per axis = cells + p (open knot, no junctions, m=0).
     @test BasicBSpline.dim.(fam.spaces) == (7, 7)
@@ -64,8 +61,7 @@ end
     # hand-written guard in the extension — rejects integrated Legendre's
     # `:trunk` for it, at `space` time.
     @test Unfitted._supported_modes(fam) == (:tensor,)
-    @test_throws ArgumentError space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=3, basis=bspline(),
-                                     mode=:trunk)
+    @test_throws ArgumentError space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=3, basis=bspline(), mode=:trunk)
     @test_throws ArgumentError Unfitted.local_basis_indices(fam, (3, 3), :trunk)
 end
 
@@ -75,12 +71,10 @@ end
     @test_throws ArgumentError bspline(continuity=-1)
     @test_throws ArgumentError bspline(continuity=:smooth)
     # continuity > p − 1 is rejected at level construction.
-    @test_throws ArgumentError space(box((0.0,), (1.0,)); cells=4, order=2,
-                                     basis=bspline(continuity=2))
+    @test_throws ArgumentError space(box((0.0,), (1.0,)); cells=4, order=2, basis=bspline(continuity=2))
     # Too-thin level for a *clamped* continuity is rejected: eliminating m + 1
     # functions per side must leave something to pivot onto.
-    @test_throws ArgumentError space(box((0.0,), (1.0,)); cells=1, order=3,
-                                     basis=bspline(continuity=1))
+    @test_throws ArgumentError space(box((0.0,), (1.0,)); cells=1, order=3, basis=bspline(continuity=1))
     # `:maximal` carries no thickness requirement, because it clamps nothing. A
     # level too thin to hold a whole support contributes no functions, which is a
     # statement about the spline space (minimal support needs p + 1 cells) rather
@@ -99,8 +93,7 @@ end
     max_family = space(Ω; cells=6, order=3, basis=bspline()).levels[1].basis
     int_family = space(Ω; cells=6, order=3, basis=bspline(continuity=2)).levels[1].basis
     @test max_family.continuity == int_family.continuity
-    free(b) = Unfitted.active_unknowns(prepare(mass(overlay(space(Ω; cells=16, order=3,
-                                                                  basis=bspline()), B; cells=8,
+    free(b) = Unfitted.active_unknowns(prepare(mass(overlay(space(Ω; cells=16, order=3, basis=bspline()), B; cells=8,
                                                             order=3, basis=b))).dofs)
     @test free(bspline()) == free(bspline(continuity=2))
 end
@@ -129,8 +122,7 @@ end
     # rule off by one per side still satisfies.
     for m in 0:1, n in (7,)
         base = space(Ω; cells=16, order=3, basis=bspline())
-        V = overlay(base, box((0.25, 0.25), (0.75, 0.75)); cells=n, order=3,
-                    basis=bspline(; continuity=m))
+        V = overlay(base, box((0.25, 0.25), (0.75, 0.75)); cells=n, order=3, basis=bspline(; continuity=m))
         @test free(V) - free(base) == (n + 3 - 2 * (m + 1))^2
     end
     # A user-masked support cell blocks the dedup — the level assembles the function
@@ -192,8 +184,7 @@ end
         model = prepare(poisson(V; source=source, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
         solution = solve!(model)
         jump(ε) = maximum(abs(field_gradient(solution, model, (0.25 - ε, y))[1] -
-                              field_gradient(solution, model, (0.25 + ε, y))[1])
-                          for y in (0.35, 0.5, 0.65))
+                              field_gradient(solution, model, (0.25 + ε, y))[1]) for y in (0.35, 0.5, 0.65))
         return jump(1.0e-4) / jump(1.0e-5)
     end
     # `:maximal` is C¹ or better across the face, so the ratio is ten.
@@ -207,13 +198,11 @@ end
 
 @testset "support_extension dilates by the family's support radius" begin
     Ω = box((0.0, 0.0), (1.0, 1.0))
-    marked = [CartesianIndex(8, 8), CartesianIndex(8, 9), CartesianIndex(9, 8),
-              CartesianIndex(9, 9)]
+    marked = [CartesianIndex(8, 8), CartesianIndex(8, 9), CartesianIndex(9, 8), CartesianIndex(9, 9)]
     # Integrated Legendre's modes are cell-local or shared across the face they sit
     # on, so its radius is zero and the dilation is the identity.
     V = space(Ω; cells=16, order=3)
-    @test support_extension(V, marked; level=1) ==
-          Unfitted._normalize_mask(marked, V.levels[1].mesh).on
+    @test support_extension(V, marked; level=1) == Unfitted._normalize_mask(marked, V.levels[1].mesh).on
     # A degree-p B-spline reaches p cells, so a 2×2 block becomes (2 + 2p)².
     for p in 1:3
         W = space(Ω; cells=16, order=p, basis=bspline())
@@ -225,11 +214,9 @@ end
     # one that does. A 2×2 active block is two cells wide, below the `p + 1` cells a
     # degree-2 support needs, so such a level carries nothing at all; the extension
     # is 6×6 and carries `(6 − 2)² = 16`.
-    free(cells) = Unfitted.active_unknowns(prepare(mass(space(Ω; cells=16, order=2, basis=bspline(),
-                                                              active=cells))).dofs)
+    free(cells) = Unfitted.active_unknowns(prepare(mass(space(Ω; cells=16, order=2, basis=bspline(), active=cells))).dofs)
     @test free(marked) == 0
-    @test free(support_extension(space(Ω; cells=16, order=2, basis=bspline()), marked; level=1)) ==
-          16
+    @test free(support_extension(space(Ω; cells=16, order=2, basis=bspline()), marked; level=1)) == 16
     # The dilation clips to the level's own grid rather than widening its box.
     edge = space(Ω; cells=8, order=3, basis=bspline())
     @test size(support_extension(edge, [CartesianIndex(1, 1)]; level=1)) == (8, 8)
@@ -348,8 +335,7 @@ end
     # constraint, while a user-masked face still does. Without the exemption the
     # cut cells around the hole would lose their boundary modes.
     omega = box((0.0, 0.0), (1.0, 1.0))
-    hole = physical_domain(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0, subcell_length_scale=1 / 64,
-                           max_depth=6)
+    hole = physical_domain(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0, subcell_length_scale=1 / 64, max_depth=6)
     V = space(omega; cells=8, order=2, basis=bspline(), physical=hole)
     l = Unfitted._field_layout(prepare(mass(V)).dofs, :u).dofs
     # dim = cells + p = 10 per axis. Every function touches an active cell, and the
@@ -399,8 +385,8 @@ end
     # read the same tables, each with and without `keep_fictitious` (where no fold runs
     # and every inactive cell is the user's).
     omega = box((0.0, 0.0), (1.0, 1.0))
-    hole(; kw...) = physical_domain(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0,
-                                    subcell_length_scale=1 / 64, max_depth=6, kw...)
+    hole(; kw...) = physical_domain(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0, subcell_length_scale=1 / 64, max_depth=6,
+                                    kw...)
     p = 2
     # The base and the first overlay each mask one cell entirely inside the hole (void)
     # and one in the material. The first overlay's x₁ = ½ face is artificial and crosses
@@ -413,8 +399,7 @@ end
     function stack(continuity, physical)
         basis = bspline(; continuity)
         V = space(omega; cells=8, order=p, basis, physical, active=basemask)
-        V = overlay(V, box((0.0, 0.0), (0.5, 1.0)); cells=(8, 16), order=p, basis,
-                    active=overlaymask)
+        V = overlay(V, box((0.0, 0.0), (0.5, 1.0)); cells=(8, 16), order=p, basis, active=overlaymask)
         return overlay(V, box((0.0, 0.0), (0.25, 0.25)); cells=(4, 4), order=p, basis)
     end
     tol = GeometryTolerance(Float64)
@@ -441,8 +426,7 @@ end
         fold = Unfitted._Fold(V, cache)
         nocoverage = Unfitted.Coverage{2}(Dict{Int,BitArray{2}}())
         for level in V.levels
-            ctx = Unfitted._LevelContext(V, fold, tol, nocoverage, raw_keys, raw_by_key,
-                                         level_raws[level.id])
+            ctx = Unfitted._LevelContext(V, fold, tol, nocoverage, raw_keys, raw_by_key, level_raws[level.id])
             a = BSExt._admissibility(level, ctx)
             # Nothing is classified or allocated to build the record: the oracle's table
             # for the level — the one every other site of the build asks — does not exist
@@ -450,8 +434,7 @@ end
             @test !isassigned(fold.cells, level.id)
             grid = CartesianIndices(ntuple(d -> (1-p):(level.mesh.cells[d]+p), 2))
             dense = Dict(c => _dense_admissible(V, level, c, tol) for c in grid)
-            @test [c for c in grid if BSExt._cell_admissible(a, c) != dense[c]] ==
-                  CartesianIndex{2}[]
+            @test [c for c in grid if BSExt._cell_admissible(a, c) != dense[c]] == CartesianIndex{2}[]
             # The sweep reaches every grid cell, and the record read the oracle's table:
             # exactly the inactive grid cells hold a verdict there, so only they were ever
             # looked up, and every one of them was. An all-active level never asks.
@@ -493,8 +476,8 @@ end
     #   doi:10.1016/j.cma.2016.07.006.
     Ω = box((0.0, 0.0), (1.0, 1.0))
     scaled(basis, p, n, r) =
-        let hole = physical_domain(leaf(x -> r - norm(x .- 0.5); lipschitz=1.0);
-                                   subcell_length_scale=1 / 128, max_depth=6),
+        let hole = physical_domain(leaf(x -> r - norm(x .- 0.5); lipschitz=1.0); subcell_length_scale=1 / 128,
+                                   max_depth=6),
             V = space(Ω; cells=n, order=p, basis=basis, physical=hole),
             model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
@@ -526,8 +509,7 @@ end
     # rather than a verdict — the same contract `condition_estimate` has always
     # had, and the reason the cross-family comparison above runs at a size where
     # the integrated-Legendre system still fits under it.
-    big = prepare(poisson(space(Ω; cells=8, order=3); source=1.0,
-                          dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    big = prepare(poisson(space(Ω; cells=8, order=3); source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     dbig = diagnostics(big, solve!(big))
     @test isnan(dbig.condition_estimate) && isnan(dbig.scaled_condition_estimate)
 end
@@ -539,8 +521,7 @@ end
     # cells carry the partition of unity there), and the solution must agree with
     # the integrated-Legendre reference on the same mesh.
     omega = box((0.0, 0.0), (1.0, 1.0))
-    hole = physical_domain(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0, subcell_length_scale=1 / 64,
-                           max_depth=6)
+    hole = physical_domain(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0, subcell_length_scale=1 / 64, max_depth=6)
     V = space(omega; cells=8, order=3, basis=bspline(), physical=hole)
     m, _ = _gram(V)
     M = Symmetric(Matrix(m.matrix))
@@ -797,8 +778,7 @@ end
     # collapsed constraints the unit test above pins.
     free_on_level(V, level) =
         let l = Unfitted._field_layout(prepare(mass(V)).dofs, :u).dofs
-            count(i -> l.raw_keys[i].level == level && l.elimination_source[i] === :free,
-                  eachindex(l.raw_keys))
+            count(i -> l.raw_keys[i].level == level && l.elimination_source[i] === :free, eachindex(l.raw_keys))
         end
     Ω = box((0.0, 0.0), (1.0, 1.0))
     mask = trues(8, 8)
@@ -813,17 +793,14 @@ end
     @test length(layout.pivots) == length(layout.raw_keys)
     none = layout.pivots[findfirst(isempty, layout.pivots)]
     @test all(e -> !isempty(e) || e === none, layout.pivots)
-    @test all(r -> isempty(layout.pivots[r]) || layout.elimination_source[r] !== :free,
-              eachindex(layout.pivots))
+    @test all(r -> isempty(layout.pivots[r]) || layout.elimination_source[r] !== :free, eachindex(layout.pivots))
     @test all(e -> all(((o, _),) -> layout.elimination_source[o] === :free, e), layout.pivots)
     # And the two shapes that no longer reach it, kept because their dof ledgers are
     # the closed forms the family's docstring states: `n − p` per axis at maximal
     # continuity, for a level whose faces are all artificial.
     B = box((0.25, 0.25), (0.75, 0.75))
-    @test free_on_level(overlay(space(Ω; cells=8, order=1, basis=bspline()), B; cells=4, order=1),
-                        2) == 9
-    @test free_on_level(overlay(space(Ω; cells=8, order=3, basis=bspline()), B; cells=8, order=3),
-                        2) == 25
+    @test free_on_level(overlay(space(Ω; cells=8, order=1, basis=bspline()), B; cells=4, order=1), 2) == 9
+    @test free_on_level(overlay(space(Ω; cells=8, order=3, basis=bspline()), B; cells=8, order=3), 2) == 25
 end
 
 @testset "Linear-constraint resolver: a pivot contributes its expansion to the field" begin
@@ -856,16 +833,14 @@ end
             integral += q.weight * v * v
             return nothing
         end
-        return abs(quadratic - integral) / abs(quadratic),
-               Unfitted.has_linear_constraints(model.dofs)
+        return abs(quadratic - integral) / abs(quadratic), Unfitted.has_linear_constraints(model.dofs)
     end
 
     Ω = box((0.0, 0.0), (1.0, 1.0))
     mask = trues(6, 6)
     mask[4:6, 4:6] .= false                          # L-shaped active region
     for m in 0:1                                     # m < p − 1 ⇒ genuine pivots
-        gap, pivots = projection_gap(space(Ω; cells=6, order=3, active=mask,
-                                           basis=bspline(; continuity=m)))
+        gap, pivots = projection_gap(space(Ω; cells=6, order=3, active=mask, basis=bspline(; continuity=m)))
         @test pivots
         @test gap < 1e-13
     end
@@ -997,8 +972,7 @@ end
     # (`_active_cell_at_face` exempts it), and a nested same-degree cover reproduces the
     # base function exactly — so all 16 must go, and the space must be unchanged.
     Ωfold = box((-1.0, -1.0), (2.0, 2.0))
-    half() = physical_domain(x -> x[1] - 0.9; lipschitz=1.0, subcell_length_scale=0.125,
-                             max_depth=6)
+    half() = physical_domain(x -> x[1] - 0.9; lipschitz=1.0, subcell_length_scale=0.125, max_depth=6)
     function fold_stack(xhi)
         base = space(Ωfold; cells=6, order=2, basis=bspline(), physical=half())
         return overlay(base, box((0.0, -1.0), (xhi, 2.0)); cells=(round(Int, 4xhi), 12), order=2)
@@ -1030,9 +1004,8 @@ end
     # truncation is invisible on Ω. A rule that stopped at the cover's box would
     # deduplicate nothing here and leave all 16 duplicates.
     deep = overlay(space(Ωfold; cells=6, order=2, basis=bspline(),
-                         physical=physical_domain(x -> x[1] - 0.6; lipschitz=1.0,
-                                                  subcell_length_scale=0.125, max_depth=6)),
-                   box((0.0, -1.0), (1.0, 2.0)); cells=(4, 12), order=2)
+                         physical=physical_domain(x -> x[1] - 0.6; lipschitz=1.0, subcell_length_scale=0.125,
+                                                  max_depth=6)), box((0.0, -1.0), (1.0, 2.0)); cells=(4, 12), order=2)
     md, ld = _gram(deep)
     @test count(==(:dedup), ld.elimination_source) == 16
     @test active_unknowns(ld) == 74
@@ -1044,9 +1017,9 @@ end
     # keyed on whole cell boxes rejects them all because the base cell straddling
     # x = 1.1 is not contained in the cover's box even though its material part is.
     beyond = overlay(space(Ωfold; cells=6, order=2, basis=bspline(),
-                           physical=physical_domain(x -> x[1] - 1.1; lipschitz=1.0,
-                                                    subcell_length_scale=0.125, max_depth=6)),
-                     box((0.0, -1.0), (1.25, 2.0)); cells=(5, 12), order=2)
+                           physical=physical_domain(x -> x[1] - 1.1; lipschitz=1.0, subcell_length_scale=0.125,
+                                                    max_depth=6)), box((0.0, -1.0), (1.25, 2.0)); cells=(5, 12),
+                     order=2)
     mb, lb = _gram(beyond)
     @test count(==(:dedup), lb.elimination_source) == 24
     @test rank(Symmetric(Matrix(mb.matrix))) == active_unknowns(lb)
@@ -1060,8 +1033,7 @@ end
     # functions on Ω while reproducing neither on its own, and a dedup keyed on single
     # buried functions cannot see it.
     clamped_base = space(Ωfold; cells=6, order=2, basis=bspline(; continuity=0), physical=half())
-    clamped = overlay(clamped_base, box((0.0, -1.0), (1.0, 2.0)); cells=(4, 12), order=2,
-                      basis=bspline(; continuity=0))
+    clamped = overlay(clamped_base, box((0.0, -1.0), (1.0, 2.0)); cells=(4, 12), order=2, basis=bspline(; continuity=0))
     mc, lc = _gram(clamped)
     @test count(==(:dedup), lc.elimination_source) == 0
     @test active_unknowns(lc) == 104
@@ -1109,8 +1081,7 @@ end
     # spline of degree p + 1 is C^p at a simple knot, too smooth to carry the kink
     # of a degree-p one. Nothing is deduped, and nothing is rank deficient either.
     for over in (overlay(base(), B; cells=5, order=3), overlay(base(), B; cells=4, order=2),
-                 overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=2, basis=bspline()), B; cells=4,
-                         order=3))
+                 overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=2, basis=bspline()), B; cells=4, order=3))
         m, l = _gram(over)
         @test count(==(:dedup), l.elimination_source) == 0
         @test rank(Symmetric(Matrix(m.matrix))) == active_unknowns(l)
@@ -1156,10 +1127,9 @@ end
     graded(lo, hi) = [isodd(i + j) ? lo : hi for i in 1:4, j in 1:4]
     il(order; mode=:tensor) = space(Ω; cells=4, order=order, mode=mode).levels[1]
     bs(order; kw...) = space(Ω; cells=4, order=order, basis=bspline(; kw...)).levels[1]
-    levels = [il(1), il(2), il(3), il(4), il(3; mode=:trunk), il(4; mode=:trunk), il(graded(2, 3)),
-              il(graded(3, 4)), il(graded(3, 4); mode=:trunk), il((3, 2)), bs(1), bs(2), bs(3),
-              bs((1, 2)), bs((2, 3)), bs((3, 2)), bs(2; continuity=0), bs(3; continuity=0),
-              bs(3; continuity=1)]
+    levels = [il(1), il(2), il(3), il(4), il(3; mode=:trunk), il(4; mode=:trunk), il(graded(2, 3)), il(graded(3, 4)),
+              il(graded(3, 4); mode=:trunk), il((3, 2)), bs(1), bs(2), bs(3), bs((1, 2)), bs((2, 3)), bs((3, 2)),
+              bs(2; continuity=0), bs(3; continuity=0), bs(3; continuity=1)]
     for k in levels, level in levels
         @test Unfitted._reproduces(k, level) == _span_contains_by_definition(k, level)
     end
@@ -1183,8 +1153,8 @@ end
     # `ntuple` shows up. Degree 1 on 8 base cells buries `{i : i − 1 ≥ 3, i ≤ 6}` =
     # 3 functions per axis, so 27 of them in 3D.
     omega3 = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
-    V = overlay(space(omega3; cells=8, order=1, basis=bspline()),
-                box((0.25, 0.25, 0.25), (0.75, 0.75, 0.75)); cells=4, order=1)
+    V = overlay(space(omega3; cells=8, order=1, basis=bspline()), box((0.25, 0.25, 0.25), (0.75, 0.75, 0.75)); cells=4,
+                order=1)
     m, l = _gram(V)
     @test count(==(:dedup), l.elimination_source) == 27
     @test isposdef(Symmetric(Matrix(m.matrix)))
@@ -1197,8 +1167,7 @@ end
     # while keeping the L² error competitive for this smooth solution.
     smooth(x) = sin(pi * x[1]) * sinh(pi * x[2]) / sinh(pi)
     function build(overlay_basis, base_continuity)
-        V = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3,
-                  basis=bspline(continuity=base_continuity))
+        V = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3, basis=bspline(continuity=base_continuity))
         V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=8, order=3, basis=overlay_basis)
         u = field(:u, V)
         problem = poisson(V; source=0.0,
@@ -1208,8 +1177,7 @@ end
                                      dirichlet(smooth; on=boundary(axis=2, side=:upper))])
         model = prepare(problem)
         solution = solve!(model)
-        return (active=active_unknowns(model.dofs),
-                err=diagnostics(model, solution; exact=smooth).l2_error)
+        return (active=active_unknowns(model.dofs), err=diagnostics(model, solution; exact=smooth).l2_error)
     end
     c0 = build(bspline(; continuity=0), 0)
     c1 = build(bspline(; continuity=1), 0)
@@ -1239,8 +1207,7 @@ end
     mask_L = falses(4, 4)
     mask_L[1:4, 1] .= true
     mask_L[1, 2:4] .= true
-    Vover = overlay(Vbase, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3, basis=bspline(),
-                    active=mask_L)
+    Vover = overlay(Vbase, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3, basis=bspline(), active=mask_L)
     m, l = _gram(Vover)
     @test rank(Symmetric(Matrix(m.matrix))) == active_unknowns(l)
     @test _proj_residual(m, _one, _INT_ONE) < 1e-6
@@ -1258,8 +1225,7 @@ end
     Vbase = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=2)
     overlay_mask = falses(4, 4)
     overlay_mask[1:2, 1:2] .= true
-    Vover = overlay(Vbase, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3, basis=bspline(),
-                    active=overlay_mask)
+    Vover = overlay(Vbase, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3, basis=bspline(), active=overlay_mask)
     m, l = _gram(Vover)
     @test count(==(:dedup), l.elimination_source) == 0
     @test rank(Symmetric(Matrix(m.matrix))) == active_unknowns(l)

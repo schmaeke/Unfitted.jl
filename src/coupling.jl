@@ -105,8 +105,8 @@ end
 # parents are then classified per side. A sub-cell whose midpoint has no active
 # cover on one side (its trace lies outside that subdomain's active region) is
 # skipped. `field_a` / `field_b` are the resolved global field indices.
-function _interface_regions(iface::Interface, V_a::Space{D,T}, V_b::Space{D,T}, field_a::Int,
-                            field_b::Int, tol::GeometryTolerance{T}) where {D,T}
+function _interface_regions(iface::Interface, V_a::Space{D,T}, V_b::Space{D,T}, field_a::Int, field_b::Int,
+                            tol::GeometryTolerance{T}) where {D,T}
     merged = _grid_lines_for_levels((V_a.levels..., V_b.levels...), Val(D), tol)
     subdivided = _subdivide_mesh(iface.geometry, merged, tol)
     return _emit_interface_regions(subdivided, V_a, V_b, field_a, field_b, tol)
@@ -117,10 +117,9 @@ end
 # every interface a form names, and how assembly builds them for an interface
 # `prepare` did not see.
 function _interface_regions(iface::Interface, problem::Problem, layout::SystemLayout)
-    return _interface_regions(iface, _field_space(problem, iface.field_a),
-                              _field_space(problem, iface.field_b),
-                              _field_index(layout, iface.field_a),
-                              _field_index(layout, iface.field_b), layout.tolerance)
+    return _interface_regions(iface, _field_space(problem, iface.field_a), _field_space(problem, iface.field_b),
+                              _field_index(layout, iface.field_a), _field_index(layout, iface.field_b),
+                              layout.tolerance)
 end
 
 # The rule is sized per sub-cell from the cells that actually cover it, on both
@@ -131,9 +130,8 @@ end
 # side would resolve to the wrong level through the other's lookup. `rules`
 # precomputes every rule the sweep can reach, bounded by the larger of the two
 # spaces' nominal-order bounds.
-function _emit_interface_regions(subdivided::BoundaryMesh{D,T,K}, V_a::Space{D,T}, V_b::Space{D,T},
-                                 field_a::Int, field_b::Int,
-                                 tol::GeometryTolerance{T}) where {D,T,K}
+function _emit_interface_regions(subdivided::BoundaryMesh{D,T,K}, V_a::Space{D,T}, V_b::Space{D,T}, field_a::Int,
+                                 field_b::Int, tol::GeometryTolerance{T}) where {D,T,K}
     bound = max(maximum(_surface_quadrature_order(V_a)), maximum(_surface_quadrature_order(V_b)))
     rules = [_simplex_reference_quadrature(Val(K), n, T) for n in 1:bound]
     reference_area = _reference_area(Val(K))
@@ -146,11 +144,9 @@ function _emit_interface_regions(subdivided::BoundaryMesh{D,T,K}, V_a::Space{D,T
 
         n = max(maximum(_parent_quadrature_counts(Val(D), parents_a, id -> _level_by_id(V_a, id))),
                 maximum(_parent_quadrature_counts(Val(D), parents_b, id -> _level_by_id(V_b, id))))
-        points, weights, normals = _simplex_cell_quadrature(cell, cell_index, subdivided.normals,
-                                                            rules[n], reference_area, Val(K))
-        push!(regions,
-              InterfaceRegion{D,T}(field_a, field_b, parents_a, parents_b, points, weights,
-                                   normals))
+        points, weights, normals = _simplex_cell_quadrature(cell, cell_index, subdivided.normals, rules[n],
+                                                            reference_area, Val(K))
+        push!(regions, InterfaceRegion{D,T}(field_a, field_b, parents_a, parents_b, points, weights, normals))
     end
     return regions
 end
@@ -189,11 +185,9 @@ _negate_channels(x::Number) = -x
 # Wrap a bilinear form so its emitted channels are negated, preserving the
 # component-aware arity and the symmetry / linear metadata.
 function _negated_form(form::WeakForm)
-    bilinear = form.component_aware ?
-               ((q, trial, tc) -> _negate_channels(form.bilinear(q, trial, tc))) :
+    bilinear = form.component_aware ? ((q, trial, tc) -> _negate_channels(form.bilinear(q, trial, tc))) :
                ((q, trial) -> _negate_channels(form.bilinear(q, trial)))
-    return WeakForm(; bilinear, linear=form.linear, symmetric=form.symmetric,
-                    component_aware=form.component_aware)
+    return WeakForm(; bilinear, linear=form.linear, symmetric=form.symmetric, component_aware=form.component_aware)
 end
 
 """
@@ -307,8 +301,8 @@ directly with `block(test, trial, form; on = interface(uₐ, u_b, Γ))`.
 function couple(u_a::Field, u_b::Field, geometry::BoundaryMesh, form::WeakForm)
     iface = interface(u_a, u_b, geometry)
     neg = _negated_form(form)
-    return (block(u_a, u_a, form; on=iface), block(u_b, u_a, neg; on=iface),
-            block(u_a, u_b, neg; on=iface), block(u_b, u_b, form; on=iface))
+    return (block(u_a, u_a, form; on=iface), block(u_b, u_a, neg; on=iface), block(u_a, u_b, neg; on=iface),
+            block(u_b, u_b, form; on=iface))
 end
 
 """
@@ -326,11 +320,8 @@ function couple(u_a::Field, u_b::Field, geometry::BoundaryMesh, form::InterfaceF
     iface = interface(u_a, u_b, geometry)
     side_form(test_side, trial_side) = WeakForm(bilinear=(q, trial, tc) -> form.kernel(q,
                                                                                        (test=test_side,
-                                                                                        trial=trial_side),
-                                                                                       trial, tc),
+                                                                                        trial=trial_side), trial, tc),
                                                 symmetric=form.symmetric, component_aware=true)
-    return (block(u_a, u_a, side_form(:a, :a); on=iface),
-            block(u_a, u_b, side_form(:a, :b); on=iface),
-            block(u_b, u_a, side_form(:b, :a); on=iface),
-            block(u_b, u_b, side_form(:b, :b); on=iface))
+    return (block(u_a, u_a, side_form(:a, :a); on=iface), block(u_a, u_b, side_form(:a, :b); on=iface),
+            block(u_b, u_a, side_form(:b, :a); on=iface), block(u_b, u_b, side_form(:b, :b); on=iface))
 end

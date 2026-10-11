@@ -68,22 +68,19 @@ source(x) = -0.25 * radius(x)^(-1.5)
 # `max_order = n + 1`; each overlay covers a smaller box anchored at the
 # corner with a *lower* polynomial order, so the inner overlays add
 # their own local correction without ballooning the dof count.
-function singular_refinement_space(omega; no_refinements, overlay_ratio, base_cells, overlay_cells,
-                                   max_order)
+function singular_refinement_space(omega; no_refinements, overlay_ratio, base_cells, overlay_cells, max_order)
     V = space(omega; cells=base_cells, order=max_order)
 
     for i in 1:no_refinements
         side_length = overlay_ratio^i
         level_order = max(1, max_order - i)
-        V = overlay(V, box((0.0, 0.0), (side_length, side_length)); cells=overlay_cells,
-                    order=level_order)
+        V = overlay(V, box((0.0, 0.0), (side_length, side_length)); cells=overlay_cells, order=level_order)
     end
 
     return V
 end
 
-V = singular_refinement_space(omega; no_refinements, overlay_ratio, base_cells, overlay_cells,
-                              max_order)
+V = singular_refinement_space(omega; no_refinements, overlay_ratio, base_cells, overlay_cells, max_order)
 
 # Poisson problem with Dirichlet data only on the two non-corner edges.
 # The corner sides `x = 0` and `y = 0` are left natural — the symmetry
@@ -108,5 +105,5 @@ write_vtk(out, solution, model; subdivisions=4,
 
 print_run_report("2D singular square", report;
                  parameters=(:no_refinements => no_refinements, :overlay_ratio => overlay_ratio,
-                             :base_cells => base_cells, :overlay_cells => overlay_cells,
-                             :max_order => max_order), output=out)
+                             :base_cells => base_cells, :overlay_cells => overlay_cells, :max_order => max_order),
+                 output=out)

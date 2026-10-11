@@ -92,8 +92,7 @@ struct WeakForm{B,L}
     component_aware::Bool
 end
 
-function WeakForm(; bilinear=nothing, linear=nothing, symmetric::Bool=false,
-                  component_aware::Bool=false)
+function WeakForm(; bilinear=nothing, linear=nothing, symmetric::Bool=false, component_aware::Bool=false)
     (bilinear === nothing && linear === nothing) &&
         throw(ArgumentError("a WeakForm needs a bilinear part, a linear part, or both"))
     return WeakForm{typeof(bilinear),typeof(linear)}(bilinear, linear, symmetric, component_aware)
@@ -131,13 +130,9 @@ function TrialChannels(component::Integer, value::Real, gradient::SVector{D,<:Re
     return TrialChannels{D,T}(Int(component), convert(T, value), SVector{D,T}(gradient))
 end
 
-function TrialChannels(value::Real, gradient::SVector{D,<:Real}) where {D}
-    return TrialChannels(1, value, gradient)
-end
+TrialChannels(value::Real, gradient::SVector{D,<:Real}) where {D} = TrialChannels(1, value, gradient)
 
-function TrialChannels(value::Real, gradient::NTuple{D,<:Real}) where {D}
-    TrialChannels(value, SVector{D}(gradient))
-end
+TrialChannels(value::Real, gradient::NTuple{D,<:Real}) where {D} = TrialChannels(value, SVector{D}(gradient))
 
 """
     TestChannels(value, gradient)
@@ -177,9 +172,7 @@ function TestChannels(value::Real, gradient::SVector{D,<:Real}) where {D}
     return TestChannels{D,T}(convert(T, value), SVector{D,T}(gradient))
 end
 
-function TestChannels(value::Real, gradient::NTuple{D,<:Real}) where {D}
-    TestChannels(value, SVector{D}(gradient))
-end
+TestChannels(value::Real, gradient::NTuple{D,<:Real}) where {D} = TestChannels(value, SVector{D}(gradient))
 
 # Zero-vector gradient in the assembly scalar type, used as the default
 # test-gradient coefficient when a callback returns a scalar.
@@ -230,8 +223,7 @@ function _as_test_channels(channels::TestChannels{K}, ::Val{D}, ::Type{T}) where
                                      "mesh does not have"))
     gradient = channels.gradient
     return TestChannels{D,T}(convert(T, channels.value),
-                             SVector{D,T}(ntuple(i -> i ≤ K ? convert(T, gradient[i]) : zero(T),
-                                                 Val(D))))
+                             SVector{D,T}(ntuple(i -> i ≤ K ? convert(T, gradient[i]) : zero(T), Val(D))))
 end
 
 # Scalar contraction `channels.value × test_value`. Used by the Dirichlet
@@ -370,9 +362,7 @@ both sides of a form that declares both. That is why the habit the convenience
 path teaches does not carry over here: on the multi-field path the two sides are
 two separate attachments.
 """
-function block(test_field::Field, trial_field::Field, form; on=nothing)
-    return BlockForm(test_field.name, trial_field.name, form, on)
-end
+block(test_field::Field, trial_field::Field, form; on=nothing) = BlockForm(test_field.name, trial_field.name, form, on)
 
 """
     loadform(test_field::Field, form; on=nothing) -> LoadForm
@@ -535,8 +525,7 @@ end
 function _check_dirichlet(dirichlet, fields::Tuple)
     for condition in dirichlet
         name = condition.field
-        index = name === nothing ? (length(fields) == 1 ? 1 : nothing) :
-                findfirst(f -> f.name === name, fields)
+        index = name === nothing ? (length(fields) == 1 ? 1 : nothing) : findfirst(f -> f.name === name, fields)
         index === nothing && continue
         owner = fields[index]
         _check_component(condition.component, owner)
@@ -551,12 +540,10 @@ function Problem(fields::Tuple; blocks=(), loads=(), dirichlet=[], symmetric=not
     _check_form_fields(block_tuple, names)
     _check_form_fields(load_tuple, names)
     _check_dirichlet(dirichlet, fields)
-    symmetric_value = symmetric === nothing ? all(block -> block.form.symmetric, block_tuple) :
-                      Bool(symmetric)
+    symmetric_value = symmetric === nothing ? all(block -> block.form.symmetric, block_tuple) : Bool(symmetric)
     D = length(space_data.domain.lower)
     T = eltype(space_data.domain.lower)
-    return Problem{D,T,typeof(space_data),typeof(fields),typeof(block_tuple),typeof(load_tuple)}(space_data,
-                                                                                                 fields,
+    return Problem{D,T,typeof(space_data),typeof(fields),typeof(block_tuple),typeof(load_tuple)}(space_data, fields,
                                                                                                  block_tuple,
                                                                                                  load_tuple,
                                                                                                  collect(dirichlet),

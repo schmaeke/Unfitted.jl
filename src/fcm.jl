@@ -214,8 +214,7 @@ function _build_moment_matrix(points::Vector{SVector{D,T}}, region_box::AxisBox{
     A = Matrix{T}(undef, length(indices), npoints)
     factors = _legendre_factor_buffers(moment_order, T)
     @inbounds for j in 1:npoints
-        _fill_legendre_factors!(factors, points[j], region_box.lower, region_box.upper,
-                                moment_order)
+        _fill_legendre_factors!(factors, points[j], region_box.lower, region_box.upper, moment_order)
         for (a, idx) in pairs(indices)
             A[a, j] = _tensor_legendre_value(factors, idx)
         end
@@ -246,9 +245,8 @@ end
 # entries are copied out before the loop runs, so no second full-length array is
 # needed — which matters, because the candidate cloud is thousands of points
 # wide while the rule handed back is `nbasis` wide.
-function _solve_moment_fit(moments::Vector{T}, points::Vector{SVector{D,T}},
-                           region_box::AxisBox{D,T}, moment_order::NTuple{D,Int},
-                           cut_volume::T) where {D,T}
+function _solve_moment_fit(moments::Vector{T}, points::Vector{SVector{D,T}}, region_box::AxisBox{D,T},
+                           moment_order::NTuple{D,Int}, cut_volume::T) where {D,T}
     A = _build_moment_matrix(points, region_box, moment_order)
     weights, _ = nnls(A, moments)
     cutoff = _NNLS_WEIGHT_TOL * cut_volume
@@ -266,14 +264,13 @@ end
 
 # Tensor Legendre moments mₐ = ∫_{Ω∩R} ψₐ dx recovered from an implicit volume
 # rule by direct summation; reuses the per-axis Legendre tables of section 2.
-function _moments_from_rule(points::Vector{SVector{D,T}}, weights::Vector{T},
-                            region_box::AxisBox{D,T}, moment_order::NTuple{D,Int}) where {D,T}
+function _moments_from_rule(points::Vector{SVector{D,T}}, weights::Vector{T}, region_box::AxisBox{D,T},
+                            moment_order::NTuple{D,Int}) where {D,T}
     indices = _moment_basis_indices(moment_order)
     moments = zeros(T, length(indices))
     factors = _legendre_factor_buffers(moment_order, T)
     @inbounds for q in eachindex(weights)
-        _fill_legendre_factors!(factors, points[q], region_box.lower, region_box.upper,
-                                moment_order)
+        _fill_legendre_factors!(factors, points[q], region_box.lower, region_box.upper, moment_order)
         wq = weights[q]
         for (a, idx) in pairs(indices)
             moments[a] += wq * _tensor_legendre_value(factors, idx)
@@ -353,8 +350,7 @@ const _MAX_FIT_MATRIX_ENTRIES = 6_000_000
 # each attempt draws a genuinely denser cloud. The `max` keeps the first
 # attempt's `6 · nbasis` budget exempt from the ceiling, so the entry point of
 # the pipeline behaves identically at every moment order.
-function _cap_candidates(points::Vector{SVector{D,T}}, moment_order::NTuple{D,Int},
-                         budget::Int) where {D,T}
+function _cap_candidates(points::Vector{SVector{D,T}}, moment_order::NTuple{D,Int}, budget::Int) where {D,T}
     nbasis = _moment_basis_count(moment_order)
     cap = min(budget * nbasis, max(6 * nbasis, cld(_MAX_FIT_MATRIX_ENTRIES, nbasis)))
     n = length(points)
@@ -483,8 +479,8 @@ is a safety net against the silently wrong answer an empty rule would give, not 
 substitute for an adequate mesh. `AssemblyDiagnostics.cut_fallback_count` and
 `cut_fallback_points` report how often it fired and what it cost.
 """
-function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T},
-                         moment_order::NTuple{D,Int}; target_residual::Real=1.0e-10) where {D,T}
+function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T}, moment_order::NTuple{D,Int};
+                         target_residual::Real=1.0e-10) where {D,T}
     target = T(target_residual)
     q0 = _implicit_gauss_points(moment_order)
     max_subdiv = _effective_subcell_depth(physical, region_box)
@@ -516,9 +512,8 @@ function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T},
         # comes from both knobs at once — a higher fiber Gauss order emits more
         # rule points, a larger budget lets more of them past `_cap_candidates`.
         q = q0 + (attempt - 1)
-        saye_pts, saye_ws = implicit_volume_quadrature(leaf_fs, membership, region_box;
-                                                       gauss_points=q, max_subdiv=max_subdiv,
-                                                       lipschitz=leaf_ls)
+        saye_pts, saye_ws = implicit_volume_quadrature(leaf_fs, membership, region_box; gauss_points=q,
+                                                       max_subdiv=max_subdiv, lipschitz=leaf_ls)
         isempty(saye_pts) && return SVector{D,T}[], T[], zero(T), :empty
         moments = _moments_from_rule(saye_pts, saye_ws, region_box, moment_order)
         # `target_residual` is a RELATIVE tolerance, so the comparison needs the
@@ -540,8 +535,7 @@ function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T},
         # which is the safe direction.
         moment_scale = norm(moments)
         candidates = _cap_candidates(saye_pts, moment_order, _candidate_budget(attempt))
-        kept, kept_ws, residual = _solve_moment_fit(moments, candidates, region_box, moment_order,
-                                                    sum(saye_ws))
+        kept, kept_ws, residual = _solve_moment_fit(moments, candidates, region_box, moment_order, sum(saye_ws))
         # A fit whose every weight falls under the truncation cutoff is no rule at
         # all: hand back the same `:empty` an empty kernel rule returns, so the
         # caller drops the region (or keeps its α-stabilised tensor part) instead

@@ -207,8 +207,7 @@ the two models must agree on the space bounding box, the field names, and
 the per-field component counts.
 """
 function transfer(source_solution::Solution, source_model::Model{D,T}, target_model::Model{D,T};
-                  via::TransferBackend=L2Projection(),
-                  tolerance=target_model.dofs.tolerance) where {D,T}
+                  via::TransferBackend=L2Projection(), tolerance=target_model.dofs.tolerance) where {D,T}
     return _transfer!(source_solution, source_model, target_model, via, tolerance)
 end
 
@@ -293,8 +292,7 @@ function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_
 
     coefficients = F === Nothing ? mass \ rhs : backend.factor \ rhs
     residual = norm(mass * coefficients - rhs)
-    return Solution(coefficients, target_model.version,
-                    SolverDiagnostics(:l2_projection, Float64(residual), true))
+    return Solution(coefficients, target_model.version, SolverDiagnostics(:l2_projection, Float64(residual), true))
 end
 
 # Sanity-check the source / target compatibility for a transfer: the same
@@ -343,16 +341,15 @@ function _transfer_regions(source_model::Model{D,T}, target_model::Model{D,T};
         target_parents = _parents_covering(target_model.problem.space.levels, box, tolerance)
         isempty(target_parents) && continue
         source_parents = _parents_covering(source_model.problem.space.levels, box, tolerance)
-        quadrature = _transfer_quadrature(source_model, target_model, target_parents,
-                                          source_parents, quadrature_cache)
+        quadrature = _transfer_quadrature(source_model, target_model, target_parents, source_parents, quadrature_cache)
         push!(regions, TransferRegion{D,T}(box, target_parents, source_parents, quadrature))
     end
 
     return regions
 end
 
-function _transfer_quadrature(source_model::Model{D,T}, target_model::Model{D,T}, target_parents,
-                              source_parents, cache) where {D,T}
+function _transfer_quadrature(source_model::Model{D,T}, target_model::Model{D,T}, target_parents, source_parents,
+                              cache) where {D,T}
     counts = _transfer_quadrature_counts(source_model, target_model, target_parents, source_parents)
     return _cached_tensor_quadrature!(cache, counts, T)
 end
@@ -409,8 +406,8 @@ end
 # per row in point order. A pivot target is condensed onto its branches before
 # the local rhs is added to the global one. A region the source does not cover
 # contributes nothing (`u_S ≡ 0` there) and is skipped.
-function _transfer_rhs_regions!(rhs::Vector{T}, target::AssemblyWorkspace{D,T},
-                                source::AssemblyWorkspace, state::FormState, regions) where {D,T}
+function _transfer_rhs_regions!(rhs::Vector{T}, target::AssemblyWorkspace{D,T}, source::AssemblyWorkspace,
+                                state::FormState, regions) where {D,T}
     # Target field `f`'s component `c` reads the source field of the same name.
     source_field = [_field_index(source.layout, fl.name) for fl in target.layout.fields]
     for region in regions
@@ -418,8 +415,7 @@ function _transfer_rhs_regions!(rhs::Vector{T}, target::AssemblyWorkspace{D,T},
         # Each side as the kernel's helpers see a region, a parent list, so
         # `_frame!`, `_refresh!` and the state evaluation run on it unchanged,
         # with `region_parents` and `_parent_lists` taking their defaults.
-        target_view, source_view = (; parents=region.target_parents),
-                                   (; parents=region.source_parents)
+        target_view, source_view = (; parents=region.target_parents), (; parents=region.source_parents)
         n = _slots!(_frame!(target, target_view))
         m = n + length(target.pivots)
         _state_region!(state, _frame!(source, source_view))
@@ -453,8 +449,8 @@ end
 # field error of 2.0. A source-free dof with no counterpart, or with a
 # constrained one, is an error under `strict = true` and silently skipped
 # otherwise; a source-constrained dof never is.
-function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_model::Model{D,T},
-                    backend::Rewire, _tolerance) where {D,T}
+function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_model::Model{D,T}, backend::Rewire,
+                    _tolerance) where {D,T}
     # Rewire walks raw `TensorDofKey`s, never the geometry — the
     # geometric merge tolerance accepted by `transfer` has no role
     # here and is ignored on purpose.

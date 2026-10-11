@@ -156,8 +156,7 @@ segment_count(r) = ceil(Int, 2π * r / SEGMENT_LENGTH)
 
 function circle_mesh(r, orientation)
     n = segment_count(r)
-    vertices = [SVector(r * cos(orientation * t), r * sin(orientation * t))
-                for t in range(0.0, 2π; length=n + 1)[1:n]]
+    vertices = [SVector(r * cos(orientation * t), r * sin(orientation * t)) for t in range(0.0, 2π; length=n + 1)[1:n]]
     return polyline_mesh(vertices; closed=true)
 end
 
@@ -256,10 +255,8 @@ package reports them rather than silently discarding them.
 =#
 
 print_run_report("Tutorial 3 — Poisson on an immersed annulus (FCM + Nitsche)", report;
-                 parameters=(:r_inner => R_INNER, :r_outer => R_OUTER,
-                             :embedding_box => "[-0.8, 0.8]²", :cells => V.levels[1].mesh.cells,
-                             :order => nominal_order(V.levels[1]),
-                             :subcell_length_scale => annulus.subcell_length_scale,
-                             :nitsche_beta => BETA, :nitsche_h => H,
-                             :outer_rim_segments => length(outer_rim.cells),
+                 parameters=(:r_inner => R_INNER, :r_outer => R_OUTER, :embedding_box => "[-0.8, 0.8]²",
+                             :cells => V.levels[1].mesh.cells, :order => nominal_order(V.levels[1]),
+                             :subcell_length_scale => annulus.subcell_length_scale, :nitsche_beta => BETA,
+                             :nitsche_h => H, :outer_rim_segments => length(outer_rim.cells),
                              :inner_rim_segments => length(inner_rim.cells)))

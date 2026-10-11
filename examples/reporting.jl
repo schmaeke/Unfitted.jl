@@ -61,8 +61,8 @@ function print_level_block(report)
         # above this one. It is reported because losing it is otherwise invisible:
         # the operator stays full rank with a clean residual while the space it
         # spans has quietly shrunk.
-        print("    ", level.id, " ", level.role, " cells=", level.cells, " order=", level.order,
-              " mode=", level.mode, " basis=", level.basis)
+        print("    ", level.id, " ", level.role, " cells=", level.cells, " order=", level.order, " mode=", level.mode,
+              " basis=", level.basis)
         hasproperty(level, :nested) && print(" nested=", level.nested)
         # `order` is the level's NOMINAL order — the per-axis maximum over its
         # cells — and stays that, so a reader who has always read this field keeps
@@ -149,8 +149,7 @@ function print_run_report(title, report; parameters=(), output=nothing)
     print_optional_report_value("surface regions", report, :surface_region_count)
     print_small_overlap_block(report)
     print_optional_report_value("min integration volume", report, :min_integration_volume)
-    print_optional_report_value("min relative integration volume", report,
-                                :min_relative_integration_volume)
+    print_optional_report_value("min relative integration volume", report, :min_relative_integration_volume)
     print_optional_report_value("inactive cell counts", report, :inactive_cell_counts)
     print_optional_report_value("reduced mode counts", report, :reduced_mode_counts)
     print_optional_report_value("cut region count", report, :cut_region_count)

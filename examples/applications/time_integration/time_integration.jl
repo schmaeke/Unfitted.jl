@@ -189,12 +189,12 @@ primary = first(results)
 
 println("Transient heat conduction, t = 0 → ", t_final, " — spatial operators fixed, ",
         "time stepping by OrdinaryDiffEq.jl")
-println("  ", rpad("integrator", 14), rpad("accepted", 10), rpad("rejected", 10),
-        rpad("rhs evals", 12), "final rel. L² error")
+println("  ", rpad("integrator", 14), rpad("accepted", 10), rpad("rejected", 10), rpad("rhs evals", 12),
+        "final rel. L² error")
 for ((name, _), result) in zip(integrators, results)
     stats = result.ode_solution.stats
-    println("  ", rpad(name, 14), rpad(stats.naccept, 10), rpad(stats.nreject, 10),
-            rpad(stats.nf, 12), round(result.l2; sigdigits=6))
+    println("  ", rpad(name, 14), rpad(stats.naccept, 10), rpad(stats.nreject, 10), rpad(stats.nf, 12),
+            round(result.l2; sigdigits=6))
 end
 println()
 println("  operators assembled once, then reused for every step of both runs:")
@@ -210,5 +210,5 @@ write_vtk(out, primary.final, model;
 
 print_run_report("Transient heat conduction — $(primary_name) at t = $(t_final)",
                  diagnostics(model, primary.final; exact=x -> exact(x, t_final)); output=out,
-                 parameters=(:cells => cells, :order => order, :t_final => t_final,
-                             :integrator => primary_name, :reltol => reltol, :abstol => abstol))
+                 parameters=(:cells => cells, :order => order, :t_final => t_final, :integrator => primary_name,
+                             :reltol => reltol, :abstol => abstol))

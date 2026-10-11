@@ -244,8 +244,7 @@ end
 # sheds its would-be child's: measured on a depth-2 ladder with level 3 live over
 # a base cell and level 2 empty, activating level 2 under it moved the active
 # unknowns by exactly zero, 97 before and 97 after.
-function _has_h_step(V::Space{D}, k::Integer, cell::CartesianIndex{D},
-                     live=_live_levels(V)) where {D}
+function _has_h_step(V::Space{D}, k::Integer, cell::CartesianIndex{D}, live=_live_levels(V)) where {D}
     k < length(V.levels) || return false
     mask = V.levels[k + 1].mask
     for c in _cell_block(V, k, k + 1, cell)
@@ -263,8 +262,7 @@ end
 # them on its finest level. The mask scan is one pass over a `BitArray`, cheap
 # against the per-cell dof lookup and the vector it allocates per component.
 function _live_cells(level::Level)
-    level.mask === nothing ? cell_indices(level.mesh) :
-    CartesianIndices(level.mask.on)[level.mask.on]
+    level.mask === nothing ? cell_indices(level.mesh) : CartesianIndices(level.mask.on)[level.mask.on]
 end
 
 # `V` with every cell's order raised by `inc`. A uniform level is raised as a
@@ -280,8 +278,7 @@ end
 # no `Pair{Int,Any}` accumulator is needed to hold the two shapes together.
 function _enriched_space(V::Space{D,T}, inc::Int) where {D,T}
     raised(k) = (o=V.levels[k].orders;
-                 length(o.palette) == 1 ? o.nominal .+ inc :
-                 map(p -> p .+ inc, cell_orders(V; level=k)))
+                 length(o.palette) == 1 ? o.nominal .+ inc : map(p -> p .+ inc, cell_orders(V; level=k)))
     graded = [k for k in 1:length(V.levels) if _supports_cell_order(V.levels[k].basis)]
     W = isempty(graded) ? V : elevate(V, (k => raised(k) for k in graded)...)
     twins = Tuple{Int,Int,Int}[]
@@ -321,8 +318,8 @@ function _refinement_twin(W::Space{D,T}, level::Level{D,T}, factor::Int) where {
         end
         mask = on
     end
-    return overlay(W, level.mesh.domain; cells=cells, order=nominal_order(level), basis=level.basis,
-                   mode=level.mode, active=mask)
+    return overlay(W, level.mesh.domain; cells=cells, order=nominal_order(level), basis=level.basis, mode=level.mode,
+                   active=mask)
 end
 
 """
@@ -458,9 +455,8 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     _assert_single_domain(model, "estimate")
     enrichment >= 1 || throw(ArgumentError("enrichment must be at least 1; got $enrichment"))
     V = model.prefold_space
-    model.matrix === nothing &&
-        throw(ArgumentError("estimate: the model has not been assembled; call `solve!` or " *
-                            "`assemble!` before estimating"))
+    model.matrix === nothing && throw(ArgumentError("estimate: the model has not been assembled; call `solve!` or " *
+                                                    "`assemble!` before estimating"))
     # Before the expensive half: the enriched twin below re-runs THESE forms on
     # a different quadrature cloud, and a form keyed by `q.point` reads the
     # wrong points there without raising. `data.jl` carries the search and the
@@ -490,10 +486,8 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     # `R = b⁺ − A⁺u⁺`; `b⁺` and the diagonal on `W` are untouched; and `A⁺` being
     # singular is harmless here, since the indicator reads its diagonal and forms one
     # matrix–vector product and never factorises.
-    options = isempty(exempt) ? model.plan_options :
-              merge(model.plan_options, (; prune_exempt=exempt))
-    plus = _prepared_model(_problem_with_space(model.problem, enriched_space), options,
-                           model.moment_fit_caches)
+    options = isempty(exempt) ? model.plan_options : merge(model.plan_options, (; prune_exempt=exempt))
+    plus = _prepared_model(_problem_with_space(model.problem, enriched_space), options, model.moment_fit_caches)
     _on_foreign_cloud(plus.version) do
         assemble!(plus)
     end
@@ -560,17 +554,15 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
                 active == 0 && continue                   # constrained away
                 if !counted[active]
                     counted[active] = true
-                    in_W[raw] ? (residual_W += residual[active]^2) :
-                    (residual_V += residual[active]^2)
+                    in_W[raw] ? (residual_W += residual[active]^2) : (residual_V += residual[active]^2)
                 end
                 in_W[raw] || continue
                 d = diagonal[active]
-                d > 0 ||
-                    throw(ArgumentError("estimate: the enriched diagonal of a complement mode on " *
-                                        "level $k, cell $cell, component $component is $d. The " *
-                                        "Bank–Weiser indicator reads that diagonal as the mode's " *
-                                        "energy, so it needs a coercive form; on this one the " *
-                                        "indicator has no meaning."))
+                d > 0 || throw(ArgumentError("estimate: the enriched diagonal of a complement mode on " *
+                                             "level $k, cell $cell, component $component is $d. The " *
+                                             "Bank–Weiser indicator reads that diagonal as the mode's " *
+                                             "energy, so it needs a coercive form; on this one the " *
+                                             "indicator has no meaning."))
                 cells[k][cell] += residual[active]^2 / d / incidence[raw]
             end
         end
@@ -773,9 +765,7 @@ const _History{D,T} = Tuple{Space{D,T},ErrorEstimate{D,T}}
 # themselves rather than from an assumed bisection: ρ is the volume ratio, so
 # ρ^{1/D} is the mesh size the h^p law of the energy norm refers to. See the
 # note above for why a scalar rate on an anisotropic split is a judgement.
-function _h_rate(fine::AxisBox, coarse::AxisBox, q::Int, ::Val{D}) where {D}
-    return (volume(fine) / volume(coarse))^(q / D)
-end
+_h_rate(fine::AxisBox, coarse::AxisBox, q::Int, ::Val{D}) where {D} = (volume(fine) / volume(coarse))^(q / D)
 
 # The indicator this cell was predicted to have by now, read off what happened to
 # it between `previous` and `V`. Nothing is stored between cycles: the previous
@@ -790,8 +780,7 @@ end
 # over the whole level, to answer a question about the handful of cells a cycle
 # marks. On the tanh ladder's finest level — 192² cells — that is a measured
 # 589 872 bytes per copy to read a few dozen entries.
-function _predicted(V::Space{D,T}, previous::_History{D,T}, k::Integer,
-                    cell::CartesianIndex{D}) where {D,T}
+function _predicted(V::Space{D,T}, previous::_History{D,T}, k::Integer, cell::CartesianIndex{D}) where {D,T}
     Vprev, eprev = previous
     k <= length(Vprev.levels) || return T(Inf)
     q = minimum(cell_order(V.levels[k], cell))
@@ -810,10 +799,7 @@ function _predicted(V::Space{D,T}, previous::_History{D,T}, k::Integer,
         parent === nothing && return T(Inf)              # no parent carried any error
         n = length(_cell_block(Vprev, k - 1, k, parent))
         rate = _h_rate(cell_box(V, cell; level=k), cell_box(Vprev, parent; level=k - 1), q, Val(D))
-        return η *
-               T(_GAMMA_H) *
-               T(rate) *
-               T(_GAMMA_P)^(q - minimum(cell_order(Vprev.levels[k - 1], parent))) /
+        return η * T(_GAMMA_H) * T(rate) * T(_GAMMA_P)^(q - minimum(cell_order(Vprev.levels[k - 1], parent))) /
                sqrt(T(max(n, 1)))
     end
 
@@ -831,14 +817,11 @@ function _predicted(V::Space{D,T}, previous::_History{D,T}, k::Integer,
         block = _cell_block(Vprev, k, k + 1, cell)
         released = zero(T)
         for ch in block
-            (is_active(Vprev.levels[k + 1].mask, ch) && !is_active(V.levels[k + 1].mask, ch)) ||
-                continue
-            released += (eprev.cells[k + 1][ch] *
-                         T(_GAMMA_P)^(q - minimum(cell_order(Vprev.levels[k + 1], ch))))^2
+            (is_active(Vprev.levels[k + 1].mask, ch) && !is_active(V.levels[k + 1].mask, ch)) || continue
+            released += (eprev.cells[k + 1][ch] * T(_GAMMA_P)^(q - minimum(cell_order(Vprev.levels[k + 1], ch))))^2
         end
         if released > 0
-            rate = _h_rate(cell_box(Vprev, first(block); level=k + 1),
-                           cell_box(Vprev, cell; level=k), q, Val(D))
+            rate = _h_rate(cell_box(Vprev, first(block); level=k + 1), cell_box(Vprev, cell; level=k), q, Val(D))
             return sqrt(released) / (T(_GAMMA_H) * T(rate))
         end
     end
@@ -859,12 +842,10 @@ end
 # A `(level, cell)` mark against the space it names. Both halves are checked
 # here, because the alternative is a `BoundsError` raised from inside the
 # prediction or the order field, naming an array the caller never handed over.
-function _check_mark(V::Space{D}, k::Integer, cell::CartesianIndex{D},
-                     verb::AbstractString) where {D}
+function _check_mark(V::Space{D}, k::Integer, cell::CartesianIndex{D}, verb::AbstractString) where {D}
     k = _check_level(V, k, "$verb: marked level")
     checkbounds(Bool, CartesianIndices(V.levels[k].mesh.cells), cell) ||
-        throw(ArgumentError("$verb: marked cell $cell is outside level $k's cell grid " *
-                            "$(V.levels[k].mesh.cells)"))
+        throw(ArgumentError("$verb: marked cell $cell is outside level $k's cell grid " * "$(V.levels[k].mesh.cells)"))
     return k
 end
 
@@ -921,8 +902,7 @@ function decide(V::Space{D,T}, estimate::ErrorEstimate{D,T}, marked; pmax::Integ
     if previous !== nothing
         Vprev, eprev = previous
         _check_estimate(Vprev, eprev, "previous")
-        all(k -> V.levels[k].mesh.cells == Vprev.levels[k].mesh.cells,
-            1:min(length(V.levels), length(Vprev.levels))) ||
+        all(k -> V.levels[k].mesh.cells == Vprev.levels[k].mesh.cells, 1:min(length(V.levels), length(Vprev.levels))) ||
             throw(DimensionMismatch("previous: a shared level's cell grid differs from this " *
                                     "space's, so a cell's history cannot be read at its own index"))
     end
@@ -948,9 +928,8 @@ function decide(V::Space{D,T}, estimate::ErrorEstimate{D,T}, marked; pmax::Integ
                     !all(>=(Int(pmax)), cell_order(V.levels[k], cell)) &&
                     _is_leaf(V, k, cell, live)
         h_offered || p_offered || continue
-        take_p = p_offered && (!h_offered ||
-                               previous === nothing ||
-                               estimate.cells[k][cell] < _predicted(V, previous, k, cell))
+        take_p = p_offered &&
+                 (!h_offered || previous === nothing || estimate.cells[k][cell] < _predicted(V, previous, k, cell))
         push!(take_p ? p : h, (k, cell))
     end
     return h, p
@@ -1272,8 +1251,7 @@ function coarsen(V::Space{D,T}; h=(), p=(), pmin::Integer=1) where {D,T}
 
     for (k, cell) in h
         _check_mark(V, k, cell, "coarsen")
-        k < nlevels ||
-            throw(ArgumentError("coarsen: level $k is the finest, so it covers nothing to release"))
+        k < nlevels || throw(ArgumentError("coarsen: level $k is the finest, so it covers nothing to release"))
         block = _cell_block(V, k, k + 1, cell)
         mask = mask_of(k + 1)
         carries_order = _supports_cell_order(V.levels[k + 1].basis)
@@ -1358,8 +1336,7 @@ function coarsen(V::Space{D,T}; h=(), p=(), pmin::Integer=1) where {D,T}
     filter!(kv -> kv.second != cell_orders(V; level=kv.first), fields)
     isempty(masks) && isempty(fields) && return V
 
-    released = isempty(masks) ? V :
-               adapt(V, (k => masks[k] for k in sort!(collect(keys(masks))))...)
+    released = isempty(masks) ? V : adapt(V, (k => masks[k] for k in sort!(collect(keys(masks))))...)
     isempty(fields) && return released
     return elevate(released, (k => fields[k] for k in sort!(collect(keys(fields))))...)
 end

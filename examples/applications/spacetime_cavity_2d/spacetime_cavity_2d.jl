@@ -243,8 +243,7 @@ const cells_per_axis = env("SC_CELLS", 6)
 const order = (2, 2, 3)
 
 domain = physical_domain(cavity; alpha=1.0e-6, subcell_length_scale=L / (4 * cells_per_axis))
-V = space(box((0.0, 0.0, 0.0), (L, L, T_end)); cells=ntuple(_ -> cells_per_axis, 3), order=order,
-          physical=domain)
+V = space(box((0.0, 0.0, 0.0), (L, L, T_end)); cells=ntuple(_ -> cells_per_axis, 3), order=order, physical=domain)
 const θ = field(:θ, V)
 const u = field(:u, V; components=2)
 
@@ -266,8 +265,7 @@ bcs = [dirichlet(temperature; on=boundary(:all; except=(axis=3, side=:upper)), f
 # `block` carries the bilinear side only, so the manufactured source is attached
 # as its own load. The displacement rows take no load: everything that drives
 # them arrives through the `(u, θ)` block.
-problem = Problem((θ, u);
-                  blocks=(block(θ, θ, heat), block(u, u, elasticity), block(u, θ, eigenstrain)),
+problem = Problem((θ, u); blocks=(block(θ, θ, heat), block(u, u, elasticity), block(u, θ, eigenstrain)),
                   loads=(source_load(θ; source=heat_source),), dirichlet=bcs)
 
 model = prepare(problem)
@@ -288,9 +286,7 @@ write_quadrature_vtm(out * "_quadrature", model)
 
 print_run_report("Growing cavity in a plate — space-time thermo-elasticity", report;
                  parameters=(:cells => V.levels[1].mesh.cells, :order => nominal_order(V.levels[1]),
-                             :cavity_radius => (r₀, radius(T_end)), :growth_rate => ṙ,
-                             :lipschitz => sqrt(1 + ṙ^2), :diffusivity => κ, :E => E, :nu => ν,
-                             :thermal_expansion => α_T,
-                             :geometry => "Ω = plate ∖ { ‖xₛ − c‖ ≤ r(t) }, one cone leaf",
-                             :alpha => domain.alpha,
+                             :cavity_radius => (r₀, radius(T_end)), :growth_rate => ṙ, :lipschitz => sqrt(1 + ṙ^2),
+                             :diffusivity => κ, :E => E, :nu => ν, :thermal_expansion => α_T,
+                             :geometry => "Ω = plate ∖ { ‖xₛ − c‖ ≤ r(t) }, one cone leaf", :alpha => domain.alpha,
                              :subcell_length_scale => domain.subcell_length_scale), output=out)

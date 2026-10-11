@@ -27,8 +27,7 @@ end
     base_coefficients = copy(coefficients)
     base_coefficients[overlay_dofs[3]] = 0.0
     solution = Solution(coefficients, model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
-    base_solution = Solution(base_coefficients, model.version,
-                             Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    base_solution = Solution(base_coefficients, model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
     @test value(solution, model, (0.1,)) ≈ value(base_solution, model, (0.1,))
 
@@ -90,10 +89,8 @@ end
 
     @test_throws ArgumentError value(solution, model, (0.5,))
     @test_throws ArgumentError l2_error(solution, model, x -> 0.0)
-    @test_throws ArgumentError value(Solution(ones(Unfitted.active_unknowns(model.dofs)),
-                                              model.version,
-                                              Unfitted.SolverDiagnostics(:manual, 0.0, true)),
-                                     model, (1.5,))
+    @test_throws ArgumentError value(Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
+                                              Unfitted.SolverDiagnostics(:manual, 0.0, true)), model, (1.5,))
 end
 
 @testset "active_unknowns(model) public accessor" begin
@@ -137,8 +134,7 @@ end
     @test boundary_integral(q -> 1.0, model; on=boundary(:all)) ≈ 4.0
     @test boundary_integral(q -> 1.0, model; on=boundary(axis=1, side=:lower)) ≈ 1.0
     @test boundary_integral(q -> 1.0, model; on=boundary(axis=2, side=:upper)) ≈ 1.0
-    @test boundary_integral(q -> 1.0, model;
-                            on=boundary((axis=1, side=:lower), (axis=2, side=:lower))) ≈ 1.0  # codim-2 point
+    @test boundary_integral(q -> 1.0, model; on=boundary((axis=1, side=:lower), (axis=2, side=:lower))) ≈ 1.0  # codim-2 point
 
     # 3D unit cube: ∫_∂Ω 1 ds == 6 (six unit faces), per-face == 1.
     cube = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
@@ -160,8 +156,7 @@ end
     model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(exact_value; on=boundary(:all))]))
     sol = solve!(model)
 
-    top_trace = boundary_integral(q -> value(sol, model, q.x), model;
-                                  on=boundary(axis=2, side=:upper))
+    top_trace = boundary_integral(q -> value(sol, model, q.x), model; on=boundary(axis=2, side=:upper))
     @test top_trace ≈ 0.5 atol = 1.0e-10
 
     right_flux = boundary_integral(model; on=boundary(axis=1, side=:upper)) do q
@@ -299,8 +294,7 @@ end
     ss = solve!(single)
     exact = x -> x[1] * (1 - x[1])
     @test l2_error(ss, single, exact) === l2_error(ss, single, u, exact)
-    @test l2_error(ss, single, exact; norm=:absolute) ===
-          l2_error(ss, single, u, exact; norm=:absolute)
+    @test l2_error(ss, single, exact; norm=:absolute) === l2_error(ss, single, u, exact; norm=:absolute)
 end
 
 @testset "model.facet_regions caches one entry per Dirichlet selector" begin

@@ -84,14 +84,11 @@ struct BoundaryMesh{D,T<:Real,K,C}
     normals::Union{Nothing,Vector{SVector{D,T}}}
 
     function BoundaryMesh{D,T,K}(cells::Vector{NTuple{KP,SVector{D,T}}},
-                                 normals::Union{Nothing,Vector{SVector{D,T}}}) where {D,T<:Real,K,
-                                                                                      KP}
-        KP == K + 1 || throw(ArgumentError("BoundaryMesh{$D,$T,$K} expects $(K+1)-vertex cells, " *
-                                           "got $KP-vertex tuples"))
-        0 <= K <= D ||
-            throw(ArgumentError("BoundaryMesh simplex dimension K=$K must satisfy 0 ≤ K ≤ D=$D"))
-        D <= 3 ||
-            throw(ArgumentError("BoundaryMesh integration is supported only for D ≤ 3; got D=$D"))
+                                 normals::Union{Nothing,Vector{SVector{D,T}}}) where {D,T<:Real,K,KP}
+        KP == K + 1 ||
+            throw(ArgumentError("BoundaryMesh{$D,$T,$K} expects $(K+1)-vertex cells, " * "got $KP-vertex tuples"))
+        0 <= K <= D || throw(ArgumentError("BoundaryMesh simplex dimension K=$K must satisfy 0 ≤ K ≤ D=$D"))
+        D <= 3 || throw(ArgumentError("BoundaryMesh integration is supported only for D ≤ 3; got D=$D"))
         if normals !== nothing
             length(normals) == length(cells) ||
                 throw(DimensionMismatch("BoundaryMesh: $(length(normals)) normals supplied for " *
@@ -180,8 +177,7 @@ carries no geometric direction. The integration weight per cell is 1
 of `integrand(q)` values at the requested points, with `q.normal`
 exposing the user-supplied direction.
 """
-function points_mesh(points::AbstractVector{SVector{D,T}};
-                     normals::AbstractVector{SVector{D,T}}) where {D,T}
+function points_mesh(points::AbstractVector{SVector{D,T}}; normals::AbstractVector{SVector{D,T}}) where {D,T}
     cells = NTuple{1,SVector{D,T}}[]
     for p in points
         push!(cells, (p,))
@@ -234,9 +230,7 @@ function _simplex_measure(cell::NTuple{3,SVector{2,T}}) where {T}
     return abs(e1[1] * e2[2] - e1[2] * e2[1]) / 2
 end
 
-function _simplex_measure(cell::NTuple{3,SVector{3,T}}) where {T}
-    return norm(cross(cell[2] - cell[1], cell[3] - cell[1])) / 2
-end
+_simplex_measure(cell::NTuple{3,SVector{3,T}}) where {T} = norm(cross(cell[2] - cell[1], cell[3] - cell[1])) / 2
 
 # Geometric default normal. Throws for K=0 (no normal exists from
 # geometry alone).
@@ -261,9 +255,7 @@ end
 
 # K=2 in 3D: unit cross product of two edges (right-hand rule on the
 # vertex ordering).
-function _default_normal(cell::NTuple{3,SVector{3,T}}) where {T}
-    return normalize(cross(cell[2] - cell[1], cell[3] - cell[1]))
-end
+_default_normal(cell::NTuple{3,SVector{3,T}}) where {T} = normalize(cross(cell[2] - cell[1], cell[3] - cell[1]))
 
 # K=2 in 2D: degenerate (a triangle filling a 2D region carries the
 # whole plane in its tangent space). Throws — the user should not be
@@ -378,9 +370,7 @@ function _grid_lines_for_levels(levels, ::Val{D}, tol::GeometryTolerance{T}) whe
 end
 
 # Per-axis sorted unique grid coordinates across every level of `V`.
-function _level_grid_lines(V::Space{D,T}, tol::GeometryTolerance{T}) where {D,T}
-    _grid_lines_for_levels(V.levels, Val(D), tol)
-end
+_level_grid_lines(V::Space{D,T}, tol::GeometryTolerance{T}) where {D,T} = _grid_lines_for_levels(V.levels, Val(D), tol)
 
 """
     _subdivide_segment(p1, p2, grid_lines, nudge)
@@ -402,8 +392,7 @@ grid *intersection* produces one root per axis, agreeing to a few ulp).
 Because `t` is a ratio of coordinate differences, the tolerance is
 scale-free: rescaling the geometry leaves the subdivision unchanged.
 """
-function _subdivide_segment(p1::SVector{D,T}, p2::SVector{D,T}, grid_lines::NTuple{D},
-                            nudge::T) where {D,T}
+function _subdivide_segment(p1::SVector{D,T}, p2::SVector{D,T}, grid_lines::NTuple{D}, nudge::T) where {D,T}
     crossings = T[]
     for d in 1:D
         denom = p2[d] - p1[d]
@@ -453,8 +442,7 @@ end
 # bounding box overlaps. `grid_lines[d]` is sorted, so
 # `searchsortedlast` resolves the first and last cell indices in
 # `O(log n)` per axis.
-function _overlapping_cell_indices(tri::NTuple{3,SVector{3,T}}, grid_lines::NTuple{3},
-                                   tol::T) where {T}
+function _overlapping_cell_indices(tri::NTuple{3,SVector{3,T}}, grid_lines::NTuple{3}, tol::T) where {T}
     return ntuple(3) do d
         coords = (tri[1][d], tri[2][d], tri[3][d])
         lo = min(coords...) - tol
@@ -471,8 +459,7 @@ end
 # polygon intersected with the half-space. `nudge` lets a vertex
 # exactly on the plane count as inside, avoiding zero-measure
 # slivers in the clipped result.
-function _clip_polygon_halfspace(polygon::Vector{SVector{D,T}}, axis::Int, sign::Int, plane::T,
-                                 nudge::T) where {D,T}
+function _clip_polygon_halfspace(polygon::Vector{SVector{D,T}}, axis::Int, sign::Int, plane::T, nudge::T) where {D,T}
     isempty(polygon) && return polygon
     out = SVector{D,T}[]
     n = length(polygon)
@@ -501,8 +488,8 @@ end
 # Clip a convex polygon against an axis-aligned 3D box (cell). The
 # box is `lower[d] ≤ x[d] ≤ upper[d]` for each axis; clipped against
 # six half-spaces in turn.
-function _clip_polygon_to_box(polygon::Vector{SVector{3,T}}, lower::SVector{3,T},
-                              upper::SVector{3,T}, nudge::T) where {T}
+function _clip_polygon_to_box(polygon::Vector{SVector{3,T}}, lower::SVector{3,T}, upper::SVector{3,T},
+                              nudge::T) where {T}
     poly = polygon
     for d in 1:3
         poly = _clip_polygon_halfspace(poly, d, -1, lower[d], nudge)
@@ -550,8 +537,8 @@ compared against physical coordinates (half-space tests, bounding-box
 padding) and against an area (`min_area = nudge²`), so it is a length and
 does not survive a change of geometric scale.
 """
-function _subdivide_triangle(v1::SVector{3,T}, v2::SVector{3,T}, v3::SVector{3,T},
-                             grid_lines::NTuple{3}, nudge::T) where {T}
+function _subdivide_triangle(v1::SVector{3,T}, v2::SVector{3,T}, v3::SVector{3,T}, grid_lines::NTuple{3},
+                             nudge::T) where {T}
     tri = (v1, v2, v3)
     cell_ranges = _overlapping_cell_indices(tri, grid_lines, nudge)
     min_area = nudge * nudge
@@ -589,8 +576,7 @@ directly.
 """
 _subdivide_mesh(mesh::BoundaryMesh{D,T,0}, ::Space{D,T}, ::GeometryTolerance{T}) where {D,T} = mesh
 
-function _subdivide_mesh(mesh::BoundaryMesh{D,T,1}, grid_lines::NTuple{D,Vector{T}},
-                         ::GeometryTolerance{T}) where {D,T}
+function _subdivide_mesh(mesh::BoundaryMesh{D,T,1}, grid_lines::NTuple{D,Vector{T}}, ::GeometryTolerance{T}) where {D,T}
     nudge = sqrt(eps(T))
     cells = NTuple{2,SVector{D,T}}[]
     normals = mesh.normals === nothing ? nothing : SVector{D,T}[]
@@ -607,8 +593,7 @@ function _subdivide_mesh(mesh::BoundaryMesh{D,T,1}, grid_lines::NTuple{D,Vector{
     return BoundaryMesh{D,T,1}(cells, normals)
 end
 
-function _subdivide_mesh(mesh::BoundaryMesh{3,T,2}, grid_lines::NTuple{3,Vector{T}},
-                         ::GeometryTolerance{T}) where {T}
+function _subdivide_mesh(mesh::BoundaryMesh{3,T,2}, grid_lines::NTuple{3,Vector{T}}, ::GeometryTolerance{T}) where {T}
     nudge = sqrt(eps(T))
     cells = NTuple{3,SVector{3,T}}[]
     normals = mesh.normals === nothing ? nothing : SVector{3,T}[]
@@ -626,21 +611,16 @@ function _subdivide_mesh(mesh::BoundaryMesh{3,T,2}, grid_lines::NTuple{3,Vector{
 end
 
 # `Space` wrappers: subdivide against one space's own merged grid lines.
-function _subdivide_mesh(mesh::BoundaryMesh{D,T,1}, V::Space{D,T},
-                         tol::GeometryTolerance{T}) where {D,T}
+function _subdivide_mesh(mesh::BoundaryMesh{D,T,1}, V::Space{D,T}, tol::GeometryTolerance{T}) where {D,T}
     _subdivide_mesh(mesh, _level_grid_lines(V, tol), tol)
 end
-function _subdivide_mesh(mesh::BoundaryMesh{3,T,2}, V::Space{3,T},
-                         tol::GeometryTolerance{T}) where {T}
+function _subdivide_mesh(mesh::BoundaryMesh{3,T,2}, V::Space{3,T}, tol::GeometryTolerance{T}) where {T}
     _subdivide_mesh(mesh, _level_grid_lines(V, tol), tol)
 end
 
 # Fallback: combinations not covered above (e.g. `K = 2` in `D = 2`,
 # a codim-0 mesh) pass through unchanged.
-function _subdivide_mesh(mesh::BoundaryMesh{D,T,K}, ::Space{D,T},
-                         ::GeometryTolerance{T}) where {D,T,K}
-    return mesh
-end
+_subdivide_mesh(mesh::BoundaryMesh{D,T,K}, ::Space{D,T}, ::GeometryTolerance{T}) where {D,T,K} = mesh
 
 # ── SurfaceRegion and builder ────────────────────────────────────────────────
 
@@ -682,8 +662,8 @@ end
 # the normal, so the body stays type-stable without threading `{D,T}` in. The
 # Jacobian is uniformly `measure / reference_area`: a K=0 point cell has
 # `measure = 1` and `_reference_area(Val(0)) = 1`, so it needs no special case.
-function _simplex_cell_quadrature(cell, cell_index::Integer, mesh_normals, reference_samples,
-                                  reference_area, ::Val{K}) where {K}
+function _simplex_cell_quadrature(cell, cell_index::Integer, mesh_normals, reference_samples, reference_area,
+                                  ::Val{K}) where {K}
     measure = _simplex_measure(cell)
     T = typeof(measure)
     jacobian = measure / convert(T, reference_area)
@@ -723,20 +703,17 @@ end
 function _surface_regions_for_mesh(V::Space{D,T}, mesh::BoundaryMesh{D,T,K},
                                    tolerance::GeometryTolerance{T}) where {D,T,K}
     subdivided = _subdivide_mesh(mesh, V, tolerance)
-    rules = [_simplex_reference_quadrature(Val(K), n, T)
-             for n in 1:maximum(_surface_quadrature_order(V))]
+    rules = [_simplex_reference_quadrature(Val(K), n, T) for n in 1:maximum(_surface_quadrature_order(V))]
     reference_area = _reference_area(Val(K))
 
     regions = SurfaceRegion{D,T}[]
     for (cell_index, cell) in pairs(subdivided.cells)
         parents = _surface_cell_parents(V, subdivided, cell, cell_index, tolerance)
-        isempty(parents) &&
-            throw(ArgumentError("BoundaryMesh cell #$cell_index lies entirely outside the " *
-                                "discretization — no covering parent found on any level"))
+        isempty(parents) && throw(ArgumentError("BoundaryMesh cell #$cell_index lies entirely outside the " *
+                                                "discretization — no covering parent found on any level"))
         counts = _parent_quadrature_counts(Val(D), parents, id -> _level_by_id(V, id))
         points, weights, normals = _simplex_cell_quadrature(cell, cell_index, subdivided.normals,
-                                                            rules[maximum(counts)], reference_area,
-                                                            Val(K))
+                                                            rules[maximum(counts)], reference_area, Val(K))
         push!(regions, SurfaceRegion{D,T}(parents, points, weights, normals))
     end
 
@@ -771,8 +748,7 @@ end
 # and clipping-produced vertices may legitimately sit on grid lines
 # (where `locate_cell` would snap them into the adjacent cell).
 # Returns the list of covering parents.
-function _surface_cell_parents(V::Space{D,T}, mesh::BoundaryMesh{D,T,K},
-                               cell::NTuple{KP,SVector{D,T}}, cell_index::Int,
+function _surface_cell_parents(V::Space{D,T}, mesh::BoundaryMesh{D,T,K}, cell::NTuple{KP,SVector{D,T}}, cell_index::Int,
                                tolerance::GeometryTolerance{T}) where {D,T,K,KP}
     midpoint = _cell_midpoint(cell)
     parents = FacetParent{D,T}[]
@@ -782,8 +758,7 @@ function _surface_cell_parents(V::Space{D,T}, mesh::BoundaryMesh{D,T,K},
         is_active(level.mask, midpoint_cell) ||
             throw(ArgumentError("BoundaryMesh cell #$cell_index midpoint $midpoint falls inside " *
                                 "an inactive cell on level $(level.id)"))
-        push!(parents,
-              FacetParent{D,T}(level.id, midpoint_cell, cell_box(level.mesh, midpoint_cell)))
+        push!(parents, FacetParent{D,T}(level.id, midpoint_cell, cell_box(level.mesh, midpoint_cell)))
     end
     return parents
 end
@@ -796,8 +771,7 @@ end
 # uses it per side and skips a sub-cell whose midpoint has no active cover
 # on one of the two subdomains (the interface trace there lies outside that
 # subdomain's active region).
-function _active_cover_parents(V::Space{D,T}, point::SVector{D,T},
-                               tol::GeometryTolerance{T}) where {D,T}
+function _active_cover_parents(V::Space{D,T}, point::SVector{D,T}, tol::GeometryTolerance{T}) where {D,T}
     parents = FacetParent{D,T}[]
     for level in V.levels
         cell = locate_cell(level.mesh, point; tol)

@@ -25,8 +25,7 @@ using StaticArrays
     @test tmesh isa BoundaryMesh{3,Float64,2}
 
     # D ≥ 4 is rejected.
-    @test_throws ArgumentError BoundaryMesh{4,Float64,1}(NTuple{2,SVector{4,Float64}}[],
-                                                         SVector{4,Float64}[])
+    @test_throws ArgumentError BoundaryMesh{4,Float64,1}(NTuple{2,SVector{4,Float64}}[], SVector{4,Float64}[])
 
     # Wrong vertex count for the declared K.
     @test_throws ArgumentError BoundaryMesh{2,Float64,1}([(SVector(0.0, 0.0),)], nothing)
@@ -175,8 +174,7 @@ end
     @test on === mesh
     @test key_space === model.problem.space
     @test haskey(model.surface_regions, (mesh, model.problem.space))
-    @test diagnostics(model).surface_region_count ==
-          length(model.surface_regions[(mesh, model.problem.space)])
+    @test diagnostics(model).surface_region_count == length(model.surface_regions[(mesh, model.problem.space)])
     @test nquadpoints(model; kind=:surface) > 0
     # With one cached mesh the aggregate and the per-`on=` count coincide; the
     # `on=` form is the one that stays equal to the `q.point` range once a
@@ -263,8 +261,7 @@ end
     grid_lines = Unfitted._level_grid_lines(V, GeometryTolerance(Float64))
     nudge = sqrt(eps(Float64))
 
-    corner = Unfitted._subdivide_segment(SVector(0.05, 0.05), SVector(0.45, 0.45), grid_lines,
-                                         nudge)
+    corner = Unfitted._subdivide_segment(SVector(0.05, 0.05), SVector(0.45, 0.45), grid_lines, nudge)
     @test length(corner) == 2
     @test corner[1][2] == corner[2][1]
     @test sum(norm(s[2] - s[1]) for s in corner) ≈ norm(SVector(0.40, 0.40)) rtol = 1.0e-14
@@ -272,8 +269,7 @@ end
     # Endpoints sitting exactly on grid lines are crossings at t = 0 and
     # t = 1. Neither may spawn a degenerate sub-segment, and neither may
     # cost any length.
-    on_lines = Unfitted._subdivide_segment(SVector(0.25, 0.25), SVector(0.75, 0.75), grid_lines,
-                                           nudge)
+    on_lines = Unfitted._subdivide_segment(SVector(0.25, 0.25), SVector(0.75, 0.75), grid_lines, nudge)
     @test all(norm(s[2] - s[1]) > nudge for s in on_lines)
     @test on_lines[1][1] == SVector(0.25, 0.25)
     @test on_lines[end][2] == SVector(0.75, 0.75)
@@ -356,18 +352,13 @@ end
     # per-cell order made more expensive rather than less.
     omega = box((0.0, 0.0), (1.0, 1.0))
     tol = GeometryTolerance(Float64)
-    V = overlay(space(omega; cells=(4, 4), order=1), box((0.5, 0.5), (1.0, 1.0)); cells=(2, 2),
-                order=3)
+    V = overlay(space(omega; cells=(4, 4), order=1), box((0.5, 0.5), (1.0, 1.0)); cells=(2, 2), order=3)
 
-    near = Unfitted._surface_regions_for_mesh(V,
-                                              segment_mesh([(SVector(0.05, 0.10),
-                                                             SVector(0.20, 0.10))]), tol)
+    near = Unfitted._surface_regions_for_mesh(V, segment_mesh([(SVector(0.05, 0.10), SVector(0.20, 0.10))]), tol)
     @test length(only(near).parents) == 1                 # the base level alone
     @test length(only(near).points) == 2                  # p = 1 → 2 Gauss points
 
-    far = Unfitted._surface_regions_for_mesh(V,
-                                             segment_mesh([(SVector(0.55, 0.60),
-                                                            SVector(0.70, 0.60))]), tol)
+    far = Unfitted._surface_regions_for_mesh(V, segment_mesh([(SVector(0.55, 0.60), SVector(0.70, 0.60))]), tol)
     @test length(only(far).parents) == 2
     @test length(only(far).points) == 4                   # max p = 3 → 4 Gauss points
 
@@ -376,12 +367,8 @@ end
     orders = fill(1, 4, 4)
     orders[4, 4] = 4
     W = space(omega; cells=(4, 4), order=orders)
-    quiet = Unfitted._surface_regions_for_mesh(W,
-                                               segment_mesh([(SVector(0.05, 0.10),
-                                                              SVector(0.20, 0.10))]), tol)
+    quiet = Unfitted._surface_regions_for_mesh(W, segment_mesh([(SVector(0.05, 0.10), SVector(0.20, 0.10))]), tol)
     @test length(only(quiet).points) == 2
-    loud = Unfitted._surface_regions_for_mesh(W,
-                                              segment_mesh([(SVector(0.80, 0.85),
-                                                             SVector(0.95, 0.85))]), tol)
+    loud = Unfitted._surface_regions_for_mesh(W, segment_mesh([(SVector(0.80, 0.85), SVector(0.95, 0.85))]), tol)
     @test length(only(loud).points) == 5                  # p = 4 → 5 Gauss points
 end

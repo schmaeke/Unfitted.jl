@@ -82,14 +82,13 @@ function Solution(coefficients::C, model_version::Integer, diagnostics::SolverDi
 end
 
 function Base.show(io::IO, diagnostics::SolverDiagnostics)
-    print(io, "SolverDiagnostics(method=:", diagnostics.method, ", residual=",
-          diagnostics.residual_norm, ", converged=", diagnostics.converged, ")")
+    print(io, "SolverDiagnostics(method=:", diagnostics.method, ", residual=", diagnostics.residual_norm,
+          ", converged=", diagnostics.converged, ")")
 end
 
 function Base.show(io::IO, solution::Solution)
-    print(io, "Solution(pin=0x", string(solution.model_version; base=16), ", dofs=",
-          length(solution.coefficients), ", method=:", solution.diagnostics.method, ", residual=",
-          solution.diagnostics.residual_norm, ")")
+    print(io, "Solution(pin=0x", string(solution.model_version; base=16), ", dofs=", length(solution.coefficients),
+          ", method=:", solution.diagnostics.method, ", residual=", solution.diagnostics.residual_norm, ")")
 end
 
 """
@@ -106,8 +105,7 @@ transfer paths.
 external code knows what it did. `residual` and `converged` end up in
 the [`SolverDiagnostics`](@ref) record verbatim.
 """
-function solution(model::Model, coefficients; method::Symbol=:manual, residual=NaN,
-                  converged::Bool=true)
+function solution(model::Model, coefficients; method::Symbol=:manual, residual=NaN, converged::Bool=true)
     length(coefficients) == active_unknowns(model.dofs) ||
         throw(DimensionMismatch("coefficient vector does not match the model active space"))
     diagnostics = SolverDiagnostics(method, Float64(residual), converged)
@@ -150,9 +148,7 @@ end
 # copy. Dispatched methods rather than one unspecialised body, which measured
 # three more allocations per call.
 _state_vector(::Nothing, ::Model) = nothing
-function _state_vector(solution::Solution, model::Model)
-    return _state_vector(_checked_coefficients(solution, model), model)
-end
+_state_vector(solution::Solution, model::Model) = _state_vector(_checked_coefficients(solution, model), model)
 function _state_vector(coefficients::AbstractVector, model::Model)
     length(coefficients) == active_unknowns(model.dofs) ||
         throw(DimensionMismatch("state coefficient vector does not match the model active space"))
@@ -209,8 +205,7 @@ function solve!(model::Model; linear_solver=nothing, method::Union{Nothing,Symbo
 
     solve_method = method === nothing ? (linear_solver === nothing ? :direct : :custom) : method
     if linear_solver === nothing
-        solve_method === :direct ||
-            throw(ArgumentError("method=:$solve_method requires a linear_solver"))
+        solve_method === :direct || throw(ArgumentError("method=:$solve_method requires a linear_solver"))
         coefficients = model.matrix \ model.rhs
     else
         coefficients = linear_solver(model.matrix, model.rhs)

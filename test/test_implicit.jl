@@ -58,8 +58,7 @@ end
         exact = a^(m + 1) / (m + 1) * 1 / (n + 1) * 1 / (p + 1)
         @test _quad(x -> x[1]^m * x[2]^n * x[3]^p, rule) ≈ exact atol = 1e-12
     end
-    simplex = _IVQ(x -> x[1] + x[2] + x[3] - 1, box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0));
-                   gauss_points=8)
+    simplex = _IVQ(x -> x[1] + x[2] + x[3] - 1, box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); gauss_points=8)
     @test _quad(x -> 1.0, simplex) ≈ 1 / 6 atol = 1e-12
 end
 
@@ -123,10 +122,8 @@ end
     @test isapprox(a10, π * 0.3^2; atol=1e-4)
 
     ball = x -> sqrt((x[1] - 0.53)^2 + (x[2] - 0.47)^2 + (x[3] - 0.51)^2) - 0.3
-    v8 = _quad(x -> 1.0,
-               _IVQ(ball, box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); gauss_points=8, max_subdiv=6))
-    v12 = _quad(x -> 1.0,
-                _IVQ(ball, box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); gauss_points=12, max_subdiv=6))
+    v8 = _quad(x -> 1.0, _IVQ(ball, box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); gauss_points=8, max_subdiv=6))
+    v12 = _quad(x -> 1.0, _IVQ(ball, box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); gauss_points=12, max_subdiv=6))
     truth = 4 / 3 * π * 0.3^3
     @test isapprox(v8, truth; atol=1e-4)
     @test abs(v12 - truth) < abs(v8 - truth)   # higher order ⇒ smaller error
@@ -147,8 +144,8 @@ end
 function _csg_rule(geom, region; gp, ms=5, certified=false)
     leaves = Unfitted._leaves(geom)
     lipschitz = certified ? Float64[l.lipschitz for l in leaves] : nothing
-    _IVQ(Any[l.f for l in leaves], x -> Unfitted._inside(geom, x), region; gauss_points=gp,
-         max_subdiv=ms, lipschitz=lipschitz)
+    _IVQ(Any[l.f for l in leaves], x -> Unfitted._inside(geom, x), region; gauss_points=gp, max_subdiv=ms,
+         lipschitz=lipschitz)
 end
 
 @testset "implicit quadrature — force-reduce stays correct without subdivision" begin
@@ -200,8 +197,7 @@ end
     # ForwardDiff result to integration accuracy.
     a = 0.45
     ad = _IVQ(x -> x[1] - a, box((0.0, 0.0), (1.0, 1.0)); gauss_points=6)
-    fd = _IVQ(x -> x[1] - a, box((0.0, 0.0), (1.0, 1.0)); gauss_points=6,
-              grad=Unfitted._fd_gradient)
+    fd = _IVQ(x -> x[1] - a, box((0.0, 0.0), (1.0, 1.0)); gauss_points=6, grad=Unfitted._fd_gradient)
     @test _quad(x -> 1.0, fd) ≈ _quad(x -> 1.0, ad) atol = 1e-10
     @test _quad(x -> x[1] * x[2], fd) ≈ _quad(x -> x[1] * x[2], ad) atol = 1e-10
 end
@@ -257,8 +253,7 @@ end
     region = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
     ball = x -> 0.15 - sqrt((x[1] - 0.3)^2 + (x[2] - 0.3)^2 + (x[3] - 0.3)^2)
     @test _quad(x -> 1.0, _IVQ(ball, region; gauss_points=8)) ≈ 1.0 atol = 1e-13
-    @test _quad(x -> 1.0, _IVQ(ball, region; gauss_points=8, lipschitz=1.0)) ≈
-          1 - 4 / 3 * π * 0.15^3 atol = 1e-7
+    @test _quad(x -> 1.0, _IVQ(ball, region; gauss_points=8, lipschitz=1.0)) ≈ 1 - 4 / 3 * π * 0.15^3 atol = 1e-7
 end
 
 @testset "implicit quadrature — per-leaf Lipschitz constants on a CSG tree" begin

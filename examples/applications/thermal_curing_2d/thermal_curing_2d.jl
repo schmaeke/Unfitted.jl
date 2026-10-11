@@ -158,9 +158,7 @@ advance(chi, u) = clamp(chi + time_step * cure_rate * (1 - chi) * gate(u), 0.0, 
 
 # The heater as a `source` coefficient at time `t`. One closure shape for the
 # whole run, so the assembly kernel specialises once rather than once per step.
-function heater(t)
-    x -> t <= pulse_end && sum(abs2, x .- heater_center) < heater_radius^2 ? heater_power : 0.0
-end
+heater(t) = x -> t <= pulse_end && sum(abs2, x .- heater_center) < heater_radius^2 ? heater_power : 0.0
 
 # ── The discretisation, rebuilt per active set ───────────────────────────────
 
@@ -169,8 +167,8 @@ end
 # and the mass matrix, which is wanted both by the time step and by the L²
 # transfer of the temperature.
 function build(mask)
-    V = overlay(space(omega; cells=base_cells, order=base_order), omega; cells=front_cells,
-                order=front_order, active=mask)
+    V = overlay(space(omega; cells=base_cells, order=base_order), omega; cells=front_cells, order=front_order,
+                active=mask)
     u = field(:u, V)
     model = prepare(Problem((u,); dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     return model, u, assemble_matrix(model, mass_block(u))
@@ -293,21 +291,18 @@ println("  quadrature points per rebuild : ",
         join(("$before→$after" for (before, after) in carried.point_counts), ", "),
         all(pair -> first(pair) != last(pair), carried.point_counts) ? "  (all changed)" :
         "  (SOME UNCHANGED — the transfer would be a no-op there)")
-println("  largest χ excursion outside [0, 1] introduced by the RBF transfer: ",
-        round(carried.excursion; sigdigits=3))
+println("  largest χ excursion outside [0, 1] introduced by the RBF transfer: ", round(carried.excursion; sigdigits=3))
 println()
-println("  ", rpad("run", 30), rpad("rebuilds", 10), rpad("cured area", 14),
-        rpad("front radius", 14), "peak temperature (cure onset ", cure_temperature, ")")
+println("  ", rpad("run", 30), rpad("rebuilds", 10), rpad("cured area", 14), rpad("front radius", 14),
+        "peak temperature (cure onset ", cure_temperature, ")")
 for (label, run) in (("χ transferred (RBFP0)", carried), ("χ dropped at every rebuild", dropped),
                      ("reference, no remeshing", reference))
-    println("  ", rpad(label, 30), rpad(length(run.point_counts), 10),
-            rpad(round(run.area; sigdigits=6), 14), rpad(round(run.radius; sigdigits=6), 14),
-            round(run.peak; sigdigits=4))
+    println("  ", rpad(label, 30), rpad(length(run.point_counts), 10), rpad(round(run.area; sigdigits=6), 14),
+            rpad(round(run.radius; sigdigits=6), 14), round(run.peak; sigdigits=4))
 end
 println("  carried vs reference (the accuracy claim): ",
         round(100 * abs(carried.area - reference.area) / reference.area; sigdigits=3), " %")
-println("  cured area lost without the transfer: ",
-        round(100 * (1 - dropped.area / carried.area); sigdigits=4), " %")
+println("  cured area lost without the transfer: ", round(100 * (1 - dropped.area / carried.area); sigdigits=4), " %")
 println()
 
 out = joinpath(@__DIR__, "output", "thermal_curing_2d")

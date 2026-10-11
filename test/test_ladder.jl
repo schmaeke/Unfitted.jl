@@ -36,8 +36,7 @@ lossless(V) = size(gram(V), 1) == rank(gram(V; prune=false))
     @test is_nested(V)
     @test all(k -> !any(active_cells(V; level=k)), 2:4)
     # inert: the declared stack carries the base level's unknowns and no more
-    base = prepare(poisson(space(LADDER_OMEGA; cells=8, order=3); source=1.0,
-                           dirichlet=ladder_bc()))
+    base = prepare(poisson(space(LADDER_OMEGA; cells=8, order=3); source=1.0, dirichlet=ladder_bc()))
     full = prepare(poisson(V; source=1.0, dirichlet=ladder_bc()))
     @test diagnostics(full).active_unknowns == diagnostics(base).active_unknowns
 end
@@ -56,8 +55,8 @@ end
     # sheds modes; the reduced space must still span the unreduced one.
     for depth in 1:3
         V = ladder(LADDER_OMEGA; cells=4, order=3, depth=depth, splits=2)
-        spec = [k => overlapping_cells(V, [CartesianIndex(1, 1), CartesianIndex(2, 2)]; from=1,
-                                       to=k) for k in 2:(depth+1)]
+        spec = [k => overlapping_cells(V, [CartesianIndex(1, 1), CartesianIndex(2, 2)]; from=1, to=k)
+                for k in 2:(depth+1)]
         W = adapt(V, spec...)
         @test is_nested(W)
         @test rank(gram(W)) == size(gram(W), 1)          # nothing left dependent
@@ -163,10 +162,9 @@ end
     # The mapping must not depend on an absolute tolerance: a domain far from the
     # origin has ulps larger than one, and a domain of small extent has cells
     # smaller than the geometry tolerance.
-    for dom in (box((1e10, 1e10), (1e10 + 1.0, 1e10 + 1.0)), box((0.0, 0.0), (1e-7, 1e-7)),
-                box((-3.0, -7.0), (-1.0, -5.0)))
-        V = ladder(dom; cells=4, order=2, depth=2, splits=2,
-                   tolerance=GeometryTolerance(Float64; merge=1e-30))
+    for dom in
+        (box((1e10, 1e10), (1e10 + 1.0, 1e10 + 1.0)), box((0.0, 0.0), (1e-7, 1e-7)), box((-3.0, -7.0), (-1.0, -5.0)))
+        V = ladder(dom; cells=4, order=2, depth=2, splits=2, tolerance=GeometryTolerance(Float64; merge=1e-30))
         d = zeros(Int, 4, 4)
         d[3, 3] = 2
         W = adapt(V, d)
@@ -218,8 +216,7 @@ end
     # the scale-first order mis-nested a large share of the combinations.
     failures = 0
     for lo in (0.0, 0.1, -0.3), extent in (0.7, 0.3, 1.1), cells in 1:4, splits in 2:5
-        failures += !nests_exactly(ladder(box((lo,), (lo + extent,)); cells=cells, depth=2,
-                                          splits=splits))
+        failures += !nests_exactly(ladder(box((lo,), (lo + extent,)); cells=cells, depth=2, splits=splits))
     end
     @test failures == 0
 
@@ -285,8 +282,7 @@ end
 
     # `is_nested` passes vacuously where the finer level's box contains no node
     # of the level below, which its docstring states and no test asserted.
-    @test is_nested(overlay(space(LADDER_OMEGA; cells=4, order=2), box((0.3, 0.3), (0.45, 0.45));
-                            cells=3))
+    @test is_nested(overlay(space(LADDER_OMEGA; cells=4, order=2), box((0.3, 0.3), (0.45, 0.45)); cells=3))
 end
 
 @testset "the per-cell block and the whole-level map are the same rule" begin
@@ -296,8 +292,8 @@ end
     # milliseconds. The two must agree everywhere, in both directions, including
     # on a stack that is neither nested nor aligned nor isotropic — and including
     # the empty answer a level whose box misses the cell must give.
-    V = overlay(overlay(space(LADDER_OMEGA; cells=4, order=2), box((0.3, 0.1), (0.8, 0.9));
-                        cells=3), box((0.15, 0.55), (0.65, 0.95)); cells=5)
+    V = overlay(overlay(space(LADDER_OMEGA; cells=4, order=2), box((0.3, 0.1), (0.8, 0.9)); cells=3),
+                box((0.15, 0.55), (0.65, 0.95)); cells=5)
     @test !is_nested(V)
     agrees = true
     empties = 0
@@ -329,8 +325,7 @@ end
     near, far = zeros(Int, 8, 8), zeros(Int, 8, 8)
     near[1, 1] = 3
     far[8, 8] = 3
-    @test count(active_cells(adapt(V, near; grade=1); level=2)) ==
-          count(active_cells(adapt(V, far; grade=1); level=2))
+    @test count(active_cells(adapt(V, near; grade=1); level=2)) == count(active_cells(adapt(V, far; grade=1); level=2))
     @test_throws ArgumentError adapt(V, d; grade=-1)
 end
 
@@ -436,8 +431,7 @@ end
     same = adapted(model, 3 => active_cells(model; level=3, effective=false))
     @test diagnostics(same).active_unknowns == before.active_unknowns
     @test diagnostics(same).inactive_cell_counts == before.inactive_cell_counts
-    @test active_cells(same; level=3, effective=false) ==
-          active_cells(model; level=3, effective=false)
+    @test active_cells(same; level=3, effective=false) == active_cells(model; level=3, effective=false)
     # and the fold is genuinely applied, not skipped
     @test any(>(0), before.inactive_cell_counts)
     @test diagnostics(model, solve!(model)).fit_failure_count == 0
@@ -450,8 +444,7 @@ end
 # returned is the region box's own tensor Gauss — the cheapest thing that
 # honours the contract, which is all a counting test needs.
 function counting_cut_rule(fits::Ref{Int})
-    return function (physical, region_box::Unfitted.AxisBox{D,T},
-                     moment_order::NTuple{D,Int}) where {D,T}
+    return function (physical, region_box::Unfitted.AxisBox{D,T}, moment_order::NTuple{D,Int}) where {D,T}
         fits[] += 1
         rule = Unfitted._tensor_gauss_rule(moment_order .+ 1, T)
         jacobian = Unfitted.volume(region_box) / T(2^D)
@@ -504,10 +497,10 @@ end
     # every rule it had. Ω = {x ≤ 0.55} cuts the x ∈ [0.5, 0.75] column of the
     # base, which the one-cell overlay never touches at either position.
     fits = Ref(0)
-    half = physical_domain(x -> x[1] - 0.55; lipschitz=1.0, subcell_length_scale=1.0e-3,
-                           max_depth=3, cut_quadrature=counting_cut_rule(fits))
-    V = overlay(space(LADDER_OMEGA; cells=(4, 4), order=1, physical=half),
-                box((0.0, 0.0), (0.25, 0.25)); cells=(1, 1), order=1)
+    half = physical_domain(x -> x[1] - 0.55; lipschitz=1.0, subcell_length_scale=1.0e-3, max_depth=3,
+                           cut_quadrature=counting_cut_rule(fits))
+    V = overlay(space(LADDER_OMEGA; cells=(4, 4), order=1, physical=half), box((0.0, 0.0), (0.25, 0.25)); cells=(1, 1),
+                order=1)
     model = prepare(mass(V; coefficient=1.0))
     before = length(only(model.moment_fit_caches))
     @test before > 0
@@ -521,8 +514,8 @@ end
 
 @testset "ladder composes with an immersed domain" begin
     disc = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.7; subcell_length_scale=0.25)
-    V = adapt(ladder(box((-1.0, -1.0), (1.0, 1.0)); cells=8, order=2, depth=2, splits=2,
-                     physical=disc), 3 => trues(32, 32))
+    V = adapt(ladder(box((-1.0, -1.0), (1.0, 1.0)); cells=8, order=2, depth=2, splits=2, physical=disc),
+              3 => trues(32, 32))
     @test is_nested(V)
     model = prepare(mass(V))
     report = diagnostics(model, solve!(model))

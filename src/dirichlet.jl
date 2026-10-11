@@ -65,12 +65,8 @@ end
 # which selectors are the same one. `sides` is hashed by value (Julia hashes a
 # `Vector` element-wise), matching the element-wise `==` below; the elements are
 # isbits tuples, so both are exact.
-function Base.:(==)(a::BoundarySelector, b::BoundarySelector)
-    a.selector === b.selector && a.sides == b.sides
-end
-function Base.hash(s::BoundarySelector, h::UInt)
-    hash(s.sides, hash(s.selector, hash(:BoundarySelector, h)))
-end
+Base.:(==)(a::BoundarySelector, b::BoundarySelector) = a.selector === b.selector && a.sides == b.sides
+Base.hash(s::BoundarySelector, h::UInt) = hash(s.sides, hash(s.selector, hash(:BoundarySelector, h)))
 
 """
     DirichletCondition(value, boundary, field, component)
@@ -109,8 +105,7 @@ end
 # could say what it returns. The condition, rather than its datum, is the
 # argument, so a caller walking an abstractly typed condition list dispatches
 # once per condition and never boxes an isbits datum to pass it on.
-function _check_dirichlet_datum(condition::DirichletCondition, components::Integer,
-                                name::Union{Nothing,Symbol})
+function _check_dirichlet_datum(condition::DirichletCondition, components::Integer, name::Union{Nothing,Symbol})
     value = condition.value
     (value isa Union{Tuple,AbstractArray} && length(value) != components) || return nothing
     owner = name === nothing ? "its field" : "field $name"
@@ -158,8 +153,7 @@ end
 function _physical_dirichlet(t, V::Space{D,T}, conditions, components::Integer) where {D,T}
     marks = zeros(Bool, length(t.raw_keys), components)
     isempty(conditions) && return marks
-    2D <= 64 ||
-        throw(ArgumentError("physical-Dirichlet face masks hold at most 32 axes; got D = $D"))
+    2D <= 64 || throw(ArgumentError("physical-Dirichlet face masks hold at most 32 axes; got D = $D"))
     # Per condition, the columns of `marks` it sets and its facets' masks — all the
     # per-raw loop reads of it, concretely typed, since `conditions` comes from
     # `_dirichlet_for_field` as an `Any[]`. The columns are every component for
@@ -171,8 +165,7 @@ function _physical_dirichlet(t, V::Space{D,T}, conditions, components::Integer) 
     every = 1:components
     masks = Tuple{UnitRange{Int},Vector{UInt64}}[(c.component === nothing ? every :
                                                   intersect(c.component:c.component, every),
-                                                  UInt64[_face_mask(f)
-                                                         for f in _facets(c.boundary, Val(D))])
+                                                  UInt64[_face_mask(f) for f in _facets(c.boundary, Val(D))])
                                                  for c in conditions]
     for level in V.levels
         _mark_physical_dirichlet!(marks, t, level, V.domain, masks)
@@ -196,13 +189,11 @@ function _facets(selector::BoundarySelector, ::Val{D}) where {D}
         return [Tuple{Int,Symbol}[face] for face in _kept_faces(selector.sides, Val(D))]
     elseif selector.selector === :sides
         for (axis, side) in selector.sides
-            1 <= axis <= D ||
-                throw(ArgumentError("boundary axis $axis is out of bounds for dimension $D"))
+            1 <= axis <= D || throw(ArgumentError("boundary axis $axis is out of bounds for dimension $D"))
             # Reachable only through a hand-built `BoundarySelector`: `boundary`
             # validates its sides. Refused here, where every consumer decomposes a
             # selector, with the message every side check in the package uses.
-            side in (:lower, :upper) ||
-                throw(ArgumentError("boundary side must be :lower or :upper"))
+            side in (:lower, :upper) || throw(ArgumentError("boundary side must be :lower or :upper"))
         end
         return [selector.sides]
     end
@@ -228,8 +219,7 @@ end
 # prevent.
 function _kept_faces(excluded::Vector{Tuple{Int,Symbol}}, ::Val{D}) where {D}
     for (axis, _) in excluded
-        1 <= axis <= D ||
-            throw(ArgumentError("boundary axis $axis is out of bounds for dimension $D"))
+        1 <= axis <= D || throw(ArgumentError("boundary axis $axis is out of bounds for dimension $D"))
     end
     kept = [(axis, side) for axis in 1:D for side in (:lower, :upper) if (axis, side) ∉ excluded]
     isempty(kept) && throw(ArgumentError("boundary(:all; except=…) excludes all $(2D) faces of " *
@@ -259,8 +249,7 @@ _face_bit(axis::Integer, side::Symbol) = UInt64(1) << (2(axis - 1) + (side === :
 function _mark_physical_dirichlet!(marks::Matrix{Bool}, t, level::Level{D}, domain::AxisBox{D},
                                    masks::Vector{Tuple{UnitRange{Int},Vector{UInt64}}}) where {D}
     sides = [(axis, side) for axis in 1:D
-             for side in (:lower, :upper)
-             if _level_side_is_physical(level, domain, axis, side, t.tolerance)]
+             for side in (:lower, :upper) if _level_side_is_physical(level, domain, axis, side, t.tolerance)]
     for raw in t.level_raws[level.id]
         key, on = t.raw_keys[raw], UInt64(0)
         for (axis, side) in sides
@@ -503,8 +492,7 @@ end
 # only `get!` call site anywhere in the package, which is what makes "one
 # resolution per (space, face) per model lifetime" a property of the code rather
 # than a convention several independent call sites happen to honour.
-function _resolve_face(facets::FacetResolver{D,T}, V::Space{D,T},
-                       sides::Vector{Tuple{Int,Symbol}}) where {D,T}
+function _resolve_face(facets::FacetResolver{D,T}, V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}) where {D,T}
     return get!(() -> _boundary_facet_regions(V, sides, facets.tolerance), facets.faces, (V, sides))
 end
 
@@ -538,8 +526,7 @@ end
 # Takes the per-axis maximum recommended quadrature order over the
 # covering parents so the trace integration is exact for every covering
 # parent simultaneously.
-function _facet_quadrature_counts(V::Space{D,T}, parents::Vector{FacetParent{D,T}},
-                                  free_axes::Vector{Int}) where {D,T}
+function _facet_quadrature_counts(V::Space{D,T}, parents::Vector{FacetParent{D,T}}, free_axes::Vector{Int}) where {D,T}
     return [maximum(parents) do parent
                 level = _level_by_id(V, parent.level)
                 recommended_quadrature_order(level.basis, cell_order(level, parent.cell))[d]
@@ -578,13 +565,11 @@ end
 # and normalised; well-defined for every `K ≤ D` and continuous in the
 # face geometry, though not geometrically as sharp as the codim-1 case
 # (a codim-2 corner in 2D returns the diagonal-out direction).
-function _facet_outward_normal(sides::AbstractVector{<:Tuple{Integer,Symbol}}, ::Val{D},
-                               ::Type{T}) where {D,T}
+function _facet_outward_normal(sides::AbstractVector{<:Tuple{Integer,Symbol}}, ::Val{D}, ::Type{T}) where {D,T}
     accumulator = MVector{D,T}(ntuple(_ -> zero(T), D))
     for (axis, side) in sides
         sign = side === :lower ? -one(T) :
-               side === :upper ? one(T) :
-               throw(ArgumentError("boundary side must be :lower or :upper"))
+               side === :upper ? one(T) : throw(ArgumentError("boundary side must be :lower or :upper"))
         accumulator[axis] += sign
     end
     n = SVector{D,T}(accumulator)
@@ -713,12 +698,10 @@ end
 # inside it, with the fit's own residual at 3.5e-16. That is a pre-existing property
 # of the kernel, shared by volume integration; `boundary`'s docstring states the
 # condition for the public reader.
-function _boundary_facet_regions(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}},
-                                 tol::GeometryTolerance{T}) where {D,T}
+function _boundary_facet_regions(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}, tol::GeometryTolerance{T}) where {D,T}
     touching_levels = [level
                        for level in V.levels
-                       if all(_level_side_is_physical(level, V.domain, axis, side, tol)
-                              for (axis, side) in sides)]
+                       if all(_level_side_is_physical(level, V.domain, axis, side, tol) for (axis, side) in sides)]
     isempty(touching_levels) && return FacetRegion{D,T}[]
 
     free_axes = _free_axes(sides, Val(D))
@@ -726,13 +709,11 @@ function _boundary_facet_regions(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}
     # Per-axis intervals along the free axes, mirroring `_axis_intervals` from
     # intersections.jl but scanning only the cells that can parent a region
     # here (`_side_cells`).
-    merged = _merged_axis_coordinates(touching_levels, Val(D), tol,
-                                      level -> _side_cells(level, sides))
+    merged = _merged_axis_coordinates(touching_levels, Val(D), tol, level -> _side_cells(level, sides))
     intervals = map(d -> _intervals_from_coordinates(merged[d], tol), free_axes)
     any(isempty, intervals) && return FacetRegion{D,T}[]
 
-    return _merged_facet_regions(V, touching_levels, sides, free_axes, intervals, tol,
-                                 Val(length(free_axes)))
+    return _merged_facet_regions(V, touching_levels, sides, free_axes, intervals, tol, Val(length(free_axes)))
 end
 
 # Physical corners of the facet sub-rectangle spanned by the candidate index
@@ -756,8 +737,7 @@ end
 # inactive" rule widened by the side filter, and it carries everything the
 # parent list does — `_facet_parents` decodes it once per *emitted* region
 # instead of building a parent list once per candidate.
-function _facet_signature(levels, linmaps, sides, point::SVector{D,T},
-                          tol::GeometryTolerance{T}) where {D,T}
+function _facet_signature(levels, linmaps, sides, point::SVector{D,T}, tol::GeometryTolerance{T}) where {D,T}
     sig = zeros(Int, length(levels))
     for (i, level) in pairs(levels)
         cell = locate_cell(level.mesh, point; tol)
@@ -788,9 +768,8 @@ end
 # The codim-`D` vertex facet is `F = 0`, where the grid degenerates to the
 # single candidate `CartesianIndex()`, no axis is ever extended, and the region
 # is the point evaluation such a facet should be.
-function _merged_facet_regions(V::Space{D,T}, touching_levels, sides::Vector{Tuple{Int,Symbol}},
-                               free_axes::Vector{Int}, intervals, tol::GeometryTolerance{T},
-                               ::Val{F}) where {D,T,F}
+function _merged_facet_regions(V::Space{D,T}, touching_levels, sides::Vector{Tuple{Int,Symbol}}, free_axes::Vector{Int},
+                               intervals, tol::GeometryTolerance{T}, ::Val{F}) where {D,T,F}
     axis_intervals = ntuple(j -> intervals[j], Val(F))
     ranges = ntuple(j -> length(axis_intervals[j]), Val(F))
     normal = _facet_outward_normal(sides, Val(D), T)
@@ -828,9 +807,7 @@ function _merged_facet_regions(V::Space{D,T}, touching_levels, sides::Vector{Tup
 
         lower, upper = _facet_corners(V.domain, sides, free_axes, axis_intervals, start.I, hi)
         parents = _facet_parents(touching_levels, sig, Val(D), T)
-        push!(regions,
-              _facet_region(V, sides, parents, free_axes, lower, upper, normal, slice, pins,
-                            Val(F)))
+        push!(regions, _facet_region(V, sides, parents, free_axes, lower, upper, normal, slice, pins, Val(F)))
     end
     return regions
 end
@@ -850,8 +827,7 @@ end
 # `_lift` splices them back in. The coordinate is the facet's own, so the pins are
 # a property of `(domain, sides)` alone and are shared by every region on the face.
 function _facet_pins(domain::AxisBox{D,T}, sides::Vector{Tuple{Int,Symbol}}) where {D,T}
-    return sort!([(axis, _facet_fixed_coord(domain, sides, axis)) for (axis, _) in sides]; by=first,
-                 rev=true)
+    return sort!([(axis, _facet_fixed_coord(domain, sides, axis)) for (axis, _) in sides]; by=first, rev=true)
 end
 
 # The facet region's own extent as an `AxisBox` over its `F` free axes — the box
@@ -860,8 +836,7 @@ end
 # box of a codim-`K > 1` drop is degenerate on the axes still pinned and
 # `AxisBox`'s inner constructor rejects that (which is also why `FacetRegion`
 # stores a corner pair instead of a box).
-function _facet_box(lower::SVector{D,T}, upper::SVector{D,T}, free_axes::Vector{Int},
-                    ::Val{F}) where {D,T,F}
+function _facet_box(lower::SVector{D,T}, upper::SVector{D,T}, free_axes::Vector{Int}, ::Val{F}) where {D,T,F}
     return AxisBox(SVector{F,T}(ntuple(j -> lower[free_axes[j]], Val(F))),
                    SVector{F,T}(ntuple(j -> upper[free_axes[j]], Val(F))))
 end
@@ -872,9 +847,7 @@ end
 # axis order — `_facet_pins` holds them descending, hence the reverse — because an
 # insertion at index `k` lands on axis `k` of the result only once every axis below
 # `k` is already in place.
-function _lift(x::SVector, pins)
-    return foldl((y, pin) -> _insert_axis(y, pin[1], pin[2]), Iterators.reverse(pins); init=x)
-end
+_lift(x::SVector, pins) = foldl((y, pin) -> _insert_axis(y, pin[1], pin[2]), Iterators.reverse(pins); init=x)
 
 # How Ω meets one facet region's own face: `:full`, `:cut` or `:fictitious`, the
 # same three verdicts `classify_cell` returns on a cell box, reached on the
@@ -893,13 +866,12 @@ end
 # classifies the face box.
 _classify_facet(::Nothing, lower, upper, free_axes, ::Val) = :full
 
-function _classify_facet(slice::PhysicalDomain, lower::SVector{D,T}, upper::SVector{D,T},
-                         free_axes::Vector{Int}, ::Val{F}) where {D,T,F}
+function _classify_facet(slice::PhysicalDomain, lower::SVector{D,T}, upper::SVector{D,T}, free_axes::Vector{Int},
+                         ::Val{F}) where {D,T,F}
     return classify_cell(slice, _facet_box(lower, upper, free_axes, Val(F)))
 end
 
-function _classify_facet(slice::PhysicalDomain, ::SVector{D,T}, ::SVector{D,T}, ::Vector{Int},
-                         ::Val{0}) where {D,T}
+function _classify_facet(slice::PhysicalDomain, ::SVector{D,T}, ::SVector{D,T}, ::Vector{Int}, ::Val{0}) where {D,T}
     return _inside(slice.geometry, SVector{0,T}()) ? :full : :fictitious
 end
 
@@ -914,9 +886,8 @@ end
 # This is the base rule the dispatch below trims: exact on a `:full` face, the
 # carrier of the α-FCM term on every other kind, and never by itself the rule a
 # region on a cut face ends up with.
-function _facet_tensor_rule(V::Space{D,T}, parents::Vector{FacetParent{D,T}},
-                            free_axes::Vector{Int}, lower::SVector{D,T},
-                            upper::SVector{D,T}) where {D,T}
+function _facet_tensor_rule(V::Space{D,T}, parents::Vector{FacetParent{D,T}}, free_axes::Vector{Int},
+                            lower::SVector{D,T}, upper::SVector{D,T}) where {D,T}
     counts = _facet_quadrature_counts(V, parents, free_axes)
     jacobian = if isempty(free_axes)
         one(T)
@@ -980,14 +951,13 @@ end
 # The codim-`D` vertex facet (`F = 0`) never reaches the cut branch:
 # `_classify_facet` decides a single point by membership, so its verdict is `:full`
 # or `:fictitious` and there is no degenerate box for the fit to see.
-function _facet_region(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}},
-                       parents::Vector{FacetParent{D,T}}, free_axes::Vector{Int},
-                       lower::SVector{D,T}, upper::SVector{D,T}, normal::SVector{D,T},
+function _facet_region(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}, parents::Vector{FacetParent{D,T}},
+                       free_axes::Vector{Int}, lower::SVector{D,T}, upper::SVector{D,T}, normal::SVector{D,T},
                        slice::Union{Nothing,PhysicalDomain}, pins, ::Val{F}) where {D,T,F}
     state = _classify_facet(slice, lower, upper, free_axes, Val(F))
     base_points, base_weights = _facet_tensor_rule(V, parents, free_axes, lower, upper)
-    built(kind, points, weights, residual) = FacetRegion{D,T}(sides, lower, upper, parents, kind,
-                                                              points, weights, normal, residual)
+    built(kind, points, weights, residual) = FacetRegion{D,T}(sides, lower, upper, parents, kind, points, weights,
+                                                              normal, residual)
 
     state === :full && return built(:full, base_points, base_weights, zero(T))
     alpha = slice.alpha
@@ -1007,8 +977,8 @@ function _facet_region(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}},
     kind = status === :fallback ? :cut_fallback : :cut_fitted
     points = SVector{D,T}[_lift(p, pins) for p in fit_points]
     iszero(alpha) && return built(kind, points, fit_weights, residual)
-    return built(kind, vcat(points, base_points),
-                 vcat(fit_weights .* (one(T) - alpha), base_weights .* alpha), residual)
+    return built(kind, vcat(points, base_points), vcat(fit_weights .* (one(T) - alpha), base_weights .* alpha),
+                 residual)
 end
 
 # The measure of a facet region's own face — its full `(D − K)`-dimensional extent,
@@ -1091,8 +1061,7 @@ path for every basis family, reaching the family only through its
 [`boundary_trace_indices`](@ref) and plays no part here.
 """
 function boundary_trace_values!(level::Level{D,T}, trace, xi::SVector{D,T}) where {D,T}
-    _tensor_values!(level.basis, trace.values, trace.local_ids, nominal_order(level), xi,
-                    trace.factors, trace.cell)
+    _tensor_values!(level.basis, trace.values, trace.local_ids, nominal_order(level), xi, trace.factors, trace.cell)
     return trace
 end
 
@@ -1311,9 +1280,7 @@ _needs_dirichlet_projection(dirichlet) = !all(c -> _is_zero_datum(c.value), diri
 # value (`SVector`, `Tuple`, vector) whose every entry is zero. `SVector(0.0, 0.0)`
 # names the same homogeneous condition as `0.0`; any other datum — a function above
 # all — is taken to be nonzero, since only evaluating it could say otherwise.
-function _is_zero_datum(value)
-    value isa Number ? iszero(value) : value isa Union{Tuple,AbstractArray} && all(iszero, value)
-end
+_is_zero_datum(value) = value isa Number ? iszero(value) : value isa Union{Tuple,AbstractArray} && all(iszero, value)
 
 # Refill `layout.constrained_values` from `dirichlet`, returning the
 # [`DirichletProjection`](@ref) used. The caller reads the trace solve's verdicts —
@@ -1328,13 +1295,10 @@ end
 # under `prepare` and `update_dirichlet!`, a private one for a standalone
 # `dof_layout`. It must carry the layout's tolerance, checked before a projection is
 # built.
-function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T},
-                                    facets::FacetResolver{D,T}, dirichlet,
-                                    projection::Union{Nothing,DirichletProjection{D,T}}=nothing) where {D,
-                                                                                                        T}
+function _project_dirichlet_values!(layout::DofLayout{D,T}, V::Space{D,T}, facets::FacetResolver{D,T}, dirichlet,
+                                    projection::Union{Nothing,DirichletProjection{D,T}}=nothing) where {D,T}
     ncomp = layout.components
-    plan = if projection === nothing ||
-              projection.facet_count != _dirichlet_facet_count(dirichlet, Val(D))
+    plan = if projection === nothing || projection.facet_count != _dirichlet_facet_count(dirichlet, Val(D))
         # A tolerance mismatch is a caller bug and is raised as one. A memo's entries
         # were merged against *its* tolerance, so reading them with a layout built at
         # another one would project the datum over a different partition of ∂Ω than
@@ -1379,9 +1343,7 @@ end
 # Number of (condition, facet) pairs a Dirichlet list covers. Recorded on a
 # `DirichletProjection` as its `facet_count` field so a cached projection can be
 # rejected when the condition list no longer has the shape it was built for.
-function _dirichlet_facet_count(dirichlet, ::Val{D}) where {D}
-    return sum(c -> length(_facets(c.boundary, Val(D))), dirichlet; init=0)
-end
+_dirichlet_facet_count(dirichlet, ::Val{D}) where {D} = sum(c -> length(_facets(c.boundary, Val(D))), dirichlet; init=0)
 
 # Build the datum-independent half of the projection.
 #
@@ -1404,20 +1366,17 @@ end
 # faces the assembly path and `boundary_integral` read, and the operator and the
 # projected datum can never integrate different facets; a standalone `dof_layout`
 # hands in a private one at the layout's tolerance.
-function _dirichlet_projection(layout::DofLayout{D,T}, V::Space{D,T}, facets::FacetResolver{D,T},
-                               dirichlet) where {D,T}
+function _dirichlet_projection(layout::DofLayout{D,T}, V::Space{D,T}, facets::FacetResolver{D,T}, dirichlet) where {D,T}
     ncomp = layout.components
     facet_count = _dirichlet_facet_count(dirichlet, Val(D))
     unknowns = [[raw
                  for raw in eachindex(layout.raw_keys)
-                 if layout.elimination_source[raw] === :free && layout.physical_dirichlet[raw, c]]
-                for c in 1:ncomp]
+                 if layout.elimination_source[raw] === :free && layout.physical_dirichlet[raw, c]] for c in 1:ncomp]
     # Nothing is constrained anywhere: no mass to accumulate and no facet to walk,
     # so the projection is the empty one its `facet_count` still has to carry.
     if all(isempty, unknowns)
         return DirichletProjection{D,T}(facet_count, unknowns, [Int[] for _ in 1:ncomp],
-                                        DirichletFactor{T}[nothing for _ in 1:ncomp],
-                                        FacetTraceSamples{D,T}[])
+                                        DirichletFactor{T}[nothing for _ in 1:ncomp], FacetTraceSamples{D,T}[])
     end
 
     index = [Dict(raw => i for (i, raw) in pairs(unknowns[c])) for c in 1:ncomp]
@@ -1429,8 +1388,7 @@ function _dirichlet_projection(layout::DofLayout{D,T}, V::Space{D,T}, facets::Fa
     samples = FacetTraceSamples{D,T}[]
     for condition in dirichlet
         for sides in _facets(condition.boundary, Val(D))
-            push!(samples,
-                  _sample_dirichlet_facet!(mass, index, layout, V, facets, condition, sides))
+            push!(samples, _sample_dirichlet_facet!(mass, index, layout, V, facets, condition, sides))
         end
     end
 
@@ -1444,8 +1402,7 @@ function _dirichlet_projection(layout::DofLayout{D,T}, V::Space{D,T}, facets::Fa
     # face is structural (an empty rule, or a trace vanishing at every point of
     # one), while a merely *small* diagonal is the conditioning question
     # `min_relative_facet_measure` already answers and not a missing constraint.
-    unsupported = [Int[raw for (i, raw) in pairs(unknowns[c]) if iszero(mass[c][i, i])]
-                   for c in 1:ncomp]
+    unsupported = [Int[raw for (i, raw) in pairs(unknowns[c]) if iszero(mass[c][i, i])] for c in 1:ncomp]
 
     # Solve `M c = b` for each component. Cholesky first; pseudoinverse fallback
     # on the rare indefinite case (degenerate / zero-area facets under heavy
@@ -1470,9 +1427,8 @@ end
 # boundary traces of every covering parent once, record them as a sample, and
 # accumulate the mass-matrix contribution of every component the condition
 # constrains.
-function _sample_dirichlet_facet!(mass::Vector{Matrix{T}}, index::Vector{Dict{Int,Int}},
-                                  layout::DofLayout{D,T}, V::Space{D,T}, facets::FacetResolver{D,T},
-                                  condition::DirichletCondition,
+function _sample_dirichlet_facet!(mass::Vector{Matrix{T}}, index::Vector{Dict{Int,Int}}, layout::DofLayout{D,T},
+                                  V::Space{D,T}, facets::FacetResolver{D,T}, condition::DirichletCondition,
                                   sides::Vector{Tuple{Int,Symbol}}) where {D,T}
     ncomp = layout.components
     points = SVector{D,T}[]
@@ -1542,8 +1498,7 @@ function _sample_dirichlet_facet!(mass::Vector{Matrix{T}}, index::Vector{Dict{In
                                 row = get(index_c, test_trace.raw_dofs[a], 0)
                                 row == 0 && continue
                                 mass_c[row, col] += qweight *
-                                                    _test_value_contribution(mass_channels,
-                                                                             test_trace.values[a])
+                                                    _test_value_contribution(mass_channels, test_trace.values[a])
                             end
                         end
                     end
@@ -1604,9 +1559,8 @@ function _check_dirichlet_update_compatibility(old, new)
                                                       "conditions (the count the model was prepared " *
                                                       "with), got $(length(new))"))
     for (i, (o, n)) in enumerate(zip(old, new))
-        o.boundary == n.boundary ||
-            throw(ArgumentError("update_dirichlet! condition $i: boundary selector changed; " *
-                                "rebuild the model with prepare(problem) instead"))
+        o.boundary == n.boundary || throw(ArgumentError("update_dirichlet! condition $i: boundary selector changed; " *
+                                                        "rebuild the model with prepare(problem) instead"))
         o.field === n.field || throw(ArgumentError("update_dirichlet! condition $i: field name " *
                                                    "changed; rebuild the model with " *
                                                    "prepare(problem) instead"))

@@ -40,9 +40,8 @@
 _level_splits(s, depth::Int, ::Val{D}) where {D} = fill(_axis_int_tuple(s, Val(D), :splits), depth)
 
 function _level_splits(s::AbstractVector, depth::Int, ::Val{D}) where {D}
-    length(s) == depth ||
-        throw(ArgumentError("a per-level `splits` vector must have one entry per overlay " *
-                            "level: got $(length(s)) for depth $depth"))
+    length(s) == depth || throw(ArgumentError("a per-level `splits` vector must have one entry per overlay " *
+                                              "level: got $(length(s)) for depth $depth"))
     return [_axis_int_tuple(e, Val(D), :splits) for e in s]
 end
 
@@ -161,19 +160,18 @@ m[29:36, 29:36] .= true
 V = adapt(V, 4 => m)          # the finest level alone, live on a small patch
 ```
 """
-function ladder(domain::AxisBox{D,T}; cells, depth::Integer, splits=2, order=1,
-                basis=IntegratedLegendre(), mode::Symbol=:tensor, physical=nothing, active=nothing,
+function ladder(domain::AxisBox{D,T}; cells, depth::Integer, splits=2, order=1, basis=IntegratedLegendre(),
+                mode::Symbol=:tensor, physical=nothing, active=nothing,
                 tolerance::GeometryTolerance{T}=GeometryTolerance(T)) where {D,T}
     depth >= 0 || throw(ArgumentError("ladder depth must be non-negative; got $depth"))
     base_cells = _axis_int_tuple(cells, Val(D), :cells)
     factors = _level_splits(splits, Int(depth), Val(D))
     counts = _ladder_counts(base_cells, factors, domain, tolerance)
 
-    V = space(domain; cells=base_cells, order=order, basis=basis, mode=mode, physical=physical,
-              active=active)
+    V = space(domain; cells=base_cells, order=order, basis=basis, mode=mode, physical=physical, active=active)
     for k in 1:depth
-        V = overlay(V, domain; cells=counts[k], order=order, basis=basis, mode=mode,
-                    active=CartesianIndex{D}[], tolerance=tolerance)
+        V = overlay(V, domain; cells=counts[k], order=order, basis=basis, mode=mode, active=CartesianIndex{D}[],
+                    tolerance=tolerance)
     end
     return V
 end
@@ -291,8 +289,7 @@ end
 # affairs on a sub-box overlay. Every caller must read it that way.
 function _cell_block(V::Space{D}, from::Integer, to::Integer, cell::CartesianIndex{D}) where {D}
     f, t = V.levels[from].mesh, V.levels[to].mesh
-    return CartesianIndices(ntuple(d -> _axis_cells(t.axes[d], f.axes[d][cell.I[d]],
-                                                    f.axes[d][cell.I[d] + 1]), D))
+    return CartesianIndices(ntuple(d -> _axis_cells(t.axes[d], f.axes[d][cell.I[d]], f.axes[d][cell.I[d] + 1]), D))
 end
 
 """
@@ -361,8 +358,7 @@ function overlapping_cells(V::Space{D,T}, cells; from::Integer, to::Integer) whe
     # 15 625 sources. The per-axis blocks are tabulated once over the source axes
     # so no cell repeats the binary search.
     f, t = src_level.mesh, dst_level.mesh
-    ranges = ntuple(d -> [_axis_cells(t.axes[d], f.axes[d][i], f.axes[d][i + 1])
-                          for i in 1:f.cells[d]], D)
+    ranges = ntuple(d -> [_axis_cells(t.axes[d], f.axes[d][i], f.axes[d][i + 1]) for i in 1:f.cells[d]], D)
     out = falses(t.cells)
     for ci in CartesianIndices(src)
         src[ci] || continue
@@ -445,13 +441,11 @@ the feature that marked it.
 """
 function depth_masks(V::Space{D}, depths::AbstractArray{<:Integer,D}; grade::Int=0) where {D}
     base = V.levels[1].mesh
-    size(depths) == base.cells ||
-        throw(DimensionMismatch("depth map shape $(size(depths)) does not match the base " *
-                                "level's cells $(base.cells)"))
+    size(depths) == base.cells || throw(DimensionMismatch("depth map shape $(size(depths)) does not match the base " *
+                                                          "level's cells $(base.cells)"))
     maxdepth = length(V.levels) - 1
-    all(dk -> 0 <= dk <= maxdepth, depths) ||
-        throw(ArgumentError("depths must lie in 0:$maxdepth for a ladder with " *
-                            "$(length(V.levels)) levels; got $(extrema(depths))"))
+    all(dk -> 0 <= dk <= maxdepth, depths) || throw(ArgumentError("depths must lie in 0:$maxdepth for a ladder with " *
+                                                                  "$(length(V.levels)) levels; got $(extrema(depths))"))
     grade >= 0 || throw(ArgumentError("grade must be non-negative; got $grade"))
 
     d = Array{Int,D}(depths)

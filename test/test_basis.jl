@@ -20,8 +20,7 @@ end
 
         ξ = -0.7 + 1.4 * (i - 2) / 6
         h = 1.0e-6
-        fd = (Unfitted.integrated_legendre_value(i, ξ + h) -
-              Unfitted.integrated_legendre_value(i, ξ - h)) / (2h)
+        fd = (Unfitted.integrated_legendre_value(i, ξ + h) - Unfitted.integrated_legendre_value(i, ξ - h)) / (2h)
         @test Unfitted.integrated_legendre_derivative(i, ξ) ≈ fd rtol = 1.0e-7 atol = 1.0e-8
     end
 end
@@ -30,8 +29,8 @@ end
     basis = IntegratedLegendre()
 
     @test Unfitted.local_basis_indices(basis, (1, 2)) ==
-          [CartesianIndex(0, 0), CartesianIndex(1, 0), CartesianIndex(0, 1), CartesianIndex(1, 1),
-           CartesianIndex(0, 2), CartesianIndex(1, 2)]
+          [CartesianIndex(0, 0), CartesianIndex(1, 0), CartesianIndex(0, 1), CartesianIndex(1, 1), CartesianIndex(0, 2),
+           CartesianIndex(1, 2)]
 
     # `basis_values` carries the parent cell in its signature for every family;
     # integrated Legendre ignores it, so any in-bounds index does here.
@@ -39,12 +38,10 @@ end
     @test length(values) == 4
     @test sum(values) ≈ 1.0
 
-    values3 = Unfitted.basis_values(basis, (1, 2, 1), :tensor, (0.0, 0.25, -0.25),
-                                    CartesianIndex(1, 1, 1))
+    values3 = Unfitted.basis_values(basis, (1, 2, 1), :tensor, (0.0, 0.25, -0.25), CartesianIndex(1, 1, 1))
     @test length(values3) == 12
 
-    values4 = Unfitted.basis_values(basis, (1, 1, 1, 1), :tensor, (0.0, 0.1, -0.2, 0.3),
-                                    CartesianIndex(1, 1, 1, 1))
+    values4 = Unfitted.basis_values(basis, (1, 1, 1, 1), :tensor, (0.0, 0.1, -0.2, 0.3), CartesianIndex(1, 1, 1, 1))
     @test length(values4) == 16
     @test sum(values4) ≈ 1.0
 end
@@ -94,8 +91,7 @@ end
     # its chain-rule factor `2 / h_d` is 1 and the physical gradient the single
     # entry point returns is the bare reference gradient ∂N_α/∂ξ.
     reference1 = box((-1.0,), (1.0,))
-    gradients1 = Unfitted.physical_basis_gradients(basis, (2,), :tensor, reference1, (0.25,),
-                                                   CartesianIndex(1))
+    gradients1 = Unfitted.physical_basis_gradients(basis, (2,), :tensor, reference1, (0.25,), CartesianIndex(1))
     @test length(gradients1) == 3
     @test gradients1[1][1] ≈ -0.5
     @test gradients1[2][1] ≈ 0.5
@@ -118,8 +114,8 @@ end
     @test physical[1] ≈ gradients[1] .* (2 ./ Unfitted.edge_lengths(cell))
 
     reference3 = box((-1.0, -1.0, -1.0), (1.0, 1.0, 1.0))
-    gradients3 = Unfitted.physical_basis_gradients(basis, (1, 1, 1), :tensor, reference3,
-                                                   (0.2, -0.1, 0.4), CartesianIndex(1, 1, 1))
+    gradients3 = Unfitted.physical_basis_gradients(basis, (1, 1, 1), :tensor, reference3, (0.2, -0.1, 0.4),
+                                                   CartesianIndex(1, 1, 1))
     @test length(gradients3) == 8
     @test length(gradients3[1]) == 3
 end

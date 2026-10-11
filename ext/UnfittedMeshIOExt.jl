@@ -91,8 +91,7 @@ function _closest_point(cell::NTuple{3,SVector{3,T}}, p) where {T}
     vb = d5 * d2 - d1 * d6
     (vb <= 0 && d2 >= 0 && d6 <= 0) && return a + (d2 / (d2 - d6)) * ac
     va = d3 * d6 - d5 * d4
-    (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) &&
-        return b + ((d4 - d3) / ((d4 - d3) + (d5 - d6))) * (c - b)
+    (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) && return b + ((d4 - d3) / ((d4 - d3) + (d5 - d6))) * (c - b)
     denom = 1 / (va + vb + vc)
     return a + ab * (vb * denom) + ac * (vc * denom)
 end
@@ -115,8 +114,7 @@ function _feature_weight(cell::NTuple{3,SVector{3,T}}, cp, tol) where {T}
     norm(cp - a) <= tol && return _vertex_angle(a, b, c)
     norm(cp - b) <= tol && return _vertex_angle(b, c, a)
     norm(cp - c) <= tol && return _vertex_angle(c, a, b)
-    (_on_segment(cp, a, b, tol) || _on_segment(cp, b, c, tol) || _on_segment(cp, c, a, tol)) &&
-        return Float64(pi)
+    (_on_segment(cp, a, b, tol) || _on_segment(cp, b, c, tol) || _on_segment(cp, c, a, tol)) && return Float64(pi)
     return 2 * Float64(pi)
 end
 
@@ -164,9 +162,7 @@ function _mesh_scale(cells)
 end
 
 # Degenerate (zero-measure) cells have no defined normal and corrupt the sign.
-function _is_degenerate(cell::NTuple{2,SVector{D,T}}, scale) where {D,T}
-    norm(cell[2] - cell[1]) <= 1.0e-10 * scale
-end
+_is_degenerate(cell::NTuple{2,SVector{D,T}}, scale) where {D,T} = norm(cell[2] - cell[1]) <= 1.0e-10 * scale
 function _is_degenerate(cell::NTuple{3,SVector{3,T}}, scale) where {T}
     ab = cell[2] - cell[1]
     ac = cell[3] - cell[1]
@@ -238,11 +234,9 @@ end
 # exactly, x·n being affine over the cell and the midpoint its centroid.
 function _check_watertight(cells, normals, scale)
     open_faces = _unpaired_faces(_weld(cells, 1.0e-6 * scale))
-    open_faces == 0 ||
-        throw(ArgumentError("mesh is not closed: $open_faces unpaired cell faces. Repair it, " *
-                            "or pass orientation=:winding"))
-    sum(Unfitted._simplex_measure(c) * dot(Unfitted._cell_midpoint(c), n)
-        for (c, n) in zip(cells, normals)) > 0 ||
+    open_faces == 0 || throw(ArgumentError("mesh is not closed: $open_faces unpaired cell faces. Repair it, " *
+                                           "or pass orientation=:winding"))
+    sum(Unfitted._simplex_measure(c) * dot(Unfitted._cell_midpoint(c), n) for (c, n) in zip(cells, normals)) > 0 ||
         throw(ArgumentError("mesh is inside-out (encloses a negative volume): reverse the cell " *
                             "winding, or pass orientation=:winding"))
     return nothing
@@ -265,8 +259,7 @@ function _build_mesh_sdf(bmesh::BoundaryMesh{D,T,K}, winding::Bool) where {D,T,K
     # against NaN is false — the sign test would then read the whole space as
     # inside, silently, so the direction is required to exist here.
     bad = overrides === nothing ? nothing : findfirst(n -> !(0 < norm(n) < Inf), overrides)
-    bad === nothing ||
-        throw(ArgumentError("mesh normal #$bad is zero or non-finite; give each cell a direction"))
+    bad === nothing || throw(ArgumentError("mesh normal #$bad is zero or non-finite; give each cell a direction"))
     scale = _mesh_scale(cells)
 
     kept = eltype(cells)[]
@@ -285,8 +278,7 @@ function _build_mesh_sdf(bmesh::BoundaryMesh{D,T,K}, winding::Bool) where {D,T,K
     isempty(kept) && throw(ArgumentError("mesh has no non-degenerate cells"))
     tol = 1.0e-8 * scale     # scale-free length tolerance for the sign tests
     winding || _check_watertight(kept, normals, scale)
-    return _MeshSDF{D,eltype(kept),typeof(KDTree(midpoints))}(kept, KDTree(midpoints), normals,
-                                                              maxcr, tol, winding)
+    return _MeshSDF{D,eltype(kept),typeof(KDTree(midpoints))}(kept, KDTree(midpoints), normals, maxcr, tol, winding)
 end
 
 # Generalized winding number sign (opt-in). 2D sums signed segment angles; 3D
@@ -347,8 +339,7 @@ function (m::_MeshSDF{D})(p) where {D}
         pseudonormal = zero(SVector{D,Float64})
         for k in eachindex(candidates)
             norm(cpvs[k] - best_cpv) <= m.tol &&
-                (pseudonormal += _feature_weight(m.cells[candidates[k]], cpvs[k], m.tol) *
-                                 m.normals[candidates[k]])
+                (pseudonormal += _feature_weight(m.cells[candidates[k]], cpvs[k], m.tol) * m.normals[candidates[k]])
         end
         s = dot(pv - best_cpv, pseudonormal) >= 0 ? 1.0 : -1.0
     end
@@ -447,8 +438,7 @@ or mis-wound facets is rejected under the default `:pseudonormal`, and
 Accuracy is bounded by the STL faceting: each planar facet is integrated
 exactly, while facet edges are creases resolved by the kernel's subdivision.
 """
-function stl_levelset(path::AbstractString; lipschitz::Union{Real,Nothing}=nothing,
-                      orientation::Symbol=:pseudonormal)
+function stl_levelset(path::AbstractString; lipschitz::Union{Real,Nothing}=nothing, orientation::Symbol=:pseudonormal)
     verts, faces = _load_triangles(path)
     isempty(faces) && throw(ArgumentError("no triangles in $path; expected an ASCII or binary STL"))
     return mesh_levelset(triangle_mesh(verts, faces); lipschitz=lipschitz, orientation=orientation)

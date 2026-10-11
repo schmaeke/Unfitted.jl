@@ -3,9 +3,7 @@ using StaticArrays
 # Parse one `<DataArray>` back out of an ASCII `.vtu`/`.vtp` by name, so the
 # tests can assert the numbers ParaView will show. Requires `ascii=true,
 # append=false` on the write; the appended-binary form carries no parsable text.
-function _vtu_values(xml, name)
-    split(match(Regex("Name=\"$name\"[^>]*>([^<]*)</DataArray>"), xml).captures[1])
-end
+_vtu_values(xml, name) = split(match(Regex("Name=\"$name\"[^>]*>([^<]*)</DataArray>"), xml).captures[1])
 _vtu_ints(xml, name) = parse.(Int, _vtu_values(xml, name))
 _vtu_floats(xml, name) = parse.(Float64, _vtu_values(xml, name))
 
@@ -19,10 +17,8 @@ _vtu_floats(xml, name) = parse.(Float64, _vtu_values(xml, name))
     solution = solve!(model)
 
     dir = mktempdir()
-    files = write_vtk(joinpath(dir, "case"), solution, model; subdivisions=:none, ascii=true,
-                      append=false, compress=false,
-                      point_data=(uh=(u, c, x, xi) -> u(c, xi),
-                                  twice=(u, c, x, xi) -> 2 * u(c, xi)),
+    files = write_vtk(joinpath(dir, "case"), solution, model; subdivisions=:none, ascii=true, append=false,
+                      compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi), twice=(u, c, x, xi) -> 2 * u(c, xi)),
                       cell_data=(midpoint_x=(u, c, x, xi) -> x[1],))
 
     @test joinpath(dir, "case.vtm") in files
@@ -74,8 +70,8 @@ end
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
     dir = mktempdir()
-    files = write_vtk(joinpath(dir, "cpl"), solution, model; subdivisions=:none, ascii=true,
-                      append=false, compress=false)
+    files = write_vtk(joinpath(dir, "cpl"), solution, model; subdivisions=:none, ascii=true, append=false,
+                      compress=false)
 
     # one data `.vtu` per field, ASCII-indexed so Extract Block can isolate it
     @test joinpath(dir, "cpl_data_1.vtu") in files
@@ -120,8 +116,8 @@ end
     dir = mktempdir()
     foreign = (other=(u, c, x, xi) -> u(c, xi, u2),)
     err = try
-        write_vtk(joinpath(dir, "foreign"), solution, model; field=:u1, level_meshes=false,
-                  subdivisions=:none, point_data=foreign)
+        write_vtk(joinpath(dir, "foreign"), solution, model; field=:u1, level_meshes=false, subdivisions=:none,
+                  point_data=foreign)
         nothing
     catch e
         e
@@ -133,22 +129,19 @@ end
 @testset "a VTK callback reads another field of the same subdomain" begin
     # Two fields on one space: writing `a`, a callback may evaluate `b` at the
     # sample, and gets the value the point evaluation gives at the same `x`.
-    V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2),
-                box((0.0, 0.0), (0.5, 0.5)); cells=(2, 2), order=3)
+    V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2), box((0.0, 0.0), (0.5, 0.5)); cells=(2, 2),
+                order=3)
     a = field(:a, V)
     b = field(:b, V)
-    model = prepare(Problem((a, b); blocks=(stiffness_block(a), mass_block(b)),
-                            loads=(source_load(a; source=1.0),),
+    model = prepare(Problem((a, b); blocks=(stiffness_block(a), mass_block(b)), loads=(source_load(a; source=1.0),),
                             dirichlet=[dirichlet(x -> 1.0 + x[1]; on=boundary(:all), field=:a)]))
     n = Unfitted.active_unknowns(model.dofs)
-    solution = Solution([sin(3i) for i in 1:n], model.version,
-                        Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    solution = Solution([sin(3i) for i in 1:n], model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
     gaps = Float64[]
     record(gap) = (push!(gaps, abs(gap)); gap)
     point_data = (own=(u, c, x, xi) -> record(u(c, xi) - value(solution, model, a, x)),
                   other=(u, c, x, xi) -> record(u(c, xi, b) - value(solution, model, b, x)))
-    write_vtk(joinpath(mktempdir(), "named"), solution, model; field=:a, level_meshes=false,
-              subdivisions=2, point_data)
+    write_vtk(joinpath(mktempdir(), "named"), solution, model; field=:a, level_meshes=false, subdivisions=2, point_data)
     @test length(gaps) > 100
     @test maximum(gaps) ≤ 1.0e-12
 end
@@ -159,14 +152,13 @@ end
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
     a = field(:a, V)
     b = field(:b, V)
-    model = prepare(Problem((a, b); blocks=(stiffness_block(a), mass_block(b)),
-                            loads=(source_load(a; source=1.0),),
+    model = prepare(Problem((a, b); blocks=(stiffness_block(a), mass_block(b)), loads=(source_load(a; source=1.0),),
                             dirichlet=[dirichlet(0.0; on=boundary(:all), field=:a)]))
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
     dir = mktempdir()
-    files = write_vtk(joinpath(dir, "shared"), solution, model; subdivisions=:none, ascii=true,
-                      append=false, compress=false)
+    files = write_vtk(joinpath(dir, "shared"), solution, model; subdivisions=:none, ascii=true, append=false,
+                      compress=false)
     meshes = filter(f -> occursin("_mesh.vtu", f), files)
     @test length(meshes) == 1
 end
@@ -180,8 +172,8 @@ end
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
     dir = mktempdir()
-    files = write_vtk(joinpath(dir, "vector_case"), solution, model; subdivisions=:none, ascii=true,
-                      append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+    files = write_vtk(joinpath(dir, "vector_case"), solution, model; subdivisions=:none, ascii=true, append=false,
+                      compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
 
     @test joinpath(dir, "vector_case_data.vtu") in files
     solution_xml = read(joinpath(dir, "vector_case_data.vtu"), String)
@@ -194,8 +186,7 @@ end
     uh_header = match(r"<DataArray[^>]*Name=\"uh\"[^>]*>", solution_xml)
     @test uh_header !== nothing
     @test occursin("NumberOfComponents=\"3\"", uh_header.match)
-    @test occursin("NumberOfComponents=\"3\"",
-                   match(r"<DataArray[^>]*Name=\"Points\"[^>]*>", solution_xml).match)
+    @test occursin("NumberOfComponents=\"3\"", match(r"<DataArray[^>]*Name=\"Points\"[^>]*>", solution_xml).match)
 end
 
 @testset "level mesh exports all cells with an active flag" begin
@@ -212,8 +203,8 @@ end
     soln = Solution(coefficients, model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
     dir = mktempdir()
-    files = write_vtk(joinpath(dir, "masked"), soln, model; subdivisions=:none, ascii=true,
-                      append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+    files = write_vtk(joinpath(dir, "masked"), soln, model; subdivisions=:none, ascii=true, append=false,
+                      compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
 
     overlay_file = joinpath(dir, "masked_level_2_overlay_mesh.vtu")
     @test overlay_file in files
@@ -232,8 +223,8 @@ end
     # cell data; assert the actual values, not just that the arrays are emitted. A
     # 4×4 p=2 base with an aligned p=3 overlay over the middle 2×2 block covers four
     # base cells and sheds high-order (plus one deduped vertex) there.
-    V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2),
-                box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4), order=3)
+    V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2), box((0.25, 0.25), (0.75, 0.75));
+                cells=(4, 4), order=3)
     model = prepare(mass(V))
     sol = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
                    Unfitted.SolverDiagnostics(:manual, 0.0, true))
@@ -270,21 +261,19 @@ end
     # ParaView contour at level 0 reproduces ∂Ω.
     phi_disk(x) = sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.4
     omega = box((0.0, 0.0), (1.0, 1.0))
-    physical = physical_domain(phi_disk; lipschitz=1.0, alpha=1.0, subcell_length_scale=0.125,
-                               max_depth=3)
+    physical = physical_domain(phi_disk; lipschitz=1.0, alpha=1.0, subcell_length_scale=0.125, max_depth=3)
     V = space(omega; cells=(2, 2), order=1, physical=physical)
     model = prepare(poisson(V; source=0.0))
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
     dir = mktempdir()
-    files = write_vtk(joinpath(dir, "disk"), solution, model; subdivisions=:none, ascii=true,
-                      append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+    files = write_vtk(joinpath(dir, "disk"), solution, model; subdivisions=:none, ascii=true, append=false,
+                      compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
 
     solution_xml = read(joinpath(dir, "disk_data.vtu"), String)
     points = reshape(_vtu_floats(solution_xml, "Points"), 3, :)
-    @test _vtu_floats(solution_xml, "level_set") ≈
-          [phi_disk(view(points, :, i)) for i in axes(points, 2)] atol = 1.0e-14
+    @test _vtu_floats(solution_xml, "level_set") ≈ [phi_disk(view(points, :, i)) for i in axes(points, 2)] atol = 1.0e-14
 end
 
 @testset "VTK omits level_set when no PhysicalDomain is attached" begin
@@ -295,8 +284,8 @@ end
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
     dir = mktempdir()
-    write_vtk(joinpath(dir, "plain"), solution, model; subdivisions=:none, ascii=true, append=false,
-              compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+    write_vtk(joinpath(dir, "plain"), solution, model; subdivisions=:none, ascii=true, append=false, compress=false,
+              point_data=(uh=(u, c, x, xi) -> u(c, xi),))
 
     solution_xml = read(joinpath(dir, "plain_data.vtu"), String)
     @test !occursin("level_set", solution_xml)
@@ -310,16 +299,14 @@ end
     # WriteVTK serialises numeric arrays.
     phi_disk(x) = sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.4
     omega = box((0.0, 0.0), (1.0, 1.0))
-    physical = physical_domain(phi_disk; lipschitz=1.0, alpha=1.0, subcell_length_scale=0.25,
-                               max_depth=2)
+    physical = physical_domain(phi_disk; lipschitz=1.0, alpha=1.0, subcell_length_scale=0.25, max_depth=2)
     V = space(omega; cells=(1, 1), order=1, physical=physical)
     model = prepare(poisson(V; source=0.0))
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
     dir = mktempdir()
-    write_vtk(joinpath(dir, "override"), solution, model; subdivisions=:none, ascii=true,
-              append=false, compress=false,
+    write_vtk(joinpath(dir, "override"), solution, model; subdivisions=:none, ascii=true, append=false, compress=false,
               point_data=(uh=(u, c, x, xi) -> u(c, xi), level_set=(u, c, x, xi) -> 42.0))
 
     solution_xml = read(joinpath(dir, "override_data.vtu"), String)
@@ -336,35 +323,30 @@ end
     # exists for: each frame carries its own level meshes, so the animation shows
     # the mesh following the feature and not just the field on a frozen mesh.
     omega = box((0.0, 0.0), (1.0, 1.0))
-    V = overlay(space(omega; cells=(2, 2), order=1), box((0.1, 0.1), (0.5, 0.5)); cells=(1, 1),
-                order=2)
+    V = overlay(space(omega; cells=(2, 2), order=1), box((0.1, 0.1), (0.5, 0.5)); cells=(1, 1), order=2)
     model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     dir = mktempdir()
     series = vtk_series(joinpath(dir, "run"))
-    first_frame = write_vtk(series, 0.0, solve!(model), model; subdivisions=:none, ascii=true,
-                            append=false, compress=false)
+    first_frame = write_vtk(series, 0.0, solve!(model), model; subdivisions=:none, ascii=true, append=false,
+                            compress=false)
     @test first_frame == joinpath(dir, "run_frames", "frame_0001.vtm")
     @test isfile(joinpath(dir, "run_frames", "frame_0001_level_2_overlay_mesh.vtu"))
 
     # Byte-identity, the contract of the body split: a frame is the ordinary
     # bundle. Written from the same `(solution, model)` before the overlay moves.
     solo = solve!(model)
-    write_vtk(joinpath(dir, "solo"), solo, model; subdivisions=:none, ascii=true, append=false,
-              compress=false)
-    @test read(joinpath(dir, "run_frames", "frame_0001_data.vtu")) ==
-          read(joinpath(dir, "solo_data.vtu"))
+    write_vtk(joinpath(dir, "solo"), solo, model; subdivisions=:none, ascii=true, append=false, compress=false)
+    @test read(joinpath(dir, "run_frames", "frame_0001_data.vtu")) == read(joinpath(dir, "solo_data.vtu"))
 
     move!(model; level=2, to=box((0.5, 0.5), (0.9, 0.9)))
-    write_vtk(series, 0.25, solve!(model), model; subdivisions=:none, ascii=true, append=false,
-              compress=false)
+    write_vtk(series, 0.25, solve!(model), model; subdivisions=:none, ascii=true, append=false, compress=false)
     @test read(joinpath(dir, "run_frames", "frame_0002_level_2_overlay_mesh.vtu")) !=
           read(joinpath(dir, "run_frames", "frame_0001_level_2_overlay_mesh.vtu"))
 
     collection = close(series)
     @test collection == joinpath(dir, "run.pvd")
-    sets = collect(eachmatch(r"<DataSet timestep=\"([^\"]*)\"[^>]*file=\"([^\"]*)\"",
-                             read(collection, String)))
+    sets = collect(eachmatch(r"<DataSet timestep=\"([^\"]*)\"[^>]*file=\"([^\"]*)\"", read(collection, String)))
     @test length(sets) == 2
     @test parse.(Float64, [s.captures[1] for s in sets]) == [0.0, 0.25]
     @test [s.captures[2] for s in sets] ==
@@ -433,17 +415,14 @@ end
 function _vtu_mixed_cells(xml)
     phi = _vtu_floats(xml, "level_set")
     connectivity = reshape(_vtu_ints(xml, "connectivity"), 4, :)
-    return [c
-            for c in axes(connectivity, 2)
-            if !allequal(phi[i + 1] <= 0 for i in connectivity[:, c])]
+    return [c for c in axes(connectivity, 2) if !allequal(phi[i + 1] <= 0 for i in connectivity[:, c])]
 end
 
 # A disk cutting every cell of a 2×2 mesh: four regions, all `:cut_fitted`.
 function _cut_depth_disk_model()
     phi_disk(x) = sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.4
     omega = box((0.0, 0.0), (1.0, 1.0))
-    physical = physical_domain(phi_disk; lipschitz=1.0, alpha=1.0, subcell_length_scale=0.125,
-                               max_depth=3)
+    physical = physical_domain(phi_disk; lipschitz=1.0, alpha=1.0, subcell_length_scale=0.125, max_depth=3)
     V = space(omega; cells=(2, 2), order=1, physical=physical)
     model = prepare(poisson(V; source=0.0))
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
@@ -460,9 +439,8 @@ end
     dir = mktempdir()
 
     for (depth, cells) in ((0, 4), (1, 16), (2, 52), (3, 160))
-        write_vtk(joinpath(dir, "d$(depth)"), solution, model; subdivisions=:none, cut_depth=depth,
-                  ascii=true, append=false, compress=false,
-                  point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+        write_vtk(joinpath(dir, "d$(depth)"), solution, model; subdivisions=:none, cut_depth=depth, ascii=true,
+                  append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
         xml = read(joinpath(dir, "d$(depth)_data.vtu"), String)
         widths = _vtu_quad_widths(xml)
         @test length(widths) == cells
@@ -490,8 +468,8 @@ end
     # the ones the tree introduced, carries `levelset_value` evaluated there.
     phi_disk, model, solution = _cut_depth_disk_model()
     dir = mktempdir()
-    write_vtk(joinpath(dir, "exact"), solution, model; subdivisions=:none, cut_depth=2, ascii=true,
-              append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+    write_vtk(joinpath(dir, "exact"), solution, model; subdivisions=:none, cut_depth=2, ascii=true, append=false,
+              compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
 
     xml = read(joinpath(dir, "exact_data.vtu"), String)
     points = reshape(_vtu_floats(xml, "Points"), 3, :)
@@ -504,8 +482,8 @@ end
     # introduce, and invisible in the geometry.
     _, model, solution = _cut_depth_disk_model()
     dir = mktempdir()
-    write_vtk(joinpath(dir, "leaf"), solution, model; subdivisions=:none, cut_depth=2, ascii=true,
-              append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),),
+    write_vtk(joinpath(dir, "leaf"), solution, model; subdivisions=:none, cut_depth=2, ascii=true, append=false,
+              compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),),
               cell_data=(w=(u, c, x, xi) -> c.cell.upper[1] - c.cell.lower[1],))
 
     xml = read(joinpath(dir, "leaf_data.vtu"), String)
@@ -520,8 +498,8 @@ end
     # ones may be refined.
     phi_disk(x) = sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.3
     omega = box((0.0, 0.0), (1.0, 1.0))
-    physical = physical_domain(phi_disk; lipschitz=1.0, alpha=1.0, keep_fictitious=true,
-                               subcell_length_scale=1 / 32, max_depth=4)
+    physical = physical_domain(phi_disk; lipschitz=1.0, alpha=1.0, keep_fictitious=true, subcell_length_scale=1 / 32,
+                               max_depth=4)
     V = space(omega; cells=(8, 8), order=1, physical=physical)
     model = prepare(poisson(V; source=0.0))
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
@@ -535,8 +513,8 @@ end
     @test !isempty(uncut)
 
     dir = mktempdir()
-    write_vtk(joinpath(dir, "mixed"), solution, model; subdivisions=:none, cut_depth=2, ascii=true,
-              append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+    write_vtk(joinpath(dir, "mixed"), solution, model; subdivisions=:none, cut_depth=2, ascii=true, append=false,
+              compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
     xml = read(joinpath(dir, "mixed_data.vtu"), String)
     widths = _vtu_quad_widths(xml)
     region_ids = _vtu_ints(xml, "region_id")
@@ -561,21 +539,18 @@ end
     dir = mktempdir()
     reference = nothing
     for depth in (:none, 0, 3)
-        write_vtk(joinpath(dir, "plain_$(depth)"), solution, model; subdivisions=2, cut_depth=depth,
-                  ascii=true, append=false, compress=false,
-                  point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+        write_vtk(joinpath(dir, "plain_$(depth)"), solution, model; subdivisions=2, cut_depth=depth, ascii=true,
+                  append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
         xml = read(joinpath(dir, "plain_$(depth)_data.vtu"), String)
         reference === nothing ? (reference = xml) : @test(xml == reference)
     end
 
     _, fcm_model, fcm_solution = _cut_depth_disk_model()
     for depth in (:none, 0)
-        write_vtk(joinpath(dir, "fcm_$(depth)"), fcm_solution, fcm_model; subdivisions=:none,
-                  cut_depth=depth, ascii=true, append=false, compress=false,
-                  point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+        write_vtk(joinpath(dir, "fcm_$(depth)"), fcm_solution, fcm_model; subdivisions=:none, cut_depth=depth,
+                  ascii=true, append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
     end
-    @test read(joinpath(dir, "fcm_none_data.vtu"), String) ==
-          read(joinpath(dir, "fcm_0_data.vtu"), String)
+    @test read(joinpath(dir, "fcm_none_data.vtu"), String) == read(joinpath(dir, "fcm_0_data.vtu"), String)
 end
 
 @testset "cut_depth rejects values outside its budget" begin
@@ -585,8 +560,7 @@ end
     _, model, solution = _cut_depth_disk_model()
     dir = mktempdir()
     for bad in (-1, 9, :deep, 2.5)
-        @test_throws ArgumentError write_vtk(joinpath(dir, "bad"), solution, model; cut_depth=bad,
-                                             subdivisions=:none)
+        @test_throws ArgumentError write_vtk(joinpath(dir, "bad"), solution, model; cut_depth=bad, subdivisions=:none)
     end
     @test isempty(readdir(dir))
 end
@@ -598,14 +572,13 @@ end
     _, model, solution = _cut_depth_disk_model()
     dir = mktempdir()
     series = vtk_series(joinpath(dir, "run"); frames=joinpath(dir, "frames"))
-    write_vtk(series, 0.0, solution, model; subdivisions=:none, cut_depth=2, ascii=true,
-              append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+    write_vtk(series, 0.0, solution, model; subdivisions=:none, cut_depth=2, ascii=true, append=false, compress=false,
+              point_data=(uh=(u, c, x, xi) -> u(c, xi),))
     close(series)
-    write_vtk(joinpath(dir, "solo"), solution, model; subdivisions=:none, cut_depth=2, ascii=true,
-              append=false, compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+    write_vtk(joinpath(dir, "solo"), solution, model; subdivisions=:none, cut_depth=2, ascii=true, append=false,
+              compress=false, point_data=(uh=(u, c, x, xi) -> u(c, xi),))
 
-    @test read(joinpath(dir, "frames", "frame_0001_data.vtu")) ==
-          read(joinpath(dir, "solo_data.vtu"))
+    @test read(joinpath(dir, "frames", "frame_0001_data.vtu")) == read(joinpath(dir, "solo_data.vtu"))
 end
 
 @testset "write_vtk compresses by default" begin
@@ -618,8 +591,7 @@ end
     pd = (uh=(u, c, x, xi) -> u(c, xi),)
 
     write_vtk(joinpath(dir, "on"), solution, model; subdivisions=4, cut_depth=:none, point_data=pd)
-    write_vtk(joinpath(dir, "off"), solution, model; subdivisions=4, cut_depth=:none, point_data=pd,
-              compress=false)
+    write_vtk(joinpath(dir, "off"), solution, model; subdivisions=4, cut_depth=:none, point_data=pd, compress=false)
 
     on_xml = read(joinpath(dir, "on_data.vtu"), String)
     off_xml = read(joinpath(dir, "off_data.vtu"), String)
@@ -628,8 +600,8 @@ end
     @test filesize(joinpath(dir, "on_data.vtu")) < filesize(joinpath(dir, "off_data.vtu")) / 2
 
     # Same numbers underneath: written as parsable text, the two agree exactly.
-    write_vtk(joinpath(dir, "plain"), solution, model; subdivisions=4, cut_depth=:none,
-              point_data=pd, ascii=true, append=false, compress=false)
+    write_vtk(joinpath(dir, "plain"), solution, model; subdivisions=4, cut_depth=:none, point_data=pd, ascii=true,
+              append=false, compress=false)
     plain_xml = read(joinpath(dir, "plain_data.vtu"), String)
     @test length(_vtu_floats(plain_xml, "uh")) == length(_vtu_floats(plain_xml, "level_set"))
 end

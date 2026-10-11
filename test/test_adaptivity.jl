@@ -12,10 +12,7 @@ using Unfitted
 const _AD_Ω = box((0.0, 0.0), (1.0, 1.0))
 _ad_exact(x) = sinpi(x[1]) * sinpi(x[2])
 _ad_grad(x) = (pi * cospi(x[1]) * sinpi(x[2]), pi * sinpi(x[1]) * cospi(x[2]))
-function _ad_problem(V)
-    poisson(V; source=x -> 2pi^2 * _ad_exact(x),
-            dirichlet=[dirichlet(_ad_exact; on=boundary(:all))])
-end
+_ad_problem(V) = poisson(V; source=x -> 2pi^2 * _ad_exact(x), dirichlet=[dirichlet(_ad_exact; on=boundary(:all))])
 
 # H¹ seminorm of the error on a lattice independent of the space being measured:
 # the model's own quadrature is sized from that space, so using it to compare two
@@ -107,16 +104,16 @@ end
     # smaller, entirely plausible η for a form the indicator has no claim on.
     # Helmholtz well above the first resonance is the clean case.
     V = space(_AD_Ω; cells=4, order=2)
-    helmholtz = WeakForm(bilinear=(q, trial) -> TestChannels(-2000.0 * trial.value, trial.gradient),
-                         linear=q -> 1.0, symmetric=true)
+    helmholtz = WeakForm(bilinear=(q, trial) -> TestChannels(-2000.0 * trial.value, trial.gradient), linear=q -> 1.0,
+                         symmetric=true)
     model = prepare(Problem(V, helmholtz; dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     u = solve!(model)
     @test_throws ArgumentError estimate(model, u)
 
     # The same form at a wave number the mesh keeps coercive is estimated
     # normally, so the guard is about the operator and not about the syntax.
-    mild = WeakForm(bilinear=(q, trial) -> TestChannels(-1.0 * trial.value, trial.gradient),
-                    linear=q -> 1.0, symmetric=true)
+    mild = WeakForm(bilinear=(q, trial) -> TestChannels(-1.0 * trial.value, trial.gradient), linear=q -> 1.0,
+                    symmetric=true)
     tame = prepare(Problem(V, mild; dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     @test estimate(tame, solve!(tame)).total > 0
 end
@@ -145,8 +142,7 @@ end
     P = refine(V; p=[(1, cell)])
     @test cell_orders(P; level=1)[cell] == parent_order .+ 1
     @test active_cells(P; level=2) == active_cells(V; level=2)
-    @test all(cell_orders(P; level=1)[c] == cell_orders(V; level=1)[c]
-              for c in cell_indices(V; level=1) if c != cell)
+    @test all(cell_orders(P; level=1)[c] == cell_orders(V; level=1)[c] for c in cell_indices(V; level=1) if c != cell)
 
     # Nothing already live is lost: `adapt` SETS a mask, so an application that
     # forgets to keep what is live silently coarsens the rest of the domain.
@@ -159,8 +155,7 @@ end
     # takes the order step instead.
     fine = length(V.levels)
     X = refine(V; h=[(fine, CartesianIndex(1, 1))])
-    @test cell_orders(X; level=fine)[CartesianIndex(1, 1)] ==
-          cell_orders(V; level=fine)[CartesianIndex(1, 1)] .+ 1
+    @test cell_orders(X; level=fine)[CartesianIndex(1, 1)] == cell_orders(V; level=fine)[CartesianIndex(1, 1)] .+ 1
     @test active_cells(X; level=fine) == active_cells(V; level=fine)
 
     # `pmax` caps the order so a loop cannot run away.
@@ -175,8 +170,7 @@ end
     V = ladder(_AD_Ω; cells=4, order=2, depth=2)
     nlevels = length(V.levels)
     marked = [(1, c) for c in cell_indices(V; level=1)]
-    flat(V) = Unfitted.ErrorEstimate{2,Float64}([ones(l.mesh.cells) for l in V.levels], 1.0, 1.0,
-                                                0.0)
+    flat(V) = Unfitted.ErrorEstimate{2,Float64}([ones(l.mesh.cells) for l in V.levels], 1.0, 1.0, 0.0)
     est = flat(V)
 
     # With no history, every marked leaf takes p.
@@ -231,8 +225,7 @@ end
     # skip lasted.
     V = ladder(_AD_Ω; cells=4, order=2, depth=2)
     cell = CartesianIndex(2, 2)
-    flat(W) = Unfitted.ErrorEstimate{2,Float64}([ones(l.mesh.cells) for l in W.levels], 1.0, 1.0,
-                                                0.0)
+    flat(W) = Unfitted.ErrorEstimate{2,Float64}([ones(l.mesh.cells) for l in W.levels], 1.0, 1.0, 0.0)
     grandchildren = overlapping_cells(V, [cell]; from=1, to=3)
     S = adapt(V, 3 => grandchildren)                   # level 3 live, level 2 empty
     @test !any(active_cells(S; level=2))
@@ -347,8 +340,8 @@ end
     # levels' cell counts is 1 where each parent has 2^D children, which made
     # every child look √(2^D) better than it was and take p on sight.
     inner = box((0.25, 0.25), (0.75, 0.75))
-    U = overlay(overlay(space(_AD_Ω; cells=4, order=2), inner; cells=4, active=falses(4, 4)), inner;
-                cells=8, active=falses(8, 8))
+    U = overlay(overlay(space(_AD_Ω; cells=4, order=2), inner; cells=4, active=falses(4, 4)), inner; cells=8,
+                active=falses(8, 8))
     cell = CartesianIndex(2, 2)                       # [0.25, 0.5]², inside the overlay
     UW = refine(U; h=[(1, cell)])
     kids = [c
@@ -404,8 +397,7 @@ end
     V = ladder(_AD_Ω; cells=4, order=2, depth=2)
     cell = CartesianIndex(2, 2)
     same(a, b) = all(active_cells(a; level=k) == active_cells(b; level=k) &&
-                         cell_orders(a; level=k) == cell_orders(b; level=k)
-                     for k in 1:length(a.levels))
+                         cell_orders(a; level=k) == cell_orders(b; level=k) for k in 1:length(a.levels))
 
     W = refine(V; h=[(1, cell)])
     @test !same(W, V)
@@ -428,8 +420,7 @@ end
 
     lowered = coarsen(V; p=[(1, cell)])
     @test cell_orders(lowered; level=1)[cell] == (2, 2)
-    @test all(cell_orders(lowered; level=1)[c] == (3, 3)
-              for c in cell_indices(V; level=1) if c != cell)
+    @test all(cell_orders(lowered; level=1)[c] == (3, 3) for c in cell_indices(V; level=1) if c != cell)
     @test cell_orders(coarsen(V; p=[(1, cell)], pmin=3); level=1)[cell] == (3, 3)
 
     # Lowering a COVERED cell's order is invisible until the cover lifts, and no
@@ -500,8 +491,7 @@ end
     V = ladder(_AD_Ω; cells=4, order=4, depth=1)
     cell = CartesianIndex(2, 2)
     same(a, b) = all(active_cells(a; level=k) == active_cells(b; level=k) &&
-                         cell_orders(a; level=k) == cell_orders(b; level=k)
-                     for k in 1:length(a.levels))
+                         cell_orders(a; level=k) == cell_orders(b; level=k) for k in 1:length(a.levels))
 
     @test cell_orders(refine(V; p=[(1, cell)], pmax=2); level=1)[cell] == (4, 4)
     @test refine(V; p=[(1, cell)], pmax=2) === V
@@ -511,8 +501,7 @@ end
     # trip on any stack whose order already exceeds `pmax`.
     H = refine(V; h=[(1, cell)], pmax=2)
     children = overlapping_cells(V, [cell]; from=1, to=2)
-    @test all(cell_orders(H; level=2)[c] == (4, 4)
-              for c in CartesianIndices(children) if children[c])
+    @test all(cell_orders(H; level=2)[c] == (4, 4) for c in CartesianIndices(children) if children[c])
     @test same(coarsen(H; h=[(1, cell)]), V)
 
     @test cell_orders(coarsen(V; p=[(1, cell)], pmin=6); level=1)[cell] == (4, 4)
@@ -530,8 +519,7 @@ end
     # runs to its step limit with nothing changing.
     V = ladder(_AD_Ω; cells=4, order=2, depth=1)
     cell = CartesianIndex(2, 2)
-    zero_est = Unfitted.ErrorEstimate{2,Float64}([zeros(l.mesh.cells) for l in V.levels], 0.0, 1.0,
-                                                 0.0)
+    zero_est = Unfitted.ErrorEstimate{2,Float64}([zeros(l.mesh.cells) for l in V.levels], 0.0, 1.0, 0.0)
     @test isempty(mark_cells(zero_est; theta=0.5))
     @test refine(V, zero_est) === V
     @test refine(V; h=(), p=()) === V
@@ -553,8 +541,7 @@ end
     V = ladder(_AD_Ω; cells=4, order=4, depth=1)
     cell = CartesianIndex(2, 2)
     other = ladder(_AD_Ω; cells=8, order=2, depth=1)
-    flat(W) = Unfitted.ErrorEstimate{2,Float64}([ones(l.mesh.cells) for l in W.levels], 1.0, 1.0,
-                                                0.0)
+    flat(W) = Unfitted.ErrorEstimate{2,Float64}([ones(l.mesh.cells) for l in W.levels], 1.0, 1.0, 0.0)
 
     # A cell index out of range is the caller's mistake, named as such, rather
     # than a `BoundsError` from inside an array they never handed over.
@@ -570,8 +557,7 @@ end
     # prediction; where they happen to agree it would silently score the wrong
     # cell, so both arguments are checked against the space they are read with.
     @test_throws DimensionMismatch refine(V, flat(other))
-    @test_throws DimensionMismatch decide(V, flat(V), [(1, cell)]; pmax=8,
-                                          previous=(other, flat(other)))
+    @test_throws DimensionMismatch decide(V, flat(V), [(1, cell)]; pmax=8, previous=(other, flat(other)))
     truncated = Unfitted.ErrorEstimate{2,Float64}([ones(4, 4)], 1.0, 1.0, 0.0)
     @test_throws DimensionMismatch refine(V, truncated)
 end
@@ -659,8 +645,7 @@ end
     for D in (1, 2, 3)
         Ω = box(ntuple(_ -> 0.0, D), ntuple(_ -> 1.0, D))
         exact(x) = prod(sinpi, x)
-        problem(W) = poisson(W; source=x -> D * pi^2 * exact(x),
-                             dirichlet=[dirichlet(exact; on=boundary(:all))])
+        problem(W) = poisson(W; source=x -> D * pi^2 * exact(x), dirichlet=[dirichlet(exact; on=boundary(:all))])
         V = ladder(Ω; cells=(D == 3 ? 3 : 4), order=2, depth=2)
         model = prepare(problem(V))
         est = estimate(model, solve!(model))
@@ -686,8 +671,7 @@ end
         # And the explicit verbs close on themselves in every dimension.
         cell = first(cell_indices(V; level=1))
         same(a, b) = all(active_cells(a; level=k) == active_cells(b; level=k) &&
-                             cell_orders(a; level=k) == cell_orders(b; level=k)
-                         for k in 1:length(a.levels))
+                             cell_orders(a; level=k) == cell_orders(b; level=k) for k in 1:length(a.levels))
         @test same(coarsen(refine(V; h=[(1, cell)]); h=[(1, cell)]), V)
     end
 end
@@ -734,8 +718,7 @@ end
     live[9:16, 9:16] .= false
     live[1:8, 1:8] .= false
     plain = overlay(base, _AD_Ω; cells=16, order=2, active=live)
-    withdormant = overlay(plain, _AD_Ω; cells=4, order=2, basis=bspline(),
-                          active=CartesianIndex{2}[])
+    withdormant = overlay(plain, _AD_Ω; cells=4, order=2, basis=bspline(), active=CartesianIndex{2}[])
 
     a = prepare(poisson(plain; source=source, dirichlet=bc))
     b = prepare(poisson(withdormant; source=source, dirichlet=bc))
@@ -756,17 +739,11 @@ end
     # that is the only step such a level has, and the h-step support-extends the
     # cells it wakes so the level actually carries the functions the marking meant
     # to buy.
-    peak(x) = x[1] *
-              (1 - x[1]) *
-              x[2] *
-              (1 - x[2]) *
-              exp(-120.0 * ((x[1] - 0.3)^2 + (x[2] - 0.7)^2))
+    peak(x) = x[1] * (1 - x[1]) * x[2] * (1 - x[2]) * exp(-120.0 * ((x[1] - 0.3)^2 + (x[2] - 0.7)^2))
     load(x) =
         let h = 1.0e-4
-            -(peak((x[1] + h, x[2])) +
-              peak((x[1] - h, x[2])) +
-              peak((x[1], x[2] + h)) +
-              peak((x[1], x[2] - h)) - 4 * peak((x[1], x[2]))) / h^2
+            -(peak((x[1] + h, x[2])) + peak((x[1] - h, x[2])) + peak((x[1], x[2] + h)) + peak((x[1], x[2] - h)) -
+              4 * peak((x[1], x[2]))) / h^2
         end
     V = ladder(_AD_Ω; cells=8, depth=3, order=3, basis=bspline())
     problem(W) = poisson(W; source=load, dirichlet=[dirichlet(0.0; on=boundary(:all))])
@@ -903,8 +880,8 @@ end
     # the closure's captures and the refusal comes before anything is built.
     conduction(c) = WeakForm(; linear=q -> 0.0, symmetric=true,
                              bilinear=(q, trial) -> TestChannels(0.0, c[q.point] .* trial.gradient))
-    stateful = prepare(Problem((u,); blocks=(block(u, u, conduction(chi)),),
-                               loads=(source_load(u; source=1.0),), dirichlet=bc))
+    stateful = prepare(Problem((u,); blocks=(block(u, u, conduction(chi)),), loads=(source_load(u; source=1.0),),
+                               dirichlet=bc))
     @test_throws ArgumentError estimate(stateful, solve!(stateful))
 
     # And the read itself is guarded, which is what covers the shape reflection
@@ -923,8 +900,8 @@ end
     # Ω is the unit square minus the disc of radius 0.2 at its centre, on 8×8
     # cells of width 0.125, with one dormant level of 16×16 under it.
     Ω = box((0.0, 0.0), (1.0, 1.0))
-    hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0,
-                           subcell_length_scale=1.0e-6, max_depth=2)
+    hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0, subcell_length_scale=1.0e-6,
+                           max_depth=2)
     V = ladder(Ω; cells=8, order=2, depth=1, physical=hole)
     bc = [dirichlet(0.0; on=boundary(:all))]
     model = prepare(poisson(V; source=1.0, dirichlet=bc))

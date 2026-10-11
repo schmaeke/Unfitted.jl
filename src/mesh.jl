@@ -152,8 +152,7 @@ Used by region-to-parent coverage (`_parents_covering` in
 `intersections.jl`) and by post-processing evaluation
 (`_level_field`).
 """
-function locate_cell(m::CartesianMesh{D,T}, point::PointLike{D};
-                     tol=GeometryTolerance(T)) where {D,T}
+function locate_cell(m::CartesianMesh{D,T}, point::PointLike{D}; tol=GeometryTolerance(T)) where {D,T}
     contains_point(point, m.domain, tol) || return nothing
 
     ids = ntuple(D) do d
@@ -378,8 +377,8 @@ end
 # minimum rule — every active cell asks the same question of neighbours carrying
 # the same order — so the filter would be a no-op, and a uniform level pays
 # nothing for the existence of the graded path.
-function _uniform_cell_modes(basis::BasisFamily, orders::CellOrders{D}, mesh::CartesianMesh{D},
-                             mode::Symbol, mask) where {D}
+function _uniform_cell_modes(basis::BasisFamily, orders::CellOrders{D}, mesh::CartesianMesh{D}, mode::Symbol,
+                             mask) where {D}
     sets = [CartesianIndex{D}[], local_basis_indices(basis, orders.palette[1], mode)]
     kind = Array{UInt16,D}(undef, mesh.cells)
     for cell in cell_indices(mesh)
@@ -403,8 +402,7 @@ end
 # assemble every cell at `palette[1]` while `cell_order` reported the field the
 # caller asked for — a non-conforming space with no error anywhere, which is the
 # exact failure the minimum rule exists to prevent.
-function _cell_modes(basis::BasisFamily, orders::CellOrders{D}, mesh::CartesianMesh{D},
-                     mode::Symbol, mask) where {D}
+function _cell_modes(basis::BasisFamily, orders::CellOrders{D}, mesh::CartesianMesh{D}, mode::Symbol, mask) where {D}
     length(orders.palette) == 1 ||
         throw(ArgumentError("the $(basis_name(basis)) basis family answers _supports_cell_order " *
                             "but supplies no _cell_modes method: the minimum rule for a graded " *
@@ -431,26 +429,20 @@ end
 # the same discipline `_apply_mask_update` applies to an all-active mask.
 _normalize_order(n::Integer, ::CartesianMesh{D}) where {D} = _axis_int_tuple(n, Val(D), :order)
 
-function _normalize_order(t::NTuple{D,<:Integer}, ::CartesianMesh{D}) where {D}
-    return _axis_int_tuple(t, Val(D), :order)
-end
+_normalize_order(t::NTuple{D,<:Integer}, ::CartesianMesh{D}) where {D} = _axis_int_tuple(t, Val(D), :order)
 
 function _normalize_order(a::AbstractArray{<:Integer,D}, mesh::CartesianMesh{D}) where {D}
-    size(a) == mesh.cells ||
-        throw(DimensionMismatch("order shape $(size(a)) does not match mesh cells $(mesh.cells)"))
+    size(a) == mesh.cells || throw(DimensionMismatch("order shape $(size(a)) does not match mesh cells $(mesh.cells)"))
     return _collapse_order(vec([_axis_int_tuple(a[ci], Val(D), :order) for ci in cell_indices(mesh)]))
 end
 
-function _normalize_order(a::AbstractArray{<:NTuple{D,<:Integer},D},
-                          mesh::CartesianMesh{D}) where {D}
-    size(a) == mesh.cells ||
-        throw(DimensionMismatch("order shape $(size(a)) does not match mesh cells $(mesh.cells)"))
+function _normalize_order(a::AbstractArray{<:NTuple{D,<:Integer},D}, mesh::CartesianMesh{D}) where {D}
+    size(a) == mesh.cells || throw(DimensionMismatch("order shape $(size(a)) does not match mesh cells $(mesh.cells)"))
     return _collapse_order(vec([_axis_int_tuple(a[ci], Val(D), :order) for ci in cell_indices(mesh)]))
 end
 
 function _normalize_order(f::Function, mesh::CartesianMesh{D}) where {D}
-    entries = vec([_axis_int_tuple(f(cell_box(mesh, ci), ci), Val(D), :order)
-                   for ci in cell_indices(mesh)])
+    entries = vec([_axis_int_tuple(f(cell_box(mesh, ci), ci), Val(D), :order) for ci in cell_indices(mesh)])
     return _collapse_order(entries)
 end
 
@@ -502,14 +494,13 @@ end
 # on the mask, not on the mode. What the basis then emits per cell is derived
 # from it by `_cell_modes`, whose generic method is defined above and whose
 # per-family methods live where each family's key-incidence machinery does.
-function _build_cell_orders(family::BasisFamily, order::NTuple{D,Int}, mesh::CartesianMesh{D},
-                            mode::Symbol) where {D}
+function _build_cell_orders(family::BasisFamily, order::NTuple{D,Int}, mesh::CartesianMesh{D}, mode::Symbol) where {D}
     local_basis_indices(family, order, mode)    # mode against the family, order against both
     return CellOrders{D}([order], fill(UInt16(1), mesh.cells), order)
 end
 
-function _build_cell_orders(family::BasisFamily, entries::Vector{NTuple{D,Int}},
-                            mesh::CartesianMesh{D}, mode::Symbol) where {D}
+function _build_cell_orders(family::BasisFamily, entries::Vector{NTuple{D,Int}}, mesh::CartesianMesh{D},
+                            mode::Symbol) where {D}
     _supports_cell_order(family) ||
         throw(ArgumentError("the $(basis_name(family)) basis family does not support a per-cell " *
                             "polynomial order: its degree belongs to a whole-axis knot vector, not " *
@@ -613,10 +604,8 @@ struct Level{D,T<:Real,B<:BasisFamily}
     # that determine it makes the mismatch unspellable instead, and the
     # construction sites — which now all go through `_level` / `_new_level`
     # below — stop having to remember anything.
-    function Level{D,T,B}(id, role, mesh, basis, orders, mode,
-                          mask) where {D,T<:Real,B<:BasisFamily}
-        return new{D,T,B}(id, role, mesh, basis, orders,
-                          _cell_modes(basis, orders, mesh, mode, mask), mode, mask)
+    function Level{D,T,B}(id, role, mesh, basis, orders, mode, mask) where {D,T<:Real,B<:BasisFamily}
+        return new{D,T,B}(id, role, mesh, basis, orders, _cell_modes(basis, orders, mesh, mode, mask), mode, mask)
     end
 end
 
@@ -734,8 +723,8 @@ function physical_basis_gradients(level::Level{D}, cell::CartesianIndex{D}, cell
     gradients = Vector{SVector{D,R}}(undef, length(indices))
     scale = SVector{D,R}(2 ./ edge_lengths(cell_box))
     p = cell_order(level, cell)
-    _tensor_values_grads!(level.basis, values, gradients, indices, p, ξ, scale,
-                          _factor_buffers(p, R), _factor_buffers(p, R), cell)
+    _tensor_values_grads!(level.basis, values, gradients, indices, p, ξ, scale, _factor_buffers(p, R),
+                          _factor_buffers(p, R), cell)
     return gradients
 end
 
@@ -811,8 +800,7 @@ end
 # user-visible name of the argument (`"from"`, `"marked level"`, …).
 function _check_level(V::Space, level::Integer, name::AbstractString="level")
     1 <= level <= length(V.levels) ||
-        throw(ArgumentError("$name index $level is out of bounds for a space with " *
-                            "$(length(V.levels)) levels"))
+        throw(ArgumentError("$name index $level is out of bounds for a space with " * "$(length(V.levels)) levels"))
     return Int(level)
 end
 
@@ -835,9 +823,7 @@ end
 # which is what keeps a new `Space` or `Level` field from having to be
 # remembered at eight call sites; before them, each site spelled out the full
 # positional constructor and a `ntuple` splice of its own.
-function _with_levels(V::Space{D,T}, levels::Tuple) where {D,T}
-    Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
-end
+_with_levels(V::Space{D,T}, levels::Tuple) where {D,T} = Space{D,T,typeof(levels)}(V.domain, levels, V.physical)
 
 function _with_level(V::Space, k::Int, level::Level)
     return _with_levels(V, ntuple(i -> i == k ? level : V.levels[i], length(V.levels)))
@@ -874,10 +860,7 @@ The level's activation mask is not an argument: a mask face selects or
 constrains functions in the dof layer rather than changing the family, which is
 how the shipped B-spline family handles every mask geometry.
 """
-function instantiate_basis(basis::BasisFamily, mesh::CartesianMesh{D,T}, order::NTuple{D,Int},
-                           mode::Symbol) where {D,T}
-    basis
-end
+instantiate_basis(basis::BasisFamily, mesh::CartesianMesh{D,T}, order::NTuple{D,Int}, mode::Symbol) where {D,T} = basis
 
 # ── Space construction ────────────────────────────────────────────────────────
 
@@ -993,8 +976,8 @@ semantics eliminate nothing. See `src/coverage.jl` and
 `_coverage_constraints!` in `src/dofs.jl`;
 `diagnostics(...).reduced_mode_counts` reports the per-level count.
 """
-function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(),
-               mode::Symbol=:tensor, active=nothing, physical=nothing) where {D,T}
+function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(), mode::Symbol=:tensor, active=nothing,
+               physical=nothing) where {D,T}
     base_mesh = CartesianMesh(domain; cells)
     base_level = _new_level(1, :base, base_mesh, basis, _normalize_order(order, base_mesh), mode,
                             _normalize_mask(active, base_mesh))
@@ -1038,14 +1021,11 @@ with parents (every overlay imposes homogeneous Dirichlet data on its
 artificial boundary, see `CONTRIBUTING.md`'s "The superposition model"
 section).
 """
-function overlay(V::Space{D,T}, domain::AxisBox{D,T}; cells, order=nominal_order(V.levels[1]),
-                 basis=V.levels[1].basis, mode::Symbol=V.levels[1].mode,
-                 tolerance=GeometryTolerance(T), active=nothing) where {D,T}
-    is_inside(domain, V.domain, tolerance) ||
-        throw(ArgumentError("overlay domain must lie inside the physical domain"))
+function overlay(V::Space{D,T}, domain::AxisBox{D,T}; cells, order=nominal_order(V.levels[1]), basis=V.levels[1].basis,
+                 mode::Symbol=V.levels[1].mode, tolerance=GeometryTolerance(T), active=nothing) where {D,T}
+    is_inside(domain, V.domain, tolerance) || throw(ArgumentError("overlay domain must lie inside the physical domain"))
     overlay_mesh = CartesianMesh(domain; cells)
-    level = _new_level(length(V.levels) + 1, :overlay, overlay_mesh, basis,
-                       _normalize_order(order, overlay_mesh), mode,
+    level = _new_level(length(V.levels) + 1, :overlay, overlay_mesh, basis, _normalize_order(order, overlay_mesh), mode,
                        _normalize_mask(active, overlay_mesh))
     return _with_levels(V, (V.levels..., level))
 end
@@ -1061,8 +1041,7 @@ end
 # run before `_build_cell_orders`, because a deferred family (the B-spline spec)
 # is not a family yet and `_supports_cell_order` has to be asked of the concrete
 # one.
-function _new_level(id::Int, role::Symbol, mesh::CartesianMesh{D,T}, basis, field, mode::Symbol,
-                    mask) where {D,T}
+function _new_level(id::Int, role::Symbol, mesh::CartesianMesh{D,T}, basis, field, mode::Symbol, mask) where {D,T}
     family = instantiate_basis(basis, mesh, _nominal_order(field), mode)
     orders = _build_cell_orders(family, field, mesh, mode)
     return Level{D,T,typeof(family)}(id, role, mesh, family, orders, mode, mask)
@@ -1077,11 +1056,9 @@ counts, basis family, order, level id, and activation mask. The base level
 (level 1) cannot be moved. This is the space-level building block behind
 [`move!`](@ref) and [`moved`](@ref).
 """
-function moved_space(V::Space{D,T}; level::Integer, to::AxisBox{D,T},
-                     tolerance=GeometryTolerance(T)) where {D,T}
+function moved_space(V::Space{D,T}; level::Integer, to::AxisBox{D,T}, tolerance=GeometryTolerance(T)) where {D,T}
     1 < level <= length(V.levels) || throw(ArgumentError("only overlay levels can be moved"))
-    is_inside(to, V.domain, tolerance) ||
-        throw(ArgumentError("overlay domain must lie inside the physical domain"))
+    is_inside(to, V.domain, tolerance) || throw(ArgumentError("overlay domain must lie inside the physical domain"))
     k = Int(level)
     old = V.levels[k]
     # The order field is indexed by cell and a move keeps the cell grid identical
@@ -1118,8 +1095,7 @@ end
 # rebuilt). Before this helper the sites disagreed about it — `moved_space` and
 # the mask rebuilds re-instantiated while the fold and the reindex did not — and
 # the disagreement was invisible because the answers coincide.
-function _level(old::Level{D,T}; id=old.id, mesh=old.mesh, orders=old.orders,
-                mask=old.mask) where {D,T}
+function _level(old::Level{D,T}; id=old.id, mesh=old.mesh, orders=old.orders, mask=old.mask) where {D,T}
     family = instantiate_basis(old.basis, mesh, orders.nominal, old.mode)
     return Level{D,T,typeof(family)}(id, old.role, mesh, family, orders, old.mode, mask)
 end
@@ -1276,14 +1252,12 @@ function _dilation_radius(by::Integer, ::Val{D}) where {D}
 end
 
 function _dilation_radius(by::NTuple{D,<:Integer}, ::Val{D}) where {D}
-    all(>=(0), by) ||
-        throw(ArgumentError("dilate: every entry of `by` must be non-negative; " * "got $by"))
+    all(>=(0), by) || throw(ArgumentError("dilate: every entry of `by` must be non-negative; " * "got $by"))
     return Int.(by)
 end
 
 function _dilation_radius(by, ::Val{D}) where {D}
-    throw(ArgumentError("dilate: `by` must be a non-negative integer or an NTuple{$D,Int}; " *
-                        "got $(typeof(by))"))
+    throw(ArgumentError("dilate: `by` must be a non-negative integer or an NTuple{$D,Int}; " * "got $(typeof(by))"))
 end
 
 # Erode a cell mask by `radius[d]` cells along each axis: the cells whose whole
@@ -1294,9 +1268,7 @@ end
 # Used by `coarsen` to recover the set `refine` dilated, which is the one thing a
 # mask does not record: erosion is a right inverse of dilation on a dilated set,
 # `dilate(erode(dilate(X, r), r), r) == dilate(X, r)`.
-function _erode_cells(marked::BitArray{D}, radius::NTuple{D,Int}) where {D}
-    return .!_dilate_cells(.!marked, radius)
-end
+_erode_cells(marked::BitArray{D}, radius::NTuple{D,Int}) where {D} = .!_dilate_cells(.!marked, radius)
 
 # Dilate a cell mask by `radius[d]` cells along each axis, clipped to the grid.
 #
@@ -1386,8 +1358,7 @@ function _pair_orders(V::Space{D}, k::Int, pairs) where {D}
                                               "`CartesianIndex{$D} => order` entries; got $(typeof(entry))"))
         cell, order = entry
         cell isa CartesianIndex{D} ||
-            throw(ArgumentError("an order pair list must be keyed by CartesianIndex{$D}; " *
-                                "got $(typeof(cell))"))
+            throw(ArgumentError("an order pair list must be keyed by CartesianIndex{$D}; " * "got $(typeof(cell))"))
         checkbounds(Bool, out, cell) ||
             throw(ArgumentError("cell index $cell is out of bounds for mesh cells $(lvl.mesh.cells)"))
         out[cell] = _axis_int_tuple(order, Val(D), :order)
@@ -1409,8 +1380,7 @@ function _reordered_space(V::Space, level_index::Integer, spec)
     k = _check_level(V, level_index)
     old = V.levels[k]
     field = _normalize_order(_normalize_elevate_spec(V, k, spec), old.mesh)
-    return _with_level(V, k,
-                       _new_level(old.id, old.role, old.mesh, old.basis, field, old.mode, old.mask))
+    return _with_level(V, k, _new_level(old.id, old.role, old.mesh, old.basis, field, old.mode, old.mask))
 end
 
 """
@@ -1572,8 +1542,7 @@ end
 # slower with the broadcast, both on spaces that compile the fold without running it
 # (a two-level overlay, a masked clamped B-spline space) and on an immersed FCM plate;
 # the one-pass form compiles one method fewer than that loop.
-function _folded_mask(level::Level{D,T}, physical::PhysicalDomain,
-                      cache::_ClassifyCache{D,T}) where {D,T}
+function _folded_mask(level::Level{D,T}, physical::PhysicalDomain, cache::_ClassifyCache{D,T}) where {D,T}
     on = level.mask === nothing ? trues(level.mesh.cells) : copy(level.mask.on)
     folded = false
     for ci in cell_indices(level.mesh)
@@ -1601,9 +1570,7 @@ end
 # id and works with any id assignment.
 function _reindex_space_levels(V::Space, offset::Int)
     offset == 0 && return V
-    return _with_levels(V,
-                        ntuple(i -> _level(V.levels[i]; id=V.levels[i].id + offset),
-                               length(V.levels)))
+    return _with_levels(V, ntuple(i -> _level(V.levels[i]; id=V.levels[i].id + offset), length(V.levels)))
 end
 
 # ── Mask updates ──────────────────────────────────────────────────────────────
@@ -1614,8 +1581,7 @@ end
 # `CartesianIndex{D}`. For Bool-array selectors we iterate the `findall`
 # index list — `O(#selected)` instead of `O(#cells)`, important when the
 # selector is sparse on a large mesh.
-function _flip_cells!(on::BitArray{D}, bits::AbstractArray{Bool,D}, mesh::CartesianMesh{D},
-                      value::Bool) where {D}
+function _flip_cells!(on::BitArray{D}, bits::AbstractArray{Bool,D}, mesh::CartesianMesh{D}, value::Bool) where {D}
     size(bits) == size(on) ||
         throw(DimensionMismatch("selector shape $(size(bits)) does not match mesh cells $(mesh.cells)"))
     for ci in findall(bits)
@@ -1649,8 +1615,7 @@ end
 # of the mask. `_flip_cells!` always runs (even when the starting mask is
 # all-on) so out-of-bounds and wrong-typed selectors raise the same error
 # regardless of the starting mask state.
-function _apply_mask_update(old::Union{Nothing,LevelMask{D}}, mesh::CartesianMesh{D}, cells,
-                            value::Bool) where {D}
+function _apply_mask_update(old::Union{Nothing,LevelMask{D}}, mesh::CartesianMesh{D}, cells, value::Bool) where {D}
     on = old === nothing ? trues(mesh.cells) : copy(old.on)
     _flip_cells!(on, cells, mesh, value)
     return _collapse_mask(on)
@@ -1659,9 +1624,8 @@ end
 # ── Display ───────────────────────────────────────────────────────────────────
 
 function Base.show(io::IO, level::Level)
-    print(io, "Level(id=", level.id, ", role=:", level.role, ", cells=", level.mesh.cells,
-          ", order=", nominal_order(level), ", mode=:", level.mode, ", basis=:",
-          basis_name(level.basis))
+    print(io, "Level(id=", level.id, ", role=:", level.role, ", cells=", level.mesh.cells, ", order=",
+          nominal_order(level), ", mode=:", level.mode, ", basis=:", basis_name(level.basis))
     # A per-cell field is summarised by its palette size, never dumped: a graded
     # level carries one order per cell and printing them all is unreadable. A
     # uniform level's palette holds exactly one entry and says nothing worth

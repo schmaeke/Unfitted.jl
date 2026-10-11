@@ -14,8 +14,8 @@ using MeshIO
 # triangles). Cube faces are planar, so each cut cell sees a linear signed
 # distance and the volume integrates exactly.
 function _cube_mesh(lo, hi)
-    v = [SVector(lo, lo, lo), SVector(hi, lo, lo), SVector(hi, hi, lo), SVector(lo, hi, lo),
-         SVector(lo, lo, hi), SVector(hi, lo, hi), SVector(hi, hi, hi), SVector(lo, hi, hi)]
+    v = [SVector(lo, lo, lo), SVector(hi, lo, lo), SVector(hi, hi, lo), SVector(lo, hi, lo), SVector(lo, lo, hi),
+         SVector(hi, lo, hi), SVector(hi, hi, hi), SVector(lo, hi, hi)]
     quads = [(1, 4, 3, 2), (5, 6, 7, 8), (1, 2, 6, 5), (2, 3, 7, 6), (3, 4, 8, 7), (4, 1, 5, 8)]
     faces = NTuple{3,Int}[]
     for (a, b, c, d) in quads
@@ -72,8 +72,8 @@ function _lprism_mesh()
     for (x, y) in poly
         push!(verts, SVector(x, y, 1.0))
     end
-    faces = NTuple{3,Int}[(4, 5, 6), (4, 6, 7), (4, 7, 1), (4, 1, 2), (4, 2, 3), (11, 12, 13),
-                          (11, 13, 14), (11, 14, 8), (11, 8, 9), (11, 9, 10)]
+    faces = NTuple{3,Int}[(4, 5, 6), (4, 6, 7), (4, 7, 1), (4, 1, 2), (4, 2, 3), (11, 12, 13), (11, 13, 14),
+                          (11, 14, 8), (11, 8, 9), (11, 9, 10)]
     for i in 1:n
         j = i % n + 1
         push!(faces, (i, j, j + n))
@@ -110,8 +110,7 @@ _square_poly(lo, hi) = [SVector(lo, lo), SVector(hi, lo), SVector(hi, hi), SVect
 
 # CCW L-polygon with a reflex vertex at (1,1), and its analytic membership.
 function _lpoly2d()
-    [SVector(0.0, 0.0), SVector(2.0, 0.0), SVector(2.0, 1.0), SVector(1.0, 1.0), SVector(1.0, 2.0),
-     SVector(0.0, 2.0)]
+    [SVector(0.0, 0.0), SVector(2.0, 0.0), SVector(2.0, 1.0), SVector(1.0, 1.0), SVector(1.0, 2.0), SVector(0.0, 2.0)]
 end
 function _inside_L2(p)
     ((-1e-9 <= p[1] <= 2 + 1e-9) && (-1e-9 <= p[2] <= 1 + 1e-9)) ||
@@ -122,8 +121,7 @@ end
 function _mesh_volume(geom, region; gp=4, ms=3)
     leaves = Any[l.f for l in Unfitted._leaves(geom)]
     membership = x -> Unfitted._inside(geom, x)
-    pts, wts = Unfitted.implicit_volume_quadrature(leaves, membership, region; gauss_points=gp,
-                                                   max_subdiv=ms)
+    pts, wts = Unfitted.implicit_volume_quadrature(leaves, membership, region; gauss_points=gp, max_subdiv=ms)
     return sum(wts; init=0.0)
 end
 
@@ -221,13 +219,10 @@ end
     @test_throws ArgumentError mesh_levelset(triangle_mesh(v, flipped))          # one facet
     @test_throws ArgumentError mesh_levelset(triangle_mesh(v, [(a, c, b) for (a, b, c) in f]))
     @test_throws ArgumentError mesh_levelset(polyline_mesh(_square_poly(0.2, 0.8)))   # open 2D
-    @test_throws ArgumentError mesh_levelset(polyline_mesh(reverse(_square_poly(0.2, 0.8));
-                                                           closed=true))              # clockwise
+    @test_throws ArgumentError mesh_levelset(polyline_mesh(reverse(_square_poly(0.2, 0.8)); closed=true))              # clockwise
     # A zero normal normalises to NaN, under which every sign test is false and
     # the whole space reads as inside.
-    @test_throws ArgumentError mesh_levelset(triangle_mesh(v, f;
-                                                           normals=[SVector(0.0, 0.0, 0.0)
-                                                                    for _ in f]))
+    @test_throws ArgumentError mesh_levelset(triangle_mesh(v, f; normals=[SVector(0.0, 0.0, 0.0) for _ in f]))
     empty_stl = tempname() * ".stl"
     write(empty_stl, "solid s\nendsolid s\n")
     @test_throws ArgumentError stl_levelset(empty_stl)
@@ -381,8 +376,7 @@ end
     @test tested > 5000
     @test bad == 0
     # Winding mode agrees, including in the reentrant notch.
-    sw = Unfitted._leaves(mesh_levelset(polyline_mesh(_lpoly2d(); closed=true);
-                                        orientation=:winding))[1].f
+    sw = Unfitted._leaves(mesh_levelset(polyline_mesh(_lpoly2d(); closed=true); orientation=:winding))[1].f
     @test (sw(SVector(1.5, 1.5)) < 0) == _inside_L2(SVector(1.5, 1.5))
     @test (sw(SVector(0.5, 0.5)) < 0) == _inside_L2(SVector(0.5, 0.5))
 end
@@ -390,7 +384,6 @@ end
 @testset "MeshIO ext — mesh_levelset rejects unsupported simplex dimensions" begin
     # K=1 segments in 3D (a curve, no enclosed region) and K=2 triangles in 2D
     # are not closed-boundary cases.
-    seg3d = segment_mesh([(SVector(0.0, 0.0, 0.0), SVector(1.0, 0.0, 0.0))];
-                         normals=[SVector(0.0, 1.0, 0.0)])
+    seg3d = segment_mesh([(SVector(0.0, 0.0, 0.0), SVector(1.0, 0.0, 0.0))]; normals=[SVector(0.0, 1.0, 0.0)])
     @test_throws ArgumentError mesh_levelset(seg3d)
 end

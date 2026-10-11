@@ -158,8 +158,7 @@ end
 # double contraction σ = ℂ ⊡ ε then reproduces σ_xx = E/(1−ν²)(ε_xx + ν ε_yy),
 # σ_yy = E/(1−ν²)(ε_yy + ν ε_xx), σ_xy = E/(1+ν) ε_xy.
 const ℂ = SymmetricTensor{4,2,Float64}((i, j, k, l) -> λ_ps * (i == j) * (k == l) +
-                                                       μ *
-                                                       ((i == k) * (j == l) + (i == l) * (j == k)))
+                                                       μ * ((i == k) * (j == l) + (i == l) * (j == k)))
 
 # Bulk bilinear σ(u) : ε(v), written in tensor notation throughout.
 # `symmetric_gradient(trial)` is the strain ε of the trial basis function
@@ -213,15 +212,13 @@ end
 
 results = map(run_order, orders)
 
-println("Plate with a circular hole — p-refinement on a fixed grid (cells = ",
-        (cells_per_axis, cells_per_axis), ")")
-println("  ", rpad("order", 8), rpad("unknowns", 12), rpad("rel. L² error", 16),
-        "moment-fit residual")
+println("Plate with a circular hole — p-refinement on a fixed grid (cells = ", (cells_per_axis, cells_per_axis), ")")
+println("  ", rpad("order", 8), rpad("unknowns", 12), rpad("rel. L² error", 16), "moment-fit residual")
 for (order, res) in zip(orders, results)
     rep = res.report
     resid = hasproperty(rep, :moment_fit_residual_max) ? rep.moment_fit_residual_max : NaN
-    println("  ", rpad(order, 8), rpad(rep.active_unknowns, 12),
-            rpad(string(round(rep.l2_error; sigdigits=4)), 16), round(resid; sigdigits=3))
+    println("  ", rpad(order, 8), rpad(rep.active_unknowns, 12), rpad(string(round(rep.l2_error; sigdigits=4)), 16),
+            round(resid; sigdigits=3))
 end
 println()
 
@@ -237,9 +234,8 @@ write_vtk(out, finest.solution, finest.model;
 write_quadrature_vtm(out * "_quadrature", finest.model)
 
 print_run_report("Plate with a circular hole (Kirsch) — order $(last(orders))", finest.report;
-                 parameters=(:cells => finest.V.levels[1].mesh.cells,
-                             :order => nominal_order(finest.V.levels[1]), :hole_radius => a,
-                             :domain_edge => L, :far_field_traction => T, :E => E, :nu => ν,
+                 parameters=(:cells => finest.V.levels[1].mesh.cells, :order => nominal_order(finest.V.levels[1]),
+                             :hole_radius => a, :domain_edge => L, :far_field_traction => T, :E => E, :nu => ν,
                              :geometry => "Ω = { ‖x‖ ≥ a } (single circle leaf)",
                              :subcell_length_scale => finest.plate.subcell_length_scale,
                              :max_depth => finest.plate.max_depth), output=out)

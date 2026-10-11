@@ -41,8 +41,7 @@ const _INT_X1SQ = 1 / 3
 # Reduced 2×2 block: base 4×4 p=2, overlay covering the middle 2×2 base cells at p=3,
 # aligned (overlay nodes ⊇ base nodes), so the buried centre vertex is deduped.
 function _nested_block()
-    return overlay(space(_OMEGA_CR; cells=(4, 4), order=2), box((0.25, 0.25), (0.75, 0.75));
-                   cells=(4, 4), order=3)
+    return overlay(space(_OMEGA_CR; cells=(4, 4), order=2), box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4), order=3)
 end
 
 @testset "leaf semantics switched off is a no-op" begin
@@ -84,8 +83,7 @@ end
     # Overlay is one p=2 cell coincident with the interior base cell (2,2). Its only
     # surviving mode duplicates the base cell's bubble → the full space is rank
     # deficient by one; covered-mode pruning drops that buried bubble.
-    coincident = overlay(space(_OMEGA_CR; cells=(4, 4), order=2), box((0.25, 0.25), (0.5, 0.5));
-                         cells=(1, 1), order=2)
+    coincident = overlay(space(_OMEGA_CR; cells=(4, 4), order=2), box((0.25, 0.25), (0.5, 0.5)); cells=(1, 1), order=2)
 
     mf, lf = _gram(coincident; prune=false)
     mr, lr = _gram(coincident)
@@ -97,8 +95,7 @@ end
 @testset "non-aligned overlay: linear skeleton retained, completeness preserved" begin
     # 3×3 overlay over the middle 2×2 base cells is not nested: the buried centre
     # vertex is NOT reproducible, so it must stay (no dedup) and the constant survives.
-    V = overlay(space(_OMEGA_CR; cells=(4, 4), order=2), box((0.25, 0.25), (0.75, 0.75));
-                cells=(3, 3), order=3)
+    V = overlay(space(_OMEGA_CR; cells=(4, 4), order=2), box((0.25, 0.25), (0.75, 0.75)); cells=(3, 3), order=3)
     m, l = _gram(V)
     @test count(==(:coverage), l.elimination_source) > 0     # high-order still shed
     @test count(==(:dedup), l.elimination_source) == 0       # vertex kept
@@ -133,8 +130,7 @@ end
     # eliminations; the top level (3) has nothing above it and is untouched.
     lvl_of(raw) = l.raw_keys[raw].level
     reduced_levels = Set(lvl_of(raw)
-                         for raw in eachindex(l.raw_keys)
-                         if l.elimination_source[raw] in (:coverage, :dedup))
+                         for raw in eachindex(l.raw_keys) if l.elimination_source[raw] in (:coverage, :dedup))
     @test 1 in reduced_levels
     @test 2 in reduced_levels
     @test !(3 in reduced_levels)
@@ -151,8 +147,7 @@ end
     src = x -> 2pi^2 * sin(pi * x[1]) * sin(pi * x[2])
     exact = x -> sin(pi * x[1]) * sin(pi * x[2])
     bc = dirichlet(0.0; on=boundary(:all))
-    Vr = overlay(space(_OMEGA_CR; cells=(8, 8), order=3), box((0.3, 0.3), (0.7, 0.7)); cells=(4, 4),
-                 order=3)
+    Vr = overlay(space(_OMEGA_CR; cells=(8, 8), order=3), box((0.3, 0.3), (0.7, 0.7)); cells=(4, 4), order=3)
     m = prepare(poisson(Vr; source=src, dirichlet=[bc]))
     assemble!(m)
     sol = solve!(m)
@@ -164,10 +159,10 @@ end
     # A covered region that is also cut by ∂Ω: the fold removes fictitious cells, cut
     # cells keep moment-fit quadrature, and covered-mode pruning drops only buried
     # high-order. The reduced immersed solve must remain well posed AND complete.
-    disk = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.35; lipschitz=1.0,
-                           subcell_length_scale=0.125, max_depth=4)
-    V = overlay(space(_OMEGA_CR; cells=(4, 4), order=2, physical=disk),
-                box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4), order=3)
+    disk = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.35; lipschitz=1.0, subcell_length_scale=0.125,
+                           max_depth=4)
+    V = overlay(space(_OMEGA_CR; cells=(4, 4), order=2, physical=disk), box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4),
+                order=3)
     m, l = _gram(V)
     @test count(==(:coverage), l.elimination_source) > 0
     @test isposdef(Symmetric(Matrix(m.matrix)))
@@ -197,8 +192,8 @@ end
     # artificial overlay boundary.
     hole = physical_domain(x -> 0.25 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0,
                            subcell_length_scale=0.015625, max_depth=6)
-    V = overlay(space(_OMEGA_CR; cells=(8, 8), order=2, physical=hole),
-                box((0.125, 0.125), (0.875, 0.875)); cells=(12, 12), order=2)
+    V = overlay(space(_OMEGA_CR; cells=(8, 8), order=2, physical=hole), box((0.125, 0.125), (0.875, 0.875));
+                cells=(12, 12), order=2)
     m, l = _gram(V)
     @test diagnostics(m).inactive_cell_counts[2] > 0    # the fold really folds something
     @test count(==(:coverage), l.elimination_source) > 0
@@ -234,8 +229,8 @@ end
     # high-order modes the overlay already reproduces on Ω — the null mode again.
     hole = physical_domain(x -> 0.06 - sqrt((x[1] - 0.32)^2 + (x[2] - 0.32)^2); lipschitz=1.0,
                            subcell_length_scale=0.0078125, max_depth=6)
-    V = overlay(space(_OMEGA_CR; cells=(4, 4), order=2, physical=hole),
-                box((0.25, 0.25), (0.75, 0.75)); cells=(16, 16), order=2)
+    V = overlay(space(_OMEGA_CR; cells=(4, 4), order=2, physical=hole), box((0.25, 0.25), (0.75, 0.75)); cells=(16, 16),
+                order=2)
     m, l = _gram(V)
     @test diagnostics(m).inactive_cell_counts[2] > 0     # the fold really folds something
 
@@ -245,8 +240,7 @@ end
     cell = CartesianIndex(2, 2)
     @test Unfitted._inside(m.problem.fields[1].space.physical.geometry,
                            Unfitted.center(Unfitted.cell_box(base.mesh, cell)))
-    @test Unfitted._covered_by_level(Unfitted.cell_box(base.mesh, cell), fine,
-                                     GeometryTolerance(Float64),
+    @test Unfitted._covered_by_level(Unfitted.cell_box(base.mesh, cell), fine, GeometryTolerance(Float64),
                                      Unfitted._Fold(m.problem.fields[1].space))
     @test count(==(:coverage), l.elimination_source) == 8
 
@@ -298,20 +292,18 @@ end
     basemask[1, 1] = basemask[4, 4] = false
     overlaymask = trues(8, 16)
     overlaymask[1, 16] = overlaymask[7, 8] = false
-    masked_stack(physical) = overlay(overlay(space(_OMEGA_CR; cells=8, order=2, physical=physical,
-                                                   active=basemask), box((0.0, 0.0), (0.5, 1.0));
-                                             cells=(8, 16), order=2, active=overlaymask),
+    masked_stack(physical) = overlay(overlay(space(_OMEGA_CR; cells=8, order=2, physical=physical, active=basemask),
+                                             box((0.0, 0.0), (0.5, 1.0)); cells=(8, 16), order=2, active=overlaymask),
                                      box((0.5, 0.0), (1.0, 1.0)); cells=(8, 16), order=2)
     void_masked = ((1, CartesianIndex(1, 1)), (2, CartesianIndex(1, 16)))
     material_masked = ((1, CartesianIndex(4, 4)), (2, CartesianIndex(7, 8)))
-    probes = (box((1.0, 0.0), (1.125, 0.125)), box((0.45, 0.45), (0.55, 0.55)),
-              box((0.75, 0.4), (0.85, 0.6)))
+    probes = (box((1.0, 0.0), (1.125, 0.125)), box((0.45, 0.45), (0.55, 0.55)), box((0.75, 0.4), (0.85, 0.6)))
     for physical in (disc(), disc(; alpha=1e-3, keep_fictitious=true))
         # The prepared space and its warm memo, exactly as the layout build gets them.
         _, spaces, caches = Unfitted._prepare_spaces(mass(masked_stack(physical)))
         V, cache = only(spaces), only(caches)
-        expected = Dict(level.id => [_void_by_classifier(physical, level, c)
-                                     for c in cell_indices(level.mesh)] for level in V.levels)
+        expected = Dict(level.id => [_void_by_classifier(physical, level, c) for c in cell_indices(level.mesh)]
+                        for level in V.levels)
         inactive(level) = [!Unfitted.is_active(level.mask, c) for c in cell_indices(level.mesh)]
         # Non-vacuity: the fold switched cells off (unless kept), and both kinds of user
         # mask are there, each inactive and of the kind it was placed to be.
@@ -333,13 +325,11 @@ end
         for pass in 1:2, level in V.levels
             cells = cell_indices(level.mesh)
             @test [Unfitted._is_void(fold, level, c) for c in cells] == expected[level.id]
-            @test [Unfitted._is_fictitious(fold, level, c) for c in cells] ==
-                  inactive(level) .& expected[level.id]
+            @test [Unfitted._is_fictitious(fold, level, c) for c in cells] == inactive(level) .& expected[level.id]
         end
         # Every verdict the tables hold is the one the box memo holds for that box.
         for level in V.levels
-            memo = [cache[(b.lower, b.upper)]
-                    for b in (cell_box(level.mesh, c) for c in cell_indices(level.mesh))]
+            memo = [cache[(b.lower, b.upper)] for b in (cell_box(level.mesh, c) for c in cell_indices(level.mesh))]
             @test fold.cells[level.id] == [m === :fictitious ? 0x01 : 0x02 for m in memo]
         end
         for b in probes
@@ -354,8 +344,7 @@ end
     @test fold isa Unfitted._Fold{2,Float64,Nothing}
     for level in V.levels
         cells = cell_indices(level.mesh)
-        @test !any(c -> Unfitted._is_void(fold, level, c) || Unfitted._is_fictitious(fold, level, c),
-                   cells)
+        @test !any(c -> Unfitted._is_void(fold, level, c) || Unfitted._is_fictitious(fold, level, c), cells)
         _oracle_query_bytes(fold, level, probes[1])                 # compile once
         @test _oracle_query_bytes(fold, level, probes[1]) == 0
     end
@@ -373,14 +362,13 @@ end
     # one — every flag, every stored answer and every answer asked through the memo,
     # first as a miss and then as a hit, must be the one `_covered_by_level` computes on
     # a fresh oracle with no memo at all.
-    disc = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.3; lipschitz=1.0,
-                           subcell_length_scale=1 / 64, max_depth=4)
+    disc = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.3; lipschitz=1.0, subcell_length_scale=1 / 64,
+                           max_depth=4)
     # The user hole lies inside the disc, under base cells 5…6 along each axis.
     hole = trues(12, 12)
     hole[8:9, 8:9] .= false
-    stack = overlay(overlay(space(_OMEGA_CR; cells=8, order=2, physical=disc),
-                            box((0.125, 0.125), (0.875, 0.875)); cells=12, order=2, active=hole),
-                    box((0.375, 0.375), (0.625, 0.625)); cells=4, order=2)
+    stack = overlay(overlay(space(_OMEGA_CR; cells=8, order=2, physical=disc), box((0.125, 0.125), (0.875, 0.875));
+                            cells=12, order=2, active=hole), box((0.375, 0.375), (0.625, 0.625)); cells=4, order=2)
     _, spaces, caches = Unfitted._prepare_spaces(mass(stack))
     V, cache = only(spaces), only(caches)
     tol = GeometryTolerance(Float64)
@@ -456,8 +444,7 @@ end
     # Each probe as the one interior node of a one-cell inner level, whose two
     # axis-1 nodes are the probe and an end of the outer box (a one-cell axis is exactly
     # its two corners).
-    probe_level(x) = space(x < 1 ? box((x, 0.0), (1.0, 1.0)) : box((0.0, 0.0), (x, 1.0)); cells=1,
-                           order=1).levels[1]
+    probe_level(x) = space(x < 1 ? box((x, 0.0), (1.0, 1.0)) : box((0.0, 0.0), (x, 1.0)); cells=1, order=1).levels[1]
     nested = [Unfitted._nested_over(probe_level(x), outer, tol) for x in probes]
     @test nested == [_nested_by_scan(probe_level(x), outer, tol) for x in probes]
     @test any(nested) && !all(nested)
@@ -475,9 +462,7 @@ end
 # `ladder`: a ladder spans the level below, `is_inside` passes, and the fold is settled
 # by the mask branch of `_covered_by_level` — the configuration below never arises.
 _HALF_PLANE_CR = box((-1.0, -1.0), (2.0, 2.0))
-function _half_plane_cr()
-    physical_domain(x -> x[1] - 0.9; lipschitz=1.0, subcell_length_scale=0.125, max_depth=6)
-end
+_half_plane_cr() = physical_domain(x -> x[1] - 0.9; lipschitz=1.0, subcell_length_scale=0.125, max_depth=6)
 function _fold_cover(xhi, p)
     base = space(_HALF_PLANE_CR; cells=3, order=p, physical=_half_plane_cr())
     return overlay(base, box((0.0, -1.0), (xhi, 2.0)); cells=(round(Int, 2xhi), 6), order=p)
@@ -504,8 +489,7 @@ end
     # touches them, and every reproduction assertion here passes on the singular
     # operator too. What it does guard is the other direction — that the repair prunes
     # nothing the space needs.
-    for (p, xhi, dedup, unknowns) in
-        ((3, 1.5, 4, 154), (3, 1.0, 0, 145), (1, 1.5, 4, 22), (1, 1.0, 0, 19))
+    for (p, xhi, dedup, unknowns) in ((3, 1.5, 4, 154), (3, 1.0, 0, 145), (1, 1.5, 4, 22), (1, 1.0, 0, 19))
         m, l = _gram(_fold_cover(xhi, p))
         mu, _ = _gram(_fold_cover(xhi, p); prune=false)
         M = Symmetric(Matrix(m.matrix))
@@ -532,8 +516,8 @@ end
     # centre vertex is deduped and the eight covered cells shed their edge/face/interior
     # modes. Exercises the 3-axis incidence and coverage that no 2D config reaches.
     omega3 = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
-    V = overlay(space(omega3; cells=(4, 4, 4), order=2),
-                box((0.25, 0.25, 0.25), (0.75, 0.75, 0.75)); cells=(4, 4, 4), order=2)
+    V = overlay(space(omega3; cells=(4, 4, 4), order=2), box((0.25, 0.25, 0.25), (0.75, 0.75, 0.75)); cells=(4, 4, 4),
+                order=2)
     m, l = _gram(V)
     @test count(==(:coverage), l.elimination_source) > 0   # buried edge/face/interior modes
     @test count(==(:dedup), l.elimination_source) >= 1     # the buried centre vertex

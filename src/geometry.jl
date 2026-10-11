@@ -43,8 +43,7 @@ struct GeometryTolerance{T<:Real}
     small_volume::T
 end
 
-function GeometryTolerance(::Type{T}=Float64; merge=sqrt(eps(T)), contain=merge,
-                           small_volume=merge) where {T<:Real}
+function GeometryTolerance(::Type{T}=Float64; merge=sqrt(eps(T)), contain=merge, small_volume=merge) where {T<:Real}
     return GeometryTolerance{T}(convert(T, merge), convert(T, contain), convert(T, small_volume))
 end
 
@@ -114,8 +113,7 @@ struct AxisBox{D,T<:Real}
 
     function AxisBox{D,T}(lower::SVector{D,T}, upper::SVector{D,T}) where {D,T<:Real}
         D >= 1 || throw(ArgumentError("AxisBox dimension must be at least 1"))
-        all(upper[i] > lower[i] for i in 1:D) ||
-            throw(ArgumentError("AxisBox upper bounds must exceed lower bounds"))
+        all(upper[i] > lower[i] for i in 1:D) || throw(ArgumentError("AxisBox upper bounds must exceed lower bounds"))
         return new{D,T}(lower, upper)
     end
 end
@@ -141,9 +139,7 @@ throughout the package.
 See [`AxisBox`](@ref) for the stored representation and the non-degenerate
 `lower[i] < upper[i]` invariant the constructor enforces.
 """
-function box(lower::NTuple{D,<:Real}, upper::NTuple{D,<:Real}) where {D}
-    return box(SVector(lower), SVector(upper))
-end
+box(lower::NTuple{D,<:Real}, upper::NTuple{D,<:Real}) where {D} = box(SVector(lower), SVector(upper))
 
 function box(lower::SVector{D,<:Real}, upper::SVector{D,<:Real}) where {D}
     T = promote_type(eltype(lower), eltype(upper))
@@ -217,9 +213,7 @@ end
 # coordinate satisfies `lower[i] ≤ x[i] ≤ upper[i]`. Use `contains_point`
 # instead when the query is geometrically motivated and a positive
 # `GeometryTolerance.contain` is in scope.
-function Base.in(point::PointLike{D}, b::AxisBox{D,T}) where {D,T}
-    return all(b.lower[i] <= point[i] <= b.upper[i] for i in 1:D)
-end
+Base.in(point::PointLike{D}, b::AxisBox{D,T}) where {D,T} = all(b.lower[i] <= point[i] <= b.upper[i] for i in 1:D)
 
 """
     contains_point(point, b::AxisBox, tol::GeometryTolerance) -> Bool
@@ -267,10 +261,9 @@ validate overlay placement, since the `overlay(...)` constructor requires
 the overlay domain to lie inside the space's bounding box `V.domain` (not
 inside an immersed `Ω` — an overlay may cover fictitious material).
 """
-function is_inside(inner::AxisBox{D,T}, outer::AxisBox{D,T},
-                   tol::GeometryTolerance{T}=GeometryTolerance(T)) where {D,T}
-    return all(inner.lower[i] >= outer.lower[i] - tol.contain &&
-                   inner.upper[i] <= outer.upper[i] + tol.contain for i in 1:D)
+function is_inside(inner::AxisBox{D,T}, outer::AxisBox{D,T}, tol::GeometryTolerance{T}=GeometryTolerance(T)) where {D,T}
+    return all(inner.lower[i] >= outer.lower[i] - tol.contain && inner.upper[i] <= outer.upper[i] + tol.contain
+               for i in 1:D)
 end
 
 """

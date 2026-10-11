@@ -172,23 +172,21 @@
 
         for line in eachline(IOBuffer(text))
             if startswith(line, markers.opening)
-                name === nothing ||
-                    (blocks[name] = (status="crashed", seconds="?", output=String(take!(buffer))))
+                name === nothing || (blocks[name] = (status="crashed", seconds="?", output=String(take!(buffer))))
                 name = strip(line[(length(markers.opening)+1):end])
                 buffer = IOBuffer()
             elseif name !== nothing && startswith(line, markers.closing)
                 fields = split(line)
                 options = Dict(first(kv) => last(kv) for kv in split.(fields[3:end], "="; limit=2))
-                blocks[name] = (status=get(options, "status", "unknown"),
-                                seconds=get(options, "seconds", "?"), output=String(take!(buffer)))
+                blocks[name] = (status=get(options, "status", "unknown"), seconds=get(options, "seconds", "?"),
+                                output=String(take!(buffer)))
                 name = nothing
             elseif name !== nothing
                 println(buffer, line)
             end
         end
 
-        name === nothing ||
-            (blocks[name] = (status="crashed", seconds="?", output=String(take!(buffer))))
+        name === nothing || (blocks[name] = (status="crashed", seconds="?", output=String(take!(buffer))))
         return blocks
     end
 
@@ -273,10 +271,9 @@
     # arithmetic artefact with no consequence for the answer.
     function check_ladders(output, tol)
         # Part 1's table, read by row: cells, h, nested, unknowns, error.
-        rows = [(cells=parse(Int, m.captures[1]), nested=m.captures[2] == "true",
-                 unknowns=parse(Int, m.captures[3]), error=parse(Float64, m.captures[4]))
-                for m in eachmatch(r"^(\d+)\s+[\d.e+-]+\s+(true|false)\s+(\d+)\s+([\d.e+-]+)\s*$"m,
-                                   output)]
+        rows = [(cells=parse(Int, m.captures[1]), nested=m.captures[2] == "true", unknowns=parse(Int, m.captures[3]),
+                 error=parse(Float64, m.captures[4]))
+                for m in eachmatch(r"^(\d+)\s+[\d.e+-]+\s+(true|false)\s+(\d+)\s+([\d.e+-]+)\s*$"m, output)]
         @test length(rows) == 6
         if length(rows) == 6
             by_cells = Dict(r.cells => r for r in rows)
@@ -340,12 +337,11 @@
     #     `previous` produces — leaves every overlay fully inactive and fails
     #     here.
     function check_adaptive_hp(output, tol)
-        rows = [(step=parse(Int, m.captures[1]), unknowns=parse(Int, m.captures[2]),
-                 eta=parse(Float64, m.captures[3]), ratio=parse(Float64, m.captures[4]),
-                 consistency=parse(Float64, m.captures[5]), l2=parse(Float64, m.captures[6]))
-                for m in
-                    eachmatch(r"^\s+(\d+)\s+(\d+)\s+([\d.e+-]+)\s+([\d.e+-]+)\s+([\d.e+-]+)\s+([\d.e+-]+)\s*$"m,
-                              output)]
+        rows = [(step=parse(Int, m.captures[1]), unknowns=parse(Int, m.captures[2]), eta=parse(Float64, m.captures[3]),
+                 ratio=parse(Float64, m.captures[4]), consistency=parse(Float64, m.captures[5]),
+                 l2=parse(Float64, m.captures[6]))
+                for m in eachmatch(r"^\s+(\d+)\s+(\d+)\s+([\d.e+-]+)\s+([\d.e+-]+)\s+([\d.e+-]+)\s+([\d.e+-]+)\s*$"m,
+                                   output)]
         @test length(rows) ≥ tol.steps
         @test occursin("── tolerance met ──", output)
         if !isempty(rows)
@@ -418,8 +414,7 @@
         @test centre !== nothing
         if centre !== nothing
             reference = 0.07367135326539033
-            @test sane_error(abs(parse(Float64, centre.captures[1]) - reference) / reference,
-                             tol.centre)
+            @test sane_error(abs(parse(Float64, centre.captures[1]) - reference) / reference, tol.centre)
         end
 
         # Part 2's check: the same immersed problem in two different families on
@@ -488,11 +483,9 @@
     function check_conditioning(output, tol)
         @test occursin("columns: p, k, δ, active_unknowns, regions, small_regions, min_volume, " *
                        "first_small_volume, cond_estimate, residual_norm", output)
-        rows = [split(line, ", ")
-                for line in eachline(IOBuffer(output)) if occursin(r"^\s*\d+, ", line)]
+        rows = [split(line, ", ") for line in eachline(IOBuffer(output)) if occursin(r"^\s*\d+, ", line)]
         @test length(rows) == 4 * 8
-        @test all(row -> sane_error(parse(Float64, row[9]), tol.condition[parse(Int, row[1])]),
-                  rows)
+        @test all(row -> sane_error(parse(Float64, row[9]), tol.condition[parse(Int, row[1])]), rows)
         @test all(row -> sane_error(parse(Float64, row[10]), tol.residual), rows)
     end
 
@@ -534,17 +527,14 @@
 
         # "the RBF interpolant is not monotone … it overshoots a little where
         # the front is steepest". A little is the claim; this is the bound.
-        excursion = metric_values(output,
-                                  raw"excursion outside \[0, 1\] introduced by the " *
-                                  "RBF transfer")
+        excursion = metric_values(output, raw"excursion outside \[0, 1\] introduced by the " * "RBF transfer")
         @test length(excursion) == 1
         @test all(value -> sane_error(value, tol.excursion), excursion)
 
         # The headline. `cured area = ∫_Ω χ dx` has to be a substantial region
         # when χ rides along, and a small fraction of it when χ is dropped —
         # "the physics comes out wrong, not merely less accurate".
-        areas = match(r"cured_area: \(transferred = ([-+0-9.eE]+), dropped = ([-+0-9.eE]+)\)",
-                      output)
+        areas = match(r"cured_area: \(transferred = ([-+0-9.eE]+), dropped = ([-+0-9.eE]+)\)", output)
         @test areas !== nothing
         if areas !== nothing
             transferred, dropped = parse.(Float64, areas.captures)
@@ -576,8 +566,7 @@
     # series writer deletes nothing, by design, so the directory is cleared
     # before the batch runs — otherwise a stale collection from an earlier run
     # at a different size would satisfy `check_laser_output` on its own.
-    LASER_OUTPUT = joinpath(@__DIR__, "..", "examples", "reproductions", "traveling_laser_2d",
-                            "output")
+    LASER_OUTPUT = joinpath(@__DIR__, "..", "examples", "reproductions", "traveling_laser_2d", "output")
 
     # The write path — the ParaView series and the CSV — has no other automated
     # coverage anywhere in the suite, and it is the half of this example a
@@ -592,8 +581,8 @@
         @test isfile(collection)
         isfile(collection) || return nothing
         datasets = [(time=parse(Float64, m.captures[1]), file=String(m.captures[2]))
-                    for m in eachmatch(r"<DataSet timestep=\"([^\"]+)\"[^>]*file=\"([^\"]+)\"",
-                                       read(collection, String))]
+                    for m in
+                        eachmatch(r"<DataSet timestep=\"([^\"]+)\"[^>]*file=\"([^\"]+)\"", read(collection, String))]
         @test length(datasets) == tol.frames
         @test all(d -> isfile(joinpath(LASER_OUTPUT, d.file)), datasets)
         if !isempty(datasets)
@@ -606,8 +595,7 @@
         # meshes and one data grid.
         frames = readdir(joinpath(LASER_OUTPUT, "traveling_laser_2d_frames"))
         @test count(endswith(".vtu"), frames) == 6 * tol.frames
-        @test occursin(Regex("VTK series: .*traveling_laser_2d\\.pvd  \\($(tol.frames) frames\\)"),
-                       output)
+        @test occursin(Regex("VTK series: .*traveling_laser_2d\\.pvd  \\($(tol.frames) frames\\)"), output)
 
         csv = readlines(joinpath(LASER_OUTPUT, "history.csv"))
         @test !isempty(csv)
@@ -648,8 +636,8 @@
     # measured with output off, so a frame schedule that touched the
     # discretisation would fail here rather than quietly re-baseline.
     function check_laser(output, tol)
-        rows = [(unknowns=parse(Int, m.captures[2]), n_h=parse(Int, m.captures[6]),
-                 n_p=parse(Int, m.captures[7]), n_rel=parse(Int, m.captures[8]))
+        rows = [(unknowns=parse(Int, m.captures[2]), n_h=parse(Int, m.captures[6]), n_p=parse(Int, m.captures[7]),
+                 n_rel=parse(Int, m.captures[8]))
                 for m in
                     eachmatch(r"^\s*([\d.]+)\s*,\s*(\d+),\s*([\d.e+-]+)\s*,\s*([\d.e+-]+)\s*,\s*([\d.e+-]+)\s*,\s*(\d+),\s*(\d+),\s*(\d+)\s*$"m,
                               output)]
@@ -669,8 +657,8 @@
         # is the one a lucky sample can slip through. The band is asserted to be
         # a band — a run whose low and high coincide has stopped adapting, and
         # every other assertion here would still pass.
-        averaged = match(r"mean over t ≥ [\d.]+: (\d+) unknowns \((\d+)–(\d+)\) " *
-                         r"at relative L2 ([\d.e+-]+)", output)
+        averaged = match(r"mean over t ≥ [\d.]+: (\d+) unknowns \((\d+)–(\d+)\) " * r"at relative L2 ([\d.e+-]+)",
+                         output)
         @test averaged !== nothing
         if averaged !== nothing
             @test tol.mean_unknowns[1] < parse(Int, averaged.captures[1]) < tol.mean_unknowns[2]
@@ -690,8 +678,8 @@
     # the table is switched off in this case's `env` and prints `-`, which the
     # row pattern accepts and nothing below reads.
     function check_tanh(output, tol)
-        rows = [(unknowns=parse(Int, m.captures[2]), n_h=parse(Int, m.captures[6]),
-                 n_p=parse(Int, m.captures[7]), orders=m.captures[8])
+        rows = [(unknowns=parse(Int, m.captures[2]), n_h=parse(Int, m.captures[6]), n_p=parse(Int, m.captures[7]),
+                 orders=m.captures[8])
                 for m in
                     eachmatch(r"^\s*(\d+),\s*(\d+),\s*([\d.e+-]+)\s*,\s*([\d.e+-]+)\s*,\s*([\d.e+-]+)\s*,\s*(\d+),\s*(\d+),\s*\[([\d, ]+)\]"m,
                               output)]
@@ -716,20 +704,20 @@
              # The seven-call workflow, run once on the interval and once,
              # unchanged, on the square. Two relative L² errors: 6.32e-6 (1-D)
              # and 8.91e-6 (2-D).
-             (name="tutorials/01_first_solve", env=Dict{String,String}(), requires=(),
-              check=check_first_solve, tol=1.0e-4),
+             (name="tutorials/01_first_solve", env=Dict{String,String}(), requires=(), check=check_first_solve,
+              tol=1.0e-4),
              # Overlays, masking and the activation contract. Five relative L²
              # errors: 4.30e-2 (base only) then 1.576e-3 four times over, as
              # the overlay configurations are varied around a fixed answer. The
              # `coarsest` band covers the base-only run, `headline` the final
              # patch-only configuration.
-             (name="tutorials/02_overlays", env=Dict{String,String}(), requires=(),
-              check=check_overlays, tol=(coarsest=5.0e-1, headline=1.0e-2)),
+             (name="tutorials/02_overlays", env=Dict{String,String}(), requires=(), check=check_overlays,
+              tol=(coarsest=5.0e-1, headline=1.0e-2)),
              # Finite cell method on an annulus with Nitsche on both immersed
              # rims; prints one relative L² error, 1.21e-4, over 56 cut regions
              # with no failed fits.
-             (name="tutorials/03_immersed_fcm", env=Dict{String,String}(), requires=(),
-              check=check_immersed_fcm, tol=1.0e-3),
+             (name="tutorials/03_immersed_fcm", env=Dict{String,String}(), requires=(), check=check_immersed_fcm,
+              tol=1.0e-3),
              # The B-spline family. No L² error at all (see `check_bspline`);
              # measured instead: 249 unknowns at cond 253.2 deduplicated
              # against 250 at order 5e15 undeduplicated, u_h(½,½) within 1.6e-7
@@ -737,18 +725,16 @@
              # pointwise gap. Part 1c builds its stack through
              # `prepare(…; prune = false)`; measured bit-for-bit identical to
              # the internal it replaced.
-             (name="tutorials/04_bspline", env=Dict{String,String}(), requires=("BasicBSpline",),
-              check=check_bspline,
-              tol=(deduplicated=1.0e4, singular=1.0e10, centre=1.0e-3, cross_family=1.0e-4,
-                   scaled_bspline=1.0e4)),
+             (name="tutorials/04_bspline", env=Dict{String,String}(), requires=("BasicBSpline",), check=check_bspline,
+              tol=(deduplicated=1.0e4, singular=1.0e10, centre=1.0e-3, cross_family=1.0e-4, scaled_bspline=1.0e4)),
 
              # Nested ladders. No single headline error: the claim is that a
              # finer non-nested overlay is *less* accurate (9 cells against 8)
              # and that the cause is 108 destroyed dimensions, both asserted in
              # `check_ladders`. `coarsest` bands Part 1's whole table, whose
              # worst row is 2.26e-3.
-             (name="tutorials/05_ladders", env=Dict{String,String}(), requires=(),
-              check=check_ladders, tol=(coarsest=5.0e-2, sparse_vs_block=1.0e-4)),
+             (name="tutorials/05_ladders", env=Dict{String,String}(), requires=(), check=check_ladders,
+              tol=(coarsest=5.0e-2, sparse_vs_block=1.0e-4)),
 
              # The estimate/refine loop driven to its own tolerance. No size
              # knob: the case is 12.2 s standalone at -O0, and shortening it
@@ -762,8 +748,7 @@
              # a decade above the peak: a decade is meaningless on a ratio, and
              # 1.0 is the value with a meaning — the residual `V` leaves on its
              # own dofs exceeding the one it leaves on the enrichment.
-             (name="tutorials/06_adaptive_hp", env=Dict{String,String}(), requires=(),
-              check=check_adaptive_hp,
+             (name="tutorials/06_adaptive_hp", env=Dict{String,String}(), requires=(), check=check_adaptive_hp,
               tol=(l2=1.0e-4, eta_ratio=1.0e-3, eta_fall=100.0, consistency=1.0, steps=10)),
 
              # ── Applications ────────────────────────────────────────────────
@@ -790,8 +775,8 @@
              # wires up a job that runs it on the example's own project:
              # measured relative L² error 4.10e-4 at t = 0.2, identical to six
              # digits under both integrators.
-             (name="applications/time_integration", env=Dict{String,String}(),
-              requires=("OrdinaryDiffEq",), check=check_single_l2, tol=1.0e-2),
+             (name="applications/time_integration", env=Dict{String,String}(), requires=("OrdinaryDiffEq",),
+              check=check_single_l2, tol=1.0e-2),
              # Irreversible thermal curing on a cure front that drives its own
              # overlay activation: the only example carrying `QuadField`
              # per-quadrature-point state and `RBFP0` history transfer through a
@@ -801,10 +786,9 @@
              # 0.156; cured area 0.1226 carrying χ against exactly 0.0 dropping
              # it. The contrast factor is the point of the example, so it is
              # asserted at ten rather than at the ∞ the run actually delivers.
-             (name="applications/thermal_curing_2d", env=Dict{String,String}(), requires=(),
-              check=check_curing,
-              tol=(rebuilds=3, picard=16, excursion=5.0e-1, accuracy_percent=3.0,
-                   cured_area=(1.0e-2, 1.0), contrast=10)),
+             (name="applications/thermal_curing_2d", env=Dict{String,String}(), requires=(), check=check_curing,
+              tol=(rebuilds=3, picard=16, excursion=5.0e-1, accuracy_percent=3.0, cured_area=(1.0e-2, 1.0),
+                   contrast=10)),
              # Space-time thermo-elasticity on a growing cavity: time is the
              # third mesh axis, so the moving domain is one static cone-shaped
              # level set and the whole transient is a single solve. The only case
@@ -836,25 +820,24 @@
              # Those timings are easy to get wrong: they are numerics-bound, so a
              # single competing process on the machine inflates them severalfold.
              # Re-measure serially on an idle box before trusting any of them.
-             (name="applications/spacetime_cavity_2d", env=Dict("SC_CELLS" => "3"),
-              requires=("Tensors",), check=check_spacetime_cavity, tol=(l2=1.0e-1,)),
+             (name="applications/spacetime_cavity_2d", env=Dict("SC_CELLS" => "3"), requires=("Tensors",),
+              check=check_spacetime_cavity, tol=(l2=1.0e-1,)),
 
              # ── Reproductions ───────────────────────────────────────────────
              # Smooth manufactured Laplace, published 12×12 p=4 config (already
              # sub-second numerics); prints one relative L² error, 2.17e-8.
-             (name="reproductions/laplace_unit_square_smooth", env=Dict{String,String}(),
-              requires=(), check=check_single_l2, tol=1.0e-6),
+             (name="reproductions/laplace_unit_square_smooth", env=Dict{String,String}(), requires=(),
+              check=check_single_l2, tol=1.0e-6),
              # Corner-singularity nested-overlay solve at its published size
              # (small system; cost is compilation); one relative L² error,
              # 4.34e-5.
-             (name="reproductions/singular_square_2d", env=Dict{String,String}(), requires=(),
-              check=check_single_l2, tol=1.0e-3),
+             (name="reproductions/singular_square_2d", env=Dict{String,String}(), requires=(), check=check_single_l2,
+              tol=1.0e-3),
              # Small-overlap conditioning sweep; 32 tiny solves, CSV output.
              # Largest `cond(A)` per order (always at δ = 2⁻⁸): 3.65e2, 1.50e3,
              # 6.30e5, 3.65e7; largest residual over all 32 rows 4.15e-15.
-             (name="reproductions/conditioning_small_overlap", env=Dict{String,String}(),
-              requires=(), check=check_conditioning,
-              tol=(condition=(4.0e3, 2.0e4, 7.0e6, 4.0e8), residual=1.0e-10)),
+             (name="reproductions/conditioning_small_overlap", env=Dict{String,String}(), requires=(),
+              check=check_conditioning, tol=(condition=(4.0e3, 2.0e4, 7.0e6, 4.0e8), residual=1.0e-10)),
              # Traveling laser: shortened transient (`TL_T_MAX = 0.8`, a fifth
              # of one revolution, `TL_DEPTH = 4`). Measured on that
              # configuration: 31 updates, Σn_h = 17, Σn_p = 110,
@@ -898,10 +881,10 @@
              # verb, including `coarsen`, fires inside the first fifth of a
              # revolution.
              (name="reproductions/traveling_laser_2d",
-              env=Dict("TL_T_MAX" => "0.8", "TL_DEPTH" => "4", "TL_WRITE_OUTPUT" => "true",
-                       "TL_VTK_FRAMES" => "5"), requires=(), check=check_laser,
-              tol=(l2=1.0e-1, updates=20, unknowns=(820, 1620), settled=(0.0187, 0.0196),
-                   mean_unknowns=(660, 1310), mean_settled=(0.0221, 0.0232), frames=6)),
+              env=Dict("TL_T_MAX" => "0.8", "TL_DEPTH" => "4", "TL_WRITE_OUTPUT" => "true", "TL_VTK_FRAMES" => "5"),
+              requires=(), check=check_laser,
+              tol=(l2=1.0e-1, updates=20, unknowns=(820, 1620), settled=(0.0187, 0.0196), mean_unknowns=(660, 1310),
+                   mean_settled=(0.0221, 0.0232), frames=6)),
 
              # Automated hp on a curved interior layer: 22 adaptive cycles from
              # a linear 6×6 base at the published size, VTK off, and the
@@ -915,16 +898,14 @@
              # relative L² 3.5277e-4, Σn_h = 60, Σn_p = 296, final max order
              # per level [3, 5, 7, 6, 1, 1].
              (name="reproductions/adaptive_tanh_layer_2d",
-              env=Dict("TANH_WRITE_OUTPUT" => "false", "TANH_TABLE_ENERGY" => "false"), requires=(),
-              check=check_tanh,
+              env=Dict("TANH_WRITE_OUTPUT" => "false", "TANH_TABLE_ENERGY" => "false"), requires=(), check=check_tanh,
               tol=(l2=5.0e-3, energy=2.0e-2, pmax=8, cycles=22, unknowns=(1900, 7500))))
 
     # Only the cases whose requirements the active project can resolve go into
     # the batch; the rest are reported as skips below.
     selection = [case for case in cases if isempty(missing_packages(case))]
     rm(LASER_OUTPUT; force=true, recursive=true)
-    batch_stdout, batch_stderr, batch_ok = isempty(selection) ? ("", "", true) :
-                                           run_batch(selection)
+    batch_stdout, batch_stderr, batch_ok = isempty(selection) ? ("", "", true) : run_batch(selection)
     blocks = split_blocks(batch_stdout)
     batch_finished = occursin(markers.done, batch_stdout)
     # The child's exit status is a signal no per-case block can carry: a case

@@ -54,8 +54,7 @@ end
     # ∫_Ω ∇v ⋅ ∇u dx with no load, and ∫_Ω 1 ⋅ v dx with no operator: each side
     # stands alone, and neither writes the zero stub the constructor used to
     # demand.
-    bilinear_only = WeakForm(bilinear=(q, trial) -> TestChannels(0.0, trial.gradient),
-                             symmetric=true)
+    bilinear_only = WeakForm(bilinear=(q, trial) -> TestChannels(0.0, trial.gradient), symmetric=true)
     @test bilinear_only.linear === nothing
     @test bilinear_only.bilinear !== nothing
 
@@ -74,8 +73,7 @@ end
     # halves.
     V = space(box((0.0,), (1.0,)); cells=2, order=1)
     u = field(:u, V)
-    model = prepare(Problem((u,); blocks=(block(u, u, bilinear_only),),
-                            loads=(loadform(u, linear_only),),
+    model = prepare(Problem((u,); blocks=(block(u, u, bilinear_only),), loads=(loadform(u, linear_only),),
                             dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     @test model.problem.symmetric
 
@@ -91,8 +89,7 @@ end
 
 @testset "the single-field shorthand attaches the sides the form declares" begin
     V = space(box((0.0,), (1.0,)); cells=2, order=1)
-    bilinear_only = WeakForm(bilinear=(q, trial) -> TestChannels(0.0, trial.gradient),
-                             symmetric=true)
+    bilinear_only = WeakForm(bilinear=(q, trial) -> TestChannels(0.0, trial.gradient), symmetric=true)
     linear_only = WeakForm(linear=q -> 1.0)
 
     # Laplace with boundary data: an operator, no load, and a solution driven
@@ -128,8 +125,7 @@ end
                                   dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     @test_throws MethodError assemble!(wrong_block; threaded=false)
 
-    wrong_load = prepare(Problem((u,); blocks=(block(u, u, bilinear_only),),
-                                 loads=(loadform(u, bilinear_only),),
+    wrong_load = prepare(Problem((u,); blocks=(block(u, u, bilinear_only),), loads=(loadform(u, bilinear_only),),
                                  dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     @test_throws MethodError assemble!(wrong_load; threaded=false)
 end
@@ -204,8 +200,7 @@ end
     # at 4²; `assemble_matrix` has no such step and is compared from 4².
     omega = box((0.0, 0.0), (1.0, 1.0))
     patch = box((0.25, 0.25), (0.75, 0.75))
-    homogeneous(c) = prepare(mass(overlay(space(omega; cells=(c, c), order=2), patch; cells=c ÷ 2,
-                                          order=3)))
+    homogeneous(c) = prepare(mass(overlay(space(omega; cells=(c, c), order=2), patch; cells=c ÷ 2, order=3)))
     small, medium, large = homogeneous(4), homogeneous(8), homogeneous(16)
     @test eltype(Unfitted._assembly_workspace(small).bank.bases) === IntegratedLegendre
     @test _warm_allocations(assemble!, large) - _warm_allocations(assemble!, medium) < 20
@@ -215,8 +210,7 @@ end
 
     # A space that genuinely mixes families widens the bank back to a common
     # supertype, pays the dynamic basis call, and must still assemble.
-    mixed = prepare(mass(overlay(space(omega; cells=(4, 4), order=2), patch; cells=2, order=3,
-                                 basis=bspline())))
+    mixed = prepare(mass(overlay(space(omega; cells=(4, 4), order=2), patch; cells=2, order=3, basis=bspline())))
     @test !isconcretetype(eltype(Unfitted._assembly_workspace(mixed).bank.bases))
     assemble!(mixed)
     @test all(isfinite, mixed.matrix.nzval)
@@ -235,13 +229,11 @@ end
     # 4² to 16² cells: 5 at 1 thread and 26 at 6.
     omega = box((0.0, 0.0), (1.0, 1.0))
     patch = box((0.25, 0.25), (0.75, 0.75))
-    homogeneous(c) = prepare(mass(overlay(space(omega; cells=(c, c), order=2), patch; cells=c ÷ 2,
-                                          order=3)))
+    homogeneous(c) = prepare(mass(overlay(space(omega; cells=(c, c), order=2), patch; cells=c ÷ 2, order=3)))
     small, large = homogeneous(4), homogeneous(16)
     mass_u(model) = mass_block(only(model.problem.fields))
     @test _warm_allocations(assemble_matrix, large, mass_u(large); threaded=true) -
-          _warm_allocations(assemble_matrix, small, mass_u(small); threaded=true) ≤
-          20 + 8 * Threads.nthreads()
+          _warm_allocations(assemble_matrix, small, mass_u(small); threaded=true) ≤ 20 + 8 * Threads.nthreads()
 end
 
 @testset "symmetric mirror reproduces A + Aᵀ − diag(A) to the bit" begin
@@ -271,8 +263,7 @@ end
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(3, 3), order=2)
     V = overlay(V, box((0.2, 0.25), (0.8, 0.75)); cells=(2, 2), order=3)
-    problem = poisson(V; source=x -> 1.0 + x[1] - x[2],
-                      dirichlet=[dirichlet(0.0; on=boundary(:all))])
+    problem = poisson(V; source=x -> 1.0 + x[1] - x[2], dirichlet=[dirichlet(0.0; on=boundary(:all))])
     serial_model = prepare(problem)
     threaded_model = prepare(problem)
     reassembled = prepare(problem)
@@ -297,10 +288,8 @@ end
     # rhs-only threaded pass: assemble_vector defers each region's rhs to an
     # arena and gathers it by dof in serial order, so it too is bit-identical
     # to the serial walk.
-    load = loadform(field(:u, V),
-                    WeakForm(bilinear=(q, trial) -> 0.0, linear=q -> 1.0, symmetric=false))
-    @test assemble_vector(serial_model, load; threaded=true) ==
-          assemble_vector(serial_model, load; threaded=false)
+    load = loadform(field(:u, V), WeakForm(bilinear=(q, trial) -> 0.0, linear=q -> 1.0, symmetric=false))
+    @test assemble_vector(serial_model, load; threaded=true) == assemble_vector(serial_model, load; threaded=false)
 end
 
 @testset "a region filter assembles the same vector threaded and serial" begin
@@ -343,8 +332,7 @@ end
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=2, order=1)
     diffusion = x -> x[1] < 0.5 ? 2.0 : 4.0
-    model = prepare(poisson(V; source=1.0, diffusion,
-                            dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    model = prepare(poisson(V; source=1.0, diffusion, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     assemble!(model)
     @test model.matrix[1, 1] ≈ 12.0
@@ -356,8 +344,7 @@ end
     omega2 = box((0.0, 0.0), (1.0, 1.0))
     V2 = space(omega2; cells=(1, 1), order=2)
     tensor = [2.0 0.25; 0.25 3.0]
-    model2 = prepare(poisson(V2; source=1.0, diffusion=x -> tensor,
-                             dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    model2 = prepare(poisson(V2; source=1.0, diffusion=x -> tensor, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     assemble!(model2)
     @test size(model2.matrix) == (1, 1)
@@ -370,8 +357,7 @@ end
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(1, 1), order=2)
     u = field(:u, V; components=2)
-    model = prepare(poisson(u; source=SVector(1.0, 2.0),
-                            dirichlet=[dirichlet(SVector(0.0, 0.0); on=boundary(:all))]))
+    model = prepare(poisson(u; source=SVector(1.0, 2.0), dirichlet=[dirichlet(SVector(0.0, 0.0); on=boundary(:all))]))
 
     assemble!(model)
     @test diagnostics(model).active_unknowns == 2
@@ -387,8 +373,7 @@ end
     @test center_value isa SVector{2}
     @test center_value[2] ≈ 2center_value[1]
     @test center_gradient[1] isa SVector{2}
-    @test l2_error(solution, model,
-                   x -> SVector(value(solution, model, x, 1), value(solution, model, x, 2));
+    @test l2_error(solution, model, x -> SVector(value(solution, model, x, 1), value(solution, model, x, 2));
                    norm=:absolute) < 1.0e-12
 end
 
@@ -424,10 +409,8 @@ end
     V = space(omega; cells=2, order=1)
     u = field(:u, V)
     c = field(:c, V)
-    uform = WeakForm(bilinear=(q, trial) -> TestChannels(0.0, trial.gradient), linear=q -> 1.0,
-                     symmetric=true)
-    cform = WeakForm(bilinear=(q, trial) -> TestChannels(0.0, trial.gradient), linear=q -> 2.0,
-                     symmetric=true)
+    uform = WeakForm(bilinear=(q, trial) -> TestChannels(0.0, trial.gradient), linear=q -> 1.0, symmetric=true)
+    cform = WeakForm(bilinear=(q, trial) -> TestChannels(0.0, trial.gradient), linear=q -> 2.0, symmetric=true)
     model = prepare(Problem((u, c); blocks=(block(u, u, uform), block(c, c, cform)),
                             loads=(loadform(u, uform), loadform(c, cform)),
                             dirichlet=[dirichlet(0.0; on=boundary(:all), field=u),
@@ -449,8 +432,8 @@ end
     V = space(omega; cells=(1, 1), order=2)
     u = field(:u, V; components=2)
     c = field(:c, V)
-    zero_form = WeakForm(bilinear=(q, trial, test_component) -> 0.0,
-                         linear=(q, test_component) -> 0.0, symmetric=true, component_aware=true)
+    zero_form = WeakForm(bilinear=(q, trial, test_component) -> 0.0, linear=(q, test_component) -> 0.0, symmetric=true,
+                         component_aware=true)
     model = prepare(Problem((u, c); blocks=(block(u, u, zero_form), block(c, c, zero_form)),
                             loads=(loadform(u, zero_form), loadform(c, zero_form)),
                             dirichlet=[dirichlet(SVector(0.0, 0.0); on=boundary(:all), field=u)]))
@@ -474,10 +457,8 @@ end
     V = space(omega; cells=2, order=1)
     u = field(:u, V)
     c = field(:c, V)
-    stiffness_form = WeakForm(bilinear=(q, trial) -> TestChannels(0.0, trial.gradient),
-                              linear=q -> 0.0, symmetric=true)
-    coupling_form = WeakForm(bilinear=(q, trial) -> 0.5 * trial.value, linear=q -> 0.0,
-                             symmetric=true)
+    stiffness_form = WeakForm(bilinear=(q, trial) -> TestChannels(0.0, trial.gradient), linear=q -> 0.0, symmetric=true)
+    coupling_form = WeakForm(bilinear=(q, trial) -> 0.5 * trial.value, linear=q -> 0.0, symmetric=true)
     model = prepare(Problem((u, c);
                             blocks=(block(u, u, stiffness_form), block(c, c, stiffness_form),
                                     block(c, u, coupling_form)),
@@ -510,8 +491,7 @@ end
     @test isposdef(Symmetric(Matrix(mass_model.matrix)))
     @test Matrix(stiffness_model.matrix) ≈ Matrix(poisson_model.matrix)
     @test load_vector(stiffness_model; source=x -> 1.0 + x[1]) ≈ load_model.rhs
-    @test load_vector(stiffness_model; source=2.0) ≈
-          fill(1.0, diagnostics(stiffness_model).active_unknowns)
+    @test load_vector(stiffness_model; source=2.0) ≈ fill(1.0, diagnostics(stiffness_model).active_unknowns)
 end
 
 @testset "operators assemble on an existing prepared model" begin
@@ -543,12 +523,10 @@ end
     # Dirichlet data across two levels, whose lift −K_ac g only a call carrying
     # the blocks can produce, and a facet load besides the volume source.
     omega = box((0.0, 0.0), (1.0, 1.0))
-    V = overlay(space(omega; cells=(4, 4), order=2), box((0.0, 0.25), (0.5, 0.75)); cells=(2, 2),
-                order=3)
+    V = overlay(space(omega; cells=(4, 4), order=2), box((0.0, 0.25), (0.5, 0.75)); cells=(2, 2), order=3)
     u = field(:u, V)
     blocks = (stiffness_block(u; diffusion=2.0),)
-    loads = (source_load(u; source=x -> 1 + x[1]),
-             neumann(u, 0.5; on=boundary(axis=2, side=:upper)))
+    loads = (source_load(u; source=x -> 1 + x[1]), neumann(u, 0.5; on=boundary(axis=2, side=:upper)))
     model = prepare(Problem((u,); blocks, loads,
                             dirichlet=[dirichlet(x -> 1 + x[2]^2; on=boundary(axis=1, side=:lower))]))
 
@@ -614,8 +592,7 @@ end
 
     diffusion = x -> x[1] < 0.5 ? 1.0 : 4.0
     exact = x -> x[1] <= 0.5 ? 1.6 * x[1] : 0.8 + 0.4 * (x[1] - 0.5)
-    model = prepare(poisson(V; source=0.0, diffusion,
-                            dirichlet=[dirichlet(exact; on=boundary(:all))]))
+    model = prepare(poisson(V; source=0.0, diffusion, dirichlet=[dirichlet(exact; on=boundary(:all))]))
     solution = solve!(model)
 
     @test l2_error(solution, model, exact; norm=:absolute) < 1.0e-11
@@ -643,8 +620,7 @@ end
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(1, 1), order=(1, 2))
     g = x -> 1 + x[2]
-    model = prepare(poisson(V; source=0.0,
-                            dirichlet=[dirichlet(g; on=boundary(axis=1, side=:lower))]))
+    model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(g; on=boundary(axis=1, side=:lower))]))
     solution = solve!(model)
 
     @test value(solution, model, (0.0, 0.25)) ≈ g((0.0, 0.25)) atol = 1.0e-12
@@ -666,10 +642,8 @@ end
     K = assemble_matrix(model, stiffness_block(u; diffusion=1.0))
 
     # ∫ value(u_h) v == (M u)_i ; ∫ ∇u_h·∇v == (K u)_i
-    value_form = WeakForm(bilinear=(q, trial) -> 0.0, linear=q -> value(q.state, :u),
-                          symmetric=false)
-    grad_form = WeakForm(bilinear=(q, trial) -> 0.0,
-                         linear=q -> TestChannels(0.0, field_gradient(q.state, :u)),
+    value_form = WeakForm(bilinear=(q, trial) -> 0.0, linear=q -> value(q.state, :u), symmetric=false)
+    grad_form = WeakForm(bilinear=(q, trial) -> 0.0, linear=q -> TestChannels(0.0, field_gradient(q.state, :u)),
                          symmetric=false)
 
     @test assemble_vector(model, loadform(u, value_form); state=iterate) ≈ M * coefficients rtol = 1.0e-10
@@ -694,8 +668,7 @@ end
     # divergence load: ∫ (∂x u_x + ∂y u_y) v  for the ux test space, vs M_ux*ux + (coupling)
     Mux = assemble_matrix(model, mass_block(ux))
     div_form = WeakForm(bilinear=(q, trial) -> 0.0,
-                        linear=q -> field_gradient(q.state, :ux)[1] +
-                                    field_gradient(q.state, :uy)[2], symmetric=false)
+                        linear=q -> field_gradient(q.state, :ux)[1] + field_gradient(q.state, :uy)[2], symmetric=false)
     r = assemble_vector(model, loadform(ux, div_form); state=iterate)
     # compare against a direct region-quadrature reference of ∫ div(u_h) φ_i over ux dofs
     @test length(r) == n
@@ -726,11 +699,9 @@ end
                         WeakForm(linear=q -> (uk=value(q.state, u); gk=field_gradient(q.state, u);
                                               TestChannels(-1.0, (1 + uk^2) * gk))))
     tangent = block(u, u,
-                    WeakForm(bilinear=(q, trial) -> (uk=value(q.state, u);
-                                                     gk=field_gradient(q.state, u);
+                    WeakForm(bilinear=(q, trial) -> (uk=value(q.state, u); gk=field_gradient(q.state, u);
                                                      TestChannels(0.0,
-                                                                  (1 + uk^2) * trial.gradient +
-                                                                  2uk * trial.value * gk))))
+                                                                  (1 + uk^2) * trial.gradient + 2uk * trial.value * gk))))
     n = Unfitted.active_unknowns(model.dofs)
     c = [0.5 * sin(3i) for i in 1:n]
 
@@ -741,8 +712,7 @@ end
     for j in 1:n
         e[j] = h
         finite_difference[:, j] = (assemble_vector(model, residual; state=c + e, threaded=false) -
-                                   assemble_vector(model, residual; state=c - e, threaded=false)) /
-                                  2h
+                                   assemble_vector(model, residual; state=c - e, threaded=false)) / 2h
         e[j] = 0.0
     end
     @test !issymmetric(J)
@@ -753,8 +723,7 @@ end
     @test assemble_matrix(model, tangent; state=c, threaded=true) == J
     @test assemble_vector(model, residual; state=c, threaded=true) ==
           assemble_vector(model, residual; state=c, threaded=false)
-    @test assemble_matrix(model, tangent; state=solution(model, c; method=:test), threaded=false) ==
-          J
+    @test assemble_matrix(model, tangent; state=solution(model, c; method=:test), threaded=false) == J
 end
 
 @testset "q.point is numbered per region list; nquadpoints(; on=) is its size" begin
@@ -771,8 +740,7 @@ end
 
     seen_lo = Int[]
     seen_hi = Int[]
-    probe(sink) = WeakForm(bilinear=(q, trial, c) -> 0.0,
-                           linear=(q, c) -> (push!(sink, q.point); 0.0), symmetric=true,
+    probe(sink) = WeakForm(bilinear=(q, trial, c) -> 0.0, linear=(q, c) -> (push!(sink, q.point); 0.0), symmetric=true,
                            component_aware=true)
     lo = loadform(u, probe(seen_lo); on=lower)
     hi = loadform(u, probe(seen_hi); on=upper)
@@ -843,8 +811,7 @@ end
 
     # the same q.point appears (serial) during assembly at the same location
     xa = Dict{Int,eltype(values(xf))}()
-    probe = WeakForm(bilinear=(q, trial) -> 0.0, linear=q -> (xa[q.point]=q.x; 0.0),
-                     symmetric=false)
+    probe = WeakForm(bilinear=(q, trial) -> 0.0, linear=q -> (xa[q.point]=q.x; 0.0), symmetric=false)
     assemble_vector(model, loadform(u, probe); threaded=false)
     @test length(xa) == nq
     @test all(xa[p] ≈ xf[p] for p in 1:nq)
@@ -854,8 +821,7 @@ end
     mass_factor = factorize(assemble_matrix(model, mass_block(u)))
     proj_rhs = assemble_vector(model,
                                loadform(u,
-                                        WeakForm(bilinear=(q, trial) -> 0.0, linear=q -> H[q.point],
-                                                 symmetric=false)))
+                                        WeakForm(bilinear=(q, trial) -> 0.0, linear=q -> H[q.point], symmetric=false)))
     field_solution = solution(model, mass_factor \ proj_rhs; method=:proj)
     resampled = Float64[]
     foreach_quadrature_point(model; state=field_solution) do q
@@ -922,8 +888,7 @@ end
     stale = Solution(zeros(n), model.version + 1, Unfitted.SolverDiagnostics(:manual, 0.0, true))
     walk = q -> nothing
 
-    @test_throws DimensionMismatch assemble_vector(model, source_load(u; source=1.0);
-                                                   state=zeros(n + 1))
+    @test_throws DimensionMismatch assemble_vector(model, source_load(u; source=1.0); state=zeros(n + 1))
     @test_throws DimensionMismatch assemble_matrix(model, stiffness_block(u); state=zeros(n - 1))
     @test_throws DimensionMismatch foreach_quadrature_point(walk, model; state=zeros(n - 1))
     @test_throws ArgumentError assemble_matrix(model, stiffness_block(u); state=stale)
@@ -952,12 +917,10 @@ end
     c = [sin(3i) for i in 1:active_unknowns(model)]
     upper = boundary(axis=2, side=:upper)
     record(sink, name) = q -> begin
-        sink[q.point] = (keys(q), q.x, q.weight, q.normal, q.sides, value(q.state, name),
-                         field_gradient(q.state, name))
+        sink[q.point] = (keys(q), q.x, q.weight, q.normal, q.sides, value(q.state, name), field_gradient(q.state, name))
         return 0.0
     end
-    probe(sink, name) = WeakForm(bilinear=(q, trial) -> 0.0, linear=record(sink, name),
-                                 symmetric=false)
+    probe(sink, name) = WeakForm(bilinear=(q, trial) -> 0.0, linear=record(sink, name), symmetric=false)
 
     # A boundary walk with a state, its subdomain named by `field`.
     assembled, walked = Dict{Int,Any}(), Dict{Int,Any}()
@@ -1020,8 +983,7 @@ end
     g = 1.7
     u = field(:u, V)
 
-    problem = Problem((u,); blocks=(stiffness_block(u),),
-                      loads=(neumann(u, g; on=boundary(axis=1, side=:upper)),),
+    problem = Problem((u,); blocks=(stiffness_block(u),), loads=(neumann(u, g; on=boundary(axis=1, side=:upper)),),
                       dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower))])
     model = prepare(problem)
     sol = solve!(model)
@@ -1083,8 +1045,7 @@ end
     # singular up to the Dirichlet column elimination. The Robin
     # entries are detectable as a non-trivial perturbation of the
     # plain stiffness matrix's value at the (x=1) endpoint.
-    plain = prepare(poisson(V; source=0.0,
-                            dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower))]))
+    plain = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower))]))
     assemble!(plain)
     @test !(Matrix(matrix) ≈ Matrix(plain.matrix))
 end
@@ -1099,11 +1060,9 @@ end
     u = field(:u, V)
     src = 1.0
 
-    plain = prepare(poisson(V; source=src,
-                            dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower))]))
+    plain = prepare(poisson(V; source=src, dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower))]))
     explicit = prepare(Problem((u,); blocks=(stiffness_block(u),),
-                               loads=(source_load(u; source=src),
-                                      neumann(u, 0.0; on=boundary(axis=1, side=:upper)),
+                               loads=(source_load(u; source=src), neumann(u, 0.0; on=boundary(axis=1, side=:upper)),
                                       neumann(u, 0.0; on=boundary(axis=2, side=:lower)),
                                       neumann(u, 0.0; on=boundary(axis=2, side=:upper))),
                                dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower))]))
@@ -1159,8 +1118,7 @@ end
 
     # 2D scalar, higher order, symmetric.
     let V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=3)
-        model = prepare(poisson(V; source=x -> 1.0 + x[1],
-                                dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+        model = prepare(poisson(V; source=x -> 1.0 + x[1], dirichlet=[dirichlet(0.0; on=boundary(:all))]))
         _check_scatter_assemble!(model)
     end
 
@@ -1168,17 +1126,14 @@ end
     let V0 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2),
         V = overlay(V0, box((0.2, 0.25), (0.8, 0.75)); cells=(2, 2), order=3)
 
-        model = prepare(poisson(V; source=x -> 1.0 - x[2],
-                                dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+        model = prepare(poisson(V; source=x -> 1.0 - x[2], dirichlet=[dirichlet(0.0; on=boundary(:all))]))
         _check_scatter_assemble!(model)
     end
 
     # Vector field, component-unaware form: cross-component blocks are
     # structurally present in the pattern but always zero — the dropzeros
     # equivalence the scatter path must reproduce.
-    let V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2),
-        u = field(:u, V; components=2)
-
+    let V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2), u = field(:u, V; components=2)
         model = prepare(poisson(u; source=SVector(1.0, 2.0),
                                 dirichlet=[dirichlet(SVector(0.0, 0.0); on=boundary(:all))]))
         _check_scatter_assemble!(model)
@@ -1199,13 +1154,9 @@ end
 
     # Multi-field symmetric coupling block(c, u).
     let V = space(box((0.0,), (1.0,)); cells=2, order=1), u = field(:u, V), c = field(:c, V)
-        stiff = WeakForm(bilinear=(q, trial) -> TestChannels(0.0, trial.gradient), linear=q -> 0.0,
-                         symmetric=true)
-        coupling = WeakForm(bilinear=(q, trial) -> 0.5 * trial.value, linear=q -> 0.0,
-                            symmetric=true)
-        model = prepare(Problem((u, c);
-                                blocks=(block(u, u, stiff), block(c, c, stiff),
-                                        block(c, u, coupling)),
+        stiff = WeakForm(bilinear=(q, trial) -> TestChannels(0.0, trial.gradient), linear=q -> 0.0, symmetric=true)
+        coupling = WeakForm(bilinear=(q, trial) -> 0.5 * trial.value, linear=q -> 0.0, symmetric=true)
+        model = prepare(Problem((u, c); blocks=(block(u, u, stiff), block(c, c, stiff), block(c, u, coupling)),
                                 loads=(loadform(u, stiff), loadform(c, stiff)),
                                 dirichlet=[dirichlet(0.0; on=boundary(:all), field=u),
                                            dirichlet(0.0; on=boundary(:all), field=c)]))
@@ -1228,8 +1179,7 @@ end
     # produced linear-constraint pivots — this fixture exercises the
     # B-spline assembly path regardless.
     let V0 = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3, basis=bspline()),
-        V = overlay(V0, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3,
-                    basis=bspline(continuity=1))
+        V = overlay(V0, box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3, basis=bspline(continuity=1))
 
         model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
         _check_scatter_assemble!(model)
@@ -1289,8 +1239,7 @@ end
     @test Unfitted.has_linear_constraints(model.dofs)
     layout = Unfitted._field_layout(model.dofs, :u).dofs
     @test any(layout.pivots) do expansion
-        return !isempty(expansion) &&
-               any(((other, _),) -> Unfitted.constrained_value(layout, other) != 0, expansion)
+        return !isempty(expansion) && any(((other, _),) -> Unfitted.constrained_value(layout, other) != 0, expansion)
     end
 
     # Threaded assembly is bit-identical to serial on the pivot path too, and
@@ -1376,8 +1325,7 @@ end
     # are transposes up to summation order, and a defect in only the row step or
     # only the column step breaks that.
     convect(q, trial) = TestChannels(trial.gradient[1] + q.x[2] * trial.value, 0.1 * trial.gradient)
-    adjoint(q, trial) = TestChannels(q.x[2] * trial.value,
-                                     SVector(trial.value, 0.0) + 0.1 * trial.gradient)
+    adjoint(q, trial) = TestChannels(q.x[2] * trial.value, SVector(trial.value, 0.0) + 0.1 * trial.gradient)
     forward = block(u, u, WeakForm(bilinear=convect, symmetric=false))
     backward = block(u, u, WeakForm(bilinear=adjoint, symmetric=false))
     A = assemble_matrix(model, forward; threaded=false)
@@ -1465,21 +1413,17 @@ end
     model = prepare(Problem((a, b, c, d)))
     forms = (WeakForm(bilinear=(q, trial) -> TestChannels(0.0, trial.gradient), linear=q -> 1.0),
              WeakForm(bilinear=(q, trial) -> trial.gradient[1], linear=q -> q.x[1]),
-             WeakForm(bilinear=(q, trial) -> -trial.gradient[2],
-                      linear=q -> TestChannels(0.0, q.x)),
+             WeakForm(bilinear=(q, trial) -> -trial.gradient[2], linear=q -> TestChannels(0.0, q.x)),
              WeakForm(bilinear=(q, trial) -> trial.value, linear=q -> q.x[2]^2))
-    blocks = (block(a, a, forms[1]), block(b, c, forms[2]), block(c, b, forms[3]),
-              block(d, d, forms[4]))
-    loads = (loadform(a, forms[1]), loadform(b, forms[2]), loadform(c, forms[3]),
-             loadform(d, forms[4]))
+    blocks = (block(a, a, forms[1]), block(b, c, forms[2]), block(c, b, forms[3]), block(d, d, forms[4]))
+    loads = (loadform(a, forms[1]), loadform(b, forms[2]), loadform(c, forms[3]), loadform(d, forms[4]))
 
     for (assemble, combined_forms) in ((assemble_matrix, blocks), (assemble_vector, loads))
         combined = assemble(model, combined_forms; threaded=false)
         @test combined == sum(form -> assemble(model, (form,); threaded=false), combined_forms)
         @test assemble(model, combined_forms; threaded=true) == combined
 
-        separate_bytes = sum(form -> _serial_assembly_bytes(assemble, model, (form,)),
-                             combined_forms)
+        separate_bytes = sum(form -> _serial_assembly_bytes(assemble, model, (form,)), combined_forms)
         @test _serial_assembly_bytes(assemble, model, combined_forms) ≤ separate_bytes
     end
 end
@@ -1589,8 +1533,7 @@ end
     V = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(2, 2, 2), order=1)
     u = field(:u, V)
     prepared = boundary(axis=1, side=:lower)
-    model = prepare(Problem((u,); blocks=(stiffness_block(u),),
-                            loads=(neumann(u, 1.0; on=prepared),),
+    model = prepare(Problem((u,); blocks=(stiffness_block(u),), loads=(neumann(u, 1.0; on=prepared),),
                             dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:upper))]))
     assemble!(model)
     space_ = model.problem.space
@@ -1600,10 +1543,10 @@ end
     # 20 distinct selectors, none of them named by the problem: the 12 edges and
     # the 8 corners of the cube.
     side(axis, upper) = (axis=axis, side=upper ? :upper : :lower)
-    edges = [boundary(side(a, s), side(b, t)) for (a, b) in ((1, 2), (1, 3), (2, 3))
-             for s in (false, true) for t in (false, true)]
-    corners = [boundary(side(1, s), side(2, t), side(3, r)) for s in (false, true)
-               for t in (false, true) for r in (false, true)]
+    edges = [boundary(side(a, s), side(b, t)) for (a, b) in ((1, 2), (1, 3), (2, 3)) for s in (false, true)
+             for t in (false, true)]
+    corners = [boundary(side(1, s), side(2, t), side(3, r)) for s in (false, true) for t in (false, true)
+               for r in (false, true)]
     selectors = vcat(edges, corners)
     @test length(unique(selectors)) == 20
     @test !any(s -> isequal(s, prepared), selectors)
@@ -1637,8 +1580,7 @@ function _growing_facet_passes(cells::Int)
     u = field(:u, space(box((0.0, 0.0), (1.0, 1.0)); cells=(cells, cells), order=3))
     form = mass_form(coefficient=1.0)
     blocks = (block(u, u, form; on=boundary(axis=1, side=:lower)),
-              block(u, u, form; on=boundary(:all; except=(axis=2, side=:upper))),
-              block(u, u, form; on=boundary(:all)))
+              block(u, u, form; on=boundary(:all; except=(axis=2, side=:upper))), block(u, u, form; on=boundary(:all)))
     return prepare(Problem((u,))), blocks
 end
 
@@ -1732,8 +1674,8 @@ end
     # a(u, v) = ∫ (∂ₓu + y·u) v + 0.1 ∇u·∇v, unsymmetric through ∂ₓu v.
     convect(q, trial) = TestChannels(trial.gradient[1] + q.x[2] * trial.value, 0.1 * trial.gradient)
     convection = WeakForm(bilinear=convect, linear=q -> 1 + q.x[1], symmetric=false)
-    unsymmetric = prepare(Problem((u,); blocks=(block(u, u, convection),),
-                                  loads=(loadform(u, convection),), dirichlet=[lift]))
+    unsymmetric = prepare(Problem((u,); blocks=(block(u, u, convection),), loads=(loadform(u, convection),),
+                                  dirichlet=[lift]))
     @test !unsymmetric.problem.symmetric
     for model in (symmetric, unsymmetric)
         assemble!(model; threaded=false)
@@ -1770,8 +1712,7 @@ end
     V = space(omega; cells=(4, 4), order=2)
     u = field(:u, V)
     robin = block(u, u, mass_form(coefficient=2.0); on=boundary(axis=1, side=:upper))
-    target = prepare(Problem((u,); blocks=(stiffness_block(u), robin),
-                             loads=(source_load(u; source=1.0),),
+    target = prepare(Problem((u,); blocks=(stiffness_block(u), robin), loads=(source_load(u; source=1.0),),
                              dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower))]))
     solve!(target)
     own = only(target.assembly.patterns).second

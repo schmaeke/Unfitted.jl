@@ -124,8 +124,7 @@ if Base.identify_package("BasicBSpline") === nothing
         if !needs_dev
             manifest = joinpath(env, "Manifest.toml")
             entry = isfile(manifest) ? get(Pkg.TOML.parsefile(manifest), "deps", nothing) : nothing
-            recorded = entry === nothing ? nothing :
-                       get(first(get(entry, "Unfitted", [Dict()])), "path", nothing)
+            recorded = entry === nothing ? nothing : get(first(get(entry, "Unfitted", [Dict()])), "path", nothing)
             needs_dev = recorded === nothing || normpath(recorded) != normpath(repo)
         end
         if needs_dev
@@ -145,8 +144,8 @@ using BasicBSpline
 using LinearAlgebra
 using SparseArrays
 
-using Unfitted: SVector, SMatrix, active_unknowns, raw_dof_count, volume, problem_spaces,
-                moment_fit_rule, _diffusion_flux
+using Unfitted: SVector, SMatrix, active_unknowns, raw_dof_count, volume, problem_spaces, moment_fit_rule,
+                _diffusion_flux
 
 # ── Formatting ────────────────────────────────────────────────────────────────
 #
@@ -182,8 +181,7 @@ pointlabel(p) = "(" * join((repr(Float64(c)) for c in p), ", ") * ")"
 
 const CASE_MARKS = String[]
 
-function case(id::Integer, label::AbstractString, mark::AbstractString; note=nothing,
-              wrong_because=nothing)
+function case(id::Integer, label::AbstractString, mark::AbstractString; note=nothing, wrong_because=nothing)
     push!(CASE_MARKS, mark)
     println()
     println("CASE ", lpad(id, 2, '0'), "  ", rpad(label, 38), "  ", mark)
@@ -402,12 +400,10 @@ end
 # both are ordered by the layout's own field and component order.
 function emit_dirichlet_projection(model)
     d = diagnostics(model)
-    emit("dirichlet.nonzero_value_count",
-         count(!iszero, only(model.dofs.fields).dofs.constrained_values))
+    emit("dirichlet.nonzero_value_count", count(!iszero, only(model.dofs.fields).dofs.constrained_values))
     emit("dirichlet.trace_factors", d.dirichlet_trace_factors)
     emit("dirichlet.unsupported_dof_count", d.unsupported_dirichlet_dof_count)
-    emit("dirichlet.unsupported_dofs",
-         [(r.field, r.component, r.raw) for r in d.unsupported_dirichlet_dofs])
+    emit("dirichlet.unsupported_dofs", [(r.field, r.component, r.raw) for r in d.unsupported_dirichlet_dofs])
     return nothing
 end
 
@@ -479,8 +475,8 @@ end
 # difference between them can only come from `_diffusion_flux`.
 function diffusion_case(V, diffusion, source)
     u = field(:u, V)
-    model = prepare(Problem((u,); blocks=(stiffness_block(u; diffusion),),
-                            loads=(source_load(u; source),), dirichlet=zero_dirichlet()))
+    model = prepare(Problem((u,); blocks=(stiffness_block(u; diffusion),), loads=(source_load(u; source),),
+                            dirichlet=zero_dirichlet()))
     return model, solve!(model)
 end
 
@@ -549,8 +545,7 @@ function main()
 
     # ── 08 ── D = 2, B-splines.
     case(8, "d2-bspline-p3", "MUST-NOT-CHANGE")
-    poisson_case(space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=3, basis=bspline()), f2d,
-                 u2d, P2)
+    poisson_case(space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=3, basis=bspline()), f2d, u2d, P2)
 
     # ── 09 ── D = 2, B-splines with an overlay: the family's constraint path.
     case(9, "d2-bspline-overlay", "MUST-NOT-CHANGE")
@@ -561,8 +556,7 @@ function main()
 
     # ── 10 ── D = 3, base level only.
     case(10, "d3-legendre-p2", "MUST-NOT-CHANGE")
-    poisson_case(space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(2, 2, 2), order=2), f3d, u3d,
-                 P3)
+    poisson_case(space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(2, 2, 2), order=2), f3d, u3d, P3)
 
     # ── 11 ── D = 3 with an overlay.
     case(11, "d3-legendre-overlay", "MUST-NOT-CHANGE")
@@ -581,8 +575,7 @@ function main()
 
         V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=p)
         u = field(:u, V)
-        model = prepare(Problem((u,); blocks=(stiffness_block(u), mass_block(u)),
-                                loads=(source_load(u; source=1.0),)))
+        model = prepare(Problem((u,); blocks=(stiffness_block(u), mass_block(u)), loads=(source_load(u; source=1.0),)))
         solution = solve!(model)
         emit_model(model)
         emit("exact_area", Float64(pi * 0.3^2))
@@ -590,16 +583,13 @@ function main()
     end
 
     # ── 13 ── FCM with α-blended fictitious quadrature.
-    case(13, "d2-fcm-disc-alpha", "MUST-NOT-CHANGE",
-         note="see case 12 on moment_fit_residual_max under fix #2.")
+    case(13, "d2-fcm-disc-alpha", "MUST-NOT-CHANGE", note="see case 12 on moment_fit_residual_max under fix #2.")
     let phi = x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.3,
-        p = physical_domain(phi; lipschitz=1.0, alpha=0.05, subcell_length_scale=1 / 32,
-                            max_depth=4)
+        p = physical_domain(phi; lipschitz=1.0, alpha=0.05, subcell_length_scale=1 / 32, max_depth=4)
 
         V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=p)
         u = field(:u, V)
-        model = prepare(Problem((u,); blocks=(stiffness_block(u), mass_block(u)),
-                                loads=(source_load(u; source=1.0),)))
+        model = prepare(Problem((u,); blocks=(stiffness_block(u), mass_block(u)), loads=(source_load(u; source=1.0),)))
         solution = solve!(model)
         emit_model(model)
         emit_solution(model, solution; points=((0.5, 0.5), (0.4, 0.6)))
@@ -609,19 +599,14 @@ function main()
     #          healthy half of #1: one subdomain, so selector resolution has
     #          nothing to get wrong, and the fix must leave it alone.
     case(14, "d2-neumann-facet", "MUST-NOT-CHANGE")
-    let V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2),
-        u = field(:u, V),
-        exact = x -> x[1]
-
+    let V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2), u = field(:u, V), exact = x -> x[1]
         model = prepare(Problem((u,); blocks=(stiffness_block(u),),
                                 loads=(neumann(u, 1.0; on=boundary(axis=1, side=:upper)),),
                                 dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower))]))
         solution = solve!(model)
         emit_model(model)
-        emit("facet_measure.x_upper",
-             boundary_integral(q -> 1.0, model; on=boundary(axis=1, side=:upper)))
-        emit("facet_flux.x_upper",
-             boundary_integral(q -> q.normal[1], model; on=boundary(axis=1, side=:upper)))
+        emit("facet_measure.x_upper", boundary_integral(q -> 1.0, model; on=boundary(axis=1, side=:upper)))
+        emit("facet_flux.x_upper", boundary_integral(q -> q.normal[1], model; on=boundary(axis=1, side=:upper)))
         emit_solution(model, solution; exact, points=P2)
     end
 
@@ -645,8 +630,7 @@ function main()
                                            dirichlet(0.0; on=boundary(:all), field=:u2)]))
         solution = solve!(model)
         emit_model(model)
-        emit_solution(model, solution;
-                      fields=((u1, ((0.5, 0.5), (0.25, 0.75))), (u2, ((2.5, 0.5), (2.25, 0.75)))))
+        emit_solution(model, solution; fields=((u1, ((0.5, 0.5), (0.25, 0.75))), (u2, ((2.5, 0.5), (2.25, 0.75)))))
     end
 
     # ── 16 ── Nonzero Dirichlet data on two value-equal `boundary(:all)`
@@ -691,15 +675,12 @@ function main()
     #          control against which case 26's deficit is read.
     case(17, "d2-surface-in-cell", "MUST-NOT-CHANGE")
     let V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2),
-        square = polyline_mesh([SVector(0.03, 0.03), SVector(0.10, 0.03), SVector(0.10, 0.10),
-                                SVector(0.03, 0.10)]; closed=true),
+        square = polyline_mesh([SVector(0.03, 0.03), SVector(0.10, 0.03), SVector(0.10, 0.10), SVector(0.03, 0.10)];
+                               closed=true),
         u = field(:u, V)
 
-        model = prepare(Problem((u,);
-                                blocks=(stiffness_block(u),
-                                        block(u, u, mass_form(coefficient=2.0); on=square)),
-                                loads=(source_load(u; source=1.0),),
-                                dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+        model = prepare(Problem((u,); blocks=(stiffness_block(u), block(u, u, mass_form(coefficient=2.0); on=square)),
+                                loads=(source_load(u; source=1.0),), dirichlet=[dirichlet(0.0; on=boundary(:all))]))
         solution = solve!(model)
         emit_model(model)
         emit("surface_measure", boundary_integral(q -> 1.0, model; on=square))
@@ -769,9 +750,7 @@ function main()
     #          healthy neighbour of cases 23/24, so #3's guard can be shown not
     #          to fire on a legitimately stretched mesh.
     case(20, "d2-anisotropic-healthy", "MUST-NOT-CHANGE")
-    let V = space(box((0.0, 0.0), (1.0, 1.0e-3)); cells=(4, 4), order=2),
-        exact = x -> x[1] * (1 - x[1])
-
+    let V = space(box((0.0, 0.0), (1.0, 1.0e-3)); cells=(4, 4), order=2), exact = x -> x[1] * (1 - x[1])
         model = prepare(poisson(V; source=f1d, dirichlet=zero_dirichlet()))
         solution = solve!(model)
         emit("h_axis2", 1.0e-3 / 4)
@@ -799,10 +778,8 @@ function main()
         model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
                                 loads=(neumann(u1, 1.0; on=boundary(axis=1, side=:upper)),
                                        neumann(u2, 1.0; on=boundary(axis=1, side=:upper))),
-                                dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower),
-                                                     field=:u1),
-                                           dirichlet(0.0; on=boundary(axis=1, side=:lower),
-                                                     field=:u2)]))
+                                dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower), field=:u1),
+                                           dirichlet(0.0; on=boundary(axis=1, side=:lower), field=:u2)]))
         solution = solve!(model)
         emit("facet_cache_keys", length(model.facet_regions))
         emit_model(model)
@@ -810,8 +787,7 @@ function main()
         half = n ÷ 2
         emit_vector("rhs.block1", model.rhs[1:half])
         emit_vector("rhs.block2", model.rhs[(half+1):end])
-        emit_solution(model, solution;
-                      fields=((u1, ((1.0, 0.5), (0.5, 0.5))), (u2, ((3.0, 0.5), (2.5, 0.5)))))
+        emit_solution(model, solution; fields=((u1, ((1.0, 0.5), (0.5, 0.5))), (u2, ((3.0, 0.5), (2.5, 0.5)))))
         emit("u1_exact(1.0, 0.5)", 1.0)
         emit("u2_exact(3.0, 0.5)", 1.0)
     end
@@ -830,8 +806,7 @@ function main()
 
         V = space(box((0.0, 0.0), (S, S)); cells=(4, 4), order=2, physical=p)
         u = field(:u, V)
-        model = prepare(Problem((u,); blocks=(stiffness_block(u), mass_block(u)),
-                                loads=(source_load(u; source=1.0),)))
+        model = prepare(Problem((u,); blocks=(stiffness_block(u), mass_block(u)), loads=(source_load(u; source=1.0),)))
         assemble!(model)
         emit("length_scale", S)
         emit("exact_area", Float64(pi * (0.3S)^2))
@@ -859,8 +834,7 @@ function main()
         emit("mesh_cells", (4, 8))
         model = attempt("prepare",
                         () -> begin
-                            V = space(box((0.0, 0.0), (1.0, H)); cells=(4, 8), order=3,
-                                      basis=bspline())
+                            V = space(box((0.0, 0.0), (1.0, H)); cells=(4, 8), order=3, basis=bspline())
                             prepare(poisson(V; source=f1d, dirichlet=zero_dirichlet()))
                         end)
         if model !== nothing
@@ -882,8 +856,7 @@ function main()
     let H = 1.0e-7, exact = x -> x[1] * (1 - x[1])
         emit("h_axis2", H / 8)
         emit("tolerance.merge", sqrt(eps(Float64)))
-        model = attempt("prepare",
-                        () -> begin
+        model = attempt("prepare", () -> begin
                             V = space(box((0.0, 0.0), (1.0, H)); cells=(4, 8), order=2)
                             prepare(poisson(V; source=f1d, dirichlet=zero_dirichlet()))
                         end)
@@ -904,10 +877,7 @@ function main()
                        "over-integration of the cell. lipschitz = 0.0 is also accepted on the " *
                        "tree path where the callable path throws. After the fix the discarding " *
                        "combination must be rejected outright.")
-    let region = box((0.0, 0.0), (1.0, 1.0)),
-        order = (3, 3),
-        phi = x -> 0.16 - hypot(x[1] - 0.25, x[2] - 0.25)   # Ω = outside the disc
-
+    let region = box((0.0, 0.0), (1.0, 1.0)), order = (3, 3), phi = x -> 0.16 - hypot(x[1] - 0.25, x[2] - 0.25)   # Ω = outside the disc
         exact_area = 1 - pi * 0.16^2
 
         report = (tag, domain) -> begin
@@ -928,17 +898,13 @@ function main()
         # integral below, after the fix it throws and there is nothing to report.
         # Every other configuration here is legal on both sides of the fix.
         kwarg_on_tree = attempt("kwarg_on_tree.construct",
-                                () -> physical_domain(leaf(phi); lipschitz=1.0,
-                                                      subcell_length_scale=0.1))
+                                () -> physical_domain(leaf(phi); lipschitz=1.0, subcell_length_scale=0.1))
         kwarg_on_tree === nothing || report("kwarg_on_tree", kwarg_on_tree)
-        report("leaf_carries_L",
-               physical_domain(leaf(phi; lipschitz=1.0); subcell_length_scale=0.1))
+        report("leaf_carries_L", physical_domain(leaf(phi; lipschitz=1.0); subcell_length_scale=0.1))
         report("callable", physical_domain(phi; lipschitz=1.0, subcell_length_scale=0.1))
         report("uncertified", physical_domain(leaf(phi); subcell_length_scale=0.1))
-        attempt("tree_lipschitz_0",
-                () -> physical_domain(leaf(phi); lipschitz=0.0, subcell_length_scale=0.1))
-        attempt("callable_lipschitz_0",
-                () -> physical_domain(phi; lipschitz=0.0, subcell_length_scale=0.1))
+        attempt("tree_lipschitz_0", () -> physical_domain(leaf(phi); lipschitz=0.0, subcell_length_scale=0.1))
+        attempt("callable_lipschitz_0", () -> physical_domain(phi; lipschitz=0.0, subcell_length_scale=0.1))
     end
 
     # ── 26 ── #9. A closed 24-gon inscribed in a circle of radius 0.3, whose
@@ -955,11 +921,8 @@ function main()
         exact_perimeter = N * 2R * sin(pi / N)
         V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(8, 8), order=2)
         u = field(:u, V)
-        model = prepare(Problem((u,);
-                                blocks=(stiffness_block(u),
-                                        block(u, u, mass_form(coefficient=1.0); on=Γ)),
-                                loads=(source_load(u; source=1.0),),
-                                dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+        model = prepare(Problem((u,); blocks=(stiffness_block(u), block(u, u, mass_form(coefficient=1.0); on=Γ)),
+                                loads=(source_load(u; source=1.0),), dirichlet=[dirichlet(0.0; on=boundary(:all))]))
         solution = solve!(model)
         measure = boundary_integral(q -> 1.0, model; on=Γ)
         emit("polygon_segments", N)
@@ -996,18 +959,12 @@ function main()
         cpl = couple(u1, u2, Γ, mass_form(coefficient=β))
         model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2), cpl...),
                                 loads=(source_load(u1; source=f2d), source_load(u2; source=f2d)),
-                                dirichlet=[dirichlet(0.0; on=boundary(axis=2, side=:lower),
-                                                     field=:u1),
-                                           dirichlet(0.0; on=boundary(axis=1, side=:lower),
-                                                     field=:u1),
-                                           dirichlet(0.0; on=boundary(axis=1, side=:upper),
-                                                     field=:u1),
-                                           dirichlet(0.0; on=boundary(axis=2, side=:upper),
-                                                     field=:u2),
-                                           dirichlet(0.0; on=boundary(axis=1, side=:lower),
-                                                     field=:u2),
-                                           dirichlet(0.0; on=boundary(axis=1, side=:upper),
-                                                     field=:u2)]))
+                                dirichlet=[dirichlet(0.0; on=boundary(axis=2, side=:lower), field=:u1),
+                                           dirichlet(0.0; on=boundary(axis=1, side=:lower), field=:u1),
+                                           dirichlet(0.0; on=boundary(axis=1, side=:upper), field=:u1),
+                                           dirichlet(0.0; on=boundary(axis=2, side=:upper), field=:u2),
+                                           dirichlet(0.0; on=boundary(axis=1, side=:lower), field=:u2),
+                                           dirichlet(0.0; on=boundary(axis=1, side=:upper), field=:u2)]))
         solution = solve!(model)
         # Read the interface-region cache through the very object that keys it:
         # the cache is an `IdDict`, so iterating it would expose identity-hash
@@ -1053,8 +1010,7 @@ function main()
             V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=p)
             V = overlay(V, ob; cells=(2, 2), order=2)
             u = field(:u, V)
-            prepare(Problem((u,); blocks=(stiffness_block(u), mass_block(u)),
-                            loads=(source_load(u; source=1.0),)))
+            prepare(Problem((u,); blocks=(stiffness_block(u), mass_block(u)), loads=(source_load(u; source=1.0),)))
         end,
         start_box = box((0.55, 0.55), (0.95, 0.95)),
         to_box = box((0.05, 0.05), (0.45, 0.45))
@@ -1080,14 +1036,12 @@ function main()
         emit_matrix("direct.matrix", direct.matrix)
         emit_vector("direct.coefficients", direct_solution.coefficients)
         emit("match.active_unknowns", active_unknowns(model) == active_unknowns(direct))
-        emit("match.mask",
-             maskstr(active_cells(model; level=2)) == maskstr(active_cells(direct; level=2)))
+        emit("match.mask", maskstr(active_cells(model; level=2)) == maskstr(active_cells(direct; level=2)))
         emit("match.inactive_cell_counts",
              diagnostics(model).inactive_cell_counts == diagnostics(direct).inactive_cell_counts)
         emit("match.reduced_mode_counts",
              diagnostics(model).reduced_mode_counts == diagnostics(direct).reduced_mode_counts)
-        emit("match.regions",
-             diagnostics(model).integration_regions == diagnostics(direct).integration_regions)
+        emit("match.regions", diagnostics(model).integration_regions == diagnostics(direct).integration_regions)
         emit("match.domain_measure", domain_measure(model) == domain_measure(direct))
         emit("match.matrix_nnz", nnz(model.matrix) == nnz(direct.matrix))
         emit("match.matrix_values", nonzeros(model.matrix) == nonzeros(direct.matrix))
@@ -1100,8 +1054,8 @@ function main()
          wrong_because="moved returns a model with subdomain_spaces = 1 and field :u2 living " *
                        "on [0,1]^2 instead of [2,3]x[0,1], and solve! accepts it. After the " *
                        "fix `moved` must throw ArgumentError, as `move!` already does.")
-    let V1 = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2),
-                     box((0.25, 0.25), (0.75, 0.75)); cells=(2, 2), order=2),
+    let V1 = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2), box((0.25, 0.25), (0.75, 0.75));
+                     cells=(2, 2), order=2),
         V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(2, 2), order=2),
         u1 = field(:u1, V1),
         u2 = field(:u2, V2)
@@ -1143,8 +1097,7 @@ function main()
               "space that cannot reproduce a constant.")
     let V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(8, 8), order=2), mask = falses(4, 4)
         mask[1:2, 1:2] .= true
-        V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4), order=3, basis=bspline(),
-                    active=mask)
+        V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(4, 4), order=3, basis=bspline(), active=mask)
         model, _ = poisson_case(V, f2d, u2d, P2)
         emit("active_cells.level2", maskstr(active_cells(model; level=2)))
     end
@@ -1197,8 +1150,7 @@ function main()
         emit_matrix("static.matrix", static_model.matrix)
         emit_solution(static_model, static_solution; exact=u2d, points=P2, prefix="static.")
         emit("dense_equals_static.matrix", model.matrix == static_model.matrix)
-        emit("dense_equals_static.coefficients",
-             solution.coefficients == static_solution.coefficients)
+        emit("dense_equals_static.coefficients", solution.coefficients == static_solution.coefficients)
 
         # The isotropic branch at a non-unit coefficient, which no other case
         # reaches: 2.5 f2d is the source that keeps u2d exact for diffusion 2.5.
@@ -1297,8 +1249,7 @@ function main()
         g = x -> sin(x[1] + 2x[2])
 
         V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=p)
-        model = prepare(poisson(V; source=x -> 5 * sin(x[1] + 2x[2]),
-                                dirichlet=[dirichlet(g; on=boundary(:all))]))
+        model = prepare(poisson(V; source=x -> 5 * sin(x[1] + 2x[2]), dirichlet=[dirichlet(g; on=boundary(:all))]))
         solution = solve!(model)
         emit_model(model)
         emit_facet_rule(model)
@@ -1317,8 +1268,7 @@ function main()
         # its faces and the `pinv` transition above would not be reachable here.
         # The two faces are mirror images through x₁ ↔ x₂ and `hypot` is symmetric,
         # so one φ reading covers both.
-        emit("corner_cell.classification",
-             classify_cell(p, cell_box(V, CartesianIndex(1, 1); level=1)))
+        emit("corner_cell.classification", classify_cell(p, cell_box(V, CartesianIndex(1, 1); level=1)))
         emit("corner_cell.active", active_cells(model; level=1)[1, 1])
         emit("corner_cell.face_phi_at_far_end", levelset_value(p, SVector(0.0, 0.25)))
         emit_solution(model, solution; exact=g, points=P2)

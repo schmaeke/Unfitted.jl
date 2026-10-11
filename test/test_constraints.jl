@@ -43,8 +43,7 @@ end
     # `sides` is a Vector, so hashing must be by value, not by the vector's
     # identity — a fresh selector must find a cache entry a prepared model made.
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
-    model = prepare(poisson(V; source=0.0,
-                            dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:upper))]))
+    model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:upper))]))
     @test haskey(model.facet_regions, (boundary(axis=1, side=:upper), model.problem.space))
 end
 
@@ -63,8 +62,7 @@ end
                                                 dirichlet(SVector(0.0, 0.1); on=top, field=u)]))
 
     # constraining one component leaves the top u_x dofs active
-    @test Unfitted.active_unknowns(per_component.dofs) >
-          Unfitted.active_unknowns(all_components.dofs)
+    @test Unfitted.active_unknowns(per_component.dofs) > Unfitted.active_unknowns(all_components.dofs)
 
     solution = solve!(per_component)
     @test isposdef(Symmetric(Matrix(per_component.matrix)))
@@ -83,8 +81,7 @@ end
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2)
     plain = Unfitted.dof_layout(V; components=2)
     for component in (0, 3), value in (0.0, 0.5, SVector(0.5, 0.25))
-        layout = Unfitted.dof_layout(V; dirichlet=[dirichlet(value; on=boundary(:all), component)],
-                                     components=2)
+        layout = Unfitted.dof_layout(V; dirichlet=[dirichlet(value; on=boundary(:all), component)], components=2)
         @test !any(layout.physical_dirichlet)
         @test layout.active_component == plain.active_component
         @test all(iszero, layout.constrained_values)
@@ -101,8 +98,7 @@ end
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
     u = field(:u, V; components=2)
     model = prepare(poisson(u; source=SVector(0.0, 0.0),
-                            dirichlet=[dirichlet(0.1; on=boundary(axis=2, side=:upper), field=u,
-                                                 component=2)]))
+                            dirichlet=[dirichlet(0.1; on=boundary(axis=2, side=:upper), field=u, component=2)]))
     layout = model.dofs
     dofs = only(layout.fields).dofs
 
@@ -178,8 +174,7 @@ end
     @test Unfitted.raw_dof_count(layout) == 17
     @test Unfitted.active_unknowns(layout) == 1
     @test count(!iszero, active) == 1
-    @test_throws ArgumentError space(box((0.0, 0.0), (1.0, 1.0)); cells=(1, 1), order=(2, 3),
-                                     mode=:trunk)
+    @test_throws ArgumentError space(box((0.0, 0.0), (1.0, 1.0)); cells=(1, 1), order=(2, 3), mode=:trunk)
 
     V2 = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(1, 1))
     overlay_active = Unfitted.active_cell_dofs(Unfitted.dof_layout(V2), 2, CartesianIndex(1, 1))
@@ -211,9 +206,7 @@ end
     V = overlay(V, box((0.0, 0.25), (0.5, 0.75)); cells=(1, 1), order=2)
     layout = Unfitted.dof_layout(V; dirichlet=[dirichlet(1.0; on=boundary(axis=1, side=:lower))])
     overlay_raw = Unfitted.cell_dofs(layout, 2, CartesianIndex(1, 1))
-    artificial = [raw
-                  for raw in overlay_raw
-                  if Unfitted.constraint_kind(layout, raw) in (:overlay, :mixed)]
+    artificial = [raw for raw in overlay_raw if Unfitted.constraint_kind(layout, raw) in (:overlay, :mixed)]
 
     @test !isempty(artificial)
     @test all(iszero(Unfitted.constrained_value(layout, raw)) for raw in artificial)
@@ -229,8 +222,7 @@ end
     @test Unfitted.active_unknowns(layout3_dirichlet) == 0
 
     V4 = space(box((0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0, 1.0)); cells=(1, 1, 1, 1), order=1)
-    V4 = overlay(V4, box((0.25, 0.25, 0.25, 0.25), (0.75, 0.75, 0.75, 0.75)); cells=(1, 1, 1, 1),
-                 order=1)
+    V4 = overlay(V4, box((0.25, 0.25, 0.25, 0.25), (0.75, 0.75, 0.75, 0.75)); cells=(1, 1, 1, 1), order=1)
     layout4 = Unfitted.dof_layout(V4)
 
     @test Unfitted.raw_dof_count(layout4) == 32
@@ -250,8 +242,7 @@ end
     rungs = Unfitted.dof_layout(ladder(dom; cells=(4, 4), order=2, depth=3, splits=2))
     for layout in (stack, rungs)
         @test reduce(vcat, collect.(layout.level_raws)) == eachindex(layout.raw_keys)
-        @test all(layout.raw_keys[r].level == id for id in eachindex(layout.level_raws)
-                  for r in layout.level_raws[id])
+        @test all(layout.raw_keys[r].level == id for id in eachindex(layout.level_raws) for r in layout.level_raws[id])
     end
     @test length.(stack.level_raws) == [13^2, 13^2, 5^2]
     # A ladder's unwoken rungs enumerate nothing: their ranges are empty.
@@ -260,12 +251,11 @@ end
 
     # A subdomain reindexed into a higher id block holds no raw below it, and the
     # leading slot reads empty rather than undefined.
-    V2 = overlay(space(box((2.0, 0.0), (3.0, 1.0)); cells=3, order=3),
-                 box((2.25, 0.25), (2.75, 0.75)); cells=2, order=2)
+    V2 = overlay(space(box((2.0, 0.0), (3.0, 1.0)); cells=3, order=3), box((2.25, 0.25), (2.75, 0.75)); cells=2,
+                 order=2)
     u1, u2 = field(:u1, space(dom; cells=4, order=2)), field(:u2, V2)
     model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
-                            loads=(source_load(u1; source=x -> 1.0),
-                                   source_load(u2; source=x -> 1.0))))
+                            loads=(source_load(u1; source=x -> 1.0), source_load(u2; source=x -> 1.0))))
     second = model.dofs.fields[2]
     @test second.level_ids == 2:3
     @test second.dofs.level_raws == [1:0, 1:100, 101:125]
@@ -281,9 +271,7 @@ end
 
     layout = Unfitted.dof_layout(V; dirichlet=[dirichlet(0.7; on=corner)])
     # Exactly one dof is constrained, and it is the vertex at (0, 0).
-    matched = [(raw, c)
-               for raw in 1:Unfitted.raw_dof_count(layout), c in 1:1
-               if layout.physical_dirichlet[raw, c]]
+    matched = [(raw, c) for raw in 1:Unfitted.raw_dof_count(layout), c in 1:1 if layout.physical_dirichlet[raw, c]]
     @test length(matched) == 1
     raw_corner = matched[1][1]
     @test Unfitted.constrained_value(layout, raw_corner) ≈ 0.7
@@ -296,9 +284,7 @@ end
     layout = Unfitted.dof_layout(V; dirichlet=[dirichlet(x -> x[1] + 10x[2]; on=pin)])
 
     # The vertex mode at the top-right corner gets constrained value g(2,3) = 32.
-    matched = [(raw, c)
-               for raw in 1:Unfitted.raw_dof_count(layout), c in 1:1
-               if layout.physical_dirichlet[raw, c]]
+    matched = [(raw, c) for raw in 1:Unfitted.raw_dof_count(layout), c in 1:1 if layout.physical_dirichlet[raw, c]]
     @test length(matched) == 1
     @test Unfitted.constrained_value(layout, matched[1][1]) ≈ 32.0
 end
@@ -399,8 +385,7 @@ end
 
     # Two conditions sharing the top edge, one per component: a component-blind
     # mass double-counts the shared trace dofs and halves both values.
-    halving(g) = [dirichlet(SVector(0.0, 0.0); on=bottom, field=u),
-                  dirichlet(3g; on=top, field=u, component=1),
+    halving(g) = [dirichlet(SVector(0.0, 0.0); on=bottom, field=u), dirichlet(3g; on=top, field=u, component=1),
                   dirichlet(g; on=top, field=u, component=2)]
     model = prepare(poisson(u; source=SVector(0.0, 0.0), dirichlet=halving(0.1)))
     for g in (0.2, 0.3, -0.15)
@@ -413,10 +398,8 @@ end
     # Laterals constrain only u_1 and share the top corners with a vector
     # condition on the top: mass from the u_1-only conditions must not reach the
     # corner's u_2 row, which has no matching right-hand side there.
-    corner(g) = [dirichlet(SVector(0.0, 0.0); on=bottom, field=u),
-                 dirichlet(0.0; on=left, field=u, component=1),
-                 dirichlet(0.0; on=right, field=u, component=1),
-                 dirichlet(SVector(0.0, g); on=top, field=u)]
+    corner(g) = [dirichlet(SVector(0.0, 0.0); on=bottom, field=u), dirichlet(0.0; on=left, field=u, component=1),
+                 dirichlet(0.0; on=right, field=u, component=1), dirichlet(SVector(0.0, g); on=top, field=u)]
     model = prepare(poisson(u; source=SVector(0.0, 0.0), dirichlet=corner(0.1)))
     for g in (0.2, 0.3, -0.15)
         update_dirichlet!(model, corner(g))
@@ -433,12 +416,10 @@ end
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2)
     u = field(:u, V; components=2)
     build(g) = poisson(u; source=SVector(0.0, 0.0),
-                       dirichlet=[dirichlet(SVector(0.0, 0.0); on=boundary(axis=2, side=:lower),
-                                            field=u),
-                                  dirichlet(x -> 0.3 + g * x[1]; on=boundary(axis=2, side=:upper),
-                                            field=u, component=1),
-                                  dirichlet(g; on=boundary(axis=1, side=:upper), field=u,
-                                            component=2)])
+                       dirichlet=[dirichlet(SVector(0.0, 0.0); on=boundary(axis=2, side=:lower), field=u),
+                                  dirichlet(x -> 0.3 + g * x[1]; on=boundary(axis=2, side=:upper), field=u,
+                                            component=1),
+                                  dirichlet(g; on=boundary(axis=1, side=:upper), field=u, component=2)])
 
     model = prepare(build(0.1))
     @test isempty(model.dirichlet_projections)   # `prepare` projects without caching
@@ -493,13 +474,11 @@ end
         @test base.version == initial_version
         @test base.matrix === nothing
         @test base.rhs === nothing
-        @test length(base.assembly.patterns) == 1 &&
-              first(base.assembly.patterns).second === pattern
+        @test length(base.assembly.patterns) == 1 && first(base.assembly.patterns).second === pattern
         timed = @timed solve!(base)
         s = timed.value
         push!(warm_bytes, timed.bytes)
-        @test length(base.assembly.patterns) == 1 &&
-              first(base.assembly.patterns).second === pattern
+        @test length(base.assembly.patterns) == 1 && first(base.assembly.patterns).second === pattern
 
         reference = solve!(prepare(build(new_value)))
         @test value(s, base, (0.5,)) ≈ value(reference, prepare(build(new_value)), (0.5,)) atol = 1.0e-10
@@ -531,8 +510,7 @@ end
               dirichlet(g; on=boundary(axis=2, side=:upper), field=u2)]
     build(g) = Problem((u1, u2);
                        blocks=(stiffness_block(u1), stiffness_block(u2),
-                               couple(u1, u2, Γ, mass_form(coefficient=100.0))...),
-                       dirichlet=dir(g))
+                               couple(u1, u2, Γ, mass_form(coefficient=100.0))...), dirichlet=dir(g))
 
     base = prepare(build(0.0))
     initial_version = base.version
@@ -549,9 +527,7 @@ end
 # The functions of level `id` in `dofs` that survive every elimination in at least
 # one component: what a level report states as `active_functions`, counted here
 # straight from the field's layout.
-function _level_active_functions(dofs, id)
-    count(r -> any(!iszero, view(dofs.active_component, r, :)), dofs.level_raws[id])
-end
+_level_active_functions(dofs, id) = count(r -> any(!iszero, view(dofs.active_component, r, :)), dofs.level_raws[id])
 
 @testset "fields over one space share its dof topology and nothing else" begin
     # `system_layout` builds a space's dof topology once and hands the same arrays
@@ -564,13 +540,11 @@ end
     # the one a standalone `dof_layout` builds for it, re-projecting u's data leaves
     # v's values alone, and the per-level function counts read the shared raws once
     # rather than once per field.
-    V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=10, order=3), box((0.3, 0.3), (0.7, 0.7));
-                cells=8, order=2)
+    V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=10, order=3), box((0.3, 0.3), (0.7, 0.7)); cells=8, order=2)
     u, v = field(:u, V), field(:v, V; components=2)
     g(x) = sin(π * x[1]) * sin(π * x[2]) + exp(x[1]) * sin(x[2]) + 1.0
     conditions(s) = [dirichlet(x -> s * g(x); on=boundary(:all), field=:u),
-                     dirichlet(x -> SVector(x[1], x[2]^2); on=boundary(axis=1, side=:lower),
-                               field=:v),
+                     dirichlet(x -> SVector(x[1], x[2]^2); on=boundary(axis=1, side=:lower), field=:v),
                      dirichlet(0.0; on=boundary(axis=2, side=:upper), field=:v, component=2)]
     model = prepare(Problem((u, v); blocks=(stiffness_block(u), stiffness_block(v)),
                             loads=(source_load(u; source=1.0),), dirichlet=conditions(1.0)))
@@ -590,8 +564,7 @@ end
 
     # Each field is exactly the layout it would have on its own, over the prepared
     # space, with only its own conditions.
-    for (fl, own) in
-        ((layout.fields[1], conditions(1.0)[1:1]), (layout.fields[2], conditions(1.0)[2:3]))
+    for (fl, own) in ((layout.fields[1], conditions(1.0)[1:1]), (layout.fields[2], conditions(1.0)[2:3]))
         alone = Unfitted.dof_layout(model.problem.space; dirichlet=own, tolerance=fl.dofs.tolerance,
                                     components=fl.components)
         @test alone.raw_keys == fl.dofs.raw_keys
@@ -655,8 +628,7 @@ end
     model = prepare(p)
 
     # Different condition count.
-    @test_throws ArgumentError update_dirichlet!(model,
-                                                 [dirichlet(0.0; on=boundary(axis=1, side=:lower))])
+    @test_throws ArgumentError update_dirichlet!(model, [dirichlet(0.0; on=boundary(axis=1, side=:lower))])
 
     # Different boundary selector.
     @test_throws ArgumentError update_dirichlet!(model,
@@ -707,10 +679,8 @@ end
     # datum there and let a short one through to the projection, after the
     # conditions had been replaced; a datum on `s` is held to its own count.
     s = field(:s, V)
-    pair(u_value, s_value=0.1) = [dirichlet(s_value; on=top, field=:s),
-                                  dirichlet(u_value; on=top, field=:u)]
-    pair_model(bcs) = prepare(Problem((s, u); blocks=(stiffness_block(s), stiffness_block(u)),
-                                      dirichlet=bcs))
+    pair(u_value, s_value=0.1) = [dirichlet(s_value; on=top, field=:s), dirichlet(u_value; on=top, field=:u)]
+    pair_model(bcs) = prepare(Problem((s, u); blocks=(stiffness_block(s), stiffness_block(u)), dirichlet=bcs))
     pair_values(model) = [copy(f.dofs.constrained_values) for f in model.dofs.fields]
     paired = pair_model(pair(SVector(0.2, 0.5)))
     @test update_dirichlet!(paired, pair(SVector(0.3, 0.6), 0.4)) === paired
@@ -728,22 +698,18 @@ end
     # scoped or not, zero or not — and an entry reaches its own component only.
     for value in (SVector(0.2, 0.5), (0.2, 0.5), [0.2, 0.5])
         @test values_of(vector_model([dirichlet(value; on=top)])) ==
-              values_of(vector_model([dirichlet(0.2; on=top, component=1),
-                                      dirichlet(0.5; on=top, component=2)]))
+              values_of(vector_model([dirichlet(0.2; on=top, component=1), dirichlet(0.5; on=top, component=2)]))
         @test values_of(vector_model([dirichlet(value; on=top, component=2)])) ==
               values_of(vector_model([dirichlet(0.5; on=top, component=2)]))
     end
-    @test diagnostics(vector_model([dirichlet((0.0, 0.0); on=top)])).dirichlet_trace_factors ==
-          [:none, :none]
+    @test diagnostics(vector_model([dirichlet((0.0, 0.0); on=top)])).dirichlet_trace_factors == [:none, :none]
 
     # A scalar is still every constrained component's value, and zero still skips the
     # projection; a scalar field takes a one-entry datum and refuses a two-entry one.
     @test values_of(vector_model([dirichlet(0.5; on=top)])) ==
           values_of(vector_model([dirichlet(SVector(0.5, 0.5); on=top)]))
-    @test diagnostics(vector_model([dirichlet(0.5; on=top)])).dirichlet_trace_factors ==
-          [:cholesky, :cholesky]
-    @test diagnostics(vector_model([dirichlet(0.0; on=top)])).dirichlet_trace_factors ==
-          [:none, :none]
+    @test diagnostics(vector_model([dirichlet(0.5; on=top)])).dirichlet_trace_factors == [:cholesky, :cholesky]
+    @test diagnostics(vector_model([dirichlet(0.0; on=top)])).dirichlet_trace_factors == [:none, :none]
     scalar_model(value) = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(value; on=top)]))
     @test values_of(scalar_model((0.5,))) == values_of(scalar_model(0.5))
     @test_throws "of field u, 1, but this one has length 2" scalar_model((0.5, 0.5))
@@ -841,8 +807,7 @@ end
     # pruning candidate, whether or not the overlay condition also names it.
     ledger = Unfitted.EliminationLedger{Float64}(length(layout.raw_keys))
     ctx = Unfitted._LevelContext(V, fold, tol, coverage, layout.raw_keys,
-                                 Dict(k => r for (r, k) in pairs(layout.raw_keys)),
-                                 layout.level_raws[middle.id])
+                                 Dict(k => r for (r, k) in pairs(layout.raw_keys)), layout.level_raws[middle.id])
     Unfitted._coverage_constraints!(ledger, middle, ctx)
     candidates = [r for r in ctx.raws if ledger.source[r] !== :free]
 
@@ -856,16 +821,14 @@ end
 
     # Every candidate that is *not* on Γ_o keeps its pruning provenance,
     # so the fix removes only the mislabelled ones.
-    reduced = count(r -> layout.elimination_source[r] === :coverage ||
-                         layout.elimination_source[r] === :dedup, candidates)
+    reduced = count(r -> layout.elimination_source[r] === :coverage || layout.elimination_source[r] === :dedup,
+                    candidates)
     @test reduced == length(candidates) - collisions
 end
 
 # Bytes one integrated-Legendre artificial-boundary pass allocates, measured
 # inside a function so that only the call itself is counted.
-function _overlay_pass_bytes(ledger, level, ctx)
-    @allocated Unfitted._overlay_constraints!(ledger, level, ctx)
-end
+_overlay_pass_bytes(ledger, level, ctx) = @allocated Unfitted._overlay_constraints!(ledger, level, ctx)
 
 @testset "the artificial-boundary pass over an immersed level does not allocate per raw" begin
     # `Space.physical` is abstractly typed. The dof-layer hooks read it through the
@@ -876,8 +839,8 @@ end
     # the space instead, it dispatched dynamically on every raw and boxed its
     # arguments, which is an allocation per raw on every layout build of an immersed
     # space.
-    disc = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.37; lipschitz=1.0,
-                           subcell_length_scale=1 / 128, max_depth=3)
+    disc = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.37; lipschitz=1.0, subcell_length_scale=1 / 128,
+                           max_depth=3)
     for n in (16, 32)
         problem = mass(space(box((0.0, 0.0), (1.0, 1.0)); cells=n, order=2, physical=disc))
         # The folded space and its warm classification cache, exactly as `prepare`
@@ -886,12 +849,10 @@ end
         V, cache = only(spaces), only(caches)
         level = only(V.levels)
         raw_by_key, raw_keys, _, level_raws = Unfitted._enumerate_raws(V)
-        ctx = Unfitted._LevelContext(V, Unfitted._Fold(V, cache),
-                                     Unfitted.GeometryTolerance(Float64),
-                                     Unfitted.Coverage{2}(Dict{Int,BitArray{2}}()), raw_keys,
-                                     raw_by_key, level_raws[level.id])
-        @test ctx isa Unfitted._LevelContext{2,Float64,typeof(V),
-                                             Unfitted._Fold{2,Float64,typeof(V.physical)}}
+        ctx = Unfitted._LevelContext(V, Unfitted._Fold(V, cache), Unfitted.GeometryTolerance(Float64),
+                                     Unfitted.Coverage{2}(Dict{Int,BitArray{2}}()), raw_keys, raw_by_key,
+                                     level_raws[level.id])
+        @test ctx isa Unfitted._LevelContext{2,Float64,typeof(V),Unfitted._Fold{2,Float64,typeof(V.physical)}}
         # Non-vacuity: the fold deactivated cells, so the pass walks fold faces.
         @test count(!, level.mask.on) > 0
         ledger() = Unfitted.EliminationLedger{Float64}(length(raw_keys))
@@ -918,8 +879,7 @@ end
     # instead would leave the masked face free and the truncated solution
     # discontinuous, and only an estimator inequality elsewhere would notice. The
     # B-spline family's counterpart is in test_basis_bspline.jl.
-    hole = physical_domain(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0, subcell_length_scale=1 / 64,
-                           max_depth=6)
+    hole = physical_domain(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0, subcell_length_scale=1 / 64, max_depth=6)
     omega = box((0.0, 0.0), (1.0, 1.0))
     folded = prepare(mass(space(omega; cells=8, order=2, physical=hole)))
     # Non-vacuity: the fold deactivated the cells inside the hole, so there are fold
@@ -935,8 +895,7 @@ end
     layout = only(prepare(mass(masked)).dofs.fields).dofs
     constrained = findall(==(:overlay), layout.elimination_source)
     @test !isempty(constrained)
-    @test all(r -> any(a -> a.kind == Unfitted._AXIS_NODE && a.index == 7, layout.raw_keys[r].axes),
-              constrained)
+    @test all(r -> any(a -> a.kind == Unfitted._AXIS_NODE && a.index == 7, layout.raw_keys[r].axes), constrained)
 end
 
 @testset "a dormant level does not change the base space's Dirichlet lift" begin
@@ -950,8 +909,7 @@ end
     # dependence on geometry that carries no unknowns.
     g(x) = sinpi(x[1]) * exp(x[2])
     dom = box((0.0, 0.0), (1.0, 1.0))
-    solved = map((space(dom; cells=(4, 4), order=2),
-                  ladder(dom; cells=(4, 4), order=2, depth=3, splits=2))) do V
+    solved = map((space(dom; cells=(4, 4), order=2), ladder(dom; cells=(4, 4), order=2, depth=3, splits=2))) do V
         model = prepare(poisson(V; source=x -> 1.0, dirichlet=[dirichlet(g; on=boundary(:all))]))
         (model, solve!(model))
     end
@@ -1022,8 +980,7 @@ end
     V = ladder(dom; cells=4, order=2, depth=1, splits=2)
     V = adapt(V, 2 => CartesianIndices((1:2, 1:2, 1:2)))
     sides = [(3, :lower)]
-    merged = Unfitted._merged_axis_coordinates(V.levels, Val(3), tol,
-                                               level -> Unfitted._side_cells(level, sides))
+    merged = Unfitted._merged_axis_coordinates(V.levels, Val(3), tol, level -> Unfitted._side_cells(level, sides))
     candidates = prod(length(Unfitted._intervals_from_coordinates(merged[d], tol)) for d in 1:2)
     regions = Unfitted._boundary_facet_regions(V, sides, tol)
     @test candidates == 25                       # 5 base lines + 2 overlay lines per free axis
@@ -1084,8 +1041,7 @@ end
     # still reproduces a datum the trace space contains.
     g(x) = 1 + x[1] + 2x[2] + x[1] * x[2]
     both = prepare(poisson(V; source=x -> 0.0,
-                           dirichlet=[dirichlet(g; on=boundary(:all)),
-                                      dirichlet(g; on=boundary(axis=1, side=:lower))]))
+                           dirichlet=[dirichlet(g; on=boundary(:all)), dirichlet(g; on=boundary(axis=1, side=:lower))]))
     @test length(both.facet_regions) == 2
     @test diagnostics(both).facet_region_count == length(whole) + length(single)
     @test l2_error(solve!(both), both, g) < 1.0e-12
@@ -1107,8 +1063,7 @@ end
     # at all: `_needs_dirichlet_projection` skips a homogeneous one, so under a zero
     # datum one of the two consumers would be silent and the test vacuous.
     g(x) = 1 + x[1] + 2x[2]
-    model = prepare(poisson(V; source=0.0,
-                            dirichlet=[dirichlet(g; on=boundary(:all)), dirichlet(g; on=face)]))
+    model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(g; on=boundary(:all)), dirichlet(g; on=face)]))
     resolver = model.facet_resolver
 
     # The four faces of the space, resolved once each — against the five
@@ -1121,9 +1076,7 @@ end
     # Every region in every per-selector cache entry IS one of the resolver's,
     # position for position — not a copy of one carrying the same numbers.
     for ((selector, each_space), list) in model.facet_regions
-        shared = reduce(vcat,
-                        (resolver.faces[(each_space, sides)]
-                         for sides in Unfitted._facets(selector, Val(2))))
+        shared = reduce(vcat, (resolver.faces[(each_space, sides)] for sides in Unfitted._facets(selector, Val(2))))
         @test length(list) == length(shared)
         @test all(a === b for (a, b) in zip(list, shared))
     end
@@ -1172,8 +1125,8 @@ end
     projected = copy(layout.constrained_values)
     @test any(!iszero, projected)
     coarse = Unfitted.FacetResolver{2,Float64}(GeometryTolerance(Float64; merge=1.0e-3))
-    @test_throws ArgumentError Unfitted._project_dirichlet_values!(layout, model.problem.space,
-                                                                   coarse, model.problem.dirichlet)
+    @test_throws ArgumentError Unfitted._project_dirichlet_values!(layout, model.problem.space, coarse,
+                                                                   model.problem.dirichlet)
     @test layout.constrained_values == projected
 
     # A private resolver at the layout's own tolerance is what the standalone
@@ -1182,8 +1135,7 @@ end
     # bit-identical to the shared route, which is what makes the resolver a saving
     # rather than a semantic change.
     private = Unfitted.FacetResolver{2,Float64}(layout.tolerance)
-    @test Unfitted._project_dirichlet_values!(layout, model.problem.space, private,
-                                              model.problem.dirichlet) isa
+    @test Unfitted._project_dirichlet_values!(layout, model.problem.space, private, model.problem.dirichlet) isa
           Unfitted.DirichletProjection{2,Float64}
     @test Set(keys(private.faces)) == Set(keys(before))
     @test layout.constrained_values == projected
@@ -1291,8 +1243,7 @@ end
     # geometry in which the two tests trivially agree.
     hole_regions = hole_model.facet_regions[(boundary(:all), hole_model.problem.space)]
     @test all(r -> r.kind === :full, hole_regions)
-    @test count(r -> any(p -> Unfitted.classify_cell(interior, p.parent_box) === :cut, r.parents),
-                hole_regions) == 2
+    @test count(r -> any(p -> Unfitted.classify_cell(interior, p.parent_box) === :cut, r.parents), hole_regions) == 2
 
     # No geometry at all: nothing can leave Ω, and the classification says so
     # without a level set to ask — `_classify_facet` dispatches on the absent
@@ -1359,12 +1310,10 @@ end
     # fictitious fold cannot reach that: the cell is not fictitious, only its faces
     # are, which is the one configuration a face can reach only by being trimmed
     # inside a single cell.
-    disc = physical_domain(leaf(x -> 0.3 - hypot(x[1], x[2]); lipschitz=1.0);
-                           subcell_length_scale=0.0625)
+    disc = physical_domain(leaf(x -> 0.3 - hypot(x[1], x[2]); lipschitz=1.0); subcell_length_scale=0.0625)
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=disc)
     g(x) = sin(x[1] + 2x[2])
-    model = prepare(poisson(V; source=x -> 5 * sin(x[1] + 2x[2]),
-                            dirichlet=[dirichlet(g; on=boundary(:all))]))
+    model = prepare(poisson(V; source=x -> 5 * sin(x[1] + 2x[2]), dirichlet=[dirichlet(g; on=boundary(:all))]))
     layout = only(model.dofs.fields).dofs
     report = diagnostics(model)
 
@@ -1390,8 +1339,7 @@ end
     @test report.unsupported_dirichlet_dof_count == 3
     @test all(r -> r.field === :u && r.component == 1, report.unsupported_dirichlet_dofs)
     @test Set(layout.raw_keys[r.raw] for r in report.unsupported_dirichlet_dofs) ==
-          Set(Unfitted.TensorDofKey{2}(1, axes)
-              for axes in ((node, node), (bubble, node), (node, bubble)))
+          Set(Unfitted.TensorDofKey{2}(1, axes) for axes in ((node, node), (bubble, node), (node, bubble)))
 
     # The branch the count explains. A zero row makes the mass positive
     # SEMI-definite, which is the one thing `cholesky(…; check = false)` does
@@ -1403,8 +1351,7 @@ end
     # singular-value decomposition, so two of the three come out at ~1e-16 and the
     # pinned dofs are invisible in a scan of the projected values — 31 of the 32
     # nonzero, not 29.
-    @test all(abs(layout.constrained_values[r.raw, r.component]) < 1.0e-14
-              for r in report.unsupported_dirichlet_dofs)
+    @test all(abs(layout.constrained_values[r.raw, r.component]) < 1.0e-14 for r in report.unsupported_dirichlet_dofs)
     @test count(!iszero, layout.constrained_values) == 31
 
     # And the discretisation does not move. Reporting a dof is not refusing to
@@ -1425,20 +1372,16 @@ end
     # φ = x₂ − 0.55 on the x₁ = 0 face, so it is the FOURTH region, over
     # x₂ ∈ [¾, 1], that lies outside Ω: the node at x₂ = 1 and cell 4's bubble lose
     # their measure, while the node at x₂ = ¾ keeps the 0.05 the third region has.
-    plane = physical_domain(leaf(x -> x[2] - x[1] - 0.55; lipschitz=sqrt(2.0));
-                            subcell_length_scale=0.0625)
+    plane = physical_domain(leaf(x -> x[2] - x[1] - 0.55; lipschitz=sqrt(2.0)); subcell_length_scale=0.0625)
     face = boundary(axis=1, side=:lower)
     Vplane = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=plane)
-    cut_model = prepare(poisson(Vplane; source=0.0,
-                                dirichlet=[dirichlet(x -> 1 + x[1] + 2x[2]; on=face)]))
+    cut_model = prepare(poisson(Vplane; source=0.0, dirichlet=[dirichlet(x -> 1 + x[1] + 2x[2]; on=face)]))
     cut_report = diagnostics(cut_model)
     cut_keys = only(cut_model.dofs.fields).dofs.raw_keys
     @test cut_report.dirichlet_trace_factors == [:pseudoinverse]
     @test cut_report.unsupported_dirichlet_dof_count == 2
-    @test Set(cut_keys[r.raw] for r in cut_report.unsupported_dirichlet_dofs) ==
-          Set(Unfitted.TensorDofKey{2}(1, axes)
-              for axes in
-                  ((node, Unfitted._axis_dof_key(4, 1)), (node, Unfitted._axis_dof_key(4, 2))))
+    @test Set(cut_keys[r.raw] for r in cut_report.unsupported_dirichlet_dofs) == Set(Unfitted.TensorDofKey{2}(1, axes)
+                                                                                     for axes in ((node, Unfitted._axis_dof_key(4, 1)), (node, Unfitted._axis_dof_key(4, 2))))
 
     # The geometry is not what the list reports on its own: it reports a trace solve,
     # and homogeneous data run none at `prepare` — a per-component zero no more than a
@@ -1459,8 +1402,7 @@ end
     # at all, so both read their "nothing has happened" value until a nonzero
     # increment establishes them — the one event short of a rebuild that moves either.
     Vplain = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2)
-    plain = prepare(poisson(Vplain; source=0.0,
-                            dirichlet=[dirichlet(x -> 1 + x[1]; on=boundary(:all))]))
+    plain = prepare(poisson(Vplain; source=0.0, dirichlet=[dirichlet(x -> 1 + x[1]; on=boundary(:all))]))
     @test diagnostics(plain).dirichlet_trace_factors == [:cholesky]
     @test isempty(diagnostics(plain).unsupported_dirichlet_dofs)
 
@@ -1493,8 +1435,7 @@ end
     vector_report = diagnostics(vector_model)
     @test vector_report.dirichlet_trace_factors == [:pseudoinverse, :none]
     @test [r.component for r in vector_report.unsupported_dirichlet_dofs] == [1, 1]
-    @test Set(only(vector_model.dofs.fields).dofs.raw_keys[r.raw]
-              for r in vector_report.unsupported_dirichlet_dofs) ==
+    @test Set(only(vector_model.dofs.fields).dofs.raw_keys[r.raw] for r in vector_report.unsupported_dirichlet_dofs) ==
           Set(Unfitted.TensorDofKey{2}(1, axes) for axes in ((node, node), (node, bubble)))
 
     # And the knob that removes the condition instead of reporting it, which is also
@@ -1512,8 +1453,7 @@ end
     stable_model = prepare(poisson(Vstable; source=x -> 5 * sin(x[1] + 2x[2]),
                                    dirichlet=[dirichlet(g; on=boundary(:all))]))
     stable_faces = stable_model.facet_resolver.faces
-    @test first(stable_faces[(stable_model.problem.space, [(1, :lower)])]).kind ===
-          :fictitious_alpha
+    @test first(stable_faces[(stable_model.problem.space, [(1, :lower)])]).kind === :fictitious_alpha
     @test diagnostics(stable_model).dirichlet_trace_factors == [:cholesky]
     @test diagnostics(stable_model).unsupported_dirichlet_dof_count == 0
     @test active_unknowns(stable_model) == 49
@@ -1537,14 +1477,12 @@ end
     # names a (field, component) pair — and a one-component w cannot tell one entry
     # per component from one entry per field. Three fields, so the field then
     # component then raw order of both lists is pinned as well.
-    disc = physical_domain(leaf(x -> 0.3 - hypot(x[1], x[2]); lipschitz=1.0);
-                           subcell_length_scale=0.0625)
+    disc = physical_domain(leaf(x -> 0.3 - hypot(x[1], x[2]); lipschitz=1.0); subcell_length_scale=0.0625)
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=disc)
     u, v, w = field(:u, V), field(:v, V; components=2), field(:w, V; components=2)
     conditions = [dirichlet(x -> sin(x[1] + 2x[2]); on=boundary(:all), field=u),
                   dirichlet(0.5; on=boundary(axis=1, side=:lower), field=v, component=1)]
-    model = prepare(Problem((u, v, w);
-                            blocks=(stiffness_block(u), stiffness_block(v), stiffness_block(w)),
+    model = prepare(Problem((u, v, w); blocks=(stiffness_block(u), stiffness_block(v), stiffness_block(w)),
                             dirichlet=conditions))
     @test isempty(model.dirichlet_projections)
     report = diagnostics(model)
@@ -1563,9 +1501,8 @@ end
     @test diagnostics(model).unsupported_dirichlet_dofs == unsupported
     @test diagnostics(model).unsupported_dirichlet_dof_count == 5
     @test factors == [Unfitted._trace_branch(factor) for p in cached for factor in p.factors]
-    @test unsupported ==
-          [Unfitted.UnsupportedDirichletDof(name, c, raw) for (name, p) in zip(field_names, cached)
-           for (c, raws) in pairs(p.unsupported) for raw in raws]
+    @test unsupported == [Unfitted.UnsupportedDirichletDof(name, c, raw) for (name, p) in zip(field_names, cached)
+                          for (c, raws) in pairs(p.unsupported) for raw in raws]
 end
 
 @testset "a facet region's kind is the verdict on its own face, in every codimension" begin
@@ -1592,9 +1529,8 @@ end
     ball = leaf(x -> 0.3 - sqrt(x[1]^2 + x[2]^2 + x[3]^2); lipschitz=1.0)
     p = physical_domain(ball; subcell_length_scale=0.0625)
     V = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(4, 4, 4), order=2, physical=p)
-    verdicts = Dict(:full => :full, :fictitious => :fictitious, :fictitious_alpha => :fictitious,
-                    :cut_fitted => :cut, :cut_fallback => :cut, :cut_failed => :cut,
-                    :cut_alpha_failed => :cut)
+    verdicts = Dict(:full => :full, :fictitious => :fictitious, :fictitious_alpha => :fictitious, :cut_fitted => :cut,
+                    :cut_fallback => :cut, :cut_failed => :cut, :cut_alpha_failed => :cut)
     verdict(region) = verdicts[region.kind]
     expected(region) =
         let near = norm(region.lower), far = norm(region.upper)
@@ -1642,8 +1578,7 @@ end
     # no integer solution on this mesh), so no verdict sits on a tie, and no cell is
     # wholly fictitious, so the mask retracts nothing and every face keeps all 16
     # regions — the geometry under test is the slice and nothing else.
-    tilt = physical_domain(leaf(x -> 0.9 - 2x[1] - 3x[2] - x[3]; lipschitz=sqrt(14.0));
-                           subcell_length_scale=0.0625)
+    tilt = physical_domain(leaf(x -> 0.9 - 2x[1] - 3x[2] - x[3]; lipschitz=sqrt(14.0)); subcell_length_scale=0.0625)
     Vtilt = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(4, 4, 4), order=2, physical=tilt)
     expected_tilt(region) =
         let lo = 2region.lower[1] + 3region.lower[2] + region.lower[3],
@@ -1664,8 +1599,7 @@ end
     # move 4 of these 16 verdicts. All three verdicts occur on it, so the oracle is
     # discriminating here and not a face on which every region answers the same.
     tilted_face = Unfitted._boundary_facet_regions(Vtilt, [(2, :lower)], tol)
-    @test map(k -> count(r -> verdict(r) === k, tilted_face), (:full, :cut, :fictitious)) ==
-          (10, 5, 1)
+    @test map(k -> count(r -> verdict(r) === k, tilted_face), (:full, :cut, :fictitious)) == (10, 5, 1)
 
     # The pinned axes interleave in turn whenever the lower-numbered one is not the
     # last — axes 1 and 2 of a 3-D box, whose free axis is 3. Consuming the pins
@@ -1705,8 +1639,7 @@ end
     # which is what makes a datum defined only on Ω usable on a cut face. The curved
     # anchor below runs at α = 1e-6 and so is deliberately exempt; the α-FCM blend
     # and its forfeiture of this invariant are pinned where α is.
-    on_omega(V, sides) = all(Unfitted._inside(V.physical.geometry, p) for r in regions(V, sides)
-                             for p in r.points)
+    on_omega(V, sides) = all(Unfitted._inside(V.physical.geometry, p) for r in regions(V, sides) for p in r.points)
 
     # 1. A symmetry plane through a hole — the shape `kirsch_plate_2d` ships, which
     #    is the reason this defect was worth fixing rather than documenting. Ω is the
@@ -1725,8 +1658,8 @@ end
     #    regions alone: machine-exact without a fit having to be. Pinning the kinds
     #    is what keeps this a tangency test rather than a measure test that happens
     #    to pass.
-    plate = physical_domain(leaf(x -> 1.0 - sqrt(x[1]^2 + x[2]^2); lipschitz=1.0);
-                            subcell_length_scale=0.5 / 2^4, max_depth=4)
+    plate = physical_domain(leaf(x -> 1.0 - sqrt(x[1]^2 + x[2]^2); lipschitz=1.0); subcell_length_scale=0.5 / 2^4,
+                            max_depth=4)
     Vplate = space(box((0.0, 0.0), (4.0, 4.0)); cells=(8, 8), order=2, physical=plate)
     for axis in 1:2
         @test measure(Vplate, [(axis, :lower)]) ≈ 3.0 rtol = 1.0e-14
@@ -1781,12 +1714,10 @@ end
     #    moment order, which `_moment_order_for_region` takes from the parent cells.
     r₀, ṙ = 0.1373, 0.22
     centre = SVector(0.4967, 0.5013)
-    cavity = leaf(x -> (r₀ + ṙ * x[3]) - sqrt((x[1] - centre[1])^2 + (x[2] - centre[2])^2);
-                  lipschitz=sqrt(1 + ṙ^2))
+    cavity = leaf(x -> (r₀ + ṙ * x[3]) - sqrt((x[1] - centre[1])^2 + (x[2] - centre[2])^2); lipschitz=sqrt(1 + ṙ^2))
     slab(scale, depth) =
         let dom = physical_domain(cavity; alpha=1.0e-6, subcell_length_scale=scale, max_depth=depth)
-            space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(3, 3, 3), order=(2, 2, 3),
-                  physical=dom)
+            space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(3, 3, 3), order=(2, 2, 3), physical=dom)
         end
     initial = measure(slab(1 / 12, 8), [(3, :lower)])
     @test initial ≈ 1 - π * r₀^2 atol = 5.0e-5
@@ -1826,8 +1757,7 @@ end
     V = space(box((1.0, 1.0), (2.0, 2.0)); cells=(4, 4), order=2, physical=hole)
     # Traversed (0, R) → (R, 0) about `c`: a 2-D segment's normal is 90° clockwise
     # from its direction, which points at the centre here, i.e. out of Ω.
-    arc = polyline_mesh([c + R * SVector(sin(t), cos(t))
-                         for t in range(0, π / 2; length=segments + 1)])
+    arc = polyline_mesh([c + R * SVector(sin(t), cos(t)) for t in range(0, π / 2; length=segments + 1)])
     model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     # Both trimmed faces, machine-exact: on the x₁ = 1 face the leaf restricts to
@@ -1900,8 +1830,7 @@ end
 
             one = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(g; on=selector)]))
             many = prepare(poisson(V; source=0.0,
-                                   dirichlet=[dirichlet(g; on=boundary(axis=a, side=s))
-                                              for (a, s) in kept]))
+                                   dirichlet=[dirichlet(g; on=boundary(axis=a, side=s)) for (a, s) in kept]))
             one_dofs, many_dofs = only(one.dofs.fields).dofs, only(many.dofs.fields).dofs
             @test one_dofs.physical_dirichlet == many_dofs.physical_dirichlet
             @test one_dofs.constrained_values == many_dofs.constrained_values
@@ -1934,22 +1863,18 @@ end
     # *value*, hence one facet-region cache entry instead of two resolutions of
     # the same faces. Order in the list is not part of the value either: it is a
     # set of faces to remove.
-    @test boundary(:all; except=(axis=2,)) ==
-          boundary(:all; except=((axis=2, side=:lower), (axis=2, side=:upper)))
+    @test boundary(:all; except=(axis=2,)) == boundary(:all; except=((axis=2, side=:lower), (axis=2, side=:upper)))
     @test hash(boundary(:all; except=(axis=2,))) ==
           hash(boundary(:all; except=((axis=2, side=:upper), (axis=2, side=:lower))))
     scrambled = [(axis=3, side=:upper), (axis=3, side=:lower), (axis=1, side=:lower)]
-    @test boundary(:all; except=((axis=1, side=:lower), (axis=3,))) ==
-          boundary(:all; except=scrambled)
+    @test boundary(:all; except=((axis=1, side=:lower), (axis=3,))) == boundary(:all; except=scrambled)
 
     # A repeated axis is meaningless for an intersection and `boundary(pairs...)`
     # rejects it. For an exclusion list it is ordinary and must construct; so must
     # a face named twice over.
     @test_throws ArgumentError boundary((axis=3, side=:lower), (axis=3, side=:upper))
-    @test boundary(:all; except=((axis=3, side=:lower), (axis=3, side=:upper))).sides ==
-          [(3, :lower), (3, :upper)]
-    @test boundary(:all; except=((axis=1,), (axis=1, side=:lower))).sides ==
-          [(1, :lower), (1, :upper)]
+    @test boundary(:all; except=((axis=3, side=:lower), (axis=3, side=:upper))).sides == [(3, :lower), (3, :upper)]
+    @test boundary(:all; except=((axis=1,), (axis=1, side=:lower))).sides == [(1, :lower), (1, :upper)]
     @test boundary(:all; except=(axis=1, side=:lower)).selector === :except
 
     # `except` removes faces from the whole boundary, so it means nothing on any
@@ -1980,8 +1905,7 @@ end
     bogus = Unfitted.BoundarySelector(:sides, [(1, :bogus)])
     @test_throws "boundary side must be :lower or :upper" Unfitted._facets(bogus, Val(2))
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
-    @test_throws ArgumentError prepare(poisson(V; source=0.0,
-                                               dirichlet=[dirichlet(0.0; on=everything)]))
+    @test_throws ArgumentError prepare(poisson(V; source=0.0, dirichlet=[dirichlet(0.0; on=everything)]))
     # ...but in 3D that same list keeps the two faces of axis 3.
     @test length(Unfitted._facets(everything, Val(3))) == 2
 end
@@ -2032,14 +1956,11 @@ end
     folded = model.problem.space
     flagged(on) = Unfitted._physical_dirichlet(dofs, folded, [dirichlet(0.0; on)], 1)[:, 1]
     matches(key, on) = key in Set(dofs.raw_keys[findall(flagged(on))])
-    corner = only(key
-                  for key in dofs.raw_keys
-                  if matches(key, boundary((axis=1, side=:upper), (axis=2, side=:lower))))
+    corner = only(key for key in dofs.raw_keys if matches(key, boundary((axis=1, side=:upper), (axis=2, side=:lower))))
     @test matches(corner, selector)
     # ...while the mid-face dof of the excluded face, which no kept face touches,
     # does not.
-    @test count(key -> matches(key, boundary(axis=1, side=:upper)) && !matches(key, selector),
-                dofs.raw_keys) == 1
+    @test count(key -> matches(key, boundary(axis=1, side=:upper)) && !matches(key, selector), dofs.raw_keys) == 1
 end
 
 # Grid-aligned facet integration has two consumers that must see the same facet:

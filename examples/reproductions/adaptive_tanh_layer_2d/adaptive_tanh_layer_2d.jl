@@ -124,10 +124,8 @@ problem(V) = poisson(V; source=source, dirichlet=[dirichlet(exact; on=boundary(:
 # is the whole point: the same nodes and weights score every space in the run and
 # the uniform spaces it is compared against. 96 panels is converged for λ = 30 —
 # doubling it moves the reported error in the fifth digit.
-const GAUSS5 = ((-0.9061798459386640, -0.5384693101056831, 0.0, 0.5384693101056831,
-                 0.9061798459386640),
-                (0.2369268850561891, 0.4786286704993665, 0.5688888888888889, 0.4786286704993665,
-                 0.2369268850561891))
+const GAUSS5 = ((-0.9061798459386640, -0.5384693101056831, 0.0, 0.5384693101056831, 0.9061798459386640),
+                (0.2369268850561891, 0.4786286704993665, 0.5688888888888889, 0.4786286704993665, 0.2369268850561891))
 
 function lattice_energy_error(solution, model; panels::Int=96)
     ξ, w = GAUSS5
@@ -157,8 +155,7 @@ solution = solve!(model)
 
 previous = nothing
 
-println("  columns: cycle, unknowns, rel_energy, eta, consistency, n_h, n_p, ",
-        "max order per level")
+println("  columns: cycle, unknowns, rel_energy, eta, consistency, n_h, n_p, ", "max order per level")
 for cycle in 1:CYCLES
     estimate_ = estimate(model, solution)
     # The ruler is independent of the space, so it can be read every cycle — but
@@ -166,8 +163,7 @@ for cycle in 1:CYCLES
     # in the header). With the column off the run still prints the closing
     # headline, which is the number this benchmark is about.
     energy = TABLE_ENERGY ? lattice_energy_error(solution, model) : nothing
-    orders = [maximum(first, cell_orders(model.prefold_space; level=k))
-              for k in 1:length(model.prefold_space.levels)]
+    orders = [maximum(first, cell_orders(model.prefold_space; level=k)) for k in 1:length(model.prefold_space.levels)]
 
     # `refine(V, est; theta, previous)` is exactly these two calls followed by
     # the application step. They are made separately here so the h/p decision is
@@ -176,9 +172,9 @@ for cycle in 1:CYCLES
     h_cells, p_cells = decide(model.prefold_space, estimate_, marked; pmax=PMAX, previous=previous)
 
     println("  ", lpad(cycle, 3), ", ", lpad(active_unknowns(model), 7), ", ",
-            rpad(energy === nothing ? "-" : sig(energy), 10), ", ", rpad(sig(estimate_.total), 10),
-            ", ", rpad(sig(estimate_.consistency, 3), 9), ", ", lpad(length(h_cells), 4), ", ",
-            lpad(length(p_cells), 4), ", ", orders)
+            rpad(energy === nothing ? "-" : sig(energy), 10), ", ", rpad(sig(estimate_.total), 10), ", ",
+            rpad(sig(estimate_.consistency, 3), 9), ", ", lpad(length(h_cells), 4), ", ", lpad(length(p_cells), 4),
+            ", ", orders)
 
     global previous = (model.prefold_space, estimate_)
     cycle == CYCLES && break
@@ -198,9 +194,8 @@ if WRITE_OUTPUT
 end
 
 println()
-println("relative energy error (fixed 96² lattice): ",
-        sig(lattice_energy_error(solution, model), 6))
+println("relative energy error (fixed 96² lattice): ", sig(lattice_energy_error(solution, model), 6))
 
 print_run_report("2D adaptive hp on a curved interior layer", report;
-                 parameters=(:lambda => LAMBDA, :cycles => CYCLES, :base_cells => BASE_CELLS,
-                             :depth => DEPTH, :theta => THETA, :pmax => PMAX), output=out)
+                 parameters=(:lambda => LAMBDA, :cycles => CYCLES, :base_cells => BASE_CELLS, :depth => DEPTH,
+                             :theta => THETA, :pmax => PMAX), output=out)

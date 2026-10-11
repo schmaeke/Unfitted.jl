@@ -253,9 +253,7 @@ to degree `2n − 1`, which covers the degree `2 · order[d]` of a product of tw
 degree-`order[d]` modes. A family whose functions are not degree-`order[d]`
 polynomials overrides this.
 """
-function recommended_quadrature_order(::BasisFamily, order::NTuple{D,Int}) where {D}
-    return ntuple(i -> order[i] + 1, D)
-end
+recommended_quadrature_order(::BasisFamily, order::NTuple{D,Int}) where {D} = ntuple(i -> order[i] + 1, D)
 
 # ── Basis modes and local mode counts ─────────────────────────────────────────
 
@@ -271,9 +269,7 @@ for integrated Legendre `:trunk` counts the multi-indices passing the
 trunk-degree filter (see [`IntegratedLegendre`](@ref)). A family that supports
 only some modes says so through `_supported_modes`, not by counting.
 """
-function local_basis_count(::BasisFamily, order::NTuple{D,Int}) where {D}
-    return prod(ntuple(i -> order[i] + 1, D))
-end
+local_basis_count(::BasisFamily, order::NTuple{D,Int}) where {D} = prod(ntuple(i -> order[i] + 1, D))
 
 function local_basis_count(basis::BasisFamily, order::NTuple{D,Int}, mode::Symbol) where {D}
     return length(local_basis_indices(basis, order, mode))
@@ -405,9 +401,7 @@ end
 # (see `CONTRIBUTING.md`, "Coordinate conventions"), so it lives in one place
 # and every family's `local_basis_indices` is a filter over it, never a
 # re-derivation of it.
-function _tensor_index_set(order::NTuple{D,Int}) where {D}
-    return vec(collect(CartesianIndices(ntuple(d -> 0:order[d], D))))
-end
+_tensor_index_set(order::NTuple{D,Int}) where {D} = vec(collect(CartesianIndices(ntuple(d -> 0:order[d], D))))
 
 """
     local_basis_indices(basis, order)         -> Vector{CartesianIndex{D}}
@@ -448,8 +442,7 @@ function local_basis_indices(basis::BasisFamily, order::NTuple{D,Int}, mode::Sym
 end
 
 function local_basis_indices(::IntegratedLegendre, order::NTuple{D,Int}) where {D}
-    all(o -> o >= 1, order) ||
-        throw(ArgumentError("integrated Legendre order must be at least 1 in every axis"))
+    all(o -> o >= 1, order) || throw(ArgumentError("integrated Legendre order must be at least 1 in every axis"))
     return _tensor_index_set(order)
 end
 
@@ -474,8 +467,7 @@ function _trunk_degree(id::CartesianIndex{D}) where {D}
     return degree
 end
 
-function local_basis_indices(basis::IntegratedLegendre, order::NTuple{D,Int},
-                             mode::Symbol) where {D}
+function local_basis_indices(basis::IntegratedLegendre, order::NTuple{D,Int}, mode::Symbol) where {D}
     _check_basis_mode(basis, mode, order)
     indices = local_basis_indices(basis, order)
     mode === :tensor && return indices
@@ -563,8 +555,7 @@ monotone in the order for every family declaring `_supports_cell_order`, and tha
 the intersection form reproduces the componentwise-minimum form cell for cell —
 the three contracts that keep the two layers from drifting.
 """
-function _index_admissible(::IntegratedLegendre, order::NTuple{D,Int}, mode::Symbol,
-                           id::CartesianIndex{D}) where {D}
+function _index_admissible(::IntegratedLegendre, order::NTuple{D,Int}, mode::Symbol, id::CartesianIndex{D}) where {D}
     all(d -> 0 <= id.I[d] <= order[d], 1:D) || return false
     mode === :tensor && return true
     return _trunk_degree(id) <= order[1]
@@ -591,9 +582,7 @@ end
 # exactly `p + 1` 1D functions non-zero on any single span. So the
 # buffer allocation is family-agnostic; only the per-axis evaluator
 # (`_fill_factor_tables!`) dispatches.
-function _factor_buffers(order::NTuple{D,Int}, ::Type{T}) where {D,T}
-    ntuple(d -> Vector{T}(undef, order[d] + 1), D)
-end
+_factor_buffers(order::NTuple{D,Int}, ::Type{T}) where {D,T} = ntuple(d -> Vector{T}(undef, order[d] + 1), D)
 
 # Fill caller-owned per-axis 1D tables for `basis` at one reference
 # point: `val1d[d][i + 1] = N̂ᵢ(ξ[d])` for the `order[d] + 1` 1D modes
@@ -638,8 +627,8 @@ function _fill_factor_tables!(::IntegratedLegendre, val1d, order::NTuple{D,Int},
     return nothing
 end
 
-function _fill_factor_tables!(::IntegratedLegendre, val1d, der1d, order::NTuple{D,Int},
-                              ξ::SVector{D,T}, ::CartesianIndex{D}) where {D,T}
+function _fill_factor_tables!(::IntegratedLegendre, val1d, der1d, order::NTuple{D,Int}, ξ::SVector{D,T},
+                              ::CartesianIndex{D}) where {D,T}
     @inbounds for d in 1:D
         x = ξ[d]
         p = order[d]
@@ -692,11 +681,9 @@ end
 # it is *false* for a family whose 1D modes depend on the degree — de Boor at
 # degree p yields p+1 span-specific functions — which is one more reason
 # `_supports_cell_order` is false for B-splines.
-function _tensor_values!(basis::BasisFamily, values::AbstractVector,
-                         indices::AbstractVector{CartesianIndex{D}}, order::NTuple{D,Int},
-                         ξ::SVector{D,T}, val1d, cell::CartesianIndex{D}) where {D,T}
-    length(values) >= length(indices) ||
-        throw(DimensionMismatch("basis value buffer has wrong length"))
+function _tensor_values!(basis::BasisFamily, values::AbstractVector, indices::AbstractVector{CartesianIndex{D}},
+                         order::NTuple{D,Int}, ξ::SVector{D,T}, val1d, cell::CartesianIndex{D}) where {D,T}
+    length(values) >= length(indices) || throw(DimensionMismatch("basis value buffer has wrong length"))
     _fill_factor_tables!(basis, val1d, order, ξ, cell)
     @inbounds for (a, id) in pairs(indices)
         values[a] = prod(ntuple(d -> val1d[d][id.I[d] + 1], D))
@@ -719,22 +706,16 @@ end
 # `O(D²)` per multi-index — for typical `D ≤ 4` and modest mode counts
 # this is comfortably allocation-free with `_product_except` operating
 # on `NTuple` scratch.
-function _tensor_values_grads!(basis::BasisFamily, values::AbstractVector,
-                               gradients::AbstractVector,
-                               indices::AbstractVector{CartesianIndex{D}}, order::NTuple{D,Int},
-                               ξ::SVector{D,T}, scale::SVector{D,T}, val1d, der1d,
-                               cell::CartesianIndex{D}) where {D,T}
-    length(values) >= length(indices) ||
-        throw(DimensionMismatch("basis value buffer has wrong length"))
-    length(gradients) >= length(indices) ||
-        throw(DimensionMismatch("basis gradient buffer has wrong length"))
+function _tensor_values_grads!(basis::BasisFamily, values::AbstractVector, gradients::AbstractVector,
+                               indices::AbstractVector{CartesianIndex{D}}, order::NTuple{D,Int}, ξ::SVector{D,T},
+                               scale::SVector{D,T}, val1d, der1d, cell::CartesianIndex{D}) where {D,T}
+    length(values) >= length(indices) || throw(DimensionMismatch("basis value buffer has wrong length"))
+    length(gradients) >= length(indices) || throw(DimensionMismatch("basis gradient buffer has wrong length"))
     _fill_factor_tables!(basis, val1d, der1d, order, ξ, cell)
     @inbounds for (a, id) in pairs(indices)
         vfac = ntuple(d -> val1d[d][id.I[d] + 1], D)
         values[a] = prod(vfac)
-        gradients[a] = SVector{D,T}(ntuple(k -> der1d[k][id.I[k] + 1] *
-                                                _product_except(vfac, k) *
-                                                scale[k], D))
+        gradients[a] = SVector{D,T}(ntuple(k -> der1d[k][id.I[k] + 1] * _product_except(vfac, k) * scale[k], D))
     end
     return values, gradients
 end
@@ -816,9 +797,8 @@ family unchanged.
     set, so this vector does not line up with `cell_dofs`. Use
     `physical_basis_gradients(level::Level, cell, cell_box, xi)` there.
 """
-function physical_basis_gradients(basis::BasisFamily, order::NTuple{D,Int}, mode::Symbol,
-                                  cell_box::AxisBox{D,T}, xi::PointLike{D},
-                                  cell::CartesianIndex{D}) where {D,T}
+function physical_basis_gradients(basis::BasisFamily, order::NTuple{D,Int}, mode::Symbol, cell_box::AxisBox{D,T},
+                                  xi::PointLike{D}, cell::CartesianIndex{D}) where {D,T}
     indices = local_basis_indices(basis, order, mode)
     # The cell's scalar type joins the promotion: `scale` is derived from the
     # box, so a `Float32` reference point on a `Float64` cell must still
@@ -828,8 +808,8 @@ function physical_basis_gradients(basis::BasisFamily, order::NTuple{D,Int}, mode
     values = Vector{R}(undef, length(indices))
     gradients = Vector{SVector{D,R}}(undef, length(indices))
     scale = SVector{D,R}(2 ./ edge_lengths(cell_box))
-    _tensor_values_grads!(basis, values, gradients, indices, order, ξ, scale,
-                          _factor_buffers(order, R), _factor_buffers(order, R), cell)
+    _tensor_values_grads!(basis, values, gradients, indices, order, ξ, scale, _factor_buffers(order, R),
+                          _factor_buffers(order, R), cell)
     return gradients
 end
 
@@ -849,8 +829,7 @@ end
 # support on the codim-1 face specified by `(axis, side)`. For integrated
 # Legendre this reduces to checking the single 1D mode along the requested
 # axis.
-function is_boundary_basis(::IntegratedLegendre, id::CartesianIndex{D}, axis::Integer,
-                           side::Symbol) where {D}
+function is_boundary_basis(::IntegratedLegendre, id::CartesianIndex{D}, axis::Integer, side::Symbol) where {D}
     1 <= axis <= D || throw(ArgumentError("axis out of bounds"))
     return boundary_mode(id.I[axis], side)
 end
@@ -879,11 +858,9 @@ face at the requested `(axis, side)`. Used by the Dirichlet projection in
 facet. This `::BasisFamily` default filters `local_basis_indices(basis, order,
 mode)` through the family's `is_boundary_basis`, so it needs no override.
 """
-function boundary_basis_indices(basis::BasisFamily, order::NTuple{D,Int}; axis::Integer,
-                                side::Symbol, mode::Symbol=:tensor) where {D}
-    return [id
-            for id in local_basis_indices(basis, order, mode)
-            if is_boundary_basis(basis, id, axis, side)]
+function boundary_basis_indices(basis::BasisFamily, order::NTuple{D,Int}; axis::Integer, side::Symbol,
+                                mode::Symbol=:tensor) where {D}
+    return [id for id in local_basis_indices(basis, order, mode) if is_boundary_basis(basis, id, axis, side)]
 end
 
 # ── Public quadrature rule ────────────────────────────────────────────────────
@@ -896,7 +873,6 @@ Tensor Gauss–Legendre rule on the reference cube `[−1, 1]ᴰ` sized by
 order. Useful for one-shot reference-cell quadrature in tests and
 examples; the assembly path uses the cached `_tensor_gauss_rule` directly.
 """
-function gauss_rule(basis::IntegratedLegendre, order::NTuple{D,Int},
-                    ::Type{T}=Float64) where {D,T<:Real}
+function gauss_rule(basis::IntegratedLegendre, order::NTuple{D,Int}, ::Type{T}=Float64) where {D,T<:Real}
     _tensor_gauss_rule(recommended_quadrature_order(basis, order), T)
 end

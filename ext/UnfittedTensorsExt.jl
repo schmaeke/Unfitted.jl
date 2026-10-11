@@ -170,8 +170,7 @@ one-argument `symmetric_gradient(trial)` is correctly sized on its own and
 both two-argument forms become redundant.
 """
 @inline function Unfitted.symmetric_gradient(t::TrialChannels{D,T}, ::Val{C}) where {D,T,C}
-    C ≤ D || throw(DimensionMismatch("a field of $C components has no strain tensor on a " *
-                                     "$D-dimensional mesh"))
+    C ≤ D || throw(DimensionMismatch("a field of $C components has no strain tensor on a " * "$D-dimensional mesh"))
     g = Vec(t)
     c = t.component
     return SymmetricTensor{2,C,T}() do i, j
@@ -286,8 +285,7 @@ both cases.
 [`symmetric_gradient`](@ref) documents: a field carrying more components
 than the space has axes has no stress tensor to take a row of.
 """
-@inline function Unfitted.TestChannels(value::Real, σ::SecondOrderTensor{D,T},
-                                       component::Integer) where {D,T}
+@inline function Unfitted.TestChannels(value::Real, σ::SecondOrderTensor{D,T}, component::Integer) where {D,T}
     return TestChannels(value, SVector{D,T}(ntuple(j -> σ[component, j], Val(D))))
 end
 

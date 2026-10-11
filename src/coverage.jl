@@ -134,8 +134,7 @@ end
 # A table miss: classify the cell box through the box memo and record the verdict. Out
 # of line, so the hit path a per-cell loop inlines stays the few loads and the compare
 # `_is_void` describes.
-@noinline function _classify_void!(f::_Fold{D,T}, level::Level{D,T},
-                                   c::CartesianIndex{D}) where {D,T<:Real}
+@noinline function _classify_void!(f::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}) where {D,T<:Real}
     isassigned(f.cells, level.id) || (f.cells[level.id] = zeros(UInt8, level.mesh.cells))
     void = classify_cell(f.physical, cell_box(level.mesh, c), f.boxes) === :fictitious
     f.cells[level.id][c] = void ? 0x01 : 0x02
@@ -200,8 +199,7 @@ is a single box test and is not stored. The memo is not keyed by the tolerance, 
 `fold` belongs to one build and one `tol`: pass a fresh oracle for another tolerance,
 or the stored answers of the first are returned for the second.
 """
-function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T},
-                        fold::_Fold{D,T}=_Fold(V)) where {D,T}
+function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T}, fold::_Fold{D,T}=_Fold(V)) where {D,T}
     covered = Dict{Int,BitArray{D}}()
     for level in V.levels
         cov = falses(level.mesh.cells)
@@ -322,8 +320,7 @@ end
 # finer level under this coarser cell" question the block resolution answers —
 # and by `_reproduced_on_domain`, which asks it of a support hull that may stick
 # out past the covering level's box.
-function _cells_under_box(mesh::CartesianMesh{D,T}, box::AxisBox{D,T},
-                          tol::GeometryTolerance{T}) where {D,T}
+function _cells_under_box(mesh::CartesianMesh{D,T}, box::AxisBox{D,T}, tol::GeometryTolerance{T}) where {D,T}
     return CartesianIndices(ntuple(d -> _axis_cells(mesh.axes[d], box.lower[d] + tol.contain,
                                                     box.upper[d] - tol.contain), D))
 end
@@ -356,8 +353,7 @@ end
 #
 # For the masked case we do NOT scan all of k's cells: `_cells_under_box` resolves the
 # axis-aligned block by binary search.
-function _covered_by_level(box::AxisBox{D,T}, k::Level{D,T}, tol::GeometryTolerance{T},
-                           fold::_Fold{D,T}) where {D,T}
+function _covered_by_level(box::AxisBox{D,T}, k::Level{D,T}, tol::GeometryTolerance{T}, fold::_Fold{D,T}) where {D,T}
     is_inside(box, k.mesh.domain, tol) || return false
     k.mask === nothing && return true
     cells = _cells_under_box(k.mesh, box, tol)
@@ -426,8 +422,8 @@ end
 #
 # Condition 1 reads the oracle's coverage memo (`_covered_by!`), which `build_coverage`
 # filled with the same `_covered_by_level` answers.
-function _reproduced_on_domain(level::Level{D,T}, k::Level{D,T}, cells::CartesianIndices{D},
-                               tol::GeometryTolerance{T}, fold::_Fold{D,T}) where {D,T}
+function _reproduced_on_domain(level::Level{D,T}, k::Level{D,T}, cells::CartesianIndices{D}, tol::GeometryTolerance{T},
+                               fold::_Fold{D,T}) where {D,T}
     for ci in cells
         if is_active(level.mask, ci)
             _covered_by!(fold, level, ci, k, tol) || return false
@@ -435,8 +431,7 @@ function _reproduced_on_domain(level::Level{D,T}, k::Level{D,T}, cells::Cartesia
             _is_void(fold, level, ci) || return false
         end
     end
-    hull = AxisBox{D,T}(cell_box(level.mesh, first(cells)).lower,
-                        cell_box(level.mesh, last(cells)).upper)
+    hull = AxisBox{D,T}(cell_box(level.mesh, first(cells)).lower, cell_box(level.mesh, last(cells)).upper)
     for d in 1:D
         faces = ((1, k.mesh.domain.lower[d]), (k.mesh.cells[d], k.mesh.domain.upper[d]))
         for (j, x) in faces                                     # k's two box faces on axis d

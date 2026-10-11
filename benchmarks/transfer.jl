@@ -10,8 +10,7 @@ target_space = Unfitted.moved_space(source_space; level=2, to=box((0.31, 0.26), 
 source_model = prepare(poisson(source_space; source=0.0))
 target_model = prepare(poisson(target_space; source=0.0))
 source_coefficients = [sin(0.01 * i) for i in 1:Unfitted.active_unknowns(source_model.dofs)]
-source_solution = Solution(source_coefficients, source_model.version,
-                           Unfitted.SolverDiagnostics(:synthetic, 0.0, true))
+source_solution = Solution(source_coefficients, source_model.version, Unfitted.SolverDiagnostics(:synthetic, 0.0, true))
 
 stats = best_timed(; samples=3) do
     transfer(source_solution, source_model, target_model)

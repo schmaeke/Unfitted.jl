@@ -72,10 +72,10 @@ end
     K_sym = SymmetricTensor{2,2,Float64}((2.0, 0.3, 1.0))    # (xx, xy, yy)
     source(x) = sin(pi * x[1]) * sin(pi * x[2])
 
-    form_baseline = WeakForm(; bilinear=(q, u) -> TestChannels(0.0, K_mat * u.gradient),
-                             linear=q -> source(q.x), symmetric=true)
-    form_tensors = WeakForm(; bilinear=(q, u) -> TestChannels(0.0, K_sym ⋅ Vec(u)),
-                            linear=q -> source(q.x), symmetric=true)
+    form_baseline = WeakForm(; bilinear=(q, u) -> TestChannels(0.0, K_mat * u.gradient), linear=q -> source(q.x),
+                             symmetric=true)
+    form_tensors = WeakForm(; bilinear=(q, u) -> TestChannels(0.0, K_sym ⋅ Vec(u)), linear=q -> source(q.x),
+                            symmetric=true)
 
     m_b = prepare(Problem(V, form_baseline; dirichlet=bc))
     m_t = prepare(Problem(V, form_tensors; dirichlet=bc))
@@ -190,8 +190,7 @@ end
     # convention differs by `|A[1,2] − A[2,1]| = 2`, so this pins the index
     # order rather than restating the implementation.
     for (cells, A, b) in (((2, 2), SMatrix{2,2,Float64}(3.0, 7.0, 5.0, 11.0), SVector(0.25, -0.5)),
-                          ((1, 1, 1), SMatrix{3,3,Float64}(1.0, 4.0, 7.0, 2.0, 5.0, 8.0, 3.0, 6.0, 10.0),
-                           SVector(0.1, 0.2, 0.3)))
+                          ((1, 1, 1), SMatrix{3,3,Float64}(1.0, 4.0, 7.0, 2.0, 5.0, 8.0, 3.0, 6.0, 10.0), SVector(0.1, 0.2, 0.3)))
         D = length(cells)
         exact(x) = A * SVector{D,Float64}(x) + b
         V = space(box(ntuple(_ -> 0.0, D), ntuple(_ -> 1.0, D)); cells=cells, order=1)
@@ -241,8 +240,7 @@ end
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
     u = field(:u, V; components=2)
     model = prepare(Problem((u,)))
-    form(bilinear) = WeakForm(bilinear=bilinear, linear=(q, c) -> 0.0, symmetric=true,
-                              component_aware=true)
+    form(bilinear) = WeakForm(bilinear=bilinear, linear=(q, c) -> 0.0, symmetric=true, component_aware=true)
     K = Matrix(assemble_matrix(model, block(u, u, form(tensor_bilinear))))
     K_manual = Matrix(assemble_matrix(model, block(u, u, form(manual_bilinear))))
     @test K == K_manual
@@ -269,8 +267,7 @@ end
     # suite is compile-bound, so a second discretisation would cost more than
     # it proves.
     λ, μ = 1.3, 0.7
-    isotropic(i, j, k, l) = λ * (i == j) * (k == l) +
-                            μ * ((i == k) * (j == l) + (i == l) * (j == k))
+    isotropic(i, j, k, l) = λ * (i == j) * (k == l) + μ * ((i == k) * (j == l) + (i == l) * (j == k))
     ℂ_mesh = SymmetricTensor{4,3,Float64}(isotropic)
     ℂ_field = SymmetricTensor{4,2,Float64}(isotropic)
 
@@ -278,8 +275,7 @@ end
     u = field(:u, V; components=2)
     @test u isa Field{3,Float64,2}
     model = prepare(Problem((u,)))
-    form(bilinear) = WeakForm(bilinear=bilinear, linear=(q, c) -> 0.0, symmetric=true,
-                              component_aware=true)
+    form(bilinear) = WeakForm(bilinear=bilinear, linear=(q, c) -> 0.0, symmetric=true, component_aware=true)
 
     # The one-argument strain is a 3×3 tensor here — the defect — while the
     # two-argument one is the 2×2 tensor the field actually has.
@@ -295,9 +291,7 @@ end
     # `trial.component == test_component` pattern itself.
     time_bilinear(q, trial) = TestChannels(0.0, SVector(0.0, 0.0, μ * trial.gradient[3]))
     A_time = Matrix(assemble_matrix(model,
-                                    block(u, u,
-                                          WeakForm(bilinear=time_bilinear, linear=q -> 0.0,
-                                                   symmetric=true))))
+                                    block(u, u, WeakForm(bilinear=time_bilinear, linear=q -> 0.0, symmetric=true))))
 
     # The load-bearing assertion is the exact identity
     #
@@ -337,17 +331,15 @@ end
     # Both guards refuse the long direction loudly. Truncating either would be
     # a fresh instance of the silent wrongness this testset exists to pin.
     @test_throws DimensionMismatch symmetric_gradient(trial, Val(4))
-    @test_throws DimensionMismatch Unfitted._as_test_channels(TestChannels(0.0,
-                                                                           SVector(1.0, 2.0, 3.0)),
-                                                              Val(2), Float64)
+    @test_throws DimensionMismatch Unfitted._as_test_channels(TestChannels(0.0, SVector(1.0, 2.0, 3.0)), Val(2),
+                                                              Float64)
 
     # The ergonomic three-argument `TestChannels(value, σ, component)` return
     # path died inside assembly with a `MethodError` on `_as_test_channels`
     # whenever the stress was smaller than the mesh, which is every `C ≠ D`
     # field. Drive it through a whole solve.
     solved = prepare(Problem(u,
-                             WeakForm(bilinear=field_bilinear,
-                                      linear=(q, c) -> (c == 1 ? 1.0 : 0.0), symmetric=true,
+                             WeakForm(bilinear=field_bilinear, linear=(q, c) -> (c == 1 ? 1.0 : 0.0), symmetric=true,
                                       component_aware=true);
                              dirichlet=[dirichlet(SVector(0.0, 0.0); on=boundary(:all))]))
     assemble!(solved)
@@ -385,8 +377,7 @@ end
 # feeds `sink` so it cannot be eliminated as dead code, and `sink` is returned
 # so the caller can pin that the work happened.
 function _conversion_allocations()
-    ℂ = SymmetricTensor{4,2,Float64}((i, j, k, l) -> (i == j) * (k == l) +
-                                                     ((i == k) * (j == l) + (i == l) * (j == k)))
+    ℂ = SymmetricTensor{4,2,Float64}((i, j, k, l) -> (i == j) * (k == l) + ((i == k) * (j == l) + (i == l) * (j == k)))
     trial2 = TrialChannels(1, 1.0, SVector(0.7, -1.3))
     trial3 = TrialChannels(2, 1.0, SVector(0.5, -0.25, 1.5))
     vec2 = Vec{2,Float64}((1.5, -0.25))
@@ -394,9 +385,8 @@ function _conversion_allocations()
     stress(trial, c) = TestChannels(0.0, ℂ ⊡ symmetric_gradient(trial), c)
 
     sink = 0.0
-    warmup = (Vec(trial2)[1], Vec(trial3)[1], symmetric_gradient(trial2)[1, 1],
-              symmetric_gradient(trial3)[1, 1], TestChannels(0.0, vec2).gradient[1],
-              TestChannels(0.0, vec3).gradient[1], stress(trial2, 1).gradient[1])
+    warmup = (Vec(trial2)[1], Vec(trial3)[1], symmetric_gradient(trial2)[1, 1], symmetric_gradient(trial3)[1, 1],
+              TestChannels(0.0, vec2).gradient[1], TestChannels(0.0, vec3).gradient[1], stress(trial2, 1).gradient[1])
     sink += sum(warmup)
 
     vec_2d = @allocated for _ in 1:100
@@ -472,31 +462,25 @@ end
 
 # Strain regimes the simulation is expected to visit. Reused by the
 # two CH testsets and the spectral pinning testset.
-const _SPLIT_PROBE_STRAINS = ("tensile separated" =>
-                                  SymmetricTensor{2,2,Float64}((1.0e-3, 2.0e-4, 5.0e-4)),
-                              "compressive separated" =>
-                                  SymmetricTensor{2,2,Float64}((-1.0e-3, 2.0e-4, -5.0e-4)),
-                              "mixed sign at trace cusp" =>
-                                  SymmetricTensor{2,2,Float64}((1.0e-3, 5.0e-4, -1.0e-3)),
+const _SPLIT_PROBE_STRAINS = ("tensile separated" => SymmetricTensor{2,2,Float64}((1.0e-3, 2.0e-4, 5.0e-4)),
+                              "compressive separated" => SymmetricTensor{2,2,Float64}((-1.0e-3, 2.0e-4, -5.0e-4)),
+                              "mixed sign at trace cusp" => SymmetricTensor{2,2,Float64}((1.0e-3, 5.0e-4, -1.0e-3)),
                               "near-degenerate frame" =>
                                   SymmetricTensor{2,2,Float64}((5.0e-4 + 1.0e-12, 1.0e-12, 5.0e-4)),
-                              "exactly spherical" =>
-                                  SymmetricTensor{2,2,Float64}((5.0e-4, 0.0, 5.0e-4)),
+                              "exactly spherical" => SymmetricTensor{2,2,Float64}((5.0e-4, 0.0, 5.0e-4)),
                               "exact zero" => zero(SymmetricTensor{2,2,Float64}))
 
-function _spectral_split(ε::SymmetricTensor{2,2})
+_spectral_split(ε::SymmetricTensor{2,2}) =
     let e = eigen(ε)
         p1 = e.vectors[:, 1] ⊗ e.vectors[:, 1]
         p2 = e.vectors[:, 2] ⊗ e.vectors[:, 2]
         plus = max(e.values[1], 0.0) * p1 + max(e.values[2], 0.0) * p2
         (symmetric(plus), ε - symmetric(plus))
     end
-end
 
 function _ch_split(ε::SymmetricTensor{2,2})
     let detε = det(ε)
-        abs_ε = (tr(ε) * ε + 2 * max(-detε, 0.0) * one(ε)) /
-                sqrt(tr(ε ⋅ ε) + 2 * abs(detε) + eps(Float64))
+        abs_ε = (tr(ε) * ε + 2 * max(-detε, 0.0) * one(ε)) / sqrt(tr(ε ⋅ ε) + 2 * abs(detε) + eps(Float64))
         plus = symmetric((ε + abs_ε) / 2)
         (plus, ε - plus)
     end

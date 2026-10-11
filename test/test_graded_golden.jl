@@ -1,6 +1,5 @@
 using Unfitted
-using Unfitted: cell_basis_indices, cell_order, dof_layout, local_basis_indices, cell_indices,
-                is_active
+using Unfitted: cell_basis_indices, cell_order, dof_layout, local_basis_indices, cell_indices, is_active
 
 # Golden values for a level carrying a PER-CELL polynomial order.
 #
@@ -43,16 +42,13 @@ end
 # are not the same: `separable` in particular varies along one axis only, so no
 # cell has a lower neighbour on an axis it shares an index with — the case a
 # conservative "does this cell touch a jump" filter gets wrong.
-function _blocky(c, lo, hi)
-    [clamp(lo + (sum(Tuple(i)) - length(c)) ÷ 8, lo, hi) for i in CartesianIndices(c)]
-end
+_blocky(c, lo, hi) = [clamp(lo + (sum(Tuple(i)) - length(c)) ÷ 8, lo, hi) for i in CartesianIndices(c)]
 _fine(c, lo, hi) = [lo + (sum(Tuple(i)) - length(c)) % (hi - lo + 1) for i in CartesianIndices(c)]
 _onehot(c, lo, hi) = (a=fill(lo, c); a[CartesianIndex(cld.(c, 2))]=hi; a)
 function _band(c, lo, hi)
     mid = ntuple(d -> c[d] / 2, length(c))
     r = minimum(c) / 6
-    return [sum((Tuple(i)[d] - mid[d])^2 for d in 1:length(c)) < r^2 ? hi : lo
-            for i in CartesianIndices(c)]
+    return [sum((Tuple(i)[d] - mid[d])^2 for d in 1:length(c)) < r^2 ? hi : lo for i in CartesianIndices(c)]
 end
 function _aniso(c, lo, hi)
     D = length(c)
@@ -152,21 +148,18 @@ end
     end
 
     # Overlay stacks, and `elevate` on a level that is not the base.
-    V = overlay(space(Ω(2); cells=(16, 16), order=_blocky((16, 16), 1, 4)),
-                box((0.25, 0.25), (0.75, 0.75)); cells=(16, 16), order=3)
+    V = overlay(space(Ω(2); cells=(16, 16), order=_blocky((16, 16), 1, 4)), box((0.25, 0.25), (0.75, 0.75));
+                cells=(16, 16), order=3)
     _absorb!(state, V, next!())
     _absorb!(state, V, next!(); level=2)
     _absorb!(state, elevate(V, 2 => 6), next!(); level=2)
     _absorb!(state, elevate(V, 1 => _blocky((16, 16), 2, 5)), next!())
 
     # The fictitious fold, which re-masks the level underneath the user.
-    disc = physical_domain(x -> sum(abs2, x .- 0.5) - 0.16; lipschitz=2.0, alpha=1e-8,
-                           subcell_length_scale=0.05)
+    disc = physical_domain(x -> sum(abs2, x .- 0.5) - 0.16; lipschitz=2.0, alpha=1e-8, subcell_length_scale=0.05)
     _absorb!(state, space(Ω(2); cells=(8, 8), order=_blocky((8, 8), 1, 4), physical=disc), next!())
     _absorb!(state, space(Ω(2); cells=(8, 8), order=_aniso((8, 8), 1, 4), physical=disc), next!())
-    _absorb!(state,
-             space(Ω(2); cells=(8, 8), order=_blocky((8, 8), 1, 4), mode=:trunk, physical=disc),
-             next!())
+    _absorb!(state, space(Ω(2); cells=(8, 8), order=_blocky((8, 8), 1, 4), mode=:trunk, physical=disc), next!())
 
     # The digest. It covers every configuration above; a change here means the
     # per-cell mode sets moved, which is either the defect you are hunting or the

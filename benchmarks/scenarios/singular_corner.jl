@@ -21,8 +21,7 @@ let
     V = space(omega; cells=base_cells, order=max_order)
     for i in 1:no_refinements
         side = overlay_ratio^i
-        V = overlay(V, box((0.0, 0.0), (side, side)); cells=overlay_cells,
-                    order=max(1, max_order - i))
+        V = overlay(V, box((0.0, 0.0), (side, side)); cells=overlay_cells, order=max(1, max_order - i))
     end
 
     problem = poisson(V; source,

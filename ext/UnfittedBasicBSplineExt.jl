@@ -126,10 +126,9 @@ using Unfitted
 # installs on an Unfitted function is written `Unfitted.f(...)` at its
 # definition, which needs no import. The list is therefore an honest measure of
 # how far the extension reaches into the package.
-using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, AxisDofKey, TensorDofKey,
-                EliminationLedger, _LevelContext, _eliminate!, _constrain!, _pivot!, is_active,
-                AxisBox, _check_basis_mode, _level_side_is_physical, _tensor_dof_key, _Fold,
-                _is_fictitious, _is_void
+using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, AxisDofKey, TensorDofKey, EliminationLedger,
+                _LevelContext, _eliminate!, _constrain!, _pivot!, is_active, AxisBox, _check_basis_mode,
+                _level_side_is_physical, _tensor_dof_key, _Fold, _is_fictitious, _is_void
 using StaticArrays: SVector
 using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim
 
@@ -293,10 +292,8 @@ accepts it without special casing.
 function Unfitted.bspline(; continuity::Union{Symbol,Integer}=:maximal)
     continuity === :maximal && return _BSplineSpec(_MAXIMAL_CONTINUITY)
     continuity isa Symbol &&
-        throw(ArgumentError("bspline: continuity must be :maximal or a nonnegative integer; " *
-                            "got :$continuity"))
-    continuity >= 0 ||
-        throw(ArgumentError("bspline: continuity must be nonnegative; got $continuity"))
+        throw(ArgumentError("bspline: continuity must be :maximal or a nonnegative integer; " * "got :$continuity"))
+    continuity >= 0 || throw(ArgumentError("bspline: continuity must be nonnegative; got $continuity"))
     return _BSplineSpec(Int(continuity))
 end
 
@@ -401,19 +398,17 @@ _selects_by_support(family::BSplineFamily) = family.continuity == _MAXIMAL_CONTI
 # strong eliminations rather than a constraint cascade, so routing the
 # integer spelling through the cheaper mechanism costs the caller nothing and
 # saves the dof layer a pass.
-function Unfitted.instantiate_basis(spec::_BSplineSpec, mesh::CartesianMesh{D,T},
-                                    order::NTuple{D,Int}, mode::Symbol) where {D,T<:Real}
+function Unfitted.instantiate_basis(spec::_BSplineSpec, mesh::CartesianMesh{D,T}, order::NTuple{D,Int},
+                                    mode::Symbol) where {D,T<:Real}
     _check_basis_mode(spec, mode, order)
-    all(p -> p >= 1, order) ||
-        throw(ArgumentError("bspline order (per-axis polynomial degree) must be ≥ 1"))
+    all(p -> p >= 1, order) || throw(ArgumentError("bspline order (per-axis polynomial degree) must be ≥ 1"))
     m = spec.continuity
     m == _MAXIMAL_CONTINUITY && return _materialize(spec, mesh, order)
     max_m = minimum(p -> p - 1, order)
     m <= max_m || throw(ArgumentError("bspline continuity $m exceeds p_d − 1 = $max_m on the " *
                                       "lowest-degree axis; raise the order, lower the continuity, " *
                                       "or ask for :maximal"))
-    all(p -> m == p - 1, order) &&
-        return _materialize(_BSplineSpec(_MAXIMAL_CONTINUITY), mesh, order)
+    all(p -> m == p - 1, order) && return _materialize(_BSplineSpec(_MAXIMAL_CONTINUITY), mesh, order)
     # The clamped mechanism needs enough interior 1D dofs for the constraint
     # system to have something left to pivot onto: eliminating `m + 1` boundary
     # functions per side must leave at least one interior dof, i.e.
@@ -449,8 +444,8 @@ end
 # `_BSplineSpec` method applies is repeated — which a refinement cannot invalidate,
 # since it only adds cells, but which a new order from `elevate` is not checked
 # against.
-function Unfitted.instantiate_basis(family::BSplineFamily, mesh::CartesianMesh{D,T},
-                                    order::NTuple{D,Int}, mode::Symbol) where {D,T<:Real}
+function Unfitted.instantiate_basis(family::BSplineFamily, mesh::CartesianMesh{D,T}, order::NTuple{D,Int},
+                                    mode::Symbol) where {D,T<:Real}
     _check_basis_mode(family, mode, order)
     return _materialize(_BSplineSpec(family.continuity), mesh, order)
 end
@@ -472,8 +467,8 @@ function _materialize(spec::_BSplineSpec, mesh::CartesianMesh{D,T}, p::NTuple{D,
     cell_to_span = ntuple(D) do d
         collect(1:mesh.cells[d])  # uniform knots: span = cell index
     end
-    return BSplineFamily{D,T,typeof(spaces),typeof(derivative_spaces)}(spaces, derivative_spaces,
-                                                                       axis_coords, cell_to_span, m)
+    return BSplineFamily{D,T,typeof(spaces),typeof(derivative_spaces)}(spaces, derivative_spaces, axis_coords,
+                                                                       cell_to_span, m)
 end
 
 # Build a clamped open uniform knot vector for one axis from the mesh's
@@ -529,8 +524,7 @@ Unfitted.basis_name(::_BSplineSpec) = :bspline
 # local functions are non-zero at the face (only local index `p` vanishes at
 # the cell's lower edge, only local index `0` at its upper edge), so a caller
 # that needs interior-face support must ask the knot vector, not this.
-function Unfitted.is_boundary_basis(family::BSplineFamily, id::CartesianIndex{D}, axis::Integer,
-                                    side::Symbol) where {D}
+function Unfitted.is_boundary_basis(family::BSplineFamily, id::CartesianIndex{D}, axis::Integer, side::Symbol) where {D}
     1 <= axis <= D || throw(ArgumentError("axis out of bounds"))
     p = degree(family.spaces[axis])
     side === :lower && return id.I[axis] == 0
@@ -547,8 +541,7 @@ end
 # basis function `N_i(t)` satisfies `dN/dξ = dN/dt · half_width`, so the
 # reference-frame derivative the kernel needs to fill into `der1d[d]`
 # already includes that factor.
-@inline function _axis_parameter(family::BSplineFamily{D,T}, axis::Integer, cell::Integer,
-                                 ξ::Real) where {D,T}
+@inline function _axis_parameter(family::BSplineFamily{D,T}, axis::Integer, cell::Integer, ξ::Real) where {D,T}
     coords = family.axis_coords[axis]
     t_lower = coords[cell]
     t_upper = coords[cell + 1]
@@ -562,8 +555,7 @@ end
 # values on `span` as a stack-allocated `SVector{p_d + 1}` — no
 # allocation; the SVector entries are then unrolled into the per-axis
 # buffer.
-function Unfitted._fill_factor_tables!(family::BSplineFamily{D,T,S,DS}, val1d, order::NTuple{D,Int},
-                                       ξ::SVector{D,Tξ},
+function Unfitted._fill_factor_tables!(family::BSplineFamily{D,T,S,DS}, val1d, order::NTuple{D,Int}, ξ::SVector{D,Tξ},
                                        cell::CartesianIndex{D}) where {D,T,S,DS,Tξ}
     @inbounds for d in 1:D
         c = cell.I[d]
@@ -588,9 +580,8 @@ end
 # `dN/dx = dN/dt · (h_d / 2) · (2 / h_d) = dN/dt`, the physical
 # derivative — consistent with the integrated-Legendre chain-rule
 # convention.
-function Unfitted._fill_factor_tables!(family::BSplineFamily{D,T,S,DS}, val1d, der1d,
-                                       order::NTuple{D,Int}, ξ::SVector{D,Tξ},
-                                       cell::CartesianIndex{D}) where {D,T,S,DS,Tξ}
+function Unfitted._fill_factor_tables!(family::BSplineFamily{D,T,S,DS}, val1d, der1d, order::NTuple{D,Int},
+                                       ξ::SVector{D,Tξ}, cell::CartesianIndex{D}) where {D,T,S,DS,Tξ}
     @inbounds for d in 1:D
         c = cell.I[d]
         span = family.cell_to_span[d][c]
@@ -629,8 +620,7 @@ end
 # across the level, so adjacent cells naturally reuse the dof slot for
 # every shared function through the `TensorDofKey` cache in
 # `src/dofs.jl`.
-@inline function _bspline_axis_dof_key(family::BSplineFamily, axis::Integer, cell_axis::Integer,
-                                       mode::Integer)
+@inline function _bspline_axis_dof_key(family::BSplineFamily, axis::Integer, cell_axis::Integer, mode::Integer)
     return AxisDofKey(_AXIS_BSPLINE, family.cell_to_span[axis][cell_axis] + mode, 0)
 end
 
@@ -643,8 +633,8 @@ end
 # (`continuity ≥ 1`) at the **overlay-artificial** boundary are
 # imposed by the linear-constraint rows
 # [`_overlay_constraints!`](@ref) records, not through this predicate.
-function Unfitted._key_on_level_side(key::TensorDofKey{D}, level::Level{D,T,<:BSplineFamily},
-                                     axis::Integer, side::Symbol) where {D,T}
+function Unfitted._key_on_level_side(key::TensorDofKey{D}, level::Level{D,T,<:BSplineFamily}, axis::Integer,
+                                     side::Symbol) where {D,T}
     axis_key = key.axes[axis]
     axis_key.kind == _AXIS_BSPLINE || return false
     family = level.basis
@@ -760,8 +750,7 @@ end
 
 # Whether the tensor B-spline named by `key` may stay: its full, unclipped support
 # must be admissible.
-function _support_admissible(a::_Admissibility{D,T,<:BSplineFamily},
-                             key::TensorDofKey{D}) where {D,T}
+function _support_admissible(a::_Admissibility{D,T,<:BSplineFamily}, key::TensorDofKey{D}) where {D,T}
     lo, hi = _support_block(a.level.basis, ntuple(d -> key.axes[d].index, D))
     return _block_admissible(a, lo, hi)
 end
@@ -890,8 +879,7 @@ end
 #     *Weakly Enforced Essential Boundary Conditions for NURBS-embedded and
 #     trimmed NURBS geometries on the basis of the Finite Cell Method*,
 #     Int. J. Numer. Methods Engng. 95 (2013) 811–846.
-function Unfitted._overlay_constraints!(ledger::EliminationLedger,
-                                        level::Level{D,T,<:BSplineFamily},
+function Unfitted._overlay_constraints!(ledger::EliminationLedger, level::Level{D,T,<:BSplineFamily},
                                         ctx::_LevelContext{D,T}) where {D,T}
     _selects_by_support(level.basis) && return _selection_constraints!(ledger, level, ctx)
     # The clamped path does not walk `ctx.raws`: the trace generator walks the
@@ -977,8 +965,7 @@ function _trace_coeffs(P_d, lower_span::Int, upper_span::Int, t_star, ::Val{m}) 
 end
 
 @inline _trace_at(P_d, span, t_star, k::Int) = k == 0 ? bsplinebasisall(P_d, span, t_star) :
-                                               bsplinebasisall(BSplineDerivativeSpace{k}(P_d), span,
-                                                               t_star)
+                                               bsplinebasisall(BSplineDerivativeSpace{k}(P_d), span, t_star)
 
 # Returns `(active_cell::CartesianIndex{D}, span::Int)` if the face at
 # axis `d`, position `j`, perpendicular cell `perp_cell` is artificial
@@ -999,8 +986,8 @@ end
 # integrated-Legendre family, and both ask it of `_is_fictitious`
 # (`src/coverage.jl`) on the build's material oracle `fold`. With no physical
 # domain every inactive cell holds material and nothing is classified.
-function _active_cell_at_face(level::Level{D}, d::Int, j::Int, perp_cell::CartesianIndex{D},
-                              n_cells::NTuple{D,Int}, ::Val{D}, fold::_Fold{D}) where {D}
+function _active_cell_at_face(level::Level{D}, d::Int, j::Int, perp_cell::CartesianIndex{D}, n_cells::NTuple{D,Int},
+                              ::Val{D}, fold::_Fold{D}) where {D}
     if j == 0 || j == n_cells[d]
         axis_d_idx = j == 0 ? 1 : n_cells[d]
         cell = CartesianIndex(ntuple(e -> e == d ? axis_d_idx : perp_cell[e], D))
@@ -1041,14 +1028,12 @@ end
 # Speleers, Comput. Aided Geom. Design 29 (2012) 485–498, Definition 1(I)). The
 # fine half is the support selection in `_selection_constraints!`; together they
 # are the hierarchical spline basis, stated for superposed independent grids.
-function Unfitted._burial_cells(level::Level{D,T,<:BSplineFamily},
-                                key::TensorDofKey{D}) where {D,T<:Real}
+function Unfitted._burial_cells(level::Level{D,T,<:BSplineFamily}, key::TensorDofKey{D}) where {D,T<:Real}
     return _support_cells(key, level.basis, level.mesh.cells)
 end
 
 function _support_cells(key::TensorDofKey{D}, family::BSplineFamily{D}, n::NTuple{D,Int}) where {D}
-    return CartesianIndices(ntuple(d -> _axis_support(key.axes[d].index, degree(family.spaces[d]),
-                                                      n[d]), D))
+    return CartesianIndices(ntuple(d -> _axis_support(key.axes[d].index, degree(family.spaces[d]), n[d]), D))
 end
 
 # The cells this level's axis-`d` 1D function with global index `i` is supported
@@ -1078,13 +1063,11 @@ end
 # Every other family answers `false` (the trait's default). That is the safe direction:
 # skipping a legitimate dedup leaves a rank-deficient operator, whereas deduping a
 # function nothing reproduces would delete part of the space.
-function Unfitted._reproduces(k::Level{D,T,<:BSplineFamily},
-                              level::Level{D,T,<:BSplineFamily}) where {D,T<:Real}
+function Unfitted._reproduces(k::Level{D,T,<:BSplineFamily}, level::Level{D,T,<:BSplineFamily}) where {D,T<:Real}
     return all(d -> degree(k.basis.spaces[d]) == degree(level.basis.spaces[d]), 1:D)
 end
 
-function Unfitted._reproduces(k::Level{D,T,<:IntegratedLegendre},
-                              level::Level{D,T,<:BSplineFamily}) where {D,T<:Real}
+function Unfitted._reproduces(k::Level{D,T,<:IntegratedLegendre}, level::Level{D,T,<:BSplineFamily}) where {D,T<:Real}
     k.mode === :tensor || return false
     p = ntuple(d -> degree(level.basis.spaces[d]), D)
     # `nominal_order(k)` is the level's per-axis maximum, which is not enough when `k` carries
@@ -1105,8 +1088,7 @@ end
 # question: a degree-1 B-spline cover over an integrated-Legendre base is the C⁰ hat
 # space and was previously refused the dedup by a family type test, leaving the stack
 # exactly singular.
-function Unfitted._reproduces(k::Level{D,T,<:BSplineFamily},
-                              ::Level{D,T,<:IntegratedLegendre}) where {D,T<:Real}
+function Unfitted._reproduces(k::Level{D,T,<:BSplineFamily}, ::Level{D,T,<:IntegratedLegendre}) where {D,T<:Real}
     return all(d -> degree(k.basis.spaces[d]) == 1, 1:D)
 end
 
@@ -1152,8 +1134,7 @@ end
 # statement about supports describes, and it can reproduce a *combination* of two
 # buried functions without reproducing either — a dependency a per-function dedup
 # cannot see, and one exact null mode per combination in the assembled operator.
-function Unfitted._reproduced_by(cover::_Admissibility{D,T,<:BSplineFamily},
-                                 level::Level{D,T,<:BSplineFamily},
+function Unfitted._reproduced_by(cover::_Admissibility{D,T,<:BSplineFamily}, level::Level{D,T,<:BSplineFamily},
                                  key::TensorDofKey{D}) where {D,T<:Real}
     coarse = level.basis
     index = ntuple(d -> key.axes[d].index, D)
@@ -1187,8 +1168,7 @@ end
 # up to floating point; rounding to the nearest integer is therefore the right
 # reading rather than a tolerance choice, and it extends past `k`'s own box
 # because the grid does.
-function _fine_cell_range(a::_Admissibility{D,T}, lower::SVector{D,T},
-                          upper::SVector{D,T}) where {D,T}
+function _fine_cell_range(a::_Admissibility{D,T}, lower::SVector{D,T}, upper::SVector{D,T}) where {D,T}
     origin = a.level.mesh.domain.lower
     lo = ntuple(d -> round(Int, (lower[d] - origin[d]) / a.width[d]) + 1, D)
     hi = ntuple(d -> round(Int, (upper[d] - origin[d]) / a.width[d]), D)
@@ -1202,8 +1182,7 @@ end
 # credited to `:overlay`, and its dedup row collapses to `0 = 0`. Eliminating it
 # directly instead would remove it *before* the trace rows are resolved and change
 # which raws they pivot (see `EliminationLedger`).
-function Unfitted._dedup!(ledger::EliminationLedger{T}, level::Level{D,T,<:BSplineFamily},
-                          raw::Int) where {D,T<:Real}
+function Unfitted._dedup!(ledger::EliminationLedger{T}, level::Level{D,T,<:BSplineFamily}, raw::Int) where {D,T<:Real}
     _selects_by_support(level.basis) && return _eliminate!(ledger, raw, :dedup)
     return _constrain!(ledger, [raw], [one(T)], :dedup)
 end
@@ -1218,10 +1197,7 @@ end
 # below lives here rather than in the core because this family is its only
 # consumer: the core keeps the ledger, the pivot table and a default that raises
 # for a family that records rows without resolving them.
-function Unfitted._resolve_rows!(ledger::EliminationLedger,
-                                 ::Level{D,T,<:BSplineFamily}) where {D,T}
-    return _cascade!(ledger)
-end
+Unfitted._resolve_rows!(ledger::EliminationLedger, ::Level{D,T,<:BSplineFamily}) where {D,T} = _cascade!(ledger)
 
 # Combine repeated raws in a list of `(raw, coefficient)` pairs by
 # summing the coefficients, dropping terms whose coefficient falls
@@ -1331,8 +1307,7 @@ function _cascade!(ledger::EliminationLedger{T}) where {T}
         pivot_raw, pivot_coeff = combined[pivot_pos]
 
         # 4) Build the pivot expansion (in terms of remaining raws).
-        new_expansion = Tuple{Int,T}[(raw, -c / pivot_coeff)
-                                     for (k, (raw, c)) in pairs(combined) if k != pivot_pos]
+        new_expansion = Tuple{Int,T}[(raw, -c / pivot_coeff) for (k, (raw, c)) in pairs(combined) if k != pivot_pos]
 
         expansions[pivot_raw - offset] = new_expansion
         sources[pivot_raw - offset] = source
@@ -1376,9 +1351,8 @@ end
 #
 # Both tables are `_cascade!`'s level-local ones: entry `raw - offset` belongs to
 # `raw`, and an entry stays unassigned until something is written to it.
-function _back_substitute!(expansions::Vector{Vector{Tuple{Int,T}}}, mentions::Vector{Vector{Int}},
-                           offset::Int, pivot_raw::Int,
-                           pivot_expansion::Vector{Tuple{Int,T}}) where {T}
+function _back_substitute!(expansions::Vector{Vector{Tuple{Int,T}}}, mentions::Vector{Vector{Int}}, offset::Int,
+                           pivot_raw::Int, pivot_expansion::Vector{Tuple{Int,T}}) where {T}
     isassigned(mentions, pivot_raw - offset) || return expansions
     @inbounds for raw in mentions[pivot_raw - offset]
         raw == pivot_raw && continue

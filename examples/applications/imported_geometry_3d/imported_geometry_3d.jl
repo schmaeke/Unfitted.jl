@@ -143,8 +143,8 @@ const z_hi = 0.8            # so the box truncates it and owns the end faces
 # The L-shaped cross-section, listed counter-clockwise so the extruded side
 # walls come out outward-facing under the right-hand rule. Vertex 4 is the
 # reflex corner — interior angle 270° — and the whole point of the example.
-const profile = [SVector(0.0, 0.0), SVector(span, 0.0), SVector(span, arm), SVector(arm, arm),
-                 SVector(arm, span), SVector(0.0, span)]
+const profile = [SVector(0.0, 0.0), SVector(span, 0.0), SVector(span, arm), SVector(arm, arm), SVector(arm, span),
+                 SVector(0.0, span)]
 const reflex = 4
 
 # Analytic area of the L-shaped cross-section; the volume reference below is
@@ -259,17 +259,14 @@ volume_error = abs(quadrature_volume[] - exact_volume) / exact_volume
 # C⁰ and the clip converges at first order, so the edge stays comparatively
 # faceted however deep this goes.
 out = joinpath(@__DIR__, "output", "imported_geometry_3d")
-write_vtk(out, sol, model;
-          point_data=(u=(uh, c, x, xi) -> uh(c, xi), exact=(uh, c, x, xi) -> exact(x)), cut_depth=3)
+write_vtk(out, sol, model; point_data=(u=(uh, c, x, xi) -> uh(c, xi), exact=(uh, c, x, xi) -> exact(x)), cut_depth=3)
 write_quadrature_vtm(out * "_quadrature", model)
 
-print_run_report("L-bracket from a triangle surface — imported-geometry level set",
-                 diagnostics(model, sol; exact); output=out,
-                 parameters=(:surface_triangles => length(surface.cells), :cells => cells,
-                             :order => order,
+print_run_report("L-bracket from a triangle surface — imported-geometry level set", diagnostics(model, sol; exact);
+                 output=out,
+                 parameters=(:surface_triangles => length(surface.cells), :cells => cells, :order => order,
                              :cross_section => "L-profile, arm $(arm) of span $(span)",
-                             :subcell_length_scale => solid.subcell_length_scale,
-                             :max_depth => solid.max_depth))
+                             :subcell_length_scale => solid.subcell_length_scale, :max_depth => solid.max_depth))
 println("  quadrature volume: ", quadrature_volume[])
 println("  analytic volume: ", exact_volume)
 println("  volume error: ", volume_error)

@@ -149,8 +149,7 @@ println()
 
 report = diagnostics(model, solution; exact)
 print_run_report("Tutorial 1 — Poisson on the interval (0, 1)", report;
-                 parameters=(:cells => V.levels[1].mesh.cells,
-                             :order => nominal_order(V.levels[1])))
+                 parameters=(:cells => V.levels[1].mesh.cells, :order => nominal_order(V.levels[1])))
 
 # ── The same workflow in two dimensions ──────────────────────────────────────
 #
@@ -170,10 +169,7 @@ solution_2d = solve!(model_2d)
 
 println()
 println("Tutorial 1 — the same script one dimension up")
-println("    u_h(0.5, 0.5) = ", value(solution_2d, model_2d, u_2d, (0.5, 0.5)), "   exact = ",
-        exact_2d((0.5, 0.5)))
+println("    u_h(0.5, 0.5) = ", value(solution_2d, model_2d, u_2d, (0.5, 0.5)), "   exact = ", exact_2d((0.5, 0.5)))
 println()
-print_run_report("Tutorial 1 — Poisson on the unit square (0, 1)²",
-                 diagnostics(model_2d, solution_2d; exact=exact_2d);
-                 parameters=(:cells => V_2d.levels[1].mesh.cells,
-                             :order => nominal_order(V_2d.levels[1])))
+print_run_report("Tutorial 1 — Poisson on the unit square (0, 1)²", diagnostics(model_2d, solution_2d; exact=exact_2d);
+                 parameters=(:cells => V_2d.levels[1].mesh.cells, :order => nominal_order(V_2d.levels[1])))

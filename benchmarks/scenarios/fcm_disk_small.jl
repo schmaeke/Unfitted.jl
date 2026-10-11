@@ -20,10 +20,8 @@ let
 
     V = space(omega; cells=(8, 8), order=2, physical=disk)
     u = field(:u, V)
-    problem = Problem((u,);
-                      blocks=(stiffness_block(u; diffusion=1.0), mass_block(u; coefficient=1.0)),
-                      loads=(source_load(u; source=rhs),),
-                      dirichlet=[dirichlet(0.0; on=boundary(:all))])
+    problem = Problem((u,); blocks=(stiffness_block(u; diffusion=1.0), mass_block(u; coefficient=1.0)),
+                      loads=(source_load(u; source=rhs),), dirichlet=[dirichlet(0.0; on=boundary(:all))])
 
     model = prepare(problem)
     assemble!(model)

@@ -66,8 +66,8 @@ end
 # The identity id map makes `_fold_pivot` hand back raw ids rather than active ids, so
 # the read is independent of the numbering and never touches a constrained value.
 function _dl_pivot(dofs, raw::Integer)
-    branches, pivot = Unfitted._fold_pivot((acc, g, w, v) -> push!(acc, (g, w)),
-                                           Tuple{Int,Float64}[], dofs, (o, c) -> o, raw, 1)
+    branches, pivot = Unfitted._fold_pivot((acc, g, w, v) -> push!(acc, (g, w)), Tuple{Int,Float64}[], dofs,
+                                           (o, c) -> o, raw, 1)
     return pivot ? branches : nothing
 end
 
@@ -130,8 +130,7 @@ end
 function _dl_problem(V, bcs; components::Integer=1)
     u = field(:u, V; components=components)
     src = components == 1 ? 1.0 : SVector(ntuple(_ -> 1.0, components))
-    return Problem((u,); blocks=(stiffness_block(u),), loads=(source_load(u; source=src),),
-                   dirichlet=bcs)
+    return Problem((u,); blocks=(stiffness_block(u),), loads=(source_load(u; source=src),), dirichlet=bcs)
 end
 
 # The seven configurations: each a different way for the layout to be non-trivial.
@@ -140,10 +139,8 @@ function _dl_configurations()
     # 1. IL overlay with nonzero data on all faces but one. The overlay sits on the
     #    corner where a Dirichlet face meets the excepted one, so detection must keep
     #    the excepted face natural on both levels.
-    c1 = _dl_problem(overlay(space(_DL_U2; cells=6, order=3), box((0.0, 2 / 3), (1 / 3, 1.0));
-                             cells=4, order=2),
-                     [dirichlet(x -> 1.0 + x[1] * x[2];
-                                on=boundary(:all; except=(axis=2, side=:upper)))])
+    c1 = _dl_problem(overlay(space(_DL_U2; cells=6, order=3), box((0.0, 2 / 3), (1 / 3, 1.0)); cells=4, order=2),
+                     [dirichlet(x -> 1.0 + x[1] * x[2]; on=boundary(:all; except=(axis=2, side=:upper)))])
     # 2. An adapted IL ladder: a corner refined to the bottom rung, graded.
     depths = zeros(Int, 4, 4)
     depths[1, 1] = 3
@@ -155,11 +152,9 @@ function _dl_configurations()
                      [dirichlet(0.0; on=boundary(:all))])
     # 4. A 2-component IL field: an `:except` condition on both components and a
     #    component-2 condition on the excepted face, over an overlay on that face.
-    c4 = _dl_problem(overlay(space(_DL_U2; cells=4, order=2), box((0.5, 0.25), (1.0, 0.75));
-                             cells=2, order=3),
+    c4 = _dl_problem(overlay(space(_DL_U2; cells=4, order=2), box((0.5, 0.25), (1.0, 0.75)); cells=2, order=3),
                      [dirichlet(SVector(0.0, 0.0); on=boundary(:all; except=(axis=1, side=:upper))),
-                      dirichlet(x -> 1.0 + x[2]; on=boundary(axis=1, side=:upper), component=2)];
-                     components=2)
+                      dirichlet(x -> 1.0 + x[2]; on=boundary(axis=1, side=:upper), component=2)]; components=2)
     # 5. A clamped C¹ B-spline level under an L mask: the masked faces' trace rows
     #    leave linear-constraint pivots.
     mask = trues(8, 8)
@@ -168,16 +163,14 @@ function _dl_configurations()
                      [dirichlet(0.0; on=boundary(:all))])
     # 6. A maximal B-spline base under a nested maximal cover: support selection on
     #    the overlay, the B-spline dedup on the base.
-    c6 = _dl_problem(overlay(space(_DL_U2; cells=8, order=3, basis=bspline()),
-                             box((0.25, 0.25), (0.75, 0.75)); cells=8, order=3, basis=bspline()),
-                     [dirichlet(0.0; on=boundary(:all))])
+    c6 = _dl_problem(overlay(space(_DL_U2; cells=8, order=3, basis=bspline()), box((0.25, 0.25), (0.75, 0.75)); cells=8,
+                             order=3, basis=bspline()), [dirichlet(0.0; on=boundary(:all))])
     # 7. A 1D IL overlay with nonzero data at both ends.
-    c7 = _dl_problem(overlay(space(box((0.0,), (1.0,)); cells=8, order=3), box((0.25,), (0.5,));
-                             cells=4, order=2), [dirichlet(x -> 1.0 + x[1]; on=boundary(:all))])
-    return ["IL 2D overlay, nonzero :except" => c1, "IL 2D adapted ladder" => c2,
-            "IL 3D overlay" => c3, "IL 2-component field, :except + component" => c4,
-            "clamped C1 B-spline, L mask" => c5, "maximal B-spline, nested cover" => c6,
-            "IL 1D overlay, nonzero" => c7]
+    c7 = _dl_problem(overlay(space(box((0.0,), (1.0,)); cells=8, order=3), box((0.25,), (0.5,)); cells=4, order=2),
+                     [dirichlet(x -> 1.0 + x[1]; on=boundary(:all))])
+    return ["IL 2D overlay, nonzero :except" => c1, "IL 2D adapted ladder" => c2, "IL 3D overlay" => c3,
+            "IL 2-component field, :except + component" => c4, "clamped C1 B-spline, L mask" => c5,
+            "maximal B-spline, nested cover" => c6, "IL 1D overlay, nonzero" => c7]
 end
 
 # Written at the round-2 baseline (`ff390ba`): unknowns, pivots, reduced modes, digest.

@@ -98,9 +98,9 @@ sig(x, n=4) = string(round(x; sigdigits=n))
 println("step  unknowns   η           η/‖u‖_a     consistency  L² error")
 for step in 1:20
     est = estimate(model, u)
-    println("  ", lpad(step, 2), "  ", lpad(active_unknowns(model), 7), "  ",
-            rpad(sig(est.total), 11), " ", rpad(sig(est.total / est.reference), 11), " ",
-            rpad(sig(est.consistency), 11), "  ", sig(l2_error(u, model, exact)))
+    println("  ", lpad(step, 2), "  ", lpad(active_unknowns(model), 7), "  ", rpad(sig(est.total), 11), " ",
+            rpad(sig(est.total / est.reference), 11), " ", rpad(sig(est.consistency), 11), "  ",
+            sig(l2_error(u, model, exact)))
     est.total <= 1.0e-4 * est.reference && (println("  ── tolerance met ──"); break)
 
     refined = refine(model.prefold_space, est; theta=0.5, previous=previous)

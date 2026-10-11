@@ -149,18 +149,16 @@ model_nested, solution_nested, u_nested, report_nested = solve_and_report(V_nest
 # estimate; the model prints it for systems small enough to densify
 # (a few hundred unknowns), and `NaN` above that.
 
-V_undeduped = overlay(space(omega; cells=8, order=3, basis=bspline()),
-                      box((0.25, 0.25), (0.75, 0.75)); cells=16)
-_, _, _, report_undeduped = solve_and_report(V_undeduped,
-                                             "Part 1c — the same stack, deduplication switched off";
+V_undeduped = overlay(space(omega; cells=8, order=3, basis=bspline()), box((0.25, 0.25), (0.75, 0.75)); cells=16)
+_, _, _, report_undeduped = solve_and_report(V_undeduped, "Part 1c — the same stack, deduplication switched off";
                                              parameters=(:pruning => "off",), prune=false)
 
 println("Nested B-spline stack, deduplicated : unknowns ", report_nested.active_unknowns, ", cond ",
         report_nested.condition_estimate)
-println("Nested B-spline stack, as built     : unknowns ", report_undeduped.active_unknowns,
-        ", cond ", report_undeduped.condition_estimate)
-println("u_h(0.5, 0.5) = ", value(solution_nested, model_nested, u_nested, (0.5, 0.5)),
-        "   reference = ", CENTRE_REFERENCE)
+println("Nested B-spline stack, as built     : unknowns ", report_undeduped.active_unknowns, ", cond ",
+        report_undeduped.condition_estimate)
+println("u_h(0.5, 0.5) = ", value(solution_nested, model_nested, u_nested, (0.5, 0.5)), "   reference = ",
+        CENTRE_REFERENCE)
 println()
 
 # The undeduplicated operator is numerically singular: its condition
@@ -187,12 +185,10 @@ println()
 # compare the two solutions pointwise. Two different bases, two different
 # unknown counts, one answer.
 
-perforated = physical_domain(leaf(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0);
-                             subcell_length_scale=1 / 128, max_depth=6)
+perforated = physical_domain(leaf(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0); subcell_length_scale=1 / 128, max_depth=6)
 
 V_immersed = space(omega; cells=8, order=3, basis=bspline(), physical=perforated)
-model_bs, solution_bs, u_bs, report_bs = solve_and_report(V_immersed,
-                                                          "Part 2 — B-splines on a perforated square (FCM)")
+model_bs, solution_bs, u_bs, report_bs = solve_and_report(V_immersed, "Part 2 — B-splines on a perforated square (FCM)")
 
 V_reference = space(omega; cells=8, order=3, physical=perforated)
 model_il, solution_il, u_il, report_il = solve_and_report(V_reference,
@@ -211,8 +207,7 @@ println("immersed scaled cond, bspline : ", report_bs.scaled_condition_estimate)
 println("immersed cond, bspline          : ", report_bs.condition_estimate)
 println("Unknowns, B-spline       : ", report_bs.active_unknowns)
 println("Unknowns, Legendre       : ", report_il.active_unknowns)
-println("Cut regions / fit failures: ", report_bs.cut_region_count, " / ",
-        report_bs.fit_failure_count)
+println("Cut regions / fit failures: ", report_bs.cut_region_count, " / ", report_bs.fit_failure_count)
 println()
 
 # ── What to check when this script runs ──────────────────────────────────────

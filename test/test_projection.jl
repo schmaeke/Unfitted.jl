@@ -50,8 +50,7 @@ end
     # The cached-matrix path omits the lift, so it must reject this target
     # rather than silently return wrong interior coefficients.
     target_mass = assemble_matrix(target_model, mass_block(first(target_model.problem.fields)))
-    @test_throws ArgumentError transfer(source_solution, source_model, target_model;
-                                        via=L2Projection(target_mass))
+    @test_throws ArgumentError transfer(source_solution, source_model, target_model; via=L2Projection(target_mass))
 end
 
 @testset "L2 transfer between shifted overlays preserves constants" begin
@@ -66,8 +65,7 @@ end
     base_dofs = Unfitted.active_cell_dofs(source_model.dofs, 1, CartesianIndex(1))
     coefficients[base_dofs[1]] = 1.0
     coefficients[base_dofs[2]] = 1.0
-    source_solution = Solution(coefficients, source_model.version,
-                               Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    source_solution = Solution(coefficients, source_model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
     target_solution = transfer(source_solution, source_model, target_model)
 
@@ -88,8 +86,7 @@ end
         dofs = Unfitted.active_cell_dofs(source_model.dofs, 1, CartesianIndex(1), component)
         coefficients[dofs] .= component == 1 ? 2.0 : -1.0
     end
-    source_solution = Solution(coefficients, source_model.version,
-                               Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    source_solution = Solution(coefficients, source_model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
     target_solution = transfer(source_solution, source_model, target_model)
     exact = x -> SVector(2.0, -1.0)
@@ -108,21 +105,16 @@ end
     target_c = field(:c, target_space)
     zero_form = WeakForm(bilinear=(q, trial) -> 0.0, linear=q -> 0.0, symmetric=true)
     source_model = prepare(Problem((source_u, source_c);
-                                   blocks=(block(source_u, source_u, zero_form),
-                                           block(source_c, source_c, zero_form)),
-                                   loads=(loadform(source_u, zero_form),
-                                          loadform(source_c, zero_form))))
+                                   blocks=(block(source_u, source_u, zero_form), block(source_c, source_c, zero_form)),
+                                   loads=(loadform(source_u, zero_form), loadform(source_c, zero_form))))
     target_model = prepare(Problem((target_u, target_c);
-                                   blocks=(block(target_u, target_u, zero_form),
-                                           block(target_c, target_c, zero_form)),
-                                   loads=(loadform(target_u, zero_form),
-                                          loadform(target_c, zero_form))))
+                                   blocks=(block(target_u, target_u, zero_form), block(target_c, target_c, zero_form)),
+                                   loads=(loadform(target_u, zero_form), loadform(target_c, zero_form))))
 
     coefficients = zeros(Unfitted.active_unknowns(source_model.dofs))
     coefficients[Unfitted.active_cell_dofs(source_model.dofs, :u, 1, CartesianIndex(1))] .= 2.0
     coefficients[Unfitted.active_cell_dofs(source_model.dofs, :c, 1, CartesianIndex(1))] .= -1.0
-    source_solution = Solution(coefficients, source_model.version,
-                               Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    source_solution = Solution(coefficients, source_model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
     target_solution = transfer(source_solution, source_model, target_model)
     @test value(target_solution, target_model, target_u, (0.3,)) ≈ 2.0
@@ -157,20 +149,17 @@ end
     coefficients = zeros(Unfitted.active_unknowns(source_model.dofs))
     overlay_dofs = Unfitted.active_cell_dofs(source_model.dofs, 2, CartesianIndex(1))
     coefficients[overlay_dofs[3]] = 1.0
-    source_solution = Solution(coefficients, source_model.version,
-                               Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    source_solution = Solution(coefficients, source_model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
     target_solution = transfer(source_solution, source_model, target_model)
 
     @test value(source_solution, source_model, (0.1,)) ≈ 0.0 atol = 1.0e-12
     @test value(target_solution, target_model, (0.1,)) ≈ 0.0 atol = 1.0e-12
-    @test l2_error(target_solution, target_model, x -> value(source_solution, source_model, x);
-                   norm=:absolute) < 1.0e-12
+    @test l2_error(target_solution, target_model, x -> value(source_solution, source_model, x); norm=:absolute) <
+          1.0e-12
 
     target_overlay_raw = Unfitted.cell_dofs(target_model.dofs, 2, CartesianIndex(1))
-    constrained = [raw
-                   for raw in target_overlay_raw
-                   if Unfitted.constraint_kind(target_model.dofs, raw) == :overlay]
+    constrained = [raw for raw in target_overlay_raw if Unfitted.constraint_kind(target_model.dofs, raw) == :overlay]
     @test all(iszero(Unfitted.constrained_value(target_model.dofs, raw)) for raw in constrained)
 end
 
@@ -194,16 +183,15 @@ end
     target_space = overlay(source_space, box((0.3, 0.3), (0.7, 0.7)); cells=(2, 2), order=2,
                            basis=bspline(; continuity=0), active=mask)
 
-    source_model = prepare(poisson(source_space; source=1.0,
-                                   dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    source_model = prepare(poisson(source_space; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     source_solution = solve!(source_model)
     target_model = prepare(poisson(target_space; source=0.0))
     @test Unfitted.has_linear_constraints(target_model.dofs)
 
     target_solution = transfer(source_solution, source_model, target_model)
     @test target_solution.diagnostics.residual_norm < 1.0e-12
-    @test l2_error(target_solution, target_model, x -> value(source_solution, source_model, x);
-                   norm=:relative) < 1.0e-12
+    @test l2_error(target_solution, target_model, x -> value(source_solution, source_model, x); norm=:relative) <
+          1.0e-12
 end
 
 @testset "L2 transfer between B-spline models at the default continuity" begin
@@ -214,11 +202,9 @@ end
     # default spelling of that family is this one.
     omega = box((0.0, 0.0), (1.0, 1.0))
     source_space = space(omega; cells=(8, 8), order=2, basis=bspline())
-    target_space = overlay(source_space, box((0.3, 0.3), (0.7, 0.7)); cells=(5, 5), order=2,
-                           basis=bspline())
+    target_space = overlay(source_space, box((0.3, 0.3), (0.7, 0.7)); cells=(5, 5), order=2, basis=bspline())
 
-    source_model = prepare(poisson(source_space; source=1.0,
-                                   dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    source_model = prepare(poisson(source_space; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     source_solution = solve!(source_model)
     target_model = prepare(poisson(target_space; source=0.0))
     @test !Unfitted.has_linear_constraints(target_model.dofs)
@@ -228,14 +214,13 @@ end
     # round-off rather than merely being finite.
     target_solution = transfer(source_solution, source_model, target_model)
     @test target_solution.diagnostics.residual_norm < 1.0e-12
-    @test l2_error(target_solution, target_model, x -> value(source_solution, source_model, x);
-                   norm=:relative) < 1.0e-12
+    @test l2_error(target_solution, target_model, x -> value(source_solution, source_model, x); norm=:relative) <
+          1.0e-12
 end
 
 @testset "L2 transfer rejects incompatible models" begin
     source_model = prepare(poisson(space(box((0.0,), (1.0,)); cells=1, order=1); source=0.0))
-    target_model = prepare(poisson(space(box((0.0, 0.0), (1.0, 1.0)); cells=(1, 1), order=1);
-                                   source=0.0))
+    target_model = prepare(poisson(space(box((0.0, 0.0), (1.0, 1.0)); cells=(1, 1), order=1); source=0.0))
     solution = Solution(ones(Unfitted.active_unknowns(source_model.dofs)), source_model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
@@ -259,8 +244,7 @@ end
         dof == 0 && continue
         src_coeffs[dof] = Float64(i)
     end
-    source_solution = Solution(src_coeffs, source_model.version,
-                               Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    source_solution = Solution(src_coeffs, source_model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
     rewired = transfer(source_solution, source_model, target_model; via=Rewire())
     l2_target = transfer(source_solution, source_model, target_model)
@@ -284,16 +268,13 @@ end
     end
 
     V_small = space(omega; cells=(2, 2), order=2)
-    V_small = overlay(V_small, box((0.2, 0.2), (0.8, 0.8)); cells=(4, 4), order=2,
-                      active=small_mask)
+    V_small = overlay(V_small, box((0.2, 0.2), (0.8, 0.8)); cells=(4, 4), order=2, active=small_mask)
     V_big = space(omega; cells=(2, 2), order=2)
     V_big = overlay(V_big, box((0.2, 0.2), (0.8, 0.8)); cells=(4, 4), order=2, active=big_mask)
 
-    source_model = prepare(poisson(V_small; source=1.0,
-                                   dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    source_model = prepare(poisson(V_small; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     source_solution = solve!(source_model)
-    target_model = prepare(poisson(V_big; source=1.0,
-                                   dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    target_model = prepare(poisson(V_big; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     rewired = transfer(source_solution, source_model, target_model; via=Rewire())
 
@@ -318,14 +299,13 @@ end
     source_model = prepare(poisson(V; source=1.0, dirichlet=[bottom, top]))
     source_solution = solve!(source_model)
     target_model = prepare(poisson(V; source=1.0, dirichlet=[bottom]))
-    @test Unfitted.active_unknowns(target_model.dofs) ==
-          Unfitted.active_unknowns(source_model.dofs) + 9
+    @test Unfitted.active_unknowns(target_model.dofs) == Unfitted.active_unknowns(source_model.dofs) + 9
 
     pts = [(x, y) for x in 0.0:0.125:1.0, y in 0.0:0.125:1.0]
     for strict in (true, false)
         rewired = transfer(source_solution, source_model, target_model; via=Rewire(; strict=strict))
-        @test maximum(abs(value(rewired, target_model, p) - value(source_solution, source_model, p))
-                      for p in pts) == 0.0
+        @test maximum(abs(value(rewired, target_model, p) - value(source_solution, source_model, p)) for p in pts) ==
+              0.0
         @test value(rewired, target_model, (1.0, 1.0)) ≈ 2.0
     end
 end
@@ -338,8 +318,7 @@ end
     V = space(omega; cells=4, order=1)
     source_model = prepare(poisson(V; source=0.0))
     target_model = prepare(poisson(space(omega; cells=4, order=1,
-                                         active=[c != CartesianIndex(2)
-                                                 for c in CartesianIndices((4,))]); source=0.0))
+                                         active=[c != CartesianIndex(2) for c in CartesianIndices((4,))]); source=0.0))
 
     src_coeffs = ones(Unfitted.active_unknowns(source_model.dofs))
     sol = Solution(src_coeffs, source_model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
@@ -398,11 +377,10 @@ end
     # follow-up.) The guard fires before the source coefficients are read, so a
     # trivial source solution suffices.
     omega = box((-1.0, -1.0), (1.0, 1.0))
-    disk = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.7; lipschitz=1.0,
-                           subcell_length_scale=0.5)
+    disk = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.7; lipschitz=1.0, subcell_length_scale=0.5)
     source_model = prepare(poisson(space(omega; cells=(2, 2), order=1); source=0.0))
-    source_solution = Solution(zeros(Unfitted.active_unknowns(source_model.dofs)),
-                               source_model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    source_solution = Solution(zeros(Unfitted.active_unknowns(source_model.dofs)), source_model.version,
+                               Unfitted.SolverDiagnostics(:manual, 0.0, true))
     target_model = prepare(poisson(space(omega; cells=(2, 2), order=1, physical=disk); source=0.0))
     @test_throws ArgumentError transfer(source_solution, source_model, target_model)
 end

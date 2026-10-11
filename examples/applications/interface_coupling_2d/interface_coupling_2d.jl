@@ -233,8 +233,7 @@ end
 bcs = [dirichlet(exact₁; on=boundary(:all; except=(axis=1, side=:upper)), field=u₁),
        dirichlet(exact₂; on=boundary(:all; except=(axis=1, side=:lower)), field=u₂)]
 
-blocks = (stiffness_block(u₁; diffusion=κ₁), stiffness_block(u₂; diffusion=κ₂),
-          couple(u₁, u₂, seam, bond)...)
+blocks = (stiffness_block(u₁; diffusion=κ₁), stiffness_block(u₂; diffusion=κ₂), couple(u₁, u₂, seam, bond)...)
 loads = (source_load(u₁; source=source), source_load(u₂; source=source))
 
 problem = Problem((u₁, u₂); blocks=blocks, loads=loads, dirichlet=bcs, symmetric=true)
@@ -260,8 +259,7 @@ write_vtk(out, sol, model; point_data=(u=(uh, c, x, xi) -> uh(c, xi),))
 report = merge(diagnostics(model, sol), (; l2_error=max(error₁, error₂)))
 
 print_run_report("Bonded bi-material joint — Nitsche interface coupling", report;
-                 parameters=(:seam_position => s, :conductivities => (κ₁, κ₂), :cells_Ω₁ => cells₁,
-                             :cells_Ω₂ => cells₂, :order => order, :nitsche_factor => γ,
-                             :nitsche_penalty => β), output=out)
+                 parameters=(:seam_position => s, :conductivities => (κ₁, κ₂), :cells_Ω₁ => cells₁, :cells_Ω₂ => cells₂,
+                             :order => order, :nitsche_factor => γ, :nitsche_penalty => β), output=out)
 println("  interface regions: ", diagnostics(model).interface_region_count)
 println("  per-subdomain error (Ω₁ | Ω₂): ", error₁, " | ", error₂)

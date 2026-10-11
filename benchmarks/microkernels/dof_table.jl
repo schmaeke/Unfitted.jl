@@ -27,14 +27,12 @@ include(joinpath(@__DIR__, "..", "common.jl"))
 legendre = let omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(24, 24), order=3)
     V = overlay(V, box((0.32, 0.28), (0.72, 0.68)); cells=(9, 9), order=4)
-    prepare(poisson(V; source=x -> sin(pi * x[1]) * sin(pi * x[2]),
-                    dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    prepare(poisson(V; source=x -> sin(pi * x[1]) * sin(pi * x[2]), dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 end
 
 clamped = let mask = trues(24, 24)
     mask[13:24, 13:24] .= false   # L-shaped active region
-    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=24, order=3, basis=bspline(; continuity=1),
-              active=mask)
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=24, order=3, basis=bspline(; continuity=1), active=mask)
     prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 end
 

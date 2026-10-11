@@ -138,15 +138,14 @@ To write a *sequence* of these bundles as one animation — a moving overlay, an
 adaptive ladder, a time-dependent solution — open a [`vtk_series`](@ref) and
 call this function with it in place of a path.
 """
-function write_vtk(path::AbstractString, solution::Solution, model::Model{D,T}; field=nothing,
-                   subdivisions=:degree, cut_depth=3, point_data=_default_vtk_point_data(),
-                   cell_data=NamedTuple(), level_meshes::Bool=true, ascii::Bool=false,
-                   append::Bool=true, compress=true) where {D,T}
+function write_vtk(path::AbstractString, solution::Solution, model::Model{D,T}; field=nothing, subdivisions=:degree,
+                   cut_depth=3, point_data=_default_vtk_point_data(), cell_data=NamedTuple(), level_meshes::Bool=true,
+                   ascii::Bool=false, append::Bool=true, compress=true) where {D,T}
     budget = _cut_depth_budget(cut_depth)
     base = _vtk_bundle_base(path, solution, model)
     return vtk_multiblock(base) do vtm
-        _write_vtk_blocks!(vtm, base, solution, model; field, subdivisions, cut_depth=budget,
-                           point_data, cell_data, level_meshes, ascii, append, compress)
+        _write_vtk_blocks!(vtm, base, solution, model; field, subdivisions, cut_depth=budget, point_data, cell_data,
+                           level_meshes, ascii, append, compress)
     end
 end
 
@@ -236,17 +235,15 @@ and every keyword of that method is accepted here unchanged — see
 it is handed. `time` is recorded in the collection and is otherwise unused: it
 need not be a step index, a multiple of anything, or evenly spaced.
 """
-function write_vtk(series::VTKSeries, time::Real, solution::Solution, model::Model{D,T};
-                   field=nothing, subdivisions=:degree, cut_depth=3,
-                   point_data=_default_vtk_point_data(), cell_data=NamedTuple(),
-                   level_meshes::Bool=true, ascii::Bool=false, append::Bool=true,
-                   compress=true) where {D,T}
+function write_vtk(series::VTKSeries, time::Real, solution::Solution, model::Model{D,T}; field=nothing,
+                   subdivisions=:degree, cut_depth=3, point_data=_default_vtk_point_data(), cell_data=NamedTuple(),
+                   level_meshes::Bool=true, ascii::Bool=false, append::Bool=true, compress=true) where {D,T}
     budget = _cut_depth_budget(cut_depth)
     n = series.count[] + 1
     base = _vtk_bundle_base(joinpath(series.frames, "frame_" * lpad(n, 4, '0')), solution, model)
     vtm = vtk_multiblock(base)
-    _write_vtk_blocks!(vtm, base, solution, model; field, subdivisions, cut_depth=budget,
-                       point_data, cell_data, level_meshes, ascii, append, compress)
+    _write_vtk_blocks!(vtm, base, solution, model; field, subdivisions, cut_depth=budget, point_data, cell_data,
+                       level_meshes, ascii, append, compress)
     # Hands the *open* multiblock over: the collection closes it — which is what
     # writes the frame's files — and records its path, relative to the `.pvd`,
     # against `time`. The counter advances only once that has succeeded, so a
@@ -418,9 +415,8 @@ end
 # block label, where a Unicode collision is harmless — the user extracts leaves.
 # `meshed` dedups the meshes of a space shared by several fields onto its
 # first.
-function _write_vtk_blocks!(vtm, base::AbstractString, solution::Solution, model::Model; field,
-                            subdivisions, cut_depth, point_data, cell_data, level_meshes, ascii,
-                            append, compress)
+function _write_vtk_blocks!(vtm, base::AbstractString, solution::Solution, model::Model; field, subdivisions, cut_depth,
+                            point_data, cell_data, level_meshes, ascii, append, compress)
     fields = _vtk_fields_to_write(model, field)
     multi = length(fields) > 1
     meshed = Any[]
@@ -429,12 +425,11 @@ function _write_vtk_blocks!(vtm, base::AbstractString, solution::Solution, model
         # The workspace is built here and passed in: its basis-family parameter is
         # not inferable from the model, and the call is the function barrier that
         # types it, and with it the sample accessor every callback receives.
-        data = _partition_vtk_data(solution, model, _assembly_workspace(model), space, regions, fld,
-                                   subdivisions, cut_depth, point_data, cell_data)
+        data = _partition_vtk_data(solution, model, _assembly_workspace(model), space, regions, fld, subdivisions,
+                                   cut_depth, point_data, cell_data)
         field_block = multiblock_add_block(vtm, string(fld.name))
         data_name = multi ? "data_$i" : "data"
-        vtk = vtk_grid(_vtk_child_path(base, data_name), data.points, data.cells; ascii, append,
-                       compress)
+        vtk = vtk_grid(_vtk_child_path(base, data_name), data.points, data.cells; ascii, append, compress)
         multiblock_add_block(field_block, vtk, data_name)
         for (name, arr) in data.point_arrays
             vtk[name, VTKPointData()] = arr
@@ -454,8 +449,7 @@ function _write_vtk_blocks!(vtm, base::AbstractString, solution::Solution, model
         for level in space.levels
             data = _mesh_vtk_data(level, layout.dofs, coverage)
             label = "level_$(level.id)_$(level.role)"
-            mvtk = vtk_grid(_vtk_child_path(base, "$(label)_mesh"), data.points, data.cells; ascii,
-                            append, compress)
+            mvtk = vtk_grid(_vtk_child_path(base, "$(label)_mesh"), data.points, data.cells; ascii, append, compress)
             multiblock_add_block(field_block, mvtk, label)
             mvtk["level_id", VTKCellData()] = data.level_ids
             mvtk["role_id", VTKCellData()] = data.role_ids
@@ -495,9 +489,7 @@ end
 # Compose the file path for a child VTK block by suffixing the base
 # name. Used by the multiblock writer to derive paths for the solution
 # `.vtu` and the per-level mesh `.vtu`s.
-function _vtk_child_path(base::AbstractString, suffix::AbstractString)
-    return joinpath(dirname(base), basename(base) * "_" * suffix)
-end
+_vtk_child_path(base::AbstractString, suffix::AbstractString) = joinpath(dirname(base), basename(base) * "_" * suffix)
 
 # ── VTK partition and samples ─────────────────────────────────────────────────
 
@@ -515,9 +507,9 @@ end
 # zero-level isocontour) without the user having to wire a `phi`
 # callback themselves. A user-supplied `level_set` entry in
 # `point_data` overrides the built-in.
-function _partition_vtk_data(solution::Solution, model::Model{D,T}, ws::AssemblyWorkspace,
-                             space::Space{D,T}, regions::Vector{VolumeRegion{D,T}}, fld::Field,
-                             subdivisions, cut_depth::Int, point_data, cell_data) where {D,T}
+function _partition_vtk_data(solution::Solution, model::Model{D,T}, ws::AssemblyWorkspace, space::Space{D,T},
+                             regions::Vector{VolumeRegion{D,T}}, fld::Field, subdivisions, cut_depth::Int, point_data,
+                             cell_data) where {D,T}
     point_pairs = _vtk_pairs(point_data, :point_data)
     cell_pairs = _vtk_pairs(cell_data, :cell_data)
     physical = space.physical
@@ -529,8 +521,7 @@ function _partition_vtk_data(solution::Solution, model::Model{D,T}, ws::Assembly
         @warn("cut_depth is refining on corner signs alone: no leaf of this PhysicalDomain " *
               "declares a Lipschitz constant, so a feature of Ω smaller than a sub-cell can be " *
               "missed and the clipped surface is not guaranteed watertight. Pass " *
-              "`leaf(f; lipschitz = L)` (1.0 for a signed distance function) to certify it.",
-              maxlog=1)
+              "`leaf(f; lipschitz = L)` (1.0 for a signed distance function) to certify it.", maxlog=1)
     end
 
     points = SVector{3,T}[]
@@ -564,8 +555,7 @@ function _partition_vtk_data(solution::Solution, model::Model{D,T}, ws::Assembly
                 end
             end
 
-            push!(cells,
-                  MeshCell(cell_type, SVector{2^D,Int}(ntuple(i -> first_point + i - 1, 2^D))))
+            push!(cells, MeshCell(cell_type, SVector{2^D,Int}(ntuple(i -> first_point + i - 1, 2^D))))
             push!(region_ids, region_id)
             push!(cover_counts, length(region.parents))
             sample = _vtk_sample(model, region_id, region, subbox, center(subbox), :cell)
@@ -635,19 +625,16 @@ end
 # for vertex samples and `:cell` for cell-center samples. `xi` carries
 # the sample's region-reference coordinate, which is what the `u`
 # accessor evaluates the solution at.
-function _vtk_sample(model::Model{D,T}, region_id::Int, region::VolumeRegion{D,T},
-                     box::AxisBox{D,T}, x::SVector{D,T}, location::Symbol) where {D,T}
-    context = (; location, region_id, region=region.box, cell=box, parents=region.parents,
-               model_version=model.version,)
+function _vtk_sample(model::Model{D,T}, region_id::Int, region::VolumeRegion{D,T}, box::AxisBox{D,T}, x::SVector{D,T},
+                     location::Symbol) where {D,T}
+    context = (; location, region_id, region=region.box, cell=box, parents=region.parents, model_version=model.version,)
     return (; context, x, xi=(; region=physical_to_reference(region.box, x)))
 end
 
 # Pair each `name => callback` entry with a typed array of the values that
 # callback returned, ready for `WriteVTK` attachment. `values[i]` is the
 # collected output of `pairs[i]`, in sample order.
-function _vtk_data_arrays(pairs, values)
-    return Pair{String,Any}[first(p) => _vtk_data_array(v) for (p, v) in zip(pairs, values)]
-end
+_vtk_data_arrays(pairs, values) = Pair{String,Any}[first(p) => _vtk_data_array(v) for (p, v) in zip(pairs, values)]
 
 # Coerce a `Vector{Any}` of callback returns to a typed array suitable
 # for `WriteVTK`. Three accepted patterns:
@@ -679,8 +666,7 @@ function _vtk_data_array(values::Vector{Any})
     elseif all(v -> v isa SVector, values)
         S = typeof(first_value)
         return _vtk_vector_array(S[convert(S, v) for v in values])
-    elseif first_value isa Tuple &&
-           all(v -> v isa Tuple && length(v) == length(first_value), values)
+    elseif first_value isa Tuple && all(v -> v isa Tuple && length(v) == length(first_value), values)
         T = reduce(promote_type, (typeof(v[i]) for v in values for i in eachindex(first_value)))
         S = SVector{length(first_value),T}
         return _vtk_vector_array(S[S(v) for v in values])
@@ -763,17 +749,14 @@ function _subdivision_counts(space::Space{D,T}, region::VolumeRegion{D,T}, subdi
         # p=6 cell, the default `write_vtk` path emitted 110 592 subcells
         # against 512 and 221.9 MB against 2.50 MB.
         return ntuple(D) do d
-            maximum(parent -> max(1, cell_order(_level_by_id(space, parent.level), parent.cell)[d]),
-                    region.parents)
+            maximum(parent -> max(1, cell_order(_level_by_id(space, parent.level), parent.cell)[d]), region.parents)
         end
     elseif subdivisions === :none
         return ntuple(_ -> 1, D)
     elseif subdivisions isa Integer
         subdivisions > 0 || throw(ArgumentError("subdivisions must be positive"))
         return ntuple(_ -> Int(subdivisions), D)
-    elseif subdivisions isa Tuple &&
-           length(subdivisions) == D &&
-           all(n -> n isa Integer && n > 0, subdivisions)
+    elseif subdivisions isa Tuple && length(subdivisions) == D && all(n -> n isa Integer && n > 0, subdivisions)
         return ntuple(d -> Int(subdivisions[d]), D)
     end
 
@@ -803,9 +786,7 @@ end
 # the two non-cut kinds rather than the five cut ones keeps a future cut kind on
 # the correct side by default. Without a `PhysicalDomain` every region is
 # `:full`, so this is uniformly `false`.
-function _is_cut_region(region::VolumeRegion)
-    return region.quadrature.kind !== :full && region.quadrature.kind !== :fictitious_alpha
-end
+_is_cut_region(region::VolumeRegion) = region.quadrature.kind !== :full && region.quadrature.kind !== :fictitious_alpha
 
 # Collect the leaves of the cut tree rooted at `b` into `boxes`. Descend only
 # into marked boxes, and descend every marked box the full `depth`, so every
@@ -814,8 +795,8 @@ end
 # coordinates and therefore identical φ, so their clip surfaces meet exactly,
 # and every coarser leaf is unmarked and contributes no clip surface at all.
 # A variable-depth rule would buy fewer cells and lose both properties.
-function _cut_leaves!(boxes::Vector{AxisBox{D,T}}, physical::PhysicalDomain, b::AxisBox{D,T},
-                      depth::Int, lipschitz::Float64) where {D,T}
+function _cut_leaves!(boxes::Vector{AxisBox{D,T}}, physical::PhysicalDomain, b::AxisBox{D,T}, depth::Int,
+                      lipschitz::Float64) where {D,T}
     if depth == 0 || !_cut_marked(physical, b, lipschitz)
         push!(boxes, b)
         return boxes
@@ -904,13 +885,11 @@ function _mesh_vtk_data(level::Level{D,T}, dofs::DofLayout{D}, coverage::Coverag
         push!(active, is_active(level.mask, cell) ? 1 : 0)
         push!(covered, cov[cell] ? 1 : 0)
         raws = cell_dofs(dofs, level.id, cell)
-        push!(active_dofs,
-              count(raw -> any(c -> dofs.active_component[raw, c] != 0, 1:dofs.components), raws))
+        push!(active_dofs, count(raw -> any(c -> dofs.active_component[raw, c] != 0, 1:dofs.components), raws))
         push!(reduced_dofs, count(raw -> dofs.elimination_source[raw] in (:coverage, :dedup), raws))
     end
 
-    return (; points, cells, level_ids, role_ids, order_max, cell_ids, active, covered, active_dofs,
-            reduced_dofs)
+    return (; points, cells, level_ids, role_ids, order_max, cell_ids, active, covered, active_dofs, reduced_dofs)
 end
 
 # Map a level's `role` to a small integer tag for the mesh export, so ParaView
@@ -948,9 +927,7 @@ end
 # orient correctly in ParaView.
 _vtk_corner_bits(::Val{1}) = ((0,), (1,))
 _vtk_corner_bits(::Val{2}) = ((0, 0), (1, 0), (1, 1), (0, 1))
-function _vtk_corner_bits(::Val{3})
-    ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1))
-end
+_vtk_corner_bits(::Val{3}) = ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1))
 
 # Pad a `D`-dimensional physical point with trailing zeros to three
 # coordinates: ParaView point arrays are always 3D regardless of the
@@ -992,8 +969,7 @@ function value(solution::Solution, model::Model{D,T}, x::PointLike{D}) where {D,
     return value(solution, model, _default_field(model), x)
 end
 
-function value(solution::Solution, model::Model{D,T}, x::PointLike{D},
-               component::Integer) where {D,T}
+function value(solution::Solution, model::Model{D,T}, x::PointLike{D}, component::Integer) where {D,T}
     return value(solution, model, _default_field(model), x, component)
 end
 
@@ -1001,8 +977,7 @@ function value(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D})
     _field_quantity(solution, model, u, x, nothing, Val(false))
 end
 
-function value(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D},
-               component::Integer) where {D,T}
+function value(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D}, component::Integer) where {D,T}
     _field_quantity(solution, model, u, x, component, Val(false))
 end
 
@@ -1026,13 +1001,11 @@ function field_gradient(solution::Solution, model::Model{D,T}, x::PointLike{D}) 
     return field_gradient(solution, model, _default_field(model), x)
 end
 
-function field_gradient(solution::Solution, model::Model{D,T}, x::PointLike{D},
-                        component::Integer) where {D,T}
+function field_gradient(solution::Solution, model::Model{D,T}, x::PointLike{D}, component::Integer) where {D,T}
     return field_gradient(solution, model, _default_field(model), x, component)
 end
 
-function field_gradient(solution::Solution, model::Model{D,T}, u::Field,
-                        x::PointLike{D}) where {D,T}
+function field_gradient(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D}) where {D,T}
     _field_quantity(solution, model, u, x, nothing, Val(true))
 end
 
@@ -1045,14 +1018,12 @@ end
 # === nothing`: return a scalar for single-component fields and an
 # `SVector` across components for vector fields. When `component` is
 # explicit: bounds-check and evaluate that one component.
-function _field_quantity(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D},
-                         component, gradient::Val) where {D,T}
+function _field_quantity(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D}, component,
+                         gradient::Val) where {D,T}
     coefficients, point, layout = _evaluation_data(solution, model, u, x)
     if component === nothing
-        layout.components == 1 &&
-            return _evaluate_field(coefficients, model, layout, point, 1, gradient)
-        return SVector(ntuple(c -> _evaluate_field(coefficients, model, layout, point, c, gradient),
-                              layout.components))
+        layout.components == 1 && return _evaluate_field(coefficients, model, layout, point, 1, gradient)
+        return SVector(ntuple(c -> _evaluate_field(coefficients, model, layout, point, c, gradient), layout.components))
     end
 
     _check_component(layout, component)
@@ -1071,8 +1042,7 @@ end
 # Shared pre-flight for the public `value` / `field_gradient` paths:
 # coefficient check, point coercion, in-domain check, field-layout
 # lookup. Returns the triple every evaluator needs.
-function _evaluation_data(solution::Solution, model::Model{D,T}, u::Field,
-                          x::PointLike{D}) where {D,T}
+function _evaluation_data(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D}) where {D,T}
     coefficients = _checked_coefficients(solution, model)
     point = _point_vector(x, T)
     space = _field_space(model.problem, u.name)
@@ -1091,10 +1061,8 @@ _point_vector(x::PointLike{D}, ::Type{T}) where {D,T} = SVector{D,T}(x)
 # accepted. The domain is always passed in by the caller, never taken from the
 # problem's representative space: on a coupled model each field is bounded by
 # its own subdomain, not by subdomain 1's.
-function _assert_point_in_domain(x::SVector{D,T}, domain::AxisBox{D,T},
-                                 tol::GeometryTolerance{T}) where {D,T}
-    contains_point(x, domain, tol) ||
-        throw(ArgumentError("evaluation point is outside the field's domain"))
+function _assert_point_in_domain(x::SVector{D,T}, domain::AxisBox{D,T}, tol::GeometryTolerance{T}) where {D,T}
+    contains_point(x, domain, tol) || throw(ArgumentError("evaluation point is outside the field's domain"))
 end
 
 # Bounds-check a component argument against the field's component count.
@@ -1105,8 +1073,8 @@ end
 # Sum every level's `_level_field` contribution, the value or the gradient by
 # `G`. The overlay zero-extension comes from `_level_field` returning zero when
 # its level does not cover `point`.
-function _evaluate_field(coefficients, model::Model{D,T}, layout::FieldLayout{D,T},
-                         point::SVector{D,T}, component::Integer, ::Val{G}) where {D,T,G}
+function _evaluate_field(coefficients, model::Model{D,T}, layout::FieldLayout{D,T}, point::SVector{D,T},
+                         component::Integer, ::Val{G}) where {D,T,G}
     R = promote_type(T, eltype(coefficients))
     result = G ? zero(SVector{D,R}) : zero(R)
     for level in _field_levels(model, layout)
@@ -1129,8 +1097,8 @@ _field_levels(model::Model, layout::FieldLayout) = _field_space(model.problem, l
 # `physical_basis_gradients` scales by the chain rule `2 / h_d` of the
 # axis-aligned cell — and contract them with the dof values through
 # `dof_value`, so constrained dofs contribute their pinned values.
-function _level_field(coefficients, model::Model{D,T}, layout::FieldLayout{D,T}, level::Level{D,T},
-                      x::SVector{D,T}, component::Integer, ::Val{G}) where {D,T,G}
+function _level_field(coefficients, model::Model{D,T}, layout::FieldLayout{D,T}, level::Level{D,T}, x::SVector{D,T},
+                      component::Integer, ::Val{G}) where {D,T,G}
     R = promote_type(T, eltype(coefficients))
     cell = locate_cell(level.mesh, x; tol=model.dofs.tolerance)
     (cell === nothing || !is_active(level.mask, cell)) && return G ? zero(SVector{D,R}) : zero(R)
@@ -1145,8 +1113,7 @@ end
 # gradients (its gradient). `dof_value` reads `u`, so a constrained dof
 # contributes its pinned value and a linear-constraint pivot its expansion. The
 # number type is the coefficients' promoted with the model's.
-function _parent_field(layout::FieldLayout{D,T}, coefficients, raw_dofs, φ,
-                       component::Integer) where {D,T}
+function _parent_field(layout::FieldLayout{D,T}, coefficients, raw_dofs, φ, component::Integer) where {D,T}
     result = zero(promote_type(T, eltype(coefficients))) * zero(eltype(φ))
     for i in eachindex(raw_dofs)
         result += dof_value(layout, coefficients, raw_dofs[i], component) * φ[i]
@@ -1194,8 +1161,7 @@ function l2_error(solution::Solution, model::Model, exact; norm::Symbol=:relativ
     return l2_error(solution, model, _default_field(model), exact; norm)
 end
 
-function l2_error(solution::Solution, model::Model{D,T}, u::Field, exact;
-                  norm::Symbol=:relative) where {D,T}
+function l2_error(solution::Solution, model::Model{D,T}, u::Field, exact; norm::Symbol=:relative) where {D,T}
     norm in (:relative, :absolute) || throw(ArgumentError("norm must be :relative or :absolute"))
     state = FormState(model.dofs, _state_vector(solution, model))
     list = _region_list(model, nothing, _field_space(model.problem, u.name))
@@ -1317,18 +1283,16 @@ type is whatever `q.weight * integrand(q)` yields on the first
 sample. Throws `ArgumentError` if no admissible region exists on the
 selected portion of the boundary.
 """
-function boundary_integral(integrand, model::Model;
-                           on::Union{BoundarySelector,BoundaryMesh,Interface},
+function boundary_integral(integrand, model::Model; on::Union{BoundarySelector,BoundaryMesh,Interface},
                            field::Union{Nothing,Symbol}=nothing)
     list = _region_list(model, on, _target_space(model, on, field))
     # A third cause joins "no such facet" and "every cell masked out" now that a
     # facet rule is trimmed: a selector all of whose faces lie outside Ω resolves to
     # regions that carry no quadrature. Naming it here is the difference between a
     # user checking their selector and a user checking their geometry.
-    list.offsets[end] == 0 &&
-        throw(ArgumentError("no admissible boundary quadrature for on=$(on); check the " *
-                            "selector or mesh, any level masks, and whether the selected " *
-                            "faces lie outside Ω"))
+    list.offsets[end] == 0 && throw(ArgumentError("no admissible boundary quadrature for on=$(on); check the " *
+                                                  "selector or mesh, any level masks, and whether the selected " *
+                                                  "faces lie outside Ω"))
     return _walk(nothing, nothing, list, nothing) do result, q
         contribution = q.weight * integrand(q)
         return result === nothing ? contribution : result + contribution

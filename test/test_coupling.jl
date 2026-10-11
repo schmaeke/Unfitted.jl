@@ -35,8 +35,7 @@ using Test
     u1 = field(:u1, V1)
     u2 = field(:u2, V2)
     prob = Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)),
-                   loads=(source_load(u1; source=src1), source_load(u2; source=src2)),
-                   dirichlet=[bc(:u1); bc(:u2)])
+                   loads=(source_load(u1; source=src1), source_load(u2; source=src2)), dirichlet=[bc(:u1); bc(:u2)])
     model = prepare(prob)
 
     # The model tracks two independent subdomain discretisations.
@@ -92,8 +91,7 @@ end
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=2)
     a = field(:a, V)
     b = field(:b, V)
-    prob = Problem((a, b); blocks=(stiffness_block(a), mass_block(b)),
-                   loads=(source_load(a; source=1.0),),
+    prob = Problem((a, b); blocks=(stiffness_block(a), mass_block(b)), loads=(source_load(a; source=1.0),),
                    dirichlet=[dirichlet(0.0; on=boundary(:all), field=:a)])
     model = prepare(prob)
     @test length(problem_spaces(model.problem)) == 1
@@ -126,8 +124,8 @@ end
     # guard is reached, and the test would pass without proving anything — so
     # the throw below is matched on its message, and the `moved_space` call
     # above it shows that level 2 really is a movable overlay.
-    V1 = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2),
-                 box((0.25, 0.25), (0.75, 0.75)); cells=(2, 2), order=2)
+    V1 = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2), box((0.25, 0.25), (0.75, 0.75));
+                 cells=(2, 2), order=2)
     V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(2, 2), order=2)
     u1 = field(:u1, V1)
     u2 = field(:u2, V2)
@@ -143,8 +141,7 @@ end
 
     # The same call on the single-domain half is legal, so the guard rejects the
     # coupling and not the level index.
-    single = prepare(Problem((u1,); blocks=(stiffness_block(u1),),
-                             loads=(source_load(u1; source=1.0),),
+    single = prepare(Problem((u1,); blocks=(stiffness_block(u1),), loads=(source_load(u1; source=1.0),),
                              dirichlet=[dirichlet(0.0; on=boundary(:all), field=:u1)]))
     @test moved(single; level=2, to=to) isa Model
 end
@@ -158,8 +155,7 @@ end
     V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=3, order=1)
     V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=3, order=1)
     model = prepare(Problem((field(:u1, V1), field(:u2, V2));
-                            blocks=(stiffness_block(field(:u1, V1)),
-                                    stiffness_block(field(:u2, V2)))))
+                            blocks=(stiffness_block(field(:u1, V1)), stiffness_block(field(:u2, V2)))))
     @test_throws ArgumentError foreach_quadrature_point(q -> nothing, model)
     @test_throws "field=" foreach_quadrature_point(q -> nothing, model)
     @test_throws ArgumentError QuadField{Float64}(model)
@@ -265,8 +261,8 @@ end
 
     # Both faces of both subdomains are represented: x = 0 and 1 (subdomain 1),
     # x = 2 and 3 (subdomain 2). Before the fix only 0 and 1 ever appeared.
-    faces = sort(unique(round(x[1]; digits=12) for regions in values(model.facet_regions)
-                        for region in regions for x in region.points))
+    faces = sort(unique(round(x[1]; digits=12) for regions in values(model.facet_regions) for region in regions
+                        for x in region.points))
     @test faces == [0.0, 1.0, 2.0, 3.0]
 end
 
@@ -314,8 +310,7 @@ function _solve_stacked(β, g; nx1=4, ny1=2, nx2=4, ny2=2, sym=false)
                               dirichlet(g; on=boundary(axis=1, side=:upper), field=:u1),
                               dirichlet(g; on=boundary(axis=2, side=:upper), field=:u2),
                               dirichlet(g; on=boundary(axis=1, side=:lower), field=:u2),
-                              dirichlet(g; on=boundary(axis=1, side=:upper), field=:u2)],
-                   symmetric=sym)
+                              dirichlet(g; on=boundary(axis=1, side=:upper), field=:u2)], symmetric=sym)
     model = prepare(prob)
     return model, solve!(model), u1, u2
 end
@@ -382,19 +377,16 @@ function _solve_nitsche(γ, exact; nx1=4, ny1=2, nx2=4, ny2=2, sym=true)
     nitsche = InterfaceForm() do q, sides, trial, _tc
         n = q.normal
         sv, su = jump_sign(sides.test), jump_sign(sides.trial)
-        TestChannels(-0.5 * sv * dot(trial.gradient, n) + β * sv * su * trial.value,
-                     -0.5 * su * trial.value .* n)
+        TestChannels(-0.5 * sv * dot(trial.gradient, n) + β * sv * su * trial.value, -0.5 * su * trial.value .* n)
     end
-    prob = Problem((u1, u2);
-                   blocks=(stiffness_block(u1), stiffness_block(u2), couple(u1, u2, Γ, nitsche)...),
+    prob = Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2), couple(u1, u2, Γ, nitsche)...),
                    loads=(source_load(u1; source=src), source_load(u2; source=src)),
                    dirichlet=[dirichlet(exact; on=boundary(axis=2, side=:lower), field=:u1),
                               dirichlet(exact; on=boundary(axis=1, side=:lower), field=:u1),
                               dirichlet(exact; on=boundary(axis=1, side=:upper), field=:u1),
                               dirichlet(exact; on=boundary(axis=2, side=:upper), field=:u2),
                               dirichlet(exact; on=boundary(axis=1, side=:lower), field=:u2),
-                              dirichlet(exact; on=boundary(axis=1, side=:upper), field=:u2)],
-                   symmetric=sym)
+                              dirichlet(exact; on=boundary(axis=1, side=:upper), field=:u2)], symmetric=sym)
     model = prepare(prob)
     return model, solve!(model), u1, u2
 end
@@ -426,8 +418,7 @@ end
     @test !onesided.symmetric
 
     model = prepare(Problem((u1, u2);
-                            blocks=(stiffness_block(u1), stiffness_block(u2),
-                                    couple(u1, u2, Γ, onesided)...)))
+                            blocks=(stiffness_block(u1), stiffness_block(u2), couple(u1, u2, Γ, onesided)...)))
     @test !model.problem.symmetric   # one asymmetric block ⇒ the problem is asymmetric
 
     A = assemble!(model).matrix
@@ -463,14 +454,11 @@ end
         TestChannels(trial.component == tc ? β * sg * trial.value : 0.0, SVector(0.0, 0.0))
     end
     zero_bc(name, ax, sd) = dirichlet(SVector(0.0, 0.0); on=boundary(axis=ax, side=sd), field=name)
-    model = prepare(Problem((u1, u2);
-                            blocks=(stiffness_block(u1), stiffness_block(u2),
-                                    couple(u1, u2, Γ, vpen)...),
+    model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2), couple(u1, u2, Γ, vpen)...),
                             loads=(source_load(u1; source=x -> SVector(s(x), 2s(x))),
                                    source_load(u2; source=x -> SVector(s(x), 2s(x)))),
-                            dirichlet=[zero_bc(:u1, 2, :lower), zero_bc(:u1, 1, :lower),
-                                       zero_bc(:u1, 1, :upper), zero_bc(:u2, 2, :upper),
-                                       zero_bc(:u2, 1, :lower), zero_bc(:u2, 1, :upper)]))
+                            dirichlet=[zero_bc(:u1, 2, :lower), zero_bc(:u1, 1, :lower), zero_bc(:u1, 1, :upper),
+                                       zero_bc(:u2, 2, :upper), zero_bc(:u2, 1, :lower), zero_bc(:u2, 1, :upper)]))
     # Correctness is measured on the SERIAL assembly and the shipped threaded
     # assembly is then pinned to it bit-for-bit, so the manufactured-solution
     # bound below covers both paths. Splitting the two keeps the diagnosis
@@ -507,12 +495,10 @@ end
     seen = Int[]
     rec = InterfaceForm() do q, sides, trial, _tc
         push!(seen, q.point)
-        TestChannels(jump_sign(sides.test) * jump_sign(sides.trial) * trial.value,
-                     SVector(0.0, 0.0))
+        TestChannels(jump_sign(sides.test) * jump_sign(sides.trial) * trial.value, SVector(0.0, 0.0))
     end
-    model = prepare(Problem((u1, u2);
-                            blocks=(stiffness_block(u1), stiffness_block(u2),
-                                    couple(u1, u2, Γ, rec)...), symmetric=false))
+    model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2), couple(u1, u2, Γ, rec)...),
+                            symmetric=false))
     assemble_matrix(model, couple(u1, u2, Γ, rec); threaded=false, symmetric=false)
 
     count = nquadpoints(model; on=iface)
@@ -585,17 +571,13 @@ end
     u1, p1, u2 = field(:u1, V1), field(:p1, V1), field(:u2, V2)
     Γ = polyline_mesh([SVector(1.0, 0.5), SVector(0.0, 0.5)])
     blocks = couple(u1, u2, Γ, mass_form(coefficient=10.0))
-    model = prepare(Problem((u1, p1, u2);
-                            blocks=(stiffness_block(u1), mass_block(p1), stiffness_block(u2),
-                                    blocks...)))
+    model = prepare(Problem((u1, p1, u2); blocks=(stiffness_block(u1), mass_block(p1), stiffness_block(u2), blocks...)))
     c = [sin(3i) for i in 1:active_unknowns(model)]
     zero_gradient = zero(SVector{2,Float64})
 
     reads = Tuple{Float64,Float64,Float64,SVector{2,Float64}}[]
     foreach_quadrature_point(model; on=first(blocks).on, state=c) do q
-        push!(reads,
-              (value(q.state, :u1), value(q.state, :u2), value(q.state, :p1),
-               field_gradient(q.state, :p1)))
+        push!(reads, (value(q.state, :u1), value(q.state, :u2), value(q.state, :p1), field_gradient(q.state, :p1)))
     end
     @test length(reads) == nquadpoints(model; on=first(blocks).on) > 0
     @test any(r -> r[1] != 0, reads) && any(r -> r[2] != 0, reads)
@@ -614,8 +596,8 @@ end
     # neither side alone can size it. The two lookups stay separate because the
     # level ids of the two spaces are independently numbered.
     tol = GeometryTolerance(Float64)
-    V1 = overlay(space(box((0.0, 0.0), (1.0, 0.5)); cells=(4, 2), order=1),
-                 box((0.5, 0.25), (1.0, 0.5)); cells=(2, 1), order=3)
+    V1 = overlay(space(box((0.0, 0.0), (1.0, 0.5)); cells=(4, 2), order=1), box((0.5, 0.25), (1.0, 0.5)); cells=(2, 1),
+                 order=3)
     V2 = space(box((0.0, 0.5), (1.0, 1.0)); cells=(4, 2), order=2)
     u1 = field(:u1, V1)
     u2 = field(:u2, V2)

@@ -99,14 +99,12 @@ function parse_arguments(arguments)
     end
 
     if payload !== nothing
-        isempty(names) ||
-            error("run_examples_child.jl: pass either --cases= or example names, not both")
+        isempty(names) || error("run_examples_child.jl: pass either --cases= or example names, not both")
         return payload
     end
 
     isempty(names) && error("run_examples_child.jl: no examples given")
-    return (markers=DEFAULT_MARKERS,
-            cases=[(name=name, env=Dict{String,String}()) for name in names])
+    return (markers=DEFAULT_MARKERS, cases=[(name=name, env=Dict{String,String}()) for name in names])
 end
 
 # Run `body` with `env` layered over the process environment and restore every

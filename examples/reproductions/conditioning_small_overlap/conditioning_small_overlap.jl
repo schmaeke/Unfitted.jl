@@ -55,8 +55,7 @@ tolerance = GeometryTolerance(Float64; small_volume=1.0e-3)
 # Sweep header. The comma-separated columns are emitted verbatim by the
 # inner loop so the output can be redirected to a CSV file.
 println("Small-overlap conditioning sweep")
-print_parameter_block((:dimension => 2, :domain => omega,
-                       :small_volume_threshold => tolerance.small_volume))
+print_parameter_block((:dimension => 2, :domain => omega, :small_volume_threshold => tolerance.small_volume))
 println("  columns: p, k, δ, active_unknowns, regions, small_regions, ",
         "min_volume, first_small_volume, cond_estimate, residual_norm")
 
@@ -79,16 +78,14 @@ for p in 1:4
         assemble!(model)
         solution = solve!(model)
         report = diagnostics(model, solution)
-        first_small_volume = isempty(report.small_overlaps) ? NaN :
-                             first(report.small_overlaps).volume
+        first_small_volume = isempty(report.small_overlaps) ? NaN : first(report.small_overlaps).volume
 
         # One CSV row per (p, k). `condition_estimate` is `NaN` for
         # `active_unknowns > 256` — that is intentional, the
         # estimator densifies the matrix and is only cheap up to a
         # few hundred unknowns.
-        println("  ", p, ", ", k, ", ", delta, ", ", report.active_unknowns, ", ",
-                report.integration_regions, ", ", report.small_overlap_count, ", ",
-                report.min_integration_volume, ", ", first_small_volume, ", ",
+        println("  ", p, ", ", k, ", ", delta, ", ", report.active_unknowns, ", ", report.integration_regions, ", ",
+                report.small_overlap_count, ", ", report.min_integration_volume, ", ", first_small_volume, ", ",
                 report.condition_estimate, ", ", report.residual_norm)
     end
 end

@@ -1,10 +1,9 @@
 using StaticArrays
 using LinearAlgebra: norm
 
-using Unfitted: dof_layout, cell_dofs, cell_basis_indices, basis_values, _level_by_id,
-                _index_admissible, local_basis_indices, _tensor_values!, _factor_buffers,
-                _entity_carries, _incident_cells, TensorDofKey, _axis_dof_key, _AXIS_SPAN,
-                _supports_cell_order, IntegratedLegendre, cell_order
+using Unfitted: dof_layout, cell_dofs, cell_basis_indices, basis_values, _level_by_id, _index_admissible,
+                local_basis_indices, _tensor_values!, _factor_buffers, _entity_carries, _incident_cells, TensorDofKey,
+                _axis_dof_key, _AXIS_SPAN, _supports_cell_order, IntegratedLegendre, cell_order
 
 # Per-cell polynomial order: the minimum rule, and the invariants that keep a
 # mixed-order space usable.
@@ -33,8 +32,7 @@ function trace_jump(V, lid, a, b, d; n=13)
     ra = cell_dofs(layout, lid, a)
     rb = cell_dofs(layout, lid, b)
     ts = range(-1.0, 1.0; length=n)
-    tangential = D == 1 ? [()] :
-                 vec([Tuple(g) for g in Iterators.product(ntuple(_ -> ts, D - 1)...)])
+    tangential = D == 1 ? [()] : vec([Tuple(g) for g in Iterators.product(ntuple(_ -> ts, D - 1)...)])
     worst = 0.0
     for g in tangential
         face(sign) = SVector{D,Float64}(ntuple(k -> k == d ? sign : g[k < d ? k : k - 1], D))
@@ -88,10 +86,9 @@ const _CO_3D = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
     @test nominal_order(V; level=1) == (2, 2)
 
     # And a stacked, pruned space keeps its reduction verdicts.
-    ref = overlay(space(_CO_2D; cells=4, order=3), box((0.25, 0.25), (0.75, 0.75)); cells=4,
-                  order=3)
-    per = overlay(space(_CO_2D; cells=4, order=fill(3, 4, 4)), box((0.25, 0.25), (0.75, 0.75));
-                  cells=4, order=fill(3, 4, 4))
+    ref = overlay(space(_CO_2D; cells=4, order=3), box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3)
+    per = overlay(space(_CO_2D; cells=4, order=fill(3, 4, 4)), box((0.25, 0.25), (0.75, 0.75)); cells=4,
+                  order=fill(3, 4, 4))
     lr = dof_layout(ref)
     lp = dof_layout(per)
     @test length(lr.raw_keys) == length(lp.raw_keys)
@@ -128,15 +125,12 @@ end
     @test trace_jump(V, 1, CartesianIndex(1, 1, 1), CartesianIndex(2, 1, 1), 1) == 0.0
 
     # Graded fields in both dimensions, every internal face.
-    @test worst_trace_jump(space(_CO_2D; cells=4, order=[2 + (i + j) % 4 for i in 1:4, j in 1:4])) ==
-          0.0
-    @test worst_trace_jump(space(_CO_3D; cells=2,
-                                 order=[2 + (i + 2j + 3k) % 4 for i in 1:2, j in 1:2, k in 1:2])) ==
+    @test worst_trace_jump(space(_CO_2D; cells=4, order=[2 + (i + j) % 4 for i in 1:4, j in 1:4])) == 0.0
+    @test worst_trace_jump(space(_CO_3D; cells=2, order=[2 + (i + 2j + 3k) % 4 for i in 1:2, j in 1:2, k in 1:2])) ==
           0.0
     # 1D needs no rule at all — every shared key carries mode 0 — but must still
     # come out conforming.
-    @test worst_trace_jump(space(box((0.0,), (1.0,)); cells=(3,), order=reshape([2, 5, 3], 3))) ==
-          0.0
+    @test worst_trace_jump(space(box((0.0,), (1.0,)); cells=(3,), order=reshape([2, 5, 3], 3))) == 0.0
 end
 
 @testset "per-cell order: the minimum rule's shape" begin
@@ -201,8 +195,7 @@ end
     # keys can notice a cell missing one of its two endpoint modes.
     @test_throws ArgumentError space(_CO_2D; cells=2, order=[1 1; 1 0])
     # `:trunk` needs isotropy per cell, not per level.
-    @test_throws ArgumentError space(_CO_2D; cells=2,
-                                     order=reshape([(2, 2), (3, 2), (2, 2), (2, 2)], 2, 2),
+    @test_throws ArgumentError space(_CO_2D; cells=2, order=reshape([(2, 2), (3, 2), (2, 2), (2, 2)], 2, 2),
                                      mode=:trunk)
     # Shape and type errors are actionable.
     @test_throws DimensionMismatch space(_CO_2D; cells=2, order=fill(2, 3, 3))
@@ -280,8 +273,7 @@ end
     @test_throws ArgumentError elevate(V, 1 => 2, 1 => 3)
 
     # Overlays take the same shapes, resolved against their own cell grid.
-    S = overlay(space(_CO_2D; cells=4, order=2), box((0.25, 0.25), (0.75, 0.75)); cells=2,
-                order=[3 4; 4 3])
+    S = overlay(space(_CO_2D; cells=4, order=2), box((0.25, 0.25), (0.75, 0.75)); cells=2, order=[3 4; 4 3])
     @test cell_orders(S; level=2) == [(3, 3) (4, 4); (4, 4) (3, 3)]
     @test nominal_order(S; level=2) == (4, 4)
     @test worst_trace_jump(S; level=2) == 0.0
@@ -393,8 +385,7 @@ end
     # must be rebuilt with it — and the moment-fit order is now taken per parent
     # cell, so a low-p cut cell no longer pays the level maximum's fit.
     Ω = box((-1.0, -1.0), (1.0, 1.0))
-    disc = physical_domain(x -> x[1]^2 + x[2]^2 - 0.64; lipschitz=2.0, alpha=1e-8,
-                           subcell_length_scale=0.1)
+    disc = physical_domain(x -> x[1]^2 + x[2]^2 - 0.64; lipschitz=2.0, alpha=1e-8, subcell_length_scale=0.1)
     orders = [x1 <= 4 ? 2 : 4 for x1 in 1:8, _ in 1:8]
     V = space(Ω; cells=8, order=orders, physical=disc)
     model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
@@ -436,8 +427,7 @@ end
     # sets it produces agree with a level built at that mask from scratch.
     kept = [ci for ci in cell_indices(V; level=1) if ci != CartesianIndex(2, 2)]
     V2 = adapt(V, 1 => kept)
-    fresh = space(Ω; cells=(4, 4), order=field,
-                  active=[ci != CartesianIndex(2, 2) for ci in CartesianIndices((4, 4))])
+    fresh = space(Ω; cells=(4, 4), order=field, active=[ci != CartesianIndex(2, 2) for ci in CartesianIndices((4, 4))])
     for ci in cell_indices(V2; level=1)
         @test cell_basis_indices(V2.levels[1], ci) == cell_basis_indices(fresh.levels[1], ci)
     end
@@ -461,8 +451,7 @@ end
     @test level_count(uniform) == 1
 
     # The fictitious fold re-masks underneath the user; it is the case that bit.
-    disc = physical_domain(x -> sum(abs2, x .- 0.5) - 0.09; lipschitz=2.0, alpha=1e-8,
-                           subcell_length_scale=0.03)
+    disc = physical_domain(x -> sum(abs2, x .- 0.5) - 0.09; lipschitz=2.0, alpha=1e-8, subcell_length_scale=0.03)
     Vf = space(Ω; cells=(4, 4), order=field, physical=disc)
     @test active_unknowns(prepare(mass(Vf))) > 0
 end
@@ -489,9 +478,7 @@ end
     Ω = box((0.0, 0.0), (1.0, 1.0))
     V = ladder(Ω; cells=(8, 8), order=2, depth=1, splits=2)
     model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
-    mask = [ci
-            for ci in cell_indices(V; level=2)
-            if sum(abs2, center(cell_box(V, ci; level=2)) .- 0.5) < 0.08]
+    mask = [ci for ci in cell_indices(V; level=2) if sum(abs2, center(cell_box(V, ci; level=2)) .- 0.5) < 0.08]
     orders = fill(2, 8, 8)
     orders[3:6, 3:6] .= 4
 
@@ -504,8 +491,7 @@ end
 
     # The caches this reuses are keyed without the geometry, so a space that is
     # not this model's own is refused rather than fitted with the wrong rules.
-    @test_throws ArgumentError adapted(model,
-                                       space(box((0.0, 0.0), (2.0, 2.0)); cells=(4, 4), order=2))
+    @test_throws ArgumentError adapted(model, space(box((0.0, 0.0), (2.0, 2.0)); cells=(4, 4), order=2))
 end
 
 @testset "per-cell order: the intersection rule is the minimum rule" begin
@@ -541,8 +527,7 @@ end
         pmin
     end
     Ω = box((0.0, 0.0), (1.0, 1.0))
-    for field in
-        ([1 + (i + j) % 4 for i in 1:6, j in 1:6], [(1 + i % 3, 1 + j % 4) for i in 1:6, j in 1:6]),
+    for field in ([1 + (i + j) % 4 for i in 1:6, j in 1:6], [(1 + i % 3, 1 + j % 4) for i in 1:6, j in 1:6]),
         msk in (nothing, [!(i == 3 && j == 3) for i in 1:6, j in 1:6])
 
         V = space(Ω,; cells=(6, 6), order=field, active=msk)
@@ -557,8 +542,7 @@ end
                 classical = pmin === nothing || _index_admissible(lvl.basis, pmin, lvl.mode, id)
                 # The dense `orders` matrix is the reference rule's input; the
                 # kernel reads the palette record the level actually carries.
-                @test _entity_carries(lvl.basis, lvl.orders, lvl.mask, key, n, lvl.mode, id) ==
-                      classical
+                @test _entity_carries(lvl.basis, lvl.orders, lvl.mask, key, n, lvl.mode, id) == classical
             end
         end
     end

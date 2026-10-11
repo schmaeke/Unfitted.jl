@@ -166,14 +166,11 @@ digits. The unknowns were redundant, not merely cheap.
 # ── Run 2b: the same stack with covered-mode pruning switched off ─────────────────
 
 V_unreduced = overlay(space(omega; cells=8, order=3), refined_region; cells=8)
-_, _, report_unreduced = solve_and_report(V_unreduced,
-                                          "Run 2b — Run 2 with covered-mode pruning switched off";
+_, _, report_unreduced = solve_and_report(V_unreduced, "Run 2b — Run 2 with covered-mode pruning switched off";
                                           parameters=(:pruning => "off",), prune=false)
 
-println("Run 2  (reduction on) : ", report_overlay.active_unknowns, " unknowns, error ",
-        report_overlay.l2_error)
-println("Run 2b (reduction off): ", report_unreduced.active_unknowns, " unknowns, error ",
-        report_unreduced.l2_error)
+println("Run 2  (reduction on) : ", report_overlay.active_unknowns, " unknowns, error ", report_overlay.l2_error)
+println("Run 2b (reduction off): ", report_unreduced.active_unknowns, " unknowns, error ", report_unreduced.l2_error)
 println()
 
 # ── Run 3: selective activation at construction time ─────────────────────────
@@ -194,16 +191,12 @@ const PATCH_RADIUS = 0.22
 near_peak(cell_box, cell_index) = squared_radius(center(cell_box)) < PATCH_RADIUS^2
 
 V_masked = overlay(V_base, refined_region; cells=8, active=near_peak)
-model, _, report_masked = solve_and_report(V_masked,
-                                           "Run 3 — overlay masked to a patch around the peak";
+model, _, report_masked = solve_and_report(V_masked, "Run 3 — overlay masked to a patch around the peak";
                                            parameters=(:patch_radius => PATCH_RADIUS,))
 
-println("Unknowns, full overlay  : ", report_overlay.active_unknowns, "   error ",
-        report_overlay.l2_error)
-println("Unknowns, masked overlay: ", report_masked.active_unknowns, "   error ",
-        report_masked.l2_error)
-println("Active overlay cells    : ", count(active_cells(model; level=2)), " of ",
-        length(active_cells(model; level=2)))
+println("Unknowns, full overlay  : ", report_overlay.active_unknowns, "   error ", report_overlay.l2_error)
+println("Unknowns, masked overlay: ", report_masked.active_unknowns, "   error ", report_masked.l2_error)
+println("Active overlay cells    : ", count(active_cells(model; level=2)), " of ", length(active_cells(model; level=2)))
 println()
 
 # ── Run 4: switching cells on and off after the model is prepared ────────────
@@ -226,10 +219,9 @@ report_grown = diagnostics(model, solution_grown; exact)
 
 println("After activate! (all overlay cells on):")
 println("    active overlay cells : ", count(active_cells(model; level=2)))
-println("    active unknowns      : ", report_grown.active_unknowns, "   (Run 2 had ",
-        report_overlay.active_unknowns, ")")
-println("    relative L² error    : ", report_grown.l2_error, "   (Run 2 had ",
-        report_overlay.l2_error, ")")
+println("    active unknowns      : ", report_grown.active_unknowns, "   (Run 2 had ", report_overlay.active_unknowns,
+        ")")
+println("    relative L² error    : ", report_grown.l2_error, "   (Run 2 had ", report_overlay.l2_error, ")")
 
 # And back again: deactivating everything *not* near the peak restores
 # Run 3's discretisation, unknown for unknown.
@@ -239,10 +231,9 @@ report_shrunk = diagnostics(model, solution_shrunk; exact)
 
 println("After deactivate! (patch only again):")
 println("    active overlay cells : ", count(active_cells(model; level=2)))
-println("    active unknowns      : ", report_shrunk.active_unknowns, "   (Run 3 had ",
-        report_masked.active_unknowns, ")")
-println("    relative L² error    : ", report_shrunk.l2_error, "   (Run 3 had ",
-        report_masked.l2_error, ")")
+println("    active unknowns      : ", report_shrunk.active_unknowns, "   (Run 3 had ", report_masked.active_unknowns,
+        ")")
+println("    relative L² error    : ", report_shrunk.l2_error, "   (Run 3 had ", report_masked.l2_error, ")")
 println()
 
 # ── What to check when this script runs ──────────────────────────────────────
@@ -258,6 +249,5 @@ println()
 
 print_run_report("Tutorial 2 — summary of the final (patch-only) configuration", report_shrunk;
                  parameters=(:dimension => D, :base_cells => V_base.levels[1].mesh.cells,
-                             :overlay_cells => V_masked.levels[2].mesh.cells,
-                             :order => nominal_order(V_base.levels[1]), :alpha => ALPHA,
-                             :patch_radius => PATCH_RADIUS))
+                             :overlay_cells => V_masked.levels[2].mesh.cells, :order => nominal_order(V_base.levels[1]),
+                             :alpha => ALPHA, :patch_radius => PATCH_RADIUS))

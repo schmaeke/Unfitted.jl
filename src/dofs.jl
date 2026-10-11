@@ -361,8 +361,7 @@ end
 
 # A ledger over `nraw` raws with nothing eliminated, no row pending and no pivot.
 function EliminationLedger{T}(nraw::Integer) where {T}
-    return EliminationLedger{T}(fill(:free, nraw), Tuple{Vector{Int},Vector{T},Symbol}[],
-                                Vector{Tuple{Int,T}}[])
+    return EliminationLedger{T}(fill(:free, nraw), Tuple{Vector{Int},Vector{T},Symbol}[], Vector{Tuple{Int,T}}[])
 end
 
 # A dof-wise strong elimination of `raw` by `source`. The first source to eliminate a
@@ -376,8 +375,7 @@ end
 # One homogeneous linear constraint Σᵢ cᵢ u_{rawsᵢ} = 0 among the current level's raws,
 # credited to `source`. It is held until both of the level's hooks have run and is then
 # handed to `_resolve_rows!`. The vectors are stored, not copied.
-function _constrain!(ledger::EliminationLedger{T}, raws::Vector{Int}, coefficients::Vector{T},
-                     source::Symbol) where {T}
+function _constrain!(ledger::EliminationLedger{T}, raws::Vector{Int}, coefficients::Vector{T}, source::Symbol) where {T}
     push!(ledger.rows, (raws, coefficients, source))
     return ledger
 end
@@ -390,8 +388,7 @@ end
 # maximal-continuity B-spline space, never allocates it. A raw already eliminated is
 # refused: a resolver that pivoted it again would silently overwrite its source and,
 # for a pivot, the expansion other readers already rely on.
-function _pivot!(ledger::EliminationLedger{T}, raw::Integer, expansion::Vector{Tuple{Int,T}},
-                 source::Symbol) where {T}
+function _pivot!(ledger::EliminationLedger{T}, raw::Integer, expansion::Vector{Tuple{Int,T}}, source::Symbol) where {T}
     ledger.source[raw] === :free ||
         throw(ArgumentError("raw $raw is already eliminated; a resolver records each raw it " *
                             "eliminates exactly once"))
@@ -504,16 +501,14 @@ end
 # A topology reads neither a field's components nor its Dirichlet data, so one is
 # the same for every field over the space, and `_system_layout` builds it once per
 # space and shares it between them.
-function _dof_topology(V::Space{D,T}; tolerance::GeometryTolerance{T}=GeometryTolerance(T),
-                       prune::Bool=true, prune_exempt=(),
-                       classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
+function _dof_topology(V::Space{D,T}; tolerance::GeometryTolerance{T}=GeometryTolerance(T), prune::Bool=true,
+                       prune_exempt=(), classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
     raw_by_key, raw_keys, cell_dofs_by_level, level_raws = _enumerate_raws(V)
     fold = _Fold(V, classify_cache)
     coverage = prune ? build_coverage(V, tolerance, fold) : Coverage{D}(Dict{Int,BitArray{D}}())
     ledger = EliminationLedger{T}(length(raw_keys))
     for level in V.levels
-        ctx = _LevelContext(V, fold, tolerance, coverage, raw_keys, raw_by_key,
-                            level_raws[level.id])
+        ctx = _LevelContext(V, fold, tolerance, coverage, raw_keys, raw_by_key, level_raws[level.id])
         _overlay_constraints!(ledger, level, ctx)
         prune && !(level.id in prune_exempt) && _coverage_constraints!(ledger, level, ctx)
         isempty(ledger.rows) && continue
@@ -521,8 +516,7 @@ function _dof_topology(V::Space{D,T}; tolerance::GeometryTolerance{T}=GeometryTo
         empty!(ledger.rows)
     end
     _assert_resolved(ledger)
-    return _DofTopology{D,T}(cell_dofs_by_level, raw_keys, level_raws, ledger.source, ledger.pivots,
-                             tolerance)
+    return _DofTopology{D,T}(cell_dofs_by_level, raw_keys, level_raws, ledger.source, ledger.pivots, tolerance)
 end
 
 # The raw enumeration, the first half of step 1 (`_dof_topology`): walk every
@@ -564,8 +558,8 @@ function _enumerate_raws(V::Space{D}) where {D}
         first_raw = length(raw_keys) + 1
         level_cells = Array{Vector{Int},D}(undef, level.mesh.cells)
         for cell in cell_indices(level.mesh)
-            level_cells[cell] = is_active(level.mask, cell) ?
-                                _build_cell_dofs!(raw_by_key, raw_keys, level, cell) : none
+            level_cells[cell] = is_active(level.mask, cell) ? _build_cell_dofs!(raw_by_key, raw_keys, level, cell) :
+                                none
         end
         cell_dofs_by_level[level.id] = level_cells
         level_raws[level.id] = first_raw:length(raw_keys)
@@ -580,8 +574,8 @@ end
 # name alike, such as an endpoint node, while a key carries its level id and
 # so is never shared across levels) or register a fresh id by appending the
 # key to `raw_keys`.
-function _build_cell_dofs!(raw_by_key::Dict{TensorDofKey{D},Int}, raw_keys::Vector{TensorDofKey{D}},
-                           level::Level{D}, cell::CartesianIndex{D}) where {D}
+function _build_cell_dofs!(raw_by_key::Dict{TensorDofKey{D},Int}, raw_keys::Vector{TensorDofKey{D}}, level::Level{D},
+                           cell::CartesianIndex{D}) where {D}
     local_ids = cell_basis_indices(level, cell)
     raw_ids = Vector{Int}(undef, length(local_ids))
 
@@ -615,9 +609,8 @@ function DofLayout(t::_DofTopology{D,T}, physical_dirichlet::Matrix{Bool}) where
         (physical_dirichlet[raw, c] || t.elimination_source[raw] !== :free) && continue
         active_component[raw, c] = (active_count += 1)
     end
-    return DofLayout{D,T}(t.cell_dofs_by_level, t.raw_keys, t.level_raws, t.elimination_source,
-                          t.pivots, t.tolerance, ncomp, physical_dirichlet, active_component,
-                          active_count, zeros(T, nraw, ncomp))
+    return DofLayout{D,T}(t.cell_dofs_by_level, t.raw_keys, t.level_raws, t.elimination_source, t.pivots, t.tolerance,
+                          ncomp, physical_dirichlet, active_component, active_count, zeros(T, nraw, ncomp))
 end
 
 # ── Geometric helpers shared with `dirichlet.jl` ──────────────────────────────
@@ -633,12 +626,10 @@ _coordinate_matches(a::Real, b::Real, tol::GeometryTolerance) = abs(a - b) <= to
 # by `_has_overlay_constraint` to decide whether a mesh-boundary face is
 # a physical face (no overlay constraint) or an artificial overlay face
 # (homogeneous Dirichlet constraint).
-function _level_side_is_physical(level::Level{D,T}, domain::AxisBox{D,T}, axis::Integer,
-                                 side::Symbol, tol::GeometryTolerance{T}) where {D,T}
-    side === :lower &&
-        return _coordinate_matches(level.mesh.domain.lower[axis], domain.lower[axis], tol)
-    side === :upper &&
-        return _coordinate_matches(level.mesh.domain.upper[axis], domain.upper[axis], tol)
+function _level_side_is_physical(level::Level{D,T}, domain::AxisBox{D,T}, axis::Integer, side::Symbol,
+                                 tol::GeometryTolerance{T}) where {D,T}
+    side === :lower && return _coordinate_matches(level.mesh.domain.lower[axis], domain.lower[axis], tol)
+    side === :upper && return _coordinate_matches(level.mesh.domain.upper[axis], domain.upper[axis], tol)
     throw(ArgumentError("boundary side must be :lower or :upper"))
 end
 
@@ -670,8 +661,7 @@ per line per face, factored through the tensor-product structure of the basis an
 looking raw ids up by `(cell, mode)` in `ctx.raw_by_key`. That family therefore
 never reaches this default or the per-raw `_has_overlay_constraint`.
 """
-function _overlay_constraints!(ledger::EliminationLedger, level::Level{D,T},
-                               ctx::_LevelContext{D,T}) where {D,T}
+function _overlay_constraints!(ledger::EliminationLedger, level::Level{D,T}, ctx::_LevelContext{D,T}) where {D,T}
     for raw in ctx.raws
         _has_overlay_constraint(ctx.raw_keys[raw], level, ctx) && _eliminate!(ledger, raw, :overlay)
     end
@@ -757,8 +747,7 @@ Every hook method over a `Level` carries `{D,T<:Real}` in its signature, as the
 defaults do, so a family method is always more specific than the default rather than
 ambiguous with it.
 """
-function _coverage_constraints!(ledger::EliminationLedger, level::Level{D,T},
-                                ctx::_LevelContext{D,T}) where {D,T}
+function _coverage_constraints!(ledger::EliminationLedger, level::Level{D,T}, ctx::_LevelContext{D,T}) where {D,T}
     any(ctx.coverage.covered[level.id]) || return ledger
     covers = Level[]
     for k in ctx.space.levels
@@ -892,8 +881,7 @@ end
 # pass added 24 to 55 allocations (10 to 34 KB) to one layout of the ladders and band
 # stacks over an immersed disc and of a depth-5 ladder, with no change in time.
 function _decides(marks::_BurialMarks, dedup::Bool)
-    any(i -> marks.candidate[i] && !marks.done[i] && (dedup || marks.sheds[i]),
-        eachindex(marks.done))
+    any(i -> marks.candidate[i] && !marks.done[i] && (dedup || marks.sheds[i]), eachindex(marks.done))
 end
 
 # One cover's pass (step 2 of `_coverage_constraints!`): mark every undecided candidate
@@ -945,9 +933,7 @@ _sheds(::Level{D,T}, ::TensorDofKey{D}) where {D,T<:Real} = false
 function _burial_cells end
 _cover_test(::Level{D,T}, ::Level{D,T}, ::_LevelContext{D,T}) where {D,T<:Real} = nothing
 function _reproduced_by end
-function _dedup!(ledger::EliminationLedger, ::Level{D,T}, raw::Int) where {D,T<:Real}
-    _eliminate!(ledger, raw, :dedup)
-end
+_dedup!(ledger::EliminationLedger, ::Level{D,T}, raw::Int) where {D,T<:Real} = _eliminate!(ledger, raw, :dedup)
 
 # Whether the cover `k`'s span contains `level`'s buried functions, given that `k`'s mesh
 # nests over `level`'s (`_nested_over`, the geometric half, which the driver asks
@@ -1015,8 +1001,7 @@ function cell_dofs(layout::DofLayout{D}, level::Integer, cell::CartesianIndex{D}
     # (region, parent, field), pays one test as before, and the read after it is
     # in bounds.
     tables = layout.cell_dofs_by_level
-    isassigned(tables, level) ||
-        throw(ArgumentError("level id $level is not a level of this layout's space"))
+    isassigned(tables, level) || throw(ArgumentError("level id $level is not a level of this layout's space"))
     return @inbounds(tables[level])[cell]
 end
 
@@ -1037,8 +1022,7 @@ the system's active-dof vector, so they index a [`Solution`](@ref)'s
 coefficients directly. The second form reads the only field of a single-field
 problem; the third names the field.
 """
-function active_cell_dofs(layout::DofLayout{D}, level::Integer, cell::CartesianIndex{D},
-                          component::Integer=1) where {D}
+function active_cell_dofs(layout::DofLayout{D}, level::Integer, cell::CartesianIndex{D}, component::Integer=1) where {D}
     return [layout.active_component[raw, component] for raw in cell_dofs(layout, level, cell)]
 end
 
@@ -1080,9 +1064,7 @@ elimination (overlay boundary, pruning, and a `:mixed` dof, see
 projected value for nonzero Dirichlet data. `layout` is a
 [`DofLayout`](@ref), or the `SystemLayout` of a single-field problem.
 """
-function constrained_value(layout::DofLayout, raw::Integer, component::Integer=1)
-    layout.constrained_values[raw, component]
-end
+constrained_value(layout::DofLayout, raw::Integer, component::Integer=1) = layout.constrained_values[raw, component]
 
 """
     has_linear_constraints(layout::DofLayout) -> Bool
@@ -1117,16 +1099,13 @@ raw_dof_count(layout::SystemLayout) = sum(raw_dof_count(field.dofs) for field in
 # True iff any field's dof layout carries a linear-constraint pivot (a raw
 # redistributed onto other raws; see [`DofLayout`](@ref)'s `pivots`). Assembly
 # itself asks per field; this system-wide form serves tests and diagnostics.
-function has_linear_constraints(layout::SystemLayout)
-    any(field -> has_linear_constraints(field.dofs), layout.fields)
-end
+has_linear_constraints(layout::SystemLayout) = any(field -> has_linear_constraints(field.dofs), layout.fields)
 
 # Resolve the unique field of a single-field layout. Used by the
 # single-field system forms below, so a single-field problem need not
 # name its field.
 function _only_field_layout(layout::SystemLayout)
-    length(layout.fields) == 1 ||
-        throw(ArgumentError("field argument is required for multi-field layouts"))
+    length(layout.fields) == 1 || throw(ArgumentError("field argument is required for multi-field layouts"))
     return only(layout.fields)
 end
 
@@ -1141,16 +1120,14 @@ function cell_dofs(layout::SystemLayout, level::Integer, cell::CartesianIndex)
     cell_dofs(_only_field_layout(layout).dofs, level, cell)
 end
 
-function active_cell_dofs(layout::SystemLayout, level::Integer, cell::CartesianIndex,
-                          component::Integer=1)
+function active_cell_dofs(layout::SystemLayout, level::Integer, cell::CartesianIndex, component::Integer=1)
     active_cell_dofs(layout, _only_field_layout(layout).name, level, cell, component)
 end
 
 function active_cell_dofs(layout::SystemLayout, name::Symbol, level::Integer, cell::CartesianIndex,
                           component::Integer=1)
     field = _field_layout(layout, name)
-    return [_field_component_dof(field, raw, component)
-            for raw in cell_dofs(field.dofs, level, cell)]
+    return [_field_component_dof(field, raw, component) for raw in cell_dofs(field.dofs, level, cell)]
 end
 
 function constraint_kind(layout::SystemLayout, raw::Integer, component::Integer=1)
@@ -1229,8 +1206,7 @@ assembled another.
 function dof_value(layout::FieldLayout, coefficients, raw::Integer, component::Integer=1)
     global_dof = _field_component_dof(layout, raw, component)
     global_dof == 0 || return coefficients[global_dof]
-    value, _ = _fold_pivot(_branch_value(coefficients),
-                           constrained_value(layout.dofs, raw, component), layout.dofs,
+    value, _ = _fold_pivot(_branch_value(coefficients), constrained_value(layout.dofs, raw, component), layout.dofs,
                            (other, c) -> _field_component_dof(layout, other, c), raw, component)
     return value
 end
@@ -1324,8 +1300,7 @@ function _tensor_dof_key(level::Level{D,T,<:IntegratedLegendre}, cell::Cartesian
     return TensorDofKey{D}(level.id, axes)
 end
 
-function _tensor_dof_key(level::Level{D,T,B}, cell::CartesianIndex{D},
-                         local_id::CartesianIndex{D}) where {D,T,B}
+function _tensor_dof_key(level::Level{D,T,B}, cell::CartesianIndex{D}, local_id::CartesianIndex{D}) where {D,T,B}
     throw(ArgumentError("dof layout is not implemented for basis family $(basis_name(level.basis))"))
 end
 
@@ -1344,8 +1319,8 @@ end
 # `_AXIS_NODE.index == 1` (lower) or `cells[axis] + 1` (upper). Bubbles
 # never touch any edge. B-spline overloads live in
 # `ext/UnfittedBasicBSplineExt.jl`.
-function _key_on_level_side(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
-                            axis::Integer, side::Symbol) where {D,T}
+function _key_on_level_side(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre}, axis::Integer,
+                            side::Symbol) where {D,T}
     axis_key = key.axes[axis]
     axis_key.kind == _AXIS_NODE || return false
     side === :lower && return axis_key.index == 1
@@ -1410,8 +1385,7 @@ end
 # family in `ext/UnfittedBasicBSplineExt.jl` does the same job in its own
 # `_overlay_constraints!`, with a support map that spans several cells and
 # the same material exemption (`_active_cell_at_face`).
-@inline function _has_overlay_constraint(key::TensorDofKey{D},
-                                         level::Level{D,T,<:IntegratedLegendre},
+@inline function _has_overlay_constraint(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
                                          ctx::_LevelContext{D,T}) where {D,T}
     n = level.mesh.cells
     for axis in 1:D
@@ -1471,8 +1445,7 @@ end
 # to probe both sides of a candidate face for an active/inactive transition.
 # A position off the mesh reads as inactive, so a mesh-box face is a
 # transition wherever the cell just inside it is active.
-function _cell_active(level::Level{D}, axis::Integer, pos::Integer, outer::NTuple{D,Int},
-                      n::NTuple{D,Int}) where {D}
+function _cell_active(level::Level{D}, axis::Integer, pos::Integer, outer::NTuple{D,Int}, n::NTuple{D,Int}) where {D}
     1 <= pos <= n[axis] || return false
     cell_tuple = ntuple(d -> d == axis ? pos : outer[d], D)
     return is_active(level.mask, CartesianIndex(cell_tuple))
@@ -1560,8 +1533,8 @@ end
 # vector on every call, so asking it per cell allocated one vector per active
 # cell of the level. Measured on a 16³ level carrying 36 distinct anisotropic
 # orders, 36 973 allocations and 30.6 ms against 23 912 and 28.5 ms.
-function _cell_modes(basis::IntegratedLegendre, orders::CellOrders{D}, mesh::CartesianMesh{D},
-                     mode::Symbol, mask) where {D}
+function _cell_modes(basis::IntegratedLegendre, orders::CellOrders{D}, mesh::CartesianMesh{D}, mode::Symbol,
+                     mask) where {D}
     length(orders.palette) == 1 && return _uniform_cell_modes(basis, orders, mesh, mode, mask)
     n = mesh.cells
     sets = [CartesianIndex{D}[]]
@@ -1593,8 +1566,8 @@ end
 # incident to it generates `id` from its own order. The generating cell is itself
 # incident, and `id` came from its own index set, so the loop is never empty and
 # the unconstrained case needs no separate answer.
-function _entity_carries(basis::BasisFamily, orders::CellOrders{D}, mask, key::TensorDofKey{D},
-                         n::NTuple{D,Int}, mode::Symbol, id::CartesianIndex{D}) where {D}
+function _entity_carries(basis::BasisFamily, orders::CellOrders{D}, mask, key::TensorDofKey{D}, n::NTuple{D,Int},
+                         mode::Symbol, id::CartesianIndex{D}) where {D}
     for ci in _incident_cells(key, n)
         is_active(mask, ci) || continue
         _index_admissible(basis, orders.palette[orders.class[ci]], mode, id) || return false
@@ -1614,8 +1587,7 @@ function _sheds(::Level{D,T,<:IntegratedLegendre}, key::TensorDofKey{D}) where {
     return any(a -> a.kind == _AXIS_SPAN, key.axes)
 end
 
-function _burial_cells(level::Level{D,T,<:IntegratedLegendre},
-                       key::TensorDofKey{D}) where {D,T<:Real}
+function _burial_cells(level::Level{D,T,<:IntegratedLegendre}, key::TensorDofKey{D}) where {D,T<:Real}
     return _incident_cells(key, level.mesh.cells)
 end
 
@@ -1624,7 +1596,4 @@ end
 # endpoint modes it collapses into one node factor have trunk degree 0, so Q1 is in
 # every cell's index set. The other rows of the `_reproduces` table involve a B-spline
 # level and are the extension's.
-function _reproduces(::Level{D,T,<:IntegratedLegendre},
-                     ::Level{D,T,<:IntegratedLegendre}) where {D,T<:Real}
-    true
-end
+_reproduces(::Level{D,T,<:IntegratedLegendre}, ::Level{D,T,<:IntegratedLegendre}) where {D,T<:Real} = true

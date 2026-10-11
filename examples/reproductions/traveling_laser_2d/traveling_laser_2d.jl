@@ -274,9 +274,7 @@ end
 # behind it is concrete again. At t = 0 there is no history, and the bare scalar
 # is the documented shorthand for "value channel only, zero gradient channel".
 step_load(::Nothing, x, dt, f) = f
-function step_load(p, x, dt, f)
-    return TestChannels(value(p..., x) / dt + f, (-(1 - THETA) * KAPPA) .* field_gradient(p..., x))
-end
+step_load(p, x, dt, f) = TestChannels(value(p..., x) / dt + f, (-(1 - THETA) * KAPPA) .* field_gradient(p..., x))
 
 # The callback reaches `previous` through a `Ref{Any}`, which is a type eraser
 # and not mutable state: it is written once, at construction, and only read
@@ -295,10 +293,8 @@ function step_model(V, previous, dt, t0, t1)
     q0, q1 = heat_source(t0), heat_source(t1)
     history = Ref{Any}(previous)
     form = WeakForm(; symmetric=true,
-                    bilinear=(q, trial) -> TestChannels(trial.value / dt,
-                                                        (THETA * KAPPA) .* trial.gradient),
-                    linear=q -> step_load(history[], q.x, dt,
-                                          THETA * q1(q.x) + (1 - THETA) * q0(q.x)))
+                    bilinear=(q, trial) -> TestChannels(trial.value / dt, (THETA * KAPPA) .* trial.gradient),
+                    linear=q -> step_load(history[], q.x, dt, THETA * q1(q.x) + (1 - THETA) * q0(q.x)))
     T = field(:temperature, V)
     return prepare(Problem(T, form; dirichlet=[dirichlet(0.0; on=boundary(:all), field=T)]))
 end
@@ -378,8 +374,7 @@ function write_frame(series, t, u, model)
     series === nothing && return nothing
     q = heat_source(t)
     return write_vtk(series, t, u, model; compress=true, subdivisions=20,
-                     point_data=(temperature=(f, c, x, xi) -> f(c, xi),
-                                 source=(f, c, x, xi) -> q(x)))
+                     point_data=(temperature=(f, c, x, xi) -> f(c, xi), source=(f, c, x, xi) -> q(x)))
 end
 
 # ── The run ───────────────────────────────────────────────────────────────────
@@ -436,15 +431,12 @@ function run_study(series)
         isempty(released) || (W = coarsen(W; h=released))
         W = seed(W, t + UPDATE_EVERY)
 
-        row = NamedTuple{COLUMNS}((t, active_unknowns(model),
-                                   l2_error(u, model, exact_temperature(t)), est.total,
-                                   est.consistency, length(h_cells), length(p_cells),
-                                   length(released)))
+        row = NamedTuple{COLUMNS}((t, active_unknowns(model), l2_error(u, model, exact_temperature(t)), est.total,
+                                   est.consistency, length(h_cells), length(p_cells), length(released)))
         push!(rows, row)
-        println("  ", rpad(sig(row.time, 3), 6), ", ", lpad(row.unknowns, 6), ", ",
-                rpad(sig(row.rel_l2_error), 10), ", ", rpad(sig(row.eta), 10), ", ",
-                rpad(sig(row.consistency, 3), 9), ", ", lpad(row.n_h, 4), ", ", lpad(row.n_p, 4),
-                ", ", lpad(row.n_released, 4))
+        println("  ", rpad(sig(row.time, 3), 6), ", ", lpad(row.unknowns, 6), ", ", rpad(sig(row.rel_l2_error), 10),
+                ", ", rpad(sig(row.eta), 10), ", ", rpad(sig(row.consistency, 3), 9), ", ", lpad(row.n_h, 4), ", ",
+                lpad(row.n_p, 4), ", ", lpad(row.n_released, 4))
 
         new_model = step_model(W, nothing, DT_MAX, t, t + DT_MAX)
         u = transfer(u, model, new_model; via=L2Projection())
@@ -482,9 +474,9 @@ function print_second_half(rows)
     half = filter(row -> row.time >= T_MAX / 2 - 1.0e-12, rows)
     isempty(half) && return nothing
     u, e = [row.unknowns for row in half], [row.rel_l2_error for row in half]
-    println("mean over t ≥ ", sig(T_MAX / 2, 3), ": ", round(Int, sum(u) / length(u)),
-            " unknowns (", minimum(u), "–", maximum(u), ") at relative L2 ",
-            sig(sum(e) / length(e), 4), " (", sig(minimum(e), 4), "–", sig(maximum(e), 4), ")")
+    println("mean over t ≥ ", sig(T_MAX / 2, 3), ": ", round(Int, sum(u) / length(u)), " unknowns (", minimum(u), "–",
+            maximum(u), ") at relative L2 ", sig(sum(e) / length(e), 4), " (", sig(minimum(e), 4), "–",
+            sig(maximum(e), 4), ")")
     return nothing
 end
 
@@ -506,6 +498,6 @@ if WRITE_OUTPUT
 end
 
 print_run_report("2D traveling laser, automated hp", report;
-                 parameters=(:t_max => T_MAX, :dt => STEP, :update => UPDATE_EVERY, :theta => THETA,
-                             :kappa => KAPPA, :sigma => SIGMA, :depth => DEPTH,
-                             :theta_mark => THETA_MARK, :release => RELEASE), output=nothing)
+                 parameters=(:t_max => T_MAX, :dt => STEP, :update => UPDATE_EVERY, :theta => THETA, :kappa => KAPPA,
+                             :sigma => SIGMA, :depth => DEPTH, :theta_mark => THETA_MARK, :release => RELEASE),
+                 output=nothing)

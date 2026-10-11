@@ -46,8 +46,8 @@ end
     # A 2D disk cut cell: the single Lawson–Hanson solve yields at most
     # nbasis = prod(order .+ 1) non-negative weights, reproducing the exact
     # moments. No point-elimination loop is needed.
-    p = physical_domain(x -> sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.3; lipschitz=1.0,
-                        subcell_length_scale=1.0 / 2^5, max_depth=5)
+    p = physical_domain(x -> sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.3; lipschitz=1.0, subcell_length_scale=1.0 / 2^5,
+                        max_depth=5)
     region = box((0.0, 0.0), (1.0, 1.0))
     moment_order = (3, 3)
     nbasis = prod(moment_order .+ 1)
@@ -105,8 +105,7 @@ end
         @test all(w -> w >= 0, ws)
         @test res < 1.0e-8
     end
-    pk = physical_domain(x -> max(x[1] - 0.7, x[2] - 0.6); lipschitz=2.0,
-                         subcell_length_scale=1.0 / 2^5, max_depth=5)
+    pk = physical_domain(x -> max(x[1] - 0.7, x[2] - 0.6); lipschitz=2.0, subcell_length_scale=1.0 / 2^5, max_depth=5)
     _, wsk, resk = Unfitted.moment_fit_rule(pk, region, order)
     @test all(w -> w >= 0, wsk)
     @test resk < Unfitted._FIT_FAILURE_RESIDUAL
@@ -213,24 +212,20 @@ end
     order = (8, 8)
     radius = 0.1
     holes = ((0.3, 0.3), (0.7, 0.3), (0.3, 0.7), (0.7, 0.7))
-    geom = complement(union((leaf(x -> hypot(x[1] - c[1], x[2] - c[2]) - radius; lipschitz=1.0)
-                             for c in holes)...))
+    geom = complement(union((leaf(x -> hypot(x[1] - c[1], x[2] - c[2]) - radius; lipschitz=1.0) for c in holes)...))
     p = physical_domain(geom; subcell_length_scale=0.1)
     @test classify_cell(p, region) === :cut
 
     # The first attempt in isolation: the same volume rule and (exact) moments
     # the real loop builds, capped at the first attempt's `6 · nbasis` budget.
     leaves = Unfitted._leaves(geom)
-    rule = Unfitted.implicit_volume_quadrature(Any[l.f for l in leaves],
-                                               x -> Unfitted._inside(geom, x), region;
+    rule = Unfitted.implicit_volume_quadrature(Any[l.f for l in leaves], x -> Unfitted._inside(geom, x), region;
                                                gauss_points=Unfitted._implicit_gauss_points(order),
-                                               max_subdiv=Unfitted._effective_subcell_depth(p,
-                                                                                            region),
+                                               max_subdiv=Unfitted._effective_subcell_depth(p, region),
                                                lipschitz=Float64[l.lipschitz for l in leaves])
     moments = Unfitted._moments_from_rule(rule[1], rule[2], region, order)
     starved = Unfitted._cap_candidates(rule[1], order, Unfitted._candidate_budget(1))
-    _, _, starved_residual = Unfitted._solve_moment_fit(moments, starved, region, order,
-                                                        sum(rule[2]))
+    _, _, starved_residual = Unfitted._solve_moment_fit(moments, starved, region, order, sum(rule[2]))
     @test starved_residual > Unfitted._FIT_FAILURE_RESIDUAL
     # The retry must genuinely enlarge the cloud — the property the fixed cap
     # silently removed.
@@ -270,12 +265,11 @@ end
     # tolerance reaches the fallback.
     L = 2000.0f0
     radius = 200.0f0
-    holes = ((0.3f0 * L, 0.3f0 * L), (0.7f0 * L, 0.3f0 * L), (0.3f0 * L, 0.7f0 * L),
-             (0.7f0 * L, 0.7f0 * L))
+    holes = ((0.3f0 * L, 0.3f0 * L), (0.7f0 * L, 0.3f0 * L), (0.3f0 * L, 0.7f0 * L), (0.7f0 * L, 0.7f0 * L))
     order = (4, 4)
     exact = L^2 - 4 * π * radius^2
-    geom32 = complement(union((leaf(x -> sqrt((x[1] - c[1])^2 + (x[2] - c[2])^2) - radius;
-                                    lipschitz=1.0) for c in holes)...))
+    geom32 = complement(union((leaf(x -> sqrt((x[1] - c[1])^2 + (x[2] - c[2])^2) - radius; lipschitz=1.0)
+                               for c in holes)...))
     p32 = physical_domain(geom32; subcell_length_scale=L / 10, max_depth=8)
     region32 = box((0.0f0, 0.0f0), (L, L))
 
@@ -294,12 +288,11 @@ end
 
     # Control: identical geometry in Float64 fits, so no fallback and an
     # O(nbasis) rule.
-    geom64 = complement(union((leaf(x -> hypot(x[1] - Float64(c[1]), x[2] - Float64(c[2])) -
-                                         Float64(radius); lipschitz=1.0) for c in holes)...))
+    geom64 = complement(union((leaf(x -> hypot(x[1] - Float64(c[1]), x[2] - Float64(c[2])) - Float64(radius);
+                                    lipschitz=1.0) for c in holes)...))
     p64 = physical_domain(geom64; subcell_length_scale=Float64(L) / 10, max_depth=8)
     region64 = box((0.0, 0.0), (Float64(L), Float64(L)))
-    pts64, ws64, res64, status64 = Unfitted.moment_fit_rule(p64, region64, order;
-                                                            target_residual=1.0e-6)
+    pts64, ws64, res64, status64 = Unfitted.moment_fit_rule(p64, region64, order; target_residual=1.0e-6)
     @test status64 === :fitted
     @test res64 < Unfitted._FIT_FAILURE_RESIDUAL
     @test length(ws64) <= prod(order .+ 1)
@@ -312,8 +305,7 @@ end
     # `res32 / ‖m‖` and not `res32` that honours the tolerance. Under the previous
     # absolute comparison this fit was reported `:fallback` on a 2000-unit cell and
     # `:fitted` on a unit one, for identical arithmetic.
-    pts32, ws32, res32, status32 = Unfitted.moment_fit_rule(p32, region32, order;
-                                                            target_residual=1.0e-6)
+    pts32, ws32, res32, status32 = Unfitted.moment_fit_rule(p32, region32, order; target_residual=1.0e-6)
     @test status32 === :fitted
     @test length(ws32) <= prod(order .+ 1)
     @test sum(ws32) ≈ exact rtol = 1.0e-4
@@ -344,8 +336,7 @@ end
     @test mc ≈ _legendre_moments(ref_rule[1], ref_rule[2], region, order) atol = 1e-9
 
     nbasis = prod(order .+ 1)
-    pts, _ = Unfitted.implicit_volume_quadrature(phi, region;
-                                                 gauss_points=Unfitted._implicit_gauss_points(order))
+    pts, _ = Unfitted.implicit_volume_quadrature(phi, region; gauss_points=Unfitted._implicit_gauss_points(order))
     @test length(pts) <= 12 * nbasis
 end
 
@@ -379,8 +370,7 @@ end
     @test sum(wsS) ≈ sum(ws1) * S^2 rtol = 1.0e-10
     # The whole rule as an integrator, not just its measure: every tensor Legendre
     # moment in the cell's own reference frame scales by S^D and nothing else.
-    @test _legendre_moments(ptsS, wsS, cellS, order) ≈
-          _legendre_moments(pts1, ws1, cell1, order) .* S^2 rtol = 1.0e-10
+    @test _legendre_moments(ptsS, wsS, cellS, order) ≈ _legendre_moments(pts1, ws1, cell1, order) .* S^2 rtol = 1.0e-10
     # The reported residual describes the returned rule, and is machine-level
     # relative to the cut volume at both scales — the only scale-free reading.
     @test res1 <= 1.0e-12 * sum(ws1)

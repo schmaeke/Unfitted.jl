@@ -42,8 +42,7 @@ let
     # A Poisson problem (stiffness plus a unit source) over `V` with Dirichlet list `bcs`.
     function poisson_problem(V, bcs)
         u = field(:u, V)
-        return Problem((u,); blocks=(stiffness_block(u),), loads=(source_load(u; source=1.0),),
-                       dirichlet=bcs)
+        return Problem((u,); blocks=(stiffness_block(u),), loads=(source_load(u; source=1.0),), dirichlet=bcs)
     end
     # The three layout entry points on one problem, as one subgroup.
     function layout_cases(name, V, bcs)
@@ -65,15 +64,12 @@ let
         end
     end
 
-    layout_cases("D=3 12^3 p3 :all", space(Ω3; cells=12, order=3),
-                 [dirichlet(0.0; on=boundary(:all))])
+    layout_cases("D=3 12^3 p3 :all", space(Ω3; cells=12, order=3), [dirichlet(0.0; on=boundary(:all))])
 
     # Nonzero data, so `dof_layout`, `prepare` and `move!` all include the projection.
-    data(s) = [dirichlet(x -> s * (prod(sinpi, x) + exp(x[1]) * sin(x[2]) + 1.0);
-                         on=boundary(:all))]
+    data(s) = [dirichlet(x -> s * (prod(sinpi, x) + exp(x[1]) * sin(x[2]) + 1.0); on=boundary(:all))]
     corner = overlay(space(Ω2; cells=32, order=3), box((0.0, 0.0), (0.5, 0.5)); cells=32, order=3)
-    overlay_cases, overlay_problem = layout_cases("D=2 32^2 + 32^2 p3 overlay, nonzero", corner,
-                                                  data(1.0))
+    overlay_cases, overlay_problem = layout_cases("D=2 32^2 + 32^2 p3 overlay, nonzero", corner, data(1.0))
     let model = prepare(overlay_problem)
         b1, b2 = box((0.0, 0.0), (0.5, 0.5)), box((0.25, 0.0), (0.75, 0.5))
         move = toggler(() -> move!(model; level=2, to=b2), () -> move!(model; level=2, to=b1))
@@ -83,8 +79,7 @@ let
         # A fresh model per sample: `prepare` keeps no projection, so the first
         # increment always builds one.
         overlay_cases["update_dirichlet! first"] = @benchmarkable(update_dirichlet!(m, $increment),
-                                                                  setup=(m = prepare($overlay_problem)),
-                                                                  evals=1)
+                                                                  setup=(m = prepare($overlay_problem)), evals=1)
     end
     let model = prepare(overlay_problem), d1 = data(1.0), d2 = data(2.0)
         update_dirichlet!(model, d1)   # builds and caches the projection
@@ -95,12 +90,10 @@ let
     depths = zeros(Int, 6, 6)
     depths[3, 3] = 5
     deep = adapt(ladder(Ω2; cells=6, order=2, depth=5, splits=2), depths; grade=1)
-    ladder_cases, ladder_problem = layout_cases("D=2 ladder 6^2 depth 5 p2", deep,
-                                                [dirichlet(0.0; on=boundary(:all))])
+    ladder_cases, ladder_problem = layout_cases("D=2 ladder 6^2 depth 5 p2", deep, [dirichlet(0.0; on=boundary(:all))])
     let model = prepare(ladder_problem)
         cells = [CartesianIndex(i, j) for i in 17:20 for j in 17:20]
-        flip = toggler(() -> activate!(model; level=4, cells=cells),
-                       () -> deactivate!(model; level=4, cells=cells))
+        flip = toggler(() -> activate!(model; level=4, cells=cells), () -> deactivate!(model; level=4, cells=cells))
         ladder_cases["activate!/deactivate!"] = @benchmarkable $flip()
     end
 
@@ -126,8 +119,7 @@ let
         front(x) = 0.5 + 0.25 * sinpi(2x)
         marks = [abs((j - 0.5) / 6 - front((i - 0.5) / 6)) < 0.2 ? 2 : 0 for i in 1:6, j in 1:6]
         u = field(:u, adapt(ladder(Ω2; cells=6, order=2, depth=3), marks; grade=1))
-        model = prepare(Problem((u,); blocks=(stiffness_block(u),),
-                                loads=(source_load(u; source=source),),
+        model = prepare(Problem((u,); blocks=(stiffness_block(u),), loads=(source_load(u; source=source),),
                                 dirichlet=[dirichlet(exact; on=boundary(:all))]))
         sol = solve!(model)
         group["D=2 tanh ladder 6^2 depth 3 p2"] = BenchmarkGroup()

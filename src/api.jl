@@ -29,9 +29,7 @@ end
 # `UniformScaling`. Only genuine callables `c(x)` become `FunctionCoefficient`,
 # so a bare per-component value (e.g. `coefficient = SVector(2, 3)`) is resolved
 # component-wise rather than mistakenly called as a function of `x`.
-function _as_coefficient(value::Union{Number,AbstractArray,UniformScaling,Tuple})
-    ConstantCoefficient(value)
-end
+_as_coefficient(value::Union{Number,AbstractArray,UniformScaling,Tuple}) = ConstantCoefficient(value)
 _as_coefficient(value) = FunctionCoefficient(value)
 
 # Resolve a coefficient at the physical point `x`. Constant
@@ -43,9 +41,7 @@ _coefficient_value(c::FunctionCoefficient, x) = c.f(x)
 # `_component_value` so a scalar coefficient applies to every
 # component uniformly while an indexable (`SVector`, `Tuple`) coefficient
 # resolves the component slot.
-function _component_coefficient_value(c, x, component::Integer)
-    _component_value(_coefficient_value(c, x), component)
-end
+_component_coefficient_value(c, x, component::Integer) = _component_value(_coefficient_value(c, x), component)
 
 # Diffusion flux `a · ∇u` for the three accepted shapes of `a`:
 # scalar (isotropic), `UniformScaling` (also isotropic; supports
@@ -85,8 +81,7 @@ _check_square_diffusion(_) = nothing
 # generic ones do not, so the flux can differ from the generic product in the
 # last few ulps.
 function _diffusion_flux(a::AbstractMatrix, ugrad::SVector{D}) where {D}
-    size(a) == (D, D) ||
-        throw(DimensionMismatch("diffusion tensor has size $(size(a)); expected ($D, $D)"))
+    size(a) == (D, D) || throw(DimensionMismatch("diffusion tensor has size $(size(a)); expected ($D, $D)"))
     return SMatrix{D,D}(a) * ugrad
 end
 
@@ -220,9 +215,8 @@ function boundary(selector::Symbol; except=())
     # no consumer supports still fails where it always failed — at prepare time,
     # in `_facets`, not here.
     isempty(except) && return BoundarySelector(selector, Tuple{Int,Symbol}[])
-    selector === :all ||
-        throw(ArgumentError("except= removes faces from the whole boundary, so it applies " *
-                            "only to boundary(:all); got boundary(:$selector)"))
+    selector === :all || throw(ArgumentError("except= removes faces from the whole boundary, so it applies " *
+                                             "only to boundary(:all); got boundary(:$selector)"))
     return BoundarySelector(:except, _excluded_faces(except))
 end
 
@@ -258,8 +252,7 @@ function _excluded_faces(specs)
         axis = Int(spec.axis)
         axis >= 1 || throw(ArgumentError("boundary axis $axis must be positive"))
         if haskey(spec, :side)
-            spec.side in (:lower, :upper) ||
-                throw(ArgumentError("boundary side must be :lower or :upper"))
+            spec.side in (:lower, :upper) || throw(ArgumentError("boundary side must be :lower or :upper"))
             push!(faces, (axis, spec.side))
         else
             append!(faces, ((axis, :lower), (axis, :upper)))
@@ -278,8 +271,7 @@ function boundary(pairs::NamedTuple...)
     sides = Tuple{Int,Symbol}[]
     seen = Set{Int}()
     for p in pairs
-        (haskey(p, :axis) && haskey(p, :side)) ||
-            throw(ArgumentError("boundary pairs must carry :axis and :side keys"))
+        (haskey(p, :axis) && haskey(p, :side)) || throw(ArgumentError("boundary pairs must carry :axis and :side keys"))
         axis = Int(p.axis)
         side = p.side
         side in (:lower, :upper) || throw(ArgumentError("boundary side must be :lower or :upper"))
@@ -371,8 +363,7 @@ function dirichlet(value; on::BoundarySelector, field=nothing, component=nothing
         component isa Integer ||
         throw(ArgumentError("Dirichlet component must be an integer or nothing"))
     field isa Field && _check_component(component, field)
-    condition = DirichletCondition(value, on, field_name,
-                                   component === nothing ? nothing : Int(component))
+    condition = DirichletCondition(value, on, field_name, component === nothing ? nothing : Int(component))
     field isa Field && _check_dirichlet_datum(condition, component_count(field), field.name)
     return condition
 end
@@ -400,8 +391,7 @@ block, and [`mass`](@ref) for the whole one-field problem.
 """
 function mass_form(; coefficient=1)
     coefficient_data = _as_coefficient(coefficient)
-    return WeakForm(bilinear=(q, trial, test_component) -> _mass_value(coefficient_data, q, trial,
-                                                                       test_component),
+    return WeakForm(bilinear=(q, trial, test_component) -> _mass_value(coefficient_data, q, trial, test_component),
                     symmetric=true, component_aware=true)
 end
 
@@ -463,10 +453,9 @@ block, and [`stiffness`](@ref) for the whole one-field problem.
 function stiffness_form(; diffusion=1)
     _check_square_diffusion(diffusion)
     diffusion_coefficient = _as_coefficient(diffusion)
-    return WeakForm(bilinear=(q, trial, test_component) -> _stiffness_channels(diffusion_coefficient,
-                                                                               q, trial,
-                                                                               test_component),
-                    symmetric=true, component_aware=true)
+    return WeakForm(bilinear=(q, trial, test_component) -> _stiffness_channels(diffusion_coefficient, q, trial,
+                                                                               test_component), symmetric=true,
+                    component_aware=true)
 end
 
 """
@@ -489,8 +478,7 @@ contribution, [`load`](@ref) for the whole one-field problem, and
 """
 function source_form(; source)
     source_coefficient = _as_coefficient(source)
-    return WeakForm(linear=(q, test_component) -> _source_value(source_coefficient, q,
-                                                                test_component), symmetric=true,
+    return WeakForm(linear=(q, test_component) -> _source_value(source_coefficient, q, test_component), symmetric=true,
                     component_aware=true)
 end
 
@@ -502,11 +490,9 @@ function _poisson_form(; source, diffusion=1)
     _check_square_diffusion(diffusion)
     source_coefficient = _as_coefficient(source)
     diffusion_coefficient = _as_coefficient(diffusion)
-    return WeakForm(bilinear=(q, trial, test_component) -> _stiffness_channels(diffusion_coefficient,
-                                                                               q, trial,
+    return WeakForm(bilinear=(q, trial, test_component) -> _stiffness_channels(diffusion_coefficient, q, trial,
                                                                                test_component),
-                    linear=(q, test_component) -> _source_value(source_coefficient, q,
-                                                                test_component), symmetric=true,
+                    linear=(q, test_component) -> _source_value(source_coefficient, q, test_component), symmetric=true,
                     component_aware=true)
 end
 
@@ -601,8 +587,8 @@ function neumann(u::Field, value; on::BoundarySelector, component=nothing)
     # walking test component matches the requested one.
     coefficient = _as_coefficient(value)
     return loadform(u,
-                    WeakForm(linear=(q, c) -> c == selected ? _source_value(coefficient, q, c) : 0.0,
-                             symmetric=true, component_aware=true); on)
+                    WeakForm(linear=(q, c) -> c == selected ? _source_value(coefficient, q, c) : 0.0, symmetric=true,
+                             component_aware=true); on)
 end
 
 """
@@ -620,9 +606,7 @@ form is diagonal in the component index.
 `dirichlet` is the list of physical Dirichlet conditions to impose;
 see [`dirichlet`](@ref).
 """
-function mass(V::Space{D,T}; coefficient=one(T), dirichlet=[]) where {D,T}
-    return mass(field(:u, V); coefficient, dirichlet)
-end
+mass(V::Space{D,T}; coefficient=one(T), dirichlet=[]) where {D,T} = mass(field(:u, V); coefficient, dirichlet)
 
 function mass(u::Field{D,T}; coefficient=one(T), dirichlet=[]) where {D,T}
     return Problem((u,); blocks=(mass_block(u; coefficient),), dirichlet)
@@ -647,9 +631,7 @@ rank-deficient, whose zero rows drop those axes from the operator (see
 `dirichlet` is the list of physical Dirichlet conditions to impose; see
 [`dirichlet`](@ref).
 """
-function stiffness(V::Space{D,T}; diffusion=one(T), dirichlet=[]) where {D,T}
-    return stiffness(field(:u, V); diffusion, dirichlet)
-end
+stiffness(V::Space{D,T}; diffusion=one(T), dirichlet=[]) where {D,T} = stiffness(field(:u, V); diffusion, dirichlet)
 
 function stiffness(u::Field{D,T}; diffusion=one(T), dirichlet=[]) where {D,T}
     return Problem((u,); blocks=(stiffness_block(u; diffusion),), dirichlet)
@@ -674,9 +656,7 @@ from the problem.
 """
 load(V::Space{D,T}; source, dirichlet=[]) where {D,T} = load(field(:u, V); source, dirichlet)
 
-function load(u::Field{D,T}; source, dirichlet=[]) where {D,T}
-    return Problem((u,); loads=(source_load(u; source),), dirichlet)
-end
+load(u::Field{D,T}; source, dirichlet=[]) where {D,T} = Problem((u,); loads=(source_load(u; source),), dirichlet)
 
 """
     load_vector(model; source) -> Vector
@@ -695,9 +675,7 @@ The canonical use case is time-dependent or otherwise repeated load
 assembly: build the model once via [`prepare`](@ref), then call
 `load_vector` once per time step with the current source.
 """
-function load_vector(model::Model{D,T}; source) where {D,T}
-    return assemble_vector(model, source_load(_default_field(model); source))
-end
+load_vector(model::Model{D,T}; source) where {D,T} = assemble_vector(model, source_load(_default_field(model); source))
 
 """
     poisson(V::Space; source, diffusion=1, dirichlet=[])  -> Problem

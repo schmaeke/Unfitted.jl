@@ -34,8 +34,7 @@ end
     base_dofs = Unfitted.active_cell_dofs(source_model.dofs, 1, CartesianIndex(1))
     coefficients[base_dofs[1]] = 2.0
     coefficients[base_dofs[2]] = 2.0
-    source_solution = Solution(coefficients, source_model.version,
-                               Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    source_solution = Solution(coefficients, source_model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
     target_solution = transfer(source_solution, source_model, target_model)
 
     # Two freshly prepared models of *different* discretisations. Their pins
@@ -62,8 +61,7 @@ end
         for c in cells
             mask[c] = true
         end
-        return prepare(poisson(adapt(V, 2 => mask); source=1.0,
-                               dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+        return prepare(poisson(adapt(V, 2 => mask); source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     end
     a = prepared((CartesianIndex(3, 3), CartesianIndex(3, 4)))
     b = prepared((CartesianIndex(6, 6), CartesianIndex(6, 7)))
@@ -91,8 +89,7 @@ end
     # only from the other side.
     omega = box((0.0,), (1.0,))
     described() = overlay(space(omega; cells=4, order=2), box((0.25,), (0.75,)); cells=2, order=3)
-    step() = prepare(poisson(described(); source=x -> 1.0 + x[1],
-                             dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    step() = prepare(poisson(described(); source=x -> 1.0 + x[1], dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     m1 = step()
     u = solve!(m1)
     m2 = step()
@@ -108,8 +105,7 @@ end
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=1, order=2)
     V = overlay(V, box((0.9999,), (1.0,)); cells=1, order=2)
-    model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]);
-                    tolerance)
+    model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]); tolerance)
 
     assemble!(model)
     diag = diagnostics(model)

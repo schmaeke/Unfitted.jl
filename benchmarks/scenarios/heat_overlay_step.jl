@@ -34,10 +34,8 @@ let
     temp_src = field(:temperature, V_src)
     temp_tgt = field(:temperature, V_tgt)
 
-    problem_src = Problem((temp_src,);
-                          dirichlet=[dirichlet(0.0; on=boundary(:all), field=temp_src)])
-    problem_tgt = Problem((temp_tgt,);
-                          dirichlet=[dirichlet(0.0; on=boundary(:all), field=temp_tgt)])
+    problem_src = Problem((temp_src,); dirichlet=[dirichlet(0.0; on=boundary(:all), field=temp_src)])
+    problem_tgt = Problem((temp_tgt,); dirichlet=[dirichlet(0.0; on=boundary(:all), field=temp_tgt)])
     model_src = prepare(problem_src)
     model_tgt = prepare(problem_tgt)
 
@@ -63,7 +61,6 @@ let
     group["assemble_mass"] = @benchmarkable assemble_matrix($model_src, $mass_block_src)
     group["assemble_stiffness"] = @benchmarkable assemble_matrix($model_src, $stiff_block_src)
     group["assemble_load"] = @benchmarkable assemble_vector($model_src, $load_src)
-    group["transfer cached"] = @benchmarkable transfer($src_solution, $model_src, $model_tgt;
-                                                       via=($cached_backend))
+    group["transfer cached"] = @benchmarkable transfer($src_solution, $model_src, $model_tgt; via=($cached_backend))
     group["transfer uncached"] = @benchmarkable transfer($src_solution, $model_src, $model_tgt)
 end

@@ -44,9 +44,8 @@ end
     @test_throws ArgumentError solve!(model; method=:iterative_without_hook)
     @test_throws DimensionMismatch solve!(model; linear_solver=(A, b) -> zeros(0))
 
-    shown = (sprint(show, V.levels[1]), sprint(show, V), sprint(show, model),
-             sprint(show, diagnostics(model)), sprint(show, solution),
-             sprint(show, solution.diagnostics))
+    shown = (sprint(show, V.levels[1]), sprint(show, V), sprint(show, model), sprint(show, diagnostics(model)),
+             sprint(show, solution), sprint(show, solution.diagnostics))
 
     @test occursin("Level", shown[1])
     @test occursin("Space", shown[2])
@@ -104,11 +103,8 @@ end
 
     # Conditions naming their field by `Symbol`, and unscoped conditions on a
     # single-field problem, are resolved at `Problem` construction instead.
-    @test_throws ArgumentError poisson(u; source=0.0,
-                                       dirichlet=[dirichlet(0.0; on=everywhere, field=:u,
-                                                            component=3)])
-    @test_throws ArgumentError poisson(u; source=0.0,
-                                       dirichlet=[dirichlet(0.0; on=everywhere, component=3)])
+    @test_throws ArgumentError poisson(u; source=0.0, dirichlet=[dirichlet(0.0; on=everywhere, field=:u, component=3)])
+    @test_throws ArgumentError poisson(u; source=0.0, dirichlet=[dirichlet(0.0; on=everywhere, component=3)])
 
     # An unscoped condition on a multi-field problem names no field to check
     # against; `_dirichlet_for_field` still rejects it at `prepare` time.
@@ -157,9 +153,7 @@ end
 # difference, so that is what this asserts.
 @testset "exported names carry reachable docstrings" begin
     meta = Base.Docs.meta(Unfitted)
-    undocumented = [n
-                    for n in names(Unfitted)
-                    if n !== :Unfitted && !haskey(meta, Base.Docs.Binding(Unfitted, n))]
+    undocumented = [n for n in names(Unfitted) if n !== :Unfitted && !haskey(meta, Base.Docs.Binding(Unfitted, n))]
 
     # The two names that regressed, pinned by name so a re-detachment fails here.
     @test :BlockForm ∉ undocumented
@@ -178,7 +172,6 @@ end
     # Subset, not equality: documenting one of these is an improvement and must
     # not fail the suite, while a *new* undocumented export does.
     grouped = [:source_form, :stiffness_form, :source_load, :stiffness_block]
-    extension_stubs = [:bspline, :gradient_tensor, :mesh_levelset, :stl_levelset,
-                       :symmetric_gradient, :value_vec]
+    extension_stubs = [:bspline, :gradient_tensor, :mesh_levelset, :stl_levelset, :symmetric_gradient, :value_vec]
     @test issubset(undocumented, union(grouped, extension_stubs))
 end

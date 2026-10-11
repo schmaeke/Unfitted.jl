@@ -8,14 +8,11 @@ using LinearAlgebra
     @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.0)
     @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=-1.0)
     @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1, max_depth=-1)
-    @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1,
-                                               target_residual=0.0)
-    @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1,
-                                               target_residual=-1.0)
+    @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1, target_residual=0.0)
+    @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1, target_residual=-1.0)
     # keep_fictitious keeps fully-fictitious cells active, so it needs α > 0 to
     # give them quadrature; pairing it with the strict-cut path is singular.
-    @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1,
-                                               keep_fictitious=true, alpha=0.0)
+    @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1, keep_fictitious=true, alpha=0.0)
     @test physical_domain(x -> x[1]; subcell_length_scale=0.1, keep_fictitious=true, alpha=1.0e-6).keep_fictitious
 
     # A bare callable is auto-wrapped as a single leaf carrying the `lipschitz`
@@ -31,8 +28,7 @@ using LinearAlgebra
     p_alpha = physical_domain(x -> x[1]; lipschitz=1.0, alpha=0.25, subcell_length_scale=0.1)
     @test p_alpha.alpha == 0.25
 
-    p_tight = physical_domain(x -> x[1]; lipschitz=1.0, subcell_length_scale=0.1,
-                              target_residual=1.0e-10)
+    p_tight = physical_domain(x -> x[1]; lipschitz=1.0, subcell_length_scale=0.1, target_residual=1.0e-10)
     @test p_tight.target_residual == 1.0e-10
 
     p2 = physical_domain(x -> x[1]; subcell_length_scale=0.1)
@@ -60,9 +56,8 @@ end
     @test err isa ArgumentError
     @test occursin("leaf(f; lipschitz=1.0)", err.msg)   # the remedy
     # One uncertified leaf anywhere in a CSG combination is enough.
-    @test_throws ArgumentError physical_domain(setdiff(leaf(x -> hypot(x...) - 0.45; lipschitz=1.0),
-                                                       leaf(phi)); lipschitz=1.0,
-                                               subcell_length_scale=0.1)
+    @test_throws ArgumentError physical_domain(setdiff(leaf(x -> hypot(x...) - 0.45; lipschitz=1.0), leaf(phi));
+                                               lipschitz=1.0, subcell_length_scale=0.1)
 
     # Positivity is checked on every path now, not only on the auto-wrap: the
     # tree path used to accept a constant the callable path throws on.
@@ -73,8 +68,7 @@ end
     # carry their own constant is simply unaffected by the keyword…
     both = intersect(leaf(x -> x[1] - 0.5; lipschitz=1.0), leaf(x -> x[2] - 0.5; lipschitz=2.0))
     @test physical_domain(both; lipschitz=1.0, subcell_length_scale=0.1).geometry === both
-    @test physical_domain(leaf(phi; lipschitz=1.0); lipschitz=1.0, subcell_length_scale=0.1).geometry.lipschitz ==
-          1.0
+    @test physical_domain(leaf(phi; lipschitz=1.0); lipschitz=1.0, subcell_length_scale=0.1).geometry.lipschitz == 1.0
     # …and the default `Inf` on an uncertified tree is the documented
     # corner-sampling path, so it must not be caught by the new check.
     @test isinf(physical_domain(leaf(phi); subcell_length_scale=0.1).geometry.lipschitz)
@@ -113,8 +107,7 @@ end
 @testset "classify_cell — CSG combinations" begin
     # Annulus r ∈ [0.2, 0.45] about the origin: full in the ring, fictitious in
     # the hole, cut across either rim.
-    ann = setdiff(leaf(x -> hypot(x...) - 0.45; lipschitz=1.0),
-                  leaf(x -> hypot(x...) - 0.2; lipschitz=1.0))
+    ann = setdiff(leaf(x -> hypot(x...) - 0.45; lipschitz=1.0), leaf(x -> hypot(x...) - 0.2; lipschitz=1.0))
     p = physical_domain(ann; subcell_length_scale=0.02)
     @test classify_cell(p, box((0.30, 0.0), (0.32, 0.02))) === :full
     @test classify_cell(p, box((0.0, 0.0), (0.05, 0.05))) === :fictitious
@@ -186,8 +179,7 @@ end
     omega = box((-1.0, -1.0), (1.0, 1.0))
 
     loose = physical_domain(phi; lipschitz=1.0, subcell_length_scale=2.0 / 8 / 2^4)
-    tight = physical_domain(phi; lipschitz=1.0, subcell_length_scale=2.0 / 8 / 2^4,
-                            target_residual=1.0e-10)
+    tight = physical_domain(phi; lipschitz=1.0, subcell_length_scale=2.0 / 8 / 2^4, target_residual=1.0e-10)
 
     V_loose = space(omega; cells=(8, 8), order=2, physical=loose)
     V_tight = space(omega; cells=(8, 8), order=2, physical=tight)
@@ -210,8 +202,7 @@ end
 @testset "classify_cell — Lipschitz certificate" begin
     # SDF for a disk centered at (0.5, 0.5) with radius 0.3.
     # phi(x) = ‖x − c‖ − r;  inside Ω ⇔ phi ≤ 0.
-    p = physical_domain(x -> sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.3; lipschitz=1.0,
-                        subcell_length_scale=0.0625)
+    p = physical_domain(x -> sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.3; lipschitz=1.0, subcell_length_scale=0.0625)
 
     # A small box well inside the disk → certificate fires → :full.
     @test classify_cell(p, box((0.45, 0.45), (0.55, 0.55))) === :full
@@ -277,8 +268,8 @@ end
     # keep the NNMF cost on the surrounding cut cells small — this test is
     # about cell classification, not cut-quadrature accuracy.
     omega = box((0.0, 0.0), (1.0, 1.0))
-    hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0,
-                           subcell_length_scale=1.0e-6, max_depth=2)
+    hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0, subcell_length_scale=1.0e-6,
+                           max_depth=2)
     V = space(omega; cells=(10, 10), order=1, physical=hole)
 
     m = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
@@ -308,12 +299,11 @@ end
     src = x -> sin(pi * x[1]) * sin(pi * x[2])
     omega = box((0.0, 0.0), (1.0, 1.0))
 
-    hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0,
-                           subcell_length_scale=1.0e-6, max_depth=2)
+    hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0, subcell_length_scale=1.0e-6,
+                           max_depth=2)
     V_phys = space(omega; cells=(10, 10), order=1, physical=hole)
     V_manual = space(omega; cells=(10, 10), order=1,
-                     active=[CartesianIndex(i, j)
-                             for i in 1:10, j in 1:10 if !(i in 5:6 && j in 5:6)])
+                     active=[CartesianIndex(i, j) for i in 1:10, j in 1:10 if !(i in 5:6 && j in 5:6)])
 
     m_phys = prepare(poisson(V_phys; source=src, dirichlet=[bc]))
     m_manual = prepare(poisson(V_manual; source=src, dirichlet=[bc]))
@@ -334,8 +324,8 @@ end
     # (0.4–0.5) is :cut and kept active by the classifier.
     p = physical_domain(x -> x[1] - 0.495; lipschitz=1.0, subcell_length_scale=1.0e-6, max_depth=2)
 
-    V = overlay(space(omega; cells=(8, 8), order=1, physical=p), box((0.3, 0.3), (0.7, 0.7));
-                cells=(4, 4), order=1, active=(b, i) -> i.I[2] != 4)
+    V = overlay(space(omega; cells=(8, 8), order=1, physical=p), box((0.3, 0.3), (0.7, 0.7)); cells=(4, 4), order=1,
+                active=(b, i) -> i.I[2] != 4)
 
     m = prepare(poisson(V; source=1.0, dirichlet=[bc]))
     bits = active_cells(m; level=2)
@@ -348,8 +338,8 @@ end
 @testset "threaded == serial under fictitious fold" begin
     bc = dirichlet(0.0; on=boundary(:all))
     omega = box((0.0, 0.0), (1.0, 1.0))
-    hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0,
-                           subcell_length_scale=1.0e-6, max_depth=2)
+    hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0, subcell_length_scale=1.0e-6,
+                           max_depth=2)
     V = space(omega; cells=(10, 10), order=1, physical=hole)
 
     m_s = prepare(poisson(V; source=1.0, dirichlet=[bc]))
@@ -368,8 +358,7 @@ end
     p = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=1.0e-6, max_depth=2)
 
     # Overlay starts on the left (entirely inside Ω) → no fictitious cells.
-    V = overlay(space(omega; cells=(8, 8), order=1, physical=p), box((0.1, 0.3), (0.4, 0.7));
-                cells=(3, 4), order=1)
+    V = overlay(space(omega; cells=(8, 8), order=1, physical=p), box((0.1, 0.3), (0.4, 0.7)); cells=(3, 4), order=1)
     m = prepare(poisson(V; source=1.0, dirichlet=[bc]))
     @test all(active_cells(m; level=2))   # all overlay cells active
 
@@ -391,18 +380,17 @@ end
     # entirely and `inside` meets every overlay cell. Moving between two boxes
     # that both overlap Ω shows nothing, because there the stale mask happens
     # to be right at both ends.
-    p = physical_domain(x -> hypot(x[1] - 0.25, x[2] - 0.25) - 0.28; lipschitz=1.0,
-                        subcell_length_scale=1 / 32, max_depth=4)
+    p = physical_domain(x -> hypot(x[1] - 0.25, x[2] - 0.25) - 0.28; lipschitz=1.0, subcell_length_scale=1 / 32,
+                        max_depth=4)
     outside = box((0.55, 0.55), (0.95, 0.95))
     inside = box((0.05, 0.05), (0.45, 0.45))
     # Stiffness + mass, so the operator is nonsingular without a Dirichlet
     # condition and the comparison is over the raw assembled system.
     build = target -> begin
-        V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=p), target;
-                    cells=(2, 2), order=2)
+        V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=p), target; cells=(2, 2),
+                    order=2)
         u = field(:u, V)
-        prepare(Problem((u,); blocks=(stiffness_block(u), mass_block(u)),
-                        loads=(source_load(u; source=1.0),)))
+        prepare(Problem((u,); blocks=(stiffness_block(u), mass_block(u)), loads=(source_load(u; source=1.0),)))
     end
 
     model = build(outside)
@@ -436,8 +424,8 @@ end
 
     V_none = space(omega; cells=1, order=2)
     V_alpha1 = space(omega; cells=1, order=2,
-                     physical=physical_domain(x -> 1.0; lipschitz=1.0, alpha=1.0,
-                                              keep_fictitious=true, subcell_length_scale=1.0))
+                     physical=physical_domain(x -> 1.0; lipschitz=1.0, alpha=1.0, keep_fictitious=true,
+                                              subcell_length_scale=1.0))
 
     m_none = prepare(stiffness(V_none; dirichlet=[bc]))
     m_alpha1 = prepare(stiffness(V_alpha1; dirichlet=[bc]))
@@ -453,11 +441,11 @@ end
     bc = dirichlet(0.0; on=boundary(:all))
 
     V_alpha1 = space(omega; cells=1, order=2,
-                     physical=physical_domain(x -> 1.0; lipschitz=1.0, alpha=1.0,
-                                              keep_fictitious=true, subcell_length_scale=1.0))
+                     physical=physical_domain(x -> 1.0; lipschitz=1.0, alpha=1.0, keep_fictitious=true,
+                                              subcell_length_scale=1.0))
     V_alpha05 = space(omega; cells=1, order=2,
-                      physical=physical_domain(x -> 1.0; lipschitz=1.0, alpha=0.5,
-                                               keep_fictitious=true, subcell_length_scale=1.0))
+                      physical=physical_domain(x -> 1.0; lipschitz=1.0, alpha=0.5, keep_fictitious=true,
+                                               subcell_length_scale=1.0))
 
     m1 = prepare(stiffness(V_alpha1; dirichlet=[bc]))
     m05 = prepare(stiffness(V_alpha05; dirichlet=[bc]))
@@ -493,8 +481,7 @@ end
     #     fictitious right column — α stabilises cut cells, not whole fictitious
     #     cells — so the active dof count is strictly smaller.
     V_drop = space(omega; cells=(3, 3), order=3,
-                   physical=physical_domain(cut; lipschitz=1.0, alpha=1.0e-6,
-                                            subcell_length_scale=0.05, max_depth=4))
+                   physical=physical_domain(cut; lipschitz=1.0, alpha=1.0e-6, subcell_length_scale=0.05, max_depth=4))
     m_drop = prepare(stiffness(V_drop; dirichlet=[bc]))
     @test Unfitted.active_unknowns(m_drop.dofs) < Unfitted.active_unknowns(m_keep.dofs)
 end
@@ -506,8 +493,7 @@ end
     # phi(x) = 1 ⇒ Ω = ∅. The fictitious fold deactivates every cell at the
     # cell level (so dof enumeration is empty); the integration plan correctly
     # produces no regions.
-    V = space(omega; cells=1, order=2,
-              physical=physical_domain(x -> 1.0; lipschitz=1.0, subcell_length_scale=1.0))
+    V = space(omega; cells=1, order=2, physical=physical_domain(x -> 1.0; lipschitz=1.0, subcell_length_scale=1.0))
     m = prepare(stiffness(V; dirichlet=[bc]))
     plan = Unfitted.integration_plan(m)
 
@@ -525,8 +511,8 @@ end
     # fold. Uses subcell_length_scale=1.0e-6, max_depth=2 + order=1 to keep the
     # moment-fit cost on the surrounding cut cells bounded.
     omega = box((0.0, 0.0), (1.0, 1.0))
-    hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0,
-                           subcell_length_scale=1.0e-6, max_depth=2)
+    hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0, subcell_length_scale=1.0e-6,
+                           max_depth=2)
     V = space(omega; cells=(10, 10), order=1, physical=hole)
     m = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
@@ -559,8 +545,7 @@ end
     # Cell (0, 1), order 2, Ω = (0, 0.7). Mass entry M[1,1] for the
     # endpoint mode N_0(x) = 1 − x: ∫_0^0.7 (1 − x)^2 dx = (1 − 0.3^3) / 3.
     omega = box((0.0,), (1.0,))
-    p = physical_domain(x -> x[1] - 0.7; lipschitz=1.0, subcell_length_scale=1.0 / 2^10,
-                        max_depth=10)
+    p = physical_domain(x -> x[1] - 0.7; lipschitz=1.0, subcell_length_scale=1.0 / 2^10, max_depth=10)
     V = space(omega; cells=1, order=2, physical=p)
     m = prepare(mass(V; coefficient=1.0))
     assemble!(m)
@@ -576,8 +561,8 @@ end
     # solver returns a finite solution. Uses moderate accuracy parameters
     # for a fast test.
     omega = box((0.0, 0.0), (1.0, 1.0))
-    hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0,
-                           subcell_length_scale=1.0e-6, max_depth=2)
+    hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0, subcell_length_scale=1.0e-6,
+                           max_depth=2)
     V = space(omega; cells=(6, 6), order=1, physical=hole)
     m = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     assemble!(m)
@@ -594,8 +579,8 @@ end
     # points rather than the 8^depth cloud a stair-step octree would need, and
     # the system stays SPD.
     omega = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
-    hole = physical_domain(x -> 0.3 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2 + (x[3] - 0.5)^2);
-                           lipschitz=1.0, subcell_length_scale=0.1)
+    hole = physical_domain(x -> 0.3 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2 + (x[3] - 0.5)^2); lipschitz=1.0,
+                           subcell_length_scale=0.1)
     V = space(omega; cells=(6, 6, 6), order=1, physical=hole)
     m = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     assemble!(m)
@@ -620,15 +605,14 @@ end
 
 @testset "diagnostics report cut_region_count" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
-    hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0,
-                           subcell_length_scale=1.0e-6, max_depth=2)
+    hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0, subcell_length_scale=1.0e-6,
+                           max_depth=2)
     V = space(omega; cells=(6, 6), order=1, physical=hole)
     m = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     diag = diagnostics(m)
     plan = Unfitted.integration_plan(m)
-    expected = count(r -> r.quadrature.kind in
-                          (:cut_fitted, :cut_fallback, :cut_failed, :cut_alpha_failed),
+    expected = count(r -> r.quadrature.kind in (:cut_fitted, :cut_fallback, :cut_failed, :cut_alpha_failed),
                      plan.regions)
     @test diag.cut_region_count == expected
     @test diag.cut_region_count > 0
@@ -653,14 +637,11 @@ end
     # cut column's region boxes come out bit-identical either side of the move.
     omega = box((0.0, 0.0), (1.0, 1.0))
     p = physical_domain(x -> x[1] - 0.55; lipschitz=1.0, subcell_length_scale=1.0e-3, max_depth=3)
-    V = overlay(space(omega; cells=(4, 4), order=1, physical=p), box((0.0, 0.0), (0.25, 0.25));
-                cells=(1, 1), order=1)
+    V = overlay(space(omega; cells=(4, 4), order=1, physical=p), box((0.0, 0.0), (0.25, 0.25)); cells=(1, 1), order=1)
     model = prepare(mass(V; coefficient=1.0))
 
     cache = only(model.moment_fit_caches)
-    cut_regions(m) = [r
-                      for r in Unfitted.integration_plan(m).regions
-                      if r.quadrature.kind === :cut_fitted]
+    cut_regions(m) = [r for r in Unfitted.integration_plan(m).regions if r.quadrature.kind === :cut_fitted]
     before = cut_regions(model)
     @test !isempty(before)
     # Bounded: one entry per cut region, and each region aliases its cached
@@ -709,8 +690,7 @@ end
     # the Saye moments are exact and a zero-residual non-negative fit exists: the
     # region is :cut_fitted, neither of the two, and the max residual stays far
     # below the failure threshold.
-    failed = count(r -> r.quadrature.kind in (:cut_fallback, :cut_failed, :cut_alpha_failed),
-                   plan.regions)
+    failed = count(r -> r.quadrature.kind in (:cut_fallback, :cut_failed, :cut_alpha_failed), plan.regions)
     @test failed == 0
     @test plan.moment_fit_residual_max < Unfitted._FIT_FAILURE_RESIDUAL
     # Diagnostics counts must agree with the plan tags — guarding the flagging
@@ -727,8 +707,7 @@ end
     bc = dirichlet(0.0; on=boundary(:all))
     omega = box((0.0, 0.0), (1.0, 1.0))
     p = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=1.0e-6, max_depth=2)
-    V = overlay(space(omega; cells=(8, 8), order=1, physical=p), box((0.1, 0.3), (0.4, 0.7));
-                cells=(3, 4), order=1)
+    V = overlay(space(omega; cells=(8, 8), order=1, physical=p), box((0.1, 0.3), (0.4, 0.7)); cells=(3, 4), order=1)
     V_moved = Unfitted.moved_space(V; level=2, to=box((0.2, 0.3), (0.5, 0.7)))
     @test V_moved.physical === V.physical
 end
@@ -754,9 +733,7 @@ end
     plan = Unfitted.integration_plan(V)
 
     # At least one cut-fitted region with two parents (base + overlay).
-    multi_parent_cuts = [r
-                         for r in plan.regions
-                         if r.quadrature.kind === :cut_fitted && length(r.parents) == 2]
+    multi_parent_cuts = [r for r in plan.regions if r.quadrature.kind === :cut_fitted && length(r.parents) == 2]
     @test !isempty(multi_parent_cuts)
     # moment_order for such a region = 2 × max(base.order, overlay.order) = 2 × 2 = 4.
     region = multi_parent_cuts[1]
@@ -766,16 +743,14 @@ end
 
 @testset "moment_order_factor knob tunes the NNMF basis" begin
     omega = box((0.0,), (1.0,))
-    p_default = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=1.0e-6,
-                                max_depth=2)
-    p_cheap = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=1.0e-6,
-                              max_depth=2, moment_order_factor=1)
+    p_default = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=1.0e-6, max_depth=2)
+    p_cheap = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=1.0e-6, max_depth=2,
+                              moment_order_factor=1)
 
     V_def = space(omega; cells=1, order=2, physical=p_default)
     V_che = space(omega; cells=1, order=2, physical=p_cheap)
 
-    parents = Unfitted._parents_covering(V_def.levels, box((0.0,), (1.0,)),
-                                         GeometryTolerance(Float64))
+    parents = Unfitted._parents_covering(V_def.levels, box((0.0,), (1.0,)), GeometryTolerance(Float64))
     # The default spans degree `2p`, which is what makes trial × test products
     # exact on the moment basis.
     @test p_default.moment_order_factor == 2
@@ -785,8 +760,7 @@ end
     # docstring — for a stiffness form only up to `p = 2`.
     @test Unfitted._moment_order_for_region(V_che, parents) == (2,)
 
-    @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1,
-                                               moment_order_factor=0)
+    @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1, moment_order_factor=0)
 end
 
 @testset "high moment order on a starved cut still fits below the failure threshold" begin
@@ -819,11 +793,10 @@ end
     back = RQ(:cut_fallback, [SVector(0.25), SVector(0.75)], [0.5, 0.5])
     @test !isempty(afail.weights)          # α fallback is a nonzero rule …
     @test isempty(strict.weights)          # … the strict failure is empty
-    plan = Unfitted.IntegrationPlan{1,Float64}([VR(b, noparents,
-                                                   RQ(:cut_fitted, [SVector(0.5)], [1.0])),
+    plan = Unfitted.IntegrationPlan{1,Float64}([VR(b, noparents, RQ(:cut_fitted, [SVector(0.5)], [1.0])),
                                                 VR(b, noparents, strict), VR(b, noparents, afail),
-                                                VR(b, noparents, back)], GeometryTolerance(Float64),
-                                               0, Unfitted.SmallOverlap{Float64}[], 1.0, 1.0, 0.0)
+                                                VR(b, noparents, back)], GeometryTolerance(Float64), 0,
+                                               Unfitted.SmallOverlap{Float64}[], 1.0, 1.0, 0.0)
     cut, failed, fallback, fallback_points = Unfitted._cut_region_stats(plan)
     @test cut == 4
     @test failed == 3
@@ -840,8 +813,7 @@ end
     # — a value no moment fit could return on a cut cell, which is what makes
     # "the rule was actually used" checkable without re-deriving a fit.
     calls = Ref(0)
-    function tensor_rule(physical, region_box::Unfitted.AxisBox{D,T},
-                         moment_order::NTuple{D,Int}) where {D,T}
+    function tensor_rule(physical, region_box::Unfitted.AxisBox{D,T}, moment_order::NTuple{D,Int}) where {D,T}
         calls[] += 1
         rule = Unfitted._tensor_gauss_rule(moment_order .+ 1, T)
         jacobian = Unfitted.volume(region_box) / T(2^D)
@@ -872,9 +844,7 @@ end
     # `:full` regions, `:cut_fitted` swapped for `:cut_custom` one for one.
     @test [r.box for r in plan_custom.regions] == [r.box for r in plan_fitted.regions]
     @test count(==(:full), kinds(plan_custom)) == count(==(:full), kinds(plan_fitted))
-    @test count(==(:cut_custom), kinds(plan_custom)) ==
-          count(==(:cut_fitted), kinds(plan_fitted)) >
-          0
+    @test count(==(:cut_custom), kinds(plan_custom)) == count(==(:cut_fitted), kinds(plan_fitted)) > 0
     @test calls[] == count(==(:cut_custom), kinds(plan_custom))
 
     # Points come back in the region's reference frame with the standard
@@ -901,9 +871,7 @@ end
     blended = physical_domain(geometry; settings..., alpha=alpha, cut_quadrature=tensor_rule)
     plan_blended = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2, physical=blended))
     strict = first(r for r in plan_custom.regions if r.quadrature.kind === :cut_custom)
-    mixed = first(r
-                  for r in plan_blended.regions
-                  if r.quadrature.kind === :cut_custom && r.box == strict.box)
+    mixed = first(r for r in plan_blended.regions if r.quadrature.kind === :cut_custom && r.box == strict.box)
     n = length(strict.quadrature.weights)
     @test length(mixed.quadrature.weights) > n
     @test mixed.quadrature.points[1:n] == strict.quadrature.points
@@ -935,13 +903,12 @@ end
     @test sliced.geometry isa Unfitted.AllOf
     @test sliced.geometry.parts[1] isa Unfitted.AnyOf
     @test sliced.geometry.parts[2] isa Unfitted.Not
-    @test [l.lipschitz for l in Unfitted._leaves(sliced.geometry)] ==
-          [l.lipschitz for l in Unfitted._leaves(tree)]
+    @test [l.lipschitz for l in Unfitted._leaves(sliced.geometry)] == [l.lipschitz for l in Unfitted._leaves(tree)]
 
     # Membership on the slice is membership on the parent at the lifted point,
     # which is the one property the whole construction has to have.
-    @test all(Unfitted._inside(sliced.geometry, SVector(y)) ==
-              Unfitted._inside(tree, SVector(0.0, y)) for y in 0.0:0.025:1.0)
+    @test all(Unfitted._inside(sliced.geometry, SVector(y)) == Unfitted._inside(tree, SVector(0.0, y))
+              for y in 0.0:0.025:1.0)
 
     # And the slice is not merely *equivalent* to the same geometry written in one
     # dimension fewer — it is bit-identical to it. The restricted closure evaluates
@@ -955,13 +922,9 @@ end
     # subdivision budget) and the box, because each of the three enters the rule
     # by a different route.
     identical = 0
-    for scale in (0.0625, 0.25), order in (2, 4, 6),
-        bounds in ((0.0, 1.0), (0.4, 0.8), (0.5, 0.6), (0.25, 0.75))
-
-        here = Unfitted._restrict_domain(physical_domain(plate; subcell_length_scale=scale),
-                                         [(1, 0.0)])
-        native = physical_domain(leaf(y -> y[1] - 0.55; lipschitz=sqrt(2.0));
-                                 subcell_length_scale=scale)
+    for scale in (0.0625, 0.25), order in (2, 4, 6), bounds in ((0.0, 1.0), (0.4, 0.8), (0.5, 0.6), (0.25, 0.75))
+        here = Unfitted._restrict_domain(physical_domain(plate; subcell_length_scale=scale), [(1, 0.0)])
+        native = physical_domain(leaf(y -> y[1] - 0.55; lipschitz=sqrt(2.0)); subcell_length_scale=scale)
         interval = box((bounds[1],), (bounds[2],))
         a_pts, a_ws, _, a_status = Unfitted.moment_fit_rule(here, interval, (order,))
         b_pts, b_ws, _, b_status = Unfitted.moment_fit_rule(native, interval, (order,))
@@ -976,8 +939,7 @@ end
     # The upper face pins at a coordinate that does not vanish, where the
     # restricted arithmetic is its own: Ω reaches x₂ ≤ 1.55 there, so the whole
     # face is physical and the slice classifies `:full`.
-    upper = Unfitted._restrict_domain(physical_domain(plate; subcell_length_scale=0.0625),
-                                      [(1, 1.0)])
+    upper = Unfitted._restrict_domain(physical_domain(plate; subcell_length_scale=0.0625), [(1, 1.0)])
     @test classify_cell(upper, box((0.0,), (1.0,))) === :full
     @test sum(Unfitted.moment_fit_rule(upper, box((0.0,), (1.0,)), (4,))[2]) ≈ 1.0 rtol = 1.0e-14
 
@@ -989,8 +951,7 @@ end
     ball = leaf(x -> 0.3 - sqrt(x[1]^2 + x[2]^2 + x[3]^2); lipschitz=1.0)
     p3 = physical_domain(ball; subcell_length_scale=0.0625)
     edge = Unfitted._restrict_domain(p3, [(3, 0.0), (1, 0.0)])
-    @test Unfitted._inside(edge.geometry, SVector(0.4)) ==
-          Unfitted._inside(p3.geometry, SVector(0.0, 0.4, 0.0))
+    @test Unfitted._inside(edge.geometry, SVector(0.4)) == Unfitted._inside(p3.geometry, SVector(0.0, 0.4, 0.0))
     @test classify_cell(edge, box((0.0,), (0.25,))) === :fictitious   # inside the ball
     @test classify_cell(edge, box((0.25,), (0.5,))) === :cut          # ∂Ω crosses at 0.3
     @test classify_cell(edge, box((0.5,), (1.0,))) === :full
@@ -1010,8 +971,8 @@ end
     # the caller never wrote.
     rule = (physical, region_box, moment_order) -> (SVector{1,Float64}[], Float64[], 0.0, :empty)
     p = physical_domain(leaf(x -> x[2] - 0.5; lipschitz=1.0); alpha=1.0e-3, keep_fictitious=true,
-                        subcell_length_scale=0.0125, max_depth=5, moment_order_factor=3,
-                        target_residual=1.0e-9, cut_quadrature=rule)
+                        subcell_length_scale=0.0125, max_depth=5, moment_order_factor=3, target_residual=1.0e-9,
+                        cut_quadrature=rule)
     sliced = Unfitted._restrict_domain(p, [(1, 0.25)])
     for field in fieldnames(typeof(p))
         field === :geometry && continue
@@ -1030,8 +991,8 @@ end
     # the slice reaches its consumers through the second map, so a disagreement
     # between them would place every quadrature point on the wrong facet.
     x = SVector(0.1, 0.2, 0.3, 0.4)
-    for pins in ([(4, 0.4)], [(3, 0.3), (1, 0.1)], [(4, 0.4), (3, 0.3), (2, 0.2)],
-                 [(4, 0.4), (3, 0.3), (2, 0.2), (1, 0.1)])
+    for pins in
+        ([(4, 0.4)], [(3, 0.3), (1, 0.1)], [(4, 0.4), (3, 0.3), (2, 0.2)], [(4, 0.4), (3, 0.3), (2, 0.2), (1, 0.1)])
         # `pins` are descending, which is the order the restriction consumes them
         # in; the drop below follows the same order for the same reason.
         reduced = foldl((y, pin) -> Unfitted._remove_axis(y, pin[1]), pins; init=x)
@@ -1068,12 +1029,11 @@ end
     face = box((0.0, 0.0), (1.0, 1.0))
 
     leafwise = Unfitted._restrict_domain(p3, [(3, 0.5)])
-    collapsed = physical_domain(leaf(y -> levelset_value(p3, SVector(y[1], y[2], 0.5));
-                                     lipschitz=sqrt(2.0)); subcell_length_scale=0.25)
+    collapsed = physical_domain(leaf(y -> levelset_value(p3, SVector(y[1], y[2], 0.5)); lipschitz=sqrt(2.0));
+                                subcell_length_scale=0.25)
     # Same sign everywhere, so the two describe the same set and differ only in
     # how smooth the kernel can take its boundary to be.
-    @test all(Unfitted._inside(leafwise.geometry, SVector(a, b)) ==
-              (levelset_value(collapsed, SVector(a, b)) <= 0)
+    @test all(Unfitted._inside(leafwise.geometry, SVector(a, b)) == (levelset_value(collapsed, SVector(a, b)) <= 0)
               for a in 0.05:0.1:0.95, b in 0.05:0.1:0.95)
 
     err(domain) = abs(sum(Unfitted.moment_fit_rule(domain, face, (4, 4))[2]) - 0.5)
@@ -1098,8 +1058,7 @@ end
     # only because `_restrict` carries the constant through.
     face = box((0.0, 0.0), (1.0, 1.0))
     measure(L, scale) =
-        let ball = leaf(x -> 0.02 - sqrt((x[1] - 0.31337)^2 + (x[2] - 0.43731)^2 + x[3]^2);
-                        lipschitz=L),
+        let ball = leaf(x -> 0.02 - sqrt((x[1] - 0.31337)^2 + (x[2] - 0.43731)^2 + x[3]^2); lipschitz=L),
             p = physical_domain(ball; subcell_length_scale=scale)
 
             sum(Unfitted.moment_fit_rule(Unfitted._restrict_domain(p, [(3, 0.0)]), face, (4, 4))[2])

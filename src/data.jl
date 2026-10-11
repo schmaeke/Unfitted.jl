@@ -138,8 +138,7 @@ function _checked_quadfield(qf::QuadField, model::Model)
 end
 
 function Base.show(io::IO, qf::QuadField{T}) where {T}
-    print(io, "QuadField{", T, "}(npoints=", length(qf.data), ", pin=0x",
-          string(qf.model_version; base=16), ")")
+    print(io, "QuadField{", T, "}(npoints=", length(qf.data), ", pin=0x", string(qf.model_version; base=16), ")")
 end
 
 # ── Detecting point-keyed state ──────────────────────────────────────────────
@@ -296,8 +295,7 @@ _rbf_invmq(r) = inv(sqrt(1 + r * r))
 # there: the `K = 1` system is `[1 1; 1 0] [w; α] = [f₁; 0]`, whose
 # solution `w = 0`, `α = f₁` is nearest-neighbour extension at any
 # scale.
-function _rbfp0_static_solve(local_sources::NTuple{K,SVector{D,T}},
-                             local_values::NTuple{K,T}) where {K,D,T}
+function _rbfp0_static_solve(local_sources::NTuple{K,SVector{D,T}}, local_values::NTuple{K,T}) where {K,D,T}
     mean_r = zero(T)
     pairs = 0
     @inbounds for i in 1:K, j in (i+1):K
@@ -387,15 +385,13 @@ of thread count for a fixed neighbour set. `threaded = true` is the
 default; `threaded = false` runs the same loop serially, which is how the
 suite asserts that the two paths agree bit for bit.
 """
-function transfer(source::QuadField, source_model::Model{D,T}, target_model::Model{D,T};
-                  via::RBFP0=RBFP0(), threaded::Bool=true) where {D,T}
+function transfer(source::QuadField, source_model::Model{D,T}, target_model::Model{D,T}; via::RBFP0=RBFP0(),
+                  threaded::Bool=true) where {D,T}
     source_data = _checked_quadfield(source, source_model)
     k = via.neighbors
-    1 <= k <= _RBFP0_MAX_NEIGHBORS ||
-        throw(ArgumentError("RBFP0 supports 1..$_RBFP0_MAX_NEIGHBORS neighbours; got $k"))
+    1 <= k <= _RBFP0_MAX_NEIGHBORS || throw(ArgumentError("RBFP0 supports 1..$_RBFP0_MAX_NEIGHBORS neighbours; got $k"))
     nsrc = length(source_data)
-    nsrc >= k ||
-        throw(ArgumentError("RBFP0 needs ≥ neighbors=$k source quadrature points, model only has $nsrc"))
+    nsrc >= k || throw(ArgumentError("RBFP0 needs ≥ neighbors=$k source quadrature points, model only has $nsrc"))
 
     # Source cloud + KD-tree built once; target points collected once.
     cloud_matrix, cloud_svecs = _collect_source_cloud(source_model)
@@ -436,8 +432,7 @@ end
 # `k ∈ 1:_RBFP0_MAX_NEIGHBORS` produces its own specialised method.
 # An explicit `@generated` version would shave the dispatch overhead
 # slightly but is not necessary at the current `K ≤ 16` cap.
-@inline function _rbfp0_resolve(::Val{K}, x::SVector{D,T}, idxs::AbstractVector{Int},
-                                cloud::Vector{SVector{D,T}},
+@inline function _rbfp0_resolve(::Val{K}, x::SVector{D,T}, idxs::AbstractVector{Int}, cloud::Vector{SVector{D,T}},
                                 source_data::AbstractVector{T}) where {K,D,T}
     local_sources = ntuple(j -> cloud[idxs[j]], Val(K))
     local_values = ntuple(j -> source_data[idxs[j]], Val(K))

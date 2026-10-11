@@ -353,9 +353,8 @@ hazard of an empty rule, and the α blend that still applies downstream — is
 spelled out under "Custom cut-cell quadrature" in the [`PhysicalDomain`](@ref)
 docstring.
 """
-function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0,
-                         keep_fictitious::Bool=false, subcell_length_scale::Real,
-                         max_depth::Integer=8, moment_order_factor::Integer=2,
+function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0, keep_fictitious::Bool=false,
+                         subcell_length_scale::Real, max_depth::Integer=8, moment_order_factor::Integer=2,
                          target_residual::Real=1.0e-6, cut_quadrature=nothing)
     # Validated here rather than only inside `leaf`, so the constraint holds on
     # every path: with a tree argument the auto-wrap never runs, and `lipschitz`
@@ -366,13 +365,10 @@ function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0,
         throw(ArgumentError("keep_fictitious=true requires alpha > 0: fully-fictitious cells " *
                             "kept active under the strict-cut (alpha=0) path receive no " *
                             "quadrature and would make the system singular"))
-    subcell_length_scale > 0 ||
-        throw(ArgumentError("subcell_length_scale must be > 0; got $subcell_length_scale"))
+    subcell_length_scale > 0 || throw(ArgumentError("subcell_length_scale must be > 0; got $subcell_length_scale"))
     max_depth >= 0 || throw(ArgumentError("max_depth must be ≥ 0; got $max_depth"))
-    moment_order_factor >= 1 ||
-        throw(ArgumentError("moment_order_factor must be ≥ 1; got $moment_order_factor"))
-    target_residual > 0 ||
-        throw(ArgumentError("target_residual must be positive; got $target_residual"))
+    moment_order_factor >= 1 || throw(ArgumentError("moment_order_factor must be ≥ 1; got $moment_order_factor"))
+    target_residual > 0 || throw(ArgumentError("target_residual must be positive; got $target_residual"))
     # A bare callable becomes a single leaf, honouring the `lipschitz` keyword;
     # an explicit CSG tree carries per-leaf Lipschitz constants already, so the
     # keyword has nowhere to go there. Only the combination that actually loses
@@ -392,19 +388,15 @@ function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0,
     if geometry isa LevelSet && !isinf(lipschitz)
         ls = _leaves(geometry)
         bare = count(l -> isinf(l.lipschitz), ls)
-        bare == 0 ||
-            throw(ArgumentError("lipschitz=$lipschitz was given with a LevelSet tree, and " *
-                                "$bare of its $(length(ls)) leaves carry no constant of their " *
-                                "own; set it on the leaf instead: leaf(f; lipschitz=$lipschitz)"))
+        bare == 0 || throw(ArgumentError("lipschitz=$lipschitz was given with a LevelSet tree, and " *
+                                         "$bare of its $(length(ls)) leaves carry no constant of their " *
+                                         "own; set it on the leaf instead: leaf(f; lipschitz=$lipschitz)"))
     end
     g = geometry isa LevelSet ? geometry : leaf(geometry; lipschitz=lipschitz)
-    T = promote_type(typeof(float(alpha)), typeof(float(subcell_length_scale)),
-                     typeof(float(target_residual)))
-    return PhysicalDomain{typeof(g),T,typeof(cut_quadrature)}(g, T(alpha), T(subcell_length_scale),
-                                                              Int(max_depth),
-                                                              Int(moment_order_factor),
-                                                              T(target_residual), keep_fictitious,
-                                                              cut_quadrature)
+    T = promote_type(typeof(float(alpha)), typeof(float(subcell_length_scale)), typeof(float(target_residual)))
+    return PhysicalDomain{typeof(g),T,typeof(cut_quadrature)}(g, T(alpha), T(subcell_length_scale), Int(max_depth),
+                                                              Int(moment_order_factor), T(target_residual),
+                                                              keep_fictitious, cut_quadrature)
 end
 
 """
@@ -510,8 +502,7 @@ end
 #
 # The single-leaf case reduces exactly to the Lipschitz-then-corner strategy
 # the package used before CSG.
-function _classify_box(geometry::LevelSet, box::AxisBox{D,T}, depth::Integer,
-                       max_depth::Integer) where {D,T}
+function _classify_box(geometry::LevelSet, box::AxisBox{D,T}, depth::Integer, max_depth::Integer) where {D,T}
     t = _tri(geometry, box)
     t == 1 && return :full
     t == -1 && return :fictitious
@@ -525,8 +516,7 @@ function _classify_box(geometry::LevelSet, box::AxisBox{D,T}, depth::Integer,
         for ci in CartesianIndices(ntuple(_ -> 0:1, D))
             child_lower = SVector{D,T}(ntuple(d -> ci.I[d] == 0 ? box.lower[d] : c[d], D))
             child_upper = SVector{D,T}(ntuple(d -> ci.I[d] == 0 ? c[d] : box.upper[d], D))
-            child_state = _classify_box(geometry, AxisBox{D,T}(child_lower, child_upper), depth + 1,
-                                        max_depth)
+            child_state = _classify_box(geometry, AxisBox{D,T}(child_lower, child_upper), depth + 1, max_depth)
             if result === nothing
                 result = child_state
             elseif result !== child_state
@@ -560,8 +550,7 @@ end
 # Memoisation cache for `classify_cell`, keyed by the box corner pair.
 const _ClassifyCache{D,T} = Dict{Tuple{SVector{D,T},SVector{D,T}},Symbol}
 
-function classify_cell(physical::PhysicalDomain, box::AxisBox{D,T},
-                       cache::_ClassifyCache{D,T}) where {D,T}
+function classify_cell(physical::PhysicalDomain, box::AxisBox{D,T}, cache::_ClassifyCache{D,T}) where {D,T}
     return get!(cache, (box.lower, box.upper)) do
         _classify_box(physical.geometry, box, 0, _effective_subcell_depth(physical, box))
     end
@@ -609,9 +598,8 @@ _restrict(n::Not, k::Int, v) = Not(_restrict(n.part, k, v))
 # wrote).
 function _restrict_domain(physical::PhysicalDomain{G,T,Q}, pins) where {G,T,Q}
     geometry = foldl((g, pin) -> _restrict(g, pin[1], pin[2]), pins; init=physical.geometry)
-    return PhysicalDomain{typeof(geometry),T,Q}(geometry, physical.alpha,
-                                                physical.subcell_length_scale, physical.max_depth,
-                                                physical.moment_order_factor,
+    return PhysicalDomain{typeof(geometry),T,Q}(geometry, physical.alpha, physical.subcell_length_scale,
+                                                physical.max_depth, physical.moment_order_factor,
                                                 physical.target_residual, physical.keep_fictitious,
                                                 physical.cut_quadrature)
 end
