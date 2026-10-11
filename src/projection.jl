@@ -263,30 +263,33 @@ function _has_nonhomogeneous_constraints(layout::SystemLayout)
     return any(field -> any(!iszero, field.dofs.constrained_values), layout.fields)
 end
 
-# Build the [`TransferRegion`](@ref) list. Reuses the volume admissible-box partition from `intersections.jl`: feed both
-# sides' levels to `_merged_boxes` so the resulting boxes respect every mesh boundary on both sides. Drop boxes the
-# target does not cover (no rhs contribution and no place to deposit the result).
+# Build the [`TransferRegion`](@ref) list on the admissible-box partition engine (`_partition` in `intersections.jl`),
+# fed both sides' levels in one tuple — source first — so the resulting boxes respect every mesh boundary on both sides.
+# A box's coverage signature then splits into its source and its target half (`_split_signature`), and each side's
+# parents are decoded from its own half: the two models' level ids overlap, so neither side's parents could be told
+# apart in a joint list. Boxes the target does not cover are dropped (no rhs contribution and no place to deposit the
+# result).
 function _transfer_regions(source_model::Model{D,T}, target_model::Model{D,T};
                            tolerance=target_model.dofs.tolerance) where {D,T}
-    levels = (source_model.problem.space.levels..., target_model.problem.space.levels...)
+    source_levels, target_levels = source_model.problem.space.levels, target_model.problem.space.levels
     regions = TransferRegion{D,T}[]
     quadrature_cache = Dict{NTuple{D,Int},TensorQuadrature{D,T}}()
-
-    for box in _merged_boxes(levels, Val(D), tolerance)
-        target_parents = _parents_covering(target_model.problem.space.levels, box, tolerance)
-        isempty(target_parents) && continue
-        source_parents = _parents_covering(source_model.problem.space.levels, box, tolerance)
-        quadrature = _transfer_quadrature(source_model, target_model, target_parents, source_parents, quadrature_cache)
-        push!(regions, TransferRegion{D,T}(box, target_parents, source_parents, quadrature))
+    for (lower, upper, sig) in
+        _partition((source_levels..., target_levels...), ntuple(identity, Val(D)), zero(SVector{D,T}), tolerance)
+        source_sig, target_sig = _split_signature(sig, source_levels)
+        all(iszero, target_sig) && continue
+        target_parents = _parents(target_levels, target_sig, lower, upper)
+        source_parents = _parents(source_levels, source_sig, lower, upper)
+        counts = _transfer_quadrature_counts(source_model, target_model, target_parents, source_parents)
+        quadrature = _cached_tensor_quadrature!(quadrature_cache, counts, T)
+        push!(regions, TransferRegion{D,T}(AxisBox{D,T}(lower, upper), target_parents, source_parents, quadrature))
     end
-
     return regions
 end
 
-function _transfer_quadrature(source_model::Model{D,T}, target_model::Model{D,T}, target_parents, source_parents,
-                              cache) where {D,T}
-    counts = _transfer_quadrature_counts(source_model, target_model, target_parents, source_parents)
-    return _cached_tensor_quadrature!(cache, counts, T)
+# The first `K` slots of a signature (the `K` levels of `first`) and the rest, as tuples of compile-time length.
+function _split_signature(sig::NTuple{N,Int}, ::NTuple{K,Any}) where {N,K}
+    (ntuple(i -> sig[i], Val(K)), ntuple(i -> sig[K + i], Val(N - K)))
 end
 
 # Per-axis quadrature counts for a transfer region: take the per-axis maximum recommended order across the *union* of
@@ -300,7 +303,7 @@ function _transfer_quadrature_counts(source_model::Model{D}, target_model::Model
     target_counts = _axis_max(_gauss_counts, target_model.problem.space, target_parents)
     source_counts = isempty(source_parents) ? ntuple(_ -> 1, D) :
                     _axis_max(_gauss_counts, source_model.problem.space, source_parents)
-    return ntuple(d -> max(target_counts[d], source_counts[d]), D)
+    return max.(target_counts, source_counts)
 end
 
 # Accumulate the source-driven rhs of the L² transfer over the union partition `regions`, onto `rhs`. The target mass

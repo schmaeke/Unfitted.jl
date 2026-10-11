@@ -493,13 +493,6 @@ function _partition(levels::NTuple{N,Any}, free::NTuple{F,Int}, anchor::SVector{
     return out
 end
 
-# The partition's boxes alone, with every axis free and every cell eligible: the view the L² transfer
-# (`_transfer_regions` in `projection.jl`) locates its two parent lists in.
-function _merged_boxes(levels, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
-    return [AxisBox{D,T}(lower, upper)
-            for (lower, upper, _) in _partition(levels, ntuple(identity, Val(D)), zero(SVector{D,T}), tol)]
-end
-
 # ── Merge tolerance vs. mesh spacing ──────────────────────────────────────────
 #
 # `tolerance.merge` is an absolute length, and `merge_coordinates` collapses per-axis element boundaries that separate
@@ -550,26 +543,6 @@ function _parents(levels::Tuple, sig::Tuple, lower::SVector{D,T}, upper::SVector
         return ParentRef{D,T}(level.id, cell, local_box, parent_box)
     end
     return ParentRef{D,T}[parent for parent in found if parent !== nothing]
-end
-
-# For an admissible region `box`, find every parent level whose active cell contains the box midpoint and record the
-# box's geometry in that parent's reference frame — the transfer's way to its target and source parents, which live on
-# two models whose level ids overlap (`_transfer_regions` in `projection.jl`). The midpoint is a deterministic
-# representative of the box's interior because the box was built as a sub-rectangle of the cell along every axis.
-# Inactive cells (per the level's `LevelMask`) do not contribute.
-function _parents_covering(levels, box::AxisBox{D,T}, tol::GeometryTolerance{T}) where {D,T}
-    midpoint = center(box)
-    parents = ParentRef{D,T}[]
-    for level in levels
-        cell = locate_cell(level.mesh, midpoint; tol)
-        cell === nothing && continue
-        is_active(level.mask, cell) || continue
-        parent_box = cell_box(level.mesh, cell)
-        local_box = AxisBox{D,T}(physical_to_reference(parent_box, box.lower),
-                                 physical_to_reference(parent_box, box.upper))
-        push!(parents, ParentRef{D,T}(level.id, cell, local_box, parent_box))
-    end
-    return parents
 end
 
 # Keep-or-drop predicate for an admissible region. Three accepted shapes:

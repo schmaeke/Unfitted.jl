@@ -629,9 +629,7 @@ function _subdivision_counts(space::Space{D,T}, region::VolumeRegion{D,T}, subdi
         # cells, so sizing from it subdivides every region at the order of the loudest cell anywhere on the level.
         # Measured on a 3D 8³ level at p=1 with a single p=6 cell, the default `write_vtk` path emitted 110 592 subcells
         # against 512 and 221.9 MB against 2.50 MB.
-        return ntuple(D) do d
-            maximum(parent -> max(1, cell_order(_level_by_id(space, parent.level), parent.cell)[d]), region.parents)
-        end
+        return _axis_max((level, cell) -> max.(1, cell_order(level, cell)), space, region.parents)
     elseif subdivisions === :none
         return ntuple(_ -> 1, D)
     elseif subdivisions isa Integer
