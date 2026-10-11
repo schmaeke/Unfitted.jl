@@ -379,56 +379,6 @@ end
 # is stored rather than what it means.
 _selects_by_support(family::BSplineFamily) = family.continuity == _MAXIMAL_CONTINUITY
 
-# ── Knot-vector construction ──────────────────────────────────────────────────
-
-# Build a clamped open uniform knot vector for one axis from the mesh's
-# per-axis coordinates and the requested degree `p`. End knots have
-# multiplicity `p + 1` (clamped open knots); every interior knot has
-# multiplicity 1 (max-regularity `C^{p − 1}` continuity across cell
-# boundaries). The resulting knot vector aligns each cell with one span
-# of the resulting `BSplineSpace`, so the per-cell span index in the
-# B-spline parameter coincides with the cell's mesh index.
-#
-# Boundary conditions on the artificial overlay boundary (mesh-edge
-# faces and mask-induced internal faces) are imposed by
-# `_overlay_constraints!` below — by support selection at maximal
-# continuity, by trace-vanishing linear constraints below it — *not*
-# via knot multiplicity. This keeps the basis globally `C^{p − 1}`
-# inside the active region regardless of mask geometry.
-function _open_knot_vector(axis_coords::AbstractVector{T}, p::Integer) where {T<:Real}
-    knots = T[]
-    sizehint!(knots, length(axis_coords) + 2 * p)
-    for _ in 1:(p+1)
-        push!(knots, axis_coords[1])
-    end
-    for i in 2:(length(axis_coords)-1)
-        push!(knots, axis_coords[i])
-    end
-    for _ in 1:(p+1)
-        push!(knots, axis_coords[end])
-    end
-    return KnotVector(knots)
-end
-
-# Build the concrete `BSplineFamily` from a deferred `_BSplineSpec`,
-# the mesh, and the per-axis polynomial degree. Uniform knots only:
-# the cell-to-span map is the identity (`cell_to_span[d][c] = c`),
-# and `dim(spaces[d]) = cells[d] + p[d]`.
-function _materialize(spec::_BSplineSpec, mesh::CartesianMesh{D,T}, p::NTuple{D,Int}) where {D,T}
-    m = spec.continuity
-    spaces = ntuple(D) do d
-        kv = _open_knot_vector(mesh.axes[d], p[d])
-        BSplineSpace{p[d]}(kv)
-    end
-    derivative_spaces = ntuple(d -> BSplineDerivativeSpace{1}(spaces[d]), D)
-    axis_coords = ntuple(d -> copy(mesh.axes[d]), D)
-    cell_to_span = ntuple(D) do d
-        collect(1:mesh.cells[d])  # uniform knots: span = cell index
-    end
-    return BSplineFamily{D,T,typeof(spaces),typeof(derivative_spaces)}(spaces, derivative_spaces,
-                                                                       axis_coords, cell_to_span, m)
-end
-
 # ── Basis instantiation: materialise the deferred spec onto a mesh ────────────
 
 # `instantiate_basis` hook for the deferred `_BSplineSpec`. Invoked when
@@ -503,6 +453,56 @@ function Unfitted.instantiate_basis(family::BSplineFamily, mesh::CartesianMesh{D
                                     order::NTuple{D,Int}, mode::Symbol) where {D,T<:Real}
     _check_basis_mode(family, mode, order)
     return _materialize(_BSplineSpec(family.continuity), mesh, order)
+end
+
+# ── Knot-vector construction ──────────────────────────────────────────────────
+
+# Build the concrete `BSplineFamily` from a deferred `_BSplineSpec`,
+# the mesh, and the per-axis polynomial degree. Uniform knots only:
+# the cell-to-span map is the identity (`cell_to_span[d][c] = c`),
+# and `dim(spaces[d]) = cells[d] + p[d]`.
+function _materialize(spec::_BSplineSpec, mesh::CartesianMesh{D,T}, p::NTuple{D,Int}) where {D,T}
+    m = spec.continuity
+    spaces = ntuple(D) do d
+        kv = _open_knot_vector(mesh.axes[d], p[d])
+        BSplineSpace{p[d]}(kv)
+    end
+    derivative_spaces = ntuple(d -> BSplineDerivativeSpace{1}(spaces[d]), D)
+    axis_coords = ntuple(d -> copy(mesh.axes[d]), D)
+    cell_to_span = ntuple(D) do d
+        collect(1:mesh.cells[d])  # uniform knots: span = cell index
+    end
+    return BSplineFamily{D,T,typeof(spaces),typeof(derivative_spaces)}(spaces, derivative_spaces,
+                                                                       axis_coords, cell_to_span, m)
+end
+
+# Build a clamped open uniform knot vector for one axis from the mesh's
+# per-axis coordinates and the requested degree `p`. End knots have
+# multiplicity `p + 1` (clamped open knots); every interior knot has
+# multiplicity 1 (max-regularity `C^{p − 1}` continuity across cell
+# boundaries). The resulting knot vector aligns each cell with one span
+# of the resulting `BSplineSpace`, so the per-cell span index in the
+# B-spline parameter coincides with the cell's mesh index.
+#
+# Boundary conditions on the artificial overlay boundary (mesh-edge
+# faces and mask-induced internal faces) are imposed by
+# `_overlay_constraints!` below — by support selection at maximal
+# continuity, by trace-vanishing linear constraints below it — *not*
+# via knot multiplicity. This keeps the basis globally `C^{p − 1}`
+# inside the active region regardless of mask geometry.
+function _open_knot_vector(axis_coords::AbstractVector{T}, p::Integer) where {T<:Real}
+    knots = T[]
+    sizehint!(knots, length(axis_coords) + 2 * p)
+    for _ in 1:(p+1)
+        push!(knots, axis_coords[1])
+    end
+    for i in 2:(length(axis_coords)-1)
+        push!(knots, axis_coords[i])
+    end
+    for _ in 1:(p+1)
+        push!(knots, axis_coords[end])
+    end
+    return KnotVector(knots)
 end
 
 # ── Basis-interface methods ───────────────────────────────────────────────────
@@ -1046,21 +1046,18 @@ function Unfitted._burial_cells(level::Level{D,T,<:BSplineFamily},
     return _support_cells(key, level.basis, level.mesh.cells)
 end
 
-# One reproduction test per covering level, chosen by what that cover actually is. A
-# cover that selects by support answers the question *exactly*, by walking the
-# subdivision and asking whether every fine function in it survived its own selection;
-# it therefore needs that cover's admissibility record, which the driver asks for once
-# per cover rather than once per buried function. Any other cover — an
-# integrated-Legendre overlay, or a B-spline level below maximal continuity — is
-# *clamped* on its artificial boundary, so its span near that boundary is not described
-# by any statement about supports, and the conservative geometric predicate
-# `_reproduced_on_domain` is the right one: it keeps the driver's `nothing` default,
-# as does every cover of an integrated-Legendre level, a degree-1 selecting one
-# included.
-function Unfitted._cover_test(::Level{D,T,<:BSplineFamily}, k::Level{D,T,<:BSplineFamily},
-                              ctx::_LevelContext{D,T}) where {D,T<:Real}
-    return _selects_by_support(k.basis) ? _admissibility(k, ctx) : nothing
+function _support_cells(key::TensorDofKey{D}, family::BSplineFamily{D}, n::NTuple{D,Int}) where {D}
+    return CartesianIndices(ntuple(d -> _axis_support(key.axes[d].index, degree(family.spaces[d]),
+                                                      n[d]), D))
 end
+
+# The cells this level's axis-`d` 1D function with global index `i` is supported
+# on. Cell `c` carries the global indices `c … c + p` (uniform knots,
+# `cell_to_span` the identity), so function `i` lives on
+# `max(1, i − p) … min(ncells, i)` — up to `p + 1` cells. The core's
+# `_axis_incidence` cannot answer this: it is written for the integrated-Legendre
+# node / span keys and reports a single cell for any other tag.
+@inline _axis_support(i::Integer, p::Integer, ncells::Integer) = max(1, i-p):min(ncells, i)
 
 # The rows of the `_reproduces` trait (`src/dofs.jl`) with a B-spline side.
 #
@@ -1113,18 +1110,21 @@ function Unfitted._reproduces(k::Level{D,T,<:BSplineFamily},
     return all(d -> degree(k.basis.spaces[d]) == 1, 1:D)
 end
 
-function _support_cells(key::TensorDofKey{D}, family::BSplineFamily{D}, n::NTuple{D,Int}) where {D}
-    return CartesianIndices(ntuple(d -> _axis_support(key.axes[d].index, degree(family.spaces[d]),
-                                                      n[d]), D))
+# One reproduction test per covering level, chosen by what that cover actually is. A
+# cover that selects by support answers the question *exactly*, by walking the
+# subdivision and asking whether every fine function in it survived its own selection;
+# it therefore needs that cover's admissibility record, which the driver asks for once
+# per cover rather than once per buried function. Any other cover — an
+# integrated-Legendre overlay, or a B-spline level below maximal continuity — is
+# *clamped* on its artificial boundary, so its span near that boundary is not described
+# by any statement about supports, and the conservative geometric predicate
+# `_reproduced_on_domain` is the right one: it keeps the driver's `nothing` default,
+# as does every cover of an integrated-Legendre level, a degree-1 selecting one
+# included.
+function Unfitted._cover_test(::Level{D,T,<:BSplineFamily}, k::Level{D,T,<:BSplineFamily},
+                              ctx::_LevelContext{D,T}) where {D,T<:Real}
+    return _selects_by_support(k.basis) ? _admissibility(k, ctx) : nothing
 end
-
-# The cells this level's axis-`d` 1D function with global index `i` is supported
-# on. Cell `c` carries the global indices `c … c + p` (uniform knots,
-# `cell_to_span` the identity), so function `i` lives on
-# `max(1, i − p) … min(ncells, i)` — up to `p + 1` cells. The core's
-# `_axis_incidence` cannot answer this: it is written for the integrated-Legendre
-# node / span keys and reports a single cell for any other tag.
-@inline _axis_support(i::Integer, p::Integer, ncells::Integer) = max(1, i-p):min(ncells, i)
 
 # True iff the covering level `k`, whose admissibility record is `cover`, reproduces
 # on Ω the function of `level` named by `key` — the burial test in the form support
