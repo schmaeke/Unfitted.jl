@@ -147,7 +147,7 @@ Fields:
     defines membership.
   - `alpha::T`: fictitious-region stabilization weight (α-FCM). `0` is the strict cut path; `> 0` enriches every **cut**
     cell's quadrature with the α-scaled full-cell rule, so cut-cell dofs whose basis support lies in the fictitious part
-    still get a well-posed contribution (see `_build_region_quadrature` in `intersections.jl`). It is honoured one
+    still get a well-posed contribution (see `_trimmed_rule` in `intersections.jl`). It is honoured one
     dimension down on a boundary **face** in exactly the same way — on the level set restricted to that face's affine
     slice (`_facet_region` in `dirichlet.jl`) — which is what lets α stabilise a thin physical sliver of face; the price
     there is that the rule then carries points outside Ω, so a datum defined only on Ω needs `alpha = 0` (see
@@ -238,11 +238,11 @@ The rule must also be a deterministic function of its three arguments: results a
 `(region box, moment order)` in a cache the [`Model`](@ref) owns per participating space and threads back through every
 plan rebuild, so a rule reading mutable state outside its arguments is captured at its first answer for a box and
 silently reused — across rebuilds, not merely within one. Put every knob in the callable itself; that is what makes the
-rule reproducible. The package does not run a custom rule on several threads, unlike its own fit: `_prefit_cut_rules!`
-in `src/intersections.jl` fits custom rules serially, because they are caller code under no thread-safety contract.
+rule reproducible. The package does not run a custom rule on several threads, unlike its own fit: `_fit_rules` in
+`src/intersections.jl` fits custom rules serially, because they are caller code under no thread-safety contract.
 `residual` is reported verbatim through `diagnostics(model).moment_fit_residual_max`.
 
-A region built from a custom rule is tagged `:cut_custom` (see `_build_region_quadrature` in `src/intersections.jl`) —
+A region built from a custom rule is tagged `:cut_custom` (see `_trimmed_rule` in `src/intersections.jl`) —
 one kind for every custom rule, whatever status symbol it returns, `:empty` excepted as in point 3 above.
 `_cut_region_stats` counts `:cut_custom` as a cut region and **not** as a fit failure, since there is no fit to fail.
 The rule is stored on the domain rather than in a global, so two models in one session can use different rules and

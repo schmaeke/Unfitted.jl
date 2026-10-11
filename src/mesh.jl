@@ -127,8 +127,8 @@ is at the boundary — the larger index along that axis — is returned, because
 sitting on node `axis[i]` to cell `i`. Points right at the upper boundary of an axis are snapped to the last cell along
 that axis so a point sitting exactly on `domain.upper[d]` still returns a valid cell.
 
-Used by region-to-parent coverage (`_parents_covering` in `intersections.jl`) and by post-processing evaluation
-(`_level_field`).
+Used by the coverage signature of the admissible-box partition (`_signature` in `intersections.jl`) and by
+post-processing evaluation (`_level_field`).
 """
 function locate_cell(m::CartesianMesh{D,T}, point::PointLike{D}; tol=GeometryTolerance(T)) where {D,T}
     contains_point(point, m.domain, tol) || return nothing
@@ -400,9 +400,9 @@ end
 #
 # Sizing a quadrature rule from it is always SAFE, because it bounds every cell of the level from above and
 # over-integrating costs points rather than accuracy. Safe is not the same as right, though, and the consumers have
-# since split on that: `_parent_quadrature_counts`, `_moment_order_for_region`, `_facet_quadrature_counts` and
-# `_subdivision_counts` each size from the parent CELL's own order, so one loud cell no longer sets the rule for the
-# level; `_surface_quadrature_order` still sizes from the level, where the region is not owned by a single parent cell.
+# since split on that: `_axis_max` (tensor counts, moment orders), `_facet_quadrature_counts` and `_subdivision_counts`
+# each size from the parent CELL's own order, so one loud cell no longer sets the rule for the level;
+# `_surface_quadrature_order` still sizes from the level, where the region is not owned by a single parent cell.
 _nominal_order(o::NTuple{D,Int}) where {D} = o
 
 function _nominal_order(entries::Vector{NTuple{D,Int}}) where {D}

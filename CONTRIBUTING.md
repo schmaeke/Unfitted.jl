@@ -507,16 +507,17 @@ constructed as follows:
      still lies inside a single cell of every covering level, so the
      `C^∞` contract below is preserved while the region count stays
      proportional to the number of genuinely distinct coverage
-     patterns.
-  6. For every merged box, resolve the covering parent cells by midpoint
-     containment and keep the box only if it satisfies the caller's
+     patterns. A candidate no level covers (an all-zero signature) seeds
+     no box: it is no region of any consumer.
+  6. For every merged box, decode the covering parent cells from its
+     signature and keep the box only if it satisfies the caller's
      `criterion`, expressed over those parent *levels*: `:any_parent`
      (the default — at least one level covers the box; used by assembly,
      field evaluation, and visualization), `:all_levels` (every level of
      the space covers it), or a caller-supplied predicate
      `parents -> Bool`. No in-tree caller uses the predicate form:
-     `projection.jl` builds its transfer regions from `_merged_boxes` /
-     `_parents_covering` directly and applies its own target-coverage
+     `projection.jl` builds its transfer regions from the partition
+     engine (`_partition`) directly and applies its own target-coverage
      test rather than going through a `criterion`. Any other value
      raises `ArgumentError`.
   7. Dispatch the region quadrature on the `PhysicalDomain`
@@ -1448,7 +1449,7 @@ demos.
     cut region, not as a fit failure. **Requirement not yet met:** no
     test drives a custom rule returning an `:empty` status, so its
     routing to `:cut_failed` / `:cut_alpha_failed` is unexercised; and
-    because `_merged_boxes` emits pairwise-disjoint boxes, the
+    because `_partition` emits pairwise-disjoint boxes, the
     `(box, moment order)` cache key never repeats within one plan, so
     no test distinguishes a memoised rule from an unmemoised one.
   - Multi-domain coupling: a machine-precision Nitsche interface patch

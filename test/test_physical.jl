@@ -685,8 +685,8 @@ end
 end
 
 @testset "NNMF on a region with multi-level parents" begin
-    # A cut base cell that is also covered by a cut overlay cell — exercises `_moment_order_for_region`'s
-    # max-over-parents logic. Use orders that differ between levels so the chosen moment_order is meaningful.
+    # A cut base cell that is also covered by a cut overlay cell — exercises the moment order's max over parents
+    # (`_axis_max` of `_moment_orders`). Use orders that differ between levels so the chosen moment_order is meaningful.
     bc = dirichlet(0.0; on=boundary(:all))
     omega = box((0.0,), (1.0,))
     p = physical_domain(x -> x[1] - 0.45; lipschitz=1.0, subcell_length_scale=1.0e-6, max_depth=4)
@@ -698,7 +698,7 @@ end
     @test !isempty(multi_parent_cuts)
     # moment_order for such a region = 2 × max(base.order, overlay.order) = 2 × 2 = 4.
     region = multi_parent_cuts[1]
-    moment_order = Unfitted._moment_order_for_region(V, region.parents)
+    moment_order = Unfitted._axis_max(Unfitted._moment_orders(p.moment_order_factor), V, region.parents)
     @test moment_order == (4,)
 end
 
@@ -711,13 +711,14 @@ end
     V_def = space(omega; cells=1, order=2, physical=p_default)
     V_che = space(omega; cells=1, order=2, physical=p_cheap)
 
-    parents = Unfitted._parents_covering(V_def.levels, box((0.0,), (1.0,)), GeometryTolerance(Float64))
+    parents = Unfitted._parents(V_def.levels, (1,), Unfitted.SVector(0.0), Unfitted.SVector(1.0))
+    order(V) = Unfitted._axis_max(Unfitted._moment_orders(V.physical.moment_order_factor), V, parents)
     # The default spans degree `2p`, which is what makes trial × test products exact on the moment basis.
     @test p_default.moment_order_factor == 2
-    @test Unfitted._moment_order_for_region(V_def, parents) == (4,)
+    @test order(V_def) == (4,)
     # Factor 1 spans degree `p` only: `∏(p+1)` weights, the tensor Gauss count on an uncut cell, exact for linear
     # functionals but — see `physical_domain`'s docstring — for a stiffness form only up to `p = 2`.
-    @test Unfitted._moment_order_for_region(V_che, parents) == (2,)
+    @test order(V_che) == (2,)
 
     @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1, moment_order_factor=0)
 end
@@ -1133,6 +1134,5 @@ end
     cache = Unfitted._MomentFitCache{2,Float64}()
     Unfitted.integration_plan(V; moment_fit_cache=cache)
     @test length(cache) > 8
-    @test all(isequal(value, Unfitted._fit_moment_rule(V.physical, Unfitted.AxisBox(key[1], key[2]), key[3]))
-              for (key, value) in cache)
+    @test all(isequal(value, Unfitted._fit_rule(V.physical, key..., false)) for (key, value) in cache)
 end

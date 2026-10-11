@@ -926,7 +926,8 @@ end
     V = ladder(dom; cells=4, order=2, depth=1, splits=2)
     V = adapt(V, 2 => CartesianIndices((1:2, 1:2, 1:2)))
     sides = [(3, :lower)]
-    merged = Unfitted._merged_axis_coordinates(V.levels, Val(3), tol, level -> Unfitted._side_cells(level, sides))
+    merged = Unfitted._merged_axis_coordinates(V.levels, Val(3), tol,
+                                               map(level -> Unfitted._side_cells(level, sides), V.levels))
     candidates = prod(length(Unfitted._intervals_from_coordinates(merged[d], tol)) for d in 1:2)
     regions = Unfitted._boundary_facet_regions(V, sides, tol)
     @test candidates == 25                       # 5 base lines + 2 overlay lines per free axis
@@ -1565,7 +1566,7 @@ end
     #    And it is insensitive to the geometric-robustness knobs: `_choose_axis` declares the sliced sub-boxes
     #    graph-like and stops bisecting, so driving `subcell_length_scale` from 1/12 to 1/192 (effective depth 2 → 6) or
     #    capping `max_depth` at 2 reproduces the value to the last bit. The only knob is the moment order, which
-    #    `_moment_order_for_region` takes from the parent cells.
+    #    `_moment_orders` takes from the parent cells.
     r₀, ṙ = 0.1373, 0.22
     centre = SVector(0.4967, 0.5013)
     cavity = leaf(x -> (r₀ + ṙ * x[3]) - sqrt((x[1] - centre[1])^2 + (x[2] - centre[2])^2); lipschitz=sqrt(1 + ṙ^2))

@@ -521,7 +521,7 @@ end
 #   4. For each candidate, compute the per-level *signature* at its midpoint: the linear index of the touching level's
 #      on-side active cell containing it, or `0` where the level contributes nothing — a cell off the side, or one the
 #      `LevelMask` deactivated, has no dofs to constrain. Drop candidates whose signature is all zero.
-#   5. Greedily merge axis-adjacent candidates that share a signature, exactly as `_merged_boxes` does over the volume
+#   5. Greedily merge axis-adjacent candidates that share a signature, exactly as `_partition` does over the volume
 #      (steps 3–4 there, through the same `_extend_axis`). Every point of a merged region still lies inside one cell of
 #      every parent level, so a product of boundary traces is still polynomial on it and the rule below is still exact
 #      for it.
@@ -542,7 +542,7 @@ end
 # therefore move at the boundary-quadrature-error level, not at roundoff.
 #
 # On a *cut* face the exactness argument is the moment fit's rather than tensor Gauss's, and it reaches the same degree
-# by construction: the order is the volume path's own `_moment_order_for_region` read over the free axes, so with the
+# by construction: the order is the volume path's own `_moment_orders` read over the free axes, so with the
 # default `moment_order_factor = 2` the fitted rule reproduces the moments of products of traces. The maximum over
 # parents that primitive takes is exactly what a merged region needs, for the same reason `_facet_quadrature_counts`
 # takes one — `adapt` and per-cell order let a region span cells of different orders, and anything less would
@@ -563,9 +563,10 @@ function _boundary_facet_regions(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}
 
     free_axes = _free_axes(sides, Val(D))
 
-    # Per-axis intervals along the free axes, mirroring `_axis_intervals` from intersections.jl but scanning only the
+    # Per-axis intervals along the free axes, as `_partition` (intersections.jl) forms them, but scanning only the
     # cells that can parent a region here (`_side_cells`).
-    merged = _merged_axis_coordinates(touching_levels, Val(D), tol, level -> _side_cells(level, sides))
+    merged = _merged_axis_coordinates(touching_levels, Val(D), tol,
+                                      map(level -> _side_cells(level, sides), touching_levels))
     intervals = map(d -> _intervals_from_coordinates(merged[d], tol), free_axes)
     any(isempty, intervals) && return FacetRegion{D,T}[]
 
@@ -587,7 +588,7 @@ end
 
 # On-side coverage signature at a facet point: per touching level, the linear index of the active cell whose own face on
 # `sides` contains the point, and `0` where the level contributes no boundary dof there. The facet counterpart of
-# `_coverage_signature` (intersections.jl), with that one's "off the mesh or inactive" rule widened by the side filter,
+# `_signature` (intersections.jl), with that one's "off the mesh or inactive" rule widened by the side filter,
 # and it carries everything the parent list does — `_facet_parents` decodes it once per *emitted* region instead of
 # building a parent list once per candidate.
 function _facet_signature(levels, linmaps, sides, point::SVector{D,T}, tol::GeometryTolerance{T}) where {D,T}
@@ -745,7 +746,7 @@ function _facet_tensor_rule(V::Space{D,T}, parents::Vector{FacetParent{D,T}}, fr
 end
 
 # One merged facet region: the classification of its face, and the rule that verdict calls for. This is the facet
-# counterpart of `_build_region_quadrature` (`intersections.jl`) — the same three-way dispatch, the same α-FCM blend,
+# counterpart of `_trimmed_rule` (`intersections.jl`) — the same three-way dispatch, the same α-FCM blend,
 # the same `kind` vocabulary — taken one dimension down, on the facet's own affine slice of Ω and its own
 # `(D − K)`-dimensional face box.
 #
@@ -796,7 +797,8 @@ function _facet_region(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}, parents:
     end
 
     box = _facet_box(lower, upper, free_axes, Val(F))
-    moment_order = _moment_order_for_region(V, parents, free_axes, Val(F))
+    full_order = _axis_max(_moment_orders(V.physical.moment_order_factor), V, parents, lower, upper)
+    moment_order = ntuple(j -> full_order[free_axes[j]], Val(F))
     fit_points, fit_weights, residual, status = moment_fit_rule(slice, box, moment_order;
                                                                 target_residual=slice.target_residual)
     if status === :empty

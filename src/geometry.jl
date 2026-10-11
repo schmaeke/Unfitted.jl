@@ -156,7 +156,8 @@ volume(b::AxisBox) = prod(edge_lengths(b))
     center(b::AxisBox) -> SVector{D}
 
 Geometric center of the box, `(b.lower + b.upper) / 2`. Used to construct midpoint coverage queries (see
-`_parents_covering` in `intersections.jl`) and to build the reference-to-physical affine map below.
+`_parents_covering` in `intersections.jl`, the transfer's parent lookup) and to build the reference-to-physical affine
+map below.
 """
 center(b::AxisBox) = (b.lower + b.upper) / 2
 

@@ -103,7 +103,7 @@ end
 
 # The rule is sized per sub-cell from the cells that actually cover it, on both sides: the interface integrand is a
 # product of one trace from each subdomain, so the count that integrates it is the larger of the two sides' own counts.
-# The two `_parent_quadrature_counts` lookups have to stay separate because the level ids of `V_a` and `V_b` are
+# The two `_axis_max` lookups have to stay separate because the level ids of `V_a` and `V_b` are
 # independently numbered and a parent from one side would resolve to the wrong level through the other's lookup. `rules`
 # precomputes every rule the sweep can reach, bounded by the larger of the two spaces' nominal-order bounds.
 function _emit_interface_regions(subdivided::BoundaryMesh{D,T,K}, V_a::Space{D,T}, V_b::Space{D,T}, field_a::Int,
@@ -118,8 +118,7 @@ function _emit_interface_regions(subdivided::BoundaryMesh{D,T,K}, V_a::Space{D,T
         parents_b = _active_cover_parents(V_b, midpoint, tol)
         (isempty(parents_a) || isempty(parents_b)) && continue
 
-        n = max(maximum(_parent_quadrature_counts(Val(D), parents_a, id -> _level_by_id(V_a, id))),
-                maximum(_parent_quadrature_counts(Val(D), parents_b, id -> _level_by_id(V_b, id))))
+        n = max(maximum(_axis_max(_gauss_counts, V_a, parents_a)), maximum(_axis_max(_gauss_counts, V_b, parents_b)))
         points, weights, normals = _simplex_cell_quadrature(cell, cell_index, subdivided.normals, rules[n],
                                                             reference_area, Val(K))
         push!(regions, InterfaceRegion{D,T}(field_a, field_b, parents_a, parents_b, points, weights, normals))

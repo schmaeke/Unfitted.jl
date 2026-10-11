@@ -593,9 +593,9 @@ end
 # the cartesian level grids so each emitted cell lies inside one parent per level, then walks the resulting sub-cells to
 # emit one `SurfaceRegion` per cell with its physical quadrature, per-Q-point normal, and constant parent set.
 #
-# The rule is sized per sub-cell from that cell's own covering parents (`_parent_quadrature_counts`, the same helper the
-# volume regions and the projection path use — `FacetParent` carries the `.level` / `.cell` fields it is duck-typed on).
-# Every rule a sub-cell can ask for is precomputed once into `rules`, indexed by point count and bounded above by
+# The rule is sized per sub-cell from that cell's own covering parents (`_axis_max` of `_gauss_counts`, the same helper
+# the volume regions and the projection path use — `FacetParent` carries the `.level` / `.cell` fields it is duck-typed
+# on). Every rule a sub-cell can ask for is precomputed once into `rules`, indexed by point count and bounded above by
 # `_surface_quadrature_order`, so a mesh of many cells over a handful of distinct orders builds a handful of
 # `gausslegendre` tables rather than one per cell.
 function _surface_regions_for_mesh(V::Space{D,T}, mesh::BoundaryMesh{D,T,K},
@@ -609,7 +609,7 @@ function _surface_regions_for_mesh(V::Space{D,T}, mesh::BoundaryMesh{D,T,K},
         parents = _surface_cell_parents(V, subdivided, cell, cell_index, tolerance)
         isempty(parents) && throw(ArgumentError("BoundaryMesh cell #$cell_index lies entirely outside the " *
                                                 "discretization — no covering parent found on any level"))
-        counts = _parent_quadrature_counts(Val(D), parents, id -> _level_by_id(V, id))
+        counts = _axis_max(_gauss_counts, V, parents)
         points, weights, normals = _simplex_cell_quadrature(cell, cell_index, subdivided.normals,
                                                             rules[maximum(counts)], reference_area, Val(K))
         push!(regions, SurfaceRegion{D,T}(parents, points, weights, normals))

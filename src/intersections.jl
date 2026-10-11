@@ -94,47 +94,33 @@ function Base.show(io::IO, overlap::SmallOverlap)
           overlap.relative_volume, ", cover=", overlap.cover_count, ")")
 end
 
-# ── Region quadrature dispatch and caching ────────────────────────────────────
+# ── Rule sizing ───────────────────────────────────────────────────────────────
 
-# Per-axis maximum recommended quadrature order across a region's parents. `level_lookup(id)` resolves a parent's level
-# id to its `Level`. Taking the per-axis maximum guarantees that the rule is exact for every parent level's basis
-# simultaneously.
+# The per-axis maximum of `f(level, cell)` over a region's parent cells: the one helper that sizes every rule a region
+# carries. `f` returns a per-axis tuple for one parent cell — its tensor Gauss counts (`_gauss_counts`), its moment-fit
+# order (`_moment_orders`), its VTK subdivision count — and the maximum over the parents makes the rule exact for every
+# parent level's basis at once. `parents` is any list of items carrying a `level` id of `V` and a `cell`.
 #
-# The order is read per parent *cell*, not per level. Under one order per level the two are the same value and the rule
+# The value is read per parent *cell*, not per level. Under one order per level the two are the same value and the rule
 # is unchanged; under a per-cell order they differ, and reading the cell is both cheaper and still exact — the minimum
 # rule only ever *removes* modes from a cell, so no function on that parent exceeds its own cell's per-axis order.
 # Sizing from the level's nominal maximum instead would make one high-p cell raise the rule on every region the level
 # touches.
-function _parent_quadrature_counts(::Val{D}, parents, level_lookup) where {D}
-    return ntuple(D) do d
-        maximum(parents) do parent
-            level = level_lookup(parent.level)
-            recommended_quadrature_order(level.basis, cell_order(level, parent.cell))[d]
-        end
+#
+# `lower` / `upper`, when given, are the region's corners: an axis on which they coincide — a boundary facet's pinned
+# axis — carries no extent to integrate along and gets 0.
+function _axis_max(f, V::Space{D}, parents, lower=nothing, upper=nothing) where {D}
+    return ntuple(Val(D)) do d
+        lower !== nothing && lower[d] == upper[d] && return 0
+        return maximum(parent -> f(_level_by_id(V, parent.level), parent.cell)[d], parents)
     end
 end
 
-# Tensor Gauss rule cache, keyed by per-axis count tuple. Built lazily and shared across every `:full` region that needs
-# the same per-axis count. `:full` regions then alias the cached `points`/`weights` arrays directly in their
-# `RegionQuadrature`, so they cost only the assembly-loop iteration time — no allocation per region.
-function _cached_tensor_quadrature!(cache::Dict{NTuple{D,Int},TensorQuadrature{D,T}}, counts::NTuple{D,Int},
-                                    ::Type{T}) where {D,T}
-    return get!(cache, counts) do
-        _tensor_gauss_rule(counts, T)
-    end
-end
+# Per-axis tensor Gauss counts that integrate products of one cell's basis functions exactly.
+_gauss_counts(level, cell) = recommended_quadrature_order(level.basis, cell_order(level, cell))
 
-# α-scaled weights cache for `:fictitious_alpha` regions, keyed by per-axis quadrature counts. The PhysicalDomain (and
-# so `alpha`) is constant for the duration of one `integration_plan` call, so `alpha` need not be part of the cache key.
-function _cached_alpha_weights!(cache::Dict{NTuple{D,Int},Vector{T}}, counts::NTuple{D,Int}, base_weights::Vector{T},
-                                alpha::T) where {D,T}
-    return get!(cache, counts) do
-        base_weights .* alpha
-    end
-end
-
-# Pick the moment-fit basis order for a cut region: `moment_order_factor` times the per-axis maximum of `cell_order`
-# over the region's parent CELLS — not over their levels, so one high-p cell elsewhere on a level does not raise the
+# Per-axis moment-fit basis order of one parent cell: `moment_order_factor` times its `cell_order`, so `_axis_max` takes
+# it over the region's parent CELLS — not over their levels, so one high-p cell elsewhere on a level does not raise the
 # moment basis here.
 #
 # At the default `moment_order_factor = 2` the basis spans degree `2p`, so trial × test products integrate exactly and
@@ -147,149 +133,148 @@ end
 # plate, factor 1 stops converging after `p = 2` and by `p = 7` is three times worse than first order while the fit
 # residual stays at ~1e-16. `physical_domain`'s docstring carries that table.
 #
-# `axes` names the axes the fit has coordinates on, which are also the slots of the order it returns: all `D` of them
-# for a volume region, and a facet region's free axes where the fit runs on the facet's affine slice one or more
-# dimensions down (`_facet_region` in `dirichlet.jl`). The convention is per axis, so reading it on a subset is the
-# whole of what a face needs — and reading it from here rather than restating it is what keeps a cut face and the cells
-# behind it integrating products of traces to the same degree. `parents` is any list of items carrying `level` and
-# `cell`, which is both [`ParentRef`](@ref) and `FacetParent`.
-function _moment_order_for_region(V::Space{D}, parents) where {D}
-    return _moment_order_for_region(V, parents, ntuple(identity, Val(D)), Val(D))
+# The convention is per axis, so a boundary facet reads it on its free axes alone (`_facet_region` in `dirichlet.jl`):
+# reading it from here rather than restating it is what keeps a cut face and the cells behind it integrating products of
+# traces to the same degree.
+_moment_orders(factor::Int) = (level, cell) -> factor .* cell_order(level, cell)
+
+# ── Region rules ──────────────────────────────────────────────────────────────
+
+# Tensor Gauss rule cache, keyed by per-axis count tuple. Built lazily and shared across every `:full` region that needs
+# the same per-axis count. `:full` regions then alias the cached `points`/`weights` arrays directly in their
+# `RegionQuadrature`, so they cost only the assembly-loop iteration time — no allocation per region.
+function _cached_tensor_quadrature!(cache::Dict{NTuple{D,Int},TensorQuadrature{D,T}}, counts::NTuple{D,Int},
+                                    ::Type{T}) where {D,T}
+    return get!(() -> _tensor_gauss_rule(counts, T), cache, counts)
 end
 
-function _moment_order_for_region(V::Space, parents, axes, ::Val{N}) where {N}
-    factor = V.physical.moment_order_factor
-    return ntuple(Val(N)) do j
-        factor * maximum(p -> cell_order(_level_by_id(V, p.level), p.cell)[axes[j]], parents)
-    end
+# α-scaled weights cache, keyed by per-axis quadrature counts, shared by every region whose rule carries the α-scaled
+# tensor rule (`:fictitious_alpha`, `:cut_alpha_failed` and the α part of a blended cut rule). The PhysicalDomain (and
+# so `alpha`) is constant for the duration of one `integration_plan` call, so `alpha` need not be part of the cache key.
+function _cached_alpha_weights!(cache::Dict{NTuple{D,Int},Vector{T}}, counts::NTuple{D,Int}, base_weights::Vector{T},
+                                alpha) where {D,T}
+    return get!(() -> base_weights .* alpha, cache, counts)
 end
 
-# Moment-fit rule cache, keyed by the canonicalised region bounds and the moment basis order. Returns
-# `(ref_points, ref_weights, residual, status)`:
+# Moment-fit rule cache, keyed by the canonicalised region bounds and the moment basis order, each value one cut
+# region's rule `(ref_points, ref_weights, residual, status)` as `_fit_rule` returns it.
 #
-#   - `ref_points` are the moment-fit physical points mapped into the region's `[−1, 1]ᴰ` reference frame via
-#     `physical_to_reference`;
-#   - `ref_weights` are the moment-fit physical weights divided by the standard region Jacobian `vol(box) / 2ᴰ`, so the
-#     assembly hot loop's `weight * jacobian` step recovers the original physical weight (the same convention used for
-#     `:full` regions);
-#   - `residual` is the moment-fit L² residual reported by `fcm.jl`;
-#   - `status` is `:fitted`, `:fallback`, or `:empty` — see [`moment_fit_rule`](@ref). The mapping above is
-#     rule-agnostic, so a `:fallback` rule (the raw Saye volume rule) is cached and consumed exactly like a fitted one.
-#
-# `physical.cut_quadrature` is the user extension point: a non-`nothing` callable supplies the cut-cell rule in place of
-# the moment fit, in the same 4-tuple shape and the same *physical*-frame convention. Placing it here — rather than in
-# `_build_region_quadrature` — puts a custom rule under the same per-box memoisation, the same reference-frame mapping,
-# and the same α-FCM blend as the fit, so swapping the rule changes exactly one thing. The field is concretely typed, so
-# `Q === Nothing` folds the branch away and the default path is the moment fit and nothing else.
-#
-# The cache belongs to one *space*, not to one plan. Within a single plan no two regions share a key — `_merged_boxes`
-# emits pairwise-disjoint boxes — so `_prefit_cut_rules!` fits each key it does not already hold exactly once up front
-# and the region loop below reads back nothing but hits. Its value is across plan rebuilds — a `move!` leaves the great
-# majority of cut boxes bit-identical, and refitting one costs hundreds of milliseconds in 3D — so [`Model`](@ref) owns
-# one per distinct participating space and threads it back in through every rebuild. That scope also keeps the key
-# honest: a space's `PhysicalDomain` is immutable and is carried unchanged through `moved_space` / `_remasked_space`, so
-# one cache sees exactly one `physical` for its whole life and the key need not include it. `_prefit_cut_rules!` bounds
-# the cache to the current plan's regions, so a long `move!` sweep holds one plan's rules, not the sweep's.
+# The cache belongs to one *space*, not to one plan. Within a single plan no two regions share a key — `_partition`
+# emits pairwise-disjoint boxes — so `_prefit!` fits each key it does not already hold exactly once up front and the
+# region loop reads back nothing but hits. Its value is across plan rebuilds — a `move!` leaves the great majority of
+# cut boxes bit-identical, and refitting one costs hundreds of milliseconds in 3D — so [`Model`](@ref) owns one per
+# distinct participating space and threads it back in through every rebuild. That scope also keeps the key honest: a
+# space's `PhysicalDomain` is immutable and is carried unchanged through `moved_space` / `_remasked_space`, so one cache
+# sees exactly one `physical` for its whole life and the key need not include it. `_prefit!` bounds the cache to the
+# current plan's regions, so a long `move!` sweep holds one plan's rules, not the sweep's.
 const _MomentFitKey{D,T} = Tuple{SVector{D,T},SVector{D,T},NTuple{D,Int}}
 const _MomentFitValue{D,T} = Tuple{Vector{SVector{D,T}},Vector{T},T,Symbol}
 const _MomentFitCache{D,T} = Dict{_MomentFitKey{D,T},_MomentFitValue{D,T}}
 
-# The rule itself, off the cache: the moment fit (or the user's `cut_quadrature`) followed by the reference-frame
-# mapping described above. Split out of `_cached_moment_fit!` so `_prefit_cut_rules!` can run the very same conversion
-# from another thread, with no `Dict` in reach.
-function _fit_moment_rule(physical::PhysicalDomain, box::AxisBox{D,T}, moment_order::NTuple{D,Int}) where {D,T}
-    rule = physical.cut_quadrature
-    phys_pts, phys_ws, residual, status = rule === nothing ?
-                                          moment_fit_rule(physical, box, moment_order;
-                                                          target_residual=physical.target_residual) :
-                                          rule(physical, box, moment_order)
-    jac = volume(box) / convert(T, 2^D)
-    ref_pts = [physical_to_reference(box, p) for p in phys_pts]
-    ref_ws = T[w / jac for w in phys_ws]
-    return (ref_pts, ref_ws, T(residual), status)
-end
-
-function _cached_moment_fit!(cache::_MomentFitCache{D,T}, physical::PhysicalDomain, box::AxisBox{D,T},
-                             moment_order::NTuple{D,Int}) where {D,T}
-    return get!(() -> _fit_moment_rule(physical, box, moment_order), cache, (box.lower, box.upper, moment_order))
-end
-
-# Build the region quadrature for one admissible box, dispatching on the `PhysicalDomain` classification:
+# One cut region's rule on the box `lower`–`upper`, in the box's reference frame: the moment fit (`moment_fit_rule`, at
+# the domain's own `target_residual`) or, when `custom`, the domain's `cut_quadrature`, then mapped as follows:
 #
-#   - no `PhysicalDomain` attached      → `:full`            tensor Gauss
-#   - `:full`                           → `:full`            tensor Gauss
-#   - `:fictitious` + `alpha == 0`      → drop region (return `nothing`)
-#   - `:fictitious` + `alpha > 0`       → `:fictitious_alpha` α-scaled tensor Gauss
-#   - `:cut` with successful moment fit → `:cut_fitted`       moment-fit rule
-#     (α > 0 appends the α-scaled full-cell tensor rule for stabilisation)
-#   - `:cut` + `physical.cut_quadrature` → `:cut_custom`       the user's rule
-#     (in place of the moment fit; α blends it exactly as it blends a fit)
-#   - `:cut` with failed moment fit     → `:cut_fallback`     raw Saye volume rule
-#     (correct but uncompressed; α > 0 appends the α-scaled tensor rule as above)
-#   - `:cut`, empty Ω ∩ box, α == 0     → `:cut_failed`       empty rule (zero contribution)
-#   - `:cut`, empty Ω ∩ box, α > 0      → `:cut_alpha_failed` α-scaled tensor rule only
+#   - `ref_points` are the rule's physical points mapped into the box's `[−1, 1]ᴰ` reference frame via
+#     `physical_to_reference`;
+#   - `ref_weights` are the rule's physical weights divided by the box Jacobian `vol(box) / 2ᴰ`, so the assembly hot
+#     loop's `weight * jacobian` step recovers the original physical weight (the same convention used for `:full`
+#     regions);
+#   - `residual` is the moment-fit L² residual reported by `fcm.jl`;
+#   - `status` is `:fitted`, `:fallback`, or `:empty` — see [`moment_fit_rule`](@ref). The mapping above is
+#     rule-agnostic, so a `:fallback` rule (the raw Saye volume rule) is mapped and consumed exactly like a fitted one.
+#
+# `physical.cut_quadrature` is the user extension point: a non-`nothing` callable supplies the cut-cell rule in place of
+# the moment fit, in the same 4-tuple shape and the same *physical*-frame convention. Placing it here puts a custom rule
+# under the same per-box memoisation, the same reference-frame mapping, and the same α-FCM blend as the fit, so swapping
+# the rule changes exactly one thing. `custom` is the caller's, not the field's, because a caller may decline the rule:
+# a boundary facet never consults it (see `_facet_region` in `dirichlet.jl`).
+#
+# A pure function of its arguments, which is what lets `_fit_rules` run it on any thread.
+function _fit_rule(physical::PhysicalDomain, lower::SVector{D,T}, upper::SVector{D,T}, order::NTuple{D,Int},
+                   custom::Bool) where {D,T}
+    box = AxisBox{D,T}(lower, upper)
+    points, weights, residual, status = custom ? physical.cut_quadrature(physical, box, order) :
+                                        moment_fit_rule(physical, box, order; target_residual=physical.target_residual)
+    jacobian = volume(box) / convert(T, 2^D)
+    return ([physical_to_reference(box, p) for p in points], T[w / jacobian for w in weights], T(residual), status)
+end
+
+# The rules of a list of cut keys `(lower, upper, order)`, in key order, fitted on every thread.
+#
+# At the default `moment_order_factor = 2` the fits *are* the plan: 99.9% of a 3D build, tens of seconds over a few
+# dozen cut cells. They are also independent of one another — `_fit_rule` reads the immutable `PhysicalDomain` and the
+# box and touches nothing else — so each writes its own slot of a pre-sized vector, with no `Dict` in reach.
+#
+# A user `cut_quadrature` is fitted serially instead. It is caller code under no thread-safety contract — the package's
+# own test rule counts its calls through a shared `Ref` — so the package does not unilaterally run it on N threads.
+function _fit_rules(physical::PhysicalDomain, keys::Vector{_MomentFitKey{D,T}}, custom::Bool) where {D,T}
+    fitted = Vector{_MomentFitValue{D,T}}(undef, length(keys))
+    fit(key) = _fit_rule(physical, key[1], key[2], key[3], custom)
+    if custom
+        map!(fit, fitted, keys)
+    else
+        Threads.@threads for i in eachindex(keys)
+            fitted[i] = fit(keys[i])
+        end
+    end
+    return fitted
+end
+
+# The rule one admissible region carries, from the classifier's `verdict` on it: the single home of the dispatch the
+# volume plan and the boundary facets share, of the α-FCM blend, and of the closed `kind` vocabulary (`CONTRIBUTING.md`,
+# "Region quadrature kinds"). Returns `(kind, points, weights, residual)`:
+#
+#   - `:full`                         → `:full`, the base tensor rule, ALIASED
+#   - `:fictitious`, `α == 0`         → `:fictitious`, the empty rule (the volume plan
+#                                       drops such a region before asking; a facet
+#                                       keeps it, see `_facet_region`)
+#   - `:fictitious`, `α > 0`          → `:fictitious_alpha`, the α-scaled base rule
+#   - `:cut`, a fitted rule           → `:cut_fitted`
+#     (α > 0 appends the α-scaled base rule for stabilisation)
+#   - `:cut`, the domain's own rule   → `:cut_custom` (`custom`: the domain's
+#     `cut_quadrature` supplied it; α blends it exactly as it blends a fit)
+#   - `:cut`, a failed fit            → `:cut_fallback`, the raw Saye volume rule
+#     (correct but uncompressed; α > 0 appends the α-scaled base rule as above)
+#   - `:cut`, empty Ω ∩ box, `α == 0` → `:cut_failed`, the empty rule (zero contribution)
+#   - `:cut`, empty Ω ∩ box, `α > 0`  → `:cut_alpha_failed`, the α-scaled base rule alone
 #     (nonzero: the physical sliver is negligible, but the cell's dofs stay α-stabilised)
 #
-# Returns `(RegionQuadrature, residual)` for kept regions and `(nothing, 0)` when the region is dropped. The `residual`
-# field is the NNMF moment-fit residual on cut regions and zero otherwise.
+# A `:fallback` rule is the Saye volume rule itself, so it is a valid non-negative physical rule and is consumed exactly
+# like a fit — only with 50–200× the points. The distinct kind is what makes that cost visible in the diagnostics
+# instead of hiding it in `:cut_fitted`. A custom rule owns the region outright, so it gets the single kind
+# `:cut_custom` whatever status symbol it returns — the diagnostic vocabulary stays closed rather than growing one kind
+# per user rule. `:empty` is the one status a custom rule shares with the fit, and it still routes to `:cut_failed` /
+# `:cut_alpha_failed`.
 #
-# `classify_cache` is shared with `_apply_physical_fold` in `mesh.jl`, so a region whose box coincides with a
-# previously-classified cell box (the common no-overlay case) reuses the classification verdict instead of re-walking
-# the octree.
-function _build_region_quadrature(V::Space{D,T}, box::AxisBox{D,T}, parents,
-                                  tensor_cache::Dict{NTuple{D,Int},TensorQuadrature{D,T}},
-                                  alpha_cache::Dict{NTuple{D,Int},Vector{T}}, moment_fit_cache::_MomentFitCache{D,T},
-                                  classify_cache::_ClassifyCache{D,T}) where {D,T}
-    counts = _parent_quadrature_counts(Val(D), parents, id -> _level_by_id(V, id))
-    base_rule = _cached_tensor_quadrature!(tensor_cache, counts, T)
-
-    physical = V.physical
-    if physical === nothing
-        return RegionQuadrature{D,T}(:full, base_rule.points, base_rule.weights), zero(T)
+# α-FCM on a cut region stabilises the fictitious part by *adding* the α-scaled base rule to the physical rule. Writing
+# the α-FCM integrand as
+#     ∫_box α(x) f = ∫_phys f + α∫_fict f = (1−α)∫_phys f + α∫_box f,
+# the rule is the concatenation `(1−α)·fit ∪ α·tensor`, fit first. Both summands are exact (the fit integrates the
+# physical part, tensor Gauss the whole box), so the total is exact for the α-FCM integrand; unlike the strict
+# physical-only rule it gives *every* mode — including the interior bubbles whose support lies entirely in the
+# fictitious corner of a thin cut — a nonzero, well-posed contribution. When Ω ∩ box carries no rule at all (a
+# degenerate sliver, whose physical contribution is negligible by construction — the domain volume is captured by the
+# well-fitted cells), the α·tensor part is kept alone so the cell's dofs are α-stabilised rather than left singular.
+#
+# `base_points` / `base_weights` are the region's tensor rule and `fit` its cut rule `(points, weights, residual,
+# status)`, both in the frame the caller integrates in; `fit` is read only on a `:cut` verdict. `alpha_weights` is the
+# α-scaled base weights, read only when `α > 0` and the verdict is not `:full`, so a caller computes it only then. The
+# residual is the fit's on every `:cut` kind and zero otherwise.
+function _trimmed_rule(verdict::Symbol, base_points::Vector{P}, base_weights::Vector{T}, alpha, alpha_weights, fit,
+                       custom::Bool) where {P,T}
+    verdict === :full && return :full, base_points, base_weights, zero(T)
+    if verdict === :fictitious
+        iszero(alpha) && return :fictitious, P[], T[], zero(T)
+        return :fictitious_alpha, base_points, alpha_weights, zero(T)
     end
-
-    state = classify_cell(physical, box, classify_cache)
-    if state === :full
-        return RegionQuadrature{D,T}(:full, base_rule.points, base_rule.weights), zero(T)
-    elseif state === :fictitious
-        iszero(physical.alpha) && return nothing, zero(T)
-        scaled = _cached_alpha_weights!(alpha_cache, counts, base_rule.weights, physical.alpha)
-        return RegionQuadrature{D,T}(:fictitious_alpha, base_rule.points, scaled), zero(T)
-    else  # `:cut` — moment-fit pipeline from `src/fcm.jl`.
-        moment_order = _moment_order_for_region(V, parents)
-        ref_pts, ref_ws, residual, status = _cached_moment_fit!(moment_fit_cache, physical, box, moment_order)
-        # A `:fallback` rule is the Saye volume rule itself, so it is a valid non-negative physical rule and is consumed
-        # exactly like a fit — only with 50–200× the points. The distinct kind is what makes that cost visible in the
-        # diagnostics instead of hiding it in `:cut_fitted`.
-        #
-        # A custom `cut_quadrature` rule owns the region outright, so it gets the single kind `:cut_custom` whatever
-        # status symbol it returns — the diagnostic vocabulary stays closed rather than growing one kind per user rule.
-        # `:empty` is the one status a custom rule shares with the fit, and it still routes to `:cut_failed` /
-        # `:cut_alpha_failed` below.
-        kind = physical.cut_quadrature !== nothing ? :cut_custom : status === :fallback ? :cut_fallback : :cut_fitted
-        if iszero(physical.alpha)
-            status === :empty && return RegionQuadrature{D,T}(:cut_failed, SVector{D,T}[], T[]), residual
-            return RegionQuadrature{D,T}(kind, ref_pts, ref_ws), residual
-        end
-
-        # α-FCM on a cut cell: stabilise the fictitious part by *adding* the α-scaled full-cell tensor rule to the
-        # physical moment-fit rule. Writing the α-FCM integrand as
-        #     ∫_cell α(x) f = ∫_phys f + α∫_fict f = (1−α)∫_phys f + α∫_cell f,
-        # the rule is the concatenation `(1−α)·moment-fit ∪ α·tensor`. Both summands are exact (moment-fit integrates
-        # the physical part, tensor Gauss the whole cell), so the total is exact for the α-FCM integrand; unlike the
-        # strict physical-only rule it gives *every* mode — including the interior bubbles whose support lies entirely
-        # in the fictitious corner of a thin cut — a nonzero, well-posed contribution. When Ω ∩ box carries no volume
-        # rule at all (a degenerate sliver, whose physical contribution is negligible by construction — the domain
-        # volume is captured by the well-fitted cells), keep the α·tensor part alone so the cell's dofs are α-stabilised
-        # rather than left singular.
-        alpha_weights = base_rule.weights .* physical.alpha
-        if status === :empty
-            return RegionQuadrature{D,T}(:cut_alpha_failed, base_rule.points, alpha_weights), residual
-        end
-        points = vcat(ref_pts, base_rule.points)
-        weights = vcat(ref_ws .* (one(T) - physical.alpha), alpha_weights)
-        return RegionQuadrature{D,T}(kind, points, weights), residual
+    points, weights, residual, status = fit
+    if status === :empty
+        iszero(alpha) && return :cut_failed, P[], T[], residual
+        return :cut_alpha_failed, base_points, alpha_weights, residual
     end
+    kind = custom ? :cut_custom : status === :fallback ? :cut_fallback : :cut_fitted
+    iszero(alpha) && return kind, points, weights, residual
+    return kind, vcat(points, base_points), vcat(weights .* (one(T) - alpha), alpha_weights), residual
 end
 
 # ── Admissible box partition ──────────────────────────────────────────────────
@@ -308,29 +293,32 @@ function _intervals_from_coordinates(coords::Vector{T}, tol::GeometryTolerance{T
     return intervals
 end
 
-# The whole cell grid of a level: the default scan range below, and the only one the volume and surface partitions ever
-# want.
-_all_level_cells(level) = CartesianIndices(level.mesh.cells)
+# The cells one level may parent in a partition — its slot of `_partition`'s `cells` tuple: every cell of the level
+# (`_AllCells`: the volume plan, the transfer and the surface grid lines), the cells with a face on a boundary facet
+# (`_side_cells` in `dirichlet.jl`), or none at all (an empty range: a level whose mesh does not reach that facet).
+# `_AllCells` is a singleton so that the membership tests below fold to `true` at compile time wherever every cell is
+# eligible.
+struct _AllCells end
+Base.in(::CartesianIndex, ::_AllCells) = true
+Base.isempty(::_AllCells) = false
+_cell_range(level, ::_AllCells) = CartesianIndices(level.mesh.cells)
+_cell_range(_, cells::CartesianIndices) = cells
 
 # Per-axis live element-boundary coordinates of one level: for each axis, the coordinates that bound at least one
-# *active* cell of `level` whose index lies in `cells`. This is the projection of the level's live region onto the axes,
-# and it replaces the level's whole node grid in every partition the package builds. One pass over the mask marks all
-# `D` axes, so a plan pays for a level's mask once, not once per axis.
+# *active* cell of `level` among `cells` (see `_AllCells`). This is the projection of the level's live region onto the
+# axes, and it replaces the level's whole node grid in every partition the package builds. One pass over the mask marks
+# all `D` axes, so a plan pays for a level's mask once, not once per axis. A level with no eligible cell contributes no
+# coordinate at all.
 #
 # *Why the partition does not change.* A coordinate is dropped only when it separates two slabs of cells, neither of
 # which is live on this level. It is then the face of no live cell here, and the level's coverage signature
-# (`_coverage_signature`) is the same on both sides of it: either the line is not a node of this mesh, so both sides sit
-# inside one cell, or it is a node whose two neighbouring cells are both dead, so both sides read `0`. A line the
-# *merged* set loses is one that no level keeps, so every level's signature is constant across it and the greedy merge
-# in `_merged_boxes` fuses the two slabs it separates anyway. The emitted box list comes out the same, in the same order
-# — and the candidate grid now follows the active region instead of the finest participating mesh, which is where the
-# cost of a deep `ladder` sat.
-#
-# One class of box does change: a region *no* level covers, which arises only where no level is live at all. The
-# partition then stops at the outermost live face instead of tiling the dead remainder. Such a box has no parent, and
-# every consumer of the partition drops it before anything else — `:any_parent` and `:all_levels` by definition,
-# `projection.jl` for want of a target parent, and a caller's own predicate because a parentless region has no
-# quadrature order to build a rule from in the first place.
+# (`_signature`) is the same on both sides of it: either the line is not a node of this mesh, so both sides sit inside
+# one cell, or it is a node whose two neighbouring cells are both dead, so both sides read `0`. A line the *merged* set
+# loses is one that no level keeps, so every level's signature is constant across it and the greedy merge in
+# `_partition` fuses the two slabs it separates anyway. The emitted box list comes out the same, in the same order —
+# and the candidate grid now follows the active region instead of the finest participating mesh, which is where the
+# cost of a deep `ladder` sat. Where no level is live at all the projection stops at the outermost live face instead of
+# tiling the dead remainder, which changes no emitted box: `_partition` emits no box that no level covers.
 #
 # The remaining caveat is canonicalisation, not geometry: `merge_coordinates` keeps the *first* representative of a
 # group within `tol.merge`. On a nested stack the shared nodes are bit-identical (`_mesh_axes` divides equal rationals),
@@ -338,13 +326,13 @@ _all_level_cells(level) = CartesianIndices(level.mesh.cells)
 # overlay a dead line sitting within `tol.merge` below a live line of another level *was* that group's representative,
 # so the canonical coordinate can move by at most `tol.merge`.
 #
-# `cells` exists for the boundary-facet partition in `dirichlet.jl`, which can only be parented by cells with a face on
-# the facet; every other caller takes the default. An unmasked level answers from its axes directly, without touching a
-# mask it does not have.
-function _live_axis_coordinates(level, ::Val{D}, cells::CartesianIndices{D}) where {D}
+# An unmasked level answers from its axes directly, without touching a mask it does not have.
+function _live_axis_coordinates(level, ::Val{D}, cells) where {D}
     nodes = boundary_coordinates(level.mesh)
+    scan = _cell_range(level, cells)
+    isempty(scan) && return ntuple(d -> nodes[d][1:0], D)
     mask = level.mask
-    lo, hi = first(cells).I, last(cells).I
+    lo, hi = first(scan).I, last(scan).I
     mask === nothing && return ntuple(d -> nodes[d][lo[d]:(hi[d]+1)], D)
     live = ntuple(d -> falses(length(nodes[d])), D)
     # `findall` on a `BitVector` walks 64 cells per machine word, so this costs the mask's size in *words* plus its
@@ -364,12 +352,12 @@ function _live_axis_coordinates(level, ::Val{D}, cells::CartesianIndices{D}) whe
 end
 
 # Per-axis merged element-boundary coordinates: gather each axis's live element-boundary coordinates from every level
-# (`_live_axis_coordinates`) and canonicalise them with `merge_coordinates`, so two meshes' nearly-coincident boundaries
-# collapse to a single shared coordinate. Shared by the integration-region partition (`_axis_intervals`), the
-# physical-facet partition (`_boundary_facet_regions` in dirichlet.jl) and the surface grid lines
-# (`_grid_lines_for_levels` in surface.jl).
-function _merged_axis_coordinates(levels, ::Val{D}, tol::GeometryTolerance{T}, cells=_all_level_cells) where {D,T}
-    per_level = map(level -> _live_axis_coordinates(level, Val(D), cells(level)), levels)
+# (`_live_axis_coordinates`, over that level's slot of `cells`) and canonicalise them with `merge_coordinates`, so two
+# meshes' nearly-coincident boundaries collapse to a single shared coordinate. Shared by the partition engine
+# (`_partition`) and the surface grid lines (`_grid_lines_for_levels` in surface.jl).
+function _merged_axis_coordinates(levels, ::Val{D}, tol::GeometryTolerance{T},
+                                  cells=map(_ -> _AllCells(), levels)) where {D,T}
+    per_level = map((level, eligible) -> _live_axis_coordinates(level, Val(D), eligible), levels, cells)
     return ntuple(D) do d
         merged = T[]
         for live in per_level
@@ -379,61 +367,71 @@ function _merged_axis_coordinates(levels, ::Val{D}, tol::GeometryTolerance{T}, c
     end
 end
 
-# Per-axis intervals on which the admissible-box partition is built: turn each axis's merged element-boundary
-# coordinates (`_merged_axis_coordinates`) into non-degenerate intervals.
-function _axis_intervals(levels::Tuple, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
-    coords = _merged_axis_coordinates(levels, Val(D), tol)
-    return ntuple(d -> _intervals_from_coordinates(coords[d], tol), D)
-end
-
-# Coverage signature at a point: the linear cell index per level, with `0` standing for "off this level's mesh" or "in
-# an inactive cell" — both cases are treated identically because both mean the level contributes nothing here. Two boxes
-# share a coverage signature iff they lie inside the same cell of every active level, so the smooth-integrand contract
-# (one cell per axis per level) is preserved when merging axis-adjacent equal-signature boxes.
+# Coverage signature at a point: per level, the linear index of the cell containing `x`, with `0` standing for "off this
+# level's mesh", "in an inactive cell" or "in a cell the level may not parent here" (`cells`) — all three mean the level
+# contributes nothing at `x`. Two boxes share a signature iff they lie inside the same cell of every contributing level,
+# so the smooth-integrand contract (one cell per axis per level) is preserved when merging axis-adjacent
+# equal-signature boxes, and the signature alone determines a box's parents (`_parents`).
 #
-# The signature is returned as an `NTuple{N,Int}` rather than a `Vector{Int}` so the equality comparison in
-# `_merged_boxes` stays on the stack. The previous `Vector{Int}` allocation per candidate box was the largest single
-# allocation source in `integration_plan`.
-function _coverage_signature(levels::Tuple, linmaps::Tuple, point::SVector{D,T}, tol::GeometryTolerance{T}) where {D,T}
-    return map(levels, linmaps) do level, linmap
-        cell = locate_cell(level.mesh, point; tol)
-        cell === nothing || !is_active(level.mask, cell) ? 0 : linmap[cell]
+# The signature is an `NTuple{N,Int}` built by `map` over the level tuple rather than a `Vector{Int}`, so the equality
+# comparison in the merge stays on the stack and every level's lookup is statically dispatched. A `Vector{Int}` per
+# candidate box was once the largest single allocation source in `integration_plan`.
+function _signature(levels::Tuple, linmaps::Tuple, cells::Tuple, x::SVector{D,T}, tol::GeometryTolerance{T}) where {D,T}
+    return map(levels, linmaps, cells) do level, linmap, eligible
+        isempty(eligible) && return 0
+        cell = locate_cell(level.mesh, x; tol)
+        return cell === nothing || !(cell in eligible) || !is_active(level.mask, cell) ? 0 : linmap[cell]
     end
 end
 
-# Build the admissible integration boxes for `levels`. This is the box-partition half of the recipe documented in
-# `CONTRIBUTING.md`'s "Integration regions" section — coordinates through greedy merge; `integration_plan` runs the
-# parent resolution, the keep-criterion and the quadrature dispatch over the boxes emitted here:
+# The admissible-box partition engine: the boxes of `levels` spanned on the `free` axes through the point `anchor`,
+# whose other coordinates are held fixed, as `(lower, upper, sig)` records in emission order, `sig` the box's coverage
+# signature. It is the box-partition half of the recipe documented in `CONTRIBUTING.md`'s "Integration regions" section,
+# and every partition the package builds runs through it:
 #
-#   1. Collect, per axis, every participating mesh's element-boundary coordinates that bound an active cell of that mesh
-#      — all of them on an unmasked level (`_axis_intervals` ⇒ `_merged_axis_coordinates` ⇒ `_live_axis_coordinates` ⇒
-#      `merge_coordinates` ⇒ `_intervals_from_coordinates`). A coordinate no level keeps separates two slabs of
+#   - the volume plan (`integration_plan`): every axis free, every cell eligible;
+#   - a boundary facet (`_boundary_facet_regions` in `dirichlet.jl`): the facet's free axes, the anchor carrying the
+#     facet's own coordinates on its pinned ones, and per level only the cells with a face on the facet;
+#   - the L² transfer (`_transfer_regions` in `projection.jl`): the source and target levels in one tuple.
+#
+# The steps:
+#
+#   1. Collect, per axis, every level's element-boundary coordinates that bound an active eligible cell of that level
+#      (`_merged_axis_coordinates` ⇒ `_live_axis_coordinates` ⇒ `merge_coordinates`), and form the free axes'
+#      non-degenerate intervals (`_intervals_from_coordinates`). A coordinate no level keeps separates two slabs of
 #      identical coverage signature, which step 4 would have merged again, so dropping it costs no region and no
 #      exactness.
 #   2. Form the Cartesian product of those intervals, giving the *candidate* box index grid `CartesianIndices(ranges)`.
-#   3. For each candidate, compute the per-level coverage signature at the box midpoint (`_coverage_signature`).
-#   4. Greedy axis-by-axis merging: starting from an unvisited candidate box, extend the box along each axis in turn as
-#      long as the next "slab" of candidates is (a) unvisited and (b) shares the signature of the starting box. Mark
-#      every visited candidate so it is not emitted again.
+#   3. For each candidate, compute the coverage signature at its midpoint (`_signature`). On a fixed axis the midpoint
+#      is `(v + v) / 2 = v`, the anchor's own coordinate.
+#   4. Greedy axis-by-axis merging: starting from an unvisited candidate, extend the box along each free axis in turn as
+#      long as the next "slab" of candidates is (a) unvisited and (b) shares the signature of the starting candidate.
+#      Mark every merged candidate visited so it is not emitted again.
 #
 # The greedy merge keeps the number of regions close to the number of genuinely distinct cell-coverage patterns rather
 # than producing one region per candidate. Without the merge, a small overlay's per-axis coordinates would slice the
 # entire physical domain along the overlay axis, splitting far-away base cells into long chains of
 # trivially-equal-signature sub-boxes for no integration benefit.
 #
-# Mathematical correctness: every cell inside a merged box has the same coverage signature, so the box lies inside one
-# cell of every covering level. The integrand of any basis-function product on the box is then a smooth polynomial in
-# the parent's reference frame, and the per-region Gauss rule remains exact. The greedy order of axes can change the
-# *shape* of the resulting boxes (the same volume can be packed many ways) but never their *total* volume or their
-# numerical contribution.
+# Mathematical correctness: every candidate inside a merged box has the same coverage signature, so the box lies inside
+# one cell of every contributing level. The integrand of any basis-function product on the box is then a smooth
+# polynomial in the parent's reference frame, and the per-region Gauss rule remains exact. The greedy order of axes can
+# change the *shape* of the resulting boxes (the same volume can be packed many ways) but never their *total* volume or
+# their numerical contribution.
 #
-# Steps 3–4 are split across the three small helpers below rather than written as one flat loop. That split is
-# load-bearing, not style. The greedy merge's running upper corner `hi` is reassigned on every extension *and* read
-# inside `ntuple` closures; written in one frame, Julia heap-boxes it as a `Core.Box`, rebuilds the box on each
-# extension and turns every read into a dynamic dispatch. In that form this single variable accounted for 95% of
-# `integration_plan`'s allocations, on a path `prepare`, `move!` and `activate!` all run. The helpers restore the
-# separation the compiler needs: every frame that *closes over* `hi` receives it as an argument and never writes it, and
-# the one frame that writes it (`_extend_axis`) closes over nothing. Do not fold them back inline.
+# A seed no level covers — an all-zero signature, where every level is inactive or ineligible — is skipped rather than
+# emitted: it is no region for any user of the engine, which has nothing to integrate, constrain or transfer there.
+# Skipping it changes nothing else, since a seed with a non-zero signature only ever absorbs candidates of its own
+# signature: every other box, its extent and its place in the order are the ones the full partition would emit.
+#
+# Steps 3–4 are split across the small helpers below rather than written as one flat loop. That split is load-bearing,
+# not style. The greedy merge's running upper corner `hi` is reassigned on every extension *and* read inside `ntuple`
+# closures; written in one frame, Julia heap-boxes it as a `Core.Box`, rebuilds the box on each extension and turns
+# every read into a dynamic dispatch. In that form this single variable accounted for 95% of `integration_plan`'s
+# allocations, on a path `prepare`, `move!` and `activate!` all run. The helpers restore the separation the compiler
+# needs: every frame that *closes over* `hi` receives it as an argument and never writes it, and the frames that write
+# it (`_extend_axis`, and `_partition`, which turns it into ranges with `map(:, …)` rather than a closure) close over
+# nothing. Do not fold them back inline.
 
 # Does the candidate slab one step past `hi` along axis `d` join the box seeded at `start`? It does when every candidate
 # in the slab is unvisited and carries the seed signature `sig0`.
@@ -453,44 +451,53 @@ function _extend_axis(sigs, visited, ranges::NTuple{D,Int}, start::NTuple{D,Int}
     return hi
 end
 
-# Mark every candidate of the merged box `start:hi` visited and push the box's physical extent.
-function _emit_merged_box!(boxes::Vector{AxisBox{D,T}}, visited, intervals, start::NTuple{D,Int},
-                           hi::NTuple{D,Int}) where {D,T}
-    for c in CartesianIndices(ntuple(e -> start[e]:hi[e], D))
-        visited[c] = true
-    end
-    lower = SVector{D,T}(ntuple(d -> intervals[d][start[d]][1], D))
-    upper = SVector{D,T}(ntuple(d -> intervals[d][hi[d]][2], D))
-    push!(boxes, AxisBox{D,T}(lower, upper))
-    return boxes
+# Physical corners of the candidate index range `lo:hi`: the interval ends on the free axes, the anchor's coordinate on
+# the others. `slot[d]` is axis `d`'s position among the free axes, `0` on a fixed axis.
+function _corners(anchor::SVector{D,T}, slot::NTuple{D,Int}, intervals, lo, hi) where {D,T}
+    lower = SVector{D,T}(ntuple(d -> slot[d] == 0 ? anchor[d] : intervals[slot[d]][lo[slot[d]]][1], Val(D)))
+    upper = SVector{D,T}(ntuple(d -> slot[d] == 0 ? anchor[d] : intervals[slot[d]][hi[slot[d]]][2], Val(D)))
+    return lower, upper
 end
 
-function _merged_boxes(levels, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
-    intervals = _axis_intervals(levels, Val(D), tol)
-    ranges = ntuple(d -> length(intervals[d]), D)
-    boxes = AxisBox{D,T}[]
-    any(==(0), ranges) && return boxes
+function _partition(levels::NTuple{N,Any}, free::NTuple{F,Int}, anchor::SVector{D,T}, tol::GeometryTolerance{T},
+                    cells::Tuple=map(_ -> _AllCells(), levels)) where {N,F,D,T}
+    coords = _merged_axis_coordinates(levels, Val(D), tol, cells)
+    intervals = ntuple(j -> _intervals_from_coordinates(coords[free[j]], tol), Val(F))
+    ranges = ntuple(j -> length(intervals[j]), Val(F))
+    out = Tuple{SVector{D,T},SVector{D,T},NTuple{N,Int}}[]
+    any(==(0), ranges) && return out
 
-    # Compute the per-level linear cell index map once and the per-candidate coverage signature once. Both are reused
-    # inside the greedy merge loop, where signature equality is the hot inner check.
+    # The per-level linear cell index maps once, and the coverage signature once per candidate: both are reused inside
+    # the greedy merge, where signature equality is the hot inner check.
     linmaps = map(level -> LinearIndices(level.mesh.cells), levels)
+    slot = ntuple(d -> something(findfirst(==(d), free), 0), Val(D))
     sigs = map(CartesianIndices(ranges)) do index
-        mid = SVector{D,T}(ntuple(d -> (intervals[d][index.I[d]][1] + intervals[d][index.I[d]][2]) / 2, D))
-        _coverage_signature(levels, linmaps, mid, tol)
+        lower, upper = _corners(anchor, slot, intervals, index.I, index.I)
+        return _signature(levels, linmaps, cells, (lower + upper) / 2, tol)
     end
 
     visited = falses(ranges)
     for start in CartesianIndices(ranges)
         visited[start] && continue
-        # Greedy axis-by-axis extension: extend along axis `d` as far as the next slab of candidates matches the seed
-        # signature, then repeat for the next axis. The merge never backtracks.
+        sig = sigs[start]
+        all(iszero, sig) && continue
+        # Greedy axis-by-axis extension: extend along free axis `j` as far as the next slab of candidates matches the
+        # seed signature, then repeat for the next axis. The merge never backtracks.
         hi = start.I
-        for d in 1:D
-            hi = _extend_axis(sigs, visited, ranges, start.I, hi, sigs[start], d)
+        for j in 1:F
+            hi = _extend_axis(sigs, visited, ranges, start.I, hi, sig, j)
         end
-        _emit_merged_box!(boxes, visited, intervals, start.I, hi)
+        fill!(view(visited, map(:, start.I, hi)...), true)
+        push!(out, (_corners(anchor, slot, intervals, start.I, hi)..., sig))
     end
-    return boxes
+    return out
+end
+
+# The partition's boxes alone, with every axis free and every cell eligible: the view the L² transfer
+# (`_transfer_regions` in `projection.jl`) locates its two parent lists in.
+function _merged_boxes(levels, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
+    return [AxisBox{D,T}(lower, upper)
+            for (lower, upper, _) in _partition(levels, ntuple(identity, Val(D)), zero(SVector{D,T}), tol)]
 end
 
 # ── Merge tolerance vs. mesh spacing ──────────────────────────────────────────
@@ -528,13 +535,28 @@ function _check_axis_spacing(levels, ::Val{D}, tol::GeometryTolerance{T}) where 
     return nothing
 end
 
-# ── Region parent coverage ────────────────────────────────────────────────────
+# ── Region parents ────────────────────────────────────────────────────────────
+
+# The parents a box's coverage signature stands for, in level order: per non-zero slot, the level's cell with that
+# linear index, the cell's physical box, and the region's corners in that cell's reference frame. Every candidate the
+# partition merged into the box shares the signature, so the whole box lies in each of these cells — the contract the
+# smooth-integrand argument needs — and decoding the signature is all it takes to find them.
+function _parents(levels::Tuple, sig::Tuple, lower::SVector{D,T}, upper::SVector{D,T}) where {D,T}
+    found = map(levels, sig) do level, index
+        index == 0 && return nothing
+        cell = CartesianIndices(level.mesh.cells)[index]
+        parent_box = cell_box(level.mesh, cell)
+        local_box = AxisBox{D,T}(physical_to_reference(parent_box, lower), physical_to_reference(parent_box, upper))
+        return ParentRef{D,T}(level.id, cell, local_box, parent_box)
+    end
+    return ParentRef{D,T}[parent for parent in found if parent !== nothing]
+end
 
 # For an admissible region `box`, find every parent level whose active cell contains the box midpoint and record the
-# box's geometry in that parent's reference frame. The midpoint is a deterministic representative of the box's interior
-# because the box was built as a sub-rectangle of the cell along every axis — every interior point of the box belongs to
-# the same parent cell, so midpoint containment matches "the whole box lies in this cell". Inactive cells (per the
-# level's `LevelMask`) do not contribute.
+# box's geometry in that parent's reference frame — the transfer's way to its target and source parents, which live on
+# two models whose level ids overlap (`_transfer_regions` in `projection.jl`). The midpoint is a deterministic
+# representative of the box's interior because the box was built as a sub-rectangle of the cell along every axis.
+# Inactive cells (per the level's `LevelMask`) do not contribute.
 function _parents_covering(levels, box::AxisBox{D,T}, tol::GeometryTolerance{T}) where {D,T}
     midpoint = center(box)
     parents = ParentRef{D,T}[]
@@ -566,9 +588,9 @@ end
 #                      reaches the plan through `prepare(problem;
 #                      criterion = …)`.
 #
-# `parents` is never empty here: `integration_plan` drops a box no level covers before asking, because such a box has no
-# basis function to integrate and no parent order to size a rule from. Handing it to a callable criterion used to let
-# one that answers `true` keep the box and then crash building its rule.
+# `parents` is never empty here: `_partition` emits no box that no level covers, because such a box has no basis
+# function to integrate and no parent order to size a rule from. Handing one to a callable criterion used to let one
+# that answers `true` keep the box and then crash building its rule.
 function _criterion_satisfied(parents, level_count::Int, criterion)
     if criterion === :any_parent
         return !isempty(parents)
@@ -583,44 +605,45 @@ end
 
 # ── Plan construction ─────────────────────────────────────────────────────────
 
-# Fit every cut region's moment rule before the region loop consumes any of them, in parallel, and reduce the cache to
-# exactly this plan's regions.
-#
-# At the default `moment_order_factor = 2` the fits *are* the plan: 99.9% of a 3D build, tens of seconds over a few
-# dozen cut cells. They are also independent of one another — `moment_fit_rule` reads the immutable `PhysicalDomain` and
-# the region box and touches nothing else — so the only obstacle to running them in parallel is the two `Dict`s, and
-# neither is in reach of the parallel loop: classification runs first and serially (it is memoised, and a `Dict` is not
-# thread-safe), each fit writes its own slot of a pre-sized vector, and the cache is filled afterwards, serially. The
-# region loop then runs exactly as before, in region order, on nothing but cache hits, so region order, `residual_max`
-# and the small-overlap bookkeeping are the serial path's, bit for bit.
-#
-# A user `cut_quadrature` is fitted serially instead. It is caller code under no thread-safety contract — the package's
-# own test rule counts its calls through a shared `Ref` — so the package does not unilaterally run it on N threads. It
-# still gets the dedup and the cross-plan reuse.
+# One kept region of a volume plan before its rule is built: its corners and parents, and what sizing and classification
+# decided about it, computed once per region (`_region_record`) and read by both the prefit and the rule loop. `order`
+# is the moment-fit order on a `:cut` verdict and repeats `counts` otherwise, where nothing reads it.
+const _RegionRecord{D,T} = @NamedTuple{lower::SVector{D,T}, upper::SVector{D,T}, parents::Vector{ParentRef{D,T}},
+                                       verdict::Symbol, counts::NTuple{D,Int}, order::NTuple{D,Int}}
+
+# The record of one kept box: tensor counts from its parents, the `PhysicalDomain` classification (`:full` without one),
+# and on a `:cut` verdict the moment-fit order. `classify_cache` is shared with `_apply_physical_fold` in `mesh.jl`, so
+# a box that coincides with a previously classified cell box (the common no-overlay case) reuses the fold's verdict
+# instead of re-walking the octree.
+function _region_record(V::Space{D,T}, lower::SVector{D,T}, upper::SVector{D,T}, parents::Vector{ParentRef{D,T}},
+                        classify_cache::_ClassifyCache{D,T}) where {D,T}
+    physical = V.physical
+    counts = _axis_max(_gauss_counts, V, parents, lower, upper)
+    verdict = physical === nothing ? :full : classify_cell(physical, AxisBox{D,T}(lower, upper), classify_cache)
+    order = verdict === :cut ? _axis_max(_moment_orders(physical.moment_order_factor), V, parents, lower, upper) :
+            counts
+    return _RegionRecord{D,T}((lower, upper, parents, verdict, counts, order))
+end
+
+# Fit every cut region's rule before the rule loop consumes any of them, in parallel (`_fit_rules`), and reduce the
+# cache to exactly this plan's regions. Classification ran first and serially, in the records (it is memoised, and a
+# `Dict` is not thread-safe); the fits fill the cache afterwards, serially; the rule loop then runs in region order on
+# nothing but cache hits, so region order, `residual_max` and the small-overlap bookkeeping are the serial path's, bit
+# for bit. A custom `cut_quadrature` is fitted serially (`_fit_rules`) and still gets the dedup and the cross-plan
+# reuse.
 #
 # `live` is the plan's whole cut-key set, not just its misses, because restricting the cache afterwards is what keeps a
 # cache threaded through a long `move!` sweep from holding the sweep's worth of rules. On exit the cache holds only the
 # *boxes* this plan cuts — but at every moment order fitted at one of them, which is where the eviction rule differs
 # from the lookup key. See the `filter!` below for why the two are not the same rule, and what the difference costs.
-function _prefit_cut_rules!(cache::_MomentFitCache{D,T}, V::Space{D,T}, admissible,
-                            classify_cache::_ClassifyCache{D,T}) where {D,T}
-    physical = V.physical
+function _prefit!(cache::_MomentFitCache{D,T}, physical, records::Vector{_RegionRecord{D,T}}) where {D,T}
     physical === nothing && return cache
     live = Set{_MomentFitKey{D,T}}()
-    for (box, parents) in admissible
-        classify_cell(physical, box, classify_cache) === :cut || continue
-        push!(live, (box.lower, box.upper, _moment_order_for_region(V, parents)))
+    for record in records
+        record.verdict === :cut && push!(live, (record.lower, record.upper, record.order))
     end
     pending = _MomentFitKey{D,T}[key for key in live if !haskey(cache, key)]
-    fitted = Vector{_MomentFitValue{D,T}}(undef, length(pending))
-    fit(key) = _fit_moment_rule(physical, AxisBox{D,T}(key[1], key[2]), key[3])
-    if physical.cut_quadrature === nothing
-        Threads.@threads for i in eachindex(pending)
-            fitted[i] = fit(pending[i])
-        end
-    else
-        map!(fit, fitted, pending)
-    end
+    fitted = _fit_rules(physical, pending, physical.cut_quadrature !== nothing)
     for i in eachindex(pending)
         cache[pending[i]] = fitted[i]
     end
@@ -650,6 +673,39 @@ function _prefit_cut_rules!(cache::_MomentFitCache{D,T}, V::Space{D,T}, admissib
     return cache
 end
 
+# The rule loop of `integration_plan`: one `VolumeRegion` per record, in record order, through `_trimmed_rule` — except
+# a fictitious box under strict α = 0, which has nothing to integrate and is dropped — with the small-overlap records
+# and the largest cut residual. Small-overlap diagnostics are accumulated rather than acted on: the package exposes the
+# warning, the caller decides whether to stabilise. A function barrier on `alpha`, a field of the abstractly typed
+# `Space.physical`, so the per-region rule dispatch below is static.
+function _plan_regions(records::Vector{_RegionRecord{D,T}}, fits::_MomentFitCache{D,T}, alpha, custom::Bool,
+                       tolerance::GeometryTolerance{T}, domain_volume::T) where {D,T}
+    regions = VolumeRegion{D,T}[]
+    small_overlaps = SmallOverlap{T}[]
+    tensor_cache = Dict{NTuple{D,Int},TensorQuadrature{D,T}}()
+    alpha_cache = Dict{NTuple{D,Int},Vector{T}}()
+    residual_max = 0.0
+    for record in records
+        record.verdict === :fictitious && iszero(alpha) && continue
+        base = _cached_tensor_quadrature!(tensor_cache, record.counts, T)
+        alpha_weights = record.verdict === :full || iszero(alpha) ? base.weights :
+                        _cached_alpha_weights!(alpha_cache, record.counts, base.weights, alpha)
+        fit = record.verdict === :cut ? fits[(record.lower, record.upper, record.order)] : nothing
+        kind, points, weights, residual = _trimmed_rule(record.verdict, base.points, base.weights, alpha, alpha_weights,
+                                                        fit, custom)
+        residual > residual_max && (residual_max = Float64(residual))
+        box = AxisBox{D,T}(record.lower, record.upper)
+        region_volume = volume(box)
+        push!(regions, VolumeRegion{D,T}(box, record.parents, RegionQuadrature{D,T}(kind, points, weights)))
+        if region_volume <= tolerance.small_volume
+            relative_volume = iszero(domain_volume) ? zero(T) : region_volume / domain_volume
+            push!(small_overlaps,
+                  SmallOverlap{T}(length(regions), region_volume, relative_volume, length(record.parents)))
+        end
+    end
+    return regions, small_overlaps, residual_max
+end
+
 """
     integration_plan(V::Space; tolerance=GeometryTolerance(T),
                                criterion=:any_parent,
@@ -669,12 +725,12 @@ The construction follows the recipe in `CONTRIBUTING.md`'s "Integration regions"
      collapse to a single shared boundary. A coordinate no level keeps is the face of no active cell, so every level's
      coverage signature is constant across it and the partition is the one the full grids would have produced: the
      candidate grid follows the active region rather than the finest participating mesh.
-  2. Form the Cartesian product of the resulting intervals to get candidate boxes; greedily merge axis-adjacent
-     candidates that share a coverage signature (every cell inside the merged box lies inside the same cell of every
-     active level).
-  3. For each kept candidate, identify the covering parent cells via midpoint containment and build the box's geometry
-     in each parent's reference frame. A box no level covers is dropped; every other box is checked against the
-     `criterion`.
+  2. Form the Cartesian product of the resulting intervals to get candidate boxes, take each candidate's coverage
+     signature — per level, the active cell containing its midpoint — and greedily merge axis-adjacent candidates that
+     share it (every cell inside the merged box lies inside the same cell of every active level). A box no level covers
+     is no region of the plan.
+  3. Decode each box's parents from its signature, building the box's geometry in each parent's reference frame, and
+     check the `criterion`.
   4. Dispatch on the `PhysicalDomain` classification to pick the region quadrature: tensor Gauss for `:full`, α-scaled
      tensor Gauss for `:fictitious + alpha > 0`, and on `:cut` the NNMF moment-fit — or the domain's `cut_quadrature`
      callable, when it supplies one, in the fit's place. Drop the region entirely under strict-α (`alpha = 0` and
@@ -684,9 +740,10 @@ The construction follows the recipe in `CONTRIBUTING.md`'s "Integration regions"
 
 Keyword arguments:
 
-  - `tolerance` — geometry tolerance applied at every step (`merge_coordinates`, midpoint containment, small-volume
-    reporting). Its `merge` field is an absolute length, so a mesh finer than it on any axis is rejected rather than
-    silently decimated (step 0). Small geometry is fully supported; it needs a `merge` below its own spacing.
+  - `tolerance` — geometry tolerance applied at every step (`merge_coordinates`, the signatures' midpoint containment,
+    small-volume reporting). Its `merge` field is an absolute length, so a mesh finer than it on any axis is rejected
+    rather than silently decimated (step 0). Small geometry is fully supported; it needs a `merge` below its own
+    spacing.
   - `criterion` — `:any_parent` (default), `:all_levels`, or a function `parents -> Bool`. See `_criterion_satisfied`
     for the semantics. The predicate form is an escape hatch for a coverage rule the two symbols do not express; it is
     reached through `prepare(problem; criterion = …)` and, like every plan option, survives `move!` and `activate!`
@@ -707,8 +764,8 @@ Keyword arguments:
 The function is called by `prepare`, `move!`, and `_update_mask!`, all in `src/model.jl`, which own the plan a
 [`Model`](@ref) carries; `assembly.jl` and `postprocessing.jl` only read that cached plan back through the
 [`integration_plan`](@ref) / [`integration_plans`](@ref) accessors. The projection path in `projection.jl` builds no
-plan at all: it reuses this file's admissible-box partition (`_merged_boxes`, `_parents_covering`) directly and keeps
-every box the target covers, without a `criterion`.
+plan at all: it reuses this file's admissible-box partition engine (`_partition`) directly and keeps every box the
+target covers, without a `criterion`.
 """
 function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criterion=:any_parent,
                           classify_cache=_ClassifyCache{D,T}(), moment_fit_cache=_MomentFitCache{D,T}()) where {D,T}
@@ -716,43 +773,23 @@ function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criteri
     # built. See `_check_axis_spacing`.
     _check_axis_spacing(V.levels, Val(D), tolerance)
 
-    regions = VolumeRegion{D,T}[]
-    small_overlaps = SmallOverlap{T}[]
-    tensor_cache = Dict{NTuple{D,Int},TensorQuadrature{D,T}}()
-    alpha_cache = Dict{NTuple{D,Int},Vector{T}}()
+    # Parents and the keep-criterion first, then one record per kept box with its sizing and classification, before
+    # touching the (potentially expensive) rules; then every cut rule up front (`_prefit!`), so the rule loop walks the
+    # records in partition order on nothing but cache hits.
+    records = _RegionRecord{D,T}[]
+    for (lower, upper, sig) in _partition(V.levels, ntuple(identity, Val(D)), zero(SVector{D,T}), tolerance)
+        parents = _parents(V.levels, sig, lower, upper)
+        _criterion_satisfied(parents, length(V.levels), criterion) || continue
+        push!(records, _region_record(V, lower, upper, parents, classify_cache))
+    end
+    physical = V.physical
+    _prefit!(moment_fit_cache, physical, records)
+
+    alpha = physical === nothing ? zero(T) : physical.alpha
+    custom = physical !== nothing && physical.cut_quadrature !== nothing
     domain_volume = volume(V.domain)
-    residual_max = 0.0
-
-    # Find covering parents and apply the keep-criterion before touching the (potentially expensive) quadrature
-    # dispatch, then fit every cut region's rule up front. Both passes leave the region loop below alone: it still walks
-    # the admissible regions in construction order, and every moment fit it asks for is a cache hit. See
-    # `_prefit_cut_rules!`.
-    admissible = Tuple{AxisBox{D,T},Vector{ParentRef{D,T}}}[]
-    for box in _merged_boxes(V.levels, Val(D), tolerance)
-        parents = _parents_covering(V.levels, box, tolerance)
-        # A box no level covers — where every level is inactive — is no region of any plan, whatever the criterion.
-        isempty(parents) && continue
-        _criterion_satisfied(parents, length(V.levels), criterion) && push!(admissible, (box, parents))
-    end
-    _prefit_cut_rules!(moment_fit_cache, V, admissible, classify_cache)
-
-    for (box, parents) in admissible
-        # Dispatch on PhysicalDomain classification; a `nothing` quadrature signals a strict-α fictitious drop.
-        quadrature, residual = _build_region_quadrature(V, box, parents, tensor_cache, alpha_cache, moment_fit_cache,
-                                                        classify_cache)
-        quadrature === nothing && continue
-        residual > residual_max && (residual_max = Float64(residual))
-
-        # Record the region. Small-overlap diagnostics are accumulated rather than acted on: the package exposes the
-        # warning, the caller decides whether to stabilise.
-        region_volume = volume(box)
-        push!(regions, VolumeRegion{D,T}(box, parents, quadrature))
-        if region_volume <= tolerance.small_volume
-            relative_volume = iszero(domain_volume) ? zero(T) : region_volume / domain_volume
-            push!(small_overlaps, SmallOverlap{T}(length(regions), region_volume, relative_volume, length(parents)))
-        end
-    end
-
+    regions, small_overlaps, residual_max = _plan_regions(records, moment_fit_cache, alpha, custom, tolerance,
+                                                          domain_volume)
     min_volume = isempty(regions) ? zero(T) : minimum(volume(region.box) for region in regions)
     min_relative_volume = iszero(domain_volume) ? zero(T) : min_volume / domain_volume
     return IntegrationPlan{D,T}(regions, tolerance, length(small_overlaps), small_overlaps, min_volume,

@@ -5,8 +5,8 @@ using Unfitted: merge_coordinates, box_intersection, locate_cell, CartesianMesh
 
 group = SUITE["microkernels"]["geometry"] = BenchmarkGroup()
 
-# merge_coordinates: three overlapping per-axis coordinate sets, like the input `_axis_intervals` sees from a base + two
-# overlays.
+# merge_coordinates: three overlapping per-axis coordinate sets, like the input `_merged_axis_coordinates` sees from a
+# base + two overlays.
 let
     tol = GeometryTolerance(Float64)
     coords = vcat(collect(0.0:(1/32):1.0), collect(0.2:(1/17):0.8), collect(0.47:(1/11):0.86))

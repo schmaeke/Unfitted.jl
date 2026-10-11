@@ -297,11 +297,9 @@ end
 # contribution there is zero anyway, so any rule will do, and the cheap `1` keeps cache pressure low.
 function _transfer_quadrature_counts(source_model::Model{D}, target_model::Model{D}, target_parents,
                                      source_parents) where {D}
-    target_counts = _parent_quadrature_counts(Val(D), target_parents,
-                                              id -> _level_by_id(target_model.problem.space, id))
+    target_counts = _axis_max(_gauss_counts, target_model.problem.space, target_parents)
     source_counts = isempty(source_parents) ? ntuple(_ -> 1, D) :
-                    _parent_quadrature_counts(Val(D), source_parents,
-                                              id -> _level_by_id(source_model.problem.space, id))
+                    _axis_max(_gauss_counts, source_model.problem.space, source_parents)
     return ntuple(d -> max(target_counts[d], source_counts[d]), D)
 end
 
