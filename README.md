@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="resources/logo-dark.svg">
-    <img alt="Unfitted.jl" src="resources/logo.svg" width="440">
+    <img alt="Unfitted.jl" src="resources/logo.svg" width="520">
   </picture>
 </p>
 
