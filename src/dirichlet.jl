@@ -471,18 +471,18 @@ end
 # Build the admissible boundary regions on the facet identified by `sides`.
 #
 # The **partition** is grid-aligned and level-set-blind, and that is the one property to know before using them. No
-# `PhysicalDomain` reaches steps 1–5: step 1 selects levels by comparing mesh edges against the space's `AxisBox`
-# (`_level_side_is_physical`), step 2 partitions over `_side_cells`, step 4 asks `locate_cell` and the `LevelMask`. So a
-# region *is* the whole face of its parent cells — but the **rule** on it is not. Step 6 restricts the level set to the
-# facet's affine slice and integrates `face ∩ Ω`, so a region's weights sum to the measure of the physical part of its
-# face and never to the face's full geometric measure. Every consumer inherits that: the L² Dirichlet mass and
-# right-hand side below, a Neumann / Robin / Nitsche term tagged `on::BoundarySelector`, and `boundary_integral`.
-# `FacetRegion.kind` names which rule the region ended up with, and `cut_facet_region_count` in the assembly diagnostics
-# counts the regions whose kind is not `:full` — exactly the faces part of whose area falls outside Ω. Integration over
-# the immersed boundary itself goes through a `BoundaryMesh` (`surface.jl`), which is cut against the grid in the same
-# spirit. The whole-cell fictitious fold reaches here too, through the mask step 4 reads: a fully fictitious cell is
-# inactive and parents nothing, so a face loses whole cells through the mask and the part of a surviving cell's face
-# that lies outside Ω through the rule.
+# `PhysicalDomain` reaches steps 1–3: step 2 selects levels by comparing mesh edges against the space's `AxisBox`
+# (`_level_side_is_physical`), partitions over `_side_cells` and asks `locate_cell` and the `LevelMask` for every
+# signature. So a region *is* the whole face of its parent cells — but the **rule** on it is not. Step 4 restricts the
+# level set to the facet's affine slice and integrates `face ∩ Ω`, so a region's weights sum to the measure of the
+# physical part of its face and never to the face's full geometric measure. Every consumer inherits that: the L²
+# Dirichlet mass and right-hand side below, a Neumann / Robin / Nitsche term tagged `on::BoundarySelector`, and
+# `boundary_integral`. `FacetRegion.kind` names which rule the region ended up with, and `cut_facet_region_count` in the
+# assembly diagnostics counts the regions whose kind is not `:full` — exactly the faces part of whose area falls outside
+# Ω. Integration over the immersed boundary itself goes through a `BoundaryMesh` (`surface.jl`), which is cut against
+# the grid in the same spirit. The whole-cell fictitious fold reaches here too, through the mask step 2 reads: a fully
+# fictitious cell is inactive and parents nothing, so a face loses whole cells through the mask and the part of a
+# surviving cell's face that lies outside Ω through the rule.
 #
 # Two things the partition's level-set-blindness still costs, and they are the reason the distinction above is worth
 # stating. A region whose face lies wholly outside Ω is **kept**, with an empty rule, because its parents carry trace
