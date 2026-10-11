@@ -214,7 +214,7 @@ end
     @test_throws ArgumentError mesh_levelset(triangle_mesh(v, flipped))          # one facet
     @test_throws ArgumentError mesh_levelset(triangle_mesh(v, [(a, c, b) for (a, b, c) in f]))
     @test_throws ArgumentError mesh_levelset(polyline_mesh(_square_poly(0.2, 0.8)))   # open 2D
-    @test_throws ArgumentError mesh_levelset(polyline_mesh(reverse(_square_poly(0.2, 0.8)); closed=true))              # clockwise
+    @test_throws ArgumentError mesh_levelset(polyline_mesh(reverse(_square_poly(0.2, 0.8)); closed=true))   # clockwise
     # A zero normal normalises to NaN, under which every sign test is false and the whole space reads as inside.
     @test_throws ArgumentError mesh_levelset(triangle_mesh(v, f; normals=[SVector(0.0, 0.0, 0.0) for _ in f]))
     empty_stl = tempname() * ".stl"

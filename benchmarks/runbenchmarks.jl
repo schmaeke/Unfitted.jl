@@ -85,6 +85,7 @@ println("-"^88)
 for (path, trial) in BenchmarkTools.leaves(results)
     name = join(path, " / ")
     m = median(trial)
-    @printf "  %-62s %10s  %10s  allocs=%d\n" name BenchmarkTools.prettytime(m.time) BenchmarkTools.prettymemory(m.memory) m.allocs
+    @printf("  %-62s %10s  %10s  allocs=%d\n", name, BenchmarkTools.prettytime(m.time),
+            BenchmarkTools.prettymemory(m.memory), m.allocs)
 end
 println("-"^88)

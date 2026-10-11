@@ -544,9 +544,8 @@
     function check_laser(output, tol)
         rows = [(unknowns=parse(Int, m.captures[2]), n_h=parse(Int, m.captures[6]), n_p=parse(Int, m.captures[7]),
                  n_rel=parse(Int, m.captures[8]))
-                for m in
-                    eachmatch(r"^\s*([\d.]+)\s*,\s*(\d+),\s*([\d.e+-]+)\s*,\s*([\d.e+-]+)\s*,\s*([\d.e+-]+)\s*,\s*(\d+),\s*(\d+),\s*(\d+)\s*$"m,
-                              output)]
+                for m in eachmatch(Regex(raw"^\s*([\d.]+)\s*,\s*(\d+),\s*([\d.e+-]+)\s*,\s*([\d.e+-]+)\s*," *
+                                         raw"\s*([\d.e+-]+)\s*,\s*(\d+),\s*(\d+),\s*(\d+)\s*$", "m"), output)]
         @test length(rows) ≥ tol.updates
         @test sum(row -> row.n_rel, rows; init=0) > 0
         @test sum(row -> row.n_h, rows; init=0) > 0
@@ -581,9 +580,8 @@
     function check_tanh(output, tol)
         rows = [(unknowns=parse(Int, m.captures[2]), n_h=parse(Int, m.captures[6]), n_p=parse(Int, m.captures[7]),
                  orders=m.captures[8])
-                for m in
-                    eachmatch(r"^\s*(\d+),\s*(\d+),\s*([\d.e+-]+)\s*,\s*([\d.e+-]+)\s*,\s*([\d.e+-]+)\s*,\s*(\d+),\s*(\d+),\s*\[([\d, ]+)\]"m,
-                              output)]
+                for m in eachmatch(Regex(raw"^\s*(\d+),\s*(\d+),\s*([\d.e+-]+)\s*,\s*([\d.e+-]+)\s*," *
+                                         raw"\s*([\d.e+-]+)\s*,\s*(\d+),\s*(\d+),\s*\[([\d, ]+)\]", "m"), output)]
         @test length(rows) == tol.cycles
         @test sum(row -> row.n_h, rows; init=0) > 0
         @test sum(row -> row.n_p, rows; init=0) > 0
@@ -775,9 +773,11 @@
                 block = get(blocks, case.name, nothing)
                 ok = block !== nothing && block.status == "ok"
                 if block === nothing
-                    @error "example never ran (the batch process ended early)" example = case.name batch_finished batch_stderr
+                    @error("example never ran (the batch process ended early)", example = case.name, batch_finished,
+                           batch_stderr)
                 elseif !ok
-                    @error "example did not run to completion" example = case.name status = block.status seconds = block.seconds output = block.output
+                    @error("example did not run to completion", example = case.name, status = block.status,
+                           seconds = block.seconds, output = block.output)
                 end
                 @test ok
                 ok && case.check(block.output, case.tol)

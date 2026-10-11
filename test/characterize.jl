@@ -839,7 +839,8 @@ function main()
                        "over-integration of the cell. lipschitz = 0.0 is also accepted on the " *
                        "tree path where the callable path throws. After the fix the discarding " *
                        "combination must be rejected outright.")
-    let region = box((0.0, 0.0), (1.0, 1.0)), order = (3, 3), phi = x -> 0.16 - hypot(x[1] - 0.25, x[2] - 0.25)   # Ω = outside the disc
+    # Ω = outside the disc
+    let region = box((0.0, 0.0), (1.0, 1.0)), order = (3, 3), phi = x -> 0.16 - hypot(x[1] - 0.25, x[2] - 0.25)
         exact_area = 1 - pi * 0.16^2
 
         report = (tag, domain) -> begin

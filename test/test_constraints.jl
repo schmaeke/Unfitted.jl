@@ -1273,8 +1273,9 @@ end
     cut_keys = only(cut_model.dofs.fields).dofs.raw_keys
     @test cut_report.dirichlet_trace_factors == [:pseudoinverse]
     @test cut_report.unsupported_dirichlet_dof_count == 2
-    @test Set(cut_keys[r.raw] for r in cut_report.unsupported_dirichlet_dofs) == Set(Unfitted.TensorDofKey{2}(1, axes)
-                                                                                     for axes in ((node, Unfitted._axis_dof_key(4, 1)), (node, Unfitted._axis_dof_key(4, 2))))
+    @test (Set(cut_keys[r.raw] for r in cut_report.unsupported_dirichlet_dofs)) ==
+          (Set(Unfitted.TensorDofKey{2}(1, axes)
+               for axes in ((node, Unfitted._axis_dof_key(4, 1)), (node, Unfitted._axis_dof_key(4, 2)))))
 
     # The geometry is not what the list reports on its own: it reports a trace solve, and homogeneous data run none at
     # `prepare` — a per-component zero no more than a scalar one. On the same face, which leaves two dofs per component

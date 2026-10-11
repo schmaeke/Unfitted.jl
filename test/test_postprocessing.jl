@@ -129,7 +129,8 @@ end
     @test boundary_integral(q -> 1.0, model; on=boundary(:all)) ≈ 4.0
     @test boundary_integral(q -> 1.0, model; on=boundary(axis=1, side=:lower)) ≈ 1.0
     @test boundary_integral(q -> 1.0, model; on=boundary(axis=2, side=:upper)) ≈ 1.0
-    @test boundary_integral(q -> 1.0, model; on=boundary((axis=1, side=:lower), (axis=2, side=:lower))) ≈ 1.0  # codim-2 point
+    # codim-2 point
+    @test boundary_integral(q -> 1.0, model; on=boundary((axis=1, side=:lower), (axis=2, side=:lower))) ≈ 1.0
 
     # 3D unit cube: ∫_∂Ω 1 ds == 6 (six unit faces), per-face == 1.
     cube = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))

@@ -52,7 +52,8 @@ end
 
 function QuadField(data::AbstractVector{T}, model::Model) where {T}
     length(data) == nquadpoints(model) ||
-        throw(DimensionMismatch("QuadField data length $(length(data)) does not match nquadpoints(model) = $(nquadpoints(model))"))
+        throw(DimensionMismatch("QuadField data length $(length(data)) does not match " *
+                                "nquadpoints(model) = $(nquadpoints(model))"))
     return QuadField{T}(collect(data), model.version)
 end
 
@@ -112,7 +113,8 @@ function _checked_quadfield(qf::QuadField, model::Model)
                             "model pin 0x$(string(model.version; base=16))); carry it across with " *
                             "`transfer`"))
     length(qf.data) == nquadpoints(model) ||
-        throw(DimensionMismatch("QuadField length $(length(qf.data)) does not match nquadpoints(model) = $(nquadpoints(model))"))
+        throw(DimensionMismatch("QuadField length $(length(qf.data)) does not match " *
+                                "nquadpoints(model) = $(nquadpoints(model))"))
     return qf.data
 end
 

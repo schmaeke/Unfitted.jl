@@ -178,8 +178,9 @@ end
     # A linear field with a non-symmetric Jacobian `A`, reproduced exactly by the order-1 space. `gradient_tensor` must
     # return `A`; the transposed convention differs by `|A[1,2] − A[2,1]| = 2`, so this pins the index order rather than
     # restating the implementation.
-    for (cells, A, b) in (((2, 2), SMatrix{2,2,Float64}(3.0, 7.0, 5.0, 11.0), SVector(0.25, -0.5)),
-                          ((1, 1, 1), SMatrix{3,3,Float64}(1.0, 4.0, 7.0, 2.0, 5.0, 8.0, 3.0, 6.0, 10.0), SVector(0.1, 0.2, 0.3)))
+    cases = (((2, 2), SMatrix{2,2,Float64}(3.0, 7.0, 5.0, 11.0), SVector(0.25, -0.5)),
+             ((1, 1, 1), SMatrix{3,3,Float64}(1.0, 4.0, 7.0, 2.0, 5.0, 8.0, 3.0, 6.0, 10.0), SVector(0.1, 0.2, 0.3)))
+    for (cells, A, b) in cases
         D = length(cells)
         exact(x) = A * SVector{D,Float64}(x) + b
         V = space(box(ntuple(_ -> 0.0, D), ntuple(_ -> 1.0, D)); cells=cells, order=1)

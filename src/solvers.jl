@@ -178,7 +178,8 @@ function solve!(model::Model; linear_solver=nothing, method::Union{Nothing,Symbo
     else
         coefficients = linear_solver(model.matrix, model.rhs)
         length(coefficients) == length(model.rhs) ||
-            throw(DimensionMismatch("linear_solver returned $(length(coefficients)) coefficients; expected $(length(model.rhs))"))
+            throw(DimensionMismatch("linear_solver returned $(length(coefficients)) coefficients; " *
+                                    "expected $(length(model.rhs))"))
     end
 
     residual = norm(model.matrix * coefficients - model.rhs)

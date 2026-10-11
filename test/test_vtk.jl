@@ -264,7 +264,8 @@ end
 
     solution_xml = read(joinpath(dir, "disk_data.vtu"), String)
     points = reshape(_vtu_floats(solution_xml, "Points"), 3, :)
-    @test _vtu_floats(solution_xml, "level_set") ≈ [phi_disk(view(points, :, i)) for i in axes(points, 2)] atol = 1.0e-14
+    @test(_vtu_floats(solution_xml, "level_set") ≈ [phi_disk(view(points, :, i)) for i in axes(points, 2)],
+          atol = 1.0e-14)
 end
 
 @testset "VTK omits level_set when no PhysicalDomain is attached" begin

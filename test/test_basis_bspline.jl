@@ -194,7 +194,9 @@ end
     # And the dilation is what turns a masked region that carries no unknowns into one that does. A 2×2 active block is
     # two cells wide, below the `p + 1` cells a degree-2 support needs, so such a level carries nothing at all; the
     # extension is 6×6 and carries `(6 − 2)² = 16`.
-    free(cells) = Unfitted.active_unknowns(prepare(mass(space(Ω; cells=16, order=2, basis=bspline(), active=cells))).dofs)
+    function free(cells)
+        Unfitted.active_unknowns(prepare(mass(space(Ω; cells=16, order=2, basis=bspline(), active=cells))).dofs)
+    end
     @test free(marked) == 0
     @test free(support_extension(space(Ω; cells=16, order=2, basis=bspline()), marked; level=1)) == 16
     # The dilation clips to the level's own grid rather than widening its box.

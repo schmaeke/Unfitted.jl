@@ -675,7 +675,8 @@ end
     tangent = block(u, u,
                     WeakForm(bilinear=(q, trial) -> (uk=value(q.state, u); gk=field_gradient(q.state, u);
                                                      TestChannels(0.0,
-                                                                  (1 + uk^2) * trial.gradient + 2uk * trial.value * gk))))
+                                                                  (1 + uk^2) * trial.gradient +
+                                                                  (2uk * trial.value * gk)))))
     n = Unfitted.active_unknowns(model.dofs)
     c = [0.5 * sin(3i) for i in 1:n]
 

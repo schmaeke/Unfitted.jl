@@ -153,9 +153,9 @@ function _ladder_counts(base::NTuple{D,Int}, factors::Vector{NTuple{D,Int}}, dom
     for (k, f) in pairs(factors)
         all(isone, f) &&
             throw(ArgumentError("ladder level $k has `splits` of $f, which repeats the grid below it. A level with " *
-                                "the same partition as its parent adds no resolution: covered-mode pruning deduplicates " *
-                                "it away again, and it costs a plan, a dof layout and an assembly pass. Use a " *
-                                "factor above 1 on at least one axis, or reduce `depth`."))
+                                "the same partition as its parent adds no resolution: covered-mode pruning " *
+                                "deduplicates it away again, and it costs a plan, a dof layout and an assembly pass. " *
+                                "Use a factor above 1 on at least one axis, or reduce `depth`."))
         current = ntuple(d -> current[d] * f[d], D)
         for d in 1:D
             h = extent[d] / current[d]

@@ -174,7 +174,8 @@ function transfer(::Solution, ::Model, ::Model; kwargs...)
 end
 
 function transfer(::Solution, ::Model; kwargs...)
-    throw(ArgumentError("transfer requires source and target models; call transfer(solution, source_model, target_model)"))
+    throw(ArgumentError("transfer requires source and target models; " *
+                        "call transfer(solution, source_model, target_model)"))
 end
 
 # ── L² projection ─────────────────────────────────────────────────────────────
@@ -398,14 +399,16 @@ function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_
                 if target_raw == 0
                     backend.strict &&
                         source_free &&
-                        throw(ArgumentError("Rewire: source active dof at key $(source_key) component $c has no target counterpart; pass `Rewire(strict=false)` to skip"))
+                        throw(ArgumentError("Rewire: source active dof at key $(source_key) component $c has no " *
+                                            "target counterpart; pass `Rewire(strict=false)` to skip"))
                     continue
                 end
                 target_active = target_field.dofs.active_component[target_raw, c]
                 if target_active == 0
                     backend.strict &&
                         source_free &&
-                        throw(ArgumentError("Rewire: source active dof at key $(source_key) component $c is constrained in the target"))
+                        throw(ArgumentError("Rewire: source active dof at key $(source_key) component $c is " *
+                                            "constrained in the target"))
                     continue
                 end
                 u = dof_value(source_field, source_coefficients, source_raw, c)

@@ -104,7 +104,8 @@ _, _, _, report_base = solve_and_report(V_base, "Part 1a — B-spline base level
 
 V_nested = overlay(V_base, box((0.25, 0.25), (0.75, 0.75)); cells=16)
 model_nested, solution_nested, u_nested, report_nested = solve_and_report(V_nested,
-                                                                          "Part 1b — a nested B-spline overlay on [¼, ¾]²")
+                                                                          "Part 1b — a nested B-spline overlay " *
+                                                                          "on [¼, ¾]²")
 
 # ── Part 1c: what the deduplication is worth ─────────────────────────────────
 #
