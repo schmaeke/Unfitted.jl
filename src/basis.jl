@@ -47,16 +47,17 @@ A new family `F <: BasisFamily` must provide:
     (`TensorDofKey(level.id, …)`): no key is then shared between two levels,
     which is what lets the dof layer hold each level's raw dofs as one
     contiguous range and run every per-level pass over that range alone.
-  - `instantiate_basis(::F, mesh, order, mode, mask)` — only when the concrete
+  - `instantiate_basis(::F, mesh, order, mode)` — only when the concrete
     family depends on the level's mesh. The `::BasisFamily` default returns the
-    family unchanged; see [`instantiate_basis`](@ref) for the five-argument
-    contract and why the hook exists.
+    family unchanged; see [`instantiate_basis`](@ref) for the contract and why
+    the hook exists.
   - `_supports_cell_order(::F)` — `false` by default, and a *loud* default: a
     non-uniform `order =` on a family that declines it raises rather than being
     silently flattened. Answer `true` only where a per-cell degree names a set of
     functions and the minimum rule has a shared entity to act on, and supply the
     matching `_cell_modes` method (`src/dofs.jl`) in the same change —
-    `_index_admissible` below is the per-axis filter that rule is expressed over,
+    `_index_admissible` below is the per-axis filter that rule is expressed over
+    (it has no `::BasisFamily` default, so the family supplies that method too),
     and `test_cell_order.jl` asserts its monotonicity in the order, which is what
     makes the rule correct.
 
@@ -68,25 +69,32 @@ ones that do not fit: `recommended_quadrature_order` (`order .+ 1`),
 [`basis_values`](@ref) / [`physical_basis_gradients`](@ref), which are built on
 `_fill_factor_tables!` and therefore already serve every family.
 
-Two further defaults are silent rather than fatal, so a new family should decide
-about them deliberately:
+One further default is silent rather than fatal, so a new family should decide
+about it deliberately: the burial hooks of `_coverage_constraints!`
+(`src/dofs.jl`), `_sheds_any` and `_reproduces` above all — `false` by default,
+so on a family that does not opt in the space's leaf semantics stay on and do
+nothing.
+Opting in is not only about shedding dofs: where a covering level's span
+*contains* one of this level's functions, the two are linearly dependent and the
+superposed operator is exactly singular until one of them is eliminated there.
+Both shipped families opt in — integrated Legendre in `src/dofs.jl`, B-splines
+in the extension.
 
-  - `_supports_physical_domain(::F)` — `true` by default, i.e. the family claims
-    it can carry an immersed [`PhysicalDomain`](@ref). Answer `false` when the
-    family's overlay constraints would over-constrain cut-cell modes on
-    fully-fictitious fold faces; [`space`](@ref) / [`overlay`](@ref) then reject
-    the pairing with an `ArgumentError` instead of silently degrading the FCM
-    solution. Both shipped families answer `true`: the fold exemption is the one
-    thing a family must supply, and it is a single test on the inactive
-    neighbour of a face.
-  - `_coverage_constraints!` (`src/dofs.jl`) — the generic method records
-    nothing, so on a family that does not override it the space's leaf
-    semantics stay on and do nothing. Overriding it is not only about
-    shedding dofs: where a covering level's span *contains* one of this level's
-    functions, the two are linearly dependent and the superposed operator is
-    exactly singular until one of them is eliminated here. Both shipped
-    families override it — integrated Legendre in `src/dofs.jl`, B-splines in
-    the extension.
+Nothing gates an immersed [`PhysicalDomain`](@ref) by family, so a family's
+overlay constraints owe it one exemption, on internal faces: a face between an
+active and an inactive cell of the level's own grid, whose inactive cell holds
+no material (`_is_fictitious`, `src/coverage.jl`), has no trace to vanish on,
+and constraining it would over-constrain the adjacent cut cell's modes. It is a
+single test on the inactive neighbour of the face, and both shipped families
+make it (`_has_overlay_constraint` in `src/dofs.jl`; `_active_cell_at_face` in
+the extension, and `_cell_admissible` at `:maximal` continuity). A level's own
+box face follows the box-face rule instead: next to an active cell it is
+constrained unless that side of the level lies on the boundary of the space's
+domain (`_level_side_is_physical`), whatever lies beyond it. That holds for
+integrated Legendre and for B-splines below `:maximal` continuity; the
+`:maximal` B-spline support selection asks the material question past the box
+face too (`_cell_admissible`, case 3), and keeps a function whose support
+reaches beyond an artificial box face only into cells that hold no material.
 
 The integrated Legendre family (this file) and the B-spline extension are the
 two worked examples.
@@ -500,16 +508,6 @@ end
 _supports_cell_order(::BasisFamily) = false
 _supports_cell_order(::IntegratedLegendre) = true
 
-# Whether a basis family supports an immersed `PhysicalDomain` — the α-FCM fold,
-# cut-cell moment-fit quadrature, and the fictitious-fold exemption that keeps a
-# cut cell's boundary modes on its fully-fictitious fold faces. Defaults to
-# `true`, and both shipped families answer it: the exemption is the only piece a
-# family has to get right, and each has it. A family whose constraint generator
-# lacks one must override this to `false` rather than degrade the FCM solution
-# silently. `_check_physical_basis` in `mesh.jl` is the space-construction guard
-# that consults it.
-_supports_physical_domain(::BasisFamily) = true
-
 # How far, in cells, a basis function of this family reaches beyond the cell that
 # generates it — the radius [`support_extension`](@ref) dilates a marked region
 # by, per axis.
@@ -557,19 +555,14 @@ because a 3D face mode with bubble degrees `(3, 2)` passes a per-axis test at
 order 4 while its trunk degree 5 puts it outside the order-4 trunk set. A family
 that adds a mode adds it here and the minimum rule follows.
 
-The `::BasisFamily` default is the per-axis box every tensor-product family
-carries; integrated Legendre adds the trunk-degree filter. `test_cell_order.jl`
-asserts that this predicate agrees with `local_basis_indices` over a range of
-orders, modes and dimensions, that it is monotone in the order for every family
-declaring `_supports_cell_order`, and that the intersection form reproduces the
-componentwise-minimum form cell for cell — the three contracts that keep the two
-layers from drifting.
+Integrated Legendre, the one family declaring `_supports_cell_order`, has the
+only method: the per-axis box, plus the trunk-degree filter under `:trunk`.
+`test_cell_order.jl` asserts that this predicate agrees with
+`local_basis_indices` over a range of orders, modes and dimensions, that it is
+monotone in the order for every family declaring `_supports_cell_order`, and that
+the intersection form reproduces the componentwise-minimum form cell for cell —
+the three contracts that keep the two layers from drifting.
 """
-function _index_admissible(::BasisFamily, order::NTuple{D,Int}, ::Symbol,
-                           id::CartesianIndex{D}) where {D}
-    return all(d -> 0 <= id.I[d] <= order[d], 1:D)
-end
-
 function _index_admissible(::IntegratedLegendre, order::NTuple{D,Int}, mode::Symbol,
                            id::CartesianIndex{D}) where {D}
     all(d -> 0 <= id.I[d] <= order[d], 1:D) || return false

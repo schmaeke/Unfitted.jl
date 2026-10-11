@@ -28,15 +28,16 @@ two mechanisms.
 
 At `continuity = :maximal`, the default, the level keeps exactly the functions
 whose full `(p_d + 1)`-cell support lies inside its admissible region — its
-active cells, the cells a fictitious fold switched off, and everything beyond a
-box face that coincides with the boundary of the space's own domain — that
-face is not artificial, and what lies past it is not part of the discretised
-domain at all. Such a function is already globally
-`C^{p_d − 1}` and identically zero outside its support, so its extension by zero
-is `C^{p_d − 1}` for free, under any mask geometry and with no constraint
-equation anywhere. This is Kraft's hierarchical-spline selection rule stated for
-superposed independent grids; the full statement, its maximality proof and the
-citations are in [`bspline`](@ref).
+active cells, the cells that hold no material (every cell the fictitious fold
+switched off, a user-masked cell lying entirely outside Ω, and a cell past an
+artificial box face lying entirely outside Ω), and everything beyond a box face
+that coincides with the boundary of the space's own domain — that face is not
+artificial, and what lies past it is not part of the discretised domain at all.
+Such a function is already globally `C^{p_d − 1}` and identically zero outside
+its support, so its extension by zero is `C^{p_d − 1}` for free, under any mask
+geometry and with no constraint equation anywhere. This is Kraft's
+hierarchical-spline selection rule stated for superposed independent grids; the
+full statement, its maximality proof and the citations are in [`bspline`](@ref).
 
 At an integer `continuity = m < p_d − 1` the level is instead clamped at its
 artificial faces and the trace and its derivatives `k = 0 … m` are constrained
@@ -88,9 +89,12 @@ global 1D function index via the `_AXIS_BSPLINE` tag.
     / mask face as linear-constraint rows (`_constrain!`), which the
     `_resolve_rows!` overload below turns into pivots. Masked levels of any
     geometry are eliminable either way.
-  - A `_coverage_constraints!` overload. Covered-mode pruning for this family is
-    the dedup and nothing else: a buried function a covering level's span
-    already contains exactly is eliminated, because the two are linearly
+  - The burial hooks of the dof layer's one pruning driver,
+    `_coverage_constraints!`: `_burial_cells`, `_cover_test` with its exact test
+    `_reproduced_by`, `_dedup!`, and the rows of
+    the `_reproduces` trait that have a B-spline side. Covered-mode pruning for this
+    family is the dedup and nothing else: a buried function a covering level's
+    span already contains exactly is eliminated, because the two are linearly
     dependent and the superposition is otherwise singular. Under selection the
     burial test is an *exact* containment rather than a conservative one; see
     [`bspline`](@ref) under "Nested levels". On a clamped level the dedup is a
@@ -102,13 +106,14 @@ global 1D function index via the `_AXIS_BSPLINE` tag.
     `_cascade!` — pivoting on the largest coefficient, dropping terms below a
     relative tolerance, back-substituting each new pivot into the earlier ones —
     which leaves every pivot a depth-one expansion over raws that stay free.
-  - The fictitious-fold exemption, which appears once in each mechanism: a
-    fold-deactivated cell is admissible for the selection rule, and a face whose
-    inactive side is fully fictitious carries no trace to vanish on and emits no
-    constraint, while a user-masked cell or face blocks in both. That one
-    distinction is all the family needs to take the `true` default of
-    `_supports_physical_domain` and carry an immersed [`PhysicalDomain`](@ref),
-    so the finite-cell workflow is open to it.
+  - The material exemption, which appears once in each mechanism: an inactive
+    cell that holds no material (every cell the fictitious fold switched off,
+    and a user-masked cell lying entirely outside Ω) is admissible for the
+    selection rule, and an internal face whose inactive cell holds none
+    carries no trace to vanish on and emits no constraint, while an inactive
+    cell that holds material (a user mask reaching into Ω) blocks in both. That
+    one distinction is all the family needs to carry an immersed
+    [`PhysicalDomain`](@ref), so the finite-cell workflow is open to it.
 
 The hot loops in `src/assembly.jl` and `src/projection.jl` are
 unchanged — they dispatch on `level.basis` (via the `bases` vector of
@@ -121,11 +126,10 @@ using Unfitted
 # installs on an Unfitted function is written `Unfitted.f(...)` at its
 # definition, which needs no import. The list is therefore an honest measure of
 # how far the extension reaches into the package.
-using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, LevelMask, AxisDofKey,
-                TensorDofKey, EliminationLedger, _LevelContext, _eliminate!, _constrain!, _pivot!,
-                cell_indices, is_active, AxisBox, _check_basis_mode, _level_side_is_physical,
-                _tensor_dof_key, _ClassifyCache, _is_fictitious, _nested_over,
-                _reproduced_on_domain, classify_cell
+using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, AxisDofKey, TensorDofKey,
+                EliminationLedger, _LevelContext, _eliminate!, _constrain!, _pivot!, is_active,
+                AxisBox, _check_basis_mode, _level_side_is_physical, _tensor_dof_key, _Fold,
+                _is_fictitious, _is_void
 using StaticArrays: SVector
 using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim
 
@@ -157,11 +161,14 @@ V = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3, basis=bspline())
 
 # What a level contributes, and the one theorem behind it
 
-Write `Â` for the level's **admissible region**: its active cells, plus the
-cells a fictitious fold switched off (nothing is integrated there, so a
-truncation there is invisible on Ω), plus everything beyond a box face that
-coincides with the boundary of the space's own domain (that face is not artificial, so
-nothing has to vanish on it). At `:maximal` the level generates exactly
+Write `Â` for the level's **admissible region**: its active cells, plus every
+cell that holds no material — an inactive cell lying entirely outside Ω, which
+every cell the fictitious fold switched off is and a user-masked cell may be, and
+a cell of the grid continued past an artificial box face lying entirely outside
+Ω (nothing is integrated there, so a truncation there is invisible on Ω) — plus
+everything beyond a box face that coincides with the boundary of the space's own
+domain (that face is not artificial, so nothing has to vanish on it). At
+`:maximal` the level generates exactly
 
     W = span { B_α : supp B_α ⊆ Â }
 
@@ -372,77 +379,19 @@ end
 # is stored rather than what it means.
 _selects_by_support(family::BSplineFamily) = family.continuity == _MAXIMAL_CONTINUITY
 
-# The per-axis smoothness the level actually carries across its artificial
-# boundary, with the `:maximal` sentinel resolved against the degree. Used by
-# the diagnostics-facing accessors and by the validation below; the constraint
-# generator reads `family.continuity` directly because it only runs when the
-# sentinel is absent.
-function _continuity_orders(family::BSplineFamily{D}) where {D}
-    return ntuple(d -> _selects_by_support(family) ? degree(family.spaces[d]) - 1 :
-                       family.continuity, D)
-end
-
-# ── Knot-vector construction ──────────────────────────────────────────────────
-
-# Build a clamped open uniform knot vector for one axis from the mesh's
-# per-axis coordinates and the requested degree `p`. End knots have
-# multiplicity `p + 1` (clamped open knots); every interior knot has
-# multiplicity 1 (max-regularity `C^{p − 1}` continuity across cell
-# boundaries). The resulting knot vector aligns each cell with one span
-# of the resulting `BSplineSpace`, so the per-cell span index in the
-# B-spline parameter coincides with the cell's mesh index.
-#
-# Boundary conditions on the artificial overlay boundary (mesh-edge
-# faces and mask-induced internal faces) are imposed by
-# `_overlay_constraints!` below — by support selection at maximal
-# continuity, by trace-vanishing linear constraints below it — *not*
-# via knot multiplicity. This keeps the basis globally `C^{p − 1}`
-# inside the active region regardless of mask geometry.
-function _open_knot_vector(axis_coords::AbstractVector{T}, p::Integer) where {T<:Real}
-    knots = T[]
-    sizehint!(knots, length(axis_coords) + 2 * p)
-    for _ in 1:(p+1)
-        push!(knots, axis_coords[1])
-    end
-    for i in 2:(length(axis_coords)-1)
-        push!(knots, axis_coords[i])
-    end
-    for _ in 1:(p+1)
-        push!(knots, axis_coords[end])
-    end
-    return KnotVector(knots)
-end
-
-# Build the concrete `BSplineFamily` from a deferred `_BSplineSpec`,
-# the mesh, and the per-axis polynomial degree. Uniform knots only:
-# the cell-to-span map is the identity (`cell_to_span[d][c] = c`),
-# and `dim(spaces[d]) = cells[d] + p[d]`.
-function _materialize(spec::_BSplineSpec, mesh::CartesianMesh{D,T}, p::NTuple{D,Int}) where {D,T}
-    m = spec.continuity
-    spaces = ntuple(D) do d
-        kv = _open_knot_vector(mesh.axes[d], p[d])
-        BSplineSpace{p[d]}(kv)
-    end
-    derivative_spaces = ntuple(d -> BSplineDerivativeSpace{1}(spaces[d]), D)
-    axis_coords = ntuple(d -> copy(mesh.axes[d]), D)
-    cell_to_span = ntuple(D) do d
-        collect(1:mesh.cells[d])  # uniform knots: span = cell index
-    end
-    return BSplineFamily{D,T,typeof(spaces),typeof(derivative_spaces)}(spaces, derivative_spaces,
-                                                                       axis_coords, cell_to_span, m)
-end
-
 # ── Basis instantiation: materialise the deferred spec onto a mesh ────────────
 
-# `instantiate_basis` hook for the deferred `_BSplineSpec`. Invoked by
-# the core `space` / `overlay` / `moved_space` / mask-mutator paths once
-# the level's mesh, order, and mask are known. Validates the request and
+# `instantiate_basis` hook for the deferred `_BSplineSpec`. Invoked when
+# `space` / `overlay` build a level from `bspline(...)`, once the level's
+# mesh and order are known; every later rebuild of the level reaches the
+# `BSplineFamily` method below instead. Validates the request and
 # materialises the concrete `BSplineFamily` from the mesh axes; the spec
 # itself only ever exists between `bspline(...)` and this call, so every
 # downstream method dispatches on the concrete family type.
 #
-# Arbitrary `LevelMask` geometries are accepted under either mechanism: the
-# support-selection rule is a per-function containment test and the
+# The mask is not an argument, because the family does not depend on it:
+# arbitrary `LevelMask` geometries are handled by either mechanism in the dof
+# layer — the support-selection rule is a per-function containment test and the
 # trace-vanishing constraints are assembled face by face, so neither needs the
 # mask to be separable.
 #
@@ -453,8 +402,7 @@ end
 # integer spelling through the cheaper mechanism costs the caller nothing and
 # saves the dof layer a pass.
 function Unfitted.instantiate_basis(spec::_BSplineSpec, mesh::CartesianMesh{D,T},
-                                    order::NTuple{D,Int}, mode::Symbol,
-                                    mask::Union{Nothing,LevelMask{D}}) where {D,T<:Real}
+                                    order::NTuple{D,Int}, mode::Symbol) where {D,T<:Real}
     _check_basis_mode(spec, mode, order)
     all(p -> p >= 1, order) ||
         throw(ArgumentError("bspline order (per-axis polynomial degree) must be ≥ 1"))
@@ -487,20 +435,74 @@ function Unfitted.instantiate_basis(spec::_BSplineSpec, mesh::CartesianMesh{D,T}
     return _materialize(spec, mesh, order)
 end
 
-# Re-instantiate an already-concrete `BSplineFamily` against a
-# (possibly new) mesh. Invoked when an overlay carrying this family is
-# moved — where the per-axis knot vectors must be rebuilt for the new cell
-# coordinates, since reusing the old family would leave stale `axis_coords`
-# / `cell_to_span` — and, for uniformity, when it is re-masked, where the
-# mesh is unchanged and the rebuild reproduces an identical family (the
-# mask never enters a knot vector). Cell counts and order are unchanged in
-# both cases, so the thinness / continuity validation already passed at
-# first construction and is not repeated.
+# Re-instantiate an already-concrete `BSplineFamily` against a (possibly new)
+# mesh and order: every rebuild of a B-spline level after its first construction
+# comes here. A move (`moved_space`) rebuilds the per-axis knot vectors for the new
+# cell coordinates, since reusing the old family would leave stale `axis_coords` /
+# `cell_to_span`. A re-mask, the fold and a level-id reindex keep the mesh and the
+# order, and the rebuild reproduces an equal family (the mask never enters a knot
+# vector). `estimate`'s refinement twin (`_refinement_twin`) passes the family with
+# a mesh refined by an integer factor at the same order, and `elevate`
+# (`_reordered_space`) passes the level's new order. Only the mode check runs: the
+# family keeps the continuity it holds, and neither the continuity / thinness
+# validation nor the normalisation of `m = p − 1` to `:maximal` that the
+# `_BSplineSpec` method applies is repeated — which a refinement cannot invalidate,
+# since it only adds cells, but which a new order from `elevate` is not checked
+# against.
 function Unfitted.instantiate_basis(family::BSplineFamily, mesh::CartesianMesh{D,T},
-                                    order::NTuple{D,Int}, mode::Symbol,
-                                    mask::Union{Nothing,LevelMask{D}}) where {D,T<:Real}
+                                    order::NTuple{D,Int}, mode::Symbol) where {D,T<:Real}
     _check_basis_mode(family, mode, order)
     return _materialize(_BSplineSpec(family.continuity), mesh, order)
+end
+
+# ── Knot-vector construction ──────────────────────────────────────────────────
+
+# Build the concrete `BSplineFamily` from a deferred `_BSplineSpec`,
+# the mesh, and the per-axis polynomial degree. Uniform knots only:
+# the cell-to-span map is the identity (`cell_to_span[d][c] = c`),
+# and `dim(spaces[d]) = cells[d] + p[d]`.
+function _materialize(spec::_BSplineSpec, mesh::CartesianMesh{D,T}, p::NTuple{D,Int}) where {D,T}
+    m = spec.continuity
+    spaces = ntuple(D) do d
+        kv = _open_knot_vector(mesh.axes[d], p[d])
+        BSplineSpace{p[d]}(kv)
+    end
+    derivative_spaces = ntuple(d -> BSplineDerivativeSpace{1}(spaces[d]), D)
+    axis_coords = ntuple(d -> copy(mesh.axes[d]), D)
+    cell_to_span = ntuple(D) do d
+        collect(1:mesh.cells[d])  # uniform knots: span = cell index
+    end
+    return BSplineFamily{D,T,typeof(spaces),typeof(derivative_spaces)}(spaces, derivative_spaces,
+                                                                       axis_coords, cell_to_span, m)
+end
+
+# Build a clamped open uniform knot vector for one axis from the mesh's
+# per-axis coordinates and the requested degree `p`. End knots have
+# multiplicity `p + 1` (clamped open knots); every interior knot has
+# multiplicity 1 (max-regularity `C^{p − 1}` continuity across cell
+# boundaries). The resulting knot vector aligns each cell with one span
+# of the resulting `BSplineSpace`, so the per-cell span index in the
+# B-spline parameter coincides with the cell's mesh index.
+#
+# Boundary conditions on the artificial overlay boundary (mesh-edge
+# faces and mask-induced internal faces) are imposed by
+# `_overlay_constraints!` below — by support selection at maximal
+# continuity, by trace-vanishing linear constraints below it — *not*
+# via knot multiplicity. This keeps the basis globally `C^{p − 1}`
+# inside the active region regardless of mask geometry.
+function _open_knot_vector(axis_coords::AbstractVector{T}, p::Integer) where {T<:Real}
+    knots = T[]
+    sizehint!(knots, length(axis_coords) + 2 * p)
+    for _ in 1:(p+1)
+        push!(knots, axis_coords[1])
+    end
+    for i in 2:(length(axis_coords)-1)
+        push!(knots, axis_coords[i])
+    end
+    for _ in 1:(p+1)
+        push!(knots, axis_coords[end])
+    end
+    return KnotVector(knots)
 end
 
 # ── Basis-interface methods ───────────────────────────────────────────────────
@@ -654,68 +656,74 @@ end
 
 # ── Support selection: the admissible region and the functions inside it ──────
 
-# The cells of `level` over which its functions may live: the active ones, plus
-# the ones a fictitious fold switched off.
+# The cells of a level over which its functions may live — its *admissible region* —
+# are the active ones, plus the inactive ones that hold no material.
 #
-# The two are merged into one `LevelMask` by `_apply_physical_fold` and mean
-# opposite things here. A *user*-masked cell carries material that only the
-# coarser level represents, so a function reaching into it would be truncated at
-# a face where it does not vanish, and the superposition would lose its
-# continuity there. A *fictitious* cell carries no material at all: nothing is
-# integrated there, so the truncated and untruncated functions agree on Ω and the
-# function may stay. That single distinction is the whole of this family's
-# finite-cell compatibility — it is what keeps a cut cell's modes alive instead of
-# constraining them away — and it costs one classification per inactive cell. The
-# fold classifies only the cells that were active before it, so that is a cache hit
-# for a cell the fold switched off and a fresh classification for a user-masked one.
+# A `LevelMask` merges two deactivations (`_apply_physical_fold`), and what decides
+# here is not which one switched a cell off but whether the cell holds material. An
+# inactive cell that does — a user mask reaching into Ω — carries material that only
+# the coarser level represents, so a function reaching into it would be truncated at
+# a face where it does not vanish, and the superposition would lose its continuity
+# there. An inactive cell that holds none — every cell the fictitious fold switched
+# off, and a user mask entirely outside Ω — has nothing integrated over it, so the
+# truncated and untruncated functions agree on Ω and the function may stay. That
+# single distinction is the whole of this family's finite-cell compatibility — it is
+# what keeps a cut cell's modes alive instead of constraining them away.
 #
-# Materialised as a dense `Array{Bool,D}` rather than asked per function because
-# a degree-`p` function's support meets `(p + 1)^D` cells and every cell is
-# asked about by up to `(p + 1)^D` functions; the array turns that
-# `O(raws · (p+1)^D)` classification budget into `O(cells)`.
-function _admissible_cells(level::Level{D,T}, physical, cache::_ClassifyCache{D,T}) where {D,T}
-    admissible = Array{Bool,D}(undef, level.mesh.cells)
-    for ci in cell_indices(level.mesh)
-        admissible[ci] = is_active(level.mask, ci) || _is_fictitious(level, ci, physical, cache)
-    end
-    return admissible
-end
-
-# Everything a level's admissibility question needs, gathered once per level: the
-# per-cell table above, which of the level's box faces are physical, the level's
-# uniform per-axis cell width (for the virtual cells outside the mesh), and the
-# space's physical domain and its classification cache.
+# The region is read lazily, cell by cell, off the build's material oracle
+# (`ctx.fold`): its verdict table for the level answers whether an inactive cell is
+# void, classifying the cell on its first ask and reading the stored verdict on every
+# later one. The table, rather than a fresh classification per ask, because a
+# degree-`p` function's support meets `(p + 1)^D` cells and every cell is asked about
+# by up to `(p + 1)^D` functions. Lazily, rather than as a dense per-level table
+# filled up front, because most inactive cells of a level lie farther than `p` cells
+# from every active one, where no function's support reaches. A dense table asked
+# about all of them for each record — for the selection and again for every burial
+# test that asks this level as a cover — classifying each cell once per build and
+# finding it in the box memo every later time. Measured on an 8² base under five
+# band-shaped overlays around a hole, that was 82 % of the layout and 79 824
+# classifications, against the 1 092 integrated Legendre's coverage asks on the same
+# stack; read lazily, the B-spline layout classifies 5 177 cells.
 #
-# A struct rather than five arguments because both the selection rule and the
-# burial test ask the same question of the same level, and the burial test asks it
-# of a *second* level as well.
-struct _Admissibility{D,T,P,S}
+# The table is the build's one table for the level, shared rather than owned here:
+# the selection, every burial test that builds a record on this level as a cover,
+# the clamped trace faces (`_active_cell_at_face`), the burial's level-side test and
+# the coverage pass all ask the same oracle. A grid cell is therefore classified at
+# most once per layout build, whichever of them asks first, and only if one of them
+# asks at all; a cell the fold already classified costs a lookup in the box memo
+# behind the oracle.
+#
+# Everything a level's admissibility question needs is gathered here once per
+# record: the level, which of its box faces are physical, its uniform per-axis cell
+# width (for the virtual cells outside the mesh), and the oracle, which answers for
+# the level's inactive cells through its verdict table and for those virtual cells
+# through its box memo. A struct rather than five arguments because both the
+# selection rule and the burial test ask the same question of the same level, and
+# the burial test asks it of a *second* level as well.
+struct _Admissibility{D,T,S,F}
     level::Level{D,T,S}
-    cells::Array{Bool,D}
     lower_physical::NTuple{D,Bool}
     upper_physical::NTuple{D,Bool}
     width::NTuple{D,T}
-    physical::P
-    cache::_ClassifyCache{D,T}
+    fold::F
 end
 
 # The admissibility record of `level`, read off the hook context of the level being
 # processed. `level` may be another level of the same space — the burial test builds
 # one for each covering level — because everything it takes from `ctx` (the domain,
-# the physical domain, the tolerance and the classification cache) is space-wide.
-# `ctx.physical` is concretely typed, so `P` is too, and every admissibility query
-# specialises on it.
+# the tolerance and the material oracle) is space-wide. `ctx.fold` is concretely
+# typed, so `F` is too, and every admissibility query specialises on it.
+#
+# Nothing is classified or allocated here: the oracle allocates the level's verdict
+# table on its first miss, so an all-active level (a `nothing` mask), whose cells
+# `_cell_admissible` never asks it about, gets none.
 function _admissibility(level::Level{D,T,S}, ctx::_LevelContext{D,T}) where {D,T,S}
     mesh = level.mesh
     width = ntuple(d -> (mesh.domain.upper[d] - mesh.domain.lower[d]) / mesh.cells[d], D)
-    domain, tol = ctx.space.domain, ctx.tolerance
+    domain, tol, fold = ctx.space.domain, ctx.tolerance, ctx.fold
     lower = ntuple(d -> _level_side_is_physical(level, domain, d, :lower, tol), D)
     upper = ntuple(d -> _level_side_is_physical(level, domain, d, :upper, tol), D)
-    return _Admissibility{D,T,typeof(ctx.physical),S}(level,
-                                                      _admissible_cells(level, ctx.physical,
-                                                                        ctx.classify_cache), lower,
-                                                      upper, width, ctx.physical,
-                                                      ctx.classify_cache)
+    return _Admissibility{D,T,S,typeof(fold)}(level, lower, upper, width, fold)
 end
 
 # `_overlay_constraints!` at `continuity = :maximal`: one strong elimination per
@@ -752,8 +760,8 @@ end
 
 # Whether the tensor B-spline named by `key` may stay: its full, unclipped support
 # must be admissible.
-function _support_admissible(a::_Admissibility{D,T,P,<:BSplineFamily},
-                             key::TensorDofKey{D}) where {D,T,P}
+function _support_admissible(a::_Admissibility{D,T,<:BSplineFamily},
+                             key::TensorDofKey{D}) where {D,T}
     lo, hi = _support_block(a.level.basis, ntuple(d -> key.axes[d].index, D))
     return _block_admissible(a, lo, hi)
 end
@@ -782,8 +790,10 @@ end
 # Three cases, and the third is the one that makes this family work under an
 # immersed geometry:
 #
-#   1. Inside the grid. The precomputed table answers: active, or folded away as
-#      fictitious.
+#   1. Inside the grid: active, or inactive and holding no material. The mask
+#      answers the first half; the second is asked of the build's material oracle
+#      only for an inactive cell, through the level's verdict table (see
+#      `_Admissibility`).
 #   2. Outside the grid across a face that coincides with the space's own
 #      boundary. There is no artificial boundary there and nothing beyond it is
 #      part of the discretised domain, so the question is vacuous and the answer
@@ -793,10 +803,19 @@ end
 #      truncated at that face, so it may stay only if the material beyond carries
 #      nothing: if the cell is fictitious, the truncated and untruncated functions
 #      agree on Ω and the extension is smooth *where it is integrated*. This is the
-#      same fold exemption as case 1's second half, applied past the level's own
-#      box, and without it a level whose face sits in fictitious material loses the
-#      functions that reach ∂Ω — the ones the cut cells there need most.
-function _cell_admissible(a::_Admissibility{D}, c::CartesianIndex{D}) where {D}
+#      same material exemption as case 1's second half, applied past the level's
+#      own box, and without it a level whose face sits in fictitious material loses
+#      the functions that reach ∂Ω — the ones the cut cells there need most.
+#
+# `@inline` because it is the body of `_block_admissible`'s per-cell loop, which every
+# function's selection and every burial test runs over `(p + 1)^D` cells or more.
+# Reading the mask and then the verdict table made it too large for the compiler to
+# inline on its own, and a call per cell cost more than laziness saves on a small
+# stack. Measured as the minimum of 400 `system_layout` builds of a 16² p3 plate
+# around a hole under a nested 24² overlay: 0.38 ms with the call, 0.28 ms inlined,
+# which is what the dense table took; and on the five-overlay band stack 4.3 ms with
+# the call against 3.1 ms inlined.
+@inline function _cell_admissible(a::_Admissibility{D}, c::CartesianIndex{D}) where {D}
     n = a.level.mesh.cells
     inside = true
     for d in 1:D
@@ -808,9 +827,8 @@ function _cell_admissible(a::_Admissibility{D}, c::CartesianIndex{D}) where {D}
             inside = false
         end
     end
-    inside && return a.cells[c]
-    a.physical === nothing && return false
-    return classify_cell(a.physical, _virtual_cell_box(a, c), a.cache) === :fictitious
+    inside && return is_active(a.level.mask, c) || _is_void(a.fold, a.level, c)
+    return _is_void(a.fold, _virtual_cell_box(a, c))
 end
 
 # The box of cell `c` of the level's grid, for a `c` that may lie outside
@@ -879,9 +897,9 @@ function Unfitted._overlay_constraints!(ledger::EliminationLedger,
     # The clamped path does not walk `ctx.raws`: the trace generator walks the
     # mesh face/perp grids and looks raws up through `ctx.raw_by_key`, and every
     # key it builds carries `level.id`, so its rows name only this level's raws.
-    # `ctx.classify_cache` goes to `_active_cell_at_face`, which reads it to tell
-    # a fictitious fold face from a user-mask face; with no physical domain it
-    # is never touched.
+    # `ctx.fold` goes to `_active_cell_at_face`, which asks it whether the inactive
+    # side of an internal face holds material; with no physical domain it classifies
+    # nothing.
     family = level.basis
     m = family.continuity
     n_cells = level.mesh.cells
@@ -916,8 +934,7 @@ function Unfitted._overlay_constraints!(ledger::EliminationLedger,
             coeffs_lower, coeffs_upper = _trace_coeffs(P_d, lower_span, upper_span, t_star, Val(m))
 
             for perp_cell in perp_cells
-                located = _active_cell_at_face(level, d, j, perp_cell, n_cells, Val(D),
-                                               ctx.physical, ctx.classify_cache)
+                located = _active_cell_at_face(level, d, j, perp_cell, n_cells, Val(D), ctx.fold)
                 located === nothing && continue
                 active_cell, span = located
                 coeffs_for_span = span == lower_span ? coeffs_lower : coeffs_upper
@@ -970,19 +987,20 @@ end
 # internal faces, it's "the two adjacent cells differ in activity".
 #
 # With one exemption, and it is what lets this family carry an immersed
-# `PhysicalDomain`. A `LevelMask` merges two deactivations that mean opposite
-# things: a *user-masked* cell holds material only the coarser level represents,
-# so the face between it and the active side is a real artificial boundary and
-# the trace must vanish there; a *fictitious* cell holds no material at all, so
-# there is no trace to vanish on, and constraining it would delete the cut cell's
-# boundary modes — the very over-constraint the FCM solution must not suffer.
+# `PhysicalDomain`. What decides an internal face is whether its inactive cell
+# holds material, not which deactivation switched it off: an inactive cell that
+# does — a user mask reaching into Ω — holds material only the coarser level
+# represents, so the face between it and the active side is a real artificial
+# boundary and the trace must vanish there; one that holds none — every cell the
+# fictitious fold switched off, and a user mask entirely outside Ω — leaves no
+# trace to vanish on, and constraining it would delete the cut cell's boundary
+# modes — the very over-constraint the FCM solution must not suffer.
 # `_has_overlay_constraint` in `src/dofs.jl` draws the same line for the
-# integrated-Legendre family, and both read it from `_is_fictitious` in
-# `src/coverage.jl`. With `physical === nothing` there is no fold and `cache` is
-# never touched.
+# integrated-Legendre family, and both ask it of `_is_fictitious`
+# (`src/coverage.jl`) on the build's material oracle `fold`. With no physical
+# domain every inactive cell holds material and nothing is classified.
 function _active_cell_at_face(level::Level{D}, d::Int, j::Int, perp_cell::CartesianIndex{D},
-                              n_cells::NTuple{D,Int}, ::Val{D}, physical,
-                              cache::_ClassifyCache{D}) where {D}
+                              n_cells::NTuple{D,Int}, ::Val{D}, fold::_Fold{D}) where {D}
     if j == 0 || j == n_cells[d]
         axis_d_idx = j == 0 ? 1 : n_cells[d]
         cell = CartesianIndex(ntuple(e -> e == d ? axis_d_idx : perp_cell[e], D))
@@ -993,14 +1011,15 @@ function _active_cell_at_face(level::Level{D}, d::Int, j::Int, perp_cell::Cartes
     a_j = is_active(level.mask, cell_j)
     a_jp1 = is_active(level.mask, cell_jp1)
     a_j == a_jp1 && return nothing
-    _is_fictitious(level, a_j ? cell_jp1 : cell_j, physical, cache) && return nothing
+    _is_fictitious(fold, level, a_j ? cell_jp1 : cell_j) && return nothing
     return a_j ? (cell_j, j) : (cell_jp1, j + 1)
 end
 
 # ── Covered-mode pruning: dedup of what a covering level already contains ─────
 
-# `_coverage_constraints!` for a B-spline level — the dedup half only, and it is
-# the whole of covered-mode pruning for this family.
+# This family's side of the dof layer's one pruning driver, `_coverage_constraints!`
+# (`src/dofs.jl`, whose docstring states the hooks' contract) — the dedup half only, and
+# it is the whole of covered-mode pruning for this family.
 #
 # Integrated Legendre splits into a linear skeleton plus bubble modes, so it can
 # shed the bubbles of a covered cell on their own and trade accuracy for dofs. A
@@ -1012,7 +1031,9 @@ end
 # therefore unconditional here as everywhere: the only stack that keeps both
 # copies is the unreduced twin `prepare(problem; prune = false)` builds, which
 # opts out of the repair along with the reduction, exactly as it does for
-# integrated Legendre.
+# integrated Legendre. The family sheds nothing, so it keeps the driver's `_sheds_any`
+# / `_sheds` defaults, and a level that no cover above may dedup (`_reproduces`,
+# `_nested_over`) is done before a candidate is looked at.
 #
 # This is also the coarse half of the hierarchical selection rule: what it
 # removes is exactly `{β : supp β ⊆ Ω^{k}}`, the functions Kraft's construction
@@ -1020,112 +1041,9 @@ end
 # Speleers, Comput. Aided Geom. Design 29 (2012) 485–498, Definition 1(I)). The
 # fine half is the support selection in `_selection_constraints!`; together they
 # are the hierarchical spline basis, stated for superposed independent grids.
-function Unfitted._coverage_constraints!(ledger::EliminationLedger,
-                                         level::Level{D,T,<:BSplineFamily},
-                                         ctx::_LevelContext{D,T}) where {D,T}
-    cov = ctx.coverage.covered[level.id]
-    any(cov) || return ledger
-    family = level.basis
-    n = level.mesh.cells
-    p = ntuple(d -> degree(family.spaces[d]), D)
-    physical, tol, cache = ctx.physical, ctx.tolerance, ctx.classify_cache
-    above = [k
-             for k in ctx.space.levels
-             if k.id > level.id && _reproduces(k, p) && _nested_over(level, k, tol)]
-    isempty(above) && return ledger
-    # One reproduction predicate per covering level, chosen by what that cover
-    # actually is. A cover that selects by support answers the question *exactly*,
-    # by walking the subdivision and asking whether every fine function in it
-    # survived its own selection; it therefore needs that cover's admissibility
-    # record, built once per cover rather than once per buried function. Any other
-    # cover — an integrated-Legendre overlay, or a B-spline level below maximal
-    # continuity — is *clamped* on its artificial boundary, so its span near that
-    # boundary is not described by any statement about supports, and the
-    # conservative geometric predicate `_reproduced_on_domain` is the right one.
-    selecting(k) = k.basis isa BSplineFamily && _selects_by_support(k.basis)
-    # `coverage`'s per-cell verdict is a prefilter for the clamped path only. It
-    # tests the *whole* cell box against the cover's box, which under an immersed
-    # geometry can reject a cell whose material part the cover does reach — the rest
-    # of it being fictitious — and that would silently under-deduplicate. The exact
-    # path needs no prefilter: its first block test fails immediately for a function
-    # nowhere near the cover, which is what keeps the walk off the level's bulk.
-    clamped_only = !any(selecting, above)
-    candidates = Int[]
-    for raw in ctx.raws
-        cells = _support_cells(ctx.raw_keys[raw], family, n)
-        # The level-side half, and it holds for BOTH mechanisms. A *user-masked*
-        # support cell blocks: what a masked level assembles is the function truncated
-        # to its own active cells, which is not the function the cover reproduces. A
-        # *fictitious* one does not: nothing is integrated there, so the truncation is
-        # invisible on Ω. Leaving this to the covering predicate was wrong — the
-        # subdivision walk looks only at the cover — and what it deleted was real
-        # approximation rather than a null mode: measured on a `continuity = 0` base of
-        # 4² masked at one interior cell under a nested maximal-continuity 6² cover, the
-        # pruned space carried 58 unknowns against an unreduced rank of 59.
-        all(ci -> is_active(level.mask, ci) || _is_fictitious(level, ci, physical, cache), cells) ||
-            continue
-        if clamped_only
-            # Buried, and buried as a whole function — but the two halves of "whole"
-            # are not the same test. A *user-masked* support cell blocks: what a masked
-            # level assembles is the function truncated to its own active cells, which
-            # is not the function `k` reproduces. A *fictitious* one does not: nothing
-            # is integrated there, so the truncation is invisible on Ω. It must also
-            # bypass `cov`, which is computed only on the active cells dilated by one
-            # (`_coverage_cells`) — a support cell two cells past the active front holds
-            # the `false` default, not a verdict.
-            all(ci -> !is_active(level.mask, ci) || cov[ci], cells) || continue
-        end
-        push!(candidates, raw)
-    end
-    # The covers are asked one at a time, each about the candidates no earlier cover
-    # reproduced: every candidate meets its covers in `above` order up to the first
-    # that reproduces it, exactly as a per-function loop over the covers would ask
-    # them. The dedups are then recorded in raw order, which is the order the rows of
-    # a clamped level must keep (see `_dedup!`).
-    reproduced = falses(length(candidates))
-    for k in above
-        cover = selecting(k) ? _admissibility(k, ctx) : nothing
-        _mark_reproduced!(reproduced, candidates, level, k, cover, ctx)
-    end
-    for (i, raw) in pairs(candidates)
-        reproduced[i] && _dedup!(ledger, level, raw)
-    end
-    return ledger
-end
-
-# True iff level `k`, standing above a B-spline level of per-axis degree `p`,
-# reproduces that level's buried functions exactly — given the meshes nest, which
-# the caller tests separately with `_nested_over`.
-#
-# A buried function's support lies inside `k`'s active region, and it vanishes
-# there to order `p − 1` (its own end knots are simple), so `k`'s trace conditions
-# — orders `0 … m ≤ p − 1` — never exclude it. What is left is a question about
-# the two spans:
-#
-#   * a B-spline `k` of the *same* degree. Interior knots are simple on both
-#     sides, so `k` is `C^{p−1}` exactly where the buried function kinks and,
-#     under nesting, that function is one of `k`'s own splines. A *higher* degree
-#     does not help — at a shared simple knot `k` would be `C^p`, too smooth to
-#     carry the kink — and a lower one cannot carry the polynomial degree.
-#   * an integrated-Legendre `k` in `:tensor` mode of order ≥ `p`. Its span is
-#     every `C⁰` tensor polynomial of that degree on its cells, which contains a
-#     `C^{p−1}` spline of degree `p`. `:trunk` drops the mixed high-order terms,
-#     so it does not.
-#
-# Every other family answers `false`. That is the safe direction: skipping a
-# legitimate dedup leaves a rank-deficient operator, whereas deduping a function
-# nothing reproduces would delete part of the space.
-function _reproduces(k::Level{D}, p::NTuple{D,Int}) where {D}
-    family = k.basis
-    family isa BSplineFamily && return all(d -> degree(family.spaces[d]) == p[d], 1:D)
-    family isa IntegratedLegendre || return false
-    k.mode === :tensor || return false
-    # `nominal_order(k)` is the level's per-axis maximum, which is not enough when `k` carries
-    # a per-cell order: a single cell below `p` anywhere under the buried function's
-    # support cannot reproduce it. Requiring every palette entry to clear `p` is the
-    # conservative reading — it can only skip a legitimate dedup, never delete a
-    # function nothing reproduces.
-    return all(o -> all(d -> o[d] >= p[d], 1:D), k.orders.palette)
+function Unfitted._burial_cells(level::Level{D,T,<:BSplineFamily},
+                                key::TensorDofKey{D}) where {D,T<:Real}
+    return _support_cells(key, level.basis, level.mesh.cells)
 end
 
 function _support_cells(key::TensorDofKey{D}, family::BSplineFamily{D}, n::NTuple{D,Int}) where {D}
@@ -1141,37 +1059,77 @@ end
 # node / span keys and reports a single cell for any other tag.
 @inline _axis_support(i::Integer, p::Integer, ncells::Integer) = max(1, i-p):min(ncells, i)
 
-# Mark every candidate of `level` that the covering level `k` reproduces and no
-# earlier cover did: by subdivision against `cover`, `k`'s admissibility record, when
-# `k` selects by support, and by `_reproduced_on_domain` when `cover` is `nothing`.
+# The rows of the `_reproduces` trait (`src/dofs.jl`) with a B-spline side.
 #
-# A function of its own, with the cover's record a local of the caller rather than an
-# element of a per-level vector. A `Vector{Union{Nothing, _Admissibility}}` is built by
-# `collect`'s element-type widening, which is compiled for every element type it passes
-# through, and inference reaches it on every B-spline space, including a one-level one
-# whose burial test never runs; and each record read back out of it was re-boxed for
-# the call, 272 bytes per candidate (measured on a 48² degree-3 level under a nested
-# maximal-continuity cover). The barrier also keeps this per-raw loop specialised on
-# `k` and `cover` when the space mixes basis families and `above` is abstractly
-# typed: the call then dispatches once per cover rather than once per raw.
-function _mark_reproduced!(reproduced::BitVector, candidates::Vector{Int},
-                           level::Level{D,T,<:BSplineFamily}, k::Level{D,T}, cover,
-                           ctx::_LevelContext{D,T}) where {D,T}
-    family, n = level.basis, level.mesh.cells
-    for (i, raw) in pairs(candidates)
-        reproduced[i] && continue
-        key = ctx.raw_keys[raw]
-        reproduced[i] = cover === nothing ?
-                        _reproduced_on_domain(level, k, _support_cells(key, family, n),
-                                              ctx.physical, ctx.tolerance, ctx.classify_cache) :
-                        _reproduced_by_selection(level, key, cover)
-    end
-    return reproduced
+# Above a B-spline level of per-axis degree `p`, given the meshes nest: a buried
+# function's support lies inside `k`'s active region, and it vanishes there to order
+# `p − 1` (its own end knots are simple), so `k`'s trace conditions — orders
+# `0 … m ≤ p − 1` — never exclude it. What is left is a question about the two spans:
+#
+#   * a B-spline `k` of the *same* degree. Interior knots are simple on both sides,
+#     so `k` is `C^{p−1}` exactly where the buried function kinks and, under nesting,
+#     that function is one of `k`'s own splines. A *higher* degree does not help — at a
+#     shared simple knot `k` would be `C^p`, too smooth to carry the kink — and a lower
+#     one cannot carry the polynomial degree.
+#   * an integrated-Legendre `k` in `:tensor` mode of order ≥ `p`. Its span is every
+#     `C⁰` tensor polynomial of that degree on its cells, which contains a `C^{p−1}`
+#     spline of degree `p`. `:trunk` drops the mixed high-order terms, so it does not.
+#
+# Every other family answers `false` (the trait's default). That is the safe direction:
+# skipping a legitimate dedup leaves a rank-deficient operator, whereas deduping a
+# function nothing reproduces would delete part of the space.
+function Unfitted._reproduces(k::Level{D,T,<:BSplineFamily},
+                              level::Level{D,T,<:BSplineFamily}) where {D,T<:Real}
+    return all(d -> degree(k.basis.spaces[d]) == degree(level.basis.spaces[d]), 1:D)
 end
 
-# True iff the covering level `k` reproduces, on Ω, the function of `level` named
-# by `key` — the burial test in the form support selection makes available, and
-# the one that is **exact** rather than conservative.
+function Unfitted._reproduces(k::Level{D,T,<:IntegratedLegendre},
+                              level::Level{D,T,<:BSplineFamily}) where {D,T<:Real}
+    k.mode === :tensor || return false
+    p = ntuple(d -> degree(level.basis.spaces[d]), D)
+    # `nominal_order(k)` is the level's per-axis maximum, which is not enough when `k` carries
+    # a per-cell order: a single cell below `p` anywhere under the buried function's
+    # support cannot reproduce it. Requiring every palette entry to clear `p` is the
+    # conservative reading — it can only skip a legitimate dedup, never delete a
+    # function nothing reproduces.
+    return all(o -> all(d -> o[d] >= p[d], 1:D), k.orders.palette)
+end
+
+# The reverse direction: whether a B-spline `k`, standing above an integrated-Legendre
+# level, spans that level's C⁰ hats and may therefore deduplicate them. At degree 1 the
+# open knot vector is the Q1 hat basis outright — simple interior knots give exactly C⁰,
+# the clamped ends give the two boundary hats — so on a nested mesh the buried hat is
+# one of `k`'s own functions. Any axis at degree ≥ 2 is C^(p−1) with p − 1 ≥ 1 at a
+# simple interior knot, too smooth to carry the kink, and the whole tensor product goes
+# with it. Answering per axis rather than per level is what makes this a mixed-family
+# question: a degree-1 B-spline cover over an integrated-Legendre base is the C⁰ hat
+# space and was previously refused the dedup by a family type test, leaving the stack
+# exactly singular.
+function Unfitted._reproduces(k::Level{D,T,<:BSplineFamily},
+                              ::Level{D,T,<:IntegratedLegendre}) where {D,T<:Real}
+    return all(d -> degree(k.basis.spaces[d]) == 1, 1:D)
+end
+
+# One reproduction test per covering level, chosen by what that cover actually is. A
+# cover that selects by support answers the question *exactly*, by walking the
+# subdivision and asking whether every fine function in it survived its own selection;
+# it therefore needs that cover's admissibility record, which the driver asks for once
+# per cover rather than once per buried function. Any other cover — an
+# integrated-Legendre overlay, or a B-spline level below maximal continuity — is
+# *clamped* on its artificial boundary, so its span near that boundary is not described
+# by any statement about supports, and the conservative geometric predicate
+# `_reproduced_on_domain` is the right one: it keeps the driver's `nothing` default,
+# as does every cover of an integrated-Legendre level, a degree-1 selecting one
+# included.
+function Unfitted._cover_test(::Level{D,T,<:BSplineFamily}, k::Level{D,T,<:BSplineFamily},
+                              ctx::_LevelContext{D,T}) where {D,T<:Real}
+    return _selects_by_support(k.basis) ? _admissibility(k, ctx) : nothing
+end
+
+# True iff the covering level `k`, whose admissibility record is `cover`, reproduces
+# on Ω the function of `level` named by `key` — the burial test in the form support
+# selection makes available (the driver's exact test, `_cover_test`), and the one that
+# is **exact** rather than conservative.
 #
 # Subdivision is the whole argument. On nested meshes of equal degree a B-spline
 # of the coarse level is a combination, with strictly positive coefficients, of
@@ -1194,8 +1152,9 @@ end
 # statement about supports describes, and it can reproduce a *combination* of two
 # buried functions without reproducing either — a dependency a per-function dedup
 # cannot see, and one exact null mode per combination in the assembled operator.
-function _reproduced_by_selection(level::Level{D,T,<:BSplineFamily}, key::TensorDofKey{D},
-                                  cover::_Admissibility{D,T,P,<:BSplineFamily}) where {D,T,P}
+function Unfitted._reproduced_by(cover::_Admissibility{D,T,<:BSplineFamily},
+                                 level::Level{D,T,<:BSplineFamily},
+                                 key::TensorDofKey{D}) where {D,T<:Real}
     coarse = level.basis
     index = ntuple(d -> key.axes[d].index, D)
     clo, chi = _support_block(coarse, index)
@@ -1223,7 +1182,7 @@ end
 # stated in the *coarse* level's cells, into the fine cell block the subdivision
 # lives on.
 #
-# The meshes nest (the caller has already asked `_nested_over`), so every
+# The meshes nest (the driver has already asked `_nested_over`), so every
 # coordinate involved lands on one of `k`'s knot lines and the division is exact
 # up to floating point; rounding to the nearest integer is therefore the right
 # reading rather than a tolerance choice, and it extends past `k`'s own box
@@ -1243,8 +1202,8 @@ end
 # credited to `:overlay`, and its dedup row collapses to `0 = 0`. Eliminating it
 # directly instead would remove it *before* the trace rows are resolved and change
 # which raws they pivot (see `EliminationLedger`).
-function _dedup!(ledger::EliminationLedger{T}, level::Level{D,T,<:BSplineFamily},
-                 raw::Int) where {D,T}
+function Unfitted._dedup!(ledger::EliminationLedger{T}, level::Level{D,T,<:BSplineFamily},
+                          raw::Int) where {D,T<:Real}
     _selects_by_support(level.basis) && return _eliminate!(ledger, raw, :dedup)
     return _constrain!(ledger, [raw], [one(T)], :dedup)
 end
@@ -1461,18 +1420,6 @@ function _register_mentions!(mentions::Vector{Vector{Int}}, offset::Int, raw::In
 end
 
 # ── Family traits ─────────────────────────────────────────────────────────────
-
-# The reverse direction of `_reproduces`: whether *this* family, standing above an
-# integrated-Legendre level, spans that level's C⁰ hats and may therefore deduplicate
-# them. At degree 1 the open knot vector is the Q1 hat basis outright — simple interior
-# knots give exactly C⁰, the clamped ends give the two boundary hats — so on a nested
-# mesh the buried hat is one of this level's own functions. Any axis at degree ≥ 2 is
-# C^(p−1) with p − 1 ≥ 1 at a simple interior knot, too smooth to carry the kink, and
-# the whole tensor product goes with it. Answering per axis rather than per level is
-# what makes this a mixed-family question: a degree-1 B-spline cover over an
-# integrated-Legendre base is the C⁰ hat space and was previously refused the dedup by a
-# family type test, leaving the stack exactly singular.
-Unfitted._spans_hats(f::BSplineFamily{D}) where {D} = all(d -> degree(f.spaces[d]) == 1, 1:D)
 
 # A degree-`p_d` B-spline spans `p_d + 1` cells along axis `d`, so a marked region
 # has to be dilated by `p_d` cells per side before the level carries the functions

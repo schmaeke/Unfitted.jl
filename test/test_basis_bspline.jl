@@ -7,9 +7,9 @@ using LinearAlgebra: Symmetric, eigvals, isposdef, norm, pinv, rank
 # and add B-spline-specific tests for the dof-key sharing and mask
 # handling.
 #
-# Several testsets below reuse `_gram` / `_proj_residual` and the `_one` / `_x1` /
-# `_INT_*` constants from `test_coverage_reduction.jl`, which `runtests.jl`
-# includes first; this file does not stand alone.
+# Several testsets below reuse `_gram` / `_proj_residual` / `_void_by_classifier` and
+# the `_one` / `_x1` / `_INT_*` constants from `test_coverage_reduction.jl`, which
+# `runtests.jl` includes first; this file does not stand alone.
 
 # The extension module, for the internals it alone defines: the cascade resolver
 # of linear-constraint rows (`_cascade!`, `_combine_terms`) lives there, not in
@@ -364,6 +364,116 @@ end
     Vm = space(omega; cells=8, order=2, basis=bspline(), physical=hole, active=mask)
     lm = Unfitted._field_layout(prepare(mass(Vm)).dofs, :u).dofs
     @test count(==(:overlay), lm.elimination_source) > 0
+end
+
+# Whether cell `c` of `level` (which may lie outside the grid) is admissible, stated
+# the way the dense per-level table filled up front stated it, and independently of
+# the lazy record under test: inside the grid, active or else void by the classifier;
+# past a box face on the space's own boundary, admissible; past an artificial face,
+# void by the classifier on the virtual cell the uniform grid continues into.
+function _dense_admissible(V, level, c::CartesianIndex{D}, tol) where {D}
+    mesh, n = level.mesh, level.mesh.cells
+    inside = true
+    for d in 1:D
+        1 <= c[d] <= n[d] && continue
+        side = c[d] < 1 ? :lower : :upper
+        Unfitted._level_side_is_physical(level, V.domain, d, side, tol) && return true
+        inside = false
+    end
+    inside && return Unfitted.is_active(level.mask, c) || _void_by_classifier(V.physical, level, c)
+    width = ntuple(d -> (mesh.domain.upper[d] - mesh.domain.lower[d]) / n[d], D)
+    virtual = box(ntuple(d -> mesh.domain.lower[d] + (c[d] - 1) * width[d], D),
+                  ntuple(d -> mesh.domain.lower[d] + c[d] * width[d], D))
+    return classify_cell(V.physical, virtual) === :fictitious
+end
+
+@testset "BSpline extension: the admissible region is read lazily, with the dense answers" begin
+    # `_cell_admissible` asks whether an inactive grid cell is void through the build's
+    # material oracle — the level's verdict table, which classifies a cell on its first
+    # ask — instead of reading a dense per-level table classified up front. Its answers
+    # must be the dense table's on every cell a function's support can reach, the
+    # level's grid dilated by `p`, whatever the cell is: active, folded, user-masked
+    # over void or over material, past the space's boundary, or past an artificial face
+    # into void or into material. Checked on a selecting stack, whose records the
+    # selection and the burial build, and on a clamped one, whose trace faces and burial
+    # read the same tables, each with and without `keep_fictitious` (where no fold runs
+    # and every inactive cell is the user's).
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    hole(; kw...) = physical_domain(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0,
+                                    subcell_length_scale=1 / 64, max_depth=6, kw...)
+    p = 2
+    # The base and the first overlay each mask one cell entirely inside the hole (void)
+    # and one in the material. The first overlay's x₁ = ½ face is artificial and crosses
+    # the hole, so its virtual cells past it are void near x₂ = ½ and material near
+    # x₂ = 0 and 1. The second overlay lies in the material and keeps a `nothing` mask.
+    basemask = trues(8, 8)
+    basemask[4, 4] = basemask[2, 6] = false
+    overlaymask = trues(8, 16)
+    overlaymask[8, 8] = overlaymask[3, 12] = false
+    function stack(continuity, physical)
+        basis = bspline(; continuity)
+        V = space(omega; cells=8, order=p, basis, physical, active=basemask)
+        V = overlay(V, box((0.0, 0.0), (0.5, 1.0)); cells=(8, 16), order=p, basis,
+                    active=overlaymask)
+        return overlay(V, box((0.0, 0.0), (0.25, 0.25)); cells=(4, 4), order=p, basis)
+    end
+    tol = GeometryTolerance(Float64)
+    for continuity in (:maximal, 0), physical in (hole(), hole(; alpha=1e-3, keep_fictitious=true))
+        # The prepared space and its warm memo, exactly as the layout build gets them.
+        _, spaces, caches = Unfitted._prepare_spaces(mass(stack(continuity, physical)))
+        V, cache = only(spaces), only(caches)
+        masked, unmasked = V.levels[1:2], V.levels[3]
+        @test all(level -> level.mask !== nothing, masked) && unmasked.mask === nothing
+
+        # A layout build classifies through the caller's box memo, so a second build on
+        # the same memo classifies nothing new: every grid cell a verdict table asks
+        # about and every virtual cell past an artificial face is already there. The
+        # first build does classify — the user-masked cells and the virtual cells, which
+        # the fold never asks about.
+        before = length(cache)
+        Unfitted.dof_layout(V; classify_cache=cache)
+        after_first = length(cache)
+        Unfitted.dof_layout(V; classify_cache=cache)
+        @test after_first > before
+        @test length(cache) == after_first
+
+        raw_by_key, raw_keys, _, level_raws = Unfitted._enumerate_raws(V)
+        fold = Unfitted._Fold(V, cache)
+        nocoverage = Unfitted.Coverage{2}(Dict{Int,BitArray{2}}())
+        for level in V.levels
+            ctx = Unfitted._LevelContext(V, fold, tol, nocoverage, raw_keys, raw_by_key,
+                                         level_raws[level.id])
+            a = BSExt._admissibility(level, ctx)
+            # Nothing is classified or allocated to build the record: the oracle's table
+            # for the level — the one every other site of the build asks — does not exist
+            # until the first inactive cell is asked about.
+            @test !isassigned(fold.cells, level.id)
+            grid = CartesianIndices(ntuple(d -> (1-p):(level.mesh.cells[d]+p), 2))
+            dense = Dict(c => _dense_admissible(V, level, c, tol) for c in grid)
+            @test [c for c in grid if BSExt._cell_admissible(a, c) != dense[c]] ==
+                  CartesianIndex{2}[]
+            # The sweep reaches every grid cell, and the record read the oracle's table:
+            # exactly the inactive grid cells hold a verdict there, so only they were ever
+            # looked up, and every one of them was. An all-active level never asks.
+            if level.mask === nothing
+                @test !isassigned(fold.cells, level.id)
+            else
+                @test [!iszero(fold.cells[level.id][c]) for c in cell_indices(level.mesh)] ==
+                      [!Unfitted.is_active(level.mask, c) for c in cell_indices(level.mesh)]
+            end
+            # Non-vacuity on the overlay: every kind of cell is there and answers as its
+            # kind must.
+            if level.id == V.levels[2].id
+                inactive = filter(c -> !Unfitted.is_active(level.mask, c), cell_indices(level.mesh))
+                @test any(c -> dense[c], inactive) && any(c -> !dense[c], inactive)
+                past_face = [c for c in grid if c[1] > level.mesh.cells[1] && 1 <= c[2] <= 16]
+                @test any(c -> dense[c], past_face) && any(c -> !dense[c], past_face)
+                @test all(c -> dense[c], [c for c in grid if c[2] < 1 || c[2] > 16])
+            end
+        end
+        # An all-active level's grid was never classified into a table of its own.
+        @test !isassigned(fold.cells, unmasked.id)
+    end
 end
 
 @testset "BSpline extension: an immersed spline system is Jacobi-conditionable" begin
@@ -974,7 +1084,7 @@ end
     # because `p − 1 = 0` makes the two mechanisms the same rule.
     for (deg, dedup, unknowns) in ((1, 1, 81), (2, 0, 77))
         V = overlay(base(), B; cells=4, order=deg, basis=bspline())
-        @test Unfitted._spans_hats(V.levels[2].basis) == (deg == 1)
+        @test Unfitted._reproduces(V.levels[2], V.levels[1]) == (deg == 1)
         m, l = _gram(V)
         @test count(==(:dedup), l.elimination_source) == dedup
         @test count(==(:coverage), l.elimination_source) == 8
@@ -1015,6 +1125,57 @@ end
         @test count(==(:dedup), l.elimination_source) == expected
         @test rank(Symmetric(Matrix(m.matrix))) == active_unknowns(l)
     end
+end
+
+# The span half of the dedup as two family traits once answered it, written out here so
+# the one trait that replaced them is checked against their definitions: above an
+# integrated-Legendre level whether the cover spans the level's hats (`true` for
+# integrated Legendre in either mode, every axis of degree 1 for a B-spline, `false`
+# otherwise); above a B-spline level of degree `p` whether the cover reproduces degree
+# `p` (the same degree for a B-spline cover, `:tensor` with every palette entry ≥ `p`
+# for an integrated-Legendre one, `false` otherwise).
+function _span_contains_by_definition(k, level)
+    if level.basis isa Unfitted.IntegratedLegendre
+        k.basis isa BSExt.BSplineFamily && return all(d -> degree(k.basis.spaces[d]) == 1, 1:2)
+        return k.basis isa Unfitted.IntegratedLegendre
+    end
+    p = ntuple(d -> degree(level.basis.spaces[d]), 2)
+    k.basis isa BSExt.BSplineFamily && return all(d -> degree(k.basis.spaces[d]) == p[d], 1:2)
+    k.basis isa Unfitted.IntegratedLegendre || return false
+    k.mode === :tensor || return false
+    return all(o -> all(d -> o[d] >= p[d], 1:2), k.orders.palette)
+end
+
+@testset "BSpline extension: the span trait answers both directions, every family pair" begin
+    # `_reproduces(k, level)` — whether the cover `k`'s span contains `level`'s buried
+    # functions — is dispatched on both families. Every ordered pair of the levels below
+    # is asked, in both directions: integrated Legendre in `:tensor` and `:trunk` mode
+    # with uniform and graded orders (palettes above, straddling and below a B-spline's
+    # degree), and B-splines of degree 1, 2, 3 and anisotropic, maximal and clamped.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    graded(lo, hi) = [isodd(i + j) ? lo : hi for i in 1:4, j in 1:4]
+    il(order; mode=:tensor) = space(Ω; cells=4, order=order, mode=mode).levels[1]
+    bs(order; kw...) = space(Ω; cells=4, order=order, basis=bspline(; kw...)).levels[1]
+    levels = [il(1), il(2), il(3), il(4), il(3; mode=:trunk), il(4; mode=:trunk), il(graded(2, 3)),
+              il(graded(3, 4)), il(graded(3, 4); mode=:trunk), il((3, 2)), bs(1), bs(2), bs(3),
+              bs((1, 2)), bs((2, 3)), bs((3, 2)), bs(2; continuity=0), bs(3; continuity=0),
+              bs(3; continuity=1)]
+    for k in levels, level in levels
+        @test Unfitted._reproduces(k, level) == _span_contains_by_definition(k, level)
+    end
+
+    # Spot checks, so the table above is not checked only against itself.
+    @test Unfitted._reproduces(il(1), il(4; mode=:trunk))          # any IL cover spans the hats
+    @test Unfitted._reproduces(bs(1), il(3))                        # a degree-1 cover is the hats
+    @test !Unfitted._reproduces(bs((1, 2)), il(3))                  # … on every axis
+    @test Unfitted._reproduces(il(3), bs(3; continuity=1))          # `:tensor`, order ≥ p
+    @test !Unfitted._reproduces(il(3; mode=:trunk), bs(3))          # `:trunk` drops mixed terms
+    @test !Unfitted._reproduces(il(graded(2, 3)), bs(3))            # one cell below p is enough
+    @test Unfitted._reproduces(il(graded(3, 4)), bs(3))
+    @test !Unfitted._reproduces(il((3, 2)), bs((2, 3)))             # componentwise
+    @test Unfitted._reproduces(bs(2; continuity=0), bs(2))          # equal degree, any continuity
+    @test !Unfitted._reproduces(bs(3), bs(2))                       # too smooth at a shared knot
+    @test !Unfitted._reproduces(bs((3, 2)), bs((2, 3)))
 end
 
 @testset "BSpline extension: nested dedup in 3D" begin

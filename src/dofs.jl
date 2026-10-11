@@ -63,16 +63,16 @@
 # The file is in two parts. The first is family-agnostic: the dof keys and
 # the layout structs; the elimination ledger, the raising `_resolve_rows!`
 # default and the hooks' typed context; steps 1 and 3; the boundary-side
-# geometry shared with `dirichlet.jl`; the generic defaults of the
-# artificial-boundary and pruning hooks; and the accessors. The second,
+# geometry shared with `dirichlet.jl`; the generic default of the
+# artificial-boundary hook, the pruning hook — one burial driver for every
+# family — and its family hooks' defaults; and the accessors. The second,
 # from the "Integrated Legendre family" divider to the end, is that
 # family's side of the dof-layer interface: its key tags and keys, its
 # boundary association, its artificial-boundary predicate, the hp minimum
-# rule, its covered-mode pruning and dedup, and the `_spans_hats` trait.
-# The fallbacks of `_tensor_dof_key` and `_spans_hats` sit beside this
-# family's methods. The B-spline family implements the same hooks in
-# `ext/UnfittedBasicBSplineExt.jl`. The file calls nothing defined in a
-# later file.
+# rule, and its burial hooks (covered-mode pruning and dedup). The fallback
+# of `_tensor_dof_key` sits beside this family's methods. The B-spline
+# family implements the same hooks in `ext/UnfittedBasicBSplineExt.jl`. The
+# file calls nothing defined in a later file.
 
 # ── Dof keys and layout structs ───────────────────────────────────────────────
 
@@ -450,24 +450,26 @@ function _assert_resolved(ledger::EliminationLedger)
 end
 
 # Everything a dof-layer hook may read about the level it is called for: the space,
-# its physical domain and tolerance, the space's cell-classification cache, the
-# coverage masks (empty when the build does not prune), the raw keys and the key → raw
-# map the raw enumeration built (for a family that addresses functions by
-# `(cell, mode)`), and the level's own raws.
+# the build's material oracle (`_Fold` in `coverage.jl`, which answers whether a cell
+# holds material), the tolerance, the coverage masks (empty when the build does not
+# prune), the raw keys and the key → raw map the raw enumeration built (for a family
+# that addresses functions by `(cell, mode)`), and the level's own raws. One oracle
+# serves every level of the build, so a cell is classified at most once per build
+# whichever hook asks.
 #
-# `P` is the CONCRETE type of `V.physical`. `Space.physical` is abstractly typed, so a
-# hook that read it off the space dispatched dynamically on every per-raw predicate
-# call it fed it to. The struct is built from the run-time value of `V.physical`,
-# which gives it the concrete `P` wherever it is built, and the hook it is handed
-# to is the function barrier: the hooks, and every predicate they call, specialise
-# on `P` instead. Measured on the integrated-Legendre artificial-boundary pass over
-# an immersed disc at 128² p2 (29 281 raws): 304 bytes per raw and 1.26 ms with
-# `P = Any`, nothing and 0.24 ms typed.
-struct _LevelContext{D,T,S<:Space{D,T},P}
+# `F` is the CONCRETE type of the oracle, whose own parameter is the run-time type of
+# `V.physical`. `Space.physical` is abstractly typed, so a hook that read it off the
+# space dispatched dynamically on every per-raw predicate call it fed it to. The oracle
+# is built from the run-time value of `V.physical`, which gives it, and this struct, a
+# concrete type wherever they are built, and the hook the context is handed to is the
+# function barrier: the hooks, and every predicate they call, specialise on it instead.
+# Measured on the integrated-Legendre artificial-boundary pass over an immersed disc at
+# 128² p2 (29 281 raws): 304 bytes per raw and 1.26 ms with the physical domain typed
+# `Any`, nothing and 0.24 ms typed.
+struct _LevelContext{D,T,S<:Space{D,T},F<:_Fold{D,T}}
     space::S
-    physical::P
+    fold::F
     tolerance::GeometryTolerance{T}
-    classify_cache::_ClassifyCache{D,T}
     coverage::Coverage{D}
     raw_keys::Vector{TensorDofKey{D}}
     raw_by_key::Dict{TensorDofKey{D},Int}
@@ -487,11 +489,17 @@ end
 # owns this order and the pruning gate (`prune`, `prune_exempt`), so no family
 # re-implements either: a family that forgot the gate would prune the unreduced twin.
 #
-# Each hook call is the function barrier its per-raw loop runs behind. The level's
-# context is built from the run-time value of `V.physical`, so its `P` is concrete
-# (see `_LevelContext`) even though the field is not, and `V.levels` may mix basis
-# families; a hook therefore runs specialised on both, and what dispatches at run
-# time is at most the context's construction and the three calls per level.
+# The material oracle (`_Fold`) is built here, once, over `classify_cache` — the
+# cache `prepare` filled during the fold, or a fresh one for a standalone call — and
+# every consumer of the build reads it: `build_coverage` and every level's context. It
+# lives for this call only.
+#
+# Each hook call is the function barrier its per-raw loop runs behind. The oracle is
+# built from the run-time value of `V.physical`, so its type, and with it the level's
+# context, is concrete (see `_LevelContext`) even though the field is not, and
+# `V.levels` may mix basis families; a hook therefore runs specialised on both, and
+# what dispatches at run time is at most the context's construction and the three
+# calls per level.
 #
 # A topology reads neither a field's components nor its Dirichlet data, so one is
 # the same for every field over the space, and `_system_layout` builds it once per
@@ -500,12 +508,12 @@ function _dof_topology(V::Space{D,T}; tolerance::GeometryTolerance{T}=GeometryTo
                        prune::Bool=true, prune_exempt=(),
                        classify_cache::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T}
     raw_by_key, raw_keys, cell_dofs_by_level, level_raws = _enumerate_raws(V)
-    coverage = prune ? build_coverage(V, tolerance, classify_cache) :
-               Coverage{D}(Dict{Int,BitArray{D}}())
+    fold = _Fold(V, classify_cache)
+    coverage = prune ? build_coverage(V, tolerance, fold) : Coverage{D}(Dict{Int,BitArray{D}}())
     ledger = EliminationLedger{T}(length(raw_keys))
     for level in V.levels
-        ctx = _LevelContext(V, V.physical, tolerance, classify_cache, coverage, raw_keys,
-                            raw_by_key, level_raws[level.id])
+        ctx = _LevelContext(V, fold, tolerance, coverage, raw_keys, raw_by_key,
+                            level_raws[level.id])
         _overlay_constraints!(ledger, level, ctx)
         prune && !(level.id in prune_exempt) && _coverage_constraints!(ledger, level, ctx)
         isempty(ledger.rows) && continue
@@ -634,7 +642,7 @@ function _level_side_is_physical(level::Level{D,T}, domain::AxisBox{D,T}, axis::
     throw(ArgumentError("boundary side must be :lower or :upper"))
 end
 
-# ── The artificial-boundary and pruning hooks ─────────────────────────────────
+# ── The artificial-boundary hook ──────────────────────────────────────────────
 
 """
     _overlay_constraints!(ledger::EliminationLedger, level::Level, ctx::_LevelContext) -> ledger
@@ -650,9 +658,9 @@ structure. Called once per level, before `_coverage_constraints!` (see
 This default walks the level's raws, asks the family's per-raw
 `_has_overlay_constraint` predicate about each, and strongly eliminates every raw
 it accepts with `_eliminate!(ledger, raw, :overlay)`: the regime the integrated
-Legendre family relies on. The predicate consults `ctx.classify_cache`, the
-space's cell-classification cache, only to tell a fully-fictitious fold face from
-a user-mask face; the cache is untouched when the space has no physical domain.
+Legendre family relies on. The predicate consults `ctx.fold`, the build's material
+oracle, only to ask whether the inactive cell across an internal face holds
+material; nothing is classified when the space has no physical domain.
 
 The B-spline family in the extension overrides this default. At `continuity =
 :maximal` its method is a support selection, which again eliminates strongly. At
@@ -670,11 +678,299 @@ function _overlay_constraints!(ledger::EliminationLedger, level::Level{D,T},
     return ledger
 end
 
-# Generic fallback: no covered-mode pruning for a family that has not opted in.
-function _coverage_constraints!(ledger::EliminationLedger, ::Level{D,T},
-                                ::_LevelContext{D,T}) where {D,T}
-    ledger
+# ── The pruning hook: one burial driver ───────────────────────────────────────
+
+"""
+    _coverage_constraints!(ledger::EliminationLedger, level::Level, ctx::_LevelContext) -> ledger
+
+Pruning constraint source, the peer of [`_overlay_constraints!`](@ref) and bound by
+the same contract. Called only under leaf semantics (`dof_layout`'s `prune`, on by
+default) and only on a level outside `prune_exempt`, after the level's
+`_overlay_constraints!`. It is one driver for every family — the *burial test* — and a
+family takes part through the burial hooks below rather than through a method of its
+own. It strongly eliminates
+
+  * every **buried high-order** mode of a family that sheds them (integrated Legendre:
+    at least one bubble axis, every active incident cell covered by and every
+    fictitious one reached by a single finer level) — covered-mode pruning, source
+    `:coverage`; and
+  * every **buried** function a single nested level above whose span contains it
+    reproduces exactly — dedup, source `:dedup`. The cover's mesh must nest over this
+    one (`_nested_over`) and its span must contain the function (`_reproduces`): for
+    integrated Legendre the linear modes, under a cover whose basis spans that mesh's
+    hats; for a B-spline any buried function, under a cover that carries its degree
+    and smoothness.
+
+The linear skeleton is otherwise retained, which is what makes the reduced space
+complete. Each elimination is credited with its source for `constraint_kind` /
+diagnostics, unless the artificial boundary already eliminated the raw: the first
+writer wins (see [`EliminationLedger`](@ref)), so a buried raw on `Γ_o` stays
+credited to `:overlay`.
+
+Both halves ask `_reproduced_on_domain` (`coverage.jl`) of a cover judged
+geometrically, which applies the material rule on the covering level *and* on this
+one — an inactive support cell that holds no material (a folded cell, or a user mask
+entirely outside Ω) carries nothing to reproduce, so it neither has to be covered nor
+may veto the verdict. `ctx.fold` is the material oracle that answers it, the same one
+[`build_coverage`](@ref) used, and its memo holds `build_coverage`'s answers to the
+per-cover coverage question that test asks again. A B-spline level under a cover
+that selects by support is judged exactly instead, by subdivision against the cover's
+own admissible region (see `bspline` in the extension).
+
+The dedup half is not an optimisation: a mode a covering level reproduces exactly is
+linearly dependent on that level's own modes, so leaving both active makes the
+superposed operator exactly singular. The B-spline family takes part for that reason
+and records nothing but dedups — it has no bubble modes to shed. A family that does
+not opt in — that sheds nothing (`_sheds_any`) and has no cover that reproduces its
+functions (`_reproduces`) — records nothing.
+
+The driver runs in three steps, all behind a dispatch barrier (`_bury!`):
+
+  1. The **candidates**, in raw order: the level's functions whose support passes
+     the prefilter of the test that will judge them — every active cell of it
+     covered by some level above, for the geometric test; every inactive cell of
+     it void, for the exact one — each marked as a mode to shed or a function to
+     dedup (`_sheds`).
+  2. One **pass per cover**, in `V.levels` order, over the candidates no earlier cover
+     decided. A shed mode is decided by any cover that reproduces it geometrically, a
+     dedup candidate only by a cover that may dedup it (nested, and spanning it), with
+     that cover's exact test when the family has one (`_cover_test`). A candidate thus
+     meets the covers in order up to the first that decides it, as a per-function
+     loop over the covers would ask them.
+  3. The **record**, in raw order: `:coverage` for a shed mode, the family's `_dedup!`
+     for a deduped function — a direct elimination, or the one-term row a clamped
+     B-spline level resolves among its trace rows.
+
+The family hooks, each defaulting to "takes no part":
+
+  - `_sheds_any(level)` / `_sheds(level, key)` — whether the level has, and the key
+    names, a high-order mode to shed rather than a function to dedup;
+  - `_burial_cells(level, key)` — the cells the function named by `key` lives on;
+  - `_cover_test(level, k, ctx)` — the exact reproduction record of cover `k` for this
+    level's functions, read by `_reproduced_by`, or `nothing` to judge `k`
+    geometrically;
+  - `_dedup!(ledger, level, raw)` — how a dedup is recorded;
+  - `_reproduces(k, level)` — whether `k`'s span contains this level's buried
+    functions on a mesh `k` nests over.
+
+Every hook method over a `Level` carries `{D,T<:Real}` in its signature, as the
+defaults do, so a family method is always more specific than the default rather than
+ambiguous with it.
+"""
+function _coverage_constraints!(ledger::EliminationLedger, level::Level{D,T},
+                                ctx::_LevelContext{D,T}) where {D,T}
+    any(ctx.coverage.covered[level.id]) || return ledger
+    covers = Level[]
+    for k in ctx.space.levels
+        k.id > level.id && push!(covers, k)
+    end
+    # `inferencebarrier` hides the callee from inference: the call is resolved at run
+    # time, on the level's concrete type, so the burial test is inferred and compiled
+    # when a level first reaches it and not before. A level whose coverage flags are all
+    # false — every level of a single-level space — never does, so a build in which
+    # nothing is covered compiles none of it. Hiding the level's type instead is not
+    # enough: `_bury!` is the only method that can match, so inference still descends
+    # into it with the level widened to an abstract `Level` and infers every family's
+    # hooks there — measured on the first `prepare` of an immersed single-level plate,
+    # 146 ms of inference in a `_bury!` that never runs. `Base.inferencebarrier` is a
+    # Base internal, not declared public, and its effect was measured on Julia 1.12: a
+    # Julia that changed it would show here as more compile work, never as another
+    # answer, since the call it wraps is the same either way.
+    Base.inferencebarrier(_bury!)(ledger, level, ctx, covers)
+    return ledger
 end
+
+# The burial test of one level (`_coverage_constraints!`), entered through the dispatch
+# barrier and so specialised on the level's concrete type. `covers` holds the levels
+# above, abstractly typed: each cover's pass is one run-time dispatch, on the cover and
+# its record, and the per-candidate loop inside it runs specialised on them, whatever
+# mix of families the space has. The records are handed to the pass as an argument and
+# never kept in a vector: one read back out of a `Vector{Union{Nothing,
+# _Admissibility}}` was re-boxed for every call, 272 bytes per candidate measured on a
+# 48² degree-3 B-spline level under a nested maximal-continuity cover.
+#
+# `dedups[i]` says whether `covers[i]` may dedup: its span contains this level's buried
+# functions (`_reproduces`) and its mesh nests over this one (`_nested_over`). Only
+# those covers may dedup; any cover may shed. A level that sheds nothing and has no
+# cover to dedup it is done before a candidate is looked at.
+#
+# `geometric` is whether every cover that may dedup is judged geometrically, which picks
+# the candidates' prefilter (`_BurialMarks`): the coverage flags, a fast path for the
+# geometric test only, or else the level side the exact test needs. It is decided before
+# the passes, so a family whose `_cover_test` builds a record builds the first one here
+# only to learn that it is not `nothing`, and that cover's pass builds it again; that
+# record is O(1) to build.
+#
+# Step 3, the record, follows the passes: every decided candidate, in raw order. The
+# geometric and exact tests read the mask and the material oracle with its memo but
+# never the ledger, so recording after the passes is recording as each candidate is
+# decided; raw order is the order a clamped B-spline level's dedup rows must keep (see
+# `_dedup!` in the extension).
+function _bury!(ledger::EliminationLedger, level::Level{D,T}, ctx::_LevelContext{D,T},
+                covers::Vector{Level}) where {D,T<:Real}
+    dedups = falses(length(covers))
+    geometric = true
+    for (i, k) in pairs(covers)
+        dedups[i] = _reproduces(k, level) && _nested_over(level, k, ctx.tolerance)
+        geometric && dedups[i] && (geometric = _cover_test(level, k, ctx) === nothing)
+    end
+    _sheds_any(level) || any(dedups) || return ledger
+    marks = _BurialMarks(level, ctx, geometric)
+    for (k, dedup) in zip(covers, dedups)
+        # A pass that can decide nothing is skipped before the cover's record is built.
+        _decides(marks, dedup) || continue
+        _mark_buried!(marks, level, k, dedup ? _cover_test(level, k, ctx) : nothing, dedup, ctx)
+    end
+    for (i, raw) in enumerate(ctx.raws)
+        marks.done[i] || continue
+        marks.sheds[i] ? _eliminate!(ledger, raw, :coverage) : _dedup!(ledger, level, raw)
+    end
+    return ledger
+end
+
+# The burial test's working set, one bit per raw of the level, in raw order: whether the
+# raw is a candidate, whether it is a mode to shed (`:coverage`) rather than a function
+# to dedup, and whether a cover has decided it yet. Bits over the level's raw range
+# rather than a list of the candidates, so the set costs the same few allocations
+# whatever the number of candidates.
+struct _BurialMarks
+    candidate::BitVector
+    sheds::BitVector
+    done::BitVector
+end
+
+# The candidates of `level` (step 1 of `_coverage_constraints!`): every raw whose
+# support passes the prefilter of the test that will judge it. Each half of "buried as
+# a whole function" belongs to one of the two tests.
+#
+# The coverage half — every active support cell covered by some level above — is the
+# prefilter of the geometric test, used when every cover that may dedup is judged
+# geometrically (`geometric`; always, for an integrated-Legendre level): a cover that
+# reproduces the function covers each active support cell, so the flags turn away only
+# functions no geometric cover could decide. It tests the *whole* cell box against the
+# cover's box, which under an immersed geometry can reject a cell whose material part a
+# cover does reach — the rest of it being fictitious — and for the exact test of a
+# selecting cover that would silently under-deduplicate, so it is not asked when such a
+# cover may dedup. The exact test needs no such prefilter for speed: its block test
+# stops at the first inadmissible cell, which for a function nowhere near the cover is
+# one of the first it asks — what keeps the walk off the level's bulk. The flags are
+# read on the active support cells only, the ones `_coverage_cells` computed: a support
+# cell two cells past the active front holds the `false` default, not a verdict.
+#
+# The level half — every inactive support cell void — is the exact test's. An inactive
+# support cell that holds material (a user mask reaching into Ω) blocks: what a masked
+# level assembles is the function truncated to its own active cells, which is not the
+# function a cover reproduces. One that holds none (a folded cell, or a user mask
+# entirely outside Ω) does not: nothing is integrated there, so the truncation is
+# invisible on Ω. The geometric test asks this itself (`_reproduced_on_domain`,
+# condition 2, the same for every cover), but the exact test of a selecting B-spline
+# cover looks only at the cover, and without the level half it deleted real
+# approximation rather than a null mode: measured on a `continuity = 0` base of 4²
+# masked at one interior cell under a nested maximal-continuity 6² cover, the pruned
+# space carried 58 unknowns against an unreduced rank of 59. Where both tests are in
+# play the level half is asked, and a cover judged geometrically still applies its own
+# condition 2.
+function _BurialMarks(level::Level{D,T}, ctx::_LevelContext{D,T}, geometric::Bool) where {D,T<:Real}
+    cov, n = ctx.coverage.covered[level.id], length(ctx.raws)
+    candidate, sheds = falses(n), falses(n)
+    for (i, raw) in enumerate(ctx.raws)
+        key = ctx.raw_keys[raw]
+        cells = _burial_cells(level, key)
+        buried = geometric ? all(ci -> !is_active(level.mask, ci) || cov[ci], cells) :
+                 all(ci -> is_active(level.mask, ci) || _is_void(ctx.fold, level, ci), cells)
+        buried || continue
+        candidate[i] = true
+        sheds[i] = _sheds(level, key)
+    end
+    return _BurialMarks(candidate, sheds, falses(n))
+end
+
+# Whether a pass over a cover can decide anything: an undecided shed mode, or, when the
+# cover may dedup, any undecided candidate. Its scan of the bits costs what an empty pass
+# does; what skipping buys is the pass's run-time dispatch with its boxed arguments and,
+# for a selecting B-spline cover, the record: measured single-threaded, running every
+# pass added 24 to 55 allocations (10 to 34 KB) to one layout of the ladders and band
+# stacks over an immersed disc and of a depth-5 ladder, with no change in time.
+function _decides(marks::_BurialMarks, dedup::Bool)
+    any(i -> marks.candidate[i] && !marks.done[i] && (dedup || marks.sheds[i]),
+        eachindex(marks.done))
+end
+
+# One cover's pass (step 2 of `_coverage_constraints!`): mark every undecided candidate
+# the cover `k` reproduces. `test` is `k`'s exact record from `_cover_test`, or
+# `nothing` to judge geometrically (`_reproduced_on_domain`); `dedup` whether `k` may
+# dedup at all.
+#
+# A shed mode is judged geometrically by every cover, and the question is the same
+# *single-level* one the dedup asks. A mode whose incident cells are covered by two
+# different levels is reproduced by neither: each of them is clamped to zero on the
+# face they share, so at that seam nothing carries what the elimination removes — the
+# coverage flags say only that *some* level covers each cell, which is why they are a
+# prefilter and not the verdict.
+#
+# The shed deliberately does NOT ask the cover to carry this level's order (nor to
+# nest, nor to span). Shedding a buried high-order mode is not a claim that something
+# reproduces it — that is the dedup's job, for the functions a cover does reproduce.
+# It is what leaf semantics mean: over a region a finer level resolves, a coarse cell's
+# high-order modes buy almost nothing in L² and carry the oscillation, so a high-order
+# base with a low-order fine overlay over a non-smooth feature is exactly the
+# configuration the rule exists to serve. Gating on the cover's order turns leaf
+# semantics off exactly there: measured on a tanh layer with base p = 5 and a p = 2
+# overlay, the gate cut the base's shed modes from 189 to 5 and left far-field
+# oscillation and overshoot bit-identical to switching the rule off (9.37e-3 both),
+# against 9.95e-4 and 7.03e-4 without it.
+function _mark_buried!(marks::_BurialMarks, level::Level{D,T}, k::Level{D,T}, test, dedup::Bool,
+                       ctx::_LevelContext{D,T}) where {D,T<:Real}
+    for (i, raw) in enumerate(ctx.raws)
+        marks.candidate[i] && !marks.done[i] || continue
+        shed = marks.sheds[i]
+        shed || dedup || continue
+        key = ctx.raw_keys[raw]
+        marks.done[i] = if shed || test === nothing
+            _reproduced_on_domain(level, k, _burial_cells(level, key), ctx.tolerance, ctx.fold)
+        else
+            _reproduced_by(test, level, key)
+        end
+    end
+    return marks
+end
+
+# The burial hooks' defaults: a family takes no part until it says so. The
+# integrated-Legendre methods are under the "Integrated Legendre family" divider below,
+# the B-spline ones in the extension. `_burial_cells` and `_reproduced_by` have no
+# default: a family that answers `_sheds_any` or `_reproduces` (or `_cover_test`) with
+# something other than the default supplies them.
+_sheds_any(::Level{D,T}) where {D,T<:Real} = false
+_sheds(::Level{D,T}, ::TensorDofKey{D}) where {D,T<:Real} = false
+function _burial_cells end
+_cover_test(::Level{D,T}, ::Level{D,T}, ::_LevelContext{D,T}) where {D,T<:Real} = nothing
+function _reproduced_by end
+function _dedup!(ledger::EliminationLedger, ::Level{D,T}, raw::Int) where {D,T<:Real}
+    _eliminate!(ledger, raw, :dedup)
+end
+
+# Whether the cover `k`'s span contains `level`'s buried functions, given that `k`'s mesh
+# nests over `level`'s (`_nested_over`, the geometric half, which the driver asks
+# separately). Dispatched on both families, so every pair has exactly one answer:
+#
+#   level \ k             integrated Legendre        B-spline
+#   integrated Legendre   true                       every axis of degree 1
+#   B-spline, degree p    `:tensor`, every palette    the same degree p on
+#                         entry ≥ p componentwise     every axis
+#
+# A buried integrated-Legendre function that a cover may dedup is a C⁰ hat: multilinear
+# on each of `level`'s cells, kinked across every cell boundary. Nesting buys the
+# multilinear half; the kink is the cover basis's half, and neither half is about
+# `level`'s family — a cover that spans the hats dedups them whoever generated them.
+# The B-spline rows are the extension's.
+#
+# The default is `false`, which is the safe direction: skipping a legitimate dedup leaves
+# a duplicate, while deduping against a span that does not contain the function deletes
+# part of the space. It is a trait of the pair rather than a type test on the cover
+# because smoothness is a property of a family's own construction: a maximal-regularity
+# B-spline is C^(p−1) at a simple interior knot, so it carries the hat's kink at degree 1
+# and at no higher degree, which a `k.basis isa IntegratedLegendre` gate cannot say.
+_reproduces(::Level{D,T}, ::Level{D,T}) where {D,T<:Real} = false
 
 # ── DofLayout accessors ───────────────────────────────────────────────────────
 
@@ -1085,21 +1381,22 @@ end
 #     lies on the physical boundary (`_level_side_is_physical`), and the rest
 #     of the face cannot say otherwise;
 #   * on an internal face, a position constrains when the inactive cell
-#     across it is not `_is_fictitious`.
+#     across it holds material (it is not `_is_fictitious`).
 #
-# The second case is the fold exemption. The fictitious fold deactivates
-# fully-fictitious cells, so a fold face sees no material on its inactive
-# side, and its boundary modes stay active. They vanish on every physical
+# The second case is the material exemption. A face whose inactive side holds
+# no material — every cell the fictitious fold switched off, and a user-masked
+# cell lying entirely outside Ω — has nothing on that side to stay continuous
+# with, and its boundary modes stay active. They vanish on every physical
 # face — so they cannot break the C⁰ trace condition the overlay constraint
-# enforces — and instead carry the adjacent cut cell's approximation up to
-# ∂Ω. A cell the *user* masked out still holds material: the modes on its
-# face are non-zero on a physical face and must be eliminated to keep the
-# truncated solution continuous. With no physical domain there is no
-# fictitious material, so every internal active/inactive face constrains
-# (the original overlay/user-mask behaviour) and `ctx.classify_cache` is
-# never touched. The walk stops at the first constraining position, so a
-# fold face classifies its inactive neighbours only until one of them holds
-# material.
+# enforces — and instead carry the adjacent active cell's approximation (a cut
+# cell's, up to ∂Ω, whenever the fold runs). An inactive cell that holds
+# material — a user mask reaching into Ω — is represented by a coarser level
+# only: the modes on its face are non-zero on a physical face and must be
+# eliminated to keep the truncated solution continuous. With no physical
+# domain every inactive cell holds material, so every internal active/inactive
+# face constrains (the original overlay/user-mask behaviour) and `ctx.fold`
+# classifies nothing. The walk stops at the first constraining position, so a
+# face classifies its inactive neighbours only until one of them holds material.
 #
 # This runs once per raw on every layout build, and two measured choices keep
 # it cheap: `@inline`, without which the call stays out of
@@ -1112,7 +1409,7 @@ end
 # Integrated-Legendre-specific, because the incidence rule is. The B-spline
 # family in `ext/UnfittedBasicBSplineExt.jl` does the same job in its own
 # `_overlay_constraints!`, with a support map that spans several cells and
-# the same fold exemption (`_active_cell_at_face`).
+# the same material exemption (`_active_cell_at_face`).
 @inline function _has_overlay_constraint(key::TensorDofKey{D},
                                          level::Level{D,T,<:IntegratedLegendre},
                                          ctx::_LevelContext{D,T}) where {D,T}
@@ -1131,7 +1428,7 @@ end
             end
             across = below_active ? i : i - 1          # the inactive cell's axis position
             inactive = CartesianIndex(ntuple(d -> d == axis ? across : outer[d], D))
-            _is_fictitious(level, inactive, ctx.physical, ctx.classify_cache) || return true
+            _is_fictitious(ctx.fold, level, inactive) || return true
         end
     end
     return false
@@ -1255,8 +1552,8 @@ end
 
 # Integrated Legendre's method of the `_cell_modes` hook whose generic form is in
 # `mesh.jl`. It lives here, with `_entity_carries` and the `TensorDofKey` factors
-# the minimum rule is expressed over, the same way the B-spline family's
-# `_coverage_constraints!` lives in its extension.
+# the minimum rule is expressed over, the same way the B-spline family's burial
+# hooks live in its extension.
 #
 # The per-order index sets are hoisted out of the cell loop: there are only
 # `length(palette)` distinct answers and `local_basis_indices` allocates a fresh
@@ -1305,109 +1602,29 @@ function _entity_carries(basis::BasisFamily, orders::CellOrders{D}, mask, key::T
     return true
 end
 
-# ── Pruning (coverage) constraint source ──────────────────────────────────────
+# ── The burial hooks ──────────────────────────────────────────────────────────
 
-"""
-    _coverage_constraints!(ledger::EliminationLedger, level::Level, ctx::_LevelContext) -> ledger
+# Integrated Legendre's side of the burial driver `_coverage_constraints!` (see its
+# docstring for the hooks' contract): a buried mode with a bubble axis is shed, and a
+# buried linear mode — every factor a node, a C⁰ hat — is deduped by a cover that
+# reproduces it.
+_sheds_any(::Level{D,T,<:IntegratedLegendre}) where {D,T<:Real} = true
 
-Pruning constraint source, the peer of [`_overlay_constraints!`](@ref) and bound by
-the same contract. Called only under leaf semantics (`dof_layout`'s `prune`, on by
-default) and only on a level outside `prune_exempt`, after the level's
-`_overlay_constraints!`. This integrated-Legendre method strongly eliminates
-
-  * every **buried high-order** mode (at least one bubble axis, every active incident
-    cell covered by and every fictitious one reached by a single finer level) —
-    covered-mode pruning, source `:coverage`; and
-  * every **buried linear** mode a single nested level above whose basis spans that
-    mesh's hats reproduces exactly — dedup, source `:dedup`.
-
-The linear skeleton is otherwise retained, which is what makes the reduced space
-complete. Each elimination is credited with its source for `constraint_kind` /
-diagnostics, unless the artificial boundary already eliminated the raw: the first
-writer wins (see [`EliminationLedger`](@ref)), so a buried raw on `Γ_o` stays
-credited to `:overlay`.
-
-Both halves ask `_reproduced_on_domain` (`coverage.jl`), which applies the
-fictitious-fold rule on the covering level *and* on this one — a support cell folded
-away carries nothing to reproduce, so it neither has to be covered nor may veto the
-verdict. `ctx.classify_cache` is the classification that tells a fold from a user
-mask, the same one [`build_coverage`](@ref) used.
-
-The dedup half is not an optimisation: a mode a covering level reproduces exactly is
-linearly dependent on that level's own modes, so leaving both active makes the
-superposed operator exactly singular. The B-spline extension overrides this hook for
-the same reason, and records nothing but dedups — that family has no bubble modes to
-shed. Every other family takes the generic fallback above and records nothing.
-"""
-function _coverage_constraints!(ledger::EliminationLedger, level::Level{D,T,<:IntegratedLegendre},
-                                ctx::_LevelContext{D,T}) where {D,T}
-    cov = ctx.coverage.covered[level.id]
-    any(cov) || return ledger
-    V, tol, n = ctx.space, ctx.tolerance, level.mesh.cells
-    # A buried vertex function is a C⁰ hat: multilinear on each of `level`'s cells,
-    # kinked across every cell boundary. Mesh nesting (`_nested_over`) only buys the
-    # multilinear half; the kink is the cover basis's half, and `_spans_hats` is where
-    # each family answers for it. Both halves are necessary and neither is about this
-    # level's family — a cover that spans the hats deduplicates them whoever generated
-    # them.
-    nested_above = [k
-                    for k in V.levels
-                    if k.id > level.id && _spans_hats(k.basis) && _nested_over(level, k, tol)]
-    reproduces(k, cells) = _reproduced_on_domain(level, k, cells, ctx.physical, tol,
-                                                 ctx.classify_cache)
-    # Covered-mode pruning asks the same *single-level* question the dedup half asks.
-    # `cov[ci]` says only that *some* higher level contains cell `ci`, and a mode
-    # whose incident cells are covered by two different levels is reproduced by
-    # neither: each of them is clamped to zero on the face they share, so at that
-    # seam nothing carries what the elimination removes. Requiring one level to
-    # cover the whole stencil is the same condition the dedup half already
-    # applies, and for the same reason.
-    #
-    # It deliberately does NOT ask the covering level to carry this level's
-    # order. Shedding a buried high-order mode is not a claim that something
-    # reproduces it — that is the dedup half's job, for linear modes. It is the
-    # what leaf semantics mean: over a region a finer level
-    # resolves, a coarse cell's high-order modes buy almost nothing in L² and
-    # carry the oscillation, so a *high-order base with a low-order fine overlay
-    # over a non-smooth feature* is exactly the configuration the rule exists to
-    # serve. Gating on the cover's order turns leaf semantics off exactly there:
-    # measured on a tanh layer with base p = 5 and
-    # a p = 2 overlay, the gate cut the base's shed modes from 189 to 5 and left
-    # far-field oscillation and overshoot bit-identical to switching the rule
-    # off (9.37e-3 both), against 9.95e-4 and 7.03e-4 without it.
-    above = [k for k in V.levels if k.id > level.id]
-    resolves(cells) = any(k -> reproduces(k, cells), above)
-    # The `cov` prefilter is a fast path over the *active* support only, which is both
-    # the set `_coverage_cells` computed and the only set on which a `false` entry is a
-    # verdict rather than a default. An inactive incident cell is settled by
-    # `reproduces`: fictitious and it is skipped, user-masked and it refuses.
-    for raw in ctx.raws
-        key = ctx.raw_keys[raw]
-        cells = _incident_cells(key, n)
-        all(ci -> !is_active(level.mask, ci) || cov[ci], cells) || continue     # buried?
-        if any(a -> a.kind == _AXIS_SPAN, key.axes)                 # high-order → covered-mode pruning
-            resolves(cells) && _eliminate!(ledger, raw, :coverage)
-        elseif any(k -> reproduces(k, cells), nested_above)          # linear reproduced above
-            _eliminate!(ledger, raw, :dedup)
-        end
-    end
-    return ledger
+function _sheds(::Level{D,T,<:IntegratedLegendre}, key::TensorDofKey{D}) where {D,T<:Real}
+    return any(a -> a.kind == _AXIS_SPAN, key.axes)
 end
 
-# Whether a family's span on a mesh contains that mesh's C⁰ multilinear vertex
-# functions — the hats. This is the basis half of the linear dedup in
-# `_coverage_constraints!`; `_nested_over` (`coverage.jl`) is the geometric half, and a
-# cover must pass both before a buried hat of the level below is eliminated.
-#
-# Integrated Legendre qualifies in either mode at any per-cell order ≥ 1: it is exactly
-# C⁰ across a cell boundary, and the two endpoint modes it collapses into one node
-# factor have trunk degree 0, so Q1 is in every cell's index set. The default is `false`,
-# which is the safe direction — skipping a legitimate dedup leaves a duplicate, while
-# deduping against a span that does not contain the hat deletes part of the space.
-#
-# It is a family trait rather than a type test on the cover because smoothness is a
-# property of the family's own construction: a maximal-regularity B-spline is C^(p−1) at
-# a simple interior knot, so it carries the kink at degree 1 and at no higher degree —
-# the extension answers exactly that, and a `k.basis isa IntegratedLegendre` gate cannot.
-_spans_hats(::BasisFamily) = false
-_spans_hats(::IntegratedLegendre) = true
+function _burial_cells(level::Level{D,T,<:IntegratedLegendre},
+                       key::TensorDofKey{D}) where {D,T<:Real}
+    return _incident_cells(key, level.mesh.cells)
+end
+
+# An integrated-Legendre cover spans the hats of any mesh it nests over, in either mode
+# at any per-cell order ≥ 1: it is exactly C⁰ across a cell boundary, and the two
+# endpoint modes it collapses into one node factor have trunk degree 0, so Q1 is in
+# every cell's index set. The other rows of the `_reproduces` table involve a B-spline
+# level and are the extension's.
+function _reproduces(::Level{D,T,<:IntegratedLegendre},
+                     ::Level{D,T,<:IntegratedLegendre}) where {D,T<:Real}
+    true
+end

@@ -217,13 +217,15 @@ as artificial overlay constraints (analogous to faces between the level
 and its physical-domain complement). Span-mode dofs whose support is
 entirely inside inactive cells are not enumerated.
 
-One exception, and it is a physical one: when the inactive side of such a
-face is inactive only because the finite-cell fold found it *fully
-fictitious*, the face carries no physical material and the modes on it stay
-active — they vanish on every physical face anyway and instead carry the
-adjacent cut cell's approximation up to `∂Ω`. A cell the *user* masked out
-is treated as physical and does constrain. See `_has_overlay_constraint`
-in `src/dofs.jl`.
+One exception, and it is a physical one: when the inactive cell across such
+a face holds no material — the classifier finds its box *fully fictitious*,
+entirely outside `Ω` — the face carries no physical material and the modes
+on it stay active: they vanish on every physical face anyway and instead
+carry the adjacent active cell's approximation — a cut cell's, up to `∂Ω`,
+whenever the fold runs. Every cell the finite-cell fold switched off is such
+a cell. A cell the *user* masked out constrains when it holds material,
+which is the case unless it lies entirely outside `Ω` (always, without a
+[`PhysicalDomain`](@ref)). See `_has_overlay_constraint` in `src/dofs.jl`.
 """
 struct LevelMask{D}
     on::BitArray{D}
@@ -392,8 +394,8 @@ end
 # stays the dependency map.
 #
 # A family that declares `_supports_cell_order` supplies its own method where its
-# dof-key incidence machinery lives, exactly as a family supplies its own
-# `_coverage_constraints!`: integrated Legendre's is in `dofs.jl`, next to
+# dof-key incidence machinery lives, exactly as a family supplies its own burial
+# hooks for `_coverage_constraints!`: integrated Legendre's is in `dofs.jl`, next to
 # `_entity_carries` and the `TensorDofKey` factors it is expressed over, and the
 # B-spline family's would live in its extension. A family that has not supplied
 # one may only be handed a single-entry palette, and the refusal below is loud on
@@ -844,7 +846,7 @@ end
 # ── Basis-family hooks ────────────────────────────────────────────────────────
 
 """
-    instantiate_basis(basis, mesh, order, mode, mask) -> BasisFamily
+    instantiate_basis(basis, mesh, order, mode) -> BasisFamily
 
 Finalize a basis family for a concrete level, just before the
 [`Level`](@ref) is built. The default returns `basis` unchanged: most
@@ -868,69 +870,16 @@ copy of an existing one ([`moved_space`](@ref), [`adapt`](@ref), the mask
 mutators, the fictitious fold, level-id reindexing) — so a mesh-dependent
 family is rebuilt whenever the mesh changes (e.g. an overlay move) and is
 validated against the level's `order` and `mode` at construction time.
-`mask` is the normalised [`LevelMask`](@ref) (`nothing` for an all-active
-level); it is passed so a family whose concrete form depends on where the
-active region ends can use it, and the shipped B-spline family — which
-handles arbitrary mask geometry through linear constraints instead —
-accepts every mask.
+The level's activation mask is not an argument: a mask face selects or
+constrains functions in the dof layer rather than changing the family, which is
+how the shipped B-spline family handles every mask geometry.
 """
 function instantiate_basis(basis::BasisFamily, mesh::CartesianMesh{D,T}, order::NTuple{D,Int},
-                           mode::Symbol, mask) where {D,T}
+                           mode::Symbol) where {D,T}
     basis
 end
 
-# Reject a `PhysicalDomain` on a basis family that cannot integrate it yet.
-# The trait it consults, `_supports_physical_domain`, is declared with the rest
-# of the family interface in `basis.jl`; this is the space-construction guard.
-# Called from every space-building entry point once the concrete family exists.
-function _check_physical_basis(family::BasisFamily, physical)
-    physical === nothing ||
-        _supports_physical_domain(family) ||
-        throw(ArgumentError("the $(basis_name(family)) basis family does not yet support an immersed physical " *
-                            "domain (finite-cell method): its overlay constraints would over-constrain cut-cell " *
-                            "modes on fold faces. Use the default integrated-Legendre basis for FCM problems."))
-    return nothing
-end
-
 # ── Space construction ────────────────────────────────────────────────────────
-
-# A brand-new `Level` from a user-facing specification: the normalise → check →
-# instantiate → derive pipeline `space`, `overlay` and `_reordered_space` each
-# used to spell out. `field` is the already-normalised order (a tuple or a
-# per-cell vector) and `mask` the already-normalised activation, because
-# `_reordered_space` reuses the level's stored mask and `_normalize_mask` would
-# copy it for nothing.
-#
-# The step order matters and is not free to rearrange: `instantiate_basis` must
-# run before `_build_cell_orders`, because a deferred family (the B-spline spec)
-# is not a family yet and `_supports_cell_order` has to be asked of the concrete
-# one.
-function _new_level(id::Int, role::Symbol, mesh::CartesianMesh{D,T}, basis, field, mode::Symbol,
-                    mask, physical) where {D,T}
-    family = instantiate_basis(basis, mesh, _nominal_order(field), mode, mask)
-    _check_physical_basis(family, physical)
-    orders = _build_cell_orders(family, field, mesh, mode)
-    return Level{D,T,typeof(family)}(id, role, mesh, family, orders, mode, mask)
-end
-
-# A copy of an existing `Level` with one thing changed, by keyword. Every rebuild
-# in this file is one of these: a move changes the mesh, `activate!` the mask,
-# `_apply_physical_fold` the mask, coupling the id.
-#
-# The family is re-instantiated unconditionally. That is behaviour-preserving
-# rather than merely convenient: `instantiate_basis` consumes the mesh, the
-# nominal order, the mode and the mask, the first two of which are the only ones
-# a family's concrete form can depend on here — integrated Legendre returns
-# itself, and the B-spline hook rebuilds knot vectors from the mesh axes and the
-# degree, with "a mask changes nothing about the knot vectors" stated in the
-# extension. Before this helper the sites disagreed about it — `moved_space` and
-# the mask rebuilds re-instantiated while the fold and the reindex did not — and
-# the disagreement was invisible because the answers coincide.
-function _level(old::Level{D,T}; id=old.id, mesh=old.mesh, orders=old.orders,
-                mask=old.mask) where {D,T}
-    family = instantiate_basis(old.basis, mesh, orders.nominal, old.mode, mask)
-    return Level{D,T,typeof(family)}(id, old.role, mesh, family, orders, old.mode, mask)
-end
 
 """
     space(domain::AxisBox; cells, order=1, basis=IntegratedLegendre(),
@@ -992,10 +941,8 @@ Keyword arguments:
     artificial overlay boundary; see [`LevelMask`](@ref).
   - `physical` — optional [`PhysicalDomain`](@ref) describing an
     immersed `Ω ⊂ domain`. With `nothing` (default) the bounding box is
-    the physical domain. Not every basis family can integrate one: the
-    call raises `ArgumentError` for a family that declares
-    `_supports_physical_domain` false. Both shipped families declare it
-    true.
+    the physical domain. Both shipped basis families support an immersed
+    domain.
 
 # Leaf semantics
 
@@ -1019,7 +966,7 @@ mode be *buried* — every cell it is incident to covered by one finer level:
   * a buried **linear** mode is dropped when one finer level reproduces it
     exactly, which takes both halves of a test: that level's mesh must refine
     this one's (`_nested_over` in `src/coverage.jl`) *and* its basis must span
-    that mesh's hats (`_spans_hats` in `src/dofs.jl`). A buried vertex function
+    that mesh's hats (`_reproduces` in `src/dofs.jl`). A buried vertex function
     is a C⁰ hat, and a basis smoother than C⁰ across its own cell boundaries — a
     B-spline of degree ≥ 2 — carries nothing that reproduces the kink.
 
@@ -1040,9 +987,9 @@ A B-spline level has no bubble/skeleton split and so has only the second
 elimination: a buried function is dropped exactly when a nested level above
 reproduces it, which for that family is not an accuracy trade at all but the
 thing that keeps a nested stack non-singular — see `bspline` in the
-`BasicBSpline` extension. Any further family takes the generic
-`_coverage_constraints!` fallback, which records nothing, so on such a
-space leaf semantics eliminate nothing. See `src/coverage.jl` and
+`BasicBSpline` extension. Any further family takes no part in the burial
+test of `_coverage_constraints!` unless it opts in, so on such a space leaf
+semantics eliminate nothing. See `src/coverage.jl` and
 `_coverage_constraints!` in `src/dofs.jl`;
 `diagnostics(...).reduced_mode_counts` reports the per-level count.
 """
@@ -1050,7 +997,7 @@ function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(),
                mode::Symbol=:tensor, active=nothing, physical=nothing) where {D,T}
     base_mesh = CartesianMesh(domain; cells)
     base_level = _new_level(1, :base, base_mesh, basis, _normalize_order(order, base_mesh), mode,
-                            _normalize_mask(active, base_mesh), physical)
+                            _normalize_mask(active, base_mesh))
     return Space{D,T,Tuple{typeof(base_level)}}(domain, (base_level,), physical)
 end
 
@@ -1099,8 +1046,26 @@ function overlay(V::Space{D,T}, domain::AxisBox{D,T}; cells, order=nominal_order
     overlay_mesh = CartesianMesh(domain; cells)
     level = _new_level(length(V.levels) + 1, :overlay, overlay_mesh, basis,
                        _normalize_order(order, overlay_mesh), mode,
-                       _normalize_mask(active, overlay_mesh), V.physical)
+                       _normalize_mask(active, overlay_mesh))
     return _with_levels(V, (V.levels..., level))
+end
+
+# A brand-new `Level` from a user-facing specification: the normalise → check →
+# instantiate → derive pipeline `space`, `overlay` and `_reordered_space` each
+# used to spell out. `field` is the already-normalised order (a tuple or a
+# per-cell vector) and `mask` the already-normalised activation, because
+# `_reordered_space` reuses the level's stored mask and `_normalize_mask` would
+# copy it for nothing.
+#
+# The step order matters and is not free to rearrange: `instantiate_basis` must
+# run before `_build_cell_orders`, because a deferred family (the B-spline spec)
+# is not a family yet and `_supports_cell_order` has to be asked of the concrete
+# one.
+function _new_level(id::Int, role::Symbol, mesh::CartesianMesh{D,T}, basis, field, mode::Symbol,
+                    mask) where {D,T}
+    family = instantiate_basis(basis, mesh, _nominal_order(field), mode)
+    orders = _build_cell_orders(family, field, mesh, mode)
+    return Level{D,T,typeof(family)}(id, role, mesh, family, orders, mode, mask)
 end
 
 """
@@ -1137,6 +1102,26 @@ end
 function _remasked_space(V::Space, level_index::Integer, mask)
     k = _check_level(V, level_index)
     return _with_level(V, k, _level(V.levels[k]; mask=mask))
+end
+
+# A copy of an existing `Level` with one thing changed, by keyword. Every rebuild
+# in this file is one of these: a move changes the mesh, `activate!` the mask,
+# `_apply_physical_fold` the mask, coupling the id.
+#
+# The family is re-instantiated unconditionally. That is behaviour-preserving
+# rather than merely convenient: `instantiate_basis` consumes the mesh, the
+# nominal order and the mode, the first two of which are the only ones a
+# family's concrete form can depend on — integrated Legendre returns itself, and
+# the B-spline hook rebuilds knot vectors from the mesh axes and the degree — so
+# a rebuild that keeps the mesh and the order, such as a mask update,
+# re-instantiates an equal family (for B-splines the same knot vectors,
+# rebuilt). Before this helper the sites disagreed about it — `moved_space` and
+# the mask rebuilds re-instantiated while the fold and the reindex did not — and
+# the disagreement was invisible because the answers coincide.
+function _level(old::Level{D,T}; id=old.id, mesh=old.mesh, orders=old.orders,
+                mask=old.mask) where {D,T}
+    family = instantiate_basis(old.basis, mesh, orders.nominal, old.mode)
+    return Level{D,T,typeof(family)}(id, old.role, mesh, family, orders, old.mode, mask)
 end
 
 # ── Reading a level ───────────────────────────────────────────────────────────
@@ -1425,8 +1410,7 @@ function _reordered_space(V::Space, level_index::Integer, spec)
     old = V.levels[k]
     field = _normalize_order(_normalize_elevate_spec(V, k, spec), old.mesh)
     return _with_level(V, k,
-                       _new_level(old.id, old.role, old.mesh, old.basis, field, old.mode, old.mask,
-                                  V.physical))
+                       _new_level(old.id, old.role, old.mesh, old.basis, field, old.mode, old.mask))
 end
 
 """
@@ -1515,63 +1499,6 @@ end
 
 # ── Fictitious-cell fold ──────────────────────────────────────────────────────
 
-# Per-cell classification of a level's mesh against `physical`. Returns a
-# `BitArray{D}` marking the cells the classifier reports as fully outside
-# Ω (`:fictitious`). Cells classified as `:full` or `:cut` are kept active:
-# `:cut` cells will get their quadrature replaced by the NNMF moment-fit
-# rule at region-build time (see `intersections.jl`), while `:fictitious`
-# cells are dropped from the dof layout via the fold below — at every α,
-# unless `keep_fictitious` asks for the classic α-FCM fill instead.
-#
-# Only cells the level's own mask already keeps active are classified. The fold
-# below combines the two masks with `active .& .!fictitious` (`_fold_fictitious`),
-# so a cell the user already deactivated stays deactivated whatever the classifier
-# would say about it: `false & x == false`. Leaving `fict` at its `false` default
-# there is therefore bit-identical to classifying it, and the guard turns the pass
-# from O(cells of the level) into O(active cells of the level).
-#
-# That distinction is what makes a deep, sparsely-populated overlay affordable.
-# A refinement level whose grid is Nᴰ cells but which carries a handful of active
-# ones — the normal state of an adaptive front — otherwise pays a full-grid
-# classification sweep every time the mesh is folded, and `classify_cell` is not
-# cheap: it walks a bounded octree whenever the Lipschitz certificate cannot
-# settle the box from its centre sample.
-#
-# The classification verdicts of *inactive* cells are still needed further down
-# the pipeline — `_covered_by_level` in `coverage.jl` and `_has_overlay_constraint`
-# in `dofs.jl` both have to tell a fictitious fold from a user mask — but each asks
-# only about the cells on its own fold/mask boundary, and each goes through the same
-# `cache`. Skipping them here turns those queries from cache hits into cache misses;
-# it does not change a single verdict, because `classify_cell` is a pure function of
-# the box and the geometry.
-function _level_fictitious_cells(level::Level{D,T}, physical::PhysicalDomain,
-                                 cache::_ClassifyCache{D,T}) where {D,T}
-    fict = falses(level.mesh.cells)
-    for ci in cell_indices(level.mesh)
-        is_active(level.mask, ci) || continue
-        if classify_cell(physical, cell_box(level.mesh, ci), cache) === :fictitious
-            fict[ci] = true
-        end
-    end
-    return fict
-end
-
-# Combine the user-supplied mask with the fictitious mask. A cell is
-# deactivated when *either* source asks for it: the user explicitly
-# excluded it via `active=`, or the geometry classifier reports the cell
-# entirely outside Ω. A `nothing` user mask is treated as "all active".
-# The result collapses back to `nothing` when the fold leaves every cell
-# active, preserving the no-mask hot path.
-function _fold_fictitious(::Nothing, fictitious::BitArray{D}) where {D}
-    any(fictitious) || return nothing
-    return LevelMask{D}(.!fictitious)
-end
-
-function _fold_fictitious(user::LevelMask{D}, fictitious::BitArray{D}) where {D}
-    !any(fictitious) && return user
-    return LevelMask{D}(user.on .& .!fictitious)
-end
-
 # Apply the PhysicalDomain fold to `V`. For each level, classifies cells
 # against `V.physical` and merges the resulting fictitious mask into the
 # level's user mask, so cells fully outside Ω are dropped from the dof layout.
@@ -1597,16 +1524,66 @@ function _apply_physical_fold(V::Space{D,T}, cache::_ClassifyCache{D,T}) where {
 
     new_levels = ntuple(length(V.levels)) do i
         level = V.levels[i]
-        fict = _level_fictitious_cells(level, V.physical, cache)
-        any(fict) ? _level(level; mask=_fold_fictitious(level.mask, fict)) : level
+        mask = _folded_mask(level, V.physical, cache)
+        mask === nothing ? level : _level(level; mask)
     end
     return _with_levels(V, new_levels)
 end
 
-# Convenience overload: allocate a one-shot classification cache, fold
-# once, discard. Used by `space(...)` and the activation mutators when
-# nobody is going to reuse the cache.
-_apply_physical_fold(V::Space{D,T}) where {D,T} = _apply_physical_fold(V, _ClassifyCache{D,T}())
+# The fold of one level: its user mask with every cell the classifier reports as
+# fully outside Ω (`:fictitious`) switched off as well, or `nothing` when the
+# classifier reports none. A cell is deactivated when *either* source asks for it:
+# the user explicitly excluded it via `active=`, or it lies entirely outside Ω; a
+# `nothing` user mask is treated as "all active". Cells classified as `:full` or
+# `:cut` stay active: `:cut` cells will get their quadrature replaced by the NNMF
+# moment-fit rule at region-build time (see `intersections.jl`), while
+# `:fictitious` cells are dropped from the dof layout — at every α, unless
+# `keep_fictitious` asks for the classic α-FCM fill instead.
+#
+# Only cells the level's own mask already keeps active are classified: a cell the
+# user already deactivated stays deactivated whatever the classifier would say
+# about it, so skipping it is bit-identical to classifying it, and the guard turns
+# the pass from O(cells of the level) into O(active cells of the level).
+#
+# That distinction is what makes a deep, sparsely-populated overlay affordable.
+# A refinement level whose grid is Nᴰ cells but which carries a handful of active
+# ones — the normal state of an adaptive front — otherwise pays a full-grid
+# classification sweep every time the mesh is folded, and `classify_cell` is not
+# cheap: it walks a bounded octree whenever the Lipschitz certificate cannot
+# settle the box from its centre sample.
+#
+# Whether an *inactive* cell holds material is still needed further down the
+# pipeline — coverage (`_covered_by_level`, `coverage.jl`) and the artificial-face
+# tests of the dof layer (`_has_overlay_constraint`, `dofs.jl`) all ask it — but
+# each asks only about the cells it meets, through the dof layer's material oracle
+# (`_Fold`, `coverage.jl`) over the same `cache`. Skipping them here turns those
+# queries from cache hits into cache misses; it does not change a single verdict,
+# because `classify_cell` is a pure function of the box and the geometry.
+#
+# Returning `nothing` when nothing folds is what lets `_apply_physical_fold` keep
+# such a level as it is, and with it a `nothing` mask — the no-mask hot path.
+#
+# One pass that clears bits of a copy of the mask, rather than classifying into a
+# separate `BitArray` and merging the two by the broadcast `mask.on .& .!fictitious`.
+# The bit reads and writes ride on the classification loop, which visits every cell
+# anyway, so the broadcast's word-at-a-time merge would only add a pass; and the loop
+# is the cheaper form to compile. Measured on the earlier two-pass form, where only
+# the merge was a loop or a broadcast, a fresh process's first `prepare` was 0.3–1 %
+# slower with the broadcast, both on spaces that compile the fold without running it
+# (a two-level overlay, a masked clamped B-spline space) and on an immersed FCM plate;
+# the one-pass form compiles one method fewer than that loop.
+function _folded_mask(level::Level{D,T}, physical::PhysicalDomain,
+                      cache::_ClassifyCache{D,T}) where {D,T}
+    on = level.mask === nothing ? trues(level.mesh.cells) : copy(level.mask.on)
+    folded = false
+    for ci in cell_indices(level.mesh)
+        on[ci] || continue
+        classify_cell(physical, cell_box(level.mesh, ci), cache) === :fictitious || continue
+        on[ci] = false
+        folded = true
+    end
+    return folded ? LevelMask{D}(on) : nothing
+end
 
 # ── Level-id reindexing ───────────────────────────────────────────────────────
 

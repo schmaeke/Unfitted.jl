@@ -145,7 +145,7 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `fcm.jl`          | finite-cell-method cut-cell quadrature: exact moments from `implicit.jl`, non-negative (NNLS) moment fit |
 | `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks (`LevelMask`) and per-cell polynomial order (`CellOrders` / `CellModes`); the `space` / `overlay` / `adapt` / `elevate` verbs |
 | `intersections.jl`| admissible integration regions for non-matching meshes; cut/fictitious region-quadrature dispatch |
-| `coverage.jl`     | per-level covered-cell masks (`Coverage`, `build_coverage`); the mask-aware, fictitious-fold-aware covering rule behind covered-mode pruning |
+| `coverage.jl`     | per-level covered-cell masks (`Coverage`, `build_coverage`); the mask- and material-aware covering rule behind covered-mode pruning; the material oracle (`_Fold`) the dof layer asks whether an inactive cell holds material |
 | `ladder.jl`       | nested refinement ladders: `ladder` declaration, the depth-map form of `adapt` and the `depth_masks` grading behind it, cross-level cell mapping (`overlapping_cells`), the `is_nested` predicate |
 | `dofs.jl`         | dof keys; the per-space dof topology (raw enumeration, the elimination ledger, the pivot table) and per-field numbering and accessors; the integrated-Legendre family's dof hooks (artificial boundary, leaf-semantics pruning, the hp minimum rule) |
 | `dirichlet.jl`    | physical Dirichlet conditions and boundary selectors, per-level physical-Dirichlet detection, codim-K facet regions and quadrature, and the L² boundary projection for nonzero data |
@@ -361,10 +361,11 @@ interface:
   - the dof-layer hooks: `_tensor_dof_key`, `_key_on_level_side`,
     `_overlay_constraints!` (whose default eliminates each raw the per-raw
     `_has_overlay_constraint` predicate accepts) and, for leaf semantics,
-    `_coverage_constraints!` — each reading a typed per-level context and
-    writing into the elimination ledger — plus `_resolve_rows!` if the
-    family records linear-constraint rows (see *Degree-of-freedom
-    enumeration and constraints*).
+    the burial hooks of the one pruning driver `_coverage_constraints!`
+    (`_sheds_any`, `_burial_cells`, `_reproduces`, …) — each reading a
+    typed per-level context and writing into the elimination ledger — plus
+    `_resolve_rows!` if the family records linear-constraint rows (see
+    *Degree-of-freedom enumeration and constraints*).
 
 The integrated Legendre implementation uses 1D hierarchical endpoint and
 interior modes, then builds `D`-dimensional tensor-product bases from
@@ -396,13 +397,15 @@ per-mode, not per-cell: a mode is shed only when *every* cell it is
 incident to is covered, so an edge or face mode straddling the boundary
 of the covered region survives even though its own cell is covered. A
 buried linear mode that a *nested* finer level reproduces exactly is
-deduplicated. Coverage is mask-aware — a user-masked cell blocks
-coverage, a fictitious fold does not.
+deduplicated. Coverage is mask-aware — an inactive cell blocks coverage
+when it holds material (a user-masked cell reaching into Ω), and one that
+holds none (every folded cell, and a user-masked cell lying entirely
+outside Ω) does not.
 
-Covered-mode pruning is a basis-family-specific feature, and
-`_coverage_constraints!` is where a family implements it. The
-`Level{D,T,<:IntegratedLegendre}` method does both eliminations above.
-The B-spline extension overrides the hook too, but only for the dedup:
+Covered-mode pruning is a basis-family-specific feature, run by one
+generic driver, `_coverage_constraints!` in `src/dofs.jl`, through which a
+family takes part by its burial hooks. Integrated Legendre's hooks give
+both eliminations above. The B-spline extension's give only the dedup:
 that family has no bubble/skeleton split, so its one reducible mode is
 the one a covering level reproduces exactly — and eliminating it is not
 an accuracy trade but the thing that keeps a nested B-spline stack
@@ -413,8 +416,8 @@ function the buried one is a combination of survived the cover's own
 support selection, which is necessary as well as sufficient because the
 subdivision coefficients are strictly positive and its representation is
 unique. Any further
-family takes the generic fallback, which records nothing, so on such a
-space leaf semantics eliminate nothing. `prepare(problem;
+family takes no part unless it opts in (`_sheds_any`, `_reproduces`), so on such a space
+leaf semantics eliminate nothing. `prepare(problem;
 prune = false)` is the one way to build a space's unreduced twin; it is
 a diagnostic — exactly singular on a nested stack — rather than a
 discretisation to solve with. See `src/coverage.jl` and
@@ -694,10 +697,12 @@ features evolve.
   - **Dof layer treatment**: a face between an active and an inactive
     cell of the same level is an artificial overlay constraint, analogous
     to a mesh-box-face constraint — unless every inactive cell across it
-    was folded away as fictitious rather than masked by the user, in
-    which case the modes stay free (`_has_overlay_constraint`). A
-    fictitious fold covers; a user mask does not. Span-mode dofs of
-    inactive cells are not enumerated.
+    holds no material (folded away as fictitious, or user-masked but
+    lying entirely outside Ω), in which case the modes stay free
+    (`_has_overlay_constraint`). Coverage asks the same question: an
+    inactive cell that holds no material covers; one that holds material
+    (a user mask reaching into Ω) does not. Span-mode dofs of inactive
+    cells are not enumerated.
 
 All masking lives at cell granularity; sub-cell activation is out of
 scope and would require a different abstraction.
@@ -1439,14 +1444,16 @@ demos.
     side has no active cover is unexercised.
   - Covered-mode pruning: covered high-order modes eliminated and buried
     linear modes deduplicated only under a nested finer level;
-    `reduced_mode_counts` matches the eliminated set. No test in
-    `test_coverage_reduction.jl` builds a masked overlay; the fully
-    deactivated case is pinned indirectly by test_activation.jl's
-    "fully-deactivated overlay equals no overlay", which compares
-    active-unknown counts against an overlay-free space; masked coverage
-    under a ladder — split cover retained, single cover shed, lossless by
-    rank against the unreduced twin — is pinned in `test_ladder.jl`
-    ("covered-mode pruning on a ladder is lossless", with the rank witness).
+    `reduced_mode_counts` matches the eliminated set. The user-masked
+    (`active =`) overlays `test_coverage_reduction.jl` builds check the
+    material oracle and the coverage memo against a direct recomputation,
+    not a pruned space; the fully deactivated case is pinned indirectly by
+    test_activation.jl's "fully-deactivated overlay equals no overlay",
+    which compares active-unknown counts against an overlay-free space;
+    masked coverage under a ladder — split cover retained, single cover
+    shed, lossless by rank against the unreduced twin — is pinned in
+    `test_ladder.jl` ("covered-mode pruning on a ladder is lossless", with
+    the rank witness).
   - Per-cell polynomial order: C⁰ conformity across an order jump, asserted
     as a per-basis-function one-sided trace jump `== 0`; the minimum rule's
     shape, and its set-membership form under `:trunk` where a per-axis
