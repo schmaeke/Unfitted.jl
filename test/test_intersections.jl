@@ -56,6 +56,40 @@ end
     assert_parent_maps(V4, plan4)
 end
 
+@testset "the integration-region criterion: both symbols and a callable" begin
+    # `:any_parent` keeps every region some level covers, `:all_levels` only the overlap of every level, and a callable
+    # receives each region's parent list. `parents -> length(parents) ≥ 2` spells `:all_levels` on a two-level overlay,
+    # so the two must agree region for region — directly, through `prepare`, and after `move!` replays the captured
+    # plan options.
+    base = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2)
+    V = overlay(base, box((0.2, 0.3), (0.6, 0.7)); cells=(2, 2), order=2)
+    both = parents -> length(parents) >= 2
+    boxes(plan) = [region.box for region in plan.regions]
+
+    any_plan = Unfitted.integration_plan(V)
+    all_plan = Unfitted.integration_plan(V; criterion=:all_levels)
+    fn_plan = Unfitted.integration_plan(V; criterion=both)
+    @test sum(Unfitted.volume(b) for b in boxes(any_plan)) ≈ 1.0
+    @test sum(Unfitted.volume(b) for b in boxes(all_plan)) ≈ 0.4 * 0.4
+    @test all(region -> length(region.parents) == 2, all_plan.regions)
+    @test length(all_plan.regions) < length(any_plan.regions)
+    @test boxes(fn_plan) == boxes(all_plan)
+    @test [r.parents for r in fn_plan.regions] == [r.parents for r in all_plan.regions]
+    @test_throws ArgumentError Unfitted.integration_plan(V; criterion=:no_such_rule)
+
+    bc = [dirichlet(0.0; on=boundary(:all))]
+    to = box((0.35, 0.1), (0.75, 0.5))
+    V_end = overlay(base, to; cells=(2, 2), order=2)
+    model_boxes(model) = boxes(only(model.space_plans))
+    direct = prepare(stiffness(V_end; dirichlet=bc); criterion=:all_levels)
+    mover = prepare(stiffness(V; dirichlet=bc); criterion=both)
+    @test model_boxes(mover) == boxes(all_plan)
+    move!(mover; level=2, to)
+    @test mover.plan_options.criterion === both
+    @test model_boxes(mover) == model_boxes(direct)
+    @test diagnostics(mover).integration_regions == diagnostics(direct).integration_regions
+end
+
 # `tolerance.merge` is an absolute length. A mesh whose spacing on some axis falls at or below it would have that axis's
 # own element boundaries collapsed by `merge_coordinates`, leaving integration regions that straddle two cells —
 # silently, since nothing downstream can see it. `integration_plan` rejects the combination instead. The threshold is

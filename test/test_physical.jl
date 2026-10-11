@@ -997,3 +997,142 @@ end
     @test measure(1.0, 0.01) ≈ 1 - π * 0.02^2 rtol = 1.0e-6
     @test all(isapprox(measure(Inf, scale), 1.0; rtol=1.0e-14) for scale in (1.0, 0.1, 0.01))
 end
+
+# ── Plan-level analytic anchors ───────────────────────────────────────────────
+
+# ∫ g over every region of a plan, in physical coordinates: a region's reference point η maps through its own box and
+# its reference weight carries the box Jacobian vol(box) / 2ᴰ — the quantities the assembly loop integrates.
+function _plan_integral(plan, g)
+    total = 0.0
+    for region in plan.regions
+        jacobian = Unfitted.volume(region.box) / 2^length(region.box.lower)
+        for (η, w) in zip(region.quadrature.points, region.quadrature.weights)
+            total += w * jacobian * g(Unfitted.reference_to_physical(region.box, η))
+        end
+    end
+    return total
+end
+
+_ball(c, r) = leaf(x -> sqrt(sum((x[d] - c[d])^2 for d in eachindex(c))) - r; lipschitz=1.0)
+
+# The convex polygon `P` clipped to `{keep(x) ≥ 0}` for an affine `keep` (one Sutherland–Hodgman pass), and to an axis
+# box by four such passes.
+function _clip(P, keep)
+    out = eltype(P)[]
+    for i in eachindex(P)
+        a, b = P[i], P[mod1(i + 1, length(P))]
+        fa, fb = keep(a), keep(b)
+        fa >= 0 && push!(out, a)
+        if (fa > 0 && fb < 0) || (fa < 0 && fb > 0)
+            push!(out, a + fa / (fa - fb) * (b - a))
+        end
+    end
+    return out
+end
+function _clip_to_box(P, lo, hi)
+    foldl((Q, (d, s, c)) -> isempty(Q) ? Q : _clip(Q, x -> s * (x[d] - c)),
+          ((1, 1, lo[1]), (1, -1, hi[1]), (2, 1, lo[2]), (2, -1, hi[2])); init=P)
+end
+function _shoelace(P)
+    sum(P[i][1] * P[mod1(i + 1, length(P))][2] - P[mod1(i + 1, length(P))][1] * P[i][2] for i in eachindex(P);
+        init=0.0) / 2
+end
+
+# ∫ g over a triangle by a collapsed (Duffy) Gauss rule of n² points, exact to degree 2n − 2; over a convex polygon by
+# its fan.
+function _triangle_integral(g, a, b, c; n=8)
+    ξ, ω = Unfitted.gausslegendre(n)
+    total = 0.0
+    for i in 1:n, j in 1:n
+        u = (ξ[i] + 1) / 2
+        v = (ξ[j] + 1) / 2 * (1 - u)
+        total += ω[i] * ω[j] / 4 * (1 - u) * g(a + u * (b - a) + v * (c - a))
+    end
+    return total * abs((b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]))
+end
+_polygon_integral(g, P) = sum(_triangle_integral(g, P[1], P[i], P[i+1]) for i in 2:(length(P)-1); init=0.0)
+
+@testset "integration plans integrate discs, annuli and spheres to their analytic values" begin
+    # End-to-end anchors through `integration_plan`: classification, the partition, the moment fits and the full-cell
+    # tensor rules together. The bounds sit well above the measured errors (disc 1.7e-14 / 1.4e-15, annulus 2.3e-13 /
+    # 6.3e-14, sphere 2.4e-11) and far below any structural failure — a lost cell or a wrong Jacobian costs ≥ 1e-4.
+    polar(c) = x -> sum((x[d] - c[d])^2 for d in eachindex(c))
+
+    c, r = (0.5, 0.5), 0.37
+    disc = space(box((0.0, 0.0), (1.0, 1.0)); cells=(16, 16), order=4,
+                 physical=physical_domain(_ball(c, r); subcell_length_scale=1 / 256, max_depth=4))
+    plan = Unfitted.integration_plan(disc)
+    @test _plan_integral(plan, x -> 1.0) ≈ π * r^2 rtol = 1.0e-10
+    @test _plan_integral(plan, polar(c)) ≈ π * r^4 / 2 rtol = 1.0e-10
+
+    c, R, r = (0.51, 0.49), 0.43, 0.17
+    annulus = space(box((0.0, 0.0), (1.0, 1.0)); cells=(10, 10), order=3,
+                    physical=physical_domain(intersect(_ball(c, R), complement(_ball(c, r)));
+                                             subcell_length_scale=1 / 160, max_depth=4))
+    plan = Unfitted.integration_plan(annulus)
+    @test _plan_integral(plan, x -> 1.0) ≈ π * (R^2 - r^2) rtol = 1.0e-11
+    @test _plan_integral(plan, polar(c)) ≈ π * (R^4 - r^4) / 2 rtol = 1.0e-11
+
+    c, r = (0.5, 0.5, 0.5), 0.37
+    sphere = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(4, 4, 4), order=2,
+                   physical=physical_domain(_ball(c, r); subcell_length_scale=1 / 64, max_depth=4))
+    @test _plan_integral(Unfitted.integration_plan(sphere), x -> 1.0) ≈ 4π * r^3 / 3 rtol = 1.0e-10
+end
+
+@testset "a triangle's moments over the kept cells match their exact clipped integrals" begin
+    # Three linear leaves whose corners sit at cell centres of a 6² p = 3 grid. The reference is the triangle clipped to
+    # every region box the plan keeps, so it judges the cut-cell quadrature alone, whatever the classifier decides about
+    # a sub-resolution tip. Every monomial up to total degree 2p — the trial × test degree — is checked.
+    #
+    # The bound is twice the error measured before interior corners were integrated exactly: 2.7e-3 relative on the
+    # worst monomial. The kernel places no base breakpoint at a corner strictly inside a cut cell, so this test pins the
+    # regression level of that known limitation rather than the documented machine-precision contract.
+    A, B, C = SVector(0.25, 0.25), SVector(0.75, 5 / 12), SVector(5 / 12, 11 / 12)
+    edge(p, q) = (t=q - p; n=SVector(t[2], -t[1]) / norm(t);
+                  leaf(x -> n[1] * (x[1] - p[1]) + n[2] * (x[2] - p[2]); lipschitz=1.0))
+    p = 3
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(6, 6), order=p,
+              physical=physical_domain(intersect(edge(A, B), edge(B, C), edge(C, A)); subcell_length_scale=1 / 96,
+                                       max_depth=4))
+    plan = Unfitted.integration_plan(V)
+    pieces = filter(c -> length(c) >= 3, [_clip_to_box([A, B, C], r.box.lower, r.box.upper) for r in plan.regions])
+    @test sum(_shoelace(c) for c in pieces) ≈ _shoelace([A, B, C]) rtol = 1.0e-14   # nothing lost to the classifier
+    worst = 0.0
+    for a in 0:(2p), b in 0:(2p-a)
+        g = x -> x[1]^a * x[2]^b
+        exact = sum(_polygon_integral(g, c) for c in pieces)
+        worst = max(worst, abs(_plan_integral(plan, g) - exact) / exact)
+    end
+    @test worst < 2 * 2.7e-3
+end
+
+@testset "α-FCM regions integrate (1 − α)|Ω ∩ box| + α|box|" begin
+    # Under α-FCM every region's rule integrates the blended indicator: the whole box on a `:full` region, α times it on
+    # a `:fictitious_alpha` one, and on a cut region the fit scaled by (1 − α) plus the α-scaled tensor rule. One linear
+    # leaf keeps every cut exact, so the identity holds to round-off on all three kinds at once.
+    α = 0.01
+    n, p0 = normalize(SVector(0.3, 0.7)), SVector(0.5, 0.45)
+    phys = physical_domain(leaf(x -> n[1] * (x[1] - p0[1]) + n[2] * (x[2] - p0[2]); lipschitz=1.0); alpha=α,
+                           keep_fictitious=true, subcell_length_scale=1 / 80, max_depth=4)
+    plan = Unfitted.integration_plan(space(box((0.0, 0.0), (1.0, 1.0)); cells=(5, 5), order=2, physical=phys))
+    @test Set(r.quadrature.kind for r in plan.regions) == Set([:full, :cut_fitted, :fictitious_alpha])
+    for region in plan.regions
+        lo, hi = region.box.lower, region.box.upper
+        boxvol = Unfitted.volume(region.box)
+        inside = _clip([lo, SVector(hi[1], lo[2]), hi, SVector(lo[1], hi[2])], x -> -dot(n, x - p0))
+        expected = (1 - α) * (length(inside) >= 3 ? _shoelace(inside) : 0.0) + α * boxvol
+        @test boxvol / 4 * sum(region.quadrature.weights) ≈ expected atol = 1.0e-13 * boxvol
+    end
+end
+
+@testset "the threaded prefit equals the serial fit, key for key" begin
+    # The plan fits its cut keys on every thread and fills the cache afterwards. The fits share nothing, so each cached
+    # value must be bit for bit the rule a serial call returns. Meaningful when the suite runs on more than one thread.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(8, 8), order=2,
+              physical=physical_domain(_ball((0.47, 0.52), 0.33); subcell_length_scale=1 / 128, max_depth=4))
+    cache = Unfitted._MomentFitCache{2,Float64}()
+    Unfitted.integration_plan(V; moment_fit_cache=cache)
+    @test length(cache) > 8
+    @test all(isequal(value, Unfitted._fit_moment_rule(V.physical, Unfitted.AxisBox(key[1], key[2]), key[3]))
+              for (key, value) in cache)
+end
