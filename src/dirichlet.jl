@@ -545,6 +545,15 @@ end
 # `:cut_failed` — is kept rather than dropped. Its parents carry trace dofs the dof layer constrains on the same
 # grid-aligned test, and dropping it would move `facet_region_count` without changing one integral. The codim-`D` vertex
 # facet (`F = 0`) never reaches the cut branch: `_classify_facet` decides a single point by membership.
+#
+# The fits are entered through `Base.inferencebarrier` (the idiom of `_coverage_constraints!` in `dofs.jl`), so
+# inference never descends from here into the moment-fit chain — `_fit_rules`, `moment_fit_rule`, the implicit kernel,
+# NNLS. The call is resolved at run time on the slice's concrete type, and the chain is inferred and compiled when a
+# face first has a cut region, not before. Without the barrier, the abstract inference `_regions` (`assembly.jl`) starts
+# on its unspecialised `space` reaches this call with the face's dimension and number type unknown and infers the whole
+# chain for them, in code that never runs — on the Kirsch plate's first assemble (12² cells, p = 3, no facet region
+# cut), 2726 of the 8249 method instances it inferred; with the barrier it infers 4730 and none of the chain. The
+# result is asserted to its concrete type, so the rule loop below stays statically dispatched.
 function _facet_regions(records::Vector{_RegionRecord{D,T}}, slice, sides::Vector{Tuple{Int,Symbol}},
                         free_axes::Vector{Int}, pins, rules::_TensorRuleCache{D,T}, ::Val{F}) where {D,T,F}
     function key(record)
@@ -552,7 +561,8 @@ function _facet_regions(records::Vector{_RegionRecord{D,T}}, slice, sides::Vecto
         return (face.lower, face.upper, ntuple(j -> record.order[free_axes[j]], Val(F)))
     end
     keys = _MomentFitKey{F,T}[key(record) for record in records if record.verdict === :cut]
-    fits = isempty(keys) ? _MomentFitValue{F,T}[] : _fit_rules(slice, keys, false)
+    fits = isempty(keys) ? _MomentFitValue{F,T}[] :
+           Base.inferencebarrier(_fit_rules)(slice, keys, false)::Vector{_MomentFitValue{F,T}}
     frame_pins = [(axis, zero(T)) for (axis, _) in pins]
     alpha = slice === nothing ? zero(T) : slice.alpha
     alpha_cache = Dict{NTuple{D,Int},Vector{T}}()
