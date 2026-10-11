@@ -712,8 +712,8 @@ geometrically, which applies the material rule on the covering level *and* on th
 one — an inactive support cell that holds no material (a folded cell, or a user mask
 entirely outside Ω) carries nothing to reproduce, so it neither has to be covered nor
 may veto the verdict. `ctx.fold` is the material oracle that answers it, the same one
-[`build_coverage`](@ref) used, and `ctx.coverage` holds `build_coverage`'s answers to
-the per-cover coverage question that test asks again. A B-spline level under a cover
+[`build_coverage`](@ref) used, and its memo holds `build_coverage`'s answers to the
+per-cover coverage question that test asks again. A B-spline level under a cover
 that selects by support is judged exactly instead, by subdivision against the cover's
 own admissible region (see `bspline` in the extension).
 
@@ -798,8 +798,8 @@ end
 # that record is O(1) to build.
 #
 # Step 3, the record, follows the passes: every decided candidate, in raw order. The
-# geometric and exact tests read the mask, the material oracle and the coverage memo
-# but never the ledger, so recording after the passes is recording as each candidate is
+# geometric and exact tests read the mask and the material oracle with its memo but
+# never the ledger, so recording after the passes is recording as each candidate is
 # decided; raw order is the order a clamped B-spline level's dedup rows must keep (see
 # `_dedup!` in the extension).
 function _bury!(ledger::EliminationLedger, level::Level{D,T}, ctx::_LevelContext{D,T},
@@ -921,8 +921,7 @@ function _mark_buried!(marks::_BurialMarks, level::Level{D,T}, k::Level{D,T}, te
         shed || dedup || continue
         key = ctx.raw_keys[raw]
         marks.done[i] = if shed || test === nothing
-            _reproduced_on_domain(level, k, _burial_cells(level, key), ctx.tolerance, ctx.fold,
-                                  ctx.coverage)
+            _reproduced_on_domain(level, k, _burial_cells(level, key), ctx.tolerance, ctx.fold)
         else
             _reproduced_by(test, level, key)
         end

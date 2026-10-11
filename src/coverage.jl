@@ -66,14 +66,22 @@
 #   * `cells` — per level id, a per-cell verdict table (`0x00` not asked yet, `0x01`
 #     void, `0x02` material), allocated on the level's first miss. A build asks about
 #     the same cell many times — per buried function, per cover, per face position — and
-#     a table read is cheaper than hashing the box into `boxes` again. Level ids are
-#     unique within the space the fold was built for, the only space it is asked about,
-#     and bounded by the largest of them, which sizes the vector up front.
+#     a table read is cheaper than hashing the box into `boxes` again.
+#   * `covered_by` — per (level id, cover id) pair, the same kind of table for
+#     `_covered_by_level` of the level's cells against the cover (`0x01` covered, `0x02`
+#     not), which `build_coverage` fills and the burial test reads back; see
+#     `_covered_by!`.
+#
+# Both tables are indexed by level id. Ids are unique within the space the fold was
+# built for, the only space it is asked about, and bounded by the largest of them, which
+# sizes both up front.
 #
 # The verdicts are exactly `classify_cell`'s: a table miss makes the same
 # `classify_cell(physical, cell_box(mesh, c), boxes)` call with the same box and memo, a
 # hit returns the stored result of that call, and the call is a pure function of the
-# geometry and the box. Only how often a cell is asked changes.
+# geometry and the box. Only how often a cell is asked changes. The same holds for
+# `covered_by`, a pure function of the cell box, the cover, the tolerance — one per
+# build — and these verdicts.
 #
 # A `_Fold` is built by `_dof_topology` or `build_coverage` and lives for that one call:
 # no `Space`, `Model` or layout keeps it, so its tables are never shared between two
@@ -86,11 +94,13 @@ struct _Fold{D,T<:Real,P}
     physical::P
     boxes::_ClassifyCache{D,T}
     cells::Vector{Array{UInt8,D}}
+    covered_by::Matrix{Array{UInt8,D}}
 end
 
 function _Fold(V::Space{D,T}, boxes::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T<:Real}
     n = maximum(level -> level.id, V.levels)
-    return _Fold{D,T,typeof(V.physical)}(V.physical, boxes, Vector{Array{UInt8,D}}(undef, n))
+    return _Fold{D,T,typeof(V.physical)}(V.physical, boxes, Vector{Array{UInt8,D}}(undef, n),
+                                         Matrix{Array{UInt8,D}}(undef, n, n))
 end
 
 # Whether `box`, an arbitrary axis-aligned box, holds no material: the box memo alone,
@@ -149,33 +159,10 @@ the cell is uncovered. The VTK mesh export (`_mesh_vtk_data` in `postprocessing.
 also reads the flag, for *every* cell of a level, so its `covered` cell array shows
 `0` on the masked level's far-away inactive cells whatever their true coverage; read
 it alongside the `active` array it is written next to.
-
-The remaining fields are the memo behind those flags, private to the build that made
-the value. `covered[level_id]` asks, per cell, whether *some* level above covers it;
-the burial test of `_coverage_constraints!` asks the narrower question whether *one
-given* level does (`_reproduced_on_domain`), once per buried function per cover, about
-cells `build_coverage` has already answered. Both are `_covered_by_level` of the same
-cell box, cover, tolerance and material oracle, so `build_coverage` records each
-answer it computes and the burial test reads it back (`_covered_by!`):
-
-  - `by` — one table per (level, cover) pair, a `UInt8` per cell of the level (`0x00`
-    not asked yet, `0x01` covered, `0x02` not), allocated on the pair's first ask.
-    An unmasked cover gets none: its answer is a single box test.
-  - `first`, `stride` — the pair `(level, k)` owns slot
-    `(level.id − first)·stride + (k.id − first) + 1` of `by`, where `first` is the
-    space's smallest level id and `stride` the width of its id range.
-
-A `Coverage` built from the `covered` dictionary alone has an empty memo; it is the
-value of a build that does not prune, which never asks.
 """
 struct Coverage{D}
     covered::Dict{Int,BitArray{D}}
-    by::Vector{Array{UInt8,D}}
-    first::Int
-    stride::Int
 end
-
-Coverage{D}(covered::Dict{Int,BitArray{D}}) where {D} = Coverage{D}(covered, Array{UInt8,D}[], 0, 0)
 
 # The cells of `mesh` that `box` overlaps, as an axis-aligned block. `_axis_cells`
 # (`mesh.jl`) does the per-axis binary search, so the cost is O(D·log N +
@@ -266,23 +253,24 @@ function _covered_by_level(box::AxisBox{D,T}, k::Level{D,T}, tol::GeometryTolera
 end
 
 # `_covered_by_level` of cell `c` of `level` against the single level `k`, through the
-# memo in `coverage` (see `Coverage`). The answer is a pure function of the cell box,
-# `k`, the tolerance and the material oracle, all fixed for the build `coverage`
-# belongs to, so a stored verdict is the one a fresh call returns. `build_coverage`
-# fills the memo as it decides its flags, and the burial test's condition 1
+# oracle's `covered_by` memo (see `_Fold`). The answer is a pure function of the cell
+# box, `k`, the tolerance and the oracle's verdicts, all fixed for the build the oracle
+# serves, so a stored verdict is the one a fresh call returns. `build_coverage` fills
+# the memo as it decides its flags, and the burial test's condition 1
 # (`_reproduced_on_domain`) asks the same (cell, cover) pairs again once per buried
 # function and cover: on an integrated-Legendre depth-5 ladder (8² p2) over an immersed
 # disc the memo cut the `_covered_by_level` evaluations of one layout from 88 440 to
 # 10 492, and on a base under five band-shaped overlays around a hole from 13 204 to
 # 5 092.
 #
-# The pair's table is allocated, every cell "not asked yet", on the pair's first ask.
-function _covered_by!(coverage::Coverage{D}, level::Level{D,T}, c::CartesianIndex{D}, k::Level{D,T},
-                      tol::GeometryTolerance{T}, fold::_Fold{D,T}) where {D,T}
+# The pair's table is allocated, every cell "not asked yet", on the pair's first ask. An
+# unmasked cover gets none: its answer is a single box test.
+function _covered_by!(fold::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}, k::Level{D,T},
+                      tol::GeometryTolerance{T}) where {D,T}
     k.mask === nothing && return _covered_by_level(cell_box(level.mesh, c), k, tol, fold)
-    slot = (level.id - coverage.first) * coverage.stride + (k.id - coverage.first) + 1
-    isassigned(coverage.by, slot) || (coverage.by[slot] = zeros(UInt8, level.mesh.cells))
-    table = coverage.by[slot]
+    memo = fold.covered_by
+    isassigned(memo, level.id, k.id) || (memo[level.id, k.id] = zeros(UInt8, level.mesh.cells))
+    table = memo[level.id, k.id]
     verdict = table[c]
     verdict == 0x00 || return verdict == 0x01
     covered = _covered_by_level(cell_box(level.mesh, c), k, tol, fold)
@@ -325,17 +313,16 @@ end
 # support whose material part `k` covers while its fictitious part sticks out past `k`'s
 # box.
 #
-# Condition 1 reads `coverage`'s memo (`_covered_by!`), which `build_coverage` filled
-# with the same `_covered_by_level` answers. Condition 3 needs `k`'s cells across the
+# Condition 1 reads the oracle's coverage memo (`_covered_by!`), which `build_coverage`
+# filled with the same `_covered_by_level` answers. Condition 3 needs `k`'s cells across the
 # hull, which depend only on `k`, the hull and the tolerance, so they are found once per
 # call, at the first face that cuts the hull — and not at all on the common path, where
 # none does.
 function _reproduced_on_domain(level::Level{D,T}, k::Level{D,T}, cells::CartesianIndices{D},
-                               tol::GeometryTolerance{T}, fold::_Fold{D,T},
-                               coverage::Coverage{D}) where {D,T}
+                               tol::GeometryTolerance{T}, fold::_Fold{D,T}) where {D,T}
     for ci in cells
         if is_active(level.mask, ci)
-            _covered_by!(coverage, level, ci, k, tol, fold) || return false
+            _covered_by!(fold, level, ci, k, tol) || return false
         else
             _is_void(fold, level, ci) || return false
         end
@@ -384,18 +371,16 @@ Only the cells `_coverage_cells` selects are evaluated; the rest keep the `false
 default, which the pruning rule never reads. On a masked level that is what
 keeps the pass proportional to the *active* region rather than to the level's grid.
 
-Every per-cover answer computed on the way is kept in the returned value's memo (see
-[`Coverage`](@ref)), which the burial test of the same build reads back.
+Every answer computed on the way against a masked cover is kept in `fold`'s coverage
+memo, which the burial test of the same build reads back; an unmasked cover's answer
+is a single box test and is not stored.
 """
 function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T}) where {D,T}
     build_coverage(V, tol, _Fold(V))
 end
 
 function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T}, fold::_Fold{D,T}) where {D,T}
-    lo, hi = extrema(level -> level.id, V.levels)
-    stride = hi - lo + 1
-    coverage = Coverage{D}(Dict{Int,BitArray{D}}(), Vector{Array{UInt8,D}}(undef, stride^2), lo,
-                           stride)
+    covered = Dict{Int,BitArray{D}}()
     for level in V.levels
         cov = falses(level.mesh.cells)
         above = [k for k in V.levels if k.id > level.id]
@@ -405,21 +390,20 @@ function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T}, fold::_Fold{D,
         # measured on the first `prepare` of an immersed single-level plate, 84 ms of
         # codegen that never runs there (`_covered_by!`, `_covered_by_level`,
         # `_coverage_cells` and the loop).
-        isempty(above) ||
-            Base.inferencebarrier(_cover_cells!)(cov, coverage, level, above, tol, fold)
-        coverage.covered[level.id] = cov
+        isempty(above) || Base.inferencebarrier(_cover_cells!)(cov, level, above, tol, fold)
+        covered[level.id] = cov
     end
-    return coverage
+    return Coverage{D}(covered)
 end
 
 # The coverage flags of `level` against the levels `above` it, on the cells
-# `_coverage_cells` selects; every per-cover answer goes into `coverage`'s memo.
-function _cover_cells!(cov::BitArray{D}, coverage::Coverage{D}, level::Level{D,T}, above,
-                       tol::GeometryTolerance{T}, fold::_Fold{D,T}) where {D,T}
+# `_coverage_cells` selects; every per-cover answer goes into `fold`'s coverage memo.
+function _cover_cells!(cov::BitArray{D}, level::Level{D,T}, above, tol::GeometryTolerance{T},
+                       fold::_Fold{D,T}) where {D,T}
     wanted = _coverage_cells(level)
     for ci in cell_indices(level.mesh)
         wanted[ci] || continue
-        cov[ci] = any(k -> _covered_by!(coverage, level, ci, k, tol, fold), above)
+        cov[ci] = any(k -> _covered_by!(fold, level, ci, k, tol), above)
     end
     return cov
 end

@@ -359,8 +359,9 @@ end
 end
 
 @testset "the coverage memo answers what a fresh coverage test does" begin
-    # `build_coverage` keeps every per-cover answer it computes (`Coverage.by`), and the
-    # burial test reads them back through `_covered_by!` instead of asking
+    # `build_coverage` keeps every per-cover answer it computes in the material oracle's
+    # memo (`_Fold.covered_by`), and the burial test reads them back through
+    # `_covered_by!` instead of asking
     # `_covered_by_level` again. On an immersed three-level stack — a middle overlay the
     # fold and a user mask over material both switch cells off, under an unmasked inner
     # one — every flag, every stored answer and every answer asked through the memo,
@@ -381,7 +382,6 @@ end
     coverage = Unfitted.build_coverage(V, tol, fold)
     reference = Unfitted._Fold(V)
     fresh(level, c, k) = Unfitted._covered_by_level(cell_box(level.mesh, c), k, tol, reference)
-    slot(level, k) = (level.id - coverage.first) * coverage.stride + (k.id - coverage.first) + 1
     middle, inner = V.levels[2], V.levels[3]
     # Non-vacuity: the middle cover is masked (by the fold and by the user), the inner
     # one is not.
@@ -398,14 +398,14 @@ end
             # A masked cover's answers are stored as they were computed, and nowhere else;
             # an unmasked one's are never stored.
             if k.mask === nothing
-                @test !isassigned(coverage.by, slot(level, k))
-            elseif isassigned(coverage.by, slot(level, k))
-                table = coverage.by[slot(level, k)]
+                @test !isassigned(fold.covered_by, level.id, k.id)
+            elseif isassigned(fold.covered_by, level.id, k.id)
+                table = fold.covered_by[level.id, k.id]
                 @test all(c -> table[c] == 0x00 || (table[c] == 0x01) == fresh(level, c, k), cells)
                 append!(stored, table)
             end
             for pass in 1:2
-                @test [Unfitted._covered_by!(coverage, level, c, k, tol, fold) for c in cells] ==
+                @test [Unfitted._covered_by!(fold, level, c, k, tol) for c in cells] ==
                       [fresh(level, c, k) for c in cells]
             end
         end
