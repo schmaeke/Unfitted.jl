@@ -89,8 +89,8 @@ global 1D function index via the `_AXIS_BSPLINE` tag.
     `_resolve_rows!` overload below turns into pivots. Masked levels of any
     geometry are eliminable either way.
   - The burial hooks of the dof layer's one pruning driver,
-    `_coverage_constraints!`: `_buries`, `_burial_cells`, `_burial_candidate`,
-    `_cover_test` with its exact test `_reproduced_by`, `_dedup!`, and the rows of
+    `_coverage_constraints!`: `_burial_cells`, `_cover_test` with its exact test
+    `_reproduced_by`, `_dedup!`, and the rows of
     the `_reproduces` trait that have a B-spline side. Covered-mode pruning for this
     family is the dedup and nothing else: a buried function a covering level's
     span already contains exactly is eliminated, because the two are linearly
@@ -1030,44 +1030,9 @@ end
 # Speleers, Comput. Aided Geom. Design 29 (2012) 485–498, Definition 1(I)). The
 # fine half is the support selection in `_selection_constraints!`; together they
 # are the hierarchical spline basis, stated for superposed independent grids.
-Unfitted._buries(::BSplineFamily) = true
-
 function Unfitted._burial_cells(level::Level{D,T,<:BSplineFamily},
                                 key::TensorDofKey{D}) where {D,T<:Real}
     return _support_cells(key, level.basis, level.mesh.cells)
-end
-
-# The candidate test: whether the function on `cells`, its support, is buried — and the
-# two halves of "buried as a whole function" are not the same test.
-#
-# The level-side half holds for BOTH mechanisms. An inactive support cell that holds
-# material (a user mask inside Ω) blocks: what a masked level assembles is the function
-# truncated to its own active cells, which is not the function the cover reproduces.
-# One that holds none (a folded cell, or a user mask entirely outside Ω) does not:
-# nothing is integrated there, so the truncation is invisible on Ω. Leaving this to the
-# covering predicate was wrong — the subdivision walk looks only at the cover — and what
-# it deleted was real approximation rather than a null mode: measured on a
-# `continuity = 0` base of 4² masked at one interior cell under a nested
-# maximal-continuity 6² cover, the pruned space carried 58 unknowns against an
-# unreduced rank of 59.
-#
-# The coverage half — every active support cell covered by some level above — is a
-# prefilter for the geometric test only, and applies only when every cover that may
-# dedup this level is judged geometrically (`geometric`). It tests the *whole* cell box
-# against the cover's box, which under an immersed geometry can reject a cell whose
-# material part the cover does reach — the rest of it being fictitious — and for the
-# exact test of a selecting cover that would silently under-deduplicate. The exact path
-# needs no prefilter: its first block test fails immediately for a function nowhere near
-# the cover, which is what keeps the walk off the level's bulk. The half reads `cov` on
-# the active support cells only, the ones `_coverage_cells` computed: a support cell two
-# cells past the active front holds the `false` default, not a verdict.
-function Unfitted._burial_candidate(level::Level{D,T,<:BSplineFamily}, cells::CartesianIndices{D},
-                                    cov::BitArray{D}, ctx::_LevelContext{D,T},
-                                    geometric::Bool) where {D,T<:Real}
-    fold = ctx.fold
-    all(ci -> is_active(level.mask, ci) || _is_fictitious(fold, level, ci), cells) || return false
-    geometric || return true
-    return all(ci -> !is_active(level.mask, ci) || cov[ci], cells)
 end
 
 # One reproduction test per covering level, chosen by what that cover actually is. A

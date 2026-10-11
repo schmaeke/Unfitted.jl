@@ -71,8 +71,9 @@ ones that do not fit: `recommended_quadrature_order` (`order .+ 1`),
 
 One further default is silent rather than fatal, so a new family should decide
 about it deliberately: the burial hooks of `_coverage_constraints!`
-(`src/dofs.jl`), starting with `_buries(::F)` — `false` by default, so on a
-family that does not opt in the space's leaf semantics stay on and do nothing.
+(`src/dofs.jl`), `_sheds_any` and `_reproduces` above all — `false` by default,
+so on a family that does not opt in the space's leaf semantics stay on and do
+nothing.
 Opting in is not only about shedding dofs: where a covering level's span
 *contains* one of this level's functions, the two are linearly dependent and the
 superposed operator is exactly singular until one of them is eliminated there.

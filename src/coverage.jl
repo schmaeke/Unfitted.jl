@@ -427,8 +427,8 @@ end
 # The cells of `level` whose coverage flag can ever be read, as a `BitArray{D}`.
 #
 # `_coverage_constraints!` (in `dofs.jl`) is the consumer this set is cut for: its
-# integrated-Legendre candidate test (`_burial_candidate`) reads `cov` exactly on
-# `_incident_cells(key, n)` for the level's raw dof keys. Raw
+# candidate test (`_BurialMarks`) reads `cov`, on an integrated-Legendre level, exactly
+# on `_incident_cells(key, n)` for the level's raw dof keys. Raw
 # dofs are enumerated on *active* cells only (`_enumerate_raws`), and a key born on
 # cell `c` is incident to `c` and — through its node factors — to the cells sharing a
 # face, edge, or vertex with `c`. The read set is therefore the active set dilated by
@@ -440,13 +440,13 @@ end
 # An unmasked level is all-active, so its dilation is the whole grid and the pass is the
 # original one.
 #
-# The B-spline family's candidate test (`_burial_candidate`, in the extension) reads `cov`
-# over a wider stencil — a spline of degree `p` lives on up to `p + 1` cells per axis. Both
-# consumers read it only on the *active* cells of that stencil, which are the seed of the
-# dilation above, and skip the inactive ones outright: a fictitious support cell can lie
-# several cells past the active front, where the entry is the uninformative `false`
-# default, and `_reproduced_on_domain` settles it by classification instead. So both read
-# only computed entries.
+# On a B-spline level the same test reads `cov` over a wider stencil — a spline of
+# degree `p` lives on up to `p + 1` cells per axis. On either family it reads only the
+# *active* cells of the stencil, which are the seed of the dilation above, and skips the
+# inactive ones outright: a fictitious support cell can lie several cells past the
+# active front, where the entry is the uninformative `false` default, and
+# `_reproduced_on_domain` settles it by classification instead. So it reads only
+# computed entries.
 #
 # The dof layer is not the only reader: `_mesh_vtk_data` in `postprocessing.jl` reads
 # `cov` on every cell of the level for its `covered` diagnostic array. That reader is
