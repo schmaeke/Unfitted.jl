@@ -127,9 +127,9 @@ using Unfitted
 # definition, which needs no import. The list is therefore an honest measure of
 # how far the extension reaches into the package.
 using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, AxisDofKey, TensorDofKey,
-                EliminationLedger, _LevelContext, _eliminate!, _constrain!, _pivot!, cell_indices,
-                is_active, AxisBox, _check_basis_mode, _level_side_is_physical, _tensor_dof_key,
-                _Fold, _fictitious, _is_fictitious, _is_void
+                EliminationLedger, _LevelContext, _eliminate!, _constrain!, _pivot!, is_active,
+                AxisBox, _check_basis_mode, _level_side_is_physical, _tensor_dof_key, _Fold,
+                _is_fictitious, _is_void
 using StaticArrays: SVector
 using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim
 
@@ -828,7 +828,7 @@ end
         end
     end
     inside && return is_active(a.level.mask, c) || _is_void(a.fold, a.level, c)
-    return _fictitious(a.fold, _virtual_cell_box(a, c))
+    return _is_void(a.fold, _virtual_cell_box(a, c))
 end
 
 # The box of cell `c` of the level's grid, for a `c` that may lie outside

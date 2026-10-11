@@ -268,7 +268,7 @@ end
 # Bytes the material oracle's queries allocate over every cell of `level`, measured
 # inside a function so that only the calls themselves are counted.
 function _oracle_query_bytes(fold, level, probe)
-    bytes = @allocated Unfitted._fictitious(fold, probe)
+    bytes = @allocated Unfitted._is_void(fold, probe)
     for c in cell_indices(level.mesh)
         bytes += @allocated Unfitted._is_void(fold, level, c)
         bytes += @allocated Unfitted._is_fictitious(fold, level, c)
@@ -337,7 +337,7 @@ end
             @test fold.cells[level.id] == [m === :fictitious ? 0x01 : 0x02 for m in memo]
         end
         for b in probes
-            @test Unfitted._fictitious(fold, b) == (classify_cell(physical, b) === :fictitious)
+            @test Unfitted._is_void(fold, b) == (classify_cell(physical, b) === :fictitious)
         end
     end
 
@@ -353,7 +353,7 @@ end
         _oracle_query_bytes(fold, level, probes[1])                 # compile once
         @test _oracle_query_bytes(fold, level, probes[1]) == 0
     end
-    @test !any(b -> Unfitted._fictitious(fold, b), probes)
+    @test !any(b -> Unfitted._is_void(fold, b), probes)
     Unfitted.build_coverage(V, GeometryTolerance(Float64), fold)
     @test !any(id -> isassigned(fold.cells, id), eachindex(fold.cells)) && isempty(fold.boxes)
 end

@@ -108,10 +108,11 @@ function _Fold(V::Space{D,T}, boxes::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) 
                                          Matrix{Array{UInt8,D}}(undef, n, n))
 end
 
-# Whether `box`, an arbitrary axis-aligned box, holds no material: the box memo alone,
-# with no table, for a box that is not a cell of one of the space's grids — a B-spline
-# level's virtual cell past its own face.
-function _fictitious(f::_Fold{D,T}, box::AxisBox{D,T}) where {D,T<:Real}
+# Whether `box`, an arbitrary axis-aligned box, holds no material: the void query of
+# the method below for a box that is not a cell of one of the space's grids — a
+# B-spline level's virtual cell past its own face — and so the box memo alone, with no
+# table.
+function _is_void(f::_Fold{D,T}, box::AxisBox{D,T}) where {D,T<:Real}
     f.physical === nothing && return false
     return classify_cell(f.physical, box, f.boxes) === :fictitious
 end
