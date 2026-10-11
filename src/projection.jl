@@ -244,14 +244,17 @@ end
 # are decoded from its own half: the two models' level ids overlap, so neither side's parents could be told apart in a
 # joint list. Boxes the target does not cover are dropped (no rhs contribution and no place to deposit the result).
 #
-# Each box becomes a `(target, source)` pair of one-sided volume regions over the same corners and the same cached
-# tensor rule — sized by both sides at once (`_transfer_quadrature_counts`), so it integrates the source × target
-# products — and each side's workspace frames and refreshes its own member of the pair exactly as the kernel does a plan
-# region. A source member with no parent is a box the source does not cover.
+# Each box becomes a one-sided volume region over its target parents, carrying the cached tensor rule sized by both
+# sides at once (`_transfer_quadrature_counts`, so it integrates the source × target products), stored with the box's
+# source parents. The source side of the box is that region's frame and rule over the source parents, which
+# `_transfer_rhs_regions!` builds on the spot; each side's workspace then frames and refreshes its own region exactly
+# as the kernel does a plan region. Storing the source side as its parent list alone makes the per-box record one
+# region and one pointer instead of two regions, about half the bytes. An empty source-parent list is a box the source
+# does not cover.
 function _transfer_regions(source_model::Model{D,T}, target_model::Model{D,T};
                            tolerance=target_model.dofs.tolerance) where {D,T}
     source_levels, target_levels = source_model.problem.space.levels, target_model.problem.space.levels
-    regions = Tuple{VolumeRegion{D,T},VolumeRegion{D,T}}[]
+    regions = Tuple{VolumeRegion{D,T},Vector{Parent{D,T}}}[]
     quadrature_cache = _TensorRuleCache{D,T}()
     levels = (source_levels..., target_levels...)
     _partition(levels, ntuple(identity, Val(D)), zero(SVector{D,T}), tolerance) do lower, upper, sig
@@ -261,9 +264,7 @@ function _transfer_regions(source_model::Model{D,T}, target_model::Model{D,T};
         source_parents = _parents(source_levels, source_sig, lower, upper)
         counts = _transfer_quadrature_counts(source_model, target_model, target_parents, source_parents)
         rule = _cached_tensor_quadrature!(quadrature_cache, counts, T)
-        push!(regions,
-              (Region(lower, upper, target_parents, :full, rule.points, rule.weights),
-               Region(lower, upper, source_parents, :full, rule.points, rule.weights)))
+        push!(regions, (Region(lower, upper, target_parents, :full, rule.points, rule.weights), source_parents))
         return nothing
     end
     return regions
@@ -309,17 +310,23 @@ function _transfer_rhs!(rhs, source_coefficients, source_model::Model, target_mo
     return _transfer_rhs_regions!(rhs, target, source, state, regions)
 end
 
-# The region loop of `_transfer_rhs!`, behind a function barrier on the two workspaces. Per region pair the source dof
-# values are read once; per point and per target field component, `u_S` of the same-named source field is emitted
-# against every target test function as a load, `(qweight·u_S)·φ`, accumulated per row in point order. A pivot target is
+# The region loop of `_transfer_rhs!`, behind a function barrier on the two workspaces. Per box the source dof values
+# are read once; per point and per target field component, `u_S` of the same-named source field is emitted against
+# every target test function as a load, `(qweight·u_S)·φ`, accumulated per row in point order. A pivot target is
 # condensed onto its branches before the local rhs is added to the global one. A box the source does not cover
 # contributes nothing (`u_S ≡ 0` there) and is skipped.
+#
+# The source region is the target region with the source parents in place of the target's: the same frame and the same
+# rule, so both sides see the same frame point `η`. A `Region` is immutable, so building it here costs no heap
+# allocation.
 function _transfer_rhs_regions!(rhs::Vector{T}, target::AssemblyWorkspace{D,T}, source::AssemblyWorkspace,
                                 state::FormState, regions) where {D,T}
     # Target field `f`'s component `c` reads the source field of the same name.
     source_field = [_field_index(source.layout, fl.name) for fl in target.layout.fields]
-    for (target_region, source_region) in regions
-        isempty(source_region.parents) && continue
+    for (target_region, source_parents) in regions
+        isempty(source_parents) && continue
+        source_region = Region(target_region.lower, target_region.upper, source_parents, target_region.kind,
+                               target_region.points, target_region.weights)
         n = _slots!(_frame!(target, target_region))
         m = n + length(target.pivots)
         _state_region!(state, _frame!(source, source_region))

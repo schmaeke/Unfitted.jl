@@ -44,8 +44,8 @@ inside a single cell of every parent level, so that any product of the parents' 
 and the region's rule integrates it to the rule's own exactness. Every region the assembly kernel walks is one of
 these, and the aliases name its three shapes:
 
-  - `VolumeRegion{D,T} = Region{D,T,Nothing,Nothing}` — a box of an [`IntegrationPlan`](@ref), and each side of an L²
-    transfer region pair;
+  - `VolumeRegion{D,T} = Region{D,T,Nothing,Nothing}` — a box of an [`IntegrationPlan`](@ref), and either side of a
+    box of the L² transfer;
   - [`FacetRegion`](@ref)`{D,T}` — a piece of a grid-aligned boundary facet: `normal` is the facet's outward unit normal
     and `sides` its codim-`K` identifier;
   - [`SimplexRegion`](@ref)`{D,T}` — a sub-cell of an immersed [`BoundaryMesh`](@ref) or of a coupling interface:
