@@ -74,7 +74,12 @@
 #
 # Both tables are indexed by level id. Ids are unique within the space the fold was
 # built for, the only space it is asked about, and bounded by the largest of them, which
-# sizes both up front.
+# sizes both up front. `covered_by` is therefore a (largest id)² matrix of which a build
+# uses at most the pairs above the diagonal, and in a coupled model, where
+# `_prepare_spaces` numbers a later subdomain's levels after the earlier ones', it also
+# spans the ids below the space's own. Its slots are unassigned references until asked
+# — a pointer each, in one allocation per layout build, pruning or not — which at the
+# level counts in use is a few hundred bytes to a few KB.
 #
 # The verdicts are exactly `classify_cell`'s: a table miss makes the same
 # `classify_cell(physical, cell_box(mesh, c), boxes)` call with the same box and memo, a
@@ -113,9 +118,10 @@ end
 
 # Whether cell `c` of `level` holds no material: its box lies entirely outside Ω. A
 # fact about the geometry and the box, whatever the cell's activity. Inlined, so the
-# hit path a per-cell loop runs — the B-spline admissibility walk above all — is two
-# loads and a compare; a level's table is allocated on its first miss, so a level
-# nobody asks about, and every level of a space without a physical domain, gets none.
+# hit path a per-cell loop runs — the B-spline admissibility walk above all — is an
+# `isassigned` test, a table load and a compare; a level's table is allocated on its
+# first miss, so a level nobody asks about, and every level of a space without a
+# physical domain, gets none.
 @inline function _is_void(f::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}) where {D,T<:Real}
     f.physical === nothing && return false
     isassigned(f.cells, level.id) || return _classify_void!(f, level, c)
@@ -125,7 +131,8 @@ end
 end
 
 # A table miss: classify the cell box through the box memo and record the verdict. Out
-# of line, so the hit path a per-cell loop inlines stays a load and a compare.
+# of line, so the hit path a per-cell loop inlines stays the few loads and the compare
+# `_is_void` describes.
 @noinline function _classify_void!(f::_Fold{D,T}, level::Level{D,T},
                                    c::CartesianIndex{D}) where {D,T<:Real}
     isassigned(f.cells, level.id) || (f.cells[level.id] = zeros(UInt8, level.mesh.cells))
@@ -362,7 +369,9 @@ keeps the pass proportional to the *active* region rather than to the level's gr
 
 Every answer computed on the way against a masked cover is kept in `fold`'s coverage
 memo, which the burial test of the same build reads back; an unmasked cover's answer
-is a single box test and is not stored.
+is a single box test and is not stored. The memo is not keyed by the tolerance, so a
+`fold` belongs to one build and one `tol`: pass a fresh oracle for another tolerance,
+or the stored answers of the first are returned for the second.
 """
 function build_coverage(V::Space{D,T}, tol::GeometryTolerance{T},
                         fold::_Fold{D,T}=_Fold(V)) where {D,T}

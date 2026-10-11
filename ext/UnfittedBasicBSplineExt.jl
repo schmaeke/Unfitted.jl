@@ -431,9 +431,10 @@ end
 
 # ── Basis instantiation: materialise the deferred spec onto a mesh ────────────
 
-# `instantiate_basis` hook for the deferred `_BSplineSpec`. Invoked by
-# the core `space` / `overlay` / `moved_space` / mask-mutator paths once
-# the level's mesh and order are known. Validates the request and
+# `instantiate_basis` hook for the deferred `_BSplineSpec`. Invoked when
+# `space` / `overlay` build a level from `bspline(...)`, once the level's
+# mesh and order are known; every later rebuild of the level reaches the
+# `BSplineFamily` method below instead. Validates the request and
 # materialises the concrete `BSplineFamily` from the mesh axes; the spec
 # itself only ever exists between `bspline(...)` and this call, so every
 # downstream method dispatches on the concrete family type.
@@ -484,15 +485,20 @@ function Unfitted.instantiate_basis(spec::_BSplineSpec, mesh::CartesianMesh{D,T}
     return _materialize(spec, mesh, order)
 end
 
-# Re-instantiate an already-concrete `BSplineFamily` against a
-# (possibly new) mesh. Invoked when an overlay carrying this family is
-# moved — where the per-axis knot vectors must be rebuilt for the new cell
-# coordinates, since reusing the old family would leave stale `axis_coords`
-# / `cell_to_span` — and, for uniformity, when it is re-masked, where the
-# mesh is unchanged and the rebuild reproduces an identical family (the
-# mask never enters a knot vector). Cell counts and order are unchanged in
-# both cases, so the thinness / continuity validation already passed at
-# first construction and is not repeated.
+# Re-instantiate an already-concrete `BSplineFamily` against a (possibly new)
+# mesh and order: every rebuild of a B-spline level after its first construction
+# comes here. A move (`moved_space`) rebuilds the per-axis knot vectors for the new
+# cell coordinates, since reusing the old family would leave stale `axis_coords` /
+# `cell_to_span`. A re-mask, the fold and a level-id reindex keep the mesh and the
+# order, and the rebuild reproduces an equal family (the mask never enters a knot
+# vector). `estimate`'s refinement twin (`_refinement_twin`) passes the family with
+# a mesh refined by an integer factor at the same order, and `elevate`
+# (`_reordered_space`) passes the level's new order. Only the mode check runs: the
+# family keeps the continuity it holds, and neither the continuity / thinness
+# validation nor the normalisation of `m = p − 1` to `:maximal` that the
+# `_BSplineSpec` method applies is repeated — which a refinement cannot invalidate,
+# since it only adds cells, but which a new order from `elevate` is not checked
+# against.
 function Unfitted.instantiate_basis(family::BSplineFamily, mesh::CartesianMesh{D,T},
                                     order::NTuple{D,Int}, mode::Symbol) where {D,T<:Real}
     _check_basis_mode(family, mode, order)
@@ -671,9 +677,10 @@ end
 # degree-`p` function's support meets `(p + 1)^D` cells and every cell is asked about
 # by up to `(p + 1)^D` functions. Lazily, rather than as a dense per-level table
 # filled up front, because most inactive cells of a level lie farther than `p` cells
-# from every active one, where no function's support reaches. A dense table
-# classified all of them, once per record — for the selection and again for every
-# burial test that asks this level as a cover. Measured on an 8² base under five
+# from every active one, where no function's support reaches. A dense table asked
+# about all of them for each record — for the selection and again for every burial
+# test that asks this level as a cover — classifying each cell once per build and
+# finding it in the box memo every later time. Measured on an 8² base under five
 # band-shaped overlays around a hole, that was 82 % of the layout and 79 824
 # classifications, against the 1 092 integrated Legendre's coverage asks on the same
 # stack; read lazily, the B-spline layout classifies 5 177 cells.

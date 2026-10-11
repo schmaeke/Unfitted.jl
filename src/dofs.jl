@@ -772,7 +772,10 @@ function _coverage_constraints!(ledger::EliminationLedger, level::Level{D,T},
     # enough: `_bury!` is the only method that can match, so inference still descends
     # into it with the level widened to an abstract `Level` and infers every family's
     # hooks there — measured on the first `prepare` of an immersed single-level plate,
-    # 146 ms of inference in a `_bury!` that never runs.
+    # 146 ms of inference in a `_bury!` that never runs. `Base.inferencebarrier` is a
+    # Base internal, not declared public, and its effect was measured on Julia 1.12: a
+    # Julia that changed it would show here as more compile work, never as another
+    # answer, since the call it wraps is the same either way.
     Base.inferencebarrier(_bury!)(ledger, level, ctx, covers)
     return ledger
 end
@@ -794,8 +797,9 @@ end
 # `geometric` is whether every cover that may dedup is judged geometrically, which picks
 # the candidates' prefilter (`_BurialMarks`): the coverage flags, a fast path for the
 # geometric test only, or else the level side the exact test needs. It is decided before
-# the passes, so a family whose `_cover_test` builds a record builds the first one here;
-# that record is O(1) to build.
+# the passes, so a family whose `_cover_test` builds a record builds the first one here
+# only to learn that it is not `nothing`, and that cover's pass builds it again; that
+# record is O(1) to build.
 #
 # Step 3, the record, follows the passes: every decided candidate, in raw order. The
 # geometric and exact tests read the mask and the material oracle with its memo but
@@ -847,9 +851,11 @@ end
 # cover's box, which under an immersed geometry can reject a cell whose material part a
 # cover does reach — the rest of it being fictitious — and for the exact test of a
 # selecting cover that would silently under-deduplicate, so it is not asked when such a
-# cover may dedup. The flags are read on the active support cells only, the ones
-# `_coverage_cells` computed: a support cell two cells past the active front holds the
-# `false` default, not a verdict.
+# cover may dedup. The exact test needs no such prefilter for speed: its block test
+# stops at the first inadmissible cell, which for a function nowhere near the cover is
+# one of the first it asks — what keeps the walk off the level's bulk. The flags are
+# read on the active support cells only, the ones `_coverage_cells` computed: a support
+# cell two cells past the active front holds the `false` default, not a verdict.
 #
 # The level half — every inactive support cell void — is the exact test's. An inactive
 # support cell that holds material (a user mask reaching into Ω) blocks: what a masked

@@ -909,10 +909,10 @@ end
 # family's concrete form can depend on — integrated Legendre returns itself, and
 # the B-spline hook rebuilds knot vectors from the mesh axes and the degree — so
 # a rebuild that keeps the mesh and the order, such as a mask update,
-# re-instantiates the identical family. Before this helper the sites disagreed
-# about it — `moved_space` and the mask rebuilds re-instantiated while the fold
-# and the reindex did not — and the disagreement was invisible because the
-# answers coincide.
+# re-instantiates an equal family (for B-splines the same knot vectors,
+# rebuilt). Before this helper the sites disagreed about it — `moved_space` and
+# the mask rebuilds re-instantiated while the fold and the reindex did not — and
+# the disagreement was invisible because the answers coincide.
 function _level(old::Level{D,T}; id=old.id, mesh=old.mesh, orders=old.orders,
                 mask=old.mask) where {D,T}
     family = instantiate_basis(old.basis, mesh, orders.nominal, old.mode)
@@ -1531,11 +1531,16 @@ end
 #
 # Returning `nothing` when nothing folds is what lets `_apply_physical_fold` keep
 # such a level as it is, and with it a `nothing` mask — the no-mask hot path.
-# The mask is cleared cell by cell in a loop rather than merged by the broadcast
-# `user.on .& .!fictitious`, the cheaper form to compile: with the broadcast, a
-# fresh process's first `prepare` measured 0.3–1 % slower, both on spaces that
-# compile the fold without running it (a two-level overlay, a masked clamped
-# B-spline space) and on an immersed FCM plate.
+#
+# One pass that clears bits of a copy of the mask, rather than classifying into a
+# separate `BitArray` and merging the two by the broadcast `mask.on .& .!fictitious`.
+# The bit reads and writes ride on the classification loop, which visits every cell
+# anyway, so the broadcast's word-at-a-time merge would only add a pass; and the loop
+# is the cheaper form to compile. Measured on the earlier two-pass form, where only
+# the merge was a loop or a broadcast, a fresh process's first `prepare` was 0.3–1 %
+# slower with the broadcast, both on spaces that compile the fold without running it
+# (a two-level overlay, a masked clamped B-spline space) and on an immersed FCM plate;
+# the one-pass form compiles one method fewer than that loop.
 function _folded_mask(level::Level{D,T}, physical::PhysicalDomain,
                       cache::_ClassifyCache{D,T}) where {D,T}
     on = level.mask === nothing ? trues(level.mesh.cells) : copy(level.mask.on)
