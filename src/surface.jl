@@ -13,7 +13,7 @@
 #   * Simplex geometry, one affine map `x = v₁ + E·λ` for every simplex dimension `K`: the measure, the default normal
 #     and the unit-simplex quadrature rules.
 #   * Automatic subdivision of user cells against every level's grid (segments via per-axis parameter crossings,
-#     triangles via Sutherland–Hodgman half-space clipping + fan triangulation).
+#     triangles via single-plane Sutherland–Hodgman splits + fan triangulation).
 #   * `SimplexRegion{D,T}` — one per sub-cell: the region record of `intersections.jl` in the sub-cell's bounding-box
 #     frame, carrying the mapped rule, the sub-cell's normal and the constant covering-parent list.
 #   * `_simplex_regions` — the one builder that ties subdivision + quadrature + parent classification together, for an
@@ -53,11 +53,14 @@ Construct via [`segment_mesh`](@ref), [`polyline_mesh`](@ref), [`triangle_mesh`]
 directly to [`block`](@ref), [`loadform`](@ref), or [`boundary_integral`](@ref) via `on = mesh`.
 
 User contract: every cell is subdivided against every level's grid and each resulting sub-cell carries one
-[`SimplexRegion`](@ref), so a mesh need not be aligned with the discretization. Each sub-cell must, however, land
-somewhere the space can integrate: its midpoint must lie in at least one level's mesh, and the cell it lands in must be
-active. A sub-cell outside every level raises, and one whose midpoint falls in a cell deactivated by a
-[`LevelMask`](@ref) raises as well; both messages carry the sub-cell's index in the subdivided mesh, which is not the
-index of the input cell it came from. Sub-cells inherit the parent cell's normal (geometric default or user override).
+[`SimplexRegion`](@ref), so a mesh need not be aligned with the discretization. The subdivision partitions each cell
+exactly — the sub-cell measures sum to the cell's up to round-off — and decides nothing by an absolute length, so it is
+the same at every geometric scale. Each sub-cell must, however, land somewhere the space can integrate: its midpoint
+must lie in at least one level's mesh, and the cell it lands in must be active. A sub-cell outside every level raises —
+so does any cell reaching past the outermost grid lines, whose outside part becomes such a sub-cell — and one whose
+midpoint falls in a cell deactivated by a [`LevelMask`](@ref) raises as well; both messages carry the sub-cell's index
+in the subdivided mesh, which is not the index of the input cell it came from. Sub-cells inherit the parent cell's
+normal (geometric default or user override).
 """
 struct BoundaryMesh{D,T<:Real,K,C}
     cells::Vector{C}
@@ -245,9 +248,10 @@ end
 #   * `K = 1` (segments)    — per-axis parameter-value crossings, sorted, then cut at each one exactly. The sub-segments
 #                             partition the input: an endpoint may land on a grid line, and the sub-segment's *interior*
 #                             — which is what the midpoint classification sees — lies in one cell. Works in any `D`.
-#   * `K = 2` (triangles)   — in 3D, Sutherland–Hodgman clipping against the six axis-aligned half-spaces of every cell
-#                             the triangle overlaps, followed by fan triangulation of the resulting convex polygon. A 2D
-#                             triangle (a codim-0 simplex) is passed through unsplit.
+#   * `K = 2` (triangles)   — in 3D, plane splitting: one single-plane Sutherland–Hodgman pass per grid plane the
+#                             triangle crosses, then fan triangulation of each convex piece. The pieces partition the
+#                             input, and the parts beyond the outermost planes are kept, so a triangle leaving the grid
+#                             fails like a segment does. A 2D triangle (a codim-0 simplex) is passed through unsplit.
 
 """
     _subdivide_segment(p1, p2, grid_lines, nudge)
@@ -303,120 +307,84 @@ function _subdivide_segment(p1::SVector{D,T}, p2::SVector{D,T}, grid_lines::NTup
     return segments
 end
 
-# Per-axis cell-index range of the cells that the triangle's bounding box overlaps. `grid_lines[d]` is sorted, so
-# `searchsortedlast` resolves the first and last cell indices in `O(log n)` per axis.
-function _overlapping_cell_indices(tri::NTuple{3,SVector{3,T}}, grid_lines::NTuple{3}, tol::T) where {T}
-    return ntuple(3) do d
-        coords = (tri[1][d], tri[2][d], tri[3][d])
-        lo = min(coords...) - tol
-        hi = max(coords...) + tol
-        axes = grid_lines[d]
-        i_lo = max(1, searchsortedlast(axes, lo))
-        i_hi = min(length(axes) - 1, searchsortedlast(axes, hi))
-        return i_lo:i_hi
-    end
-end
-
-# Sutherland-Hodgman clip of a convex polygon (vertex list) against one half-space `n · x ≤ c`. The output polygon is
-# the input polygon intersected with the half-space. `nudge` lets a vertex exactly on the plane count as inside,
-# avoiding zero-measure slivers in the clipped result.
-function _clip_polygon_halfspace(polygon::Vector{SVector{D,T}}, axis::Int, sign::Int, plane::T, nudge::T) where {D,T}
-    isempty(polygon) && return polygon
-    out = SVector{D,T}[]
-    n = length(polygon)
-    inside(p) = sign > 0 ? p[axis] <= plane + nudge : p[axis] >= plane - nudge
-    for i in 1:n
-        a = polygon[i]
-        b = polygon[mod1(i + 1, n)]
-        a_in = inside(a)
-        b_in = inside(b)
-        if a_in
-            push!(out, a)
-            if !b_in
-                # a inside, b outside — push intersection.
-                t = (plane - a[axis]) / (b[axis] - a[axis])
-                push!(out, a + t * (b - a))
-            end
-        elseif b_in
-            # a outside, b inside — push intersection then b on next iter.
-            t = (plane - a[axis]) / (b[axis] - a[axis])
-            push!(out, a + t * (b - a))
+# Split a convex polygon at the plane `x[d] = c` through its interior into the parts below and above it: one
+# Sutherland–Hodgman pass against a single plane that keeps both sides (I. E. Sutherland, G. W. Hodgman, "Reentrant
+# polygon clipping", Commun. ACM 17 (1974) 32–42, doi:10.1145/360767.360802). Walking the edges in order, a vertex goes
+# to the side it lies on, and to both when it lies on the plane; an edge that crosses the plane strictly puts its
+# crossing point on both sides, between its endpoints. The crossing is interpolated from the edge's lower endpoint
+# along `d`, so two triangles sharing an edge compute the same points on it, and then set exactly onto the plane: the
+# two sides meet along it with neither a gap nor an overlap, and a piece split at `c` ends exactly at `c`. Both sides
+# of a convex polygon are convex, in the input's vertex order, and have at most one vertex more than it.
+function _split_polygon(polygon::Vector{SVector{D,T}}, d::Int, c::T) where {D,T}
+    below = sizehint!(SVector{D,T}[], length(polygon) + 1)
+    above = sizehint!(SVector{D,T}[], length(polygon) + 1)
+    a = polygon[end]
+    for b in polygon
+        if min(a[d], b[d]) < c < max(a[d], b[d])
+            p, q = a[d] < b[d] ? (a, b) : (b, a)
+            x = Base.setindex(p + (c - p[d]) / (q[d] - p[d]) * (q - p), c, d)
+            push!(below, x)
+            push!(above, x)
         end
+        b[d] <= c && push!(below, b)
+        b[d] >= c && push!(above, b)
+        a = b
     end
-    return out
+    return below, above
 end
 
-# Clip a convex polygon against an axis-aligned 3D box (cell). The box is `lower[d] ≤ x[d] ≤ upper[d]` for each axis;
-# clipped against six half-spaces in turn.
-function _clip_polygon_to_box(polygon::Vector{SVector{3,T}}, lower::SVector{3,T}, upper::SVector{3,T},
-                              nudge::T) where {T}
-    poly = polygon
-    for d in 1:3
-        poly = _clip_polygon_halfspace(poly, d, -1, lower[d], nudge)
-        poly = _clip_polygon_halfspace(poly, d, +1, upper[d], nudge)
-    end
-    return poly
-end
+"""
+    _subdivide_triangle(v1, v2, v3, grid_lines) -> Vector{NTuple{3,SVector{D,T}}}
 
-# Fan-triangulate a convex polygon from its first vertex. Triangles with area below `min_area` are dropped to keep the
-# output free of numerical slivers from the clipping step.
-function _fan_triangulate(polygon::Vector{SVector{3,T}}, min_area::T) where {T}
-    triangles = NTuple{3,SVector{3,T}}[]
-    length(polygon) < 3 && return triangles
-    v1 = polygon[1]
-    for i in 2:(length(polygon)-1)
-        v2 = polygon[i]
-        v3 = polygon[i + 1]
-        area = norm(cross(v2 - v1, v3 - v1)) / 2
-        area > min_area && push!(triangles, (v1, v2, v3))
+Split a triangle in 2D or 3D at the axis-aligned grid lines (planes, in 3D) `grid_lines[d]`, sorted per axis. Axis by
+axis, every piece is split (`_split_polygon`) at each line strictly inside its own extent along that axis, so the work
+is the number of lines the triangle actually crosses, not the number of grid cells under its bounding box. Each final
+piece is a convex polygon inside one grid cell, fan-triangulated from its first vertex.
+
+The pieces **partition** the triangle: a crossing point is shared exactly by the two sides of its split, so the
+sub-triangle areas sum to the input's up to round-off. A fan triangle whose area is at most `eps(T)` times the input's
+is a round-off sliver — a line passing within an ulp of a vertex — and is dropped. Every test is either exact (a line
+strictly inside an extent) or relative to the input (the sliver floor), so the subdivision is the same at every
+geometric scale.
+
+Parts beyond the outermost lines are kept like any other piece. They lie in no cell, so the surface builder raises on
+them and the interface builder skips them, as for a segment that leaves the grid. Sub-triangles lie in the input's plane
+and are given its normal by `_subdivide_mesh`.
+"""
+function _subdivide_triangle(v1::SVector{D,T}, v2::SVector{D,T}, v3::SVector{D,T}, grid_lines::NTuple{D}) where {D,T}
+    pieces = [SVector{D,T}[v1, v2, v3]]
+    for d in 1:D
+        lines = grid_lines[d]
+        split = Vector{SVector{D,T}}[]
+        for piece in pieces
+            lo, hi = extrema(p -> p[d], piece)
+            rest = piece
+            for k in (searchsortedlast(lines, lo)+1):length(lines)
+                lines[k] < hi || break
+                below, rest = _split_polygon(rest, d, lines[k])
+                push!(split, below)
+            end
+            push!(split, rest)
+        end
+        pieces = split
+    end
+    floor = eps(T) * _simplex_jacobian((v1, v2, v3))
+    triangles = NTuple{3,SVector{D,T}}[]
+    for piece in pieces, i in 2:(length(piece)-1)
+        triangle = (piece[1], piece[i], piece[i + 1])
+        _simplex_jacobian(triangle) > floor && push!(triangles, triangle)
     end
     return triangles
 end
 
-"""
-    _subdivide_triangle(v1, v2, v3, grid_lines, nudge)
-
-Split a 3D triangle against the level-grid axis-aligned planes. For each cell the triangle's bounding box overlaps, the
-triangle is clipped against that cell's six half-spaces via Sutherland-Hodgman and the resulting convex polygon is
-fan-triangulated. Sub-triangles inherit the parent triangle's plane (and therefore its normal); the combined area of all
-sub-triangles equals the input triangle's area to floating-point precision (modulo nudge-induced sliver drops).
-
-That area statement holds for a triangle that lies inside the grid. Only cells between the outermost grid lines are
-visited, so whatever part of a triangle sticks out past them is dropped silently — a triangle entirely outside yields no
-sub-triangles at all, and the region builder then never sees it. The segment path does not behave this way: it keeps the
-whole segment and lets the region builder raise.
-
-Unlike `_subdivide_segment`'s parameter-space `nudge`, the `nudge` here is compared against physical coordinates
-(half-space tests, bounding-box padding) and against an area (`min_area = nudge²`), so it is a length and does not
-survive a change of geometric scale.
-"""
-function _subdivide_triangle(v1::SVector{3,T}, v2::SVector{3,T}, v3::SVector{3,T}, grid_lines::NTuple{3},
-                             nudge::T) where {T}
-    tri = (v1, v2, v3)
-    cell_ranges = _overlapping_cell_indices(tri, grid_lines, nudge)
-    min_area = nudge * nudge
-    sub_triangles = NTuple{3,SVector{3,T}}[]
-    polygon0 = SVector{3,T}[v1, v2, v3]
-
-    for ix in cell_ranges[1], iy in cell_ranges[2], iz in cell_ranges[3]
-        lower = SVector(grid_lines[1][ix], grid_lines[2][iy], grid_lines[3][iz])
-        upper = SVector(grid_lines[1][ix + 1], grid_lines[2][iy + 1], grid_lines[3][iz + 1])
-        clipped = _clip_polygon_to_box(polygon0, lower, upper, nudge)
-        length(clipped) < 3 && continue
-        append!(sub_triangles, _fan_triangulate(clipped, min_area))
-    end
-    return sub_triangles
-end
-
 # One input cell's pieces, each inside a single cell of every level the `lines` come from, appended to `cells` (see
-# above). The tolerances are the subdividers' own: `_subdivide_segment` reads a dimensionless crossing parameter.
+# above). Both subdividers are scale-free: `_subdivide_segment` reads a dimensionless crossing parameter, and
+# `_subdivide_triangle` an area relative to the input's.
 _split_cell!(cells, cell::NTuple{1}, _) = push!(cells, cell)
 function _split_cell!(cells, (a, b)::NTuple{2,SVector{D,T}}, lines) where {D,T}
     append!(cells, _subdivide_segment(a, b, lines, sqrt(eps(T))))
 end
-function _split_cell!(cells, (a, b, c)::NTuple{3,SVector{3,T}}, lines) where {T}
-    append!(cells, _subdivide_triangle(a, b, c, lines, sqrt(eps(T))))
-end
+_split_cell!(cells, (a, b, c)::NTuple{3,SVector{3}}, lines) = append!(cells, _subdivide_triangle(a, b, c, lines))
 _split_cell!(cells, cell::NTuple{3,SVector{2}}, _) = push!(cells, cell)
 
 # The sub-cells of `mesh` split at the per-axis `lines` (`_split_cell!`), as `(; cells, normals)` with one unit normal

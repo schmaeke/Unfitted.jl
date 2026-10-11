@@ -266,17 +266,16 @@ end
     @test sum(norm(s[2] - s[1]) for s in along) ≈ 0.90 rtol = 1.0e-14
 end
 
-@testset "_subdivide_triangle: triangle clipped against 3D grid" begin
-    # A triangle in 3D crossing two grid planes. Its sub-triangles should sum to the original area, with every
-    # sub-triangle inside one cell of every level.
+@testset "_subdivide_triangle: triangle split against the 3D grid" begin
+    # A triangle in 3D crossing two grid planes. Its sub-triangles partition it — their areas sum to the original's at
+    # round-off — and each lies inside one cell of the grid, vertices included.
     omega = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
     V = space(omega; cells=(2, 2, 2), order=1)
     grid_lines = Unfitted._merged_axis_coordinates(V.levels, Val(3), GeometryTolerance(Float64))
     v1 = SVector(0.1, 0.1, 0.3)
     v2 = SVector(0.9, 0.1, 0.3)
     v3 = SVector(0.5, 0.9, 0.3)
-    nudge = sqrt(eps(Float64))
-    subs = Unfitted._subdivide_triangle(v1, v2, v3, grid_lines, nudge)
+    subs = Unfitted._subdivide_triangle(v1, v2, v3, grid_lines)
 
     # Original triangle area = 0.5·|e1 × e2| = 0.5·|(0.8,0,0) × (0.4,0.8,0)| = 0.5·|0.64 k̂| = 0.32.
     expected_area = 0.32
@@ -287,15 +286,62 @@ end
         sqrt(sum(x->x*x, c)) / 2
     end
     total_area = sum(area, subs)
-    @test total_area ≈ expected_area atol = 1.0e-9
+    @test total_area ≈ expected_area rtol = 1.0e-14
     @test length(subs) >= 3
 
-    # The midpoint of every sub-triangle lies inside exactly one cell; vertices may sit on grid planes (where they
-    # cannot be classified uniquely by `locate_cell`), which is fine — the surface-region builder uses the midpoint to
-    # assign the parent.
+    # The midpoint of every sub-triangle locates its cell, and the whole sub-triangle lies in that cell's box. Vertices
+    # may sit on grid planes, where `locate_cell` cannot classify them uniquely, which is why the surface-region builder
+    # assigns the parent by the midpoint.
     for tri in subs
         mid = (tri[1] + tri[2] + tri[3]) / 3
-        @test Unfitted.locate_cell(V.levels[1].mesh, mid) !== nothing
+        cell = Unfitted.locate_cell(V.levels[1].mesh, mid)
+        @test cell !== nothing
+        cbox = cell_box(V.levels[1].mesh, cell)
+        @test all(all(cbox.lower .<= v .<= cbox.upper) for v in tri)
+    end
+end
+
+@testset "a triangle reaching past the grid raises like a segment; an interface skips the part outside" begin
+    # Regression (F4). The triangle subdivider once visited only the cells between the outermost grid lines, so the
+    # part of a triangle beyond them vanished silently: this surface integrated 0.12 of its 0.16 area. A segment
+    # leaving the grid raises instead, and now a triangle does too, because its outside part is kept as a sub-cell no
+    # level covers.
+    omega = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    V = space(omega; cells=(4, 4, 4), order=1)
+    u = field(:u, V)
+    Γ = triangle_mesh([SVector(0.6, 0.3, 0.4), SVector(1.4, 0.3, 0.4), SVector(0.6, 0.7, 0.4)], [(1, 2, 3)])
+    @test_throws "entirely outside" prepare(Problem((u,); loads=(loadform(u, source_form(source=0.0); on=Γ),)))
+    leg = segment_mesh([(SVector(0.6, 0.3, 0.4), SVector(1.4, 0.3, 0.4))]; normals=[SVector(0.0, 1.0, 0.0)])
+    @test_throws "entirely outside" prepare(Problem((u,); loads=(loadform(u, source_form(source=0.0); on=leg),)))
+
+    # An interface integrates the trace inside both subdomains and skips the rest, whole or in part: the area left of
+    # x = 1 is ∫_{0.6}^{1} (1.4 − x)/2 dx = 0.12.
+    u1, u2 = field(:u1, V), field(:u2, space(omega; cells=(3, 3, 3), order=1))
+    blocks = couple(u1, u2, Γ, mass_form(coefficient=1.0))
+    model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2), blocks...)))
+    @test boundary_integral(q -> 1.0, model; on=first(blocks).on) ≈ 0.12 rtol = 1.0e-14
+end
+
+@testset "triangle subdivision is the same at every geometric scale" begin
+    # Regression (F4). The triangle subdivider compared physical coordinates against an absolute `nudge = √eps` and
+    # dropped sub-triangles below an absolute area `nudge²`, so the same mesh on the same grid split differently at a
+    # different scale: at 1e-6 this triangle came out as 32 sub-cells and 1.7 % too much area, at 1 and 1e6 as 33 and
+    # the exact area. Every test of the split is now exact or relative to the input.
+    P = [SVector(0.13, 0.27, 0.31), SVector(0.86, 0.12, 0.58), SVector(0.41, 0.93, 0.74)]
+    function split(s)
+        V = space(box((0.0, 0.0, 0.0), (s, s, s)); cells=(4, 4, 4), order=1)
+        u = field(:u, V)
+        Γ = triangle_mesh([s * p for p in P], [(1, 2, 3)])
+        model = prepare(Problem((u,); loads=(loadform(u, source_form(source=0.0); on=Γ),));
+                        tolerance=GeometryTolerance(; merge=sqrt(eps()) * s))
+        return diagnostics(model).surface_region_count, boundary_integral(q -> 1.0, model; on=Γ) / s^2
+    end
+    count, area = split(1.0)
+    @test area ≈ norm(cross(P[2] - P[1], P[3] - P[1])) / 2 rtol = 1.0e-14
+    for s in (1.0e-6, 1.0e6)
+        scaled_count, scaled_area = split(s)
+        @test scaled_count == count
+        @test scaled_area ≈ area rtol = 1.0e-14
     end
 end
 
