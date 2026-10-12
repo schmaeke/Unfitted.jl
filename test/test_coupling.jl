@@ -158,6 +158,34 @@ end
     @test_throws ArgumentError QuadField{Float64}(model)
 end
 
+# Two disjoint unit squares as one coupled problem, the second meshed with `cells2` cells per axis, and the solution
+# that sets every coefficient to one — u₁ = u₂ = 1, since an order-1 basis is a partition of unity: the smallest
+# multi-domain pair a transfer can be asked about.
+function coupled_squares(cells2)
+    V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=3, order=1)
+    V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=cells2, order=1)
+    u1, u2 = field(:u1, V1), field(:u2, V2)
+    model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2))))
+    ones_solution = Solution(ones(active_unknowns(model)), model.version,
+                             Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    return model, ones_solution, u1, u2
+end
+
+@testset "L2Projection refuses a multi-domain model" begin
+    # The L² transfer builds its union partition from `problem.space`, which on a coupled model is the first subdomain's
+    # space alone, so the second subdomain's field finds no target cell to deposit its load on. Unguarded, the pair
+    # below — the same discretisation on both sides — came back with u₂ ≡ 0 and a solver residual of 4e-17: wrong, and
+    # nothing in the result says so. Rewire serves the same pair, and exactly.
+    source, s, u1, u2 = coupled_squares(3)
+    target, _, _, _ = coupled_squares(3)
+    @test_throws "multi-domain" transfer(s, source, target)
+    @test_throws "multi-domain" transfer(s, source, target; via=L2Projection())
+
+    rewired = transfer(s, source, target; via=Rewire())
+    @test value(rewired, target, u1, (0.45, 0.55)) ≈ 1.0
+    @test value(rewired, target, u2, (2.95, 0.95)) ≈ 1.0
+end
+
 @testset "one single-sided on= mesh shared across subdomains serves both" begin
     # A single BoundaryMesh object used as the `on=` target for weak forms on two different subdomains used to be
     # rejected at assembly, because one region list serves one space and the second subdomain's contribution would have

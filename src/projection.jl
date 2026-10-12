@@ -58,10 +58,12 @@ target mass restricts to `Ω` through the cut-cell rules while the source-driven
 of the union partition, so the two halves of the system would disagree about the domain. Making the union partition
 FCM-aware is separate work.
 
-This backend is single-domain only, and nothing checks it: the union partition is built from `problem.space`, the
+This backend is single-domain only: a source or a target with more than one subdomain space (a coupled
+[`Problem`](@ref)) is rejected with an `ArgumentError`. The union partition is built from `problem.space`, the
 representative (first field's) space, while the rhs pass walks every field, so on a coupled model the fields of the
-other subdomains are integrated against subdomain 1's cells and the run fails inside the dof lookup rather than with a
-diagnostic. Use [`Rewire`](@ref) there. Several fields sharing *one* space are fine.
+other subdomains would find no target cell to integrate against — two subdomains carrying u₁ = u₂ = 1 came back with
+u₂ ≡ 0 and a solver residual of 4e-17, wrong and silent. Use [`Rewire`](@ref) there. Several fields sharing *one* space
+are fine.
 """
 struct L2Projection{M,F} <: TransferBackend
     matrix::M
@@ -132,9 +134,9 @@ the target dof layout's stored tolerance and is ignored by strategies that do no
 [`Rewire`](@ref)).
 
 The two backends do not cover the same cases. [`L2Projection`](@ref) walks the geometry of both models, rejects a target
-carrying a [`PhysicalDomain`](@ref), and is single-domain only. [`Rewire`](@ref) reads only raw dof keys, so it also
-serves coupled models, but it reproduces the source exactly only when the target's active basis contains it. Either way
-the two models must agree on the space bounding box, the field names, and the per-field component counts.
+carrying a [`PhysicalDomain`](@ref), and rejects a multi-domain model. [`Rewire`](@ref) reads only raw dof keys, so it
+also serves coupled models, but it reproduces the source exactly only when the target's active basis contains it. Either
+way the two models must agree on the space bounding box, the field names, and the per-field component counts.
 """
 function transfer(source_solution::Solution, source_model::Model{D,T}, target_model::Model{D,T};
                   via::TransferBackend=L2Projection(), tolerance=target_model.dofs.tolerance) where {D,T}
@@ -168,6 +170,10 @@ end
 function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_model::Model{D,T},
                     backend::L2Projection{M,F}, tolerance) where {D,T,M,F}
     _assert_transfer_compatible(source_model, target_model)
+    # The union partition below reads one space, `problem.space`, so a second subdomain would have no target cell to
+    # deposit its load on: refuse a coupled model on either side rather than return its other fields as zero.
+    _assert_single_domain(source_model, "L2Projection")
+    _assert_single_domain(target_model, "L2Projection")
     if M !== Nothing && _has_nonhomogeneous_constraints(target_model.dofs)
         throw(ArgumentError("L2Projection(matrix): the cached mass omits the Dirichlet lift, so " *
                             "it cannot transfer onto a target with non-homogeneous Dirichlet " *
