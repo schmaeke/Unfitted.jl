@@ -198,6 +198,8 @@ Base.@kwdef mutable struct AssemblyDiagnostics
     facet_moment_fit_residual_max::Float64 = 0.0
     min_relative_facet_measure::Float64 = 1.0
     dirichlet_trace_factors::Vector{Symbol} = Symbol[]
+    # The count is `length(unsupported_dirichlet_dofs)`, kept as a field for the report: `prepare` and
+    # `update_dirichlet!`, the list's only writers, set the two together.
     unsupported_dirichlet_dof_count::Int = 0
     unsupported_dirichlet_dofs::Vector{UnsupportedDirichletDof} = UnsupportedDirichletDof[]
     surface_region_count::Int = 0

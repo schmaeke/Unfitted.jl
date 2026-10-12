@@ -221,9 +221,10 @@ end
 end
 
 @testset "per-cell order: the basis value buffer guard" begin
-    # The tensor kernels were relaxed from `length(values) == length(indices)` to `>=` so a nominal-order bank can serve
-    # a lower-order cell. The surviving half of the guard — a buffer too SHORT for the index list — is what stands
-    # between a length bug and a silently wrong answer, so it must still fire.
+    # The tensor kernel's guard was relaxed from `length(values) == length(indices)` to `>=` so a bank sized for the
+    # level's longest minimum-rule set can serve a cell whose set is shorter. The surviving half of the guard — a buffer
+    # too SHORT for the index list — is what stands between a length bug and a silently wrong answer, so it must still
+    # fire.
     fam = IntegratedLegendre()
     ids = local_basis_indices(fam, (2, 2))
     ξ = SVector(0.1, -0.2)

@@ -119,9 +119,9 @@ internal flag the `mode` keyword sets when a level is built, so a level's family
 functions does a cell of this order carry" (see [`BasisFamily`](@ref)); pass `mode = :trunk` rather than building the
 trunk family by hand. It displays as `IntegratedLegendre()` in `:tensor` mode and is marked in `:trunk` mode.
 
-All integrated-Legendre-specific dof and constraint behaviour (endpoint-vs-bubble identification, boundary-mode
-dispatch, facet detection) lives in this file and `src/dofs.jl`; the rest of the codebase queries this family through
-the [`BasisFamily`](@ref) interface.
+All integrated-Legendre-specific dof and constraint behaviour (endpoint-vs-bubble identification, boundary and facet
+incidence through `is_boundary_basis` / `is_facet_basis`) lives in this file and `src/dofs.jl`; the rest of the codebase
+queries this family through the [`BasisFamily`](@ref) interface.
 """
 struct IntegratedLegendre <: BasisFamily
     trunk::Bool    # the `:trunk` index set; internal, set from the `mode` keyword by `_with_mode`

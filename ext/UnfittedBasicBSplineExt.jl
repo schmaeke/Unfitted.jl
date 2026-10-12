@@ -427,11 +427,10 @@ end
 # `dN/dx = dN/dt · (h_d / 2) · (2 / h_d) = dN/dt`, the physical derivative — the integrated-Legendre chain-rule
 # convention.
 #
-# Reading the interval off the knot vector and wrapping the same `P` for the derivatives, rather than keeping a copy of
-# the mesh nodes and a stored derivative space on the family, also lets the compiler see that the value and derivative
-# recurrences read the same knots and share their loads and differences: the optimised code of this method has fewer
-# floating-point operations than it had with the copies (30 against 76 multiplications, divisions and subtractions on a
-# 3D degree-2 level), with every result bit for bit the same.
+# The family keeps no copy of the mesh nodes and no stored derivative space for this: the interval is two entries of the
+# knot vector `P` already holds, built from those very nodes, and the derivative space is a function of `P`, so either
+# copy would be state a rebuild has to keep in step with `spaces` and nothing more. Every table is bit for bit what the
+# stored copies gave.
 #
 # The loop over the axes is unrolled at compile time (`ntuple` over `Val(D)`), so each `family.spaces[d]` is read at a
 # constant index. The degree is a type parameter of `BSplineSpace`, so on a level whose degrees differ by axis the

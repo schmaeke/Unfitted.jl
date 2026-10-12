@@ -208,10 +208,10 @@ functions:
 
   - **A stored mask excludes at least one cell.** A selection naming every cell is stored as `nothing`
     (`_collapse_mask`), so `level.mask === nothing` is exactly "every cell active", whichever way the level was built.
-  - **A stored mask is owned by its level.** Every entry point hands the level a fresh array — the `active =` keyword,
+  - **A stored mask is never mutated.** Every entry point hands the level a fresh array — the `active =` keyword,
     [`adapt`](@ref) and the mask mutators copy their selection, the fictitious fold and the adaptive rebuild edit a copy
-    — and nothing mutates a level's mask afterwards. A caller that wants to edit one reads a copy
-    ([`active_cells`](@ref)) and hands it back.
+    — and nothing writes to a level's mask afterwards, so a rebuild that keeps the mask shares it between the old level
+    and the new one safely. A caller that wants to edit one reads a copy ([`active_cells`](@ref)) and hands it back.
 
 The mask interacts with the dof layer like a geometric overlay boundary: faces between active and inactive cells of the
 *same* level are treated as artificial overlay constraints (analogous to faces between the level and its physical-domain
@@ -300,7 +300,8 @@ _normalize_mask(cells, mesh::CartesianMesh) = _collapse_mask(_selection(cells, m
 """
     CellOrders{D}
 
-The per-cell polynomial order of a [`Level`](@ref), as a palette of the distinct orders plus one palette index per cell.
+The per-cell polynomial order of a [`Level`](@ref), as a palette of the distinct orders plus, on a graded level, one
+palette index per cell.
 
 A level whose order is one tuple for every cell carries a palette of one entry and no per-cell index at all: the record
 is the same type either way, and a uniform level is the `nothing` branch of its readers rather than a second code path.
@@ -529,11 +530,11 @@ the basis mode), polynomial-order metadata and an optional activation mask. Fiel
     value is the whole index-set rule: it carries the basis mode the level was built with (`:tensor`, the full tensor
     product, or integrated Legendre's `:trunk`, the Szabó–Babuška trunk space filtered by trunk degree), which
     `_mode(level.basis)` reads back.
-  - `orders::CellOrders{D}` — the per-cell polynomial order, as a palette of the distinct orders plus one index per
-    cell. A level whose order is uniform carries a palette of one entry and no per-cell index, in the same record type,
-    so there is no second representation. Ask [`cell_order`](@ref) for a cell's order and [`nominal_order`](@ref) for
-    the per-axis maximum, which is a sizing quantity only. Both take a [`Space`](@ref) and a `level` keyword as well,
-    which is how a caller who is not inside the package should reach them.
+  - `orders::CellOrders{D}` — the per-cell polynomial order, as a palette of the distinct orders plus, on a graded
+    level, one index per cell. A level whose order is uniform carries a palette of one entry and no per-cell index, in
+    the same record type, so there is no second representation. Ask [`cell_order`](@ref) for a cell's order and
+    [`nominal_order`](@ref) for the per-axis maximum, which is a sizing quantity only. Both take a [`Space`](@ref) and a
+    `level` keyword as well, which is how a caller who is not inside the package should reach them.
   - `modes::CellModes{D}` — the multi-index sets those orders actually generate, after the minimum rule. **Derived**,
     never supplied: see [`CellModes`](@ref) for why that is the point rather than a detail.
   - `mask::Union{Nothing,LevelMask{D}}` — optional per-cell activation mask. `nothing` keeps every cell active and is
@@ -1256,7 +1257,8 @@ sense against an existing level:
   * `CartesianIndex{D} => order` pairs — one `Pair`, or a vector, tuple, dictionary or generator of them — raising the
     listed cells and leaving every other cell at the order it already has. It is the shape a marking loop produces when
     it changes a dozen cells: the caller states only what changed and never has to read, copy and hand back the whole
-    field. The level's current field is still read once here, to fill the cells the list does not name.
+    field. The level's current field is still read once here, to fill the cells the list does not name, so an empty
+    list leaves the level's orders as they are.
 
 Where two cells of different order share a face, the shared entity carries the minimum of the two orders; see
 [`CellModes`](@ref) for why that is what keeps the space C⁰, and [`space`](@ref) for the per-cell `order ≥ 1` and
