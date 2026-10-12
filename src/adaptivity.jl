@@ -523,13 +523,18 @@ function mark_cells(estimate::ErrorEstimate{D,T}; theta::Real=0.5) where {D,T}
     0 < theta <= 1 || throw(ArgumentError("theta must lie in (0, 1]; got $theta"))
     # Every cell carrying an indicator, scanned level by level, then sorted by decreasing η. The sort is stable, so
     # cells of equal η keep the scan order and the marking is a function of the estimate alone. The cut is the first
-    # prefix whose squared indicators reach `theta` of the total, accumulated in that order; a sum that round-off leaves
-    # short of the goal marks every cell.
+    # prefix whose squared indicators reach `theta` of the total, summed left to right in that order; a sum that
+    # round-off leaves short of the goal marks every cell.
+    #
+    # Left to right is `accumulate` over a generator, `Iterators.accumulate`'s documented fold: each partial sum is the
+    # previous one plus the next term. `cumsum` is no substitute. On floating-point data it re-associates the partial
+    # sums for accuracy, as v₁ + (v₂ + … + vᵢ) and pairwise in blocks on long inputs, so they differ from the running
+    # sum in the last bit, and a goal that falls between the two moves the cut by a cell.
     η((k, cell)) = estimate.cells[k][cell]
     marked = sort!(Tuple{Int,CartesianIndex{D}}[(k, cell) for (k, a) in pairs(estimate.cells)
                                                 for cell in CartesianIndices(a) if a[cell] > 0]; by=kc -> -η(kc))
     isempty(marked) && return marked
-    taken = something(findfirst(>=(theta * estimate.total^2), cumsum([η(kc)^2 for kc in marked])), length(marked))
+    taken = something(findfirst(>=(theta * estimate.total^2), accumulate(+, η(kc)^2 for kc in marked)), length(marked))
 
     # Extend through the group the cut lands in. Dörfler asks for a MINIMAL set reaching `theta`, and any minimal set
     # satisfies it, so this is a free choice — but resolving it by strict comparison hands the decision to round-off,

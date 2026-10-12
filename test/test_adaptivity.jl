@@ -607,6 +607,24 @@ end
     @test length(mark_cells(est; theta=1.0)) == 5
 end
 
+@testset "Dörfler cuts where the running sum of the marked order reaches the goal" begin
+    # The cut is the first prefix whose squared indicators, summed left to right in decreasing η, reach θ·total². A
+    # cumulative sum that re-associates the terms for accuracy, as `cumsum` does on floating-point data, differs from
+    # the running sum in the last bit, and a goal between the two moved the cut by a cell. Here η² ∝ 1/(i + 0.37) over
+    # 300 cells, normalised so the total is one: the goal is then θ itself, and each running sum is set as the goal
+    # exactly, so the cut must land on its own prefix. Neighbouring indicators differ by more than 1e-3 relative, far
+    # outside the group tolerance, so the group extension never moves the cut.
+    r = [1 / (i + 0.37) for i in 1:300]
+    η = sqrt.(r ./ sum(r))
+    est = Unfitted.ErrorEstimate{1,Float64}([η], 1.0, 1.0, 0.0)
+    running, sums = 0.0, Float64[]
+    for x in η
+        running += x^2
+        push!(sums, running)
+    end
+    @test isempty([k for k in eachindex(sums) if sums[k] < 1 && length(mark_cells(est; theta=sums[k])) != k])
+end
+
 @testset "the loop reduces the error and the estimate" begin
     V = ladder(_AD_Ω; cells=4, order=2, depth=3)
     model = prepare(_ad_problem(V))
