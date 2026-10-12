@@ -85,7 +85,9 @@ end
 
 Raw-key coefficient mapping backend. For each (raw, component) of every source field:
 
-  1. Look up the source's `TensorDofKey` in the target field's `raw_keys` table.
+  1. Look up the source's `TensorDofKey` in the target field's `raw_keys` table, pairing the two fields' levels by their
+     position in the field's own space: a coupled model numbers each subdomain's levels after the previous
+     subdomain's, so a level added to one subdomain renumbers the next one's without changing its functions.
   2. If a target raw matches and is active on the target, write the source field's value of that dof into the target's
      active slot: the source coefficient when the dof is free on the source, and otherwise the value the source field
      carries for it — its constrained value (the projected datum of a nonzero Dirichlet condition, zero for an
@@ -432,10 +434,15 @@ function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_
     coefficients = zeros(T, active_unknowns(target_model.dofs))
     for source_field in source_model.dofs.fields
         target_field = _field_layout(target_model.dofs, source_field.name)
-        # A target-side key → raw lookup, built once per field and read for every source raw of it.
+        # A target-side key → raw lookup, built once per field and read for every source raw of it. A key carries the
+        # GLOBAL level id, and a coupled model numbers each subdomain's levels after the previous subdomain's, so the
+        # same level of an unchanged subdomain can carry another id on the two sides. Levels are paired by position in
+        # the field's own space, as `_assert_keys_comparable` compares them: the source id moves by the difference of
+        # the two fields' first ids, which is 0 on a single-domain model.
         target_raw_by_key = Dict(key => raw for (raw, key) in pairs(target_field.dofs.raw_keys))
+        shift = first(target_field.level_ids) - first(source_field.level_ids)
         for (source_raw, key) in pairs(source_field.dofs.raw_keys)
-            target_raw = get(target_raw_by_key, key, 0)
+            target_raw = get(target_raw_by_key, TensorDofKey(key.level + shift, key.axes), 0)
             for c in 1:source_field.components
                 slot = target_raw == 0 ? 0 : target_field.dofs.active_component[target_raw, c]
                 if slot != 0

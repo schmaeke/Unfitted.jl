@@ -205,6 +205,30 @@ end
     end
 end
 
+@testset "Rewire pairs each subdomain's levels by position" begin
+    # A dof key carries the global level id, and a coupled model numbers each subdomain's levels after the previous
+    # subdomain's. An overlay added to the first subdomain therefore renumbered the second, unchanged one from id 2 to
+    # id 3: strict Rewire refused a target that contains the source, naming a subdomain-2 key with "no target
+    # counterpart", and lax Rewire returned u₂ ≡ 0 against a source of 1. The levels of a field are paired by their
+    # position in its own space, so both modes now transfer both fields exactly.
+    base = space(box((0.0, 0.0), (1.0, 1.0)); cells=3, order=1)
+    V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=3, order=1)
+    function pair(V1)
+        u1, u2 = field(:u1, V1), field(:u2, V2)
+        return prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)))), u1, u2
+    end
+    source, _, _ = pair(base)
+    target, u1, u2 = pair(overlay(base, box((0.25, 0.25), (0.75, 0.75)); cells=2, order=1))
+    @test [f.level_ids for f in target.dofs.fields] == [1:2, 3:3]
+    s = Solution(ones(active_unknowns(source)), source.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    for strict in (true, false)
+        rewired = transfer(s, source, target; via=Rewire(; strict=strict))
+        @test value(rewired, target, u1, (0.5, 0.5)) ≈ 1.0
+        @test value(rewired, target, u2, (2.5, 0.5)) ≈ 1.0
+        @test value(rewired, target, u2, (2.95, 0.95)) ≈ 1.0
+    end
+end
+
 @testset "one single-sided on= mesh shared across subdomains serves both" begin
     # A single BoundaryMesh object used as the `on=` target for weak forms on two different subdomains used to be
     # rejected at assembly, because one region list serves one space and the second subdomain's contribution would have
