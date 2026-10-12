@@ -731,10 +731,13 @@ lowers an order.
 
 Both `estimate` and `previous`'s estimate are checked against the space they are read on, since an indicator is indexed
 by that space's cells: a shape mismatch raises `DimensionMismatch` rather than misattributing a score, and a marked
-level or cell outside `V` raises `ArgumentError`.
+level or cell outside `V` raises `ArgumentError`, as does a `pmax` below one.
 """
 function decide(V::Space{D,T}, estimate::ErrorEstimate{D,T}, marked; pmax::Integer=8,
                 previous::Union{Nothing,_History{D,T}}=nothing) where {D,T}
+    # The bound `refine` refuses below one is refused here too. Accepted, `pmax = 0` reads every cell as already at its
+    # cap and quietly sends it to h, a split `refine` would refuse to apply under the same bound.
+    pmax >= 1 || throw(ArgumentError("decide: pmax must be at least 1; got $pmax"))
     _check_estimate(V, estimate, "estimate")
     h = Tuple{Int,CartesianIndex{D}}[]
     p = Tuple{Int,CartesianIndex{D}}[]
@@ -748,7 +751,7 @@ function decide(V::Space{D,T}, estimate::ErrorEstimate{D,T}, marked; pmax::Integ
     end
 
     for (k, cell) in marked
-        _check_mark(V, k, cell, "refine")
+        _check_mark(V, k, cell, "decide")
         # What is on offer here, then which of the two to spend. A cell with neither step available is dropped rather
         # than parked in `p`: `refine` would return a new but identical space, and a loop made of those does not
         # terminate.

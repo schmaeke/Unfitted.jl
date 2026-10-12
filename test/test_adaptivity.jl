@@ -552,6 +552,20 @@ end
     @test_throws DimensionMismatch refine(V, truncated)
 end
 
+@testset "decide validates pmax and names itself in its errors" begin
+    # `refine` refuses a `pmax` below one, and so does the decision that feeds it. Accepted, `pmax = 0` used to read
+    # every marked cell as already at its cap and send it to h without a word.
+    V = ladder(_AD_Ω; cells=4, order=2, depth=1)
+    flat = Unfitted.ErrorEstimate{2,Float64}([ones(l.mesh.cells) for l in V.levels], 1.0, 1.0, 0.0)
+    cell = CartesianIndex(2, 2)
+    @test_throws ArgumentError decide(V, flat, [(1, cell)]; pmax=0)
+    @test_throws "decide: pmax" decide(V, flat, [(1, cell)]; pmax=0)
+
+    # A bad mark is reported by the verb that was handed it, not by `refine`.
+    @test_throws "decide: marked level" decide(V, flat, [(99, cell)]; pmax=8)
+    @test_throws "decide: marked cell" decide(V, flat, [(1, CartesianIndex(9, 9))]; pmax=8)
+end
+
 @testset "refine: Dörfler marking is monotone in theta" begin
     V = ladder(_AD_Ω; cells=8, order=2, depth=1)
     model = prepare(_ad_problem(V))
