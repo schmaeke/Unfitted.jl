@@ -778,6 +778,38 @@ end
     @test argmax(ec.cells[1]) == CartesianIndex(1, 1)
 end
 
+@testset "estimate refuses an enriched space that does not contain V, before assembling it" begin
+    # A B-spline level's twin is appended above every level of V, so under an integrated-Legendre overlay it covers the
+    # overlay, which then sheds modes in V⁺ that are free in V. The injection has nowhere to put them. That surfaced as
+    # Rewire's key error after the whole enriched assembly, with the load below evaluated 688 times; it is now
+    # estimate's own refusal, made before anything is assembled.
+    calls = Threads.Atomic{Int}(0)
+    load(x) = (Threads.atomic_add!(calls, 1); 1.0)
+    bc = [dirichlet(0.0; on=boundary(:all))]
+    inner = box((0.25, 0.25), (0.75, 0.75))
+    under = overlay(space(_AD_Ω; cells=4, order=2, basis=bspline()), inner; cells=4, order=2,
+                    basis=IntegratedLegendre())
+    model = prepare(poisson(under; source=load, dirichlet=bc))
+    u = solve!(model)
+    calls[] = 0
+    @test_throws ArgumentError estimate(model, u)
+    @test_throws "estimate: the enriched space V⁺ does not contain V" estimate(model, u)
+    @test calls[] == 0
+
+    # The supported order, B-spline above Legendre, estimates; so do stacks where no live twin covers a Legendre level —
+    # a B-spline sub-box beside a Legendre one, and a dormant B-spline level under one.
+    estimated(V) = (m=prepare(poisson(V; source=1.0, dirichlet=bc)); estimate(m, solve!(m)).total)
+    over = overlay(space(_AD_Ω; cells=4, order=2), inner; cells=4, order=2, basis=bspline())
+    @test estimated(over) ≈ 0.0138854 rtol = 1.0e-5
+    lower = box((0.0, 0.0), (0.5, 0.5))
+    beside = overlay(overlay(space(_AD_Ω; cells=4, order=2), lower; cells=4, order=2, basis=bspline()),
+                     box((0.5, 0.5), (1.0, 1.0)); cells=4, order=2, basis=IntegratedLegendre())
+    @test estimated(beside) ≈ 0.0105092 rtol = 1.0e-5
+    dormant = overlay(overlay(space(_AD_Ω; cells=4, order=2), lower; cells=4, order=2, basis=bspline(),
+                              active=falses(4, 4)), lower; cells=4, order=2, basis=IntegratedLegendre())
+    @test estimated(dormant) ≈ 0.00576587 rtol = 1.0e-5
+end
+
 @testset "estimate does not change when a dormant level is appended" begin
     # The enriched twin needs leaf semantics off for the level it enriches, and only that one. Turning them off for the
     # whole enriched model instead made the indicator a function of which levels happen to be present: appending a level

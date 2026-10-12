@@ -369,9 +369,12 @@ compute the indicator on a model whose forms read that state through the physica
 What it refuses, before anything enriched is built and in messages that name `estimate`: a multi-domain or multi-field
 problem (the one field may carry any number of components), a model that has not been assembled, a `solution` that is
 not one of `model` as it stands (computed on another discretisation, or before a mutation), and an `enrichment` below
-one. It no longer refuses a basis family without a per-cell order — that family is enriched by superposition instead, as
-described above — but the injection still copies coefficients by dof key, so [`Rewire`](@ref)'s
-`_assert_keys_comparable` remains the backstop for a family whose keys would not survive the enrichment it chose.
+one. It does not refuse a basis family without a per-cell order — that family is enriched by superposition instead, as
+described above — but it does refuse, after preparing `V⁺` and before assembling it, an enriched space that does not
+contain `V`. The injection copies coefficients by dof key, so a key that is free in `V` and not in `V⁺` has nowhere to
+go. That happens where a twin, which is placed above every level of `V`, covers a higher level that carries a per-cell
+order: estimate a mixed stack with its B-spline levels above its integrated-Legendre ones (a Legendre base under a
+B-spline overlay estimates, the reverse is refused).
 
 See [`refine`](@ref) for the rest of the loop.
 """
@@ -420,8 +423,26 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     # without capturing it — through a global, which the walk above cannot see — raises at the read rather than reading
     # `model`'s points at the twin's indices (see "Detecting point-keyed state" in `data.jl`).
     plus = _derived(model, enriched_space; options, caches=model.moment_fit_caches, point_base=_FOREIGN_POINTS)
+
+    # Inject before assembling. `Rewire` reads only the two dof layouts, so it needs nothing assembled, and after the
+    # refusals above it has one way left to fail: a key of `V` that `V⁺` does not carry free, i.e. `V⁺ ⊉ V`. The known
+    # cause is a twin covering a level it should not. A twin is appended above every level of `V`, so it covers a
+    # higher level carrying a per-cell order, which in `V⁺` then sheds modes that are free in `V`. The structural fix —
+    # a twin that never covers an original level — belongs to the coverage rule, so here the call is refused under its
+    # own name, with the supported ordering and `Rewire`'s text, and before the enriched assembly rather than after it.
+    injected = try
+        transfer(solution, model, plus; via=Rewire())
+    catch err
+        err isa ArgumentError || rethrow()
+        throw(ArgumentError("estimate: the enriched space V⁺ does not contain V, so the solution cannot be injected " *
+                            "into it. A level enriched by superposition (one without a per-cell order, such as a " *
+                            "B-spline level) gets a refined twin placed above every level of V; where the twin is " *
+                            "live it covers the cells of any higher level that carries a per-cell order, and that " *
+                            "level then sheds modes in V⁺ that are free in V. Place such levels above the " *
+                            "per-cell-order ones. The injection reported: " *
+                            err.msg))
+    end
     assemble!(plus)
-    injected = transfer(solution, model, plus; via=Rewire())
     residual = plus.rhs .- plus.matrix * injected.coefficients
 
     base_keys = Set(_only_field_layout(model.dofs).dofs.raw_keys)
