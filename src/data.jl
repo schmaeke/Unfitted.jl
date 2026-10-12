@@ -146,8 +146,9 @@ end
 # and dictionaries to `depth` levels, skipping arrays of bits types (coefficient vectors, masks, meshes), and returns
 # the first field it finds. Missing one is a false negative and never a false alarm, which is the safe direction for a
 # guard that raises. It reads only what is there: an undefined struct field is skipped, and so is an unassigned array
-# slot — a scratch buffer such as `Vector{Any}(undef, n)` has one, and reading it raised an `UndefRefError` out of
-# `estimate` before the walk reached anything. An array is walked by linear index, which every array supports.
+# slot (`_assigned`) — a scratch buffer such as `Vector{Any}(undef, n)` has one, and reading it raised an
+# `UndefRefError` out of `estimate` before the walk reached anything. A dictionary is walked by its values, never looked
+# up again by its keys: a key mutated after insertion no longer hashes to its slot, and a lookup by it raises.
 #
 # The second layer is `_FOREIGN_CLOUD` and the branch in `getindex`, and it exists because the first has one blind spot
 # that reflection cannot close: a form written at top level reads a *global* binding rather than capturing it, so its
@@ -166,9 +167,8 @@ function _captured_quadfield(x, depth::Int=6)
     depth <= 0 && return nothing
     if x isa Union{Tuple,NamedTuple,AbstractArray,AbstractDict}
         x isa AbstractArray && isbitstype(eltype(x)) && return nothing
-        for i in (x isa AbstractArray ? LinearIndices(x) : keys(x))
-            x isa AbstractArray && !isassigned(x, i) && continue
-            found = _captured_quadfield(x[i], depth - 1)
+        for v in (x isa AbstractDict ? values(x) : x isa AbstractArray ? _assigned(x) : x)
+            found = _captured_quadfield(v, depth - 1)
             found === nothing || return found
         end
         return nothing
@@ -181,6 +181,10 @@ function _captured_quadfield(x, depth::Int=6)
     end
     return nothing
 end
+
+# The elements an array holds, in linear order — every array supports linear indexing — passing over each slot
+# `isassigned` reports empty, which only an array of a non-bits element type can have.
+_assigned(x::AbstractArray) = (x[i] for i in LinearIndices(x) if isassigned(x, i))
 
 # Refuse `verb` on a problem whose forms carry per-quadrature-point state. The message names the field's own pin, which
 # is what identifies the model its `q.point` numbering belongs to. Called by `estimate` (`adaptivity.jl`), whose name it

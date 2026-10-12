@@ -862,6 +862,21 @@ end
     @test_throws "captures a QuadField" estimate(stateful, solve!(stateful))
 end
 
+@testset "the point-keyed-state walk reads a dictionary by its values" begin
+    # A dictionary among a form's captures is walked through its values. Looking each key up again instead fails on a
+    # key mutated after insertion — legal, if unwise — which no longer hashes to its slot: the walk then raised a
+    # `KeyError` out of `estimate` for a form that merely captured such a dictionary.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=2)
+    bc = [dirichlet(0.0; on=boundary(:all))]
+    plain = prepare(poisson(V; source=1.0, dirichlet=bc))
+    table = Dict([1] => 1.0)
+    push!(first(keys(table)), 2)
+    lookup = WeakForm(; linear=q -> 1.0, symmetric=true,
+                      bilinear=(q, trial) -> TestChannels(0.0 * length(table) * trial.value, trial.gradient))
+    keyed = prepare(Problem(V, lookup; dirichlet=bc))
+    @test estimate(keyed, solve!(keyed)).total ≈ estimate(plain, solve!(plain)).total rtol = 1.0e-12
+end
+
 @testset "estimate, refine and coarsen on an immersed domain" begin
     # The fictitious fold writes a mask of its own, and the verbs read masks throughout — the attribution sweep, the h/p
     # decision, the application. None of that was exercised over a `PhysicalDomain` before this testset.
