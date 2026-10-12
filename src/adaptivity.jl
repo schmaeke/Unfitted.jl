@@ -506,10 +506,10 @@ Returns `(level, cell)` pairs — the shape [`decide`](@ref) takes and the same 
 form accepts. A cell whose indicator is zero is never marked: it carries no approximation of its own, because it is
 inactive or because a finer level has taken its region over.
 
-`theta` must lie in `(0, 1]`; at `theta = 1` every cell with a positive indicator is marked. It is the loop's only free
-constant, and the criterion was chosen so it does not have to be refitted per problem: over a factor-three sweep the
-resulting unknown count moves by at most 1.46×, against 1.86× for a smoothness threshold and 1.36× for a benefit/cost
-rule whose informative window is narrower still.
+`theta` must lie in `(0, 1]`; at `theta = 1` every cell with a positive indicator is marked, however small that
+indicator is against the total. It is the loop's only free constant, and the criterion was chosen so it does not have
+to be refitted per problem: over a factor-three sweep the resulting unknown count moves by at most 1.46×, against 1.86×
+for a smoothness threshold and 1.36× for a benefit/cost rule whose informative window is narrower still.
 
 The marked set is extended through the group of equal indicators the `theta` cut lands in. Dörfler asks for a set
 reaching *at least* `theta`, so this is permitted, and it is what keeps a symmetric problem's refinement symmetric:
@@ -533,7 +533,11 @@ function mark_cells(estimate::ErrorEstimate{D,T}; theta::Real=0.5) where {D,T}
     η((k, cell)) = estimate.cells[k][cell]
     marked = sort!(Tuple{Int,CartesianIndex{D}}[(k, cell) for (k, a) in pairs(estimate.cells)
                                                 for cell in CartesianIndices(a) if a[cell] > 0]; by=kc -> -η(kc))
-    isempty(marked) && return marked
+    # At θ = 1 the set is every positive cell by definition, so the prefix is not consulted. It would lose a cell whose
+    # η² lies below the round-off of the running sum (η under about 1e-8 of the total): that term adds nothing, the sum
+    # can reach total² one cell early, and the group extension, read against the cut value, never reaches so small an
+    # indicator either.
+    (isempty(marked) || theta == 1) && return marked
     taken = something(findfirst(>=(theta * estimate.total^2), accumulate(+, η(kc)^2 for kc in marked)), length(marked))
 
     # Extend through the group the cut lands in. Dörfler asks for a MINIMAL set reaching `theta`, and any minimal set

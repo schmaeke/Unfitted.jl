@@ -625,6 +625,21 @@ end
     @test isempty([k for k in eachindex(sums) if sums[k] < 1 && length(mark_cells(est; theta=sums[k])) != k])
 end
 
+@testset "θ = 1 marks every cell with a positive indicator, however small" begin
+    # The docstring's promise, which the prefix alone did not keep. An indicator below about 1e-8 of the total adds
+    # nothing to the running sum of squares, so the sum reached total² before it, and the group extension never reaches
+    # so small a value: here the prefix stopped after the two large cells. The large indicators are dyadic, so total² is
+    # exactly 1.5625 and the early cut is not left to round-off; the scan crosses both levels, and zeros stay unmarked.
+    coarse = [1.0 0.0; 1.0e-9 0.0]
+    fine = [0.0 3.0e-10; 0.75 0.0]
+    est = Unfitted.ErrorEstimate{2,Float64}([coarse, fine], sqrt(sum(abs2, coarse) + sum(abs2, fine)), 1.0, 0.0)
+    @test est.total == 1.25
+    @test mark_cells(est; theta=1.0) ==
+          [(1, CartesianIndex(1, 1)), (2, CartesianIndex(2, 1)), (1, CartesianIndex(2, 1)), (2, CartesianIndex(1, 2))]
+    # Below θ = 1 the prefix rule stands: the two large cells already carry the whole total.
+    @test length(mark_cells(est; theta=prevfloat(1.0))) == 2
+end
+
 @testset "the loop reduces the error and the estimate" begin
     V = ladder(_AD_Ω; cells=4, order=2, depth=3)
     model = prepare(_ad_problem(V))
