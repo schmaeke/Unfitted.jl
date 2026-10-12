@@ -145,7 +145,9 @@ end
 # The walk is bounded rather than exhaustive: it follows struct fields and the elements of tuples, named tuples, arrays
 # and dictionaries to `depth` levels, skipping arrays of bits types (coefficient vectors, masks, meshes), and returns
 # the first field it finds. Missing one is a false negative and never a false alarm, which is the safe direction for a
-# guard that raises.
+# guard that raises. It reads only what is there: an undefined struct field is skipped, and so is an unassigned array
+# slot — a scratch buffer such as `Vector{Any}(undef, n)` has one, and reading it raised an `UndefRefError` out of
+# `estimate` before the walk reached anything. An array is walked by linear index, which every array supports.
 #
 # The second layer is `_FOREIGN_CLOUD` and the branch in `getindex`, and it exists because the first has one blind spot
 # that reflection cannot close: a form written at top level reads a *global* binding rather than capturing it, so its
@@ -164,8 +166,9 @@ function _captured_quadfield(x, depth::Int=6)
     depth <= 0 && return nothing
     if x isa Union{Tuple,NamedTuple,AbstractArray,AbstractDict}
         x isa AbstractArray && isbitstype(eltype(x)) && return nothing
-        for v in (x isa AbstractDict ? values(x) : x)
-            found = _captured_quadfield(v, depth - 1)
+        for i in (x isa AbstractArray ? LinearIndices(x) : keys(x))
+            x isa AbstractArray && !isassigned(x, i) && continue
+            found = _captured_quadfield(x[i], depth - 1)
             found === nothing || return found
         end
         return nothing

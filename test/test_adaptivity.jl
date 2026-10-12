@@ -838,6 +838,30 @@ end
     @test chi[1] == 1.0
 end
 
+@testset "the point-keyed-state walk skips an unassigned slot" begin
+    # The refusal above finds a `QuadField` by walking a form's captures, element by element through an array whose
+    # element type is not a bits type. A slot that was never assigned holds no element, and reading it raised an
+    # `UndefRefError` out of `estimate` for a form that merely captured a `Vector{Any}(undef, 2)` scratch buffer. The
+    # walk skips such a slot: that form estimates as the plain Poisson problem does, and a field held in an assigned
+    # slot behind an unassigned one is still found and refused.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    V = space(Ω; cells=4, order=2)
+    bc = [dirichlet(0.0; on=boundary(:all))]
+    plain = prepare(poisson(V; source=1.0, dirichlet=bc))
+    buffer = Vector{Any}(undef, 2)
+    scratch = WeakForm(; linear=q -> 1.0, symmetric=true,
+                       bilinear=(q, trial) -> TestChannels(0.0 * length(buffer) * trial.value, trial.gradient))
+    stateless = prepare(Problem(V, scratch; dirichlet=bc))
+    @test estimate(stateless, solve!(stateless)).total ≈ estimate(plain, solve!(plain)).total rtol = 1.0e-12
+
+    held = Vector{Any}(undef, 2)
+    held[2] = QuadField{Float64}(plain; init=q -> 1.0)
+    conduction = WeakForm(; linear=q -> 1.0, symmetric=true,
+                          bilinear=(q, trial) -> TestChannels(0.0, held[2][q.point] .* trial.gradient))
+    stateful = prepare(Problem(V, conduction; dirichlet=bc))
+    @test_throws "captures a QuadField" estimate(stateful, solve!(stateful))
+end
+
 @testset "estimate, refine and coarsen on an immersed domain" begin
     # The fictitious fold writes a mask of its own, and the verbs read masks throughout — the attribution sweep, the h/p
     # decision, the application. None of that was exercised over a `PhysicalDomain` before this testset.
