@@ -1032,10 +1032,10 @@ Integrate a user callback over a portion of the boundary or over a coupling inte
     `boundary_integral(q -> 1.0, model; on=boundary(axis=d, side=s))` returns the measure of the face's physical part
     and `integrand` is called only at points inside `Ω`, while `α > 0` blends the full face back in and forfeits both.
     The `cut_facet_region_count` field of [`AssemblyDiagnostics`](@ref) counts how many of the integrated regions needed
-    trimming, and `facet_moment_fit_residual_max` how well their fits went — accurate rather than exact wherever the
-    restricted level set is not one affine function, for which [`boundary`](@ref) gives the condition and the two ways
-    it fails. A selector every one of whose faces lies outside `Ω` carries no quadrature at all under `α = 0` and
-    raises, exactly as a selector no active cell reaches does.
+    trimming, and `facet_moment_fit_residual_max` how well their fits went — exact where the restricted level set is
+    piecewise affine (corners strictly inside the face included) and on one-dimensional facets, accurate rather than
+    exact on a curved cut, as [`boundary`](@ref) details. A selector every one of whose faces lies outside `Ω` carries
+    no quadrature at all under `α = 0` and raises, exactly as a selector no active cell reaches does.
   - A [`BoundaryMesh`](@ref) — a user-supplied immersed-boundary mesh (segments in 2D, triangles in 3D, points in any
     D). The package walks the precomputed per-cell quadrature rules, which integrate any product of two basis functions
     of the covering cells exactly on every sub-cell, oblique or axis-aligned.

@@ -125,9 +125,10 @@ Fields:
     (`:cut_fitted`), the raw Saye rule on the slice when the residual misses the failure threshold (`:cut_fallback`),
     and no rule at all where `Ω ∩ face` carries none (`:cut_failed` / `:cut_alpha_failed`). The residual bounds the
     fit's own compression error — how well the returned rule reproduces the moments the quadrature kernel handed it —
-    and is zero on a model with no cut face. It does **not** bound the kernel's error on those moments, which is a
-    separate and silent ceiling where the restricted tree's leaves meet inside the face box; the condition for an exact
-    facet rule, and both ways it fails, are in [`boundary`](@ref)'s docstring.
+    and is zero on a model with no cut face. It does **not** bound the kernel's error on those moments, a separate and
+    silent ceiling: the moments are exact where the level set restricted to the face is piecewise affine (corners
+    strictly inside the face box included) and on one-dimensional facets, and accurate rather than exact on a curved
+    cut, as [`boundary`](@ref)'s docstring details.
 
     Read a nonzero `facet_fit_failure_count` with `facet_moment_fit_residual_max` beside it, because the two name
     different situations and only one is a warning. A *tangency* — `∂Ω` touching a face without crossing it — classifies
@@ -301,10 +302,10 @@ end
 # A `FacetRegion` is therefore the *whole* grid-aligned face of its parent cells, and where that face leaves Ω the rule
 # on it is the moment fit on the facet's affine slice of Ω rather than an exact tensor product. Every consumer of a
 # facet region inherits that: the L² Dirichlet mass and right-hand side, a Neumann / Robin / Nitsche term placed with
-# `on = boundary(…)`, and `boundary_integral`. That fit is machine-exact only where the restricted level set is a
-# single affine function (`boundary`'s docstring states the condition and both ways it fails), so the count says how
-# much of a model's boundary integration rests on a fitted rule, and `residual_max` says how well those fits reproduced
-# the moments they were given — not how right those moments were.
+# `on = boundary(…)`, and `boundary_integral`. That fit is machine-exact where the restricted level set is piecewise
+# affine and accurate rather than exact on a curved cut (`boundary`'s docstring states the condition), so the count says
+# how much of a model's boundary integration rests on a fitted rule, and `residual_max` says how well those fits
+# reproduced the moments they were given — not how right those moments were.
 #
 # The classification is of the region's own *face*, not of its parent cells, and the distinction is not academic: a cut
 # cell can have a face lying wholly inside Ω, and no trimming is needed there. Classifying the cells would make the
