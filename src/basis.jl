@@ -491,10 +491,16 @@ end
 # gradient) or the tuple `(gradients, scale, der1d)`: the gradient buffer, the per-axis chain-rule factor from reference
 # to physical coordinates (`2 / h_d` on an axis-aligned cell of edge lengths `h_d`, ones for the bare reference
 # gradient), and the derivative tables. It is a type either way, so the gradient work folds away at compile time and one
-# kernel serves both paths without a second copy of the loop to keep in step. The loop is family-agnostic: it only
-# assumes the per-axis tables are indexed by the 1D mode number on the cell, the convention every family here follows.
-# The caller owns every buffer. The "product except one" is `O(D)` per gradient component, `O(D²)` per multi-index, on
-# `NTuple` scratch and allocation-free.
+# loop serves both paths without a second copy to keep in step. The loop is family-agnostic: it only assumes the
+# per-axis tables are indexed by the 1D mode number on the cell, the convention every family here follows. The caller
+# owns every buffer. The "product except one" is `O(D)` per gradient component, `O(D²)` per multi-index, on `NTuple`
+# scratch and allocation-free.
+#
+# The entry point is a thin `@inline` method that unpacks `grad` into plain arguments of the loop's body,
+# `_tensor_kernel!`, so the tuple is taken apart in the caller and never built. Handing the tuple whole to a body that
+# is not inlined was measured 12–15 % slower on the gradient path of a 3D integrated-Legendre level: the caller then
+# stores the tuple to memory on every call, and the body loads the gradient buffer, scale and derivative tables back out
+# of it and roots them in a GC frame twice the size.
 #
 # The buffer checks are `>=`, not `==`. Under a per-cell polynomial order the workspace banks stay sized at the level's
 # *nominal* (maximum) order while `indices` is the cell's own minimum-rule set, which is shorter on every cell below the
@@ -510,19 +516,27 @@ end
 # what makes the nominal-order banks correct, and it is *false* for a family whose 1D modes depend on the degree — de
 # Boor at degree p yields p+1 span-specific functions — which is one more reason `_supports_cell_order` is false for
 # B-splines.
-function _tensor_values!(basis::BasisFamily, values::AbstractVector, indices::AbstractVector{CartesianIndex{D}},
-                         order::NTuple{D,Int}, ξ::SVector{D,T}, val1d, cell::CartesianIndex{D},
-                         grad=nothing) where {D,T}
+@inline function _tensor_values!(basis::BasisFamily, values::AbstractVector, indices::AbstractVector{CartesianIndex{D}},
+                                 order::NTuple{D,Int}, ξ::SVector{D}, val1d, cell::CartesianIndex{D},
+                                 grad=nothing) where {D}
+    gradients, scale, der1d = grad === nothing ? (nothing, nothing, nothing) : grad
+    return _tensor_kernel!(basis, values, gradients, indices, order, ξ, scale, val1d, der1d, cell)
+end
+
+# The body of `_tensor_values!` above, with the gradient buffer, scale and derivative tables as plain arguments, each
+# `nothing` on the values-only path.
+function _tensor_kernel!(basis::BasisFamily, values::AbstractVector, gradients,
+                         indices::AbstractVector{CartesianIndex{D}}, order::NTuple{D,Int}, ξ::SVector{D,T}, scale,
+                         val1d, der1d, cell::CartesianIndex{D}) where {D,T}
     length(values) >= length(indices) || throw(DimensionMismatch("basis value buffer has wrong length"))
-    grad === nothing ||
-        length(grad[1]) >= length(indices) ||
+    gradients === nothing ||
+        length(gradients) >= length(indices) ||
         throw(DimensionMismatch("basis gradient buffer has wrong length"))
-    _fill_factor_tables!(basis, val1d, grad === nothing ? nothing : grad[3], order, ξ, cell)
+    _fill_factor_tables!(basis, val1d, der1d, order, ξ, cell)
     @inbounds for (a, id) in pairs(indices)
         vfac = ntuple(d -> val1d[d][id.I[d] + 1], D)
         values[a] = prod(vfac)
-        grad === nothing && continue
-        gradients, scale, der1d = grad
+        gradients === nothing && continue
         gradients[a] = SVector{D,T}(ntuple(k -> der1d[k][id.I[k] + 1] * _product_except(vfac, k) * scale[k], D))
     end
     return values
