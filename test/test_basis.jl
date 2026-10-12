@@ -1,3 +1,5 @@
+using StaticArrays: SVector
+
 @testset "basis scaffold" begin
     basis = IntegratedLegendre()
 
@@ -36,6 +38,38 @@ end
         h = 1.0e-6
         fd = (Unfitted.integrated_legendre_value(i, ξ + h) - Unfitted.integrated_legendre_value(i, ξ - h)) / (2h)
         @test Unfitted.integrated_legendre_derivative(i, ξ) ≈ fd rtol = 1.0e-7 atol = 1.0e-8
+    end
+end
+
+@testset "the hot factor tables are the closed forms, bit for bit" begin
+    # `_fill_factor_tables!` fills every mode's value and derivative from one Legendre recurrence and one square root
+    # per mode; `integrated_legendre_value` / `_derivative` evaluate each mode from its own closed form and are the
+    # independent reference. They must agree exactly: the recurrence is the same expression, and the derivative's
+    # constant √((2m − 1)/2) is the value's √(4m − 2) halved, which is exact under a correctly rounded square root
+    # because both scalings are powers of two. The values-only call (`der1d === nothing`) must fill the same values.
+    basis = IntegratedLegendre()
+    p = 10
+    for T in (Float64, Float32, BigFloat)
+        @test all(m -> sqrt(T(4m - 2)) / 2 == sqrt(T(2m - 1) / 2), 2:64)
+        for x in T.((-1, -0.7, -0.25, 0, 0.3, 0.85, 1))
+            val1d, der1d, values_only = (Unfitted._factor_buffers((p,), T) for _ in 1:3)
+            Unfitted._fill_factor_tables!(basis, val1d, der1d, (p,), SVector{1,T}(x), CartesianIndex(1))
+            Unfitted._fill_factor_tables!(basis, values_only, nothing, (p,), SVector{1,T}(x), CartesianIndex(1))
+            @test eltype(val1d[1]) === eltype(der1d[1]) === T
+            @test val1d[1] == [Unfitted.integrated_legendre_value(m, x) for m in 0:p]
+            @test der1d[1] == [Unfitted.integrated_legendre_derivative(m, x) for m in 0:p]
+            @test values_only[1] == val1d[1]
+        end
+    end
+
+    # Each axis reads its own coordinate and fills exactly its own order's modes.
+    ξ = SVector(0.35, -0.6, 0.9)
+    order = (4, 10, 2)
+    val1d, der1d = Unfitted._factor_buffers(order, Float64), Unfitted._factor_buffers(order, Float64)
+    Unfitted._fill_factor_tables!(basis, val1d, der1d, order, ξ, CartesianIndex(1, 1, 1))
+    for d in 1:3
+        @test val1d[d] == [Unfitted.integrated_legendre_value(m, ξ[d]) for m in 0:order[d]]
+        @test der1d[d] == [Unfitted.integrated_legendre_derivative(m, ξ[d]) for m in 0:order[d]]
     end
 end
 

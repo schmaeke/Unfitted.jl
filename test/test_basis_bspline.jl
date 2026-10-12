@@ -626,7 +626,7 @@ end
     cell = CartesianIndex(2)
     val1d = (Vector{Float64}(undef, 4),)  # p + 1 = 4
     ξ = SVector(0.5)
-    Unfitted._fill_factor_tables!(fam, val1d, (3,), ξ, cell)
+    Unfitted._fill_factor_tables!(fam, val1d, nothing, (3,), ξ, cell)
     # Direct reference: cell 2 spans t ∈ [0.25, 0.5], midpoint at ξ = 0.5 maps to t = 0.25 + (0.5 + 1) / 2 * 0.25 =
     # 0.25 + 0.1875 = 0.4375.
     P = fam.spaces[1]

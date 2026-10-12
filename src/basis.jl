@@ -23,10 +23,11 @@ A new family `F <: BasisFamily` must provide:
   - `basis_name(::F) -> Symbol` — the short identifier error messages and diagnostics print. There is no `::BasisFamily`
     default, so a family that omits it turns the dof layer's own "not implemented for basis family" message into an
     unrelated `MethodError`.
-  - `_fill_factor_tables!(::F, val1d[, der1d], order, ξ, cell)` — the per-axis 1D value (and derivative) tables at one
-    reference point on one cell. This is the *only* family-specific step on the hot path: tensor-product evaluation,
-    assembly, projection, field evaluation, and the boundary trace all reach the family through it and through nothing
-    else.
+  - `_fill_factor_tables!(::F, val1d, der1d, order, ξ, cell)` — the per-axis 1D value tables at one reference point on
+    one cell, and the derivative tables unless `der1d === nothing`. One method serves both: `der1d` is `nothing` by
+    type on the values-only path, so the derivative work folds away at compile time. This is the *only*
+    family-specific step on the hot path: tensor-product evaluation, assembly, projection, field evaluation, and the
+    boundary trace all reach the family through it and through nothing else.
   - `is_boundary_basis(::F, id, axis, side)` — per-axis facet incidence.
   - the dof-key and overlay-constraint hooks the dof layer needs: `_tensor_dof_key`, `_key_on_level_side`, and either
     the per-raw `_has_overlay_constraint` predicate or a whole-level `_overlay_constraints!` method that records into
@@ -453,64 +454,44 @@ end
 _factor_buffers(order::NTuple{D,Int}, ::Type{T}) where {D,T} = ntuple(d -> Vector{T}(undef, order[d] + 1), D)
 
 # Fill caller-owned per-axis 1D tables for `basis` at one reference point: `val1d[d][i + 1] = N̂ᵢ(ξ[d])` for the
-# `order[d] + 1` 1D modes active on the cell along axis `d`. The 5-arg form fills only values; the 6-arg form
-# additionally fills `der1d[d][i + 1] = N̂ᵢ′(ξ[d])`. The specific recurrence is basis-family-specific (Legendre
-# three-term for integrated Legendre, de Boor for B-splines); both share the same `O(D · (order + 1))` per-point cost so
-# the tensor-product evaluators downstream stay basis-agnostic.
+# `order[d] + 1` 1D modes active on the cell along axis `d`, and, unless `der1d === nothing`, also
+# `der1d[d][i + 1] = N̂ᵢ′(ξ[d])`. One method per family serves both: `der1d` is `nothing` or a tuple of vectors by type,
+# so the derivative work folds away at compile time on the values-only path (the transfer right-hand side and the
+# Dirichlet trace) and no second method can drift from the first. The recurrence is the family's own (Legendre
+# three-term for integrated Legendre, de Boor for B-splines); both cost `O(D · (order + 1))` per point, so the
+# tensor-product kernel downstream stays family-agnostic.
 #
-# `cell::CartesianIndex{D}` is the parent cell's mesh-index along each axis. Integrated Legendre ignores it (its 1D
-# modes are cell-local in the reference frame, identical on every cell); the B-spline family in the extension uses it to
-# look up the knot-vector span the parent cell corresponds to. Callers always pass the same `parent.cell` the rest of
-# the assembly loop uses, so the integrated-Legendre overhead is zero and the B-spline overload gets the lookup for
-# free.
+# `cell::CartesianIndex{D}` is the parent cell's mesh index along each axis. Integrated Legendre ignores it (its 1D
+# modes are cell-local in the reference frame, identical on every cell); the B-spline family in the extension uses it as
+# the knot span the parent cell occupies. Callers always pass the same `parent.cell` the rest of the assembly loop uses,
+# so the integrated-Legendre overhead is zero and the B-spline method gets the span for free.
 #
-# The integrated-Legendre overloads below are the in-package default; additional basis families plug in via further
-# overloads. The B-spline overloads live in `ext/UnfittedBasicBSplineExt.jl`.
-function _fill_factor_tables!(::IntegratedLegendre, val1d, order::NTuple{D,Int}, ξ::SVector{D,T},
-                              ::CartesianIndex{D}) where {D,T}
-    @inbounds for d in 1:D
-        x = ξ[d]
-        p = order[d]
-        vd = val1d[d]
-        vd[1] = (one(T) - x) / 2
-        if p >= 1
-            vd[2] = (one(T) + x) / 2
-        end
-        if p >= 2
-            ℓm2 = one(T)
-            ℓm1 = x
-            for m in 2:p
-                ℓm = ((2m - 1) * x * ℓm1 - (m - 1) * ℓm2) / m
-                vd[m + 1] = (ℓm - ℓm2) / sqrt(T(4m - 2))
-                ℓm2, ℓm1 = ℓm1, ℓm
-            end
-        end
-    end
-    return nothing
-end
-
+# The integrated-Legendre recurrence below is the in-package method; the B-spline one lives in
+# `ext/UnfittedBasicBSplineExt.jl`. Each step of the three-term recurrence yields `Lₘ` from `Lₘ₋₁` and `Lₘ₋₂`, which is
+# all that `N̂ₘ = (Lₘ − Lₘ₋₂) / √(4m − 2)` and `N̂ₘ′ = √((2m − 1)/2) · Lₘ₋₁` need. The derivative's constant is taken
+# from the value's: `√((2m − 1)/2) = √(4m − 2) / 2` holds bit for bit under a correctly rounded square root, because
+# `4m − 2 = 4 · (2m − 1)/2` with both scalings exact powers of two, so the gradient path pays one square root per mode
+# instead of two and returns exactly what the closed forms `integrated_legendre_value` / `_derivative` return.
 function _fill_factor_tables!(::IntegratedLegendre, val1d, der1d, order::NTuple{D,Int}, ξ::SVector{D,T},
                               ::CartesianIndex{D}) where {D,T}
     @inbounds for d in 1:D
         x = ξ[d]
         p = order[d]
         vd = val1d[d]
-        dd = der1d[d]
+        dd = der1d === nothing ? nothing : der1d[d]
         vd[1] = (one(T) - x) / 2
-        dd[1] = -one(T) / 2
+        dd === nothing || (dd[1] = -one(T) / 2)
         if p >= 1
             vd[2] = (one(T) + x) / 2
-            dd[2] = one(T) / 2
+            dd === nothing || (dd[2] = one(T) / 2)
         end
-        if p >= 2
-            ℓm2 = one(T)
-            ℓm1 = x
-            for m in 2:p
-                ℓm = ((2m - 1) * x * ℓm1 - (m - 1) * ℓm2) / m
-                vd[m + 1] = (ℓm - ℓm2) / sqrt(T(4m - 2))
-                dd[m + 1] = sqrt(T(2m - 1) / 2) * ℓm1
-                ℓm2, ℓm1 = ℓm1, ℓm
-            end
+        ℓm2, ℓm1 = one(T), x
+        for m in 2:p
+            ℓm = ((2m - 1) * x * ℓm1 - (m - 1) * ℓm2) / m
+            s = sqrt(T(4m - 2))
+            vd[m + 1] = (ℓm - ℓm2) / s
+            dd === nothing || (dd[m + 1] = s / 2 * ℓm1)
+            ℓm2, ℓm1 = ℓm1, ℓm
         end
     end
     return nothing
@@ -539,7 +520,7 @@ end
 function _tensor_values!(basis::BasisFamily, values::AbstractVector, indices::AbstractVector{CartesianIndex{D}},
                          order::NTuple{D,Int}, ξ::SVector{D,T}, val1d, cell::CartesianIndex{D}) where {D,T}
     length(values) >= length(indices) || throw(DimensionMismatch("basis value buffer has wrong length"))
-    _fill_factor_tables!(basis, val1d, order, ξ, cell)
+    _fill_factor_tables!(basis, val1d, nothing, order, ξ, cell)
     @inbounds for (a, id) in pairs(indices)
         values[a] = prod(ntuple(d -> val1d[d][id.I[d] + 1], D))
     end

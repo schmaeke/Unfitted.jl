@@ -52,8 +52,9 @@ cell-local mode index is mapped to its global 1D function index via the `_AXIS_B
     point evaluators `basis_values` / `physical_basis_gradients` reach the family through the kernels below alone. The
     family declares no mode support of its own either: the `::BasisFamily` default is `:tensor` only, which is exactly
     what this family serves, so `_check_basis_mode` rejects `:trunk` for it.
-  - Hot-path `_fill_factor_tables!` overloads (values, values + derivatives) using `BasicBSpline.bsplinebasisall` per
-    axis after mapping the cell-local reference coordinate `ξ ∈ [−1, 1]` to the knot-vector parameter.
+  - The hot-path `_fill_factor_tables!` method (values, and derivatives unless the caller asks for values only) using
+    `BasicBSpline.bsplinebasisall` per axis after mapping the cell-local reference coordinate `ξ ∈ [−1, 1]` to the
+    knot-vector parameter.
   - `_tensor_dof_key` and `_key_on_level_side` overloads that route through the family's own `_AXIS_BSPLINE` key tag.
   - The `_overlay_constraints!` overload, which carries both artificial-boundary mechanisms and writes them into the dof
     layer's [`EliminationLedger`](@ref). At `continuity = :maximal` it is the **support selection**: a strong
@@ -441,30 +442,14 @@ end
     return t, half_width
 end
 
-# Per-axis B-spline values into `val1d[d]` for one quadrature point. Calls `bsplinebasisall(spaces[d], span, t)` which
-# returns the `p_d + 1` values on `span` as a stack-allocated `SVector{p_d + 1}` — no allocation; the SVector entries
-# are then unrolled into the per-axis buffer.
-function Unfitted._fill_factor_tables!(family::BSplineFamily{D,T,S,DS}, val1d, order::NTuple{D,Int}, ξ::SVector{D,Tξ},
-                                       cell::CartesianIndex{D}) where {D,T,S,DS,Tξ}
-    @inbounds for d in 1:D
-        c = cell.I[d]
-        span = family.cell_to_span[d][c]
-        t, _ = _axis_parameter(family, d, c, ξ[d])
-        values = bsplinebasisall(family.spaces[d], span, t)
-        vd = val1d[d]
-        for i in 1:(order[d]+1)
-            vd[i] = values[i]
-        end
-    end
-    return nothing
-end
-
-# Per-axis B-spline values + reference-frame derivatives. Values from `bsplinebasisall(spaces[d], span, t)`; raw
-# `t`-derivatives from `bsplinebasisall(derivative_spaces[d], span, t)` (a fully unrolled
-# `BasicBSpline.BSplineDerivativeSpace{1, …}` call); reference-frame `ξ`-derivatives obtained by multiplying with
-# `half_width`. The downstream tensor-product kernel multiplies by the assembly-loop `scale[d] = 2 / edge_lengths[d]`
-# factor; the two compose to `dN/dx = dN/dt · (h_d / 2) · (2 / h_d) = dN/dt`, the physical derivative — consistent with
-# the integrated-Legendre chain-rule convention.
+# Per-axis B-spline values into `val1d[d]` for one quadrature point and, unless `der1d === nothing`, reference-frame
+# derivatives into `der1d[d]`: the one factor-table method of this family (see the core's `_fill_factor_tables!` for
+# the contract). `bsplinebasisall(spaces[d], span, t)` returns the `p_d + 1` values on `span` as a stack-allocated
+# `SVector{p_d + 1}` — no allocation — and its entries are unrolled into the per-axis buffer. The raw `t`-derivatives
+# come from `bsplinebasisall(derivative_spaces[d], span, t)` (a fully unrolled `BSplineDerivativeSpace{1, …}` call) and
+# become `ξ`-derivatives by the factor `half_width`. The downstream tensor-product kernel multiplies by the assembly
+# loop's `scale[d] = 2 / edge_lengths[d]`; the two compose to `dN/dx = dN/dt · (h_d / 2) · (2 / h_d) = dN/dt`, the
+# physical derivative — the integrated-Legendre chain-rule convention.
 function Unfitted._fill_factor_tables!(family::BSplineFamily{D,T,S,DS}, val1d, der1d, order::NTuple{D,Int},
                                        ξ::SVector{D,Tξ}, cell::CartesianIndex{D}) where {D,T,S,DS,Tξ}
     @inbounds for d in 1:D
@@ -472,11 +457,14 @@ function Unfitted._fill_factor_tables!(family::BSplineFamily{D,T,S,DS}, val1d, d
         span = family.cell_to_span[d][c]
         t, half_width = _axis_parameter(family, d, c, ξ[d])
         values = bsplinebasisall(family.spaces[d], span, t)
-        derivs = bsplinebasisall(family.derivative_spaces[d], span, t)
         vd = val1d[d]
-        dd = der1d[d]
         for i in 1:(order[d]+1)
             vd[i] = values[i]
+        end
+        der1d === nothing && continue
+        derivs = bsplinebasisall(family.derivative_spaces[d], span, t)
+        dd = der1d[d]
+        for i in 1:(order[d]+1)
             dd[i] = derivs[i] * half_width
         end
     end
