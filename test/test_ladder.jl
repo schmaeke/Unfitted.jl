@@ -9,6 +9,7 @@
 using BasicBSpline
 using LinearAlgebra
 using Random
+using SparseArrays
 
 const LADDER_OMEGA = box((0.0, 0.0), (1.0, 1.0))
 ladder_bc() = [dirichlet(0.0; on=boundary(:all))]
@@ -384,6 +385,16 @@ end
     end
     @test agrees
     @test raised >= 9                                       # grading moved at least half of the 18 graded maps
+
+    # Any integer array of the base grid's shape is a depth map, not only a dense one: a mostly-zero map is naturally
+    # sparse. Grading once failed on it, because the threshold sets kept the sparse container and the dilation takes
+    # only a `BitArray`.
+    V = ladder(LADDER_OMEGA; cells=8, order=2, depth=3, splits=2)
+    d = spzeros(Int, 8, 8)
+    d[4, 4] = 3
+    @test all(grade -> Unfitted.depth_masks(V, d; grade=grade) == Unfitted.depth_masks(V, Matrix(d); grade=grade), 0:2)
+    @test all(k -> active_cells(adapt(V, d; grade=1); level=k) == active_cells(adapt(V, Matrix(d); grade=1); level=k),
+              1:4)
 end
 
 @testset "adapt takes a depth map in 1D" begin

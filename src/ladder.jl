@@ -415,8 +415,10 @@ function depth_masks(V::Space{D}, depths::AbstractArray{<:Integer,D}; grade::Int
     #
     # The selections are `BitArray`s over the base grid, which is a cell selection in every dimension. `findall` is
     # not: on a `Vector` it returns plain `Int` indices rather than `CartesianIndex{1}`, which `overlapping_cells`
-    # rejects, so a 1D ladder with an overlay could not take a depth map at all.
-    G = [depths .>= t for t in 1:maxdepth]
+    # rejects, so a 1D ladder with an overlay could not take a depth map at all. The element type is stated, not left
+    # to the broadcast: `.>=` keeps the input's container, so a sparse or static depth map would give sets the
+    # dilation does not take. A dense array already broadcasts to a `BitArray`, which the conversion passes through.
+    G = BitArray{D}[depths .>= t for t in 1:maxdepth]
     if grade > 0
         for t in (maxdepth-grade):-1:1
             G[t] .|= _dilate_cells(G[t + grade], ntuple(_ -> 1, D))
