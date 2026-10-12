@@ -368,7 +368,9 @@ function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_
     # Rewire walks raw `TensorDofKey`s, never the geometry — the geometric merge tolerance accepted by `transfer` has no
     # role here and is ignored on purpose.
     _assert_transfer_compatible(source_model, target_model)
-    _assert_keys_comparable(source_model, target_model)
+    for field in source_model.problem.fields
+        _assert_keys_comparable(field.space, _field_space(target_model.problem, field.name))
+    end
     source_coefficients = _checked_coefficients(source_solution, source_model)
 
     source_layout = source_model.dofs
@@ -437,8 +439,12 @@ end
 #
 # `domain` and `cells` settle it between them: a `CartesianMesh`'s `axes` are derived from exactly those two by
 # `_mesh_axes` (mesh.jl), and `AxisBox` equality is corner-wise and bit-exact for meshes built that way.
-function _assert_keys_comparable(source_model::Model, target_model::Model)
-    src, tgt = source_model.problem.space, target_model.problem.space
+#
+# The two spaces compared are one field's own, on either side, and the caller passes every field's pair. Comparing
+# `problem.space` alone covers only the first subdomain of a coupled model: re-meshing the second from 3² to 4² cells
+# kept every source key present in the target, so strict Rewire raised nothing and returned u₂ = 0.04 at a point where
+# the source was 1.0.
+function _assert_keys_comparable(src::Space, tgt::Space)
     for k in 1:min(length(src.levels), length(tgt.levels))
         a, b = src.levels[k], tgt.levels[k]
         typeof(a.basis) === typeof(b.basis) ||

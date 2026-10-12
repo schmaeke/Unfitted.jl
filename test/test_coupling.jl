@@ -186,6 +186,19 @@ end
     @test value(rewired, target, u2, (2.95, 0.95)) ≈ 1.0
 end
 
+@testset "Rewire compares every field's own space" begin
+    # A dof key names the same function only while both sides index the same mesh, and Rewire refuses a pair whose
+    # meshes differ. It used to compare `problem.space` alone, which on a coupled model is the first subdomain's: with
+    # the second re-meshed from 3² to 4² cells every source key was still present in the target, so strict Rewire
+    # raised nothing and returned u₂(2.95, 0.95) = 0.04 against a source of 1.0. Each field is read on its own space,
+    # so the second subdomain's mesh change raises in either strict mode, as a single-domain one does.
+    source, s, _, _ = coupled_squares(3)
+    target, _, _, _ = coupled_squares(4)
+    for strict in (true, false)
+        @test_throws "is meshed as" transfer(s, source, target; via=Rewire(; strict=strict))
+    end
+end
+
 @testset "one single-sided on= mesh shared across subdomains serves both" begin
     # A single BoundaryMesh object used as the `on=` target for weak forms on two different subdomains used to be
     # rejected at assembly, because one region list serves one space and the second subdomain's contribution would have
