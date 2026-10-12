@@ -942,16 +942,11 @@ end
 # any other `on` is left to assembly, which raises on it. A condition with `field === nothing` (only legal on a
 # single-field problem) lands on that problem's one space.
 function _referenced_targets(problem::Problem)
-    return Iterators.flatten((((c.boundary, _condition_space(problem, c)) for c in problem.dirichlet),
+    return Iterators.flatten((((c.boundary, c.field === nothing ? problem.space : _field_space(problem, c.field))
+                               for c in problem.dirichlet),
                               ((f.on, f.on isa Interface ? nothing : _field_space(problem, f.test_name))
                                for f in (problem.blocks..., problem.loads...)
                                if f.on isa Union{BoundarySelector,BoundaryMesh,Interface})))
-end
-
-# The subdomain space a Dirichlet condition constrains. `field === nothing` is only reachable on a single-field problem
-# (the multi-field constructors demand a name), where the representative space *is* that field's space.
-function _condition_space(problem::Problem, condition)
-    condition.field === nothing ? problem.space : _field_space(problem, condition.field)
 end
 
 # The regions of one `on=` target on space `V`: how `prepare` fills `Model.regions`, and how assembly resolves a target
@@ -1744,9 +1739,8 @@ function _level_report(level, V::Space, tol::GeometryTolerance, layout::SystemLa
     # `order` stays the level's nominal (maximum) per-axis order, so an existing reader keeps reading the same field
     # with the same meaning. `order_palette` carries the distinct per-cell orders — a one-element vector on a uniform
     # level — so a graded run is reproducible from the report without the entry's type varying from level to level.
-    order_palette = copy(level.orders.palette)
     return (; id=level.id, role=level.role, cells=level.mesh.cells, order=nominal_order(level),
-            order_palette=order_palette, mode=_mode(level.basis), basis=basis_name(level.basis),
+            order_palette=copy(level.orders.palette), mode=_mode(level.basis), basis=basis_name(level.basis),
             domain=level.mesh.domain, nested=nested, raw_functions=length(raws),
             active_functions=count(r -> any(!iszero, view(dofs.active_component, r, :)), raws),)
 end
