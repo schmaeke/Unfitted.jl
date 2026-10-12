@@ -41,9 +41,10 @@ numbers a different and larger set of points, so a `qf[q.point]` there would rea
 the wrong point. Such a read raises, and `estimate` refuses outright when it can see the field among a form's captures.
 Ordinary assembly, and every read against the model the field was built on, is unaffected.
 
-`QuadField{T}(model; init)` walks the volume through [`foreach_quadrature_point`](@ref) and is single-domain only — on a
-coupled model it raises. Sizing against `nquadpoints(model)`, as the `QuadField(data, model)` form does, is not enough
-there: `q.point` restarts at 1 for each subdomain, so one flat array would alias the subdomains onto each other.
+Both constructors are single-domain only and raise on a coupled model. `q.point` restarts at 1 for each subdomain, so
+one flat array — sized by `nquadpoints(model)`, the sum over the subdomains, as `QuadField(data, model)` checks — would
+alias the subdomains onto each other, and `QuadField{T}(model; init)`, which walks the volume through
+[`foreach_quadrature_point`](@ref), has no single list to walk there either.
 """
 mutable struct QuadField{T}
     data::Vector{T}
@@ -51,6 +52,7 @@ mutable struct QuadField{T}
 end
 
 function QuadField(data::AbstractVector{T}, model::Model) where {T}
+    _assert_single_domain(model, "QuadField")
     length(data) == nquadpoints(model) ||
         throw(DimensionMismatch("QuadField data length $(length(data)) does not match " *
                                 "nquadpoints(model) = $(nquadpoints(model))"))

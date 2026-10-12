@@ -156,6 +156,12 @@ end
     @test_throws ArgumentError foreach_quadrature_point(q -> nothing, model)
     @test_throws "field=" foreach_quadrature_point(q -> nothing, model)
     @test_throws ArgumentError QuadField{Float64}(model)
+
+    # Wrapping a vector is refused for the same reason. Its length check reads `nquadpoints(model)`, the sum over both
+    # subdomains (72 points here), which `q.point` never spans: the wrapper used to accept it, and a form on either
+    # subdomain then read its points from the same leading slots.
+    @test nquadpoints(model) == 72
+    @test_throws "multi-domain" QuadField(zeros(nquadpoints(model)), model)
 end
 
 # Two disjoint unit squares as one coupled problem, the second meshed with `cells2` cells per axis, and the solution
