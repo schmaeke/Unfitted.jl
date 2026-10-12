@@ -431,6 +431,12 @@ end
     @test nquadpoints(model; kind=:interface) ==
           sum(length(r.weights) for (key, list) in model.regions if first(key) isa Interface for r in list)
     @test_throws ArgumentError nquadpoints(model; kind=:nonsense)
+
+    # The plan statistics of a coupled model are sums over its subdomains' plans, one plan per subdomain.
+    plans = Unfitted.integration_plans(model)
+    @test length(plans) == 2
+    @test diagnostics(model).integration_regions == sum(length(p.regions) for p in plans)
+    @test diagnostics(model).integration_regions > maximum(length(p.regions) for p in plans)
 end
 
 # Symmetric weighted-Nitsche coupling via a two-sided InterfaceForm (κ=1, w=½). The interface normal must point a→b; the
