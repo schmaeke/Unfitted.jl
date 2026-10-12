@@ -345,6 +345,24 @@ end
     end
 end
 
+@testset "a closed surface on the grid planes is integrated once" begin
+    # Regression (fixed with F4). Every face of this cube lies in an interior grid plane of the 4³ grid. The triangle
+    # clipper once visited the cells under a triangle's bounding box widened by an absolute `nudge` — for a triangle in
+    # a grid plane, the cells on both sides of it — and its nudge-tolerant half-space clip kept the whole triangle in
+    # each, so every face was integrated twice: area 3.0 and ∯ x·n = 0.25. The plane splitter splits a piece only at
+    # the lines strictly inside its extent, so an in-plane triangle stays whole and its midpoint picks one cell.
+    V = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(4, 4, 4), order=1)
+    a, b = 0.25, 0.75
+    vertices = [SVector(x, y, z) for z in (a, b) for y in (a, b) for x in (a, b)]
+    faces = [(1, 3, 2), (2, 3, 4), (5, 6, 7), (6, 8, 7), (1, 2, 5), (2, 6, 5), (3, 7, 4), (4, 7, 8), (1, 5, 3),
+             (3, 5, 7), (2, 4, 6), (4, 8, 6)]                       # outward, two triangles per face
+    Γ = triangle_mesh(vertices, faces)
+    u = field(:u, V)
+    model = prepare(Problem((u,); loads=(loadform(u, source_form(source=0.0); on=Γ),)))
+    @test boundary_integral(q -> 1.0, model; on=Γ) ≈ 6 * (b - a)^2 rtol = 1.0e-14
+    @test boundary_integral(q -> q.x[1] * q.normal[1], model; on=Γ) ≈ (b - a)^3 rtol = 1.0e-14   # the volume
+end
+
 @testset "BoundaryMesh: subdivision preserves per-cell normals" begin
     # User-supplied normal on a single segment that gets split by the subdivision into multiple sub-segments. Every
     # sub-segment must inherit the original normal.

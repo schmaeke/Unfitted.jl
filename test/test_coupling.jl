@@ -658,3 +658,19 @@ end
         @test maximum(abs, trace - volume) / maximum(abs, volume) < 1.0e-13
     end
 end
+
+@testset "a 3D interface on the plane two subdomains share is integrated once" begin
+    # Regression (fixed with F4). Two stacked boxes with non-matching grids meet in the plane z = 0.5, and the interface
+    # is a square in that plane. The triangle clipper once kept a triangle lying in a grid plane whole in the cells on
+    # both sides of it — here the slab below z = 0.5 and the slab above — and both copies found parents on both sides,
+    # so the interface measured 1.28 instead of its area 0.64.
+    V1 = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 0.5)); cells=(2, 2, 1), order=1)
+    V2 = space(box((0.0, 0.0, 0.5), (1.0, 1.0, 1.0)); cells=(3, 3, 1), order=1)
+    u1, u2 = field(:u1, V1), field(:u2, V2)
+    square = [SVector(0.1, 0.1, 0.5), SVector(0.9, 0.1, 0.5), SVector(0.9, 0.9, 0.5), SVector(0.1, 0.9, 0.5)]
+    Γ = triangle_mesh(square, [(1, 2, 3), (1, 3, 4)])
+    model = prepare(Problem((u1, u2);
+                            blocks=(stiffness_block(u1), stiffness_block(u2),
+                                    couple(u1, u2, Γ, mass_form(coefficient=1.0))...)))
+    @test boundary_integral(q -> 1.0, model; on=interface(u1, u2, Γ)) ≈ 0.64 rtol = 1.0e-14
+end
