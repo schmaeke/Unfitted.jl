@@ -103,7 +103,7 @@ end
 function _fill_bank!(bank::BasisBank{D,T}, levels::Tuple) where {D,T}
     for level in levels
         i, p = level.id, nominal_order(level)
-        nbasis = length(local_basis_indices(level.basis, p, level.mode))
+        nbasis = length(local_basis_indices(level.basis, p))
         bank.bases[i] = level.basis
         bank.modes[i] = _cell_locals(level)
         bank.orders[i] = p

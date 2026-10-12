@@ -50,8 +50,9 @@ cell-local mode index is mapped to its global 1D function index via the `_AXIS_B
     `local_basis_count` (an open-knot span carries exactly the full `∏_d {0, …, p_d}` set),
     `recommended_quadrature_order`, `is_facet_basis`, `boundary_basis_indices`, and the boundary trace; the level-keyed
     point evaluators `basis_values` / `physical_basis_gradients` reach the family through the kernels below alone. The
-    family declares no mode support of its own either: the `::BasisFamily` default is `:tensor` only, which is exactly
-    what this family serves, so `_check_basis_mode` rejects `:trunk` for it.
+    family declares no mode support of its own either: the `::BasisFamily` default `_with_mode` accepts `:tensor` only,
+    which is exactly what this family serves, so it rejects `:trunk` for both the deferred spec and the concrete family
+    before a level is built.
   - The hot-path `_fill_factor_tables!` method (values, and derivatives unless the caller asks for values only) using
     `BasicBSpline.bsplinebasisall` per axis after mapping the cell-local reference coordinate `ξ ∈ [−1, 1]` to the
     knot-vector parameter.
@@ -91,8 +92,8 @@ using Unfitted
 # written `Unfitted.f(...)` at its definition, which needs no import. The list is therefore an honest measure of how far
 # the extension reaches into the package.
 using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, AxisDofKey, TensorDofKey, EliminationLedger,
-                _LevelContext, _eliminate!, _constrain!, _pivot!, is_active, AxisBox, _check_basis_mode,
-                _level_side_is_physical, _tensor_dof_key, _Fold, _is_fictitious, _is_void
+                _LevelContext, _eliminate!, _constrain!, _pivot!, is_active, AxisBox, _level_side_is_physical,
+                _tensor_dof_key, _Fold, _is_fictitious, _is_void
 using StaticArrays: SVector
 using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim, knotvector
 
@@ -309,9 +310,8 @@ end
 # mechanism costs the caller nothing and saves the dof layer a pass. The family keeps the request as given rather than
 # rewriting it to the sentinel: the equivalence holds at this degree only, and a level rebuilt at another degree must
 # be judged against what was asked.
-function Unfitted.instantiate_basis(spec::_BSplineSpec, mesh::CartesianMesh{D,T}, order::NTuple{D,Int},
-                                    mode::Symbol) where {D,T<:Real}
-    _check_basis_mode(spec, mode, order)
+function Unfitted.instantiate_basis(spec::_BSplineSpec, mesh::CartesianMesh{D,T},
+                                    order::NTuple{D,Int}) where {D,T<:Real}
     all(p -> p >= 1, order) || throw(ArgumentError("bspline order (per-axis polynomial degree) must be ≥ 1"))
     m = spec.continuity
     m == _MAXIMAL_CONTINUITY && return _materialize(spec, mesh, order)
@@ -344,12 +344,12 @@ end
 # refinement twin and the adaptive rebuild. It is the spec method on the family's own request, so each of them re-runs
 # the continuity bound, the clamped thinness check and the mechanism choice exactly as a fresh build of the same request
 # would, and a rebuild that keeps the mesh and the order reproduces an equal family. A family that kept its stored
-# continuity instead, with only the mode checked, let an inherited or elevated level carry a continuity its new degree
+# continuity instead, re-checked for nothing else, let an inherited or elevated level carry a continuity its new degree
 # cannot have (`C¹` at degree 1), be thinner than the clamped mechanism needs, or keep a mechanism its new degree no
 # longer implies (a `C²` request inherited at degree 4 silently became `C³`).
-function Unfitted.instantiate_basis(family::BSplineFamily, mesh::CartesianMesh{D,T}, order::NTuple{D,Int},
-                                    mode::Symbol) where {D,T<:Real}
-    return Unfitted.instantiate_basis(_BSplineSpec(family.continuity), mesh, order, mode)
+function Unfitted.instantiate_basis(family::BSplineFamily, mesh::CartesianMesh{D,T},
+                                    order::NTuple{D,Int}) where {D,T<:Real}
+    return Unfitted.instantiate_basis(_BSplineSpec(family.continuity), mesh, order)
 end
 
 # ── Knot-vector construction ──────────────────────────────────────────────────
@@ -389,8 +389,8 @@ end
 # ── Basis-interface methods ───────────────────────────────────────────────────
 
 Unfitted.basis_name(::BSplineFamily) = :bspline
-# The deferred spec answers to the same name: it is the family the user asked for, and `_check_basis_mode` reports
-# through `basis_name` while validating a `space(...; basis=bspline(), mode=…)` call, before the spec is materialised.
+# The deferred spec answers to the same name: it is the family the user asked for, and `_with_mode` reports through
+# `basis_name` while validating a `space(...; basis=bspline(), mode=…)` call, before the spec is materialised.
 Unfitted.basis_name(::_BSplineSpec) = :bspline
 
 # ── Boundary / facet incidence ────────────────────────────────────────────────
@@ -853,7 +853,7 @@ function Unfitted._reproduces(k::Level{D,T,<:BSplineFamily}, level::Level{D,T,<:
 end
 
 function Unfitted._reproduces(k::Level{D,T,<:IntegratedLegendre}, level::Level{D,T,<:BSplineFamily}) where {D,T<:Real}
-    k.mode === :tensor || return false
+    k.basis.trunk && return false
     p = ntuple(d -> degree(level.basis.spaces[d]), D)
     # `nominal_order(k)` is the level's per-axis maximum, which is not enough when `k` carries a per-cell order: a
     # single cell below `p` anywhere under the buried function's support cannot reproduce it. Requiring every palette

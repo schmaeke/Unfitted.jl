@@ -145,7 +145,7 @@ end
     model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     assemble!(model)
-    @test V.levels[1].mode == :trunk
+    @test Unfitted._mode(V.levels[1].basis) == :trunk
     @test size(model.matrix) == (1, 1)
     @test model.matrix[1, 1] > 0.0
     @test model.rhs[1] > 0.0

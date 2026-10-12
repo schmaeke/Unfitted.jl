@@ -349,9 +349,21 @@ small interface.
 A basis family must provide, directly or through a compact trait-like
 interface:
 
-  - the number and identity of local basis functions for a cell or span;
+  - the number and identity of local basis functions for a cell or span:
+    `local_basis_indices(F, order)`, one form, whose family value carries
+    the basis mode. The `mode` keyword of `space` / `overlay` / `ladder` is
+    folded into the family once, when a level is built, by
+    `_with_mode(F, mode)` (the `::BasisFamily` default serves `:tensor`
+    alone; integrated Legendre adds `:trunk`), so no index-set question
+    takes a mode argument and `_mode(F)` reads it back;
+  - `instantiate_basis(F, mesh, order)` when the concrete family depends on
+    the level's mesh (the B-spline knot vectors), run on every build and
+    rebuild of a level;
   - the active basis functions covering an element or integration box;
-  - values and physical/reference gradients at quadrature points;
+  - values and physical/reference gradients at quadrature points, through
+    the one per-family `_fill_factor_tables!` hook that the hot path and
+    the level-keyed evaluators `basis_values(level, cell, ξ)` /
+    `physical_basis_gradients(level, cell, box, ξ)` share;
   - a tensor-product ordering convention;
   - support information sufficient for overlap queries and assembly;
   - boundary or entity association information needed for physical
@@ -785,8 +797,8 @@ superposition idea for its own enrichment.
     buffers, where over-sizing is safe; and the order a new `overlay` or a
     re-instantiated basis family inherits. `Level.modes` is the derived
     minimum-rule table (`CellModes`), computed by `Level`'s inner
-    constructor from the orders, the mesh, the mode and the mask, and never
-    supplied by a caller.
+    constructor from the orders, the mesh, the family (which carries the
+    basis mode) and the mask, and never supplied by a caller.
   - **Order ≥ 1 per cell** is enforced per palette entry at construction, and
     `mode = :trunk` requires isotropy per cell. Neither can be expressed by
     the minimum rule: the dof key collapses the two endpoint modes into one

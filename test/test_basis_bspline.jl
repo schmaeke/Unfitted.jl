@@ -44,16 +44,19 @@ end
     # `local_basis_indices` / `local_basis_count` come from the `::BasisFamily` tensor defaults: an open-knot span
     # carries the full ∏_d {0, …, p_d} set, so the family adds nothing of its own here.
     @test Unfitted.local_basis_indices(fam, (1, 2))[1] == CartesianIndex(0, 0)
-    @test Unfitted.local_basis_indices(fam, (1, 2)) == Unfitted.local_basis_indices(fam, (1, 2), :tensor)
-    @test Unfitted.local_basis_count(fam, (3, 3), :tensor) == 16
+    @test Unfitted._with_mode(fam, :tensor) === fam
+    @test Unfitted.local_basis_indices(Unfitted._with_mode(fam, :tensor), (1, 2)) ==
+          Unfitted.local_basis_indices(fam, (1, 2))
+    @test Unfitted.local_basis_count(Unfitted._with_mode(fam, :tensor), (3, 3)) == 16
     # `dim` per axis = cells + p (open knot, no junctions, m=0).
     @test BasicBSpline.dim.(fam.spaces) == (7, 7)
 
-    # The family declares only `:tensor`, so the core mode check — not a hand-written guard in the extension — rejects
-    # integrated Legendre's `:trunk` for it, at `space` time.
-    @test Unfitted._supported_modes(fam) == (:tensor,)
+    # The family carries only `:tensor`, so the core mode check — not a hand-written guard in the extension — rejects
+    # integrated Legendre's `:trunk` for it, at `space` time and for the deferred spec and the concrete family alike.
+    @test Unfitted._mode(fam) === :tensor
     @test_throws ArgumentError space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=3, basis=bspline(), mode=:trunk)
-    @test_throws ArgumentError Unfitted.local_basis_indices(fam, (3, 3), :trunk)
+    @test_throws ArgumentError Unfitted._with_mode(fam, :trunk)
+    @test_throws ArgumentError Unfitted._with_mode(fam_marker, :trunk)
 end
 
 # What a B-spline level's family is: its mechanism, the continuity it was asked for, and its per-axis degrees and knots.
@@ -1190,7 +1193,7 @@ function _span_contains_by_definition(k, level)
     p = ntuple(d -> degree(level.basis.spaces[d]), 2)
     k.basis isa BSExt.BSplineFamily && return all(d -> degree(k.basis.spaces[d]) == p[d], 1:2)
     k.basis isa Unfitted.IntegratedLegendre || return false
-    k.mode === :tensor || return false
+    Unfitted._mode(k.basis) === :tensor || return false
     return all(o -> all(d -> o[d] >= p[d], 1:2), k.orders.palette)
 end
 

@@ -1118,7 +1118,7 @@ function _discretisation_pin(spaces, layout::SystemLayout)
         for level in V.levels
             h = _pin(h, level.id)
             h = _pin(h, level.role)
-            h = _pin(h, level.mode)
+            h = _pin(h, _mode(level.basis))
             h = _pin(h, basis_name(level.basis))
             h = _pin(h, level.mesh.domain.lower)
             h = _pin(h, level.mesh.domain.upper)
@@ -1832,7 +1832,7 @@ function _level_report(level, V::Space, tol::GeometryTolerance, layout::SystemLa
     # level — so a graded run is reproducible from the report without the entry's type varying from level to level.
     order_palette = copy(level.orders.palette)
     return (; id=level.id, role=level.role, cells=level.mesh.cells, order=nominal_order(level),
-            order_palette=order_palette, mode=level.mode, basis=basis_name(level.basis), domain=level.mesh.domain,
-            nested=nested, raw_functions=length(raws),
+            order_palette=order_palette, mode=_mode(level.basis), basis=basis_name(level.basis),
+            domain=level.mesh.domain, nested=nested, raw_functions=length(raws),
             active_functions=count(r -> any(!iszero, view(dofs.active_component, r, :)), raws),)
 end

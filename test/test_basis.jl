@@ -14,7 +14,7 @@ end
     basis = IntegratedLegendre()
     @test_throws ArgumentError Unfitted.local_basis_count(basis, (0, 0))
     @test_throws ArgumentError Unfitted.local_basis_count(basis, (2, 0))
-    @test_throws ArgumentError Unfitted.local_basis_count(basis, (0, 2), :tensor)
+    @test_throws ArgumentError Unfitted.local_basis_count(Unfitted._with_mode(basis, :trunk), (0, 0))
     for order in ((1,), (2, 3), (1, 2, 3), (4, 4, 4))
         @test Unfitted.local_basis_count(basis, order) ==
               length(Unfitted.local_basis_indices(basis, order)) ==
@@ -116,36 +116,44 @@ end
 
 @testset "trunk basis filtering" begin
     basis = IntegratedLegendre()
+    # The mode is folded into the family: `_with_mode` is what `space`, `overlay` and `ladder` apply to their `mode`
+    # keyword, and every index-set question then takes the family alone.
+    trunk = Unfitted._with_mode(basis, :trunk)
 
     # 2D counts: trunk trims only the interior, so p=2 (no interior modes yet) matches tensor minus the single (2,2)
     # interior mode.
-    @test Unfitted.local_basis_count(basis, (2, 2), :trunk) == 8
-    @test Unfitted.local_basis_count(basis, (3, 3), :trunk) == 12
+    @test Unfitted.local_basis_count(trunk, (2, 2)) == 8
+    @test Unfitted.local_basis_count(trunk, (3, 3)) == 12
     # 3D is where trunk pays off: the interior face/volume modes are the bulk of the tensor count at moderate order.
-    @test Unfitted.local_basis_count(basis, (2, 2, 2), :trunk) == 20
-    @test Unfitted.local_basis_count(basis, (3, 3, 3), :trunk) == 32
-    @test Unfitted.local_basis_count(basis, (4, 4, 4), :trunk) == 50
+    @test Unfitted.local_basis_count(trunk, (2, 2, 2)) == 20
+    @test Unfitted.local_basis_count(trunk, (3, 3, 3)) == 32
+    @test Unfitted.local_basis_count(trunk, (4, 4, 4)) == 50
 
     # Edge modes survive up to degree p; interior modes only while their bubble degrees sum to ≤ p, so (2,2) is dropped
     # at p=3 and reappears at p=4.
-    @test CartesianIndex(2, 2) ∉ Unfitted.local_basis_indices(basis, (2, 2), :trunk)
-    @test CartesianIndex(3, 1) ∈ Unfitted.local_basis_indices(basis, (3, 3), :trunk)
-    @test CartesianIndex(2, 2) ∉ Unfitted.local_basis_indices(basis, (3, 3), :trunk)
-    @test CartesianIndex(2, 2) ∈ Unfitted.local_basis_indices(basis, (4, 4), :trunk)
-    @test_throws ArgumentError Unfitted.local_basis_indices(basis, (2, 3), :trunk)
+    @test CartesianIndex(2, 2) ∉ Unfitted.local_basis_indices(trunk, (2, 2))
+    @test CartesianIndex(3, 1) ∈ Unfitted.local_basis_indices(trunk, (3, 3))
+    @test CartesianIndex(2, 2) ∉ Unfitted.local_basis_indices(trunk, (3, 3))
+    @test CartesianIndex(2, 2) ∈ Unfitted.local_basis_indices(trunk, (4, 4))
+    @test_throws ArgumentError Unfitted.local_basis_indices(trunk, (2, 3))
 
     values = Unfitted.basis_values(_reference_level((1, 1); mode=:trunk), _reference_cell((1, 1)), (0.2, -0.3))
     @test length(values) == 4
     @test sum(values) ≈ 1.0
 
-    # Mode validation is family-aware: integrated Legendre is the family that declares `:trunk`, and a mode name no
-    # family defines is rejected by the family-blind gate the family-aware form delegates to. The B-spline suite covers
-    # the other branch — a defined mode a family does not carry.
-    @test Unfitted._supported_modes(basis) == (:tensor, :trunk)
-    @test Unfitted._check_basis_mode(basis, :trunk, (2, 2)) === :trunk
-    @test_throws ArgumentError Unfitted._check_basis_mode(basis, :serendipity, (2, 2))
+    # Mode validation is family-aware: integrated Legendre is the family that carries `:trunk` as well as `:tensor`, and
+    # a mode name no family defines is rejected before any family is asked. The B-spline suite covers the other branch —
+    # a defined mode a family does not carry. The keyword always wins, so a trunk family asked for `:tensor` gets
+    # `:tensor`, and `_mode` reads the mode back.
+    @test all(m -> Unfitted._mode(Unfitted._with_mode(basis, m)) === m, (:tensor, :trunk))
+    @test Unfitted._mode(Unfitted._with_mode(trunk, :tensor)) === :tensor
+    @test Unfitted._mode(basis) === :tensor
+    @test_throws ArgumentError Unfitted._with_mode(basis, :serendipity)
+    # The tensor family keeps its one public spelling as its display; the trunk one is marked.
+    @test sprint(show, basis) == "IntegratedLegendre()"
+    @test sprint(show, trunk) != sprint(show, basis)
 
-    lower = Unfitted.boundary_basis_indices(basis, (2, 2); axis=1, side=:lower, mode=:trunk)
+    lower = Unfitted.boundary_basis_indices(trunk, (2, 2); axis=1, side=:lower)
     @test length(lower) == 3
     @test all(id.I[1] == 0 for id in lower)
 end

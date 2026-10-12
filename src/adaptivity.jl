@@ -461,11 +461,13 @@ end
 # `factor` is an integer, so the twin's knot lines contain the level's and the two spline spaces nest — which is what
 # makes `V⁺ ⊇ V` and the injection exact. The mask is mapped child-to-parent so the twin is live exactly where the level
 # is, and its own selection rule then trims it to the functions that fit, exactly as it does for any level. `repeat`
-# with `inner` is that map: it writes each parent bit over its `factor`^D children, as `_coarse_cell` reads it back.
+# with `inner` is that map: it writes each parent bit over its `factor`^D children, as `_coarse_cell` reads it back. The
+# mode is passed as the level's own, because `overlay` applies its `mode` keyword to the family it is given and
+# defaults it to the base level's mode, which an overlay's twin need not share.
 function _refinement_twin(W::Space{D,T}, level::Level{D,T}, factor::Int) where {D,T}
     mask = level.mask === nothing ? nothing : repeat(level.mask.on; inner=ntuple(_ -> factor, D))
     return overlay(W, level.mesh.domain; cells=level.mesh.cells .* factor, order=nominal_order(level),
-                   basis=level.basis, mode=level.mode, active=mask)
+                   basis=level.basis, mode=_mode(level.basis), active=mask)
 end
 
 # The cell of a level that cell `c` of its `f`-fold refinement lies in, and `c` itself at `f = 1`: where `estimate`
@@ -1255,7 +1257,7 @@ function _apply(e::_StackEdit)
         mask = m === nothing ? old.mask : _collapse_mask(m)
         level = isempty(changed) ? _level(old; mask) :
                 _new_level(old.id, old.role, old.mesh, old.basis,
-                           _normalize_order(_pair_orders(V, k, changed), old.mesh), old.mode, mask)
+                           _normalize_order(_pair_orders(V, k, changed), old.mesh), mask)
         out = _with_level(out, k, level)
     end
     return out

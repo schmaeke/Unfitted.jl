@@ -36,22 +36,31 @@ A new family `F <: BasisFamily` must provide:
     extension's cascade is the one shipped resolver. A key `_tensor_dof_key(level, …)` returns must carry `level.id`
     (`TensorDofKey(level.id, …)`): no key is then shared between two levels, which is what lets the dof layer hold each
     level's raw dofs as one contiguous range and run every per-level pass over that range alone.
-  - `instantiate_basis(::F, mesh, order, mode)` — only when the concrete family depends on the level's mesh. The
+  - `instantiate_basis(::F, mesh, order)` — only when the concrete family depends on the level's mesh. The
     `::BasisFamily` default returns the family unchanged; see [`instantiate_basis`](@ref) for the contract and why the
     hook exists.
   - `_supports_cell_order(::F)` — `false` by default, and a *loud* default: a non-uniform `order =` on a family that
     declines it raises rather than being silently flattened. Answer `true` only where a per-cell degree names a set of
     functions and the minimum rule has a shared entity to act on, and supply the matching `_cell_modes` method
-    (`src/dofs.jl`) in the same change — `_index_admissible` below is the per-axis filter that rule is expressed over
-    (it has no `::BasisFamily` default, so the family supplies that method too), and `test_cell_order.jl` asserts its
-    monotonicity in the order, which is what makes the rule correct.
+    (`src/dofs.jl`) in the same change — `_index_admissible(::F, order, id)` below is the per-axis filter that rule is
+    expressed over (it has no `::BasisFamily` default, so the family supplies that method too), and
+    `test_cell_order.jl` asserts its monotonicity in the order, which is what makes the rule correct.
 
 It inherits the basis-agnostic `::BasisFamily` defaults and overrides only the ones that do not fit:
-`recommended_quadrature_order` (`order .+ 1`), `_supported_modes` (`(:tensor,)`), `local_basis_indices` /
-`local_basis_count` (the lexicographic tensor index set `∏_d {0, …, order[d]}` and its size), `is_facet_basis` and
-`boundary_basis_indices`. The point evaluators [`basis_values`](@ref) / [`physical_basis_gradients`](@ref) take a
-[`Level`](@ref) and a cell rather than a family: they read the cell's order and index set from the level and reach the
-family through `_fill_factor_tables!` alone, so they serve every family with nothing to override.
+`recommended_quadrature_order` (`order .+ 1`), `local_basis_indices` (the lexicographic tensor index set
+`∏_d {0, …, order[d]}`), `_with_mode` (`:tensor` only), `is_facet_basis` and `boundary_basis_indices`;
+`local_basis_count` is the size of `local_basis_indices` and has nothing to override. The point evaluators
+[`basis_values`](@ref) / [`physical_basis_gradients`](@ref) take a [`Level`](@ref) and a cell rather than a family: they
+read the cell's order and index set from the level and reach the family through `_fill_factor_tables!` alone, so they
+serve every family with nothing to override.
+
+**The family value is the whole index-set rule.** A basis mode (the `mode` keyword of [`space`](@ref),
+[`overlay`](@ref) and [`ladder`](@ref)) is not a second argument carried beside the family: it is applied once, when a
+level is built, by `_with_mode(family, mode)`, which returns the family value that serves that index set or refuses a
+mode the family does not carry. Every index-set question — `local_basis_indices(F, order)`, `local_basis_count`,
+`boundary_basis_indices`, `_index_admissible` — then takes the family alone, and `_mode(F)` reads the mode back for
+display and diagnostics. A family that offers a mode beyond `:tensor` overrides `_with_mode`, `_mode` and
+`local_basis_indices`, as integrated Legendre does for `:trunk`; the default `_with_mode` accepts `:tensor` alone.
 
 One further default is silent rather than fatal, so a new family should decide about it deliberately: the burial hooks
 of `_coverage_constraints!` (`src/dofs.jl`), `_sheds_any` and `_reproduces` above all — `false` by default, so on a
@@ -95,7 +104,7 @@ what fixes that diagonal at `⟨N̂ₘ′, N̂ₙ′⟩_{L²(−1,1)} = δₘₙ
 
     N_α(ξ) = ∏_{d=1}^{D} N̂_{α_d}(ξ_d),   α = (α₁, …, α_D),   0 ≤ α_d ≤ p_d
 
-Two index sets are available, set by the `mode` keyword on [`space`](@ref) / [`overlay`](@ref):
+Two index sets are available, set by the `mode` keyword on [`space`](@ref) / [`overlay`](@ref) / [`ladder`](@ref):
 
   - `:tensor` — the full tensor product `∏_d {0, …, p_d}` (default).
   - `:trunk` — the Szabó–Babuška trunk (serendipity) space at isotropic order `p`. Keep every multi-index whose *trunk
@@ -105,11 +114,24 @@ Two index sets are available, set by the `mode` keyword on [`space`](@ref) / [`o
     degrees `≤ p`. Requires isotropic order. The saving over `:tensor` grows with dimension: e.g. for `p = 4` a
     hexahedral cell carries 50 modes instead of 125.
 
+`IntegratedLegendre()` is the one public spelling. The family value also carries the index set it serves, as an
+internal flag the `mode` keyword sets when a level is built, so a level's family is the whole answer to "which
+functions does a cell of this order carry" (see [`BasisFamily`](@ref)); pass `mode = :trunk` rather than building the
+trunk family by hand. It displays as `IntegratedLegendre()` in `:tensor` mode and is marked in `:trunk` mode.
+
 All integrated-Legendre-specific dof and constraint behaviour (endpoint-vs-bubble identification, boundary-mode
 dispatch, facet detection) lives in this file and `src/dofs.jl`; the rest of the codebase queries this family through
 the [`BasisFamily`](@ref) interface.
 """
-struct IntegratedLegendre <: BasisFamily end
+struct IntegratedLegendre <: BasisFamily
+    trunk::Bool    # the `:trunk` index set; internal, set from the `mode` keyword by `_with_mode`
+end
+
+IntegratedLegendre() = IntegratedLegendre(false)
+
+function Base.show(io::IO, b::IntegratedLegendre)
+    print(io, b.trunk ? "IntegratedLegendre() (mode=:trunk)" : "IntegratedLegendre()")
+end
 
 """
     basis_name(basis) -> Symbol
@@ -171,51 +193,37 @@ recommended_quadrature_order(::BasisFamily, order::NTuple{D,Int}) where {D} = nt
 # ── Basis modes and local mode counts ─────────────────────────────────────────
 
 """
-    local_basis_count(basis, order)         -> Int
-    local_basis_count(basis, order, mode)   -> Int
+    local_basis_count(basis, order) -> Int
 
-Number of local basis functions on a single cell: the size of the matching [`local_basis_indices`](@ref) set, in both
-forms, so the count validates exactly what the set validates and cannot describe a set the family does not have —
-integrated Legendre refuses an order below 1 on any axis here as it does there. The two-argument form counts the
-`:tensor` set, `prod(order .+ 1)` on every shipped family. The three-argument form takes a basis mode and counts the
-index set that mode selects: for integrated Legendre `:trunk` counts the multi-indices passing the trunk-degree filter
-(see [`IntegratedLegendre`](@ref)). A family that supports only some modes says so through `_supported_modes`, not by
-counting.
+Number of local basis functions on a single cell: the size of the matching [`local_basis_indices`](@ref) set, so the
+count validates exactly what the set validates and cannot describe a set the family does not have — integrated Legendre
+refuses an order below 1 on any axis here as it does there. The family value carries its mode, so on a `:tensor` family
+this is `prod(order .+ 1)` on every shipped family, and on integrated Legendre's `:trunk` family it counts the
+multi-indices passing the trunk-degree filter (see [`IntegratedLegendre`](@ref)).
 """
 local_basis_count(basis::BasisFamily, order::NTuple{D,Int}) where {D} = length(local_basis_indices(basis, order))
 
-function local_basis_count(basis::BasisFamily, order::NTuple{D,Int}, mode::Symbol) where {D}
-    return length(local_basis_indices(basis, order, mode))
+# The family value that serves the index set `mode` names, applied once where a level is built (`space`, `overlay`, and
+# through them `ladder`): the `mode` keyword is folded into the family here, and every index-set question after it takes
+# the family alone. `:tensor` — the full tensor-product set — is the only mode every tensor-product family serves, so
+# the default accepts it and returns the family unchanged; a family offering more overrides this, and integrated
+# Legendre's method sets its `trunk` flag. A symbol the package does not define is refused as unknown, and a defined
+# mode the family does not carry is refused naming the family and the one mode it serves, so a family needs no
+# hand-written mode guard of its own. The keyword always wins: an integrated-Legendre family handed in with one mode and
+# asked for the other gets the other. `_mode` reads the mode back, for display, the pin and the diagnostics report.
+function _known_mode(mode::Symbol)
+    mode in (:tensor, :trunk) ? mode : throw(ArgumentError("basis mode must be :tensor or :trunk"))
 end
 
-# The basis modes a family carries. `:tensor` — the full tensor-product index set — is the only mode every
-# tensor-product family can serve, so it is the default; a family offering more (integrated Legendre's `:trunk`)
-# overrides this, and `_check_basis_mode` is the single place the answer is consulted.
-_supported_modes(::BasisFamily) = (:tensor,)
-_supported_modes(::IntegratedLegendre) = (:tensor, :trunk)
-
-# Validate a basis-mode symbol against a concrete family and a per-axis polynomial order. Three conditions, in one place
-# because there is only ever one caller position for them — the family's own index-set constructor:
-#
-#   * the symbol must be a mode the package defines at all;
-#   * `:trunk` requires isotropic order, since the trunk-degree filter compares against a single scalar `p`;
-#   * the family must list the mode in its `_supported_modes`, which is what rejects a mode the package defines but
-#     *this* family cannot serve, so a family needs no hand-written mode guard of its own.
-#
-# There used to be a second, family-blind two-argument form, run by `space` and `overlay` before `instantiate_basis` had
-# produced a concrete family. Nothing needed the answer that early: every `Level` construction reaches
-# `local_basis_indices` — through `_build_cell_orders` on a graded level and through `_cell_modes` on a uniform one —
-# and that is where this check lives.
-function _check_basis_mode(basis::BasisFamily, mode::Symbol, order::NTuple{D,Int}) where {D}
-    mode in (:tensor, :trunk) || throw(ArgumentError("basis mode must be :tensor or :trunk"))
-    if mode === :trunk && any(!=(order[1]), order)
-        throw(ArgumentError("mode=:trunk requires isotropic order"))
-    end
-    supported = _supported_modes(basis)
-    mode in supported || throw(ArgumentError("basis family $(basis_name(basis)) does not support " *
-                                             "mode=:$mode; supported: $(join(supported, ", "))"))
-    return mode
+function _with_mode(basis::BasisFamily, mode::Symbol)
+    _known_mode(mode) === :tensor && return basis
+    throw(ArgumentError("basis family $(basis_name(basis)) does not support mode=:$mode; supported: tensor"))
 end
+
+_with_mode(::IntegratedLegendre, mode::Symbol) = IntegratedLegendre(_known_mode(mode) === :trunk)
+
+_mode(::BasisFamily) = :tensor
+_mode(b::IntegratedLegendre) = b.trunk ? :trunk : :tensor
 
 # ── 1D Legendre primitives ────────────────────────────────────────────────────
 
@@ -303,21 +311,18 @@ end
 _tensor_index_set(order::NTuple{D,Int}) where {D} = vec(collect(CartesianIndices(ntuple(d -> 0:order[d], D))))
 
 """
-    local_basis_indices(basis, order)         -> Vector{CartesianIndex{D}}
-    local_basis_indices(basis, order, mode)   -> Vector{CartesianIndex{D}}
+    local_basis_indices(basis, order) -> Vector{CartesianIndex{D}}
 
 Multi-indices `α = (α₁, …, α_D)` enumerating the local basis functions on a cell of polynomial order `order`.
 Lexicographic over `CartesianIndices(ntuple(d -> 0:order[d], D))`, axis 1 varying fastest — this is the canonical
 tensor-product ordering used by every basis consumer (assembly, projection, post-processing, the dof layer).
 
 The `::BasisFamily` default is that full tensor set, which is what an open-knot B-spline span and any other
-tensor-product family need; a family overrides it only to *filter* the set, and inherits the ordering either way.
-Integrated Legendre overrides both forms: the two-argument form to require order ≥ 1 per axis (order 0 would leave a
-single endpoint mode, not a partition of unity), the three-argument form to add `:trunk`.
-
-The two-argument form is the `:tensor` set (no filter); `mode = :trunk` keeps only indices with trunk degree
-`Σ_d t(α_d) ≤ p`, where `t(α_d) = α_d` for a bubble mode (`α_d ≥ 2`) and `t(α_d) = 0` for the two linear endpoint modes
-(`α_d ∈ {0, 1}`) — the trunk space of
+tensor-product family need; a family overrides it only to *filter* the set, and inherits the ordering either way. The
+family value carries its basis mode (see [`BasisFamily`](@ref)), so the set is the one that mode selects. Integrated
+Legendre overrides it to require order ≥ 1 per axis (order 0 would leave a single endpoint mode, not a partition of
+unity) and, in `:trunk` mode, to keep only the indices with trunk degree `Σ_d t(α_d) ≤ p`, where `t(α_d) = α_d` for a
+bubble mode (`α_d ≥ 2`) and `t(α_d) = 0` for the two linear endpoint modes (`α_d ∈ {0, 1}`) — the trunk space of
 
 > B. Szabó, I. Babuška, *Finite Element Analysis*, Wiley, New York (1991), ISBN 978-0-471-50273-9,
 
@@ -329,16 +334,6 @@ function local_basis_indices(::BasisFamily, order::NTuple{D,Int}) where {D}
     return _tensor_index_set(order)
 end
 
-function local_basis_indices(basis::BasisFamily, order::NTuple{D,Int}, mode::Symbol) where {D}
-    _check_basis_mode(basis, mode, order)
-    return local_basis_indices(basis, order)
-end
-
-function local_basis_indices(::IntegratedLegendre, order::NTuple{D,Int}) where {D}
-    all(o -> o >= 1, order) || throw(ArgumentError("integrated Legendre order must be at least 1 in every axis"))
-    return _tensor_index_set(order)
-end
-
 # Trunk degree `Σ_d t(α_d)` of a multi-index `α`, where `t(α_d) = α_d` for a bubble mode `α_d ≥ 2` and `t(α_d) = 0` for
 # the two endpoint modes 0 and 1, the linear vertex shape functions. This is what the `:trunk` mode compares against the
 # isotropic polynomial order `p`: edge modes (one bubble axis) survive up to degree p, while face/volume modes survive
@@ -347,11 +342,13 @@ end
 # top edge modes and break C⁰ conformity.
 _trunk_degree(id::CartesianIndex) = sum(a -> a ≥ 2 ? a : 0, Tuple(id))
 
-function local_basis_indices(basis::IntegratedLegendre, order::NTuple{D,Int}, mode::Symbol) where {D}
-    _check_basis_mode(basis, mode, order)
-    indices = local_basis_indices(basis, order)
-    mode === :tensor && return indices
-    return [id for id in indices if _trunk_degree(id) <= order[1]]
+# The trunk filter compares against one scalar `p`, so a trunk family refuses an anisotropic order first, then — as in
+# either mode — an order below 1 on some axis.
+function local_basis_indices(basis::IntegratedLegendre, order::NTuple{D,Int}) where {D}
+    basis.trunk && any(!=(order[1]), order) && throw(ArgumentError("mode=:trunk requires isotropic order"))
+    all(o -> o >= 1, order) || throw(ArgumentError("integrated Legendre order must be at least 1 in every axis"))
+    indices = _tensor_index_set(order)
+    return basis.trunk ? filter!(id -> _trunk_degree(id) <= order[1], indices) : indices
 end
 
 # ── Family capability traits ──────────────────────────────────────────────────
@@ -395,10 +392,10 @@ _supports_cell_order(::IntegratedLegendre) = true
 _support_radius(::BasisFamily, order::NTuple{D,Int}) where {D} = ntuple(_ -> 0, D)
 
 """
-    _index_admissible(basis, order, mode, id) -> Bool
+    _index_admissible(basis, order, id) -> Bool
 
-Whether the multi-index `id` belongs to `local_basis_indices(basis, order, mode)`, answered in `O(D)` instead of by
-scanning the set.
+Whether the multi-index `id` belongs to `local_basis_indices(basis, order)`, answered in `O(D)` instead of by scanning
+the set.
 
 This is the family's own index-set filter, factored out so the dof layer's minimum rule (`_entity_carries` in
 `src/dofs.jl`) can ask, per active incident cell, whether *that cell's own* order generates the mode. The intersection
@@ -413,15 +410,14 @@ agree, and for `:trunk` they do not, because a 3D face mode with bubble degrees 
 rule follows.
 
 Integrated Legendre, the one family declaring `_supports_cell_order`, has the only method: the per-axis box, plus the
-trunk-degree filter under `:trunk`. `test_cell_order.jl` asserts that this predicate agrees with `local_basis_indices`
-over a range of orders, modes and dimensions, that it is monotone in the order for every family declaring
-`_supports_cell_order`, and that the intersection form reproduces the componentwise-minimum form cell for cell — the
-three contracts that keep the two layers from drifting.
+trunk-degree filter on a `:trunk` family. `test_cell_order.jl` asserts that this predicate agrees with
+`local_basis_indices` over a range of orders, modes and dimensions, that it is monotone in the order for every family
+declaring `_supports_cell_order`, and that the intersection form reproduces the componentwise-minimum form cell for cell
+— the three contracts that keep the two layers from drifting.
 """
-function _index_admissible(::IntegratedLegendre, order::NTuple{D,Int}, mode::Symbol, id::CartesianIndex{D}) where {D}
+function _index_admissible(basis::IntegratedLegendre, order::NTuple{D,Int}, id::CartesianIndex{D}) where {D}
     all(d -> 0 <= id.I[d] <= order[d], 1:D) || return false
-    mode === :tensor && return true
-    return _trunk_degree(id) <= order[1]
+    return !basis.trunk || _trunk_degree(id) <= order[1]
 end
 
 # ── Hot-path tensor-product evaluation ────────────────────────────────────────
@@ -578,17 +574,15 @@ function is_facet_basis(basis::BasisFamily, id::CartesianIndex{D},
 end
 
 """
-    boundary_basis_indices(basis, order; axis, side, mode=:tensor)
-        -> Vector{CartesianIndex{D}}
+    boundary_basis_indices(basis, order; axis, side) -> Vector{CartesianIndex{D}}
 
 Multi-indices of the local basis functions whose support touches the codim-1 face at the requested `(axis, side)`. Used
 by the Dirichlet projection in `src/dofs.jl` to identify which trial / test modes contribute on each physical facet.
-This `::BasisFamily` default filters `local_basis_indices(basis, order, mode)` through the family's `is_boundary_basis`,
-so it needs no override.
+This `::BasisFamily` default filters `local_basis_indices(basis, order)` — the set of the family's own mode — through
+the family's `is_boundary_basis`, so it needs no override.
 """
-function boundary_basis_indices(basis::BasisFamily, order::NTuple{D,Int}; axis::Integer, side::Symbol,
-                                mode::Symbol=:tensor) where {D}
-    return [id for id in local_basis_indices(basis, order, mode) if is_boundary_basis(basis, id, axis, side)]
+function boundary_basis_indices(basis::BasisFamily, order::NTuple{D,Int}; axis::Integer, side::Symbol) where {D}
+    return [id for id in local_basis_indices(basis, order) if is_boundary_basis(basis, id, axis, side)]
 end
 
 # ── Public quadrature rule ────────────────────────────────────────────────────

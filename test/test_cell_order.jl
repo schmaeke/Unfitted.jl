@@ -130,11 +130,11 @@ end
     V = space(_CO_2D; cells=(2, 1), order=reshape([(5, 2), (2, 5)], 2, 1))
     lvl = V.levels[1]
     free = Set(cell_basis_indices(lvl, CartesianIndex(1, 1)))
-    full = Set(local_basis_indices(lvl.basis, (5, 2), :tensor))
+    full = Set(local_basis_indices(lvl.basis, (5, 2)))
     dropped = setdiff(full, free)
     @test length(dropped) == 0                     # cell A is already at 2 on axis 2
     freeB = Set(cell_basis_indices(lvl, CartesianIndex(2, 1)))
-    fullB = Set(local_basis_indices(lvl.basis, (2, 5), :tensor))
+    fullB = Set(local_basis_indices(lvl.basis, (2, 5)))
     droppedB = setdiff(fullB, freeB)
     @test length(droppedB) == 3
     @test all(id -> id.I[1] == 0 && id.I[2] in 3:5, droppedB)
@@ -196,21 +196,22 @@ end
 end
 
 @testset "per-cell order: the index-set membership predicate" begin
-    # `_index_admissible` is the O(D) form of "is this multi-index in `local_basis_indices(basis, order, mode)`", and
-    # the minimum rule asks it at an order no cell carries. The two forms must not drift apart.
-    fam = IntegratedLegendre()
+    # `_index_admissible` is the O(D) form of "is this multi-index in `local_basis_indices(basis, order)`", and the
+    # minimum rule asks it at an order no cell carries. The two forms must not drift apart, in either mode.
     for D in 1:3, mode in (:tensor, :trunk), p in 1:5
+        fam = Unfitted._with_mode(IntegratedLegendre(), mode)
         order = ntuple(_ -> p, D)
-        want = Set(local_basis_indices(fam, order, mode))
+        want = Set(local_basis_indices(fam, order))
         for id in CartesianIndices(ntuple(_ -> 0:6, D))
-            @test _index_admissible(fam, order, mode, id) == (id in want)
+            @test _index_admissible(fam, order, id) == (id in want)
         end
     end
     # Anisotropic, `:tensor` only (`:trunk` requires isotropy).
+    fam = IntegratedLegendre()
     for order in ((2, 5), (5, 2), (1, 4))
-        want = Set(local_basis_indices(fam, order, :tensor))
+        want = Set(local_basis_indices(fam, order))
         for id in CartesianIndices((0:6, 0:6))
-            @test _index_admissible(fam, order, :tensor, id) == (id in want)
+            @test _index_admissible(fam, order, id) == (id in want)
         end
     end
 end
@@ -220,7 +221,7 @@ end
     # a lower-order cell. The surviving half of the guard — a buffer too SHORT for the index list — is what stands
     # between a length bug and a silently wrong answer, so it must still fire.
     fam = IntegratedLegendre()
-    ids = local_basis_indices(fam, (2, 2), :tensor)
+    ids = local_basis_indices(fam, (2, 2))
     ξ = SVector(0.1, -0.2)
     cell = CartesianIndex(1, 1)
     @test_throws DimensionMismatch _tensor_values!(fam, zeros(length(ids) - 1), ids, (2, 2), ξ,
@@ -299,7 +300,7 @@ end
     shared = cell_basis_indices(level, CartesianIndex(1, 1))
     @test cell_basis_indices(level, CartesianIndex(2, 2)) === shared
     @test cell_basis_indices(level, CartesianIndex(1, 2)) === shared
-    @test shared == local_basis_indices(level.basis, (2, 2), :tensor)
+    @test shared == local_basis_indices(level.basis, (2, 2))
     @test isempty(cell_basis_indices(level, CartesianIndex(2, 1)))
     # And a p-step on integrated Legendre keeps the space's type, uniform or graded.
     @test typeof(elevate(V, 1 => 3)) === typeof(V)
@@ -516,16 +517,16 @@ end
     # property of the FAMILY, not of the dof layer, so assert it directly. A family that broke it would get a silently
     # non-conforming space.
     for mode in (:tensor, :trunk), D in (2, 3)
-        basis = IntegratedLegendre()
+        basis = Unfitted._with_mode(IntegratedLegendre(), mode)
         @test _supports_cell_order(basis)
         for lo in 1:4
             los = ntuple(_ -> lo, D)
-            ids = local_basis_indices(basis, los, mode)
+            ids = local_basis_indices(basis, los)
             for hi in lo:5, d in 1:D
                 his = ntuple(e -> e == d ? hi : lo, D)
                 mode === :trunk && his != ntuple(_ -> hi, D) && continue   # trunk wants isotropy
                 # Raising one axis may only ADD modes, never remove one.
-                @test all(id -> _index_admissible(basis, his, mode, id), ids)
+                @test all(id -> _index_admissible(basis, his, id), ids)
             end
         end
     end
@@ -550,13 +551,13 @@ end
         n = lvl.mesh.cells
         for cell in cell_indices(V; level=1)
             Unfitted.is_active(lvl.mask, cell) || continue
-            for id in local_basis_indices(lvl.basis, cell_order(lvl, cell), lvl.mode)
+            for id in local_basis_indices(lvl.basis, cell_order(lvl, cell))
                 key = TensorDofKey{2}(0, ntuple(d -> _axis_dof_key(cell.I[d], id.I[d]), 2))
                 pmin = minimum_rule(orders, lvl.mask, key, n)
-                classical = pmin === nothing || _index_admissible(lvl.basis, pmin, lvl.mode, id)
+                classical = pmin === nothing || _index_admissible(lvl.basis, pmin, id)
                 # The dense `orders` matrix is the reference rule's input; the kernel reads the palette record the level
                 # actually carries.
-                @test _entity_carries(lvl.basis, lvl.orders, lvl.mask, key, n, lvl.mode, id) == classical
+                @test _entity_carries(lvl.basis, lvl.orders, lvl.mask, key, n, id) == classical
             end
         end
     end
@@ -577,13 +578,13 @@ Unfitted._supports_cell_order(::_OptInNoRule) = true
     Ω = box((0.0, 0.0), (1.0, 1.0))
     mesh = Unfitted.CartesianMesh(Ω; cells=(2, 2))
     family = _OptInNoRule()
-    graded = Unfitted._build_cell_orders(family, [(1, 1), (2, 2), (1, 1), (2, 2)], mesh, :tensor)
+    graded = Unfitted._build_cell_orders(family, [(1, 1), (2, 2), (1, 1), (2, 2)], mesh)
     @test length(graded.palette) == 2
-    @test_throws ArgumentError Unfitted._cell_modes(family, graded, mesh, :tensor, nothing)
+    @test_throws ArgumentError Unfitted._cell_modes(family, graded, mesh, nothing)
 
     # A one-entry palette is the uniform case and still goes through.
-    flat = Unfitted._build_cell_orders(family, (2, 2), mesh, :tensor)
-    modes = Unfitted._cell_modes(family, flat, mesh, :tensor, nothing)
+    flat = Unfitted._build_cell_orders(family, (2, 2), mesh)
+    modes = Unfitted._cell_modes(family, flat, mesh, nothing)
     @test length(modes.sets) == 2                        # the empty set plus the shared one
     @test all(==(UInt16(2)), modes.kind)                 # every cell active
 end

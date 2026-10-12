@@ -173,7 +173,7 @@ end
     layout = Unfitted.dof_layout(V; dirichlet=[dirichlet(0.0; on=boundary(:all))])
     active = Unfitted.active_cell_dofs(layout, 1, CartesianIndex(1, 1))
 
-    @test V.levels[1].mode == :trunk
+    @test Unfitted._mode(V.levels[1].basis) == :trunk
     @test Unfitted.raw_dof_count(layout) == 17
     @test Unfitted.active_unknowns(layout) == 1
     @test count(!iszero, active) == 1
@@ -181,8 +181,18 @@ end
 
     V2 = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(1, 1))
     overlay_active = Unfitted.active_cell_dofs(Unfitted.dof_layout(V2), 2, CartesianIndex(1, 1))
-    @test V2.levels[2].mode == :trunk
+    @test Unfitted._mode(V2.levels[2].basis) == :trunk
     @test count(!iszero, overlay_active) == 1
+    @test occursin("mode=:trunk", sprint(show, V2.levels[2]))
+
+    # The mode is folded into the level's family, and the `mode` keyword always applies: an explicit
+    # `basis = IntegratedLegendre()` on an overlay of a trunk base still inherits `:trunk` through the keyword's
+    # default, and an explicit `mode` overrides the family it is handed.
+    inner = box((0.25, 0.25), (0.75, 0.75))
+    @test Unfitted._mode(overlay(V, inner; cells=(1, 1), basis=IntegratedLegendre()).levels[2].basis) == :trunk
+    @test Unfitted._mode(overlay(V, inner; cells=(1, 1), mode=:tensor).levels[2].basis) == :tensor
+    @test Unfitted._mode(overlay(V, inner; cells=(1, 1), basis=V.levels[1].basis, mode=:tensor).levels[2].basis) ==
+          :tensor
 end
 
 @testset "overlay artificial constraints stay separate from physical boundaries" begin

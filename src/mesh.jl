@@ -300,9 +300,10 @@ case has no second code path and the lookup stays allocation-free. Fields:
 
 This record is what the caller asked for, and it depends on nothing else — not on the mask, not on the basis mode. The
 index sets those orders actually generate, once the minimum rule has trimmed the modes a shared entity cannot carry,
-live in [`CellModes`](@ref), which `Level`'s inner constructor derives from this record together with the mesh, the mode
-and the mask. `CellModes` is what makes the space C⁰, and it is the table every positional pairing of raw dofs with
-basis values must read; go through [`cell_basis_indices`](@ref) rather than re-deriving the set.
+live in [`CellModes`](@ref), which `Level`'s inner constructor derives from this record together with the mesh, the
+family (which carries the basis mode) and the mask. `CellModes` is what makes the space C⁰, and it is the table every
+positional pairing of raw dofs with basis values must read; go through [`cell_basis_indices`](@ref) rather than
+re-deriving the set.
 """
 struct CellOrders{D}
     palette::Vector{NTuple{D,Int}}
@@ -317,11 +318,12 @@ The multi-index sets a level's cells actually generate, after the minimum rule h
 cannot carry. Two fields, the same shape as [`CellOrders`](@ref): `sets` holds the distinct index sets (entry 1 is the
 empty set every inactive cell points at) and `kind` maps a cell to one of them.
 
-**This is derived, never supplied.** It is a function of the level's orders, its mesh, its mode and its activation mask,
-and it is computed by `Level`'s inner constructor from exactly those. That is not a stylistic choice: the mask half of
-that dependency is what a caller used to be able to get wrong, by handing in a table built against one mask alongside a
-different one, and the failure was silent — the dof layout is built *from* this table, so layout and table went stale
-together and nothing downstream could notice. A table that cannot be passed in cannot be passed in stale.
+**This is derived, never supplied.** It is a function of the level's orders, its mesh, its basis family (which carries
+the basis mode) and its activation mask, and it is computed by `Level`'s inner constructor from exactly those. That is
+not a stylistic choice: the mask half of that dependency is what a caller used to be able to get wrong, by handing in a
+table built against one mask alongside a different one, and the failure was silent — the dof layout is built *from* this
+table, so layout and table went stale together and nothing downstream could notice. A table that cannot be passed in
+cannot be passed in stale.
 """
 struct CellModes{D}
     sets::Vector{Vector{CartesianIndex{D}}}
@@ -332,9 +334,8 @@ end
 # case: a family with no per-cell order, and a level whose palette has a single entry. Neither can lose a mode to the
 # minimum rule — every active cell asks the same question of neighbours carrying the same order — so the filter would be
 # a no-op, and a uniform level pays nothing for the existence of the graded path.
-function _uniform_cell_modes(basis::BasisFamily, orders::CellOrders{D}, mesh::CartesianMesh{D}, mode::Symbol,
-                             mask) where {D}
-    sets = [CartesianIndex{D}[], local_basis_indices(basis, orders.palette[1], mode)]
+function _uniform_cell_modes(basis::BasisFamily, orders::CellOrders{D}, mesh::CartesianMesh{D}, mask) where {D}
+    sets = [CartesianIndex{D}[], local_basis_indices(basis, orders.palette[1])]
     kind = Array{UInt16,D}(undef, mesh.cells)
     for cell in cell_indices(mesh)
         kind[cell] = is_active(mask, cell) ? UInt16(2) : UInt16(1)
@@ -353,13 +354,13 @@ end
 # loud on purpose. Falling through to `_uniform_cell_modes` with a real palette would assemble every cell at
 # `palette[1]` while `cell_order` reported the field the caller asked for — a non-conforming space with no error
 # anywhere, which is the exact failure the minimum rule exists to prevent.
-function _cell_modes(basis::BasisFamily, orders::CellOrders{D}, mesh::CartesianMesh{D}, mode::Symbol, mask) where {D}
+function _cell_modes(basis::BasisFamily, orders::CellOrders{D}, mesh::CartesianMesh{D}, mask) where {D}
     length(orders.palette) == 1 ||
         throw(ArgumentError("the $(basis_name(basis)) basis family answers _supports_cell_order " *
                             "but supplies no _cell_modes method: the minimum rule for a graded " *
                             "level is the family's to state, and the uniform fallback would " *
                             "silently assemble every cell at $(orders.palette[1])."))
-    return _uniform_cell_modes(basis, orders, mesh, mode, mask)
+    return _uniform_cell_modes(basis, orders, mesh, mask)
 end
 
 # Translate a user-supplied `order` specification into either an `NTuple{D,Int}` (uniform) or a flat
@@ -426,22 +427,20 @@ function _nominal_order(entries::Vector{NTuple{D,Int}}) where {D}
 end
 
 # Build the `CellOrders` record a level carries. Both methods run the same per-palette-entry validation —
-# `local_basis_indices(family, o, mode)`, which checks the mode against the family and raises on an order the family
-# rejects — so the per-*cell* `order ≥ 1` requirement and the `:trunk` isotropy requirement are enforced at the
-# granularity a graded level needs, where a per-level check can no longer see a single offending cell. The graded method
-# adds two checks a uniform level gets for free: the family must declare `_supports_cell_order`, and the palette must
-# fit the `UInt16` class index.
+# `local_basis_indices(family, o)`, which raises on an order the family, in its mode, rejects — so the per-*cell*
+# `order ≥ 1` requirement and the `:trunk` isotropy requirement are enforced at the granularity a graded level needs,
+# where a per-level check can no longer see a single offending cell. The graded method adds two checks a uniform level
+# gets for free: the family must declare `_supports_cell_order`, and the palette must fit the `UInt16` class index.
 #
 # This record is what the caller ASKED FOR, and it depends on nothing else — not on the mask, not on the mode. What the
 # basis then emits per cell is derived from it by `_cell_modes`, whose generic method is defined above and whose
 # per-family methods live where each family's key-incidence machinery does.
-function _build_cell_orders(family::BasisFamily, order::NTuple{D,Int}, mesh::CartesianMesh{D}, mode::Symbol) where {D}
-    local_basis_indices(family, order, mode)    # mode against the family, order against both
+function _build_cell_orders(family::BasisFamily, order::NTuple{D,Int}, mesh::CartesianMesh{D}) where {D}
+    local_basis_indices(family, order)    # raises on an order the family rejects
     return CellOrders{D}([order], fill(UInt16(1), mesh.cells), order)
 end
 
-function _build_cell_orders(family::BasisFamily, entries::Vector{NTuple{D,Int}}, mesh::CartesianMesh{D},
-                            mode::Symbol) where {D}
+function _build_cell_orders(family::BasisFamily, entries::Vector{NTuple{D,Int}}, mesh::CartesianMesh{D}) where {D}
     _supports_cell_order(family) ||
         throw(ArgumentError("the $(basis_name(family)) basis family does not support a per-cell " *
                             "polynomial order: its degree belongs to a whole-axis knot vector, not " *
@@ -467,7 +466,7 @@ function _build_cell_orders(family::BasisFamily, entries::Vector{NTuple{D,Int}},
         end
     end
     for o in palette
-        local_basis_indices(family, o, mode)     # raises on an order the family rejects
+        local_basis_indices(family, o)     # raises on an order the family rejects
     end
     return CellOrders{D}(palette, class, _nominal_order(palette))
 end
@@ -477,8 +476,8 @@ end
 """
     Level
 
-One base or overlay discretization level of a [`Space`](@ref). Carries the level's mesh, basis family, polynomial-order
-metadata, basis mode, and an optional activation mask. Fields:
+One base or overlay discretization level of a [`Space`](@ref). Carries the level's mesh, basis family (which carries
+the basis mode), polynomial-order metadata and an optional activation mask. Fields:
 
   - `id::Int` — level identifier, unique within a `Space`. `1` for the base level, `2, 3, …` for overlays in the order
     they were added. In a coupled multi-domain model every subdomain's ids are shifted into a disjoint block by
@@ -486,7 +485,10 @@ metadata, basis mode, and an optional activation mask. Fields:
   - `role::Symbol` — `:base` or `:overlay`. The base level covers the full physical domain; overlay levels live inside
     it.
   - `mesh::CartesianMesh{D,T}` — the Cartesian mesh that discretizes the level's domain.
-  - `basis::B` — basis family (see [`BasisFamily`](@ref)). All cells of the level share the same family.
+  - `basis::B` — basis family (see [`BasisFamily`](@ref)). All cells of the level share the same family. The family
+    value is the whole index-set rule: it carries the basis mode the level was built with (`:tensor`, the full tensor
+    product, or integrated Legendre's `:trunk`, the Szabó–Babuška trunk space filtered by trunk degree), which
+    `_mode(level.basis)` reads back.
   - `orders::CellOrders{D}` — the per-cell polynomial order, as a palette of the distinct orders plus one index per
     cell. A level whose order is uniform carries a palette of one entry, so there is no second representation and no
     second code path for the common case. Ask [`cell_order`](@ref) for a cell's order and [`nominal_order`](@ref) for
@@ -494,8 +496,6 @@ metadata, basis mode, and an optional activation mask. Fields:
     which is how a caller who is not inside the package should reach them.
   - `modes::CellModes{D}` — the multi-index sets those orders actually generate, after the minimum rule. **Derived**,
     never supplied: see [`CellModes`](@ref) for why that is the point rather than a detail.
-  - `mode::Symbol` — basis index-set mode: `:tensor` (full tensor product) or `:trunk` (the Szabó–Babuška trunk space,
-    filtered by trunk degree).
   - `mask::Union{Nothing,LevelMask{D}}` — optional per-cell activation mask. `nothing` keeps every cell active and is
     the type-stable no-mask hot path; the `Union` is small so the `Level` type stays stable across `activate!` /
     `deactivate!` transitions between the masked and unmasked states. An `active =` selection that happens to name every
@@ -513,20 +513,19 @@ struct Level{D,T<:Real,B<:BasisFamily}
     basis::B
     orders::CellOrders{D}
     modes::CellModes{D}
-    mode::Symbol
     mask::Union{Nothing,LevelMask{D}}
 
-    # `modes` is DERIVED, and deriving it here is the whole point. It depends on the orders, the mesh, the mode and the
-    # mask; when it was a constructor argument a caller could hand in a table built against one mask alongside a
-    # different one, and the failure was silent — `_build_cell_dofs!` builds the dof layout *from* the table, so layout
-    # and table went stale together and nothing downstream could see it. Measured, a fold carrying its pre-fold table
-    # dropped 24 of 780 unknowns while reporting `symmetry_residual = 0.0` and a 1e-16 residual. That mismatch used to
-    # be guarded by a witness field recording which mask the table was built against; a guard is a confession that the
-    # invariant can be violated. Computing the table from the arguments that determine it makes the mismatch unspellable
-    # instead, and the construction sites — which now all go through `_level` / `_new_level` below — stop having to
-    # remember anything.
-    function Level{D,T,B}(id, role, mesh, basis, orders, mode, mask) where {D,T<:Real,B<:BasisFamily}
-        return new{D,T,B}(id, role, mesh, basis, orders, _cell_modes(basis, orders, mesh, mode, mask), mode, mask)
+    # `modes` is DERIVED, and deriving it here is the whole point. It depends on the orders, the mesh, the family (with
+    # its mode) and the mask; when it was a constructor argument a caller could hand in a table built against one mask
+    # alongside a different one, and the failure was silent — `_build_cell_dofs!` builds the dof layout *from* the
+    # table, so layout and table went stale together and nothing downstream could see it. Measured, a fold carrying its
+    # pre-fold table dropped 24 of 780 unknowns while reporting `symmetry_residual = 0.0` and a 1e-16 residual. That
+    # mismatch used to be guarded by a witness field recording which mask the table was built against; a guard is a
+    # confession that the invariant can be violated. Computing the table from the arguments that determine it makes the
+    # mismatch unspellable instead, and the construction sites — which now all go through `_level` / `_new_level` below
+    # — stop having to remember anything.
+    function Level{D,T,B}(id, role, mesh, basis, orders, mask) where {D,T<:Real,B<:BasisFamily}
+        return new{D,T,B}(id, role, mesh, basis, orders, _cell_modes(basis, orders, mesh, mask), mask)
     end
 end
 
@@ -574,7 +573,7 @@ Multi-indices of the local basis functions cell `cell` of `level` generates, in 
 
 The answer is a lookup into the level's minimum-rule table ([`CellModes`](@ref)) on every level, and allocates
 nothing. On a uniform level every active cell shares one set, the level's whole index set
-`local_basis_indices(level.basis, nominal_order(level), level.mode)`. On a level carrying a per-cell order the set is
+`local_basis_indices(level.basis, nominal_order(level))`. On a level carrying a per-cell order the set is
 *not* the index set at the cell's own order: the modes a lower-order neighbour cannot match are gone, which is what
 keeps the space C⁰ across an order jump.
 
@@ -749,7 +748,7 @@ end
 # ── Basis-family hooks ────────────────────────────────────────────────────────
 
 """
-    instantiate_basis(basis, mesh, order, mode) -> BasisFamily
+    instantiate_basis(basis, mesh, order) -> BasisFamily
 
 Finalize a basis family for a concrete level, just before the [`Level`](@ref) is built. The default returns `basis`
 unchanged: most families — including the default [`IntegratedLegendre`](@ref) — are fully specified before any mesh
@@ -766,9 +765,10 @@ Every level-building path routes the basis through this hook — there are exact
 from a user specification ([`space`](@ref), [`overlay`](@ref), [`elevate`](@ref)) and `_level` for a copy of an existing
 one ([`moved_space`](@ref), [`adapt`](@ref), the mask mutators, the fictitious fold, level-id reindexing) — so a
 mesh-dependent family is rebuilt whenever the mesh changes (e.g. an overlay move) and is validated against the level's
-`order` and `mode` at construction time. The level's activation mask is not an argument: a mask face selects or
-constrains functions in the dof layer rather than changing the family, which is how the shipped B-spline family handles
-every mask geometry.
+`order` at construction time. The basis mode is not an argument either: it is already folded into `basis` (see
+[`BasisFamily`](@ref)), and a family that serves `:tensor` alone has refused any other mode before this hook runs. The
+level's activation mask is not an argument: a mask face selects or constrains functions in the dof layer rather than
+changing the family, which is how the shipped B-spline family handles every mask geometry.
 
 A concrete family handed to this hook is a request like any other, and a family that validates its request must do so
 on every call, not only on the first. The B-spline family re-judges its requested continuity against the new mesh and
@@ -776,7 +776,7 @@ order each time, so a level built by inheritance ([`overlay`](@ref)'s default `b
 family), by [`elevate`](@ref), by a move or by a mask edit is validated and given its mechanism exactly as a fresh build
 of the same request is.
 """
-instantiate_basis(basis::BasisFamily, mesh::CartesianMesh{D,T}, order::NTuple{D,Int}, mode::Symbol) where {D,T} = basis
+instantiate_basis(basis::BasisFamily, mesh::CartesianMesh{D,T}, order::NTuple{D,Int}) where {D,T} = basis
 
 # ── Space construction ────────────────────────────────────────────────────────
 
@@ -809,7 +809,8 @@ Keyword arguments:
     other family raises `ArgumentError` rather than being silently ignored.
   - `basis` — basis family. Defaults to [`IntegratedLegendre`](@ref).
   - `mode` — basis index set. `:tensor` is the full tensor product; `:trunk` is the Szabó–Babuška trunk space (filtered
-    by trunk degree) and requires isotropic `order`.
+    by trunk degree) and requires isotropic `order`. It is folded into the level's family (see [`BasisFamily`](@ref)),
+    and a family that does not carry the mode refuses it.
   - `active` — per-cell activation mask, `nothing` (default) meaning every cell is active. The accepted shapes, all
     normalised to a [`LevelMask`](@ref) over the level's cells, are:
 
@@ -865,7 +866,7 @@ per-level count.
 function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(), mode::Symbol=:tensor, active=nothing,
                physical=nothing) where {D,T}
     base_mesh = CartesianMesh(domain; cells)
-    base_level = _new_level(1, :base, base_mesh, basis, _normalize_order(order, base_mesh), mode,
+    base_level = _new_level(1, :base, base_mesh, _with_mode(basis, mode), _normalize_order(order, base_mesh),
                             _normalize_mask(active, base_mesh))
     return Space{D,T,Tuple{typeof(base_level)}}(domain, (base_level,), physical)
 end
@@ -873,7 +874,7 @@ end
 """
     overlay(V::Space, domain::AxisBox; cells, order=nominal_order(V.levels[1]),
                                        basis=V.levels[1].basis,
-                                       mode=V.levels[1].mode,
+                                       mode=<the base level's mode>,
                                        tolerance=GeometryTolerance(T),
                                        active=nothing) -> Space
 
@@ -886,7 +887,8 @@ Defaults inherit from the base level so a quick overlay only needs `cells` and p
   - `order` — polynomial order; defaults to the base level's nominal order. Takes every shape [`space`](@ref)'s `order`
     takes, including the per-cell ones, resolved against *this* overlay's cell grid.
   - `basis` — basis family; defaults to the base level's family.
-  - `mode` — basis index set; defaults to the base level's mode.
+  - `mode` — basis index set; defaults to the base level's mode. It always applies, to an explicit `basis` as to the
+    inherited one, so an overlay of a `:trunk` base is `:trunk` unless `mode` says otherwise.
   - `tolerance` — slack on the inside-domain check.
   - `active` — optional per-cell mask, same shapes as [`space`](@ref)'s `active`.
 
@@ -901,11 +903,11 @@ boundaries need not coincide with lower-level element boundaries, and there is n
 model" section).
 """
 function overlay(V::Space{D,T}, domain::AxisBox{D,T}; cells, order=nominal_order(V.levels[1]), basis=V.levels[1].basis,
-                 mode::Symbol=V.levels[1].mode, tolerance=GeometryTolerance(T), active=nothing) where {D,T}
+                 mode::Symbol=_mode(V.levels[1].basis), tolerance=GeometryTolerance(T), active=nothing) where {D,T}
     is_inside(domain, V.domain, tolerance) || throw(ArgumentError("overlay domain must lie inside the physical domain"))
     overlay_mesh = CartesianMesh(domain; cells)
-    level = _new_level(length(V.levels) + 1, :overlay, overlay_mesh, basis, _normalize_order(order, overlay_mesh), mode,
-                       _normalize_mask(active, overlay_mesh))
+    level = _new_level(length(V.levels) + 1, :overlay, overlay_mesh, _with_mode(basis, mode),
+                       _normalize_order(order, overlay_mesh), _normalize_mask(active, overlay_mesh))
     return _with_levels(V, (V.levels..., level))
 end
 
@@ -917,10 +919,10 @@ end
 # The step order matters and is not free to rearrange: `instantiate_basis` must run before `_build_cell_orders`, because
 # a deferred family (the B-spline spec) is not a family yet and `_supports_cell_order` has to be asked of the concrete
 # one.
-function _new_level(id::Int, role::Symbol, mesh::CartesianMesh{D,T}, basis, field, mode::Symbol, mask) where {D,T}
-    family = instantiate_basis(basis, mesh, _nominal_order(field), mode)
-    orders = _build_cell_orders(family, field, mesh, mode)
-    return Level{D,T,typeof(family)}(id, role, mesh, family, orders, mode, mask)
+function _new_level(id::Int, role::Symbol, mesh::CartesianMesh{D,T}, basis, field, mask) where {D,T}
+    family = instantiate_basis(basis, mesh, _nominal_order(field))
+    orders = _build_cell_orders(family, field, mesh)
+    return Level{D,T,typeof(family)}(id, role, mesh, family, orders, mask)
 end
 
 """
@@ -957,15 +959,15 @@ end
 # changes the mesh, `activate!` the mask, `_apply_physical_fold` the mask, coupling the id.
 #
 # The family is re-instantiated unconditionally. That is behaviour-preserving rather than merely convenient:
-# `instantiate_basis` consumes the mesh, the nominal order and the mode, the first two of which are the only ones a
-# family's concrete form can depend on — integrated Legendre returns itself, and the B-spline hook rebuilds knot vectors
-# from the mesh axes and the degree — so a rebuild that keeps the mesh and the order, such as a mask update,
-# re-instantiates an equal family (for B-splines the same knot vectors, rebuilt). Before this helper the sites disagreed
-# about it — `moved_space` and the mask rebuilds re-instantiated while the fold and the reindex did not — and the
-# disagreement was invisible because the answers coincide.
+# `instantiate_basis` consumes the mesh and the nominal order, the only things a family's concrete form can depend on —
+# integrated Legendre returns itself, and the B-spline hook rebuilds knot vectors from the mesh axes and the degree — so
+# a rebuild that keeps the mesh and the order, such as a mask update, re-instantiates an equal family (for B-splines the
+# same knot vectors, rebuilt). Before this helper the sites disagreed about it — `moved_space` and the mask rebuilds
+# re-instantiated while the fold and the reindex did not — and the disagreement was invisible because the answers
+# coincide.
 function _level(old::Level{D,T}; id=old.id, mesh=old.mesh, orders=old.orders, mask=old.mask) where {D,T}
-    family = instantiate_basis(old.basis, mesh, orders.nominal, old.mode)
-    return Level{D,T,typeof(family)}(id, old.role, mesh, family, orders, old.mode, mask)
+    family = instantiate_basis(old.basis, mesh, orders.nominal)
+    return Level{D,T,typeof(family)}(id, old.role, mesh, family, orders, mask)
 end
 
 # ── Reading a level ───────────────────────────────────────────────────────────
@@ -1219,7 +1221,7 @@ function _reordered_space(V::Space, level_index::Integer, spec)
     k = _check_level(V, level_index)
     old = V.levels[k]
     field = _normalize_order(_normalize_elevate_spec(V, k, spec), old.mesh)
-    return _with_level(V, k, _new_level(old.id, old.role, old.mesh, old.basis, field, old.mode, old.mask))
+    return _with_level(V, k, _new_level(old.id, old.role, old.mesh, old.basis, field, old.mask))
 end
 
 """
@@ -1390,7 +1392,7 @@ end
 
 function Base.show(io::IO, level::Level)
     print(io, "Level(id=", level.id, ", role=:", level.role, ", cells=", level.mesh.cells, ", order=",
-          nominal_order(level), ", mode=:", level.mode, ", basis=:", basis_name(level.basis))
+          nominal_order(level), ", mode=:", _mode(level.basis), ", basis=:", basis_name(level.basis))
     # A per-cell field is summarised by its palette size, never dumped: a graded level carries one order per cell and
     # printing them all is unreadable. A uniform level's palette holds exactly one entry and says nothing worth
     # printing, so the suffix appears only where the order actually varies.

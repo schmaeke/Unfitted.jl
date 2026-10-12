@@ -1260,14 +1260,13 @@ end
 # `local_basis_indices` allocates a fresh vector on every call, so asking it per cell allocated one vector per active
 # cell of the level. Measured on a 16³ level carrying 36 distinct anisotropic orders, 36 973 allocations and 30.6 ms
 # against 23 912 and 28.5 ms.
-function _cell_modes(basis::IntegratedLegendre, orders::CellOrders{D}, mesh::CartesianMesh{D}, mode::Symbol,
-                     mask) where {D}
-    length(orders.palette) == 1 && return _uniform_cell_modes(basis, orders, mesh, mode, mask)
+function _cell_modes(basis::IntegratedLegendre, orders::CellOrders{D}, mesh::CartesianMesh{D}, mask) where {D}
+    length(orders.palette) == 1 && return _uniform_cell_modes(basis, orders, mesh, mask)
     n = mesh.cells
     sets = [CartesianIndex{D}[]]
     index = Dict{Vector{CartesianIndex{D}},UInt16}(sets[1] => UInt16(1))
     kind = Array{UInt16,D}(undef, n)
-    sets_by_class = [local_basis_indices(basis, o, mode) for o in orders.palette]
+    sets_by_class = [local_basis_indices(basis, o) for o in orders.palette]
     for cell in cell_indices(mesh)
         if !is_active(mask, cell)
             kind[cell] = UInt16(1)
@@ -1276,7 +1275,7 @@ function _cell_modes(basis::IntegratedLegendre, orders::CellOrders{D}, mesh::Car
         kept = CartesianIndex{D}[]
         for id in sets_by_class[orders.class[cell]]
             key = TensorDofKey{D}(0, ntuple(d -> _axis_dof_key(cell.I[d], id.I[d]), D))
-            _entity_carries(basis, orders, mask, key, n, mode, id) && push!(kept, id)
+            _entity_carries(basis, orders, mask, key, n, id) && push!(kept, id)
         end
         kind[cell] = get!(index, kept) do
             length(sets) == typemax(UInt16) &&
@@ -1293,10 +1292,10 @@ end
 # own order. The generating cell is itself incident, and `id` came from its own index set, so the loop is never empty
 # and the unconstrained case needs no separate answer.
 function _entity_carries(basis::BasisFamily, orders::CellOrders{D}, mask, key::TensorDofKey{D}, n::NTuple{D,Int},
-                         mode::Symbol, id::CartesianIndex{D}) where {D}
+                         id::CartesianIndex{D}) where {D}
     for ci in _incident_cells(key, n)
         is_active(mask, ci) || continue
-        _index_admissible(basis, orders.palette[orders.class[ci]], mode, id) || return false
+        _index_admissible(basis, orders.palette[orders.class[ci]], id) || return false
     end
     return true
 end
