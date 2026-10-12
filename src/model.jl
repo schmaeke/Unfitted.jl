@@ -1228,9 +1228,16 @@ active_unknowns(model::Model) = active_unknowns(model.dofs)
 
 # Guard the positional-level mutators (`move!`, `activate!`, `deactivate!`) against multi-domain models. Those mutators
 # address a level by its position in the single `model.problem.space`, which is ambiguous once a problem spans several
-# subdomain spaces; supporting per-subdomain mutation is deferred. A single-domain model passes through silently.
+# subdomain spaces; supporting per-subdomain mutation is deferred. A single-domain model passes through silently. The
+# derivations, the estimator, `L2Projection` and `QuadField`, which read that one space as the whole discretisation,
+# refuse through the same guard.
+#
+# Single-domain means that every field lives on the first field's space, compared by identity as `problem_spaces`
+# deduplicates spaces, which is `length(problem_spaces(problem)) == 1` without building that vector: the guard runs on
+# every `L2Projection` transfer, twice, and on every `QuadField`, where building the vector allocated on every call.
 function _assert_single_domain(model::Model, op::AbstractString)
-    length(problem_spaces(model.problem)) == 1 ||
+    space = first(model.problem.fields).space
+    all(field -> field.space === space, model.problem.fields) ||
         throw(ArgumentError("$op is not yet supported for multi-domain (coupled) models"))
     return nothing
 end
