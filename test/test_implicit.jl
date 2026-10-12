@@ -385,3 +385,29 @@ end
         @test rules(union(intersect(a, b), intersect(a, c))) == rules(intersect(a, union(b, c)))
     end
 end
+
+@testset "implicit quadrature — leaves are evaluated inside the region only" begin
+    # A level set may be defined on the mesh domain alone — an image interpolant without extrapolation, a lookup into a
+    # grid. Every evaluation the kernel makes stays in the closed region, a pair leaf's included, so such leaves work in
+    # a corner cell of the domain where two planes cross, through the kernel and the finite-cell fit alike, and give the
+    # rule of the same leaves defined everywhere. (Pair leaves evaluated their leaves at a secant root beyond the fiber
+    # and at finite-difference steps beyond the region's corners, and threw here.)
+    inside(x) = all(c -> 0 <= c <= 1, x)
+    bounded(f) = x -> (inside(x) || throw(DomainError(x, "outside the mesh domain")); f(x))
+    p1 = x -> (x[1] - 0.12) + 0.5 * (x[2] - 0.12)
+    p2 = x -> -(x[1] - 0.12) + 2.0 * (x[2] - 0.12)
+    corner = box((0.0, 0.0), (0.25, 0.25))
+    rule(f1, f2, region) = _IVQ(Any[f1, f2], x -> f1(x) <= 0 && f2(x) <= 0, region; gauss_points=4,
+                                lipschitz=[1.2, 2.3])
+    @test rule(bounded(p1), bounded(p2), corner) == rule(p1, p2, corner)
+    @test _quad(x -> 1.0, rule(bounded(p1), bounded(p2), corner)) ≈ 0.0144 rtol = 1e-14
+    domain = physical_domain(intersect(leaf(bounded(p1); lipschitz=1.2), leaf(bounded(p2); lipschitz=2.3));
+                             subcell_length_scale=0.25)
+    _, weights, _, status = Unfitted.moment_fit_rule(domain, corner, (4, 4))
+    @test status === :fitted
+    @test sum(weights) ≈ 0.0144 rtol = 1e-13
+    q1 = x -> (x[1] - 0.12) + 0.5 * (x[2] - 0.12) + 0.3 * (x[3] - 0.1)
+    q2 = x -> -(x[1] - 0.12) + 2.0 * (x[2] - 0.12) + 0.2 * (x[3] - 0.1)
+    corner3 = box((0.0, 0.0, 0.0), (0.25, 0.25, 0.25))
+    @test rule(bounded(q1), bounded(q2), corner3) == rule(q1, q2, corner3)
+end

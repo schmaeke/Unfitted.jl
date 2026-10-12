@@ -58,7 +58,11 @@
 #   take `Dual` arguments overrides that with its own operator through the `grad` keyword, for which `_fd_gradient`
 #   below is the central-difference choice. Nothing in the finite-cell path sets it, so leaves reaching
 #   `moment_fit_rule` must be AD-capable. Pair leaves are the exception the kernel makes for itself: they are
-#   differentiated by central differences (`_FDLeaf`) and never see a `Dual`.
+#   differentiated by finite differences (`_FDLeaf`) and never see a `Dual`.
+#
+#   With the default gradient the kernel evaluates a leaf inside the closed box R only — at its corners, centre and
+#   fibers, and for a pair leaf at the two ends of a fiber and at a root between them — so a level set defined on the
+#   mesh domain alone (an image interpolant without extrapolation, a lookup into a grid) is a valid leaf.
 
 # ── Coordinate insert / remove helpers ─────────────────────────────────────────
 
@@ -96,12 +100,15 @@ end
 
 # Central-difference gradient operator for level sets through which automatic differentiation cannot be pushed. It is
 # opt-in — a caller passes it as the `grad` keyword of `implicit_volume_quadrature`, and nothing falls back to it. The
-# default step `h` is the cube-root-of-eps balance between truncation and round-off, scaled per axis by the coordinate
-# magnitude; the kernel's own pair leaves pass a step relative to their box instead (`_gradient`).
-function _fd_gradient(g, x::SVector{D,T}, h=cbrt(eps(T)) .* max.(one(T), abs.(x))) where {D,T}
+# step size is the cube-root-of-eps balance between truncation and round-off, scaled per axis by the coordinate
+# magnitude. (The kernel's own pair leaves are differentiated by `_gradient` instead, at a box-relative step and never
+# outside the box.)
+function _fd_gradient(g, x::SVector{D,T}) where {D,T}
+    h0 = cbrt(eps(T))
     return SVector{D,T}(ntuple(D) do d
-                            e = SVector{D,T}(ntuple(i -> i == d ? h[d] : zero(T), D))
-                            (g(x + e) - g(x - e)) / (2h[d])
+                            h = h0 * max(one(T), abs(x[d]))
+                            e = SVector{D,T}(ntuple(i -> i == d ? h : zero(T), D))
+                            (g(x + e) - g(x - e)) / (2h)
                         end)
 end
 
@@ -223,10 +230,20 @@ _restrict(g::_LipschitzLeaf, k::Int, v) = _LipschitzLeaf(_Slice(g.f, k, v), g.li
 # the two, so an interior corner becomes an exact breakpoint at every level of the reduction, and the recursion handles
 # the nested pairs of 3D (Saye's pairwise elimination, see the file header).
 #
-# t̃ⱼ(y) is gⱼ's root on the fiber where its end values bracket one (`_root`); elsewhere it is the secant root of those
-# end values — exact for a linear gⱼ, so P stays the eliminated linear function over the whole base — and the end of
-# smaller |gⱼ| when that secant is not finite. Leaves are therefore also evaluated on the fiber's secant extension,
-# outside the box; a `leaf` is defined on all coordinates, so that is within its contract.
+# t̃ⱼ(y) is gⱼ's root on the fiber where its end values bracket one (`_root`). Where they do not, gⱼ's root lies off the
+# fiber, outside the box, where a leaf need not be defined at all (the file header), so P is continued from values at
+# the fiber's two ends only — gᵢ's linear interpolant between its end values, taken at the secant root of gⱼ's,
+#
+#     P(y) = gᵢ(lo) + λ (gᵢ(hi) − gᵢ(lo)),    λ = gⱼ(lo) / (gⱼ(lo) − gⱼ(hi)),
+#
+# the resultant of the two leaves' linear interpolants along the fiber. It equals gᵢ at gⱼ's root as that root reaches
+# an end (λ = 0 or 1), so P is continuous, and for linear leaves it is the eliminated linear function itself over the
+# whole base: P has no kink, and an interior corner stays an exact breakpoint. (Clamping t̃ⱼ to the fiber instead would
+# also stay inside the box, but kinks P along gⱼ's traces, and the tetrahedron of the tests then misses its volume by
+# 2e-6.) Off the bracket P vanishes only where the two interpolants' roots meet beyond the box, so two curved leaves
+# that do not cross inside it usually leave P of one sign — the order of their roots — and the base problem prunes it
+# like any leaf that does not vary (`_sample_sign`). When gⱼ's end values are equal the secant has no root and P is gᵢ
+# at the lower end.
 #
 # `gi` and `gj` are `Any`, as the kernel's leaf lists are: typed fields would nest a pair leaf's type once per level of
 # the reduction (pairs of restricted pairs in 3D), and the compile work with it.
@@ -239,22 +256,20 @@ struct _PairLeaf{T}
 end
 
 function (p::_PairLeaf)(y)
-    fj = t -> p.gj(_insert_axis(y, p.k, t))
-    fa, fb = fj(p.lo), fj(p.hi)
-    t = if (fa < 0 < fb) || (fb < 0 < fa)
-        _root(fj, p.lo, p.hi, fa, fb)
-    else
-        s = (p.lo * fb - p.hi * fa) / (fb - fa)
-        isfinite(s) ? s : (abs(fa) <= abs(fb) ? p.lo : p.hi)
+    at(g, t) = g(_insert_axis(y, p.k, t))
+    ja, jb = at(p.gj, p.lo), at(p.gj, p.hi)
+    if (ja < 0 < jb) || (jb < 0 < ja)
+        return at(p.gi, _root(t -> at(p.gj, t), p.lo, p.hi, ja, jb))
     end
-    return p.gi(_insert_axis(y, p.k, t))
+    ia, ib = at(p.gi, p.lo), at(p.gi, p.hi)
+    r = ia + ja / (ja - jb) * (ib - ia)
+    return isfinite(r) ? r : ia
 end
 
-# A callback the kernel differentiates by central differences at the fixed step `h` instead of through
-# `ctx.gradient`: the wrapper on every pair leaf, so a pair leaf never sees a `Dual` (its root finding would have to be
-# differentiated through) and never instantiates one. The step is a fixed fraction, cbrt(eps), of the fiber the pair
-# leaf was built on, so the gradient does not depend on the geometry's length scale; its error, about 1e-10 relative,
-# is far below the `flat_tol` (√eps) that the gradient only feeds. Pair leaves steer the axis choice and the pruning
+# A callback the kernel differentiates by finite differences at the fixed step `h` instead of through `ctx.gradient`:
+# the wrapper on every pair leaf, so a pair leaf never sees a `Dual` (its root finding would have to be differentiated
+# through) and never instantiates one. The step is a fixed fraction, cbrt(eps), of the fiber the pair leaf was built
+# on, so the gradient does not depend on the geometry's length scale. Pair leaves steer the axis choice and the pruning
 # of base problems and are never integrated themselves. Restriction keeps the wrapper and the step.
 struct _FDLeaf{F,T}
     f::F
@@ -276,10 +291,21 @@ _parent(g::Union{_LipschitzLeaf,_FDLeaf}) = _parent(g.f)
 _parent(_) = nothing
 _siblings(a, b) = (p = _parent(a)) !== nothing && p === _parent(b)
 
-# The gradient of one leaf at `x`: central differences for a pair leaf, the context's operator (`ForwardDiff`, or the
-# caller's `grad`) for everything else.
-_gradient(ctx::_QuadCtx, g, x) = ctx.gradient(g, x)
-_gradient(::_QuadCtx, g::_FDLeaf, x::SVector) = _fd_gradient(g.f, x, map(_ -> g.h, x))
+# The gradient of one leaf at a sample `x` of the box `U`: the context's operator (`ForwardDiff`, or the caller's
+# `grad`) for a leaf the user supplied, and finite differences at the leaf's step for a pair leaf. Each difference is
+# central where `x ± h` lies in `U` and one-sided where it would not — at the box corners the axis choice samples — so
+# the leaves inside the pair leaf are never evaluated outside the box. The error is about 1e-10 relative for a central
+# difference and of the order h·|∂²P| for a one-sided one (round-off only for linear leaves, whose pair leaves are
+# linear). It reaches nothing but the classification of `_axis_class` — the sign of a component, and whether it exceeds
+# `flat_tol` (√eps) of the gradient's norm — so at worst a nearly flat component of a curved pair leaf is misread at a
+# corner, which changes how a base problem is partitioned, never the region integrated.
+_gradient(ctx::_QuadCtx, g, x, U::AxisBox) = ctx.gradient(g, x)
+function _gradient(::_QuadCtx, g::_FDLeaf, x::SVector{D,T}, U::AxisBox) where {D,T}
+    return SVector{D,T}(ntuple(D) do d
+                            a, b = max(x[d] - g.h, U.lower[d]), min(x[d] + g.h, U.upper[d])
+                            (g.f(Base.setindex(x, b, d)) - g.f(Base.setindex(x, a, d))) / (b - a)
+                        end)
+end
 
 # Pick a height axis and report whether it is certifiably graph-like. For each axis k, every leaf is classified by
 # sampling ∂g/∂x_k at the box center and 2ᴰ corners (`_axis_class`):
@@ -296,7 +322,7 @@ _gradient(::_QuadCtx, g::_FDLeaf, x::SVector) = _fd_gradient(g.f, x, map(_ -> g.
 # `(k, usable, classes)`: `usable` says that no leaf is bad along `k`, and `classes` holds every leaf's class along it.
 function _choose_axis(lsets, U::AxisBox{D}, ctx::_QuadCtx) where {D}
     samples = (center(U), _box_vertices(U)...)
-    grads = [map(x -> _gradient(ctx, g, x), samples) for g in lsets]
+    grads = [map(x -> _gradient(ctx, g, x, U), samples) for g in lsets]
     return _choose_axis(grads, ctx.flat_tol, Val(D))::Tuple{Int,Bool,Vector{Symbol}}
 end
 
