@@ -339,23 +339,13 @@ function local_basis_indices(::IntegratedLegendre, order::NTuple{D,Int}) where {
     return _tensor_index_set(order)
 end
 
-# Trunk degree of a single 1D integrated-Legendre mode index. The two endpoint modes 0 and 1 are the linear vertex shape
-# functions and count as 0; a bubble mode m ≥ 2 is an integrated Legendre polynomial of degree m and counts as m.
-# Counting the vertex factors as 0 is what lets the trunk filter keep every edge mode up to degree p while still
-# trimming the interior — a pure polynomial-total-degree filter would instead drop the top edge modes and break C⁰
-# conformity.
-_trunk_degree(mode::Integer) = mode ≥ 2 ? Int(mode) : 0
-
-# Trunk degree of a D-dim multi-index `α` is `Σ_d t(α_d)`. This is what the `:trunk` mode compares against the isotropic
-# polynomial order `p`: edge modes (one bubble axis) survive up to degree p, while face/volume modes survive only while
-# their bubble degrees sum to ≤ p.
-function _trunk_degree(id::CartesianIndex{D}) where {D}
-    degree = 0
-    for axis in 1:D
-        degree += _trunk_degree(id.I[axis])
-    end
-    return degree
-end
+# Trunk degree `Σ_d t(α_d)` of a multi-index `α`, where `t(α_d) = α_d` for a bubble mode `α_d ≥ 2` and `t(α_d) = 0` for
+# the two endpoint modes 0 and 1, the linear vertex shape functions. This is what the `:trunk` mode compares against the
+# isotropic polynomial order `p`: edge modes (one bubble axis) survive up to degree p, while face/volume modes survive
+# only while their bubble degrees sum to ≤ p. Counting the vertex factors as 0 is what lets the filter keep every edge
+# mode up to degree p while still trimming the interior — a pure polynomial-total-degree filter would instead drop the
+# top edge modes and break C⁰ conformity.
+_trunk_degree(id::CartesianIndex) = sum(a -> a ≥ 2 ? a : 0, Tuple(id))
 
 function local_basis_indices(basis::IntegratedLegendre, order::NTuple{D,Int}, mode::Symbol) where {D}
     _check_basis_mode(basis, mode, order)
@@ -436,16 +426,9 @@ end
 
 # ── Hot-path tensor-product evaluation ────────────────────────────────────────
 
-# Promote a `PointLike` input (NTuple or SVector) to an `SVector{D,T}` whose scalar type is the common floating-point
-# promotion of the inputs.
-function _reference_coordinate(xi::PointLike{D}) where {D}
-    T = float(promote_type(map(typeof, Tuple(xi))...))
-    return SVector{D,T}(xi)
-end
-
-# Caller-owned per-axis 1D scratch buffers used by `_fill_factor_tables!` and the tensor-product evaluation kernels. One
-# `Vector{T}` per axis, length `order[d] + 1`. The assembly workspace pre-allocates one of these per level so the hot
-# loop never reallocates.
+# Caller-owned per-axis 1D scratch buffers used by `_fill_factor_tables!` and the tensor-product kernel. One `Vector{T}`
+# per axis, length `order[d] + 1`. The assembly workspace pre-allocates one of these per level so the hot loop never
+# reallocates.
 #
 # The per-axis size requirement `order[d] + 1` is the count of 1D modes active on a single cell for *every* basis family
 # the package currently supports: integrated Legendre carries one endpoint per side plus `order − 1` bubbles, and an
@@ -497,19 +480,29 @@ function _fill_factor_tables!(::IntegratedLegendre, val1d, der1d, order::NTuple{
     return nothing
 end
 
-# Tensor-product values from precomputed 1D tables. Fills the per-axis tables via `_fill_factor_tables!(basis, …)` (the
-# only family-specific step), then walks each multi-index `α` in `indices` and assembles the product
-# `N_α(ξ) = ∏_d val1d[d][α_d + 1]`. The tensor-product loop is basis-agnostic: it only assumes the per-axis tables are
-# indexed by the 1D mode number on the cell, which is the canonical convention every family in this package follows. The
-# caller owns `val1d`.
+# The tensor-product kernel, the one evaluator every hot loop calls: fills the per-axis tables through
+# `_fill_factor_tables!(basis, …)` (the only family-specific step), then walks each multi-index `α` in `indices` and
+# writes
 #
-# The buffer check is `>=`, not `==`. Under a per-cell polynomial order the workspace banks stay sized at the level's
+#     values[a]       = N_α(ξ)    = ∏_d val1d[d][α_d + 1]
+#     gradients[a][d] = ∂N_α/∂x_d = der1d[d][α_d + 1] · ∏_{j ≠ d} val1d[j][α_j + 1] · scale[d]     (when asked)
+#
+# `grad` is `nothing` for values alone (the transfer right-hand side and the Dirichlet trace, which never read a
+# gradient) or the tuple `(gradients, scale, der1d)`: the gradient buffer, the per-axis chain-rule factor from reference
+# to physical coordinates (`2 / h_d` on an axis-aligned cell of edge lengths `h_d`, ones for the bare reference
+# gradient), and the derivative tables. It is a type either way, so the gradient work folds away at compile time and one
+# kernel serves both paths without a second copy of the loop to keep in step. The loop is family-agnostic: it only
+# assumes the per-axis tables are indexed by the 1D mode number on the cell, the convention every family here follows.
+# The caller owns every buffer. The "product except one" is `O(D)` per gradient component, `O(D²)` per multi-index, on
+# `NTuple` scratch and allocation-free.
+#
+# The buffer checks are `>=`, not `==`. Under a per-cell polynomial order the workspace banks stay sized at the level's
 # *nominal* (maximum) order while `indices` is the cell's own minimum-rule set, which is shorter on every cell below the
 # maximum. Writing into a prefix of the longer buffer is transparent to every consumer, because they all bound their
 # loop by `eachindex(raw_dofs)` and read `values[a]` positionally — the pairing is with the index list, not with the
 # buffer's length. Length-matching with a `view` instead was measured at +24–30% on this kernel and is not worth it.
-# What `>=` gives up is the guard against a *short* buffer, so `test_cell_order.jl` asserts the surviving check still
-# fires.
+# What `>=` gives up is the guard against a *short* buffer, so `test_cell_order.jl` asserts the surviving checks still
+# fire.
 #
 # The 1D factor tables are likewise filled at the nominal order and read only up to the cell's own: for integrated
 # Legendre `_fill_factor_tables!` computes mode `m` from `ξ` and `m` alone, with no `p` anywhere in the recurrence, so
@@ -518,38 +511,21 @@ end
 # Boor at degree p yields p+1 span-specific functions — which is one more reason `_supports_cell_order` is false for
 # B-splines.
 function _tensor_values!(basis::BasisFamily, values::AbstractVector, indices::AbstractVector{CartesianIndex{D}},
-                         order::NTuple{D,Int}, ξ::SVector{D,T}, val1d, cell::CartesianIndex{D}) where {D,T}
+                         order::NTuple{D,Int}, ξ::SVector{D,T}, val1d, cell::CartesianIndex{D},
+                         grad=nothing) where {D,T}
     length(values) >= length(indices) || throw(DimensionMismatch("basis value buffer has wrong length"))
-    _fill_factor_tables!(basis, val1d, nothing, order, ξ, cell)
-    @inbounds for (a, id) in pairs(indices)
-        values[a] = prod(ntuple(d -> val1d[d][id.I[d] + 1], D))
-    end
-    return values
-end
-
-# Tensor-product values and physically-scaled gradients from precomputed 1D tables. For each multi-index `α`:
-#
-#     N_α(ξ)     = ∏_d val1d[d][α_d + 1]
-#     ∂N_α/∂x_d  = der1d[d][α_d + 1] · ∏_{j ≠ d} val1d[j][α_j + 1] · scale[d]
-#
-# `scale[d]` is the chain-rule factor from reference to physical coordinates. For the bare reference gradient pass
-# `scale = (1, …, 1)`; for the physical gradient on an axis-aligned cell with edge lengths `h_d` pass
-# `scale[d] = 2 / h_d` (the reference cell has edge length 2).
-#
-# The "product except one" trick is `O(D)` per gradient component for `O(D²)` per multi-index — for typical `D ≤ 4` and
-# modest mode counts this is comfortably allocation-free with `_product_except` operating on `NTuple` scratch.
-function _tensor_values_grads!(basis::BasisFamily, values::AbstractVector, gradients::AbstractVector,
-                               indices::AbstractVector{CartesianIndex{D}}, order::NTuple{D,Int}, ξ::SVector{D,T},
-                               scale::SVector{D,T}, val1d, der1d, cell::CartesianIndex{D}) where {D,T}
-    length(values) >= length(indices) || throw(DimensionMismatch("basis value buffer has wrong length"))
-    length(gradients) >= length(indices) || throw(DimensionMismatch("basis gradient buffer has wrong length"))
-    _fill_factor_tables!(basis, val1d, der1d, order, ξ, cell)
+    grad === nothing ||
+        length(grad[1]) >= length(indices) ||
+        throw(DimensionMismatch("basis gradient buffer has wrong length"))
+    _fill_factor_tables!(basis, val1d, grad === nothing ? nothing : grad[3], order, ξ, cell)
     @inbounds for (a, id) in pairs(indices)
         vfac = ntuple(d -> val1d[d][id.I[d] + 1], D)
         values[a] = prod(vfac)
+        grad === nothing && continue
+        gradients, scale, der1d = grad
         gradients[a] = SVector{D,T}(ntuple(k -> der1d[k][id.I[k] + 1] * _product_except(vfac, k) * scale[k], D))
     end
-    return values, gradients
+    return values
 end
 
 # Product `∏_{d ≠ k} values[d]`. Used by the gradient kernel to compute the "value part" of the gradient component along
@@ -564,20 +540,15 @@ end
 
 # ── Boundary and facet basis identification ───────────────────────────────────
 
-# True iff the 1D integrated Legendre mode index `mode` carries support on the requested cell side: mode 0 lives on the
-# lower endpoint (`ξ = −1`), mode 1 on the upper endpoint (`ξ = +1`), and modes m ≥ 2 (bubbles) vanish at both endpoints
-# — they never sit on either side.
-function boundary_mode(mode::Integer, side::Symbol)
-    side === :lower && return mode == 0
-    side === :upper && return mode == 1
-    throw(ArgumentError("boundary side must be :lower or :upper"))
-end
-
 # True iff the tensor-product basis function with multi-index `id` carries support on the codim-1 face specified by
-# `(axis, side)`. For integrated Legendre this reduces to checking the single 1D mode along the requested axis.
+# `(axis, side)`. For integrated Legendre this is a test of the single 1D mode along the requested axis: mode 0 lives on
+# the lower endpoint (`ξ = −1`), mode 1 on the upper endpoint (`ξ = +1`), and modes m ≥ 2 (bubbles) vanish at both
+# endpoints — they never sit on either side.
 function is_boundary_basis(::IntegratedLegendre, id::CartesianIndex{D}, axis::Integer, side::Symbol) where {D}
     1 <= axis <= D || throw(ArgumentError("axis out of bounds"))
-    return boundary_mode(id.I[axis], side)
+    side === :lower && return id.I[axis] == 0
+    side === :upper && return id.I[axis] == 1
+    throw(ArgumentError("boundary side must be :lower or :upper"))
 end
 
 # Codim-K facet membership for a tensor-product multi-index: the basis function sits on the facet specified by `sides`

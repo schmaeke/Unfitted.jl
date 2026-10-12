@@ -230,6 +230,20 @@ end
     exact = zeros(length(ids))
     _tensor_values!(fam, exact, ids, (2, 2), ξ, _factor_buffers((2, 2), Float64), cell)
     @test long[1:length(ids)] == exact
+
+    # The same two halves for the gradient buffer the kernel's `grad = (gradients, scale, der1d)` argument carries: a
+    # short one is refused, a long one is filled in a prefix, and the values the gradient call writes are the
+    # values-only call's.
+    scale = SVector(2.0, 4.0)
+    grad(n) = (zeros(SVector{2,Float64}, n), scale, _factor_buffers((2, 2), Float64))
+    @test_throws DimensionMismatch _tensor_values!(fam, zeros(length(ids)), ids, (2, 2), ξ,
+                                                   _factor_buffers((2, 2), Float64), cell, grad(length(ids) - 1))
+    long_values, long_grad = zeros(length(ids) + 7), grad(length(ids) + 7)
+    _tensor_values!(fam, long_values, ids, (2, 2), ξ, _factor_buffers((2, 2), Float64), cell, long_grad)
+    exact_values, exact_grad = zeros(length(ids)), grad(length(ids))
+    _tensor_values!(fam, exact_values, ids, (2, 2), ξ, _factor_buffers((2, 2), Float64), cell, exact_grad)
+    @test long_grad[1][1:length(ids)] == exact_grad[1]
+    @test long_values[1:length(ids)] == exact_values == exact
 end
 
 @testset "per-cell order: elevate / cell_orders round trip" begin

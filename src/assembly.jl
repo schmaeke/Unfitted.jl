@@ -63,7 +63,7 @@ end
 #     because the positional pairing between a cell's raw dofs and its basis values is the only link between the dof
 #     layer and the basis layer, and nothing checks it.
 #   - `values[i]` and `gradients[i]` are sized at the level's nominal (maximum) order, so a cell at a lower per-cell
-#     order fills a prefix. See `_tensor_values_grads!` in `basis.jl` for why that is transparent and why the buffers
+#     order fills a prefix. See `_tensor_values!` in `basis.jl` for why that is transparent and why the buffers
 #     are not keyed by order value.
 struct BasisBank{D,T,B<:BasisFamily}
     bases::Vector{B}
@@ -1173,7 +1173,7 @@ end
 # disagree.
 #
 # The guard compares a cell's raw dof list with the bank, which is sized once from the level's nominal order — the `>=`
-# relaxation `_tensor_values_grads!` relies on. `_build_cell_dofs!` and the bank both read `level.modes`, so the list
+# relaxation `_tensor_values!` relies on. `_build_cell_dofs!` and the bank both read `level.modes`, so the list
 # and the cell's own index set cannot disagree in length; what can fail is a cell needing more basis values than its
 # level's bank holds. One integer compare per (region, parent, field), outside the quadrature loop.
 function _frame!(ws::AssemblyWorkspace, region)
@@ -1308,22 +1308,19 @@ end
 # (`Val(true)`), or values only (`Val(false)`, for the L² transfer rhs, whose integrand never reads a gradient). Each
 # parent maps `p` into its own reference frame through `ξ0 + dξ ∘ p` (`Parent`), with no division. The gradient scale is
 # the axis-aligned chain rule `2 / edge_lengths(parent_box)` of `physical_basis_gradients` in `mesh.jl`. One basis
-# evaluation per parent per point. A one-sided region's parents have distinct levels, so their bank slots never
-# collide; an interface region's two sides live in the two subdomains' disjoint level banks, so the kernel reads field
-# `a` from `a`'s cut cell and field `b` from `b`'s at the same physical point.
+# evaluation per parent per point, through one kernel call: `G` is a type parameter, so the gradient tuple is formed,
+# and the gradient work done, only when it is `true`. A one-sided region's parents have distinct levels, so their bank
+# slots never collide; an interface region's two sides live in the two subdomains' disjoint level banks, so the kernel
+# reads field `a` from `a`'s cut cell and field `b` from `b`'s at the same physical point.
 @noinline function _refresh!(ws::AssemblyWorkspace{D,T}, region::Region, p, ::Val{G}) where {D,T,G}
     bank = ws.bank
     for parent in region.parents
         l = parent.level
         ids = bank.modes[l].sets[bank.modes[l].kind[parent.cell]]
         xi = parent.ξ0 + parent.dξ .* p
-        if G
-            scale = SVector{D,T}(2 .* inv.(edge_lengths(parent.parent_box)))
-            _tensor_values_grads!(bank.bases[l], bank.values[l], bank.gradients[l], ids, bank.orders[l], xi, scale,
-                                  bank.val1d[l], bank.der1d[l], parent.cell)
-        else
-            _tensor_values!(bank.bases[l], bank.values[l], ids, bank.orders[l], xi, bank.val1d[l], parent.cell)
-        end
+        grad = G ? (bank.gradients[l], SVector{D,T}(2 .* inv.(edge_lengths(parent.parent_box))), bank.der1d[l]) :
+               nothing
+        _tensor_values!(bank.bases[l], bank.values[l], ids, bank.orders[l], xi, bank.val1d[l], parent.cell, grad)
     end
     return nothing
 end

@@ -611,12 +611,7 @@ reference cell itself, use a one-cell level over `[−1, 1]ᴰ`, e.g.
 Allocates a fresh vector per call. The assembly hot loops go through the workspace banks instead and allocate nothing.
 """
 function basis_values(level::Level{D}, cell::CartesianIndex{D}, xi::PointLike{D}) where {D}
-    indices = cell_basis_indices(level, cell)
-    ξ = _reference_coordinate(xi)
-    R = eltype(ξ)
-    values = Vector{R}(undef, length(indices))
-    p = cell_order(level, cell)
-    return _tensor_values!(level.basis, values, indices, p, ξ, _factor_buffers(p, R), cell)
+    return _cell_basis(level, cell, xi, float(promote_type(map(typeof, Tuple(xi))...)), nothing)
 end
 
 """
@@ -640,16 +635,22 @@ precision.
 """
 function physical_basis_gradients(level::Level{D}, cell::CartesianIndex{D}, cell_box::AxisBox{D,T},
                                   xi::PointLike{D}) where {D,T}
+    return _cell_basis(level, cell, xi, float(promote_type(map(typeof, Tuple(xi))..., T)), cell_box)
+end
+
+# The one body of the two per-cell evaluators: the cell's own index set and order from the level, fresh buffers in the
+# working precision `R`, and one kernel call — values alone without a box, values and physical gradients (the chain-rule
+# scale `2 / h_d` of `cell_box`) with one. Each public method states its own precision in its signature, because the
+# two differ: values in the promotion of the point's coordinate types, gradients in its promotion with the box's.
+function _cell_basis(level::Level{D}, cell::CartesianIndex{D}, xi::PointLike{D}, ::Type{R}, cell_box) where {D,R}
     indices = cell_basis_indices(level, cell)
-    R = float(promote_type(map(typeof, Tuple(xi))..., T))
-    ξ = SVector{D,R}(xi)
-    values = Vector{R}(undef, length(indices))
-    gradients = Vector{SVector{D,R}}(undef, length(indices))
-    scale = SVector{D,R}(2 ./ edge_lengths(cell_box))
     p = cell_order(level, cell)
-    _tensor_values_grads!(level.basis, values, gradients, indices, p, ξ, scale, _factor_buffers(p, R),
-                          _factor_buffers(p, R), cell)
-    return gradients
+    values = Vector{R}(undef, length(indices))
+    grad = cell_box === nothing ? nothing :
+           (Vector{SVector{D,R}}(undef, length(indices)), SVector{D,R}(2 ./ edge_lengths(cell_box)),
+            _factor_buffers(p, R))
+    _tensor_values!(level.basis, values, indices, p, SVector{D,R}(xi), _factor_buffers(p, R), cell, grad)
+    return grad === nothing ? values : grad[1]
 end
 
 # The per-cell minimum-rule table of a level: one `CellModes` always, a palette of one set on a uniform level. Assembly
