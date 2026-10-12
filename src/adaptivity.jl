@@ -248,18 +248,22 @@ end
 # the palette scan that collapses it). Measured on a uniform 512² level, 7.9 ms and 13.0 MiB against 1.3 ms and 1.0 MiB
 # for the tuple, for an identical result.
 #
-# The generator's element type is `Pair{Int,Union{NTuple{D,Int},Array{...,D}}}`, which is what
-# `elevate(V, pairs::Pair{<:Integer}...)` already dispatches on, so no `Pair{Int,Any}` accumulator is needed to hold the
-# two shapes together.
+# Each level is raised by `_reordered_space`, which is `elevate`'s own per-level step. The only other thing `elevate`
+# adds is the check that no level is named twice, and this loop names each level once by construction. Calling it
+# instead meant splatting a generator whose length is known only at run time into a `Vararg` call, which inference
+# resolves by iterating the generator abstractly, with closures of its own specialised on the generator's type and
+# compiled on the spot. Measured on an adapted 8² order-2 ladder, that was 129 ms of inference and 127 ms of the
+# closures' codegen, nearly a fifth of the first `estimate`'s compile time.
 function _enriched_space(V::Space{D,T}, inc::Int) where {D,T}
-    raised(k) = (o=V.levels[k].orders;
-                 length(o.palette) == 1 ? o.nominal .+ inc : map(p -> p .+ inc, cell_orders(V; level=k)))
-    graded = [k for k in 1:length(V.levels) if _supports_cell_order(V.levels[k].basis)]
-    W = isempty(graded) ? V : elevate(V, (k => raised(k) for k in graded)...)
-    charge = [(k, 1) for k in 1:length(V.levels)]
-    live = _live_levels(V)
+    W, charge, live = V, [(k, 1) for k in 1:length(V.levels)], _live_levels(V)
     for k in 1:length(V.levels)
-        (live[k] && !(k in graded)) || continue
+        _supports_cell_order(V.levels[k].basis) || continue
+        o = V.levels[k].orders
+        raised = length(o.palette) == 1 ? o.nominal .+ inc : map(p -> p .+ inc, cell_orders(V; level=k))
+        W = _reordered_space(W, k, raised)
+    end
+    for k in 1:length(V.levels)
+        (live[k] && !_supports_cell_order(V.levels[k].basis)) || continue
         W = _refinement_twin(W, V.levels[k], inc + 1)
         push!(charge, (k, inc + 1))
     end
@@ -285,6 +289,41 @@ end
 # The cell of a level that cell `c` of its `f`-fold refinement lies in, and `c` itself at `f = 1`: where `estimate`
 # charges a twin's indicator.
 _coarse_cell(c::CartesianIndex{D}, f::Int) where {D} = CartesianIndex(ntuple(d -> (c.I[d] - 1) ÷ f + 1, D))
+
+# `estimate`'s enriched model when `space` holds a live refinement twin, charged to the levels whose ids are `twinned`.
+# Two things differ from the plain enrichment, and both come from the twin.
+#
+# Pruning. A superposed twin is a *nested* level of the same degree, so leaf semantics would deduplicate the level it
+# enriches — removing exactly the keys the injection is about to look for, and turning `Rewire` into a refusal. Only
+# *that* level may skip pruning, and only in this throwaway model: turning leaf semantics off for the whole enriched
+# model instead was measured to inflate the indicator on a covered cell of an unrelated integrated-Legendre level by
+# 4.1×, because that level's order-elevated covered modes then survive, land in `W`, and are charged as error to a cell
+# `decide` can spend nothing on. Exempting the enriched level costs the indicator nothing. `u⁺` is zero on every key the
+# injection does not fill, so the duplicate columns contribute nothing to `R = b⁺ − A⁺u⁺`; `b⁺` and the diagonal on `W`
+# are untouched; and `A⁺` being singular is harmless here, since the indicator reads its diagonal and forms one
+# matrix–vector product and never factorises.
+#
+# The caches. A twin refines the integration partition wherever it is live, so the enriched plan cuts none of `model`'s
+# boxes there, and building it on `model`'s own caches, which a plan restricts to the boxes it cuts, evicted every rule
+# `model` held: on an immersed 8² order-2 B-spline ladder the next `adapted` refitted all 44 of its boxes. So the plan
+# is built on a copy, and the rules fitted there are merged back into `model`'s caches, where both sets coexist as the
+# two moment orders of the plain enrichment do. The twin's rules are worth keeping: on a ladder split by the twin's
+# factor its mesh is the next level's, so its boxes are the ones the next h-step wakes. Over two estimate → refine →
+# adapted cycles on an immersed 8² order-2 B-spline ladder of depth 2, the merge took the fits from 309 (shared) to 236,
+# every `adapted` refitting nothing; a copy alone took them to 326, because the next `adapted` then refitted the twin's
+# boxes. The price is that `model`'s caches carry one twin plan's boxes beyond its own until its next plan build evicts
+# them.
+#
+# It is a function rather than a branch of `estimate` for compile time: `space` is built at run time and is not
+# concretely typed there, so this call is dispatched at run time and the copy and the merge are compiled when a twin is
+# first estimated, never for a stack without one.
+function _twinned_model(model::Model, space::Space, twinned::Vector{Int})
+    caches = copy.(model.moment_fit_caches)
+    plus = _derived(model, space; options=merge(model.plan_options, (; prune_exempt=twinned)), caches,
+                    point_base=_FOREIGN_POINTS)
+    foreach(merge!, model.moment_fit_caches, caches)
+    return plus
+end
 
 """
     estimate(model::Model, solution::Solution; enrichment = 1) -> ErrorEstimate
@@ -415,43 +454,25 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     # never per point.
     _assert_no_point_keyed_state(model.problem, "estimate")
 
-    # The caches are handed over UNcopied unless a live twin refines the partition, which is the opposite of what every
-    # other derivation does (`adapted` gives its target its own copy so a fork cannot evict a sibling's rules). Sharing
-    # is deliberate where `V⁺` cuts `model`'s own boxes: `plus` is thrown away at the end of this call, and the
+    # Without a live twin, `V⁺` is built on `model`'s caches UNcopied, which is the opposite of what every other
+    # derivation does (`adapted` gives its target its own copy so a fork cannot evict a sibling's rules). Sharing is
+    # deliberate where `V⁺` cuts `model`'s own boxes: `plus` is thrown away at the end of this call, and the
     # (p+1)-order cut rules it fits are wanted on `model`, where the next `adapted` copies them forward and the next
     # `estimate` finds them. `integration_plan` evicts by region box, so the two moment orders coexist at the same boxes
-    # instead of evicting each other — see `_prefit!` in `intersections.jl`.
+    # instead of evicting each other — see `_prefit!` in `intersections.jl`. A live twin breaks that premise, and
+    # changes the pruning too, so `_twinned_model` builds `V⁺` then. `twinned` holds the ids of the levels a twin is
+    # charged to, the key `dof_layout` reads its pruning exemption by.
     #
-    # A live twin breaks that premise: it refines the integration partition wherever it is live, so `plus` cuts none of
-    # `model`'s boxes there, and building its plan on the shared cache, which a plan restricts to the boxes it cuts,
-    # evicted every rule `model` held. On an immersed 8² order-2 B-spline ladder the next `adapted` then refitted all 44
-    # of its boxes. So `plus` builds its plan on a copy there, and the rules it fitted are merged back into `model`'s
-    # cache afterwards, where both sets coexist as the two moment orders do above. The twin's rules are worth keeping:
-    # on a ladder split by the twin's factor its mesh is the next level's, so its boxes are the ones the next h-step
-    # wakes. Over two estimate → refine → adapted cycles on an immersed 8² order-2 B-spline ladder of depth 2, the
-    # merge took the fits from 309 (shared) to 236, every `adapted` refitting nothing; a copy alone took them to 326,
-    # because the next `adapted` then refitted the twin's boxes.
-    enriched_space, charge = _enriched_space(V, Int(enrichment))
-    # A superposed twin is a *nested* level of the same degree, so leaf semantics would deduplicate the level it
-    # enriches — removing exactly the keys the injection is about to look for, and turning `Rewire` into a refusal. Only
-    # *that* level may skip pruning, and only in this throwaway twin: turning leaf semantics off for the whole enriched
-    # model instead was measured to inflate the indicator on a covered cell of an unrelated integrated-Legendre level by
-    # 4.1×, because that level's order-elevated covered modes then survive, land in `W`, and are charged as error to a
-    # cell `decide` can spend nothing on. The exempt levels are the ones a twin is charged to, named by *id*, as
-    # `dof_layout` reads them.
-    #
-    # Exempting the enriched level costs the indicator nothing. `u⁺` is zero on every key the injection does not fill,
-    # so the duplicate columns contribute nothing to `R = b⁺ − A⁺u⁺`; `b⁺` and the diagonal on `W` are untouched; and
-    # `A⁺` being singular is harmless here, since the indicator reads its diagonal and forms one matrix–vector product
-    # and never factorises.
-    twinned = [V.levels[k].id for (k, factor) in charge if factor > 1]
-    options = isempty(twinned) ? model.plan_options : merge(model.plan_options, (; prune_exempt=twinned))
-    caches = isempty(twinned) ? model.moment_fit_caches : copy.(model.moment_fit_caches)
-    # The twin numbers its points from `_FOREIGN_POINTS`, far below 1, so a form that reads per-point state by `q.point`
+    # `V⁺` numbers its points from `_FOREIGN_POINTS`, far below 1, so a form that reads per-point state by `q.point`
     # without capturing it — through a global, which the walk above cannot see — raises at the read rather than reading
     # `model`'s points at the twin's indices (see "Detecting point-keyed state" in `data.jl`).
-    plus = _derived(model, enriched_space; options, caches, point_base=_FOREIGN_POINTS)
-    caches === model.moment_fit_caches || foreach(merge!, model.moment_fit_caches, caches)
+    enriched_space, charge = _enriched_space(V, Int(enrichment))
+    twinned = Int[V.levels[k].id for (k, factor) in charge if factor > 1]
+    plus = if isempty(twinned)
+        _derived(model, enriched_space; caches=model.moment_fit_caches, point_base=_FOREIGN_POINTS)
+    else
+        _twinned_model(model, enriched_space, twinned)
+    end
 
     # Inject before assembling. `Rewire` reads only the two dof layouts, so it needs nothing assembled, and after the
     # refusals above it has one way left to fail: a key of `V` that `V⁺` does not carry free, i.e. `V⁺ ⊉ V`. The known
