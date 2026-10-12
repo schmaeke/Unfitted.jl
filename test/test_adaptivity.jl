@@ -932,6 +932,60 @@ end
     @test all(ch -> est.cells[2][ch] == 0, children)
 end
 
+# State a form reads by `q.point` without capturing it: globals, which `estimate`'s walk of a form's captures cannot
+# see, so the testsets below pin what happens at the read itself.
+const _AD_CHI = Ref{QuadField{Float64}}()
+const _AD_PER_POINT = ones(10^6)
+
+# What `f()` returns, or the exception it raised, out of the wrappers a threaded assembly (`CompositeException`) and a
+# spawned task (`TaskFailedException`) put around an exception a form raised, so the assertions hold at any thread
+# count.
+function _ad_root(e)
+    e isa CompositeException ? _ad_root(first(e.exceptions)) :
+    e isa TaskFailedException ? _ad_root(e.task.exception) : e
+end
+_ad_outcome(f) =
+    try
+        return f()
+    catch err
+        return _ad_root(err)
+    end
+
+# A load source that, once armed, blocks at its first evaluation until the test releases it, suspending an `estimate`
+# in the middle of its enriched assembly. Gate `i` is `_AD_GATES[i]`: the flag the first evaluation after arming claims
+# atomically, so only one task of a threaded assembly blocks, a channel announcing that it has, and one releasing it.
+# The source holds the gate's number rather than the gate, so a form captures nothing the walk would follow.
+const _AD_GATES = [(Threads.Atomic{Bool}(false), Channel{Nothing}(1), Channel{Nothing}(1)) for _ in 1:2]
+struct _ADGated
+    gate::Int
+end
+function (source::_ADGated)(x)
+    armed, entered, resume = _AD_GATES[source.gate]
+    if Threads.atomic_xchg!(armed, false)
+        put!(entered, nothing)
+        take!(resume)
+    end
+    return 1.0
+end
+
+# Arm gate `i`, start `estimate(model, u)` on a task of its own, and return the task once it is blocked at the gate. A
+# task that ends first never reached it, and that is raised here rather than leaving the test waiting.
+function _ad_suspended_estimate(i, model, u)
+    armed, entered, _ = _AD_GATES[i]
+    armed[] = true
+    task = Threads.@spawn estimate(model, u)
+    timedwait(() -> isready(entered) || istaskdone(task), 600.0)
+    isready(entered) || error("estimate ended without reaching gate $i: $(_ad_outcome(() -> fetch(task)))")
+    take!(entered)
+    return task
+end
+
+# Release the estimate `task` suspended at gate `i`, and return it.
+function _ad_resumed(i, task)
+    put!(_AD_GATES[i][3], nothing)
+    return fetch(task)
+end
+
 @testset "estimate refuses a form that reads per-quadrature-point state" begin
     # `estimate` assembles the problem's own blocks and loads a second time, on an order-elevated twin whose `q.point`
     # numbers a larger cloud sitting at different places. A form reading a `QuadField` there indexes an array built for
@@ -952,11 +1006,58 @@ end
                                dirichlet=bc))
     @test_throws ArgumentError estimate(stateful, solve!(stateful))
 
-    # And the read itself is guarded, which is what covers the shape reflection cannot see: a form written at top level
-    # reads a global binding and captures nothing at all. Outside such a pass the read is unguarded.
-    @test_throws ArgumentError Unfitted._on_foreign_cloud(() -> chi[1], base.version + 1)
-    @test Unfitted._on_foreign_cloud(() -> chi[1], base.version) == 1.0
+    # And the read itself is guarded, which is what covers the shape reflection cannot see: a form that reads a global
+    # binding captures nothing at all. The enriched model numbers its points far below 1, so the read raises, and it
+    # raises as itself rather than as the walk's refusal. The field reads as before everywhere else.
+    reads_global = WeakForm(; linear=q -> 1.0, symmetric=true,
+                            bilinear=(q, trial) -> TestChannels(0.0, _AD_CHI[][q.point] .* trial.gradient))
+    unseen = prepare(Problem(V, reads_global; dirichlet=bc))
+    _AD_CHI[] = QuadField{Float64}(unseen; init=q -> 1.0)
+    solution = solve!(unseen)
+    err = _ad_outcome(() -> estimate(unseen, solution))
+    @test err isa ArgumentError
+    @test occursin("another model's quadrature cloud", sprint(showerror, err))
+    @test _AD_CHI[][1] == 1.0
     @test chi[1] == 1.0
+end
+
+@testset "estimate: a plain array read by q.point raises rather than reading the wrong points" begin
+    # The same uncaptured read from a plain vector long enough for any cloud of this size. The enriched model's points
+    # lie far below 1, so the read is out of bounds and raises; numbered from 1 they read this vector at points of
+    # another cloud and the estimate came back as if nothing had happened.
+    V = space(_AD_Ω; cells=4, order=2)
+    reads_vector = WeakForm(; linear=q -> _AD_PER_POINT[q.point], symmetric=true,
+                            bilinear=(q, trial) -> TestChannels(0.0, trial.gradient))
+    model = prepare(Problem(V, reads_vector; dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    @test nquadpoints(model) < length(_AD_PER_POINT)
+    solution = solve!(model)
+    @test _ad_outcome(() -> estimate(model, solution)) isa BoundsError
+end
+
+@testset "an estimate in flight leaves every other task's reads alone" begin
+    # Nothing of the enriched model's numbering is process-wide. `a` and `b` are two models of the same Poisson problem,
+    # with sources that suspend their estimates at gates 1 and 2; `other` is a field on `a` that no form reads.
+    V = space(_AD_Ω; cells=4, order=2)
+    bc = [dirichlet(0.0; on=boundary(:all))]
+    a, b = (prepare(poisson(V; source=_ADGated(i), dirichlet=bc)) for i in 1:2)
+    ua, ub = solve!(a), solve!(b)
+    other = QuadField{Float64}(a; init=q -> 2.0)
+    alone = estimate(a, ua)
+
+    # While `a`'s estimate is suspended inside its enriched assembly, a read of the unrelated field from another task
+    # sees nothing of it.
+    task = _ad_suspended_estimate(1, a, ua)
+    seen = _ad_outcome(() -> fetch(Threads.@spawn other[1]))
+    @test _ad_resumed(1, task).cells == alone.cells
+    @test seen === 2.0
+
+    # Two estimates interleaved — `a` in, `b` in, `a` out, `b` out — compute what each computes alone and leave nothing
+    # behind: the field reads afterwards as it did before.
+    ta = _ad_suspended_estimate(1, a, ua)
+    tb = _ad_suspended_estimate(2, b, ub)
+    @test _ad_resumed(1, ta).cells == alone.cells
+    @test _ad_resumed(2, tb).cells == alone.cells
+    @test _ad_outcome(() -> other[1]) === 2.0
 end
 
 @testset "the point-keyed-state walk skips an unassigned slot" begin

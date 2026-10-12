@@ -445,8 +445,10 @@ struct RegionDofs
 end
 
 # One integration region list as assembly sees it: the regions, the `q.point` offset of each (region `r`'s points are
-# `offsets[r] .+ (1:npoints)`, and `offsets[end]` is the list's point count), and the regions' active dofs. All three
-# are derived once, under the cache lock, when the list is first resolved, and never change afterwards.
+# `offsets[r] .+ (1:npoints)`), and the regions' active dofs. `offsets[1]` is the model's point base
+# (`AssemblyCache.point_base`): 0 on every model a caller holds, so the points number from 1 and `offsets[end]` is the
+# count, but not on `estimate`'s enriched twin, so the count is read as `_point_count`. All three are derived once,
+# under the cache lock, when the list is first resolved, and never change afterwards.
 struct RegionList{R}
     regions::Vector{R}
     offsets::Vector{Int}
@@ -478,6 +480,12 @@ end
 #     finds it taken allocates its own, and the larger one is kept when it comes back.
 #   - `workspaces` — idle `AssemblyWorkspace`s, at most `Threads.nthreads()`. Typed `Any` because the workspace type is
 #     defined in `assembly.jl`; the drivers recover it behind a function barrier.
+#   - `point_base` — the number every region list's `q.point`s count up from, fixed when the model is prepared. It is 0
+#     on every model but one, so the points of a list number `1:n`. The exception is the throw-away twin `estimate`
+#     prepares, which re-evaluates the caller's own forms on a cloud they were not written for: it numbers from
+#     `_FOREIGN_POINTS` (`data.jl`), far below 1, so a form reading per-point state by `q.point` there fails at the read
+#     instead of landing on another model's point. Carrying the base on the model rather than in a process-wide flag is
+#     what keeps every other model, task and thread out of it.
 #
 # Nothing here depends on constrained values, so `update_dirichlet!` keeps the cache, and `_remodel!` replaces it whole
 # when the structure changes.
@@ -488,10 +496,11 @@ mutable struct AssemblyCache{T}
     const patterns::Vector{Pair{Tuple{Vector{RegionList},Bool},AssemblyPattern}}
     arena::Vector{T}
     const workspaces::Vector{Any}
+    const point_base::Int
 end
-function AssemblyCache{T}() where {T}
+function AssemblyCache{T}(point_base::Int=0) where {T}
     return AssemblyCache{T}(ReentrantLock(), Pair{RegionKey,RegionList}[], Pair{RegionKey,RegionList}[],
-                            Pair{Tuple{Vector{RegionList},Bool},AssemblyPattern}[], T[], Any[])
+                            Pair{Tuple{Vector{RegionList},Bool},AssemblyPattern}[], T[], Any[], point_base)
 end
 
 # ── Model and `prepare` ───────────────────────────────────────────────────────
@@ -653,9 +662,10 @@ prepare(problem::Problem{D,T}; kwargs...) where {D,T} = _prepared_model(problem,
 
 # The body of [`prepare`](@ref), with the moment-fit caches optionally supplied: `reuse` is `nothing` for fresh ones,
 # which is what `prepare` starts with, or the vector a derivation of an existing model hands in through `_derived`,
-# which is where the choice between sharing and copying is made and explained.
+# which is where the choice between sharing and copying is made and explained. `point_base` is the assembly cache's
+# (see `AssemblyCache`): 0 everywhere but in `estimate`'s twin.
 function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
-                         reuse::Union{Nothing,Vector{_MomentFitCache{D,T}}}) where {D,T}
+                         reuse::Union{Nothing,Vector{_MomentFitCache{D,T}}}; point_base::Int=0) where {D,T}
     effective_problem, spaces, caches = _prepare_spaces(problem)
     # `plan_options` captures the user's integration-plan options (tolerance, criterion, …) so the in-place mutators can
     # reproduce this exact plan instead of reverting to `integration_plan`'s defaults. The classification caches are
@@ -714,8 +724,8 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
     return Model{D,T,typeof(effective_problem)}(effective_problem, problem.space, _discretisation_pin(spaces, layout),
                                                 space_plans, fit_caches, layout, nothing, nothing, facet_resolver,
                                                 facet_regions, surface_regions, interface_regions,
-                                                Dict{Symbol,DirichletProjection{D,T}}(), diag, AssemblyCache{T}(),
-                                                plan_options)
+                                                Dict{Symbol,DirichletProjection{D,T}}(), diag,
+                                                AssemblyCache{T}(point_base), plan_options)
 end
 
 # Fold each distinct space against its own `PhysicalDomain` and reindex its level ids into a disjoint global block, then
@@ -1246,9 +1256,11 @@ end
 #     fork it, so there is no sibling to protect and the model keeps one cache object for its whole life;
 #   - `estimate` (`adaptivity.jl`) shares, so the elevated-order rules its throw-away twin fits land on the source
 #     model.
+#
+# `point_base` numbers the new model's quadrature points (`AssemblyCache`). Only `estimate` moves it off 0.
 function _derived(model::Model{D,T}, space::Space{D,T}; options::NamedTuple=model.plan_options,
-                  caches::Vector{_MomentFitCache{D,T}}) where {D,T}
-    return _prepared_model(_problem_with_space(model.problem, space), options, caches)
+                  caches::Vector{_MomentFitCache{D,T}}, point_base::Int=0) where {D,T}
+    return _prepared_model(_problem_with_space(model.problem, space), options, caches; point_base)
 end
 
 # Rebuild every piece of reusable state `model` carries from a derived pre-fold space, in place. This is the whole body

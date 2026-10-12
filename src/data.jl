@@ -35,11 +35,13 @@ points through an [`RBFP0`](@ref) interpolation. The container places no restric
 takes a `QuadField{T}` on a `Model{D,T}` and nothing else, so a component-valued state is carried one component per
 `QuadField`.
 
-Indexing is guarded while a verb re-evaluates the problem's forms on a cloud this field does not belong to.
-[`estimate`](@ref) is that verb: it assembles the same blocks and loads on an order-elevated twin, whose `q.point`
-numbers a different and larger set of points, so a `qf[q.point]` there would read out of range or — worse — silently at
-the wrong point. Such a read raises, and `estimate` refuses outright when it can see the field among a form's captures.
-Ordinary assembly, and every read against the model the field was built on, is unaffected.
+Indexing is checked, and the check also guards a read from a cloud this field does not belong to. [`estimate`](@ref)
+re-evaluates the problem's blocks and loads on an order-elevated twin with a different and larger set of points, so a
+`qf[q.point]` there would read out of range or — worse — silently at the wrong point. The twin numbers its points far
+below 1 instead, so such a read raises an `ArgumentError` naming the cause, on whichever task or thread makes it, and
+`estimate` refuses outright when it can see the field among a form's captures. The numbering is the twin's own and
+nothing is set process-wide, so ordinary assembly, other tasks and threads, and every read against the model the field
+was built on are unaffected. The check is an explicit call, which a caller's `@inbounds` does not remove.
 
 Both constructors are single-domain only and raise on a coupled model. `q.point` restarts at 1 for each subdomain, so
 one flat array — sized by `nquadpoints(model)`, the sum over the subdomains, as `QuadField(data, model)` checks — would
@@ -69,38 +71,18 @@ function QuadField{T}(model::Model; init=_ -> zero(T)) where {T}
     return QuadField{T}(data, model.version)
 end
 
-# The pin of the quadrature cloud currently being walked by a verb that is re-evaluating forms it did not write, or 0 —
-# which is every ordinary assembly, and the value `getindex` below reads. See "Detecting point-keyed state" further down
-# for what the pair guards and what it costs.
-const _FOREIGN_CLOUD = Ref(0)
-
-# Run `f` with the foreign-cloud pin set to `version`, restoring whatever was set before. Nesting is honoured; a `throw`
-# inside `f` still restores. The write happens outside the threaded region `f` starts — `estimate` wraps a whole
-# `assemble!` — so the worker threads only ever read it.
-function _on_foreign_cloud(f, version::Integer)
-    previous = _FOREIGN_CLOUD[]
-    _FOREIGN_CLOUD[] = Int(version)
-    try
-        return f()
-    finally
-        _FOREIGN_CLOUD[] = previous
-    end
-end
-
 # Forwarding to the underlying data vector. `setindex!` returns the `QuadField` itself so chained updates work; `copy`
 # makes a defensive copy of the data and preserves the version pin.
+#
+# `getindex` checks by an explicit call rather than `@boundscheck`, so a caller's `@inbounds` cannot remove the check:
+# it is also what refuses a `q.point` of `estimate`'s twin (`_out_of_range`, under "Detecting point-keyed state"
+# below), and it is the one compare the vector's own `getindex` would make, so the guard costs a read nothing.
 Base.length(qf::QuadField) = length(qf.data)
 Base.eltype(::Type{QuadField{T}}) where {T} = T
 Base.eltype(qf::QuadField) = eltype(typeof(qf))
 @inline function Base.getindex(qf::QuadField, i::Integer)
-    pin = _FOREIGN_CLOUD[]
-    (pin == 0 || pin == qf.model_version) ||
-        throw(ArgumentError("this QuadField (pin 0x$(string(qf.model_version; base=16))) is being " *
-                            "read while a second integration plan is being walked (pin " *
-                            "0x$(string(pin; base=16))): `q.point` numbers that cloud, not this " *
-                            "field's. Read the state through the physical point `q.x`, or run " *
-                            "the verb on a model whose forms carry no per-point state."))
-    return qf.data[i]
+    checkbounds(Bool, qf.data, i) || _out_of_range(qf, i)
+    return @inbounds qf.data[i]
 end
 Base.setindex!(qf::QuadField, v, i::Integer) = (qf.data[i]=v; qf)
 Base.copy(qf::QuadField{T}) where {T} = QuadField{T}(copy(qf.data), qf.model_version)
@@ -149,19 +131,6 @@ end
 # slot (`_assigned`) — a scratch buffer such as `Vector{Any}(undef, n)` has one, and reading it raised an
 # `UndefRefError` out of `estimate` before the walk reached anything. A dictionary is walked by its values, never looked
 # up again by its keys: a key mutated after insertion no longer hashes to its slot, and a lookup by it raises.
-#
-# The second layer is `_FOREIGN_CLOUD` and the branch in `getindex`, and it exists because the first has one blind spot
-# that reflection cannot close: a form written at top level reads a *global* binding rather than capturing it, so its
-# closure has no fields at all and carries no evidence of the state it reads. Scoping the pin over the foreign assembly
-# catches that at the read instead, and cannot raise on anything legitimate — the twin is built fresh inside the call,
-# so no field in existence can carry its pin.
-#
-# What the branch costs, measured on helios (`assemble_matrix` of a stiffness form whose integrand reads `chi[q.point]`,
-# four threads, min of seven per run, three runs each way): at 36 864 quadrature points, 7.57/7.70/8.05 ms with the
-# branch against 7.64/7.56/8.16 ms without it at `-O2`, and 44.0/47.6 ms against 44.0/44.7 at `-O0` — a difference the
-# noise swallows. At 9 216 points, 0.95/1.09/0.98 ms against 0.91/0.88/0.94 at `-O2`: at most a tenth of a millisecond,
-# and only forms that actually read a `QuadField` pay any of it. Forms that carry no per-point state never reach this
-# code.
 function _captured_quadfield(x, depth::Int=6)
     x isa QuadField && return x
     depth <= 0 && return nothing
@@ -203,6 +172,46 @@ function _assert_no_point_keyed_state(problem, verb::AbstractString)
                             "on a model whose forms carry none."))
     end
     return nothing
+end
+
+# The second layer is the twin's point numbering, and it exists because the first has one blind spot that reflection
+# cannot close: a form written at top level reads a *global* binding rather than capturing it, so its closure has no
+# fields at all and carries no evidence of the state it reads. `estimate` prepares the twin with its points numbered
+# from `_FOREIGN_POINTS`, far below 1, so every `q.point` the twin hands out lies outside every array a caller can hold.
+# A `QuadField` read raises the `ArgumentError` of `_out_of_range`, which names the cause; a read from a plain array
+# raises Julia's own `BoundsError`. Neither can raise on anything legitimate: only the twin numbers its points there,
+# and it is built fresh inside the call.
+#
+# The numbering is the twin's own (`AssemblyCache.point_base`), so nothing is set process-wide. A flag set around the
+# twin's assembly would also stop the read, but it is seen by every task: it raises on an unrelated read in another
+# task while it is set, and two estimates interleaved restore it out of order and leave it set for good. Here another
+# task assembling, another `estimate` in flight and every thread of the twin's own threaded assembly see exactly what
+# they would see alone, and nothing outlives the call. It also costs the accessor nothing: the bounds check is the whole
+# guard, and only its failure path reads the constant.
+#
+# The constant has three properties, and the suite asserts each:
+#
+#   - every point of any cloud the twin could have, `_FOREIGN_POINTS + n` with `n` far below 2⁶⁰, is negative and below
+#     `_FOREIGN_POINTS ÷ 2`, the line `_out_of_range` reads as "a point of the twin";
+#   - it is far below any index written by hand, at about −2.85e18;
+#   - it does not wrap. An `@inbounds v[q.point]` on a raw vector reads the address `v + (q.point − 1)·s` for elements
+#     of `s` bytes, modulo 2⁶⁴, and a base whose product with `s` is ≡ 0 would put that read exactly on element `k` —
+#     the silent misread the numbering is there to prevent. `typemin(Int) ÷ 2 = −2⁶²` is such a base for every `s`
+#     divisible by 4. This one is the 64-bit golden-ratio constant shifted right by two, whose multiples spread evenly
+#     modulo 2⁶⁴: for every `s` from 1 to 64 bytes `_FOREIGN_POINTS·s` stays at least 2⁵⁷ away from 0 modulo 2⁶⁴, so
+#     such a read lands far outside the vector rather than on one of its elements.
+const _FOREIGN_POINTS = -reinterpret(Int, 0x9E3779B97F4A7C15 >> 2)
+
+# The error of an index outside a field's data, raised out of line so the accessor keeps the single compare of its
+# bounds check. An index below `_FOREIGN_POINTS ÷ 2` is a `q.point` of `estimate`'s twin and is named as such; any other
+# raises the `BoundsError` the data vector itself would.
+@noinline function _out_of_range(qf::QuadField, i::Integer)
+    i < _FOREIGN_POINTS ÷ 2 || throw(BoundsError(qf.data, i))
+    throw(ArgumentError("this QuadField (pin 0x$(string(qf.model_version; base=16))) is being read at a `q.point` " *
+                        "of another model's quadrature cloud: `estimate` re-evaluates the problem's forms on an " *
+                        "enriched model of its own, whose points it numbers far below 1 so that such a read raises " *
+                        "rather than landing on the wrong point. Read the state through the physical point `q.x`, " *
+                        "or estimate on a model whose forms carry no per-point state."))
 end
 
 # ── Transfer scheme ──────────────────────────────────────────────────────────

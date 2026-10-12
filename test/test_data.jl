@@ -31,6 +31,30 @@ end
     @test qf[1] == 3.5   # original untouched
 end
 
+@testset "QuadField indexing out of range, and at a point of estimate's enriched model" begin
+    model = prepare(poisson(space(box((0.0,), (1.0,)); cells=2, order=1); source=0.0))
+    qf = QuadField{Float64}(model; init=q -> q.x[1])
+    n = length(qf)
+    @test qf[n] == qf.data[n]
+    @test_throws BoundsError qf[0]
+    @test_throws BoundsError qf[n+1]
+    # `estimate`'s enriched model numbers its points from `_FOREIGN_POINTS`, and an index there is named for what it is.
+    base = Unfitted._FOREIGN_POINTS
+    @test_throws "another model's quadrature cloud" qf[base+1]
+    @test_throws ArgumentError qf[base+n]
+
+    # The constant's three properties (see "Detecting point-keyed state" in `data.jl`): every point of any feasible
+    # cloud lies below the line `_out_of_range` reads; it is far below any index written by hand; and for no element
+    # size from 1 to 64 bytes does `base · s` come within 2⁴⁸ of a multiple of 2⁶⁴, so an `@inbounds` read of a raw
+    # vector at `base + k` cannot wrap around onto element `k`.
+    @test base + 2^60 < base ÷ 2 < 0
+    @test base < -2^61
+    @test all(1:64) do s
+        r = mod(Int128(base) * s, Int128(2)^64)
+        return 2^48 <= r <= Int128(2)^64 - 2^48
+    end
+end
+
 @testset "RBFP0 reproduces constant fields exactly (Sartorti & Düster Tab. 3)" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     source_model = prepare(poisson(space(omega; cells=(3, 3), order=2); source=0.0))

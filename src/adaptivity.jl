@@ -358,9 +358,12 @@ from the base model's — `V⁺` has more points per cell, and they sit at diffe
 state through `q.point` (a [`QuadField`](@ref), the documented mechanism for material history) would therefore index an
 array built for `model` with `plus`'s indices: out of range where the base plan is the smaller of the two, and at the
 wrong points where it is not, which is the reading that produces a plausible number rather than an error. A
-[`QuadField`](@ref) captured by any of the problem's forms is found before the enriched model is built and raises. Where
-a model carries per-point state, compute the indicator on a model whose forms read that state through the physical point
-`q.x` instead.
+[`QuadField`](@ref) captured by any of the problem's forms is found before the enriched model is built and raises. A
+read the forms make without capturing the state — through a global — raises at the read instead, as does a read of
+any array by `q.point`, a plain one with a `BoundsError`: `V⁺` numbers its points far below 1, so no such read can
+land on a point of `model`'s cloud. That numbering is `V⁺`'s own and sets nothing process-wide, so a read in any other
+task, another `estimate` running at the same time included, is unaffected. Where a model carries per-point state,
+compute the indicator on a model whose forms read that state through the physical point `q.x` instead.
 
 What it refuses: single-field and single-domain, a model that has not been assembled, and an `enrichment` below one. It
 no longer refuses a basis family without a per-cell order — that family is enriched by superposition instead, as
@@ -398,10 +401,11 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     # `A⁺` being singular is harmless here, since the indicator reads its diagonal and forms one matrix–vector product
     # and never factorises.
     options = isempty(exempt) ? model.plan_options : merge(model.plan_options, (; prune_exempt=exempt))
-    plus = _derived(model, enriched_space; options, caches=model.moment_fit_caches)
-    _on_foreign_cloud(plus.version) do
-        assemble!(plus)
-    end
+    # The twin numbers its points from `_FOREIGN_POINTS`, far below 1, so a form that reads per-point state by `q.point`
+    # without capturing it — through a global, which the walk above cannot see — raises at the read rather than reading
+    # `model`'s points at the twin's indices (see "Detecting point-keyed state" in `data.jl`).
+    plus = _derived(model, enriched_space; options, caches=model.moment_fit_caches, point_base=_FOREIGN_POINTS)
+    assemble!(plus)
     injected = transfer(solution, model, plus; via=Rewire())
     residual = plus.rhs .- plus.matrix * injected.coefficients
 
