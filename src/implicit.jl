@@ -464,22 +464,6 @@ end
 
 # ── Height-axis choice ─────────────────────────────────────────────────────────
 
-# The gradient of one leaf at a sample `x` of the box `U`: the context's operator (`ForwardDiff`, or the caller's
-# `grad`) for a leaf the user supplied, and finite differences at the leaf's step for a pair leaf. Each difference is
-# central where `x ± h` lies in `U` and one-sided where it would not — at the box corners the axis choice samples — so
-# the leaves inside the pair leaf are never evaluated outside the box. The error is about 1e-10 relative for a central
-# difference and of the order h·|∂²P| for a one-sided one (round-off only for linear leaves, whose pair leaves are
-# linear). It reaches nothing but the classification of `_axis_class` — the sign of a component, and whether it exceeds
-# `flat_tol` (√eps) of the gradient's norm — so at worst a nearly flat component of a curved pair leaf is misread at a
-# corner, which changes how a base problem is partitioned, never the region integrated.
-_gradient(ctx::_QuadCtx, g, x, U::AxisBox) = ctx.gradient(g, x)
-function _gradient(::_QuadCtx, g::_FDLeaf, x::SVector{D,T}, U::AxisBox) where {D,T}
-    return SVector{D,T}(ntuple(D) do d
-                            a, b = max(x[d] - g.h, U.lower[d]), min(x[d] + g.h, U.upper[d])
-                            (g.f(Base.setindex(x, b, d)) - g.f(Base.setindex(x, a, d))) / (b - a)
-                        end)
-end
-
 # Pick a height axis and report whether it is certifiably graph-like. For each axis k, every leaf is classified by
 # sampling ∂g/∂x_k at the box center and 2ᴰ corners (`_axis_class`):
 #
@@ -527,6 +511,22 @@ function _axis_class(gs, k::Int, flat_tol)
     neg = any(g -> isfinite(g[k]) && g[k] < -tol, gs)
     minmag = minimum(g -> isfinite(g[k]) && abs(g[k]) > tol ? abs(g[k]) : oftype(tol, Inf), gs)
     return (pos && neg ? :bad : pos || neg ? :monotone : :flat), minmag
+end
+
+# The gradient of one leaf at a sample `x` of the box `U`: the context's operator (`ForwardDiff`, or the caller's
+# `grad`) for a leaf the user supplied, and finite differences at the leaf's step for a pair leaf. Each difference is
+# central where `x ± h` lies in `U` and one-sided where it would not — at the box corners the axis choice samples — so
+# the leaves inside the pair leaf are never evaluated outside the box. The error is about 1e-10 relative for a central
+# difference and of the order h·|∂²P| for a one-sided one (round-off only for linear leaves, whose pair leaves are
+# linear). It reaches nothing but the classification of `_axis_class` — the sign of a component, and whether it exceeds
+# `flat_tol` (√eps) of the gradient's norm — so at worst a nearly flat component of a curved pair leaf is misread at a
+# corner, which changes how a base problem is partitioned, never the region integrated.
+_gradient(ctx::_QuadCtx, g, x, U::AxisBox) = ctx.gradient(g, x)
+function _gradient(::_QuadCtx, g::_FDLeaf, x::SVector{D,T}, U::AxisBox) where {D,T}
+    return SVector{D,T}(ntuple(D) do d
+                            a, b = max(x[d] - g.h, U.lower[d]), min(x[d] + g.h, U.upper[d])
+                            (g.f(Base.setindex(x, b, d)) - g.f(Base.setindex(x, a, d))) / (b - a)
+                        end)
 end
 
 # ── Full-box tensor rule ───────────────────────────────────────────────────────
