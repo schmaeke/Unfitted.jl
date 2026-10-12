@@ -198,6 +198,136 @@ struct IntegrationPlan{D,T<:Real}
     moment_fit_residual_max::Float64
 end
 
+# ── Plan construction ─────────────────────────────────────────────────────────
+
+"""
+    integration_plan(V::Space; tolerance=GeometryTolerance(T),
+                               criterion=:any_parent,
+                               classify_cache=_ClassifyCache{D,T}(),
+                               moment_fit_cache=_MomentFitCache{D,T}()) -> IntegrationPlan
+
+Build the [`IntegrationPlan`](@ref) for a [`Space`](@ref). The plan carries every admissible integration region the
+assembly path will iterate over, together with the small-overlap / cut-region / moment-fit diagnostics.
+
+The construction follows the recipe in `CONTRIBUTING.md`'s "Integration regions" section:
+
+  0. Per level, per axis: check that the mesh spacing exceeds `tolerance.merge`. An axis at or below it would have its
+     own cell boundaries collapsed by step 1, silently, so this combination is rejected with an `ArgumentError` naming
+     the axis, its spacing, and the tolerance.
+  1. Per axis: collect every level's element-boundary coordinates that bound an active cell of that level — all of them
+     on an unmasked level — and canonicalise them via `merge_coordinates` so two meshes' near-coincident coordinates
+     collapse to a single shared boundary. A coordinate no level keeps is the face of no active cell, so every level's
+     coverage signature is constant across it and the partition is the one the full grids would have produced: the
+     candidate grid follows the active region rather than the finest participating mesh.
+  2. Form the Cartesian product of the resulting intervals to get candidate boxes, take each candidate's coverage
+     signature — per level, the active cell containing its midpoint — and greedily merge axis-adjacent candidates that
+     share it (every cell inside the merged box lies inside the same cell of every active level). A box no level covers
+     is no region of the plan.
+  3. Decode each box's parents from its signature, building each parent's map from the box's frame into its own
+     reference frame ([`Parent`](@ref)), and check the `criterion`.
+  4. Dispatch on the `PhysicalDomain` classification to pick the region quadrature: tensor Gauss for `:full`, α-scaled
+     tensor Gauss for `:fictitious + alpha > 0`, and on `:cut` the NNMF moment-fit — or the domain's `cut_quadrature`
+     callable, when it supplies one, in the fit's place. Drop the region entirely under strict-α (`alpha = 0` and
+     `:fictitious`).
+  5. Record a [`SmallOverlap`](@ref) for every region whose physical volume falls below `tolerance.small_volume`, and
+     track the maximum NNMF residual observed across cut regions.
+
+Keyword arguments:
+
+  - `tolerance` — geometry tolerance applied at every step (`merge_coordinates`, the signatures' midpoint containment,
+    small-volume reporting). Its `merge` field is an absolute length, so a mesh finer than it on any axis is rejected
+    rather than silently decimated (step 0). Small geometry is fully supported; it needs a `merge` below its own
+    spacing.
+  - `criterion` — `:any_parent` (default), `:all_levels`, or a function `parents -> Bool`. See `_criterion_satisfied`
+    for the semantics. The predicate form is an escape hatch for a coverage rule the two symbols do not express; it is
+    reached through `prepare(problem; criterion = …)` and, like every plan option, survives `move!` and `activate!`
+    because [`Model`](@ref) replays its captured `plan_options`. It is only ever called with a non-empty parent list:
+    a box no level covers is no region under any criterion.
+  - `classify_cache` — optional classification cache shared with the cell-level fictitious fold. Pass the same cache
+    through `_apply_physical_fold` so the per-cell verdicts computed there can be reused at the region level.
+  - `moment_fit_cache` — optional cut-region rule cache, keyed by region bounds and moment order. Pass the same cache
+    across successive plans for one space — [`Model`](@ref) does, through every `move!` and `activate!` — so a cut
+    region the mutation left unchanged reuses its rule instead of being refitted. On return the cache is restricted to
+    the boxes *this* plan cuts: a box that has left the plan is dropped with all of its rules, so a `move!` sweep cannot
+    grow the cache. A box that stays live keeps one entry per distinct moment order fitted there, so an order-elevated
+    twin of the same space and this plan do not evict each other — and, where the order at a live box keeps rising (an
+    hp loop), entries accumulate with the cycles rather than staying at one plan's worth. The accumulation is bounded
+    above by `moment_order_factor × pmax` per axis. On a 3D sphere with 32 cut regions, four hp cycles took the cache
+    from 0.035 MiB to 0.61 MiB and the next plan build from 11.9 s (no reuse) to 0.011 s.
+
+The function is called by `prepare`, `move!`, and `_update_mask!`, all in `src/model.jl`, which own the plan a
+[`Model`](@ref) carries; `assembly.jl` and `postprocessing.jl` only read that cached plan back through the
+[`integration_plan`](@ref) / [`integration_plans`](@ref) accessors. The projection path in `projection.jl` builds no
+plan at all: it reuses this file's admissible-box partition engine (`_partition`) directly and keeps every box the
+target covers, without a `criterion`.
+"""
+function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criterion=:any_parent,
+                          classify_cache=_ClassifyCache{D,T}(), moment_fit_cache=_MomentFitCache{D,T}()) where {D,T}
+    # Reject a merge tolerance that cannot resolve the meshes it is about to canonicalise, before a single region is
+    # built. See `_check_axis_spacing`.
+    _check_axis_spacing(V.levels, Val(D), tolerance)
+
+    # Parents and the keep-criterion first, then one record per kept box with its sizing and classification, before
+    # touching the (potentially expensive) rules; then every cut rule up front (`_prefit!`), so the rule loop walks the
+    # records in partition order on nothing but cache hits. `classify_cache` is shared with `_apply_physical_fold` in
+    # `mesh.jl`, so a box that coincides with a previously classified cell box (the common no-overlay case) reuses the
+    # fold's verdict instead of re-walking the octree.
+    physical = V.physical
+    records = _RegionRecord{D,T}[]
+    _partition(V.levels, ntuple(identity, Val(D)), zero(SVector{D,T}), tolerance) do lower, upper, sig
+        parents = _parents(V.levels, sig, lower, upper)
+        _criterion_satisfied(parents, length(V.levels), criterion) || return nothing
+        verdict = physical === nothing ? :full : classify_cell(physical, AxisBox{D,T}(lower, upper), classify_cache)
+        push!(records, _region_record(V, lower, upper, parents, verdict))
+        return nothing
+    end
+    _prefit!(moment_fit_cache, physical, records)
+
+    alpha = physical === nothing ? zero(T) : physical.alpha
+    custom = physical !== nothing && physical.cut_quadrature !== nothing
+    domain_volume = volume(V.domain)
+    regions, small_overlaps, residual_max = _plan_regions(records, moment_fit_cache, alpha, custom, tolerance,
+                                                          domain_volume)
+    min_volume = isempty(regions) ? zero(T) : minimum(volume(_region_box(region)) for region in regions)
+    min_relative_volume = iszero(domain_volume) ? zero(T) : min_volume / domain_volume
+    return IntegrationPlan{D,T}(regions, small_overlaps, min_volume, min_relative_volume, residual_max)
+end
+
+# ── Merge tolerance vs. mesh spacing ──────────────────────────────────────────
+#
+# `tolerance.merge` is an absolute length, and `merge_coordinates` collapses per-axis element boundaries that separate
+# by no more than it. Between levels that is exactly the intent: two meshes' near-coincident boundaries should become
+# one shared coordinate rather than a sliver. Within a single level it is silent destruction. An axis whose own cell
+# spacing `h` satisfies `h ≤ tolerance.merge` has its boundary list decimated — genuinely distinct cell faces collapse —
+# and every surviving integration region then straddles two cells of that level. That breaks the
+# one-cell-per-axis-per-level contract the whole region partition rests on, and nothing downstream can detect it: the
+# integrand is no longer smooth on the region, yet the tensor Gauss rule is still applied to it. The observed outcomes
+# are a converged, entirely wrong solution for a span-mode B-spline basis, and an unattributed `SingularException` for
+# integrated Legendre.
+#
+# The check is the compatibility condition between the two lengths the user controls — mesh spacing and merge tolerance
+# — not a floor on either one. Geometry at h = 1e-9 stays legal; it needs a `tolerance.merge` below it, in the same
+# spirit as the region-scaled `atol` in `implicit.jl` and the diagonal-scaled sign tolerance in the MeshIO extension.
+#
+# The threshold is `tolerance.merge` itself and not a multiple of it: it mirrors `merge_coordinates`'s own `> tol.merge`
+# keep-test, so exactly the configurations that lose a coordinate are rejected, and configurations that merely sit close
+# to the tolerance keep working.
+function _check_axis_spacing(levels, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
+    for level in levels, d in 1:D
+        coords = boundary_coordinates(level.mesh)[d]
+        spacing = minimum(coords[i + 1] - coords[i] for i in 1:(length(coords)-1))
+        spacing > tol.merge && continue
+        # Report the scale-aware value the default would have had on this axis, √eps(T) · extent, so the remedy is a
+        # number to paste.
+        suggested = sqrt(eps(T)) * (coords[end] - coords[begin])
+        throw(ArgumentError("level $(level.id) has cell spacing h = $spacing on axis $d, at or " *
+                            "below the coordinate merge tolerance $(tol.merge); pass a smaller " *
+                            "merge tolerance, e.g. `tolerance=GeometryTolerance(; " *
+                            "merge=$suggested)`"))
+    end
+    return nothing
+end
+
 # ── Admissible box partition ──────────────────────────────────────────────────
 
 # The cells one level may parent in a partition — its slot of `_partition`'s `cells` tuple: every cell of the level
@@ -417,41 +547,6 @@ function _slab_matches(sigs, visited, start::NTuple{D,Int}, hi::NTuple{D,Int}, s
     return all(c -> !visited[c] && sigs[c] == sig0, slab)
 end
 
-# ── Merge tolerance vs. mesh spacing ──────────────────────────────────────────
-#
-# `tolerance.merge` is an absolute length, and `merge_coordinates` collapses per-axis element boundaries that separate
-# by no more than it. Between levels that is exactly the intent: two meshes' near-coincident boundaries should become
-# one shared coordinate rather than a sliver. Within a single level it is silent destruction. An axis whose own cell
-# spacing `h` satisfies `h ≤ tolerance.merge` has its boundary list decimated — genuinely distinct cell faces collapse —
-# and every surviving integration region then straddles two cells of that level. That breaks the
-# one-cell-per-axis-per-level contract the whole region partition rests on, and nothing downstream can detect it: the
-# integrand is no longer smooth on the region, yet the tensor Gauss rule is still applied to it. The observed outcomes
-# are a converged, entirely wrong solution for a span-mode B-spline basis, and an unattributed `SingularException` for
-# integrated Legendre.
-#
-# The check is the compatibility condition between the two lengths the user controls — mesh spacing and merge tolerance
-# — not a floor on either one. Geometry at h = 1e-9 stays legal; it needs a `tolerance.merge` below it, in the same
-# spirit as the region-scaled `atol` in `implicit.jl` and the diagonal-scaled sign tolerance in the MeshIO extension.
-#
-# The threshold is `tolerance.merge` itself and not a multiple of it: it mirrors `merge_coordinates`'s own `> tol.merge`
-# keep-test, so exactly the configurations that lose a coordinate are rejected, and configurations that merely sit close
-# to the tolerance keep working.
-function _check_axis_spacing(levels, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
-    for level in levels, d in 1:D
-        coords = boundary_coordinates(level.mesh)[d]
-        spacing = minimum(coords[i + 1] - coords[i] for i in 1:(length(coords)-1))
-        spacing > tol.merge && continue
-        # Report the scale-aware value the default would have had on this axis, √eps(T) · extent, so the remedy is a
-        # number to paste.
-        suggested = sqrt(eps(T)) * (coords[end] - coords[begin])
-        throw(ArgumentError("level $(level.id) has cell spacing h = $spacing on axis $d, at or " *
-                            "below the coordinate merge tolerance $(tol.merge); pass a smaller " *
-                            "merge tolerance, e.g. `tolerance=GeometryTolerance(; " *
-                            "merge=$suggested)`"))
-    end
-    return nothing
-end
-
 # ── Region parents ────────────────────────────────────────────────────────────
 
 # The parents a box's coverage signature stands for, in level order: per non-zero slot, the level's cell with that
@@ -509,7 +604,25 @@ function _criterion_satisfied(parents, level_count::Int, criterion)
     throw(ArgumentError("unknown integration-region criterion $criterion"))
 end
 
-# ── Rule sizing ───────────────────────────────────────────────────────────────
+# ── Region records and rule sizing ────────────────────────────────────────────
+
+# One kept region of a volume plan or a boundary facet before its rule is built: its corners and parents, and what
+# sizing and classification decided about it, computed once per region (`_region_record`) and read by both the fits and
+# the rule loop. `order` is the moment-fit order on a `:cut` verdict and repeats `counts` otherwise, where nothing reads
+# it.
+const _RegionRecord{D,T} = @NamedTuple{lower::SVector{D,T}, upper::SVector{D,T}, parents::Vector{Parent{D,T}},
+                                       verdict::Symbol, counts::NTuple{D,Int}, order::NTuple{D,Int}}
+
+# The record of one kept region from its classifier `verdict`: the tensor counts from its parents (`0` on an axis the
+# region does not extend along) and, on a `:cut` verdict, the moment-fit order. The facet slice of a `PhysicalDomain`
+# carries the domain's own `moment_order_factor`, so reading it off `V` sizes a cut face and the cells behind it alike.
+function _region_record(V::Space{D,T}, lower::SVector{D,T}, upper::SVector{D,T}, parents::Vector{Parent{D,T}},
+                        verdict::Symbol) where {D,T}
+    counts = _axis_max(_gauss_counts, V, parents, lower, upper)
+    order = verdict === :cut ? _axis_max(_moment_orders(V.physical.moment_order_factor), V, parents, lower, upper) :
+            counts
+    return _RegionRecord{D,T}((lower, upper, parents, verdict, counts, order))
+end
 
 # The per-axis maximum of `f(level, cell)` over a region's parent cells: the one helper that sizes every rule a region
 # carries. `f` returns a per-axis tuple for one parent cell — its tensor Gauss counts (`_gauss_counts`), its moment-fit
@@ -562,16 +675,7 @@ _gauss_counts(level, cell) = recommended_quadrature_order(level.basis, cell_orde
 # traces to the same degree.
 _moment_orders(factor::Int) = (level, cell) -> factor .* cell_order(level, cell)
 
-# ── Region rules ──────────────────────────────────────────────────────────────
-
-# Tensor Gauss rule cache, keyed by per-axis count tuple. Built lazily and shared across every `:full` region that needs
-# the same per-axis count. `:full` regions then alias the cached `points`/`weights` arrays directly, so they cost only
-# the assembly-loop iteration time — no allocation per region.
-const _TensorRuleCache{D,T} = Dict{NTuple{D,Int},TensorQuadrature{D,T}}
-
-function _cached_tensor_quadrature!(cache::_TensorRuleCache{D,T}, counts::NTuple{D,Int}, ::Type{T}) where {D,T}
-    return get!(() -> _tensor_gauss_rule(counts, T), cache, counts)
-end
+# ── Cut-region fits ───────────────────────────────────────────────────────────
 
 # Moment-fit rule cache, keyed by the canonicalised region bounds and the moment basis order, each value one cut
 # region's rule `(ref_points, ref_weights, residual, status)` as `_fit_rule` returns it.
@@ -587,6 +691,76 @@ end
 const _MomentFitKey{D,T} = Tuple{SVector{D,T},SVector{D,T},NTuple{D,Int}}
 const _MomentFitValue{D,T} = Tuple{Vector{SVector{D,T}},Vector{T},T,Symbol}
 const _MomentFitCache{D,T} = Dict{_MomentFitKey{D,T},_MomentFitValue{D,T}}
+
+# Fit every cut region's rule before the rule loop consumes any of them, in parallel (`_fit_rules`), and reduce the
+# cache to exactly this plan's regions. Classification ran first and serially, in the records (it is memoised, and a
+# `Dict` is not thread-safe); the fits fill the cache afterwards, serially; the rule loop then runs in region order on
+# nothing but cache hits, so region order, `residual_max` and the small-overlap bookkeeping are the serial path's, bit
+# for bit. A custom `cut_quadrature` is fitted serially (`_fit_rules`) and still gets the dedup and the cross-plan
+# reuse.
+#
+# `live` is the plan's whole cut-key set, not just its misses, because restricting the cache afterwards is what keeps a
+# cache threaded through a long `move!` sweep from holding the sweep's worth of rules. On exit the cache holds only the
+# *boxes* this plan cuts — but at every moment order fitted at one of them, which is where the eviction rule differs
+# from the lookup key. See the `filter!` below for why the two are not the same rule, and what the difference costs.
+function _prefit!(cache::_MomentFitCache{D,T}, physical, records::Vector{_RegionRecord{D,T}}) where {D,T}
+    physical === nothing && return cache
+    live = Set{_MomentFitKey{D,T}}()
+    for record in records
+        record.verdict === :cut && push!(live, (record.lower, record.upper, record.order))
+    end
+    pending = _MomentFitKey{D,T}[key for key in live if !haskey(cache, key)]
+    fitted = _fit_rules(physical, pending, physical.cut_quadrature)
+    for i in eachindex(pending)
+        cache[pending[i]] = fitted[i]
+    end
+    # Evict by box, not by full key. The bound the eviction exists for is the geometric one — a `move!` sweep must not
+    # leave the cache holding every box the overlay ever passed over — and a box that has left the plan takes all of its
+    # rules with it either way, so keying the eviction on the box alone costs that bound nothing: a move changes which
+    # boxes are cut, never the moment order at one of them.
+    #
+    # What it buys is the case full-key eviction gets wrong. An order-elevated twin of the same space — `estimate`'s
+    # `V⁺`, `adaptivity.jl` — has exactly this plan's boxes at a higher moment order, and under full-key eviction the
+    # two orders evict each other, so every `estimate` / `adapted` alternation refits both from scratch. Measured on a
+    # 3D sphere probe (base 4³, order 2, depth 1, 80 cut regions, 4 threads, -O0): a repeated `estimate` cost 38.7 s and
+    # the step after it 1.9 s; evicting by box they cost 0.006 s and 0.03 s, with the elevated order fitted once.
+    #
+    # What it costs, stated plainly because it is not free: a box that stays live keeps one entry per distinct moment
+    # order ever fitted there. Under a `move!` sweep that is flat, since orders do not change there. Under an hp loop it
+    # is not: `refine` raises the order at a live cut cell, the box does not leave the plan, and the entries at it
+    # accumulate *per cycle*. Bounded above — the key's order is `moment_order_factor × cell_order` and `refine` caps
+    # `cell_order` at `pmax` — but not by one plan's worth.
+    #
+    # The trade, measured on one configuration: four `estimate` → `refine` → `adapted` cycles on a 3D sphere (ladder
+    # base 4³, order 1, depth 1, 32 cut boxes) grew the cache from 32 entries / 0.035 MiB to 96 entries over the same 32
+    # boxes / 0.61 MiB, and the next step's plan build cost 0.011 s against 11.9 s with no reuse. An h-step resets the
+    # accumulation where it lands, because the boxes it splits do leave the plan.
+    live_boxes = Set((key[1], key[2]) for key in live)
+    filter!(entry -> (entry.first[1], entry.first[2]) in live_boxes, cache)
+    return cache
+end
+
+# The rules of a list of cut keys `(lower, upper, order)`, in key order: `_fit_rule` with `rule` on every key, on every
+# thread.
+#
+# At the default `moment_order_factor = 2` the fits *are* the plan: 99.9% of a 3D build, tens of seconds over a few
+# dozen cut cells. They are also independent of one another — `_fit_rule` reads the immutable `PhysicalDomain` and the
+# box and touches nothing else — so each writes its own slot of a pre-sized vector, with no `Dict` in reach.
+#
+# A user `cut_quadrature` is fitted serially instead. It is caller code under no thread-safety contract — the package's
+# own test rule counts its calls through a shared `Ref` — so the package does not unilaterally run it on N threads.
+function _fit_rules(physical::PhysicalDomain, keys::Vector{_MomentFitKey{D,T}}, rule) where {D,T}
+    fitted = Vector{_MomentFitValue{D,T}}(undef, length(keys))
+    fit(key) = _fit_rule(physical, key[1], key[2], key[3], rule)
+    if rule !== nothing
+        map!(fit, fitted, keys)
+    else
+        Threads.@threads for i in eachindex(keys)
+            fitted[i] = fit(keys[i])
+        end
+    end
+    return fitted
+end
 
 # One cut region's rule on the box `lower`–`upper`, in the box's reference frame — the moment fit (`moment_fit_rule`, at
 # the domain's own `target_residual`) when `rule` is `nothing`, else `rule(physical, box, order)` — mapped as follows:
@@ -619,33 +793,47 @@ function _fit_rule(physical::PhysicalDomain, lower::SVector{D,T}, upper::SVector
     return ([physical_to_reference(box, p) for p in points], T[w / jacobian for w in weights], T(residual), status)
 end
 
-# The rules of a list of cut keys `(lower, upper, order)`, in key order: `_fit_rule` with `rule` on every key, on every
-# thread.
-#
-# At the default `moment_order_factor = 2` the fits *are* the plan: 99.9% of a 3D build, tens of seconds over a few
-# dozen cut cells. They are also independent of one another — `_fit_rule` reads the immutable `PhysicalDomain` and the
-# box and touches nothing else — so each writes its own slot of a pre-sized vector, with no `Dict` in reach.
-#
-# A user `cut_quadrature` is fitted serially instead. It is caller code under no thread-safety contract — the package's
-# own test rule counts its calls through a shared `Ref` — so the package does not unilaterally run it on N threads.
-function _fit_rules(physical::PhysicalDomain, keys::Vector{_MomentFitKey{D,T}}, rule) where {D,T}
-    fitted = Vector{_MomentFitValue{D,T}}(undef, length(keys))
-    fit(key) = _fit_rule(physical, key[1], key[2], key[3], rule)
-    if rule !== nothing
-        map!(fit, fitted, keys)
-    else
-        Threads.@threads for i in eachindex(keys)
-            fitted[i] = fit(keys[i])
+# ── Region rules ──────────────────────────────────────────────────────────────
+
+# The rule loop of `integration_plan`: one `VolumeRegion` per record, in record order, through `_trimmed_rule` — except
+# a fictitious box under strict α = 0, which has nothing to integrate and is dropped — with the small-overlap records
+# and the largest cut residual. Small-overlap diagnostics are accumulated rather than acted on: the package exposes the
+# warning, the caller decides whether to stabilise. A function barrier on `alpha`, a field of the abstractly typed
+# `Space.physical`, so the per-region rule dispatch below is static. The region list is reserved at the record count,
+# its bound, so it is filled without regrowing.
+function _plan_regions(records::Vector{_RegionRecord{D,T}}, fits::_MomentFitCache{D,T}, alpha, custom::Bool,
+                       tolerance::GeometryTolerance{T}, domain_volume::T) where {D,T}
+    regions = sizehint!(VolumeRegion{D,T}[], length(records))
+    small_overlaps = SmallOverlap{T}[]
+    tensor_cache = _TensorRuleCache{D,T}()
+    alpha_cache = Dict{NTuple{D,Int},Vector{T}}()
+    residual_max = 0.0
+    for record in records
+        record.verdict === :fictitious && iszero(alpha) && continue
+        fit = record.verdict === :cut ? fits[(record.lower, record.upper, record.order)] : nothing
+        kind, points, weights, residual = _trimmed_rule(record.verdict, record.counts, tensor_cache, alpha_cache, alpha,
+                                                        fit, custom)
+        residual > residual_max && (residual_max = Float64(residual))
+        region = Region(record.lower, record.upper, record.parents, kind, points, weights; residual)
+        region_volume = volume(_region_box(region))
+        push!(regions, region)
+        if region_volume <= tolerance.small_volume
+            relative_volume = iszero(domain_volume) ? zero(T) : region_volume / domain_volume
+            push!(small_overlaps,
+                  SmallOverlap{T}(length(regions), region_volume, relative_volume, length(record.parents)))
         end
     end
-    return fitted
+    return regions, small_overlaps, residual_max
 end
 
-# The kinds `_trimmed_rule` gives a region `∂Ω` crosses, whatever rule it ended up with, and the subset on which the
-# moment fit failed (a custom rule never fails a fit: no fit ran). The diagnostics count both (`_kind_stats` in
-# `model.jl`), and the VTK writer refines exactly the first.
-const _CUT_KINDS = (:cut_fitted, :cut_custom, :cut_fallback, :cut_failed, :cut_alpha_failed)
-const _FAILED_KINDS = (:cut_fallback, :cut_failed, :cut_alpha_failed)
+# Tensor Gauss rule cache, keyed by per-axis count tuple. Built lazily and shared across every `:full` region that needs
+# the same per-axis count. `:full` regions then alias the cached `points`/`weights` arrays directly, so they cost only
+# the assembly-loop iteration time — no allocation per region.
+const _TensorRuleCache{D,T} = Dict{NTuple{D,Int},TensorQuadrature{D,T}}
+
+function _cached_tensor_quadrature!(cache::_TensorRuleCache{D,T}, counts::NTuple{D,Int}, ::Type{T}) where {D,T}
+    return get!(() -> _tensor_gauss_rule(counts, T), cache, counts)
+end
 
 # The rule one admissible region carries, from the classifier's `verdict` on it: the single home of the dispatch the
 # volume plan and the boundary facets share, of the shared base rules, of the α-FCM blend, and of the closed `kind`
@@ -710,194 +898,8 @@ function _trimmed_rule(verdict::Symbol, counts::NTuple{D,Int}, rules::_TensorRul
     return kind, vcat(points, base.points), vcat(weights .* (one(T) - alpha), scaled), residual
 end
 
-# ── Plan construction ─────────────────────────────────────────────────────────
-
-# One kept region of a volume plan or a boundary facet before its rule is built: its corners and parents, and what
-# sizing and classification decided about it, computed once per region (`_region_record`) and read by both the fits and
-# the rule loop. `order` is the moment-fit order on a `:cut` verdict and repeats `counts` otherwise, where nothing reads
-# it.
-const _RegionRecord{D,T} = @NamedTuple{lower::SVector{D,T}, upper::SVector{D,T}, parents::Vector{Parent{D,T}},
-                                       verdict::Symbol, counts::NTuple{D,Int}, order::NTuple{D,Int}}
-
-"""
-    integration_plan(V::Space; tolerance=GeometryTolerance(T),
-                               criterion=:any_parent,
-                               classify_cache=_ClassifyCache{D,T}(),
-                               moment_fit_cache=_MomentFitCache{D,T}()) -> IntegrationPlan
-
-Build the [`IntegrationPlan`](@ref) for a [`Space`](@ref). The plan carries every admissible integration region the
-assembly path will iterate over, together with the small-overlap / cut-region / moment-fit diagnostics.
-
-The construction follows the recipe in `CONTRIBUTING.md`'s "Integration regions" section:
-
-  0. Per level, per axis: check that the mesh spacing exceeds `tolerance.merge`. An axis at or below it would have its
-     own cell boundaries collapsed by step 1, silently, so this combination is rejected with an `ArgumentError` naming
-     the axis, its spacing, and the tolerance.
-  1. Per axis: collect every level's element-boundary coordinates that bound an active cell of that level — all of them
-     on an unmasked level — and canonicalise them via `merge_coordinates` so two meshes' near-coincident coordinates
-     collapse to a single shared boundary. A coordinate no level keeps is the face of no active cell, so every level's
-     coverage signature is constant across it and the partition is the one the full grids would have produced: the
-     candidate grid follows the active region rather than the finest participating mesh.
-  2. Form the Cartesian product of the resulting intervals to get candidate boxes, take each candidate's coverage
-     signature — per level, the active cell containing its midpoint — and greedily merge axis-adjacent candidates that
-     share it (every cell inside the merged box lies inside the same cell of every active level). A box no level covers
-     is no region of the plan.
-  3. Decode each box's parents from its signature, building each parent's map from the box's frame into its own
-     reference frame ([`Parent`](@ref)), and check the `criterion`.
-  4. Dispatch on the `PhysicalDomain` classification to pick the region quadrature: tensor Gauss for `:full`, α-scaled
-     tensor Gauss for `:fictitious + alpha > 0`, and on `:cut` the NNMF moment-fit — or the domain's `cut_quadrature`
-     callable, when it supplies one, in the fit's place. Drop the region entirely under strict-α (`alpha = 0` and
-     `:fictitious`).
-  5. Record a [`SmallOverlap`](@ref) for every region whose physical volume falls below `tolerance.small_volume`, and
-     track the maximum NNMF residual observed across cut regions.
-
-Keyword arguments:
-
-  - `tolerance` — geometry tolerance applied at every step (`merge_coordinates`, the signatures' midpoint containment,
-    small-volume reporting). Its `merge` field is an absolute length, so a mesh finer than it on any axis is rejected
-    rather than silently decimated (step 0). Small geometry is fully supported; it needs a `merge` below its own
-    spacing.
-  - `criterion` — `:any_parent` (default), `:all_levels`, or a function `parents -> Bool`. See `_criterion_satisfied`
-    for the semantics. The predicate form is an escape hatch for a coverage rule the two symbols do not express; it is
-    reached through `prepare(problem; criterion = …)` and, like every plan option, survives `move!` and `activate!`
-    because [`Model`](@ref) replays its captured `plan_options`. It is only ever called with a non-empty parent list:
-    a box no level covers is no region under any criterion.
-  - `classify_cache` — optional classification cache shared with the cell-level fictitious fold. Pass the same cache
-    through `_apply_physical_fold` so the per-cell verdicts computed there can be reused at the region level.
-  - `moment_fit_cache` — optional cut-region rule cache, keyed by region bounds and moment order. Pass the same cache
-    across successive plans for one space — [`Model`](@ref) does, through every `move!` and `activate!` — so a cut
-    region the mutation left unchanged reuses its rule instead of being refitted. On return the cache is restricted to
-    the boxes *this* plan cuts: a box that has left the plan is dropped with all of its rules, so a `move!` sweep cannot
-    grow the cache. A box that stays live keeps one entry per distinct moment order fitted there, so an order-elevated
-    twin of the same space and this plan do not evict each other — and, where the order at a live box keeps rising (an
-    hp loop), entries accumulate with the cycles rather than staying at one plan's worth. The accumulation is bounded
-    above by `moment_order_factor × pmax` per axis. On a 3D sphere with 32 cut regions, four hp cycles took the cache
-    from 0.035 MiB to 0.61 MiB and the next plan build from 11.9 s (no reuse) to 0.011 s.
-
-The function is called by `prepare`, `move!`, and `_update_mask!`, all in `src/model.jl`, which own the plan a
-[`Model`](@ref) carries; `assembly.jl` and `postprocessing.jl` only read that cached plan back through the
-[`integration_plan`](@ref) / [`integration_plans`](@ref) accessors. The projection path in `projection.jl` builds no
-plan at all: it reuses this file's admissible-box partition engine (`_partition`) directly and keeps every box the
-target covers, without a `criterion`.
-"""
-function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criterion=:any_parent,
-                          classify_cache=_ClassifyCache{D,T}(), moment_fit_cache=_MomentFitCache{D,T}()) where {D,T}
-    # Reject a merge tolerance that cannot resolve the meshes it is about to canonicalise, before a single region is
-    # built. See `_check_axis_spacing`.
-    _check_axis_spacing(V.levels, Val(D), tolerance)
-
-    # Parents and the keep-criterion first, then one record per kept box with its sizing and classification, before
-    # touching the (potentially expensive) rules; then every cut rule up front (`_prefit!`), so the rule loop walks the
-    # records in partition order on nothing but cache hits. `classify_cache` is shared with `_apply_physical_fold` in
-    # `mesh.jl`, so a box that coincides with a previously classified cell box (the common no-overlay case) reuses the
-    # fold's verdict instead of re-walking the octree.
-    physical = V.physical
-    records = _RegionRecord{D,T}[]
-    _partition(V.levels, ntuple(identity, Val(D)), zero(SVector{D,T}), tolerance) do lower, upper, sig
-        parents = _parents(V.levels, sig, lower, upper)
-        _criterion_satisfied(parents, length(V.levels), criterion) || return nothing
-        verdict = physical === nothing ? :full : classify_cell(physical, AxisBox{D,T}(lower, upper), classify_cache)
-        push!(records, _region_record(V, lower, upper, parents, verdict))
-        return nothing
-    end
-    _prefit!(moment_fit_cache, physical, records)
-
-    alpha = physical === nothing ? zero(T) : physical.alpha
-    custom = physical !== nothing && physical.cut_quadrature !== nothing
-    domain_volume = volume(V.domain)
-    regions, small_overlaps, residual_max = _plan_regions(records, moment_fit_cache, alpha, custom, tolerance,
-                                                          domain_volume)
-    min_volume = isempty(regions) ? zero(T) : minimum(volume(_region_box(region)) for region in regions)
-    min_relative_volume = iszero(domain_volume) ? zero(T) : min_volume / domain_volume
-    return IntegrationPlan{D,T}(regions, small_overlaps, min_volume, min_relative_volume, residual_max)
-end
-
-# The record of one kept region from its classifier `verdict`: the tensor counts from its parents (`0` on an axis the
-# region does not extend along) and, on a `:cut` verdict, the moment-fit order. The facet slice of a `PhysicalDomain`
-# carries the domain's own `moment_order_factor`, so reading it off `V` sizes a cut face and the cells behind it alike.
-function _region_record(V::Space{D,T}, lower::SVector{D,T}, upper::SVector{D,T}, parents::Vector{Parent{D,T}},
-                        verdict::Symbol) where {D,T}
-    counts = _axis_max(_gauss_counts, V, parents, lower, upper)
-    order = verdict === :cut ? _axis_max(_moment_orders(V.physical.moment_order_factor), V, parents, lower, upper) :
-            counts
-    return _RegionRecord{D,T}((lower, upper, parents, verdict, counts, order))
-end
-
-# Fit every cut region's rule before the rule loop consumes any of them, in parallel (`_fit_rules`), and reduce the
-# cache to exactly this plan's regions. Classification ran first and serially, in the records (it is memoised, and a
-# `Dict` is not thread-safe); the fits fill the cache afterwards, serially; the rule loop then runs in region order on
-# nothing but cache hits, so region order, `residual_max` and the small-overlap bookkeeping are the serial path's, bit
-# for bit. A custom `cut_quadrature` is fitted serially (`_fit_rules`) and still gets the dedup and the cross-plan
-# reuse.
-#
-# `live` is the plan's whole cut-key set, not just its misses, because restricting the cache afterwards is what keeps a
-# cache threaded through a long `move!` sweep from holding the sweep's worth of rules. On exit the cache holds only the
-# *boxes* this plan cuts — but at every moment order fitted at one of them, which is where the eviction rule differs
-# from the lookup key. See the `filter!` below for why the two are not the same rule, and what the difference costs.
-function _prefit!(cache::_MomentFitCache{D,T}, physical, records::Vector{_RegionRecord{D,T}}) where {D,T}
-    physical === nothing && return cache
-    live = Set{_MomentFitKey{D,T}}()
-    for record in records
-        record.verdict === :cut && push!(live, (record.lower, record.upper, record.order))
-    end
-    pending = _MomentFitKey{D,T}[key for key in live if !haskey(cache, key)]
-    fitted = _fit_rules(physical, pending, physical.cut_quadrature)
-    for i in eachindex(pending)
-        cache[pending[i]] = fitted[i]
-    end
-    # Evict by box, not by full key. The bound the eviction exists for is the geometric one — a `move!` sweep must not
-    # leave the cache holding every box the overlay ever passed over — and a box that has left the plan takes all of its
-    # rules with it either way, so keying the eviction on the box alone costs that bound nothing: a move changes which
-    # boxes are cut, never the moment order at one of them.
-    #
-    # What it buys is the case full-key eviction gets wrong. An order-elevated twin of the same space — `estimate`'s
-    # `V⁺`, `adaptivity.jl` — has exactly this plan's boxes at a higher moment order, and under full-key eviction the
-    # two orders evict each other, so every `estimate` / `adapted` alternation refits both from scratch. Measured on a
-    # 3D sphere probe (base 4³, order 2, depth 1, 80 cut regions, 4 threads, -O0): a repeated `estimate` cost 38.7 s and
-    # the step after it 1.9 s; evicting by box they cost 0.006 s and 0.03 s, with the elevated order fitted once.
-    #
-    # What it costs, stated plainly because it is not free: a box that stays live keeps one entry per distinct moment
-    # order ever fitted there. Under a `move!` sweep that is flat, since orders do not change there. Under an hp loop it
-    # is not: `refine` raises the order at a live cut cell, the box does not leave the plan, and the entries at it
-    # accumulate *per cycle*. Bounded above — the key's order is `moment_order_factor × cell_order` and `refine` caps
-    # `cell_order` at `pmax` — but not by one plan's worth.
-    #
-    # The trade, measured on one configuration: four `estimate` → `refine` → `adapted` cycles on a 3D sphere (ladder
-    # base 4³, order 1, depth 1, 32 cut boxes) grew the cache from 32 entries / 0.035 MiB to 96 entries over the same 32
-    # boxes / 0.61 MiB, and the next step's plan build cost 0.011 s against 11.9 s with no reuse. An h-step resets the
-    # accumulation where it lands, because the boxes it splits do leave the plan.
-    live_boxes = Set((key[1], key[2]) for key in live)
-    filter!(entry -> (entry.first[1], entry.first[2]) in live_boxes, cache)
-    return cache
-end
-
-# The rule loop of `integration_plan`: one `VolumeRegion` per record, in record order, through `_trimmed_rule` — except
-# a fictitious box under strict α = 0, which has nothing to integrate and is dropped — with the small-overlap records
-# and the largest cut residual. Small-overlap diagnostics are accumulated rather than acted on: the package exposes the
-# warning, the caller decides whether to stabilise. A function barrier on `alpha`, a field of the abstractly typed
-# `Space.physical`, so the per-region rule dispatch below is static. The region list is reserved at the record count,
-# its bound, so it is filled without regrowing.
-function _plan_regions(records::Vector{_RegionRecord{D,T}}, fits::_MomentFitCache{D,T}, alpha, custom::Bool,
-                       tolerance::GeometryTolerance{T}, domain_volume::T) where {D,T}
-    regions = sizehint!(VolumeRegion{D,T}[], length(records))
-    small_overlaps = SmallOverlap{T}[]
-    tensor_cache = _TensorRuleCache{D,T}()
-    alpha_cache = Dict{NTuple{D,Int},Vector{T}}()
-    residual_max = 0.0
-    for record in records
-        record.verdict === :fictitious && iszero(alpha) && continue
-        fit = record.verdict === :cut ? fits[(record.lower, record.upper, record.order)] : nothing
-        kind, points, weights, residual = _trimmed_rule(record.verdict, record.counts, tensor_cache, alpha_cache, alpha,
-                                                        fit, custom)
-        residual > residual_max && (residual_max = Float64(residual))
-        region = Region(record.lower, record.upper, record.parents, kind, points, weights; residual)
-        region_volume = volume(_region_box(region))
-        push!(regions, region)
-        if region_volume <= tolerance.small_volume
-            relative_volume = iszero(domain_volume) ? zero(T) : region_volume / domain_volume
-            push!(small_overlaps,
-                  SmallOverlap{T}(length(regions), region_volume, relative_volume, length(record.parents)))
-        end
-    end
-    return regions, small_overlaps, residual_max
-end
+# The kinds `_trimmed_rule` gives a region `∂Ω` crosses, whatever rule it ended up with, and the subset on which the
+# moment fit failed (a custom rule never fails a fit: no fit ran). The diagnostics count both (`_kind_stats` in
+# `model.jl`), and the VTK writer refines exactly the first.
+const _CUT_KINDS = (:cut_fitted, :cut_custom, :cut_fallback, :cut_failed, :cut_alpha_failed)
+const _FAILED_KINDS = (:cut_fallback, :cut_failed, :cut_alpha_failed)
