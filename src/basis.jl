@@ -504,9 +504,9 @@ end
 # The 1D factor tables are likewise filled at the nominal order and read only up to the cell's own: for integrated
 # Legendre `_fill_factor_tables!` computes mode `m` from `ξ` and `m` alone, with no `p` anywhere in the recurrence, so
 # slots `1:p_cell+1` hold bit-identical values whether the table was filled at `p_cell` or at `p_max`. That identity is
-# what makes the nominal-order banks correct, and it is *false* for a family whose 1D modes depend on the degree — de
-# Boor at degree p yields p+1 span-specific functions — which is one more reason `_supports_cell_order` is false for
-# B-splines.
+# what makes the nominal-order factor tables correct, and it is *false* for a family whose 1D modes depend on the
+# degree — de Boor at degree p yields p+1 span-specific functions — which is one more reason `_supports_cell_order` is
+# false for B-splines.
 @inline function _tensor_values!(basis::BasisFamily, values::AbstractVector, indices::AbstractVector{CartesianIndex{D}},
                                  order::NTuple{D,Int}, ξ::SVector{D}, val1d, cell::CartesianIndex{D},
                                  grad=nothing) where {D}
