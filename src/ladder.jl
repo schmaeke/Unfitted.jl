@@ -24,17 +24,7 @@
 # feature far finer than the base cell can be resolved without paying for the levels in between. The cost is
 # conditioning — see [`adapt`](@ref) — not admissibility.
 
-# Per-level split specification. A `Tuple` is per-axis and applies to every level; a `Vector` is per-level, one entry
-# per overlay, each itself a positive integer or a `D`-tuple. The two readings collide — in 2D `(2, 2)` could be "two
-# axes" or "two levels" — and the tuple/vector distinction settles it without a second keyword, reusing the fact that
-# `_axis_int_tuple` already rejects a `Vector`.
-_level_splits(s, depth::Int, ::Val{D}) where {D} = fill(_axis_int_tuple(s, Val(D), :splits), depth)
-
-function _level_splits(s::AbstractVector, depth::Int, ::Val{D}) where {D}
-    length(s) == depth || throw(ArgumentError("a per-level `splits` vector must have one entry per overlay " *
-                                              "level: got $(length(s)) for depth $depth"))
-    return [_axis_int_tuple(e, Val(D), :splits) for e in s]
-end
+# ── Ladders and nesting ───────────────────────────────────────────────────────
 
 """
     ladder(domain::AxisBox; cells, depth, splits=2, order=1, basis=IntegratedLegendre(),
@@ -148,6 +138,18 @@ function ladder(domain::AxisBox{D,T}; cells, depth::Integer, splits=2, order=1, 
     return V
 end
 
+# Per-level split specification. A `Tuple` is per-axis and applies to every level; a `Vector` is per-level, one entry
+# per overlay, each itself a positive integer or a `D`-tuple. The two readings collide — in 2D `(2, 2)` could be "two
+# axes" or "two levels" — and the tuple/vector distinction settles it without a second keyword, reusing the fact that
+# `_axis_int_tuple` already rejects a `Vector`.
+_level_splits(s, depth::Int, ::Val{D}) where {D} = fill(_axis_int_tuple(s, Val(D), :splits), depth)
+
+function _level_splits(s::AbstractVector, depth::Int, ::Val{D}) where {D}
+    length(s) == depth || throw(ArgumentError("a per-level `splits` vector must have one entry per overlay " *
+                                              "level: got $(length(s)) for depth $depth"))
+    return [_axis_int_tuple(e, Val(D), :splits) for e in s]
+end
+
 # Per-level cell counts, with the two failure modes a `depth` keyword invites checked before anything is allocated. Both
 # are otherwise diagnosed far away from their cause: a spacing below `tolerance.merge` surfaces as `_check_axis_spacing`
 # naming a level number at `prepare` time, and an unaffordable grid surfaces as the process running out of memory inside
@@ -211,61 +213,6 @@ function is_nested(V::Space{D,T}; tolerance::GeometryTolerance{T}=GeometryTolera
 end
 
 # ── Mapping cells between levels ──────────────────────────────────────────────
-
-# The block of level-`to` cells that cell `cell` of level `from` overlaps. The answer is always an axis-aligned block,
-# because both meshes are tensor products of sorted axes, so `D` binary searches settle it: O(D·log N + block) rather
-# than the O(N_to) pass over the destination grid a dense answer would make.
-#
-# That difference is why this exists. Adaptivity asks the question one cell at a time — is anything live below this
-# cell, which cells does an h-step activate, how many children does this parent have — and paying for a whole level per
-# marked cell dominated the cycle: measured mapping one base cell of a depth-3 3D ladder onto its 64³ level, 7.65 ms
-# through `overlapping_cells` against 0.29 µs for this block, and a cycle asks it once per mark from four sites.
-#
-# That ratio holds per mark and inverts over a sweep, which is worth saying here because the figures above invite the
-# wrong generalisation. Asking the question for *every* cell of a level is faster through the public verb, called once
-# on the whole set, than through this one called once per cell: one set-wise call amortises the per-axis tabulation, the
-# source scan and the destination mask over the entire selection. Measured over a 2D ladder of 4×4 base cells and five
-# overlays, the release sweep costs 0.058 ms as two `overlapping_cells` calls per level against 0.36 ms as one
-# `_cell_block` per cell — and 56 ms as one `overlapping_cells` per cell, which is the trap. Per mark, this function;
-# per level, the public one.
-#
-# The per-axis rule, rounding margin included, is `_axis_overlap` below, and `overlapping_cells` tabulates the same
-# rule, so the per-cell and the set-wise map cannot disagree.
-#
-# The overlap relation is symmetric — cell i of one axis overlaps cell j of the other exactly when the reverse holds —
-# so this one function answers the cross-level map in both directions and nothing here has to know which level is the
-# finer one.
-#
-# An empty block is a legitimate answer rather than an error: a level whose box does not reach this cell covers none of
-# it, which is the ordinary state of affairs on a sub-box overlay. Every caller must read it that way.
-function _cell_block(V::Space{D}, from::Integer, to::Integer, cell::CartesianIndex{D}) where {D}
-    f, t = V.levels[from].mesh, V.levels[to].mesh
-    return CartesianIndices(ntuple(d -> _axis_overlap(t.axes[d], f.axes[d], cell.I[d]), D))
-end
-
-# The cells of axis `target` that cell `i` of axis `source` overlaps by more than rounding: the one per-axis relation
-# both cross-level maps read.
-#
-# Each endpoint is pulled inward by δ = 4·eps(m) before the exact lookup, with m the largest coordinate magnitude on
-# either axis — the coordinates' own round-off, at their own scale. Two meshes built from different boxes compute their
-# nodes from different corners, so a node one of them places on the other's face can miss it by an ulp. Read exactly, a
-# miss of 5.6e-17 on the wrong side made a cell that merely touches the face an overlapping one: a child an h-step woke,
-# a child `_predicted` counted, a parent that was no longer a leaf — against `overlapping_cells`' own contract. On a
-# ladder the margin changes nothing, because its levels share their node coordinates bit for bit (`_mesh_axes` makes a
-# node a function of the ratio `i / n` alone), so a node either coincides or lies a whole cell away.
-#
-# The margin is relative, never `GeometryTolerance`'s absolute `contain`, which is wrong twice over: on a domain far
-# from the origin it is below one ulp and does nothing, and on a domain of small extent it is larger than a whole cell
-# and empties every range — both silently. A relative δ only has to stay far below a cell, and it does wherever every
-# cell is wider than about 8·eps(m). That m is the larger of the two axes' magnitudes, not a cell's own coordinates, so
-# a fine cell near a node of small magnitude is held to the scale of the larger axis. Under the default
-# `GeometryTolerance`, whose `merge` admits no cell narrower than √eps(T) (`_check_axis_spacing`), it holds for every
-# admitted mesh with coordinates below about 1e6; a custom tolerance on a deeply graded stack far from the origin is
-# where to look for the limit. The coverage rule nudges by the absolute tolerance instead; see `_cells_under_box`.
-function _axis_overlap(target::Vector{T}, source::Vector{T}, i::Integer) where {T}
-    δ = 4 * eps(max(abs(target[1]), abs(target[end]), abs(source[1]), abs(source[end])))
-    return _axis_cells(target, source[i] + δ, source[i + 1] - δ)
-end
 
 """
     overlapping_cells(V::Space, cells; from, to) -> BitArray
@@ -338,6 +285,61 @@ function _level_selection(cells, level::Level{D}) where {D}
     mask = _normalize_mask(cells, level.mesh)
     mask === nothing && return trues(level.mesh.cells)
     return mask.on
+end
+
+# The block of level-`to` cells that cell `cell` of level `from` overlaps. The answer is always an axis-aligned block,
+# because both meshes are tensor products of sorted axes, so `D` binary searches settle it: O(D·log N + block) rather
+# than the O(N_to) pass over the destination grid a dense answer would make.
+#
+# That difference is why this exists. Adaptivity asks the question one cell at a time — is anything live below this
+# cell, which cells does an h-step activate, how many children does this parent have — and paying for a whole level per
+# marked cell dominated the cycle: measured mapping one base cell of a depth-3 3D ladder onto its 64³ level, 7.65 ms
+# through `overlapping_cells` against 0.29 µs for this block, and a cycle asks it once per mark from four sites.
+#
+# That ratio holds per mark and inverts over a sweep, which is worth saying here because the figures above invite the
+# wrong generalisation. Asking the question for *every* cell of a level is faster through the public verb, called once
+# on the whole set, than through this one called once per cell: one set-wise call amortises the per-axis tabulation, the
+# source scan and the destination mask over the entire selection. Measured over a 2D ladder of 4×4 base cells and five
+# overlays, the release sweep costs 0.058 ms as two `overlapping_cells` calls per level against 0.36 ms as one
+# `_cell_block` per cell — and 56 ms as one `overlapping_cells` per cell, which is the trap. Per mark, this function;
+# per level, the public one.
+#
+# The per-axis rule, rounding margin included, is `_axis_overlap` below, and `overlapping_cells` tabulates the same
+# rule, so the per-cell and the set-wise map cannot disagree.
+#
+# The overlap relation is symmetric — cell i of one axis overlaps cell j of the other exactly when the reverse holds —
+# so this one function answers the cross-level map in both directions and nothing here has to know which level is the
+# finer one.
+#
+# An empty block is a legitimate answer rather than an error: a level whose box does not reach this cell covers none of
+# it, which is the ordinary state of affairs on a sub-box overlay. Every caller must read it that way.
+function _cell_block(V::Space{D}, from::Integer, to::Integer, cell::CartesianIndex{D}) where {D}
+    f, t = V.levels[from].mesh, V.levels[to].mesh
+    return CartesianIndices(ntuple(d -> _axis_overlap(t.axes[d], f.axes[d], cell.I[d]), D))
+end
+
+# The cells of axis `target` that cell `i` of axis `source` overlaps by more than rounding: the one per-axis relation
+# both cross-level maps read.
+#
+# Each endpoint is pulled inward by δ = 4·eps(m) before the exact lookup, with m the largest coordinate magnitude on
+# either axis — the coordinates' own round-off, at their own scale. Two meshes built from different boxes compute their
+# nodes from different corners, so a node one of them places on the other's face can miss it by an ulp. Read exactly, a
+# miss of 5.6e-17 on the wrong side made a cell that merely touches the face an overlapping one: a child an h-step woke,
+# a child `_predicted` counted, a parent that was no longer a leaf — against `overlapping_cells`' own contract. On a
+# ladder the margin changes nothing, because its levels share their node coordinates bit for bit (`_mesh_axes` makes a
+# node a function of the ratio `i / n` alone), so a node either coincides or lies a whole cell away.
+#
+# The margin is relative, never `GeometryTolerance`'s absolute `contain`, which is wrong twice over: on a domain far
+# from the origin it is below one ulp and does nothing, and on a domain of small extent it is larger than a whole cell
+# and empties every range — both silently. A relative δ only has to stay far below a cell, and it does wherever every
+# cell is wider than about 8·eps(m). That m is the larger of the two axes' magnitudes, not a cell's own coordinates, so
+# a fine cell near a node of small magnitude is held to the scale of the larger axis. Under the default
+# `GeometryTolerance`, whose `merge` admits no cell narrower than √eps(T) (`_check_axis_spacing`), it holds for every
+# admitted mesh with coordinates below about 1e6; a custom tolerance on a deeply graded stack far from the origin is
+# where to look for the limit. The coverage rule nudges by the absolute tolerance instead; see `_cells_under_box`.
+function _axis_overlap(target::Vector{T}, source::Vector{T}, i::Integer) where {T}
+    δ = 4 * eps(max(abs(target[1]), abs(target[end]), abs(source[1]), abs(source[end])))
+    return _axis_cells(target, source[i] + δ, source[i + 1] - δ)
 end
 
 # ── Writing the activation of a whole stack ───────────────────────────────────
