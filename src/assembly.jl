@@ -506,27 +506,18 @@ end
 _point_count(list::RegionList) = list.offsets[end] - list.offsets[1]
 
 # The regions of pass target `target` on `space`, and whether they are the model's own prepare-time list (`true`) or
-# were resolved just now for a target `prepare` never saw (`false`). The miss paths are the builders `prepare` runs.
-# "Fresh" is per target, not per face: a selector resolves through the model's `FacetResolver`, so a face `prepare`
-# already resolved is reused, and a new face is resolved once however many selectors name it.
+# were resolved just now for a target `prepare` never saw (`false`): the volume plan of `space`, or the `on=` target's
+# entry of `model.regions`, a miss resolving through `_resolve_target`, the builder `prepare` runs. "Fresh" is per
+# target, not per face: a selector resolves through the model's `FacetResolver`, so a face `prepare` already resolved is
+# reused, and a new face is resolved once however many selectors name it.
 function _regions(@nospecialize(model::Model), ::Nothing, @nospecialize(space))
     plan = findfirst(s -> s === space, problem_spaces(model.problem))
     return model.space_plans[plan].regions, true
 end
-function _regions(@nospecialize(model::Model), selector::BoundarySelector, @nospecialize(space))
-    cached = get(model.facet_regions, (selector, space), nothing)
+function _regions(@nospecialize(model::Model), @nospecialize(target), @nospecialize(space))
+    cached = get(model.regions, (target, space), nothing)
     cached === nothing || return cached, true
-    return _facet_regions_for_selector(space, selector, model.facet_resolver), false
-end
-function _regions(@nospecialize(model::Model), mesh::BoundaryMesh, @nospecialize(space))
-    cached = get(model.surface_regions, (mesh, space), nothing)
-    cached === nothing || return cached, true
-    return _surface_regions_for_mesh(space, mesh, model.dofs.tolerance), false
-end
-function _regions(@nospecialize(model::Model), iface::Interface, _)
-    cached = get(model.interface_regions, iface, nothing)
-    cached === nothing || return cached, true
-    return _interface_regions(iface, model.problem, model.dofs), false
+    return _resolve_target(target, space, model.problem, model.dofs, model.facet_resolver), false
 end
 
 # A small most-recently-used-first cache kept in a `Vector` of `key => value` pairs, every key a 2-tuple. `_lru_get!`
@@ -1470,9 +1461,9 @@ function nquadpoints(model::Model; kind::Symbol=:volume, on=nothing, field::Unio
     # keeps a caller that sizes a loop by the count type-stable (the `RBFP0` transfer's serial loop allocated per
     # point).
     lists = kind === :volume ? (plan.regions for plan in integration_plans(model)) :
-            kind === :facet ? values(model.facet_regions) :
-            kind === :surface ? values(model.surface_regions) :
-            kind === :interface ? values(model.interface_regions) :
+            kind === :facet ? _cached_lists(model.regions, BoundarySelector) :
+            kind === :surface ? _cached_lists(model.regions, BoundaryMesh) :
+            kind === :interface ? _cached_lists(model.regions, Interface) :
             throw(ArgumentError("nquadpoints kind must be :volume, :facet, :surface, or " * ":interface, got $kind"))
     return sum(regions -> sum(_region_qpoint_count, regions; init=0), lists; init=0)
 end

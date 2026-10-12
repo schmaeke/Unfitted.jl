@@ -285,13 +285,13 @@ end
     @test l2_error(ss, single, exact; norm=:absolute) === l2_error(ss, single, u, exact; norm=:absolute)
 end
 
-@testset "model.facet_regions caches one entry per Dirichlet selector" begin
+@testset "model.regions caches one entry per Dirichlet selector" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(2, 2), order=1)
 
     # No Dirichlet → empty cache, zero facet-region count.
     plain = prepare(poisson(V; source=0.0))
-    @test isempty(plain.facet_regions)
+    @test isempty(plain.regions)
     @test diagnostics(plain).facet_region_count == 0
     @test nquadpoints(plain; kind=:facet) == 0
     @test nquadpoints(plain) == nquadpoints(plain; kind=:volume)  # default unchanged
@@ -299,8 +299,8 @@ end
     # boundary(:all) → one cached selector. Region count and q-point count match what boundary_integral sees on the same
     # model.
     with_dirichlet = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
-    @test length(with_dirichlet.facet_regions) == 1
-    selector_count = sum(length, values(with_dirichlet.facet_regions))
+    @test length(with_dirichlet.regions) == 1
+    selector_count = sum(length, values(with_dirichlet.regions))
     @test diagnostics(with_dirichlet).facet_region_count == selector_count
     @test nquadpoints(with_dirichlet; kind=:facet) > 0
 
@@ -308,13 +308,13 @@ end
     multi = prepare(poisson(V; source=0.0,
                             dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower)),
                                        dirichlet(0.0; on=boundary(axis=2, side=:upper))]))
-    @test length(multi.facet_regions) == 2
+    @test length(multi.regions) == 2
 
     # nquadpoints rejects unknown kinds with a clear message.
     @test_throws ArgumentError nquadpoints(plain; kind=:nope)
 end
 
-@testset "facet_regions refresh on move! / activate! / deactivate!" begin
+@testset "the facet regions refresh on move! / activate! / deactivate!" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(2, 2), order=1)
     V = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(1, 1), order=1)
@@ -324,11 +324,11 @@ end
     move!(model; level=2, to=box((0.3, 0.3), (0.8, 0.8)))
     # The overlay box did not coincide with the physical boundary before or after the move, so the cached facet region
     # list must still be populated and consistent with the post-move space.
-    @test !isempty(model.facet_regions)
+    @test !isempty(model.regions)
     @test diagnostics(model).facet_region_count == before_count
     # The facet-region cache contents must now reflect the new space: at least one parent in each region's list must be
     # from level 1 (the base — overlays inside Ω cannot touch ∂Ω).
-    for (_, list) in model.facet_regions
+    for (_, list) in model.regions
         for region in list
             @test all(parent.level == 1 for parent in region.parents)
         end

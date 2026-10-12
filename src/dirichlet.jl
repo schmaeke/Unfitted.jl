@@ -308,11 +308,11 @@ at, together with the per-face memo (`FacetKey` → region list) it fills as fac
 those regions share.
 
 One resolver belongs to a [`Model`](@ref) and lives as long as it does, so every consumer of grid-aligned boundary
-integration shares one resolution per `(space, face)` pair — the per-selector cache `prepare` builds
-(`_resolve_facet_regions`), the one-shot lookup `_region_list` falls back to for a selector no `prepare` saw, and the L²
-Dirichlet projection (`_dirichlet_projection`), which reaches the same faces from the dof layer. Sharing is worth
-arranging because `_boundary_facet_regions` is a pure function of `(V, sides, tolerance)`: a second resolution of a face
-can only ever reproduce the first one, at full price.
+integration shares one resolution per `(space, face)` pair — the per-selector entries `prepare` resolves into
+`Model.regions` (`_resolve_target`), the one-shot lookup `_region_list` falls back to for a selector no `prepare` saw,
+and the L² Dirichlet projection (`_dirichlet_projection`), which reaches the same faces from the dof layer. Sharing is
+worth arranging because `_boundary_facet_regions` is a pure function of `(V, sides, tolerance)`: a second resolution of
+a face can only ever reproduce the first one, at full price.
 
 The memo is filled lazily and so is mutated by lookups, which is safe for the same reason the integration plan's
 moment-fit cache is: every resolution happens on the task that called the public API — `prepare`, `update_dirichlet!`,

@@ -312,9 +312,11 @@ end
 # cell can have a face lying wholly inside Ω, and no trimming is needed there. Classifying the cells would make the
 # number a loose upper bound — on the space-time cavity example at `SC_CELLS = 3` it reads 61 of 81 against a true 1,
 # because the growing cavity cuts nearly every cell while touching only the `t = 0` and `t = T` faces.
-function _kind_stats(regions)
-    cut, trimmed, failed, fallbacks, fallback_points = 0, 0, 0, 0, 0
-    residual_max, min_relative_measure = 0.0, 1.0
+#
+# `stats` is where the counts start from: the statistics of the lists already read, so that `_kind_stats_of` can carry
+# them from one list into the next.
+function _kind_stats(regions, stats=_NO_KIND_STATS)
+    (; cut, trimmed, failed, fallbacks, fallback_points, residual_max, min_relative_measure) = stats
     for region in regions
         kind = region.kind
         kind === :full && continue
@@ -330,6 +332,15 @@ function _kind_stats(regions)
         min_relative_measure = min(min_relative_measure, Float64(relative))
     end
     return (; cut, trimmed, failed, fallbacks, fallback_points, residual_max, min_relative_measure)
+end
+const _NO_KIND_STATS = (; cut=0, trimmed=0, failed=0, fallbacks=0, fallback_points=0, residual_max=0.0,
+                        min_relative_measure=1.0)
+
+# `_kind_stats` over several region lists: the statistics of their concatenation, read one list at a time. Each list is
+# its own call, a function barrier, so the lists of the model's region cache — whose values are typed only `Vector` —
+# are each walked with their concrete region type rather than dispatching on every region.
+function _kind_stats_of(lists)
+    foldl((stats, regions) -> _kind_stats(regions, stats)::typeof(_NO_KIND_STATS), lists; init=_NO_KIND_STATS)
 end
 
 # Fold every plan-level statistic into a diagnostics record in place, and return it so call sites can chain. Shared by
@@ -397,13 +408,15 @@ function Base.show(io::IO, diagnostics::AssemblyDiagnostics)
           diagnostics.solver, ")")
 end
 
-# ── Single-sided region-cache keys ────────────────────────────────────────────
+# ── Region-cache keys ─────────────────────────────────────────────────────────
 #
 # A single-sided region list (`FacetRegion`s for a `BoundarySelector`, `SimplexRegion`s for a `BoundaryMesh`) is built
 # against exactly *one* subdomain space: its parents live on that space's level-id block, so only that space's fields
 # ever evaluate on it (`_parent_range`). On a coupled problem the same `on=` target may legitimately be named by fields
 # on different subdomains — `boundary(axis=1, side=:upper)` is a face of every subdomain that has one — and those are
-# different sets of facets. The cache key is therefore the *pair* `(on, space)`, not the target alone.
+# different sets of facets. The cache key is therefore the *pair* `(on, space)`, not the target alone. A two-sided
+# interface list carries the parents of both its subdomains, so its key is `(iface, nothing)`, and the two kinds share
+# one cache (`Model.regions`) without ever sharing a key.
 #
 # A plain `Tuple` already gives each half the equality it deserves, because `Tuple` composes its elements' `isequal` /
 # `hash` elementwise:
@@ -564,26 +577,32 @@ value through. Fields:
   - `rhs::Union{Nothing,Vector{T}}` — assembled right-hand side. Same invalidation contract as `matrix`.
   - `facet_resolver::FacetResolver{D,T}` — the model's single route from a boundary *face* to its
     [`FacetRegion`](@ref)s, and the memo of every face already resolved (see [`FacetResolver`](@ref)). It sits one level
-    below `facet_regions`: that cache keys whole `BoundarySelector`s, which are unions of faces, while this memo keys
-    the faces themselves, so a face two selectors both name is resolved once and shared. Every consumer resolves through
-    it — the per-selector cache below, the one-shot lookup for a selector no `prepare` saw, and the L² Dirichlet
-    projection, which the dof layer reaches through the resolver `prepare` hands `system_layout`. Replaced wholesale by
-    every mutator, which is also what retires the entries of the spaces the mutation left behind; a non-mutating
-    derivation (`adapted`, `elevated`, `moved`) gets its own fresh one rather than a copy, since the keys are spaces and
-    a derivation has new ones to resolve anyway.
-  - `facet_regions::Dict{RegionKey,Vector{FacetRegion{D,T}}}` — cache of physical-boundary [`FacetRegion`](@ref)s, keyed
-    by the `RegionKey` pair `(selector, space)`. One entry per `BoundarySelector` **per subdomain space** that names it,
-    whether through a Dirichlet condition or a `block`/`loadform` carrying `on::BoundarySelector`. The space is part of
-    the key because a region list lives on one space's level-id block: two subdomains naming a value-equal selector own
-    different facets and must not share an entry. Populated at `prepare` and refreshed by every mutator.
-  - `surface_regions::Dict{RegionKey,Vector{SimplexRegion{D,T}}}` — cache of immersed-boundary
-    [`SimplexRegion`](@ref)s, keyed the same way by `(mesh, space)`. One entry per [`BoundaryMesh`](@ref) per subdomain
-    space naming it through a `block`/`loadform` carrying `on::BoundaryMesh`. The mesh half of the key matches by object
-    identity (the `BoundaryMesh` value carries no canonical hash; identity match prevents two structurally-equal but
-    distinct meshes from accidentally sharing a cache entry).
-  - `interface_regions::IdDict{Any,Vector{SimplexRegion{D,T}}}` — per-interface cache of two-sided
-    [`SimplexRegion`](@ref)s. One entry per [`Interface`](@ref) referenced by a coupling `block` (`couple`'s four
-    blocks share one `Interface` object). Keyed by object identity, as for `surface_regions`.
+    below `regions`: that cache keys whole `BoundarySelector`s, which are unions of faces, while this memo keys the
+    faces themselves, so a face two selectors both name is resolved once and shared. Every consumer resolves through it
+    — the per-selector entries of `regions` below, the one-shot lookup for a selector no `prepare` saw, and the L²
+    Dirichlet projection, which the dof layer reaches through the resolver `prepare` hands `system_layout`. Replaced
+    wholesale by every mutator, which is also what retires the entries of the spaces the mutation left behind; a
+    non-mutating derivation (`adapted`, `elevated`, `moved`) gets its own fresh one rather than a copy, since the keys
+    are spaces and a derivation has new ones to resolve anyway.
+  - `regions::Dict{RegionKey,Vector}` — the region list of every `on=` target the problem names, resolved at `prepare`
+    and refreshed by every mutator. Each entry is keyed by the `RegionKey` its assembly pass carries:
+
+      - `(selector, space)` — the physical-boundary [`FacetRegion`](@ref)s of a [`BoundarySelector`](@ref), one entry
+        per selector **per subdomain space** that names it, whether through a Dirichlet condition or a
+        `block`/`loadform` carrying `on::BoundarySelector`. The space is part of the key because a region list lives on
+        one space's level-id block: two subdomains naming a value-equal selector own different facets and must not
+        share an entry. A selector whose faces hold no admissible region (an overlay-only mask emptying a face, say)
+        keeps an empty list, so "named, and empty" stays distinguishable from "never named".
+      - `(mesh, space)` — the immersed-boundary [`SimplexRegion`](@ref)s of a [`BoundaryMesh`](@ref), one entry per
+        mesh per subdomain space naming it through a `block`/`loadform` carrying `on::BoundaryMesh`.
+      - `(iface, nothing)` — the two-sided [`SimplexRegion`](@ref)s of a coupling [`Interface`](@ref), one entry per
+        interface a coupling `block` names (`couple`'s four blocks share one `Interface` object). There is no space half
+        because the regions carry the parents of both subdomains.
+
+    A selector matches by value; a mesh, an interface and a space match by object identity, so two structurally equal
+    but distinct meshes never share an entry. A value is a `Vector{FacetRegion{D,T}}` under a selector and a
+    `Vector{SimplexRegion{D,T}}` otherwise, and the per-kind counts of [`diagnostics`](@ref) and
+    [`nquadpoints`](@ref)`(model; kind)` select their entries by the type of the key's head.
   - `dirichlet_projections::Dict{Symbol,DirichletProjection{D,T}}` — per-field cache of the datum-independent half of
     the L² Dirichlet projection (see [`DirichletProjection`](@ref)). Empty at `prepare` and filled by the first
     [`update_dirichlet!`](@ref) on each field, which is the only path that re-projects an existing dof layout; every
@@ -614,9 +633,7 @@ mutable struct Model{D,T,P}
     matrix::Union{Nothing,SparseMatrixCSC{T,Int}}
     rhs::Union{Nothing,Vector{T}}
     facet_resolver::FacetResolver{D,T}
-    facet_regions::Dict{RegionKey,Vector{FacetRegion{D,T}}}
-    surface_regions::Dict{RegionKey,Vector{SimplexRegion{D,T}}}
-    interface_regions::IdDict{Any,Vector{SimplexRegion{D,T}}}
+    regions::Dict{RegionKey,Vector}
     dirichlet_projections::Dict{Symbol,DirichletProjection{D,T}}
     diagnostics::AssemblyDiagnostics
     assembly::AssemblyCache{T}
@@ -705,26 +722,29 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
     classify_caches = IdDict{Space,_ClassifyCache{D,T}}(zip(spaces, caches))
     layout, trace_factors, unsupported = _system_layout(effective_problem; tolerance, prune, prune_exempt,
                                                         classify_caches, facets=facet_resolver)
-    facet_regions = _resolve_facet_regions(effective_problem, facet_resolver)
-    surface_regions = _resolve_surface_regions(effective_problem, tolerance)
-    interface_regions = _resolve_interface_regions(effective_problem, layout)
-    facet_stats = _kind_stats(region for list in values(facet_regions) for region in list)
+    # The region list of every `on=` target the problem names, each resolved once however often it is named. The facet
+    # lists come after the layout, so every face a nonzero Dirichlet datum projected onto is read from the resolver's
+    # memo here rather than resolved again.
+    regions = Dict{RegionKey,Vector}()
+    for key in _referenced_targets(effective_problem)
+        haskey(regions, key) || (regions[key] = _resolve_target(key..., effective_problem, layout, facet_resolver))
+    end
+    facet_stats = _kind_stats_of(_cached_lists(regions, BoundarySelector))
     diag = AssemblyDiagnostics(dimension=D, active_unknowns=active_unknowns(layout),
                                inactive_cell_counts=_inactive_cell_counts(spaces),
                                reduced_mode_counts=_reduced_mode_counts(layout),
-                               facet_region_count=_region_count(facet_regions),
+                               facet_region_count=_region_count(regions, BoundarySelector),
                                cut_facet_region_count=facet_stats.trimmed, facet_fit_failure_count=facet_stats.failed,
                                facet_cut_fallback_count=facet_stats.fallbacks,
                                facet_moment_fit_residual_max=facet_stats.residual_max,
                                min_relative_facet_measure=facet_stats.min_relative_measure,
-                               surface_region_count=_region_count(surface_regions),
-                               interface_region_count=_region_count(interface_regions))
+                               surface_region_count=_region_count(regions, BoundaryMesh),
+                               interface_region_count=_region_count(regions, Interface))
     _set_plan_stats_multi!(diag, space_plans)
     _set_dirichlet_trace_stats!(diag, trace_factors, unsupported)
     return Model{D,T,typeof(effective_problem)}(effective_problem, problem.space, _discretisation_pin(spaces, layout),
                                                 space_plans, fit_caches, layout, nothing, nothing, facet_resolver,
-                                                facet_regions, surface_regions, interface_regions,
-                                                Dict{Symbol,DirichletProjection{D,T}}(), diag,
+                                                regions, Dict{Symbol,DirichletProjection{D,T}}(), diag,
                                                 AssemblyCache{T}(point_base), plan_options)
 end
 
@@ -943,38 +963,18 @@ end
 
 # ── Region caches ─────────────────────────────────────────────────────────────
 
-# Build the facet-region cache for a problem from every *site* that references a `BoundarySelector`: Dirichlet
-# conditions and any block/load carrying `on::BoundarySelector`. Each site contributes the pair (selector, the space of
-# the field naming it), and each distinct pair is resolved through `_facet_regions_for_selector` and stored, so two
-# subdomains naming a value-equal selector get two entries, their own facets each. Pairs without any admissible regions
-# (e.g. an overlay-only level mask emptying a face) end up with an empty list, not absent — callers can distinguish
-# "selector with no regions" from "selector never referenced".
-#
-# `facets` is the model's [`FacetResolver`](@ref), so a face two *different* selectors both name is resolved once and
-# its `FacetRegion`s are shared between their vectors rather than built twice. Because the resolver is the model's and
-# not a throw-away of this sweep, the sharing also reaches outside it in both directions: `system_layout` has already
-# run, so every face carrying a nonzero Dirichlet datum is read from the memo here rather than resolved a second time,
-# and the one-shot lookup for a selector no `prepare` saw reads the same entries later.
-function _resolve_facet_regions(problem::Problem{D,T}, facets::FacetResolver{D,T}) where {D,T}
-    regions = Dict{RegionKey,Vector{FacetRegion{D,T}}}()
-    for (selector, space) in _referenced_facet_sites(problem)
-        key = (selector, space)
-        haskey(regions, key) && continue
-        regions[key] = _facet_regions_for_selector(space, selector, facets)
-    end
-    return regions
-end
-
-# Yields every (selector, space) *site* referenced in `problem`: one entry per Dirichlet condition and per block/load
-# carrying `on::BoundarySelector`, paired with the space of the field that names it. A condition with
-# `field === nothing` (only legal on a single-field problem) and a form on a single-domain problem both land on the one
-# representative space, which is that problem's only one.
-function _referenced_facet_sites(problem::Problem)
+# Every `on=` target `prepare` resolves a region list for, as the `RegionKey` its assembly pass will look up: each
+# Dirichlet condition's selector on the space it constrains, then each block's and load's `on` — a `BoundarySelector`
+# or a `BoundaryMesh` on the space of the form's test field, an `Interface` on `nothing`, since its regions span both
+# its subdomains. A target named several times is yielded as often; `prepare` resolves it once. A form with
+# `on === nothing` integrates over its subdomain's plan, which `prepare` builds per subdomain rather than per form, and
+# any other `on` is left to assembly, which raises on it. A condition with `field === nothing` (only legal on a
+# single-field problem) lands on that problem's one space.
+function _referenced_targets(problem::Problem)
     return Iterators.flatten((((c.boundary, _condition_space(problem, c)) for c in problem.dirichlet),
-                              ((b.on, _field_space(problem, b.test_name))
-                               for b in problem.blocks if b.on isa BoundarySelector),
-                              ((l.on, _field_space(problem, l.test_name))
-                               for l in problem.loads if l.on isa BoundarySelector)))
+                              ((f.on, f.on isa Interface ? nothing : _field_space(problem, f.test_name))
+                               for f in (problem.blocks..., problem.loads...)
+                               if f.on isa Union{BoundarySelector,BoundaryMesh,Interface})))
 end
 
 # The subdomain space a Dirichlet condition constrains. `field === nothing` is only reachable on a single-field problem
@@ -983,55 +983,28 @@ function _condition_space(problem::Problem, condition)
     condition.field === nothing ? problem.space : _field_space(problem, condition.field)
 end
 
-# Build the surface-region cache for a problem from every (mesh, space) site referenced by a block or load's `on` tag,
-# keyed like the facet cache — the mesh half of the key by object identity (a `BoundaryMesh` value carries no canonical
-# hash, and identity match prevents two structurally-equal but distinct meshes from accidentally sharing an entry), the
-# space half likewise. One mesh named by fields on two subdomains yields two entries, each cut against its own grid; a
-# genuine *two-sided* coupling across a mesh is an [`Interface`](@ref), which carries both sides in one region.
-function _resolve_surface_regions(problem::Problem{D,T}, tolerance::GeometryTolerance{T}) where {D,T}
-    regions = Dict{RegionKey,Vector{SimplexRegion{D,T}}}()
-    for (mesh, space) in _referenced_boundary_mesh_sites(problem)
-        key = (mesh, space)
-        haskey(regions, key) && continue
-        regions[key] = _surface_regions_for_mesh(space, mesh, tolerance)
-    end
-    return regions
-end
+# The regions of one `on=` target on space `V`: how `prepare` fills `Model.regions`, and how assembly resolves a target
+# `prepare` never saw (`_regions` in `assembly.jl`), so the two cannot build a target differently.
+#
+#   - A selector is the union of its faces' `FacetRegion`s (`_facet_regions_for_selector`), resolved through the model's
+#     `FacetResolver`: a face another selector or the Dirichlet projection already resolved is shared, not rebuilt.
+#   - A mesh is cut against `V`'s grid at the layout's tolerance. One mesh named by fields on two subdomains is two
+#     targets, each cut against its own grid; a genuine *two-sided* coupling across a mesh is an `Interface`.
+#   - An interface is cut against the merged grid lines of both its subdomains (`_interface_regions`), with the coupled
+#     fields' indices from the layout, which is why it reads the problem and the layout and ignores `V`.
+_resolve_target(selector::BoundarySelector, V, _, _, facets) = _facet_regions_for_selector(V, selector, facets)
+_resolve_target(mesh::BoundaryMesh, V, _, layout, _) = _surface_regions_for_mesh(V, mesh, layout.tolerance)
+_resolve_target(iface::Interface, _, problem, layout, _) = _interface_regions(iface, problem, layout)
 
-function _referenced_boundary_mesh_sites(problem::Problem)
-    return Iterators.flatten((((b.on, _field_space(problem, b.test_name))
-                               for b in problem.blocks if b.on isa BoundaryMesh),
-                              ((l.on, _field_space(problem, l.test_name))
-                               for l in problem.loads if l.on isa BoundaryMesh)))
-end
-
-# Build the interface-region cache for a problem from every `Interface` referenced by a coupling block's `on` tag (the
-# four blocks a `couple` call emits share one `Interface` object → one cache entry), each built by
-# `_interface_regions(iface, problem, layout)` exactly as a one-shot interface is: field indices from the dof `layout`
-# (global field order), the two subdomain spaces from the effective problem's fields, and the two-sided regions by
-# subdividing the interface mesh against the merged trace of both grids. Keyed by `IdDict` (object identity), as for the
-# surface cache.
-function _resolve_interface_regions(problem::Problem{D,T}, layout::SystemLayout{D,T}) where {D,T}
-    regions = IdDict{Any,Vector{SimplexRegion{D,T}}}()
-    for iface in _referenced_interfaces(problem)
-        haskey(regions, iface) || (regions[iface] = _interface_regions(iface, problem, layout))
-    end
-    return regions
-end
-
-function _referenced_interfaces(problem::Problem)
-    return Iterators.flatten(((b.on for b in problem.blocks if b.on isa Interface),
-                              (l.on for l in problem.loads if l.on isa Interface)))
-end
-
-# Total number of cached regions across a per-selector / per-mesh / per-interface region cache. Sums the list lengths of
-# the facet, surface, or interface caches; used for the diagnostics `facet_region_count` / `surface_region_count` /
-# `interface_region_count` fields.
-_region_count(regions::AbstractDict) = sum(length, values(regions); init=0)
+# The cached region lists of one kind of target, `K` the type of their key's head: `BoundarySelector` for the facet
+# lists, `BoundaryMesh` for the surface lists, `Interface` for the interface lists. The per-kind diagnostics and
+# `nquadpoints(model; kind)` read the cache through this, and `_region_count` sums the lists' lengths, so a region two
+# targets share is counted once per target.
+_cached_lists(regions::AbstractDict, ::Type{K}) where {K} = (list for (key, list) in regions if first(key) isa K)
+_region_count(regions::AbstractDict, ::Type{K}) where {K} = sum(length, _cached_lists(regions, K); init=0)
 
 # Resolve one selector into its full list of `FacetRegion`s (the union of regions across every facet the selector
-# covers). Used by `_resolve_facet_regions` and reused by consumers that need to look up a selector that was not
-# pre-resolved at `prepare` time.
+# covers): the facet case of `_resolve_target`.
 #
 # The union is assembled face by face through `facets` (see [`FacetResolver`](@ref)), so a face already resolved on `V`
 # — by this selector or by any other selector sharing it — contributes the regions it resolved to rather than a second
