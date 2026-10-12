@@ -201,7 +201,7 @@ end
 
 # The restriction of a level-set callback `g` to the affine slice `{x_k = v}`: the base-problem leaf of one
 # dimension-reduction step, and through `src/physical.jl` the leaf of a boundary facet's slice of Ω. A callable record
-# rather than a closure, so that the two face restrictions of one leaf can tell they are siblings (`_siblings`). The
+# rather than a closure, so that the kernel can tell which face a restriction lies on (`_opposite_faces`). The
 # slice is an isometric embedding of the base into ℝᴰ (`‖_insert_axis(y, k, v) − _insert_axis(z, k, v)‖ = ‖y − z‖`), so
 # a Lipschitz constant of `g` bounds the restriction just as tightly and is carried through unchanged.
 struct _Slice{G,T}
@@ -279,17 +279,26 @@ end
 (g::_FDLeaf)(x) = g.f(x)
 _restrict(g::_FDLeaf, k::Int, v) = _FDLeaf(_Slice(g.f, k, v), g.h)
 
-# Whether two leaves are the restrictions of one leaf to the two faces of the previous reduction, which never get a
-# pair leaf: where that leaf was monotone along the previous height axis its two face restrictions cannot cross (g = 0
-# at both ends of one fiber contradicts monotonicity), and where it was flat they are one function, whose pair leaf
-# vanishes identically and would scatter breakpoints over round-off noise — measured on the gate's napkin-ring octant,
-# that made the volume rule 1.6× less accurate at every Gauss order. (A leaf that was bad along that axis, at the
-# depth floor, could cross its sibling; the floor promises no order there.) `_parent` is the leaf a restriction was cut
-# from, and `nothing` for a leaf that is not a restriction.
-_parent(s::_Slice) = s.g
-_parent(g::Union{_LipschitzLeaf,_FDLeaf}) = _parent(g.f)
-_parent(_) = nothing
-_siblings(a, b) = (p = _parent(a)) !== nothing && p === _parent(b)
+# Whether two leaves are restrictions to the two opposite faces of the previous reduction, x_k = lo and x_k = hi, which
+# never get a pair leaf: where they cross, the base problem's integrand has no kink to resolve. That integrand is the
+# previous reduction's fiber integral — ∫ over [lo, hi] of a polynomial piecewise between the fiber roots — and while
+# the roots keep their order and the leaves flat along x_k their signs, it is a constant plus one term per root tₑ, a
+# function of tₑ clamped to [lo, hi]. A trace on the face lo is where one root reaches lo and kinks its own term; a
+# trace on hi kinks another term (or the same one elsewhere). So across a crossing of two traces on opposite faces the
+# integrand is a sum of terms each kinked along one of them only, which the base rule integrates exactly without a
+# breakpoint there. What couples the terms has a same-face partner: two roots swapping order (the pair leaf's zero set,
+# met by both leaves' traces on one face where both roots sit at that face) and a flat leaf changing sign (its two
+# traces are one function, so its trace on the other trace's face crosses there too). Skipping these pairs therefore
+# costs no exactness, and saves the work of traces that cross without bounding Ω together — a cylinder inside a sphere,
+# whose traces on one face cross the sphere's on the other in every cell around their common axis. The rule also covers
+# the two traces of one leaf: they cannot cross where the leaf is monotone, and where it is flat they are one function,
+# whose pair leaf would vanish identically and scatter breakpoints over round-off noise. `_face` is the coordinate of
+# the face a restriction lies on, and `nothing` for a leaf that is not one (a pair leaf, or a leaf of the original
+# problem, where the facet slices of `src/physical.jl` all lie on their pins' faces).
+_face(s::_Slice) = s.v
+_face(g::Union{_LipschitzLeaf,_FDLeaf}) = _face(g.f)
+_face(_) = nothing
+_opposite_faces(a, b) = (fa = _face(a)) !== nothing && (fb = _face(b)) !== nothing && fa != fb
 
 # The gradient of one leaf at a sample `x` of the box `U`: the context's operator (`ForwardDiff`, or the caller's
 # `grad`) for a leaf the user supplied, and finite differences at the leaf's step for a pair leaf. Each difference is
@@ -436,8 +445,9 @@ end
 
 # The leaves of the base problem of one reduction along axis `k` of a box spanning `[lo, hi]` on it: every active leaf's
 # restrictions to the two faces x_k = lo and x_k = hi, which resolve the projection boundary and every change of fiber
-# topology on the faces, then one pair leaf per two leaves monotone along `k` that are not siblings, for the crossings
-# inside the box (`_PairLeaf`, `_siblings`). `classes` are the leaves' classes along `k` (`_choose_axis`).
+# topology on the faces, then one pair leaf per two leaves monotone along `k` that are not restrictions to opposite
+# faces of the previous reduction, for the crossings inside the box (`_PairLeaf`, `_opposite_faces`). `classes` are the
+# leaves' classes along `k` (`_choose_axis`).
 function _base_leaves(active, classes, k::Int, lo::T, hi::T) where {T}
     base = Any[]
     for g in active
@@ -446,7 +456,7 @@ function _base_leaves(active, classes, k::Int, lo::T, hi::T) where {T}
     monotone = active[classes .=== :monotone]
     h = cbrt(eps(T)) * (hi - lo)
     for i in eachindex(monotone), j in (i+1):lastindex(monotone)
-        _siblings(monotone[i], monotone[j]) && continue
+        _opposite_faces(monotone[i], monotone[j]) && continue
         push!(base, _FDLeaf(_PairLeaf{T}(monotone[i], monotone[j], k, lo, hi), h))
     end
     return base

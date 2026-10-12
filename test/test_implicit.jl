@@ -411,3 +411,31 @@ end
     corner3 = box((0.0, 0.0, 0.0), (0.25, 0.25, 0.25))
     @test rule(bounded(q1), bounded(q2), corner3) == rule(q1, q2, corner3)
 end
+
+@testset "implicit quadrature — traces on opposite faces get no pair leaf" begin
+    # The base problem pairs its monotone leaves for the crossings inside the box, but never two restrictions to
+    # opposite faces of the previous reduction: the fiber integral is a sum of one term per root clamped to the fiber,
+    # so a trace on the face lo and one on the face hi kink different terms, and their crossing needs no breakpoint. Two
+    # traces on one face still pair, and so do leaves that are not traces.
+    g1 = x -> x[1] + x[2] - 0.6
+    g2 = x -> x[1] - x[2] + 0.1
+    traces = Any[Unfitted._restrict(g, 1, v) for g in (g1, g2) for v in (0.0, 0.5)]
+    base = Unfitted._base_leaves(traces, fill(:monotone, 4), 1, 0.0, 0.5)
+    pairs = [l.f for l in base if l isa Unfitted._FDLeaf]
+    @test length(pairs) == 2 && all(p -> Unfitted._face(p.gi) == Unfitted._face(p.gj), pairs)
+    plain = Unfitted._base_leaves(Any[g1, g2], [:monotone, :monotone], 1, 0.0, 0.5)
+    @test count(l -> l isa Unfitted._FDLeaf, plain) == 1
+
+    # What that saves: cube − (sphere ∪ cylinder) around the common axis, where the cylinder lies inside the sphere and
+    # its traces on one face cross the sphere's on the other in every cell. Paired, they add a breakpoint to each of
+    # those cells that bounds no part of Ω (3072 kernel points instead of 2240), enough to starve the first moment-fit
+    # attempt: it missed its target or fitted to only 1e-9, and a miss refits with an eight times larger candidate
+    # cloud. Now each cell fits at the first attempt, to round-off.
+    sphere = leaf(x -> norm(x - SVector(0.5, 0.5, 0.5)) - 0.32; lipschitz=1.0)
+    cylinder = leaf(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.14; lipschitz=1.0)
+    domain = physical_domain(complement(union(sphere, cylinder)); subcell_length_scale=1 / 64, max_depth=4)
+    for lower in Iterators.product((0.25, 0.5), (0.25, 0.5), (0.25, 0.5))
+        _, _, residual, status = Unfitted._moment_fit_rule(domain, box(lower, lower .+ 0.25), (4, 4, 4), 1e-6, 1)
+        @test status === :fitted && residual < 1e-14
+    end
+end
