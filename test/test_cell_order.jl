@@ -261,6 +261,21 @@ end
     @test worst_trace_jump(S; level=2) == 0.0
 end
 
+@testset "per-cell order: elevate takes a pair list in every documented container" begin
+    # The pair form is documented as a vector, tuple, dictionary or generator of `cell => order` pairs. Each must mean
+    # exactly what the vector means, and go through the same entry checks.
+    V = space(_CO_2D; cells=4, order=2)
+    a, b = CartesianIndex(1, 1), CartesianIndex(3, 2)
+    want = cell_orders(elevate(V, 1 => [a => 3, b => (4, 3)]); level=1)
+    @test want[a] == (3, 3) && want[b] == (4, 3) && want[CartesianIndex(2, 2)] == (2, 2)
+    for spec in ((a => 3, b => (4, 3)), Dict(a => 3, b => (4, 3)), (c => o for (c, o) in ((a, 3), (b, (4, 3)))))
+        @test cell_orders(elevate(V, 1 => spec); level=1) == want
+    end
+    @test_throws ArgumentError elevate(V, 1 => (CartesianIndex(9, 9) => 3,))
+    @test_throws ArgumentError elevate(V, 1 => Dict((1, 1) => 3))
+    @test_throws ArgumentError elevate(V, 1 => (c => 0 for c in (a,)))
+end
+
 @testset "per-cell order: through the model" begin
     Ω = _CO_2D
     orders = [2 + (i + j) % 3 for i in 1:8, j in 1:8]

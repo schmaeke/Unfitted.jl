@@ -1181,8 +1181,14 @@ function _pair_orders(V::Space{D}, k::Int, pairs) where {D}
     return out
 end
 
+# Which spellings are a pair list. Every container the docstring names goes to `_pair_orders`, which owns the entry
+# checks; a generator is collected first, so a generator of pairs takes the vector path and anything else it yields is
+# judged as the order spec it then is. Everything that is not a pair list is an ordinary order spec. A vector must be
+# typed as a vector of pairs, because a vector of integers is a per-cell order field on a 1D level.
+const _PairList = Union{AbstractVector{<:Pair},Tuple{Vararg{Pair}},AbstractDict}
 _normalize_elevate_spec(V::Space, k::Int, spec::Pair) = _pair_orders(V, k, (spec,))
-_normalize_elevate_spec(V::Space, k::Int, spec::AbstractVector{<:Pair}) = _pair_orders(V, k, spec)
+_normalize_elevate_spec(V::Space, k::Int, spec::_PairList) = _pair_orders(V, k, spec)
+_normalize_elevate_spec(V::Space, k::Int, spec::Base.Generator) = _normalize_elevate_spec(V, k, collect(spec))
 _normalize_elevate_spec(::Space, ::Int, spec) = spec
 
 # Rebuild `V` with the polynomial order of one level replaced. Mirrors `_remasked_space` but keeps the mesh / basis /
@@ -1208,10 +1214,10 @@ parameter, so a p-step never changes `typeof(V)`.
 shaped like the level's cell grid, or a predicate `(cell_box, cell_index) -> order` — plus one shape that only makes
 sense against an existing level:
 
-  * an iterable of `CartesianIndex{D} => order` pairs, raising the listed cells and leaving every other cell at the
-    order it already has. It is the shape a marking loop produces when it changes a dozen cells: the caller states only
-    what changed and never has to read, copy and hand back the whole field. The level's current field is still read once
-    here, to fill the cells the list does not name.
+  * `CartesianIndex{D} => order` pairs — one `Pair`, or a vector, tuple, dictionary or generator of them — raising the
+    listed cells and leaving every other cell at the order it already has. It is the shape a marking loop produces when
+    it changes a dozen cells: the caller states only what changed and never has to read, copy and hand back the whole
+    field. The level's current field is still read once here, to fill the cells the list does not name.
 
 Where two cells of different order share a face, the shared entity carries the minimum of the two orders; see
 [`CellModes`](@ref) for why that is what keeps the space C⁰, and [`space`](@ref) for the per-cell `order ≥ 1` and
