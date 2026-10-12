@@ -99,6 +99,8 @@
 #     form of Melenk & Wohlmuth's prediction this file follows, and ships their
 #     constants unsquared as γ_p = √0.4, γ_h = 2, γ_n = 1.
 
+# ── The error estimate ────────────────────────────────────────────────────────
+
 """
     ErrorEstimate{D,T}
 
@@ -148,182 +150,6 @@ end
 function Base.show(io::IO, e::ErrorEstimate)
     print(io, "ErrorEstimate(total=", e.total, ", reference=", e.reference, ", total/reference=",
           e.reference > 0 ? e.total / e.reference : NaN, ", consistency=", e.consistency, ")")
-end
-
-# ── Reading the stack under one cell ──────────────────────────────────────────
-#
-# Every question below is asked once per marked cell and is answered from the per-axis block `_cell_block`
-# (`src/ladder.jl`) resolves by binary search, never from `overlapping_cells`, which builds a mask over the whole target
-# level. On a depth-3 3D ladder that is 0.29 µs against 7.65 ms per mark, and a cycle marks hundreds of them.
-#
-# A cell is a leaf when no finer level has taken any of it over. The distinction is the whole reason the p-step needs
-# guarding: leaf semantics shed a covered cell's bubble modes, so raising the order of a non-leaf cell adds nothing that
-# survives the dof walk. `refine` sends such a cell to h instead.
-#
-# EVERY finer level is asked, not only the one immediately below. The dof layer's covering rule tests each higher-id
-# level in turn (`build_coverage` in `src/coverage.jl`), so on a stack where level k+2 is live over a cell while k+1 is
-# dormant — a structure `ladder` admits by design and one `adapt` call builds — the cell is covered and its bubbles are
-# shed. Asking k+1 alone called such a cell a leaf, sent it to p, and the order step it was given then vanished in the
-# dof walk: a mark spent on nothing, every cycle, for as long as the skip lasted.
-#
-# "Any active cell of a finer level overlaps this one" rather than "fully covered" is deliberately the conservative side
-# of the question: a partly covered cell does keep its bubbles, but it is also a cell the stack is already in the middle
-# of taking over, and spending a p-step there is at best premature.
-
-# Which levels hold an active cell at all, as one `Bool` per level. A verb builds this once and both tests below skip a
-# dormant level without touching the geometry — which on a declared-but-empty ladder is every level under the mark, and
-# is the common case. Measured on a depth-3 3D ladder with empty overlays, the leaf test on a base cell falls from 6.19
-# µs to 0.05 µs; its worst case — a live 64³ level that does not reach the marked cell, so the whole block is read and
-# none of it is live — is 4.5 µs.
-_live_levels(V::Space) = [level.mask === nothing || any(level.mask.on) for level in V.levels]
-
-function _is_leaf(V::Space{D}, k::Integer, cell::CartesianIndex{D}, live=_live_levels(V)) where {D}
-    for j in (k+1):length(V.levels)
-        live[j] || continue
-        mask = V.levels[j].mask
-        for c in _cell_block(V, k, j, cell)
-            is_active(mask, c) && return false
-        end
-    end
-    return true
-end
-
-# The block of level k+1 under cell `c` of level k: what an h-step on (k, c) wakes, and what a release of it puts back
-# to sleep. It is empty on the finest level and wherever level k+1's box does not reach the cell, and every reader takes
-# an empty block to mean the same thing — there is no h-step here: `_has_h_step` offers none, `refine` turns the mark
-# into the order step, and `coarsen` has nothing to release. The empty block has `_cell_block`'s own type, so the
-# answer stays concrete.
-function _children(V::Space{D}, k::Integer, c::CartesianIndex{D}) where {D}
-    k < length(V.levels) || return CartesianIndices(ntuple(_ -> 1:0, D))
-    return _cell_block(V, k, k + 1, c)
-end
-
-# Whether an h-step on this cell would buy anything: level k+1 must exist, its box must reach the cell, and the block
-# must hold a cell that is both dormant and a leaf.
-#
-# The three conditions are what makes the h-step total on an arbitrary stack, and each rules out a mark that would
-# otherwise be re-issued every cycle for nothing. A level below that does not reach the cell — a sub-box overlay, or two
-# overlays over different regions — offers no h-step, exactly as the finest level offers none, so both fall under one
-# rule rather than a level-count test. A block already fully live offers none either: the step would set no mask bit.
-# And a dormant cell that a *deeper* level has already taken over is dof-inert to activate, because the same covering
-# rule that sheds the marked cell's bubbles sheds its would-be child's: measured on a depth-2 ladder with level 3 live
-# over a base cell and level 2 empty, activating level 2 under it moved the active unknowns by exactly zero, 97 before
-# and 97 after.
-function _has_h_step(V::Space{D}, k::Integer, cell::CartesianIndex{D}, live=_live_levels(V)) where {D}
-    children = _children(V, k, cell)
-    isempty(children) && return false
-    mask = V.levels[k + 1].mask
-    return any(c -> !is_active(mask, c) && _is_leaf(V, k + 1, c, live), children)
-end
-
-# The cells of one level that carry an approximation. `cell_dofs` answers with an empty vector on a dormant cell, so
-# restricting the estimator's two sweeps to these changes no result — only how much of a level has to be walked to find
-# that out. That is the point on a ladder, where a level holds N^D cells however few are switched on: a depth-5 3D chain
-# over a 4³ base declares 2 097 152 of them on its finest level. The mask scan is one pass over a `BitArray`, cheap
-# against a dof lookup per declared cell: `cell_dofs` allocates nothing, since it returns the layout's own vector, but
-# it is still a table read per cell, and on such a level almost every one of them comes back empty. `estimate` builds
-# the list once per level and walks it in both sweeps.
-#
-# The list has one of two shapes, the lazy grid of an unmasked level or the vector of a masked one, and `_LiveCells`
-# names the pair. `estimate` holds its lists in a vector of that `Union`, so a cell drawn from one is a concrete
-# `CartesianIndex` and the per-cell loop splits on the two shapes, where the alternative, one shape for both, would
-# materialise every cell of an unmasked level.
-const _LiveCells{D} = Union{CartesianIndices{D,NTuple{D,Base.OneTo{Int}}},Vector{CartesianIndex{D}}}
-
-function _live_cells(level::Level)
-    level.mask === nothing ? cell_indices(level.mesh) : CartesianIndices(level.mask.on)[level.mask.on]
-end
-
-# The enrichment `estimate` reads, as a record: `(W, charge)`, where `charge[j] = (k, f)` says that level `j` of `W` is
-# charged to level `k` of `V`, each of its cells to the cell of `k` it lies in when `k` is refined `f`-fold per axis.
-# Every level of `V` is its own `(j, 1)`, raised by `inc` in place where its family carries a per-cell order. Every live
-# level whose family does not gets a refinement twin (`_refinement_twin`), appended above all of them and charged
-# `(k, inc + 1)` to the level it enriches. A dormant level gets none: every cell of its twin would be dormant too, so
-# the twin would carry no raw and no integration region — the partition follows live cells — and add nothing to the
-# indicator but a level to walk.
-#
-# A uniform level is raised as a tuple rather than through a per-cell field, and the reason is cost rather than
-# meaning: `_normalize_order` collapses an all-equal field back to exactly this tuple, so the per-cell path arrives at
-# the same level having materialised three N^D arrays on the way (the field `cell_orders` builds, the raised copy, and
-# the palette scan that collapses it). Measured on a uniform 512² level, 7.9 ms and 13.0 MiB against 1.3 ms and 1.0 MiB
-# for the tuple, for an identical result.
-#
-# Each level is raised by `_reordered_space`, which is `elevate`'s own per-level step. The only other thing `elevate`
-# adds is the check that no level is named twice, and this loop names each level once by construction. Calling it
-# instead meant splatting a generator whose length is known only at run time into a `Vararg` call, which inference
-# resolves by iterating the generator abstractly, with closures of its own specialised on the generator's type and
-# compiled on the spot. Measured on an adapted 8² order-2 ladder, that was 129 ms of inference and 127 ms of the
-# closures' codegen, nearly a fifth of the first `estimate`'s compile time.
-function _enriched_space(V::Space{D,T}, inc::Int) where {D,T}
-    W, charge, live = V, [(k, 1) for k in 1:length(V.levels)], _live_levels(V)
-    for k in 1:length(V.levels)
-        _supports_cell_order(V.levels[k].basis) || continue
-        o = V.levels[k].orders
-        raised = length(o.palette) == 1 ? o.nominal .+ inc : map(p -> p .+ inc, cell_orders(V; level=k))
-        W = _reordered_space(W, k, raised)
-    end
-    for k in 1:length(V.levels)
-        (live[k] && !_supports_cell_order(V.levels[k].basis)) || continue
-        W = _refinement_twin(W, V.levels[k], inc + 1)
-        push!(charge, (k, inc + 1))
-    end
-    return W, charge
-end
-
-# A level co-located with `level` — same box, same family, same degree, same active region — on a mesh refined by
-# `factor` per axis. This is the enrichment for a family whose degree cannot be raised in place, and the reason it is a
-# *superposition* rather than an elevation is the same reason `_supports_cell_order` is false for such a family: raising
-# a B-spline degree rewrites the whole-axis knot vector, so every function is renamed and the injection that `estimate`
-# needs has nothing to copy onto. Refining the mesh renames nothing that already exists; it only adds.
-#
-# `factor` is an integer, so the twin's knot lines contain the level's and the two spline spaces nest — which is what
-# makes `V⁺ ⊇ V` and the injection exact. The mask is mapped child-to-parent so the twin is live exactly where the level
-# is, and its own selection rule then trims it to the functions that fit, exactly as it does for any level. `repeat`
-# with `inner` is that map: it writes each parent bit over its `factor`^D children, as `_coarse_cell` reads it back.
-function _refinement_twin(W::Space{D,T}, level::Level{D,T}, factor::Int) where {D,T}
-    mask = level.mask === nothing ? nothing : repeat(level.mask.on; inner=ntuple(_ -> factor, D))
-    return overlay(W, level.mesh.domain; cells=level.mesh.cells .* factor, order=nominal_order(level),
-                   basis=level.basis, mode=level.mode, active=mask)
-end
-
-# The cell of a level that cell `c` of its `f`-fold refinement lies in, and `c` itself at `f = 1`: where `estimate`
-# charges a twin's indicator.
-_coarse_cell(c::CartesianIndex{D}, f::Int) where {D} = CartesianIndex(ntuple(d -> (c.I[d] - 1) ÷ f + 1, D))
-
-# `estimate`'s enriched model when `space` holds a live refinement twin, charged to the levels whose ids are `twinned`.
-# Two things differ from the plain enrichment, and both come from the twin.
-#
-# Pruning. A superposed twin is a *nested* level of the same degree, so leaf semantics would deduplicate the level it
-# enriches — removing exactly the keys the injection is about to look for, and turning `Rewire` into a refusal. Only
-# *that* level may skip pruning, and only in this throwaway model: turning leaf semantics off for the whole enriched
-# model instead was measured to inflate the indicator on a covered cell of an unrelated integrated-Legendre level by
-# 4.1×, because that level's order-elevated covered modes then survive, land in `W`, and are charged as error to a cell
-# `decide` can spend nothing on. Exempting the enriched level costs the indicator nothing. `u⁺` is zero on every key the
-# injection does not fill, so the duplicate columns contribute nothing to `R = b⁺ − A⁺u⁺`; `b⁺` and the diagonal on `W`
-# are untouched; and `A⁺` being singular is harmless here, since the indicator reads its diagonal and forms one
-# matrix–vector product and never factorises.
-#
-# The caches. A twin refines the integration partition wherever it is live, so the enriched plan cuts none of `model`'s
-# boxes there, and building it on `model`'s own caches, which a plan restricts to the boxes it cuts, evicted every rule
-# `model` held: on an immersed 8² order-2 B-spline ladder the next `adapted` refitted all 44 of its boxes. So the plan
-# is built on a copy, and the rules fitted there are merged back into `model`'s caches, where both sets coexist as the
-# two moment orders of the plain enrichment do. The twin's rules are worth keeping: on a ladder split by the twin's
-# factor its mesh is the next level's, so its boxes are the ones the next h-step wakes. Over two estimate → refine →
-# adapted cycles on an immersed 8² order-2 B-spline ladder of depth 2, the merge took the fits from 309 (shared) to 236,
-# every `adapted` refitting nothing; a copy alone took them to 326, because the next `adapted` then refitted the twin's
-# boxes. The price is that `model`'s caches carry one twin plan's boxes beyond its own until its next plan build evicts
-# them.
-#
-# It is a function rather than a branch of `estimate` for compile time: `space` is built at run time and is not
-# concretely typed there, so this call is dispatched at run time, and the copy and the merge are code-generated only
-# when a twin is first estimated, never for a stack without one. Inference still reads its body, for the abstract
-# signature, when `estimate` itself is first compiled, whatever the stack.
-function _twinned_model(model::Model, space::Space, twinned::Vector{Int})
-    caches = copy.(model.moment_fit_caches)
-    plus = _derived(model, space; options=merge(model.plan_options, (; prune_exempt=twinned)), caches,
-                    point_base=_FOREIGN_POINTS)
-    foreach(merge!, model.moment_fit_caches, caches)
-    return plus
 end
 
 """
@@ -590,6 +416,118 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     return ErrorEstimate{D,T}(cells, total, reference, consistency)
 end
 
+# The enrichment `estimate` reads, as a record: `(W, charge)`, where `charge[j] = (k, f)` says that level `j` of `W` is
+# charged to level `k` of `V`, each of its cells to the cell of `k` it lies in when `k` is refined `f`-fold per axis.
+# Every level of `V` is its own `(j, 1)`, raised by `inc` in place where its family carries a per-cell order. Every live
+# level whose family does not gets a refinement twin (`_refinement_twin`), appended above all of them and charged
+# `(k, inc + 1)` to the level it enriches. A dormant level gets none: every cell of its twin would be dormant too, so
+# the twin would carry no raw and no integration region — the partition follows live cells — and add nothing to the
+# indicator but a level to walk.
+#
+# A uniform level is raised as a tuple rather than through a per-cell field, and the reason is cost rather than
+# meaning: `_normalize_order` collapses an all-equal field back to exactly this tuple, so the per-cell path arrives at
+# the same level having materialised three N^D arrays on the way (the field `cell_orders` builds, the raised copy, and
+# the palette scan that collapses it). Measured on a uniform 512² level, 7.9 ms and 13.0 MiB against 1.3 ms and 1.0 MiB
+# for the tuple, for an identical result.
+#
+# Each level is raised by `_reordered_space`, which is `elevate`'s own per-level step. The only other thing `elevate`
+# adds is the check that no level is named twice, and this loop names each level once by construction. Calling it
+# instead meant splatting a generator whose length is known only at run time into a `Vararg` call, which inference
+# resolves by iterating the generator abstractly, with closures of its own specialised on the generator's type and
+# compiled on the spot. Measured on an adapted 8² order-2 ladder, that was 129 ms of inference and 127 ms of the
+# closures' codegen, nearly a fifth of the first `estimate`'s compile time.
+function _enriched_space(V::Space{D,T}, inc::Int) where {D,T}
+    W, charge, live = V, [(k, 1) for k in 1:length(V.levels)], _live_levels(V)
+    for k in 1:length(V.levels)
+        _supports_cell_order(V.levels[k].basis) || continue
+        o = V.levels[k].orders
+        raised = length(o.palette) == 1 ? o.nominal .+ inc : map(p -> p .+ inc, cell_orders(V; level=k))
+        W = _reordered_space(W, k, raised)
+    end
+    for k in 1:length(V.levels)
+        (live[k] && !_supports_cell_order(V.levels[k].basis)) || continue
+        W = _refinement_twin(W, V.levels[k], inc + 1)
+        push!(charge, (k, inc + 1))
+    end
+    return W, charge
+end
+
+# A level co-located with `level` — same box, same family, same degree, same active region — on a mesh refined by
+# `factor` per axis. This is the enrichment for a family whose degree cannot be raised in place, and the reason it is a
+# *superposition* rather than an elevation is the same reason `_supports_cell_order` is false for such a family: raising
+# a B-spline degree rewrites the whole-axis knot vector, so every function is renamed and the injection that `estimate`
+# needs has nothing to copy onto. Refining the mesh renames nothing that already exists; it only adds.
+#
+# `factor` is an integer, so the twin's knot lines contain the level's and the two spline spaces nest — which is what
+# makes `V⁺ ⊇ V` and the injection exact. The mask is mapped child-to-parent so the twin is live exactly where the level
+# is, and its own selection rule then trims it to the functions that fit, exactly as it does for any level. `repeat`
+# with `inner` is that map: it writes each parent bit over its `factor`^D children, as `_coarse_cell` reads it back.
+function _refinement_twin(W::Space{D,T}, level::Level{D,T}, factor::Int) where {D,T}
+    mask = level.mask === nothing ? nothing : repeat(level.mask.on; inner=ntuple(_ -> factor, D))
+    return overlay(W, level.mesh.domain; cells=level.mesh.cells .* factor, order=nominal_order(level),
+                   basis=level.basis, mode=level.mode, active=mask)
+end
+
+# The cell of a level that cell `c` of its `f`-fold refinement lies in, and `c` itself at `f = 1`: where `estimate`
+# charges a twin's indicator.
+_coarse_cell(c::CartesianIndex{D}, f::Int) where {D} = CartesianIndex(ntuple(d -> (c.I[d] - 1) ÷ f + 1, D))
+
+# `estimate`'s enriched model when `space` holds a live refinement twin, charged to the levels whose ids are `twinned`.
+# Two things differ from the plain enrichment, and both come from the twin.
+#
+# Pruning. A superposed twin is a *nested* level of the same degree, so leaf semantics would deduplicate the level it
+# enriches — removing exactly the keys the injection is about to look for, and turning `Rewire` into a refusal. Only
+# *that* level may skip pruning, and only in this throwaway model: turning leaf semantics off for the whole enriched
+# model instead was measured to inflate the indicator on a covered cell of an unrelated integrated-Legendre level by
+# 4.1×, because that level's order-elevated covered modes then survive, land in `W`, and are charged as error to a cell
+# `decide` can spend nothing on. Exempting the enriched level costs the indicator nothing. `u⁺` is zero on every key the
+# injection does not fill, so the duplicate columns contribute nothing to `R = b⁺ − A⁺u⁺`; `b⁺` and the diagonal on `W`
+# are untouched; and `A⁺` being singular is harmless here, since the indicator reads its diagonal and forms one
+# matrix–vector product and never factorises.
+#
+# The caches. A twin refines the integration partition wherever it is live, so the enriched plan cuts none of `model`'s
+# boxes there, and building it on `model`'s own caches, which a plan restricts to the boxes it cuts, evicted every rule
+# `model` held: on an immersed 8² order-2 B-spline ladder the next `adapted` refitted all 44 of its boxes. So the plan
+# is built on a copy, and the rules fitted there are merged back into `model`'s caches, where both sets coexist as the
+# two moment orders of the plain enrichment do. The twin's rules are worth keeping: on a ladder split by the twin's
+# factor its mesh is the next level's, so its boxes are the ones the next h-step wakes. Over two estimate → refine →
+# adapted cycles on an immersed 8² order-2 B-spline ladder of depth 2, the merge took the fits from 309 (shared) to 236,
+# every `adapted` refitting nothing; a copy alone took them to 326, because the next `adapted` then refitted the twin's
+# boxes. The price is that `model`'s caches carry one twin plan's boxes beyond its own until its next plan build evicts
+# them.
+#
+# It is a function rather than a branch of `estimate` for compile time: `space` is built at run time and is not
+# concretely typed there, so this call is dispatched at run time, and the copy and the merge are code-generated only
+# when a twin is first estimated, never for a stack without one. Inference still reads its body, for the abstract
+# signature, when `estimate` itself is first compiled, whatever the stack.
+function _twinned_model(model::Model, space::Space, twinned::Vector{Int})
+    caches = copy.(model.moment_fit_caches)
+    plus = _derived(model, space; options=merge(model.plan_options, (; prune_exempt=twinned)), caches,
+                    point_base=_FOREIGN_POINTS)
+    foreach(merge!, model.moment_fit_caches, caches)
+    return plus
+end
+
+# The cells of one level that carry an approximation. `cell_dofs` answers with an empty vector on a dormant cell, so
+# restricting the estimator's two sweeps to these changes no result — only how much of a level has to be walked to find
+# that out. That is the point on a ladder, where a level holds N^D cells however few are switched on: a depth-5 3D chain
+# over a 4³ base declares 2 097 152 of them on its finest level. The mask scan is one pass over a `BitArray`, cheap
+# against a dof lookup per declared cell: `cell_dofs` allocates nothing, since it returns the layout's own vector, but
+# it is still a table read per cell, and on such a level almost every one of them comes back empty. `estimate` builds
+# the list once per level and walks it in both sweeps.
+#
+# The list has one of two shapes, the lazy grid of an unmasked level or the vector of a masked one, and `_LiveCells`
+# names the pair. `estimate` holds its lists in a vector of that `Union`, so a cell drawn from one is a concrete
+# `CartesianIndex` and the per-cell loop splits on the two shapes, where the alternative, one shape for both, would
+# materialise every cell of an unmasked level.
+const _LiveCells{D} = Union{CartesianIndices{D,NTuple{D,Base.OneTo{Int}}},Vector{CartesianIndex{D}}}
+
+function _live_cells(level::Level)
+    level.mask === nothing ? cell_indices(level.mesh) : CartesianIndices(level.mask.on)[level.mask.on]
+end
+
+# ── Dörfler marking ───────────────────────────────────────────────────────────
+
 """
     mark_cells(estimate::ErrorEstimate; theta = 0.5) -> Vector{Tuple{Int,CartesianIndex{D}}}
 
@@ -729,95 +667,6 @@ const _GAMMA_H = 2.0
 # scored by the indicator the earlier one carried.
 const _History{D,T} = Tuple{Space{D,T},ErrorEstimate{D,T}}
 
-# The h-rate ρ^{q/D} between two cells of consecutive levels, from the boxes themselves rather than from an assumed
-# bisection: ρ is the volume ratio, so ρ^{1/D} is the mesh size the h^p law of the energy norm refers to. See the note
-# above for why a scalar rate on an anisotropic split is a judgement.
-_h_rate(fine::AxisBox, coarse::AxisBox, q::Int, ::Val{D}) where {D} = (volume(fine) / volume(coarse))^(q / D)
-
-# The indicator this cell was predicted to have by now, read off what happened to it between `previous` and `V`. Nothing
-# is stored between cycles: the previous space and its estimate say what was done, because a p-step shows up as a raised
-# order, an h-step as a cell that was not active before, and an h-release as a cover that was live before and is not
-# now.
-#
-# Every question here is per cell and has an O(1) accessor: `cell_order` reads one palette entry, `is_active` one mask
-# bit, `_cell_block` resolves the stack by binary search. None of them is memoised, and none should be — a cache keyed
-# by level materialises `cell_orders(…; level=k)`, a dense `Array{NTuple{D,Int},D}` over the whole level, to answer a
-# question about the handful of cells a cycle marks. On the tanh ladder's finest level — 192² cells — that is a measured
-# 589 872 bytes per copy to read a few dozen entries.
-function _predicted(V::Space{D,T}, previous::_History{D,T}, k::Integer, cell::CartesianIndex{D}) where {D,T}
-    Vprev, eprev = previous
-    k <= length(Vprev.levels) || return T(Inf)
-    q = minimum(cell_order(V.levels[k], cell))
-
-    if !is_active(Vprev.levels[k].mask, cell)
-        # Newly activated, so it is the child of an h-step one level up. The parent is the overlapping cell of level k−1
-        # that carried the most error; on a nested stack there is exactly one.
-        k == 1 && return T(Inf)
-        η = zero(T)
-        parent = nothing
-        for par in _cell_block(Vprev, k, k - 1, cell)
-            eprev.cells[k - 1][par] > η || continue
-            η, parent = eprev.cells[k - 1][par], par
-        end
-        parent === nothing && return T(Inf)              # no parent carried any error
-        n = length(_cell_block(Vprev, k - 1, k, parent))
-        rate = _h_rate(cell_box(V, cell; level=k), cell_box(Vprev, parent; level=k - 1), q, Val(D))
-        return η * T(_GAMMA_H) * T(rate) * T(_GAMMA_P)^(q - minimum(cell_order(Vprev.levels[k - 1], parent))) /
-               sqrt(T(max(n, 1)))
-    end
-
-    # The h-coarsening row, which is read before the cell's own history because its evidence is the children's error,
-    # not the parent's. `decide` reaches this only for a leaf of `V`, so a cover that was live in `Vprev` and is not now
-    # is exactly an h-release, and the cell is predicted to get worse by the reciprocal of what the subdivision was
-    # worth — the children's error, ℓ²-combined and scaled to this cell's current order, undone by the rate the h-step
-    # was credited with. Without it a released parent falls through the equality test below, takes the no-evidence row
-    # and buys p on sight, which is the oscillation the release was trying to avoid; the p-release row exists for the
-    # same reason.
-    if k < length(V.levels) && k < length(Vprev.levels)
-        block = _cell_block(Vprev, k, k + 1, cell)
-        released = zero(T)
-        for ch in block
-            (is_active(Vprev.levels[k + 1].mask, ch) && !is_active(V.levels[k + 1].mask, ch)) || continue
-            released += (eprev.cells[k + 1][ch] * T(_GAMMA_P)^(q - minimum(cell_order(Vprev.levels[k + 1], ch))))^2
-        end
-        if released > 0
-            rate = _h_rate(cell_box(Vprev, first(block); level=k + 1), cell_box(Vprev, cell; level=k), q, Val(D))
-            return sqrt(released) / (T(_GAMMA_H) * T(rate))
-        end
-    end
-
-    # Equal orders mean nothing was applied here, so there is no evidence and the caller takes p. A LOWERED order is
-    # evidence, and of the opposite sign: the exponent goes negative, γ_p^(negative) exceeds one, and the cell is
-    # predicted to get WORSE by the reciprocal of what the degree was worth. That is Melenk & Wohlmuth's coarsening row
-    # for p, and without it a p-released cell falls through the equality branch and takes p again on sight.
-    η = eprev.cells[k][cell]
-    η > 0 || return T(Inf)
-    q_prev = minimum(cell_order(Vprev.levels[k], cell))
-    q == q_prev && return T(Inf)
-    return η * T(_GAMMA_P)^(q - q_prev)
-end
-
-# A `(level, cell)` mark against the space it names. Both halves are checked here, because the alternative is a
-# `BoundsError` raised from inside the prediction or the order field, naming an array the caller never handed over.
-function _check_mark(V::Space{D}, k::Integer, cell::CartesianIndex{D}, verb::AbstractString) where {D}
-    k = _check_level(V, k, "$verb: marked level")
-    checkbounds(Bool, CartesianIndices(V.levels[k].mesh.cells), cell) ||
-        throw(ArgumentError("$verb: marked cell $cell is outside level $k's cell grid " * "$(V.levels[k].mesh.cells)"))
-    return k
-end
-
-# An `ErrorEstimate` is indexed by the cell indices of the space it is read against, from the first line of `decide`
-# onward. A mismatched one is otherwise a `BoundsError` from deep inside the prediction or — where two levels happen to
-# agree in shape — a silently misattributed score, so both arguments are checked once, here, against the space each
-# belongs to.
-function _check_estimate(V::Space{D,T}, est::ErrorEstimate{D,T}, name::AbstractString) where {D,T}
-    shapes = [level.mesh.cells for level in V.levels]
-    map(size, est.cells) == shapes ||
-        throw(DimensionMismatch("$name holds indicators shaped $(map(size, est.cells)), but this " *
-                                "space's levels have cells $shapes"))
-    return est
-end
-
 """
     decide(V::Space, estimate::ErrorEstimate, marked; pmax = 8, previous = nothing) -> (h, p)
 
@@ -883,74 +732,162 @@ function decide(V::Space{D,T}, estimate::ErrorEstimate{D,T}, marked; pmax::Integ
     return h, p
 end
 
-# ── One pending edit of the stack ─────────────────────────────────────────────
+# An `ErrorEstimate` is indexed by the cell indices of the space it is read against, from the first line of `decide`
+# onward. A mismatched one is otherwise a `BoundsError` from deep inside the prediction or — where two levels happen to
+# agree in shape — a silently misattributed score, so both arguments are checked once, here, against the space each
+# belongs to.
+function _check_estimate(V::Space{D,T}, est::ErrorEstimate{D,T}, name::AbstractString) where {D,T}
+    shapes = [level.mesh.cells for level in V.levels]
+    map(size, est.cells) == shapes ||
+        throw(DimensionMismatch("$name holds indicators shaped $(map(size, est.cells)), but this " *
+                                "space's levels have cells $shapes"))
+    return est
+end
+
+# A `(level, cell)` mark against the space it names. Both halves are checked here, because the alternative is a
+# `BoundsError` raised from inside the prediction or the order field, naming an array the caller never handed over.
+function _check_mark(V::Space{D}, k::Integer, cell::CartesianIndex{D}, verb::AbstractString) where {D}
+    k = _check_level(V, k, "$verb: marked level")
+    checkbounds(Bool, CartesianIndices(V.levels[k].mesh.cells), cell) ||
+        throw(ArgumentError("$verb: marked cell $cell is outside level $k's cell grid " * "$(V.levels[k].mesh.cells)"))
+    return k
+end
+
+# The indicator this cell was predicted to have by now, read off what happened to it between `previous` and `V`. Nothing
+# is stored between cycles: the previous space and its estimate say what was done, because a p-step shows up as a raised
+# order, an h-step as a cell that was not active before, and an h-release as a cover that was live before and is not
+# now.
 #
-# What one `refine` or `coarsen` call writes, held until the call ends and applied in one pass. Both verbs write a level
-# from two sides — the order steps of its own cells, and the mask bits and inherited orders of the children a coarser
-# mark wakes or releases — so the writes are collected per level and each level that ends up changed is rebuilt ONCE,
-# with its final mask and orders together. Composing `adapt` and `elevate` instead rebuilds a level whose mask and
-# orders both moved twice, and needs dense copies of every touched level's mask and order field just to tell whether
-# anything moved.
-#
-# The two kinds of write are stored as they are shaped. A mask write is dense — a support dilation sets a whole collar —
-# so a level's mask is copied on its first write and edited in place. An order write is sparse — a handful of cells per
-# mark — so orders are a per-level dictionary of the cells written, and no dense order field exists unless an edit
-# survives to `_apply`.
-struct _StackEdit{D,S<:Space{D}}
-    space::S
-    masks::Vector{Union{Nothing,BitArray{D}}}
-    orders::Vector{Union{Nothing,Dict{CartesianIndex{D},NTuple{D,Int}}}}
-end
+# Every question here is per cell and has an O(1) accessor: `cell_order` reads one palette entry, `is_active` one mask
+# bit, `_cell_block` resolves the stack by binary search. None of them is memoised, and none should be — a cache keyed
+# by level materialises `cell_orders(…; level=k)`, a dense `Array{NTuple{D,Int},D}` over the whole level, to answer a
+# question about the handful of cells a cycle marks. On the tanh ladder's finest level — 192² cells — that is a measured
+# 589 872 bytes per copy to read a few dozen entries.
+function _predicted(V::Space{D,T}, previous::_History{D,T}, k::Integer, cell::CartesianIndex{D}) where {D,T}
+    Vprev, eprev = previous
+    k <= length(Vprev.levels) || return T(Inf)
+    q = minimum(cell_order(V.levels[k], cell))
 
-function _StackEdit(V::Space{D}) where {D}
-    n = length(V.levels)
-    return _StackEdit{D,typeof(V)}(V, Vector{Union{Nothing,BitArray{D}}}(nothing, n),
-                                   Vector{Union{Nothing,Dict{CartesianIndex{D},NTuple{D,Int}}}}(nothing, n))
-end
-
-# Level k's edited mask, copied from the space on first use.
-function _mask!(e::_StackEdit, k::Integer)
-    m = e.masks[k]
-    return m === nothing ? (e.masks[k] = active_cells(e.space; level=k)) : m
-end
-
-# Record an order write. A family without a per-cell order has none to write — a B-spline level's degree belongs to a
-# whole-axis knot vector, and no step may change it — so the write is dropped here, once, rather than guarded at every
-# site that writes: the p-step, the order step an h-mark turns into, and the order a woken or released child is given.
-function _set_order!(e::_StackEdit{D}, k::Integer, c::CartesianIndex{D}, o::NTuple{D,Int}) where {D}
-    _supports_cell_order(e.space.levels[k].basis) || return e
-    written = e.orders[k]
-    written === nothing && (written = e.orders[k] = Dict{CartesianIndex{D},NTuple{D,Int}}())
-    written[c] = o
-    return e
-end
-
-# The edit as a space. Writes that left a level as it was are dropped first — a mask equal to the level's own, an order
-# equal to the cell's own — and each level that still differs is rebuilt once. When none does the input space comes
-# back ITSELF, `===`, which is the exhaustion signal `refine` documents: a call that only re-wrote what was there — a
-# release of a cover that was not live, an order step at the cap, a wake of a cover already live — must not hand back a
-# fresh copy, or a saturated loop rebuilds an identical model for ever.
-#
-# The rebuild is the one `adapt` followed by `elevate` produces. A mask-only change goes through `_level`, as `adapt`'s
-# does; an order change goes through `_new_level` with the written cells normalised exactly as `elevate`'s pair form
-# normalises them, carrying the final mask. Only a family with a per-cell order carries order writes, and integrated
-# Legendre instantiates to itself, so building from the input level rather than from an intermediate re-masked copy
-# changes nothing but the count of rebuilds.
-function _apply(e::_StackEdit)
-    V = out = e.space
-    for k in eachindex(V.levels)
-        old, m = V.levels[k], e.masks[k]
-        m !== nothing && (old.mask === nothing ? all(m) : m == old.mask.on) && (m = nothing)
-        changed = [c => o for (c, o) in something(e.orders[k], ()) if o != cell_order(old, c)]
-        m === nothing && isempty(changed) && continue
-        mask = m === nothing ? old.mask : _collapse_mask(m)
-        level = isempty(changed) ? _level(old; mask) :
-                _new_level(old.id, old.role, old.mesh, old.basis,
-                           _normalize_order(_pair_orders(V, k, changed), old.mesh), old.mode, mask)
-        out = _with_level(out, k, level)
+    if !is_active(Vprev.levels[k].mask, cell)
+        # Newly activated, so it is the child of an h-step one level up. The parent is the overlapping cell of level k−1
+        # that carried the most error; on a nested stack there is exactly one.
+        k == 1 && return T(Inf)
+        η = zero(T)
+        parent = nothing
+        for par in _cell_block(Vprev, k, k - 1, cell)
+            eprev.cells[k - 1][par] > η || continue
+            η, parent = eprev.cells[k - 1][par], par
+        end
+        parent === nothing && return T(Inf)              # no parent carried any error
+        n = length(_cell_block(Vprev, k - 1, k, parent))
+        rate = _h_rate(cell_box(V, cell; level=k), cell_box(Vprev, parent; level=k - 1), q, Val(D))
+        return η * T(_GAMMA_H) * T(rate) * T(_GAMMA_P)^(q - minimum(cell_order(Vprev.levels[k - 1], parent))) /
+               sqrt(T(max(n, 1)))
     end
-    return out
+
+    # The h-coarsening row, which is read before the cell's own history because its evidence is the children's error,
+    # not the parent's. `decide` reaches this only for a leaf of `V`, so a cover that was live in `Vprev` and is not now
+    # is exactly an h-release, and the cell is predicted to get worse by the reciprocal of what the subdivision was
+    # worth — the children's error, ℓ²-combined and scaled to this cell's current order, undone by the rate the h-step
+    # was credited with. Without it a released parent falls through the equality test below, takes the no-evidence row
+    # and buys p on sight, which is the oscillation the release was trying to avoid; the p-release row exists for the
+    # same reason.
+    if k < length(V.levels) && k < length(Vprev.levels)
+        block = _cell_block(Vprev, k, k + 1, cell)
+        released = zero(T)
+        for ch in block
+            (is_active(Vprev.levels[k + 1].mask, ch) && !is_active(V.levels[k + 1].mask, ch)) || continue
+            released += (eprev.cells[k + 1][ch] * T(_GAMMA_P)^(q - minimum(cell_order(Vprev.levels[k + 1], ch))))^2
+        end
+        if released > 0
+            rate = _h_rate(cell_box(Vprev, first(block); level=k + 1), cell_box(Vprev, cell; level=k), q, Val(D))
+            return sqrt(released) / (T(_GAMMA_H) * T(rate))
+        end
+    end
+
+    # Equal orders mean nothing was applied here, so there is no evidence and the caller takes p. A LOWERED order is
+    # evidence, and of the opposite sign: the exponent goes negative, γ_p^(negative) exceeds one, and the cell is
+    # predicted to get WORSE by the reciprocal of what the degree was worth. That is Melenk & Wohlmuth's coarsening row
+    # for p, and without it a p-released cell falls through the equality branch and takes p again on sight.
+    η = eprev.cells[k][cell]
+    η > 0 || return T(Inf)
+    q_prev = minimum(cell_order(Vprev.levels[k], cell))
+    q == q_prev && return T(Inf)
+    return η * T(_GAMMA_P)^(q - q_prev)
 end
+
+# The h-rate ρ^{q/D} between two cells of consecutive levels, from the boxes themselves rather than from an assumed
+# bisection: ρ is the volume ratio, so ρ^{1/D} is the mesh size the h^p law of the energy norm refers to. See the note
+# above for why a scalar rate on an anisotropic split is a judgement.
+_h_rate(fine::AxisBox, coarse::AxisBox, q::Int, ::Val{D}) where {D} = (volume(fine) / volume(coarse))^(q / D)
+
+# ── Reading the stack under one cell ──────────────────────────────────────────
+#
+# Every question below is asked once per marked cell and is answered from the per-axis block `_cell_block`
+# (`src/ladder.jl`) resolves by binary search, never from `overlapping_cells`, which builds a mask over the whole target
+# level. On a depth-3 3D ladder that is 0.29 µs against 7.65 ms per mark, and a cycle marks hundreds of them.
+#
+# A cell is a leaf when no finer level has taken any of it over. The distinction is the whole reason the p-step needs
+# guarding: leaf semantics shed a covered cell's bubble modes, so raising the order of a non-leaf cell adds nothing that
+# survives the dof walk. `refine` sends such a cell to h instead.
+#
+# EVERY finer level is asked, not only the one immediately below. The dof layer's covering rule tests each higher-id
+# level in turn (`build_coverage` in `src/coverage.jl`), so on a stack where level k+2 is live over a cell while k+1 is
+# dormant — a structure `ladder` admits by design and one `adapt` call builds — the cell is covered and its bubbles are
+# shed. Asking k+1 alone called such a cell a leaf, sent it to p, and the order step it was given then vanished in the
+# dof walk: a mark spent on nothing, every cycle, for as long as the skip lasted.
+#
+# "Any active cell of a finer level overlaps this one" rather than "fully covered" is deliberately the conservative side
+# of the question: a partly covered cell does keep its bubbles, but it is also a cell the stack is already in the middle
+# of taking over, and spending a p-step there is at best premature.
+
+# Which levels hold an active cell at all, as one `Bool` per level. A verb builds this once and both tests below skip a
+# dormant level without touching the geometry — which on a declared-but-empty ladder is every level under the mark, and
+# is the common case. Measured on a depth-3 3D ladder with empty overlays, the leaf test on a base cell falls from 6.19
+# µs to 0.05 µs; its worst case — a live 64³ level that does not reach the marked cell, so the whole block is read and
+# none of it is live — is 4.5 µs.
+_live_levels(V::Space) = [level.mask === nothing || any(level.mask.on) for level in V.levels]
+
+function _is_leaf(V::Space{D}, k::Integer, cell::CartesianIndex{D}, live=_live_levels(V)) where {D}
+    for j in (k+1):length(V.levels)
+        live[j] || continue
+        mask = V.levels[j].mask
+        for c in _cell_block(V, k, j, cell)
+            is_active(mask, c) && return false
+        end
+    end
+    return true
+end
+
+# The block of level k+1 under cell `c` of level k: what an h-step on (k, c) wakes, and what a release of it puts back
+# to sleep. It is empty on the finest level and wherever level k+1's box does not reach the cell, and every reader takes
+# an empty block to mean the same thing — there is no h-step here: `_has_h_step` offers none, `refine` turns the mark
+# into the order step, and `coarsen` has nothing to release. The empty block has `_cell_block`'s own type, so the
+# answer stays concrete.
+function _children(V::Space{D}, k::Integer, c::CartesianIndex{D}) where {D}
+    k < length(V.levels) || return CartesianIndices(ntuple(_ -> 1:0, D))
+    return _cell_block(V, k, k + 1, c)
+end
+
+# Whether an h-step on this cell would buy anything: level k+1 must exist, its box must reach the cell, and the block
+# must hold a cell that is both dormant and a leaf.
+#
+# The three conditions are what makes the h-step total on an arbitrary stack, and each rules out a mark that would
+# otherwise be re-issued every cycle for nothing. A level below that does not reach the cell — a sub-box overlay, or two
+# overlays over different regions — offers no h-step, exactly as the finest level offers none, so both fall under one
+# rule rather than a level-count test. A block already fully live offers none either: the step would set no mask bit.
+# And a dormant cell that a *deeper* level has already taken over is dof-inert to activate, because the same covering
+# rule that sheds the marked cell's bubbles sheds its would-be child's: measured on a depth-2 ladder with level 3 live
+# over a base cell and level 2 empty, activating level 2 under it moved the active unknowns by exactly zero, 97 before
+# and 97 after.
+function _has_h_step(V::Space{D}, k::Integer, cell::CartesianIndex{D}, live=_live_levels(V)) where {D}
+    children = _children(V, k, cell)
+    isempty(children) && return false
+    mask = V.levels[k + 1].mask
+    return any(c -> !is_active(mask, c) && _is_leaf(V, k + 1, c, live), children)
+end
+
+# ── Refinement and release ────────────────────────────────────────────────────
 
 """
     refine(V::Space, estimate::ErrorEstimate; theta = 0.5, pmax = 8, previous = nothing) -> Space
@@ -1253,4 +1190,73 @@ function coarsen(V::Space{D,T}; h=(), p=(), pmin::Integer=1) where {D,T}
         end
     end
     return _apply(edit)
+end
+
+# ── One pending edit of the stack ─────────────────────────────────────────────
+#
+# What one `refine` or `coarsen` call writes, held until the call ends and applied in one pass. Both verbs write a level
+# from two sides — the order steps of its own cells, and the mask bits and inherited orders of the children a coarser
+# mark wakes or releases — so the writes are collected per level and each level that ends up changed is rebuilt ONCE,
+# with its final mask and orders together. Composing `adapt` and `elevate` instead rebuilds a level whose mask and
+# orders both moved twice, and needs dense copies of every touched level's mask and order field just to tell whether
+# anything moved.
+#
+# The two kinds of write are stored as they are shaped. A mask write is dense — a support dilation sets a whole collar —
+# so a level's mask is copied on its first write and edited in place. An order write is sparse — a handful of cells per
+# mark — so orders are a per-level dictionary of the cells written, and no dense order field exists unless an edit
+# survives to `_apply`.
+struct _StackEdit{D,S<:Space{D}}
+    space::S
+    masks::Vector{Union{Nothing,BitArray{D}}}
+    orders::Vector{Union{Nothing,Dict{CartesianIndex{D},NTuple{D,Int}}}}
+end
+
+function _StackEdit(V::Space{D}) where {D}
+    n = length(V.levels)
+    return _StackEdit{D,typeof(V)}(V, Vector{Union{Nothing,BitArray{D}}}(nothing, n),
+                                   Vector{Union{Nothing,Dict{CartesianIndex{D},NTuple{D,Int}}}}(nothing, n))
+end
+
+# Level k's edited mask, copied from the space on first use.
+function _mask!(e::_StackEdit, k::Integer)
+    m = e.masks[k]
+    return m === nothing ? (e.masks[k] = active_cells(e.space; level=k)) : m
+end
+
+# Record an order write. A family without a per-cell order has none to write — a B-spline level's degree belongs to a
+# whole-axis knot vector, and no step may change it — so the write is dropped here, once, rather than guarded at every
+# site that writes: the p-step, the order step an h-mark turns into, and the order a woken or released child is given.
+function _set_order!(e::_StackEdit{D}, k::Integer, c::CartesianIndex{D}, o::NTuple{D,Int}) where {D}
+    _supports_cell_order(e.space.levels[k].basis) || return e
+    written = e.orders[k]
+    written === nothing && (written = e.orders[k] = Dict{CartesianIndex{D},NTuple{D,Int}}())
+    written[c] = o
+    return e
+end
+
+# The edit as a space. Writes that left a level as it was are dropped first — a mask equal to the level's own, an order
+# equal to the cell's own — and each level that still differs is rebuilt once. When none does the input space comes
+# back ITSELF, `===`, which is the exhaustion signal `refine` documents: a call that only re-wrote what was there — a
+# release of a cover that was not live, an order step at the cap, a wake of a cover already live — must not hand back a
+# fresh copy, or a saturated loop rebuilds an identical model for ever.
+#
+# The rebuild is the one `adapt` followed by `elevate` produces. A mask-only change goes through `_level`, as `adapt`'s
+# does; an order change goes through `_new_level` with the written cells normalised exactly as `elevate`'s pair form
+# normalises them, carrying the final mask. Only a family with a per-cell order carries order writes, and integrated
+# Legendre instantiates to itself, so building from the input level rather than from an intermediate re-masked copy
+# changes nothing but the count of rebuilds.
+function _apply(e::_StackEdit)
+    V = out = e.space
+    for k in eachindex(V.levels)
+        old, m = V.levels[k], e.masks[k]
+        m !== nothing && (old.mask === nothing ? all(m) : m == old.mask.on) && (m = nothing)
+        changed = [c => o for (c, o) in something(e.orders[k], ()) if o != cell_order(old, c)]
+        m === nothing && isempty(changed) && continue
+        mask = m === nothing ? old.mask : _collapse_mask(m)
+        level = isempty(changed) ? _level(old; mask) :
+                _new_level(old.id, old.role, old.mesh, old.basis,
+                           _normalize_order(_pair_orders(V, k, changed), old.mesh), old.mode, mask)
+        out = _with_level(out, k, level)
+    end
+    return out
 end
