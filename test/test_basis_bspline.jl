@@ -648,6 +648,48 @@ end
     @test_throws BoundsError Unfitted.physical_basis_gradients(level, CartesianIndex(9), box((0.0,), (1.0,)), ξ)
 end
 
+@testset "BSpline extension: derivative tables against finite differences and the derivative space" begin
+    # The kernel maps ξ ∈ [−1, 1] onto the cell's knot interval, read off the knot vector, fills the values there and,
+    # when asked, the t-derivatives of the derivative space scaled by the half-width into ξ-derivatives. Checked on an
+    # off-origin mesh whose cell widths are not dyadic, in 1D and in 2D with anisotropic degrees, on the first, an
+    # interior and the last cell of every axis:
+    #   * the derivative tables are the central finite differences of the value tables in ξ;
+    #   * both tables are BasicBSpline's own `bsplinebasisall` of the space and of `BSplineDerivativeSpace{1}` at the
+    #     parameter mapped from the level's mesh nodes, the derivatives times the half-width;
+    #   * the values-only call (`der1d === nothing`) fills the same value tables.
+    h = 1.0e-6
+    for (lower, upper, cells, order) in (((-0.3,), (1.45,), (6,), (3,)), ((-0.3, 0.2), (1.45, 0.9), (6, 5), (2, 3)))
+        D = length(order)
+        level = space(box(lower, upper); cells, order, basis=bspline()).levels[1]
+        family = level.basis
+        tables() = Unfitted._factor_buffers(order, Float64)
+        for cell in (CartesianIndex(ntuple(_ -> 1, D)), CartesianIndex(ntuple(_ -> 3, D)), CartesianIndex(cells)),
+            ξ in (SVector{D}(ntuple(d -> -0.8 + 0.1d, D)), SVector{D}(ntuple(d -> 0.35 - 0.2d, D)),
+                  SVector{D}(ntuple(_ -> 0.9, D)))
+
+            val1d, der1d, values_only = tables(), tables(), tables()
+            Unfitted._fill_factor_tables!(family, val1d, der1d, order, ξ, cell)
+            Unfitted._fill_factor_tables!(family, values_only, nothing, order, ξ, cell)
+            @test values_only == val1d
+            for d in 1:D
+                plus, minus = tables(), tables()
+                Unfitted._fill_factor_tables!(family, plus, nothing, order,
+                                              SVector{D}(ntuple(e -> ξ[e] + (e == d) * h, D)), cell)
+                Unfitted._fill_factor_tables!(family, minus, nothing, order,
+                                              SVector{D}(ntuple(e -> ξ[e] - (e == d) * h, D)), cell)
+                @test der1d[d] ≈ (plus[d] .- minus[d]) ./ (2h) rtol = 1.0e-7 atol = 1.0e-8
+
+                a, b = level.mesh.axes[d][cell[d]], level.mesh.axes[d][cell[d] + 1]
+                t = a + (ξ[d] + 1) * (b - a) / 2
+                P = family.spaces[d]
+                @test val1d[d] ≈ collect(bsplinebasisall(P, cell[d], t)) rtol = 1.0e-13
+                derivative = collect(bsplinebasisall(BSplineDerivativeSpace{1}(P), cell[d], t))
+                @test der1d[d] ≈ derivative .* ((b - a) / 2) rtol = 1.0e-13
+            end
+        end
+    end
+end
+
 @testset "BSpline extension: dof-key sharing across cells" begin
     # Two adjacent cells of the same level should share p = degree raw dofs along the shared axis.
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=3, basis=bspline())
@@ -1228,20 +1270,25 @@ end
 
 @testset "BSpline extension: moved overlay rebuilds knot vectors" begin
     # Moving a B-spline overlay must rebuild its per-axis knot vectors for the overlay's new cell coordinates — reusing
-    # the stale family would leave `axis_coords` / `cell_to_span` pointing at the old position and corrupt every basis
-    # evaluation on the moved level. Regression for the `instantiate_basis` hook on `moved_space`.
+    # the stale family would leave the knots, which the kernel reads each cell's parameter interval from, at the old
+    # position and corrupt every basis evaluation on the moved level. Regression for the `instantiate_basis` hook on
+    # `moved_space`. Between the `p + 1`-fold clamped ends the knots are the level's own mesh nodes.
     V = space(box((0.0,), (1.0,)); cells=8, order=3)
     V = overlay(V, box((0.2,), (0.6,)); cells=4, order=3, basis=bspline())
     fam_before = V.levels[2].basis
     @test fam_before isa Unfitted.BasisFamily
-    @test fam_before.axis_coords[1][1] ≈ 0.2
-    @test fam_before.axis_coords[1][end] ≈ 0.6
+    knots_before = collect(BasicBSpline.knotvector(fam_before.spaces[1]))
+    @test knots_before[1] ≈ 0.2
+    @test knots_before[end] ≈ 0.6
+    @test knots_before[4:(end-3)] == V.levels[2].mesh.axes[1]
 
     V2 = moved_space(V; level=2, to=box((0.3,), (0.7,)))
     fam_after = V2.levels[2].basis
     @test fam_after isa typeof(fam_before)
-    @test fam_after.axis_coords[1][1] ≈ 0.3
-    @test fam_after.axis_coords[1][end] ≈ 0.7
+    knots_after = collect(BasicBSpline.knotvector(fam_after.spaces[1]))
+    @test knots_after[1] ≈ 0.3
+    @test knots_after[end] ≈ 0.7
+    @test knots_after[4:(end-3)] == V2.levels[2].mesh.axes[1]
     # Cell count and degree are unchanged, so dim = cells + p still holds.
     @test BasicBSpline.dim(fam_after.spaces[1]) == 4 + 3
 

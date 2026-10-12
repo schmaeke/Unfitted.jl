@@ -41,7 +41,7 @@ cell-local mode index is mapped to its global 1D function index via the `_AXIS_B
 
 # What this extension installs
 
-  - `BSplineFamily{D,T,…}` (a `BasisFamily` subtype) plus a deferred `_BSplineSpec` returned by the public
+  - `BSplineFamily{D,S}` (a `BasisFamily` subtype) plus a deferred `_BSplineSpec` returned by the public
     [`bspline`](@ref) factory. The deferred form lives only between `bspline(...)` and the [`instantiate_basis`](@ref)
     hook, which materialises the per-axis `BSplineSpace`s once the mesh axes are known. The knot vectors depend on the
     mesh alone — never on the mask, whose faces are handled by the selection and the constraints described below.
@@ -94,7 +94,7 @@ using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, AxisDofKe
                 _LevelContext, _eliminate!, _constrain!, _pivot!, is_active, AxisBox, _check_basis_mode,
                 _level_side_is_physical, _tensor_dof_key, _Fold, _is_fictitious, _is_void
 using StaticArrays: SVector
-using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim
+using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim, knotvector
 
 # ── Public factory and deferred spec ──────────────────────────────────────────
 
@@ -247,7 +247,7 @@ end
 # ── BSplineFamily struct and accessors ────────────────────────────────────────
 
 """
-    BSplineFamily{D,T,S,DS}
+    BSplineFamily{D,S}
 
 Open-knot tensor-product B-spline basis family.
 
@@ -255,14 +255,6 @@ Fields:
 
   - `spaces::S` — `D`-tuple of `BasicBSpline.BSplineSpace` objects, one per axis. Built from the level's mesh axes as
     clamped open uniform knot vectors (interior knot multiplicity 1, `C^{p − 1}`).
-  - `derivative_spaces::DS` — `D`-tuple of `BSplineDerivativeSpace{1, _}` objects, one per axis, precomputed for the
-    derivative hot path so every quadrature point uses a stable type.
-  - `axis_coords::NTuple{D,Vector{T}}` — per-axis mesh cell-corner coordinates (a copy of `mesh.axes[d]`). Stored on the
-    family so the hot kernel can do the `ξ ∈ [−1, 1]` → `t` affine map without looking up the level.
-  - `cell_to_span::NTuple{D,Vector{Int}}` — per-axis map from a cell index `c ∈ 1:cells[d]` to the BasicBSpline span
-    index. With the uniform max-regularity knots used here it is the identity (`cell_to_span[d][c] = c`); it is kept as
-    an explicit field because it also doubles as the per-cell first global 1D function index —
-    `bsplinebasisall(P, span, t)` returns the functions with global indices `span, span + 1, …, span + p`.
   - `continuity::Int` — the smoothness the level was *asked* to carry across its own artificial boundary, as
     requested: an integer `0 ≤ m ≤ p_d − 1` or the [`_MAXIMAL_CONTINUITY`](@ref) sentinel for `C^{p_d − 1}` per axis.
     The mechanism is derived from it and the degrees by `_selects_by_support`, and the two mechanisms are different
@@ -273,14 +265,18 @@ Fields:
     mechanism because a rebuild at another degree must re-derive the mechanism from what was asked: `C²` at degree 3
     selects, at degree 4 it clamps.
 
+Everything else a hot loop or the dof layer needs is a function of these two fields and the level's mesh, so the family
+stores no copy of it. With uniform knots the knot span of cell `c` along axis `d` is `c` itself, so
+`bsplinebasisall(spaces[d], c, t)` returns the functions with global indices `c, c + 1, …, c + p_d` and a cell-local
+mode `m` is the global function `c + m`. The cell's parameter interval runs from `knotvector(spaces[d])[c + p_d]` to
+`knotvector(spaces[d])[c + p_d + 1]`, two of the mesh nodes the knot vector was built from. And the derivative space
+`BSplineDerivativeSpace{1}(spaces[d])` is a wrapper around the space that costs nothing to build at the point of use.
+
 Constructed automatically from a [`_BSplineSpec`](@ref) by the [`instantiate_basis`](@ref) hook in this extension —
 users do not build it directly.
 """
-struct BSplineFamily{D,T,S<:Tuple,DS<:Tuple} <: BasisFamily
+struct BSplineFamily{D,S<:Tuple} <: BasisFamily
     spaces::S
-    derivative_spaces::DS
-    axis_coords::NTuple{D,Vector{T}}
-    cell_to_span::NTuple{D,Vector{Int}}
     continuity::Int
 end
 
@@ -358,22 +354,12 @@ end
 
 # ── Knot-vector construction ──────────────────────────────────────────────────
 
-# Build the concrete `BSplineFamily` from a deferred `_BSplineSpec`, the mesh, and the per-axis polynomial degree.
-# Uniform knots only: the cell-to-span map is the identity (`cell_to_span[d][c] = c`), and
-# `dim(spaces[d]) = cells[d] + p[d]`.
-function _materialize(spec::_BSplineSpec, mesh::CartesianMesh{D,T}, p::NTuple{D,Int}) where {D,T}
-    m = spec.continuity
-    spaces = ntuple(D) do d
-        kv = _open_knot_vector(mesh.axes[d], p[d])
-        BSplineSpace{p[d]}(kv)
-    end
-    derivative_spaces = ntuple(d -> BSplineDerivativeSpace{1}(spaces[d]), D)
-    axis_coords = ntuple(d -> copy(mesh.axes[d]), D)
-    cell_to_span = ntuple(D) do d
-        collect(1:mesh.cells[d])  # uniform knots: span = cell index
-    end
-    return BSplineFamily{D,T,typeof(spaces),typeof(derivative_spaces)}(spaces, derivative_spaces, axis_coords,
-                                                                       cell_to_span, m)
+# Build the concrete `BSplineFamily` from a deferred `_BSplineSpec`, the mesh, and the per-axis polynomial degree: one
+# clamped open knot vector per axis on the mesh nodes, and the request carried on unchanged. Uniform knots only, so cell
+# `c` is span `c` and `dim(spaces[d]) = cells[d] + p[d]`.
+function _materialize(spec::_BSplineSpec, mesh::CartesianMesh{D}, p::NTuple{D,Int}) where {D}
+    spaces = ntuple(d -> BSplineSpace{p[d]}(_open_knot_vector(mesh.axes[d], p[d])), D)
+    return BSplineFamily{D,typeof(spaces)}(spaces, spec.continuity)
 end
 
 # Build a clamped open uniform knot vector for one axis from the mesh's per-axis coordinates and the requested degree
@@ -385,17 +371,17 @@ end
 # by `_overlay_constraints!` below — by support selection at maximal continuity, by trace-vanishing linear constraints
 # below it — *not* via knot multiplicity. This keeps the basis globally `C^{p − 1}` inside the active region regardless
 # of mask geometry.
-function _open_knot_vector(axis_coords::AbstractVector{T}, p::Integer) where {T<:Real}
+function _open_knot_vector(nodes::AbstractVector{T}, p::Integer) where {T<:Real}
     knots = T[]
-    sizehint!(knots, length(axis_coords) + 2 * p)
+    sizehint!(knots, length(nodes) + 2 * p)
     for _ in 1:(p+1)
-        push!(knots, axis_coords[1])
+        push!(knots, nodes[1])
     end
-    for i in 2:(length(axis_coords)-1)
-        push!(knots, axis_coords[i])
+    for i in 2:(length(nodes)-1)
+        push!(knots, nodes[i])
     end
     for _ in 1:(p+1)
-        push!(knots, axis_coords[end])
+        push!(knots, nodes[end])
     end
     return KnotVector(knots)
 end
@@ -428,44 +414,37 @@ end
 
 # ── Hot kernels: per-axis 1D B-spline value and derivative tables ─────────────
 
-# Affine reference-to-parameter map for axis `d` on cell `c`: ξ ∈ [−1, 1] ↦ t ∈
-# [axis_coords[d][c], axis_coords[d][c + 1]]. Returns `(t, half_width)` where `half_width = (t_upper − t_lower) / 2`.
-# Stored half-width is reused for the derivative-axis chain rule: a B-spline basis function `N_i(t)` satisfies
-# `dN/dξ = dN/dt · half_width`, so the reference-frame derivative the kernel needs to fill into `der1d[d]` already
-# includes that factor.
-@inline function _axis_parameter(family::BSplineFamily{D,T}, axis::Integer, cell::Integer, ξ::Real) where {D,T}
-    coords = family.axis_coords[axis]
-    t_lower = coords[cell]
-    t_upper = coords[cell + 1]
-    half_width = (t_upper - t_lower) / 2
-    t = t_lower + (ξ + one(ξ)) * half_width
-    return t, half_width
-end
-
 # Per-axis B-spline values into `val1d[d]` for one quadrature point and, unless `der1d === nothing`, reference-frame
 # derivatives into `der1d[d]`: the one factor-table method of this family (see the core's `_fill_factor_tables!` for
-# the contract). `bsplinebasisall(spaces[d], span, t)` returns the `p_d + 1` values on `span` as a stack-allocated
+# the contract). Cell `c` is knot span `c` (uniform knots; see `BSplineFamily`), and its parameter interval
+# `[t_c, t_{c+1}]` is read off the knot vector at positions `c + p` and `c + p + 1`, past the `p` extra copies of the
+# clamped first knot. The affine map `t = t_c + (ξ + 1) · w` with the half-width `w = (t_{c+1} − t_c) / 2` takes
+# `ξ ∈ [−1, 1]` onto it. `bsplinebasisall(P, c, t)` returns the `p_d + 1` values on the span as a stack-allocated
 # `SVector{p_d + 1}` — no allocation — and its entries are unrolled into the per-axis buffer. The raw `t`-derivatives
-# come from `bsplinebasisall(derivative_spaces[d], span, t)` (a fully unrolled `BSplineDerivativeSpace{1, …}` call) and
-# become `ξ`-derivatives by the factor `half_width`. The downstream tensor-product kernel multiplies by the assembly
-# loop's `scale[d] = 2 / edge_lengths[d]`; the two compose to `dN/dx = dN/dt · (h_d / 2) · (2 / h_d) = dN/dt`, the
-# physical derivative — the integrated-Legendre chain-rule convention.
-function Unfitted._fill_factor_tables!(family::BSplineFamily{D,T,S,DS}, val1d, der1d, order::NTuple{D,Int},
-                                       ξ::SVector{D,Tξ}, cell::CartesianIndex{D}) where {D,T,S,DS,Tξ}
+# come from the derivative space `BSplineDerivativeSpace{1}(P)`, a wrapper around `P` built at the point of use only
+# when derivatives are asked for, and become `ξ`-derivatives by the factor `w`. The downstream tensor-product kernel
+# multiplies by the assembly loop's `scale[d] = 2 / edge_lengths[d]`; the two compose to
+# `dN/dx = dN/dt · (h_d / 2) · (2 / h_d) = dN/dt`, the physical derivative — the integrated-Legendre chain-rule
+# convention.
+#
+# Reading the interval off the knot vector and wrapping the same `P` for the derivatives, rather than keeping a copy of
+# the mesh nodes and a stored derivative space on the family, also lets the compiler see that the value and derivative
+# recurrences read the same knots and share their loads and differences: the optimised code of this method has fewer
+# floating-point operations than it had with the copies (30 against 76 multiplications, divisions and subtractions on a
+# 3D degree-2 level), with every result bit for bit the same.
+function Unfitted._fill_factor_tables!(family::BSplineFamily{D}, val1d, der1d, order::NTuple{D,Int}, ξ::SVector{D},
+                                       cell::CartesianIndex{D}) where {D}
     @inbounds for d in 1:D
-        c = cell.I[d]
-        span = family.cell_to_span[d][c]
-        t, half_width = _axis_parameter(family, d, c, ξ[d])
-        values = bsplinebasisall(family.spaces[d], span, t)
-        vd = val1d[d]
+        P, c = family.spaces[d], cell.I[d]
+        knots, p = knotvector(P), degree(P)
+        half_width = (knots[c + p + 1] - knots[c + p]) / 2
+        t = knots[c + p] + (ξ[d] + one(ξ[d])) * half_width
+        values = bsplinebasisall(P, c, t)
+        derivs = der1d === nothing ? nothing : bsplinebasisall(BSplineDerivativeSpace{1}(P), c, t)
+        vd, dd = val1d[d], der1d === nothing ? nothing : der1d[d]
         for i in 1:(order[d]+1)
             vd[i] = values[i]
-        end
-        der1d === nothing && continue
-        derivs = bsplinebasisall(family.derivative_spaces[d], span, t)
-        dd = der1d[d]
-        for i in 1:(order[d]+1)
-            dd[i] = derivs[i] * half_width
+            dd === nothing || (dd[i] = derivs[i] * half_width)
         end
     end
     return nothing
@@ -478,18 +457,13 @@ end
 # with the family. Its value differs from the integrated-Legendre tags although nothing requires it to.
 const _AXIS_BSPLINE = UInt8(2)
 
+# The dof key of a cell-local tensor mode. On cell `c` the knot span is `c` (uniform knots, see `BSplineFamily`), and
+# `bsplinebasisall(P, c, t)` returns the functions with global indices `c, c + 1, …, c + p_d`, so the local 1D mode
+# `m ∈ 0:p_d` is the global 1D function `c + m`. That index names the function across the level, so adjacent cells
+# reuse the dof slot of every function they share through the `TensorDofKey` cache in `src/dofs.jl`.
 function Unfitted._tensor_dof_key(level::Level{D,T,<:BSplineFamily}, cell::CartesianIndex{D},
                                   local_id::CartesianIndex{D}) where {D,T}
-    family = level.basis
-    axes = ntuple(d -> _bspline_axis_dof_key(family, d, cell.I[d], local_id.I[d]), D)
-    return TensorDofKey{D}(level.id, axes)
-end
-
-# Build the per-axis dof key for the B-spline family. A cell-local 1D mode `m ∈ 0:p_d` on cell `c` maps to the global 1D
-# function index `cell_to_span[d][c] + m`; that index uniquely identifies the function across the level, so adjacent
-# cells naturally reuse the dof slot for every shared function through the `TensorDofKey` cache in `src/dofs.jl`.
-@inline function _bspline_axis_dof_key(family::BSplineFamily, axis::Integer, cell_axis::Integer, mode::Integer)
-    return AxisDofKey(_AXIS_BSPLINE, family.cell_to_span[axis][cell_axis] + mode, 0)
+    return TensorDofKey{D}(level.id, ntuple(d -> AxisDofKey(_AXIS_BSPLINE, cell.I[d] + local_id.I[d], 0), D))
 end
 
 # True iff the per-axis B-spline factor of `key` anchors at the level's lower or upper mesh edge along `axis`. Used by
@@ -727,8 +701,7 @@ function Unfitted._overlay_constraints!(ledger::EliminationLedger, level::Level{
             j == 0 && _level_side_is_physical(level, domain, d, :lower, tol) && continue
             j == n_cells[d] && _level_side_is_physical(level, domain, d, :upper, tol) && continue
 
-            t_star = j == 0 ? family.axis_coords[d][1] :
-                     j == n_cells[d] ? family.axis_coords[d][end] : family.axis_coords[d][j + 1]
+            t_star = level.mesh.axes[d][j + 1]    # the face's node: the lower box face at j = 0, the upper at j = n
 
             # Two possible spans (= active-cell axis-d index) per face: `j` if the lower-cell is active, `j+1` if the
             # upper is. Boundary faces have a single span (lower_span == upper_span). Precompute the `(p_d + 1)`-vectors
@@ -839,7 +812,7 @@ function _support_cells(key::TensorDofKey{D}, family::BSplineFamily{D}, n::NTupl
 end
 
 # The cells this level's axis-`d` 1D function with global index `i` is supported on. Cell `c` carries the global indices
-# `c … c + p` (uniform knots, `cell_to_span` the identity), so function `i` lives on `max(1, i − p) … min(ncells, i)` —
+# `c … c + p` (uniform knots: cell `c` is span `c`), so function `i` lives on `max(1, i − p) … min(ncells, i)` —
 # up to `p + 1` cells. The core's `_axis_incidence` cannot answer this: it is written for the integrated-Legendre node /
 # span keys and reports a single cell for any other tag.
 @inline _axis_support(i::Integer, p::Integer, ncells::Integer) = max(1, i-p):min(ncells, i)
