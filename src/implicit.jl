@@ -18,7 +18,12 @@
 #     integration on implicit domains by means of moment-fitting", Int. J.
 #     Numer. Methods Engng. 96 (2013) 512–528, doi:10.1002/nme.4569.
 #
-#   This is a clean-room pure-Julia implementation written from the method description, not a port of any specific
+#   Fiber roots are found by the Illinois variant of regula falsi,
+#
+#     M. Dowell, P. Jarratt, "A modified regula falsi method for computing the
+#     root of an equation", BIT 11 (1971) 168–174, doi:10.1007/BF01934364.
+#
+#   This is a clean-room pure-Julia implementation written from the method descriptions, not a port of any specific
 #   codebase.
 #
 # What it produces
@@ -96,22 +101,45 @@ end
 
 # ── 1D safeguarded root finding ────────────────────────────────────────────────
 
-# Bisection of `f` on a bracket `[a, b]` with `f(a)`, `f(b)` of opposite sign. Converges to the machine-representable
-# root. Bisection (rather than Newton/Brent) never leaves the bracket, so a root is always returned.
-function _bisect(f, a::T, b::T, fa::T, fb::T) where {T}
-    lo, hi, flo = a, b, fa
-    for _ in 1:80
-        m = (lo + hi) / 2
-        (m == lo || m == hi) && return m
-        fm = f(m)
-        fm == 0 && return m
-        if (flo < 0) == (fm < 0)
-            lo, flo = m, fm
+# Root of `f` in a bracket `a < b` whose end values `fa`, `fb` have opposite signs, by the Illinois variant of regula
+# falsi (Dowell & Jarratt 1971, see the file header). Each step evaluates the secant point of the bracket and keeps the
+# sub-bracket over which the sign changes; when the same end is replaced twice in a row, the value at the end that
+# stayed is halved, which removes regula falsi's one-sided stagnation and makes the convergence superlinear (order
+# 3^(1/3) ≈ 1.442 at a simple root). On the kernel's smooth fibers that is several times fewer leaf evaluations per
+# root than bisection.
+#
+# Safeguards, so the method keeps bisection's guarantees:
+#
+#   - the step is clamped strictly inside the bracket — a secant point that rounds onto an end moves one float inward,
+#     which is also what ends the iteration in a step or two once the secant has found the root;
+#   - a step is a bisection when the secant point is not a number, or when the last three steps have not halved the
+#     bracket — the regime of a multiple root, where regula falsi, Illinois or not, converges only linearly;
+#   - the side of `a` is fixed by its sign at entry, so a halved end value that underflows to zero cannot misread one.
+#
+# The bracket therefore shrinks at every evaluation, halves at least every third one, and always contains a sign
+# change; the iteration stops at an exact zero or once the bracket is two adjacent floats, returning a point of it.
+function _root(f, a::T, b::T, fa::T, fb::T) where {T}
+    negative_a = fa < 0
+    side = 0
+    widths = (T(Inf), T(Inf), T(Inf))   # bracket widths before each of the last three steps
+    while nextfloat(a) < b
+        c = a - fa * (b - a) / (fb - fa)
+        (isnan(c) || b - a > widths[1] / 2) && (c = (a + b) / 2)
+        widths = (widths[2], widths[3], b - a)
+        c = clamp(c, nextfloat(a), prevfloat(b))
+        fc = f(c)
+        fc == 0 && return c
+        if (fc < 0) == negative_a
+            a, fa = c, fc
+            side == -1 && (fb /= 2)
+            side = -1
         else
-            hi = m
+            b, fb = c, fc
+            side == 1 && (fa /= 2)
+            side = 1
         end
     end
-    return (lo + hi) / 2
+    return (a + b) / 2
 end
 
 # ── Sign sampling and height-axis certificate ──────────────────────────────────
@@ -214,7 +242,7 @@ end
 # ── Fiber rule emission ────────────────────────────────────────────────────────
 
 # Sorted breakpoints of the fiber `t ↦ embed(t)` on `[lo, hi]`: the endpoints plus every sign change of every active
-# leaf, located by scanning `ctx.root_samples` sub-intervals and bisecting each bracketed crossing.
+# leaf, located by scanning `ctx.root_samples` sub-intervals and solving each bracketed crossing with `_root`.
 function _fiber_breaks(lsets, embed, lo::T, hi::T, ctx::_QuadCtx) where {T}
     breaks = T[lo, hi]
     M = ctx.root_samples
@@ -231,7 +259,7 @@ function _fiber_breaks(lsets, embed, lo::T, hi::T, ctx::_QuadCtx) where {T}
             if fcur == 0
                 push!(breaks, tcur)
             elseif (fprev < 0 < fcur) || (fcur < 0 < fprev)
-                push!(breaks, _bisect(t -> g(embed(t)), tprev, tcur, fprev, fcur))
+                push!(breaks, _root(t -> g(embed(t)), tprev, tcur, fprev, fcur))
             end
             tprev, fprev = tcur, fcur
         end

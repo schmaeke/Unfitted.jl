@@ -26,6 +26,22 @@ end
     @test _quad(x -> x[1], rule) ≈ 0.3^2 / 2 atol = 1e-15
 end
 
+@testset "implicit quadrature — the fiber root finder keeps bisection's guarantees in fewer steps" begin
+    # The Illinois regula falsi `_root` lands on the floating-point root — within two ulps, the rounding of f near it —
+    # on every bracket. A simple root takes a handful of evaluations where bisection spends about 50 to reach adjacent
+    # floats; at a triple root, where regula falsi of any kind converges only linearly, the bisection safeguard still
+    # gets there, within three times bisection's count.
+    for (f, r, simple) in ((t -> t^3 - 2, cbrt(2.0), true), (t -> exp(t) - 3, log(3.0), true),
+                           (t -> sqrt((t - 0.31)^2 + 0.2^2) - 0.25, 0.46, true), (t -> 0.7 - t, 0.7, true),
+                           (t -> (t - 0.3)^3, 0.3, false))
+        a, b = r - 0.21, r + 0.17
+        evaluations = Ref(0)
+        x = Unfitted._root(t -> (evaluations[] += 1; f(t)), a, b, f(a), f(b))
+        @test abs(x - r) <= 2 * eps(r)
+        @test evaluations[] <= (simple ? 12 : 3 * 52)
+    end
+end
+
 @testset "implicit quadrature — 2D axis-aligned cut moments are exact" begin
     # Ω = {x ≤ a} on [0, 1]², independent of y. ∫∫ xᵐ yⁿ = a^(m+1)/(m+1) · 1/(n+1).
     a = 0.4

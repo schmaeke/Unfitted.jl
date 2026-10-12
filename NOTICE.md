@@ -22,7 +22,11 @@ in full at the top of the implementing file, for academic attribution:
     [doi:10.1016/j.jcp.2021.110720](https://doi.org/10.1016/j.jcp.2021.110720).
     Its use as a moment source follows B. Müller, F. Kummer, M. Oberlack,
     Int. J. Numer. Methods Engng. **96** (2013) 512,
-    [doi:10.1002/nme.4569](https://doi.org/10.1002/nme.4569).
+    [doi:10.1002/nme.4569](https://doi.org/10.1002/nme.4569). Fiber roots are
+    found by the Illinois variant of regula falsi: M. Dowell, P. Jarratt,
+    "A modified regula falsi method for computing the root of an equation",
+    BIT **11** (1971) 168,
+    [doi:10.1007/BF01934364](https://doi.org/10.1007/BF01934364).
 
   - **Mesh signed-distance** in `ext/UnfittedMeshIOExt.jl` — closest point on a
     triangle: C. Ericson, "Real-Time Collision Detection", Morgan Kaufmann
