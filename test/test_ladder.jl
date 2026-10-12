@@ -8,6 +8,7 @@
 
 using BasicBSpline
 using LinearAlgebra
+using Random
 
 const LADDER_OMEGA = box((0.0, 0.0), (1.0, 1.0))
 ladder_bc() = [dirichlet(0.0; on=boundary(:all))]
@@ -360,6 +361,29 @@ end
     far[8, 8] = 3
     @test count(active_cells(adapt(V, near; grade=1); level=2)) == count(active_cells(adapt(V, far; grade=1); level=2))
     @test_throws ArgumentError adapt(V, d; grade=-1)
+end
+
+@testset "graded depth maps equal the brute-force maximum" begin
+    # A positive grade raises every base cell to g(c) = max over x of (d(x) − grade·‖c − x‖_∞), and grade 0 is off.
+    # `depth_masks` never forms g: it builds the threshold sets {g ≥ t} top-down by dilation, which rests on a proof in
+    # its comment. Check it against g itself, cell by cell, on random sparse and dense depth maps in 1D, 2D and 3D.
+    rng = MersenneTwister(20261012)
+    agrees, raised = true, 0
+    for (dom, cells, depth) in ((box((0.0,), (1.0,)), (9,), 4), (LADDER_OMEGA, (6, 5), 4),
+                                (box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)), (4, 3, 4), 3))
+        V = ladder(dom; cells=cells, depth=depth, splits=2)
+        for grade in 0:3, density in (0.15, 0.6)
+            d = [rand(rng) < density ? rand(rng, 1:depth) : 0 for _ in CartesianIndices(cells)]
+            g = grade == 0 ? d :
+                [maximum(d[x] - grade * maximum(abs.(Tuple(c - x))) for x in CartesianIndices(d))
+                 for c in CartesianIndices(d)]
+            raised += g != d
+            agrees &= Unfitted.depth_masks(V, d; grade=grade) ==
+                      [k => overlapping_cells(V, g .>= k - 1; from=1, to=k) for k in 2:(depth+1)]
+        end
+    end
+    @test agrees
+    @test raised >= 9                                       # grading moved at least half of the 18 graded maps
 end
 
 @testset "adapt takes a depth map in 1D" begin

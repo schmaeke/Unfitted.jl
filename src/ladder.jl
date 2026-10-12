@@ -396,54 +396,31 @@ function depth_masks(V::Space{D}, depths::AbstractArray{<:Integer,D}; grade::Int
                                                                   "$(length(V.levels)) levels; got $(extrema(depths))"))
     grade >= 0 || throw(ArgumentError("grade must be non-negative; got $grade"))
 
-    d = Array{Int,D}(depths)
-    grade > 0 && _grade!(d, grade)
-    # The selection is a `BitArray` over the base grid, which is a cell selection in every dimension. `findall` is not:
-    # on a `Vector` it returns plain `Int` indices rather than `CartesianIndex{1}`, which `overlapping_cells` rejects,
-    # so a 1D ladder with an overlay could not take a depth map at all.
-    return [k => overlapping_cells(V, d .>= k - 1; from=1, to=k) for k in 2:length(V.levels)]
-end
-
-# Raise every depth that sits more than `by` below a neighbour, to the fixed point
-#
-#     d[c] ← max over x of (d[x] − by · ‖c − x‖_∞).
-#
-# One iteration is `d ← max(d, dilate(d) − by)` with `dilate` the ∞-norm unit-ball dilation. That ball is a hypercube,
-# and a hypercube is the Minkowski sum of unit intervals, so the dilation separates into `D` one-dimensional maximum
-# filters rather than a sweep over the `3^D` neighbourhood. Writing it as a whole-array step also makes the result
-# independent of iteration order, which a neighbour-by-neighbour sweep is not — the same input graded from opposite
-# corners differed by a factor of four in cost, and the fixed point is a property of the input, not of the traversal.
-function _grade!(d::Array{Int,D}, by::Int) where {D}
-    buffer = Vector{Int}(undef, maximum(size(d); init=0))
-    dilated = similar(d)
-    while true
-        copyto!(dilated, d)
-        for axis in 1:D
-            _max_filter3!(dilated, axis, buffer)
-        end
-        dilated .-= by
-        any(k -> dilated[k] > d[k], eachindex(d)) || return d
-        d .= max.(d, dilated)
-    end
-end
-
-# In-place maximum filter of width three along one axis. `buffer` holds the row being filtered so the filter reads the
-# original values rather than the ones it has just written.
-function _max_filter3!(a::Array{Int,D}, axis::Int, buffer::Vector{Int}) where {D}
-    n = size(a, axis)
-    n > 1 || return a
-    for slice in CartesianIndices(ntuple(d -> d == axis ? (1:1) : axes(a, d), D))
-        for i in 1:n
-            buffer[i] = a[_along(slice, axis, i)]
-        end
-        for i in 1:n
-            a[_along(slice, axis, i)] = max(buffer[max(i - 1, 1)], buffer[i], buffer[min(i + 1, n)])
+    # Overlay level k is live where the graded depth is at least k − 1, so only the threshold sets G[t] = {g ≥ t} of
+    # the graded depth g are ever needed, and they are built directly. Grading raises every cell to
+    #
+    #     g(c) = max over x of (d(x) − grade · ‖c − x‖_∞),
+    #
+    # and for `grade > 0` its threshold sets obey
+    #
+    #     G[t] = {d ≥ t} ∪ dilate₁(G[t + grade]),
+    #
+    # with dilate₁ the unit-ball dilation of the ∞-norm, clipped to the grid (`_dilate_cells` at radius 1).
+    #
+    # ⊇: g ≥ d, and g is grade-Lipschitz in the ∞-norm, so a king neighbour of a cell where g ≥ t + grade has g ≥ t.
+    # ⊆: let g(c) ≥ t be attained at x. If x = c, then d(c) ≥ t. Otherwise the king move from c toward x stays on the
+    # grid and brings x one step closer, so that neighbour has g ≥ t + grade. Above `maxdepth − grade` the dilated set
+    # is empty, since g never exceeds the largest depth. So the sets come top-down, one radius-1 dilation each, where
+    # iterating g to its fixed point took whole-array max-filter sweeps until nothing moved.
+    #
+    # The selections are `BitArray`s over the base grid, which is a cell selection in every dimension. `findall` is
+    # not: on a `Vector` it returns plain `Int` indices rather than `CartesianIndex{1}`, which `overlapping_cells`
+    # rejects, so a 1D ladder with an overlay could not take a depth map at all.
+    G = [depths .>= t for t in 1:maxdepth]
+    if grade > 0
+        for t in (maxdepth-grade):-1:1
+            G[t] .|= _dilate_cells(G[t + grade], ntuple(_ -> 1, D))
         end
     end
-    return a
-end
-
-# `slice` with its `axis` component replaced by `i`.
-function _along(slice::CartesianIndex{D}, axis::Int, i::Int) where {D}
-    CartesianIndex(ntuple(d -> d == axis ? i : slice.I[d], D))
+    return [k => overlapping_cells(V, G[k - 1]; from=1, to=k) for k in 2:length(V.levels)]
 end
