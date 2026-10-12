@@ -34,11 +34,15 @@
     BoundaryMesh{D,T,K}(cells, normals)
 
 User-supplied immersed surface mesh: a finite list of `(K+1)`-vertex simplices embedded in physical space `ℝᴰ`. `K` is
-the simplex dimension:
+the simplex dimension, `0 ≤ K ≤ min(D, 2)`:
 
-  - `K = 0` — point cloud (codim-`D` evaluation). Useful for pinning fields at specific physical coordinates.
-  - `K = 1` — line-segment mesh (codim-1 in 2D). Use for arcs or polylines in 2D problems.
-  - `K = 2` — triangle mesh (codim-1 in 3D). Use for surfaces of immersed 3D bodies.
+  - `K = 0` — point cloud (codim-`D` evaluation). Useful for pinning fields at specific physical coordinates, or as the
+    point interface of a 1D coupling.
+  - `K = 1` — line-segment mesh: codim-1 in 2D (arcs, polylines), a curve in 3D, a codim-0 interval in 1D.
+  - `K = 2` — triangle mesh: codim-1 in 3D (surfaces of immersed bodies), a codim-0 patch in 2D.
+
+Every one of these is subdivided and integrated alike (see the user contract below). A codim-0 mesh integrates over the
+area (2D) or length (1D) it covers, and like every simplex without a geometric normal it needs `normals`.
 
 Fields:
 
@@ -70,7 +74,9 @@ struct BoundaryMesh{D,T<:Real,K,C}
                                  normals::Union{Nothing,Vector{SVector{D,T}}}) where {D,T<:Real,K,KP}
         KP == K + 1 ||
             throw(ArgumentError("BoundaryMesh{$D,$T,$K} expects $(K+1)-vertex cells, " * "got $KP-vertex tuples"))
-        0 <= K <= D || throw(ArgumentError("BoundaryMesh simplex dimension K=$K must satisfy 0 ≤ K ≤ D=$D"))
+        0 <= K <= min(D, 2) ||
+            throw(ArgumentError("BoundaryMesh simplex dimension K=$K must satisfy 0 ≤ K ≤ min(D, 2) = $(min(D, 2)): " *
+                                "points, segments and triangles"))
         D <= 3 || throw(ArgumentError("BoundaryMesh integration is supported only for D ≤ 3; got D=$D"))
         if normals !== nothing
             length(normals) == length(cells) ||
@@ -248,10 +254,10 @@ end
 #   * `K = 1` (segments)    — per-axis parameter-value crossings, sorted, then cut at each one exactly. The sub-segments
 #                             partition the input: an endpoint may land on a grid line, and the sub-segment's *interior*
 #                             — which is what the midpoint classification sees — lies in one cell. Works in any `D`.
-#   * `K = 2` (triangles)   — in 3D, plane splitting: one single-plane Sutherland–Hodgman pass per grid plane the
-#                             triangle crosses, then fan triangulation of each convex piece. The pieces partition the
-#                             input, and the parts beyond the outermost planes are kept, so a triangle leaving the grid
-#                             fails like a segment does. A 2D triangle (a codim-0 simplex) is passed through unsplit.
+#   * `K = 2` (triangles)   — plane splitting: one single-plane Sutherland–Hodgman pass per grid line (plane, in 3D)
+#                             the triangle crosses, then fan triangulation of each convex piece. The pieces partition
+#                             the input, and the parts beyond the outermost lines are kept, so a triangle leaving the
+#                             grid fails like a segment does. Works in 2D and 3D.
 
 """
     _subdivide_segment(p1, p2, grid_lines, nudge)
@@ -384,8 +390,7 @@ _split_cell!(cells, cell::NTuple{1}, _) = push!(cells, cell)
 function _split_cell!(cells, (a, b)::NTuple{2,SVector{D,T}}, lines) where {D,T}
     append!(cells, _subdivide_segment(a, b, lines, sqrt(eps(T))))
 end
-_split_cell!(cells, (a, b, c)::NTuple{3,SVector{3}}, lines) = append!(cells, _subdivide_triangle(a, b, c, lines))
-_split_cell!(cells, cell::NTuple{3,SVector{2}}, _) = push!(cells, cell)
+_split_cell!(cells, (a, b, c)::NTuple{3,SVector}, lines) = append!(cells, _subdivide_triangle(a, b, c, lines))
 
 # The sub-cells of `mesh` split at the per-axis `lines` (`_split_cell!`), as `(; cells, normals)` with one unit normal
 # per sub-cell: its input cell's, from the mesh's own override (normalised) or else the geometric `_default_normal` of

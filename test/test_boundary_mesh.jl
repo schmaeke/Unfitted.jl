@@ -467,3 +467,30 @@ end
     u = field(:u, V3)
     @test nquadpoints(prepare(Problem((u,); blocks=(block(u, u, mass_form(); on=flat),))); on=flat) == 25
 end
+
+@testset "a 2D triangle mesh is split at the grid: its surface mass is the volume mass" begin
+    # Regression (F3b). A K = 2 mesh in 2D passed through the subdivision unsplit, so each triangle was integrated as
+    # one region with the parents of its midpoint's cells: across every other cell it evaluated their basis functions'
+    # polynomial extensions. Two triangles tiling the domain must reproduce the volume mass matrix — on an overlay too,
+    # where each sub-triangle carries the parents of both levels.
+    V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2), box((0.25, 0.25), (0.75, 0.75));
+                cells=(2, 2), order=3)
+    u = field(:u, V)
+    corners = [SVector(0.0, 0.0), SVector(1.0, 0.0), SVector(1.0, 1.0), SVector(0.0, 1.0)]
+    tiles = triangle_mesh(corners, [(1, 2, 3), (1, 3, 4)]; normals=[SVector(1.0, 0.0), SVector(1.0, 0.0)])
+    model = prepare(Problem((u,); blocks=(mass_block(u), block(u, u, mass_form(); on=tiles))))
+    volume = assemble_matrix(model, mass_block(u); threaded=false)
+    surface = assemble_matrix(model, block(u, u, mass_form(); on=tiles); threaded=false)
+    @test maximum(abs, surface - volume) / maximum(abs, volume) < 1.0e-13
+    @test boundary_integral(q -> 1.0, model; on=tiles) ≈ 1.0 rtol = 1.0e-14
+end
+
+@testset "BoundaryMesh accepts points, segments and triangles only" begin
+    # Regression (F3). `0 ≤ K ≤ D` let a tetrahedron mesh through, which then failed far downstream; no subdivision or
+    # rule exists past triangles, so the constructor says so.
+    tet = (SVector(0.0, 0.0, 0.0), SVector(1.0, 0.0, 0.0), SVector(0.0, 1.0, 0.0), SVector(0.0, 0.0, 1.0))
+    @test_throws "min(D, 2)" BoundaryMesh{3,Float64,3}([tet], [SVector(1.0, 0.0, 0.0)])
+    triangle = (SVector(0.0, 0.0), SVector(1.0, 0.0), SVector(0.0, 1.0))
+    @test BoundaryMesh{2,Float64,2}([triangle], nothing) isa BoundaryMesh
+    @test BoundaryMesh{1,Float64,1}([(SVector(0.0), SVector(1.0))], nothing) isa BoundaryMesh
+end

@@ -597,3 +597,64 @@ end
     end
     @test sort(unique(counts)) == [5, 7]
 end
+
+@testset "an interface over points couples a 1D problem exactly" begin
+    # Regression (F3). An `Interface` over a `points_mesh` raised a MethodError: the interface builder had no K = 0
+    # subdivision. In 1D the interface between two subdomains *is* a point. A consistent Nitsche coupling there
+    # reproduces a quadratic exactly, which an order-2 space represents.
+    exact(x) = x[1] * (1 - x[1]) + x[1]                     # −u″ = 2, flux 1 − 2x ≠ 0 at the interface
+    V1 = space(box((0.0,), (0.5,)); cells=3, order=2)
+    V2 = space(box((0.5,), (1.0,)); cells=2, order=2)
+    u1, u2 = field(:u1, V1), field(:u2, V2)
+    Γ = points_mesh([SVector(0.5)]; normals=[SVector(1.0)])  # a → b
+    β = 50.0
+    nitsche = InterfaceForm(; symmetric=true) do q, sides, trial, _tc
+        sv, su = jump_sign(sides.test), jump_sign(sides.trial)
+        TestChannels(-0.5 * sv * dot(trial.gradient, q.normal) + β * sv * su * trial.value,
+                     -0.5 * su * trial.value .* q.normal)
+    end
+    model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2), couple(u1, u2, Γ, nitsche)...),
+                            loads=(source_load(u1; source=2.0), source_load(u2; source=2.0)),
+                            dirichlet=[dirichlet(exact; on=boundary(axis=1, side=:lower), field=:u1),
+                                       dirichlet(exact; on=boundary(axis=1, side=:upper), field=:u2)], symmetric=true))
+    sol = solve!(model)
+    @test boundary_integral(q -> 1.0, model; on=interface(u1, u2, Γ)) == 1.0
+    @test maximum(abs(value(sol, model, u1, (x,)) - exact((x,))) for x in (0.1, 0.3, 0.5)) < 1.0e-12
+    @test maximum(abs(value(sol, model, u2, (x,)) - exact((x,))) for x in (0.5, 0.7, 0.9)) < 1.0e-12
+end
+
+@testset "an interface over points or a 2D triangle patch integrates where both sides are" begin
+    # Regression (F3). Points (K = 0) and a 2D triangle mesh (codim 0) had no interface subdivision: both raised a
+    # MethodError. Each now integrates exactly the part of its geometry both subdomains cover.
+    V1 = space(box((0.0, 0.0), (1.0, 0.5)); cells=(4, 2), order=2)
+    V2 = space(box((0.0, 0.5), (1.0, 1.0)); cells=(3, 2), order=2)
+    u1, u2 = field(:u1, V1), field(:u2, V2)
+    # Three points on the shared edge y = 0.5 and one inside V1 alone, which the interface skips.
+    pts = [SVector(0.1, 0.5), SVector(0.45, 0.5), SVector(0.8, 0.5), SVector(0.3, 0.2)]
+    Γ = points_mesh(pts; normals=fill(SVector(0.0, 1.0), 4))
+    model = prepare(Problem((u1, u2);
+                            blocks=(stiffness_block(u1), stiffness_block(u2),
+                                    couple(u1, u2, Γ, mass_form(coefficient=1.0))...)))
+    @test boundary_integral(q -> 1.0, model; on=interface(u1, u2, Γ)) == 3.0
+    @test nquadpoints(model; on=interface(u1, u2, Γ)) == 3
+
+    # Two spaces over one square, non-matching (one an overlay stack), coupled over a codim-0 triangle mesh — an
+    # overlapping-domain coupling. Split at both grids, each sub-triangle carries each side's own covering cells, so
+    # over the whole square the coupling's diagonal blocks are the two fields' volume mass matrices.
+    W1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2)
+    W2 = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2), box((0.3, 0.3), (0.7, 0.7)); cells=(2, 2),
+                 order=2)
+    w1, w2 = field(:w1, W1), field(:w2, W2)
+    square = triangle_mesh([SVector(0.0, 0.0), SVector(1.0, 0.0), SVector(1.0, 1.0), SVector(0.0, 1.0)],
+                           [(1, 2, 3), (1, 3, 4)]; normals=fill(SVector(1.0, 0.0), 2))
+    iface = interface(w1, w2, square)
+    coupled = prepare(Problem((w1, w2);
+                              blocks=(mass_block(w1), mass_block(w2),
+                                      couple(w1, w2, square, mass_form(coefficient=1.0))...)))
+    @test boundary_integral(q -> 1.0, coupled; on=iface) ≈ 1.0 rtol = 1.0e-14
+    for w in (w1, w2)
+        volume = assemble_matrix(coupled, mass_block(w); threaded=false)
+        trace = assemble_matrix(coupled, block(w, w, mass_form(); on=iface); threaded=false)
+        @test maximum(abs, trace - volume) / maximum(abs, volume) < 1.0e-13
+    end
+end

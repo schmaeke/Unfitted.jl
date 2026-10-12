@@ -25,9 +25,11 @@
     Interface(field_a::Symbol, field_b::Symbol, geometry)
 
 The `on=` tag identifying a coupling interface between the fields named `field_a` and `field_b`, integrated over
-`geometry` (a [`BoundaryMesh`](@ref): a segment loop in 2D, a triangle surface in 3D). The interface trace is foreign to
-both subdomains' grids; assembly evaluates each field in whichever of *its own* cut cells contains each interface
-quadrature point.
+`geometry` (a [`BoundaryMesh`](@ref) of any simplex dimension: a segment loop in 2D, a triangle surface in 3D, points —
+in 1D the interface itself; or a codim-0 patch, triangles in 2D, where the two subdomains overlap). The interface trace
+is foreign to both subdomains' grids; assembly evaluates each field in whichever of *its own* cut cells contains each
+interface quadrature point. The geometry is split at the grid lines of both subdomains, and the parts of it outside
+either subdomain's active region are not integrated.
 
 Build one with [`interface`](@ref); attach coupling contributions with [`couple`](@ref) or by passing
 `on = interface(...)` to [`block`](@ref).
