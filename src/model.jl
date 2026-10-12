@@ -913,11 +913,21 @@ end
 # Pick out the Dirichlet conditions that apply to the field called `name` from a problem's `dirichlet` list: every
 # unscoped condition (`condition.field === nothing`) applies to the only field of a single-field problem and raises on
 # multi-field problems; named conditions match by name. An `Any[]`, which the projection reads as such.
+#
+# A plain loop rather than a filtered comprehension: over the abstractly typed condition vector the comprehension's
+# filter and generator are built and boxed at run time, two allocations more per field on every `update_dirichlet!`
+# (51 against 49 on a cached load increment of a 2D overlay model).
 function _dirichlet_for_field(problem::Problem, name::Symbol)
-    length(problem.fields) == 1 ||
-        all(c -> c.field !== nothing, problem.dirichlet) ||
-        throw(ArgumentError("multi-field Dirichlet conditions must specify a field"))
-    return Any[c for c in problem.dirichlet if c.field === nothing || c.field === name]
+    scoped = Any[]
+    for condition in problem.dirichlet
+        if condition.field === nothing
+            length(problem.fields) == 1 || throw(ArgumentError("multi-field Dirichlet conditions must specify a field"))
+            push!(scoped, condition)
+        elseif condition.field === name
+            push!(scoped, condition)
+        end
+    end
+    return scoped
 end
 
 # ── Region caches ─────────────────────────────────────────────────────────────
