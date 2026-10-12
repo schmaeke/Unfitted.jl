@@ -56,6 +56,13 @@ end
     @test_throws ArgumentError Unfitted.local_basis_indices(fam, (3, 3), :trunk)
 end
 
+# What a B-spline level's family is: its mechanism, the continuity it was asked for, and its per-axis degrees and knots.
+_bspline_knots(family) = map(P -> Float64[t for t in BasicBSpline.knotvector(P)], family.spaces)
+function _bspline_family_key(family)
+    (BSExt._selects_by_support(family), family.continuity, map(BasicBSpline.degree, family.spaces),
+     _bspline_knots(family))
+end
+
 @testset "BSpline extension: continuity validation" begin
     # Negative continuity is rejected at factory time, and so is a symbol that is not `:maximal`.
     @test_throws ArgumentError bspline(continuity=-1)
@@ -86,13 +93,6 @@ end
     free(b) = Unfitted.active_unknowns(prepare(mass(overlay(space(Ω; cells=16, order=3, basis=bspline()), B; cells=8,
                                                             order=3, basis=b))).dofs)
     @test free(bspline()) == free(bspline(continuity=2))
-end
-
-# What a B-spline level's family is: its mechanism, the continuity it was asked for, and its per-axis degrees and knots.
-_bspline_knots(family) = map(P -> Float64[t for t in BasicBSpline.knotvector(P)], family.spaces)
-function _bspline_family_key(family)
-    (BSExt._selects_by_support(family), family.continuity, map(BasicBSpline.degree, family.spaces),
-     _bspline_knots(family))
 end
 
 @testset "BSpline extension: every rebuild re-validates the requested continuity" begin
