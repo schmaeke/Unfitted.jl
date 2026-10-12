@@ -228,8 +228,9 @@ Düster's recommendation for point-based history-data transfer:
 (See Sec. 3.3.1 of that work for an analysis of why the RBF + P0 scheme outperforms element-local interpolation in their
 hyperelastic FCM remeshing study.)
 
-Neighbour counts up to `_RBFP0_MAX_NEIGHBORS = 16` use a `StaticArrays.SMatrix` solve and stay BLAS-free; larger counts
-are not currently supported.
+Neighbour counts up to `_RBFP0_MAX_NEIGHBORS = 16` are supported; larger counts are not. Up to 13 neighbours the local
+system is solved as a `StaticArrays.SMatrix`, in pure Julia and without the heap. From 14 on it is larger than the
+14 × 14 up to which StaticArrays factors a static matrix itself, and it is solved as a dense `Matrix` through LAPACK.
 """
 struct RBFP0
     neighbors::Int
@@ -258,10 +259,11 @@ Algorithm: collect the source and the target quadrature-point clouds, one walk e
 source cloud; for each target quadrature point find the `via.neighbors` nearest source neighbours, run the local
 RBF + P0 solve on them, and evaluate the interpolant at the target point.
 
-The outer loop over target points is embarrassingly parallel: each target's small solve is independent and uses
-pure-Julia `StaticArrays` operations, so the result is bit-identical regardless of thread count for a fixed neighbour
-set. `threaded = true` is the default; `threaded = false` runs the same loop serially, which is how the suite asserts
-that the two paths agree bit for bit.
+The outer loop over target points is embarrassingly parallel: each target's small solve is independent and runs the
+same arithmetic whichever thread takes it, so the result is bit-identical regardless of thread count for a fixed
+neighbour set — the dense solve from 14 neighbours on included, which agreed bit for bit at every count from 1 to 16 on
+eight threads. `threaded = true` is the default; `threaded = false` runs the same loop serially, which is how the suite
+asserts that the two paths agree bit for bit.
 """
 function transfer(source::QuadField, source_model::Model{D,T}, target_model::Model{D,T}; via::RBFP0=RBFP0(),
                   threaded::Bool=true) where {D,T}

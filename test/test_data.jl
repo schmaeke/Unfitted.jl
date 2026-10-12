@@ -64,10 +64,13 @@ end
 
     source = QuadField{Float64}(source_model; init=q -> exp(-((q.x[1] - 0.5)^2 + (q.x[2] - 0.5)^2)))
 
-    serial = transfer(source, source_model, target_model; via=RBFP0(), threaded=false)
-    threaded = transfer(source, source_model, target_model; via=RBFP0(), threaded=true)
-
-    @test serial.data == threaded.data
+    # The default count is solved as a static matrix; 16 neighbours exceed the size StaticArrays factors itself and go
+    # through its dense-matrix fallback, which must agree across threads as well.
+    for k in (10, 16)
+        serial = transfer(source, source_model, target_model; via=RBFP0(; neighbors=k), threaded=false)
+        threaded = transfer(source, source_model, target_model; via=RBFP0(; neighbors=k), threaded=true)
+        @test serial.data == threaded.data
+    end
 end
 
 @testset "RBFP0 rejects unsupported neighbour counts" begin
