@@ -127,7 +127,8 @@ What [`estimate`](@ref) returns: a Bank–Weiser error indicator per cell, with 
     small `consistency` and a small `η` at once. Measured on a 4² order-2 space, changing nothing but the data — the
     non-polynomial `sin πx sin πy` replaced by `x² + y²`, which both rules integrate exactly and whose trace `V`
     reproduces — drops it from 7.1e-4 to 5.2e-7. A value that climbs means the data is under-integrated where `η` is
-    smallest.
+    smallest. It is a pure ratio, so scaling the data leaves it unchanged; it is `Inf` when the residual on `W` is
+    exactly zero while the one on `V` is not, and `0` when both are, as on zero data.
 
     For an actual saturation signal there is one the loop already has, under two conditions: on a refine-only sequence
     with homogeneous Dirichlet data, Galerkin orthogonality makes `est_new.reference² − est_prev.reference²` the true
@@ -502,7 +503,12 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
 
     reference = sqrt(max(zero(T), dot(coefficients, model.matrix * coefficients)))
     total = sqrt(sum(sum(a .^ 2) for a in cells))
-    consistency = sqrt(residual_V / max(residual_W, eps(T)))
+    # A pure ratio, so it is as scale-free as the residual it reads. Flooring the denominator at an absolute
+    # `eps(T)`, as this once did, made it a function of the data's units: on a 4² order-2 Poisson problem it read
+    # 7.06e-4 with the source scaled by 1 or 1e-4, but 3.54e-5 at 1e-8 and 3.54e-7 at 1e-10, for the same relative
+    # residual. The two edge cases follow the ratio: nothing left on `W` while `V` carries a residual is infinitely
+    # inconsistent, and nothing left on either (zero data) is perfectly consistent.
+    consistency = residual_W > 0 ? sqrt(residual_V / residual_W) : (residual_V > 0 ? T(Inf) : zero(T))
     return ErrorEstimate{D,T}(cells, total, reference, consistency)
 end
 

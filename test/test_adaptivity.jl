@@ -92,6 +92,26 @@ end
     @test calls[] == 0
 end
 
+@testset "consistency is a pure ratio: scaling the data leaves it unchanged" begin
+    # ‖R|_V‖ / ‖R|_W‖ compares two residuals of one solve, so it cannot depend on the data's units. Flooring the
+    # denominator at an absolute eps made it one: 7.06e-4 with the source scaled by 1 or 1e-4, but 3.54e-5 at 1e-8 and
+    # 3.54e-7 at 1e-10, for the same relative residual.
+    V = space(_AD_Ω; cells=4, order=2)
+    bc = [dirichlet(0.0; on=boundary(:all))]
+    source(x) = 2pi^2 * sinpi(x[1]) * sinpi(x[2])
+    consistency(s) = (m=prepare(poisson(V; source=x -> s * source(x), dirichlet=bc));
+                      estimate(m, solve!(m)).consistency)
+    unscaled = consistency(1.0)
+    @test 1.0e-4 < unscaled < 1.0e-2                  # a data-oscillation residual, far above round-off
+    for s in (1.0e-4, 1.0e-8, 1.0e-10)
+        @test consistency(s) ≈ unscaled rtol = 1.0e-6
+    end
+    # Zero data leaves nothing on either side, and the ratio's 0 / 0 reads as perfectly consistent.
+    zero_data = prepare(poisson(V; source=0.0, dirichlet=bc))
+    nothing_left = estimate(zero_data, solve!(zero_data))
+    @test nothing_left.consistency == 0 && nothing_left.total == 0
+end
+
 @testset "estimate charges every component of a vector field" begin
     # The attribution used to read `active_cell_dofs` at its default component, so on a vector-valued field it measured
     # component 1 and nothing else. A two-component problem whose datum sits on component 2 then came back with
