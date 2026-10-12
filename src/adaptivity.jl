@@ -806,6 +806,9 @@ The two steps, and what each one means here:
     same increment on a covered cell would be a no-op. Measured before that was understood, 356 cells raised while
     covered retained 576 active modes between them and **zero** bubbles.
 
+A cell takes at most one order step per call, however many marks name it: a duplicated p-mark, or a p-mark beside an
+h-mark that turns into the order step, raises it by one from its order in `V`.
+
 Existing activation is preserved rather than replaced. [`adapt`](@ref) *sets* a level's mask, so an application that
 forgets to keep what is already live silently un-refines the rest of the domain; this keeps it.
 
@@ -859,6 +862,11 @@ function refine(V::Space{D,T}; h=(), p=(), pmax::Integer=8) where {D,T}
     field_of(k) = get!(() -> cell_orders(V; level=k), fields, k)
     # Raise only the axes below the cap. A `pmax` under a cell's current order is a "no more p here" instruction, not a
     # request to lower an order `refine` was asked to enrich, and the loop's saturation test reads it the same way.
+    #
+    # Every order step starts from the cell's order in `V`, never from the field this call is editing, so a cell marked
+    # twice takes one step: a duplicated p-mark, or a p-mark beside an h-mark that the finest level turns into the order
+    # step. Reading the edited field compounded them — a duplicated p-mark took an order-2 cell to 4 — against the
+    # docstring's "raises the marked cell's own order by one".
     raised(o) = min.(o .+ 1, max.(o, Int(pmax)))
 
     for (k, cell) in p
@@ -867,8 +875,7 @@ function refine(V::Space{D,T}; h=(), p=(), pmax::Integer=8) where {D,T}
         # mirror case. `decide` never hands one over, so this is the explicit form's branch; without it the mark would
         # reach `elevate` and raise, which is a worse answer than "there was nothing to spend here".
         _supports_cell_order(V.levels[k].basis) || continue
-        field = field_of(k)
-        field[cell] = raised(field[cell])
+        field_of(k)[cell] = raised(cell_order(V.levels[k], cell))
     end
 
     for (k, cell) in h
@@ -886,8 +893,7 @@ function refine(V::Space{D,T}; h=(), p=(), pmax::Integer=8) where {D,T}
             # order change nobody asked for. `decide` already withholds such a cell, so this is the explicit form's
             # branch.
             _supports_cell_order(V.levels[k].basis) || continue
-            field = field_of(k)
-            field[cell] = raised(field[cell])
+            field_of(k)[cell] = raised(cell_order(V.levels[k], cell))
             continue
         end
         # The children take the parent's order as it stands, uncapped: `coarsen` restores exactly this value on release,
@@ -959,7 +965,8 @@ refinement left behind is pure cost.
     on its observable part;
   - a **p-mark** `(level, cell)` lowers that cell's own order by one, floored at `pmin`: it lowers only axes above
     `pmin` and leaves a cell already at or below it alone, so a `pmin` above a cell's current order means "no more
-    release here" rather than "raise it".
+    release here" rather than "raise it". As in `refine`, a cell takes at most one order step per call: a duplicated
+    p-mark lowers it by one from its order in `V`.
 
 Releasing a cover whose children are themselves covered is a no-op rather than an error: the region is carried further
 down and the deeper level is what holds it, so releasing this level alone would leave a hole. On a family whose
@@ -1011,7 +1018,8 @@ function coarsen(V::Space{D,T}; h=(), p=(), pmin::Integer=1) where {D,T}
     live = _live_levels(V)
     # The parents released per level, for the support-extension mirror below.
     released = Dict{Int,Vector{CartesianIndex{D}}}()
-    # Lower only the axes above the floor, the mirror of `refine`'s `raised`.
+    # Lower only the axes above the floor, the mirror of `refine`'s `raised`, and from the cell's order in `V` for the
+    # same reason: a duplicated p-mark lowers once.
     lowered(o) = max.(o .- 1, min.(o, Int(pmin)))
 
     for (k, cell) in p
@@ -1025,8 +1033,7 @@ function coarsen(V::Space{D,T}; h=(), p=(), pmin::Integer=1) where {D,T}
             throw(ArgumentError("coarsen: cell $cell of level $k is covered by a finer level, " *
                                 "and lowering a covered cell's order is not observable until the " *
                                 "cover lifts. Release the cover first."))
-        field = field_of(k)
-        field[cell] = lowered(field[cell])
+        field_of(k)[cell] = lowered(cell_order(V.levels[k], cell))
     end
 
     for (k, cell) in h

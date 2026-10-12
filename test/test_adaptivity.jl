@@ -483,6 +483,28 @@ end
     @test cell_orders(coarsen(A; p=[(1, cell)], pmin=3); level=1)[cell] == (2, 8)
 end
 
+@testset "an explicit mark takes at most one order step per call" begin
+    # "Raises the marked cell's own order by one", and "lowers" it by one. A cell named twice used to step twice,
+    # because each step read the order field the call was already editing: a duplicated p-mark took an order-2 cell to
+    # 4.
+    V = ladder(_AD_Ω; cells=4, order=2, depth=1)
+    cell = CartesianIndex(2, 2)
+    @test cell_orders(refine(V; p=[(1, cell), (1, cell)]); level=1)[cell] == (3, 3)
+
+    # On the finest level an h-mark has nothing to activate and turns into the order step. Marked for p as well, the
+    # cell still takes one step, and so does an h-mark named twice.
+    W = refine(V; h=[(1, cell)])
+    fine = length(W.levels)
+    leaf = findfirst(active_cells(W; level=fine))
+    once = cell_order(W, leaf; level=fine) .+ 1
+    @test cell_orders(refine(W; h=[(fine, leaf)], p=[(fine, leaf)]); level=fine)[leaf] == once
+    @test cell_orders(refine(W; h=[(fine, leaf), (fine, leaf)]); level=fine)[leaf] == once
+
+    # The mirror: a duplicated release lowers once.
+    T = ladder(_AD_Ω; cells=4, order=3, depth=1)
+    @test cell_orders(coarsen(T; p=[(1, cell), (1, cell)]); level=1)[cell] == (2, 2)
+end
+
 @testset "refine and coarsen return their argument when nothing moved" begin
     # Identity is the exhaustion signal. Without it a saturated cycle returns a fresh but identical `Space`, the caller
     # rebuilds the model, and the loop runs to its step limit with nothing changing.
