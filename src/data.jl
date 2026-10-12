@@ -11,7 +11,7 @@
 # keyword is typed to it. It moves one scalar per point, so a component-valued state travels as one `QuadField` per
 # component.
 
-# ── QuadField ────────────────────────────────────────────────────────────────
+# ── QuadField ─────────────────────────────────────────────────────────────────
 
 """
     QuadField{T}(model; init = q -> zero(T))
@@ -87,26 +87,11 @@ end
 Base.setindex!(qf::QuadField, v, i::Integer) = (qf.data[i]=v; qf)
 Base.copy(qf::QuadField{T}) where {T} = QuadField{T}(copy(qf.data), qf.model_version)
 
-# Stale-QuadField check used by `transfer` and any consumer that reads a `QuadField` against a `Model`. Same contract as
-# `_checked_coefficients` in `solvers.jl`: returns the data vector when the pin and the length agree, raises a clear
-# error otherwise.
-function _checked_quadfield(qf::QuadField, model::Model)
-    qf.model_version == model.version ||
-        throw(ArgumentError("this QuadField was built on a different discretisation, or on this model " *
-                            "before it was mutated (field pin 0x$(string(qf.model_version; base=16)), " *
-                            "model pin 0x$(string(model.version; base=16))); carry it across with " *
-                            "`transfer`"))
-    length(qf.data) == nquadpoints(model) ||
-        throw(DimensionMismatch("QuadField length $(length(qf.data)) does not match " *
-                                "nquadpoints(model) = $(nquadpoints(model))"))
-    return qf.data
-end
-
 function Base.show(io::IO, qf::QuadField{T}) where {T}
     print(io, "QuadField{", T, "}(npoints=", length(qf.data), ", pin=0x", string(qf.model_version; base=16), ")")
 end
 
-# ── Detecting point-keyed state ──────────────────────────────────────────────
+# ── Detecting point-keyed state ───────────────────────────────────────────────
 #
 # `q.point` is an index into ONE model's quadrature cloud. A verb that re-evaluates forms it did not write, on a second
 # cloud — `estimate`, which assembles the caller's own blocks and loads on an enriched model of its own — therefore
@@ -216,7 +201,7 @@ const _FOREIGN_POINTS = -reinterpret(Int, 0x9E3779B97F4A7C15 >> 2)
                         "or estimate on a model whose forms carry no per-point state."))
 end
 
-# ── Transfer scheme ──────────────────────────────────────────────────────────
+# ── Transfer scheme ───────────────────────────────────────────────────────────
 
 """
     RBFP0(; neighbors=10)
@@ -257,7 +242,7 @@ RBFP0(; neighbors::Int=10) = RBFP0(neighbors)
 # `_rbfp0_local`).
 const _RBFP0_MAX_NEIGHBORS = 16
 
-# ── Public transfer ──────────────────────────────────────────────────────────
+# ── Public transfer ───────────────────────────────────────────────────────────
 
 """
     transfer(source::QuadField, source_model, target_model; via=RBFP0(), threaded=true) -> QuadField
@@ -293,6 +278,21 @@ function transfer(source::QuadField, source_model::Model{D,T}, target_model::Mod
     out = Vector{T}(undef, length(targets))
     _rbfp0_transfer!(Val(k), out, KDTree(cloud; reorder=false), cloud, source_data, targets, threaded)
     return QuadField{T}(out, target_model.version)
+end
+
+# Stale-QuadField check used by `transfer` and any consumer that reads a `QuadField` against a `Model`. Same contract as
+# `_checked_coefficients` in `solvers.jl`: returns the data vector when the pin and the length agree, raises a clear
+# error otherwise.
+function _checked_quadfield(qf::QuadField, model::Model)
+    qf.model_version == model.version ||
+        throw(ArgumentError("this QuadField was built on a different discretisation, or on this model " *
+                            "before it was mutated (field pin 0x$(string(qf.model_version; base=16)), " *
+                            "model pin 0x$(string(model.version; base=16))); carry it across with " *
+                            "`transfer`"))
+    length(qf.data) == nquadpoints(model) ||
+        throw(DimensionMismatch("QuadField length $(length(qf.data)) does not match " *
+                                "nquadpoints(model) = $(nquadpoints(model))"))
+    return qf.data
 end
 
 # The physical coordinates of `model`'s quadrature points in `q.point` order, from one walk: RBFP0 reads it once for the
