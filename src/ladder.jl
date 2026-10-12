@@ -51,7 +51,10 @@ Populate it with [`adapt`](@ref).
 Keyword arguments:
 
   - `cells`, `order`, `basis`, `mode`, `physical`, `active` — as on [`space`](@ref); they describe the base level.
-    `basis`, `mode` and `order` are carried unchanged to every overlay, and `active` applies to the base level only.
+    `basis` and `mode` are carried unchanged to every overlay, and `active` applies to the base level only. `order`
+    reaches every overlay too: an integer or a per-axis tuple unchanged; a per-cell array, shaped like the base level's
+    cells, by giving every overlay cell the order of the base cell it lies in — what an h-step of [`refine`](@ref)
+    gives a child; a function `(cell_box, cell_index) -> order` by asking it again on every level's own cells.
   - `depth` — the number of overlay levels. The space has `depth + 1` levels, at positions `1:(depth + 1)`, deepest
     last. Coverage searches strictly upward in level id, so the emission order matters and this is the only order that
     is correct.
@@ -135,7 +138,11 @@ function ladder(domain::AxisBox{D,T}; cells, depth::Integer, splits=2, order=1, 
 
     V = space(domain; cells=base_cells, order=order, basis=basis, mode=mode, physical=physical, active=active)
     for k in 1:depth
-        V = overlay(V, domain; cells=counts[k], order=order, basis=basis, mode=mode, active=CartesianIndex{D}[],
+        # A per-cell order is shaped like the base grid, which no overlay is. Every level spans the whole domain at an
+        # integer multiple of the base resolution, so repeating each entry over its own child block is exactly "each
+        # cell inherits its base parent's order" — the order an h-step of `refine` hands a child.
+        o = order isa AbstractArray ? repeat(order; inner=counts[k] .÷ base_cells) : order
+        V = overlay(V, domain; cells=counts[k], order=o, basis=basis, mode=mode, active=CartesianIndex{D}[],
                     tolerance=tolerance)
     end
     return V

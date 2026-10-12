@@ -46,6 +46,25 @@ end
     @test_throws ArgumentError ladder(LADDER_OMEGA; cells=6, depth=3, splits=[2, 2])
 end
 
+@testset "a per-cell order reaches every overlay through its base parent" begin
+    # A per-cell `order` is shaped like the base grid. Passed to the overlays unchanged it raised a DimensionMismatch
+    # against their finer grids; every overlay cell now takes its base parent's order, scalar or per axis, over
+    # anisotropic per-level splits.
+    for o in ([1 + (i + 2j) % 3 for i in 1:4, j in 1:3], [(1 + i % 2, 1 + j % 3) for i in 1:4, j in 1:3])
+        V = ladder(LADDER_OMEGA; cells=(4, 3), depth=2, splits=[(2, 3), (3, 1)], order=o)
+        @test cell_orders(V; level=1) == [p isa Int ? (p, p) : p for p in o]
+        inherits = true
+        for k in 2:3, c in cell_indices(V; level=k)
+            inherits &= cell_order(V, c; level=k) == cell_order(V, only(Unfitted._cell_block(V, k, 1, c)); level=1)
+        end
+        @test inherits
+        # The same order an h-step gives the children it wakes, so refining writes nothing new.
+        W = refine(V; h=[(1, CartesianIndex(2, 2))])
+        @test count(active_cells(W; level=2)) == 6
+        @test cell_orders(W; level=2) == cell_orders(V; level=2)
+    end
+end
+
 @testset "covered-mode pruning on a ladder is lossless" begin
     # The feature, in one assertion. A ladder refined over a block of base cells sheds modes; the reduced space must
     # still span the unreduced one.
