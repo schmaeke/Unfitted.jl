@@ -213,14 +213,19 @@ end
 # `lower` / `upper`, when given, are the region's corners: an axis on which they coincide — a boundary facet's pinned
 # axis — carries no extent to integrate along and gets 0.
 #
+# `f` runs once per parent and the maximum is taken tuple-wise (`max.`), not once per parent *and* axis: what `f` costs
+# is resolving the parent's level and reading its cell's order, which is the same work for every axis. Sizing is the
+# largest single cost of a partition-only plan — on the deep ladder of the build benchmark (6 levels, 4272 regions,
+# 21 008 parents) it was a third of `integration_plan` while `f` ran per axis. An empty `parents` still raises, as
+# `maximum` did: a region without a parent has no rule to size.
+#
 # `f::F` is a type parameter on purpose: `f` is only passed into a closure here, never called directly, and Julia does
 # not specialise a method on a function argument it merely passes along — the helper then ran on `f::Function` and
-# dispatched dynamically for every parent and axis, boxing each per-cell tuple it returned.
+# dispatched dynamically for every parent, boxing each per-cell tuple it returned.
 function _axis_max(f::F, V::Space{D}, parents, lower=nothing, upper=nothing) where {F,D}
-    return ntuple(Val(D)) do d
-        lower !== nothing && lower[d] == upper[d] && return 0
-        return maximum(parent -> f(_level_by_id(V, parent.level), parent.cell)[d], parents)
-    end
+    counts = mapreduce(parent -> f(_level_by_id(V, parent.level), parent.cell), (a, b) -> max.(a, b), parents)
+    lower === nothing && return counts
+    return ntuple(d -> lower[d] == upper[d] ? 0 : counts[d], Val(D))
 end
 
 # Per-axis tensor Gauss counts that integrate products of one cell's basis functions exactly.
@@ -653,12 +658,13 @@ end
 # contract the smooth-integrand argument needs — and decoding the signature is all it takes to find them.
 #
 # A `for` loop that pushes, not a `map` over the levels: a `map` yields a tuple of `Union{Nothing,Parent}` that is
-# boxed per level, which once made a 3D overlay plan 1.8× slower to build.
+# boxed per level, which once made a 3D overlay plan 1.8× slower to build. The list is sized to the signature's
+# non-zero slots before the first push, so each region allocates its parent storage once instead of growing it.
 #
 # `_parents!` appends to an existing list instead: a two-sided interface sub-cell decodes both sides' signatures into
 # one parent list, side `a` first (`_simplex_regions` in `surface.jl`).
 function _parents(levels::Tuple, sig::Tuple, lower::SVector{D,T}, upper::SVector{D,T}) where {D,T}
-    return _parents!(Parent{D,T}[], levels, sig, lower, upper)
+    return _parents!(sizehint!(Parent{D,T}[], count(!iszero, sig)), levels, sig, lower, upper)
 end
 
 function _parents!(parents::Vector{Parent{D,T}}, levels::Tuple, sig::Tuple, lower::SVector{D,T},
@@ -773,10 +779,11 @@ end
 # a fictitious box under strict α = 0, which has nothing to integrate and is dropped — with the small-overlap records
 # and the largest cut residual. Small-overlap diagnostics are accumulated rather than acted on: the package exposes the
 # warning, the caller decides whether to stabilise. A function barrier on `alpha`, a field of the abstractly typed
-# `Space.physical`, so the per-region rule dispatch below is static.
+# `Space.physical`, so the per-region rule dispatch below is static. The region list is reserved at the record count,
+# its bound, so it is filled without regrowing.
 function _plan_regions(records::Vector{_RegionRecord{D,T}}, fits::_MomentFitCache{D,T}, alpha, custom::Bool,
                        tolerance::GeometryTolerance{T}, domain_volume::T) where {D,T}
-    regions = VolumeRegion{D,T}[]
+    regions = sizehint!(VolumeRegion{D,T}[], length(records))
     small_overlaps = SmallOverlap{T}[]
     tensor_cache = _TensorRuleCache{D,T}()
     alpha_cache = Dict{NTuple{D,Int},Vector{T}}()

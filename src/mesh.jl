@@ -670,12 +670,17 @@ level_count(V::Space) = length(V.levels)
 
 # Linear scan over `V.levels` resolving a level id to its `Level` value. Linear is fine because typical problems carry
 # only a handful of levels; downstream callers cache the resolved levels when they iterate hot loops.
-function _level_by_id(V::Space, id::Integer)
-    for level in V.levels
-        level.id == id && return level
-    end
-    throw(ArgumentError("unknown level id $id"))
+#
+# The scan is a recursion over the level tuple, not a `for` loop: peeling the tuple with `Base.tail` unrolls it at
+# compile time, so each step compares one statically known level's id and the match is returned as is. A `for` loop
+# indexes the tuple at run time and materialises every `Level` it passes (144 bytes each in 2D) — about 40 ns per
+# lookup on a six-level ladder, which made this lookup most of the cost of sizing the rules of an integration plan
+# (`_axis_max`, one lookup per region parent).
+_level_by_id(V::Space, id::Integer) = _level_by_id(V.levels, id)
+@inline function _level_by_id(levels::Tuple, id::Integer)
+    return first(levels).id == id ? first(levels) : _level_by_id(Base.tail(levels), id)
 end
+_level_by_id(::Tuple{}, id::Integer) = throw(ArgumentError("unknown level id $id"))
 
 # Bounds check shared by every entry point that takes a level index, returning the index as an `Int` so the caller can
 # use the result directly. Written once because every site that spelled it out chose a different message, and two of

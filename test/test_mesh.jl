@@ -17,3 +17,13 @@
     V = space(omega; cells=(2, 2), order=1)
     @test_throws ArgumentError overlay(V, box((-0.1, 0.0), (0.5, 0.5)); cells=(1, 1))
 end
+
+@testset "_level_by_id resolves every level and rejects an unknown id" begin
+    # The lookup recurses over the level tuple (see its comment in mesh.jl); pin its contract on a three-level ladder.
+    V = ladder(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=2, depth=2, splits=2)
+    @test length(V.levels) == 3
+    for level in V.levels
+        @test Unfitted._level_by_id(V, level.id) === level
+    end
+    @test_throws ArgumentError Unfitted._level_by_id(V, maximum(level.id for level in V.levels) + 1)
+end
