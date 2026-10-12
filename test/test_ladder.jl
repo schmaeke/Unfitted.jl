@@ -296,6 +296,35 @@ end
     @test empties > 0                                       # the sub-box cases really occur
 end
 
+@testset "a face missed by an ulp is not an overlap" begin
+    # A sub-box overlay computes its nodes from its own corners, so a node meant to sit on a coarser level's face can
+    # miss it by an ulp: here the overlay's eighth node is 0.39999999999999997 where the base face is 0.4. Read exactly,
+    # that 5.6e-17 sliver made overlay cell 8 a child of base cell 2, and an h-step there woke 4..8.
+    V = overlay(space(box((0.0,), (1.0,)); cells=5, order=2), box((0.05,), (0.55,)); cells=10, active=falses(10))
+    @test findall(active_cells(refine(V; h=[(1, CartesianIndex(2))]); level=2)) == 4:7
+    @test findall(overlapping_cells(V, [CartesianIndex(2)]; from=1, to=2)) == 4:7
+    @test findall(overlapping_cells(V, [CartesianIndex(8)]; from=2, to=1)) == [3]
+
+    # Over sub-box overlays whose nodes refine the base's, in both directions: no block claims a cell it overlaps by at
+    # most 1e-12 of a cell, and none misses one it overlaps by more than 1e-9 of a cell.
+    slivers, missed = 0, 0
+    for nb in (5, 7, 10), a in 0:(nb-1), b in (a+1):nb, s in 1:3
+        V = overlay(space(box((0.0,), (1.0,)); cells=nb, order=2), box((a / nb,), (b / nb,)); cells=(b - a) * s)
+        for (from, to) in ((1, 2), (2, 1)), c in cell_indices(V; level=from)
+            x, y = V.levels[from].mesh.axes[1], V.levels[to].mesh.axes[1]
+            block = Unfitted._cell_block(V, from, to, c).indices[1]
+            for j in 1:(length(y)-1)
+                overlap = min(x[c[1] + 1], y[j + 1]) - max(x[c[1]], y[j])
+                h = min(x[c[1] + 1] - x[c[1]], y[j + 1] - y[j])
+                slivers += (j in block) && overlap <= 1e-12 * h
+                missed += !(j in block) && overlap > 1e-9 * h
+            end
+        end
+    end
+    @test slivers == 0
+    @test missed == 0
+end
+
 @testset "depth_masks and grading" begin
     V = ladder(LADDER_OMEGA; cells=8, order=2, depth=3, splits=2)
     d = zeros(Int, 8, 8)

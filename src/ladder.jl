@@ -222,13 +222,8 @@ end
 # `_cell_block` per cell — and 56 ms as one `overlapping_cells` per cell, which is the trap. Per mark, this function;
 # per level, the public one.
 #
-# The cell's own node coordinates are passed to `_axis_cells` exactly, with no tolerance. That is the ladder's
-# convention and it is not an oversight: levels of a ladder share their node coordinates bit-for-bit (`_mesh_axes` makes
-# a node a function of the ratio `i / n` alone, and pins the last one to the domain's upper corner), so there is no
-# rounding difference to absorb, and an additive epsilon would be wrong twice over — `GeometryTolerance` is absolute, so
-# on a domain far from the origin it is below one ulp and does nothing, while on a domain of small extent it is larger
-# than a whole cell and empties every range. Both silently. The coverage rule, whose boxes come from a level that does
-# *not* share coordinates, nudges instead; see `_cells_under_box`.
+# The per-axis rule, rounding margin included, is `_axis_overlap` below, and `overlapping_cells` tabulates the same
+# rule, so the per-cell and the set-wise map cannot disagree.
 #
 # The overlap relation is symmetric — cell i of one axis overlaps cell j of the other exactly when the reverse holds —
 # so this one function answers the cross-level map in both directions and nothing here has to know which level is the
@@ -238,7 +233,28 @@ end
 # it, which is the ordinary state of affairs on a sub-box overlay. Every caller must read it that way.
 function _cell_block(V::Space{D}, from::Integer, to::Integer, cell::CartesianIndex{D}) where {D}
     f, t = V.levels[from].mesh, V.levels[to].mesh
-    return CartesianIndices(ntuple(d -> _axis_cells(t.axes[d], f.axes[d][cell.I[d]], f.axes[d][cell.I[d] + 1]), D))
+    return CartesianIndices(ntuple(d -> _axis_overlap(t.axes[d], f.axes[d], cell.I[d]), D))
+end
+
+# The cells of axis `target` that cell `i` of axis `source` overlaps by more than rounding: the one per-axis relation
+# both cross-level maps read.
+#
+# Each endpoint is pulled inward by δ = 4·eps(m) before the exact lookup, with m the largest coordinate magnitude on
+# either axis — the coordinates' own round-off, at their own scale. Two meshes built from different boxes compute their
+# nodes from different corners, so a node one of them places on the other's face can miss it by an ulp. Read exactly, a
+# miss of 5.6e-17 on the wrong side made a cell that merely touches the face an overlapping one: a child an h-step woke,
+# a child `_predicted` counted, a parent that was no longer a leaf — against `overlapping_cells`' own contract. On a
+# ladder the margin changes nothing, because its levels share their node coordinates bit for bit (`_mesh_axes` makes a
+# node a function of the ratio `i / n` alone), so a node either coincides or lies a whole cell away.
+#
+# The margin is relative, never `GeometryTolerance`'s absolute `contain`, which is wrong twice over: on a domain far
+# from the origin it is below one ulp and does nothing, and on a domain of small extent it is larger than a whole cell
+# and empties every range — both silently. A relative δ only has to stay far below a cell, which holds for any mesh
+# whose cells are wider than a few ulps of its coordinates. The coverage rule nudges by the absolute tolerance instead;
+# see `_cells_under_box`.
+function _axis_overlap(target::Vector{T}, source::Vector{T}, i::Integer) where {T}
+    δ = 4 * eps(max(abs(target[1]), abs(target[end]), abs(source[1]), abs(source[end])))
+    return _axis_cells(target, source[i] + δ, source[i + 1] - δ)
 end
 
 """
@@ -296,7 +312,7 @@ function overlapping_cells(V::Space{D,T}, cells; from::Integer, to::Integer) whe
     # base cells are mapped onto a 64³ level, and parity (1.95 ms against 1.91 ms) in the other direction with 15 625
     # sources. The per-axis blocks are tabulated once over the source axes so no cell repeats the binary search.
     f, t = src_level.mesh, dst_level.mesh
-    ranges = ntuple(d -> [_axis_cells(t.axes[d], f.axes[d][i], f.axes[d][i + 1]) for i in 1:f.cells[d]], D)
+    ranges = ntuple(d -> [_axis_overlap(t.axes[d], f.axes[d], i) for i in 1:f.cells[d]], D)
     out = falses(t.cells)
     for ci in CartesianIndices(src)
         src[ci] || continue

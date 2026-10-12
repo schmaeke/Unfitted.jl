@@ -47,11 +47,12 @@ end
 #     scale-first order below put the last node one ulp short of `0.7`.
 #   * Meshes of the same domain whose cell counts are multiples of each other share their nodes. A node depends on `i`
 #     and `n` only through `fl(i / n)`, and the correct rounding of a rational does not depend on how it is written, so
-#     node `j·s` of an `n·s`-cell axis is node `j` of an `n`-cell axis, bit for bit. A `ladder` is built on that: its
-#     cross-level cell map (`_cell_block`, `ladder.jl`) compares node coordinates with no tolerance. Scaling first,
+#     node `j·s` of an `n·s`-cell axis is node `j` of an `n`-cell axis, bit for bit. A `ladder` is built on that: a
+#     node of one level either is a node of a finer level or lies a whole cell away from every one, so its cross-level
+#     cell map (`_cell_block`, `ladder.jl`) is exact whatever rounding margin it reads with. Scaling first,
 #     `(hi − lo)·i / n`, rounds a different product `(hi − lo)·i` on each level before dividing, and the levels part by
-#     an ulp: on `[0, 0.7]` in three cells refined by three, the last coarse cell claimed three fine cells and the other
-#     two claimed four each.
+#     an ulp: on `[0, 0.7]` in three cells refined by three, an exact map gave the last coarse cell three fine cells
+#     and the other two four each.
 #
 # Where `hi − lo` is exactly a power of two, the scale-first order gave the same nodes bit for bit, so the dyadic
 # domains of most tests and examples are unchanged by the switch; a power-of-two cell count keeps every interior node
@@ -157,13 +158,14 @@ end
 # Whether the endpoints need a tolerance is the caller's decision, not this function's, and the two in-tree callers
 # answer it differently for reasons that belong to them:
 #
-#   * endpoints taken from ANOTHER mesh are nudged inward by `tol.contain` first (`_cells_under_box`, `coverage.jl`) —
-#     an `overlay` box whose axes were built by `_mesh_axes` from its own corners does not reproduce a coarser level's
-#     node coordinates bit-for-bit;
-#   * endpoints that are this axis's own nodes, or a ladder sibling's, are passed exactly (`overlapping_cells` and
-#     `_cell_block`, `ladder.jl`), because the levels of a ladder share their node coordinates bit-for-bit and an
-#     additive epsilon there is wrong twice over — `GeometryTolerance` is absolute, so on a domain far from the origin
-#     it is below the coordinates' own ulp, and on a fine level it is a sizeable fraction of a cell.
+#   * the coverage rule nudges a box's faces inward by the absolute `tol.contain` (`_cells_under_box`, `coverage.jl`):
+#     an `overlay` box whose axes were built by `_mesh_axes` from its own corners does not reproduce a coarser
+#     level's node coordinates bit-for-bit;
+#   * the cross-level cell map nudges a cell's faces inward by a few ulps of the two axes' own magnitude
+#     (`_axis_overlap`, behind `overlapping_cells` and `_cell_block`, `ladder.jl`). That margin is scale-free: it
+#     absorbs the same rounding at any offset and extent, and changes nothing on a ladder, whose levels share their node
+#     coordinates bit-for-bit. `GeometryTolerance` would be wrong twice over there — it is absolute, so on a domain far
+#     from the origin it is below the coordinates' own ulp, and on a fine level it is a sizeable fraction of a cell.
 function _axis_cells(axis::Vector{T}, lo::T, hi::T) where {T}
     ncells = length(axis) - 1
     i = searchsortedlast(axis, lo)
