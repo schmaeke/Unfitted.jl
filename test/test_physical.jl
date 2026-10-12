@@ -649,12 +649,14 @@ end
     p = physical_domain(x -> x[1] - 0.001; lipschitz=1.0, subcell_length_scale=10.0, max_depth=0)
     V = space(omega; cells=1, order=2, physical=p)
     plan = Unfitted.integration_plan(V)
-    # :cut_failed (empty Ω∩R) and :cut_fallback (residual > _FIT_FAILURE_RESIDUAL) are both defensive tags. The leaf
-    # here is linear, so the Saye moments are exact and a zero-residual non-negative fit exists: the region is
-    # :cut_fitted, neither of the two, and the max residual stays far below the failure threshold.
+    # :cut_failed (empty Ω∩R) and :cut_fallback (residual > _FIT_FAILURE_RESIDUAL · ‖m‖) are both defensive tags. The
+    # leaf here is linear, so the Saye moments are exact and a zero-residual non-negative fit exists: the region is
+    # :cut_fitted, neither of the two, and the max residual stays far below the failure threshold. The threshold is
+    # relative to the moment norm, which is at least the cut measure 0.001 (the moment of the constant), so the
+    # residual is held against that.
     failed = count(r -> r.kind in (:cut_fallback, :cut_failed, :cut_alpha_failed), plan.regions)
     @test failed == 0
-    @test plan.moment_fit_residual_max < Unfitted._FIT_FAILURE_RESIDUAL
+    @test plan.moment_fit_residual_max < Unfitted._FIT_FAILURE_RESIDUAL * 0.001
     # Diagnostics counts must agree with the plan tags — guarding the flagging logic that the old `failed >= 0`
     # placeholder did not.
     m = prepare(stiffness(V; dirichlet=[dirichlet(0.0; on=boundary(:all))]))
@@ -728,9 +730,10 @@ end
     # would tag a region :cut_failed is not reached through the public path with the exact kernel.
     p = physical_domain(x -> 0.5 - x[1]; lipschitz=1.0, subcell_length_scale=10.0, max_depth=0)
     region_box = box((0.0,), (1.0,))
-    pts, ws, res = Unfitted.moment_fit_rule(p, region_box, (20,); target_residual=1.0e-14)
+    pts, ws, res, status = Unfitted.moment_fit_rule(p, region_box, (20,); target_residual=1.0e-14)
     @test !isempty(pts)
-    @test res < Unfitted._FIT_FAILURE_RESIDUAL
+    @test status === :fitted
+    @test res < Unfitted._FIT_FAILURE_RESIDUAL * sum(ws)   # relative to ‖m‖ ≥ m₀ = Σw, the cut measure
 end
 
 @testset "α-FCM fit failure is :cut_alpha_failed and counts as a failure" begin

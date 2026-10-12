@@ -208,7 +208,7 @@ end
     # A candidate coordinate the projection drops is the face of no active cell on any level, so every level's coverage
     # signature is constant across it and the greedy merge fuses the two slabs it separates anyway. The emitted box list
     # must therefore come out identical — box for box, in order, and bit for bit — to the one the full node grids
-    # produce. `AxisBox` is an isbits struct, so `==` on these vectors *is* the bitwise comparison.
+    # produce. `isequal` compares the corner coordinates bit for bit (it tells −0.0 from 0.0, which `==` does not).
     #
     # Neither side seeds a box where no level is live at all — outside a masked base level, say — where the projected
     # partition stops at the outermost live face instead of tiling the dead remainder; everywhere else the two lists
@@ -218,7 +218,7 @@ end
     # 1D: an overlay live on one of its cells.
     V1 = ladder(box((0.0,), (1.0,)); cells=4, order=2, depth=2, splits=2)
     V1 = adapt(V1, 3 => [CartesianIndex(5), CartesianIndex(6)])
-    @test partition_boxes(V1.levels, Val(1), tol) == full_grid_boxes(V1.levels, Val(1), tol)
+    @test isequal(partition_boxes(V1.levels, Val(1), tol), full_grid_boxes(V1.levels, Val(1), tol))
 
     # 2D and 3D ladders with a corner-anchored chain: every level spans the whole domain, so this is the configuration
     # the projection exists for.
@@ -230,7 +230,7 @@ end
             m[CartesianIndices(ntuple(_ -> 1:2, D))] .= true
             V = adapt(V, k => m)
         end
-        @test partition_boxes(V.levels, Val(D), tol) == full_grid_boxes(V.levels, Val(D), tol)
+        @test isequal(partition_boxes(V.levels, Val(D), tol), full_grid_boxes(V.levels, Val(D), tol))
         # Non-vacuity: the projection really did shrink the candidate grid.
         @test length(Unfitted._merged_axis_coordinates(V.levels, Val(D), tol)[1]) <
               length(Unfitted.merge_coordinates(vcat((Unfitted.boundary_coordinates(l.mesh)[1] for l in V.levels)...),
@@ -245,11 +245,19 @@ end
     over_mask = falses(3, 3)
     over_mask[1:2, 2:3] .= true
     V = overlay(V, box((0.13, 0.21), (0.79, 0.86)); cells=(3, 3), order=2, active=over_mask)
-    @test partition_boxes(V.levels, Val(2), tol) == full_grid_boxes(V.levels, Val(2), tol)
+    @test isequal(partition_boxes(V.levels, Val(2), tol), full_grid_boxes(V.levels, Val(2), tol))
     # Non-vacuity: the full grid really does carry boxes no level covers here — the ones the rule of seeding no such box
     # keeps out of both lists — so the masked case exercises it.
     @test length(full_grid_boxes(V.levels, Val(2), tol; uncovered=true)) >
           length(partition_boxes(V.levels, Val(2), tol))
+    # And skipping them changes no other box: a covered seed only ever absorbs candidates of its own signature, never an
+    # uncovered one, so the partition that does emit the uncovered boxes, filtered down to the covered ones, is the
+    # engine's list box for box, in order. Coverage is read the engine's way, from the signature at the box midpoint.
+    linmaps = map(level -> LinearIndices(level.mesh.cells), V.levels)
+    cells = map(_ -> Unfitted._AllCells(), V.levels)
+    covered((lower, upper)) = !all(iszero, Unfitted._signature(V.levels, linmaps, cells, (lower + upper) / 2, tol))
+    @test isequal(filter(covered, full_grid_boxes(V.levels, Val(2), tol; uncovered=true)),
+                  partition_boxes(V.levels, Val(2), tol))
 end
 
 @testset "a dropped coordinate can move a canonical one by at most tol.merge" begin

@@ -56,6 +56,17 @@ end
     pt = (SVector(0.3, 0.4),)
     @test Unfitted._simplex_measure(pt) == 1.0
     @test_throws ArgumentError Unfitted._default_normal(pt)
+
+    # Nor does any other simplex that is not codim-1: a segment in 1D (codim 0; this was a MethodError) or in 3D (a
+    # circle of normals), a triangle in 2D. Each raises the same ArgumentError, and so does a mesh of them integrated
+    # without explicit normals.
+    @test_throws ArgumentError Unfitted._default_normal((SVector(0.0), SVector(1.0)))
+    @test_throws ArgumentError Unfitted._default_normal((SVector(0.0, 0.0, 0.0), SVector(1.0, 1.0, 0.0)))
+    @test_throws ArgumentError Unfitted._default_normal((SVector(0.0, 0.0), SVector(1.0, 0.0), SVector(0.0, 1.0)))
+    u = field(:u, space(box((0.0,), (1.0,)); cells=4, order=1))
+    interval = segment_mesh([(SVector(0.1), SVector(0.9))])
+    @test_throws "no geometric normal" prepare(Problem((u,);
+                                                       loads=(loadform(u, source_form(source=1.0); on=interval),)))
 end
 
 @testset "surface region builder: simple 2D segment inside one cell" begin
@@ -426,6 +437,13 @@ end
     @test oblique(V, SVector(0.05, 0.10), SVector(0.20, 0.15)) == 3     # base p = 1
     @test oblique(V, SVector(0.55, 0.60), SVector(0.70, 0.65)) == 7     # max p = 3
     @test oblique(W, SVector(0.80, 0.80), SVector(0.95, 0.85)) == 9     # p = 4
+
+    # Under per-axis orders an axis-aligned segment takes its own axis's count, not the largest one: along x the trace
+    # product of an order-(1, 3) cell has degree 2, which 2 Gauss points integrate exactly; along y it has degree 6.
+    A = space(omega; cells=(4, 4), order=(1, 3))
+    @test oblique(A, SVector(0.05, 0.10), SVector(0.20, 0.10)) == 2     # along x: p = 1
+    @test oblique(A, SVector(0.10, 0.05), SVector(0.10, 0.20)) == 4     # along y: p = 3
+    @test oblique(A, SVector(0.05, 0.10), SVector(0.20, 0.15)) == 5     # oblique: 1 + 1 + 3
 end
 
 # The surface mass and stiffness matrices of `Γ` on the one-cell space `V` (p = 2), and the same matrices from an
@@ -484,6 +502,18 @@ end
     flat = triangle_mesh([SVector(0.12, 0.21, 0.4), SVector(0.81, 0.17, 0.4), SVector(0.37, 0.88, 0.4)], [(1, 2, 3)])
     u = field(:u, V3)
     @test nquadpoints(prepare(Problem((u,); blocks=(block(u, u, mass_form(); on=flat),))); on=flat) == 25
+
+    # Under per-axis orders the count follows the axes the simplex extends along, so an axis-aligned segment may take
+    # fewer points than the cell's largest per-axis count: along x an order-(1, 3) cell's trace products have degree 2,
+    # which 2 points integrate exactly, mass and stiffness alike.
+    a, b = SVector(0.12, 0.31), SVector(0.83, 0.31)
+    Va = space(box((0.0, 0.0), (1.0, 1.0)); cells=(1, 1), order=(1, 3))
+    mass_err, stiffness_err, count = _surface_operators_against_reference(Va, segment_mesh([(a, b)]),
+                                                                          [a + t * (b - a) for t in s],
+                                                                          w .* norm(b - a))
+    @test mass_err < 1.0e-13
+    @test stiffness_err < 1.0e-13
+    @test count == 2
 end
 
 @testset "a 2D triangle mesh is split at the grid: its surface mass is the volume mass" begin

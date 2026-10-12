@@ -391,25 +391,35 @@ end
     # grid. Every evaluation the kernel makes stays in the closed region, a pair leaf's included, so such leaves work in
     # a corner cell of the domain where two planes cross, through the kernel and the finite-cell fit alike, and give the
     # rule of the same leaves defined everywhere. (Pair leaves evaluated their leaves at a secant root beyond the fiber
-    # and at finite-difference steps beyond the region's corners, and threw here.)
-    inside(x) = all(c -> 0 <= c <= 1, x)
-    bounded(f) = x -> (inside(x) || throw(DomainError(x, "outside the mesh domain")); f(x))
+    # and at finite-difference steps beyond the region's corners, and threw here.) The leaves below are checked against
+    # the region itself, not against the domain, so every face of the region is pinned, the interior ones included;
+    # the interior cell pins faces on both sides. The test reads the coordinates' values: the kernel differentiates
+    # these leaves by `ForwardDiff`, and a `Dual` on a face of the region does not compare `<=` to the face coordinate.
+    function bounded(f, region)
+        return x -> (all(region.lower .<= Unfitted.ForwardDiff.value.(x) .<= region.upper) ||
+                         throw(DomainError(x, "outside the region $region")); f(x))
+    end
     p1 = x -> (x[1] - 0.12) + 0.5 * (x[2] - 0.12)
     p2 = x -> -(x[1] - 0.12) + 2.0 * (x[2] - 0.12)
     corner = box((0.0, 0.0), (0.25, 0.25))
     rule(f1, f2, region) = _IVQ(Any[f1, f2], x -> f1(x) <= 0 && f2(x) <= 0, region; gauss_points=4,
                                 lipschitz=[1.2, 2.3])
-    @test rule(bounded(p1), bounded(p2), corner) == rule(p1, p2, corner)
-    @test _quad(x -> 1.0, rule(bounded(p1), bounded(p2), corner)) ≈ 0.0144 rtol = 1e-14
-    domain = physical_domain(intersect(leaf(bounded(p1); lipschitz=1.2), leaf(bounded(p2); lipschitz=2.3));
-                             subcell_length_scale=0.25)
+    @test rule(bounded(p1, corner), bounded(p2, corner), corner) == rule(p1, p2, corner)
+    @test _quad(x -> 1.0, rule(bounded(p1, corner), bounded(p2, corner), corner)) ≈ 0.0144 rtol = 1e-14
+    domain = physical_domain(intersect(leaf(bounded(p1, corner); lipschitz=1.2),
+                                       leaf(bounded(p2, corner); lipschitz=2.3)); subcell_length_scale=0.25)
     _, weights, _, status = Unfitted.moment_fit_rule(domain, corner, (4, 4))
     @test status === :fitted
     @test sum(weights) ≈ 0.0144 rtol = 1e-13
+    # The same two planes crossing inside an interior cell.
+    m1 = x -> (x[1] - 0.37) + 0.5 * (x[2] - 0.37)
+    m2 = x -> -(x[1] - 0.37) + 2.0 * (x[2] - 0.37)
+    interior = box((0.25, 0.25), (0.5, 0.5))
+    @test rule(bounded(m1, interior), bounded(m2, interior), interior) == rule(m1, m2, interior)
     q1 = x -> (x[1] - 0.12) + 0.5 * (x[2] - 0.12) + 0.3 * (x[3] - 0.1)
     q2 = x -> -(x[1] - 0.12) + 2.0 * (x[2] - 0.12) + 0.2 * (x[3] - 0.1)
     corner3 = box((0.0, 0.0, 0.0), (0.25, 0.25, 0.25))
-    @test rule(bounded(q1), bounded(q2), corner3) == rule(q1, q2, corner3)
+    @test rule(bounded(q1, corner3), bounded(q2, corner3), corner3) == rule(q1, q2, corner3)
 end
 
 @testset "implicit quadrature — traces on opposite faces get no pair leaf" begin
