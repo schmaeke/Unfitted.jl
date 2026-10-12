@@ -240,78 +240,6 @@ RBFP0(; neighbors::Int=10) = RBFP0(neighbors)
 # static-array path performant and the per-target memory footprint tight.
 const _RBFP0_MAX_NEIGHBORS = 16
 
-# Inverse-multiquadric kernel `ψ(r) = 1 / √(1 + r²)`. Monotone decreasing, positive, bounded by 1 at `r = 0`.
-_rbf_invmq(r) = inv(sqrt(1 + r * r))
-
-# Build and solve the (K+1) × (K+1) RBF + P0 system as a static `SMatrix`. Returns the solution `SVector` (length
-# `K + 1`: K kernel weights followed by the constant `α`) plus the `mean_r` rescaling used so the evaluation path can
-# reproduce it.
-#
-# The system has the bordered form
-#
-#     [ A  1 ] [ w ]   [ fᵢ ]
-#     [ 1ᵀ 0 ] [ α ] = [ 0  ],   Aᵢⱼ = ψ(‖xᵢ − xⱼ‖ / r̄),
-#
-# where the bottom row enforces `Σ wᵢ = 0` (the standard polynomial orthogonality condition). `r̄ = mean ‖xᵢ − xⱼ‖` is
-# the natural length scale; it is floored at `eps(T)` so a cluster of coincident neighbours cannot divide by zero, and
-# falls back to `1` at `K = 1`, where there is no pair to average. The fallback value is arbitrary there: the `K = 1`
-# system is `[1 1; 1 0] [w; α] = [f₁; 0]`, whose solution `w = 0`, `α = f₁` is nearest-neighbour extension at any scale.
-function _rbfp0_static_solve(local_sources::NTuple{K,SVector{D,T}}, local_values::NTuple{K,T}) where {K,D,T}
-    mean_r = zero(T)
-    pairs = 0
-    @inbounds for i in 1:K, j in (i+1):K
-        mean_r += norm(local_sources[i] - local_sources[j])
-        pairs += 1
-    end
-    mean_r = pairs == 0 ? one(T) : max(mean_r / pairs, eps(T))
-    M = K + 1
-    A = MMatrix{M,M,T,M * M}(zeros(T, M, M))
-    @inbounds for i in 1:K
-        A[i, i] = _rbf_invmq(zero(T))
-        for j in (i+1):K
-            v = _rbf_invmq(norm(local_sources[i] - local_sources[j]) / mean_r)
-            A[i, j] = v
-            A[j, i] = v
-        end
-        A[i, M] = one(T)
-        A[M, i] = one(T)
-    end
-    rhs = MVector{M,T}(zeros(T, M))
-    @inbounds for i in 1:K
-        rhs[i] = local_values[i]
-    end
-    return SMatrix(A) \ SVector(rhs), mean_r
-end
-
-# Evaluate the RBF + P0 interpolant at `x` given the local solve returned by `_rbfp0_static_solve`. Same kernel
-# `ψ(r) = 1 / √(1 + r²)` and the same `mean_r` rescaling; the constant `sol[M]` is the polynomial extension `α`.
-function _rbfp0_evaluate(x::SVector{D,T}, local_sources::NTuple{K,SVector{D,T}}, sol::SVector{M,T},
-                         mean_r::T) where {K,D,T,M}
-    K + 1 == M || throw(ArgumentError("solution length $M does not match K + 1 = $(K + 1)"))
-    result = sol[M]
-    @inbounds for i in 1:K
-        result += sol[i] * _rbf_invmq(norm(local_sources[i] - x) / mean_r)
-    end
-    return result
-end
-
-# Materialise the source quadrature-point cloud in two complementary layouts: a `D × N` `Matrix{T}` for
-# `NearestNeighbors.KDTree` compatibility (it indexes points by column) and a `Vector{SVector{D,T}}` for the small RBF
-# solve below.
-function _collect_source_cloud(source_model::Model{D,T}) where {D,T}
-    n = nquadpoints(source_model)
-    points = Matrix{T}(undef, D, n)
-    svec_points = Vector{SVector{D,T}}(undef, n)
-    foreach_quadrature_point(source_model) do q
-        x = q.x
-        @inbounds for d in 1:D
-            points[d, q.point] = x[d]
-        end
-        svec_points[q.point] = x
-    end
-    return points, svec_points
-end
-
 # ── Public transfer ──────────────────────────────────────────────────────────
 
 """
@@ -326,8 +254,9 @@ argument check — a mismatched element type surfaces as a `MethodError` from th
 the neighbour count — `1 ≤ via.neighbors ≤ 16` (the static-solve cap documented on [`RBFP0`](@ref)) and at least
 `via.neighbors` quadrature points on the source model.
 
-Algorithm: build a `KDTree` over the source cloud; for each target quadrature point find the `via.neighbors` nearest
-source neighbours, run the local RBF + P0 solve on them, and evaluate the interpolant at the target point.
+Algorithm: collect the source and the target quadrature-point clouds, one walk each, and build a `KDTree` over the
+source cloud; for each target quadrature point find the `via.neighbors` nearest source neighbours, run the local
+RBF + P0 solve on them, and evaluate the interpolant at the target point.
 
 The outer loop over target points is embarrassingly parallel: each target's small solve is independent and uses
 pure-Julia `StaticArrays` operations, so the result is bit-identical regardless of thread count for a fixed neighbour
@@ -341,47 +270,90 @@ function transfer(source::QuadField, source_model::Model{D,T}, target_model::Mod
     1 <= k <= _RBFP0_MAX_NEIGHBORS || throw(ArgumentError("RBFP0 supports 1..$_RBFP0_MAX_NEIGHBORS neighbours; got $k"))
     nsrc = length(source_data)
     nsrc >= k || throw(ArgumentError("RBFP0 needs ≥ neighbors=$k source quadrature points, model only has $nsrc"))
+    cloud = _quadrature_cloud(source_model)
+    targets = _quadrature_cloud(target_model)
+    out = Vector{T}(undef, length(targets))
+    _rbfp0_transfer!(Val(k), out, KDTree(cloud; reorder=false), cloud, source_data, targets, threaded)
+    return QuadField{T}(out, target_model.version)
+end
 
-    # Source cloud + KD-tree built once; target points collected once.
-    cloud_matrix, cloud_svecs = _collect_source_cloud(source_model)
-    tree = KDTree(cloud_matrix; reorder=false)
+# The physical coordinates of `model`'s quadrature points in `q.point` order, from one walk: RBFP0 reads it once for the
+# source cloud its KD-tree indexes and once for the target points it evaluates at. `NearestNeighbors.KDTree` builds its
+# tree over exactly such a `Vector{SVector}` — handed a `D × N` matrix it first copies the columns into one — so the
+# vector is passed as it is, and the tree, the neighbours found and the result are those of the matrix form.
+function _quadrature_cloud(model::Model{D,T}) where {D,T}
+    cloud = Vector{SVector{D,T}}(undef, nquadpoints(model))
+    foreach_quadrature_point(q -> (cloud[q.point] = q.x), model)
+    return cloud
+end
 
-    n_target = nquadpoints(target_model)
-    target_data = Vector{T}(undef, n_target)
-    target_points = Vector{SVector{D,T}}(undef, n_target)
-    foreach_quadrature_point(target_model) do q
-        target_points[q.point] = q.x
+# The per-point loop of the RBFP0 transfer, behind the one dynamic dispatch a transfer makes: `Val(K)` turns the runtime
+# neighbour count into a compile-time one, so this body and the static solve below it are compiled once per `K` and run
+# with no dispatch per point. Per target point it finds the `K` nearest source points, sorted by distance, and writes
+# the local interpolant's value there. Each target is independent, so the threaded loop writes the same values as the
+# serial one, bit for bit.
+#
+# What remains on the heap per point is `knn`'s two result vectors — four allocations on Julia 1.12, which counts an
+# array and its memory block separately — and, from `K = 14` on, the solve's (see `_rbfp0_local`). `knn!` fills
+# preallocated vectors, but it exists only from NearestNeighbors 0.4.19 on, and the package's compat admits 0.4.8.
+function _rbfp0_transfer!(::Val{K}, out::Vector{T}, tree, cloud::Vector{SVector{D,T}}, data,
+                          targets::Vector{SVector{D,T}}, threaded::Bool) where {K,D,T}
+    function point!(i)
+        nearest = first(knn(tree, targets[i], K, true))
+        sources, values = ntuple(j -> cloud[nearest[j]], Val(K)), ntuple(j -> data[nearest[j]], Val(K))
+        out[i] = _rbfp0_local(targets[i], sources, values)
+        return nothing
     end
-
-    # Per-target work: K-nearest-neighbour query + local RBF + P0 solve. Pulled into a named closure so the threaded and
-    # serial branches below share the body.
-    function process(i)
-        x = target_points[i]
-        idxs, _ = knn(tree, x, k, true)
-        target_data[i] = _rbfp0_resolve(Val(k), x, idxs, cloud_svecs, source_data)
-    end
-
     if threaded
-        Threads.@threads for i in 1:n_target
-            process(i)
+        Threads.@threads for i in eachindex(targets)
+            point!(i)
         end
     else
-        for i in 1:n_target
-            process(i)
-        end
+        foreach(point!, eachindex(targets))
     end
-
-    return QuadField{T}(target_data, target_model.version)
+    return out
 end
 
-# Materialise the `k` source neighbours' coordinates and values as `NTuple`s so the small RBF + P0 solve runs on
-# `SMatrix` / `SVector`. The `Val(k)` closure keeps the body type-stable: every distinct `k ∈ 1:_RBFP0_MAX_NEIGHBORS`
-# produces its own specialised method. An explicit `@generated` version would shave the dispatch overhead slightly but
-# is not necessary at the current `K ≤ 16` cap.
-@inline function _rbfp0_resolve(::Val{K}, x::SVector{D,T}, idxs::AbstractVector{Int}, cloud::Vector{SVector{D,T}},
-                                source_data::AbstractVector{T}) where {K,D,T}
-    local_sources = ntuple(j -> cloud[idxs[j]], Val(K))
-    local_values = ntuple(j -> source_data[idxs[j]], Val(K))
-    sol, mean_r = _rbfp0_static_solve(local_sources, local_values)
-    return _rbfp0_evaluate(x, local_sources, sol, mean_r)
+# The RBF + P0 interpolant through the `K` neighbours `sources` with the values `values`, evaluated at `x`. It solves
+# the bordered (K+1) × (K+1) system
+#
+#     [ A  1 ] [ w ]   [ fᵢ ]
+#     [ 1ᵀ 0 ] [ α ] = [ 0  ],   Aᵢⱼ = ψ(‖xᵢ − xⱼ‖ / r̄),
+#
+# whose bottom row enforces `Σ wᵢ = 0` (the standard polynomial orthogonality condition), and returns
+# `α + Σ wᵢ ψ(‖xᵢ − x‖ / r̄)`. `r̄ = mean ‖xᵢ − xⱼ‖` is the natural length scale; it is floored at `eps(T)` so a cluster
+# of coincident neighbours cannot divide by zero, and falls back to `1` at `K = 1`, where there is no pair to average.
+# The fallback value is arbitrary there: the `K = 1` system is `[1 1; 1 0] [w; α] = [f₁; 0]`, whose solution `w = 0`,
+# `α = f₁` is nearest-neighbour extension at any scale.
+#
+# The matrix is filled in place as an `MMatrix` and solved as an `SMatrix`. It does not escape, so an optimised build
+# keeps it off the heap, where `MMatrix(zeros(T, M, M))` used to build a heap `Matrix` first and the right-hand side a
+# second heap vector at every target point: up to `K = 13` the whole solve allocates nothing. A larger system exceeds
+# the 14 × 14 up to which StaticArrays factors a static matrix itself, and its `\` converts to a dense `Matrix` and
+# solves that, 8 to 10 allocations per point at `K = 14` to 16. A neighbour value of another type than the coordinates'
+# has no method here, which is the `MethodError` `transfer`'s docstring describes.
+function _rbfp0_local(x::SVector{D,T}, sources::NTuple{K,SVector{D,T}}, values::NTuple{K,T}) where {K,D,T}
+    mean_r = zero(T)
+    @inbounds for i in 1:K, j in (i+1):K
+        mean_r += norm(sources[i] - sources[j])
+    end
+    pairs = K * (K - 1) ÷ 2
+    mean_r = pairs == 0 ? one(T) : max(mean_r / pairs, eps(T))
+    A = zeros(MMatrix{K + 1,K + 1,T})
+    @inbounds for i in 1:K
+        A[i, i] = _rbf_invmq(zero(T))
+        for j in (i+1):K
+            A[i, j] = A[j, i] = _rbf_invmq(norm(sources[i] - sources[j]) / mean_r)
+        end
+        A[i, K+1] = A[K+1, i] = one(T)
+    end
+    sol = SMatrix(A) \ SVector(values..., zero(T))
+    result = sol[K+1]
+    @inbounds for i in 1:K
+        result += sol[i] * _rbf_invmq(norm(sources[i] - x) / mean_r)
+    end
+    return result
 end
+
+# Inverse-multiquadric kernel `ψ(r) = 1 / √(1 + r²)`. Monotone decreasing, positive, bounded by 1 at `r = 0`.
+_rbf_invmq(r) = inv(sqrt(1 + r * r))
