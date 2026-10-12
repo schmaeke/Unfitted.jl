@@ -498,16 +498,13 @@ function _facet_regions(records::Vector{_RegionRecord{D,T}}, slice, sides::Vecto
     regions = FacetRegion{D,T}[]
     next = 0
     for record in records
-        base = _cached_tensor_quadrature!(rules, record.counts, T)
-        alpha_weights = record.verdict === :full || iszero(alpha) ? base.weights :
-                        _cached_alpha_weights!(alpha_cache, record.counts, base.weights, alpha)
         fit = nothing
         if record.verdict === :cut
             points, weights, residual, status = fits[next += 1]
             fit = (SVector{D,T}[_lift(p, frame_pins) for p in points], weights, residual, status)
         end
-        kind, points, weights, residual = _trimmed_rule(record.verdict, base.points, base.weights, alpha, alpha_weights,
-                                                        fit, false)
+        kind, points, weights, residual = _trimmed_rule(record.verdict, record.counts, rules, alpha_cache, alpha, fit,
+                                                        false)
         push!(regions,
               Region(record.lower, record.upper, record.parents, kind, points, weights; normal, sides, residual))
     end

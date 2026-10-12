@@ -572,14 +572,6 @@ function _cached_tensor_quadrature!(cache::_TensorRuleCache{D,T}, counts::NTuple
     return get!(() -> _tensor_gauss_rule(counts, T), cache, counts)
 end
 
-# α-scaled weights cache, keyed by per-axis quadrature counts, shared by every region whose rule carries the α-scaled
-# tensor rule (`:fictitious_alpha`, `:cut_alpha_failed` and the α part of a blended cut rule). The PhysicalDomain (and
-# so `alpha`) is constant for the duration of one `integration_plan` call, so `alpha` need not be part of the cache key.
-function _cached_alpha_weights!(cache::Dict{NTuple{D,Int},Vector{T}}, counts::NTuple{D,Int}, base_weights::Vector{T},
-                                alpha) where {D,T}
-    return get!(() -> base_weights .* alpha, cache, counts)
-end
-
 # Moment-fit rule cache, keyed by the canonicalised region bounds and the moment basis order, each value one cut
 # region's rule `(ref_points, ref_weights, residual, status)` as `_fit_rule` returns it.
 #
@@ -655,8 +647,8 @@ const _CUT_KINDS = (:cut_fitted, :cut_custom, :cut_fallback, :cut_failed, :cut_a
 const _FAILED_KINDS = (:cut_fallback, :cut_failed, :cut_alpha_failed)
 
 # The rule one admissible region carries, from the classifier's `verdict` on it: the single home of the dispatch the
-# volume plan and the boundary facets share, of the α-FCM blend, and of the closed `kind` vocabulary (`CONTRIBUTING.md`,
-# "Region quadrature kinds"). Returns `(kind, points, weights, residual)`:
+# volume plan and the boundary facets share, of the shared base rules, of the α-FCM blend, and of the closed `kind`
+# vocabulary (`CONTRIBUTING.md`, "Region quadrature kinds"). Returns `(kind, points, weights, residual)`:
 #
 #   - `:full`                         → `:full`, the base tensor rule, ALIASED
 #   - `:fictitious`, `α == 0`         → `:fictitious`, the empty rule (the volume plan
@@ -690,25 +682,31 @@ const _FAILED_KINDS = (:cut_fallback, :cut_failed, :cut_alpha_failed)
 # degenerate sliver, whose physical contribution is negligible by construction — the domain volume is captured by the
 # well-fitted cells), the α·tensor part is kept alone so the cell's dofs are α-stabilised rather than left singular.
 #
-# `base_points` / `base_weights` are the region's tensor rule and `fit` its cut rule `(points, weights, residual,
-# status)`, both in the frame the caller integrates in; `fit` is read only on a `:cut` verdict. `alpha_weights` is the
-# α-scaled base weights, read only when `α > 0` and the verdict is not `:full`, so a caller computes it only then. The
-# residual is the fit's on every `:cut` kind and zero otherwise.
-function _trimmed_rule(verdict::Symbol, base_points::Vector{P}, base_weights::Vector{T}, alpha, alpha_weights, fit,
-                       custom::Bool) where {P,T}
-    verdict === :full && return :full, base_points, base_weights, zero(T)
+# The base rule is the region's tensor Gauss rule at its per-axis `counts` (0 on an axis the region does not extend
+# along), read from the caller's cache `rules`, and its α-scaled weights from `alpha_rules`, both keyed by the counts:
+# every `:full` region of one order aliases one rule, and every α-scaled kind one weight vector, so neither costs an
+# allocation per region. The α-scaled weights are looked up only when `α > 0` and the verdict is not `:full`, and the
+# counts alone key them because the caller's cache belongs to one `α`: one plan's (one `PhysicalDomain`), or one face's
+# (a resolver serves several spaces, which may carry different `α`). `fit` is the cut rule `(points, weights, residual,
+# status)` in the region's frame, read only on a `:cut` verdict. The residual is the fit's on every `:cut` kind and zero
+# otherwise.
+function _trimmed_rule(verdict::Symbol, counts::NTuple{D,Int}, rules::_TensorRuleCache{D,T},
+                       alpha_rules::Dict{NTuple{D,Int},Vector{T}}, alpha, fit, custom::Bool) where {D,T}
+    base = _cached_tensor_quadrature!(rules, counts, T)
+    verdict === :full && return :full, base.points, base.weights, zero(T)
+    scaled = iszero(alpha) ? base.weights : get!(() -> base.weights .* alpha, alpha_rules, counts)
     if verdict === :fictitious
-        iszero(alpha) && return :fictitious, P[], T[], zero(T)
-        return :fictitious_alpha, base_points, alpha_weights, zero(T)
+        iszero(alpha) && return :fictitious, SVector{D,T}[], T[], zero(T)
+        return :fictitious_alpha, base.points, scaled, zero(T)
     end
     points, weights, residual, status = fit
     if status === :empty
-        iszero(alpha) && return :cut_failed, P[], T[], residual
-        return :cut_alpha_failed, base_points, alpha_weights, residual
+        iszero(alpha) && return :cut_failed, SVector{D,T}[], T[], residual
+        return :cut_alpha_failed, base.points, scaled, residual
     end
     kind = custom ? :cut_custom : status === :fallback ? :cut_fallback : :cut_fitted
     iszero(alpha) && return kind, points, weights, residual
-    return kind, vcat(points, base_points), vcat(weights .* (one(T) - alpha), alpha_weights), residual
+    return kind, vcat(points, base.points), vcat(weights .* (one(T) - alpha), scaled), residual
 end
 
 # ── Plan construction ─────────────────────────────────────────────────────────
@@ -887,11 +885,8 @@ function _plan_regions(records::Vector{_RegionRecord{D,T}}, fits::_MomentFitCach
     residual_max = 0.0
     for record in records
         record.verdict === :fictitious && iszero(alpha) && continue
-        base = _cached_tensor_quadrature!(tensor_cache, record.counts, T)
-        alpha_weights = record.verdict === :full || iszero(alpha) ? base.weights :
-                        _cached_alpha_weights!(alpha_cache, record.counts, base.weights, alpha)
         fit = record.verdict === :cut ? fits[(record.lower, record.upper, record.order)] : nothing
-        kind, points, weights, residual = _trimmed_rule(record.verdict, base.points, base.weights, alpha, alpha_weights,
+        kind, points, weights, residual = _trimmed_rule(record.verdict, record.counts, tensor_cache, alpha_cache, alpha,
                                                         fit, custom)
         residual > residual_max && (residual_max = Float64(residual))
         region = Region(record.lower, record.upper, record.parents, kind, points, weights; residual)
