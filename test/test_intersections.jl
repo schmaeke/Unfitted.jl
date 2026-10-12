@@ -3,22 +3,24 @@
     @test isdefined(Unfitted, :IntegrationPlan)
 end
 
+# Every parent's frame map sends the region's frame corners `p = ∓1` — through `ξ = ξ0 ∓ dξ` in the cell's reference
+# frame — back onto the region's own physical corners.
 function assert_parent_maps(V, plan)
     for region in plan.regions
         for parent in region.parents
             parent_box = Unfitted.cell_box(V.levels[parent.level].mesh, parent.cell)
             @test parent.parent_box == parent_box
-            lower = Unfitted.reference_to_physical(parent_box, parent.local_box.lower)
-            upper = Unfitted.reference_to_physical(parent_box, parent.local_box.upper)
+            lower = Unfitted.reference_to_physical(parent_box, parent.ξ0 - parent.dξ)
+            upper = Unfitted.reference_to_physical(parent_box, parent.ξ0 + parent.dξ)
 
-            @test all(isapprox(lower[i], region.box.lower[i]; atol=1.0e-12) for i in eachindex(lower))
-            @test all(isapprox(upper[i], region.box.upper[i]; atol=1.0e-12) for i in eachindex(upper))
+            @test all(isapprox(lower[i], region.lower[i]; atol=1.0e-12) for i in eachindex(lower))
+            @test all(isapprox(upper[i], region.upper[i]; atol=1.0e-12) for i in eachindex(upper))
         end
-        @test !isempty(region.quadrature.points)
-        @test length(region.quadrature.points) == length(region.quadrature.weights)
+        @test !isempty(region.points)
+        @test length(region.points) == length(region.weights)
     end
     # merged regions must still partition the domain exactly (no lost coverage)
-    @test sum(Unfitted.volume(region.box) for region in plan.regions) ≈ Unfitted.volume(V.domain)
+    @test sum(Unfitted.volume(Unfitted._region_box(region)) for region in plan.regions) ≈ Unfitted.volume(V.domain)
 end
 
 @testset "integration regions" begin
@@ -54,6 +56,62 @@ end
     @test length(plan4.regions) == 9    # merged (was 81 unmerged)
     @test count(region -> length(region.parents) == 2, plan4.regions) == 1
     assert_parent_maps(V4, plan4)
+end
+
+@testset "the integration-region criterion: both symbols and a callable" begin
+    # `:any_parent` keeps every region some level covers, `:all_levels` only the overlap of every level, and a callable
+    # receives each region's parent list. `parents -> length(parents) ≥ 2` spells `:all_levels` on a two-level overlay,
+    # so the two must agree region for region — directly, through `prepare`, and after `move!` replays the captured
+    # plan options.
+    base = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2)
+    V = overlay(base, box((0.2, 0.3), (0.6, 0.7)); cells=(2, 2), order=2)
+    both = parents -> length(parents) >= 2
+    boxes(plan) = [Unfitted._region_box(region) for region in plan.regions]
+
+    any_plan = Unfitted.integration_plan(V)
+    all_plan = Unfitted.integration_plan(V; criterion=:all_levels)
+    fn_plan = Unfitted.integration_plan(V; criterion=both)
+    @test sum(Unfitted.volume(b) for b in boxes(any_plan)) ≈ 1.0
+    @test sum(Unfitted.volume(b) for b in boxes(all_plan)) ≈ 0.4 * 0.4
+    @test all(region -> length(region.parents) == 2, all_plan.regions)
+    @test length(all_plan.regions) < length(any_plan.regions)
+    @test boxes(fn_plan) == boxes(all_plan)
+    @test [r.parents for r in fn_plan.regions] == [r.parents for r in all_plan.regions]
+    @test_throws ArgumentError Unfitted.integration_plan(V; criterion=:no_such_rule)
+
+    bc = [dirichlet(0.0; on=boundary(:all))]
+    to = box((0.35, 0.1), (0.75, 0.5))
+    V_end = overlay(base, to; cells=(2, 2), order=2)
+    model_boxes(model) = boxes(only(model.space_plans))
+    direct = prepare(stiffness(V_end; dirichlet=bc); criterion=:all_levels)
+    mover = prepare(stiffness(V; dirichlet=bc); criterion=both)
+    @test model_boxes(mover) == boxes(all_plan)
+    move!(mover; level=2, to)
+    @test mover.plan_options.criterion === both
+    @test model_boxes(mover) == model_boxes(direct)
+    @test diagnostics(mover).integration_regions == diagnostics(direct).integration_regions
+end
+
+@testset "a callable criterion never sees a region no level covers" begin
+    # Regression. Where no level is active — the base cell (2, 2) and the overlay cell over it are both masked off — the
+    # partition still forms a candidate box, which carries no parent. `:any_parent` and `:all_levels` reject it by
+    # definition, but a callable criterion used to be handed the empty parent list, and one returning `true` kept the
+    # region and crashed sizing its rule (`maximum` over no parents). Parentless boxes are now dropped before any
+    # criterion runs, so `_ -> true` is `:any_parent`.
+    base_mask = trues(3, 3)
+    base_mask[2, 2] = false
+    over_mask = trues(2, 2)
+    over_mask[1, 1] = false
+    V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=1, active=base_mask),
+                box((1 / 3, 1 / 3), (1.0, 1.0)); cells=(2, 2), order=1, active=over_mask)
+    saw_empty = Ref(false)
+    keep_all = parents -> (isempty(parents) && (saw_empty[] = true); true)
+    plan = Unfitted.integration_plan(V; criterion=keep_all)
+    @test !saw_empty[]
+    reference = Unfitted.integration_plan(V)
+    @test [Unfitted._region_box(r) for r in plan.regions] == [Unfitted._region_box(r) for r in reference.regions]
+    @test [r.parents for r in plan.regions] == [r.parents for r in reference.regions]
+    @test sum(Unfitted.volume(Unfitted._region_box(r)) for r in plan.regions) ≈ 1 - 1 / 9
 end
 
 # `tolerance.merge` is an absolute length. A mesh whose spacing on some axis falls at or below it would have that axis's
@@ -99,11 +157,12 @@ end
     @test occursin("axis 1", err2.msg)
 end
 
-# Twin of `_merged_boxes` that builds its candidate grid from every level's *full* node grid — the partition exactly as
-# it was before the candidate coordinates were projected onto the active cells. Everything downstream is the package's
-# own code (`_coverage_signature`, `_extend_axis`, `_emit_merged_box!`), so a difference between the two can only come
-# from the coordinates.
-function full_grid_boxes(levels::Tuple, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
+# Twin of the partition engine (`_partition`, every axis free and every cell eligible) that builds its candidate grid
+# from every level's *full* node grid — the partition exactly as it was before the candidate coordinates were projected
+# onto the active cells. Everything downstream is the package's own code (`_signature`, `_extend_axis`), so a difference
+# between the two can only come from the coordinates. Like the engine it seeds no box at a candidate no level covers;
+# `uncovered = true` emits those too, which is what a partition without that rule would hand its consumers.
+function full_grid_boxes(levels::Tuple, ::Val{D}, tol::GeometryTolerance{T}; uncovered=false) where {D,T}
     intervals = ntuple(D) do d
         coords = T[]
         for level in levels
@@ -112,44 +171,54 @@ function full_grid_boxes(levels::Tuple, ::Val{D}, tol::GeometryTolerance{T}) whe
         Unfitted._intervals_from_coordinates(Unfitted.merge_coordinates(coords, tol), tol)
     end
     ranges = ntuple(d -> length(intervals[d]), D)
-    boxes = Unfitted.AxisBox{D,T}[]
+    boxes = Tuple{Unfitted.SVector{D,T},Unfitted.SVector{D,T}}[]
     any(==(0), ranges) && return boxes
     linmaps = map(level -> LinearIndices(level.mesh.cells), levels)
+    cells = map(_ -> Unfitted._AllCells(), levels)
     sigs = map(CartesianIndices(ranges)) do index
         mid = Unfitted.SVector{D,T}(ntuple(d -> (intervals[d][index.I[d]][1] + intervals[d][index.I[d]][2]) / 2, D))
-        Unfitted._coverage_signature(levels, linmaps, mid, tol)
+        Unfitted._signature(levels, linmaps, cells, mid, tol)
     end
     visited = falses(ranges)
     for start in CartesianIndices(ranges)
         visited[start] && continue
+        uncovered || !all(iszero, sigs[start]) || continue
         hi = start.I
         for d in 1:D
             hi = Unfitted._extend_axis(sigs, visited, ranges, start.I, hi, sigs[start], d)
         end
-        Unfitted._emit_merged_box!(boxes, visited, intervals, start.I, hi)
+        top = hi
+        visited[CartesianIndices(ntuple(e -> start.I[e]:top[e], D))] .= true
+        push!(boxes,
+              (Unfitted.SVector{D,T}(ntuple(d -> intervals[d][start.I[d]][1], D)),
+               Unfitted.SVector{D,T}(ntuple(d -> intervals[d][top[d]][2], D))))
     end
     return boxes
 end
 
-# The boxes of a partition that any level actually covers — the only ones any consumer of `_merged_boxes` keeps.
-covered_boxes(levels::Tuple, boxes, tol) = filter(b -> !isempty(Unfitted._parents_covering(levels, b, tol)), boxes)
+# The corners of the engine's volume partition of `levels`, in emission order.
+function partition_boxes(levels::Tuple, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
+    boxes = Tuple{Unfitted.SVector{D,T},Unfitted.SVector{D,T}}[]
+    Unfitted._partition((lower, upper, _) -> push!(boxes, (lower, upper)), levels, ntuple(identity, Val(D)),
+                        zero(Unfitted.SVector{D,T}), tol)
+    return boxes
+end
 
 @testset "the active-cell projection leaves the box partition unchanged" begin
     # A candidate coordinate the projection drops is the face of no active cell on any level, so every level's coverage
     # signature is constant across it and the greedy merge fuses the two slabs it separates anyway. The emitted box list
     # must therefore come out identical — box for box, in order, and bit for bit — to the one the full node grids
-    # produce. `AxisBox` is an isbits struct, so `==` on these vectors *is* the bitwise comparison.
+    # produce. `isequal` compares the corner coordinates bit for bit (it tells −0.0 from 0.0, which `==` does not).
     #
-    # The comparison is on the *covered* boxes. Where no level is live at all — outside a masked base level, say — the
-    # projected partition stops at the outermost live face instead of tiling the dead remainder, and the boxes that
-    # differ are exactly the parentless ones every consumer drops. On a `ladder`, whose base level is never masked, even
-    # the unfiltered lists agree, and that is asserted separately below.
+    # Neither side seeds a box where no level is live at all — outside a masked base level, say — where the projected
+    # partition stops at the outermost live face instead of tiling the dead remainder; everywhere else the two lists
+    # must agree exactly.
     tol = GeometryTolerance(Float64)
 
     # 1D: an overlay live on one of its cells.
     V1 = ladder(box((0.0,), (1.0,)); cells=4, order=2, depth=2, splits=2)
     V1 = adapt(V1, 3 => [CartesianIndex(5), CartesianIndex(6)])
-    @test Unfitted._merged_boxes(V1.levels, Val(1), tol) == full_grid_boxes(V1.levels, Val(1), tol)
+    @test isequal(partition_boxes(V1.levels, Val(1), tol), full_grid_boxes(V1.levels, Val(1), tol))
 
     # 2D and 3D ladders with a corner-anchored chain: every level spans the whole domain, so this is the configuration
     # the projection exists for.
@@ -161,7 +230,7 @@ covered_boxes(levels::Tuple, boxes, tol) = filter(b -> !isempty(Unfitted._parent
             m[CartesianIndices(ntuple(_ -> 1:2, D))] .= true
             V = adapt(V, k => m)
         end
-        @test Unfitted._merged_boxes(V.levels, Val(D), tol) == full_grid_boxes(V.levels, Val(D), tol)
+        @test isequal(partition_boxes(V.levels, Val(D), tol), full_grid_boxes(V.levels, Val(D), tol))
         # Non-vacuity: the projection really did shrink the candidate grid.
         @test length(Unfitted._merged_axis_coordinates(V.levels, Val(D), tol)[1]) <
               length(Unfitted.merge_coordinates(vcat((Unfitted.boundary_coordinates(l.mesh)[1] for l in V.levels)...),
@@ -176,11 +245,19 @@ covered_boxes(levels::Tuple, boxes, tol) = filter(b -> !isempty(Unfitted._parent
     over_mask = falses(3, 3)
     over_mask[1:2, 2:3] .= true
     V = overlay(V, box((0.13, 0.21), (0.79, 0.86)); cells=(3, 3), order=2, active=over_mask)
-    @test covered_boxes(V.levels, Unfitted._merged_boxes(V.levels, Val(2), tol), tol) ==
-          covered_boxes(V.levels, full_grid_boxes(V.levels, Val(2), tol), tol)
-    # Non-vacuity: the unfiltered lists really do differ here, so the filter is carrying the claim rather than hiding a
-    # failure.
-    @test Unfitted._merged_boxes(V.levels, Val(2), tol) != full_grid_boxes(V.levels, Val(2), tol)
+    @test isequal(partition_boxes(V.levels, Val(2), tol), full_grid_boxes(V.levels, Val(2), tol))
+    # Non-vacuity: the full grid really does carry boxes no level covers here — the ones the rule of seeding no such box
+    # keeps out of both lists — so the masked case exercises it.
+    @test length(full_grid_boxes(V.levels, Val(2), tol; uncovered=true)) >
+          length(partition_boxes(V.levels, Val(2), tol))
+    # And skipping them changes no other box: a covered seed only ever absorbs candidates of its own signature, never an
+    # uncovered one, so the partition that does emit the uncovered boxes, filtered down to the covered ones, is the
+    # engine's list box for box, in order. Coverage is read the engine's way, from the signature at the box midpoint.
+    linmaps = map(level -> LinearIndices(level.mesh.cells), V.levels)
+    cells = map(_ -> Unfitted._AllCells(), V.levels)
+    covered((lower, upper)) = !all(iszero, Unfitted._signature(V.levels, linmaps, cells, (lower + upper) / 2, tol))
+    @test isequal(filter(covered, full_grid_boxes(V.levels, Val(2), tol; uncovered=true)),
+                  partition_boxes(V.levels, Val(2), tol))
 end
 
 @testset "a dropped coordinate can move a canonical one by at most tol.merge" begin
@@ -195,12 +272,12 @@ end
     V = space(box((0.0,), (1.0,)); cells=2, order=1)
     V = overlay(V, box((0.0,), (1.0 - eps_shift,)); cells=2, order=1, active=[CartesianIndex(1)])
 
-    projected = Unfitted._merged_boxes(V.levels, Val(1), tol)
+    projected = partition_boxes(V.levels, Val(1), tol)
     full = full_grid_boxes(V.levels, Val(1), tol)
     @test length(projected) == length(full)
     @test projected != full                                  # the caveat is real
-    for (p, f) in zip(projected, full)
-        @test maximum(abs, p.lower - f.lower) <= tol.merge
-        @test maximum(abs, p.upper - f.upper) <= tol.merge
+    for ((plower, pupper), (flower, fupper)) in zip(projected, full)
+        @test maximum(abs, plower - flower) <= tol.merge
+        @test maximum(abs, pupper - fupper) <= tol.merge
     end
 end

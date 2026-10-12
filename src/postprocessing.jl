@@ -256,11 +256,11 @@ function write_quadrature_vtm(path::AbstractString, model::Model{D,T}) where {D,
             for i in region_indices
                 region = all_regions[i]
                 jacobian = _region_jacobian(region)
-                for (eta, w) in zip(region.quadrature.points, region.quadrature.weights)
-                    x = reference_to_physical(region.box, eta)
+                for k in 1:_region_qpoint_count(region)
+                    x, weight, _ = _region_point(region, k, jacobian)
                     push!(points, _vtk_point(x))
                     push!(verts, MeshCell(PolyData.Verts(), SVector{1,Int}(length(points))))
-                    push!(weights, w * jacobian)
+                    push!(weights, weight)
                 end
             end
             suffix = isempty(sig) ? "none" : join(sig, "_")
@@ -527,8 +527,9 @@ end
 # region-reference coordinate, which is what the `u` accessor evaluates the solution at.
 function _vtk_sample(model::Model{D,T}, region_id::Int, region::VolumeRegion{D,T}, box::AxisBox{D,T}, x::SVector{D,T},
                      location::Symbol) where {D,T}
-    context = (; location, region_id, region=region.box, cell=box, parents=region.parents, model_version=model.version,)
-    return (; context, x, xi=(; region=physical_to_reference(region.box, x)))
+    region_box = _region_box(region)
+    context = (; location, region_id, region=region_box, cell=box, parents=region.parents, model_version=model.version,)
+    return (; context, x, xi=(; region=physical_to_reference(region_box, x)))
 end
 
 # Pair each `name => callback` entry with a typed array of the values that callback returned, ready for `WriteVTK`
@@ -600,9 +601,9 @@ _vtk_vector_array(array::Vector) = array
 # by construction rather than by care.
 function _region_boxes(space::Space{D,T}, region::VolumeRegion{D,T}, subdivisions, depth::Int,
                        lipschitz::Float64) where {D,T}
-    base = _subboxes(region.box, _subdivision_counts(space, region, subdivisions))
+    base = _subboxes(_region_box(region), _subdivision_counts(space, region, subdivisions))
     physical = space.physical
-    (depth == 0 || physical === nothing || !_is_cut_region(region)) && return base
+    (depth == 0 || physical === nothing || !(region.kind in _CUT_KINDS)) && return base
 
     boxes = AxisBox{D,T}[]
     for b in base
@@ -629,9 +630,7 @@ function _subdivision_counts(space::Space{D,T}, region::VolumeRegion{D,T}, subdi
         # cells, so sizing from it subdivides every region at the order of the loudest cell anywhere on the level.
         # Measured on a 3D 8³ level at p=1 with a single p=6 cell, the default `write_vtk` path emitted 110 592 subcells
         # against 512 and 221.9 MB against 2.50 MB.
-        return ntuple(D) do d
-            maximum(parent -> max(1, cell_order(_level_by_id(space, parent.level), parent.cell)[d]), region.parents)
-        end
+        return _axis_max((level, cell) -> max.(1, cell_order(level, cell)), space, region.parents)
     elseif subdivisions === :none
         return ntuple(_ -> 1, D)
     elseif subdivisions isa Integer
@@ -658,13 +657,6 @@ function _subboxes(b::AxisBox{D,T}, counts::NTuple{D,Int}) where {D,T}
     return boxes
 end
 
-# Does ∂Ω pass through this region? `:full` is entirely physical and `:fictitious_alpha` entirely fictitious; every
-# other kind the quadrature builder produces — `:cut_fitted`, `:cut_custom`, `:cut_fallback`, `:cut_failed`,
-# `:cut_alpha_failed` — is a region the boundary crosses. Naming the two non-cut kinds rather than the five cut ones
-# keeps a future cut kind on the correct side by default. Without a `PhysicalDomain` every region is `:full`, so this is
-# uniformly `false`.
-_is_cut_region(region::VolumeRegion) = region.quadrature.kind !== :full && region.quadrature.kind !== :fictitious_alpha
-
 # Collect the leaves of the cut tree rooted at `b` into `boxes`. Descend only into marked boxes, and descend every
 # marked box the full `depth`, so every leaf that ∂Ω passes through comes out at the same size. That uniformity is
 # load-bearing: two finest leaves sharing a face see identical corner coordinates and therefore identical φ, so their
@@ -690,11 +682,11 @@ end
 # Should this sub-box be bisected? Two regimes, and which one applies is decided by whether the geometry declares a
 # Lipschitz constant.
 #
-#   * finite `L` — mark iff `|φ(c)| ≤ L·r` with `r` the half-diagonal. This is the exact negation of the package's own
-#     uniform-sign certificate in `_tri`: an *unmarked* box provably has one sign of φ over its whole closed box, so it
-#     contains no part of ∂Ω and emits no cut surface, and no hanging node on its faces can disagree with a finer
-#     neighbour. That is what makes the output crack-free rather than merely crack-free in practice. One φ evaluation
-#     per box.
+#   * finite `L` — mark iff `|φ(c)| ≤ L·r` with `r` the half-diagonal, i.e. iff the package's own uniform-sign
+#     certificate (`_certified_sign`, the classifier's test) leaves the box undetermined: an *unmarked* box provably
+#     has one sign of φ over its whole closed box, so it contains no part of ∂Ω and emits no cut surface, and no
+#     hanging node on its faces can disagree with a finer neighbour. That is what makes the output crack-free rather
+#     than merely crack-free in practice. One φ evaluation per box.
 #   * `L = Inf` (the default from `leaf(f)`) — no certificate exists, so fall back to the corner signs, which is the
 #     same evidence ParaView's own clip works from. 2ᴰ evaluations, and a feature of Ω smaller than the box and missing
 #     every corner is invisible; the remedy is to declare the constant on the leaf.
@@ -702,13 +694,12 @@ end
 # Deliberately *not* used: a secant bound `max|φ(vᵢ) − φ(c)|` in place of `L·r`. It is identically zero whenever φ is
 # symmetric about the box center — two parallel plates straddling it, say — and the box then goes unmarked at every
 # threshold, which is exactly the configuration that tears.
-function _cut_marked(physical::PhysicalDomain, b::AxisBox{D,T}, lipschitz::Float64) where {D,T}
-    if isfinite(lipschitz)
-        return abs(levelset_value(physical, center(b))) <= lipschitz * _half_diagonal(b)
-    end
-    corners = _box_corners(b, Val(D))
-    inside = levelset_value(physical, corners[1]) <= 0
-    return any(i -> (levelset_value(physical, corners[i]) <= 0) != inside, 2:(2^D))
+function _cut_marked(physical::PhysicalDomain, b::AxisBox, lipschitz::Float64)
+    φ = x -> levelset_value(physical, x)
+    isfinite(lipschitz) && return _certified_sign(φ, lipschitz, b) == 0
+    corners = _box_vertices(b)
+    inside = φ(first(corners)) <= 0
+    return any(x -> (φ(x) <= 0) != inside, Base.tail(corners))
 end
 
 # ── Level meshes ──────────────────────────────────────────────────────────────
@@ -1023,8 +1014,8 @@ _squared_norm(value) = sum(abs2, value)
 # Quadrature-only postprocessing on a portion of the boundary. It is a sum over the quadrature-point walker (`_walk` in
 # `assembly.jl`), so it integrates over the region list assembly resolves for the same `on=` target, visits the points
 # in the serial assembly order and hands the integrand the payload a form sees. Physical [`FacetRegion`](@ref)s,
-# immersed [`SurfaceRegion`](@ref)s and two-sided [`InterfaceRegion`](@ref)s take one path, and no per-point geometry
-# work happens in it — every region carries precomputed physical-frame points and weights.
+# immersed-surface and two-sided interface [`SimplexRegion`](@ref)s take one path, the region accessors', which map
+# each region's frame rule to physical points and weights.
 
 """
     boundary_integral(integrand, model::Model; on, field=nothing) -> result
@@ -1041,12 +1032,14 @@ Integrate a user callback over a portion of the boundary or over a coupling inte
     `boundary_integral(q -> 1.0, model; on=boundary(axis=d, side=s))` returns the measure of the face's physical part
     and `integrand` is called only at points inside `Ω`, while `α > 0` blends the full face back in and forfeits both.
     The `cut_facet_region_count` field of [`AssemblyDiagnostics`](@ref) counts how many of the integrated regions needed
-    trimming, and `facet_moment_fit_residual_max` how well their fits went — accurate rather than exact wherever the
-    restricted level set is not one affine function, for which [`boundary`](@ref) gives the condition and the two ways
-    it fails. A selector every one of whose faces lies outside `Ω` carries no quadrature at all under `α = 0` and
-    raises, exactly as a selector no active cell reaches does.
-  - A [`BoundaryMesh`](@ref) — a user-supplied immersed-boundary mesh (segments in 2D, triangles in 3D, points in any
-    D). The package walks the precomputed per-cell quadrature rules.
+    trimming, and `facet_moment_fit_residual_max` how well their fits went — exact where every restricted leaf is affine
+    (planar), corners strictly inside the face included, and on one-dimensional facets, accurate rather than exact on a
+    curved cut, as [`boundary`](@ref) details. A selector every one of whose faces lies outside `Ω` carries no
+    quadrature at all under `α = 0` and raises, exactly as a selector no active cell reaches does.
+  - A [`BoundaryMesh`](@ref) — a user-supplied immersed mesh of points, segments or triangles, of any simplex dimension
+    `0 ≤ K ≤ min(D, 2)`: a curve or a surface, a point set, or a codim-0 patch (see [`BoundaryMesh`](@ref)). The
+    package walks the precomputed per-cell quadrature rules, which integrate any product of two basis functions of the
+    covering cells exactly on every sub-cell, oblique or axis-aligned.
   - An [`Interface`](@ref) — the two-sided interface of a coupled model, which spans both its subdomains and ignores
     `field`.
 

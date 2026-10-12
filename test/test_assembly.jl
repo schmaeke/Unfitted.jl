@@ -286,8 +286,8 @@ end
     u = field(:u, V)
     model = prepare(Problem((u,); dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     load = source_load(u; source=1.0)
-    left = region -> region.box.upper[1] <= 0.5 + 1.0e-12
-    right = region -> region.box.upper[1] > 0.5 + 1.0e-12
+    left = region -> region.upper[1] <= 0.5 + 1.0e-12
+    right = region -> region.upper[1] > 0.5 + 1.0e-12
     nowhere = region -> false
 
     full = assemble_vector(model, load; threaded=false)
@@ -483,7 +483,7 @@ end
     K = assemble_matrix(model, stiffness_block(u; diffusion=2.0))
     f = assemble_vector(model, source_load(u; source=1.0))
     filtered = assemble_vector(model, source_load(u; source=1.0);
-                               region_filter=region -> region.box.upper[1] <= 0.5 + 1.0e-12)
+                               region_filter=region -> region.upper[1] <= 0.5 + 1.0e-12)
     manual = solution(model, [0.25]; method=:manual_check)
 
     @test M[1, 1] ≈ 1 / 3
@@ -1590,7 +1590,7 @@ end
     @test cld(sum(width), Unfitted._GATHER_GRAIN) ≥ 3
 
     load = source_load(only(symmetric.problem.fields); source=x -> 1 + x[1] * x[2])
-    left = region -> region.box.upper[1] <= 0.5 + 1.0e-12
+    left = region -> region.upper[1] <= 0.5 + 1.0e-12
     full = assemble_vector(symmetric, load; threaded=false)
     part = assemble_vector(symmetric, load; region_filter=left, threaded=false)
     @test part != full

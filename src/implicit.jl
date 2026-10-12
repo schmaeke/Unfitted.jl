@@ -18,7 +18,17 @@
 #     integration on implicit domains by means of moment-fitting", Int. J.
 #     Numer. Methods Engng. 96 (2013) 512–528, doi:10.1002/nme.4569.
 #
-#   This is a clean-room pure-Julia implementation written from the method description, not a port of any specific
+#   The pair leaves that make interior corners exact (`_PairLeaf` below) specialise the second paper's pairwise
+#   elimination — every pair of level sets contributes the polynomial that eliminates the height variable between them
+#   (their resultant) to the base problem — to leaves that are monotone along the height axis, where the eliminant is
+#   one leaf evaluated at the other's fiber root.
+#
+#   Fiber roots are found by the Illinois variant of regula falsi,
+#
+#     M. Dowell, P. Jarratt, "A modified regula falsi method for computing the
+#     root of an equation", BIT 11 (1971) 168–174, doi:10.1007/BF01934364.
+#
+#   This is a clean-room pure-Julia implementation written from the method descriptions, not a port of any specific
 #   codebase.
 #
 # What it produces
@@ -38,32 +48,24 @@
 #   are graph-like (each varies monotonically, or is constant, along d* — a constant leaf, e.g. a perpendicular
 #   half-space, simply partitions the base, which is what keeps polytope corners exact). The (D−1)-dimensional base
 #   integral over the projection is built by the same recursion, partitioned by the leaves' restrictions to the two
-#   faces x_{d*} = lo and x_{d*} = hi so the projection boundary and the change in fiber topology are resolved. At each
-#   base node a 1D Gauss rule is placed on the parts of the fiber that lie in Ω, found by root-finding on the level sets
-#   and testing the membership predicate. When a box is not graph-like it is bisected (a shallow octree above the
-#   kernel); at the depth floor the kernel reduces anyway — the multi-root fiber scan still yields the correct region,
-#   only the base partition (and thus the order) degrades at the unresolved feature. ∇φ is obtained by automatic
-#   differentiation (`ForwardDiff`); a caller whose leaves cannot take `Dual` arguments overrides that with its own
-#   operator through the `grad` keyword, for which `_fd_gradient` below is the central-difference choice. Nothing in the
-#   finite-cell path sets it, so leaves reaching `moment_fit_rule` must be AD-capable.
-
-# ── Coordinate insert / remove helpers ─────────────────────────────────────────
-
-# Insert scalar `v` at axis `k` of an `M`-vector, yielding an `(M+1)`-vector. `v` may differ in type from `x`'s eltype —
-# when automatic differentiation pushes `ForwardDiff.Dual` base coordinates through a reduced closure the spliced-in
-# face value is still a plain real, so the result type is promoted.
-@inline function _insert_axis(x::SVector{M,T}, k::Int, v) where {M,T}
-    R = promote_type(T, typeof(v))
-    return SVector{M + 1,R}(ntuple(i -> i < k ? R(x[i]) : (i == k ? R(v) : R(x[i - 1])), M + 1))
-end
-
-# Drop axis `k` from an `M`-vector, yielding an `(M−1)`-vector.
-@inline function _remove_axis(x::SVector{M,T}, k::Int) where {M,T}
-    return SVector{M - 1,T}(ntuple(i -> i < k ? x[i] : x[i + 1], M - 1))
-end
-
-# Project a box onto the base obtained by removing the height axis `k`.
-_remove_axis(b::AxisBox{M,T}, k::Int) where {M,T} = AxisBox{M - 1,T}(_remove_axis(b.lower, k), _remove_axis(b.upper, k))
+#   faces x_{d*} = lo and x_{d*} = hi so the projection boundary and the change in fiber topology are resolved, and by
+#   one pair leaf per two monotone leaves, whose zero set holds the projection of their crossing — where two fiber roots
+#   swap order inside the box, a polytope corner for instance. At each base node a 1D Gauss rule is placed on the parts
+#   of the fiber that lie in Ω, found by root-finding on the level sets and testing the membership predicate. When a box
+#   is not graph-like it is bisected (a shallow octree above the kernel); at the depth floor the kernel reduces anyway —
+#   the multi-root fiber scan still yields the correct region, only the base partition (and thus the order) degrades at
+#   the unresolved feature. ∇φ is obtained by automatic differentiation (`ForwardDiff`); a caller whose leaves cannot
+#   take `Dual` arguments overrides that with its own operator through the `grad` keyword, for which `_fd_gradient`
+#   below is the central-difference choice. Nothing in the finite-cell path sets it, so leaves reaching
+#   `moment_fit_rule` must be AD-capable. Pair leaves are the exception the kernel makes for itself: they are
+#   differentiated by finite differences (`_FDLeaf`) and never see a `Dual`.
+#
+#   With the default gradient the kernel evaluates a leaf inside the closed box R only — at its corners, centre and
+#   fibers, and for a pair leaf at the two ends of a fiber and at a root between them — so a level set defined on the
+#   mesh domain alone (an image interpolant without extrapolation, a lookup into a grid) is a valid leaf. Such a leaf
+#   should test its domain on the coordinates' values (`ForwardDiff.value`): the gradient samples at R's corners are
+#   `Dual` numbers, and a `Dual` with nonzero partials does not compare `<=` (nor `==`) to a real equal to its value,
+#   so a guard `x[d] <= upper` rejects a point on R's upper face.
 
 # ── Kernel context and gradient ────────────────────────────────────────────────
 
@@ -84,7 +86,8 @@ end
 # Central-difference gradient operator for level sets through which automatic differentiation cannot be pushed. It is
 # opt-in — a caller passes it as the `grad` keyword of `implicit_volume_quadrature`, and nothing falls back to it. The
 # step size is the cube-root-of-eps balance between truncation and round-off, scaled per axis by the coordinate
-# magnitude.
+# magnitude. (The kernel's own pair leaves are differentiated by `_gradient` instead, at a box-relative step and never
+# outside the box.)
 function _fd_gradient(g, x::SVector{D,T}) where {D,T}
     h0 = cbrt(eps(T))
     return SVector{D,T}(ntuple(D) do d
@@ -94,329 +97,7 @@ function _fd_gradient(g, x::SVector{D,T}) where {D,T}
                         end)
 end
 
-# ── 1D safeguarded root finding ────────────────────────────────────────────────
-
-# Bisection of `f` on a bracket `[a, b]` with `f(a)`, `f(b)` of opposite sign. Converges to the machine-representable
-# root. Bisection (rather than Newton/Brent) never leaves the bracket, so a root is always returned.
-function _bisect(f, a::T, b::T, fa::T, fb::T) where {T}
-    lo, hi, flo = a, b, fa
-    for _ in 1:80
-        m = (lo + hi) / 2
-        (m == lo || m == hi) && return m
-        fm = f(m)
-        fm == 0 && return m
-        if (flo < 0) == (fm < 0)
-            lo, flo = m, fm
-        else
-            hi = m
-        end
-    end
-    return (lo + hi) / 2
-end
-
-# ── Sign sampling and height-axis certificate ──────────────────────────────────
-
-# A level-set callback carrying a Lipschitz constant `L` of `f` (`|f(x) − f(y)| ≤ L‖x − y‖`). The wrapper is itself
-# callable and forwards to `f`, so every consumer in this file — `_choose_axis`, `_fiber_breaks`, `_emit_fiber!`, and
-# the `ForwardDiff` gradient operator — keeps treating it as a plain callback; only `_sample_sign` dispatches on the
-# wrapper to use the certificate below.
-struct _LipschitzLeaf{F}
-    f::F
-    lipschitz::Float64
-end
-
-@inline (g::_LipschitzLeaf)(x) = g.f(x)
-
-# Attach a Lipschitz bound to a level-set callback. `nothing` passes the callback through unchanged, which selects the
-# uncertified sampling path.
-_certified(f, ::Nothing) = f
-function _certified(f, lipschitz::Real)
-    lipschitz > 0 || throw(ArgumentError("lipschitz must be positive; got $lipschitz"))
-    return _LipschitzLeaf(f, Float64(lipschitz))
-end
-
-# Sign of `g` if it is uniformly signed across the box center and its 2ᴰ corners, else `0` (a sign change was sampled).
-# Used to prune leaves that do not vary on the box.
-#
-# This is a *heuristic*: a feature smaller than the sample spacing is invisible, and pruning every leaf makes the caller
-# treat the box as uniform. The `_LipschitzLeaf` method below replaces it by a certificate wherever the caller supplied
-# a Lipschitz constant.
-function _sample_sign(g, U::AxisBox{D,T}) where {D,T}
-    vc = g(center(U))
-    sref = vc < zero(vc) ? -1 : (vc > zero(vc) ? 1 : 0)
-    sref == 0 && return 0
-    for ci in CartesianIndices(ntuple(_ -> 0:1, D))
-        x = SVector{D,T}(ntuple(a -> ci.I[a] == 0 ? U.lower[a] : U.upper[a], D))
-        v = g(x)
-        s = v < zero(v) ? -1 : (v > zero(v) ? 1 : 0)
-        s != sref && return 0
-    end
-    return sref
-end
-
-# Certified sign of a Lipschitz leaf on `U`, the same test the CSG cell classifier uses (`_tri` in `src/physical.jl`):
-# with `c` the box center and `r = _half_diagonal(U)` the radius of the smallest enclosing ball,
-#
-#     |f(y) − f(c)| ≤ L‖y − c‖ ≤ L·r    for every y ∈ U,
-#
-# so `|f(c)| > L·r` proves `f` cannot change sign on `U`. Unlike point sampling this never prunes a leaf that does vary
-# on the box, which is what keeps a geometric feature smaller than the sample spacing — a small hole well inside a cell,
-# say — from vanishing into a silently full box rule.
-#
-# `L = Inf` (the default of [`leaf`](@ref)) makes the threshold infinite, which would certify nothing and leave every
-# leaf active; that mode falls back to the point-sampling heuristic above, matching the pre-certificate behavior.
-function _sample_sign(g::_LipschitzLeaf, U::AxisBox{D,T}) where {D,T}
-    thr = g.lipschitz * _half_diagonal(U)
-    isfinite(thr) || return _sample_sign(g.f, U)
-    vc = g.f(center(U))
-    return vc > thr ? 1 : (vc < -thr ? -1 : 0)
-end
-
-# Restrict a level-set callback to the affine slice `{x_k = v}`, the base-problem leaf of one dimension-reduction step.
-# The slice is an isometric embedding of the base into ℝᴰ (`‖_insert_axis(y, k, v) − _insert_axis(z, k, v)‖ = ‖y − z‖`),
-# so a Lipschitz constant of `f` bounds the restriction just as tightly and is carried through unchanged.
-_restrict(g, k::Int, v) = x -> g(_insert_axis(x, k, v))
-_restrict(g::_LipschitzLeaf, k::Int, v) = _LipschitzLeaf(x -> g.f(_insert_axis(x, k, v)), g.lipschitz)
-
-# Pick a height axis and report whether it is certifiably graph-like. For each axis k, every leaf is classified by
-# sampling ∂g/∂x_k at the box center and 2ᴰ corners:
-#
-#   MONOTONE — consistent non-zero sign ⇒ at most one fiber root;
-#   FLAT     — |∂g/∂x_k| ≈ 0 at every sample ⇒ no fiber root (the leaf
-#              partitions the base instead; this is what makes polytope corners
-#              exact, e.g. a half-space perpendicular to k);
-#   BAD      — the sign of ∂g/∂x_k changes ⇒ possibly several fiber roots.
-#
-# An axis is usable when no leaf is BAD; among usable axes pick the one maximising the smallest |∂g/∂x_k| over the
-# MONOTONE leaves (best conditioning). Returns `(k, usable)`; when no axis is usable, `k` is the least-bad axis for the
-# force-reduce path at the subdivision floor.
-function _choose_axis(lsets, U::AxisBox{D,T}, ctx::_QuadCtx) where {D,T}
-    samples = SVector{D,T}[center(U)]
-    for ci in CartesianIndices(ntuple(_ -> 0:1, D))
-        push!(samples, SVector{D,T}(ntuple(a -> ci.I[a] == 0 ? U.lower[a] : U.upper[a], D)))
-    end
-    grads = [[ctx.gradient(g, s) for s in samples] for g in lsets]
-    # Gradient scale per leaf from the finite samples only: an SDF-like leaf evaluated at its own centre yields ∇ =
-    # 0/0 = NaN, which must not poison the flat/monotone/bad classification below.
-    scales = map(grads) do gs
-        finite = (norm(g) for g in gs if all(isfinite, g))
-        m = reduce(max, finite; init=zero(T))
-        m > 0 ? m : one(T)
-    end
-
-    best_k = 0
-    best_score = T(-Inf)
-    fallback_k = 1
-    fallback_bad = typemax(Int)
-    fallback_score = T(-Inf)
-    for k in 1:D
-        usable = true
-        score = T(Inf)
-        any_monotone = false
-        nbad = 0
-        for (gi, gs) in enumerate(grads)
-            tol = ctx.flat_tol * max(scales[gi], one(T))
-            pos = false
-            neg = false
-            minmag = T(Inf)
-            for g in gs
-                dk = g[k]
-                isfinite(dk) || continue   # ignore non-finite gradient samples
-                if dk > tol
-                    pos = true
-                    minmag = min(minmag, dk)
-                elseif dk < -tol
-                    neg = true
-                    minmag = min(minmag, -dk)
-                end
-            end
-            if pos && neg
-                usable = false
-                nbad += 1
-            elseif pos || neg
-                any_monotone = true
-                score = min(score, minmag)
-            end
-        end
-        # An axis along which no active leaf varies (all FLAT) cannot root-find the interface — it scores lowest so a
-        # genuinely monotone axis wins whenever one exists.
-        any_monotone || (score = zero(T))
-        if usable && score > best_score
-            best_score = score
-            best_k = k
-        end
-        fscore = isfinite(score) ? score : zero(T)
-        if nbad < fallback_bad || (nbad == fallback_bad && fscore > fallback_score)
-            fallback_bad = nbad
-            fallback_score = fscore
-            fallback_k = k
-        end
-    end
-    return best_k == 0 ? (fallback_k, false) : (best_k, true)
-end
-
-# ── Fiber rule emission ────────────────────────────────────────────────────────
-
-# Sorted breakpoints of the fiber `t ↦ embed(t)` on `[lo, hi]`: the endpoints plus every sign change of every active
-# leaf, located by scanning `ctx.root_samples` sub-intervals and bisecting each bracketed crossing.
-function _fiber_breaks(lsets, embed, lo::T, hi::T, ctx::_QuadCtx) where {T}
-    breaks = T[lo, hi]
-    M = ctx.root_samples
-    for g in lsets
-        tprev = lo
-        fprev = g(embed(lo))
-        for s in 1:M
-            tcur = s == M ? hi : lo + (hi - lo) * (T(s) / M)
-            fcur = g(embed(tcur))
-            # A root landing exactly on a scan sample makes `fprev*fcur` vanish, so the strict sign-change test below
-            # would miss it; the sample is itself the breakpoint.
-            if fcur == 0
-                push!(breaks, tcur)
-            elseif fprev * fcur < 0
-                push!(breaks, _bisect(t -> g(embed(t)), tprev, tcur, fprev, fcur))
-            end
-            tprev, fprev = tcur, fcur
-        end
-    end
-    sort!(breaks)
-    return breaks
-end
-
-# Place 1D Gauss rules on the parts of one fiber that lie in Ω and append the lifted points/weights (scaled by the base
-# weight `wbase`). `embed(t)` lifts a fiber coordinate to the full D-dimensional point; `membership` is the Ω test.
-function _emit_fiber!(pts::Vector{SVector{D,T}}, wts::Vector{T}, lsets, embed, lo::T, hi::T, wbase::T, membership,
-                      ctx::_QuadCtx) where {D,T}
-    breaks = _fiber_breaks(lsets, embed, lo, hi, ctx)
-    nodes, gw = ctx.nodes, ctx.weights
-    for i in 1:(length(breaks)-1)
-        a, b = breaks[i], breaks[i + 1]
-        b - a <= ctx.atol && continue
-        mid = (a + b) / 2
-        membership(embed(mid)) || continue
-        half = (b - a) / 2
-        for j in eachindex(nodes)
-            push!(pts, embed(mid + half * nodes[j]))
-            push!(wts, wbase * gw[j] * half)
-        end
-    end
-    return nothing
-end
-
-# ── Full-box tensor rule ───────────────────────────────────────────────────────
-
-# Tensor Gauss rule over the whole box, used when no leaf varies on the box and the box is inside Ω. Maps directly into
-# physical coordinates with the box Jacobian folded in.
-function _full_box_rule(U::AxisBox{D,T}, ctx::_QuadCtx) where {D,T}
-    nodes, gw = ctx.nodes, ctx.weights
-    n = length(nodes)
-    jac = volume(U) / convert(T, 2^D)
-    pts = Vector{SVector{D,T}}(undef, n^D)
-    wts = Vector{T}(undef, n^D)
-    idx = 1
-    for ci in CartesianIndices(ntuple(_ -> 1:n, D))
-        eta = SVector{D,T}(ntuple(a -> nodes[ci.I[a]], D))
-        w = one(T)
-        for a in 1:D
-            w *= gw[ci.I[a]]
-        end
-        pts[idx] = reference_to_physical(U, eta)
-        wts[idx] = w * jac
-        idx += 1
-    end
-    return pts, wts
-end
-
-# ── Core recursion ─────────────────────────────────────────────────────────────
-
-# Bisect `U` into its 2ᴰ children and concatenate `recurse(child, depth+1)` over them. This is the "not graph-like ⇒
-# subdivide" branch of the volume recursion; `recurse` is the per-child continuation.
-function _subdivide_and_collect(recurse, U::AxisBox{D,T}, depth::Int) where {D,T}
-    c = center(U)
-    pts = SVector{D,T}[]
-    wts = T[]
-    for ci in CartesianIndices(ntuple(_ -> 0:1, D))
-        lower = SVector{D,T}(ntuple(a -> ci.I[a] == 0 ? U.lower[a] : c[a], D))
-        upper = SVector{D,T}(ntuple(a -> ci.I[a] == 0 ? c[a] : U.upper[a], D))
-        cp, cw = recurse(AxisBox{D,T}(lower, upper), depth + 1)
-        append!(pts, cp)
-        append!(wts, cw)
-    end
-    return pts, wts
-end
-
-# Recursively integrate over Ω ∩ U. `lsets` is the list of leaf callbacks to partition by; `membership(x)` tests x ∈ Ω
-# at a full-dimensional point. The original problem starts from the domain's leaves and its membership predicate; each
-# reduction passes the leaves' face restrictions as a partition-only base problem (`Returns(true)` membership) and
-# applies the real membership in its own fiber loop. Stages:
-#
-#   1. Prune leaves that do not vary on U (a partition-only optimisation; `membership` re-evaluates the full predicate,
-#      so this is safe). With no varying leaf left, U is uniform: full tensor rule if inside, else empty.
-#   2. Base case D = 1: emit the inside parts of the single axis.
-#   3. Choose the height axis. If not certifiably graph-like and budget remains, bisect and recurse; at the floor,
-#      force-reduce on the least-bad axis.
-#   4. Reduce: build the base problem on U with the height axis removed (every leaf's two face restrictions,
-#      partition-only) and recurse; then sweep the base nodes, emitting a fiber rule at each.
-function _implicit_quad(lsets, membership, U::AxisBox{D,T}, ctx::_QuadCtx, depth::Int) where {D,T}
-    active = Any[]
-    for g in lsets
-        _sample_sign(g, U) == 0 && push!(active, g)
-    end
-    if isempty(active)
-        return membership(center(U)) ? _full_box_rule(U, ctx) : (SVector{D,T}[], T[])
-    end
-
-    if D == 1
-        pts = SVector{1,T}[]
-        wts = T[]
-        _emit_fiber!(pts, wts, active, t -> SVector{1,T}(t), U.lower[1], U.upper[1], one(T), membership, ctx)
-        return pts, wts
-    end
-
-    k, usable = _choose_axis(active, U, ctx)
-    if !usable && depth < ctx.max_subdiv
-        return _subdivide_and_collect((box, d) -> _implicit_quad(active, membership, box, ctx, d), U, depth)
-    end
-
-    # Reduce one dimension: partition-only base, then a fiber rule per base node.
-    Ub = _remove_axis(U, k)
-    facelo, facehi = U.lower[k], U.upper[k]
-    base = Any[]
-    for g in active
-        push!(base, _restrict(g, k, facelo))
-        push!(base, _restrict(g, k, facehi))
-    end
-    bpts, bwts = _implicit_quad(base, Returns(true), Ub, ctx, 0)
-
-    pts = SVector{D,T}[]
-    wts = T[]
-    for n in eachindex(bpts)
-        xb, wb = bpts[n], bwts[n]
-        _emit_fiber!(pts, wts, active, t -> _insert_axis(xb, k, t), facelo, facehi, wb, membership, ctx)
-    end
-    return pts, wts
-end
-
 # ── Public entry points ────────────────────────────────────────────────────────
-
-# `scale` is the region's largest edge length; the breakpoint-drop tolerance `atol` is taken relative to it so the
-# kernel behaves identically under a rescaling of the geometry. `flat_tol` is already relative (to the gradient
-# magnitude) inside `_choose_axis`.
-function _quad_ctx(::Type{T}, gauss_points::Int, grad, max_subdiv::Int, scale::Real) where {T}
-    rawnodes, rawweights = gausslegendre(gauss_points)
-    gradient = grad === nothing ? (g, x) -> ForwardDiff.gradient(g, x) : grad
-    return _QuadCtx(T.(rawnodes), T.(rawweights), gradient, max_subdiv, max(6, 2 * gauss_points),
-                    eps(T)^(3 // 4) * T(scale), sqrt(eps(T)))
-end
-
-# Pair each leaf callback with its Lipschitz bound, or pass the callbacks through untouched when the caller opted out.
-# The length check is worth an explicit error: a silently truncated `zip` would certify the wrong leaves.
-function _certified_leaves(leaves::AbstractVector, lipschitz)
-    lipschitz === nothing && return collect(Any, leaves)
-    length(lipschitz) == length(leaves) ||
-        throw(DimensionMismatch("lipschitz has $(length(lipschitz)) entries but there are " *
-                                "$(length(leaves)) leaves"))
-    return Any[_certified(f, L) for (f, L) in zip(leaves, lipschitz)]
-end
 
 """
     implicit_volume_quadrature(leaves, membership, region; gauss_points,
@@ -466,7 +147,7 @@ leaves active per box.
 function implicit_volume_quadrature(leaves::AbstractVector, membership, region::AxisBox{D,T}; gauss_points::Int,
                                     grad=nothing, max_subdiv::Int=4, lipschitz=nothing) where {D,T}
     ctx = _quad_ctx(T, gauss_points, grad, max_subdiv, maximum(region.upper - region.lower))
-    return _implicit_quad(_certified_leaves(leaves, lipschitz), membership, region, ctx, 0)
+    return _implicit_quad(_distinct(_certified_leaves(leaves, lipschitz)), membership, region, ctx, 0)
 end
 
 function implicit_volume_quadrature(phi, region::AxisBox{D,T}; gauss_points::Int, grad=nothing, max_subdiv::Int=4,
@@ -474,3 +155,502 @@ function implicit_volume_quadrature(phi, region::AxisBox{D,T}; gauss_points::Int
     return implicit_volume_quadrature(Any[phi], x -> phi(x) <= 0, region; gauss_points, grad, max_subdiv,
                                       lipschitz=lipschitz === nothing ? nothing : Any[lipschitz])
 end
+
+# `scale` is the region's largest edge length; the breakpoint-drop tolerance `atol` is taken relative to it so the
+# kernel behaves identically under a rescaling of the geometry. `flat_tol` is already relative (to the gradient
+# magnitude) inside `_choose_axis`.
+function _quad_ctx(::Type{T}, gauss_points::Int, grad, max_subdiv::Int, scale::Real) where {T}
+    rawnodes, rawweights = gausslegendre(gauss_points)
+    gradient = grad === nothing ? (g, x) -> ForwardDiff.gradient(g, x) : grad
+    return _QuadCtx(T.(rawnodes), T.(rawweights), gradient, max_subdiv, max(6, 2 * gauss_points),
+                    eps(T)^(3 // 4) * T(scale), sqrt(eps(T)))
+end
+
+# Pair each leaf callback with its Lipschitz bound, or pass the callbacks through untouched when the caller opted out.
+# The length check is worth an explicit error: a silently truncated `zip` would certify the wrong leaves.
+function _certified_leaves(leaves::AbstractVector, lipschitz)
+    lipschitz === nothing && return collect(Any, leaves)
+    length(lipschitz) == length(leaves) ||
+        throw(DimensionMismatch("lipschitz has $(length(lipschitz)) entries but there are " *
+                                "$(length(leaves)) leaves"))
+    return Any[_certified(f, L) for (f, L) in zip(leaves, lipschitz)]
+end
+
+# The leaf list with every repeat dropped, first occurrences in order. A CSG tree may name one leaf twice — (a ∩ b) ∪
+# (a ∩ c) for a ∩ (b ∪ c) — and `_leaves` lists it once per occurrence. A repeat adds nothing to the partition, only
+# work: every fiber scans it twice, and every pair leaf it forms with a third leaf is built twice (`_base_leaves`). The
+# pair leaf of the two copies, and the one of their two pair leaves a reduction further down, vanish and are pruned
+# (`_vanishes`), but only after they have been built and sampled. Identity (`===`) is the test, so wrappers of one
+# callback with one Lipschitz constant are the same leaf.
+function _distinct(leaves::Vector{Any})
+    distinct = Any[]
+    for g in leaves
+        any(h -> h === g, distinct) || push!(distinct, g)
+    end
+    return distinct
+end
+
+# ── Core recursion ─────────────────────────────────────────────────────────────
+
+# Recursively integrate over Ω ∩ U. `lsets` is the list of leaf callbacks to partition by; `membership(x)` tests x ∈ Ω
+# at a full-dimensional point. The original problem starts from the domain's leaves and its membership predicate; each
+# reduction passes the leaves' face restrictions as a partition-only base problem (`Returns(true)` membership) and
+# applies the real membership in its own fiber loop. Stages:
+#
+#   1. Prune leaves that do not vary on U, and pair leaves that vanish on it (`_vanishes`) — a partition-only
+#      optimisation; `membership` re-evaluates the full predicate, so this is safe. With no varying leaf left, U is
+#      uniform: full tensor rule if inside, else empty.
+#   2. Base case D = 1: emit the inside parts of the single axis.
+#   3. Choose the height axis. If not certifiably graph-like and budget remains, bisect and recurse; at the floor (or
+#      on a box too small to bisect), force-reduce on the least-bad axis.
+#   4. Reduce: build the base problem on U with the height axis removed (`_base_leaves`: every leaf's two face
+#      restrictions and one pair leaf per two leaves monotone along the axis that are not traces on opposite faces,
+#      partition-only) and recurse; then sweep the base nodes, emitting a fiber rule at each.
+function _implicit_quad(lsets, membership, U::AxisBox{D,T}, ctx::_QuadCtx, depth::Int) where {D,T}
+    active = Any[]
+    for g in lsets
+        _sample_sign(g, U) == 0 && !_vanishes(g, U, ctx.atol) && push!(active, g)
+    end
+    if isempty(active)
+        return membership(center(U)) ? _full_box_rule(U, ctx) : (SVector{D,T}[], T[])
+    end
+
+    if D == 1
+        pts = SVector{1,T}[]
+        wts = T[]
+        _emit_fiber!(pts, wts, active, t -> SVector{1,T}(t), U.lower[1], U.upper[1], one(T), membership, ctx)
+        return pts, wts
+    end
+
+    k, usable, classes = _choose_axis(active, U, ctx)
+    if !usable && depth < ctx.max_subdiv
+        rule = _subdivide_and_collect(box -> _implicit_quad(active, membership, box, ctx, depth + 1), U)
+        rule === nothing || return rule
+    end
+
+    # Reduce one dimension: partition-only base, then a fiber rule per base node.
+    facelo, facehi = U.lower[k], U.upper[k]
+    base = _base_leaves(active, classes, k, facelo, facehi)
+    bpts, bwts = _implicit_quad(base, Returns(true), _remove_axis(U, k), ctx, 0)
+
+    pts = SVector{D,T}[]
+    wts = T[]
+    for n in eachindex(bpts)
+        xb, wb = bpts[n], bwts[n]
+        _emit_fiber!(pts, wts, active, t -> _insert_axis(xb, k, t), facelo, facehi, wb, membership, ctx)
+    end
+    return pts, wts
+end
+
+# Bisect `U` into its 2ᴰ children (`_box_children`) and concatenate `recurse(child)` over them. This is the "not
+# graph-like ⇒ subdivide" branch of the volume recursion; `recurse` is the per-child continuation. `nothing` when `U` is
+# too small to bisect, which the caller treats as the depth floor.
+function _subdivide_and_collect(recurse, U::AxisBox{D,T}) where {D,T}
+    children = _box_children(U)
+    children === nothing && return nothing
+    pts = SVector{D,T}[]
+    wts = T[]
+    for child in children
+        cp, cw = recurse(child)
+        append!(pts, cp)
+        append!(wts, cw)
+    end
+    return pts, wts
+end
+
+# The leaves of the base problem of one reduction along axis `k` of a box spanning `[lo, hi]` on it: every active leaf's
+# restrictions to the two faces x_k = lo and x_k = hi, which resolve the projection boundary and every change of fiber
+# topology on the faces, then one pair leaf per two leaves monotone along `k` that are not restrictions to opposite
+# faces of the previous reduction, for the crossings inside the box (`_PairLeaf`, `_opposite_faces`). `classes` are the
+# leaves' classes along `k` (`_choose_axis`).
+function _base_leaves(active, classes, k::Int, lo::T, hi::T) where {T}
+    base = Any[]
+    for g in active
+        push!(base, _restrict(g, k, lo), _restrict(g, k, hi))
+    end
+    monotone = active[classes .=== :monotone]
+    h = cbrt(eps(T)) * (hi - lo)
+    for i in eachindex(monotone), j in (i+1):lastindex(monotone)
+        _opposite_faces(monotone[i], monotone[j]) && continue
+        push!(base, _FDLeaf(_PairLeaf{T}(monotone[i], monotone[j], k, lo, hi), h))
+    end
+    return base
+end
+
+# ── Sign sampling and restriction ──────────────────────────────────────────────
+
+# A level-set callback carrying a Lipschitz constant `L` of `f` (`|f(x) − f(y)| ≤ L‖x − y‖`). The wrapper is itself
+# callable and forwards to `f`, so every consumer in this file — `_choose_axis`, `_fiber_breaks`, `_emit_fiber!`, and
+# the `ForwardDiff` gradient operator — keeps treating it as a plain callback; only `_sample_sign` dispatches on the
+# wrapper to use the certificate below.
+struct _LipschitzLeaf{F}
+    f::F
+    lipschitz::Float64
+end
+
+@inline (g::_LipschitzLeaf)(x) = g.f(x)
+
+# Attach a Lipschitz bound to a level-set callback. `nothing` passes the callback through unchanged, which selects the
+# uncertified sampling path.
+_certified(f, ::Nothing) = f
+function _certified(f, lipschitz::Real)
+    lipschitz > 0 || throw(ArgumentError("lipschitz must be positive; got $lipschitz"))
+    return _LipschitzLeaf(f, Float64(lipschitz))
+end
+
+# Sign of `g` if it is uniformly signed across the box center and its 2ᴰ corners, else `0` (a sign change was sampled).
+# Used to prune leaves that do not vary on the box.
+#
+# This is a *heuristic*: a feature smaller than the sample spacing is invisible, and pruning every leaf makes the caller
+# treat the box as uniform. The `_LipschitzLeaf` method below replaces it by a certificate wherever the caller supplied
+# a Lipschitz constant.
+function _sample_sign(g, U::AxisBox)
+    sgn(v) = v < zero(v) ? -1 : (v > zero(v) ? 1 : 0)
+    sref = sgn(g(center(U)))
+    return sref != 0 && all(x -> sgn(g(x)) == sref, _box_vertices(U)) ? sref : 0
+end
+
+# Certified sign of a Lipschitz leaf on `U`, the same test the CSG cell classifier uses (`_certified_sign`: |f(c)| > L·r
+# at the center `c`, with `r` the half-diagonal, proves `f` cannot change sign on `U`). Unlike point sampling this never
+# prunes a leaf that does vary on the box, which is what keeps a geometric feature smaller than the sample spacing — a
+# small hole well inside a cell, say — from vanishing into a silently full box rule.
+#
+# `L = Inf` (the default of [`leaf`](@ref)) would certify nothing and leave every leaf active; that mode falls back to
+# the point-sampling heuristic above, matching the pre-certificate behavior.
+function _sample_sign(g::_LipschitzLeaf, U::AxisBox)
+    return isfinite(g.lipschitz) ? _certified_sign(g.f, g.lipschitz, U) : _sample_sign(g.f, U)
+end
+
+# The restriction of a level-set callback `g` to the affine slice `{x_k = v}`: the base-problem leaf of one
+# dimension-reduction step, and through `src/physical.jl` the leaf of a boundary facet's slice of Ω. A callable record
+# rather than a closure, so that the kernel can tell which face a restriction lies on (`_opposite_faces`). The
+# slice is an isometric embedding of the base into ℝᴰ (`‖_insert_axis(y, k, v) − _insert_axis(z, k, v)‖ = ‖y − z‖`), so
+# a Lipschitz constant of `g` bounds the restriction just as tightly and is carried through unchanged.
+struct _Slice{G,T}
+    g::G
+    k::Int
+    v::T
+end
+
+(s::_Slice)(x) = s.g(_insert_axis(x, s.k, s.v))
+_restrict(g, k::Int, v) = _Slice(g, k, v)
+_restrict(g::_LipschitzLeaf, k::Int, v) = _LipschitzLeaf(_Slice(g.f, k, v), g.lipschitz)
+
+# ── Pair leaves: crossings inside the box ──────────────────────────────────────
+
+# The base problem of one reduction is partitioned by the leaves' restrictions to the faces x_k = lo and x_k = hi, which
+# resolves every change of fiber topology on those faces but none strictly inside the box. Where two leaves gᵢ and gⱼ
+# that are both monotone along k cross inside it, their fiber roots swap order and the fiber integral has a kink over
+# the projection of {gᵢ = 0 = gⱼ}, with no base breakpoint there — so a polytope corner strictly inside a cut cell was
+# integrated to the base rule's accuracy (about 1e-5 at the default orders), not exactly. Each such pair therefore adds
+# one leaf to the base problem,
+#
+#     P(y) = gᵢ(y ⊕ₖ t̃ⱼ(y)),
+#
+# gᵢ evaluated at gⱼ's fiber root t̃ⱼ(y). P vanishes on the projection of the crossing; its other zeros are breakpoints
+# the base already has, or harmless extra ones. For linear leaves P is the linear function that eliminates x_k between
+# the two, so an interior corner becomes an exact breakpoint at every level of the reduction, and the recursion handles
+# the nested pairs of 3D (Saye's pairwise elimination, see the file header).
+#
+# t̃ⱼ(y) is gⱼ's root on the fiber where its end values bracket one (`_root`). Where they do not, gⱼ's root lies off the
+# fiber, outside the box, where a leaf need not be defined at all (the file header), so P is continued from values at
+# the fiber's two ends only — gᵢ's linear interpolant between its end values, taken at the secant root of gⱼ's,
+#
+#     P(y) = gᵢ(lo) + λ (gᵢ(hi) − gᵢ(lo)),    λ = gⱼ(lo) / (gⱼ(lo) − gⱼ(hi)),
+#
+# the resultant of the two leaves' linear interpolants along the fiber. It equals gᵢ at gⱼ's root as that root reaches
+# an end (λ = 0 or 1), so P is continuous, and for linear leaves it is the eliminated linear function itself over the
+# whole base: P has no kink, and an interior corner stays an exact breakpoint. (Clamping t̃ⱼ to the fiber instead would
+# also stay inside the box, but kinks P along gⱼ's traces, and the tetrahedron of the tests then misses its volume by
+# 2e-6.) Off the bracket P vanishes only where the two interpolants' roots meet beyond the box, so two curved leaves
+# that do not cross inside it usually leave P of one sign — the order of their roots — and the base problem prunes it
+# like any leaf that does not vary (`_sample_sign`). Two leaves with one zero set whose values along a fiber are
+# proportional — linear leaves, a leaf and its negation or rescaling — leave P zero up to round-off, and the base
+# problem prunes that as well (`_vanishes`); two different curved functions of one surface do not, see there. When gⱼ's
+# end values are equal the secant has no root and P is gᵢ at the lower end.
+#
+# `gi` and `gj` are `Any`, as the kernel's leaf lists are: typed fields would nest a pair leaf's type once per level of
+# the reduction (pairs of restricted pairs in 3D), and the compile work with it.
+struct _PairLeaf{T}
+    gi::Any
+    gj::Any
+    k::Int
+    lo::T
+    hi::T
+end
+
+function (p::_PairLeaf)(y)
+    at(g, t) = g(_insert_axis(y, p.k, t))
+    ja, jb = at(p.gj, p.lo), at(p.gj, p.hi)
+    if (ja < 0 < jb) || (jb < 0 < ja)
+        return at(p.gi, _root(t -> at(p.gj, t), p.lo, p.hi, ja, jb))
+    end
+    ia, ib = at(p.gi, p.lo), at(p.gi, p.hi)
+    r = ia + ja / (ja - jb) * (ib - ia)
+    return isfinite(r) ? r : ia
+end
+
+# A callback the kernel differentiates by finite differences at the fixed step `h` instead of through `ctx.gradient`:
+# the wrapper on every pair leaf, so a pair leaf never sees a `Dual` (its root finding would have to be differentiated
+# through) and never instantiates one. The step is a fixed fraction, cbrt(eps), of the fiber the pair leaf was built
+# on, so the gradient does not depend on the geometry's length scale. Pair leaves steer the axis choice and the pruning
+# of base problems and are never integrated themselves. Restriction keeps the wrapper and the step.
+#
+# The step follows the box, not the coordinates, so the gradient does depend mildly on where the box sits: a leaf value
+# carries a round-off of about an ulp of its coordinates times its slope, and on a box far from the origin, small beside
+# |x|, that noise can exceed the difference across h and misread a nearly flat component. That costs a different base
+# partition — more subdivision — and never the region integrated.
+struct _FDLeaf{F,T}
+    f::F
+    h::T
+end
+
+(g::_FDLeaf)(x) = g.f(x)
+_restrict(g::_FDLeaf, k::Int, v) = _FDLeaf(_Slice(g.f, k, v), g.h)
+
+# Whether two leaves are restrictions to the two opposite faces of the previous reduction, x_k = lo and x_k = hi, which
+# never get a pair leaf: where they cross, the base problem's integrand has no kink to resolve. That integrand is the
+# previous reduction's fiber integral — ∫ over [lo, hi] of a polynomial piecewise between the fiber roots — and while
+# the roots keep their order and the leaves flat along x_k their signs, it is a constant plus one term per root tₑ, a
+# function of tₑ clamped to [lo, hi]. A trace on the face lo is where one root reaches lo and kinks its own term; a
+# trace on hi kinks another term (or the same one elsewhere). So across a crossing of two traces on opposite faces the
+# integrand is a sum of terms each kinked along one of them only, which the base rule integrates exactly without a
+# breakpoint there. What couples the terms has a same-face partner: two roots swapping order (the pair leaf's zero set,
+# met by both leaves' traces on one face where both roots sit at that face) and a flat leaf changing sign (its two
+# traces are one function, so its trace on the other trace's face crosses there too). Skipping these pairs therefore
+# costs no exactness, and saves the work of traces that cross without bounding Ω together — a cylinder inside a sphere,
+# whose traces on one face cross the sphere's on the other in every cell around their common axis. The rule also covers
+# the two traces of one leaf: they cannot cross where the leaf is monotone, and where it is flat they are one function,
+# whose pair leaf would vanish identically and scatter breakpoints over round-off noise. `_face` is the coordinate of
+# the face a restriction lies on, and `nothing` for a leaf that is not one (a pair leaf, or a leaf of the original
+# problem, where the facet slices of `src/physical.jl` all lie on their pins' faces).
+_face(s::_Slice) = s.v
+_face(g::Union{_LipschitzLeaf,_FDLeaf}) = _face(g.f)
+_face(_) = nothing
+_opposite_faces(a, b) = (fa = _face(a)) !== nothing && (fb = _face(b)) !== nothing && fa != fb
+
+# Whether the leaf `g` is a pair leaf, or a restriction of one, that vanishes on the box `U` up to round-off. Two
+# distinct leaves with one zero set whose values along a fiber are proportional — the shared face of two adjoining CSG
+# boxes, x − a for one and a − x for the other, or one plane that two boxes give as two leaf objects — have roots that
+# coincide on every fiber, so their pair leaf is zero over the whole base: where gⱼ's root is bracketed P is gᵢ at a
+# root of its own, and off the bracket the two leaves' linear interpolants share their root. And where two leaves cross
+# in a line that lies in a face of the base box (a roof ridge in a grid plane), their pair leaf's restriction to that
+# face is zero. Neither has a crossing to resolve, but `_sample_sign` cannot prune them: they sample zeros, or round-off
+# of either sign, and kept as leaves they put a breakpoint at every scan sample of every fiber — seven to ten times the
+# kernel points, and sixty to seventy times the leaf evaluations of the moment fits, of two boxes that share a face
+# inside a cell.
+#
+# The test is a distance along the fiber, so the kernel's own coincidence tolerance `atol` applies (`_emit_fiber!` drops
+# a sub-interval shorter than it): at the center and every corner of `U`, |P| ≤ atol·s, with s = |gᵢ(hi) − gᵢ(lo)| /
+# (hi − lo) the mean slope of gᵢ along the fiber, which turns P = gᵢ at gⱼ's root into the gap between the two roots.
+# For linear leaves P is affine, so the roots are then that close over all of `U`; for curved ones a crossing missed
+# between the samples loses only the breakpoint the pair leaf would have added, which is the accuracy of no pair leaf.
+# Where round-off exceeds `atol` (a box tiny against its distance from the origin) the pair leaf is kept, which costs
+# work only. Leaves the caller supplied are never tested, so the partition they give is unchanged.
+#
+# Two *different* curved functions of one surface — a sphere's distance ‖x − c‖ − r and its square ‖x − c‖² − r², say —
+# keep their pair leaf: off the bracket their interpolants' roots differ, so P is not small there, and its round-off
+# inside the bracket scatters breakpoints. That costs kernel points — measured on a ball whose surface two CSG leaves
+# spell this way, 1.8× in 2D and 5.4× in 3D the points of a kernel without pair leaves — never accuracy. The test
+# deliberately reads every sample, those off the bracket included: one that skipped them would be vacuously true on a
+# box all of whose samples are off the bracket, where two linear leaves can still cross between them.
+_vanishes(_, ::AxisBox, _) = false
+_vanishes(g::_FDLeaf, U::AxisBox, atol) = all(x -> _negligible(g.f, x, atol), (center(U), _box_vertices(U)...))
+_negligible(s::_Slice, x, atol) = _negligible(s.g, _insert_axis(x, s.k, s.v), atol)
+function _negligible(p::_PairLeaf, y, atol)
+    at(g, t) = g(_insert_axis(y, p.k, t))
+    return abs(p(y)) * (p.hi - p.lo) <= atol * abs(at(p.gi, p.hi) - at(p.gi, p.lo))
+end
+
+# ── Height-axis choice ─────────────────────────────────────────────────────────
+
+# Pick a height axis and report whether it is certifiably graph-like. For each axis k, every leaf is classified by
+# sampling ∂g/∂x_k at the box center and 2ᴰ corners (`_axis_class`):
+#
+#   :monotone — consistent non-zero sign ⇒ at most one fiber root;
+#   :flat     — |∂g/∂x_k| ≈ 0 at every sample ⇒ no fiber root (the leaf partitions the base instead; this is what makes
+#               polytope corners exact, e.g. a half-space perpendicular to k);
+#   :bad      — the sign of ∂g/∂x_k changes ⇒ possibly several fiber roots.
+#
+# The axis is the lexicographic maximum of (−#bad leaves, score), the first axis winning a tie, where the score is the
+# smallest |∂g/∂x_k| over the monotone leaves (best conditioning) and 0 when no leaf is monotone along k (an axis along
+# which nothing varies cannot root-find the interface). An axis with no bad leaf therefore always wins, and is the one
+# of best conditioning; with none, the least-bad axis is the force-reduce choice at the subdivision floor. Returns
+# `(k, usable, classes)`: `usable` says that no leaf is bad along `k`, and `classes` holds every leaf's class along it.
+function _choose_axis(lsets, U::AxisBox{D}, ctx::_QuadCtx) where {D}
+    samples = (center(U), _box_vertices(U)...)
+    grads = [map(x -> _gradient(ctx, g, x, U), samples) for g in lsets]
+    return _choose_axis(grads, ctx.flat_tol, Val(D))::Tuple{Int,Bool,Vector{Symbol}}
+end
+
+# The axis choice on the sampled gradients, behind a function barrier: `lsets` holds `Any`-typed callbacks, so the
+# gradients' type is known only at run time, and the classification below then runs on concrete types. The call into
+# the barrier is dynamic for the same reason, so its caller asserts the result type: without it `k` is inferred as
+# `Any`, and `_implicit_quad` would dispatch `_emit_fiber!` dynamically, boxing its arguments, once per base node.
+function _choose_axis(grads::Vector, flat_tol, ::Val{D}) where {D}
+    k = argmax(1:D) do k
+        nbad, score = 0, oftype(flat_tol, Inf)
+        for gs in grads
+            class, minmag = _axis_class(gs, k, flat_tol)
+            nbad += class === :bad
+            class === :monotone && (score = min(score, minmag))
+        end
+        return (-nbad, isinf(score) ? zero(score) : score)
+    end
+    classes = [first(_axis_class(gs, k, flat_tol)) for gs in grads]
+    return k, !(:bad in classes), classes
+end
+
+# Class of one leaf along axis `k` from its gradient samples `gs`, and the smallest |∂g/∂x_k| over the samples that
+# vary. A component counts as zero within `flat_tol` of the leaf's largest finite gradient norm (floored at 1, so a
+# nearly constant leaf is not held to an absolute round-off scale). Non-finite samples are ignored: an SDF-like leaf
+# evaluated at its own center yields ∇ = 0/0 = NaN, which must not poison the classification.
+function _axis_class(gs, k::Int, flat_tol)
+    tol = flat_tol * max(maximum(g -> all(isfinite, g) ? norm(g) : zero(flat_tol), gs), one(flat_tol))
+    pos = any(g -> isfinite(g[k]) && g[k] > tol, gs)
+    neg = any(g -> isfinite(g[k]) && g[k] < -tol, gs)
+    minmag = minimum(g -> isfinite(g[k]) && abs(g[k]) > tol ? abs(g[k]) : oftype(tol, Inf), gs)
+    return (pos && neg ? :bad : pos || neg ? :monotone : :flat), minmag
+end
+
+# The gradient of one leaf at a sample `x` of the box `U`: the context's operator (`ForwardDiff`, or the caller's
+# `grad`) for a leaf the user supplied, and finite differences at the leaf's step for a pair leaf. Each difference is
+# central where `x ± h` lies in `U` and one-sided where it would not — at the box corners the axis choice samples — so
+# the leaves inside the pair leaf are never evaluated outside the box. The error is about 1e-10 relative for a central
+# difference and of the order h·|∂²P| for a one-sided one (round-off only for linear leaves, whose pair leaves are
+# linear). It reaches nothing but the classification of `_axis_class` — the sign of a component, and whether it exceeds
+# `flat_tol` (√eps) of the gradient's norm — so at worst a nearly flat component of a curved pair leaf is misread at a
+# corner, which changes how a base problem is partitioned, never the region integrated.
+_gradient(ctx::_QuadCtx, g, x, U::AxisBox) = ctx.gradient(g, x)
+function _gradient(::_QuadCtx, g::_FDLeaf, x::SVector{D,T}, U::AxisBox) where {D,T}
+    return SVector{D,T}(ntuple(D) do d
+                            a, b = max(x[d] - g.h, U.lower[d]), min(x[d] + g.h, U.upper[d])
+                            (g.f(Base.setindex(x, b, d)) - g.f(Base.setindex(x, a, d))) / (b - a)
+                        end)
+end
+
+# ── Full-box tensor rule ───────────────────────────────────────────────────────
+
+# Tensor Gauss rule over the whole box, used when no leaf varies on the box and the box is inside Ω: the context's 1D
+# rule on every axis (`_tensor_rule`), mapped in place into physical coordinates with the box Jacobian folded in. The
+# rule is a fresh one, so mapping its arrays in place is safe; the loop rather than `map!` because `map!` leaves a
+# destination that aliases its source unspecified.
+function _full_box_rule(U::AxisBox{D,T}, ctx::_QuadCtx) where {D,T}
+    rule = _tensor_rule(ntuple(_ -> (ctx.nodes, ctx.weights), Val(D)))
+    for i in eachindex(rule.points)
+        rule.points[i] = reference_to_physical(U, rule.points[i])
+    end
+    rule.weights .*= volume(U) / convert(T, 2^D)
+    return rule.points, rule.weights
+end
+
+# ── Fiber rule emission ────────────────────────────────────────────────────────
+
+# Place 1D Gauss rules on the parts of one fiber that lie in Ω and append the lifted points/weights (scaled by the base
+# weight `wbase`). `embed(t)` lifts a fiber coordinate to the full D-dimensional point; `membership` is the Ω test.
+function _emit_fiber!(pts::Vector{SVector{D,T}}, wts::Vector{T}, lsets, embed, lo::T, hi::T, wbase::T, membership,
+                      ctx::_QuadCtx) where {D,T}
+    breaks = _fiber_breaks(lsets, embed, lo, hi, ctx)
+    nodes, gw = ctx.nodes, ctx.weights
+    for i in 1:(length(breaks)-1)
+        a, b = breaks[i], breaks[i + 1]
+        b - a <= ctx.atol && continue
+        mid = (a + b) / 2
+        membership(embed(mid)) || continue
+        half = (b - a) / 2
+        for j in eachindex(nodes)
+            push!(pts, embed(mid + half * nodes[j]))
+            push!(wts, wbase * gw[j] * half)
+        end
+    end
+    return nothing
+end
+
+# Sorted breakpoints of the fiber `t ↦ embed(t)` on `[lo, hi]`: the endpoints plus every sign change of every active
+# leaf, located by scanning `ctx.root_samples` sub-intervals and solving each bracketed crossing with `_root`.
+function _fiber_breaks(lsets, embed, lo::T, hi::T, ctx::_QuadCtx) where {T}
+    breaks = T[lo, hi]
+    M = ctx.root_samples
+    for g in lsets
+        tprev = lo
+        fprev = g(embed(lo))
+        for s in 1:M
+            tcur = s == M ? hi : lo + (hi - lo) * (T(s) / M)
+            fcur = g(embed(tcur))
+            # A root landing exactly on a scan sample is itself the breakpoint. Any other crossing is a strict sign
+            # change between neighbouring samples, read from the two signs: the product `fprev * fcur` underflows to
+            # zero once both values are below about 1e-162 in magnitude, which would hide the root of a leaf that is
+            # merely scaled down (Ω = {φ ≤ 0} does not depend on the scale of φ).
+            if fcur == 0
+                push!(breaks, tcur)
+            elseif (fprev < 0 < fcur) || (fcur < 0 < fprev)
+                push!(breaks, _root(t -> g(embed(t)), tprev, tcur, fprev, fcur))
+            end
+            tprev, fprev = tcur, fcur
+        end
+    end
+    sort!(breaks)
+    return breaks
+end
+
+# ── 1D safeguarded root finding ────────────────────────────────────────────────
+
+# Root of `f` in a bracket `a < b` whose end values `fa`, `fb` have opposite signs, by the Illinois variant of regula
+# falsi (Dowell & Jarratt 1971, see the file header). Each step evaluates the secant point of the bracket and keeps the
+# sub-bracket over which the sign changes; when the same end is replaced twice in a row, the value at the end that
+# stayed is halved, which removes regula falsi's one-sided stagnation and makes the convergence superlinear (order
+# 3^(1/3) ≈ 1.442 at a simple root). On the kernel's smooth fibers that is several times fewer leaf evaluations per
+# root than bisection.
+#
+# Safeguards, so the method keeps bisection's guarantees:
+#
+#   - the step is clamped strictly inside the bracket — a secant point that rounds onto an end moves one float inward,
+#     which is also what ends the iteration in a step or two once the secant has found the root;
+#   - a step is a bisection when the secant point is not a number, or when the last three steps have not halved the
+#     bracket — the regime of a multiple root, where regula falsi, Illinois or not, converges only linearly;
+#   - the side of `a` is fixed by its sign at entry, so a halved end value that underflows to zero cannot misread one.
+#
+# The bracket therefore shrinks at every evaluation, halves at least once in every four of them (three steps that did
+# not halve it are followed by a bisection), and always contains a sign change; the iteration stops at an exact zero or
+# once the bracket is two adjacent floats, returning a point of it.
+function _root(f, a::T, b::T, fa::T, fb::T) where {T}
+    negative_a = fa < 0
+    side = 0
+    widths = (T(Inf), T(Inf), T(Inf))   # bracket widths before each of the last three steps
+    while nextfloat(a) < b
+        c = a - fa * (b - a) / (fb - fa)
+        (isnan(c) || b - a > widths[1] / 2) && (c = (a + b) / 2)
+        widths = (widths[2], widths[3], b - a)
+        c = clamp(c, nextfloat(a), prevfloat(b))
+        fc = f(c)
+        fc == 0 && return c
+        if (fc < 0) == negative_a
+            a, fa = c, fc
+            side == -1 && (fb /= 2)
+            side = -1
+        else
+            b, fb = c, fc
+            side == 1 && (fa /= 2)
+            side = 1
+        end
+    end
+    return (a + b) / 2
+end
+
+# ── Coordinate insert / remove helpers ─────────────────────────────────────────
+
+# Insert scalar `v` at axis `k` of an `M`-vector, yielding an `(M+1)`-vector. `v` may differ in type from `x`'s eltype —
+# when automatic differentiation pushes `ForwardDiff.Dual` base coordinates through a reduced closure the spliced-in
+# face value is still a plain real, so the result type is promoted.
+@inline function _insert_axis(x::SVector{M,T}, k::Int, v) where {M,T}
+    R = promote_type(T, typeof(v))
+    return SVector{M + 1,R}(ntuple(i -> i < k ? R(x[i]) : (i == k ? R(v) : R(x[i - 1])), M + 1))
+end
+
+# Drop axis `k` from an `M`-vector, yielding an `(M−1)`-vector.
+@inline function _remove_axis(x::SVector{M,T}, k::Int) where {M,T}
+    return SVector{M - 1,T}(ntuple(i -> i < k ? x[i] : x[i + 1], M - 1))
+end
+
+# Project a box onto the base obtained by removing the height axis `k`.
+_remove_axis(b::AxisBox{M,T}, k::Int) where {M,T} = AxisBox{M - 1,T}(_remove_axis(b.lower, k), _remove_axis(b.upper, k))

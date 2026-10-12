@@ -377,7 +377,7 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     # its target its own copy so a fork cannot evict a sibling's rules). It is deliberate here: `plus` is thrown away at
     # the end of this call, and the (p+1)-order cut rules it fits are wanted on `model`, where the next `adapted` copies
     # them forward and the next `estimate` finds them. `integration_plan` evicts by region box, so the two moment orders
-    # coexist at the same boxes instead of evicting each other — see `_prefit_cut_rules!` in `intersections.jl`.
+    # coexist at the same boxes instead of evicting each other — see `_prefit!` in `intersections.jl`.
     enriched_space, twins, exempt = _enriched_space(V, Int(enrichment))
     # A superposed twin is a *nested* level of the same degree, so leaf semantics would deduplicate the level it
     # enriches — removing exactly the keys the injection is about to look for, and turning `Rewire` into a refusal. Only

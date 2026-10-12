@@ -144,14 +144,14 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `basis.jl`        | basis-family interface and capability traits, integrated Legendre default, the `:tensor` / `:trunk` index sets and the `_index_admissible` filter the minimum rule is expressed over, tensor-product evaluation |
 | `fcm.jl`          | finite-cell-method cut-cell quadrature: exact moments from `implicit.jl`, non-negative (NNLS) moment fit |
 | `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks (`LevelMask`) and per-cell polynomial order (`CellOrders` / `CellModes`); the `space` / `overlay` / `adapt` / `elevate` verbs |
-| `intersections.jl`| admissible integration regions for non-matching meshes; cut/fictitious region-quadrature dispatch |
+| `intersections.jl`| the integration-region record (`Region`, `Parent`) and admissible integration regions for non-matching meshes; cut/fictitious region-quadrature dispatch |
 | `coverage.jl`     | per-level covered-cell masks (`Coverage`, `build_coverage`); the mask- and material-aware covering rule behind covered-mode pruning; the material oracle (`_Fold`) the dof layer asks whether an inactive cell holds material |
 | `ladder.jl`       | nested refinement ladders: `ladder` declaration, the depth-map form of `adapt` and the `depth_masks` grading behind it, cross-level cell mapping (`overlapping_cells`), the `is_nested` predicate |
 | `dofs.jl`         | dof keys; the per-space dof topology (raw enumeration, the elimination ledger, the pivot table) and per-field numbering and accessors; the integrated-Legendre family's dof hooks (artificial boundary, leaf-semantics pruning, the hp minimum rule) |
 | `dirichlet.jl`    | physical Dirichlet conditions and boundary selectors, per-level physical-Dirichlet detection, codim-K facet regions and quadrature, and the L² boundary projection for nonzero data |
 | `surface.jl`      | immersed-boundary surface meshes (`BoundaryMesh`) and surface-region integration |
 | `problems.jl`     | `Field`, weak-form channels and blocks (`BlockForm`/`LoadForm`/`WeakForm`), `Problem` |
-| `coupling.jl`     | multi-domain interface coupling: the `Interface` `on=` tag, two-sided `InterfaceRegion` construction, `InterfaceForm`, and the four-block `couple` jump expansion |
+| `coupling.jl`     | multi-domain interface coupling: the `Interface` `on=` tag, two-sided interface-region construction, `InterfaceForm`, and the four-block `couple` jump expansion |
 | `model.jl`        | `Model` lifecycle: `prepare`, `move!`/`moved`, `activate!`/`deactivate!`, the non-mutating `adapted` / `elevated` rebuilds, `active_cells` / `cell_orders` on a model, the discretisation pin, diagnostics |
 | `assembly.jl`     | coupled Galerkin assembly: channel calculus, cached symbolic-scatter (Gustavson) pattern, serial scatter + two-phase compute→gather threaded path |
 | `solvers.jl`      | `Solution` / `SolverDiagnostics`, the default direct sparse solve, and the `linear_solver` hook for external Krylov or preconditioned solvers |
@@ -507,16 +507,17 @@ constructed as follows:
      still lies inside a single cell of every covering level, so the
      `C^∞` contract below is preserved while the region count stays
      proportional to the number of genuinely distinct coverage
-     patterns.
-  6. For every merged box, resolve the covering parent cells by midpoint
-     containment and keep the box only if it satisfies the caller's
+     patterns. A candidate no level covers (an all-zero signature) seeds
+     no box: it is no region of any consumer.
+  6. For every merged box, decode the covering parent cells from its
+     signature and keep the box only if it satisfies the caller's
      `criterion`, expressed over those parent *levels*: `:any_parent`
      (the default — at least one level covers the box; used by assembly,
      field evaluation, and visualization), `:all_levels` (every level of
      the space covers it), or a caller-supplied predicate
      `parents -> Bool`. No in-tree caller uses the predicate form:
-     `projection.jl` builds its transfer regions from `_merged_boxes` /
-     `_parents_covering` directly and applies its own target-coverage
+     `projection.jl` builds its transfer regions from the partition
+     engine (`_partition`) directly and applies its own target-coverage
      test rather than going through a `criterion`. Any other value
      raises `ArgumentError`.
   7. Dispatch the region quadrature on the `PhysicalDomain`
@@ -525,14 +526,24 @@ constructed as follows:
      the domain's `cut_quadrature` callable in its place, see *Region
      quadrature kinds* below); a `:fictitious` region under strict α
      (`α = 0`) is dropped outright.
-  8. Store each contributing parent element with the box mapped into
-     that element's local coordinates, record a `SmallOverlap` for every
-     region below `tolerance.small_volume`, and track the largest
-     moment-fit residual seen.
+  8. Store each contributing parent element with the affine map from the
+     box's frame into that element's reference frame, record a
+     `SmallOverlap` for every region below `tolerance.small_volume`, and
+     track the largest moment-fit residual seen.
 
 The integrand of a basis-function product is smooth (`C^∞`) inside such
 an admissible box. Do not integrate a product of basis functions across
 an element-boundary kink without partitioning the region first.
+
+Every region the assembly kernel walks — a volume box, a piece of a
+boundary facet, a sub-cell of an immersed `BoundaryMesh` or of a coupling
+interface — is one record, `Region`: its corners `lower` / `upper` are
+both its extent and its frame (degenerate on an axis it does not extend
+along: a facet's pinned axes, a flat axis of a simplex), its rule lives
+in that frame, and each `Parent` carries the map `ξ = ξ0 + dξ ∘ η` from
+the frame into its cell. Boundary facets are partitioned by the same
+engine restricted to the facet's free axes, so the steps above apply to
+them one dimension down.
 
 ### Moving overlays and state transfer
 
@@ -767,16 +778,15 @@ superposition idea for its own enrichment.
     uniform level is a palette of one and not a special case.
     `cell_order(level, cell)` is the question anything that integrates,
     evaluates or subdivides must ask, and every quadrature consumer does:
-    the region rule, the moment-fit order, the facet rule and the VTK
-    subdivision all size from the parent *cell*. `nominal_order(level)` is
-    the per-axis maximum over the palette, and it is a sizing and default
-    quantity — workspace banks and 1D factor buffers, where over-sizing is
-    safe; `_surface_quadrature_order`, which sizes one table of rules for
-    regions that no single parent cell owns and says so; and the order a
-    new `overlay` or a re-instantiated basis family inherits. `Level.modes`
-    is the derived minimum-rule table (`CellModes`), computed by `Level`'s
-    inner constructor from the orders, the mesh, the mode and the mask, and
-    never supplied by a caller.
+    the region rule, the moment-fit order, the facet rule, the immersed
+    simplex rule and the VTK subdivision all size from the parent *cell*.
+    `nominal_order(level)` is the per-axis maximum over the palette, and it
+    is a sizing and default quantity — workspace banks and 1D factor
+    buffers, where over-sizing is safe; and the order a new `overlay` or a
+    re-instantiated basis family inherits. `Level.modes` is the derived
+    minimum-rule table (`CellModes`), computed by `Level`'s inner
+    constructor from the orders, the mesh, the mode and the mask, and never
+    supplied by a caller.
   - **Order ≥ 1 per cell** is enforced per palette entry at construction, and
     `mode = :trunk` requires isotropy per cell. Neither can be expressed by
     the minimum rule: the dof key collapses the two endpoint modes into one
@@ -973,7 +983,7 @@ indicator representations are intentionally not supported.
     `stl_levelset("part.stl")` reads an STL into one. Both compose with the
     CSG combinators (see `ext/UnfittedMeshIOExt.jl`).
 
-  - **Region quadrature kinds** (visible via `region.quadrature.kind`):
+  - **Region quadrature kinds** (visible via `region.kind`):
     `:full` (tensor Gauss), `:fictitious_alpha` (α-scaled tensor Gauss),
     `:cut_fitted` (NNLS moment-fit rule; under `α > 0` the rule is the
     concatenation `(1 − α)·moment-fit ∪ α·full-cell tensor Gauss`, from
@@ -1010,7 +1020,7 @@ indicator representations are intentionally not supported.
 
   - **Moment-fit defaults**: moment-fit basis order = `moment_order_factor
     × max(cell_order)` per axis over the region's parent cells, the factor
-    defaulting to `1`; exact tensor Legendre moments from the Saye volume
+    defaulting to `2`; exact tensor Legendre moments from the Saye volume
     rule; a single Lawson–Hanson NNLS solve (`NonNegLeastSquares.jl`) selects
     ≤ `nbasis` non-negative weights from a candidate cloud drawn by even
     fractional spacing over the volume rule (an integer stride aliases
@@ -1019,9 +1029,11 @@ indicator representations are intentionally not supported.
     wider cone and so admits a non-negative exact solution the smaller one
     did not — never with more subdivision; `target_residual` bounds that
     retry and is **relative** to `‖m‖`, since the residual carries the units
-    of a moment; if no attempt fits, the raw volume rule is used as a
-    fallback rather than dropping the cell. Rules are cached by canonicalized
-    region bounds + moment order.
+    of a moment; if no attempt comes within the failure threshold
+    `_FIT_FAILURE_RESIDUAL · ‖m‖` (1e-2, relative for the same reason, so
+    whether a cell falls back never depends on its size), the raw volume
+    rule is used as a fallback rather than dropping the cell. Rules are
+    cached by canonicalized region bounds + moment order.
 
   - **Diagnostics**: the FCM statistics on `diagnostics(model, solution)`
     are `cut_region_count`, `fit_failure_count`,
@@ -1255,9 +1267,11 @@ not have to re-derive them:
   - **Physical coordinates** `x ∈ Ω ⊂ ℝᴰ`: the user-facing world frame.
   - **Reference cell coordinates** `ξ ∈ [−1, 1]ᴰ`: per-cell reference
     frame used by basis evaluation and quadrature.
-  - **Region-local sub-box coordinates** `η ∈ [−1, 1]ᴰ`: per-region
-    reference frame used by integration; each parent cell's local frame
-    is recovered via `reference_to_physical(parent.local_box, η)`.
+  - **Region frame coordinates** `η ∈ [−1, 1]ᴰ`: the frame of an
+    integration region's corners, `x = (lower + upper)/2 + (upper −
+    lower) ∘ η / 2`, with `η = 0` on an axis the region does not extend
+    along; each parent cell's reference coordinate is
+    `ξ = parent.ξ0 + parent.dξ ∘ η`.
   - **Tensor-product basis ordering**: lexicographic over
     `CartesianIndices(ntuple(d -> 0:order[d], D))`, with the dimension-1
     axis varying fastest.
@@ -1446,14 +1460,17 @@ demos.
     cut region, not as a fit failure. **Requirement not yet met:** no
     test drives a custom rule returning an `:empty` status, so its
     routing to `:cut_failed` / `:cut_alpha_failed` is unexercised; and
-    because `_merged_boxes` emits pairwise-disjoint boxes, the
+    because `_partition` emits pairwise-disjoint boxes, the
     `(box, moment order)` cache key never repeats within one plan, so
     no test distinguishes a memoised rule from an unmemoised one.
   - Multi-domain coupling: a machine-precision Nitsche interface patch
     test across two independently discretised subdomains; the `couple`
-    four-block sign pattern. **Requirement not yet met:** no coupling
-    test masks a subdomain, so the skip of interface regions where one
-    side has no active cover is unexercised.
+    four-block sign pattern. The skip of interface regions where one
+    side has no cover is exercised for geometry outside a subdomain
+    (`test_coupling.jl`'s point interface, `test_boundary_mesh.jl`'s
+    triangle reaching past the grid). **Requirement not yet met:** no
+    coupling test masks a subdomain, so the variant where the trace lies
+    in an inactive cell is not.
   - Covered-mode pruning: covered high-order modes eliminated and buried
     linear modes deduplicated only under a nested finer level;
     `reduced_mode_counts` matches the eliminated set. The user-masked

@@ -16,6 +16,32 @@ const _IVQ = Unfitted.implicit_volume_quadrature
     end
 end
 
+@testset "implicit quadrature — a fiber root is bracketed by signs, not by a product" begin
+    # Scaling a leaf by a positive constant does not move Ω = {φ ≤ 0}. A scan that detects a crossing by `f(a)·f(b) < 0`
+    # loses the root once the two samples are small: at a scale of 1e-170 the product, about 1e-342, underflows to zero,
+    # no breakpoint is placed, and the whole fiber [0, 1] is classified by its midpoint — outside Ω, so the rule comes
+    # back empty instead of integrating [0, 0.3].
+    rule = _IVQ(x -> 1e-170 * (x[1] - 0.3), box((0.0,), (1.0,)); gauss_points=2)
+    @test _quad(x -> 1.0, rule) ≈ 0.3 atol = 1e-15
+    @test _quad(x -> x[1], rule) ≈ 0.3^2 / 2 atol = 1e-15
+end
+
+@testset "implicit quadrature — the fiber root finder keeps bisection's guarantees in fewer steps" begin
+    # The Illinois regula falsi `_root` lands on the floating-point root — within two ulps, the rounding of f near it —
+    # on every bracket. A simple root takes a handful of evaluations where bisection spends about 50 to reach adjacent
+    # floats; at a triple root, where regula falsi of any kind converges only linearly, the bisection safeguard still
+    # gets there, within three times bisection's count.
+    for (f, r, simple) in ((t -> t^3 - 2, cbrt(2.0), true), (t -> exp(t) - 3, log(3.0), true),
+                           (t -> sqrt((t - 0.31)^2 + 0.2^2) - 0.25, 0.46, true), (t -> 0.7 - t, 0.7, true),
+                           (t -> (t - 0.3)^3, 0.3, false))
+        a, b = r - 0.21, r + 0.17
+        evaluations = Ref(0)
+        x = Unfitted._root(t -> (evaluations[] += 1; f(t)), a, b, f(a), f(b))
+        @test abs(x - r) <= 2 * eps(r)
+        @test evaluations[] <= (simple ? 12 : 3 * 52)
+    end
+end
+
 @testset "implicit quadrature — 2D axis-aligned cut moments are exact" begin
     # Ω = {x ≤ a} on [0, 1]², independent of y. ∫∫ xᵐ yⁿ = a^(m+1)/(m+1) · 1/(n+1).
     a = 0.4
@@ -181,6 +207,43 @@ end
     @test isapprox(a, π * (0.45^2 - 0.2^2) / 4; atol=1e-4)
 end
 
+# ∫ g over the tetrahedron abcd by a collapsed (Duffy) Gauss rule of n³ points, exact to degree 2n − 3 in g.
+function _tetrahedron_integral(g, a, b, c, d; n=8)
+    ξ, ω = Unfitted.gausslegendre(n)
+    total = 0.0
+    for i in 1:n, j in 1:n, k in 1:n
+        s, t, r = (ξ[i] + 1) / 2, (ξ[j] + 1) / 2, (ξ[k] + 1) / 2
+        x = a + s * (b - a) + t * (1 - s) * (c - a) + r * (1 - s) * (1 - t) * (d - a)
+        total += ω[i] * ω[j] * ω[k] / 8 * (1 - s)^2 * (1 - t) * g(x)
+    end
+    return total * abs(dot(b - a, cross(c - a, d - a)))
+end
+
+@testset "implicit quadrature — a tetrahedron's interior corners are exact in 3D" begin
+    # Four oblique planes cut a tetrahedron whose vertices lie strictly inside cells of a 4³ grid, so every vertex and
+    # edge is a crossing of two or three leaves inside a cut cell. Pair leaves put each crossing into the base problem
+    # (a pair of pairs, one reduction further down, for a vertex), so the cell rules sum to the exact volume and moments
+    # to round-off at every fiber order. Without them the volume was off by 2.3e-5 at q = 3 and 1.6e-4 at q = 5.
+    v = (SVector(0.13, 0.11, 0.17), SVector(0.88, 0.21, 0.12), SVector(0.31, 0.87, 0.23), SVector(0.38, 0.34, 0.91))
+    planes = map(((1, 2, 3, 4), (1, 2, 4, 3), (1, 3, 4, 2), (2, 3, 4, 1))) do (a, b, c, o)
+        n = normalize(cross(v[b] - v[a], v[c] - v[a]))
+        n = dot(n, v[o] - v[a]) > 0 ? -n : n                       # outward: away from the fourth vertex
+        return x -> dot(n, x - v[a])
+    end
+    membership = x -> all(f -> f(x) <= 0, planes)
+    gs = (x -> 1.0, x -> x[1], x -> x[2]^2, x -> x[1] * x[2] * x[3])
+    exact = [_tetrahedron_integral(g, v...) for g in gs]
+    for q in (3, 5)
+        total = zeros(length(gs))
+        for I in CartesianIndices((4, 4, 4))
+            region = box((Tuple(I) .- 1) ./ 4, Tuple(I) ./ 4)
+            rule = _IVQ(Any[planes...], membership, region; gauss_points=q, lipschitz=ones(4))
+            total .+= [_quad(g, rule) for g in gs]
+        end
+        @test all(isapprox.(total, exact; rtol=1e-13))
+    end
+end
+
 @testset "implicit quadrature — finite-difference gradient fallback" begin
     # For level sets that are not AD-differentiable the caller can pass a finite-difference gradient; on a smooth linear
     # cut it reproduces the ForwardDiff result to integration accuracy.
@@ -271,4 +334,166 @@ end
     tilted = x -> x[1] + x[2] - 1
     @test _quad(x -> 1.0, _IVQ(tilted, region; gauss_points=8, lipschitz=sqrt(2))) ≈
           _quad(x -> 1.0, _IVQ(tilted, region; gauss_points=8)) atol = 1e-15
+end
+
+@testset "implicit quadrature — crossings of a 2D CSG domain inside cut cells" begin
+    # Two overlapping discs minus a rotated square: the two circles cross, and the square's four corners lie, strictly
+    # inside cells of an 8² grid. Summed cell by cell, the area matches the analytic value to 1e-12 (5.7e-14 measured;
+    # 3.0e-5 before the crossings became base breakpoints).
+    c1, r1, c2, r2 = SVector(0.4, 0.45), 0.3, SVector(0.65, 0.55), 0.25
+    θ, s = π / 6, 0.08
+    corners = [SVector(0.5, 0.5) + s * SVector(cos(θ) * a - sin(θ) * b, sin(θ) * a + cos(θ) * b)
+               for (a, b) in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+    sides = map(1:4) do i
+        t = corners[mod1(i + 1, 4)] - corners[i]
+        n = SVector(t[2], -t[1]) / norm(t)
+        return leaf(x -> dot(n, x - corners[i]); lipschitz=1.0)
+    end
+    geom = setdiff(union(leaf(_disc(c1, r1); lipschitz=1.0), leaf(_disc(c2, r2); lipschitz=1.0)), intersect(sides...))
+    d = norm(c2 - c1)
+    lens = r1^2 * acos((d^2 + r1^2 - r2^2) / (2d * r1)) + r2^2 * acos((d^2 + r2^2 - r1^2) / (2d * r2)) -
+           sqrt((-d + r1 + r2) * (d + r1 - r2) * (d - r1 + r2) * (d + r1 + r2)) / 2
+    area = π * (r1^2 + r2^2) - lens - (2s)^2
+    total = sum(_quad(x -> 1.0, _csg_rule(geom, box((Tuple(I) .- 1) ./ 8, Tuple(I) ./ 8); gp=8, ms=4, certified=true))
+                for I in CartesianIndices((8, 8)))
+    @test total ≈ area rtol = 1e-12
+end
+
+@testset "implicit quadrature — the height-axis choice is inferred" begin
+    # `_choose_axis` samples `Any`-typed leaves, so the call into its classification is dynamic, and its result type is
+    # asserted for `_implicit_quad`'s sake: without that the chosen axis was inferred as `Any`, and every base node's
+    # fiber emission was dispatched dynamically and boxed its arguments.
+    ctx = Unfitted._quad_ctx(Float64, 4, nothing, 4, 1.0)
+    region = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    @test (@inferred Unfitted._choose_axis(Any[x -> x[1] + 2x[2] - 1], region, ctx)) == (2, true, [:monotone])
+end
+
+@testset "implicit quadrature — a leaf named twice in a CSG tree is integrated once" begin
+    # Ω = a ∩ (b ∪ c) spelled (a ∩ b) ∪ (a ∩ c) lists the sphere `a` twice. The kernel drops the repeat, so both
+    # spellings give the same rule. Two copies of one leaf got a pair leaf that vanishes identically and scattered
+    # breakpoints over its round-off: 2.6× the points in 2D (8² cells, q = 6) and 7.4× in 3D (4³, q = 5), where pairs of
+    # such pairs follow.
+    for D in (2, 3)
+        c0 = SVector(ntuple(_ -> 0.5, D))
+        a = leaf(x -> norm(x - c0) - 0.37; lipschitz=1.0)
+        nb, nc = normalize(SVector(ntuple(i -> 0.3 + 0.2i, D))), normalize(SVector(ntuple(i -> 0.9 - 0.25i, D)))
+        b = leaf(x -> dot(nb, x - c0) - 0.05; lipschitz=1.0)
+        c = leaf(x -> dot(nc, x - c0) + 0.02; lipschitz=1.0)
+        n = D == 2 ? 8 : 2
+        rules(geom) = [_csg_rule(geom, box((Tuple(I) .- 1) ./ n, Tuple(I) ./ n); gp=5, ms=4, certified=true)
+                       for I in CartesianIndices(ntuple(_ -> n, D))]
+        @test rules(union(intersect(a, b), intersect(a, c))) == rules(intersect(a, union(b, c)))
+    end
+end
+
+@testset "implicit quadrature — leaves are evaluated inside the region only" begin
+    # A level set may be defined on the mesh domain alone — an image interpolant without extrapolation, a lookup into a
+    # grid. Every evaluation the kernel makes stays in the closed region, a pair leaf's included, so such leaves work in
+    # a corner cell of the domain where two planes cross, through the kernel and the finite-cell fit alike, and give the
+    # rule of the same leaves defined everywhere. (Pair leaves evaluated their leaves at a secant root beyond the fiber
+    # and at finite-difference steps beyond the region's corners, and threw here.) The leaves below are checked against
+    # the region itself, not against the domain, so every face of the region is pinned, the interior ones included;
+    # the interior cell pins faces on both sides. The test reads the coordinates' values: the kernel differentiates
+    # these leaves by `ForwardDiff`, and a `Dual` on a face of the region does not compare `<=` to the face coordinate.
+    function bounded(f, region)
+        return x -> (all(region.lower .<= Unfitted.ForwardDiff.value.(x) .<= region.upper) ||
+                         throw(DomainError(x, "outside the region $region")); f(x))
+    end
+    p1 = x -> (x[1] - 0.12) + 0.5 * (x[2] - 0.12)
+    p2 = x -> -(x[1] - 0.12) + 2.0 * (x[2] - 0.12)
+    corner = box((0.0, 0.0), (0.25, 0.25))
+    rule(f1, f2, region) = _IVQ(Any[f1, f2], x -> f1(x) <= 0 && f2(x) <= 0, region; gauss_points=4,
+                                lipschitz=[1.2, 2.3])
+    @test rule(bounded(p1, corner), bounded(p2, corner), corner) == rule(p1, p2, corner)
+    @test _quad(x -> 1.0, rule(bounded(p1, corner), bounded(p2, corner), corner)) ≈ 0.0144 rtol = 1e-14
+    domain = physical_domain(intersect(leaf(bounded(p1, corner); lipschitz=1.2),
+                                       leaf(bounded(p2, corner); lipschitz=2.3)); subcell_length_scale=0.25)
+    _, weights, _, status = Unfitted.moment_fit_rule(domain, corner, (4, 4))
+    @test status === :fitted
+    @test sum(weights) ≈ 0.0144 rtol = 1e-13
+    # The same two planes crossing inside an interior cell.
+    m1 = x -> (x[1] - 0.37) + 0.5 * (x[2] - 0.37)
+    m2 = x -> -(x[1] - 0.37) + 2.0 * (x[2] - 0.37)
+    interior = box((0.25, 0.25), (0.5, 0.5))
+    @test rule(bounded(m1, interior), bounded(m2, interior), interior) == rule(m1, m2, interior)
+    q1 = x -> (x[1] - 0.12) + 0.5 * (x[2] - 0.12) + 0.3 * (x[3] - 0.1)
+    q2 = x -> -(x[1] - 0.12) + 2.0 * (x[2] - 0.12) + 0.2 * (x[3] - 0.1)
+    corner3 = box((0.0, 0.0, 0.0), (0.25, 0.25, 0.25))
+    @test rule(bounded(q1, corner3), bounded(q2, corner3), corner3) == rule(q1, q2, corner3)
+end
+
+@testset "implicit quadrature — traces on opposite faces get no pair leaf" begin
+    # The base problem pairs its monotone leaves for the crossings inside the box, but never two restrictions to
+    # opposite faces of the previous reduction: the fiber integral is a sum of one term per root clamped to the fiber,
+    # so a trace on the face lo and one on the face hi kink different terms, and their crossing needs no breakpoint. Two
+    # traces on one face still pair, and so do leaves that are not traces.
+    g1 = x -> x[1] + x[2] - 0.6
+    g2 = x -> x[1] - x[2] + 0.1
+    traces = Any[Unfitted._restrict(g, 1, v) for g in (g1, g2) for v in (0.0, 0.5)]
+    base = Unfitted._base_leaves(traces, fill(:monotone, 4), 1, 0.0, 0.5)
+    pairs = [l.f for l in base if l isa Unfitted._FDLeaf]
+    @test length(pairs) == 2 && all(p -> Unfitted._face(p.gi) == Unfitted._face(p.gj), pairs)
+    plain = Unfitted._base_leaves(Any[g1, g2], [:monotone, :monotone], 1, 0.0, 0.5)
+    @test count(l -> l isa Unfitted._FDLeaf, plain) == 1
+
+    # What that saves: cube − (sphere ∪ cylinder) around the common axis, where the cylinder lies inside the sphere and
+    # its traces on one face cross the sphere's on the other in every cell. Paired, they add a breakpoint to each of
+    # those cells that bounds no part of Ω (3072 kernel points instead of 2240), enough to starve the first moment-fit
+    # attempt: it missed its target or fitted to only 1e-9, and a miss refits with an eight times larger candidate
+    # cloud. Now each cell fits at the first attempt, to round-off.
+    sphere = leaf(x -> norm(x - SVector(0.5, 0.5, 0.5)) - 0.32; lipschitz=1.0)
+    cylinder = leaf(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.14; lipschitz=1.0)
+    domain = physical_domain(complement(union(sphere, cylinder)); subcell_length_scale=1 / 64, max_depth=4)
+    for lower in Iterators.product((0.25, 0.5), (0.25, 0.5), (0.25, 0.5))
+        _, _, residual, status = Unfitted._moment_fit_rule(domain, box(lower, lower .+ 0.25), (4, 4, 4), 1e-6, 1)
+        @test status === :fitted && residual < 1e-14
+    end
+end
+
+@testset "implicit quadrature — a pair leaf that vanishes adds no breakpoints" begin
+    # Two adjoining boxes share a face inside the cells: one box's leaf x₁ − a and the other's a − x₁ are two leaf
+    # objects with one zero set, and so are the lower faces each box gives itself. The pair leaf of two such leaves is
+    # zero up to round-off, which sampling its sign cannot prune, and it put a breakpoint at every scan sample of every
+    # fiber: 17 064 kernel points instead of 1674 for the 3D boxes on 4³ at q = 3, and 1872 instead of 1056 for the
+    # L-shape rotated by 30° on 7², whose pair leaf is round-off of either sign. Pruned (`_vanishes`), the rule of every
+    # cell has as many points as with each shared face given as one leaf object, and the volume stays exact.
+    halfspace(n, c) = leaf(x -> dot(n, x) - c; lipschitz=1.0)
+    function adjoining(R, lo1, hi1, lo2, hi2; once)      # the boxes rotated by R about the centre of the unit cube
+        c = SVector(ntuple(_ -> 0.5, length(lo1)))
+        parts1, parts2 = LevelSet[], LevelSet[]
+        for d in eachindex(lo1)
+            e = R[:, d]
+            at(v) = dot(e, c) + v - 0.5
+            up1, down1 = halfspace(e, at(hi1[d])), halfspace(-e, -at(lo1[d]))
+            # the boxes meet on x₁ = hi1[1] = lo2[1] and share their lower faces on the other axes
+            down2 = !once ? halfspace(-e, -at(lo2[d])) : d == 1 ? complement(up1) : down1
+            push!(parts1, up1, down1)
+            push!(parts2, halfspace(e, at(hi2[d])), down2)
+        end
+        return union(intersect(parts1...), intersect(parts2...))
+    end
+    θ = π / 6
+    for (R, n, q, lo1, hi1, lo2, hi2) in
+        ((SMatrix{3,3}(1.0I), 4, 3, (0.1, 0.1, 0.1), (0.45, 0.9, 0.9), (0.45, 0.1, 0.1), (0.9, 0.42, 0.42)),
+         (SMatrix{2,2}(cos(θ), sin(θ), -sin(θ), cos(θ)), 7, 4, (0.2, 0.2), (0.5, 0.8), (0.5, 0.2), (0.8, 0.5)))
+        cells = [box((Tuple(I) .- 1) ./ n, Tuple(I) ./ n) for I in CartesianIndices(ntuple(_ -> n, length(lo1)))]
+        twice, once = map((false, true)) do shared
+            geom = adjoining(R, lo1, hi1, lo2, hi2; once=shared)
+            return [_csg_rule(geom, cell; gp=q, certified=true) for cell in cells]
+        end
+        @test [length(r[2]) for r in twice] == [length(r[2]) for r in once]
+        @test sum(r -> _quad(x -> 1.0, r), twice) ≈ prod(hi1 .- lo1) + prod(hi2 .- lo2) rtol = 1e-14
+    end
+
+    # Two leaves that cross in a line inside a face of the base box: the roof x₃ ≤ 0.25 − |x₁ − 0.4| has its ridge in
+    # the grid plane x₃ = 0.25. Along x₁ the pair leaf of its two planes is √2 (x₃ − 0.25) on the base of the cell below
+    # the ridge, which does not vanish there, but its restriction to the face x₃ = 0.25 does, and was kept: the roof
+    # closed by x₃ ≥ 0.05 and 0.1 ≤ x₂ ≤ 0.9 took 1350 kernel points on 4³ at q = 3 instead of 540.
+    ga = x -> (x[3] - 0.25 - (x[1] - 0.4)) / √2
+    gb = x -> (x[3] - 0.25 + (x[1] - 0.4)) / √2
+    pair = Unfitted._FDLeaf(Unfitted._PairLeaf{Float64}(ga, gb, 1, 0.25, 0.5), 1e-6)
+    atol = Unfitted._quad_ctx(Float64, 3, nothing, 4, 0.25).atol
+    @test !Unfitted._vanishes(pair, box((0.25, 0.0), (0.5, 0.25)), atol)
+    @test Unfitted._vanishes(Unfitted._restrict(pair, 2, 0.25), box((0.25,), (0.5,)), atol)
+    @test !Unfitted._vanishes(Unfitted._restrict(pair, 2, 0.0), box((0.25,), (0.5,)), atol)
 end

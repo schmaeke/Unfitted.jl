@@ -1,6 +1,16 @@
 using StaticArrays
 using LinearAlgebra
 
+# A facet region's quadrature as every consumer reads it — the kernel, `boundary_integral`, the Dirichlet walk — as
+# `(x, w)` pairs in physical coordinates through the region accessors. A region stores its rule in its own frame (the
+# face box, `0` on the pinned axes), so its `points` / `weights` are not physical values themselves.
+function facet_rule(region)
+    jacobian = Unfitted._region_jacobian(region)
+    return [Unfitted._region_point(region, k, jacobian)[1:2] for k in 1:Unfitted._region_qpoint_count(region)]
+end
+facet_measure(region) = sum((w for (_, w) in facet_rule(region)); init=0.0)
+facet_points(region) = [x for (x, _) in facet_rule(region)]
+
 @testset "constraints scaffold" begin
     bc = dirichlet(0.0; on=boundary(:all))
     side = boundary(axis=2, side=:upper)
@@ -885,17 +895,17 @@ end
 
     for axis in 1:3, side in (:lower, :upper)
         regions = Unfitted._boundary_facet_regions(V, [(axis, side)], tol)
-        @test sum(sum(r.weights) for r in regions) ≈ 1.0 rtol = 1.0e-14   # the face's area
+        @test sum(facet_measure(r) for r in regions) ≈ 1.0 rtol = 1.0e-14   # the face's area
         for region in regions
             @test !isempty(region.parents)
             @test allunique(p.level for p in region.parents)
             for p in region.parents
                 level = Unfitted._level_by_id(V, p.level)
                 @test Unfitted.is_active(level.mask, p.cell)
-                @test Unfitted._cell_on_side(level, p.cell, axis, side)
+                @test p.cell in Unfitted._side_cells(level, [(axis, side)])
                 # Every Q-point lies inside every parent's own cell: the contract the merge has to preserve, and the
                 # reason the rule below is still exact on a fused region.
-                for x in region.points
+                for x in facet_points(region)
                     @test Unfitted.contains_point(x, p.parent_box, tol)
                 end
             end
@@ -904,13 +914,12 @@ end
 
     # A codim-2 edge (one free axis) and the codim-3 vertex (none) go through the same merge with `F = 1` and `F = 0`.
     edge = Unfitted._boundary_facet_regions(V, [(1, :lower), (2, :lower)], tol)
-    @test sum(sum(r.weights) for r in edge) ≈ 1.0 rtol = 1.0e-14
+    @test sum(facet_measure(r) for r in edge) ≈ 1.0 rtol = 1.0e-14
     g(x) = 1 + x[1] + 2x[2] - x[3] + x[1] * x[2] - x[2] * x[3]
-    @test sum(sum(w * g(x) for (x, w) in zip(r.points, r.weights)) for r in edge) ≈ 0.5 rtol = 1.0e-14
+    @test sum(sum(w * g(x) for (x, w) in facet_rule(r)) for r in edge) ≈ 0.5 rtol = 1.0e-14
     vertex = Unfitted._boundary_facet_regions(V, [(1, :lower), (2, :lower), (3, :lower)], tol)
     @test length(vertex) == 1
-    @test only(vertex).weights == [1.0]
-    @test only(vertex).points == [Unfitted.SVector(0.0, 0.0, 0.0)]
+    @test facet_rule(only(vertex)) == [(Unfitted.SVector(0.0, 0.0, 0.0), 1.0)]
 
     # The datum above is in the space, so the solved field reproduces it.
     model = prepare(poisson(V; source=x -> 0.0, dirichlet=[dirichlet(g; on=boundary(:all))]))
@@ -926,12 +935,47 @@ end
     V = ladder(dom; cells=4, order=2, depth=1, splits=2)
     V = adapt(V, 2 => CartesianIndices((1:2, 1:2, 1:2)))
     sides = [(3, :lower)]
-    merged = Unfitted._merged_axis_coordinates(V.levels, Val(3), tol, level -> Unfitted._side_cells(level, sides))
+    merged = Unfitted._merged_axis_coordinates(V.levels, Val(3), tol,
+                                               map(level -> Unfitted._side_cells(level, sides), V.levels))
     candidates = prod(length(Unfitted._intervals_from_coordinates(merged[d], tol)) for d in 1:2)
     regions = Unfitted._boundary_facet_regions(V, sides, tol)
     @test candidates == 25                       # 5 base lines + 2 overlay lines per free axis
     @test length(regions) < candidates
-    @test sum(sum(r.weights) for r in regions) ≈ 1.0 rtol = 1.0e-14
+    @test sum(facet_measure(r) for r in regions) ≈ 1.0 rtol = 1.0e-14
+end
+
+@testset "facet regions alias their tensor rules" begin
+    # A facet region keeps its rule in its own frame — the face box, 0 on the pinned axes — so an uncut face's rule is
+    # the resolver's cached tensor rule itself (counts 0 on the pinned axes), never a copy: a boundary of many faces
+    # holds one array per distinct order, and every `:full` region of that order points at it.
+    tol = GeometryTolerance(Float64)
+    V = ladder(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=2, order=2, depth=1, splits=2)
+    V = adapt(V, 2 => [CartesianIndex(1, 1, 1)])
+    facets = Unfitted.FacetResolver{3,Float64}(tol)
+    regions = Unfitted._facet_regions_for_selector(V, boundary(:all), facets)
+    @test all(r -> r.kind === :full, regions)
+    @test length(facets.rules) < length(regions)
+    for region in regions
+        counts = Unfitted._axis_max(Unfitted._gauss_counts, V, region.parents, region.lower, region.upper)
+        rule = facets.rules[counts]
+        @test region.points === rule.points && region.weights === rule.weights
+        ((axis, _),) = region.sides
+        @test counts[axis] == 0 && all(p -> p[axis] == 0, region.points)
+        @test all(p -> p.dξ[axis] == 0, region.parents)
+    end
+    # The physical rule is still the face's: its weights sum to the face's area, its points lie on the face.
+    @test sum(facet_measure(r) for r in regions) ≈ 6.0 rtol = 1.0e-14
+    @test all(x[a] == r.lower[a] for r in regions for x in facet_points(r) for (a, _) in r.sides)
+
+    # The α-scaled rule of a face is shared the same way, per face: every `:fictitious_alpha` region of one order on it
+    # points at one scaled copy of that order's tensor weights. Here the x₁ = 0 face lies wholly outside Ω.
+    outside = physical_domain(leaf(x -> 0.3 - x[1]; lipschitz=1.0); alpha=0.1, keep_fictitious=true,
+                              subcell_length_scale=0.0625)
+    W = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2, physical=outside)
+    face = Unfitted._boundary_facet_regions(W, [(1, :lower)], tol)
+    @test length(face) == 4 && all(r -> r.kind === :fictitious_alpha, face)
+    @test all(r -> r.weights === first(face).weights, face)
+    @test sum(facet_measure(r) for r in face) ≈ 0.1 rtol = 1.0e-14
 end
 
 @testset "facet regions are memoised per face, not per selector" begin
@@ -1114,7 +1158,7 @@ end
     # on Ω — a square root, a reciprocal distance, a field interpolated from a prior solution — is usable on a cut face
     # holds only if no point of the rule leaves Ω at all. Asserted at the default α = 0, pinned both ways: the
     # `kept_model` block below is the same geometry under the α-FCM blend, where the promise is deliberately forfeited.
-    @test all(Unfitted._inside(cut_domain.geometry, p) for r in cut_regions for p in r.points)
+    @test all(Unfitted._inside(cut_domain.geometry, p) for r in cut_regions for p in facet_points(r))
     # And it is a promise such a datum checks for itself. √(0.55 + x₁ − x₂) is real on the physical face and nowhere
     # above it, so this is the whole class of data that was unusable on a cut face before trimming — asserted through
     # the public API, and on the projected values rather than on merely surviving `prepare`.
@@ -1192,7 +1236,7 @@ end
     # forfeited on exactly the faces α touches — 5 of the 17 points here. The datum that prepared cleanly at α = 0
     # therefore raises, and raises rather than being silently extended, which is the behaviour to want of it.
     kept_regions = kept_model.facet_regions[(face, kept_model.problem.space)]
-    @test count(!Unfitted._inside(kept.geometry, p) for r in kept_regions for p in r.points) == 5
+    @test count(!Unfitted._inside(kept.geometry, p) for r in kept_regions for p in facet_points(r)) == 5
     @test_throws DomainError prepare(poisson(Vkept; source=0.0, dirichlet=[only_on_omega]))
 end
 
@@ -1489,8 +1533,8 @@ end
     # level set reduces to φ = 0.9 − x₃, so Ω takes x₃ > 0.9 and the edge's measure is exactly 0.1 of a geometric 1.0.
     # Machine-exact because the restricted leaf is affine in the one surviving coordinate, which is also why this is an
     # analytic anchor and not a recorded run.
-    @test sum(sum(r.weights) for r in tilted_edge) ≈ 0.1 rtol = 1.0e-14
-    @test all(Unfitted._inside(tilt.geometry, p) for r in tilted_edge for p in r.points)
+    @test sum(facet_measure(r) for r in tilted_edge) ≈ 0.1 rtol = 1.0e-14
+    @test all(Unfitted._inside(tilt.geometry, p) for r in tilted_edge for p in facet_points(r))
 end
 
 @testset "a trimmed facet rule integrates the physical part of its face" begin
@@ -1500,12 +1544,13 @@ end
     # face integrates over.
     tol = GeometryTolerance(Float64)
     regions(V, sides) = Unfitted._boundary_facet_regions(V, sides, tol)
-    measure(V, sides) = sum(sum(r.weights) for r in regions(V, sides))
+    measure(V, sides) = sum(facet_measure(r) for r in regions(V, sides))
     # The anchors are measures, and a measure cannot see *where* the points are: a weight sum stays right whenever the
     # stray points cancel. So each α = 0 anchor carries the point-set invariant beside it — every point of the rule
     # inside Ω, which is what makes a datum defined only on Ω usable on a cut face. The curved anchor below runs at α =
     # 1e-6 and so is deliberately exempt; the α-FCM blend and its forfeiture of this invariant are pinned where α is.
-    on_omega(V, sides) = all(Unfitted._inside(V.physical.geometry, p) for r in regions(V, sides) for p in r.points)
+    on_omega(V, sides) = all(Unfitted._inside(V.physical.geometry, p) for r in regions(V, sides)
+                             for p in facet_points(r))
 
     # 1. A symmetry plane through a hole — the shape `kirsch_plate_2d` ships, which is the reason this defect was worth
     #    fixing rather than documenting. Ω is the quarter plate (0,4)² outside the unit circle at the origin, 8×8 cells.
@@ -1565,7 +1610,7 @@ end
     #    And it is insensitive to the geometric-robustness knobs: `_choose_axis` declares the sliced sub-boxes
     #    graph-like and stops bisecting, so driving `subcell_length_scale` from 1/12 to 1/192 (effective depth 2 → 6) or
     #    capping `max_depth` at 2 reproduces the value to the last bit. The only knob is the moment order, which
-    #    `_moment_order_for_region` takes from the parent cells.
+    #    `_moment_orders` takes from the parent cells.
     r₀, ṙ = 0.1373, 0.22
     centre = SVector(0.4967, 0.5013)
     cavity = leaf(x -> (r₀ + ṙ * x[3]) - sqrt((x[1] - centre[1])^2 + (x[2] - centre[2])^2); lipschitz=sqrt(1 + ṙ^2))
@@ -1800,7 +1845,7 @@ end
 #
 # What this guards is the trimming of a cut face's rule to its physical part — the regions `cut_facet_region_count`
 # reports. See the testset "cut_facet_region_count reports the facet regions whose face leaves Ω" above, and
-# `_facet_region_stats` in src/model.jl. That trimming has to land on BOTH paths at once. On the operator path alone,
+# `_kind_stats` in src/model.jl. That trimming has to land on BOTH paths at once. On the operator path alone,
 # the Dirichlet datum would be fitted over the whole face while the operator integrates only the physical part: a clean
 # residual, a converging solve, and boundary data fitted over area that is not in Ω. On the projection path alone, the
 # mirror image. Neither shows up in a norm.

@@ -105,7 +105,7 @@ end
     pk = physical_domain(x -> max(x[1] - 0.7, x[2] - 0.6); lipschitz=2.0, subcell_length_scale=1.0 / 2^5, max_depth=5)
     _, wsk, resk = Unfitted.moment_fit_rule(pk, region, order)
     @test all(w -> w >= 0, wsk)
-    @test resk < Unfitted._FIT_FAILURE_RESIDUAL
+    @test resk < Unfitted._FIT_FAILURE_RESIDUAL * sum(wsk)   # within the threshold relative to ‖m‖ ≥ m₀ = Σw
 end
 
 @testset "FCM — tilted/corner cuts: default Gauss order gives exact moments" begin
@@ -213,7 +213,7 @@ end
     moments = Unfitted._moments_from_rule(rule[1], rule[2], region, order)
     starved = Unfitted._cap_candidates(rule[1], order, Unfitted._candidate_budget(1))
     _, _, starved_residual = Unfitted._solve_moment_fit(moments, starved, region, order, sum(rule[2]))
-    @test starved_residual > Unfitted._FIT_FAILURE_RESIDUAL
+    @test starved_residual > Unfitted._FIT_FAILURE_RESIDUAL * norm(moments)
     # The retry must genuinely enlarge the cloud — the property the fixed cap silently removed.
     denser = Unfitted._cap_candidates(rule[1], order, Unfitted._candidate_budget(2))
     @test length(denser) > 4 * length(starved)
@@ -228,64 +228,66 @@ end
 end
 
 @testset "FCM — a failed fit falls back to the raw volume rule" begin
-    # A fit that misses `_FIT_FAILURE_RESIDUAL` no longer yields an empty rule — which silently dropped the cell's whole
+    # A fit that misses the failure threshold no longer yields an empty rule — which silently dropped the cell's whole
     # contribution — but the Saye volume rule the moments were summed from: correct and non-negative by construction,
     # merely uncompressed.
     #
-    # Driving the branch takes some doing, because the candidate-cloud retry above fits essentially every reachable cut
-    # cell to machine precision. The lever used here is precision the arithmetic cannot deliver: a Float32 fit settles
-    # around 1e-7 relative — `eps(Float32)` is 1.2e-7 — so asking it for 1e-9 relative is impossible, every attempt
-    # misses, and the absolute `_FIT_FAILURE_RESIDUAL` then routes the cell to the uncompressed rule. The same geometry
-    # in Float64 fits and needs no fallback, which is asserted below as the control.
-    #
-    # The lever used to be different, and the difference is the point of the `target_residual` test at the end of this
-    # testset: `target_residual` was once compared against an *absolute* residual, so a perfectly good Float32 fit was
-    # declared a catastrophic failure purely because the cell was 2000 units wide and `1e-7 × 3.5e6 = 0.35` exceeds
-    # `1e-6`. It is now relative, so that same fit is correctly accepted, and only a genuinely unreachable tolerance
-    # reaches the fallback.
-    L = 2000.0f0
-    radius = 200.0f0
-    holes = ((0.3f0 * L, 0.3f0 * L), (0.7f0 * L, 0.3f0 * L), (0.3f0 * L, 0.7f0 * L), (0.7f0 * L, 0.7f0 * L))
+    # Driving the branch takes a fit that genuinely fails, because the candidate-cloud retry fits essentially every
+    # reachable cut cell to machine precision. The lever is the attempt count the internal `_moment_fit_rule` exposes:
+    # one attempt on the four-holes cell at moment order 8 is the starved first attempt of the retry testset above, a
+    # relative residual of 0.13–0.14 — far beyond the 1e-2 threshold — so the cell falls back. It does so at every
+    # scale, since the threshold is relative to ‖m‖ like `target_residual`.
+    order = (8, 8)
+    for L in (1.0, 2000.0, 1.0e-3)
+        radius = 0.1L
+        holes = ((0.3L, 0.3L), (0.7L, 0.3L), (0.3L, 0.7L), (0.7L, 0.7L))
+        geom = complement(union((leaf(x -> hypot(x[1] - c[1], x[2] - c[2]) - radius; lipschitz=1.0) for c in holes)...))
+        region = box((0.0, 0.0), (L, L))
+        p = physical_domain(geom; subcell_length_scale=0.1L)
+        pts, ws, res, status = Unfitted._moment_fit_rule(p, region, order, 1.0e-10, 1)
+        @test status === :fallback
+        # The fallback rule IS the moments' source, so its own moments are the ‖m‖ the verdict was taken against.
+        @test res > Unfitted._FIT_FAILURE_RESIDUAL * norm(Unfitted._moments_from_rule(pts, ws, region, order))
+        # Non-negativity survives the fallback: every Saye weight is a product of a positive Gauss weight, a positive
+        # fiber half-length and a positive base weight (`_emit_fiber!` in `src/implicit.jl`).
+        @test all(>=(0), ws)
+        # The cell still integrates correctly — that is the whole point — but at 20×+ the points a successful fit would
+        # have used. That cost is what `AssemblyDiagnostics.cut_fallback_points` reports.
+        @test sum(ws) ≈ L^2 * (1 - 4π * 0.1^2) rtol = 1.0e-4
+        @test length(ws) > 20 * prod(order .+ 1)
+    end
+end
+
+@testset "FCM — whether a fit falls back does not depend on the cell's size" begin
+    # Regression. The fit-failure threshold used to be absolute while `target_residual` was relative, so the verdict was
+    # a statement about the cell's extent rather than about the fit. A Float32 fit settles near 1e-7 relative —
+    # `eps(Float32)` is 1.2e-7 — so it misses a 1e-9 target on every attempt and lands in the band between the target
+    # and the failure threshold, where the compressed fit is the rule to use. With an absolute 1e-2 the same cell was
+    # `:fitted` at L = 1 (residual ≈ 1e-7 · 0.87) and `:fallback` at L = 2000 (≈ 1e-7 · 3.5e6 = 0.35): identical
+    # arithmetic, opposite verdicts, and 3072 raw points instead of 25.
     order = (4, 4)
-    exact = L^2 - 4 * π * radius^2
-    geom32 = complement(union((leaf(x -> sqrt((x[1] - c[1])^2 + (x[2] - c[2])^2) - radius; lipschitz=1.0)
-                               for c in holes)...))
-    p32 = physical_domain(geom32; subcell_length_scale=L / 10, max_depth=8)
-    region32 = box((0.0f0, 0.0f0), (L, L))
+    fit_at(L, target) =
+        let radius = 0.1f0 * L,
+            holes = ((0.3f0 * L, 0.3f0 * L), (0.7f0 * L, 0.3f0 * L), (0.3f0 * L, 0.7f0 * L), (0.7f0 * L, 0.7f0 * L)),
+            geom = complement(union((leaf(x -> sqrt((x[1] - c[1])^2 + (x[2] - c[2])^2) - radius; lipschitz=1.0)
+                                     for c in holes)...))
 
-    pts, ws, res, status = Unfitted.moment_fit_rule(p32, region32, order; target_residual=1.0e-9)
-    @test status === :fallback
-    @test res > Unfitted._FIT_FAILURE_RESIDUAL
-    # Non-negativity survives the fallback: every Saye weight is a product of a positive Gauss weight, a positive fiber
-    # half-length and a positive base weight (`_emit_fiber!` in `src/implicit.jl`).
-    @test all(>=(0), ws)
-    # The cell still integrates correctly — that is the whole point — but at 20×+ the points a successful fit would have
-    # used. That cost is what `AssemblyDiagnostics.cut_fallback_points` reports.
-    @test sum(ws) ≈ exact rtol = 1.0e-4
-    @test length(ws) > 20 * prod(order .+ 1)
+            Unfitted.moment_fit_rule(physical_domain(geom; subcell_length_scale=L / 10, max_depth=8),
+                                     box((0.0f0, 0.0f0), (L, L)), order; target_residual=target)
+        end
+    for L in (1.0f0, 2000.0f0)
+        _, ws, res, status = fit_at(L, 1.0e-9)
+        @test status === :fitted
+        @test length(ws) <= prod(order .+ 1)
+        @test sum(ws) ≈ L^2 * (1 - 4π * 0.1f0^2) rtol = 1.0e-4
+        # Short of the target, inside the threshold: the residual is Float32's, relative to the cell's own moments.
+        @test 1.0e-9 < res / sum(ws) < Unfitted._FIT_FAILURE_RESIDUAL
+    end
 
-    # Control: identical geometry in Float64 fits, so no fallback and an O(nbasis) rule.
-    geom64 = complement(union((leaf(x -> hypot(x[1] - Float64(c[1]), x[2] - Float64(c[2])) - Float64(radius);
-                                    lipschitz=1.0) for c in holes)...))
-    p64 = physical_domain(geom64; subcell_length_scale=Float64(L) / 10, max_depth=8)
-    region64 = box((0.0, 0.0), (Float64(L), Float64(L)))
-    pts64, ws64, res64, status64 = Unfitted.moment_fit_rule(p64, region64, order; target_residual=1.0e-6)
-    @test status64 === :fitted
-    @test res64 < Unfitted._FIT_FAILURE_RESIDUAL
-    @test length(ws64) <= prod(order .+ 1)
-    @test sum(ws64) ≈ exact rtol = 1.0e-4
-
-    # `target_residual` is RELATIVE, so a tolerance a given precision can actually reach is met regardless of how large
-    # the cell is. The same Float32 geometry that falls back at 1e-9 above fits at 1e-6, because 1e-7 relative is what
-    # Float32 delivers — and the returned residual is still absolute, so it is `res32 / ‖m‖` and not `res32` that
-    # honours the tolerance. Under the previous absolute comparison this fit was reported `:fallback` on a 2000-unit
-    # cell and `:fitted` on a unit one, for identical arithmetic.
-    pts32, ws32, res32, status32 = Unfitted.moment_fit_rule(p32, region32, order; target_residual=1.0e-6)
+    # A tolerance the precision can reach is met at any size, and the returned residual is still the absolute one: far
+    # above the 1e-6 tolerance at L = 2000, far below it relative to the cut volume.
+    _, ws32, res32, status32 = fit_at(2000.0f0, 1.0e-6)
     @test status32 === :fitted
-    @test length(ws32) <= prod(order .+ 1)
-    @test sum(ws32) ≈ exact rtol = 1.0e-4
-    # Absolute residual far above the 1e-6 tolerance, relative residual far below: the two readings of the same number
-    # that the fix separates.
     @test res32 > 1.0e-6
     @test res32 / sum(ws32) < 1.0e-6
 end

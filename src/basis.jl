@@ -123,71 +123,37 @@ basis_name(::IntegratedLegendre) = :integrated_legendre
 
 Tensor-product Gauss–Legendre quadrature on the reference cube `[−1, 1]ᴰ`. Built once per `(per_axis_counts, T)` pair by
 `_tensor_gauss_rule` and cached, so all `:full` regions of the same per-axis order share the same `points`/`weights`
-arrays.
+arrays (see [`Region`](@ref)).
 """
 struct TensorQuadrature{D,T<:Real}
     points::Vector{SVector{D,T}}
     weights::Vector{T}
 end
 
-"""
-    RegionQuadrature{D,T}(kind, points, weights)
-
-Per-region quadrature rule consumed by the assembly hot loop. `kind` is an informational tag set by the
-integration-region dispatcher in `intersections.jl`:
-
-  - `:full` — region is entirely inside Ω (or no `PhysicalDomain` is attached). `points`/`weights` alias the shared
-    cached tensor Gauss rule; no copy is made.
-  - `:fictitious_alpha` — region is entirely outside Ω under α-FCM; weights are the tensor Gauss weights pre-multiplied
-    by `α` and shared across regions of the same per-axis order via a per-plan cache.
-  - `:cut_fitted` — region is crossed by ∂Ω; weights come from the NNMF moment-fit rule (see `src/fcm.jl`) and are
-    unique per region. Under α-FCM (`α > 0`) the rule additionally carries the α-scaled full-cell tensor part
-    (`(1−α)·moment-fit ∪ α·tensor`).
-  - `:cut_fallback` — the moment-fit residual exceeded the catastrophic threshold, so the region carries the raw Saye
-    volume rule the moments were summed from (see [`moment_fit_rule`](@ref)) instead of a fitted one: correct and
-    non-negative, but with 50–200× the points. Under α-FCM the α-scaled tensor part is appended as for `:cut_fitted`.
-  - `:cut_failed` — strict-cut (`α = 0`) region whose `Ω ∩ box` carries no volume rule at all; the region was emitted
-    with empty `points`/`weights` so it contributes zero quadrature.
-  - `:cut_alpha_failed` — same under α-FCM (`α > 0`); the physical part is empty but the region carries the α-scaled
-    tensor rule alone so the cell's dofs stay α-stabilised rather than singular.
-  - `:cut_custom` — region is crossed by ∂Ω and its rule came from the domain's own `cut_quadrature` callable instead of
-    the moment fit (see the [`PhysicalDomain`](@ref) docstring). Under α-FCM the α-scaled tensor part is appended as for
-    `:cut_fitted`.
-
-All three non-fitted kinds are reported in `AssemblyDiagnostics.fit_failure_count`; `:cut_fallback` is additionally
-counted, with its point cost, in `cut_fallback_count` and `cut_fallback_points`. `:cut_custom` is not among them — no
-fit ran, so there is no residual to report on.
-
-Assembly iterates `zip(points, weights)` without dispatching on `kind`, so the hot loop's cost is the same regardless of
-the quadrature source.
-"""
-struct RegionQuadrature{D,T<:Real}
-    kind::Symbol
-    points::Vector{SVector{D,T}}
-    weights::Vector{T}
+# The tensor product of per-axis 1D rules, `axis_rules[d] = (nodes, weights)`: the points in `CartesianIndices` order
+# (axis 1 fastest) and each weight the left-fold product of its per-axis weights. The one tensor-rule constructor; the
+# Gauss rule below and every rule built from per-axis pieces go through it.
+function _tensor_rule(axis_rules::NTuple{D,Tuple{Vector{T},Vector{T}}}) where {D,T}
+    counts = map(rule -> length(first(rule)), axis_rules)
+    points = Vector{SVector{D,T}}(undef, prod(counts))
+    weights = Vector{T}(undef, prod(counts))
+    for (k, index) in enumerate(CartesianIndices(counts))
+        points[k] = SVector{D,T}(ntuple(d -> axis_rules[d][1][index.I[d]], D))
+        weights[k] = prod(axis_rules[d][2][index.I[d]] for d in 1:D)
+    end
+    return TensorQuadrature{D,T}(points, weights)
 end
 
-# Build a fresh tensor Gauss–Legendre rule with `counts[d]` points along axis `d`. The per-axis 1D rules come from
-# FastGaussQuadrature; we then enumerate `CartesianIndices(counts)` to build the `prod(counts)` tensor points and the
-# corresponding product weights. Always called through the cache in `intersections.jl`, never on the hot path.
+# A fresh tensor Gauss–Legendre rule with `counts[d]` points along axis `d` (FastGaussQuadrature's 1D rules). A count of
+# 0 is an axis the rule does not extend along — a boundary facet's pinned axis — and carries the single node 0 with
+# weight 1, so a facet's rule lives in the full `D`-dimensional frame with the free-axis points and weights unchanged.
+# Always called through a cache (`_cached_tensor_quadrature!`), never on the hot path.
 function _tensor_gauss_rule(counts::NTuple{D,Int}, ::Type{T}) where {D,T<:Real}
-    axes = ntuple(D) do d
-        points, weights = gausslegendre(counts[d])
-        (T.(points), T.(weights))
-    end
-
-    npoints = prod(counts)
-    points = Vector{SVector{D,T}}(undef, npoints)
-    weights = Vector{T}(undef, npoints)
-    counter = 1
-
-    for index in CartesianIndices(counts)
-        points[counter] = SVector{D,T}(ntuple(d -> axes[d][1][index.I[d]], D))
-        weights[counter] = prod(axes[d][2][index.I[d]] for d in 1:D)
-        counter += 1
-    end
-
-    return TensorQuadrature{D,T}(points, weights)
+    return _tensor_rule(ntuple(D) do d
+                            counts[d] == 0 && return (T[0], T[1])
+                            points, weights = gausslegendre(counts[d])
+                            return (T.(points), T.(weights))
+                        end)
 end
 
 """

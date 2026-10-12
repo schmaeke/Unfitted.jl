@@ -47,6 +47,11 @@ must accept `ForwardDiff.Dual` arguments so the quadrature kernel can take its g
 (`physical_domain` → `moment_fit_rule`) installs no gradient override, and the `grad` keyword of
 [`implicit_volume_quadrature`](@ref) is reachable only by calling that kernel directly.
 
+`f` must also be safe to call from several threads at once — a pure function of `x` is. The package fits the
+quadrature of cut cells and of cut boundary faces on every thread, and those fits evaluate the leaves concurrently; a
+custom `cut_quadrature` (see [`PhysicalDomain`](@ref)) replaces only the cell fits and is itself called serially, so
+the face fits still evaluate the leaves on several threads.
+
 `lipschitz` is the Lipschitz constant used by the sign certificate of both the cell classifier and the implicit
 quadrature kernel; `1.0` for a true signed-distance leaf, `Inf` to rely on corner sampling. Supplying it is what lets a
 feature smaller than a mesh cell survive: under `Inf` the kernel can prune such a leaf on the cell box and integrate the
@@ -147,10 +152,10 @@ Fields:
     defines membership.
   - `alpha::T`: fictitious-region stabilization weight (α-FCM). `0` is the strict cut path; `> 0` enriches every **cut**
     cell's quadrature with the α-scaled full-cell rule, so cut-cell dofs whose basis support lies in the fictitious part
-    still get a well-posed contribution (see `_build_region_quadrature` in `intersections.jl`). It is honoured one
+    still get a well-posed contribution (see `_trimmed_rule` in `intersections.jl`). It is honoured one
     dimension down on a boundary **face** in exactly the same way — on the level set restricted to that face's affine
-    slice (`_facet_region` in `dirichlet.jl`) — which is what lets α stabilise a thin physical sliver of face; the price
-    there is that the rule then carries points outside Ω, so a datum defined only on Ω needs `alpha = 0` (see
+    slice (`_facet_regions` in `dirichlet.jl`) — which is what lets α stabilise a thin physical sliver of face; the
+    price there is that the rule then carries points outside Ω, so a datum defined only on Ω needs `alpha = 0` (see
     [`boundary`](@ref)). Fully-fictitious cells (support entirely outside Ω) are **dropped from the dof layout** unless
     `keep_fictitious` says otherwise; α alone never keeps them, because the α term stabilizes cuts, not whole fictitious
     cells.
@@ -238,13 +243,15 @@ The rule must also be a deterministic function of its three arguments: results a
 `(region box, moment order)` in a cache the [`Model`](@ref) owns per participating space and threads back through every
 plan rebuild, so a rule reading mutable state outside its arguments is captured at its first answer for a box and
 silently reused — across rebuilds, not merely within one. Put every knob in the callable itself; that is what makes the
-rule reproducible. The package does not run a custom rule on several threads, unlike its own fit: `_prefit_cut_rules!`
-in `src/intersections.jl` fits custom rules serially, because they are caller code under no thread-safety contract.
+rule reproducible. The package does not run a custom rule on several threads, unlike its own fit: `_fit_rules` in
+`src/intersections.jl` fits custom rules serially, because they are caller code under no thread-safety contract. The
+leaves are another matter: the package's own fits of cut boundary faces, which never consult the custom rule, still
+evaluate them on several threads (see [`leaf`](@ref)).
 `residual` is reported verbatim through `diagnostics(model).moment_fit_residual_max`.
 
-A region built from a custom rule is tagged `:cut_custom` (see `_build_region_quadrature` in `src/intersections.jl`) —
+A region built from a custom rule is tagged `:cut_custom` (see `_trimmed_rule` in `src/intersections.jl`) —
 one kind for every custom rule, whatever status symbol it returns, `:empty` excepted as in point 3 above.
-`_cut_region_stats` counts `:cut_custom` as a cut region and **not** as a fit failure, since there is no fit to fail.
+`_kind_stats` counts `:cut_custom` as a cut region and **not** as a fit failure, since there is no fit to fail.
 The rule is stored on the domain rather than in a global, so two models in one session can use different rules and
 nothing about the choice is process-wide or thread-shared.
 
@@ -346,11 +353,6 @@ function _effective_subcell_depth(physical::PhysicalDomain, box::AxisBox)
     return min(physical.max_depth, ceil(Int, log2(max_extent / physical.subcell_length_scale)))
 end
 
-# Half-diagonal of an axis-aligned box — the radius of the smallest enclosing ball. Used by the per-leaf Lipschitz
-# certificate: for a Lipschitz `f` and any point `y` in the box, |f(y) − f(c)| ≤ L·r with `c` the center and `r` this
-# radius, so a center sign whose magnitude exceeds `L·r` is uniform on the box.
-_half_diagonal(b::AxisBox) = norm(b.upper - b.lower) / 2
-
 # Largest Lipschitz constant declared anywhere in the tree, or `Inf` if any leaf declines to declare one.
 # `levelset_value` collapses the tree with max / min / negate, and each of those is non-expansive in its arguments, so
 # the collapsed scalar is itself Lipschitz with this constant. That is what the VTK export's cut refinement needs: it
@@ -365,15 +367,11 @@ _levelset_lipschitz(n::Not) = _levelset_lipschitz(n.part)
 # ── Cell classifier ───────────────────────────────────────────────────────────
 
 # Three-valued (Kleene) membership certificate over the CSG tree: returns `+1` if the box is certainly inside Ω, `-1` if
-# certainly outside, `0` if undetermined. Each leaf is certified by its Lipschitz bound (|f(c)| > L·r ⇒ uniform sign);
-# the Boolean combinators propagate certainty without enumerating sign patterns — e.g. a union is certainly inside as
-# soon as one part is, certainly outside only if every part is. This is what lets a cut cell of one component be
-# classified `:full`/`:fictitious` when another component dominates it.
-function _tri(l::Leaf, box::AxisBox)
-    fc = l.f(center(box))
-    thr = l.lipschitz * _half_diagonal(box)
-    return fc < -thr ? 1 : (fc > thr ? -1 : 0)
-end
+# certainly outside, `0` if undetermined. Each leaf is certified by its Lipschitz bound (`_certified_sign`: |f(c)| > L·r
+# ⇒ uniform sign, and inside is f < 0); the Boolean combinators propagate certainty without enumerating sign patterns —
+# e.g. a union is certainly inside as soon as one part is, certainly outside only if every part is. This is what lets a
+# cut cell of one component be classified `:full`/`:fictitious` when another component dominates it.
+_tri(l::Leaf, box::AxisBox) = -_certified_sign(l.f, l.lipschitz, box)
 function _tri(n::AllOf, box::AxisBox)
     r = 1
     for p in n.parts
@@ -397,14 +395,9 @@ _tri(n::Not, box::AxisBox) = -_tri(n.part, box)
 # Tally Ω-membership at the box center and its 2ᴰ corners. Mixed counts prove ∂Ω crosses the box; corners — rather than
 # interior points — are the natural sample set for an axis-aligned box and double as the child vertices when the octree
 # recurses.
-function _corner_membership(geometry::LevelSet, box::AxisBox{D,T}) where {D,T}
-    inside = _inside(geometry, center(box)) ? 1 : 0
-    outside = 1 - inside
-    for ci in CartesianIndices(ntuple(_ -> 0:1, D))
-        x = SVector{D,T}(ntuple(d -> ci.I[d] == 0 ? box.lower[d] : box.upper[d], D))
-        _inside(geometry, x) ? (inside += 1) : (outside += 1)
-    end
-    return inside, outside
+function _corner_membership(geometry::LevelSet, box::AxisBox{D}) where {D}
+    inside = count(x -> _inside(geometry, x), (center(box), _box_vertices(box)...))
+    return inside, 2^D + 1 - inside
 end
 
 # Recursive classifier returning one of `:full`, `:cut`, `:fictitious`. Strategy, cheapest first:
@@ -412,12 +405,12 @@ end
 #   1. Three-valued Lipschitz certificate on the CSG tree. A definite verdict settles `:full`/`:fictitious` with no
 #      sampling.
 #   2. Corner membership. Mixed inside/outside proves ∂Ω crosses the box.
-#   3. Octree recursion. Signs agree but the certificate did not fire; bisect into 2ᴰ children and recurse. Any `:cut`
-#      child, or any disagreement between `:full`/`:fictitious` children, makes the parent `:cut`.
-#   4. Depth budget exhausted with agreeing samples: trust the consensus.
+#   3. Octree recursion. Signs agree but the certificate did not fire; bisect into 2ᴰ children (`_box_children`) and
+#      recurse. Any `:cut` child, or any disagreement between `:full`/`:fictitious` children, makes the parent `:cut`.
+#   4. Depth budget exhausted with agreeing samples, or a box too small to bisect: trust the consensus.
 #
 # The single-leaf case reduces exactly to the Lipschitz-then-corner strategy the package used before CSG.
-function _classify_box(geometry::LevelSet, box::AxisBox{D,T}, depth::Integer, max_depth::Integer) where {D,T}
+function _classify_box(geometry::LevelSet, box::AxisBox, depth::Integer, max_depth::Integer)
     t = _tri(geometry, box)
     t == 1 && return :full
     t == -1 && return :fictitious
@@ -425,18 +418,13 @@ function _classify_box(geometry::LevelSet, box::AxisBox{D,T}, depth::Integer, ma
     n_inside, n_outside = _corner_membership(geometry, box)
     (n_inside > 0 && n_outside > 0) && return :cut
 
-    if depth < max_depth
-        c = center(box)
+    children = depth < max_depth ? _box_children(box) : nothing
+    if children !== nothing
         result::Union{Nothing,Symbol} = nothing
-        for ci in CartesianIndices(ntuple(_ -> 0:1, D))
-            child_lower = SVector{D,T}(ntuple(d -> ci.I[d] == 0 ? box.lower[d] : c[d], D))
-            child_upper = SVector{D,T}(ntuple(d -> ci.I[d] == 0 ? c[d] : box.upper[d], D))
-            child_state = _classify_box(geometry, AxisBox{D,T}(child_lower, child_upper), depth + 1, max_depth)
-            if result === nothing
-                result = child_state
-            elseif result !== child_state
-                return :cut
-            end
+        for child in children
+            state = _classify_box(geometry, child, depth + 1, max_depth)
+            result === nothing || result === state || return :cut
+            result = state
         end
         return result::Symbol
     end
@@ -478,8 +466,9 @@ end
 # Restricting the *leaves* rather than the scalar reconstruction is the whole point. `levelset_value` collapses the tree
 # to max/min, which creases ∂Ω wherever two components meet, and a crease inside the sliced box costs the quadrature
 # kernel its high order exactly as that function's docstring warns: on a wedge whose two faces meet strictly inside the
-# sliced box, the leaf-wise slice integrates the area to 3.6e-4 at moment order 4 where the collapsed one reaches only
-# 5.0e-3, 13× worse. `test_physical.jl` pins that comparison.
+# sliced box, the leaf-wise slice integrates the area to round-off at moment order 4 — the kernel puts a breakpoint
+# where the two leaves cross — while the collapsed one is 5.0e-3 off, and still 1.9e-3 at order 8. `test_physical.jl`
+# pins that comparison.
 _restrict(l::Leaf, k::Int, v) = Leaf(_restrict(l.f, k, v), l.lipschitz)
 _restrict(n::AllOf, k::Int, v) = AllOf(map(p -> _restrict(p, k, v), n.parts))
 _restrict(n::AnyOf, k::Int, v) = AnyOf(map(p -> _restrict(p, k, v), n.parts))

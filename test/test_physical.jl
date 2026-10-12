@@ -181,8 +181,8 @@ end
 
     # Identical region structure regardless of fit tolerance.
     @test length(plan_loose.regions) == length(plan_tight.regions)
-    cut_loose = count(r -> r.quadrature.kind === :cut_fitted, plan_loose.regions)
-    cut_tight = count(r -> r.quadrature.kind === :cut_fitted, plan_tight.regions)
+    cut_loose = count(r -> r.kind === :cut_fitted, plan_loose.regions)
+    cut_tight = count(r -> r.kind === :cut_fitted, plan_tight.regions)
     @test cut_loose == cut_tight > 0
 
     # Both targets reach the same residual floor: it is set by the kernel's approximation of the curved boundary, which
@@ -493,7 +493,7 @@ end
     m = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
 
     plan = Unfitted.integration_plan(m)
-    kinds = Set(region.quadrature.kind for region in plan.regions)
+    kinds = Set(region.kind for region in plan.regions)
     @test :full in kinds
     @test :cut_fitted in kinds
 end
@@ -507,11 +507,11 @@ end
                                        subcell_length_scale=1.0))
     plan = Unfitted.integration_plan(V)
 
-    fict_regions = [r for r in plan.regions if r.quadrature.kind === :fictitious_alpha]
+    fict_regions = [r for r in plan.regions if r.kind === :fictitious_alpha]
     @test length(fict_regions) >= 2
     # All :fictitious_alpha regions share weights vector identity (cache hit).
-    w = fict_regions[1].quadrature.weights
-    @test all(r.quadrature.weights === w for r in fict_regions)
+    w = fict_regions[1].weights
+    @test all(r.weights === w for r in fict_regions)
 end
 
 # --- Moment-fit quadrature in the integration plan ---
@@ -570,8 +570,8 @@ end
     # Every cut-cell rule is O(nbasis): a single NNLS solve keeps at most nbasis = (order·factor + 1)^D = 3³ = 27
     # points; a stair-step octree would have produced thousands here.
     plan = Unfitted.integration_plan(m)
-    cut_regions = [r for r in plan.regions if r.quadrature.kind === :cut_fitted]
-    @test maximum(length(r.quadrature.points) for r in cut_regions) <= 27
+    cut_regions = [r for r in plan.regions if r.kind === :cut_fitted]
+    @test maximum(length(r.points) for r in cut_regions) <= 27
 end
 
 @testset "diagnostics report cut_region_count" begin
@@ -583,8 +583,7 @@ end
 
     diag = diagnostics(m)
     plan = Unfitted.integration_plan(m)
-    expected = count(r -> r.quadrature.kind in (:cut_fitted, :cut_fallback, :cut_failed, :cut_alpha_failed),
-                     plan.regions)
+    expected = count(r -> r.kind in (:cut_fitted, :cut_fallback, :cut_failed, :cut_alpha_failed), plan.regions)
     @test diag.cut_region_count == expected
     @test diag.cut_region_count > 0
     @test diag.fit_failure_count == 0   # no failures expected on this smooth Ω
@@ -608,13 +607,13 @@ end
     model = prepare(mass(V; coefficient=1.0))
 
     cache = only(model.moment_fit_caches)
-    cut_regions(m) = [r for r in Unfitted.integration_plan(m).regions if r.quadrature.kind === :cut_fitted]
+    cut_regions(m) = [r for r in Unfitted.integration_plan(m).regions if r.kind === :cut_fitted]
     before = cut_regions(model)
     @test !isempty(before)
     # Bounded: one entry per cut region, and each region aliases its cached rule rather than owning a copy of it.
     @test length(cache) == length(before)
     cached_weights = Set(objectid(value[2]) for value in values(cache))
-    @test all(r -> objectid(r.quadrature.weights) in cached_weights, before)
+    @test all(r -> objectid(r.weights) in cached_weights, before)
 
     kept = Dict(key => value for (key, value) in cache)
     move!(model; level=2, to=box((0.25, 0.0), (0.5, 0.25)))
@@ -635,9 +634,9 @@ end
     plan = Unfitted.integration_plan(V)
 
     region = plan.regions[1]
-    @test region.quadrature.kind === :cut_fitted
-    jac = Unfitted.volume(region.box) / 2.0   # 1D
-    integral = sum(w * jac for w in region.quadrature.weights)
+    @test region.kind === :cut_fitted
+    jac = Unfitted.volume(Unfitted._region_box(region)) / 2.0   # 1D
+    integral = sum(w * jac for w in region.weights)
     @test integral ≈ 0.7 atol = 1.0e-3
 end
 
@@ -650,12 +649,14 @@ end
     p = physical_domain(x -> x[1] - 0.001; lipschitz=1.0, subcell_length_scale=10.0, max_depth=0)
     V = space(omega; cells=1, order=2, physical=p)
     plan = Unfitted.integration_plan(V)
-    # :cut_failed (empty Ω∩R) and :cut_fallback (residual > _FIT_FAILURE_RESIDUAL) are both defensive tags. The leaf
-    # here is linear, so the Saye moments are exact and a zero-residual non-negative fit exists: the region is
-    # :cut_fitted, neither of the two, and the max residual stays far below the failure threshold.
-    failed = count(r -> r.quadrature.kind in (:cut_fallback, :cut_failed, :cut_alpha_failed), plan.regions)
+    # :cut_failed (empty Ω∩R) and :cut_fallback (residual > _FIT_FAILURE_RESIDUAL · ‖m‖) are both defensive tags. The
+    # leaf here is linear, so the Saye moments are exact and a zero-residual non-negative fit exists: the region is
+    # :cut_fitted, neither of the two, and the max residual stays far below the failure threshold. The threshold is
+    # relative to the moment norm, which is at least the cut measure 0.001 (the moment of the constant), so the
+    # residual is held against that.
+    failed = count(r -> r.kind in (:cut_fallback, :cut_failed, :cut_alpha_failed), plan.regions)
     @test failed == 0
-    @test plan.moment_fit_residual_max < Unfitted._FIT_FAILURE_RESIDUAL
+    @test plan.moment_fit_residual_max < Unfitted._FIT_FAILURE_RESIDUAL * 0.001
     # Diagnostics counts must agree with the plan tags — guarding the flagging logic that the old `failed >= 0`
     # placeholder did not.
     m = prepare(stiffness(V; dirichlet=[dirichlet(0.0; on=boundary(:all))]))
@@ -685,8 +686,8 @@ end
 end
 
 @testset "NNMF on a region with multi-level parents" begin
-    # A cut base cell that is also covered by a cut overlay cell — exercises `_moment_order_for_region`'s
-    # max-over-parents logic. Use orders that differ between levels so the chosen moment_order is meaningful.
+    # A cut base cell that is also covered by a cut overlay cell — exercises the moment order's max over parents
+    # (`_axis_max` of `_moment_orders`). Use orders that differ between levels so the chosen moment_order is meaningful.
     bc = dirichlet(0.0; on=boundary(:all))
     omega = box((0.0,), (1.0,))
     p = physical_domain(x -> x[1] - 0.45; lipschitz=1.0, subcell_length_scale=1.0e-6, max_depth=4)
@@ -694,11 +695,11 @@ end
     plan = Unfitted.integration_plan(V)
 
     # At least one cut-fitted region with two parents (base + overlay).
-    multi_parent_cuts = [r for r in plan.regions if r.quadrature.kind === :cut_fitted && length(r.parents) == 2]
+    multi_parent_cuts = [r for r in plan.regions if r.kind === :cut_fitted && length(r.parents) == 2]
     @test !isempty(multi_parent_cuts)
     # moment_order for such a region = 2 × max(base.order, overlay.order) = 2 × 2 = 4.
     region = multi_parent_cuts[1]
-    moment_order = Unfitted._moment_order_for_region(V, region.parents)
+    moment_order = Unfitted._axis_max(Unfitted._moment_orders(p.moment_order_factor), V, region.parents)
     @test moment_order == (4,)
 end
 
@@ -711,13 +712,14 @@ end
     V_def = space(omega; cells=1, order=2, physical=p_default)
     V_che = space(omega; cells=1, order=2, physical=p_cheap)
 
-    parents = Unfitted._parents_covering(V_def.levels, box((0.0,), (1.0,)), GeometryTolerance(Float64))
+    parents = Unfitted._parents(V_def.levels, (1,), Unfitted.SVector(0.0), Unfitted.SVector(1.0))
+    order(V) = Unfitted._axis_max(Unfitted._moment_orders(V.physical.moment_order_factor), V, parents)
     # The default spans degree `2p`, which is what makes trial × test products exact on the moment basis.
     @test p_default.moment_order_factor == 2
-    @test Unfitted._moment_order_for_region(V_def, parents) == (4,)
+    @test order(V_def) == (4,)
     # Factor 1 spans degree `p` only: `∏(p+1)` weights, the tensor Gauss count on an uncut cell, exact for linear
     # functionals but — see `physical_domain`'s docstring — for a stiffness form only up to `p = 2`.
-    @test Unfitted._moment_order_for_region(V_che, parents) == (2,)
+    @test order(V_che) == (2,)
 
     @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1, moment_order_factor=0)
 end
@@ -728,9 +730,10 @@ end
     # would tag a region :cut_failed is not reached through the public path with the exact kernel.
     p = physical_domain(x -> 0.5 - x[1]; lipschitz=1.0, subcell_length_scale=10.0, max_depth=0)
     region_box = box((0.0,), (1.0,))
-    pts, ws, res = Unfitted.moment_fit_rule(p, region_box, (20,); target_residual=1.0e-14)
+    pts, ws, res, status = Unfitted.moment_fit_rule(p, region_box, (20,); target_residual=1.0e-14)
     @test !isempty(pts)
-    @test res < Unfitted._FIT_FAILURE_RESIDUAL
+    @test status === :fitted
+    @test res < Unfitted._FIT_FAILURE_RESIDUAL * sum(ws)   # relative to ‖m‖ ≥ m₀ = Σw, the cut measure
 end
 
 @testset "α-FCM fit failure is :cut_alpha_failed and counts as a failure" begin
@@ -739,24 +742,20 @@ end
     # cell's dofs stay α-stabilised. `:cut_fallback` carries the raw Saye volume rule — a full, correct rule with many
     # more points than a fit. All three non-fitted kinds feed the fit-failure count, all four count as cut regions, and
     # only `:cut_fallback` contributes to the fallback point budget.
-    RQ = Unfitted.RegionQuadrature{1,Float64}
-    VR = Unfitted.VolumeRegion{1,Float64}
-    b = box((0.0,), (1.0,))
-    noparents = Unfitted.ParentRef{1,Float64}[]
-    afail = RQ(:cut_alpha_failed, [SVector(0.5)], [0.3])
-    strict = RQ(:cut_failed, SVector{1,Float64}[], Float64[])
-    back = RQ(:cut_fallback, [SVector(0.25), SVector(0.75)], [0.5, 0.5])
+    region(kind, points, weights) = Unfitted.Region(SVector(0.0), SVector(1.0), Unfitted.Parent{1,Float64}[], kind,
+                                                    points, weights)
+    afail = region(:cut_alpha_failed, [SVector(0.5)], [0.3])
+    strict = region(:cut_failed, SVector{1,Float64}[], Float64[])
+    back = region(:cut_fallback, [SVector(0.25), SVector(0.75)], [0.5, 0.5])
     @test !isempty(afail.weights)          # α fallback is a nonzero rule …
     @test isempty(strict.weights)          # … the strict failure is empty
-    plan = Unfitted.IntegrationPlan{1,Float64}([VR(b, noparents, RQ(:cut_fitted, [SVector(0.5)], [1.0])),
-                                                VR(b, noparents, strict), VR(b, noparents, afail),
-                                                VR(b, noparents, back)], GeometryTolerance(Float64), 0,
+    plan = Unfitted.IntegrationPlan{1,Float64}([region(:cut_fitted, [SVector(0.5)], [1.0]), strict, afail, back],
                                                Unfitted.SmallOverlap{Float64}[], 1.0, 1.0, 0.0)
-    cut, failed, fallback, fallback_points = Unfitted._cut_region_stats(plan)
-    @test cut == 4
-    @test failed == 3
-    @test fallback == 1
-    @test fallback_points == 2
+    stats = Unfitted._kind_stats(plan.regions)
+    @test stats.cut == 4
+    @test stats.failed == 3
+    @test stats.fallbacks == 1
+    @test stats.fallback_points == 2
 end
 
 @testset "custom cut_quadrature rule replaces the moment fit on cut regions" begin
@@ -790,12 +789,12 @@ end
     plan_fitted = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2, physical=fitted))
     plan_custom = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2, physical=custom))
 
-    kinds(plan) = [r.quadrature.kind for r in plan.regions]
+    kinds(plan) = [r.kind for r in plan.regions]
     @test :cut_fitted in kinds(plan_fitted)
     @test !(:cut_custom in kinds(plan_fitted))
     # The rule replaces exactly the cut regions: same region boxes, same `:full` regions, `:cut_fitted` swapped for
     # `:cut_custom` one for one.
-    @test [r.box for r in plan_custom.regions] == [r.box for r in plan_fitted.regions]
+    @test [(r.lower, r.upper) for r in plan_custom.regions] == [(r.lower, r.upper) for r in plan_fitted.regions]
     @test count(==(:full), kinds(plan_custom)) == count(==(:full), kinds(plan_fitted))
     @test count(==(:cut_custom), kinds(plan_custom)) == count(==(:cut_fitted), kinds(plan_fitted)) > 0
     @test calls[] == count(==(:cut_custom), kinds(plan_custom))
@@ -803,32 +802,35 @@ end
     # Points come back in the region's reference frame with the standard Jacobian folded out, so `Σ w_q · vol(box) / 2ᴰ`
     # is the physical measure the rule integrates — here the whole box, since the rule ignores Ω.
     for region in plan_custom.regions
-        region.quadrature.kind === :cut_custom || continue
-        jacobian = Unfitted.volume(region.box) / 4
-        @test sum(region.quadrature.weights) * jacobian ≈ Unfitted.volume(region.box)
-        @test all(>=(0), region.quadrature.weights)
+        region.kind === :cut_custom || continue
+        region_box = Unfitted._region_box(region)
+        jacobian = Unfitted.volume(region_box) / 4
+        @test sum(region.weights) * jacobian ≈ Unfitted.volume(region_box)
+        @test all(>=(0), region.weights)
     end
 
     # A custom region is a cut region but never a fit failure: no fit ran, so there is no residual for
     # `fit_failure_count` to report on.
-    cut, failed, fallback, fallback_points = Unfitted._cut_region_stats(plan_custom)
-    @test cut == count(==(:cut_custom), kinds(plan_custom))
-    @test failed == 0
-    @test fallback == 0
-    @test fallback_points == 0
+    stats = Unfitted._kind_stats(plan_custom.regions)
+    @test stats.cut == count(==(:cut_custom), kinds(plan_custom))
+    @test stats.failed == 0
+    @test stats.fallbacks == 0
+    @test stats.fallback_points == 0
 
     # α blends the custom rule exactly as it blends a fit: the region carries `(1 − α)·custom ∪ α·tensor`, so the custom
     # part is scaled, not replaced.
     alpha = 0.25
     blended = physical_domain(geometry; settings..., alpha=alpha, cut_quadrature=tensor_rule)
     plan_blended = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2, physical=blended))
-    strict = first(r for r in plan_custom.regions if r.quadrature.kind === :cut_custom)
-    mixed = first(r for r in plan_blended.regions if r.quadrature.kind === :cut_custom && r.box == strict.box)
-    n = length(strict.quadrature.weights)
-    @test length(mixed.quadrature.weights) > n
-    @test mixed.quadrature.points[1:n] == strict.quadrature.points
-    @test mixed.quadrature.weights[1:n] ≈ strict.quadrature.weights .* (1 - alpha)
-    @test all(>=(0), mixed.quadrature.weights)
+    strict = first(r for r in plan_custom.regions if r.kind === :cut_custom)
+    mixed = first(r
+                  for r in plan_blended.regions
+                  if r.kind === :cut_custom && (r.lower, r.upper) == (strict.lower, strict.upper))
+    n = length(strict.weights)
+    @test length(mixed.weights) > n
+    @test mixed.points[1:n] == strict.points
+    @test mixed.weights[1:n] ≈ strict.weights .* (1 - alpha)
+    @test all(>=(0), mixed.weights)
 end
 
 @testset "an affine slice of the CSG tree is the geometry one dimension down" begin
@@ -956,8 +958,9 @@ end
     # Restricting leaf by leaf keeps those two faces as two smooth leaves, which is what the quadrature kernel's
     # multi-component construction needs. Restricting `levelset_value` instead — the tree collapsed to max/min — hands
     # the kernel a single leaf with a crease along the ridge, exactly the representation that function's own docstring
-    # warns against for integration. Measured at moment order 4 on the slice: 3.63e-4 leaf-wise against 4.97e-3
-    # collapsed, 13.7× worse, and the gap persists at orders 6 and 8 (2.2× and 2.5×).
+    # warns against for integration. Measured on the slice: leaf-wise, the kernel puts a breakpoint where the two faces
+    # cross and the area is exact to round-off at moment orders 4, 6 and 8 (0, 1.1e-16, 2.8e-16); collapsed, the crease
+    # leaves 4.97e-3, 2.88e-3 and 1.88e-3.
     wedge = intersect(leaf(x -> x[2] - x[1] - 0.25; lipschitz=sqrt(2.0)),
                       leaf(x -> x[2] + x[1] - 1.25; lipschitz=sqrt(2.0)))
     p3 = physical_domain(wedge; subcell_length_scale=0.25)
@@ -972,7 +975,7 @@ end
               for a in 0.05:0.1:0.95, b in 0.05:0.1:0.95)
 
     err(domain) = abs(sum(Unfitted.moment_fit_rule(domain, face, (4, 4))[2]) - 0.5)
-    @test err(leafwise) < 1.0e-3
+    @test err(leafwise) < 1.0e-13
     @test err(leafwise) < err(collapsed) / 3
 end
 
@@ -996,4 +999,169 @@ end
         end
     @test measure(1.0, 0.01) ≈ 1 - π * 0.02^2 rtol = 1.0e-6
     @test all(isapprox(measure(Inf, scale), 1.0; rtol=1.0e-14) for scale in (1.0, 0.1, 0.01))
+end
+
+# ── Plan-level analytic anchors ───────────────────────────────────────────────
+
+# ∫ g over every region of a plan, in physical coordinates: a region's reference point η maps through its own box and
+# its reference weight carries the box Jacobian vol(box) / 2ᴰ — the quantities the assembly loop integrates.
+function _plan_integral(plan, g)
+    total = 0.0
+    for region in plan.regions
+        region_box = Unfitted._region_box(region)
+        jacobian = Unfitted.volume(region_box) / 2^length(region.lower)
+        for (η, w) in zip(region.points, region.weights)
+            total += w * jacobian * g(Unfitted.reference_to_physical(region_box, η))
+        end
+    end
+    return total
+end
+
+_ball(c, r) = leaf(x -> sqrt(sum((x[d] - c[d])^2 for d in eachindex(c))) - r; lipschitz=1.0)
+
+# The convex polygon `P` clipped to `{keep(x) ≥ 0}` for an affine `keep` (one Sutherland–Hodgman pass), and to an axis
+# box by four such passes.
+function _clip(P, keep)
+    out = eltype(P)[]
+    for i in eachindex(P)
+        a, b = P[i], P[mod1(i + 1, length(P))]
+        fa, fb = keep(a), keep(b)
+        fa >= 0 && push!(out, a)
+        if (fa > 0 && fb < 0) || (fa < 0 && fb > 0)
+            push!(out, a + fa / (fa - fb) * (b - a))
+        end
+    end
+    return out
+end
+function _clip_to_box(P, lo, hi)
+    foldl((Q, (d, s, c)) -> isempty(Q) ? Q : _clip(Q, x -> s * (x[d] - c)),
+          ((1, 1, lo[1]), (1, -1, hi[1]), (2, 1, lo[2]), (2, -1, hi[2])); init=P)
+end
+function _shoelace(P)
+    sum(P[i][1] * P[mod1(i + 1, length(P))][2] - P[mod1(i + 1, length(P))][1] * P[i][2] for i in eachindex(P);
+        init=0.0) / 2
+end
+
+# ∫ g over a triangle by a collapsed (Duffy) Gauss rule of n² points, exact to degree 2n − 2; over a convex polygon by
+# its fan.
+function _triangle_integral(g, a, b, c; n=8)
+    ξ, ω = Unfitted.gausslegendre(n)
+    total = 0.0
+    for i in 1:n, j in 1:n
+        u = (ξ[i] + 1) / 2
+        v = (ξ[j] + 1) / 2 * (1 - u)
+        total += ω[i] * ω[j] / 4 * (1 - u) * g(a + u * (b - a) + v * (c - a))
+    end
+    return total * abs((b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]))
+end
+_polygon_integral(g, P) = sum(_triangle_integral(g, P[1], P[i], P[i+1]) for i in 2:(length(P)-1); init=0.0)
+
+@testset "integration plans integrate discs, annuli and spheres to their analytic values" begin
+    # End-to-end anchors through `integration_plan`: classification, the partition, the moment fits and the full-cell
+    # tensor rules together. The bounds sit well above the measured errors (disc 1.7e-14 / 1.4e-15, annulus 2.3e-13 /
+    # 6.3e-14, sphere 2.4e-11) and far below any structural failure — a lost cell or a wrong Jacobian costs ≥ 1e-4.
+    polar(c) = x -> sum((x[d] - c[d])^2 for d in eachindex(c))
+
+    c, r = (0.5, 0.5), 0.37
+    disc = space(box((0.0, 0.0), (1.0, 1.0)); cells=(16, 16), order=4,
+                 physical=physical_domain(_ball(c, r); subcell_length_scale=1 / 256, max_depth=4))
+    plan = Unfitted.integration_plan(disc)
+    @test _plan_integral(plan, x -> 1.0) ≈ π * r^2 rtol = 1.0e-10
+    @test _plan_integral(plan, polar(c)) ≈ π * r^4 / 2 rtol = 1.0e-10
+
+    c, R, r = (0.51, 0.49), 0.43, 0.17
+    annulus = space(box((0.0, 0.0), (1.0, 1.0)); cells=(10, 10), order=3,
+                    physical=physical_domain(intersect(_ball(c, R), complement(_ball(c, r)));
+                                             subcell_length_scale=1 / 160, max_depth=4))
+    plan = Unfitted.integration_plan(annulus)
+    @test _plan_integral(plan, x -> 1.0) ≈ π * (R^2 - r^2) rtol = 1.0e-11
+    @test _plan_integral(plan, polar(c)) ≈ π * (R^4 - r^4) / 2 rtol = 1.0e-11
+
+    c, r = (0.5, 0.5, 0.5), 0.37
+    sphere = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(4, 4, 4), order=2,
+                   physical=physical_domain(_ball(c, r); subcell_length_scale=1 / 64, max_depth=4))
+    @test _plan_integral(Unfitted.integration_plan(sphere), x -> 1.0) ≈ 4π * r^3 / 3 rtol = 1.0e-10
+end
+
+@testset "a triangle's moments over the kept cells match their exact clipped integrals" begin
+    # Three linear leaves whose corners sit at cell centres of a 6² p = 3 grid. The reference is the triangle clipped to
+    # every region box the plan keeps, so it judges the cut-cell quadrature alone, whatever the classifier decides about
+    # a sub-resolution tip. Every monomial up to total degree 2p — the trial × test degree — is checked.
+    #
+    # The documented machine-precision contract, corners included: the kernel's pair leaves make each corner a base
+    # breakpoint. Before they did, the worst monomial was 2.7e-3 off.
+    A, B, C = SVector(0.25, 0.25), SVector(0.75, 5 / 12), SVector(5 / 12, 11 / 12)
+    edge(p, q) = (t=q - p; n=SVector(t[2], -t[1]) / norm(t);
+                  leaf(x -> n[1] * (x[1] - p[1]) + n[2] * (x[2] - p[2]); lipschitz=1.0))
+    p = 3
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(6, 6), order=p,
+              physical=physical_domain(intersect(edge(A, B), edge(B, C), edge(C, A)); subcell_length_scale=1 / 96,
+                                       max_depth=4))
+    plan = Unfitted.integration_plan(V)
+    pieces = filter(c -> length(c) >= 3, [_clip_to_box([A, B, C], r.lower, r.upper) for r in plan.regions])
+    @test sum(_shoelace(c) for c in pieces) ≈ _shoelace([A, B, C]) rtol = 1.0e-14   # nothing lost to the classifier
+    worst = 0.0
+    for a in 0:(2p), b in 0:(2p-a)
+        g = x -> x[1]^a * x[2]^b
+        exact = sum(_polygon_integral(g, c) for c in pieces)
+        worst = max(worst, abs(_plan_integral(plan, g) - exact) / exact)
+    end
+    @test worst < 1.0e-13
+end
+
+@testset "the kernel integrates a triangle's interior corners exactly, cell by cell" begin
+    # Three linear leaves cut out a triangle whose corners lie strictly inside cut cells of a 7² grid. Every cut cell's
+    # Saye rule reproduces every monomial of total degree ≤ 6 over the clipped piece to round-off, measured against
+    # ∫_cell |g| so that a small piece is held to its cell's scale. Without a base breakpoint at the corners
+    # (`_PairLeaf` in `src/implicit.jl`) the worst cell was 8.9e-4 off.
+    A, B, C = SVector(0.13, 0.21), SVector(0.86, 0.34), SVector(0.41, 0.88)
+    edge(p, q) = (t=q - p; n=SVector(t[2], -t[1]) / norm(t);
+                  leaf(x -> n[1] * (x[1] - p[1]) + n[2] * (x[2] - p[2]); lipschitz=1.0))
+    triangle = intersect(edge(A, B), edge(B, C), edge(C, A))
+    fs = Any[l.f for l in Unfitted._leaves(triangle)]
+    worst = 0.0
+    for i in 0:6, j in 0:6
+        lo, hi = SVector(i / 7, j / 7), SVector((i + 1) / 7, (j + 1) / 7)
+        piece = _clip_to_box([A, B, C], lo, hi)
+        (length(piece) < 3 || _shoelace(piece) ≈ 1 / 49) && continue          # no part of the triangle, or a full cell
+        pts, ws = Unfitted.implicit_volume_quadrature(fs, x -> Unfitted._inside(triangle, x), box(lo, hi);
+                                                      gauss_points=8, lipschitz=ones(3))
+        cell = [lo, SVector(hi[1], lo[2]), hi, SVector(lo[1], hi[2])]
+        for a in 0:6, b in 0:(6-a)
+            g = x -> x[1]^a * x[2]^b
+            err = abs(sum(w * g(x) for (x, w) in zip(pts, ws)) - _polygon_integral(g, piece))
+            worst = max(worst, err / _polygon_integral(x -> abs(g(x)), cell))
+        end
+    end
+    @test worst < 1.0e-13
+end
+
+@testset "α-FCM regions integrate (1 − α)|Ω ∩ box| + α|box|" begin
+    # Under α-FCM every region's rule integrates the blended indicator: the whole box on a `:full` region, α times it on
+    # a `:fictitious_alpha` one, and on a cut region the fit scaled by (1 − α) plus the α-scaled tensor rule. One linear
+    # leaf keeps every cut exact, so the identity holds to round-off on all three kinds at once.
+    α = 0.01
+    n, p0 = normalize(SVector(0.3, 0.7)), SVector(0.5, 0.45)
+    phys = physical_domain(leaf(x -> n[1] * (x[1] - p0[1]) + n[2] * (x[2] - p0[2]); lipschitz=1.0); alpha=α,
+                           keep_fictitious=true, subcell_length_scale=1 / 80, max_depth=4)
+    plan = Unfitted.integration_plan(space(box((0.0, 0.0), (1.0, 1.0)); cells=(5, 5), order=2, physical=phys))
+    @test Set(r.kind for r in plan.regions) == Set([:full, :cut_fitted, :fictitious_alpha])
+    for region in plan.regions
+        lo, hi = region.lower, region.upper
+        boxvol = Unfitted.volume(Unfitted._region_box(region))
+        inside = _clip([lo, SVector(hi[1], lo[2]), hi, SVector(lo[1], hi[2])], x -> -dot(n, x - p0))
+        expected = (1 - α) * (length(inside) >= 3 ? _shoelace(inside) : 0.0) + α * boxvol
+        @test boxvol / 4 * sum(region.weights) ≈ expected atol = 1.0e-13 * boxvol
+    end
+end
+
+@testset "the threaded prefit equals the serial fit, key for key" begin
+    # The plan fits its cut keys on every thread and fills the cache afterwards. The fits share nothing, so each cached
+    # value must be bit for bit the rule a serial call returns. Meaningful when the suite runs on more than one thread.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(8, 8), order=2,
+              physical=physical_domain(_ball((0.47, 0.52), 0.33); subcell_length_scale=1 / 128, max_depth=4))
+    cache = Unfitted._MomentFitCache{2,Float64}()
+    Unfitted.integration_plan(V; moment_fit_cache=cache)
+    @test length(cache) > 8
+    @test all(isequal(value, Unfitted._fit_rule(V.physical, key..., nothing)) for (key, value) in cache)
 end

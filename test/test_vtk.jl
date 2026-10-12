@@ -487,7 +487,7 @@ end
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
     plan = Unfitted.integration_plans(model)[1]
-    kinds = [r.quadrature.kind for r in plan.regions]
+    kinds = [r.kind for r in plan.regions]
     @test :full in kinds
     @test :fictitious_alpha in kinds
     uncut = Set(i for (i, k) in pairs(kinds) if k === :full || k === :fictitious_alpha)

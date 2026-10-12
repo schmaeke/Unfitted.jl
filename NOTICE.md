@@ -22,7 +22,20 @@ in full at the top of the implementing file, for academic attribution:
     [doi:10.1016/j.jcp.2021.110720](https://doi.org/10.1016/j.jcp.2021.110720).
     Its use as a moment source follows B. Müller, F. Kummer, M. Oberlack,
     Int. J. Numer. Methods Engng. **96** (2013) 512,
-    [doi:10.1002/nme.4569](https://doi.org/10.1002/nme.4569).
+    [doi:10.1002/nme.4569](https://doi.org/10.1002/nme.4569). The pair leaves
+    that make polytope corners inside a cell exact specialise the 2022 paper's
+    pairwise elimination of the height variable between level sets to leaves
+    monotone along the height axis. Fiber roots are found by the Illinois
+    variant of regula falsi: M. Dowell, P. Jarratt,
+    "A modified regula falsi method for computing the root of an equation",
+    BIT **11** (1971) 168,
+    [doi:10.1007/BF01934364](https://doi.org/10.1007/BF01934364).
+
+  - **Polygon splitting** in `src/surface.jl` — the triangles of an immersed
+    surface are split at grid planes by single-plane passes of the polygon
+    clipper of I. E. Sutherland, G. W. Hodgman, "Reentrant polygon
+    clipping", Commun. ACM **17** (1974) 32,
+    [doi:10.1145/360767.360802](https://doi.org/10.1145/360767.360802).
 
   - **Mesh signed-distance** in `ext/UnfittedMeshIOExt.jl` — closest point on a
     triangle: C. Ericson, "Real-Time Collision Detection", Morgan Kaufmann

@@ -11,6 +11,13 @@ using SparseArrays
 using StaticArrays
 using Test
 
+# A facet region's quadrature points in physical coordinates, as the region accessors hand them to every consumer (a
+# region stores its rule in its own frame, `0` on the facet's pinned axes).
+function coupled_facet_points(region)
+    jacobian = Unfitted._region_jacobian(region)
+    return [first(Unfitted._region_point(region, k, jacobian)) for k in 1:Unfitted._region_qpoint_count(region)]
+end
+
 @testset "product space of disjoint domains == block diagonal" begin
     # Two disjoint unit squares, deliberately different resolutions, orders, and even source terms, so nothing about the
     # two discretisations lines up.
@@ -238,7 +245,7 @@ end
     for ((on, key_space), regions) in model.facet_regions
         @test !isempty(regions)
         expected = on.sides == [(1, :upper)] ? key_space.domain.upper[1] : key_space.domain.lower[1]
-        for region in regions, x in region.points
+        for region in regions, x in coupled_facet_points(region)
             @test x[1] ≈ expected
         end
     end
@@ -246,7 +253,7 @@ end
     # Both faces of both subdomains are represented: x = 0 and 1 (subdomain 1), x = 2 and 3 (subdomain 2). Before the
     # fix only 0 and 1 ever appeared.
     faces = sort(unique(round(x[1]; digits=12) for regions in values(model.facet_regions) for region in regions
-                        for x in region.points))
+                        for x in coupled_facet_points(region)))
     @test faces == [0.0, 1.0, 2.0, 3.0]
 end
 
@@ -558,25 +565,112 @@ end
 end
 
 @testset "the interface rule is sized per sub-cell from both sides" begin
-    # `_emit_interface_regions` used to take one `qorder` for the whole interface, from both spaces' nominal maxima. It
-    # now asks each sub-cell's own covering parents, per side, and keeps the larger of the two counts — the interface
+    # The interface builder used to take one `qorder` for the whole interface, from both spaces' nominal maxima. It now
+    # asks each sub-cell's own covering parents, per side, and keeps the larger of the two counts — the interface
     # integrand is a product of one trace from each subdomain, so neither side alone can size it. The two lookups stay
     # separate because the level ids of the two spaces are independently numbered.
     tol = GeometryTolerance(Float64)
     V1 = overlay(space(box((0.0, 0.0), (1.0, 0.5)); cells=(4, 2), order=1), box((0.5, 0.25), (1.0, 0.5)); cells=(2, 1),
                  order=3)
     V2 = space(box((0.0, 0.5), (1.0, 1.0)); cells=(4, 2), order=2)
-    u1 = field(:u1, V1)
-    u2 = field(:u2, V2)
     Γ = polyline_mesh([SVector(0.0, 0.5), SVector(1.0, 0.5)])
 
-    regions = Unfitted._interface_regions(interface(u1, u2, Γ), V1, V2, 1, 2, tol)
+    regions = Unfitted._simplex_regions(Γ, (V1, V2), (1, 2), tol)
     counts = [length(r.points) for r in regions]
     # Left half: base (p = 1 → 2) against V2 (p = 2 → 3). Right half: the overlay (p = 3 → 4) against V2. A single
     # global rule would print 4 twice.
     @test sort(unique(counts)) == [3, 4]
     for region in regions
-        x = sum(p[1] for p in region.points) / length(region.points)
+        x = (region.lower[1] + region.upper[1]) / 2   # the sub-segment's midpoint
         @test length(region.points) == (x < 0.5 ? 3 : 4)
     end
+
+    # An oblique interface crosses both axes, so each adds its own degree: 1 + 2(n − 1) points from the same per-axis
+    # count n — 5 against the base (n = 3, from V2′'s side), 7 under the overlay (n = 4). V2′ overlaps V1, so the
+    # oblique trace lies in both subdomains.
+    V2′ = space(box((0.0, 0.0), (1.0, 0.5)); cells=(3, 2), order=2)
+    oblique = polyline_mesh([SVector(0.05, 0.05), SVector(0.95, 0.40)])
+    counts = map(Unfitted._simplex_regions(oblique, (V1, V2′), (1, 2), tol)) do region
+        x = (region.lower + region.upper) / 2   # the sub-segment's midpoint
+        @test length(region.points) == (x[1] > 0.5 && x[2] > 0.25 ? 7 : 5)
+        return length(region.points)
+    end
+    @test sort(unique(counts)) == [5, 7]
+end
+
+@testset "an interface over points couples a 1D problem exactly" begin
+    # Regression (F3). An `Interface` over a `points_mesh` raised a MethodError: the interface builder had no K = 0
+    # subdivision. In 1D the interface between two subdomains *is* a point. A consistent Nitsche coupling there
+    # reproduces a quadratic exactly, which an order-2 space represents.
+    exact(x) = x[1] * (1 - x[1]) + x[1]                     # −u″ = 2, flux 1 − 2x ≠ 0 at the interface
+    V1 = space(box((0.0,), (0.5,)); cells=3, order=2)
+    V2 = space(box((0.5,), (1.0,)); cells=2, order=2)
+    u1, u2 = field(:u1, V1), field(:u2, V2)
+    Γ = points_mesh([SVector(0.5)]; normals=[SVector(1.0)])  # a → b
+    β = 50.0
+    nitsche = InterfaceForm(; symmetric=true) do q, sides, trial, _tc
+        sv, su = jump_sign(sides.test), jump_sign(sides.trial)
+        TestChannels(-0.5 * sv * dot(trial.gradient, q.normal) + β * sv * su * trial.value,
+                     -0.5 * su * trial.value .* q.normal)
+    end
+    model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2), couple(u1, u2, Γ, nitsche)...),
+                            loads=(source_load(u1; source=2.0), source_load(u2; source=2.0)),
+                            dirichlet=[dirichlet(exact; on=boundary(axis=1, side=:lower), field=:u1),
+                                       dirichlet(exact; on=boundary(axis=1, side=:upper), field=:u2)], symmetric=true))
+    sol = solve!(model)
+    @test boundary_integral(q -> 1.0, model; on=interface(u1, u2, Γ)) == 1.0
+    @test maximum(abs(value(sol, model, u1, (x,)) - exact((x,))) for x in (0.1, 0.3, 0.5)) < 1.0e-12
+    @test maximum(abs(value(sol, model, u2, (x,)) - exact((x,))) for x in (0.5, 0.7, 0.9)) < 1.0e-12
+end
+
+@testset "an interface over points or a 2D triangle patch integrates where both sides are" begin
+    # Regression (F3). Points (K = 0) and a 2D triangle mesh (codim 0) had no interface subdivision: both raised a
+    # MethodError. Each now integrates exactly the part of its geometry both subdomains cover.
+    V1 = space(box((0.0, 0.0), (1.0, 0.5)); cells=(4, 2), order=2)
+    V2 = space(box((0.0, 0.5), (1.0, 1.0)); cells=(3, 2), order=2)
+    u1, u2 = field(:u1, V1), field(:u2, V2)
+    # Three points on the shared edge y = 0.5 and one inside V1 alone, which the interface skips.
+    pts = [SVector(0.1, 0.5), SVector(0.45, 0.5), SVector(0.8, 0.5), SVector(0.3, 0.2)]
+    Γ = points_mesh(pts; normals=fill(SVector(0.0, 1.0), 4))
+    model = prepare(Problem((u1, u2);
+                            blocks=(stiffness_block(u1), stiffness_block(u2),
+                                    couple(u1, u2, Γ, mass_form(coefficient=1.0))...)))
+    @test boundary_integral(q -> 1.0, model; on=interface(u1, u2, Γ)) == 3.0
+    @test nquadpoints(model; on=interface(u1, u2, Γ)) == 3
+
+    # Two spaces over one square, non-matching (one an overlay stack), coupled over a codim-0 triangle mesh — an
+    # overlapping-domain coupling. Split at both grids, each sub-triangle carries each side's own covering cells, so
+    # over the whole square the coupling's diagonal blocks are the two fields' volume mass matrices.
+    W1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2)
+    W2 = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2), box((0.3, 0.3), (0.7, 0.7)); cells=(2, 2),
+                 order=2)
+    w1, w2 = field(:w1, W1), field(:w2, W2)
+    square = triangle_mesh([SVector(0.0, 0.0), SVector(1.0, 0.0), SVector(1.0, 1.0), SVector(0.0, 1.0)],
+                           [(1, 2, 3), (1, 3, 4)]; normals=fill(SVector(1.0, 0.0), 2))
+    iface = interface(w1, w2, square)
+    coupled = prepare(Problem((w1, w2);
+                              blocks=(mass_block(w1), mass_block(w2),
+                                      couple(w1, w2, square, mass_form(coefficient=1.0))...)))
+    @test boundary_integral(q -> 1.0, coupled; on=iface) ≈ 1.0 rtol = 1.0e-14
+    for w in (w1, w2)
+        volume = assemble_matrix(coupled, mass_block(w); threaded=false)
+        trace = assemble_matrix(coupled, block(w, w, mass_form(); on=iface); threaded=false)
+        @test maximum(abs, trace - volume) / maximum(abs, volume) < 1.0e-13
+    end
+end
+
+@testset "a 3D interface on the plane two subdomains share is integrated once" begin
+    # Regression (fixed with F4). Two stacked boxes with non-matching grids meet in the plane z = 0.5, and the interface
+    # is a square in that plane. The triangle clipper once kept a triangle lying in a grid plane whole in the cells on
+    # both sides of it — here the slab below z = 0.5 and the slab above — and both copies found parents on both sides,
+    # so the interface measured 1.28 instead of its area 0.64.
+    V1 = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 0.5)); cells=(2, 2, 1), order=1)
+    V2 = space(box((0.0, 0.0, 0.5), (1.0, 1.0, 1.0)); cells=(3, 3, 1), order=1)
+    u1, u2 = field(:u1, V1), field(:u2, V2)
+    square = [SVector(0.1, 0.1, 0.5), SVector(0.9, 0.1, 0.5), SVector(0.9, 0.9, 0.5), SVector(0.1, 0.9, 0.5)]
+    Γ = triangle_mesh(square, [(1, 2, 3), (1, 3, 4)])
+    model = prepare(Problem((u1, u2);
+                            blocks=(stiffness_block(u1), stiffness_block(u2),
+                                    couple(u1, u2, Γ, mass_form(coefficient=1.0))...)))
+    @test boundary_integral(q -> 1.0, model; on=interface(u1, u2, Γ)) ≈ 0.64 rtol = 1.0e-14
 end

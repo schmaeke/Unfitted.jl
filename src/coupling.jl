@@ -4,18 +4,19 @@
 #   * `Interface` — the `on=` tag that names the two coupled fields and the interface geometry (a user-supplied
 #     `BoundaryMesh`). It sits beside `BoundarySelector` and `BoundaryMesh` as a third `BlockForm.on` kind and is
 #     grouped into its own assembly pass by `_passes`.
-#   * `InterfaceRegion` — a two-sided integration region: shared physical quadrature points / weights / per-point
-#     normals (like `SurfaceRegion`), plus a *separate* covering-parent list per side, so field `a` is evaluated in its
-#     own subdomain's cut cell and field `b` in its subdomain's cut cell at the *same* physical point. The builder
-#     subdivides `Γ` against the merged trace of *both* grids (the non-matching segment-merge of the references), so one
-#     cut cell of one subdomain may face several of the other.
+#   * the interface regions — two-sided `SimplexRegion`s (`kind = :interface`): one rule and normal per sub-cell, like
+#     a surface region, with the covering parents of *both* subdomains, side `a`'s first (`split`), so field `a` is
+#     evaluated in its own subdomain's cut cell and field `b` in its subdomain's cut cell at the *same* physical point.
+#     They come from the immersed surface's builder (`_simplex_regions` in `surface.jl`), which subdivides `Γ` against
+#     the merged trace of *both* grids (the non-matching segment-merge of the references), so one cut cell of one
+#     subdomain may face several of the other.
 #   * `couple` — the public verb. Following the library's "supply the integration primitives, not the constitutive
 #     choice" rule, it does not bake in any penalty / Nitsche / cohesive law: it takes the user's bilinear interface
 #     form `a(trial, test)` and expands the jump coupling `∫_Γ a([u], [v]) dΓ`, `[u] = uₐ − u_b`, into the four field
 #     blocks `Kₐₐ, K_ab, K_ba, K_bb` with the exact `+ − − +` sign pattern. The constitutive content (β, flux weights,
 #     cohesive traction) lives entirely in `a`, written by the user from ordinary `WeakForm`s.
 #
-# The region assembly accessors (`_region_point`, `_refresh!`, `_region_normal`, …) and the `on`-resolution live with
+# The region assembly accessors (`_region_point`, `_refresh!`, `_parent_range`, …) and the `on`-resolution live with
 # the other region kinds in `assembly.jl`; the per-model region cache lives on the `Model` in `model.jl`.
 
 # ── Interface tag ─────────────────────────────────────────────────────────────
@@ -24,9 +25,11 @@
     Interface(field_a::Symbol, field_b::Symbol, geometry)
 
 The `on=` tag identifying a coupling interface between the fields named `field_a` and `field_b`, integrated over
-`geometry` (a [`BoundaryMesh`](@ref): a segment loop in 2D, a triangle surface in 3D). The interface trace is foreign to
-both subdomains' grids; assembly evaluates each field in whichever of *its own* cut cells contains each interface
-quadrature point.
+`geometry` (a [`BoundaryMesh`](@ref) of any simplex dimension: a segment loop in 2D, a triangle surface in 3D, points —
+in 1D the interface itself; or a codim-0 patch, triangles in 2D, where the two subdomains overlap). The interface trace
+is foreign to both subdomains' grids; assembly evaluates each field in whichever of *its own* cut cells contains each
+interface quadrature point. The geometry is split at the grid lines of both subdomains, and the parts of it outside
+either subdomain's active region are not integrated.
 
 Build one with [`interface`](@ref); attach coupling contributions with [`couple`](@ref) or by passing
 `on = interface(...)` to [`block`](@ref).
@@ -62,99 +65,58 @@ interface(u_a::Field, u_b::Field, geometry::BoundaryMesh) = Interface(u_a.name, 
 
 # ── Interface region ──────────────────────────────────────────────────────────
 
-"""
-    InterfaceRegion{D,T}
-
-One two-sided integration region on a sub-cell of a coupling interface. Mirrors [`SurfaceRegion`](@ref) — precomputed
-physical quadrature points, physical-frame weights, and a per-point normal — but carries a *separate* covering-parent
-list for each side (`parents_a` in `field_a`'s subdomain, `parents_b` in `field_b`'s) so the two fields are evaluated in
-their own cut cells at the shared point. `field_a` / `field_b` are the global field indices the assembly hot loop keys
-on through `region_parents`.
-"""
-struct InterfaceRegion{D,T<:Real}
-    field_a::Int
-    field_b::Int
-    parents_a::Vector{FacetParent{D,T}}
-    parents_b::Vector{FacetParent{D,T}}
-    points::Vector{SVector{D,T}}
-    weights::Vector{T}
-    normals::Vector{SVector{D,T}}
-end
-
-# Build every `InterfaceRegion` for one interface. The interface mesh is subdivided against the *merged* grid lines of
-# both subdomains, so each sub-cell lies inside a single cut cell of each subdomain; the covering parents are then
-# classified per side. A sub-cell whose midpoint has no active cover on one side (its trace lies outside that
-# subdomain's active region) is skipped. `field_a` / `field_b` are the resolved global field indices.
-function _interface_regions(iface::Interface, V_a::Space{D,T}, V_b::Space{D,T}, field_a::Int, field_b::Int,
-                            tol::GeometryTolerance{T}) where {D,T}
-    merged = _grid_lines_for_levels((V_a.levels..., V_b.levels...), Val(D), tol)
-    subdivided = _subdivide_mesh(iface.geometry, merged, tol)
-    return _emit_interface_regions(subdivided, V_a, V_b, field_a, field_b, tol)
-end
-
 # The regions of `iface` across the two subdomains of `problem`, with the coupled fields' global indices taken from
 # `layout`: how `prepare` builds the regions of every interface a form names, and how assembly builds them for an
-# interface `prepare` did not see.
+# interface `prepare` did not see. The builder is the immersed surface's (`_simplex_regions` in `surface.jl`), run over
+# both subdomain spaces: the mesh is split at the merged grid lines of both, and each sub-cell carries the covering
+# parents of both sides, side `a`'s first.
 function _interface_regions(iface::Interface, problem::Problem, layout::SystemLayout)
-    return _interface_regions(iface, _field_space(problem, iface.field_a), _field_space(problem, iface.field_b),
-                              _field_index(layout, iface.field_a), _field_index(layout, iface.field_b),
-                              layout.tolerance)
+    spaces = (_field_space(problem, iface.field_a), _field_space(problem, iface.field_b))
+    fields = (_field_index(layout, iface.field_a), _field_index(layout, iface.field_b))
+    return _simplex_regions(iface.geometry, spaces, fields, layout.tolerance)
 end
-
-# The rule is sized per sub-cell from the cells that actually cover it, on both sides: the interface integrand is a
-# product of one trace from each subdomain, so the count that integrates it is the larger of the two sides' own counts.
-# The two `_parent_quadrature_counts` lookups have to stay separate because the level ids of `V_a` and `V_b` are
-# independently numbered and a parent from one side would resolve to the wrong level through the other's lookup. `rules`
-# precomputes every rule the sweep can reach, bounded by the larger of the two spaces' nominal-order bounds.
-function _emit_interface_regions(subdivided::BoundaryMesh{D,T,K}, V_a::Space{D,T}, V_b::Space{D,T}, field_a::Int,
-                                 field_b::Int, tol::GeometryTolerance{T}) where {D,T,K}
-    bound = max(maximum(_surface_quadrature_order(V_a)), maximum(_surface_quadrature_order(V_b)))
-    rules = [_simplex_reference_quadrature(Val(K), n, T) for n in 1:bound]
-    reference_area = _reference_area(Val(K))
-    regions = InterfaceRegion{D,T}[]
-    for (cell_index, cell) in pairs(subdivided.cells)
-        midpoint = _cell_midpoint(cell)
-        parents_a = _active_cover_parents(V_a, midpoint, tol)
-        parents_b = _active_cover_parents(V_b, midpoint, tol)
-        (isempty(parents_a) || isempty(parents_b)) && continue
-
-        n = max(maximum(_parent_quadrature_counts(Val(D), parents_a, id -> _level_by_id(V_a, id))),
-                maximum(_parent_quadrature_counts(Val(D), parents_b, id -> _level_by_id(V_b, id))))
-        points, weights, normals = _simplex_cell_quadrature(cell, cell_index, subdivided.normals, rules[n],
-                                                            reference_area, Val(K))
-        push!(regions, InterfaceRegion{D,T}(field_a, field_b, parents_a, parents_b, points, weights, normals))
-    end
-    return regions
-end
-
-# ── Interface-kernel sugar ────────────────────────────────────────────────────
-
-"""
-    onside(side, a, b)
-
-Pick the value on `side` of a coupling interface: `a` when `side === :a`, `b` when `side === :b`. Replaces the
-`side === :a ? a : b` ternaries an [`InterfaceForm`](@ref) kernel writes for per-side material data. Bundle several
-per-side quantities into a `NamedTuple` to pick them all at once, e.g.
-`m = onside(sides.trial, (κ=κ₁, w=w₁), (κ=κ₂, w=w₂))` then `m.κ`, `m.w`.
-"""
-onside(side::Symbol, a, b) = side === :a ? a : b
-
-"""
-    jump_sign(side)
-
-The sign `side` contributes to an interface jump `⟦·⟧ = (·)_a − (·)_b`: `+1` on `:a`, `−1` on `:b`. In an
-[`InterfaceForm`](@ref) kernel the test/trial jumps are `⟦v⟧ = jump_sign(sides.test)·v` and
-`⟦u⟧ = jump_sign(sides.trial)·u`.
-"""
-jump_sign(side::Symbol) = onside(side, 1, -1)
 
 # ── couple ────────────────────────────────────────────────────────────────────
 
-# Zero-gradient / value negation of a weak-form callback return: flips the sign of the emitted `TestChannels` (or bare
-# scalar) so the off-diagonal blocks of a jump coupling carry `−a`. `_negate_channels` covers both the structured and
-# the scalar-shorthand return conventions of `WeakForm`.
-_negate_channels(c::TestChannels) = TestChannels(-c.value, -c.gradient)
-_negate_channels(x::Number) = -x
+"""
+    couple(uₐ::Field, u_b::Field, Γ::BoundaryMesh, form::WeakForm) -> NTuple{4,BlockForm}
+
+Expand the jump coupling `∫_Γ a([u], [v]) dΓ` — `[u] = uₐ − u_b` — between two independently discretised fields into the
+four field blocks it populates, ready to drop into a [`Problem`](@ref)'s `blocks`:
+
+    a([u],[v]) = a(uₐ,vₐ) − a(uₐ,v_b) − a(u_b,vₐ) + a(u_b,v_b),
+
+i.e. `+Kₐₐ, −K_ab, −K_ba, +K_bb`, all integrated over the shared interface `Γ`.
+
+`form` is *your* bilinear interface form `a(trial, test)`, written from ordinary [`WeakForm`](@ref)s — the library
+supplies the two-sided interface integration, not the constitutive law. The canonical penalty coupling
+`∫_Γ β [u]·[v] dΓ` is `couple(uₐ, u_b, Γ, mass_form(coefficient = β))`; a form reading `q.normal` and `trial.gradient`
+gives a flux/Nitsche coupling (mind the interface orientation — see [`Interface`](@ref)). Like every assembled bilinear
+form, the callback must be **linear in `trial` at fixed `q.state`**; a jump-nonlinear cohesive law is expressed by
+reading both fields' current iterate through `q.state` and returning its secant/tangent coefficient (a
+Newton/fixed-point step), not by making the callback itself nonlinear. There is no per-point interface history channel,
+so genuinely path-dependent state must be carried by the caller.
+
+For a bespoke interface term that is *not* a symmetric jump coupling, attach it directly with
+`block(test, trial, form; on = interface(uₐ, u_b, Γ))`.
+
+!!! note "Threaded assembly under code coverage"
+    Interface coupling passes assemble in parallel, like every other pass. One unexplained observation stands against
+    that: the assembled two-sided block of a vector-valued coupling was seen to be nondeterministically corrupted under
+    `--code-coverage` with `Threads.nthreads() ≥ 2`, on both x86 and ARM, and never outside a coverage-instrumented
+    process. It has not been reproduced since, and the mechanism is not established. A later stress campaign — some
+    30,000 assemblies compared bit-exactly against serial across both platforms, plus twenty consecutive
+    coverage-instrumented full-suite runs at four threads on Linux x64 — produced no mismatch, with a positive control
+    confirming the comparison detects a one-ulp perturbation. That is a strong negative result and not a proof of
+    absence. If you need bit-reproducible output from a coupled assembly *inside* a coverage-instrumented multithreaded
+    process, assemble that step serially with `assemble!(model; threaded=false)`.
+"""
+function couple(u_a::Field, u_b::Field, geometry::BoundaryMesh, form::WeakForm)
+    iface = interface(u_a, u_b, geometry)
+    neg = _negated_form(form)
+    return (block(u_a, u_a, form; on=iface), block(u_b, u_a, neg; on=iface), block(u_a, u_b, neg; on=iface),
+            block(u_b, u_b, form; on=iface))
+end
 
 # Wrap a bilinear form so its emitted channels are negated, preserving the component-aware arity and the symmetry /
 # linear metadata.
@@ -163,6 +125,12 @@ function _negated_form(form::WeakForm)
                ((q, trial) -> _negate_channels(form.bilinear(q, trial)))
     return WeakForm(; bilinear, linear=form.linear, symmetric=form.symmetric, component_aware=form.component_aware)
 end
+
+# Zero-gradient / value negation of a weak-form callback return: flips the sign of the emitted `TestChannels` (or bare
+# scalar) so the off-diagonal blocks of a jump coupling carry `−a`. `_negate_channels` covers both the structured and
+# the scalar-shorthand return conventions of `WeakForm`.
+_negate_channels(c::TestChannels) = TestChannels(-c.value, -c.gradient)
+_negate_channels(x::Number) = -x
 
 """
     InterfaceForm(kernel; symmetric=false)
@@ -221,46 +189,6 @@ end
 InterfaceForm(kernel; symmetric::Bool=false) = InterfaceForm{typeof(kernel)}(kernel, symmetric)
 
 """
-    couple(uₐ::Field, u_b::Field, Γ::BoundaryMesh, form::WeakForm) -> NTuple{4,BlockForm}
-
-Expand the jump coupling `∫_Γ a([u], [v]) dΓ` — `[u] = uₐ − u_b` — between two independently discretised fields into the
-four field blocks it populates, ready to drop into a [`Problem`](@ref)'s `blocks`:
-
-    a([u],[v]) = a(uₐ,vₐ) − a(uₐ,v_b) − a(u_b,vₐ) + a(u_b,v_b),
-
-i.e. `+Kₐₐ, −K_ab, −K_ba, +K_bb`, all integrated over the shared interface `Γ`.
-
-`form` is *your* bilinear interface form `a(trial, test)`, written from ordinary [`WeakForm`](@ref)s — the library
-supplies the two-sided interface integration, not the constitutive law. The canonical penalty coupling
-`∫_Γ β [u]·[v] dΓ` is `couple(uₐ, u_b, Γ, mass_form(coefficient = β))`; a form reading `q.normal` and `trial.gradient`
-gives a flux/Nitsche coupling (mind the interface orientation — see [`Interface`](@ref)). Like every assembled bilinear
-form, the callback must be **linear in `trial` at fixed `q.state`**; a jump-nonlinear cohesive law is expressed by
-reading both fields' current iterate through `q.state` and returning its secant/tangent coefficient (a
-Newton/fixed-point step), not by making the callback itself nonlinear. There is no per-point interface history channel,
-so genuinely path-dependent state must be carried by the caller.
-
-For a bespoke interface term that is *not* a symmetric jump coupling, attach it directly with
-`block(test, trial, form; on = interface(uₐ, u_b, Γ))`.
-
-!!! note "Threaded assembly under code coverage"
-    Interface coupling passes assemble in parallel, like every other pass. One unexplained observation stands against
-    that: the assembled two-sided block of a vector-valued coupling was seen to be nondeterministically corrupted under
-    `--code-coverage` with `Threads.nthreads() ≥ 2`, on both x86 and ARM, and never outside a coverage-instrumented
-    process. It has not been reproduced since, and the mechanism is not established. A later stress campaign — some
-    30,000 assemblies compared bit-exactly against serial across both platforms, plus twenty consecutive
-    coverage-instrumented full-suite runs at four threads on Linux x64 — produced no mismatch, with a positive control
-    confirming the comparison detects a one-ulp perturbation. That is a strong negative result and not a proof of
-    absence. If you need bit-reproducible output from a coupled assembly *inside* a coverage-instrumented multithreaded
-    process, assemble that step serially with `assemble!(model; threaded=false)`.
-"""
-function couple(u_a::Field, u_b::Field, geometry::BoundaryMesh, form::WeakForm)
-    iface = interface(u_a, u_b, geometry)
-    neg = _negated_form(form)
-    return (block(u_a, u_a, form; on=iface), block(u_b, u_a, neg; on=iface), block(u_a, u_b, neg; on=iface),
-            block(u_b, u_b, form; on=iface))
-end
-
-"""
     couple(uₐ::Field, u_b::Field, Γ::BoundaryMesh, form::InterfaceForm) -> NTuple{4,BlockForm}
 
 Expand a two-sided [`InterfaceForm`](@ref) into the four field blocks it populates. Each block wraps the user kernel
@@ -278,3 +206,24 @@ function couple(u_a::Field, u_b::Field, geometry::BoundaryMesh, form::InterfaceF
     return (block(u_a, u_a, side_form(:a, :a); on=iface), block(u_a, u_b, side_form(:a, :b); on=iface),
             block(u_b, u_a, side_form(:b, :a); on=iface), block(u_b, u_b, side_form(:b, :b); on=iface))
 end
+
+# ── Interface-kernel sugar ────────────────────────────────────────────────────
+
+"""
+    onside(side, a, b)
+
+Pick the value on `side` of a coupling interface: `a` when `side === :a`, `b` when `side === :b`. Replaces the
+`side === :a ? a : b` ternaries an [`InterfaceForm`](@ref) kernel writes for per-side material data. Bundle several
+per-side quantities into a `NamedTuple` to pick them all at once, e.g.
+`m = onside(sides.trial, (κ=κ₁, w=w₁), (κ=κ₂, w=w₂))` then `m.κ`, `m.w`.
+"""
+onside(side::Symbol, a, b) = side === :a ? a : b
+
+"""
+    jump_sign(side)
+
+The sign `side` contributes to an interface jump `⟦·⟧ = (·)_a − (·)_b`: `+1` on `:a`, `−1` on `:b`. In an
+[`InterfaceForm`](@ref) kernel the test/trial jumps are `⟦v⟧ = jump_sign(sides.test)·v` and
+`⟦u⟧ = jump_sign(sides.trial)·u`.
+"""
+jump_sign(side::Symbol) = onside(side, 1, -1)

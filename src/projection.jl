@@ -14,7 +14,7 @@
 #     Lossless when the target's active basis contains the source's — typically after a monotone `activate!` — and
 #     avoids the projection cost / smoothing in that case.
 
-# ── Backends and transfer regions ─────────────────────────────────────────────
+# ── Backends ──────────────────────────────────────────────────────────────────
 
 """
     abstract type TransferBackend end
@@ -113,31 +113,6 @@ struct Rewire <: TransferBackend
     strict::Bool
 end
 Rewire(; strict::Bool=true) = Rewire(strict)
-
-"""
-    TransferRegion{D,T}(box, target_parents, source_parents, quadrature)
-
-One admissible integration region for a source-to-target L² projection. Mirrors [`VolumeRegion`](@ref) but carries *two*
-parent lists — one per side of the projection — so the assembly hot loop can evaluate the source field and the target
-trace simultaneously without re-walking the mesh.
-
-Fields:
-
-  - `box::AxisBox{D,T}` — the region's physical-frame extent. Built from the *union* of source and target mesh
-    boundaries so the integrand is smooth across the box.
-  - `target_parents` — active target levels whose cell contains the box midpoint, with the box in each parent's
-    reference frame.
-  - `source_parents` — same, for the source. May be empty when the box lies in part of `Ω` the source did not cover
-    (e.g. after an overlay activation extended the target).
-  - `quadrature::TensorQuadrature{D,T}` — shared cached tensor Gauss rule, sized by the per-axis maximum recommended
-    quadrature order across both sides.
-"""
-struct TransferRegion{D,T<:Real}
-    box::AxisBox{D,T}
-    target_parents::Vector{ParentRef{D,T}}
-    source_parents::Vector{ParentRef{D,T}}
-    quadrature::TensorQuadrature{D,T}
-end
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
@@ -263,30 +238,42 @@ function _has_nonhomogeneous_constraints(layout::SystemLayout)
     return any(field -> any(!iszero, field.dofs.constrained_values), layout.fields)
 end
 
-# Build the [`TransferRegion`](@ref) list. Reuses the volume admissible-box partition from `intersections.jl`: feed both
-# sides' levels to `_merged_boxes` so the resulting boxes respect every mesh boundary on both sides. Drop boxes the
-# target does not cover (no rhs contribution and no place to deposit the result).
+# Build the L² transfer's region list on the admissible-box partition engine (`_partition` in `intersections.jl`), fed
+# both sides' levels in one tuple — source first — so the resulting boxes respect every mesh boundary on both sides. A
+# box's coverage signature then splits into its source and its target half (`_split_signature`), and each side's parents
+# are decoded from its own half: the two models' level ids overlap, so neither side's parents could be told apart in a
+# joint list. Boxes the target does not cover are dropped (no rhs contribution and no place to deposit the result).
+#
+# Each box becomes a one-sided volume region over its target parents, carrying the cached tensor rule sized by both
+# sides at once (`_transfer_quadrature_counts`, so it integrates the source × target products), stored with the box's
+# source parents. The source side of the box is that region's frame and rule over the source parents, which
+# `_transfer_rhs_regions!` builds on the spot; each side's workspace then frames and refreshes its own region exactly
+# as the kernel does a plan region. Storing the source side as its parent list alone makes the per-box record one
+# region and one pointer instead of two regions, about half the bytes. An empty source-parent list is a box the source
+# does not cover.
 function _transfer_regions(source_model::Model{D,T}, target_model::Model{D,T};
                            tolerance=target_model.dofs.tolerance) where {D,T}
-    levels = (source_model.problem.space.levels..., target_model.problem.space.levels...)
-    regions = TransferRegion{D,T}[]
-    quadrature_cache = Dict{NTuple{D,Int},TensorQuadrature{D,T}}()
-
-    for box in _merged_boxes(levels, Val(D), tolerance)
-        target_parents = _parents_covering(target_model.problem.space.levels, box, tolerance)
-        isempty(target_parents) && continue
-        source_parents = _parents_covering(source_model.problem.space.levels, box, tolerance)
-        quadrature = _transfer_quadrature(source_model, target_model, target_parents, source_parents, quadrature_cache)
-        push!(regions, TransferRegion{D,T}(box, target_parents, source_parents, quadrature))
+    source_levels, target_levels = source_model.problem.space.levels, target_model.problem.space.levels
+    regions = Tuple{VolumeRegion{D,T},Vector{Parent{D,T}}}[]
+    quadrature_cache = _TensorRuleCache{D,T}()
+    levels = (source_levels..., target_levels...)
+    _partition(levels, ntuple(identity, Val(D)), zero(SVector{D,T}), tolerance) do lower, upper, sig
+        source_sig, target_sig = _split_signature(sig, source_levels)
+        all(iszero, target_sig) && return nothing
+        target_parents = _parents(target_levels, target_sig, lower, upper)
+        source_parents = _parents(source_levels, source_sig, lower, upper)
+        counts = _transfer_quadrature_counts(source_model, target_model, target_parents, source_parents)
+        rule = _cached_tensor_quadrature!(quadrature_cache, counts, T)
+        push!(regions, (Region(lower, upper, target_parents, :full, rule.points, rule.weights), source_parents))
+        return nothing
     end
-
     return regions
 end
 
-function _transfer_quadrature(source_model::Model{D,T}, target_model::Model{D,T}, target_parents, source_parents,
-                              cache) where {D,T}
-    counts = _transfer_quadrature_counts(source_model, target_model, target_parents, source_parents)
-    return _cached_tensor_quadrature!(cache, counts, T)
+# A signature split after its first `K` slots — those of the `K` levels passed as the second argument, the source
+# levels — into the two sides' halves, as tuples of compile-time length.
+function _split_signature(sig::NTuple{N,Int}, ::NTuple{K,Any}) where {N,K}
+    (ntuple(i -> sig[i], Val(K)), ntuple(i -> sig[K + i], Val(N - K)))
 end
 
 # Per-axis quadrature counts for a transfer region: take the per-axis maximum recommended order across the *union* of
@@ -297,12 +284,10 @@ end
 # contribution there is zero anyway, so any rule will do, and the cheap `1` keeps cache pressure low.
 function _transfer_quadrature_counts(source_model::Model{D}, target_model::Model{D}, target_parents,
                                      source_parents) where {D}
-    target_counts = _parent_quadrature_counts(Val(D), target_parents,
-                                              id -> _level_by_id(target_model.problem.space, id))
+    target_counts = _axis_max(_gauss_counts, target_model.problem.space, target_parents)
     source_counts = isempty(source_parents) ? ntuple(_ -> 1, D) :
-                    _parent_quadrature_counts(Val(D), source_parents,
-                                              id -> _level_by_id(source_model.problem.space, id))
-    return ntuple(d -> max(target_counts[d], source_counts[d]), D)
+                    _axis_max(_gauss_counts, source_model.problem.space, source_parents)
+    return max.(target_counts, source_counts)
 end
 
 # Accumulate the source-driven rhs of the L² transfer over the union partition `regions`, onto `rhs`. The target mass
@@ -326,29 +311,32 @@ function _transfer_rhs!(rhs, source_coefficients, source_model::Model, target_mo
     return _transfer_rhs_regions!(rhs, target, source, state, regions)
 end
 
-# The region loop of `_transfer_rhs!`, behind a function barrier on the two workspaces. Per region the source dof values
-# are read once; per point and per target field component, `u_S` of the same-named source field is emitted against every
-# target test function as a load, `(qweight·u_S)·φ`, accumulated per row in point order. A pivot target is condensed
-# onto its branches before the local rhs is added to the global one. A region the source does not cover contributes
-# nothing (`u_S ≡ 0` there) and is skipped.
+# The region loop of `_transfer_rhs!`, behind a function barrier on the two workspaces. Per box the source dof values
+# are read once; per point and per target field component, `u_S` of the same-named source field is emitted against
+# every target test function as a load, `(qweight·u_S)·φ`, accumulated per row in point order. A pivot target is
+# condensed onto its branches before the local rhs is added to the global one. A box the source does not cover
+# contributes nothing (`u_S ≡ 0` there) and is skipped.
+#
+# The source region is the target region with the source parents in place of the target's: the same frame and the same
+# rule, so both sides see the same frame point `η`. A `Region` is immutable, so building it here costs no heap
+# allocation.
 function _transfer_rhs_regions!(rhs::Vector{T}, target::AssemblyWorkspace{D,T}, source::AssemblyWorkspace,
                                 state::FormState, regions) where {D,T}
     # Target field `f`'s component `c` reads the source field of the same name.
     source_field = [_field_index(source.layout, fl.name) for fl in target.layout.fields]
-    for region in regions
-        isempty(region.source_parents) && continue
-        # Each side as the kernel's helpers see a region, a parent list, so `_frame!`, `_refresh!` and the state
-        # evaluation run on it unchanged, with `region_parents` and `_parent_lists` taking their defaults.
-        target_view, source_view = (; parents=region.target_parents), (; parents=region.source_parents)
-        n = _slots!(_frame!(target, target_view))
+    for (target_region, source_parents) in regions
+        isempty(source_parents) && continue
+        source_region = Region(target_region.lower, target_region.upper, source_parents, target_region.kind,
+                               target_region.points, target_region.weights)
+        n = _slots!(_frame!(target, target_region))
         m = n + length(target.pivots)
-        _state_region!(state, _frame!(source, source_view))
+        _state_region!(state, _frame!(source, source_region))
         fill!(resize!(target.b, m), zero(T))
-        jacobian = volume(region.box) / convert(T, 2^D)
-        for (η, weight) in zip(region.quadrature.points, region.quadrature.weights)
+        jacobian = _region_jacobian(target_region)
+        for (η, weight) in zip(target_region.points, target_region.weights)
             qweight = weight * jacobian
-            _refresh!(target, target_view, η, Val(false))
-            _refresh!(source, source_view, η, Val(false))
+            _refresh!(target, target_region, η, Val(false))
+            _refresh!(source, source_region, η, Val(false))
             _state_point!(state, source, Val(false))
             for (f, fl) in pairs(target.layout.fields), c in 1:fl.components
                 u = state.values[state.offsets[source_field[f]]+c]
