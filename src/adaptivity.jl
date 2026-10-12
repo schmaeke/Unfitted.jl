@@ -315,8 +315,9 @@ _coarse_cell(c::CartesianIndex{D}, f::Int) where {D} = CartesianIndex(ntuple(d -
 # them.
 #
 # It is a function rather than a branch of `estimate` for compile time: `space` is built at run time and is not
-# concretely typed there, so this call is dispatched at run time and the copy and the merge are compiled when a twin is
-# first estimated, never for a stack without one.
+# concretely typed there, so this call is dispatched at run time, and the copy and the merge are code-generated only
+# when a twin is first estimated, never for a stack without one. Inference still reads its body, for the abstract
+# signature, when `estimate` itself is first compiled, whatever the stack.
 function _twinned_model(model::Model, space::Space, twinned::Vector{Int})
     caches = copy.(model.moment_fit_caches)
     plus = _derived(model, space; options=merge(model.plan_options, (; prune_exempt=twinned)), caches,
@@ -415,9 +416,10 @@ wrong points where it is not, which is the reading that produces a plausible num
 [`QuadField`](@ref) captured by any of the problem's forms is found before the enriched model is built and raises. A
 read the forms make without capturing the state — through a global — raises at the read instead, as does a read of
 any array by `q.point`, a plain one with a `BoundsError`: `V⁺` numbers its points far below 1, so no such read can
-land on a point of `model`'s cloud. That numbering is `V⁺`'s own and sets nothing process-wide, so a read in any other
-task, another `estimate` running at the same time included, is unaffected. Where a model carries per-point state,
-compute the indicator on a model whose forms read that state through the physical point `q.x` instead.
+land on a point of `model`'s cloud. That numbering is `V⁺`'s own and sets nothing process-wide, so a `q.point` read in
+any other task, one in an `estimate` of another model running at the same time included, is unaffected. Where a model
+carries per-point state, compute the indicator on a model whose forms read that state through the physical point `q.x`
+instead.
 
 What it refuses, before anything enriched is built and in messages that name `estimate`: a multi-domain or multi-field
 problem (the one field may carry any number of components), a model that has not been assembled, a `solution` that is
@@ -449,9 +451,10 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     catch err
         err isa ArgumentError ? throw(ArgumentError("estimate: " * err.msg)) : rethrow()
     end
-    # The enriched twin below re-runs THESE forms on a different quadrature cloud, and a form keyed by `q.point` reads
-    # the wrong points there without raising. `data.jl` carries the search and the reasoning; it runs once per call and
-    # never per point.
+    # The enriched model V⁺ below re-runs THESE forms on a different quadrature cloud, where a form keyed by `q.point`
+    # has no point of its own to read. V⁺'s numbering makes such a read raise at the read (below); this walk refuses a
+    # captured `QuadField` before anything is built, and names it. `data.jl` carries the search and the reasoning; it
+    # runs once per call and never per point.
     _assert_no_point_keyed_state(model.problem, "estimate")
 
     # Without a live twin, `V⁺` is built on `model`'s caches UNcopied, which is the opposite of what every other
@@ -1117,8 +1120,8 @@ Releasing a cover whose children are themselves covered is a no-op rather than a
 down and the deeper level is what holds it, so releasing this level alone would leave a hole. On a family whose
 functions reach beyond their cell (a B-spline level) that includes the support collar a held child needs, and no cell a
 deeper level holds is released as part of anyone's collar. Release the stack from the top down and each call is well
-defined. So is an h-mark on a level the one below does not reach, which has no cover to
-release. As in [`refine`](@ref), a call that changes nothing returns `V` itself.
+defined. So is an h-mark on a level the one below does not reach, which has no cover to release. As in
+[`refine`](@ref), a call that changes nothing returns `V` itself.
 
 Lowering the order of a cell a finer level has taken over is **rejected**, and *any* finer level counts, not only the
 one immediately below — the dof layer's covering rule tests them all, so a cell held by level `k + 2` while `k + 1` is
