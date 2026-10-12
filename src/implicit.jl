@@ -361,9 +361,10 @@ _restrict(g::_LipschitzLeaf, k::Int, v) = _LipschitzLeaf(_Slice(g.f, k, v), g.li
 # also stay inside the box, but kinks P along gⱼ's traces, and the tetrahedron of the tests then misses its volume by
 # 2e-6.) Off the bracket P vanishes only where the two interpolants' roots meet beyond the box, so two curved leaves
 # that do not cross inside it usually leave P of one sign — the order of their roots — and the base problem prunes it
-# like any leaf that does not vary (`_sample_sign`); two leaves with one zero set leave P zero up to round-off, and the
-# base problem prunes that as well (`_vanishes`). When gⱼ's end values are equal the secant has no root and P is gᵢ at
-# the lower end.
+# like any leaf that does not vary (`_sample_sign`). Two leaves with one zero set whose values along a fiber are
+# proportional — linear leaves, a leaf and its negation or rescaling — leave P zero up to round-off, and the base
+# problem prunes that as well (`_vanishes`); two different curved functions of one surface do not, see there. When gⱼ's
+# end values are equal the secant has no root and P is gᵢ at the lower end.
 #
 # `gi` and `gj` are `Any`, as the kernel's leaf lists are: typed fields would nest a pair leaf's type once per level of
 # the reduction (pairs of restricted pairs in 3D), and the compile work with it.
@@ -391,6 +392,11 @@ end
 # through) and never instantiates one. The step is a fixed fraction, cbrt(eps), of the fiber the pair leaf was built
 # on, so the gradient does not depend on the geometry's length scale. Pair leaves steer the axis choice and the pruning
 # of base problems and are never integrated themselves. Restriction keeps the wrapper and the step.
+#
+# The step follows the box, not the coordinates, so the gradient does depend mildly on where the box sits: a leaf value
+# carries a round-off of about an ulp of its coordinates times its slope, and on a box far from the origin, small beside
+# |x|, that noise can exceed the difference across h and misread a nearly flat component. That costs a different base
+# partition — more subdivision — and never the region integrated.
 struct _FDLeaf{F,T}
     f::F
     h::T
@@ -421,13 +427,15 @@ _face(_) = nothing
 _opposite_faces(a, b) = (fa = _face(a)) !== nothing && (fb = _face(b)) !== nothing && fa != fb
 
 # Whether the leaf `g` is a pair leaf, or a restriction of one, that vanishes on the box `U` up to round-off. Two
-# distinct leaves with one zero set — the shared face of two adjoining CSG boxes, x − a for one and a − x for the other,
-# or one plane that two boxes give as two leaf objects — have roots that coincide on every fiber, so their pair leaf is
-# zero over the whole base; and where two leaves cross in a line that lies in a face of the base box (a roof ridge in a
-# grid plane), their pair leaf's restriction to that face is zero. Neither has a crossing to resolve, but `_sample_sign`
-# cannot prune them: they sample zeros, or round-off of either sign, and kept as leaves they put a breakpoint at every
-# scan sample of every fiber — seven to ten times the kernel points, and sixty to seventy times the leaf evaluations of
-# the moment fits, of two boxes that share a face inside a cell.
+# distinct leaves with one zero set whose values along a fiber are proportional — the shared face of two adjoining CSG
+# boxes, x − a for one and a − x for the other, or one plane that two boxes give as two leaf objects — have roots that
+# coincide on every fiber, so their pair leaf is zero over the whole base: where gⱼ's root is bracketed P is gᵢ at a
+# root of its own, and off the bracket the two leaves' linear interpolants share their root. And where two leaves cross
+# in a line that lies in a face of the base box (a roof ridge in a grid plane), their pair leaf's restriction to that
+# face is zero. Neither has a crossing to resolve, but `_sample_sign` cannot prune them: they sample zeros, or round-off
+# of either sign, and kept as leaves they put a breakpoint at every scan sample of every fiber — seven to ten times the
+# kernel points, and sixty to seventy times the leaf evaluations of the moment fits, of two boxes that share a face
+# inside a cell.
 #
 # The test is a distance along the fiber, so the kernel's own coincidence tolerance `atol` applies (`_emit_fiber!` drops
 # a sub-interval shorter than it): at the center and every corner of `U`, |P| ≤ atol·s, with s = |gᵢ(hi) − gᵢ(lo)| /
@@ -436,6 +444,13 @@ _opposite_faces(a, b) = (fa = _face(a)) !== nothing && (fb = _face(b)) !== nothi
 # between the samples loses only the breakpoint the pair leaf would have added, which is the accuracy of no pair leaf.
 # Where round-off exceeds `atol` (a box tiny against its distance from the origin) the pair leaf is kept, which costs
 # work only. Leaves the caller supplied are never tested, so the partition they give is unchanged.
+#
+# Two *different* curved functions of one surface — a sphere's distance ‖x − c‖ − r and its square ‖x − c‖² − r², say —
+# keep their pair leaf: off the bracket their interpolants' roots differ, so P is not small there, and its round-off
+# inside the bracket scatters breakpoints. That costs kernel points — measured on a ball whose surface two CSG leaves
+# spell this way, 1.8× in 2D and 5.4× in 3D the points of a kernel without pair leaves — never accuracy. The test
+# deliberately reads every sample, those off the bracket included: one that skipped them would be vacuously true on a
+# box all of whose samples are off the bracket, where two linear leaves can still cross between them.
 _vanishes(_, ::AxisBox, _) = false
 _vanishes(g::_FDLeaf, U::AxisBox, atol) = all(x -> _negligible(g.f, x, atol), (center(U), _box_vertices(U)...))
 _negligible(s::_Slice, x, atol) = _negligible(s.g, _insert_axis(x, s.k, s.v), atol)
@@ -514,10 +529,14 @@ end
 # ── Full-box tensor rule ───────────────────────────────────────────────────────
 
 # Tensor Gauss rule over the whole box, used when no leaf varies on the box and the box is inside Ω: the context's 1D
-# rule on every axis (`_tensor_rule`), mapped in place into physical coordinates with the box Jacobian folded in.
+# rule on every axis (`_tensor_rule`), mapped in place into physical coordinates with the box Jacobian folded in. The
+# rule is a fresh one, so mapping its arrays in place is safe; the loop rather than `map!` because `map!` leaves a
+# destination that aliases its source unspecified.
 function _full_box_rule(U::AxisBox{D,T}, ctx::_QuadCtx) where {D,T}
     rule = _tensor_rule(ntuple(_ -> (ctx.nodes, ctx.weights), Val(D)))
-    map!(η -> reference_to_physical(U, η), rule.points, rule.points)
+    for i in eachindex(rule.points)
+        rule.points[i] = reference_to_physical(U, rule.points[i])
+    end
     rule.weights .*= volume(U) / convert(T, 2^D)
     return rule.points, rule.weights
 end
@@ -588,8 +607,9 @@ end
 #     bracket — the regime of a multiple root, where regula falsi, Illinois or not, converges only linearly;
 #   - the side of `a` is fixed by its sign at entry, so a halved end value that underflows to zero cannot misread one.
 #
-# The bracket therefore shrinks at every evaluation, halves at least every third one, and always contains a sign
-# change; the iteration stops at an exact zero or once the bracket is two adjacent floats, returning a point of it.
+# The bracket therefore shrinks at every evaluation, halves at least once in every four of them (three steps that did
+# not halve it are followed by a bisection), and always contains a sign change; the iteration stops at an exact zero or
+# once the bracket is two adjacent floats, returning a point of it.
 function _root(f, a::T, b::T, fa::T, fb::T) where {T}
     negative_a = fa < 0
     side = 0
