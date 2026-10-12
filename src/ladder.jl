@@ -258,8 +258,8 @@ overlays (levels up to 128×128, 42–50 live cells on each overlay), the sweep 
 the per-cell loop — the same answer, three orders of magnitude apart.
 """
 function overlapping_cells(V::Space{D,T}, cells; from::Integer, to::Integer) where {D,T}
-    src_level = V.levels[_check_level(V, from, "from")]
-    dst_level = V.levels[_check_level(V, to, "to")]
+    src_level = _level_at(V, from, "from")
+    dst_level = _level_at(V, to, "to")
     src = _selection(cells, src_level.mesh)
     from == to && return src
 

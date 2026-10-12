@@ -1398,7 +1398,7 @@ function _update_mask!(model::Model{D,T}, level_index::Integer, cells, value::Bo
     on = active_cells(V; level=k)
     selected = _selection(cells, V.levels[k].mesh)
     value ? (on .|= selected) : (on .&= .!selected)
-    return _remodel!(model, _remasked_space(V, k, _collapse_mask(on)))
+    return _remodel!(model, _relevel(V, k; mask=_collapse_mask(on)))
 end
 
 """
@@ -1584,7 +1584,7 @@ model, so on a multi-domain model it reports the first subdomain.
 """
 function active_cells(model::Model; level::Integer, effective::Bool=true)
     V = effective ? model.problem.space : model.prefold_space
-    lvl = V.levels[_check_level(V, level)]
+    lvl = _level_at(V, level)
     lvl.mask === nothing && return trues(lvl.mesh.cells)
     return copy(lvl.mask.on)
 end

@@ -685,7 +685,7 @@ _moment_orders(factor::Int) = (level, cell) -> factor .* cell_order(level, cell)
 # region loop reads back nothing but hits. Its value is across plan rebuilds — a `move!` leaves the great majority of
 # cut boxes bit-identical, and refitting one costs hundreds of milliseconds in 3D — so [`Model`](@ref) owns one per
 # distinct participating space and threads it back in through every rebuild. That scope also keeps the key honest: a
-# space's `PhysicalDomain` is immutable and is carried unchanged through `moved_space` / `_remasked_space`, so one cache
+# space's `PhysicalDomain` is immutable and is carried unchanged through every level rebuild (`_relevel`), so one cache
 # sees exactly one `physical` for its whole life and the key need not include it. `_prefit!` bounds the cache to the
 # current plan's regions, so a long `move!` sweep holds one plan's rules, not the sweep's.
 const _MomentFitKey{D,T} = Tuple{SVector{D,T},SVector{D,T},NTuple{D,Int}}

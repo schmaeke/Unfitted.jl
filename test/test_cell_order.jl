@@ -364,7 +364,7 @@ end
     @test cell_orders(W; level=2) == cell_orders(V; level=2)
     @test worst_trace_jump(W; level=2) == 0.0
 
-    # activate! / deactivate! go through `_remasked_space`.
+    # activate! / deactivate! rebuild the level's mask through the one level builder.
     model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     before = active_unknowns(model)
     deactivate!(model; level=2, cells=[CartesianIndex(1, 1)])

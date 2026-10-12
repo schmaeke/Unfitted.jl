@@ -499,12 +499,11 @@ end
 # of it and roots them in a GC frame twice the size.
 #
 # The buffer checks are `>=`, not `==`. Under a per-cell polynomial order the workspace banks stay sized at the level's
-# *nominal* (maximum) order while `indices` is the cell's own minimum-rule set, which is shorter on every cell below the
-# maximum. Writing into a prefix of the longer buffer is transparent to every consumer, because they all bound their
-# loop by `eachindex(raw_dofs)` and read `values[a]` positionally — the pairing is with the index list, not with the
-# buffer's length. Length-matching with a `view` instead was measured at +24–30% on this kernel and is not worth it.
-# What `>=` gives up is the guard against a *short* buffer, so `test_cell_order.jl` asserts the surviving checks still
-# fire.
+# longest minimum-rule set while `indices` is the cell's own set, which is shorter on every cell below the maximum.
+# Writing into a prefix of the longer buffer is transparent to every consumer, because they all bound their loop by
+# `eachindex(raw_dofs)` and read `values[a]` positionally — the pairing is with the index list, not with the buffer's
+# length. Length-matching with a `view` instead was measured at +24–30% on this kernel and is not worth it. What `>=`
+# gives up is the guard against a *short* buffer, so `test_cell_order.jl` asserts the surviving checks still fire.
 #
 # The 1D factor tables are likewise filled at the nominal order and read only up to the cell's own: for integrated
 # Legendre `_fill_factor_tables!` computes mode `m` from `ξ` and `m` alone, with no `p` anywhere in the recurrence, so

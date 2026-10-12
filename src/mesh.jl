@@ -408,8 +408,9 @@ function _collapse_order(entries::Vector{NTuple{D,Int}}) where {D}
     return entries
 end
 
-# The level's *nominal* order: the uniform order, or the per-axis maximum over a per-cell field. It is the `nominal`
-# field of `CellOrders` — there is no `Level.order` any more — and `nominal_order` is its public read.
+# The level's *nominal* order: the uniform order, the per-axis maximum over a per-cell field, or the `nominal` field of
+# a `CellOrders` record a rebuild reuses. That field is the stored answer — there is no `Level.order` any more — and
+# `nominal_order` is its public read.
 #
 # Sizing a quadrature rule from it is always SAFE, because it bounds every cell of the level from above and
 # over-integrating costs points rather than accuracy. Safe is not the same as right, though, and the consumers have
@@ -417,6 +418,7 @@ end
 # `_subdivision_counts` each size from the parent CELL's own order, so one loud cell no longer sets the rule for the
 # level.
 _nominal_order(o::NTuple{D,Int}) where {D} = o
+_nominal_order(o::CellOrders) = o.nominal
 
 function _nominal_order(entries::Vector{NTuple{D,Int}}) where {D}
     out = first(entries)
@@ -471,6 +473,12 @@ function _build_cell_orders(family::BasisFamily, entries::Vector{NTuple{D,Int}},
     return CellOrders{D}(palette, class, _nominal_order(palette))
 end
 
+# A rebuild that keeps the order field hands the level's own record back in, and it is reused as it is: it was
+# validated against this family's request when it was built, and a move, a mask edit, the fold and a reindex change
+# nothing it was validated for. (`estimate`'s enriched space hands in a record it raised entry by entry, which keeps
+# every property the validation checks; see `_enriched_space`.)
+_build_cell_orders(::BasisFamily, orders::CellOrders{D}, ::CartesianMesh{D}) where {D} = orders
+
 # ── Levels and superposition spaces ───────────────────────────────────────────
 
 """
@@ -522,8 +530,8 @@ struct Level{D,T<:Real,B<:BasisFamily}
     # pre-fold table dropped 24 of 780 unknowns while reporting `symmetry_residual = 0.0` and a 1e-16 residual. That
     # mismatch used to be guarded by a witness field recording which mask the table was built against; a guard is a
     # confession that the invariant can be violated. Computing the table from the arguments that determine it makes the
-    # mismatch unspellable instead, and the construction sites — which now all go through `_level` / `_new_level` below
-    # — stop having to remember anything.
+    # mismatch unspellable instead, and the construction sites — which now all go through `_level` below — stop having
+    # to remember anything.
     function Level{D,T,B}(id, role, mesh, basis, orders, mask) where {D,T<:Real,B<:BasisFamily}
         return new{D,T,B}(id, role, mesh, basis, orders, _cell_modes(basis, orders, mesh, mask), mask)
     end
@@ -722,6 +730,9 @@ function _check_level(V::Space, level::Integer, name::AbstractString="level")
     return Int(level)
 end
 
+# The level at a checked position: the read every `level =` accessor starts with.
+_level_at(V::Space, level::Integer, name::AbstractString="level") = V.levels[_check_level(V, level, name)]
+
 # The guard the `level => spec` verbs share: every named level exists, and none is named twice. Naming a level twice is
 # always a mistake rather than a last-one-wins composition — the two specs would be applied in argument order and the
 # first silently discarded — and `verb` names the call in the message.
@@ -761,14 +772,15 @@ Keeping the two-phase "spec → concrete family" handshake in one named hook (ra
 overload) makes the extension point explicit and means every level-building path treats mesh-dependent families
 uniformly.
 
-Every level-building path routes the basis through this hook — there are exactly two, `_new_level` for a level built
-from a user specification ([`space`](@ref), [`overlay`](@ref), [`elevate`](@ref)) and `_level` for a copy of an existing
-one ([`moved_space`](@ref), [`adapt`](@ref), the mask mutators, the fictitious fold, level-id reindexing) — so a
-mesh-dependent family is rebuilt whenever the mesh changes (e.g. an overlay move) and is validated against the level's
-`order` at construction time. The basis mode is not an argument either: it is already folded into `basis` (see
-[`BasisFamily`](@ref)), and a family that serves `:tensor` alone has refused any other mode before this hook runs. The
-level's activation mask is not an argument: a mask face selects or constrains functions in the dof layer rather than
-changing the family, which is how the shipped B-spline family handles every mask geometry.
+Every level is built and rebuilt by one function, `_level`, and it routes the basis through this hook every time: a
+level built from a user specification ([`space`](@ref), [`overlay`](@ref)) and a copy of an existing one with its mesh,
+order field, mask or id replaced ([`moved_space`](@ref), [`elevate`](@ref), [`adapt`](@ref), the mask mutators, the
+adaptive rebuild, the fictitious fold, level-id reindexing) alike. So a mesh-dependent family is rebuilt whenever the
+mesh changes (e.g. an overlay move) and is validated against the level's `order` at construction time. The basis mode
+is not an argument: it is already folded into `basis` (see [`BasisFamily`](@ref)), and a family that serves `:tensor`
+alone has refused any other mode before this hook runs. Nor is the level's activation mask: a mask face selects or
+constrains functions in the dof layer rather than changing the family, which is how the shipped B-spline family handles
+every mask geometry.
 
 A concrete family handed to this hook is a request like any other, and a family that validates its request must do so
 on every call, not only on the first. The B-spline family re-judges its requested continuity against the new mesh and
@@ -866,8 +878,8 @@ per-level count.
 function space(domain::AxisBox{D,T}; cells, order=1, basis=IntegratedLegendre(), mode::Symbol=:tensor, active=nothing,
                physical=nothing) where {D,T}
     base_mesh = CartesianMesh(domain; cells)
-    base_level = _new_level(1, :base, base_mesh, _with_mode(basis, mode), _normalize_order(order, base_mesh),
-                            _normalize_mask(active, base_mesh))
+    base_level = _level(1, :base, base_mesh, _with_mode(basis, mode), _normalize_order(order, base_mesh),
+                        _normalize_mask(active, base_mesh))
     return Space{D,T,Tuple{typeof(base_level)}}(domain, (base_level,), physical)
 end
 
@@ -906,24 +918,42 @@ function overlay(V::Space{D,T}, domain::AxisBox{D,T}; cells, order=nominal_order
                  mode::Symbol=_mode(V.levels[1].basis), tolerance=GeometryTolerance(T), active=nothing) where {D,T}
     is_inside(domain, V.domain, tolerance) || throw(ArgumentError("overlay domain must lie inside the physical domain"))
     overlay_mesh = CartesianMesh(domain; cells)
-    level = _new_level(length(V.levels) + 1, :overlay, overlay_mesh, _with_mode(basis, mode),
-                       _normalize_order(order, overlay_mesh), _normalize_mask(active, overlay_mesh))
+    level = _level(length(V.levels) + 1, :overlay, overlay_mesh, _with_mode(basis, mode),
+                   _normalize_order(order, overlay_mesh), _normalize_mask(active, overlay_mesh))
     return _with_levels(V, (V.levels..., level))
 end
 
-# A brand-new `Level` from a user-facing specification: the normalise → check → instantiate → derive pipeline `space`,
-# `overlay` and `_reordered_space` each used to spell out. `field` is the already-normalised order (a tuple or a
-# per-cell vector) and `mask` the already-normalised activation, because `_reordered_space` reuses the level's stored
-# mask and `_normalize_mask` would copy it for nothing.
+# The one level builder: every construction and every rebuild of a `Level` is a call to it, so the pipeline — the
+# family instantiated against the mesh and the nominal order, the order record built and validated against the concrete
+# family, the minimum-rule table derived by `Level`'s inner constructor — is written once. `basis` carries its mode
+# already (`_with_mode`), `field` is a normalised order spec (a tuple or a per-cell vector) or a `CellOrders` record to
+# reuse, and `mask` is the normalised activation, stored as given.
 #
 # The step order matters and is not free to rearrange: `instantiate_basis` must run before `_build_cell_orders`, because
 # a deferred family (the B-spline spec) is not a family yet and `_supports_cell_order` has to be asked of the concrete
 # one.
-function _new_level(id::Int, role::Symbol, mesh::CartesianMesh{D,T}, basis, field, mask) where {D,T}
+function _level(id::Int, role::Symbol, mesh::CartesianMesh{D,T}, basis::BasisFamily, field, mask) where {D,T}
     family = instantiate_basis(basis, mesh, _nominal_order(field))
     orders = _build_cell_orders(family, field, mesh)
     return Level{D,T,typeof(family)}(id, role, mesh, family, orders, mask)
 end
+
+# A copy of an existing `Level` with some of its parts replaced, by keyword: a move replaces the mesh, `elevate` the
+# order field, `adapt`, the mask mutators and the fictitious fold the mask, the adaptive rebuild the mask and the order
+# field together, coupling the id. The level's role and its family's request carry over.
+#
+# The family is re-instantiated unconditionally. That is behaviour-preserving rather than merely convenient:
+# `instantiate_basis` consumes the mesh and the nominal order, the only things a family's concrete form can depend on —
+# integrated Legendre returns itself, and the B-spline hook rebuilds knot vectors from the mesh axes and the degree and
+# re-judges the requested continuity — so a rebuild that keeps the mesh and the order, such as a mask update,
+# re-instantiates an equal family (for B-splines the same knot vectors, rebuilt), and one that changes either is
+# validated exactly as a fresh build of the same request is.
+function _level(old::Level; id=old.id, mesh=old.mesh, field=old.orders, mask=old.mask)
+    return _level(id, old.role, mesh, old.basis, field, mask)
+end
+
+# `V` with its `k`-th level rebuilt by the copy form above. `k` is a checked position.
+_relevel(V::Space, k::Int; kw...) = _with_level(V, k, _level(V.levels[k]; kw...))
 
 """
     moved_space(V::Space; level, to, tolerance=GeometryTolerance(T)) -> Space
@@ -937,37 +967,10 @@ function moved_space(V::Space{D,T}; level::Integer, to::AxisBox{D,T}, tolerance=
     k = _check_level(V, level)
     k > 1 || throw(ArgumentError("only overlay levels can be moved"))
     is_inside(to, V.domain, tolerance) || throw(ArgumentError("overlay domain must lie inside the physical domain"))
-    old = V.levels[k]
     # The order field is indexed by cell and a move keeps the cell grid identical — only the coordinates change — so it
     # carries over verbatim. `_level` re-instantiates the family against the moved mesh, which is what a mesh-dependent
     # family (B-splines) needs to rebuild its knot vectors.
-    return _with_level(V, k, _level(old; mesh=CartesianMesh(to; cells=old.mesh.cells)))
-end
-
-# Rebuild `V` with the mask of one level replaced. Mirrors `moved_space` but keeps the mesh / basis / order fixed and
-# swaps only the mask. `mask` must already be normalised. Used by [`adapt`](@ref) and by the `activate!` / `deactivate!`
-# model-level mutators in `model.jl`.
-#
-# A mask edit changes which shared-entity modes survive, and nothing has to be rebuilt for that: the order field is the
-# caller's and is unaffected, and `Level`'s constructor re-derives the modes from the new mask.
-function _remasked_space(V::Space, level_index::Integer, mask)
-    k = _check_level(V, level_index)
-    return _with_level(V, k, _level(V.levels[k]; mask=mask))
-end
-
-# A copy of an existing `Level` with one thing changed, by keyword. Every rebuild in this file is one of these: a move
-# changes the mesh, `activate!` the mask, `_apply_physical_fold` the mask, coupling the id.
-#
-# The family is re-instantiated unconditionally. That is behaviour-preserving rather than merely convenient:
-# `instantiate_basis` consumes the mesh and the nominal order, the only things a family's concrete form can depend on —
-# integrated Legendre returns itself, and the B-spline hook rebuilds knot vectors from the mesh axes and the degree — so
-# a rebuild that keeps the mesh and the order, such as a mask update, re-instantiates an equal family (for B-splines the
-# same knot vectors, rebuilt). Before this helper the sites disagreed about it — `moved_space` and the mask rebuilds
-# re-instantiated while the fold and the reindex did not — and the disagreement was invisible because the answers
-# coincide.
-function _level(old::Level{D,T}; id=old.id, mesh=old.mesh, orders=old.orders, mask=old.mask) where {D,T}
-    family = instantiate_basis(old.basis, mesh, orders.nominal)
-    return Level{D,T,typeof(family)}(id, old.role, mesh, family, orders, mask)
+    return _relevel(V, k; mesh=CartesianMesh(to; cells=V.levels[k].mesh.cells))
 end
 
 # ── Reading a level ───────────────────────────────────────────────────────────
@@ -984,7 +987,7 @@ carrying a [`PhysicalDomain`](@ref) already has the fictitious fold applied; pas
 what the caller asked for.
 """
 function active_cells(V::Space{D}; level::Integer) where {D}
-    lvl = V.levels[_check_level(V, level)]
+    lvl = _level_at(V, level)
     lvl.mask === nothing && return trues(lvl.mesh.cells)
     return copy(lvl.mask.on)
 end
@@ -1037,7 +1040,7 @@ Dirichlet data produces it too — but on an overlay, whose faces are artificial
 means.
 """
 function support_extension(V::Space{D}, cells; level::Integer) where {D}
-    lvl = V.levels[_check_level(V, level)]
+    lvl = _level_at(V, level)
     return dilate(V, cells; level=level, by=_support_radius(lvl.basis, nominal_order(lvl)))
 end
 
@@ -1074,7 +1077,7 @@ It never widens the level's box — a region against a face stays against it —
 already-dilated set by `a` then `b` is the same as dilating once by `a + b`.
 """
 function dilate(V::Space{D}, cells; level::Integer, by) where {D}
-    lvl = V.levels[_check_level(V, level)]
+    lvl = _level_at(V, level)
     # `by` is validated first, so a bad width is reported whatever the selection is — including one naming every cell,
     # which an earlier early return let through while the array method rejected it.
     radius = _dilation_radius(by, Val(D))
@@ -1155,15 +1158,13 @@ V = elevate(V, 1 => p)
 ```
 """
 function cell_orders(V::Space{D}; level::Integer) where {D}
-    lvl = V.levels[_check_level(V, level)]
+    lvl = _level_at(V, level)
     return [lvl.orders.palette[c] for c in lvl.orders.class]
 end
 
-nominal_order(V::Space; level::Integer) = nominal_order(V.levels[_check_level(V, level)])
+nominal_order(V::Space; level::Integer) = nominal_order(_level_at(V, level))
 
-function cell_order(V::Space{D}, cell::CartesianIndex{D}; level::Integer) where {D}
-    return cell_order(V.levels[_check_level(V, level)], cell)
-end
+cell_order(V::Space{D}, cell::CartesianIndex{D}; level::Integer) where {D} = cell_order(_level_at(V, level), cell)
 
 """
     cell_indices(V::Space; level) -> CartesianIndices
@@ -1171,16 +1172,14 @@ end
 Cell index space of `level`. Together with [`cell_box`](@ref)'s `Space` method this is what lets a caller build a cell
 selection — evaluate an error indicator per cell, mark, [`adapt`](@ref) — without reaching into `V.levels[k].mesh`.
 """
-cell_indices(V::Space; level::Integer) = cell_indices(V.levels[_check_level(V, level)].mesh)
+cell_indices(V::Space; level::Integer) = cell_indices(_level_at(V, level).mesh)
 
 """
     cell_box(V::Space, index::CartesianIndex; level) -> AxisBox
 
 Axis-aligned box of one cell of `level`, in the physical frame.
 """
-function cell_box(V::Space{D}, index::CartesianIndex{D}; level::Integer) where {D}
-    return cell_box(V.levels[_check_level(V, level)].mesh, index)
-end
+cell_box(V::Space{D}, index::CartesianIndex{D}; level::Integer) where {D} = cell_box(_level_at(V, level).mesh, index)
 
 # ── Writing a level: the `elevate` and `adapt` verbs ──────────────────────────
 
@@ -1212,17 +1211,6 @@ _normalize_elevate_spec(V::Space, k::Int, spec::Pair) = _pair_orders(V, k, (spec
 _normalize_elevate_spec(V::Space, k::Int, spec::_PairList) = _pair_orders(V, k, spec)
 _normalize_elevate_spec(V::Space, k::Int, spec::Base.Generator) = _normalize_elevate_spec(V, k, collect(spec))
 _normalize_elevate_spec(::Space, ::Int, spec) = spec
-
-# Rebuild `V` with the polynomial order of one level replaced. Mirrors `_remasked_space` but keeps the mesh / basis /
-# mask fixed and swaps only the order field, so the level's type — and with it the `Space` type and the compiled
-# assembly pipeline — is unchanged. The level's own mask is passed through without re-normalising, which is why this
-# goes to `_new_level` rather than `_level`: the order field is new and the whole pipeline has to run for it.
-function _reordered_space(V::Space, level_index::Integer, spec)
-    k = _check_level(V, level_index)
-    old = V.levels[k]
-    field = _normalize_order(_normalize_elevate_spec(V, k, spec), old.mesh)
-    return _with_level(V, k, _new_level(old.id, old.role, old.mesh, old.basis, field, old.mask))
-end
 
 """
     elevate(V::Space, level => order, ...) -> Space
@@ -1260,7 +1248,10 @@ function elevate(V::Space, pairs::Pair{<:Integer}...)
     _check_named_once(V, pairs, "elevate")
     out = V
     for (level, spec) in pairs
-        out = _reordered_space(out, level, spec)
+        # The level's mask and mesh are its own and carry over; the order field is new, so `_level` builds and validates
+        # it, against the family rebuilt at the new order.
+        k = _check_level(V, level)
+        out = _relevel(out, k; field=_normalize_order(_normalize_elevate_spec(out, k, spec), out.levels[k].mesh))
     end
     return out
 end
@@ -1295,8 +1286,10 @@ function adapt(V::Space, pairs::Pair{<:Integer}...)
     _check_named_once(V, pairs, "adapt")
     out = V
     for (level, cells) in pairs
+        # A mask edit changes which shared-entity modes survive, and nothing has to be rebuilt for that: the order field
+        # is the caller's and is unaffected, and `Level`'s constructor re-derives the modes from the new mask.
         k = _check_level(V, level)
-        out = _remasked_space(out, k, _normalize_mask(cells, V.levels[k].mesh))
+        out = _relevel(out, k; mask=_normalize_mask(cells, V.levels[k].mesh))
     end
     return out
 end

@@ -62,9 +62,10 @@ end
 #     the same object `_build_cell_dofs!` walked to produce `cell_dofs`, taken off the level rather than re-derived,
 #     because the positional pairing between a cell's raw dofs and its basis values is the only link between the dof
 #     layer and the basis layer, and nothing checks it.
-#   - `values[i]` and `gradients[i]` are sized at the level's nominal (maximum) order, so a cell at a lower per-cell
-#     order fills a prefix. See `_tensor_values!` in `basis.jl` for why that is transparent and why the buffers
-#     are not keyed by order value.
+#   - `values[i]` and `gradients[i]` are sized at the level's largest minimum-rule set, so a cell whose set is
+#     shorter fills a prefix. See `_tensor_values!` in `basis.jl` for why that is transparent and why the buffers are
+#     not keyed by order value. The 1D factor buffers `val1d[i]` / `der1d[i]` are sized at the level's nominal
+#     (maximum) order, which bounds every cell's.
 struct BasisBank{D,T,B<:BasisFamily}
     bases::Vector{B}
     modes::Vector{CellModes{D}}
@@ -99,11 +100,14 @@ function BasisBank(spaces, ::Val{D}, ::Type{T}) where {D,T}
 end
 
 # Function barrier: fill the id-indexed bank from one space's concretely typed level `Tuple`, so every per-level field
-# read and the `local_basis_indices` / `_factor_buffers` calls dispatch statically.
+# read and the `_factor_buffers` calls dispatch statically. The value buffers are sized from the level's own
+# minimum-rule table, the sets the kernel is handed, rather than by building the index set at the nominal order: every
+# cell's set is no longer than the longest one, which is all the kernel's `>=` guard asks, and the table is already on
+# the level.
 function _fill_bank!(bank::BasisBank{D,T}, levels::Tuple) where {D,T}
     for level in levels
         i, p = level.id, nominal_order(level)
-        nbasis = length(local_basis_indices(level.basis, p))
+        nbasis = maximum(length, level.modes.sets)
         bank.bases[i] = level.basis
         bank.modes[i] = _cell_locals(level)
         bank.orders[i] = p
@@ -1172,10 +1176,10 @@ end
 # is derived: the symbolic pattern, the threaded arena layout and the numeric pass all go through it, so they cannot
 # disagree.
 #
-# The guard compares a cell's raw dof list with the bank, which is sized once from the level's nominal order — the `>=`
-# relaxation `_tensor_values!` relies on. `_build_cell_dofs!` and the bank both read `level.modes`, so the list
-# and the cell's own index set cannot disagree in length; what can fail is a cell needing more basis values than its
-# level's bank holds. One integer compare per (region, parent, field), outside the quadrature loop.
+# The guard compares a cell's raw dof list with the bank, which is sized once from the level's longest minimum-rule set
+# — the `>=` relaxation `_tensor_values!` relies on. `_build_cell_dofs!` and the bank both read `level.modes`, so the
+# list and the cell's own index set cannot disagree in length; what can fail is a cell needing more basis values than
+# its level's bank holds. One integer compare per (region, parent, field), outside the quadrature loop.
 function _frame!(ws::AssemblyWorkspace, region)
     empty!(ws.parents)
     empty!(ws.slots)

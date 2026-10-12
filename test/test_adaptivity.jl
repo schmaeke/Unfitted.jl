@@ -592,6 +592,69 @@ end
     @test refine(V; h=[(1, cell)]) !== V
 end
 
+@testset "an edit rebuilds each changed level once, as adapt then elevate would" begin
+    # `refine` and `coarsen` collect their writes in one `_StackEdit`, and `_apply` rebuilds each level that moved once,
+    # with its final mask and orders together. Each such level must be the one
+    # `elevate(adapt(V, k => mask), k => pairs)` builds — the same per-cell orders, active cells and minimum-rule sets —
+    # on a graded stack and on a masked ladder, for a mask write alone, an order write alone and both together. A write
+    # equal to what the level already holds is dropped, and a mask that wakes every cell collapses to the no-mask
+    # default as `adapt`'s does.
+    c(i, j) = CartesianIndex(i, j)
+    graded = overlay(overlay(space(_AD_Ω; cells=4, order=(b, ci) -> 1 + (ci[1] + ci[2]) % 3),
+                             box((0.25, 0.25), (0.75, 0.75)); cells=4, order=2), box((0.5, 0.5), (1.0, 1.0)); cells=4,
+                     order=(b, ci) -> 2 + ci[1] % 2, active=[c(i, j) for i in 1:3 for j in 1:3])
+    masked = adapt(ladder(_AD_Ω; cells=4, order=2, depth=2), 2 => [c(i, j) for i in 2:5 for j in 3:6])
+    cases = (graded => [(1, nothing, [c(1, 1) => (4, 4), c(2, 3) => (3, 1), c(4, 4) => (3, 3)]),
+                        (2, m -> (m[c(2, 2)] = false), []), (3, m -> fill!(m, true), [c(1, 1) => (4, 4)])],
+             masked => [(2, m -> (m[c(6, 6)] = true), [c(3, 4) => (3, 3), c(1, 1) => (3, 3)]),
+                        (3, m -> (m[5:10, 7:12] .= true), [])])
+    for (V, edits) in cases
+        e = Unfitted._StackEdit(V)
+        for (k, write!, pairs) in edits
+            write! === nothing || write!(Unfitted._mask!(e, k))
+            foreach(p -> Unfitted._set_order!(e, k, p.first, p.second), pairs)
+        end
+        W = Unfitted._apply(e)
+        masks = [k => e.masks[k] for (k, write!, _) in edits if write! !== nothing]
+        ref = elevate(adapt(V, masks...), [k => pairs for (k, _, pairs) in edits if !isempty(pairs)]...)
+        @test typeof(W) === typeof(V)
+        for k in eachindex(V.levels)
+            @test cell_orders(W; level=k) == cell_orders(ref; level=k)
+            @test active_cells(W; level=k) == active_cells(ref; level=k)
+            @test (W.levels[k].mask === nothing) == (ref.levels[k].mask === nothing)
+            @test all(ci -> Unfitted.cell_basis_indices(W.levels[k], ci) ==
+                            Unfitted.cell_basis_indices(ref.levels[k], ci), cell_indices(V; level=k))
+        end
+        # An edit that writes nothing hands the input back.
+        @test Unfitted._apply(Unfitted._StackEdit(V)) === V
+    end
+end
+
+@testset "the enriched space raises every per-cell-order level as elevate would" begin
+    # `_enriched_space` raises a level by rebuilding it on its own order record with every palette entry raised, rather
+    # than by materialising and re-normalising the raised per-cell field. The level must be the one
+    # `elevate(V, k => cell_orders(V; level = k) .+ inc)` builds: on an anisotropic graded base, a uniform masked
+    # overlay and a graded trunk overlay, at two increments.
+    c(i, j) = CartesianIndex(i, j)
+    V = overlay(overlay(space(_AD_Ω; cells=4, order=(b, ci) -> (1 + ci[1] % 3, 1 + ci[2] % 2)),
+                        box((0.25, 0.25), (0.75, 0.75)); cells=4, order=2, active=[c(i, j) for i in 1:3 for j in 2:4]),
+                box((0.5, 0.0), (1.0, 0.5)); cells=4, order=(b, ci) -> 2 + (ci[1] + ci[2]) % 3, mode=:trunk)
+    for inc in (1, 2)
+        W, charge = Unfitted._enriched_space(V, inc)
+        @test charge == [(k, 1) for k in 1:3]
+        for k in 1:3
+            ref = elevate(V, k => map(p -> p .+ inc, cell_orders(V; level=k))).levels[k]
+            lvl = W.levels[k]
+            @test lvl.orders.palette == ref.orders.palette
+            @test lvl.orders.class == ref.orders.class
+            @test lvl.orders.nominal == ref.orders.nominal
+            @test lvl.modes.sets == ref.modes.sets && lvl.modes.kind == ref.modes.kind
+            @test active_cells(W; level=k) == active_cells(V; level=k)
+            @test Unfitted._mode(lvl.basis) === Unfitted._mode(V.levels[k].basis)
+        end
+    end
+end
+
 @testset "refine and coarsen: what they refuse" begin
     V = ladder(_AD_Ω; cells=4, order=4, depth=1)
     cell = CartesianIndex(2, 2)

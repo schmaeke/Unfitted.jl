@@ -424,25 +424,25 @@ end
 # the twin would carry no raw and no integration region — the partition follows live cells — and add nothing to the
 # indicator but a level to walk.
 #
-# A uniform level is raised as a tuple rather than through a per-cell field, and the reason is cost rather than
-# meaning: `_normalize_order` collapses an all-equal field back to exactly this tuple, so the per-cell path arrives at
-# the same level having materialised three N^D arrays on the way (the field `cell_orders` builds, the raised copy, and
-# the palette scan that collapses it). Measured on a uniform 512² level, 7.9 ms and 13.0 MiB against 1.3 ms and 1.0 MiB
-# for the tuple, for an identical result.
+# A level is raised by rebuilding it on its own order record with every palette entry raised by `inc`, the class map
+# and the mesh unchanged. That is the record `elevate(V, k => p .+ inc)` would build from the raised per-cell field: an
+# increment keeps distinct palette entries distinct and in first-occurrence order, keeps an isotropic entry isotropic
+# and an order ≥ 1 at least 1, so the palette, the class map and every check the build would run come out the same —
+# and no per-cell field is materialised on the way. A uniform level stays a palette of one. (`inc ≥ 1`: `estimate`
+# refuses a smaller enrichment.)
 #
-# Each level is raised by `_reordered_space`, which is `elevate`'s own per-level step. The only other thing `elevate`
-# adds is the check that no level is named twice, and this loop names each level once by construction. Calling it
-# instead meant splatting a generator whose length is known only at run time into a `Vararg` call, which inference
-# resolves by iterating the generator abstractly, with closures of its own specialised on the generator's type and
-# compiled on the spot. Measured on an adapted 8² order-2 ladder, that was 129 ms of inference and 127 ms of the
-# closures' codegen, nearly a fifth of the first `estimate`'s compile time.
+# Each level is rebuilt directly, by `_relevel`, rather than through `elevate`. The only other thing `elevate` adds is
+# the check that no level is named twice, and this loop names each level once by construction. Calling it instead meant
+# splatting a generator whose length is known only at run time into a `Vararg` call, which inference resolves by
+# iterating the generator abstractly, with closures of its own specialised on the generator's type and compiled on the
+# spot. Measured on an adapted 8² order-2 ladder, that was 129 ms of inference and 127 ms of the closures' codegen,
+# nearly a fifth of the first `estimate`'s compile time.
 function _enriched_space(V::Space{D,T}, inc::Int) where {D,T}
     W, charge, live = V, [(k, 1) for k in 1:length(V.levels)], _live_levels(V)
     for k in 1:length(V.levels)
         _supports_cell_order(V.levels[k].basis) || continue
         o = V.levels[k].orders
-        raised = length(o.palette) == 1 ? o.nominal .+ inc : map(p -> p .+ inc, cell_orders(V; level=k))
-        W = _reordered_space(W, k, raised)
+        W = _relevel(W, k; field=CellOrders{D}(map(p -> p .+ inc, o.palette), o.class, o.nominal .+ inc))
     end
     for k in 1:length(V.levels)
         (live[k] && !_supports_cell_order(V.levels[k].basis)) || continue
@@ -1242,11 +1242,11 @@ end
 # release of a cover that was not live, an order step at the cap, a wake of a cover already live — must not hand back a
 # fresh copy, or a saturated loop rebuilds an identical model for ever.
 #
-# The rebuild is the one `adapt` followed by `elevate` produces. A mask-only change goes through `_level`, as `adapt`'s
-# does; an order change goes through `_new_level` with the written cells normalised exactly as `elevate`'s pair form
-# normalises them, carrying the final mask. Only a family with a per-cell order carries order writes, and integrated
-# Legendre instantiates to itself, so building from the input level rather than from an intermediate re-masked copy
-# changes nothing but the count of rebuilds.
+# The rebuild is the one `adapt` followed by `elevate` produces, in one `_relevel` per changed level: the final mask,
+# collapsed as `adapt` collapses it, and — where an order moved — the written cells normalised exactly as `elevate`'s
+# pair form normalises them; an unchanged part is the level's own. Only a family with a per-cell order carries order
+# writes, and integrated Legendre instantiates to itself, so building from the input level rather than from an
+# intermediate re-masked copy changes nothing but the count of rebuilds.
 function _apply(e::_StackEdit)
     V = out = e.space
     for k in eachindex(V.levels)
@@ -1254,11 +1254,8 @@ function _apply(e::_StackEdit)
         m !== nothing && (old.mask === nothing ? all(m) : m == old.mask.on) && (m = nothing)
         changed = [c => o for (c, o) in something(e.orders[k], ()) if o != cell_order(old, c)]
         m === nothing && isempty(changed) && continue
-        mask = m === nothing ? old.mask : _collapse_mask(m)
-        level = isempty(changed) ? _level(old; mask) :
-                _new_level(old.id, old.role, old.mesh, old.basis,
-                           _normalize_order(_pair_orders(V, k, changed), old.mesh), mask)
-        out = _with_level(out, k, level)
+        out = _relevel(out, k; mask=m === nothing ? old.mask : _collapse_mask(m),
+                       field=isempty(changed) ? old.orders : _normalize_order(_pair_orders(V, k, changed), old.mesh))
     end
     return out
 end
