@@ -255,7 +255,7 @@ end
 # subdomain space in `problem_spaces` order — the same order the reindexed global level ids run. One entry per level,
 # `0` for an unmasked level. Reported by `diagnostics` so the user can see how many cells each level dropped.
 function _inactive_cell_counts(spaces)
-    return Int[level.mask === nothing ? 0 : count(!, level.mask.on) for V in spaces for level in V.levels]
+    return Int[level.mask === nothing ? 0 : count(!, level.mask) for V in spaces for level in V.levels]
 end
 
 # Per-level count of raws eliminated by covered-mode pruning (`:coverage` or `:dedup`), one entry per id of each field's
@@ -1123,7 +1123,7 @@ function _discretisation_pin(spaces, layout::SystemLayout)
             h = _pin(h, level.mesh.domain.lower)
             h = _pin(h, level.mesh.domain.upper)
             h = _pin(h, level.mesh.cells)
-            h = level.mask === nothing ? _pin(h, -1) : _pin(h, level.mask.on)
+            h = level.mask === nothing ? _pin(h, -1) : _pin(h, level.mask)
             h = _pin(h, level.orders.palette)
             h = _pin(h, level.orders.class)
             h = _pin(h, level.orders.nominal)
@@ -1583,10 +1583,7 @@ Unlike the mutators this reads the problem's representative space (the first fie
 model, so on a multi-domain model it reports the first subdomain.
 """
 function active_cells(model::Model; level::Integer, effective::Bool=true)
-    V = effective ? model.problem.space : model.prefold_space
-    lvl = _level_at(V, level)
-    lvl.mask === nothing && return trues(lvl.mesh.cells)
-    return copy(lvl.mask.on)
+    return active_cells(effective ? model.problem.space : model.prefold_space; level)
 end
 
 """

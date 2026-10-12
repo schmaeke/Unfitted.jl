@@ -8,28 +8,32 @@ using SparseArrays
 
     @test Unfitted._normalize_mask(nothing, mesh) === nothing
 
+    # A stored mask is the bits themselves: `LevelMask{D}` is an alias of `BitArray{D}`, not a wrapper around one.
     bits = trues(4, 4)
     bits[1, 1] = false
     mask = Unfitted._normalize_mask(bits, mesh)
     @test mask isa Unfitted.LevelMask{2}
-    @test !mask.on[1, 1]
-    @test mask.on[2, 2]
+    @test mask isa BitArray{2}
+    @test !mask[1, 1]
+    @test mask[2, 2]
+    @test mask == bits && mask !== bits     # copied: a later edit of `bits` cannot reach a level
 
-    # Pre-built LevelMask passes through as a copy (caller mutations of the original BitArray must not leak into the
-    # model).
+    # A pre-built mask passes through as a copy (caller mutations of the original BitArray must not leak into the
+    # model), and the alias still constructs one.
     passed = Unfitted._normalize_mask(mask, mesh)
     @test passed isa Unfitted.LevelMask{2}
-    @test passed.on == mask.on
-    @test passed.on !== mask.on
+    @test passed == mask
+    @test passed !== mask
+    @test Unfitted.LevelMask{2}(bits) == bits && Unfitted.LevelMask{2}(bits) !== bits
 
     pred_mask = Unfitted._normalize_mask((b, i) -> b.lower[1] < 0.5, mesh)
     @test pred_mask isa Unfitted.LevelMask{2}
-    @test pred_mask.on[1, 1] && pred_mask.on[1, 2]
-    @test !pred_mask.on[3, 1] && !pred_mask.on[3, 2]
+    @test pred_mask[1, 1] && pred_mask[1, 2]
+    @test !pred_mask[3, 1] && !pred_mask[3, 2]
 
     iter_mask = Unfitted._normalize_mask([CartesianIndex(1, 1), CartesianIndex(2, 2)], mesh)
-    @test iter_mask.on[1, 1] && iter_mask.on[2, 2]
-    @test !iter_mask.on[1, 2] && !iter_mask.on[2, 1]
+    @test iter_mask[1, 1] && iter_mask[2, 2]
+    @test !iter_mask[1, 2] && !iter_mask[2, 1]
 
     @test_throws DimensionMismatch Unfitted._normalize_mask(trues(3, 3), mesh)
     @test_throws DimensionMismatch Unfitted._normalize_mask(Unfitted.LevelMask{2}(trues(3, 3)), mesh)
@@ -204,7 +208,7 @@ end
     V_moved = Unfitted.moved_space(V; level=2, to=box((0.2, 0.2), (0.6, 0.6)))
 
     @test V_moved.levels[2].mask !== nothing
-    @test V_moved.levels[2].mask.on == V.levels[2].mask.on
+    @test V_moved.levels[2].mask == V.levels[2].mask
 end
 
 @testset "active_cells query" begin

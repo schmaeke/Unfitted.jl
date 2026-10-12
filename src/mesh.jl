@@ -20,23 +20,27 @@ struct CartesianMesh{D,T<:Real}
     axes::NTuple{D,Vector{T}}
 end
 
-# Multi-method dispatcher: coerce a user-supplied "cell count" / "polynomial order" specification into a canonical
-# `NTuple{D,Int}`. Accepts a single positive integer (replicated across every axis) or a `D`-tuple of integers (one per
-# axis). The fallback method gives a clear error for any other input shape. `name` is the user-visible parameter name
-# used in error messages (`:cells`, `:order`, …).
-function _axis_int_tuple(n::Integer, ::Val{D}, name::Symbol) where {D}
-    n > 0 || throw(ArgumentError("$name entries must be positive"))
+# Multi-method dispatcher: coerce a user-supplied per-axis integer specification — a cell count, a polynomial order, a
+# dilation width — into a canonical `NTuple{D,Int}`. Accepts a single integer (replicated across every axis) or a
+# `D`-tuple of integers (one per axis). The fallback method gives a clear error for any other input shape. `name` is
+# the user-visible parameter name used in error messages (`:cells`, `:order`, `:by`), and `min` the smallest admissible
+# entry: 1 for counts and orders, 0 for a dilation width, where zero is the sensible request to leave an axis alone.
+function _axis_int_tuple(n::Integer, ::Val{D}, name::Symbol; min::Int=1) where {D}
+    n >= min || throw(ArgumentError("$name entries must be $(_sign_word(min))"))
     return ntuple(_ -> Int(n), D)
 end
 
-function _axis_int_tuple(t::NTuple{D,<:Integer}, ::Val{D}, name::Symbol) where {D}
-    all(>(0), t) || throw(ArgumentError("$name entries must be positive"))
+function _axis_int_tuple(t::NTuple{D,<:Integer}, ::Val{D}, name::Symbol; min::Int=1) where {D}
+    all(>=(min), t) || throw(ArgumentError("$name entries must be $(_sign_word(min))"))
     return Int.(t)
 end
 
-function _axis_int_tuple(_, ::Val{D}, name::Symbol) where {D}
-    throw(ArgumentError("$name must be a positive integer or an NTuple{$D,Int}"))
+function _axis_int_tuple(spec, ::Val{D}, name::Symbol; min::Int=1) where {D}
+    throw(ArgumentError("$name must be a $(_sign_word(min)) integer or an NTuple{$D,Int}"))
 end
+
+# The refusals' word for the bound, so the messages for counts and orders read as they always have.
+_sign_word(min::Int) = min == 1 ? "positive" : min == 0 ? "non-negative" : "at least $min"
 
 # Per-axis coordinate samples for a uniform Cartesian mesh: axis `d` carries `cells[d] + 1` values evenly spaced from
 # `lo = domain.lower[d]` to `hi = domain.upper[d]`,
@@ -189,11 +193,23 @@ end
 # ── Per-cell activation mask ──────────────────────────────────────────────────
 
 """
-    LevelMask{D}(on::BitArray{D})
+    LevelMask{D} = BitArray{D}
 
-Per-cell activation mask for a level. `on[cell]` is `true` when the cell participates in assembly and dof enumeration.
-Carried as an optional field on [`Level`](@ref); a `nothing` mask means "every cell active" and keeps the no-mask hot
-path type-stable and allocation-free.
+Per-cell activation mask for a level: a `BitArray{D}` over the level's cell grid, `true` where the cell participates in
+assembly and dof enumeration. The name is an alias rather than a wrapper, so a mask is read, counted and broadcast as
+the bits it is, and `LevelMask{D}(bits)` still constructs one (a copy of `bits`). Carried as an optional field on
+[`Level`](@ref); a `nothing` mask means "every cell active" and keeps the no-mask hot path type-stable and
+allocation-free.
+
+Two invariants hold for every mask a level stores, because every path that stores one goes through the same few
+functions:
+
+  - **A stored mask excludes at least one cell.** A selection naming every cell is stored as `nothing`
+    (`_collapse_mask`), so `level.mask === nothing` is exactly "every cell active", whichever way the level was built.
+  - **A stored mask is owned by its level.** Every entry point hands the level a fresh array — the `active =` keyword,
+    [`adapt`](@ref) and the mask mutators copy their selection, the fictitious fold and the adaptive rebuild edit a copy
+    — and nothing mutates a level's mask afterwards. A caller that wants to edit one reads a copy
+    ([`active_cells`](@ref)) and hands it back.
 
 The mask interacts with the dof layer like a geometric overlay boundary: faces between active and inactive cells of the
 *same* level are treated as artificial overlay constraints (analogous to faces between the level and its physical-domain
@@ -206,9 +222,7 @@ cell's, up to `∂Ω`, whenever the fold runs. Every cell the finite-cell fold s
 *user* masked out constrains when it holds material, which is the case unless it lies entirely outside `Ω` (always,
 without a [`PhysicalDomain`](@ref)). See `_has_overlay_constraint` in `src/dofs.jl`.
 """
-struct LevelMask{D}
-    on::BitArray{D}
-end
+const LevelMask{D} = BitArray{D}
 
 """
     is_active(mask, cell) -> Bool
@@ -216,20 +230,21 @@ end
 Whether `cell` is active under the level's mask. `nothing` (the default mask) treats every cell as active.
 """
 is_active(::Nothing, ::CartesianIndex) = true
-is_active(mask::LevelMask{D}, cell::CartesianIndex{D}) where {D} = mask.on[cell]
+is_active(mask::LevelMask{D}, cell::CartesianIndex{D}) where {D} = mask[cell]
 
 # Fold an all-active bit field back into the no-mask default it is. `nothing` is not merely a shorthand:
 # `is_active(::Nothing, _)` is a compile-time `true`, `_covered_by_level` takes an O(1) box-containment answer instead
 # of scanning the block under every coarse cell, and `_coverage_cells` returns `trues` instead of dilating the active
-# front. Routing every construction through this one function is what makes the invariant "a `LevelMask` always excludes
+# front. Routing every construction through this one function is what makes the invariant "a stored mask always excludes
 # at least one cell" hold for `space`, `overlay`, `adapt` and the mutators alike, rather than for the mutators alone.
-_collapse_mask(on::BitArray{D}) where {D} = all(on) ? nothing : LevelMask{D}(on)
+# `on` is stored as it is, not copied: every caller hands in an array it built for the level (see `LevelMask`).
+_collapse_mask(on::BitArray) = all(on) ? nothing : on
 
 # A cell selection, as a fresh `BitArray` over `mesh`'s cells, from every shape the `active =` keyword documents:
 #
 #   * `nothing` — every cell, the reading `nothing` has in `active =`, `dilate`, `ladder` and the mutators alike;
-#   * a `LevelMask{D}`, or an `AbstractArray{Bool,D}` shaped like the cell grid — copied, so a later mutation of the
-#     argument cannot reach a level;
+#   * an `AbstractArray{Bool,D}` shaped like the cell grid, a `LevelMask{D}` (a `BitArray`) included — copied, so a
+#     later mutation of the argument cannot reach a level;
 #   * a predicate `(cell_box, cell_index) -> Bool` — evaluated once per cell;
 #   * an iterable of `CartesianIndex{D}` — the listed cells, each type- and bounds-checked.
 #
@@ -239,8 +254,6 @@ _collapse_mask(on::BitArray{D}) where {D} = all(on) ? nothing : LevelMask{D}(on)
 # the copies drifted: the mutators' copy accepted neither `nothing` nor a `LevelMask`. The result is always a new array
 # the caller may keep or mutate.
 _selection(::Nothing, mesh::CartesianMesh) = trues(mesh.cells)
-
-_selection(mask::LevelMask, mesh::CartesianMesh) = _selection(mask.on, mesh)
 
 function _selection(bits::AbstractArray{Bool,D}, mesh::CartesianMesh{D}) where {D}
     size(bits) == mesh.cells ||
@@ -986,11 +999,13 @@ On a `Space` this is the mask as written. The `Model` method reports the *effect
 carrying a [`PhysicalDomain`](@ref) already has the fictitious fold applied; pass `effective = false` there to read back
 what the caller asked for.
 """
-function active_cells(V::Space{D}; level::Integer) where {D}
-    lvl = _level_at(V, level)
-    lvl.mask === nothing && return trues(lvl.mesh.cells)
-    return copy(lvl.mask.on)
-end
+active_cells(V::Space; level::Integer) = _active_bits(_level_at(V, level))
+
+# A level's activation as a fresh `BitArray` the caller owns: a copy of its mask, or all `true` for a level without one.
+# The one read of a level's mask as bits — `active_cells` on a space and on a model, and through it the mask mutators
+# and the adaptive rebuild's edits, and the fictitious fold start from it — so the `nothing` default is unpacked in one
+# place.
+_active_bits(level::Level) = level.mask === nothing ? trues(level.mesh.cells) : copy(level.mask)
 
 """
     support_extension(V::Space, cells; level) -> BitArray{D}
@@ -1080,31 +1095,14 @@ function dilate(V::Space{D}, cells; level::Integer, by) where {D}
     lvl = _level_at(V, level)
     # `by` is validated first, so a bad width is reported whatever the selection is — including one naming every cell,
     # which an earlier early return let through while the array method rejected it.
-    radius = _dilation_radius(by, Val(D))
+    radius = _axis_int_tuple(by, Val(D), :by; min=0)
     return _dilate_cells(_selection(cells, lvl.mesh), radius)
 end
 
 function dilate(mask::AbstractArray{Bool,D}, by) where {D}
     on = BitArray(undef, size(mask))
     copyto!(on, mask)
-    return _dilate_cells(on, _dilation_radius(by, Val(D)))
-end
-
-# Coerce a `by =` specification into a per-axis radius. Deliberately parallel to `_axis_int_tuple`, which it cannot
-# reuse: cell counts and polynomial orders must be positive, and a dilation width of zero is the perfectly sensible
-# request to leave one axis alone.
-function _dilation_radius(by::Integer, ::Val{D}) where {D}
-    by >= 0 || throw(ArgumentError("dilate: `by` must be non-negative; got $by"))
-    return ntuple(_ -> Int(by), D)
-end
-
-function _dilation_radius(by::NTuple{D,<:Integer}, ::Val{D}) where {D}
-    all(>=(0), by) || throw(ArgumentError("dilate: every entry of `by` must be non-negative; " * "got $by"))
-    return Int.(by)
-end
-
-function _dilation_radius(by, ::Val{D}) where {D}
-    throw(ArgumentError("dilate: `by` must be a non-negative integer or an NTuple{$D,Int}; " * "got $(typeof(by))"))
+    return _dilate_cells(on, _axis_int_tuple(by, Val(D), :by; min=0))
 end
 
 # Erode a cell mask by `radius[d]` cells along each axis: the cells whose whole neighbourhood, clipped to the grid, is
@@ -1347,14 +1345,14 @@ end
 # `nothing` mask — the no-mask hot path.
 #
 # One pass that clears bits of a copy of the mask, rather than classifying into a separate `BitArray` and merging the
-# two by the broadcast `mask.on .& .!fictitious`. The bit reads and writes ride on the classification loop, which visits
+# two by the broadcast `mask .& .!fictitious`. The bit reads and writes ride on the classification loop, which visits
 # every cell anyway, so the broadcast's word-at-a-time merge would only add a pass; and the loop is the cheaper form to
 # compile. Measured on the earlier two-pass form, where only the merge was a loop or a broadcast, a fresh process's
 # first `prepare` was 0.3–1 % slower with the broadcast, both on spaces that compile the fold without running it (a
 # two-level overlay, a masked clamped B-spline space) and on an immersed FCM plate; the one-pass form compiles one
 # method fewer than that loop.
 function _folded_mask(level::Level{D,T}, physical::PhysicalDomain, cache::_ClassifyCache{D,T}) where {D,T}
-    on = level.mask === nothing ? trues(level.mesh.cells) : copy(level.mask.on)
+    on = _active_bits(level)
     folded = false
     for ci in cell_indices(level.mesh)
         on[ci] || continue
@@ -1362,7 +1360,7 @@ function _folded_mask(level::Level{D,T}, physical::PhysicalDomain, cache::_Class
         on[ci] = false
         folded = true
     end
-    return folded ? LevelMask{D}(on) : nothing
+    return folded ? on : nothing
 end
 
 # ── Level-id reindexing ───────────────────────────────────────────────────────
@@ -1391,7 +1389,7 @@ function Base.show(io::IO, level::Level)
     # printing, so the suffix appears only where the order actually varies.
     length(level.orders.palette) > 1 && print(io, ", cell_orders=", length(level.orders.palette))
     if level.mask !== nothing
-        print(io, ", active=", count(level.mask.on), "/", length(level.mask.on))
+        print(io, ", active=", count(level.mask), "/", length(level.mask))
     end
     print(io, ")")
 end

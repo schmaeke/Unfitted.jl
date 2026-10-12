@@ -478,8 +478,8 @@ function _live_axis_coordinates(level, ::Val{D}, cells) where {D}
     # active cells — not its cell count. It runs on the flattened mask rather than the `D`-dimensional one on purpose:
     # `findall` returns `Int` for a vector and `CartesianIndex{D}` for `D > 1`, and one `D`-generic loop body cannot
     # consume both. `vec` on a `BitArray` is a reshape, so nothing is copied.
-    cartesian = CartesianIndices(mask.on)
-    for i in findall(vec(mask.on))
+    cartesian = CartesianIndices(mask)
+    for i in findall(vec(mask))
         c = cartesian[i]
         c in cells || continue
         for d in 1:D

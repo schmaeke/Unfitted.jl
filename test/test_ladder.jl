@@ -282,7 +282,8 @@ end
     @test overlapping_cells(L, (_, ci) -> ci == CartesianIndex(2, 2); from=1, to=2) == listed
     sel = falses(4, 4)
     sel[2, 2] = true
-    @test overlapping_cells(L, Unfitted.LevelMask{2}(sel); from=1, to=2) == listed
+    @test overlapping_cells(L, sel; from=1, to=2) == listed
+    @test overlapping_cells(L, Unfitted.LevelMask{2}(sel); from=1, to=2) == listed   # the alias: the same bits
     @test all(overlapping_cells(L, nothing; from=1, to=2))  # `nothing` is every cell
 
     # The array form overwrites an overlay mask rather than merging with it.

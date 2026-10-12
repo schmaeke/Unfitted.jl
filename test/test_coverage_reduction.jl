@@ -361,7 +361,7 @@ end
     fresh(level, c, k) = Unfitted._covered_by_level(cell_box(level.mesh, c), k, tol, reference)
     middle, inner = V.levels[2], V.levels[3]
     # Non-vacuity: the middle cover is masked (by the fold and by the user), the inner one is not.
-    @test middle.mask !== nothing && count(!, middle.mask.on) > 4
+    @test middle.mask !== nothing && count(!, middle.mask) > 4
     @test inner.mask === nothing
     stored = UInt8[]
     for level in V.levels

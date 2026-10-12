@@ -280,7 +280,7 @@ end
     # Integrated Legendre's modes are cell-local or shared across the face they sit on, so its radius is zero and the
     # dilation is the identity.
     V = space(Ω; cells=16, order=3)
-    @test support_extension(V, marked; level=1) == Unfitted._normalize_mask(marked, V.levels[1].mesh).on
+    @test support_extension(V, marked; level=1) == Unfitted._normalize_mask(marked, V.levels[1].mesh)
     # A degree-p B-spline reaches p cells, so a 2×2 block becomes (2 + 2p)².
     for p in 1:3
         W = space(Ω; cells=16, order=p, basis=bspline())

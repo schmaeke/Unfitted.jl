@@ -465,7 +465,7 @@ end
 # mode is passed as the level's own, because `overlay` applies its `mode` keyword to the family it is given and
 # defaults it to the base level's mode, which an overlay's twin need not share.
 function _refinement_twin(W::Space{D,T}, level::Level{D,T}, factor::Int) where {D,T}
-    mask = level.mask === nothing ? nothing : repeat(level.mask.on; inner=ntuple(_ -> factor, D))
+    mask = level.mask === nothing ? nothing : repeat(level.mask; inner=ntuple(_ -> factor, D))
     return overlay(W, level.mesh.domain; cells=level.mesh.cells .* factor, order=nominal_order(level),
                    basis=level.basis, mode=_mode(level.basis), active=mask)
 end
@@ -524,9 +524,7 @@ end
 # materialise every cell of an unmasked level.
 const _LiveCells{D} = Union{CartesianIndices{D,NTuple{D,Base.OneTo{Int}}},Vector{CartesianIndex{D}}}
 
-function _live_cells(level::Level)
-    level.mask === nothing ? cell_indices(level.mesh) : CartesianIndices(level.mask.on)[level.mask.on]
-end
+_live_cells(level::Level) = level.mask === nothing ? cell_indices(level.mesh) : CartesianIndices(level.mask)[level.mask]
 
 # ── Dörfler marking ───────────────────────────────────────────────────────────
 
@@ -848,7 +846,7 @@ _h_rate(fine::AxisBox, coarse::AxisBox, q::Int, ::Val{D}) where {D} = (volume(fi
 # is the common case. Measured on a depth-3 3D ladder with empty overlays, the leaf test on a base cell falls from 6.19
 # µs to 0.05 µs; its worst case — a live 64³ level that does not reach the marked cell, so the whole block is read and
 # none of it is live — is 4.5 µs.
-_live_levels(V::Space) = [level.mask === nothing || any(level.mask.on) for level in V.levels]
+_live_levels(V::Space) = [level.mask === nothing || any(level.mask) for level in V.levels]
 
 function _is_leaf(V::Space{D}, k::Integer, cell::CartesianIndex{D}, live=_live_levels(V)) where {D}
     for j in (k+1):length(V.levels)
@@ -1035,7 +1033,7 @@ function refine(V::Space{D,T}; h=(), p=(), pmax::Integer=8) where {D,T}
         old = V.levels[k].mask
         (m === nothing || old === nothing) && continue
         radius = _support_radius(V.levels[k].basis, nominal_order(V.levels[k]))
-        all(iszero, radius) || (m .|= _dilate_cells(m .& .!old.on, radius))
+        all(iszero, radius) || (m .|= _dilate_cells(m .& .!old, radius))
     end
     return _apply(edit)
 end
@@ -1251,7 +1249,7 @@ function _apply(e::_StackEdit)
     V = out = e.space
     for k in eachindex(V.levels)
         old, m = V.levels[k], e.masks[k]
-        m !== nothing && (old.mask === nothing ? all(m) : m == old.mask.on) && (m = nothing)
+        m !== nothing && (old.mask === nothing ? all(m) : m == old.mask) && (m = nothing)
         changed = [c => o for (c, o) in something(e.orders[k], ()) if o != cell_order(old, c)]
         m === nothing && isempty(changed) && continue
         out = _relevel(out, k; mask=m === nothing ? old.mask : _collapse_mask(m),

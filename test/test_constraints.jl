@@ -834,7 +834,7 @@ _overlay_pass_bytes(ledger, level, ctx) = @allocated Unfitted._overlay_constrain
                                      level_raws[level.id])
         @test ctx isa Unfitted._LevelContext{2,Float64,typeof(V),Unfitted._Fold{2,Float64,typeof(V.physical)}}
         # Non-vacuity: the fold deactivated cells, so the pass walks fold faces.
-        @test count(!, level.mask.on) > 0
+        @test count(!, level.mask) > 0
         ledger() = Unfitted.EliminationLedger{Float64}(length(raw_keys))
         # Compile once. The measured call below shares `ctx`, and with it the oracle's verdict table for this level,
         # which this first call allocates: a layout build allocates it once too, and the bound is about what the pass
@@ -860,7 +860,7 @@ end
     omega = box((0.0, 0.0), (1.0, 1.0))
     folded = prepare(mass(space(omega; cells=8, order=2, physical=hole)))
     # Non-vacuity: the fold deactivated the cells inside the hole, so there are fold faces, and none of them constrains.
-    @test count(!, only(folded.problem.space.levels).mask.on) > 0
+    @test count(!, only(folded.problem.space.levels).mask) > 0
     @test !any(==(:overlay), only(folded.dofs.fields).dofs.elimination_source)
 
     # A corner block of material cells, masked out by hand: the internal faces at node index 7 bound it, and they
