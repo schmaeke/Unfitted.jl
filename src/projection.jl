@@ -437,21 +437,35 @@ function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_
         # A target-side key → raw lookup, built once per field and read for every source raw of it. A key carries the
         # GLOBAL level id, and a coupled model numbers each subdomain's levels after the previous subdomain's, so the
         # same level of an unchanged subdomain can carry another id on the two sides. Levels are paired by position in
-        # the field's own space, as `_assert_keys_comparable` compares them: the source id moves by the difference of
-        # the two fields' first ids, which is 0 on a single-domain model.
-        target_raw_by_key = Dict(key => raw for (raw, key) in pairs(target_field.dofs.raw_keys))
+        # the field's own space, as `_assert_keys_comparable` compares them: the table re-bases each target key onto
+        # the source's ids by the difference of the two fields' first ids. That difference is 0 on every single-domain
+        # model, where the table holds the target's keys as stored; either way the loop below looks up each source key
+        # as stored, so the per-raw path builds no key.
         shift = first(target_field.level_ids) - first(source_field.level_ids)
-        for (source_raw, key) in pairs(source_field.dofs.raw_keys)
-            target_raw = get(target_raw_by_key, TensorDofKey(key.level + shift, key.axes), 0)
+        target_raw_by_key = Dict((shift == 0 ? key : TensorDofKey(key.level - shift, key.axes)) => raw
+                                 for (raw, key) in pairs(target_field.dofs.raw_keys))
+        for source_raw in eachindex(source_field.dofs.raw_keys)
+            source_key = source_field.dofs.raw_keys[source_raw]
+            target_raw = get(target_raw_by_key, source_key, 0)
             for c in 1:source_field.components
-                slot = target_raw == 0 ? 0 : target_field.dofs.active_component[target_raw, c]
-                if slot != 0
-                    coefficients[target_field.offset+slot] = dof_value(source_field, source_coefficients, source_raw, c)
-                elseif backend.strict && source_field.dofs.active_component[source_raw, c] != 0
-                    why = target_raw == 0 ? "has no target counterpart; pass `Rewire(strict=false)` to skip" :
-                          "is constrained in the target"
-                    throw(ArgumentError("Rewire: source active dof at key $key component $c $why"))
+                source_free = source_field.dofs.active_component[source_raw, c] != 0
+                if target_raw == 0
+                    backend.strict &&
+                        source_free &&
+                        throw(ArgumentError("Rewire: source active dof at key $(source_key) component $c has no " *
+                                            "target counterpart; pass `Rewire(strict=false)` to skip"))
+                    continue
                 end
+                target_active = target_field.dofs.active_component[target_raw, c]
+                if target_active == 0
+                    backend.strict &&
+                        source_free &&
+                        throw(ArgumentError("Rewire: source active dof at key $(source_key) component $c is " *
+                                            "constrained in the target"))
+                    continue
+                end
+                coefficients[target_field.offset+target_active] = dof_value(source_field, source_coefficients,
+                                                                            source_raw, c)
             end
         end
     end
