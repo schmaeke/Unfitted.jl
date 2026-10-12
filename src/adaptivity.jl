@@ -437,7 +437,7 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     # both: the field by the attribution sweep's single-field lookup, whose message did not name the verb, and the pin
     # by the injection, after the enriched load had been evaluated 512 and 256 times on a 4² order-2 Poisson problem.
     _assert_single_domain(model, "estimate")
-    enrichment >= 1 || throw(ArgumentError("enrichment must be at least 1; got $enrichment"))
+    enrichment >= 1 || throw(ArgumentError("estimate: enrichment must be at least 1; got $enrichment"))
     V = model.prefold_space
     model.matrix === nothing && throw(ArgumentError("estimate: the model has not been assembled; call `solve!` or " *
                                                     "`assemble!` before estimating"))

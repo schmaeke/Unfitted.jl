@@ -61,6 +61,8 @@ end
                                                  Unfitted.SolverDiagnostics(:manual, 0.0, true)))
     u = solve!(model)
     @test_throws ArgumentError estimate(model, u; enrichment=0)
+    # Every refusal names the verb, as the docstring promises; this one did not.
+    @test_throws "estimate: enrichment must be at least 1" estimate(model, u; enrichment=0)
 end
 
 @testset "estimate refuses a second field and a stale solution before building V⁺" begin
