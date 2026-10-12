@@ -151,7 +151,7 @@ end
 
 # ── Reading the stack under one cell ──────────────────────────────────────────
 #
-# Both questions below are asked once per marked cell and are answered from the per-axis block `_cell_block`
+# Every question below is asked once per marked cell and is answered from the per-axis block `_cell_block`
 # (`src/ladder.jl`) resolves by binary search, never from `overlapping_cells`, which builds a mask over the whole target
 # level. On a depth-3 3D ladder that is 0.29 µs against 7.65 ms per mark, and a cycle marks hundreds of them.
 #
@@ -187,6 +187,16 @@ function _is_leaf(V::Space{D}, k::Integer, cell::CartesianIndex{D}, live=_live_l
     return true
 end
 
+# The block of level k+1 under cell `c` of level k: what an h-step on (k, c) wakes, and what a release of it puts back
+# to sleep. It is empty on the finest level and wherever level k+1's box does not reach the cell, and every reader takes
+# an empty block to mean the same thing — there is no h-step here: `_has_h_step` offers none, `refine` turns the mark
+# into the order step, and `coarsen` has nothing to release. The empty block has `_cell_block`'s own type, so the
+# answer stays concrete.
+function _children(V::Space{D}, k::Integer, c::CartesianIndex{D}) where {D}
+    k < length(V.levels) || return CartesianIndices(ntuple(_ -> 1:0, D))
+    return _cell_block(V, k, k + 1, c)
+end
+
 # Whether an h-step on this cell would buy anything: level k+1 must exist, its box must reach the cell, and the block
 # must hold a cell that is both dormant and a leaf.
 #
@@ -199,13 +209,10 @@ end
 # over a base cell and level 2 empty, activating level 2 under it moved the active unknowns by exactly zero, 97 before
 # and 97 after.
 function _has_h_step(V::Space{D}, k::Integer, cell::CartesianIndex{D}, live=_live_levels(V)) where {D}
-    k < length(V.levels) || return false
+    children = _children(V, k, cell)
+    isempty(children) && return false
     mask = V.levels[k + 1].mask
-    for c in _cell_block(V, k, k + 1, cell)
-        is_active(mask, c) && continue
-        _is_leaf(V, k + 1, c, live) && return true
-    end
-    return false
+    return any(c -> !is_active(mask, c) && _is_leaf(V, k + 1, c, live), children)
 end
 
 # The cells of one level that carry an approximation. `cell_dofs` answers with an empty vector on a dormant cell, so
@@ -514,22 +521,15 @@ would make every unqualified use of the name ambiguous for anyone writing `using
 """
 function mark_cells(estimate::ErrorEstimate{D,T}; theta::Real=0.5) where {D,T}
     0 < theta <= 1 || throw(ArgumentError("theta must lie in (0, 1]; got $theta"))
-    marked = Tuple{Int,CartesianIndex{D}}[]
-    for (k, indicators) in pairs(estimate.cells), cell in CartesianIndices(indicators)
-        indicators[cell] > 0 && push!(marked, (k, cell))
-    end
+    # Every cell carrying an indicator, scanned level by level, then sorted by decreasing η. The sort is stable, so
+    # cells of equal η keep the scan order and the marking is a function of the estimate alone. The cut is the first
+    # prefix whose squared indicators reach `theta` of the total, accumulated in that order; a sum that round-off leaves
+    # short of the goal marks every cell.
+    η((k, cell)) = estimate.cells[k][cell]
+    marked = sort!(Tuple{Int,CartesianIndex{D}}[(k, cell) for (k, a) in pairs(estimate.cells)
+                                                for cell in CartesianIndices(a) if a[cell] > 0]; by=kc -> -η(kc))
     isempty(marked) && return marked
-    sort!(marked; by=kc -> -estimate.cells[kc[1]][kc[2]])
-    goal = theta * estimate.total^2
-    accumulated = zero(T)
-    taken = length(marked)
-    for (i, (k, cell)) in pairs(marked)
-        accumulated += estimate.cells[k][cell]^2
-        if accumulated >= goal
-            taken = i
-            break
-        end
-    end
+    taken = something(findfirst(>=(theta * estimate.total^2), cumsum([η(kc)^2 for kc in marked])), length(marked))
 
     # Extend through the group the cut lands in. Dörfler asks for a MINIMAL set reaching `theta`, and any minimal set
     # satisfies it, so this is a free choice — but resolving it by strict comparison hands the decision to round-off,
@@ -541,11 +541,10 @@ function mark_cells(estimate::ErrorEstimate{D,T}; theta::Real=0.5) where {D,T}
     # orbit structure that cannot produce an odd count.
     #
     # Completing the group marks slightly more than `theta`, which Dörfler permits (it asks for at least `theta`), and
-    # it buys back the symmetry of the problem exactly.
-    last = estimate.cells[marked[taken][1]][marked[taken][2]]
-    while taken < length(marked)
-        next = estimate.cells[marked[taken + 1][1]][marked[taken + 1][2]]
-        isapprox(next, last; rtol=sqrt(eps(T))) || break
+    # it buys back the symmetry of the problem exactly. The group is read against the cut value itself, never against
+    # the previous member, so it cannot creep down a slow ramp of indicators.
+    cut = η(marked[taken])
+    while taken < length(marked) && isapprox(η(marked[taken + 1]), cut; rtol=sqrt(eps(T)))
         taken += 1
     end
     return marked[1:taken]
@@ -774,6 +773,81 @@ function decide(V::Space{D,T}, estimate::ErrorEstimate{D,T}, marked; pmax::Integ
     return h, p
 end
 
+# ── One pending edit of the stack ─────────────────────────────────────────────
+#
+# What one `refine` or `coarsen` call writes, held until the call ends and applied in one pass. Both verbs write a level
+# from two sides — the order steps of its own cells, and the mask bits and inherited orders of the children a coarser
+# mark wakes or releases — so the writes are collected per level and each level that ends up changed is rebuilt ONCE,
+# with its final mask and orders together. Composing `adapt` and `elevate` instead rebuilds a level whose mask and
+# orders both moved twice, and needs dense copies of every touched level's mask and order field just to tell whether
+# anything moved.
+#
+# The two kinds of write are stored as they are shaped. A mask write is dense — a support dilation sets a whole collar —
+# so a level's mask is copied on its first write and edited in place. An order write is sparse — a handful of cells per
+# mark — so orders are a per-level dictionary of the cells written, and no dense order field exists unless an edit
+# survives to `_apply`.
+struct _StackEdit{D,S<:Space{D}}
+    space::S
+    masks::Vector{Union{Nothing,BitArray{D}}}
+    orders::Vector{Union{Nothing,Dict{CartesianIndex{D},NTuple{D,Int}}}}
+end
+
+function _StackEdit(V::Space{D}) where {D}
+    n = length(V.levels)
+    return _StackEdit{D,typeof(V)}(V, Vector{Union{Nothing,BitArray{D}}}(nothing, n),
+                                   Vector{Union{Nothing,Dict{CartesianIndex{D},NTuple{D,Int}}}}(nothing, n))
+end
+
+# Level k's edited mask, copied from the space on first use.
+function _mask!(e::_StackEdit, k::Integer)
+    m = e.masks[k]
+    return m === nothing ? (e.masks[k] = active_cells(e.space; level=k)) : m
+end
+
+# A cell's order as the edit stands: the last write, else the space's own.
+function _order(e::_StackEdit, k::Integer, c::CartesianIndex)
+    written = e.orders[k]
+    return written !== nothing && haskey(written, c) ? written[c] : cell_order(e.space.levels[k], c)
+end
+
+# Record an order write. A family without a per-cell order has none to write — a B-spline level's degree belongs to a
+# whole-axis knot vector, and no step may change it — so the write is dropped here, once, rather than guarded at every
+# site that writes: the p-step, the order step an h-mark turns into, and the order a woken or released child is given.
+function _set_order!(e::_StackEdit{D}, k::Integer, c::CartesianIndex{D}, o::NTuple{D,Int}) where {D}
+    _supports_cell_order(e.space.levels[k].basis) || return e
+    written = e.orders[k]
+    written === nothing && (written = e.orders[k] = Dict{CartesianIndex{D},NTuple{D,Int}}())
+    written[c] = o
+    return e
+end
+
+# The edit as a space. Writes that left a level as it was are dropped first — a mask equal to the level's own, an order
+# equal to the cell's own — and each level that still differs is rebuilt once. When none does the input space comes
+# back ITSELF, `===`, which is the exhaustion signal `refine` documents: a call that only re-wrote what was there — a
+# release of a cover that was not live, an order step at the cap, a wake of a cover already live — must not hand back a
+# fresh copy, or a saturated loop rebuilds an identical model for ever.
+#
+# The rebuild is the one `adapt` followed by `elevate` produces. A mask-only change goes through `_level`, as `adapt`'s
+# does; an order change goes through `_new_level` with the written cells normalised exactly as `elevate`'s pair form
+# normalises them, carrying the final mask. Only a family with a per-cell order carries order writes, and integrated
+# Legendre instantiates to itself, so building from the input level rather than from an intermediate re-masked copy
+# changes nothing but the count of rebuilds.
+function _apply(e::_StackEdit)
+    V = out = e.space
+    for k in eachindex(V.levels)
+        old, m = V.levels[k], e.masks[k]
+        m !== nothing && (old.mask === nothing ? all(m) : m == old.mask.on) && (m = nothing)
+        changed = [c => o for (c, o) in something(e.orders[k], ()) if o != cell_order(old, c)]
+        m === nothing && isempty(changed) && continue
+        mask = m === nothing ? old.mask : _collapse_mask(m)
+        level = isempty(changed) ? _level(old; mask) :
+                _new_level(old.id, old.role, old.mesh, old.basis,
+                           _normalize_order(_pair_orders(V, k, changed), old.mesh), old.mode, mask)
+        out = _with_level(out, k, level)
+    end
+    return out
+end
+
 """
     refine(V::Space, estimate::ErrorEstimate; theta = 0.5, pmax = 8, previous = nothing) -> Space
     refine(V::Space; h = (), p = (), pmax = 8) -> Space
@@ -851,74 +925,54 @@ function refine(V::Space{D,T}, estimate::ErrorEstimate{D,T}; theta::Real=0.5, pm
 end
 
 function refine(V::Space{D,T}; h=(), p=(), pmax::Integer=8) where {D,T}
-    nlevels = length(V.levels)
     pmax >= 1 || throw(ArgumentError("pmax must be at least 1; got $pmax"))
-
-    # One field and one mask per level, built against `V` and merged, because a level can be written from both sides: it
-    # holds the p-step of its own cells and the inherited order of the children some coarser cell just activated.
-    # `elevate` rejects a level named twice, so merging is not optional.
-    masks = Dict{Int,Any}()
-    fields = Dict{Int,Any}()
-    # The cells this step woke, per level, for the support-extension pass below.
-    woken = Dict{Int,Vector{CartesianIndex{D}}}()
-    mask_of(k) = get!(() -> active_cells(V; level=k), masks, k)
-    field_of(k) = get!(() -> cell_orders(V; level=k), fields, k)
+    edit = _StackEdit(V)
     # Raise only the axes below the cap. A `pmax` under a cell's current order is a "no more p here" instruction, not a
     # request to lower an order `refine` was asked to enrich, and the loop's saturation test reads it the same way.
     #
-    # Every order step starts from the cell's order in `V`, never from the field this call is editing, so a cell marked
-    # twice takes one step: a duplicated p-mark, or a p-mark beside an h-mark that the finest level turns into the order
-    # step. Reading the edited field compounded them — a duplicated p-mark took an order-2 cell to 4 — against the
-    # docstring's "raises the marked cell's own order by one".
+    # Every order step starts from the cell's order in `V`, never from the edit, so a cell marked twice takes one step:
+    # a duplicated p-mark, or a p-mark beside an h-mark that the finest level turns into the order step. Reading the
+    # edit compounded them — a duplicated p-mark took an order-2 cell to 4 — against the docstring's "raises the marked
+    # cell's own order by one".
     raised(o) = min.(o .+ 1, max.(o, Int(pmax)))
 
     for (k, cell) in p
         _check_mark(V, k, cell, "refine")
-        # A level with no per-cell order has no p-step to take, and dropping the mark is what `coarsen` does with the
-        # mirror case. `decide` never hands one over, so this is the explicit form's branch; without it the mark would
-        # reach `elevate` and raise, which is a worse answer than "there was nothing to spend here".
-        _supports_cell_order(V.levels[k].basis) || continue
-        field_of(k)[cell] = raised(cell_order(V.levels[k], cell))
+        # A level with no per-cell order has no p-step to take, and `_set_order!` drops the mark, which is what
+        # `coarsen` does with the mirror case. `decide` never hands one over, so this is the explicit form's branch;
+        # without the drop the mark would reach the level rebuild and raise there, a worse answer than "there was
+        # nothing to spend here".
+        _set_order!(edit, k, cell, raised(cell_order(V.levels[k], cell)))
     end
 
     for (k, cell) in h
         _check_mark(V, k, cell, "refine")
         # Level k+1 is the target, and where it has no cell under this one — the finest level, or a level whose box does
-        # not reach the cell — there is nothing to activate and the order step is what is left to spend. This is where
-        # the substitution happens; `_has_h_step` is where the loop form DECIDES that h is unavailable, and it sends
-        # such a cell to `p` so this branch is unreachable from `refine(V, estimate)`. The two are not a duplicated
-        # rule: a decision that h is unavailable and an application that converts an impossible h are different jobs,
-        # and the explicit form — which takes the caller's own sets — needs the second on its own.
-        block = k < nlevels ? _cell_block(V, k, k + 1, cell) : nothing
-        if block === nothing || isempty(block)
-            # Nothing to activate. Where the family carries a per-cell order the order step is what is left to spend;
-            # where it does not there is no second step, and the cell is dropped rather than turned into a whole-level
-            # order change nobody asked for. `decide` already withholds such a cell, so this is the explicit form's
-            # branch.
-            _supports_cell_order(V.levels[k].basis) || continue
-            field_of(k)[cell] = raised(cell_order(V.levels[k], cell))
+        # not reach the cell — there is nothing to activate and the order step is what is left to spend; where the
+        # family carries no per-cell order there is no second step either, and `_set_order!` drops the cell rather than
+        # turning it into a whole-level order change nobody asked for. This is where the substitution happens;
+        # `_has_h_step` is where the loop form DECIDES that h is unavailable, and it sends such a cell to `p` so this
+        # branch is unreachable from `refine(V, estimate)`. The two are not a duplicated rule: a decision that h is
+        # unavailable and an application that converts an impossible h are different jobs, and the explicit form —
+        # which takes the caller's own sets — needs the second on its own.
+        children = _children(V, k, cell)
+        if isempty(children)
+            _set_order!(edit, k, cell, raised(cell_order(V.levels[k], cell)))
             continue
         end
         # The children take the parent's order as it stands, uncapped: `coarsen` restores exactly this value on release,
         # and capping here would break that inverse on any stack whose order already exceeds `pmax`. It is read from `V`
-        # rather than from `field_of(k)`, which the p-step above may already have raised — an h-step hands down the
-        # order the parent had when the cycle started, never one bought in the same cycle.
+        # rather than from the edit, which the p-step above may already have raised — an h-step hands down the order the
+        # parent had when the cycle started, never one bought in the same cycle.
         target = cell_order(V.levels[k], cell)
-        mask = mask_of(k + 1)
-        # A level whose degree belongs to a whole-axis knot vector has no per-cell order to write, and its order is not
-        # something an h-step may change.
-        carries_order = _supports_cell_order(V.levels[k + 1].basis)
-        field = carries_order ? field_of(k + 1) : nothing
-        for child in block
+        mask = _mask!(edit, k + 1)
+        for child in children
             # A child that is not live carries whatever order it held in a previous life, and `coarsen` clears that on
             # release — but only for the covers it releases. Writing the parent's order over it is what keeps a stale
             # entry from being resurrected: measured, one h-step onto a released order-6 cover returned 169 unknowns
             # where a cold h-step gives 57. A child that IS live is left exactly as it is — its order was earned on its
             # own evidence, and silently raising it would make this an order step wearing an h-step's name.
-            if !mask[child]
-                carries_order && (field[child] = target)
-                push!(get!(() -> CartesianIndex{D}[], woken, k + 1), child)
-            end
+            mask[child] || _set_order!(edit, k + 1, child, target)
             mask[child] = true
         end
     end
@@ -930,30 +984,17 @@ function refine(V::Space{D,T}; h=(), p=(), pmax::Integer=8) where {D,T}
     # condition of admissible hierarchical meshes, and it is applied to the cells this step woke rather than to the
     # whole mask, so a region that was already live is left exactly as it was. `_support_radius` is zero for integrated
     # Legendre, so this loop is a no-op on the default family.
-    for (k, cs) in woken
+    #
+    # The woken set is the bits the edited mask gained over `V`'s own, and that is exact rather than an approximation:
+    # the h-step above only ever sets a bit and the p-step never touches a mask, so nothing else can differ. A level
+    # without a mask in `V` is live everywhere and had nothing to wake.
+    for (k, m) in pairs(edit.masks)
+        old = V.levels[k].mask
+        (m === nothing || old === nothing) && continue
         radius = _support_radius(V.levels[k].basis, nominal_order(V.levels[k]))
-        all(iszero, radius) && continue
-        seed = falses(V.levels[k].mesh.cells)
-        for c in cs
-            seed[c] = true
-        end
-        mask = mask_of(k)
-        extended = _dilate_cells(seed, radius)
-        for c in CartesianIndices(extended)
-            extended[c] && (mask[c] = true)
-        end
+        all(iszero, radius) || (m .|= _dilate_cells(m .& .!old.on, radius))
     end
-
-    # Identity is the exhaustion signal, so a step that wrote nothing must return the space it was given rather than a
-    # fresh copy of it. Each touched level is compared against the one it was built from; the arrays are the ones the
-    # merge already allocated, so this costs one more read of each.
-    filter!(kv -> kv.second != active_cells(V; level=kv.first), masks)
-    filter!(kv -> kv.second != cell_orders(V; level=kv.first), fields)
-    isempty(masks) && isempty(fields) && return V
-
-    refined = isempty(masks) ? V : adapt(V, (k => masks[k] for k in sort!(collect(keys(masks))))...)
-    isempty(fields) && return refined
-    return elevate(refined, (k => fields[k] for k in sort!(collect(keys(fields))))...)
+    return _apply(edit)
 end
 
 """
@@ -1011,16 +1052,14 @@ monotone loop carries 2.6× the from-scratch optimum after six layer-widths of t
 package does not pretend to know the rule.
 """
 function coarsen(V::Space{D,T}; h=(), p=(), pmin::Integer=1) where {D,T}
-    nlevels = length(V.levels)
     pmin >= 1 || throw(ArgumentError("pmin must be at least 1; got $pmin"))
-
-    masks = Dict{Int,Any}()
-    fields = Dict{Int,Any}()
-    mask_of(k) = get!(() -> active_cells(V; level=k), masks, k)
-    field_of(k) = get!(() -> cell_orders(V; level=k), fields, k)
+    edit = _StackEdit(V)
     live = _live_levels(V)
-    # The parents released per level, for the support-extension mirror below.
-    released = Dict{Int,Vector{CartesianIndex{D}}}()
+    radius(k) = _support_radius(V.levels[k].basis, nominal_order(V.levels[k]))
+    # The children released per level, for the support-collar mirror below; held only on a level whose family has a
+    # collar to release.
+    blocks = Union{Nothing,BitArray{D}}[all(iszero, radius(k)) ? nothing : falses(V.levels[k].mesh.cells)
+                                        for k in eachindex(V.levels)]
     # Lower only the axes above the floor, the mirror of `refine`'s `raised`, and from the cell's order in `V` for the
     # same reason: a duplicated p-mark lowers once.
     lowered(o) = max.(o .- 1, min.(o, Int(pmin)))
@@ -1031,36 +1070,40 @@ function coarsen(V::Space{D,T}; h=(), p=(), pmin::Integer=1) where {D,T}
         # order to lower, so there is nothing for this mark to release and it is dropped rather than turned into a
         # whole-level order change. `refine` never hands such a level a p-step, so a loop's release set cannot contain
         # one either; this is the explicit form's branch, and dropping keeps `coarsen` the inverse of `refine` on it.
+        # The drop comes before the leaf test, so such a mark is dropped even on a covered cell.
         _supports_cell_order(V.levels[k].basis) || continue
         _is_leaf(V, k, cell, live) ||
             throw(ArgumentError("coarsen: cell $cell of level $k is covered by a finer level, " *
                                 "and lowering a covered cell's order is not observable until the " *
                                 "cover lifts. Release the cover first."))
-        field_of(k)[cell] = lowered(cell_order(V.levels[k], cell))
+        _set_order!(edit, k, cell, lowered(cell_order(V.levels[k], cell)))
     end
 
     for (k, cell) in h
         _check_mark(V, k, cell, "coarsen")
-        k < nlevels || throw(ArgumentError("coarsen: level $k is the finest, so it covers nothing to release"))
-        block = _cell_block(V, k, k + 1, cell)
-        mask = mask_of(k + 1)
-        carries_order = _supports_cell_order(V.levels[k + 1].basis)
-        field = carries_order ? field_of(k + 1) : nothing
+        k < length(V.levels) || throw(ArgumentError("coarsen: level $k is the finest, so it covers nothing to release"))
         # The released children take the PARENT's order, which is exactly what `refine`'s h-step gives them. An inactive
         # cell's order is unobservable, so this is not required for correctness — but it makes the two verbs inverses of
         # the whole order field rather than only of its observable part, which is what lets a transient loop refine and
-        # release the same region thousands of times without drift. Note `nominal_order` is NOT the value to use: it is
-        # a maximum kept for buffer sizing, and on a level that has been elevated it has already moved.
-        parent_order = carries_order ? field_of(k)[cell] : nothing
-        for child in block
-            mask[child] || continue
+        # release the same region thousands of times without drift. It is the parent's order as this call leaves it,
+        # after a p-mark on the same parent. Note `nominal_order` is NOT the value to use: it is a maximum kept for
+        # buffer sizing, and on a level that has been elevated it has already moved.
+        parent = _order(edit, k, cell)
+        mask, block = _mask!(edit, k + 1), blocks[k + 1]
+        for child in _children(V, k, cell)
             # A child that is itself covered — by any deeper level, not only the next one — is not this level's to
-            # release.
+            # release, and it stays out of the released block for the same reason: the deeper level is built on it.
+            # Recorded in the block, the collar pass below would release it anyway, with its whole dilated footprint —
+            # measured on an order-3 B-spline ladder of depth 2, releasing the level-1 parent of a child that level 3
+            # refines left level 2 with no live cell under 64 live level-3 cells. Left out, it stays in the eroded core
+            # below, so the collar keeps its dilated footprint and the held child keeps the support its own functions
+            # need: the docstring's "no-op rather than a hole".
             _is_leaf(V, k + 1, child, live) || continue
+            block === nothing || (block[child] = true)
+            mask[child] || continue
             mask[child] = false
-            carries_order && (field[child] = parent_order)
+            _set_order!(edit, k + 1, child, parent)
         end
-        push!(get!(() -> CartesianIndex{D}[], released, k + 1), cell)
     end
 
     # The mirror of `refine`'s support extension, and what keeps this verb the exact inverse it claims to be. `refine`
@@ -1074,57 +1117,32 @@ function coarsen(V::Space{D,T}; h=(), p=(), pmin::Integer=1) where {D,T}
     # footprint stays live if it also lies in the dilated footprint of a parent whose own block is still live. That is
     # exactly the set `refine` would have produced from the remaining marks, so refine-then-coarsen returns the mask it
     # started from, and a cell some other caller activated outside every footprint is never touched.
-    for (k, parents) in released
-        radius = _support_radius(V.levels[k].basis, nominal_order(V.levels[k]))
-        all(iszero, radius) && continue
-        mask = mask_of(k)
-        before = active_cells(V; level=k)                 # the mask as this call found it
-        blocks = falses(V.levels[k].mesh.cells)
-        for parent in parents
-            block = _cell_block(V, k - 1, k, parent)
-            (block === nothing || isempty(block)) && continue
-            for child in block
-                # A child a deeper level holds is not released by the loop above, and it stays out of `blocks` for the
-                # same reason: the deeper level is built on it. Left in, the collar pass below would release it anyway,
-                # with its whole dilated footprint, past the leaf test the loop applied — measured on an order-3
-                # B-spline ladder of depth 2, releasing the level-1 parent of a child that level 3 refines left level 2
-                # with no live cell under 64 live level-3 cells. Left out, it stays in `core`, so `keep` retains its
-                # dilated footprint and the held child keeps the support its own functions need: the docstring's "no-op
-                # rather than a hole".
-                _is_leaf(V, k, child, live) && (blocks[child] = true)
-            end
-        end
-        # Recover the set `refine` dilated, so the collar can be released without taking one another refined region
-        # still needs. It cannot be read off the live cells exactly, and that is worth stating rather than papering
-        # over: the dilation fills in neighbouring parents' blocks, so "this parent's block is live" stops meaning "this
-        # parent was refined", and clipping at a box face defeats in opposite directions the two instruments that might
-        # recover it — a morphological erosion recovers more than the block there, while requiring a parent's whole
-        # dilated footprint to be live rejects a genuinely refined edge parent. Measured, the two agree cell for cell on
-        # an 8² ladder, so the simpler one is used.
-        #
-        # Erosion is therefore the conservative reading: away from a box face
-        # `dilate(erode(dilate(X, r), r), r) == dilate(X, r)` recovers the blocks exactly and the release is exact; near
-        # one it recovers more, so a collar stays live. Conservative is the safe direction — it can only leave
-        # refinement standing, never take away refinement another mark needs — and it is what fixes the defect that
-        # matters, an active set that grew without bound as a feature travelled.
-        #
-        # A collar cell a deeper level holds is not this release's either, whoever's footprint it lies in: the leaf test
-        # on each release is the h-mark loop's own rule, applied to the collar.
-        core = _erode_cells(before, radius)
-        keep = _dilate_cells(core .& .!blocks, radius)
-        dropped = _dilate_cells(blocks, radius)
+    #
+    # Recover the set `refine` dilated, so the collar can be released without taking one another refined region still
+    # needs. It cannot be read off the live cells exactly, and that is worth stating rather than papering over: the
+    # dilation fills in neighbouring parents' blocks, so "this parent's block is live" stops meaning "this parent was
+    # refined", and clipping at a box face defeats in opposite directions the two instruments that might recover it — a
+    # morphological erosion recovers more than the block there, while requiring a parent's whole dilated footprint to
+    # be live rejects a genuinely refined edge parent. Measured, the two agree cell for cell on an 8² ladder, so the
+    # simpler one is used.
+    #
+    # Erosion is therefore the conservative reading: away from a box face `dilate(erode(dilate(X, r), r), r) ==
+    # dilate(X, r)` recovers the blocks exactly and the release is exact; near one it recovers more, so a collar stays
+    # live. Conservative is the safe direction — it can only leave refinement standing, never take away refinement
+    # another mark needs — and it is what fixes the defect that matters, an active set that grew without bound as a
+    # feature travelled.
+    #
+    # A collar cell a deeper level holds is not this release's either, whoever's footprint it lies in: the leaf test on
+    # each release is the h-mark loop's own rule, applied to the collar. A level whose block stayed empty — no h-mark
+    # reached it, or every child it named is held — releases nothing and is skipped.
+    for (k, block) in pairs(blocks)
+        (block === nothing || !any(block)) && continue
+        r, mask = radius(k), _mask!(edit, k)
+        keep = _dilate_cells(_erode_cells(active_cells(V; level=k), r) .& .!block, r)
+        dropped = _dilate_cells(block, r)
         for c in CartesianIndices(mask)
             dropped[c] && !keep[c] && mask[c] && _is_leaf(V, k, c, live) && (mask[c] = false)
         end
     end
-
-    # Identity when nothing moved, as in `refine`: a release of a cover that was not there, or a p-mark already at
-    # `pmin`, returns the space it was given.
-    filter!(kv -> kv.second != active_cells(V; level=kv.first), masks)
-    filter!(kv -> kv.second != cell_orders(V; level=kv.first), fields)
-    isempty(masks) && isempty(fields) && return V
-
-    released = isempty(masks) ? V : adapt(V, (k => masks[k] for k in sort!(collect(keys(masks))))...)
-    isempty(fields) && return released
-    return elevate(released, (k => fields[k] for k in sort!(collect(keys(fields))))...)
+    return _apply(edit)
 end
