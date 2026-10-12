@@ -10,6 +10,9 @@ recompute the same coordinates.
 
 The mesh discretization is uniform: axis `d` is split into `cells[d]` equal sub-intervals. Non-uniform Cartesian meshes
 are not currently supported.
+
+The coordinate type is the domain's. It must be able to hold a fraction of the extent, so a domain with integer corners
+is refused with an `ArgumentError`: write `box((0, 0), (1, 1))` as `box((0.0, 0.0), (1.0, 1.0))`.
 """
 struct CartesianMesh{D,T<:Real}
     domain::AxisBox{D,T}
@@ -69,6 +72,12 @@ function _mesh_axes(domain::AxisBox{D,T}, cells::NTuple{D,Int}) where {D,T}
 end
 
 function CartesianMesh(domain::AxisBox{D,T}; cells) where {D,T}
+    # Interior nodes are fractions of the extent, which an integer type cannot hold: `box((0, 0), (1, 1))` used to fail
+    # deep inside `_mesh_axes` with an `InexactError` at two cells, and to build at one cell a mesh no tolerance could
+    # be formed for (`GeometryTolerance(Int)` has no `eps`). Refuse it here, where the fix can be named.
+    T <: Integer && throw(ArgumentError("a mesh needs floating-point coordinates, but the domain's corners are " *
+                                        "$T; write box$((Tuple(domain.lower), Tuple(domain.upper))) as " *
+                                        "box$((Tuple(float.(domain.lower)), Tuple(float.(domain.upper))))"))
     cell_tuple = _axis_int_tuple(cells, Val(D), :cells)
     return CartesianMesh{D,T}(domain, cell_tuple, _mesh_axes(domain, cell_tuple))
 end

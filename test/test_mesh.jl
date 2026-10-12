@@ -36,6 +36,25 @@ end
     end
 end
 
+@testset "a mesh refuses integer coordinates and names the float spelling" begin
+    # Interior nodes are fractions of the extent. An integer domain used to raise an `InexactError` from inside the node
+    # computation (two cells) or to build a mesh no `GeometryTolerance` exists for (one cell); both spellings, and both
+    # entry points, now refuse up front and say what to write instead.
+    for build in (() -> space(box((0, 0), (1, 1)); cells=2), () -> mesh(box((0, 0), (1, 1)); cells=2),
+                  () -> mesh(box((0, 0), (1, 1)); cells=1))
+        err = try
+            build()
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("box((0.0, 0.0), (1.0, 1.0))", sprint(showerror, err))
+    end
+    # A rational domain is untouched: its nodes are exact.
+    @test mesh(box((0 // 1,), (1 // 1,)); cells=3).axes[1] == [0, 1 // 3, 2 // 3, 1]
+end
+
 @testset "_level_by_id resolves every level and rejects an unknown id" begin
     # The lookup recurses over the level tuple (see its comment in mesh.jl); pin its contract on a three-level ladder.
     V = ladder(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=2, depth=2, splits=2)
