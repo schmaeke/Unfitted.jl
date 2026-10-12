@@ -256,9 +256,12 @@ end
 #
 # The margin is relative, never `GeometryTolerance`'s absolute `contain`, which is wrong twice over: on a domain far
 # from the origin it is below one ulp and does nothing, and on a domain of small extent it is larger than a whole cell
-# and empties every range — both silently. A relative δ only has to stay far below a cell, which holds for any mesh
-# whose cells are wider than a few ulps of its coordinates. The coverage rule nudges by the absolute tolerance instead;
-# see `_cells_under_box`.
+# and empties every range — both silently. A relative δ only has to stay far below a cell, and it does wherever every
+# cell is wider than about 8·eps(m). That m is the larger of the two axes' magnitudes, not a cell's own coordinates, so
+# a fine cell near a node of small magnitude is held to the scale of the larger axis. Under the default
+# `GeometryTolerance`, whose `merge` admits no cell narrower than √eps(T) (`_check_axis_spacing`), it holds for every
+# admitted mesh with coordinates below about 1e6; a custom tolerance on a deeply graded stack far from the origin is
+# where to look for the limit. The coverage rule nudges by the absolute tolerance instead; see `_cells_under_box`.
 function _axis_overlap(target::Vector{T}, source::Vector{T}, i::Integer) where {T}
     δ = 4 * eps(max(abs(target[1]), abs(target[end]), abs(source[1]), abs(source[end])))
     return _axis_cells(target, source[i] + δ, source[i + 1] - δ)

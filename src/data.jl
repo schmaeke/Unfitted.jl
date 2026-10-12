@@ -36,12 +36,12 @@ takes a `QuadField{T}` on a `Model{D,T}` and nothing else, so a component-valued
 `QuadField`.
 
 Indexing is checked, and the check also guards a read from a cloud this field does not belong to. [`estimate`](@ref)
-re-evaluates the problem's blocks and loads on an order-elevated twin with a different and larger set of points, so a
-`qf[q.point]` there would read out of range or — worse — silently at the wrong point. The twin numbers its points far
-below 1 instead, so such a read raises an `ArgumentError` naming the cause, on whichever task or thread makes it, and
-`estimate` refuses outright when it can see the field among a form's captures. The numbering is the twin's own and
-nothing is set process-wide, so ordinary assembly, other tasks and threads, and every read against the model the field
-was built on are unaffected. The check is an explicit call, which a caller's `@inbounds` does not remove.
+re-evaluates the problem's blocks and loads on an enriched model of its own, with a different and larger set of points,
+so a `qf[q.point]` there would read out of range or — worse — silently at the wrong point. That model numbers its
+points far below 1 instead, so such a read raises an `ArgumentError` naming the cause, on whichever task or thread makes
+it, and `estimate` refuses outright when it can see the field among a form's captures. The numbering is that model's
+own and nothing is set process-wide, so a read in ordinary assembly, in another task or thread, or against the model
+the field was built on is unaffected. The check is an explicit call, which a caller's `@inbounds` does not remove.
 
 Both constructors are single-domain only and raise on a coupled model. `q.point` restarts at 1 for each subdomain, so
 one flat array — sized by `nquadpoints(model)`, the sum over the subdomains, as `QuadField(data, model)` checks — would
@@ -75,8 +75,8 @@ end
 # makes a defensive copy of the data and preserves the version pin.
 #
 # `getindex` checks by an explicit call rather than `@boundscheck`, so a caller's `@inbounds` cannot remove the check:
-# it is also what refuses a `q.point` of `estimate`'s twin (`_out_of_range`, under "Detecting point-keyed state"
-# below), and it is the one compare the vector's own `getindex` would make, so the guard costs a read nothing.
+# it is also what refuses a `q.point` of `estimate`'s enriched model (`_out_of_range`, under "Detecting point-keyed
+# state" below), and it is the one compare the vector's own `getindex` would make, so the guard costs a read nothing.
 Base.length(qf::QuadField) = length(qf.data)
 Base.eltype(::Type{QuadField{T}}) where {T} = T
 Base.eltype(qf::QuadField) = eltype(typeof(qf))
@@ -109,11 +109,11 @@ end
 # ── Detecting point-keyed state ──────────────────────────────────────────────
 #
 # `q.point` is an index into ONE model's quadrature cloud. A verb that re-evaluates forms it did not write, on a second
-# cloud — `estimate`, which assembles the caller's own blocks and loads on an order-elevated twin — therefore hands a
-# form built for `model` the twin's indices: out of range where the base plan is the smaller of the two, and silently at
-# the wrong points where it is not. The `QuadField` pin already separates the two models, and has since the pin became a
-# digest of the discretisation rather than a counter. What it could not do is reach the indexing site: `qf[q.point]` is
-# an ordinary `getindex` on a vector, and the form owns the call.
+# cloud — `estimate`, which assembles the caller's own blocks and loads on an enriched model of its own — therefore
+# hands a form built for `model` that model's indices: out of range where the base plan is the smaller of the two, and
+# silently at the wrong points where it is not. The `QuadField` pin already separates the two models, and has since the
+# pin became a digest of the discretisation rather than a counter. What it could not do is reach the indexing site:
+# `qf[q.point]` is an ordinary `getindex` on a vector, and the form owns the call.
 #
 # Two layers bring the identity there, and they cover different cases because a form can hold its state in two different
 # ways.
@@ -174,25 +174,27 @@ function _assert_no_point_keyed_state(problem, verb::AbstractString)
     return nothing
 end
 
-# The second layer is the twin's point numbering, and it exists because the first has one blind spot that reflection
-# cannot close: a form written at top level reads a *global* binding rather than capturing it, so its closure has no
-# fields at all and carries no evidence of the state it reads. `estimate` prepares the twin with its points numbered
-# from `_FOREIGN_POINTS`, far below 1, so every `q.point` the twin hands out lies outside every array a caller can hold.
-# A `QuadField` read raises the `ArgumentError` of `_out_of_range`, which names the cause; a read from a plain array
-# raises Julia's own `BoundsError`. Neither can raise on anything legitimate: only the twin numbers its points there,
-# and it is built fresh inside the call.
+# The second layer is the enriched model's point numbering, and it exists because the first has one blind spot that
+# reflection cannot close: a form written at top level reads a *global* binding rather than capturing it, so its
+# closure has no fields at all and carries no evidence of the state it reads. `estimate` prepares its enriched model
+# with the points numbered from `_FOREIGN_POINTS`, far below 1, so every `q.point` that model hands out lies outside
+# every array a caller can hold. A `QuadField` read raises the `ArgumentError` of `_out_of_range`, which names the
+# cause; a read from a plain array raises Julia's own `BoundsError`. Neither can raise on anything legitimate: only that
+# model numbers its points there, and it is built fresh inside the call.
 #
-# The numbering is the twin's own (`AssemblyCache.point_base`), so nothing is set process-wide. A flag set around the
-# twin's assembly would also stop the read, but it is seen by every task: it raises on an unrelated read in another
-# task while it is set, and two estimates interleaved restore it out of order and leave it set for good. Here another
-# task assembling, another `estimate` in flight and every thread of the twin's own threaded assembly see exactly what
-# they would see alone, and nothing outlives the call. It also costs the accessor nothing: the bounds check is the whole
-# guard, and only its failure path reads the constant.
+# The numbering is the enriched model's own (`AssemblyCache.point_base`), so nothing is set process-wide. A flag set
+# around its assembly would also stop the read, but it is seen by every task: it raises on an unrelated read in another
+# task while it is set, and two estimates interleaved restore it out of order and leave it set for good. Here a read by
+# `q.point` sees exactly what it would see alone — whether it is made by another task assembling, by an `estimate` of
+# another model in flight, or by a thread of the enriched model's own threaded assembly — and nothing outlives the
+# call. That is a guarantee about point numbering only: two estimates of one immersed model also share its moment-fit
+# caches, which nothing locks. It costs the accessor nothing: the bounds check is the whole guard, and only its failure
+# path reads the constant.
 #
 # The constant has three properties, and the suite asserts each:
 #
-#   - every point of any cloud the twin could have, `_FOREIGN_POINTS + n` with `n` far below 2⁶⁰, is negative and below
-#     `_FOREIGN_POINTS ÷ 2`, the line `_out_of_range` reads as "a point of the twin";
+#   - every point of any cloud the enriched model could have, `_FOREIGN_POINTS + n` with `n` far below 2⁶⁰, is negative
+#     and below `_FOREIGN_POINTS ÷ 2`, the line `_out_of_range` reads as "a point of the enriched model";
 #   - it is far below any index written by hand, at about −2.85e18;
 #   - it does not wrap. An `@inbounds v[q.point]` on a raw vector reads the address `v + (q.point − 1)·s` for elements
 #     of `s` bytes, modulo 2⁶⁴, and a base whose product with `s` is ≡ 0 would put that read exactly on element `k` —
@@ -203,8 +205,8 @@ end
 const _FOREIGN_POINTS = -reinterpret(Int, 0x9E3779B97F4A7C15 >> 2)
 
 # The error of an index outside a field's data, raised out of line so the accessor keeps the single compare of its
-# bounds check. An index below `_FOREIGN_POINTS ÷ 2` is a `q.point` of `estimate`'s twin and is named as such; any other
-# raises the `BoundsError` the data vector itself would.
+# bounds check. An index below `_FOREIGN_POINTS ÷ 2` is a `q.point` of `estimate`'s enriched model and is named as such;
+# any other raises the `BoundsError` the data vector itself would.
 @noinline function _out_of_range(qf::QuadField, i::Integer)
     i < _FOREIGN_POINTS ÷ 2 || throw(BoundsError(qf.data, i))
     throw(ArgumentError("this QuadField (pin 0x$(string(qf.model_version; base=16))) is being read at a `q.point` " *
@@ -250,8 +252,9 @@ struct RBFP0
 end
 RBFP0(; neighbors::Int=10) = RBFP0(neighbors)
 
-# Maximum supported neighbour count for `RBFP0`. The local solve is a `(K+1) × (K+1)` SMatrix system; the cap keeps the
-# static-array path performant and the per-target memory footprint tight.
+# Maximum supported neighbour count for `RBFP0`. The cap bounds the per-point solve, a `(K+1) × (K+1)` system: up to 13
+# neighbours it is a static `SMatrix` solve, off the heap, and from 14 on it is StaticArrays' dense LAPACK fallback (see
+# `_rbfp0_local`).
 const _RBFP0_MAX_NEIGHBORS = 16
 
 # ── Public transfer ──────────────────────────────────────────────────────────
@@ -265,7 +268,7 @@ Reconstruct `source` on `target_model`'s quadrature-point cloud with the [`RBFP0
 `source` must be a `QuadField{T}` over the models' own scalar type `T`: the local solve carries neighbour coordinates
 and neighbour values in one type, so a component-valued state is transferred one component at a time. That one is not an
 argument check — a mismatched element type surfaces as a `MethodError` from the local solve. Two `ArgumentError`s guard
-the neighbour count — `1 ≤ via.neighbors ≤ 16` (the static-solve cap documented on [`RBFP0`](@ref)) and at least
+the neighbour count — `1 ≤ via.neighbors ≤ 16` (the neighbour cap documented on [`RBFP0`](@ref)) and at least
 `via.neighbors` quadrature points on the source model.
 
 Algorithm: collect the source and the target quadrature-point clouds, one walk each, and build a `KDTree` over the
@@ -303,7 +306,7 @@ function _quadrature_cloud(model::Model{D,T}) where {D,T}
 end
 
 # The per-point loop of the RBFP0 transfer, behind the one dynamic dispatch a transfer makes: `Val(K)` turns the runtime
-# neighbour count into a compile-time one, so this body and the static solve below it are compiled once per `K` and run
+# neighbour count into a compile-time one, so this body and the local solve below it are compiled once per `K` and run
 # with no dispatch per point. Per target point it finds the `K` nearest source points, sorted by distance, and writes
 # the local interpolant's value there. Each target is independent, so the threaded loop writes the same values as the
 # serial one, bit for bit.

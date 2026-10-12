@@ -188,10 +188,11 @@ end
 end
 
 @testset "levels share their node coordinates on a non-dyadic domain" begin
-    # The cross-level map compares node coordinates with no tolerance, so a ladder is only nested if its levels share
-    # their nodes bit for bit. On an extent that is not a power of two they did not: `_mesh_axes` scaled before
-    # dividing, so each level rounded a different product, and on [0, 0.7] in three cells refined by three the base axis
-    # ended one ulp short of 0.7 and its cells claimed 4, 4 and 3 fine cells instead of 3 each.
+    # A ladder's levels must share their nodes bit for bit, so that the cross-level map is exact without leaning on its
+    # few-ulp rounding margin. On an extent that is not a power of two they did not: `_mesh_axes` scaled before
+    # dividing, so each level rounded a different product, and on [0, 0.7] in three cells refined by three the base
+    # axis ended one ulp short of 0.7; read with an exact map, its cells claimed 4, 4 and 3 fine cells instead of 3
+    # each. The axes' equality asserted below, here and in `nests_exactly`, is the guard.
     V = ladder(box((0.0,), (0.7,)); cells=3, depth=1, splits=3)
     @test V.levels[1].mesh.axes[1][end] == 0.7
     @test [Unfitted._cell_block(V, 1, 2, CartesianIndex(i)) for i in 1:3] ==

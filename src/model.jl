@@ -447,7 +447,7 @@ end
 # One integration region list as assembly sees it: the regions, the `q.point` offset of each (region `r`'s points are
 # `offsets[r] .+ (1:npoints)`), and the regions' active dofs. `offsets[1]` is the model's point base
 # (`AssemblyCache.point_base`): 0 on every model a caller holds, so the points number from 1 and `offsets[end]` is the
-# count, but not on `estimate`'s enriched twin, so the count is read as `_point_count`. All three are derived once,
+# count, but not on `estimate`'s enriched model, so the count is read as `_point_count`. All three are derived once,
 # under the cache lock, when the list is first resolved, and never change afterwards.
 struct RegionList{R}
     regions::Vector{R}
@@ -481,11 +481,11 @@ end
 #   - `workspaces` — idle `AssemblyWorkspace`s, at most `Threads.nthreads()`. Typed `Any` because the workspace type is
 #     defined in `assembly.jl`; the drivers recover it behind a function barrier.
 #   - `point_base` — the number every region list's `q.point`s count up from, fixed when the model is prepared. It is 0
-#     on every model but one, so the points of a list number `1:n`. The exception is the throw-away twin `estimate`
-#     prepares, which re-evaluates the caller's own forms on a cloud they were not written for: it numbers from
-#     `_FOREIGN_POINTS` (`data.jl`), far below 1, so a form reading per-point state by `q.point` there fails at the read
-#     instead of landing on another model's point. Carrying the base on the model rather than in a process-wide flag is
-#     what keeps every other model, task and thread out of it.
+#     on every model but one, so the points of a list number `1:n`. The exception is the throw-away enriched model
+#     `estimate` prepares, which re-evaluates the caller's own forms on a cloud they were not written for: it numbers
+#     from `_FOREIGN_POINTS` (`data.jl`), far below 1, so a form reading per-point state by `q.point` there fails at the
+#     read instead of landing on another model's point. Carrying the base on the model rather than in a process-wide
+#     flag is what keeps every other model, task and thread out of it.
 #
 # Nothing here depends on constrained values, so `update_dirichlet!` keeps the cache, and `_remodel!` replaces it whole
 # when the structure changes.
@@ -663,7 +663,7 @@ prepare(problem::Problem{D,T}; kwargs...) where {D,T} = _prepared_model(problem,
 # The body of [`prepare`](@ref), with the moment-fit caches optionally supplied: `reuse` is `nothing` for fresh ones,
 # which is what `prepare` starts with, or the vector a derivation of an existing model hands in through `_derived`,
 # which is where the choice between sharing and copying is made and explained. `point_base` is the assembly cache's
-# (see `AssemblyCache`): 0 everywhere but in `estimate`'s twin.
+# (see `AssemblyCache`): 0 everywhere but in `estimate`'s enriched model.
 function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                          reuse::Union{Nothing,Vector{_MomentFitCache{D,T}}}; point_base::Int=0) where {D,T}
     effective_problem, spaces, caches = _prepare_spaces(problem)
@@ -1237,7 +1237,7 @@ function _assert_single_domain(model::Model, op::AbstractString)
 end
 
 # A model of `model`'s problem prepared over `space`: the one builder behind every model derived from another — the
-# non-mutating derivations, the in-place mutators (`_remodel!`) and `estimate`'s enriched twin. The forms, field
+# non-mutating derivations, the in-place mutators (`_remodel!`) and `estimate`'s enriched model. The forms, field
 # channels and Dirichlet data are `model`'s (`_problem_with_space`); the plan options are too, unless `options` says
 # otherwise, as `estimate`'s does when it exempts a level from pruning.
 #
@@ -1279,16 +1279,14 @@ end
 # (`_assert_single_domain`), so `prefold_space` is *the* space and `_problem_with_space` re-homes every field onto the
 # derived copy.
 #
-# The moment-fit caches are threaded in uncopied, unlike `adapted`'s: a mutator overwrites the model rather than forking
-# it, so no sibling model can have its rules evicted and the model keeps one cache object for its whole life.
-#
 # The rebuilt model is then copied onto `model` field by field, by name, so the rule is "everything a `prepare` builds
 # is replaced" and a field added to `Model` later is replaced with the rest rather than forgotten. A field that must
 # survive a rebuild has to be excluded by name, as `version` is: the pin moves on from the model's own value, so an
 # outstanding `Solution` raises. Everything else is what the rebuild should leave:
 #
 #   - `matrix` and `rhs` are `nothing` on the fresh model, so the assembled state is cleared;
-#   - `plan_options` is the same object, and `moment_fit_caches` the model's own vector;
+#   - `plan_options` is the same object, and `moment_fit_caches` the model's own vector, passed in uncopied (`_derived`
+#     gives the reason);
 #   - the Dirichlet projection cache is a fresh empty one: its unknown sets, facet regions and mass all belong to the
 #     dof layout being replaced, and the next `update_dirichlet!` rebuilds it against the new one;
 #   - the facet resolver is replaced for the same reason and with a second effect: its keys hold spaces by identity, so

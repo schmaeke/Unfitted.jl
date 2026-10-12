@@ -267,7 +267,8 @@ end
 # margin that must hold at any scale; see `_axis_overlap` in `ladder.jl`.
 #
 # The name is deliberately not `_overlapping_cells`: that was one underscore from `overlapping_cells`, a public function
-# with a different contract (which cells of one *level* overlap a selection on another, tolerance-free).
+# with a different contract (which cells of one *level* overlap a selection on another, free of `GeometryTolerance`: a
+# relative rounding margin only).
 #
 # Used by `_covered_by_level` below, which asks whether every overlapped cell of a masked covering level is active or
 # fictitious — the "for every cell of the finer level under this coarser cell" question the block resolution answers —
