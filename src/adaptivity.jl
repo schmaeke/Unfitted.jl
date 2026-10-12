@@ -911,12 +911,6 @@ function _mask!(e::_StackEdit, k::Integer)
     return m === nothing ? (e.masks[k] = active_cells(e.space; level=k)) : m
 end
 
-# A cell's order as the edit stands: the last write, else the space's own.
-function _order(e::_StackEdit, k::Integer, c::CartesianIndex)
-    written = e.orders[k]
-    return written !== nothing && haskey(written, c) ? written[c] : cell_order(e.space.levels[k], c)
-end
-
 # Record an order write. A family without a per-cell order has none to write — a B-spline level's degree belongs to a
 # whole-axis knot vector, and no step may change it — so the write is dropped here, once, rather than guarded at every
 # site that writes: the p-step, the order step an h-mark turns into, and the order a woken or released child is given.
@@ -1163,10 +1157,9 @@ function coarsen(V::Space{D,T}; h=(), p=(), pmin::Integer=1) where {D,T}
     edit = _StackEdit(V)
     live = _live_levels(V)
     radius(k) = _support_radius(V.levels[k].basis, nominal_order(V.levels[k]))
-    # The children released per level, for the support-collar mirror below; held only on a level whose family has a
-    # collar to release.
-    blocks = Union{Nothing,BitArray{D}}[all(iszero, radius(k)) ? nothing : falses(V.levels[k].mesh.cells)
-                                        for k in eachindex(V.levels)]
+    # The children released per level, for the support-collar mirror below: allocated when a release first reaches a
+    # level whose family has a collar to release, and never on a level no release reaches.
+    blocks = Vector{Union{Nothing,BitArray{D}}}(nothing, length(V.levels))
     # Lower only the axes above the floor, the mirror of `refine`'s `raised`, and from the cell's order in `V` for the
     # same reason: a duplicated p-mark lowers once.
     lowered(o) = max.(o .- 1, min.(o, Int(pmin)))
@@ -1192,11 +1185,16 @@ function coarsen(V::Space{D,T}; h=(), p=(), pmin::Integer=1) where {D,T}
         # The released children take the PARENT's order, which is exactly what `refine`'s h-step gives them. An inactive
         # cell's order is unobservable, so this is not required for correctness — but it makes the two verbs inverses of
         # the whole order field rather than only of its observable part, which is what lets a transient loop refine and
-        # release the same region thousands of times without drift. It is the parent's order as this call leaves it,
-        # after a p-mark on the same parent. Note `nominal_order` is NOT the value to use: it is a maximum kept for
-        # buffer sizing, and on a level that has been elevated it has already moved.
-        parent = _order(edit, k, cell)
-        mask, block = _mask!(edit, k + 1), blocks[k + 1]
+        # release the same region thousands of times without drift. It is read from `V`, as `refine` reads it: a p-mark
+        # in this call cannot have lowered it, since only a live child is released and a parent with a live child is no
+        # leaf, so its p-mark has been refused above. Note `nominal_order` is NOT the value to use: it is a maximum kept
+        # for buffer sizing, and on a level that has been elevated it has already moved.
+        parent = cell_order(V.levels[k], cell)
+        mask = _mask!(edit, k + 1)
+        if blocks[k + 1] === nothing && !all(iszero, radius(k + 1))
+            blocks[k + 1] = falses(V.levels[k + 1].mesh.cells)
+        end
+        block = blocks[k + 1]
         for child in _children(V, k, cell)
             # A child that is itself covered — by any deeper level, not only the next one — is not this level's to
             # release, and it stays out of the released block for the same reason: the deeper level is built on it.
