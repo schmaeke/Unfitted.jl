@@ -861,6 +861,22 @@ end
         @test same(coarsen(coarsen(held; h=[(2, kid)]); h=[(1, cell)]), L)
     end
 
+    # The collar pass's own leaf test, which the input above never reaches: there every child of `cell` is held, so the
+    # released block is empty and the pass skips the level. Here level 3 refines (4, 7), a cell of the level-2 support
+    # collar that is not a child of `cell`. The four children stay leaves and are released, and the collar pass then
+    # reaches the 15 live level-2 cells level 3 stands over. Released by footprint alone, all 15 went, and level 2 was
+    # left with no live cell under 64 live level-3 cells.
+    L = ladder(_AD_Ω; cells=8, depth=2, order=3, basis=bspline())
+    edge = CartesianIndex(4, 7)
+    held = refine(refine(L; h=[(1, cell)]); h=[(2, edge)])
+    released = coarsen(held; h=[(1, cell)])
+    under = overlapping_cells(held, active_cells(held; level=3); from=3, to=2) .& active_cells(held; level=2)
+    @test count(under) == 15
+    @test all(active_cells(released; level=2)[under])
+    @test !any(active_cells(released; level=2)[overlapping_cells(L, [cell]; from=1, to=2)])
+    @test active_cells(released; level=3) == active_cells(held; level=3)
+    @test same(coarsen(coarsen(held; h=[(2, edge)]); h=[(1, cell)]), L)
+
     # The control's answer, which the collar never touched: the held child alone stays, its three siblings go.
     L = ladder(_AD_Ω; cells=8, depth=2, order=3)
     kid = findfirst(overlapping_cells(L, [cell]; from=1, to=2))
