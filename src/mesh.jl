@@ -588,17 +588,22 @@ end
     basis_values(level::Level, cell::CartesianIndex, xi) -> Vector
 
 Values of exactly the functions cell `cell` of `level` generates, at reference point `xi ∈ [−1, 1]ᴰ`, in
-[`cell_basis_indices`](@ref) order.
+[`cell_basis_indices`](@ref) order, in the floating-point promotion of `xi`'s coordinate type.
 
-This is the per-cell half of the family interface's evaluation pair, and the one to reach for whenever the result will
-be paired with `cell_dofs`. The order-keyed method `basis_values(basis, order, mode, xi, cell)` re-derives its index set
-from the order it is handed, which on a level whose order varies from cell to cell is not the set the cell generates:
-the minimum rule has already removed the shared-entity modes a lower-order neighbour cannot match, and what is left is
-in general the index set of no order at all. This method reads the level's own table instead, so the values pair
-positionally with `cell_dofs(layout, level.id, cell)` on a uniform and a graded level alike.
+This is the package's per-cell point evaluator, and the one to reach for whenever the result will be paired with
+`cell_dofs`: it reads the level's own minimum-rule table, so the values pair positionally with
+`cell_dofs(layout, level.id, cell)` on a uniform and a graded level alike. An index set derived from an order instead
+would be wrong on a level whose order varies from cell to cell, where the minimum rule has removed the shared-entity
+modes a lower-order neighbour cannot match and what is left is in general the index set of no order at all.
 
-Allocates a fresh vector per call, as the order-keyed method does. The assembly hot loops go through the workspace banks
-instead and allocate nothing.
+`cell` is the parent cell's mesh index as well as the key into that table. Integrated Legendre's 1D modes are cell-local
+in the reference frame and ignore it; the B-spline extension's are global and pick their knot-vector span from it. The
+cell is therefore looked up on the level's own grid, and an index outside it raises `BoundsError`. The evaluator reaches
+the family through its `_fill_factor_tables!` hook alone, so it serves every family unchanged. To evaluate on the
+reference cell itself, use a one-cell level over `[−1, 1]ᴰ`, e.g.
+`space(box((-1.0, -1.0), (1.0, 1.0)); cells=1, order=p).levels[1]`.
+
+Allocates a fresh vector per call. The assembly hot loops go through the workspace banks instead and allocate nothing.
 """
 function basis_values(level::Level{D}, cell::CartesianIndex{D}, xi::PointLike{D}) where {D}
     indices = cell_basis_indices(level, cell)
@@ -613,12 +618,20 @@ end
     physical_basis_gradients(level::Level, cell::CartesianIndex, cell_box, xi) -> Vector{SVector{D}}
 
 Physical gradients of exactly the functions cell `cell` of `level` generates, on the axis-aligned `cell_box`, at
-reference point `xi ∈ [−1, 1]ᴰ`, in [`cell_basis_indices`](@ref) order.
+reference point `xi ∈ [−1, 1]ᴰ`, in [`cell_basis_indices`](@ref) order — the gradient counterpart of
+[`basis_values`](@ref)`(level, cell, xi)`, with the same pairing with `cell_dofs` and the same contract on `cell`.
 
-The gradient counterpart of [`basis_values`](@ref)`(level, cell, xi)` and it carries the same reason for existing: the
-order-keyed method derives its index set from an order, which is the wrong set on a level whose order varies from cell
-to cell. The chain rule is the one the order-keyed method documents — `∂N_α/∂x_d = (2 / h_d) · ∂N_α/∂ξ_d` with
-`h = edge_lengths(cell_box)`.
+The chain rule for an axis-aligned cell with edge lengths `h_d = edge_lengths(cell_box)[d]` gives
+
+    ∂N_α/∂x_d = (2 / h_d) · ∂N_α/∂ξ_d,
+
+so the physical gradient is the reference gradient scaled per axis by `2 / h_d`; on a cell of edge length 2 per axis it
+is the bare reference gradient. `cell_box` is the cell's *geometry* and `cell` its *mesh index*, independent arguments
+because the chain rule needs the former while a span-based family needs the latter: pass
+[`cell_box`](@ref)`(level.mesh, cell)` for the cell's own box, and map a physical point through
+[`physical_to_reference`](@ref) first if you have `x` rather than `ξ`. The result is in the promotion of `xi`'s
+coordinate type with the box's, so a `Float32` point on a `Float64` cell computes and stores the chain rule at the wider
+precision.
 """
 function physical_basis_gradients(level::Level{D}, cell::CartesianIndex{D}, cell_box::AxisBox{D,T},
                                   xi::PointLike{D}) where {D,T}

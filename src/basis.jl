@@ -47,9 +47,10 @@ A new family `F <: BasisFamily` must provide:
 
 It inherits the basis-agnostic `::BasisFamily` defaults and overrides only the ones that do not fit:
 `recommended_quadrature_order` (`order .+ 1`), `_supported_modes` (`(:tensor,)`), `local_basis_indices` /
-`local_basis_count` (the lexicographic tensor index set `∏_d {0, …, order[d]}` and its size), `is_facet_basis`,
-`boundary_basis_indices`, and the point evaluators [`basis_values`](@ref) / [`physical_basis_gradients`](@ref), which
-are built on `_fill_factor_tables!` and therefore already serve every family.
+`local_basis_count` (the lexicographic tensor index set `∏_d {0, …, order[d]}` and its size), `is_facet_basis` and
+`boundary_basis_indices`. The point evaluators [`basis_values`](@ref) / [`physical_basis_gradients`](@ref) take a
+[`Level`](@ref) and a cell rather than a family: they read the cell's order and index set from the level and reach the
+family through `_fill_factor_tables!` alone, so they serve every family with nothing to override.
 
 One further default is silent rather than fatal, so a new family should decide about it deliberately: the burial hooks
 of `_coverage_constraints!` (`src/dofs.jl`), `_sheds_any` and `_reproduces` above all — `false` by default, so on a
@@ -578,77 +579,6 @@ function _product_except(values::NTuple{D}, k::Integer) where {D}
         d == k || (result *= values[d])
     end
     return result
-end
-
-# ── Public value and gradient evaluation ──────────────────────────────────────
-
-"""
-    basis_values(basis, order, mode, xi, cell) -> Vector
-
-Local basis values at reference point `xi ∈ [−1, 1]ᴰ` on the parent `cell`, in [`local_basis_indices`](@ref) order.
-Returns a fresh vector; the hot loops in `src/assembly.jl` call `_tensor_values!` with reused scratch instead.
-
-`cell::CartesianIndex{D}` is the parent cell's mesh index along each axis. Families whose 1D modes are cell-local in the
-reference frame (integrated Legendre) ignore it; families whose modes are global (the B-spline extension's knot-vector
-spans) need it to pick the right span, which is why it is part of the signature for *every* family rather than an
-overload some families add.
-
-This `::BasisFamily` method is built on `_tensor_values!` and therefore serves every family through its
-`_fill_factor_tables!` hook — there is nothing here for a family to override.
-
-!!! warning "Pairing with `cell_dofs`"
-    The result is in `local_basis_indices(basis, order, mode)` order, which is the set the *order* names. On a level
-    whose order varies from cell to cell that is not the set the cell generates: the minimum rule removes the
-    shared-entity modes a lower-order neighbour cannot match, and the survivors are in general not the index set of any
-    order. Pairing this vector positionally with `cell_dofs(layout, level, cell)` then attaches values to the wrong
-    unknowns. Use `basis_values(level::Level, cell, xi)`, which takes the cell rather than an order and reads
-    `cell_basis_indices`.
-"""
-function basis_values(basis::BasisFamily, order::NTuple{D,Int}, mode::Symbol, xi::PointLike{D},
-                      cell::CartesianIndex{D}) where {D}
-    indices = local_basis_indices(basis, order, mode)
-    ξ = _reference_coordinate(xi)
-    T = eltype(ξ)
-    values = Vector{T}(undef, length(indices))
-    return _tensor_values!(basis, values, indices, order, ξ, _factor_buffers(order, T), cell)
-end
-
-"""
-    physical_basis_gradients(basis, order, mode, cell_box, xi, cell) -> Vector{SVector{D}}
-
-Local basis gradients with respect to the *physical* coordinate on the axis-aligned cell `cell_box`, at reference point
-`xi ∈ [−1, 1]ᴰ`, in [`local_basis_indices`](@ref) order. The chain rule for an axis-aligned cell with edge lengths
-`h_d = edge_lengths(cell_box)[d]` gives
-
-    ∂N_α/∂x_d = (2 / h_d) · ∂N_α/∂ξ_d,
-
-so the physical gradient is the reference gradient scaled per axis by `scale[d] = 2 / h_d`; pass a box of edge length 2
-per axis to recover the bare reference gradient. Map a physical point through [`physical_to_reference`](@ref) first if
-you have `x` rather than `ξ`.
-
-`cell_box` is the cell's *geometry* and `cell` its *mesh index* — the two are independent arguments because the
-chain-rule scaling needs the former while a span-based family needs the latter. As with [`basis_values`](@ref), this
-`::BasisFamily` method is built on `_tensor_values_grads!` and serves every family unchanged.
-
-!!! warning "Pairing with `cell_dofs`"
-    The result is in `local_basis_indices(basis, order, mode)` order and carries the same caveat [`basis_values`](@ref)
-    does: on a level whose order varies from cell to cell the minimum rule has already removed modes from the cell's
-    set, so this vector does not line up with `cell_dofs`. Use
-    `physical_basis_gradients(level::Level, cell, cell_box, xi)` there.
-"""
-function physical_basis_gradients(basis::BasisFamily, order::NTuple{D,Int}, mode::Symbol, cell_box::AxisBox{D,T},
-                                  xi::PointLike{D}, cell::CartesianIndex{D}) where {D,T}
-    indices = local_basis_indices(basis, order, mode)
-    # The cell's scalar type joins the promotion: `scale` is derived from the box, so a `Float32` reference point on a
-    # `Float64` cell must still compute — and store — the chain rule at the wider precision.
-    R = float(promote_type(map(typeof, Tuple(xi))..., T))
-    ξ = SVector{D,R}(xi)
-    values = Vector{R}(undef, length(indices))
-    gradients = Vector{SVector{D,R}}(undef, length(indices))
-    scale = SVector{D,R}(2 ./ edge_lengths(cell_box))
-    _tensor_values_grads!(basis, values, gradients, indices, order, ξ, scale, _factor_buffers(order, R),
-                          _factor_buffers(order, R), cell)
-    return gradients
 end
 
 # ── Boundary and facet basis identification ───────────────────────────────────

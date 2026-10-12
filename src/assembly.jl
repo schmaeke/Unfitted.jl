@@ -1307,7 +1307,7 @@ end
 # Evaluate every parent's basis at the current frame point `p` into the bank: values and physical gradients
 # (`Val(true)`), or values only (`Val(false)`, for the L² transfer rhs, whose integrand never reads a gradient). Each
 # parent maps `p` into its own reference frame through `ξ0 + dξ ∘ p` (`Parent`), with no division. The gradient scale is
-# the axis-aligned chain rule `2 / edge_lengths(parent_box)` of `physical_basis_gradients` in `basis.jl`. One basis
+# the axis-aligned chain rule `2 / edge_lengths(parent_box)` of `physical_basis_gradients` in `mesh.jl`. One basis
 # evaluation per parent per point. A one-sided region's parents have distinct levels, so their bank slots never
 # collide; an interface region's two sides live in the two subdomains' disjoint level banks, so the kernel reads field
 # `a` from `a`'s cut cell and field `b` from `b`'s at the same physical point.

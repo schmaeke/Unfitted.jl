@@ -48,10 +48,10 @@ cell-local mode index is mapped to its global 1D function index via the `_AXIS_B
   - The family-specific basis-interface overloads — `basis_name` and `is_boundary_basis`. Everything else in the
     interface is inherited from the `::BasisFamily` defaults in `src/basis.jl`: the tensor `local_basis_indices` /
     `local_basis_count` (an open-knot span carries exactly the full `∏_d {0, …, p_d}` set),
-    `recommended_quadrature_order`, `is_facet_basis`, `boundary_basis_indices`, `basis_values`,
-    `physical_basis_gradients`, and the boundary trace. The family declares no mode support of its own either: the
-    `::BasisFamily` default is `:tensor` only, which is exactly what this family serves, so `_check_basis_mode` rejects
-    `:trunk` for it.
+    `recommended_quadrature_order`, `is_facet_basis`, `boundary_basis_indices`, and the boundary trace; the level-keyed
+    point evaluators `basis_values` / `physical_basis_gradients` reach the family through the kernels below alone. The
+    family declares no mode support of its own either: the `::BasisFamily` default is `:tensor` only, which is exactly
+    what this family serves, so `_check_basis_mode` rejects `:trunk` for it.
   - Hot-path `_fill_factor_tables!` overloads (values, values + derivatives) using `BasicBSpline.bsplinebasisall` per
     axis after mapping the cell-local reference coordinate `ξ ∈ [−1, 1]` to the knot-vector parameter.
   - `_tensor_dof_key` and `_key_on_level_side` overloads that route through the family's own `_AXIS_BSPLINE` key tag.

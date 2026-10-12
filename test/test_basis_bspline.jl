@@ -541,13 +541,17 @@ end
         @test val1d[1][i] ≈ expected[i]
     end
 
-    # The generic `::BasisFamily` evaluator must carry `cell` through to the span lookup — in 1D its output is exactly
-    # the per-axis table, so it can be compared to BasicBSpline directly, and evaluating the same ξ on cell 1 must give
-    # a different span and different values.
-    on_cell2 = Unfitted.basis_values(fam, (3,), :tensor, ξ, cell)
-    on_cell1 = Unfitted.basis_values(fam, (3,), :tensor, ξ, CartesianIndex(1))
+    # The level-keyed evaluator must carry `cell` through to the span lookup — in 1D its output is exactly the per-axis
+    # table, so it can be compared to BasicBSpline directly, and evaluating the same ξ on cell 1 must give a different
+    # span and different values.
+    level = V.levels[1]
+    on_cell2 = Unfitted.basis_values(level, cell, ξ)
+    on_cell1 = Unfitted.basis_values(level, CartesianIndex(1), ξ)
     @test on_cell2 ≈ collect(expected)
     @test on_cell1 != on_cell2
+    # A cell off the level's grid is refused before the kernel could read the knot vector past its end.
+    @test_throws BoundsError Unfitted.basis_values(level, CartesianIndex(9), ξ)
+    @test_throws BoundsError Unfitted.physical_basis_gradients(level, CartesianIndex(9), box((0.0,), (1.0,)), ξ)
 end
 
 @testset "BSpline extension: dof-key sharing across cells" begin
