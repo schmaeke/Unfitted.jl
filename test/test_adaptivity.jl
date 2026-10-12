@@ -63,6 +63,35 @@ end
     @test_throws ArgumentError estimate(model, u; enrichment=0)
 end
 
+@testset "estimate refuses a second field and a stale solution before building V⁺" begin
+    # Both refusals used to come after the enriched model had been prepared and assembled: the stale pin from the
+    # injection, the second field from the attribution sweep's single-field lookup, in a message that did not name the
+    # verb. A load that counts its evaluations shows that nothing enriched is built now: it is never called.
+    calls = Threads.Atomic{Int}(0)
+    load(x) = (Threads.atomic_add!(calls, 1); 1.0)
+    V = space(_AD_Ω; cells=4, order=2)
+    a, b = field(:a, V), field(:b, V)
+    two = prepare(Problem((a, b); blocks=(stiffness_block(a), stiffness_block(b)),
+                          loads=(source_load(a; source=load), source_load(b; source=load)),
+                          dirichlet=[dirichlet(0.0; on=boundary(:all), field=:a),
+                                     dirichlet(0.0; on=boundary(:all), field=:b)]))
+    u = solve!(two)
+    calls[] = 0
+    @test_throws ArgumentError estimate(two, u)
+    @test_throws "estimate: the problem has 2 fields" estimate(two, u)
+    @test calls[] == 0
+
+    # A solution of another discretisation: the same problem at order 3.
+    one = prepare(poisson(V; source=load, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    solve!(one)
+    other = prepare(poisson(space(_AD_Ω; cells=4, order=3); source=load, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    stale = solve!(other)
+    calls[] = 0
+    @test_throws ArgumentError estimate(one, stale)
+    @test_throws "estimate: this solution was computed on a different discretisation" estimate(one, stale)
+    @test calls[] == 0
+end
+
 @testset "estimate charges every component of a vector field" begin
     # The attribution used to read `active_cell_dofs` at its default component, so on a vector-valued field it measured
     # component 1 and nothing else. A two-component problem whose datum sits on component 2 then came back with

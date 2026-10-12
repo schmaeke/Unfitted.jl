@@ -365,22 +365,36 @@ land on a point of `model`'s cloud. That numbering is `V⁺`'s own and sets noth
 task, another `estimate` running at the same time included, is unaffected. Where a model carries per-point state,
 compute the indicator on a model whose forms read that state through the physical point `q.x` instead.
 
-What it refuses: single-field and single-domain, a model that has not been assembled, and an `enrichment` below one. It
-no longer refuses a basis family without a per-cell order — that family is enriched by superposition instead, as
+What it refuses, before anything enriched is built and in messages that name `estimate`: a multi-domain or multi-field
+problem (the one field may carry any number of components), a model that has not been assembled, a `solution` that is
+not one of `model` as it stands (computed on another discretisation, or before a mutation), and an `enrichment` below
+one. It no longer refuses a basis family without a per-cell order — that family is enriched by superposition instead, as
 described above — but the injection still copies coefficients by dof key, so [`Rewire`](@ref)'s
 `_assert_keys_comparable` remains the backstop for a family whose keys would not survive the enrichment it chose.
 
 See [`refine`](@ref) for the rest of the loop.
 """
 function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) where {D,T}
+    # Every refusal comes before `V⁺` exists, cheapest first, so a refused call costs neither the enriched preparation
+    # nor its assembly, and names `estimate` itself. The second field and the stale solution used to be found only after
+    # both: the field by the attribution sweep's single-field lookup, whose message did not name the verb, and the pin
+    # by the injection, after the enriched load had been evaluated 512 and 256 times on a 4² order-2 Poisson problem.
     _assert_single_domain(model, "estimate")
     enrichment >= 1 || throw(ArgumentError("enrichment must be at least 1; got $enrichment"))
     V = model.prefold_space
     model.matrix === nothing && throw(ArgumentError("estimate: the model has not been assembled; call `solve!` or " *
                                                     "`assemble!` before estimating"))
-    # Before the expensive half: the enriched twin below re-runs THESE forms on a different quadrature cloud, and a form
-    # keyed by `q.point` reads the wrong points there without raising. `data.jl` carries the search and the reasoning;
-    # it runs once per call and never per point.
+    length(model.dofs.fields) == 1 ||
+        throw(ArgumentError("estimate: the problem has $(length(model.dofs.fields)) fields; the indicator is defined " *
+                            "for a single field, which may carry any number of components"))
+    coefficients = try
+        _checked_coefficients(solution, model)
+    catch err
+        err isa ArgumentError ? throw(ArgumentError("estimate: " * err.msg)) : rethrow()
+    end
+    # The enriched twin below re-runs THESE forms on a different quadrature cloud, and a form keyed by `q.point` reads
+    # the wrong points there without raising. `data.jl` carries the search and the reasoning; it runs once per call and
+    # never per point.
     _assert_no_point_keyed_state(model.problem, "estimate")
 
     # The caches are handed over UNcopied, which is the opposite of what every other derivation does (`adapted` gives
@@ -486,7 +500,6 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
         a .= sqrt.(a)
     end
 
-    coefficients = _checked_coefficients(solution, model)
     reference = sqrt(max(zero(T), dot(coefficients, model.matrix * coefficients)))
     total = sqrt(sum(sum(a .^ 2) for a in cells))
     consistency = sqrt(residual_V / max(residual_W, eps(T)))
