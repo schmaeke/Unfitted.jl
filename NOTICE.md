@@ -31,6 +31,12 @@ in full at the top of the implementing file, for academic attribution:
     BIT **11** (1971) 168,
     [doi:10.1007/BF01934364](https://doi.org/10.1007/BF01934364).
 
+  - **Polygon splitting** in `src/surface.jl` — the triangles of an immersed
+    surface are split at grid planes by single-plane passes of the polygon
+    clipper of I. E. Sutherland, G. W. Hodgman, "Reentrant polygon
+    clipping", Commun. ACM **17** (1974) 32,
+    [doi:10.1145/360767.360802](https://doi.org/10.1145/360767.360802).
+
   - **Mesh signed-distance** in `ext/UnfittedMeshIOExt.jl` — closest point on a
     triangle: C. Ericson, "Real-Time Collision Detection", Morgan Kaufmann
     (2005), ISBN 978-1-55860-732-3; angle-weighted pseudonormal sign:

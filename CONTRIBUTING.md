@@ -1465,9 +1465,12 @@ demos.
     no test distinguishes a memoised rule from an unmemoised one.
   - Multi-domain coupling: a machine-precision Nitsche interface patch
     test across two independently discretised subdomains; the `couple`
-    four-block sign pattern. **Requirement not yet met:** no coupling
-    test masks a subdomain, so the skip of interface regions where one
-    side has no active cover is unexercised.
+    four-block sign pattern. The skip of interface regions where one
+    side has no cover is exercised for geometry outside a subdomain
+    (`test_coupling.jl`'s point interface, `test_boundary_mesh.jl`'s
+    triangle reaching past the grid). **Requirement not yet met:** no
+    coupling test masks a subdomain, so the variant where the trace lies
+    in an inactive cell is not.
   - Covered-mode pruning: covered high-order modes eliminated and buried
     linear modes deduplicated only under a nested finer level;
     `reduced_mode_counts` matches the eliminated set. The user-masked

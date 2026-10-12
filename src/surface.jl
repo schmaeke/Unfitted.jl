@@ -13,7 +13,11 @@
 #   * Simplex geometry, one affine map `x = v₁ + E·λ` for every simplex dimension `K`: the measure, the default normal
 #     and the unit-simplex quadrature rules.
 #   * Automatic subdivision of user cells against every level's grid (segments via per-axis parameter crossings,
-#     triangles via single-plane Sutherland–Hodgman splits + fan triangulation).
+#     triangles via single-plane Sutherland–Hodgman splits + fan triangulation). The polygon split is a clean-room
+#     implementation of one pass of the clipper of
+#
+#       I. E. Sutherland, G. W. Hodgman, "Reentrant polygon clipping",
+#       Commun. ACM 17 (1974) 32–42, doi:10.1145/360767.360802.
 #   * `SimplexRegion{D,T}` — one per sub-cell: the region record of `intersections.jl` in the sub-cell's bounding-box
 #     frame, carrying the mapped rule, the sub-cell's normal and the constant covering-parent list.
 #   * `_simplex_regions` — the one builder that ties subdivision + quadrature + parent classification together, for an
@@ -385,13 +389,13 @@ function _subdivide_triangle(v1::SVector{D,T}, v2::SVector{D,T}, v3::SVector{D,T
 end
 
 # Split a convex polygon at the plane `x[d] = c` through its interior into the parts below and above it: one
-# Sutherland–Hodgman pass against a single plane that keeps both sides (I. E. Sutherland, G. W. Hodgman, "Reentrant
-# polygon clipping", Commun. ACM 17 (1974) 32–42, doi:10.1145/360767.360802). Walking the edges in order, a vertex goes
-# to the side it lies on, and to both when it lies on the plane; an edge that crosses the plane strictly puts its
-# crossing point on both sides, between its endpoints. The crossing is interpolated from the edge's lower endpoint
-# along `d`, so two triangles sharing an edge compute the same points on it, and then set exactly onto the plane: the
-# two sides meet along it with neither a gap nor an overlap, and a piece split at `c` ends exactly at `c`. Both sides
-# of a convex polygon are convex, in the input's vertex order, and have at most one vertex more than it.
+# Sutherland–Hodgman pass against a single plane that keeps both sides (Sutherland & Hodgman 1974, see the file header).
+# Walking the edges in order, a vertex goes to the side it lies on, and to both when it lies on the plane; an edge that
+# crosses the plane strictly puts its crossing point on both sides, between its endpoints. The crossing is interpolated
+# from the edge's lower endpoint along `d`, so two triangles sharing an edge compute the same points on it, and then set
+# exactly onto the plane: the two sides meet along it with neither a gap nor an overlap, and a piece split at `c` ends
+# exactly at `c`. Both sides of a convex polygon are convex, in the input's vertex order, and have at most one vertex
+# more than it.
 function _split_polygon(polygon::Vector{SVector{D,T}}, d::Int, c::T) where {D,T}
     below = sizehint!(SVector{D,T}[], length(polygon) + 1)
     above = sizehint!(SVector{D,T}[], length(polygon) + 1)

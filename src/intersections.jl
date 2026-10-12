@@ -181,7 +181,8 @@ Fields:
   - `regions::Vector{VolumeRegion{D,T}}` — every region the assembly will see, in construction order (see
     [`Region`](@ref): each carries its box corners, its parents, its `kind` and its rule).
   - `small_overlaps::Vector{SmallOverlap{T}}` — diagnostic records for every region whose volume fell below the
-    plan's `tolerance.small_volume`; [`AssemblyDiagnostics`](@ref) reports their number as `small_overlap_count`.
+    `small_volume` of the `tolerance` the plan was built with; [`AssemblyDiagnostics`](@ref) reports their number as
+    `small_overlap_count`.
   - `min_volume::T` — the smallest region volume in `regions`, or zero if `regions` is empty.
   - `min_relative_volume::T` — `min_volume / volume(V.domain)`.
   - `moment_fit_residual_max::Float64` — the largest NNMF moment-fit residual observed across all `:cut_fitted`,
@@ -257,8 +258,8 @@ _cell_range(_, cells::CartesianIndices) = cells
 # every read into a dynamic dispatch. In that form this single variable accounted for 95% of `integration_plan`'s
 # allocations, on a path `prepare`, `move!` and `activate!` all run. The helpers restore the separation the compiler
 # needs: every frame that *closes over* `hi` receives it as an argument and never writes it, and the frames that write
-# it (`_extend_axis`, and `_partition`, which turns it into ranges with `map(:, …)` rather than a closure) close over
-# nothing. Do not fold them back inline.
+# it (`_extend_axis`, and `_partition`, which turns it into ranges with `map(:, …)` rather than a closure) never close
+# over it. Do not fold them back inline.
 
 function _partition(emit, levels::Tuple, free::NTuple{F,Int}, anchor::SVector{D,T}, tol::GeometryTolerance{T},
                     cells::Tuple=map(_ -> _AllCells(), levels)) where {F,D,T}

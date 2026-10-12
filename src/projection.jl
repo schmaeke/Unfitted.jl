@@ -270,7 +270,8 @@ function _transfer_regions(source_model::Model{D,T}, target_model::Model{D,T};
     return regions
 end
 
-# The first `K` slots of a signature (the `K` levels of `first`) and the rest, as tuples of compile-time length.
+# A signature split after its first `K` slots — those of the `K` levels passed as the second argument, the source
+# levels — into the two sides' halves, as tuples of compile-time length.
 function _split_signature(sig::NTuple{N,Int}, ::NTuple{K,Any}) where {N,K}
     (ntuple(i -> sig[i], Val(K)), ntuple(i -> sig[K + i], Val(N - K)))
 end

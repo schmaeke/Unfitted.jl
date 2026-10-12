@@ -419,11 +419,11 @@ end
 # per-cell order let a region span cells of different orders, and anything less would under-integrate the finest of
 # them.
 #
-# That makes the rule exact where the restricted level set is piecewise affine — one planar leaf, or several meeting at
-# a corner strictly *inside* the face box, where the quadrature kernel's pair leaves put a base breakpoint (`_PairLeaf`
-# in `implicit.jl`; a face cut by two planes meeting inside it comes out exact to round-off) — and accurate to the
-# reported residual and the kernel's approximation where it curves: never exact on a curved cut, which is why nothing
-# here promises exactness there. `boundary`'s docstring states the condition for the public reader.
+# That makes the rule exact where every restricted leaf is affine (planar) — one planar leaf, or several meeting at a
+# corner strictly *inside* the face box, where the quadrature kernel's pair leaves put a base breakpoint (`_PairLeaf` in
+# `implicit.jl`; a face cut by two planes meeting inside it comes out exact to round-off) — and accurate to the reported
+# residual and the kernel's approximation where it curves: never exact on a curved cut, which is why nothing here
+# promises exactness there. `boundary`'s docstring states the condition for the public reader.
 function _boundary_facet_regions(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}, tol::GeometryTolerance{T},
                                  rules::_TensorRuleCache{D,T}=_TensorRuleCache{D,T}()) where {D,T}
     free_axes = _free_axes(sides, Val(D))

@@ -82,8 +82,9 @@ Fields:
     two vectors line up entry-for-entry only when every space carries exactly one field (the common case). Two fields
     over one space give this vector twice the length of that one.
   - `cut_region_count::Int`, `fit_failure_count::Int`, `moment_fit_residual_max::Float64` — FCM moment-fit statistics
-    from the integration plan. `fit_failure_count` counts every cut region whose fit missed `_FIT_FAILURE_RESIDUAL`,
-    whatever rule the region ended up carrying.
+    from the integration plan. `fit_failure_count` counts every cut region whose fit missed the failure threshold
+    `_FIT_FAILURE_RESIDUAL · ‖m‖` (relative to the norm of the cell's moment vector, so the verdict does not depend on
+    the cell's size), whatever rule the region ended up carrying.
   - `cut_fallback_count::Int`, `cut_fallback_points::Int` — the subset of those failures that fell back to the raw Saye
     volume rule (`:cut_fallback`), and the total number of quadrature points those regions carry. A successful fit
     yields ≈ nbasis points, so the second number is the price of the safety net; a nonzero count means the mesh is too
@@ -126,9 +127,9 @@ Fields:
     and no rule at all where `Ω ∩ face` carries none (`:cut_failed` / `:cut_alpha_failed`). The residual bounds the
     fit's own compression error — how well the returned rule reproduces the moments the quadrature kernel handed it —
     and is zero on a model with no cut face. It does **not** bound the kernel's error on those moments, a separate and
-    silent ceiling: the moments are exact where the level set restricted to the face is piecewise affine (corners
-    strictly inside the face box included) and on one-dimensional facets, and accurate rather than exact on a curved
-    cut, as [`boundary`](@ref)'s docstring details.
+    silent ceiling: the moments are exact where every leaf of the level set restricted to the face is affine (planar),
+    corners where several meet strictly inside the face box included, and on one-dimensional facets, and accurate
+    rather than exact on a curved cut, as [`boundary`](@ref)'s docstring details.
 
     Read a nonzero `facet_fit_failure_count` with `facet_moment_fit_residual_max` beside it, because the two name
     different situations and only one is a warning. A *tangency* — `∂Ω` touching a face without crossing it — classifies
@@ -296,16 +297,16 @@ end
 # see — and independent of the rule itself, which is no longer a plain tensor product exactly on the faces it reports.
 #
 # Why the facet count is worth reporting at all (`trimmed`, summed over every cached selector, so a region two selectors
-# share is counted once per selector, exactly as `facet_region_count` is). The grid-aligned facet
-# *partition* is level-set-blind: `_boundary_facet_regions` selects its contributing levels with
-# `_level_side_is_physical` — pure mesh-edge versus domain-edge geometry — and partitions the face over `_side_cells`.
-# A `FacetRegion` is therefore the *whole* grid-aligned face of its parent cells, and where that face leaves Ω the rule
-# on it is the moment fit on the facet's affine slice of Ω rather than an exact tensor product. Every consumer of a
-# facet region inherits that: the L² Dirichlet mass and right-hand side, a Neumann / Robin / Nitsche term placed with
-# `on = boundary(…)`, and `boundary_integral`. That fit is machine-exact where the restricted level set is piecewise
-# affine and accurate rather than exact on a curved cut (`boundary`'s docstring states the condition), so the count says
-# how much of a model's boundary integration rests on a fitted rule, and `residual_max` says how well those fits
-# reproduced the moments they were given — not how right those moments were.
+# share is counted once per selector, exactly as `facet_region_count` is). The grid-aligned facet *partition* is
+# level-set-blind: `_boundary_facet_regions` selects its contributing levels with `_level_side_is_physical` — pure
+# mesh-edge versus domain-edge geometry — and partitions the face over `_side_cells`. A `FacetRegion` is therefore the
+# *whole* grid-aligned face of its parent cells, and where that face leaves Ω the rule on it is the moment fit on the
+# facet's affine slice of Ω rather than an exact tensor product. Every consumer of a facet region inherits that: the L²
+# Dirichlet mass and right-hand side, a Neumann / Robin / Nitsche term placed with `on = boundary(…)`, and
+# `boundary_integral`. That fit is machine-exact where every restricted leaf is affine (planar) and accurate rather than
+# exact on a curved cut (`boundary`'s docstring states the condition), so the count says how much of a model's boundary
+# integration rests on a fitted rule, and `residual_max` says how well those fits reproduced the moments they were
+# given, not how right those moments were.
 #
 # The classification is of the region's own *face*, not of its parent cells, and the distinction is not academic: a cut
 # cell can have a face lying wholly inside Ω, and no trimming is needed there. Classifying the cells would make the

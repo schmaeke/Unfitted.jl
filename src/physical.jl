@@ -47,6 +47,11 @@ must accept `ForwardDiff.Dual` arguments so the quadrature kernel can take its g
 (`physical_domain` → `moment_fit_rule`) installs no gradient override, and the `grad` keyword of
 [`implicit_volume_quadrature`](@ref) is reachable only by calling that kernel directly.
 
+`f` must also be safe to call from several threads at once — a pure function of `x` is. The package fits the
+quadrature of cut cells and of cut boundary faces on every thread, and those fits evaluate the leaves concurrently; a
+custom `cut_quadrature` (see [`PhysicalDomain`](@ref)) replaces only the cell fits and is itself called serially, so
+the face fits still evaluate the leaves on several threads.
+
 `lipschitz` is the Lipschitz constant used by the sign certificate of both the cell classifier and the implicit
 quadrature kernel; `1.0` for a true signed-distance leaf, `Inf` to rely on corner sampling. Supplying it is what lets a
 feature smaller than a mesh cell survive: under `Inf` the kernel can prune such a leaf on the cell box and integrate the
@@ -239,7 +244,9 @@ The rule must also be a deterministic function of its three arguments: results a
 plan rebuild, so a rule reading mutable state outside its arguments is captured at its first answer for a box and
 silently reused — across rebuilds, not merely within one. Put every knob in the callable itself; that is what makes the
 rule reproducible. The package does not run a custom rule on several threads, unlike its own fit: `_fit_rules` in
-`src/intersections.jl` fits custom rules serially, because they are caller code under no thread-safety contract.
+`src/intersections.jl` fits custom rules serially, because they are caller code under no thread-safety contract. The
+leaves are another matter: the package's own fits of cut boundary faces, which never consult the custom rule, still
+evaluate them on several threads (see [`leaf`](@ref)).
 `residual` is reported verbatim through `diagnostics(model).moment_fit_residual_max`.
 
 A region built from a custom rule is tagged `:cut_custom` (see `_trimmed_rule` in `src/intersections.jl`) —
