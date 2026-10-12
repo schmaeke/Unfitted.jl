@@ -407,12 +407,8 @@ _normalize_order(n::Integer, ::CartesianMesh{D}) where {D} = _axis_int_tuple(n, 
 
 _normalize_order(t::NTuple{D,<:Integer}, ::CartesianMesh{D}) where {D} = _axis_int_tuple(t, Val(D), :order)
 
-function _normalize_order(a::AbstractArray{<:Integer,D}, mesh::CartesianMesh{D}) where {D}
-    size(a) == mesh.cells || throw(DimensionMismatch("order shape $(size(a)) does not match mesh cells $(mesh.cells)"))
-    return _collapse_order(vec([_axis_int_tuple(a[ci], Val(D), :order) for ci in cell_indices(mesh)]))
-end
-
-function _normalize_order(a::AbstractArray{<:NTuple{D,<:Integer},D}, mesh::CartesianMesh{D}) where {D}
+function _normalize_order(a::Union{AbstractArray{<:Integer,D},AbstractArray{<:NTuple{D,<:Integer},D}},
+                          mesh::CartesianMesh{D}) where {D}
     size(a) == mesh.cells || throw(DimensionMismatch("order shape $(size(a)) does not match mesh cells $(mesh.cells)"))
     return _collapse_order(vec([_axis_int_tuple(a[ci], Val(D), :order) for ci in cell_indices(mesh)]))
 end
