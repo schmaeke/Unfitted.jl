@@ -497,6 +497,19 @@ function _certified_leaves(leaves::AbstractVector, lipschitz)
     return Any[_certified(f, L) for (f, L) in zip(leaves, lipschitz)]
 end
 
+# The leaf list with every repeat dropped, first occurrences in order. A CSG tree may name one leaf twice — (a ∩ b) ∪
+# (a ∩ c) for a ∩ (b ∪ c) — and `_leaves` lists it once per occurrence. A repeat adds nothing to the partition, but two
+# copies of one leaf would get a pair leaf (`_base_leaves`) that vanishes identically, whose round-off scatters
+# breakpoints over the base, and the copies' pair leaves with a third leaf would pair up again one reduction further
+# down. Identity (`===`) is the test, so wrappers of one callback with one Lipschitz constant are the same leaf.
+function _distinct(leaves::Vector{Any})
+    distinct = Any[]
+    for g in leaves
+        any(h -> h === g, distinct) || push!(distinct, g)
+    end
+    return distinct
+end
+
 """
     implicit_volume_quadrature(leaves, membership, region; gauss_points,
                                grad=nothing, max_subdiv=4, lipschitz=nothing)
@@ -545,7 +558,7 @@ leaves active per box.
 function implicit_volume_quadrature(leaves::AbstractVector, membership, region::AxisBox{D,T}; gauss_points::Int,
                                     grad=nothing, max_subdiv::Int=4, lipschitz=nothing) where {D,T}
     ctx = _quad_ctx(T, gauss_points, grad, max_subdiv, maximum(region.upper - region.lower))
-    return _implicit_quad(_certified_leaves(leaves, lipschitz), membership, region, ctx, 0)
+    return _implicit_quad(_distinct(_certified_leaves(leaves, lipschitz)), membership, region, ctx, 0)
 end
 
 function implicit_volume_quadrature(phi, region::AxisBox{D,T}; gauss_points::Int, grad=nothing, max_subdiv::Int=4,

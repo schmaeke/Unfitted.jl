@@ -367,3 +367,21 @@ end
     region = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
     @test (@inferred Unfitted._choose_axis(Any[x -> x[1] + 2x[2] - 1], region, ctx)) == (2, true, [:monotone])
 end
+
+@testset "implicit quadrature — a leaf named twice in a CSG tree is integrated once" begin
+    # Ω = a ∩ (b ∪ c) spelled (a ∩ b) ∪ (a ∩ c) lists the sphere `a` twice. The kernel drops the repeat, so both
+    # spellings give the same rule. Two copies of one leaf got a pair leaf that vanishes identically and scattered
+    # breakpoints over its round-off: 2.6× the points in 2D (8² cells, q = 6) and 7.4× in 3D (4³, q = 5), where pairs of
+    # such pairs follow.
+    for D in (2, 3)
+        c0 = SVector(ntuple(_ -> 0.5, D))
+        a = leaf(x -> norm(x - c0) - 0.37; lipschitz=1.0)
+        nb, nc = normalize(SVector(ntuple(i -> 0.3 + 0.2i, D))), normalize(SVector(ntuple(i -> 0.9 - 0.25i, D)))
+        b = leaf(x -> dot(nb, x - c0) - 0.05; lipschitz=1.0)
+        c = leaf(x -> dot(nc, x - c0) + 0.02; lipschitz=1.0)
+        n = D == 2 ? 8 : 2
+        rules(geom) = [_csg_rule(geom, box((Tuple(I) .- 1) ./ n, Tuple(I) ./ n); gp=5, ms=4, certified=true)
+                       for I in CartesianIndices(ntuple(_ -> n, D))]
+        @test rules(union(intersect(a, b), intersect(a, c))) == rules(intersect(a, union(b, c)))
+    end
+end
