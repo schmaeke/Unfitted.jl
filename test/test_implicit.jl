@@ -16,6 +16,16 @@ const _IVQ = Unfitted.implicit_volume_quadrature
     end
 end
 
+@testset "implicit quadrature — a fiber root is bracketed by signs, not by a product" begin
+    # Scaling a leaf by a positive constant does not move Ω = {φ ≤ 0}. A scan that detects a crossing by `f(a)·f(b) < 0`
+    # loses the root once the two samples are small: at a scale of 1e-170 the product, about 1e-342, underflows to zero,
+    # no breakpoint is placed, and the whole fiber [0, 1] is classified by its midpoint — outside Ω, so the rule comes
+    # back empty instead of integrating [0, 0.3].
+    rule = _IVQ(x -> 1e-170 * (x[1] - 0.3), box((0.0,), (1.0,)); gauss_points=2)
+    @test _quad(x -> 1.0, rule) ≈ 0.3 atol = 1e-15
+    @test _quad(x -> x[1], rule) ≈ 0.3^2 / 2 atol = 1e-15
+end
+
 @testset "implicit quadrature — 2D axis-aligned cut moments are exact" begin
     # Ω = {x ≤ a} on [0, 1]², independent of y. ∫∫ xᵐ yⁿ = a^(m+1)/(m+1) · 1/(n+1).
     a = 0.4

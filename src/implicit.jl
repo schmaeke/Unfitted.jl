@@ -224,11 +224,13 @@ function _fiber_breaks(lsets, embed, lo::T, hi::T, ctx::_QuadCtx) where {T}
         for s in 1:M
             tcur = s == M ? hi : lo + (hi - lo) * (T(s) / M)
             fcur = g(embed(tcur))
-            # A root landing exactly on a scan sample makes `fprev*fcur` vanish, so the strict sign-change test below
-            # would miss it; the sample is itself the breakpoint.
+            # A root landing exactly on a scan sample is itself the breakpoint. Any other crossing is a strict sign
+            # change between neighbouring samples, read from the two signs: the product `fprev * fcur` underflows to
+            # zero once both values are below about 1e-162 in magnitude, which would hide the root of a leaf that is
+            # merely scaled down (Ω = {φ ≤ 0} does not depend on the scale of φ).
             if fcur == 0
                 push!(breaks, tcur)
-            elseif fprev * fcur < 0
+            elseif (fprev < 0 < fcur) || (fcur < 0 < fprev)
                 push!(breaks, _bisect(t -> g(embed(t)), tprev, tcur, fprev, fcur))
             end
             tprev, fprev = tcur, fcur
