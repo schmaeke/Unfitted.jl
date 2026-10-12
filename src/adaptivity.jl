@@ -580,9 +580,10 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     # A pure ratio, so it is as scale-free as the residual it reads. Flooring the denominator at an absolute
     # `eps(T)`, as this once did, made it a function of the data's units: on a 4² order-2 Poisson problem it read
     # 7.06e-4 with the source scaled by 1 or 1e-4, but 3.54e-5 at 1e-8 and 3.54e-7 at 1e-10, for the same relative
-    # residual. The two edge cases follow the ratio: nothing left on `W` while `V` carries a residual is infinitely
-    # inconsistent, and nothing left on either (zero data) is perfectly consistent.
-    consistency = residual_W > 0 ? sqrt(residual_V / residual_W) : (residual_V > 0 ? T(Inf) : zero(T))
+    # residual. The ratio itself gives `Inf` where nothing is left on `W` while `V` carries a residual, and NaN where a
+    # residual is NaN, as it is in the total. The one case it leaves undefined, nothing left on either side (zero data),
+    # is perfectly consistent.
+    consistency = iszero(residual_V) && iszero(residual_W) ? zero(T) : sqrt(residual_V / residual_W)
     return ErrorEstimate{D,T}(cells, total, reference, consistency)
 end
 

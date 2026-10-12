@@ -112,6 +112,19 @@ end
     @test nothing_left.consistency == 0 && nothing_left.total == 0
 end
 
+@testset "consistency carries a NaN residual through" begin
+    # The ratio's two edge cases are exact zeros. A NaN residual, as a diverged solve leaves, is neither, and reads as
+    # NaN like the total beside it. Taken for an edge case, it came back as 0, "perfectly consistent".
+    V = space(_AD_Ω; cells=4, order=2)
+    model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    solve!(model)
+    diverged = Solution(fill(NaN, active_unknowns(model)), model.version,
+                        Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    est = estimate(model, diverged)
+    @test isnan(est.total)
+    @test isnan(est.consistency)
+end
+
 @testset "estimate charges every component of a vector field" begin
     # The attribution used to read `active_cell_dofs` at its default component, so on a vector-valued field it measured
     # component 1 and nothing else. A two-component problem whose datum sits on component 2 then came back with
