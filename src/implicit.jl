@@ -406,6 +406,24 @@ function _subdivide_and_collect(recurse, U::AxisBox{D,T}) where {D,T}
     return pts, wts
 end
 
+# The leaves of the base problem of one reduction along axis `k` of a box spanning `[lo, hi]` on it: every active leaf's
+# restrictions to the two faces x_k = lo and x_k = hi, which resolve the projection boundary and every change of fiber
+# topology on the faces, then one pair leaf per two leaves monotone along `k` that are not siblings, for the crossings
+# inside the box (`_PairLeaf`, `_siblings`). `classes` are the leaves' classes along `k` (`_choose_axis`).
+function _base_leaves(active, classes, k::Int, lo::T, hi::T) where {T}
+    base = Any[]
+    for g in active
+        push!(base, _restrict(g, k, lo), _restrict(g, k, hi))
+    end
+    monotone = active[classes .=== :monotone]
+    h = cbrt(eps(T)) * (hi - lo)
+    for i in eachindex(monotone), j in (i+1):lastindex(monotone)
+        _siblings(monotone[i], monotone[j]) && continue
+        push!(base, _FDLeaf(_PairLeaf{T}(monotone[i], monotone[j], k, lo, hi), h))
+    end
+    return base
+end
+
 # Recursively integrate over Ω ∩ U. `lsets` is the list of leaf callbacks to partition by; `membership(x)` tests x ∈ Ω
 # at a full-dimensional point. The original problem starts from the domain's leaves and its membership predicate; each
 # reduction passes the leaves' face restrictions as a partition-only base problem (`Returns(true)` membership) and
@@ -442,22 +460,9 @@ function _implicit_quad(lsets, membership, U::AxisBox{D,T}, ctx::_QuadCtx, depth
     end
 
     # Reduce one dimension: partition-only base, then a fiber rule per base node.
-    Ub = _remove_axis(U, k)
     facelo, facehi = U.lower[k], U.upper[k]
-    base = Any[]
-    for g in active
-        push!(base, _restrict(g, k, facelo))
-        push!(base, _restrict(g, k, facehi))
-    end
-    # Crossings inside the box: one pair leaf per two leaves monotone along the height axis that are not siblings
-    # (`_PairLeaf`, `_siblings`).
-    monotone = active[classes .=== :monotone]
-    h = cbrt(eps(T)) * (facehi - facelo)
-    for i in eachindex(monotone), j in (i+1):lastindex(monotone)
-        _siblings(monotone[i], monotone[j]) && continue
-        push!(base, _FDLeaf(_PairLeaf{T}(monotone[i], monotone[j], k, facelo, facehi), h))
-    end
-    bpts, bwts = _implicit_quad(base, Returns(true), Ub, ctx, 0)
+    base = _base_leaves(active, classes, k, facelo, facehi)
+    bpts, bwts = _implicit_quad(base, Returns(true), _remove_axis(U, k), ctx, 0)
 
     pts = SVector{D,T}[]
     wts = T[]
