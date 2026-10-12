@@ -6,6 +6,20 @@
     @test Unfitted.local_basis_count(basis, (2, 3)) == 12
 end
 
+@testset "local_basis_count is the size of the index set it counts" begin
+    # The count must refuse what the set refuses. Integrated Legendre needs order ≥ 1 on every axis (order 0 leaves one
+    # endpoint mode, not a partition of unity); the count used to answer `prod(order .+ 1)` there regardless.
+    basis = IntegratedLegendre()
+    @test_throws ArgumentError Unfitted.local_basis_count(basis, (0, 0))
+    @test_throws ArgumentError Unfitted.local_basis_count(basis, (2, 0))
+    @test_throws ArgumentError Unfitted.local_basis_count(basis, (0, 2), :tensor)
+    for order in ((1,), (2, 3), (1, 2, 3), (4, 4, 4))
+        @test Unfitted.local_basis_count(basis, order) ==
+              length(Unfitted.local_basis_indices(basis, order)) ==
+              prod(order .+ 1)
+    end
+end
+
 @testset "integrated Legendre 1D" begin
     for ξ in (-1.0, -0.3, 0.2, 1.0)
         @test Unfitted.integrated_legendre_value(0, ξ) ≈ (1.0 - ξ) / 2

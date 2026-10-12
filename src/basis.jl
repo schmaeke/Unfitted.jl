@@ -172,13 +172,15 @@ recommended_quadrature_order(::BasisFamily, order::NTuple{D,Int}) where {D} = nt
     local_basis_count(basis, order)         -> Int
     local_basis_count(basis, order, mode)   -> Int
 
-Number of local basis functions on a single cell. The two-argument form is the tensor count `prod(order .+ 1)`, a
-`::BasisFamily` default for tensor-product families. The three-argument form takes a basis mode and counts the index set
-that mode selects, so it tracks [`local_basis_indices`](@ref) by construction: for integrated Legendre `:trunk` counts
-the multi-indices passing the trunk-degree filter (see [`IntegratedLegendre`](@ref)). A family that supports only some
-modes says so through `_supported_modes`, not by counting.
+Number of local basis functions on a single cell: the size of the matching [`local_basis_indices`](@ref) set, in both
+forms, so the count validates exactly what the set validates and cannot describe a set the family does not have —
+integrated Legendre refuses an order below 1 on any axis here as it does there. The two-argument form counts the
+`:tensor` set, `prod(order .+ 1)` on every shipped family. The three-argument form takes a basis mode and counts the
+index set that mode selects: for integrated Legendre `:trunk` counts the multi-indices passing the trunk-degree filter
+(see [`IntegratedLegendre`](@ref)). A family that supports only some modes says so through `_supported_modes`, not by
+counting.
 """
-local_basis_count(::BasisFamily, order::NTuple{D,Int}) where {D} = prod(ntuple(i -> order[i] + 1, D))
+local_basis_count(basis::BasisFamily, order::NTuple{D,Int}) where {D} = length(local_basis_indices(basis, order))
 
 function local_basis_count(basis::BasisFamily, order::NTuple{D,Int}, mode::Symbol) where {D}
     return length(local_basis_indices(basis, order, mode))
