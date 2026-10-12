@@ -55,6 +55,17 @@ end
     @test mesh(box((0 // 1,), (1 // 1,)); cells=3).axes[1] == [0, 1 // 3, 2 // 3, 1]
 end
 
+@testset "moved_space names an out-of-range level index" begin
+    # A level past the last one is an index error, not the base level: the message must say so, as every other entry
+    # point that takes a level index does. The base level itself keeps its own refusal.
+    V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=4), box((0.25, 0.25), (0.75, 0.75)); cells=2)
+    to = box((0.2, 0.2), (0.7, 0.7))
+    @test_throws "out of bounds" moved_space(V; level=5, to)
+    @test_throws "out of bounds" moved_space(V; level=0, to)
+    @test_throws "only overlay levels" moved_space(V; level=1, to)
+    @test moved_space(V; level=2, to).levels[2].mesh.domain == to
+end
+
 @testset "_level_by_id resolves every level and rejects an unknown id" begin
     # The lookup recurses over the level tuple (see its comment in mesh.jl); pin its contract on a three-level ladder.
     V = ladder(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=2, depth=2, splits=2)

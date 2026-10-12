@@ -908,9 +908,10 @@ Return a copy of `V` with overlay `level` (its `level`-th level, which must be a
 be moved. This is the space-level building block behind [`move!`](@ref) and [`moved`](@ref).
 """
 function moved_space(V::Space{D,T}; level::Integer, to::AxisBox{D,T}, tolerance=GeometryTolerance(T)) where {D,T}
-    1 < level <= length(V.levels) || throw(ArgumentError("only overlay levels can be moved"))
+    # The range check first, so an index past the last level is named as such rather than reported as the base level.
+    k = _check_level(V, level)
+    k > 1 || throw(ArgumentError("only overlay levels can be moved"))
     is_inside(to, V.domain, tolerance) || throw(ArgumentError("overlay domain must lie inside the physical domain"))
-    k = Int(level)
     old = V.levels[k]
     # The order field is indexed by cell and a move keeps the cell grid identical — only the coordinates change — so it
     # carries over verbatim. `_level` re-instantiates the family against the moved mesh, which is what a mesh-dependent
