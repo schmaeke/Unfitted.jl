@@ -244,7 +244,9 @@ _collapse_mask(on::BitArray) = all(on) ? nothing : on
 #
 #   * `nothing` — every cell, the reading `nothing` has in `active =`, `dilate`, `ladder` and the mutators alike;
 #   * an `AbstractArray{Bool,D}` shaped like the cell grid, a `LevelMask{D}` (a `BitArray`) included — copied, so a
-#     later mutation of the argument cannot reach a level;
+#     later mutation of the argument cannot reach a level. A `Bool` array of any other shape, of another dimension
+#     included, is one mistake and is refused as one, naming both shapes: had the method required the mesh's
+#     dimension, an array of another one would reach the iterable fallback and be refused for its `Bool` entries;
 #   * a predicate `(cell_box, cell_index) -> Bool` — evaluated once per cell;
 #   * an iterable of `CartesianIndex{D}` — the listed cells, each type- and bounds-checked.
 #
@@ -255,7 +257,7 @@ _collapse_mask(on::BitArray) = all(on) ? nothing : on
 # the caller may keep or mutate.
 _selection(::Nothing, mesh::CartesianMesh) = trues(mesh.cells)
 
-function _selection(bits::AbstractArray{Bool,D}, mesh::CartesianMesh{D}) where {D}
+function _selection(bits::AbstractArray{Bool}, mesh::CartesianMesh)
     size(bits) == mesh.cells ||
         throw(DimensionMismatch("selector shape $(size(bits)) does not match mesh cells $(mesh.cells)"))
     on = BitArray(undef, mesh.cells)

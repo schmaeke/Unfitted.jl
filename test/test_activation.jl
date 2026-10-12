@@ -41,6 +41,19 @@ using SparseArrays
     @test_throws ArgumentError Unfitted._normalize_mask([(1, 1)], mesh)
 end
 
+@testset "a selection array of another dimension is refused as a shape mismatch" begin
+    # A `Bool` array selects by shape whatever its dimension, so one of the wrong dimension is the same mistake as one
+    # of the wrong size and is refused the same way, naming both shapes. It used to reach the iterable path and be
+    # refused for its `Bool` entries, which describes a different mistake.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    V = space(omega; cells=4)
+    @test_throws DimensionMismatch Unfitted._normalize_mask(trues(16), V.levels[1].mesh)
+    @test_throws "does not match mesh cells (4, 4)" space(omega; cells=4, active=trues(16))
+    @test_throws DimensionMismatch space(omega; cells=4, active=trues(4, 4, 1))
+    @test_throws DimensionMismatch adapt(V, 1 => trues(4, 4, 1))
+    @test_throws DimensionMismatch dilate(V, trues(16); level=1, by=1)
+end
+
 @testset "is_active predicate" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     mesh = Unfitted.CartesianMesh(omega; cells=(2, 2))
