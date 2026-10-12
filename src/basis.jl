@@ -129,9 +129,7 @@ end
 
 IntegratedLegendre() = IntegratedLegendre(false)
 
-function Base.show(io::IO, b::IntegratedLegendre)
-    print(io, b.trunk ? "IntegratedLegendre() (mode=:trunk)" : "IntegratedLegendre()")
-end
+Base.show(io::IO, b::IntegratedLegendre) = print(io, "IntegratedLegendre()", b.trunk ? " (mode=:trunk)" : "")
 
 """
     basis_name(basis) -> Symbol
@@ -211,9 +209,7 @@ local_basis_count(basis::BasisFamily, order::NTuple{D,Int}) where {D} = length(l
 # mode the family does not carry is refused naming the family and the one mode it serves, so a family needs no
 # hand-written mode guard of its own. The keyword always wins: an integrated-Legendre family handed in with one mode and
 # asked for the other gets the other. `_mode` reads the mode back, for display, the pin and the diagnostics report.
-function _known_mode(mode::Symbol)
-    mode in (:tensor, :trunk) ? mode : throw(ArgumentError("basis mode must be :tensor or :trunk"))
-end
+_known_mode(m::Symbol) = m in (:tensor, :trunk) ? m : throw(ArgumentError("basis mode must be :tensor or :trunk"))
 
 function _with_mode(basis::BasisFamily, mode::Symbol)
     _known_mode(mode) === :tensor && return basis
