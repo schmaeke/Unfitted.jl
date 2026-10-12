@@ -223,6 +223,13 @@ end
 # against a dof lookup per declared cell: `cell_dofs` allocates nothing, since it returns the layout's own vector, but
 # it is still a table read per cell, and on such a level almost every one of them comes back empty. `estimate` builds
 # the list once per level and walks it in both sweeps.
+#
+# The list has one of two shapes, the lazy grid of an unmasked level or the vector of a masked one, and `_LiveCells`
+# names the pair. `estimate` holds its lists in a vector of that `Union`, so a cell drawn from one is a concrete
+# `CartesianIndex` and the per-cell loop splits on the two shapes, where the alternative, one shape for both, would
+# materialise every cell of an unmasked level.
+const _LiveCells{D} = Union{CartesianIndices{D,NTuple{D,Base.OneTo{Int}}},Vector{CartesianIndex{D}}}
+
 function _live_cells(level::Level)
     level.mask === nothing ? cell_indices(level.mesh) : CartesianIndices(level.mask.on)[level.mask.on]
 end
@@ -490,16 +497,19 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     #
     # Both sweeps address a level's cell tables by its level *id*, as `cell_dofs` is keyed; the attribution sweep keeps
     # the position `j` for `charge`, which follows `enriched.levels`. The two coincide on a single-domain space, the
-    # only kind `estimate` accepts, but only the id is the table's key. The id is read once per level: the enriched
-    # space is built at run time, so `level` is not concretely typed here, and reading `level.id` per cell cost one
-    # allocation per cell (measured +6 020 on a depth-5 ladder).
-    live_cells = [_live_cells(level) for level in enriched.levels]
+    # only kind `estimate` accepts, but only the id is the table's key.
+    #
+    # Each level's id and live cells are read once, into the typed vectors `ids` and `live_cells`, and the sweeps read
+    # nothing else off a level. That is what keeps the per-cell loops free of dynamic dispatch. `V⁺` is built at run
+    # time, so `enriched` is not concretely typed here and neither is anything read off one of its levels. A cell or an
+    # id taken from there was `Any`, and every `cell_dofs`, `_coarse_cell` and `cells[k][…] +=` below then dispatched
+    # at run time: about 12 allocations per live cell, 70 % of all that `estimate` allocated on a 32² order-2 Poisson
+    # problem.
+    ids = Int[level.id for level in enriched.levels]
+    live_cells = _LiveCells{D}[_live_cells(level) for level in enriched.levels]
     incidence = zeros(Int, length(plus_keys))
-    for (j, level) in enumerate(enriched.levels)
-        id = level.id
-        for cell in live_cells[j], raw in cell_dofs(plus_field.dofs, id, cell)
-            incidence[raw] += 1
-        end
+    for j in eachindex(ids), cell in live_cells[j], raw in cell_dofs(plus_field.dofs, ids[j], cell)
+        incidence[raw] += 1
     end
 
     # The attribution sweep, each level charged where `charge` says. A twin carries the complement modes of the level it
@@ -516,12 +526,11 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     cells = Array{T,D}[zeros(T, level.mesh.cells) for level in V.levels]
     counted = falses(length(residual))
     residual_V = residual_W = zero(T)
-    for (j, level) in enumerate(enriched.levels)
-        id = level.id
+    for j in eachindex(ids)
         k, factor = charge[j]
         for cell in live_cells[j]
             η² = zero(T)
-            raws = cell_dofs(plus_field.dofs, id, cell)
+            raws = cell_dofs(plus_field.dofs, ids[j], cell)
             for component in 1:plus_field.components, raw in raws
                 active = _field_component_dof(plus_field, raw, component)
                 active == 0 && continue                   # constrained away
