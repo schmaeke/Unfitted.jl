@@ -432,17 +432,32 @@ end
 # recurrences read the same knots and share their loads and differences: the optimised code of this method has fewer
 # floating-point operations than it had with the copies (30 against 76 multiplications, divisions and subtractions on a
 # 3D degree-2 level), with every result bit for bit the same.
+#
+# The loop over the axes is unrolled at compile time (`ntuple` over `Val(D)`), so each `family.spaces[d]` is read at a
+# constant index. The degree is a type parameter of `BSplineSpace`, so on a level whose degrees differ by axis the
+# spaces form a tuple of different types. A runtime index into it yields a space of no single concrete type, and the
+# tables `bsplinebasisall` returns then go through the heap on every call, once per parent per quadrature point in
+# assembly and transfer.
 function Unfitted._fill_factor_tables!(family::BSplineFamily{D}, val1d, der1d, order::NTuple{D,Int}, ξ::SVector{D},
                                        cell::CartesianIndex{D}) where {D}
-    @inbounds for d in 1:D
-        P, c = family.spaces[d], cell.I[d]
+    ntuple(Val(D)) do d
+        @inline
+        _fill_axis_tables!(family.spaces[d], cell.I[d], ξ[d], val1d[d], der1d === nothing ? nothing : der1d[d],
+                           order[d] + 1)
+    end
+    return nothing
+end
+
+# One axis of `_fill_factor_tables!` above: the `n` values of space `P` on span `c` at the reference coordinate `x`
+# into `vd`, and their `x`-derivatives into `dd` unless it is `nothing`.
+@inline function _fill_axis_tables!(P::BSplineSpace, c::Int, x, vd, dd, n::Int)
+    @inbounds begin
         knots, p = knotvector(P), degree(P)
         half_width = (knots[c + p + 1] - knots[c + p]) / 2
-        t = knots[c + p] + (ξ[d] + one(ξ[d])) * half_width
+        t = knots[c + p] + (x + one(x)) * half_width
         values = bsplinebasisall(P, c, t)
-        derivs = der1d === nothing ? nothing : bsplinebasisall(BSplineDerivativeSpace{1}(P), c, t)
-        vd, dd = val1d[d], der1d === nothing ? nothing : der1d[d]
-        for i in 1:(order[d]+1)
+        derivs = dd === nothing ? nothing : bsplinebasisall(BSplineDerivativeSpace{1}(P), c, t)
+        for i in 1:n
             vd[i] = values[i]
             dd === nothing || (dd[i] = derivs[i] * half_width)
         end

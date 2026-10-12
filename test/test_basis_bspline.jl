@@ -690,6 +690,41 @@ end
     end
 end
 
+# Bytes one warm call of the factor fill, and of the tensor-product kernel (values only when `grad === nothing`),
+# allocates; the first call of each compiles.
+function _bspline_fill_bytes(family, val1d, der1d, order, ξ, cell)
+    Unfitted._fill_factor_tables!(family, val1d, der1d, order, ξ, cell)
+    return @allocated Unfitted._fill_factor_tables!(family, val1d, der1d, order, ξ, cell)
+end
+function _bspline_kernel_bytes(family, values, ids, order, ξ, val1d, cell, grad)
+    kernel() = grad === nothing ? Unfitted._tensor_values!(family, values, ids, order, ξ, val1d, cell) :
+               Unfitted._tensor_values!(family, values, ids, order, ξ, val1d, cell, grad)
+    kernel()
+    return @allocated kernel()
+end
+
+@testset "BSpline extension: the hot kernel allocates nothing when the degrees differ by axis" begin
+    # The degree is a type parameter of each axis's `BSplineSpace`, so the family's tuple of spaces holds different
+    # types when the degrees differ by axis. The factor fill and the tensor-product kernel run once per parent per
+    # quadrature point in assembly and transfer and must not allocate there, on such a level as on an isotropic one.
+    for V in (space(box((-0.3, 0.2), (1.45, 0.9)); cells=(6, 5), order=(2, 3), basis=bspline()),
+              space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(4, 5, 3), order=(1, 2, 3), basis=bspline()))
+        level = V.levels[1]
+        order = Unfitted.nominal_order(level)
+        D = length(order)
+        cell = CartesianIndex(ntuple(_ -> 2, D))
+        ξ = SVector{D}(ntuple(d -> 0.3 - 0.2d, D))
+        ids = Unfitted.cell_basis_indices(level, cell)
+        val1d, der1d = Unfitted._factor_buffers(order, Float64), Unfitted._factor_buffers(order, Float64)
+        values, gradients = zeros(length(ids)), zeros(SVector{D,Float64}, length(ids))
+        grad = (gradients, SVector{D}(ntuple(_ -> 2.0, D)), der1d)
+        @test _bspline_fill_bytes(level.basis, val1d, der1d, order, ξ, cell) == 0
+        @test _bspline_kernel_bytes(level.basis, values, ids, order, ξ, val1d, cell, nothing) == 0
+        @test _bspline_fill_bytes(level.basis, val1d, nothing, order, ξ, cell) == 0
+        @test _bspline_kernel_bytes(level.basis, values, ids, order, ξ, val1d, cell, grad) == 0
+    end
+end
+
 @testset "BSpline extension: dof-key sharing across cells" begin
     # Two adjacent cells of the same level should share p = degree raw dofs along the shared axis.
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=3, basis=bspline())
