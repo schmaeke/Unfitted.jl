@@ -444,24 +444,19 @@ function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_
         shift = first(target_field.level_ids) - first(source_field.level_ids)
         target_raw_by_key = Dict((shift == 0 ? key : TensorDofKey(key.level - shift, key.axes)) => raw
                                  for (raw, key) in pairs(target_field.dofs.raw_keys))
-        for source_raw in eachindex(source_field.dofs.raw_keys)
-            source_key = source_field.dofs.raw_keys[source_raw]
+        for (source_raw, source_key) in pairs(source_field.dofs.raw_keys)
             target_raw = get(target_raw_by_key, source_key, 0)
             for c in 1:source_field.components
-                source_free = source_field.dofs.active_component[source_raw, c] != 0
-                if target_raw == 0
-                    backend.strict &&
-                        source_free &&
-                        throw(ArgumentError("Rewire: source active dof at key $(source_key) component $c has no " *
-                                            "target counterpart; pass `Rewire(strict=false)` to skip"))
-                    continue
-                end
-                target_active = target_field.dofs.active_component[target_raw, c]
+                # The target's active slot for this (raw, component), 0 where there is none to write: no counterpart,
+                # or one the target constrains. Either is an error only for a dof the source leaves free.
+                target_active = target_raw == 0 ? 0 : target_field.dofs.active_component[target_raw, c]
                 if target_active == 0
                     backend.strict &&
-                        source_free &&
-                        throw(ArgumentError("Rewire: source active dof at key $(source_key) component $c is " *
-                                            "constrained in the target"))
+                        source_field.dofs.active_component[source_raw, c] != 0 &&
+                        throw(ArgumentError("Rewire: source active dof at key $(source_key) component $c " *
+                                            (target_raw == 0 ?
+                                             "has no target counterpart; pass `Rewire(strict=false)` to skip" :
+                                             "is constrained in the target")))
                     continue
                 end
                 coefficients[target_field.offset+target_active] = dof_value(source_field, source_coefficients,
