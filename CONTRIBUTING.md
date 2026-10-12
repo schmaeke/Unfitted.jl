@@ -143,7 +143,7 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `implicit.jl`     | Saye dimension-reduction implicit quadrature on the level set (volume rules) |
 | `basis.jl`        | basis-family interface and capability traits, integrated Legendre default, the `:tensor` / `:trunk` index sets and the `_index_admissible` filter the minimum rule is expressed over, tensor-product evaluation |
 | `fcm.jl`          | finite-cell-method cut-cell quadrature: exact moments from `implicit.jl`, non-negative (NNLS) moment fit |
-| `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks (`LevelMask`) and per-cell polynomial order (`CellOrders` / `CellModes`); the `space` / `overlay` / `adapt` / `elevate` verbs |
+| `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks (`LevelMask`, an alias of `BitArray`) and per-cell polynomial order (`CellOrders` / `CellModes`, with no per-cell arrays on a uniform level); the `space` / `overlay` / `adapt` / `elevate` verbs |
 | `intersections.jl`| the integration-region record (`Region`, `Parent`) and admissible integration regions for non-matching meshes; cut/fictitious region-quadrature dispatch |
 | `coverage.jl`     | per-level covered-cell masks (`Coverage`, `build_coverage`); the mask- and material-aware covering rule behind covered-mode pruning; the material oracle (`_Fold`) the dof layer asks whether an inactive cell holds material |
 | `ladder.jl`       | nested refinement ladders: `ladder` declaration, the depth-map form of `adapt` and the `depth_masks` grading behind it, cross-level cell mapping (`overlapping_cells`), the `is_nested` predicate |
@@ -439,7 +439,8 @@ concatenated field-by-field (one entry per level of each field, in
 declaration order).
 
 Cells of a level may also be selectively activated or deactivated via a
-per-cell `LevelMask`. See *Selective activation* below.
+per-cell `LevelMask` — a `BitArray` over the level's cells, or `nothing`
+for "every cell active". See *Selective activation* below.
 
 ### Degree-of-freedom enumeration and constraints
 
@@ -786,8 +787,23 @@ superposition idea for its own enrichment.
     cells must be skipped rather than minimised over (a fictitious fold
     otherwise loses live dofs).
   - **One order field, two readers.** `Level.orders` is a `CellOrders` — a
-    palette of the distinct per-axis orders plus one index per cell, so a
-    uniform level is a palette of one and not a special case.
+    palette of the distinct per-axis orders plus, on a graded level, one
+    `UInt16` index per cell. A uniform level stores its one palette entry
+    and no per-cell index (`class = nothing`), and its minimum-rule table
+    stores its one index set and no per-cell map (`kind = nothing`; every
+    active cell generates it, and the mask says which cells are active).
+    That revises an earlier rule — "a uniform level is a palette of one and
+    not a special case" — for a measured reason: on a uniform level both
+    per-cell arrays are constants, 4 bytes on every cell of most levels
+    (4.15 bytes per cell on an 8² ladder of depth 7, against 0.13 with the
+    mask alone, about 90 MB across the 22.4 M cells of a depth-9 stack), and
+    the discretisation pin digested them at 8 hash rounds per cell. The
+    record type is still one; the uniform case is one `nothing` branch in
+    four readers — `cell_order`, `cell_basis_indices`, `cell_orders` and the
+    assembly hot path's `_active_set`, which reads no mask because every
+    region parent is an active cell by construction (`_signature`). The
+    readers check the cell against the level's grid themselves, since a
+    uniform level has no array whose indexing would.
     `cell_order(level, cell)` is the question anything that integrates,
     evaluates or subdivides must ask, and every quadrature consumer does:
     the region rule, the moment-fit order, the facet rule, the immersed
@@ -1460,7 +1476,9 @@ demos.
     `LevelMask` and a geometrically smaller overlay covering the same
     active cells; artificial-boundary constraint on internal
     active/inactive interfaces; `activate!`/`deactivate!` invalidation
-    contract. `dilate`'s box shape (one cell grows to `∏_d (2·by_d + 1)`),
+    contract; every region parent an active cell of its level, on a
+    masked uniform overlay, an immersed level and a ladder — the
+    invariant the hot path's mask-free set read rests on. `dilate`'s box shape (one cell grows to `∏_d (2·by_d + 1)`),
     its per-axis widths, its monotonicity in the width, its clipping at a
     box face, its refusals, and its agreement with `support_extension` at
     the family's own radius.

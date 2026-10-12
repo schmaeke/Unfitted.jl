@@ -411,3 +411,39 @@ end
     @test active_cells(model; level=1, effective=false)[outside]   # the request is kept
     @test diagnostics(model, solve!(model)).fit_failure_count == 0
 end
+
+@testset "every region parent is an active cell of its level" begin
+    # The assembly hot path reads a parent's basis set without consulting the level's mask (`_active_set` in
+    # `_refresh!`): on a uniform level that read is the level's one shared set for any cell, which is the right set only
+    # because every parent is active. That holds by construction — every parent list is decoded from a coverage
+    # signature, which gives an inactive cell no slot (`_signature`) — and is asserted here on the three ways a uniform
+    # level gets a mask: the caller's selection on an overlay, the fictitious fold of an immersed level and a ladder's
+    # depth masks; over the volume partition, every boundary facet's partition and a transfer partition.
+    tol = GeometryTolerance(Float64)
+    active_parents(V, parents) = all(p -> Unfitted.is_active(Unfitted._level_by_id(V, p.level).mask, p.cell), parents)
+    function check(model)
+        V = model.problem.space
+        masked = [level.id for level in V.levels if level.mask !== nothing]
+        # Non-vacuity: masked levels that store no per-cell mode map, and that parent regions.
+        @test !isempty(masked) && all(level -> level.modes.kind === nothing, V.levels)
+        regions = Unfitted.integration_plan(model).regions
+        @test any(r -> any(p -> p.level in masked, r.parents), regions)
+        @test all(r -> active_parents(V, r.parents), regions)
+        for axis in 1:2, side in (:lower, :upper)
+            @test all(r -> active_parents(V, r.parents), Unfitted._boundary_facet_regions(V, [(axis, side)], tol))
+        end
+        return model
+    end
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    check(prepare(mass(overlay(space(Ω; cells=4, order=2), box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3,
+                               active=(b, c) -> c[1] + c[2] <= 5))))
+    disc = physical_domain(x -> sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.3; lipschitz=1.0, subcell_length_scale=0.05)
+    check(prepare(mass(space(Ω; cells=8, order=2, physical=disc))))
+    L = ladder(Ω; cells=4, order=2, depth=2)
+    source = check(prepare(mass(adapt(L, [i == j ? 2 : (i + j == 5 ? 1 : 0) for i in 1:4, j in 1:4]))))
+    target = check(prepare(mass(adapt(L, [i == 1 ? 2 : (j == 4 ? 1 : 0) for i in 1:4, j in 1:4]))))
+    transfer = Unfitted._transfer_regions(source, target)
+    @test !isempty(transfer)
+    @test all(((r, from),) -> active_parents(target.problem.space, r.parents) &&
+                              active_parents(source.problem.space, from), transfer)
+end

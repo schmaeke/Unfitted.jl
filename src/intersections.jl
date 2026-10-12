@@ -518,6 +518,11 @@ end
 # so the smooth-integrand contract (one cell per axis per level) is preserved when merging axis-adjacent
 # equal-signature boxes, and the signature alone determines a box's parents (`_parents`).
 #
+# The inactive-cell zero is an invariant the assembly hot path relies on, not only a filter: every region parent is
+# decoded from a signature, so every parent is an active cell of its level, and `_refresh!` (`assembly.jl`) reads a
+# parent's basis set without consulting the mask — on a uniform level, the level's one set for any cell. A parent built
+# from any other source would have to keep that property.
+#
 # The signature is an `NTuple{N,Int}` built by `map` over the level tuple rather than a `Vector{Int}`, so the equality
 # comparison in the merge stays on the stack and every level's lookup is statically dispatched. A `Vector{Int}` per
 # candidate box was once the largest single allocation source in `integration_plan`.

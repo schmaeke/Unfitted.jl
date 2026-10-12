@@ -58,10 +58,11 @@ end
 #   - `bases[i]` is narrowed by `map(identity, …)` to the eltype the space's families share, `IntegratedLegendre` on the
 #     default space. An abstract bank turns the per-point basis call into a dynamic dispatch that boxes its `SVector` /
 #     `NTuple` / `CartesianIndex` arguments: measured at 448 B per call, and 94 % of `assemble_matrix`'s allocations.
-#   - `modes[i]` is the level's own minimum-rule table (`level.modes`), read by parent cell as `sets[kind[cell]]`. It is
-#     the same object `_build_cell_dofs!` walked to produce `cell_dofs`, taken off the level rather than re-derived,
-#     because the positional pairing between a cell's raw dofs and its basis values is the only link between the dof
-#     layer and the basis layer, and nothing checks it.
+#   - `modes[i]` is the level's own minimum-rule table (`level.modes`), read by parent cell through `_active_set`: the
+#     level's one set on a uniform level, `sets[kind[cell]]` on a graded one. It is the same object `_build_cell_dofs!`
+#     walked to produce `cell_dofs`, taken off the level rather than re-derived, because the positional pairing between
+#     a cell's raw dofs and its basis values is the only link between the dof layer and the basis layer, and nothing
+#     checks it.
 #   - `values[i]` and `gradients[i]` are sized at the level's largest minimum-rule set, so a cell whose set is
 #     shorter fills a prefix. See `_tensor_values!` in `basis.jl` for why that is transparent and why the buffers are
 #     not keyed by order value. The 1D factor buffers `val1d[i]` / `der1d[i]` are sized at the level's nominal
@@ -109,7 +110,7 @@ function _fill_bank!(bank::BasisBank{D,T}, levels::Tuple) where {D,T}
         i, p = level.id, nominal_order(level)
         nbasis = maximum(length, level.modes.sets)
         bank.bases[i] = level.basis
-        bank.modes[i] = _cell_locals(level)
+        bank.modes[i] = level.modes
         bank.orders[i] = p
         bank.values[i] = Vector{T}(undef, nbasis)
         bank.gradients[i] = Vector{SVector{D,T}}(undef, nbasis)
@@ -1316,11 +1317,17 @@ end
 # and the gradient work done, only when it is `true`. A one-sided region's parents have distinct levels, so their bank
 # slots never collide; an interface region's two sides live in the two subdomains' disjoint level banks, so the kernel
 # reads field `a` from `a`'s cut cell and field `b` from `b`'s at the same physical point.
+#
+# A parent's set is read with `_active_set`, which does not consult the level's mask, and that rests on an invariant:
+# every region parent is an ACTIVE cell of its level. It holds by construction rather than by checking — every parent
+# list is decoded from a coverage signature (`_signature`, `intersections.jl`), which gives an inactive cell no slot —
+# for the volume, facet, surface, interface and transfer partitions alike. So a uniform level's parents all read its
+# one shared set and touch no per-cell memory, and a graded level's read their own entry, as before.
 @noinline function _refresh!(ws::AssemblyWorkspace{D,T}, region::Region, p, ::Val{G}) where {D,T,G}
     bank = ws.bank
     for parent in region.parents
         l = parent.level
-        ids = bank.modes[l].sets[bank.modes[l].kind[parent.cell]]
+        ids = _active_set(bank.modes[l], parent.cell)
         xi = parent.ξ0 + parent.dξ .* p
         grad = G ? (bank.gradients[l], SVector{D,T}(2 .* inv.(edge_lengths(parent.parent_box))), bank.der1d[l]) :
                nothing

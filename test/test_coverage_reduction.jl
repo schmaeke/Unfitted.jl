@@ -227,7 +227,7 @@ end
 
     # Base cell (2, 2) is the one holding the hole. Its centre is in Ω, its overlay block is not entirely active — and
     # it is covered all the same.
-    base, fine = Unfitted._problem_levels(m.problem)[1:2]
+    base, fine = only(Unfitted.problem_spaces(m.problem)).levels
     cell = CartesianIndex(2, 2)
     @test Unfitted._inside(m.problem.fields[1].space.physical.geometry,
                            Unfitted.center(Unfitted.cell_box(base.mesh, cell)))

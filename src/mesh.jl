@@ -298,15 +298,19 @@ _normalize_mask(cells, mesh::CartesianMesh) = _collapse_mask(_selection(cells, m
 
 The per-cell polynomial order of a [`Level`](@ref), as a palette of the distinct orders plus one palette index per cell.
 
-A level whose order is one tuple for every cell carries a palette of one entry — the same representation, so the uniform
-case has no second code path and the lookup stays allocation-free. Fields:
+A level whose order is one tuple for every cell carries a palette of one entry and no per-cell index at all: the record
+is the same type either way, and a uniform level is the `nothing` branch of its readers rather than a second code path.
+Fields:
 
   - `palette::Vector{NTuple{D,Int}}` — the distinct per-axis orders occurring on the level, in first-occurrence order.
     Stored as a palette rather than a dense `Array{NTuple{D,Int},D}` because a graded p-field carries a handful of
     distinct orders however many cells it has, and the palette doubles as the list a per-order validation walks.
-  - `class::Array{UInt16,D}` — two bytes per cell, indexing `palette`. An anisotropic hp estimator reaches 255 distinct
-    orders on a modest 3D grid (an 8³ grid admits 512), so the index is wide enough that the cap is not a shape a real
-    p-field runs into; the normaliser still rejects rather than wraps.
+  - `class::Union{Nothing,Array{UInt16,D}}` — on a graded level, two bytes per cell indexing `palette`; `nothing`
+    exactly when the palette has one entry, which every cell then carries. A per-cell array of ones would be a constant
+    stored once per cell: two bytes on every cell of a uniform level, which is most levels and, on a deep ladder, tens
+    of millions of cells of grid that no order varies over. An anisotropic hp estimator reaches 255 distinct orders on a
+    modest 3D grid (an 8³ grid admits 512), so the index is wide enough that the cap is not a shape a real p-field runs
+    into; the normaliser still rejects rather than wraps.
   - `nominal::NTuple{D,Int}` — the per-axis maximum over `palette`, computed once at construction and read through
     [`nominal_order`](@ref). It sizes buffers and 1D factor tables, where over-sizing is safe; it is not the question
     anything that integrates, evaluates or subdivides should ask. That one is [`cell_order`](@ref).
@@ -320,16 +324,27 @@ re-deriving the set.
 """
 struct CellOrders{D}
     palette::Vector{NTuple{D,Int}}
-    class::Array{UInt16,D}
+    class::Union{Nothing,Array{UInt16,D}}
     nominal::NTuple{D,Int}
 end
+
+# The order of cell `c` under the record `o`: its class's palette entry, or the one entry of a uniform record. Unchecked
+# on a uniform record, which has no per-cell array to index; `cell_order` checks the cell against the grid first.
+@inline _order_at(o::CellOrders, c::CartesianIndex) = (k=o.class; k === nothing ? o.palette[1] : o.palette[k[c]])
 
 """
     CellModes{D}
 
 The multi-index sets a level's cells actually generate, after the minimum rule has trimmed the modes a shared entity
 cannot carry. Two fields, the same shape as [`CellOrders`](@ref): `sets` holds the distinct index sets (entry 1 is the
-empty set every inactive cell points at) and `kind` maps a cell to one of them.
+empty set every inactive cell points at) and `kind` maps a cell to one of them — or is `nothing` on a level with a
+uniform order, where every *active* cell generates `sets[2]`, the level's whole index set, and every inactive one
+generates `sets[1]`. The uniform case cannot lose a mode to the minimum rule, because every active cell asks the same
+question of neighbours carrying the same order, so its per-cell map would only copy the mask; it is not stored.
+
+Read a cell's set through [`cell_basis_indices`](@ref), which consults the mask. The assembly hot path reads
+`_active_set` instead, which does not: every region parent is an active cell by construction, so the mask test would
+always pass there.
 
 **This is derived, never supplied.** It is a function of the level's orders, its mesh, its basis family (which carries
 the basis mode) and its activation mask, and it is computed by `Level`'s inner constructor from exactly those. That is
@@ -340,40 +355,34 @@ cannot be passed in stale.
 """
 struct CellModes{D}
     sets::Vector{Vector{CartesianIndex{D}}}
-    kind::Array{UInt16,D}
+    kind::Union{Nothing,Array{UInt16,D}}
 end
 
-# One shared index set for every active cell, and the empty set for the rest. This serves two cases that are the same
-# case: a family with no per-cell order, and a level whose palette has a single entry. Neither can lose a mode to the
-# minimum rule — every active cell asks the same question of neighbours carrying the same order — so the filter would be
-# a no-op, and a uniform level pays nothing for the existence of the graded path.
-function _uniform_cell_modes(basis::BasisFamily, orders::CellOrders{D}, mesh::CartesianMesh{D}, mask) where {D}
-    sets = [CartesianIndex{D}[], local_basis_indices(basis, orders.palette[1])]
-    kind = Array{UInt16,D}(undef, mesh.cells)
-    for cell in cell_indices(mesh)
-        kind[cell] = is_active(mask, cell) ? UInt16(2) : UInt16(1)
-    end
-    return CellModes{D}(sets, kind)
-end
+# The set an ACTIVE cell `c` generates: `sets[2]` on a uniform table, the cell's own entry on a graded one. The mask is
+# not read, and that is what the name says: an inactive cell's entry is the empty set on a graded table but not on a
+# uniform one. It is the read for a caller that knows the cell is active — the assembly hot path (`_refresh!`), whose
+# region parents are active by construction (`_signature`) — and costs it no per-cell memory on a uniform level. Every
+# other caller asks `cell_basis_indices`.
+@inline _active_set(m::CellModes, c::CartesianIndex) = (k=m.kind; k === nothing ? m.sets[2] : m.sets[k[c]])
 
-# The multi-index set each cell of a level generates — the minimum rule — as a basis-family hook. This generic method is
-# the whole interface: it is what `Level`'s constructor below calls, and it is bound here so the include order stays the
+# The minimum-rule table of a graded level — the multi-index set each cell generates once the minimum rule has trimmed
+# what a shared entity cannot carry — as a basis-family hook. `Level`'s constructor calls it for a level whose order
+# varies from cell to cell; a uniform level's table is the family's index set at its one order and is answered there,
+# for every family, because nothing can be trimmed. The generic method is bound here so the include order stays the
 # dependency map.
 #
 # A family that declares `_supports_cell_order` supplies its own method where its dof-key incidence machinery lives,
 # exactly as a family supplies its own burial hooks for `_coverage_constraints!`: integrated Legendre's is in `dofs.jl`,
 # next to `_entity_carries` and the `TensorDofKey` factors it is expressed over, and the B-spline family's would live in
-# its extension. A family that has not supplied one may only be handed a single-entry palette, and the refusal below is
-# loud on purpose. Falling through to `_uniform_cell_modes` with a real palette would assemble every cell at
-# `palette[1]` while `cell_order` reported the field the caller asked for — a non-conforming space with no error
-# anywhere, which is the exact failure the minimum rule exists to prevent.
-function _cell_modes(basis::BasisFamily, orders::CellOrders{D}, mesh::CartesianMesh{D}, mask) where {D}
-    length(orders.palette) == 1 ||
-        throw(ArgumentError("the $(basis_name(basis)) basis family answers _supports_cell_order " *
-                            "but supplies no _cell_modes method: the minimum rule for a graded " *
-                            "level is the family's to state, and the uniform fallback would " *
-                            "silently assemble every cell at $(orders.palette[1])."))
-    return _uniform_cell_modes(basis, orders, mesh, mask)
+# its extension. This generic method is therefore reached only by a graded level of a family that declared the
+# capability without stating the rule, and it refuses loudly on purpose. Assembling every cell at `palette[1]` instead
+# while `cell_order` reported the field the caller asked for would be a non-conforming space with no error anywhere,
+# which is the exact failure the minimum rule exists to prevent.
+function _cell_modes(basis::BasisFamily, orders::CellOrders, ::CartesianMesh, mask)
+    throw(ArgumentError("the $(basis_name(basis)) basis family answers _supports_cell_order " *
+                        "but supplies no _cell_modes method: the minimum rule for a graded " *
+                        "level is the family's to state, and the uniform fallback would " *
+                        "silently assemble every cell at $(orders.palette[1])."))
 end
 
 # Translate a user-supplied `order` specification into either an `NTuple{D,Int}` (uniform) or a flat
@@ -445,14 +454,17 @@ end
 # `local_basis_indices(family, o)`, which raises on an order the family, in its mode, rejects — so the per-*cell*
 # `order ≥ 1` requirement and the `:trunk` isotropy requirement are enforced at the granularity a graded level needs,
 # where a per-level check can no longer see a single offending cell. The graded method adds two checks a uniform level
-# gets for free: the family must declare `_supports_cell_order`, and the palette must fit the `UInt16` class index.
+# gets for free: the family must declare `_supports_cell_order`, and the palette must fit the `UInt16` class index. A
+# uniform order stores no class array (`class = nothing`); a graded one reaches its method only through
+# `_collapse_order`, which has folded an everywhere-equal field back to the uniform tuple, so `class === nothing` is
+# exactly a palette of one.
 #
 # This record is what the caller ASKED FOR, and it depends on nothing else — not on the mask, not on the mode. What the
-# basis then emits per cell is derived from it by `_cell_modes`, whose generic method is defined above and whose
-# per-family methods live where each family's key-incidence machinery does.
-function _build_cell_orders(family::BasisFamily, order::NTuple{D,Int}, mesh::CartesianMesh{D}) where {D}
+# basis then emits per cell is derived from it by `Level`'s constructor and, on a graded level, the family's
+# `_cell_modes` method, which lives where the family's key-incidence machinery does.
+function _build_cell_orders(family::BasisFamily, order::NTuple{D,Int}, ::CartesianMesh{D}) where {D}
     local_basis_indices(family, order)    # raises on an order the family rejects
-    return CellOrders{D}([order], fill(UInt16(1), mesh.cells), order)
+    return CellOrders{D}([order], nothing, order)
 end
 
 function _build_cell_orders(family::BasisFamily, entries::Vector{NTuple{D,Int}}, mesh::CartesianMesh{D}) where {D}
@@ -463,27 +475,30 @@ function _build_cell_orders(family::BasisFamily, entries::Vector{NTuple{D,Int}},
                             "could name and no shared entity for the minimum rule to act on. Use " *
                             "the default integrated-Legendre basis, or pass one order for the level."))
     palette = NTuple{D,Int}[]
-    # A dictionary rather than a scan over `palette`: the class index is `UInt16` because an anisotropic hp field
-    # reaches hundreds of distinct orders on a modest grid, and `findfirst` over the palette made the build O(cells ×
-    # palette) — measured on a 512² field carrying 500 distinct orders, 284 ms against 174 ms. It is also the idiom
-    # `_cell_modes` already uses for its own dedup, so the two palette builders now read the same way.
     slot = Dict{NTuple{D,Int},UInt16}()
     class = Array{UInt16,D}(undef, mesh.cells)
     for (i, ci) in enumerate(cell_indices(mesh))
-        o = entries[i]
-        class[ci] = get!(slot, o) do
-            length(palette) == typemax(UInt16) &&
-                throw(ArgumentError("a level carries at most $(typemax(UInt16)) distinct per-cell " *
-                                    "orders, and this one asks for more. That is a palette index " *
-                                    "limit, not a statement about your p-field."))
-            push!(palette, o)
-            UInt16(length(palette))
-        end
+        class[ci] = _intern!(slot, palette, entries[i], "per-cell orders")
     end
     for o in palette
         local_basis_indices(family, o)     # raises on an order the family rejects
     end
     return CellOrders{D}(palette, class, _nominal_order(palette))
+end
+
+# The palette index of `x`, appending it to `palette` the first time it is seen: the one palette builder, behind a
+# graded level's order classes (`_build_cell_orders`) and its minimum-rule mode sets (integrated Legendre's
+# `_cell_modes`). `slot` maps each entry to its index, so a build is O(cells) rather than O(cells × palette): a scan
+# with `findfirst` over the palette, measured on a 512² field carrying 500 distinct orders, took 284 ms against 174 ms.
+# The index is `UInt16`, and the guard refuses rather than wraps; `what` names the entries in the refusal.
+function _intern!(slot::Dict{K,UInt16}, palette::Vector{K}, x::K, what::AbstractString) where {K}
+    return get!(slot, x) do
+        length(palette) == typemax(UInt16) &&
+            throw(ArgumentError("a level carries at most $(typemax(UInt16)) distinct $what, and this one asks for " *
+                                "more. That is a palette index limit, not a statement about your p-field."))
+        push!(palette, x)
+        UInt16(length(palette))
+    end
 end
 
 # A rebuild that keeps the order field hands the level's own record back in, and it is reused as it is: it was
@@ -511,8 +526,8 @@ the basis mode), polynomial-order metadata and an optional activation mask. Fiel
     product, or integrated Legendre's `:trunk`, the Szabó–Babuška trunk space filtered by trunk degree), which
     `_mode(level.basis)` reads back.
   - `orders::CellOrders{D}` — the per-cell polynomial order, as a palette of the distinct orders plus one index per
-    cell. A level whose order is uniform carries a palette of one entry, so there is no second representation and no
-    second code path for the common case. Ask [`cell_order`](@ref) for a cell's order and [`nominal_order`](@ref) for
+    cell. A level whose order is uniform carries a palette of one entry and no per-cell index, in the same record type,
+    so there is no second representation. Ask [`cell_order`](@ref) for a cell's order and [`nominal_order`](@ref) for
     the per-axis maximum, which is a sizing quantity only. Both take a [`Space`](@ref) and a `level` keyword as well,
     which is how a caller who is not inside the package should reach them.
   - `modes::CellModes{D}` — the multi-index sets those orders actually generate, after the minimum rule. **Derived**,
@@ -545,8 +560,16 @@ struct Level{D,T<:Real,B<:BasisFamily}
     # confession that the invariant can be violated. Computing the table from the arguments that determine it makes the
     # mismatch unspellable instead, and the construction sites — which now all go through `_level` below — stop having
     # to remember anything.
+    #
+    # A uniform level's table is answered here, for every family: every active cell asks the same question of
+    # neighbours carrying the same order, so the minimum rule cannot trim anything, and the table is the level's one
+    # index set with no per-cell map (`kind = nothing`; `cell_basis_indices` reads the mask instead). A graded level's
+    # table is the family's to state, through its `_cell_modes` method.
     function Level{D,T,B}(id, role, mesh, basis, orders, mask) where {D,T<:Real,B<:BasisFamily}
-        return new{D,T,B}(id, role, mesh, basis, orders, _cell_modes(basis, orders, mesh, mask), mask)
+        modes = orders.class === nothing ?
+                CellModes{D}([CartesianIndex{D}[], local_basis_indices(basis, orders.palette[1])], nothing) :
+                _cell_modes(basis, orders, mesh, mask)
+        return new{D,T,B}(id, role, mesh, basis, orders, modes, mask)
     end
 end
 
@@ -575,15 +598,17 @@ nominal_order(level::Level) = level.orders.nominal
     cell_order(V::Space, cell::CartesianIndex; level) -> NTuple{D,Int}
     cell_order(level::Level, cell::CartesianIndex) -> NTuple{D,Int}
 
-Per-axis polynomial order of one cell of `level`. A level whose order is uniform carries a palette of one entry, so this
-is the same lookup either way and there is no second code path for the common case.
+Per-axis polynomial order of one cell of `level`. A level whose order is uniform answers from its one palette entry
+without a per-cell read; a graded level reads the cell's class. Either way `cell` is checked against the level's grid,
+and an index outside it raises `BoundsError`.
 
 The `Space` form is the public spelling — a marking loop that already asks [`cell_box`](@ref)`(V, ci; level)` and
 [`cell_orders`](@ref)`(V; level)` asks this the same way, without reaching into `V.levels`. It costs one bounds check on
 the level index over the `Level` form, which is the one the kernels use.
 """
 @inline function cell_order(level::Level{D}, cell::CartesianIndex{D}) where {D}
-    return level.orders.palette[level.orders.class[cell]]
+    @boundscheck checkbounds(cell_indices(level.mesh), cell)
+    return _order_at(level.orders, cell)
 end
 
 """
@@ -592,11 +617,12 @@ end
 Multi-indices of the local basis functions cell `cell` of `level` generates, in the canonical
 [`local_basis_indices`](@ref) order. An inactive cell generates none and gets the empty set.
 
-The answer is a lookup into the level's minimum-rule table ([`CellModes`](@ref)) on every level, and allocates
-nothing. On a uniform level every active cell shares one set, the level's whole index set
-`local_basis_indices(level.basis, nominal_order(level))`. On a level carrying a per-cell order the set is
-*not* the index set at the cell's own order: the modes a lower-order neighbour cannot match are gone, which is what
-keeps the space C⁰ across an order jump.
+The answer is a lookup into the level's minimum-rule table ([`CellModes`](@ref)), and allocates nothing. On a uniform
+level every active cell shares one set, the level's whole index set `local_basis_indices(level.basis,
+nominal_order(level))`, and the table stores no per-cell map, so the cell's activity is read from the level's mask. On a
+level carrying a per-cell order the set is *not* the index set at the cell's own order: the modes a lower-order
+neighbour cannot match are gone, which is what keeps the space C⁰ across an order jump. `cell` is checked against the
+level's grid, and an index outside it raises `BoundsError`.
 
 The result is the level's own vector — the same object for every cell with the same set, and the one the dof layout and
 the assembly banks pair raw dofs against — so treat it as read-only and `copy` it before modifying it. Mutating it
@@ -606,7 +632,8 @@ This is the one place the per-cell index set is defined. Every consumer that pai
 basis values positionally must obtain its multi-indices here, or from a bank filled from `level.modes`.
 """
 @inline function cell_basis_indices(level::Level{D}, cell::CartesianIndex{D}) where {D}
-    return level.modes.sets[level.modes.kind[cell]]
+    @boundscheck checkbounds(cell_indices(level.mesh), cell)
+    return is_active(level.mask, cell) ? _active_set(level.modes, cell) : level.modes.sets[1]
 end
 
 """
@@ -672,12 +699,6 @@ function _cell_basis(level::Level{D}, cell::CartesianIndex{D}, xi::PointLike{D},
     _tensor_values!(level.basis, values, indices, p, SVector{D,R}(xi), _factor_buffers(p, R), cell, grad)
     return grad === nothing ? values : grad[1]
 end
-
-# The per-cell minimum-rule table of a level: one `CellModes` always, a palette of one set on a uniform level. Assembly
-# and transfer workspaces bank it per level id so a hot loop reads `sets[kind[cell]]` — two array reads, no branch and
-# no per-cell derivation — and so that the table they pair raw dofs against is literally the one `_build_cell_dofs!`
-# walked.
-_cell_locals(level::Level) = level.modes
 
 """
     Space
@@ -1157,7 +1178,8 @@ V = elevate(V, 1 => p)
 """
 function cell_orders(V::Space{D}; level::Integer) where {D}
     lvl = _level_at(V, level)
-    return [lvl.orders.palette[c] for c in lvl.orders.class]
+    palette, class = lvl.orders.palette, lvl.orders.class
+    return class === nothing ? fill(palette[1], lvl.mesh.cells) : [palette[c] for c in class]
 end
 
 nominal_order(V::Space; level::Integer) = nominal_order(_level_at(V, level))

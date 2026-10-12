@@ -1063,8 +1063,10 @@ end
 #
 # WHAT GOES IN — everything the active dof numbering is a function of:
 #
-#   * per level, in order: id, role, mode, basis family name, the mesh's corner bits and cell counts, the activation
-#     mask's bits, and the order field's palette, class map and nominal;
+#   * per level, as one tuple: id, role, mode, basis family name, the mesh's corner bits and cell counts, the activation
+#     mask's bits, and the order field's palette, class map and nominal. An absent mask or class map — every cell
+#     active, one order for every cell — is digested as `-1`, where an array's digest starts with its shape, so a
+#     uniform unmasked level costs no per-cell rounds however many cells it has;
 #   * per field: name, component count, offset, raw and active dof counts, and the `(raw, component) -> active id` map
 #     itself — which is precisely the numbering a coefficient vector indexes into, and the only thing that separates two
 #     models differing solely in *which* dofs a Dirichlet condition constrains rather than how many;
@@ -1116,17 +1118,11 @@ function _discretisation_pin(spaces, layout::SystemLayout)
     for V in spaces
         h = _pin(h, level_count(V))
         for level in V.levels
-            h = _pin(h, level.id)
-            h = _pin(h, level.role)
-            h = _pin(h, _mode(level.basis))
-            h = _pin(h, basis_name(level.basis))
-            h = _pin(h, level.mesh.domain.lower)
-            h = _pin(h, level.mesh.domain.upper)
-            h = _pin(h, level.mesh.cells)
-            h = level.mask === nothing ? _pin(h, -1) : _pin(h, level.mask)
-            h = _pin(h, level.orders.palette)
-            h = _pin(h, level.orders.class)
-            h = _pin(h, level.orders.nominal)
+            o = level.orders
+            h = _pin(h,
+                     (level.id, level.role, _mode(level.basis), basis_name(level.basis), level.mesh.domain.lower,
+                      level.mesh.domain.upper, level.mesh.cells, something(level.mask, -1), o.palette,
+                      something(o.class, -1), o.nominal))
         end
     end
     for f in layout.fields

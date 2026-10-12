@@ -25,6 +25,7 @@ const BSExt = Base.get_extension(Unfitted, :UnfittedBasicBSplineExt)
     # well defined B-spline level.
     W = space(Ω; cells=4, order=fill(3, 4, 4), basis=bspline())
     @test length(W.levels[1].orders.palette) == 1
+    @test W.levels[1].orders.class === nothing && W.levels[1].modes.kind === nothing
     @test nominal_order(W.levels[1]) == (3, 3)
     @test Unfitted.dof_layout(W).active_count ==
           Unfitted.dof_layout(space(Ω; cells=4, order=3, basis=bspline())).active_count

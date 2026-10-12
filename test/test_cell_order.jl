@@ -62,13 +62,16 @@ const _CO_3D = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
 
 @testset "per-cell order: uniform levels are unchanged" begin
     # A per-cell field that happens to be flat must collapse to the uniform representation, so an existing user pays
-    # nothing — same `nothing` order field, same dof counts, same reduction counts, same solution.
+    # nothing — one palette entry and no per-cell order or mode array, same dof counts, same reduction counts, same
+    # solution.
     for (Ω, cells, p) in ((_CO_2D, 6, 3), (_CO_3D, 3, 2))
         D = length(Ω.lower)
         plain = space(Ω; cells=cells, order=p)
         dense = space(Ω; cells=cells, order=fill(p, ntuple(_ -> cells, D)))
         @test length(plain.levels[1].orders.palette) == 1
         @test length(dense.levels[1].orders.palette) == 1  # collapsed, not merely equal
+        @test plain.levels[1].orders.class === nothing && plain.levels[1].modes.kind === nothing
+        @test dense.levels[1].orders.class === nothing && dense.levels[1].modes.kind === nothing
         @test nominal_order(dense; level=1) == nominal_order(plain; level=1)
         @test dof_layout(dense).active_count == dof_layout(plain).active_count
         @test cell_orders(plain; level=1) == fill(ntuple(_ -> p, D), ntuple(_ -> cells, D))
@@ -77,6 +80,7 @@ const _CO_3D = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
     # A predicate that returns one order everywhere collapses too.
     V = space(_CO_2D; cells=4, order=(_box, _cell) -> 2)
     @test length(V.levels[1].orders.palette) == 1
+    @test V.levels[1].orders.class === nothing && V.levels[1].modes.kind === nothing
     @test nominal_order(V; level=1) == (2, 2)
 
     # And a stacked, pruned space keeps its reduction verdicts.
@@ -192,7 +196,7 @@ end
     # a level. The rejection itself is still there, just out of reach.
     wide = space(box((0.0,), (1.0,)); cells=(300,), order=reshape(collect(1:300), 300))
     @test length(wide.levels[1].orders.palette) == 300
-    @test eltype(wide.levels[1].orders.class) === UInt16
+    @test wide.levels[1].orders.class isa Array{UInt16,1}     # a graded level carries its class map
 end
 
 @testset "per-cell order: the index-set membership predicate" begin
@@ -453,9 +457,10 @@ end
     end
     @test active_unknowns(prepare(mass(V2))) < active_unknowns(prepare(mass(V)))
 
-    # A uniform level is a palette of one, not an absence — no second code path.
+    # A uniform level is a palette of one with no per-cell order or mode array: its readers answer from the one entry.
     uniform = space(Ω; cells=(4, 4), order=3)
     @test length(uniform.levels[1].orders.palette) == 1
+    @test uniform.levels[1].orders.class === nothing && uniform.levels[1].modes.kind === nothing
     # The `Space` forms are the public spelling: space plus a `level` keyword, like every other accessor, with no reach
     # into `V.levels`.
     @test cell_order(uniform, CartesianIndex(2, 2); level=1) == (3, 3)
@@ -482,7 +487,7 @@ end
     Ω = box((0.0, 0.0), (1.0, 1.0))
     anisotropic = [(1 + (i - 1) % 16, 1 + (j - 1) % 16) for i in 1:16, j in 1:16]
     V = space(Ω; cells=(16, 16), order=anisotropic)
-    @test eltype(V.levels[1].orders.class) === UInt16
+    @test V.levels[1].orders.class isa Array{UInt16,2}
     @test length(V.levels[1].orders.palette) == 256          # would have thrown at 255
     @test cell_orders(V; level=1)[CartesianIndex(3, 5)] == (3, 5)
     @test active_unknowns(prepare(mass(V))) > 0
@@ -581,10 +586,76 @@ Unfitted._supports_cell_order(::_OptInNoRule) = true
     graded = Unfitted._build_cell_orders(family, [(1, 1), (2, 2), (1, 1), (2, 2)], mesh)
     @test length(graded.palette) == 2
     @test_throws ArgumentError Unfitted._cell_modes(family, graded, mesh, nothing)
+    @test_throws ArgumentError space(Ω; cells=(2, 2), order=[1 2; 1 2], basis=family)
 
-    # A one-entry palette is the uniform case and still goes through.
+    # A one-entry palette is the uniform case and still goes through: `Level`'s constructor answers it for every family,
+    # with the family's index set at the one order shared by every active cell.
     flat = Unfitted._build_cell_orders(family, (2, 2), mesh)
-    modes = Unfitted._cell_modes(family, flat, mesh, nothing)
+    @test flat.class === nothing
+    level = space(Ω; cells=(2, 2), order=2, basis=family, active=[CartesianIndex(1, 1), CartesianIndex(2, 2)]).levels[1]
+    modes = level.modes
     @test length(modes.sets) == 2                        # the empty set plus the shared one
-    @test all(==(UInt16(2)), modes.kind)                 # every cell active
+    @test modes.kind === nothing                         # no per-cell map: every active cell has the shared set
+    @test modes.sets[2] == local_basis_indices(family, (2, 2))
+    @test cell_basis_indices(level, CartesianIndex(1, 1)) === modes.sets[2]
+    @test isempty(cell_basis_indices(level, CartesianIndex(1, 2)))   # the mask, not a table, says which cells generate
+end
+
+@testset "per-cell order: a uniform level stores no per-cell arrays" begin
+    # A per-cell order class and mode kind on a uniform level would be constants stored once per cell — four bytes on
+    # every cell of most levels, and tens of millions of cells on a deep ladder. The uniform level stores neither, so
+    # its record is the same size at any cell count, while a graded level carries both; the readers answer the same
+    # either way, and `cell_orders` round-trips through `elevate` in both representations.
+    for active in (nothing, [!(i == 2 && j == 3) for i in 1:4, j in 1:4])
+        V = space(_CO_2D; cells=4, order=3, active=active)
+        lvl = V.levels[1]
+        @test lvl.orders.class === nothing && lvl.modes.kind === nothing
+        @test lvl.orders.palette == [(3, 3)] && length(lvl.modes.sets) == 2
+        for c in cell_indices(V; level=1)
+            @test cell_order(lvl, c) == (3, 3)
+            on = Unfitted.is_active(lvl.mask, c)
+            @test cell_basis_indices(lvl, c) === (on ? lvl.modes.sets[2] : lvl.modes.sets[1])
+            on && @test Unfitted._active_set(lvl.modes, c) === cell_basis_indices(lvl, c)
+        end
+        @test cell_orders(V; level=1) == fill((3, 3), 4, 4)
+        back = elevate(V, 1 => cell_orders(V; level=1))
+        @test back.levels[1].orders.class === nothing && back.levels[1].modes.kind === nothing
+        @test cell_orders(back; level=1) == cell_orders(V; level=1)
+        @test all(c -> cell_basis_indices(back.levels[1], c) == cell_basis_indices(lvl, c), cell_indices(V; level=1))
+    end
+    small, large = space(_CO_2D; cells=4, order=3).levels[1], space(_CO_2D; cells=64, order=3).levels[1]
+    @test Base.summarysize(large.orders) == Base.summarysize(small.orders)
+    @test Base.summarysize(large.modes) == Base.summarysize(small.modes)
+
+    field = [(2 + (i + j) % 2, 2 + i % 3) for i in 1:4, j in 1:4]
+    graded = space(_CO_2D; cells=4, order=field)
+    lvl = graded.levels[1]
+    @test lvl.orders.class isa Array{UInt16,2} && size(lvl.orders.class) == (4, 4)
+    @test lvl.modes.kind isa Array{UInt16,2} && size(lvl.modes.kind) == (4, 4)
+    @test cell_orders(graded; level=1) == field
+    @test all(c -> cell_order(lvl, c) == field[c], cell_indices(graded; level=1))
+    @test cell_orders(elevate(graded, 1 => cell_orders(graded; level=1)); level=1) == field
+    # Elevating a graded level to one order drops both arrays again, and a pair edit of a uniform one builds them.
+    flat = elevate(graded, 1 => 3).levels[1]
+    @test flat.orders.class === nothing && flat.modes.kind === nothing
+    raised = elevate(space(_CO_2D; cells=4, order=3), 1 => CartesianIndex(2, 2) => 4).levels[1]
+    @test raised.orders.class isa Array{UInt16,2} && raised.modes.kind isa Array{UInt16,2}
+end
+
+@testset "per-cell order: the per-cell readers refuse a cell off the grid" begin
+    # A uniform level has no per-cell array whose indexing would raise, so the readers check the cell against the grid
+    # themselves; a cell off the grid must not quietly read as the level's one order or set. The refusal stays the
+    # `BoundsError` an array read raised before.
+    Ω = _CO_2D
+    for V in (space(Ω; cells=(4, 3), order=2), space(Ω; cells=(4, 3), order=2, active=(b, c) -> c[1] <= 2),
+              space(Ω; cells=(4, 3), order=[1 + (i + j) % 3 for i in 1:4, j in 1:3]))
+        lvl = V.levels[1]
+        for c in (CartesianIndex(5, 1), CartesianIndex(1, 4), CartesianIndex(0, 2))
+            @test_throws BoundsError cell_order(lvl, c)
+            @test_throws BoundsError cell_order(V, c; level=1)
+            @test_throws BoundsError cell_basis_indices(lvl, c)
+            @test_throws BoundsError basis_values(lvl, c, (0.0, 0.0))
+            @test_throws BoundsError Unfitted.physical_basis_gradients(lvl, c, box((0.0, 0.0), (1.0, 1.0)), (0.0, 0.0))
+        end
+    end
 end
