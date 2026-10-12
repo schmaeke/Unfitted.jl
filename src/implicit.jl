@@ -62,7 +62,10 @@
 #
 #   With the default gradient the kernel evaluates a leaf inside the closed box R only — at its corners, centre and
 #   fibers, and for a pair leaf at the two ends of a fiber and at a root between them — so a level set defined on the
-#   mesh domain alone (an image interpolant without extrapolation, a lookup into a grid) is a valid leaf.
+#   mesh domain alone (an image interpolant without extrapolation, a lookup into a grid) is a valid leaf. Such a leaf
+#   should test its domain on the coordinates' values (`ForwardDiff.value`): the gradient samples at R's corners are
+#   `Dual` numbers, and a `Dual` with nonzero partials does not compare `<=` (nor `==`) to a real equal to its value,
+#   so a guard `x[d] <= upper` rejects a point on R's upper face.
 
 # ── Kernel context and gradient ────────────────────────────────────────────────
 
