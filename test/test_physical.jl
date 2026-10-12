@@ -1160,5 +1160,5 @@ end
     cache = Unfitted._MomentFitCache{2,Float64}()
     Unfitted.integration_plan(V; moment_fit_cache=cache)
     @test length(cache) > 8
-    @test all(isequal(value, Unfitted._fit_rule(V.physical, key..., false)) for (key, value) in cache)
+    @test all(isequal(value, Unfitted._fit_rule(V.physical, key..., nothing)) for (key, value) in cache)
 end

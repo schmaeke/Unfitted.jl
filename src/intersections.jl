@@ -595,8 +595,8 @@ const _MomentFitKey{D,T} = Tuple{SVector{D,T},SVector{D,T},NTuple{D,Int}}
 const _MomentFitValue{D,T} = Tuple{Vector{SVector{D,T}},Vector{T},T,Symbol}
 const _MomentFitCache{D,T} = Dict{_MomentFitKey{D,T},_MomentFitValue{D,T}}
 
-# One cut region's rule on the box `lower`–`upper`, in the box's reference frame: the moment fit (`moment_fit_rule`, at
-# the domain's own `target_residual`) or, when `custom`, the domain's `cut_quadrature`, then mapped as follows:
+# One cut region's rule on the box `lower`–`upper`, in the box's reference frame — the moment fit (`moment_fit_rule`, at
+# the domain's own `target_residual`) when `rule` is `nothing`, else `rule(physical, box, order)` — mapped as follows:
 #
 #   - `ref_points` are the rule's physical points mapped into the box's `[−1, 1]ᴰ` reference frame via
 #     `physical_to_reference`;
@@ -610,20 +610,24 @@ const _MomentFitCache{D,T} = Dict{_MomentFitKey{D,T},_MomentFitValue{D,T}}
 # `physical.cut_quadrature` is the user extension point: a non-`nothing` callable supplies the cut-cell rule in place of
 # the moment fit, in the same 4-tuple shape and the same *physical*-frame convention. Placing it here puts a custom rule
 # under the same per-box memoisation, the same reference-frame mapping, and the same α-FCM blend as the fit, so swapping
-# the rule changes exactly one thing. `custom` is the caller's, not the field's, because a caller may decline the rule:
-# a boundary facet never consults it (see `_facet_regions` in `dirichlet.jl`).
+# the rule changes exactly one thing. `rule` is the caller's, not read off the domain here, because a caller may decline
+# the domain's rule: the volume plan passes `physical.cut_quadrature`, and a boundary facet passes `nothing`, since it
+# never consults it (see `_facet_regions` in `dirichlet.jl`). Passed as a value, its type decides the branch at compile
+# time, so a space with a custom rule compiles no moment fit for its cells, and a facet compiles no call to the rule.
 #
 # A pure function of its arguments, which is what lets `_fit_rules` run it on any thread.
 function _fit_rule(physical::PhysicalDomain, lower::SVector{D,T}, upper::SVector{D,T}, order::NTuple{D,Int},
-                   custom::Bool) where {D,T}
+                   rule) where {D,T}
     box = AxisBox{D,T}(lower, upper)
-    points, weights, residual, status = custom ? physical.cut_quadrature(physical, box, order) :
-                                        moment_fit_rule(physical, box, order; target_residual=physical.target_residual)
+    target_residual = physical.target_residual
+    points, weights, residual, status = rule === nothing ? moment_fit_rule(physical, box, order; target_residual) :
+                                        rule(physical, box, order)
     jacobian = volume(box) / convert(T, 2^D)
     return ([physical_to_reference(box, p) for p in points], T[w / jacobian for w in weights], T(residual), status)
 end
 
-# The rules of a list of cut keys `(lower, upper, order)`, in key order, fitted on every thread.
+# The rules of a list of cut keys `(lower, upper, order)`, in key order: `_fit_rule` with `rule` on every key, on every
+# thread.
 #
 # At the default `moment_order_factor = 2` the fits *are* the plan: 99.9% of a 3D build, tens of seconds over a few
 # dozen cut cells. They are also independent of one another — `_fit_rule` reads the immutable `PhysicalDomain` and the
@@ -631,10 +635,10 @@ end
 #
 # A user `cut_quadrature` is fitted serially instead. It is caller code under no thread-safety contract — the package's
 # own test rule counts its calls through a shared `Ref` — so the package does not unilaterally run it on N threads.
-function _fit_rules(physical::PhysicalDomain, keys::Vector{_MomentFitKey{D,T}}, custom::Bool) where {D,T}
+function _fit_rules(physical::PhysicalDomain, keys::Vector{_MomentFitKey{D,T}}, rule) where {D,T}
     fitted = Vector{_MomentFitValue{D,T}}(undef, length(keys))
-    fit(key) = _fit_rule(physical, key[1], key[2], key[3], custom)
-    if custom
+    fit(key) = _fit_rule(physical, key[1], key[2], key[3], rule)
+    if rule !== nothing
         map!(fit, fitted, keys)
     else
         Threads.@threads for i in eachindex(keys)
@@ -838,7 +842,7 @@ function _prefit!(cache::_MomentFitCache{D,T}, physical, records::Vector{_Region
         record.verdict === :cut && push!(live, (record.lower, record.upper, record.order))
     end
     pending = _MomentFitKey{D,T}[key for key in live if !haskey(cache, key)]
-    fitted = _fit_rules(physical, pending, physical.cut_quadrature !== nothing)
+    fitted = _fit_rules(physical, pending, physical.cut_quadrature)
     for i in eachindex(pending)
         cache[pending[i]] = fitted[i]
     end

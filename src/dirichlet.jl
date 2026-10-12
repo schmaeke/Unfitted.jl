@@ -490,7 +490,7 @@ function _facet_regions(records::Vector{_RegionRecord{D,T}}, slice, sides::Vecto
     end
     keys = _MomentFitKey{F,T}[key(record) for record in records if record.verdict === :cut]
     fits = isempty(keys) ? _MomentFitValue{F,T}[] :
-           Base.inferencebarrier(_fit_rules)(slice, keys, false)::Vector{_MomentFitValue{F,T}}
+           Base.inferencebarrier(_fit_rules)(slice, keys, nothing)::Vector{_MomentFitValue{F,T}}
     frame_pins = [(axis, zero(T)) for (axis, _) in pins]
     alpha = slice === nothing ? zero(T) : slice.alpha
     alpha_cache = Dict{NTuple{D,Int},Vector{T}}()
