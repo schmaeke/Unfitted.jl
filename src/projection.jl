@@ -14,7 +14,7 @@
 #     Lossless when the target's active basis contains the source's — typically after a monotone `activate!` — and
 #     avoids the projection cost / smoothing in that case.
 
-# ── Backends and transfer regions ─────────────────────────────────────────────
+# ── Backends ──────────────────────────────────────────────────────────────────
 
 """
     abstract type TransferBackend end

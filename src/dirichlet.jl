@@ -224,20 +224,6 @@ _covers_a_facet(on::UInt64, facets::Vector{UInt64}) = any(f -> on & f == f, face
 
 # ── Boundary facet integration ────────────────────────────────────────────────
 
-# Component extraction from a Dirichlet value: scalars apply to every component, anything indexable supplies one entry
-# per component.
-function _component_value(value, component::Integer)
-    value isa Number && return value
-    return value[component]
-end
-
-# Evaluate a `DirichletCondition` at physical coordinate `x` for the given component. Handles both constant and callback
-# `value` fields.
-function _condition_value(condition::DirichletCondition, x, component::Integer=1)
-    value = condition.value isa Function ? condition.value(x) : condition.value
-    return _component_value(value, component)
-end
-
 """
     FacetRegion{D,T} = Region{D,T,SVector{D,T},Vector{Tuple{Int,Symbol}}}
 
@@ -367,62 +353,6 @@ end
 # honour.
 function _resolve_face(facets::FacetResolver{D,T}, V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}) where {D,T}
     return get!(() -> _boundary_facet_regions(V, sides, facets.tolerance, facets.rules), facets.faces, (V, sides))
-end
-
-# Axes *not* constrained by `sides`. Each codim-1 face has `D − 1` free axes; a codim-D vertex has zero free axes. Used
-# to size the free-axis tensor quadrature and to enumerate which axes carry physical extent on the boundary region.
-function _free_axes(sides::AbstractVector{<:Tuple{Integer,Symbol}}, ::Val{D}) where {D}
-    constrained = Set{Int}()
-    for (axis, _) in sides
-        push!(constrained, Int(axis))
-    end
-    return [d for d in 1:D if !(d in constrained)]
-end
-
-# Fixed coordinate value for axis `d` of a facet specified by `sides`. Returns the side's coordinate
-# (`domain.lower[axis]` or `domain.upper[axis]`) when `d` is constrained by some entry of `sides` and `zero(T)`
-# otherwise — the caller overwrites the free-axis entries with actual interval bounds.
-function _facet_fixed_coord(domain::AxisBox{D,T}, sides::AbstractVector{<:Tuple{Integer,Symbol}},
-                            d::Integer) where {D,T}
-    for (axis, side) in sides
-        axis == d || continue
-        return side === :lower ? domain.lower[axis] : domain.upper[axis]
-    end
-    return zero(T)
-end
-
-# Outward unit normal of a facet identified by `sides`. For codim-1 facets this is `±eₐ` with the sign set by the single
-# `side`. For codim-`K > 1` facets the constrained-face outward normals are summed and normalised; well-defined for
-# every `K ≤ D` and continuous in the face geometry, though not geometrically as sharp as the codim-1 case (a codim-2
-# corner in 2D returns the diagonal-out direction).
-function _facet_outward_normal(sides::AbstractVector{<:Tuple{Integer,Symbol}}, ::Val{D}, ::Type{T}) where {D,T}
-    accumulator = MVector{D,T}(ntuple(_ -> zero(T), D))
-    for (axis, side) in sides
-        sign = side === :lower ? -one(T) :
-               side === :upper ? one(T) : throw(ArgumentError("boundary side must be :lower or :upper"))
-        accumulator[axis] += sign
-    end
-    n = SVector{D,T}(accumulator)
-    norm_n = sqrt(sum(x -> x * x, n))
-    return iszero(norm_n) ? n : n / norm_n
-end
-
-# The cells of `level` whose own faces all lie on `sides`: index `1` or the last index on each constrained axis, the
-# whole range on the free ones. These are the only cells that carry trace dofs on the facet, so they are the level's
-# eligible cells in the facet's partition (`_partition`): its signature accepts no other parent, and its coordinate
-# projection follows the *active boundary layer* rather than the level's whole active region — an overlay live deep in
-# the interior then contributes nothing to a facet it never touches.
-function _side_cells(level::Level{D}, sides::Vector{Tuple{Int,Symbol}}) where {D}
-    counts = level.mesh.cells
-    return CartesianIndices(ntuple(D) do d
-                                for (axis, side) in sides
-                                    axis == d || continue
-                                    side === :lower && return 1:1
-                                    side === :upper && return counts[d]:counts[d]
-                                    throw(ArgumentError("boundary side must be :lower or :upper"))
-                                end
-                                return 1:counts[d]
-                            end)
 end
 
 # Build the admissible boundary regions on the facet identified by `sides`.
@@ -582,6 +512,62 @@ function _facet_regions(records::Vector{_RegionRecord{D,T}}, slice, sides::Vecto
               Region(record.lower, record.upper, record.parents, kind, points, weights; normal, sides, residual))
     end
     return regions
+end
+
+# Axes *not* constrained by `sides`. Each codim-1 face has `D − 1` free axes; a codim-D vertex has zero free axes. Used
+# to size the free-axis tensor quadrature and to enumerate which axes carry physical extent on the boundary region.
+function _free_axes(sides::AbstractVector{<:Tuple{Integer,Symbol}}, ::Val{D}) where {D}
+    constrained = Set{Int}()
+    for (axis, _) in sides
+        push!(constrained, Int(axis))
+    end
+    return [d for d in 1:D if !(d in constrained)]
+end
+
+# Fixed coordinate value for axis `d` of a facet specified by `sides`. Returns the side's coordinate
+# (`domain.lower[axis]` or `domain.upper[axis]`) when `d` is constrained by some entry of `sides` and `zero(T)`
+# otherwise — the caller overwrites the free-axis entries with actual interval bounds.
+function _facet_fixed_coord(domain::AxisBox{D,T}, sides::AbstractVector{<:Tuple{Integer,Symbol}},
+                            d::Integer) where {D,T}
+    for (axis, side) in sides
+        axis == d || continue
+        return side === :lower ? domain.lower[axis] : domain.upper[axis]
+    end
+    return zero(T)
+end
+
+# The cells of `level` whose own faces all lie on `sides`: index `1` or the last index on each constrained axis, the
+# whole range on the free ones. These are the only cells that carry trace dofs on the facet, so they are the level's
+# eligible cells in the facet's partition (`_partition`): its signature accepts no other parent, and its coordinate
+# projection follows the *active boundary layer* rather than the level's whole active region — an overlay live deep in
+# the interior then contributes nothing to a facet it never touches.
+function _side_cells(level::Level{D}, sides::Vector{Tuple{Int,Symbol}}) where {D}
+    counts = level.mesh.cells
+    return CartesianIndices(ntuple(D) do d
+                                for (axis, side) in sides
+                                    axis == d || continue
+                                    side === :lower && return 1:1
+                                    side === :upper && return counts[d]:counts[d]
+                                    throw(ArgumentError("boundary side must be :lower or :upper"))
+                                end
+                                return 1:counts[d]
+                            end)
+end
+
+# Outward unit normal of a facet identified by `sides`. For codim-1 facets this is `±eₐ` with the sign set by the single
+# `side`. For codim-`K > 1` facets the constrained-face outward normals are summed and normalised; well-defined for
+# every `K ≤ D` and continuous in the face geometry, though not geometrically as sharp as the codim-1 case (a codim-2
+# corner in 2D returns the diagonal-out direction).
+function _facet_outward_normal(sides::AbstractVector{<:Tuple{Integer,Symbol}}, ::Val{D}, ::Type{T}) where {D,T}
+    accumulator = MVector{D,T}(ntuple(_ -> zero(T), D))
+    for (axis, side) in sides
+        sign = side === :lower ? -one(T) :
+               side === :upper ? one(T) : throw(ArgumentError("boundary side must be :lower or :upper"))
+        accumulator[axis] += sign
+    end
+    n = SVector{D,T}(accumulator)
+    norm_n = sqrt(sum(x -> x * x, n))
+    return iszero(norm_n) ? n : n / norm_n
 end
 
 # ── Facet slices ──────────────────────────────────────────────────────────────
@@ -1111,6 +1097,20 @@ function _accumulate_dirichlet_rhs!(rhs::Vector{Vector{T}}, samples::FacetTraceS
         end
     end
     return rhs
+end
+
+# Evaluate a `DirichletCondition` at physical coordinate `x` for the given component. Handles both constant and callback
+# `value` fields.
+function _condition_value(condition::DirichletCondition, x, component::Integer=1)
+    value = condition.value isa Function ? condition.value(x) : condition.value
+    return _component_value(value, component)
+end
+
+# Component extraction from a Dirichlet value: scalars apply to every component, anything indexable supplies one entry
+# per component.
+function _component_value(value, component::Integer)
+    value isa Number && return value
+    return value[component]
 end
 
 # Cheap structural compatibility check. Re-projecting Dirichlet values in place is only valid when the *set* of

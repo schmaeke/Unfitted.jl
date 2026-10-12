@@ -76,34 +76,47 @@ function _interface_regions(iface::Interface, problem::Problem, layout::SystemLa
     return _simplex_regions(iface.geometry, spaces, fields, layout.tolerance)
 end
 
-# ── Interface-kernel sugar ────────────────────────────────────────────────────
-
-"""
-    onside(side, a, b)
-
-Pick the value on `side` of a coupling interface: `a` when `side === :a`, `b` when `side === :b`. Replaces the
-`side === :a ? a : b` ternaries an [`InterfaceForm`](@ref) kernel writes for per-side material data. Bundle several
-per-side quantities into a `NamedTuple` to pick them all at once, e.g.
-`m = onside(sides.trial, (κ=κ₁, w=w₁), (κ=κ₂, w=w₂))` then `m.κ`, `m.w`.
-"""
-onside(side::Symbol, a, b) = side === :a ? a : b
-
-"""
-    jump_sign(side)
-
-The sign `side` contributes to an interface jump `⟦·⟧ = (·)_a − (·)_b`: `+1` on `:a`, `−1` on `:b`. In an
-[`InterfaceForm`](@ref) kernel the test/trial jumps are `⟦v⟧ = jump_sign(sides.test)·v` and
-`⟦u⟧ = jump_sign(sides.trial)·u`.
-"""
-jump_sign(side::Symbol) = onside(side, 1, -1)
-
 # ── couple ────────────────────────────────────────────────────────────────────
 
-# Zero-gradient / value negation of a weak-form callback return: flips the sign of the emitted `TestChannels` (or bare
-# scalar) so the off-diagonal blocks of a jump coupling carry `−a`. `_negate_channels` covers both the structured and
-# the scalar-shorthand return conventions of `WeakForm`.
-_negate_channels(c::TestChannels) = TestChannels(-c.value, -c.gradient)
-_negate_channels(x::Number) = -x
+"""
+    couple(uₐ::Field, u_b::Field, Γ::BoundaryMesh, form::WeakForm) -> NTuple{4,BlockForm}
+
+Expand the jump coupling `∫_Γ a([u], [v]) dΓ` — `[u] = uₐ − u_b` — between two independently discretised fields into the
+four field blocks it populates, ready to drop into a [`Problem`](@ref)'s `blocks`:
+
+    a([u],[v]) = a(uₐ,vₐ) − a(uₐ,v_b) − a(u_b,vₐ) + a(u_b,v_b),
+
+i.e. `+Kₐₐ, −K_ab, −K_ba, +K_bb`, all integrated over the shared interface `Γ`.
+
+`form` is *your* bilinear interface form `a(trial, test)`, written from ordinary [`WeakForm`](@ref)s — the library
+supplies the two-sided interface integration, not the constitutive law. The canonical penalty coupling
+`∫_Γ β [u]·[v] dΓ` is `couple(uₐ, u_b, Γ, mass_form(coefficient = β))`; a form reading `q.normal` and `trial.gradient`
+gives a flux/Nitsche coupling (mind the interface orientation — see [`Interface`](@ref)). Like every assembled bilinear
+form, the callback must be **linear in `trial` at fixed `q.state`**; a jump-nonlinear cohesive law is expressed by
+reading both fields' current iterate through `q.state` and returning its secant/tangent coefficient (a
+Newton/fixed-point step), not by making the callback itself nonlinear. There is no per-point interface history channel,
+so genuinely path-dependent state must be carried by the caller.
+
+For a bespoke interface term that is *not* a symmetric jump coupling, attach it directly with
+`block(test, trial, form; on = interface(uₐ, u_b, Γ))`.
+
+!!! note "Threaded assembly under code coverage"
+    Interface coupling passes assemble in parallel, like every other pass. One unexplained observation stands against
+    that: the assembled two-sided block of a vector-valued coupling was seen to be nondeterministically corrupted under
+    `--code-coverage` with `Threads.nthreads() ≥ 2`, on both x86 and ARM, and never outside a coverage-instrumented
+    process. It has not been reproduced since, and the mechanism is not established. A later stress campaign — some
+    30,000 assemblies compared bit-exactly against serial across both platforms, plus twenty consecutive
+    coverage-instrumented full-suite runs at four threads on Linux x64 — produced no mismatch, with a positive control
+    confirming the comparison detects a one-ulp perturbation. That is a strong negative result and not a proof of
+    absence. If you need bit-reproducible output from a coupled assembly *inside* a coverage-instrumented multithreaded
+    process, assemble that step serially with `assemble!(model; threaded=false)`.
+"""
+function couple(u_a::Field, u_b::Field, geometry::BoundaryMesh, form::WeakForm)
+    iface = interface(u_a, u_b, geometry)
+    neg = _negated_form(form)
+    return (block(u_a, u_a, form; on=iface), block(u_b, u_a, neg; on=iface), block(u_a, u_b, neg; on=iface),
+            block(u_b, u_b, form; on=iface))
+end
 
 # Wrap a bilinear form so its emitted channels are negated, preserving the component-aware arity and the symmetry /
 # linear metadata.
@@ -112,6 +125,12 @@ function _negated_form(form::WeakForm)
                ((q, trial) -> _negate_channels(form.bilinear(q, trial)))
     return WeakForm(; bilinear, linear=form.linear, symmetric=form.symmetric, component_aware=form.component_aware)
 end
+
+# Zero-gradient / value negation of a weak-form callback return: flips the sign of the emitted `TestChannels` (or bare
+# scalar) so the off-diagonal blocks of a jump coupling carry `−a`. `_negate_channels` covers both the structured and
+# the scalar-shorthand return conventions of `WeakForm`.
+_negate_channels(c::TestChannels) = TestChannels(-c.value, -c.gradient)
+_negate_channels(x::Number) = -x
 
 """
     InterfaceForm(kernel; symmetric=false)
@@ -170,46 +189,6 @@ end
 InterfaceForm(kernel; symmetric::Bool=false) = InterfaceForm{typeof(kernel)}(kernel, symmetric)
 
 """
-    couple(uₐ::Field, u_b::Field, Γ::BoundaryMesh, form::WeakForm) -> NTuple{4,BlockForm}
-
-Expand the jump coupling `∫_Γ a([u], [v]) dΓ` — `[u] = uₐ − u_b` — between two independently discretised fields into the
-four field blocks it populates, ready to drop into a [`Problem`](@ref)'s `blocks`:
-
-    a([u],[v]) = a(uₐ,vₐ) − a(uₐ,v_b) − a(u_b,vₐ) + a(u_b,v_b),
-
-i.e. `+Kₐₐ, −K_ab, −K_ba, +K_bb`, all integrated over the shared interface `Γ`.
-
-`form` is *your* bilinear interface form `a(trial, test)`, written from ordinary [`WeakForm`](@ref)s — the library
-supplies the two-sided interface integration, not the constitutive law. The canonical penalty coupling
-`∫_Γ β [u]·[v] dΓ` is `couple(uₐ, u_b, Γ, mass_form(coefficient = β))`; a form reading `q.normal` and `trial.gradient`
-gives a flux/Nitsche coupling (mind the interface orientation — see [`Interface`](@ref)). Like every assembled bilinear
-form, the callback must be **linear in `trial` at fixed `q.state`**; a jump-nonlinear cohesive law is expressed by
-reading both fields' current iterate through `q.state` and returning its secant/tangent coefficient (a
-Newton/fixed-point step), not by making the callback itself nonlinear. There is no per-point interface history channel,
-so genuinely path-dependent state must be carried by the caller.
-
-For a bespoke interface term that is *not* a symmetric jump coupling, attach it directly with
-`block(test, trial, form; on = interface(uₐ, u_b, Γ))`.
-
-!!! note "Threaded assembly under code coverage"
-    Interface coupling passes assemble in parallel, like every other pass. One unexplained observation stands against
-    that: the assembled two-sided block of a vector-valued coupling was seen to be nondeterministically corrupted under
-    `--code-coverage` with `Threads.nthreads() ≥ 2`, on both x86 and ARM, and never outside a coverage-instrumented
-    process. It has not been reproduced since, and the mechanism is not established. A later stress campaign — some
-    30,000 assemblies compared bit-exactly against serial across both platforms, plus twenty consecutive
-    coverage-instrumented full-suite runs at four threads on Linux x64 — produced no mismatch, with a positive control
-    confirming the comparison detects a one-ulp perturbation. That is a strong negative result and not a proof of
-    absence. If you need bit-reproducible output from a coupled assembly *inside* a coverage-instrumented multithreaded
-    process, assemble that step serially with `assemble!(model; threaded=false)`.
-"""
-function couple(u_a::Field, u_b::Field, geometry::BoundaryMesh, form::WeakForm)
-    iface = interface(u_a, u_b, geometry)
-    neg = _negated_form(form)
-    return (block(u_a, u_a, form; on=iface), block(u_b, u_a, neg; on=iface), block(u_a, u_b, neg; on=iface),
-            block(u_b, u_b, form; on=iface))
-end
-
-"""
     couple(uₐ::Field, u_b::Field, Γ::BoundaryMesh, form::InterfaceForm) -> NTuple{4,BlockForm}
 
 Expand a two-sided [`InterfaceForm`](@ref) into the four field blocks it populates. Each block wraps the user kernel
@@ -227,3 +206,24 @@ function couple(u_a::Field, u_b::Field, geometry::BoundaryMesh, form::InterfaceF
     return (block(u_a, u_a, side_form(:a, :a); on=iface), block(u_a, u_b, side_form(:a, :b); on=iface),
             block(u_b, u_a, side_form(:b, :a); on=iface), block(u_b, u_b, side_form(:b, :b); on=iface))
 end
+
+# ── Interface-kernel sugar ────────────────────────────────────────────────────
+
+"""
+    onside(side, a, b)
+
+Pick the value on `side` of a coupling interface: `a` when `side === :a`, `b` when `side === :b`. Replaces the
+`side === :a ? a : b` ternaries an [`InterfaceForm`](@ref) kernel writes for per-side material data. Bundle several
+per-side quantities into a `NamedTuple` to pick them all at once, e.g.
+`m = onside(sides.trial, (κ=κ₁, w=w₁), (κ=κ₂, w=w₂))` then `m.κ`, `m.w`.
+"""
+onside(side::Symbol, a, b) = side === :a ? a : b
+
+"""
+    jump_sign(side)
+
+The sign `side` contributes to an interface jump `⟦·⟧ = (·)_a − (·)_b`: `+1` on `:a`, `−1` on `:b`. In an
+[`InterfaceForm`](@ref) kernel the test/trial jumps are `⟦v⟧ = jump_sign(sides.test)·v` and
+`⟦u⟧ = jump_sign(sides.trial)·u`.
+"""
+jump_sign(side::Symbol) = onside(side, 1, -1)

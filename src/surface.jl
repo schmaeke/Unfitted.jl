@@ -259,6 +259,33 @@ end
 #                             the input, and the parts beyond the outermost lines are kept, so a triangle leaving the
 #                             grid fails like a segment does. Works in 2D and 3D.
 
+# The sub-cells of `mesh` split at the per-axis `lines` (`_split_cell!`), as `(; cells, normals)` with one unit normal
+# per sub-cell: its input cell's, from the mesh's own override (normalised) or else the geometric `_default_normal` of
+# the input cell. Taking the normal from the input cell rather than from each piece keeps a sliver from carrying a
+# normal its few surviving digits define, and computes it once per input cell.
+function _subdivide_mesh(mesh::BoundaryMesh{D,T}, lines::NTuple{D,Vector{T}}) where {D,T}
+    cells = eltype(mesh.cells)[]
+    normals = SVector{D,T}[]
+    for (i, cell) in pairs(mesh.cells)
+        count = length(cells)
+        _split_cell!(cells, cell, lines)
+        normal = mesh.normals === nothing ? _default_normal(cell) : mesh.normals[i] / sqrt(sum(abs2, mesh.normals[i]))
+        for _ in (count+1):length(cells)
+            push!(normals, normal)
+        end
+    end
+    return (; cells, normals)
+end
+
+# One input cell's pieces, each inside a single cell of every level the `lines` come from, appended to `cells` (see
+# above). Both subdividers are scale-free: `_subdivide_segment` reads a dimensionless crossing parameter, and
+# `_subdivide_triangle` an area relative to the input's.
+_split_cell!(cells, cell::NTuple{1}, _) = push!(cells, cell)
+function _split_cell!(cells, (a, b)::NTuple{2,SVector{D,T}}, lines) where {D,T}
+    append!(cells, _subdivide_segment(a, b, lines, sqrt(eps(T))))
+end
+_split_cell!(cells, (a, b, c)::NTuple{3,SVector}, lines) = append!(cells, _subdivide_triangle(a, b, c, lines))
+
 """
     _subdivide_segment(p1, p2, grid_lines, nudge)
 
@@ -313,32 +340,6 @@ function _subdivide_segment(p1::SVector{D,T}, p2::SVector{D,T}, grid_lines::NTup
     return segments
 end
 
-# Split a convex polygon at the plane `x[d] = c` through its interior into the parts below and above it: one
-# Sutherland–Hodgman pass against a single plane that keeps both sides (I. E. Sutherland, G. W. Hodgman, "Reentrant
-# polygon clipping", Commun. ACM 17 (1974) 32–42, doi:10.1145/360767.360802). Walking the edges in order, a vertex goes
-# to the side it lies on, and to both when it lies on the plane; an edge that crosses the plane strictly puts its
-# crossing point on both sides, between its endpoints. The crossing is interpolated from the edge's lower endpoint
-# along `d`, so two triangles sharing an edge compute the same points on it, and then set exactly onto the plane: the
-# two sides meet along it with neither a gap nor an overlap, and a piece split at `c` ends exactly at `c`. Both sides
-# of a convex polygon are convex, in the input's vertex order, and have at most one vertex more than it.
-function _split_polygon(polygon::Vector{SVector{D,T}}, d::Int, c::T) where {D,T}
-    below = sizehint!(SVector{D,T}[], length(polygon) + 1)
-    above = sizehint!(SVector{D,T}[], length(polygon) + 1)
-    a = polygon[end]
-    for b in polygon
-        if min(a[d], b[d]) < c < max(a[d], b[d])
-            p, q = a[d] < b[d] ? (a, b) : (b, a)
-            x = Base.setindex(p + (c - p[d]) / (q[d] - p[d]) * (q - p), c, d)
-            push!(below, x)
-            push!(above, x)
-        end
-        b[d] <= c && push!(below, b)
-        b[d] >= c && push!(above, b)
-        a = b
-    end
-    return below, above
-end
-
 """
     _subdivide_triangle(v1, v2, v3, grid_lines) -> Vector{NTuple{3,SVector{D,T}}}
 
@@ -383,31 +384,30 @@ function _subdivide_triangle(v1::SVector{D,T}, v2::SVector{D,T}, v3::SVector{D,T
     return triangles
 end
 
-# One input cell's pieces, each inside a single cell of every level the `lines` come from, appended to `cells` (see
-# above). Both subdividers are scale-free: `_subdivide_segment` reads a dimensionless crossing parameter, and
-# `_subdivide_triangle` an area relative to the input's.
-_split_cell!(cells, cell::NTuple{1}, _) = push!(cells, cell)
-function _split_cell!(cells, (a, b)::NTuple{2,SVector{D,T}}, lines) where {D,T}
-    append!(cells, _subdivide_segment(a, b, lines, sqrt(eps(T))))
-end
-_split_cell!(cells, (a, b, c)::NTuple{3,SVector}, lines) = append!(cells, _subdivide_triangle(a, b, c, lines))
-
-# The sub-cells of `mesh` split at the per-axis `lines` (`_split_cell!`), as `(; cells, normals)` with one unit normal
-# per sub-cell: its input cell's, from the mesh's own override (normalised) or else the geometric `_default_normal` of
-# the input cell. Taking the normal from the input cell rather than from each piece keeps a sliver from carrying a
-# normal its few surviving digits define, and computes it once per input cell.
-function _subdivide_mesh(mesh::BoundaryMesh{D,T}, lines::NTuple{D,Vector{T}}) where {D,T}
-    cells = eltype(mesh.cells)[]
-    normals = SVector{D,T}[]
-    for (i, cell) in pairs(mesh.cells)
-        count = length(cells)
-        _split_cell!(cells, cell, lines)
-        normal = mesh.normals === nothing ? _default_normal(cell) : mesh.normals[i] / sqrt(sum(abs2, mesh.normals[i]))
-        for _ in (count+1):length(cells)
-            push!(normals, normal)
+# Split a convex polygon at the plane `x[d] = c` through its interior into the parts below and above it: one
+# Sutherland–Hodgman pass against a single plane that keeps both sides (I. E. Sutherland, G. W. Hodgman, "Reentrant
+# polygon clipping", Commun. ACM 17 (1974) 32–42, doi:10.1145/360767.360802). Walking the edges in order, a vertex goes
+# to the side it lies on, and to both when it lies on the plane; an edge that crosses the plane strictly puts its
+# crossing point on both sides, between its endpoints. The crossing is interpolated from the edge's lower endpoint
+# along `d`, so two triangles sharing an edge compute the same points on it, and then set exactly onto the plane: the
+# two sides meet along it with neither a gap nor an overlap, and a piece split at `c` ends exactly at `c`. Both sides
+# of a convex polygon are convex, in the input's vertex order, and have at most one vertex more than it.
+function _split_polygon(polygon::Vector{SVector{D,T}}, d::Int, c::T) where {D,T}
+    below = sizehint!(SVector{D,T}[], length(polygon) + 1)
+    above = sizehint!(SVector{D,T}[], length(polygon) + 1)
+    a = polygon[end]
+    for b in polygon
+        if min(a[d], b[d]) < c < max(a[d], b[d])
+            p, q = a[d] < b[d] ? (a, b) : (b, a)
+            x = Base.setindex(p + (c - p[d]) / (q[d] - p[d]) * (q - p), c, d)
+            push!(below, x)
+            push!(above, x)
         end
+        b[d] <= c && push!(below, b)
+        b[d] >= c && push!(above, b)
+        a = b
     end
-    return (; cells, normals)
+    return below, above
 end
 
 # ── SimplexRegion and builder ─────────────────────────────────────────────────
@@ -439,6 +439,11 @@ What its fields hold on a sub-cell:
     there is no trimming and no fit, unlike a facet region whose part inside `Ω` the package has to find.
 """
 const SimplexRegion{D,T} = Region{D,T,SVector{D,T},Nothing}
+
+# Build the full list of surface regions for one `BoundaryMesh` against a given space (`_simplex_regions`, one-sided).
+function _surface_regions_for_mesh(V::Space{D,T}, mesh::BoundaryMesh{D,T}, tol::GeometryTolerance{T}) where {D,T}
+    _simplex_regions(mesh, (V,), (0, 0), tol)
+end
 
 # Every `SimplexRegion` of `mesh` integrated against `spaces`: one space for an immersed surface (`fields = (0, 0)`,
 # kind `:surface`), the two subdomain spaces of a coupling interface (`fields = (field_a, field_b)`, their global field
@@ -519,9 +524,4 @@ function _check_surface_cover(levels::Tuple, sig::Tuple, x, tol, index::Int)
     all(iszero, sig) && throw(ArgumentError("BoundaryMesh cell #$index lies entirely outside the discretization — " *
                                             "no covering parent found on any level"))
     return nothing
-end
-
-# Build the full list of surface regions for one `BoundaryMesh` against a given space (`_simplex_regions`, one-sided).
-function _surface_regions_for_mesh(V::Space{D,T}, mesh::BoundaryMesh{D,T}, tol::GeometryTolerance{T}) where {D,T}
-    _simplex_regions(mesh, (V,), (0, 0), tol)
 end

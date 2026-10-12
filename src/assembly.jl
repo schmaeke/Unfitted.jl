@@ -1255,6 +1255,21 @@ end
 # (`intersections.jl`). These accessors are the only place the kernel reads a region; each has one method, and the
 # region kinds differ only in the `normal` / `sides` types they carry.
 
+# The range of `region.parents` field `fl` (global index `f`) is evaluated on, empty when the field does not live
+# there. Subdomain ownership is intrinsic. A one-sided region (`fields == (0, 0)`) hands its parents only to a field
+# whose level-id block contains the region's level, so a region built on one subdomain's plan is owned exactly by the
+# fields on that subdomain; on a single-domain model every field's block covers every level and every field gets the
+# parents. A two-sided interface region evaluates each coupled field on its own side's parents — `1:split` for
+# `field_a`, the rest for `field_b` — and every other field on none, so an interface pass emits into exactly the four
+# field blocks Kₐₐ, K_ab, K_ba, K_bb. It is keyed on the field *index* (the region stores its two sides' global field
+# indices), not on the level block.
+function _parent_range(region::Region, f::Int, fl::FieldLayout)
+    a, b = region.fields
+    n = length(region.parents)
+    a == 0 && return (n == 0 || first(region.parents).level in fl.level_ids) ? (1:n) : (1:0)
+    return f == a ? (1:region.split) : f == b ? ((region.split+1):n) : (1:0)
+end
+
 # Number of quadrature points of a region, which sizes its `q.point` range (`RegionList`) and drives the kernel's point
 # loop.
 _region_qpoint_count(region::Region) = length(region.weights)
@@ -1285,27 +1300,6 @@ end
     return x, region.weights[k] * jacobian, p
 end
 
-# `q`-tuple extras the form callbacks read: the unit normal (`nothing` for a volume region; the outward face normal for
-# a facet; the sub-cell's normal for an immersed surface or an interface, oriented from side `a` to side `b` there) and
-# the codim-`K` facet identifier `q.sides` (only a facet carries one).
-_region_normal(region::Region, ::Int) = region.normal
-_region_sides(region::Region) = region.sides
-
-# The range of `region.parents` field `fl` (global index `f`) is evaluated on, empty when the field does not live
-# there. Subdomain ownership is intrinsic. A one-sided region (`fields == (0, 0)`) hands its parents only to a field
-# whose level-id block contains the region's level, so a region built on one subdomain's plan is owned exactly by the
-# fields on that subdomain; on a single-domain model every field's block covers every level and every field gets the
-# parents. A two-sided interface region evaluates each coupled field on its own side's parents — `1:split` for
-# `field_a`, the rest for `field_b` — and every other field on none, so an interface pass emits into exactly the four
-# field blocks Kₐₐ, K_ab, K_ba, K_bb. It is keyed on the field *index* (the region stores its two sides' global field
-# indices), not on the level block.
-function _parent_range(region::Region, f::Int, fl::FieldLayout)
-    a, b = region.fields
-    n = length(region.parents)
-    a == 0 && return (n == 0 || first(region.parents).level in fl.level_ids) ? (1:n) : (1:0)
-    return f == a ? (1:region.split) : f == b ? ((region.split+1):n) : (1:0)
-end
-
 # Evaluate every parent's basis at the current frame point `p` into the bank: values and physical gradients
 # (`Val(true)`), or values only (`Val(false)`, for the L² transfer rhs, whose integrand never reads a gradient). Each
 # parent maps `p` into its own reference frame through `ξ0 + dξ ∘ p` (`Parent`), with no division. The gradient scale is
@@ -1329,6 +1323,12 @@ end
     end
     return nothing
 end
+
+# `q`-tuple extras the form callbacks read: the unit normal (`nothing` for a volume region; the outward face normal for
+# a facet; the sub-cell's normal for an immersed surface or an interface, oriented from side `a` to side `b` there) and
+# the codim-`K` facet identifier `q.sides` (only a facet carries one).
+_region_normal(region::Region, ::Int) = region.normal
+_region_sides(region::Region) = region.sides
 
 # ── FormState: evaluation and accessors ───────────────────────────────────────
 

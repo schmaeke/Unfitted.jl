@@ -165,6 +165,11 @@ struct SmallOverlap{T<:Real}
     cover_count::Int
 end
 
+function Base.show(io::IO, overlap::SmallOverlap)
+    print(io, "SmallOverlap(region=", overlap.region, ", volume=", overlap.volume, ", relative=",
+          overlap.relative_volume, ", cover=", overlap.cover_count, ")")
+end
+
 """
     IntegrationPlan{D,T}
 
@@ -192,9 +197,315 @@ struct IntegrationPlan{D,T<:Real}
     moment_fit_residual_max::Float64
 end
 
-function Base.show(io::IO, overlap::SmallOverlap)
-    print(io, "SmallOverlap(region=", overlap.region, ", volume=", overlap.volume, ", relative=",
-          overlap.relative_volume, ", cover=", overlap.cover_count, ")")
+# ── Admissible box partition ──────────────────────────────────────────────────
+
+# The cells one level may parent in a partition — its slot of `_partition`'s `cells` tuple: every cell of the level
+# (`_AllCells`: the volume plan, the transfer and the immersed simplices), the cells with a face on a boundary facet
+# (`_side_cells` in `dirichlet.jl`), or none at all (an empty range: a level whose mesh does not reach that facet).
+# `_AllCells` is a singleton so that the membership tests below fold to `true` at compile time wherever every cell is
+# eligible.
+struct _AllCells end
+Base.in(::CartesianIndex, ::_AllCells) = true
+Base.isempty(::_AllCells) = false
+_cell_range(level, ::_AllCells) = CartesianIndices(level.mesh.cells)
+_cell_range(_, cells::CartesianIndices) = cells
+
+# The admissible-box partition engine: the boxes of `levels` spanned on the `free` axes through the point `anchor`,
+# whose other coordinates are held fixed, each handed to `emit(lower, upper, sig)` in emission order, `sig` the box's
+# coverage signature. Every consumer turns a box into its own record on the spot, so the engine materialises no box list
+# of its own. It is the box-partition half of the recipe documented in `CONTRIBUTING.md`'s "Integration regions"
+# section, and every partition the package builds runs through it:
+#
+#   - the volume plan (`integration_plan`): every axis free, every cell eligible;
+#   - a boundary facet (`_boundary_facet_regions` in `dirichlet.jl`): the facet's free axes, the anchor carrying the
+#     facet's own coordinates on its pinned ones, and per level only the cells with a face on the facet;
+#   - the L² transfer (`_transfer_regions` in `projection.jl`): the source and target levels in one tuple.
+#
+# The steps:
+#
+#   1. Collect, per axis, every level's element-boundary coordinates that bound an active eligible cell of that level
+#      (`_merged_axis_coordinates` ⇒ `_live_axis_coordinates` ⇒ `merge_coordinates`), and form the free axes'
+#      non-degenerate intervals (`_intervals_from_coordinates`). A coordinate no level keeps separates two slabs of
+#      identical coverage signature, which step 4 would have merged again, so dropping it costs no region and no
+#      exactness.
+#   2. Form the Cartesian product of those intervals, giving the *candidate* box index grid `CartesianIndices(ranges)`.
+#   3. For each candidate, compute the coverage signature at its midpoint (`_signature`). On a fixed axis the midpoint
+#      is `(v + v) / 2 = v`, the anchor's own coordinate.
+#   4. Greedy axis-by-axis merging: starting from an unvisited candidate, extend the box along each free axis in turn as
+#      long as the next "slab" of candidates is (a) unvisited and (b) shares the signature of the starting candidate.
+#      Mark every merged candidate visited so it is not emitted again.
+#
+# The greedy merge keeps the number of regions close to the number of genuinely distinct cell-coverage patterns rather
+# than producing one region per candidate. Without the merge, a small overlay's per-axis coordinates would slice the
+# entire physical domain along the overlay axis, splitting far-away base cells into long chains of
+# trivially-equal-signature sub-boxes for no integration benefit.
+#
+# Mathematical correctness: every candidate inside a merged box has the same coverage signature, so the box lies inside
+# one cell of every contributing level. The integrand of any basis-function product on the box is then a smooth
+# polynomial in the parent's reference frame, and the per-region Gauss rule remains exact. The greedy order of axes can
+# change the *shape* of the resulting boxes (the same volume can be packed many ways) but never their *total* volume or
+# their numerical contribution.
+#
+# A seed no level covers — an all-zero signature, where every level is inactive or ineligible — is skipped rather than
+# emitted: it is no region for any user of the engine, which has nothing to integrate, constrain or transfer there.
+# Skipping it changes nothing else, since a seed with a non-zero signature only ever absorbs candidates of its own
+# signature: every other box, its extent and its place in the order are the ones the full partition would emit.
+#
+# Steps 3–4 are split across the small helpers below rather than written as one flat loop. That split is load-bearing,
+# not style. The greedy merge's running upper corner `hi` is reassigned on every extension *and* read inside `ntuple`
+# closures; written in one frame, Julia heap-boxes it as a `Core.Box`, rebuilds the box on each extension and turns
+# every read into a dynamic dispatch. In that form this single variable accounted for 95% of `integration_plan`'s
+# allocations, on a path `prepare`, `move!` and `activate!` all run. The helpers restore the separation the compiler
+# needs: every frame that *closes over* `hi` receives it as an argument and never writes it, and the frames that write
+# it (`_extend_axis`, and `_partition`, which turns it into ranges with `map(:, …)` rather than a closure) close over
+# nothing. Do not fold them back inline.
+
+function _partition(emit, levels::Tuple, free::NTuple{F,Int}, anchor::SVector{D,T}, tol::GeometryTolerance{T},
+                    cells::Tuple=map(_ -> _AllCells(), levels)) where {F,D,T}
+    coords = _merged_axis_coordinates(levels, Val(D), tol, cells)
+    intervals = ntuple(j -> _intervals_from_coordinates(coords[free[j]], tol), Val(F))
+    ranges = ntuple(j -> length(intervals[j]), Val(F))
+    any(==(0), ranges) && return nothing
+
+    # The per-level linear cell index maps once, and the coverage signature once per candidate: both are reused inside
+    # the greedy merge, where signature equality is the hot inner check.
+    linmaps = map(level -> LinearIndices(level.mesh.cells), levels)
+    slot = ntuple(d -> something(findfirst(==(d), free), 0), Val(D))
+    sigs = map(CartesianIndices(ranges)) do index
+        lower, upper = _corners(anchor, slot, intervals, index.I, index.I)
+        return _signature(levels, linmaps, cells, (lower + upper) / 2, tol)
+    end
+
+    visited = falses(ranges)
+    for start in CartesianIndices(ranges)
+        visited[start] && continue
+        sig = sigs[start]
+        all(iszero, sig) && continue
+        # Greedy axis-by-axis extension: extend along free axis `j` as far as the next slab of candidates matches the
+        # seed signature, then repeat for the next axis. The merge never backtracks.
+        hi = start.I
+        for j in 1:F
+            hi = _extend_axis(sigs, visited, ranges, start.I, hi, sig, j)
+        end
+        for c in CartesianIndices(map(:, start.I, hi))
+            visited[c] = true
+        end
+        lower, upper = _corners(anchor, slot, intervals, start.I, hi)
+        emit(lower, upper, sig)
+    end
+    return nothing
+end
+
+# Per-axis merged element-boundary coordinates: gather each axis's live element-boundary coordinates from every level
+# (`_live_axis_coordinates`, over that level's slot of `cells`) and canonicalise them with `merge_coordinates`, so two
+# meshes' nearly-coincident boundaries collapse to a single shared coordinate. Shared by the partition engine
+# (`_partition`) and the lines immersed simplices are split at (`_simplex_regions` in surface.jl).
+function _merged_axis_coordinates(levels, ::Val{D}, tol::GeometryTolerance{T},
+                                  cells=map(_ -> _AllCells(), levels)) where {D,T}
+    per_level = map((level, eligible) -> _live_axis_coordinates(level, Val(D), eligible), levels, cells)
+    return ntuple(D) do d
+        merged = T[]
+        for live in per_level
+            append!(merged, live[d])
+        end
+        merge_coordinates(merged, tol)
+    end
+end
+
+# Per-axis live element-boundary coordinates of one level: for each axis, the coordinates that bound at least one
+# *active* cell of `level` among `cells` (see `_AllCells`). This is the projection of the level's live region onto the
+# axes, and it replaces the level's whole node grid in every partition the package builds. One pass over the mask marks
+# all `D` axes, so a plan pays for a level's mask once, not once per axis. A level with no eligible cell contributes no
+# coordinate at all.
+#
+# *Why the partition does not change.* A coordinate is dropped only when it separates two slabs of cells, neither of
+# which is live on this level. It is then the face of no live cell here, and the level's coverage signature
+# (`_signature`) is the same on both sides of it: either the line is not a node of this mesh, so both sides sit inside
+# one cell, or it is a node whose two neighbouring cells are both dead, so both sides read `0`. A line the *merged* set
+# loses is one that no level keeps, so every level's signature is constant across it and the greedy merge in
+# `_partition` fuses the two slabs it separates anyway. The emitted box list comes out the same, in the same order —
+# and the candidate grid now follows the active region instead of the finest participating mesh, which is where the
+# cost of a deep `ladder` sat. Where no level is live at all the projection stops at the outermost live face instead of
+# tiling the dead remainder, which changes no emitted box: `_partition` emits no box that no level covers.
+#
+# The remaining caveat is canonicalisation, not geometry: `merge_coordinates` keeps the *first* representative of a
+# group within `tol.merge`. On a nested stack the shared nodes are bit-identical (`_mesh_axes` divides equal rationals),
+# so dropping a dead line cannot change which value represents a group and the plan is bit-identical. On a non-nested
+# overlay a dead line sitting within `tol.merge` below a live line of another level *was* that group's representative,
+# so the canonical coordinate can move by at most `tol.merge`.
+#
+# An unmasked level answers from its axes directly, without touching a mask it does not have.
+function _live_axis_coordinates(level, ::Val{D}, cells) where {D}
+    nodes = boundary_coordinates(level.mesh)
+    scan = _cell_range(level, cells)
+    isempty(scan) && return ntuple(d -> nodes[d][1:0], D)
+    mask = level.mask
+    lo, hi = first(scan).I, last(scan).I
+    mask === nothing && return ntuple(d -> nodes[d][lo[d]:(hi[d]+1)], D)
+    live = ntuple(d -> falses(length(nodes[d])), D)
+    # `findall` on a `BitVector` walks 64 cells per machine word, so this costs the mask's size in *words* plus its
+    # active cells — not its cell count. It runs on the flattened mask rather than the `D`-dimensional one on purpose:
+    # `findall` returns `Int` for a vector and `CartesianIndex{D}` for `D > 1`, and one `D`-generic loop body cannot
+    # consume both. `vec` on a `BitArray` is a reshape, so nothing is copied.
+    cartesian = CartesianIndices(mask.on)
+    for i in findall(vec(mask.on))
+        c = cartesian[i]
+        c in cells || continue
+        for d in 1:D
+            live[d][c.I[d]] = true
+            live[d][c.I[d] + 1] = true
+        end
+    end
+    return ntuple(d -> nodes[d][live[d]], D)
+end
+
+# Form non-degenerate intervals between successive entries of a sorted, canonicalised coordinate list. Pairs closer than
+# `tol.merge` are dropped — `merge_coordinates` should already have collapsed them, but the check here is a safety net.
+function _intervals_from_coordinates(coords::Vector{T}, tol::GeometryTolerance{T}) where {T}
+    intervals = Tuple{T,T}[]
+    for i in 1:(length(coords)-1)
+        lower = coords[i]
+        upper = coords[i + 1]
+        if upper - lower > tol.merge
+            push!(intervals, (lower, upper))
+        end
+    end
+    return intervals
+end
+
+# Physical corners of the candidate index range `lo:hi`: the interval ends on the free axes, the anchor's coordinate on
+# the others. `slot[d]` is axis `d`'s position among the free axes, `0` on a fixed axis.
+function _corners(anchor::SVector{D,T}, slot::NTuple{D,Int}, intervals, lo, hi) where {D,T}
+    lower = SVector{D,T}(ntuple(d -> slot[d] == 0 ? anchor[d] : intervals[slot[d]][lo[slot[d]]][1], Val(D)))
+    upper = SVector{D,T}(ntuple(d -> slot[d] == 0 ? anchor[d] : intervals[slot[d]][hi[slot[d]]][2], Val(D)))
+    return lower, upper
+end
+
+# Coverage signature at a point: per level, the linear index of the cell containing `x`, with `0` standing for "off this
+# level's mesh", "in an inactive cell" or "in a cell the level may not parent here" (`cells`) — all three mean the level
+# contributes nothing at `x`. Two boxes share a signature iff they lie inside the same cell of every contributing level,
+# so the smooth-integrand contract (one cell per axis per level) is preserved when merging axis-adjacent
+# equal-signature boxes, and the signature alone determines a box's parents (`_parents`).
+#
+# The signature is an `NTuple{N,Int}` built by `map` over the level tuple rather than a `Vector{Int}`, so the equality
+# comparison in the merge stays on the stack and every level's lookup is statically dispatched. A `Vector{Int}` per
+# candidate box was once the largest single allocation source in `integration_plan`.
+function _signature(levels::Tuple, linmaps::Tuple, cells::Tuple, x::SVector{D,T}, tol::GeometryTolerance{T}) where {D,T}
+    return map(levels, linmaps, cells) do level, linmap, eligible
+        isempty(eligible) && return 0
+        cell = locate_cell(level.mesh, x; tol)
+        return cell === nothing || !(cell in eligible) || !is_active(level.mask, cell) ? 0 : linmap[cell]
+    end
+end
+
+# Extend `hi` along axis `d` for as long as successive slabs keep matching.
+function _extend_axis(sigs, visited, ranges::NTuple{D,Int}, start::NTuple{D,Int}, hi::NTuple{D,Int}, sig0,
+                      d::Int) where {D}
+    while hi[d] < ranges[d]
+        next = hi[d] + 1
+        _slab_matches(sigs, visited, start, hi, sig0, d, next) || break
+        hi = Base.setindex(hi, next, d)
+    end
+    return hi
+end
+
+# Does the candidate slab one step past `hi` along axis `d` join the box seeded at `start`? It does when every candidate
+# in the slab is unvisited and carries the seed signature `sig0`.
+function _slab_matches(sigs, visited, start::NTuple{D,Int}, hi::NTuple{D,Int}, sig0, d::Int, next::Int) where {D}
+    slab = CartesianIndices(ntuple(e -> e == d ? (next:next) : (start[e]:hi[e]), D))
+    return all(c -> !visited[c] && sigs[c] == sig0, slab)
+end
+
+# ── Merge tolerance vs. mesh spacing ──────────────────────────────────────────
+#
+# `tolerance.merge` is an absolute length, and `merge_coordinates` collapses per-axis element boundaries that separate
+# by no more than it. Between levels that is exactly the intent: two meshes' near-coincident boundaries should become
+# one shared coordinate rather than a sliver. Within a single level it is silent destruction. An axis whose own cell
+# spacing `h` satisfies `h ≤ tolerance.merge` has its boundary list decimated — genuinely distinct cell faces collapse —
+# and every surviving integration region then straddles two cells of that level. That breaks the
+# one-cell-per-axis-per-level contract the whole region partition rests on, and nothing downstream can detect it: the
+# integrand is no longer smooth on the region, yet the tensor Gauss rule is still applied to it. The observed outcomes
+# are a converged, entirely wrong solution for a span-mode B-spline basis, and an unattributed `SingularException` for
+# integrated Legendre.
+#
+# The check is the compatibility condition between the two lengths the user controls — mesh spacing and merge tolerance
+# — not a floor on either one. Geometry at h = 1e-9 stays legal; it needs a `tolerance.merge` below it, in the same
+# spirit as the region-scaled `atol` in `implicit.jl` and the diagonal-scaled sign tolerance in the MeshIO extension.
+#
+# The threshold is `tolerance.merge` itself and not a multiple of it: it mirrors `merge_coordinates`'s own `> tol.merge`
+# keep-test, so exactly the configurations that lose a coordinate are rejected, and configurations that merely sit close
+# to the tolerance keep working.
+function _check_axis_spacing(levels, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
+    for level in levels, d in 1:D
+        coords = boundary_coordinates(level.mesh)[d]
+        spacing = minimum(coords[i + 1] - coords[i] for i in 1:(length(coords)-1))
+        spacing > tol.merge && continue
+        # Report the scale-aware value the default would have had on this axis, √eps(T) · extent, so the remedy is a
+        # number to paste.
+        suggested = sqrt(eps(T)) * (coords[end] - coords[begin])
+        throw(ArgumentError("level $(level.id) has cell spacing h = $spacing on axis $d, at or " *
+                            "below the coordinate merge tolerance $(tol.merge); pass a smaller " *
+                            "merge tolerance, e.g. `tolerance=GeometryTolerance(; " *
+                            "merge=$suggested)`"))
+    end
+    return nothing
+end
+
+# ── Region parents ────────────────────────────────────────────────────────────
+
+# The parents a box's coverage signature stands for, in level order: per non-zero slot, the level's cell with that
+# linear index and the map from the region's frame `lower`–`upper` into the cell's reference frame (`Parent`). Every
+# candidate the partition merged into the box shares the signature, so the whole box lies in each of these cells — the
+# contract the smooth-integrand argument needs — and decoding the signature is all it takes to find them.
+#
+# A `for` loop that pushes, not a `map` over the levels: a `map` yields a tuple of `Union{Nothing,Parent}` that is
+# boxed per level, which once made a 3D overlay plan 1.8× slower to build. The list is sized to the signature's
+# non-zero slots before the first push, so each region allocates its parent storage once instead of growing it.
+#
+# `_parents!` appends to an existing list instead: a two-sided interface sub-cell decodes both sides' signatures into
+# one parent list, side `a` first (`_simplex_regions` in `surface.jl`).
+function _parents(levels::Tuple, sig::Tuple, lower::SVector{D,T}, upper::SVector{D,T}) where {D,T}
+    return _parents!(sizehint!(Parent{D,T}[], count(!iszero, sig)), levels, sig, lower, upper)
+end
+
+function _parents!(parents::Vector{Parent{D,T}}, levels::Tuple, sig::Tuple, lower::SVector{D,T},
+                   upper::SVector{D,T}) where {D,T}
+    for (level, index) in zip(levels, sig)
+        index == 0 && continue
+        push!(parents, Parent(level, CartesianIndices(level.mesh.cells)[index], lower, upper))
+    end
+    return parents
+end
+
+# Keep-or-drop predicate for an admissible region. Three accepted shapes:
+#
+#   - `:any_parent`  — keep the region if any active level covers it
+#                      (the common assembly criterion: every region with
+#                      at least one contributing basis function counts).
+#   - `:all_levels`  — keep the region only if every level covers it, i.e.
+#                      only where the full superposition overlaps. No
+#                      package code selects it; it is reached through
+#                      `prepare(problem; criterion = :all_levels)`.
+#   - `criterion isa Function` — caller-supplied predicate, called as
+#                      `criterion(parents)` and returning `Bool`. The
+#                      escape hatch for a coverage rule the two symbols
+#                      do not express; no in-tree caller uses it, and it
+#                      reaches the plan through `prepare(problem;
+#                      criterion = …)`.
+#
+# `parents` is never empty here: `_partition` emits no box that no level covers, because such a box has no basis
+# function to integrate and no parent order to size a rule from. Handing one to a callable criterion used to let one
+# that answers `true` keep the box and then crash building its rule.
+function _criterion_satisfied(parents, level_count::Int, criterion)
+    if criterion === :any_parent
+        return !isempty(parents)
+    elseif criterion === :all_levels
+        return length(parents) == level_count
+    elseif criterion isa Function
+        return criterion(parents)
+    end
+
+    throw(ArgumentError("unknown integration-region criterion $criterion"))
 end
 
 # ── Rule sizing ───────────────────────────────────────────────────────────────
@@ -396,317 +707,6 @@ function _trimmed_rule(verdict::Symbol, base_points::Vector{P}, base_weights::Ve
     return kind, vcat(points, base_points), vcat(weights .* (one(T) - alpha), alpha_weights), residual
 end
 
-# ── Admissible box partition ──────────────────────────────────────────────────
-
-# Form non-degenerate intervals between successive entries of a sorted, canonicalised coordinate list. Pairs closer than
-# `tol.merge` are dropped — `merge_coordinates` should already have collapsed them, but the check here is a safety net.
-function _intervals_from_coordinates(coords::Vector{T}, tol::GeometryTolerance{T}) where {T}
-    intervals = Tuple{T,T}[]
-    for i in 1:(length(coords)-1)
-        lower = coords[i]
-        upper = coords[i + 1]
-        if upper - lower > tol.merge
-            push!(intervals, (lower, upper))
-        end
-    end
-    return intervals
-end
-
-# The cells one level may parent in a partition — its slot of `_partition`'s `cells` tuple: every cell of the level
-# (`_AllCells`: the volume plan, the transfer and the immersed simplices), the cells with a face on a boundary facet
-# (`_side_cells` in `dirichlet.jl`), or none at all (an empty range: a level whose mesh does not reach that facet).
-# `_AllCells` is a singleton so that the membership tests below fold to `true` at compile time wherever every cell is
-# eligible.
-struct _AllCells end
-Base.in(::CartesianIndex, ::_AllCells) = true
-Base.isempty(::_AllCells) = false
-_cell_range(level, ::_AllCells) = CartesianIndices(level.mesh.cells)
-_cell_range(_, cells::CartesianIndices) = cells
-
-# Per-axis live element-boundary coordinates of one level: for each axis, the coordinates that bound at least one
-# *active* cell of `level` among `cells` (see `_AllCells`). This is the projection of the level's live region onto the
-# axes, and it replaces the level's whole node grid in every partition the package builds. One pass over the mask marks
-# all `D` axes, so a plan pays for a level's mask once, not once per axis. A level with no eligible cell contributes no
-# coordinate at all.
-#
-# *Why the partition does not change.* A coordinate is dropped only when it separates two slabs of cells, neither of
-# which is live on this level. It is then the face of no live cell here, and the level's coverage signature
-# (`_signature`) is the same on both sides of it: either the line is not a node of this mesh, so both sides sit inside
-# one cell, or it is a node whose two neighbouring cells are both dead, so both sides read `0`. A line the *merged* set
-# loses is one that no level keeps, so every level's signature is constant across it and the greedy merge in
-# `_partition` fuses the two slabs it separates anyway. The emitted box list comes out the same, in the same order —
-# and the candidate grid now follows the active region instead of the finest participating mesh, which is where the
-# cost of a deep `ladder` sat. Where no level is live at all the projection stops at the outermost live face instead of
-# tiling the dead remainder, which changes no emitted box: `_partition` emits no box that no level covers.
-#
-# The remaining caveat is canonicalisation, not geometry: `merge_coordinates` keeps the *first* representative of a
-# group within `tol.merge`. On a nested stack the shared nodes are bit-identical (`_mesh_axes` divides equal rationals),
-# so dropping a dead line cannot change which value represents a group and the plan is bit-identical. On a non-nested
-# overlay a dead line sitting within `tol.merge` below a live line of another level *was* that group's representative,
-# so the canonical coordinate can move by at most `tol.merge`.
-#
-# An unmasked level answers from its axes directly, without touching a mask it does not have.
-function _live_axis_coordinates(level, ::Val{D}, cells) where {D}
-    nodes = boundary_coordinates(level.mesh)
-    scan = _cell_range(level, cells)
-    isempty(scan) && return ntuple(d -> nodes[d][1:0], D)
-    mask = level.mask
-    lo, hi = first(scan).I, last(scan).I
-    mask === nothing && return ntuple(d -> nodes[d][lo[d]:(hi[d]+1)], D)
-    live = ntuple(d -> falses(length(nodes[d])), D)
-    # `findall` on a `BitVector` walks 64 cells per machine word, so this costs the mask's size in *words* plus its
-    # active cells — not its cell count. It runs on the flattened mask rather than the `D`-dimensional one on purpose:
-    # `findall` returns `Int` for a vector and `CartesianIndex{D}` for `D > 1`, and one `D`-generic loop body cannot
-    # consume both. `vec` on a `BitArray` is a reshape, so nothing is copied.
-    cartesian = CartesianIndices(mask.on)
-    for i in findall(vec(mask.on))
-        c = cartesian[i]
-        c in cells || continue
-        for d in 1:D
-            live[d][c.I[d]] = true
-            live[d][c.I[d] + 1] = true
-        end
-    end
-    return ntuple(d -> nodes[d][live[d]], D)
-end
-
-# Per-axis merged element-boundary coordinates: gather each axis's live element-boundary coordinates from every level
-# (`_live_axis_coordinates`, over that level's slot of `cells`) and canonicalise them with `merge_coordinates`, so two
-# meshes' nearly-coincident boundaries collapse to a single shared coordinate. Shared by the partition engine
-# (`_partition`) and the lines immersed simplices are split at (`_simplex_regions` in surface.jl).
-function _merged_axis_coordinates(levels, ::Val{D}, tol::GeometryTolerance{T},
-                                  cells=map(_ -> _AllCells(), levels)) where {D,T}
-    per_level = map((level, eligible) -> _live_axis_coordinates(level, Val(D), eligible), levels, cells)
-    return ntuple(D) do d
-        merged = T[]
-        for live in per_level
-            append!(merged, live[d])
-        end
-        merge_coordinates(merged, tol)
-    end
-end
-
-# Coverage signature at a point: per level, the linear index of the cell containing `x`, with `0` standing for "off this
-# level's mesh", "in an inactive cell" or "in a cell the level may not parent here" (`cells`) — all three mean the level
-# contributes nothing at `x`. Two boxes share a signature iff they lie inside the same cell of every contributing level,
-# so the smooth-integrand contract (one cell per axis per level) is preserved when merging axis-adjacent
-# equal-signature boxes, and the signature alone determines a box's parents (`_parents`).
-#
-# The signature is an `NTuple{N,Int}` built by `map` over the level tuple rather than a `Vector{Int}`, so the equality
-# comparison in the merge stays on the stack and every level's lookup is statically dispatched. A `Vector{Int}` per
-# candidate box was once the largest single allocation source in `integration_plan`.
-function _signature(levels::Tuple, linmaps::Tuple, cells::Tuple, x::SVector{D,T}, tol::GeometryTolerance{T}) where {D,T}
-    return map(levels, linmaps, cells) do level, linmap, eligible
-        isempty(eligible) && return 0
-        cell = locate_cell(level.mesh, x; tol)
-        return cell === nothing || !(cell in eligible) || !is_active(level.mask, cell) ? 0 : linmap[cell]
-    end
-end
-
-# The admissible-box partition engine: the boxes of `levels` spanned on the `free` axes through the point `anchor`,
-# whose other coordinates are held fixed, each handed to `emit(lower, upper, sig)` in emission order, `sig` the box's
-# coverage signature. Every consumer turns a box into its own record on the spot, so the engine materialises no box list
-# of its own. It is the box-partition half of the recipe documented in `CONTRIBUTING.md`'s "Integration regions"
-# section, and every partition the package builds runs through it:
-#
-#   - the volume plan (`integration_plan`): every axis free, every cell eligible;
-#   - a boundary facet (`_boundary_facet_regions` in `dirichlet.jl`): the facet's free axes, the anchor carrying the
-#     facet's own coordinates on its pinned ones, and per level only the cells with a face on the facet;
-#   - the L² transfer (`_transfer_regions` in `projection.jl`): the source and target levels in one tuple.
-#
-# The steps:
-#
-#   1. Collect, per axis, every level's element-boundary coordinates that bound an active eligible cell of that level
-#      (`_merged_axis_coordinates` ⇒ `_live_axis_coordinates` ⇒ `merge_coordinates`), and form the free axes'
-#      non-degenerate intervals (`_intervals_from_coordinates`). A coordinate no level keeps separates two slabs of
-#      identical coverage signature, which step 4 would have merged again, so dropping it costs no region and no
-#      exactness.
-#   2. Form the Cartesian product of those intervals, giving the *candidate* box index grid `CartesianIndices(ranges)`.
-#   3. For each candidate, compute the coverage signature at its midpoint (`_signature`). On a fixed axis the midpoint
-#      is `(v + v) / 2 = v`, the anchor's own coordinate.
-#   4. Greedy axis-by-axis merging: starting from an unvisited candidate, extend the box along each free axis in turn as
-#      long as the next "slab" of candidates is (a) unvisited and (b) shares the signature of the starting candidate.
-#      Mark every merged candidate visited so it is not emitted again.
-#
-# The greedy merge keeps the number of regions close to the number of genuinely distinct cell-coverage patterns rather
-# than producing one region per candidate. Without the merge, a small overlay's per-axis coordinates would slice the
-# entire physical domain along the overlay axis, splitting far-away base cells into long chains of
-# trivially-equal-signature sub-boxes for no integration benefit.
-#
-# Mathematical correctness: every candidate inside a merged box has the same coverage signature, so the box lies inside
-# one cell of every contributing level. The integrand of any basis-function product on the box is then a smooth
-# polynomial in the parent's reference frame, and the per-region Gauss rule remains exact. The greedy order of axes can
-# change the *shape* of the resulting boxes (the same volume can be packed many ways) but never their *total* volume or
-# their numerical contribution.
-#
-# A seed no level covers — an all-zero signature, where every level is inactive or ineligible — is skipped rather than
-# emitted: it is no region for any user of the engine, which has nothing to integrate, constrain or transfer there.
-# Skipping it changes nothing else, since a seed with a non-zero signature only ever absorbs candidates of its own
-# signature: every other box, its extent and its place in the order are the ones the full partition would emit.
-#
-# Steps 3–4 are split across the small helpers below rather than written as one flat loop. That split is load-bearing,
-# not style. The greedy merge's running upper corner `hi` is reassigned on every extension *and* read inside `ntuple`
-# closures; written in one frame, Julia heap-boxes it as a `Core.Box`, rebuilds the box on each extension and turns
-# every read into a dynamic dispatch. In that form this single variable accounted for 95% of `integration_plan`'s
-# allocations, on a path `prepare`, `move!` and `activate!` all run. The helpers restore the separation the compiler
-# needs: every frame that *closes over* `hi` receives it as an argument and never writes it, and the frames that write
-# it (`_extend_axis`, and `_partition`, which turns it into ranges with `map(:, …)` rather than a closure) close over
-# nothing. Do not fold them back inline.
-
-# Does the candidate slab one step past `hi` along axis `d` join the box seeded at `start`? It does when every candidate
-# in the slab is unvisited and carries the seed signature `sig0`.
-function _slab_matches(sigs, visited, start::NTuple{D,Int}, hi::NTuple{D,Int}, sig0, d::Int, next::Int) where {D}
-    slab = CartesianIndices(ntuple(e -> e == d ? (next:next) : (start[e]:hi[e]), D))
-    return all(c -> !visited[c] && sigs[c] == sig0, slab)
-end
-
-# Extend `hi` along axis `d` for as long as successive slabs keep matching.
-function _extend_axis(sigs, visited, ranges::NTuple{D,Int}, start::NTuple{D,Int}, hi::NTuple{D,Int}, sig0,
-                      d::Int) where {D}
-    while hi[d] < ranges[d]
-        next = hi[d] + 1
-        _slab_matches(sigs, visited, start, hi, sig0, d, next) || break
-        hi = Base.setindex(hi, next, d)
-    end
-    return hi
-end
-
-# Physical corners of the candidate index range `lo:hi`: the interval ends on the free axes, the anchor's coordinate on
-# the others. `slot[d]` is axis `d`'s position among the free axes, `0` on a fixed axis.
-function _corners(anchor::SVector{D,T}, slot::NTuple{D,Int}, intervals, lo, hi) where {D,T}
-    lower = SVector{D,T}(ntuple(d -> slot[d] == 0 ? anchor[d] : intervals[slot[d]][lo[slot[d]]][1], Val(D)))
-    upper = SVector{D,T}(ntuple(d -> slot[d] == 0 ? anchor[d] : intervals[slot[d]][hi[slot[d]]][2], Val(D)))
-    return lower, upper
-end
-
-function _partition(emit, levels::Tuple, free::NTuple{F,Int}, anchor::SVector{D,T}, tol::GeometryTolerance{T},
-                    cells::Tuple=map(_ -> _AllCells(), levels)) where {F,D,T}
-    coords = _merged_axis_coordinates(levels, Val(D), tol, cells)
-    intervals = ntuple(j -> _intervals_from_coordinates(coords[free[j]], tol), Val(F))
-    ranges = ntuple(j -> length(intervals[j]), Val(F))
-    any(==(0), ranges) && return nothing
-
-    # The per-level linear cell index maps once, and the coverage signature once per candidate: both are reused inside
-    # the greedy merge, where signature equality is the hot inner check.
-    linmaps = map(level -> LinearIndices(level.mesh.cells), levels)
-    slot = ntuple(d -> something(findfirst(==(d), free), 0), Val(D))
-    sigs = map(CartesianIndices(ranges)) do index
-        lower, upper = _corners(anchor, slot, intervals, index.I, index.I)
-        return _signature(levels, linmaps, cells, (lower + upper) / 2, tol)
-    end
-
-    visited = falses(ranges)
-    for start in CartesianIndices(ranges)
-        visited[start] && continue
-        sig = sigs[start]
-        all(iszero, sig) && continue
-        # Greedy axis-by-axis extension: extend along free axis `j` as far as the next slab of candidates matches the
-        # seed signature, then repeat for the next axis. The merge never backtracks.
-        hi = start.I
-        for j in 1:F
-            hi = _extend_axis(sigs, visited, ranges, start.I, hi, sig, j)
-        end
-        for c in CartesianIndices(map(:, start.I, hi))
-            visited[c] = true
-        end
-        lower, upper = _corners(anchor, slot, intervals, start.I, hi)
-        emit(lower, upper, sig)
-    end
-    return nothing
-end
-
-# ── Merge tolerance vs. mesh spacing ──────────────────────────────────────────
-#
-# `tolerance.merge` is an absolute length, and `merge_coordinates` collapses per-axis element boundaries that separate
-# by no more than it. Between levels that is exactly the intent: two meshes' near-coincident boundaries should become
-# one shared coordinate rather than a sliver. Within a single level it is silent destruction. An axis whose own cell
-# spacing `h` satisfies `h ≤ tolerance.merge` has its boundary list decimated — genuinely distinct cell faces collapse —
-# and every surviving integration region then straddles two cells of that level. That breaks the
-# one-cell-per-axis-per-level contract the whole region partition rests on, and nothing downstream can detect it: the
-# integrand is no longer smooth on the region, yet the tensor Gauss rule is still applied to it. The observed outcomes
-# are a converged, entirely wrong solution for a span-mode B-spline basis, and an unattributed `SingularException` for
-# integrated Legendre.
-#
-# The check is the compatibility condition between the two lengths the user controls — mesh spacing and merge tolerance
-# — not a floor on either one. Geometry at h = 1e-9 stays legal; it needs a `tolerance.merge` below it, in the same
-# spirit as the region-scaled `atol` in `implicit.jl` and the diagonal-scaled sign tolerance in the MeshIO extension.
-#
-# The threshold is `tolerance.merge` itself and not a multiple of it: it mirrors `merge_coordinates`'s own `> tol.merge`
-# keep-test, so exactly the configurations that lose a coordinate are rejected, and configurations that merely sit close
-# to the tolerance keep working.
-function _check_axis_spacing(levels, ::Val{D}, tol::GeometryTolerance{T}) where {D,T}
-    for level in levels, d in 1:D
-        coords = boundary_coordinates(level.mesh)[d]
-        spacing = minimum(coords[i + 1] - coords[i] for i in 1:(length(coords)-1))
-        spacing > tol.merge && continue
-        # Report the scale-aware value the default would have had on this axis, √eps(T) · extent, so the remedy is a
-        # number to paste.
-        suggested = sqrt(eps(T)) * (coords[end] - coords[begin])
-        throw(ArgumentError("level $(level.id) has cell spacing h = $spacing on axis $d, at or " *
-                            "below the coordinate merge tolerance $(tol.merge); pass a smaller " *
-                            "merge tolerance, e.g. `tolerance=GeometryTolerance(; " *
-                            "merge=$suggested)`"))
-    end
-    return nothing
-end
-
-# ── Region parents ────────────────────────────────────────────────────────────
-
-# The parents a box's coverage signature stands for, in level order: per non-zero slot, the level's cell with that
-# linear index and the map from the region's frame `lower`–`upper` into the cell's reference frame (`Parent`). Every
-# candidate the partition merged into the box shares the signature, so the whole box lies in each of these cells — the
-# contract the smooth-integrand argument needs — and decoding the signature is all it takes to find them.
-#
-# A `for` loop that pushes, not a `map` over the levels: a `map` yields a tuple of `Union{Nothing,Parent}` that is
-# boxed per level, which once made a 3D overlay plan 1.8× slower to build. The list is sized to the signature's
-# non-zero slots before the first push, so each region allocates its parent storage once instead of growing it.
-#
-# `_parents!` appends to an existing list instead: a two-sided interface sub-cell decodes both sides' signatures into
-# one parent list, side `a` first (`_simplex_regions` in `surface.jl`).
-function _parents(levels::Tuple, sig::Tuple, lower::SVector{D,T}, upper::SVector{D,T}) where {D,T}
-    return _parents!(sizehint!(Parent{D,T}[], count(!iszero, sig)), levels, sig, lower, upper)
-end
-
-function _parents!(parents::Vector{Parent{D,T}}, levels::Tuple, sig::Tuple, lower::SVector{D,T},
-                   upper::SVector{D,T}) where {D,T}
-    for (level, index) in zip(levels, sig)
-        index == 0 && continue
-        push!(parents, Parent(level, CartesianIndices(level.mesh.cells)[index], lower, upper))
-    end
-    return parents
-end
-
-# Keep-or-drop predicate for an admissible region. Three accepted shapes:
-#
-#   - `:any_parent`  — keep the region if any active level covers it
-#                      (the common assembly criterion: every region with
-#                      at least one contributing basis function counts).
-#   - `:all_levels`  — keep the region only if every level covers it, i.e.
-#                      only where the full superposition overlaps. No
-#                      package code selects it; it is reached through
-#                      `prepare(problem; criterion = :all_levels)`.
-#   - `criterion isa Function` — caller-supplied predicate, called as
-#                      `criterion(parents)` and returning `Bool`. The
-#                      escape hatch for a coverage rule the two symbols
-#                      do not express; no in-tree caller uses it, and it
-#                      reaches the plan through `prepare(problem;
-#                      criterion = …)`.
-#
-# `parents` is never empty here: `_partition` emits no box that no level covers, because such a box has no basis
-# function to integrate and no parent order to size a rule from. Handing one to a callable criterion used to let one
-# that answers `true` keep the box and then crash building its rule.
-function _criterion_satisfied(parents, level_count::Int, criterion)
-    if criterion === :any_parent
-        return !isempty(parents)
-    elseif criterion === :all_levels
-        return length(parents) == level_count
-    elseif criterion isa Function
-        return criterion(parents)
-    end
-
-    throw(ArgumentError("unknown integration-region criterion $criterion"))
-end
-
 # ── Plan construction ─────────────────────────────────────────────────────────
 
 # One kept region of a volume plan or a boundary facet before its rule is built: its corners and parents, and what
@@ -715,99 +715,6 @@ end
 # it.
 const _RegionRecord{D,T} = @NamedTuple{lower::SVector{D,T}, upper::SVector{D,T}, parents::Vector{Parent{D,T}},
                                        verdict::Symbol, counts::NTuple{D,Int}, order::NTuple{D,Int}}
-
-# The record of one kept region from its classifier `verdict`: the tensor counts from its parents (`0` on an axis the
-# region does not extend along) and, on a `:cut` verdict, the moment-fit order. The facet slice of a `PhysicalDomain`
-# carries the domain's own `moment_order_factor`, so reading it off `V` sizes a cut face and the cells behind it alike.
-function _region_record(V::Space{D,T}, lower::SVector{D,T}, upper::SVector{D,T}, parents::Vector{Parent{D,T}},
-                        verdict::Symbol) where {D,T}
-    counts = _axis_max(_gauss_counts, V, parents, lower, upper)
-    order = verdict === :cut ? _axis_max(_moment_orders(V.physical.moment_order_factor), V, parents, lower, upper) :
-            counts
-    return _RegionRecord{D,T}((lower, upper, parents, verdict, counts, order))
-end
-
-# Fit every cut region's rule before the rule loop consumes any of them, in parallel (`_fit_rules`), and reduce the
-# cache to exactly this plan's regions. Classification ran first and serially, in the records (it is memoised, and a
-# `Dict` is not thread-safe); the fits fill the cache afterwards, serially; the rule loop then runs in region order on
-# nothing but cache hits, so region order, `residual_max` and the small-overlap bookkeeping are the serial path's, bit
-# for bit. A custom `cut_quadrature` is fitted serially (`_fit_rules`) and still gets the dedup and the cross-plan
-# reuse.
-#
-# `live` is the plan's whole cut-key set, not just its misses, because restricting the cache afterwards is what keeps a
-# cache threaded through a long `move!` sweep from holding the sweep's worth of rules. On exit the cache holds only the
-# *boxes* this plan cuts — but at every moment order fitted at one of them, which is where the eviction rule differs
-# from the lookup key. See the `filter!` below for why the two are not the same rule, and what the difference costs.
-function _prefit!(cache::_MomentFitCache{D,T}, physical, records::Vector{_RegionRecord{D,T}}) where {D,T}
-    physical === nothing && return cache
-    live = Set{_MomentFitKey{D,T}}()
-    for record in records
-        record.verdict === :cut && push!(live, (record.lower, record.upper, record.order))
-    end
-    pending = _MomentFitKey{D,T}[key for key in live if !haskey(cache, key)]
-    fitted = _fit_rules(physical, pending, physical.cut_quadrature !== nothing)
-    for i in eachindex(pending)
-        cache[pending[i]] = fitted[i]
-    end
-    # Evict by box, not by full key. The bound the eviction exists for is the geometric one — a `move!` sweep must not
-    # leave the cache holding every box the overlay ever passed over — and a box that has left the plan takes all of its
-    # rules with it either way, so keying the eviction on the box alone costs that bound nothing: a move changes which
-    # boxes are cut, never the moment order at one of them.
-    #
-    # What it buys is the case full-key eviction gets wrong. An order-elevated twin of the same space — `estimate`'s
-    # `V⁺`, `adaptivity.jl` — has exactly this plan's boxes at a higher moment order, and under full-key eviction the
-    # two orders evict each other, so every `estimate` / `adapted` alternation refits both from scratch. Measured on a
-    # 3D sphere probe (base 4³, order 2, depth 1, 80 cut regions, 4 threads, -O0): a repeated `estimate` cost 38.7 s and
-    # the step after it 1.9 s; evicting by box they cost 0.006 s and 0.03 s, with the elevated order fitted once.
-    #
-    # What it costs, stated plainly because it is not free: a box that stays live keeps one entry per distinct moment
-    # order ever fitted there. Under a `move!` sweep that is flat, since orders do not change there. Under an hp loop it
-    # is not: `refine` raises the order at a live cut cell, the box does not leave the plan, and the entries at it
-    # accumulate *per cycle*. Bounded above — the key's order is `moment_order_factor × cell_order` and `refine` caps
-    # `cell_order` at `pmax` — but not by one plan's worth.
-    #
-    # The trade, measured on one configuration: four `estimate` → `refine` → `adapted` cycles on a 3D sphere (ladder
-    # base 4³, order 1, depth 1, 32 cut boxes) grew the cache from 32 entries / 0.035 MiB to 96 entries over the same 32
-    # boxes / 0.61 MiB, and the next step's plan build cost 0.011 s against 11.9 s with no reuse. An h-step resets the
-    # accumulation where it lands, because the boxes it splits do leave the plan.
-    live_boxes = Set((key[1], key[2]) for key in live)
-    filter!(entry -> (entry.first[1], entry.first[2]) in live_boxes, cache)
-    return cache
-end
-
-# The rule loop of `integration_plan`: one `VolumeRegion` per record, in record order, through `_trimmed_rule` — except
-# a fictitious box under strict α = 0, which has nothing to integrate and is dropped — with the small-overlap records
-# and the largest cut residual. Small-overlap diagnostics are accumulated rather than acted on: the package exposes the
-# warning, the caller decides whether to stabilise. A function barrier on `alpha`, a field of the abstractly typed
-# `Space.physical`, so the per-region rule dispatch below is static. The region list is reserved at the record count,
-# its bound, so it is filled without regrowing.
-function _plan_regions(records::Vector{_RegionRecord{D,T}}, fits::_MomentFitCache{D,T}, alpha, custom::Bool,
-                       tolerance::GeometryTolerance{T}, domain_volume::T) where {D,T}
-    regions = sizehint!(VolumeRegion{D,T}[], length(records))
-    small_overlaps = SmallOverlap{T}[]
-    tensor_cache = _TensorRuleCache{D,T}()
-    alpha_cache = Dict{NTuple{D,Int},Vector{T}}()
-    residual_max = 0.0
-    for record in records
-        record.verdict === :fictitious && iszero(alpha) && continue
-        base = _cached_tensor_quadrature!(tensor_cache, record.counts, T)
-        alpha_weights = record.verdict === :full || iszero(alpha) ? base.weights :
-                        _cached_alpha_weights!(alpha_cache, record.counts, base.weights, alpha)
-        fit = record.verdict === :cut ? fits[(record.lower, record.upper, record.order)] : nothing
-        kind, points, weights, residual = _trimmed_rule(record.verdict, base.points, base.weights, alpha, alpha_weights,
-                                                        fit, custom)
-        residual > residual_max && (residual_max = Float64(residual))
-        region = Region(record.lower, record.upper, record.parents, kind, points, weights; residual)
-        region_volume = volume(_region_box(region))
-        push!(regions, region)
-        if region_volume <= tolerance.small_volume
-            relative_volume = iszero(domain_volume) ? zero(T) : region_volume / domain_volume
-            push!(small_overlaps,
-                  SmallOverlap{T}(length(regions), region_volume, relative_volume, length(record.parents)))
-        end
-    end
-    return regions, small_overlaps, residual_max
-end
 
 """
     integration_plan(V::Space; tolerance=GeometryTolerance(T),
@@ -900,4 +807,97 @@ function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criteri
     min_volume = isempty(regions) ? zero(T) : minimum(volume(_region_box(region)) for region in regions)
     min_relative_volume = iszero(domain_volume) ? zero(T) : min_volume / domain_volume
     return IntegrationPlan{D,T}(regions, small_overlaps, min_volume, min_relative_volume, residual_max)
+end
+
+# The record of one kept region from its classifier `verdict`: the tensor counts from its parents (`0` on an axis the
+# region does not extend along) and, on a `:cut` verdict, the moment-fit order. The facet slice of a `PhysicalDomain`
+# carries the domain's own `moment_order_factor`, so reading it off `V` sizes a cut face and the cells behind it alike.
+function _region_record(V::Space{D,T}, lower::SVector{D,T}, upper::SVector{D,T}, parents::Vector{Parent{D,T}},
+                        verdict::Symbol) where {D,T}
+    counts = _axis_max(_gauss_counts, V, parents, lower, upper)
+    order = verdict === :cut ? _axis_max(_moment_orders(V.physical.moment_order_factor), V, parents, lower, upper) :
+            counts
+    return _RegionRecord{D,T}((lower, upper, parents, verdict, counts, order))
+end
+
+# Fit every cut region's rule before the rule loop consumes any of them, in parallel (`_fit_rules`), and reduce the
+# cache to exactly this plan's regions. Classification ran first and serially, in the records (it is memoised, and a
+# `Dict` is not thread-safe); the fits fill the cache afterwards, serially; the rule loop then runs in region order on
+# nothing but cache hits, so region order, `residual_max` and the small-overlap bookkeeping are the serial path's, bit
+# for bit. A custom `cut_quadrature` is fitted serially (`_fit_rules`) and still gets the dedup and the cross-plan
+# reuse.
+#
+# `live` is the plan's whole cut-key set, not just its misses, because restricting the cache afterwards is what keeps a
+# cache threaded through a long `move!` sweep from holding the sweep's worth of rules. On exit the cache holds only the
+# *boxes* this plan cuts — but at every moment order fitted at one of them, which is where the eviction rule differs
+# from the lookup key. See the `filter!` below for why the two are not the same rule, and what the difference costs.
+function _prefit!(cache::_MomentFitCache{D,T}, physical, records::Vector{_RegionRecord{D,T}}) where {D,T}
+    physical === nothing && return cache
+    live = Set{_MomentFitKey{D,T}}()
+    for record in records
+        record.verdict === :cut && push!(live, (record.lower, record.upper, record.order))
+    end
+    pending = _MomentFitKey{D,T}[key for key in live if !haskey(cache, key)]
+    fitted = _fit_rules(physical, pending, physical.cut_quadrature !== nothing)
+    for i in eachindex(pending)
+        cache[pending[i]] = fitted[i]
+    end
+    # Evict by box, not by full key. The bound the eviction exists for is the geometric one — a `move!` sweep must not
+    # leave the cache holding every box the overlay ever passed over — and a box that has left the plan takes all of its
+    # rules with it either way, so keying the eviction on the box alone costs that bound nothing: a move changes which
+    # boxes are cut, never the moment order at one of them.
+    #
+    # What it buys is the case full-key eviction gets wrong. An order-elevated twin of the same space — `estimate`'s
+    # `V⁺`, `adaptivity.jl` — has exactly this plan's boxes at a higher moment order, and under full-key eviction the
+    # two orders evict each other, so every `estimate` / `adapted` alternation refits both from scratch. Measured on a
+    # 3D sphere probe (base 4³, order 2, depth 1, 80 cut regions, 4 threads, -O0): a repeated `estimate` cost 38.7 s and
+    # the step after it 1.9 s; evicting by box they cost 0.006 s and 0.03 s, with the elevated order fitted once.
+    #
+    # What it costs, stated plainly because it is not free: a box that stays live keeps one entry per distinct moment
+    # order ever fitted there. Under a `move!` sweep that is flat, since orders do not change there. Under an hp loop it
+    # is not: `refine` raises the order at a live cut cell, the box does not leave the plan, and the entries at it
+    # accumulate *per cycle*. Bounded above — the key's order is `moment_order_factor × cell_order` and `refine` caps
+    # `cell_order` at `pmax` — but not by one plan's worth.
+    #
+    # The trade, measured on one configuration: four `estimate` → `refine` → `adapted` cycles on a 3D sphere (ladder
+    # base 4³, order 1, depth 1, 32 cut boxes) grew the cache from 32 entries / 0.035 MiB to 96 entries over the same 32
+    # boxes / 0.61 MiB, and the next step's plan build cost 0.011 s against 11.9 s with no reuse. An h-step resets the
+    # accumulation where it lands, because the boxes it splits do leave the plan.
+    live_boxes = Set((key[1], key[2]) for key in live)
+    filter!(entry -> (entry.first[1], entry.first[2]) in live_boxes, cache)
+    return cache
+end
+
+# The rule loop of `integration_plan`: one `VolumeRegion` per record, in record order, through `_trimmed_rule` — except
+# a fictitious box under strict α = 0, which has nothing to integrate and is dropped — with the small-overlap records
+# and the largest cut residual. Small-overlap diagnostics are accumulated rather than acted on: the package exposes the
+# warning, the caller decides whether to stabilise. A function barrier on `alpha`, a field of the abstractly typed
+# `Space.physical`, so the per-region rule dispatch below is static. The region list is reserved at the record count,
+# its bound, so it is filled without regrowing.
+function _plan_regions(records::Vector{_RegionRecord{D,T}}, fits::_MomentFitCache{D,T}, alpha, custom::Bool,
+                       tolerance::GeometryTolerance{T}, domain_volume::T) where {D,T}
+    regions = sizehint!(VolumeRegion{D,T}[], length(records))
+    small_overlaps = SmallOverlap{T}[]
+    tensor_cache = _TensorRuleCache{D,T}()
+    alpha_cache = Dict{NTuple{D,Int},Vector{T}}()
+    residual_max = 0.0
+    for record in records
+        record.verdict === :fictitious && iszero(alpha) && continue
+        base = _cached_tensor_quadrature!(tensor_cache, record.counts, T)
+        alpha_weights = record.verdict === :full || iszero(alpha) ? base.weights :
+                        _cached_alpha_weights!(alpha_cache, record.counts, base.weights, alpha)
+        fit = record.verdict === :cut ? fits[(record.lower, record.upper, record.order)] : nothing
+        kind, points, weights, residual = _trimmed_rule(record.verdict, base.points, base.weights, alpha, alpha_weights,
+                                                        fit, custom)
+        residual > residual_max && (residual_max = Float64(residual))
+        region = Region(record.lower, record.upper, record.parents, kind, points, weights; residual)
+        region_volume = volume(_region_box(region))
+        push!(regions, region)
+        if region_volume <= tolerance.small_volume
+            relative_volume = iszero(domain_volume) ? zero(T) : region_volume / domain_volume
+            push!(small_overlaps,
+                  SmallOverlap{T}(length(regions), region_volume, relative_volume, length(record.parents)))
+        end
+    end
+    return regions, small_overlaps, residual_max
 end
