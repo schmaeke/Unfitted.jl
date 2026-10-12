@@ -651,25 +651,9 @@ The remaining keyword arguments are forwarded to `integration_plan`; see its doc
 """
 prepare(problem::Problem{D,T}; kwargs...) where {D,T} = _prepared_model(problem, (; kwargs...), nothing)
 
-# The body of [`prepare`](@ref), with the moment-fit caches optionally supplied.
-#
-# `prepare` starts them empty. Every derivation of an existing model hands that model's back, for the reason `move!`
-# gives for not invalidating them: they are keyed by region bounds and moment order, and a mask edit, an order edit or a
-# move changes which cells are active and never the geometry, so every fitted cut-cell rule is still valid. Rebuilding
-# them instead refits every cut region on every step, which on an immersed model is the dominant cost of the step.
-#
-# Whether the handed-in caches are *shared* with the source model or a copy of them is the caller's choice, and the two
-# callers make it differently:
-#
-#   - the non-mutating derivations ([`adapted`](@ref), and through it [`elevated`](@ref) and [`moved`](@ref)) pass a
-#     copy, because source and target are then both live and each builds a plan against its own cut regions. Sharing
-#     would make the fork's plan build evict the rules the source's own plan is still using — an `O(#cut regions)` copy
-#     against a full refit;
-#   - the in-place mutators pass the model's own caches through `_remodel!`, since they overwrite the model rather than
-#     fork it, so there is no sibling to protect and the model keeps one cache object for its whole life.
-#
-# `estimate` (`adaptivity.jl`) is the deliberate third case: it shares, so the elevated-order rules its throw-away twin
-# fits land on the source model.
+# The body of [`prepare`](@ref), with the moment-fit caches optionally supplied: `reuse` is `nothing` for fresh ones,
+# which is what `prepare` starts with, or the vector a derivation of an existing model hands in through `_derived`,
+# which is where the choice between sharing and copying is made and explained.
 function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                          reuse::Union{Nothing,Vector{_MomentFitCache{D,T}}}) where {D,T}
     effective_problem, spaces, caches = _prepare_spaces(problem)
@@ -1242,6 +1226,31 @@ function _assert_single_domain(model::Model, op::AbstractString)
     return nothing
 end
 
+# A model of `model`'s problem prepared over `space`: the one builder behind every model derived from another — the
+# non-mutating derivations, the in-place mutators (`_remodel!`) and `estimate`'s enriched twin. The forms, field
+# channels and Dirichlet data are `model`'s (`_problem_with_space`); the plan options are too, unless `options` says
+# otherwise, as `estimate`'s does when it exempts a level from pruning.
+#
+# `caches` has no default, so every caller states what happens to `model`'s moment-fit caches. Every derivation hands
+# them on rather than starting empty, for the reason `move!` gives for not invalidating them: they are keyed by region
+# bounds and moment order, and a mask edit, an order edit or a move changes which cells are active and never the
+# geometry, so every fitted cut-cell rule is still valid. Rebuilding them instead refits every cut region on every
+# step, which on an immersed model is the dominant cost of the step. Whether the new model *shares* them or gets a copy
+# is the policy each caller states:
+#
+#   - the non-mutating derivations ([`adapted`](@ref), and through it [`elevated`](@ref) and [`moved`](@ref)) pass a
+#     copy, because source and target are then both live and each builds a plan against its own cut regions. Sharing
+#     would make the fork's plan build evict the rules the source's own plan is still using — an `O(#cut regions)` copy
+#     against a full refit;
+#   - the in-place mutators pass the model's own caches through `_remodel!`, since they overwrite the model rather than
+#     fork it, so there is no sibling to protect and the model keeps one cache object for its whole life;
+#   - `estimate` (`adaptivity.jl`) shares, so the elevated-order rules its throw-away twin fits land on the source
+#     model.
+function _derived(model::Model{D,T}, space::Space{D,T}; options::NamedTuple=model.plan_options,
+                  caches::Vector{_MomentFitCache{D,T}}) where {D,T}
+    return _prepared_model(_problem_with_space(model.problem, space), options, caches)
+end
+
 # Rebuild every piece of reusable state `model` carries from a derived pre-fold space, in place. This is the whole body
 # of the in-place mutators: `move!`, `activate!` and `deactivate!` differ only in how they derive `space` from
 # `model.prefold_space`, and everything after that is the rebuild `prepare` runs, so it is written once here rather than
@@ -1260,34 +1269,33 @@ end
 # The moment-fit caches are threaded in uncopied, unlike `adapted`'s: a mutator overwrites the model rather than forking
 # it, so no sibling model can have its rules evicted and the model keeps one cache object for its whole life.
 #
-# The Dirichlet projection cache is dropped rather than rebuilt: its unknown sets, facet regions and mass all belong to
-# the dof layout being replaced, and the next `update_dirichlet!` rebuilds it against the new one. The facet resolver is
-# replaced for the same reason and with a second effect: its keys hold spaces by identity, so taking the fresh model's
-# resolver retires every entry resolved on the space this rebuild has just superseded, instead of carrying them forward
-# as ballast no lookup can reach.
+# The rebuilt model is then copied onto `model` field by field, by name, so the rule is "everything a `prepare` builds
+# is replaced" and a field added to `Model` later is replaced with the rest rather than forgotten. A field that must
+# survive a rebuild has to be excluded by name, as `version` is: the pin moves on from the model's own value, so an
+# outstanding `Solution` raises. Everything else is what the rebuild should leave:
+#
+#   - `matrix` and `rhs` are `nothing` on the fresh model, so the assembled state is cleared;
+#   - `plan_options` is the same object, and `moment_fit_caches` the model's own vector;
+#   - the Dirichlet projection cache is a fresh empty one: its unknown sets, facet regions and mass all belong to the
+#     dof layout being replaced, and the next `update_dirichlet!` rebuilds it against the new one;
+#   - the facet resolver is replaced for the same reason and with a second effect: its keys hold spaces by identity, so
+#     taking the fresh model's resolver retires every entry resolved on the space this rebuild has just superseded,
+#     instead of carrying them forward as ballast no lookup can reach.
+#
+# `setproperty!` converts as a field assignment does, so a rebuilt problem of another concrete type raises exactly as
+# `model.problem = …` would.
 function _remodel!(model::Model{D,T}, space::Space{D,T}) where {D,T}
-    fresh = _prepared_model(_problem_with_space(model.problem, space), model.plan_options, model.moment_fit_caches)
-    model.problem = fresh.problem
-    model.prefold_space = fresh.prefold_space
-    model.space_plans = fresh.space_plans
-    model.moment_fit_caches = fresh.moment_fit_caches
-    model.dofs = fresh.dofs
-    model.facet_resolver = fresh.facet_resolver
-    model.facet_regions = fresh.facet_regions
-    model.surface_regions = fresh.surface_regions
-    model.interface_regions = fresh.interface_regions
-    model.diagnostics = fresh.diagnostics
-    model.matrix = nothing
-    model.rhs = nothing
-    model.assembly = fresh.assembly
-    empty!(model.dirichlet_projections)
+    fresh = _derived(model, space; caches=model.moment_fit_caches)
+    for name in fieldnames(Model)
+        name === :version || setproperty!(model, name, getfield(fresh, name))
+    end
     model.version += 1
     return model
 end
 
-# Rebuild `problem` over a new (adapted / elevated / moved / remasked) space, reusing the field channels, forms, and
-# Dirichlet data. Shared rebuild rule behind `adapted(model, space)` and `_remodel!` (the geometry-fold rebuild goes
-# through `_prepare_spaces`, which also reindexes level ids).
+# Rebuild `problem` over a new (adapted / elevated / moved / remasked / enriched) space, reusing the field channels,
+# forms, and Dirichlet data. The rebuild rule of `_derived` (the geometry-fold rebuild goes through `_prepare_spaces`,
+# which also reindexes level ids).
 function _problem_with_space(problem::Problem, new_space::Space)
     new_fields = map(f -> field(f.name, new_space; components=component_count(f)), problem.fields)
     return Problem(new_fields; blocks=problem.blocks, loads=problem.loads, dirichlet=problem.dirichlet,
@@ -1491,9 +1499,8 @@ function adapted(model::Model{D,T}, space::Space{D,T}) where {D,T}
                             "got $(space.domain)."))
     # Seeded warm from the source, but the target's own object: both models are live from here on, and each builds a
     # plan that bounds its cache to its own cut boxes. Sharing would make the fork evict the rules the source's plan is
-    # still using — the `Model` docstring's `moment_fit_caches` entry has the lineage rule in full.
-    return _prepared_model(_problem_with_space(model.problem, space), model.plan_options,
-                           copy.(model.moment_fit_caches))
+    # still using — `_derived` has the lineage rule in full.
+    return _derived(model, space; caches=copy.(model.moment_fit_caches))
 end
 
 """

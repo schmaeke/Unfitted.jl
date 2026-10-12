@@ -398,7 +398,7 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     # `A⁺` being singular is harmless here, since the indicator reads its diagonal and forms one matrix–vector product
     # and never factorises.
     options = isempty(exempt) ? model.plan_options : merge(model.plan_options, (; prune_exempt=exempt))
-    plus = _prepared_model(_problem_with_space(model.problem, enriched_space), options, model.moment_fit_caches)
+    plus = _derived(model, enriched_space; options, caches=model.moment_fit_caches)
     _on_foreign_cloud(plus.version) do
         assemble!(plus)
     end
