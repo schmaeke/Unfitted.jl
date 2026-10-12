@@ -30,7 +30,8 @@ Fields, in declaration order, which is also the order [`diagnostics`](@ref)`(mod
 
   - `dimension::Int` — spatial dimension `D`.
   - `active_unknowns::Int` — number of active (post-constraint) dofs.
-  - `integration_regions::Int` — number of admissible integration regions in the model's plan.
+  - `integration_regions::Int` — number of admissible integration regions in the model's integration plans, summed over
+    the subdomains of a coupled model.
   - `facet_region_count::Int` — total number of [`FacetRegion`](@ref)s cached on the model, summed across every cached
     selector (Dirichlet conditions and any `block`/`loadform` carrying `on::BoundarySelector`). Zero for problems with
     no physical- boundary integration. Because the sum runs over selector × face pairs and not over distinct regions,
@@ -677,7 +678,7 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                                                  integration_plan(spaces[i]; integration_options...,
                                                                   classify_cache=caches[i], moment_fit_cache=fits[i]),
                                                  fits[i]) for i in eachindex(spaces)]
-    # The facet resolver is built before the dof layout, not after the region caches, because the layout's Dirichlet
+    # The facet resolver is built before the dof layout, not after the region cache, because the layout's Dirichlet
     # projection resolves faces too: it is the first consumer, and handing it the model's resolver is what makes the
     # projection and the operator integrate the same facet by construction rather than by two call sites agreeing.
     #
