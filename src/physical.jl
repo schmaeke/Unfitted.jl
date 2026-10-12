@@ -459,8 +459,9 @@ end
 # Restricting the *leaves* rather than the scalar reconstruction is the whole point. `levelset_value` collapses the tree
 # to max/min, which creases ∂Ω wherever two components meet, and a crease inside the sliced box costs the quadrature
 # kernel its high order exactly as that function's docstring warns: on a wedge whose two faces meet strictly inside the
-# sliced box, the leaf-wise slice integrates the area to 3.6e-4 at moment order 4 where the collapsed one reaches only
-# 5.0e-3, 13× worse. `test_physical.jl` pins that comparison.
+# sliced box, the leaf-wise slice integrates the area to round-off at moment order 4 — the kernel puts a breakpoint
+# where the two leaves cross — while the collapsed one is 5.0e-3 off, and still 1.9e-3 at order 8. `test_physical.jl`
+# pins that comparison.
 _restrict(l::Leaf, k::Int, v) = Leaf(_restrict(l.f, k, v), l.lipschitz)
 _restrict(n::AllOf, k::Int, v) = AllOf(map(p -> _restrict(p, k, v), n.parts))
 _restrict(n::AnyOf, k::Int, v) = AnyOf(map(p -> _restrict(p, k, v), n.parts))

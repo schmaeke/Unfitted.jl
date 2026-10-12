@@ -489,13 +489,11 @@ end
 # per-cell order let a region span cells of different orders, and anything less would under-integrate the finest of
 # them.
 #
-# That makes the rule exact where the restricted level set is a single affine function, and accurate to the reported
-# residual where it curves — never exact on a curved cut, which is why nothing here promises exactness. Nor is it exact
-# where the restricted tree's leaves meet at a corner strictly *inside* the face box: the quadrature kernel's base
-# partition places no breakpoint at such a corner (`implicit.jl`), so the moments the fit reproduces are themselves
-# slightly wrong and the residual cannot see it — measured 3.6e-4 on a face cut by two planes meeting inside it, with
-# the fit's own residual at 3.5e-16. That is a pre-existing property of the kernel, shared by volume integration;
-# `boundary`'s docstring states the condition for the public reader.
+# That makes the rule exact where the restricted level set is piecewise affine — one planar leaf, or several meeting at
+# a corner strictly *inside* the face box, where the quadrature kernel's pair leaves put a base breakpoint (`_PairLeaf`
+# in `implicit.jl`; a face cut by two planes meeting inside it comes out exact to round-off) — and accurate to the
+# reported residual and the kernel's approximation where it curves: never exact on a curved cut, which is why nothing
+# here promises exactness there. `boundary`'s docstring states the condition for the public reader.
 function _boundary_facet_regions(V::Space{D,T}, sides::Vector{Tuple{Int,Symbol}}, tol::GeometryTolerance{T},
                                  rules::_TensorRuleCache{D,T}=_TensorRuleCache{D,T}()) where {D,T}
     free_axes = _free_axes(sides, Val(D))

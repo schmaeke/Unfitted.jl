@@ -955,8 +955,9 @@ end
     # Restricting leaf by leaf keeps those two faces as two smooth leaves, which is what the quadrature kernel's
     # multi-component construction needs. Restricting `levelset_value` instead — the tree collapsed to max/min — hands
     # the kernel a single leaf with a crease along the ridge, exactly the representation that function's own docstring
-    # warns against for integration. Measured at moment order 4 on the slice: 3.63e-4 leaf-wise against 4.97e-3
-    # collapsed, 13.7× worse, and the gap persists at orders 6 and 8 (2.2× and 2.5×).
+    # warns against for integration. Measured on the slice: leaf-wise, the kernel puts a breakpoint where the two faces
+    # cross and the area is exact to round-off at moment orders 4, 6 and 8 (0, 1.1e-16, 2.8e-16); collapsed, the crease
+    # leaves 4.97e-3, 2.88e-3 and 1.88e-3.
     wedge = intersect(leaf(x -> x[2] - x[1] - 0.25; lipschitz=sqrt(2.0)),
                       leaf(x -> x[2] + x[1] - 1.25; lipschitz=sqrt(2.0)))
     p3 = physical_domain(wedge; subcell_length_scale=0.25)
@@ -971,7 +972,7 @@ end
               for a in 0.05:0.1:0.95, b in 0.05:0.1:0.95)
 
     err(domain) = abs(sum(Unfitted.moment_fit_rule(domain, face, (4, 4))[2]) - 0.5)
-    @test err(leafwise) < 1.0e-3
+    @test err(leafwise) < 1.0e-13
     @test err(leafwise) < err(collapsed) / 3
 end
 
@@ -1084,9 +1085,8 @@ end
     # every region box the plan keeps, so it judges the cut-cell quadrature alone, whatever the classifier decides about
     # a sub-resolution tip. Every monomial up to total degree 2p — the trial × test degree — is checked.
     #
-    # The bound is twice the error measured before interior corners were integrated exactly: 2.7e-3 relative on the
-    # worst monomial. The kernel places no base breakpoint at a corner strictly inside a cut cell, so this test pins the
-    # regression level of that known limitation rather than the documented machine-precision contract.
+    # The documented machine-precision contract, corners included: the kernel's pair leaves make each corner a base
+    # breakpoint. Before they did, the worst monomial was 2.7e-3 off.
     A, B, C = SVector(0.25, 0.25), SVector(0.75, 5 / 12), SVector(5 / 12, 11 / 12)
     edge(p, q) = (t=q - p; n=SVector(t[2], -t[1]) / norm(t);
                   leaf(x -> n[1] * (x[1] - p[1]) + n[2] * (x[2] - p[2]); lipschitz=1.0))
@@ -1103,7 +1103,34 @@ end
         exact = sum(_polygon_integral(g, c) for c in pieces)
         worst = max(worst, abs(_plan_integral(plan, g) - exact) / exact)
     end
-    @test worst < 2 * 2.7e-3
+    @test worst < 1.0e-13
+end
+
+@testset "the kernel integrates a triangle's interior corners exactly, cell by cell" begin
+    # Three linear leaves cut out a triangle whose corners lie strictly inside cut cells of a 7² grid. Every cut cell's
+    # Saye rule reproduces every monomial of total degree ≤ 6 over the clipped piece to round-off, measured against
+    # ∫_cell |g| so that a small piece is held to its cell's scale. Without a base breakpoint at the corners
+    # (`_PairLeaf` in `src/implicit.jl`) the worst cell was 8.9e-4 off.
+    A, B, C = SVector(0.13, 0.21), SVector(0.86, 0.34), SVector(0.41, 0.88)
+    edge(p, q) = (t=q - p; n=SVector(t[2], -t[1]) / norm(t);
+                  leaf(x -> n[1] * (x[1] - p[1]) + n[2] * (x[2] - p[2]); lipschitz=1.0))
+    triangle = intersect(edge(A, B), edge(B, C), edge(C, A))
+    fs = Any[l.f for l in Unfitted._leaves(triangle)]
+    worst = 0.0
+    for i in 0:6, j in 0:6
+        lo, hi = SVector(i / 7, j / 7), SVector((i + 1) / 7, (j + 1) / 7)
+        piece = _clip_to_box([A, B, C], lo, hi)
+        (length(piece) < 3 || _shoelace(piece) ≈ 1 / 49) && continue          # no part of the triangle, or a full cell
+        pts, ws = Unfitted.implicit_volume_quadrature(fs, x -> Unfitted._inside(triangle, x), box(lo, hi);
+                                                      gauss_points=8, lipschitz=ones(3))
+        cell = [lo, SVector(hi[1], lo[2]), hi, SVector(lo[1], hi[2])]
+        for a in 0:6, b in 0:(6-a)
+            g = x -> x[1]^a * x[2]^b
+            err = abs(sum(w * g(x) for (x, w) in zip(pts, ws)) - _polygon_integral(g, piece))
+            worst = max(worst, err / _polygon_integral(x -> abs(g(x)), cell))
+        end
+    end
+    @test worst < 1.0e-13
 end
 
 @testset "α-FCM regions integrate (1 − α)|Ω ∩ box| + α|box|" begin

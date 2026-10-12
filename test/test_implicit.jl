@@ -207,6 +207,43 @@ end
     @test isapprox(a, π * (0.45^2 - 0.2^2) / 4; atol=1e-4)
 end
 
+# ∫ g over the tetrahedron abcd by a collapsed (Duffy) Gauss rule of n³ points, exact to degree 2n − 3 in g.
+function _tetrahedron_integral(g, a, b, c, d; n=8)
+    ξ, ω = Unfitted.gausslegendre(n)
+    total = 0.0
+    for i in 1:n, j in 1:n, k in 1:n
+        s, t, r = (ξ[i] + 1) / 2, (ξ[j] + 1) / 2, (ξ[k] + 1) / 2
+        x = a + s * (b - a) + t * (1 - s) * (c - a) + r * (1 - s) * (1 - t) * (d - a)
+        total += ω[i] * ω[j] * ω[k] / 8 * (1 - s)^2 * (1 - t) * g(x)
+    end
+    return total * abs(dot(b - a, cross(c - a, d - a)))
+end
+
+@testset "implicit quadrature — a tetrahedron's interior corners are exact in 3D" begin
+    # Four oblique planes cut a tetrahedron whose vertices lie strictly inside cells of a 4³ grid, so every vertex and
+    # edge is a crossing of two or three leaves inside a cut cell. Pair leaves put each crossing into the base problem
+    # (a pair of pairs, one reduction further down, for a vertex), so the cell rules sum to the exact volume and moments
+    # to round-off at every fiber order. Without them the volume was off by 2.3e-5 at q = 3 and 1.6e-4 at q = 5.
+    v = (SVector(0.13, 0.11, 0.17), SVector(0.88, 0.21, 0.12), SVector(0.31, 0.87, 0.23), SVector(0.38, 0.34, 0.91))
+    planes = map(((1, 2, 3, 4), (1, 2, 4, 3), (1, 3, 4, 2), (2, 3, 4, 1))) do (a, b, c, o)
+        n = normalize(cross(v[b] - v[a], v[c] - v[a]))
+        n = dot(n, v[o] - v[a]) > 0 ? -n : n                       # outward: away from the fourth vertex
+        return x -> dot(n, x - v[a])
+    end
+    membership = x -> all(f -> f(x) <= 0, planes)
+    gs = (x -> 1.0, x -> x[1], x -> x[2]^2, x -> x[1] * x[2] * x[3])
+    exact = [_tetrahedron_integral(g, v...) for g in gs]
+    for q in (3, 5)
+        total = zeros(length(gs))
+        for I in CartesianIndices((4, 4, 4))
+            region = box((Tuple(I) .- 1) ./ 4, Tuple(I) ./ 4)
+            rule = _IVQ(Any[planes...], membership, region; gauss_points=q, lipschitz=ones(4))
+            total .+= [_quad(g, rule) for g in gs]
+        end
+        @test all(isapprox.(total, exact; rtol=1e-13))
+    end
+end
+
 @testset "implicit quadrature — finite-difference gradient fallback" begin
     # For level sets that are not AD-differentiable the caller can pass a finite-difference gradient; on a smooth linear
     # cut it reproduces the ForwardDiff result to integration accuracy.
@@ -297,4 +334,27 @@ end
     tilted = x -> x[1] + x[2] - 1
     @test _quad(x -> 1.0, _IVQ(tilted, region; gauss_points=8, lipschitz=sqrt(2))) ≈
           _quad(x -> 1.0, _IVQ(tilted, region; gauss_points=8)) atol = 1e-15
+end
+
+@testset "implicit quadrature — crossings of a 2D CSG domain inside cut cells" begin
+    # Two overlapping discs minus a rotated square: the two circles cross, and the square's four corners lie, strictly
+    # inside cells of an 8² grid. Summed cell by cell, the area matches the analytic value to 1e-12 (5.7e-14 measured;
+    # 3.0e-5 before the crossings became base breakpoints).
+    c1, r1, c2, r2 = SVector(0.4, 0.45), 0.3, SVector(0.65, 0.55), 0.25
+    θ, s = π / 6, 0.08
+    corners = [SVector(0.5, 0.5) + s * SVector(cos(θ) * a - sin(θ) * b, sin(θ) * a + cos(θ) * b)
+               for (a, b) in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+    sides = map(1:4) do i
+        t = corners[mod1(i + 1, 4)] - corners[i]
+        n = SVector(t[2], -t[1]) / norm(t)
+        return leaf(x -> dot(n, x - corners[i]); lipschitz=1.0)
+    end
+    geom = setdiff(union(leaf(_disc(c1, r1); lipschitz=1.0), leaf(_disc(c2, r2); lipschitz=1.0)), intersect(sides...))
+    d = norm(c2 - c1)
+    lens = r1^2 * acos((d^2 + r1^2 - r2^2) / (2d * r1)) + r2^2 * acos((d^2 + r2^2 - r1^2) / (2d * r2)) -
+           sqrt((-d + r1 + r2) * (d + r1 - r2) * (d - r1 + r2) * (d + r1 + r2)) / 2
+    area = π * (r1^2 + r2^2) - lens - (2s)^2
+    total = sum(_quad(x -> 1.0, _csg_rule(geom, box((Tuple(I) .- 1) ./ 8, Tuple(I) ./ 8); gp=8, ms=4, certified=true))
+                for I in CartesianIndices((8, 8)))
+    @test total ≈ area rtol = 1e-12
 end

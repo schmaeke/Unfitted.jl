@@ -18,6 +18,11 @@
 #     integration on implicit domains by means of moment-fitting", Int. J.
 #     Numer. Methods Engng. 96 (2013) 512–528, doi:10.1002/nme.4569.
 #
+#   The pair leaves that make interior corners exact (`_PairLeaf` below) specialise the second paper's pairwise
+#   elimination — every pair of level sets contributes the polynomial that eliminates the height variable between them
+#   (their resultant) to the base problem — to leaves that are monotone along the height axis, where the eliminant is
+#   one leaf evaluated at the other's fiber root.
+#
 #   Fiber roots are found by the Illinois variant of regula falsi,
 #
 #     M. Dowell, P. Jarratt, "A modified regula falsi method for computing the
@@ -43,14 +48,17 @@
 #   are graph-like (each varies monotonically, or is constant, along d* — a constant leaf, e.g. a perpendicular
 #   half-space, simply partitions the base, which is what keeps polytope corners exact). The (D−1)-dimensional base
 #   integral over the projection is built by the same recursion, partitioned by the leaves' restrictions to the two
-#   faces x_{d*} = lo and x_{d*} = hi so the projection boundary and the change in fiber topology are resolved. At each
-#   base node a 1D Gauss rule is placed on the parts of the fiber that lie in Ω, found by root-finding on the level sets
-#   and testing the membership predicate. When a box is not graph-like it is bisected (a shallow octree above the
-#   kernel); at the depth floor the kernel reduces anyway — the multi-root fiber scan still yields the correct region,
-#   only the base partition (and thus the order) degrades at the unresolved feature. ∇φ is obtained by automatic
-#   differentiation (`ForwardDiff`); a caller whose leaves cannot take `Dual` arguments overrides that with its own
-#   operator through the `grad` keyword, for which `_fd_gradient` below is the central-difference choice. Nothing in the
-#   finite-cell path sets it, so leaves reaching `moment_fit_rule` must be AD-capable.
+#   faces x_{d*} = lo and x_{d*} = hi so the projection boundary and the change in fiber topology are resolved, and by
+#   one pair leaf per two monotone leaves, whose zero set holds the projection of their crossing — where two fiber roots
+#   swap order inside the box, a polytope corner for instance. At each base node a 1D Gauss rule is placed on the parts
+#   of the fiber that lie in Ω, found by root-finding on the level sets and testing the membership predicate. When a box
+#   is not graph-like it is bisected (a shallow octree above the kernel); at the depth floor the kernel reduces anyway —
+#   the multi-root fiber scan still yields the correct region, only the base partition (and thus the order) degrades at
+#   the unresolved feature. ∇φ is obtained by automatic differentiation (`ForwardDiff`); a caller whose leaves cannot
+#   take `Dual` arguments overrides that with its own operator through the `grad` keyword, for which `_fd_gradient`
+#   below is the central-difference choice. Nothing in the finite-cell path sets it, so leaves reaching
+#   `moment_fit_rule` must be AD-capable. Pair leaves are the exception the kernel makes for itself: they are
+#   differentiated by central differences (`_FDLeaf`) and never see a `Dual`.
 
 # ── Coordinate insert / remove helpers ─────────────────────────────────────────
 
@@ -88,14 +96,12 @@ end
 
 # Central-difference gradient operator for level sets through which automatic differentiation cannot be pushed. It is
 # opt-in — a caller passes it as the `grad` keyword of `implicit_volume_quadrature`, and nothing falls back to it. The
-# step size is the cube-root-of-eps balance between truncation and round-off, scaled per axis by the coordinate
-# magnitude.
-function _fd_gradient(g, x::SVector{D,T}) where {D,T}
-    h0 = cbrt(eps(T))
+# default step `h` is the cube-root-of-eps balance between truncation and round-off, scaled per axis by the coordinate
+# magnitude; the kernel's own pair leaves pass a step relative to their box instead (`_gradient`).
+function _fd_gradient(g, x::SVector{D,T}, h=cbrt(eps(T)) .* max.(one(T), abs.(x))) where {D,T}
     return SVector{D,T}(ntuple(D) do d
-                            h = h0 * max(one(T), abs(x[d]))
-                            e = SVector{D,T}(ntuple(i -> i == d ? h : zero(T), D))
-                            (g(x + e) - g(x - e)) / (2h)
+                            e = SVector{D,T}(ntuple(i -> i == d ? h[d] : zero(T), D))
+                            (g(x + e) - g(x - e)) / (2h[d])
                         end)
 end
 
@@ -186,11 +192,94 @@ function _sample_sign(g::_LipschitzLeaf, U::AxisBox)
     return isfinite(g.lipschitz) ? _certified_sign(g.f, g.lipschitz, U) : _sample_sign(g.f, U)
 end
 
-# Restrict a level-set callback to the affine slice `{x_k = v}`, the base-problem leaf of one dimension-reduction step.
-# The slice is an isometric embedding of the base into ℝᴰ (`‖_insert_axis(y, k, v) − _insert_axis(z, k, v)‖ = ‖y − z‖`),
-# so a Lipschitz constant of `f` bounds the restriction just as tightly and is carried through unchanged.
-_restrict(g, k::Int, v) = x -> g(_insert_axis(x, k, v))
-_restrict(g::_LipschitzLeaf, k::Int, v) = _LipschitzLeaf(x -> g.f(_insert_axis(x, k, v)), g.lipschitz)
+# The restriction of a level-set callback `g` to the affine slice `{x_k = v}`: the base-problem leaf of one
+# dimension-reduction step, and through `src/physical.jl` the leaf of a boundary facet's slice of Ω. A callable record
+# rather than a closure, so that the two face restrictions of one leaf can tell they are siblings (`_siblings`). The
+# slice is an isometric embedding of the base into ℝᴰ (`‖_insert_axis(y, k, v) − _insert_axis(z, k, v)‖ = ‖y − z‖`), so
+# a Lipschitz constant of `g` bounds the restriction just as tightly and is carried through unchanged.
+struct _Slice{G,T}
+    g::G
+    k::Int
+    v::T
+end
+
+(s::_Slice)(x) = s.g(_insert_axis(x, s.k, s.v))
+_restrict(g, k::Int, v) = _Slice(g, k, v)
+_restrict(g::_LipschitzLeaf, k::Int, v) = _LipschitzLeaf(_Slice(g.f, k, v), g.lipschitz)
+
+# ── Pair leaves: crossings inside the box ──────────────────────────────────────
+
+# The base problem of one reduction is partitioned by the leaves' restrictions to the faces x_k = lo and x_k = hi, which
+# resolves every change of fiber topology on those faces but none strictly inside the box. Where two leaves gᵢ and gⱼ
+# that are both monotone along k cross inside it, their fiber roots swap order and the fiber integral has a kink over
+# the projection of {gᵢ = 0 = gⱼ}, with no base breakpoint there — so a polytope corner strictly inside a cut cell was
+# integrated to the base rule's accuracy (about 1e-5 at the default orders), not exactly. Each such pair therefore adds
+# one leaf to the base problem,
+#
+#     P(y) = gᵢ(y ⊕ₖ t̃ⱼ(y)),
+#
+# gᵢ evaluated at gⱼ's fiber root t̃ⱼ(y). P vanishes on the projection of the crossing; its other zeros are breakpoints
+# the base already has, or harmless extra ones. For linear leaves P is the linear function that eliminates x_k between
+# the two, so an interior corner becomes an exact breakpoint at every level of the reduction, and the recursion handles
+# the nested pairs of 3D (Saye's pairwise elimination, see the file header).
+#
+# t̃ⱼ(y) is gⱼ's root on the fiber where its end values bracket one (`_root`); elsewhere it is the secant root of those
+# end values — exact for a linear gⱼ, so P stays the eliminated linear function over the whole base — and the end of
+# smaller |gⱼ| when that secant is not finite. Leaves are therefore also evaluated on the fiber's secant extension,
+# outside the box; a `leaf` is defined on all coordinates, so that is within its contract.
+#
+# `gi` and `gj` are `Any`, as the kernel's leaf lists are: typed fields would nest a pair leaf's type once per level of
+# the reduction (pairs of restricted pairs in 3D), and the compile work with it.
+struct _PairLeaf{T}
+    gi::Any
+    gj::Any
+    k::Int
+    lo::T
+    hi::T
+end
+
+function (p::_PairLeaf)(y)
+    fj = t -> p.gj(_insert_axis(y, p.k, t))
+    fa, fb = fj(p.lo), fj(p.hi)
+    t = if (fa < 0 < fb) || (fb < 0 < fa)
+        _root(fj, p.lo, p.hi, fa, fb)
+    else
+        s = (p.lo * fb - p.hi * fa) / (fb - fa)
+        isfinite(s) ? s : (abs(fa) <= abs(fb) ? p.lo : p.hi)
+    end
+    return p.gi(_insert_axis(y, p.k, t))
+end
+
+# A callback the kernel differentiates by central differences at the fixed step `h` instead of through
+# `ctx.gradient`: the wrapper on every pair leaf, so a pair leaf never sees a `Dual` (its root finding would have to be
+# differentiated through) and never instantiates one. The step is a fixed fraction, cbrt(eps), of the fiber the pair
+# leaf was built on, so the gradient does not depend on the geometry's length scale; its error, about 1e-10 relative,
+# is far below the `flat_tol` (√eps) that the gradient only feeds. Pair leaves steer the axis choice and the pruning
+# of base problems and are never integrated themselves. Restriction keeps the wrapper and the step.
+struct _FDLeaf{F,T}
+    f::F
+    h::T
+end
+
+(g::_FDLeaf)(x) = g.f(x)
+_restrict(g::_FDLeaf, k::Int, v) = _FDLeaf(_Slice(g.f, k, v), g.h)
+
+# Whether two leaves are the restrictions of one leaf to the two faces of the previous reduction, which never get a
+# pair leaf: where that leaf was monotone along the previous height axis its two face restrictions cannot cross (g = 0
+# at both ends of one fiber contradicts monotonicity), and where it was flat they are one function, whose pair leaf
+# vanishes identically and would scatter breakpoints over round-off noise — measured on the gate's napkin-ring octant,
+# that made the volume rule 1.6× less accurate at every Gauss order. (A leaf that was bad along that axis, at the
+# depth floor, could cross its sibling; the floor promises no order there.) `_parent` is the leaf a restriction was cut
+# from, and `nothing` for a leaf that is not a restriction.
+_parent(s::_Slice) = s.g
+_parent(g::Union{_LipschitzLeaf,_FDLeaf}) = _parent(g.f)
+_parent(_) = nothing
+_siblings(a, b) = (p = _parent(a)) !== nothing && p === _parent(b)
+
+# The gradient of one leaf at `x`: central differences for a pair leaf, the context's operator (`ForwardDiff`, or the
+# caller's `grad`) for everything else.
+_gradient(ctx::_QuadCtx, g, x) = ctx.gradient(g, x)
+_gradient(::_QuadCtx, g::_FDLeaf, x::SVector) = _fd_gradient(g.f, x, map(_ -> g.h, x))
 
 # Pick a height axis and report whether it is certifiably graph-like. For each axis k, every leaf is classified by
 # sampling ∂g/∂x_k at the box center and 2ᴰ corners (`_axis_class`):
@@ -207,7 +296,7 @@ _restrict(g::_LipschitzLeaf, k::Int, v) = _LipschitzLeaf(x -> g.f(_insert_axis(x
 # `(k, usable, classes)`: `usable` says that no leaf is bad along `k`, and `classes` holds every leaf's class along it.
 function _choose_axis(lsets, U::AxisBox{D}, ctx::_QuadCtx) where {D}
     samples = (center(U), _box_vertices(U)...)
-    grads = [map(x -> ctx.gradient(g, x), samples) for g in lsets]
+    grads = [map(x -> _gradient(ctx, g, x), samples) for g in lsets]
     return _choose_axis(grads, ctx.flat_tol, Val(D))
 end
 
@@ -327,8 +416,9 @@ end
 #   2. Base case D = 1: emit the inside parts of the single axis.
 #   3. Choose the height axis. If not certifiably graph-like and budget remains, bisect and recurse; at the floor (or
 #      on a box too small to bisect), force-reduce on the least-bad axis.
-#   4. Reduce: build the base problem on U with the height axis removed (every leaf's two face restrictions,
-#      partition-only) and recurse; then sweep the base nodes, emitting a fiber rule at each.
+#   4. Reduce: build the base problem on U with the height axis removed (every leaf's two face restrictions and one pair
+#      leaf per two leaves monotone along the axis that are not siblings, partition-only) and recurse; then sweep the
+#      base nodes, emitting a fiber rule at each.
 function _implicit_quad(lsets, membership, U::AxisBox{D,T}, ctx::_QuadCtx, depth::Int) where {D,T}
     active = Any[]
     for g in lsets
@@ -345,7 +435,7 @@ function _implicit_quad(lsets, membership, U::AxisBox{D,T}, ctx::_QuadCtx, depth
         return pts, wts
     end
 
-    k, usable, _ = _choose_axis(active, U, ctx)
+    k, usable, classes = _choose_axis(active, U, ctx)
     if !usable && depth < ctx.max_subdiv
         rule = _subdivide_and_collect(box -> _implicit_quad(active, membership, box, ctx, depth + 1), U)
         rule === nothing || return rule
@@ -358,6 +448,14 @@ function _implicit_quad(lsets, membership, U::AxisBox{D,T}, ctx::_QuadCtx, depth
     for g in active
         push!(base, _restrict(g, k, facelo))
         push!(base, _restrict(g, k, facehi))
+    end
+    # Crossings inside the box: one pair leaf per two leaves monotone along the height axis that are not siblings
+    # (`_PairLeaf`, `_siblings`).
+    monotone = active[classes .=== :monotone]
+    h = cbrt(eps(T)) * (facehi - facelo)
+    for i in eachindex(monotone), j in (i+1):lastindex(monotone)
+        _siblings(monotone[i], monotone[j]) && continue
+        push!(base, _FDLeaf(_PairLeaf{T}(monotone[i], monotone[j], k, facelo, facehi), h))
     end
     bpts, bwts = _implicit_quad(base, Returns(true), Ub, ctx, 0)
 

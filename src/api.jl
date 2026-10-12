@@ -136,15 +136,14 @@ outside `Ω` is also masked inactive and parents nothing, so a face loses whole 
 its non-physical area through the rule. The `cut_facet_region_count` field of [`AssemblyDiagnostics`](@ref) counts how
 many resolved facet regions needed that trimming, and `facet_moment_fit_residual_max` reports how well their fits went.
 
-The trimmed rule is **machine-exact where the level set restricted to the face is a single affine function** — one
-planar leaf, or one a 1-D bisection resolves exactly — and accurate rather than exact everywhere else, in two
-distinguishable ways. A curved cut converges in the moment order and in nothing else: measured 3.0e-5 on a disc cutting
-one cell of a face, unmoved by `subcell_length_scale` or `max_depth`. A CSG tree whose leaves meet at a corner *strictly
-inside* the face box is limited by something the fit cannot report, because the limit is not in the fit: the quadrature
-kernel places no breakpoint at such a corner, so the moments the fit reproduces are themselves slightly wrong, and a
-face cut by two planes meeting inside it comes out 3.6e-4 off with the fit's own residual at 3.5e-16. Read
-`facet_moment_fit_residual_max` as a bound on the fit and never on the kernel. That second ceiling is the kernel's
-rather than the facet path's, and volume integration on such a tree meets it too.
+The trimmed rule is **machine-exact where the level set restricted to the face is piecewise affine** — one planar leaf,
+or several meeting at a corner *strictly inside* the face box, where the quadrature kernel places a breakpoint (a face
+cut by two planes meeting inside it comes out exact to round-off) — and on every one-dimensional facet (a face of a 2D
+domain, an edge of a 3D one), whose crossings the kernel's root finding resolves to round-off. A curved cut is accurate
+rather than exact: it converges in the moment order and in nothing else, measured 3.0e-5 on a disc cutting one cell of a
+face, unmoved by `subcell_length_scale` or `max_depth`. Read `facet_moment_fit_residual_max` as a bound on the fit and
+never on the kernel: on a curved cut the moments the fit reproduces are themselves approximations, which the residual
+cannot see, and volume integration on the same tree shares that ceiling.
 
 `α` on the [`PhysicalDomain`](@ref) is honoured on a face exactly as it is in a cell. At `α > 0` a trimmed region's rule
 is the blend `(1−α)·fit ∪ α·tensor`, from `∫_face α f = (1−α)∫_{face∩Ω} f + α∫_face f`, and a region whose face lies
