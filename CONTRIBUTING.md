@@ -798,24 +798,25 @@ superposition idea for its own enrichment.
     (`Base.summarysize` of an 8² ladder of depth 7: 4.15 bytes per cell
     with them, 0.15 without, the mask's bit per cell being most of the rest;
     about 90 MB across the 22.4 M cells of a depth-9 stack), and the
-    discretisation pin digested them at 8 hash rounds per cell. The
-    record type is still one; the uniform case is one `nothing` branch in
-    four readers — `cell_order`, `cell_basis_indices`, `cell_orders` and the
-    assembly hot path's `_active_set`, which reads no mask because every
-    region parent is an active cell by construction (`_signature`). The
-    readers check the cell against the level's grid themselves, since a
-    uniform level has no array whose indexing would.
+    discretisation pin digested the class array at 8 hash rounds per cell.
+    The record type is still one; the uniform case is one `nothing` branch
+    in four readers — `cell_order`, `cell_basis_indices`, `cell_orders` and
+    the assembly hot path's `_active_set`, which reads no mask because
+    every region parent is an active cell by construction (`_signature`).
+    The readers check the cell against the level's grid themselves, since
+    a uniform level has no array whose indexing would.
     `cell_order(level, cell)` is the question anything that integrates,
     evaluates or subdivides must ask, and every quadrature consumer does:
     the region rule, the moment-fit order, the facet rule, the immersed
     simplex rule and the VTK subdivision all size from the parent *cell*.
     `nominal_order(level)` is the per-axis maximum over the palette, and it
-    is a sizing and default quantity — workspace banks and 1D factor
-    buffers, where over-sizing is safe; and the order a new `overlay` or a
-    re-instantiated basis family inherits. `Level.modes` is the derived
-    minimum-rule table (`CellModes`), computed by `Level`'s inner
-    constructor from the orders, the mesh, the family (which carries the
-    basis mode) and the mask, and never supplied by a caller.
+    is a sizing and default quantity — the workspace's 1D factor buffers,
+    where over-sizing is safe (its value and gradient buffers are sized
+    from the level's longest minimum-rule set instead); and the order a new
+    `overlay` or a re-instantiated basis family inherits. `Level.modes` is
+    the derived minimum-rule table (`CellModes`), computed by `Level`'s
+    inner constructor from the orders, the mesh, the family (which carries
+    the basis mode) and the mask, and never supplied by a caller.
   - **Order ≥ 1 per cell** is enforced per palette entry at construction, and
     `mode = :trunk` requires isotropy per cell. Neither can be expressed by
     the minimum rule: the dof key collapses the two endpoint modes into one
@@ -1479,10 +1480,10 @@ demos.
     active/inactive interfaces; `activate!`/`deactivate!` invalidation
     contract; every region parent an active cell of its level, on a
     masked uniform overlay, an immersed level and a ladder — the
-    invariant the hot path's mask-free set read rests on. `dilate`'s box shape (one cell grows to `∏_d (2·by_d + 1)`),
-    its per-axis widths, its monotonicity in the width, its clipping at a
-    box face, its refusals, and its agreement with `support_extension` at
-    the family's own radius.
+    invariant the hot path's mask-free set read rests on. `dilate`'s box
+    shape (one cell grows to `∏_d (2·by_d + 1)`), its per-axis widths, its
+    monotonicity in the width, its clipping at a box face, its refusals,
+    and its agreement with `support_extension` at the family's own radius.
   - Immersed boundary (`PhysicalDomain`): strict-α cell-level
     fictitious fold drops the right cells; the expected
     `:full` / `:cut_fitted` / `:fictitious_alpha` / `:cut_fallback` /
