@@ -161,23 +161,46 @@ below.
 """
 center(b::AxisBox) = (b.lower + b.upper) / 2
 
-# The 2ᴰ children of one bisection of `b` on every axis, ordered by the lexicographic bit pattern that selects `lower`
-# (bit 0) or the center (bit 1) per axis — the same enumeration shape `_classify_box` and the implicit kernel's
-# subdivision use, hoisted here so a third consumer need not repeat it.
+# The 2ᴰ vertices of the box spanned by `lower` and `upper`, vertex `i` taking `lower[d]` where bit `d − 1` of `i − 1`
+# is 0 and `upper[d]` where it is 1 — axis 1 fastest, the `CartesianIndices` order. The one corner enumeration of the
+# sign samplers (the kernel's leaf pruning and height-axis choice, the classifier's corner membership, the VTK cut
+# refinement) and of `_box_children` below; VTK cell connectivity keeps its own order (`_box_corners`).
+function _box_vertices(lower::SVector{D,T}, upper::SVector{D,T}) where {D,T}
+    return ntuple(i -> SVector{D,T}(ntuple(d -> (i - 1) >> (d - 1) & 1 == 0 ? lower[d] : upper[d], D)), Val(2^D))
+end
+_box_vertices(b::AxisBox) = _box_vertices(b.lower, b.upper)
+
+# The 2ᴰ children of one bisection of `b` on every axis, in `_box_vertices` order: child `i` spans vertex `i` of the
+# lower half-box `[lower, c]` to vertex `i` of the upper one `[c, upper]`. Shared by the classifier's octree
+# (`_classify_box`), the implicit kernel's subdivision and the VTK cut refinement.
 #
 # Returns `nothing` when the bisection would be degenerate. On a box whose extent has reached the floating-point floor
 # the midpoint coincides with a bound on some axis, and `AxisBox`'s strict `lower[i] < upper[i]` invariant would reject
-# the child; the caller stops subdividing instead. The guard mirrors `_bisect` in `implicit.jl`, which halts on the same
-# condition rather than looping on a midpoint that no longer moves.
+# the child; every caller treats `nothing` as its depth floor and stops subdividing, rather than looping on a midpoint
+# that no longer moves.
 function _box_children(b::AxisBox{D,T}) where {D,T}
     c = center(b)
     all(d -> b.lower[d] < c[d] < b.upper[d], 1:D) || return nothing
-    return ntuple(Val(2^D)) do i
-        bits = ntuple(d -> (i - 1) >> (d - 1) & 1, D)
-        lower = SVector{D,T}(ntuple(d -> bits[d] == 0 ? b.lower[d] : c[d], D))
-        upper = SVector{D,T}(ntuple(d -> bits[d] == 0 ? c[d] : b.upper[d], D))
-        AxisBox{D,T}(lower, upper)
-    end
+    return map(AxisBox{D,T}, _box_vertices(b.lower, c), _box_vertices(c, b.upper))
+end
+
+# Half-diagonal of an axis-aligned box — the radius of the smallest enclosing ball. Used by the Lipschitz certificate
+# below: for a Lipschitz `f` and any point `y` in the box, |f(y) − f(c)| ≤ L·r with `c` the center and `r` this radius.
+_half_diagonal(b::AxisBox) = norm(b.upper - b.lower) / 2
+
+# Sign of `f` over the whole of `box`, certified by a Lipschitz constant `L` of `f` (`|f(x) − f(y)| ≤ L‖x − y‖`): with
+# `c` the center and `r = _half_diagonal(box)`,
+#
+#     |f(y) − f(c)| ≤ L‖y − c‖ ≤ L·r    for every y ∈ box,
+#
+# so `f(c) > L·r` proves `f > 0` on the box (`+1`) and `f(c) < −L·r` proves `f < 0` (`−1`). Anything else is `0`,
+# undetermined — including `L = Inf`, which certifies nothing. One evaluation of `f`. The single certificate of the
+# CSG classifier (`_tri`), the implicit kernel's leaf pruning (`_sample_sign`) and the VTK cut refinement
+# (`_cut_marked`), so the three agree on which boxes a leaf provably misses.
+function _certified_sign(f, L, box::AxisBox)
+    fc = f(center(box))
+    thr = L * _half_diagonal(box)
+    return fc > thr ? 1 : (fc < -thr ? -1 : 0)
 end
 
 # Strict containment without tolerance: a point lies in the box iff every coordinate satisfies

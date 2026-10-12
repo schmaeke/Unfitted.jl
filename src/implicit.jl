@@ -141,35 +141,21 @@ end
 # This is a *heuristic*: a feature smaller than the sample spacing is invisible, and pruning every leaf makes the caller
 # treat the box as uniform. The `_LipschitzLeaf` method below replaces it by a certificate wherever the caller supplied
 # a Lipschitz constant.
-function _sample_sign(g, U::AxisBox{D,T}) where {D,T}
-    vc = g(center(U))
-    sref = vc < zero(vc) ? -1 : (vc > zero(vc) ? 1 : 0)
-    sref == 0 && return 0
-    for ci in CartesianIndices(ntuple(_ -> 0:1, D))
-        x = SVector{D,T}(ntuple(a -> ci.I[a] == 0 ? U.lower[a] : U.upper[a], D))
-        v = g(x)
-        s = v < zero(v) ? -1 : (v > zero(v) ? 1 : 0)
-        s != sref && return 0
-    end
-    return sref
+function _sample_sign(g, U::AxisBox)
+    sgn(v) = v < zero(v) ? -1 : (v > zero(v) ? 1 : 0)
+    sref = sgn(g(center(U)))
+    return sref != 0 && all(x -> sgn(g(x)) == sref, _box_vertices(U)) ? sref : 0
 end
 
-# Certified sign of a Lipschitz leaf on `U`, the same test the CSG cell classifier uses (`_tri` in `src/physical.jl`):
-# with `c` the box center and `r = _half_diagonal(U)` the radius of the smallest enclosing ball,
+# Certified sign of a Lipschitz leaf on `U`, the same test the CSG cell classifier uses (`_certified_sign`: |f(c)| > L·r
+# at the center `c`, with `r` the half-diagonal, proves `f` cannot change sign on `U`). Unlike point sampling this never
+# prunes a leaf that does vary on the box, which is what keeps a geometric feature smaller than the sample spacing — a
+# small hole well inside a cell, say — from vanishing into a silently full box rule.
 #
-#     |f(y) − f(c)| ≤ L‖y − c‖ ≤ L·r    for every y ∈ U,
-#
-# so `|f(c)| > L·r` proves `f` cannot change sign on `U`. Unlike point sampling this never prunes a leaf that does vary
-# on the box, which is what keeps a geometric feature smaller than the sample spacing — a small hole well inside a cell,
-# say — from vanishing into a silently full box rule.
-#
-# `L = Inf` (the default of [`leaf`](@ref)) makes the threshold infinite, which would certify nothing and leave every
-# leaf active; that mode falls back to the point-sampling heuristic above, matching the pre-certificate behavior.
-function _sample_sign(g::_LipschitzLeaf, U::AxisBox{D,T}) where {D,T}
-    thr = g.lipschitz * _half_diagonal(U)
-    isfinite(thr) || return _sample_sign(g.f, U)
-    vc = g.f(center(U))
-    return vc > thr ? 1 : (vc < -thr ? -1 : 0)
+# `L = Inf` (the default of [`leaf`](@ref)) would certify nothing and leave every leaf active; that mode falls back to
+# the point-sampling heuristic above, matching the pre-certificate behavior.
+function _sample_sign(g::_LipschitzLeaf, U::AxisBox)
+    return isfinite(g.lipschitz) ? _certified_sign(g.f, g.lipschitz, U) : _sample_sign(g.f, U)
 end
 
 # Restrict a level-set callback to the affine slice `{x_k = v}`, the base-problem leaf of one dimension-reduction step.
@@ -179,80 +165,50 @@ _restrict(g, k::Int, v) = x -> g(_insert_axis(x, k, v))
 _restrict(g::_LipschitzLeaf, k::Int, v) = _LipschitzLeaf(x -> g.f(_insert_axis(x, k, v)), g.lipschitz)
 
 # Pick a height axis and report whether it is certifiably graph-like. For each axis k, every leaf is classified by
-# sampling ∂g/∂x_k at the box center and 2ᴰ corners:
+# sampling ∂g/∂x_k at the box center and 2ᴰ corners (`_axis_class`):
 #
-#   MONOTONE — consistent non-zero sign ⇒ at most one fiber root;
-#   FLAT     — |∂g/∂x_k| ≈ 0 at every sample ⇒ no fiber root (the leaf
-#              partitions the base instead; this is what makes polytope corners
-#              exact, e.g. a half-space perpendicular to k);
-#   BAD      — the sign of ∂g/∂x_k changes ⇒ possibly several fiber roots.
+#   :monotone — consistent non-zero sign ⇒ at most one fiber root;
+#   :flat     — |∂g/∂x_k| ≈ 0 at every sample ⇒ no fiber root (the leaf partitions the base instead; this is what makes
+#               polytope corners exact, e.g. a half-space perpendicular to k);
+#   :bad      — the sign of ∂g/∂x_k changes ⇒ possibly several fiber roots.
 #
-# An axis is usable when no leaf is BAD; among usable axes pick the one maximising the smallest |∂g/∂x_k| over the
-# MONOTONE leaves (best conditioning). Returns `(k, usable)`; when no axis is usable, `k` is the least-bad axis for the
-# force-reduce path at the subdivision floor.
-function _choose_axis(lsets, U::AxisBox{D,T}, ctx::_QuadCtx) where {D,T}
-    samples = SVector{D,T}[center(U)]
-    for ci in CartesianIndices(ntuple(_ -> 0:1, D))
-        push!(samples, SVector{D,T}(ntuple(a -> ci.I[a] == 0 ? U.lower[a] : U.upper[a], D)))
-    end
-    grads = [[ctx.gradient(g, s) for s in samples] for g in lsets]
-    # Gradient scale per leaf from the finite samples only: an SDF-like leaf evaluated at its own centre yields ∇ =
-    # 0/0 = NaN, which must not poison the flat/monotone/bad classification below.
-    scales = map(grads) do gs
-        finite = (norm(g) for g in gs if all(isfinite, g))
-        m = reduce(max, finite; init=zero(T))
-        m > 0 ? m : one(T)
-    end
+# The axis is the lexicographic maximum of (−#bad leaves, score), the first axis winning a tie, where the score is the
+# smallest |∂g/∂x_k| over the monotone leaves (best conditioning) and 0 when no leaf is monotone along k (an axis along
+# which nothing varies cannot root-find the interface). An axis with no bad leaf therefore always wins, and is the one
+# of best conditioning; with none, the least-bad axis is the force-reduce choice at the subdivision floor. Returns
+# `(k, usable, classes)`: `usable` says that no leaf is bad along `k`, and `classes` holds every leaf's class along it.
+function _choose_axis(lsets, U::AxisBox{D}, ctx::_QuadCtx) where {D}
+    samples = (center(U), _box_vertices(U)...)
+    grads = [map(x -> ctx.gradient(g, x), samples) for g in lsets]
+    return _choose_axis(grads, ctx.flat_tol, Val(D))
+end
 
-    best_k = 0
-    best_score = T(-Inf)
-    fallback_k = 1
-    fallback_bad = typemax(Int)
-    fallback_score = T(-Inf)
-    for k in 1:D
-        usable = true
-        score = T(Inf)
-        any_monotone = false
-        nbad = 0
-        for (gi, gs) in enumerate(grads)
-            tol = ctx.flat_tol * max(scales[gi], one(T))
-            pos = false
-            neg = false
-            minmag = T(Inf)
-            for g in gs
-                dk = g[k]
-                isfinite(dk) || continue   # ignore non-finite gradient samples
-                if dk > tol
-                    pos = true
-                    minmag = min(minmag, dk)
-                elseif dk < -tol
-                    neg = true
-                    minmag = min(minmag, -dk)
-                end
-            end
-            if pos && neg
-                usable = false
-                nbad += 1
-            elseif pos || neg
-                any_monotone = true
-                score = min(score, minmag)
-            end
+# The axis choice on the sampled gradients, behind a function barrier: `lsets` holds `Any`-typed callbacks, so the
+# gradients' type is known only at run time, and the classification below then runs on concrete types.
+function _choose_axis(grads::Vector, flat_tol, ::Val{D}) where {D}
+    k = argmax(1:D) do k
+        nbad, score = 0, oftype(flat_tol, Inf)
+        for gs in grads
+            class, minmag = _axis_class(gs, k, flat_tol)
+            nbad += class === :bad
+            class === :monotone && (score = min(score, minmag))
         end
-        # An axis along which no active leaf varies (all FLAT) cannot root-find the interface — it scores lowest so a
-        # genuinely monotone axis wins whenever one exists.
-        any_monotone || (score = zero(T))
-        if usable && score > best_score
-            best_score = score
-            best_k = k
-        end
-        fscore = isfinite(score) ? score : zero(T)
-        if nbad < fallback_bad || (nbad == fallback_bad && fscore > fallback_score)
-            fallback_bad = nbad
-            fallback_score = fscore
-            fallback_k = k
-        end
+        return (-nbad, isinf(score) ? zero(score) : score)
     end
-    return best_k == 0 ? (fallback_k, false) : (best_k, true)
+    classes = [first(_axis_class(gs, k, flat_tol)) for gs in grads]
+    return k, !(:bad in classes), classes
+end
+
+# Class of one leaf along axis `k` from its gradient samples `gs`, and the smallest |∂g/∂x_k| over the samples that
+# vary. A component counts as zero within `flat_tol` of the leaf's largest finite gradient norm (floored at 1, so a
+# nearly constant leaf is not held to an absolute round-off scale). Non-finite samples are ignored: an SDF-like leaf
+# evaluated at its own center yields ∇ = 0/0 = NaN, which must not poison the classification.
+function _axis_class(gs, k::Int, flat_tol)
+    tol = flat_tol * max(maximum(g -> all(isfinite, g) ? norm(g) : zero(flat_tol), gs), one(flat_tol))
+    pos = any(g -> isfinite(g[k]) && g[k] > tol, gs)
+    neg = any(g -> isfinite(g[k]) && g[k] < -tol, gs)
+    minmag = minimum(g -> isfinite(g[k]) && abs(g[k]) > tol ? abs(g[k]) : oftype(tol, Inf), gs)
+    return (pos && neg ? :bad : pos || neg ? :monotone : :flat), minmag
 end
 
 # ── Fiber rule emission ────────────────────────────────────────────────────────
@@ -304,40 +260,27 @@ end
 
 # ── Full-box tensor rule ───────────────────────────────────────────────────────
 
-# Tensor Gauss rule over the whole box, used when no leaf varies on the box and the box is inside Ω. Maps directly into
-# physical coordinates with the box Jacobian folded in.
+# Tensor Gauss rule over the whole box, used when no leaf varies on the box and the box is inside Ω: the context's 1D
+# rule on every axis (`_tensor_rule`), mapped in place into physical coordinates with the box Jacobian folded in.
 function _full_box_rule(U::AxisBox{D,T}, ctx::_QuadCtx) where {D,T}
-    nodes, gw = ctx.nodes, ctx.weights
-    n = length(nodes)
-    jac = volume(U) / convert(T, 2^D)
-    pts = Vector{SVector{D,T}}(undef, n^D)
-    wts = Vector{T}(undef, n^D)
-    idx = 1
-    for ci in CartesianIndices(ntuple(_ -> 1:n, D))
-        eta = SVector{D,T}(ntuple(a -> nodes[ci.I[a]], D))
-        w = one(T)
-        for a in 1:D
-            w *= gw[ci.I[a]]
-        end
-        pts[idx] = reference_to_physical(U, eta)
-        wts[idx] = w * jac
-        idx += 1
-    end
-    return pts, wts
+    rule = _tensor_rule(ntuple(_ -> (ctx.nodes, ctx.weights), Val(D)))
+    map!(η -> reference_to_physical(U, η), rule.points, rule.points)
+    rule.weights .*= volume(U) / convert(T, 2^D)
+    return rule.points, rule.weights
 end
 
 # ── Core recursion ─────────────────────────────────────────────────────────────
 
-# Bisect `U` into its 2ᴰ children and concatenate `recurse(child, depth+1)` over them. This is the "not graph-like ⇒
-# subdivide" branch of the volume recursion; `recurse` is the per-child continuation.
-function _subdivide_and_collect(recurse, U::AxisBox{D,T}, depth::Int) where {D,T}
-    c = center(U)
+# Bisect `U` into its 2ᴰ children (`_box_children`) and concatenate `recurse(child)` over them. This is the "not
+# graph-like ⇒ subdivide" branch of the volume recursion; `recurse` is the per-child continuation. `nothing` when `U` is
+# too small to bisect, which the caller treats as the depth floor.
+function _subdivide_and_collect(recurse, U::AxisBox{D,T}) where {D,T}
+    children = _box_children(U)
+    children === nothing && return nothing
     pts = SVector{D,T}[]
     wts = T[]
-    for ci in CartesianIndices(ntuple(_ -> 0:1, D))
-        lower = SVector{D,T}(ntuple(a -> ci.I[a] == 0 ? U.lower[a] : c[a], D))
-        upper = SVector{D,T}(ntuple(a -> ci.I[a] == 0 ? c[a] : U.upper[a], D))
-        cp, cw = recurse(AxisBox{D,T}(lower, upper), depth + 1)
+    for child in children
+        cp, cw = recurse(child)
         append!(pts, cp)
         append!(wts, cw)
     end
@@ -352,8 +295,8 @@ end
 #   1. Prune leaves that do not vary on U (a partition-only optimisation; `membership` re-evaluates the full predicate,
 #      so this is safe). With no varying leaf left, U is uniform: full tensor rule if inside, else empty.
 #   2. Base case D = 1: emit the inside parts of the single axis.
-#   3. Choose the height axis. If not certifiably graph-like and budget remains, bisect and recurse; at the floor,
-#      force-reduce on the least-bad axis.
+#   3. Choose the height axis. If not certifiably graph-like and budget remains, bisect and recurse; at the floor (or
+#      on a box too small to bisect), force-reduce on the least-bad axis.
 #   4. Reduce: build the base problem on U with the height axis removed (every leaf's two face restrictions,
 #      partition-only) and recurse; then sweep the base nodes, emitting a fiber rule at each.
 function _implicit_quad(lsets, membership, U::AxisBox{D,T}, ctx::_QuadCtx, depth::Int) where {D,T}
@@ -372,9 +315,10 @@ function _implicit_quad(lsets, membership, U::AxisBox{D,T}, ctx::_QuadCtx, depth
         return pts, wts
     end
 
-    k, usable = _choose_axis(active, U, ctx)
+    k, usable, _ = _choose_axis(active, U, ctx)
     if !usable && depth < ctx.max_subdiv
-        return _subdivide_and_collect((box, d) -> _implicit_quad(active, membership, box, ctx, d), U, depth)
+        rule = _subdivide_and_collect(box -> _implicit_quad(active, membership, box, ctx, depth + 1), U)
+        rule === nothing || return rule
     end
 
     # Reduce one dimension: partition-only base, then a fiber rule per base node.

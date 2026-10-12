@@ -682,11 +682,11 @@ end
 # Should this sub-box be bisected? Two regimes, and which one applies is decided by whether the geometry declares a
 # Lipschitz constant.
 #
-#   * finite `L` — mark iff `|φ(c)| ≤ L·r` with `r` the half-diagonal. This is the exact negation of the package's own
-#     uniform-sign certificate in `_tri`: an *unmarked* box provably has one sign of φ over its whole closed box, so it
-#     contains no part of ∂Ω and emits no cut surface, and no hanging node on its faces can disagree with a finer
-#     neighbour. That is what makes the output crack-free rather than merely crack-free in practice. One φ evaluation
-#     per box.
+#   * finite `L` — mark iff `|φ(c)| ≤ L·r` with `r` the half-diagonal, i.e. iff the package's own uniform-sign
+#     certificate (`_certified_sign`, the classifier's test) leaves the box undetermined: an *unmarked* box provably
+#     has one sign of φ over its whole closed box, so it contains no part of ∂Ω and emits no cut surface, and no
+#     hanging node on its faces can disagree with a finer neighbour. That is what makes the output crack-free rather
+#     than merely crack-free in practice. One φ evaluation per box.
 #   * `L = Inf` (the default from `leaf(f)`) — no certificate exists, so fall back to the corner signs, which is the
 #     same evidence ParaView's own clip works from. 2ᴰ evaluations, and a feature of Ω smaller than the box and missing
 #     every corner is invisible; the remedy is to declare the constant on the leaf.
@@ -694,13 +694,12 @@ end
 # Deliberately *not* used: a secant bound `max|φ(vᵢ) − φ(c)|` in place of `L·r`. It is identically zero whenever φ is
 # symmetric about the box center — two parallel plates straddling it, say — and the box then goes unmarked at every
 # threshold, which is exactly the configuration that tears.
-function _cut_marked(physical::PhysicalDomain, b::AxisBox{D,T}, lipschitz::Float64) where {D,T}
-    if isfinite(lipschitz)
-        return abs(levelset_value(physical, center(b))) <= lipschitz * _half_diagonal(b)
-    end
-    corners = _box_corners(b, Val(D))
-    inside = levelset_value(physical, corners[1]) <= 0
-    return any(i -> (levelset_value(physical, corners[i]) <= 0) != inside, 2:(2^D))
+function _cut_marked(physical::PhysicalDomain, b::AxisBox, lipschitz::Float64)
+    φ = x -> levelset_value(physical, x)
+    isfinite(lipschitz) && return _certified_sign(φ, lipschitz, b) == 0
+    corners = _box_vertices(b)
+    inside = φ(first(corners)) <= 0
+    return any(x -> (φ(x) <= 0) != inside, Base.tail(corners))
 end
 
 # ── Level meshes ──────────────────────────────────────────────────────────────
