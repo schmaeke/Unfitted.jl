@@ -297,11 +297,13 @@ _gradient(::_QuadCtx, g::_FDLeaf, x::SVector) = _fd_gradient(g.f, x, map(_ -> g.
 function _choose_axis(lsets, U::AxisBox{D}, ctx::_QuadCtx) where {D}
     samples = (center(U), _box_vertices(U)...)
     grads = [map(x -> _gradient(ctx, g, x), samples) for g in lsets]
-    return _choose_axis(grads, ctx.flat_tol, Val(D))
+    return _choose_axis(grads, ctx.flat_tol, Val(D))::Tuple{Int,Bool,Vector{Symbol}}
 end
 
 # The axis choice on the sampled gradients, behind a function barrier: `lsets` holds `Any`-typed callbacks, so the
-# gradients' type is known only at run time, and the classification below then runs on concrete types.
+# gradients' type is known only at run time, and the classification below then runs on concrete types. The call into
+# the barrier is dynamic for the same reason, so its caller asserts the result type: without it `k` is inferred as
+# `Any`, and `_implicit_quad` would dispatch `_emit_fiber!` dynamically, boxing its arguments, once per base node.
 function _choose_axis(grads::Vector, flat_tol, ::Val{D}) where {D}
     k = argmax(1:D) do k
         nbad, score = 0, oftype(flat_tol, Inf)

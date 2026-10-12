@@ -358,3 +358,12 @@ end
                 for I in CartesianIndices((8, 8)))
     @test total ≈ area rtol = 1e-12
 end
+
+@testset "implicit quadrature — the height-axis choice is inferred" begin
+    # `_choose_axis` samples `Any`-typed leaves, so the call into its classification is dynamic, and its result type is
+    # asserted for `_implicit_quad`'s sake: without that the chosen axis was inferred as `Any`, and every base node's
+    # fiber emission was dispatched dynamically and boxed its arguments.
+    ctx = Unfitted._quad_ctx(Float64, 4, nothing, 4, 1.0)
+    region = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    @test (@inferred Unfitted._choose_axis(Any[x -> x[1] + 2x[2] - 1], region, ctx)) == (2, true, [:monotone])
+end
