@@ -533,8 +533,8 @@ end
     @test fits[] == 0
     # Its own cache, holding everything the source's does: both models are live from here, so neither may reduce the
     # other's.
-    @test only(target.moment_fit_caches) !== only(model.moment_fit_caches)
-    @test length(only(target.moment_fit_caches)) == length(only(model.moment_fit_caches))
+    @test only(Unfitted._fits(target)) !== only(Unfitted._fits(model))
+    @test length(only(Unfitted._fits(target))) == length(only(Unfitted._fits(model)))
 
     # The alternation an hp loop runs. `estimate` builds an order-elevated twin, which needs a *second* moment order at
     # the very same region boxes; the step that follows needs the first one back. Evicting a cache to exactly one plan's
@@ -564,12 +564,12 @@ end
                            cut_quadrature=counting_cut_rule(fits))
     V = ladder(box((-1.0, -1.0), (1.0, 1.0)); cells=8, order=2, depth=1, physical=disc, basis=bspline())
     model = prepare(mass(adapt(V, 2 => trues(16, 16))))
-    held = collect(keys(only(model.moment_fit_caches)))
+    held = collect(keys(only(Unfitted._fits(model))))
     u = solve!(model)
     fits[] = 0
     estimate(model, u)
     @test fits[] > 0                                   # the twin's boxes are new
-    @test all(key -> haskey(only(model.moment_fit_caches), key), held)
+    @test all(key -> haskey(only(Unfitted._fits(model)), key), held)
     fits[] = 0
     adapted(model, 2 => trues(16, 16))
     @test fits[] == 0                                  # ... the step after it is warm
@@ -589,14 +589,14 @@ end
     V = overlay(space(LADDER_OMEGA; cells=(4, 4), order=1, physical=half), box((0.0, 0.0), (0.25, 0.25)); cells=(1, 1),
                 order=1)
     model = prepare(mass(V; coefficient=1.0))
-    before = length(only(model.moment_fit_caches))
+    before = length(only(Unfitted._fits(model)))
     @test before > 0
 
     fits[] = 0
     target = moved(model; level=2, to=box((0.25, 0.0), (0.5, 0.25)))
     @test fits[] == 0
-    @test only(target.moment_fit_caches) !== only(model.moment_fit_caches)
-    @test length(only(model.moment_fit_caches)) == before
+    @test only(Unfitted._fits(target)) !== only(Unfitted._fits(model))
+    @test length(only(Unfitted._fits(model))) == before
 end
 
 @testset "ladder composes with an immersed domain" begin

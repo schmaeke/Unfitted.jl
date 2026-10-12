@@ -298,7 +298,7 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     enriched_space, charge = _enriched_space(V, Int(enrichment))
     twinned = Int[V.levels[k].id for (k, factor) in charge if factor > 1]
     plus = if isempty(twinned)
-        _derived(model, enriched_space; caches=model.moment_fit_caches, point_base=_FOREIGN_POINTS)
+        _derived(model, enriched_space; caches=_fits(model), point_base=_FOREIGN_POINTS)
     else
         _twinned_model(model, enriched_space, twinned)
     end
@@ -503,10 +503,10 @@ _coarse_cell(c::CartesianIndex{D}, f::Int) where {D} = CartesianIndex(ntuple(d -
 # when a twin is first estimated, never for a stack without one. Inference still reads its body, for the abstract
 # signature, when `estimate` itself is first compiled, whatever the stack.
 function _twinned_model(model::Model, space::Space, twinned::Vector{Int})
-    caches = copy.(model.moment_fit_caches)
+    caches = copy.(_fits(model))
     plus = _derived(model, space; options=merge(model.plan_options, (; prune_exempt=twinned)), caches,
                     point_base=_FOREIGN_POINTS)
-    foreach(merge!, model.moment_fit_caches, caches)
+    foreach(merge!, _fits(model), caches)
     return plus
 end
 

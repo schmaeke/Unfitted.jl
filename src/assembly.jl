@@ -165,7 +165,7 @@ end
 
 # A fresh workspace for `model`. Deliberately unspecialised: it runs once per call, never per region, and specialising
 # it on `Model{D,T,P}` would only compile it again for every problem type.
-_assembly_workspace(@nospecialize(model::Model)) = AssemblyWorkspace(model.dofs, problem_spaces(model.problem))
+_assembly_workspace(@nospecialize(model::Model)) = AssemblyWorkspace(model.dofs, (s.space for s in model.subdomains))
 
 """
     FormState
@@ -425,7 +425,7 @@ _scalar(::SystemLayout{D,T}) where {D,T} = T
 #
 #   1. the volume target first, then every `on=` target in its first appearance in `(blocks..., loads...)`, matched by
 #      `isequal` — value-equal selectors are one target, meshes and interfaces match by identity;
-#   2. each target split per subdomain space, in `problem_spaces` order, a pass taking the forms whose test field lives
+#   2. each target split per subdomain space, in subdomain order, a pass taking the forms whose test field lives
 #      on that space. A region list is built on one space's level block and only that space's fields evaluate on it
 #      (`_parent_range`), so a target named on two subdomains is two independent passes, and a volume form runs on its
 #      own subdomain's plan only;
@@ -443,7 +443,7 @@ function _passes(@nospecialize(model::Model), @nospecialize(blocks::Tuple), @nos
         form.on === nothing || any(t -> isequal(t, form.on), targets) || push!(targets, form.on)
     end
     passes = Any[]
-    for target in targets, space in (target isa Interface ? Any[nothing] : problem_spaces(model.problem))
+    for target in targets, space in (target isa Interface ? (nothing,) : (s.space for s in model.subdomains))
         mine = form -> isequal(form.on, target) &&
                        (space === nothing || _field_space(model.problem, form.test_name) === space)
         target_blocks, target_loads = filter(mine, blocks), filter(mine, loads)
@@ -511,8 +511,7 @@ _point_count(list::RegionList) = list.offsets[end] - list.offsets[1]
 # target, not per face: a selector resolves through the model's `FacetResolver`, so a face `prepare` already resolved is
 # reused, and a new face is resolved once however many selectors name it.
 function _regions(@nospecialize(model::Model), ::Nothing, @nospecialize(space))
-    plan = findfirst(s -> s === space, problem_spaces(model.problem))
-    return model.space_plans[plan].regions, true
+    return model.subdomains[findfirst(s -> s.space === space, model.subdomains)].plan.regions, true
 end
 function _regions(@nospecialize(model::Model), @nospecialize(target), @nospecialize(space))
     cached = get(model.regions, (target, space), nothing)
@@ -1460,7 +1459,7 @@ function nquadpoints(model::Model; kind::Symbol=:volume, on=nothing, field::Unio
     # The aggregate sums over one of four iterator types, which inference does not follow; the declared `::Int` is what
     # keeps a caller that sizes a loop by the count type-stable (the `RBFP0` transfer's serial loop allocated per
     # point).
-    lists = kind === :volume ? (plan.regions for plan in integration_plans(model)) :
+    lists = kind === :volume ? (s.plan.regions for s in model.subdomains) :
             kind === :facet ? _cached_lists(model.regions, BoundarySelector) :
             kind === :surface ? _cached_lists(model.regions, BoundaryMesh) :
             kind === :interface ? _cached_lists(model.regions, Interface) :
@@ -1524,7 +1523,7 @@ end
 function _target_space(@nospecialize(model::Model), @nospecialize(on), field::Union{Nothing,Symbol})
     on isa Interface && return nothing
     field === nothing || return _field_space(model.problem, field)
-    length(problem_spaces(model.problem)) == 1 && return model.problem.space
+    length(model.subdomains) == 1 && return model.problem.space
     names = join((":" * String(f.name) for f in model.problem.fields), ", ")
     throw(ArgumentError("field argument is required for multi-domain models; pass field=… " * "(one of $names)"))
 end

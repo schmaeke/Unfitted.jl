@@ -236,8 +236,8 @@ function write_quadrature_vtm(path::AbstractString, model::Model{D,T}) where {D,
     # covering-level signature already separates subdomains into distinct blocks — a coupled model shows every
     # subdomain's quadrature cloud, not just the first.
     all_regions = VolumeRegion{D,T}[]
-    for plan in integration_plans(model)
-        append!(all_regions, plan.regions)
+    for subdomain in model.subdomains
+        append!(all_regions, subdomain.plan.regions)
     end
 
     # Group regions by the sorted list of covering parent-level ids, then emit one VTP block per group.

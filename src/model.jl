@@ -518,6 +518,15 @@ end
 
 # ── Model and `prepare` ───────────────────────────────────────────────────────
 
+# One prepared subdomain of a model: its space, its integration plan and the moment-fit cache the plan was built on
+# (see `Model.subdomains`). The three are made together by `prepare`, one per distinct space, and every per-subdomain
+# reader wants them together, so they are one record rather than parallel vectors kept aligned by position.
+struct _Subdomain{D,T}
+    space::Space{D,T}
+    plan::IntegrationPlan{D,T}
+    fits::_MomentFitCache{D,T}
+end
+
 """
     Model{D,T,P}
 
@@ -544,18 +553,24 @@ value through. Fields:
     carry-over raises. Every in-place mutation that invalidates the assembled state then moves the pin on as well, so a
     solution taken before a [`move!`](@ref) or a mask flip raises as it always has. See `_discretisation_pin` for
     exactly what the digest reads and, just as importantly, what it must not.
-  - `space_plans::Vector{IntegrationPlan{D,T}}` — cached integration plan per *distinct* participating discretisation,
-    in the first-appearance order of `problem_spaces``(problem)`. A single-domain problem carries one plan; a
-    multi-domain (coupled) problem carries one per subdomain space, each built against that space's own physical fold.
-    Populated by `prepare` and refreshed by every mutator. The field-to-plan routing is intrinsic: each field owns the
-    regions on its space's level-id block (see `FieldLayout.level_ids` and `_parent_range`), so no per-plan routing
-    table is stored.
-  - `moment_fit_caches::Vector{_MomentFitCache{D,T}}` — one cut-region moment-fit rule cache per distinct participating
-    space, aligned with `space_plans`. Every mutator threads it back into `integration_plan`, so a cut region a `move!`
-    or a mask flip leaves bit-identical reuses its rule instead of being refitted — by far the dominant cost of a 3D
-    plan rebuild. A cache is keyed by `(region box, moment order)` and omits the geometry, on the reasoning that one
-    cache sees exactly one immutable [`PhysicalDomain`](@ref) for its whole life; that is what the guards on
-    [`adapted`](@ref)`(model, space)` enforce, and it is why there is nothing here to invalidate.
+  - `subdomains::Vector{_Subdomain{D,T}}` — one prepared record per *distinct* participating discretisation, in the
+    first-appearance order of `problem_spaces(problem)`: one on a single-domain problem, one per subdomain space on a
+    multi-domain (coupled) one. Populated by `prepare` and refreshed by every mutator. A record holds what is built
+    together for one subdomain and read together:
+
+      - `space` — the subdomain's space as prepared: folded against its own physical domain and reindexed into its own
+        block of level ids. It is the very object the effective `problem`'s fields over the subdomain hold (`===`), so
+        the per-subdomain consumers — the assembly passes, workspace and volume lookup, the reproducibility report —
+        read it here instead of recomputing `problem_spaces`.
+      - `plan` — the subdomain's cached [`IntegrationPlan`](@ref), built against that space's own physical fold. The
+        field-to-plan routing is intrinsic: each field owns the regions on its space's level-id block (see
+        `FieldLayout.level_ids` and `_parent_range`), so no per-plan routing table is stored.
+      - `fits` — the subdomain's cut-region moment-fit rule cache, which `plan` was built on. Every mutator threads it
+        back into `integration_plan`, so a cut region a `move!` or a mask flip leaves bit-identical reuses its rule
+        instead of being refitted — by far the dominant cost of a 3D plan rebuild. A cache is keyed by
+        `(region box, moment order)` and omits the geometry, on the reasoning that one cache sees exactly one immutable
+        [`PhysicalDomain`](@ref) for its whole life; that is what the guards on [`adapted`](@ref)`(model, space)`
+        enforce, and it is why there is nothing here to invalidate.
 
     Lineage, because a cache outlives the model that created it. A mutator (`move!`, `activate!`, `deactivate!`) keeps
     the model's own cache objects, since it overwrites the model rather than forking it. A non-mutating derivation
@@ -627,8 +642,7 @@ mutable struct Model{D,T,P}
     problem::P
     prefold_space::Space{D,T}
     version::Int
-    space_plans::Vector{IntegrationPlan{D,T}}
-    moment_fit_caches::Vector{_MomentFitCache{D,T}}
+    subdomains::Vector{_Subdomain{D,T}}
     dofs::SystemLayout{D,T}
     matrix::Union{Nothing,SparseMatrixCSC{T,Int}}
     rhs::Union{Nothing,Vector{T}}
@@ -639,6 +653,10 @@ mutable struct Model{D,T,P}
     assembly::AssemblyCache{T}
     plan_options::NamedTuple
 end
+
+# The moment-fit caches of `model`'s subdomains, in order: what a derivation hands `_derived`, which states whether the
+# new model shares them or gets copies. The vector is fresh; the caches in it are the model's own objects.
+_fits(model::Model) = [s.fits for s in model.subdomains]
 
 """
     prepare(problem::Problem; prune=true, tolerance=…, criterion=…) -> Model
@@ -695,12 +713,13 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
     prune = get(plan_options, :prune, true)
     prune_exempt = get(plan_options, :prune_exempt, ())
     integration_options = Base.structdiff(plan_options, NamedTuple{(:prune, :prune_exempt)})
-    # One integration plan per distinct subdomain space, each sharing that space's own cell-classification cache. The
-    # moment-fit caches, unlike the classification ones, outlive this call: they are the model's, and every mutator
-    # hands them back so an unchanged cut region is not refitted. A handed-in vector is aligned with `problem_spaces`,
-    # so a length mismatch is a caller bug and is raised as one. Falling back to fresh caches here instead would turn it
-    # into a silent full refit — the exact cost the reuse exists to avoid, and invisible from the outside.
-    fit_caches = if reuse === nothing
+    # One prepared subdomain per distinct space: the space, its integration plan sharing the space's own
+    # cell-classification cache, and its moment-fit cache. The moment-fit caches, unlike the classification ones,
+    # outlive this call: they are the model's, and every mutator hands them back so an unchanged cut region is not
+    # refitted. A handed-in vector is aligned with `problem_spaces`, so a length mismatch is a caller bug and is raised
+    # as one. Falling back to fresh caches here instead would turn it into a silent full refit — the exact cost the
+    # reuse exists to avoid, and invisible from the outside.
+    fits = if reuse === nothing
         _MomentFitCache{D,T}[_MomentFitCache{D,T}() for _ in eachindex(spaces)]
     else
         length(reuse) == length(spaces) ||
@@ -708,8 +727,10 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                                 "got $(length(reuse)) for $(length(spaces))"))
         reuse
     end
-    space_plans = IntegrationPlan{D,T}[integration_plan(spaces[i]; integration_options..., classify_cache=caches[i],
-                                                        moment_fit_cache=fit_caches[i]) for i in eachindex(spaces)]
+    subdomains = _Subdomain{D,T}[_Subdomain{D,T}(spaces[i],
+                                                 integration_plan(spaces[i]; integration_options...,
+                                                                  classify_cache=caches[i], moment_fit_cache=fits[i]),
+                                                 fits[i]) for i in eachindex(spaces)]
     # The facet resolver is built before the dof layout, not after the region caches, because the layout's Dirichlet
     # projection resolves faces too: it is the first consumer, and handing it the model's resolver is what makes the
     # projection and the operator integrate the same facet by construction rather than by two call sites agreeing.
@@ -740,11 +761,11 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                                min_relative_facet_measure=facet_stats.min_relative_measure,
                                surface_region_count=_region_count(regions, BoundaryMesh),
                                interface_region_count=_region_count(regions, Interface))
-    _set_plan_stats_multi!(diag, space_plans)
+    _set_plan_stats_multi!(diag, [s.plan for s in subdomains])
     _set_dirichlet_trace_stats!(diag, trace_factors, unsupported)
     return Model{D,T,typeof(effective_problem)}(effective_problem, problem.space, _discretisation_pin(spaces, layout),
-                                                space_plans, fit_caches, layout, nothing, nothing, facet_resolver,
-                                                regions, Dict{Symbol,DirichletProjection{D,T}}(), diag,
+                                                subdomains, layout, nothing, nothing, facet_resolver, regions,
+                                                Dict{Symbol,DirichletProjection{D,T}}(), diag,
                                                 AssemblyCache{T}(point_base), plan_options)
 end
 
@@ -1155,21 +1176,22 @@ end
 """
     integration_plan(model::Model) -> IntegrationPlan
 
-The **first** subdomain's cached integration plan (`first(model.space_plans)`). Plans are built by [`prepare`](@ref) and
-refreshed by [`move!`](@ref) / [`activate!`](@ref) / [`deactivate!`](@ref), so once a model is prepared every assembly
-call uses the same plan the dof layout was built against. For a single-domain model this is *the* plan; a coupled model
-holds one plan per subdomain — use [`integration_plans`](@ref) to reach all of them.
+The **first** subdomain's cached integration plan (`first(model.subdomains).plan`). Plans are built by
+[`prepare`](@ref) and refreshed by [`move!`](@ref) / [`activate!`](@ref) / [`deactivate!`](@ref), so once a model is
+prepared every assembly call uses the same plan the dof layout was built against. For a single-domain model this is
+*the* plan; a coupled model holds one plan per subdomain — use [`integration_plans`](@ref) to reach all of them.
 """
-integration_plan(model::Model) = first(model.space_plans)
+integration_plan(model::Model) = first(model.subdomains).plan
 
 """
     integration_plans(model::Model) -> Vector{IntegrationPlan}
 
-Every subdomain's cached [`IntegrationPlan`](@ref), in `problem_spaces` order. The assembly volume pass iterates these;
-each region is owned by the fields on its subdomain intrinsically (`_parent_range` via `FieldLayout.level_ids`). For a
-single-domain model this is a one-element vector whose only element is what [`integration_plan`](@ref) returns.
+Every subdomain's cached [`IntegrationPlan`](@ref), in `problem_spaces` order, read off `model.subdomains` into a fresh
+vector (the plans in it are the model's own). The assembly volume pass integrates over these; each region is owned by
+the fields on its subdomain intrinsically (`_parent_range` via `FieldLayout.level_ids`). For a single-domain model this
+is a one-element vector whose only element is what [`integration_plan`](@ref) returns.
 """
-integration_plans(model::Model) = model.space_plans
+integration_plans(model::Model) = [s.plan for s in model.subdomains]
 
 """
     dof_layout(model::Model) -> SystemLayout
@@ -1195,13 +1217,11 @@ active_unknowns(model::Model) = active_unknowns(model.dofs)
 # derivations, the estimator, `L2Projection` and `QuadField`, which read that one space as the whole discretisation,
 # refuse through the same guard.
 #
-# Single-domain means that every field lives on the first field's space, compared by identity as `problem_spaces`
-# deduplicates spaces, which is `length(problem_spaces(problem)) == 1` without building that vector: the guard runs on
-# every `L2Projection` transfer, twice, and on every `QuadField`, where building the vector allocated on every call.
+# Single-domain means one prepared subdomain: every field lives on one space, compared by identity as `problem_spaces`
+# deduplicates spaces. Read off `model.subdomains` rather than recomputed from the fields, because the guard runs on
+# every `L2Projection` transfer, twice, and on every `QuadField`, where building the space vector allocated per call.
 function _assert_single_domain(model::Model, op::AbstractString)
-    space = first(model.problem.fields).space
-    all(field -> field.space === space, model.problem.fields) ||
-        throw(ArgumentError("$op is not yet supported for multi-domain (coupled) models"))
+    length(model.subdomains) == 1 || throw(ArgumentError("$op is not yet supported for multi-domain (coupled) models"))
     return nothing
 end
 
@@ -1226,8 +1246,8 @@ end
 # outstanding `Solution` raises. Everything else is what the rebuild should leave:
 #
 #   - `matrix` and `rhs` are `nothing` on the fresh model, so the assembled state is cleared;
-#   - `plan_options` is the same object, and `moment_fit_caches` the model's own vector, passed in uncopied (`_derived`
-#     gives the reason);
+#   - `plan_options` is the same object, and the subdomains' moment-fit caches are the model's own, passed in uncopied
+#     (`_derived` gives the reason);
 #   - the Dirichlet projection cache is a fresh empty one: its unknown sets, facet regions and mass all belong to the
 #     dof layout being replaced, and the next `update_dirichlet!` rebuilds it against the new one;
 #   - the facet resolver is replaced for the same reason and with a second effect: its keys hold spaces by identity, so
@@ -1237,7 +1257,7 @@ end
 # `setproperty!` converts as a field assignment does, so a rebuilt problem of another concrete type raises exactly as
 # `model.problem = …` would.
 function _remodel!(model::Model{D,T}, space::Space{D,T}) where {D,T}
-    fresh = _derived(model, space; caches=model.moment_fit_caches)
+    fresh = _derived(model, space; caches=_fits(model))
     for name in fieldnames(Model)
         name === :version || setproperty!(model, name, getfield(fresh, name))
     end
@@ -1489,7 +1509,7 @@ function adapted(model::Model{D,T}, space::Space{D,T}) where {D,T}
     # Seeded warm from the source, but the target's own object: both models are live from here on, and each builds a
     # plan that bounds its cache to its own cut boxes. Sharing would make the fork evict the rules the source's plan is
     # still using — `_derived` has the lineage rule in full.
-    return _derived(model, space; caches=copy.(model.moment_fit_caches))
+    return _derived(model, space; caches=copy.(_fits(model)))
 end
 
 """
@@ -1726,9 +1746,9 @@ function diagnostics(model::Model{D,T}, solution; exact=nothing) where {D,T}
     diag = diagnostics(model)
     error = exact === nothing ? nothing : l2_error(solution, model, exact)
     tol = get(model.plan_options, :tolerance, GeometryTolerance(T))
-    # Level reports for every subdomain space, flattened in the same order as `_problem_levels`. Built per space because
-    # nesting is a relation between the levels of one space; a coupled problem's spaces are independent stacks.
-    levels = Any[_level_report(level, V, tol, model.dofs) for V in problem_spaces(model.problem) for level in V.levels]
+    # Level reports for every subdomain space, in subdomain order, which is global level-id order. Built per space
+    # because nesting is a relation between the levels of one space; a coupled problem's spaces are independent stacks.
+    levels = Any[_level_report(level, s.space, tol, model.dofs) for s in model.subdomains for level in s.space.levels]
     return (; dimension=diag.dimension, levels=levels, active_unknowns=diag.active_unknowns,
             raw_dofs=raw_dof_count(model.dofs), integration_regions=diag.integration_regions,
             facet_region_count=diag.facet_region_count, cut_facet_region_count=diag.cut_facet_region_count,

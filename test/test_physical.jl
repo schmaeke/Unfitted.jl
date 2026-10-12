@@ -606,7 +606,7 @@ end
     V = overlay(space(omega; cells=(4, 4), order=1, physical=p), box((0.0, 0.0), (0.25, 0.25)); cells=(1, 1), order=1)
     model = prepare(mass(V; coefficient=1.0))
 
-    cache = only(model.moment_fit_caches)
+    cache = only(model.subdomains).fits
     cut_regions(m) = [r for r in Unfitted.integration_plan(m).regions if r.kind === :cut_fitted]
     before = cut_regions(model)
     @test !isempty(before)

@@ -250,7 +250,7 @@ end
 # never depends on Dict order.
 function region_kinds(model)
     counts = Dict{Symbol,Int}()
-    for plan in model.space_plans, region in plan.regions
+    for subdomain in model.subdomains, region in subdomain.plan.regions
         counts[region.kind] = get(counts, region.kind, 0) + 1
     end
     return join((string(k, "=", counts[k]) for k in sort!(collect(keys(counts)))), " ")
@@ -260,7 +260,7 @@ end
 # multi-level intersection moved.
 function cover_histogram(model)
     counts = Dict{Int,Int}()
-    for plan in model.space_plans, region in plan.regions
+    for subdomain in model.subdomains, region in subdomain.plan.regions
         c = length(region.parents)
         counts[c] = get(counts, c, 0) + 1
     end
@@ -274,7 +274,7 @@ function domain_measure(model)
     D = diagnostics(model).dimension
     jacobian_scale = 1 / 2.0^D
     total = 0.0
-    for plan in model.space_plans, region in plan.regions
+    for subdomain in model.subdomains, region in subdomain.plan.regions
         w = 0.0
         for weight in region.weights
             w += weight
@@ -288,7 +288,7 @@ end
 # described in the `PhysicalDomain` docstring.
 function empty_region_count(model)
     n = 0
-    for plan in model.space_plans, region in plan.regions
+    for subdomain in model.subdomains, region in subdomain.plan.regions
         isempty(region.weights) && (n += 1)
     end
     return n
