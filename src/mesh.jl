@@ -225,60 +225,58 @@ is_active(mask::LevelMask{D}, cell::CartesianIndex{D}) where {D} = mask.on[cell]
 # at least one cell" hold for `space`, `overlay`, `adapt` and the mutators alike, rather than for the mutators alone.
 _collapse_mask(on::BitArray{D}) where {D} = all(on) ? nothing : LevelMask{D}(on)
 
-# Translate a user-supplied `active` specification into either `nothing` (no mask, default) or a `LevelMask{D}` whose
-# shape matches the mesh's cell grid. Five accepted input shapes, dispatched on type:
+# A cell selection, as a fresh `BitArray` over `mesh`'s cells, from every shape the `active =` keyword documents:
 #
-#   * `nothing`                            — no mask, default fast path.
-#   * `LevelMask{D}` with matching shape   — defensively copied so user
-#                                            mutation of the BitArray does
-#                                            not leak into the level.
-#   * `AbstractArray{Bool,D}` of cell shape — copied into a fresh BitArray.
-#   * predicate `(cell_box, cell_index) -> Bool` — evaluated per cell.
-#   * iterable of `CartesianIndex{D}`      — listed cells are active, the
-#                                            rest inactive.
+#   * `nothing` — every cell, the reading `nothing` has in `active =`, `dilate`, `ladder` and the mutators alike;
+#   * a `LevelMask{D}`, or an `AbstractArray{Bool,D}` shaped like the cell grid — copied, so a later mutation of the
+#     argument cannot reach a level;
+#   * a predicate `(cell_box, cell_index) -> Bool` — evaluated once per cell;
+#   * an iterable of `CartesianIndex{D}` — the listed cells, each type- and bounds-checked.
 #
-# Every branch returns through `_collapse_mask`, so a selection that happens to name every cell is stored as the no-mask
-# default whichever shape it arrived in.
-#
-# The fallback signature `_normalize_mask(cells, mesh::CartesianMesh{D})` acts as a generic iterable consumer plus a
-# type-check error path so a wrong-typed `active=` keyword still gives a clear message.
-_normalize_mask(::Nothing, ::CartesianMesh) = nothing
+# This is the one definition of what a selection is. `_normalize_mask` (`active =`, `adapt`), the mutators `activate!`
+# / `deactivate!`, `dilate` / `support_extension` and the ladder's `overlapping_cells` all read it, so a shape one of
+# them accepts every one accepts, with the same refusals. Each caller used to carry its own copy of this dispatch, and
+# the copies drifted: the mutators' copy accepted neither `nothing` nor a `LevelMask`. The result is always a new array
+# the caller may keep or mutate.
+_selection(::Nothing, mesh::CartesianMesh) = trues(mesh.cells)
 
-function _normalize_mask(mask::LevelMask{D}, mesh::CartesianMesh{D}) where {D}
-    size(mask.on) == mesh.cells ||
-        throw(DimensionMismatch("mask shape $(size(mask.on)) does not match mesh cells $(mesh.cells)"))
-    # Copy: a user mutation of `mask.on` after construction must not leak into the level. Matches `active_cells`'s
-    # return-a-copy contract.
-    return _collapse_mask(copy(mask.on))
-end
+_selection(mask::LevelMask, mesh::CartesianMesh) = _selection(mask.on, mesh)
 
-function _normalize_mask(bits::AbstractArray{Bool,D}, mesh::CartesianMesh{D}) where {D}
+function _selection(bits::AbstractArray{Bool,D}, mesh::CartesianMesh{D}) where {D}
     size(bits) == mesh.cells ||
-        throw(DimensionMismatch("mask shape $(size(bits)) does not match mesh cells $(mesh.cells)"))
+        throw(DimensionMismatch("selector shape $(size(bits)) does not match mesh cells $(mesh.cells)"))
     on = BitArray(undef, mesh.cells)
     copyto!(on, bits)
-    return _collapse_mask(on)
+    return on
 end
 
-function _normalize_mask(f::Function, mesh::CartesianMesh{D}) where {D}
+function _selection(f::Function, mesh::CartesianMesh{D}) where {D}
     on = BitArray(undef, mesh.cells)
     for ci in cell_indices(mesh)
         on[ci] = f(cell_box(mesh, ci), ci)::Bool
     end
-    return _collapse_mask(on)
+    return on
 end
 
-function _normalize_mask(cells, mesh::CartesianMesh{D}) where {D}
+# The fallback consumes any other iterable, and is also the type-check error path: a wrong-typed selection still gets a
+# clear message rather than a `MethodError` from deep inside.
+function _selection(cells, mesh::CartesianMesh{D}) where {D}
     on = falses(mesh.cells)
     for ci in cells
         ci isa CartesianIndex{D} ||
-            throw(ArgumentError("active cell list must contain CartesianIndex{$D} entries; got $(typeof(ci))"))
+            throw(ArgumentError("cells iterable entries must be CartesianIndex{$D}; got $(typeof(ci))"))
         checkbounds(Bool, on, ci) ||
-            throw(ArgumentError("active cell index $ci is out of bounds for mesh cells $(mesh.cells)"))
+            throw(ArgumentError("cell index $ci is out of bounds for mesh cells $(mesh.cells)"))
         on[ci] = true
     end
-    return _collapse_mask(on)
+    return on
 end
+
+# A level's stored mask for an `active =` selection: the selection, collapsed to the no-mask default when it names
+# every cell, so that holds whichever shape the selection arrived in. `nothing` is answered without building the
+# all-true array it would collapse from.
+_normalize_mask(::Nothing, ::CartesianMesh) = nothing
+_normalize_mask(cells, mesh::CartesianMesh) = _collapse_mask(_selection(cells, mesh))
 
 # ── Per-cell polynomial order ─────────────────────────────────────────────────
 
@@ -376,7 +374,7 @@ end
 #   * predicate `(cell_box, cell_index) -> Integer | NTuple{D,Integer}`.
 #
 # A per-cell array whose entries are all equal collapses back to the uniform tuple, so a nominally graded field that
-# happens to be flat costs nothing — the same discipline `_apply_mask_update` applies to an all-active mask.
+# happens to be flat costs nothing — the same discipline `_collapse_mask` applies to an all-active mask.
 _normalize_order(n::Integer, ::CartesianMesh{D}) where {D} = _axis_int_tuple(n, Val(D), :order)
 
 _normalize_order(t::NTuple{D,<:Integer}, ::CartesianMesh{D}) where {D} = _axis_int_tuple(t, Val(D), :order)
@@ -1050,13 +1048,10 @@ already-dilated set by `a` then `b` is the same as dilating once by `a + b`.
 """
 function dilate(V::Space{D}, cells; level::Integer, by) where {D}
     lvl = V.levels[_check_level(V, level)]
-    # `by` is validated before the early return, not inside it: `_normalize_mask` collapses a selection naming every
-    # cell to `nothing`, and a bad width would otherwise pass unchallenged on exactly that input while the array method
-    # rejected it — two spellings of one operation disagreeing.
+    # `by` is validated first, so a bad width is reported whatever the selection is — including one naming every cell,
+    # which an earlier early return let through while the array method rejected it.
     radius = _dilation_radius(by, Val(D))
-    marked = _normalize_mask(cells, lvl.mesh)
-    marked === nothing && return trues(lvl.mesh.cells)
-    return _dilate_cells(marked.on, radius)
+    return _dilate_cells(_selection(cells, lvl.mesh), radius)
 end
 
 function dilate(mask::AbstractArray{Bool,D}, by) where {D}
@@ -1359,49 +1354,6 @@ end
 function _reindex_space_levels(V::Space, offset::Int)
     offset == 0 && return V
     return _with_levels(V, ntuple(i -> _level(V.levels[i]; id=V.levels[i].id + offset), length(V.levels)))
-end
-
-# ── Mask updates ──────────────────────────────────────────────────────────────
-
-# Flip cells in `on` selected by `cells` to `value`. Accepts the same shapes as `_normalize_mask`'s selector branches:
-# `AbstractArray{Bool,D}`, predicate `(cell_box, cell_index) -> Bool`, or iterable of `CartesianIndex{D}`. For
-# Bool-array selectors we iterate the `findall` index list — `O(#selected)` instead of `O(#cells)`, important when the
-# selector is sparse on a large mesh.
-function _flip_cells!(on::BitArray{D}, bits::AbstractArray{Bool,D}, mesh::CartesianMesh{D}, value::Bool) where {D}
-    size(bits) == size(on) ||
-        throw(DimensionMismatch("selector shape $(size(bits)) does not match mesh cells $(mesh.cells)"))
-    for ci in findall(bits)
-        on[ci] = value
-    end
-    return on
-end
-
-function _flip_cells!(on::BitArray{D}, f::Function, mesh::CartesianMesh{D}, value::Bool) where {D}
-    for ci in cell_indices(mesh)
-        f(cell_box(mesh, ci), ci)::Bool && (on[ci] = value)
-    end
-    return on
-end
-
-function _flip_cells!(on::BitArray{D}, cells, mesh::CartesianMesh{D}, value::Bool) where {D}
-    for ci in cells
-        ci isa CartesianIndex{D} ||
-            throw(ArgumentError("cells iterable entries must be CartesianIndex{$D}; got $(typeof(ci))"))
-        checkbounds(Bool, on, ci) ||
-            throw(ArgumentError("cell index $ci is out of bounds for mesh cells $(mesh.cells)"))
-        on[ci] = value
-    end
-    return on
-end
-
-# Build the new mask after activating or deactivating `cells` on a level whose current mask is `old`. Starts from the
-# current active set (all-true if `old === nothing`), flips the selected cells, and returns through `_collapse_mask` so
-# the no-mask hot path survives bouncing in and out of the mask. `_flip_cells!` always runs (even when the starting mask
-# is all-on) so out-of-bounds and wrong-typed selectors raise the same error regardless of the starting mask state.
-function _apply_mask_update(old::Union{Nothing,LevelMask{D}}, mesh::CartesianMesh{D}, cells, value::Bool) where {D}
-    on = old === nothing ? trues(mesh.cells) : copy(old.on)
-    _flip_cells!(on, cells, mesh, value)
-    return _collapse_mask(on)
 end
 
 # ── Display ───────────────────────────────────────────────────────────────────

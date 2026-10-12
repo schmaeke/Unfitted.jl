@@ -352,6 +352,38 @@ end
     @test count(bits) == 2
 end
 
+@testset "activate! / deactivate! take every selector shape `active =` takes" begin
+    # A `LevelMask` is the documented mask type and `nothing` reads "every cell" in `active =`, `dilate` and `ladder`;
+    # the mutators used to refuse both with a `MethodError`. Each spelling must equal its BitArray twin, and bump the
+    # pin exactly once.
+    bc = dirichlet(0.0; on=boundary(:all))
+    fresh() = prepare(poisson(_safe_overlay(active=(b, i) -> i.I[1] <= 2); source=1.0, dirichlet=[bc]))
+    sel = falses(4, 4)
+    sel[1, 1] = true    # active at the start
+    sel[4, 4] = true    # inactive at the start
+    for verb! in (activate!, deactivate!)
+        twin = verb!(fresh(); level=2, cells=sel)
+        model = fresh()
+        version = model.version
+        verb!(model; level=2, cells=Unfitted.LevelMask{2}(copy(sel)))
+        @test model.version == version + 1
+        @test active_cells(model; level=2) == active_cells(twin; level=2)
+        @test active_unknowns(model) == active_unknowns(twin)
+    end
+
+    model = fresh()
+    version = model.version
+    activate!(model; level=2, cells=nothing)
+    @test model.version == version + 1
+    @test active_cells(model; level=2) == trues(4, 4)
+    @test model.problem.space.levels[2].mask === nothing    # collapsed to the no-mask fast path
+    @test active_unknowns(model) == active_unknowns(activate!(fresh(); level=2, cells=trues(4, 4)))
+    deactivate!(model; level=2, cells=nothing)
+    @test model.version == version + 2
+    @test active_cells(model; level=2) == falses(4, 4)
+    @test active_unknowns(model) == active_unknowns(deactivate!(fresh(); level=2, cells=trues(4, 4)))
+end
+
 @testset "activate! rejects out-of-bounds level" begin
     V = _safe_overlay()
     model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))

@@ -1386,21 +1386,29 @@ end
 # the level set classifies as fictitious is a no-op on the effective space and stays visible through
 # `active_cells(model; level, effective = false)`, instead of overriding the geometry until the next `move!` re-folded
 # it away. Any outstanding `Solution` becomes stale.
+#
+# The update is word-wise on the level's active bits, against the selection `_selection` reads from every shape
+# `active =` takes. The result goes through `_collapse_mask`, so the no-mask fast path survives bouncing in and out of
+# the mask, and the selection is read even when it changes nothing, so a malformed one raises whatever the level's
+# current state.
 function _update_mask!(model::Model{D,T}, level_index::Integer, cells, value::Bool) where {D,T}
     _assert_single_domain(model, "activate! / deactivate!")
-    level_index = _check_level(model.prefold_space, level_index)
-    level = model.prefold_space.levels[level_index]
-    mask = _apply_mask_update(level.mask, level.mesh, cells, value)
-    return _remodel!(model, _remasked_space(model.prefold_space, level_index, mask))
+    V = model.prefold_space
+    k = _check_level(V, level_index)
+    on = active_cells(V; level=k)
+    selected = _selection(cells, V.levels[k].mesh)
+    value ? (on .|= selected) : (on .&= .!selected)
+    return _remodel!(model, _remasked_space(V, k, _collapse_mask(on)))
 end
 
 """
     activate!(model; level, cells) -> Model
 
-Mark `cells` on `level` as active in place. `cells` is a selection of cells, not a whole mask, and accepts the selector
-shapes the `active=` keyword of [`space`](@ref) documents: an iterable of `CartesianIndex{D}`, a predicate
-`(cell_box, cell_index) -> Bool`, or an `AbstractArray{Bool,D}` matching the level's cell grid. Currently-active cells
-in the selection are unchanged.
+Mark `cells` on `level` as active in place. `cells` is a selection of cells, not a whole mask, and accepts every shape
+the `active=` keyword of [`space`](@ref) documents: an iterable of `CartesianIndex{D}`, a predicate
+`(cell_box, cell_index) -> Bool`, an `AbstractArray{Bool,D}` or a [`LevelMask`](@ref) matching the level's cell grid
+(`true` selects the cell), or `nothing`, which selects every cell. Currently-active cells in the selection are
+unchanged, and cells outside it keep their state.
 
 Bumps `model.version`, so an existing [`Solution`](@ref) raises on reuse, and runs the same invalidation tail as
 [`move!`](@ref) — see that docstring for exactly what is cleared, rebuilt, and deliberately kept. The one difference is
@@ -1424,7 +1432,8 @@ activate!(model::Model{D,T}; level::Integer, cells) where {D,T} = _update_mask!(
     deactivate!(model; level, cells) -> Model
 
 Mark `cells` on `level` as inactive in place. See [`activate!`](@ref) for the accepted shapes of `cells`, the
-invalidation contract, and the interaction with a model's `physical_domain`.
+invalidation contract, and the interaction with a model's `physical_domain`. `cells = nothing` selects every cell, so it
+leaves the level dormant.
 """
 deactivate!(model::Model{D,T}; level::Integer, cells) where {D,T} = _update_mask!(model, level, cells, false)
 

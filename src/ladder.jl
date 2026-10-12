@@ -260,8 +260,8 @@ the per-cell loop — the same answer, three orders of magnitude apart.
 function overlapping_cells(V::Space{D,T}, cells; from::Integer, to::Integer) where {D,T}
     src_level = V.levels[_check_level(V, from, "from")]
     dst_level = V.levels[_check_level(V, to, "to")]
-    src = _level_selection(cells, src_level)
-    from == to && return copy(src)
+    src = _selection(cells, src_level.mesh)
+    from == to && return src
 
     # The union of the selected cells' blocks, which is the same set as "every destination cell that sees a selected
     # source cell" because the overlap relation is symmetric. Reading it this way costs one block per *selected* cell
@@ -276,15 +276,6 @@ function overlapping_cells(V::Space{D,T}, cells; from::Integer, to::Integer) whe
         out[CartesianIndices(ntuple(d -> ranges[d][ci.I[d]], D))] .= true
     end
     return out
-end
-
-# A cell selection as a plain `BitArray` over a level's cells. `_normalize_mask` already accepts every shape `active =`
-# documents and copies defensively, so it is the single definition of what a selection is; this only unwraps the mask it
-# returns, and gives `nothing` the "every cell" reading it has everywhere else.
-function _level_selection(cells, level::Level{D}) where {D}
-    mask = _normalize_mask(cells, level.mesh)
-    mask === nothing && return trues(level.mesh.cells)
-    return mask.on
 end
 
 # The block of level-`to` cells that cell `cell` of level `from` overlaps. The answer is always an axis-aligned block,
