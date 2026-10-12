@@ -113,7 +113,10 @@ Axis-aligned box for the cell at the given multi-index. Returns the cell in the 
 reference frame, and a region's reference frame. Throws `BoundsError` if `index` is outside `cell_indices(m)`.
 """
 function cell_box(m::CartesianMesh{D,T}, index::CartesianIndex{D}) where {D,T}
-    checkbounds(Bool, cell_indices(m), index) || throw(BoundsError(m, index))
+    # Base's own refusal, against the cell index space. A `BoundsError(m, index)` built by hand carries the bare
+    # `CartesianIndex` as its index, and `showerror` iterates that field, which a `CartesianIndex` refuses: the error
+    # could be thrown but not printed.
+    checkbounds(cell_indices(m), index)
     lower = SVector{D,T}(ntuple(d -> m.axes[d][index.I[d]], D))
     upper = SVector{D,T}(ntuple(d -> m.axes[d][index.I[d] + 1], D))
     return AxisBox{D,T}(lower, upper)
