@@ -221,6 +221,23 @@ end
     @test_throws ArgumentError transfer(solution, source_model, target_model)
 end
 
+@testset "transfer names every model mismatch it refuses, for either backend" begin
+    # The refusals both backends share, each pinned by its message. Every target below differs from the source in
+    # exactly one respect — its box, its number of fields, a field's name, a field's component count — so a guard that
+    # compared the wrong attribute, or stopped reading it, would let that pair through to wrong numbers downstream.
+    V = space(box((0.0,), (1.0,)); cells=2, order=1)
+    model(fields...) = prepare(Problem(fields; blocks=map(stiffness_block, fields)))
+    source = model(field(:u, V))
+    s = Solution(zeros(Unfitted.active_unknowns(source.dofs)), source.version,
+                 Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    cases = ["same physical domain" => model(field(:u, space(box((0.0,), (2.0,)); cells=2, order=1))),
+             "same fields" => model(field(:u, V), field(:c, V)), "unknown field u" => model(field(:v, V)),
+             "different component counts" => model(field(:u, V; components=2))]
+    for (message, target) in cases, via in (L2Projection(), Rewire())
+        @test_throws message transfer(s, source, target; via=via)
+    end
+end
+
 @testset "Rewire backend reproduces source pointwise on monotone activation" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     full_mask = trues(2, 2)
