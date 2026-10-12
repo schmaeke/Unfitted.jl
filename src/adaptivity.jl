@@ -401,12 +401,25 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     # never per point.
     _assert_no_point_keyed_state(model.problem, "estimate")
 
-    # The caches are handed over UNcopied, which is the opposite of what every other derivation does (`adapted` gives
-    # its target its own copy so a fork cannot evict a sibling's rules). It is deliberate here: `plus` is thrown away at
-    # the end of this call, and the (p+1)-order cut rules it fits are wanted on `model`, where the next `adapted` copies
-    # them forward and the next `estimate` finds them. `integration_plan` evicts by region box, so the two moment orders
-    # coexist at the same boxes instead of evicting each other — see `_prefit!` in `intersections.jl`.
+    # The caches are handed over UNcopied unless a live twin refines the partition, which is the opposite of what every
+    # other derivation does (`adapted` gives its target its own copy so a fork cannot evict a sibling's rules). Sharing
+    # is deliberate where `V⁺` cuts `model`'s own boxes: `plus` is thrown away at the end of this call, and the
+    # (p+1)-order cut rules it fits are wanted on `model`, where the next `adapted` copies them forward and the next
+    # `estimate` finds them. `integration_plan` evicts by region box, so the two moment orders coexist at the same boxes
+    # instead of evicting each other — see `_prefit!` in `intersections.jl`.
+    #
+    # A live twin breaks that premise: it refines the integration partition wherever it is live, so `plus` cuts none of
+    # `model`'s boxes there, and building its plan on the shared cache, which a plan restricts to the boxes it cuts,
+    # evicted every rule `model` held. On an immersed 8² order-2 B-spline ladder the next `adapted` then refitted all 44
+    # of its boxes. So `plus` builds its plan on a copy there, and the rules it fitted are merged back into `model`'s
+    # cache afterwards, where both sets coexist as the two moment orders do above. The twin's rules are worth keeping:
+    # on a ladder split by the twin's factor its mesh is the next level's, so its boxes are the ones the next h-step
+    # wakes. Over two estimate → refine → adapted cycles on an immersed 8² order-2 B-spline ladder of depth 2, the
+    # merge took the fits from 309 (shared) to 236, every `adapted` refitting nothing; a copy alone took them to 326,
+    # because the next `adapted` then refitted the twin's boxes.
     enriched_space, twins, exempt = _enriched_space(V, Int(enrichment))
+    live = _live_levels(V)
+    caches = any(((_, k, _),) -> live[k], twins) ? copy.(model.moment_fit_caches) : model.moment_fit_caches
     # A superposed twin is a *nested* level of the same degree, so leaf semantics would deduplicate the level it
     # enriches — removing exactly the keys the injection is about to look for, and turning `Rewire` into a refusal. Only
     # *that* level may skip pruning, and only in this throwaway twin: turning leaf semantics off for the whole enriched
@@ -422,7 +435,8 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     # The twin numbers its points from `_FOREIGN_POINTS`, far below 1, so a form that reads per-point state by `q.point`
     # without capturing it — through a global, which the walk above cannot see — raises at the read rather than reading
     # `model`'s points at the twin's indices (see "Detecting point-keyed state" in `data.jl`).
-    plus = _derived(model, enriched_space; options, caches=model.moment_fit_caches, point_base=_FOREIGN_POINTS)
+    plus = _derived(model, enriched_space; options, caches, point_base=_FOREIGN_POINTS)
+    caches === model.moment_fit_caches || foreach(merge!, model.moment_fit_caches, caches)
 
     # Inject before assembling. `Rewire` reads only the two dof layouts, so it needs nothing assembled, and after the
     # refusals above it has one way left to fail: a key of `V` that `V⁺` does not carry free, i.e. `V⁺ ⊉ V`. The known

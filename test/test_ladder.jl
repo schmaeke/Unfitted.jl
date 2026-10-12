@@ -550,6 +550,32 @@ end
     @test fits[] == 0                                  # ... as is the next estimate
 end
 
+@testset "estimate with a refinement twin leaves the source's cut rules in place" begin
+    # A B-spline level is enriched by a refined twin rather than by an order raise, and the twin refines the integration
+    # partition wherever it is live, so the enriched model cuts none of the source's boxes there. Building its plan on
+    # the source's own cache evicted every rule the source held, and the `adapted` after an `estimate` refitted all 44
+    # of them. The enriched model now fits into a copy whose rules are merged back, so the source keeps its own rules
+    # and gains the twin's, and both the step after the estimate and a second estimate are as warm as in the Legendre
+    # case above.
+    fits = Ref(0)
+    disc = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.7; subcell_length_scale=0.25,
+                           cut_quadrature=counting_cut_rule(fits))
+    V = ladder(box((-1.0, -1.0), (1.0, 1.0)); cells=8, order=2, depth=1, physical=disc, basis=bspline())
+    model = prepare(mass(adapt(V, 2 => trues(16, 16))))
+    held = collect(keys(only(model.moment_fit_caches)))
+    u = solve!(model)
+    fits[] = 0
+    estimate(model, u)
+    @test fits[] > 0                                   # the twin's boxes are new
+    @test all(key -> haskey(only(model.moment_fit_caches), key), held)
+    fits[] = 0
+    adapted(model, 2 => trues(16, 16))
+    @test fits[] == 0                                  # ... the step after it is warm
+    fits[] = 0
+    estimate(model, u)
+    @test fits[] == 0                                  # ... and so is the next estimate
+end
+
 @testset "moved reuses the source's cut rules" begin
     # `moved` is the third non-mutating derivation and goes through the same builder as `adapted` and `elevated`, so it
     # reuses rules on the same terms: the boxes the move leaves bit-identical cost nothing, and the source keeps every

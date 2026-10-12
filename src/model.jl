@@ -1254,8 +1254,9 @@ end
 #     against a full refit;
 #   - the in-place mutators pass the model's own caches through `_remodel!`, since they overwrite the model rather than
 #     fork it, so there is no sibling to protect and the model keeps one cache object for its whole life;
-#   - `estimate` (`adaptivity.jl`) shares, so the elevated-order rules its throw-away twin fits land on the source
-#     model.
+#   - `estimate` (`adaptivity.jl`) shares, so the elevated-order rules its throw-away enriched model fits land on the
+#     source model — except where a live refinement twin changes the partition, so that the enriched plan would evict
+#     every rule the source holds; there it passes a copy and merges the rules fitted on it back into the source's.
 #
 # `point_base` numbers the new model's quadrature points (`AssemblyCache`). Only `estimate` moves it off 0.
 function _derived(model::Model{D,T}, space::Space{D,T}; options::NamedTuple=model.plan_options,
