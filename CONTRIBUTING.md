@@ -698,7 +698,7 @@ features evolve.
     invalidation contract: bump `model.version`, clear `model.matrix` and
     `model.rhs`, replace the assembly cache (`model.assembly`), drop the
     Dirichlet projection cache, rebuild the integration plan, dof layout and the
-    facet / surface / interface region caches, and refresh diagnostics.
+    region cache (`model.regions`), and refresh diagnostics.
     An outstanding `Solution` raises on stale reuse. Like `move!`, they
     address a level by position in the model's single space and
     therefore raise `ArgumentError` on a multi-domain (coupled) model.

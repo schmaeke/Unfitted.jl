@@ -1240,8 +1240,8 @@ Invalidation contract — the one the sibling mutators [`activate!`](@ref) and [
     patterns, pooled scratch);
   - empties the Dirichlet projection cache, whose unknown sets and boundary mass belong to the dof layout being
     replaced;
-  - rebuilds `model.prefold_space` at the new box, the integration plan, the dof layout, and the facet / surface /
-    interface region caches;
+  - rebuilds `model.prefold_space` at the new box, the subdomain record (the folded space and its integration plan),
+    the dof layout, and the region cache `model.regions`;
   - installs a fresh [`AssemblyDiagnostics`](@ref) record (a reference taken before the move keeps reporting the old
     state).
 
@@ -1521,7 +1521,7 @@ dilate(model::Model, cells; level::Integer, by) = dilate(model.prefold_space, ce
     update_dirichlet!(model::Model, dirichlet) -> Model
 
 Refresh the *values* of a prepared model's Dirichlet conditions in place, reusing the existing integration plan, dof
-enumeration, facet/surface region caches, and immersed-boundary moment-fit cache.
+enumeration, region cache, and immersed-boundary moment-fit cache.
 
 The argument `dirichlet` is a vector or tuple of [`DirichletCondition`](@ref)s that must structurally match the
 conditions the model was prepared with: the same number of conditions in the same order, each with identical `boundary`,
