@@ -1236,34 +1236,6 @@ function _assert_single_domain(model::Model, op::AbstractString)
     return nothing
 end
 
-# A model of `model`'s problem prepared over `space`: the one builder behind every model derived from another — the
-# non-mutating derivations, the in-place mutators (`_remodel!`) and `estimate`'s enriched model. The forms, field
-# channels and Dirichlet data are `model`'s (`_problem_with_space`); the plan options are too, unless `options` says
-# otherwise, as `estimate`'s does when it exempts a level from pruning.
-#
-# `caches` has no default, so every caller states what happens to `model`'s moment-fit caches. Every derivation hands
-# them on rather than starting empty, for the reason `move!` gives for not invalidating them: they are keyed by region
-# bounds and moment order, and a mask edit, an order edit or a move changes which cells are active and never the
-# geometry, so every fitted cut-cell rule is still valid. Rebuilding them instead refits every cut region on every
-# step, which on an immersed model is the dominant cost of the step. Whether the new model *shares* them or gets a copy
-# is the policy each caller states:
-#
-#   - the non-mutating derivations ([`adapted`](@ref), and through it [`elevated`](@ref) and [`moved`](@ref)) pass a
-#     copy, because source and target are then both live and each builds a plan against its own cut regions. Sharing
-#     would make the fork's plan build evict the rules the source's own plan is still using — an `O(#cut regions)` copy
-#     against a full refit;
-#   - the in-place mutators pass the model's own caches through `_remodel!`, since they overwrite the model rather than
-#     fork it, so there is no sibling to protect and the model keeps one cache object for its whole life;
-#   - `estimate` (`adaptivity.jl`) shares, so the elevated-order rules its throw-away enriched model fits land on the
-#     source model — except where a live refinement twin changes the partition, so that the enriched plan would evict
-#     every rule the source holds; there it passes a copy and merges the rules fitted on it back into the source's.
-#
-# `point_base` numbers the new model's quadrature points (`AssemblyCache`). Only `estimate` moves it off 0.
-function _derived(model::Model{D,T}, space::Space{D,T}; options::NamedTuple=model.plan_options,
-                  caches::Vector{_MomentFitCache{D,T}}, point_base::Int=0) where {D,T}
-    return _prepared_model(_problem_with_space(model.problem, space), options, caches; point_base)
-end
-
 # Rebuild every piece of reusable state `model` carries from a derived pre-fold space, in place. This is the whole body
 # of the in-place mutators: `move!`, `activate!` and `deactivate!` differ only in how they derive `space` from
 # `model.prefold_space`, and everything after that is the rebuild `prepare` runs, so it is written once here rather than
@@ -1302,6 +1274,34 @@ function _remodel!(model::Model{D,T}, space::Space{D,T}) where {D,T}
     end
     model.version += 1
     return model
+end
+
+# A model of `model`'s problem prepared over `space`: the one builder behind every model derived from another — the
+# non-mutating derivations, the in-place mutators (`_remodel!`) and `estimate`'s enriched model. The forms, field
+# channels and Dirichlet data are `model`'s (`_problem_with_space`); the plan options are too, unless `options` says
+# otherwise, as `estimate`'s does when it exempts a level from pruning.
+#
+# `caches` has no default, so every caller states what happens to `model`'s moment-fit caches. Every derivation hands
+# them on rather than starting empty, for the reason `move!` gives for not invalidating them: they are keyed by region
+# bounds and moment order, and a mask edit, an order edit or a move changes which cells are active and never the
+# geometry, so every fitted cut-cell rule is still valid. Rebuilding them instead refits every cut region on every
+# step, which on an immersed model is the dominant cost of the step. Whether the new model *shares* them or gets a copy
+# is the policy each caller states:
+#
+#   - the non-mutating derivations ([`adapted`](@ref), and through it [`elevated`](@ref) and [`moved`](@ref)) pass a
+#     copy, because source and target are then both live and each builds a plan against its own cut regions. Sharing
+#     would make the fork's plan build evict the rules the source's own plan is still using — an `O(#cut regions)` copy
+#     against a full refit;
+#   - the in-place mutators pass the model's own caches through `_remodel!`, since they overwrite the model rather than
+#     fork it, so there is no sibling to protect and the model keeps one cache object for its whole life;
+#   - `estimate` (`adaptivity.jl`) shares, so the elevated-order rules its throw-away enriched model fits land on the
+#     source model — except where a live refinement twin changes the partition, so that the enriched plan would evict
+#     every rule the source holds; there it passes a copy and merges the rules fitted on it back into the source's.
+#
+# `point_base` numbers the new model's quadrature points (`AssemblyCache`). Only `estimate` moves it off 0.
+function _derived(model::Model{D,T}, space::Space{D,T}; options::NamedTuple=model.plan_options,
+                  caches::Vector{_MomentFitCache{D,T}}, point_base::Int=0) where {D,T}
+    return _prepared_model(_problem_with_space(model.problem, space), options, caches; point_base)
 end
 
 # Rebuild `problem` over a new (adapted / elevated / moved / remasked / enriched) space, reusing the field channels,
