@@ -21,6 +21,18 @@
     @test report.l2_error < 1.0e-12
     @test length(report.levels) == 1
     @test report.levels[1].basis == :integrated_legendre
+    # The report's keys, in order. The order is documented, and it is the declaration order of `AssemblyDiagnostics`'
+    # fields with `levels`, `raw_dofs` and the solution's two entries placed around them, so reordering a declaration
+    # reorders the report: written out in full so that change fails here rather than in a reader's script.
+    @test collect(keys(report)) ==
+          [:dimension, :levels, :active_unknowns, :raw_dofs, :integration_regions, :facet_region_count,
+           :cut_facet_region_count, :facet_fit_failure_count, :facet_cut_fallback_count, :facet_moment_fit_residual_max,
+           :min_relative_facet_measure, :dirichlet_trace_factors, :unsupported_dirichlet_dof_count,
+           :unsupported_dirichlet_dofs, :surface_region_count, :interface_region_count, :small_overlap_count,
+           :small_overlaps, :min_integration_volume, :min_relative_integration_volume, :inactive_cell_counts,
+           :reduced_mode_counts, :cut_region_count, :fit_failure_count, :moment_fit_residual_max, :cut_fallback_count,
+           :cut_fallback_points, :symmetry_residual, :condition_estimate, :scaled_condition_estimate, :solver,
+           :residual_norm, :l2_error]
 end
 
 @testset "moving overlay transfer regression" begin

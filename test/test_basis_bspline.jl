@@ -58,6 +58,10 @@ end
     @test_throws ArgumentError space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=3, basis=bspline(), mode=:trunk)
     @test_throws ArgumentError Unfitted._with_mode(fam, :trunk)
     @test_throws ArgumentError Unfitted._with_mode(fam_marker, :trunk)
+    # The mode is judged against the family before any order is: at an anisotropic order the refusal still names the
+    # family, not `:trunk`'s isotropy requirement, which a family that has no trunk set never reaches.
+    @test_throws "does not support mode=:trunk" space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=(2, 3),
+                                                      basis=bspline(), mode=:trunk)
 end
 
 # What a B-spline level's family is: its mechanism, the continuity it was asked for, and its per-axis degrees and knots.
