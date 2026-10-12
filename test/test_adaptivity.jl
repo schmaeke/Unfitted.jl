@@ -763,6 +763,42 @@ end
     @test active_cells(coarsen(LW; h=[(1, cell)]); level=2) == active_cells(L; level=2)
 end
 
+@testset "coarsen keeps a child a deeper level holds, with its support" begin
+    # The docstring's "no-op rather than a hole" on a family with a support collar. Releasing the parent of a child that
+    # a deeper level refines must leave the child live, and with it the collar its own functions need. The collar pass
+    # used to release the held child with the rest of the parent's dilated footprint: on this B-spline stack it left
+    # level 2 with no live cell at all under 64 live level-3 cells. Integrated Legendre has no collar and is the
+    # control.
+    same(a, b) = all(active_cells(a; level=k) == active_cells(b; level=k) &&
+                         cell_orders(a; level=k) == cell_orders(b; level=k) for k in 1:length(a.levels))
+    cell = CartesianIndex(4, 4)
+    for (basis, radius) in ((bspline(), 3), (IntegratedLegendre(), 0))
+        L = ladder(_AD_Ω; cells=8, depth=2, order=3, basis=basis)
+        kid = findfirst(overlapping_cells(L, [cell]; from=1, to=2))
+        held = refine(refine(L; h=[(1, cell)]); h=[(2, kid)])
+        released = coarsen(held; h=[(1, cell)])
+
+        @test active_cells(released; level=2)[kid]
+        @test active_cells(released; level=3) == active_cells(held; level=3)
+        footprint = falses(size(active_cells(held; level=2)))
+        footprint[kid] = true
+        support = dilate(footprint, radius) .& active_cells(held; level=2)
+        @test all(active_cells(released; level=2)[support])
+        # No live level-3 cell is left standing over a released level-2 cell.
+        under = overlapping_cells(released, active_cells(released; level=3); from=3, to=2)
+        @test all(active_cells(released; level=2)[under])
+
+        # Released from the top down, each call is well defined and the pair restores the ladder exactly.
+        @test same(coarsen(coarsen(held; h=[(2, kid)]); h=[(1, cell)]), L)
+    end
+
+    # The control's answer, which the collar never touched: the held child alone stays, its three siblings go.
+    L = ladder(_AD_Ω; cells=8, depth=2, order=3)
+    kid = findfirst(overlapping_cells(L, [cell]; from=1, to=2))
+    @test findall(active_cells(coarsen(refine(refine(L; h=[(1, cell)]); h=[(2, kid)]); h=[(1, cell)]); level=2)) ==
+          [kid]
+end
+
 @testset "refine: the p-step actually survives" begin
     # A p-step is only ever handed a LEAF, and that is what makes it real: the same increment on a covered cell is a
     # no-op, because leaf semantics shed a covered cell's bubble modes. Measured before that was understood, 356 cells

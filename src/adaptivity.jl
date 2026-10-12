@@ -962,8 +962,10 @@ refinement left behind is pure cost.
     release here" rather than "raise it".
 
 Releasing a cover whose children are themselves covered is a no-op rather than an error: the region is carried further
-down and the deeper level is what holds it, so releasing this level alone would leave a hole. Release the stack from the
-top down and each call is well defined. So is an h-mark on a level the one below does not reach, which has no cover to
+down and the deeper level is what holds it, so releasing this level alone would leave a hole. On a family whose
+functions reach beyond their cell (a B-spline level) that includes the support collar a held child needs, and no cell a
+deeper level holds is released as part of anyone's collar. Release the stack from the top down and each call is well
+defined. So is an h-mark on a level the one below does not reach, which has no cover to
 release. As in [`refine`](@ref), a call that changes nothing returns `V` itself.
 
 Lowering the order of a cell a finer level has taken over is **rejected**, and *any* finer level counts, not only the
@@ -1072,7 +1074,14 @@ function coarsen(V::Space{D,T}; h=(), p=(), pmin::Integer=1) where {D,T}
             block = _cell_block(V, k - 1, k, parent)
             (block === nothing || isempty(block)) && continue
             for child in block
-                blocks[child] = true
+                # A child a deeper level holds is not released by the loop above, and it stays out of `blocks` for the
+                # same reason: the deeper level is built on it. Left in, the collar pass below would release it anyway,
+                # with its whole dilated footprint, past the leaf test the loop applied — measured on an order-3
+                # B-spline ladder of depth 2, releasing the level-1 parent of a child that level 3 refines left level 2
+                # with no live cell under 64 live level-3 cells. Left out, it stays in `core`, so `keep` retains its
+                # dilated footprint and the held child keeps the support its own functions need: the docstring's "no-op
+                # rather than a hole".
+                _is_leaf(V, k, child, live) && (blocks[child] = true)
             end
         end
         # Recover the set `refine` dilated, so the collar can be released without taking one another refined region
@@ -1088,11 +1097,14 @@ function coarsen(V::Space{D,T}; h=(), p=(), pmin::Integer=1) where {D,T}
         # one it recovers more, so a collar stays live. Conservative is the safe direction — it can only leave
         # refinement standing, never take away refinement another mark needs — and it is what fixes the defect that
         # matters, an active set that grew without bound as a feature travelled.
+        #
+        # A collar cell a deeper level holds is not this release's either, whoever's footprint it lies in: the leaf test
+        # on each release is the h-mark loop's own rule, applied to the collar.
         core = _erode_cells(before, radius)
         keep = _dilate_cells(core .& .!blocks, radius)
         dropped = _dilate_cells(blocks, radius)
         for c in CartesianIndices(mask)
-            dropped[c] && !keep[c] && (mask[c] = false)
+            dropped[c] && !keep[c] && mask[c] && _is_leaf(V, k, c, live) && (mask[c] = false)
         end
     end
 
