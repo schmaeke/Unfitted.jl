@@ -810,6 +810,23 @@ end
     @test estimated(dormant) ≈ 0.00576587 rtol = 1.0e-5
 end
 
+@testset "the enrichment record twins live levels only and charges each twin to its level" begin
+    # `estimate` reads V⁺ through one record: level j of V⁺ is charged to level k of V, each cell to the cell of k it
+    # lies in. V's own levels are their own; a live level without a per-cell order gets a refined twin above all of
+    # them, live exactly where the level is; a dormant one gets none, since its twin would carry nothing.
+    live = falses(8, 8)
+    live[1:4, 1:4] .= true
+    V = overlay(overlay(space(_AD_Ω; cells=4, order=2), _AD_Ω; cells=8, order=2, basis=bspline(), active=live), _AD_Ω;
+                cells=4, order=2, basis=bspline(), active=CartesianIndex{2}[])
+    W, charge = Unfitted._enriched_space(V, 1)
+    @test charge == [(1, 1), (2, 1), (3, 1), (2, 2)]
+    @test length(W.levels) == 4 && W.levels[4].mesh.cells == (16, 16)
+    # The twin's mask and the charge read the same child-to-parent map.
+    twin = active_cells(W; level=4)
+    @test count(twin) == 4 * count(live)
+    @test all(c -> twin[c] == live[Unfitted._coarse_cell(c, 2)], CartesianIndices(twin))
+end
+
 @testset "estimate does not change when a dormant level is appended" begin
     # The enriched twin needs leaf semantics off for the level it enriches, and only that one. Turning them off for the
     # whole enriched model instead made the indicator a function of which levels happen to be present: appending a level

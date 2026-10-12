@@ -220,16 +220,26 @@ end
 # restricting the estimator's two sweeps to these changes no result — only how much of a level has to be walked to find
 # that out. That is the point on a ladder, where a level holds N^D cells however few are switched on: a depth-5 3D chain
 # over a 4³ base declares 2 097 152 of them on its finest level. The mask scan is one pass over a `BitArray`, cheap
-# against the per-cell dof lookup and the vector it allocates per component.
+# against a dof lookup per declared cell: `cell_dofs` allocates nothing, since it returns the layout's own vector, but
+# it is still a table read per cell, and on such a level almost every one of them comes back empty. `estimate` builds
+# the list once per level and walks it in both sweeps.
 function _live_cells(level::Level)
     level.mask === nothing ? cell_indices(level.mesh) : CartesianIndices(level.mask.on)[level.mask.on]
 end
 
-# `V` with every cell's order raised by `inc`. A uniform level is raised as a tuple rather than through a per-cell
-# field, and the reason is cost rather than meaning: `_normalize_order` collapses an all-equal field back to exactly
-# this tuple, so the per-cell path arrives at the same level having materialised three N^D arrays on the way (the field
-# `cell_orders` builds, the raised copy, and the palette scan that collapses it). Measured on a uniform 512² level, 7.9
-# ms and 13.0 MiB against 1.3 ms and 1.0 MiB for the tuple, for an identical result.
+# The enrichment `estimate` reads, as a record: `(W, charge)`, where `charge[j] = (k, f)` says that level `j` of `W` is
+# charged to level `k` of `V`, each of its cells to the cell of `k` it lies in when `k` is refined `f`-fold per axis.
+# Every level of `V` is its own `(j, 1)`, raised by `inc` in place where its family carries a per-cell order. Every live
+# level whose family does not gets a refinement twin (`_refinement_twin`), appended above all of them and charged
+# `(k, inc + 1)` to the level it enriches. A dormant level gets none: every cell of its twin would be dormant too, so
+# the twin would carry no raw and no integration region — the partition follows live cells — and add nothing to the
+# indicator but a level to walk.
+#
+# A uniform level is raised as a tuple rather than through a per-cell field, and the reason is cost rather than
+# meaning: `_normalize_order` collapses an all-equal field back to exactly this tuple, so the per-cell path arrives at
+# the same level having materialised three N^D arrays on the way (the field `cell_orders` builds, the raised copy, and
+# the palette scan that collapses it). Measured on a uniform 512² level, 7.9 ms and 13.0 MiB against 1.3 ms and 1.0 MiB
+# for the tuple, for an identical result.
 #
 # The generator's element type is `Pair{Int,Union{NTuple{D,Int},Array{...,D}}}`, which is what
 # `elevate(V, pairs::Pair{<:Integer}...)` already dispatches on, so no `Pair{Int,Any}` accumulator is needed to hold the
@@ -239,17 +249,14 @@ function _enriched_space(V::Space{D,T}, inc::Int) where {D,T}
                  length(o.palette) == 1 ? o.nominal .+ inc : map(p -> p .+ inc, cell_orders(V; level=k)))
     graded = [k for k in 1:length(V.levels) if _supports_cell_order(V.levels[k].basis)]
     W = isempty(graded) ? V : elevate(V, (k => raised(k) for k in graded)...)
-    twins = Tuple{Int,Int,Int}[]
-    exempt = Int[]
+    charge = [(k, 1) for k in 1:length(V.levels)]
+    live = _live_levels(V)
     for k in 1:length(V.levels)
-        k in graded && continue
+        (live[k] && !(k in graded)) || continue
         W = _refinement_twin(W, V.levels[k], inc + 1)
-        push!(twins, (length(W.levels), k, inc + 1))
-        # The enriched level, by *id*: it is the one a twin would deduplicate, and the one `dof_layout` must therefore
-        # leave unpruned.
-        push!(exempt, V.levels[k].id)
+        push!(charge, (k, inc + 1))
     end
-    return W, twins, exempt
+    return W, charge
 end
 
 # A level co-located with `level` — same box, same family, same degree, same active region — on a mesh refined by
@@ -260,20 +267,17 @@ end
 #
 # `factor` is an integer, so the twin's knot lines contain the level's and the two spline spaces nest — which is what
 # makes `V⁺ ⊇ V` and the injection exact. The mask is mapped child-to-parent so the twin is live exactly where the level
-# is, and its own selection rule then trims it to the functions that fit, exactly as it does for any level.
+# is, and its own selection rule then trims it to the functions that fit, exactly as it does for any level. `repeat`
+# with `inner` is that map: it writes each parent bit over its `factor`^D children, as `_coarse_cell` reads it back.
 function _refinement_twin(W::Space{D,T}, level::Level{D,T}, factor::Int) where {D,T}
-    cells = ntuple(d -> level.mesh.cells[d] * factor, D)
-    mask = nothing
-    if level.mask !== nothing
-        on = BitArray(undef, cells)
-        for c in CartesianIndices(cells)
-            on[c] = level.mask.on[CartesianIndex(ntuple(d -> (c.I[d] - 1) ÷ factor + 1, D))]
-        end
-        mask = on
-    end
-    return overlay(W, level.mesh.domain; cells=cells, order=nominal_order(level), basis=level.basis, mode=level.mode,
-                   active=mask)
+    mask = level.mask === nothing ? nothing : repeat(level.mask.on; inner=ntuple(_ -> factor, D))
+    return overlay(W, level.mesh.domain; cells=level.mesh.cells .* factor, order=nominal_order(level),
+                   basis=level.basis, mode=level.mode, active=mask)
 end
+
+# The cell of a level that cell `c` of its `f`-fold refinement lies in, and `c` itself at `f = 1`: where `estimate`
+# charges a twin's indicator.
+_coarse_cell(c::CartesianIndex{D}, f::Int) where {D} = CartesianIndex(ntuple(d -> (c.I[d] - 1) ÷ f + 1, D))
 
 """
     estimate(model::Model, solution::Solution; enrichment = 1) -> ErrorEstimate
@@ -292,10 +296,13 @@ injection is again exact, and the two spline spaces nest because the refinement 
 The twin's per-cell indicators are charged back to the cells of the level it enriches, so the estimate a caller sees is
 always indexed by `V`'s own levels and is fed straight to [`mark_cells`](@ref) and [`refine`](@ref) either way.
 
-The level a twin enriches is built with leaf semantics off *for that level alone*, and the reason is in `estimate`'s
-body: a nested same-degree cover would otherwise deduplicate the very keys the injection looks for. Every other level is
-pruned exactly as in `V`, which is what keeps the indicator a function of the model rather than of which levels happen
-to be present.
+Only a live level is twinned: a dormant one has nothing to enrich. The level a twin enriches is built with leaf
+semantics off *for that level alone*, and the reason is in `estimate`'s body: a nested same-degree cover would otherwise
+deduplicate the very keys the injection looks for. Every other level keeps leaf semantics, pruned by the same rule as
+in `V`, which is what keeps the indicator a function of the model rather than of which levels happen to be present. The
+rule's outcome differs from `V`'s in one place: the twins sit above every level of `V`, so where a twin is live it also
+covers the cells of any higher level. A level there that carries a per-cell order then sheds modes `V` keeps free, `V⁺`
+no longer contains `V`, and that stack is refused (below).
 
 `W` is a set difference on raw dof keys, not a comparison of mode indices: at an anisotropic order the two disagree, and
 the index form selects 5 of the 11 complement modes at order `(3, 5)`. Each complement mode is shared equally among the
@@ -417,21 +424,22 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     # wakes. Over two estimate → refine → adapted cycles on an immersed 8² order-2 B-spline ladder of depth 2, the
     # merge took the fits from 309 (shared) to 236, every `adapted` refitting nothing; a copy alone took them to 326,
     # because the next `adapted` then refitted the twin's boxes.
-    enriched_space, twins, exempt = _enriched_space(V, Int(enrichment))
-    live = _live_levels(V)
-    caches = any(((_, k, _),) -> live[k], twins) ? copy.(model.moment_fit_caches) : model.moment_fit_caches
+    enriched_space, charge = _enriched_space(V, Int(enrichment))
     # A superposed twin is a *nested* level of the same degree, so leaf semantics would deduplicate the level it
     # enriches — removing exactly the keys the injection is about to look for, and turning `Rewire` into a refusal. Only
     # *that* level may skip pruning, and only in this throwaway twin: turning leaf semantics off for the whole enriched
     # model instead was measured to inflate the indicator on a covered cell of an unrelated integrated-Legendre level by
     # 4.1×, because that level's order-elevated covered modes then survive, land in `W`, and are charged as error to a
-    # cell `decide` can spend nothing on.
+    # cell `decide` can spend nothing on. The exempt levels are the ones a twin is charged to, named by *id*, as
+    # `dof_layout` reads them.
     #
     # Exempting the enriched level costs the indicator nothing. `u⁺` is zero on every key the injection does not fill,
     # so the duplicate columns contribute nothing to `R = b⁺ − A⁺u⁺`; `b⁺` and the diagonal on `W` are untouched; and
     # `A⁺` being singular is harmless here, since the indicator reads its diagonal and forms one matrix–vector product
     # and never factorises.
-    options = isempty(exempt) ? model.plan_options : merge(model.plan_options, (; prune_exempt=exempt))
+    twinned = [V.levels[k].id for (k, factor) in charge if factor > 1]
+    options = isempty(twinned) ? model.plan_options : merge(model.plan_options, (; prune_exempt=twinned))
+    caches = isempty(twinned) ? model.moment_fit_caches : copy.(model.moment_fit_caches)
     # The twin numbers its points from `_FOREIGN_POINTS`, far below 1, so a form that reads per-point state by `q.point`
     # without capturing it — through a global, which the walk above cannot see — raises at the read rather than reading
     # `model`'s points at the twin's indices (see "Detecting point-keyed state" in `data.jl`).
@@ -481,28 +489,38 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
     # neighbour's error. Raw ids are contiguous, so this is a dense vector rather than a `Dict`.
     #
     # Both sweeps address a level's cell tables by its level *id*, as `cell_dofs` is keyed; the attribution sweep keeps
-    # the position `k` for `cells`, which follows `enriched.levels`. The two coincide on a single-domain space, the only
-    # kind `estimate` accepts, but only the id is the table's key. The id is read once per level: the enriched space is
-    # built at run time, so `level` is not concretely typed here, and reading `level.id` per cell cost one allocation
-    # per cell (measured +6 020 on a depth-5 ladder).
+    # the position `j` for `charge`, which follows `enriched.levels`. The two coincide on a single-domain space, the
+    # only kind `estimate` accepts, but only the id is the table's key. The id is read once per level: the enriched
+    # space is built at run time, so `level` is not concretely typed here, and reading `level.id` per cell cost one
+    # allocation per cell (measured +6 020 on a depth-5 ladder).
+    live_cells = [_live_cells(level) for level in enriched.levels]
     incidence = zeros(Int, length(plus_keys))
-    for level in enriched.levels
+    for (j, level) in enumerate(enriched.levels)
         id = level.id
-        for cell in _live_cells(level), raw in cell_dofs(plus_field.dofs, id, cell)
+        for cell in live_cells[j], raw in cell_dofs(plus_field.dofs, id, cell)
             incidence[raw] += 1
         end
     end
 
-    # The attribution sweep. `counted` is indexed by ACTIVE id, not by raw: active ids are unique across components, so
-    # a vector-valued field's `(raw, component)` slots are each counted once into the V/W split while every one of them
-    # is charged to its cell. A slot's active id is read straight from the field's table, so the sweep allocates nothing
-    # per (cell, component).
-    cells = [zeros(T, level.mesh.cells) for level in enriched.levels]
+    # The attribution sweep, each level charged where `charge` says. A twin carries the complement modes of the level it
+    # enriches, so its indicators belong to that level's cells, each twin cell to the coarse cell it subdivides: the
+    # twins exist only inside this call, and a marked pair naming one could not be applied. A cell's terms are summed
+    # locally in (component, raw) order and charged once, which is bit for bit the attribution this replaced, one dense
+    # array per level of `V⁺` folded onto the parents cell by cell afterwards: the same terms in the same order, every
+    # level of `V` complete before any twin is added, and a dormant twin cell, which that fold also visited, adding an
+    # exact 0.0.
+    #
+    # `counted` is indexed by ACTIVE id, not by raw: active ids are unique across components, so a vector-valued field's
+    # `(raw, component)` slots are each counted once into the V/W split while every one of them is charged to its cell.
+    # A slot's active id is read straight from the field's table, so the sweep allocates nothing per (cell, component).
+    cells = Array{T,D}[zeros(T, level.mesh.cells) for level in V.levels]
     counted = falses(length(residual))
     residual_V = residual_W = zero(T)
-    for (k, level) in enumerate(enriched.levels)
+    for (j, level) in enumerate(enriched.levels)
         id = level.id
-        for cell in _live_cells(level)
+        k, factor = charge[j]
+        for cell in live_cells[j]
+            η² = zero(T)
             raws = cell_dofs(plus_field.dofs, id, cell)
             for component in 1:plus_field.components, raw in raws
                 active = _field_component_dof(plus_field, raw, component)
@@ -514,24 +532,15 @@ function estimate(model::Model{D,T}, solution::Solution; enrichment::Integer=1) 
                 in_W[raw] || continue
                 d = diagonal[active]
                 d > 0 || throw(ArgumentError("estimate: the enriched diagonal of a complement mode on " *
-                                             "level $k, cell $cell, component $component is $d. The " *
+                                             "level $j, cell $cell, component $component is $d. The " *
                                              "Bank–Weiser indicator reads that diagonal as the mode's " *
                                              "energy, so it needs a coercive form; on this one the " *
                                              "indicator has no meaning."))
-                cells[k][cell] += residual[active]^2 / d / incidence[raw]
+                η² += residual[active]^2 / d / incidence[raw]
             end
+            cells[k][_coarse_cell(cell, factor)] += η²
         end
     end
-    # A superposed twin carries the complement modes of the level it enriches, so its per-cell squared indicators belong
-    # to that level's cells: each twin cell charges the parent cell it subdivides, and the twins then leave the estimate
-    # altogether. Without this the marked pairs would name levels `refine` cannot act on — the twins exist only inside
-    # this call.
-    for (twin, parent, factor) in twins
-        for c in CartesianIndices(cells[twin])
-            cells[parent][CartesianIndex(ntuple(d -> (c.I[d] - 1) ÷ factor + 1, D))] += cells[twin][c]
-        end
-    end
-    resize!(cells, length(V.levels))
     for a in cells
         a .= sqrt.(a)
     end
