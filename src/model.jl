@@ -26,69 +26,11 @@ Mutable diagnostics record carried on every [`Model`](@ref) and exposed through 
 reporting the old state — re-read it through [`diagnostics`](@ref). Every field is `Float64`- or `Int`-typed for
 stability across scalar types.
 
-Fields:
+Fields, in declaration order, which is also the order [`diagnostics`](@ref)`(model, solution)` reports them in:
 
   - `dimension::Int` — spatial dimension `D`.
   - `active_unknowns::Int` — number of active (post-constraint) dofs.
   - `integration_regions::Int` — number of admissible integration regions in the model's plan.
-  - `small_overlap_count::Int` and `small_overlaps::Vector` — number and per-region records of integration regions below
-    `tolerance.small_volume`.
-  - `min_integration_volume::Float64` — smallest region volume.
-  - `min_relative_integration_volume::Float64` — same, divided by `volume(V.domain)`.
-  - `symmetry_residual::Float64` — the reported value of `‖A − Aᵀ‖_F` for the assembled matrix. It is asserted, never
-    measured: `assemble!` writes exactly `0.0` when the problem declares itself symmetric — such a form is scattered
-    into the lower triangle only and mirrored entry-for-entry by `_mirror_lower`, so `A = Aᵀ` holds to the bit by
-    construction — and `NaN` otherwise. `NaN` therefore means "no symmetry claim", both before `assemble!` has run and
-    for a form the problem did not declare symmetric; it is never a measurement of asymmetry.
-  - `condition_estimate::Float64` — `cond(Matrix(A))` for systems with `1 ≤ n ≤ 256`; `NaN` otherwise (computing the
-    condition number of a large matrix is too expensive for a default diagnostic, and an empty system has none).
-  - `scaled_condition_estimate::Float64` — the same quantity for the symmetrically diagonal-scaled operator `D⁻¹ A D⁻¹`,
-    `D = diag(√|A_ii|)`, which is what a Jacobi-preconditioned solver actually sees. Same size cap, and `NaN` where any
-    diagonal entry is zero.
-
-    Reporting both is what makes an **immersed** system readable, because on a cut cell the two answer different
-    questions. An unscaled `cond` there is dominated by the spread of the diagonal — a basis function whose support is
-    almost entirely fictitious carries an almost-zero diagonal entry — and that spread is exactly what a diagonal
-    preconditioner removes. Whether anything is left after it is removed is a property of the *basis*, and the two
-    shipped families differ on it sharply. Measured on a disc of radius `r` removed from the unit square, `−Δu = 1`,
-    degree 2 on an 8² grid — a size at which both families stay under the cap above, so both numbers are the ones this
-    diagnostic prints:
-
-    ```text
-    r        family       unknowns    cond       scaled cond
-    0.25     Legendre      216        1.36e6     4.22e4
-    0.25     B-spline       64        5.99e2     6.04
-    0.30     Legendre      192        1.06e5     5.58e3
-    0.30     B-spline       64        1.26e5     7.17
-    ```
-
-    The gap widens with the degree, and past degree 2 only the B-spline half is reportable here: at degree 3 on the same
-    grid the spline system has 81 unknowns and scales to 39.9 (`r = 0.25`) and 45.1 (`r = 0.30`) from 1.48e5 and 3.63e8,
-    while the integrated-Legendre system has 504 and is `NaN` by the cap. Computed directly, past the cap, a degree-3
-    16² pair gives 2.2e10 for integrated Legendre against 4.4e1 for the splines.
-
-    The B-spline rows are the maximal-continuity family: on a cut cell holding a background vertex only one spline is
-    supported there, so near-dependence survives only on vertex-free slivers, while a `C⁰` basis of degree ≥ 2 produces
-    it on every small cut cell. That difference is the reason an immersed spline system is solvable with a diagonal
-    preconditioner and an immersed high-order `C⁰` system is not, and it is invisible in `condition_estimate` alone.
-  - `solver::Symbol` — solver tag recorded by [`solve!`](@ref).
-  - `inactive_cell_counts::Vector{Int}` — count of cells deactivated by `LevelMask`, one entry per level of each
-    distinct participating space, in `problem_spaces` order. Includes both user-provided masks and the fictitious fold
-    `mesh.jl`'s `_apply_physical_fold` applies whenever the domain's `keep_fictitious` is `false` (the default) — that
-    fold runs at any `alpha`, not only in the strict `alpha = 0` case.
-  - `reduced_mode_counts::Vector{Int}` — count of high-order and dedup modes eliminated by covered-mode pruning in
-    covered regions (leaf semantics; see [`prepare`](@ref)'s `prune`), one entry per level of each *field*, concatenated
-    in field-declaration order. Note the different granularity from `inactive_cell_counts`, which is per *space*: the
-    two vectors line up entry-for-entry only when every space carries exactly one field (the common case). Two fields
-    over one space give this vector twice the length of that one.
-  - `cut_region_count::Int`, `fit_failure_count::Int`, `moment_fit_residual_max::Float64` — FCM moment-fit statistics
-    from the integration plan. `fit_failure_count` counts every cut region whose fit missed the failure threshold
-    `_FIT_FAILURE_RESIDUAL · ‖m‖` (relative to the norm of the cell's moment vector, so the verdict does not depend on
-    the cell's size), whatever rule the region ended up carrying.
-  - `cut_fallback_count::Int`, `cut_fallback_points::Int` — the subset of those failures that fell back to the raw Saye
-    volume rule (`:cut_fallback`), and the total number of quadrature points those regions carry. A successful fit
-    yields ≈ nbasis points, so the second number is the price of the safety net; a nonzero count means the mesh is too
-    coarse for the geometry in those cells and should be refined. See [`moment_fit_rule`](@ref).
   - `facet_region_count::Int` — total number of [`FacetRegion`](@ref)s cached on the model, summed across every cached
     selector (Dirichlet conditions and any `block`/`loadform` carrying `on::BoundarySelector`). Zero for problems with
     no physical- boundary integration. Because the sum runs over selector × face pairs and not over distinct regions,
@@ -185,70 +127,95 @@ Fields:
     across every cached [`BoundaryMesh`](@ref). Zero for problems with no immersed-boundary integration.
   - `interface_region_count::Int` — total number of interface [`SimplexRegion`](@ref)s cached on the model, summed
     across every cached coupling [`Interface`](@ref). Zero for problems with no multi-domain interface coupling.
+  - `small_overlap_count::Int` and `small_overlaps::Vector` — number and per-region records of integration regions below
+    `tolerance.small_volume`.
+  - `min_integration_volume::Float64` — smallest region volume.
+  - `min_relative_integration_volume::Float64` — same, divided by `volume(V.domain)`.
+  - `inactive_cell_counts::Vector{Int}` — count of cells deactivated by `LevelMask`, one entry per level of each
+    distinct participating space, in `problem_spaces` order. Includes both user-provided masks and the fictitious fold
+    `mesh.jl`'s `_apply_physical_fold` applies whenever the domain's `keep_fictitious` is `false` (the default) — that
+    fold runs at any `alpha`, not only in the strict `alpha = 0` case.
+  - `reduced_mode_counts::Vector{Int}` — count of high-order and dedup modes eliminated by covered-mode pruning in
+    covered regions (leaf semantics; see [`prepare`](@ref)'s `prune`), one entry per level of each *field*, concatenated
+    in field-declaration order. Note the different granularity from `inactive_cell_counts`, which is per *space*: the
+    two vectors line up entry-for-entry only when every space carries exactly one field (the common case). Two fields
+    over one space give this vector twice the length of that one.
+  - `cut_region_count::Int`, `fit_failure_count::Int`, `moment_fit_residual_max::Float64` — FCM moment-fit statistics
+    from the integration plan. `fit_failure_count` counts every cut region whose fit missed the failure threshold
+    `_FIT_FAILURE_RESIDUAL · ‖m‖` (relative to the norm of the cell's moment vector, so the verdict does not depend on
+    the cell's size), whatever rule the region ended up carrying.
+  - `cut_fallback_count::Int`, `cut_fallback_points::Int` — the subset of those failures that fell back to the raw Saye
+    volume rule (`:cut_fallback`), and the total number of quadrature points those regions carry. A successful fit
+    yields ≈ nbasis points, so the second number is the price of the safety net; a nonzero count means the mesh is too
+    coarse for the geometry in those cells and should be refined. See [`moment_fit_rule`](@ref).
+  - `symmetry_residual::Float64` — the reported value of `‖A − Aᵀ‖_F` for the assembled matrix. It is asserted, never
+    measured: `assemble!` writes exactly `0.0` when the problem declares itself symmetric — such a form is scattered
+    into the lower triangle only and mirrored entry-for-entry by `_mirror_lower`, so `A = Aᵀ` holds to the bit by
+    construction — and `NaN` otherwise. `NaN` therefore means "no symmetry claim", both before `assemble!` has run and
+    for a form the problem did not declare symmetric; it is never a measurement of asymmetry.
+  - `condition_estimate::Float64` — `cond(Matrix(A))` for systems with `1 ≤ n ≤ 256`; `NaN` otherwise (computing the
+    condition number of a large matrix is too expensive for a default diagnostic, and an empty system has none).
+  - `scaled_condition_estimate::Float64` — the same quantity for the symmetrically diagonal-scaled operator `D⁻¹ A D⁻¹`,
+    `D = diag(√|A_ii|)`, which is what a Jacobi-preconditioned solver actually sees. Same size cap, and `NaN` where any
+    diagonal entry is zero.
+
+    Reporting both is what makes an **immersed** system readable, because on a cut cell the two answer different
+    questions. An unscaled `cond` there is dominated by the spread of the diagonal — a basis function whose support is
+    almost entirely fictitious carries an almost-zero diagonal entry — and that spread is exactly what a diagonal
+    preconditioner removes. Whether anything is left after it is removed is a property of the *basis*, and the two
+    shipped families differ on it sharply. Measured on a disc of radius `r` removed from the unit square, `−Δu = 1`,
+    degree 2 on an 8² grid — a size at which both families stay under the cap above, so both numbers are the ones this
+    diagnostic prints:
+
+    ```text
+    r        family       unknowns    cond       scaled cond
+    0.25     Legendre      216        1.36e6     4.22e4
+    0.25     B-spline       64        5.99e2     6.04
+    0.30     Legendre      192        1.06e5     5.58e3
+    0.30     B-spline       64        1.26e5     7.17
+    ```
+
+    The gap widens with the degree, and past degree 2 only the B-spline half is reportable here: at degree 3 on the same
+    grid the spline system has 81 unknowns and scales to 39.9 (`r = 0.25`) and 45.1 (`r = 0.30`) from 1.48e5 and 3.63e8,
+    while the integrated-Legendre system has 504 and is `NaN` by the cap. Computed directly, past the cap, a degree-3
+    16² pair gives 2.2e10 for integrated Legendre against 4.4e1 for the splines.
+
+    The B-spline rows are the maximal-continuity family: on a cut cell holding a background vertex only one spline is
+    supported there, so near-dependence survives only on vertex-free slivers, while a `C⁰` basis of degree ≥ 2 produces
+    it on every small cut cell. That difference is the reason an immersed spline system is solvable with a diagonal
+    preconditioner and an immersed high-order `C⁰` system is not, and it is invisible in `condition_estimate` alone.
+  - `solver::Symbol` — solver tag recorded by [`solve!`](@ref).
 """
-mutable struct AssemblyDiagnostics
-    dimension::Int
-    active_unknowns::Int
-    integration_regions::Int
-    small_overlap_count::Int
-    small_overlaps::Vector{SmallOverlap{Float64}}
-    min_integration_volume::Float64
-    min_relative_integration_volume::Float64
-    symmetry_residual::Float64
-    condition_estimate::Float64
-    scaled_condition_estimate::Float64
-    solver::Symbol
-    inactive_cell_counts::Vector{Int}
-    reduced_mode_counts::Vector{Int}
-    cut_region_count::Int
-    fit_failure_count::Int
-    moment_fit_residual_max::Float64
-    cut_fallback_count::Int
-    cut_fallback_points::Int
-    facet_region_count::Int
-    cut_facet_region_count::Int
-    facet_fit_failure_count::Int
-    facet_cut_fallback_count::Int
-    facet_moment_fit_residual_max::Float64
-    min_relative_facet_measure::Float64
-    dirichlet_trace_factors::Vector{Symbol}
-    unsupported_dirichlet_dof_count::Int
-    unsupported_dirichlet_dofs::Vector{UnsupportedDirichletDof}
-    surface_region_count::Int
-    interface_region_count::Int
-end
-
-# Promote the small-overlap records of an integration plan to `Float64` scalars so they fit the diagnostics'
-# fixed-precision storage. The integration plan carries them in the model's scalar type `T`; widening to `Float64` here
-# keeps `AssemblyDiagnostics` `T`-agnostic.
-function _float_small_overlaps(records)
-    return [SmallOverlap{Float64}(record.region, Float64(record.volume), Float64(record.relative_volume),
-                                  record.cover_count) for record in records]
-end
-
-function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regions=0, small_overlap_count=0,
-                             min_integration_volume=NaN, min_relative_integration_volume=NaN, symmetry_residual=NaN,
-                             condition_estimate=NaN, scaled_condition_estimate=NaN, solver=:none,
-                             small_overlaps=SmallOverlap{Float64}[], inactive_cell_counts=Int[],
-                             reduced_mode_counts=Int[], cut_region_count=0, fit_failure_count=0,
-                             moment_fit_residual_max=0.0, cut_fallback_count=0, cut_fallback_points=0,
-                             facet_region_count=0, cut_facet_region_count=0, facet_fit_failure_count=0,
-                             facet_cut_fallback_count=0, facet_moment_fit_residual_max=0.0,
-                             min_relative_facet_measure=1.0, dirichlet_trace_factors=Symbol[],
-                             unsupported_dirichlet_dofs=UnsupportedDirichletDof[], surface_region_count=0,
-                             interface_region_count=0)
-    return AssemblyDiagnostics(Int(dimension), Int(active_unknowns), Int(integration_regions), Int(small_overlap_count),
-                               _float_small_overlaps(small_overlaps), Float64(min_integration_volume),
-                               Float64(min_relative_integration_volume), Float64(symmetry_residual),
-                               Float64(condition_estimate), Float64(scaled_condition_estimate), Symbol(solver),
-                               Int[inactive_cell_counts...], Int[reduced_mode_counts...], Int(cut_region_count),
-                               Int(fit_failure_count), Float64(moment_fit_residual_max), Int(cut_fallback_count),
-                               Int(cut_fallback_points), Int(facet_region_count), Int(cut_facet_region_count),
-                               Int(facet_fit_failure_count), Int(facet_cut_fallback_count),
-                               Float64(facet_moment_fit_residual_max), Float64(min_relative_facet_measure),
-                               Symbol[dirichlet_trace_factors...], length(unsupported_dirichlet_dofs),
-                               UnsupportedDirichletDof[unsupported_dirichlet_dofs...], Int(surface_region_count),
-                               Int(interface_region_count))
+Base.@kwdef mutable struct AssemblyDiagnostics
+    dimension::Int = 0
+    active_unknowns::Int = 0
+    integration_regions::Int = 0
+    facet_region_count::Int = 0
+    cut_facet_region_count::Int = 0
+    facet_fit_failure_count::Int = 0
+    facet_cut_fallback_count::Int = 0
+    facet_moment_fit_residual_max::Float64 = 0.0
+    min_relative_facet_measure::Float64 = 1.0
+    dirichlet_trace_factors::Vector{Symbol} = Symbol[]
+    unsupported_dirichlet_dof_count::Int = 0
+    unsupported_dirichlet_dofs::Vector{UnsupportedDirichletDof} = UnsupportedDirichletDof[]
+    surface_region_count::Int = 0
+    interface_region_count::Int = 0
+    small_overlap_count::Int = 0
+    small_overlaps::Vector{SmallOverlap{Float64}} = SmallOverlap{Float64}[]
+    min_integration_volume::Float64 = NaN
+    min_relative_integration_volume::Float64 = NaN
+    inactive_cell_counts::Vector{Int} = Int[]
+    reduced_mode_counts::Vector{Int} = Int[]
+    cut_region_count::Int = 0
+    fit_failure_count::Int = 0
+    moment_fit_residual_max::Float64 = 0.0
+    cut_fallback_count::Int = 0
+    cut_fallback_points::Int = 0
+    symmetry_residual::Float64 = NaN
+    condition_estimate::Float64 = NaN
+    scaled_condition_estimate::Float64 = NaN
+    solver::Symbol = :none
 end
 
 # Per-level count of cells deactivated by a `LevelMask` (mask and fictitious fold combined), across every distinct
@@ -343,27 +310,22 @@ function _kind_stats_of(lists)
     foldl((stats, regions) -> _kind_stats(regions, stats)::typeof(_NO_KIND_STATS), lists; init=_NO_KIND_STATS)
 end
 
-# Fold every plan-level statistic into a diagnostics record in place, and return it so call sites can chain. Shared by
-# `prepare`, `move!` and `_update_mask!`, which install a fresh record.
-#
-# `plans` holds one integration plan per subdomain and must be non-empty. The aggregation is the identity on a
-# single-domain problem: region / cut / small-overlap counts sum, minimum volumes take the global minimum, the
-# moment-fit residual takes the global maximum, and the small-overlap records are concatenated so every subdomain's
-# offending regions are reported.
-function _set_plan_stats_multi!(diag::AssemblyDiagnostics, plans)
-    diag.integration_regions = sum(length(p.regions) for p in plans; init=0)
-    diag.small_overlap_count = sum(length(p.small_overlaps) for p in plans; init=0)
-    diag.small_overlaps = reduce(vcat, (_float_small_overlaps(p.small_overlaps) for p in plans);
-                                 init=SmallOverlap{Float64}[])
-    diag.min_integration_volume = minimum(Float64(p.min_volume) for p in plans)
-    diag.min_relative_integration_volume = minimum(Float64(p.min_relative_volume) for p in plans)
-    stats = [_kind_stats(p.regions) for p in plans]
-    diag.cut_region_count = sum(s.cut for s in stats; init=0)
-    diag.fit_failure_count = sum(s.failed for s in stats; init=0)
-    diag.cut_fallback_count = sum(s.fallbacks for s in stats; init=0)
-    diag.cut_fallback_points = sum(s.fallback_points for s in stats; init=0)
-    diag.moment_fit_residual_max = maximum(p.moment_fit_residual_max for p in plans; init=0.0)
-    return diag
+# The integration plans' half of the diagnostics, over every subdomain's plan, under the record's own field names. The
+# aggregation is the identity on a single-domain problem: region and small-overlap counts sum, the minimum volumes take
+# the global minimum, the moment-fit residual the global maximum of each plan's own (NaN-ignoring) one, and the cut
+# statistics are `_kind_stats` over every plan's regions. The small-overlap records are concatenated, so every
+# subdomain's offending regions are reported, and widened to `Float64`: a plan carries them in the model's scalar type
+# `T`, and the record is `T`-agnostic. `plans` must be non-empty.
+function _plan_stats(plans)
+    kinds = _kind_stats_of(p.regions for p in plans)
+    small = SmallOverlap{Float64}[SmallOverlap{Float64}(r.region, Float64(r.volume), Float64(r.relative_volume),
+                                                        r.cover_count) for p in plans for r in p.small_overlaps]
+    return (; integration_regions=sum(p -> length(p.regions), plans), small_overlap_count=length(small),
+            small_overlaps=small, min_integration_volume=minimum(p -> Float64(p.min_volume), plans),
+            min_relative_integration_volume=minimum(p -> Float64(p.min_relative_volume), plans),
+            cut_region_count=kinds.cut, fit_failure_count=kinds.failed,
+            moment_fit_residual_max=maximum(p -> p.moment_fit_residual_max, plans; init=0.0),
+            cut_fallback_count=kinds.fallbacks, cut_fallback_points=kinds.fallback_points)
 end
 
 # Append one field's L² Dirichlet trace-solve verdicts to `factors` and `unsupported`, in component order: the branch
@@ -374,7 +336,8 @@ end
 #
 # Read off the projection because that is where the verdicts live and nowhere else: the dof layout keeps no copy of
 # them, and `prepare` drops each projection it builds as soon as this has read it, so the model it returns holds none.
-# `update_dirichlet!` reads the ones it caches the same way.
+# `update_dirichlet!` reads the ones it caches the same way. The unsupported dofs are self-describing records rather
+# than a flattened vector: the list is empty on every untrimmed boundary, so there is no position worth counting from.
 function _append_trace_stats!(factors::Vector{Symbol}, unsupported::Vector{UnsupportedDirichletDof}, name::Symbol,
                               projection, components::Integer)
     for c in 1:components
@@ -383,23 +346,6 @@ function _append_trace_stats!(factors::Vector{Symbol}, unsupported::Vector{Unsup
         append!(unsupported, (UnsupportedDirichletDof(name, c, raw) for raw in projection.unsupported[c]))
     end
     return factors, unsupported
-end
-
-# Install the trace-solve verdicts `_append_trace_stats!` collected, over every field in field order, in a diagnostics
-# record in place, and return it so call sites can chain — the counterpart of `_set_plan_stats_multi!` for the
-# boundary-trace half of the build. The unsupported dofs are self-describing records rather than a flattened vector: the
-# list is empty on every untrimmed boundary, so there is no position worth counting from.
-#
-# Both quantities describe the boundary mass and not the datum, so a load increment restates the same answers; the two
-# events that move them are a rebuilt layout and a *first* projection, the latter being why `update_dirichlet!` calls
-# this too. A model prepared with homogeneous data has run no projection at all, and its first increment is where the
-# branch and the unsupported dofs are established.
-function _set_dirichlet_trace_stats!(diag::AssemblyDiagnostics, factors::Vector{Symbol},
-                                     unsupported::Vector{UnsupportedDirichletDof})
-    diag.dirichlet_trace_factors = factors
-    diag.unsupported_dirichlet_dofs = unsupported
-    diag.unsupported_dirichlet_dof_count = length(unsupported)
-    return diag
 end
 
 function Base.show(io::IO, diagnostics::AssemblyDiagnostics)
@@ -750,19 +696,21 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
     for key in _referenced_targets(effective_problem)
         haskey(regions, key) || (regions[key] = _resolve_target(key..., effective_problem, layout, facet_resolver))
     end
-    facet_stats = _kind_stats_of(_cached_lists(regions, BoundarySelector))
-    diag = AssemblyDiagnostics(dimension=D, active_unknowns=active_unknowns(layout),
-                               inactive_cell_counts=_inactive_cell_counts(spaces),
-                               reduced_mode_counts=_reduced_mode_counts(layout),
+    facets = _kind_stats_of(_cached_lists(regions, BoundarySelector))
+    diag = AssemblyDiagnostics(; dimension=D, active_unknowns=active_unknowns(layout),
                                facet_region_count=_region_count(regions, BoundarySelector),
-                               cut_facet_region_count=facet_stats.trimmed, facet_fit_failure_count=facet_stats.failed,
-                               facet_cut_fallback_count=facet_stats.fallbacks,
-                               facet_moment_fit_residual_max=facet_stats.residual_max,
-                               min_relative_facet_measure=facet_stats.min_relative_measure,
+                               cut_facet_region_count=facets.trimmed, facet_fit_failure_count=facets.failed,
+                               facet_cut_fallback_count=facets.fallbacks,
+                               facet_moment_fit_residual_max=facets.residual_max,
+                               min_relative_facet_measure=facets.min_relative_measure,
+                               dirichlet_trace_factors=trace_factors,
+                               unsupported_dirichlet_dof_count=length(unsupported),
+                               unsupported_dirichlet_dofs=unsupported,
                                surface_region_count=_region_count(regions, BoundaryMesh),
-                               interface_region_count=_region_count(regions, Interface))
-    _set_plan_stats_multi!(diag, [s.plan for s in subdomains])
-    _set_dirichlet_trace_stats!(diag, trace_factors, unsupported)
+                               interface_region_count=_region_count(regions, Interface),
+                               _plan_stats(s.plan for s in subdomains)...,
+                               inactive_cell_counts=_inactive_cell_counts(spaces),
+                               reduced_mode_counts=_reduced_mode_counts(layout))
     return Model{D,T,typeof(effective_problem)}(effective_problem, problem.space, _discretisation_pin(spaces, layout),
                                                 subdomains, layout, nothing, nothing, facet_resolver, regions,
                                                 Dict{Symbol,DirichletProjection{D,T}}(), diag,
@@ -794,18 +742,6 @@ function _prepare_spaces(problem::Problem{D,T}) where {D,T}
     effective = Problem(new_fields; blocks=problem.blocks, loads=problem.loads, dirichlet=problem.dirichlet,
                         symmetric=problem.symmetric)
     return effective, prepared, caches
-end
-
-# All levels across every distinct participating space, concatenated in `problem_spaces` order. Because `prepare`
-# reindexes each space's level ids into a disjoint block, the concatenation has globally-unique, contiguous ids `1:N` —
-# exactly what the assembly workspace's flat level-id banks and each field's dof layout agree on. For a single-domain
-# problem this is just the one space's levels.
-function _problem_levels(problem::Problem)
-    levels = Any[]
-    for V in problem_spaces(problem)
-        append!(levels, V.levels)
-    end
-    return levels
 end
 
 # ── Dof layouts ───────────────────────────────────────────────────────────────
@@ -927,7 +863,7 @@ system_layout(problem::Problem; kwargs...) = first(_system_layout(problem; kwarg
 
 # `system_layout`, plus the Dirichlet trace-solve verdicts of the projections it built:
 # `(layout, factors, unsupported)`, with `factors` per field per component and `unsupported` per field, component and
-# raw, in that order — which is what `diagnostics` reports and what `_set_dirichlet_trace_stats!` installs. Each
+# raw, in that order — which is what `diagnostics` reports and what the diagnostics record holds. Each
 # projection is read (`_append_trace_stats!`) as soon as its field is laid out and then dropped, so the layout is built
 # with at most one projection alive, and the model `prepare` returns keeps none of them: `model.dirichlet_projections`
 # is filled by `update_dirichlet!` alone.
@@ -1696,7 +1632,9 @@ function update_dirichlet!(model::Model{D,T}, dirichlet) where {D,T}
     # A model prepared with homogeneous data has run no trace solve, so this is where its first increment establishes
     # the branch and the unsupported dofs. Later increments restate the same two answers: both describe the boundary
     # mass, which the structural check above pins.
-    _set_dirichlet_trace_stats!(model.diagnostics, trace_factors, unsupported)
+    diag = model.diagnostics
+    diag.dirichlet_trace_factors, diag.unsupported_dirichlet_dofs = trace_factors, unsupported
+    diag.unsupported_dirichlet_dof_count = length(unsupported)
 
     # Clear cached operators. The RHS depends on the constrained values via column elimination, so the next assembly
     # must rebuild it. The matrix would technically still be valid (Dirichlet only moves entries into the RHS at
@@ -1725,6 +1663,10 @@ reproducibility-report `NamedTuple` that bundles the diagnostics with per-level 
 solution, and (optionally) the relative L² error against `exact(x)`. The result is the natural artefact to include in PR
 descriptions, paper figures, and regression tests.
 
+The report's keys are the record's fields in their declaration order (see [`AssemblyDiagnostics`](@ref)), with `levels`
+after `dimension` and `raw_dofs` — every field's raw dof slots, counted before any elimination — after
+`active_unknowns`, followed by `residual_norm` (the solution's) and `l2_error` (`nothing` without `exact`).
+
 Each `levels` entry carries `id`, `role`, `cells`, `order` (the level's nominal per-axis maximum), `order_palette` (the
 distinct per-cell orders, a one-element vector on a uniform level), `mode`, `basis`, `domain`, `nested` — whether every
 higher level's nodes coincide with this level's where the two overlap — and `raw_functions` and `active_functions`.
@@ -1749,25 +1691,13 @@ function diagnostics(model::Model{D,T}, solution; exact=nothing) where {D,T}
     # Level reports for every subdomain space, in subdomain order, which is global level-id order. Built per space
     # because nesting is a relation between the levels of one space; a coupled problem's spaces are independent stacks.
     levels = Any[_level_report(level, s.space, tol, model.dofs) for s in model.subdomains for level in s.space.levels]
-    return (; dimension=diag.dimension, levels=levels, active_unknowns=diag.active_unknowns,
-            raw_dofs=raw_dof_count(model.dofs), integration_regions=diag.integration_regions,
-            facet_region_count=diag.facet_region_count, cut_facet_region_count=diag.cut_facet_region_count,
-            facet_fit_failure_count=diag.facet_fit_failure_count,
-            facet_cut_fallback_count=diag.facet_cut_fallback_count,
-            facet_moment_fit_residual_max=diag.facet_moment_fit_residual_max,
-            min_relative_facet_measure=diag.min_relative_facet_measure,
-            dirichlet_trace_factors=diag.dirichlet_trace_factors,
-            unsupported_dirichlet_dof_count=diag.unsupported_dirichlet_dof_count,
-            unsupported_dirichlet_dofs=diag.unsupported_dirichlet_dofs, surface_region_count=diag.surface_region_count,
-            interface_region_count=diag.interface_region_count, small_overlap_count=diag.small_overlap_count,
-            small_overlaps=diag.small_overlaps, min_integration_volume=diag.min_integration_volume,
-            min_relative_integration_volume=diag.min_relative_integration_volume,
-            inactive_cell_counts=diag.inactive_cell_counts, reduced_mode_counts=diag.reduced_mode_counts,
-            cut_region_count=diag.cut_region_count, fit_failure_count=diag.fit_failure_count,
-            moment_fit_residual_max=diag.moment_fit_residual_max, cut_fallback_count=diag.cut_fallback_count,
-            cut_fallback_points=diag.cut_fallback_points, symmetry_residual=diag.symmetry_residual,
-            condition_estimate=diag.condition_estimate, scaled_condition_estimate=diag.scaled_condition_estimate,
-            solver=diag.solver, residual_norm=solution.diagnostics.residual_norm, l2_error=error,)
+    # The record's fields in declaration order, `levels` and `raw_dofs` placed after the two they describe: `merge`
+    # keeps the first argument's keys where they are and appends the rest in order.
+    record = NamedTuple{fieldnames(AssemblyDiagnostics)}(ntuple(i -> getfield(diag, i),
+                                                                Val(fieldcount(AssemblyDiagnostics))))
+    return merge((; dimension=diag.dimension, levels, active_unknowns=diag.active_unknowns,
+                  raw_dofs=raw_dof_count(model.dofs)), record,
+                 (; residual_norm=solution.diagnostics.residual_norm, l2_error=error))
 end
 
 # Compact per-level reproducibility report used inside `diagnostics(model, solution)`: enough to know which basis,
