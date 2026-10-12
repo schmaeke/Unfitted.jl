@@ -210,22 +210,31 @@ end
     # subdomain's. An overlay added to the first subdomain therefore renumbered the second, unchanged one from id 2 to
     # id 3: strict Rewire refused a target that contains the source, naming a subdomain-2 key with "no target
     # counterpart", and lax Rewire returned u₂ ≡ 0 against a source of 1. The levels of a field are paired by their
-    # position in its own space, so both modes now transfer both fields exactly.
+    # position in its own space, so both modes now transfer every field exactly — whichever way the target declares
+    # its fields, which moves the shift between the two sides' ids to either sign, and when two fields share the space
+    # the overlay is added to, which gives them one block of ids.
     base = space(box((0.0, 0.0), (1.0, 1.0)); cells=3, order=1)
     V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=3, order=1)
-    function pair(V1)
-        u1, u2 = field(:u1, V1), field(:u2, V2)
-        return prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2)))), u1, u2
+    fine = overlay(base, box((0.25, 0.25), (0.75, 0.75)); cells=2, order=1)
+    function coupled(names, spaces)
+        fields = map(field, names, spaces)
+        return prepare(Problem(fields; blocks=map(stiffness_block, fields))), fields
     end
-    source, _, _ = pair(base)
-    target, u1, u2 = pair(overlay(base, box((0.25, 0.25), (0.75, 0.75)); cells=2, order=1))
-    @test [f.level_ids for f in target.dofs.fields] == [1:2, 3:3]
-    s = Solution(ones(active_unknowns(source)), source.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
-    for strict in (true, false)
-        rewired = transfer(s, source, target; via=Rewire(; strict=strict))
-        @test value(rewired, target, u1, (0.5, 0.5)) ≈ 1.0
-        @test value(rewired, target, u2, (2.5, 0.5)) ≈ 1.0
-        @test value(rewired, target, u2, (2.95, 0.95)) ≈ 1.0
+    points = Dict(:u1 => [(0.5, 0.5), (0.3, 0.3)], :w => [(0.5, 0.5)], :u2 => [(2.5, 0.5), (2.95, 0.95)])
+    cases = [((:u1, :u2), (base, V2), (:u1, :u2), (fine, V2), [1:2, 3:3]),
+             ((:u1, :u2), (base, V2), (:u2, :u1), (V2, fine), [1:1, 2:3]),
+             ((:u1, :w, :u2), (base, base, V2), (:u1, :w, :u2), (fine, fine, V2), [1:2, 1:2, 3:3])]
+    for (source_names, source_spaces, target_names, target_spaces, target_ids) in cases
+        source, _ = coupled(source_names, source_spaces)
+        target, fields = coupled(target_names, target_spaces)
+        @test [f.level_ids for f in target.dofs.fields] == target_ids
+        s = Solution(ones(active_unknowns(source)), source.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
+        for strict in (true, false)
+            rewired = transfer(s, source, target; via=Rewire(; strict=strict))
+            for f in fields, x in points[f.name]
+                @test value(rewired, target, f, x) ≈ 1.0
+            end
+        end
     end
 end
 
