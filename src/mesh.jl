@@ -25,18 +25,20 @@ end
 # `D`-tuple of integers (one per axis). The fallback method gives a clear error for any other input shape. `name` is
 # the user-visible parameter name used in error messages (`:cells`, `:order`, `:by`), and `min` the smallest admissible
 # entry: 1 for counts and orders, 0 for a dilation width, where zero is the sensible request to leave an axis alone.
+# Every refusal names what it was given — an out-of-range integer or tuple by its value, any other spelling by its type
+# — so a call that passes several of these specifications says which one was wrong.
 function _axis_int_tuple(n::Integer, ::Val{D}, name::Symbol; min::Int=1) where {D}
-    n >= min || throw(ArgumentError("$name entries must be $(_sign_word(min))"))
+    n >= min || throw(ArgumentError("$name entries must be $(_sign_word(min)); got $n"))
     return ntuple(_ -> Int(n), D)
 end
 
 function _axis_int_tuple(t::NTuple{D,<:Integer}, ::Val{D}, name::Symbol; min::Int=1) where {D}
-    all(>=(min), t) || throw(ArgumentError("$name entries must be $(_sign_word(min))"))
+    all(>=(min), t) || throw(ArgumentError("$name entries must be $(_sign_word(min)); got $t"))
     return Int.(t)
 end
 
 function _axis_int_tuple(spec, ::Val{D}, name::Symbol; min::Int=1) where {D}
-    throw(ArgumentError("$name must be a $(_sign_word(min)) integer or an NTuple{$D,Int}"))
+    throw(ArgumentError("$name must be a $(_sign_word(min)) integer or an NTuple{$D,Int}; got $(typeof(spec))"))
 end
 
 # The refusals' word for the bound, so the messages for counts and orders read as they always have.

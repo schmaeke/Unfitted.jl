@@ -55,6 +55,20 @@ end
     @test mesh(box((0 // 1,), (1 // 1,)); cells=3).axes[1] == [0, 1 // 3, 2 // 3, 1]
 end
 
+@testset "a cell count, order or dilation width refusal names what it was given" begin
+    # `cells`, `order` and `dilate`'s `by` share one per-axis normaliser and so its refusals, and each says what it was
+    # handed: an out-of-range integer or tuple by its value, any other spelling by its type.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    V = space(Ω; cells=4)
+    @test_throws "cells entries must be positive; got 0" mesh(Ω; cells=0)
+    @test_throws "cells entries must be positive; got (2, 0)" space(Ω; cells=(2, 0))
+    @test_throws "got Tuple{Int64}" mesh(Ω; cells=(2,))
+    @test_throws "order entries must be positive; got (1, 0)" space(Ω; cells=2, order=(1, 0))
+    @test_throws "by entries must be non-negative; got -1" dilate(V, [CartesianIndex(1, 1)]; level=1, by=-1)
+    @test_throws "by entries must be non-negative; got (1, -1)" dilate(trues(4, 4), (1, -1))
+    @test_throws "got Float64" dilate(V, [CartesianIndex(1, 1)]; level=1, by=1.5)
+end
+
 @testset "moved_space names an out-of-range level index" begin
     # A level past the last one is an index error, not the base level: the message must say so, as every other entry
     # point that takes a level index does. The base level itself keeps its own refusal.
