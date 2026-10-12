@@ -8,6 +8,8 @@
 
 using BasicBSpline
 using LinearAlgebra
+using Random
+using SparseArrays
 
 const LADDER_OMEGA = box((0.0, 0.0), (1.0, 1.0))
 ladder_bc() = [dirichlet(0.0; on=boundary(:all))]
@@ -44,6 +46,25 @@ end
     @test [l.mesh.cells for l in b.levels] == [(6, 6), (12, 12), (36, 12)]
     @test is_nested(a) && is_nested(b)
     @test_throws ArgumentError ladder(LADDER_OMEGA; cells=6, depth=3, splits=[2, 2])
+end
+
+@testset "a per-cell order reaches every overlay through its base parent" begin
+    # A per-cell `order` is shaped like the base grid. Passed to the overlays unchanged it raised a DimensionMismatch
+    # against their finer grids; every overlay cell now takes its base parent's order, scalar or per axis, over
+    # anisotropic per-level splits.
+    for o in ([1 + (i + 2j) % 3 for i in 1:4, j in 1:3], [(1 + i % 2, 1 + j % 3) for i in 1:4, j in 1:3])
+        V = ladder(LADDER_OMEGA; cells=(4, 3), depth=2, splits=[(2, 3), (3, 1)], order=o)
+        @test cell_orders(V; level=1) == [p isa Int ? (p, p) : p for p in o]
+        inherits = true
+        for k in 2:3, c in cell_indices(V; level=k)
+            inherits &= cell_order(V, c; level=k) == cell_order(V, only(Unfitted._cell_block(V, k, 1, c)); level=1)
+        end
+        @test inherits
+        # The same order an h-step gives the children it wakes, so refining writes nothing new.
+        W = refine(V; h=[(1, CartesianIndex(2, 2))])
+        @test count(active_cells(W; level=2)) == 6
+        @test cell_orders(W; level=2) == cell_orders(V; level=2)
+    end
 end
 
 @testset "covered-mode pruning on a ladder is lossless" begin
@@ -167,10 +188,11 @@ end
 end
 
 @testset "levels share their node coordinates on a non-dyadic domain" begin
-    # The cross-level map compares node coordinates with no tolerance, so a ladder is only nested if its levels share
-    # their nodes bit for bit. On an extent that is not a power of two they did not: `_mesh_axes` scaled before
-    # dividing, so each level rounded a different product, and on [0, 0.7] in three cells refined by three the base axis
-    # ended one ulp short of 0.7 and its cells claimed 4, 4 and 3 fine cells instead of 3 each.
+    # A ladder's levels must share their nodes bit for bit, so that the cross-level map is exact without leaning on its
+    # few-ulp rounding margin. On an extent that is not a power of two they did not: `_mesh_axes` scaled before
+    # dividing, so each level rounded a different product, and on [0, 0.7] in three cells refined by three the base
+    # axis ended one ulp short of 0.7; read with an exact map, its cells claimed 4, 4 and 3 fine cells instead of 3
+    # each. The axes' equality asserted below, here and in `nests_exactly`, is the guard.
     V = ladder(box((0.0,), (0.7,)); cells=3, depth=1, splits=3)
     @test V.levels[1].mesh.axes[1][end] == 0.7
     @test [Unfitted._cell_block(V, 1, 2, CartesianIndex(i)) for i in 1:3] ==
@@ -296,6 +318,35 @@ end
     @test empties > 0                                       # the sub-box cases really occur
 end
 
+@testset "a face missed by an ulp is not an overlap" begin
+    # A sub-box overlay computes its nodes from its own corners, so a node meant to sit on a coarser level's face can
+    # miss it by an ulp: here the overlay's eighth node is 0.39999999999999997 where the base face is 0.4. Read exactly,
+    # that 5.6e-17 sliver made overlay cell 8 a child of base cell 2, and an h-step there woke 4..8.
+    V = overlay(space(box((0.0,), (1.0,)); cells=5, order=2), box((0.05,), (0.55,)); cells=10, active=falses(10))
+    @test findall(active_cells(refine(V; h=[(1, CartesianIndex(2))]); level=2)) == 4:7
+    @test findall(overlapping_cells(V, [CartesianIndex(2)]; from=1, to=2)) == 4:7
+    @test findall(overlapping_cells(V, [CartesianIndex(8)]; from=2, to=1)) == [3]
+
+    # Over sub-box overlays whose nodes refine the base's, in both directions: no block claims a cell it overlaps by at
+    # most 1e-12 of a cell, and none misses one it overlaps by more than 1e-9 of a cell.
+    slivers, missed = 0, 0
+    for nb in (5, 7, 10), a in 0:(nb-1), b in (a+1):nb, s in 1:3
+        V = overlay(space(box((0.0,), (1.0,)); cells=nb, order=2), box((a / nb,), (b / nb,)); cells=(b - a) * s)
+        for (from, to) in ((1, 2), (2, 1)), c in cell_indices(V; level=from)
+            x, y = V.levels[from].mesh.axes[1], V.levels[to].mesh.axes[1]
+            block = Unfitted._cell_block(V, from, to, c).indices[1]
+            for j in 1:(length(y)-1)
+                overlap = min(x[c[1] + 1], y[j + 1]) - max(x[c[1]], y[j])
+                h = min(x[c[1] + 1] - x[c[1]], y[j + 1] - y[j])
+                slivers += (j in block) && overlap <= 1e-12 * h
+                missed += !(j in block) && overlap > 1e-9 * h
+            end
+        end
+    end
+    @test slivers == 0
+    @test missed == 0
+end
+
 @testset "depth_masks and grading" begin
     V = ladder(LADDER_OMEGA; cells=8, order=2, depth=3, splits=2)
     d = zeros(Int, 8, 8)
@@ -312,6 +363,39 @@ end
     far[8, 8] = 3
     @test count(active_cells(adapt(V, near; grade=1); level=2)) == count(active_cells(adapt(V, far; grade=1); level=2))
     @test_throws ArgumentError adapt(V, d; grade=-1)
+end
+
+@testset "graded depth maps equal the brute-force maximum" begin
+    # A positive grade raises every base cell to g(c) = max over x of (d(x) − grade·‖c − x‖_∞), and grade 0 is off.
+    # `depth_masks` never forms g: it builds the threshold sets {g ≥ t} top-down by dilation, which rests on a proof in
+    # its comment. Check it against g itself, cell by cell, on random sparse and dense depth maps in 1D, 2D and 3D.
+    rng = MersenneTwister(20261012)
+    agrees, raised = true, 0
+    for (dom, cells, depth) in ((box((0.0,), (1.0,)), (9,), 4), (LADDER_OMEGA, (6, 5), 4),
+                                (box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)), (4, 3, 4), 3))
+        V = ladder(dom; cells=cells, depth=depth, splits=2)
+        for grade in 0:3, density in (0.15, 0.6)
+            d = [rand(rng) < density ? rand(rng, 1:depth) : 0 for _ in CartesianIndices(cells)]
+            g = grade == 0 ? d :
+                [maximum(d[x] - grade * maximum(abs.(Tuple(c - x))) for x in CartesianIndices(d))
+                 for c in CartesianIndices(d)]
+            raised += g != d
+            agrees &= Unfitted.depth_masks(V, d; grade=grade) ==
+                      [k => overlapping_cells(V, g .>= k - 1; from=1, to=k) for k in 2:(depth+1)]
+        end
+    end
+    @test agrees
+    @test raised >= 9                                       # grading moved at least half of the 18 graded maps
+
+    # Any integer array of the base grid's shape is a depth map, not only a dense one: a mostly-zero map is naturally
+    # sparse. Grading once failed on it, because the threshold sets kept the sparse container and the dilation takes
+    # only a `BitArray`.
+    V = ladder(LADDER_OMEGA; cells=8, order=2, depth=3, splits=2)
+    d = spzeros(Int, 8, 8)
+    d[4, 4] = 3
+    @test all(grade -> Unfitted.depth_masks(V, d; grade=grade) == Unfitted.depth_masks(V, Matrix(d); grade=grade), 0:2)
+    @test all(k -> active_cells(adapt(V, d; grade=1); level=k) == active_cells(adapt(V, Matrix(d); grade=1); level=k),
+              1:4)
 end
 
 @testset "adapt takes a depth map in 1D" begin
@@ -465,6 +549,32 @@ end
     fits[] = 0
     estimate(model, u)
     @test fits[] == 0                                  # ... as is the next estimate
+end
+
+@testset "estimate with a refinement twin leaves the source's cut rules in place" begin
+    # A B-spline level is enriched by a refined twin rather than by an order raise, and the twin refines the integration
+    # partition wherever it is live, so the enriched model cuts none of the source's boxes there. Building its plan on
+    # the source's own cache evicted every rule the source held, and the `adapted` after an `estimate` refitted all 44
+    # of them. The enriched model now fits into a copy whose rules are merged back, so the source keeps its own rules
+    # and gains the twin's, and both the step after the estimate and a second estimate are as warm as in the Legendre
+    # case above.
+    fits = Ref(0)
+    disc = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.7; subcell_length_scale=0.25,
+                           cut_quadrature=counting_cut_rule(fits))
+    V = ladder(box((-1.0, -1.0), (1.0, 1.0)); cells=8, order=2, depth=1, physical=disc, basis=bspline())
+    model = prepare(mass(adapt(V, 2 => trues(16, 16))))
+    held = collect(keys(only(model.moment_fit_caches)))
+    u = solve!(model)
+    fits[] = 0
+    estimate(model, u)
+    @test fits[] > 0                                   # the twin's boxes are new
+    @test all(key -> haskey(only(model.moment_fit_caches), key), held)
+    fits[] = 0
+    adapted(model, 2 => trues(16, 16))
+    @test fits[] == 0                                  # ... the step after it is warm
+    fits[] = 0
+    estimate(model, u)
+    @test fits[] == 0                                  # ... and so is the next estimate
 end
 
 @testset "moved reuses the source's cut rules" begin

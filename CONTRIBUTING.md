@@ -833,9 +833,13 @@ the loop, and nothing in `src/adaptivity.jl` holds state between cycles.
     nothing, the two spline spaces nest because the factor is an integer, so
     `V⁺ ⊇ V` and the injection is exact. The twin's per-cell indicators are
     charged back to the cells of the level it enriches, so the estimate is always
-    indexed by the caller's own levels. It is built with leaf semantics off,
-    because a nested same-degree cover would otherwise deduplicate the very keys
-    the injection looks for.
+    indexed by the caller's own levels. The level a twin enriches is built with
+    leaf semantics off, for that level alone, because a nested same-degree cover
+    would otherwise deduplicate the very keys the injection looks for. The twin
+    is placed above every level, so where it is live over a higher level that
+    carries a per-cell order, that level sheds modes in `V⁺` that are free in
+    `V`; `V⁺` then does not contain `V`, and `estimate` refuses the stack. Put
+    B-spline levels above integrated-Legendre ones.
 
     > R. E. Bank, A. Weiser, *Some a posteriori error estimators for elliptic
     > partial differential equations*, Math. Comp. **44** (1985) 283–301.
@@ -887,12 +891,14 @@ the loop, and nothing in `src/adaptivity.jl` holds state between cycles.
     indicator — so the caller marks.
 
 The loop's restrictions, all of them checked rather than assumed: a
-single-domain model; every level on a family declaring `_supports_cell_order`,
-because the decision and the enrichment both rest on a per-cell order; a
-coercive form; an assembled model; `enrichment ≥ 1`; and no form keyed by
-quadrature-point index, which the enriched twin would read on a different
-cloud. On an immersed model the h-step has no state transfer — see *Moving
-overlays and state transfer*.
+single-domain, single-field model (the field may carry any number of
+components); an assembled model, and a solution of that model as it stands;
+`enrichment ≥ 1`; a coercive form; no form keyed by quadrature-point index,
+which the enriched model would read on a different cloud; and `V⁺ ⊇ V`, so a
+B-spline level under an integrated-Legendre level is refused. A per-cell order
+(`_supports_cell_order`) is needed by the p-step alone: a level without one
+takes h, and is enriched by superposition. On an immersed model the h-step has
+no state transfer — see *Moving overlays and state transfer*.
 
 ### Immersed boundary (finite cell method)
 

@@ -470,7 +470,7 @@ function _region_list(@nospecialize(model::Model), @nospecialize(target), @nospe
         list === nothing || return list
         regions, owned = _regions(model, target, space)
         isempty(cache.workspaces) && push!(cache.workspaces, _assembly_workspace(model))
-        list = RegionList(regions, last(cache.workspaces))
+        list = RegionList(regions, last(cache.workspaces), cache.point_base)
         entry = (target, space) => list
         owned ? push!(cache.lists, entry) : _lru_push!(cache.oneshot, entry, 8)
         return list
@@ -478,14 +478,15 @@ function _region_list(@nospecialize(model::Model), @nospecialize(target), @nospe
 end
 
 # A region list with its `q.point` offsets and the active dofs of every region (see `RegionDofs`), all derived once,
-# when the list is resolved. The dofs come from the numeric pass's own `_frame!` and `_slots!`, run on the workspace
-# `ws`, so the pattern and the threaded arena layout describe exactly the dofs the kernel emits: active ids and the
-# active branches of every pivot, never a constrained id. A plain loop rather than `cumsum` over a `map`, which cost
-# 30–40 ms of first-call compile per region kind.
-function RegionList(regions::Vector{R}, ws) where {R}
+# when the list is resolved. The offsets count up from the model's point base `base` (see `AssemblyCache`), so the
+# list's points are `base .+ (1:n)`. The dofs come from the numeric pass's own `_frame!` and `_slots!`, run on the
+# workspace `ws`, so the pattern and the threaded arena layout describe exactly the dofs the kernel emits: active ids
+# and the active branches of every pivot, never a constrained id. A plain loop rather than `cumsum` over a `map`, which
+# cost 30–40 ms of first-call compile per region kind.
+function RegionList(regions::Vector{R}, ws, base::Int=0) where {R}
     offsets = Vector{Int}(undef, length(regions) + 1)
     ptr = Vector{Int}(undef, length(regions) + 1)
-    offsets[1], ptr[1] = 0, 1
+    offsets[1], ptr[1] = base, 1
     val = Int[]
     for (r, region) in pairs(regions)
         offsets[r+1] = offsets[r] + _region_qpoint_count(region)
@@ -495,6 +496,9 @@ function RegionList(regions::Vector{R}, ws) where {R}
     end
     return RegionList{R}(regions, offsets, RegionDofs(ptr, val))
 end
+
+# The number of quadrature points of a list: the span of its offsets, whatever point base they count up from.
+_point_count(list::RegionList) = list.offsets[end] - list.offsets[1]
 
 # The regions of pass target `target` on `space`, and whether they are the model's own prepare-time list (`true`) or
 # were resolved just now for a target `prepare` never saw (`false`). The miss paths are the builders `prepare` runs.
@@ -1453,7 +1457,7 @@ reject a coupled model for that reason.
 """
 function nquadpoints(model::Model; kind::Symbol=:volume, on=nothing, field::Union{Nothing,Symbol}=nothing)::Int
     (on === nothing && field === nothing) ||
-        return _region_list(model, on, _target_space(model, on, field)).offsets[end]
+        return _point_count(_region_list(model, on, _target_space(model, on, field)))
     # The aggregate sums over one of four iterator types, which inference does not follow; the declared `::Int` is what
     # keeps a caller that sizes a loop by the count type-stable (the `RBFP0` transfer's serial loop allocated per
     # point).

@@ -11,8 +11,8 @@
 #   * [`Rewire`](@ref) — direct raw-key coefficient matching. Each active target dof whose `TensorDofKey` matches a
 #     source dof inherits the source's value of that dof — its coefficient when the source leaves it free, its
 #     constrained value or pivot reconstruction when the source constrains it — and genuinely new dofs start at zero.
-#     Lossless when the target's active basis contains the source's — typically after a monotone `activate!` — and
-#     avoids the projection cost / smoothing in that case.
+#     Lossless when the target's active basis contains the source's and the two models constrain the dofs they share
+#     to the same values — typically after a monotone `activate!` — and avoids the projection cost / smoothing there.
 
 # ── Backends ──────────────────────────────────────────────────────────────────
 
@@ -53,15 +53,21 @@ The cached-matrix shortcut requires the target to be homogeneously constrained: 
 column-elimination lift, so a target with non-homogeneous physical Dirichlet data is rejected (use the default
 `L2Projection()` there, which assembles the lift).
 
+Matching the cached matrix to the target is the caller's responsibility: it must be the mass matrix of `target_model`
+itself, or of a model of the same discretisation. Nothing checks this beyond the solve's dimensions, so a matrix of the
+right size assembled on another target is accepted and gives a wrong projection without a diagnostic.
+
 A target whose [`Space`](@ref) carries a [`PhysicalDomain`](@ref) is rejected with an `ArgumentError` as well: the
 target mass restricts to `Ω` through the cut-cell rules while the source-driven rhs integrates over the full mesh boxes
 of the union partition, so the two halves of the system would disagree about the domain. Making the union partition
 FCM-aware is separate work.
 
-This backend is single-domain only, and nothing checks it: the union partition is built from `problem.space`, the
+This backend is single-domain only: a source or a target with more than one subdomain space (a coupled
+[`Problem`](@ref)) is rejected with an `ArgumentError`. The union partition is built from `problem.space`, the
 representative (first field's) space, while the rhs pass walks every field, so on a coupled model the fields of the
-other subdomains are integrated against subdomain 1's cells and the run fails inside the dof lookup rather than with a
-diagnostic. Use [`Rewire`](@ref) there. Several fields sharing *one* space are fine.
+other subdomains would find no target cell to integrate against — two subdomains carrying u₁ = u₂ = 1 came back with
+u₂ ≡ 0 and a solver residual of 4e-17, wrong and silent. Use [`Rewire`](@ref) there. Several fields sharing *one* space
+are fine.
 """
 struct L2Projection{M,F} <: TransferBackend
     matrix::M
@@ -79,7 +85,9 @@ end
 
 Raw-key coefficient mapping backend. For each (raw, component) of every source field:
 
-  1. Look up the source's `TensorDofKey` in the target field's `raw_keys` table.
+  1. Look up the source's `TensorDofKey` in the target field's `raw_keys` table, pairing the two fields' levels by their
+     position in the field's own space: a coupled model numbers each subdomain's levels after the previous
+     subdomain's, so a level added to one subdomain renumbers the next one's without changing its functions.
   2. If a target raw matches and is active on the target, write the source field's value of that dof into the target's
      active slot: the source coefficient when the dof is free on the source, and otherwise the value the source field
      carries for it — its constrained value (the projected datum of a nonzero Dirichlet condition, zero for an
@@ -89,8 +97,13 @@ Raw-key coefficient mapping backend. For each (raw, component) of every source f
      (strict mode) or skip it silently (`strict = false`). A dof the source constrains is never an error: without an
      active target counterpart it is skipped.
 
-Reconstructs the source field pointwise when the target's active basis *contains* the source's. The values are not
-modified, so the reconstruction is exact, and the smoothing of the L² backend is avoided.
+Reconstructs the source field pointwise when the target's active basis *contains* the source's and the two models
+constrain the dofs they share to the same values. The values are not modified, so the reconstruction is then exact,
+and the smoothing of the L² backend is avoided. The second condition concerns the target's own constrained values,
+which this backend never writes: a target that projects nonzero Dirichlet data afresh holds the dofs it constrains at
+its own projection of the datum, which need not equal the source's. Raising the order of boundary cells does this
+while keeping every source key active, and the transferred field then differs from the source by the difference of the
+two projections: a relative deviation of 3.6e-5 when the base of a 3D ladder goes from order 2 to 3.
 
 A moved overlay ([`moved`](@ref) / [`move!`](@ref)) does not satisfy containment either, and in the way that is hardest
 to notice: the keys survive the move unchanged but name functions at the new position, so every lookup succeeds and the
@@ -131,10 +144,20 @@ given one — see that method for the quadrature-point schemes.
 the target dof layout's stored tolerance and is ignored by strategies that do not walk the geometry (currently
 [`Rewire`](@ref)).
 
-The two backends do not cover the same cases. [`L2Projection`](@ref) walks the geometry of both models, rejects a target
-carrying a [`PhysicalDomain`](@ref), and is single-domain only. [`Rewire`](@ref) reads only raw dof keys, so it also
-serves coupled models, but it reproduces the source exactly only when the target's active basis contains it. Either way
-the two models must agree on the space bounding box, the field names, and the per-field component counts.
+The two backends do not cover the same cases. Both pair the fields by name, and both require of every field, read on
+its own space, the same bounding box and the same component count on the two sides; the two models carry the same
+number of fields. Beyond that:
+
+| case                                                       | [`L2Projection`](@ref)    | [`Rewire`](@ref)            |
+|:-----------------------------------------------------------|:--------------------------|:----------------------------|
+| reproduces the source exactly when                         | target space ⊇ the field  | target basis ⊇ source's (¹) |
+| a level re-meshed or moved, or a B-spline degree changed   | projects                  | raises                      |
+| a source dof the target eliminates (refinement buries it)  | projects                  | raises; lax mode drops it   |
+| a target carrying a [`PhysicalDomain`](@ref)               | raises                    | serves                      |
+| a multi-domain (coupled) source or target                  | raises                    | serves                      |
+| `L2Projection(matrix)` onto nonzero Dirichlet data         | raises                    | —                           |
+
+(¹) and both models constrain the dofs they share to the same values; see [`Rewire`](@ref).
 """
 function transfer(source_solution::Solution, source_model::Model{D,T}, target_model::Model{D,T};
                   via::TransferBackend=L2Projection(), tolerance=target_model.dofs.tolerance) where {D,T}
@@ -153,6 +176,99 @@ function transfer(::Solution, ::Model; kwargs...)
                         "call transfer(solution, source_model, target_model)"))
 end
 
+# ── Refusals ──────────────────────────────────────────────────────────────────
+
+# The one list of what a `Solution` transfer refuses, checked before either backend reads a coefficient or builds a
+# region, so a mismatch surfaces as a named `ArgumentError` rather than as wrong numbers downstream.
+#
+# Every backend pairs the fields by name and reads each on its OWN space (`_field_space`), never through the
+# representative `problem.space`, which on a coupled problem is the first subdomain's alone. The two models carry the
+# same number of fields, and per field the target carries it (`_field_space` raises on a name it lacks), over the same
+# bounding box (`Space.domain`; the immersed `Space.physical` is not compared), with the same component count. Rewire
+# also needs each pair's levels to name the same functions by key (`_assert_keys_comparable`).
+#
+# `L2Projection` adds three refusals of its own:
+#
+#   * a multi-domain model on either side: its union partition reads one space, `problem.space`, so a second
+#     subdomain's fields would find no target cell to deposit their load on and come back as zero;
+#   * a cached mass on a target with a nonzero constrained value: the cached path omits the Dirichlet column-elimination
+#     lift `−M_ac·c_c`, which is nonzero exactly there (artificial overlay constraints are always homogeneous);
+#   * a target carrying a `physical_domain`: the target mass restricts to Ω through the FCM cut rules, while the
+#     source-driven rhs integrates over the full mesh boxes of the union partition (FCM-blind), so the two halves of the
+#     system would disagree about the domain. Making the union partition FCM-aware is a separate follow-up.
+#
+# The function specialises on the backend type, so the backend tests fold at compile time.
+function _check_transfer(source::Model, target::Model, backend::TransferBackend)
+    length(source.dofs.fields) == length(target.dofs.fields) ||
+        throw(ArgumentError("source and target models must have the same fields"))
+    for field in source.dofs.fields
+        a, b = _field_space(source.problem, field.name), _field_space(target.problem, field.name)
+        a.domain == b.domain || throw(ArgumentError("source and target models must have the same physical domain"))
+        field.components == _field_layout(target.dofs, field.name).components ||
+            throw(ArgumentError("source and target field $(field.name) have different component counts"))
+        backend isa Rewire && _assert_keys_comparable(a, b)
+    end
+    backend isa L2Projection || return nothing
+    _assert_single_domain(source, "L2Projection")
+    _assert_single_domain(target, "L2Projection")
+    (backend.matrix === nothing || !any(f -> any(!iszero, f.dofs.constrained_values), target.dofs.fields)) ||
+        throw(ArgumentError("L2Projection(matrix): the cached mass omits the Dirichlet lift, so " *
+                            "it cannot transfer onto a target with non-homogeneous Dirichlet " *
+                            "data. Use the default L2Projection() (no cached matrix) here."))
+    target.problem.space.physical === nothing ||
+        throw(ArgumentError("L2 transfer onto a target with an immersed physical_domain is not yet " *
+                            "supported: the target mass restricts to Ω but the source-driven rhs " *
+                            "integrates over full mesh boxes, so the two are inconsistent."))
+    return nothing
+end
+
+# `Rewire` matches source to target by `TensorDofKey` equality, which is only sound while the same key names the same
+# function on both sides. That is a property of the basis family, and the two shipped families differ on it.
+#
+# An integrated-Legendre key indexes a mode by its DEGREE, and mode 3 is the same function at order 4 and at order 7, so
+# a pure order elevation rewires exactly — measured, order 3 → 4 on 8² transfers with 0.000e+00 error. A B-spline key
+# indexes a global 1D function over the whole axis (`_AXIS_BSPLINE`), and raising the degree rewrites the knot vector,
+# so index *i* at degree 3 and index *i* at degree 4 are simply different functions. The keys still compare equal, the
+# lookup still succeeds, and the coefficients land on the wrong basis: measured, the same order 3 → 4 transfer
+# "succeeded" with no raise and a relative error of 1.80e-1. `strict = true` did not catch it, because it tests key
+# PRESENCE while the docstring promises span containment.
+#
+# The test is family-generic rather than a B-spline special case: the degree lives in `BSplineFamily`'s type (its spaces
+# are `BSplineSpace{p}`), while `IntegratedLegendre` is one type for every order. So comparing the instantiated basis
+# TYPE admits exactly the rewires that are sound and rejects the rest, and a future family inherits the right behaviour
+# by construction. The mesh is compared for the same reason: a key indexes into a mesh, and two meshes of different size
+# *or position* do not share an indexing. Position is the half a cell-count test alone misses — `moved` and `move!` keep
+# every key and move the function it names, so a displaced overlay matches key for key and lands the source's
+# coefficients on functions somewhere else. Measured with the guard stubbed out, on a 2D Poisson base 8² p=3 carrying a
+# 4×4 overlay displaced by half a fine cell: `strict = true` raised nothing and the transferred field deviated by up to
+# 4.3e-2 from the source, against a solution whose own magnitude is 7.4e-2 — a 58% error, silently.
+#
+# `domain` and `cells` settle it between them: a `CartesianMesh`'s `axes` are derived from exactly those two by
+# `_mesh_axes` (mesh.jl), and `AxisBox` equality is corner-wise and bit-exact for meshes built that way.
+#
+# The two spaces compared are one field's own, on either side, and `_check_transfer` passes every field's pair.
+# Comparing `problem.space` alone covers only the first subdomain of a coupled model: re-meshing the second from 3² to
+# 4² cells kept every source key present in the target, so strict Rewire raised nothing and returned u₂ = 0.04 at a
+# point where the source was 1.0.
+function _assert_keys_comparable(src::Space, tgt::Space)
+    for k in 1:min(length(src.levels), length(tgt.levels))
+        a, b = src.levels[k], tgt.levels[k]
+        typeof(a.basis) === typeof(b.basis) ||
+            throw(ArgumentError("Rewire: level $k carries $(basis_name(a.basis)) at order " *
+                                "$(nominal_order(a)) on the source and $(basis_name(b.basis)) at order " *
+                                "$(nominal_order(b)) on the target, and those name different function sets, so a " *
+                                "dof key does not name the same function on both sides — raising a B-spline degree " *
+                                "rewrites the knot vector and does exactly this. Use `L2Projection()` instead."))
+        (a.mesh.cells == b.mesh.cells && a.mesh.domain == b.mesh.domain) ||
+            throw(ArgumentError("Rewire: level $k is meshed as $(a.mesh.cells) cells over $(a.mesh.domain) on the " *
+                                "source and $(b.mesh.cells) cells over $(b.mesh.domain) on the target; a dof key " *
+                                "indexes into a mesh, so the same key names a function of a different size or at a " *
+                                "different position on the two sides and they are not comparable. Use " *
+                                "`L2Projection()` instead."))
+    end
+    return nothing
+end
+
 # ── L² projection ─────────────────────────────────────────────────────────────
 
 # `L2Projection` implementation. The target-side mass matrix `M_T` and its Dirichlet column-elimination lift `−M_ac·c_c`
@@ -162,47 +278,24 @@ end
 # over the union partition, added onto the lift, and the system is solved sparse-direct.
 #
 # The cached-matrix backend (`M ≠ Nothing`) reuses `backend.matrix` and omits the lift, which vanishes only for a
-# homogeneously-constrained target — so a non-homogeneous target is rejected there (the default `L2Projection()`
-# re-assembles the mass and applies the lift correctly). The branch on `M === Nothing` tests a type parameter, so it
-# folds at compile time; a supplied `backend.factor` short-circuits the factorisation.
+# homogeneously-constrained target — `_check_transfer` rejects any other (the default `L2Projection()` re-assembles the
+# mass and applies the lift correctly). The branch on `M === Nothing` tests a type parameter, so it folds at compile
+# time; a supplied `backend.factor` short-circuits the factorisation.
 function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_model::Model{D,T},
                     backend::L2Projection{M,F}, tolerance) where {D,T,M,F}
-    _assert_transfer_compatible(source_model, target_model)
-    if M !== Nothing && _has_nonhomogeneous_constraints(target_model.dofs)
-        throw(ArgumentError("L2Projection(matrix): the cached mass omits the Dirichlet lift, so " *
-                            "it cannot transfer onto a target with non-homogeneous Dirichlet " *
-                            "data. Use the default L2Projection() (no cached matrix) here."))
-    end
-    # The default path takes the target mass from the standard assembler, which restricts to the immersed Ω via the FCM
-    # cut rules, while the source-driven rhs below is assembled over the full mesh boxes of the union partition
-    # (FCM-blind). For a target carrying a `physical_domain` those two are inconsistent, so reject it rather than return
-    # a silently wrong projection. Making the transfer union partition FCM-aware (both mass and rhs restricted to Ω) is
-    # a separate follow-up.
-    if target_model.problem.space.physical !== nothing
-        throw(ArgumentError("L2 transfer onto a target with an immersed physical_domain is not yet " *
-                            "supported: the target mass restricts to Ω but the source-driven rhs " *
-                            "integrates over full mesh boxes, so the two are inconsistent."))
-    end
+    _check_transfer(source_model, target_model, backend)
     source_coefficients = _checked_coefficients(source_solution, source_model)
-
     nactive = active_unknowns(target_model.dofs)
-    if nactive == 0
-        return Solution(T[], target_model.version, SolverDiagnostics(:l2_projection, 0.0, true))
-    end
+    nactive == 0 && return Solution(T[], target_model.version, SolverDiagnostics(:l2_projection, 0.0, true))
 
     # Target mass + Dirichlet lift. Default path: assemble both from the standard assembler over the target's own
     # regions in one pass (the bilinear pass shifts constrained trial columns onto the returned rhs, which is the lift
-    # since there is no source load). Cached path: reuse `backend.matrix` with a zero lift (homogeneous target, guarded
-    # above).
-    if M === Nothing
-        # The mass pattern joins the target's pattern cache, which keeps the four most recently used ones, beside the
-        # problem's own pattern rather than in place of it; on a symmetric volume-only problem the problem's operator
-        # and the mass integrate over the same pass, and the two share one pattern.
-        mass, rhs = assemble(target_model, map(mass_block, target_model.problem.fields), ())
-    else
-        mass = backend.matrix
-        rhs = zeros(T, nactive)
-    end
+    # since there is no source load). The mass pattern joins the target's pattern cache, which keeps the four most
+    # recently used ones, beside the problem's own pattern rather than in place of it; on a symmetric volume-only
+    # problem the problem's operator and the mass integrate over the same pass, and the two share one pattern. Cached
+    # path: reuse `backend.matrix` with a zero lift (homogeneous target, guarded above).
+    mass, rhs = M === Nothing ? assemble(target_model, map(mass_block, target_model.problem.fields), ()) :
+                (backend.matrix, zeros(T, nactive))
 
     # Source-driven rhs over the source/target union partition, accumulated onto the lift already in `rhs`.
     regions = _transfer_regions(source_model, target_model; tolerance=tolerance)
@@ -211,31 +304,6 @@ function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_
     coefficients = F === Nothing ? mass \ rhs : backend.factor \ rhs
     residual = norm(mass * coefficients - rhs)
     return Solution(coefficients, target_model.version, SolverDiagnostics(:l2_projection, Float64(residual), true))
-end
-
-# Sanity-check the source / target compatibility for a transfer: the same space bounding box (`Space.domain`; the
-# immersed `Space.physical` is not compared here), the same number of fields, and the same field names with the same
-# per-field component counts. The name check is implicit in `_field_layout`, which raises on a source field the target
-# does not carry. Lets backends fail early with a clear message instead of producing wrong numbers downstream. On a
-# coupled model `problem.space` is the *representative* (first field's) space, so only that subdomain's box is compared.
-function _assert_transfer_compatible(source_model::Model{D,T}, target_model::Model{D,T}) where {D,T}
-    source_model.problem.space.domain == target_model.problem.space.domain ||
-        throw(ArgumentError("source and target models must have the same physical domain"))
-    length(source_model.dofs.fields) == length(target_model.dofs.fields) ||
-        throw(ArgumentError("source and target models must have the same fields"))
-    for source_field in source_model.dofs.fields
-        target_field = _field_layout(target_model.dofs, source_field.name)
-        source_field.components == target_field.components ||
-            throw(ArgumentError("source and target field $(source_field.name) have different component counts"))
-    end
-    return nothing
-end
-
-# True when any field of `layout` carries a nonzero constrained value, i.e. non-homogeneous physical Dirichlet data.
-# Artificial overlay constraints are always homogeneous (value 0), so this flags exactly the case where the Dirichlet
-# column-elimination lift `−M_ac·c_c` is nonzero — the term the cached-matrix transfer path omits.
-function _has_nonhomogeneous_constraints(layout::SystemLayout)
-    return any(field -> any(!iszero, field.dofs.constrained_values), layout.fields)
 end
 
 # Build the L² transfer's region list on the admissible-box partition engine (`_partition` in `intersections.jl`), fed
@@ -361,92 +429,40 @@ function _transfer!(source_solution::Solution, source_model::Model{D,T}, target_
                     _tolerance) where {D,T}
     # Rewire walks raw `TensorDofKey`s, never the geometry — the geometric merge tolerance accepted by `transfer` has no
     # role here and is ignored on purpose.
-    _assert_transfer_compatible(source_model, target_model)
-    _assert_keys_comparable(source_model, target_model)
+    _check_transfer(source_model, target_model, backend)
     source_coefficients = _checked_coefficients(source_solution, source_model)
-
-    source_layout = source_model.dofs
-    target_layout = target_model.dofs
-    nactive = active_unknowns(target_layout)
-    coefficients = zeros(T, nactive)
-
-    for source_field in source_layout.fields
-        target_field_idx = get(target_layout.by_name, source_field.name, 0)
-        target_field_idx == 0 && continue
-        target_field = target_layout.fields[target_field_idx]
-
-        # Build a target-side key → raw lookup once per field. The mapping is small (one entry per target raw key) and
-        # is reused across every source raw key of the field.
-        target_raw_by_key = Dict(key => raw for (raw, key) in pairs(target_field.dofs.raw_keys))
-
-        for source_raw in eachindex(source_field.dofs.raw_keys)
-            source_key = source_field.dofs.raw_keys[source_raw]
+    coefficients = zeros(T, active_unknowns(target_model.dofs))
+    for source_field in source_model.dofs.fields
+        target_field = _field_layout(target_model.dofs, source_field.name)
+        # A target-side key → raw lookup, built once per field and read for every source raw of it. A key carries the
+        # GLOBAL level id, and a coupled model numbers each subdomain's levels after the previous subdomain's, so the
+        # same level of an unchanged subdomain can carry another id on the two sides. Levels are paired by position in
+        # the field's own space, as `_assert_keys_comparable` compares them: the table re-bases each target key onto
+        # the source's ids by the difference of the two fields' first ids. That difference is 0 on every single-domain
+        # model, where the table holds the target's keys as stored; either way the loop below looks up each source key
+        # as stored, so the per-raw path builds no key.
+        shift = first(target_field.level_ids) - first(source_field.level_ids)
+        target_raw_by_key = Dict((shift == 0 ? key : TensorDofKey(key.level - shift, key.axes)) => raw
+                                 for (raw, key) in pairs(target_field.dofs.raw_keys))
+        for (source_raw, source_key) in pairs(source_field.dofs.raw_keys)
             target_raw = get(target_raw_by_key, source_key, 0)
             for c in 1:source_field.components
-                source_free = source_field.dofs.active_component[source_raw, c] != 0
-                if target_raw == 0
-                    backend.strict &&
-                        source_free &&
-                        throw(ArgumentError("Rewire: source active dof at key $(source_key) component $c has no " *
-                                            "target counterpart; pass `Rewire(strict=false)` to skip"))
-                    continue
-                end
-                target_active = target_field.dofs.active_component[target_raw, c]
+                # The target's active slot for this (raw, component), 0 where there is none to write: no counterpart,
+                # or one the target constrains. Either is an error only for a dof the source leaves free.
+                target_active = target_raw == 0 ? 0 : target_field.dofs.active_component[target_raw, c]
                 if target_active == 0
                     backend.strict &&
-                        source_free &&
-                        throw(ArgumentError("Rewire: source active dof at key $(source_key) component $c is " *
-                                            "constrained in the target"))
+                        source_field.dofs.active_component[source_raw, c] != 0 &&
+                        throw(ArgumentError("Rewire: source active dof at key $(source_key) component $c " *
+                                            (target_raw == 0 ?
+                                             "has no target counterpart; pass `Rewire(strict=false)` to skip" :
+                                             "is constrained in the target")))
                     continue
                 end
-                u = dof_value(source_field, source_coefficients, source_raw, c)
-                coefficients[target_field.offset + target_active] = u
+                coefficients[target_field.offset+target_active] = dof_value(source_field, source_coefficients,
+                                                                            source_raw, c)
             end
         end
     end
-
     return Solution(coefficients, target_model.version, SolverDiagnostics(:rewire, 0.0, true))
-end
-
-# `Rewire` matches source to target by `TensorDofKey` equality, which is only sound while the same key names the same
-# function on both sides. That is a property of the basis family, and the two shipped families differ on it.
-#
-# An integrated-Legendre key indexes a mode by its DEGREE, and mode 3 is the same function at order 4 and at order 7, so
-# a pure order elevation rewires exactly — measured, order 3 → 4 on 8² transfers with 0.000e+00 error. A B-spline key
-# indexes a global 1D function over the whole axis (`_AXIS_BSPLINE`), and raising the degree rewrites the knot vector,
-# so index *i* at degree 3 and index *i* at degree 4 are simply different functions. The keys still compare equal, the
-# lookup still succeeds, and the coefficients land on the wrong basis: measured, the same order 3 → 4 transfer
-# "succeeded" with no raise and a relative error of 1.80e-1. `strict = true` did not catch it, because it tests key
-# PRESENCE while the docstring promises span containment.
-#
-# The test is family-generic rather than a B-spline special case: the degree lives in `BSplineFamily`'s type (its spaces
-# are `BSplineSpace{p}`), while `IntegratedLegendre` is one type for every order. So comparing the instantiated basis
-# TYPE admits exactly the rewires that are sound and rejects the rest, and a future family inherits the right behaviour
-# by construction. The mesh is compared for the same reason: a key indexes into a mesh, and two meshes of different size
-# *or position* do not share an indexing. Position is the half a cell-count test alone misses — `moved` and `move!` keep
-# every key and move the function it names, so a displaced overlay matches key for key and lands the source's
-# coefficients on functions somewhere else. Measured with the guard stubbed out, on a 2D Poisson base 8² p=3 carrying a
-# 4×4 overlay displaced by half a fine cell: `strict = true` raised nothing and the transferred field deviated by up to
-# 4.3e-2 from the source, against a solution whose own magnitude is 7.4e-2 — a 58% error, silently.
-#
-# `domain` and `cells` settle it between them: a `CartesianMesh`'s `axes` are derived from exactly those two by
-# `_mesh_axes` (mesh.jl), and `AxisBox` equality is corner-wise and bit-exact for meshes built that way.
-function _assert_keys_comparable(source_model::Model, target_model::Model)
-    src, tgt = source_model.problem.space, target_model.problem.space
-    for k in 1:min(length(src.levels), length(tgt.levels))
-        a, b = src.levels[k], tgt.levels[k]
-        typeof(a.basis) === typeof(b.basis) ||
-            throw(ArgumentError("Rewire: level $k carries $(basis_name(a.basis)) at order " *
-                                "$(nominal_order(a)) on the source and $(basis_name(b.basis)) at order " *
-                                "$(nominal_order(b)) on the target, and those name different function sets, so a " *
-                                "dof key does not name the same function on both sides — raising a B-spline degree " *
-                                "rewrites the knot vector and does exactly this. Use `L2Projection()` instead."))
-        (a.mesh.cells == b.mesh.cells && a.mesh.domain == b.mesh.domain) ||
-            throw(ArgumentError("Rewire: level $k is meshed as $(a.mesh.cells) cells over $(a.mesh.domain) on the " *
-                                "source and $(b.mesh.cells) cells over $(b.mesh.domain) on the target; a dof key " *
-                                "indexes into a mesh, so the same key names a function of a different size or at a " *
-                                "different position on the two sides and they are not comparable. Use " *
-                                "`L2Projection()` instead."))
-    end
-    return nothing
 end

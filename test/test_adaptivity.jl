@@ -61,6 +61,70 @@ end
                                                  Unfitted.SolverDiagnostics(:manual, 0.0, true)))
     u = solve!(model)
     @test_throws ArgumentError estimate(model, u; enrichment=0)
+    # Every refusal names the verb, as the docstring promises; this one did not.
+    @test_throws "estimate: enrichment must be at least 1" estimate(model, u; enrichment=0)
+end
+
+@testset "estimate refuses a second field and a stale solution before building V⁺" begin
+    # Both refusals used to come after the enriched model had been prepared and assembled: the stale pin from the
+    # injection, the second field from the attribution sweep's single-field lookup, in a message that did not name the
+    # verb. A load that counts its evaluations shows that nothing enriched is built now: it is never called.
+    calls = Threads.Atomic{Int}(0)
+    load(x) = (Threads.atomic_add!(calls, 1); 1.0)
+    V = space(_AD_Ω; cells=4, order=2)
+    a, b = field(:a, V), field(:b, V)
+    two = prepare(Problem((a, b); blocks=(stiffness_block(a), stiffness_block(b)),
+                          loads=(source_load(a; source=load), source_load(b; source=load)),
+                          dirichlet=[dirichlet(0.0; on=boundary(:all), field=:a),
+                                     dirichlet(0.0; on=boundary(:all), field=:b)]))
+    u = solve!(two)
+    calls[] = 0
+    @test_throws ArgumentError estimate(two, u)
+    @test_throws "estimate: the problem has 2 fields" estimate(two, u)
+    @test calls[] == 0
+
+    # A solution of another discretisation: the same problem at order 3.
+    one = prepare(poisson(V; source=load, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    solve!(one)
+    other = prepare(poisson(space(_AD_Ω; cells=4, order=3); source=load, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    stale = solve!(other)
+    calls[] = 0
+    @test_throws ArgumentError estimate(one, stale)
+    @test_throws "estimate: this solution was computed on a different discretisation" estimate(one, stale)
+    @test calls[] == 0
+end
+
+@testset "consistency is a pure ratio: scaling the data leaves it unchanged" begin
+    # ‖R|_V‖ / ‖R|_W‖ compares two residuals of one solve, so it cannot depend on the data's units. Flooring the
+    # denominator at an absolute eps made it one: 7.06e-4 with the source scaled by 1 or 1e-4, but 3.54e-5 at 1e-8 and
+    # 3.54e-7 at 1e-10, for the same relative residual.
+    V = space(_AD_Ω; cells=4, order=2)
+    bc = [dirichlet(0.0; on=boundary(:all))]
+    source(x) = 2pi^2 * sinpi(x[1]) * sinpi(x[2])
+    consistency(s) = (m=prepare(poisson(V; source=x -> s * source(x), dirichlet=bc));
+                      estimate(m, solve!(m)).consistency)
+    unscaled = consistency(1.0)
+    @test 1.0e-4 < unscaled < 1.0e-2                  # a data-oscillation residual, far above round-off
+    for s in (1.0e-4, 1.0e-8, 1.0e-10)
+        @test consistency(s) ≈ unscaled rtol = 1.0e-6
+    end
+    # Zero data leaves nothing on either side, and the ratio's 0 / 0 reads as perfectly consistent.
+    zero_data = prepare(poisson(V; source=0.0, dirichlet=bc))
+    nothing_left = estimate(zero_data, solve!(zero_data))
+    @test nothing_left.consistency == 0 && nothing_left.total == 0
+end
+
+@testset "consistency carries a NaN residual through" begin
+    # The ratio's two edge cases are exact zeros. A NaN residual, as a diverged solve leaves, is neither, and reads as
+    # NaN like the total beside it. Taken for an edge case, it came back as 0, "perfectly consistent".
+    V = space(_AD_Ω; cells=4, order=2)
+    model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    solve!(model)
+    diverged = Solution(fill(NaN, active_unknowns(model)), model.version,
+                        Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    est = estimate(model, diverged)
+    @test isnan(est.total)
+    @test isnan(est.consistency)
 end
 
 @testset "estimate charges every component of a vector field" begin
@@ -483,6 +547,28 @@ end
     @test cell_orders(coarsen(A; p=[(1, cell)], pmin=3); level=1)[cell] == (2, 8)
 end
 
+@testset "an explicit mark takes at most one order step per call" begin
+    # "Raises the marked cell's own order by one", and "lowers" it by one. A cell named twice used to step twice,
+    # because each step read the order field the call was already editing: a duplicated p-mark took an order-2 cell to
+    # 4.
+    V = ladder(_AD_Ω; cells=4, order=2, depth=1)
+    cell = CartesianIndex(2, 2)
+    @test cell_orders(refine(V; p=[(1, cell), (1, cell)]); level=1)[cell] == (3, 3)
+
+    # On the finest level an h-mark has nothing to activate and turns into the order step. Marked for p as well, the
+    # cell still takes one step, and so does an h-mark named twice.
+    W = refine(V; h=[(1, cell)])
+    fine = length(W.levels)
+    leaf = findfirst(active_cells(W; level=fine))
+    once = cell_order(W, leaf; level=fine) .+ 1
+    @test cell_orders(refine(W; h=[(fine, leaf)], p=[(fine, leaf)]); level=fine)[leaf] == once
+    @test cell_orders(refine(W; h=[(fine, leaf), (fine, leaf)]); level=fine)[leaf] == once
+
+    # The mirror: a duplicated release lowers once.
+    T = ladder(_AD_Ω; cells=4, order=3, depth=1)
+    @test cell_orders(coarsen(T; p=[(1, cell), (1, cell)]); level=1)[cell] == (2, 2)
+end
+
 @testset "refine and coarsen return their argument when nothing moved" begin
     # Identity is the exhaustion signal. Without it a saturated cycle returns a fresh but identical `Space`, the caller
     # rebuilds the model, and the loop runs to its step limit with nothing changing.
@@ -530,6 +616,20 @@ end
     @test_throws DimensionMismatch refine(V, truncated)
 end
 
+@testset "decide validates pmax and names itself in its errors" begin
+    # `refine` refuses a `pmax` below one, and so does the decision that feeds it. Accepted, `pmax = 0` used to read
+    # every marked cell as already at its cap and send it to h without a word.
+    V = ladder(_AD_Ω; cells=4, order=2, depth=1)
+    flat = Unfitted.ErrorEstimate{2,Float64}([ones(l.mesh.cells) for l in V.levels], 1.0, 1.0, 0.0)
+    cell = CartesianIndex(2, 2)
+    @test_throws ArgumentError decide(V, flat, [(1, cell)]; pmax=0)
+    @test_throws "decide: pmax" decide(V, flat, [(1, cell)]; pmax=0)
+
+    # A bad mark is reported by the verb that was handed it, not by `refine`.
+    @test_throws "decide: marked level" decide(V, flat, [(99, cell)]; pmax=8)
+    @test_throws "decide: marked cell" decide(V, flat, [(1, CartesianIndex(9, 9))]; pmax=8)
+end
+
 @testset "refine: Dörfler marking is monotone in theta" begin
     V = ladder(_AD_Ω; cells=8, order=2, depth=1)
     model = prepare(_ad_problem(V))
@@ -569,6 +669,39 @@ end
     # seen through round-off.
     @test !((1, CartesianIndex(2, 2)) in marked)
     @test length(mark_cells(est; theta=1.0)) == 5
+end
+
+@testset "Dörfler cuts where the running sum of the marked order reaches the goal" begin
+    # The cut is the first prefix whose squared indicators, summed left to right in decreasing η, reach θ·total². A
+    # cumulative sum that re-associates the terms for accuracy, as `cumsum` does on floating-point data, differs from
+    # the running sum in the last bit, and a goal between the two moved the cut by a cell. Here η² ∝ 1/(i + 0.37) over
+    # 300 cells, normalised so the total is one: the goal is then θ itself, and each running sum is set as the goal
+    # exactly, so the cut must land on its own prefix. Neighbouring indicators differ by more than 1e-3 relative, far
+    # outside the group tolerance, so the group extension never moves the cut.
+    r = [1 / (i + 0.37) for i in 1:300]
+    η = sqrt.(r ./ sum(r))
+    est = Unfitted.ErrorEstimate{1,Float64}([η], 1.0, 1.0, 0.0)
+    running, sums = 0.0, Float64[]
+    for x in η
+        running += x^2
+        push!(sums, running)
+    end
+    @test isempty([k for k in eachindex(sums) if sums[k] < 1 && length(mark_cells(est; theta=sums[k])) != k])
+end
+
+@testset "θ = 1 marks every cell with a positive indicator, however small" begin
+    # The docstring's promise, which the prefix alone did not keep. An indicator below about 1e-8 of the total adds
+    # nothing to the running sum of squares, so the sum reached total² before it, and the group extension never reaches
+    # so small a value: here the prefix stopped after the two large cells. The large indicators are dyadic, so total² is
+    # exactly 1.5625 and the early cut is not left to round-off; the scan crosses both levels, and zeros stay unmarked.
+    coarse = [1.0 0.0; 1.0e-9 0.0]
+    fine = [0.0 3.0e-10; 0.75 0.0]
+    est = Unfitted.ErrorEstimate{2,Float64}([coarse, fine], sqrt(sum(abs2, coarse) + sum(abs2, fine)), 1.0, 0.0)
+    @test est.total == 1.25
+    @test mark_cells(est; theta=1.0) ==
+          [(1, CartesianIndex(1, 1)), (2, CartesianIndex(2, 1)), (1, CartesianIndex(2, 1)), (2, CartesianIndex(1, 2))]
+    # Below θ = 1 the prefix rule stands: the two large cells already carry the whole total.
+    @test length(mark_cells(est; theta=prevfloat(1.0))) == 2
 end
 
 @testset "the loop reduces the error and the estimate" begin
@@ -658,6 +791,55 @@ end
     mc = prepare(poisson(V; source=corner, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     ec = estimate(mc, solve!(mc))
     @test argmax(ec.cells[1]) == CartesianIndex(1, 1)
+end
+
+@testset "estimate refuses an enriched space that does not contain V, before assembling it" begin
+    # A B-spline level's twin is appended above every level of V, so under an integrated-Legendre overlay it covers the
+    # overlay, which then sheds modes in V⁺ that are free in V. The injection has nowhere to put them. That surfaced as
+    # Rewire's key error after the whole enriched assembly, with the load below evaluated 688 times; it is now
+    # estimate's own refusal, made before anything is assembled.
+    calls = Threads.Atomic{Int}(0)
+    load(x) = (Threads.atomic_add!(calls, 1); 1.0)
+    bc = [dirichlet(0.0; on=boundary(:all))]
+    inner = box((0.25, 0.25), (0.75, 0.75))
+    under = overlay(space(_AD_Ω; cells=4, order=2, basis=bspline()), inner; cells=4, order=2,
+                    basis=IntegratedLegendre())
+    model = prepare(poisson(under; source=load, dirichlet=bc))
+    u = solve!(model)
+    calls[] = 0
+    @test_throws ArgumentError estimate(model, u)
+    @test_throws "estimate: the enriched space V⁺ does not contain V" estimate(model, u)
+    @test calls[] == 0
+
+    # The supported order, B-spline above Legendre, estimates; so do stacks where no live twin covers a Legendre level —
+    # a B-spline sub-box beside a Legendre one, and a dormant B-spline level under one.
+    estimated(V) = (m=prepare(poisson(V; source=1.0, dirichlet=bc)); estimate(m, solve!(m)).total)
+    over = overlay(space(_AD_Ω; cells=4, order=2), inner; cells=4, order=2, basis=bspline())
+    @test estimated(over) ≈ 0.0138854 rtol = 1.0e-5
+    lower = box((0.0, 0.0), (0.5, 0.5))
+    beside = overlay(overlay(space(_AD_Ω; cells=4, order=2), lower; cells=4, order=2, basis=bspline()),
+                     box((0.5, 0.5), (1.0, 1.0)); cells=4, order=2, basis=IntegratedLegendre())
+    @test estimated(beside) ≈ 0.0105092 rtol = 1.0e-5
+    dormant = overlay(overlay(space(_AD_Ω; cells=4, order=2), lower; cells=4, order=2, basis=bspline(),
+                              active=falses(4, 4)), lower; cells=4, order=2, basis=IntegratedLegendre())
+    @test estimated(dormant) ≈ 0.00576587 rtol = 1.0e-5
+end
+
+@testset "the enrichment record twins live levels only and charges each twin to its level" begin
+    # `estimate` reads V⁺ through one record: level j of V⁺ is charged to level k of V, each cell to the cell of k it
+    # lies in. V's own levels are their own; a live level without a per-cell order gets a refined twin above all of
+    # them, live exactly where the level is; a dormant one gets none, since its twin would carry nothing.
+    live = falses(8, 8)
+    live[1:4, 1:4] .= true
+    V = overlay(overlay(space(_AD_Ω; cells=4, order=2), _AD_Ω; cells=8, order=2, basis=bspline(), active=live), _AD_Ω;
+                cells=4, order=2, basis=bspline(), active=CartesianIndex{2}[])
+    W, charge = Unfitted._enriched_space(V, 1)
+    @test charge == [(1, 1), (2, 1), (3, 1), (2, 2)]
+    @test length(W.levels) == 4 && W.levels[4].mesh.cells == (16, 16)
+    # The twin's mask and the charge read the same child-to-parent map.
+    twin = active_cells(W; level=4)
+    @test count(twin) == 4 * count(live)
+    @test all(c -> twin[c] == live[Unfitted._coarse_cell(c, 2)], CartesianIndices(twin))
 end
 
 @testset "estimate does not change when a dormant level is appended" begin
@@ -763,6 +945,61 @@ end
     @test active_cells(coarsen(LW; h=[(1, cell)]); level=2) == active_cells(L; level=2)
 end
 
+@testset "coarsen keeps a child a deeper level holds, with its support" begin
+    # The docstring's "no-op rather than a hole" on a family with a support collar. Releasing the parent of a child that
+    # a deeper level refines must leave the child live, and with it the collar its own functions need. The collar pass
+    # used to release the held child with the rest of the parent's dilated footprint: on this B-spline stack it left
+    # level 2 with no live cell at all under 64 live level-3 cells. Integrated Legendre has no collar and is the
+    # control.
+    same(a, b) = all(active_cells(a; level=k) == active_cells(b; level=k) &&
+                         cell_orders(a; level=k) == cell_orders(b; level=k) for k in 1:length(a.levels))
+    cell = CartesianIndex(4, 4)
+    for (basis, radius) in ((bspline(), 3), (IntegratedLegendre(), 0))
+        L = ladder(_AD_Ω; cells=8, depth=2, order=3, basis=basis)
+        kid = findfirst(overlapping_cells(L, [cell]; from=1, to=2))
+        held = refine(refine(L; h=[(1, cell)]); h=[(2, kid)])
+        released = coarsen(held; h=[(1, cell)])
+        # On the B-spline stack level 3's collar reaches every child of `cell`, so all four are held and the call
+        # releases nothing: it returns its argument itself, as any call that changes nothing does.
+        basis isa IntegratedLegendre || @test released === held
+
+        @test active_cells(released; level=2)[kid]
+        @test active_cells(released; level=3) == active_cells(held; level=3)
+        footprint = falses(size(active_cells(held; level=2)))
+        footprint[kid] = true
+        support = dilate(footprint, radius) .& active_cells(held; level=2)
+        @test all(active_cells(released; level=2)[support])
+        # No live level-3 cell is left standing over a released level-2 cell.
+        under = overlapping_cells(released, active_cells(released; level=3); from=3, to=2)
+        @test all(active_cells(released; level=2)[under])
+
+        # Released from the top down, each call is well defined and the pair restores the ladder exactly.
+        @test same(coarsen(coarsen(held; h=[(2, kid)]); h=[(1, cell)]), L)
+    end
+
+    # The collar pass's own leaf test, which the input above never reaches: there every child of `cell` is held, so the
+    # released block is empty and the pass skips the level. Here level 3 refines (4, 7), a cell of the level-2 support
+    # collar that is not a child of `cell`. The four children stay leaves and are released, and the collar pass then
+    # reaches the 15 live level-2 cells level 3 stands over. Released by footprint alone, all 15 went, and level 2 was
+    # left with no live cell under 64 live level-3 cells.
+    L = ladder(_AD_Ω; cells=8, depth=2, order=3, basis=bspline())
+    edge = CartesianIndex(4, 7)
+    held = refine(refine(L; h=[(1, cell)]); h=[(2, edge)])
+    released = coarsen(held; h=[(1, cell)])
+    under = overlapping_cells(held, active_cells(held; level=3); from=3, to=2) .& active_cells(held; level=2)
+    @test count(under) == 15
+    @test all(active_cells(released; level=2)[under])
+    @test !any(active_cells(released; level=2)[overlapping_cells(L, [cell]; from=1, to=2)])
+    @test active_cells(released; level=3) == active_cells(held; level=3)
+    @test same(coarsen(coarsen(held; h=[(2, edge)]); h=[(1, cell)]), L)
+
+    # The control's answer, which the collar never touched: the held child alone stays, its three siblings go.
+    L = ladder(_AD_Ω; cells=8, depth=2, order=3)
+    kid = findfirst(overlapping_cells(L, [cell]; from=1, to=2))
+    @test findall(active_cells(coarsen(refine(refine(L; h=[(1, cell)]); h=[(2, kid)]); h=[(1, cell)]); level=2)) ==
+          [kid]
+end
+
 @testset "refine: the p-step actually survives" begin
     # A p-step is only ever handed a LEAF, and that is what makes it real: the same increment on a covered cell is a
     # no-op, because leaf semantics shed a covered cell's bubble modes. Measured before that was understood, 356 cells
@@ -811,6 +1048,60 @@ end
     @test all(ch -> est.cells[2][ch] == 0, children)
 end
 
+# State a form reads by `q.point` without capturing it: globals, which `estimate`'s walk of a form's captures cannot
+# see, so the testsets below pin what happens at the read itself.
+const _AD_CHI = Ref{QuadField{Float64}}()
+const _AD_PER_POINT = ones(10^6)
+
+# What `f()` returns, or the exception it raised, out of the wrappers a threaded assembly (`CompositeException`) and a
+# spawned task (`TaskFailedException`) put around an exception a form raised, so the assertions hold at any thread
+# count.
+function _ad_root(e)
+    e isa CompositeException ? _ad_root(first(e.exceptions)) :
+    e isa TaskFailedException ? _ad_root(e.task.exception) : e
+end
+_ad_outcome(f) =
+    try
+        return f()
+    catch err
+        return _ad_root(err)
+    end
+
+# A load source that, once armed, blocks at its first evaluation until the test releases it, suspending an `estimate`
+# in the middle of its enriched assembly. Gate `i` is `_AD_GATES[i]`: the flag the first evaluation after arming claims
+# atomically, so only one task of a threaded assembly blocks, a channel announcing that it has, and one releasing it.
+# The source holds the gate's number rather than the gate, so a form captures nothing the walk would follow.
+const _AD_GATES = [(Threads.Atomic{Bool}(false), Channel{Nothing}(1), Channel{Nothing}(1)) for _ in 1:2]
+struct _ADGated
+    gate::Int
+end
+function (source::_ADGated)(x)
+    armed, entered, resume = _AD_GATES[source.gate]
+    if Threads.atomic_xchg!(armed, false)
+        put!(entered, nothing)
+        take!(resume)
+    end
+    return 1.0
+end
+
+# Arm gate `i`, start `estimate(model, u)` on a task of its own, and return the task once it is blocked at the gate. A
+# task that ends first never reached it, and that is raised here rather than leaving the test waiting.
+function _ad_suspended_estimate(i, model, u)
+    armed, entered, _ = _AD_GATES[i]
+    armed[] = true
+    task = Threads.@spawn estimate(model, u)
+    timedwait(() -> isready(entered) || istaskdone(task), 600.0)
+    isready(entered) || error("estimate ended without reaching gate $i: $(_ad_outcome(() -> fetch(task)))")
+    take!(entered)
+    return task
+end
+
+# Release the estimate `task` suspended at gate `i`, and return it.
+function _ad_resumed(i, task)
+    put!(_AD_GATES[i][3], nothing)
+    return fetch(task)
+end
+
 @testset "estimate refuses a form that reads per-quadrature-point state" begin
     # `estimate` assembles the problem's own blocks and loads a second time, on an order-elevated twin whose `q.point`
     # numbers a larger cloud sitting at different places. A form reading a `QuadField` there indexes an array built for
@@ -831,11 +1122,97 @@ end
                                dirichlet=bc))
     @test_throws ArgumentError estimate(stateful, solve!(stateful))
 
-    # And the read itself is guarded, which is what covers the shape reflection cannot see: a form written at top level
-    # reads a global binding and captures nothing at all. Outside such a pass the read is unguarded.
-    @test_throws ArgumentError Unfitted._on_foreign_cloud(() -> chi[1], base.version + 1)
-    @test Unfitted._on_foreign_cloud(() -> chi[1], base.version) == 1.0
+    # And the read itself is guarded, which is what covers the shape reflection cannot see: a form that reads a global
+    # binding captures nothing at all. The enriched model numbers its points far below 1, so the read raises, and it
+    # raises as itself rather than as the walk's refusal. The field reads as before everywhere else.
+    reads_global = WeakForm(; linear=q -> 1.0, symmetric=true,
+                            bilinear=(q, trial) -> TestChannels(0.0, _AD_CHI[][q.point] .* trial.gradient))
+    unseen = prepare(Problem(V, reads_global; dirichlet=bc))
+    _AD_CHI[] = QuadField{Float64}(unseen; init=q -> 1.0)
+    solution = solve!(unseen)
+    err = _ad_outcome(() -> estimate(unseen, solution))
+    @test err isa ArgumentError
+    @test occursin("another model's quadrature cloud", sprint(showerror, err))
+    @test _AD_CHI[][1] == 1.0
     @test chi[1] == 1.0
+end
+
+@testset "estimate: a plain array read by q.point raises rather than reading the wrong points" begin
+    # The same uncaptured read from a plain vector long enough for any cloud of this size. The enriched model's points
+    # lie far below 1, so the read is out of bounds and raises; numbered from 1 they read this vector at points of
+    # another cloud and the estimate came back as if nothing had happened.
+    V = space(_AD_Ω; cells=4, order=2)
+    reads_vector = WeakForm(; linear=q -> _AD_PER_POINT[q.point], symmetric=true,
+                            bilinear=(q, trial) -> TestChannels(0.0, trial.gradient))
+    model = prepare(Problem(V, reads_vector; dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    @test nquadpoints(model) < length(_AD_PER_POINT)
+    solution = solve!(model)
+    @test _ad_outcome(() -> estimate(model, solution)) isa BoundsError
+end
+
+@testset "an estimate in flight leaves every other task's reads alone" begin
+    # Nothing of the enriched model's numbering is process-wide. `a` and `b` are two models of the same Poisson problem,
+    # with sources that suspend their estimates at gates 1 and 2; `other` is a field on `a` that no form reads.
+    V = space(_AD_Ω; cells=4, order=2)
+    bc = [dirichlet(0.0; on=boundary(:all))]
+    a, b = (prepare(poisson(V; source=_ADGated(i), dirichlet=bc)) for i in 1:2)
+    ua, ub = solve!(a), solve!(b)
+    other = QuadField{Float64}(a; init=q -> 2.0)
+    alone = estimate(a, ua)
+
+    # While `a`'s estimate is suspended inside its enriched assembly, a read of the unrelated field from another task
+    # sees nothing of it.
+    task = _ad_suspended_estimate(1, a, ua)
+    seen = _ad_outcome(() -> fetch(Threads.@spawn other[1]))
+    @test _ad_resumed(1, task).cells == alone.cells
+    @test seen === 2.0
+
+    # Two estimates interleaved — `a` in, `b` in, `a` out, `b` out — compute what each computes alone and leave nothing
+    # behind: the field reads afterwards as it did before.
+    ta = _ad_suspended_estimate(1, a, ua)
+    tb = _ad_suspended_estimate(2, b, ub)
+    @test _ad_resumed(1, ta).cells == alone.cells
+    @test _ad_resumed(2, tb).cells == alone.cells
+    @test _ad_outcome(() -> other[1]) === 2.0
+end
+
+@testset "the point-keyed-state walk skips an unassigned slot" begin
+    # The refusal above finds a `QuadField` by walking a form's captures, element by element through an array whose
+    # element type is not a bits type. A slot that was never assigned holds no element, and reading it raised an
+    # `UndefRefError` out of `estimate` for a form that merely captured a `Vector{Any}(undef, 2)` scratch buffer. The
+    # walk skips such a slot: that form estimates as the plain Poisson problem does, and a field held in an assigned
+    # slot behind an unassigned one is still found and refused.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    V = space(Ω; cells=4, order=2)
+    bc = [dirichlet(0.0; on=boundary(:all))]
+    plain = prepare(poisson(V; source=1.0, dirichlet=bc))
+    buffer = Vector{Any}(undef, 2)
+    scratch = WeakForm(; linear=q -> 1.0, symmetric=true,
+                       bilinear=(q, trial) -> TestChannels(0.0 * length(buffer) * trial.value, trial.gradient))
+    stateless = prepare(Problem(V, scratch; dirichlet=bc))
+    @test estimate(stateless, solve!(stateless)).total ≈ estimate(plain, solve!(plain)).total rtol = 1.0e-12
+
+    held = Vector{Any}(undef, 2)
+    held[2] = QuadField{Float64}(plain; init=q -> 1.0)
+    conduction = WeakForm(; linear=q -> 1.0, symmetric=true,
+                          bilinear=(q, trial) -> TestChannels(0.0, held[2][q.point] .* trial.gradient))
+    stateful = prepare(Problem(V, conduction; dirichlet=bc))
+    @test_throws "captures a QuadField" estimate(stateful, solve!(stateful))
+end
+
+@testset "the point-keyed-state walk reads a dictionary by its values" begin
+    # A dictionary among a form's captures is walked through its values. Looking each key up again instead fails on a
+    # key mutated after insertion — legal, if unwise — which no longer hashes to its slot: the walk then raised a
+    # `KeyError` out of `estimate` for a form that merely captured such a dictionary.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=2)
+    bc = [dirichlet(0.0; on=boundary(:all))]
+    plain = prepare(poisson(V; source=1.0, dirichlet=bc))
+    table = Dict([1] => 1.0)
+    push!(first(keys(table)), 2)
+    lookup = WeakForm(; linear=q -> 1.0, symmetric=true,
+                      bilinear=(q, trial) -> TestChannels(0.0 * length(table) * trial.value, trial.gradient))
+    keyed = prepare(Problem(V, lookup; dirichlet=bc))
+    @test estimate(keyed, solve!(keyed)).total ≈ estimate(plain, solve!(plain)).total rtol = 1.0e-12
 end
 
 @testset "estimate, refine and coarsen on an immersed domain" begin

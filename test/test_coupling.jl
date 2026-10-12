@@ -156,6 +156,86 @@ end
     @test_throws ArgumentError foreach_quadrature_point(q -> nothing, model)
     @test_throws "field=" foreach_quadrature_point(q -> nothing, model)
     @test_throws ArgumentError QuadField{Float64}(model)
+
+    # Wrapping a vector is refused for the same reason. Its length check reads `nquadpoints(model)`, the sum over both
+    # subdomains (72 points here), which `q.point` never spans: the wrapper used to accept it, and a form on either
+    # subdomain then read its points from the same leading slots.
+    @test nquadpoints(model) == 72
+    @test_throws "multi-domain" QuadField(zeros(nquadpoints(model)), model)
+end
+
+# Two disjoint unit squares as one coupled problem, the second meshed with `cells2` cells per axis, and the solution
+# that sets every coefficient to one — u₁ = u₂ = 1, since an order-1 basis is a partition of unity: the smallest
+# multi-domain pair a transfer can be asked about.
+function coupled_squares(cells2)
+    V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=3, order=1)
+    V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=cells2, order=1)
+    u1, u2 = field(:u1, V1), field(:u2, V2)
+    model = prepare(Problem((u1, u2); blocks=(stiffness_block(u1), stiffness_block(u2))))
+    ones_solution = Solution(ones(active_unknowns(model)), model.version,
+                             Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    return model, ones_solution, u1, u2
+end
+
+@testset "L2Projection refuses a multi-domain model" begin
+    # The L² transfer builds its union partition from `problem.space`, which on a coupled model is the first subdomain's
+    # space alone, so the second subdomain's field finds no target cell to deposit its load on. Unguarded, the pair
+    # below — the same discretisation on both sides — came back with u₂ ≡ 0 and a solver residual of 4e-17: wrong, and
+    # nothing in the result says so. Rewire serves the same pair, and exactly.
+    source, s, u1, u2 = coupled_squares(3)
+    target, _, _, _ = coupled_squares(3)
+    @test_throws "multi-domain" transfer(s, source, target)
+    @test_throws "multi-domain" transfer(s, source, target; via=L2Projection())
+
+    rewired = transfer(s, source, target; via=Rewire())
+    @test value(rewired, target, u1, (0.45, 0.55)) ≈ 1.0
+    @test value(rewired, target, u2, (2.95, 0.95)) ≈ 1.0
+end
+
+@testset "Rewire compares every field's own space" begin
+    # A dof key names the same function only while both sides index the same mesh, and Rewire refuses a pair whose
+    # meshes differ. It used to compare `problem.space` alone, which on a coupled model is the first subdomain's: with
+    # the second re-meshed from 3² to 4² cells every source key was still present in the target, so strict Rewire
+    # raised nothing and returned u₂(2.95, 0.95) = 0.04 against a source of 1.0. Each field is read on its own space,
+    # so the second subdomain's mesh change raises in either strict mode, as a single-domain one does.
+    source, s, _, _ = coupled_squares(3)
+    target, _, _, _ = coupled_squares(4)
+    for strict in (true, false)
+        @test_throws "is meshed as" transfer(s, source, target; via=Rewire(; strict=strict))
+    end
+end
+
+@testset "Rewire pairs each subdomain's levels by position" begin
+    # A dof key carries the global level id, and a coupled model numbers each subdomain's levels after the previous
+    # subdomain's. An overlay added to the first subdomain therefore renumbered the second, unchanged one from id 2 to
+    # id 3: strict Rewire refused a target that contains the source, naming a subdomain-2 key with "no target
+    # counterpart", and lax Rewire returned u₂ ≡ 0 against a source of 1. The levels of a field are paired by their
+    # position in its own space, so both modes now transfer every field exactly — whichever way the target declares
+    # its fields, which moves the shift between the two sides' ids to either sign, and when two fields share the space
+    # the overlay is added to, which gives them one block of ids.
+    base = space(box((0.0, 0.0), (1.0, 1.0)); cells=3, order=1)
+    V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=3, order=1)
+    fine = overlay(base, box((0.25, 0.25), (0.75, 0.75)); cells=2, order=1)
+    function coupled(names, spaces)
+        fields = map(field, names, spaces)
+        return prepare(Problem(fields; blocks=map(stiffness_block, fields))), fields
+    end
+    points = Dict(:u1 => [(0.5, 0.5), (0.3, 0.3)], :w => [(0.5, 0.5)], :u2 => [(2.5, 0.5), (2.95, 0.95)])
+    cases = [((:u1, :u2), (base, V2), (:u1, :u2), (fine, V2), [1:2, 3:3]),
+             ((:u1, :u2), (base, V2), (:u2, :u1), (V2, fine), [1:1, 2:3]),
+             ((:u1, :w, :u2), (base, base, V2), (:u1, :w, :u2), (fine, fine, V2), [1:2, 1:2, 3:3])]
+    for (source_names, source_spaces, target_names, target_spaces, target_ids) in cases
+        source, _ = coupled(source_names, source_spaces)
+        target, fields = coupled(target_names, target_spaces)
+        @test [f.level_ids for f in target.dofs.fields] == target_ids
+        s = Solution(ones(active_unknowns(source)), source.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
+        for strict in (true, false)
+            rewired = transfer(s, source, target; via=Rewire(; strict=strict))
+            for f in fields, x in points[f.name]
+                @test value(rewired, target, f, x) ≈ 1.0
+            end
+        end
+    end
 end
 
 @testset "one single-sided on= mesh shared across subdomains serves both" begin

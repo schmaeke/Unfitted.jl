@@ -1081,9 +1081,9 @@ function boundary_integral(integrand, model::Model; on::Union{BoundarySelector,B
     # A third cause joins "no such facet" and "every cell masked out" now that a facet rule is trimmed: a selector all
     # of whose faces lie outside Ω resolves to regions that carry no quadrature. Naming it here is the difference
     # between a user checking their selector and a user checking their geometry.
-    list.offsets[end] == 0 && throw(ArgumentError("no admissible boundary quadrature for on=$(on); check the " *
-                                                  "selector or mesh, any level masks, and whether the selected " *
-                                                  "faces lie outside Ω"))
+    _point_count(list) == 0 && throw(ArgumentError("no admissible boundary quadrature for on=$(on); check the " *
+                                                   "selector or mesh, any level masks, and whether the selected " *
+                                                   "faces lie outside Ω"))
     return _walk(nothing, nothing, list, nothing) do result, q
         contribution = q.weight * integrand(q)
         return result === nothing ? contribution : result + contribution
