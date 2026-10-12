@@ -74,16 +74,99 @@ end
     V = space(box((0.0,), (1.0,)); cells=8, order=3, basis=bspline(continuity=1))
     @test V.levels[1].basis isa Unfitted.BasisFamily
     # An integer request that already equals p − 1 on every axis is `:maximal` by another name: the same space, reached
-    # by selection rather than by a constraint cascade. The family normalises the one spelling into the other, so the
-    # two levels are indistinguishable afterwards.
+    # by selection rather than by a constraint cascade. Both spellings take the selection mechanism over the same knot
+    # vectors, so the two levels carry the same space; each family keeps the request it was given, which is what a
+    # rebuild at another degree is judged against (see the next testset).
     Ω = box((0.0, 0.0), (1.0, 1.0))
     B = box((0.25, 0.25), (0.75, 0.75))
     max_family = space(Ω; cells=6, order=3, basis=bspline()).levels[1].basis
     int_family = space(Ω; cells=6, order=3, basis=bspline(continuity=2)).levels[1].basis
-    @test max_family.continuity == int_family.continuity
+    @test BSExt._selects_by_support(max_family) && BSExt._selects_by_support(int_family)
+    @test _bspline_knots(max_family) == _bspline_knots(int_family)
     free(b) = Unfitted.active_unknowns(prepare(mass(overlay(space(Ω; cells=16, order=3, basis=bspline()), B; cells=8,
                                                             order=3, basis=b))).dofs)
     @test free(bspline()) == free(bspline(continuity=2))
+end
+
+# What a B-spline level's family is: its mechanism, the continuity it was asked for, and its per-axis degrees and knots.
+_bspline_knots(family) = map(P -> Float64[t for t in BasicBSpline.knotvector(P)], family.spaces)
+function _bspline_family_key(family)
+    (BSExt._selects_by_support(family), family.continuity, map(BasicBSpline.degree, family.spaces),
+     _bspline_knots(family))
+end
+
+@testset "BSpline extension: every rebuild re-validates the requested continuity" begin
+    # A level built from an already-concrete family — overlay inheritance (`overlay`'s default `basis` is the base
+    # level's family), `elevate`, a move, a mask edit, the fold — must be judged exactly as a fresh build of the same
+    # request: refused where the explicit spelling is refused, and otherwise the same family, the same unknowns and the
+    # same operator. The family used to keep its stored continuity with only the mode checked, so each case below built
+    # a level the explicit spelling refuses or a different space from it.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    B = box((0.25, 0.25), (0.75, 0.75))
+    refusal(build) =
+        try
+            build()
+            nothing
+        catch e
+            e isa ArgumentError ? sprint(showerror, e) : rethrow()
+        end
+    # The same space: equal raw and active unknowns and equal assembled mass matrices (to round-off, since a threaded
+    # assembly need not sum in one order).
+    function same_space(V, W)
+        (mv, lv), (mw, lw) = _gram(V), _gram(W)
+        return Unfitted.raw_dof_count(lv) == Unfitted.raw_dof_count(lw) &&
+               active_unknowns(lv) == active_unknowns(lw) &&
+               isapprox(mv.matrix, mw.matrix; rtol=1e-13)
+    end
+
+    clamped_base = space(Ω; cells=8, order=3, basis=bspline(; continuity=1))
+    # (a) C¹ inherited by a degree-1 overlay, where p − 1 = 0: refused, as the explicit spelling is.
+    explicit = refusal(() -> overlay(clamped_base, B; cells=4, order=1, basis=bspline(; continuity=1)))
+    @test explicit !== nothing
+    @test refusal(() -> overlay(clamped_base, B; cells=4, order=1)) == explicit
+    # (b) a clamped request inherited by a level too thin for it (cells + p = 4 < 2m + 3 = 5): refused likewise.
+    explicit = refusal(() -> overlay(clamped_base, B; cells=1, basis=bspline(; continuity=1)))
+    @test explicit !== nothing
+    @test refusal(() -> overlay(clamped_base, B; cells=1)) == explicit
+
+    il_base = space(Ω; cells=8, order=3)
+    clamped_overlay = overlay(il_base, B; cells=8, order=3, basis=bspline(; continuity=1))
+    # (c) a C¹ level elevated to degree 1: refused, as a fresh C¹ level of degree 1 is.
+    explicit = refusal(() -> overlay(il_base, B; cells=8, order=1, basis=bspline(; continuity=1)))
+    @test explicit !== nothing
+    @test refusal(() -> elevate(clamped_overlay, 2 => 1)) == explicit
+
+    # (d) a C² request selects at degree 3 (C² = p − 1) and must stay a C² request when inherited at degree 4, where it
+    # clamps; it used to inherit as `:maximal` and silently become C³.
+    c2_base = space(Ω; cells=8, order=3, basis=bspline(; continuity=2))
+    inherited = overlay(c2_base, B; cells=8, order=4)
+    fresh = overlay(c2_base, B; cells=8, order=4, basis=bspline(; continuity=2))
+    @test BSExt._selects_by_support(c2_base.levels[1].basis)
+    @test !BSExt._selects_by_support(inherited.levels[2].basis)
+    @test _bspline_family_key(inherited.levels[2].basis) == _bspline_family_key(fresh.levels[2].basis)
+    @test same_space(inherited, fresh)
+
+    # (e) a C¹ degree-3 overlay elevated to degree 2, where C¹ = p − 1: it selects by support, as a fresh build does.
+    elevated_c1 = elevate(clamped_overlay, 2 => 2)
+    fresh = overlay(il_base, B; cells=8, order=2, basis=bspline(; continuity=1))
+    @test BSExt._selects_by_support(elevated_c1.levels[2].basis)
+    @test _bspline_family_key(elevated_c1.levels[2].basis) == _bspline_family_key(fresh.levels[2].basis)
+    @test same_space(elevated_c1, fresh)
+
+    # A rebuild that keeps the degree reproduces the family a fresh build gives: a move (new knots), a mask edit, and
+    # the fictitious fold of a cut overlay.
+    to = box((0.2, 0.3), (0.7, 0.8))
+    @test _bspline_family_key(moved_space(clamped_overlay; level=2, to).levels[2].basis) ==
+          _bspline_family_key(overlay(il_base, to; cells=8, order=3, basis=bspline(; continuity=1)).levels[2].basis)
+    mask = trues(8, 8)
+    mask[1:2, :] .= false
+    @test _bspline_family_key(adapt(clamped_overlay, 2 => mask).levels[2].basis) ==
+          _bspline_family_key(clamped_overlay.levels[2].basis)
+    half = physical_domain(x -> x[1] - 0.6; lipschitz=1.0, subcell_length_scale=1 / 32)
+    cut = overlay(space(Ω; cells=8, order=3, physical=half), B; cells=8, order=3, basis=bspline(; continuity=1))
+    folded = prepare(mass(cut)).problem.space
+    @test folded.levels[2].mask !== nothing                                  # the fold did switch cells off
+    @test _bspline_family_key(folded.levels[2].basis) == _bspline_family_key(cut.levels[2].basis)
 end
 
 @testset "BSpline extension: support selection — the dof ledger is the closed form" begin

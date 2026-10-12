@@ -763,6 +763,12 @@ mesh-dependent family is rebuilt whenever the mesh changes (e.g. an overlay move
 `order` and `mode` at construction time. The level's activation mask is not an argument: a mask face selects or
 constrains functions in the dof layer rather than changing the family, which is how the shipped B-spline family handles
 every mask geometry.
+
+A concrete family handed to this hook is a request like any other, and a family that validates its request must do so
+on every call, not only on the first. The B-spline family re-judges its requested continuity against the new mesh and
+order each time, so a level built by inheritance ([`overlay`](@ref)'s default `basis` is the base level's concrete
+family), by [`elevate`](@ref), by a move or by a mask edit is validated and given its mechanism exactly as a fresh build
+of the same request is.
 """
 instantiate_basis(basis::BasisFamily, mesh::CartesianMesh{D,T}, order::NTuple{D,Int}, mode::Symbol) where {D,T} = basis
 

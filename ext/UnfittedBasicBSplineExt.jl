@@ -234,8 +234,10 @@ it as a `basis=` value, but carries no per-axis knot vectors yet — the [`insta
 extension materialises a real [`BSplineFamily`](@ref) from the mesh axes. Once the level is built, the spec is gone;
 every hot-path method dispatches on the concrete `BSplineFamily` type.
 
-`continuity` is either a requested smoothness `m ≥ 0` or the [`_MAXIMAL_CONTINUITY`](@ref) sentinel; `instantiate_basis`
-resolves the sentinel against the level's per-axis degree.
+`continuity` is either a requested smoothness `m ≥ 0` or the [`_MAXIMAL_CONTINUITY`](@ref) sentinel. It is the request
+and only the request: `instantiate_basis` validates it against the level's mesh and per-axis degree and chooses the
+mechanism, and every concrete family it builds carries the same request on, so a rebuild at another order or cell count
+is judged exactly as a fresh build would be.
 """
 struct _BSplineSpec <: BasisFamily
     continuity::Int
@@ -260,11 +262,15 @@ Fields:
     index. With the uniform max-regularity knots used here it is the identity (`cell_to_span[d][c] = c`); it is kept as
     an explicit field because it also doubles as the per-cell first global 1D function index —
     `bsplinebasisall(P, span, t)` returns the functions with global indices `span, span + 1, …, span + p`.
-  - `continuity::Int` — the smoothness the level carries across its own artificial boundary, either a requested
-    `0 ≤ m ≤ p_d − 1` or the [`_MAXIMAL_CONTINUITY`](@ref) sentinel for `C^{p_d − 1}` per axis. The two are different
-    *mechanisms*, not just different numbers: at the sentinel the level selects the functions whose full support lies
-    inside its admissible region and eliminates the rest strongly, while a requested `m < p_d − 1` clamps the level at
-    its artificial faces and imposes trace-vanishing conditions of orders `0 … m`. See [`bspline`](@ref).
+  - `continuity::Int` — the smoothness the level was *asked* to carry across its own artificial boundary, as
+    requested: an integer `0 ≤ m ≤ p_d − 1` or the [`_MAXIMAL_CONTINUITY`](@ref) sentinel for `C^{p_d − 1}` per axis.
+    The mechanism is derived from it and the degrees by `_selects_by_support`, and the two mechanisms are different
+    things rather than different numbers: the sentinel, or an integer equal to `p_d − 1` on every axis (the same space
+    by another name), selects the functions whose full support lies inside the admissible region and eliminates the
+    rest strongly, while an integer below `p_d − 1` on some axis clamps the level at its artificial faces and imposes
+    trace-vanishing conditions of orders `0 … m`. See [`bspline`](@ref). The request is stored rather than the
+    mechanism because a rebuild at another degree must re-derive the mechanism from what was asked: `C²` at degree 3
+    selects, at degree 4 it clamps.
 
 Constructed automatically from a [`_BSplineSpec`](@ref) by the [`instantiate_basis`](@ref) hook in this extension —
 users do not build it directly.
@@ -277,27 +283,35 @@ struct BSplineFamily{D,T,S<:Tuple,DS<:Tuple} <: BasisFamily
     continuity::Int
 end
 
-# Whether the level selects by support (`:maximal`) rather than clamping and constraining. Written as a predicate rather
-# than compared inline because the two mechanisms diverge in three places — the overlay constraints, the burial test,
-# and the thinness validation — and a bare `== -1` at each would say what is stored rather than what it means.
-_selects_by_support(family::BSplineFamily) = family.continuity == _MAXIMAL_CONTINUITY
+# Whether the level selects by support (`:maximal`) rather than clamping and constraining: the selection sentinel, or an
+# integer request equal to `p_d − 1` on every axis, which names the same space and is reached by the cheaper mechanism
+# (strong eliminations instead of a constraint cascade). Derived from the stored request and the family's own degrees
+# rather than stored, so it cannot disagree with them after a rebuild at another degree. Written as a predicate because
+# the two mechanisms diverge in several places — the overlay constraints, the burial test, the dedup and the support
+# radius — and a comparison at each would say what is stored rather than what it means.
+function _selects_by_support(family::BSplineFamily)
+    m = family.continuity
+    return m == _MAXIMAL_CONTINUITY || all(P -> m == degree(P) - 1, family.spaces)
+end
 
 # ── Basis instantiation: materialise the deferred spec onto a mesh ────────────
 
-# `instantiate_basis` hook for the deferred `_BSplineSpec`. Invoked when `space` / `overlay` build a level from
-# `bspline(...)`, once the level's mesh and order are known; every later rebuild of the level reaches the
-# `BSplineFamily` method below instead. Validates the request and materialises the concrete `BSplineFamily` from the
-# mesh axes; the spec itself only ever exists between `bspline(...)` and this call, so every downstream method
-# dispatches on the concrete family type.
+# `instantiate_basis` hook for the deferred `_BSplineSpec`, and the one place a B-spline request is judged. Invoked when
+# `space` / `overlay` build a level from `bspline(...)`, once the level's mesh and order are known, and — through the
+# `BSplineFamily` method below — on every later rebuild of the level as well. Validates the request and materialises the
+# concrete `BSplineFamily` from the mesh axes; the spec itself only ever exists between `bspline(...)` and this call, so
+# every downstream method dispatches on the concrete family type.
 #
 # The mask is not an argument, because the family does not depend on it: arbitrary `LevelMask` geometries are handled by
 # either mechanism in the dof layer — the support-selection rule is a per-function containment test and the
 # trace-vanishing constraints are assembled face by face, so neither needs the mask to be separable.
 #
-# A request for an integer `continuity = m` that already equals `p_d − 1` on every axis is normalised to the `:maximal`
-# sentinel. The two name the same space — the proof is in `bspline`'s docstring — but selection reaches it with strong
-# eliminations rather than a constraint cascade, so routing the integer spelling through the cheaper mechanism costs the
-# caller nothing and saves the dof layer a pass.
+# A request for an integer `continuity = m` that already equals `p_d − 1` on every axis takes the selection mechanism
+# (`_selects_by_support`). The two name the same space — the proof is in `bspline`'s docstring — but selection reaches
+# it with strong eliminations rather than a constraint cascade, so routing the integer spelling through the cheaper
+# mechanism costs the caller nothing and saves the dof layer a pass. The family keeps the request as given rather than
+# rewriting it to the sentinel: the equivalence holds at this degree only, and a level rebuilt at another degree must
+# be judged against what was asked.
 function Unfitted.instantiate_basis(spec::_BSplineSpec, mesh::CartesianMesh{D,T}, order::NTuple{D,Int},
                                     mode::Symbol) where {D,T<:Real}
     _check_basis_mode(spec, mode, order)
@@ -308,7 +322,7 @@ function Unfitted.instantiate_basis(spec::_BSplineSpec, mesh::CartesianMesh{D,T}
     m <= max_m || throw(ArgumentError("bspline continuity $m exceeds p_d − 1 = $max_m on the " *
                                       "lowest-degree axis; raise the order, lower the continuity, " *
                                       "or ask for :maximal"))
-    all(p -> m == p - 1, order) && return _materialize(_BSplineSpec(_MAXIMAL_CONTINUITY), mesh, order)
+    all(p -> m == p - 1, order) && return _materialize(spec, mesh, order)    # selects by support
     # The clamped mechanism needs enough interior 1D dofs for the constraint system to have something left to pivot
     # onto: eliminating `m + 1` boundary functions per side must leave at least one interior dof, i.e.
     # `dim ≥ 2(m + 1) + 1`, equivalently `cells + p ≥ 2m + 3`. Selection carries no such requirement and is not checked
@@ -328,18 +342,17 @@ function Unfitted.instantiate_basis(spec::_BSplineSpec, mesh::CartesianMesh{D,T}
 end
 
 # Re-instantiate an already-concrete `BSplineFamily` against a (possibly new) mesh and order: every rebuild of a
-# B-spline level after its first construction comes here. A move (`moved_space`) rebuilds the per-axis knot vectors for
-# the new cell coordinates, since reusing the old family would leave stale `axis_coords` / `cell_to_span`. A re-mask,
-# the fold and a level-id reindex keep the mesh and the order, and the rebuild reproduces an equal family (the mask
-# never enters a knot vector). `estimate`'s refinement twin (`_refinement_twin`) passes the family with a mesh refined
-# by an integer factor at the same order, and `elevate` (`_reordered_space`) passes the level's new order. Only the mode
-# check runs: the family keeps the continuity it holds, and neither the continuity / thinness validation nor the
-# normalisation of `m = p − 1` to `:maximal` that the `_BSplineSpec` method applies is repeated — which a refinement
-# cannot invalidate, since it only adds cells, but which a new order from `elevate` is not checked against.
+# B-spline level after its first construction comes here — overlay inheritance (`overlay`'s default `basis` is the base
+# level's concrete family), `elevate`, a move, a mask edit, the fictitious fold, a level-id reindex, `estimate`'s
+# refinement twin and the adaptive rebuild. It is the spec method on the family's own request, so each of them re-runs
+# the continuity bound, the clamped thinness check and the mechanism choice exactly as a fresh build of the same request
+# would, and a rebuild that keeps the mesh and the order reproduces an equal family. A family that kept its stored
+# continuity instead, with only the mode checked, let an inherited or elevated level carry a continuity its new degree
+# cannot have (`C¹` at degree 1), be thinner than the clamped mechanism needs, or keep a mechanism its new degree no
+# longer implies (a `C²` request inherited at degree 4 silently became `C³`).
 function Unfitted.instantiate_basis(family::BSplineFamily, mesh::CartesianMesh{D,T}, order::NTuple{D,Int},
                                     mode::Symbol) where {D,T<:Real}
-    _check_basis_mode(family, mode, order)
-    return _materialize(_BSplineSpec(family.continuity), mesh, order)
+    return Unfitted.instantiate_basis(_BSplineSpec(family.continuity), mesh, order, mode)
 end
 
 # ── Knot-vector construction ──────────────────────────────────────────────────
