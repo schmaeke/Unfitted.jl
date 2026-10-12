@@ -439,3 +439,51 @@ end
         @test status === :fitted && residual < 1e-14
     end
 end
+
+@testset "implicit quadrature — a pair leaf that vanishes adds no breakpoints" begin
+    # Two adjoining boxes share a face inside the cells: one box's leaf x₁ − a and the other's a − x₁ are two leaf
+    # objects with one zero set, and so are the lower faces each box gives itself. The pair leaf of two such leaves is
+    # zero up to round-off, which sampling its sign cannot prune, and it put a breakpoint at every scan sample of every
+    # fiber: 17 064 kernel points instead of 1674 for the 3D boxes on 4³ at q = 3, and 1872 instead of 1056 for the
+    # L-shape rotated by 30° on 7², whose pair leaf is round-off of either sign. Pruned (`_vanishes`), the rule of every
+    # cell has as many points as with each shared face given as one leaf object, and the volume stays exact.
+    halfspace(n, c) = leaf(x -> dot(n, x) - c; lipschitz=1.0)
+    function adjoining(R, lo1, hi1, lo2, hi2; once)      # the boxes rotated by R about the centre of the unit cube
+        c = SVector(ntuple(_ -> 0.5, length(lo1)))
+        parts1, parts2 = LevelSet[], LevelSet[]
+        for d in eachindex(lo1)
+            e = R[:, d]
+            at(v) = dot(e, c) + v - 0.5
+            up1, down1 = halfspace(e, at(hi1[d])), halfspace(-e, -at(lo1[d]))
+            # the boxes meet on x₁ = hi1[1] = lo2[1] and share their lower faces on the other axes
+            down2 = !once ? halfspace(-e, -at(lo2[d])) : d == 1 ? complement(up1) : down1
+            push!(parts1, up1, down1)
+            push!(parts2, halfspace(e, at(hi2[d])), down2)
+        end
+        return union(intersect(parts1...), intersect(parts2...))
+    end
+    θ = π / 6
+    for (R, n, q, lo1, hi1, lo2, hi2) in
+        ((SMatrix{3,3}(1.0I), 4, 3, (0.1, 0.1, 0.1), (0.45, 0.9, 0.9), (0.45, 0.1, 0.1), (0.9, 0.42, 0.42)),
+         (SMatrix{2,2}(cos(θ), sin(θ), -sin(θ), cos(θ)), 7, 4, (0.2, 0.2), (0.5, 0.8), (0.5, 0.2), (0.8, 0.5)))
+        cells = [box((Tuple(I) .- 1) ./ n, Tuple(I) ./ n) for I in CartesianIndices(ntuple(_ -> n, length(lo1)))]
+        twice, once = map((false, true)) do shared
+            geom = adjoining(R, lo1, hi1, lo2, hi2; once=shared)
+            return [_csg_rule(geom, cell; gp=q, certified=true) for cell in cells]
+        end
+        @test [length(r[2]) for r in twice] == [length(r[2]) for r in once]
+        @test sum(r -> _quad(x -> 1.0, r), twice) ≈ prod(hi1 .- lo1) + prod(hi2 .- lo2) rtol = 1e-14
+    end
+
+    # Two leaves that cross in a line inside a face of the base box: the roof x₃ ≤ 0.25 − |x₁ − 0.4| has its ridge in
+    # the grid plane x₃ = 0.25. Along x₁ the pair leaf of its two planes is √2 (x₃ − 0.25) on the base of the cell below
+    # the ridge, which does not vanish there, but its restriction to the face x₃ = 0.25 does, and was kept: the roof
+    # closed by x₃ ≥ 0.05 and 0.1 ≤ x₂ ≤ 0.9 took 1350 kernel points on 4³ at q = 3 instead of 540.
+    ga = x -> (x[3] - 0.25 - (x[1] - 0.4)) / √2
+    gb = x -> (x[3] - 0.25 + (x[1] - 0.4)) / √2
+    pair = Unfitted._FDLeaf(Unfitted._PairLeaf{Float64}(ga, gb, 1, 0.25, 0.5), 1e-6)
+    atol = Unfitted._quad_ctx(Float64, 3, nothing, 4, 0.25).atol
+    @test !Unfitted._vanishes(pair, box((0.25, 0.0), (0.5, 0.25)), atol)
+    @test Unfitted._vanishes(Unfitted._restrict(pair, 2, 0.25), box((0.25,), (0.5,)), atol)
+    @test !Unfitted._vanishes(Unfitted._restrict(pair, 2, 0.0), box((0.25,), (0.5,)), atol)
+end

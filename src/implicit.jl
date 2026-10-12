@@ -242,8 +242,9 @@ _restrict(g::_LipschitzLeaf, k::Int, v) = _LipschitzLeaf(_Slice(g.f, k, v), g.li
 # also stay inside the box, but kinks P along gⱼ's traces, and the tetrahedron of the tests then misses its volume by
 # 2e-6.) Off the bracket P vanishes only where the two interpolants' roots meet beyond the box, so two curved leaves
 # that do not cross inside it usually leave P of one sign — the order of their roots — and the base problem prunes it
-# like any leaf that does not vary (`_sample_sign`). When gⱼ's end values are equal the secant has no root and P is gᵢ
-# at the lower end.
+# like any leaf that does not vary (`_sample_sign`); two leaves with one zero set leave P zero up to round-off, and the
+# base problem prunes that as well (`_vanishes`). When gⱼ's end values are equal the secant has no root and P is gᵢ at
+# the lower end.
 #
 # `gi` and `gj` are `Any`, as the kernel's leaf lists are: typed fields would nest a pair leaf's type once per level of
 # the reduction (pairs of restricted pairs in 3D), and the compile work with it.
@@ -299,6 +300,30 @@ _face(s::_Slice) = s.v
 _face(g::Union{_LipschitzLeaf,_FDLeaf}) = _face(g.f)
 _face(_) = nothing
 _opposite_faces(a, b) = (fa = _face(a)) !== nothing && (fb = _face(b)) !== nothing && fa != fb
+
+# Whether the leaf `g` is a pair leaf, or a restriction of one, that vanishes on the box `U` up to round-off. Two
+# distinct leaves with one zero set — the shared face of two adjoining CSG boxes, x − a for one and a − x for the other,
+# or one plane that two boxes give as two leaf objects — have roots that coincide on every fiber, so their pair leaf is
+# zero over the whole base; and where two leaves cross in a line that lies in a face of the base box (a roof ridge in a
+# grid plane), their pair leaf's restriction to that face is zero. Neither has a crossing to resolve, but `_sample_sign`
+# cannot prune them: they sample zeros, or round-off of either sign, and kept as leaves they put a breakpoint at every
+# scan sample of every fiber — seven to ten times the kernel points, and sixty to seventy times the leaf evaluations of
+# the moment fits, of two boxes that share a face inside a cell.
+#
+# The test is a distance along the fiber, so the kernel's own coincidence tolerance `atol` applies (`_emit_fiber!` drops
+# a sub-interval shorter than it): at the center and every corner of `U`, |P| ≤ atol·s, with s = |gᵢ(hi) − gᵢ(lo)| /
+# (hi − lo) the mean slope of gᵢ along the fiber, which turns P = gᵢ at gⱼ's root into the gap between the two roots.
+# For linear leaves P is affine, so the roots are then that close over all of `U`; for curved ones a crossing missed
+# between the samples loses only the breakpoint the pair leaf would have added, which is the accuracy of no pair leaf.
+# Where round-off exceeds `atol` (a box tiny against its distance from the origin) the pair leaf is kept, which costs
+# work only. Leaves the caller supplied are never tested, so the partition they give is unchanged.
+_vanishes(_, ::AxisBox, _) = false
+_vanishes(g::_FDLeaf, U::AxisBox, atol) = all(x -> _negligible(g.f, x, atol), (center(U), _box_vertices(U)...))
+_negligible(s::_Slice, x, atol) = _negligible(s.g, _insert_axis(x, s.k, s.v), atol)
+function _negligible(p::_PairLeaf, y, atol)
+    at(g, t) = g(_insert_axis(y, p.k, t))
+    return abs(p(y)) * (p.hi - p.lo) <= atol * abs(at(p.gi, p.hi) - at(p.gi, p.lo))
+end
 
 # The gradient of one leaf at a sample `x` of the box `U`: the context's operator (`ForwardDiff`, or the caller's
 # `grad`) for a leaf the user supplied, and finite differences at the leaf's step for a pair leaf. Each difference is
@@ -467,18 +492,19 @@ end
 # reduction passes the leaves' face restrictions as a partition-only base problem (`Returns(true)` membership) and
 # applies the real membership in its own fiber loop. Stages:
 #
-#   1. Prune leaves that do not vary on U (a partition-only optimisation; `membership` re-evaluates the full predicate,
-#      so this is safe). With no varying leaf left, U is uniform: full tensor rule if inside, else empty.
+#   1. Prune leaves that do not vary on U, and pair leaves that vanish on it (`_vanishes`) — a partition-only
+#      optimisation; `membership` re-evaluates the full predicate, so this is safe. With no varying leaf left, U is
+#      uniform: full tensor rule if inside, else empty.
 #   2. Base case D = 1: emit the inside parts of the single axis.
 #   3. Choose the height axis. If not certifiably graph-like and budget remains, bisect and recurse; at the floor (or
 #      on a box too small to bisect), force-reduce on the least-bad axis.
-#   4. Reduce: build the base problem on U with the height axis removed (every leaf's two face restrictions and one pair
-#      leaf per two leaves monotone along the axis that are not siblings, partition-only) and recurse; then sweep the
-#      base nodes, emitting a fiber rule at each.
+#   4. Reduce: build the base problem on U with the height axis removed (`_base_leaves`: every leaf's two face
+#      restrictions and one pair leaf per two leaves monotone along the axis that are not traces on opposite faces,
+#      partition-only) and recurse; then sweep the base nodes, emitting a fiber rule at each.
 function _implicit_quad(lsets, membership, U::AxisBox{D,T}, ctx::_QuadCtx, depth::Int) where {D,T}
     active = Any[]
     for g in lsets
-        _sample_sign(g, U) == 0 && push!(active, g)
+        _sample_sign(g, U) == 0 && !_vanishes(g, U, ctx.atol) && push!(active, g)
     end
     if isempty(active)
         return membership(center(U)) ? _full_box_rule(U, ctx) : (SVector{D,T}[], T[])
@@ -534,10 +560,11 @@ function _certified_leaves(leaves::AbstractVector, lipschitz)
 end
 
 # The leaf list with every repeat dropped, first occurrences in order. A CSG tree may name one leaf twice — (a ∩ b) ∪
-# (a ∩ c) for a ∩ (b ∪ c) — and `_leaves` lists it once per occurrence. A repeat adds nothing to the partition, but two
-# copies of one leaf would get a pair leaf (`_base_leaves`) that vanishes identically, whose round-off scatters
-# breakpoints over the base, and the copies' pair leaves with a third leaf would pair up again one reduction further
-# down. Identity (`===`) is the test, so wrappers of one callback with one Lipschitz constant are the same leaf.
+# (a ∩ c) for a ∩ (b ∪ c) — and `_leaves` lists it once per occurrence. A repeat adds nothing to the partition, only
+# work: every fiber scans it twice, and every pair leaf it forms with a third leaf is built twice (`_base_leaves`). The
+# pair leaf of the two copies, and the one of their two pair leaves a reduction further down, vanish and are pruned
+# (`_vanishes`), but only after they have been built and sampled. Identity (`===`) is the test, so wrappers of one
+# callback with one Lipschitz constant are the same leaf.
 function _distinct(leaves::Vector{Any})
     distinct = Any[]
     for g in leaves
