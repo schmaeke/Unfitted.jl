@@ -959,6 +959,9 @@ end
         kid = findfirst(overlapping_cells(L, [cell]; from=1, to=2))
         held = refine(refine(L; h=[(1, cell)]); h=[(2, kid)])
         released = coarsen(held; h=[(1, cell)])
+        # On the B-spline stack level 3's collar reaches every child of `cell`, so all four are held and the call
+        # releases nothing: it returns its argument itself, as any call that changes nothing does.
+        basis isa IntegratedLegendre || @test released === held
 
         @test active_cells(released; level=2)[kid]
         @test active_cells(released; level=3) == active_cells(held; level=3)
