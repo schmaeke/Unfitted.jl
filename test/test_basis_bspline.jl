@@ -169,6 +169,17 @@ end
     @test _bspline_family_key(folded.levels[2].basis) == _bspline_family_key(cut.levels[2].basis)
 end
 
+@testset "BSpline extension: a degree raise changes the level's type" begin
+    # `elevate` keeps `typeof(V)` only where the degree is not a type parameter. A B-spline level's degree is one
+    # (`BSplineSpace{p}`), so a raise is a new level type — and a valid one, the same as a fresh build at that degree.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    V = space(Ω; cells=4, order=2, basis=bspline())
+    W = elevate(V, 1 => 3)
+    @test typeof(W) !== typeof(V)
+    @test typeof(W) === typeof(space(Ω; cells=4, order=3, basis=bspline()))
+    @test typeof(elevate(V, 1 => 2)) === typeof(V)
+end
+
 @testset "BSpline extension: support selection — the dof ledger is the closed form" begin
     # The two halves of the selection rule, as counts. A level whose faces are all PHYSICAL keeps every function it has
     # — nothing is artificial, so nothing has to vanish — and a level whose faces are all ARTIFICIAL keeps exactly the

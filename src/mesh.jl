@@ -570,12 +570,17 @@ end
     cell_basis_indices(level::Level, cell::CartesianIndex) -> Vector{CartesianIndex{D}}
 
 Multi-indices of the local basis functions cell `cell` of `level` generates, in the canonical
-[`local_basis_indices`](@ref) order.
+[`local_basis_indices`](@ref) order. An inactive cell generates none and gets the empty set.
 
-On a uniform level this is `local_basis_indices(level.basis, nominal_order(level), level.mode)` and allocates a fresh
-vector per call, exactly as the dof walk has always done. On a level carrying a per-cell order it is a lookup into the
-level's precomputed minimum-rule table and allocates nothing — and it is *not* the index set at the cell's own order:
-the modes a lower-order neighbour cannot match are gone, which is what keeps the space C⁰ across an order jump.
+The answer is a lookup into the level's minimum-rule table ([`CellModes`](@ref)) on every level, and allocates
+nothing. On a uniform level every active cell shares one set, the level's whole index set
+`local_basis_indices(level.basis, nominal_order(level), level.mode)`. On a level carrying a per-cell order the set is
+*not* the index set at the cell's own order: the modes a lower-order neighbour cannot match are gone, which is what
+keeps the space C⁰ across an order jump.
+
+The result is the level's own vector — the same object for every cell with the same set, and the one the dof layout and
+the assembly banks pair raw dofs against — so treat it as read-only and `copy` it before modifying it. Mutating it
+corrupts that table for every cell that shares it.
 
 This is the one place the per-cell index set is defined. Every consumer that pairs `cell_dofs(layout, level, cell)` with
 basis values positionally must obtain its multi-indices here, or from a bank filled from `level.modes`.
@@ -1219,10 +1224,15 @@ end
 """
     elevate(V::Space, level => order, ...) -> Space
 
-Return `V` with the named levels' polynomial orders replaced. Meshes, level boxes, activation masks and basis families
-are untouched, so the result has the *same type* as `V` and a model rebuilt from it does not recompile the assembly
-pipeline — the per-cell order lives in a `CellOrders` field whose palette length is a value rather than a type
-parameter, so a p-step never changes `typeof(V)`.
+Return `V` with the named levels' polynomial orders replaced. Meshes, level boxes, activation masks and the basis
+families' requests are untouched; a family whose concrete form depends on the order — the B-spline family's knot vectors
+— is rebuilt at the new order and validated there, as a fresh build of the same request would be.
+
+For a family whose degree is not a type parameter, integrated Legendre's, the result has the *same type* as `V` and a
+model rebuilt from it does not recompile the assembly pipeline: the per-cell order lives in a `CellOrders` field whose
+palette length is a value rather than a type parameter, so a p-step never changes `typeof(V)`. A B-spline level's degree
+is a type parameter of its knot-vector spaces (`BSplineSpace{p}`), so raising it changes the level's type, and the
+pipeline is compiled for the new one.
 
 `order` takes every shape [`space`](@ref)'s `order` keyword takes — an integer, an `NTuple{D,Int}`, an array of either
 shaped like the level's cell grid, or a predicate `(cell_box, cell_index) -> order` — plus one shape that only makes

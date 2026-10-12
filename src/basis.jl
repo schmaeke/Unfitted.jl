@@ -227,7 +227,7 @@ Standard Legendre polynomial `Lₙ(x)` evaluated via the three-term recurrence
     L₁(ξ) = ξ
     Lₘ(ξ) = ((2m − 1) ξ Lₘ₋₁(ξ) − (m − 1) Lₘ₋₂(ξ)) / m,     m ≥ 2.
 
-Used by the per-mode value/derivative wrappers below for testing and one- off evaluation. The hot-path assembly route
+Used by the per-mode value/derivative wrappers below for testing and one-off evaluation. The hot-path assembly route
 does not call this — see `_fill_factor_tables!` for the fused per-axis recurrence that serves it.
 """
 function legendre_value(n::Integer, x::Real)

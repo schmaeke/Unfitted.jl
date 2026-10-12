@@ -276,6 +276,22 @@ end
     @test_throws ArgumentError elevate(V, 1 => (c => 0 for c in (a,)))
 end
 
+@testset "per-cell order: cell_basis_indices returns the level's shared, read-only set" begin
+    # The documented contract: a lookup into the level's own table on every level, so every active cell of a uniform
+    # level gets the SAME vector (callers must not mutate it), equal to the index set at the level's order, and an
+    # inactive cell gets the empty set.
+    V = space(_CO_2D; cells=2, order=2, active=[CartesianIndex(1, 1), CartesianIndex(2, 2), CartesianIndex(1, 2)])
+    level = V.levels[1]
+    shared = cell_basis_indices(level, CartesianIndex(1, 1))
+    @test cell_basis_indices(level, CartesianIndex(2, 2)) === shared
+    @test cell_basis_indices(level, CartesianIndex(1, 2)) === shared
+    @test shared == local_basis_indices(level.basis, (2, 2), :tensor)
+    @test isempty(cell_basis_indices(level, CartesianIndex(2, 1)))
+    # And a p-step on integrated Legendre keeps the space's type, uniform or graded.
+    @test typeof(elevate(V, 1 => 3)) === typeof(V)
+    @test typeof(elevate(V, 1 => [CartesianIndex(1, 1) => 4])) === typeof(V)
+end
+
 @testset "per-cell order: through the model" begin
     Ω = _CO_2D
     orders = [2 + (i + j) % 3 for i in 1:8, j in 1:8]
