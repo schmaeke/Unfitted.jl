@@ -333,8 +333,7 @@ function assemble!(model::Model; threaded::Bool=Threads.nthreads() > 1)
     model.matrix, model.rhs = matrix, rhs
     diag = model.diagnostics
     diag.symmetry_residual = model.problem.symmetric ? 0.0 : NaN
-    diag.condition_estimate = _condition_estimate(matrix)
-    diag.scaled_condition_estimate = _scaled_condition_estimate(matrix)
+    diag.condition_estimate, diag.scaled_condition_estimate = _condition_estimates(matrix)
     return model
 end
 

@@ -738,10 +738,17 @@ function _prepare_spaces(problem::Problem{D,T}) where {D,T}
         remap[V] = reindexed
         offset += level_count(reindexed)
     end
-    new_fields = map(f -> field(f.name, remap[f.space]; components=component_count(f)), problem.fields)
-    effective = Problem(new_fields; blocks=problem.blocks, loads=problem.loads, dirichlet=problem.dirichlet,
-                        symmetric=problem.symmetric)
-    return effective, prepared, caches
+    return _rehome(problem, V -> remap[V]), prepared, caches
+end
+
+# `problem` with every field re-homed onto `space_of(field.space)`: the same names, components, forms, Dirichlet data
+# and symmetry flag over other spaces. `_prepare_spaces` re-homes onto the prepared spaces, and `_derived` rebuilds a
+# model's problem over a derived (adapted / elevated / moved / remasked / enriched) space, which `_prepare_spaces` then
+# folds and reindexes like any other.
+function _rehome(problem::Problem, space_of)
+    fields = map(f -> field(f.name, space_of(f.space); components=component_count(f)), problem.fields)
+    return Problem(fields; blocks=problem.blocks, loads=problem.loads, dirichlet=problem.dirichlet,
+                   symmetric=problem.symmetric)
 end
 
 # ── Dof layouts ───────────────────────────────────────────────────────────────
@@ -904,18 +911,12 @@ end
 
 # Pick out the Dirichlet conditions that apply to the field called `name` from a problem's `dirichlet` list: every
 # unscoped condition (`condition.field === nothing`) applies to the only field of a single-field problem and raises on
-# multi-field problems; named conditions match by name.
+# multi-field problems; named conditions match by name. An `Any[]`, which the projection reads as such.
 function _dirichlet_for_field(problem::Problem, name::Symbol)
-    scoped = Any[]
-    for condition in problem.dirichlet
-        if condition.field === nothing
-            length(problem.fields) == 1 || throw(ArgumentError("multi-field Dirichlet conditions must specify a field"))
-            push!(scoped, condition)
-        elseif condition.field === name
-            push!(scoped, condition)
-        end
-    end
-    return scoped
+    length(problem.fields) == 1 ||
+        all(c -> c.field !== nothing, problem.dirichlet) ||
+        throw(ArgumentError("multi-field Dirichlet conditions must specify a field"))
+    return Any[c for c in problem.dirichlet if c.field === nothing || c.field === name]
 end
 
 # ── Region caches ─────────────────────────────────────────────────────────────
@@ -1073,40 +1074,34 @@ function Base.show(io::IO, model::Model{D}) where {D}
           ", regions=", diagnostics(model).integration_regions, ", assembled=", model.matrix !== nothing, ")")
 end
 
-# Condition-number estimator for small assembled matrices. Returns `NaN` above `max_size` since `cond(Matrix(sparse))`
-# densifies the matrix and is only viable up to a few hundred unknowns. The 256 cap keeps the diagnostic free for unit
-# tests and small examples while never silently dominating real-problem assembly cost.
-function _condition_estimate(matrix::SparseMatrixCSC; max_size::Int=256)
-    n = size(matrix, 1)
-    n == 0 && return NaN
-    n > max_size && return NaN
-    return Float64(cond(Matrix(matrix)))
-end
-
-# The same estimator on the symmetrically diagonal-scaled operator `D⁻¹ A D⁻¹` with `D = diag(√|A_ii|)` — what a
-# Jacobi-preconditioned solver sees, and the half of the conditioning question that is about the basis rather than about
-# the scale spread of the diagonal.
+# Condition-number estimates of a small assembled matrix, `(plain, scaled)`: `cond(A)`, and the same on the
+# symmetrically diagonal-scaled operator `D⁻¹ A D⁻¹` with `D = diag(√|A_ii|)`. Both are `NaN` for an empty matrix and
+# above `max_size`, since `cond` needs the dense matrix and is only viable up to a few hundred unknowns: the 256 cap
+# keeps the diagnostic free for unit tests and small examples while never silently dominating real-problem assembly
+# cost. The matrix is densified once for both (`cond` copies its argument, so the scaling below reads the original).
 #
-# On an immersed system those two halves are far apart and the distinction is not academic: a basis function whose
-# support is almost entirely fictitious carries an almost-zero diagonal, which inflates `cond(A)` by the spread of that
-# diagonal alone. Scaling removes exactly that, and what remains measures whether the surviving functions are
-# near-dependent on Ω. `AssemblyDiagnostics` documents the measured gap between the two shipped families.
+# The scaled operator is what a Jacobi-preconditioned solver sees, and the half of the conditioning question that is
+# about the basis rather than about the scale spread of the diagonal. On an immersed system those two halves are far
+# apart and the distinction is not academic: a basis function whose support is almost entirely fictitious carries an
+# almost-zero diagonal, which inflates `cond(A)` by the spread of that diagonal alone. Scaling removes exactly that, and
+# what remains measures whether the surviving functions are near-dependent on Ω. `AssemblyDiagnostics` documents the
+# measured gap between the two shipped families.
 #
 # It is also the *accurate* computation of the two on such a system. The unscaled matrix's smallest eigenvalue can sit
 # below `λ_max · eps`, where a dense eigensolver returns roundoff — including a negative value on an operator that is
-# positive definite — while the scaled matrix resolves the same mode comfortably. A `NaN` here means a zero diagonal
-# entry, which is a dof carrying no energy at all rather than a conditioning verdict.
-function _scaled_condition_estimate(matrix::SparseMatrixCSC; max_size::Int=256)
+# positive definite — while the scaled matrix resolves the same mode comfortably. A scaled `NaN` beside a finite plain
+# estimate means a zero diagonal entry, which is a dof carrying no energy at all rather than a conditioning verdict.
+function _condition_estimates(matrix::SparseMatrixCSC; max_size::Int=256)
     n = size(matrix, 1)
-    n == 0 && return NaN
-    n > max_size && return NaN
+    (n == 0 || n > max_size) && return NaN, NaN
     dense = Matrix(matrix)
+    plain = Float64(cond(dense))
     scale = [sqrt(abs(dense[i, i])) for i in 1:n]
-    any(iszero, scale) && return NaN
+    any(iszero, scale) && return plain, NaN
     for j in 1:n, i in 1:n
         dense[i, j] /= scale[i] * scale[j]
     end
-    return Float64(cond(dense))
+    return plain, Float64(cond(dense))
 end
 
 """
@@ -1173,8 +1168,7 @@ end
 # new configuration exactly, which is the contract all three mutators advertise. Everything that is *not* geometry —
 # field names and component counts, blocks, loads, Dirichlet data — is read back from `model.problem`, which carries it
 # unchanged through the fold and is kept current by `update_dirichlet!`. Every caller is single-domain
-# (`_assert_single_domain`), so `prefold_space` is *the* space and `_problem_with_space` re-homes every field onto the
-# derived copy.
+# (`_assert_single_domain`), so `prefold_space` is *the* space and `_rehome` re-homes every field onto the derived copy.
 #
 # The rebuilt model is then copied onto `model` field by field, by name, so the rule is "everything a `prepare` builds
 # is replaced" and a field added to `Model` later is replaced with the rest rather than forgotten. A field that must
@@ -1203,8 +1197,8 @@ end
 
 # A model of `model`'s problem prepared over `space`: the one builder behind every model derived from another — the
 # non-mutating derivations, the in-place mutators (`_remodel!`) and `estimate`'s enriched model. The forms, field
-# channels and Dirichlet data are `model`'s (`_problem_with_space`); the plan options are too, unless `options` says
-# otherwise, as `estimate`'s does when it exempts a level from pruning.
+# channels and Dirichlet data are `model`'s (`_rehome`); the plan options are too, unless `options` says otherwise, as
+# `estimate`'s does when it exempts a level from pruning.
 #
 # `caches` has no default, so every caller states what happens to `model`'s moment-fit caches. Every derivation hands
 # them on rather than starting empty, for the reason `move!` gives for not invalidating them: they are keyed by region
@@ -1226,16 +1220,7 @@ end
 # `point_base` numbers the new model's quadrature points (`AssemblyCache`). Only `estimate` moves it off 0.
 function _derived(model::Model{D,T}, space::Space{D,T}; options::NamedTuple=model.plan_options,
                   caches::Vector{_MomentFitCache{D,T}}, point_base::Int=0) where {D,T}
-    return _prepared_model(_problem_with_space(model.problem, space), options, caches; point_base)
-end
-
-# Rebuild `problem` over a new (adapted / elevated / moved / remasked / enriched) space, reusing the field channels,
-# forms, and Dirichlet data. The rebuild rule of `_derived` (the geometry-fold rebuild goes through `_prepare_spaces`,
-# which also reindexes level ids).
-function _problem_with_space(problem::Problem, new_space::Space)
-    new_fields = map(f -> field(f.name, new_space; components=component_count(f)), problem.fields)
-    return Problem(new_fields; blocks=problem.blocks, loads=problem.loads, dirichlet=problem.dirichlet,
-                   symmetric=problem.symmetric)
+    return _prepared_model(_rehome(model.problem, _ -> space), options, caches; point_base)
 end
 
 """
@@ -1298,9 +1283,9 @@ every rule it has.
 """
 function moved(model::Model{D,T}; level::Integer, to::AxisBox{D,T}) where {D,T}
     # Same restriction as `move!`, and for the same reason: `level` indexes one space's level tuple, which is ambiguous
-    # once a problem spans several subdomain spaces. `_problem_with_space` re-homes *every* field onto the moved space,
-    # so on a coupled model there is no answer to give rather than a wrong one — hence a raise, not a pick. It is
-    # asserted here, before `adapted` would assert it under its own name, so the message says `moved`.
+    # once a problem spans several subdomain spaces. `_rehome` re-homes *every* field onto the moved space, so on a
+    # coupled model there is no answer to give rather than a wrong one — hence a raise, not a pick. It is asserted
+    # here, before `adapted` would assert it under its own name, so the message says `moved`.
     _assert_single_domain(model, "moved")
     return adapted(model, _moved_prefold_space(model, level, to))
 end
