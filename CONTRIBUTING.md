@@ -795,9 +795,10 @@ superposition idea for its own enrichment.
     That revises an earlier rule — "a uniform level is a palette of one and
     not a special case" — for a measured reason: on a uniform level both
     per-cell arrays are constants, 4 bytes on every cell of most levels
-    (4.15 bytes per cell on an 8² ladder of depth 7, against 0.13 with the
-    mask alone, about 90 MB across the 22.4 M cells of a depth-9 stack), and
-    the discretisation pin digested them at 8 hash rounds per cell. The
+    (`Base.summarysize` of an 8² ladder of depth 7: 4.15 bytes per cell
+    with them, 0.15 without, the mask's bit per cell being most of the rest;
+    about 90 MB across the 22.4 M cells of a depth-9 stack), and the
+    discretisation pin digested them at 8 hash rounds per cell. The
     record type is still one; the uniform case is one `nothing` branch in
     four readers — `cell_order`, `cell_basis_indices`, `cell_orders` and the
     assembly hot path's `_active_set`, which reads no mask because every
