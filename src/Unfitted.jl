@@ -336,7 +336,9 @@ merge touching or overlapping bodies into the boundary of their union and orient
 `orientation` selects the inside/outside test:
 
   - `:pseudonormal` (default) — angle-weighted pseudonormal of the closest feature (Bærentzen & Aanæs 2005). Fast
-    (O(candidates) per query), exact for a clean mesh including reflex features.
+    (O(candidates) per query), exact for a clean mesh including reflex features, down to the length at which it tells
+    features apart, 10⁻⁸ of the bounding-box diagonal: within a few such lengths of a ridge too sharp for it to
+    resolve, the sign can be wrong.
   - `:winding` — generalized winding number (Jacobson et al. 2013). Robust on imperfect / non-watertight / globally
     flipped meshes, at O(cells) per query, and the only mode that accepts a mesh failing the checks above.
 

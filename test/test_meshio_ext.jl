@@ -213,6 +213,15 @@ end
     @test abs(sdf(p)) ≈ minimum(_triangle_distance((v[a], v[b], v[c]), p) for (a, b, c) in f) rtol = 1e-6
 end
 
+# Closer to such a ridge, within a few of the sign tests' `tol` (1e-8 of the bounding-box diagonal), the gather can sum
+# cells that do not share the closest feature and the weights no longer balance them: 2 `tol` from this wedge's ridge
+# some points outside read as inside. `mesh_levelset`'s docstring states that limit rather than promising an exact sign.
+@testset "MeshIO ext — the docs state the pseudonormal's resolution limit" begin
+    texts = [join(doc.text)
+             for doc in values(Base.Docs.meta(Unfitted)[Base.Docs.Binding(Unfitted, :mesh_levelset)].docs)]
+    @test any(t -> occursin("10⁻⁸ of the bounding-box diagonal", t), texts)
+end
+
 @testset "MeshIO ext — winding sign mode" begin
     v, f = _cube_mesh(0.2, 0.8)
     sp = Unfitted._leaves(mesh_levelset(triangle_mesh(v, f); orientation=:pseudonormal))[1].f
