@@ -407,8 +407,8 @@ absent rather than zero (see [`WeakForm`](@ref)), so it belongs on a [`loadform`
 component. The form is built `component_aware = true`, and `symmetric = true` — an inert flag on a form with no bilinear
 part to mirror.
 
-See [`source_load`](@ref) for the same form wrapped as a load contribution, [`load`](@ref) for the whole one-field
-problem, and [`neumann`](@ref) for the boundary-integrated counterpart.
+See [`source_load`](@ref) for the same form wrapped as a load contribution, which is also how the whole one-field load
+problem is spelled, and [`neumann`](@ref) for the boundary-integrated counterpart.
 """
 function source_form(; source)
     source_coefficient = _as_coefficient(source)
@@ -461,6 +461,14 @@ Wrap [`source_form`](@ref) as the load contribution `loadform(u, source_form(; s
 [`source_form`](@ref) for the shapes it accepts. A constant tuple or array must carry exactly one entry per component of
 `u`, and any other length raises `ArgumentError` here, before anything is assembled. Pass `on = …` by building the
 [`loadform`](@ref) directly when the load belongs on a boundary rather than in the volume — or use [`neumann`](@ref).
+
+The whole one-field load problem `a(u, v) = 0`, `ℓ(v) = ∫_Ω source(x) · v dx` is one line:
+
+```julia
+Problem((u,); loads=(source_load(u; source),), dirichlet)
+```
+
+For repeated loads on an already prepared model, [`load_vector`](@ref) reuses its integration plan and dof layout.
 """
 function source_load(u::Field; source)
     _check_coefficient_length(source, u, "source")
@@ -552,23 +560,6 @@ function stiffness(u::Field{D,T}; diffusion=one(T), dirichlet=[]) where {D,T}
 end
 
 """
-    load(V::Space; source, dirichlet=[])  -> Problem
-    load(u::Field; source, dirichlet=[])  -> Problem
-
-Build a load-vector [`Problem`](@ref) over a scalar space `V` or a component field `u`:
-
-    a(u, v) = 0,    ℓ(v) = ∫_Ω source(x) · v dx.
-
-For vector fields `source` may return a scalar (applied to all components) or an indexable component value (`SVector`,
-`Tuple`). `dirichlet` is the list of physical Dirichlet conditions to impose; see [`dirichlet`](@ref). For repeated
-time-dependent loads on an already prepared model, prefer [`load_vector`](@ref) — it reuses the model's existing
-integration plan and dof layout instead of building fresh ones from the problem.
-"""
-load(V::Space{D,T}; source, dirichlet=[]) where {D,T} = load(field(:u, V); source, dirichlet)
-
-load(u::Field{D,T}; source, dirichlet=[]) where {D,T} = Problem((u,); loads=(source_load(u; source),), dirichlet)
-
-"""
     load_vector(model; source) -> Vector
 
 Assemble a load vector on the single field of an already prepared `model`, reusing its dof layout, constraints, and
@@ -578,7 +569,8 @@ not name it. A multi-field model has no implicit field and raises `ArgumentError
 [`source_load`](@ref) and [`assemble_vector`](@ref) there.
 
 The canonical use case is time-dependent or otherwise repeated load assembly: build the model once via
-[`prepare`](@ref), then call `load_vector` once per time step with the current source.
+[`prepare`](@ref), then call `load_vector` once per time step with the current source. A load problem built from scratch
+is `Problem((u,); loads=(source_load(u; source),), dirichlet)`; see [`source_load`](@ref).
 """
 load_vector(model::Model{D,T}; source) where {D,T} = assemble_vector(model, source_load(_default_field(model); source))
 

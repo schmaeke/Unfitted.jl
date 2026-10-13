@@ -7,6 +7,13 @@ using Random
 using FileIO
 using MeshIO
 
+# The documented recipe loads FileIO beside Unfitted, so the two must export no common name: a shared one is ambiguous
+# in the caller's namespace and raises an `UndefVarError` the moment it is used. Unfitted's `load` was such a name, so
+# `stl_levelset`'s own example could not call it.
+@testset "MeshIO ext — Unfitted and FileIO export no common name" begin
+    @test isempty(intersect(names(Unfitted), names(FileIO)))
+end
+
 # ── 3D cube (triangle surface) ────────────────────────────────────────────────
 
 # A cube [lo,hi]³ as an outward-oriented triangle mesh (8 vertices, 12 triangles). Cube faces are planar, so each cut

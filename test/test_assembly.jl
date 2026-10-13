@@ -460,7 +460,8 @@ end
     mass_model = prepare(mass(V; dirichlet=bc))
     stiffness_model = prepare(stiffness(V; diffusion=2.0, dirichlet=bc))
     poisson_model = prepare(poisson(V; source=0.0, diffusion=2.0, dirichlet=bc))
-    load_model = prepare(load(V; source=x -> 1.0 + x[1], dirichlet=bc))
+    u = field(:u, V)
+    load_model = prepare(Problem((u,); loads=(source_load(u; source=x -> 1.0 + x[1]),), dirichlet=bc))
 
     assemble!(mass_model)
     assemble!(stiffness_model)

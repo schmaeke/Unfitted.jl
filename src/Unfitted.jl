@@ -70,7 +70,7 @@ export AxisBox, GeometryTolerance, PhysicalDomain, physical_domain, classify_cel
        LoadForm, TrialChannels, TestChannels, WeakForm, Problem, Model, Solution, box, mesh, space, overlay, field,
        block, loadform, boundary, dirichlet, update_dirichlet!, neumann, couple, interface, Interface, InterfaceForm,
        onside, jump_sign, BoundaryMesh, segment_mesh, polyline_mesh, triangle_mesh, points_mesh, poisson, mass,
-       mass_form, mass_block, stiffness, stiffness_form, stiffness_block, load, source_form, source_load, load_vector,
+       mass_form, mass_block, stiffness, stiffness_form, stiffness_block, source_form, source_load, load_vector,
        prepare, assemble, assemble_matrix, assemble_vector, assemble!, foreach_quadrature_point, nquadpoints, solve!,
        solution, move!, moved, moved_space, activate!, deactivate!, active_cells, support_extension, dilate,
        cell_orders, elevate, elevated, cell_order, nominal_order, ladder, adapt, adapted, is_nested, overlapping_cells,
