@@ -2,6 +2,8 @@
 # for stored coordinates and downstream kernels. Both round-trip cheaply via `SVector{D}(…)`.
 const PointLike{D} = Union{NTuple{D,<:Real},SVector{D,<:Real}}
 
+# ── Tolerances ────────────────────────────────────────────────────────────────
+
 """
     GeometryTolerance([T=Float64]; merge, contain, small_volume)
 
@@ -44,6 +46,10 @@ struct GeometryTolerance{T<:Real}
     end
 end
 
+function GeometryTolerance(::Type{T}=Float64; merge=sqrt(eps(T)), contain=merge, small_volume=merge) where {T<:Real}
+    return GeometryTolerance{T}(convert(T, merge), convert(T, contain), convert(T, small_volume))
+end
+
 # The positional constructor Julia generates for a struct without an inner constructor, kept by hand now that there is
 # one; like every other route it ends in the inner constructor's check.
 function GeometryTolerance(merge::T, contain::T, small_volume::T) where {T<:Real}
@@ -55,10 +61,6 @@ function _tolerance_value(::Type{T}, value, name::Symbol) where {T}
     v = convert(T, value)
     v >= 0 || throw(ArgumentError("GeometryTolerance $name must be non-negative; got $value"))
     return v
-end
-
-function GeometryTolerance(::Type{T}=Float64; merge=sqrt(eps(T)), contain=merge, small_volume=merge) where {T<:Real}
-    return GeometryTolerance{T}(convert(T, merge), convert(T, contain), convert(T, small_volume))
 end
 
 """
@@ -88,6 +90,8 @@ function merge_coordinates(values, tol::GeometryTolerance{T}) where {T}
     end
     return resize!(sorted, n)
 end
+
+# ── Axis-aligned boxes ────────────────────────────────────────────────────────
 
 """
     AxisBox{D,T}(lower, upper)
