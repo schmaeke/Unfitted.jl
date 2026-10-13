@@ -134,13 +134,6 @@ end
 
 # ── Solve ─────────────────────────────────────────────────────────────────────
 
-# Record the solver tag on the model's diagnostics. Called from `solve!` after the solve completes so the
-# reproducibility report downstream knows which solver path produced the cached result.
-function _record_solver!(model::Model, method::Symbol)
-    model.diagnostics.solver = method
-    return model
-end
-
 """
     solve!(model::Model; linear_solver=nothing, method=nothing) -> Solution
 
@@ -183,7 +176,8 @@ function solve!(model::Model; linear_solver=nothing, method::Union{Nothing,Symbo
     end
 
     residual = norm(model.matrix * coefficients - model.rhs)
-    _record_solver!(model, solve_method)
+    # The tag on the model's diagnostics tells the reproducibility report which solver path produced the result.
+    model.diagnostics.solver = solve_method
     solver_diagnostics = SolverDiagnostics(solve_method, Float64(residual), isfinite(residual))
     return Solution(coefficients, model.version, solver_diagnostics)
 end
