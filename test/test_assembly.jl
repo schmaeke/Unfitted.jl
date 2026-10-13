@@ -1395,8 +1395,11 @@ end
     u = field(:u, V)
     model = prepare(Problem((u,)))
     A = SMatrix{3,3}(2.0, 0.25, 0.0, 0.25, 1.0, 0.0, 0.0, 0.0, 1.5)
-    constant = _serial_assembly_bytes(assemble_matrix, model, (stiffness_block(u; diffusion=A),))
-    callback = _serial_assembly_bytes(assemble_matrix, model, (stiffness_block(u; diffusion=x -> (1 + x[2]) * A),))
+    blocks = (stiffness_block(u; diffusion=A), stiffness_block(u; diffusion=x -> (1 + x[2]) * A))
+    # On a fresh model the first block measured is charged about 26 KB more than any later one, on its second call too,
+    # which would hide part of a regression behind the constant's figure, so one measurement is thrown away first.
+    _serial_assembly_bytes(assemble_matrix, model, (first(blocks),))
+    constant, callback = map(b -> _serial_assembly_bytes(assemble_matrix, model, (b,)), blocks)
     @test callback ≤ constant + 4096
 end
 
