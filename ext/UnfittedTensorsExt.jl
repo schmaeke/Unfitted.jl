@@ -6,7 +6,7 @@ Package extension that lets weak-form callbacks read trial-side data and return 
 that the assembly hot loop already uses.
 
 The extension is purely additive — it does not change any existing behaviour. Loading `Tensors` next to `Unfitted`
-installs the methods below, on names that `src/Unfitted.jl` declares and documents (the two `TestChannels` constructors
+installs the methods below, on names that `src/stubs.jl` declares and documents (the two `TestChannels` constructors
 and `Vec(::TrialChannels)` are documented on `TestChannels` and `TrialChannels` in `src/problems.jl`); without
 `Tensors`, a call of `symmetric_gradient`, `value_vec` or `gradient_tensor` raises an error that says to run
 `using Tensors`, and the rest of the package functions exactly as before.
