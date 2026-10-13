@@ -1098,9 +1098,13 @@ function _accumulate_dirichlet_rhs!(rhs::Vector{Vector{T}}, samples::FacetTraceS
 end
 
 # Evaluate a `DirichletCondition` at physical coordinate `x` for the given component. Handles both constant and callback
-# `value` fields.
+# `value` fields, classified as a coefficient is (`_as_coefficient`): a number, tuple, array or `UniformScaling` is a
+# constant, and anything else is a callback `value(x)`. Testing for a `Function` instead missed a callable struct,
+# which then reached `_component_value` as if it were a constant and raised a `MethodError` for `getindex`, while the
+# same struct as a source worked.
 function _condition_value(condition::DirichletCondition, x, component::Integer=1)
-    value = condition.value isa Function ? condition.value(x) : condition.value
+    constant = condition.value isa Union{Number,Tuple,AbstractArray,UniformScaling}
+    value = constant ? condition.value : condition.value(x)
     return _component_value(value, component)
 end
 

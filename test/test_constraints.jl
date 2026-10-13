@@ -709,6 +709,28 @@ end
     @test dirichlet(x -> SVector(1.0); on=top, field=u) isa Unfitted.DirichletCondition
 end
 
+# A callable struct, used as a Dirichlet datum below. The `dirichlet` docstring promises "a callback `value(x)`", and a
+# callable struct is one, as it is when passed as a source.
+struct AffineDirichletDatum
+    slope::Float64
+end
+(g::AffineDirichletDatum)(x) = 1.0 + g.slope * x[1] - x[2]
+
+@testset "a callable-struct Dirichlet datum is called" begin
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    datum = AffineDirichletDatum(0.5)
+    function solved(g)
+        model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(g; on=boundary(:all))]))
+        return model, solve!(model)
+    end
+    model, s = solved(datum)
+    wrapped, sw = solved(x -> datum(x))
+    @test only(model.dofs.fields).dofs.constrained_values == only(wrapped.dofs.fields).dofs.constrained_values
+    @test s.coefficients == sw.coefficients
+    # The datum is affine and so harmonic: the discrete solution reproduces it exactly, inside as on the boundary.
+    @test value(s, model, (0.3, 0.6)) ≈ datum((0.3, 0.6)) atol = 1e-12
+end
+
 # Function-valued Dirichlet must also refresh correctly. A constant callback `x -> c` must give the same answer as the
 # scalar `c`.
 @testset "update_dirichlet! handles function-valued data" begin
