@@ -1858,6 +1858,15 @@ end
     @test_throws "boundary axis 0 must be positive" boundary(axis=0, side=:lower)
     @test_throws "boundary axis -1 must be positive" boundary((axis=1, side=:lower), (axis=-1, side=:upper))
 
+    # An exclusion names both faces of an axis by leaving `side` out, not by giving it `nothing`. A present `side` is
+    # checked whatever its value, so `side=nothing` is refused with the side's own message in either spelling, rather
+    # than excluding both faces of the axis silently or failing on an incidental `MethodError`.
+    @test_throws "boundary side must be :lower or :upper" boundary((axis=1, side=nothing))
+    @test_throws "boundary side must be :lower or :upper" boundary((axis=1, side=:lower), (axis=2, side=nothing))
+    @test_throws "boundary side must be :lower or :upper" boundary(:all; except=(axis=1, side=nothing))
+    @test_throws "boundary side must be :lower or :upper" boundary(:all; except=[(axis=2, side=nothing)])
+    @test boundary(:all; except=(axis=1,)).sides == [(1, :lower), (1, :upper)]
+
     # The messages a pair always gave, and the selectors it built, are unchanged.
     @test_throws "boundary pairs must carry :axis and :side keys" boundary((axis=1,), (axis=2, side=:lower))
     @test_throws "boundary side must be :lower or :upper" boundary((axis=1, side=:mid))

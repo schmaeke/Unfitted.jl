@@ -172,6 +172,11 @@ end
 # false`, also `(axis=d,)`, both faces of axis `d`, returned with `side === nothing`. The one parser of the positional
 # pairs (`side_required = true`) and of the `except` entries (`false`), each context keeping its own messages.
 #
+# "Both faces" is the *absence* of the `side` key, never a value of it: a `side` that is present must be `:lower` or
+# `:upper`, so `(axis=1, side=nothing)` is refused like any other side, in a pair and in an exclusion alike. Read by
+# value, it used to be taken for `(axis=1,)`: an exclusion silently dropped both faces of the axis, and a pair raised an
+# incidental `MethodError` instead of naming the side.
+#
 # Unknown keys are refused in both. The reason is the optional `side` of an exclusion: a typo such as
 # `(axis=1, sides=:lower)` would otherwise read as `(axis=1,)` and silently exclude one face too many; a pair, whose
 # `side` is required, used to accept such a key silently all the same. An axis below 1 names no axis of any space and is
@@ -190,9 +195,9 @@ function _face(spec, side_required::Bool)
     end
     axis = Int(spec.axis)
     axis >= 1 || throw(ArgumentError("boundary axis $axis must be positive"))
-    side = get(spec, :side, nothing)
-    side === nothing || side in (:lower, :upper) || throw(ArgumentError("boundary side must be :lower or :upper"))
-    return axis, side
+    haskey(spec, :side) || return axis, nothing
+    spec.side in (:lower, :upper) || throw(ArgumentError("boundary side must be :lower or :upper"))
+    return axis, spec.side
 end
 
 # `boundary`'s `except` argument as the excluded codim-1 faces an `:except` selector stores. One named tuple is accepted
