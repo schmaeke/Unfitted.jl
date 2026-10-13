@@ -868,3 +868,26 @@ end
     @test _vtu_ints(xml, "pair") == _vtu_ints(xml, "corner")
     @test _vtu_ints(xml, "first") == Int.(_vtu_ints(xml, "region_id") .== 1)
 end
+
+@testset "a frame written to a closed series is refused up front" begin
+    # `close` writes the collection and frees it. A later frame used to be sampled in full and then fail inside the XML
+    # library (`XMLNoRootError`); it is now refused before any sampling, writes nothing and keeps the frame count.
+    (; model, sol) = _pin_2d
+    dir = mktempdir()
+    series = vtk_series(joinpath(dir, "run"))
+    write_vtk(series, 0.0, sol, model; level_meshes=false)
+    close(series)
+    frames = readdir(joinpath(dir, "run_frames"))
+    sampled = Ref(0)
+    err = try
+        write_vtk(series, 1.0, sol, model; level_meshes=false, point_data=(n=(u, c, x, xi) -> (sampled[] += 1; 0.0),))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("closed series", err === nothing ? "" : sprint(showerror, err))
+    @test sampled[] == 0
+    @test readdir(joinpath(dir, "run_frames")) == frames
+    @test series.count[] == 1
+end

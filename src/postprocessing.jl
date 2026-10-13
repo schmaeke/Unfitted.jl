@@ -196,11 +196,16 @@ The frame is exactly the bundle `write_vtk(path, solution, model; …)` writes, 
 (`frame_<n>` in the series' frames directory), and every keyword of that method is accepted here unchanged — see
 [`vtk_series`](@ref) for what the series does and does not do with the frames it is handed. `time` is recorded in the
 collection and is otherwise unused: it need not be a step index, a multiple of anything, or evenly spaced. A frame that
-fails writes nothing and does not use up a frame number.
+fails writes nothing and does not use up a frame number. A series that has been closed takes no more frames: a frame
+written to it raises an `ArgumentError`, before any sampling.
 """
 function write_vtk(series::VTKSeries, time::Real, solution::Solution, model::Model{D,T}; field=nothing,
                    subdivisions=:degree, cut_depth=3, point_data=_default_vtk_point_data(), cell_data=NamedTuple(),
                    level_meshes::Bool=true, ascii::Bool=false, append::Bool=true, compress=true) where {D,T}
+    # `close` has written the collection file and freed its XML document. Without this check the frame would be sampled
+    # in full and then fail inside the XML library (`XMLNoRootError`) when the collection is asked to record it.
+    isopen(series.collection) ||
+        throw(ArgumentError("cannot write a frame to a closed series: close(series) already wrote its collection"))
     budget = _cut_depth_budget(cut_depth)
     n = series.count[] + 1
     base = _vtk_bundle_base(joinpath(series.frames, "frame_" * lpad(n, 4, '0')), solution, model)
@@ -222,7 +227,7 @@ end
 
 Write the ParaView collection file of `series` and return its path. The frame bundles are already on disk — each is
 written as it is handed over — so this writes only the `.pvd` index over them. Calling it a second time writes nothing
-and returns the same path.
+and returns the same path; a frame written after it is refused.
 """
 function Base.close(series::VTKSeries)
     vtk_save(series.collection)
