@@ -80,6 +80,24 @@ end
     @test GeometryTolerance(1.0e-8, 1.0e-8, 1.0e-8) == GeometryTolerance(; merge=1.0e-8)
 end
 
+# `isequal` and `hash` agree, as Julia requires of every type that is put in a `Set` or used as a `Dict` key. With only
+# `==` overloaded, the `-0.0` and `0.0` spellings of one box, and a `Float32` and a `Float64` box with the same corners,
+# were `isequal` with different hashes.
+@testset "geometry box isequal and hash agree" begin
+    signed = box((-0.0, 0.0), (1.0, 1.0))
+    unsigned = box((0.0, 0.0), (1.0, 1.0))
+    @test signed == unsigned                 # `==` is unchanged …
+    @test !isequal(signed, unsigned)         # … and `isequal` tells the signed zero apart, as it does for numbers
+    @test length(Set([signed, unsigned])) == 2
+
+    single = box((0.0f0, 0.5f0), (1.0f0, 2.0f0))
+    double = box((0.0, 0.5), (1.0, 2.0))
+    @test isequal(single, double)
+    @test hash(single) == hash(double)
+    @test length(Set([single, double, box((0.0, 0.5), (1.0, 2.0))])) == 1
+    @test !isequal(double, box((0.0, 0.5), (1.0, 3.0)))
+end
+
 # The `AxisBox` constructor enforces `lower[i] < upper[i]` on every axis: an inverted or equal corner on any axis must
 # raise, so degenerate (zero- or negative-measure) regions never reach the assembly hot loop. Covers both the `box`
 # helper and the direct `AxisBox` constructor.

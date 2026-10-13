@@ -252,6 +252,14 @@ end
 # never two independently rounded paths to the "same" corner.
 Base.:(==)(a::AxisBox{D}, b::AxisBox{D}) where {D} = a.lower == b.lower && a.upper == b.upper
 
+# `isequal` and `hash` go together, as Julia's contract `isequal(a, b) ⇒ hash(a) == hash(b)` requires. With `==` alone
+# overloaded, `isequal` fell back to `==` while `hash` stayed the bitwise default, so `box((-0.0, 0), (1, 1))` and
+# `box((0.0, 0), (1, 1))`, or a `Float32` and a `Float64` box with the same corners, were `isequal` with different
+# hashes, and a `Set` or `Dict` of boxes could hold both or miss either. Both now follow the corners' own `isequal` and
+# `hash`, the split Julia's floating-point numbers make: `-0.0 == 0.0`, but they are not `isequal`.
+Base.isequal(a::AxisBox, b::AxisBox) = isequal(a.lower, b.lower) && isequal(a.upper, b.upper)
+Base.hash(b::AxisBox, h::UInt) = hash(b.upper, hash(b.lower, hash(:AxisBox, h)))
+
 """
     box_intersection(a::AxisBox{D,T}, b::AxisBox{D,T}) -> Union{AxisBox{D,T},Nothing}
 
