@@ -92,11 +92,12 @@ Select a physical facet for boundary conditions:
     is accepted on `:all` only, and it may not name every face — that would select nothing.
   - `boundary(axis=d, side=s)` — one codim-1 face. `side` is `:lower` or `:upper`.
   - `boundary((axis=d₁, side=s₁), …)` — the intersection of `K` codim-1 faces, i.e. a codim-`K` facet. Two pairs in 2D
-    pick a corner; two pairs in 3D pick an edge; three pairs in 3D pick a vertex. Each axis may appear at most once, and
-    `side` must be `:lower` or `:upper`.
+    pick a corner; two pairs in 3D pick an edge; three pairs in 3D pick a vertex. Each pair carries the keys `axis` and
+    `side` and no other, each axis may appear at most once, and `side` must be `:lower` or `:upper`.
 
 `:all` is the only symbol a selector takes: a face is named by its `(axis, side)` pair, and any other symbol raises
-`ArgumentError` here.
+`ArgumentError` here. So does an axis below 1, in every spelling; an axis beyond the dimension of the space is refused
+when the selector meets the space, at [`prepare`](@ref).
 
 Several faces therefore mean two different things depending on where they are written, and the difference is the whole
 reason `except` exists: in the positional form they *intersect* —
@@ -167,17 +168,41 @@ function boundary(selector::Symbol; except=())
     return BoundarySelector(:except, _excluded_faces(except))
 end
 
-# Parse `boundary`'s `except` argument into the excluded codim-1 faces stored on an `:except` selector. One named tuple
-# is accepted directly, so the common single-exclusion case needs no wrapping brackets.
+# One codim-1 face spec of `boundary`, a named tuple `(axis=d, side=s)`, as `(axis, side)`; with `side_required =
+# false`, also `(axis=d,)`, both faces of axis `d`, returned with `side === nothing`. The one parser of the positional
+# pairs (`side_required = true`) and of the `except` entries (`false`), each context keeping its own messages.
 #
-# This is deliberately *not* `boundary(pairs...)`'s parser. That one rejects a repeated axis, which is right for an
-# intersection — `(axis=3, side=:lower)` together with `(axis=3, side=:upper)` names an empty facet — and wrong for an
-# exclusion list, where the same pair is the perfectly ordinary request to drop both faces of axis 3. Here a repeated
-# axis, and even a repeated face, is admissible: the list is a set of faces to remove, so duplicates are dropped rather
-# than diagnosed.
+# Unknown keys are refused in both. The reason is the optional `side` of an exclusion: a typo such as
+# `(axis=1, sides=:lower)` would otherwise read as `(axis=1,)` and silently exclude one face too many; a pair, whose
+# `side` is required, used to accept such a key silently all the same. An axis below 1 names no axis of any space and is
+# refused here; one beyond the dimension needs `D` and is refused when the selector meets a space (`_facets`). A pair
+# used to pass an axis below 1 on to `prepare`, which refused it as out of bounds.
+function _face(spec, side_required::Bool)
+    if side_required    # a pair of `boundary(pairs...)`, a `NamedTuple` by dispatch
+        haskey(spec, :axis) && haskey(spec, :side) ||
+            throw(ArgumentError("boundary pairs must carry :axis and :side keys"))
+        issubset(keys(spec), (:axis, :side)) ||
+            throw(ArgumentError("boundary pairs take the keys :axis and :side only; got $spec"))
+    else
+        spec isa NamedTuple && haskey(spec, :axis) && issubset(keys(spec), (:axis, :side)) ||
+            throw(ArgumentError("boundary except entries must be named tuples (axis=d, side=s) or (axis=d,); " *
+                                "got $spec"))
+    end
+    axis = Int(spec.axis)
+    axis >= 1 || throw(ArgumentError("boundary axis $axis must be positive"))
+    side = get(spec, :side, nothing)
+    side === nothing || side in (:lower, :upper) || throw(ArgumentError("boundary side must be :lower or :upper"))
+    return axis, side
+end
+
+# `boundary`'s `except` argument as the excluded codim-1 faces an `:except` selector stores. One named tuple is accepted
+# directly, so the common single exclusion needs no wrapping brackets.
 #
-# Unknown keys *are* rejected, which `boundary(pairs...)` has no need to do. The reason is the optional `side`: a typo
-# such as `(axis=1, sides=:lower)` would otherwise read as `(axis=1,)` and silently exclude one face too many.
+# The entries are parsed as the positional pairs are, but the list is not an intersection. A pair list rejects a
+# repeated axis, which is right for an intersection — `(axis=3, side=:lower)` together with `(axis=3, side=:upper)`
+# names an empty facet — and wrong for an exclusion list, where the same two entries are the perfectly ordinary request
+# to drop both faces of axis 3. Here a repeated axis, and even a repeated face, is admissible: the list is a set of
+# faces to remove, so duplicates are dropped rather than diagnosed.
 #
 # The result is canonicalised — deduplicated, then sorted — so that two spellings of the same exclusion set are one
 # selector *value*: `(axis=2,)` and its two faces written out are then a single facet-region cache entry rather than two
@@ -188,37 +213,21 @@ _excluded_faces(spec::NamedTuple) = _excluded_faces((spec,))
 function _excluded_faces(specs)
     faces = Tuple{Int,Symbol}[]
     for spec in specs
-        spec isa NamedTuple && haskey(spec, :axis) && issubset(keys(spec), (:axis, :side)) ||
-            throw(ArgumentError("boundary except entries must be named tuples (axis=d, side=s) " *
-                                "or (axis=d,); got $spec"))
-        axis = Int(spec.axis)
-        axis >= 1 || throw(ArgumentError("boundary axis $axis must be positive"))
-        if haskey(spec, :side)
-            spec.side in (:lower, :upper) || throw(ArgumentError("boundary side must be :lower or :upper"))
-            push!(faces, (axis, spec.side))
-        else
-            append!(faces, ((axis, :lower), (axis, :upper)))
-        end
+        axis, side = _face(spec, false)
+        side === nothing ? append!(faces, ((axis, :lower), (axis, :upper))) : push!(faces, (axis, side))
     end
     return sort!(unique!(faces))
 end
 
-function boundary(; axis::Integer, side::Symbol)
-    side in (:lower, :upper) || throw(ArgumentError("boundary side must be :lower or :upper"))
-    return BoundarySelector(:sides, [(Int(axis), side)])
-end
+boundary(; axis::Integer, side::Symbol) = boundary((; axis, side))
 
+# A call without arguments dispatches to the keyword method above and raises there for the missing `axis`, so `pairs` is
+# never empty here.
 function boundary(pairs::NamedTuple...)
-    isempty(pairs) && throw(ArgumentError("boundary requires at least one (axis, side) pair"))
     sides = Tuple{Int,Symbol}[]
-    seen = Set{Int}()
-    for p in pairs
-        (haskey(p, :axis) && haskey(p, :side)) || throw(ArgumentError("boundary pairs must carry :axis and :side keys"))
-        axis = Int(p.axis)
-        side = p.side
-        side in (:lower, :upper) || throw(ArgumentError("boundary side must be :lower or :upper"))
-        axis in seen && throw(ArgumentError("boundary axis $axis specified more than once"))
-        push!(seen, axis)
+    for pair in pairs
+        axis, side = _face(pair, true)
+        any(s -> first(s) == axis, sides) && throw(ArgumentError("boundary axis $axis specified more than once"))
         push!(sides, (axis, side))
     end
     return BoundarySelector(:sides, sides)

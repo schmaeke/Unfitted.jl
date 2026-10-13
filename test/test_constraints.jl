@@ -1846,6 +1846,28 @@ end
     @test haskey(model.regions, (boundary(:all), model.problem.space))
 end
 
+@testset "a boundary pair is parsed as an except entry is" begin
+    # One parser reads the positional pairs and the `except` entries. A pair used to accept a key it does not know
+    # silently, `(axis=1, side=:lower, sides=:upper)` reading as its first two keys, and to pass an axis below 1 on to
+    # `prepare`, which refused it there as out of bounds. Both are refused where they are spelled now, in every spelling
+    # of a face, as `except` always refused them.
+    @test_throws "boundary pairs take the keys :axis and :side only" boundary((axis=1, side=:lower, sides=:upper))
+    @test_throws "boundary pairs take the keys :axis and :side only" boundary((axis=1, side=:lower),
+                                                                              (axis=2, side=:upper, x=1))
+    @test_throws "boundary axis 0 must be positive" boundary((axis=0, side=:lower))
+    @test_throws "boundary axis 0 must be positive" boundary(axis=0, side=:lower)
+    @test_throws "boundary axis -1 must be positive" boundary((axis=1, side=:lower), (axis=-1, side=:upper))
+
+    # The messages a pair always gave, and the selectors it built, are unchanged.
+    @test_throws "boundary pairs must carry :axis and :side keys" boundary((axis=1,), (axis=2, side=:lower))
+    @test_throws "boundary side must be :lower or :upper" boundary((axis=1, side=:mid))
+    @test_throws "boundary side must be :lower or :upper" boundary(axis=1, side=:mid)
+    @test_throws "boundary axis 1 specified more than once" boundary((axis=1, side=:lower), (axis=1, side=:upper))
+    @test boundary(axis=2, side=:upper) == Unfitted.BoundarySelector(:sides, [(2, :upper)])
+    @test boundary((axis=2, side=:upper)) == boundary(axis=2, side=:upper)
+    @test boundary((axis=1, side=:lower), (axis=Int32(2), side=:upper)).sides == [(1, :lower), (2, :upper)]
+end
+
 @testset "except excludes closed faces, so the seam dof stays constrained" begin
     # Exclusion is by closed face: the kept faces come with their closure, so a dof where a kept face meets an excluded
     # one is still constrained, because the kept face's datum extends to its own edge. That is exactly what makes the
