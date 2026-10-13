@@ -509,13 +509,24 @@ _point_count(list::RegionList) = list.offsets[end] - list.offsets[1]
 # entry of `model.regions`, a miss resolving through `_resolve_target`, the builder `prepare` runs. "Fresh" is per
 # target, not per face: a selector resolves through the model's `FacetResolver`, so a face `prepare` already resolved is
 # reused, and a new face is resolved once however many selectors name it.
+#
+# The miss goes through `Base.inferencebarrier` (the idiom of `_coverage_constraints!` in `dofs.jl`). `_region_list`
+# passes `target` unspecialised, and both methods match an abstract target, so inferring it infers the second method
+# with `target` abstract, even for a call whose only target is the volume. `_resolve_target` has three methods, few
+# enough for inference to descend into all of them: without the barrier every first assembly inferred the facet,
+# surface-mesh and interface builders with their space and number type unknown, code that never runs while the targets
+# hit the cache. On the first `assemble!` of a two-level 2D overlay with volume forms only, that was 4855 method
+# instances inferred against 2726 with the barrier. Behind it a miss dispatches at run time on its concrete target and
+# space, and compiles only the builder it runs: the specialisation `prepare` compiled when the problem names a target of
+# that kind.
 function _regions(@nospecialize(model::Model), ::Nothing, @nospecialize(space))
     return model.subdomains[findfirst(s -> s.space === space, model.subdomains)].plan.regions, true
 end
 function _regions(@nospecialize(model::Model), @nospecialize(target), @nospecialize(space))
     cached = get(model.regions, (target, space), nothing)
     cached === nothing || return cached, true
-    return _resolve_target(target, space, model.problem, model.dofs, model.facet_resolver), false
+    resolve = Base.inferencebarrier(_resolve_target)
+    return resolve(target, space, model.problem, model.dofs, model.facet_resolver), false
 end
 
 # A small most-recently-used-first cache kept in a `Vector` of `key => value` pairs, every key a 2-tuple. `_lru_get!`

@@ -477,11 +477,12 @@ end
 # The fits are entered through `Base.inferencebarrier` (the idiom of `_coverage_constraints!` in `dofs.jl`), so
 # inference never descends from here into the moment-fit chain — `_fit_rules`, `moment_fit_rule`, the implicit kernel,
 # NNLS. The call is resolved at run time on the slice's concrete type, and the chain is inferred and compiled when a
-# face first has a cut region, not before. Without the barrier, the abstract inference `_regions` (`assembly.jl`) starts
-# on its unspecialised `space` reaches this call with the face's dimension and number type unknown and infers the whole
-# chain for them, in code that never runs — on the Kirsch plate's first assemble (12² cells, p = 3, no facet region
-# cut), 2726 of the 8249 method instances it inferred; with the barrier it infers 4730 and none of the chain. The
-# result is asserted to its concrete type, so the rule loop below stays statically dispatched.
+# face first has a cut region, not before. Without the barrier, an inference that reaches this call with the face's
+# dimension and number type unknown infers the whole chain for them, in code that never runs. That was measured while
+# `_regions` (`assembly.jl`) still started one on its unspecialised `space`, before its miss path went behind a barrier
+# of its own: on the Kirsch plate's first assemble (12² cells, p = 3, no facet region cut), 2726 of the 8249 method
+# instances it inferred; with the barrier it infers 4730 and none of the chain. The result is asserted to its concrete
+# type, so the rule loop below stays statically dispatched.
 function _facet_regions(records::Vector{_RegionRecord{D,T}}, slice, sides::Vector{Tuple{Int,Symbol}},
                         free_axes::Vector{Int}, pins, rules::_TensorRuleCache{D,T}, ::Val{F}) where {D,T,F}
     function key(record)
