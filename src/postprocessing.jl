@@ -533,29 +533,24 @@ end
     value(solution, model, u::Field, x[, component])
 
 Evaluate the superposed solution at physical point `x`. Scalar fields return a scalar; component fields return an
-`SVector` across components unless a single `component` is requested. Overlay levels are extended by zero — only levels
-whose mesh contains `x` (and whose covering cell is active) contribute. Throws if `x` lies outside the evaluated field's
-own subdomain box, at the model's containment tolerance. That box is the embedding domain, not `Ω`: with a
-[`PhysicalDomain`](@ref) in play a point outside `Ω` does not raise. It evaluates the polynomial extension inside a cut
-cell, and zero inside a cell the fictitious fold deactivated.
+`SVector` across components unless a single `component` is requested. `component = nothing`, the default, evaluates
+every component; a `component` outside `1:component_count(u)` raises `ArgumentError`. Overlay levels are extended by
+zero — only levels whose mesh contains `x` (and whose covering cell is active) contribute. Throws if `x` lies outside
+the evaluated field's own subdomain box, at the model's containment tolerance. That box is the embedding domain, not
+`Ω`: with a [`PhysicalDomain`](@ref) in play a point outside `Ω` does not raise. It evaluates the polynomial extension
+inside a cut cell, and zero inside a cell the fictitious fold deactivated.
 
 `x` accepts `NTuple{D,<:Real}` or `SVector{D,<:Real}`. Multi-field models require the `u::Field` form so the field to
-evaluate is unambiguous.
+evaluate is unambiguous; `u` must be the model's field of that name, with its component count.
 """
-function value(solution::Solution, model::Model{D,T}, x::PointLike{D}) where {D,T}
-    return value(solution, model, _default_field(model), x)
+function value(solution::Solution, model::Model{D}, x::PointLike{D},
+               component::Union{Nothing,Integer}=nothing) where {D}
+    return _field_quantity(solution, model, _default_field(model), x, component, Val(false))
 end
 
-function value(solution::Solution, model::Model{D,T}, x::PointLike{D}, component::Integer) where {D,T}
-    return value(solution, model, _default_field(model), x, component)
-end
-
-function value(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D}) where {D,T}
-    _field_quantity(solution, model, u, x, nothing, Val(false))
-end
-
-function value(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D}, component::Integer) where {D,T}
-    _field_quantity(solution, model, u, x, component, Val(false))
+function value(solution::Solution, model::Model{D}, u::Field, x::PointLike{D},
+               component::Union{Nothing,Integer}=nothing) where {D}
+    return _field_quantity(solution, model, u, x, component, Val(false))
 end
 
 """
@@ -564,43 +559,52 @@ end
     field_gradient(solution, model, u::Field, x[, component])
 
 Evaluate the physical gradient of the superposed solution at physical point `x`. Scalar fields return one `SVector{D}`
-gradient; component fields return an `SVector` of component gradients unless a single `component` is requested. Overlay
-levels are extended by zero, same as [`value`](@ref). The leading `field_` avoids colliding with `Tensors.gradient` when
-both packages are loaded together.
+gradient; component fields return an `SVector` of component gradients unless a single `component` is requested.
+`component = nothing`, the default, evaluates every component. Overlay levels are extended by zero, and the point and
+component are checked, as for [`value`](@ref). The leading `field_` avoids colliding with `Tensors.gradient` when both
+packages are loaded together.
 
 The gradient is the physical gradient (chain-rule scaled by `2 / edge_lengths(parent_box)` per axis), not the
 reference-frame gradient.
 """
-function field_gradient(solution::Solution, model::Model{D,T}, x::PointLike{D}) where {D,T}
-    return field_gradient(solution, model, _default_field(model), x)
+function field_gradient(solution::Solution, model::Model{D}, x::PointLike{D},
+                        component::Union{Nothing,Integer}=nothing) where {D}
+    return _field_quantity(solution, model, _default_field(model), x, component, Val(true))
 end
 
-function field_gradient(solution::Solution, model::Model{D,T}, x::PointLike{D}, component::Integer) where {D,T}
-    return field_gradient(solution, model, _default_field(model), x, component)
+function field_gradient(solution::Solution, model::Model{D}, u::Field, x::PointLike{D},
+                        component::Union{Nothing,Integer}=nothing) where {D}
+    return _field_quantity(solution, model, u, x, component, Val(true))
 end
 
-function field_gradient(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D}) where {D,T}
-    _field_quantity(solution, model, u, x, nothing, Val(true))
-end
-
-function field_gradient(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D},
-                        component::Integer) where {D,T}
-    _field_quantity(solution, model, u, x, component, Val(true))
-end
-
-# Component dispatch shared by `value` and `field_gradient`. When `component === nothing`: return a scalar for
-# single-component fields and an `SVector` across components for vector fields. When `component` is explicit:
-# bounds-check and evaluate that one component.
-function _field_quantity(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D}, component,
-                         gradient::Val) where {D,T}
-    coefficients, point, layout = _evaluation_data(solution, model, u, x)
-    if component === nothing
-        layout.components == 1 && return _evaluate_field(coefficients, model, layout, point, 1, gradient)
-        return SVector(ntuple(c -> _evaluate_field(coefficients, model, layout, point, c, gradient), layout.components))
+# The one body of `value` (`G = false`) and `field_gradient` (`G = true`). The checks run in a fixed order — the
+# solution's pin and length, the point's conversion to the model's number type, the field's space, the point inside
+# that space's box, the field's component count, the component's range — so a call wrong in two ways always names the
+# same fault. The box is the field's own subdomain's, never subdomain 1's: on a coupled model each field is bounded by
+# its own. The component count is checked because it is read from `u`'s type rather than from the layout: that keeps a
+# vector result inferable, and a `Field` that shares a name with the model's but not its count is not the model's field.
+#
+# The components evaluated, `comps`, are static: the requested one, or `1` for a scalar field, or the tuple `(1, …, C)`,
+# so every level evaluates its basis once for all of them (`_level_field`). The level sum starts from zero rather than
+# from the first level, which keeps the sign of an exact zero, and a tuple of components is returned as an `SVector`.
+function _field_quantity(solution::Solution, model::Model{D,T}, u::Field{<:Any,<:Any,C}, x::PointLike{D},
+                         component::Union{Nothing,Integer}, ::Val{G}) where {D,T,C,G}
+    coefficients = _checked_coefficients(solution, model)
+    point = SVector{D,T}(x)
+    space = _field_space(model.problem, u.name)
+    contains_point(point, space.domain, model.dofs.tolerance) ||
+        throw(ArgumentError("evaluation point is outside the field's domain"))
+    layout = _field_layout(model.dofs, u.name)
+    layout.components == C ||
+        throw(ArgumentError("field $(u.name) has $(layout.components) components in this model, not $C"))
+    _check_component(component, u)
+    comps = component !== nothing ? component : C == 1 ? 1 : ntuple(identity, Val(C))
+    R = promote_type(T, eltype(coefficients))
+    acc = map(_ -> G ? zero(SVector{D,R}) : zero(R), comps)
+    for level in space.levels
+        acc = map(+, acc, _level_field(coefficients, model, layout, level, point, comps, Val(G)))
     end
-
-    _check_component(layout, component)
-    return _evaluate_field(coefficients, model, layout, point, component, gradient)
+    return comps isa Tuple ? SVector(acc) : acc
 end
 
 # Pick the implicit field of a single-field model. Multi-field models require an explicit field argument so the caller
@@ -610,64 +614,22 @@ function _default_field(model::Model)
     throw(ArgumentError("field argument is required for multi-field models"))
 end
 
-# Shared pre-flight for the public `value` / `field_gradient` paths: coefficient check, point coercion, in-domain check,
-# field-layout lookup. Returns the triple every evaluator needs.
-function _evaluation_data(solution::Solution, model::Model{D,T}, u::Field, x::PointLike{D}) where {D,T}
-    coefficients = _checked_coefficients(solution, model)
-    point = _point_vector(x, T)
-    space = _field_space(model.problem, u.name)
-    _assert_point_in_domain(point, space.domain, model.dofs.tolerance)
-    return coefficients, point, _field_layout(model.dofs, u.name)
-end
-
-# Convert a `PointLike` user input (NTuple or SVector) to a typed `SVector{D,T}` matching the model's scalar type. Used
-# at the top of every public evaluation path so the downstream kernels see a single canonical point representation.
-_point_vector(x::PointLike{D}, ::Type{T}) where {D,T} = SVector{D,T}(x)
-
-# Reject evaluation points outside a field's own subdomain box, at the model's geometry tolerance so points on the
-# boundary (up to `tol.contain`) are accepted. The domain is always passed in by the caller, never taken from the
-# problem's representative space: on a coupled model each field is bounded by its own subdomain, not by subdomain 1's.
-function _assert_point_in_domain(x::SVector{D,T}, domain::AxisBox{D,T}, tol::GeometryTolerance{T}) where {D,T}
-    contains_point(x, domain, tol) || throw(ArgumentError("evaluation point is outside the field's domain"))
-end
-
-# Bounds-check a component argument against the field's component count.
-function _check_component(layout::FieldLayout, component::Integer)
-    1 <= component <= layout.components || throw(ArgumentError("field component out of bounds"))
-end
-
-# Sum every level's `_level_field` contribution, the value or the gradient by `G`. The overlay zero-extension comes from
-# `_level_field` returning zero when its level does not cover `point`.
-function _evaluate_field(coefficients, model::Model{D,T}, layout::FieldLayout{D,T}, point::SVector{D,T},
-                         component::Integer, ::Val{G}) where {D,T,G}
-    R = promote_type(T, eltype(coefficients))
-    result = G ? zero(SVector{D,R}) : zero(R)
-    for level in _field_levels(model, layout)
-        result += _level_field(coefficients, model, layout, level, point, component, Val(G))
-    end
-    return result
-end
-
-# Levels of the space owning `layout`'s field. For a single-domain model this is the one space's levels; for a coupled
-# model it routes each field to its own subdomain's (reindexed) levels, so a point evaluation of field `b` never reaches
-# into field `a`'s grid.
-_field_levels(model::Model, layout::FieldLayout) = _field_space(model.problem, layout.name).levels
-
-# One level's contribution to the field of `layout` at physical point `x`: its value (`G = false`) or its physical
-# gradient (`G = true`). Zero if the level's mesh does not contain `x` (overlay zero-extension) or if the containing
-# cell is masked inactive. Otherwise: locate the cell, map `x` to the cell's reference frame, evaluate the basis values
-# there — or the physical basis gradients, which `physical_basis_gradients` scales by the chain rule `2 / h_d` of the
-# axis-aligned cell — and contract them with the dof values through `dof_value`, so constrained dofs contribute their
-# pinned values.
+# One level's contribution to the field of `layout` at physical point `x`, for each of `components` (an `Int` gives a
+# scalar, a tuple a tuple): its value (`G = false`) or its physical gradient (`G = true`). Zero if the level's mesh does
+# not contain `x` (overlay zero-extension) or if the containing cell is masked inactive. Otherwise: locate the cell, map
+# `x` to the cell's reference frame, evaluate the basis values there — or the physical basis gradients, which
+# `physical_basis_gradients` scales by the chain rule `2 / h_d` of the axis-aligned cell — once for all the components,
+# and contract them with each component's dof values (`_parent_field`).
 function _level_field(coefficients, model::Model{D,T}, layout::FieldLayout{D,T}, level::Level{D,T}, x::SVector{D,T},
-                      component::Integer, ::Val{G}) where {D,T,G}
+                      components::Union{Integer,Tuple}, ::Val{G}) where {D,T,G}
     R = promote_type(T, eltype(coefficients))
     cell = locate_cell(level.mesh, x; tol=model.dofs.tolerance)
-    (cell === nothing || !is_active(level.mask, cell)) && return G ? zero(SVector{D,R}) : zero(R)
+    (cell === nothing || !is_active(level.mask, cell)) && return map(_ -> G ? zero(SVector{D,R}) : zero(R), components)
     parent_box = cell_box(level.mesh, cell)
     xi = physical_to_reference(parent_box, x)
     φ = G ? physical_basis_gradients(level, cell, parent_box, xi) : basis_values(level, cell, xi)
-    return _parent_field(layout, coefficients, cell_dofs(layout.dofs, level.id, cell), φ, component)
+    raw_dofs = cell_dofs(layout.dofs, level.id, cell)
+    return map(c -> _parent_field(layout, coefficients, raw_dofs, φ, c), components)
 end
 
 # The field on one parent cell: `Σᵢ u(rawᵢ, component)·φᵢ` over the cell's raw dofs, with `φ` the cell's basis values
