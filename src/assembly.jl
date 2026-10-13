@@ -1291,11 +1291,14 @@ _region_jacobian(region::Region) = _frame_jacobian(region.lower, region.upper)
 # list is `point`, `(; x, weight, point, state, normal, sides)`. With a workspace `ws` the basis is refreshed at the
 # point first and, with a `state`, every field is evaluated there; a walk without a state passes `ws = nothing` and
 # evaluates nothing. The kernel hands the payload to every form callback and the walker (`_walk`) to its caller, so a
-# form and a walk over the same list see the same payload at the same point by construction.
-@inline function _payload!(ws, region, k::Int, jacobian, point::Int, state)
+# form and a walk over the same list see the same payload at the same point by construction. `G` says whether the basis
+# gradients, and with them `q.state`'s gradients, are evaluated too: always for the kernel, whose forms read them, and
+# for a walk unless its caller reads values only (`l2_error`); without them `q.state`'s gradients read zero. The values
+# do not depend on `G` (`_refresh!`), so a values-only walk reads the same values bit for bit.
+@inline function _payload!(ws, region, k::Int, jacobian, point::Int, state, ::Val{G}=Val(true)) where {G}
     x, weight, p = _region_point(region, k, jacobian)
-    ws === nothing || _refresh!(ws, region, p, Val(true))
-    state = state === nothing ? nothing : _state_point!(state, ws, Val(true))
+    ws === nothing || _refresh!(ws, region, p, Val(G))
+    state = state === nothing ? nothing : _state_point!(state, ws, Val(G))
     return (; x, weight, point, state, normal=_region_normal(region, k), sides=_region_sides(region))
 end
 
@@ -1310,13 +1313,14 @@ end
 end
 
 # Evaluate every parent's basis at the current frame point `p` into the bank: values and physical gradients
-# (`Val(true)`), or values only (`Val(false)`, for the L² transfer rhs, whose integrand never reads a gradient). Each
-# parent maps `p` into its own reference frame through `ξ0 + dξ ∘ p` (`Parent`), with no division. The gradient scale is
-# the axis-aligned chain rule `2 / edge_lengths(parent_box)` of `physical_basis_gradients` in `mesh.jl`. One basis
-# evaluation per parent per point, through one kernel call: `G` is a type parameter, so the gradient tuple is formed,
-# and the gradient work done, only when it is `true`. A one-sided region's parents have distinct levels, so their bank
-# slots never collide; an interface region's two sides live in the two subdomains' disjoint level banks, so the kernel
-# reads field `a` from `a`'s cut cell and field `b` from `b`'s at the same physical point.
+# (`Val(true)`), or values only (`Val(false)`, for the L² transfer rhs, `l2_error` and the post-processing sample
+# accessor, which never read a gradient). Each parent maps `p` into its own reference frame through `ξ0 + dξ ∘ p`
+# (`Parent`), with no division. The gradient scale is the axis-aligned chain rule `2 / edge_lengths(parent_box)` of
+# `physical_basis_gradients` in `mesh.jl`. One basis evaluation per parent per point, through one kernel call: `G` is a
+# type parameter, so the gradient tuple is formed, and the gradient work done, only when it is `true`. A one-sided
+# region's parents have distinct levels, so their bank slots never collide; an interface region's two sides live in the
+# two subdomains' disjoint level banks, so the kernel reads field `a` from `a`'s cut cell and field `b` from `b`'s at
+# the same physical point.
 #
 # A parent's set is read with `_active_set`, which does not consult the level's mask, and that rests on an invariant:
 # every region parent is an ACTIVE cell of its level. It holds by construction rather than by checking — every parent
@@ -1539,19 +1543,22 @@ function _target_space(@nospecialize(model::Model), @nospecialize(on), field::Un
 end
 
 # Fold `op(acc, q)` over every quadrature point of `list` in the serial assembly order, starting from `acc`, and return
-# the result: `foreach_quadrature_point` discards it, `boundary_integral` sums through it. The payload is the kernel's
-# own (`_payload!`), from the same `_region_point`, with `q.point = list.offsets[r] + k`. With a state, each region's
-# dof values are read once and every field is evaluated at every point through the same `_frame!`, `_refresh!` and
-# `_state_point!` the kernel uses, on the workspace `ws`; without one, `ws` is `nothing` and no basis is evaluated at
-# all. Reached by a dynamic call, which makes it the function barrier for the region and state types. Its callers build
-# `ws` fresh (`_assembly_workspace`) on purpose rather than check one out of the model's assembly pool: a walk needs one
-# per call, which costs a few microseconds, and a checkout would need a check-in in a `finally` at every caller.
-function _walk(op, acc, ws, list::RegionList, state)
+# the result: `foreach_quadrature_point` discards it, `boundary_integral` and `l2_error` sum through it. The payload is
+# the kernel's own (`_payload!`), from the same `_region_point`, with `q.point = list.offsets[r] + k`. With a state,
+# each region's dof values are read once and every field is evaluated at every point through the same `_frame!`,
+# `_refresh!` and `_state_point!` the kernel uses, on the workspace `ws`; without one, `ws` is `nothing` and no basis is
+# evaluated at all. `gradients` is passed on to `_payload!`: `Val(true)`, the default, evaluates `q.state`'s gradients
+# as the kernel does, which `foreach_quadrature_point` keeps because its callback may read them; `l2_error` reads values
+# only and passes `Val(false)`, which skips the gradient tables. Reached by a dynamic call, which makes it the function
+# barrier for the region and state types. Its callers build `ws` fresh (`_assembly_workspace`) on purpose rather than
+# check one out of the model's assembly pool: a walk needs one per call, which costs a few microseconds, and a checkout
+# would need a check-in in a `finally` at every caller.
+function _walk(op, acc, ws, list::RegionList, state, gradients::Val=Val(true))
     for (r, region) in pairs(list.regions)
         state === nothing || _state_region!(state, _frame!(ws, region))
         jacobian = _region_jacobian(region)
         for k in 1:_region_qpoint_count(region)
-            acc = op(acc, _payload!(ws, region, k, jacobian, list.offsets[r] + k, state))
+            acc = op(acc, _payload!(ws, region, k, jacobian, list.offsets[r] + k, state, gradients))
         end
     end
     return acc

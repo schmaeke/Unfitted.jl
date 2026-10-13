@@ -681,11 +681,12 @@ function l2_error(solution::Solution, model::Model{D,T}, u::Field, exact; norm::
     list = _region_list(model, nothing, _field_space(model.problem, u.name))
     f = _field_index(model.dofs, u.name)
     offset, C = state.offsets[f], model.dofs.fields[f].components
-    # A walk with the field's dof values, as `foreach_quadrature_point` runs one. The squared error is summed component
-    # by component, which is `_squared_norm(u_h − exact)` term for term and keeps the fold type-stable whatever the
-    # component count.
+    # A walk with the field's dof values, as `foreach_quadrature_point` runs one, but of values only (`Val(false)`): the
+    # integrand reads no gradient, so the walk skips the gradient tables and reads the same values. The squared error is
+    # summed component by component, which is `_squared_norm(u_h − exact)` term for term and keeps the fold type-stable
+    # whatever the component count.
     ws = _assembly_workspace(model)
-    error_squared, exact_squared = _walk((zero(T), zero(T)), ws, list, state) do (err, ref), q
+    error_squared, exact_squared = _walk((zero(T), zero(T)), ws, list, state, Val(false)) do (err, ref), q
         exact_value = exact(q.x)
         squared = sum(c -> abs2(q.state.values[offset+c] - exact_value[c]), 1:C)
         return err + q.weight * squared, ref + q.weight * _squared_norm(exact_value)
