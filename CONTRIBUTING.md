@@ -137,7 +137,7 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 
 | File              | Responsibility                                              |
 |-------------------|-------------------------------------------------------------|
-| `Unfitted.jl`     | top-level module: imports, exports, include order           |
+| `Unfitted.jl`     | top-level module: imports, exports, the extension stubs with their docstrings, include order |
 | `geometry.jl`     | D-dimensional axis-aligned boxes, coordinate maps, tolerances |
 | `physical.jl`     | CSG level-set tree, `PhysicalDomain`, three-valued cell classifier |
 | `implicit.jl`     | Saye dimension-reduction implicit quadrature on the level set (volume rules) |
@@ -809,7 +809,8 @@ superposition idea for its own enrichment.
     `cell_order(level, cell)` is the question anything that integrates,
     evaluates or subdivides must ask, and every quadrature consumer does:
     the region rule, the moment-fit order, the facet rule, the immersed
-    simplex rule and the VTK subdivision all size from the parent *cell*.
+    simplex rule and the post-processing sample lattice all size from the
+    parent *cell*.
     `nominal_order(level)` is the per-axis maximum over the palette, and it
     is a sizing and default quantity — the workspace's 1D factor buffers,
     where over-sizing is safe (its value and gradient buffers are sized

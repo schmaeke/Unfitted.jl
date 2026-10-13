@@ -49,11 +49,16 @@
 #   * `_sample_quadrature(model)` — one `(; signature, grid::SampleGrid{D,T,0})` per sorted covering-level signature, in
 #     sorted order, with the point array `weight`.
 #
-# A plotting extension would read the same records. With Makie, a 2D grid is
-# `mesh(Point.(g.points), [QuadFace((4c − 3):(4c)) for c in 1:_cell_count(g)]; color = <a point array>)` and the
-# quadrature cloud `scatter(Point.(entry.grid.points); color = <its weight array>)`. Its public functions would be
-# declared and documented in `Unfitted.jl`, as the VTK writer's are, each a fallback method whose body is
-# `_extension_missing`, so that a call made without the plotting package loaded says which package to load.
+# A plotting extension would read the same records. With Makie, a 2D grid `g` coloured by its first point array, and
+# a quadrature-cloud entry `e` coloured by its weights, are
+#
+#     faces = [QuadFace(4c - 3, 4c - 2, 4c - 1, 4c) for c in 1:_cell_count(g)]
+#     mesh(Point.(g.points), faces; color=last(g.point_data[1]))
+#     scatter(Point.(e.grid.points); color=last(only(e.grid.point_data)))
+#
+# Its public functions would be declared and documented in `Unfitted.jl`, as the VTK writer's are, each a fallback
+# method whose body is `_extension_missing`, so that a call made without the plotting package loaded says which package
+# to load.
 
 # ── Sample records ────────────────────────────────────────────────────────────
 
@@ -78,8 +83,9 @@ _cell_count(g::SampleGrid{D,T,K}) where {D,T,K} = length(g.points) >> K
 # closed polygon or a hexahedron without permuting them. It is a fixed permutation of `_box_vertices`, whose axis-1
 # fastest order swaps the last two corners of every face: corner `j` is vertex `xor(j − 1, ((j − 1) >> 1) & 1) + 1`,
 # which is (1, 2, 4, 3) in 2D and (1, 2, 4, 3, 5, 6, 8, 7) in 3D. Every coordinate is `lower[d]` or `upper[d]` itself,
-# so the corners of neighbouring cells that share a face are bit for bit the same points. Dimension-generic: which `D`
-# a format can hold is its consumer's question.
+# so two boxes whose shared face has the same coordinates — neighbours in the lattice of one region, or among the leaves
+# of one cut tree — get bit-identical corner points on it; across regions the lattices are computed apart and may differ
+# in the last bit. Dimension-generic: which `D` a format can hold is its consumer's question.
 function _box_corners(b::AxisBox{D}) where {D}
     v = _box_vertices(b)
     return ntuple(j -> v[xor(j - 1, ((j - 1) >> 1) & 1)+1], Val(2^D))
@@ -522,9 +528,9 @@ end
 # ── Solution evaluation ───────────────────────────────────────────────────────
 #
 # The point evaluations `value` / `field_gradient` (`_level_field`) reconstruct a field one covering cell at a time and
-# sum the cells. Every other evaluation — assembly's `q.state`, the quadrature-point walker, `l2_error` and
-# `write_vtk`'s sample accessor — evaluates into a workspace's `BasisBank` (`_refresh!` and `_state_point!` in
-# `assembly.jl`), which keeps the same association: per-cell partial sums, then the sum over cells.
+# sum the cells. Every other evaluation — assembly's `q.state`, the quadrature-point walker, `l2_error` and the
+# sampling callbacks' accessor (`_sample_accessor`) — evaluates into a workspace's `BasisBank` (`_refresh!` and
+# `_state_point!` in `assembly.jl`), which keeps the same association: per-cell partial sums, then the sum over cells.
 
 """
     value(solution, model, x)
@@ -584,8 +590,10 @@ end
 # vector result inferable, and a `Field` that shares a name with the model's but not its count is not the model's field.
 #
 # The components evaluated, `comps`, are static: the requested one, or `1` for a scalar field, or the tuple `(1, …, C)`,
-# so every level evaluates its basis once for all of them (`_level_field`). The level sum starts from zero rather than
-# from the first level, which keeps the sign of an exact zero, and a tuple of components is returned as an `SVector`.
+# so every level evaluates its basis once for all of them (`_level_field`). The level sum starts from zero, as the
+# per-component sum always has, so the two agree bit for bit, the sign of an exact zero included: a sum started from
+# the first level would keep a −0.0 that the zero start turns into +0.0. A tuple of components is returned as an
+# `SVector`.
 function _field_quantity(solution::Solution, model::Model{D,T}, u::Field{<:Any,<:Any,C}, x::PointLike{D},
                          component::Union{Nothing,Integer}, ::Val{G}) where {D,T,C,G}
     coefficients = _checked_coefficients(solution, model)
@@ -613,12 +621,13 @@ function _default_field(model::Model)
     throw(ArgumentError("field argument is required for multi-field models"))
 end
 
-# One level's contribution to the field of `layout` at physical point `x`, for each of `components` (an `Int` gives a
-# scalar, a tuple a tuple): its value (`G = false`) or its physical gradient (`G = true`). Zero if the level's mesh does
-# not contain `x` (overlay zero-extension) or if the containing cell is masked inactive. Otherwise: locate the cell, map
-# `x` to the cell's reference frame, evaluate the basis values there — or the physical basis gradients, which
-# `physical_basis_gradients` scales by the chain rule `2 / h_d` of the axis-aligned cell — once for all the components,
-# and contract them with each component's dof values (`_parent_field`).
+# One level's contribution to the field of `layout` at physical point `x`, for each of `components` (an `Int` gives one
+# component's value or gradient, a tuple one per component): its value (`G = false`) or its physical gradient
+# (`G = true`). Zero if the level's mesh does not contain `x` (overlay zero-extension) or if the containing cell is
+# masked inactive. Otherwise: locate the cell, map `x` to the cell's reference frame, evaluate the basis values there —
+# or the physical basis gradients, which `physical_basis_gradients` scales by the chain rule `2 / h_d` of the
+# axis-aligned cell — once for all the components, and contract them with each component's dof values
+# (`_parent_field`).
 function _level_field(coefficients, model::Model{D,T}, layout::FieldLayout{D,T}, level::Level{D,T}, x::SVector{D,T},
                       components::Union{Integer,Tuple}, ::Val{G}) where {D,T,G}
     R = promote_type(T, eltype(coefficients))
@@ -660,11 +669,13 @@ Compute the L² error of `solution` against an analytic / manufactured solution 
 tuple or a vector) for a vector field; the pointwise error is summed component by component,
 `‖u_h − u_exact‖² = Σ_c (u_h[c] − u_exact[c])²`.
 
-`u` names the field to measure, exactly as for [`value`](@ref) and [`field_gradient`](@ref). The error is integrated
-over that field's own subdomain — its space, its integration plan, its dof layout — so on a coupled model it is each
-subdomain's own error, and there is no single number for the union: an interface shared by two subdomains would be
-integrated twice. Omitting `u` picks the implied field of a single-field model and raises on a multi-field one, which is
-why the multi-field and coupled workflows had no L² error report before this overload existed.
+`u` names the field to measure and is matched by name: the model's field of that name is measured, with the component
+count of the model's layout, where [`value`](@ref) and [`field_gradient`](@ref) also refuse a `u` whose own count
+differs. The error is integrated over that field's own subdomain — its space, its integration plan, its dof layout — so
+on a coupled model it is each subdomain's own error, and there is no single number for the union: an interface shared
+by two subdomains would be integrated twice. Omitting `u` picks the implied field of a single-field model and raises on
+a multi-field one, which is why the multi-field and coupled workflows had no L² error report before this overload
+existed.
 
 The integration uses the model's own integration plan — the same admissible regions assembly walks — so the error is
 consistent with what the solver actually integrated. For SPD model problems this is the natural convergence-study

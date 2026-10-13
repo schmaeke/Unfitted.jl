@@ -182,22 +182,23 @@ Keyword arguments:
     volume: in 3D the leaf count grows as `8ᵏ` under `subdivisions` but only as `4ᵏ` under `cut_depth`. See "Resolving
     the immersed boundary" below.
   - `point_data` — `NamedTuple` / `Dict` / `Tuple` of `name => callback` pairs. Each callback is invoked at every vertex
-    sample as `f(u, context, x, xi)` and returns a real number, a tuple of real numbers or an `SVector` of real
-    numbers, of one shape at every sample. A tuple is written as the `SVector` of its components. The values of one
-    entry are promoted to a common element type, which must be one VTK stores — `Float32`, `Float64` or an integer of
-    at most 64 bits — or `Bool`, which VTK has no type for and is written as `UInt8` 0 / 1. A two-component value is
-    written as a three-component VTK vector with a trailing zero. Any other value (a `Vector`, a matrix, a `String`, a
-    `Complex`, a `Rational`, or shapes that differ between samples) is refused with an `ArgumentError` naming the
-    entry, and nothing is written. Each callback is called exactly once per sample, but in an unspecified order — across
-    the samples and across the entries — so a callback should compute its value from its arguments and not count or
-    record its calls. `u(context, xi[, field])` evaluates the current solution at the sample, given the `context` and
-    `xi` the callback received: the block's own field by default, or another `field` on the same subdomain. A field on
-    another subdomain of a coupled model raises an `ArgumentError`; evaluate it with
-    [`value`](@ref)`(solution, model, field, x)` instead. `x` is the physical coordinate and `xi.region` the same point
-    in the region's reference frame; `context` carries `location` (`:point`, or `:cell` for a `cell_data` sample),
-    `region_id`, the `region` box, the emitted `cell` box, the covering `parents` — each with the `parent_box` a
-    callback needs to map `x` into a cell's own frame — and the `model_version` the samples were taken from. Defaults to
-    a single `uh` entry that emits the current solution value.
+    sample as `f(u, context, x, xi)` and returns a real number, a tuple of real numbers or an `SVector` of real numbers,
+    of one shape at every sample. A tuple is written as the `SVector` of its components. The values of one entry are
+    promoted to a common element type, which must be one VTK stores — `Float32`, `Float64` or an integer of at most 64
+    bits — or `Bool`, which VTK has no type for and is written as `UInt8` 0 / 1. A two-component value is written as a
+    three-component VTK vector with a trailing zero. An entry is refused with an `ArgumentError` naming it, and nothing
+    is written, when a value has none of these shapes (a `Vector`, a matrix, a `String`, a `Complex`), when its shapes
+    differ between samples, or when its values promote to a type VTK does not store (a `Rational`, a `BigFloat`); a
+    `Rational` among `Float64` values promotes to `Float64` and is accepted. Each callback is called exactly once per
+    sample, but in an unspecified order — across the samples and across the entries — so a callback should compute its
+    value from its arguments and not count or record its calls. `u(context, xi[, field])` evaluates the current solution
+    at the sample, given the `context` and `xi` the callback received: the block's own field by default, or another
+    `field` on the same subdomain. A field on another subdomain of a coupled model raises an `ArgumentError`; evaluate
+    it with [`value`](@ref)`(solution, model, field, x)` instead. `x` is the physical coordinate and `xi.region` the
+    same point in the region's reference frame; `context` carries `location` (`:point`, or `:cell` for a `cell_data`
+    sample), `region_id`, the `region` box, the emitted `cell` box, the covering `parents` — each with the `parent_box`
+    a callback needs to map `x` into a cell's own frame — and the `model_version` the samples were taken from. Defaults
+    to a single `uh` entry that emits the current solution value.
   - `cell_data` — same shape as `point_data` but evaluated at per-cell sample points (the subbox center). Defaults to no
     user-defined cell data; the bundle always includes `region_id` and `cover_count` as built-in cell arrays.
   - `level_meshes` — emit one solid-cell `.vtu` per level when `true` (default), each cell carrying per-cell `active` /
