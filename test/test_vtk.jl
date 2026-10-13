@@ -582,3 +582,187 @@ end
     plain_xml = read(joinpath(dir, "plain_data.vtu"), String)
     @test length(_vtu_floats(plain_xml, "uh")) == length(_vtu_floats(plain_xml, "level_set"))
 end
+
+# ── Pins: the writer's output contract ────────────────────────────────────────
+#
+# What a rewrite of the writer must keep, pinned end to end on three tiny models built once and shared: the VTK cell
+# type and corner order per dimension, the subdivision rules, the accepted spellings of the keywords and of a callback's
+# value, the files a bundle consists of and the list `write_vtk` returns, and the size of the quadrature cloud.
+
+# The attributes of the `<DataArray>` named `name` in a `.vtu` / `.vtp`, as a `Dict`; readable in every encoding.
+function _vtu_tag(xml, name)
+    tag = match(Regex("<DataArray[^>]*Name=\"$name\"[^>]*>"), xml).match
+    return Dict(m.captures[1] => m.captures[2] for m in eachmatch(r"(\w+)=\"([^\"]*)\"", tag))
+end
+
+# An integer attribute of the `<Piece>` of a `.vtu` / `.vtp` (`NumberOfPoints`, `NumberOfCells`, `NumberOfVerts`, …).
+_vtu_piece(xml, attribute) = parse(Int, match(Regex("<Piece[^>]*$attribute=\"(\\d+)\""), xml).captures[1])
+
+# The keywords that make a bundle parsable text.
+_pin_ascii = (ascii=true, append=false, compress=false)
+
+# A mass model on `V` and a solution with distinct coefficients, so that no two dofs carry the same value.
+function _pin_model(V)
+    model = prepare(mass(V))
+    return (; V, model, sol=solution(model, [sin(i) for i in 1:active_unknowns(model)]))
+end
+
+# 1D: two order-1 cells. 2D: two cells of per-cell anisotropic orders (1, 2) and (3, 1), with an order-(1, 3) overlay
+# over the right one, so the right region has two parents and `:degree` takes the per-axis maximum (3, 3) over them.
+# 3D: one order-1 cell of an off-origin box with unequal edges, so every corner of it has distinct coordinates.
+_pin_1d = _pin_model(space(box((0.0,), (1.0,)); cells=2, order=1))
+_pin_2d = _pin_model(overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 1), order=reshape([(1, 2), (3, 1)], 2, 1)),
+                             box((0.5, 0.0), (1.0, 1.0)); cells=1, order=(1, 3)))
+_pin_3d = _pin_model(space(box((0.5, -1.0, 2.0), (1.5, 0.25, 4.0)); cells=1, order=1))
+
+@testset "pin: a 1D bundle is VTK_LINE cells of two points each" begin
+    (; model, sol) = _pin_1d
+    dir = mktempdir()
+    write_vtk(joinpath(dir, "line"), sol, model; subdivisions=:none, _pin_ascii...)
+    for file in ("line_data.vtu", "line_level_1_base_mesh.vtu")
+        xml = read(joinpath(dir, file), String)
+        @test _vtu_piece(xml, "NumberOfCells") == 2
+        @test _vtu_piece(xml, "NumberOfPoints") == 4
+        @test _vtu_ints(xml, "types") == [3, 3]                  # VTK_LINE
+        @test _vtu_ints(xml, "offsets") == [2, 4]
+        @test _vtu_ints(xml, "connectivity") == 0:3
+        @test reshape(_vtu_floats(xml, "Points"), 3, :) == [0.0 0.5 0.5 1.0; 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0]
+    end
+end
+
+@testset "pin: a 3D bundle is VTK_HEXAHEDRON cells with their corners in VTK order" begin
+    (; V, model, sol) = _pin_3d
+    dir = mktempdir()
+    write_vtk(joinpath(dir, "hex"), sol, model; subdivisions=:none, _pin_ascii...)
+    b = cell_box(V, CartesianIndex(1, 1, 1); level=1)
+    l, u = b.lower, b.upper
+    # VTK's hexahedron: the lower face counterclockwise, then the upper face in the same order.
+    corners = [l[1] u[1] u[1] l[1] l[1] u[1] u[1] l[1]
+               l[2] l[2] u[2] u[2] l[2] l[2] u[2] u[2]
+               l[3] l[3] l[3] l[3] u[3] u[3] u[3] u[3]]
+    for file in ("hex_data.vtu", "hex_level_1_base_mesh.vtu")
+        xml = read(joinpath(dir, file), String)
+        @test _vtu_ints(xml, "types") == [12]                    # VTK_HEXAHEDRON
+        @test _vtu_ints(xml, "offsets") == [8]
+        @test _vtu_ints(xml, "connectivity") == 0:7
+        @test reshape(_vtu_floats(xml, "Points"), 3, :) == corners
+    end
+end
+
+@testset "pin: :degree subdivides each region at its parents' per-axis maximum order" begin
+    (; model, sol) = _pin_2d
+    dir = mktempdir()
+    write_vtk(joinpath(dir, "deg"), sol, model; level_meshes=false, _pin_ascii...)
+    xml = read(joinpath(dir, "deg_data.vtu"), String)
+    # The left region (one parent, order (1, 2)) is cut 1 × 2; the right one (orders (3, 1) and (1, 3)) 3 × 3.
+    covers = _vtu_ints(xml, "cover_count")
+    @test _vtu_piece(xml, "NumberOfCells") == 11
+    @test count(==(1), covers) == 2
+    @test count(==(2), covers) == 9
+end
+
+@testset "pin: subdivisions as an NTuple sets the per-axis counts" begin
+    (; model, sol) = _pin_2d
+    dir = mktempdir()
+    write_vtk(joinpath(dir, "tup"), sol, model; subdivisions=(2, 3), level_meshes=false, _pin_ascii...)
+    xml = read(joinpath(dir, "tup_data.vtu"), String)
+    @test _vtu_piece(xml, "NumberOfCells") == 12             # two regions, 2 × 3 each
+    points = reshape(_vtu_floats(xml, "Points"), 3, 4, :)
+    @test all(c -> maximum(points[1, :, c]) - minimum(points[1, :, c]) == 0.25, axes(points, 3))
+    @test all(c -> maximum(points[2, :, c]) - minimum(points[2, :, c]) ≈ 1 / 3, axes(points, 3))
+end
+
+@testset "pin: point_data and cell_data as a Dict or a tuple of Pairs" begin
+    # The three spellings of the entries write the same arrays; only their order in the file is the container's.
+    (; model, sol) = _pin_2d
+    dir = mktempdir()
+    uh = (u, c, x, xi) -> u(c, xi)
+    tilt = (u, c, x, xi) -> x[1] - 2 * x[2]
+    width = (u, c, x, xi) -> c.cell.upper[1] - c.cell.lower[1]
+    spellings = (named=((uh=uh, tilt=tilt), (width=width,)),
+                 dict=(Dict("uh" => uh, :tilt => tilt), Dict(:width => width)),
+                 pairs=((:uh => uh, "tilt" => tilt), ("width" => width,)))
+    xml = Dict(map(collect(pairs(spellings))) do (label, (point_data, cell_data))
+                   write_vtk(joinpath(dir, "$label"), sol, model; level_meshes=false, point_data, cell_data,
+                             _pin_ascii...)
+                   return label => read(joinpath(dir, "$(label)_data.vtu"), String)
+               end)
+    for label in (:dict, :pairs), name in ("uh", "tilt", "width")
+        @test _vtu_values(xml[label], name) == _vtu_values(xml[:named], name)
+    end
+end
+
+@testset "pin: the written type and component count of each callback value shape" begin
+    (; model, sol) = _pin_2d
+    dir = mktempdir()
+    shapes = (pair=(u, c, x, xi) -> (x[1], x[2]),                 # a 2-tuple: padded to a 3-vector
+              mixed_tuple=(u, c, x, xi) -> (1, x[1], 2),          # Int and Float64 components: promoted
+              vector=(u, c, x, xi) -> SVector(x[1], x[2], 1.0), int_vector=(u, c, x, xi) -> SVector(1, 2, c.region_id),
+              mixed=(u, c, x, xi) -> c.region_id == 1 ? 1 : 0.5,  # Int at some samples, Float64 at others: promoted
+              int=(u, c, x, xi) -> c.region_id, single=(u, c, x, xi) -> Float32(x[1]))
+    written = (pair=("Float64", "3"), mixed_tuple=("Float64", "3"), vector=("Float64", "3"), int_vector=("Int64", "3"),
+               mixed=("Float64", "1"), int=("Int64", "1"), single=("Float32", "1"))
+    write_vtk(joinpath(dir, "shapes"), sol, model; subdivisions=:none, level_meshes=false, point_data=shapes,
+              cell_data=(cell_pair=shapes.pair,), _pin_ascii...)
+    xml = read(joinpath(dir, "shapes_data.vtu"), String)
+    for (name, (type, components)) in pairs(written)
+        tag = _vtu_tag(xml, name)
+        @test (tag["type"], tag["NumberOfComponents"]) == (type, components)
+    end
+    @test (_vtu_tag(xml, "cell_pair")["type"], _vtu_tag(xml, "cell_pair")["NumberOfComponents"]) == ("Float64", "3")
+    points = reshape(_vtu_floats(xml, "Points"), 3, :)
+    @test reshape(_vtu_floats(xml, "pair"), 3, :) == [points[1:2, :]; zeros(1, size(points, 2))]
+    @test reshape(_vtu_floats(xml, "mixed_tuple"), 3, :) == [ones(1, 8); points[1:1, :]; fill(2.0, 1, 8)]
+    @test _vtu_floats(xml, "mixed") == [fill(1.0, 4); fill(0.5, 4)]
+    @test reshape(_vtu_floats(xml, "cell_pair"), 3, :)[3, :] == zeros(2)
+end
+
+@testset "pin: field= given as a Field writes that field alone, as `data`" begin
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    a = field(:a, V)
+    b = field(:b, V)
+    model = prepare(Problem((a, b); blocks=(stiffness_block(a), mass_block(b)), loads=(source_load(a; source=1.0),),
+                            dirichlet=[dirichlet(0.0; on=boundary(:all), field=:a)]))
+    sol = solution(model, [sin(i) for i in 1:active_unknowns(model)])
+    dir = mktempdir()
+    files = write_vtk(joinpath(dir, "byfield"), sol, model; field=b, subdivisions=:none, _pin_ascii...)
+    @test basename.(files) == ["byfield.vtm", "byfield_data.vtu", "byfield_level_1_base_mesh.vtu"]
+    vtm = read(joinpath(dir, "byfield.vtm"), String)
+    @test occursin("name=\"b\"", vtm) && !occursin("name=\"a\"", vtm)
+    # The default `uh` entry evaluates the written field, `b`, not the model's first one.
+    xml = read(joinpath(dir, "byfield_data.vtu"), String)
+    points = reshape(_vtu_floats(xml, "Points"), 3, :)
+    @test _vtu_floats(xml, "uh") ≈ [value(sol, model, b, (points[1, k], points[2, k])) for k in axes(points, 2)]
+    # The Field and its name write the same bytes.
+    write_vtk(joinpath(dir, "byname"), sol, model; field=:b, subdivisions=:none, _pin_ascii...)
+    @test read(joinpath(dir, "byfield_data.vtu")) == read(joinpath(dir, "byname_data.vtu"))
+end
+
+@testset "pin: level_meshes=false writes no level mesh" begin
+    (; model, sol) = _pin_2d
+    dir = mktempdir()
+    files = write_vtk(joinpath(dir, "bare"), sol, model; level_meshes=false)
+    @test basename.(files) == ["bare.vtm", "bare_data.vtu"]
+    @test sort(readdir(dir)) == ["bare.vtm", "bare_data.vtu"]
+    @test !occursin("_mesh", read(joinpath(dir, "bare.vtm"), String))
+end
+
+@testset "pin: the quadrature cloud holds one vertex per quadrature point" begin
+    (; model) = _pin_2d
+    dir = mktempdir()
+    files = write_quadrature_vtm(joinpath(dir, "cloud"), model)
+    pieces = [read(file, String) for file in files if endswith(file, ".vtp")]
+    @test length(pieces) == 2                                # signatures [1] and [1, 2]
+    @test sum(xml -> _vtu_piece(xml, "NumberOfVerts"), pieces) == nquadpoints(model)
+    @test sum(xml -> _vtu_piece(xml, "NumberOfPoints"), pieces) == nquadpoints(model)
+end
+
+@testset "pin: write_vtk(path, …) returns every file it wrote, the .vtm first" begin
+    (; model, sol) = _pin_2d
+    dir = mktempdir()
+    files = write_vtk(joinpath(dir, "all"), sol, model)
+    @test files isa Vector{String}
+    @test first(files) == joinpath(dir, "all.vtm")
+    @test length(files) == 4                                 # the data grid and two level meshes
+    @test sort(files) == sort(joinpath.(dir, readdir(dir)))
+end
