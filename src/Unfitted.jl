@@ -329,16 +329,17 @@ corners welded within 10⁻⁶ of the bounding-box diagonal (a binary STL stores
 `Float32`). At that scale the check cannot tell a sliver of a closed surface from a dangling one, so a cell with two
 corners that close is rejected too, even in an otherwise sound mesh. So are two cells on the same welded corners — a
 sheet listed in both windings, or a face shared by two touching solids — which pass both checks while bounding nothing.
-The checks do not detect bodies that overlap, or that share a face triangulated differently on its two sides, nor a
-separate component wound inside-out beside a larger outward one. The default mode inverts the sign near such faces, so
-merge touching or overlapping bodies into the boundary of their union and orient every component outward.
+The checks do not detect bodies that overlap, a two-sided sheet or a shared face triangulated differently on its two
+sides, nor a separate component wound inside-out beside a larger outward one. The default mode inverts the sign near
+such faces, so merge touching or overlapping bodies into the boundary of their union and orient every component
+outward.
 
 `orientation` selects the inside/outside test:
 
   - `:pseudonormal` (default) — angle-weighted pseudonormal of the closest feature (Bærentzen & Aanæs 2005). Fast
     (O(candidates) per query), exact for a clean mesh including reflex features, down to the length at which it tells
-    features apart, 10⁻⁸ of the bounding-box diagonal: within a few such lengths of a ridge too sharp for it to
-    resolve, the sign can be wrong.
+    features apart, 10⁻⁸ of the bounding-box diagonal: next to a ridge too sharp for it to resolve, the sign can be
+    wrong at points up to some tens of such lengths from the surface, which `:winding` signs correctly.
   - `:winding` — generalized winding number (Jacobson et al. 2013). Robust on imperfect / non-watertight / globally
     flipped meshes, at O(cells) per query, and the only mode that accepts a mesh failing the checks above.
 

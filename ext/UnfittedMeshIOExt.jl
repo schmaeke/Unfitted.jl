@@ -22,8 +22,9 @@
 #   "Signed distance computation using the angle weighted pseudonormal", IEEE Trans. Vis. Comput. Graph. 11 (2005)
 #   243–253, doi:10.1109/TVCG.2005.49. In 2D a boundary vertex is codimension-1 (two segments meet), so the plain
 #   `n₁ + n₂` is already correct for convex and reflex vertices; in 3D a vertex needs the incident-angle weighting.
-#   Correct on a watertight, consistently outward-oriented mesh — a precondition this mode verifies before answering
-#   (see "Mesh validity").
+#   Correct, down to the coincidence tolerance `tol`, on a watertight, consistently outward-oriented mesh — a
+#   precondition this mode verifies before answering (see "Mesh validity"). Next to a ridge too sharp for `tol` to
+#   resolve, the sign can be wrong some tens of `tol` from the surface (see `mesh_levelset`'s docstring).
 #
 #   Inside/outside sign (`orientation = :winding`, opt-in): the generalized winding number — A. Jacobson, L. Kavan, O.
 #   Sorkine-Hornung, "Robust inside-outside segmentation using generalized winding numbers", ACM Trans. Graph. 32 (2013)
@@ -166,9 +167,10 @@ _is_degenerate(cell::NTuple{2,SVector{D,T}}, scale) where {D,T} = norm(cell[2] -
 # triangle rather than of how its vertices are listed. `‖ab × ac‖` is twice the area whichever vertex it is taken at,
 # and the smallest angle lies between the two longest edges, so twice the area over their product `ℓ₁ℓ₂` (the largest
 # of the three pairwise edge products) is that sine. Testing the angle at the first vertex alone made the verdict depend
-# on the vertex order: a needle with one edge of 1e-12 was dropped when listed from its blunt corner and kept when
-# listed from either end of the short edge. Since every pair of edges multiplies to at most `ℓ₁ℓ₂`, this flags every
-# triangle the first-vertex test did, and the needles it missed.
+# on the vertex order: a needle with one edge of 1e-12 was dropped when listed from its sharp tip (the corner opposite
+# the short edge) and kept when listed from either end of the short edge, where the angles are near 90°. Since every
+# pair of edges multiplies to at most `ℓ₁ℓ₂`, this flags every triangle the first-vertex test did, and the needles it
+# missed.
 function _is_degenerate(cell::NTuple{3,SVector{3,T}}, scale) where {T}
     a, b, c = cell
     ab, bc, ca = norm(b - a), norm(c - b), norm(a - c)
@@ -177,10 +179,11 @@ end
 
 # ── Mesh validity ─────────────────────────────────────────────────────────────
 
-# The pseudonormal sign is *exact* on a closed, coherently outward-oriented mesh and silently wrong on anything else — a
-# hole, a flipped cell or a globally reversed winding all yield a plausible-looking distance with the sign inverted over
-# part of space. The precondition is therefore checked, on the cells that survive the degeneracy filter because those
-# are the ones the sign field is built from. Three tests cover it:
+# The pseudonormal sign is *exact* on a closed, coherently outward-oriented mesh, down to the coincidence tolerance
+# `tol` (next to a ridge too sharp for `tol` to resolve it can be wrong, as `mesh_levelset`'s docstring states), and
+# silently wrong on anything else — a hole, a flipped cell or a globally reversed winding all yield a plausible-looking
+# distance with the sign inverted over part of space. The precondition is therefore checked, on the cells that survive
+# the degeneracy filter because those are the ones the sign field is built from. Three tests cover it:
 #
 #   * every codimension-1 face is traversed once in each direction (the boundary of the cell chain vanishes). A hole
 #     leaves faces traversed once; a flipped cell leaves faces traversed twice the same way. The faces are paired
@@ -257,9 +260,9 @@ end
 # The composition is Base's and StaticArrays', so the check compiles no function of this module's own. The count it
 # reports is of the repeated cells, each copy beyond the first of a corner set, not of every cell in such a set.
 #
-# A shared face triangulated differently on its two sides, or two bodies that overlap, inverts the sign in the same way
-# without repeating a cell; telling them apart needs a self-intersection test, which this check does not attempt, so
-# `mesh_levelset`'s docstring states them as limits.
+# A two-sided sheet, or a face shared by two bodies, that is triangulated differently on its two sides inverts the sign
+# in the same way without repeating a cell, and so do two bodies that overlap; telling them apart needs a
+# self-intersection test, which this check does not attempt, so `mesh_levelset`'s docstring states them as limits.
 function _check_watertight(cells, normals, scale)
     idcells = _weld(cells, 1.0e-6 * scale)
     shut = count(!allunique, idcells)
