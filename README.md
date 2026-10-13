@@ -153,8 +153,8 @@ Pkg.add(url="https://github.com/schmaeke/Unfitted.jl")
 Julia 1.10 or newer is required. The optional integrations are package
 extensions and load with their package: add `WriteVTK` to your environment
 (`Pkg.add("WriteVTK")`) for ParaView output, as the quick example below
-uses, and `BasicBSpline`, `Tensors`, or `FileIO` + `MeshIO` for the features
-that name them above.
+uses, `BasicBSpline` for the B-spline family, `FileIO` + `MeshIO` for
+imported boundary meshes, and `Tensors` for weak forms in tensor notation.
 
 ## Quick example
 
