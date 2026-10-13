@@ -156,15 +156,16 @@ volume(b::AxisBox) = prod(edge_lengths(b))
     center(b::AxisBox) -> SVector{D}
 
 Geometric center of the box, `(b.lower + b.upper) / 2`. Used for midpoint queries — cell-level sign samples and
-certificates in `physical.jl` and `implicit.jl`, VTK cell samples — and to build the reference-to-physical affine map
-below.
+certificates in `physical.jl` and `implicit.jl`, the post-processing cell samples — and to build the
+reference-to-physical affine map below.
 """
 center(b::AxisBox) = (b.lower + b.upper) / 2
 
 # The 2ᴰ vertices of the box spanned by `lower` and `upper`, vertex `i` taking `lower[d]` where bit `d − 1` of `i − 1`
 # is 0 and `upper[d]` where it is 1 — axis 1 fastest, the `CartesianIndices` order. The one corner enumeration of the
-# sign samplers (the kernel's leaf pruning and height-axis choice, the classifier's corner membership, the VTK cut
-# refinement) and of `_box_children` below; VTK cell connectivity keeps its own order (`_box_corners`).
+# sign samplers (the kernel's leaf pruning and height-axis choice, the classifier's corner membership, the
+# post-processing cut refinement) and of `_box_children` below. The post-processing records read the same corners in
+# face-cyclic order (`_box_corners`, VTK's cell order), a fixed permutation of this one.
 function _box_vertices(lower::SVector{D,T}, upper::SVector{D,T}) where {D,T}
     return ntuple(i -> SVector{D,T}(ntuple(d -> (i - 1) >> (d - 1) & 1 == 0 ? lower[d] : upper[d], D)), Val(2^D))
 end
@@ -172,7 +173,7 @@ _box_vertices(b::AxisBox) = _box_vertices(b.lower, b.upper)
 
 # The 2ᴰ children of one bisection of `b` on every axis, in `_box_vertices` order: child `i` spans vertex `i` of the
 # lower half-box `[lower, c]` to vertex `i` of the upper one `[c, upper]`. Shared by the classifier's octree
-# (`_classify_box`), the implicit kernel's subdivision and the VTK cut refinement.
+# (`_classify_box`), the implicit kernel's subdivision and the post-processing cut refinement (`_cut_leaves!`).
 #
 # Returns `nothing` when the bisection would be degenerate. On a box whose extent has reached the floating-point floor
 # the midpoint coincides with a bound on some axis, and `AxisBox`'s strict `lower[i] < upper[i]` invariant would reject
@@ -195,7 +196,7 @@ _half_diagonal(b::AxisBox) = norm(b.upper - b.lower) / 2
 #
 # so `f(c) > L·r` proves `f > 0` on the box (`+1`) and `f(c) < −L·r` proves `f < 0` (`−1`). Anything else is `0`,
 # undetermined — including `L = Inf`, which certifies nothing. One evaluation of `f`. The single certificate of the
-# CSG classifier (`_tri`), the implicit kernel's leaf pruning (`_sample_sign`) and the VTK cut refinement
+# CSG classifier (`_tri`), the implicit kernel's leaf pruning (`_sample_sign`) and the post-processing cut refinement
 # (`_cut_marked`), so the three agree on which boxes a leaf provably misses.
 function _certified_sign(f, L, box::AxisBox)
     fc = f(center(box))

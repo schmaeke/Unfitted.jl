@@ -114,8 +114,8 @@ end
 const VolumeRegion{D,T} = Region{D,T,Nothing,Nothing}
 
 # A volume region's box. A region stores its corners rather than an `AxisBox` because a frame may be degenerate on some
-# axis, which `AxisBox` rejects; the volume consumers that want a box — the VTK writers and the plan's volume
-# bookkeeping — build it here.
+# axis, which `AxisBox` rejects; the volume consumers that want a box — the post-processing sampler and the plan's
+# volume bookkeeping — build it here.
 _region_box(region::Region) = AxisBox(region.lower, region.upper)
 
 # The Jacobian of the frame `lower`–`upper`: `∏ (upper[d] − lower[d]) / 2` over the axes it extends along, a left fold
@@ -256,10 +256,11 @@ Keyword arguments:
     from 0.035 MiB to 0.61 MiB and the next plan build from 11.9 s (no reuse) to 0.011 s.
 
 The function is called by `prepare`, `move!`, and `_update_mask!`, all in `src/model.jl`, which own the plan a
-[`Model`](@ref) carries; `assembly.jl` and `postprocessing.jl` only read that cached plan back through the
-[`integration_plan`](@ref) / [`integration_plans`](@ref) accessors. The projection path in `projection.jl` builds no
-plan at all: it reuses this file's admissible-box partition engine (`_partition`) directly and keeps every box the
-target covers, without a `criterion`.
+[`Model`](@ref) carries; `assembly.jl` and `postprocessing.jl` only read that cached plan back — the volume walks
+through `_region_list`, the quadrature-point cloud through each subdomain's `plan.regions` — and user code reaches it
+through the [`integration_plan`](@ref) / [`integration_plans`](@ref) accessors. The projection path in `projection.jl`
+builds no plan at all: it reuses this file's admissible-box partition engine (`_partition`) directly and keeps every box
+the target covers, without a `criterion`.
 """
 function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criterion=:any_parent,
                           classify_cache=_ClassifyCache{D,T}(), moment_fit_cache=_MomentFitCache{D,T}()) where {D,T}
@@ -631,8 +632,9 @@ end
 
 # The per-axis maximum of `f(level, cell)` over a region's parent cells: the one helper that sizes every rule a region
 # carries. `f` returns a per-axis tuple for one parent cell — its tensor Gauss counts (`_gauss_counts`), its moment-fit
-# order (`_moment_orders`), its VTK subdivision count — and the maximum over the parents makes the rule exact for every
-# parent level's basis at once. `parents` is any list of items carrying a `level` id of `V` and a `cell`.
+# order (`_moment_orders`), its post-processing sample lattice (`_sample_cells`) — and the maximum over the parents
+# makes the rule exact for every parent level's basis at once. `parents` is any list of items carrying a `level` id of
+# `V` and a `cell`.
 #
 # The value is read per parent *cell*, not per level. Under one order per level the two are the same value and the rule
 # is unchanged; under a per-cell order they differ, and reading the cell is both cheaper and still exact — the minimum
@@ -905,6 +907,6 @@ end
 
 # The kinds `_trimmed_rule` gives a region `∂Ω` crosses, whatever rule it ended up with, and the subset on which the
 # moment fit failed (a custom rule never fails a fit: no fit ran). The diagnostics count both (`_kind_stats` in
-# `model.jl`), and the VTK writer refines exactly the first.
+# `model.jl`), and the post-processing sampler cut-refines exactly the first (`_sample_cells`).
 const _CUT_KINDS = (:cut_fitted, :cut_custom, :cut_fallback, :cut_failed, :cut_alpha_failed)
 const _FAILED_KINDS = (:cut_fallback, :cut_failed, :cut_alpha_failed)

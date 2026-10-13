@@ -1,8 +1,10 @@
 [deps]
 Unfitted = "c68911ed-f311-4fcd-9d58-9cd3adb40d87"
+WriteVTK = "64499a7a-5c06-52f2-abe2-ccb03c286192"
 
 [sources]
 Unfitted = {path = "../../.."}
 
 [compat]
+WriteVTK = "1.18"
 julia = "1.11"

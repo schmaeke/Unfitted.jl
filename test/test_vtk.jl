@@ -1,10 +1,24 @@
 using StaticArrays
+using WriteVTK      # loads UnfittedWriteVTKExt, which provides write_vtk, vtk_series and write_quadrature_vtm
 
 # Parse one `<DataArray>` back out of an ASCII `.vtu`/`.vtp` by name, so the tests can assert the numbers ParaView will
 # show. Requires `ascii=true, append=false` on the write; the appended-binary form carries no parsable text.
 _vtu_values(xml, name) = split(match(Regex("Name=\"$name\"[^>]*>([^<]*)</DataArray>"), xml).captures[1])
 _vtu_ints(xml, name) = parse.(Int, _vtu_values(xml, name))
 _vtu_floats(xml, name) = parse.(Float64, _vtu_values(xml, name))
+
+@testset "the WriteVTK extension provides the VTK entry points" begin
+    # The entry points are declared in the core and implemented by the extension `using WriteVTK` loads. Once it is
+    # loaded, a call none of its methods accepts is an ordinary `MethodError`, not advice to load what is loaded; the
+    # behaviour without the extension is pinned in a fresh process by test_api.jl.
+    @test Base.get_extension(Unfitted, :UnfittedWriteVTKExt) !== nothing
+    @test_throws MethodError write_vtk(1)
+    @test_throws MethodError vtk_series(1)
+    @test_throws MethodError write_quadrature_vtm(1)
+    series = vtk_series(joinpath(mktempdir(), "run"))
+    @test series isa VTKSeries
+    @test close(series) isa String
+end
 
 @testset "partitioned VTK bundle with level meshes" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
@@ -119,7 +133,11 @@ end
         e
     end
     @test err isa ArgumentError
-    @test occursin("value(solution, model, u2, x)", sprint(showerror, err))
+    message = sprint(showerror, err)
+    @test occursin("value(solution, model, u2, x)", message)
+    # The refusal comes from the consumer-neutral sampler, which a plotting front end would call too: it names the
+    # sampled field's subdomain, not the VTK writer or its blocks.
+    @test occursin("sampled field's own subdomain", message) && !occursin("write_vtk", message)
 end
 
 @testset "a VTK callback reads another field of the same subdomain" begin
@@ -139,6 +157,41 @@ end
                   other=(u, c, x, xi) -> record(u(c, xi, b) - value(solution, model, b, x)))
     write_vtk(joinpath(mktempdir(), "named"), solution, model; field=:a, level_meshes=false, subdivisions=2, point_data)
     @test length(gaps) > 100
+    @test maximum(gaps) ≤ 1.0e-12
+end
+
+@testset "a VTK callback reads a field only with the model's component count" begin
+    # The accessor reads a field's component count off the `Field` it is given. A `Field` that shares a model field's
+    # name but not its count is not that field: read with its own count it would return part of the model's field, or
+    # that field followed by the next field's values. It is refused before anything is written, as `value` refuses it;
+    # the model's own fields read their values, a vector field's included.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(1, 1), order=1)
+    a = field(:a, V)
+    w = field(:w, V; components=2)
+    model = prepare(Problem((a, w); blocks=(mass_block(a), mass_block(w))))
+    n = Unfitted.active_unknowns(model.dofs)
+    solution = Solution([10.0i for i in 1:n], model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    for impostor in (field(:a, V; components=2), field(:w, V))
+        dir = mktempdir()
+        err = try
+            write_vtk(joinpath(dir, "impostor"), solution, model; field=:a, level_meshes=false, subdivisions=:none,
+                      point_data=(read=(u, c, x, xi) -> u(c, xi, impostor),))
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("field $(impostor.name) has", sprint(showerror, err))
+        @test isempty(readdir(dir))
+        @test_throws ArgumentError value(solution, model, impostor, (0.5, 0.5))
+    end
+    gaps = Float64[]
+    record(gap) = (push!(gaps, maximum(abs, gap)); 0.0)
+    point_data = (a=(u, c, x, xi) -> record(u(c, xi, a) - value(solution, model, a, x)),
+                  w=(u, c, x, xi) -> record(u(c, xi, w) - value(solution, model, w, x)))
+    write_vtk(joinpath(mktempdir(), "own"), solution, model; field=:a, level_meshes=false, subdivisions=:none,
+              point_data)
+    @test length(gaps) == 8
     @test maximum(gaps) ≤ 1.0e-12
 end
 
@@ -177,7 +230,7 @@ end
 
     # A VTK data array is a vector only at three components; a 2-component array is stored but cannot be assigned as
     # VECTORS, so ParaView's Glyph / Warp By Vector cannot read it. The 2-D field is padded with a trailing zero, the
-    # same padding `_vtk_point` applies to the geometry it is attached to.
+    # same padding the WriteVTK extension's `_vtk_points` applies to the geometry it is attached to.
     uh_header = match(r"<DataArray[^>]*Name=\"uh\"[^>]*>", solution_xml)
     @test uh_header !== nothing
     @test occursin("NumberOfComponents=\"3\"", uh_header.match)
@@ -534,8 +587,8 @@ end
 end
 
 @testset "cut_depth rejects values outside its budget" begin
-    # The budget is resolved before any file handle exists, so a rejected call leaves nothing on disk — the same
-    # contract `_vtk_bundle_base` keeps for the dimension and coefficient checks.
+    # The budget is resolved before anything is sampled or a file opened, so a rejected call leaves nothing on disk —
+    # the contract every refusal of the writer keeps, the dimension and coefficient checks included.
     _, model, solution = _cut_depth_disk_model()
     dir = mktempdir()
     for bad in (-1, 9, :deep, 2.5)
@@ -560,9 +613,9 @@ end
 end
 
 @testset "write_vtk compresses by default" begin
-    # The default is `compress = true`, matching `WriteVTK`'s own. Pinned two ways: the appended payload really is zlib
-    # (the `.vtu` declares the compressor, and the file is markedly smaller), and the decompressed content is unchanged
-    # — a reader sees the same arrays either way.
+    # The default is `compress = true`, matching `WriteVTK`'s own. Pinned by what the files declare and weigh: the
+    # default `.vtu` names the zlib compressor and is under half the size of the uncompressed one. That the encodings
+    # decode to the same arrays is WriteVTK's to keep and is not decoded here.
     _, model, solution = _cut_depth_disk_model()
     dir = mktempdir()
     pd = (uh=(u, c, x, xi) -> u(c, xi),)
@@ -576,9 +629,413 @@ end
     @test !occursin("compressor=", off_xml)
     @test filesize(joinpath(dir, "on_data.vtu")) < filesize(joinpath(dir, "off_data.vtu")) / 2
 
-    # Same numbers underneath: written as parsable text, the two agree exactly.
+    # The same write as parsable text carries a `uh` and a `level_set` value at every point.
     write_vtk(joinpath(dir, "plain"), solution, model; subdivisions=4, cut_depth=:none, point_data=pd, ascii=true,
               append=false, compress=false)
     plain_xml = read(joinpath(dir, "plain_data.vtu"), String)
     @test length(_vtu_floats(plain_xml, "uh")) == length(_vtu_floats(plain_xml, "level_set"))
+end
+
+# ── Pins: the writer's output contract ────────────────────────────────────────
+#
+# What a rewrite of the writer must keep, pinned end to end on three tiny models built once and shared: the VTK cell
+# type and corner order per dimension, the subdivision rules, the accepted spellings of the keywords and of a callback's
+# value, the files a bundle consists of and the list `write_vtk` returns, and the size of the quadrature cloud.
+
+# The attributes of the `<DataArray>` named `name` in a `.vtu` / `.vtp`, as a `Dict`; readable in every encoding.
+function _vtu_tag(xml, name)
+    tag = match(Regex("<DataArray[^>]*Name=\"$name\"[^>]*>"), xml).match
+    return Dict(m.captures[1] => m.captures[2] for m in eachmatch(r"(\w+)=\"([^\"]*)\"", tag))
+end
+
+# An integer attribute of the `<Piece>` of a `.vtu` / `.vtp` (`NumberOfPoints`, `NumberOfCells`, `NumberOfVerts`, …).
+_vtu_piece(xml, attribute) = parse(Int, match(Regex("<Piece[^>]*$attribute=\"(\\d+)\""), xml).captures[1])
+
+# The keywords that make a bundle parsable text.
+_pin_ascii = (ascii=true, append=false, compress=false)
+
+# A mass model on `V` and a solution with distinct coefficients, so that no two dofs carry the same value.
+function _pin_model(V)
+    model = prepare(mass(V))
+    return (; V, model, sol=solution(model, [sin(i) for i in 1:active_unknowns(model)]))
+end
+
+# 1D: two order-1 cells. 2D: two cells of per-cell anisotropic orders (1, 2) and (3, 1), with an order-(1, 3) overlay
+# over the right one, so the right region has two parents and `:degree` takes the per-axis maximum (3, 3) over them.
+# 3D: one order-1 cell of an off-origin box with unequal edges, so every corner of it has distinct coordinates.
+_pin_1d = _pin_model(space(box((0.0,), (1.0,)); cells=2, order=1))
+_pin_2d = _pin_model(overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 1), order=reshape([(1, 2), (3, 1)], 2, 1)),
+                             box((0.5, 0.0), (1.0, 1.0)); cells=1, order=(1, 3)))
+_pin_3d = _pin_model(space(box((0.5, -1.0, 2.0), (1.5, 0.25, 4.0)); cells=1, order=1))
+
+@testset "pin: a 1D bundle is VTK_LINE cells of two points each" begin
+    (; model, sol) = _pin_1d
+    dir = mktempdir()
+    write_vtk(joinpath(dir, "line"), sol, model; subdivisions=:none, _pin_ascii...)
+    for file in ("line_data.vtu", "line_level_1_base_mesh.vtu")
+        xml = read(joinpath(dir, file), String)
+        @test _vtu_piece(xml, "NumberOfCells") == 2
+        @test _vtu_piece(xml, "NumberOfPoints") == 4
+        @test _vtu_ints(xml, "types") == [3, 3]                  # VTK_LINE
+        @test _vtu_ints(xml, "offsets") == [2, 4]
+        @test _vtu_ints(xml, "connectivity") == 0:3
+        @test reshape(_vtu_floats(xml, "Points"), 3, :) == [0.0 0.5 0.5 1.0; 0.0 0.0 0.0 0.0; 0.0 0.0 0.0 0.0]
+    end
+end
+
+@testset "pin: a 3D bundle is VTK_HEXAHEDRON cells with their corners in VTK order" begin
+    (; V, model, sol) = _pin_3d
+    dir = mktempdir()
+    write_vtk(joinpath(dir, "hex"), sol, model; subdivisions=:none, _pin_ascii...)
+    b = cell_box(V, CartesianIndex(1, 1, 1); level=1)
+    l, u = b.lower, b.upper
+    # VTK's hexahedron: the lower face counterclockwise, then the upper face in the same order.
+    corners = [l[1] u[1] u[1] l[1] l[1] u[1] u[1] l[1]
+               l[2] l[2] u[2] u[2] l[2] l[2] u[2] u[2]
+               l[3] l[3] l[3] l[3] u[3] u[3] u[3] u[3]]
+    for file in ("hex_data.vtu", "hex_level_1_base_mesh.vtu")
+        xml = read(joinpath(dir, file), String)
+        @test _vtu_ints(xml, "types") == [12]                    # VTK_HEXAHEDRON
+        @test _vtu_ints(xml, "offsets") == [8]
+        @test _vtu_ints(xml, "connectivity") == 0:7
+        @test reshape(_vtu_floats(xml, "Points"), 3, :) == corners
+    end
+end
+
+@testset "pin: :degree subdivides each region at its parents' per-axis maximum order" begin
+    (; model, sol) = _pin_2d
+    dir = mktempdir()
+    write_vtk(joinpath(dir, "deg"), sol, model; level_meshes=false, _pin_ascii...)
+    xml = read(joinpath(dir, "deg_data.vtu"), String)
+    # The left region (one parent, order (1, 2)) is cut 1 × 2; the right one (orders (3, 1) and (1, 3)) 3 × 3.
+    covers = _vtu_ints(xml, "cover_count")
+    @test _vtu_piece(xml, "NumberOfCells") == 11
+    @test count(==(1), covers) == 2
+    @test count(==(2), covers) == 9
+end
+
+@testset "pin: subdivisions as an NTuple sets the per-axis counts" begin
+    (; model, sol) = _pin_2d
+    dir = mktempdir()
+    write_vtk(joinpath(dir, "tup"), sol, model; subdivisions=(2, 3), level_meshes=false, _pin_ascii...)
+    xml = read(joinpath(dir, "tup_data.vtu"), String)
+    @test _vtu_piece(xml, "NumberOfCells") == 12             # two regions, 2 × 3 each
+    points = reshape(_vtu_floats(xml, "Points"), 3, 4, :)
+    @test all(c -> maximum(points[1, :, c]) - minimum(points[1, :, c]) == 0.25, axes(points, 3))
+    @test all(c -> maximum(points[2, :, c]) - minimum(points[2, :, c]) ≈ 1 / 3, axes(points, 3))
+end
+
+@testset "pin: point_data and cell_data as a Dict or a tuple of Pairs" begin
+    # The three spellings of the entries write the same arrays; only their order in the file is the container's.
+    (; model, sol) = _pin_2d
+    dir = mktempdir()
+    uh = (u, c, x, xi) -> u(c, xi)
+    tilt = (u, c, x, xi) -> x[1] - 2 * x[2]
+    width = (u, c, x, xi) -> c.cell.upper[1] - c.cell.lower[1]
+    spellings = (named=((uh=uh, tilt=tilt), (width=width,)),
+                 dict=(Dict("uh" => uh, :tilt => tilt), Dict(:width => width)),
+                 pairs=((:uh => uh, "tilt" => tilt), ("width" => width,)))
+    xml = Dict(map(collect(pairs(spellings))) do (label, (point_data, cell_data))
+                   write_vtk(joinpath(dir, "$label"), sol, model; level_meshes=false, point_data, cell_data,
+                             _pin_ascii...)
+                   return label => read(joinpath(dir, "$(label)_data.vtu"), String)
+               end)
+    for label in (:dict, :pairs), name in ("uh", "tilt", "width")
+        @test _vtu_values(xml[label], name) == _vtu_values(xml[:named], name)
+    end
+end
+
+@testset "pin: the written type and component count of each callback value shape" begin
+    (; model, sol) = _pin_2d
+    dir = mktempdir()
+    shapes = (pair=(u, c, x, xi) -> (x[1], x[2]),                 # a 2-tuple: padded to a 3-vector
+              mixed_tuple=(u, c, x, xi) -> (1, x[1], 2),          # Int and Float64 components: promoted
+              vector=(u, c, x, xi) -> SVector(x[1], x[2], 1.0), int_vector=(u, c, x, xi) -> SVector(1, 2, c.region_id),
+              mixed=(u, c, x, xi) -> c.region_id == 1 ? 1 : 0.5,  # Int at some samples, Float64 at others: promoted
+              int=(u, c, x, xi) -> c.region_id, single=(u, c, x, xi) -> Float32(x[1]))
+    written = (pair=("Float64", "3"), mixed_tuple=("Float64", "3"), vector=("Float64", "3"), int_vector=("Int64", "3"),
+               mixed=("Float64", "1"), int=("Int64", "1"), single=("Float32", "1"))
+    write_vtk(joinpath(dir, "shapes"), sol, model; subdivisions=:none, level_meshes=false, point_data=shapes,
+              cell_data=(cell_pair=shapes.pair,), _pin_ascii...)
+    xml = read(joinpath(dir, "shapes_data.vtu"), String)
+    for (name, (type, components)) in pairs(written)
+        tag = _vtu_tag(xml, name)
+        @test (tag["type"], tag["NumberOfComponents"]) == (type, components)
+    end
+    @test (_vtu_tag(xml, "cell_pair")["type"], _vtu_tag(xml, "cell_pair")["NumberOfComponents"]) == ("Float64", "3")
+    points = reshape(_vtu_floats(xml, "Points"), 3, :)
+    @test reshape(_vtu_floats(xml, "pair"), 3, :) == [points[1:2, :]; zeros(1, size(points, 2))]
+    @test reshape(_vtu_floats(xml, "mixed_tuple"), 3, :) == [ones(1, 8); points[1:1, :]; fill(2.0, 1, 8)]
+    @test _vtu_floats(xml, "mixed") == [fill(1.0, 4); fill(0.5, 4)]
+    @test reshape(_vtu_floats(xml, "cell_pair"), 3, :)[3, :] == zeros(2)
+end
+
+@testset "pin: field= given as a Field writes that field alone, as `data`" begin
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    a = field(:a, V)
+    b = field(:b, V)
+    model = prepare(Problem((a, b); blocks=(stiffness_block(a), mass_block(b)), loads=(source_load(a; source=1.0),),
+                            dirichlet=[dirichlet(0.0; on=boundary(:all), field=:a)]))
+    sol = solution(model, [sin(i) for i in 1:active_unknowns(model)])
+    dir = mktempdir()
+    files = write_vtk(joinpath(dir, "byfield"), sol, model; field=b, subdivisions=:none, _pin_ascii...)
+    @test basename.(files) == ["byfield.vtm", "byfield_data.vtu", "byfield_level_1_base_mesh.vtu"]
+    vtm = read(joinpath(dir, "byfield.vtm"), String)
+    @test occursin("name=\"b\"", vtm) && !occursin("name=\"a\"", vtm)
+    # The default `uh` entry evaluates the written field, `b`, not the model's first one.
+    xml = read(joinpath(dir, "byfield_data.vtu"), String)
+    points = reshape(_vtu_floats(xml, "Points"), 3, :)
+    @test _vtu_floats(xml, "uh") ≈ [value(sol, model, b, (points[1, k], points[2, k])) for k in axes(points, 2)]
+    # The Field and its name write the same bytes.
+    write_vtk(joinpath(dir, "byname"), sol, model; field=:b, subdivisions=:none, _pin_ascii...)
+    @test read(joinpath(dir, "byfield_data.vtu")) == read(joinpath(dir, "byname_data.vtu"))
+end
+
+@testset "pin: level_meshes=false writes no level mesh" begin
+    (; model, sol) = _pin_2d
+    dir = mktempdir()
+    files = write_vtk(joinpath(dir, "bare"), sol, model; level_meshes=false)
+    @test basename.(files) == ["bare.vtm", "bare_data.vtu"]
+    @test sort(readdir(dir)) == ["bare.vtm", "bare_data.vtu"]
+    @test !occursin("_mesh", read(joinpath(dir, "bare.vtm"), String))
+end
+
+@testset "pin: the quadrature cloud holds one vertex per quadrature point" begin
+    (; model) = _pin_2d
+    dir = mktempdir()
+    files = write_quadrature_vtm(joinpath(dir, "cloud"), model)
+    pieces = [read(file, String) for file in files if endswith(file, ".vtp")]
+    @test length(pieces) == 2                                # signatures [1] and [1, 2]
+    @test sum(xml -> _vtu_piece(xml, "NumberOfVerts"), pieces) == nquadpoints(model)
+    @test sum(xml -> _vtu_piece(xml, "NumberOfPoints"), pieces) == nquadpoints(model)
+end
+
+@testset "pin: write_vtk(path, …) returns every file it wrote, the .vtm first" begin
+    (; model, sol) = _pin_2d
+    dir = mktempdir()
+    files = write_vtk(joinpath(dir, "all"), sol, model)
+    @test files isa Vector{String}
+    @test first(files) == joinpath(dir, "all.vtm")
+    @test length(files) == 4                                 # the data grid and two level meshes
+    @test sort(files) == sort(joinpath.(dir, readdir(dir)))
+end
+
+# ── Regressions: the writer's fixed bugs ──────────────────────────────────────
+
+@testset "a refused or throwing write leaves nothing on disk" begin
+    # Refusals of a keyword or of a callback's value, and an exception a callback raises — here only while the second
+    # field of a coupled model is sampled, after the first field's block is complete — all happen while the bundle is
+    # still in memory. The writer used to make the directory first and save whatever it had on the way out, leaving a
+    # stub `.vtm` and partial grids behind.
+    (; model, sol) = _pin_2d
+    V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(1, 1), order=1)
+    V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(1, 1), order=1)
+    u1 = field(:u1, V1)
+    u2 = field(:u2, V2)
+    coupled = prepare(Problem((u1, u2); blocks=(mass_block(u1), mass_block(u2))))
+    coupled_sol = solution(coupled, ones(active_unknowns(coupled)))
+    cases = [(ArgumentError, model, sol, (; subdivisions=0)), (ArgumentError, model, sol, (; subdivisions=(2, 2, 2))),
+             (ArgumentError, model, sol, (; subdivisions=:bad)), (ArgumentError, model, sol, (; field=:nope)),
+             (ArgumentError, model, sol, (; point_data=[1])),
+             (ArgumentError, model, sol, (; point_data=(text=(u, c, x, xi) -> "text",))),
+             (ErrorException, coupled, coupled_sol,
+              (; cell_data=(late=(u, c, x, xi) -> x[1] > 1.5 ? error("second field") : 0.0,)))]
+    for (exception, m, s, keywords) in cases
+        dir = mktempdir()
+        @test_throws exception write_vtk(joinpath(dir, "sub", "x"), s, m; keywords...)
+        @test isempty(readdir(dir))
+    end
+    # A series frame that fails while it is sampled writes nothing either, and does not use up its frame number.
+    dir = mktempdir()
+    series = vtk_series(joinpath(dir, "run"))
+    @test_throws ErrorException write_vtk(series, 0.0, sol, model; point_data=(late=(u, c, x, xi) -> error("frame"),))
+    @test isempty(readdir(joinpath(dir, "run_frames")))
+    @test series.count[] == 0
+    @test write_vtk(series, 0.0, sol, model; level_meshes=false) == joinpath(dir, "run_frames", "frame_0001.vtm")
+    close(series)
+end
+
+@testset "SVector callback values are promoted over every sample" begin
+    # The values of one entry share one element type, promoted over every sample as numbers and tuples already were.
+    # Converting every SVector to the first sample's type refused a fractional value after an integer first sample
+    # (`InexactError`) and rounded every `Float64` value after a `Float32` one. Region 1 is walked first here, so its
+    # value is the first sample's.
+    (; model, sol) = _pin_2d
+    dir = mktempdir()
+    first_int = (u, c, x, xi) -> c.region_id == 1 ? SVector(1, 2) : SVector(x[1], x[2] / 3)
+    first_single = (u, c, x, xi) -> c.region_id == 1 ? SVector(0.5f0, 0.25f0) : SVector(x[1] / 3, x[2] / 3)
+    for (name, f, region_one, other) in (("first_single", first_single, (0.5, 0.25), x -> (x[1] / 3, x[2] / 3)),
+                                         ("first_int", first_int, (1.0, 2.0), x -> (x[1], x[2] / 3)))
+        write_vtk(joinpath(dir, name), sol, model; subdivisions=:none, level_meshes=false, point_data=(v=f,),
+                  _pin_ascii...)
+        xml = read(joinpath(dir, name * "_data.vtu"), String)
+        @test _vtu_tag(xml, "v")["type"] == "Float64"
+        points = reshape(_vtu_floats(xml, "Points"), 3, :)
+        regions = _vtu_ints(xml, "region_id")
+        # Every value exactly what the callback returned, padded to three components.
+        expected = [regions[(k - 1) ÷ 4 + 1] == 1 ? region_one : other(points[:, k]) for k in axes(points, 2)]
+        @test reshape(_vtu_floats(xml, "v"), 3, :) == reduce(hcat, [[e..., 0.0] for e in expected])
+    end
+end
+
+@testset "an unsupported callback value is refused naming its entry" begin
+    # Each of these used to reach WriteVTK, which refused it as `data type not supported by VTK: Any` (or a
+    # `DimensionMismatch`), naming neither the entry nor what it accepts. The refusal now names both, and like every
+    # refusal it leaves nothing on disk.
+    (; model, sol) = _pin_2d
+    refused = [(:point_data, "vector", (u, c, x, xi) -> [x[1], x[2], 0.0]),          # a Vector, not an SVector
+               (:point_data, "matrix", (u, c, x, xi) -> SMatrix{2,2}(x[1], 0.0, 0.0, x[2])),
+               (:point_data, "text", (u, c, x, xi) -> "text"),
+               (:point_data, "complex", (u, c, x, xi) -> complex(x[1], x[2])),
+               (:point_data, "rational", (u, c, x, xi) -> 1 // 3),                     # real, but not a VTK type
+               (:cell_data, "shapes", (u, c, x, xi) -> c.region_id == 1 ? x[1] : (x[1], x[2])),
+               (:cell_data, "lengths", (u, c, x, xi) -> c.region_id == 1 ? SVector(x[1]) : SVector(x[1], x[2]))]
+    for (kind, name, f) in refused
+        dir = mktempdir()
+        entries = NamedTuple{(Symbol(name),)}((f,))
+        keywords = kind === :point_data ? (; point_data=entries) : (; cell_data=entries)
+        err = try
+            write_vtk(joinpath(dir, "x"), sol, model; subdivisions=:none, keywords...)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        message = err === nothing ? "" : sprint(showerror, err)
+        @test occursin("$kind entry \"$name\"", message)
+        @test occursin("a real number, a tuple of reals or an SVector of reals", message)
+        @test isempty(readdir(dir))
+    end
+end
+
+@testset "a Bool callback value is written as UInt8 0 / 1" begin
+    # VTK has no boolean type, and WriteVTK refused a Bool array outright (`data type not supported by VTK: Bool`),
+    # although a Bool is the natural value of a flag or a mask. It is written as UInt8 0 / 1: alone, in an SVector or in
+    # a tuple, and padded to three components like any other 2-vector.
+    (; model, sol) = _pin_2d
+    dir = mktempdir()
+    write_vtk(joinpath(dir, "flags"), sol, model; subdivisions=:none, level_meshes=false, _pin_ascii...,
+              point_data=(right=(u, c, x, xi) -> x[1] > 0.5, corner=(u, c, x, xi) -> SVector(x[1] > 0.5, x[2] > 0.5),
+                          pair=(u, c, x, xi) -> (x[1] > 0.5, x[2] > 0.5)),
+              cell_data=(first=(u, c, x, xi) -> c.region_id == 1,))
+    xml = read(joinpath(dir, "flags_data.vtu"), String)
+    for (name, components) in (("right", "1"), ("corner", "3"), ("pair", "3"), ("first", "1"))
+        tag = _vtu_tag(xml, name)
+        @test (tag["type"], tag["NumberOfComponents"]) == ("UInt8", components)
+    end
+    points = reshape(_vtu_floats(xml, "Points"), 3, :)
+    @test _vtu_ints(xml, "right") == Int.(points[1, :] .> 0.5)
+    @test reshape(_vtu_ints(xml, "corner"), 3, :) == [Int.(points[1:2, :] .> 0.5); zeros(Int, 1, size(points, 2))]
+    @test _vtu_ints(xml, "pair") == _vtu_ints(xml, "corner")
+    @test _vtu_ints(xml, "first") == Int.(_vtu_ints(xml, "region_id") .== 1)
+end
+
+@testset "a frame written to a closed series is refused up front" begin
+    # `close` writes the collection and frees it. A later frame used to be sampled in full and then fail inside the XML
+    # library (`XMLNoRootError`); it is now refused before any sampling, writes nothing and keeps the frame count.
+    (; model, sol) = _pin_2d
+    dir = mktempdir()
+    series = vtk_series(joinpath(dir, "run"))
+    write_vtk(series, 0.0, sol, model; level_meshes=false)
+    close(series)
+    frames = readdir(joinpath(dir, "run_frames"))
+    sampled = Ref(0)
+    err = try
+        write_vtk(series, 1.0, sol, model; level_meshes=false, point_data=(n=(u, c, x, xi) -> (sampled[] += 1; 0.0),))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("closed series", err === nothing ? "" : sprint(showerror, err))
+    @test sampled[] == 0
+    @test readdir(joinpath(dir, "run_frames")) == frames
+    @test series.count[] == 1
+end
+
+@testset "a dotted base name writes the same files without warnings" begin
+    # WriteVTK appends a file's extension when it is missing, but warns when the name carries any other one, and a
+    # time-stamped base name such as `out_t=0.5` has one (`.5`): every file of its bundle used to warn. The writers now
+    # name each file with its extension — the data grid, the level meshes, the quadrature clouds, a series frame and its
+    # collection — and the names are unchanged.
+    (; model, sol) = _pin_2d
+    base = joinpath(mktempdir(), "out_t=0.5")
+    files = @test_logs write_vtk(base, sol, model)
+    @test files == base .* [".vtm", "_data.vtu", "_level_1_base_mesh.vtu", "_level_2_overlay_mesh.vtu"]
+    cloud = joinpath(mktempdir(), "cloud_t=0.5")
+    @test (@test_logs write_quadrature_vtm(cloud, model)) ==
+          [cloud * ".vtm", cloud * "_quadrature_levels_1.vtp", cloud * "_quadrature_levels_1_2.vtp"]
+    run = joinpath(mktempdir(), "run_t=0.5")
+    series = @test_logs vtk_series(run)
+    @test (@test_logs write_vtk(series, 0.5, sol, model; level_meshes=false)) ==
+          joinpath(run * "_frames", "frame_0001.vtm")
+    @test (@test_logs close(series)) == run * ".pvd"
+    @test isfile(run * ".pvd")
+end
+
+# ── Records: what a consumer reads ────────────────────────────────────────────
+#
+# The writers serialise consumer-neutral records (`Unfitted.SampleGrid`), which a plotting front end would read as they
+# are. These internal tests pin the record contract itself, without decoding a file: the point and cell counts, the
+# corner order, one value per point or per cell in every array, the built-in arrays and their order.
+
+@testset "records: a sampled field's data grid and level mesh" begin
+    phi_disk, model, sol = _cut_depth_disk_model()
+    width = (u, c, x, xi) -> c.cell.upper[1] - c.cell.lower[1]
+    records = Unfitted._sample_fields(sol, model; subdivisions=2, cut_depth=1, cell_data=(width=width,))
+    (; field, data, meshes) = only(records)
+    n = Unfitted._cell_count(data)
+    @test n > 16                                             # four regions, a 2 × 2 lattice each, and the cut leaves
+    @test length(data.points) == n << 2
+    # Every cell's corners are the face-cyclic permutation (1, 2, 4, 3) of the `_box_vertices` of the box they span.
+    @test all(1:n) do c
+        corners = data.points[(4c-3):(4c)]
+        return corners == collect(Unfitted._box_vertices(corners[1], corners[3]))[[1, 2, 4, 3]]
+    end
+    @test first.(data.point_data) == ["uh", "level_set"]
+    @test first.(data.cell_data) == ["region_id", "cover_count", "width"]
+    @test all(length(last(entry)) == length(data.points) for entry in data.point_data)
+    @test all(length(last(entry)) == n for entry in data.cell_data)
+    arrays = Dict(data.point_data..., data.cell_data...)
+    @test arrays["level_set"] == [levelset_value(field.space.physical, x) for x in data.points]
+    @test issorted(arrays["region_id"])
+    @test arrays["width"] == [data.points[4c - 2][1] - data.points[4c - 3][1] for c in 1:n]
+
+    @test [(m.level, m.role) for m in meshes] == [(1, :base)]
+    mesh = only(meshes).grid
+    @test Unfitted._cell_count(mesh) == 4
+    @test isempty(mesh.point_data)
+    @test first.(mesh.cell_data) ==
+          ["level_id", "role_id", "order_max", "cell_id", "active", "covered", "active_dofs", "reduced_dofs"]
+    @test all(entry -> last(entry) isa Vector{Int} && length(last(entry)) == 4, mesh.cell_data)
+end
+
+@testset "records: fields sharing a space carry its level meshes once" begin
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    a = field(:a, V)
+    b = field(:b, V)
+    model = prepare(Problem((a, b); blocks=(mass_block(a), mass_block(b))))
+    sol = solution(model, [sin(i) for i in 1:active_unknowns(model)])
+    records = Unfitted._sample_fields(sol, model; subdivisions=:none, point_data=NamedTuple())
+    @test [r.field.name for r in records] == [:a, :b]
+    @test [length(r.meshes) for r in records] == [1, 0]
+    @test all(r -> isempty(r.data.point_data), records)
+    @test isempty(only(Unfitted._sample_fields(sol, model; field=b, level_meshes=false)).meshes)
+end
+
+@testset "records: the quadrature cloud weighs each signature's regions" begin
+    # One vertex cloud per sorted covering-level signature, in sorted order. Its weights are the physical quadrature
+    # weights, so they sum to the measure of that signature's regions — the left region of the two-cell mesh is covered
+    # by the base level alone, the right one by the base and the overlay.
+    (; model) = _pin_2d
+    cloud = Unfitted._sample_quadrature(model)
+    @test [entry.signature for entry in cloud] == [[1], [1, 2]]
+    regions = Unfitted.integration_plans(model)[1].regions
+    for (; signature, grid) in cloud
+        @test Unfitted._cell_count(grid) == length(grid.points)
+        @test first.(grid.point_data) == ["weight"] && isempty(grid.cell_data)
+        measure = sum(Unfitted._region_measure(r) for r in regions if sort([p.level for p in r.parents]) == signature)
+        @test sum(last(only(grid.point_data))) ≈ measure rtol = 1.0e-13
+    end
+    @test sum(entry -> length(entry.grid.points), cloud) == nquadpoints(model)
 end

@@ -1025,7 +1025,7 @@ end
 #
 # FNV-1a over the integers themselves rather than `Base.hash`, for the reason `test/test_graded_golden.jl` gives for its
 # own digest: `Base.hash` carries no stability guarantee across Julia versions, and this value is displayed, goes into
-# the reproducibility report (`postprocessing.jl`) and may be quoted back in a bug report.
+# the reproducibility report (`diagnostics(model, solution)`, below) and may be quoted back in a bug report.
 const _PIN_PRIME = 0x00000100000001b3
 const _PIN_BASIS = 0xcbf29ce484222325
 

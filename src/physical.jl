@@ -120,8 +120,8 @@ _inside(n::Not, x) = !_inside(n.part, x)
 
 # A single scalar that is ≤ 0 exactly on Ω, reconstructed from the tree (intersection → max, union → min, complement →
 # negate). This is the representation the kernel deliberately avoids for *integration* (its kinks are why we carry
-# leaves separately), but it is the right thing to *display*: a contour at 0 reproduces ∂Ω. Used by VTK export and
-# nowhere in the hot path.
+# leaves separately), but it is the right thing to *display*: a contour at 0 reproduces ∂Ω. Used by the post-processing
+# samples (the `level_set` array and the cut refinement in `postprocessing.jl`) and nowhere in the hot path.
 _value(l::Leaf, x) = l.f(x)
 _value(n::AllOf, x) = maximum(p -> _value(p, x), n.parts)
 _value(n::AnyOf, x) = minimum(p -> _value(p, x), n.parts)
@@ -355,10 +355,10 @@ end
 
 # Largest Lipschitz constant declared anywhere in the tree, or `Inf` if any leaf declines to declare one.
 # `levelset_value` collapses the tree with max / min / negate, and each of those is non-expansive in its arguments, so
-# the collapsed scalar is itself Lipschitz with this constant. That is what the VTK export's cut refinement needs: it
-# bands on the collapsed φ rather than on the separate leaves, so it needs a constant for φ, not one per leaf. `Inf`
-# propagates — one undeclared leaf leaves the whole tree uncertified, exactly as it does for `_tri`, and the export then
-# falls back to corner signs.
+# the collapsed scalar is itself Lipschitz with this constant. That is what the post-processing cut refinement
+# (`_cut_marked`) needs: it bands on the collapsed φ rather than on the separate leaves, so it needs a constant for φ,
+# not one per leaf. `Inf` propagates — one undeclared leaf leaves the whole tree uncertified, exactly as it does for
+# `_tri`, and the refinement then falls back to corner signs.
 _levelset_lipschitz(l::Leaf) = float(l.lipschitz)
 _levelset_lipschitz(n::AllOf) = maximum(_levelset_lipschitz, n.parts)
 _levelset_lipschitz(n::AnyOf) = maximum(_levelset_lipschitz, n.parts)

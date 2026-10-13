@@ -937,6 +937,37 @@ end
     @test all(r -> r[1] == 0 && r[2] == zero(SVector{2,Float64}), off_list)
 end
 
+# Allocation count of one warm quadrature-point walk, with `gradients` defaulted (`flags = ()`) or given
+# (`flags = (Val(true),)`), behind a function barrier so the count is the walk's own. The walk is reached by a dynamic
+# call, as its callers reach it (`foreach_quadrature_point` does not specialise on the model, so it does not infer the
+# state's type either): a static call would inline the five-argument method and hide what it costs.
+function _warm_walk_allocations(op::F, ws, list, state, flags::Tuple) where {F}
+    walk = Base.inferencebarrier(Unfitted._walk)
+    walk(op, nothing, ws, list, state, flags...)
+    walk(op, nothing, ws, list, state, flags...)
+    return @allocations walk(op, nothing, ws, list, state, flags...)
+end
+
+@testset "a walk that defaults its gradients flag allocates as an explicit one" begin
+    # `_walk`'s `gradients` defaults to `Val(true)`, so Julia generates a five-argument method that only passes the fold
+    # `op` along, and it does not specialise a method on a function argument it merely passes along. Unless `_walk`
+    # names `op`'s type, that method reaches the full one by a dynamic call that boxes its arguments: on this fixture
+    # four allocations per walk with a state and two without, against none with the flag given. Through the public walk
+    # that was three more allocations per `foreach_quadrature_point` call with a state and one more without. The fold
+    # captures a variable, as `foreach_quadrature_point`'s does, so it is boxed too when it is passed as a `Function`.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2)
+    model = prepare(Problem((field(:u, V),)))
+    list = Unfitted._region_list(model, nothing, V)
+    total = Ref(0.0)
+    op = (acc, q) -> (total[] += q.weight; acc)
+    ws = Unfitted._assembly_workspace(model)
+    state = Unfitted.FormState(model.dofs, ones(active_unknowns(model)))
+    for (walk_ws, walk_state) in ((nothing, nothing), (ws, state))
+        @test _warm_walk_allocations(op, walk_ws, list, walk_state, ()) ==
+              _warm_walk_allocations(op, walk_ws, list, walk_state, (Val(true),))
+    end
+end
+
 @testset "1D bar with inhomogeneous Neumann data has analytic solution" begin
     # −u''(x) = 0 on (0, 1), u(0) = 0, u'(1) = g. Exact: u(x) = g x.
     omega = box((0.0,), (1.0,))

@@ -105,6 +105,7 @@ a ghost penalty) and is the natural next step from this example.
 =#
 
 using Unfitted
+using WriteVTK              # loads UnfittedWriteVTKExt, the ParaView writer
 using StaticArrays
 using Tensors
 

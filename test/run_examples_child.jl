@@ -34,12 +34,13 @@
 #
 # Usage — the parent drives the first form; the second is for running examples by hand. Each name is the example's
 # `<tier>/<name>` path under `examples/`. `--project=.` works for every example whose only dependency is `Unfitted`
-# itself; one that also needs a weak dependency (`Tensors`, `BasicBSpline`, `FileIO` + `MeshIO`) needs a project that
-# carries it, and one that needs a package the repository does not depend on at all — `OrdinaryDiffEq` — has to be run
-# on its own example project, which `test_examples.jl` explains:
+# itself; one that also needs a weak dependency (`WriteVTK`, which every example writing ParaView output loads;
+# `Tensors`, `BasicBSpline`, `FileIO` + `MeshIO`) needs a project that carries it, and one that needs a package the
+# repository does not depend on at all — `OrdinaryDiffEq` — has to be run on its own example project, which
+# `test_examples.jl` explains:
 #
 #     julia -O0 --project=<env> test/run_examples_child.jl --cases=<payload.jl>
-#     julia -O0 --project=. test/run_examples_child.jl reproductions/singular_square_2d
+#     julia -O0 --project=. test/run_examples_child.jl reproductions/conditioning_small_overlap
 #
 # `<payload.jl>` is a file that evaluates to a `NamedTuple`
 #

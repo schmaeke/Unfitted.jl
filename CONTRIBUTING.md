@@ -123,7 +123,7 @@ CITATION.cff                  machine-readable citation metadata
 .JuliaFormatter.toml          repo-wide formatting config (yas style, indent 4, margin 120)
 precommit.jl                  formatter wrapper + SLOC/comment/docstring stats
 src/                          library source
-ext/                          package extensions (BasicBSpline, FileIO+MeshIO+GeometryBasics, Tensors)
+ext/                          package extensions (BasicBSpline, FileIO+MeshIO+GeometryBasics, Tensors, WriteVTK)
 test/                         unit and regression tests
 examples/                     runnable scripts in three tiers (tutorials/, applications/, reproductions/), one sub-directory per example, each with its own Project.toml
 benchmarks/                   targeted performance benchmarks (own Project.toml)
@@ -137,7 +137,7 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 
 | File              | Responsibility                                              |
 |-------------------|-------------------------------------------------------------|
-| `Unfitted.jl`     | top-level module: imports, exports, include order           |
+| `Unfitted.jl`     | top-level module: imports, exports, the extension stubs with their docstrings, include order |
 | `geometry.jl`     | D-dimensional axis-aligned boxes, coordinate maps, tolerances |
 | `physical.jl`     | CSG level-set tree, `PhysicalDomain`, three-valued cell classifier |
 | `implicit.jl`     | Saye dimension-reduction implicit quadrature on the level set (volume rules) |
@@ -158,8 +158,9 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `projection.jl`   | variational and rewire-based state transfer between models  |
 | `adaptivity.jl`   | automated hp adaptivity: `estimate` (Bank–Weiser indicator), Dörfler marking, the h-versus-p decision by Melenk–Wohlmuth predicted error reduction, `refine` and `coarsen` |
 | `data.jl`         | per-quadrature-point `QuadField` + RBF transfer             |
-| `postprocessing.jl` | VTK export, L² error, field/gradient evaluation           |
+| `postprocessing.jl` | what every post-processing consumer shares: the consumer-neutral sampling records (data grids, level meshes, the quadrature cloud), field/gradient evaluation, L² error, boundary integrals |
 | `api.jl`          | thin public-API wrappers (mass, stiffness, poisson, neumann, …) |
+| `ext/UnfittedWriteVTKExt.jl` (not in `src/`) | the VTK consumer of `postprocessing.jl`'s records, a package extension loaded with WriteVTK: `write_vtk`, `vtk_series`, `write_quadrature_vtm`, declared and documented in `Unfitted.jl` |
 
 Only split a single file when a second basis family, an alternative
 transfer scheme, or an honest test burden makes the split helpful.
@@ -808,7 +809,8 @@ superposition idea for its own enrichment.
     `cell_order(level, cell)` is the question anything that integrates,
     evaluates or subdivides must ask, and every quadrature consumer does:
     the region rule, the moment-fit order, the facet rule, the immersed
-    simplex rule and the VTK subdivision all size from the parent *cell*.
+    simplex rule and the post-processing sample lattice all size from the
+    parent *cell*.
     `nominal_order(level)` is the per-axis maximum over the palette, and it
     is a sizing and default quantity — the workspace's 1D factor buffers,
     where over-sizing is safe (its value and gradient buffers are sized
@@ -1208,8 +1210,8 @@ The rules:
     a multi-line `#` comment block immediately above the definition.
     "Non-trivial" means anything that a new reader could not predict
     from the name and signature alone. Tiny obvious helpers
-    (`_role_id(::Symbol)`, single-line predicate wrappers) do not need
-    one.
+    (`_squared_norm(::Number)`, single-line predicate wrappers) do not
+    need one.
   - **Explain the *why*, not the *what*.** The code already states what
     it does. Comments and docstrings exist for the reasoning: the
     invariant being preserved, the numerical-convention being honored,
@@ -1345,7 +1347,8 @@ when they remove real work:
   - basis-family support packages only when a non-default basis is
     added and the dependency is smaller than implementing the needed
     operations;
-  - VTK output for examples, e.g. `WriteVTK`;
+  - VTK output, e.g. `WriteVTK`, as a weak dependency behind the
+    `UnfittedWriteVTKExt` package extension;
   - development quality tools, e.g. `BenchmarkTools`, `JuliaFormatter`,
     `Aqua`, `JET`, `Documenter`.
 
@@ -1358,9 +1361,16 @@ Rules:
   - Do not add production dependencies without a short justification in
     the PR summary.
   - Optional integrations belong in `[weakdeps]` + `[extensions]`, not in
-    `[deps]`. The package currently ships three: `BasicBSpline` (B-spline
+    `[deps]`. The package currently ships four: `BasicBSpline` (B-spline
     basis family), `FileIO` + `MeshIO` + `GeometryBasics` (STL /
-    boundary-mesh level sets), and `Tensors` (tensor-notation weak forms).
+    boundary-mesh level sets), `Tensors` (tensor-notation weak forms), and
+    `WriteVTK` (ParaView output). An extension's public names are
+    declared in `src/Unfitted.jl`, since an extension cannot export a
+    name, and a docstring that `?name` must find in a session without the
+    extension belongs there too: one written in the extension lands in
+    the extension module's own docs. The VTK writers are declared as
+    fallback methods that, without the extension, raise an error naming
+    the package to load (`_extension_missing`).
   - `Manifest.toml` is git-ignored. Do not change that.
 
 ## Performance
@@ -1572,7 +1582,12 @@ demos.
     mixed-family direction where a degree-1 cover spans an
     integrated-Legendre level's hats, and the fold configurations where the
     cover's face lands before, inside and beyond the cut band; the MeshIO
-    signed-distance leaf; the Tensors notation round-trip.
+    signed-distance leaf; the Tensors notation round-trip; the WriteVTK
+    writer's bundles, series and quadrature clouds (`test_vtk.jl`, which
+    also pins the consumer-neutral records they serialise), and, in a
+    fresh process that loads Unfitted alone, its entry points asking for
+    `using WriteVTK` without writing anything or loading WriteVTK
+    (`test_api.jl`).
     **Requirement not yet met:** the fold configuration that support selection
     repairs is still singular under the *clamped* mechanism, which `bspline(;
     continuity = m)` for `m < p − 1` still selects. Where a clamped cover's box
@@ -1601,8 +1616,9 @@ demos.
     floor dominated when every script paid it separately. Each case
     declares the packages it needs beyond `Unfitted` in a `requires`
     field, and a case the active project cannot resolve is skipped
-    rather than failed: the three examples that need a weak dependency
-    (`Tensors`; `BasicBSpline`; `FileIO` + `GeometryBasics` + `MeshIO`)
+    rather than failed: the examples that need a weak dependency — the
+    ten that write ParaView output (`WriteVTK`), and those needing
+    `Tensors`, `BasicBSpline` or `FileIO` + `GeometryBasics` + `MeshIO` —
     run under `Pkg.test`, where all of those sit in the `test` target,
     and skip in a bare `--project=.` isolation run.
     **Requirement not yet met:** `applications/time_integration` needs

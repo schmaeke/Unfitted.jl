@@ -57,14 +57,18 @@
 # The batch is launched on the *active* project (`Base.active_project()`). Under `Pkg.test` that is the instantiated
 # test sandbox, which carries `Unfitted` and its dependencies (`StaticArrays`, `LinearAlgebra`, `ForwardDiff`) *and*
 # every weak dependency listed in the package's `test` target — `BasicBSpline`, `FileIO`, `GeometryBasics`, `MeshIO`,
-# `Tensors`. In a bare `julia --project=. …` session the active project is the package root, which carries none of
-# those, because they are `[weakdeps]` rather than `[deps]`.
+# `Tensors`, `WriteVTK`. In a bare `julia --project=. …` session the active project is the package root, which carries
+# none of those, because they are `[weakdeps]` rather than `[deps]`.
 #
 # Each case therefore declares in `requires` the packages it needs beyond `Unfitted` itself, and a case whose
 # requirements the active project cannot resolve is *skipped* rather than failed. `Base.identify_package` answers that
-# question without loading anything. Four cases carry a requirement: `tutorials/04_bspline` (`BasicBSpline`),
-# `applications/kirsch_plate_2d` (`Tensors`), `applications/imported_geometry_3d` (`FileIO` + `GeometryBasics` +
-# `MeshIO`, the three triggers of `UnfittedMeshIOExt`), and `applications/time_integration` (`OrdinaryDiffEq`).
+# question without loading anything. Ten cases need `WriteVTK`, which loads the `UnfittedWriteVTKExt` extension they
+# write their ParaView output through: every application, and every reproduction but `conditioning_small_overlap`.
+# Five carry a requirement beyond it or instead of it: `tutorials/04_bspline` (`BasicBSpline`),
+# `applications/kirsch_plate_2d` and `applications/spacetime_cavity_2d` (`Tensors`),
+# `applications/imported_geometry_3d` (`FileIO` + `GeometryBasics` + `MeshIO`, the three triggers of
+# `UnfittedMeshIOExt`), and `applications/time_integration` (`OrdinaryDiffEq`). A bare `--project=.` run is therefore
+# left with the tutorials but `04_bspline` and with `reproductions/conditioning_small_overlap`.
 #
 # `OrdinaryDiffEq` is the one that behaves differently, and the difference is worth stating plainly rather than hiding
 # behind the gate. It is not a dependency of the package, not a weak dependency, and not in the `test` target —
@@ -525,7 +529,7 @@
     # that refined without releasing (or released without refining) still produces a plausible error while costing or
     # resolving the wrong amount.
     #
-    # It is also the only case that writes output, and it does so at a frame count that does not divide its step count.
+    # It is also the only case that writes frames, and it does so at a frame count that does not divide its step count.
     # That combination is the regression this case exists to hold: the script used to clamp every time step onto the
     # frame grid, so asking for a different number of pictures changed how the PDE was integrated. Hence the two-sided
     # band on the settled error: 1686 unknowns at 0.017389 as it stood, against 1632 at 0.014433 with the frame clamp
@@ -638,22 +642,22 @@
              # ── Applications ────────────────────────────────────────────────
              # Kirsch plate-with-hole p-refinement sweep on a fixed 8×8 grid; prints the finest-order relative L² error,
              # 2.96e-8. The weak form is written in `Tensors.jl` notation, hence the requirement.
-             (name="applications/kirsch_plate_2d", env=Dict{String,String}(), requires=("Tensors",),
+             (name="applications/kirsch_plate_2d", env=Dict{String,String}(), requires=("Tensors", "WriteVTK"),
               check=check_single_l2, tol=1.0e-6),
              # Bonded bi-material joint across a seam that misses the grid lines; prints the worse of the two subdomain
              # errors, 1.82e-5, over 14 cut regions with a bit-exact symmetric operator.
-             (name="applications/interface_coupling_2d", env=Dict{String,String}(), requires=(),
+             (name="applications/interface_coupling_2d", env=Dict{String,String}(), requires=("WriteVTK",),
               check=check_interface_coupling, tol=1.0e-3),
              # L-bracket whose geometry arrives as a triangle surface mesh. Relative L² error 6.12e-3 (pure z-resolution
              # error), volume error 5.35e-15 — the latter is the one that exercises the import.
              (name="applications/imported_geometry_3d", env=Dict{String,String}(),
-              requires=("FileIO", "GeometryBasics", "MeshIO"), check=check_imported_geometry,
+              requires=("FileIO", "GeometryBasics", "MeshIO", "WriteVTK"), check=check_imported_geometry,
               tol=(l2=1.0e-1, volume=1.0e-12)),
              # Transient heat conduction with the time axis owned by `OrdinaryDiffEq`, which is not a dependency of this
              # package and is not in its test target — so this case is *always* skipped here and has no automated
              # coverage. Band recorded for whoever wires up a job that runs it on the example's own project: measured
              # relative L² error 4.10e-4 at t = 0.2, identical to six digits under both integrators.
-             (name="applications/time_integration", env=Dict{String,String}(), requires=("OrdinaryDiffEq",),
+             (name="applications/time_integration", env=Dict{String,String}(), requires=("OrdinaryDiffEq", "WriteVTK"),
               check=check_single_l2, tol=1.0e-2),
              # Irreversible thermal curing on a cure front that drives its own overlay activation: the only example
              # carrying `QuadField` per-quadrature-point state and `RBFP0` history transfer through a physical loop.
@@ -661,7 +665,8 @@
              # 13 iterations per step; the RBF transfer undershoots χ by at most 0.156; cured area 0.1226 carrying χ
              # against exactly 0.0 dropping it. The contrast factor is the point of the example, so it is asserted at
              # ten rather than at the ∞ the run actually delivers.
-             (name="applications/thermal_curing_2d", env=Dict{String,String}(), requires=(), check=check_curing,
+             (name="applications/thermal_curing_2d", env=Dict{String,String}(), requires=("WriteVTK",),
+              check=check_curing,
               tol=(rebuilds=3, picard=16, excursion=5.0e-1, accuracy_percent=3.0, cured_area=(1.0e-2, 1.0),
                    contrast=10)),
              # Space-time thermo-elasticity on a growing cavity: time is the third mesh axis, so the moving domain is
@@ -685,18 +690,18 @@
              #
              # Those timings are easy to get wrong: they are numerics-bound, so a single competing process on the
              # machine inflates them severalfold. Re-measure serially on an idle box before trusting any of them.
-             (name="applications/spacetime_cavity_2d", env=Dict("SC_CELLS" => "3"), requires=("Tensors",),
+             (name="applications/spacetime_cavity_2d", env=Dict("SC_CELLS" => "3"), requires=("Tensors", "WriteVTK"),
               check=check_spacetime_cavity, tol=(l2=1.0e-1,)),
 
              # ── Reproductions ───────────────────────────────────────────────
              # Smooth manufactured Laplace, published 12×12 p=4 config (already sub-second numerics); prints one
              # relative L² error, 2.17e-8.
-             (name="reproductions/laplace_unit_square_smooth", env=Dict{String,String}(), requires=(),
+             (name="reproductions/laplace_unit_square_smooth", env=Dict{String,String}(), requires=("WriteVTK",),
               check=check_single_l2, tol=1.0e-6),
              # Corner-singularity nested-overlay solve at its published size (small system; cost is compilation); one
              # relative L² error, 4.34e-5.
-             (name="reproductions/singular_square_2d", env=Dict{String,String}(), requires=(), check=check_single_l2,
-              tol=1.0e-3),
+             (name="reproductions/singular_square_2d", env=Dict{String,String}(), requires=("WriteVTK",),
+              check=check_single_l2, tol=1.0e-3),
              # Small-overlap conditioning sweep; 32 tiny solves, CSV output. Largest `cond(A)` per order (always at δ =
              # 2⁻⁸): 3.65e2, 1.50e3, 6.30e5, 3.65e7; largest residual over all 32 rows 4.15e-15.
              (name="reproductions/conditioning_small_overlap", env=Dict{String,String}(), requires=(),
@@ -716,8 +721,8 @@
              # bands. The count bands are the coarse guard against a loop that stopped refining or stopped releasing,
              # which the error alone would not show.
              #
-             # This is the only case that leaves VTK on, and the only automated coverage the series writer and the CSV
-             # have. `TL_VTK_FRAMES = 5` buys that for about 3 s and 8.2 MB of frames, at a frame count the 96 steps do
+             # This is the only case that writes a VTK series, and the only end-to-end run of the series writer and the
+             # CSV. `TL_VTK_FRAMES = 5` buys that for about 3 s and 8.2 MB of frames, at a frame count the 96 steps do
              # not divide — see `check_laser` for why five and not three, and why a misaligned frame count is the
              # interesting one. Every band below was measured with output off, so a frame schedule that touched the
              # discretisation would fail here rather than quietly re-baseline.
@@ -730,7 +735,7 @@
              # the loop — every verb, including `coarsen`, fires inside the first fifth of a revolution.
              (name="reproductions/traveling_laser_2d",
               env=Dict("TL_T_MAX" => "0.8", "TL_DEPTH" => "4", "TL_WRITE_OUTPUT" => "true", "TL_VTK_FRAMES" => "5"),
-              requires=(), check=check_laser,
+              requires=("WriteVTK",), check=check_laser,
               tol=(l2=1.0e-1, updates=20, unknowns=(820, 1620), settled=(0.0187, 0.0196), mean_unknowns=(660, 1310),
                    mean_settled=(0.0221, 0.0232), frames=6)),
 
@@ -742,8 +747,8 @@
              # energy error 2.4774e-3, relative L² 3.5277e-4, Σn_h = 60, Σn_p = 296, final max order per level
              # [3, 5, 7, 6, 1, 1].
              (name="reproductions/adaptive_tanh_layer_2d",
-              env=Dict("TANH_WRITE_OUTPUT" => "false", "TANH_TABLE_ENERGY" => "false"), requires=(), check=check_tanh,
-              tol=(l2=5.0e-3, energy=2.0e-2, pmax=8, cycles=22, unknowns=(1900, 7500))))
+              env=Dict("TANH_WRITE_OUTPUT" => "false", "TANH_TABLE_ENERGY" => "false"), requires=("WriteVTK",),
+              check=check_tanh, tol=(l2=5.0e-3, energy=2.0e-2, pmax=8, cycles=22, unknowns=(1900, 7500))))
 
     # Only the cases whose requirements the active project can resolve go into the batch; the rest are reported as skips
     # below.

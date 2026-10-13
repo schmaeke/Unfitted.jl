@@ -1,3 +1,5 @@
+using StaticArrays: SVector
+
 @testset "1D solution evaluation and L2 error" begin
     omega = box((0.0,), (1.0,))
     V = space(omega; cells=1, order=2)
@@ -87,6 +89,36 @@ end
     @test_throws ArgumentError l2_error(solution, model, x -> 0.0)
     @test_throws ArgumentError value(Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
                                               Unfitted.SolverDiagnostics(:manual, 0.0, true)), model, (1.5,))
+end
+
+@testset "a vector field evaluates every component at once, exactly as one at a time" begin
+    # `value` and `field_gradient` evaluate a vector field's basis once per level for all its components, so the whole
+    # vector must equal the per-component calls exactly. The points cover the overlay and the base level alone, inside
+    # and outside the disk, each in a cut cell or a full one; the coefficients make every component and dof distinct.
+    disk = physical_domain(x -> sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.35; lipschitz=1.0, subcell_length_scale=0.125,
+                           max_depth=3)
+    base = space(box((0.0, 0.0), (1.0, 1.0)); cells=(3, 3), order=2, physical=disk)
+    V = overlay(base, box((0.25, 0.25), (0.75, 0.75)); cells=(2, 2), order=3)
+    u = field(:u, V; components=2)
+    model = prepare(poisson(u; source=SVector(1.0, 2.0)))
+    solution = Solution([sin(3.0 * i) for i in 1:active_unknowns(model)], model.version,
+                        Unfitted.SolverDiagnostics(:manual, 0.0, true))
+
+    for x in ((0.1, 0.15), (0.5, 0.5), (0.4, 0.62), (0.83, 0.5), SVector(0.3, 0.7))
+        v = @inferred value(solution, model, u, x)
+        g = @inferred field_gradient(solution, model, u, x)
+        @test v isa SVector{2,Float64} && g isa SVector{2,SVector{2,Float64}}
+        @test v == SVector(value(solution, model, u, x, 1), value(solution, model, u, x, 2))
+        @test g == SVector(field_gradient(solution, model, u, x, 1), field_gradient(solution, model, u, x, 2))
+        # `component = nothing` is the default spelled out, with and without the field.
+        @test value(solution, model, u, x, nothing) == value(solution, model, x, nothing) == v
+        @test field_gradient(solution, model, u, x, nothing) == field_gradient(solution, model, x, nothing) == g
+    end
+
+    # A component outside `1:2`, and a field of the model's name with another component count, are refused.
+    @test_throws ArgumentError value(solution, model, u, (0.5, 0.5), 3)
+    @test_throws ArgumentError field_gradient(solution, model, (0.5, 0.5), 0)
+    @test_throws ArgumentError value(solution, model, field(:u, V), (0.5, 0.5))
 end
 
 @testset "active_unknowns(model) public accessor" begin

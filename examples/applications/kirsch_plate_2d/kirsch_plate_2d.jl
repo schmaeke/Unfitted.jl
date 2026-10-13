@@ -56,6 +56,7 @@ finite-cell verification benchmark.
 =#
 
 using Unfitted
+using WriteVTK              # loads UnfittedWriteVTKExt, the ParaView writer
 using LinearAlgebra
 using StaticArrays
 using Tensors
