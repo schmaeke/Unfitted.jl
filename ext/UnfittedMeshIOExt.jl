@@ -129,14 +129,11 @@ struct _MeshSDF{D,C,TK}
     winding::Bool
 end
 
-# Bounding-box diagonal of all vertices, used as the scale for the degenerate test on segments.
+# Bounding-box diagonal of all vertices, the length every tolerance of the level set is a fraction of.
 function _mesh_scale(cells)
-    D = length(first(first(cells)))
-    lo = SVector{D,Float64}(ntuple(_ -> Inf, D))
-    hi = SVector{D,Float64}(ntuple(_ -> -Inf, D))
+    lo = hi = first(first(cells))
     for cell in cells, v in cell
-        lo = min.(lo, v)
-        hi = max.(hi, v)
+        lo, hi = min.(lo, v), max.(hi, v)
     end
     return norm(hi - lo)
 end
