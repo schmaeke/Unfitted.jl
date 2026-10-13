@@ -198,9 +198,14 @@ end
 
 # Directed codimension-1 faces of one welded cell as `(key, ±1)` pairs, the key orientation-free and the sign recording
 # which way the cell traverses it: the two endpoints of a segment, the three edges of a triangle.
+#
+# A triangle edge whose two ends welded to one vertex is no face at all, and it gets sign 0 so that it never reads as
+# unpaired. Such an edge is shorter than the weld radius but longer than the degeneracy floor allows a triangle to keep
+# — a closed cube whose bottom face is fanned from a point 1e-9 from a corner has two — and with a sign it counted as a
+# boundary, so a sound mesh was refused as "not closed". A segment needs no such case: its two ends already cancel.
 _faces(c::NTuple{2,Int}) = ((c[1], -1), (c[2], 1))
 _faces(c::NTuple{3,Int}) = (_edge(c[1], c[2]), _edge(c[2], c[3]), _edge(c[3], c[1]))
-_edge(i, j) = i < j ? ((i, j), 1) : ((j, i), -1)
+_edge(i, j) = i < j ? ((i, j), 1) : ((j, i), i == j ? 0 : -1)
 
 # Faces whose traversals do not cancel — zero on a closed, coherently oriented mesh, one per boundary or per mis-wound
 # face otherwise.

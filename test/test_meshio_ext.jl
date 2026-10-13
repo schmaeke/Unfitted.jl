@@ -242,6 +242,23 @@ end
     rm(empty_stl; force=true)
 end
 
+@testset "MeshIO ext — an edge welded to a point does not open a closed mesh" begin
+    # A closed outward cube whose bottom face is fanned from a hub `offset` from corner 1. At 1e-9 the two fan triangles
+    # at that corner keep an edge far above the degeneracy floor but inside the weld radius, so both its ends weld to
+    # one vertex: no face at all, and the mesh stays closed. At 1e-5 the hub is outside the weld radius.
+    v, f = _cube_mesh(0.2, 0.8)
+    for offset in (1e-9, 1e-5)
+        verts = vcat(v, [v[1] + SVector(offset, offset, 0.0) / sqrt(2)])
+        hub = length(verts)
+        faces = [t for t in f if !issubset(t, (1, 2, 3, 4))]
+        append!(faces, [(hub, a, b) for (a, b) in ((1, 4), (4, 3), (3, 2), (2, 1))])
+        sdf = Unfitted._leaves(mesh_levelset(triangle_mesh(verts, faces)))[1].f
+        @test length(sdf.cells) == length(faces)
+        @test sdf(SVector(0.5, 0.5, 0.5)) ≈ -0.3 atol = 1e-12
+        @test sdf(SVector(0.5, 0.5, 0.1)) ≈ 0.1 atol = 1e-12
+    end
+end
+
 @testset "MeshIO ext — vertex welding absorbs an STL's Float32 corners" begin
     # The closedness check pairs cell faces through welded vertices, and an STL stores every facet's corners separately
     # in Float32: one corner reached through two facets can differ by an ulp. Such a mesh is sound, and welding tighter
