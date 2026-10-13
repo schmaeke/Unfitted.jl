@@ -288,7 +288,7 @@ function write_quadrature_vtm(path::AbstractString, model::Model{D}) where {D}
     # As for `write_vtk`: the cloud is in memory and every dataset added before the directory is made and the bundle
     # saved, so a call that fails leaves nothing on disk.
     vtm = vtk_multiblock(base * ".vtm")
-    for entry in _quadrature_cloud(model)
+    for entry in _sample_quadrature(model)
         suffix = isempty(entry.signature) ? "none" : join(entry.signature, "_")
         _add_dataset!(vtm, base, "levels_" * suffix, "quadrature_levels_" * suffix, entry.grid)
     end
@@ -732,8 +732,9 @@ end
 # subdomains, so a coupled model's subdomains land in different entries and every one of them is kept. A grid is a
 # vertex cloud (`K = 0`) of the physical quadrature points, each with its physical weight `weight` (the rule weight
 # times the region's Jacobian, as assembly integrates with it), region by region — subdomain order, then plan order —
-# and point by point. Both arrays are presized from the regions' point counts rather than grown point by point.
-function _quadrature_cloud(model::Model{D,T}) where {D,T}
+# and point by point. Both arrays are presized from the regions' point counts rather than grown point by point. Not
+# `_quadrature_cloud` (`data.jl`), the bare coordinates in `q.point` order that the RBFP0 transfer indexes.
+function _sample_quadrature(model::Model{D,T}) where {D,T}
     groups = Dict{Vector{Int},Vector{VolumeRegion{D,T}}}()
     for subdomain in model.subdomains, region in subdomain.plan.regions
         push!(get!(() -> VolumeRegion{D,T}[], groups, sort!([p.level for p in region.parents])), region)

@@ -966,7 +966,7 @@ end
     # weights, so they sum to the measure of that signature's regions — the left region of the two-cell mesh is covered
     # by the base level alone, the right one by the base and the overlay.
     (; model) = _pin_2d
-    cloud = Unfitted._quadrature_cloud(model)
+    cloud = Unfitted._sample_quadrature(model)
     @test [entry.signature for entry in cloud] == [[1], [1, 2]]
     regions = Unfitted.integration_plans(model)[1].regions
     for (; signature, grid) in cloud
