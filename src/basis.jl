@@ -138,68 +138,7 @@ Short identifier used in error messages and diagnostics output.
 """
 basis_name(::IntegratedLegendre) = :integrated_legendre
 
-# ── Quadrature rules ──────────────────────────────────────────────────────────
-
-"""
-    TensorQuadrature{D,T}(points, weights)
-
-Tensor-product Gauss–Legendre quadrature on the reference cube `[−1, 1]ᴰ`. Built once per `(per_axis_counts, T)` pair by
-`_tensor_gauss_rule` and cached, so all `:full` regions of the same per-axis order share the same `points`/`weights`
-arrays (see [`Region`](@ref)).
-"""
-struct TensorQuadrature{D,T<:Real}
-    points::Vector{SVector{D,T}}
-    weights::Vector{T}
-end
-
-# The tensor product of per-axis 1D rules, `axis_rules[d] = (nodes, weights)`: the points in `CartesianIndices` order
-# (axis 1 fastest) and each weight the left-fold product of its per-axis weights. The one tensor-rule constructor; the
-# Gauss rule below and every rule built from per-axis pieces go through it.
-function _tensor_rule(axis_rules::NTuple{D,Tuple{Vector{T},Vector{T}}}) where {D,T}
-    counts = map(rule -> length(first(rule)), axis_rules)
-    points = Vector{SVector{D,T}}(undef, prod(counts))
-    weights = Vector{T}(undef, prod(counts))
-    for (k, index) in enumerate(CartesianIndices(counts))
-        points[k] = SVector{D,T}(ntuple(d -> axis_rules[d][1][index.I[d]], D))
-        weights[k] = prod(axis_rules[d][2][index.I[d]] for d in 1:D)
-    end
-    return TensorQuadrature{D,T}(points, weights)
-end
-
-# A fresh tensor Gauss–Legendre rule with `counts[d]` points along axis `d` (FastGaussQuadrature's 1D rules). A count of
-# 0 is an axis the rule does not extend along — a boundary facet's pinned axis — and carries the single node 0 with
-# weight 1, so a facet's rule lives in the full `D`-dimensional frame with the free-axis points and weights unchanged.
-# Always called through a cache (`_cached_tensor_quadrature!`), never on the hot path.
-function _tensor_gauss_rule(counts::NTuple{D,Int}, ::Type{T}) where {D,T<:Real}
-    return _tensor_rule(ntuple(D) do d
-                            counts[d] == 0 && return (T[0], T[1])
-                            points, weights = gausslegendre(counts[d])
-                            return (T.(points), T.(weights))
-                        end)
-end
-
-"""
-    recommended_quadrature_order(basis, order) -> NTuple{D,Int}
-
-Per-axis number of Gauss–Legendre points that integrates products of two basis functions of polynomial order `order[d]`
-exactly. The `::BasisFamily` default is `order[d] + 1`: an `n`-point Gauss rule is exact for polynomials up to degree
-`2n − 1`, which covers the degree `2 · order[d]` of a product of two degree-`order[d]` modes. A family whose functions
-are not degree-`order[d]` polynomials overrides this.
-"""
-recommended_quadrature_order(::BasisFamily, order::NTuple{D,Int}) where {D} = ntuple(i -> order[i] + 1, D)
-
-# ── Basis modes and local mode counts ─────────────────────────────────────────
-
-"""
-    local_basis_count(basis, order) -> Int
-
-Number of local basis functions on a single cell: the size of the matching [`local_basis_indices`](@ref) set, so the
-count validates exactly what the set validates and cannot describe a set the family does not have — integrated Legendre
-refuses an order below 1 on any axis here as it does there. The family value carries its mode, so on a `:tensor` family
-this is `prod(order .+ 1)` on every shipped family, and on integrated Legendre's `:trunk` family it counts the
-multi-indices passing the trunk-degree filter (see [`IntegratedLegendre`](@ref)).
-"""
-local_basis_count(basis::BasisFamily, order::NTuple{D,Int}) where {D} = length(local_basis_indices(basis, order))
+# ── Basis modes ───────────────────────────────────────────────────────────────
 
 # The family value that serves the index set `mode` names, applied once where a level is built (`space`, `overlay`, and
 # through them `ladder`): the `mode` keyword is folded into the family here, and every index-set question after it takes
@@ -220,6 +159,134 @@ _with_mode(::IntegratedLegendre, mode::Symbol) = IntegratedLegendre(_known_mode(
 
 _mode(::BasisFamily) = :tensor
 _mode(b::IntegratedLegendre) = b.trunk ? :trunk : :tensor
+
+# ── Local basis indexing ──────────────────────────────────────────────────────
+
+"""
+    local_basis_count(basis, order) -> Int
+
+Number of local basis functions on a single cell: the size of the matching [`local_basis_indices`](@ref) set, so the
+count validates exactly what the set validates and cannot describe a set the family does not have — integrated Legendre
+refuses an order below 1 on any axis here as it does there. The family value carries its mode, so on a `:tensor` family
+this is `prod(order .+ 1)` on every shipped family, and on integrated Legendre's `:trunk` family it counts the
+multi-indices passing the trunk-degree filter (see [`IntegratedLegendre`](@ref)).
+"""
+local_basis_count(basis::BasisFamily, order::NTuple{D,Int}) where {D} = length(local_basis_indices(basis, order))
+
+"""
+    local_basis_indices(basis, order) -> Vector{CartesianIndex{D}}
+
+Multi-indices `α = (α₁, …, α_D)` enumerating the local basis functions on a cell of polynomial order `order`.
+Lexicographic over `CartesianIndices(ntuple(d -> 0:order[d], D))`, axis 1 varying fastest — this is the canonical
+tensor-product ordering used by every basis consumer (assembly, projection, post-processing, the dof layer).
+
+The `::BasisFamily` default is that full tensor set, which is what an open-knot B-spline span and any other
+tensor-product family need; a family overrides it only to *filter* the set, and inherits the ordering either way. The
+family value carries its basis mode (see [`BasisFamily`](@ref)), so the set is the one that mode selects. Integrated
+Legendre overrides it to require order ≥ 1 per axis (order 0 would leave a single endpoint mode, not a partition of
+unity) and, in `:trunk` mode, to keep only the indices with trunk degree `Σ_d t(α_d) ≤ p`, where `t(α_d) = α_d` for a
+bubble mode (`α_d ≥ 2`) and `t(α_d) = 0` for the two linear endpoint modes (`α_d ∈ {0, 1}`) — the trunk space of
+
+> B. Szabó, I. Babuška, *Finite Element Analysis*, Wiley, New York (1991), ISBN 978-0-471-50273-9,
+
+which is also the source of the minimum rule `src/dofs.jl` applies across an order jump (isotropic order `p` required,
+see [`IntegratedLegendre`](@ref)).
+"""
+function local_basis_indices(::BasisFamily, order::NTuple{D,Int}) where {D}
+    all(o -> o >= 0, order) || throw(ArgumentError("basis order must be nonnegative in every axis"))
+    return _tensor_index_set(order)
+end
+
+# The lexicographic tensor index set `∏_d {0, …, order[d]}` with axis 1 varying fastest. This ordering is the package's
+# tensor-product convention (see `CONTRIBUTING.md`, "Coordinate conventions"), so it lives in one place and every
+# family's `local_basis_indices` is a filter over it, never a re-derivation of it.
+_tensor_index_set(order::NTuple{D,Int}) where {D} = vec(collect(CartesianIndices(ntuple(d -> 0:order[d], D))))
+
+# The trunk filter compares against one scalar `p`, so a trunk family refuses an anisotropic order first, then — as in
+# either mode — an order below 1 on some axis.
+function local_basis_indices(basis::IntegratedLegendre, order::NTuple{D,Int}) where {D}
+    basis.trunk && any(!=(order[1]), order) && throw(ArgumentError("mode=:trunk requires isotropic order"))
+    all(o -> o >= 1, order) || throw(ArgumentError("integrated Legendre order must be at least 1 in every axis"))
+    indices = _tensor_index_set(order)
+    return basis.trunk ? filter!(id -> _trunk_degree(id) <= order[1], indices) : indices
+end
+
+# Trunk degree `Σ_d t(α_d)` of a multi-index `α`, where `t(α_d) = α_d` for a bubble mode `α_d ≥ 2` and `t(α_d) = 0` for
+# the two endpoint modes 0 and 1, the linear vertex shape functions. This is what the `:trunk` mode compares against the
+# isotropic polynomial order `p`: edge modes (one bubble axis) survive up to degree p, while face/volume modes survive
+# only while their bubble degrees sum to ≤ p. Counting the vertex factors as 0 is what lets the filter keep every edge
+# mode up to degree p while still trimming the interior — a pure polynomial-total-degree filter would instead drop the
+# top edge modes and break C⁰ conformity.
+_trunk_degree(id::CartesianIndex) = sum(a -> a ≥ 2 ? a : 0, Tuple(id))
+
+"""
+    _index_admissible(basis, order, id) -> Bool
+
+Whether the multi-index `id` belongs to `local_basis_indices(basis, order)`, answered in `O(D)` instead of by scanning
+the set.
+
+This is the family's own index-set filter, factored out so the dof layer's minimum rule (`_entity_carries` in
+`src/dofs.jl`) can ask, per active incident cell, whether *that cell's own* order generates the mode. The intersection
+over the incident cells is the classical componentwise-minimum rule, because this predicate is monotone non-decreasing
+in the order — raising an order never removes a mode from a cell's set — so the minimum need never be formed and no
+question is ever asked at an order no cell carries. The "WHY THE INTERSECTION IS THE MINIMUM RULE" block in
+`src/dofs.jl` states that argument in full.
+
+Asking the *filter* rather than comparing modes per axis is what makes the rule family-generic: for `:tensor` the two
+agree, and for `:trunk` they do not, because a 3D face mode with bubble degrees `(3, 2)` passes a per-axis test at order
+4 while its trunk degree 5 puts it outside the order-4 trunk set. A family that adds a mode adds it here and the minimum
+rule follows.
+
+Integrated Legendre, the one family declaring `_supports_cell_order`, has the only method: the per-axis box, plus the
+trunk-degree filter on a `:trunk` family. `test_cell_order.jl` asserts that this predicate agrees with
+`local_basis_indices` over a range of orders, modes and dimensions, that it is monotone in the order for every family
+declaring `_supports_cell_order`, and that the intersection form reproduces the componentwise-minimum form cell for cell
+— the three contracts that keep the two layers from drifting.
+"""
+function _index_admissible(basis::IntegratedLegendre, order::NTuple{D,Int}, id::CartesianIndex{D}) where {D}
+    all(d -> 0 <= id.I[d] <= order[d], 1:D) || return false
+    return !basis.trunk || _trunk_degree(id) <= order[1]
+end
+
+# ── Family capability traits ──────────────────────────────────────────────────
+
+# Whether a basis family can carry a polynomial order that varies from cell to cell. Defaults to `false` and is answered
+# `true` only by integrated Legendre, whose hierarchic 1D modes make a mixed-order interface a pure question of which
+# shared-entity modes to generate.
+#
+# B-splines answer `false`, and the reason is structural rather than a missing implementation: the degree is a type
+# parameter of the whole-axis knot vector (`BSplineSpace{p}(kv)`), the clamped end multiplicity is `p + 1` so changing p
+# on one cell rewrites the vector's endpoints, the 1D dimension is `cells + p` — a global count — and a function's
+# support is `p + 1` cells wide, so no set of functions belongs to one cell for a per-cell degree to name. There is
+# likewise no shared entity for a minimum rule to attach to: continuity at an interior knot is C^(p−1), a property of
+# the knot rather than of a face between two cells with independent degrees.
+#
+# The trait is consulted only when the normalised order field is genuinely non-uniform. A B-spline level handed a
+# uniform per-cell field is still a perfectly well defined level and must keep working. A family that answers `true`
+# owes the dof layer a `_cell_modes` method as well: the generic one (`mesh.jl`) refuses a real palette rather than
+# assembling every cell at the first palette entry, because the minimum rule is the family's to state.
+_supports_cell_order(::BasisFamily) = false
+_supports_cell_order(::IntegratedLegendre) = true
+
+# How far, in cells, a basis function of this family reaches beyond the cell that generates it — the radius
+# [`support_extension`](@ref) dilates a marked region by, per axis.
+#
+# The default is zero, and it is the right answer for every family whose functions are element-local or shared only
+# across the face they sit on: integrated Legendre's bubbles live in one cell and its endpoint modes are shared by the
+# two cells meeting at the node, so a marked cell's own functions are generated by that cell and activating it is
+# enough.
+#
+# It is *not* the right answer for a family with wider support. A degree-`p` B-spline spans `p + 1` cells, and the
+# maximal-continuity selection rule keeps only the functions whose whole support lies inside the active region, so a
+# level contributes nothing until the region is more than `p` cells wide in every axis and an activation front must
+# advance `p` cells before it carries a new unknown. That is a property of the spline space rather than of the selection
+# — minimal support needs `p + 1` intervals — so the region a caller marks has to be dilated rather than the rule
+# relaxed. The requirement is the support-extension condition behind the admissible hierarchical meshes of
+#
+# > A. Buffa, C. Giannelli, *Adaptive isogeometric methods with hierarchical splines: Error estimator and convergence*,
+# > Math. Models Methods Appl. Sci. **26** (2016) 1–25,
+# > [doi:10.1142/S0218202516500019](https://doi.org/10.1142/S0218202516500019).
+_support_radius(::BasisFamily, order::NTuple{D,Int}) where {D} = ntuple(_ -> 0, D)
 
 # ── 1D Legendre primitives ────────────────────────────────────────────────────
 
@@ -299,123 +366,6 @@ function integrated_legendre_derivative(i::Integer, ξ::Real)
     return sqrt(convert(T, 2i - 1) / 2) * legendre_value(i - 1, x)
 end
 
-# ── Local basis indexing ──────────────────────────────────────────────────────
-
-# The lexicographic tensor index set `∏_d {0, …, order[d]}` with axis 1 varying fastest. This ordering is the package's
-# tensor-product convention (see `CONTRIBUTING.md`, "Coordinate conventions"), so it lives in one place and every
-# family's `local_basis_indices` is a filter over it, never a re-derivation of it.
-_tensor_index_set(order::NTuple{D,Int}) where {D} = vec(collect(CartesianIndices(ntuple(d -> 0:order[d], D))))
-
-"""
-    local_basis_indices(basis, order) -> Vector{CartesianIndex{D}}
-
-Multi-indices `α = (α₁, …, α_D)` enumerating the local basis functions on a cell of polynomial order `order`.
-Lexicographic over `CartesianIndices(ntuple(d -> 0:order[d], D))`, axis 1 varying fastest — this is the canonical
-tensor-product ordering used by every basis consumer (assembly, projection, post-processing, the dof layer).
-
-The `::BasisFamily` default is that full tensor set, which is what an open-knot B-spline span and any other
-tensor-product family need; a family overrides it only to *filter* the set, and inherits the ordering either way. The
-family value carries its basis mode (see [`BasisFamily`](@ref)), so the set is the one that mode selects. Integrated
-Legendre overrides it to require order ≥ 1 per axis (order 0 would leave a single endpoint mode, not a partition of
-unity) and, in `:trunk` mode, to keep only the indices with trunk degree `Σ_d t(α_d) ≤ p`, where `t(α_d) = α_d` for a
-bubble mode (`α_d ≥ 2`) and `t(α_d) = 0` for the two linear endpoint modes (`α_d ∈ {0, 1}`) — the trunk space of
-
-> B. Szabó, I. Babuška, *Finite Element Analysis*, Wiley, New York (1991), ISBN 978-0-471-50273-9,
-
-which is also the source of the minimum rule `src/dofs.jl` applies across an order jump (isotropic order `p` required,
-see [`IntegratedLegendre`](@ref)).
-"""
-function local_basis_indices(::BasisFamily, order::NTuple{D,Int}) where {D}
-    all(o -> o >= 0, order) || throw(ArgumentError("basis order must be nonnegative in every axis"))
-    return _tensor_index_set(order)
-end
-
-# Trunk degree `Σ_d t(α_d)` of a multi-index `α`, where `t(α_d) = α_d` for a bubble mode `α_d ≥ 2` and `t(α_d) = 0` for
-# the two endpoint modes 0 and 1, the linear vertex shape functions. This is what the `:trunk` mode compares against the
-# isotropic polynomial order `p`: edge modes (one bubble axis) survive up to degree p, while face/volume modes survive
-# only while their bubble degrees sum to ≤ p. Counting the vertex factors as 0 is what lets the filter keep every edge
-# mode up to degree p while still trimming the interior — a pure polynomial-total-degree filter would instead drop the
-# top edge modes and break C⁰ conformity.
-_trunk_degree(id::CartesianIndex) = sum(a -> a ≥ 2 ? a : 0, Tuple(id))
-
-# The trunk filter compares against one scalar `p`, so a trunk family refuses an anisotropic order first, then — as in
-# either mode — an order below 1 on some axis.
-function local_basis_indices(basis::IntegratedLegendre, order::NTuple{D,Int}) where {D}
-    basis.trunk && any(!=(order[1]), order) && throw(ArgumentError("mode=:trunk requires isotropic order"))
-    all(o -> o >= 1, order) || throw(ArgumentError("integrated Legendre order must be at least 1 in every axis"))
-    indices = _tensor_index_set(order)
-    return basis.trunk ? filter!(id -> _trunk_degree(id) <= order[1], indices) : indices
-end
-
-# ── Family capability traits ──────────────────────────────────────────────────
-
-# Whether a basis family can carry a polynomial order that varies from cell to cell. Defaults to `false` and is answered
-# `true` only by integrated Legendre, whose hierarchic 1D modes make a mixed-order interface a pure question of which
-# shared-entity modes to generate.
-#
-# B-splines answer `false`, and the reason is structural rather than a missing implementation: the degree is a type
-# parameter of the whole-axis knot vector (`BSplineSpace{p}(kv)`), the clamped end multiplicity is `p + 1` so changing p
-# on one cell rewrites the vector's endpoints, the 1D dimension is `cells + p` — a global count — and a function's
-# support is `p + 1` cells wide, so no set of functions belongs to one cell for a per-cell degree to name. There is
-# likewise no shared entity for a minimum rule to attach to: continuity at an interior knot is C^(p−1), a property of
-# the knot rather than of a face between two cells with independent degrees.
-#
-# The trait is consulted only when the normalised order field is genuinely non-uniform. A B-spline level handed a
-# uniform per-cell field is still a perfectly well defined level and must keep working. A family that answers `true`
-# owes the dof layer a `_cell_modes` method as well: the generic one (`mesh.jl`) refuses a real palette rather than
-# assembling every cell at the first palette entry, because the minimum rule is the family's to state.
-_supports_cell_order(::BasisFamily) = false
-_supports_cell_order(::IntegratedLegendre) = true
-
-# How far, in cells, a basis function of this family reaches beyond the cell that generates it — the radius
-# [`support_extension`](@ref) dilates a marked region by, per axis.
-#
-# The default is zero, and it is the right answer for every family whose functions are element-local or shared only
-# across the face they sit on: integrated Legendre's bubbles live in one cell and its endpoint modes are shared by the
-# two cells meeting at the node, so a marked cell's own functions are generated by that cell and activating it is
-# enough.
-#
-# It is *not* the right answer for a family with wider support. A degree-`p` B-spline spans `p + 1` cells, and the
-# maximal-continuity selection rule keeps only the functions whose whole support lies inside the active region, so a
-# level contributes nothing until the region is more than `p` cells wide in every axis and an activation front must
-# advance `p` cells before it carries a new unknown. That is a property of the spline space rather than of the selection
-# — minimal support needs `p + 1` intervals — so the region a caller marks has to be dilated rather than the rule
-# relaxed. The requirement is the support-extension condition behind the admissible hierarchical meshes of
-#
-# > A. Buffa, C. Giannelli, *Adaptive isogeometric methods with hierarchical splines: Error estimator and convergence*,
-# > Math. Models Methods Appl. Sci. **26** (2016) 1–25,
-# > [doi:10.1142/S0218202516500019](https://doi.org/10.1142/S0218202516500019).
-_support_radius(::BasisFamily, order::NTuple{D,Int}) where {D} = ntuple(_ -> 0, D)
-
-"""
-    _index_admissible(basis, order, id) -> Bool
-
-Whether the multi-index `id` belongs to `local_basis_indices(basis, order)`, answered in `O(D)` instead of by scanning
-the set.
-
-This is the family's own index-set filter, factored out so the dof layer's minimum rule (`_entity_carries` in
-`src/dofs.jl`) can ask, per active incident cell, whether *that cell's own* order generates the mode. The intersection
-over the incident cells is the classical componentwise-minimum rule, because this predicate is monotone non-decreasing
-in the order — raising an order never removes a mode from a cell's set — so the minimum need never be formed and no
-question is ever asked at an order no cell carries. The "WHY THE INTERSECTION IS THE MINIMUM RULE" block in
-`src/dofs.jl` states that argument in full.
-
-Asking the *filter* rather than comparing modes per axis is what makes the rule family-generic: for `:tensor` the two
-agree, and for `:trunk` they do not, because a 3D face mode with bubble degrees `(3, 2)` passes a per-axis test at order
-4 while its trunk degree 5 puts it outside the order-4 trunk set. A family that adds a mode adds it here and the minimum
-rule follows.
-
-Integrated Legendre, the one family declaring `_supports_cell_order`, has the only method: the per-axis box, plus the
-trunk-degree filter on a `:trunk` family. `test_cell_order.jl` asserts that this predicate agrees with
-`local_basis_indices` over a range of orders, modes and dimensions, that it is monotone in the order for every family
-declaring `_supports_cell_order`, and that the intersection form reproduces the componentwise-minimum form cell for cell
-— the three contracts that keep the two layers from drifting.
-"""
-function _index_admissible(basis::IntegratedLegendre, order::NTuple{D,Int}, id::CartesianIndex{D}) where {D}
-    all(d -> 0 <= id.I[d] <= order[d], 1:D) || return false
-    return !basis.trunk || _trunk_degree(id) <= order[1]
-end
-
 # ── Hot-path tensor-product evaluation ────────────────────────────────────────
 
 # Caller-owned per-axis 1D scratch buffers used by `_fill_factor_tables!` and the tensor-product kernel. One `Vector{T}`
@@ -427,50 +377,6 @@ end
 # open-knot B-spline of degree `p` has exactly `p + 1` 1D functions non-zero on any single span. So the buffer
 # allocation is family-agnostic; only the per-axis evaluator (`_fill_factor_tables!`) dispatches.
 _factor_buffers(order::NTuple{D,Int}, ::Type{T}) where {D,T} = ntuple(d -> Vector{T}(undef, order[d] + 1), D)
-
-# Fill caller-owned per-axis 1D tables for `basis` at one reference point: `val1d[d][i + 1] = N̂ᵢ(ξ[d])` for the
-# `order[d] + 1` 1D modes active on the cell along axis `d`, and, unless `der1d === nothing`, also
-# `der1d[d][i + 1] = N̂ᵢ′(ξ[d])`. One method per family serves both: `der1d` is `nothing` or a tuple of vectors by type,
-# so the derivative work folds away at compile time on the values-only path (the transfer right-hand side and the
-# Dirichlet trace) and no second method can drift from the first. The recurrence is the family's own (Legendre
-# three-term for integrated Legendre, de Boor for B-splines); both cost `O(D · (order + 1))` per point, so the
-# tensor-product kernel downstream stays family-agnostic.
-#
-# `cell::CartesianIndex{D}` is the parent cell's mesh index along each axis. Integrated Legendre ignores it (its 1D
-# modes are cell-local in the reference frame, identical on every cell); the B-spline family in the extension uses it as
-# the knot span the parent cell occupies. Callers always pass the same `parent.cell` the rest of the assembly loop uses,
-# so the integrated-Legendre overhead is zero and the B-spline method gets the span for free.
-#
-# The integrated-Legendre recurrence below is the in-package method; the B-spline one lives in
-# `ext/UnfittedBasicBSplineExt.jl`. Each step of the three-term recurrence yields `Lₘ` from `Lₘ₋₁` and `Lₘ₋₂`, which is
-# all that `N̂ₘ = (Lₘ − Lₘ₋₂) / √(4m − 2)` and `N̂ₘ′ = √((2m − 1)/2) · Lₘ₋₁` need. The derivative's constant is taken
-# from the value's: `√((2m − 1)/2) = √(4m − 2) / 2` holds bit for bit under a correctly rounded square root, because
-# `4m − 2 = 4 · (2m − 1)/2` with both scalings exact powers of two, so the gradient path pays one square root per mode
-# instead of two and returns exactly what the closed forms `integrated_legendre_value` / `_derivative` return.
-function _fill_factor_tables!(::IntegratedLegendre, val1d, der1d, order::NTuple{D,Int}, ξ::SVector{D,T},
-                              ::CartesianIndex{D}) where {D,T}
-    @inbounds for d in 1:D
-        x = ξ[d]
-        p = order[d]
-        vd = val1d[d]
-        dd = der1d === nothing ? nothing : der1d[d]
-        vd[1] = (one(T) - x) / 2
-        dd === nothing || (dd[1] = -one(T) / 2)
-        if p >= 1
-            vd[2] = (one(T) + x) / 2
-            dd === nothing || (dd[2] = one(T) / 2)
-        end
-        ℓm2, ℓm1 = one(T), x
-        for m in 2:p
-            ℓm = ((2m - 1) * x * ℓm1 - (m - 1) * ℓm2) / m
-            s = sqrt(T(4m - 2))
-            vd[m + 1] = (ℓm - ℓm2) / s
-            dd === nothing || (dd[m + 1] = s / 2 * ℓm1)
-            ℓm2, ℓm1 = ℓm1, ℓm
-        end
-    end
-    return nothing
-end
 
 # The tensor-product kernel, the one evaluator every hot loop calls: fills the per-axis tables through
 # `_fill_factor_tables!(basis, …)` (the only family-specific step), then walks each multi-index `α` in `indices` and
@@ -533,6 +439,50 @@ function _tensor_kernel!(basis::BasisFamily, values::AbstractVector, gradients,
     return values
 end
 
+# Fill caller-owned per-axis 1D tables for `basis` at one reference point: `val1d[d][i + 1] = N̂ᵢ(ξ[d])` for the
+# `order[d] + 1` 1D modes active on the cell along axis `d`, and, unless `der1d === nothing`, also
+# `der1d[d][i + 1] = N̂ᵢ′(ξ[d])`. One method per family serves both: `der1d` is `nothing` or a tuple of vectors by type,
+# so the derivative work folds away at compile time on the values-only path (the transfer right-hand side and the
+# Dirichlet trace) and no second method can drift from the first. The recurrence is the family's own (Legendre
+# three-term for integrated Legendre, de Boor for B-splines); both cost `O(D · (order + 1))` per point, so the
+# tensor-product kernel downstream stays family-agnostic.
+#
+# `cell::CartesianIndex{D}` is the parent cell's mesh index along each axis. Integrated Legendre ignores it (its 1D
+# modes are cell-local in the reference frame, identical on every cell); the B-spline family in the extension uses it as
+# the knot span the parent cell occupies. Callers always pass the same `parent.cell` the rest of the assembly loop uses,
+# so the integrated-Legendre overhead is zero and the B-spline method gets the span for free.
+#
+# The integrated-Legendre recurrence below is the in-package method; the B-spline one lives in
+# `ext/UnfittedBasicBSplineExt.jl`. Each step of the three-term recurrence yields `Lₘ` from `Lₘ₋₁` and `Lₘ₋₂`, which is
+# all that `N̂ₘ = (Lₘ − Lₘ₋₂) / √(4m − 2)` and `N̂ₘ′ = √((2m − 1)/2) · Lₘ₋₁` need. The derivative's constant is taken
+# from the value's: `√((2m − 1)/2) = √(4m − 2) / 2` holds bit for bit under a correctly rounded square root, because
+# `4m − 2 = 4 · (2m − 1)/2` with both scalings exact powers of two, so the gradient path pays one square root per mode
+# instead of two and returns exactly what the closed forms `integrated_legendre_value` / `_derivative` return.
+function _fill_factor_tables!(::IntegratedLegendre, val1d, der1d, order::NTuple{D,Int}, ξ::SVector{D,T},
+                              ::CartesianIndex{D}) where {D,T}
+    @inbounds for d in 1:D
+        x = ξ[d]
+        p = order[d]
+        vd = val1d[d]
+        dd = der1d === nothing ? nothing : der1d[d]
+        vd[1] = (one(T) - x) / 2
+        dd === nothing || (dd[1] = -one(T) / 2)
+        if p >= 1
+            vd[2] = (one(T) + x) / 2
+            dd === nothing || (dd[2] = one(T) / 2)
+        end
+        ℓm2, ℓm1 = one(T), x
+        for m in 2:p
+            ℓm = ((2m - 1) * x * ℓm1 - (m - 1) * ℓm2) / m
+            s = sqrt(T(4m - 2))
+            vd[m + 1] = (ℓm - ℓm2) / s
+            dd === nothing || (dd[m + 1] = s / 2 * ℓm1)
+            ℓm2, ℓm1 = ℓm1, ℓm
+        end
+    end
+    return nothing
+end
+
 # Product `∏_{d ≠ k} values[d]`. Used by the gradient kernel to compute the "value part" of the gradient component along
 # axis `k` without recomputing the full product.
 function _product_except(values::NTuple{D}, k::Integer) where {D}
@@ -545,15 +495,16 @@ end
 
 # ── Boundary and facet basis identification ───────────────────────────────────
 
-# True iff the tensor-product basis function with multi-index `id` carries support on the codim-1 face specified by
-# `(axis, side)`. For integrated Legendre this is a test of the single 1D mode along the requested axis: mode 0 lives on
-# the lower endpoint (`ξ = −1`), mode 1 on the upper endpoint (`ξ = +1`), and modes m ≥ 2 (bubbles) vanish at both
-# endpoints — they never sit on either side.
-function is_boundary_basis(::IntegratedLegendre, id::CartesianIndex{D}, axis::Integer, side::Symbol) where {D}
-    1 <= axis <= D || throw(ArgumentError("axis out of bounds"))
-    side === :lower && return id.I[axis] == 0
-    side === :upper && return id.I[axis] == 1
-    throw(ArgumentError("boundary side must be :lower or :upper"))
+"""
+    boundary_basis_indices(basis, order; axis, side) -> Vector{CartesianIndex{D}}
+
+Multi-indices of the local basis functions whose support touches the codim-1 face at the requested `(axis, side)`. Used
+by the Dirichlet projection in `src/dofs.jl` to identify which trial / test modes contribute on each physical facet.
+This `::BasisFamily` default filters `local_basis_indices(basis, order)` — the set of the family's own mode — through
+the family's `is_boundary_basis`, so it needs no override.
+"""
+function boundary_basis_indices(basis::BasisFamily, order::NTuple{D,Int}; axis::Integer, side::Symbol) where {D}
+    return [id for id in local_basis_indices(basis, order) if is_boundary_basis(basis, id, axis, side)]
 end
 
 # Codim-K facet membership for a tensor-product multi-index: the basis function sits on the facet specified by `sides`
@@ -568,19 +519,30 @@ function is_facet_basis(basis::BasisFamily, id::CartesianIndex{D},
     return true
 end
 
-"""
-    boundary_basis_indices(basis, order; axis, side) -> Vector{CartesianIndex{D}}
-
-Multi-indices of the local basis functions whose support touches the codim-1 face at the requested `(axis, side)`. Used
-by the Dirichlet projection in `src/dofs.jl` to identify which trial / test modes contribute on each physical facet.
-This `::BasisFamily` default filters `local_basis_indices(basis, order)` — the set of the family's own mode — through
-the family's `is_boundary_basis`, so it needs no override.
-"""
-function boundary_basis_indices(basis::BasisFamily, order::NTuple{D,Int}; axis::Integer, side::Symbol) where {D}
-    return [id for id in local_basis_indices(basis, order) if is_boundary_basis(basis, id, axis, side)]
+# True iff the tensor-product basis function with multi-index `id` carries support on the codim-1 face specified by
+# `(axis, side)`. For integrated Legendre this is a test of the single 1D mode along the requested axis: mode 0 lives on
+# the lower endpoint (`ξ = −1`), mode 1 on the upper endpoint (`ξ = +1`), and modes m ≥ 2 (bubbles) vanish at both
+# endpoints — they never sit on either side.
+function is_boundary_basis(::IntegratedLegendre, id::CartesianIndex{D}, axis::Integer, side::Symbol) where {D}
+    1 <= axis <= D || throw(ArgumentError("axis out of bounds"))
+    side === :lower && return id.I[axis] == 0
+    side === :upper && return id.I[axis] == 1
+    throw(ArgumentError("boundary side must be :lower or :upper"))
 end
 
-# ── Public quadrature rule ────────────────────────────────────────────────────
+# ── Quadrature rules ──────────────────────────────────────────────────────────
+
+"""
+    TensorQuadrature{D,T}(points, weights)
+
+Tensor-product Gauss–Legendre quadrature on the reference cube `[−1, 1]ᴰ`. Built once per `(per_axis_counts, T)` pair by
+`_tensor_gauss_rule` and cached, so all `:full` regions of the same per-axis order share the same `points`/`weights`
+arrays (see [`Region`](@ref)).
+"""
+struct TensorQuadrature{D,T<:Real}
+    points::Vector{SVector{D,T}}
+    weights::Vector{T}
+end
 
 """
     gauss_rule(basis::IntegratedLegendre, order, [T=Float64]) -> TensorQuadrature
@@ -591,4 +553,40 @@ uses the cached `_tensor_gauss_rule` directly.
 """
 function gauss_rule(basis::IntegratedLegendre, order::NTuple{D,Int}, ::Type{T}=Float64) where {D,T<:Real}
     _tensor_gauss_rule(recommended_quadrature_order(basis, order), T)
+end
+
+"""
+    recommended_quadrature_order(basis, order) -> NTuple{D,Int}
+
+Per-axis number of Gauss–Legendre points that integrates products of two basis functions of polynomial order `order[d]`
+exactly. The `::BasisFamily` default is `order[d] + 1`: an `n`-point Gauss rule is exact for polynomials up to degree
+`2n − 1`, which covers the degree `2 · order[d]` of a product of two degree-`order[d]` modes. A family whose functions
+are not degree-`order[d]` polynomials overrides this.
+"""
+recommended_quadrature_order(::BasisFamily, order::NTuple{D,Int}) where {D} = ntuple(i -> order[i] + 1, D)
+
+# A fresh tensor Gauss–Legendre rule with `counts[d]` points along axis `d` (FastGaussQuadrature's 1D rules). A count of
+# 0 is an axis the rule does not extend along — a boundary facet's pinned axis — and carries the single node 0 with
+# weight 1, so a facet's rule lives in the full `D`-dimensional frame with the free-axis points and weights unchanged.
+# Always called through a cache (`_cached_tensor_quadrature!`), never on the hot path.
+function _tensor_gauss_rule(counts::NTuple{D,Int}, ::Type{T}) where {D,T<:Real}
+    return _tensor_rule(ntuple(D) do d
+                            counts[d] == 0 && return (T[0], T[1])
+                            points, weights = gausslegendre(counts[d])
+                            return (T.(points), T.(weights))
+                        end)
+end
+
+# The tensor product of per-axis 1D rules, `axis_rules[d] = (nodes, weights)`: the points in `CartesianIndices` order
+# (axis 1 fastest) and each weight the left-fold product of its per-axis weights. The one tensor-rule constructor; the
+# Gauss rule below and every rule built from per-axis pieces go through it.
+function _tensor_rule(axis_rules::NTuple{D,Tuple{Vector{T},Vector{T}}}) where {D,T}
+    counts = map(rule -> length(first(rule)), axis_rules)
+    points = Vector{SVector{D,T}}(undef, prod(counts))
+    weights = Vector{T}(undef, prod(counts))
+    for (k, index) in enumerate(CartesianIndices(counts))
+        points[k] = SVector{D,T}(ntuple(d -> axis_rules[d][1][index.I[d]], D))
+        weights[k] = prod(axis_rules[d][2][index.I[d]] for d in 1:D)
+    end
+    return TensorQuadrature{D,T}(points, weights)
 end
