@@ -210,6 +210,18 @@ end
     sdf = Unfitted._leaves(mesh_levelset(triangle_mesh(v, bad_faces)))[1].f
     @test isfinite(sdf(SVector(0.5, 0.5, 0.5)))
     @test sdf(SVector(0.5, 0.5, 0.5)) ≈ -0.3 atol = 1e-12
+
+    # A needle — corner 1, a point 1e-12 from it, corner 4 — is one triangle in each of its three vertex rotations, and
+    # it is dropped in each: the verdict is the sine of its smallest angle, not of the angle at whichever vertex comes
+    # first. Kept, its 1e-12 edge welds shut and the closedness check reads an unpaired face.
+    v, f = _cube_mesh(0.2, 0.8)
+    needle = vcat(v, [v[1] + SVector(1e-12, 0.0, 0.0)])
+    n = length(needle)
+    for tri in ((1, n, 4), (n, 4, 1), (4, 1, n))
+        sdf = Unfitted._leaves(mesh_levelset(triangle_mesh(needle, vcat(f, [tri]))))[1].f
+        @test length(sdf.cells) == length(f)
+        @test sdf(SVector(0.5, 0.5, 0.5)) ≈ -0.3 atol = 1e-12
+    end
 end
 
 @testset "MeshIO ext — an unclosed or inside-out mesh is rejected, not answered" begin

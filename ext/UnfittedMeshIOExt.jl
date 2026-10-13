@@ -150,10 +150,18 @@ end
 
 # Degenerate (zero-measure) cells have no defined normal and corrupt the sign.
 _is_degenerate(cell::NTuple{2,SVector{D,T}}, scale) where {D,T} = norm(cell[2] - cell[1]) <= 1.0e-10 * scale
+
+# A triangle is degenerate when the sine of its smallest angle is below 1e-10 — scale-free, and a property of the
+# triangle rather than of how its vertices are listed. `‖ab × ac‖` is twice the area whichever vertex it is taken at,
+# and the smallest angle lies between the two longest edges, so twice the area over their product `ℓ₁ℓ₂` (the largest
+# of the three pairwise edge products) is that sine. Testing the angle at the first vertex alone made the verdict depend
+# on the vertex order: a needle with one edge of 1e-12 was dropped when listed from its blunt corner and kept when
+# listed from either end of the short edge. Since every pair of edges multiplies to at most `ℓ₁ℓ₂`, this flags every
+# triangle the first-vertex test did, and the needles it missed.
 function _is_degenerate(cell::NTuple{3,SVector{3,T}}, scale) where {T}
-    ab = cell[2] - cell[1]
-    ac = cell[3] - cell[1]
-    return norm(cross(ab, ac)) <= 1.0e-10 * norm(ab) * norm(ac)   # sin θ ≤ tol (scale-free)
+    a, b, c = cell
+    ab, bc, ca = norm(b - a), norm(c - b), norm(a - c)
+    return norm(cross(b - a, c - a)) <= 1.0e-10 * max(ab * bc, bc * ca, ca * ab)
 end
 
 # ── Mesh validity ─────────────────────────────────────────────────────────────
