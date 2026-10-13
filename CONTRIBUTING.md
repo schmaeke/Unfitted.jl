@@ -1639,7 +1639,7 @@ demos.
   - Pass constant-valued inputs as bare constants, not as closures, for
     the coefficient-shaped keywords that accept both — `source`,
     `coefficient`, `diffusion` and Dirichlet data, which all pass through
-    `_as_coefficient`. Write `source = 1.0`, never `source = x -> 1.0`.
+    `_datum_at`. Write `source = 1.0`, never `source = x -> 1.0`.
     Every distinct closure is a distinct *type*, and each one forces a
     full re-specialisation of the assembly emission kernel at roughly
     0.9 s of compile time, for
