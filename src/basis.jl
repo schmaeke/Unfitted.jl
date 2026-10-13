@@ -544,6 +544,20 @@ struct TensorQuadrature{D,T<:Real}
     weights::Vector{T}
 end
 
+# The tensor product of per-axis 1D rules, `axis_rules[d] = (nodes, weights)`: the points in `CartesianIndices` order
+# (axis 1 fastest) and each weight the left-fold product of its per-axis weights. The one tensor-rule constructor; the
+# Gauss rule below and every rule built from per-axis pieces go through it.
+function _tensor_rule(axis_rules::NTuple{D,Tuple{Vector{T},Vector{T}}}) where {D,T}
+    counts = map(rule -> length(first(rule)), axis_rules)
+    points = Vector{SVector{D,T}}(undef, prod(counts))
+    weights = Vector{T}(undef, prod(counts))
+    for (k, index) in enumerate(CartesianIndices(counts))
+        points[k] = SVector{D,T}(ntuple(d -> axis_rules[d][1][index.I[d]], D))
+        weights[k] = prod(axis_rules[d][2][index.I[d]] for d in 1:D)
+    end
+    return TensorQuadrature{D,T}(points, weights)
+end
+
 """
     gauss_rule(basis::IntegratedLegendre, order, [T=Float64]) -> TensorQuadrature
 
@@ -575,18 +589,4 @@ function _tensor_gauss_rule(counts::NTuple{D,Int}, ::Type{T}) where {D,T<:Real}
                             points, weights = gausslegendre(counts[d])
                             return (T.(points), T.(weights))
                         end)
-end
-
-# The tensor product of per-axis 1D rules, `axis_rules[d] = (nodes, weights)`: the points in `CartesianIndices` order
-# (axis 1 fastest) and each weight the left-fold product of its per-axis weights. The one tensor-rule constructor; the
-# Gauss rule below and every rule built from per-axis pieces go through it.
-function _tensor_rule(axis_rules::NTuple{D,Tuple{Vector{T},Vector{T}}}) where {D,T}
-    counts = map(rule -> length(first(rule)), axis_rules)
-    points = Vector{SVector{D,T}}(undef, prod(counts))
-    weights = Vector{T}(undef, prod(counts))
-    for (k, index) in enumerate(CartesianIndices(counts))
-        points[k] = SVector{D,T}(ntuple(d -> axis_rules[d][1][index.I[d]], D))
-        weights[k] = prod(axis_rules[d][2][index.I[d]] for d in 1:D)
-    end
-    return TensorQuadrature{D,T}(points, weights)
 end
