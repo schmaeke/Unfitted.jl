@@ -960,3 +960,20 @@ end
     @test all(r -> isempty(r.data.point_data), records)
     @test isempty(only(Unfitted._sample_fields(sol, model; field=b, level_meshes=false)).meshes)
 end
+
+@testset "records: the quadrature cloud weighs each signature's regions" begin
+    # One vertex cloud per sorted covering-level signature, in sorted order. Its weights are the physical quadrature
+    # weights, so they sum to the measure of that signature's regions — the left region of the two-cell mesh is covered
+    # by the base level alone, the right one by the base and the overlay.
+    (; model) = _pin_2d
+    cloud = Unfitted._quadrature_cloud(model)
+    @test [entry.signature for entry in cloud] == [[1], [1, 2]]
+    regions = Unfitted.integration_plans(model)[1].regions
+    for (; signature, grid) in cloud
+        @test Unfitted._cell_count(grid) == length(grid.points)
+        @test first.(grid.point_data) == ["weight"] && isempty(grid.cell_data)
+        measure = sum(Unfitted._region_measure(r) for r in regions if sort([p.level for p in r.parents]) == signature)
+        @test sum(last(only(grid.point_data))) ≈ measure rtol = 1.0e-13
+    end
+    @test sum(entry -> length(entry.grid.points), cloud) == nquadpoints(model)
+end

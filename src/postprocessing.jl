@@ -282,48 +282,18 @@ Useful for inspecting where the integration regions actually land in ParaView (t
 not visible from the solution VTK alone) and for diagnosing small-overlap warnings — the small regions show up as point
 clusters with tiny weights. Returns the path of every file written, the `.vtm` first.
 """
-function write_quadrature_vtm(path::AbstractString, model::Model{D,T}) where {D,T}
+function write_quadrature_vtm(path::AbstractString, model::Model{D}) where {D}
     _check_vtk_dimension(Val(D))
     base = _vtk_base_path(path)
+    # As for `write_vtk`: the cloud is in memory and every dataset added before the directory is made and the bundle
+    # saved, so a call that fails leaves nothing on disk.
+    vtm = vtk_multiblock(base * ".vtm")
+    for entry in _quadrature_cloud(model)
+        suffix = isempty(entry.signature) ? "none" : join(entry.signature, "_")
+        _add_dataset!(vtm, base, "levels_" * suffix, "quadrature_levels_" * suffix, entry.grid)
+    end
     mkpath(dirname(base))
-
-    # Regions of EVERY subdomain integration plan. The reindexed level ids are globally unique, so a region's
-    # covering-level signature already separates subdomains into distinct blocks — a coupled model shows every
-    # subdomain's quadrature cloud, not just the first.
-    all_regions = VolumeRegion{D,T}[]
-    for subdomain in model.subdomains
-        append!(all_regions, subdomain.plan.regions)
-    end
-
-    # Group regions by the sorted list of covering parent-level ids, then emit one VTP block per group.
-    groups = Dict{Vector{Int},Vector{Int}}()
-    for (i, region) in enumerate(all_regions)
-        sig = sort!([p.level for p in region.parents])
-        push!(get!(groups, sig, Int[]), i)
-    end
-
-    return vtk_multiblock(base * ".vtm") do vtm
-        for sig in sort!(collect(keys(groups)))
-            region_indices = groups[sig]
-            points = SVector{3,T}[]
-            verts = MeshCell{PolyData.Verts,SVector{1,Int}}[]
-            weights = T[]
-            for i in region_indices
-                region = all_regions[i]
-                jacobian = _region_jacobian(region)
-                for k in 1:_region_qpoint_count(region)
-                    x, weight, _ = _region_point(region, k, jacobian)
-                    push!(points, _vtk_point(x))
-                    push!(verts, MeshCell(PolyData.Verts(), SVector{1,Int}(length(points))))
-                    push!(weights, weight)
-                end
-            end
-            suffix = isempty(sig) ? "none" : join(sig, "_")
-            vtk = vtk_grid(_vtk_child_path(base, "quadrature_levels_" * suffix) * ".vtp", points, verts)
-            multiblock_add_block(vtm, vtk, "levels_" * suffix)
-            vtk["weight", VTKPointData()] = weights
-        end
-    end
+    return vtk_save(vtm)
 end
 
 # ── VTK serialisation ─────────────────────────────────────────────────────────
@@ -429,10 +399,6 @@ function _vtk_base_path(path::AbstractString)
     base, ext = splitext(String(path))
     return ext in (".vtm", ".vtu", ".vtp", ".pvd") ? base : String(path)
 end
-
-# Compose the file path for a child VTK block by suffixing the base name, without its extension, which the caller
-# appends (see `_vtk_base_path`). Used by the quadrature writer.
-_vtk_child_path(base::AbstractString, suffix::AbstractString) = joinpath(dirname(base), basename(base) * "_" * suffix)
 
 # VTK supports cells in 1D, 2D, and 3D natively. Higher-dimensional spaces have no corresponding VTK cell type and are
 # rejected at the top of the public entry points so the user sees the dimension limitation up front.
@@ -759,10 +725,33 @@ function _level_grid(level::Level{D,T}, dofs::DofLayout{D}, coverage::Coverage{D
     return SampleGrid{D,T,D}(points, Pair{String,AbstractVector}[], data)
 end
 
-# Pad a `D`-dimensional physical point with trailing zeros to three coordinates: ParaView point arrays are always 3D
-# regardless of the data's actual dimension. The padded zeros are inert (ParaView accepts them) and let 1D / 2D problems
-# render in the same viewer pipeline as 3D ones.
-_vtk_point(x::SVector{D,T}) where {D,T} = SVector{3,T}(ntuple(i -> i <= D ? x[i] : zero(T), 3))
+# ── Quadrature cloud ──────────────────────────────────────────────────────────
+
+# The model's quadrature-point cloud as records: one `(; signature, grid)` per distinct sorted list of covering parent
+# levels, in sorted order, over the regions of every subdomain's integration plan. Level ids are unique across
+# subdomains, so a coupled model's subdomains land in different entries and every one of them is kept. A grid is a
+# vertex cloud (`K = 0`) of the physical quadrature points, each with its physical weight `weight` (the rule weight
+# times the region's Jacobian, as assembly integrates with it), region by region — subdomain order, then plan order —
+# and point by point. Both arrays are presized from the regions' point counts rather than grown point by point.
+function _quadrature_cloud(model::Model{D,T}) where {D,T}
+    groups = Dict{Vector{Int},Vector{VolumeRegion{D,T}}}()
+    for subdomain in model.subdomains, region in subdomain.plan.regions
+        push!(get!(() -> VolumeRegion{D,T}[], groups, sort!([p.level for p in region.parents])), region)
+    end
+    return map(sort!(collect(keys(groups)))) do signature
+        regions = groups[signature]
+        points = Vector{SVector{D,T}}(undef, sum(_region_qpoint_count, regions))
+        weights, k = similar(points, T), 0
+        for region in regions
+            jacobian = _region_jacobian(region)
+            for q in 1:_region_qpoint_count(region)
+                k += 1
+                points[k], weights[k], _ = _region_point(region, q, jacobian)
+            end
+        end
+        return (; signature, grid=SampleGrid{D,T,0}(points, ["weight" => weights], Pair{String,AbstractVector}[]))
+    end
+end
 
 # ── Solution evaluation ───────────────────────────────────────────────────────
 #
