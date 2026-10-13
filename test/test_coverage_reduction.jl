@@ -227,7 +227,7 @@ end
 
     # Base cell (2, 2) is the one holding the hole. Its centre is in Ω, its overlay block is not entirely active — and
     # it is covered all the same.
-    base, fine = Unfitted._problem_levels(m.problem)[1:2]
+    base, fine = only(Unfitted.problem_spaces(m.problem)).levels
     cell = CartesianIndex(2, 2)
     @test Unfitted._inside(m.problem.fields[1].space.physical.geometry,
                            Unfitted.center(Unfitted.cell_box(base.mesh, cell)))
@@ -361,7 +361,7 @@ end
     fresh(level, c, k) = Unfitted._covered_by_level(cell_box(level.mesh, c), k, tol, reference)
     middle, inner = V.levels[2], V.levels[3]
     # Non-vacuity: the middle cover is masked (by the fold and by the user), the inner one is not.
-    @test middle.mask !== nothing && count(!, middle.mask.on) > 4
+    @test middle.mask !== nothing && count(!, middle.mask) > 4
     @test inner.mask === nothing
     stored = UInt8[]
     for level in V.levels

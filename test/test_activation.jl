@@ -8,33 +8,50 @@ using SparseArrays
 
     @test Unfitted._normalize_mask(nothing, mesh) === nothing
 
+    # A stored mask is the bits themselves: `LevelMask{D}` is an alias of `BitArray{D}`, not a wrapper around one.
     bits = trues(4, 4)
     bits[1, 1] = false
     mask = Unfitted._normalize_mask(bits, mesh)
     @test mask isa Unfitted.LevelMask{2}
-    @test !mask.on[1, 1]
-    @test mask.on[2, 2]
+    @test mask isa BitArray{2}
+    @test !mask[1, 1]
+    @test mask[2, 2]
+    @test mask == bits && mask !== bits     # copied: a later edit of `bits` cannot reach a level
 
-    # Pre-built LevelMask passes through as a copy (caller mutations of the original BitArray must not leak into the
-    # model).
+    # A pre-built mask passes through as a copy (caller mutations of the original BitArray must not leak into the
+    # model), and the alias still constructs one.
     passed = Unfitted._normalize_mask(mask, mesh)
     @test passed isa Unfitted.LevelMask{2}
-    @test passed.on == mask.on
-    @test passed.on !== mask.on
+    @test passed == mask
+    @test passed !== mask
+    @test Unfitted.LevelMask{2}(bits) == bits && Unfitted.LevelMask{2}(bits) !== bits
 
     pred_mask = Unfitted._normalize_mask((b, i) -> b.lower[1] < 0.5, mesh)
     @test pred_mask isa Unfitted.LevelMask{2}
-    @test pred_mask.on[1, 1] && pred_mask.on[1, 2]
-    @test !pred_mask.on[3, 1] && !pred_mask.on[3, 2]
+    @test pred_mask[1, 1] && pred_mask[1, 2]
+    @test !pred_mask[3, 1] && !pred_mask[3, 2]
 
     iter_mask = Unfitted._normalize_mask([CartesianIndex(1, 1), CartesianIndex(2, 2)], mesh)
-    @test iter_mask.on[1, 1] && iter_mask.on[2, 2]
-    @test !iter_mask.on[1, 2] && !iter_mask.on[2, 1]
+    @test iter_mask[1, 1] && iter_mask[2, 2]
+    @test !iter_mask[1, 2] && !iter_mask[2, 1]
 
     @test_throws DimensionMismatch Unfitted._normalize_mask(trues(3, 3), mesh)
     @test_throws DimensionMismatch Unfitted._normalize_mask(Unfitted.LevelMask{2}(trues(3, 3)), mesh)
     @test_throws ArgumentError Unfitted._normalize_mask([CartesianIndex(5, 5)], mesh)
     @test_throws ArgumentError Unfitted._normalize_mask([(1, 1)], mesh)
+end
+
+@testset "a selection array of another dimension is refused as a shape mismatch" begin
+    # A `Bool` array selects by shape whatever its dimension, so one of the wrong dimension is the same mistake as one
+    # of the wrong size and is refused the same way, naming both shapes. It used to reach the iterable path and be
+    # refused for its `Bool` entries, which describes a different mistake.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    V = space(omega; cells=4)
+    @test_throws DimensionMismatch Unfitted._normalize_mask(trues(16), V.levels[1].mesh)
+    @test_throws "does not match mesh cells (4, 4)" space(omega; cells=4, active=trues(16))
+    @test_throws DimensionMismatch space(omega; cells=4, active=trues(4, 4, 1))
+    @test_throws DimensionMismatch adapt(V, 1 => trues(4, 4, 1))
+    @test_throws DimensionMismatch dilate(V, trues(16); level=1, by=1)
 end
 
 @testset "is_active predicate" begin
@@ -204,7 +221,7 @@ end
     V_moved = Unfitted.moved_space(V; level=2, to=box((0.2, 0.2), (0.6, 0.6)))
 
     @test V_moved.levels[2].mask !== nothing
-    @test V_moved.levels[2].mask.on == V.levels[2].mask.on
+    @test V_moved.levels[2].mask == V.levels[2].mask
 end
 
 @testset "active_cells query" begin
@@ -352,6 +369,38 @@ end
     @test count(bits) == 2
 end
 
+@testset "activate! / deactivate! take every selector shape `active =` takes" begin
+    # A `LevelMask` is the documented mask type and `nothing` reads "every cell" in `active =`, `dilate` and `ladder`;
+    # the mutators used to refuse both with a `MethodError`. Each spelling must equal its BitArray twin, and bump the
+    # pin exactly once.
+    bc = dirichlet(0.0; on=boundary(:all))
+    fresh() = prepare(poisson(_safe_overlay(active=(b, i) -> i.I[1] <= 2); source=1.0, dirichlet=[bc]))
+    sel = falses(4, 4)
+    sel[1, 1] = true    # active at the start
+    sel[4, 4] = true    # inactive at the start
+    for verb! in (activate!, deactivate!)
+        twin = verb!(fresh(); level=2, cells=sel)
+        model = fresh()
+        version = model.version
+        verb!(model; level=2, cells=Unfitted.LevelMask{2}(copy(sel)))
+        @test model.version == version + 1
+        @test active_cells(model; level=2) == active_cells(twin; level=2)
+        @test active_unknowns(model) == active_unknowns(twin)
+    end
+
+    model = fresh()
+    version = model.version
+    activate!(model; level=2, cells=nothing)
+    @test model.version == version + 1
+    @test active_cells(model; level=2) == trues(4, 4)
+    @test model.problem.space.levels[2].mask === nothing    # collapsed to the no-mask fast path
+    @test active_unknowns(model) == active_unknowns(activate!(fresh(); level=2, cells=trues(4, 4)))
+    deactivate!(model; level=2, cells=nothing)
+    @test model.version == version + 2
+    @test active_cells(model; level=2) == falses(4, 4)
+    @test active_unknowns(model) == active_unknowns(deactivate!(fresh(); level=2, cells=trues(4, 4)))
+end
+
 @testset "activate! rejects out-of-bounds level" begin
     V = _safe_overlay()
     model = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
@@ -374,4 +423,40 @@ end
     @test !active_cells(model; level=1)[outside]                  # the geometry wins
     @test active_cells(model; level=1, effective=false)[outside]   # the request is kept
     @test diagnostics(model, solve!(model)).fit_failure_count == 0
+end
+
+@testset "every region parent is an active cell of its level" begin
+    # The assembly hot path reads a parent's basis set without consulting the level's mask (`_active_set` in
+    # `_refresh!`): on a uniform level that read is the level's one shared set for any cell, which is the right set only
+    # because every parent is active. That holds by construction — every parent list is decoded from a coverage
+    # signature, which gives an inactive cell no slot (`_signature`) — and is asserted here on the three ways a uniform
+    # level gets a mask: the caller's selection on an overlay, the fictitious fold of an immersed level and a ladder's
+    # depth masks; over the volume partition, every boundary facet's partition and a transfer partition.
+    tol = GeometryTolerance(Float64)
+    active_parents(V, parents) = all(p -> Unfitted.is_active(Unfitted._level_by_id(V, p.level).mask, p.cell), parents)
+    function check(model)
+        V = model.problem.space
+        masked = [level.id for level in V.levels if level.mask !== nothing]
+        # Non-vacuity: masked levels that store no per-cell mode map, and that parent regions.
+        @test !isempty(masked) && all(level -> level.modes.kind === nothing, V.levels)
+        regions = Unfitted.integration_plan(model).regions
+        @test any(r -> any(p -> p.level in masked, r.parents), regions)
+        @test all(r -> active_parents(V, r.parents), regions)
+        for axis in 1:2, side in (:lower, :upper)
+            @test all(r -> active_parents(V, r.parents), Unfitted._boundary_facet_regions(V, [(axis, side)], tol))
+        end
+        return model
+    end
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    check(prepare(mass(overlay(space(Ω; cells=4, order=2), box((0.25, 0.25), (0.75, 0.75)); cells=4, order=3,
+                               active=(b, c) -> c[1] + c[2] <= 5))))
+    disc = physical_domain(x -> sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.3; lipschitz=1.0, subcell_length_scale=0.05)
+    check(prepare(mass(space(Ω; cells=8, order=2, physical=disc))))
+    L = ladder(Ω; cells=4, order=2, depth=2)
+    source = check(prepare(mass(adapt(L, [i == j ? 2 : (i + j == 5 ? 1 : 0) for i in 1:4, j in 1:4]))))
+    target = check(prepare(mass(adapt(L, [i == 1 ? 2 : (j == 4 ? 1 : 0) for i in 1:4, j in 1:4]))))
+    transfer = Unfitted._transfer_regions(source, target)
+    @test !isempty(transfer)
+    @test all(((r, from),) -> active_parents(target.problem.space, r.parents) &&
+                              active_parents(source.problem.space, from), transfer)
 end

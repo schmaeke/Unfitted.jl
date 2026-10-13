@@ -26,69 +26,12 @@ Mutable diagnostics record carried on every [`Model`](@ref) and exposed through 
 reporting the old state — re-read it through [`diagnostics`](@ref). Every field is `Float64`- or `Int`-typed for
 stability across scalar types.
 
-Fields:
+Fields, in declaration order, which is also the order [`diagnostics`](@ref)`(model, solution)` reports them in:
 
   - `dimension::Int` — spatial dimension `D`.
   - `active_unknowns::Int` — number of active (post-constraint) dofs.
-  - `integration_regions::Int` — number of admissible integration regions in the model's plan.
-  - `small_overlap_count::Int` and `small_overlaps::Vector` — number and per-region records of integration regions below
-    `tolerance.small_volume`.
-  - `min_integration_volume::Float64` — smallest region volume.
-  - `min_relative_integration_volume::Float64` — same, divided by `volume(V.domain)`.
-  - `symmetry_residual::Float64` — the reported value of `‖A − Aᵀ‖_F` for the assembled matrix. It is asserted, never
-    measured: `assemble!` writes exactly `0.0` when the problem declares itself symmetric — such a form is scattered
-    into the lower triangle only and mirrored entry-for-entry by `_mirror_lower`, so `A = Aᵀ` holds to the bit by
-    construction — and `NaN` otherwise. `NaN` therefore means "no symmetry claim", both before `assemble!` has run and
-    for a form the problem did not declare symmetric; it is never a measurement of asymmetry.
-  - `condition_estimate::Float64` — `cond(Matrix(A))` for systems with `1 ≤ n ≤ 256`; `NaN` otherwise (computing the
-    condition number of a large matrix is too expensive for a default diagnostic, and an empty system has none).
-  - `scaled_condition_estimate::Float64` — the same quantity for the symmetrically diagonal-scaled operator `D⁻¹ A D⁻¹`,
-    `D = diag(√|A_ii|)`, which is what a Jacobi-preconditioned solver actually sees. Same size cap, and `NaN` where any
-    diagonal entry is zero.
-
-    Reporting both is what makes an **immersed** system readable, because on a cut cell the two answer different
-    questions. An unscaled `cond` there is dominated by the spread of the diagonal — a basis function whose support is
-    almost entirely fictitious carries an almost-zero diagonal entry — and that spread is exactly what a diagonal
-    preconditioner removes. Whether anything is left after it is removed is a property of the *basis*, and the two
-    shipped families differ on it sharply. Measured on a disc of radius `r` removed from the unit square, `−Δu = 1`,
-    degree 2 on an 8² grid — a size at which both families stay under the cap above, so both numbers are the ones this
-    diagnostic prints:
-
-    ```text
-    r        family       unknowns    cond       scaled cond
-    0.25     Legendre      216        1.36e6     4.22e4
-    0.25     B-spline       64        5.99e2     6.04
-    0.30     Legendre      192        1.06e5     5.58e3
-    0.30     B-spline       64        1.26e5     7.17
-    ```
-
-    The gap widens with the degree, and past degree 2 only the B-spline half is reportable here: at degree 3 on the same
-    grid the spline system has 81 unknowns and scales to 39.9 (`r = 0.25`) and 45.1 (`r = 0.30`) from 1.48e5 and 3.63e8,
-    while the integrated-Legendre system has 504 and is `NaN` by the cap. Computed directly, past the cap, a degree-3
-    16² pair gives 2.2e10 for integrated Legendre against 4.4e1 for the splines.
-
-    The B-spline rows are the maximal-continuity family: on a cut cell holding a background vertex only one spline is
-    supported there, so near-dependence survives only on vertex-free slivers, while a `C⁰` basis of degree ≥ 2 produces
-    it on every small cut cell. That difference is the reason an immersed spline system is solvable with a diagonal
-    preconditioner and an immersed high-order `C⁰` system is not, and it is invisible in `condition_estimate` alone.
-  - `solver::Symbol` — solver tag recorded by [`solve!`](@ref).
-  - `inactive_cell_counts::Vector{Int}` — count of cells deactivated by `LevelMask`, one entry per level of each
-    distinct participating space, in `problem_spaces` order. Includes both user-provided masks and the fictitious fold
-    `mesh.jl`'s `_apply_physical_fold` applies whenever the domain's `keep_fictitious` is `false` (the default) — that
-    fold runs at any `alpha`, not only in the strict `alpha = 0` case.
-  - `reduced_mode_counts::Vector{Int}` — count of high-order and dedup modes eliminated by covered-mode pruning in
-    covered regions (leaf semantics; see [`prepare`](@ref)'s `prune`), one entry per level of each *field*, concatenated
-    in field-declaration order. Note the different granularity from `inactive_cell_counts`, which is per *space*: the
-    two vectors line up entry-for-entry only when every space carries exactly one field (the common case). Two fields
-    over one space give this vector twice the length of that one.
-  - `cut_region_count::Int`, `fit_failure_count::Int`, `moment_fit_residual_max::Float64` — FCM moment-fit statistics
-    from the integration plan. `fit_failure_count` counts every cut region whose fit missed the failure threshold
-    `_FIT_FAILURE_RESIDUAL · ‖m‖` (relative to the norm of the cell's moment vector, so the verdict does not depend on
-    the cell's size), whatever rule the region ended up carrying.
-  - `cut_fallback_count::Int`, `cut_fallback_points::Int` — the subset of those failures that fell back to the raw Saye
-    volume rule (`:cut_fallback`), and the total number of quadrature points those regions carry. A successful fit
-    yields ≈ nbasis points, so the second number is the price of the safety net; a nonzero count means the mesh is too
-    coarse for the geometry in those cells and should be refined. See [`moment_fit_rule`](@ref).
+  - `integration_regions::Int` — number of admissible integration regions in the model's integration plans, summed over
+    the subdomains of a coupled model.
   - `facet_region_count::Int` — total number of [`FacetRegion`](@ref)s cached on the model, summed across every cached
     selector (Dirichlet conditions and any `block`/`loadform` carrying `on::BoundarySelector`). Zero for problems with
     no physical- boundary integration. Because the sum runs over selector × face pairs and not over distinct regions,
@@ -185,210 +128,97 @@ Fields:
     across every cached [`BoundaryMesh`](@ref). Zero for problems with no immersed-boundary integration.
   - `interface_region_count::Int` — total number of interface [`SimplexRegion`](@ref)s cached on the model, summed
     across every cached coupling [`Interface`](@ref). Zero for problems with no multi-domain interface coupling.
+  - `small_overlap_count::Int` and `small_overlaps::Vector` — number and per-region records of integration regions below
+    `tolerance.small_volume`.
+  - `min_integration_volume::Float64` — smallest region volume.
+  - `min_relative_integration_volume::Float64` — same, divided by `volume(V.domain)`.
+  - `inactive_cell_counts::Vector{Int}` — count of cells deactivated by `LevelMask`, one entry per level of each
+    distinct participating space, in `problem_spaces` order. Includes both user-provided masks and the fictitious fold
+    `mesh.jl`'s `_apply_physical_fold` applies whenever the domain's `keep_fictitious` is `false` (the default) — that
+    fold runs at any `alpha`, not only in the strict `alpha = 0` case.
+  - `reduced_mode_counts::Vector{Int}` — count of high-order and dedup modes eliminated by covered-mode pruning in
+    covered regions (leaf semantics; see [`prepare`](@ref)'s `prune`), one entry per level of each *field*, concatenated
+    in field-declaration order. Note the different granularity from `inactive_cell_counts`, which is per *space*: the
+    two vectors line up entry-for-entry only when every space carries exactly one field (the common case). Two fields
+    over one space give this vector twice the length of that one.
+  - `cut_region_count::Int`, `fit_failure_count::Int`, `moment_fit_residual_max::Float64` — FCM moment-fit statistics
+    from the integration plan. `fit_failure_count` counts every cut region whose fit missed the failure threshold
+    `_FIT_FAILURE_RESIDUAL · ‖m‖` (relative to the norm of the cell's moment vector, so the verdict does not depend on
+    the cell's size), whatever rule the region ended up carrying.
+  - `cut_fallback_count::Int`, `cut_fallback_points::Int` — the subset of those failures that fell back to the raw Saye
+    volume rule (`:cut_fallback`), and the total number of quadrature points those regions carry. A successful fit
+    yields ≈ nbasis points, so the second number is the price of the safety net; a nonzero count means the mesh is too
+    coarse for the geometry in those cells and should be refined. See [`moment_fit_rule`](@ref).
+  - `symmetry_residual::Float64` — the reported value of `‖A − Aᵀ‖_F` for the assembled matrix. It is asserted, never
+    measured: `assemble!` writes exactly `0.0` when the problem declares itself symmetric — such a form is scattered
+    into the lower triangle only and mirrored entry-for-entry by `_mirror_lower`, so `A = Aᵀ` holds to the bit by
+    construction — and `NaN` otherwise. `NaN` therefore means "no symmetry claim", both before `assemble!` has run and
+    for a form the problem did not declare symmetric; it is never a measurement of asymmetry.
+  - `condition_estimate::Float64` — `cond(Matrix(A))` for systems with `1 ≤ n ≤ 256`; `NaN` otherwise (computing the
+    condition number of a large matrix is too expensive for a default diagnostic, and an empty system has none).
+  - `scaled_condition_estimate::Float64` — the same quantity for the symmetrically diagonal-scaled operator `D⁻¹ A D⁻¹`,
+    `D = diag(√|A_ii|)`, which is what a Jacobi-preconditioned solver actually sees. Same size cap, and `NaN` where any
+    diagonal entry is zero.
+
+    Reporting both is what makes an **immersed** system readable, because on a cut cell the two answer different
+    questions. An unscaled `cond` there is dominated by the spread of the diagonal — a basis function whose support is
+    almost entirely fictitious carries an almost-zero diagonal entry — and that spread is exactly what a diagonal
+    preconditioner removes. Whether anything is left after it is removed is a property of the *basis*, and the two
+    shipped families differ on it sharply. Measured on a disc of radius `r` removed from the unit square, `−Δu = 1`,
+    degree 2 on an 8² grid — a size at which both families stay under the cap above, so both numbers are the ones this
+    diagnostic prints:
+
+    ```text
+    r        family       unknowns    cond       scaled cond
+    0.25     Legendre      216        1.36e6     4.22e4
+    0.25     B-spline       64        5.99e2     6.04
+    0.30     Legendre      192        1.06e5     5.58e3
+    0.30     B-spline       64        1.26e5     7.17
+    ```
+
+    The gap widens with the degree, and past degree 2 only the B-spline half is reportable here: at degree 3 on the same
+    grid the spline system has 81 unknowns and scales to 39.9 (`r = 0.25`) and 45.1 (`r = 0.30`) from 1.48e5 and 3.63e8,
+    while the integrated-Legendre system has 504 and is `NaN` by the cap. Computed directly, past the cap, a degree-3
+    16² pair gives 2.2e10 for integrated Legendre against 4.4e1 for the splines.
+
+    The B-spline rows are the maximal-continuity family: on a cut cell holding a background vertex only one spline is
+    supported there, so near-dependence survives only on vertex-free slivers, while a `C⁰` basis of degree ≥ 2 produces
+    it on every small cut cell. That difference is the reason an immersed spline system is solvable with a diagonal
+    preconditioner and an immersed high-order `C⁰` system is not, and it is invisible in `condition_estimate` alone.
+  - `solver::Symbol` — solver tag recorded by [`solve!`](@ref).
 """
-mutable struct AssemblyDiagnostics
-    dimension::Int
-    active_unknowns::Int
-    integration_regions::Int
-    small_overlap_count::Int
-    small_overlaps::Vector{SmallOverlap{Float64}}
-    min_integration_volume::Float64
-    min_relative_integration_volume::Float64
-    symmetry_residual::Float64
-    condition_estimate::Float64
-    scaled_condition_estimate::Float64
-    solver::Symbol
-    inactive_cell_counts::Vector{Int}
-    reduced_mode_counts::Vector{Int}
-    cut_region_count::Int
-    fit_failure_count::Int
-    moment_fit_residual_max::Float64
-    cut_fallback_count::Int
-    cut_fallback_points::Int
-    facet_region_count::Int
-    cut_facet_region_count::Int
-    facet_fit_failure_count::Int
-    facet_cut_fallback_count::Int
-    facet_moment_fit_residual_max::Float64
-    min_relative_facet_measure::Float64
-    dirichlet_trace_factors::Vector{Symbol}
-    unsupported_dirichlet_dof_count::Int
-    unsupported_dirichlet_dofs::Vector{UnsupportedDirichletDof}
-    surface_region_count::Int
-    interface_region_count::Int
-end
-
-# Promote the small-overlap records of an integration plan to `Float64` scalars so they fit the diagnostics'
-# fixed-precision storage. The integration plan carries them in the model's scalar type `T`; widening to `Float64` here
-# keeps `AssemblyDiagnostics` `T`-agnostic.
-function _float_small_overlaps(records)
-    return [SmallOverlap{Float64}(record.region, Float64(record.volume), Float64(record.relative_volume),
-                                  record.cover_count) for record in records]
-end
-
-function AssemblyDiagnostics(; dimension=0, active_unknowns=0, integration_regions=0, small_overlap_count=0,
-                             min_integration_volume=NaN, min_relative_integration_volume=NaN, symmetry_residual=NaN,
-                             condition_estimate=NaN, scaled_condition_estimate=NaN, solver=:none,
-                             small_overlaps=SmallOverlap{Float64}[], inactive_cell_counts=Int[],
-                             reduced_mode_counts=Int[], cut_region_count=0, fit_failure_count=0,
-                             moment_fit_residual_max=0.0, cut_fallback_count=0, cut_fallback_points=0,
-                             facet_region_count=0, cut_facet_region_count=0, facet_fit_failure_count=0,
-                             facet_cut_fallback_count=0, facet_moment_fit_residual_max=0.0,
-                             min_relative_facet_measure=1.0, dirichlet_trace_factors=Symbol[],
-                             unsupported_dirichlet_dofs=UnsupportedDirichletDof[], surface_region_count=0,
-                             interface_region_count=0)
-    return AssemblyDiagnostics(Int(dimension), Int(active_unknowns), Int(integration_regions), Int(small_overlap_count),
-                               _float_small_overlaps(small_overlaps), Float64(min_integration_volume),
-                               Float64(min_relative_integration_volume), Float64(symmetry_residual),
-                               Float64(condition_estimate), Float64(scaled_condition_estimate), Symbol(solver),
-                               Int[inactive_cell_counts...], Int[reduced_mode_counts...], Int(cut_region_count),
-                               Int(fit_failure_count), Float64(moment_fit_residual_max), Int(cut_fallback_count),
-                               Int(cut_fallback_points), Int(facet_region_count), Int(cut_facet_region_count),
-                               Int(facet_fit_failure_count), Int(facet_cut_fallback_count),
-                               Float64(facet_moment_fit_residual_max), Float64(min_relative_facet_measure),
-                               Symbol[dirichlet_trace_factors...], length(unsupported_dirichlet_dofs),
-                               UnsupportedDirichletDof[unsupported_dirichlet_dofs...], Int(surface_region_count),
-                               Int(interface_region_count))
-end
-
-# Per-level count of cells deactivated by a `LevelMask` (mask and fictitious fold combined), across every distinct
-# subdomain space in `problem_spaces` order — the same order the reindexed global level ids run. One entry per level,
-# `0` for an unmasked level. Reported by `diagnostics` so the user can see how many cells each level dropped.
-function _inactive_cell_counts(spaces)
-    return Int[level.mask === nothing ? 0 : count(!, level.mask.on) for V in spaces for level in V.levels]
-end
-
-# Per-level count of raws eliminated by covered-mode pruning (`:coverage` or `:dedup`), one entry per id of each field's
-# level block, concatenated in field order. That is the per-*field* granularity the `reduced_mode_counts` docstring
-# states, not the per-space one `_inactive_cell_counts` walks, so the two vectors line up entry-for-entry only when each
-# space carries one field. Pruning reads the space alone — never a field's components or Dirichlet data — so two fields
-# over one space report the same counts, once each.
-#
-# Each level's raws are one range of the layout (`level_raws`), so a level is counted from its own elimination sources
-# without a pass over every raw.
-function _reduced_mode_counts(layout::SystemLayout)
-    return Int[count(s -> s === :coverage || s === :dedup, view(f.dofs.elimination_source, f.dofs.level_raws[id]))
-               for f in layout.fields for id in f.level_ids]
-end
-
-# Everything the diagnostics report about the rules of a region list, read off the regions' `kind`s and returned as
-# `(cut, trimmed, failed, fallbacks, fallback_points, residual_max, min_relative_measure)`. The plan statistics and the
-# facet statistics both compose from it; the two count "cut" differently, and both counts are here:
-#
-#   - `cut` — the regions `∂Ω` crosses (`_CUT_KINDS`), the volume plan's `cut_region_count`. `:cut_fitted` are
-#     successful fits; `:cut_fallback` (the raw Saye volume rule), `:cut_failed` (empty Ω ∩ box at α = 0) and
-#     `:cut_alpha_failed` (the same at α > 0) all failed to fit, and are `failed` (`_FAILED_KINDS`) too — so
-#     `fit_failure_count` keeps meaning "the moment fit did not succeed" whichever rule the region ended up carrying.
-#     `:cut_custom` — a region integrated by the domain's own `cut_quadrature` rule instead of the fit (see
-#     `PhysicalDomain`) — is a cut region but never a fit failure: no fit ran, so there is nothing for the
-#     residual-based counter to report. A custom rule that wants to be counted as a failure says so by returning
-#     `status === :empty`, which lands the region in `:cut_failed` / `:cut_alpha_failed` instead.
-#   - `trimmed` — every region that is not `:full`, the facet statistics' `cut_facet_region_count`: a face part of whose
-#     area falls outside Ω, `:fictitious*` faces included.
-#   - `fallbacks` and `fallback_points` — the `:cut_fallback` regions and their quadrature points. That is the assembly
-#     cost of the safety net, and the number a caller should watch: it is bounded only by the volume rule's own point
-#     count, not by nbasis.
-#   - `residual_max` and `min_relative_measure` — over the `trimmed` regions, the largest moment-fit residual and the
-#     smallest fraction of a region's own measure its rule integrates (`_region_measure`). A list that trims nothing
-#     reports 0 and exactly 1 rather than a Gauss weight sum's last bit.
-#
-# Reading the kind rather than re-deriving a test from the rule is what makes the facet counts as sharp as the
-# classifier behind the kind and no sharper — `FacetRegion`'s docstring states what that sharpness does and does not
-# see — and independent of the rule itself, which is no longer a plain tensor product exactly on the faces it reports.
-#
-# Why the facet count is worth reporting at all (`trimmed`, summed over every cached selector, so a region two selectors
-# share is counted once per selector, exactly as `facet_region_count` is). The grid-aligned facet *partition* is
-# level-set-blind: `_boundary_facet_regions` selects its contributing levels with `_level_side_is_physical` — pure
-# mesh-edge versus domain-edge geometry — and partitions the face over `_side_cells`. A `FacetRegion` is therefore the
-# *whole* grid-aligned face of its parent cells, and where that face leaves Ω the rule on it is the moment fit on the
-# facet's affine slice of Ω rather than an exact tensor product. Every consumer of a facet region inherits that: the L²
-# Dirichlet mass and right-hand side, a Neumann / Robin / Nitsche term placed with `on = boundary(…)`, and
-# `boundary_integral`. That fit is machine-exact where every restricted leaf is affine (planar) and accurate rather than
-# exact on a curved cut (`boundary`'s docstring states the condition), so the count says how much of a model's boundary
-# integration rests on a fitted rule, and `residual_max` says how well those fits reproduced the moments they were
-# given, not how right those moments were.
-#
-# The classification is of the region's own *face*, not of its parent cells, and the distinction is not academic: a cut
-# cell can have a face lying wholly inside Ω, and no trimming is needed there. Classifying the cells would make the
-# number a loose upper bound — on the space-time cavity example at `SC_CELLS = 3` it reads 61 of 81 against a true 1,
-# because the growing cavity cuts nearly every cell while touching only the `t = 0` and `t = T` faces.
-function _kind_stats(regions)
-    cut, trimmed, failed, fallbacks, fallback_points = 0, 0, 0, 0, 0
-    residual_max, min_relative_measure = 0.0, 1.0
-    for region in regions
-        kind = region.kind
-        kind === :full && continue
-        trimmed += 1
-        cut += kind in _CUT_KINDS
-        failed += kind in _FAILED_KINDS
-        if kind === :cut_fallback
-            fallbacks += 1
-            fallback_points += length(region.weights)
-        end
-        residual_max = max(residual_max, Float64(region.residual))
-        relative = _region_jacobian(region) * sum(region.weights) / _region_measure(region)
-        min_relative_measure = min(min_relative_measure, Float64(relative))
-    end
-    return (; cut, trimmed, failed, fallbacks, fallback_points, residual_max, min_relative_measure)
-end
-
-# Fold every plan-level statistic into a diagnostics record in place, and return it so call sites can chain. Shared by
-# `prepare`, `move!` and `_update_mask!`, which install a fresh record.
-#
-# `plans` holds one integration plan per subdomain and must be non-empty. The aggregation is the identity on a
-# single-domain problem: region / cut / small-overlap counts sum, minimum volumes take the global minimum, the
-# moment-fit residual takes the global maximum, and the small-overlap records are concatenated so every subdomain's
-# offending regions are reported.
-function _set_plan_stats_multi!(diag::AssemblyDiagnostics, plans)
-    diag.integration_regions = sum(length(p.regions) for p in plans; init=0)
-    diag.small_overlap_count = sum(length(p.small_overlaps) for p in plans; init=0)
-    diag.small_overlaps = reduce(vcat, (_float_small_overlaps(p.small_overlaps) for p in plans);
-                                 init=SmallOverlap{Float64}[])
-    diag.min_integration_volume = minimum(Float64(p.min_volume) for p in plans)
-    diag.min_relative_integration_volume = minimum(Float64(p.min_relative_volume) for p in plans)
-    stats = [_kind_stats(p.regions) for p in plans]
-    diag.cut_region_count = sum(s.cut for s in stats; init=0)
-    diag.fit_failure_count = sum(s.failed for s in stats; init=0)
-    diag.cut_fallback_count = sum(s.fallbacks for s in stats; init=0)
-    diag.cut_fallback_points = sum(s.fallback_points for s in stats; init=0)
-    diag.moment_fit_residual_max = maximum(p.moment_fit_residual_max for p in plans; init=0.0)
-    return diag
-end
-
-# Append one field's L² Dirichlet trace-solve verdicts to `factors` and `unsupported`, in component order: the branch
-# each component's solve took (`_trace_branch` of its factor) and an `UnsupportedDirichletDof` record for each dof that
-# solve left undetermined. `projection` is the one the field's data were just projected through, or `nothing` for a
-# field whose data are homogeneous — `prepare` skips the projection for those, so every component reads `:none` and
-# nothing is unsupported.
-#
-# Read off the projection because that is where the verdicts live and nowhere else: the dof layout keeps no copy of
-# them, and `prepare` drops each projection it builds as soon as this has read it, so the model it returns holds none.
-# `update_dirichlet!` reads the ones it caches the same way.
-function _append_trace_stats!(factors::Vector{Symbol}, unsupported::Vector{UnsupportedDirichletDof}, name::Symbol,
-                              projection, components::Integer)
-    for c in 1:components
-        push!(factors, projection === nothing ? :none : _trace_branch(projection.factors[c]))
-        projection === nothing && continue
-        append!(unsupported, (UnsupportedDirichletDof(name, c, raw) for raw in projection.unsupported[c]))
-    end
-    return factors, unsupported
-end
-
-# Install the trace-solve verdicts `_append_trace_stats!` collected, over every field in field order, in a diagnostics
-# record in place, and return it so call sites can chain — the counterpart of `_set_plan_stats_multi!` for the
-# boundary-trace half of the build. The unsupported dofs are self-describing records rather than a flattened vector: the
-# list is empty on every untrimmed boundary, so there is no position worth counting from.
-#
-# Both quantities describe the boundary mass and not the datum, so a load increment restates the same answers; the two
-# events that move them are a rebuilt layout and a *first* projection, the latter being why `update_dirichlet!` calls
-# this too. A model prepared with homogeneous data has run no projection at all, and its first increment is where the
-# branch and the unsupported dofs are established.
-function _set_dirichlet_trace_stats!(diag::AssemblyDiagnostics, factors::Vector{Symbol},
-                                     unsupported::Vector{UnsupportedDirichletDof})
-    diag.dirichlet_trace_factors = factors
-    diag.unsupported_dirichlet_dofs = unsupported
-    diag.unsupported_dirichlet_dof_count = length(unsupported)
-    return diag
+Base.@kwdef mutable struct AssemblyDiagnostics
+    dimension::Int = 0
+    active_unknowns::Int = 0
+    integration_regions::Int = 0
+    facet_region_count::Int = 0
+    cut_facet_region_count::Int = 0
+    facet_fit_failure_count::Int = 0
+    facet_cut_fallback_count::Int = 0
+    facet_moment_fit_residual_max::Float64 = 0.0
+    min_relative_facet_measure::Float64 = 1.0
+    dirichlet_trace_factors::Vector{Symbol} = Symbol[]
+    # The count is `length(unsupported_dirichlet_dofs)`, kept as a field for the report: `prepare` and
+    # `update_dirichlet!`, the list's only writers, set the two together.
+    unsupported_dirichlet_dof_count::Int = 0
+    unsupported_dirichlet_dofs::Vector{UnsupportedDirichletDof} = UnsupportedDirichletDof[]
+    surface_region_count::Int = 0
+    interface_region_count::Int = 0
+    small_overlap_count::Int = 0
+    small_overlaps::Vector{SmallOverlap{Float64}} = SmallOverlap{Float64}[]
+    min_integration_volume::Float64 = NaN
+    min_relative_integration_volume::Float64 = NaN
+    inactive_cell_counts::Vector{Int} = Int[]
+    reduced_mode_counts::Vector{Int} = Int[]
+    cut_region_count::Int = 0
+    fit_failure_count::Int = 0
+    moment_fit_residual_max::Float64 = 0.0
+    cut_fallback_count::Int = 0
+    cut_fallback_points::Int = 0
+    symmetry_residual::Float64 = NaN
+    condition_estimate::Float64 = NaN
+    scaled_condition_estimate::Float64 = NaN
+    solver::Symbol = :none
 end
 
 function Base.show(io::IO, diagnostics::AssemblyDiagnostics)
@@ -397,13 +227,15 @@ function Base.show(io::IO, diagnostics::AssemblyDiagnostics)
           diagnostics.solver, ")")
 end
 
-# ── Single-sided region-cache keys ────────────────────────────────────────────
+# ── Region-cache keys ─────────────────────────────────────────────────────────
 #
 # A single-sided region list (`FacetRegion`s for a `BoundarySelector`, `SimplexRegion`s for a `BoundaryMesh`) is built
 # against exactly *one* subdomain space: its parents live on that space's level-id block, so only that space's fields
 # ever evaluate on it (`_parent_range`). On a coupled problem the same `on=` target may legitimately be named by fields
 # on different subdomains — `boundary(axis=1, side=:upper)` is a face of every subdomain that has one — and those are
-# different sets of facets. The cache key is therefore the *pair* `(on, space)`, not the target alone.
+# different sets of facets. The cache key is therefore the *pair* `(on, space)`, not the target alone. A two-sided
+# interface list carries the parents of both its subdomains, so its key is `(iface, nothing)`, and the two kinds share
+# one cache (`Model.regions`) without ever sharing a key.
 #
 # A plain `Tuple` already gives each half the equality it deserves, because `Tuple` composes its elements' `isequal` /
 # `hash` elementwise:
@@ -505,6 +337,15 @@ end
 
 # ── Model and `prepare` ───────────────────────────────────────────────────────
 
+# One prepared subdomain of a model: its space, its integration plan and the moment-fit cache the plan was built on
+# (see `Model.subdomains`). The three are made together by `prepare`, one per distinct space, and every per-subdomain
+# reader wants them together, so they are one record rather than parallel vectors kept aligned by position.
+struct _Subdomain{D,T}
+    space::Space{D,T}
+    plan::IntegrationPlan{D,T}
+    fits::_MomentFitCache{D,T}
+end
+
 """
     Model{D,T,P}
 
@@ -531,18 +372,24 @@ value through. Fields:
     carry-over raises. Every in-place mutation that invalidates the assembled state then moves the pin on as well, so a
     solution taken before a [`move!`](@ref) or a mask flip raises as it always has. See `_discretisation_pin` for
     exactly what the digest reads and, just as importantly, what it must not.
-  - `space_plans::Vector{IntegrationPlan{D,T}}` — cached integration plan per *distinct* participating discretisation,
-    in the first-appearance order of `problem_spaces``(problem)`. A single-domain problem carries one plan; a
-    multi-domain (coupled) problem carries one per subdomain space, each built against that space's own physical fold.
-    Populated by `prepare` and refreshed by every mutator. The field-to-plan routing is intrinsic: each field owns the
-    regions on its space's level-id block (see `FieldLayout.level_ids` and `_parent_range`), so no per-plan routing
-    table is stored.
-  - `moment_fit_caches::Vector{_MomentFitCache{D,T}}` — one cut-region moment-fit rule cache per distinct participating
-    space, aligned with `space_plans`. Every mutator threads it back into `integration_plan`, so a cut region a `move!`
-    or a mask flip leaves bit-identical reuses its rule instead of being refitted — by far the dominant cost of a 3D
-    plan rebuild. A cache is keyed by `(region box, moment order)` and omits the geometry, on the reasoning that one
-    cache sees exactly one immutable [`PhysicalDomain`](@ref) for its whole life; that is what the guards on
-    [`adapted`](@ref)`(model, space)` enforce, and it is why there is nothing here to invalidate.
+  - `subdomains::Vector{_Subdomain{D,T}}` — one prepared record per *distinct* participating discretisation, in the
+    first-appearance order of `problem_spaces(problem)`: one on a single-domain problem, one per subdomain space on a
+    multi-domain (coupled) one. Populated by `prepare` and refreshed by every mutator. A record holds what is built
+    together for one subdomain and read together:
+
+      - `space` — the subdomain's space as prepared: folded against its own physical domain and reindexed into its own
+        block of level ids. It is the very object the effective `problem`'s fields over the subdomain hold (`===`), so
+        the per-subdomain consumers — the assembly passes, workspace and volume lookup, the reproducibility report —
+        read it here instead of recomputing `problem_spaces`.
+      - `plan` — the subdomain's cached [`IntegrationPlan`](@ref), built against that space's own physical fold. The
+        field-to-plan routing is intrinsic: each field owns the regions on its space's level-id block (see
+        `FieldLayout.level_ids` and `_parent_range`), so no per-plan routing table is stored.
+      - `fits` — the subdomain's cut-region moment-fit rule cache, which `plan` was built on. Every mutator threads it
+        back into `integration_plan`, so a cut region a `move!` or a mask flip leaves bit-identical reuses its rule
+        instead of being refitted — by far the dominant cost of a 3D plan rebuild. A cache is keyed by
+        `(region box, moment order)` and omits the geometry, on the reasoning that one cache sees exactly one immutable
+        [`PhysicalDomain`](@ref) for its whole life; that is what the guards on [`adapted`](@ref)`(model, space)`
+        enforce, and it is why there is nothing here to invalidate.
 
     Lineage, because a cache outlives the model that created it. A mutator (`move!`, `activate!`, `deactivate!`) keeps
     the model's own cache objects, since it overwrites the model rather than forking it. A non-mutating derivation
@@ -564,26 +411,32 @@ value through. Fields:
   - `rhs::Union{Nothing,Vector{T}}` — assembled right-hand side. Same invalidation contract as `matrix`.
   - `facet_resolver::FacetResolver{D,T}` — the model's single route from a boundary *face* to its
     [`FacetRegion`](@ref)s, and the memo of every face already resolved (see [`FacetResolver`](@ref)). It sits one level
-    below `facet_regions`: that cache keys whole `BoundarySelector`s, which are unions of faces, while this memo keys
-    the faces themselves, so a face two selectors both name is resolved once and shared. Every consumer resolves through
-    it — the per-selector cache below, the one-shot lookup for a selector no `prepare` saw, and the L² Dirichlet
-    projection, which the dof layer reaches through the resolver `prepare` hands `system_layout`. Replaced wholesale by
-    every mutator, which is also what retires the entries of the spaces the mutation left behind; a non-mutating
-    derivation (`adapted`, `elevated`, `moved`) gets its own fresh one rather than a copy, since the keys are spaces and
-    a derivation has new ones to resolve anyway.
-  - `facet_regions::Dict{RegionKey,Vector{FacetRegion{D,T}}}` — cache of physical-boundary [`FacetRegion`](@ref)s, keyed
-    by the `RegionKey` pair `(selector, space)`. One entry per `BoundarySelector` **per subdomain space** that names it,
-    whether through a Dirichlet condition or a `block`/`loadform` carrying `on::BoundarySelector`. The space is part of
-    the key because a region list lives on one space's level-id block: two subdomains naming a value-equal selector own
-    different facets and must not share an entry. Populated at `prepare` and refreshed by every mutator.
-  - `surface_regions::Dict{RegionKey,Vector{SimplexRegion{D,T}}}` — cache of immersed-boundary
-    [`SimplexRegion`](@ref)s, keyed the same way by `(mesh, space)`. One entry per [`BoundaryMesh`](@ref) per subdomain
-    space naming it through a `block`/`loadform` carrying `on::BoundaryMesh`. The mesh half of the key matches by object
-    identity (the `BoundaryMesh` value carries no canonical hash; identity match prevents two structurally-equal but
-    distinct meshes from accidentally sharing a cache entry).
-  - `interface_regions::IdDict{Any,Vector{SimplexRegion{D,T}}}` — per-interface cache of two-sided
-    [`SimplexRegion`](@ref)s. One entry per [`Interface`](@ref) referenced by a coupling `block` (`couple`'s four
-    blocks share one `Interface` object). Keyed by object identity, as for `surface_regions`.
+    below `regions`: that cache keys whole `BoundarySelector`s, which are unions of faces, while this memo keys the
+    faces themselves, so a face two selectors both name is resolved once and shared. Every consumer resolves through it
+    — the per-selector entries of `regions` below, the one-shot lookup for a selector no `prepare` saw, and the L²
+    Dirichlet projection, which the dof layer reaches through the resolver `prepare` hands `system_layout`. Replaced
+    wholesale by every mutator, which is also what retires the entries of the spaces the mutation left behind; a
+    non-mutating derivation (`adapted`, `elevated`, `moved`) gets its own fresh one rather than a copy, since the keys
+    are spaces and a derivation has new ones to resolve anyway.
+  - `regions::Dict{RegionKey,Vector}` — the region list of every `on=` target the problem names, resolved at `prepare`
+    and refreshed by every mutator. Each entry is keyed by the `RegionKey` its assembly pass carries:
+
+      - `(selector, space)` — the physical-boundary [`FacetRegion`](@ref)s of a [`BoundarySelector`](@ref), one entry
+        per selector **per subdomain space** that names it, whether through a Dirichlet condition or a
+        `block`/`loadform` carrying `on::BoundarySelector`. The space is part of the key because a region list lives on
+        one space's level-id block: two subdomains naming a value-equal selector own different facets and must not
+        share an entry. A selector whose faces hold no admissible region (an overlay-only mask emptying a face, say)
+        keeps an empty list, so "named, and empty" stays distinguishable from "never named".
+      - `(mesh, space)` — the immersed-boundary [`SimplexRegion`](@ref)s of a [`BoundaryMesh`](@ref), one entry per
+        mesh per subdomain space naming it through a `block`/`loadform` carrying `on::BoundaryMesh`.
+      - `(iface, nothing)` — the two-sided [`SimplexRegion`](@ref)s of a coupling [`Interface`](@ref), one entry per
+        interface a coupling `block` names (`couple`'s four blocks share one `Interface` object). There is no space half
+        because the regions carry the parents of both subdomains.
+
+    A selector matches by value; a mesh, an interface and a space match by object identity, so two structurally equal
+    but distinct meshes never share an entry. A value is a `Vector{FacetRegion{D,T}}` under a selector and a
+    `Vector{SimplexRegion{D,T}}` otherwise, and the per-kind counts of [`diagnostics`](@ref) and
+    [`nquadpoints`](@ref)`(model; kind)` select their entries by the type of the key's head.
   - `dirichlet_projections::Dict{Symbol,DirichletProjection{D,T}}` — per-field cache of the datum-independent half of
     the L² Dirichlet projection (see [`DirichletProjection`](@ref)). Empty at `prepare` and filled by the first
     [`update_dirichlet!`](@ref) on each field, which is the only path that re-projects an existing dof layout; every
@@ -608,15 +461,12 @@ mutable struct Model{D,T,P}
     problem::P
     prefold_space::Space{D,T}
     version::Int
-    space_plans::Vector{IntegrationPlan{D,T}}
-    moment_fit_caches::Vector{_MomentFitCache{D,T}}
+    subdomains::Vector{_Subdomain{D,T}}
     dofs::SystemLayout{D,T}
     matrix::Union{Nothing,SparseMatrixCSC{T,Int}}
     rhs::Union{Nothing,Vector{T}}
     facet_resolver::FacetResolver{D,T}
-    facet_regions::Dict{RegionKey,Vector{FacetRegion{D,T}}}
-    surface_regions::Dict{RegionKey,Vector{SimplexRegion{D,T}}}
-    interface_regions::IdDict{Any,Vector{SimplexRegion{D,T}}}
+    regions::Dict{RegionKey,Vector}
     dirichlet_projections::Dict{Symbol,DirichletProjection{D,T}}
     diagnostics::AssemblyDiagnostics
     assembly::AssemblyCache{T}
@@ -678,12 +528,13 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
     prune = get(plan_options, :prune, true)
     prune_exempt = get(plan_options, :prune_exempt, ())
     integration_options = Base.structdiff(plan_options, NamedTuple{(:prune, :prune_exempt)})
-    # One integration plan per distinct subdomain space, each sharing that space's own cell-classification cache. The
-    # moment-fit caches, unlike the classification ones, outlive this call: they are the model's, and every mutator
-    # hands them back so an unchanged cut region is not refitted. A handed-in vector is aligned with `problem_spaces`,
-    # so a length mismatch is a caller bug and is raised as one. Falling back to fresh caches here instead would turn it
-    # into a silent full refit — the exact cost the reuse exists to avoid, and invisible from the outside.
-    fit_caches = if reuse === nothing
+    # One prepared subdomain per distinct space: the space, its integration plan sharing the space's own
+    # cell-classification cache, and its moment-fit cache. The moment-fit caches, unlike the classification ones,
+    # outlive this call: they are the model's, and every mutator hands them back so an unchanged cut region is not
+    # refitted. A handed-in vector is aligned with `problem_spaces`, so a length mismatch is a caller bug and is raised
+    # as one. Falling back to fresh caches here instead would turn it into a silent full refit — the exact cost the
+    # reuse exists to avoid, and invisible from the outside.
+    fits = if reuse === nothing
         _MomentFitCache{D,T}[_MomentFitCache{D,T}() for _ in eachindex(spaces)]
     else
         length(reuse) == length(spaces) ||
@@ -691,9 +542,11 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
                                 "got $(length(reuse)) for $(length(spaces))"))
         reuse
     end
-    space_plans = IntegrationPlan{D,T}[integration_plan(spaces[i]; integration_options..., classify_cache=caches[i],
-                                                        moment_fit_cache=fit_caches[i]) for i in eachindex(spaces)]
-    # The facet resolver is built before the dof layout, not after the region caches, because the layout's Dirichlet
+    subdomains = _Subdomain{D,T}[_Subdomain{D,T}(spaces[i],
+                                                 integration_plan(spaces[i]; integration_options...,
+                                                                  classify_cache=caches[i], moment_fit_cache=fits[i]),
+                                                 fits[i]) for i in eachindex(spaces)]
+    # The facet resolver is built before the dof layout, not after the region cache, because the layout's Dirichlet
     # projection resolves faces too: it is the first consumer, and handing it the model's resolver is what makes the
     # projection and the operator integrate the same facet by construction rather than by two call sites agreeing.
     #
@@ -705,25 +558,30 @@ function _prepared_model(problem::Problem{D,T}, plan_options::NamedTuple,
     classify_caches = IdDict{Space,_ClassifyCache{D,T}}(zip(spaces, caches))
     layout, trace_factors, unsupported = _system_layout(effective_problem; tolerance, prune, prune_exempt,
                                                         classify_caches, facets=facet_resolver)
-    facet_regions = _resolve_facet_regions(effective_problem, facet_resolver)
-    surface_regions = _resolve_surface_regions(effective_problem, tolerance)
-    interface_regions = _resolve_interface_regions(effective_problem, layout)
-    facet_stats = _kind_stats(region for list in values(facet_regions) for region in list)
-    diag = AssemblyDiagnostics(dimension=D, active_unknowns=active_unknowns(layout),
+    # The region list of every `on=` target the problem names, each resolved once however often it is named. The facet
+    # lists come after the layout, so every face a nonzero Dirichlet datum projected onto is read from the resolver's
+    # memo here rather than resolved again.
+    regions = Dict{RegionKey,Vector}()
+    for key in _referenced_targets(effective_problem)
+        haskey(regions, key) || (regions[key] = _resolve_target(key..., effective_problem, layout, facet_resolver))
+    end
+    facets = _kind_stats_of(_cached_lists(regions, BoundarySelector))
+    diag = AssemblyDiagnostics(; dimension=D, active_unknowns=active_unknowns(layout),
+                               facet_region_count=_region_count(regions, BoundarySelector),
+                               cut_facet_region_count=facets.trimmed, facet_fit_failure_count=facets.failed,
+                               facet_cut_fallback_count=facets.fallbacks,
+                               facet_moment_fit_residual_max=facets.residual_max,
+                               min_relative_facet_measure=facets.min_relative_measure,
+                               dirichlet_trace_factors=trace_factors,
+                               unsupported_dirichlet_dof_count=length(unsupported),
+                               unsupported_dirichlet_dofs=unsupported,
+                               surface_region_count=_region_count(regions, BoundaryMesh),
+                               interface_region_count=_region_count(regions, Interface),
+                               _plan_stats(s.plan for s in subdomains)...,
                                inactive_cell_counts=_inactive_cell_counts(spaces),
-                               reduced_mode_counts=_reduced_mode_counts(layout),
-                               facet_region_count=_region_count(facet_regions),
-                               cut_facet_region_count=facet_stats.trimmed, facet_fit_failure_count=facet_stats.failed,
-                               facet_cut_fallback_count=facet_stats.fallbacks,
-                               facet_moment_fit_residual_max=facet_stats.residual_max,
-                               min_relative_facet_measure=facet_stats.min_relative_measure,
-                               surface_region_count=_region_count(surface_regions),
-                               interface_region_count=_region_count(interface_regions))
-    _set_plan_stats_multi!(diag, space_plans)
-    _set_dirichlet_trace_stats!(diag, trace_factors, unsupported)
+                               reduced_mode_counts=_reduced_mode_counts(layout))
     return Model{D,T,typeof(effective_problem)}(effective_problem, problem.space, _discretisation_pin(spaces, layout),
-                                                space_plans, fit_caches, layout, nothing, nothing, facet_resolver,
-                                                facet_regions, surface_regions, interface_regions,
+                                                subdomains, layout, nothing, nothing, facet_resolver, regions,
                                                 Dict{Symbol,DirichletProjection{D,T}}(), diag,
                                                 AssemblyCache{T}(point_base), plan_options)
 end
@@ -749,22 +607,17 @@ function _prepare_spaces(problem::Problem{D,T}) where {D,T}
         remap[V] = reindexed
         offset += level_count(reindexed)
     end
-    new_fields = map(f -> field(f.name, remap[f.space]; components=component_count(f)), problem.fields)
-    effective = Problem(new_fields; blocks=problem.blocks, loads=problem.loads, dirichlet=problem.dirichlet,
-                        symmetric=problem.symmetric)
-    return effective, prepared, caches
+    return _rehome(problem, V -> remap[V]), prepared, caches
 end
 
-# All levels across every distinct participating space, concatenated in `problem_spaces` order. Because `prepare`
-# reindexes each space's level ids into a disjoint block, the concatenation has globally-unique, contiguous ids `1:N` —
-# exactly what the assembly workspace's flat level-id banks and each field's dof layout agree on. For a single-domain
-# problem this is just the one space's levels.
-function _problem_levels(problem::Problem)
-    levels = Any[]
-    for V in problem_spaces(problem)
-        append!(levels, V.levels)
-    end
-    return levels
+# `problem` with every field re-homed onto `space_of(field.space)`: the same names, components, forms, Dirichlet data
+# and symmetry flag over other spaces. `_prepare_spaces` re-homes onto the prepared spaces, and `_derived` rebuilds a
+# model's problem over a derived (adapted / elevated / moved / remasked / enriched) space, which `_prepare_spaces` then
+# folds and reindexes like any other.
+function _rehome(problem::Problem, space_of)
+    fields = map(f -> field(f.name, space_of(f.space); components=component_count(f)), problem.fields)
+    return Problem(fields; blocks=problem.blocks, loads=problem.loads, dirichlet=problem.dirichlet,
+                   symmetric=problem.symmetric)
 end
 
 # ── Dof layouts ───────────────────────────────────────────────────────────────
@@ -886,7 +739,7 @@ system_layout(problem::Problem; kwargs...) = first(_system_layout(problem; kwarg
 
 # `system_layout`, plus the Dirichlet trace-solve verdicts of the projections it built:
 # `(layout, factors, unsupported)`, with `factors` per field per component and `unsupported` per field, component and
-# raw, in that order — which is what `diagnostics` reports and what `_set_dirichlet_trace_stats!` installs. Each
+# raw, in that order — which is what `diagnostics` reports and what the diagnostics record holds. Each
 # projection is read (`_append_trace_stats!`) as soon as its field is laid out and then dropped, so the layout is built
 # with at most one projection alive, and the model `prepare` returns keeps none of them: `model.dirichlet_projections`
 # is filled by `update_dirichlet!` alone.
@@ -927,7 +780,11 @@ end
 
 # Pick out the Dirichlet conditions that apply to the field called `name` from a problem's `dirichlet` list: every
 # unscoped condition (`condition.field === nothing`) applies to the only field of a single-field problem and raises on
-# multi-field problems; named conditions match by name.
+# multi-field problems; named conditions match by name. An `Any[]`, which the projection reads as such.
+#
+# A plain loop rather than a filtered comprehension: over the abstractly typed condition vector the comprehension's
+# filter and generator are built and boxed at run time, two allocations more per field on every `update_dirichlet!`
+# (51 against 49 on a cached load increment of a 2D overlay model).
 function _dirichlet_for_field(problem::Problem, name::Symbol)
     scoped = Any[]
     for condition in problem.dirichlet
@@ -941,97 +798,58 @@ function _dirichlet_for_field(problem::Problem, name::Symbol)
     return scoped
 end
 
+# Append one field's L² Dirichlet trace-solve verdicts to `factors` and `unsupported`, in component order: the branch
+# each component's solve took (`_trace_branch` of its factor) and an `UnsupportedDirichletDof` record for each dof that
+# solve left undetermined. `projection` is the one the field's data were just projected through, or `nothing` for a
+# field whose data are homogeneous — `prepare` skips the projection for those, so every component reads `:none` and
+# nothing is unsupported.
+#
+# Read off the projection because that is where the verdicts live and nowhere else: the dof layout keeps no copy of
+# them, and `prepare` drops each projection it builds as soon as this has read it, so the model it returns holds none.
+# `update_dirichlet!` reads the ones it caches the same way. The unsupported dofs are self-describing records rather
+# than a flattened vector: the list is empty on every untrimmed boundary, so there is no position worth counting from.
+function _append_trace_stats!(factors::Vector{Symbol}, unsupported::Vector{UnsupportedDirichletDof}, name::Symbol,
+                              projection, components::Integer)
+    for c in 1:components
+        push!(factors, projection === nothing ? :none : _trace_branch(projection.factors[c]))
+        projection === nothing && continue
+        append!(unsupported, (UnsupportedDirichletDof(name, c, raw) for raw in projection.unsupported[c]))
+    end
+    return factors, unsupported
+end
+
 # ── Region caches ─────────────────────────────────────────────────────────────
 
-# Build the facet-region cache for a problem from every *site* that references a `BoundarySelector`: Dirichlet
-# conditions and any block/load carrying `on::BoundarySelector`. Each site contributes the pair (selector, the space of
-# the field naming it), and each distinct pair is resolved through `_facet_regions_for_selector` and stored, so two
-# subdomains naming a value-equal selector get two entries, their own facets each. Pairs without any admissible regions
-# (e.g. an overlay-only level mask emptying a face) end up with an empty list, not absent — callers can distinguish
-# "selector with no regions" from "selector never referenced".
+# Every `on=` target `prepare` resolves a region list for, as the `RegionKey` its assembly pass will look up: each
+# Dirichlet condition's selector on the space it constrains, then each block's and load's `on` — a `BoundarySelector`
+# or a `BoundaryMesh` on the space of the form's test field, an `Interface` on `nothing`, since its regions span both
+# its subdomains. A target named several times is yielded as often; `prepare` resolves it once. A form with
+# `on === nothing` integrates over its subdomain's plan, which `prepare` builds per subdomain rather than per form, and
+# any other `on` is left to assembly, which raises on it. A condition with `field === nothing` (only legal on a
+# single-field problem) lands on that problem's one space.
+function _referenced_targets(problem::Problem)
+    return Iterators.flatten((((c.boundary, c.field === nothing ? problem.space : _field_space(problem, c.field))
+                               for c in problem.dirichlet),
+                              ((f.on, f.on isa Interface ? nothing : _field_space(problem, f.test_name))
+                               for f in (problem.blocks..., problem.loads...)
+                               if f.on isa Union{BoundarySelector,BoundaryMesh,Interface})))
+end
+
+# The regions of one `on=` target on space `V`: how `prepare` fills `Model.regions`, and how assembly resolves a target
+# `prepare` never saw (`_regions` in `assembly.jl`), so the two cannot build a target differently.
 #
-# `facets` is the model's [`FacetResolver`](@ref), so a face two *different* selectors both name is resolved once and
-# its `FacetRegion`s are shared between their vectors rather than built twice. Because the resolver is the model's and
-# not a throw-away of this sweep, the sharing also reaches outside it in both directions: `system_layout` has already
-# run, so every face carrying a nonzero Dirichlet datum is read from the memo here rather than resolved a second time,
-# and the one-shot lookup for a selector no `prepare` saw reads the same entries later.
-function _resolve_facet_regions(problem::Problem{D,T}, facets::FacetResolver{D,T}) where {D,T}
-    regions = Dict{RegionKey,Vector{FacetRegion{D,T}}}()
-    for (selector, space) in _referenced_facet_sites(problem)
-        key = (selector, space)
-        haskey(regions, key) && continue
-        regions[key] = _facet_regions_for_selector(space, selector, facets)
-    end
-    return regions
-end
-
-# Yields every (selector, space) *site* referenced in `problem`: one entry per Dirichlet condition and per block/load
-# carrying `on::BoundarySelector`, paired with the space of the field that names it. A condition with
-# `field === nothing` (only legal on a single-field problem) and a form on a single-domain problem both land on the one
-# representative space, which is that problem's only one.
-function _referenced_facet_sites(problem::Problem)
-    return Iterators.flatten((((c.boundary, _condition_space(problem, c)) for c in problem.dirichlet),
-                              ((b.on, _field_space(problem, b.test_name))
-                               for b in problem.blocks if b.on isa BoundarySelector),
-                              ((l.on, _field_space(problem, l.test_name))
-                               for l in problem.loads if l.on isa BoundarySelector)))
-end
-
-# The subdomain space a Dirichlet condition constrains. `field === nothing` is only reachable on a single-field problem
-# (the multi-field constructors demand a name), where the representative space *is* that field's space.
-function _condition_space(problem::Problem, condition)
-    condition.field === nothing ? problem.space : _field_space(problem, condition.field)
-end
-
-# Build the surface-region cache for a problem from every (mesh, space) site referenced by a block or load's `on` tag,
-# keyed like the facet cache — the mesh half of the key by object identity (a `BoundaryMesh` value carries no canonical
-# hash, and identity match prevents two structurally-equal but distinct meshes from accidentally sharing an entry), the
-# space half likewise. One mesh named by fields on two subdomains yields two entries, each cut against its own grid; a
-# genuine *two-sided* coupling across a mesh is an [`Interface`](@ref), which carries both sides in one region.
-function _resolve_surface_regions(problem::Problem{D,T}, tolerance::GeometryTolerance{T}) where {D,T}
-    regions = Dict{RegionKey,Vector{SimplexRegion{D,T}}}()
-    for (mesh, space) in _referenced_boundary_mesh_sites(problem)
-        key = (mesh, space)
-        haskey(regions, key) && continue
-        regions[key] = _surface_regions_for_mesh(space, mesh, tolerance)
-    end
-    return regions
-end
-
-function _referenced_boundary_mesh_sites(problem::Problem)
-    return Iterators.flatten((((b.on, _field_space(problem, b.test_name))
-                               for b in problem.blocks if b.on isa BoundaryMesh),
-                              ((l.on, _field_space(problem, l.test_name))
-                               for l in problem.loads if l.on isa BoundaryMesh)))
-end
-
-# Build the interface-region cache for a problem from every `Interface` referenced by a coupling block's `on` tag (the
-# four blocks a `couple` call emits share one `Interface` object → one cache entry), each built by
-# `_interface_regions(iface, problem, layout)` exactly as a one-shot interface is: field indices from the dof `layout`
-# (global field order), the two subdomain spaces from the effective problem's fields, and the two-sided regions by
-# subdividing the interface mesh against the merged trace of both grids. Keyed by `IdDict` (object identity), as for the
-# surface cache.
-function _resolve_interface_regions(problem::Problem{D,T}, layout::SystemLayout{D,T}) where {D,T}
-    regions = IdDict{Any,Vector{SimplexRegion{D,T}}}()
-    for iface in _referenced_interfaces(problem)
-        haskey(regions, iface) || (regions[iface] = _interface_regions(iface, problem, layout))
-    end
-    return regions
-end
-
-function _referenced_interfaces(problem::Problem)
-    return Iterators.flatten(((b.on for b in problem.blocks if b.on isa Interface),
-                              (l.on for l in problem.loads if l.on isa Interface)))
-end
-
-# Total number of cached regions across a per-selector / per-mesh / per-interface region cache. Sums the list lengths of
-# the facet, surface, or interface caches; used for the diagnostics `facet_region_count` / `surface_region_count` /
-# `interface_region_count` fields.
-_region_count(regions::AbstractDict) = sum(length, values(regions); init=0)
+#   - A selector is the union of its faces' `FacetRegion`s (`_facet_regions_for_selector`), resolved through the model's
+#     `FacetResolver`: a face another selector or the Dirichlet projection already resolved is shared, not rebuilt.
+#   - A mesh is cut against `V`'s grid at the layout's tolerance. One mesh named by fields on two subdomains is two
+#     targets, each cut against its own grid; a genuine *two-sided* coupling across a mesh is an `Interface`.
+#   - An interface is cut against the merged grid lines of both its subdomains (`_interface_regions`), with the coupled
+#     fields' indices from the layout, which is why it reads the problem and the layout and ignores `V`.
+_resolve_target(selector::BoundarySelector, V, _, _, facets) = _facet_regions_for_selector(V, selector, facets)
+_resolve_target(mesh::BoundaryMesh, V, _, layout, _) = _surface_regions_for_mesh(V, mesh, layout.tolerance)
+_resolve_target(iface::Interface, _, problem, layout, _) = _interface_regions(iface, problem, layout)
 
 # Resolve one selector into its full list of `FacetRegion`s (the union of regions across every facet the selector
-# covers). Used by `_resolve_facet_regions` and reused by consumers that need to look up a selector that was not
-# pre-resolved at `prepare` time.
+# covers): the facet case of `_resolve_target`.
 #
 # The union is assembled face by face through `facets` (see [`FacetResolver`](@ref)), so a face already resolved on `V`
 # — by this selector or by any other selector sharing it — contributes the regions it resolved to rather than a second
@@ -1043,6 +861,125 @@ function _facet_regions_for_selector(V::Space{D,T}, selector::BoundarySelector, 
         append!(regions, _resolve_face(facets, V, sides))
     end
     return regions
+end
+
+# The cached region lists of one kind of target, `K` the type of their key's head: `BoundarySelector` for the facet
+# lists, `BoundaryMesh` for the surface lists, `Interface` for the interface lists. The per-kind diagnostics and
+# `nquadpoints(model; kind)` read the cache through this, and `_region_count` sums the lists' lengths, so a region two
+# targets share is counted once per target.
+_cached_lists(regions::AbstractDict, ::Type{K}) where {K} = (list for (key, list) in regions if first(key) isa K)
+_region_count(regions::AbstractDict, ::Type{K}) where {K} = sum(length, _cached_lists(regions, K); init=0)
+
+# ── Diagnostics `prepare` records ─────────────────────────────────────────────
+
+# `_kind_stats` over several region lists: the statistics of their concatenation, read one list at a time. Each list is
+# its own call, a function barrier, so the lists of the model's region cache — whose values are typed only `Vector` —
+# are each walked with their concrete region type rather than dispatching on every region.
+function _kind_stats_of(lists)
+    foldl((stats, regions) -> _kind_stats(regions, stats)::typeof(_NO_KIND_STATS), lists; init=_NO_KIND_STATS)
+end
+
+# Everything the diagnostics report about the rules of a region list, read off the regions' `kind`s and returned as
+# `(cut, trimmed, failed, fallbacks, fallback_points, residual_max, min_relative_measure)`. The plan statistics and the
+# facet statistics both compose from it; the two count "cut" differently, and both counts are here:
+#
+#   - `cut` — the regions `∂Ω` crosses (`_CUT_KINDS`), the volume plan's `cut_region_count`. `:cut_fitted` are
+#     successful fits; `:cut_fallback` (the raw Saye volume rule), `:cut_failed` (empty Ω ∩ box at α = 0) and
+#     `:cut_alpha_failed` (the same at α > 0) all failed to fit, and are `failed` (`_FAILED_KINDS`) too — so
+#     `fit_failure_count` keeps meaning "the moment fit did not succeed" whichever rule the region ended up carrying.
+#     `:cut_custom` — a region integrated by the domain's own `cut_quadrature` rule instead of the fit (see
+#     `PhysicalDomain`) — is a cut region but never a fit failure: no fit ran, so there is nothing for the
+#     residual-based counter to report. A custom rule that wants to be counted as a failure says so by returning
+#     `status === :empty`, which lands the region in `:cut_failed` / `:cut_alpha_failed` instead.
+#   - `trimmed` — every region that is not `:full`, the facet statistics' `cut_facet_region_count`: a face part of whose
+#     area falls outside Ω, `:fictitious*` faces included.
+#   - `fallbacks` and `fallback_points` — the `:cut_fallback` regions and their quadrature points. That is the assembly
+#     cost of the safety net, and the number a caller should watch: it is bounded only by the volume rule's own point
+#     count, not by nbasis.
+#   - `residual_max` and `min_relative_measure` — over the `trimmed` regions, the largest moment-fit residual and the
+#     smallest fraction of a region's own measure its rule integrates (`_region_measure`). A list that trims nothing
+#     reports 0 and exactly 1 rather than a Gauss weight sum's last bit.
+#
+# Reading the kind rather than re-deriving a test from the rule is what makes the facet counts as sharp as the
+# classifier behind the kind and no sharper — `FacetRegion`'s docstring states what that sharpness does and does not
+# see — and independent of the rule itself, which is no longer a plain tensor product exactly on the faces it reports.
+#
+# Why the facet count is worth reporting at all (`trimmed`, summed over every cached selector, so a region two selectors
+# share is counted once per selector, exactly as `facet_region_count` is). The grid-aligned facet *partition* is
+# level-set-blind: `_boundary_facet_regions` selects its contributing levels with `_level_side_is_physical` — pure
+# mesh-edge versus domain-edge geometry — and partitions the face over `_side_cells`. A `FacetRegion` is therefore the
+# *whole* grid-aligned face of its parent cells, and where that face leaves Ω the rule on it is the moment fit on the
+# facet's affine slice of Ω rather than an exact tensor product. Every consumer of a facet region inherits that: the L²
+# Dirichlet mass and right-hand side, a Neumann / Robin / Nitsche term placed with `on = boundary(…)`, and
+# `boundary_integral`. That fit is machine-exact where every restricted leaf is affine (planar) and accurate rather than
+# exact on a curved cut (`boundary`'s docstring states the condition), so the count says how much of a model's boundary
+# integration rests on a fitted rule, and `residual_max` says how well those fits reproduced the moments they were
+# given, not how right those moments were.
+#
+# The classification is of the region's own *face*, not of its parent cells, and the distinction is not academic: a cut
+# cell can have a face lying wholly inside Ω, and no trimming is needed there. Classifying the cells would make the
+# number a loose upper bound — on the space-time cavity example at `SC_CELLS = 3` it reads 61 of 81 against a true 1,
+# because the growing cavity cuts nearly every cell while touching only the `t = 0` and `t = T` faces.
+#
+# `stats` is where the counts start from: the statistics of the lists already read, so that `_kind_stats_of` can carry
+# them from one list into the next.
+function _kind_stats(regions, stats=_NO_KIND_STATS)
+    (; cut, trimmed, failed, fallbacks, fallback_points, residual_max, min_relative_measure) = stats
+    for region in regions
+        kind = region.kind
+        kind === :full && continue
+        trimmed += 1
+        cut += kind in _CUT_KINDS
+        failed += kind in _FAILED_KINDS
+        if kind === :cut_fallback
+            fallbacks += 1
+            fallback_points += length(region.weights)
+        end
+        residual_max = max(residual_max, Float64(region.residual))
+        relative = _region_jacobian(region) * sum(region.weights) / _region_measure(region)
+        min_relative_measure = min(min_relative_measure, Float64(relative))
+    end
+    return (; cut, trimmed, failed, fallbacks, fallback_points, residual_max, min_relative_measure)
+end
+const _NO_KIND_STATS = (; cut=0, trimmed=0, failed=0, fallbacks=0, fallback_points=0, residual_max=0.0,
+                        min_relative_measure=1.0)
+
+# The integration plans' half of the diagnostics, over every subdomain's plan, under the record's own field names. The
+# aggregation is the identity on a single-domain problem: region and small-overlap counts sum, the minimum volumes take
+# the global minimum, the moment-fit residual the global maximum of each plan's own (NaN-ignoring) one, and the cut
+# statistics are `_kind_stats` over every plan's regions. The small-overlap records are concatenated, so every
+# subdomain's offending regions are reported, and widened to `Float64`: a plan carries them in the model's scalar type
+# `T`, and the record is `T`-agnostic. `plans` must be non-empty.
+function _plan_stats(plans)
+    kinds = _kind_stats_of(p.regions for p in plans)
+    small = SmallOverlap{Float64}[SmallOverlap{Float64}(r.region, Float64(r.volume), Float64(r.relative_volume),
+                                                        r.cover_count) for p in plans for r in p.small_overlaps]
+    return (; integration_regions=sum(p -> length(p.regions), plans), small_overlap_count=length(small),
+            small_overlaps=small, min_integration_volume=minimum(p -> Float64(p.min_volume), plans),
+            min_relative_integration_volume=minimum(p -> Float64(p.min_relative_volume), plans),
+            cut_region_count=kinds.cut, fit_failure_count=kinds.failed,
+            moment_fit_residual_max=maximum(p -> p.moment_fit_residual_max, plans; init=0.0),
+            cut_fallback_count=kinds.fallbacks, cut_fallback_points=kinds.fallback_points)
+end
+
+# Per-level count of cells deactivated by a `LevelMask` (mask and fictitious fold combined), across every distinct
+# subdomain space in `problem_spaces` order — the same order the reindexed global level ids run. One entry per level,
+# `0` for an unmasked level. Reported by `diagnostics` so the user can see how many cells each level dropped.
+function _inactive_cell_counts(spaces)
+    return Int[level.mask === nothing ? 0 : count(!, level.mask) for V in spaces for level in V.levels]
+end
+
+# Per-level count of raws eliminated by covered-mode pruning (`:coverage` or `:dedup`), one entry per id of each field's
+# level block, concatenated in field order. That is the per-*field* granularity the `reduced_mode_counts` docstring
+# states, not the per-space one `_inactive_cell_counts` walks, so the two vectors line up entry-for-entry only when each
+# space carries one field. Pruning reads the space alone — never a field's components or Dirichlet data — so two fields
+# over one space report the same counts, once each.
+#
+# Each level's raws are one range of the layout (`level_raws`), so a level is counted from its own elimination sources
+# without a pass over every raw.
+function _reduced_mode_counts(layout::SystemLayout)
+    return Int[count(s -> s === :coverage || s === :dedup, view(f.dofs.elimination_source, f.dofs.level_raws[id]))
+               for f in layout.fields for id in f.level_ids]
 end
 
 # ── Discretisation pin ────────────────────────────────────────────────────────
@@ -1063,8 +1000,10 @@ end
 #
 # WHAT GOES IN — everything the active dof numbering is a function of:
 #
-#   * per level, in order: id, role, mode, basis family name, the mesh's corner bits and cell counts, the activation
-#     mask's bits, and the order field's palette, class map and nominal;
+#   * per level, as one tuple: id, role, mode, basis family name, the mesh's corner bits and cell counts, the activation
+#     mask's bits, and the order field's palette, class map and nominal. An absent mask or class map — every cell
+#     active, one order for every cell — is digested as `-1`, where an array's digest starts with its shape, so a
+#     uniform unmasked level costs no per-cell rounds however many cells it has;
 #   * per field: name, component count, offset, raw and active dof counts, and the `(raw, component) -> active id` map
 #     itself — which is precisely the numbering a coefficient vector indexes into, and the only thing that separates two
 #     models differing solely in *which* dofs a Dirichlet condition constrains rather than how many;
@@ -1116,17 +1055,11 @@ function _discretisation_pin(spaces, layout::SystemLayout)
     for V in spaces
         h = _pin(h, level_count(V))
         for level in V.levels
-            h = _pin(h, level.id)
-            h = _pin(h, level.role)
-            h = _pin(h, level.mode)
-            h = _pin(h, basis_name(level.basis))
-            h = _pin(h, level.mesh.domain.lower)
-            h = _pin(h, level.mesh.domain.upper)
-            h = _pin(h, level.mesh.cells)
-            h = level.mask === nothing ? _pin(h, -1) : _pin(h, level.mask.on)
-            h = _pin(h, level.orders.palette)
-            h = _pin(h, level.orders.class)
-            h = _pin(h, level.orders.nominal)
+            o = level.orders
+            h = _pin(h,
+                     (level.id, level.role, _mode(level.basis), basis_name(level.basis), level.mesh.domain.lower,
+                      level.mesh.domain.upper, level.mesh.cells, something(level.mask, -1), o.palette,
+                      something(o.class, -1), o.nominal))
         end
     end
     for f in layout.fields
@@ -1147,60 +1080,55 @@ function Base.show(io::IO, model::Model{D}) where {D}
           ", regions=", diagnostics(model).integration_regions, ", assembled=", model.matrix !== nothing, ")")
 end
 
-# Condition-number estimator for small assembled matrices. Returns `NaN` above `max_size` since `cond(Matrix(sparse))`
-# densifies the matrix and is only viable up to a few hundred unknowns. The 256 cap keeps the diagnostic free for unit
-# tests and small examples while never silently dominating real-problem assembly cost.
-function _condition_estimate(matrix::SparseMatrixCSC; max_size::Int=256)
-    n = size(matrix, 1)
-    n == 0 && return NaN
-    n > max_size && return NaN
-    return Float64(cond(Matrix(matrix)))
-end
-
-# The same estimator on the symmetrically diagonal-scaled operator `D⁻¹ A D⁻¹` with `D = diag(√|A_ii|)` — what a
-# Jacobi-preconditioned solver sees, and the half of the conditioning question that is about the basis rather than about
-# the scale spread of the diagonal.
+# Condition-number estimates of a small assembled matrix, `(plain, scaled)`: `cond(A)`, and the same on the
+# symmetrically diagonal-scaled operator `D⁻¹ A D⁻¹` with `D = diag(√|A_ii|)`. Both are `NaN` for an empty matrix and
+# above `max_size`, since `cond` needs the dense matrix and is only viable up to a few hundred unknowns: the 256 cap
+# keeps the diagnostic free for unit tests and small examples while never silently dominating real-problem assembly
+# cost. The matrix is densified once for both (`cond` copies its argument, so the scaling below reads the original).
 #
-# On an immersed system those two halves are far apart and the distinction is not academic: a basis function whose
-# support is almost entirely fictitious carries an almost-zero diagonal, which inflates `cond(A)` by the spread of that
-# diagonal alone. Scaling removes exactly that, and what remains measures whether the surviving functions are
-# near-dependent on Ω. `AssemblyDiagnostics` documents the measured gap between the two shipped families.
+# The scaled operator is what a Jacobi-preconditioned solver sees, and the half of the conditioning question that is
+# about the basis rather than about the scale spread of the diagonal. On an immersed system those two halves are far
+# apart and the distinction is not academic: a basis function whose support is almost entirely fictitious carries an
+# almost-zero diagonal, which inflates `cond(A)` by the spread of that diagonal alone. Scaling removes exactly that, and
+# what remains measures whether the surviving functions are near-dependent on Ω. `AssemblyDiagnostics` documents the
+# measured gap between the two shipped families.
 #
 # It is also the *accurate* computation of the two on such a system. The unscaled matrix's smallest eigenvalue can sit
 # below `λ_max · eps`, where a dense eigensolver returns roundoff — including a negative value on an operator that is
-# positive definite — while the scaled matrix resolves the same mode comfortably. A `NaN` here means a zero diagonal
-# entry, which is a dof carrying no energy at all rather than a conditioning verdict.
-function _scaled_condition_estimate(matrix::SparseMatrixCSC; max_size::Int=256)
+# positive definite — while the scaled matrix resolves the same mode comfortably. A scaled `NaN` beside a finite plain
+# estimate means a zero diagonal entry, which is a dof carrying no energy at all rather than a conditioning verdict.
+function _condition_estimates(matrix::SparseMatrixCSC; max_size::Int=256)
     n = size(matrix, 1)
-    n == 0 && return NaN
-    n > max_size && return NaN
+    (n == 0 || n > max_size) && return NaN, NaN
     dense = Matrix(matrix)
+    plain = Float64(cond(dense))
     scale = [sqrt(abs(dense[i, i])) for i in 1:n]
-    any(iszero, scale) && return NaN
+    any(iszero, scale) && return plain, NaN
     for j in 1:n, i in 1:n
         dense[i, j] /= scale[i] * scale[j]
     end
-    return Float64(cond(dense))
+    return plain, Float64(cond(dense))
 end
 
 """
     integration_plan(model::Model) -> IntegrationPlan
 
-The **first** subdomain's cached integration plan (`first(model.space_plans)`). Plans are built by [`prepare`](@ref) and
-refreshed by [`move!`](@ref) / [`activate!`](@ref) / [`deactivate!`](@ref), so once a model is prepared every assembly
-call uses the same plan the dof layout was built against. For a single-domain model this is *the* plan; a coupled model
-holds one plan per subdomain — use [`integration_plans`](@ref) to reach all of them.
+The **first** subdomain's cached integration plan (`first(model.subdomains).plan`). Plans are built by
+[`prepare`](@ref) and refreshed by [`move!`](@ref) / [`activate!`](@ref) / [`deactivate!`](@ref), so once a model is
+prepared every assembly call uses the same plan the dof layout was built against. For a single-domain model this is
+*the* plan; a coupled model holds one plan per subdomain — use [`integration_plans`](@ref) to reach all of them.
 """
-integration_plan(model::Model) = first(model.space_plans)
+integration_plan(model::Model) = first(model.subdomains).plan
 
 """
     integration_plans(model::Model) -> Vector{IntegrationPlan}
 
-Every subdomain's cached [`IntegrationPlan`](@ref), in `problem_spaces` order. The assembly volume pass iterates these;
-each region is owned by the fields on its subdomain intrinsically (`_parent_range` via `FieldLayout.level_ids`). For a
-single-domain model this is a one-element vector whose only element is what [`integration_plan`](@ref) returns.
+Every subdomain's cached [`IntegrationPlan`](@ref), in `problem_spaces` order, read off `model.subdomains` into a fresh
+vector (the plans in it are the model's own). The assembly volume pass integrates over these; each region is owned by
+the fields on its subdomain intrinsically (`_parent_range` via `FieldLayout.level_ids`). For a single-domain model this
+is a one-element vector whose only element is what [`integration_plan`](@ref) returns.
 """
-integration_plans(model::Model) = model.space_plans
+integration_plans(model::Model) = [s.plan for s in model.subdomains]
 
 """
     dof_layout(model::Model) -> SystemLayout
@@ -1220,19 +1148,50 @@ active_unknowns(model::Model) = active_unknowns(model.dofs)
 
 # ── Model mutation ────────────────────────────────────────────────────────────
 
+"""
+    move!(model; level, to) -> Model
+
+Move overlay `level` of a prepared `model` to box `to` in place, rebuilding its integration plan (reusing the
+`tolerance`/`criterion` captured at [`prepare`](@ref)) and dof layout, and invalidating any assembled operators. The
+base level (level 1) cannot be moved.
+
+`move!` overwrites the old state; to transfer a solution onto the moved configuration, use [`moved`](@ref) to build a
+separate target model and then [`transfer`](@ref).
+
+Invalidation contract — the one the sibling mutators [`activate!`](@ref) and [`deactivate!`](@ref) mirror. `move!`
+
+  - bumps `model.version`, so an outstanding [`Solution`](@ref) raises on reuse;
+  - clears `model.matrix` and `model.rhs`, and replaces the assembly cache `model.assembly` (region lists, sparsity
+    patterns, pooled scratch);
+  - empties the Dirichlet projection cache, whose unknown sets and boundary mass belong to the dof layout being
+    replaced;
+  - rebuilds `model.prefold_space` at the new box, the subdomain record (the folded space and its integration plan),
+    the dof layout, and the region cache `model.regions`;
+  - installs a fresh [`AssemblyDiagnostics`](@ref) record (a reference taken before the move keeps reporting the old
+    state).
+
+The cut-cell moment-fit cache is deliberately *not* invalidated: it is keyed by region bounds and moment order, so a cut
+region the move leaves unchanged reuses its rule instead of being refitted. A mutator keeps the model's own cache
+objects — it overwrites the model rather than forking it, so no sibling model can lose rules to it — and the plan build
+bounds them to the boxes the new configuration cuts, so a sweep of many moves costs one plan's rules and not the
+sweep's.
+"""
+function move!(model::Model{D,T}; level::Integer, to::AxisBox{D,T}) where {D,T}
+    _assert_single_domain(model, "move!")
+    return _remodel!(model, _moved_prefold_space(model, level, to))
+end
+
 # Guard the positional-level mutators (`move!`, `activate!`, `deactivate!`) against multi-domain models. Those mutators
 # address a level by its position in the single `model.problem.space`, which is ambiguous once a problem spans several
 # subdomain spaces; supporting per-subdomain mutation is deferred. A single-domain model passes through silently. The
 # derivations, the estimator, `L2Projection` and `QuadField`, which read that one space as the whole discretisation,
 # refuse through the same guard.
 #
-# Single-domain means that every field lives on the first field's space, compared by identity as `problem_spaces`
-# deduplicates spaces, which is `length(problem_spaces(problem)) == 1` without building that vector: the guard runs on
-# every `L2Projection` transfer, twice, and on every `QuadField`, where building the vector allocated on every call.
+# Single-domain means one prepared subdomain: every field lives on one space, compared by identity as `problem_spaces`
+# deduplicates spaces. Read off `model.subdomains` rather than recomputed from the fields, because the guard runs on
+# every `L2Projection` transfer, twice, and on every `QuadField`, where building the space vector allocated per call.
 function _assert_single_domain(model::Model, op::AbstractString)
-    space = first(model.problem.fields).space
-    all(field -> field.space === space, model.problem.fields) ||
-        throw(ArgumentError("$op is not yet supported for multi-domain (coupled) models"))
+    length(model.subdomains) == 1 || throw(ArgumentError("$op is not yet supported for multi-domain (coupled) models"))
     return nothing
 end
 
@@ -1248,8 +1207,7 @@ end
 # new configuration exactly, which is the contract all three mutators advertise. Everything that is *not* geometry —
 # field names and component counts, blocks, loads, Dirichlet data — is read back from `model.problem`, which carries it
 # unchanged through the fold and is kept current by `update_dirichlet!`. Every caller is single-domain
-# (`_assert_single_domain`), so `prefold_space` is *the* space and `_problem_with_space` re-homes every field onto the
-# derived copy.
+# (`_assert_single_domain`), so `prefold_space` is *the* space and `_rehome` re-homes every field onto the derived copy.
 #
 # The rebuilt model is then copied onto `model` field by field, by name, so the rule is "everything a `prepare` builds
 # is replaced" and a field added to `Model` later is replaced with the rest rather than forgotten. A field that must
@@ -1257,8 +1215,8 @@ end
 # outstanding `Solution` raises. Everything else is what the rebuild should leave:
 #
 #   - `matrix` and `rhs` are `nothing` on the fresh model, so the assembled state is cleared;
-#   - `plan_options` is the same object, and `moment_fit_caches` the model's own vector, passed in uncopied (`_derived`
-#     gives the reason);
+#   - `plan_options` is the same object, and the subdomains' moment-fit caches are the model's own, passed in uncopied
+#     (`_derived` gives the reason);
 #   - the Dirichlet projection cache is a fresh empty one: its unknown sets, facet regions and mass all belong to the
 #     dof layout being replaced, and the next `update_dirichlet!` rebuilds it against the new one;
 #   - the facet resolver is replaced for the same reason and with a second effect: its keys hold spaces by identity, so
@@ -1268,7 +1226,7 @@ end
 # `setproperty!` converts as a field assignment does, so a rebuilt problem of another concrete type raises exactly as
 # `model.problem = …` would.
 function _remodel!(model::Model{D,T}, space::Space{D,T}) where {D,T}
-    fresh = _derived(model, space; caches=model.moment_fit_caches)
+    fresh = _derived(model, space; caches=_fits(model))
     for name in fieldnames(Model)
         name === :version || setproperty!(model, name, getfield(fresh, name))
     end
@@ -1278,8 +1236,8 @@ end
 
 # A model of `model`'s problem prepared over `space`: the one builder behind every model derived from another — the
 # non-mutating derivations, the in-place mutators (`_remodel!`) and `estimate`'s enriched model. The forms, field
-# channels and Dirichlet data are `model`'s (`_problem_with_space`); the plan options are too, unless `options` says
-# otherwise, as `estimate`'s does when it exempts a level from pruning.
+# channels and Dirichlet data are `model`'s (`_rehome`); the plan options are too, unless `options` says otherwise, as
+# `estimate`'s does when it exempts a level from pruning.
 #
 # `caches` has no default, so every caller states what happens to `model`'s moment-fit caches. Every derivation hands
 # them on rather than starting empty, for the reason `move!` gives for not invalidating them: they are keyed by region
@@ -1301,50 +1259,12 @@ end
 # `point_base` numbers the new model's quadrature points (`AssemblyCache`). Only `estimate` moves it off 0.
 function _derived(model::Model{D,T}, space::Space{D,T}; options::NamedTuple=model.plan_options,
                   caches::Vector{_MomentFitCache{D,T}}, point_base::Int=0) where {D,T}
-    return _prepared_model(_problem_with_space(model.problem, space), options, caches; point_base)
+    return _prepared_model(_rehome(model.problem, _ -> space), options, caches; point_base)
 end
 
-# Rebuild `problem` over a new (adapted / elevated / moved / remasked / enriched) space, reusing the field channels,
-# forms, and Dirichlet data. The rebuild rule of `_derived` (the geometry-fold rebuild goes through `_prepare_spaces`,
-# which also reindexes level ids).
-function _problem_with_space(problem::Problem, new_space::Space)
-    new_fields = map(f -> field(f.name, new_space; components=component_count(f)), problem.fields)
-    return Problem(new_fields; blocks=problem.blocks, loads=problem.loads, dirichlet=problem.dirichlet,
-                   symmetric=problem.symmetric)
-end
-
-"""
-    move!(model; level, to) -> Model
-
-Move overlay `level` of a prepared `model` to box `to` in place, rebuilding its integration plan (reusing the
-`tolerance`/`criterion` captured at [`prepare`](@ref)) and dof layout, and invalidating any assembled operators. The
-base level (level 1) cannot be moved.
-
-`move!` overwrites the old state; to transfer a solution onto the moved configuration, use [`moved`](@ref) to build a
-separate target model and then [`transfer`](@ref).
-
-Invalidation contract — the one the sibling mutators [`activate!`](@ref) and [`deactivate!`](@ref) mirror. `move!`
-
-  - bumps `model.version`, so an outstanding [`Solution`](@ref) raises on reuse;
-  - clears `model.matrix` and `model.rhs`, and replaces the assembly cache `model.assembly` (region lists, sparsity
-    patterns, pooled scratch);
-  - empties the Dirichlet projection cache, whose unknown sets and boundary mass belong to the dof layout being
-    replaced;
-  - rebuilds `model.prefold_space` at the new box, the integration plan, the dof layout, and the facet / surface /
-    interface region caches;
-  - installs a fresh [`AssemblyDiagnostics`](@ref) record (a reference taken before the move keeps reporting the old
-    state).
-
-The cut-cell moment-fit cache is deliberately *not* invalidated: it is keyed by region bounds and moment order, so a cut
-region the move leaves unchanged reuses its rule instead of being refitted. A mutator keeps the model's own cache
-objects — it overwrites the model rather than forking it, so no sibling model can lose rules to it — and the plan build
-bounds them to the boxes the new configuration cuts, so a sweep of many moves costs one plan's rules and not the
-sweep's.
-"""
-function move!(model::Model{D,T}; level::Integer, to::AxisBox{D,T}) where {D,T}
-    _assert_single_domain(model, "move!")
-    return _remodel!(model, _moved_prefold_space(model, level, to))
-end
+# The moment-fit caches of `model`'s subdomains, in order: what a derivation hands `_derived`, which states whether the
+# new model shares them or gets copies. The vector is fresh; the caches in it are the model's own objects.
+_fits(model::Model) = [s.fits for s in model.subdomains]
 
 # The moved pre-fold space `move!` installs and `moved` prepares. Split out so the two spell the move once, and so
 # `moved` reads as what it is: the same derivation as `move!`, prepared into a second model instead of installed.
@@ -1373,34 +1293,21 @@ every rule it has.
 """
 function moved(model::Model{D,T}; level::Integer, to::AxisBox{D,T}) where {D,T}
     # Same restriction as `move!`, and for the same reason: `level` indexes one space's level tuple, which is ambiguous
-    # once a problem spans several subdomain spaces. `_problem_with_space` re-homes *every* field onto the moved space,
-    # so on a coupled model there is no answer to give rather than a wrong one — hence a raise, not a pick. It is
-    # asserted here, before `adapted` would assert it under its own name, so the message says `moved`.
+    # once a problem spans several subdomain spaces. `_rehome` re-homes *every* field onto the moved space, so on a
+    # coupled model there is no answer to give rather than a wrong one — hence a raise, not a pick. It is asserted
+    # here, before `adapted` would assert it under its own name, so the message says `moved`.
     _assert_single_domain(model, "moved")
     return adapted(model, _moved_prefold_space(model, level, to))
-end
-
-# Activate / deactivate `cells` on `level_index` and rebuild the model's reusable state. The flip is recorded on the
-# *pre-fold* mask — the caller's own record of what was asked for — and `_remodel!` folds the result against the
-# geometry afresh, exactly as `prepare` would at that mask. So on a model carrying a `PhysicalDomain`, activating a cell
-# the level set classifies as fictitious is a no-op on the effective space and stays visible through
-# `active_cells(model; level, effective = false)`, instead of overriding the geometry until the next `move!` re-folded
-# it away. Any outstanding `Solution` becomes stale.
-function _update_mask!(model::Model{D,T}, level_index::Integer, cells, value::Bool) where {D,T}
-    _assert_single_domain(model, "activate! / deactivate!")
-    level_index = _check_level(model.prefold_space, level_index)
-    level = model.prefold_space.levels[level_index]
-    mask = _apply_mask_update(level.mask, level.mesh, cells, value)
-    return _remodel!(model, _remasked_space(model.prefold_space, level_index, mask))
 end
 
 """
     activate!(model; level, cells) -> Model
 
-Mark `cells` on `level` as active in place. `cells` is a selection of cells, not a whole mask, and accepts the selector
-shapes the `active=` keyword of [`space`](@ref) documents: an iterable of `CartesianIndex{D}`, a predicate
-`(cell_box, cell_index) -> Bool`, or an `AbstractArray{Bool,D}` matching the level's cell grid. Currently-active cells
-in the selection are unchanged.
+Mark `cells` on `level` as active in place. `cells` is a selection of cells, not a whole mask, and accepts every shape
+the `active=` keyword of [`space`](@ref) documents: an iterable of `CartesianIndex{D}`, a predicate
+`(cell_box, cell_index) -> Bool`, an `AbstractArray{Bool,D}` or a [`LevelMask`](@ref) matching the level's cell grid
+(`true` selects the cell), or `nothing`, which selects every cell. Currently-active cells in the selection are
+unchanged, and cells outside it keep their state.
 
 Bumps `model.version`, so an existing [`Solution`](@ref) raises on reuse, and runs the same invalidation tail as
 [`move!`](@ref) — see that docstring for exactly what is cleared, rebuilt, and deliberately kept. The one difference is
@@ -1424,9 +1331,31 @@ activate!(model::Model{D,T}; level::Integer, cells) where {D,T} = _update_mask!(
     deactivate!(model; level, cells) -> Model
 
 Mark `cells` on `level` as inactive in place. See [`activate!`](@ref) for the accepted shapes of `cells`, the
-invalidation contract, and the interaction with a model's `physical_domain`.
+invalidation contract, and the interaction with a model's `physical_domain`. `cells = nothing` selects every cell, so it
+leaves the level dormant.
 """
 deactivate!(model::Model{D,T}; level::Integer, cells) where {D,T} = _update_mask!(model, level, cells, false)
+
+# Activate / deactivate `cells` on `level_index` and rebuild the model's reusable state. The flip is recorded on the
+# *pre-fold* mask — the caller's own record of what was asked for — and `_remodel!` folds the result against the
+# geometry afresh, exactly as `prepare` would at that mask. So on a model carrying a `PhysicalDomain`, activating a cell
+# the level set classifies as fictitious is a no-op on the effective space and stays visible through
+# `active_cells(model; level, effective = false)`, instead of overriding the geometry until the next `move!` re-folded
+# it away. Any outstanding `Solution` becomes stale.
+#
+# The update is word-wise on the level's active bits, against the selection `_selection` reads from every shape
+# `active =` takes. The result goes through `_collapse_mask`, so the no-mask fast path survives bouncing in and out of
+# the mask, and the selection is read even when it changes nothing, so a malformed one raises whatever the level's
+# current state.
+function _update_mask!(model::Model{D,T}, level_index::Integer, cells, value::Bool) where {D,T}
+    _assert_single_domain(model, "activate! / deactivate!")
+    V = model.prefold_space
+    k = _check_level(V, level_index)
+    on = active_cells(V; level=k)
+    selected = _selection(cells, V.levels[k].mesh)
+    value ? (on .|= selected) : (on .&= .!selected)
+    return _remodel!(model, _relevel(V, k; mask=_collapse_mask(on)))
+end
 
 """
     adapted(model::Model, level => cells, ...) -> Model
@@ -1511,7 +1440,7 @@ function adapted(model::Model{D,T}, space::Space{D,T}) where {D,T}
     # Seeded warm from the source, but the target's own object: both models are live from here on, and each builds a
     # plan that bounds its cache to its own cut boxes. Sharing would make the fork evict the rules the source's plan is
     # still using — `_derived` has the lineage rule in full.
-    return _derived(model, space; caches=copy.(model.moment_fit_caches))
+    return _derived(model, space; caches=copy.(_fits(model)))
 end
 
 """
@@ -1537,6 +1466,8 @@ function elevated(model::Model{D,T}, spec...) where {D,T}
     _assert_single_domain(model, "elevated")
     return adapted(model, elevate(model.prefold_space, spec...))
 end
+
+# ── Reading a model's levels ──────────────────────────────────────────────────
 
 """
     cell_orders(model; level) -> Array{NTuple{D,Int},D}
@@ -1574,10 +1505,7 @@ Unlike the mutators this reads the problem's representative space (the first fie
 model, so on a multi-domain model it reports the first subdomain.
 """
 function active_cells(model::Model; level::Integer, effective::Bool=true)
-    V = effective ? model.problem.space : model.prefold_space
-    lvl = V.levels[_check_level(V, level)]
-    lvl.mask === nothing && return trues(lvl.mesh.cells)
-    return copy(lvl.mask.on)
+    return active_cells(effective ? model.problem.space : model.prefold_space; level)
 end
 
 """
@@ -1605,7 +1533,7 @@ dilate(model::Model, cells; level::Integer, by) = dilate(model.prefold_space, ce
     update_dirichlet!(model::Model, dirichlet) -> Model
 
 Refresh the *values* of a prepared model's Dirichlet conditions in place, reusing the existing integration plan, dof
-enumeration, facet/surface region caches, and immersed-boundary moment-fit cache.
+enumeration, region cache, and immersed-boundary moment-fit cache.
 
 The argument `dirichlet` is a vector or tuple of [`DirichletCondition`](@ref)s that must structurally match the
 conditions the model was prepared with: the same number of conditions in the same order, each with identical `boundary`,
@@ -1701,7 +1629,9 @@ function update_dirichlet!(model::Model{D,T}, dirichlet) where {D,T}
     # A model prepared with homogeneous data has run no trace solve, so this is where its first increment establishes
     # the branch and the unsupported dofs. Later increments restate the same two answers: both describe the boundary
     # mass, which the structural check above pins.
-    _set_dirichlet_trace_stats!(model.diagnostics, trace_factors, unsupported)
+    diag = model.diagnostics
+    diag.dirichlet_trace_factors, diag.unsupported_dirichlet_dofs = trace_factors, unsupported
+    diag.unsupported_dirichlet_dof_count = length(unsupported)
 
     # Clear cached operators. The RHS depends on the constrained values via column elimination, so the next assembly
     # must rebuild it. The matrix would technically still be valid (Dirichlet only moves entries into the RHS at
@@ -1730,6 +1660,10 @@ reproducibility-report `NamedTuple` that bundles the diagnostics with per-level 
 solution, and (optionally) the relative L² error against `exact(x)`. The result is the natural artefact to include in PR
 descriptions, paper figures, and regression tests.
 
+The report's keys are the record's fields in their declaration order (see [`AssemblyDiagnostics`](@ref)), with `levels`
+after `dimension` and `raw_dofs` — every field's raw dof slots, counted before any elimination — after
+`active_unknowns`, followed by `residual_norm` (the solution's) and `l2_error` (`nothing` without `exact`).
+
 Each `levels` entry carries `id`, `role`, `cells`, `order` (the level's nominal per-axis maximum), `order_palette` (the
 distinct per-cell orders, a one-element vector on a uniform level), `mode`, `basis`, `domain`, `nested` — whether every
 higher level's nodes coincide with this level's where the two overlap — and `raw_functions` and `active_functions`.
@@ -1751,28 +1685,16 @@ function diagnostics(model::Model{D,T}, solution; exact=nothing) where {D,T}
     diag = diagnostics(model)
     error = exact === nothing ? nothing : l2_error(solution, model, exact)
     tol = get(model.plan_options, :tolerance, GeometryTolerance(T))
-    # Level reports for every subdomain space, flattened in the same order as `_problem_levels`. Built per space because
-    # nesting is a relation between the levels of one space; a coupled problem's spaces are independent stacks.
-    levels = Any[_level_report(level, V, tol, model.dofs) for V in problem_spaces(model.problem) for level in V.levels]
-    return (; dimension=diag.dimension, levels=levels, active_unknowns=diag.active_unknowns,
-            raw_dofs=raw_dof_count(model.dofs), integration_regions=diag.integration_regions,
-            facet_region_count=diag.facet_region_count, cut_facet_region_count=diag.cut_facet_region_count,
-            facet_fit_failure_count=diag.facet_fit_failure_count,
-            facet_cut_fallback_count=diag.facet_cut_fallback_count,
-            facet_moment_fit_residual_max=diag.facet_moment_fit_residual_max,
-            min_relative_facet_measure=diag.min_relative_facet_measure,
-            dirichlet_trace_factors=diag.dirichlet_trace_factors,
-            unsupported_dirichlet_dof_count=diag.unsupported_dirichlet_dof_count,
-            unsupported_dirichlet_dofs=diag.unsupported_dirichlet_dofs, surface_region_count=diag.surface_region_count,
-            interface_region_count=diag.interface_region_count, small_overlap_count=diag.small_overlap_count,
-            small_overlaps=diag.small_overlaps, min_integration_volume=diag.min_integration_volume,
-            min_relative_integration_volume=diag.min_relative_integration_volume,
-            inactive_cell_counts=diag.inactive_cell_counts, reduced_mode_counts=diag.reduced_mode_counts,
-            cut_region_count=diag.cut_region_count, fit_failure_count=diag.fit_failure_count,
-            moment_fit_residual_max=diag.moment_fit_residual_max, cut_fallback_count=diag.cut_fallback_count,
-            cut_fallback_points=diag.cut_fallback_points, symmetry_residual=diag.symmetry_residual,
-            condition_estimate=diag.condition_estimate, scaled_condition_estimate=diag.scaled_condition_estimate,
-            solver=diag.solver, residual_norm=solution.diagnostics.residual_norm, l2_error=error,)
+    # Level reports for every subdomain space, in subdomain order, which is global level-id order. Built per space
+    # because nesting is a relation between the levels of one space; a coupled problem's spaces are independent stacks.
+    levels = Any[_level_report(level, s.space, tol, model.dofs) for s in model.subdomains for level in s.space.levels]
+    # The record's fields in declaration order, `levels` and `raw_dofs` placed after the two they describe: `merge`
+    # keeps the first argument's keys where they are and appends the rest in order.
+    record = NamedTuple{fieldnames(AssemblyDiagnostics)}(ntuple(i -> getfield(diag, i),
+                                                                Val(fieldcount(AssemblyDiagnostics))))
+    return merge((; dimension=diag.dimension, levels, active_unknowns=diag.active_unknowns,
+                  raw_dofs=raw_dof_count(model.dofs)), record,
+                 (; residual_norm=solution.diagnostics.residual_norm, l2_error=error))
 end
 
 # Compact per-level reproducibility report used inside `diagnostics(model, solution)`: enough to know which basis,
@@ -1821,9 +1743,8 @@ function _level_report(level, V::Space, tol::GeometryTolerance, layout::SystemLa
     # `order` stays the level's nominal (maximum) per-axis order, so an existing reader keeps reading the same field
     # with the same meaning. `order_palette` carries the distinct per-cell orders — a one-element vector on a uniform
     # level — so a graded run is reproducible from the report without the entry's type varying from level to level.
-    order_palette = copy(level.orders.palette)
     return (; id=level.id, role=level.role, cells=level.mesh.cells, order=nominal_order(level),
-            order_palette=order_palette, mode=level.mode, basis=basis_name(level.basis), domain=level.mesh.domain,
-            nested=nested, raw_functions=length(raws),
+            order_palette=copy(level.orders.palette), mode=_mode(level.basis), basis=basis_name(level.basis),
+            domain=level.mesh.domain, nested=nested, raw_functions=length(raws),
             active_functions=count(r -> any(!iszero, view(dofs.active_component, r, :)), raws),)
 end

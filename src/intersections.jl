@@ -478,8 +478,8 @@ function _live_axis_coordinates(level, ::Val{D}, cells) where {D}
     # active cells — not its cell count. It runs on the flattened mask rather than the `D`-dimensional one on purpose:
     # `findall` returns `Int` for a vector and `CartesianIndex{D}` for `D > 1`, and one `D`-generic loop body cannot
     # consume both. `vec` on a `BitArray` is a reshape, so nothing is copied.
-    cartesian = CartesianIndices(mask.on)
-    for i in findall(vec(mask.on))
+    cartesian = CartesianIndices(mask)
+    for i in findall(vec(mask))
         c = cartesian[i]
         c in cells || continue
         for d in 1:D
@@ -517,6 +517,11 @@ end
 # contributes nothing at `x`. Two boxes share a signature iff they lie inside the same cell of every contributing level,
 # so the smooth-integrand contract (one cell per axis per level) is preserved when merging axis-adjacent
 # equal-signature boxes, and the signature alone determines a box's parents (`_parents`).
+#
+# The inactive-cell zero is an invariant the assembly hot path relies on, not only a filter: every region parent is
+# decoded from a signature, so every parent is an active cell of its level, and `_refresh!` (`assembly.jl`) reads a
+# parent's basis set without consulting the mask — on a uniform level, the level's one set for any cell. A parent built
+# from any other source would have to keep that property.
 #
 # The signature is an `NTuple{N,Int}` built by `map` over the level tuple rather than a `Vector{Int}`, so the equality
 # comparison in the merge stays on the stack and every level's lookup is statically dispatched. A `Vector{Int}` per
@@ -685,7 +690,7 @@ _moment_orders(factor::Int) = (level, cell) -> factor .* cell_order(level, cell)
 # region loop reads back nothing but hits. Its value is across plan rebuilds — a `move!` leaves the great majority of
 # cut boxes bit-identical, and refitting one costs hundreds of milliseconds in 3D — so [`Model`](@ref) owns one per
 # distinct participating space and threads it back in through every rebuild. That scope also keeps the key honest: a
-# space's `PhysicalDomain` is immutable and is carried unchanged through `moved_space` / `_remasked_space`, so one cache
+# space's `PhysicalDomain` is immutable and is carried unchanged through every level rebuild (`_relevel`), so one cache
 # sees exactly one `physical` for its whole life and the key need not include it. `_prefit!` bounds the cache to the
 # current plan's regions, so a long `move!` sweep holds one plan's rules, not the sweep's.
 const _MomentFitKey{D,T} = Tuple{SVector{D,T},SVector{D,T},NTuple{D,Int}}

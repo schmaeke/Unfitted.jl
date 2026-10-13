@@ -58,13 +58,15 @@ end
 #   - `bases[i]` is narrowed by `map(identity, …)` to the eltype the space's families share, `IntegratedLegendre` on the
 #     default space. An abstract bank turns the per-point basis call into a dynamic dispatch that boxes its `SVector` /
 #     `NTuple` / `CartesianIndex` arguments: measured at 448 B per call, and 94 % of `assemble_matrix`'s allocations.
-#   - `modes[i]` is the level's own minimum-rule table (`level.modes`), read by parent cell as `sets[kind[cell]]`. It is
-#     the same object `_build_cell_dofs!` walked to produce `cell_dofs`, taken off the level rather than re-derived,
-#     because the positional pairing between a cell's raw dofs and its basis values is the only link between the dof
-#     layer and the basis layer, and nothing checks it.
-#   - `values[i]` and `gradients[i]` are sized at the level's nominal (maximum) order, so a cell at a lower per-cell
-#     order fills a prefix. See `_tensor_values_grads!` in `basis.jl` for why that is transparent and why the buffers
-#     are not keyed by order value.
+#   - `modes[i]` is the level's own minimum-rule table (`level.modes`), read by parent cell through `_active_set`: the
+#     level's one set on a uniform level, `sets[kind[cell]]` on a graded one. It is the same object `_build_cell_dofs!`
+#     walked to produce `cell_dofs`, taken off the level rather than re-derived, because the positional pairing between
+#     a cell's raw dofs and its basis values is the only link between the dof layer and the basis layer, and nothing
+#     checks it.
+#   - `values[i]` and `gradients[i]` are sized at the level's largest minimum-rule set, so a cell whose set is
+#     shorter fills a prefix. See `_tensor_values!` in `basis.jl` for why that is transparent and why the buffers are
+#     not keyed by order value. The 1D factor buffers `val1d[i]` / `der1d[i]` are sized at the level's nominal
+#     (maximum) order, which bounds every cell's.
 struct BasisBank{D,T,B<:BasisFamily}
     bases::Vector{B}
     modes::Vector{CellModes{D}}
@@ -99,13 +101,16 @@ function BasisBank(spaces, ::Val{D}, ::Type{T}) where {D,T}
 end
 
 # Function barrier: fill the id-indexed bank from one space's concretely typed level `Tuple`, so every per-level field
-# read and the `local_basis_indices` / `_factor_buffers` calls dispatch statically.
+# read and the `_factor_buffers` calls dispatch statically. The value buffers are sized from the level's own
+# minimum-rule table, the sets the kernel is handed, rather than by building the index set at the nominal order: every
+# cell's set is no longer than the longest one, which is all the kernel's `>=` guard asks, and the table is already on
+# the level.
 function _fill_bank!(bank::BasisBank{D,T}, levels::Tuple) where {D,T}
     for level in levels
         i, p = level.id, nominal_order(level)
-        nbasis = length(local_basis_indices(level.basis, p, level.mode))
+        nbasis = maximum(length, level.modes.sets)
         bank.bases[i] = level.basis
-        bank.modes[i] = _cell_locals(level)
+        bank.modes[i] = level.modes
         bank.orders[i] = p
         bank.values[i] = Vector{T}(undef, nbasis)
         bank.gradients[i] = Vector{SVector{D,T}}(undef, nbasis)
@@ -160,7 +165,7 @@ end
 
 # A fresh workspace for `model`. Deliberately unspecialised: it runs once per call, never per region, and specialising
 # it on `Model{D,T,P}` would only compile it again for every problem type.
-_assembly_workspace(@nospecialize(model::Model)) = AssemblyWorkspace(model.dofs, problem_spaces(model.problem))
+_assembly_workspace(@nospecialize(model::Model)) = AssemblyWorkspace(model.dofs, (s.space for s in model.subdomains))
 
 """
     FormState
@@ -328,8 +333,7 @@ function assemble!(model::Model; threaded::Bool=Threads.nthreads() > 1)
     model.matrix, model.rhs = matrix, rhs
     diag = model.diagnostics
     diag.symmetry_residual = model.problem.symmetric ? 0.0 : NaN
-    diag.condition_estimate = _condition_estimate(matrix)
-    diag.scaled_condition_estimate = _scaled_condition_estimate(matrix)
+    diag.condition_estimate, diag.scaled_condition_estimate = _condition_estimates(matrix)
     return model
 end
 
@@ -420,7 +424,7 @@ _scalar(::SystemLayout{D,T}) where {D,T} = T
 #
 #   1. the volume target first, then every `on=` target in its first appearance in `(blocks..., loads...)`, matched by
 #      `isequal` — value-equal selectors are one target, meshes and interfaces match by identity;
-#   2. each target split per subdomain space, in `problem_spaces` order, a pass taking the forms whose test field lives
+#   2. each target split per subdomain space, in subdomain order, a pass taking the forms whose test field lives
 #      on that space. A region list is built on one space's level block and only that space's fields evaluate on it
 #      (`_parent_range`), so a target named on two subdomains is two independent passes, and a volume form runs on its
 #      own subdomain's plan only;
@@ -438,7 +442,7 @@ function _passes(@nospecialize(model::Model), @nospecialize(blocks::Tuple), @nos
         form.on === nothing || any(t -> isequal(t, form.on), targets) || push!(targets, form.on)
     end
     passes = Any[]
-    for target in targets, space in (target isa Interface ? Any[nothing] : problem_spaces(model.problem))
+    for target in targets, space in (target isa Interface ? (nothing,) : (s.space for s in model.subdomains))
         mine = form -> isequal(form.on, target) &&
                        (space === nothing || _field_space(model.problem, form.test_name) === space)
         target_blocks, target_loads = filter(mine, blocks), filter(mine, loads)
@@ -501,27 +505,28 @@ end
 _point_count(list::RegionList) = list.offsets[end] - list.offsets[1]
 
 # The regions of pass target `target` on `space`, and whether they are the model's own prepare-time list (`true`) or
-# were resolved just now for a target `prepare` never saw (`false`). The miss paths are the builders `prepare` runs.
-# "Fresh" is per target, not per face: a selector resolves through the model's `FacetResolver`, so a face `prepare`
-# already resolved is reused, and a new face is resolved once however many selectors name it.
+# were resolved just now for a target `prepare` never saw (`false`): the volume plan of `space`, or the `on=` target's
+# entry of `model.regions`, a miss resolving through `_resolve_target`, the builder `prepare` runs. "Fresh" is per
+# target, not per face: a selector resolves through the model's `FacetResolver`, so a face `prepare` already resolved is
+# reused, and a new face is resolved once however many selectors name it.
+#
+# The miss goes through `Base.inferencebarrier` (the idiom of `_coverage_constraints!` in `dofs.jl`). `_region_list`
+# passes `target` unspecialised, and both methods match an abstract target, so inferring it infers the second method
+# with `target` abstract, even for a call whose only target is the volume. `_resolve_target` has three methods, few
+# enough for inference to descend into all of them: without the barrier every first assembly inferred the facet,
+# surface-mesh and interface builders with their space and number type unknown, code that never runs while the targets
+# hit the cache. On the first `assemble!` of a two-level 2D overlay with volume forms only, that was 4855 method
+# instances inferred against 2726 with the barrier. Behind it a miss dispatches at run time on its concrete target and
+# space, and compiles only the builder it runs: the specialisation `prepare` compiled when the problem names a target of
+# that kind.
 function _regions(@nospecialize(model::Model), ::Nothing, @nospecialize(space))
-    plan = findfirst(s -> s === space, problem_spaces(model.problem))
-    return model.space_plans[plan].regions, true
+    return model.subdomains[findfirst(s -> s.space === space, model.subdomains)].plan.regions, true
 end
-function _regions(@nospecialize(model::Model), selector::BoundarySelector, @nospecialize(space))
-    cached = get(model.facet_regions, (selector, space), nothing)
+function _regions(@nospecialize(model::Model), @nospecialize(target), @nospecialize(space))
+    cached = get(model.regions, (target, space), nothing)
     cached === nothing || return cached, true
-    return _facet_regions_for_selector(space, selector, model.facet_resolver), false
-end
-function _regions(@nospecialize(model::Model), mesh::BoundaryMesh, @nospecialize(space))
-    cached = get(model.surface_regions, (mesh, space), nothing)
-    cached === nothing || return cached, true
-    return _surface_regions_for_mesh(space, mesh, model.dofs.tolerance), false
-end
-function _regions(@nospecialize(model::Model), iface::Interface, _)
-    cached = get(model.interface_regions, iface, nothing)
-    cached === nothing || return cached, true
-    return _interface_regions(iface, model.problem, model.dofs), false
+    resolve = Base.inferencebarrier(_resolve_target)
+    return resolve(target, space, model.problem, model.dofs, model.facet_resolver), false
 end
 
 # A small most-recently-used-first cache kept in a `Vector` of `key => value` pairs, every key a 2-tuple. `_lru_get!`
@@ -1172,10 +1177,10 @@ end
 # is derived: the symbolic pattern, the threaded arena layout and the numeric pass all go through it, so they cannot
 # disagree.
 #
-# The guard compares a cell's raw dof list with the bank, which is sized once from the level's nominal order — the `>=`
-# relaxation `_tensor_values_grads!` relies on. `_build_cell_dofs!` and the bank both read `level.modes`, so the list
-# and the cell's own index set cannot disagree in length; what can fail is a cell needing more basis values than its
-# level's bank holds. One integer compare per (region, parent, field), outside the quadrature loop.
+# The guard compares a cell's raw dof list with the bank, which is sized once from the level's longest minimum-rule set
+# — the `>=` relaxation `_tensor_values!` relies on. `_build_cell_dofs!` and the bank both read `level.modes`, so the
+# list and the cell's own index set cannot disagree in length; what can fail is a cell needing more basis values than
+# its level's bank holds. One integer compare per (region, parent, field), outside the quadrature loop.
 function _frame!(ws::AssemblyWorkspace, region)
     empty!(ws.parents)
     empty!(ws.slots)
@@ -1307,23 +1312,26 @@ end
 # Evaluate every parent's basis at the current frame point `p` into the bank: values and physical gradients
 # (`Val(true)`), or values only (`Val(false)`, for the L² transfer rhs, whose integrand never reads a gradient). Each
 # parent maps `p` into its own reference frame through `ξ0 + dξ ∘ p` (`Parent`), with no division. The gradient scale is
-# the axis-aligned chain rule `2 / edge_lengths(parent_box)` of `physical_basis_gradients` in `basis.jl`. One basis
-# evaluation per parent per point. A one-sided region's parents have distinct levels, so their bank slots never
-# collide; an interface region's two sides live in the two subdomains' disjoint level banks, so the kernel reads field
-# `a` from `a`'s cut cell and field `b` from `b`'s at the same physical point.
+# the axis-aligned chain rule `2 / edge_lengths(parent_box)` of `physical_basis_gradients` in `mesh.jl`. One basis
+# evaluation per parent per point, through one kernel call: `G` is a type parameter, so the gradient tuple is formed,
+# and the gradient work done, only when it is `true`. A one-sided region's parents have distinct levels, so their bank
+# slots never collide; an interface region's two sides live in the two subdomains' disjoint level banks, so the kernel
+# reads field `a` from `a`'s cut cell and field `b` from `b`'s at the same physical point.
+#
+# A parent's set is read with `_active_set`, which does not consult the level's mask, and that rests on an invariant:
+# every region parent is an ACTIVE cell of its level. It holds by construction rather than by checking — every parent
+# list is decoded from a coverage signature (`_signature`, `intersections.jl`), which gives an inactive cell no slot —
+# for the volume, facet, surface, interface and transfer partitions alike. So a uniform level's parents all read its
+# one shared set and touch no per-cell memory, and a graded level's read their own entry, as before.
 @noinline function _refresh!(ws::AssemblyWorkspace{D,T}, region::Region, p, ::Val{G}) where {D,T,G}
     bank = ws.bank
     for parent in region.parents
         l = parent.level
-        ids = bank.modes[l].sets[bank.modes[l].kind[parent.cell]]
+        ids = _active_set(bank.modes[l], parent.cell)
         xi = parent.ξ0 + parent.dξ .* p
-        if G
-            scale = SVector{D,T}(2 .* inv.(edge_lengths(parent.parent_box)))
-            _tensor_values_grads!(bank.bases[l], bank.values[l], bank.gradients[l], ids, bank.orders[l], xi, scale,
-                                  bank.val1d[l], bank.der1d[l], parent.cell)
-        else
-            _tensor_values!(bank.bases[l], bank.values[l], ids, bank.orders[l], xi, bank.val1d[l], parent.cell)
-        end
+        grad = G ? (bank.gradients[l], SVector{D,T}(2 .* inv.(edge_lengths(parent.parent_box))), bank.der1d[l]) :
+               nothing
+        _tensor_values!(bank.bases[l], bank.values[l], ids, bank.orders[l], xi, bank.val1d[l], parent.cell, grad)
     end
     return nothing
 end
@@ -1461,10 +1469,10 @@ function nquadpoints(model::Model; kind::Symbol=:volume, on=nothing, field::Unio
     # The aggregate sums over one of four iterator types, which inference does not follow; the declared `::Int` is what
     # keeps a caller that sizes a loop by the count type-stable (the `RBFP0` transfer's serial loop allocated per
     # point).
-    lists = kind === :volume ? (plan.regions for plan in integration_plans(model)) :
-            kind === :facet ? values(model.facet_regions) :
-            kind === :surface ? values(model.surface_regions) :
-            kind === :interface ? values(model.interface_regions) :
+    lists = kind === :volume ? (s.plan.regions for s in model.subdomains) :
+            kind === :facet ? _cached_lists(model.regions, BoundarySelector) :
+            kind === :surface ? _cached_lists(model.regions, BoundaryMesh) :
+            kind === :interface ? _cached_lists(model.regions, Interface) :
             throw(ArgumentError("nquadpoints kind must be :volume, :facet, :surface, or " * ":interface, got $kind"))
     return sum(regions -> sum(_region_qpoint_count, regions; init=0), lists; init=0)
 end
@@ -1525,7 +1533,7 @@ end
 function _target_space(@nospecialize(model::Model), @nospecialize(on), field::Union{Nothing,Symbol})
     on isa Interface && return nothing
     field === nothing || return _field_space(model.problem, field)
-    length(problem_spaces(model.problem)) == 1 && return model.problem.space
+    length(model.subdomains) == 1 && return model.problem.space
     names = join((":" * String(f.name) for f in model.problem.fields), ", ")
     throw(ArgumentError("field argument is required for multi-domain models; pass field=… " * "(one of $names)"))
 end

@@ -52,7 +52,7 @@ end
     # cache entry a prepared model made.
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
     model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:upper))]))
-    @test haskey(model.facet_regions, (boundary(axis=1, side=:upper), model.problem.space))
+    @test haskey(model.regions, (boundary(axis=1, side=:upper), model.problem.space))
 end
 
 @testset "per-component Dirichlet frees the other components" begin
@@ -173,7 +173,7 @@ end
     layout = Unfitted.dof_layout(V; dirichlet=[dirichlet(0.0; on=boundary(:all))])
     active = Unfitted.active_cell_dofs(layout, 1, CartesianIndex(1, 1))
 
-    @test V.levels[1].mode == :trunk
+    @test Unfitted._mode(V.levels[1].basis) == :trunk
     @test Unfitted.raw_dof_count(layout) == 17
     @test Unfitted.active_unknowns(layout) == 1
     @test count(!iszero, active) == 1
@@ -181,8 +181,18 @@ end
 
     V2 = overlay(V, box((0.25, 0.25), (0.75, 0.75)); cells=(1, 1))
     overlay_active = Unfitted.active_cell_dofs(Unfitted.dof_layout(V2), 2, CartesianIndex(1, 1))
-    @test V2.levels[2].mode == :trunk
+    @test Unfitted._mode(V2.levels[2].basis) == :trunk
     @test count(!iszero, overlay_active) == 1
+    @test occursin("mode=:trunk", sprint(show, V2.levels[2]))
+
+    # The mode is folded into the level's family, and the `mode` keyword always applies: an explicit
+    # `basis = IntegratedLegendre()` on an overlay of a trunk base still inherits `:trunk` through the keyword's
+    # default, and an explicit `mode` overrides the family it is handed.
+    inner = box((0.25, 0.25), (0.75, 0.75))
+    @test Unfitted._mode(overlay(V, inner; cells=(1, 1), basis=IntegratedLegendre()).levels[2].basis) == :trunk
+    @test Unfitted._mode(overlay(V, inner; cells=(1, 1), mode=:tensor).levels[2].basis) == :tensor
+    @test Unfitted._mode(overlay(V, inner; cells=(1, 1), basis=V.levels[1].basis, mode=:tensor).levels[2].basis) ==
+          :tensor
 end
 
 @testset "overlay artificial constraints stay separate from physical boundaries" begin
@@ -824,7 +834,7 @@ _overlay_pass_bytes(ledger, level, ctx) = @allocated Unfitted._overlay_constrain
                                      level_raws[level.id])
         @test ctx isa Unfitted._LevelContext{2,Float64,typeof(V),Unfitted._Fold{2,Float64,typeof(V.physical)}}
         # Non-vacuity: the fold deactivated cells, so the pass walks fold faces.
-        @test count(!, level.mask.on) > 0
+        @test count(!, level.mask) > 0
         ledger() = Unfitted.EliminationLedger{Float64}(length(raw_keys))
         # Compile once. The measured call below shares `ctx`, and with it the oracle's verdict table for this level,
         # which this first call allocates: a layout build allocates it once too, and the bound is about what the pass
@@ -850,7 +860,7 @@ end
     omega = box((0.0, 0.0), (1.0, 1.0))
     folded = prepare(mass(space(omega; cells=8, order=2, physical=hole)))
     # Non-vacuity: the fold deactivated the cells inside the hole, so there are fold faces, and none of them constrains.
-    @test count(!, only(folded.problem.space.levels).mask.on) > 0
+    @test count(!, only(folded.problem.space.levels).mask) > 0
     @test !any(==(:overlay), only(folded.dofs.fields).dofs.elimination_source)
 
     # A corner block of material cells, masked out by hand: the internal faces at node index 7 bound it, and they
@@ -979,7 +989,7 @@ end
 end
 
 @testset "facet regions are memoised per face, not per selector" begin
-    # `_resolve_facet_regions` keys the cache it *retains* on (selector, space), but resolution itself runs through a
+    # `prepare` keys the cache it *retains* (`model.regions`) on (selector, space), but resolution itself runs through a
     # per-face memo. The two are not the same granularity: `boundary(:all)` and `boundary(axis=1, side=:lower)` are not
     # value-equal, yet the second names one of the four faces the first already covers, and keying the resolution on the
     # selector resolved that shared face twice. Per-face memoisation makes the sharing deliberate. It must be invisible
@@ -1027,7 +1037,7 @@ end
     g(x) = 1 + x[1] + 2x[2] + x[1] * x[2]
     both = prepare(poisson(V; source=x -> 0.0,
                            dirichlet=[dirichlet(g; on=boundary(:all)), dirichlet(g; on=boundary(axis=1, side=:lower))]))
-    @test length(both.facet_regions) == 2
+    @test length(both.regions) == 2
     @test diagnostics(both).facet_region_count == length(whole) + length(single)
     @test l2_error(solve!(both), both, g) < 1.0e-12
 end
@@ -1056,7 +1066,7 @@ end
 
     # Every region in every per-selector cache entry IS one of the resolver's, position for position — not a copy of one
     # carrying the same numbers.
-    for ((selector, each_space), list) in model.facet_regions
+    for ((selector, each_space), list) in model.regions
         shared = reduce(vcat, (resolver.faces[(each_space, sides)] for sides in Unfitted._facets(selector, Val(2))))
         @test length(list) == length(shared)
         @test all(a === b for (a, b) in zip(list, shared))
@@ -1070,12 +1080,12 @@ end
     @test Set(keys(resolver.faces)) == Set(keys(before))
     @test all(resolver.faces[key] === before[key] for key in keys(before))
 
-    # And the projection resolves through *this* resolver, which the assertions so far cannot see:
-    # `_resolve_facet_regions` runs after `system_layout` at `prepare` and names the Dirichlet selectors among its own
-    # sites, so the four keys above would be here either way. Emptying the memo first makes the question
-    # order-sensitive. Dropping the cached `DirichletProjection` forces the next load step to rebuild it, hence to walk
-    # the boundary again, and the faces it resolves on that walk are the only thing that can refill the memo — so a
-    # projection holding a resolver of its own leaves it empty.
+    # And the projection resolves through *this* resolver, which the assertions so far cannot see: `prepare` resolves
+    # its region targets after `system_layout` and names the Dirichlet selectors among them, so the four keys above
+    # would be here either way. Emptying the memo first makes the question order-sensitive. Dropping the cached
+    # `DirichletProjection` forces the next load step to rebuild it, hence to walk the boundary again, and the faces it
+    # resolves on that walk are the only thing that can refill the memo — so a projection holding a resolver of its own
+    # leaves it empty.
     delete!(model.dirichlet_projections, only(model.dofs.fields).name)
     empty!(resolver.faces)
     update_dirichlet!(model, [dirichlet(g; on=boundary(:all)), dirichlet(g; on=face)])
@@ -1084,8 +1094,8 @@ end
     # The same hand-off on the `prepare` side, which runs one level further down: `system_layout` forwards the resolver
     # through `_field_dofs` into the projection, so a resolver handed to the layout *alone* comes back carrying the
     # conditions' faces. That is the half of the thread the step above cannot reach, and the order is the whole point
-    # again — at `prepare` this walk happens first, which is why `_resolve_facet_regions` afterwards resolves nothing
-    # and the model ends up at four.
+    # again — at `prepare` this walk happens first, which is why the region targets afterwards resolve nothing and the
+    # model ends up at four.
     fresh = Unfitted.FacetResolver{2,Float64}(model.dofs.tolerance)
     Unfitted.system_layout(model.problem; tolerance=model.dofs.tolerance, facets=fresh)
     @test Set(keys(fresh.faces)) == Set(keys(before))
@@ -1143,7 +1153,7 @@ end
     # region's own face box against the level set restricted to the x₁ = 0 slice, which is why the third region reads a
     # `:cut_*` kind and the fourth `:fictitious` rather than both reading the same thing; `:cut_fitted` rather than
     # `:cut_fallback` because the restricted leaf is affine, so the moment fit on it is machine-exact.
-    cut_regions = cut_model.facet_regions[(face, cut_model.problem.space)]
+    cut_regions = cut_model.regions[(face, cut_model.problem.space)]
     @test [r.lower[2] for r in cut_regions] == [0.0, 0.25, 0.5, 0.75]
     @test [r.kind for r in cut_regions] == [:full, :full, :cut_fitted, :fictitious]
 
@@ -1195,7 +1205,7 @@ end
     @test boundary_integral(q -> 1.0, hole_model; on=boundary(:all)) ≈ 4.0 rtol = 1.0e-14
     # ...and the cells really are cut, so this is a live discrimination and not a geometry in which the two tests
     # trivially agree.
-    hole_regions = hole_model.facet_regions[(boundary(:all), hole_model.problem.space)]
+    hole_regions = hole_model.regions[(boundary(:all), hole_model.problem.space)]
     @test all(r -> r.kind === :full, hole_regions)
     @test count(r -> any(p -> Unfitted.classify_cell(interior, p.parent_box) === :cut, r.parents), hole_regions) == 2
 
@@ -1205,7 +1215,7 @@ end
     plain = prepare(poisson(Vplain; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     @test diagnostics(plain).facet_region_count == 16
     @test diagnostics(plain).cut_facet_region_count == 0
-    @test all(r -> r.kind === :full, plain.facet_regions[(boundary(:all), plain.problem.space)])
+    @test all(r -> r.kind === :full, plain.regions[(boundary(:all), plain.problem.space)])
 
     # `keep_fictitious = true` keeps whole fictitious cells in the layout, so it can only add regions, never retract a
     # verdict: the count is a property of the geometry and the face, not of the fold. On this geometry no cell on the
@@ -1224,7 +1234,7 @@ end
     # the same two rules the volume dispatch builds. So the face's unit integral is `0.55 + α·0.45` exactly: the
     # physical 0.55, plus α times the 0.45 of face that is not in Ω. Every term is affine or a whole cell, so this is
     # machine-exact and not a band.
-    @test [r.kind for r in kept_model.facet_regions[(face, kept_model.problem.space)]] ==
+    @test [r.kind for r in kept_model.regions[(face, kept_model.problem.space)]] ==
           [:full, :full, :cut_fitted, :fictitious_alpha]
     @test boundary_integral(q -> 1.0, kept_model; on=face) ≈ 0.55 + 1.0e-3 * 0.45 rtol = 1.0e-14
     # And the relative measure now reports α on the fictitious face rather than zero: its dofs carry α-stabilised mass
@@ -1235,7 +1245,7 @@ end
     # stabilises: the full-face tensor rule it concatenates carries points *outside* Ω, so the α = 0 invariant above is
     # forfeited on exactly the faces α touches — 5 of the 17 points here. The datum that prepared cleanly at α = 0
     # therefore raises, and raises rather than being silently extended, which is the behaviour to want of it.
-    kept_regions = kept_model.facet_regions[(face, kept_model.problem.space)]
+    kept_regions = kept_model.regions[(face, kept_model.problem.space)]
     @test count(!Unfitted._inside(kept.geometry, p) for r in kept_regions for p in facet_points(r)) == 5
     @test_throws DomainError prepare(poisson(Vkept; source=0.0, dirichlet=[only_on_omega]))
 end
@@ -1661,7 +1671,7 @@ end
     @test diagnostics(model).facet_fit_failure_count == 0
     # Four of the sixteen regions are trimmed, two per cut face: the one inside the hole and the one the arc crosses.
     # The relative measure reports the worst of them, which is the wholly fictitious one at α = 0, hence exactly zero.
-    @test [r.kind for r in model.facet_regions[(boundary(:all), model.problem.space)][1:4]] ==
+    @test [r.kind for r in model.regions[(boundary(:all), model.problem.space)][1:4]] ==
           [:fictitious, :cut_fitted, :full, :full]
     @test diagnostics(model).min_relative_facet_measure == 0.0
 
@@ -1807,7 +1817,7 @@ end
 
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
     model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
-    @test haskey(model.facet_regions, (boundary(:all), model.problem.space))
+    @test haskey(model.regions, (boundary(:all), model.problem.space))
 end
 
 @testset "except excludes closed faces, so the seam dof stays constrained" begin

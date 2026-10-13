@@ -25,6 +25,7 @@ const BSExt = Base.get_extension(Unfitted, :UnfittedBasicBSplineExt)
     # well defined B-spline level.
     W = space(Ω; cells=4, order=fill(3, 4, 4), basis=bspline())
     @test length(W.levels[1].orders.palette) == 1
+    @test W.levels[1].orders.class === nothing && W.levels[1].modes.kind === nothing
     @test nominal_order(W.levels[1]) == (3, 3)
     @test Unfitted.dof_layout(W).active_count ==
           Unfitted.dof_layout(space(Ω; cells=4, order=3, basis=bspline())).active_count
@@ -44,16 +45,30 @@ end
     # `local_basis_indices` / `local_basis_count` come from the `::BasisFamily` tensor defaults: an open-knot span
     # carries the full ∏_d {0, …, p_d} set, so the family adds nothing of its own here.
     @test Unfitted.local_basis_indices(fam, (1, 2))[1] == CartesianIndex(0, 0)
-    @test Unfitted.local_basis_indices(fam, (1, 2)) == Unfitted.local_basis_indices(fam, (1, 2), :tensor)
-    @test Unfitted.local_basis_count(fam, (3, 3), :tensor) == 16
+    @test Unfitted._with_mode(fam, :tensor) === fam
+    @test Unfitted.local_basis_indices(Unfitted._with_mode(fam, :tensor), (1, 2)) ==
+          Unfitted.local_basis_indices(fam, (1, 2))
+    @test Unfitted.local_basis_count(Unfitted._with_mode(fam, :tensor), (3, 3)) == 16
     # `dim` per axis = cells + p (open knot, no junctions, m=0).
     @test BasicBSpline.dim.(fam.spaces) == (7, 7)
 
-    # The family declares only `:tensor`, so the core mode check — not a hand-written guard in the extension — rejects
-    # integrated Legendre's `:trunk` for it, at `space` time.
-    @test Unfitted._supported_modes(fam) == (:tensor,)
+    # The family carries only `:tensor`, so the core mode check — not a hand-written guard in the extension — rejects
+    # integrated Legendre's `:trunk` for it, at `space` time and for the deferred spec and the concrete family alike.
+    @test Unfitted._mode(fam) === :tensor
     @test_throws ArgumentError space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=3, basis=bspline(), mode=:trunk)
-    @test_throws ArgumentError Unfitted.local_basis_indices(fam, (3, 3), :trunk)
+    @test_throws ArgumentError Unfitted._with_mode(fam, :trunk)
+    @test_throws ArgumentError Unfitted._with_mode(fam_marker, :trunk)
+    # The mode is judged against the family before any order is: at an anisotropic order the refusal still names the
+    # family, not `:trunk`'s isotropy requirement, which a family that has no trunk set never reaches.
+    @test_throws "does not support mode=:trunk" space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=(2, 3),
+                                                      basis=bspline(), mode=:trunk)
+end
+
+# What a B-spline level's family is: its mechanism, the continuity it was asked for, and its per-axis degrees and knots.
+_bspline_knots(family) = map(P -> Float64[t for t in BasicBSpline.knotvector(P)], family.spaces)
+function _bspline_family_key(family)
+    (BSExt._selects_by_support(family), family.continuity, map(BasicBSpline.degree, family.spaces),
+     _bspline_knots(family))
 end
 
 @testset "BSpline extension: continuity validation" begin
@@ -74,16 +89,103 @@ end
     V = space(box((0.0,), (1.0,)); cells=8, order=3, basis=bspline(continuity=1))
     @test V.levels[1].basis isa Unfitted.BasisFamily
     # An integer request that already equals p − 1 on every axis is `:maximal` by another name: the same space, reached
-    # by selection rather than by a constraint cascade. The family normalises the one spelling into the other, so the
-    # two levels are indistinguishable afterwards.
+    # by selection rather than by a constraint cascade. Both spellings take the selection mechanism over the same knot
+    # vectors, so the two levels carry the same space; each family keeps the request it was given, which is what a
+    # rebuild at another degree is judged against (see the next testset).
     Ω = box((0.0, 0.0), (1.0, 1.0))
     B = box((0.25, 0.25), (0.75, 0.75))
     max_family = space(Ω; cells=6, order=3, basis=bspline()).levels[1].basis
     int_family = space(Ω; cells=6, order=3, basis=bspline(continuity=2)).levels[1].basis
-    @test max_family.continuity == int_family.continuity
+    @test BSExt._selects_by_support(max_family) && BSExt._selects_by_support(int_family)
+    @test _bspline_knots(max_family) == _bspline_knots(int_family)
     free(b) = Unfitted.active_unknowns(prepare(mass(overlay(space(Ω; cells=16, order=3, basis=bspline()), B; cells=8,
                                                             order=3, basis=b))).dofs)
     @test free(bspline()) == free(bspline(continuity=2))
+end
+
+@testset "BSpline extension: every rebuild re-validates the requested continuity" begin
+    # A level built from an already-concrete family — overlay inheritance (`overlay`'s default `basis` is the base
+    # level's family), `elevate`, a move, a mask edit, the fold — must be judged exactly as a fresh build of the same
+    # request: refused where the explicit spelling is refused, and otherwise the same family, the same unknowns and the
+    # same operator. The family used to keep its stored continuity with only the mode checked, so each case below built
+    # a level the explicit spelling refuses or a different space from it.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    B = box((0.25, 0.25), (0.75, 0.75))
+    refusal(build) =
+        try
+            build()
+            nothing
+        catch e
+            e isa ArgumentError ? sprint(showerror, e) : rethrow()
+        end
+    # The same space: equal raw and active unknowns and equal assembled mass matrices (to round-off, since a threaded
+    # assembly need not sum in one order).
+    function same_space(V, W)
+        (mv, lv), (mw, lw) = _gram(V), _gram(W)
+        return Unfitted.raw_dof_count(lv) == Unfitted.raw_dof_count(lw) &&
+               active_unknowns(lv) == active_unknowns(lw) &&
+               isapprox(mv.matrix, mw.matrix; rtol=1e-13)
+    end
+
+    clamped_base = space(Ω; cells=8, order=3, basis=bspline(; continuity=1))
+    # (a) C¹ inherited by a degree-1 overlay, where p − 1 = 0: refused, as the explicit spelling is.
+    explicit = refusal(() -> overlay(clamped_base, B; cells=4, order=1, basis=bspline(; continuity=1)))
+    @test explicit !== nothing
+    @test refusal(() -> overlay(clamped_base, B; cells=4, order=1)) == explicit
+    # (b) a clamped request inherited by a level too thin for it (cells + p = 4 < 2m + 3 = 5): refused likewise.
+    explicit = refusal(() -> overlay(clamped_base, B; cells=1, basis=bspline(; continuity=1)))
+    @test explicit !== nothing
+    @test refusal(() -> overlay(clamped_base, B; cells=1)) == explicit
+
+    il_base = space(Ω; cells=8, order=3)
+    clamped_overlay = overlay(il_base, B; cells=8, order=3, basis=bspline(; continuity=1))
+    # (c) a C¹ level elevated to degree 1: refused, as a fresh C¹ level of degree 1 is.
+    explicit = refusal(() -> overlay(il_base, B; cells=8, order=1, basis=bspline(; continuity=1)))
+    @test explicit !== nothing
+    @test refusal(() -> elevate(clamped_overlay, 2 => 1)) == explicit
+
+    # (d) a C² request selects at degree 3 (C² = p − 1) and must stay a C² request when inherited at degree 4, where it
+    # clamps; it used to inherit as `:maximal` and silently become C³.
+    c2_base = space(Ω; cells=8, order=3, basis=bspline(; continuity=2))
+    inherited = overlay(c2_base, B; cells=8, order=4)
+    fresh = overlay(c2_base, B; cells=8, order=4, basis=bspline(; continuity=2))
+    @test BSExt._selects_by_support(c2_base.levels[1].basis)
+    @test !BSExt._selects_by_support(inherited.levels[2].basis)
+    @test _bspline_family_key(inherited.levels[2].basis) == _bspline_family_key(fresh.levels[2].basis)
+    @test same_space(inherited, fresh)
+
+    # (e) a C¹ degree-3 overlay elevated to degree 2, where C¹ = p − 1: it selects by support, as a fresh build does.
+    elevated_c1 = elevate(clamped_overlay, 2 => 2)
+    fresh = overlay(il_base, B; cells=8, order=2, basis=bspline(; continuity=1))
+    @test BSExt._selects_by_support(elevated_c1.levels[2].basis)
+    @test _bspline_family_key(elevated_c1.levels[2].basis) == _bspline_family_key(fresh.levels[2].basis)
+    @test same_space(elevated_c1, fresh)
+
+    # A rebuild that keeps the degree reproduces the family a fresh build gives: a move (new knots), a mask edit, and
+    # the fictitious fold of a cut overlay.
+    to = box((0.2, 0.3), (0.7, 0.8))
+    @test _bspline_family_key(moved_space(clamped_overlay; level=2, to).levels[2].basis) ==
+          _bspline_family_key(overlay(il_base, to; cells=8, order=3, basis=bspline(; continuity=1)).levels[2].basis)
+    mask = trues(8, 8)
+    mask[1:2, :] .= false
+    @test _bspline_family_key(adapt(clamped_overlay, 2 => mask).levels[2].basis) ==
+          _bspline_family_key(clamped_overlay.levels[2].basis)
+    half = physical_domain(x -> x[1] - 0.6; lipschitz=1.0, subcell_length_scale=1 / 32)
+    cut = overlay(space(Ω; cells=8, order=3, physical=half), B; cells=8, order=3, basis=bspline(; continuity=1))
+    folded = prepare(mass(cut)).problem.space
+    @test folded.levels[2].mask !== nothing                                  # the fold did switch cells off
+    @test _bspline_family_key(folded.levels[2].basis) == _bspline_family_key(cut.levels[2].basis)
+end
+
+@testset "BSpline extension: a degree raise changes the level's type" begin
+    # `elevate` keeps `typeof(V)` only where the degree is not a type parameter. A B-spline level's degree is one
+    # (`BSplineSpace{p}`), so a raise is a new level type — and a valid one, the same as a fresh build at that degree.
+    Ω = box((0.0, 0.0), (1.0, 1.0))
+    V = space(Ω; cells=4, order=2, basis=bspline())
+    W = elevate(V, 1 => 3)
+    @test typeof(W) !== typeof(V)
+    @test typeof(W) === typeof(space(Ω; cells=4, order=3, basis=bspline()))
+    @test typeof(elevate(V, 1 => 2)) === typeof(V)
 end
 
 @testset "BSpline extension: support selection — the dof ledger is the closed form" begin
@@ -183,7 +285,7 @@ end
     # Integrated Legendre's modes are cell-local or shared across the face they sit on, so its radius is zero and the
     # dilation is the identity.
     V = space(Ω; cells=16, order=3)
-    @test support_extension(V, marked; level=1) == Unfitted._normalize_mask(marked, V.levels[1].mesh).on
+    @test support_extension(V, marked; level=1) == Unfitted._normalize_mask(marked, V.levels[1].mesh)
     # A degree-p B-spline reaches p cells, so a 2×2 block becomes (2 + 2p)².
     for p in 1:3
         W = space(Ω; cells=16, order=p, basis=bspline())
@@ -532,7 +634,7 @@ end
     cell = CartesianIndex(2)
     val1d = (Vector{Float64}(undef, 4),)  # p + 1 = 4
     ξ = SVector(0.5)
-    Unfitted._fill_factor_tables!(fam, val1d, (3,), ξ, cell)
+    Unfitted._fill_factor_tables!(fam, val1d, nothing, (3,), ξ, cell)
     # Direct reference: cell 2 spans t ∈ [0.25, 0.5], midpoint at ξ = 0.5 maps to t = 0.25 + (0.5 + 1) / 2 * 0.25 =
     # 0.25 + 0.1875 = 0.4375.
     P = fam.spaces[1]
@@ -541,13 +643,94 @@ end
         @test val1d[1][i] ≈ expected[i]
     end
 
-    # The generic `::BasisFamily` evaluator must carry `cell` through to the span lookup — in 1D its output is exactly
-    # the per-axis table, so it can be compared to BasicBSpline directly, and evaluating the same ξ on cell 1 must give
-    # a different span and different values.
-    on_cell2 = Unfitted.basis_values(fam, (3,), :tensor, ξ, cell)
-    on_cell1 = Unfitted.basis_values(fam, (3,), :tensor, ξ, CartesianIndex(1))
+    # The level-keyed evaluator must carry `cell` through to the span lookup — in 1D its output is exactly the per-axis
+    # table, so it can be compared to BasicBSpline directly, and evaluating the same ξ on cell 1 must give a different
+    # span and different values.
+    level = V.levels[1]
+    on_cell2 = Unfitted.basis_values(level, cell, ξ)
+    on_cell1 = Unfitted.basis_values(level, CartesianIndex(1), ξ)
     @test on_cell2 ≈ collect(expected)
     @test on_cell1 != on_cell2
+    # A cell off the level's grid is refused before the kernel could read the knot vector past its end.
+    @test_throws BoundsError Unfitted.basis_values(level, CartesianIndex(9), ξ)
+    @test_throws BoundsError Unfitted.physical_basis_gradients(level, CartesianIndex(9), box((0.0,), (1.0,)), ξ)
+end
+
+@testset "BSpline extension: derivative tables against finite differences and the derivative space" begin
+    # The kernel maps ξ ∈ [−1, 1] onto the cell's knot interval, read off the knot vector, fills the values there and,
+    # when asked, the t-derivatives of the derivative space scaled by the half-width into ξ-derivatives. Checked on an
+    # off-origin mesh whose cell widths are not dyadic, in 1D and in 2D with anisotropic degrees, on the first, an
+    # interior and the last cell of every axis:
+    #   * the derivative tables are the central finite differences of the value tables in ξ;
+    #   * both tables are BasicBSpline's own `bsplinebasisall` of the space and of `BSplineDerivativeSpace{1}` at the
+    #     parameter mapped from the level's mesh nodes, the derivatives times the half-width;
+    #   * the values-only call (`der1d === nothing`) fills the same value tables.
+    h = 1.0e-6
+    for (lower, upper, cells, order) in (((-0.3,), (1.45,), (6,), (3,)), ((-0.3, 0.2), (1.45, 0.9), (6, 5), (2, 3)))
+        D = length(order)
+        level = space(box(lower, upper); cells, order, basis=bspline()).levels[1]
+        family = level.basis
+        tables() = Unfitted._factor_buffers(order, Float64)
+        for cell in (CartesianIndex(ntuple(_ -> 1, D)), CartesianIndex(ntuple(_ -> 3, D)), CartesianIndex(cells)),
+            ξ in (SVector{D}(ntuple(d -> -0.8 + 0.1d, D)), SVector{D}(ntuple(d -> 0.35 - 0.2d, D)),
+                  SVector{D}(ntuple(_ -> 0.9, D)))
+
+            val1d, der1d, values_only = tables(), tables(), tables()
+            Unfitted._fill_factor_tables!(family, val1d, der1d, order, ξ, cell)
+            Unfitted._fill_factor_tables!(family, values_only, nothing, order, ξ, cell)
+            @test values_only == val1d
+            for d in 1:D
+                plus, minus = tables(), tables()
+                Unfitted._fill_factor_tables!(family, plus, nothing, order,
+                                              SVector{D}(ntuple(e -> ξ[e] + (e == d) * h, D)), cell)
+                Unfitted._fill_factor_tables!(family, minus, nothing, order,
+                                              SVector{D}(ntuple(e -> ξ[e] - (e == d) * h, D)), cell)
+                @test der1d[d] ≈ (plus[d] .- minus[d]) ./ (2h) rtol = 1.0e-7 atol = 1.0e-8
+
+                a, b = level.mesh.axes[d][cell[d]], level.mesh.axes[d][cell[d] + 1]
+                t = a + (ξ[d] + 1) * (b - a) / 2
+                P = family.spaces[d]
+                @test val1d[d] ≈ collect(bsplinebasisall(P, cell[d], t)) rtol = 1.0e-13
+                derivative = collect(bsplinebasisall(BSplineDerivativeSpace{1}(P), cell[d], t))
+                @test der1d[d] ≈ derivative .* ((b - a) / 2) rtol = 1.0e-13
+            end
+        end
+    end
+end
+
+# Bytes one warm call of the factor fill, and of the tensor-product kernel (values only when `grad === nothing`),
+# allocates; the first call of each compiles.
+function _bspline_fill_bytes(family, val1d, der1d, order, ξ, cell)
+    Unfitted._fill_factor_tables!(family, val1d, der1d, order, ξ, cell)
+    return @allocated Unfitted._fill_factor_tables!(family, val1d, der1d, order, ξ, cell)
+end
+function _bspline_kernel_bytes(family, values, ids, order, ξ, val1d, cell, grad)
+    kernel() = grad === nothing ? Unfitted._tensor_values!(family, values, ids, order, ξ, val1d, cell) :
+               Unfitted._tensor_values!(family, values, ids, order, ξ, val1d, cell, grad)
+    kernel()
+    return @allocated kernel()
+end
+
+@testset "BSpline extension: the hot kernel allocates nothing when the degrees differ by axis" begin
+    # The degree is a type parameter of each axis's `BSplineSpace`, so the family's tuple of spaces holds different
+    # types when the degrees differ by axis. The factor fill and the tensor-product kernel run once per parent per
+    # quadrature point in assembly and transfer and must not allocate there, on such a level as on an isotropic one.
+    for V in (space(box((-0.3, 0.2), (1.45, 0.9)); cells=(6, 5), order=(2, 3), basis=bspline()),
+              space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(4, 5, 3), order=(1, 2, 3), basis=bspline()))
+        level = V.levels[1]
+        order = Unfitted.nominal_order(level)
+        D = length(order)
+        cell = CartesianIndex(ntuple(_ -> 2, D))
+        ξ = SVector{D}(ntuple(d -> 0.3 - 0.2d, D))
+        ids = Unfitted.cell_basis_indices(level, cell)
+        val1d, der1d = Unfitted._factor_buffers(order, Float64), Unfitted._factor_buffers(order, Float64)
+        values, gradients = zeros(length(ids)), zeros(SVector{D,Float64}, length(ids))
+        grad = (gradients, SVector{D}(ntuple(_ -> 2.0, D)), der1d)
+        @test _bspline_fill_bytes(level.basis, val1d, der1d, order, ξ, cell) == 0
+        @test _bspline_kernel_bytes(level.basis, values, ids, order, ξ, val1d, cell, nothing) == 0
+        @test _bspline_fill_bytes(level.basis, val1d, nothing, order, ξ, cell) == 0
+        @test _bspline_kernel_bytes(level.basis, values, ids, order, ξ, val1d, cell, grad) == 0
+    end
 end
 
 @testset "BSpline extension: dof-key sharing across cells" begin
@@ -1015,7 +1198,7 @@ function _span_contains_by_definition(k, level)
     p = ntuple(d -> degree(level.basis.spaces[d]), 2)
     k.basis isa BSExt.BSplineFamily && return all(d -> degree(k.basis.spaces[d]) == p[d], 1:2)
     k.basis isa Unfitted.IntegratedLegendre || return false
-    k.mode === :tensor || return false
+    Unfitted._mode(k.basis) === :tensor || return false
     return all(o -> all(d -> o[d] >= p[d], 1:2), k.orders.palette)
 end
 
@@ -1130,20 +1313,25 @@ end
 
 @testset "BSpline extension: moved overlay rebuilds knot vectors" begin
     # Moving a B-spline overlay must rebuild its per-axis knot vectors for the overlay's new cell coordinates — reusing
-    # the stale family would leave `axis_coords` / `cell_to_span` pointing at the old position and corrupt every basis
-    # evaluation on the moved level. Regression for the `instantiate_basis` hook on `moved_space`.
+    # the stale family would leave the knots, which the kernel reads each cell's parameter interval from, at the old
+    # position and corrupt every basis evaluation on the moved level. Regression for the `instantiate_basis` hook on
+    # `moved_space`. Between the `p + 1`-fold clamped ends the knots are the level's own mesh nodes.
     V = space(box((0.0,), (1.0,)); cells=8, order=3)
     V = overlay(V, box((0.2,), (0.6,)); cells=4, order=3, basis=bspline())
     fam_before = V.levels[2].basis
     @test fam_before isa Unfitted.BasisFamily
-    @test fam_before.axis_coords[1][1] ≈ 0.2
-    @test fam_before.axis_coords[1][end] ≈ 0.6
+    knots_before = collect(BasicBSpline.knotvector(fam_before.spaces[1]))
+    @test knots_before[1] ≈ 0.2
+    @test knots_before[end] ≈ 0.6
+    @test knots_before[4:(end-3)] == V.levels[2].mesh.axes[1]
 
     V2 = moved_space(V; level=2, to=box((0.3,), (0.7,)))
     fam_after = V2.levels[2].basis
     @test fam_after isa typeof(fam_before)
-    @test fam_after.axis_coords[1][1] ≈ 0.3
-    @test fam_after.axis_coords[1][end] ≈ 0.7
+    knots_after = collect(BasicBSpline.knotvector(fam_after.spaces[1]))
+    @test knots_after[1] ≈ 0.3
+    @test knots_after[end] ≈ 0.7
+    @test knots_after[4:(end-3)] == V2.levels[2].mesh.axes[1]
     # Cell count and degree are unchanged, so dim = cells + p still holds.
     @test BasicBSpline.dim(fam_after.spaces[1]) == 4 + 3
 

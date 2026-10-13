@@ -165,7 +165,7 @@ end
           _warm_boundary_allocations(integrand, small, boundary(:all)) < 10
 end
 
-@testset "model.surface_regions caches one entry per BoundaryMesh" begin
+@testset "model.regions caches one entry per BoundaryMesh" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
     V = space(omega; cells=(4, 4), order=1)
     mesh = segment_mesh([(SVector(0.05, 0.10), SVector(0.20, 0.10))])
@@ -175,12 +175,12 @@ end
 
     # One entry, keyed on (mesh, space): the mesh half matches by object identity, the space half is the subdomain the
     # regions were cut against — here the model's only space.
-    @test length(model.surface_regions) == 1
-    on, key_space = only(keys(model.surface_regions))
+    @test length(model.regions) == 1
+    on, key_space = only(keys(model.regions))
     @test on === mesh
     @test key_space === model.problem.space
-    @test haskey(model.surface_regions, (mesh, model.problem.space))
-    @test diagnostics(model).surface_region_count == length(model.surface_regions[(mesh, model.problem.space)])
+    @test haskey(model.regions, (mesh, model.problem.space))
+    @test diagnostics(model).surface_region_count == length(model.regions[(mesh, model.problem.space)])
     @test nquadpoints(model; kind=:surface) > 0
     # With one cached mesh the aggregate and the per-`on=` count coincide; the `on=` form is the one that stays equal to
     # the `q.point` range once a second mesh is cached.

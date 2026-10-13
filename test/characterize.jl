@@ -37,8 +37,8 @@
 #
 # Determinism rules obeyed here, because a diff is the whole product:
 #   * fixed case order, fixed key order, no timings, no addresses, no paths;
-#   * `Dict` / `IdDict` iteration order is never observable — the two identity-keyed region caches are read through the
-#     objects that key them, and every derived multiset is sorted before printing;
+#   * `Dict` / `IdDict` iteration order is never observable — the model's region cache, keyed partly by identity, is
+#     read through the objects that key it or only counted, and every derived multiset is sorted before printing;
 #   * floating-point values print through `repr`, i.e. shortest-round-trip full precision, so a change in the last bit
 #     shows up as a diff.
 #
@@ -250,7 +250,7 @@ end
 # never depends on Dict order.
 function region_kinds(model)
     counts = Dict{Symbol,Int}()
-    for plan in model.space_plans, region in plan.regions
+    for subdomain in model.subdomains, region in subdomain.plan.regions
         counts[region.kind] = get(counts, region.kind, 0) + 1
     end
     return join((string(k, "=", counts[k]) for k in sort!(collect(keys(counts)))), " ")
@@ -260,7 +260,7 @@ end
 # multi-level intersection moved.
 function cover_histogram(model)
     counts = Dict{Int,Int}()
-    for plan in model.space_plans, region in plan.regions
+    for subdomain in model.subdomains, region in subdomain.plan.regions
         c = length(region.parents)
         counts[c] = get(counts, c, 0) + 1
     end
@@ -274,7 +274,7 @@ function domain_measure(model)
     D = diagnostics(model).dimension
     jacobian_scale = 1 / 2.0^D
     total = 0.0
-    for plan in model.space_plans, region in plan.regions
+    for subdomain in model.subdomains, region in subdomain.plan.regions
         w = 0.0
         for weight in region.weights
             w += weight
@@ -288,7 +288,7 @@ end
 # described in the `PhysicalDomain` docstring.
 function empty_region_count(model)
     n = 0
-    for plan in model.space_plans, region in plan.regions
+    for subdomain in model.subdomains, region in subdomain.plan.regions
         isempty(region.weights) && (n += 1)
     end
     return n
@@ -622,7 +622,7 @@ function main()
                                            dirichlet(g; on=boundary(:all), field=:u2)]))
         solution = solve!(model)
         samples = ((u1, ((0.5, 0.5), (0.25, 0.5))), (u2, ((2.5, 0.5), (2.25, 0.5))))
-        emit("facet_cache_keys", length(model.facet_regions))
+        emit("facet_cache_keys", count(key -> first(key) isa Unfitted.BoundarySelector, keys(model.regions)))
         emit_model(model)
         emit_solution(model, solution; fields=samples)
         worst = 0.0
@@ -743,7 +743,7 @@ function main()
                                 dirichlet=[dirichlet(0.0; on=boundary(axis=1, side=:lower), field=:u1),
                                            dirichlet(0.0; on=boundary(axis=1, side=:lower), field=:u2)]))
         solution = solve!(model)
-        emit("facet_cache_keys", length(model.facet_regions))
+        emit("facet_cache_keys", count(key -> first(key) isa Unfitted.BoundarySelector, keys(model.regions)))
         emit_model(model)
         n = active_unknowns(model)
         half = n ÷ 2
@@ -928,10 +928,10 @@ function main()
                                            dirichlet(0.0; on=boundary(axis=1, side=:lower), field=:u2),
                                            dirichlet(0.0; on=boundary(axis=1, side=:upper), field=:u2)]))
         solution = solve!(model)
-        # Read the interface-region cache through the very object that keys it: the cache is an `IdDict`, so iterating
-        # it would expose identity-hash order to the report. `prepare` pre-resolves every referenced interface, so a
-        # `KeyError` here would itself be a finding.
-        regions = model.interface_regions[cpl[1].on]
+        # Read the interface's entry of the region cache through the very object that keys it: interfaces key the
+        # cache by identity, so iterating it would expose identity-hash order to the report. `prepare` pre-resolves
+        # every referenced interface, so a `KeyError` here would itself be a finding.
+        regions = model.regions[(cpl[1].on, nothing)]
         measure = 0.0
         for region in regions, w in region.weights
             measure += w

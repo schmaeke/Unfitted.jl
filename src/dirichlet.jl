@@ -308,11 +308,11 @@ at, together with the per-face memo (`FacetKey` → region list) it fills as fac
 those regions share.
 
 One resolver belongs to a [`Model`](@ref) and lives as long as it does, so every consumer of grid-aligned boundary
-integration shares one resolution per `(space, face)` pair — the per-selector cache `prepare` builds
-(`_resolve_facet_regions`), the one-shot lookup `_region_list` falls back to for a selector no `prepare` saw, and the L²
-Dirichlet projection (`_dirichlet_projection`), which reaches the same faces from the dof layer. Sharing is worth
-arranging because `_boundary_facet_regions` is a pure function of `(V, sides, tolerance)`: a second resolution of a face
-can only ever reproduce the first one, at full price.
+integration shares one resolution per `(space, face)` pair — the per-selector entries `prepare` resolves into
+`Model.regions` (`_resolve_target`), the one-shot lookup `_region_list` falls back to for a selector no `prepare` saw,
+and the L² Dirichlet projection (`_dirichlet_projection`), which reaches the same faces from the dof layer. Sharing is
+worth arranging because `_boundary_facet_regions` is a pure function of `(V, sides, tolerance)`: a second resolution of
+a face can only ever reproduce the first one, at full price.
 
 The memo is filled lazily and so is mutated by lookups, which is safe for the same reason the integration plan's
 moment-fit cache is: every resolution happens on the task that called the public API — `prepare`, `update_dirichlet!`,
@@ -477,11 +477,12 @@ end
 # The fits are entered through `Base.inferencebarrier` (the idiom of `_coverage_constraints!` in `dofs.jl`), so
 # inference never descends from here into the moment-fit chain — `_fit_rules`, `moment_fit_rule`, the implicit kernel,
 # NNLS. The call is resolved at run time on the slice's concrete type, and the chain is inferred and compiled when a
-# face first has a cut region, not before. Without the barrier, the abstract inference `_regions` (`assembly.jl`) starts
-# on its unspecialised `space` reaches this call with the face's dimension and number type unknown and infers the whole
-# chain for them, in code that never runs — on the Kirsch plate's first assemble (12² cells, p = 3, no facet region
-# cut), 2726 of the 8249 method instances it inferred; with the barrier it infers 4730 and none of the chain. The
-# result is asserted to its concrete type, so the rule loop below stays statically dispatched.
+# face first has a cut region, not before. Without the barrier, an inference that reaches this call with the face's
+# dimension and number type unknown infers the whole chain for them, in code that never runs. That was measured while
+# `_regions` (`assembly.jl`) still started one on its unspecialised `space`, before its miss path went behind a barrier
+# of its own: on the Kirsch plate's first assemble (12² cells, p = 3, no facet region cut), 2726 of the 8249 method
+# instances it inferred; with the barrier it infers 4730 and none of the chain. The result is asserted to its concrete
+# type, so the rule loop below stays statically dispatched.
 function _facet_regions(records::Vector{_RegionRecord{D,T}}, slice, sides::Vector{Tuple{Int,Symbol}},
                         free_axes::Vector{Int}, pins, rules::_TensorRuleCache{D,T}, ::Val{F}) where {D,T,F}
     function key(record)

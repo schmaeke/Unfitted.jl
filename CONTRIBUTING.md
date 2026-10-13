@@ -143,7 +143,7 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `implicit.jl`     | Saye dimension-reduction implicit quadrature on the level set (volume rules) |
 | `basis.jl`        | basis-family interface and capability traits, integrated Legendre default, the `:tensor` / `:trunk` index sets and the `_index_admissible` filter the minimum rule is expressed over, tensor-product evaluation |
 | `fcm.jl`          | finite-cell-method cut-cell quadrature: exact moments from `implicit.jl`, non-negative (NNLS) moment fit |
-| `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks (`LevelMask`) and per-cell polynomial order (`CellOrders` / `CellModes`); the `space` / `overlay` / `adapt` / `elevate` verbs |
+| `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks (`LevelMask`, an alias of `BitArray`) and per-cell polynomial order (`CellOrders` / `CellModes`, with no per-cell arrays on a uniform level); the `space` / `overlay` / `adapt` / `elevate` verbs |
 | `intersections.jl`| the integration-region record (`Region`, `Parent`) and admissible integration regions for non-matching meshes; cut/fictitious region-quadrature dispatch |
 | `coverage.jl`     | per-level covered-cell masks (`Coverage`, `build_coverage`); the mask- and material-aware covering rule behind covered-mode pruning; the material oracle (`_Fold`) the dof layer asks whether an inactive cell holds material |
 | `ladder.jl`       | nested refinement ladders: `ladder` declaration, the depth-map form of `adapt` and the `depth_masks` grading behind it, cross-level cell mapping (`overlapping_cells`), the `is_nested` predicate |
@@ -349,9 +349,21 @@ small interface.
 A basis family must provide, directly or through a compact trait-like
 interface:
 
-  - the number and identity of local basis functions for a cell or span;
+  - the number and identity of local basis functions for a cell or span:
+    `local_basis_indices(F, order)`, one form, whose family value carries
+    the basis mode. The `mode` keyword of `space` / `overlay` / `ladder` is
+    folded into the family once, when a level is built, by
+    `_with_mode(F, mode)` (the `::BasisFamily` default serves `:tensor`
+    alone; integrated Legendre adds `:trunk`), so no index-set question
+    takes a mode argument and `_mode(F)` reads it back;
+  - `instantiate_basis(F, mesh, order)` when the concrete family depends on
+    the level's mesh (the B-spline knot vectors), run on every build and
+    rebuild of a level;
   - the active basis functions covering an element or integration box;
-  - values and physical/reference gradients at quadrature points;
+  - values and physical/reference gradients at quadrature points, through
+    the one per-family `_fill_factor_tables!` hook that the hot path and
+    the level-keyed evaluators `basis_values(level, cell, ξ)` /
+    `physical_basis_gradients(level, cell, box, ξ)` share;
   - a tensor-product ordering convention;
   - support information sufficient for overlap queries and assembly;
   - boundary or entity association information needed for physical
@@ -427,7 +439,8 @@ concatenated field-by-field (one entry per level of each field, in
 declaration order).
 
 Cells of a level may also be selectively activated or deactivated via a
-per-cell `LevelMask`. See *Selective activation* below.
+per-cell `LevelMask` — a `BitArray` over the level's cells, or `nothing`
+for "every cell active". See *Selective activation* below.
 
 ### Degree-of-freedom enumeration and constraints
 
@@ -685,7 +698,7 @@ features evolve.
     invalidation contract: bump `model.version`, clear `model.matrix` and
     `model.rhs`, replace the assembly cache (`model.assembly`), drop the
     Dirichlet projection cache, rebuild the integration plan, dof layout and the
-    facet / surface / interface region caches, and refresh diagnostics.
+    region cache (`model.regions`), and refresh diagnostics.
     An outstanding `Solution` raises on stale reuse. Like `move!`, they
     address a level by position in the model's single space and
     therefore raise `ArgumentError` on a multi-domain (coupled) model.
@@ -774,19 +787,36 @@ superposition idea for its own enrichment.
     cells must be skipped rather than minimised over (a fictitious fold
     otherwise loses live dofs).
   - **One order field, two readers.** `Level.orders` is a `CellOrders` — a
-    palette of the distinct per-axis orders plus one index per cell, so a
-    uniform level is a palette of one and not a special case.
+    palette of the distinct per-axis orders plus, on a graded level, one
+    `UInt16` index per cell. A uniform level stores its one palette entry
+    and no per-cell index (`class = nothing`), and its minimum-rule table
+    stores its one index set and no per-cell map (`kind = nothing`; every
+    active cell generates it, and the mask says which cells are active).
+    That revises an earlier rule — "a uniform level is a palette of one and
+    not a special case" — for a measured reason: on a uniform level both
+    per-cell arrays are constants, 4 bytes on every cell of most levels
+    (`Base.summarysize` of an 8² ladder of depth 7: 4.15 bytes per cell
+    with them, 0.15 without, the mask's bit per cell being most of the rest;
+    about 90 MB across the 22.4 M cells of a depth-9 stack), and the
+    discretisation pin digested the class array at 8 hash rounds per cell.
+    The record type is still one; the uniform case is one `nothing` branch
+    in four readers — `cell_order`, `cell_basis_indices`, `cell_orders` and
+    the assembly hot path's `_active_set`, which reads no mask because
+    every region parent is an active cell by construction (`_signature`).
+    The readers check the cell against the level's grid themselves, since
+    a uniform level has no array whose indexing would.
     `cell_order(level, cell)` is the question anything that integrates,
     evaluates or subdivides must ask, and every quadrature consumer does:
     the region rule, the moment-fit order, the facet rule, the immersed
     simplex rule and the VTK subdivision all size from the parent *cell*.
     `nominal_order(level)` is the per-axis maximum over the palette, and it
-    is a sizing and default quantity — workspace banks and 1D factor
-    buffers, where over-sizing is safe; and the order a new `overlay` or a
-    re-instantiated basis family inherits. `Level.modes` is the derived
-    minimum-rule table (`CellModes`), computed by `Level`'s inner
-    constructor from the orders, the mesh, the mode and the mask, and never
-    supplied by a caller.
+    is a sizing and default quantity — the workspace's 1D factor buffers,
+    where over-sizing is safe (its value and gradient buffers are sized
+    from the level's longest minimum-rule set instead); and the order a new
+    `overlay` or a re-instantiated basis family inherits. `Level.modes` is
+    the derived minimum-rule table (`CellModes`), computed by `Level`'s
+    inner constructor from the orders, the mesh, the family (which carries
+    the basis mode) and the mask, and never supplied by a caller.
   - **Order ≥ 1 per cell** is enforced per palette entry at construction, and
     `mode = :trunk` requires isotropy per cell. Neither can be expressed by
     the minimum rule: the dof key collapses the two endpoint modes into one
@@ -1448,10 +1478,12 @@ demos.
     `LevelMask` and a geometrically smaller overlay covering the same
     active cells; artificial-boundary constraint on internal
     active/inactive interfaces; `activate!`/`deactivate!` invalidation
-    contract. `dilate`'s box shape (one cell grows to `∏_d (2·by_d + 1)`),
-    its per-axis widths, its monotonicity in the width, its clipping at a
-    box face, its refusals, and its agreement with `support_extension` at
-    the family's own radius.
+    contract; every region parent an active cell of its level, on a
+    masked uniform overlay, an immersed level and a ladder — the
+    invariant the hot path's mask-free set read rests on. `dilate`'s box
+    shape (one cell grows to `∏_d (2·by_d + 1)`), its per-axis widths, its
+    monotonicity in the width, its clipping at a box face, its refusals,
+    and its agreement with `support_extension` at the family's own radius.
   - Immersed boundary (`PhysicalDomain`): strict-α cell-level
     fictitious fold drops the right cells; the expected
     `:full` / `:cut_fitted` / `:fictitious_alpha` / `:cut_fallback` /

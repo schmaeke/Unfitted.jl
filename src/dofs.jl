@@ -1254,37 +1254,31 @@ end
 
 # Integrated Legendre's method of the `_cell_modes` hook whose generic form is in `mesh.jl`. It lives here, with
 # `_entity_carries` and the `TensorDofKey` factors the minimum rule is expressed over, the same way the B-spline
-# family's burial hooks live in its extension.
+# family's burial hooks live in its extension. Only a graded level reaches it — `Level`'s constructor answers a uniform
+# one, whose table has no per-cell map — so the order record carries its class array here.
 #
 # The per-order index sets are hoisted out of the cell loop: there are only `length(palette)` distinct answers and
 # `local_basis_indices` allocates a fresh vector on every call, so asking it per cell allocated one vector per active
 # cell of the level. Measured on a 16³ level carrying 36 distinct anisotropic orders, 36 973 allocations and 30.6 ms
-# against 23 912 and 28.5 ms.
-function _cell_modes(basis::IntegratedLegendre, orders::CellOrders{D}, mesh::CartesianMesh{D}, mode::Symbol,
-                     mask) where {D}
-    length(orders.palette) == 1 && return _uniform_cell_modes(basis, orders, mesh, mode, mask)
+# against 23 912 and 28.5 ms. The distinct kept sets are interned (`_intern!`) the way the order palette is.
+function _cell_modes(basis::IntegratedLegendre, orders::CellOrders{D}, mesh::CartesianMesh{D}, mask) where {D}
     n = mesh.cells
+    class = orders.class::Array{UInt16,D}
     sets = [CartesianIndex{D}[]]
-    index = Dict{Vector{CartesianIndex{D}},UInt16}(sets[1] => UInt16(1))
+    slot = Dict(sets[1] => UInt16(1))
     kind = Array{UInt16,D}(undef, n)
-    sets_by_class = [local_basis_indices(basis, o, mode) for o in orders.palette]
+    sets_by_class = [local_basis_indices(basis, o) for o in orders.palette]
     for cell in cell_indices(mesh)
         if !is_active(mask, cell)
             kind[cell] = UInt16(1)
             continue
         end
         kept = CartesianIndex{D}[]
-        for id in sets_by_class[orders.class[cell]]
+        for id in sets_by_class[class[cell]]
             key = TensorDofKey{D}(0, ntuple(d -> _axis_dof_key(cell.I[d], id.I[d]), D))
-            _entity_carries(basis, orders, mask, key, n, mode, id) && push!(kept, id)
+            _entity_carries(basis, orders, mask, key, n, id) && push!(kept, id)
         end
-        kind[cell] = get!(index, kept) do
-            length(sets) == typemax(UInt16) &&
-                throw(ArgumentError("a level carries at most $(typemax(UInt16)) distinct " *
-                                    "per-cell mode sets, and this one asks for more"))
-            push!(sets, kept)
-            UInt16(length(sets))
-        end
+        kind[cell] = _intern!(slot, sets, kept, "per-cell mode sets")
     end
     return CellModes{D}(sets, kind)
 end
@@ -1293,10 +1287,10 @@ end
 # own order. The generating cell is itself incident, and `id` came from its own index set, so the loop is never empty
 # and the unconstrained case needs no separate answer.
 function _entity_carries(basis::BasisFamily, orders::CellOrders{D}, mask, key::TensorDofKey{D}, n::NTuple{D,Int},
-                         mode::Symbol, id::CartesianIndex{D}) where {D}
+                         id::CartesianIndex{D}) where {D}
     for ci in _incident_cells(key, n)
         is_active(mask, ci) || continue
-        _index_admissible(basis, orders.palette[orders.class[ci]], mode, id) || return false
+        _index_admissible(basis, _order_at(orders, ci), id) || return false
     end
     return true
 end

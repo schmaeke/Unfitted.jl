@@ -272,8 +272,8 @@ end
 
     # One surface-region entry per (mesh, space) site either way: the shared object is cached twice — once per subdomain
     # — not once.
-    @test length(shared.surface_regions) == 2
-    @test length(separate.surface_regions) == 2
+    @test length(shared.regions) == 2
+    @test length(separate.regions) == 2
     @test diagnostics(shared).surface_region_count == diagnostics(separate).surface_region_count
 
     # Both subdomains really carry the surface mass: dropping either one would leave that field's diagonal block equal
@@ -321,8 +321,8 @@ end
 
     # The cache holds four entries — two selector values × two subdomains — and each one's facets sit on the face of
     # *its own* subdomain, not subdomain 1's.
-    @test length(model.facet_regions) == 4
-    for ((on, key_space), regions) in model.facet_regions
+    @test length(model.regions) == 4
+    for ((on, key_space), regions) in model.regions
         @test !isempty(regions)
         expected = on.sides == [(1, :upper)] ? key_space.domain.upper[1] : key_space.domain.lower[1]
         for region in regions, x in coupled_facet_points(region)
@@ -332,7 +332,7 @@ end
 
     # Both faces of both subdomains are represented: x = 0 and 1 (subdomain 1), x = 2 and 3 (subdomain 2). Before the
     # fix only 0 and 1 ever appeared.
-    faces = sort(unique(round(x[1]; digits=12) for regions in values(model.facet_regions) for region in regions
+    faces = sort(unique(round(x[1]; digits=12) for regions in values(model.regions) for region in regions
                         for x in coupled_facet_points(region)))
     @test faces == [0.0, 1.0, 2.0, 3.0]
 end
@@ -429,8 +429,14 @@ end
     @test diagnostics(model).interface_region_count > 0
     @test nquadpoints(model; kind=:interface) > 0
     @test nquadpoints(model; kind=:interface) ==
-          sum(length(r.weights) for list in values(model.interface_regions) for r in list)
+          sum(length(r.weights) for (key, list) in model.regions if first(key) isa Interface for r in list)
     @test_throws ArgumentError nquadpoints(model; kind=:nonsense)
+
+    # The plan statistics of a coupled model are sums over its subdomains' plans, one plan per subdomain.
+    plans = Unfitted.integration_plans(model)
+    @test length(plans) == 2
+    @test diagnostics(model).integration_regions == sum(length(p.regions) for p in plans)
+    @test diagnostics(model).integration_regions > maximum(length(p.regions) for p in plans)
 end
 
 # Symmetric weighted-Nitsche coupling via a two-sided InterfaceForm (κ=1, w=½). The interface normal must point a→b; the
@@ -571,10 +577,10 @@ end
     # An `Interface` matches by its two field names, in order, and its mesh object, so the `iface` built here apart from
     # `couple` is the coupling's own key and walks the list `prepare` resolved. Swapped fields are another coupling, and
     # an equal mesh rebuilt as a new object is another key, resolved again on its own to the same points.
-    @test iface == interface(u1, u2, Γ) && haskey(model.interface_regions, iface)
+    @test iface == interface(u1, u2, Γ) && haskey(model.regions, (iface, nothing))
     @test interface(u2, u1, Γ) != iface
     Γ′ = polyline_mesh([SVector(1.0, 0.5), SVector(0.0, 0.5)])
-    @test interface(u1, u2, Γ′) != iface && !haskey(model.interface_regions, interface(u1, u2, Γ′))
+    @test interface(u1, u2, Γ′) != iface && !haskey(model.regions, (interface(u1, u2, Γ′), nothing))
     @test nquadpoints(model; on=interface(u1, u2, Γ′)) == count
 
     # The iterator visits each point once, with unit a→b normals; the weights sum to the interface length.

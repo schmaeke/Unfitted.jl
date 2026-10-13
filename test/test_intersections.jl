@@ -82,7 +82,7 @@ end
     bc = [dirichlet(0.0; on=boundary(:all))]
     to = box((0.35, 0.1), (0.75, 0.5))
     V_end = overlay(base, to; cells=(2, 2), order=2)
-    model_boxes(model) = boxes(only(model.space_plans))
+    model_boxes(model) = boxes(only(model.subdomains).plan)
     direct = prepare(stiffness(V_end; dirichlet=bc); criterion=:all_levels)
     mover = prepare(stiffness(V; dirichlet=bc); criterion=both)
     @test model_boxes(mover) == boxes(all_plan)

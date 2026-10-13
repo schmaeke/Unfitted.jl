@@ -41,19 +41,21 @@ cell-local mode index is mapped to its global 1D function index via the `_AXIS_B
 
 # What this extension installs
 
-  - `BSplineFamily{D,T,…}` (a `BasisFamily` subtype) plus a deferred `_BSplineSpec` returned by the public
+  - `BSplineFamily{D,S}` (a `BasisFamily` subtype) plus a deferred `_BSplineSpec` returned by the public
     [`bspline`](@ref) factory. The deferred form lives only between `bspline(...)` and the [`instantiate_basis`](@ref)
     hook, which materialises the per-axis `BSplineSpace`s once the mesh axes are known. The knot vectors depend on the
     mesh alone — never on the mask, whose faces are handled by the selection and the constraints described below.
   - The family-specific basis-interface overloads — `basis_name` and `is_boundary_basis`. Everything else in the
     interface is inherited from the `::BasisFamily` defaults in `src/basis.jl`: the tensor `local_basis_indices` /
     `local_basis_count` (an open-knot span carries exactly the full `∏_d {0, …, p_d}` set),
-    `recommended_quadrature_order`, `is_facet_basis`, `boundary_basis_indices`, `basis_values`,
-    `physical_basis_gradients`, and the boundary trace. The family declares no mode support of its own either: the
-    `::BasisFamily` default is `:tensor` only, which is exactly what this family serves, so `_check_basis_mode` rejects
-    `:trunk` for it.
-  - Hot-path `_fill_factor_tables!` overloads (values, values + derivatives) using `BasicBSpline.bsplinebasisall` per
-    axis after mapping the cell-local reference coordinate `ξ ∈ [−1, 1]` to the knot-vector parameter.
+    `recommended_quadrature_order`, `is_facet_basis`, `boundary_basis_indices`, and the boundary trace; the level-keyed
+    point evaluators `basis_values` / `physical_basis_gradients` reach the family through the kernels below alone. The
+    family declares no mode support of its own either: the `::BasisFamily` default `_with_mode` accepts `:tensor` only,
+    which is exactly what this family serves, so it rejects `:trunk` for both the deferred spec and the concrete family
+    before a level is built.
+  - The hot-path `_fill_factor_tables!` method (values, and derivatives unless the caller asks for values only) using
+    `BasicBSpline.bsplinebasisall` per axis after mapping the cell-local reference coordinate `ξ ∈ [−1, 1]` to the
+    knot-vector parameter.
   - `_tensor_dof_key` and `_key_on_level_side` overloads that route through the family's own `_AXIS_BSPLINE` key tag.
   - The `_overlay_constraints!` overload, which carries both artificial-boundary mechanisms and writes them into the dof
     layer's [`EliminationLedger`](@ref). At `continuity = :maximal` it is the **support selection**: a strong
@@ -90,10 +92,10 @@ using Unfitted
 # written `Unfitted.f(...)` at its definition, which needs no import. The list is therefore an honest measure of how far
 # the extension reaches into the package.
 using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, AxisDofKey, TensorDofKey, EliminationLedger,
-                _LevelContext, _eliminate!, _constrain!, _pivot!, is_active, AxisBox, _check_basis_mode,
-                _level_side_is_physical, _tensor_dof_key, _Fold, _is_fictitious, _is_void
+                _LevelContext, _eliminate!, _constrain!, _pivot!, is_active, AxisBox, _level_side_is_physical,
+                _tensor_dof_key, _Fold, _is_fictitious, _is_void
 using StaticArrays: SVector
-using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim
+using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim, knotvector
 
 # ── Public factory and deferred spec ──────────────────────────────────────────
 
@@ -234,8 +236,10 @@ it as a `basis=` value, but carries no per-axis knot vectors yet — the [`insta
 extension materialises a real [`BSplineFamily`](@ref) from the mesh axes. Once the level is built, the spec is gone;
 every hot-path method dispatches on the concrete `BSplineFamily` type.
 
-`continuity` is either a requested smoothness `m ≥ 0` or the [`_MAXIMAL_CONTINUITY`](@ref) sentinel; `instantiate_basis`
-resolves the sentinel against the level's per-axis degree.
+`continuity` is either a requested smoothness `m ≥ 0` or the [`_MAXIMAL_CONTINUITY`](@ref) sentinel. It is the request
+and only the request: `instantiate_basis` validates it against the level's mesh and per-axis degree and chooses the
+mechanism, and every concrete family it builds carries the same request on, so a rebuild at another order or cell count
+is judged exactly as a fresh build would be.
 """
 struct _BSplineSpec <: BasisFamily
     continuity::Int
@@ -244,7 +248,7 @@ end
 # ── BSplineFamily struct and accessors ────────────────────────────────────────
 
 """
-    BSplineFamily{D,T,S,DS}
+    BSplineFamily{D,S}
 
 Open-knot tensor-product B-spline basis family.
 
@@ -252,55 +256,62 @@ Fields:
 
   - `spaces::S` — `D`-tuple of `BasicBSpline.BSplineSpace` objects, one per axis. Built from the level's mesh axes as
     clamped open uniform knot vectors (interior knot multiplicity 1, `C^{p − 1}`).
-  - `derivative_spaces::DS` — `D`-tuple of `BSplineDerivativeSpace{1, _}` objects, one per axis, precomputed for the
-    derivative hot path so every quadrature point uses a stable type.
-  - `axis_coords::NTuple{D,Vector{T}}` — per-axis mesh cell-corner coordinates (a copy of `mesh.axes[d]`). Stored on the
-    family so the hot kernel can do the `ξ ∈ [−1, 1]` → `t` affine map without looking up the level.
-  - `cell_to_span::NTuple{D,Vector{Int}}` — per-axis map from a cell index `c ∈ 1:cells[d]` to the BasicBSpline span
-    index. With the uniform max-regularity knots used here it is the identity (`cell_to_span[d][c] = c`); it is kept as
-    an explicit field because it also doubles as the per-cell first global 1D function index —
-    `bsplinebasisall(P, span, t)` returns the functions with global indices `span, span + 1, …, span + p`.
-  - `continuity::Int` — the smoothness the level carries across its own artificial boundary, either a requested
-    `0 ≤ m ≤ p_d − 1` or the [`_MAXIMAL_CONTINUITY`](@ref) sentinel for `C^{p_d − 1}` per axis. The two are different
-    *mechanisms*, not just different numbers: at the sentinel the level selects the functions whose full support lies
-    inside its admissible region and eliminates the rest strongly, while a requested `m < p_d − 1` clamps the level at
-    its artificial faces and imposes trace-vanishing conditions of orders `0 … m`. See [`bspline`](@ref).
+  - `continuity::Int` — the smoothness the level was *asked* to carry across its own artificial boundary, as
+    requested: an integer `0 ≤ m ≤ p_d − 1` or the [`_MAXIMAL_CONTINUITY`](@ref) sentinel for `C^{p_d − 1}` per axis.
+    The mechanism is derived from it and the degrees by `_selects_by_support`, and the two mechanisms are different
+    things rather than different numbers: the sentinel, or an integer equal to `p_d − 1` on every axis (the same space
+    by another name), selects the functions whose full support lies inside the admissible region and eliminates the
+    rest strongly, while an integer below `p_d − 1` on some axis clamps the level at its artificial faces and imposes
+    trace-vanishing conditions of orders `0 … m`. See [`bspline`](@ref). The request is stored rather than the
+    mechanism because a rebuild at another degree must re-derive the mechanism from what was asked: `C²` at degree 3
+    selects, at degree 4 it clamps.
+
+Everything else a hot loop or the dof layer needs is a function of these two fields and the level's mesh, so the family
+stores no copy of it. With uniform knots the knot span of cell `c` along axis `d` is `c` itself, so
+`bsplinebasisall(spaces[d], c, t)` returns the functions with global indices `c, c + 1, …, c + p_d` and a cell-local
+mode `m` is the global function `c + m`. The cell's parameter interval runs from `knotvector(spaces[d])[c + p_d]` to
+`knotvector(spaces[d])[c + p_d + 1]`, two of the mesh nodes the knot vector was built from. And the derivative space
+`BSplineDerivativeSpace{1}(spaces[d])` is a wrapper around the space that costs nothing to build at the point of use.
 
 Constructed automatically from a [`_BSplineSpec`](@ref) by the [`instantiate_basis`](@ref) hook in this extension —
 users do not build it directly.
 """
-struct BSplineFamily{D,T,S<:Tuple,DS<:Tuple} <: BasisFamily
+struct BSplineFamily{D,S<:Tuple} <: BasisFamily
     spaces::S
-    derivative_spaces::DS
-    axis_coords::NTuple{D,Vector{T}}
-    cell_to_span::NTuple{D,Vector{Int}}
     continuity::Int
 end
 
-# Whether the level selects by support (`:maximal`) rather than clamping and constraining. Written as a predicate rather
-# than compared inline because the two mechanisms diverge in three places — the overlay constraints, the burial test,
-# and the thinness validation — and a bare `== -1` at each would say what is stored rather than what it means.
-_selects_by_support(family::BSplineFamily) = family.continuity == _MAXIMAL_CONTINUITY
+# Whether the level selects by support (`:maximal`) rather than clamping and constraining: the selection sentinel, or an
+# integer request equal to `p_d − 1` on every axis, which names the same space and is reached by the cheaper mechanism
+# (strong eliminations instead of a constraint cascade). Derived from the stored request and the family's own degrees
+# rather than stored, so it cannot disagree with them after a rebuild at another degree. Written as a predicate because
+# the two mechanisms diverge in several places — the overlay constraints, the burial test, the dedup and the support
+# radius — and a comparison at each would say what is stored rather than what it means.
+function _selects_by_support(family::BSplineFamily)
+    m = family.continuity
+    return m == _MAXIMAL_CONTINUITY || all(P -> m == degree(P) - 1, family.spaces)
+end
 
 # ── Basis instantiation: materialise the deferred spec onto a mesh ────────────
 
-# `instantiate_basis` hook for the deferred `_BSplineSpec`. Invoked when `space` / `overlay` build a level from
-# `bspline(...)`, once the level's mesh and order are known; every later rebuild of the level reaches the
-# `BSplineFamily` method below instead. Validates the request and materialises the concrete `BSplineFamily` from the
-# mesh axes; the spec itself only ever exists between `bspline(...)` and this call, so every downstream method
-# dispatches on the concrete family type.
+# `instantiate_basis` hook for the deferred `_BSplineSpec`, and the one place a B-spline request is judged. Invoked when
+# `space` / `overlay` build a level from `bspline(...)`, once the level's mesh and order are known, and — through the
+# `BSplineFamily` method below — on every later rebuild of the level as well. Validates the request and materialises the
+# concrete `BSplineFamily` from the mesh axes; the spec itself only ever exists between `bspline(...)` and this call, so
+# every downstream method dispatches on the concrete family type.
 #
 # The mask is not an argument, because the family does not depend on it: arbitrary `LevelMask` geometries are handled by
 # either mechanism in the dof layer — the support-selection rule is a per-function containment test and the
 # trace-vanishing constraints are assembled face by face, so neither needs the mask to be separable.
 #
-# A request for an integer `continuity = m` that already equals `p_d − 1` on every axis is normalised to the `:maximal`
-# sentinel. The two name the same space — the proof is in `bspline`'s docstring — but selection reaches it with strong
-# eliminations rather than a constraint cascade, so routing the integer spelling through the cheaper mechanism costs the
-# caller nothing and saves the dof layer a pass.
-function Unfitted.instantiate_basis(spec::_BSplineSpec, mesh::CartesianMesh{D,T}, order::NTuple{D,Int},
-                                    mode::Symbol) where {D,T<:Real}
-    _check_basis_mode(spec, mode, order)
+# A request for an integer `continuity = m` that already equals `p_d − 1` on every axis takes the selection mechanism
+# (`_selects_by_support`). The two name the same space — the proof is in `bspline`'s docstring — but selection reaches
+# it with strong eliminations rather than a constraint cascade, so routing the integer spelling through the cheaper
+# mechanism costs the caller nothing and saves the dof layer a pass. The family keeps the request as given rather than
+# rewriting it to the sentinel: the equivalence holds at this degree only, and a level rebuilt at another degree must
+# be judged against what was asked.
+function Unfitted.instantiate_basis(spec::_BSplineSpec, mesh::CartesianMesh{D,T},
+                                    order::NTuple{D,Int}) where {D,T<:Real}
     all(p -> p >= 1, order) || throw(ArgumentError("bspline order (per-axis polynomial degree) must be ≥ 1"))
     m = spec.continuity
     m == _MAXIMAL_CONTINUITY && return _materialize(spec, mesh, order)
@@ -308,7 +319,7 @@ function Unfitted.instantiate_basis(spec::_BSplineSpec, mesh::CartesianMesh{D,T}
     m <= max_m || throw(ArgumentError("bspline continuity $m exceeds p_d − 1 = $max_m on the " *
                                       "lowest-degree axis; raise the order, lower the continuity, " *
                                       "or ask for :maximal"))
-    all(p -> m == p - 1, order) && return _materialize(_BSplineSpec(_MAXIMAL_CONTINUITY), mesh, order)
+    all(p -> m == p - 1, order) && return _materialize(spec, mesh, order)    # selects by support
     # The clamped mechanism needs enough interior 1D dofs for the constraint system to have something left to pivot
     # onto: eliminating `m + 1` boundary functions per side must leave at least one interior dof, i.e.
     # `dim ≥ 2(m + 1) + 1`, equivalently `cells + p ≥ 2m + 3`. Selection carries no such requirement and is not checked
@@ -328,38 +339,27 @@ function Unfitted.instantiate_basis(spec::_BSplineSpec, mesh::CartesianMesh{D,T}
 end
 
 # Re-instantiate an already-concrete `BSplineFamily` against a (possibly new) mesh and order: every rebuild of a
-# B-spline level after its first construction comes here. A move (`moved_space`) rebuilds the per-axis knot vectors for
-# the new cell coordinates, since reusing the old family would leave stale `axis_coords` / `cell_to_span`. A re-mask,
-# the fold and a level-id reindex keep the mesh and the order, and the rebuild reproduces an equal family (the mask
-# never enters a knot vector). `estimate`'s refinement twin (`_refinement_twin`) passes the family with a mesh refined
-# by an integer factor at the same order, and `elevate` (`_reordered_space`) passes the level's new order. Only the mode
-# check runs: the family keeps the continuity it holds, and neither the continuity / thinness validation nor the
-# normalisation of `m = p − 1` to `:maximal` that the `_BSplineSpec` method applies is repeated — which a refinement
-# cannot invalidate, since it only adds cells, but which a new order from `elevate` is not checked against.
-function Unfitted.instantiate_basis(family::BSplineFamily, mesh::CartesianMesh{D,T}, order::NTuple{D,Int},
-                                    mode::Symbol) where {D,T<:Real}
-    _check_basis_mode(family, mode, order)
-    return _materialize(_BSplineSpec(family.continuity), mesh, order)
+# B-spline level after its first construction comes here — overlay inheritance (`overlay`'s default `basis` is the base
+# level's concrete family), `elevate`, a move, a mask edit, the fictitious fold, a level-id reindex, `estimate`'s
+# refinement twin and the adaptive rebuild. It is the spec method on the family's own request, so each of them re-runs
+# the continuity bound, the clamped thinness check and the mechanism choice exactly as a fresh build of the same request
+# would, and a rebuild that keeps the mesh and the order reproduces an equal family. A family that kept its stored
+# continuity instead, re-checked for nothing else, let an inherited or elevated level carry a continuity its new degree
+# cannot have (`C¹` at degree 1), be thinner than the clamped mechanism needs, or keep a mechanism its new degree no
+# longer implies (a `C²` request inherited at degree 4 silently became `C³`).
+function Unfitted.instantiate_basis(family::BSplineFamily, mesh::CartesianMesh{D,T},
+                                    order::NTuple{D,Int}) where {D,T<:Real}
+    return Unfitted.instantiate_basis(_BSplineSpec(family.continuity), mesh, order)
 end
 
 # ── Knot-vector construction ──────────────────────────────────────────────────
 
-# Build the concrete `BSplineFamily` from a deferred `_BSplineSpec`, the mesh, and the per-axis polynomial degree.
-# Uniform knots only: the cell-to-span map is the identity (`cell_to_span[d][c] = c`), and
-# `dim(spaces[d]) = cells[d] + p[d]`.
-function _materialize(spec::_BSplineSpec, mesh::CartesianMesh{D,T}, p::NTuple{D,Int}) where {D,T}
-    m = spec.continuity
-    spaces = ntuple(D) do d
-        kv = _open_knot_vector(mesh.axes[d], p[d])
-        BSplineSpace{p[d]}(kv)
-    end
-    derivative_spaces = ntuple(d -> BSplineDerivativeSpace{1}(spaces[d]), D)
-    axis_coords = ntuple(d -> copy(mesh.axes[d]), D)
-    cell_to_span = ntuple(D) do d
-        collect(1:mesh.cells[d])  # uniform knots: span = cell index
-    end
-    return BSplineFamily{D,T,typeof(spaces),typeof(derivative_spaces)}(spaces, derivative_spaces, axis_coords,
-                                                                       cell_to_span, m)
+# Build the concrete `BSplineFamily` from a deferred `_BSplineSpec`, the mesh, and the per-axis polynomial degree: one
+# clamped open knot vector per axis on the mesh nodes, and the request carried on unchanged. Uniform knots only, so cell
+# `c` is span `c` and `dim(spaces[d]) = cells[d] + p[d]`.
+function _materialize(spec::_BSplineSpec, mesh::CartesianMesh{D}, p::NTuple{D,Int}) where {D}
+    spaces = ntuple(d -> BSplineSpace{p[d]}(_open_knot_vector(mesh.axes[d], p[d])), D)
+    return BSplineFamily{D,typeof(spaces)}(spaces, spec.continuity)
 end
 
 # Build a clamped open uniform knot vector for one axis from the mesh's per-axis coordinates and the requested degree
@@ -371,17 +371,17 @@ end
 # by `_overlay_constraints!` below — by support selection at maximal continuity, by trace-vanishing linear constraints
 # below it — *not* via knot multiplicity. This keeps the basis globally `C^{p − 1}` inside the active region regardless
 # of mask geometry.
-function _open_knot_vector(axis_coords::AbstractVector{T}, p::Integer) where {T<:Real}
+function _open_knot_vector(nodes::AbstractVector{T}, p::Integer) where {T<:Real}
     knots = T[]
-    sizehint!(knots, length(axis_coords) + 2 * p)
+    sizehint!(knots, length(nodes) + 2 * p)
     for _ in 1:(p+1)
-        push!(knots, axis_coords[1])
+        push!(knots, nodes[1])
     end
-    for i in 2:(length(axis_coords)-1)
-        push!(knots, axis_coords[i])
+    for i in 2:(length(nodes)-1)
+        push!(knots, nodes[i])
     end
     for _ in 1:(p+1)
-        push!(knots, axis_coords[end])
+        push!(knots, nodes[end])
     end
     return KnotVector(knots)
 end
@@ -389,8 +389,8 @@ end
 # ── Basis-interface methods ───────────────────────────────────────────────────
 
 Unfitted.basis_name(::BSplineFamily) = :bspline
-# The deferred spec answers to the same name: it is the family the user asked for, and `_check_basis_mode` reports
-# through `basis_name` while validating a `space(...; basis=bspline(), mode=…)` call, before the spec is materialised.
+# The deferred spec answers to the same name: it is the family the user asked for, and `_with_mode` reports through
+# `basis_name` while validating a `space(...; basis=bspline(), mode=…)` call, before the spec is materialised.
 Unfitted.basis_name(::_BSplineSpec) = :bspline
 
 # ── Boundary / facet incidence ────────────────────────────────────────────────
@@ -414,57 +414,51 @@ end
 
 # ── Hot kernels: per-axis 1D B-spline value and derivative tables ─────────────
 
-# Affine reference-to-parameter map for axis `d` on cell `c`: ξ ∈ [−1, 1] ↦ t ∈
-# [axis_coords[d][c], axis_coords[d][c + 1]]. Returns `(t, half_width)` where `half_width = (t_upper − t_lower) / 2`.
-# Stored half-width is reused for the derivative-axis chain rule: a B-spline basis function `N_i(t)` satisfies
-# `dN/dξ = dN/dt · half_width`, so the reference-frame derivative the kernel needs to fill into `der1d[d]` already
-# includes that factor.
-@inline function _axis_parameter(family::BSplineFamily{D,T}, axis::Integer, cell::Integer, ξ::Real) where {D,T}
-    coords = family.axis_coords[axis]
-    t_lower = coords[cell]
-    t_upper = coords[cell + 1]
-    half_width = (t_upper - t_lower) / 2
-    t = t_lower + (ξ + one(ξ)) * half_width
-    return t, half_width
-end
-
-# Per-axis B-spline values into `val1d[d]` for one quadrature point. Calls `bsplinebasisall(spaces[d], span, t)` which
-# returns the `p_d + 1` values on `span` as a stack-allocated `SVector{p_d + 1}` — no allocation; the SVector entries
-# are then unrolled into the per-axis buffer.
-function Unfitted._fill_factor_tables!(family::BSplineFamily{D,T,S,DS}, val1d, order::NTuple{D,Int}, ξ::SVector{D,Tξ},
-                                       cell::CartesianIndex{D}) where {D,T,S,DS,Tξ}
-    @inbounds for d in 1:D
-        c = cell.I[d]
-        span = family.cell_to_span[d][c]
-        t, _ = _axis_parameter(family, d, c, ξ[d])
-        values = bsplinebasisall(family.spaces[d], span, t)
-        vd = val1d[d]
-        for i in 1:(order[d]+1)
-            vd[i] = values[i]
-        end
+# Per-axis B-spline values into `val1d[d]` for one quadrature point and, unless `der1d === nothing`, reference-frame
+# derivatives into `der1d[d]`: the one factor-table method of this family (see the core's `_fill_factor_tables!` for
+# the contract). Cell `c` is knot span `c` (uniform knots; see `BSplineFamily`), and its parameter interval
+# `[t_c, t_{c+1}]` is read off the knot vector at positions `c + p` and `c + p + 1`, past the `p` extra copies of the
+# clamped first knot. The affine map `t = t_c + (ξ + 1) · w` with the half-width `w = (t_{c+1} − t_c) / 2` takes
+# `ξ ∈ [−1, 1]` onto it. `bsplinebasisall(P, c, t)` returns the `p_d + 1` values on the span as a stack-allocated
+# `SVector{p_d + 1}` — no allocation — and its entries are unrolled into the per-axis buffer. The raw `t`-derivatives
+# come from the derivative space `BSplineDerivativeSpace{1}(P)`, a wrapper around `P` built at the point of use only
+# when derivatives are asked for, and become `ξ`-derivatives by the factor `w`. The downstream tensor-product kernel
+# multiplies by the assembly loop's `scale[d] = 2 / edge_lengths[d]`; the two compose to
+# `dN/dx = dN/dt · (h_d / 2) · (2 / h_d) = dN/dt`, the physical derivative — the integrated-Legendre chain-rule
+# convention.
+#
+# The family keeps no copy of the mesh nodes and no stored derivative space for this: the interval is two entries of the
+# knot vector `P` already holds, built from those very nodes, and the derivative space is a function of `P`, so either
+# copy would be state a rebuild has to keep in step with `spaces` and nothing more. Every table is bit for bit what the
+# stored copies gave.
+#
+# The loop over the axes is unrolled at compile time (`ntuple` over `Val(D)`), so each `family.spaces[d]` is read at a
+# constant index. The degree is a type parameter of `BSplineSpace`, so on a level whose degrees differ by axis the
+# spaces form a tuple of different types. A runtime index into it yields a space of no single concrete type, and the
+# tables `bsplinebasisall` returns then go through the heap on every call, once per parent per quadrature point in
+# assembly and transfer.
+function Unfitted._fill_factor_tables!(family::BSplineFamily{D}, val1d, der1d, order::NTuple{D,Int}, ξ::SVector{D},
+                                       cell::CartesianIndex{D}) where {D}
+    ntuple(Val(D)) do d
+        @inline
+        _fill_axis_tables!(family.spaces[d], cell.I[d], ξ[d], val1d[d], der1d === nothing ? nothing : der1d[d],
+                           order[d] + 1)
     end
     return nothing
 end
 
-# Per-axis B-spline values + reference-frame derivatives. Values from `bsplinebasisall(spaces[d], span, t)`; raw
-# `t`-derivatives from `bsplinebasisall(derivative_spaces[d], span, t)` (a fully unrolled
-# `BasicBSpline.BSplineDerivativeSpace{1, …}` call); reference-frame `ξ`-derivatives obtained by multiplying with
-# `half_width`. The downstream tensor-product kernel multiplies by the assembly-loop `scale[d] = 2 / edge_lengths[d]`
-# factor; the two compose to `dN/dx = dN/dt · (h_d / 2) · (2 / h_d) = dN/dt`, the physical derivative — consistent with
-# the integrated-Legendre chain-rule convention.
-function Unfitted._fill_factor_tables!(family::BSplineFamily{D,T,S,DS}, val1d, der1d, order::NTuple{D,Int},
-                                       ξ::SVector{D,Tξ}, cell::CartesianIndex{D}) where {D,T,S,DS,Tξ}
-    @inbounds for d in 1:D
-        c = cell.I[d]
-        span = family.cell_to_span[d][c]
-        t, half_width = _axis_parameter(family, d, c, ξ[d])
-        values = bsplinebasisall(family.spaces[d], span, t)
-        derivs = bsplinebasisall(family.derivative_spaces[d], span, t)
-        vd = val1d[d]
-        dd = der1d[d]
-        for i in 1:(order[d]+1)
+# One axis of `_fill_factor_tables!` above: the `n` values of space `P` on span `c` at the reference coordinate `x`
+# into `vd`, and their `x`-derivatives into `dd` unless it is `nothing`.
+@inline function _fill_axis_tables!(P::BSplineSpace, c::Int, x, vd, dd, n::Int)
+    @inbounds begin
+        knots, p = knotvector(P), degree(P)
+        half_width = (knots[c + p + 1] - knots[c + p]) / 2
+        t = knots[c + p] + (x + one(x)) * half_width
+        values = bsplinebasisall(P, c, t)
+        derivs = dd === nothing ? nothing : bsplinebasisall(BSplineDerivativeSpace{1}(P), c, t)
+        for i in 1:n
             vd[i] = values[i]
-            dd[i] = derivs[i] * half_width
+            dd === nothing || (dd[i] = derivs[i] * half_width)
         end
     end
     return nothing
@@ -477,18 +471,13 @@ end
 # with the family. Its value differs from the integrated-Legendre tags although nothing requires it to.
 const _AXIS_BSPLINE = UInt8(2)
 
+# The dof key of a cell-local tensor mode. On cell `c` the knot span is `c` (uniform knots, see `BSplineFamily`), and
+# `bsplinebasisall(P, c, t)` returns the functions with global indices `c, c + 1, …, c + p_d`, so the local 1D mode
+# `m ∈ 0:p_d` is the global 1D function `c + m`. That index names the function across the level, so adjacent cells
+# reuse the dof slot of every function they share through the `TensorDofKey` cache in `src/dofs.jl`.
 function Unfitted._tensor_dof_key(level::Level{D,T,<:BSplineFamily}, cell::CartesianIndex{D},
                                   local_id::CartesianIndex{D}) where {D,T}
-    family = level.basis
-    axes = ntuple(d -> _bspline_axis_dof_key(family, d, cell.I[d], local_id.I[d]), D)
-    return TensorDofKey{D}(level.id, axes)
-end
-
-# Build the per-axis dof key for the B-spline family. A cell-local 1D mode `m ∈ 0:p_d` on cell `c` maps to the global 1D
-# function index `cell_to_span[d][c] + m`; that index uniquely identifies the function across the level, so adjacent
-# cells naturally reuse the dof slot for every shared function through the `TensorDofKey` cache in `src/dofs.jl`.
-@inline function _bspline_axis_dof_key(family::BSplineFamily, axis::Integer, cell_axis::Integer, mode::Integer)
-    return AxisDofKey(_AXIS_BSPLINE, family.cell_to_span[axis][cell_axis] + mode, 0)
+    return TensorDofKey{D}(level.id, ntuple(d -> AxisDofKey(_AXIS_BSPLINE, cell.I[d] + local_id.I[d], 0), D))
 end
 
 # True iff the per-axis B-spline factor of `key` anchors at the level's lower or upper mesh edge along `axis`. Used by
@@ -726,8 +715,7 @@ function Unfitted._overlay_constraints!(ledger::EliminationLedger, level::Level{
             j == 0 && _level_side_is_physical(level, domain, d, :lower, tol) && continue
             j == n_cells[d] && _level_side_is_physical(level, domain, d, :upper, tol) && continue
 
-            t_star = j == 0 ? family.axis_coords[d][1] :
-                     j == n_cells[d] ? family.axis_coords[d][end] : family.axis_coords[d][j + 1]
+            t_star = level.mesh.axes[d][j + 1]    # the face's node: the lower box face at j = 0, the upper at j = n
 
             # Two possible spans (= active-cell axis-d index) per face: `j` if the lower-cell is active, `j+1` if the
             # upper is. Boundary faces have a single span (lower_span == upper_span). Precompute the `(p_d + 1)`-vectors
@@ -838,7 +826,7 @@ function _support_cells(key::TensorDofKey{D}, family::BSplineFamily{D}, n::NTupl
 end
 
 # The cells this level's axis-`d` 1D function with global index `i` is supported on. Cell `c` carries the global indices
-# `c … c + p` (uniform knots, `cell_to_span` the identity), so function `i` lives on `max(1, i − p) … min(ncells, i)` —
+# `c … c + p` (uniform knots: cell `c` is span `c`), so function `i` lives on `max(1, i − p) … min(ncells, i)` —
 # up to `p + 1` cells. The core's `_axis_incidence` cannot answer this: it is written for the integrated-Legendre node /
 # span keys and reports a single cell for any other tag.
 @inline _axis_support(i::Integer, p::Integer, ncells::Integer) = max(1, i-p):min(ncells, i)
@@ -864,7 +852,7 @@ function Unfitted._reproduces(k::Level{D,T,<:BSplineFamily}, level::Level{D,T,<:
 end
 
 function Unfitted._reproduces(k::Level{D,T,<:IntegratedLegendre}, level::Level{D,T,<:BSplineFamily}) where {D,T<:Real}
-    k.mode === :tensor || return false
+    k.basis.trunk && return false
     p = ntuple(d -> degree(level.basis.spaces[d]), D)
     # `nominal_order(k)` is the level's per-axis maximum, which is not enough when `k` carries a per-cell order: a
     # single cell below `p` anywhere under the buried function's support cannot reproduce it. Requiring every palette

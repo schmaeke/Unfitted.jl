@@ -80,7 +80,7 @@ function _absorb!(state, V, tag::Int; level::Integer=1)
         # (2) The minimum rule only ever REMOVES. A kept mode must be one the cell's own order generates; anything else
         #     is a mode from nowhere.
         if !isempty(ids)
-            own = Set(local_basis_indices(lvl.basis, cell_order(lvl, ci), lvl.mode))
+            own = Set(local_basis_indices(lvl.basis, cell_order(lvl, ci)))
             @test all(in(own), ids)
         end
         # (3) An inactive cell generates nothing.

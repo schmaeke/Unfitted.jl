@@ -49,9 +49,9 @@ end
 
 # Egal semantics: an `Interface` is immutable, so `===` compares its fields: the two field names, and the geometry, an
 # immutable `BoundaryMesh` whose arrays compare by identity. Two `interface(uₐ, u_b, Γ)` calls over the same `Γ` object
-# are therefore one coupling, one `on=` target and one key of the `IdDict` region cache, while a mesh rebuilt as a new
-# object, even an equal one, is a different coupling. `==` and `hash` follow `===` and `objectid`, so neither ever
-# compares or hashes the (potentially large) geometry's points.
+# are therefore one coupling, one `on=` target and one key `(iface, nothing)` of the model's region cache, while a mesh
+# rebuilt as a new object, even an equal one, is a different coupling. `==` and `hash` follow `===` and `objectid`, so
+# neither ever compares or hashes the (potentially large) geometry's points.
 Base.hash(iface::Interface, h::UInt) = hash(objectid(iface), h)
 Base.:(==)(a::Interface, b::Interface) = a === b
 

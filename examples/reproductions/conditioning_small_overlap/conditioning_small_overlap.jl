@@ -24,7 +24,7 @@ For each combination of polynomial order `p` and `δ = 2⁻ᵏ` the script repor
   * `integration_regions` — the count of admissible boxes,
   * `small_overlap_count` — boxes below `small_volume_threshold`,
   * `min_volume` and `first_small_volume` — the worst-overlap volumes,
-  * `condition_estimate` — `cond(A)` of the dense matrix where `active_unknowns ≤ 256` (see `_condition_estimate` in
+  * `condition_estimate` — `cond(A)` of the dense matrix where `active_unknowns ≤ 256` (see `_condition_estimates` in
     `src/model.jl`); `NaN` for larger systems,
   * `residual_norm` — the post-solve residual `‖A x − b‖₂`.
 
