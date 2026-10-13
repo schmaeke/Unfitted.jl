@@ -548,13 +548,15 @@ _vtk_data_arrays(pairs, values) = Pair{String,Any}[first(p) => _vtk_data_array(v
 # Coerce a `Vector{Any}` of callback returns to a typed array suitable for `WriteVTK`. Three accepted patterns:
 #
 #   * all-`Number` → `Vector{T}` with `T = promote_type(typeof.(v))`;
-#   * all-`SVector` → typed vector of the first element's `SVector` type (with conversion of each entry, in case widths
-#     or eltypes differ slightly);
+#   * all-`SVector` of one length → `Vector{SVector{N,T}}` with `T` promoted over every entry, as for the numbers: the
+#     first entry's type alone would make an integer first sample refuse later fractional ones (`InexactError`) and a
+#     `Float32` first sample round every later `Float64` one;
 #   * all-`Tuple` of the same length → `Vector{SVector{N,T}}` with `N` inferred from the first element and `T` promoted
 #     from every component of every entry.
 #
 # Both vector patterns pass through `_vtk_vector_array`, so a 2-component result reaches ParaView as a VTK vector. The
-# fallback returns the input untouched, and `WriteVTK` then rejects the `Vector{Any}` with
+# fallback, SVectors of different lengths included, returns the input untouched, and `WriteVTK` then rejects the
+# `Vector{Any}` with
 # `data type not supported by VTK: Any` — an error that names the type but not the offending `name => callback` entry.
 function _vtk_data_array(values::Vector{Any})
     isempty(values) && return Float64[]
@@ -567,8 +569,8 @@ function _vtk_data_array(values::Vector{Any})
         T = mapreduce(typeof, promote_type, values)
         return T[values...]
     elseif all(v -> v isa SVector, values)
-        S = typeof(first_value)
-        return _vtk_vector_array(S[convert(S, v) for v in values])
+        S = mapreduce(typeof, promote_type, values)
+        isconcretetype(S) && return _vtk_vector_array(S[convert(S, v) for v in values])
     elseif first_value isa Tuple && all(v -> v isa Tuple && length(v) == length(first_value), values)
         T = reduce(promote_type, (typeof(v[i]) for v in values for i in eachindex(first_value)))
         S = SVector{length(first_value),T}

@@ -793,3 +793,26 @@ end
         @test isempty(readdir(dir))
     end
 end
+
+@testset "SVector callback values are promoted over every sample" begin
+    # The values of one entry share one element type, promoted over every sample as numbers and tuples already were.
+    # Converting every SVector to the first sample's type refused a fractional value after an integer first sample
+    # (`InexactError`) and rounded every `Float64` value after a `Float32` one. Region 1 is walked first here, so its
+    # value is the first sample's.
+    (; model, sol) = _pin_2d
+    dir = mktempdir()
+    first_int = (u, c, x, xi) -> c.region_id == 1 ? SVector(1, 2) : SVector(x[1], x[2] / 3)
+    first_single = (u, c, x, xi) -> c.region_id == 1 ? SVector(0.5f0, 0.25f0) : SVector(x[1] / 3, x[2] / 3)
+    for (name, f, region_one, other) in (("first_single", first_single, (0.5, 0.25), x -> (x[1] / 3, x[2] / 3)),
+                                         ("first_int", first_int, (1.0, 2.0), x -> (x[1], x[2] / 3)))
+        write_vtk(joinpath(dir, name), sol, model; subdivisions=:none, level_meshes=false, point_data=(v=f,),
+                  _pin_ascii...)
+        xml = read(joinpath(dir, name * "_data.vtu"), String)
+        @test _vtu_tag(xml, "v")["type"] == "Float64"
+        points = reshape(_vtu_floats(xml, "Points"), 3, :)
+        regions = _vtu_ints(xml, "region_id")
+        # Every value exactly what the callback returned, padded to three components.
+        expected = [regions[(k - 1) ÷ 4 + 1] == 1 ? region_one : other(points[:, k]) for k in axes(points, 2)]
+        @test reshape(_vtu_floats(xml, "v"), 3, :) == reduce(hcat, [[e..., 0.0] for e in expected])
+    end
+end
