@@ -101,7 +101,7 @@ every region the assembly hot loop sees is a proper `D`-cube with positive volum
 Constructors:
 
   - `box(lower, upper)` — corner-to-corner. Accepts `NTuple{D,<:Real}` or `SVector{D,<:Real}` corners; the scalar type
-    is promoted from the inputs.
+    is promoted from the inputs. `AxisBox(lower, upper)` is the same constructor.
   - `box(center; halfwidth)` — centered form. `center` is a point; `halfwidth` may be a scalar (isotropic) or a
     `D`-tuple / `SVector` (anisotropic) of half-edge-lengths. Equivalent to
     `box(center − halfwidth, center + halfwidth)`.
@@ -121,10 +121,9 @@ struct AxisBox{D,T<:Real}
     end
 end
 
-AxisBox(lower::SVector{D,T}, upper::SVector{D,T}) where {D,T<:Real} = AxisBox{D,T}(lower, upper)
-function AxisBox(lower::NTuple{D,T}, upper::NTuple{D,T}) where {D,T<:Real}
-    AxisBox{D,T}(SVector{D,T}(lower), SVector{D,T}(upper))
-end
+# `AxisBox(lower, upper)` is `box(lower, upper)`, the one corner-to-corner construction: either corner an `NTuple` or
+# an `SVector`, the scalar type promoted over both.
+AxisBox(lower::PointLike{D}, upper::PointLike{D}) where {D} = box(lower, upper)
 
 """
     box(lower, upper) -> AxisBox
@@ -140,9 +139,7 @@ Construct an [`AxisBox`](@ref), the dimension-generic axis-aligned box used thro
 See [`AxisBox`](@ref) for the stored representation and the non-degenerate `lower[i] < upper[i]` invariant the
 constructor enforces.
 """
-box(lower::NTuple{D,<:Real}, upper::NTuple{D,<:Real}) where {D} = box(SVector(lower), SVector(upper))
-
-function box(lower::SVector{D,<:Real}, upper::SVector{D,<:Real}) where {D}
+function box(lower::PointLike{D}, upper::PointLike{D}) where {D}
     T = promote_type(eltype(lower), eltype(upper))
     return AxisBox{D,T}(SVector{D,T}(lower), SVector{D,T}(upper))
 end

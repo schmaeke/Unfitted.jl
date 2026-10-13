@@ -108,6 +108,17 @@ end
     @test_throws ArgumentError AxisBox((1.0,), (0.0,))               # inverted, 1D, direct ctor
 end
 
+# `AxisBox(lower, upper)` and `box(lower, upper)` are one construction: either corner an `NTuple` or an `SVector`, the
+# scalar type promoted over both. The direct constructor used to take only two corners of one spelling and one scalar
+# type, so `AxisBox((0, 0), (1.0, 2.0))` raised a `MethodError` where `box` promoted.
+@testset "geometry AxisBox(lower, upper) is box(lower, upper)" begin
+    SVector = Unfitted.SVector
+    @test AxisBox((0, 0), (1.0, 2.0)) === box((0, 0), (1.0, 2.0)) === box((0.0, 0.0), (1.0, 2.0))
+    @test AxisBox(SVector(0.0f0, 0.0f0), (1, 2)) isa AxisBox{2,Float32}
+    @test AxisBox(SVector(0.0, 0.5), SVector(1.0, 2.0)) === box((0.0, 0.5), (1.0, 2.0))
+    @test AxisBox((0.0,), (1.0,)) === box(SVector(0.0), SVector(1.0))
+end
+
 # Volume, center, edge lengths, box_intersection, and merge_coordinates are all dimension-generic; this exercises them
 # with exact values across D = 1, 2, 3, 4 through NTuple constructors and a loop, guarding the package's D-generic
 # contract (no per-dimension special cases). The box on each axis i is [0, i+1], so volume = ∏(i+1) = (D+1)! and the
