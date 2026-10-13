@@ -187,6 +187,13 @@ end
 
 # ── Test-side: TestChannels constructor accepting a Vec coefficient ───────────
 
+# The coordinates are read through `getindex`, not `Tuple(g)`: `Base.Tuple` has no `Vec` method, so `Tuple(g)` falls
+# through to the generic iterator constructor, whose result length is not statically known, and heap-allocates. This
+# constructor is the return path of every tensor-notation bilinear callback — once per test component per trial dof per
+# quadrature point — so it must stay allocation-free.
+#
+# The block sits above the docstring rather than between it and the definition: a comment there detaches the docstring
+# silently, and the method ends up undocumented.
 """
     TestChannels(value::Real, gradient::Vec{D,T}) -> TestChannels{D,T}
 
@@ -201,10 +208,6 @@ runtime cost beyond it. When the gradient coefficient is a row of a
 stress tensor — the elasticity case — use the three-argument
 constructor below instead of extracting the row by hand.
 """
-# The coordinates are read through `getindex`, not `Tuple(g)`: `Base.Tuple` has no `Vec` method, so `Tuple(g)` falls
-# through to the generic iterator constructor, whose result length is not statically known, and heap-allocates. This
-# constructor is the return path of every tensor-notation bilinear callback — once per test component per trial dof per
-# quadrature point — so it must stay allocation-free.
 @inline function Unfitted.TestChannels(value::Real, g::Vec{D,T}) where {D,T}
     return TestChannels(value, SVector{D,T}(ntuple(i -> g[i], Val(D))))
 end

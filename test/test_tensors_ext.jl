@@ -52,6 +52,14 @@ end
 
     g3 = Vec{3,Float64}((0.1, 0.2, 0.3))
     @test TestChannels(-1.0, g3) === TestChannels(-1.0, SVector{3,Float64}(0.1, 0.2, 0.3))
+
+    # The constructor's docstring reaches `?TestChannels`; a comment block between it and the method once detached it
+    # silently. The docstrings of a binding are gathered from every module that holds one, as `?` does, so this holds
+    # wherever the docstring is kept.
+    binding = Base.Docs.Binding(Unfitted, :TestChannels)
+    texts = [join(doc.text) for m in Base.Docs.modules if haskey(Base.Docs.meta(m), binding)
+             for doc in values(Base.Docs.meta(m)[binding].docs)]
+    @test any(t -> occursin("so a callback can return tensor algebra results directly", t), texts)
 end
 
 # ── End-to-end: anisotropic Poisson via SymmetricTensor matches SMatrix ───────
