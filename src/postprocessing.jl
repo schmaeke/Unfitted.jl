@@ -672,16 +672,7 @@ end
 # subdivided every region at the order of the loudest cell anywhere on the level — measured on a 3D 8³ level at p = 1
 # with a single p = 6 cell, 110 592 sub-cells against 512, and 221.9 MB against 2.50 MB.
 function _sample_cells(space::Space{D,T}, regions::Vector{VolumeRegion{D,T}}, rule, depth::Int) where {D,T}
-    physical = space.physical
-    # One certificate lookup per field, not per region: the constant is a property of the geometry tree, which does not
-    # change across the walk.
-    lipschitz = physical === nothing ? Inf : _levelset_lipschitz(physical.geometry)
-    if depth > 0 && physical !== nothing && !isfinite(lipschitz)
-        @warn("cut_depth is refining on corner signs alone: no leaf of this PhysicalDomain " *
-              "declares a Lipschitz constant, so a feature of Ω smaller than a sub-cell can be " *
-              "missed and the clipped surface is not guaranteed watertight. Pass " *
-              "`leaf(f; lipschitz = L)` (1.0 for a signed distance function) to certify it.", maxlog=1)
-    end
+    physical, lipschitz = space.physical, _cut_lipschitz(space.physical, depth)
     boxes, region_ids = AxisBox{D,T}[], Int[]
     for (r, region) in pairs(regions)
         b, emitted = _region_box(region), length(boxes)
@@ -695,6 +686,22 @@ function _sample_cells(space::Space{D,T}, regions::Vector{VolumeRegion{D,T}}, ru
         append!(region_ids, Iterators.repeated(r, length(boxes) - emitted))
     end
     return boxes, region_ids
+end
+
+# The Lipschitz constant the cut refinement certifies its boxes with (`_cut_marked`): the largest any leaf of the
+# geometry declares, looked up once per field rather than per region, since it is a property of the geometry tree. A
+# refining write whose geometry declares none (`leaf(f)`'s default `Inf`) falls back to corner signs, and the first
+# such write of a session warns.
+function _cut_lipschitz(physical, depth::Int)
+    physical === nothing && return Inf
+    lipschitz = _levelset_lipschitz(physical.geometry)
+    if depth > 0 && !isfinite(lipschitz)
+        @warn("cut_depth is refining on corner signs alone: no leaf of this PhysicalDomain " *
+              "declares a Lipschitz constant, so a feature of Ω smaller than a sub-cell can be " *
+              "missed and the clipped surface is not guaranteed watertight. Pass " *
+              "`leaf(f; lipschitz = L)` (1.0 for a signed distance function) to certify it.", maxlog=1)
+    end
+    return lipschitz
 end
 
 # Collect the leaves of the cut tree rooted at `b` into `boxes`. Descend only into marked boxes, and descend every
