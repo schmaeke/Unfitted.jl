@@ -30,6 +30,20 @@ _as_coefficient(value) = FunctionCoefficient(value)
 _coefficient_value(c::ConstantCoefficient, x) = c.value
 _coefficient_value(c::FunctionCoefficient, x) = c.f(x)
 
+# A constant per-component coefficient — a tuple or array — carries one entry per component of the field it acts on,
+# the same contract a constant Dirichlet datum has (`_check_dirichlet_datum`): `_component_value` reads entry `c` for
+# component `c`. Unchecked, a longer one had its extra entries ignored silently, and a shorter one raised a
+# `BoundsError` from inside the assembly loop — wrapped in a `TaskFailedException` when threaded — instead of an error
+# naming the mistake. Only the builders that know the field can check it (`mass_form` and `source_form` know none), and
+# a callback is not checked, since only evaluating it could say what it returns.
+function _check_coefficient_length(value, u::Field, what::AbstractString)
+    value isa Union{Tuple,AbstractArray} || return nothing
+    components = component_count(u)
+    length(value) == components && return nothing
+    throw(ArgumentError("a constant tuple or array $what carries one entry per component of field $(u.name), " *
+                        "$components, but this one has length $(length(value))"))
+end
+
 # Pick the requested component of a coefficient value. Routes through `_component_value` so a scalar coefficient applies
 # to every component uniformly while an indexable (`SVector`, `Tuple`) coefficient resolves the component slot.
 _component_coefficient_value(c, x, component::Integer) = _component_value(_coefficient_value(c, x), component)
@@ -47,10 +61,18 @@ _diffusion_flux(a::UniformScaling, ugrad::SVector{D}) where {D} = a * ugrad
 # `DimensionMismatch` below would reach the caller wrapped in a `TaskFailedException`, which buries the message; here it
 # names the offending shape at the call site that supplied it. The per-point check remains as the backstop for a square
 # tensor of the wrong size.
+#
+# A constant that is none of the three shapes — a vector, a tuple, an array of higher rank — has no flux at all and used
+# to raise a `MethodError` for `_diffusion_flux` at every quadrature point; it is refused here for the same reason. A
+# callback is not checked: only evaluating it could say what it returns.
 function _check_square_diffusion(a::AbstractMatrix)
     size(a, 1) == size(a, 2) ||
         throw(DimensionMismatch("diffusion tensor has size $(size(a)); expected a square matrix"))
     return nothing
+end
+function _check_square_diffusion(a::Union{Tuple,AbstractArray})
+    throw(ArgumentError("a constant diffusion is a scalar, a UniformScaling or a square matrix; got a " *
+                        "$(typeof(a))"))
 end
 _check_square_diffusion(_) = nothing
 
@@ -333,7 +355,8 @@ Build the stiffness [`WeakForm`](@ref) `∫_Ω ⟨∇v, A(x) ∇u⟩ dx` without
 `D × D` matrix (anisotropic tensor), or a callback `A(x)` returning any of those. A constant matrix argument is checked
 for squareness here, when the form is built, rather than inside the threaded assembly where the `DimensionMismatch`
 would reach the caller wrapped in a `TaskFailedException`; a square tensor whose size does not match the space's `D` is
-still caught at the first quadrature point. The form is diagonal in the component index for vector fields, and is built
+still caught at the first quadrature point. Any other constant — a vector or a tuple, say — raises `ArgumentError` here
+too. The form is diagonal in the component index for vector fields, and is built
 with `symmetric = true` and `component_aware = true`. It declares its `bilinear` side and no `linear` one, and an absent
 side is absent rather than zero (see [`WeakForm`](@ref)), so it belongs on a [`block`](@ref).
 
@@ -412,9 +435,13 @@ end
 
 Wrap [`mass_form`](@ref) as the same-field bilinear block `block(u, u, mass_form(; coefficient))`, ready for
 [`assemble_matrix`](@ref) or an explicit `Problem((fields...); blocks, loads)`. `coefficient` is forwarded unchanged;
-see [`mass_form`](@ref) for the shapes it accepts.
+see [`mass_form`](@ref) for the shapes it accepts. A constant tuple or array must carry exactly one entry per component
+of `u`, and any other length raises `ArgumentError` here, before anything is assembled.
 """
-mass_block(u::Field; coefficient=1) = block(u, u, mass_form(; coefficient))
+function mass_block(u::Field; coefficient=1)
+    _check_coefficient_length(coefficient, u, "mass coefficient")
+    return block(u, u, mass_form(; coefficient))
+end
 
 """
     stiffness_block(u::Field; diffusion=1) -> BlockForm
@@ -431,10 +458,14 @@ stiffness_block(u::Field; diffusion=1) = block(u, u, stiffness_form(; diffusion)
 
 Wrap [`source_form`](@ref) as the load contribution `loadform(u, source_form(; source))` to the rows of `u`, ready for
 [`assemble_vector`](@ref) or an explicit `Problem((fields...); blocks, loads)`. `source` is forwarded unchanged; see
-[`source_form`](@ref) for the shapes it accepts. Pass `on = …` by building the [`loadform`](@ref) directly when the load
-belongs on a boundary rather than in the volume — or use [`neumann`](@ref).
+[`source_form`](@ref) for the shapes it accepts. A constant tuple or array must carry exactly one entry per component of
+`u`, and any other length raises `ArgumentError` here, before anything is assembled. Pass `on = …` by building the
+[`loadform`](@ref) directly when the load belongs on a boundary rather than in the volume — or use [`neumann`](@ref).
 """
-source_load(u::Field; source) = loadform(u, source_form(; source))
+function source_load(u::Field; source)
+    _check_coefficient_length(source, u, "source")
+    return loadform(u, source_form(; source))
+end
 
 """
     neumann(u::Field, value; on::BoundarySelector, component=nothing) -> LoadForm
@@ -447,7 +478,8 @@ Build the standard inhomogeneous Neumann load on a portion of the physical bound
 indexable value (for vector fields). `on` is a [`BoundarySelector`](@ref) selecting the facet — build one with
 [`boundary`](@ref). `component` restricts a scalar `value` to one component of a vector field; `nothing` (default)
 applies it to every component, and an index outside `1:components` of `u` raises `ArgumentError`. For arbitrary
-per-component values pass an `SVector` / tuple directly.
+per-component values pass an `SVector` / tuple directly; a constant tuple or array must carry exactly one entry per
+component of `u`, and any other length raises `ArgumentError`.
 
 For Robin, Nitsche, or other non-canonical boundary conditions, compose [`block`](@ref) and [`loadform`](@ref) directly
 with `on = …` and your own [`WeakForm`](@ref) — the package supplies the integration primitives, not the constitutive
@@ -468,6 +500,7 @@ right reading for a Dirichlet trace and a deliberate one to check for a flux, wh
 expected to mean something about measure. It does not; nothing here is trimmed.
 """
 function neumann(u::Field, value; on::BoundarySelector, component=nothing)
+    _check_coefficient_length(value, u, "Neumann value")
     component === nothing && return loadform(u, source_form(; source=value); on)
     component isa Integer || throw(ArgumentError("Neumann component must be an integer or nothing"))
     _check_component(component, u)
@@ -557,7 +590,8 @@ Build the H¹ Poisson / Laplace [`Problem`](@ref) over a scalar space `V` or a c
 
     a(u, v) = ∫_Ω ⟨∇v, A(x) ∇u⟩ dx,    ℓ(v) = ∫_Ω source(x) · v dx.
 
-`source` accepts a scalar, a callback `source(x)`, or a per-component indexable value (vector fields). `diffusion`
+`source` accepts a scalar, a callback `source(x)`, or a per-component indexable value (vector fields); a constant
+tuple or array must carry exactly one entry per component, and any other length raises `ArgumentError`. `diffusion`
 accepts:
 
   - a scalar (isotropic constant diffusion),
@@ -580,5 +614,6 @@ function poisson(V::Space{D,T}; source, diffusion=one(T), dirichlet=[]) where {D
 end
 
 function poisson(u::Field{D,T}; source, diffusion=one(T), dirichlet=[]) where {D,T}
+    _check_coefficient_length(source, u, "source")
     return Problem(u, _poisson_form(; source, diffusion); dirichlet)
 end

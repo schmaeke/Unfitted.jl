@@ -139,6 +139,45 @@ end
     @test_throws DimensionMismatch K([1.0 0.0; 0.0 1.0; 0.0 0.0])
 end
 
+# A constant per-component coefficient carries one entry per component of its field, exactly as a constant Dirichlet
+# datum does. A longer one used to be truncated silently and a shorter one raised a `BoundsError` from inside the
+# assembly loop; a constant diffusion that is not a scalar, a `UniformScaling` or a matrix raised a `MethodError` at
+# every quadrature point. Each builder that knows the field now refuses the wrong shape where it is spelled.
+@testset "constant coefficients are checked against their field" begin
+    SVector = Unfitted.SVector
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    u = field(:u, V)
+    w = field(:w, V; components=2)
+    everywhere = boundary(:all)
+
+    for value in ((1.0,), SVector(1.0, 2.0, 99.0), [1.0, 2.0, 3.0])
+        needs = "of field w, 2, but this one has length $(length(value))"
+        @test_throws needs mass_block(w; coefficient=value)
+        @test_throws needs mass(w; coefficient=value)
+        @test_throws needs source_load(w; source=value)
+        @test_throws needs poisson(w; source=value)
+        @test_throws needs neumann(w, value; on=everywhere)
+        @test_throws needs neumann(w, value; on=everywhere, component=1)
+    end
+    @test_throws "of field u, 1, but this one has length 2" mass_block(u; coefficient=SVector(1.0, 2.0))
+    @test_throws "of field u, 1, but this one has length 2" poisson(V; source=(1.0, 2.0))
+
+    # The right length, a scalar and a callback build as before; a callback is not evaluated ahead of time.
+    @test mass_block(w; coefficient=(1.0, 2.0)) isa BlockForm
+    @test mass_block(w; coefficient=2.0) isa BlockForm
+    @test source_load(w; source=x -> SVector(1.0, 2.0, 3.0)) isa LoadForm
+    @test poisson(V; source=(1.0,)) isa Problem
+
+    for diffusion in ([1.0, 2.0], (1.0, 2.0), SVector(1.0, 2.0), ones(2, 2, 2))
+        @test_throws "a constant diffusion is a scalar, a UniformScaling or a square matrix" stiffness_form(; diffusion)
+        @test_throws ArgumentError stiffness(V; diffusion)
+        @test_throws ArgumentError poisson(V; source=1.0, diffusion)
+    end
+    for diffusion in (2.0, 3, 2.0 * I, [2.0 0.0; 0.0 3.0], x -> 2.0)
+        @test stiffness_form(; diffusion) isa WeakForm
+    end
+end
+
 # Every exported name should answer `?name` in a bare `using Unfitted` session. Reading the *source* is what let two of
 # them regress: a docstring separated from its definition by an intervening comment block parses as a standalone string
 # and never reaches `Core.@doc`, so the prose is right there in the file and `?BlockForm` still prints nothing. Only
