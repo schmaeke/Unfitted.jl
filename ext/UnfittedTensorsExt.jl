@@ -88,13 +88,7 @@ Pass the component count — `symmetric_gradient(trial, Val(C))` or `symmetric_g
 `C × C` strain the field actually has. The two return the same tensor and differ only in what they cost the closure that
 calls them, which the `::Field` method's docstring measures.
 """
-@inline function Unfitted.symmetric_gradient(t::TrialChannels{D,T}) where {D,T}
-    g = Vec(t)
-    c = t.component
-    return SymmetricTensor{2,D,T}() do i, j
-        T(((i == c) * g[j] + (j == c) * g[i]) / 2)
-    end
-end
+@inline Unfitted.symmetric_gradient(t::TrialChannels{D}) where {D} = symmetric_gradient(t, Val(D))
 
 """
     symmetric_gradient(trial::TrialChannels{D,T}, ::Val{C}) -> SymmetricTensor{2,C,T}
