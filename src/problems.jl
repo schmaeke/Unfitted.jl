@@ -146,11 +146,13 @@ TestChannels(value::Real, gradient::NTuple{D,<:Real}) where {D} = TestChannels(v
 # its value and its gradient's `K` slots, converted to `T`, and is zero-extended into the remaining `D − K`. `K`, `D`
 # and `T` are static, so the slot test folds away.
 #
-# A channel that already is a `TestChannels{D,T}` is returned as it is, by the first line, which the static parameters
-# decide at compile time. Rebuilding it would return the same values, but the kernel compiled from the rebuild fuses
-# its multiply-adds differently: measured without the early return, the stiffness matrix of a 4D Poisson problem moved
-# by 4.9e-17 relative (enough to flip an exact zero out of the sparsity pattern), and a dense and a static diffusion
-# tensor no longer assembled to the same bits. The early return keeps the kernel's code, and its results, as they were.
+# A channel that already is a `TestChannels{D,T}` passes through untouched, by a method of its own. The general method
+# would return the same values, but the code compiled around it changes: measured without the pass-through, the
+# kernel fused its multiply-adds differently, the stiffness matrix of a 4D Poisson problem moved by 4.9e-17 relative
+# (enough to flip an exact zero out of the sparsity pattern), and a dense and a static diffusion tensor no longer
+# assembled to the same bits; and with the pass-through folded into the general method as an early return, a static
+# 3 × 3 diffusion's channels, evaluated outside assembly, moved by an ulp. The separate method keeps the code, and the
+# results, as they were.
 #
 # A short gradient coefficient is legitimate, and the space-time case is where it comes from: a field of `C` components
 # on a mesh of `D = C + 1` axes (the last axis time) has a `C × C` stress, and the row of it that the test component
@@ -162,8 +164,9 @@ TestChannels(value::Real, gradient::NTuple{D,<:Real}) where {D} = TestChannels(v
 # an axis that does not exist; dropping the surplus slots would quietly delete a term the callback asked for, and the
 # resulting operator would still be symmetric, still solve and still converge — the same silent wrongness the
 # zero-extension exists to remove from the short direction.
-function _as_test_channels(channels::TestChannels{K,S}, ::Val{D}, ::Type{T}) where {K,S,D,T<:Real}
-    K == D && S === T && return channels
+_as_test_channels(channels::TestChannels{D,T}, ::Val{D}, ::Type{T}) where {D,T<:Real} = channels
+
+function _as_test_channels(channels::TestChannels{K}, ::Val{D}, ::Type{T}) where {K,D,T<:Real}
     K <= D || throw(DimensionMismatch("a test gradient coefficient of length $K cannot be used on " *
                                       "a $D-dimensional mesh: it names a flux along an axis the " *
                                       "mesh does not have"))
