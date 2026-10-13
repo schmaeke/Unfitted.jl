@@ -446,9 +446,10 @@ end
 
 # The system's symmetry flag: `flag` when one is given, else whether every block declares its form symmetric. The one
 # rule for both the `Problem` constructor and a one-shot assembly of loose blocks (`_assemble`), so the two cannot infer
-# the flag differently. The blocks are not specialised on: this runs once per problem or assembly call, and the
-# closure's `all` specialises on the tuple anyway.
-function _symmetric_flag(@nospecialize(blocks), flag)
+# the flag differently. It runs once per problem or assembly call and specialises on neither argument (the closure's
+# `all` specialises on the tuple anyway), and it is kept out of line, so the constructor's call compiles the one
+# instance that `_assemble`'s dynamic call then finds.
+@noinline function _symmetric_flag(@nospecialize(blocks), @nospecialize(flag))
     return flag === nothing ? all(block -> block.form.symmetric, blocks) : Bool(flag)
 end
 
