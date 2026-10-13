@@ -108,6 +108,15 @@ end
 
 # ── VTK serialisation ─────────────────────────────────────────────────────────
 
+# Strip a `.vtm` / `.vtu` / `.vtp` / `.pvd` extension from `path` so callers can pass either `"out"` or `"out.vtm"`
+# interchangeably. Every file name the writers hand to `WriteVTK` then carries its own extension again: given a name
+# without one, `WriteVTK` appends it, but warns whenever the name has any other extension — and a dotted base name such
+# as `out_t=0.5` has one (`.5`), so every file of a time-stamped bundle used to warn.
+function _vtk_base_path(path::AbstractString)
+    base, ext = splitext(String(path))
+    return ext in (".vtm", ".vtu", ".vtp", ".pvd") ? base : String(path)
+end
+
 # The multiblock of one bundle rooted at `base`, sampled and built and still open: nothing is on disk until the caller
 # saves it, or hands it to a series' collection, which saves it. The one keyword surface of both `write_vtk` methods:
 # it takes `ascii`, `append` and `compress` for `vtk_grid` and passes every other keyword to `_sample_fields`, after the
@@ -139,6 +148,12 @@ function _vtk_multiblock(base::AbstractString, solution::Solution, model::Model{
     return vtm
 end
 
+# VTK supports cells in 1D, 2D, and 3D natively. Higher-dimensional spaces have no corresponding VTK cell type and are
+# rejected at the top of the public entry points so the user sees the dimension limitation up front.
+function _check_vtk_dimension(::Val{D}) where {D}
+    D <= 3 || throw(ArgumentError("VTK export supports dimensions 1, 2, and 3; got D=$D"))
+end
+
 # Write one `SampleGrid` as a dataset leaf of the multiblock `parent`: the file `<base>_<suffix>.vtu` (`.vtp` for a
 # vertex cloud) under the block name `name`, with the record's point arrays and then its cell arrays attached in list
 # order. One serialiser for every dataset a bundle holds — the data grids, the level meshes, the quadrature clouds —
@@ -165,12 +180,6 @@ function _add_dataset!(parent, base::AbstractString, name::AbstractString, suffi
     return vtk
 end
 
-# Attach one record array to the dataset `vtk` at `location` (`VTKPointData()` or `VTKCellData()`), as VTK stores it
-# (`_vtk_array`). Specialised on the array's concrete type, behind `_add_dataset!`'s barrier.
-function _vtk_attach!(vtk, location, name::String, array::AbstractVector, kind::Symbol)
-    (vtk[name, location] = _vtk_array(array, name, kind))
-end
-
 # A record's points as VTK stores them: always three coordinates, a 1D or 2D point padded with zeros (ParaView accepts
 # the inert zeros, so 1D and 2D grids render in the same pipeline as 3D ones). One dense padded copy, deliberately not
 # `reinterpret` or WriteVTK's own padding of a `D × n` matrix: that path writes a tuple of views and fills one scalar
@@ -187,6 +196,12 @@ _vtk_cells(g::SampleGrid{D,T,0}) where {D,T} = [MeshCell(PolyData.Verts(), SVect
 function _vtk_cells(g::SampleGrid{D,T,K}) where {D,T,K}
     type = (VTKCellTypes.VTK_LINE, VTKCellTypes.VTK_QUAD, VTKCellTypes.VTK_HEXAHEDRON)[K]
     return [MeshCell(type, SVector{1 << K,Int}(ntuple(j -> ((c - 1) << K) + j, Val(1 << K)))) for c in 1:_cell_count(g)]
+end
+
+# Attach one record array to the dataset `vtk` at `location` (`VTKPointData()` or `VTKCellData()`), as VTK stores it
+# (`_vtk_array`). Specialised on the array's concrete type, behind `_add_dataset!`'s barrier.
+function _vtk_attach!(vtk, location, name::String, array::AbstractVector, kind::Symbol)
+    (vtk[name, location] = _vtk_array(array, name, kind))
 end
 
 # One record array as VTK stores it. The record keeps a value as computed; VTK gives an array a meaning by its
@@ -215,20 +230,5 @@ end
 # The element types a VTK data array can hold, as `WriteVTK` writes them: the machine floats and the integers of up to
 # 64 bits.
 const _VTK_NUMBERS = (Float32, Float64, Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64)
-
-# Strip a `.vtm` / `.vtu` / `.vtp` / `.pvd` extension from `path` so callers can pass either `"out"` or `"out.vtm"`
-# interchangeably. Every file name the writers hand to `WriteVTK` then carries its own extension again: given a name
-# without one, `WriteVTK` appends it, but warns whenever the name has any other extension — and a dotted base name such
-# as `out_t=0.5` has one (`.5`), so every file of a time-stamped bundle used to warn.
-function _vtk_base_path(path::AbstractString)
-    base, ext = splitext(String(path))
-    return ext in (".vtm", ".vtu", ".vtp", ".pvd") ? base : String(path)
-end
-
-# VTK supports cells in 1D, 2D, and 3D natively. Higher-dimensional spaces have no corresponding VTK cell type and are
-# rejected at the top of the public entry points so the user sees the dimension limitation up front.
-function _check_vtk_dimension(::Val{D}) where {D}
-    D <= 3 || throw(ArgumentError("VTK export supports dimensions 1, 2, and 3; got D=$D"))
-end
 
 end
