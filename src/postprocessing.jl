@@ -116,7 +116,7 @@ function write_vtk(path::AbstractString, solution::Solution, model::Model{D,T}; 
     # Not WriteVTK's do-block form, which saves the multiblock in a `finally`: a keyword refused or a callback that
     # throws halfway through the fields would leave a stub `.vtm` and the grids written so far. Every dataset stays in
     # memory until `vtk_save`, and the output directory is made just before it, so a call that fails leaves nothing.
-    vtm = vtk_multiblock(base)
+    vtm = vtk_multiblock(base * ".vtm")
     _write_vtk_blocks!(vtm, base, solution, model; field, subdivisions, cut_depth=budget, point_data, cell_data,
                        level_meshes, ascii, append, compress)
     mkpath(dirname(base))
@@ -183,7 +183,7 @@ function vtk_series(path::AbstractString; frames=nothing)
     directory = frames === nothing ? base * "_frames" : String(frames)
     mkpath(dirname(base))
     mkpath(directory)
-    return VTKSeries(paraview_collection(base), directory, Ref(0))
+    return VTKSeries(paraview_collection(base * ".pvd"), directory, Ref(0))
 end
 
 """
@@ -209,7 +209,7 @@ function write_vtk(series::VTKSeries, time::Real, solution::Solution, model::Mod
     budget = _cut_depth_budget(cut_depth)
     n = series.count[] + 1
     base = _vtk_bundle_base(joinpath(series.frames, "frame_" * lpad(n, 4, '0')), solution, model)
-    vtm = vtk_multiblock(base)
+    vtm = vtk_multiblock(base * ".vtm")
     _write_vtk_blocks!(vtm, base, solution, model; field, subdivisions, cut_depth=budget, point_data, cell_data,
                        level_meshes, ascii, append, compress)
     # Hands the *open* multiblock over: the collection closes it — which is what writes the frame's files — and records
@@ -268,7 +268,7 @@ function write_quadrature_vtm(path::AbstractString, model::Model{D,T}) where {D,
         push!(get!(groups, sig, Int[]), i)
     end
 
-    return vtk_multiblock(base) do vtm
+    return vtk_multiblock(base * ".vtm") do vtm
         for sig in sort!(collect(keys(groups)))
             region_indices = groups[sig]
             points = SVector{3,T}[]
@@ -285,7 +285,7 @@ function write_quadrature_vtm(path::AbstractString, model::Model{D,T}) where {D,
                 end
             end
             suffix = isempty(sig) ? "none" : join(sig, "_")
-            vtk = vtk_grid(_vtk_child_path(base, "quadrature_levels_" * suffix), points, verts)
+            vtk = vtk_grid(_vtk_child_path(base, "quadrature_levels_" * suffix) * ".vtp", points, verts)
             multiblock_add_block(vtm, vtk, "levels_" * suffix)
             vtk["weight", VTKPointData()] = weights
         end
@@ -323,8 +323,9 @@ function _vtk_bundle_base(path::AbstractString, solution::Solution, model::Model
 end
 
 # Strip a `.vtm` / `.vtu` / `.vtp` / `.pvd` extension from `path` so callers can pass either `"out"` or `"out.vtm"`
-# interchangeably. `WriteVTK` adds the extension automatically — and warns if it finds a different one already there,
-# which is why the collection extension is on the list too.
+# interchangeably. Every file name the writers hand to `WriteVTK` then carries its own extension again: given a name
+# without one, `WriteVTK` appends it, but warns whenever the name has any other extension — and a dotted base name such
+# as `out_t=0.5` has one (`.5`), so every file of a time-stamped bundle used to warn.
 function _vtk_base_path(path::AbstractString)
     base, ext = splitext(String(path))
     return ext in (".vtm", ".vtu", ".vtp", ".pvd") ? base : String(path)
@@ -370,7 +371,7 @@ function _write_vtk_blocks!(vtm, base::AbstractString, solution::Solution, model
                                    cut_depth, point_data, cell_data)
         field_block = multiblock_add_block(vtm, string(fld.name))
         data_name = multi ? "data_$i" : "data"
-        vtk = vtk_grid(_vtk_child_path(base, data_name), data.points, data.cells; ascii, append, compress)
+        vtk = vtk_grid(_vtk_child_path(base, data_name) * ".vtu", data.points, data.cells; ascii, append, compress)
         multiblock_add_block(field_block, vtk, data_name)
         for (name, arr) in data.point_arrays
             vtk[name, VTKPointData()] = arr
@@ -390,7 +391,8 @@ function _write_vtk_blocks!(vtm, base::AbstractString, solution::Solution, model
         for level in space.levels
             data = _mesh_vtk_data(level, layout.dofs, coverage)
             label = "level_$(level.id)_$(level.role)"
-            mvtk = vtk_grid(_vtk_child_path(base, "$(label)_mesh"), data.points, data.cells; ascii, append, compress)
+            mesh_path = _vtk_child_path(base, "$(label)_mesh") * ".vtu"
+            mvtk = vtk_grid(mesh_path, data.points, data.cells; ascii, append, compress)
             multiblock_add_block(field_block, mvtk, label)
             mvtk["level_id", VTKCellData()] = data.level_ids
             mvtk["role_id", VTKCellData()] = data.role_ids
@@ -425,8 +427,9 @@ function _field_context(model::Model, fld::Field)
     return space, _region_list(model, nothing, space).regions, _field_layout(model.dofs, fld.name)
 end
 
-# Compose the file path for a child VTK block by suffixing the base name. Used by the multiblock writer to derive paths
-# for the solution `.vtu` and the per-level mesh `.vtu`s.
+# Compose the file path for a child VTK block by suffixing the base name, without its extension, which the caller
+# appends (see `_vtk_base_path`). Used by the multiblock writers to derive paths for the solution `.vtu`, the
+# per-level mesh `.vtu`s and the quadrature `.vtp`s.
 _vtk_child_path(base::AbstractString, suffix::AbstractString) = joinpath(dirname(base), basename(base) * "_" * suffix)
 
 # ── VTK partition and samples ─────────────────────────────────────────────────

@@ -891,3 +891,22 @@ end
     @test readdir(joinpath(dir, "run_frames")) == frames
     @test series.count[] == 1
 end
+
+@testset "a dotted base name writes the same files without warnings" begin
+    # WriteVTK appends a file's extension when it is missing, but warns when the name carries any other one, and a
+    # time-stamped base name such as `out_t=0.5` has one (`.5`): every file of its bundle used to warn. The writers now
+    # name each file with its extension; the names are unchanged.
+    (; model, sol) = _pin_2d
+    base = joinpath(mktempdir(), "out_t=0.5")
+    files = @test_logs write_vtk(base, sol, model; level_meshes=false)
+    @test files == [base * ".vtm", base * "_data.vtu"]
+    cloud = joinpath(mktempdir(), "cloud_t=0.5")
+    @test (@test_logs write_quadrature_vtm(cloud, model)) ==
+          [cloud * ".vtm", cloud * "_quadrature_levels_1.vtp", cloud * "_quadrature_levels_1_2.vtp"]
+    run = joinpath(mktempdir(), "run_t=0.5")
+    series = @test_logs vtk_series(run)
+    @test (@test_logs write_vtk(series, 0.5, sol, model; level_meshes=false)) ==
+          joinpath(run * "_frames", "frame_0001.vtm")
+    @test (@test_logs close(series)) == run * ".pvd"
+    @test isfile(run * ".pvd")
+end
