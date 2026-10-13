@@ -1809,11 +1809,15 @@ end
     @test everywhere != boundary(:all; except=(axis=1, side=:lower))
     @test length(Dict(everywhere => 1, boundary(:all; except=(axis=1, side=:lower)) => 2)) == 2
 
-    # An unsupported symbol with no `except` still constructs and still fails exactly where it used to — at prepare
-    # time, not at construction.
-    @test boundary(:nonsense).selector === :nonsense
-    @test isempty(boundary(:nonsense).sides)
-    @test_throws ArgumentError Unfitted._facets(boundary(:nonsense), Val(2))
+    # `:all` is the only symbol a selector takes. Any other one is refused where it is spelled, naming the spellings
+    # that do exist. Each of these used to construct: `:sides` as the empty facet, which every raw covers, so a
+    # Dirichlet condition on it eliminated every dof of the space, interior ones included; `:except` as an undocumented
+    # alias of `:all`; and anything else as a selector that failed only at `prepare`.
+    for selector in (:sides, :except, :nonsense)
+        @test_throws "boundary(:$selector) is not a selector: use boundary(:all)" boundary(selector)
+    end
+    # `_facets`, where every consumer decomposes a selector, still refuses a hand-built one with an unknown symbol.
+    @test_throws ArgumentError Unfitted._facets(Unfitted.BoundarySelector(:nonsense, Tuple{Int,Symbol}[]), Val(2))
 
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
     model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))

@@ -108,6 +108,9 @@ Select a physical facet for boundary conditions:
     pick a corner; two pairs in 3D pick an edge; three pairs in 3D pick a vertex. Each axis may appear at most once, and
     `side` must be `:lower` or `:upper`.
 
+`:all` is the only symbol a selector takes: a face is named by its `(axis, side)` pair, and any other symbol raises
+`ArgumentError` here.
+
 Several faces therefore mean two different things depending on where they are written, and the difference is the whole
 reason `except` exists: in the positional form they *intersect* —
 `boundary((axis=1, side=:lower), (axis=2, side=:lower))` is the corner where two faces meet, not the pair of them —
@@ -159,12 +162,21 @@ disjoint and together make up `∂Ω`, so integrate the immersed part over a [`B
 [`boundary_integral`](@ref), which states the closure identity the pair satisfies.
 """
 function boundary(selector::Symbol; except=())
-    # The no-exclusion path is the original one-line method, and it is reached before every other check in this method
-    # so that it stays exactly that: any symbol still constructs the selector it always constructed, and one that no
-    # consumer supports still fails where it always failed — at prepare time, in `_facets`, not here.
-    isempty(except) && return BoundarySelector(selector, Tuple{Int,Symbol}[])
-    selector === :all || throw(ArgumentError("except= removes faces from the whole boundary, so it applies " *
-                                             "only to boundary(:all); got boundary(:$selector)"))
+    # `:all` is the only symbol a selector is built from; a face is named by `(axis, side)`, never by a symbol. Any
+    # other symbol used to construct a selector all the same, and none of them did what it seemed to: `:sides` with no
+    # side listed is the empty facet, whose empty face mask every raw covers in the Dirichlet detection pass, so a
+    # condition on it constrained every dof of the space, interior ones included; `:except` was an undocumented alias
+    # of `:all`; and anything else failed only at `prepare`, far from the call that spelled it. A misplaced `except` is
+    # diagnosed first, so its message, which names the keyword, is the one such a call gets.
+    isempty(except) ||
+        selector === :all ||
+        throw(ArgumentError("except= removes faces from the whole boundary, so it applies " *
+                            "only to boundary(:all); got boundary(:$selector)"))
+    selector === :all ||
+        throw(ArgumentError("boundary(:$selector) is not a selector: use boundary(:all) for the whole " *
+                            "boundary, boundary(axis=d, side=s) for one face, or boundary((axis=d₁, " *
+                            "side=s₁), …) for the intersection of several faces"))
+    isempty(except) && return BoundarySelector(:all, Tuple{Int,Symbol}[])
     return BoundarySelector(:except, _excluded_faces(except))
 end
 
