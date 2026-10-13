@@ -104,16 +104,16 @@ Select a physical facet for boundary conditions:
     pick a corner; two pairs in 3D pick an edge; three pairs in 3D pick a vertex. Each pair carries the keys `axis` and
     `side` and no other, each axis may appear at most once, and `side` must be `:lower` or `:upper`.
 
-`:all` is the only symbol a selector takes: a face is named by its `(axis, side)` pair, and any other symbol raises
-`ArgumentError` here. So does an axis below 1, in every spelling; an axis beyond the dimension of the space is refused
-when the selector meets the space, at [`prepare`](@ref).
-
 Several faces therefore mean two different things depending on where they are written, and the difference is the whole
 reason `except` exists: in the positional form they *intersect* —
 `boundary((axis=1, side=:lower), (axis=2, side=:lower))` is the corner where two faces meet, not the pair of them —
 while in `except` they are removed from a union. On a box every face subset is the complement of another, so `except`
 reaches all of them, and an axis may be named twice there (`(axis=3, side=:lower)` and `(axis=3, side=:upper)` together)
 where the positional form rejects it.
+
+`:all` is the only symbol a selector takes: a face is named by its `(axis, side)` pair, and any other symbol raises
+`ArgumentError` here. So does an axis below 1, in every spelling; an axis beyond the dimension of the space is refused
+when the selector meets the space, at [`prepare`](@ref).
 
 The dimension-independent Dirichlet projection treats every facet through one code path: a codim-`K` facet is integrated
 against the `(D − K)`-dim quadrature on the facet, which for `K = D` collapses to a single point evaluation with unit
