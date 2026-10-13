@@ -365,49 +365,9 @@ function _pseudonormal_sign(m::_MeshSDF{D}, candidates, pv, best_cp) where {D}
 end
 
 # ── Public constructors ───────────────────────────────────────────────────────
+#
+# The methods behind `mesh_levelset` and `stl_levelset`, which `src/Unfitted.jl` declares and documents.
 
-"""
-    mesh_levelset(mesh::BoundaryMesh; lipschitz=nothing, orientation=:pseudonormal) -> LevelSet
-
-Build a signed-distance [`LevelSet`](@ref) leaf from a closed boundary mesh — negative inside the solid — so
-`physical_domain(mesh_levelset(mesh))` integrates the enclosed region and the leaf composes with the CSG combinators
-(`intersect`/`union`/`setdiff`/`complement`). Two cases are supported:
-
-  - `BoundaryMesh{2,T,1}` — a closed segment loop bounding a 2D region (build it with
-    `polyline_mesh(verts; closed=true)` or `segment_mesh`),
-  - `BoundaryMesh{3,T,2}` — a triangle surface bounding a 3D solid (`triangle_mesh`, or [`stl_levelset`](@ref) from a
-    file).
-
-The mesh must be watertight and consistently outward-oriented; with the default geometric normals that means
-counter-clockwise segment loops in 2D and right-hand-rule triangle winding in 3D (the conventions of `BoundaryMesh`'s
-`_default_normal`). Degenerate (zero-measure) cells are dropped, and under `:pseudonormal` the surviving cells are then
-checked to be closed (every cell face traversed once in each direction) and to enclose a positive volume — a hole, a
-flipped facet or a reversed winding is rejected rather than answered with an inverted sign. Faces are paired through
-corners welded within 10⁻⁶ of the bounding-box diagonal (a binary STL stores each facet's corners separately, in
-`Float32`). At that scale the check cannot tell a sliver of a closed surface from a dangling one, so a cell with two
-corners that close is rejected too, even in an otherwise sound mesh. So are two cells on the same welded corners — a
-sheet listed in both windings, or a face shared by two touching solids — which pass both checks while bounding nothing.
-The checks do not detect bodies that overlap, or that share a face triangulated differently on its two sides, nor a
-separate component wound inside-out beside a larger outward one. The default mode inverts the sign near such faces, so
-merge touching or overlapping bodies into the boundary of their union and orient every component outward.
-
-`orientation` selects the inside/outside test:
-
-  - `:pseudonormal` (default) — angle-weighted pseudonormal of the closest feature (Bærentzen & Aanæs 2005). Fast
-    (O(candidates) per query), exact for a clean mesh including reflex features.
-  - `:winding` — generalized winding number (Jacobson et al. 2013). Robust on imperfect / non-watertight / globally
-    flipped meshes, at O(cells) per query, and the only mode that accepts a mesh failing the checks above.
-
-`lipschitz` defaults to the exact constant of what the mode returns: `1.0` under `:pseudonormal`, where the result is a
-true signed distance and the cell classifier's certificate is tight, and `Inf` under `:winding`, where a gap in the mesh
-puts a jump of the sign at a positive distance from any cell and no finite constant bounds it. Pass `lipschitz = 1.0`
-explicitly to keep the tight certificate when `:winding` runs on a watertight mesh.
-
-!!! note
-    `triangle_mesh` is exported by both Unfitted and GeometryBasics. Loading the extension via
-    `using Unfitted, FileIO, MeshIO` keeps Unfitted's in scope; do not also `using GeometryBasics`, which would shadow
-    it.
-"""
 function mesh_levelset(mesh::BoundaryMesh{D,T,K}; lipschitz::Union{Real,Nothing}=nothing,
                        orientation::Symbol=:pseudonormal) where {D,T,K}
     orientation in (:pseudonormal, :winding) ||
@@ -432,20 +392,6 @@ function _load_triangles(path::AbstractString)
     return verts, fcs
 end
 
-"""
-    stl_levelset(path; lipschitz=nothing, orientation=:pseudonormal) -> LevelSet
-
-Read an STL file (ASCII or binary) at `path` and return a signed-distance [`LevelSet`](@ref) leaf for the meshed solid:
-it loads the triangles into a `BoundaryMesh{3,T,2}` (`triangle_mesh`) and calls [`mesh_levelset`](@ref).
-
-    using Unfitted, FileIO, MeshIO   # GeometryBasics loads transitively
-    Ω = physical_domain(stl_levelset("part.stl"); subcell_length_scale=h)
-
-`lipschitz` and `orientation` are passed through to [`mesh_levelset`](@ref), including its watertightness and
-outward-orientation checks — an STL with holes or mis-wound facets is rejected under the default `:pseudonormal`, and
-`orientation = :winding` is the robust inside/outside test that accepts it. Accuracy is bounded by the STL faceting:
-each planar facet is integrated exactly, while facet edges are creases resolved by the kernel's subdivision.
-"""
 function stl_levelset(path::AbstractString; lipschitz::Union{Real,Nothing}=nothing, orientation::Symbol=:pseudonormal)
     verts, faces = _load_triangles(path)
     isempty(faces) && throw(ArgumentError("no triangles in $path; expected an ASCII or binary STL"))

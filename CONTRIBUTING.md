@@ -1368,9 +1368,11 @@ Rules:
     declared in `src/Unfitted.jl`, since an extension cannot export a
     name, and a docstring that `?name` must find in a session without the
     extension belongs there too: one written in the extension lands in
-    the extension module's own docs. The VTK writers are declared as
-    fallback methods that, without the extension, raise an error naming
-    the package to load (`_extension_missing`).
+    the extension module's own docs. Every such name is declared as one
+    fallback method that, without the extension, raises an error naming
+    the package to load (`_extension_missing`); a further signature an
+    extension implements is documented on an abstract signature in the
+    core.
   - `Manifest.toml` is git-ignored. Do not change that.
 
 ## Performance

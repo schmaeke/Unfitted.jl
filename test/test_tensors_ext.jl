@@ -2,6 +2,16 @@ using LinearAlgebra
 using StaticArrays
 using Tensors
 
+# The entry points are declared in the core and implemented by the extension `using Tensors` loads. Once it is loaded, a
+# call none of its methods accepts is an ordinary `MethodError`, not advice to load what is loaded; the behaviour
+# without the extension is pinned in a fresh process by test_api.jl.
+@testset "UnfittedTensorsExt: the extension provides the tensor-notation readers" begin
+    @test Base.get_extension(Unfitted, :UnfittedTensorsExt) !== nothing
+    @test_throws MethodError symmetric_gradient(1)
+    @test_throws MethodError value_vec(1)
+    @test_throws MethodError gradient_tensor(1)
+end
+
 # ── Trial-side: TrialChannels → Tensors.jl objects ────────────────────────────
 
 @testset "UnfittedTensorsExt: Vec(::TrialChannels) preserves component order" begin

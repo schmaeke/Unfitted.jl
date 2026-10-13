@@ -217,40 +217,42 @@ end
     texts = [join(doc.text) for doc in values(meta[Base.Docs.Binding(Unfitted, :Problem)].docs)]
     @test any(t -> occursin("Three convenience constructors", t), texts)
 
-    # The remaining gaps are known and structural, not detachments:
-    #
-    #   * `mass_form` / `mass_block` each carry one docstring covering their two siblings as well; a docstring attaches
-    #     to a single definition, so the siblings have no entry of their own;
-    #   * the extension stubs are documented in the module docstring and in the comment blocks above their
-    #     `function … end` declarations in `Unfitted.jl`, and any docstring the extension attaches lands in the
-    #     extension module's `meta`, not this one.
+    # The remaining gap is known and structural, not a detachment: `mass_form` / `mass_block` each carry one docstring
+    # covering their two siblings as well, and a docstring attaches to a single definition, so the siblings have no
+    # entry of their own.
     #
     # Subset, not equality: documenting one of these is an improvement and must not fail the suite, while a *new*
-    # undocumented export does.
+    # undocumented export does. The names an extension implements are not exempt: the core declares and documents each.
     grouped = [:source_form, :stiffness_form, :source_load, :stiffness_block]
-    extension_stubs = [:bspline, :gradient_tensor, :mesh_levelset, :stl_levelset, :symmetric_gradient, :value_vec]
-    @test issubset(undocumented, union(grouped, extension_stubs))
+    @test issubset(undocumented, grouped)
 
     # The VTK writers are implemented by an extension and documented here, the two series operations included: their
     # docstrings sit on abstract signatures that no method of the core implements, so pin that they reached the docs.
     @test haskey(meta[Base.Docs.Binding(Unfitted, :write_vtk)].docs, Tuple{VTKSeries,Any,Any,Any})
     @test haskey(meta[Base.Docs.Binding(Base, :close)].docs, Tuple{VTKSeries})
+    # So are the tensor readers' `Val` and `Field` forms: one docstring per signature the Tensors extension implements.
+    ndocs(name) = length(meta[Base.Docs.Binding(Unfitted, name)].docs)
+    @test (ndocs(:symmetric_gradient), ndocs(:value_vec), ndocs(:gradient_tensor)) == (3, 2, 2)
 end
 
-# The VTK writers are a package extension that `using WriteVTK` loads. Without it each entry point must say so, naming
-# `using WriteVTK`, before it touches the file system, and `using Unfitted` alone must not load WriteVTK, which is what
-# keeps WriteVTK out of the package's load time. Only a fresh process can show either: this one may have loaded
-# WriteVTK already (test_vtk.jl does), and a loaded package cannot be unloaded. The child loads Unfitted alone and calls
-# each entry point with placeholder arguments, which a stub never reads, so no model is built and the test costs one
-# package load.
-@testset "the VTK entry points ask for WriteVTK until it is loaded" begin
+# The VTK writers, the tensor-notation readers, the B-spline factory and the mesh level sets are package extensions that
+# `using WriteVTK`, `using Tensors`, `using BasicBSpline` and `using MeshIO` load. Without its extension each entry
+# point must say so, naming the package, before it touches anything (the file system included), and `using Unfitted`
+# alone must load none of those packages, which is what keeps them out of the package's load time. Only a fresh process
+# can show either: this one may have loaded them already (the extensions' test files do), and a loaded package cannot be
+# unloaded. The child loads Unfitted alone and calls each entry point with placeholder arguments, which a stub never
+# reads, so no model is built and the test costs one package load.
+@testset "the extension entry points ask for their package until it is loaded" begin
     dir = mktempdir()
     script = """
         using Unfitted
         dir = only(ARGS)
         calls = (write_vtk => (joinpath(dir, "w", "bundle"), nothing, nothing),
                  vtk_series => (joinpath(dir, "s", "run"),),
-                 write_quadrature_vtm => (joinpath(dir, "q", "cloud"), nothing))
+                 write_quadrature_vtm => (joinpath(dir, "q", "cloud"), nothing),
+                 symmetric_gradient => (nothing,), value_vec => (nothing, :u, Val(2)),
+                 gradient_tensor => (nothing, :u, Val(2)), bspline => (),
+                 mesh_levelset => (nothing,), stl_levelset => (joinpath(dir, "m", "part.stl"),))
         for (f, args) in calls
             message = try
                 f(args...)
@@ -260,7 +262,8 @@ end
             end
             println(nameof(f), " => ", replace(message, '\\n' => ' '))
         end
-        println("WriteVTK loaded => ", any(p -> p.name == "WriteVTK", keys(Base.loaded_modules)))
+        packages = ("WriteVTK", "Tensors", "BasicBSpline", "MeshIO", "FileIO", "GeometryBasics")
+        println("packages loaded => ", any(p -> p.name in packages, keys(Base.loaded_modules)))
         """
     cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) -e $script $dir`
     reported = Dict{String,String}()
@@ -269,9 +272,12 @@ end
         name, message = split(line, " => "; limit=2)
         reported[name] = message
     end
-    for name in ("write_vtk", "vtk_series", "write_quadrature_vtm")
-        @test occursin("using WriteVTK", get(reported, name, ""))
+    entry_points = ("write_vtk" => "WriteVTK", "vtk_series" => "WriteVTK", "write_quadrature_vtm" => "WriteVTK",
+                    "symmetric_gradient" => "Tensors", "value_vec" => "Tensors", "gradient_tensor" => "Tensors",
+                    "bspline" => "BasicBSpline", "mesh_levelset" => "MeshIO", "stl_levelset" => "MeshIO")
+    for (name, package) in entry_points
+        @test occursin("using $package", get(reported, name, ""))
     end
-    @test get(reported, "WriteVTK loaded", "") == "false"
+    @test get(reported, "packages loaded", "") == "false"
     @test isempty(readdir(dir))
 end

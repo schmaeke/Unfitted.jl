@@ -91,6 +91,14 @@ Pointwise scalar trial data passed to a weak-form `bilinear` callback at a singl
     frame).
 
 The two-argument constructor defaults `component = 1` and is the common scalar-field shorthand.
+
+With Tensors.jl loaded, its package extension adds
+
+    Tensors.Vec(trial::TrialChannels{D,T}) -> Vec{D,T}
+
+which reads the physical gradient channel of a trial basis function as a `Vec{D,T}`. `SVector{D,T}` and `Vec{D,T}` are
+both `NTuple{D,T}` underneath, so the conversion is a tuple repack that LLVM resolves to an identity store; there is no
+allocation and no extra arithmetic.
 """
 struct TrialChannels{D,T<:Real}
     component::Int
@@ -128,6 +136,37 @@ displacement on a `D`-axis space-time mesh has a `C × C` stress, whose rows are
 it does not reach are the ones the field carries no component for, where the flux is genuinely zero. A coefficient
 **longer** than `D` names a flux along an axis the mesh does not have and raises a `DimensionMismatch` rather than being
 truncated.
+
+With Tensors.jl loaded, its package extension adds two constructors that take Tensors.jl objects:
+
+    TestChannels(value::Real, gradient::Vec{D,T}) -> TestChannels{D,T}
+
+accepts a Tensors.jl `Vec` for the gradient coefficient, so a callback can return tensor algebra results directly:
+
+    return TestChannels(0.0, σ ⋅ n)          # a traction, say
+
+The conversion to the internal `SVector{D,T}` storage reads the `D` coordinates straight into the existing `SVector`
+constructor and adds no runtime cost beyond it. When the gradient coefficient is a row of a stress tensor — the
+elasticity case — use the three-argument constructor instead of extracting the row by hand:
+
+    TestChannels(value::Real, σ::SecondOrderTensor{D,T}, component::Integer) -> TestChannels{D,T}
+
+is the return-side constructor for a stress-like 2nd-order tensor, which is what a constitutive law hands back. Assembly
+contracts the gradient channel against the *scalar* test basis gradient of test component `c`, i.e. against the test
+function `v = N eᶜ` with `∇v = eᶜ ⊗ ∇N`, so
+
+    σ : ∇v = Σⱼ σ[c, j] ∂ⱼN = ⟨row c of σ, ∇N⟩,
+
+and the gradient coefficient of `∫ σ : ∇v` is row `component` of `σ`:
+
+    return TestChannels(0.0, ℂ ⊡ symmetric_gradient(trial), test_component)
+
+Row, not column. The two agree for the symmetric `σ` of small-strain elasticity, but they differ for a general 2nd-order
+tensor — a first Piola–Kirchhoff stress, say — and the contraction asks for the row in both cases.
+
+`component` indexes a row of `σ`, so a test component above `D` raises a `BoundsError`. That is the same `C = D`
+assumption [`symmetric_gradient`](@ref) documents: a field carrying more components than the space has axes has no
+stress tensor to take a row of.
 """
 struct TestChannels{D,T<:Real}
     value::T

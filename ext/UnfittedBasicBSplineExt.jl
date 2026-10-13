@@ -4,7 +4,8 @@
 Package extension that adds an open-knot, tensor-product B-spline basis family to Unfitted on top of
 [`BasicBSpline.jl`](https://github.com/hyrodium/BasicBSpline.jl). Loading `BasicBSpline` next to `Unfitted` installs the
 family and the required basis-interface methods; without `BasicBSpline`, the package functions exactly as before with
-the default [`IntegratedLegendre`](@ref) family.
+the default [`IntegratedLegendre`](@ref) family, and its factory [`bspline`](@ref), which `src/Unfitted.jl` declares and
+documents, raises an error that says to run `using BasicBSpline`.
 
 # Mathematical setting
 
@@ -99,122 +100,8 @@ using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebas
 
 # ── Public factory and deferred spec ──────────────────────────────────────────
 
-"""
-    bspline(; continuity = :maximal) -> _BSplineSpec
-
-Mark a [`space`](@ref) / [`overlay`](@ref) call as using the open-knot tensor B-spline basis family. The per-axis
-polynomial degree is taken from the `order` keyword on `space` / `overlay` (matching the integrated Legendre
-convention), so a typical use looks like
-
-```julia
-using Unfitted, BasicBSpline
-V = space(box((0.0, 0.0), (1.0, 1.0)); cells=8, order=3, basis=bspline())
-```
-
-# Keyword arguments
-
-  - `continuity` — the smoothness the level's contribution carries **across its own artificial boundary**, and therefore
-    the smoothness of the whole superposition there. `:maximal` (the default) is `C^{p_d − 1}` per axis, the most a
-    degree-`p_d` spline has to give; an `Integer` `m` asks for `C^m` and buys unknowns with the difference. `m` may run
-    from `0` (`C⁰`, which is all the integrated-Legendre family offers) up to `p_d − 1` on the lowest-degree axis, and
-    an integer request equal to `p_d − 1` on every axis is `:maximal` by another name and takes the same code path.
-
-# What a level contributes, and the one theorem behind it
-
-Write `Â` for the level's **admissible region**: its active cells, plus every cell that holds no material — an inactive
-cell lying entirely outside Ω, which every cell the fictitious fold switched off is and a user-masked cell may be, and a
-cell of the grid continued past an artificial box face lying entirely outside Ω (nothing is integrated there, so a
-truncation there is invisible on Ω) — plus everything beyond a box face that coincides with the boundary of the space's
-own domain (that face is not artificial, so nothing has to vanish on it). At `:maximal` the level generates exactly
-
-    W = span { B_α : supp B_α ⊆ Â }
-
-where `supp B_α = ∏_d [α_d − p_d, α_d]` is the full `(p_d + 1)`-cell support of the tensor B-spline, counted **without
-clipping** to the level's own mesh — the cells that fall outside the mesh are precisely what tells the rule that the
-function reaches past the level's box.
-
-That selection is not one option among several. A degree-`p` B-spline on simple interior knots is globally `C^{p−1}` and
-identically zero outside its support, so every such `B_α` extends by zero to a globally `C^{p−1}` function, with no
-constraint equation anywhere and under any mask geometry. And it is *maximal*: if `v` is a spline of the level that
-vanishes outside `Â` and is `C^{p−1}` across `∂Â`, then `v ≡ 0` on every cell outside `Â`, so by the local linear
-independence of the B-splines on a cell every coefficient of a function whose support meets that cell is zero — that is,
-`v ∈ W`. No selection rule and no constraint system can do better; the boundary layer below is a property of the space,
-not of the basis.
-
-The rule is Kraft's selection, stated for superposed independent grids instead of a nested hierarchy:
-
-> R. Kraft, *Adaptive and linearly independent multilevel B-splines*, in: A. Le Méhauté, C. Rabut, L. L. Schumaker
-> (Eds.), Surface Fitting and Multiresolution Methods, Vanderbilt University Press (1997) 209–218.
->
-> C. Giannelli, B. Jüttler, H. Speleers, *THB-splines: The truncated basis for hierarchical splines*, Comput. Aided
-> Geom. Design **29** (2012) 485–498, [doi:10.1016/j.cagd.2012.03.025](https://doi.org/10.1016/j.cagd.2012.03.025),
-> Definition 1.
-
-Its per-patch, arbitrary-degree, arbitrary-smoothness form — the one this family implements — is the Patchwork B-spline
-selection `K^ℓ = {j : β_j^ℓ|_{π^ℓ} ≠ 0 and β_j^ℓ|_{Γ^ℓ} = 0}`, whose constraining boundary `Γ^ℓ` is this package's
-`Γ_o^(k)`:
-
-> D. Engleitner, B. Jüttler, *Patchwork B-spline refinement*, Computer-Aided Design **90** (2017) 168–179,
-> [doi:10.1016/j.cad.2017.05.021](https://doi.org/10.1016/j.cad.2017.05.021), Lemma 2 and Theorem 1.
-
-# The dof ledger, and the boundary layer
-
-On a level of `n_d` cells per axis whose faces are all artificial, `:maximal` leaves `∏_d max(0, n_d − p_d)` functions,
-and an integer `m` leaves `∏_d max(0, n_d + p_d − 2(m + 1))`. So a level contributes **nothing at all** until its active
-region is more than `p_d` cells wide in every axis, and an activation front must advance `p_d` cells before the level
-carries a new unknown. That is the minimal-support theorem — a nonzero element of the degree-`p`, `C^{p−1}` spline space
-supported on `k` consecutive knot intervals exists only for `k ≥ p + 1` (C. de Boor, *A Practical Guide to Splines*,
-revised edition, Springer (2001), Ch. IX, [doi:10.1007/978-1-4612-6333-3](https://doi.org/10.1007/978-1-4612-6333-3)) —
-and it is why a refinement region has to contain the **support extension** of the feature it resolves rather than only
-the feature. [`support_extension`](@ref) computes that dilation, and passing an under-extended region is the one way to
-make this family look worse than it is: measured on a tanh layer of width 1/40 with a degree-3 base of 8 cells and a
-band overlay at `h = 1/128`, the relative L² error fell 0.0735 → 3.85e-4 as the band was widened from 1 to 4 base cells
-per side, at constant overlay resolution.
-
-# Nested levels
-
-A B-spline overlay of the same degree whose cell boundaries include the base's reproduces, exactly, every base function
-whose support lies inside the overlay's admissible region — so the two levels would carry the same function twice and
-the superposed operator would be exactly singular. Leaf semantics eliminate the duplicate, unconditionally and with no
-keyword; that costs nothing here, because the discrete space is unchanged, unlike integrated Legendre's shedding of
-buried high-order modes, which trades accuracy for dofs.
-
-Under `:maximal` the burial test is the same containment the selection rule uses, and it is **exact** rather than
-conservative. Subdivision writes a buried `B_α^ℓ` as a positive combination of the fine functions whose support lies
-inside `supp B_α^ℓ`; every one of those is itself admissible on `k` as soon as `supp B_α^ℓ ⊆ Â^k`, so containment is
-sufficient. It is also necessary: every cell of the support carries at least one fine function with a strictly positive
-subdivision coefficient, so a live cell of the support outside `Â^k` means a dropped term and no reproduction. There is
-therefore no configuration in which the cover reproduces a *combination* of buried functions without reproducing each of
-them — the failure that a clamped overlay admits, and the reason this family used to leave one fold configuration
-exactly singular.
-
-An integrated-Legendre cover in `:tensor` mode at order ≥ the degree reproduces the same functions and is deduped the
-same way, because its span is every `C⁰` tensor polynomial of that degree on its cells. `:trunk` drops the mixed
-high-order terms and does not. The converse also holds: a *degree-1* B-spline overlay is the `C⁰` multilinear hat space
-of its own mesh, so it deduplicates the buried vertex functions of an integrated-Legendre level below; at degree ≥ 2 it
-is `C^{p−1}` at a simple interior knot, too smooth to carry the hat's kink, and nothing is deduplicated.
-
-At an integer `continuity` below `p − 1` the level is *clamped* at its artificial faces instead of selected, the
-reproduction question stops being a containment, and the burial test falls back to the conservative predicate
-`_reproduced_on_domain` uses. One fold configuration is then still left singular — when the overlay's box face falls on
-a knot of the level below inside a band of cut cells, the clamped overlay reproduces a combination of two buried
-functions while reproducing neither on its own, and the operator keeps one exact null mode per combination (measured at
-8 on a 6×6 degree-2 base over Ω = {x₁ ≤ 0.9} in [−1, 2]² with a quarter-cell overlay ending at x = 1). Use `:maximal`,
-move the overlay's face off the cut-cell band, or break the nesting.
-
-The only stack that deliberately carries both copies is the **unreduced twin**
-[`prepare`](@ref)`(problem; prune = false)` builds, and on a nested stack that twin is exactly singular by construction
-— which is what it is for. It exists to be measured against, not to be solved with.
-
-# Why a deferred spec
-
-The actual per-axis `BSplineSpace`s depend on the level's mesh-cell coordinates, which do not exist yet when the
-`basis=` value is chosen. `bspline(...)` therefore returns a deferred [`_BSplineSpec`](@ref); the concrete
-[`BSplineFamily`](@ref) is built by the [`instantiate_basis`](@ref) hook in this extension once the mesh is known. A
-mask changes nothing about the knot vectors — a mask face selects functions rather than inserting knots — so a level's
-family is rebuilt on a move but is the same family before and after a mask update. The spec is itself a
-[`BasisFamily`](@ref) subtype so the existing `space` / `overlay` code path accepts it without special casing.
-"""
+# The method behind `bspline`, which `src/Unfitted.jl` declares and documents: it checks the continuity request's
+# spelling and defers everything else to the `instantiate_basis` hook below.
 function Unfitted.bspline(; continuity::Union{Symbol,Integer}=:maximal)
     continuity === :maximal && return _BSplineSpec(_MAXIMAL_CONTINUITY)
     continuity isa Symbol &&

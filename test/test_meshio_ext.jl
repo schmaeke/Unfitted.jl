@@ -14,6 +14,15 @@ using MeshIO
     @test isempty(intersect(names(Unfitted), names(FileIO)))
 end
 
+# The entry points are declared in the core and implemented by the extension `using MeshIO` loads. Once it is loaded, a
+# call none of its methods accepts is an ordinary `MethodError`, not advice to load what is loaded; the behaviour
+# without the extension is pinned in a fresh process by test_api.jl.
+@testset "MeshIO ext — the extension provides the mesh level sets" begin
+    @test Base.get_extension(Unfitted, :UnfittedMeshIOExt) !== nothing
+    @test_throws MethodError mesh_levelset(1)
+    @test_throws MethodError stl_levelset(1)
+end
+
 # ── 3D cube (triangle surface) ────────────────────────────────────────────────
 
 # A cube [lo,hi]³ as an outward-oriented triangle mesh (8 vertices, 12 triangles). Cube faces are planar, so each cut
