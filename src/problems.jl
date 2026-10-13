@@ -2,7 +2,7 @@
 # that describe *what* is being solved — pointwise channels (`TrialChannels`, `TestChannels`), the weak-form callback
 # wrapper (`WeakForm`), named fields (`Field`), per-block / per-load bindings (`BlockForm`, `LoadForm`), and the
 # top-level `Problem` container — together with the channel-arithmetic helpers (`_as_test_channels`,
-# `_test_contribution`, `_test_value_contribution`) that the assembly kernel and the Dirichlet projection both ride.
+# `_test_contribution`) that the assembly kernel and the L² transfer ride.
 #
 # No assembly, no model lifecycle — those live in `model.jl` (the prepared-problem state machine) and `assembly.jl` (the
 # hot loop and public assemble APIs). Loaded between `dofs.jl` (whose `FieldLayout`/`SystemLayout` consume the field
@@ -120,7 +120,7 @@ contribution sets `value = 0` and `gradient = diffusion × trial.gradient`; a `s
 `value = source` and `gradient = 0`.
 
 Callbacks may also return a plain scalar, which is interpreted as a pure value coefficient with a zero gradient
-coefficient (see `_as_test_channels`).
+coefficient.
 
 The gradient coefficient may also be **shorter** than the mesh dimension `D`, in which case assembly zero-extends it
 into the remaining slots. That is what a field with fewer components than the mesh has axes produces — a `C`-component
@@ -141,52 +141,34 @@ end
 
 TestChannels(value::Real, gradient::NTuple{D,<:Real}) where {D} = TestChannels(value, SVector{D}(gradient))
 
-# Zero-vector gradient in the assembly scalar type, used as the default test-gradient coefficient when a callback
-# returns a scalar.
-_zero_gradient(::Val{D}, ::Type{T}) where {D,T} = SVector{D,T}(ntuple(_ -> zero(T), Val(D)))
-
-# Coerce a callback return to a `TestChannels{D,T}` of the assembly's scalar type. Four dispatched cases:
+# Coerce a callback's return to the `TestChannels{D,T}` the kernel contracts: the mesh dimension `D` and the assembly
+# scalar type `T`. A plain scalar is a value-only channel with a zero gradient coefficient. A `TestChannels{K}` keeps
+# its value and its gradient's `K` slots, converted to `T`, and is zero-extended into the remaining `D − K`; with
+# `K == D` and its own scalar type already `T`, every conversion is the identity and the padding is empty, so the
+# channel passes through unchanged. `K`, `D` and `T` are static, so the slot test folds away.
 #
-#   * The callback already returned a `TestChannels{D,T}` — pass through.
-#   * The callback returned a `TestChannels{D, T'}` with a different scalar type — convert in-place.
-#   * The callback returned a scalar — wrap as a value-only channel.
-#   * The callback returned a channel whose gradient is *shorter* than the mesh dimension — zero-extend it (see the
-#     block below).
-_as_test_channels(channels::TestChannels{D,T}, ::Val{D}, ::Type{T}) where {D,T<:Real} = channels
-
-function _as_test_channels(channels::TestChannels{D}, ::Val{D}, ::Type{T}) where {D,T<:Real}
-    return TestChannels{D,T}(convert(T, channels.value), SVector{D,T}(channels.gradient))
-end
-
-function _as_test_channels(value::Number, ::Val{D}, ::Type{T}) where {D,T<:Real}
-    return TestChannels{D,T}(convert(T, value), _zero_gradient(Val(D), T))
-end
-
-# A gradient coefficient shorter than the mesh dimension, zero-extended into the remaining slots.
-#
-# A short coefficient is legitimate, and the space-time case is where it comes from: a field of `C` components on a mesh
-# of `D = C + 1` axes (the last axis time) has a `C × C` stress, and the row of it that the test component selects is a
-# `C`-length gradient coefficient, while assembly contracts against the `D`-length test gradient. The slots the
-# coefficient does not reach are the axes the field carries no component for, and the callback's flux along them really
-# is zero, so extending by zero records what the callback said rather than patching what it forgot.
+# A short gradient coefficient is legitimate, and the space-time case is where it comes from: a field of `C` components
+# on a mesh of `D = C + 1` axes (the last axis time) has a `C × C` stress, and the row of it that the test component
+# selects is a `C`-length gradient coefficient, while assembly contracts against the `D`-length test gradient. The
+# slots the coefficient does not reach are the axes the field carries no component for, and the callback's flux along
+# them really is zero, so extending by zero records what the callback said rather than patching what it forgot.
 #
 # The long direction is an error and not a truncation. A coefficient longer than the mesh dimension names a flux along
 # an axis that does not exist; dropping the surplus slots would quietly delete a term the callback asked for, and the
-# resulting operator would still be symmetric, still solve and still converge — the same silent wrongness this method
-# exists to remove from the short direction. The two methods above tie `TestChannels{D}` to `Val{D}` and are strictly
-# more specific, so this one is reached only when `K ≠ D` and the guard is the only thing standing between the two
-# directions.
+# resulting operator would still be symmetric, still solve and still converge — the same silent wrongness the
+# zero-extension exists to remove from the short direction.
 function _as_test_channels(channels::TestChannels{K}, ::Val{D}, ::Type{T}) where {K,D,T<:Real}
-    K < D || throw(DimensionMismatch("a test gradient coefficient of length $K cannot be used on " *
-                                     "a $D-dimensional mesh: it names a flux along an axis the " *
-                                     "mesh does not have"))
+    K <= D || throw(DimensionMismatch("a test gradient coefficient of length $K cannot be used on " *
+                                      "a $D-dimensional mesh: it names a flux along an axis the " *
+                                      "mesh does not have"))
     gradient = channels.gradient
     return TestChannels{D,T}(convert(T, channels.value),
-                             SVector{D,T}(ntuple(i -> i ≤ K ? convert(T, gradient[i]) : zero(T), Val(D))))
+                             SVector{D,T}(ntuple(i -> i <= K ? convert(T, gradient[i]) : zero(T), Val(D))))
 end
 
-# Scalar contraction `channels.value × test_value`. Used by the Dirichlet projection path in `dirichlet.jl`.
-@inline _test_value_contribution(channels::TestChannels, test_value) = channels.value * test_value
+function _as_test_channels(value::Number, ::Val{D}, ::Type{T}) where {D,T<:Real}
+    TestChannels{D,T}(convert(T, value), zero(SVector{D,T}))
+end
 
 # Value-only contraction for a scalar channel, the L² transfer rhs: it never reads the test gradient, so a value-only
 # basis refresh is enough.

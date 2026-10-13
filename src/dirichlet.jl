@@ -712,10 +712,6 @@ end
 # factorised mass, and the sampled boundary traces — and is built once and reused, while each increment re-accumulates
 # `b` from the samples and back-substitutes. See `DirichletProjection` for why that reuse is exact and when it is
 # invalidated.
-#
-# The `_test_value_contribution` and `_as_test_channels` helpers are defined in `problems.jl`'s channel layer and reused
-# here so the Dirichlet projection rides the same channel calculus the volume assembly uses; the forward reference
-# resolves at call time (`prepare(problem)` loads every source file first).
 
 """
     FacetTraceSamples{D,T}(points, weights, offsets, values, rows)
@@ -1049,13 +1045,12 @@ function _sample_dirichlet_facet!(mass::Vector{Matrix{T}}, index::Vector{Dict{In
                     for b in eachindex(trial_trace.raw_dofs)
                         col = get(index_c, trial_trace.raw_dofs[b], 0)
                         col == 0 && continue
-                        mass_channels = _as_test_channels(trial_trace.values[b], Val(D), T)
+                        trial_value = convert(T, trial_trace.values[b])
                         for test_trace in traces
                             for a in eachindex(test_trace.raw_dofs)
                                 row = get(index_c, test_trace.raw_dofs[a], 0)
                                 row == 0 && continue
-                                mass_c[row, col] += qweight *
-                                                    _test_value_contribution(mass_channels, test_trace.values[a])
+                                mass_c[row, col] += qweight * (trial_value * test_trace.values[a])
                             end
                         end
                     end
@@ -1091,13 +1086,12 @@ function _accumulate_dirichlet_rhs!(rhs::Vector{Vector{T}}, samples::FacetTraceS
         for component in 1:ncomp
             _constrains(condition, component) || continue
             g = convert(T, _component_value(_datum_at(condition.value, x), component))
-            channels = _as_test_channels(g, Val(D), T)
             rows = samples.rows[component]
             rhs_c = rhs[component]
             @inbounds for e in first_entry:last_entry
                 row = rows[e]
                 row == 0 && continue
-                rhs_c[row] += qweight * _test_value_contribution(channels, samples.values[e])
+                rhs_c[row] += qweight * (g * samples.values[e])
             end
         end
     end

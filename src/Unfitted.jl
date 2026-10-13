@@ -365,13 +365,11 @@ include("mesh.jl")
 include("intersections.jl")
 include("coverage.jl")
 include("ladder.jl")
-# Two references of the dof layer run against the include order and resolve at call time rather than at include time.
+# One reference of the dof layer runs against the include order and resolves at call time rather than at include time:
 # `dofs.jl` carries integrated Legendre's `_cell_modes`, a family method of a hook whose generic method is in `mesh.jl`
 # and which `Level`'s constructor calls, so a name defined below is reached from above — the same shape an extension
-# takes. And the L² Dirichlet projection in `dirichlet.jl` accumulates through the channel helpers of `problems.jl`
-# (`_as_test_channels`, `_test_value_contribution`), which load after it. Otherwise the dof layer depends only on what
-# loads above it: the four steps a layout is built in live in `dofs.jl` and `dirichlet.jl`, and `model.jl`, below both,
-# composes them.
+# takes. Otherwise the dof layer depends only on what loads above it: the four steps a layout is built in live in
+# `dofs.jl` and `dirichlet.jl`, and `model.jl`, below both, composes them.
 include("dofs.jl")
 include("dirichlet.jl")
 include("surface.jl")
