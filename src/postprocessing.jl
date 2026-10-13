@@ -70,6 +70,9 @@ automatically attached as a built-in `level_set` point array — convenient for 
 isocontour or for filtering cut / full / fictitious regions in ParaView. Pass a `level_set` entry in `point_data` to
 override or rename it.
 
+The bundle is built in memory and written, its directory included, only once it is complete: a call that fails — on a
+keyword it refuses, or in a callback that throws — leaves nothing on disk.
+
 ## Resolving the immersed boundary
 
 ParaView reconstructs `∂Ω` from the `level_set` array by interpolating it linearly along each cell's edges, so the
@@ -104,10 +107,14 @@ function write_vtk(path::AbstractString, solution::Solution, model::Model{D,T}; 
                    ascii::Bool=false, append::Bool=true, compress=true) where {D,T}
     budget = _cut_depth_budget(cut_depth)
     base = _vtk_bundle_base(path, solution, model)
-    return vtk_multiblock(base) do vtm
-        _write_vtk_blocks!(vtm, base, solution, model; field, subdivisions, cut_depth=budget, point_data, cell_data,
-                           level_meshes, ascii, append, compress)
-    end
+    # Not WriteVTK's do-block form, which saves the multiblock in a `finally`: a keyword refused or a callback that
+    # throws halfway through the fields would leave a stub `.vtm` and the grids written so far. Every dataset stays in
+    # memory until `vtk_save`, and the output directory is made just before it, so a call that fails leaves nothing.
+    vtm = vtk_multiblock(base)
+    _write_vtk_blocks!(vtm, base, solution, model; field, subdivisions, cut_depth=budget, point_data, cell_data,
+                       level_meshes, ascii, append, compress)
+    mkpath(dirname(base))
+    return vtk_save(vtm)
 end
 
 """
@@ -182,7 +189,8 @@ frame's `.vtm`.
 The frame is exactly the bundle `write_vtk(path, solution, model; …)` writes, under a name the series chooses
 (`frame_<n>` in the series' frames directory), and every keyword of that method is accepted here unchanged — see
 [`vtk_series`](@ref) for what the series does and does not do with the frames it is handed. `time` is recorded in the
-collection and is otherwise unused: it need not be a step index, a multiple of anything, or evenly spaced.
+collection and is otherwise unused: it need not be a step index, a multiple of anything, or evenly spaced. A frame that
+fails writes nothing and does not use up a frame number.
 """
 function write_vtk(series::VTKSeries, time::Real, solution::Solution, model::Model{D,T}; field=nothing,
                    subdivisions=:degree, cut_depth=3, point_data=_default_vtk_point_data(), cell_data=NamedTuple(),
@@ -195,7 +203,9 @@ function write_vtk(series::VTKSeries, time::Real, solution::Solution, model::Mod
                        level_meshes, ascii, append, compress)
     # Hands the *open* multiblock over: the collection closes it — which is what writes the frame's files — and records
     # its path, relative to the `.pvd`, against `time`. The counter advances only once that has succeeded, so a rejected
-    # frame does not burn a frame number.
+    # frame does not burn a frame number; and, as for a single bundle, the directory is made only now, so it writes
+    # nothing either.
+    mkpath(dirname(base))
     collection_add_timestep(series.collection, vtm, time)
     series.count[] = n
     return vtm.path
@@ -278,9 +288,9 @@ end
 # the `u` closure is the access path back to the solution evaluation kernel.
 _default_vtk_point_data() = (uh=(u, c, x, xi) -> u(c, xi),)
 
-# Resolve the `cut_depth` keyword to a non-negative bisection budget. Called by the public entry points *before*
-# `_vtk_bundle_base` opens anything, so a rejected value leaves no directory and no half-written bundle behind — the
-# same contract the dimension and coefficient checks there already keep.
+# Resolve the `cut_depth` keyword to a non-negative bisection budget. Called by the public entry points first, so a
+# rejected value costs no sampling; like every other refusal it leaves nothing on disk, since the writers save only a
+# complete bundle.
 #
 # The cap is 8 rather than a larger round number because the leaf count grows as 2^((D−1)k): at D = 3 and the measured
 # ~400 B per emitted cell, depth 8 is already of order 10⁷ cells and a gigabyte, which is a limit rather than a safety
@@ -291,15 +301,14 @@ function _cut_depth_budget(cut_depth)
     throw(ArgumentError("cut_depth must be :none or an integer in 0:8; got $(repr(cut_depth))"))
 end
 
-# Shared prologue of every bundle writer: reject a dimension VTK has no cell type for, and a solution the model did not
-# produce, *before* any file handle exists — a rejected call must leave no half-written bundle behind — then make the
-# output directory and hand back the extension-free base name.
+# Shared prologue of the two bundle writers: reject a dimension VTK has no cell type for, and a solution the model did
+# not produce, before any sampling, and hand back the extension-free base name. It creates nothing: the writers make the
+# output directory only once the whole bundle is built in memory, just before saving it, so a call refused anywhere —
+# here, or by a keyword or a callback during sampling — leaves no directory and no half-written bundle behind.
 function _vtk_bundle_base(path::AbstractString, solution::Solution, model::Model{D}) where {D}
     _check_vtk_dimension(Val(D))
     _checked_coefficients(solution, model)
-    base = _vtk_base_path(path)
-    mkpath(dirname(base))
-    return base
+    return _vtk_base_path(path)
 end
 
 # Strip a `.vtm` / `.vtu` / `.vtp` / `.pvd` extension from `path` so callers can pass either `"out"` or `"out.vtm"`

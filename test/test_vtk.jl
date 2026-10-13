@@ -766,3 +766,30 @@ end
     @test length(files) == 4                                 # the data grid and two level meshes
     @test sort(files) == sort(joinpath.(dir, readdir(dir)))
 end
+
+# ── Regressions: the writer's fixed bugs ──────────────────────────────────────
+
+@testset "a refused or throwing write leaves nothing on disk" begin
+    # Refusals of a keyword or of a callback's value, and an exception a callback raises — here only while the second
+    # field of a coupled model is sampled, after the first field's block is complete — all happen while the bundle is
+    # still in memory. The writer used to make the directory first and save whatever it had on the way out, leaving a
+    # stub `.vtm` and partial grids behind.
+    (; model, sol) = _pin_2d
+    V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(1, 1), order=1)
+    V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(1, 1), order=1)
+    u1 = field(:u1, V1)
+    u2 = field(:u2, V2)
+    coupled = prepare(Problem((u1, u2); blocks=(mass_block(u1), mass_block(u2))))
+    coupled_sol = solution(coupled, ones(active_unknowns(coupled)))
+    cases = [(ArgumentError, model, sol, (; subdivisions=0)), (ArgumentError, model, sol, (; subdivisions=(2, 2, 2))),
+             (ArgumentError, model, sol, (; subdivisions=:bad)), (ArgumentError, model, sol, (; field=:nope)),
+             (ArgumentError, model, sol, (; point_data=[1])),
+             (ArgumentError, model, sol, (; point_data=(text=(u, c, x, xi) -> "text",))),
+             (ErrorException, coupled, coupled_sol,
+              (; cell_data=(late=(u, c, x, xi) -> x[1] > 1.5 ? error("second field") : 0.0,)))]
+    for (exception, m, s, keywords) in cases
+        dir = mktempdir()
+        @test_throws exception write_vtk(joinpath(dir, "sub", "x"), s, m; keywords...)
+        @test isempty(readdir(dir))
+    end
+end
