@@ -1,6 +1,6 @@
 name = "Unfitted"
 uuid = "c68911ed-f311-4fcd-9d58-9cd3adb40d87"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Jan Niklas Schmäke"]
 
 [deps]
