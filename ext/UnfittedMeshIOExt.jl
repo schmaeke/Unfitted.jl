@@ -118,8 +118,9 @@ _vertex_angle(v, p, q) = acos(clamp(dot(normalize(p - v), normalize(q - v)), -1.
 # A boundary mesh prepared for signed-distance queries: the (non-degenerate) cells, a KD-tree over cell midpoints for
 # nearest-cell candidate search, the per-cell outward unit normals, the largest cell radius *about its midpoint*
 # (measured from the same point the tree is keyed on, which is what turns the nearest-midpoint distance into an exact
-# nearest-cell search bound), a mesh-scaled length tolerance `tol` (for the closest-point-coincidence and vertex/edge
-# feature tests, so the sign is scale-free), and the sign convention. `D` is the embedding dimension (2 or 3).
+# nearest-cell search bound), a mesh-scaled length tolerance `tol` (the slack of that search bound and the
+# closest-point-coincidence and vertex tests of the sign, so the query is scale-free), and the sign convention. `D` is
+# the embedding dimension (2 or 3).
 struct _MeshSDF{D,C,TK}
     cells::Vector{C}
     tree::TK
@@ -260,7 +261,8 @@ end
 # their normal is undefined and would corrupt the sign — and each surviving cell contributes its normal (the mesh's own,
 # renormalised, if it carries one, else the geometric `_default_normal`) and its midpoint to the search tree. The two
 # scalars are set here because both are mesh-relative: `maxcr` bounds the candidate search, and `tol` is the length
-# tolerance the vertex/edge feature tests use, taken from the bounding-box diagonal so the sign is scale-free.
+# tolerance of that bound's slack and of the sign's coincidence and vertex tests, taken from the bounding-box diagonal
+# so the query is scale-free.
 function _build_mesh_sdf(bmesh::BoundaryMesh{D,T,K}, winding::Bool) where {D,T,K}
     cells = [map(v -> SVector{D,Float64}(v), cell) for cell in bmesh.cells]
     isempty(cells) && throw(ArgumentError("mesh has no cells"))
@@ -285,7 +287,7 @@ function _build_mesh_sdf(bmesh::BoundaryMesh{D,T,K}, winding::Bool) where {D,T,K
         maxcr = max(maxcr, maximum(norm(v - mid) for v in cell))
     end
     isempty(kept) && throw(ArgumentError("mesh has no non-degenerate cells"))
-    tol = 1.0e-8 * scale     # scale-free length tolerance for the sign tests
+    tol = 1.0e-8 * scale     # scale-free length tolerance for the search slack and the sign tests
     winding || _check_watertight(kept, normals, scale)
     return _MeshSDF{D,eltype(kept),typeof(KDTree(midpoints))}(kept, KDTree(midpoints), normals, maxcr, tol, winding)
 end
@@ -318,43 +320,48 @@ function _winding_sign(m::_MeshSDF{3}, pv)
 end
 
 # Signed distance from `p` to the mesh. Candidate cells are those whose midpoint lies within
-# `nearest_midpoint_distance + maxcr` of `p` (a bound that provably contains the true nearest cell). The sign is the
-# angle-weighted pseudonormal of the closest feature — cells whose closest point coincides in space share that feature
-# and are summed with their feature weights; cells merely equidistant on the medial axis have a different closest point
-# and are excluded — or, with `winding = true`, the generalized winding number.
+# `nearest_midpoint_distance + maxcr` of `p`, a bound that provably contains the true nearest cell, widened by the
+# mesh-relative `tol` so that rounding cannot drop a cell lying exactly on it, at any scale of the mesh. The nearest
+# cell is the first candidate at the least distance. The sign is the angle-weighted pseudonormal of the closest
+# feature, or, with `winding = true`, the generalized winding number.
+#
+# The scan keeps only the best cell and its distance. The pseudonormal gather computes again the few closest points it
+# needs, with the same arithmetic and so to the same bits, which spares every query a vector of them on the heap.
 function (m::_MeshSDF{D})(p) where {D}
     pv = SVector{D,Float64}(ntuple(i -> Float64(ForwardDiff.value(p[i])), D))
-    _, nnd = knn(m.tree, pv, 1)
-    candidates = inrange(m.tree, pv, nnd[1] + m.maxcr + 1.0e-12)
-    isempty(candidates) && (candidates = knn(m.tree, pv, 1)[1])
-
-    # Closest point on each candidate cell (primal), computed once and reused for both the nearest-cell search and the
-    # pseudonormal feature gather.
-    cpvs = [_closest_point(m.cells[i], pv) for i in candidates]
-    best = 1
-    best_dv = norm(pv - cpvs[1])
-    for k in 2:length(candidates)
-        d = norm(pv - cpvs[k])
-        d < best_dv && (best=k; best_dv=d)
+    candidates = inrange(m.tree, pv, last(nn(m.tree, pv)) + m.maxcr + m.tol)
+    best, best_d = first(candidates), Inf
+    for i in candidates
+        d = norm(pv - _closest_point(m.cells[i], pv))
+        d < best_d && (best=i; best_d=d)
     end
-    best_cpv = cpvs[best]
-
-    if m.winding
-        s = _winding_sign(m, pv)
-    else
-        pseudonormal = zero(SVector{D,Float64})
-        for k in eachindex(candidates)
-            norm(cpvs[k] - best_cpv) <= m.tol &&
-                (pseudonormal += _feature_weight(m.cells[candidates[k]], cpvs[k], m.tol) * m.normals[candidates[k]])
-        end
-        s = dot(pv - best_cpv, pseudonormal) >= 0 ? 1.0 : -1.0
-    end
+    s = m.winding ? _winding_sign(m, pv) : _pseudonormal_sign(m, candidates, pv, _closest_point(m.cells[best], pv))
 
     # Differentiable distance to the selected nearest cell. The gradient is the oriented unit normal off the surface;
     # exactly on the surface √(d·d) has an infinite derivative (a NaN), which the implicit kernel's gradient sampling
     # tolerates via its non-finite-sample guard.
-    cp = _closest_point(m.cells[candidates[best]], p)
+    cp = _closest_point(m.cells[best], p)
     return s * sqrt(dot(p - cp, p - cp))
+end
+
+# The sign of `pv` relative to the closest feature, whose point on the mesh is `best_cp`: the side of the angle-weighted
+# pseudonormal it lies on. The cells whose closest point coincides with `best_cp` within `tol` share that feature and
+# are summed with their feature weights; a cell merely equidistant, across the medial axis, has its closest point
+# elsewhere and is left out.
+#
+# A closest point lies in its cell, so no farther than `maxcr` from the cell's midpoint, and a cell the gather sums has
+# its midpoint within `maxcr + tol` of `best_cp`. That test comes first, with a slack of `2tol` that rounding cannot
+# use up, so it never turns away a cell the gather sums: a closest point is recomputed only for the cells it passes,
+# about four of the twenty-two candidates of a query on a 512-facet sphere rather than all of them.
+function _pseudonormal_sign(m::_MeshSDF{D}, candidates, pv, best_cp) where {D}
+    pseudonormal = zero(SVector{D,Float64})
+    for i in candidates
+        cell = m.cells[i]
+        norm(Unfitted._cell_midpoint(cell) - best_cp) <= m.maxcr + 2 * m.tol || continue
+        cp = _closest_point(cell, pv)
+        norm(cp - best_cp) <= m.tol && (pseudonormal += _feature_weight(cell, cp, m.tol) * m.normals[i])
+    end
+    return dot(pv - best_cp, pseudonormal) >= 0 ? 1.0 : -1.0
 end
 
 # ── Public constructors ───────────────────────────────────────────────────────
