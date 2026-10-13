@@ -1553,7 +1553,12 @@ end
 # barrier for the region and state types. Its callers build `ws` fresh (`_assembly_workspace`) on purpose rather than
 # check one out of the model's assembly pool: a walk needs one per call, which costs a few microseconds, and a checkout
 # would need a check-in in a `finally` at every caller.
-function _walk(op, acc, ws, list::RegionList, state, gradients::Val=Val(true))
+#
+# `op::F` is a type parameter on purpose. The default `gradients` makes Julia generate a five-argument method that only
+# passes `op` along, and Julia does not specialise a method on a function argument it merely passes along: that method
+# then ran on `op::Function` and reached this one by a dynamic call, which boxed its arguments — three allocations per
+# walk with a state, one without, on every `foreach_quadrature_point` and `boundary_integral` call.
+function _walk(op::F, acc, ws, list::RegionList, state, gradients::Val=Val(true)) where {F}
     for (r, region) in pairs(list.regions)
         state === nothing || _state_region!(state, _frame!(ws, region))
         jacobian = _region_jacobian(region)
