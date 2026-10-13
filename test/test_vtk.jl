@@ -846,3 +846,25 @@ end
         @test isempty(readdir(dir))
     end
 end
+
+@testset "a Bool callback value is written as UInt8 0 / 1" begin
+    # VTK has no boolean type, and WriteVTK refused a Bool array outright (`data type not supported by VTK: Bool`),
+    # although a Bool is the natural value of a flag or a mask. It is written as UInt8 0 / 1: alone, in an SVector or in
+    # a tuple, and padded to three components like any other 2-vector.
+    (; model, sol) = _pin_2d
+    dir = mktempdir()
+    write_vtk(joinpath(dir, "flags"), sol, model; subdivisions=:none, level_meshes=false, _pin_ascii...,
+              point_data=(right=(u, c, x, xi) -> x[1] > 0.5, corner=(u, c, x, xi) -> SVector(x[1] > 0.5, x[2] > 0.5),
+                          pair=(u, c, x, xi) -> (x[1] > 0.5, x[2] > 0.5)),
+              cell_data=(first=(u, c, x, xi) -> c.region_id == 1,))
+    xml = read(joinpath(dir, "flags_data.vtu"), String)
+    for (name, components) in (("right", "1"), ("corner", "3"), ("pair", "3"), ("first", "1"))
+        tag = _vtu_tag(xml, name)
+        @test (tag["type"], tag["NumberOfComponents"]) == ("UInt8", components)
+    end
+    points = reshape(_vtu_floats(xml, "Points"), 3, :)
+    @test _vtu_ints(xml, "right") == Int.(points[1, :] .> 0.5)
+    @test reshape(_vtu_ints(xml, "corner"), 3, :) == [Int.(points[1:2, :] .> 0.5); zeros(Int, 1, size(points, 2))]
+    @test _vtu_ints(xml, "pair") == _vtu_ints(xml, "corner")
+    @test _vtu_ints(xml, "first") == Int.(_vtu_ints(xml, "region_id") .== 1)
+end

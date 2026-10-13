@@ -51,8 +51,9 @@ Keyword arguments:
   - `point_data` — `NamedTuple` / `Dict` / `Tuple` of `name => callback` pairs. Each callback is invoked at every vertex
     sample as `f(u, context, x, xi)` and returns a real number, a tuple of real numbers or an `SVector` of real
     numbers, of one shape at every sample. The values of one entry are promoted to a common element type, which must be
-    one VTK stores — `Float32`, `Float64` or an integer of at most 64 bits — and a two-component value is written as a
-    three-component VTK vector with a trailing zero. Any other value (a `Vector`, a matrix, a `String`, a `Complex`, a
+    one VTK stores — `Float32`, `Float64` or an integer of at most 64 bits — or `Bool`, which VTK has no type for and
+    is written as `UInt8` 0 / 1. A two-component value is written as a three-component VTK vector with a trailing
+    zero. Any other value (a `Vector`, a matrix, a `String`, a `Complex`, a
     `Rational`, or shapes that differ between samples) is refused with an `ArgumentError` naming the entry, and nothing
     is written. `u(context, xi[, field])` evaluates the current solution at the sample: the block's own field by
     default, or another `field` on the same subdomain. A field on another subdomain of a coupled model raises an
@@ -554,8 +555,13 @@ function _vtk_data_arrays(pairs, values, kind::Symbol)
 end
 
 # The element types a VTK data array can hold, as `WriteVTK` writes them: the machine floats and the integers of up to
-# 64 bits. `Bool` is none of them.
+# 64 bits.
 const _VTK_NUMBERS = (Float32, Float64, Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64)
+
+# The element type a callback's values are written in, given the type `T` they promote to: `T` itself when VTK stores
+# it, `UInt8` for `Bool` — VTK has no boolean type and `WriteVTK` refuses one, while 0 / 1 in a byte keeps a flag or a
+# mask readable in ParaView — and `nothing` for any other type, which `_vtk_data_array` refuses.
+_vtk_number(T::Type) = T === Bool ? UInt8 : T in _VTK_NUMBERS ? T : nothing
 
 # Coerce a `Vector{Any}` of callback returns to a typed array suitable for `WriteVTK`. Three accepted patterns:
 #
@@ -566,9 +572,9 @@ const _VTK_NUMBERS = (Float32, Float64, Int8, Int16, Int32, Int64, UInt8, UInt16
 #   * all-`Tuple` of the same length → `Vector{SVector{N,T}}` with `N` inferred from the first element and `T` promoted
 #     from every component of every entry;
 #
-# each only when the promoted element type is one of `_VTK_NUMBERS`. Both vector patterns pass through
-# `_vtk_vector_array`, so a 2-component result reaches ParaView as a VTK vector. Anything else is refused here, naming
-# the entry, what it returned and what is accepted, rather than handed on: `WriteVTK` would reject it with
+# each written in the `_vtk_number` of the promoted element type, and only when it has one. Both vector patterns pass
+# through `_vtk_vector_array`, so a 2-component result reaches ParaView as a VTK vector. Anything else is refused here,
+# naming the entry, what it returned and what is accepted, rather than handed on: `WriteVTK` would reject it with
 # `data type not supported by VTK: Any` (or `…: Rational{Int64}`), which names neither the entry nor the remedy.
 function _vtk_data_array(values::Vector{Any}, name::AbstractString, kind::Symbol)
     isempty(values) && return Float64[]
@@ -578,20 +584,21 @@ function _vtk_data_array(values::Vector{Any}, name::AbstractString, kind::Symbol
         # Reduce the element types pairwise rather than splatting them into `promote_type`: a `Vector{Any}` of thousands
         # of samples would splat thousands of type arguments and overflow the stack, because variadic `promote_type`
         # recurses one level per argument.
-        T = mapreduce(typeof, promote_type, values)
-        T in _VTK_NUMBERS && return T[values...]
+        T = _vtk_number(mapreduce(typeof, promote_type, values))
+        T === nothing || return T[values...]
     elseif all(v -> v isa SVector, values)
         S = mapreduce(typeof, promote_type, values)
-        isconcretetype(S) && eltype(S) in _VTK_NUMBERS && return _vtk_vector_array(S[convert(S, v) for v in values])
+        T = isconcretetype(S) ? _vtk_number(eltype(S)) : nothing
+        T === nothing || return _vtk_vector_array(SVector{length(S),T}[v for v in values])
     elseif first_value isa Tuple && all(v -> v isa Tuple && length(v) == length(first_value), values)
-        T = reduce(promote_type, (typeof(v[i]) for v in values for i in eachindex(first_value)); init=Union{})
-        S = SVector{length(first_value),T}
-        T in _VTK_NUMBERS && return _vtk_vector_array(S[S(v) for v in values])
+        N = length(first_value)
+        T = _vtk_number(reduce(promote_type, (typeof(v[i]) for v in values for i in 1:N); init=Union{}))
+        T === nothing || return _vtk_vector_array(SVector{N,T}[SVector{N,T}(v) for v in values])
     end
 
     throw(ArgumentError("$kind entry \"$name\" returned $(join(unique(typeof(v) for v in values), ", ")): write_vtk " *
                         "accepts a real number, a tuple of reals or an SVector of reals, of one shape at every " *
-                        "sample, with values promoting to Float32, Float64 or an integer of at most 64 bits"))
+                        "sample, with values promoting to Float32, Float64, Bool or an integer of at most 64 bits"))
 end
 
 # Widen a two-component vector array to three components with a trailing zero. VTK gives a point/cell data array a
