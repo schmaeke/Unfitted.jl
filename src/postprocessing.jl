@@ -274,9 +274,8 @@ function _sample_accessor(ws, state::FormState, regions, default::Field)
         end
         f = _field_index(state.layout, field.name)
         (ws.fptr[f] < ws.fptr[f+1] || isempty(region.parents)) ||
-            throw(ArgumentError("write_vtk: u(context, xi, field) reads only fields of the block's " *
-                                "own subdomain; evaluate $(field.name) with value(solution, " *
-                                "model, $(field.name), x)"))
+            throw(ArgumentError("u(context, xi, field) reads only fields of the sampled field's own subdomain; " *
+                                "evaluate $(field.name) with value(solution, model, $(field.name), x)"))
         _refresh!(ws, region, xi.region, Val(false))
         _state_point!(state, ws, Val(false))
         offset, C = state.offsets[f], component_count(field)

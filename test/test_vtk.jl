@@ -133,7 +133,11 @@ end
         e
     end
     @test err isa ArgumentError
-    @test occursin("value(solution, model, u2, x)", sprint(showerror, err))
+    message = sprint(showerror, err)
+    @test occursin("value(solution, model, u2, x)", message)
+    # The refusal comes from the consumer-neutral sampler, which a plotting front end would call too: it names the
+    # sampled field's subdomain, not the VTK writer or its blocks.
+    @test occursin("sampled field's own subdomain", message) && !occursin("write_vtk", message)
 end
 
 @testset "a VTK callback reads another field of the same subdomain" begin
