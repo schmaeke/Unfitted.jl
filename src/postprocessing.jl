@@ -606,6 +606,10 @@ end
 # per-component sum always has, so the two agree bit for bit, the sign of an exact zero included: a sum started from
 # the first level would keep a −0.0 that the zero start turns into +0.0. A tuple of components is returned as an
 # `SVector`.
+#
+# The zero is built here and handed to `map` as a value, through `Returns`, not built inside a closure: a closure that
+# builds it captures the type `R` as a `DataType` field, which Julia 1.10's inference does not see through, so the
+# result inferred as `Any` there, where Julia 1.12 infers both spellings. `_level_field` builds its zero the same way.
 function _field_quantity(solution::Solution, model::Model{D,T}, u::Field{<:Any,<:Any,C}, x::PointLike{D},
                          component::Union{Nothing,Integer}, ::Val{G}) where {D,T,C,G}
     coefficients = _checked_coefficients(solution, model)
@@ -617,7 +621,7 @@ function _field_quantity(solution::Solution, model::Model{D,T}, u::Field{<:Any,<
     _check_component(component, u)
     comps = component !== nothing ? component : C == 1 ? 1 : ntuple(identity, Val(C))
     R = promote_type(T, eltype(coefficients))
-    acc = map(_ -> G ? zero(SVector{D,R}) : zero(R), comps)
+    acc = map(Returns(G ? zero(SVector{D,R}) : zero(R)), comps)
     for level in space.levels
         acc = map(+, acc, _level_field(coefficients, model, layout, level, point, comps, Val(G)))
     end
@@ -647,8 +651,9 @@ end
 function _level_field(coefficients, model::Model{D,T}, layout::FieldLayout{D,T}, level::Level{D,T}, x::SVector{D,T},
                       components::Union{Integer,Tuple}, ::Val{G}) where {D,T,G}
     R = promote_type(T, eltype(coefficients))
+    zero_value = G ? zero(SVector{D,R}) : zero(R)
     cell = locate_cell(level.mesh, x; tol=model.dofs.tolerance)
-    (cell === nothing || !is_active(level.mask, cell)) && return map(_ -> G ? zero(SVector{D,R}) : zero(R), components)
+    (cell === nothing || !is_active(level.mask, cell)) && return map(Returns(zero_value), components)
     parent_box = cell_box(level.mesh, cell)
     xi = physical_to_reference(parent_box, x)
     φ = G ? physical_basis_gradients(level, cell, parent_box, xi) : basis_values(level, cell, xi)
