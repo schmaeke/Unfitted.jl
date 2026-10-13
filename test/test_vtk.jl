@@ -910,3 +910,53 @@ end
     @test (@test_logs close(series)) == run * ".pvd"
     @test isfile(run * ".pvd")
 end
+
+# ── Records: what a consumer reads ────────────────────────────────────────────
+#
+# The writers serialise consumer-neutral records (`Unfitted.SampleGrid`), which a plotting front end would read as they
+# are. These internal tests pin the record contract itself, without decoding a file: the point and cell counts, the
+# corner order, one value per point or per cell in every array, the built-in arrays and their order.
+
+@testset "records: a sampled field's data grid and level mesh" begin
+    phi_disk, model, sol = _cut_depth_disk_model()
+    width = (u, c, x, xi) -> c.cell.upper[1] - c.cell.lower[1]
+    records = Unfitted._sample_fields(sol, model; subdivisions=2, cut_depth=1, cell_data=(width=width,))
+    (; field, data, meshes) = only(records)
+    n = Unfitted._cell_count(data)
+    @test n > 16                                             # four regions, a 2 × 2 lattice each, and the cut leaves
+    @test length(data.points) == n << 2
+    # Every cell's corners are the face-cyclic permutation (1, 2, 4, 3) of the `_box_vertices` of the box they span.
+    @test all(1:n) do c
+        corners = data.points[(4c-3):(4c)]
+        return corners == collect(Unfitted._box_vertices(corners[1], corners[3]))[[1, 2, 4, 3]]
+    end
+    @test first.(data.point_data) == ["uh", "level_set"]
+    @test first.(data.cell_data) == ["region_id", "cover_count", "width"]
+    @test all(length(last(entry)) == length(data.points) for entry in data.point_data)
+    @test all(length(last(entry)) == n for entry in data.cell_data)
+    arrays = Dict(data.point_data..., data.cell_data...)
+    @test arrays["level_set"] == [levelset_value(field.space.physical, x) for x in data.points]
+    @test issorted(arrays["region_id"])
+    @test arrays["width"] == [data.points[4c - 2][1] - data.points[4c - 3][1] for c in 1:n]
+
+    @test [(m.level, m.role) for m in meshes] == [(1, :base)]
+    mesh = only(meshes).grid
+    @test Unfitted._cell_count(mesh) == 4
+    @test isempty(mesh.point_data)
+    @test first.(mesh.cell_data) ==
+          ["level_id", "role_id", "order_max", "cell_id", "active", "covered", "active_dofs", "reduced_dofs"]
+    @test all(entry -> last(entry) isa Vector{Int} && length(last(entry)) == 4, mesh.cell_data)
+end
+
+@testset "records: fields sharing a space carry its level meshes once" begin
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    a = field(:a, V)
+    b = field(:b, V)
+    model = prepare(Problem((a, b); blocks=(mass_block(a), mass_block(b))))
+    sol = solution(model, [sin(i) for i in 1:active_unknowns(model)])
+    records = Unfitted._sample_fields(sol, model; subdivisions=:none, point_data=NamedTuple())
+    @test [r.field.name for r in records] == [:a, :b]
+    @test [length(r.meshes) for r in records] == [1, 0]
+    @test all(r -> isempty(r.data.point_data), records)
+    @test isempty(only(Unfitted._sample_fields(sol, model; field=b, level_meshes=false)).meshes)
+end

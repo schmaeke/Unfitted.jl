@@ -81,17 +81,21 @@ Keyword arguments:
     the immersed boundary" below.
   - `point_data` — `NamedTuple` / `Dict` / `Tuple` of `name => callback` pairs. Each callback is invoked at every vertex
     sample as `f(u, context, x, xi)` and returns a real number, a tuple of real numbers or an `SVector` of real
-    numbers, of one shape at every sample. The values of one entry are promoted to a common element type, which must be
-    one VTK stores — `Float32`, `Float64` or an integer of at most 64 bits — or `Bool`, which VTK has no type for and
-    is written as `UInt8` 0 / 1. A two-component value is written as a three-component VTK vector with a trailing
-    zero. Any other value (a `Vector`, a matrix, a `String`, a `Complex`, a
-    `Rational`, or shapes that differ between samples) is refused with an `ArgumentError` naming the entry, and nothing
-    is written. `u(context, xi[, field])` evaluates the current solution at the sample: the block's own field by
-    default, or another `field` on the same subdomain. A field on another subdomain of a coupled model raises an
-    `ArgumentError`; evaluate it with [`value`](@ref)`(solution, model, field, x)` instead. `x` is the physical
-    coordinate and `xi.region` the same point in the region's reference frame; `context.parents` lists the covering
-    parents, each with the `parent_box` a callback needs to map `x` into a cell's own frame. Defaults to a single `uh`
-    entry that emits the current solution value.
+    numbers, of one shape at every sample. A tuple is written as the `SVector` of its components. The values of one
+    entry are promoted to a common element type, which must be one VTK stores — `Float32`, `Float64` or an integer of
+    at most 64 bits — or `Bool`, which VTK has no type for and is written as `UInt8` 0 / 1. A two-component value is
+    written as a three-component VTK vector with a trailing zero. Any other value (a `Vector`, a matrix, a `String`, a
+    `Complex`, a `Rational`, or shapes that differ between samples) is refused with an `ArgumentError` naming the
+    entry, and nothing is written. Each callback is called exactly once per sample, but in an unspecified order — across
+    the samples and across the entries — so a callback should compute its value from its arguments and not count or
+    record its calls. `u(context, xi[, field])` evaluates the current solution at the sample, given the `context` and
+    `xi` the callback received: the block's own field by default, or another `field` on the same subdomain. A field on
+    another subdomain of a coupled model raises an `ArgumentError`; evaluate it with
+    [`value`](@ref)`(solution, model, field, x)` instead. `x` is the physical coordinate and `xi.region` the same point
+    in the region's reference frame; `context` carries `location` (`:point`, or `:cell` for a `cell_data` sample),
+    `region_id`, the `region` box, the emitted `cell` box, the covering `parents` — each with the `parent_box` a
+    callback needs to map `x` into a cell's own frame — and the `model_version` the samples were taken from. Defaults to
+    a single `uh` entry that emits the current solution value.
   - `cell_data` — same shape as `point_data` but evaluated at per-cell sample points (the subbox center). Defaults to no
     user-defined cell data; the bundle always includes `region_id` and `cover_count` as built-in cell arrays.
   - `level_meshes` — emit one solid-cell `.vtu` per level when `true` (default), each cell carrying per-cell `active` /
@@ -143,17 +147,14 @@ smooth face; an `∩`-corner stays comparatively more faceted at any given depth
 To write a *sequence* of these bundles as one animation — a moving overlay, an adaptive ladder, a time-dependent
 solution — open a [`vtk_series`](@ref) and call this function with it in place of a path.
 """
-function write_vtk(path::AbstractString, solution::Solution, model::Model{D,T}; field=nothing, subdivisions=:degree,
-                   cut_depth=3, point_data=_default_vtk_point_data(), cell_data=NamedTuple(), level_meshes::Bool=true,
-                   ascii::Bool=false, append::Bool=true, compress=true) where {D,T}
-    budget = _cut_depth_budget(cut_depth)
-    base = _vtk_bundle_base(path, solution, model)
-    # Not WriteVTK's do-block form, which saves the multiblock in a `finally`: a keyword refused or a callback that
-    # throws halfway through the fields would leave a stub `.vtm` and the grids written so far. Every dataset stays in
-    # memory until `vtk_save`, and the output directory is made just before it, so a call that fails leaves nothing.
-    vtm = vtk_multiblock(base * ".vtm")
-    _write_vtk_blocks!(vtm, base, solution, model; field, subdivisions, cut_depth=budget, point_data, cell_data,
-                       level_meshes, ascii, append, compress)
+function write_vtk(path::AbstractString, solution::Solution, model::Model{D}; ascii::Bool=false, append::Bool=true,
+                   compress=true, kwargs...) where {D}
+    _check_vtk_dimension(Val(D))
+    base = _vtk_base_path(path)
+    # Everything is sampled, every keyword and callback value checked, before a file is opened: a call refused or a
+    # callback that throws leaves nothing. Not WriteVTK's do-block form either, which saves the multiblock in a
+    # `finally`; the datasets stay in memory until `vtk_save`, and the output directory is made just before it.
+    vtm = _vtk_multiblock(base, _sample_fields(solution, model; kwargs...); ascii, append, compress)
     mkpath(dirname(base))
     return vtk_save(vtm)
 end
@@ -234,19 +235,17 @@ collection and is otherwise unused: it need not be a step index, a multiple of a
 fails writes nothing and does not use up a frame number. A series that has been closed takes no more frames: a frame
 written to it raises an `ArgumentError`, before any sampling.
 """
-function write_vtk(series::VTKSeries, time::Real, solution::Solution, model::Model{D,T}; field=nothing,
-                   subdivisions=:degree, cut_depth=3, point_data=_default_vtk_point_data(), cell_data=NamedTuple(),
-                   level_meshes::Bool=true, ascii::Bool=false, append::Bool=true, compress=true) where {D,T}
+function write_vtk(series::VTKSeries, time::Real, solution::Solution, model::Model{D}; ascii::Bool=false,
+                   append::Bool=true, compress=true, kwargs...) where {D}
     # `close` has written the collection file and freed its XML document. Without this check the frame would be sampled
     # in full and then fail inside the XML library (`XMLNoRootError`) when the collection is asked to record it.
     isopen(series.collection) ||
         throw(ArgumentError("cannot write a frame to a closed series: close(series) already wrote its collection"))
-    budget = _cut_depth_budget(cut_depth)
+    _check_vtk_dimension(Val(D))
     n = series.count[] + 1
-    base = _vtk_bundle_base(joinpath(series.frames, "frame_" * lpad(n, 4, '0')), solution, model)
-    vtm = vtk_multiblock(base * ".vtm")
-    _write_vtk_blocks!(vtm, base, solution, model; field, subdivisions, cut_depth=budget, point_data, cell_data,
-                       level_meshes, ascii, append, compress)
+    base = joinpath(series.frames, "frame_" * lpad(n, 4, '0'))
+    # The serialiser of a single bundle, so a frame is byte for byte what `write_vtk(path, …)` writes.
+    vtm = _vtk_multiblock(base, _sample_fields(solution, model; kwargs...); ascii, append, compress)
     # Hands the *open* multiblock over: the collection closes it — which is what writes the frame's files — and records
     # its path, relative to the `.pvd`, against `time`. The counter advances only once that has succeeded, so a rejected
     # frame does not burn a frame number; and, as for a single bundle, the directory is made only now, so it writes
@@ -327,94 +326,29 @@ function write_quadrature_vtm(path::AbstractString, model::Model{D,T}) where {D,
     end
 end
 
-# ── One VTK bundle ────────────────────────────────────────────────────────────
+# ── VTK serialisation ─────────────────────────────────────────────────────────
 
-# Default point-data callback for `write_vtk`: one entry named `uh` that evaluates the current solution at the sample
-# point. Callbacks are called as `f(u, context, x, xi)` and may produce any per-point scalar, vector, or tuple value;
-# the `u` closure is the access path back to the solution evaluation kernel.
-_default_vtk_point_data() = (uh=(u, c, x, xi) -> u(c, xi),)
-
-# Resolve the `cut_depth` keyword to a non-negative bisection budget. Called by the public entry points first, so a
-# rejected value costs no sampling; like every other refusal it leaves nothing on disk, since the writers save only a
-# complete bundle.
+# The multiblock of one bundle, built from the sampled records and still open: nothing is on disk until the caller
+# saves it, or hands it to a series' collection, which saves it. One field block per record, named after its field and
+# holding that field's data grid and the level meshes the record carries as sibling leaf datasets, so a coupled field
+# is a self-contained, independently toggled unit in ParaView: `<field> → { data, level_… }`.
 #
-# The cap is 8 rather than a larger round number because the leaf count grows as 2^((D−1)k): at D = 3 and the measured
-# ~400 B per emitted cell, depth 8 is already of order 10⁷ cells and a gigabyte, which is a limit rather than a safety
-# net.
-function _cut_depth_budget(cut_depth)
-    cut_depth === :none && return 0
-    cut_depth isa Integer && 0 <= cut_depth <= 8 && return Int(cut_depth)
-    throw(ArgumentError("cut_depth must be :none or an integer in 0:8; got $(repr(cut_depth))"))
-end
-
-# Shared prologue of the two bundle writers: reject a dimension VTK has no cell type for, and a solution the model did
-# not produce, before any sampling, and hand back the extension-free base name. It creates nothing: the writers make the
-# output directory only once the whole bundle is built in memory, just before saving it, so a call refused anywhere —
-# here, or by a keyword or a callback during sampling — leaves no directory and no half-written bundle behind.
-function _vtk_bundle_base(path::AbstractString, solution::Solution, model::Model{D}) where {D}
-    _check_vtk_dimension(Val(D))
-    _checked_coefficients(solution, model)
-    return _vtk_base_path(path)
-end
-
-# Strip a `.vtm` / `.vtu` / `.vtp` / `.pvd` extension from `path` so callers can pass either `"out"` or `"out.vtm"`
-# interchangeably. Every file name the writers hand to `WriteVTK` then carries its own extension again: given a name
-# without one, `WriteVTK` appends it, but warns whenever the name has any other extension — and a dotted base name such
-# as `out_t=0.5` has one (`.5`), so every file of a time-stamped bundle used to warn.
-function _vtk_base_path(path::AbstractString)
-    base, ext = splitext(String(path))
-    return ext in (".vtm", ".vtu", ".vtp", ".pvd") ? base : String(path)
-end
-
-# VTK supports cells in 1D, 2D, and 3D natively. Higher-dimensional spaces have no corresponding VTK cell type and are
-# rejected at the top of the public entry points so the user sees the dimension limitation up front.
-function _check_vtk_dimension(::Val{D}) where {D}
-    D <= 3 || throw(ArgumentError("VTK export supports dimensions 1, 2, and 3; got D=$D"))
-end
-
-# The contents of one bundle, written into an already-open multiblock `vtm` whose children are named after `base`.
-#
-# This is split out of `write_vtk` for one reason: so that the caller owns the multiblock handle. The single-shot writer
-# opens one, fills it here and closes it; the series writer fills one the same way and hands it to a ParaView
-# collection, which closes it and records its path against a physical time. Nothing else differs between the two, so a
-# frame of a series is byte-for-byte the bundle `write_vtk` writes to the same base name.
-#
-# One grid block per field, each sampled over its own subdomain space. A single-domain model has one field → a single
-# `data` grid; a coupled model writes one block per subdomain into the same multiblock file, so opening it shows every
-# coupled field.
-#
-# Each field block groups the field's `data` grid with its own subdomain mesh(es) so each coupled field is a
-# self-contained, independently-toggled unit in ParaView: `<field> → { data, level_… }`. The children of a field block
-# are all *leaf* datasets — never a mix of a leaf and a sub-block, which breaks ParaView's Extract-Block resolution.
-#
-# Crucially, every leaf's *disambiguating* name part is ASCII. ParaView derives its Extract-Block data-assembly node
-# names from the dataset names and keeps only ASCII identifier characters, so a Unicode field name (`θ₁`, `θ₂`) or a
-# name disambiguated only by Unicode digits collapses to a single node and the blocks become indistinguishable. The
-# meshes are keyed by ASCII level id (`level_<id>_<role>`); the data leaf is likewise keyed by the ASCII field index
-# (`data_<i>`), NOT by the field name. The field name is still the (only) block label, where a Unicode collision is
-# harmless — the user extracts leaves. `meshed` dedups the meshes of a space shared by several fields onto its first.
-function _write_vtk_blocks!(vtm, base::AbstractString, solution::Solution, model::Model; field, subdivisions, cut_depth,
-                            point_data, cell_data, level_meshes, ascii, append, compress)
-    fields = _vtk_fields_to_write(model, field)
-    multi = length(fields) > 1
-    meshed = Any[]
-    for (i, fld) in enumerate(fields)
-        space, regions, layout = _field_context(model, fld)
-        # The workspace is built here and passed in: its basis-family parameter is not inferable from the model, and the
-        # call is the function barrier that types it, and with it the sample accessor every callback receives.
-        data = _partition_vtk_data(solution, model, _assembly_workspace(model), space, regions, fld, subdivisions,
-                                   cut_depth, point_data, cell_data)
-        field_block = multiblock_add_block(vtm, string(fld.name))
-        data_name = multi ? "data_$i" : "data"
-        _add_dataset!(field_block, base, data_name, data_name, data; ascii, append, compress)
-
-        (level_meshes && !any(s -> s === space, meshed)) || continue
-        push!(meshed, space)
-        coverage = build_coverage(space, layout.dofs.tolerance)
-        for level in space.levels
-            label = "level_$(level.id)_$(level.role)"
-            _add_dataset!(field_block, base, label, label * "_mesh", _level_grid(level, layout.dofs, coverage); ascii,
-                          append, compress)
+# The children of a field block are all leaves — never a mix of a leaf and a sub-block, which breaks ParaView's
+# Extract-Block resolution — and every leaf's disambiguating name part is ASCII. ParaView derives its data-assembly
+# node names from the dataset names and keeps only ASCII identifier characters, so a Unicode field name (`θ₁`, `θ₂`), or
+# a name disambiguated only by Unicode digits, collapses to one node and the blocks become indistinguishable. The data
+# leaf is keyed by the ASCII record index (`data_<i>`, plain `data` when there is one record), NOT by the field name,
+# and the meshes by the ASCII level id (`level_<id>_<role>`). The field name is still the block label, where a Unicode
+# collision is harmless: the user extracts leaves.
+function _vtk_multiblock(base::AbstractString, records; ascii, append, compress)
+    vtm = vtk_multiblock(base * ".vtm")
+    for (i, record) in enumerate(records)
+        block = multiblock_add_block(vtm, string(record.field.name))
+        leaf = length(records) == 1 ? "data" : "data_$i"
+        _add_dataset!(block, base, leaf, leaf, record.data; ascii, append, compress)
+        for mesh in record.meshes
+            label = "level_$(mesh.level)_$(mesh.role)"
+            _add_dataset!(block, base, label, label * "_mesh", mesh.grid; ascii, append, compress)
         end
     end
     return vtm
@@ -478,157 +412,6 @@ function _vtk_array(array::AbstractVector{V}, name::AbstractString, kind::Symbol
     return V <: SVector ? [SVector{length(V),R}(v) for v in array] : convert(Vector{R}, array)
 end
 
-# The fields a VTK write covers: a single explicit `field` (a `Field` or its name `Symbol`) if given, otherwise every
-# field of the model — one grid block each. A single-domain model has exactly one field, reproducing the historical
-# single-block output.
-function _vtk_fields_to_write(model::Model, field)
-    field === nothing && return collect(model.problem.fields)
-    field isa Field && return [field]
-    for f in model.problem.fields
-        f.name === field && return [f]
-    end
-    throw(ArgumentError("unknown field $field"))
-end
-
-# The (subdomain space, its volume region list, its dof layout) a field lives on: for a single-domain model the one
-# space, plan and field. The regions are the list assembly integrates the field's volume forms over (`_region_list`), so
-# the export samples exactly the regions the solve integrated.
-function _field_context(model::Model, fld::Field)
-    space = _field_space(model.problem, fld.name)
-    return space, _region_list(model, nothing, space).regions, _field_layout(model.dofs, fld.name)
-end
-
-# Compose the file path for a child VTK block by suffixing the base name, without its extension, which the caller
-# appends (see `_vtk_base_path`). Used by the multiblock writers to derive paths for the solution `.vtu`, the
-# per-level mesh `.vtu`s and the quadrature `.vtp`s.
-_vtk_child_path(base::AbstractString, suffix::AbstractString) = joinpath(dirname(base), basename(base) * "_" * suffix)
-
-# ── VTK partition and samples ─────────────────────────────────────────────────
-
-# Build the partitioned solution dataset: walk every integration region of the model, subdivide each into `_subboxes`,
-# emit one VTK cell per subbox (with its 2ᴰ corners as VTK points), record `region_id` and `cover_count` per cell, and
-# collect point-sample records for the user-supplied callbacks. The result is a `NamedTuple` ready for `vtk_grid`
-# consumption.
-#
-# When the model carries a `PhysicalDomain`, the per-vertex level-set values `φ(x)` are collected as a built-in
-# `level_set` point array — emitted alongside `region_id` / `cover_count` so cut, full, and fictitious regions are
-# always identifiable in ParaView (e.g. as a zero-level isocontour) without the user having to wire a `phi` callback
-# themselves. A user-supplied `level_set` entry in `point_data` overrides the built-in.
-function _partition_vtk_data(solution::Solution, model::Model{D,T}, ws::AssemblyWorkspace, space::Space{D,T},
-                             regions::Vector{VolumeRegion{D,T}}, fld::Field, subdivisions, cut_depth::Int, point_data,
-                             cell_data) where {D,T}
-    point_pairs = _vtk_pairs(point_data, :point_data)
-    cell_pairs = _vtk_pairs(cell_data, :cell_data)
-    physical = space.physical
-    auto_level_set = physical !== nothing && !any(p -> first(p) == "level_set", point_pairs)
-    # One certificate lookup per write, not per region: the constant is a property of the geometry tree, which does not
-    # change across the walk.
-    lipschitz = physical === nothing ? Inf : _levelset_lipschitz(physical.geometry)
-    if cut_depth > 0 && physical !== nothing && !isfinite(lipschitz)
-        @warn("cut_depth is refining on corner signs alone: no leaf of this PhysicalDomain " *
-              "declares a Lipschitz constant, so a feature of Ω smaller than a sub-cell can be " *
-              "missed and the clipped surface is not guaranteed watertight. Pass " *
-              "`leaf(f; lipschitz = L)` (1.0 for a signed distance function) to certify it.", maxlog=1)
-    end
-
-    points = SVector{D,T}[]
-    region_ids = Int[]
-    cover_counts = Int[]
-    level_set_values = auto_level_set ? T[] : nothing
-    # One value list per callback, filled in sample order. The callbacks run here, inside the region walk, rather than
-    # against a recorded sample list: that is what lets a region's dof values (`_state_region!`, the expensive part of
-    # an evaluation) be read once and reused by every one of the region's samples.
-    point_values = [Any[] for _ in point_pairs]
-    cell_values = [Any[] for _ in cell_pairs]
-    state = FormState(model.dofs, _state_vector(solution, model))
-
-    for (region_id, region) in pairs(regions)
-        _state_region!(state, _frame!(ws, region))
-        u = _vtk_value_accessor(ws, state, region, fld)
-        for subbox in _region_boxes(space, region, subdivisions, cut_depth, lipschitz)
-            for corner in _box_corners(subbox)
-                push!(points, corner)
-                auto_level_set && push!(level_set_values, T(levelset_value(physical, corner)))
-                sample = _vtk_sample(model, region_id, region, subbox, corner, :point)
-                for (i, (_, f)) in pairs(point_pairs)
-                    push!(point_values[i], f(u, sample.context, sample.x, sample.xi))
-                end
-            end
-
-            push!(region_ids, region_id)
-            push!(cover_counts, length(region.parents))
-            sample = _vtk_sample(model, region_id, region, subbox, center(subbox), :cell)
-            for (i, (_, f)) in pairs(cell_pairs)
-                push!(cell_values[i], f(u, sample.context, sample.x, sample.xi))
-            end
-        end
-    end
-
-    point_arrays = _vtk_data_arrays(point_pairs, point_values, :point_data)
-    level_set_values === nothing || push!(point_arrays, "level_set" => level_set_values)
-    cell_arrays = Pair{String,AbstractVector}["region_id" => region_ids, "cover_count" => cover_counts]
-    append!(cell_arrays, _vtk_data_arrays(cell_pairs, cell_values, :cell_data))
-    return SampleGrid{D,T,D}(points, point_arrays, cell_arrays)
-end
-
-# Normalise the `point_data` / `cell_data` keyword argument to a list of `String => callback` pairs. Three accepted
-# user-facing shapes: `NamedTuple` (the most ergonomic; `(uh = …, σ = …)`), `AbstractDict` (programmatic construction),
-# and `Tuple` of `Pair`s (explicit construction). The fallback raises with the offending parameter name (`:point_data`
-# or `:cell_data`) embedded.
-function _vtk_pairs(data, name::Symbol)
-    if data isa NamedTuple || data isa AbstractDict
-        return [String(k) => v for (k, v) in pairs(data)]
-    elseif data isa Tuple && all(item -> item isa Pair, data)
-        return [String(k) => v for (k, v) in data]
-    end
-
-    throw(ArgumentError("$name must be a NamedTuple, Dict, or tuple of Pairs"))
-end
-
-# The `u(context, xi[, field])` accessor handed to every user VTK callback: it evaluates the superposed solution at the
-# sample without the callback ever touching the dof layer. It is the assembly's own field evaluation, the one `q.state`
-# and the quadrature-point walker read: the caller frames each integration region on the workspace `ws` and reads the
-# dof values of every field on it into `state` once (`_frame!`, `_state_region!`), and each call evaluates the basis at
-# the sample (`_refresh!`, values only) and every field there (`_state_point!`), then reads one field off `state` — a
-# scalar for a one-component field, an `SVector` over the components otherwise. Reading the dof values once per region
-# rather than once per sample is what keeps the export cheap.
-#
-# `default` is the field of the block being written. A callback may name another `field`, but only one on the same
-# subdomain: the region's parents are that subdomain's cells, so another subdomain's field owns none of them in the
-# frame (`ws.fptr`) and has no value there, and asking for one raises. To read a field on a *different* subdomain, call
-# `value(solution, model, other, x)` with the sample coordinate `x` the callback also receives.
-function _vtk_value_accessor(ws, state::FormState, region, default::Field)
-    return (context, xi, field=default) -> begin
-        f = _field_index(state.layout, field.name)
-        (ws.fptr[f] < ws.fptr[f+1] || isempty(region.parents)) ||
-            throw(ArgumentError("write_vtk: u(context, xi, field) reads only fields of the block's " *
-                                "own subdomain; evaluate $(field.name) with value(solution, " *
-                                "model, $(field.name), x)"))
-        _refresh!(ws, region, xi.region, Val(false))
-        _state_point!(state, ws, Val(false))
-        offset, C = state.offsets[f], state.layout.fields[f].components
-        return C == 1 ? state.values[offset+1] : SVector(ntuple(c -> state.values[offset+c], C))
-    end
-end
-
-# Build the `(context, x, xi)` triple passed to a user VTK callback. `context` carries the integration region's
-# identity, the subbox being sampled, the covering parents, and the model version (so a stale solution can be detected
-# if needed). `location` is `:point` for vertex samples and `:cell` for cell-center samples. `xi` carries the sample's
-# region-reference coordinate, which is what the `u` accessor evaluates the solution at.
-function _vtk_sample(model::Model{D,T}, region_id::Int, region::VolumeRegion{D,T}, box::AxisBox{D,T}, x::SVector{D,T},
-                     location::Symbol) where {D,T}
-    region_box = _region_box(region)
-    context = (; location, region_id, region=region_box, cell=box, parents=region.parents, model_version=model.version,)
-    return (; context, x, xi=(; region=physical_to_reference(region_box, x)))
-end
-
-# Pair each `name => callback` entry with a typed array of the values that callback returned, ready for `WriteVTK`
-# attachment. `values[i]` is the collected output of `pairs[i]`, in sample order; `kind` (`:point_data` / `:cell_data`)
-# and the entry's name only label a refusal.
-function _vtk_data_arrays(pairs, values, kind::Symbol)
-    return Pair{String,AbstractVector}[first(p) => _vtk_data_array(v, first(p), kind) for (p, v) in zip(pairs, values)]
-end
-
 # The element types a VTK data array can hold, as `WriteVTK` writes them: the machine floats and the integers of up to
 # 64 bits.
 const _VTK_NUMBERS = (Float32, Float64, Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64)
@@ -638,42 +421,220 @@ const _VTK_NUMBERS = (Float32, Float64, Int8, Int16, Int32, Int64, UInt8, UInt16
 # mask readable in ParaView — and `nothing` for any other type, which `_vtk_array` refuses.
 _vtk_number(T::Type) = T === Bool ? UInt8 : T in _VTK_NUMBERS ? T : nothing
 
-# Coerce a `Vector{Any}` of callback returns to a typed array, kept in the type its values promote to (a `Bool` stays a
-# `Bool`, a 2-vector stays two components: `_vtk_array` maps both when it writes them). Three accepted patterns:
-#
-#   * all-`Real` → `Vector{T}` with `T = promote_type(typeof.(v))`;
-#   * all-`SVector` of one length → `Vector{SVector{N,T}}` with `T` promoted over every entry, as for the numbers: the
-#     first entry's type alone would make an integer first sample refuse later fractional ones (`InexactError`) and a
-#     `Float32` first sample round every later `Float64` one;
-#   * all-`Tuple` of the same length → `Vector{SVector{N,T}}` with `N` inferred from the first element and `T` promoted
-#     from every component of every entry;
-#
-# each only when its element type has a `_vtk_number`. Anything else is refused here, naming the entry, what it
-# returned and what is accepted, rather than handed on: `WriteVTK` would reject it with `data type not supported by VTK:
-# Any` (or `…: Rational{Int64}`), which names neither the entry nor the remedy.
-function _vtk_data_array(values::Vector{Any}, name::AbstractString, kind::Symbol)
-    isempty(values) && return Float64[]
-    first_value = first(values)
+# Strip a `.vtm` / `.vtu` / `.vtp` / `.pvd` extension from `path` so callers can pass either `"out"` or `"out.vtm"`
+# interchangeably. Every file name the writers hand to `WriteVTK` then carries its own extension again: given a name
+# without one, `WriteVTK` appends it, but warns whenever the name has any other extension — and a dotted base name such
+# as `out_t=0.5` has one (`.5`), so every file of a time-stamped bundle used to warn.
+function _vtk_base_path(path::AbstractString)
+    base, ext = splitext(String(path))
+    return ext in (".vtm", ".vtu", ".vtp", ".pvd") ? base : String(path)
+end
 
-    if all(v -> v isa Real, values)
-        # Reduce the element types pairwise rather than splatting them into `promote_type`: a `Vector{Any}` of thousands
-        # of samples would splat thousands of type arguments and overflow the stack, because variadic `promote_type`
-        # recurses one level per argument.
-        T = mapreduce(typeof, promote_type, values)
-        _vtk_number(T) === nothing || return T[values...]
-    elseif all(v -> v isa SVector, values)
-        S = mapreduce(typeof, promote_type, values)
-        T = isconcretetype(S) ? eltype(S) : Any
-        _vtk_number(T) === nothing || return SVector{length(S),T}[v for v in values]
-    elseif first_value isa Tuple && all(v -> v isa Tuple && length(v) == length(first_value), values)
-        N = length(first_value)
-        T = reduce(promote_type, (typeof(v[i]) for v in values for i in 1:N); init=Union{})
-        _vtk_number(T) === nothing || return SVector{N,T}[SVector{N,T}(v) for v in values]
+# Compose the file path for a child VTK block by suffixing the base name, without its extension, which the caller
+# appends (see `_vtk_base_path`). Used by the quadrature writer.
+_vtk_child_path(base::AbstractString, suffix::AbstractString) = joinpath(dirname(base), basename(base) * "_" * suffix)
+
+# VTK supports cells in 1D, 2D, and 3D natively. Higher-dimensional spaces have no corresponding VTK cell type and are
+# rejected at the top of the public entry points so the user sees the dimension limitation up front.
+function _check_vtk_dimension(::Val{D}) where {D}
+    D <= 3 || throw(ArgumentError("VTK export supports dimensions 1, 2, and 3; got D=$D"))
+end
+
+# ── Field sampling ────────────────────────────────────────────────────────────
+
+# The records of a solution's data: one `(; field, data, meshes)` per sampled field, in output order — every field in
+# problem order, or the one `field` names. `data` is the field's sample grid (`_sample_field`). `meshes` holds the
+# `(; level, role, grid)` records of its space's levels, in `space.levels` order (`_level_grid`); it is empty with
+# `level_meshes = false`, and for a space an earlier record already carries, so fields sharing a space have its meshes
+# once, under the first of them, whose layout the dof counts are read from — the convention `diagnostics` follows for
+# its per-level counts. That is decided here rather than by each consumer, which would otherwise have to repeat it.
+#
+# The one entry of the sampling layer and its one keyword surface: a writer passes every keyword it does not consume
+# on to this function, and the keywords mean what `write_vtk` documents. The keywords, the solution's pin and the
+# entries' containers are checked before anything is sampled, a callback's values as they are collected, and nothing
+# touches the file system. One workspace and one `FormState` serve every field: the fields are sampled one after
+# another, and each field's accessor frames the regions it reads on its own (`_sample_accessor`).
+function _sample_fields(solution::Solution, model::Model{D,T}; field=nothing, subdivisions=:degree, cut_depth=3,
+                        point_data=_default_point_data(), cell_data=NamedTuple(), level_meshes::Bool=true) where {D,T}
+    depth = _cut_depth_budget(cut_depth)
+    state = FormState(model.dofs, _state_vector(solution, model))
+    fields = _sampled_fields(model, field)
+    entries = (point=_sample_entries(point_data, :point_data), cell=_sample_entries(cell_data, :cell_data))
+    rule = _subdivision_rule(subdivisions, Val(D))
+    ws, meshed = _assembly_workspace(model), Space[]
+    return map(fields) do fld
+        space = _field_space(model.problem, fld.name)
+        regions = _region_list(model, nothing, space).regions     # the list the solve integrated the field over
+        data = _sample_field(ws, state, space, regions, fld, rule, depth, entries, model.version)
+        meshes = @NamedTuple{level::Int, role::Symbol, grid::SampleGrid{D,T,D}}[]
+        if level_meshes && !any(s -> s === space, meshed)
+            dofs = _field_layout(model.dofs, fld.name).dofs
+            coverage = build_coverage(space, dofs.tolerance)
+            for level in space.levels
+                push!(meshes, (; level=level.id, level.role, grid=_level_grid(level, dofs, coverage)))
+            end
+        end
+        push!(meshed, space)
+        return (; field=fld, data, meshes)
     end
+end
 
-    throw(ArgumentError("$kind entry \"$name\" returned $(join(unique(typeof(v) for v in values), ", ")): write_vtk " *
-                        "accepts a real number, a tuple of reals or an SVector of reals, of one shape at every " *
-                        "sample, with values promoting to Float32, Float64, Bool or an integer of at most 64 bits"))
+# The default `point_data`: one entry, `uh`, the solution value at every point.
+_default_point_data() = (uh=(u, c, x, xi) -> u(c, xi),)
+
+# Resolve the `cut_depth` keyword to a non-negative bisection budget. Checked first, so a rejected value costs no
+# sampling and, like every other refusal, leaves nothing on disk.
+#
+# The cap is 8 rather than a larger round number because the leaf count grows as 2^((D−1)k): at D = 3 and the measured
+# ~400 B per emitted cell, depth 8 is already of order 10⁷ cells and a gigabyte, which is a limit rather than a safety
+# net.
+function _cut_depth_budget(cut_depth)
+    cut_depth === :none && return 0
+    cut_depth isa Integer && 0 <= cut_depth <= 8 && return Int(cut_depth)
+    throw(ArgumentError("cut_depth must be :none or an integer in 0:8; got $(repr(cut_depth))"))
+end
+
+# The fields a sampling covers, as the model's own `Field`s: every field of the problem in order, or the one `field`
+# names — a `Field` or its name `Symbol`, matched by name, so a `Field` built before `prepare` selects the model's field
+# of that name. A single-domain model has exactly one field, which is the single-block output.
+function _sampled_fields(model::Model, field)
+    field === nothing && return collect(model.problem.fields)
+    name = field isa Field ? field.name : field
+    for f in model.problem.fields
+        f.name === name && return [f]
+    end
+    throw(ArgumentError("unknown field $name"))
+end
+
+# Normalise a `point_data` / `cell_data` keyword to its `name => callback` entries, in the container's order. Three
+# accepted shapes: a `NamedTuple` (the ergonomic one, `(uh = …, σ = …)`), an `AbstractDict` (programmatic construction)
+# and a `Tuple` of `Pair`s (explicit construction). The list is untyped in the callbacks on purpose: the sampler is
+# then compiled once per field type rather than once per callback set, and each callback meets its own compiled loop
+# through one dynamic call per entry (`_sample_array`).
+function _sample_entries(data, kind::Symbol)
+    data isa Union{NamedTuple,AbstractDict} ||
+        data isa Tuple && all(item -> item isa Pair, data) ||
+        throw(ArgumentError("$kind must be a NamedTuple, Dict, or tuple of Pairs"))
+    return Pair{String,Any}[String(k) => v for (k, v) in (data isa Tuple ? data : pairs(data))]
+end
+
+# The `subdivisions` keyword as the sampler reads it, validated once, before any region is walked: `:degree`, kept and
+# resolved per region from its parents' orders (`_sample_cells`), or the per-axis lattice counts — `(1, …, 1)` for
+# `:none`, `(n, …, n)` for a positive integer `n`, an `NTuple{D}` of positive integers as given.
+function _subdivision_rule(subdivisions, ::Val{D}) where {D}
+    subdivisions === :degree && return subdivisions
+    subdivisions === :none && return ntuple(_ -> 1, Val(D))
+    subdivisions isa Integer && subdivisions > 0 && return ntuple(_ -> Int(subdivisions), Val(D))
+    subdivisions isa NTuple{D,Integer} && all(>(0), subdivisions) && return Int.(subdivisions)
+    throw(ArgumentError("subdivisions must be :degree, :none, a positive integer or an NTuple{$D} of positive " *
+                        "integers; got $(repr(subdivisions))"))
+end
+
+# The data grid of one field: its sample cells (`_sample_cells`) and their corners, the user's entries and the built-in
+# arrays. Point arrays: the user's entries in their order, then `level_set` — `φ` at every point, exactly
+# `levelset_value` — when the space carries a `PhysicalDomain` and no entry already has that name. Cell arrays:
+# `region_id` (the cell's region in the field's region list), `cover_count` (its number of covering parents), then the
+# user's entries. A function barrier typed by the space and its regions, and never specialised on the model or on the
+# callback set, which arrive as the model's pin and an untyped entry list.
+function _sample_field(ws, state::FormState, space::Space{D,T}, regions::Vector{VolumeRegion{D,T}}, fld::Field, rule,
+                       depth::Int, entries, version::Int) where {D,T}
+    boxes, region_ids = _sample_cells(space, regions, rule, depth)
+    points = SVector{D,T}[x for b in boxes for x in _box_corners(b)]
+    u = _sample_accessor(ws, state, regions, fld)
+    at_points = (; location=:point, shift=D, boxes, points, region_ids, regions, version)
+    at_cells = merge(at_points, (; location=:cell, shift=0))
+    point_data = Pair{String,AbstractVector}[name => _sample_array(:point_data, name, f, u, at_points)
+                                             for (name, f) in entries.point]
+    space.physical === nothing ||
+        any(e -> first(e) == "level_set", entries.point) ||
+        push!(point_data, "level_set" => _levelset_values(space.physical, points, T))
+    cell_data = Pair{String,AbstractVector}["region_id" => region_ids,
+                                            "cover_count" => [length(regions[r].parents) for r in region_ids]]
+    for (name, f) in entries.cell
+        push!(cell_data, name => _sample_array(:cell_data, name, f, u, at_cells))
+    end
+    return SampleGrid{D,T,D}(points, point_data, cell_data)
+end
+
+# `φ` at every point, in the space's number type. A barrier: the space's `PhysicalDomain` is abstractly typed, so one
+# dynamic call here makes the loop concrete, where a `levelset_value` call per point would dispatch dynamically.
+_levelset_values(physical::PhysicalDomain, points, ::Type{T}) where {T} = T[levelset_value(physical, x) for x in points]
+
+# The `u(context, xi[, field])` a callback receives: the current solution at the callback's sample, through the
+# assembly's own field evaluation — the one `q.state` and the quadrature-point walker read. A region's dof values are
+# read into the shared `state` once (`_frame!`, `_state_region!`); each call then evaluates the basis at the sample
+# (`_refresh!`, values only) and every field there (`_state_point!`), and reads one field off `state`: a scalar for a
+# one-component field, an `SVector` over its components otherwise, the count read off the `Field`'s type so the result
+# is inferable.
+#
+# Framing is lazy and keyed on `context.region_id`: a region is framed by the first call that reads it and again only
+# after a call has read another region. The samples of an entry come region by region, so an entry that calls `u` frames
+# each region once, and a write whose callbacks never call `u` frames nothing. It is also why `u` takes the context of
+# the sample at hand: a context kept from another sample reads that sample's region.
+#
+# `default` is the field of the record being sampled. A callback may name another `field`, but only one on the same
+# subdomain: the region's parents are that subdomain's cells, so another subdomain's field owns none of them in the
+# frame (`ws.fptr`) and has no value there, and asking for one raises. To read a field on a *different* subdomain,
+# call `value(solution, model, other, x)` with the sample coordinate `x` the callback also receives.
+function _sample_accessor(ws, state::FormState, regions, default::Field)
+    framed = Ref(0)
+    return function (context, xi, field::Field=default)
+        region = regions[context.region_id]
+        if context.region_id != framed[]
+            _state_region!(state, _frame!(ws, region))
+            framed[] = context.region_id
+        end
+        f = _field_index(state.layout, field.name)
+        (ws.fptr[f] < ws.fptr[f+1] || isempty(region.parents)) ||
+            throw(ArgumentError("write_vtk: u(context, xi, field) reads only fields of the block's " *
+                                "own subdomain; evaluate $(field.name) with value(solution, " *
+                                "model, $(field.name), x)"))
+        _refresh!(ws, region, xi.region, Val(false))
+        _state_point!(state, ws, Val(false))
+        offset, C = state.offsets[f], component_count(field)
+        return C == 1 ? state.values[offset+1] : SVector(ntuple(c -> state.values[offset+c], Val(C)))
+    end
+end
+
+# The `(context, x, xi)` a callback receives at sample `k` of the walk `s`: point `k` of the grid, which lies in cell
+# `(k − 1) >> D + 1` (`s.shift = D`), or the center of cell `k` (`s.shift = 0`). `context` names the kind of sample, its
+# region by index and by box, the emitted cell, the region's covering parents and the model's pin; `xi.region` is `x` in
+# the region's reference frame, where the accessor evaluates the solution.
+function _callback_args(s, k::Int)
+    c = ((k - 1) >> s.shift) + 1
+    r, box = s.region_ids[c], s.boxes[c]
+    region, x = s.regions[r], s.shift == 0 ? center(box) : s.points[k]
+    region_box = _region_box(region)
+    context = (; s.location, region_id=r, region=region_box, cell=box, region.parents, model_version=s.version)
+    return context, x, (; region=physical_to_reference(region_box, x))
+end
+
+# One user entry's array over a walk: the callback at every sample, each value checked as it comes (`_sample_value`),
+# collected into the narrowest array that holds them. A function barrier — the one dynamic call per entry — so the loop
+# runs on the callback's and the accessor's concrete types. A concrete element type is kept as it is; mixed number
+# types (an `Int` at some samples, a `Float64` at others) and `SVector`s of mixed element types are promoted over every
+# sample with `promote_type`, and anything else, shapes that differ between samples, is refused naming the entry. An
+# empty walk gives an empty `Float64` array.
+function _sample_array(kind::Symbol, name::String, f::F, u::U, s) where {F,U}
+    n = length(s.boxes) << s.shift
+    n == 0 && return Float64[]
+    values = map(k -> _sample_value(kind, name, f(u, _callback_args(s, k)...)), 1:n)
+    isconcretetype(eltype(values)) && return values
+    S = mapreduce(typeof, promote_type, values)
+    isconcretetype(S) && (S <: Real || S <: SVector && eltype(S) <: Real) && return convert(Vector{S}, values)
+    throw(ArgumentError("$kind entry \"$name\" returned $(join(unique(typeof.(values)), ", ")): a callback value " *
+                        "must be a real number, a tuple of reals or an SVector of reals, of one shape at every sample"))
+end
+
+# One callback value, checked and normalised: a real number is kept as it is; a tuple or an `SVector` of reals becomes
+# an `SVector` with its components promoted to one type, so a tuple and the `SVector` of the same numbers give the same
+# array. Anything else — a `Vector`, a matrix, a `String`, a `Complex`, `nothing` — is refused, naming the entry and
+# what it returned, before anything is written.
+function _sample_value(kind::Symbol, name::String, v)
+    v isa Real && return v
+    v isa Union{Tuple,SVector} && all(x -> x isa Real, v) && return SVector(v...)
+    throw(ArgumentError("$kind entry \"$name\" returned a $(typeof(v)): a callback value must be a real number, a " *
+                        "tuple of reals or an SVector of reals, of one shape at every sample"))
 end
 
 # ── Cut-cell refinement ───────────────────────────────────────────────────────
@@ -691,66 +652,41 @@ end
 # passes through, because its job is to resolve the *geometry*. The two knobs are independent and neither can express
 # the other.
 
-# The sub-boxes one region contributes to the VTK dataset: the `subdivisions` lattice, with each of its boxes replaced
-# by its cut tree when the region is one ∂Ω crosses. The uncut path returns the lattice vector itself, so a model with
-# no `PhysicalDomain`, a region the boundary misses, and `cut_depth = 0` are all byte-identical to the unrefined writer
-# by construction rather than by care.
-function _region_boxes(space::Space{D,T}, region::VolumeRegion{D,T}, subdivisions, depth::Int,
-                       lipschitz::Float64) where {D,T}
-    base = _subboxes(_region_box(region), _subdivision_counts(space, region, subdivisions))
-    physical = space.physical
-    (depth == 0 || physical === nothing || !(region.kind in _CUT_KINDS)) && return base
-
-    boxes = AxisBox{D,T}[]
-    for b in base
-        _cut_leaves!(boxes, physical, b, depth, lipschitz)
-    end
-    return boxes
-end
-
-# Per-axis subbox count for one integration region. Four user-facing shapes:
+# The sample cells of a field, region by region: each region's `subdivisions` lattice in `CartesianIndices` order, a
+# lattice box of a region ∂Ω crosses replaced in place by the leaves of its cut tree, depth first. Returns the cells and
+# the index of each cell's region, which is non-decreasing and is the `region_id` array. A box of an uncut region, of a
+# space without a `PhysicalDomain`, or at `depth = 0` is the lattice box itself, so those write exactly the unrefined
+# lattice by construction rather than by care.
 #
-#   * `:degree`           — `max(1, polynomial_order)` per axis,
-#                           computed as the per-axis maximum over the
-#                           region's parents. The natural default: a
-#                           degree-`p` region is split into `p`
-#                           subboxes so a piecewise-linear ParaView
-#                           cell can resolve the basis without
-#                           visible aliasing.
-#   * `:none`             — no subdivision, one cell per region.
-#   * positive integer    — uniform isotropic count.
-#   * `NTuple{D,Int}`     — explicit per-axis counts.
-function _subdivision_counts(space::Space{D,T}, region::VolumeRegion{D,T}, subdivisions) where {D,T}
-    if subdivisions === :degree
-        # Per parent CELL, not per level: the level's nominal order (`nominal_order`) is the per-axis maximum over its
-        # cells, so sizing from it subdivides every region at the order of the loudest cell anywhere on the level.
-        # Measured on a 3D 8³ level at p=1 with a single p=6 cell, the default `write_vtk` path emitted 110 592 subcells
-        # against 512 and 221.9 MB against 2.50 MB.
-        return _axis_max((level, cell) -> max.(1, cell_order(level, cell)), space, region.parents)
-    elseif subdivisions === :none
-        return ntuple(_ -> 1, D)
-    elseif subdivisions isa Integer
-        subdivisions > 0 || throw(ArgumentError("subdivisions must be positive"))
-        return ntuple(_ -> Int(subdivisions), D)
-    elseif subdivisions isa Tuple && length(subdivisions) == D && all(n -> n isa Integer && n > 0, subdivisions)
-        return ntuple(d -> Int(subdivisions[d]), D)
+# `:degree` counts per axis the largest order `max(1, p)` over the region's parent CELLS — a degree-`p` region split
+# into `p` sub-cells per axis, enough for ParaView's piecewise-linear cells to show the basis without visible aliasing.
+# Per parent cell, not per level: a level's nominal order is the per-axis maximum over all its cells, so sizing from it
+# subdivided every region at the order of the loudest cell anywhere on the level — measured on a 3D 8³ level at p = 1
+# with a single p = 6 cell, 110 592 sub-cells against 512, and 221.9 MB against 2.50 MB.
+function _sample_cells(space::Space{D,T}, regions::Vector{VolumeRegion{D,T}}, rule, depth::Int) where {D,T}
+    physical = space.physical
+    # One certificate lookup per field, not per region: the constant is a property of the geometry tree, which does not
+    # change across the walk.
+    lipschitz = physical === nothing ? Inf : _levelset_lipschitz(physical.geometry)
+    if depth > 0 && physical !== nothing && !isfinite(lipschitz)
+        @warn("cut_depth is refining on corner signs alone: no leaf of this PhysicalDomain " *
+              "declares a Lipschitz constant, so a feature of Ω smaller than a sub-cell can be " *
+              "missed and the clipped surface is not guaranteed watertight. Pass " *
+              "`leaf(f; lipschitz = L)` (1.0 for a signed distance function) to certify it.", maxlog=1)
     end
-
-    throw(ArgumentError("subdivisions must be :degree, :none, a positive integer, or an NTuple{$D,Int}"))
-end
-
-# Split an axis-aligned box into a `counts[1] × counts[2] × … × counts[D]` uniform grid of sub-boxes. Used to refine the
-# VTK output beyond the raw admissible-box partition — a single high-order region gets subdivided so the linear ParaView
-# cells can resolve the higher-order solution faithfully.
-function _subboxes(b::AxisBox{D,T}, counts::NTuple{D,Int}) where {D,T}
-    boxes = AxisBox{D,T}[]
-    h = edge_lengths(b)
-    for index in CartesianIndices(counts)
-        lower = SVector{D,T}(ntuple(d -> b.lower[d] + h[d] * (index.I[d] - 1) / counts[d], D))
-        upper = SVector{D,T}(ntuple(d -> b.lower[d] + h[d] * index.I[d] / counts[d], D))
-        push!(boxes, AxisBox{D,T}(lower, upper))
+    boxes, region_ids = AxisBox{D,T}[], Int[]
+    for (r, region) in pairs(regions)
+        b, emitted = _region_box(region), length(boxes)
+        n = rule isa Symbol ? _axis_max((level, cell) -> max.(1, cell_order(level, cell)), space, region.parents) : rule
+        h, cut = edge_lengths(b), depth > 0 && physical !== nothing && region.kind in _CUT_KINDS
+        for i in CartesianIndices(n)
+            lattice = AxisBox{D,T}(SVector{D,T}(ntuple(d -> b.lower[d] + h[d] * (i[d] - 1) / n[d], Val(D))),
+                                   SVector{D,T}(ntuple(d -> b.lower[d] + h[d] * i[d] / n[d], Val(D))))
+            cut ? _cut_leaves!(boxes, physical, lattice, depth, lipschitz) : push!(boxes, lattice)
+        end
+        append!(region_ids, Iterators.repeated(r, length(boxes) - emitted))
     end
-    return boxes
+    return boxes, region_ids
 end
 
 # Collect the leaves of the cut tree rooted at `b` into `boxes`. Descend only into marked boxes, and descend every
@@ -759,21 +695,13 @@ end
 # clip surfaces meet exactly, and every coarser leaf is unmarked and contributes no clip surface at all. A
 # variable-depth rule would buy fewer cells and lose both properties. Both hold among the trees of boxes of one size —
 # the lattice of one region, or of regions whose lattice boxes coincide on a shared face — and not across two cut
-# regions whose lattice boxes differ: there the finest leaves differ too, and their T-junctions can crack the clip.
+# regions whose lattice boxes differ: there the finest leaves differ too, and their T-junctions can crack the clip. At
+# `depth = 0` nothing is marked, and a box whose bisection is degenerate (`_box_children`) is a leaf.
 function _cut_leaves!(boxes::Vector{AxisBox{D,T}}, physical::PhysicalDomain, b::AxisBox{D,T}, depth::Int,
                       lipschitz::Float64) where {D,T}
-    if depth == 0 || !_cut_marked(physical, b, lipschitz)
-        push!(boxes, b)
-        return boxes
-    end
-    children = _box_children(b)
-    if children === nothing
-        push!(boxes, b)
-        return boxes
-    end
-    for child in children
-        _cut_leaves!(boxes, physical, child, depth - 1, lipschitz)
-    end
+    children = depth > 0 && _cut_marked(physical, b, lipschitz) ? _box_children(b) : nothing
+    children === nothing && return push!(boxes, b)
+    foreach(child -> _cut_leaves!(boxes, physical, child, depth - 1, lipschitz), children)
     return boxes
 end
 
