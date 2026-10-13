@@ -4,6 +4,7 @@ LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 MeshIO = "7269a6da-0436-5bbc-96c2-40638cbb6118"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 Unfitted = "c68911ed-f311-4fcd-9d58-9cd3adb40d87"
+WriteVTK = "64499a7a-5c06-52f2-abe2-ccb03c286192"
 
 [sources]
 Unfitted = {path = "../../.."}
@@ -11,4 +12,5 @@ Unfitted = {path = "../../.."}
 [compat]
 FileIO = "1"
 MeshIO = "0.4, 0.5"
+WriteVTK = "1.18"
 julia = "1.11"

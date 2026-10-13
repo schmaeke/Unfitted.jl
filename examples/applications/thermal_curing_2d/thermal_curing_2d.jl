@@ -94,6 +94,7 @@ problem. That is what `RBFP0` is for.
 =#
 
 using Unfitted
+using WriteVTK              # loads UnfittedWriteVTKExt, the ParaView writer
 using LinearAlgebra
 
 include(joinpath(@__DIR__, "..", "..", "reporting.jl"))

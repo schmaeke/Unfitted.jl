@@ -36,6 +36,7 @@ overlay correction to zero on its artificial faces but leave the physical-bounda
 =#
 
 using Unfitted
+using WriteVTK              # loads UnfittedWriteVTKExt, the ParaView writer
 
 include(joinpath(@__DIR__, "..", "..", "reporting.jl"))
 

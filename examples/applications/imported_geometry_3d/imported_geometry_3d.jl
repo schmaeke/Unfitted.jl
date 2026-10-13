@@ -96,6 +96,7 @@ precision, and `symmetry residual` must be `0` (the operator is SPD, so the dire
 using Unfitted
 using FileIO                # together these two load the
 using MeshIO                # UnfittedMeshIOExt extension
+using WriteVTK              # loads UnfittedWriteVTKExt, the ParaView writer
 using LinearAlgebra
 using StaticArrays
 

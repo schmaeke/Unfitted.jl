@@ -79,6 +79,7 @@ symmetric factorisation.
 =#
 
 using Unfitted
+using WriteVTK              # loads UnfittedWriteVTKExt, the ParaView writer
 using OrdinaryDiffEq
 using LinearAlgebra
 using SparseArrays

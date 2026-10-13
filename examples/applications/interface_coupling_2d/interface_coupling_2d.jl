@@ -77,6 +77,7 @@ formulation for interface problems*, Comput. Methods Appl. Mech. Engrg. **225–
 =#
 
 using Unfitted
+using WriteVTK              # loads UnfittedWriteVTKExt, the ParaView writer
 using LinearAlgebra
 using StaticArrays
 

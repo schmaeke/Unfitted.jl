@@ -65,6 +65,7 @@ and bands the closing headline instead.
 =#
 
 using Unfitted
+using WriteVTK              # loads UnfittedWriteVTKExt, the ParaView writer
 
 include(joinpath(@__DIR__, "..", "..", "reporting.jl"))
 
