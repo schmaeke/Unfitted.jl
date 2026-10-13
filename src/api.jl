@@ -4,53 +4,18 @@
 # entry point composes the geometry, basis, dof, and assembly layers below but adds no behaviour that those layers can't
 # already express.
 
-# ── Coefficient wrappers ──────────────────────────────────────────────────────
+# ── Coefficients ──────────────────────────────────────────────────────────────
 
-# `Number` (scalar), `AbstractMatrix` (D × D diffusion tensor), and `UniformScaling` (isotropic scalar) values share the
-# same "fixed value at every point" semantics, so they are wrapped uniformly as `ConstantCoefficient`. Anything else is
-# assumed to be a callable `value(x)` and wrapped as `FunctionCoefficient`. The two-type representation lets the
-# bilinear / linear callbacks dispatch on the coefficient kind cheaply at the call site.
-struct ConstantCoefficient{C}
-    value::C
-end
-
-struct FunctionCoefficient{F}
-    f::F
-end
-
-# A constant coefficient is anything that is not a callback: a scalar, a per-component `SVector`/tuple/array, a `D × D`
-# diffusion tensor, or a `UniformScaling`. Only genuine callables `c(x)` become `FunctionCoefficient`, so a bare
-# per-component value (e.g. `coefficient = SVector(2, 3)`) is resolved component-wise rather than mistakenly called as a
-# function of `x`.
-_as_coefficient(value::Union{Number,AbstractArray,UniformScaling,Tuple}) = ConstantCoefficient(value)
-_as_coefficient(value) = FunctionCoefficient(value)
-
-# Resolve a coefficient at the physical point `x`. Constant coefficients ignore `x`; function coefficients evaluate
-# `f(x)`.
-_coefficient_value(c::ConstantCoefficient, x) = c.value
-_coefficient_value(c::FunctionCoefficient, x) = c.f(x)
-
-# A constant per-component coefficient — a tuple or array — carries one entry per component of the field it acts on,
-# the same contract a constant Dirichlet datum has (`_check_dirichlet_datum`): `_component_value` reads entry `c` for
-# component `c`. Unchecked, a longer one had its extra entries ignored silently, and a shorter one raised a
-# `BoundsError` from inside the assembly loop — wrapped in a `TaskFailedException` when threaded — instead of an error
-# naming the mistake. Only the builders that know the field can check it (`mass_form` and `source_form` know none), and
-# a callback is not checked, since only evaluating it could say what it returns.
-function _check_coefficient_length(value, u::Field, what::AbstractString)
-    value isa Union{Tuple,AbstractArray} || return nothing
-    components = component_count(u)
-    length(value) == components && return nothing
-    throw(ArgumentError("a constant tuple or array $what carries one entry per component of field $(u.name), " *
-                        "$components, but this one has length $(length(value))"))
-end
-
-# Pick the requested component of a coefficient value. Routes through `_component_value` so a scalar coefficient applies
-# to every component uniformly while an indexable (`SVector`, `Tuple`) coefficient resolves the component slot.
-_component_coefficient_value(c, x, component::Integer) = _component_value(_coefficient_value(c, x), component)
+# A coefficient, a diffusion, a source and a Neumann value are data like a Dirichlet value: a constant — a scalar, a
+# per-component tuple or array, a `D × D` tensor, a `UniformScaling` — or a callback `c(x)`. Each form's closure
+# captures the value as the caller gave it and resolves it at every quadrature point through `_datum_at` and, per
+# component, `_component_value` (both in `dirichlet.jl`, beside the Dirichlet projection that reads its data the same
+# way), so the resolution dispatches on the captured type at compile time. A per-component constant is checked against
+# its field by `_check_per_component` wherever a builder knows the field; `mass_form` and `source_form` know none.
 
 # Diffusion flux `a · ∇u` for the three accepted shapes of `a`: scalar (isotropic), `UniformScaling` (also isotropic;
 # supports `I` and `λI`), and `D × D` `AbstractMatrix` (anisotropic tensor). A callback `a(x)` is not a fourth shape:
-# `_coefficient_value` resolves it to one of these three before the flux is formed. Squareness is checked once at the
+# `_datum_at` resolves it to one of these three before the flux is formed. Squareness is checked once at the
 # call site (`_check_square_diffusion`) and agreement with the spatial dimension per point below; the scalar / uniform
 # paths broadcast directly across the gradient SVector.
 _diffusion_flux(a::Number, ugrad::SVector{D}) where {D} = a * ugrad
@@ -93,13 +58,13 @@ end
 # flux) and whose value coefficient is zero. Off-diagonal-in-components contributions are zero (diagonal-in-components
 # stiffness only).
 function _stiffness_channels(diffusion, q, trial, test_component)
-    trial.component == test_component ?
-    TestChannels(0.0, _diffusion_flux(_coefficient_value(diffusion, q.x), trial.gradient)) : 0.0
+    trial.component == test_component ? TestChannels(0.0, _diffusion_flux(_datum_at(diffusion, q.x), trial.gradient)) :
+    0.0
 end
 
-# Source-callback kernel: resolves the source coefficient at the quadrature point and returns its component value.
-# Wrapped here so the linear closures in `source_form` and `_poisson_form` can share the same pattern.
-_source_value(source, q, test_component) = _component_coefficient_value(source, q.x, test_component)
+# Source-callback kernel: resolves the source at the quadrature point and returns its component value. Shared by
+# `source_form`, and through it `_poisson_form`, and by `neumann`'s single-component form.
+_source_value(source, q, test_component) = _component_value(_datum_at(source, q.x), test_component)
 
 # Mass bilinear-channel kernel: the component-resolved coefficient times the trial value, diagonal in components
 # (off-diagonal trial/test pairs contribute zero). Mirrors `_stiffness_channels` / `_source_value` so all three
@@ -108,7 +73,7 @@ _source_value(source, q, test_component) = _component_coefficient_value(source, 
 # vector.
 function _mass_value(coefficient, q, trial, test_component)
     return trial.component == test_component ?
-           _component_coefficient_value(coefficient, q.x, test_component) * trial.value : 0.0
+           _component_value(_datum_at(coefficient, q.x), test_component) * trial.value : 0.0
 end
 
 # ── Boundary selectors ───────────────────────────────────────────────────────
@@ -343,8 +308,7 @@ See [`mass_block`](@ref) for the same form wrapped as a same-field block, and [`
 problem.
 """
 function mass_form(; coefficient=1)
-    coefficient_data = _as_coefficient(coefficient)
-    return WeakForm(bilinear=(q, trial, test_component) -> _mass_value(coefficient_data, q, trial, test_component),
+    return WeakForm(bilinear=(q, trial, test_component) -> _mass_value(coefficient, q, trial, test_component),
                     symmetric=true, component_aware=true)
 end
 
@@ -392,10 +356,8 @@ one-field problem.
 """
 function stiffness_form(; diffusion=1)
     _check_square_diffusion(diffusion)
-    diffusion_coefficient = _as_coefficient(diffusion)
-    return WeakForm(bilinear=(q, trial, test_component) -> _stiffness_channels(diffusion_coefficient, q, trial,
-                                                                               test_component), symmetric=true,
-                    component_aware=true)
+    return WeakForm(bilinear=(q, trial, test_component) -> _stiffness_channels(diffusion, q, trial, test_component),
+                    symmetric=true, component_aware=true)
 end
 
 """
@@ -413,20 +375,16 @@ See [`source_load`](@ref) for the same form wrapped as a load contribution, whic
 problem is spelled, and [`neumann`](@ref) for the boundary-integrated counterpart.
 """
 function source_form(; source)
-    source_coefficient = _as_coefficient(source)
-    return WeakForm(linear=(q, test_component) -> _source_value(source_coefficient, q, test_component), symmetric=true,
+    return WeakForm(linear=(q, test_component) -> _source_value(source, q, test_component), symmetric=true,
                     component_aware=true)
 end
 
-# Combined stiffness + source form used by `poisson`. Equivalent to composing `stiffness_form` and `source_form`, but
-# built inline so `poisson` can wrap one `WeakForm` rather than carrying two and combining them at the `Problem` level.
+# The Poisson form, the stiffness form's bilinear side and the source form's linear side in one `WeakForm`, so that
+# `poisson` attaches one form rather than combining two at the `Problem` level. Its callbacks are the very closures
+# `stiffness_form` and `source_form` build — one code path, compiled once per coefficient type for all three — and
+# `stiffness_form` checks the diffusion's shape.
 function _poisson_form(; source, diffusion=1)
-    _check_square_diffusion(diffusion)
-    source_coefficient = _as_coefficient(source)
-    diffusion_coefficient = _as_coefficient(diffusion)
-    return WeakForm(bilinear=(q, trial, test_component) -> _stiffness_channels(diffusion_coefficient, q, trial,
-                                                                               test_component),
-                    linear=(q, test_component) -> _source_value(source_coefficient, q, test_component), symmetric=true,
+    return WeakForm(bilinear=stiffness_form(; diffusion).bilinear, linear=source_form(; source).linear, symmetric=true,
                     component_aware=true)
 end
 
@@ -441,7 +399,7 @@ see [`mass_form`](@ref) for the shapes it accepts. A constant tuple or array mus
 of `u`, and any other length raises `ArgumentError` here, before anything is assembled.
 """
 function mass_block(u::Field; coefficient=1)
-    _check_coefficient_length(coefficient, u, "mass coefficient")
+    _check_per_component(coefficient, component_count(u), "mass coefficient", u.name)
     return block(u, u, mass_form(; coefficient))
 end
 
@@ -473,7 +431,7 @@ Problem((u,); loads=(source_load(u; source),), dirichlet)
 For repeated loads on an already prepared model, [`load_vector`](@ref) reuses its integration plan and dof layout.
 """
 function source_load(u::Field; source)
-    _check_coefficient_length(source, u, "source")
+    _check_per_component(source, component_count(u), "source", u.name)
     return loadform(u, source_form(; source))
 end
 
@@ -510,16 +468,15 @@ right reading for a Dirichlet trace and a deliberate one to check for a flux, wh
 expected to mean something about measure. It does not; nothing here is trimmed.
 """
 function neumann(u::Field, value; on::BoundarySelector, component=nothing)
-    _check_coefficient_length(value, u, "Neumann value")
+    _check_per_component(value, component_count(u), "Neumann value", u.name)
     component === nothing && return loadform(u, source_form(; source=value); on)
     component isa Integer || throw(ArgumentError("Neumann component must be an integer or nothing"))
     _check_component(component, u)
     selected = Int(component)
 
     # Single-component variant: emit a contribution only when the walking test component matches the requested one.
-    coefficient = _as_coefficient(value)
     return loadform(u,
-                    WeakForm(linear=(q, c) -> c == selected ? _source_value(coefficient, q, c) : 0.0, symmetric=true,
+                    WeakForm(linear=(q, c) -> c == selected ? _source_value(value, q, c) : 0.0, symmetric=true,
                              component_aware=true); on)
 end
 
@@ -603,6 +560,6 @@ list of physical Dirichlet conditions to impose; see [`dirichlet`](@ref).
 """
 function poisson(x::Union{Space,Field}; source, diffusion=1, dirichlet=[])
     u = _as_field(x)
-    _check_coefficient_length(source, u, "source")
+    _check_per_component(source, component_count(u), "source", u.name)
     return Problem(u, _poisson_form(; source, diffusion); dirichlet)
 end
