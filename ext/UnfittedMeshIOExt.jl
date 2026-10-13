@@ -172,7 +172,9 @@ end
 # are the ones the sign field is built from. Two tests cover it:
 #
 #   * every codimension-1 face is traversed once in each direction (the boundary of the cell chain vanishes). A hole
-#     leaves faces traversed once; a flipped cell leaves faces traversed twice the same way.
+#     leaves faces traversed once; a flipped cell leaves faces traversed twice the same way. The faces are paired
+#     through welded vertices, so a cell two of whose corners weld together is refused before they are: see
+#     `_check_watertight`.
 #   * the enclosed volume is positive. Reversing *every* cell keeps the traversals cancelling, so only this test sees a
 #     globally inside-out mesh.
 #
@@ -197,15 +199,11 @@ function _weld(cells, tol)
 end
 
 # Directed codimension-1 faces of one welded cell as `(key, ±1)` pairs, the key orientation-free and the sign recording
-# which way the cell traverses it: the two endpoints of a segment, the three edges of a triangle.
-#
-# A triangle edge whose two ends welded to one vertex is no face at all, and it gets sign 0 so that it never reads as
-# unpaired. Such an edge is shorter than the weld radius but longer than the degeneracy floor allows a triangle to keep
-# — a closed cube whose bottom face is fanned from a point 1e-9 from a corner has two — and with a sign it counted as a
-# boundary, so a sound mesh was refused as "not closed". A segment needs no such case: its two ends already cancel.
+# which way the cell traverses it: the two endpoints of a segment, the three edges of a triangle. The corners of every
+# cell that reaches here are distinct, because `_check_watertight` refuses the others first.
 _faces(c::NTuple{2,Int}) = ((c[1], -1), (c[2], 1))
 _faces(c::NTuple{3,Int}) = (_edge(c[1], c[2]), _edge(c[2], c[3]), _edge(c[3], c[1]))
-_edge(i, j) = i < j ? ((i, j), 1) : ((j, i), i == j ? 0 : -1)
+_edge(i, j) = i < j ? ((i, j), 1) : ((j, i), -1)
 
 # Faces whose traversals do not cancel — zero on a closed, coherently oriented mesh, one per boundary or per mis-wound
 # face otherwise.
@@ -221,11 +219,24 @@ end
 # coordinates, so one corner reached through two facets can differ by an ulp — `1.2e-7 · scale` at the far end of the
 # bounding box — and welding tighter than that would report a sound mesh as full of holes.
 #
+# A cell two of whose corners weld together is refused outright. Its faces between those corners vanish, and the rest
+# cancel one another or pair with the mesh, so the face count cannot tell a sliver lying flat in the surface from one
+# that dangles: a stray segment off a polygon's corner, a fin standing on an edge, a spike, a speck floating inside the
+# solid. The sign, though, is answered from the cells as given, and a dangling sliver that sticks out by more than the
+# sign tests' `tol` inverts it far from the mesh: a segment 5e-7 long hanging off a corner of the square [0.2, 0.8]²
+# reads three of five outside points at distance 0.1 as inside. Only a cell that survives the degeneracy filter with an
+# edge shorter than the weld radius is refused here, and `:winding` answers a mesh that has one.
+#
 # The orientation test is ∮ x·n dA, which the divergence theorem makes `D` times the enclosed volume — positive outward,
 # negative inward, and only its sign is read. Each planar cell contributes `measure · (midpoint · n)` exactly, x·n being
 # affine over the cell and the midpoint its centroid.
 function _check_watertight(cells, normals, scale)
-    open_faces = _unpaired_faces(_weld(cells, 1.0e-6 * scale))
+    idcells = _weld(cells, 1.0e-6 * scale)
+    shut = count(c -> !allunique(c), idcells)
+    shut == 0 || throw(ArgumentError("mesh has $shut cells with two corners closer than the vertex-weld radius " *
+                                     "(1e-6 of the mesh size), where closedness cannot be checked. Repair it, or " *
+                                     "pass orientation=:winding"))
+    open_faces = _unpaired_faces(idcells)
     open_faces == 0 || throw(ArgumentError("mesh is not closed: $open_faces unpaired cell faces. Repair it, " *
                                            "or pass orientation=:winding"))
     sum(Unfitted._simplex_measure(c) * dot(Unfitted._cell_midpoint(c), n) for (c, n) in zip(cells, normals)) > 0 ||
@@ -354,7 +365,10 @@ The mesh must be watertight and consistently outward-oriented; with the default 
 counter-clockwise segment loops in 2D and right-hand-rule triangle winding in 3D (the conventions of `BoundaryMesh`'s
 `_default_normal`). Degenerate (zero-measure) cells are dropped, and under `:pseudonormal` the surviving cells are then
 checked to be closed (every cell face traversed once in each direction) and to enclose a positive volume — a hole, a
-flipped facet or a reversed winding is rejected rather than answered with an inverted sign.
+flipped facet or a reversed winding is rejected rather than answered with an inverted sign. Faces are paired through
+corners welded within 10⁻⁶ of the bounding-box diagonal (a binary STL stores each facet's corners separately, in
+`Float32`). At that scale the check cannot tell a sliver of a closed surface from a dangling one, so a cell with two
+corners that close is rejected too, even in an otherwise sound mesh.
 
 `orientation` selects the inside/outside test:
 

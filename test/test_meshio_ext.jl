@@ -213,7 +213,7 @@ end
 
     # A needle — corner 1, a point 1e-12 from it, corner 4 — is one triangle in each of its three vertex rotations, and
     # it is dropped in each: the verdict is the sine of its smallest angle, not of the angle at whichever vertex comes
-    # first. Kept, its 1e-12 edge welds shut and the closedness check reads an unpaired face.
+    # first. Kept, its 1e-12 edge welds shut and the mesh is refused.
     v, f = _cube_mesh(0.2, 0.8)
     needle = vcat(v, [v[1] + SVector(1e-12, 0.0, 0.0)])
     n = length(needle)
@@ -242,17 +242,40 @@ end
     rm(empty_stl; force=true)
 end
 
-@testset "MeshIO ext — an edge welded to a point does not open a closed mesh" begin
-    # A closed outward cube whose bottom face is fanned from a hub `offset` from corner 1. At 1e-9 the two fan triangles
-    # at that corner keep an edge far above the degeneracy floor but inside the weld radius, so both its ends weld to
-    # one vertex: no face at all, and the mesh stays closed. At 1e-5 the hub is outside the weld radius.
+@testset "MeshIO ext — a cell with two corners inside the weld radius is refused, not answered" begin
+    # Faces are paired through corners welded at 1e-6 of the mesh size, and a cell two of whose corners weld together
+    # loses the faces between them while the rest cancel or pair with the mesh: the check cannot tell a sliver lying
+    # flat in the surface from a dangling one, and a dangling one inverts the sign: answered, each sliver below reads
+    # points outside as inside or the reverse. `:winding` is the recourse.
     v, f = _cube_mesh(0.2, 0.8)
-    for offset in (1e-9, 1e-5)
+    # A spike hanging from corner 1, its base 1e-9 and its tip 0.4 below the cube.
+    spike = vcat(v, [v[1] + SVector(1e-9, 0.0, 0.0), SVector(0.2, 0.2, -0.2)])
+    @test_throws ArgumentError mesh_levelset(triangle_mesh(spike, vcat(f, [(1, 9, 10)])))
+    # A fin standing on the edge (1, 5), its base 5e-7: above the sign tests' tolerance, inside the weld radius.
+    fin = vcat(v, [v[1] + 5e-7 * SVector(-1.0, -1.0, 0.0) / sqrt(2)])
+    @test_throws ArgumentError mesh_levelset(triangle_mesh(fin, vcat(f, [(1, 9, 5)])))
+    # A triangle of side 1e-8 floating at the centre of the cube.
+    c = SVector(0.5, 0.5, 0.5)
+    speck = vcat(v, [c, c + SVector(1e-8, 0.0, 0.0), c + SVector(0.5e-8, 0.866e-8, 0.0)])
+    @test_throws ArgumentError mesh_levelset(triangle_mesh(speck, vcat(f, [(9, 10, 11)])))
+    # 2D: a segment 1e-8 long inside the square, and one about 5e-7 long hanging off its corner.
+    sq = _square_poly(0.2, 0.8)
+    loop = [(sq[i], sq[mod1(i + 1, 4)]) for i in 1:4]
+    @test_throws ArgumentError mesh_levelset(segment_mesh(vcat(loop, [(SVector(0.5, 0.5), SVector(0.5 + 1e-8, 0.5))])))
+    @test_throws ArgumentError mesh_levelset(segment_mesh(vcat(loop, [(sq[2], sq[2] + SVector(3.5e-7, -3.5e-7))])))
+
+    # The rule refuses a sound mesh with such an edge as well: the cube with its bottom face fanned from a hub 1e-9 from
+    # corner 1, whose two fan triangles at that corner lie flat in the face. `:winding` answers it; with the hub 1e-5
+    # from the corner, outside the weld radius, the default mode does too.
+    for (offset, mode) in ((1e-9, :winding), (1e-5, :pseudonormal))
         verts = vcat(v, [v[1] + SVector(offset, offset, 0.0) / sqrt(2)])
         hub = length(verts)
         faces = [t for t in f if !issubset(t, (1, 2, 3, 4))]
         append!(faces, [(hub, a, b) for (a, b) in ((1, 4), (4, 3), (3, 2), (2, 1))])
-        sdf = Unfitted._leaves(mesh_levelset(triangle_mesh(verts, faces)))[1].f
+        if mode === :winding
+            @test_throws ArgumentError mesh_levelset(triangle_mesh(verts, faces))
+        end
+        sdf = Unfitted._leaves(mesh_levelset(triangle_mesh(verts, faces); orientation=mode))[1].f
         @test length(sdf.cells) == length(faces)
         @test sdf(SVector(0.5, 0.5, 0.5)) ≈ -0.3 atol = 1e-12
         @test sdf(SVector(0.5, 0.5, 0.1)) ≈ 0.1 atol = 1e-12
