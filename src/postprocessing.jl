@@ -11,6 +11,35 @@
 # Both subsystems share the same overlay-zero-extension convention: a level whose mesh does not cover the evaluation
 # point contributes zero. That mirrors the assembly contract from `CONTRIBUTING.md`'s "The superposition model" section.
 
+# ── Sample records ────────────────────────────────────────────────────────────
+
+# One sampled dataset in a consumer-neutral form: the record every post-processing consumer reads, so that a VTK writer
+# and a plotting front end share the geometry and the arrays instead of each re-deriving them. `K` is the cell
+# dimension — `D` for a grid of `D`-cubes, `0` for a vertex cloud — and the connectivity is implicit: cell `c` owns
+# points `(c − 1)·2ᴷ + 1 : c·2ᴷ`, in the face-cyclic order of `_box_corners`, and no point is shared between cells.
+# Points are unpadded `D`-vectors and every array is unpadded with its element type as computed (`Bool` included),
+# point arrays one value per point, cell arrays one per cell, each list in attach order: what a format needs on top —
+# three coordinates, a known number type — its consumer adds.
+struct SampleGrid{D,T,K}
+    points::Vector{SVector{D,T}}
+    point_data::Vector{Pair{String,AbstractVector}}
+    cell_data::Vector{Pair{String,AbstractVector}}
+end
+
+# Number of cells of a record: its points come in blocks of 2ᴷ.
+_cell_count(g::SampleGrid{D,T,K}) where {D,T,K} = length(g.points) >> K
+
+# The 2ᴰ corners of `b` in face-cyclic order: the lower face counterclockwise, then the upper face the same way — the
+# order of VTK's line, quad and hexahedron and of a GeometryBasics `QuadFace`, so a consumer reads a cell's points as a
+# closed polygon or a hexahedron without permuting them. It is a fixed permutation of `_box_vertices`, whose axis-1
+# fastest order swaps the last two corners of every face: corner `j` is vertex `xor(j − 1, ((j − 1) >> 1) & 1) + 1`,
+# which is (1, 2, 4, 3) in 2D and (1, 2, 4, 3, 5, 6, 8, 7) in 3D, and picks each coordinate from `lower` or `upper` as
+# the vertex does, so the points are bit for bit those of the vertex enumeration.
+function _box_corners(b::AxisBox{D}) where {D}
+    v = _box_vertices(b)
+    return ntuple(j -> v[xor(j - 1, ((j - 1) >> 1) & 1)+1], Val(2^D))
+end
+
 # ── Public VTK export ─────────────────────────────────────────────────────────
 
 """
@@ -377,40 +406,76 @@ function _write_vtk_blocks!(vtm, base::AbstractString, solution::Solution, model
                                    cut_depth, point_data, cell_data)
         field_block = multiblock_add_block(vtm, string(fld.name))
         data_name = multi ? "data_$i" : "data"
-        vtk = vtk_grid(_vtk_child_path(base, data_name) * ".vtu", data.points, data.cells; ascii, append, compress)
-        multiblock_add_block(field_block, vtk, data_name)
-        for (name, arr) in data.point_arrays
-            vtk[name, VTKPointData()] = arr
-        end
-        if data.level_set_values !== nothing
-            vtk["level_set", VTKPointData()] = data.level_set_values
-        end
-        vtk["region_id", VTKCellData()] = data.region_ids
-        vtk["cover_count", VTKCellData()] = data.cover_counts
-        for (name, arr) in data.cell_arrays
-            vtk[name, VTKCellData()] = arr
-        end
+        _add_dataset!(field_block, base, data_name, data_name, data; ascii, append, compress)
 
         (level_meshes && !any(s -> s === space, meshed)) || continue
         push!(meshed, space)
         coverage = build_coverage(space, layout.dofs.tolerance)
         for level in space.levels
-            data = _mesh_vtk_data(level, layout.dofs, coverage)
             label = "level_$(level.id)_$(level.role)"
-            mesh_path = _vtk_child_path(base, "$(label)_mesh") * ".vtu"
-            mvtk = vtk_grid(mesh_path, data.points, data.cells; ascii, append, compress)
-            multiblock_add_block(field_block, mvtk, label)
-            mvtk["level_id", VTKCellData()] = data.level_ids
-            mvtk["role_id", VTKCellData()] = data.role_ids
-            mvtk["order_max", VTKCellData()] = data.order_max
-            mvtk["cell_id", VTKCellData()] = data.cell_ids
-            mvtk["active", VTKCellData()] = data.active
-            mvtk["covered", VTKCellData()] = data.covered
-            mvtk["active_dofs", VTKCellData()] = data.active_dofs
-            mvtk["reduced_dofs", VTKCellData()] = data.reduced_dofs
+            _add_dataset!(field_block, base, label, label * "_mesh", _level_grid(level, layout.dofs, coverage); ascii,
+                          append, compress)
         end
     end
     return vtm
+end
+
+# Write one `SampleGrid` as a dataset leaf of the multiblock `parent`: the file `<base>_<suffix>.vtu` (`.vtp` for a
+# vertex cloud) under the block name `name`, with the record's point arrays and then its cell arrays attached in list
+# order. One serialiser for every dataset a bundle holds — the data grids, the level meshes, the quadrature clouds —
+# so the cell type, the padding and the attach order are decided in one place. The attach order is the order of the
+# bytes in an appended file, which is why it is the record's list order and nothing else.
+function _add_dataset!(parent, base::AbstractString, name::AbstractString, suffix::AbstractString, g::SampleGrid{D,T,K};
+                       kwargs...) where {D,T,K}
+    path = joinpath(dirname(base), basename(base) * "_" * suffix) * (K == 0 ? ".vtp" : ".vtu")
+    vtk = vtk_grid(path, _vtk_points(g), _vtk_cells(g); kwargs...)
+    multiblock_add_block(parent, vtk, name)
+    for (key, array) in g.point_data
+        vtk[key, VTKPointData()] = _vtk_array(array, key, :point_data)
+    end
+    for (key, array) in g.cell_data
+        vtk[key, VTKCellData()] = _vtk_array(array, key, :cell_data)
+    end
+    return vtk
+end
+
+# A record's points as VTK stores them: always three coordinates, a 1D or 2D point padded with zeros (ParaView accepts
+# the inert zeros, so 1D and 2D grids render in the same pipeline as 3D ones). One dense padded copy, deliberately not
+# `reinterpret` or WriteVTK's own padding of a `D × n` matrix: that path writes a tuple of views and fills one scalar
+# at a time, which changes both the bytes of a compressed file and the write time.
+_vtk_points(g::SampleGrid{3}) = g.points
+function _vtk_points(g::SampleGrid{D,T}) where {D,T}
+    return [SVector{3,T}(ntuple(i -> i <= D ? x[i] : zero(T), Val(3))) for x in g.points]
+end
+
+# The record's implicit connectivity spelled as WriteVTK cells: cell `c` owns points `(c − 1)·2ᴷ + 1 : c·2ᴷ`, in the
+# face-cyclic order of `_box_corners`, which is VTK's own order for a line, a quad and a hexahedron; a vertex cloud
+# (`K = 0`) is one poly-data vertex per point.
+_vtk_cells(g::SampleGrid{D,T,0}) where {D,T} = [MeshCell(PolyData.Verts(), SVector{1,Int}(c)) for c in 1:_cell_count(g)]
+function _vtk_cells(g::SampleGrid{D,T,K}) where {D,T,K}
+    type = (VTKCellTypes.VTK_LINE, VTKCellTypes.VTK_QUAD, VTKCellTypes.VTK_HEXAHEDRON)[K]
+    return [MeshCell(type, SVector{1 << K,Int}(ntuple(j -> ((c - 1) << K) + j, Val(1 << K)))) for c in 1:_cell_count(g)]
+end
+
+# One record array as VTK stores it. The record keeps a value as computed; VTK gives an array a meaning by its
+# component count and has no boolean or rational type, so three things happen here and nowhere else:
+#
+#   * a two-component vector is widened to three with a trailing zero — a 2-component array is stored but is not a
+#     vector to `vtkDataSetAttributes::SetVectors`, so ParaView's Glyph, Warp By Vector and Stream Tracer could not
+#     read it, and the padding matches the one `_vtk_points` gives the geometry it is attached to;
+#   * `Bool` is written as `UInt8` 0 / 1, which keeps a flag or a mask readable in ParaView;
+#   * an element type VTK has no type for (a `Rational`, a `BigFloat`, an `Int128`) is refused, naming the entry —
+#     WriteVTK would refuse it as `data type not supported by VTK`, naming neither the entry nor the remedy.
+function _vtk_array(array::AbstractVector{V}, name::AbstractString, kind::Symbol) where {V}
+    R = _vtk_number(eltype(V))
+    R === nothing &&
+        throw(ArgumentError("$kind entry \"$name\" returned $(eltype(V)) values, which VTK cannot store: " *
+                            "write_vtk accepts a real number, a tuple of reals or an SVector of " *
+                            "reals, with values promoting to Float32, Float64, Bool or an integer of " *
+                            "at most 64 bits"))
+    V <: SVector{2} && return [SVector{3,R}(v[1], v[2], zero(R)) for v in array]
+    R === eltype(V) && return array
+    return V <: SVector ? [SVector{length(V),R}(v) for v in array] : convert(Vector{R}, array)
 end
 
 # The fields a VTK write covers: a single explicit `field` (a `Field` or its name `Symbol`) if given, otherwise every
@@ -466,10 +531,7 @@ function _partition_vtk_data(solution::Solution, model::Model{D,T}, ws::Assembly
               "`leaf(f; lipschitz = L)` (1.0 for a signed distance function) to certify it.", maxlog=1)
     end
 
-    points = SVector{3,T}[]
-    cell_type = _vtk_cell_type(Val(D))
-    cell0 = MeshCell(cell_type, SVector{2^D,Int}(ntuple(identity, 2^D)))
-    cells = typeof(cell0)[]
+    points = SVector{D,T}[]
     region_ids = Int[]
     cover_counts = Int[]
     level_set_values = auto_level_set ? T[] : nothing
@@ -484,10 +546,8 @@ function _partition_vtk_data(solution::Solution, model::Model{D,T}, ws::Assembly
         _state_region!(state, _frame!(ws, region))
         u = _vtk_value_accessor(ws, state, region, fld)
         for subbox in _region_boxes(space, region, subdivisions, cut_depth, lipschitz)
-            first_point = length(points) + 1
-            corners = _box_corners(subbox, Val(D))
-            for corner in corners
-                push!(points, _vtk_point(corner))
+            for corner in _box_corners(subbox)
+                push!(points, corner)
                 auto_level_set && push!(level_set_values, T(levelset_value(physical, corner)))
                 sample = _vtk_sample(model, region_id, region, subbox, corner, :point)
                 for (i, (_, f)) in pairs(point_pairs)
@@ -495,7 +555,6 @@ function _partition_vtk_data(solution::Solution, model::Model{D,T}, ws::Assembly
                 end
             end
 
-            push!(cells, MeshCell(cell_type, SVector{2^D,Int}(ntuple(i -> first_point + i - 1, 2^D))))
             push!(region_ids, region_id)
             push!(cover_counts, length(region.parents))
             sample = _vtk_sample(model, region_id, region, subbox, center(subbox), :cell)
@@ -506,8 +565,10 @@ function _partition_vtk_data(solution::Solution, model::Model{D,T}, ws::Assembly
     end
 
     point_arrays = _vtk_data_arrays(point_pairs, point_values, :point_data)
-    cell_arrays = _vtk_data_arrays(cell_pairs, cell_values, :cell_data)
-    return (; points, cells, point_arrays, cell_arrays, region_ids, cover_counts, level_set_values)
+    level_set_values === nothing || push!(point_arrays, "level_set" => level_set_values)
+    cell_arrays = Pair{String,AbstractVector}["region_id" => region_ids, "cover_count" => cover_counts]
+    append!(cell_arrays, _vtk_data_arrays(cell_pairs, cell_values, :cell_data))
+    return SampleGrid{D,T,D}(points, point_arrays, cell_arrays)
 end
 
 # Normalise the `point_data` / `cell_data` keyword argument to a list of `String => callback` pairs. Three accepted
@@ -565,19 +626,20 @@ end
 # attachment. `values[i]` is the collected output of `pairs[i]`, in sample order; `kind` (`:point_data` / `:cell_data`)
 # and the entry's name only label a refusal.
 function _vtk_data_arrays(pairs, values, kind::Symbol)
-    return Pair{String,Any}[first(p) => _vtk_data_array(v, first(p), kind) for (p, v) in zip(pairs, values)]
+    return Pair{String,AbstractVector}[first(p) => _vtk_data_array(v, first(p), kind) for (p, v) in zip(pairs, values)]
 end
 
 # The element types a VTK data array can hold, as `WriteVTK` writes them: the machine floats and the integers of up to
 # 64 bits.
 const _VTK_NUMBERS = (Float32, Float64, Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64)
 
-# The element type a callback's values are written in, given the type `T` they promote to: `T` itself when VTK stores
+# The element type a record array is written in, given the type `T` its values promote to: `T` itself when VTK stores
 # it, `UInt8` for `Bool` — VTK has no boolean type and `WriteVTK` refuses one, while 0 / 1 in a byte keeps a flag or a
-# mask readable in ParaView — and `nothing` for any other type, which `_vtk_data_array` refuses.
+# mask readable in ParaView — and `nothing` for any other type, which `_vtk_array` refuses.
 _vtk_number(T::Type) = T === Bool ? UInt8 : T in _VTK_NUMBERS ? T : nothing
 
-# Coerce a `Vector{Any}` of callback returns to a typed array suitable for `WriteVTK`. Three accepted patterns:
+# Coerce a `Vector{Any}` of callback returns to a typed array, kept in the type its values promote to (a `Bool` stays a
+# `Bool`, a 2-vector stays two components: `_vtk_array` maps both when it writes them). Three accepted patterns:
 #
 #   * all-`Real` → `Vector{T}` with `T = promote_type(typeof.(v))`;
 #   * all-`SVector` of one length → `Vector{SVector{N,T}}` with `T` promoted over every entry, as for the numbers: the
@@ -586,10 +648,9 @@ _vtk_number(T::Type) = T === Bool ? UInt8 : T in _VTK_NUMBERS ? T : nothing
 #   * all-`Tuple` of the same length → `Vector{SVector{N,T}}` with `N` inferred from the first element and `T` promoted
 #     from every component of every entry;
 #
-# each written in the `_vtk_number` of the promoted element type, and only when it has one. Both vector patterns pass
-# through `_vtk_vector_array`, so a 2-component result reaches ParaView as a VTK vector. Anything else is refused here,
-# naming the entry, what it returned and what is accepted, rather than handed on: `WriteVTK` would reject it with
-# `data type not supported by VTK: Any` (or `…: Rational{Int64}`), which names neither the entry nor the remedy.
+# each only when its element type has a `_vtk_number`. Anything else is refused here, naming the entry, what it
+# returned and what is accepted, rather than handed on: `WriteVTK` would reject it with `data type not supported by VTK:
+# Any` (or `…: Rational{Int64}`), which names neither the entry nor the remedy.
 function _vtk_data_array(values::Vector{Any}, name::AbstractString, kind::Symbol)
     isempty(values) && return Float64[]
     first_value = first(values)
@@ -598,33 +659,22 @@ function _vtk_data_array(values::Vector{Any}, name::AbstractString, kind::Symbol
         # Reduce the element types pairwise rather than splatting them into `promote_type`: a `Vector{Any}` of thousands
         # of samples would splat thousands of type arguments and overflow the stack, because variadic `promote_type`
         # recurses one level per argument.
-        T = _vtk_number(mapreduce(typeof, promote_type, values))
-        T === nothing || return T[values...]
+        T = mapreduce(typeof, promote_type, values)
+        _vtk_number(T) === nothing || return T[values...]
     elseif all(v -> v isa SVector, values)
         S = mapreduce(typeof, promote_type, values)
-        T = isconcretetype(S) ? _vtk_number(eltype(S)) : nothing
-        T === nothing || return _vtk_vector_array(SVector{length(S),T}[v for v in values])
+        T = isconcretetype(S) ? eltype(S) : Any
+        _vtk_number(T) === nothing || return SVector{length(S),T}[v for v in values]
     elseif first_value isa Tuple && all(v -> v isa Tuple && length(v) == length(first_value), values)
         N = length(first_value)
-        T = _vtk_number(reduce(promote_type, (typeof(v[i]) for v in values for i in 1:N); init=Union{}))
-        T === nothing || return _vtk_vector_array(SVector{N,T}[SVector{N,T}(v) for v in values])
+        T = reduce(promote_type, (typeof(v[i]) for v in values for i in 1:N); init=Union{})
+        _vtk_number(T) === nothing || return SVector{N,T}[SVector{N,T}(v) for v in values]
     end
 
     throw(ArgumentError("$kind entry \"$name\" returned $(join(unique(typeof(v) for v in values), ", ")): write_vtk " *
                         "accepts a real number, a tuple of reals or an SVector of reals, of one shape at every " *
                         "sample, with values promoting to Float32, Float64, Bool or an integer of at most 64 bits"))
 end
-
-# Widen a two-component vector array to three components with a trailing zero. VTK gives a point/cell data array a
-# meaning by its component count — 1 is a scalar, 3 a vector, 9 a tensor — and a 2-component array is none of those: it
-# is stored and displayed component-wise, but `vtkDataSetAttributes::SetVectors` rejects it, so ParaView's Glyph, Warp
-# By Vector and Stream Tracer cannot read a 2-D vector field emitted at its natural width. Padding mirrors `_vtk_point`,
-# which pads the geometry of the same 2-D dataset to three coordinates, so the vectors and the points a reader
-# associates them with now agree.
-function _vtk_vector_array(array::Vector{SVector{2,T}}) where {T}
-    return SVector{3,T}[SVector{3,T}(v[1], v[2], zero(T)) for v in array]
-end
-_vtk_vector_array(array::Vector) = array
 
 # ── Cut-cell refinement ───────────────────────────────────────────────────────
 #
@@ -752,84 +802,34 @@ end
 
 # ── Level meshes ──────────────────────────────────────────────────────────────
 
-# Build the solid-cell VTK dataset for one level: one `VTK_QUAD` / `VTK_HEXAHEDRON` per mesh cell — *all* cells, active
-# or not — with per-cell scalar fields that make the pruning behaviour visible in ParaView:
+# The record of one level's mesh: every cell of the level, active or not, in `cell_indices` order, as a `K = D` grid
+# with eight integer cell arrays that make the pruning visible in ParaView:
 #
-#   * `level_id`, `role_id`, `order_max`, `cell_id` — structural tags;
-#   * `active`      — 1 iff the cell survives the `LevelMask` (user mask + fold);
-#   * `covered`     — 1 iff a finer level fully covers the cell (see `Coverage`);
-#   * `active_dofs` — basis modes on the cell with at least one active component;
-#   * `reduced_dofs`— modes eliminated by covered-mode pruning (`:coverage` / `:dedup`).
+#   * `level_id`, `role_id` (0 for the base level, 1 for an overlay), `order_max`, `cell_id` — structural tags;
+#   * `active`       — 1 iff the cell survives the `LevelMask` (user mask + fold);
+#   * `covered`      — 1 iff a finer level fully covers the cell (see `Coverage`, which computes the flag only where the
+#     dof layer reads it);
+#   * `active_dofs`  — basis modes on the cell with at least one active component;
+#   * `reduced_dofs` — modes eliminated by covered-mode pruning (`:coverage` / `:dedup`).
 #
 # Rendered "Surface With Edges" this doubles as the old wireframe while carrying the per-cell data a line mesh could
-# not.
-function _mesh_vtk_data(level::Level{D,T}, dofs::DofLayout{D}, coverage::Coverage{D}) where {D,T}
-    points = SVector{3,T}[]
-    cell_type = _vtk_cell_type(Val(D))
-    cell0 = MeshCell(cell_type, SVector{2^D,Int}(ntuple(identity, 2^D)))
-    cells = typeof(cell0)[]
-    level_ids = Int[]
-    role_ids = Int[]
-    order_max = Int[]
-    cell_ids = Int[]
-    active = Int[]
-    covered = Int[]
-    active_dofs = Int[]
-    reduced_dofs = Int[]
-    cov = coverage.covered[level.id]
-    linear = LinearIndices(level.mesh.cells)
-
-    for cell in cell_indices(level.mesh)
-        corners = _box_corners(cell_box(level.mesh, cell), Val(D))
-        first_point = length(points) + 1
-        for corner in corners
-            push!(points, _vtk_point(corner))
-        end
-        push!(cells, MeshCell(cell_type, SVector{2^D,Int}(ntuple(i -> first_point + i - 1, 2^D))))
-        push!(level_ids, level.id)
-        push!(role_ids, _role_id(level.role))
-        push!(order_max, maximum(cell_order(level, cell)))
-        push!(cell_ids, linear[cell])
-        push!(active, is_active(level.mask, cell) ? 1 : 0)
-        push!(covered, cov[cell] ? 1 : 0)
-        raws = cell_dofs(dofs, level.id, cell)
-        push!(active_dofs, count(raw -> any(c -> dofs.active_component[raw, c] != 0, 1:dofs.components), raws))
-        push!(reduced_dofs, count(raw -> dofs.elimination_source[raw] in (:coverage, :dedup), raws))
-    end
-
-    return (; points, cells, level_ids, role_ids, order_max, cell_ids, active, covered, active_dofs, reduced_dofs)
+# not. `dofs` is the layout the dof counts are read from: the first field's, for a space several fields share.
+function _level_grid(level::Level{D,T}, dofs::DofLayout{D}, coverage::Coverage{D}) where {D,T}
+    mesh, cells = level.mesh, vec(cell_indices(level.mesh))
+    covered, linear = coverage.covered[level.id], LinearIndices(mesh.cells)
+    active(raw) = any(c -> dofs.active_component[raw, c] != 0, 1:dofs.components)
+    reduced(raw) = dofs.elimination_source[raw] in (:coverage, :dedup)
+    data = Pair{String,AbstractVector}["level_id" => fill(level.id, length(cells)),
+                                       "role_id" => fill(level.role === :base ? 0 : 1, length(cells)),
+                                       "order_max" => [maximum(cell_order(level, c)) for c in cells],
+                                       "cell_id" => [linear[c] for c in cells],
+                                       "active" => [Int(is_active(level.mask, c)) for c in cells],
+                                       "covered" => [Int(covered[c]) for c in cells],
+                                       "active_dofs" => [count(active, cell_dofs(dofs, level.id, c)) for c in cells],
+                                       "reduced_dofs" => [count(reduced, cell_dofs(dofs, level.id, c)) for c in cells]]
+    points = SVector{D,T}[x for c in cells for x in _box_corners(cell_box(mesh, c))]
+    return SampleGrid{D,T,D}(points, Pair{String,AbstractVector}[], data)
 end
-
-# Map a level's `role` to a small integer tag for the mesh export, so ParaView filters can colour-by-`role_id` to
-# distinguish base levels from overlays. `Level.role` is `:base` or `:overlay` and nothing else: the two literals are
-# written in `space` and `overlay` respectively, every other `Level` constructor copies the field, and `Level` is not
-# exported.
-_role_id(role::Symbol) = role === :base ? 0 : 1
-
-# ── VTK cell geometry ─────────────────────────────────────────────────────────
-
-# VTK cell type for a `D`-cube. `D = 1` is a line segment, `D = 2` is a four-vertex quad, `D = 3` is an eight-vertex
-# hexahedron. Dispatched on `Val(D)` so the value is constant-folded into the cell construction.
-_vtk_cell_type(::Val{1}) = VTKCellTypes.VTK_LINE
-_vtk_cell_type(::Val{2}) = VTKCellTypes.VTK_QUAD
-_vtk_cell_type(::Val{3}) = VTKCellTypes.VTK_HEXAHEDRON
-
-# Collect the 2ᴰ corner coordinates of `b` in VTK canonical order. Used for the solution cells and the per-level mesh
-# cells alike.
-function _box_corners(b::AxisBox{D,T}, ::Val{D}) where {D,T}
-    return ntuple(Val(2^D)) do i
-        bits = _vtk_corner_bits(Val(D))[i]
-        SVector{D,T}(ntuple(d -> bits[d] == 0 ? b.lower[d] : b.upper[d], D))
-    end
-end
-
-# Corner-bit pattern in VTK's canonical vertex ordering for a `D`-cube. For each vertex `i ∈ 1:2ᴰ`,
-# `_vtk_corner_bits(Val(D))[i]` is a tuple of `D` bits selecting `box.lower[d]` (bit 0) or `box.upper[d]` (bit 1) on
-# axis `d`. The ordering follows the VTK convention (counterclockwise around each face, lower face before upper face)
-# rather than a plain Cartesian iteration so the resulting `MeshCell`s orient correctly in ParaView.
-_vtk_corner_bits(::Val{1}) = ((0,), (1,))
-_vtk_corner_bits(::Val{2}) = ((0, 0), (1, 0), (1, 1), (0, 1))
-_vtk_corner_bits(::Val{3}) = ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1))
 
 # Pad a `D`-dimensional physical point with trailing zeros to three coordinates: ParaView point arrays are always 3D
 # regardless of the data's actual dimension. The padded zeros are inert (ParaView accepts them) and let 1D / 2D problems
