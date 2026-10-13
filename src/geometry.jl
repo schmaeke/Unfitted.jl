@@ -140,8 +140,11 @@ See [`AxisBox`](@ref) for the stored representation and the non-degenerate `lowe
 constructor enforces.
 """
 function box(lower::PointLike{D}, upper::PointLike{D}) where {D}
-    T = promote_type(eltype(lower), eltype(upper))
-    return AxisBox{D,T}(SVector{D,T}(lower), SVector{D,T}(upper))
+    # Each corner becomes an `SVector` before the scalar type is read: an `SVector`'s element type is a parameter even
+    # when `D` is not known, where a tuple's is not, so a call whose `D` inference cannot see still infers `T`.
+    l, u = SVector{D}(lower), SVector{D}(upper)
+    T = promote_type(eltype(l), eltype(u))
+    return AxisBox{D,T}(SVector{D,T}(l), SVector{D,T}(u))
 end
 
 function box(center::PointLike{D}; halfwidth) where {D}
