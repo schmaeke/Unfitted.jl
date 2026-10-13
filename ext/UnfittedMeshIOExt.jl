@@ -51,84 +51,6 @@ using GeometryBasics
 
 import Unfitted: stl_levelset, mesh_levelset
 
-# ── Closest point on a simplex ────────────────────────────────────────────────
-
-# Segment: project `p` onto the line and clamp to the endpoints. Branch selection (the clamp) is on the primal part when
-# `p` carries `Dual`s.
-function _closest_point(cell::NTuple{2,SVector{D,T}}, p) where {D,T}
-    a, b = cell
-    ab = b - a
-    t = clamp(dot(p - a, ab) / dot(ab, ab), 0, 1)
-    return a + t * ab
-end
-
-# Triangle (Ericson §5.1.5): classify `p` against the seven Voronoi regions.
-function _closest_point(cell::NTuple{3,SVector{3,T}}, p) where {T}
-    a, b, c = cell
-    ab = b - a
-    ac = c - a
-    ap = p - a
-    d1 = dot(ab, ap)
-    d2 = dot(ac, ap)
-    (d1 <= 0 && d2 <= 0) && return a
-    bp = p - b
-    d3 = dot(ab, bp)
-    d4 = dot(ac, bp)
-    (d3 >= 0 && d4 <= d3) && return b
-    vc = d1 * d4 - d3 * d2
-    (vc <= 0 && d1 >= 0 && d3 <= 0) && return a + (d1 / (d1 - d3)) * ab
-    cp = p - c
-    d5 = dot(ab, cp)
-    d6 = dot(ac, cp)
-    (d6 >= 0 && d5 <= d6) && return c
-    vb = d5 * d2 - d1 * d6
-    (vb <= 0 && d2 >= 0 && d6 <= 0) && return a + (d2 / (d2 - d6)) * ac
-    va = d3 * d6 - d5 * d4
-    (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) && return b + ((d4 - d3) / ((d4 - d3) + (d5 - d6))) * (c - b)
-    denom = 1 / (va + vb + vc)
-    return a + ab * (vb * denom) + ac * (vc * denom)
-end
-
-# ── Angle-weighted pseudonormal feature weight ────────────────────────────────
-
-# `tol` is a length tolerance (scaled to the mesh, passed in by the functor) for deciding whether the closest point sits
-# on a vertex or an edge of the cell.
-#
-# 2D: a boundary vertex joins two segments (codim-1), so equal weight (n₁+n₂) is correct for convex and reflex vertices
-# alike — no angle weighting needed.
-_feature_weight(::NTuple{2,SVector{2,T}}, cp, tol) where {T} = 1.0
-
-# 3D: weight a triangle by the angle it subtends at `cp` — the incident angle at a vertex, `π` on an edge, `2π` in the
-# face interior. This is the Bærentzen–Aanæs pseudonormal, correct at reflex (non-convex) vertices where equal weights
-# would flip the sign.
-#
-# Telling an edge from the face interior looks redundant, since an edge gathers its two triangles at `π` each and a
-# face point its one triangle at `2π`, so a flat stretch sums to `2π·n` either way. But the functor gathers cells by
-# closest-point coincidence within `tol`, not by a shared feature. Next to a ridge too sharp for `tol` to resolve, the
-# closest point in the interior of one face and the closest point on the edge between the two triangles of the face
-# across the ridge lie within `tol` of each other, and all three cells are summed: only `2π` for the one face against
-# `π + π` for the pair keeps the two faces balanced. With `π` for the face, a point 3e-7 outside a wedge of half-angle
-# 0.82° read as inside (test_meshio_ext.jl).
-function _feature_weight(cell::NTuple{3,SVector{3,T}}, cp, tol) where {T}
-    a, b, c = cell
-    norm(cp - a) <= tol && return _vertex_angle(a, b, c)
-    norm(cp - b) <= tol && return _vertex_angle(b, c, a)
-    norm(cp - c) <= tol && return _vertex_angle(c, a, b)
-    (_on_segment(cp, a, b, tol) || _on_segment(cp, b, c, tol) || _on_segment(cp, c, a, tol)) && return Float64(pi)
-    return 2 * Float64(pi)
-end
-
-_vertex_angle(v, p, q) = acos(clamp(dot(normalize(p - v), normalize(q - v)), -1.0, 1.0))
-
-function _on_segment(cp, p, q, tol)
-    pq = q - p
-    l2 = dot(pq, pq)
-    l2 <= 0 && return false
-    t = dot(cp - p, pq) / l2
-    (-tol <= t <= 1 + tol) || return false
-    return norm(cp - (p + clamp(t, 0.0, 1.0) * pq)) <= tol
-end
-
 # ── Mesh signed-distance functor ──────────────────────────────────────────────
 
 # A boundary mesh prepared for signed-distance queries: the (non-degenerate) cells, a KD-tree over cell midpoints for
@@ -144,6 +66,78 @@ struct _MeshSDF{D,C,TK}
     maxcr::Float64
     tol::Float64
     winding::Bool
+end
+
+# ── Public constructors ───────────────────────────────────────────────────────
+#
+# The methods behind `mesh_levelset` and `stl_levelset`, which `src/Unfitted.jl` declares and documents.
+
+function mesh_levelset(mesh::BoundaryMesh{D,T,K}; lipschitz::Union{Real,Nothing}=nothing,
+                       orientation::Symbol=:pseudonormal) where {D,T,K}
+    orientation in (:pseudonormal, :winding) ||
+        throw(ArgumentError("orientation must be :pseudonormal or :winding; got :$orientation"))
+    (D, K) == (2, 1) ||
+        (D, K) == (3, 2) ||
+        throw(ArgumentError("mesh_levelset needs a closed boundary mesh: a BoundaryMesh{2,T,1} " *
+                            "(2D segment loop) or BoundaryMesh{3,T,2} (3D triangle surface); " *
+                            "got D=$D, K=$K"))
+    winding = orientation === :winding
+    L = lipschitz === nothing ? (winding ? Inf : 1.0) : lipschitz
+    return leaf(_build_mesh_sdf(mesh, winding); lipschitz=L)
+end
+
+function stl_levelset(path::AbstractString; lipschitz::Union{Real,Nothing}=nothing, orientation::Symbol=:pseudonormal)
+    verts, faces = _load_triangles(path)
+    isempty(faces) && throw(ArgumentError("no triangles in $path; expected an ASCII or binary STL"))
+    return mesh_levelset(triangle_mesh(verts, faces); lipschitz=lipschitz, orientation=orientation)
+end
+
+# Read an STL into (vertices, faces) of plain `SVector{3,Float64}` / `NTuple`.
+function _load_triangles(path::AbstractString)
+    mesh = FileIO.load(path)
+    points = GeometryBasics.decompose(GeometryBasics.Point3{Float64}, mesh)
+    triangles = GeometryBasics.decompose(GeometryBasics.TriangleFace{Int}, mesh)
+    verts = SVector{3,Float64}[SVector{3,Float64}(p[1], p[2], p[3]) for p in points]
+    fcs = NTuple{3,Int}[Tuple(t) for t in triangles]
+    return verts, fcs
+end
+
+# ── Building the level set ────────────────────────────────────────────────────
+
+# Prepare a `BoundaryMesh` for signed-distance queries. Vertices are converted to `Float64` (the sign tests and the
+# KD-tree do not need the mesh's eltype), degenerate cells are dropped before anything derived from them is built —
+# their normal is undefined and would corrupt the sign — and each surviving cell contributes its normal (the mesh's own,
+# renormalised, if it carries one, else the geometric `_default_normal`) and its midpoint to the search tree. The two
+# scalars are set here because both are mesh-relative: `maxcr` bounds the candidate search, and `tol` is the length
+# tolerance of that bound's slack and of the sign's coincidence and vertex/edge tests, taken from the bounding-box
+# diagonal so the query is scale-free.
+function _build_mesh_sdf(bmesh::BoundaryMesh{D,T,K}, winding::Bool) where {D,T,K}
+    cells = [map(v -> SVector{D,Float64}(v), cell) for cell in bmesh.cells]
+    isempty(cells) && throw(ArgumentError("mesh has no cells"))
+    overrides = bmesh.normals === nothing ? nothing : [SVector{D,Float64}(n) for n in bmesh.normals]
+    # A zero or non-finite override normalises to NaN, and every comparison against NaN is false — the sign test would
+    # then read the whole space as inside, silently, so the direction is required to exist here.
+    bad = overrides === nothing ? nothing : findfirst(n -> !(0 < norm(n) < Inf), overrides)
+    bad === nothing || throw(ArgumentError("mesh normal #$bad is zero or non-finite; give each cell a direction"))
+    scale = _mesh_scale(cells)
+
+    kept = eltype(cells)[]
+    normals = SVector{D,Float64}[]
+    midpoints = SVector{D,Float64}[]
+    maxcr = 0.0
+    for (i, cell) in pairs(cells)
+        _is_degenerate(cell, scale) && continue
+        push!(kept, cell)
+        n = overrides === nothing ? Unfitted._default_normal(cell) : normalize(overrides[i])
+        push!(normals, n)
+        mid = Unfitted._cell_midpoint(cell)
+        push!(midpoints, mid)
+        maxcr = max(maxcr, maximum(norm(v - mid) for v in cell))
+    end
+    isempty(kept) && throw(ArgumentError("mesh has no non-degenerate cells"))
+    tol = 1.0e-8 * scale     # scale-free length tolerance for the search slack and the sign tests
+    winding || _check_watertight(kept, normals, scale)
+    return _MeshSDF{D,eltype(kept),typeof(KDTree(midpoints))}(kept, KDTree(midpoints), normals, maxcr, tol, winding)
 end
 
 # Bounding-box diagonal of all vertices, the length every tolerance of the level set is a fraction of. The box starts
@@ -196,41 +190,6 @@ end
 #
 # Each is one pass over the cells, paid once when the level set is built.
 
-# Map every vertex of every cell to the index of the first vertex within `tol` of it. Cells do not share vertex indices
-# — a mesh read from an STL stores each facet's corners separately — so the face bookkeeping below needs the coincident
-# corners identified first. `tol` is loose (see `_check_watertight`) because a binary STL keeps its coordinates in
-# `Float32`.
-function _weld(cells, tol)
-    verts = [v for cell in cells for v in cell]
-    tree = KDTree(verts)
-    id = zeros(Int, length(verts))
-    for i in eachindex(verts)
-        id[i] == 0 || continue
-        for j in inrange(tree, verts[i], tol)
-            id[j] == 0 && (id[j] = i)
-        end
-    end
-    K = length(first(cells))
-    return [ntuple(k -> id[(c - 1) * K + k], K) for c in eachindex(cells)]
-end
-
-# Directed codimension-1 faces of one welded cell as `(key, ±1)` pairs, the key orientation-free and the sign recording
-# which way the cell traverses it: the two endpoints of a segment, the three edges of a triangle. The corners of every
-# cell that reaches here are distinct, because `_check_watertight` refuses the others first.
-_faces(c::NTuple{2,Int}) = ((c[1], -1), (c[2], 1))
-_faces(c::NTuple{3,Int}) = (_edge(c[1], c[2]), _edge(c[2], c[3]), _edge(c[3], c[1]))
-_edge(i, j) = i < j ? ((i, j), 1) : ((j, i), -1)
-
-# Faces whose traversals do not cancel — zero on a closed, coherently oriented mesh, one per boundary or per mis-wound
-# face otherwise.
-function _unpaired_faces(idcells)
-    net = Dict(key => 0 for c in idcells for (key, _) in _faces(c))
-    for c in idcells, (key, s) in _faces(c)
-        net[key] += s
-    end
-    return count(!iszero, values(net))
-end
-
 # Vertices are welded at `1e-6 · scale`, not at the tighter `tol` of the sign tests: a binary STL stores `Float32`
 # coordinates, so one corner reached through two facets can differ by an ulp — `1.2e-7 · scale` at the far end of the
 # bounding box — and welding tighter than that would report a sound mesh as full of holes.
@@ -282,68 +241,42 @@ function _check_watertight(cells, normals, scale)
     return nothing
 end
 
-# Prepare a `BoundaryMesh` for signed-distance queries. Vertices are converted to `Float64` (the sign tests and the
-# KD-tree do not need the mesh's eltype), degenerate cells are dropped before anything derived from them is built —
-# their normal is undefined and would corrupt the sign — and each surviving cell contributes its normal (the mesh's own,
-# renormalised, if it carries one, else the geometric `_default_normal`) and its midpoint to the search tree. The two
-# scalars are set here because both are mesh-relative: `maxcr` bounds the candidate search, and `tol` is the length
-# tolerance of that bound's slack and of the sign's coincidence and vertex/edge tests, taken from the bounding-box
-# diagonal so the query is scale-free.
-function _build_mesh_sdf(bmesh::BoundaryMesh{D,T,K}, winding::Bool) where {D,T,K}
-    cells = [map(v -> SVector{D,Float64}(v), cell) for cell in bmesh.cells]
-    isempty(cells) && throw(ArgumentError("mesh has no cells"))
-    overrides = bmesh.normals === nothing ? nothing : [SVector{D,Float64}(n) for n in bmesh.normals]
-    # A zero or non-finite override normalises to NaN, and every comparison against NaN is false — the sign test would
-    # then read the whole space as inside, silently, so the direction is required to exist here.
-    bad = overrides === nothing ? nothing : findfirst(n -> !(0 < norm(n) < Inf), overrides)
-    bad === nothing || throw(ArgumentError("mesh normal #$bad is zero or non-finite; give each cell a direction"))
-    scale = _mesh_scale(cells)
-
-    kept = eltype(cells)[]
-    normals = SVector{D,Float64}[]
-    midpoints = SVector{D,Float64}[]
-    maxcr = 0.0
-    for (i, cell) in pairs(cells)
-        _is_degenerate(cell, scale) && continue
-        push!(kept, cell)
-        n = overrides === nothing ? Unfitted._default_normal(cell) : normalize(overrides[i])
-        push!(normals, n)
-        mid = Unfitted._cell_midpoint(cell)
-        push!(midpoints, mid)
-        maxcr = max(maxcr, maximum(norm(v - mid) for v in cell))
+# Map every vertex of every cell to the index of the first vertex within `tol` of it. Cells do not share vertex indices
+# — a mesh read from an STL stores each facet's corners separately — so the face bookkeeping below needs the coincident
+# corners identified first. `tol` is loose (see `_check_watertight`) because a binary STL keeps its coordinates in
+# `Float32`.
+function _weld(cells, tol)
+    verts = [v for cell in cells for v in cell]
+    tree = KDTree(verts)
+    id = zeros(Int, length(verts))
+    for i in eachindex(verts)
+        id[i] == 0 || continue
+        for j in inrange(tree, verts[i], tol)
+            id[j] == 0 && (id[j] = i)
+        end
     end
-    isempty(kept) && throw(ArgumentError("mesh has no non-degenerate cells"))
-    tol = 1.0e-8 * scale     # scale-free length tolerance for the search slack and the sign tests
-    winding || _check_watertight(kept, normals, scale)
-    return _MeshSDF{D,eltype(kept),typeof(KDTree(midpoints))}(kept, KDTree(midpoints), normals, maxcr, tol, winding)
+    K = length(first(cells))
+    return [ntuple(k -> id[(c - 1) * K + k], K) for c in eachindex(cells)]
 end
 
-# Generalized winding number sign (opt-in). 2D sums signed segment angles; 3D sums signed solid angles. `abs(w) > 0.5` ⇒
-# inside, tolerating a globally flipped orientation as well as non-watertight gaps.
-function _winding_sign(m::_MeshSDF{2}, pv)
-    total = 0.0
-    @inbounds for cell in m.cells
-        a = cell[1] - pv
-        b = cell[2] - pv
-        total += atan(a[1] * b[2] - a[2] * b[1], dot(a, b))
+# Faces whose traversals do not cancel — zero on a closed, coherently oriented mesh, one per boundary or per mis-wound
+# face otherwise.
+function _unpaired_faces(idcells)
+    net = Dict(key => 0 for c in idcells for (key, _) in _faces(c))
+    for c in idcells, (key, s) in _faces(c)
+        net[key] += s
     end
-    return abs(total / (2 * Float64(pi))) > 0.5 ? -1.0 : 1.0
+    return count(!iszero, values(net))
 end
-function _winding_sign(m::_MeshSDF{3}, pv)
-    total = 0.0
-    @inbounds for cell in m.cells
-        a = cell[1] - pv
-        b = cell[2] - pv
-        c = cell[3] - pv
-        la = norm(a)
-        lb = norm(b)
-        lc = norm(c)
-        num = dot(a, cross(b, c))
-        den = la * lb * lc + dot(a, b) * lc + dot(b, c) * la + dot(c, a) * lb
-        total += 2 * atan(num, den)
-    end
-    return abs(total / (4 * Float64(pi))) > 0.5 ? -1.0 : 1.0
-end
+
+# Directed codimension-1 faces of one welded cell as `(key, ±1)` pairs, the key orientation-free and the sign recording
+# which way the cell traverses it: the two endpoints of a segment, the three edges of a triangle. The corners of every
+# cell that reaches here are distinct, because `_check_watertight` refuses the others first.
+_faces(c::NTuple{2,Int}) = ((c[1], -1), (c[2], 1))
+_faces(c::NTuple{3,Int}) = (_edge(c[1], c[2]), _edge(c[2], c[3]), _edge(c[3], c[1]))
+_edge(i, j) = i < j ? ((i, j), 1) : ((j, i), -1)
+
+# ── Signed-distance query ─────────────────────────────────────────────────────
 
 # Signed distance from `p` to the mesh. Candidate cells are those whose midpoint lies within
 # `nearest_midpoint_distance + maxcr` of `p`, a bound that provably contains the true nearest cell, widened by the
@@ -385,38 +318,111 @@ function (m::_MeshSDF{D})(p) where {D}
     return s * sqrt(dot(p - cp, p - cp))
 end
 
-# ── Public constructors ───────────────────────────────────────────────────────
+# ── Closest point on a simplex ────────────────────────────────────────────────
+
+# Segment: project `p` onto the line and clamp to the endpoints. Branch selection (the clamp) is on the primal part when
+# `p` carries `Dual`s.
+function _closest_point(cell::NTuple{2,SVector{D,T}}, p) where {D,T}
+    a, b = cell
+    ab = b - a
+    t = clamp(dot(p - a, ab) / dot(ab, ab), 0, 1)
+    return a + t * ab
+end
+
+# Triangle (Ericson §5.1.5): classify `p` against the seven Voronoi regions.
+function _closest_point(cell::NTuple{3,SVector{3,T}}, p) where {T}
+    a, b, c = cell
+    ab = b - a
+    ac = c - a
+    ap = p - a
+    d1 = dot(ab, ap)
+    d2 = dot(ac, ap)
+    (d1 <= 0 && d2 <= 0) && return a
+    bp = p - b
+    d3 = dot(ab, bp)
+    d4 = dot(ac, bp)
+    (d3 >= 0 && d4 <= d3) && return b
+    vc = d1 * d4 - d3 * d2
+    (vc <= 0 && d1 >= 0 && d3 <= 0) && return a + (d1 / (d1 - d3)) * ab
+    cp = p - c
+    d5 = dot(ab, cp)
+    d6 = dot(ac, cp)
+    (d6 >= 0 && d5 <= d6) && return c
+    vb = d5 * d2 - d1 * d6
+    (vb <= 0 && d2 >= 0 && d6 <= 0) && return a + (d2 / (d2 - d6)) * ac
+    va = d3 * d6 - d5 * d4
+    (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) && return b + ((d4 - d3) / ((d4 - d3) + (d5 - d6))) * (c - b)
+    denom = 1 / (va + vb + vc)
+    return a + ab * (vb * denom) + ac * (vc * denom)
+end
+
+# ── Generalized winding number sign ───────────────────────────────────────────
+
+# Generalized winding number sign (opt-in). 2D sums signed segment angles; 3D sums signed solid angles. `abs(w) > 0.5` ⇒
+# inside, tolerating a globally flipped orientation as well as non-watertight gaps.
+function _winding_sign(m::_MeshSDF{2}, pv)
+    total = 0.0
+    @inbounds for cell in m.cells
+        a = cell[1] - pv
+        b = cell[2] - pv
+        total += atan(a[1] * b[2] - a[2] * b[1], dot(a, b))
+    end
+    return abs(total / (2 * Float64(pi))) > 0.5 ? -1.0 : 1.0
+end
+function _winding_sign(m::_MeshSDF{3}, pv)
+    total = 0.0
+    @inbounds for cell in m.cells
+        a = cell[1] - pv
+        b = cell[2] - pv
+        c = cell[3] - pv
+        la = norm(a)
+        lb = norm(b)
+        lc = norm(c)
+        num = dot(a, cross(b, c))
+        den = la * lb * lc + dot(a, b) * lc + dot(b, c) * la + dot(c, a) * lb
+        total += 2 * atan(num, den)
+    end
+    return abs(total / (4 * Float64(pi))) > 0.5 ? -1.0 : 1.0
+end
+
+# ── Angle-weighted pseudonormal feature weight ────────────────────────────────
+
+# `tol` is a length tolerance (scaled to the mesh, passed in by the functor) for deciding whether the closest point sits
+# on a vertex or an edge of the cell.
 #
-# The methods behind `mesh_levelset` and `stl_levelset`, which `src/Unfitted.jl` declares and documents.
+# 2D: a boundary vertex joins two segments (codim-1), so equal weight (n₁+n₂) is correct for convex and reflex vertices
+# alike — no angle weighting needed.
+_feature_weight(::NTuple{2,SVector{2,T}}, cp, tol) where {T} = 1.0
 
-function mesh_levelset(mesh::BoundaryMesh{D,T,K}; lipschitz::Union{Real,Nothing}=nothing,
-                       orientation::Symbol=:pseudonormal) where {D,T,K}
-    orientation in (:pseudonormal, :winding) ||
-        throw(ArgumentError("orientation must be :pseudonormal or :winding; got :$orientation"))
-    (D, K) == (2, 1) ||
-        (D, K) == (3, 2) ||
-        throw(ArgumentError("mesh_levelset needs a closed boundary mesh: a BoundaryMesh{2,T,1} " *
-                            "(2D segment loop) or BoundaryMesh{3,T,2} (3D triangle surface); " *
-                            "got D=$D, K=$K"))
-    winding = orientation === :winding
-    L = lipschitz === nothing ? (winding ? Inf : 1.0) : lipschitz
-    return leaf(_build_mesh_sdf(mesh, winding); lipschitz=L)
+# 3D: weight a triangle by the angle it subtends at `cp` — the incident angle at a vertex, `π` on an edge, `2π` in the
+# face interior. This is the Bærentzen–Aanæs pseudonormal, correct at reflex (non-convex) vertices where equal weights
+# would flip the sign.
+#
+# Telling an edge from the face interior looks redundant, since an edge gathers its two triangles at `π` each and a
+# face point its one triangle at `2π`, so a flat stretch sums to `2π·n` either way. But the functor gathers cells by
+# closest-point coincidence within `tol`, not by a shared feature. Next to a ridge too sharp for `tol` to resolve, the
+# closest point in the interior of one face and the closest point on the edge between the two triangles of the face
+# across the ridge lie within `tol` of each other, and all three cells are summed: only `2π` for the one face against
+# `π + π` for the pair keeps the two faces balanced. With `π` for the face, a point 3e-7 outside a wedge of half-angle
+# 0.82° read as inside (test_meshio_ext.jl).
+function _feature_weight(cell::NTuple{3,SVector{3,T}}, cp, tol) where {T}
+    a, b, c = cell
+    norm(cp - a) <= tol && return _vertex_angle(a, b, c)
+    norm(cp - b) <= tol && return _vertex_angle(b, c, a)
+    norm(cp - c) <= tol && return _vertex_angle(c, a, b)
+    (_on_segment(cp, a, b, tol) || _on_segment(cp, b, c, tol) || _on_segment(cp, c, a, tol)) && return Float64(pi)
+    return 2 * Float64(pi)
 end
 
-# Read an STL into (vertices, faces) of plain `SVector{3,Float64}` / `NTuple`.
-function _load_triangles(path::AbstractString)
-    mesh = FileIO.load(path)
-    points = GeometryBasics.decompose(GeometryBasics.Point3{Float64}, mesh)
-    triangles = GeometryBasics.decompose(GeometryBasics.TriangleFace{Int}, mesh)
-    verts = SVector{3,Float64}[SVector{3,Float64}(p[1], p[2], p[3]) for p in points]
-    fcs = NTuple{3,Int}[Tuple(t) for t in triangles]
-    return verts, fcs
-end
+_vertex_angle(v, p, q) = acos(clamp(dot(normalize(p - v), normalize(q - v)), -1.0, 1.0))
 
-function stl_levelset(path::AbstractString; lipschitz::Union{Real,Nothing}=nothing, orientation::Symbol=:pseudonormal)
-    verts, faces = _load_triangles(path)
-    isempty(faces) && throw(ArgumentError("no triangles in $path; expected an ASCII or binary STL"))
-    return mesh_levelset(triangle_mesh(verts, faces); lipschitz=lipschitz, orientation=orientation)
+function _on_segment(cp, p, q, tol)
+    pq = q - p
+    l2 = dot(pq, pq)
+    l2 <= 0 && return false
+    t = dot(cp - p, pq) / l2
+    (-tol <= t <= 1 + tol) || return false
+    return norm(cp - (p + clamp(t, 0.0, 1.0) * pq)) <= tol
 end
 
 end # module
