@@ -164,4 +164,48 @@ end
     grouped = [:source_form, :stiffness_form, :source_load, :stiffness_block]
     extension_stubs = [:bspline, :gradient_tensor, :mesh_levelset, :stl_levelset, :symmetric_gradient, :value_vec]
     @test issubset(undocumented, union(grouped, extension_stubs))
+
+    # The VTK writers are implemented by an extension and documented here, the two series operations included: their
+    # docstrings sit on abstract signatures that no method of the core implements, so pin that they reached the docs.
+    @test haskey(meta[Base.Docs.Binding(Unfitted, :write_vtk)].docs, Tuple{VTKSeries,Any,Any,Any})
+    @test haskey(meta[Base.Docs.Binding(Base, :close)].docs, Tuple{VTKSeries})
+end
+
+# The VTK writers are a package extension that `using WriteVTK` loads. Without it each entry point must say so, naming
+# `using WriteVTK`, before it touches the file system, and `using Unfitted` alone must not load WriteVTK, which is what
+# keeps WriteVTK out of the package's load time. Only a fresh process can show either: this one may have loaded
+# WriteVTK already (test_vtk.jl does), and a loaded package cannot be unloaded. The child loads Unfitted alone and calls
+# each entry point with placeholder arguments, which a stub never reads, so no model is built and the test costs one
+# package load.
+@testset "the VTK entry points ask for WriteVTK until it is loaded" begin
+    dir = mktempdir()
+    script = """
+        using Unfitted
+        dir = only(ARGS)
+        calls = (write_vtk => (joinpath(dir, "w", "bundle"), nothing, nothing),
+                 vtk_series => (joinpath(dir, "s", "run"),),
+                 write_quadrature_vtm => (joinpath(dir, "q", "cloud"), nothing))
+        for (f, args) in calls
+            message = try
+                f(args...)
+                "returned"
+            catch e
+                sprint(showerror, e)
+            end
+            println(nameof(f), " => ", replace(message, '\\n' => ' '))
+        end
+        println("WriteVTK loaded => ", any(p -> p.name == "WriteVTK", keys(Base.loaded_modules)))
+        """
+    cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) -e $script $dir`
+    reported = Dict{String,String}()
+    for line in readlines(cmd)
+        occursin(" => ", line) || continue
+        name, message = split(line, " => "; limit=2)
+        reported[name] = message
+    end
+    for name in ("write_vtk", "vtk_series", "write_quadrature_vtm")
+        @test occursin("using WriteVTK", get(reported, name, ""))
+    end
+    @test get(reported, "WriteVTK loaded", "") == "false"
+    @test isempty(readdir(dir))
 end

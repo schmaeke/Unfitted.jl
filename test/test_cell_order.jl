@@ -1,5 +1,6 @@
 using StaticArrays
 using LinearAlgebra: norm
+using WriteVTK      # one testset writes the `order_max` level-mesh array through UnfittedWriteVTKExt
 
 using Unfitted: dof_layout, cell_dofs, cell_basis_indices, basis_values, _level_by_id, _index_admissible,
                 local_basis_indices, _tensor_values!, _factor_buffers, _entity_carries, _incident_cells, TensorDofKey,

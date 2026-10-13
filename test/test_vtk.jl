@@ -1,10 +1,24 @@
 using StaticArrays
+using WriteVTK      # loads UnfittedWriteVTKExt, which provides write_vtk, vtk_series and write_quadrature_vtm
 
 # Parse one `<DataArray>` back out of an ASCII `.vtu`/`.vtp` by name, so the tests can assert the numbers ParaView will
 # show. Requires `ascii=true, append=false` on the write; the appended-binary form carries no parsable text.
 _vtu_values(xml, name) = split(match(Regex("Name=\"$name\"[^>]*>([^<]*)</DataArray>"), xml).captures[1])
 _vtu_ints(xml, name) = parse.(Int, _vtu_values(xml, name))
 _vtu_floats(xml, name) = parse.(Float64, _vtu_values(xml, name))
+
+@testset "the WriteVTK extension provides the VTK entry points" begin
+    # The entry points are declared in the core and implemented by the extension `using WriteVTK` loads. Once it is
+    # loaded, a call none of its methods accepts is an ordinary `MethodError`, not advice to load what is loaded; the
+    # behaviour without the extension is pinned in a fresh process by test_api.jl.
+    @test Base.get_extension(Unfitted, :UnfittedWriteVTKExt) !== nothing
+    @test_throws MethodError write_vtk(1)
+    @test_throws MethodError vtk_series(1)
+    @test_throws MethodError write_quadrature_vtm(1)
+    series = vtk_series(joinpath(mktempdir(), "run"))
+    @test series isa VTKSeries
+    @test close(series) isa String
+end
 
 @testset "partitioned VTK bundle with level meshes" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
@@ -177,7 +191,7 @@ end
 
     # A VTK data array is a vector only at three components; a 2-component array is stored but cannot be assigned as
     # VECTORS, so ParaView's Glyph / Warp By Vector cannot read it. The 2-D field is padded with a trailing zero, the
-    # same padding `_vtk_points` applies to the geometry it is attached to.
+    # same padding the WriteVTK extension's `_vtk_points` applies to the geometry it is attached to.
     uh_header = match(r"<DataArray[^>]*Name=\"uh\"[^>]*>", solution_xml)
     @test uh_header !== nothing
     @test occursin("NumberOfComponents=\"3\"", uh_header.match)
