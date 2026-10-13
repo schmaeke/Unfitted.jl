@@ -256,10 +256,11 @@ Keyword arguments:
     from 0.035 MiB to 0.61 MiB and the next plan build from 11.9 s (no reuse) to 0.011 s.
 
 The function is called by `prepare`, `move!`, and `_update_mask!`, all in `src/model.jl`, which own the plan a
-[`Model`](@ref) carries; `assembly.jl` and `postprocessing.jl` only read that cached plan back through the
-[`integration_plan`](@ref) / [`integration_plans`](@ref) accessors. The projection path in `projection.jl` builds no
-plan at all: it reuses this file's admissible-box partition engine (`_partition`) directly and keeps every box the
-target covers, without a `criterion`.
+[`Model`](@ref) carries; `assembly.jl` and `postprocessing.jl` only read that cached plan back — the volume walks
+through `_region_list`, the quadrature-point cloud through each subdomain's `plan.regions` — and user code reaches it
+through the [`integration_plan`](@ref) / [`integration_plans`](@ref) accessors. The projection path in `projection.jl`
+builds no plan at all: it reuses this file's admissible-box partition engine (`_partition`) directly and keeps every box
+the target covers, without a `criterion`.
 """
 function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criterion=:any_parent,
                           classify_cache=_ClassifyCache{D,T}(), moment_fit_cache=_MomentFitCache{D,T}()) where {D,T}

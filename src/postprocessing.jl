@@ -16,7 +16,7 @@
 """
     write_vtk(path, solution, model;
               field=nothing, subdivisions=:degree, cut_depth=3, point_data, cell_data,
-              level_meshes=true, ascii=false, append=true, compress=true)
+              level_meshes=true, ascii=false, append=true, compress=true) -> Vector{String}
 
 Write a ParaView bundle rooted at `path`. The top-level file is a `.vtm` multiblock dataset with **one block per
 field**, each named after the field and grouping that field's data with its own mesh as sibling leaf datasets so it is a
@@ -25,16 +25,18 @@ self-contained, independently-toggled unit — `<field> → { data_<i>, level_�
   - `data_<i>` — the `i`-th field's partitioned solution `.vtu`, whose cells are that field's admissible integration
     regions optionally subdivided into smaller sub-cells (see `subdivisions`), with per-cell `region_id` /
     `cover_count`, per-point user-defined arrays, and (with a [`PhysicalDomain`](@ref)) the field's own `level_set`. A
-    single-field model names it simply `data`;
+    write of one field — a single-field model, or the one field picked with `field` — names it simply `data`;
   - `level_<id>_<role>` — optionally, one solid-cell `.vtu` per level of the field's subdomain: every mesh cell with
     per-cell `active`, `covered`, `active_dofs`, `reduced_dofs` (plus `level_id` / `role_id` / `order_max` / `cell_id`),
     so ParaView can colour the mesh by coverage and covered-mode pruning.
 
 A single-field model is the one-block case of this shape. Fields sharing one space emit that space's meshes once, under
-the first such field. The tree is homogeneous (a field block holds only leaf datasets) and every leaf's disambiguating
-name is **ASCII** — the field *index* `i` for `data_<i>`, the level *id* for the meshes — so ParaView's Extract Block
-(whose data-assembly node names keep only ASCII identifier characters) resolves each leaf on its own even when the field
-names themselves are Unicode (`θ₁`, `θ₂`).
+the first such field, and count their `active_dofs` / `reduced_dofs` on that field's dof layout — the convention
+[`diagnostics`](@ref) follows for its per-level counts — so with several fields over one space the counts reflect the
+first field's Dirichlet conditions alone. The tree is homogeneous (a field block holds only leaf datasets) and every
+leaf's disambiguating name is **ASCII** — the field *index* `i` for `data_<i>`, the level *id* for the meshes — so
+ParaView's Extract Block (whose data-assembly node names keep only ASCII identifier characters) resolves each leaf on
+its own even when the field names themselves are Unicode (`θ₁`, `θ₂`).
 
 Keyword arguments:
 
@@ -76,8 +78,9 @@ automatically attached as a built-in `level_set` point array — convenient for 
 isocontour or for filtering cut / full / fictitious regions in ParaView. Pass a `level_set` entry in `point_data` to
 override or rename it.
 
-The bundle is built in memory and written, its directory included, only once it is complete: a call that fails — on a
-keyword it refuses, or in a callback that throws — leaves nothing on disk.
+Returns the path of every file written: the `.vtm` first, then the datasets in block order. The bundle is built in
+memory and written, its directory included, only once it is complete: a call that fails — on a keyword it refuses, or in
+a callback that throws — leaves nothing on disk.
 
 ## Resolving the immersed boundary
 
@@ -91,13 +94,16 @@ regions: 5 723 cells against 41 472 at 8 sub-cells per axis across `∂Ω`, and 
 A sub-cell is refined when `|φ(c)| ≤ L·r`, with `c` its center, `r` its half-diagonal, and `L` the largest Lipschitz
 constant declared by any leaf of the geometry. That is the exact negation of the uniform-sign certificate the cell
 classifier uses, so an unrefined sub-cell provably holds one sign of `φ` throughout, contributes no cut surface, and
-cannot disagree with a finer neighbour across a shared face — the clipped surface is watertight. Every refined sub-cell
-bottoms out at the same depth, so neighbouring cut cells carry identical corner coordinates and their facets meet
-exactly.
+cannot disagree with a finer neighbour across a shared face. Every refined sub-cell bottoms out at the same depth, so
+the cut cells of one region carry identical corner coordinates where they meet and their facets join exactly: the
+clipped surface is watertight within a region, and across regions whose finest cells coincide on their shared face. Two
+adjacent cut regions whose finest cells differ in size — regions of different extent, or subdivided at different counts
+— meet in T-junctions instead, where the facets of the two sides need not join, and the clipped surface can show a
+crack there about as wide as its own facetisation error.
 
 When **no** leaf declares a constant — `leaf(f)` defaults to `lipschitz = Inf` — no such certificate exists and
 refinement falls back to the corner signs of `φ`, the same evidence ParaView's own clip works from. A feature of `Ω`
-smaller than a sub-cell and missing every corner is then invisible, and the write emits one warning saying so;
+smaller than a sub-cell and missing every corner is then invisible, and the first such write of a session warns so;
 `leaf(f; lipschitz = L)` (`1.0` for a signed distance function) restores the guarantee.
 
 Two limits are worth stating plainly. The clip surface is piecewise planar per cell at every depth, so `cut_depth` buys
@@ -235,7 +241,7 @@ function Base.close(series::VTKSeries)
 end
 
 """
-    write_quadrature_vtm(path, model)
+    write_quadrature_vtm(path, model) -> Vector{String}
 
 Write a ParaView multiblock bundle of the model's quadrature-point cloud. One `.vtp` block is emitted per *distinct
 combination of covering parent levels*: every region of every subdomain integration plan is keyed by
@@ -246,7 +252,7 @@ written. Each block stores the physical quadrature-point coordinates and per-poi
 
 Useful for inspecting where the integration regions actually land in ParaView (the regions / cuts / α-FCM weights are
 not visible from the solution VTK alone) and for diagnosing small-overlap warnings — the small regions show up as point
-clusters with tiny weights.
+clusters with tiny weights. Returns the path of every file written, the `.vtm` first.
 """
 function write_quadrature_vtm(path::AbstractString, model::Model{D,T}) where {D,T}
     _check_vtk_dimension(Val(D))
@@ -701,7 +707,9 @@ end
 # marked box the full `depth`, so every leaf that ∂Ω passes through comes out at the same size. That uniformity is
 # load-bearing: two finest leaves sharing a face see identical corner coordinates and therefore identical φ, so their
 # clip surfaces meet exactly, and every coarser leaf is unmarked and contributes no clip surface at all. A
-# variable-depth rule would buy fewer cells and lose both properties.
+# variable-depth rule would buy fewer cells and lose both properties. Both hold among the trees of boxes of one size —
+# the lattice of one region, or of regions whose lattice boxes coincide on a shared face — and not across two cut
+# regions whose lattice boxes differ: there the finest leaves differ too, and their T-junctions can crack the clip.
 function _cut_leaves!(boxes::Vector{AxisBox{D,T}}, physical::PhysicalDomain, b::AxisBox{D,T}, depth::Int,
                       lipschitz::Float64) where {D,T}
     if depth == 0 || !_cut_marked(physical, b, lipschitz)

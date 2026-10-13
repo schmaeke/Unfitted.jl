@@ -560,9 +560,9 @@ end
 end
 
 @testset "write_vtk compresses by default" begin
-    # The default is `compress = true`, matching `WriteVTK`'s own. Pinned two ways: the appended payload really is zlib
-    # (the `.vtu` declares the compressor, and the file is markedly smaller), and the decompressed content is unchanged
-    # — a reader sees the same arrays either way.
+    # The default is `compress = true`, matching `WriteVTK`'s own. Pinned by what the files declare and weigh: the
+    # default `.vtu` names the zlib compressor and is under half the size of the uncompressed one. That the encodings
+    # decode to the same arrays is WriteVTK's to keep and is not decoded here.
     _, model, solution = _cut_depth_disk_model()
     dir = mktempdir()
     pd = (uh=(u, c, x, xi) -> u(c, xi),)
@@ -576,7 +576,7 @@ end
     @test !occursin("compressor=", off_xml)
     @test filesize(joinpath(dir, "on_data.vtu")) < filesize(joinpath(dir, "off_data.vtu")) / 2
 
-    # Same numbers underneath: written as parsable text, the two agree exactly.
+    # The same write as parsable text carries a `uh` and a `level_set` value at every point.
     write_vtk(joinpath(dir, "plain"), solution, model; subdivisions=4, cut_depth=:none, point_data=pd, ascii=true,
               append=false, compress=false)
     plain_xml = read(joinpath(dir, "plain_data.vtu"), String)

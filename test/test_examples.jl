@@ -525,7 +525,7 @@
     # that refined without releasing (or released without refining) still produces a plausible error while costing or
     # resolving the wrong amount.
     #
-    # It is also the only case that writes output, and it does so at a frame count that does not divide its step count.
+    # It is also the only case that writes frames, and it does so at a frame count that does not divide its step count.
     # That combination is the regression this case exists to hold: the script used to clamp every time step onto the
     # frame grid, so asking for a different number of pictures changed how the PDE was integrated. Hence the two-sided
     # band on the settled error: 1686 unknowns at 0.017389 as it stood, against 1632 at 0.014433 with the frame clamp
