@@ -1,15 +1,56 @@
-# Two concerns share this file:
+# Post-processing: what a consumer of a solved model needs, in three parts.
 #
-#   * **VTK export.** [`write_vtk`](@ref) produces a ParaView multiblock bundle from a `(solution, model)` pair;
-#     [`vtk_series`](@ref) collects a sequence of those bundles into a ParaView `.pvd` collection, so a feature that
-#     moves — and the mesh that follows it — can be watched over time; [`write_quadrature_vtm`](@ref) produces a
-#     quadrature-point cloud bundle for inspecting where the integration regions land. All three rely on `WriteVTK.jl`.
+#   * **Sampling.** A solution, the meshes of its levels and the quadrature-point cloud are sampled into
+#     consumer-neutral records, so that every consumer — the VTK writer below, a plotting front end — reads the same
+#     geometry and the same arrays rather than re-deriving them. The contract is below.
+#   * **VTK export.** [`write_vtk`](@ref) writes the records of a `(solution, model)` pair as a ParaView multiblock
+#     bundle; [`vtk_series`](@ref) collects a sequence of those bundles into a ParaView `.pvd` collection, so a feature
+#     that moves — and the mesh that follows it — can be watched over time; [`write_quadrature_vtm`](@ref) writes the
+#     quadrature-point cloud, for inspecting where the integration regions land. All three serialise records with
+#     `WriteVTK.jl`, and everything VTK-specific — cell types, padding to three components, the number types VTK
+#     stores, the multiblock layout, the file names — is decided there and nowhere else.
 #   * **Solution evaluation.** [`value`](@ref) and [`field_gradient`](@ref) evaluate the superposed solution at
-#     arbitrary physical points; [`l2_error`](@ref) computes an analytic / manufactured-solution error using the model's
-#     own integration plan.
+#     arbitrary physical points; [`l2_error`](@ref) computes an analytic / manufactured-solution error over the model's
+#     own integration plan; [`boundary_integral`](@ref) integrates a callback over a portion of the boundary or an
+#     interface.
 #
-# Both subsystems share the same overlay-zero-extension convention: a level whose mesh does not cover the evaluation
-# point contributes zero. That mirrors the assembly contract from `CONTRIBUTING.md`'s "The superposition model" section.
+# All of them share the overlay-zero-extension convention: a level whose mesh does not cover a point contributes zero
+# there. That mirrors the assembly contract from `CONTRIBUTING.md`'s "The superposition model" section.
+#
+# ## The record contract
+#
+# A `SampleGrid{D,T,K}` holds cells of dimension `K` in `D` dimensions, in the number type `T`. The cell vocabulary has
+# two words: `K = D` is a set of axis-aligned `D`-cubes (a line, a quad, a hexahedron), `K = 0` a vertex cloud, one
+# point per cell.
+#
+#   * **Points.** `points::Vector{SVector{D,T}}`, unpadded. Cell `c` owns points `(c − 1)·2ᴷ + 1 : c·2ᴷ` and no point
+#     is shared between cells, so the connectivity is implicit and `_cell_count(g) == length(g.points) >> K`. The 2ᴰ
+#     corners of a cube come in face-cyclic order (`_box_corners`): the lower face counterclockwise, then the upper
+#     face — VTK's order for a line, a quad and a hexahedron, and a GeometryBasics `QuadFace`'s, so a quad splits into
+#     the triangles (1, 2, 3) and (1, 3, 4).
+#   * **Arrays.** `point_data` and `cell_data` are `name => array` lists in attach order, one value per point or per
+#     cell. An array is a `Vector{R}` with `R <: Real` or a `Vector{SVector{N,R}}`, unpadded and in the element type it
+#     was computed in, `Bool` included: a consumer maps what its format cannot hold (the VTK writer pads a 2-vector to
+#     three components and writes a `Bool` as `UInt8`).
+#
+# Two internal entry points produce records, on demand and without caching them or touching the file system:
+#
+#   * `_sample_fields(solution, model; field, subdivisions, cut_depth, point_data, cell_data, level_meshes)`, whose
+#     keywords mean what `write_vtk` documents — one `(; field, data, meshes)` per sampled field, in problem order.
+#     `data::SampleGrid{D,T,D}` covers the integration regions the field was solved on, each region its `subdivisions`
+#     lattice with the boxes ∂Ω crosses cut-refined; its point arrays are the user's `point_data` entries in their
+#     order, then `level_set` (with a `PhysicalDomain`, unless an entry already has that name); its cell arrays are
+#     `region_id` and `cover_count`, then the user's `cell_data` entries. `meshes` holds one `(; level, role, grid)`
+#     per level of the field's space, in `space.levels` order — empty when `level_meshes = false`, or when an earlier
+#     record already carries the space — and each `grid` covers every cell of its level, active or not, with the `Int`
+#     cell arrays `level_id`, `role_id`, `order_max`, `cell_id`, `active`, `covered`, `active_dofs`, `reduced_dofs`.
+#   * `_sample_quadrature(model)` — one `(; signature, grid::SampleGrid{D,T,0})` per sorted covering-level signature, in
+#     sorted order, with the point array `weight`.
+#
+# A plotting extension would read the same records. With Makie, a 2D grid is
+# `mesh(Point.(g.points), [QuadFace((4c − 3):(4c)) for c in 1:_cell_count(g)]; color = <a point array>)` and the
+# quadrature cloud `scatter(Point.(entry.grid.points); color = <its weight array>)`, and the extension's public
+# functions would be declared in the core, as every package extension's are in `Unfitted.jl`.
 
 # ── Sample records ────────────────────────────────────────────────────────────
 
@@ -33,8 +74,9 @@ _cell_count(g::SampleGrid{D,T,K}) where {D,T,K} = length(g.points) >> K
 # order of VTK's line, quad and hexahedron and of a GeometryBasics `QuadFace`, so a consumer reads a cell's points as a
 # closed polygon or a hexahedron without permuting them. It is a fixed permutation of `_box_vertices`, whose axis-1
 # fastest order swaps the last two corners of every face: corner `j` is vertex `xor(j − 1, ((j − 1) >> 1) & 1) + 1`,
-# which is (1, 2, 4, 3) in 2D and (1, 2, 4, 3, 5, 6, 8, 7) in 3D, and picks each coordinate from `lower` or `upper` as
-# the vertex does, so the points are bit for bit those of the vertex enumeration.
+# which is (1, 2, 4, 3) in 2D and (1, 2, 4, 3, 5, 6, 8, 7) in 3D. Every coordinate is `lower[d]` or `upper[d]` itself,
+# so the corners of neighbouring cells that share a face are bit for bit the same points. Dimension-generic: which `D`
+# a format can hold is its consumer's question.
 function _box_corners(b::AxisBox{D}) where {D}
     v = _box_vertices(b)
     return ntuple(j -> v[xor(j - 1, ((j - 1) >> 1) & 1)+1], Val(2^D))

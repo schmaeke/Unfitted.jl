@@ -137,9 +137,10 @@ and consumed by the pruning constraint source `_coverage_constraints!` in `dofs.
 
 The flag is only computed where that consumer can read it — on a masked level, the active cells and their one-cell
 ∞-norm halo (see `_coverage_cells`). Outside that set the entry keeps its `false` default and carries no information; it
-is not a claim that the cell is uncovered. The VTK mesh export (`_mesh_vtk_data` in `postprocessing.jl`) also reads the
-flag, for *every* cell of a level, so its `covered` cell array shows `0` on the masked level's far-away inactive cells
-whatever their true coverage; read it alongside the `active` array it is written next to.
+is not a claim that the cell is uncovered. The level-mesh records of post-processing (`_level_grid` in
+`postprocessing.jl`, which `write_vtk` writes) also read the flag, for *every* cell of a level, so their `covered` cell
+array shows `0` on the masked level's far-away inactive cells whatever their true coverage; read it alongside the
+`active` array it is written next to.
 """
 struct Coverage{D}
     covered::Dict{Int,BitArray{D}}
@@ -214,8 +215,8 @@ end
 # where the entry is the uninformative `false` default, and `_reproduced_on_domain` settles it by classification
 # instead. So it reads only computed entries.
 #
-# The dof layer is not the only reader: `_mesh_vtk_data` in `postprocessing.jl` reads `cov` on every cell of the level
-# for its `covered` diagnostic array. That reader is not what the set is sized for, and outside it sees the `false`
+# The dof layer is not the only reader: `_level_grid` in `postprocessing.jl` reads `cov` on every cell of the level for
+# its `covered` diagnostic array. That reader is not what the set is sized for, and outside it sees the `false`
 # default rather than a computed verdict — a diagnostic gap, documented on `Coverage`, not a correctness one, since no
 # constraint is ever derived from an entry nobody computed.
 function _coverage_cells(level::Level{D}) where {D}

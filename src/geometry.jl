@@ -164,7 +164,8 @@ center(b::AxisBox) = (b.lower + b.upper) / 2
 # The 2ᴰ vertices of the box spanned by `lower` and `upper`, vertex `i` taking `lower[d]` where bit `d − 1` of `i − 1`
 # is 0 and `upper[d]` where it is 1 — axis 1 fastest, the `CartesianIndices` order. The one corner enumeration of the
 # sign samplers (the kernel's leaf pruning and height-axis choice, the classifier's corner membership, the VTK cut
-# refinement) and of `_box_children` below; VTK cell connectivity keeps its own order (`_box_corners`).
+# refinement) and of `_box_children` below. The post-processing records read the same corners in face-cyclic order
+# (`_box_corners`, VTK's cell order), a fixed permutation of this one.
 function _box_vertices(lower::SVector{D,T}, upper::SVector{D,T}) where {D,T}
     return ntuple(i -> SVector{D,T}(ntuple(d -> (i - 1) >> (d - 1) & 1 == 0 ? lower[d] : upper[d], D)), Val(2^D))
 end

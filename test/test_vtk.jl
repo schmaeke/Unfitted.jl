@@ -177,7 +177,7 @@ end
 
     # A VTK data array is a vector only at three components; a 2-component array is stored but cannot be assigned as
     # VECTORS, so ParaView's Glyph / Warp By Vector cannot read it. The 2-D field is padded with a trailing zero, the
-    # same padding `_vtk_point` applies to the geometry it is attached to.
+    # same padding `_vtk_points` applies to the geometry it is attached to.
     uh_header = match(r"<DataArray[^>]*Name=\"uh\"[^>]*>", solution_xml)
     @test uh_header !== nothing
     @test occursin("NumberOfComponents=\"3\"", uh_header.match)
@@ -534,8 +534,8 @@ end
 end
 
 @testset "cut_depth rejects values outside its budget" begin
-    # The budget is resolved before any file handle exists, so a rejected call leaves nothing on disk — the same
-    # contract `_vtk_bundle_base` keeps for the dimension and coefficient checks.
+    # The budget is resolved before anything is sampled or a file opened, so a rejected call leaves nothing on disk —
+    # the contract every refusal of the writer keeps, the dimension and coefficient checks included.
     _, model, solution = _cut_depth_disk_model()
     dir = mktempdir()
     for bad in (-1, 9, :deep, 2.5)
