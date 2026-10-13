@@ -257,21 +257,6 @@ solution — open a [`vtk_series`](@ref) and call this function with it in place
 write_vtk(args...; kwargs...) = _extension_missing(write_vtk, args, "WriteVTK")
 
 """
-    write_vtk(series::VTKSeries, time, solution, model; kwargs...) -> String
-
-Write one frame of a [`vtk_series`](@ref) and register it in the collection at physical `time`. Returns the path of the
-frame's `.vtm`.
-
-The frame is exactly the bundle `write_vtk(path, solution, model; …)` writes, under a name the series chooses
-(`frame_<n>` in the series' frames directory), and every keyword of that method is accepted here unchanged — see
-[`vtk_series`](@ref) for what the series does and does not do with the frames it is handed. `time` is recorded in the
-collection and is otherwise unused: it need not be a step index, a multiple of anything, or evenly spaced. A frame that
-fails writes nothing and does not use up a frame number. A series that has been closed takes no more frames: a frame
-written to it raises an `ArgumentError`, before any sampling.
-"""
-write_vtk(series::VTKSeries, time, solution, model)
-
-"""
     vtk_series(path; frames=nothing) -> VTKSeries
 
 Open a ParaView collection at `path` for a sequence of solution bundles — the transient sibling of [`write_vtk`](@ref).
@@ -316,6 +301,21 @@ picture is a property of the loop, not of the writer, and a frame costs what a `
 Requires `using WriteVTK`, like [`write_vtk`](@ref).
 """
 vtk_series(args...; kwargs...) = _extension_missing(vtk_series, args, "WriteVTK")
+
+"""
+    write_vtk(series::VTKSeries, time, solution, model; kwargs...) -> String
+
+Write one frame of a [`vtk_series`](@ref) and register it in the collection at physical `time`. Returns the path of the
+frame's `.vtm`.
+
+The frame is exactly the bundle `write_vtk(path, solution, model; …)` writes, under a name the series chooses
+(`frame_<n>` in the series' frames directory), and every keyword of that method is accepted here unchanged — see
+[`vtk_series`](@ref) for what the series does and does not do with the frames it is handed. `time` is recorded in the
+collection and is otherwise unused: it need not be a step index, a multiple of anything, or evenly spaced. A frame that
+fails writes nothing and does not use up a frame number. A series that has been closed takes no more frames: a frame
+written to it raises an `ArgumentError`, before any sampling.
+"""
+write_vtk(series::VTKSeries, time, solution, model)
 
 """
     close(series::VTKSeries) -> String
