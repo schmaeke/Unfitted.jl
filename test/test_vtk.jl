@@ -810,6 +810,14 @@ end
         @test_throws exception write_vtk(joinpath(dir, "sub", "x"), s, m; keywords...)
         @test isempty(readdir(dir))
     end
+    # A series frame that fails while it is sampled writes nothing either, and does not use up its frame number.
+    dir = mktempdir()
+    series = vtk_series(joinpath(dir, "run"))
+    @test_throws ErrorException write_vtk(series, 0.0, sol, model; point_data=(late=(u, c, x, xi) -> error("frame"),))
+    @test isempty(readdir(joinpath(dir, "run_frames")))
+    @test series.count[] == 0
+    @test write_vtk(series, 0.0, sol, model; level_meshes=false) == joinpath(dir, "run_frames", "frame_0001.vtm")
+    close(series)
 end
 
 @testset "SVector callback values are promoted over every sample" begin
@@ -913,11 +921,12 @@ end
 @testset "a dotted base name writes the same files without warnings" begin
     # WriteVTK appends a file's extension when it is missing, but warns when the name carries any other one, and a
     # time-stamped base name such as `out_t=0.5` has one (`.5`): every file of its bundle used to warn. The writers now
-    # name each file with its extension; the names are unchanged.
+    # name each file with its extension — the data grid, the level meshes, the quadrature clouds, a series frame and its
+    # collection — and the names are unchanged.
     (; model, sol) = _pin_2d
     base = joinpath(mktempdir(), "out_t=0.5")
-    files = @test_logs write_vtk(base, sol, model; level_meshes=false)
-    @test files == [base * ".vtm", base * "_data.vtu"]
+    files = @test_logs write_vtk(base, sol, model)
+    @test files == base .* [".vtm", "_data.vtu", "_level_1_base_mesh.vtu", "_level_2_overlay_mesh.vtu"]
     cloud = joinpath(mktempdir(), "cloud_t=0.5")
     @test (@test_logs write_quadrature_vtm(cloud, model)) ==
           [cloud * ".vtm", cloud * "_quadrature_levels_1.vtp", cloud * "_quadrature_levels_1_2.vtp"]
