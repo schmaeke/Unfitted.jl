@@ -1382,6 +1382,24 @@ end
     end
 end
 
+@testset "a callback diffusion assembles without dynamic dispatch" begin
+    # The canonical forms' per-point helpers (`_stiffness_channels`, `_mass_value`, `_source_value`) pass a callback
+    # datum on to `_datum_at` without calling it, and Julia does not specialise a method on a `Function` argument it
+    # merely passes along. Unless the helper takes the datum's type as a parameter, a form closure that does not inline
+    # it runs a `::Function` instance, which dispatches dynamically and allocates at every quadrature point and trial
+    # function. A matrix-valued diffusion callback in 3D is such a case: its assembly here took 1.88 MB against the
+    # constant tensor's 0.11 MB, on Julia 1.10 and 1.12 alike. A callback costs the assembly nothing per point, so it
+    # must allocate what the constant does, up to a 4 KiB slack, a fraction of a percent of what dispatching per point
+    # costs here.
+    V = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(2, 2, 2), order=2)
+    u = field(:u, V)
+    model = prepare(Problem((u,)))
+    A = SMatrix{3,3}(2.0, 0.25, 0.0, 0.25, 1.0, 0.0, 0.0, 0.0, 1.5)
+    constant = _serial_assembly_bytes(assemble_matrix, model, (stiffness_block(u; diffusion=A),))
+    callback = _serial_assembly_bytes(assemble_matrix, model, (stiffness_block(u; diffusion=x -> (1 + x[2]) * A),))
+    @test callback ≤ constant + 4096
+end
+
 # ── Concurrent assembly calls on one model ────────────────────────────────────
 
 # One task per operator index; each task assembles `rounds` operators, cycling through the list from a staggered start,

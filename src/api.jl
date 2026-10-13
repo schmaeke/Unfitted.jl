@@ -54,24 +54,33 @@ function _diffusion_flux(a::AbstractMatrix, ugrad::SVector{D}) where {D}
     return SMatrix{D,D}(a) * ugrad
 end
 
+# The three per-point helpers below — `_stiffness_channels`, `_source_value` and `_mass_value` — receive the datum as
+# the form's closure captured it and only pass it on to `_datum_at`; none of them calls it. Julia does not specialise a
+# method on a `Function` argument that its body merely passes along, so a callback datum would run each helper as one
+# `::Function` instance, and wherever the closure does not inline the helper — a matrix-valued diffusion callback in
+# 3D, for one — `_datum_at` and everything after it would dispatch dynamically and allocate at every quadrature point
+# and trial function. Each helper therefore takes the datum's type as a parameter `F`: that keeps a callback
+# specialised now that no wrapper struct carries its type, and changes nothing for a constant, which is never a
+# `Function`.
+
 # Stiffness bilinear-channel kernel: returns a `TestChannels` whose gradient coefficient is `a · ∇u` (the diffusion
 # flux) and whose value coefficient is zero. Off-diagonal-in-components contributions are zero (diagonal-in-components
 # stiffness only).
-function _stiffness_channels(diffusion, q, trial, test_component)
+function _stiffness_channels(diffusion::F, q, trial, test_component) where {F}
     trial.component == test_component ? TestChannels(0.0, _diffusion_flux(_datum_at(diffusion, q.x), trial.gradient)) :
     0.0
 end
 
 # Source-callback kernel: resolves the source at the quadrature point and returns its component value. Shared by
 # `source_form`, and through it `_poisson_form`, and by `neumann`'s single-component form.
-_source_value(source, q, test_component) = _component_value(_datum_at(source, q.x), test_component)
+_source_value(source::F, q, test_component) where {F} = _component_value(_datum_at(source, q.x), test_component)
 
 # Mass bilinear-channel kernel: the component-resolved coefficient times the trial value, diagonal in components
 # (off-diagonal trial/test pairs contribute zero). Mirrors `_stiffness_channels` / `_source_value` so all three
 # canonical forms resolve coefficients the same component-aware way — in particular a per-component (`SVector`/tuple)
 # mass coefficient picks the slot `test_component` rather than multiplying the trial value by the whole coefficient
 # vector.
-function _mass_value(coefficient, q, trial, test_component)
+function _mass_value(coefficient::F, q, trial, test_component) where {F}
     return trial.component == test_component ?
            _component_value(_datum_at(coefficient, q.x), test_component) * trial.value : 0.0
 end
