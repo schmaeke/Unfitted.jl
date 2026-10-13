@@ -191,6 +191,28 @@ end
     @test bad == 0
 end
 
+# A thin wedge prism: the triangle (0.2, 0.49), (0.9, 0.5), (0.2, 0.51), half-angle 0.82° at its apex, extruded over
+# z ∈ [0.2, 0.8] with its caps fanned from (0.4, 0.5). The query point lies 3e-7 (about 32 of the sign tests' `tol`)
+# outside the lower side face near the ridge's bottom end. Its closest point is inside that face, and its closest point
+# on the upper face lies within `tol` of it on the diagonal splitting that face, so the sign sums the one lower cell
+# and the upper pair. That stays outside only while a face-interior closest point weighs `2π` against an edge's `π`.
+@testset "MeshIO ext — pseudonormal sign next to a sharp ridge (3D)" begin
+    tri = [SVector(0.2, 0.49), SVector(0.9, 0.5), SVector(0.2, 0.51)]
+    v = vcat([SVector(p[1], p[2], 0.2) for p in tri], [SVector(p[1], p[2], 0.8) for p in tri],
+             [SVector(0.4, 0.5, 0.2), SVector(0.4, 0.5, 0.8)])
+    f = NTuple{3,Int}[]
+    for i in 1:3
+        j = mod1(i + 1, 3)
+        push!(f, (i, j, 3 + j), (i, 3 + j, 3 + i), (7, j, i), (8, 3 + i, 3 + j))
+    end
+    p = SVector(0.8999998828300635, 0.4999996999194075, 0.20000010415420186)
+    sdf = Unfitted._leaves(mesh_levelset(triangle_mesh(v, f)))[1].f
+    sw = Unfitted._leaves(mesh_levelset(triangle_mesh(v, f); orientation=:winding))[1].f
+    @test sdf(p) > 0
+    @test sw(p) > 0
+    @test abs(sdf(p)) ≈ minimum(_triangle_distance((v[a], v[b], v[c]), p) for (a, b, c) in f) rtol = 1e-6
+end
+
 @testset "MeshIO ext — winding sign mode" begin
     v, f = _cube_mesh(0.2, 0.8)
     sp = Unfitted._leaves(mesh_levelset(triangle_mesh(v, f); orientation=:pseudonormal))[1].f
