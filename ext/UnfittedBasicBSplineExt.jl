@@ -4,7 +4,7 @@
 Package extension that adds an open-knot, tensor-product B-spline basis family to Unfitted on top of
 [`BasicBSpline.jl`](https://github.com/hyrodium/BasicBSpline.jl). Loading `BasicBSpline` next to `Unfitted` installs the
 family and the required basis-interface methods; without `BasicBSpline`, the package functions exactly as before with
-the default [`IntegratedLegendre`](@ref) family, and its factory [`bspline`](@ref), which `src/Unfitted.jl` declares and
+the default [`IntegratedLegendre`](@ref) family, and its factory [`bspline`](@ref), which `src/stubs.jl` declares and
 documents, raises an error that says to run `using BasicBSpline`.
 
 # Mathematical setting
@@ -100,7 +100,7 @@ using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebas
 
 # ── Public factory and deferred spec ──────────────────────────────────────────
 
-# The method behind `bspline`, which `src/Unfitted.jl` declares and documents: it checks the continuity request's
+# The method behind `bspline`, which `src/stubs.jl` declares and documents: it checks the continuity request's
 # spelling and defers everything else to the `instantiate_basis` hook below.
 function Unfitted.bspline(; continuity::Union{Symbol,Integer}=:maximal)
     continuity === :maximal && return _BSplineSpec(_MAXIMAL_CONTINUITY)

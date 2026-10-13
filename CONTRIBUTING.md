@@ -137,7 +137,7 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 
 | File              | Responsibility                                              |
 |-------------------|-------------------------------------------------------------|
-| `Unfitted.jl`     | top-level module: imports, exports, the extension stubs with their docstrings, include order |
+| `Unfitted.jl`     | top-level module: imports, exports, include order |
 | `geometry.jl`     | D-dimensional axis-aligned boxes, coordinate maps, tolerances |
 | `physical.jl`     | CSG level-set tree, `PhysicalDomain`, three-valued cell classifier |
 | `implicit.jl`     | Saye dimension-reduction implicit quadrature on the level set (volume rules) |
@@ -160,7 +160,8 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `data.jl`         | per-quadrature-point `QuadField` + RBF transfer             |
 | `postprocessing.jl` | what every post-processing consumer shares: the consumer-neutral sampling records (data grids, level meshes, the quadrature cloud), field/gradient evaluation, L² error, boundary integrals |
 | `api.jl`          | thin public-API wrappers (mass, stiffness, poisson, neumann, …) |
-| `ext/UnfittedWriteVTKExt.jl` (not in `src/`) | the VTK consumer of `postprocessing.jl`'s records, a package extension loaded with WriteVTK: `write_vtk`, `vtk_series`, `write_quadrature_vtm`, declared and documented in `Unfitted.jl` |
+| `stubs.jl`        | the package extensions' public entry points (`bspline`, `mesh_levelset` / `stl_levelset`, the tensor-notation readers, the VTK writers and `VTKSeries`), declared and documented in the core as fallbacks that name the package to load (`_extension_missing`); included last |
+| `ext/UnfittedWriteVTKExt.jl` (not in `src/`) | the VTK consumer of `postprocessing.jl`'s records, a package extension loaded with WriteVTK: `write_vtk`, `vtk_series`, `write_quadrature_vtm`, declared and documented in `stubs.jl` |
 
 Only split a single file when a second basis family, an alternative
 transfer scheme, or an honest test burden makes the split helpful.
@@ -1365,7 +1366,7 @@ Rules:
     basis family), `FileIO` + `MeshIO` + `GeometryBasics` (STL /
     boundary-mesh level sets), `Tensors` (tensor-notation weak forms), and
     `WriteVTK` (ParaView output). An extension's public names are
-    declared in `src/Unfitted.jl`, since an extension cannot export a
+    declared in `src/stubs.jl`, since an extension cannot export a
     name, and a docstring that `?name` must find in a session without the
     extension belongs there too: one written in the extension lands in
     the extension module's own docs. Every such name is declared as one

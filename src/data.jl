@@ -311,23 +311,24 @@ end
 # the local interpolant's value there. Each target is independent, so the threaded loop writes the same values as the
 # serial one, bit for bit.
 #
-# What remains on the heap per point is `knn`'s two result vectors — four allocations on Julia 1.12, which counts an
-# array and its memory block separately — and, from `K = 14` on, the solve's (see `_rbfp0_local`). `knn!` fills
-# preallocated vectors, but it exists only from NearestNeighbors 0.4.19 on, and the package's compat admits 0.4.8.
+# The targets are split into one contiguous chunk per thread (the split `Threads.@threads` makes by default), and each
+# chunk's task owns one pair of result vectors that `knn!` refills at every point. So the neighbour search allocates
+# nothing per point — `knn` allocated its two result vectors at each, four allocations on Julia 1.12 — and only the
+# solve does, from `K = 14` on (see `_rbfp0_local`).
 function _rbfp0_transfer!(::Val{K}, out::Vector{T}, tree, cloud::Vector{SVector{D,T}}, data,
                           targets::Vector{SVector{D,T}}, threaded::Bool) where {K,D,T}
-    function point!(i)
-        nearest = first(knn(tree, targets[i], K, true))
-        sources, values = ntuple(j -> cloud[nearest[j]], Val(K)), ntuple(j -> data[nearest[j]], Val(K))
-        out[i] = _rbfp0_local(targets[i], sources, values)
+    function points!(range)
+        nearest, distances = Vector{Int}(undef, K), Vector{T}(undef, K)
+        for i in range
+            knn!(nearest, distances, tree, targets[i], K, true)
+            sources, values = ntuple(j -> cloud[nearest[j]], Val(K)), ntuple(j -> data[nearest[j]], Val(K))
+            out[i] = _rbfp0_local(targets[i], sources, values)
+        end
         return nothing
     end
-    if threaded
-        Threads.@threads for i in eachindex(targets)
-            point!(i)
-        end
-    else
-        foreach(point!, eachindex(targets))
+    chunk = max(1, cld(length(targets), threaded ? Threads.nthreads() : 1))
+    @sync for range in Iterators.partition(eachindex(targets), chunk)
+        threaded ? Threads.@spawn(points!(range)) : points!(range)
     end
     return out
 end

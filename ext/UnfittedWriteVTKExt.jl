@@ -3,7 +3,7 @@
 
 Package extension that writes Unfitted's post-processing output as ParaView files through
 [`WriteVTK.jl`](https://github.com/JuliaVTK/WriteVTK.jl). Loading `WriteVTK` next to `Unfitted` installs the methods
-below; without it the entry points, which `src/Unfitted.jl` declares and documents, raise an error that says to run
+below; without it the entry points, which `src/stubs.jl` declares and documents, raise an error that says to run
 `using WriteVTK`.
 
 The extension samples nothing itself. `src/postprocessing.jl` samples a solution, the meshes of its levels and the
@@ -46,7 +46,7 @@ end
 
 # ── Public VTK export ─────────────────────────────────────────────────────────
 #
-# The methods behind the entry points declared and documented in `src/Unfitted.jl`. Each samples the records first
+# The methods behind the entry points declared and documented in `src/stubs.jl`. Each samples the records first
 # (`_sample_fields`, `_sample_quadrature`), checking every keyword and callback value, builds the whole multiblock in
 # memory, and only then makes the output directory and writes the files.
 

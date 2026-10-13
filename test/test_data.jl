@@ -97,6 +97,30 @@ end
     end
 end
 
+# Allocation count of one warm serial RBFP0 transfer onto `target_model`, behind a function barrier so the count is the
+# call's own.
+function _warm_rbfp0_allocations(source, source_model, target_model)
+    via = RBFP0(; neighbors=10)
+    transfer(source, source_model, target_model; via, threaded=false)
+    return @allocations transfer(source, source_model, target_model; via, threaded=false)
+end
+
+@testset "RBFP0's neighbour search allocates nothing per target point" begin
+    # Each task refills one pair of `knn!` result vectors, so the neighbour search allocates nothing per target point.
+    # `knn` allocated its two result vectors at every point, four allocations each on Julia 1.12, which took this
+    # fixture's count up by 3 073 from the 8² target (256 points) to the 16² one (1 024), and by 3 841 at -O0. With
+    # `knn!` the count grows by 1 in an optimised build (49 → 50); at -O0, where the suite runs, the local solve's
+    # static matrix stays on the heap, one allocation per point (+769). The bound, two allocations per added point,
+    # separates the two at either optimisation level.
+    omega = box((0.0, 0.0), (1.0, 1.0))
+    source_model = prepare(poisson(space(omega; cells=(4, 4), order=2); source=0.0))
+    source = QuadField{Float64}(source_model; init=q -> q.x[1] * q.x[2])
+    small, large = (prepare(poisson(space(omega; cells=(c, c), order=1); source=0.0)) for c in (8, 16))
+    added = nquadpoints(large) - nquadpoints(small)
+    @test _warm_rbfp0_allocations(source, source_model, large) - _warm_rbfp0_allocations(source, source_model, small) <
+          2 * added
+end
+
 @testset "RBFP0 rejects unsupported neighbour counts" begin
     omega = box((0.0,), (1.0,))
     model = prepare(poisson(space(omega; cells=4, order=2); source=0.0))

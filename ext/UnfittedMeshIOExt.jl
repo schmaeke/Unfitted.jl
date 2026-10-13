@@ -70,7 +70,7 @@ end
 
 # ── Public constructors ───────────────────────────────────────────────────────
 #
-# The methods behind `mesh_levelset` and `stl_levelset`, which `src/Unfitted.jl` declares and documents.
+# The methods behind `mesh_levelset` and `stl_levelset`, which `src/stubs.jl` declares and documents.
 
 function mesh_levelset(mesh::BoundaryMesh{D,T,K}; lipschitz::Union{Real,Nothing}=nothing,
                        orientation::Symbol=:pseudonormal) where {D,T,K}

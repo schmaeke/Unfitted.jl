@@ -17,7 +17,7 @@
 # that moves — and the mesh that follows it — can be watched over time, and [`write_quadrature_vtm`](@ref) writes the
 # quadrature-point cloud, for inspecting where the integration regions land. Everything VTK-specific — cell types,
 # padding to three components, the number types VTK stores, the multiblock layout, the file names — is decided there and
-# nowhere else; the entry points themselves are declared and documented in `Unfitted.jl`.
+# nowhere else; the entry points themselves are declared and documented in `stubs.jl`.
 #
 # ## The record contract
 #
@@ -56,7 +56,7 @@
 #     mesh(Point.(g.points), faces; color=last(g.point_data[1]))
 #     scatter(Point.(e.grid.points); color=last(only(e.grid.point_data)))
 #
-# Its public functions would be declared and documented in `Unfitted.jl`, as the VTK writer's are, each a fallback
+# Its public functions would be declared and documented in `stubs.jl`, as the VTK writer's are, each a fallback
 # method whose body is `_extension_missing`, so that a call made without the plotting package loaded says which package
 # to load.
 
