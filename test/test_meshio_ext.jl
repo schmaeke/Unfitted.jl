@@ -326,24 +326,26 @@ end
     # A pair of cells on the same corners, wound oppositely, traverses each of its faces once in each direction and
     # encloses no volume, so it passes the closedness and volume tests; but its normals cancel in the pseudonormal,
     # which then reads every point nearest the pair as outside. Accepted, each mesh below was answered so, over a
-    # region inside the solid. Each is refused by this check, with its own message, not by another of the same type.
-    function refused_as_twins(mesh)
+    # region inside the solid. Each is refused by this check, with its own message, not by another of the same type,
+    # and the message counts the repeated cells: each copy beyond the first, so one for a pair.
+    function refused_as_twins(mesh, repeated)
         try
             mesh_levelset(mesh)
             return false
         catch e
-            return e isa ArgumentError && occursin("on the same corners as another cell", e.msg)
+            return e isa ArgumentError &&
+                   occursin("mesh has $repeated repeated cells, each on the same corners as another cell", e.msg)
         end
     end
     v, f = _cube_mesh(0.2, 0.8)
     # A triangle inside the cube listed in both windings: a two-sided sheet.
     sheet = vcat(v, [SVector(0.4, 0.4, 0.5), SVector(0.6, 0.4, 0.5), SVector(0.5, 0.6, 0.5)])
-    @test refused_as_twins(triangle_mesh(sheet, vcat(f, [(9, 10, 11), (9, 11, 10)])))
+    @test refused_as_twins(triangle_mesh(sheet, vcat(f, [(9, 10, 11), (9, 11, 10)])), 1)
     # 2D: a whisker segment inside the square, listed both ways.
     sq = _square_poly(0.2, 0.8)
     loop = [(sq[i], sq[mod1(i + 1, 4)]) for i in 1:4]
     a, b = SVector(0.4, 0.5), SVector(0.6, 0.5)
-    @test refused_as_twins(segment_mesh(vcat(loop, [(a, b), (b, a)])))
+    @test refused_as_twins(segment_mesh(vcat(loop, [(a, b), (b, a)])), 1)
 
     # Two unit boxes sharing the face x = 1, each closed and outward, as a multi-body export gives them: the second is
     # the first mirrored in that plane, so the shared face is triangulated alike from both sides. `:winding` signs the
@@ -352,7 +354,7 @@ end
     verts = vcat(w, [SVector(2 - p[1], p[2], p[3]) for p in w])
     mirrored(faces) = [(i + 8, k + 8, j + 8) for (i, j, k) in faces]   # rewound, as the mirror reverses orientation
     wall = triangle_mesh(verts, vcat(g, mirrored(g)))
-    @test refused_as_twins(wall)
+    @test refused_as_twins(wall, 2)        # the shared face's two triangles, once each
     # Inside-out as well, the wall is refused as inside-out, as it was before cells on the same corners were looked
     # for: the check for them runs last.
     inverted = triangle_mesh(verts, [(a, c, b) for (a, b, c) in vcat(g, mirrored(g))])

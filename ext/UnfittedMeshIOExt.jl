@@ -254,7 +254,8 @@ end
 # them in nor its winding matters. They are sorted as a StaticArrays `SVector` and turned back into a tuple
 # (`Tuple ∘ sort ∘ SVector`): Julia 1.10, the oldest release the package supports, has no `sort` of a tuple, and sorting
 # a `Vector` instead allocates on the heap for every cell, where StaticArrays' `sort` of an `SVector` allocates nothing.
-# The composition is Base's and StaticArrays', so the check compiles no function of this module's own.
+# The composition is Base's and StaticArrays', so the check compiles no function of this module's own. The count it
+# reports is of the repeated cells, each copy beyond the first of a corner set, not of every cell in such a set.
 #
 # A shared face triangulated differently on its two sides, or two bodies that overlap, inverts the sign in the same way
 # without repeating a cell; telling them apart needs a self-intersection test, which this check does not attempt, so
@@ -272,9 +273,9 @@ function _check_watertight(cells, normals, scale)
         throw(ArgumentError("mesh is inside-out (encloses a negative volume): reverse the cell " *
                             "winding, or pass orientation=:winding"))
     twins = length(idcells) - length(unique(Tuple ∘ sort ∘ SVector, idcells))
-    twins == 0 || throw(ArgumentError("mesh has $twins cells on the same corners as another cell (a two-sided " *
-                                      "sheet, or a face shared by two solids), which bound no volume. Remove both " *
-                                      "copies, or pass orientation=:winding"))
+    twins == 0 || throw(ArgumentError("mesh has $twins repeated cells, each on the same corners as another cell " *
+                                      "(a two-sided sheet, or a face shared by two solids), which bound no volume. " *
+                                      "Remove both copies, or pass orientation=:winding"))
     return nothing
 end
 
