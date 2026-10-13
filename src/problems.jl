@@ -231,6 +231,11 @@ Number of scalar components in `field`.
 """
 component_count(::Field{D,T,C}) where {D,T,C} = C
 
+# The field a single-field entry point (`Problem(x, form)`, `mass`, `stiffness`, `poisson`) works on: a bare `Space` is
+# wrapped in the implicit scalar field `:u`, and a `Field` is taken as the caller named and sized it.
+_as_field(V::Space) = field(:u, V)
+_as_field(u::Field) = u
+
 # Reject a component index the field does not carry. An out-of-range index matches no component downstream, so the
 # Dirichlet condition or Neumann load carrying it contributes nothing at all — a silently free boundary or an all-zero
 # load rather than an error.
@@ -359,15 +364,14 @@ Fields may live on **distinct** spaces: a coupled problem discretises each subdo
 mesh, own level-set fold, own dof block), and off-diagonal `block(uₐ, u_b, …)` / [`couple`](@ref) forms tie them
 together. Single-space problems are the common special case.
 """
-Problem(V::Space{D,T}, form; dirichlet=[]) where {D,T} = Problem(field(:u, V), form; dirichlet)
-
 # The single-field shorthand attaches one form to both sides, so it attaches each side only where the form declares one.
 # `WeakForm` required both callbacks until it learned to take `nothing`, so on every form constructible before then both
 # branches are taken and this is a no-op; what it adds is the one-sided case, where a `nothing` would otherwise reach
 # the assembly loop and raise. The bilinear-only direction is the useful one: an operator with no load, driven entirely
 # by inhomogeneous Dirichlet data, which is Laplace with boundary data and which used to need a dead `linear = q -> 0.0`
 # to say so.
-function Problem(u::Field, form; dirichlet=[])
+function Problem(x::Union{Space,Field}, form; dirichlet=[])
+    u = _as_field(x)
     blocks = form.bilinear === nothing ? () : (block(u, u, form),)
     loads = form.linear === nothing ? () : (loadform(u, form),)
     return Problem((u,); blocks, loads, dirichlet, symmetric=form.symmetric)

@@ -535,9 +535,8 @@ Build the mass-form [`Problem`](@ref) over a scalar space `V` or a component fie
 vector fields the form is diagonal in the component index.
 `dirichlet` is the list of physical Dirichlet conditions to impose; see [`dirichlet`](@ref).
 """
-mass(V::Space{D,T}; coefficient=one(T), dirichlet=[]) where {D,T} = mass(field(:u, V); coefficient, dirichlet)
-
-function mass(u::Field{D,T}; coefficient=one(T), dirichlet=[]) where {D,T}
+function mass(x::Union{Space,Field}; coefficient=1, dirichlet=[])
+    u = _as_field(x)
     return Problem((u,); blocks=(mass_block(u; coefficient),), dirichlet)
 end
 
@@ -555,9 +554,8 @@ and carries the same assumption that a matrix `A` is symmetric, as well as the s
 zero rows drop those axes from the operator (see [`stiffness_form`](@ref)).
 `dirichlet` is the list of physical Dirichlet conditions to impose; see [`dirichlet`](@ref).
 """
-stiffness(V::Space{D,T}; diffusion=one(T), dirichlet=[]) where {D,T} = stiffness(field(:u, V); diffusion, dirichlet)
-
-function stiffness(u::Field{D,T}; diffusion=one(T), dirichlet=[]) where {D,T}
+function stiffness(x::Union{Space,Field}; diffusion=1, dirichlet=[])
+    u = _as_field(x)
     return Problem((u,); blocks=(stiffness_block(u; diffusion),), dirichlet)
 end
 
@@ -603,11 +601,8 @@ The returned problem declares `symmetric = true`, which assumes a symmetric `A`;
 assembled through an explicitly asymmetric [`Problem`](@ref) instead — see [`stiffness_form`](@ref). `dirichlet` is the
 list of physical Dirichlet conditions to impose; see [`dirichlet`](@ref).
 """
-function poisson(V::Space{D,T}; source, diffusion=one(T), dirichlet=[]) where {D,T}
-    return poisson(field(:u, V); source, diffusion, dirichlet)
-end
-
-function poisson(u::Field{D,T}; source, diffusion=one(T), dirichlet=[]) where {D,T}
+function poisson(x::Union{Space,Field}; source, diffusion=1, dirichlet=[])
+    u = _as_field(x)
     _check_coefficient_length(source, u, "source")
     return Problem(u, _poisson_form(; source, diffusion); dirichlet)
 end
