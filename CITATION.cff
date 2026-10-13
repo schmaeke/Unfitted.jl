@@ -10,7 +10,7 @@ abstract: >-
   selective per-cell activation and finite-cell-method (FCM)
   immersed-boundary integration via non-negative moment-fit quadrature.
 type: software
-version: 0.1.0
+version: 0.2.0
 license: MIT
 repository-code: https://github.com/schmaeke/Unfitted.jl
 keywords:

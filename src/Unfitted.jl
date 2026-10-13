@@ -88,13 +88,6 @@ include("mesh.jl")
 include("intersections.jl")
 include("coverage.jl")
 include("ladder.jl")
-# Two references of the dof layer run against the include order and resolve at call time rather than at include time.
-# `dofs.jl` carries integrated Legendre's `_cell_modes`, a family method of a hook whose generic method is in `mesh.jl`
-# and which `Level`'s constructor calls, so a name defined below is reached from above — the same shape an extension
-# takes. And the Dirichlet projection in `dirichlet.jl` reads its quadrature points through the region accessors of
-# `assembly.jl` (`_region_point`, `_region_jacobian`, `_region_qpoint_count`), which load after it. Otherwise the dof
-# layer depends only on what loads above it: the four steps a layout is built in live in `dofs.jl` and `dirichlet.jl`,
-# and `model.jl`, below both, composes them.
 include("dofs.jl")
 include("dirichlet.jl")
 include("surface.jl")
