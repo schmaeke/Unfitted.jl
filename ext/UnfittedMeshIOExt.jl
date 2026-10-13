@@ -232,7 +232,7 @@ end
 # affine over the cell and the midpoint its centroid.
 function _check_watertight(cells, normals, scale)
     idcells = _weld(cells, 1.0e-6 * scale)
-    shut = count(c -> !allunique(c), idcells)
+    shut = count(!allunique, idcells)
     shut == 0 || throw(ArgumentError("mesh has $shut cells with two corners closer than the vertex-weld radius " *
                                      "(1e-6 of the mesh size), where closedness cannot be checked. Repair it, or " *
                                      "pass orientation=:winding"))
