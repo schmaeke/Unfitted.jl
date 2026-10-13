@@ -212,6 +212,11 @@ end
     @test :BlockForm ∉ undocumented
     @test :LoadForm ∉ undocumented
 
+    # The `Problem` constructors' docstring, which a comment block between it and its method detached as well. The
+    # struct's own docstring keeps `:Problem` out of `undocumented` either way, so the constructors' text is looked up.
+    texts = [join(doc.text) for doc in values(meta[Base.Docs.Binding(Unfitted, :Problem)].docs)]
+    @test any(t -> occursin("Three convenience constructors", t), texts)
+
     # The remaining gaps are known and structural, not detachments:
     #
     #   * `mass_form` / `mass_block` each carry one docstring covering their two siblings as well; a docstring attaches

@@ -367,13 +367,14 @@ Fields may live on **distinct** spaces: a coupled problem discretises each subdo
 mesh, own level-set fold, own dof block), and off-diagonal `block(uₐ, u_b, …)` / [`couple`](@ref) forms tie them
 together. Single-space problems are the common special case.
 """
-# The single-field shorthand attaches one form to both sides, so it attaches each side only where the form declares one.
-# `WeakForm` required both callbacks until it learned to take `nothing`, so on every form constructible before then both
-# branches are taken and this is a no-op; what it adds is the one-sided case, where a `nothing` would otherwise reach
-# the assembly loop and raise. The bilinear-only direction is the useful one: an operator with no load, driven entirely
-# by inhomogeneous Dirichlet data, which is Laplace with boundary data and which used to need a dead `linear = q -> 0.0`
-# to say so.
 function Problem(x::Union{Space,Field}, form; dirichlet=[])
+    # The single-field shorthand attaches one form to both sides, so it attaches each side only where the form declares
+    # one. `WeakForm` required both callbacks until it learned to take `nothing`, so on every form constructible before
+    # then both branches are taken and this is a no-op; what it adds is the one-sided case, whose missing side `block`
+    # or `loadform` would refuse. The bilinear-only direction is the useful one: an operator with no load, driven
+    # entirely by inhomogeneous Dirichlet data, which is Laplace with boundary data and which used to need a dead
+    # `linear = q -> 0.0` to say so. This comment sits in the body because, between the docstring and the method, it
+    # detached the docstring from the constructors.
     u = _as_field(x)
     blocks = form.bilinear === nothing ? () : (block(u, u, form),)
     loads = form.linear === nothing ? () : (loadform(u, form),)
