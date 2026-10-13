@@ -130,6 +130,15 @@ The method is described in
   introduces the loop, and
   [`examples/reproductions/adaptive_tanh_layer_2d/`](examples/reproductions/adaptive_tanh_layer_2d)
   is the measured protocol that threads `previous`.
+- **Post-processing**: `value` and `field_gradient` evaluate the superposed
+  solution at any point, `l2_error` measures it against an exact solution
+  over the model's own integration plan, and `boundary_integral` integrates
+  over a boundary portion or an interface. ParaView output is the `WriteVTK`
+  package extension (`using WriteVTK` alongside `Unfitted`): `write_vtk`
+  writes a solution with the meshes of its levels — cut cells refined toward
+  `∂Ω`, so a Clip on the `level_set` array draws the immersed boundary —
+  `vtk_series` collects such bundles into a time series, and
+  `write_quadrature_vtm` writes the quadrature-point cloud.
 - **D-generic core**: 1D, 2D, 3D, and 4D smoke-tested.
 
 ## Installation
@@ -141,7 +150,11 @@ import Pkg
 Pkg.add(url="https://github.com/schmaeke/Unfitted.jl")
 ```
 
-Julia 1.10 or newer is required.
+Julia 1.10 or newer is required. The optional integrations are package
+extensions and load with their package: add `WriteVTK` to your environment
+(`Pkg.add("WriteVTK")`) for ParaView output, as the quick example below
+uses, and `BasicBSpline`, `Tensors`, or `FileIO` + `MeshIO` for the features
+that name them above.
 
 ## Quick example
 
@@ -151,6 +164,7 @@ immersed — the mesh knows nothing about it — and is left free.
 
 ```julia
 using Unfitted
+using WriteVTK   # loads Unfitted's ParaView writer, a package extension
 
 # The background box. It is meshed regardless of the geometry, which is what
 # makes the method unfitted: cells may be inside Ω, outside it, or cut by ∂Ω.
@@ -186,7 +200,8 @@ model    = prepare(problem)
 solution = solve!(model)
 report   = diagnostics(model, solution)
 
-# A ParaView bundle: `plate.vtm` and its pieces. The field is sampled on a
+# A ParaView bundle: `plate.vtm` and its pieces, written by the WriteVTK
+# extension that `using WriteVTK` loaded. The field is sampled on a
 # subdivided grid, since a p = 2 basis is not linear across a cell. The mesh
 # itself is written as whole cells carrying an `active` flag — cut cells are
 # not clipped — so the hole reads as the 76 of 256 cells the fold dropped.
