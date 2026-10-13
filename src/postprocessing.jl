@@ -49,12 +49,17 @@ Keyword arguments:
     volume: in 3D the leaf count grows as `8ᵏ` under `subdivisions` but only as `4ᵏ` under `cut_depth`. See "Resolving
     the immersed boundary" below.
   - `point_data` — `NamedTuple` / `Dict` / `Tuple` of `name => callback` pairs. Each callback is invoked at every vertex
-    sample as `f(u, context, x, xi)` and returns a per-point scalar / vector / tuple value. `u(context, xi[, field])`
-    evaluates the current solution at the sample: the block's own field by default, or another `field` on the same
-    subdomain. A field on another subdomain of a coupled model raises an `ArgumentError`; evaluate it with
-    [`value`](@ref)`(solution, model, field, x)` instead. `x` is the physical coordinate and `xi.region` the same point
-    in the region's reference frame; `context.parents` lists the covering parents, each with the `parent_box` a callback
-    needs to map `x` into a cell's own frame. Defaults to a single `uh` entry that emits the current solution value.
+    sample as `f(u, context, x, xi)` and returns a real number, a tuple of real numbers or an `SVector` of real
+    numbers, of one shape at every sample. The values of one entry are promoted to a common element type, which must be
+    one VTK stores — `Float32`, `Float64` or an integer of at most 64 bits — and a two-component value is written as a
+    three-component VTK vector with a trailing zero. Any other value (a `Vector`, a matrix, a `String`, a `Complex`, a
+    `Rational`, or shapes that differ between samples) is refused with an `ArgumentError` naming the entry, and nothing
+    is written. `u(context, xi[, field])` evaluates the current solution at the sample: the block's own field by
+    default, or another `field` on the same subdomain. A field on another subdomain of a coupled model raises an
+    `ArgumentError`; evaluate it with [`value`](@ref)`(solution, model, field, x)` instead. `x` is the physical
+    coordinate and `xi.region` the same point in the region's reference frame; `context.parents` lists the covering
+    parents, each with the `parent_box` a callback needs to map `x` into a cell's own frame. Defaults to a single `uh`
+    entry that emits the current solution value.
   - `cell_data` — same shape as `point_data` but evaluated at per-cell sample points (the subbox center). Defaults to no
     user-defined cell data; the bundle always includes `region_id` and `cover_count` as built-in cell arrays.
   - `level_meshes` — emit one solid-cell `.vtu` per level when `true` (default), each cell carrying per-cell `active` /
@@ -485,8 +490,8 @@ function _partition_vtk_data(solution::Solution, model::Model{D,T}, ws::Assembly
         end
     end
 
-    point_arrays = _vtk_data_arrays(point_pairs, point_values)
-    cell_arrays = _vtk_data_arrays(cell_pairs, cell_values)
+    point_arrays = _vtk_data_arrays(point_pairs, point_values, :point_data)
+    cell_arrays = _vtk_data_arrays(cell_pairs, cell_values, :cell_data)
     return (; points, cells, point_arrays, cell_arrays, region_ids, cover_counts, level_set_values)
 end
 
@@ -542,42 +547,51 @@ function _vtk_sample(model::Model{D,T}, region_id::Int, region::VolumeRegion{D,T
 end
 
 # Pair each `name => callback` entry with a typed array of the values that callback returned, ready for `WriteVTK`
-# attachment. `values[i]` is the collected output of `pairs[i]`, in sample order.
-_vtk_data_arrays(pairs, values) = Pair{String,Any}[first(p) => _vtk_data_array(v) for (p, v) in zip(pairs, values)]
+# attachment. `values[i]` is the collected output of `pairs[i]`, in sample order; `kind` (`:point_data` / `:cell_data`)
+# and the entry's name only label a refusal.
+function _vtk_data_arrays(pairs, values, kind::Symbol)
+    return Pair{String,Any}[first(p) => _vtk_data_array(v, first(p), kind) for (p, v) in zip(pairs, values)]
+end
+
+# The element types a VTK data array can hold, as `WriteVTK` writes them: the machine floats and the integers of up to
+# 64 bits. `Bool` is none of them.
+const _VTK_NUMBERS = (Float32, Float64, Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64)
 
 # Coerce a `Vector{Any}` of callback returns to a typed array suitable for `WriteVTK`. Three accepted patterns:
 #
-#   * all-`Number` → `Vector{T}` with `T = promote_type(typeof.(v))`;
+#   * all-`Real` → `Vector{T}` with `T = promote_type(typeof.(v))`;
 #   * all-`SVector` of one length → `Vector{SVector{N,T}}` with `T` promoted over every entry, as for the numbers: the
 #     first entry's type alone would make an integer first sample refuse later fractional ones (`InexactError`) and a
 #     `Float32` first sample round every later `Float64` one;
 #   * all-`Tuple` of the same length → `Vector{SVector{N,T}}` with `N` inferred from the first element and `T` promoted
-#     from every component of every entry.
+#     from every component of every entry;
 #
-# Both vector patterns pass through `_vtk_vector_array`, so a 2-component result reaches ParaView as a VTK vector. The
-# fallback, SVectors of different lengths included, returns the input untouched, and `WriteVTK` then rejects the
-# `Vector{Any}` with
-# `data type not supported by VTK: Any` — an error that names the type but not the offending `name => callback` entry.
-function _vtk_data_array(values::Vector{Any})
+# each only when the promoted element type is one of `_VTK_NUMBERS`. Both vector patterns pass through
+# `_vtk_vector_array`, so a 2-component result reaches ParaView as a VTK vector. Anything else is refused here, naming
+# the entry, what it returned and what is accepted, rather than handed on: `WriteVTK` would reject it with
+# `data type not supported by VTK: Any` (or `…: Rational{Int64}`), which names neither the entry nor the remedy.
+function _vtk_data_array(values::Vector{Any}, name::AbstractString, kind::Symbol)
     isempty(values) && return Float64[]
     first_value = first(values)
 
-    if all(v -> v isa Number, values)
+    if all(v -> v isa Real, values)
         # Reduce the element types pairwise rather than splatting them into `promote_type`: a `Vector{Any}` of thousands
         # of samples would splat thousands of type arguments and overflow the stack, because variadic `promote_type`
         # recurses one level per argument.
         T = mapreduce(typeof, promote_type, values)
-        return T[values...]
+        T in _VTK_NUMBERS && return T[values...]
     elseif all(v -> v isa SVector, values)
         S = mapreduce(typeof, promote_type, values)
-        isconcretetype(S) && return _vtk_vector_array(S[convert(S, v) for v in values])
+        isconcretetype(S) && eltype(S) in _VTK_NUMBERS && return _vtk_vector_array(S[convert(S, v) for v in values])
     elseif first_value isa Tuple && all(v -> v isa Tuple && length(v) == length(first_value), values)
-        T = reduce(promote_type, (typeof(v[i]) for v in values for i in eachindex(first_value)))
+        T = reduce(promote_type, (typeof(v[i]) for v in values for i in eachindex(first_value)); init=Union{})
         S = SVector{length(first_value),T}
-        return _vtk_vector_array(S[S(v) for v in values])
+        T in _VTK_NUMBERS && return _vtk_vector_array(S[S(v) for v in values])
     end
 
-    return values
+    throw(ArgumentError("$kind entry \"$name\" returned $(join(unique(typeof(v) for v in values), ", ")): write_vtk " *
+                        "accepts a real number, a tuple of reals or an SVector of reals, of one shape at every " *
+                        "sample, with values promoting to Float32, Float64 or an integer of at most 64 bits"))
 end
 
 # Widen a two-component vector array to three components with a trailing zero. VTK gives a point/cell data array a

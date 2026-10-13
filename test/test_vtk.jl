@@ -816,3 +816,33 @@ end
         @test reshape(_vtu_floats(xml, "v"), 3, :) == reduce(hcat, [[e..., 0.0] for e in expected])
     end
 end
+
+@testset "an unsupported callback value is refused naming its entry" begin
+    # Each of these used to reach WriteVTK, which refused it as `data type not supported by VTK: Any` (or a
+    # `DimensionMismatch`), naming neither the entry nor what it accepts. The refusal now names both, and like every
+    # refusal it leaves nothing on disk.
+    (; model, sol) = _pin_2d
+    refused = [(:point_data, "vector", (u, c, x, xi) -> [x[1], x[2], 0.0]),          # a Vector, not an SVector
+               (:point_data, "matrix", (u, c, x, xi) -> SMatrix{2,2}(x[1], 0.0, 0.0, x[2])),
+               (:point_data, "text", (u, c, x, xi) -> "text"),
+               (:point_data, "complex", (u, c, x, xi) -> complex(x[1], x[2])),
+               (:point_data, "rational", (u, c, x, xi) -> 1 // 3),                     # real, but not a VTK type
+               (:cell_data, "shapes", (u, c, x, xi) -> c.region_id == 1 ? x[1] : (x[1], x[2])),
+               (:cell_data, "lengths", (u, c, x, xi) -> c.region_id == 1 ? SVector(x[1]) : SVector(x[1], x[2]))]
+    for (kind, name, f) in refused
+        dir = mktempdir()
+        entries = NamedTuple{(Symbol(name),)}((f,))
+        keywords = kind === :point_data ? (; point_data=entries) : (; cell_data=entries)
+        err = try
+            write_vtk(joinpath(dir, "x"), sol, model; subdivisions=:none, keywords...)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        message = err === nothing ? "" : sprint(showerror, err)
+        @test occursin("$kind entry \"$name\"", message)
+        @test occursin("a real number, a tuple of reals or an SVector of reals", message)
+        @test isempty(readdir(dir))
+    end
+end
