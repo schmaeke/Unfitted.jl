@@ -169,16 +169,18 @@ end
 # The pseudonormal sign is *exact* on a closed, coherently outward-oriented mesh and silently wrong on anything else — a
 # hole, a flipped cell or a globally reversed winding all yield a plausible-looking distance with the sign inverted over
 # part of space. The precondition is therefore checked, on the cells that survive the degeneracy filter because those
-# are the ones the sign field is built from. Two tests cover it:
+# are the ones the sign field is built from. Three tests cover it:
 #
 #   * every codimension-1 face is traversed once in each direction (the boundary of the cell chain vanishes). A hole
 #     leaves faces traversed once; a flipped cell leaves faces traversed twice the same way. The faces are paired
 #     through welded vertices, so a cell two of whose corners weld together is refused before they are: see
 #     `_check_watertight`.
+#   * no two cells stand on the same corners. Such a pair wound oppositely passes the face test while bounding
+#     nothing: see `_check_watertight`.
 #   * the enclosed volume is positive. Reversing *every* cell keeps the traversals cancelling, so only this test sees a
 #     globally inside-out mesh.
 #
-# Both are one pass over the cells, paid once when the level set is built.
+# Each is one pass over the cells, paid once when the level set is built.
 
 # Map every vertex of every cell to the index of the first vertex within `tol` of it. Cells do not share vertex indices
 # — a mesh read from an STL stores each facet's corners separately — so the face bookkeeping below needs the coincident
@@ -227,6 +229,16 @@ end
 # reads three of five outside points at distance 0.1 as inside. Only a cell that survives the degeneracy filter with an
 # edge shorter than the weld radius is refused here, and `:winding` answers a mesh that has one.
 #
+# Two cells on the same welded corners are refused as well. Wound oppositely — a sheet listed in both windings, or the
+# face two touching solids share when each is exported closed — they traverse each of their faces once in each
+# direction and enclose no volume, so the face and volume tests both pass. Their normals cancel in the pseudonormal,
+# though, and every point whose closest feature is the pair reads as outside: two unit boxes sharing the face x = 1
+# answer `+0.05` at (1.05, 0.5, 0.5), half a unit inside their union. The boundary of a solid never repeats a cell, so
+# no sound mesh is refused. The corners are compared as sorted tuples, so neither the order a cell lists them in nor
+# its winding matters. A shared face triangulated differently on its two sides, or two bodies that overlap, inverts the
+# sign in the same way without repeating a cell; telling them apart needs a self-intersection test, which this check
+# does not attempt, so `mesh_levelset`'s docstring states them as limits.
+#
 # The orientation test is ∮ x·n dA, which the divergence theorem makes `D` times the enclosed volume — positive outward,
 # negative inward, and only its sign is read. Each planar cell contributes `measure · (midpoint · n)` exactly, x·n being
 # affine over the cell and the midpoint its centroid.
@@ -239,6 +251,10 @@ function _check_watertight(cells, normals, scale)
     open_faces = _unpaired_faces(idcells)
     open_faces == 0 || throw(ArgumentError("mesh is not closed: $open_faces unpaired cell faces. Repair it, " *
                                            "or pass orientation=:winding"))
+    twins = length(idcells) - length(unique(sort, idcells))
+    twins == 0 || throw(ArgumentError("mesh has $twins cells on the same corners as another cell (a two-sided " *
+                                      "sheet, or a face shared by two solids), which bound no volume. Remove both " *
+                                      "copies, or pass orientation=:winding"))
     sum(Unfitted._simplex_measure(c) * dot(Unfitted._cell_midpoint(c), n) for (c, n) in zip(cells, normals)) > 0 ||
         throw(ArgumentError("mesh is inside-out (encloses a negative volume): reverse the cell " *
                             "winding, or pass orientation=:winding"))
@@ -368,7 +384,11 @@ checked to be closed (every cell face traversed once in each direction) and to e
 flipped facet or a reversed winding is rejected rather than answered with an inverted sign. Faces are paired through
 corners welded within 10⁻⁶ of the bounding-box diagonal (a binary STL stores each facet's corners separately, in
 `Float32`). At that scale the check cannot tell a sliver of a closed surface from a dangling one, so a cell with two
-corners that close is rejected too, even in an otherwise sound mesh.
+corners that close is rejected too, even in an otherwise sound mesh. So are two cells on the same welded corners — a
+sheet listed in both windings, or a face shared by two touching solids — which pass both checks while bounding nothing.
+The checks do not detect bodies that overlap, or that share a face triangulated differently on its two sides, nor a
+separate component wound inside-out beside a larger outward one. The default mode inverts the sign near such faces, so
+merge touching or overlapping bodies into the boundary of their union and orient every component outward.
 
 `orientation` selects the inside/outside test:
 

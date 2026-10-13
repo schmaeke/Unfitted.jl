@@ -282,6 +282,36 @@ end
     end
 end
 
+@testset "MeshIO ext — two cells on the same corners are refused, not answered" begin
+    # A pair of cells on the same corners, wound oppositely, traverses each of its faces once in each direction and
+    # encloses no volume, so it passes the closedness and volume tests; but its normals cancel in the pseudonormal,
+    # which then reads every point nearest the pair as outside. Accepted, each mesh below was answered so, over a
+    # region inside the solid.
+    v, f = _cube_mesh(0.2, 0.8)
+    # A triangle inside the cube listed in both windings: a two-sided sheet.
+    sheet = vcat(v, [SVector(0.4, 0.4, 0.5), SVector(0.6, 0.4, 0.5), SVector(0.5, 0.6, 0.5)])
+    @test_throws ArgumentError mesh_levelset(triangle_mesh(sheet, vcat(f, [(9, 10, 11), (9, 11, 10)])))
+    # 2D: a whisker segment inside the square, listed both ways.
+    sq = _square_poly(0.2, 0.8)
+    loop = [(sq[i], sq[mod1(i + 1, 4)]) for i in 1:4]
+    a, b = SVector(0.4, 0.5), SVector(0.6, 0.5)
+    @test_throws ArgumentError mesh_levelset(segment_mesh(vcat(loop, [(a, b), (b, a)])))
+
+    # Two unit boxes sharing the face x = 1, each closed and outward, as a multi-body export gives them: the second is
+    # the first mirrored in that plane, so the shared face is triangulated alike from both sides. `:winding` signs the
+    # point half a unit inside their union correctly, and without the shared face the default mode answers the union.
+    w, g = _cube_mesh(0.0, 1.0)
+    verts = vcat(w, [SVector(2 - p[1], p[2], p[3]) for p in w])
+    mirrored(faces) = [(i + 8, k + 8, j + 8) for (i, j, k) in faces]   # rewound, as the mirror reverses orientation
+    wall = triangle_mesh(verts, vcat(g, mirrored(g)))
+    @test_throws ArgumentError mesh_levelset(wall)
+    p = SVector(1.05, 0.5, 0.5)
+    @test Unfitted._leaves(mesh_levelset(wall; orientation=:winding))[1].f(p) < 0
+    outer = [t for t in g if !issubset(t, (2, 3, 6, 7))]   # every face of the two boxes but the shared one
+    joined = Unfitted._leaves(mesh_levelset(triangle_mesh(verts, vcat(outer, mirrored(outer)))))[1].f
+    @test joined(p) ≈ -0.5 atol = 1e-12
+end
+
 @testset "MeshIO ext — vertex welding absorbs an STL's Float32 corners" begin
     # The closedness check pairs cell faces through welded vertices, and an STL stores every facet's corners separately
     # in Float32: one corner reached through two facets can differ by an ulp. Such a mesh is sound, and welding tighter
