@@ -112,16 +112,13 @@ end
     @test length(load_only.problem.loads) == 1
 
     # A *direct* attachment on the side a form does not declare is still an error and not a silent zero — the `WeakForm`
-    # docstring says so, and this keeps it honest. Serial assembly so the `MethodError` arrives unwrapped rather than
-    # inside a `CompositeException` from a worker task.
+    # docstring says so, and this keeps it honest. It is refused where it is spelled, by `block` and `loadform`; it used
+    # to reach the assembly loop with an uncallable `nothing` and raise a `MethodError` there, inside a
+    # `CompositeException` from a worker task when threaded.
     u = field(:u, V)
-    wrong_block = prepare(Problem((u,); blocks=(block(u, u, linear_only),),
-                                  dirichlet=[dirichlet(0.0; on=boundary(:all))]))
-    @test_throws MethodError assemble!(wrong_block; threaded=false)
-
-    wrong_load = prepare(Problem((u,); blocks=(block(u, u, bilinear_only),), loads=(loadform(u, bilinear_only),),
-                                 dirichlet=[dirichlet(0.0; on=boundary(:all))]))
-    @test_throws MethodError assemble!(wrong_load; threaded=false)
+    @test_throws "block attaches a form's bilinear side, and this form has none" block(u, u, linear_only)
+    @test_throws "loadform attaches a form's linear side, and this form has none" loadform(u, bilinear_only)
+    @test_throws ArgumentError block(u, u, linear_only; on=boundary(:all))
 end
 
 @testset "2D scalar H1 assembly is symmetric positive definite" begin

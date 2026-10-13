@@ -40,9 +40,8 @@ contribution at all and raises `ArgumentError` — `symmetric` and `component_aw
 it.
 
 An absent side is *absent*, not zero: nothing substitutes a zero callback for it. Attach a one-sided form *directly*
-only on the side it declares — [`block`](@ref) reads `bilinear` and [`loadform`](@ref) reads `linear`, which makes that
-pairing the natural one, while the wrong pairing reaches the assembly loop with an uncallable `nothing` and raises a
-`MethodError` instead of contributing zero.
+only on the side it declares — [`block`](@ref) reads `bilinear` and [`loadform`](@ref) reads `linear`, and each raises
+`ArgumentError` for a form that lacks the side it reads instead of contributing zero.
 
 The single-field `Problem(V, form)` / `Problem(u, form)` constructors attach both sides of one form, and read the
 declaration to decide which: a one-sided form there yields a problem carrying that side alone. A bilinear-only form is
@@ -292,7 +291,8 @@ end
 
 Wrap `form` as the bilinear contribution from `trial_field` (columns) to `test_field` (rows) inside a multi-field
 [`Problem`](@ref). When `on` is a [`BoundarySelector`](@ref), the contribution integrates over that facet of `∂Ω`
-instead of the volume — the user-supplied form receives `q.normal` and `q.sides` on every quadrature point.
+instead of the volume — the user-supplied form receives `q.normal` and `q.sides` on every quadrature point. A form
+without a `bilinear` side raises `ArgumentError` (see [`WeakForm`](@ref)).
 
 A block carries `form.bilinear` and nothing else. A [`WeakForm`](@ref) that also declares a `linear` part contributes
 nothing to the right-hand side through `block`: assembly reads the load side only from the [`LoadForm`](@ref)s in a
@@ -304,15 +304,27 @@ The single-field `Problem(V, form)` / `Problem(u, form)` constructors do attach 
 That is why the habit the convenience path teaches does not carry over here: on the multi-field path the two sides are
 two separate attachments.
 """
-block(test_field::Field, trial_field::Field, form; on=nothing) = BlockForm(test_field.name, trial_field.name, form, on)
+function block(test_field::Field, trial_field::Field, form; on=nothing)
+    # A side the form lacks used to reach the assembly loop as an uncallable `nothing` and raise a `MethodError` there,
+    # inside a `TaskFailedException` when threaded; the attachment is where the mistake is spelled, so it is refused
+    # here, and in `loadform` likewise.
+    form.bilinear === nothing && throw(ArgumentError("block attaches a form's bilinear side, and this form has " *
+                                                     "none; attach a linear-only form with loadform"))
+    return BlockForm(test_field.name, trial_field.name, form, on)
+end
 
 """
     loadform(test_field::Field, form; on=nothing) -> LoadForm
 
 Wrap `form` as the linear (rhs) contribution to the rows of `test_field` inside a multi-field [`Problem`](@ref). When
-`on` is a [`BoundarySelector`](@ref), the contribution integrates over that facet of `∂Ω` instead of the volume.
+`on` is a [`BoundarySelector`](@ref), the contribution integrates over that facet of `∂Ω` instead of the volume. A form
+without a `linear` side raises `ArgumentError` (see [`WeakForm`](@ref)).
 """
-loadform(test_field::Field, form; on=nothing) = LoadForm(test_field.name, form, on)
+function loadform(test_field::Field, form; on=nothing)
+    form.linear === nothing && throw(ArgumentError("loadform attaches a form's linear side, and this form has " *
+                                                   "none; attach a bilinear-only form with block"))
+    return LoadForm(test_field.name, form, on)
+end
 
 """
     Problem{D,T,S,FS,B,L}
