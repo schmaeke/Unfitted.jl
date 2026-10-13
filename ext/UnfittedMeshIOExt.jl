@@ -234,10 +234,12 @@ end
 # direction and enclose no volume, so the face and volume tests both pass. Their normals cancel in the pseudonormal,
 # though, and every point whose closest feature is the pair reads as outside: two unit boxes sharing the face x = 1
 # answer `+0.05` at (1.05, 0.5, 0.5), half a unit inside their union. The boundary of a solid never repeats a cell, so
-# no sound mesh is refused. The corners are compared as sorted tuples, so neither the order a cell lists them in nor
-# its winding matters. A shared face triangulated differently on its two sides, or two bodies that overlap, inverts the
-# sign in the same way without repeating a cell; telling them apart needs a self-intersection test, which this check
-# does not attempt, so `mesh_levelset`'s docstring states them as limits.
+# no sound mesh is refused. The corners are compared sorted, so neither the order a cell lists them in nor its winding
+# matters. They are sorted as a `Vector` (`sort ∘ collect`), because Julia 1.10, the oldest release the package
+# supports, has no `sort` of a tuple; the composition is Base's, so the check compiles no function of this module's own.
+# A shared face triangulated differently on its two sides, or two bodies that overlap, inverts the sign in the same way
+# without repeating a cell; telling them apart needs a self-intersection test, which this check does not attempt, so
+# `mesh_levelset`'s docstring states them as limits.
 #
 # The orientation test is ∮ x·n dA, which the divergence theorem makes `D` times the enclosed volume — positive outward,
 # negative inward, and only its sign is read. Each planar cell contributes `measure · (midpoint · n)` exactly, x·n being
@@ -251,7 +253,7 @@ function _check_watertight(cells, normals, scale)
     open_faces = _unpaired_faces(idcells)
     open_faces == 0 || throw(ArgumentError("mesh is not closed: $open_faces unpaired cell faces. Repair it, " *
                                            "or pass orientation=:winding"))
-    twins = length(idcells) - length(unique(sort, idcells))
+    twins = length(idcells) - length(unique(sort ∘ collect, idcells))
     twins == 0 || throw(ArgumentError("mesh has $twins cells on the same corners as another cell (a two-sided " *
                                       "sheet, or a face shared by two solids), which bound no volume. Remove both " *
                                       "copies, or pass orientation=:winding"))
