@@ -78,6 +78,17 @@ end
 # Number of cells of a record: its points come in blocks of 2ᴷ.
 _cell_count(g::SampleGrid{D,T,K}) where {D,T,K} = length(g.points) >> K
 
+# Store the corners of `b` (`_box_corners`) as the points of cell `c` of a grid of `D`-cubes: points
+# `(c − 1)·2ᴰ + 1 : c·2ᴰ`. The one writer of a grid's points, for the sample cells and the level meshes alike. It
+# fills a presized vector: collecting the corners through a nested generator instead compiles Base's collection of an
+# iterator of unknown length for every grid type, and grows the vector as it goes.
+function _put_corners!(points::Vector{SVector{D,T}}, c::Int, b::AxisBox{D,T}) where {D,T}
+    for (j, x) in enumerate(_box_corners(b))
+        points[((c - 1) << D)+j] = x
+    end
+    return points
+end
+
 # The 2ᴰ corners of `b` in face-cyclic order: the lower face counterclockwise, then the upper face the same way — the
 # order of VTK's line, quad and hexahedron and of a GeometryBasics `QuadFace`, so a consumer reads a cell's points as a
 # closed polygon or a hexahedron without permuting them. It is a fixed permutation of `_box_vertices`, whose axis-1
@@ -239,121 +250,7 @@ function _sample_field(ws, state::FormState, space::Space{D,T}, regions::Vector{
     return SampleGrid{D,T,D}(points, point_data, cell_data)
 end
 
-# `φ` at every point, in the space's number type. A barrier: the space's `PhysicalDomain` is abstractly typed, so one
-# dynamic call here makes the loop concrete, where a `levelset_value` call per point would dispatch dynamically.
-_levelset_values(physical::PhysicalDomain, points, ::Type{T}) where {T} = T[levelset_value(physical, x) for x in points]
-
-# Store the corners of `b` (`_box_corners`) as the points of cell `c` of a grid of `D`-cubes: points
-# `(c − 1)·2ᴰ + 1 : c·2ᴰ`. The one writer of a grid's points, for the sample cells and the level meshes alike. It
-# fills a presized vector: collecting the corners through a nested generator instead compiles Base's collection of an
-# iterator of unknown length for every grid type, and grows the vector as it goes.
-function _put_corners!(points::Vector{SVector{D,T}}, c::Int, b::AxisBox{D,T}) where {D,T}
-    for (j, x) in enumerate(_box_corners(b))
-        points[((c - 1) << D)+j] = x
-    end
-    return points
-end
-
-# The `u(context, xi[, field])` a callback receives: the current solution at the callback's sample, through the
-# assembly's own field evaluation — the one `q.state` and the quadrature-point walker read. A region's dof values are
-# read into the shared `state` once (`_frame!`, `_state_region!`); each call then evaluates the basis at the sample
-# (`_refresh!`, values only) and every field there (`_state_point!`), and reads one field off `state`: a scalar for a
-# one-component field, an `SVector` over its components otherwise, the count read off the `Field`'s type so the result
-# is inferable. That count is checked against the model's (`_checked_field_index`), as `value` checks it: read with
-# another count, a `Field` that shares a model field's name would truncate that field or run on into the next field's
-# values in `state`.
-#
-# Framing is lazy and keyed on `context.region_id`: a region is framed by the first call that reads it and again only
-# after a call has read another region. The samples of an entry come region by region, so an entry that calls `u` frames
-# each region once, and a write whose callbacks never call `u` frames nothing. It is also why `u` takes the context of
-# the sample at hand: a context kept from another sample reads that sample's region.
-#
-# `default` is the field of the record being sampled. A callback may name another `field`, but only one on the same
-# subdomain: the region's parents are that subdomain's cells, so another subdomain's field owns none of them in the
-# frame (`ws.fptr`) and has no value there, and asking for one raises. To read a field on a *different* subdomain,
-# call `value(solution, model, other, x)` with the sample coordinate `x` the callback also receives.
-function _sample_accessor(ws, state::FormState, regions, default::Field)
-    framed = Ref(0)
-    return function (context, xi, field::Field=default)
-        region = regions[context.region_id]
-        if context.region_id != framed[]
-            _state_region!(state, _frame!(ws, region))
-            framed[] = context.region_id
-        end
-        f = _checked_field_index(state.layout, field)
-        (ws.fptr[f] < ws.fptr[f+1] || isempty(region.parents)) ||
-            throw(ArgumentError("u(context, xi, field) reads only fields of the sampled field's own subdomain; " *
-                                "evaluate $(field.name) with value(solution, model, $(field.name), x)"))
-        _refresh!(ws, region, xi.region, Val(false))
-        _state_point!(state, ws, Val(false))
-        offset, C = state.offsets[f], component_count(field)
-        return C == 1 ? state.values[offset+1] : SVector(ntuple(c -> state.values[offset+c], Val(C)))
-    end
-end
-
-# The `(context, x, xi)` a callback receives at sample `k` of the walk `s`: point `k` of the grid, which lies in cell
-# `(k − 1) >> D + 1` (`s.shift = D`), or the center of cell `k` (`s.shift = 0`). `context` names the kind of sample, its
-# region by index and by box, the emitted cell, the region's covering parents and the model's pin; `xi.region` is `x` in
-# the region's reference frame, where the accessor evaluates the solution.
-function _callback_args(s, k::Int)
-    c = ((k - 1) >> s.shift) + 1
-    r, box = s.region_ids[c], s.boxes[c]
-    region, x = s.regions[r], s.shift == 0 ? center(box) : s.points[k]
-    region_box = _region_box(region)
-    context = (; s.location, region_id=r, region=region_box, cell=box, region.parents, model_version=s.version)
-    return context, x, (; region=physical_to_reference(region_box, x))
-end
-
-# One user entry's array over a walk: the callback at every sample, each value checked as it comes (`_sample_value`),
-# collected into the narrowest array that holds them. A function barrier — the one dynamic call per entry — so the loop
-# runs on the callback's and the accessor's concrete types. The array takes the first value's type, which is every
-# value's type for the callbacks one writes, and is then kept as it is; a value of another type hands the walk to
-# `_promoted_values`, which promotes over every sample or refuses naming the entry. An empty walk gives an empty
-# `Float64` array.
-#
-# An explicit loop, not `map`: Base's `collect` widens its element type as it goes, which compiles its collection
-# machinery anew for every callback type. Here, when the callback's value type is concrete, the type test folds to true
-# and the hand-over is never compiled.
-function _sample_array(kind::Symbol, name::String, f::F, u::U, s) where {F,U}
-    n = length(s.boxes) << s.shift
-    n == 0 && return Float64[]
-    sample(k) = _sample_value(kind, name, f(u, _callback_args(s, k)...))
-    first_value = sample(1)
-    values = Vector{typeof(first_value)}(undef, n)
-    values[1] = first_value
-    for k in 2:n
-        v = sample(k)
-        # The samples so far, this one and the rest, each callback still called once per sample and in order.
-        v isa eltype(values) ||
-            return _promoted_values(kind, name, Any[j < k ? values[j] : j == k ? v : sample(j) for j in 1:n])
-        values[k] = v
-    end
-    return values
-end
-
-# The array of an entry whose values differ in type between samples: mixed number types (an `Int` at some samples, a
-# `Float64` at others) and `SVector`s of mixed element types are promoted over every sample with `promote_type`, and
-# anything else — shapes that differ between samples — is refused, naming the entry and the types it returned. Typed
-# on the untyped value list, so it compiles once whatever the callback.
-function _promoted_values(kind::Symbol, name::String, values::Vector{Any})
-    S = mapreduce(typeof, promote_type, values)
-    isconcretetype(S) && (S <: Real || S <: SVector && eltype(S) <: Real) && return convert(Vector{S}, values)
-    throw(ArgumentError("$kind entry \"$name\" returned $(join(unique(typeof.(values)), ", ")): a callback value " *
-                        "must be a real number, a tuple of reals or an SVector of reals, of one shape at every sample"))
-end
-
-# One callback value, checked and normalised: a real number is kept as it is; a tuple or an `SVector` of reals becomes
-# an `SVector` with its components promoted to one type, so a tuple and the `SVector` of the same numbers give the same
-# array. Anything else — a `Vector`, a matrix, a `String`, a `Complex`, `nothing` — is refused, naming the entry and
-# what it returned, before anything is written.
-function _sample_value(kind::Symbol, name::String, v)
-    v isa Real && return v
-    v isa Union{Tuple,SVector} && all(x -> x isa Real, v) && return SVector(v...)
-    throw(ArgumentError("$kind entry \"$name\" returned a $(typeof(v)): a callback value must be a real number, a " *
-                        "tuple of reals or an SVector of reals, of one shape at every sample"))
-end
-
-# ── Cut-cell refinement ───────────────────────────────────────────────────────
+# ── Sample cells and cut-cell refinement ──────────────────────────────────────
 #
 # ParaView's Clip reconstructs ∂Ω from the `level_set` point array by linear interpolation along each cell's edges, so
 # the cut surface it draws is a facetisation at the size of the emitted cell and at nothing else — neither φ's own
@@ -450,6 +347,111 @@ function _cut_marked(physical::PhysicalDomain, b::AxisBox, lipschitz::Float64)
     inside = φ(first(corners)) <= 0
     return any(x -> (φ(x) <= 0) != inside, Base.tail(corners))
 end
+
+# ── Sample arrays ─────────────────────────────────────────────────────────────
+
+# The `u(context, xi[, field])` a callback receives: the current solution at the callback's sample, through the
+# assembly's own field evaluation — the one `q.state` and the quadrature-point walker read. A region's dof values are
+# read into the shared `state` once (`_frame!`, `_state_region!`); each call then evaluates the basis at the sample
+# (`_refresh!`, values only) and every field there (`_state_point!`), and reads one field off `state`: a scalar for a
+# one-component field, an `SVector` over its components otherwise, the count read off the `Field`'s type so the result
+# is inferable. That count is checked against the model's (`_checked_field_index`), as `value` checks it: read with
+# another count, a `Field` that shares a model field's name would truncate that field or run on into the next field's
+# values in `state`.
+#
+# Framing is lazy and keyed on `context.region_id`: a region is framed by the first call that reads it and again only
+# after a call has read another region. The samples of an entry come region by region, so an entry that calls `u` frames
+# each region once, and a write whose callbacks never call `u` frames nothing. It is also why `u` takes the context of
+# the sample at hand: a context kept from another sample reads that sample's region.
+#
+# `default` is the field of the record being sampled. A callback may name another `field`, but only one on the same
+# subdomain: the region's parents are that subdomain's cells, so another subdomain's field owns none of them in the
+# frame (`ws.fptr`) and has no value there, and asking for one raises. To read a field on a *different* subdomain,
+# call `value(solution, model, other, x)` with the sample coordinate `x` the callback also receives.
+function _sample_accessor(ws, state::FormState, regions, default::Field)
+    framed = Ref(0)
+    return function (context, xi, field::Field=default)
+        region = regions[context.region_id]
+        if context.region_id != framed[]
+            _state_region!(state, _frame!(ws, region))
+            framed[] = context.region_id
+        end
+        f = _checked_field_index(state.layout, field)
+        (ws.fptr[f] < ws.fptr[f+1] || isempty(region.parents)) ||
+            throw(ArgumentError("u(context, xi, field) reads only fields of the sampled field's own subdomain; " *
+                                "evaluate $(field.name) with value(solution, model, $(field.name), x)"))
+        _refresh!(ws, region, xi.region, Val(false))
+        _state_point!(state, ws, Val(false))
+        offset, C = state.offsets[f], component_count(field)
+        return C == 1 ? state.values[offset+1] : SVector(ntuple(c -> state.values[offset+c], Val(C)))
+    end
+end
+
+# One user entry's array over a walk: the callback at every sample, each value checked as it comes (`_sample_value`),
+# collected into the narrowest array that holds them. A function barrier — the one dynamic call per entry — so the loop
+# runs on the callback's and the accessor's concrete types. The array takes the first value's type, which is every
+# value's type for the callbacks one writes, and is then kept as it is; a value of another type hands the walk to
+# `_promoted_values`, which promotes over every sample or refuses naming the entry. An empty walk gives an empty
+# `Float64` array.
+#
+# An explicit loop, not `map`: Base's `collect` widens its element type as it goes, which compiles its collection
+# machinery anew for every callback type. Here, when the callback's value type is concrete, the type test folds to true
+# and the hand-over is never compiled.
+function _sample_array(kind::Symbol, name::String, f::F, u::U, s) where {F,U}
+    n = length(s.boxes) << s.shift
+    n == 0 && return Float64[]
+    sample(k) = _sample_value(kind, name, f(u, _callback_args(s, k)...))
+    first_value = sample(1)
+    values = Vector{typeof(first_value)}(undef, n)
+    values[1] = first_value
+    for k in 2:n
+        v = sample(k)
+        # The samples so far, this one and the rest, each callback still called once per sample and in order.
+        v isa eltype(values) ||
+            return _promoted_values(kind, name, Any[j < k ? values[j] : j == k ? v : sample(j) for j in 1:n])
+        values[k] = v
+    end
+    return values
+end
+
+# The `(context, x, xi)` a callback receives at sample `k` of the walk `s`: point `k` of the grid, which lies in cell
+# `(k − 1) >> D + 1` (`s.shift = D`), or the center of cell `k` (`s.shift = 0`). `context` names the kind of sample, its
+# region by index and by box, the emitted cell, the region's covering parents and the model's pin; `xi.region` is `x` in
+# the region's reference frame, where the accessor evaluates the solution.
+function _callback_args(s, k::Int)
+    c = ((k - 1) >> s.shift) + 1
+    r, box = s.region_ids[c], s.boxes[c]
+    region, x = s.regions[r], s.shift == 0 ? center(box) : s.points[k]
+    region_box = _region_box(region)
+    context = (; s.location, region_id=r, region=region_box, cell=box, region.parents, model_version=s.version)
+    return context, x, (; region=physical_to_reference(region_box, x))
+end
+
+# One callback value, checked and normalised: a real number is kept as it is; a tuple or an `SVector` of reals becomes
+# an `SVector` with its components promoted to one type, so a tuple and the `SVector` of the same numbers give the same
+# array. Anything else — a `Vector`, a matrix, a `String`, a `Complex`, `nothing` — is refused, naming the entry and
+# what it returned, before anything is written.
+function _sample_value(kind::Symbol, name::String, v)
+    v isa Real && return v
+    v isa Union{Tuple,SVector} && all(x -> x isa Real, v) && return SVector(v...)
+    throw(ArgumentError("$kind entry \"$name\" returned a $(typeof(v)): a callback value must be a real number, a " *
+                        "tuple of reals or an SVector of reals, of one shape at every sample"))
+end
+
+# The array of an entry whose values differ in type between samples: mixed number types (an `Int` at some samples, a
+# `Float64` at others) and `SVector`s of mixed element types are promoted over every sample with `promote_type`, and
+# anything else — shapes that differ between samples — is refused, naming the entry and the types it returned. Typed
+# on the untyped value list, so it compiles once whatever the callback.
+function _promoted_values(kind::Symbol, name::String, values::Vector{Any})
+    S = mapreduce(typeof, promote_type, values)
+    isconcretetype(S) && (S <: Real || S <: SVector && eltype(S) <: Real) && return convert(Vector{S}, values)
+    throw(ArgumentError("$kind entry \"$name\" returned $(join(unique(typeof.(values)), ", ")): a callback value " *
+                        "must be a real number, a tuple of reals or an SVector of reals, of one shape at every sample"))
+end
+
+# `φ` at every point, in the space's number type. A barrier: the space's `PhysicalDomain` is abstractly typed, so one
+# dynamic call here makes the loop concrete, where a `levelset_value` call per point would dispatch dynamically.
+_levelset_values(physical::PhysicalDomain, points, ::Type{T}) where {T} = T[levelset_value(physical, x) for x in points]
 
 # ── Level meshes ──────────────────────────────────────────────────────────────
 
@@ -584,6 +586,13 @@ function field_gradient(solution::Solution, model::Model{D}, u::Field, x::PointL
     return _field_quantity(solution, model, u, x, component, Val(true))
 end
 
+# Pick the implicit field of a single-field model. Multi-field models require an explicit field argument so the caller
+# does not silently evaluate the wrong field; this raises with a clear message in that case.
+function _default_field(model::Model)
+    length(model.problem.fields) == 1 ? first(model.problem.fields) :
+    throw(ArgumentError("field argument is required for multi-field models"))
+end
+
 # The one body of `value` (`G = false`) and `field_gradient` (`G = true`). The checks run in a fixed order — the
 # solution's pin and length, the point's conversion to the model's number type, the field's space, the point inside
 # that space's box, the field's component count, the component's range — so a call wrong in two ways always names the
@@ -626,13 +635,6 @@ function _checked_field_index(layout::SystemLayout, u::Field)
     components == component_count(u) ||
         throw(ArgumentError("field $(u.name) has $components components in this model, not $(component_count(u))"))
     return f
-end
-
-# Pick the implicit field of a single-field model. Multi-field models require an explicit field argument so the caller
-# does not silently evaluate the wrong field; this raises with a clear message in that case.
-function _default_field(model::Model)
-    length(model.problem.fields) == 1 ? first(model.problem.fields) :
-    throw(ArgumentError("field argument is required for multi-field models"))
 end
 
 # One level's contribution to the field of `layout` at physical point `x`, for each of `components` (an `Int` gives one
