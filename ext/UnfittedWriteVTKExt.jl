@@ -50,14 +50,12 @@ end
 # (`_sample_fields`, `_sample_quadrature`), checking every keyword and callback value, builds the whole multiblock in
 # memory, and only then makes the output directory and writes the files.
 
-function Unfitted.write_vtk(path::AbstractString, solution::Solution, model::Model{D}; ascii::Bool=false,
-                            append::Bool=true, compress=true, kwargs...) where {D}
-    _check_vtk_dimension(Val(D))
+function Unfitted.write_vtk(path::AbstractString, solution::Solution, model::Model; kwargs...)
     base = _vtk_base_path(path)
     # Everything is sampled, every keyword and callback value checked, before a file is opened: a call refused or a
     # callback that throws leaves nothing. Not WriteVTK's do-block form either, which saves the multiblock in a
     # `finally`; the datasets stay in memory until `vtk_save`, and the output directory is made just before it.
-    vtm = _vtk_multiblock(base, _sample_fields(solution, model; kwargs...); ascii, append, compress)
+    vtm = _vtk_multiblock(base, solution, model; kwargs...)
     mkpath(dirname(base))
     return vtk_save(vtm)
 end
@@ -70,17 +68,15 @@ function Unfitted.vtk_series(path::AbstractString; frames=nothing)
     return Series(paraview_collection(base * ".pvd"), directory, Ref(0))
 end
 
-function Unfitted.write_vtk(series::Series, time::Real, solution::Solution, model::Model{D}; ascii::Bool=false,
-                            append::Bool=true, compress=true, kwargs...) where {D}
+function Unfitted.write_vtk(series::Series, time::Real, solution::Solution, model::Model; kwargs...)
     # `close` has written the collection file and freed its XML document. Without this check the frame would be sampled
     # in full and then fail inside the XML library (`XMLNoRootError`) when the collection is asked to record it.
     isopen(series.collection) ||
         throw(ArgumentError("cannot write a frame to a closed series: close(series) already wrote its collection"))
-    _check_vtk_dimension(Val(D))
     n = series.count[] + 1
     base = joinpath(series.frames, "frame_" * lpad(n, 4, '0'))
-    # The serialiser of a single bundle, so a frame is byte for byte what `write_vtk(path, …)` writes.
-    vtm = _vtk_multiblock(base, _sample_fields(solution, model; kwargs...); ascii, append, compress)
+    # The builder of a single bundle, so a frame is byte for byte what `write_vtk(path, …)` writes.
+    vtm = _vtk_multiblock(base, solution, model; kwargs...)
     # Hands the *open* multiblock over: the collection closes it — which is what writes the frame's files — and records
     # its path, relative to the `.pvd`, against `time`. The counter advances only once that has succeeded, so a rejected
     # frame does not burn a frame number; and, as for a single bundle, the directory is made only now, so it writes
@@ -112,19 +108,24 @@ end
 
 # ── VTK serialisation ─────────────────────────────────────────────────────────
 
-# The multiblock of one bundle, built from the sampled records and still open: nothing is on disk until the caller
-# saves it, or hands it to a series' collection, which saves it. One field block per record, named after its field and
-# holding that field's data grid and the level meshes the record carries as sibling leaf datasets, so a coupled field
-# is a self-contained, independently toggled unit in ParaView: `<field> → { data, level_… }`.
+# The multiblock of one bundle rooted at `base`, sampled and built and still open: nothing is on disk until the caller
+# saves it, or hands it to a series' collection, which saves it. The one keyword surface of both `write_vtk` methods:
+# it takes `ascii`, `append` and `compress` for `vtk_grid` and passes every other keyword to `_sample_fields`, after the
+# dimension check, so a bundle and a series frame are refused, sampled and serialised alike.
 #
-# The children of a field block are all leaves — never a mix of a leaf and a sub-block, which breaks ParaView's
-# Extract-Block resolution — and every leaf's disambiguating name part is ASCII. ParaView derives its data-assembly
-# node names from the dataset names and keeps only ASCII identifier characters, so a Unicode field name (`θ₁`, `θ₂`), or
-# a name disambiguated only by Unicode digits, collapses to one node and the blocks become indistinguishable. The data
-# leaf is keyed by the ASCII record index (`data_<i>`, plain `data` when there is one record), NOT by the field name,
-# and the meshes by the ASCII level id (`level_<id>_<role>`). The field name is still the block label, where a Unicode
-# collision is harmless: the user extracts leaves.
-function _vtk_multiblock(base::AbstractString, records; ascii, append, compress)
+# One field block per record, named after its field and holding that field's data grid and the level meshes the record
+# carries as sibling leaf datasets, so a coupled field is a self-contained, independently toggled unit in ParaView:
+# `<field> → { data, level_… }`. The children of a field block are all leaves — never a mix of a leaf and a sub-block,
+# which breaks ParaView's Extract-Block resolution — and every leaf's disambiguating name part is ASCII. ParaView
+# derives its data-assembly node names from the dataset names and keeps only ASCII identifier characters, so a Unicode
+# field name (`θ₁`, `θ₂`), or a name disambiguated only by Unicode digits, collapses to one node and the blocks become
+# indistinguishable. The data leaf is keyed by the ASCII record index (`data_<i>`, plain `data` when there is one
+# record), NOT by the field name, and the meshes by the ASCII level id (`level_<id>_<role>`). The field name is still
+# the block label, where a Unicode collision is harmless: the user extracts leaves.
+function _vtk_multiblock(base::AbstractString, solution::Solution, model::Model{D}; ascii::Bool=false,
+                         append::Bool=true, compress=true, kwargs...) where {D}
+    _check_vtk_dimension(Val(D))
+    records = _sample_fields(solution, model; kwargs...)
     vtm = vtk_multiblock(base * ".vtm")
     for (i, record) in enumerate(records)
         block = multiblock_add_block(vtm, string(record.field.name))
@@ -197,9 +198,11 @@ end
 #   * `Bool` is written as `UInt8` 0 / 1, which keeps a flag or a mask readable in ParaView;
 #   * an element type VTK has no type for (a `Rational`, a `BigFloat`, an `Int128`) is refused, naming the entry —
 #     WriteVTK would refuse it as `data type not supported by VTK`, naming neither the entry nor the remedy.
+#
+# `R` is the element type written: the array's own, or `UInt8` for `Bool`.
 function _vtk_array(array::AbstractVector{V}, name::AbstractString, kind::Symbol) where {V}
-    R = _vtk_number(eltype(V))
-    R === nothing &&
+    R = eltype(V) === Bool ? UInt8 : eltype(V)
+    R in _VTK_NUMBERS ||
         throw(ArgumentError("$kind entry \"$name\" returned $(eltype(V)) values, which VTK cannot store: " *
                             "write_vtk accepts a real number, a tuple of reals or an SVector of " *
                             "reals, with values promoting to Float32, Float64, Bool or an integer of " *
@@ -212,11 +215,6 @@ end
 # The element types a VTK data array can hold, as `WriteVTK` writes them: the machine floats and the integers of up to
 # 64 bits.
 const _VTK_NUMBERS = (Float32, Float64, Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64)
-
-# The element type a record array is written in, given the type `T` its values promote to: `T` itself when VTK stores
-# it, `UInt8` for `Bool` — VTK has no boolean type and `WriteVTK` refuses one, while 0 / 1 in a byte keeps a flag or a
-# mask readable in ParaView — and `nothing` for any other type, which `_vtk_array` refuses.
-_vtk_number(T::Type) = T === Bool ? UInt8 : T in _VTK_NUMBERS ? T : nothing
 
 # Strip a `.vtm` / `.vtu` / `.vtp` / `.pvd` extension from `path` so callers can pass either `"out"` or `"out.vtm"`
 # interchangeably. Every file name the writers hand to `WriteVTK` then carries its own extension again: given a name
