@@ -186,10 +186,10 @@ end
 #     leaves faces traversed once; a flipped cell leaves faces traversed twice the same way. The faces are paired
 #     through welded vertices, so a cell two of whose corners weld together is refused before they are: see
 #     `_check_watertight`.
-#   * no two cells stand on the same corners. Such a pair wound oppositely passes the face test while bounding
-#     nothing: see `_check_watertight`.
 #   * the enclosed volume is positive. Reversing *every* cell keeps the traversals cancelling, so only this test sees a
 #     globally inside-out mesh.
+#   * no two cells stand on the same corners. Such a pair wound oppositely passes both tests above while bounding
+#     nothing: see `_check_watertight`.
 #
 # Each is one pass over the cells, paid once when the level set is built.
 
@@ -240,23 +240,25 @@ end
 # reads three of five outside points at distance 0.1 as inside. Only a cell that survives the degeneracy filter with an
 # edge shorter than the weld radius is refused here, and `:winding` answers a mesh that has one.
 #
-# Two cells on the same welded corners are refused as well. Wound oppositely — a sheet listed in both windings, or the
+# The orientation test is ∮ x·n dA, which the divergence theorem makes `D` times the enclosed volume — positive outward,
+# negative inward, and only its sign is read. Each planar cell contributes `measure · (midpoint · n)` exactly, x·n being
+# affine over the cell and the midpoint its centroid.
+#
+# Two cells on the same welded corners are refused last. Wound oppositely — a sheet listed in both windings, or the
 # face two touching solids share when each is exported closed — they traverse each of their faces once in each
 # direction and enclose no volume, so the face and volume tests both pass. Their normals cancel in the pseudonormal,
 # though, and every point whose closest feature is the pair reads as outside: two unit boxes sharing the face x = 1
 # answer `+0.05` at (1.05, 0.5, 0.5), half a unit inside their union. The boundary of a solid never repeats a cell, so
-# no sound mesh is refused. The corners are compared sorted, so neither the order a cell lists them in nor its winding
-# matters. They are sorted as a StaticArrays `SVector` and turned back into a tuple (`Tuple ∘ sort ∘ SVector`): Julia
-# 1.10, the oldest release the package supports, has no `sort` of a tuple, and sorting a `Vector` instead allocates on
-# the heap for every cell, where StaticArrays' `sort` of an `SVector` allocates nothing. The composition is Base's and
-# StaticArrays', so the check compiles no function of this module's own.
+# no sound mesh is refused; and as the test runs after the volume test, a mesh that is inside-out as well is refused as
+# inside-out, as it was before this test existed. The corners are compared sorted, so neither the order a cell lists
+# them in nor its winding matters. They are sorted as a StaticArrays `SVector` and turned back into a tuple
+# (`Tuple ∘ sort ∘ SVector`): Julia 1.10, the oldest release the package supports, has no `sort` of a tuple, and sorting
+# a `Vector` instead allocates on the heap for every cell, where StaticArrays' `sort` of an `SVector` allocates nothing.
+# The composition is Base's and StaticArrays', so the check compiles no function of this module's own.
+#
 # A shared face triangulated differently on its two sides, or two bodies that overlap, inverts the sign in the same way
 # without repeating a cell; telling them apart needs a self-intersection test, which this check does not attempt, so
 # `mesh_levelset`'s docstring states them as limits.
-#
-# The orientation test is ∮ x·n dA, which the divergence theorem makes `D` times the enclosed volume — positive outward,
-# negative inward, and only its sign is read. Each planar cell contributes `measure · (midpoint · n)` exactly, x·n being
-# affine over the cell and the midpoint its centroid.
 function _check_watertight(cells, normals, scale)
     idcells = _weld(cells, 1.0e-6 * scale)
     shut = count(!allunique, idcells)
@@ -266,13 +268,13 @@ function _check_watertight(cells, normals, scale)
     open_faces = _unpaired_faces(idcells)
     open_faces == 0 || throw(ArgumentError("mesh is not closed: $open_faces unpaired cell faces. Repair it, " *
                                            "or pass orientation=:winding"))
+    sum(Unfitted._simplex_measure(c) * dot(Unfitted._cell_midpoint(c), n) for (c, n) in zip(cells, normals)) > 0 ||
+        throw(ArgumentError("mesh is inside-out (encloses a negative volume): reverse the cell " *
+                            "winding, or pass orientation=:winding"))
     twins = length(idcells) - length(unique(Tuple ∘ sort ∘ SVector, idcells))
     twins == 0 || throw(ArgumentError("mesh has $twins cells on the same corners as another cell (a two-sided " *
                                       "sheet, or a face shared by two solids), which bound no volume. Remove both " *
                                       "copies, or pass orientation=:winding"))
-    sum(Unfitted._simplex_measure(c) * dot(Unfitted._cell_midpoint(c), n) for (c, n) in zip(cells, normals)) > 0 ||
-        throw(ArgumentError("mesh is inside-out (encloses a negative volume): reverse the cell " *
-                            "winding, or pass orientation=:winding"))
     return nothing
 end
 

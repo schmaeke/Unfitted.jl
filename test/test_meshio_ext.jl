@@ -353,6 +353,10 @@ end
     mirrored(faces) = [(i + 8, k + 8, j + 8) for (i, j, k) in faces]   # rewound, as the mirror reverses orientation
     wall = triangle_mesh(verts, vcat(g, mirrored(g)))
     @test refused_as_twins(wall)
+    # Inside-out as well, the wall is refused as inside-out, as it was before cells on the same corners were looked
+    # for: the check for them runs last.
+    inverted = triangle_mesh(verts, [(a, c, b) for (a, b, c) in vcat(g, mirrored(g))])
+    @test_throws "mesh is inside-out" mesh_levelset(inverted)
     p = SVector(1.05, 0.5, 0.5)
     @test Unfitted._leaves(mesh_levelset(wall; orientation=:winding))[1].f(p) < 0
     outer = [t for t in g if !issubset(t, (2, 3, 6, 7))]   # every face of the two boxes but the shared one
