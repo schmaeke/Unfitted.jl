@@ -125,7 +125,9 @@ function mesh_levelset end
 # Each entry point is one fallback method over every argument list, strictly less specific than every method the
 # extension installs, and its body is `_extension_missing`: without the extension the call raises an error that says to
 # load WriteVTK, before anything touches the file system, and with it a call no method accepts raises the ordinary
-# `MethodError`. The core defines no other method of these functions: one more specific than an extension method in
+# `MethodError`. That error bears the one trace the fallback leaves: since the fallback matches every call, Julia prints
+# it among the closest candidates and adds that the error was thrown manually, as if the method were deliberately left
+# unimplemented. The core defines no other method of these functions: one more specific than an extension method in
 # some argument would take that method's calls, or make them ambiguous. The series handle is the abstract `VTKSeries`,
 # because its concrete type holds a WriteVTK collection and is therefore the extension's; the two series operations are
 # documented below on their abstract signatures, which no method of the core implements.
@@ -250,7 +252,7 @@ smooth face; an `∩`-corner stays comparatively more faceted at any given depth
 To write a *sequence* of these bundles as one animation — a moving overlay, an adaptive ladder, a time-dependent
 solution — open a [`vtk_series`](@ref) and call this function with it in place of a path.
 """
-write_vtk(args...; kwargs...) = _extension_missing(write_vtk, args, :UnfittedWriteVTKExt, "WriteVTK")
+write_vtk(args...; kwargs...) = _extension_missing(write_vtk, args, "WriteVTK")
 
 """
     write_vtk(series::VTKSeries, time, solution, model; kwargs...) -> String
@@ -311,7 +313,7 @@ picture is a property of the loop, not of the writer, and a frame costs what a `
 
 Requires `using WriteVTK`, like [`write_vtk`](@ref).
 """
-vtk_series(args...; kwargs...) = _extension_missing(vtk_series, args, :UnfittedWriteVTKExt, "WriteVTK")
+vtk_series(args...; kwargs...) = _extension_missing(vtk_series, args, "WriteVTK")
 
 """
     close(series::VTKSeries) -> String
@@ -338,18 +340,16 @@ clusters with tiny weights. Returns the path of every file written, the `.vtm` f
 
 Requires `using WriteVTK`, like [`write_vtk`](@ref).
 """
-function write_quadrature_vtm(args...; kwargs...)
-    return _extension_missing(write_quadrature_vtm, args, :UnfittedWriteVTKExt, "WriteVTK")
-end
+write_quadrature_vtm(args...; kwargs...) = _extension_missing(write_quadrature_vtm, args, "WriteVTK")
 
 # The body of an extension stub's fallback method `f(args...; kwargs...)`: what a call no method of `f` accepts raises.
-# While the package extension `ext` is not loaded, the error names the package that loads it, which is the remedy, and
-# it is raised before the call has touched anything. Once the extension is loaded the call simply matched none of its
-# methods, and the ordinary `MethodError` says so (without the keyword arguments, which it does not carry) rather than
-# asking the user to load what is loaded. Generic in the extension and the package, so a further extension's stubs
-# reuse it.
-function _extension_missing(f, args, ext::Symbol, package::String)
-    Base.get_extension(@__MODULE__, ext) === nothing &&
+# While the package extension `Unfitted<package>Ext` — the name every extension of this package carries, after the
+# package that loads it — is not loaded, the error names that package, which is the remedy, and it is raised before the
+# call has touched anything. Once the extension is loaded the call simply matched none of its methods, and the ordinary
+# `MethodError` says so (without the keyword arguments, which it does not carry) rather than asking the user to load
+# what is loaded. Generic in the package, so a further extension's stubs reuse it.
+function _extension_missing(f, args, package::String)
+    Base.get_extension(@__MODULE__, Symbol(:Unfitted, package, :Ext)) === nothing &&
         error("$(nameof(f)) is provided by Unfitted's $package extension: run `using $package` to load it")
     throw(MethodError(f, args))
 end
