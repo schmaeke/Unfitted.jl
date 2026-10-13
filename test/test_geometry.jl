@@ -62,6 +62,24 @@ end
     @test Unfitted.box_intersection(a, box((2.0, 0.0), (3.0, 2.0))) === nothing
 end
 
+# A tolerance is a non-negative length (or volume). A negative one used to turn off the test it drives — `merge = -1`
+# kept even exact duplicates apart — and a NaN one collapsed every merged axis to its first coordinate. Every
+# constructor now refuses both, naming the field; zero stays legal and means exact merging and containment.
+@testset "geometry tolerance refuses negative and NaN thresholds" begin
+    for (key, bad) in ((:merge, -1.0), (:merge, NaN), (:contain, -1.0e-8), (:small_volume, NaN))
+        @test_throws "GeometryTolerance $key must be non-negative" GeometryTolerance(; (key => bad,)...)
+    end
+    @test_throws ArgumentError GeometryTolerance(Float32; merge=NaN)
+    @test_throws ArgumentError GeometryTolerance{Float64}(1.0e-8, -1.0, 1.0e-8)
+    @test_throws ArgumentError GeometryTolerance(1.0e-8, 1.0e-8, -1.0)
+
+    exact = GeometryTolerance(; merge=0.0, contain=0.0, small_volume=0.0)
+    @test Unfitted.merge_coordinates([0.0, 0.5, 0.5, 1.0], exact) == [0.0, 0.5, 1.0]
+    @test Unfitted.contains_point((1.0, 0.5), box((0.0, 0.0), (1.0, 1.0)), exact)
+    @test !Unfitted.contains_point((1.0 + eps(), 0.5), box((0.0, 0.0), (1.0, 1.0)), exact)
+    @test GeometryTolerance(1.0e-8, 1.0e-8, 1.0e-8) == GeometryTolerance(; merge=1.0e-8)
+end
+
 # The `AxisBox` constructor enforces `lower[i] < upper[i]` on every axis: an inverted or equal corner on any axis must
 # raise, so degenerate (zero- or negative-measure) regions never reach the assembly hot loop. Covers both the `box`
 # helper and the direct `AxisBox` constructor.

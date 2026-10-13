@@ -6,7 +6,7 @@ const PointLike{D} = Union{NTuple{D,<:Real},SVector{D,<:Real}}
     GeometryTolerance([T=Float64]; merge, contain, small_volume)
 
 Coordinate tolerances driving geometry construction, intersection building, and conditioning diagnostics. Three
-thresholds, all positive and expressed in the same units as physical-domain coordinates:
+thresholds, all non-negative and expressed in the same units as physical-domain coordinates:
 
   - `merge` — coordinates closer than this in a given axis are canonicalised to the same value. Drives
     [`merge_coordinates`](@ref) and therefore the admissible-box construction in `intersections.jl`, so it sets the
@@ -20,7 +20,9 @@ thresholds, all positive and expressed in the same units as physical-domain coor
     `SmallOverlap` entries in the assembly diagnostics; they are *not* silently dropped — small-overlap conditioning is
     made visible instead of hidden.
 
-The keyword constructor accepts any positive value per field. Defaults are `merge = √eps(T)` and
+Each field accepts any non-negative value; zero is legal and means exact merging, exact containment and no
+small-overlap report. A negative or NaN value raises `ArgumentError`: a negative threshold silently disables the test
+it drives, and a NaN one makes every comparison against it false. Defaults are `merge = √eps(T)` and
 `contain = small_volume = merge`. The defaults are calibrated for coordinates of order one; on geometry at a markedly
 different length scale, pass `merge` scaled to that geometry — e.g. `√eps(T) · L` for a domain of extent `L`. Tighten
 `merge` also when the geometry is known to need finer canonicalisation; loosen `contain` only at integration tests that
@@ -30,6 +32,29 @@ struct GeometryTolerance{T<:Real}
     merge::T
     contain::T
     small_volume::T
+
+    # Every route to a tolerance, the keyword constructor included, ends here, so this is where a value that is not a
+    # tolerance is refused. Each threshold is compared with `≤` or `>`, so a negative one turns its test off — `merge =
+    # -1` stops merging even exact duplicates, a negative `contain` shrinks every box — and a NaN one makes every
+    # comparison false, which collapses each merged axis to its first coordinate. Neither is caught anywhere downstream
+    # before it has changed a result.
+    function GeometryTolerance{T}(merge, contain, small_volume) where {T<:Real}
+        return new{T}(_tolerance_value(T, merge, :merge), _tolerance_value(T, contain, :contain),
+                      _tolerance_value(T, small_volume, :small_volume))
+    end
+end
+
+# The positional constructor Julia generates for a struct without an inner constructor, kept by hand now that there is
+# one; like every other route it ends in the inner constructor's check.
+function GeometryTolerance(merge::T, contain::T, small_volume::T) where {T<:Real}
+    return GeometryTolerance{T}(merge, contain, small_volume)
+end
+
+# Convert one threshold to `T` and refuse it unless it is non-negative (`v >= 0` is false for NaN as well).
+function _tolerance_value(::Type{T}, value, name::Symbol) where {T}
+    v = convert(T, value)
+    v >= 0 || throw(ArgumentError("GeometryTolerance $name must be non-negative; got $value"))
+    return v
 end
 
 function GeometryTolerance(::Type{T}=Float64; merge=sqrt(eps(T)), contain=merge, small_volume=merge) where {T<:Real}
