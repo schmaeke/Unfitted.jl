@@ -191,7 +191,7 @@ end
 # `side` is required, used to accept such a key silently all the same. An axis below 1 names no axis of any space and is
 # refused here; one beyond the dimension needs `D` and is refused when the selector meets a space (`_facets`). A pair
 # used to pass an axis below 1 on to `prepare`, which refused it as out of bounds.
-function _face(spec, side_required::Bool)
+function _face_spec(spec, side_required::Bool)
     if side_required    # a pair of `boundary(pairs...)`, a `NamedTuple` by dispatch
         haskey(spec, :axis) && haskey(spec, :side) ||
             throw(ArgumentError("boundary pairs must carry :axis and :side keys"))
@@ -227,7 +227,7 @@ _excluded_faces(spec::NamedTuple) = _excluded_faces((spec,))
 function _excluded_faces(specs)
     faces = Tuple{Int,Symbol}[]
     for spec in specs
-        axis, side = _face(spec, false)
+        axis, side = _face_spec(spec, false)
         side === nothing ? append!(faces, ((axis, :lower), (axis, :upper))) : push!(faces, (axis, side))
     end
     return sort!(unique!(faces))
@@ -240,7 +240,7 @@ boundary(; axis::Integer, side::Symbol) = boundary((; axis, side))
 function boundary(pairs::NamedTuple...)
     sides = Tuple{Int,Symbol}[]
     for pair in pairs
-        axis, side = _face(pair, true)
+        axis, side = _face_spec(pair, true)
         any(s -> first(s) == axis, sides) && throw(ArgumentError("boundary axis $axis specified more than once"))
         push!(sides, (axis, side))
     end
