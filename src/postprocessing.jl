@@ -371,18 +371,31 @@ end
 # order. One serialiser for every dataset a bundle holds — the data grids, the level meshes, the quadrature clouds —
 # so the cell type, the padding and the attach order are decided in one place. The attach order is the order of the
 # bytes in an appended file, which is why it is the record's list order and nothing else.
+#
+# A record's arrays come as `AbstractVector`s of several element types, so each is attached through
+# `Base.inferencebarrier` (the idiom of `_coverage_constraints!` in `dofs.jl`): the call is resolved at run time on the
+# array's concrete type. Without it, inference descends into the one method `_vtk_attach!` with the element type
+# unknown and infers its conversions and WriteVTK's array writer for an abstract array, code that never runs: on the
+# first `write_vtk` of a two-level 2D overlay, 232 more code instances inferred.
 function _add_dataset!(parent, base::AbstractString, name::AbstractString, suffix::AbstractString, g::SampleGrid{D,T,K};
                        kwargs...) where {D,T,K}
     path = joinpath(dirname(base), basename(base) * "_" * suffix) * (K == 0 ? ".vtp" : ".vtu")
     vtk = vtk_grid(path, _vtk_points(g), _vtk_cells(g); kwargs...)
     multiblock_add_block(parent, vtk, name)
+    attach! = Base.inferencebarrier(_vtk_attach!)
     for (key, array) in g.point_data
-        vtk[key, VTKPointData()] = _vtk_array(array, key, :point_data)
+        attach!(vtk, VTKPointData(), key, array, :point_data)
     end
     for (key, array) in g.cell_data
-        vtk[key, VTKCellData()] = _vtk_array(array, key, :cell_data)
+        attach!(vtk, VTKCellData(), key, array, :cell_data)
     end
     return vtk
+end
+
+# Attach one record array to the dataset `vtk` at `location` (`VTKPointData()` or `VTKCellData()`), as VTK stores it
+# (`_vtk_array`). Specialised on the array's concrete type, behind `_add_dataset!`'s barrier.
+function _vtk_attach!(vtk, location, name::String, array::AbstractVector, kind::Symbol)
+    (vtk[name, location] = _vtk_array(array, name, kind))
 end
 
 # A record's points as VTK stores them: always three coordinates, a 1D or 2D point padded with zeros (ParaView accepts
@@ -462,6 +475,13 @@ end
 # entries' containers are checked before anything is sampled, a callback's values as they are collected, and nothing
 # touches the file system. One workspace and one `FormState` serve every field: the fields are sampled one after
 # another, and each field's accessor frames the regions it reads on its own (`_sample_accessor`).
+#
+# The records are collected by an explicit loop into a vector of their concrete type, so a consumer reads them
+# type-stably whatever inference made of the workspace, whose type is not inferable from the model
+# (`_assembly_workspace`): a `map` over the fields gave the records the element type inferred for its closure, and an
+# abstract one sent inference through the whole serialiser with the grids' dimension and cell kind unknown — measured
+# on the first `write_vtk` of a two-level 2D overlay, 2721 code instances inferred and 549 methods compiled, against
+# 1549 and 406 with the loop.
 function _sample_fields(solution::Solution, model::Model{D,T}; field=nothing, subdivisions=:degree, cut_depth=3,
                         point_data=_default_point_data(), cell_data=NamedTuple(), level_meshes::Bool=true) where {D,T}
     depth = _cut_depth_budget(cut_depth)
@@ -470,11 +490,13 @@ function _sample_fields(solution::Solution, model::Model{D,T}; field=nothing, su
     entries = (point=_sample_entries(point_data, :point_data), cell=_sample_entries(cell_data, :cell_data))
     rule = _subdivision_rule(subdivisions, Val(D))
     ws, meshed = _assembly_workspace(model), Space[]
-    return map(fields) do fld
+    MeshRecord = @NamedTuple{level::Int, role::Symbol, grid::SampleGrid{D,T,D}}
+    records = @NamedTuple{field::Field, data::SampleGrid{D,T,D}, meshes::Vector{MeshRecord}}[]
+    for fld in fields
         space = _field_space(model.problem, fld.name)
         regions = _region_list(model, nothing, space).regions     # the list the solve integrated the field over
         data = _sample_field(ws, state, space, regions, fld, rule, depth, entries, model.version)
-        meshes = @NamedTuple{level::Int, role::Symbol, grid::SampleGrid{D,T,D}}[]
+        meshes = MeshRecord[]
         if level_meshes && !any(s -> s === space, meshed)
             dofs = _field_layout(model.dofs, fld.name).dofs
             coverage = build_coverage(space, dofs.tolerance)
@@ -483,8 +505,9 @@ function _sample_fields(solution::Solution, model::Model{D,T}; field=nothing, su
             end
         end
         push!(meshed, space)
-        return (; field=fld, data, meshes)
+        push!(records, (; field=fld, data, meshes))
     end
+    return records
 end
 
 # The default `point_data`: one entry, `uh`, the solution value at every point.
@@ -499,8 +522,15 @@ _default_point_data() = (uh=(u, c, x, xi) -> u(c, xi),)
 function _cut_depth_budget(cut_depth)
     cut_depth === :none && return 0
     cut_depth isa Integer && 0 <= cut_depth <= 8 && return Int(cut_depth)
-    throw(ArgumentError("cut_depth must be :none or an integer in 0:8; got $(repr(cut_depth))"))
+    throw(ArgumentError("cut_depth must be :none or an integer in 0:8; got $(_shown(cut_depth))"))
 end
+
+# `repr(x)` for a refusal message, compiled once for every `x`: unspecialised in inference as well as in code generation
+# (`@nospecializeinfer`) and never inlined, so a function that can refuse a keyword does not compile the printing of
+# that keyword's type on the path that accepts it. `repr` of a `Symbol` — the default `subdivisions = :degree` — goes
+# through Base's expression printer, `show_unquoted`, which a first `write_vtk` otherwise inferred whether or not a
+# refusal ever ran.
+@noinline Base.@nospecializeinfer _shown(@nospecialize(x)) = repr(x)
 
 # The fields a sampling covers, as the model's own `Field`s: every field of the problem in order, or the one `field`
 # names — a `Field` or its name `Symbol`, matched by name, so a `Field` built before `prepare` selects the model's field
@@ -535,7 +565,7 @@ function _subdivision_rule(subdivisions, ::Val{D}) where {D}
     subdivisions isa Integer && subdivisions > 0 && return ntuple(_ -> Int(subdivisions), Val(D))
     subdivisions isa NTuple{D,Integer} && all(>(0), subdivisions) && return Int.(subdivisions)
     throw(ArgumentError("subdivisions must be :degree, :none, a positive integer or an NTuple{$D} of positive " *
-                        "integers; got $(repr(subdivisions))"))
+                        "integers; got $(_shown(subdivisions))"))
 end
 
 # The data grid of one field: its sample cells (`_sample_cells`) and their corners, the user's entries and the built-in
@@ -544,22 +574,37 @@ end
 # `region_id` (the cell's region in the field's region list), `cover_count` (its number of covering parents), then the
 # user's entries. A function barrier typed by the space and its regions, and never specialised on the model or on the
 # callback set, which arrive as the model's pin and an untyped entry list.
+#
+# Each entry's array is collected through `Base.inferencebarrier` (the idiom of `_coverage_constraints!` in `dofs.jl`):
+# one run-time dispatch on the callback's concrete type (`_sample_array`). The entry list holds the callbacks as `Any`
+# and `_sample_array` is the only method that matches, so without the barrier inference descends into it with the
+# callback unknown and infers the collection loop and the value checks for an unknown value, code that never runs: on
+# the first `write_vtk` of a two-level 2D overlay, 67 more code instances inferred.
 function _sample_field(ws, state::FormState, space::Space{D,T}, regions::Vector{VolumeRegion{D,T}}, fld::Field, rule,
                        depth::Int, entries, version::Int) where {D,T}
     boxes, region_ids = _sample_cells(space, regions, rule, depth)
-    points = SVector{D,T}[x for b in boxes for x in _box_corners(b)]
+    points = Vector{SVector{D,T}}(undef, length(boxes) << D)
+    for (c, b) in pairs(boxes)
+        _put_corners!(points, c, b)
+    end
     u = _sample_accessor(ws, state, regions, fld)
     at_points = (; location=:point, shift=D, boxes, points, region_ids, regions, version)
     at_cells = merge(at_points, (; location=:cell, shift=0))
-    point_data = Pair{String,AbstractVector}[name => _sample_array(:point_data, name, f, u, at_points)
-                                             for (name, f) in entries.point]
+    sample = Base.inferencebarrier(_sample_array)
+    point_data = Pair{String,AbstractVector}[]
+    for (name, f) in entries.point
+        push!(point_data, name => sample(:point_data, name, f, u, at_points)::AbstractVector)
+    end
     space.physical === nothing ||
         any(e -> first(e) == "level_set", entries.point) ||
         push!(point_data, "level_set" => _levelset_values(space.physical, points, T))
-    cell_data = Pair{String,AbstractVector}["region_id" => region_ids,
-                                            "cover_count" => [length(regions[r].parents) for r in region_ids]]
+    cover_count = similar(region_ids)
+    for (c, r) in pairs(region_ids)
+        cover_count[c] = length(regions[r].parents)
+    end
+    cell_data = Pair{String,AbstractVector}["region_id" => region_ids, "cover_count" => cover_count]
     for (name, f) in entries.cell
-        push!(cell_data, name => _sample_array(:cell_data, name, f, u, at_cells))
+        push!(cell_data, name => sample(:cell_data, name, f, u, at_cells)::AbstractVector)
     end
     return SampleGrid{D,T,D}(points, point_data, cell_data)
 end
@@ -567,6 +612,17 @@ end
 # `φ` at every point, in the space's number type. A barrier: the space's `PhysicalDomain` is abstractly typed, so one
 # dynamic call here makes the loop concrete, where a `levelset_value` call per point would dispatch dynamically.
 _levelset_values(physical::PhysicalDomain, points, ::Type{T}) where {T} = T[levelset_value(physical, x) for x in points]
+
+# Store the corners of `b` (`_box_corners`) as the points of cell `c` of a grid of `D`-cubes: points
+# `(c − 1)·2ᴰ + 1 : c·2ᴰ`. The one writer of a grid's points, for the sample cells and the level meshes alike. It
+# fills a presized vector: collecting the corners through a nested generator instead compiles Base's collection of an
+# iterator of unknown length for every grid type, and grows the vector as it goes.
+function _put_corners!(points::Vector{SVector{D,T}}, c::Int, b::AxisBox{D,T}) where {D,T}
+    for (j, x) in enumerate(_box_corners(b))
+        points[((c - 1) << D)+j] = x
+    end
+    return points
+end
 
 # The `u(context, xi[, field])` a callback receives: the current solution at the callback's sample, through the
 # assembly's own field evaluation — the one `q.state` and the quadrature-point walker read. A region's dof values are
@@ -619,15 +675,36 @@ end
 
 # One user entry's array over a walk: the callback at every sample, each value checked as it comes (`_sample_value`),
 # collected into the narrowest array that holds them. A function barrier — the one dynamic call per entry — so the loop
-# runs on the callback's and the accessor's concrete types. A concrete element type is kept as it is; mixed number
-# types (an `Int` at some samples, a `Float64` at others) and `SVector`s of mixed element types are promoted over every
-# sample with `promote_type`, and anything else, shapes that differ between samples, is refused naming the entry. An
-# empty walk gives an empty `Float64` array.
+# runs on the callback's and the accessor's concrete types. The array takes the first value's type, which is every
+# value's type for the callbacks one writes, and is then kept as it is; a value of another type hands the walk to
+# `_promoted_values`, which promotes over every sample or refuses naming the entry. An empty walk gives an empty
+# `Float64` array.
+#
+# An explicit loop, not `map`: Base's `collect` widens its element type as it goes, which compiles its collection
+# machinery anew for every callback type. Here, when the callback's value type is concrete, the type test folds to true
+# and the hand-over is never compiled.
 function _sample_array(kind::Symbol, name::String, f::F, u::U, s) where {F,U}
     n = length(s.boxes) << s.shift
     n == 0 && return Float64[]
-    values = map(k -> _sample_value(kind, name, f(u, _callback_args(s, k)...)), 1:n)
-    isconcretetype(eltype(values)) && return values
+    sample(k) = _sample_value(kind, name, f(u, _callback_args(s, k)...))
+    first_value = sample(1)
+    values = Vector{typeof(first_value)}(undef, n)
+    values[1] = first_value
+    for k in 2:n
+        v = sample(k)
+        # The samples so far, this one and the rest, each callback still called once per sample and in order.
+        v isa eltype(values) ||
+            return _promoted_values(kind, name, Any[j < k ? values[j] : j == k ? v : sample(j) for j in 1:n])
+        values[k] = v
+    end
+    return values
+end
+
+# The array of an entry whose values differ in type between samples: mixed number types (an `Int` at some samples, a
+# `Float64` at others) and `SVector`s of mixed element types are promoted over every sample with `promote_type`, and
+# anything else — shapes that differ between samples — is refused, naming the entry and the types it returned. Typed
+# on the untyped value list, so it compiles once whatever the callback.
+function _promoted_values(kind::Symbol, name::String, values::Vector{Any})
     S = mapreduce(typeof, promote_type, values)
     isconcretetype(S) && (S <: Real || S <: SVector && eltype(S) <: Real) && return convert(Vector{S}, values)
     throw(ArgumentError("$kind entry \"$name\" returned $(join(unique(typeof.(values)), ", ")): a callback value " *
@@ -757,20 +834,28 @@ end
 #
 # Rendered "Surface With Edges" this doubles as the old wireframe while carrying the per-cell data a line mesh could
 # not. `dofs` is the layout the dof counts are read from: the first field's, for a space several fields share.
+#
+# One pass over the cells fills every presized array, rather than one comprehension per array: each comprehension
+# compiled Base's collection machinery for its own generator type, which a first write paid for every level type.
 function _level_grid(level::Level{D,T}, dofs::DofLayout{D}, coverage::Coverage{D}) where {D,T}
-    mesh, cells = level.mesh, vec(cell_indices(level.mesh))
-    covered, linear = coverage.covered[level.id], LinearIndices(mesh.cells)
+    mesh, cells = level.mesh, cell_indices(level.mesh)
+    covered, linear, n = coverage.covered[level.id], LinearIndices(mesh.cells), length(cells)
     active(raw) = any(c -> dofs.active_component[raw, c] != 0, 1:dofs.components)
     reduced(raw) = dofs.elimination_source[raw] in (:coverage, :dedup)
-    data = Pair{String,AbstractVector}["level_id" => fill(level.id, length(cells)),
-                                       "role_id" => fill(level.role === :base ? 0 : 1, length(cells)),
-                                       "order_max" => [maximum(cell_order(level, c)) for c in cells],
-                                       "cell_id" => [linear[c] for c in cells],
-                                       "active" => [Int(is_active(level.mask, c)) for c in cells],
-                                       "covered" => [Int(covered[c]) for c in cells],
-                                       "active_dofs" => [count(active, cell_dofs(dofs, level.id, c)) for c in cells],
-                                       "reduced_dofs" => [count(reduced, cell_dofs(dofs, level.id, c)) for c in cells]]
-    points = SVector{D,T}[x for c in cells for x in _box_corners(cell_box(mesh, c))]
+    columns = ntuple(_ -> Vector{Int}(undef, n), Val(6))
+    order_max, cell_id, active_cell, covered_cell, active_dofs, reduced_dofs = columns
+    points = Vector{SVector{D,T}}(undef, n << D)
+    for (k, c) in enumerate(cells)
+        raws = cell_dofs(dofs, level.id, c)
+        order_max[k], cell_id[k] = maximum(cell_order(level, c)), linear[c]
+        active_cell[k], covered_cell[k] = Int(is_active(level.mask, c)), Int(covered[c])
+        active_dofs[k], reduced_dofs[k] = count(active, raws), count(reduced, raws)
+        _put_corners!(points, k, cell_box(mesh, c))
+    end
+    data = Pair{String,AbstractVector}["level_id" => fill(level.id, n),
+                                       "role_id" => fill(level.role === :base ? 0 : 1, n), "order_max" => order_max,
+                                       "cell_id" => cell_id, "active" => active_cell, "covered" => covered_cell,
+                                       "active_dofs" => active_dofs, "reduced_dofs" => reduced_dofs]
     return SampleGrid{D,T,D}(points, Pair{String,AbstractVector}[], data)
 end
 
@@ -782,15 +867,20 @@ end
 # vertex cloud (`K = 0`) of the physical quadrature points, each with its physical weight `weight` (the rule weight
 # times the region's Jacobian, as assembly integrates with it), region by region — subdomain order, then plan order —
 # and point by point. Both arrays are presized from the regions' point counts rather than grown point by point. Not
-# `_quadrature_cloud` (`data.jl`), the bare coordinates in `q.point` order that the RBFP0 transfer indexes.
+# `_quadrature_cloud` (`data.jl`), the bare coordinates in `q.point` order that the RBFP0 transfer indexes. The entries
+# are collected into a vector of their concrete type by an explicit loop, as `_sample_fields` collects its records.
 function _sample_quadrature(model::Model{D,T}) where {D,T}
     groups = Dict{Vector{Int},Vector{VolumeRegion{D,T}}}()
     for subdomain in model.subdomains, region in subdomain.plan.regions
         push!(get!(() -> VolumeRegion{D,T}[], groups, sort!([p.level for p in region.parents])), region)
     end
-    return map(sort!(collect(keys(groups)))) do signature
-        regions = groups[signature]
-        points = Vector{SVector{D,T}}(undef, sum(_region_qpoint_count, regions))
+    entries = @NamedTuple{signature::Vector{Int}, grid::SampleGrid{D,T,0}}[]
+    for signature in sort!(collect(keys(groups)))
+        regions, n = groups[signature], 0
+        for region in regions               # not `sum(f, regions)`, whose reducer chain compiles for every region type
+            n += _region_qpoint_count(region)
+        end
+        points = Vector{SVector{D,T}}(undef, n)
         weights, k = similar(points, T), 0
         for region in regions
             jacobian = _region_jacobian(region)
@@ -799,8 +889,11 @@ function _sample_quadrature(model::Model{D,T}) where {D,T}
                 points[k], weights[k], _ = _region_point(region, q, jacobian)
             end
         end
-        return (; signature, grid=SampleGrid{D,T,0}(points, ["weight" => weights], Pair{String,AbstractVector}[]))
+        grid = SampleGrid{D,T,0}(points, Pair{String,AbstractVector}["weight" => weights],
+                                 Pair{String,AbstractVector}[])
+        push!(entries, (; signature, grid))
     end
+    return entries
 end
 
 # ── Solution evaluation ───────────────────────────────────────────────────────
