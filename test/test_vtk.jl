@@ -160,6 +160,41 @@ end
     @test maximum(gaps) ≤ 1.0e-12
 end
 
+@testset "a VTK callback reads a field only with the model's component count" begin
+    # The accessor reads a field's component count off the `Field` it is given. A `Field` that shares a model field's
+    # name but not its count is not that field: read with its own count it would return part of the model's field, or
+    # that field followed by the next field's values. It is refused before anything is written, as `value` refuses it;
+    # the model's own fields read their values, a vector field's included.
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(1, 1), order=1)
+    a = field(:a, V)
+    w = field(:w, V; components=2)
+    model = prepare(Problem((a, w); blocks=(mass_block(a), mass_block(w))))
+    n = Unfitted.active_unknowns(model.dofs)
+    solution = Solution([10.0i for i in 1:n], model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
+    for impostor in (field(:a, V; components=2), field(:w, V))
+        dir = mktempdir()
+        err = try
+            write_vtk(joinpath(dir, "impostor"), solution, model; field=:a, level_meshes=false, subdivisions=:none,
+                      point_data=(read=(u, c, x, xi) -> u(c, xi, impostor),))
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("field $(impostor.name) has", sprint(showerror, err))
+        @test isempty(readdir(dir))
+        @test_throws ArgumentError value(solution, model, impostor, (0.5, 0.5))
+    end
+    gaps = Float64[]
+    record(gap) = (push!(gaps, maximum(abs, gap)); 0.0)
+    point_data = (a=(u, c, x, xi) -> record(u(c, xi, a) - value(solution, model, a, x)),
+                  w=(u, c, x, xi) -> record(u(c, xi, w) - value(solution, model, w, x)))
+    write_vtk(joinpath(mktempdir(), "own"), solution, model; field=:a, level_meshes=false, subdivisions=:none,
+              point_data)
+    @test length(gaps) == 8
+    @test maximum(gaps) ≤ 1.0e-12
+end
+
 @testset "two fields on one space write each level mesh once" begin
     # The mesh dedup: fields sharing a space must not emit duplicate level blocks. A two-field/one-space model has a
     # single base level → one mesh.

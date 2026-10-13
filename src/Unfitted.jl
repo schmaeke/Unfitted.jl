@@ -193,12 +193,13 @@ Keyword arguments:
     sample, but in an unspecified order — across the samples and across the entries — so a callback should compute its
     value from its arguments and not count or record its calls. `u(context, xi[, field])` evaluates the current solution
     at the sample, given the `context` and `xi` the callback received: the block's own field by default, or another
-    `field` on the same subdomain. A field on another subdomain of a coupled model raises an `ArgumentError`; evaluate
-    it with [`value`](@ref)`(solution, model, field, x)` instead. `x` is the physical coordinate and `xi.region` the
-    same point in the region's reference frame; `context` carries `location` (`:point`, or `:cell` for a `cell_data`
-    sample), `region_id`, the `region` box, the emitted `cell` box, the covering `parents` — each with the `parent_box`
-    a callback needs to map `x` into a cell's own frame — and the `model_version` the samples were taken from. Defaults
-    to a single `uh` entry that emits the current solution value.
+    `field` on the same subdomain, which must be the model's field of that name, with its component count, as for
+    [`value`](@ref); a `Field` with another count raises an `ArgumentError`. A field on another subdomain of a coupled
+    model raises an `ArgumentError` too; evaluate it with [`value`](@ref)`(solution, model, field, x)` instead. `x` is
+    the physical coordinate and `xi.region` the same point in the region's reference frame; `context` carries `location`
+    (`:point`, or `:cell` for a `cell_data` sample), `region_id`, the `region` box, the emitted `cell` box, the covering
+    `parents` — each with the `parent_box` a callback needs to map `x` into a cell's own frame — and the `model_version`
+    the samples were taken from. Defaults to a single `uh` entry that emits the current solution value.
   - `cell_data` — same shape as `point_data` but evaluated at per-cell sample points (the subbox center). Defaults to no
     user-defined cell data; the bundle always includes `region_id` and `cover_count` as built-in cell arrays.
   - `level_meshes` — emit one solid-cell `.vtu` per level when `true` (default), each cell carrying per-cell `active` /

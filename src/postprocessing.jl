@@ -259,7 +259,9 @@ end
 # read into the shared `state` once (`_frame!`, `_state_region!`); each call then evaluates the basis at the sample
 # (`_refresh!`, values only) and every field there (`_state_point!`), and reads one field off `state`: a scalar for a
 # one-component field, an `SVector` over its components otherwise, the count read off the `Field`'s type so the result
-# is inferable.
+# is inferable. That count is checked against the model's (`_checked_field_index`), as `value` checks it: read with
+# another count, a `Field` that shares a model field's name would truncate that field or run on into the next field's
+# values in `state`.
 #
 # Framing is lazy and keyed on `context.region_id`: a region is framed by the first call that reads it and again only
 # after a call has read another region. The samples of an entry come region by region, so an entry that calls `u` frames
@@ -278,7 +280,7 @@ function _sample_accessor(ws, state::FormState, regions, default::Field)
             _state_region!(state, _frame!(ws, region))
             framed[] = context.region_id
         end
-        f = _field_index(state.layout, field.name)
+        f = _checked_field_index(state.layout, field)
         (ws.fptr[f] < ws.fptr[f+1] || isempty(region.parents)) ||
             throw(ArgumentError("u(context, xi, field) reads only fields of the sampled field's own subdomain; " *
                                 "evaluate $(field.name) with value(solution, model, $(field.name), x)"))
@@ -586,8 +588,9 @@ end
 # solution's pin and length, the point's conversion to the model's number type, the field's space, the point inside
 # that space's box, the field's component count, the component's range — so a call wrong in two ways always names the
 # same fault. The box is the field's own subdomain's, never subdomain 1's: on a coupled model each field is bounded by
-# its own. The component count is checked because it is read from `u`'s type rather than from the layout: that keeps a
-# vector result inferable, and a `Field` that shares a name with the model's but not its count is not the model's field.
+# its own. The component count is checked (`_checked_field_index`) because it is read from `u`'s type rather than from
+# the layout: that keeps a vector result inferable, and a `Field` that shares a name with the model's but not its count
+# is not the model's field.
 #
 # The components evaluated, `comps`, are static: the requested one, or `1` for a scalar field, or the tuple `(1, …, C)`,
 # so every level evaluates its basis once for all of them (`_level_field`). The level sum starts from zero, as the
@@ -601,9 +604,7 @@ function _field_quantity(solution::Solution, model::Model{D,T}, u::Field{<:Any,<
     space = _field_space(model.problem, u.name)
     contains_point(point, space.domain, model.dofs.tolerance) ||
         throw(ArgumentError("evaluation point is outside the field's domain"))
-    layout = _field_layout(model.dofs, u.name)
-    layout.components == C ||
-        throw(ArgumentError("field $(u.name) has $(layout.components) components in this model, not $C"))
+    layout = model.dofs.fields[_checked_field_index(model.dofs, u)]
     _check_component(component, u)
     comps = component !== nothing ? component : C == 1 ? 1 : ntuple(identity, Val(C))
     R = promote_type(T, eltype(coefficients))
@@ -612,6 +613,19 @@ function _field_quantity(solution::Solution, model::Model{D,T}, u::Field{<:Any,<
         acc = map(+, acc, _level_field(coefficients, model, layout, level, point, comps, Val(G)))
     end
     return comps isa Tuple ? SVector(acc) : acc
+end
+
+# The index in `layout` of the model's field `u` names, refusing a `u` whose component count is not that field's. Every
+# evaluation of a given `Field` — `value`, `field_gradient` and the sampling callbacks' `u` — reads its component count
+# `C` off `u`'s type, which keeps the result inferable; the layout holds the model's own count. A `Field` that shares a
+# model field's name but not its count is another field, and read with its own `C` it would return part of the model's
+# field, or that field followed by the next field's values; the check costs one integer comparison.
+function _checked_field_index(layout::SystemLayout, u::Field)
+    f = _field_index(layout, u.name)
+    components = layout.fields[f].components
+    components == component_count(u) ||
+        throw(ArgumentError("field $(u.name) has $components components in this model, not $(component_count(u))"))
+    return f
 end
 
 # Pick the implicit field of a single-field model. Multi-field models require an explicit field argument so the caller
