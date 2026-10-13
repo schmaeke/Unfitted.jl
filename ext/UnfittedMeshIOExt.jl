@@ -91,34 +91,27 @@ end
 # ── Angle-weighted pseudonormal feature weight ────────────────────────────────
 
 # `tol` is a length tolerance (scaled to the mesh, passed in by the functor) for deciding whether the closest point sits
-# on a vertex or an edge of the cell.
+# on a vertex of the cell.
 #
 # 2D: a boundary vertex joins two segments (codim-1), so equal weight (n₁+n₂) is correct for convex and reflex vertices
 # alike — no angle weighting needed.
 _feature_weight(::NTuple{2,SVector{2,T}}, cp, tol) where {T} = 1.0
 
-# 3D: weight a triangle by the angle it subtends at `cp` — the incident angle at a vertex, `π` on an edge, `2π` in the
-# face interior. This is the Bærentzen–Aanæs pseudonormal, correct at reflex (non-convex) vertices where equal weights
-# would flip the sign.
+# 3D: weight a triangle by the angle it subtends at `cp` when `cp` is one of its vertices — the Bærentzen–Aanæs
+# pseudonormal, correct at reflex (non-convex) vertices where equal weights would flip the sign — and by `π` anywhere
+# else. The paper's weights off a vertex are `π` on an edge and `2π` in the face interior, but only the vertex case
+# needs them told apart: the cells whose closest points coincide all share the closest feature, so on a closed manifold
+# mesh an edge gathers the two triangles meeting there, each at `π` either way, and a face-interior point gathers its
+# one triangle, whose pseudonormal `π·n` has the sign of `2π·n` exactly.
 function _feature_weight(cell::NTuple{3,SVector{3,T}}, cp, tol) where {T}
     a, b, c = cell
     norm(cp - a) <= tol && return _vertex_angle(a, b, c)
     norm(cp - b) <= tol && return _vertex_angle(b, c, a)
     norm(cp - c) <= tol && return _vertex_angle(c, a, b)
-    (_on_segment(cp, a, b, tol) || _on_segment(cp, b, c, tol) || _on_segment(cp, c, a, tol)) && return Float64(pi)
-    return 2 * Float64(pi)
+    return Float64(pi)
 end
 
 _vertex_angle(v, p, q) = acos(clamp(dot(normalize(p - v), normalize(q - v)), -1.0, 1.0))
-
-function _on_segment(cp, p, q, tol)
-    pq = q - p
-    l2 = dot(pq, pq)
-    l2 <= 0 && return false
-    t = dot(cp - p, pq) / l2
-    (-tol <= t <= 1 + tol) || return false
-    return norm(cp - (p + clamp(t, 0.0, 1.0) * pq)) <= tol
-end
 
 # ── Mesh signed-distance functor ──────────────────────────────────────────────
 
