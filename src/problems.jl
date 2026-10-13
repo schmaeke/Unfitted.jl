@@ -420,19 +420,23 @@ end
 # `component`).
 #
 # The names are gathered into a tuple of `Symbol`s first, so the lookups run over a homogeneous tuple; the fields
-# themselves are a heterogeneous one. Fields may live on different spaces (multi-domain coupling): each `Field` carries
-# its own, and the dof, integration and assembly layers key everything by the owning field.
+# themselves are a heterogeneous one. The blocks and the loads are walked in two loops rather than one over
+# `(blocks..., loads...)`: a block and a load are always of different types, so the joined tuple is never homogeneous,
+# and walking it boxed the forms, three allocations per single-field `Problem`, whose only other two are its copy of
+# the condition vector. Fields may live on different spaces (multi-domain coupling): each `Field` carries its own, and
+# the dof, integration and assembly layers key everything by the owning field.
 function _check_problem(fields::Tuple, blocks::Tuple, loads::Tuple, dirichlet)
     isempty(fields) && throw(ArgumentError("a problem needs at least one field"))
     names = map(f -> f.name, fields)
     for (i, name) in enumerate(names)
         findfirst(==(name), names) == i || throw(ArgumentError("duplicate field name $name"))
     end
-    for form in (blocks..., loads...)
+    for form in blocks
         form.test_name in names || throw(ArgumentError("unknown test field $(form.test_name)"))
-        form isa BlockForm &&
-            !(form.trial_name in names) &&
-            throw(ArgumentError("unknown trial field $(form.trial_name)"))
+        form.trial_name in names || throw(ArgumentError("unknown trial field $(form.trial_name)"))
+    end
+    for form in loads
+        form.test_name in names || throw(ArgumentError("unknown test field $(form.test_name)"))
     end
     for condition in dirichlet
         name = condition.field
