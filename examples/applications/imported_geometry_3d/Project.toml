@@ -10,7 +10,7 @@ WriteVTK = "64499a7a-5c06-52f2-abe2-ccb03c286192"
 Unfitted = {path = "../../.."}
 
 [compat]
-FileIO = "1"
-MeshIO = "0.4, 0.5"
-WriteVTK = "1.18"
+FileIO = "1.20.0"
+MeshIO = "0.5.5"
+WriteVTK = "1.22.0"
 julia = "1.11"

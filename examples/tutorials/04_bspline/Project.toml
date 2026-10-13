@@ -7,5 +7,5 @@ Unfitted = "c68911ed-f311-4fcd-9d58-9cd3adb40d87"
 Unfitted = {path = "../../.."}
 
 [compat]
-BasicBSpline = "0.11"
+BasicBSpline = "0.11.4"
 julia = "1.11"

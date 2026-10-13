@@ -8,6 +8,6 @@ WriteVTK = "64499a7a-5c06-52f2-abe2-ccb03c286192"
 Unfitted = {path = "../../.."}
 
 [compat]
-Tensors = "1.16"
-WriteVTK = "1.18"
+Tensors = "1.17.1"
+WriteVTK = "1.22.0"
 julia = "1.11"
