@@ -363,7 +363,7 @@ end
 function _assemble(@nospecialize(model::Model), @nospecialize(blocks), @nospecialize(loads), @nospecialize(symmetric),
                    threaded::Bool, @nospecialize(state), @nospecialize(region_filter))
     blocks, loads = _form_tuple(blocks), _form_tuple(loads)
-    symmetric = (symmetric === nothing ? all(block -> block.form.symmetric, blocks) : Bool(symmetric))::Bool
+    symmetric = _symmetric_flag(blocks, symmetric)::Bool
     coefficients = _state_vector(state, model)
     passes = _passes(model, blocks, loads)
     tasks = threaded ? Threads.nthreads() : 1

@@ -373,28 +373,6 @@ function Problem(u::Field, form; dirichlet=[])
     return Problem((u,); blocks, loads, dirichlet, symmetric=form.symmetric)
 end
 
-# Collect the field names of a problem's field tuple and check for duplicates. Used by the multi-field `Problem`
-# constructor.
-function _field_names(fields)
-    names = Symbol[]
-    for field in fields
-        field.name in names && throw(ArgumentError("duplicate field name $(field.name)"))
-        push!(names, field.name)
-    end
-    return names
-end
-
-# Sanity-check the field tuple of a multi-field problem: non-empty, no duplicate names. Fields may live over *different*
-# spaces (multi-domain coupling): each `Field` carries its own `Space`, and the dof, integration, and assembly layers
-# key everything by the owning field. Returns a *representative* space — the first field's — used only to infer the
-# problem's `(D, T)` type parameters and to serve single-field consumers that still reach through `problem.space`; the
-# authoritative per-field space is always `field.space`. Also returns the field-name list.
-function _check_problem_fields(fields::Tuple)
-    isempty(fields) && throw(ArgumentError("a problem needs at least one field"))
-    names = _field_names(fields)
-    return first(fields).space, names
-end
-
 """
     problem_spaces(problem::Problem) -> Vector{Space}
 
@@ -420,47 +398,66 @@ function _field_space(problem::Problem, field_name::Symbol)
     throw(ArgumentError("unknown field $field_name"))
 end
 
-# Check that every block/load form references known field names. Raises on the first unknown field so the user sees the
-# offending name.
-function _check_form_fields(forms, names)
-    for form in forms
+# Validate a problem's parts in one pass, in the order they depend on each other: the fields (at least one, no name
+# twice), then every block and load against the field names, then every Dirichlet condition against the field it
+# constrains. Each refusal names the offending field, and a repeated name is reported at its first repeat.
+#
+# Every condition is resolved to its owner here, where the fields are at hand: an unscoped one (`field === nothing`)
+# belongs to the only field of a single-field problem, a named one to the field of that name. Its `component` must be
+# one the owner carries, since an index no component carries would silently leave its boundary free, and a constant
+# tuple or array datum must carry one entry per component (`_check_dirichlet_datum`). An unscoped condition on a
+# multi-field problem, or a name no field carries, used to construct and fail only at `prepare`, where the layout of
+# each field picks out its conditions; the messages are the ones `prepare` gave. `update_dirichlet!` checks its new
+# conditions' data against the model's field layouts instead (its structural check already pins `field` and
+# `component`).
+#
+# The names are gathered into a tuple of `Symbol`s first, so the lookups run over a homogeneous tuple; the fields
+# themselves are a heterogeneous one. Fields may live on different spaces (multi-domain coupling): each `Field` carries
+# its own, and the dof, integration and assembly layers key everything by the owning field.
+function _check_problem(fields::Tuple, blocks::Tuple, loads::Tuple, dirichlet)
+    isempty(fields) && throw(ArgumentError("a problem needs at least one field"))
+    names = map(f -> f.name, fields)
+    for (i, name) in enumerate(names)
+        findfirst(==(name), names) == i || throw(ArgumentError("duplicate field name $name"))
+    end
+    for form in (blocks..., loads...)
         form.test_name in names || throw(ArgumentError("unknown test field $(form.test_name)"))
         form isa BlockForm &&
             !(form.trial_name in names) &&
             throw(ArgumentError("unknown trial field $(form.trial_name)"))
     end
-end
-
-# Check each Dirichlet condition against the field it names: its `component` must be one the field carries, so an index
-# no component carries is rejected here rather than silently leaving its boundary free, and a constant tuple or array
-# datum must carry one entry per component (`_check_dirichlet_datum`). A condition left unscoped (`field === nothing`)
-# on a multi-field problem names no field to check against; `_dirichlet_for_field` rejects those at `prepare` time.
-# `update_dirichlet!` checks its new conditions' data against the model's field layouts instead (its structural check
-# already pins `component`).
-function _check_dirichlet(dirichlet, fields::Tuple)
     for condition in dirichlet
         name = condition.field
-        index = name === nothing ? (length(fields) == 1 ? 1 : nothing) : findfirst(f -> f.name === name, fields)
-        index === nothing && continue
+        name === nothing &&
+            length(fields) > 1 &&
+            throw(ArgumentError("multi-field Dirichlet conditions must specify a field"))
+        index = name === nothing ? 1 : findfirst(==(name), names)
+        index === nothing && throw(ArgumentError("unknown field $name"))
         owner = fields[index]
         _check_component(condition.component, owner)
         _check_dirichlet_datum(condition, component_count(owner), owner.name)
     end
+    return nothing
 end
 
+# The system's symmetry flag: `flag` when one is given, else whether every block declares its form symmetric. The one
+# rule for both the `Problem` constructor and a one-shot assembly of loose blocks (`_assemble`), so the two cannot infer
+# the flag differently. The blocks are not specialised on: this runs once per problem or assembly call, and the
+# closure's `all` specialises on the tuple anyway.
+function _symmetric_flag(@nospecialize(blocks), flag)
+    return flag === nothing ? all(block -> block.form.symmetric, blocks) : Bool(flag)
+end
+
+# The representative space `V` is the first field's: it supplies the problem's `(D, T)` type parameters and serves the
+# single-field consumers that reach through `problem.space`, while the authoritative space of each field is
+# `field.space`. `D` and `T` appear only in the bound of `S`, so the type parameters are spelled out.
 function Problem(fields::Tuple; blocks=(), loads=(), dirichlet=[], symmetric=nothing)
-    space_data, names = _check_problem_fields(fields)
-    block_tuple = Tuple(blocks)
-    load_tuple = Tuple(loads)
-    _check_form_fields(block_tuple, names)
-    _check_form_fields(load_tuple, names)
-    _check_dirichlet(dirichlet, fields)
-    symmetric_value = symmetric === nothing ? all(block -> block.form.symmetric, block_tuple) : Bool(symmetric)
-    D = length(space_data.domain.lower)
-    T = eltype(space_data.domain.lower)
-    return Problem{D,T,typeof(space_data),typeof(fields),typeof(block_tuple),typeof(load_tuple)}(space_data, fields,
-                                                                                                 block_tuple,
-                                                                                                 load_tuple,
-                                                                                                 collect(dirichlet),
-                                                                                                 symmetric_value)
+    block_tuple, load_tuple = Tuple(blocks), Tuple(loads)
+    _check_problem(fields, block_tuple, load_tuple, dirichlet)
+    V = first(fields).space
+    D, T = length(V.domain.lower), eltype(V.domain.lower)
+    flag = _symmetric_flag(block_tuple, symmetric)
+    return Problem{D,T,typeof(V),typeof(fields),typeof(block_tuple),typeof(load_tuple)}(V, fields, block_tuple,
+                                                                                        load_tuple, collect(dirichlet),
+                                                                                        flag)
 end

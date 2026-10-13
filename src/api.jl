@@ -274,7 +274,9 @@ Create a physical Dirichlet condition.
     only evaluating it could say what it returns.
   - `on::BoundarySelector` — the facet to constrain. Build via [`boundary`](@ref).
   - `field` — field to constrain. Pass `nothing` for single-field problems (the only field is constrained implicitly).
-    Pass a `Symbol` or [`Field`](@ref) for multi-field problems.
+    Pass a `Symbol` or [`Field`](@ref) for multi-field problems: [`Problem`](@ref) construction raises
+    `ArgumentError` for a condition without `field` on a problem of several fields, and for a name none of its fields
+    carries.
   - `component` — component index for vector fields when constraining only one channel (e.g. a roller / symmetry
     boundary that pins the normal component). `nothing` (default) constrains every component. An index outside
     `1:components` raises `ArgumentError` as soon as the owning field is known — here when `field` is a [`Field`](@ref),

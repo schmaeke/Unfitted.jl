@@ -104,11 +104,33 @@ end
     @test_throws ArgumentError poisson(u; source=0.0, dirichlet=[dirichlet(0.0; on=everywhere, field=:u, component=3)])
     @test_throws ArgumentError poisson(u; source=0.0, dirichlet=[dirichlet(0.0; on=everywhere, component=3)])
 
-    # An unscoped condition on a multi-field problem names no field to check against; `_dirichlet_for_field` still
-    # rejects it at `prepare` time.
-    two = Problem((u, field(:w, V)); blocks=(stiffness_block(u),),
-                  dirichlet=[dirichlet(0.0; on=everywhere, component=3)])
-    @test_throws ArgumentError prepare(two)
+    # An unscoped condition on a multi-field problem names no field to check its component against, and `Problem`
+    # refuses it as such.
+    @test_throws "multi-field Dirichlet conditions must specify a field" Problem((u, field(:w, V));
+                                                                                 blocks=(stiffness_block(u),),
+                                                                                 dirichlet=[dirichlet(0.0;
+                                                                                                      on=everywhere,
+                                                                                                      component=3)])
+end
+
+# A Dirichlet condition belongs to one field of its problem: the only one when it names none, the one it names
+# otherwise. `Problem` resolves that owner when it is built. An unscoped condition on a problem of several fields, and a
+# name no field carries, used to construct and fail only at `prepare`, after the problem had been passed around and
+# perhaps rehomed; the messages are the ones `prepare` gave.
+@testset "Problem refuses a Dirichlet condition it cannot attach to a field" begin
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    u, w = field(:u, V), field(:w, V; components=2)
+    everywhere = boundary(:all)
+    unscoped = [dirichlet(0.0; on=everywhere)]
+    @test_throws "multi-field Dirichlet conditions must specify a field" Problem((u, w); dirichlet=unscoped)
+    @test_throws "unknown field v" Problem((u, w); dirichlet=[dirichlet(0.0; on=everywhere, field=:v)])
+    @test_throws "unknown field v" Problem(u, mass_form(); dirichlet=[dirichlet(0.0; on=everywhere, field=:v)])
+    @test_throws "unknown field v" poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=everywhere, field=:v)])
+
+    # The conditions every problem shape does take still build: unscoped on one field, named on several.
+    @test length(Problem((u,); dirichlet=unscoped).dirichlet) == 1
+    named = [dirichlet(0.0; on=everywhere, field=:u), dirichlet((1.0, 2.0); on=everywhere, field=w)]
+    @test length(Problem((u, w); blocks=(mass_block(u), mass_block(w)), dirichlet=named).dirichlet) == 2
 end
 
 # `diffusion` is documented as a scalar, a `D × D` matrix, or a callback returning either, and `_diffusion_flux` also
