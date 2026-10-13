@@ -7,6 +7,22 @@ using Random
 using FileIO
 using MeshIO
 
+# The documented recipe loads FileIO beside Unfitted, so the two must export no common name: a shared one is ambiguous
+# in the caller's namespace and raises an `UndefVarError` the moment it is used. Unfitted's `load` was such a name, so
+# `stl_levelset`'s own example could not call it.
+@testset "MeshIO ext — Unfitted and FileIO export no common name" begin
+    @test isempty(intersect(names(Unfitted), names(FileIO)))
+end
+
+# The entry points are declared in the core and implemented by the extension `using MeshIO` loads. Once it is loaded, a
+# call none of its methods accepts is an ordinary `MethodError`, not advice to load what is loaded; the behaviour
+# without the extension is pinned in a fresh process by test_api.jl.
+@testset "MeshIO ext — the extension provides the mesh level sets" begin
+    @test Base.get_extension(Unfitted, :UnfittedMeshIOExt) !== nothing
+    @test_throws MethodError mesh_levelset(1)
+    @test_throws MethodError stl_levelset(1)
+end
+
 # ── 3D cube (triangle surface) ────────────────────────────────────────────────
 
 # A cube [lo,hi]³ as an outward-oriented triangle mesh (8 vertices, 12 triangles). Cube faces are planar, so each cut
@@ -175,6 +191,37 @@ end
     @test bad == 0
 end
 
+# A thin wedge prism: the triangle (0.2, 0.49), (0.9, 0.5), (0.2, 0.51), half-angle 0.82° at its apex, extruded over
+# z ∈ [0.2, 0.8] with its caps fanned from (0.4, 0.5). The query point lies 3e-7 (about 32 of the sign tests' `tol`)
+# outside the lower side face near the ridge's bottom end. Its closest point is inside that face, and its closest point
+# on the upper face lies within `tol` of it on the diagonal splitting that face, so the sign sums the one lower cell
+# and the upper pair. That stays outside only while a face-interior closest point weighs `2π` against an edge's `π`.
+@testset "MeshIO ext — pseudonormal sign next to a sharp ridge (3D)" begin
+    tri = [SVector(0.2, 0.49), SVector(0.9, 0.5), SVector(0.2, 0.51)]
+    v = vcat([SVector(p[1], p[2], 0.2) for p in tri], [SVector(p[1], p[2], 0.8) for p in tri],
+             [SVector(0.4, 0.5, 0.2), SVector(0.4, 0.5, 0.8)])
+    f = NTuple{3,Int}[]
+    for i in 1:3
+        j = mod1(i + 1, 3)
+        push!(f, (i, j, 3 + j), (i, 3 + j, 3 + i), (7, j, i), (8, 3 + i, 3 + j))
+    end
+    p = SVector(0.8999998828300635, 0.4999996999194075, 0.20000010415420186)
+    sdf = Unfitted._leaves(mesh_levelset(triangle_mesh(v, f)))[1].f
+    sw = Unfitted._leaves(mesh_levelset(triangle_mesh(v, f); orientation=:winding))[1].f
+    @test sdf(p) > 0
+    @test sw(p) > 0
+    @test abs(sdf(p)) ≈ minimum(_triangle_distance((v[a], v[b], v[c]), p) for (a, b, c) in f) rtol = 1e-6
+end
+
+# Closer to such a ridge, within a few of the sign tests' `tol` (1e-8 of the bounding-box diagonal), the gather can sum
+# cells that do not share the closest feature and the weights no longer balance them: 2 `tol` from this wedge's ridge
+# some points outside read as inside. `mesh_levelset`'s docstring states that limit rather than promising an exact sign.
+@testset "MeshIO ext — the docs state the pseudonormal's resolution limit" begin
+    texts = [join(doc.text)
+             for doc in values(Base.Docs.meta(Unfitted)[Base.Docs.Binding(Unfitted, :mesh_levelset)].docs)]
+    @test any(t -> occursin("10⁻⁸ of the bounding-box diagonal", t), texts)
+end
+
 @testset "MeshIO ext — winding sign mode" begin
     v, f = _cube_mesh(0.2, 0.8)
     sp = Unfitted._leaves(mesh_levelset(triangle_mesh(v, f); orientation=:pseudonormal))[1].f
@@ -203,6 +250,18 @@ end
     sdf = Unfitted._leaves(mesh_levelset(triangle_mesh(v, bad_faces)))[1].f
     @test isfinite(sdf(SVector(0.5, 0.5, 0.5)))
     @test sdf(SVector(0.5, 0.5, 0.5)) ≈ -0.3 atol = 1e-12
+
+    # A needle — corner 1, a point 1e-12 from it, corner 4 — is one triangle in each of its three vertex rotations, and
+    # it is dropped in each: the verdict is the sine of its smallest angle, not of the angle at whichever vertex comes
+    # first. Kept, its 1e-12 edge welds shut and the mesh is refused.
+    v, f = _cube_mesh(0.2, 0.8)
+    needle = vcat(v, [v[1] + SVector(1e-12, 0.0, 0.0)])
+    n = length(needle)
+    for tri in ((1, n, 4), (n, 4, 1), (4, 1, n))
+        sdf = Unfitted._leaves(mesh_levelset(triangle_mesh(needle, vcat(f, [tri]))))[1].f
+        @test length(sdf.cells) == length(f)
+        @test sdf(SVector(0.5, 0.5, 0.5)) ≈ -0.3 atol = 1e-12
+    end
 end
 
 @testset "MeshIO ext — an unclosed or inside-out mesh is rejected, not answered" begin
@@ -221,6 +280,90 @@ end
     write(empty_stl, "solid s\nendsolid s\n")
     @test_throws ArgumentError stl_levelset(empty_stl)
     rm(empty_stl; force=true)
+end
+
+@testset "MeshIO ext — a cell with two corners inside the weld radius is refused, not answered" begin
+    # Faces are paired through corners welded at 1e-6 of the mesh size, and a cell two of whose corners weld together
+    # loses the faces between them while the rest cancel or pair with the mesh: the check cannot tell a sliver lying
+    # flat in the surface from a dangling one, and a dangling one inverts the sign: answered, each sliver below reads
+    # points outside as inside or the reverse. `:winding` is the recourse.
+    v, f = _cube_mesh(0.2, 0.8)
+    # A spike hanging from corner 1, its base 1e-9 and its tip 0.4 below the cube.
+    spike = vcat(v, [v[1] + SVector(1e-9, 0.0, 0.0), SVector(0.2, 0.2, -0.2)])
+    @test_throws ArgumentError mesh_levelset(triangle_mesh(spike, vcat(f, [(1, 9, 10)])))
+    # A fin standing on the edge (1, 5), its base 5e-7: above the sign tests' tolerance, inside the weld radius.
+    fin = vcat(v, [v[1] + 5e-7 * SVector(-1.0, -1.0, 0.0) / sqrt(2)])
+    @test_throws ArgumentError mesh_levelset(triangle_mesh(fin, vcat(f, [(1, 9, 5)])))
+    # A triangle of side 1e-8 floating at the centre of the cube.
+    c = SVector(0.5, 0.5, 0.5)
+    speck = vcat(v, [c, c + SVector(1e-8, 0.0, 0.0), c + SVector(0.5e-8, 0.866e-8, 0.0)])
+    @test_throws ArgumentError mesh_levelset(triangle_mesh(speck, vcat(f, [(9, 10, 11)])))
+    # 2D: a segment 1e-8 long inside the square, and one about 5e-7 long hanging off its corner.
+    sq = _square_poly(0.2, 0.8)
+    loop = [(sq[i], sq[mod1(i + 1, 4)]) for i in 1:4]
+    @test_throws ArgumentError mesh_levelset(segment_mesh(vcat(loop, [(SVector(0.5, 0.5), SVector(0.5 + 1e-8, 0.5))])))
+    @test_throws ArgumentError mesh_levelset(segment_mesh(vcat(loop, [(sq[2], sq[2] + SVector(3.5e-7, -3.5e-7))])))
+
+    # The rule refuses a sound mesh with such an edge as well: the cube with its bottom face fanned from a hub 1e-9 from
+    # corner 1, whose two fan triangles at that corner lie flat in the face. `:winding` answers it; with the hub 1e-5
+    # from the corner, outside the weld radius, the default mode does too.
+    for (offset, mode) in ((1e-9, :winding), (1e-5, :pseudonormal))
+        verts = vcat(v, [v[1] + SVector(offset, offset, 0.0) / sqrt(2)])
+        hub = length(verts)
+        faces = [t for t in f if !issubset(t, (1, 2, 3, 4))]
+        append!(faces, [(hub, a, b) for (a, b) in ((1, 4), (4, 3), (3, 2), (2, 1))])
+        if mode === :winding
+            @test_throws ArgumentError mesh_levelset(triangle_mesh(verts, faces))
+        end
+        sdf = Unfitted._leaves(mesh_levelset(triangle_mesh(verts, faces); orientation=mode))[1].f
+        @test length(sdf.cells) == length(faces)
+        @test sdf(SVector(0.5, 0.5, 0.5)) ≈ -0.3 atol = 1e-12
+        @test sdf(SVector(0.5, 0.5, 0.1)) ≈ 0.1 atol = 1e-12
+    end
+end
+
+@testset "MeshIO ext — two cells on the same corners are refused, not answered" begin
+    # A pair of cells on the same corners, wound oppositely, traverses each of its faces once in each direction and
+    # encloses no volume, so it passes the closedness and volume tests; but its normals cancel in the pseudonormal,
+    # which then reads every point nearest the pair as outside. Accepted, each mesh below was answered so, over a
+    # region inside the solid. Each is refused by this check, with its own message, not by another of the same type,
+    # and the message counts the repeated cells: each copy beyond the first, so one for a pair.
+    function refused_as_twins(mesh, repeated)
+        try
+            mesh_levelset(mesh)
+            return false
+        catch e
+            return e isa ArgumentError &&
+                   occursin("mesh has $repeated repeated cells, each on the same corners as another cell", e.msg)
+        end
+    end
+    v, f = _cube_mesh(0.2, 0.8)
+    # A triangle inside the cube listed in both windings: a two-sided sheet.
+    sheet = vcat(v, [SVector(0.4, 0.4, 0.5), SVector(0.6, 0.4, 0.5), SVector(0.5, 0.6, 0.5)])
+    @test refused_as_twins(triangle_mesh(sheet, vcat(f, [(9, 10, 11), (9, 11, 10)])), 1)
+    # 2D: a whisker segment inside the square, listed both ways.
+    sq = _square_poly(0.2, 0.8)
+    loop = [(sq[i], sq[mod1(i + 1, 4)]) for i in 1:4]
+    a, b = SVector(0.4, 0.5), SVector(0.6, 0.5)
+    @test refused_as_twins(segment_mesh(vcat(loop, [(a, b), (b, a)])), 1)
+
+    # Two unit boxes sharing the face x = 1, each closed and outward, as a multi-body export gives them: the second is
+    # the first mirrored in that plane, so the shared face is triangulated alike from both sides. `:winding` signs the
+    # point half a unit inside their union correctly, and without the shared face the default mode answers the union.
+    w, g = _cube_mesh(0.0, 1.0)
+    verts = vcat(w, [SVector(2 - p[1], p[2], p[3]) for p in w])
+    mirrored(faces) = [(i + 8, k + 8, j + 8) for (i, j, k) in faces]   # rewound, as the mirror reverses orientation
+    wall = triangle_mesh(verts, vcat(g, mirrored(g)))
+    @test refused_as_twins(wall, 2)        # the shared face's two triangles, once each
+    # Inside-out as well, the wall is refused as inside-out, as it was before cells on the same corners were looked
+    # for: the check for them runs last.
+    inverted = triangle_mesh(verts, [(a, c, b) for (a, b, c) in vcat(g, mirrored(g))])
+    @test_throws "mesh is inside-out" mesh_levelset(inverted)
+    p = SVector(1.05, 0.5, 0.5)
+    @test Unfitted._leaves(mesh_levelset(wall; orientation=:winding))[1].f(p) < 0
+    outer = [t for t in g if !issubset(t, (2, 3, 6, 7))]   # every face of the two boxes but the shared one
+    joined = Unfitted._leaves(mesh_levelset(triangle_mesh(verts, vcat(outer, mirrored(outer)))))[1].f
+    @test joined(p) ≈ -0.5 atol = 1e-12
 end
 
 @testset "MeshIO ext — vertex welding absorbs an STL's Float32 corners" begin

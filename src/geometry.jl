@@ -2,11 +2,13 @@
 # for stored coordinates and downstream kernels. Both round-trip cheaply via `SVector{D}(…)`.
 const PointLike{D} = Union{NTuple{D,<:Real},SVector{D,<:Real}}
 
+# ── Tolerances ────────────────────────────────────────────────────────────────
+
 """
     GeometryTolerance([T=Float64]; merge, contain, small_volume)
 
 Coordinate tolerances driving geometry construction, intersection building, and conditioning diagnostics. Three
-thresholds, all positive and expressed in the same units as physical-domain coordinates:
+thresholds, all non-negative and expressed in the same units as physical-domain coordinates:
 
   - `merge` — coordinates closer than this in a given axis are canonicalised to the same value. Drives
     [`merge_coordinates`](@ref) and therefore the admissible-box construction in `intersections.jl`, so it sets the
@@ -20,7 +22,9 @@ thresholds, all positive and expressed in the same units as physical-domain coor
     `SmallOverlap` entries in the assembly diagnostics; they are *not* silently dropped — small-overlap conditioning is
     made visible instead of hidden.
 
-The keyword constructor accepts any positive value per field. Defaults are `merge = √eps(T)` and
+Each field accepts any non-negative value; zero is legal and means exact merging, exact containment and no
+small-overlap report. A negative or NaN value raises `ArgumentError`: a negative threshold silently disables the test
+it drives, and a NaN one makes every comparison against it false. Defaults are `merge = √eps(T)` and
 `contain = small_volume = merge`. The defaults are calibrated for coordinates of order one; on geometry at a markedly
 different length scale, pass `merge` scaled to that geometry — e.g. `√eps(T) · L` for a domain of extent `L`. Tighten
 `merge` also when the geometry is known to need finer canonicalisation; loosen `contain` only at integration tests that
@@ -30,10 +34,33 @@ struct GeometryTolerance{T<:Real}
     merge::T
     contain::T
     small_volume::T
+
+    # Every route to a tolerance, the keyword constructor included, ends here, so this is where a value that is not a
+    # tolerance is refused. Each threshold is compared with `≤` or `>`, so a negative one turns its test off — `merge =
+    # -1` stops merging even exact duplicates, a negative `contain` shrinks every box — and a NaN one makes every
+    # comparison false, which collapses each merged axis to its first coordinate. Neither is caught anywhere downstream
+    # before it has changed a result.
+    function GeometryTolerance{T}(merge, contain, small_volume) where {T<:Real}
+        return new{T}(_tolerance_value(T, merge, :merge), _tolerance_value(T, contain, :contain),
+                      _tolerance_value(T, small_volume, :small_volume))
+    end
 end
 
 function GeometryTolerance(::Type{T}=Float64; merge=sqrt(eps(T)), contain=merge, small_volume=merge) where {T<:Real}
     return GeometryTolerance{T}(convert(T, merge), convert(T, contain), convert(T, small_volume))
+end
+
+# The positional constructor Julia generates for a struct without an inner constructor, kept by hand now that there is
+# one; like every other route it ends in the inner constructor's check.
+function GeometryTolerance(merge::T, contain::T, small_volume::T) where {T<:Real}
+    return GeometryTolerance{T}(merge, contain, small_volume)
+end
+
+# Convert one threshold to `T` and refuse it unless it is non-negative (`v >= 0` is false for NaN as well).
+function _tolerance_value(::Type{T}, value, name::Symbol) where {T}
+    v = convert(T, value)
+    v >= 0 || throw(ArgumentError("GeometryTolerance $name must be non-negative; got $value"))
+    return v
 end
 
 """
@@ -64,6 +91,8 @@ function merge_coordinates(values, tol::GeometryTolerance{T}) where {T}
     return resize!(sorted, n)
 end
 
+# ── Axis-aligned boxes ────────────────────────────────────────────────────────
+
 """
     AxisBox{D,T}(lower, upper)
     box(lower, upper)
@@ -76,7 +105,7 @@ every region the assembly hot loop sees is a proper `D`-cube with positive volum
 Constructors:
 
   - `box(lower, upper)` — corner-to-corner. Accepts `NTuple{D,<:Real}` or `SVector{D,<:Real}` corners; the scalar type
-    is promoted from the inputs.
+    is promoted from the inputs. `AxisBox(lower, upper)` is the same constructor.
   - `box(center; halfwidth)` — centered form. `center` is a point; `halfwidth` may be a scalar (isotropic) or a
     `D`-tuple / `SVector` (anisotropic) of half-edge-lengths. Equivalent to
     `box(center − halfwidth, center + halfwidth)`.
@@ -96,10 +125,9 @@ struct AxisBox{D,T<:Real}
     end
 end
 
-AxisBox(lower::SVector{D,T}, upper::SVector{D,T}) where {D,T<:Real} = AxisBox{D,T}(lower, upper)
-function AxisBox(lower::NTuple{D,T}, upper::NTuple{D,T}) where {D,T<:Real}
-    AxisBox{D,T}(SVector{D,T}(lower), SVector{D,T}(upper))
-end
+# `AxisBox(lower, upper)` is `box(lower, upper)`, the one corner-to-corner construction: either corner an `NTuple` or
+# an `SVector`, the scalar type promoted over both.
+AxisBox(lower::PointLike{D}, upper::PointLike{D}) where {D} = box(lower, upper)
 
 """
     box(lower, upper) -> AxisBox
@@ -115,11 +143,12 @@ Construct an [`AxisBox`](@ref), the dimension-generic axis-aligned box used thro
 See [`AxisBox`](@ref) for the stored representation and the non-degenerate `lower[i] < upper[i]` invariant the
 constructor enforces.
 """
-box(lower::NTuple{D,<:Real}, upper::NTuple{D,<:Real}) where {D} = box(SVector(lower), SVector(upper))
-
-function box(lower::SVector{D,<:Real}, upper::SVector{D,<:Real}) where {D}
-    T = promote_type(eltype(lower), eltype(upper))
-    return AxisBox{D,T}(SVector{D,T}(lower), SVector{D,T}(upper))
+function box(lower::PointLike{D}, upper::PointLike{D}) where {D}
+    # Each corner becomes an `SVector` before the scalar type is read: an `SVector`'s element type is a parameter even
+    # when `D` is not known, where a tuple's is not, so a call whose `D` inference cannot see still infers `T`.
+    l, u = SVector{D}(lower), SVector{D}(upper)
+    T = promote_type(eltype(l), eltype(u))
+    return AxisBox{D,T}(SVector{D,T}(l), SVector{D,T}(u))
 end
 
 function box(center::PointLike{D}; halfwidth) where {D}
@@ -226,6 +255,14 @@ end
 # corners, the mesh axes of `_mesh_axes` in `mesh.jl`, or the canonicalised region coordinates of `merge_coordinates` —
 # never two independently rounded paths to the "same" corner.
 Base.:(==)(a::AxisBox{D}, b::AxisBox{D}) where {D} = a.lower == b.lower && a.upper == b.upper
+
+# `isequal` and `hash` go together, as Julia's contract `isequal(a, b) ⇒ hash(a) == hash(b)` requires. With `==` alone
+# overloaded, `isequal` fell back to `==` while `hash` stayed the bitwise default, so `box((-0.0, 0), (1, 1))` and
+# `box((0.0, 0), (1, 1))`, or a `Float32` and a `Float64` box with the same corners, were `isequal` with different
+# hashes, and a `Set` or `Dict` of boxes could hold both or miss either. Both now follow the corners' own `isequal` and
+# `hash`, the split Julia's floating-point numbers make: `-0.0 == 0.0`, but they are not `isequal`.
+Base.isequal(a::AxisBox, b::AxisBox) = isequal(a.lower, b.lower) && isequal(a.upper, b.upper)
+Base.hash(b::AxisBox, h::UInt) = hash(b.upper, hash(b.lower, hash(:AxisBox, h)))
 
 """
     box_intersection(a::AxisBox{D,T}, b::AxisBox{D,T}) -> Union{AxisBox{D,T},Nothing}

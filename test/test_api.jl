@@ -104,11 +104,33 @@ end
     @test_throws ArgumentError poisson(u; source=0.0, dirichlet=[dirichlet(0.0; on=everywhere, field=:u, component=3)])
     @test_throws ArgumentError poisson(u; source=0.0, dirichlet=[dirichlet(0.0; on=everywhere, component=3)])
 
-    # An unscoped condition on a multi-field problem names no field to check against; `_dirichlet_for_field` still
-    # rejects it at `prepare` time.
-    two = Problem((u, field(:w, V)); blocks=(stiffness_block(u),),
-                  dirichlet=[dirichlet(0.0; on=everywhere, component=3)])
-    @test_throws ArgumentError prepare(two)
+    # An unscoped condition on a multi-field problem names no field to check its component against, and `Problem`
+    # refuses it as such.
+    @test_throws "multi-field Dirichlet conditions must specify a field" Problem((u, field(:w, V));
+                                                                                 blocks=(stiffness_block(u),),
+                                                                                 dirichlet=[dirichlet(0.0;
+                                                                                                      on=everywhere,
+                                                                                                      component=3)])
+end
+
+# A Dirichlet condition belongs to one field of its problem: the only one when it names none, the one it names
+# otherwise. `Problem` resolves that owner when it is built. An unscoped condition on a problem of several fields, and a
+# name no field carries, used to construct and fail only at `prepare`, after the problem had been passed around and
+# perhaps rehomed; the messages are the ones `prepare` gave.
+@testset "Problem refuses a Dirichlet condition it cannot attach to a field" begin
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    u, w = field(:u, V), field(:w, V; components=2)
+    everywhere = boundary(:all)
+    unscoped = [dirichlet(0.0; on=everywhere)]
+    @test_throws "multi-field Dirichlet conditions must specify a field" Problem((u, w); dirichlet=unscoped)
+    @test_throws "unknown field v" Problem((u, w); dirichlet=[dirichlet(0.0; on=everywhere, field=:v)])
+    @test_throws "unknown field v" Problem(u, mass_form(); dirichlet=[dirichlet(0.0; on=everywhere, field=:v)])
+    @test_throws "unknown field v" poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=everywhere, field=:v)])
+
+    # The conditions every problem shape does take still build: unscoped on one field, named on several.
+    @test length(Problem((u,); dirichlet=unscoped).dirichlet) == 1
+    named = [dirichlet(0.0; on=everywhere, field=:u), dirichlet((1.0, 2.0); on=everywhere, field=w)]
+    @test length(Problem((u, w); blocks=(mass_block(u), mass_block(w)), dirichlet=named).dirichlet) == 2
 end
 
 # `diffusion` is documented as a scalar, a `D × D` matrix, or a callback returning either, and `_diffusion_flux` also
@@ -139,6 +161,45 @@ end
     @test_throws DimensionMismatch K([1.0 0.0; 0.0 1.0; 0.0 0.0])
 end
 
+# A constant per-component coefficient carries one entry per component of its field, exactly as a constant Dirichlet
+# datum does. A longer one used to be truncated silently and a shorter one raised a `BoundsError` from inside the
+# assembly loop; a constant diffusion that is not a scalar, a `UniformScaling` or a matrix raised a `MethodError` at
+# every quadrature point. Each builder that knows the field now refuses the wrong shape where it is spelled.
+@testset "constant coefficients are checked against their field" begin
+    SVector = Unfitted.SVector
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    u = field(:u, V)
+    w = field(:w, V; components=2)
+    everywhere = boundary(:all)
+
+    for value in ((1.0,), SVector(1.0, 2.0, 99.0), [1.0, 2.0, 3.0])
+        needs = "of field w, 2, but this one has length $(length(value))"
+        @test_throws needs mass_block(w; coefficient=value)
+        @test_throws needs mass(w; coefficient=value)
+        @test_throws needs source_load(w; source=value)
+        @test_throws needs poisson(w; source=value)
+        @test_throws needs neumann(w, value; on=everywhere)
+        @test_throws needs neumann(w, value; on=everywhere, component=1)
+    end
+    @test_throws "of field u, 1, but this one has length 2" mass_block(u; coefficient=SVector(1.0, 2.0))
+    @test_throws "of field u, 1, but this one has length 2" poisson(V; source=(1.0, 2.0))
+
+    # The right length, a scalar and a callback build as before; a callback is not evaluated ahead of time.
+    @test mass_block(w; coefficient=(1.0, 2.0)) isa BlockForm
+    @test mass_block(w; coefficient=2.0) isa BlockForm
+    @test source_load(w; source=x -> SVector(1.0, 2.0, 3.0)) isa LoadForm
+    @test poisson(V; source=(1.0,)) isa Problem
+
+    for diffusion in ([1.0, 2.0], (1.0, 2.0), SVector(1.0, 2.0), ones(2, 2, 2))
+        @test_throws "a constant diffusion is a scalar, a UniformScaling or a square matrix" stiffness_form(; diffusion)
+        @test_throws ArgumentError stiffness(V; diffusion)
+        @test_throws ArgumentError poisson(V; source=1.0, diffusion)
+    end
+    for diffusion in (2.0, 3, 2.0 * I, [2.0 0.0; 0.0 3.0], x -> 2.0)
+        @test stiffness_form(; diffusion) isa WeakForm
+    end
+end
+
 # Every exported name should answer `?name` in a bare `using Unfitted` session. Reading the *source* is what let two of
 # them regress: a docstring separated from its definition by an intervening comment block parses as a standalone string
 # and never reaches `Core.@doc`, so the prose is right there in the file and `?BlockForm` still prints nothing. Only
@@ -151,40 +212,47 @@ end
     @test :BlockForm ∉ undocumented
     @test :LoadForm ∉ undocumented
 
-    # The remaining gaps are known and structural, not detachments:
-    #
-    #   * `mass_form` / `mass_block` each carry one docstring covering their two siblings as well; a docstring attaches
-    #     to a single definition, so the siblings have no entry of their own;
-    #   * the extension stubs are documented in the module docstring and in the comment blocks above their
-    #     `function … end` declarations in `Unfitted.jl`, and any docstring the extension attaches lands in the
-    #     extension module's `meta`, not this one.
+    # The `Problem` constructors' docstring, which a comment block between it and its method detached as well. The
+    # struct's own docstring keeps `:Problem` out of `undocumented` either way, so the constructors' text is looked up.
+    texts = [join(doc.text) for doc in values(meta[Base.Docs.Binding(Unfitted, :Problem)].docs)]
+    @test any(t -> occursin("Three convenience constructors", t), texts)
+
+    # The remaining gap is known and structural, not a detachment: `mass_form` / `mass_block` each carry one docstring
+    # covering their two siblings as well, and a docstring attaches to a single definition, so the siblings have no
+    # entry of their own.
     #
     # Subset, not equality: documenting one of these is an improvement and must not fail the suite, while a *new*
-    # undocumented export does.
+    # undocumented export does. The names an extension implements are not exempt: the core declares and documents each.
     grouped = [:source_form, :stiffness_form, :source_load, :stiffness_block]
-    extension_stubs = [:bspline, :gradient_tensor, :mesh_levelset, :stl_levelset, :symmetric_gradient, :value_vec]
-    @test issubset(undocumented, union(grouped, extension_stubs))
+    @test issubset(undocumented, grouped)
 
     # The VTK writers are implemented by an extension and documented here, the two series operations included: their
     # docstrings sit on abstract signatures that no method of the core implements, so pin that they reached the docs.
     @test haskey(meta[Base.Docs.Binding(Unfitted, :write_vtk)].docs, Tuple{VTKSeries,Any,Any,Any})
     @test haskey(meta[Base.Docs.Binding(Base, :close)].docs, Tuple{VTKSeries})
+    # So are the tensor readers' `Val` and `Field` forms: one docstring per signature the Tensors extension implements.
+    ndocs(name) = length(meta[Base.Docs.Binding(Unfitted, name)].docs)
+    @test (ndocs(:symmetric_gradient), ndocs(:value_vec), ndocs(:gradient_tensor)) == (3, 2, 2)
 end
 
-# The VTK writers are a package extension that `using WriteVTK` loads. Without it each entry point must say so, naming
-# `using WriteVTK`, before it touches the file system, and `using Unfitted` alone must not load WriteVTK, which is what
-# keeps WriteVTK out of the package's load time. Only a fresh process can show either: this one may have loaded
-# WriteVTK already (test_vtk.jl does), and a loaded package cannot be unloaded. The child loads Unfitted alone and calls
-# each entry point with placeholder arguments, which a stub never reads, so no model is built and the test costs one
-# package load.
-@testset "the VTK entry points ask for WriteVTK until it is loaded" begin
+# The VTK writers, the tensor-notation readers, the B-spline factory and the mesh level sets are package extensions that
+# `using WriteVTK`, `using Tensors`, `using BasicBSpline` and `using MeshIO` load. Without its extension each entry
+# point must say so, naming the package, before it touches anything (the file system included), and `using Unfitted`
+# alone must load none of those packages, which is what keeps them out of the package's load time. Only a fresh process
+# can show either: this one may have loaded them already (the extensions' test files do), and a loaded package cannot be
+# unloaded. The child loads Unfitted alone and calls each entry point with placeholder arguments, which a stub never
+# reads, so no model is built and the test costs one package load.
+@testset "the extension entry points ask for their package until it is loaded" begin
     dir = mktempdir()
     script = """
         using Unfitted
         dir = only(ARGS)
         calls = (write_vtk => (joinpath(dir, "w", "bundle"), nothing, nothing),
                  vtk_series => (joinpath(dir, "s", "run"),),
-                 write_quadrature_vtm => (joinpath(dir, "q", "cloud"), nothing))
+                 write_quadrature_vtm => (joinpath(dir, "q", "cloud"), nothing),
+                 symmetric_gradient => (nothing,), value_vec => (nothing, :u, Val(2)),
+                 gradient_tensor => (nothing, :u, Val(2)), bspline => (),
+                 mesh_levelset => (nothing,), stl_levelset => (joinpath(dir, "m", "part.stl"),))
         for (f, args) in calls
             message = try
                 f(args...)
@@ -194,7 +262,8 @@ end
             end
             println(nameof(f), " => ", replace(message, '\\n' => ' '))
         end
-        println("WriteVTK loaded => ", any(p -> p.name == "WriteVTK", keys(Base.loaded_modules)))
+        packages = ("WriteVTK", "Tensors", "BasicBSpline", "MeshIO", "FileIO", "GeometryBasics")
+        println("packages loaded => ", any(p -> p.name in packages, keys(Base.loaded_modules)))
         """
     cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) -e $script $dir`
     reported = Dict{String,String}()
@@ -203,9 +272,12 @@ end
         name, message = split(line, " => "; limit=2)
         reported[name] = message
     end
-    for name in ("write_vtk", "vtk_series", "write_quadrature_vtm")
-        @test occursin("using WriteVTK", get(reported, name, ""))
+    entry_points = ("write_vtk" => "WriteVTK", "vtk_series" => "WriteVTK", "write_quadrature_vtm" => "WriteVTK",
+                    "symmetric_gradient" => "Tensors", "value_vec" => "Tensors", "gradient_tensor" => "Tensors",
+                    "bspline" => "BasicBSpline", "mesh_levelset" => "MeshIO", "stl_levelset" => "MeshIO")
+    for (name, package) in entry_points
+        @test occursin("using $package", get(reported, name, ""))
     end
-    @test get(reported, "WriteVTK loaded", "") == "false"
+    @test get(reported, "packages loaded", "") == "false"
     @test isempty(readdir(dir))
 end

@@ -69,26 +69,33 @@ struct DirichletCondition{F}
     component::Union{Nothing,Int}
 end
 
-# Reject a constant per-component datum — a tuple or array — whose length is not `components`, the component count of
-# the field `name` the condition constrains. The projection reads entry `c` of such a datum for component `c`
-# (`_component_value`), and does so under `component = c` too, so the datum carries one entry per component whether or
-# not the condition is scoped to one. Unchecked, a wrong length went three ways, none of them an error naming the
-# mistake: a short all-zero datum passed silently, because homogeneous data are never projected
-# (`_needs_dirichlet_projection`) and so never indexed; a short nonzero one failed inside the projection with an
-# incidental `BoundsError`, or not at all when every entry it read was in range; and a long one was accepted with its
-# extra entries ignored. A callback is not checked: only evaluating it could say what it returns. The condition, rather
-# than its datum, is the argument, so a caller walking an abstractly typed condition list dispatches once per condition
-# and never boxes an isbits datum to pass it on.
-function _check_dirichlet_datum(condition::DirichletCondition, components::Integer, name::Union{Nothing,Symbol})
-    value = condition.value
+# Reject a constant per-component value — a tuple or array — whose length is not `components`, the component count of
+# the field `name` it acts on. Such a value is read through `_component_value`, entry `c` for component `c`, by a
+# Dirichlet condition (under `component = c` too, so a datum carries one entry per component whether or not its
+# condition is scoped to one) and by a coefficient, source or Neumann value alike, so it is one check with one message
+# for all of them; `what` names the value, and `component` is the scope of a Dirichlet condition, which the message
+# then explains.
+#
+# Unchecked, a wrong length never raised an error naming the mistake. A Dirichlet datum went three ways: a short
+# all-zero one passed silently, because homogeneous data are never projected (`_needs_dirichlet_projection`) and so
+# never indexed; a short nonzero one failed inside the projection with an incidental `BoundsError`, or not at all when
+# every entry it read was in range; and a long one was accepted with its extra entries ignored. A coefficient was
+# truncated, or raised the `BoundsError` from inside the assembly loop, wrapped in a `TaskFailedException` when
+# threaded. A callback is not checked: only evaluating it could say what it returns.
+function _check_per_component(value, components::Integer, what::String, name::Union{Nothing,Symbol}, component=nothing)
     (value isa Union{Tuple,AbstractArray} && length(value) != components) || return nothing
     owner = name === nothing ? "its field" : "field $name"
-    scoped = condition.component === nothing ? "" :
-             "; a condition scoped to component $(condition.component) still reads entry " *
-             "$(condition.component) of a per-component value, or takes a scalar"
-    throw(ArgumentError("a constant tuple or array Dirichlet datum carries one entry per " *
-                        "component of $owner, $components, but this one has length " *
-                        "$(length(value))$scoped"))
+    scoped = component === nothing ? "" :
+             "; a condition scoped to component $component still reads entry $component of a per-component value, " *
+             "or takes a scalar"
+    throw(ArgumentError("a constant tuple or array $what carries one entry per component of $owner, $components, " *
+                        "but this one has length $(length(value))$scoped"))
+end
+
+# The condition, rather than its datum, is the argument, so a caller walking an abstractly typed condition list
+# dispatches once per condition and never boxes an isbits datum to pass it on.
+function _check_dirichlet_datum(condition::DirichletCondition, components::Integer, name::Union{Nothing,Symbol})
+    return _check_per_component(condition.value, components, "Dirichlet datum", name, condition.component)
 end
 
 # ── Physical-Dirichlet detection ──────────────────────────────────────────────
@@ -705,10 +712,6 @@ end
 # factorised mass, and the sampled boundary traces — and is built once and reused, while each increment re-accumulates
 # `b` from the samples and back-substitutes. See `DirichletProjection` for why that reuse is exact and when it is
 # invalidated.
-#
-# The `_test_value_contribution` and `_as_test_channels` helpers are defined in `problems.jl`'s channel layer and reused
-# here so the Dirichlet projection rides the same channel calculus the volume assembly uses; the forward reference
-# resolves at call time (`prepare(problem)` loads every source file first).
 
 """
     FacetTraceSamples{D,T}(points, weights, offsets, values, rows)
@@ -1042,13 +1045,12 @@ function _sample_dirichlet_facet!(mass::Vector{Matrix{T}}, index::Vector{Dict{In
                     for b in eachindex(trial_trace.raw_dofs)
                         col = get(index_c, trial_trace.raw_dofs[b], 0)
                         col == 0 && continue
-                        mass_channels = _as_test_channels(trial_trace.values[b], Val(D), T)
+                        trial_value = convert(T, trial_trace.values[b])
                         for test_trace in traces
                             for a in eachindex(test_trace.raw_dofs)
                                 row = get(index_c, test_trace.raw_dofs[a], 0)
                                 row == 0 && continue
-                                mass_c[row, col] += qweight *
-                                                    _test_value_contribution(mass_channels, test_trace.values[a])
+                                mass_c[row, col] += qweight * (trial_value * test_trace.values[a])
                             end
                         end
                     end
@@ -1083,28 +1085,28 @@ function _accumulate_dirichlet_rhs!(rhs::Vector{Vector{T}}, samples::FacetTraceS
         last_entry = samples.offsets[k + 1] - 1
         for component in 1:ncomp
             _constrains(condition, component) || continue
-            g = convert(T, _condition_value(condition, x, component))
-            channels = _as_test_channels(g, Val(D), T)
+            g = convert(T, _component_value(_datum_at(condition.value, x), component))
             rows = samples.rows[component]
             rhs_c = rhs[component]
             @inbounds for e in first_entry:last_entry
                 row = rows[e]
                 row == 0 && continue
-                rhs_c[row] += qweight * _test_value_contribution(channels, samples.values[e])
+                rhs_c[row] += qweight * (g * samples.values[e])
             end
         end
     end
     return rhs
 end
 
-# Evaluate a `DirichletCondition` at physical coordinate `x` for the given component. Handles both constant and callback
-# `value` fields.
-function _condition_value(condition::DirichletCondition, x, component::Integer=1)
-    value = condition.value isa Function ? condition.value(x) : condition.value
-    return _component_value(value, component)
-end
+# A datum — a Dirichlet value, a coefficient, a source, a Neumann value or a diffusion — at the physical point `x`. A
+# number, tuple, array or `UniformScaling` is a constant, and anything else is a callback `value(x)`. The one rule
+# for every datum of the package: two classifiers used to disagree on a callable struct, which a source called and a
+# Dirichlet condition indexed as a constant. The value's type decides, so a form's closure, which captures the datum,
+# dispatches here at compile time.
+_datum_at(value::Union{Number,Tuple,AbstractArray,UniformScaling}, x) = value
+_datum_at(f, x) = f(x)
 
-# Component extraction from a Dirichlet value: scalars apply to every component, anything indexable supplies one entry
+# Component extraction from a datum's value: scalars apply to every component, anything indexable supplies one entry
 # per component.
 function _component_value(value, component::Integer)
     value isa Number && return value

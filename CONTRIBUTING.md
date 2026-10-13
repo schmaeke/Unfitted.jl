@@ -1368,9 +1368,11 @@ Rules:
     declared in `src/Unfitted.jl`, since an extension cannot export a
     name, and a docstring that `?name` must find in a session without the
     extension belongs there too: one written in the extension lands in
-    the extension module's own docs. The VTK writers are declared as
-    fallback methods that, without the extension, raise an error naming
-    the package to load (`_extension_missing`).
+    the extension module's own docs. Every such name is declared as one
+    fallback method that, without the extension, raises an error naming
+    the package to load (`_extension_missing`); a further signature an
+    extension implements is documented on an abstract signature in the
+    core.
   - `Manifest.toml` is git-ignored. Do not change that.
 
 ## Performance
@@ -1639,7 +1641,7 @@ demos.
   - Pass constant-valued inputs as bare constants, not as closures, for
     the coefficient-shaped keywords that accept both — `source`,
     `coefficient`, `diffusion` and Dirichlet data, which all pass through
-    `_as_coefficient`. Write `source = 1.0`, never `source = x -> 1.0`.
+    `_datum_at`. Write `source = 1.0`, never `source = x -> 1.0`.
     Every distinct closure is a distinct *type*, and each one forces a
     full re-specialisation of the assembly emission kernel at roughly
     0.9 s of compile time, for

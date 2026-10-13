@@ -12,6 +12,15 @@ using LinearAlgebra: Symmetric, eigvals, isposdef, norm, pinv, rank
 # `_combine_terms`) lives there, not in `Unfitted`.
 const BSExt = Base.get_extension(Unfitted, :UnfittedBasicBSplineExt)
 
+# The factory is declared in the core and implemented by the extension `using BasicBSpline` loads. Once it is loaded, a
+# call its method does not accept is an ordinary `MethodError`, not advice to load what is loaded; the behaviour without
+# the extension is pinned in a fresh process by test_api.jl.
+@testset "BSpline extension: the extension provides the factory" begin
+    @test BSExt !== nothing
+    @test_throws MethodError bspline(1)
+    @test_throws ArgumentError bspline(; continuity=-1)
+end
+
 @testset "BSpline extension: a per-cell order is refused, not ignored" begin
     # Per-cell polynomial order is a basis-family capability. A B-spline degree is a type parameter of the whole-axis
     # knot vector, the clamped end multiplicity is p + 1, the 1D dimension is `cells + p`, and a function's support is

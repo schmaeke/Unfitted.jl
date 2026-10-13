@@ -112,16 +112,13 @@ end
     @test length(load_only.problem.loads) == 1
 
     # A *direct* attachment on the side a form does not declare is still an error and not a silent zero — the `WeakForm`
-    # docstring says so, and this keeps it honest. Serial assembly so the `MethodError` arrives unwrapped rather than
-    # inside a `CompositeException` from a worker task.
+    # docstring says so, and this keeps it honest. It is refused where it is spelled, by `block` and `loadform`; it used
+    # to reach the assembly loop with an uncallable `nothing` and raise a `MethodError` there, inside a
+    # `CompositeException` from a worker task when threaded.
     u = field(:u, V)
-    wrong_block = prepare(Problem((u,); blocks=(block(u, u, linear_only),),
-                                  dirichlet=[dirichlet(0.0; on=boundary(:all))]))
-    @test_throws MethodError assemble!(wrong_block; threaded=false)
-
-    wrong_load = prepare(Problem((u,); blocks=(block(u, u, bilinear_only),), loads=(loadform(u, bilinear_only),),
-                                 dirichlet=[dirichlet(0.0; on=boundary(:all))]))
-    @test_throws MethodError assemble!(wrong_load; threaded=false)
+    @test_throws "block attaches a form's bilinear side, and this form has none" block(u, u, linear_only)
+    @test_throws "loadform attaches a form's linear side, and this form has none" loadform(u, bilinear_only)
+    @test_throws ArgumentError block(u, u, linear_only; on=boundary(:all))
 end
 
 @testset "2D scalar H1 assembly is symmetric positive definite" begin
@@ -460,7 +457,8 @@ end
     mass_model = prepare(mass(V; dirichlet=bc))
     stiffness_model = prepare(stiffness(V; diffusion=2.0, dirichlet=bc))
     poisson_model = prepare(poisson(V; source=0.0, diffusion=2.0, dirichlet=bc))
-    load_model = prepare(load(V; source=x -> 1.0 + x[1], dirichlet=bc))
+    u = field(:u, V)
+    load_model = prepare(Problem((u,); loads=(source_load(u; source=x -> 1.0 + x[1]),), dirichlet=bc))
 
     assemble!(mass_model)
     assemble!(stiffness_model)
@@ -1382,6 +1380,27 @@ end
         separate_bytes = sum(form -> _serial_assembly_bytes(assemble, model, (form,)), combined_forms)
         @test _serial_assembly_bytes(assemble, model, combined_forms) ≤ separate_bytes
     end
+end
+
+@testset "a callback diffusion assembles without dynamic dispatch" begin
+    # The canonical forms' per-point helpers (`_stiffness_channels`, `_mass_value`, `_source_value`) pass a callback
+    # datum on to `_datum_at` without calling it, and Julia does not specialise a method on a `Function` argument it
+    # merely passes along. Unless the helper takes the datum's type as a parameter, a form closure that does not inline
+    # it runs a `::Function` instance, which dispatches dynamically and allocates at every quadrature point and trial
+    # function. A matrix-valued diffusion callback in 3D is such a case: its assembly here took 1.88 MB against the
+    # constant tensor's 0.11 MB, on Julia 1.10 and 1.12 alike. A callback costs the assembly nothing per point, so it
+    # must allocate what the constant does, up to a 4 KiB slack, a fraction of a percent of what dispatching per point
+    # costs here.
+    V = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(2, 2, 2), order=2)
+    u = field(:u, V)
+    model = prepare(Problem((u,)))
+    A = SMatrix{3,3}(2.0, 0.25, 0.0, 0.25, 1.0, 0.0, 0.0, 0.0, 1.5)
+    blocks = (stiffness_block(u; diffusion=A), stiffness_block(u; diffusion=x -> (1 + x[2]) * A))
+    # On a fresh model the first block measured is charged about 26 KB more than any later one, on its second call too,
+    # which would hide part of a regression behind the constant's figure, so one measurement is thrown away first.
+    _serial_assembly_bytes(assemble_matrix, model, (first(blocks),))
+    constant, callback = map(b -> _serial_assembly_bytes(assemble_matrix, model, (b,)), blocks)
+    @test callback ≤ constant + 4096
 end
 
 # ── Concurrent assembly calls on one model ────────────────────────────────────

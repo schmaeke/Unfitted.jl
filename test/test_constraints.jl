@@ -709,6 +709,28 @@ end
     @test dirichlet(x -> SVector(1.0); on=top, field=u) isa Unfitted.DirichletCondition
 end
 
+# A callable struct, used as a Dirichlet datum below. The `dirichlet` docstring promises "a callback `value(x)`", and a
+# callable struct is one, as it is when passed as a source.
+struct AffineDirichletDatum
+    slope::Float64
+end
+(g::AffineDirichletDatum)(x) = 1.0 + g.slope * x[1] - x[2]
+
+@testset "a callable-struct Dirichlet datum is called" begin
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    datum = AffineDirichletDatum(0.5)
+    function solved(g)
+        model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(g; on=boundary(:all))]))
+        return model, solve!(model)
+    end
+    model, s = solved(datum)
+    wrapped, sw = solved(x -> datum(x))
+    @test only(model.dofs.fields).dofs.constrained_values == only(wrapped.dofs.fields).dofs.constrained_values
+    @test s.coefficients == sw.coefficients
+    # The datum is affine and so harmonic: the discrete solution reproduces it exactly, inside as on the boundary.
+    @test value(s, model, (0.3, 0.6)) ≈ datum((0.3, 0.6)) atol = 1e-12
+end
+
 # Function-valued Dirichlet must also refresh correctly. A constant callback `x -> c` must give the same answer as the
 # scalar `c`.
 @testset "update_dirichlet! handles function-valued data" begin
@@ -1809,15 +1831,50 @@ end
     @test everywhere != boundary(:all; except=(axis=1, side=:lower))
     @test length(Dict(everywhere => 1, boundary(:all; except=(axis=1, side=:lower)) => 2)) == 2
 
-    # An unsupported symbol with no `except` still constructs and still fails exactly where it used to — at prepare
-    # time, not at construction.
-    @test boundary(:nonsense).selector === :nonsense
-    @test isempty(boundary(:nonsense).sides)
-    @test_throws ArgumentError Unfitted._facets(boundary(:nonsense), Val(2))
+    # `:all` is the only symbol a selector takes. Any other one is refused where it is spelled, naming the spellings
+    # that do exist. Each of these used to construct: `:sides` as the empty facet, which every raw covers, so a
+    # Dirichlet condition on it eliminated every dof of the space, interior ones included; `:except` as an undocumented
+    # alias of `:all`; and anything else as a selector that failed only at `prepare`.
+    for selector in (:sides, :except, :nonsense)
+        @test_throws "boundary(:$selector) is not a selector: use boundary(:all)" boundary(selector)
+    end
+    # `_facets`, where every consumer decomposes a selector, still refuses a hand-built one with an unknown symbol.
+    @test_throws ArgumentError Unfitted._facets(Unfitted.BoundarySelector(:nonsense, Tuple{Int,Symbol}[]), Val(2))
 
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
     model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
     @test haskey(model.regions, (boundary(:all), model.problem.space))
+end
+
+@testset "a boundary pair is parsed as an except entry is" begin
+    # One parser reads the positional pairs and the `except` entries. A pair used to accept a key it does not know
+    # silently, `(axis=1, side=:lower, sides=:upper)` reading as its first two keys, and to pass an axis below 1 on to
+    # `prepare`, which refused it there as out of bounds. Both are refused where they are spelled now, in every spelling
+    # of a face, as `except` always refused them.
+    @test_throws "boundary pairs take the keys :axis and :side only" boundary((axis=1, side=:lower, sides=:upper))
+    @test_throws "boundary pairs take the keys :axis and :side only" boundary((axis=1, side=:lower),
+                                                                              (axis=2, side=:upper, x=1))
+    @test_throws "boundary axis 0 must be positive" boundary((axis=0, side=:lower))
+    @test_throws "boundary axis 0 must be positive" boundary(axis=0, side=:lower)
+    @test_throws "boundary axis -1 must be positive" boundary((axis=1, side=:lower), (axis=-1, side=:upper))
+
+    # An exclusion names both faces of an axis by leaving `side` out, not by giving it `nothing`. A present `side` is
+    # checked whatever its value, so `side=nothing` is refused with the side's own message in either spelling, rather
+    # than excluding both faces of the axis silently or failing on an incidental `MethodError`.
+    @test_throws "boundary side must be :lower or :upper" boundary((axis=1, side=nothing))
+    @test_throws "boundary side must be :lower or :upper" boundary((axis=1, side=:lower), (axis=2, side=nothing))
+    @test_throws "boundary side must be :lower or :upper" boundary(:all; except=(axis=1, side=nothing))
+    @test_throws "boundary side must be :lower or :upper" boundary(:all; except=[(axis=2, side=nothing)])
+    @test boundary(:all; except=(axis=1,)).sides == [(1, :lower), (1, :upper)]
+
+    # The messages a pair always gave, and the selectors it built, are unchanged.
+    @test_throws "boundary pairs must carry :axis and :side keys" boundary((axis=1,), (axis=2, side=:lower))
+    @test_throws "boundary side must be :lower or :upper" boundary((axis=1, side=:mid))
+    @test_throws "boundary side must be :lower or :upper" boundary(axis=1, side=:mid)
+    @test_throws "boundary axis 1 specified more than once" boundary((axis=1, side=:lower), (axis=1, side=:upper))
+    @test boundary(axis=2, side=:upper) == Unfitted.BoundarySelector(:sides, [(2, :upper)])
+    @test boundary((axis=2, side=:upper)) == boundary(axis=2, side=:upper)
+    @test boundary((axis=1, side=:lower), (axis=Int32(2), side=:upper)).sides == [(1, :lower), (2, :upper)]
 end
 
 @testset "except excludes closed faces, so the seam dof stays constrained" begin
