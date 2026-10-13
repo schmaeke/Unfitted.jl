@@ -180,55 +180,7 @@ end
 
 TestChannels(value::Real, gradient::NTuple{D,<:Real}) where {D} = TestChannels(value, SVector{D}(gradient))
 
-# Coerce a callback's return to the `TestChannels{D,T}` the kernel contracts: the mesh dimension `D` and the assembly
-# scalar type `T`. A plain scalar is a value-only channel with a zero gradient coefficient. A `TestChannels{K}` keeps
-# its value and its gradient's `K` slots, converted to `T`, and is zero-extended into the remaining `D − K`. `K`, `D`
-# and `T` are static, so the slot test folds away.
-#
-# A channel that already is a `TestChannels{D,T}` passes through untouched, by a method of its own. The general method
-# would return the same values, but the code compiled around it changes: measured without the pass-through, the
-# kernel fused its multiply-adds differently, the stiffness matrix of a 4D Poisson problem moved by 4.9e-17 relative
-# (enough to flip an exact zero out of the sparsity pattern), and a dense and a static diffusion tensor no longer
-# assembled to the same bits; and with the pass-through folded into the general method as an early return, a static
-# 3 × 3 diffusion's channels, evaluated outside assembly, moved by an ulp. The separate method keeps the code, and the
-# results, as they were.
-#
-# A short gradient coefficient is legitimate, and the space-time case is where it comes from: a field of `C` components
-# on a mesh of `D = C + 1` axes (the last axis time) has a `C × C` stress, and the row of it that the test component
-# selects is a `C`-length gradient coefficient, while assembly contracts against the `D`-length test gradient. The
-# slots the coefficient does not reach are the axes the field carries no component for, and the callback's flux along
-# them really is zero, so extending by zero records what the callback said rather than patching what it forgot.
-#
-# The long direction is an error and not a truncation. A coefficient longer than the mesh dimension names a flux along
-# an axis that does not exist; dropping the surplus slots would quietly delete a term the callback asked for, and the
-# resulting operator would still be symmetric, still solve and still converge — the same silent wrongness the
-# zero-extension exists to remove from the short direction.
-_as_test_channels(channels::TestChannels{D,T}, ::Val{D}, ::Type{T}) where {D,T<:Real} = channels
-
-function _as_test_channels(channels::TestChannels{K}, ::Val{D}, ::Type{T}) where {K,D,T<:Real}
-    K <= D || throw(DimensionMismatch("a test gradient coefficient of length $K cannot be used on " *
-                                      "a $D-dimensional mesh: it names a flux along an axis the " *
-                                      "mesh does not have"))
-    gradient = channels.gradient
-    return TestChannels{D,T}(convert(T, channels.value),
-                             SVector{D,T}(ntuple(i -> i <= K ? convert(T, gradient[i]) : zero(T), Val(D))))
-end
-
-function _as_test_channels(value::Number, ::Val{D}, ::Type{T}) where {D,T<:Real}
-    return TestChannels{D,T}(convert(T, value), zero(SVector{D,T}))
-end
-
-# Value-only contraction for a scalar channel, the L² transfer rhs: it never reads the test gradient, so a value-only
-# basis refresh is enough.
-@inline _test_contribution(channel::Number, test_value, _) = channel * test_value
-
-# Full contraction `channels.value × test_value + ⟨channels.gradient, test_gradient⟩`. The `@inline` makes sure the dot
-# product is constant- folded across the (D ≤ 4) tensor dimensions.
-@inline function _test_contribution(channels::TestChannels{D}, test_value, test_gradient) where {D}
-    return channels.value * test_value + dot(channels.gradient, test_gradient)
-end
-
-# ── Fields, blocks, loads, problems ───────────────────────────────────────────
+# ── Fields, blocks and loads ──────────────────────────────────────────────────
 
 """
     Field{D,T,C,S}
@@ -259,20 +211,6 @@ end
 Number of scalar components in `field`.
 """
 component_count(::Field{D,T,C}) where {D,T,C} = C
-
-# The field a single-field entry point (`Problem(x, form)`, `mass`, `stiffness`, `poisson`) works on: a bare `Space` is
-# wrapped in the implicit scalar field `:u`, and a `Field` is taken as the caller named and sized it.
-_as_field(V::Space) = field(:u, V)
-_as_field(u::Field) = u
-
-# Reject a component index the field does not carry. An out-of-range index matches no component downstream, so the
-# Dirichlet condition or Neumann load carrying it contributes nothing at all — a silently free boundary or an all-zero
-# load rather than an error.
-function _check_component(component, field::Field)
-    component === nothing ||
-        1 ≤ component ≤ component_count(field) ||
-        throw(ArgumentError("component $component outside 1:$(component_count(field)) of $(field.name)"))
-end
 
 # Field *names*, not full `Field` objects: the assembly hot loop only needs the name to look the field up via
 # `_field_index`, and erasing `Field{D,T,C,Space{...}}` from the struct parameters keeps the `Problem`/`Model` type tree
@@ -356,6 +294,8 @@ function loadform(test_field::Field, form; on=nothing)
     return LoadForm(test_field.name, form, on)
 end
 
+# ── Problems ──────────────────────────────────────────────────────────────────
+
 """
     Problem{D,T,S,FS,B,L}
 
@@ -420,29 +360,23 @@ function Problem(x::Union{Space,Field}, form; dirichlet=[])
     return Problem((u,); blocks, loads, dirichlet, symmetric=form.symmetric)
 end
 
-"""
-    problem_spaces(problem::Problem) -> Vector{Space}
+# The field a single-field entry point (`Problem(x, form)`, `mass`, `stiffness`, `poisson`) works on: a bare `Space` is
+# wrapped in the implicit scalar field `:u`, and a `Field` is taken as the caller named and sized it.
+_as_field(V::Space) = field(:u, V)
+_as_field(u::Field) = u
 
-Distinct spaces spanned by a problem's fields, in first-appearance order, deduplicated by object identity (fields
-sharing a space appear once). This is the set of independent discretisations a multi-domain problem couples; for a
-single-domain problem it is a one-element vector. Consumers that must act per-discretisation — the physical fold, the
-per-space integration plans, and the assembly workspace's level-id namespacing — iterate this.
-"""
-function problem_spaces(problem::Problem)
-    spaces = Space[]
-    for field in problem.fields
-        any(s -> s === field.space, spaces) || push!(spaces, field.space)
-    end
-    return spaces
-end
-
-# The `Space` owning `field_name` in `problem`. Used to route a field's volume / boundary / interface contributions to
-# its own discretisation.
-function _field_space(problem::Problem, field_name::Symbol)
-    for field in problem.fields
-        field.name === field_name && return field.space
-    end
-    throw(ArgumentError("unknown field $field_name"))
+# The representative space `V` is the first field's: it supplies the problem's `(D, T)` type parameters and serves the
+# single-field consumers that reach through `problem.space`, while the authoritative space of each field is
+# `field.space`. `D` and `T` appear only in the bound of `S`, so the type parameters are spelled out.
+function Problem(fields::Tuple; blocks=(), loads=(), dirichlet=[], symmetric=nothing)
+    block_tuple, load_tuple = Tuple(blocks), Tuple(loads)
+    _check_problem(fields, block_tuple, load_tuple, dirichlet)
+    V = first(fields).space
+    D, T = length(V.domain.lower), eltype(V.domain.lower)
+    flag = _symmetric_flag(block_tuple, symmetric)
+    return Problem{D,T,typeof(V),typeof(fields),typeof(block_tuple),typeof(load_tuple)}(V, fields, block_tuple,
+                                                                                        load_tuple, collect(dirichlet),
+                                                                                        flag)
 end
 
 # Validate a problem's parts in one pass, in the order they depend on each other: the fields (at least one, no name
@@ -491,6 +425,15 @@ function _check_problem(fields::Tuple, blocks::Tuple, loads::Tuple, dirichlet)
     return nothing
 end
 
+# Reject a component index the field does not carry. An out-of-range index matches no component downstream, so the
+# Dirichlet condition or Neumann load carrying it contributes nothing at all — a silently free boundary or an all-zero
+# load rather than an error.
+function _check_component(component, field::Field)
+    component === nothing ||
+        1 ≤ component ≤ component_count(field) ||
+        throw(ArgumentError("component $component outside 1:$(component_count(field)) of $(field.name)"))
+end
+
 # The system's symmetry flag: `flag` when one is given, else whether every block declares its form symmetric. The one
 # rule for both the `Problem` constructor and a one-shot assembly of loose blocks (`_assemble`), so the two cannot infer
 # the flag differently. It is kept out of line, specialised on the block tuple and not on the flag. The constructor
@@ -502,16 +445,77 @@ end
     return flag === nothing ? all(block -> block.form.symmetric, blocks) : Bool(flag)
 end
 
-# The representative space `V` is the first field's: it supplies the problem's `(D, T)` type parameters and serves the
-# single-field consumers that reach through `problem.space`, while the authoritative space of each field is
-# `field.space`. `D` and `T` appear only in the bound of `S`, so the type parameters are spelled out.
-function Problem(fields::Tuple; blocks=(), loads=(), dirichlet=[], symmetric=nothing)
-    block_tuple, load_tuple = Tuple(blocks), Tuple(loads)
-    _check_problem(fields, block_tuple, load_tuple, dirichlet)
-    V = first(fields).space
-    D, T = length(V.domain.lower), eltype(V.domain.lower)
-    flag = _symmetric_flag(block_tuple, symmetric)
-    return Problem{D,T,typeof(V),typeof(fields),typeof(block_tuple),typeof(load_tuple)}(V, fields, block_tuple,
-                                                                                        load_tuple, collect(dirichlet),
-                                                                                        flag)
+"""
+    problem_spaces(problem::Problem) -> Vector{Space}
+
+Distinct spaces spanned by a problem's fields, in first-appearance order, deduplicated by object identity (fields
+sharing a space appear once). This is the set of independent discretisations a multi-domain problem couples; for a
+single-domain problem it is a one-element vector. Consumers that must act per-discretisation — the physical fold, the
+per-space integration plans, and the assembly workspace's level-id namespacing — iterate this.
+"""
+function problem_spaces(problem::Problem)
+    spaces = Space[]
+    for field in problem.fields
+        any(s -> s === field.space, spaces) || push!(spaces, field.space)
+    end
+    return spaces
+end
+
+# The `Space` owning `field_name` in `problem`. Used to route a field's volume / boundary / interface contributions to
+# its own discretisation.
+function _field_space(problem::Problem, field_name::Symbol)
+    for field in problem.fields
+        field.name === field_name && return field.space
+    end
+    throw(ArgumentError("unknown field $field_name"))
+end
+
+# ── Channel arithmetic for the assembly kernel ────────────────────────────────
+
+# Coerce a callback's return to the `TestChannels{D,T}` the kernel contracts: the mesh dimension `D` and the assembly
+# scalar type `T`. A plain scalar is a value-only channel with a zero gradient coefficient. A `TestChannels{K}` keeps
+# its value and its gradient's `K` slots, converted to `T`, and is zero-extended into the remaining `D − K`. `K`, `D`
+# and `T` are static, so the slot test folds away.
+#
+# A channel that already is a `TestChannels{D,T}` passes through untouched, by a method of its own. The general method
+# would return the same values, but the code compiled around it changes: measured without the pass-through, the
+# kernel fused its multiply-adds differently, the stiffness matrix of a 4D Poisson problem moved by 4.9e-17 relative
+# (enough to flip an exact zero out of the sparsity pattern), and a dense and a static diffusion tensor no longer
+# assembled to the same bits; and with the pass-through folded into the general method as an early return, a static
+# 3 × 3 diffusion's channels, evaluated outside assembly, moved by an ulp. The separate method keeps the code, and the
+# results, as they were.
+#
+# A short gradient coefficient is legitimate, and the space-time case is where it comes from: a field of `C` components
+# on a mesh of `D = C + 1` axes (the last axis time) has a `C × C` stress, and the row of it that the test component
+# selects is a `C`-length gradient coefficient, while assembly contracts against the `D`-length test gradient. The
+# slots the coefficient does not reach are the axes the field carries no component for, and the callback's flux along
+# them really is zero, so extending by zero records what the callback said rather than patching what it forgot.
+#
+# The long direction is an error and not a truncation. A coefficient longer than the mesh dimension names a flux along
+# an axis that does not exist; dropping the surplus slots would quietly delete a term the callback asked for, and the
+# resulting operator would still be symmetric, still solve and still converge — the same silent wrongness the
+# zero-extension exists to remove from the short direction.
+_as_test_channels(channels::TestChannels{D,T}, ::Val{D}, ::Type{T}) where {D,T<:Real} = channels
+
+function _as_test_channels(channels::TestChannels{K}, ::Val{D}, ::Type{T}) where {K,D,T<:Real}
+    K <= D || throw(DimensionMismatch("a test gradient coefficient of length $K cannot be used on " *
+                                      "a $D-dimensional mesh: it names a flux along an axis the " *
+                                      "mesh does not have"))
+    gradient = channels.gradient
+    return TestChannels{D,T}(convert(T, channels.value),
+                             SVector{D,T}(ntuple(i -> i <= K ? convert(T, gradient[i]) : zero(T), Val(D))))
+end
+
+function _as_test_channels(value::Number, ::Val{D}, ::Type{T}) where {D,T<:Real}
+    return TestChannels{D,T}(convert(T, value), zero(SVector{D,T}))
+end
+
+# Value-only contraction for a scalar channel, the L² transfer rhs: it never reads the test gradient, so a value-only
+# basis refresh is enough.
+@inline _test_contribution(channel::Number, test_value, _) = channel * test_value
+
+# Full contraction `channels.value × test_value + ⟨channels.gradient, test_gradient⟩`. The `@inline` makes sure the dot
+# product is constant- folded across the (D ≤ 4) tensor dimensions.
+@inline function _test_contribution(channels::TestChannels{D}, test_value, test_gradient) where {D}
+    return channels.value * test_value + dot(channels.gradient, test_gradient)
 end
