@@ -133,10 +133,17 @@ end
     @test length(Problem((u, w); blocks=(mass_block(u), mass_block(w)), dirichlet=named).dirichlet) == 2
 end
 
+# Bytes one warm call of the diffusion flux allocates, measured behind a function barrier so the figure is the call's
+# own; the first call compiles.
+function _flux_bytes(a, ugrad)
+    Unfitted._diffusion_flux(a, ugrad)
+    return @allocated Unfitted._diffusion_flux(a, ugrad)
+end
+
 # `diffusion` is documented as a scalar, a `D × D` matrix, or a callback returning either, and `_diffusion_flux` also
 # accepts a `UniformScaling`. `_diffusion_flux` copies every `AbstractMatrix` into an `SMatrix` before contracting it
-# with the gradient, so the dense and static spellings of one tensor are a single code path and cannot drift apart; the
-# isotropic spellings must reproduce the tensor that represents them.
+# with the gradient, so the dense and static spellings of one tensor take one code path; the isotropic spellings must
+# reproduce the tensor that represents them.
 @testset "diffusion spellings agree" begin
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=2)
     u = field(:u, V)
@@ -146,10 +153,19 @@ end
     dense = [2.0 0.75; 0.75 3.0]
     static = Unfitted.SMatrix{2,2}(dense)
 
-    # Exact, not `≈`: one tensor reaching the assembler two ways runs the same instructions on the same bits. `≈` alone
-    # would let the dense spelling drift back onto the allocating generic product unnoticed.
-    @test K(dense) ≈ K(static)
-    @test K(dense) == K(static)
+    # One code path, but not one compiled kernel: each spelling is its own closure type, so the assembler is compiled
+    # once for each, and the optimiser decides separately in each kernel which of the static product's `muladd`s become
+    # FMAs. The two therefore agree to rounding, not bit for bit. On x86 under Julia 1.13 at the default optimisation
+    # level, LLVM vectorises the dense kernel's flux and leaves it unfused while it fuses the static one, and 60 of the
+    # 625 entries here differ, by at most 5 ulp (relative norm 8e-17).
+    @test K(dense) ≈ K(static) rtol = 1.0e-14
+
+    # What no tolerance can see is the dense spelling drifting off the static product onto the generic one, which
+    # allocates its result once per quadrature point per trial function and rounds within a few ulp of the static one.
+    # The flux of either spelling allocates nothing.
+    ugrad = Unfitted.SVector(0.3, -1.7)
+    @test _flux_bytes(dense, ugrad) == 0
+    @test _flux_bytes(static, ugrad) == 0
 
     isotropic = 2.5
     @test K(isotropic) ≈ K(isotropic * I)
