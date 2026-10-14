@@ -447,6 +447,25 @@ end
     @test isempty(model.dirichlet_projections)
 end
 
+# Bytes one serial `assemble!` of `model` allocates, measured behind a function barrier so the figure is the call's own.
+# A load step's cache reuse shows in its assembly alone, and three things around it vary from run to run and once broke
+# the exact comparisons below:
+#
+#   * the sparse factorisation `solve!` runs next, which on Julia 1.13 allocates a few 16-byte steps more or less from
+#     run to run;
+#   * a threaded assembly also counts what the task runtime allocates for its spawns, which varies with scheduling: up
+#     to 1 KB per call at 4 threads on Julia 1.10;
+#   * a collection that lands inside the measured call, which added 77–297 KB whenever it happened (a few calls in ten
+#     thousand).
+#
+# So the figure is a serial assembly, taken right after a young-generation collection, so that the next collection
+# cannot fall inside the measured call. Measured that way, every one of 3000 warm load steps allocated the same number
+# of bytes, in each configuration of Julia 1.10 and 1.13, `-O0` and `-O2`, 1 and 4 threads.
+function _load_step_bytes(model)
+    GC.gc(false)
+    return @allocated assemble!(model; threaded=false)
+end
+
 # The load-stepping driver pattern: a single `prepare(problem)` followed by `update_dirichlet!` between steps. The
 # converged solution must match what a fresh `prepare(problem)` with the new Dirichlet datum produces, and the
 # model.version must stay unchanged.
@@ -469,6 +488,7 @@ end
     solve!(base)
     @test length(base.assembly.patterns) == 1
     pattern = first(base.assembly.patterns).second
+    _load_step_bytes(base)    # compiles the measured call, which the first step below would otherwise pay for
 
     warm_bytes = Int[]
     for new_value in (0.25, 0.5, -0.1)
@@ -479,9 +499,8 @@ end
         @test base.matrix === nothing
         @test base.rhs === nothing
         @test length(base.assembly.patterns) == 1 && first(base.assembly.patterns).second === pattern
-        timed = @timed solve!(base)
-        s = timed.value
-        push!(warm_bytes, timed.bytes)
+        push!(warm_bytes, _load_step_bytes(base))
+        s = solve!(base)
         @test length(base.assembly.patterns) == 1 && first(base.assembly.patterns).second === pattern
 
         reference = solve!(prepare(build(new_value)))
@@ -490,13 +509,12 @@ end
         @test value(s, base, (0.0,)) ≈ 0.0 atol = 1.0e-10
     end
 
-    # The reuse is what a load-stepping loop sees: a warm step allocates no more than the one before it, and less than
-    # the same solve on a twin model whose cache is still empty, which pays for the region lists, the region dofs and
-    # the pattern.
+    # The reuse is what a load-stepping loop sees: a warm step's assembly allocates no more than the one before it, and
+    # less than the same assembly on a twin model whose cache is still empty, which pays for the region lists, the
+    # region dofs and the pattern.
     @test warm_bytes[2] <= warm_bytes[1]
     @test warm_bytes[3] <= warm_bytes[1]
-    twin = prepare(build(-0.1))
-    @test warm_bytes[3] < @allocated solve!(twin)
+    @test warm_bytes[3] < _load_step_bytes(prepare(build(-0.1)))
 end
 
 # Same driver pattern, but on a COUPLED multi-space model: a Dirichlet on u2's own top face lives on V2's space, which
