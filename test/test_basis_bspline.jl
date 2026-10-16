@@ -1129,11 +1129,11 @@ end
     @test active_unknowns(lb) == rank(Matrix(_gram(beyond; prune=false)[1].matrix))
 
     # The *clamped* mechanism, still shipped as `bspline(; continuity = m)`, reaches the same answer through the core's
-    # box-face rule rather than through selection. The cover's face at x = 1 lies outside Ω, so it carries no trace rows
-    # (`_clamps_box_face`), the cover is free there, and each buried base function is reproduced on its own and
-    # deduplicated. Clamped there, as it used to be, the cover reproduced the difference of two buried base functions on
-    # Ω while reproducing neither, and the stack kept eight exact null modes that a dedup keyed on single buried
-    # functions could not see: rank 96 of 104 unknowns.
+    # artificial-boundary rule rather than through selection. The cover's face at x = 1 lies outside Ω, so it carries no
+    # trace rows (`_on_artificial_boundary`), the cover is free there, and each buried base function is reproduced on
+    # its own and deduplicated. Clamped there, as it used to be, the cover reproduced the difference of two buried base
+    # functions on Ω while reproducing neither, and the stack kept eight exact null modes that a dedup keyed on single
+    # buried functions could not see: rank 96 of 104 unknowns.
     clamped_base = space(Ωfold; cells=6, order=2, basis=bspline(; continuity=0), physical=half())
     clamped = overlay(clamped_base, box((0.0, -1.0), (1.0, 2.0)); cells=(4, 12), order=2, basis=bspline(; continuity=0))
     mc, lc = _gram(clamped)

@@ -305,11 +305,14 @@ boundary*:
 ```
 
 — i.e. the part of the overlay's boundary that does not coincide with the
-physical boundary `∂Ω`. On an immersed space (see *Immersed boundary*)
-`Ω^(k)` is the overlay's box intersected with `Ω`, so `Γ_o^(k)` is the
-part of the box boundary that meets `Ω`: a box face lying wholly outside
-`Ω` has nothing on either side of it to keep continuous and carries no
-condition. One rule decides this for every family, `_clamps_box_face` in
+physical boundary `∂Ω`. `Ω^(k)` is the overlay's *active region* — its
+box, less the cells a `LevelMask` switches off (see *Selective
+activation*) — and on an immersed space (see *Immersed boundary*) that
+region intersected with `Ω`, so `Γ_o^(k)` is the part of the active
+region's boundary that meets `Ω`: a face of it lying wholly outside `Ω`,
+on the overlay's box or between two of its cells, has nothing on either
+side to keep continuous and carries no condition. One rule decides this
+for every face and every family, `_on_artificial_boundary` in
 `src/dofs.jl`. These artificial constraints are imposed
 strongly (eliminated dofs for the integrated Legendre basis and
 maximal-continuity B-splines; homogeneous linear constraints, resolved by
@@ -1512,7 +1515,10 @@ demos.
   - Selective activation: dof-structure equivalence between a
     `LevelMask` and a geometrically smaller overlay covering the same
     active cells; artificial-boundary constraint on internal
-    active/inactive interfaces; `activate!`/`deactivate!` invalidation
+    active/inactive interfaces, decided by the same rule as a box face — a
+    mask face through a hole carries none while the stretches of it that
+    meet `Ω` stay clamped, and a face the two cells' verdicts settle is
+    never classified itself; `activate!`/`deactivate!` invalidation
     contract; every region parent an active cell of its level, on a
     masked uniform overlay, an immersed level and a ladder — the
     invariant the hot path's mask-free set read rests on. `dilate`'s box
@@ -1627,9 +1633,10 @@ demos.
     well, which `bspline(; continuity = m)` for `m < p − 1` still selects. A
     clamped cover reproduces a *combination* of two buried functions without
     reproducing either only behind a clamped face that no material crosses,
-    and the box-face rule clamps a face only where it holds material, so that
-    configuration — 8 exact null modes of 104 unknowns while its face was
-    clamped — is pinned full rank and lossless against the unreduced twin.
+    and the artificial-boundary rule clamps a face only where it holds
+    material, so that configuration — 8 exact null modes of 104 unknowns
+    while its face was clamped — is pinned full rank and lossless against
+    the unreduced twin.
     Only a face that `∂Ω` lies on exactly can still produce one (see *Mesh and
     refinement model*). A cover holding no base cell whole, whose burial test
     the driver's early exit used to skip, is pinned under both mechanisms.

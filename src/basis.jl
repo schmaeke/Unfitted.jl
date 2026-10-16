@@ -69,19 +69,18 @@ Opting in is not only about shedding dofs: where a covering level's span *contai
 two are linearly dependent and the superposed operator is exactly singular until one of them is eliminated there. Both
 shipped families opt in — integrated Legendre in `src/dofs.jl`, B-splines in the extension.
 
-Nothing gates an immersed [`PhysicalDomain`](@ref) by family, so a family's overlay constraints owe it two exemptions,
-one per kind of face, and both for the same reason: a face with no material on one side has no trace to vanish on, and
-constraining it would over-constrain the adjacent cut cell's modes. On an internal face — between an active and an
-inactive cell of the level's own grid — it is a single test on the inactive neighbour (`_is_fictitious`,
-`src/coverage.jl`). On a face of the level's own box, which has no neighbour of the level to ask, it is the core's
-box-face rule `_clamps_box_face` (`src/dofs.jl`): a side lying on the boundary of the space's domain is never
-constrained (`_level_side_is_physical`), and elsewhere a position is constrained where its cell is active and its face
-holds material. That reads the artificial boundary `Γ_o^(k) = ∂Ω^(k) \\ ∂Ω` with `Ω^(k)` the overlay's box intersected
-with Ω. Both shipped families make both tests — `_has_overlay_constraint` in `src/dofs.jl`; `_active_cell_at_face` in
-the extension, below `:maximal` continuity — and the burial test predicts the box-face rule through the same function
-(`_reproduced_on_domain`). The `:maximal` B-spline support selection asks the material question in its own form,
-`_cell_admissible`: it keeps a function whose support reaches past an artificial box face only into cells that hold no
-material.
+Nothing gates an immersed [`PhysicalDomain`](@ref) by family, so a family's overlay constraints owe it one exemption,
+the same on every face of the level's active region — between an active and an inactive cell of the level's own grid,
+or on the level's own box: a face holding no material has no trace to vanish on, and constraining it would
+over-constrain the adjacent cut cell's modes. The core states the rule once, `_on_artificial_boundary`
+(`src/dofs.jl`): a face of the active region carries the condition unless it lies on the boundary of the space's domain
+(`_level_side_is_physical`) or holds no material (`_face_holds_material`, `src/coverage.jl`). That reads the artificial
+boundary `Γ_o^(k) = ∂Ω^(k) \\ ∂Ω` with `Ω^(k)` the level's active region intersected with Ω. Both shipped families'
+clamped mechanisms ask it — `_has_overlay_constraint` in `src/dofs.jl`; `_active_cell_at_face` in the extension, below
+`:maximal` continuity — and the burial test predicts it through its material half (`_reproduced_on_domain`). The
+`:maximal` B-spline support selection asks the material question in its own form, `_cell_admissible`: it keeps a
+function whose support reaches across the active region's boundary only into cells, of the level or past its box, that
+hold no material.
 
 The integrated Legendre family (this file) and the B-spline extension are the two worked examples.
 """

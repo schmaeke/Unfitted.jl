@@ -255,7 +255,7 @@ function _oracle_query_bytes(fold, level, probe)
     bytes = @allocated Unfitted._is_void(fold, probe)
     for c in cell_indices(level.mesh)
         bytes += @allocated Unfitted._is_void(fold, level, c)
-        bytes += @allocated Unfitted._is_fictitious(fold, level, c)
+        bytes += @allocated Unfitted._face_holds_material(fold, level, c, 1, :upper)
     end
     return bytes
 end
@@ -303,7 +303,7 @@ end
         end
         @test V.levels[2].mesh.cells == V.levels[3].mesh.cells && expected[2] != expected[3]
 
-        # The void query first, on a fresh oracle, so it takes every miss; then it and the inactive-and-void query
+        # The void query first, on a fresh oracle, so it takes every miss; then it and the full three-way verdict
         # again, all hits.
         fold = Unfitted._Fold(V, cache)
         @test fold isa Unfitted._Fold{2,Float64,typeof(V.physical)}
@@ -311,12 +311,13 @@ end
         for pass in 1:2, level in V.levels
             cells = cell_indices(level.mesh)
             @test [Unfitted._is_void(fold, level, c) for c in cells] == expected[level.id]
-            @test [Unfitted._is_fictitious(fold, level, c) for c in cells] == inactive(level) .& expected[level.id]
+            @test [Unfitted._cell_verdict(fold, level, c) for c in cells] ==
+                  [Unfitted._verdict_code(classify_cell(physical, cell_box(level.mesh, c))) for c in cells]
         end
         # Every verdict the tables hold is the one the box memo holds for that box.
         for level in V.levels
             memo = [cache[(b.lower, b.upper)] for b in (cell_box(level.mesh, c) for c in cell_indices(level.mesh))]
-            @test fold.cells[level.id] == [m === :fictitious ? 0x01 : 0x02 for m in memo]
+            @test fold.cells[level.id] == [Unfitted._verdict_code(m) for m in memo]
         end
         for b in probes
             @test Unfitted._is_void(fold, b) == (classify_cell(physical, b) === :fictitious)
@@ -330,7 +331,8 @@ end
     @test fold isa Unfitted._Fold{2,Float64,Nothing}
     for level in V.levels
         cells = cell_indices(level.mesh)
-        @test !any(c -> Unfitted._is_void(fold, level, c) || Unfitted._is_fictitious(fold, level, c), cells)
+        @test !any(c -> Unfitted._is_void(fold, level, c), cells)
+        @test all(c -> Unfitted._face_holds_material(fold, level, c, 1, :upper), cells)
         _oracle_query_bytes(fold, level, probes[1])                 # compile once
         @test _oracle_query_bytes(fold, level, probes[1]) == 0
     end
@@ -465,7 +467,7 @@ end
     #     (4 vertex hats plus 3 × 2 face modes on x = 1) and 4 at p = 1.
     #   xhi = 1.0 — the cover stops *at* the fold face. Its boundary cells there are cut,
     #     hence active, but the face itself lies outside Ω (x = 1 > 0.9), so it carries no
-    #     trace condition (`_clamps_box_face`) and the cover reproduces the base's modes on
+    #     trace condition (`_on_artificial_boundary`) and the cover reproduces the base's modes on
     #     x = 1 exactly as at xhi = 1.5. It used to be clamped there, which cost the cover
     #     those functions (145 unknowns at p = 3 against 154) and left the base's copies
     #     as the only carriers of the trace.
@@ -598,7 +600,7 @@ end
     end
 end
 
-@testset "the oracle's material part of a box, and its box faces" begin
+@testset "the oracle's material part of a box, and its cell faces" begin
     tol = GeometryTolerance(Float64)
 
     # `_any_outside_slab` partitions box \ dom: the slabs are disjoint, miss `dom`, and their volumes add up to the box
@@ -633,30 +635,87 @@ end
     end
     @test !Unfitted._material_inside(Unfitted._Fold(space(_OMEGA_CR; cells=2, order=1)), b, dom, tol)
 
-    # `_is_void_face` answers the facet classifier on the cell's face, in 1D (a point face), 2D and 3D, through a table
-    # over the face's boundary layer that its first ask allocates and later asks read. ∂Ω on the face counts as
-    # material.
+    # `_face_holds_material` settles a face from the verdicts of the two cells it separates whenever one of them is
+    # uncut, and classifies the face itself — as a facet region on it is classified, through the axis's face table —
+    # only where it must: a box face of a cut cell, or a face between two cut cells. In 1D (a point face), 2D and 3D, on
+    # a cover whose cells along x₁ are full up to 0.8 and cut on [0.8, 0.9].
     for D in 1:3
         V = _physical_cover(0.9, 9, 1; D)
         cover = V.levels[2]
         fold = Unfitted._Fold(V)
-        upper = CartesianIndex(ntuple(d -> d == 1 ? 9 : 2, D))
-        lower = CartesianIndex(ntuple(d -> d == 1 ? 1 : 2, D))
-        @test !isassigned(fold.faces, cover.id, 1, 2)
+        cell(i) = CartesianIndex(ntuple(d -> d == 1 ? i : 2, D))
+        # Settled by the cells: between two full cells, the box face x₁ = 0 of a full cell, between a full and a cut
+        # one.
+        @test Unfitted._face_holds_material(fold, cover, cell(5), 1, :upper)
+        @test Unfitted._face_holds_material(fold, cover, cell(1), 1, :lower)
+        @test Unfitted._face_holds_material(fold, cover, cell(9), 1, :lower)
+        @test !isassigned(fold.faces, cover.id, 1)
+        # Classified: the box face x₁ = 0.9 of the cut cell lies outside Ω — once, on its first ask.
         for pass in 1:2
-            @test Unfitted._is_void_face(fold, cover, upper, 1, :upper)             # x₁ = 0.9 lies outside Ω
-            @test !Unfitted._is_void_face(fold, cover, lower, 1, :lower)            # x₁ = 0 lies inside it
+            @test !Unfitted._face_holds_material(fold, cover, cell(9), 1, :upper)
         end
-        table = fold.faces[cover.id, 1, 2]
-        @test size(table) == ntuple(d -> d == 1 ? 1 : 3, D) && count(!=(0x00), table) == 1
+        table = fold.faces[cover.id, 1]
+        @test size(table) == ntuple(d -> d == 1 ? 10 : 3, D) && count(!=(0x00), table) == 1
+        # ∂Ω on the face counts as material.
         on_face = _physical_cover(0.9, 9, 1; D, ω=0.9)
-        @test !Unfitted._is_void_face(Unfitted._Fold(on_face), on_face.levels[2], upper, 1, :upper)
+        @test Unfitted._face_holds_material(Unfitted._Fold(on_face), on_face.levels[2], cell(9), 1, :upper)
     end
     # Without a physical domain every face holds material, and nothing is allocated.
     plain = overlay(space(_OMEGA_CR; cells=2, order=1), box((0.0, 0.0), (0.5, 1.0)); cells=2, order=1)
     pfold = Unfitted._Fold(plain)
-    @test !Unfitted._is_void_face(pfold, plain.levels[2], CartesianIndex(2, 1), 1, :upper)
+    @test Unfitted._face_holds_material(pfold, plain.levels[2], CartesianIndex(2, 1), 1, :upper)
     @test !any(i -> isassigned(pfold.faces, i), eachindex(pfold.faces))
+    @test !any(i -> isassigned(pfold.cells, i), eachindex(pfold.cells))
+end
+
+@testset "an internal face through a hole carries no trace condition" begin
+    # The artificial-boundary rule asks every face of a level's active region whether it holds material, a mask face as
+    # much as a box face. Ω is the unit square minus a hole of radius 0.15 at its centre, under an 8² overlay of the
+    # whole square masked to its left half. The mask face x₁ = ½ runs through the hole across rows 4 and 5: the cells
+    # beside it there are cut, holding material only at their far corners, and the face itself lies in the hole. The old
+    # internal-face rule clamped it, because the masked cell across it holds material elsewhere; it now carries no
+    # condition, while the rows where the face meets Ω stay clamped.
+    hole = physical_domain(x -> 0.15 - hypot(x[1] - 0.5, x[2] - 0.5); lipschitz=1.0, subcell_length_scale=1 / 128,
+                           max_depth=6)
+    left = trues(8, 8)
+    left[5:8, :] .= false
+    V = overlay(space(_OMEGA_CR; cells=4, order=2, physical=hole), _OMEGA_CR; cells=8, order=2, active=left)
+    m, l = _gram(V)
+    function on_mask_face(r, rows)
+        key = l.raw_keys[r]
+        return key.axes[1].kind == Unfitted._AXIS_NODE &&
+               key.axes[1].index == 5 &&
+               issubset(Unfitted._axis_incidence(key.axes[2], 8), rows)
+    end
+    through_hole = filter(r -> on_mask_face(r, 4:5), l.level_raws[2])
+    in_material = filter(r -> on_mask_face(r, 1:3) || on_mask_face(r, 6:8), l.level_raws[2])
+    @test length(through_hole) == 3 && all(r -> l.elimination_source[r] === :free, through_hole)
+    @test !isempty(in_material) && all(r -> l.elimination_source[r] === :overlay, in_material)
+    M = Symmetric(Matrix(m.matrix))
+    s = sqrt.(diag(M))
+    @test rank(Symmetric(M ./ (s * s'))) == active_unknowns(l)
+
+    # The faces the cell verdicts settle are never classified. Under a hole of radius 0.1 an 8² overlay of
+    # [0.25, 0.75]² folds the four cells inside the hole away and keeps only full cells along its box: every face of its
+    # active region lies next to a folded or a full cell, so the artificial-boundary pass reads cell verdicts alone and
+    # allocates no face table.
+    small = physical_domain(x -> 0.1 - hypot(x[1] - 0.5, x[2] - 0.5); lipschitz=1.0, subcell_length_scale=1 / 128,
+                            max_depth=6)
+    _, spaces, caches = Unfitted._prepare_spaces(mass(overlay(space(_OMEGA_CR; cells=4, order=2, physical=small),
+                                                              box((0.25, 0.25), (0.75, 0.75)); cells=8, order=2)))
+    W, cache = only(spaces), only(caches)
+    @test count(!, W.levels[2].mask) == 4                        # non-vacuity: the fold faces are there
+    raw_by_key, raw_keys, _, level_raws = Unfitted._enumerate_raws(W)
+    fold = Unfitted._Fold(W, cache)
+    tol = GeometryTolerance(Float64)
+    for level in W.levels
+        ctx = Unfitted._LevelContext(W, fold, tol, Unfitted.Coverage{2}(Dict{Int,BitArray{2}}()), raw_keys, raw_by_key,
+                                     level_raws[level.id])
+        ledger = Unfitted.EliminationLedger{Float64}(length(raw_keys))
+        Unfitted._overlay_constraints!(ledger, level, ctx)
+        level === W.levels[2] && @test count(==(:overlay), ledger.source) > 0
+    end
+    @test !any(i -> isassigned(fold.faces, i), eachindex(fold.faces))
 end
 
 @testset "covered-mode pruning in 3D (edge, face, and interior modes)" begin

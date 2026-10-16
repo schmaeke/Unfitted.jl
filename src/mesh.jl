@@ -217,12 +217,13 @@ The mask interacts with the dof layer like a geometric overlay boundary: faces b
 *same* level are treated as artificial overlay constraints (analogous to faces between the level and its physical-domain
 complement). Span-mode dofs whose support is entirely inside inactive cells are not enumerated.
 
-One exception, and it is a physical one: when the inactive cell across such a face holds no material — the classifier
-finds its box *fully fictitious*, entirely outside `Ω` — the face carries no physical material and the modes on it stay
-active: they vanish on every physical face anyway and instead carry the adjacent active cell's approximation — a cut
-cell's, up to `∂Ω`, whenever the fold runs. Every cell the finite-cell fold switched off is such a cell. A cell the
-*user* masked out constrains when it holds material, which is the case unless it lies entirely outside `Ω` (always,
-without a [`PhysicalDomain`](@ref)). See `_has_overlay_constraint` in `src/dofs.jl`.
+One exception, and it is a physical one: a face that holds no material — no point of it lies in `Ω` — has nothing on
+either side of it to keep continuous, and the modes on it stay active: they vanish on every physical face anyway and
+instead carry the adjacent active cell's approximation — a cut cell's, up to `∂Ω`, whenever the fold runs. Every face
+next to a cell the finite-cell fold switched off is such a face. A face next to a cell the *user* masked out constrains
+when it holds material, which is the case unless it lies entirely outside `Ω` (always, without a
+[`PhysicalDomain`](@ref)) — the same rule as on the level's own box faces. See `_on_artificial_boundary` in
+`src/dofs.jl`.
 """
 const LevelMask{D} = BitArray{D}
 

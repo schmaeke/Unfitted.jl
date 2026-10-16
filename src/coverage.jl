@@ -38,20 +38,20 @@
 
 # ── The material oracle ───────────────────────────────────────────────────────
 
-# Whether a cell, a box or a box face holds material, answered for one dof-layout build.
+# Whether a cell, a box or a cell face holds material, answered for one dof-layout build.
 #
 # A `LevelMask` merges two deactivations, the caller's `active =` selection and the fictitious fold
 # (`_apply_physical_fold`, `mesh.jl`). Every site of the dof layer that looks behind an inactive cell — coverage, the
-# burial test's level side, the integrated-Legendre artificial face, the B-spline admissible region and trace faces —
-# asks the same question of it: does it hold material? A cell without any carries nothing to represent and no trace to
-# keep continuous; a cell with some is represented by a coarser level only. The answer is a fact about the geometry and
-# the cell box — `classify_cell` reports the box `:fictitious` — and not about which mask switched the cell off: every
-# folded cell is void, and so is a user-masked cell lying entirely outside Ω.
+# burial test's level side, the B-spline admissible region — asks the same question of it: does it hold material? A cell
+# without any carries nothing to represent; a cell with some is represented by a coarser level only. The answer is a
+# fact about the geometry and the cell box — `classify_cell` reports the box `:fictitious` — and not about which mask
+# switched the cell off: every folded cell is void, and so is a user-masked cell lying entirely outside Ω.
 #
 # The same question is asked of two other things. Of a box that is no cell of the level's grid: a B-spline level's
 # virtual cell past its own face, and the part of a coarse cell lying outside a cover's box (`_material_inside`). And of
-# a level's own box face, which carries the artificial trace condition only where it holds material (`_is_void_face`,
-# read by the box-face rule `_clamps_box_face` in `dofs.jl`).
+# a cell face, which carries the artificial trace condition only where it holds material (`_face_holds_material`, read
+# by the artificial-boundary rule `_on_artificial_boundary` in `dofs.jl`) — for a face of the level's own box and an
+# internal face alike.
 #
 # Fields:
 #
@@ -62,22 +62,24 @@
 #   * `boxes` — the box memo `classify_cell` fills, keyed by the box corners. It is the caller's: `prepare` hands in the
 #     one its fold filled and its integration plan read, so a cell the fold classified costs a lookup here; a standalone
 #     call passes a fresh one.
-#   * `cells` — per level id, a per-cell verdict table (`0x00` not asked yet, `0x01` void, `0x02` material), allocated
-#     on the level's first miss. A build asks about the same cell many times — per buried function, per cover, per face
-#     position — and a table read is cheaper than hashing the box into `boxes` again.
+#   * `cells` — per level id, a per-cell table of the classifier's verdict (`0x00` not asked yet, then `_VOID`, `_CUT`
+#     or `_FULL`), allocated on the level's first miss. A build asks about the same cell many times — per buried
+#     function, per cover, per face position — and a table read is cheaper than hashing the box into `boxes` again. All
+#     three verdicts are kept, not only void-or-not, because a face asks for the full one too: a face of a full cell
+#     holds material, which spares classifying it.
 #   * `covered_by` — per (level id, cover id) pair, the same kind of table for `_covered_by_level` of the level's cells
 #     against the cover (`0x01` covered, `0x02` not), which `build_coverage` fills and the burial test reads back; see
 #     `_covered_by!`.
-#   * `faces` — per (level id, axis, side) — side `1` the lower, `2` the upper — the same kind of verdict table for that
-#     box face of the level (`0x01` void, `0x02` material), over the level's grid with the axis collapsed to the one
-#     boundary layer, allocated on the face's first ask. The box-face rule asks it once per raw on the face, and a
-#     cell's face carries up to `(p + 1)^(D − 1)` of them.
+#   * `faces` — per (level id, axis), a table of the verdict on each cell face normal to that axis (`0x01` void, `0x02`
+#     material), over the node positions of the axis — the level's grid with one more layer along it — so a box face
+#     and an internal face are slots of the same table. Allocated on the first face the cell verdicts cannot settle
+#     (`_face_holds_material`), which is a face both of whose cells are cut, or a box face of a cut cell.
 #
-# All three are indexed by level id. Ids are unique within the space the fold was built for, the only space it is asked
+# All four are indexed by level id. Ids are unique within the space the fold was built for, the only space it is asked
 # about, and bounded by the largest of them, which sizes them up front. `covered_by` is therefore a (largest id)² matrix
 # of which a build uses at most the pairs above the diagonal, and in a coupled model, where `_prepare_spaces` numbers a
 # later subdomain's levels after the earlier ones', it also spans the ids below the space's own; `faces` holds
-# (largest id) · 2D slots. Their slots are unassigned references until asked — a pointer each, in one allocation per
+# (largest id) · D slots. Their slots are unassigned references until asked — a pointer each, in one allocation per
 # layout build, pruning or not — which at the level counts in use is a few hundred bytes to a few KB.
 #
 # The verdicts are exactly `classify_cell`'s: a table miss makes the same
@@ -96,14 +98,18 @@ struct _Fold{D,T<:Real,P}
     boxes::_ClassifyCache{D,T}
     cells::Vector{Array{UInt8,D}}
     covered_by::Matrix{Array{UInt8,D}}
-    faces::Array{Array{UInt8,D},3}
+    faces::Matrix{Array{UInt8,D}}
 end
 
 function _Fold(V::Space{D,T}, boxes::_ClassifyCache{D,T}=_ClassifyCache{D,T}()) where {D,T<:Real}
     n = maximum(level -> level.id, V.levels)
     return _Fold{D,T,typeof(V.physical)}(V.physical, boxes, Vector{Array{UInt8,D}}(undef, n),
-                                         Matrix{Array{UInt8,D}}(undef, n, n), Array{Array{UInt8,D},3}(undef, n, D, 2))
+                                         Matrix{Array{UInt8,D}}(undef, n, n), Matrix{Array{UInt8,D}}(undef, n, D))
 end
+
+# The classifier's three verdicts as the cell tables store them; `0x00` is "not asked yet".
+const _VOID, _CUT, _FULL = 0x01, 0x02, 0x03
+_verdict_code(verdict::Symbol) = verdict === :fictitious ? _VOID : verdict === :cut ? _CUT : _FULL
 
 # Whether `box`, an arbitrary axis-aligned box, holds no material: the void query of the method below for a box that is
 # not a cell of one of the space's grids — a B-spline level's virtual cell past its own face — and so the box memo
@@ -114,63 +120,75 @@ function _is_void(f::_Fold{D,T}, box::AxisBox{D,T}) where {D,T<:Real}
 end
 
 # Whether cell `c` of `level` holds no material: its box lies entirely outside Ω. A fact about the geometry and the box,
-# whatever the cell's activity. Inlined, so the hit path a per-cell loop runs — the B-spline admissibility walk above
-# all — is an `isassigned` test, a table load and a compare; a level's table is allocated on its first miss, so a level
-# nobody asks about, and every level of a space without a physical domain, gets none.
+# whatever the cell's activity; without a physical domain a compile-time `false`.
 @inline function _is_void(f::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}) where {D,T<:Real}
     f.physical === nothing && return false
-    isassigned(f.cells, level.id) || return _classify_void!(f, level, c)
+    return _cell_verdict(f, level, c) == _VOID
+end
+
+# The classifier's verdict on cell `c` of `level`, through the level's table. Inlined, so the hit path a per-cell loop
+# runs — the B-spline admissibility walk and the artificial-boundary walk above all — is an `isassigned` test, a table
+# load and a compare; a level's table is allocated on its first miss, so a level nobody asks about, and every level of a
+# space without a physical domain, gets none. Asked only with a physical domain.
+@inline function _cell_verdict(f::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}) where {D,T<:Real}
+    isassigned(f.cells, level.id) || return _classify_cell!(f, level, c)
     verdict = f.cells[level.id][c]
-    verdict == 0x00 || return verdict == 0x01
-    return _classify_void!(f, level, c)
+    verdict == 0x00 || return verdict
+    return _classify_cell!(f, level, c)
 end
 
 # A table miss: classify the cell box through the box memo and record the verdict. Out of line, so the hit path a
-# per-cell loop inlines stays the few loads and the compare `_is_void` describes.
-@noinline function _classify_void!(f::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}) where {D,T<:Real}
+# per-cell loop inlines stays the few loads and the compare `_cell_verdict` describes.
+@noinline function _classify_cell!(f::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}) where {D,T<:Real}
     isassigned(f.cells, level.id) || (f.cells[level.id] = zeros(UInt8, level.mesh.cells))
-    void = classify_cell(f.physical, cell_box(level.mesh, c), f.boxes) === :fictitious
-    f.cells[level.id][c] = void ? 0x01 : 0x02
-    return void
+    verdict = _verdict_code(classify_cell(f.physical, cell_box(level.mesh, c), f.boxes))
+    f.cells[level.id][c] = verdict
+    return verdict
 end
 
-# Whether cell `c` of `level` is inactive and holds no material: every cell the fold switched off, and a user-masked
-# cell lying entirely outside Ω. An inactive cell for which this is false holds material that only a coarser level
-# represents.
-function _is_fictitious(f::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}) where {D,T<:Real}
-    is_active(level.mask, c) && return false
-    return _is_void(f, level, c)
+# Whether the face of `level`'s cell `c` on `axis`/`side` holds material: some point of it lies in Ω. The material half
+# of the artificial boundary (`_on_artificial_boundary`, `dofs.jl`), asked of every face of a level's active region,
+# whether it lies on the level's own box or between two of its cells; without a physical domain every face holds
+# material, a compile-time `true`.
+#
+# The face belongs to the closed boxes of both cells it separates, so the cell verdicts settle it whenever either cell
+# is uncut — a void cell on either side means a void face, a full one a face holding material — and the void verdicts
+# are read first, so that a face the fold's verdicts call void is never clamped. The cell across the face is read
+# before the cell `c` itself: a face of the active region next to a cell the fold switched off, the commonest kind, is
+# then settled by one table read. These are reads of verdicts the fold computed for the active cells and the cells it
+# switched off. Only a face both of whose cells are cut, or a box face of a cut cell, with no cell of the level beyond
+# it, is classified itself, once, through the axis's face table. That is a face in the band of cut cells, and only there
+# can the face and its cells disagree: a cut cell holding material away from the face.
+@inline function _face_holds_material(f::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}, axis::Int,
+                                      side::Symbol) where {D,T<:Real}
+    f.physical === nothing && return true
+    step = CartesianIndex(ntuple(d -> d == axis ? 1 : 0, D))
+    across = side === :lower ? c - step : c + step
+    far = checkbounds(Bool, CartesianIndices(level.mesh.cells), across) ? _cell_verdict(f, level, across) : _CUT
+    far == _VOID && return false
+    near = _cell_verdict(f, level, c)
+    near == _VOID && return false
+    (near == _FULL || far == _FULL) && return true
+    slot = side === :lower ? c : across
+    isassigned(f.faces, level.id, axis) || return _classify_face!(f, level, c, axis, side, slot)
+    verdict = f.faces[level.id, axis][slot]
+    verdict == 0x00 || return verdict == 0x02
+    return _classify_face!(f, level, c, axis, side, slot)
 end
 
-# Whether the `side` face of `level`'s own box holds no material where boundary cell `c` meets it: no point of that cell
-# face lies in Ω. Asked by the box-face rule (`_clamps_box_face`, `dofs.jl`), once per raw on the face. Inlined like the
-# cell query above, so the hit path is an `isassigned` test, a table load and a compare; a face's table is allocated on
-# its first miss, and without a physical domain the answer is a compile-time `false`.
-@inline function _is_void_face(f::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}, axis::Int,
-                               side::Symbol) where {D,T<:Real}
-    f.physical === nothing && return false
-    slot = side === :lower ? 1 : 2
-    isassigned(f.faces, level.id, axis, slot) || return _classify_face!(f, level, c, axis, slot)
-    verdict = f.faces[level.id, axis, slot][_face_index(c, axis)]
-    verdict == 0x00 || return verdict == 0x01
-    return _classify_face!(f, level, c, axis, slot)
-end
-
-# A face-table miss: classify the cell's face as a facet region on that face is classified — Ω restricted to the face's
-# affine slice, on the face's own (D − 1)-dimensional box (`_classify_facet`, `dirichlet.jl`) — and record the verdict.
-@noinline function _classify_face!(f::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}, axis::Int,
-                                   slot::Int) where {D,T<:Real}
-    isassigned(f.faces, level.id, axis, slot) ||
-        (f.faces[level.id, axis, slot] = zeros(UInt8, ntuple(d -> d == axis ? 1 : level.mesh.cells[d], D)))
+# A face-table miss: classify the face as a facet region on it is classified — Ω restricted to the face's affine slice,
+# on the face's own (D − 1)-dimensional box (`_classify_facet`, `dirichlet.jl`) — and record the verdict at `slot`, the
+# face's node position along `axis`.
+@noinline function _classify_face!(f::_Fold{D,T}, level::Level{D,T}, c::CartesianIndex{D}, axis::Int, side::Symbol,
+                                   slot::CartesianIndex{D}) where {D,T<:Real}
+    isassigned(f.faces, level.id, axis) ||
+        (f.faces[level.id, axis] = zeros(UInt8, ntuple(d -> level.mesh.cells[d] + (d == axis), D)))
     box = cell_box(level.mesh, c)
-    slice = _restrict_domain(f.physical, ((axis, (slot == 1 ? box.lower : box.upper)[axis]),))
-    void = _classify_facet(slice, box.lower, box.upper, [d for d in 1:D if d != axis], Val(D - 1)) === :fictitious
-    f.faces[level.id, axis, slot][_face_index(c, axis)] = void ? 0x01 : 0x02
-    return void
+    slice = _restrict_domain(f.physical, ((axis, (side === :lower ? box.lower : box.upper)[axis]),))
+    material = _classify_facet(slice, box.lower, box.upper, [d for d in 1:D if d != axis], Val(D - 1)) !== :fictitious
+    f.faces[level.id, axis][slot] = material ? 0x02 : 0x01
+    return material
 end
-
-# The slot of cell `c` in a face table, whose `axis` extent is the single boundary layer.
-_face_index(c::CartesianIndex{D}, axis::Int) where {D} = CartesianIndex(ntuple(d -> d == axis ? 1 : c[d], D))
 
 # Whether every part of `box` that holds material lies inside `dom`. This is the immersed half of the containment test
 # `_covered_by_level` makes, asked of a cell box that overlaps a cover's box without lying inside it. Without a physical
@@ -482,16 +500,17 @@ end
 #      where it matters. Over a cell that holds material it is not: material there is carried by `level` alone, the
 #      truncated function has a jump `k` does not reproduce, and the dedup must not fire.
 #   3. No face of `k`'s box that cuts the interior of the support carries a trace condition. `k` is clamped to zero on
-#      its artificial boundary only where the box-face rule says so (`_clamps_box_face`): on an active boundary cell
-#      whose face holds material. A face position whose cell is inactive, or whose face lies outside Ω, emits nothing.
-#      A face strictly inside the support hull is a face the function is generally non-zero on, so one clamped position
-#      of `k` along it puts the function outside `k`'s constrained span. Faces at or outside the hull are harmless: the
-#      function vanishes there. A mesh-box face lying on ∂Ω_global needs no exemption here even though it too emits
-#      nothing — it can never cut the hull, because the hull lies inside the level's own domain, which lies inside the
-#      global one. The rule is exactly the face rule of a cover that clamps (integrated Legendre, a B-spline below
-#      `:maximal`); a cover that selects by support, which reaches this test only above an integrated-Legendre level,
-#      asks the material question one cover cell past the face instead, and the two disagree only where material lies
-#      within that cell without touching the face.
+#      its artificial boundary (`_on_artificial_boundary`, `dofs.jl`): on the faces of its active region that hold
+#      material. A box-face position whose cell is inactive, or whose face lies outside Ω, emits nothing. A face
+#      strictly inside the support hull is a face the function is generally non-zero on, so one clamped position of `k`
+#      along it puts the function outside `k`'s constrained span. Faces at or outside the hull are harmless: the
+#      function vanishes there. The rule's other half, a face on the space's own boundary, needs no asking here: such a
+#      face can never cut the hull, because the hull lies inside the level's own domain, which lies inside the global
+#      one. Nor do `k`'s internal faces: condition 1 leaves under the hull only cells of `k` that are active or void,
+#      and a face next to a void cell holds no material. The rule is exactly the face rule of a cover that clamps
+#      (integrated Legendre, a B-spline below `:maximal`); a cover that selects by support, which reaches this test only
+#      above an integrated-Legendre level, asks the material question one cover cell past the face instead, and the two
+#      disagree only where material lies within that cell without touching the face.
 #
 # Condition 3 is vacuous whenever the whole support lies inside `k`'s box, as every support cell does that condition 1
 # found inside it. What makes the rule bite is material `level` has but `k` does not need to reach: a void support cell,
@@ -516,7 +535,7 @@ function _reproduced_on_domain(level::Level{D,T}, k::Level{D,T}, cells::Cartesia
             hull.lower[d] + tol.contain < x < hull.upper[d] - tol.contain || continue
             perp = _cells_under_box(k.mesh, hull, tol)
             layer = CartesianIndices(ntuple(e -> e == d ? (j:j) : perp.indices[e], D))
-            any(kc -> _clamps_box_face(fold, k, kc, d, side), layer) && return false
+            any(kc -> is_active(k.mask, kc) && _face_holds_material(fold, k, kc, d, side), layer) && return false
         end
     end
     return true
