@@ -256,6 +256,7 @@ a few minutes the first time.
 | Sub-directory | What it solves |
 |---|---|
 | `applications/kirsch_plate_2d/` | Plane-stress plate with a circular hole, verified against the Kirsch solution; the weak form is written in `Tensors.jl` notation |
+| `applications/slit_plate_2d/` | Plate with a slit far narrower than its grid: plain finite cells cannot open it, one thin-celled overlay whose fold cuts it in two lets the displacement jump; energy errors against a computed reference |
 | `applications/interface_coupling_2d/` | Bonded bi-material joint: two independently meshed subdomains tied across a shared seam by a weighted Nitsche interface form |
 | `applications/imported_geometry_3d/` | Heat conduction in a non-convex L-bracket whose geometry arrives as a triangle surface mesh (`FileIO` + `MeshIO`) rather than as a formula |
 | `applications/time_integration/` | Transient heat conduction where Unfitted supplies `M`, `K` and `f` once and `OrdinaryDiffEq.jl` owns the time axis |

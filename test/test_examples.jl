@@ -62,10 +62,10 @@
 #
 # Each case therefore declares in `requires` the packages it needs beyond `Unfitted` itself, and a case whose
 # requirements the active project cannot resolve is *skipped* rather than failed. `Base.identify_package` answers that
-# question without loading anything. Ten cases need `WriteVTK`, which loads the `UnfittedWriteVTKExt` extension they
+# question without loading anything. Eleven cases need `WriteVTK`, which loads the `UnfittedWriteVTKExt` extension they
 # write their ParaView output through: every application, and every reproduction but `conditioning_small_overlap`.
-# Five carry a requirement beyond it or instead of it: `tutorials/04_bspline` (`BasicBSpline`),
-# `applications/kirsch_plate_2d` and `applications/spacetime_cavity_2d` (`Tensors`),
+# Six carry a requirement beyond it or instead of it: `tutorials/04_bspline` (`BasicBSpline`),
+# `applications/kirsch_plate_2d`, `applications/slit_plate_2d` and `applications/spacetime_cavity_2d` (`Tensors`),
 # `applications/imported_geometry_3d` (`FileIO` + `GeometryBasics` + `MeshIO`, the three triggers of
 # `UnfittedMeshIOExt`), and `applications/time_integration` (`OrdinaryDiffEq`). A bare `--project=.` run is therefore
 # left with the tutorials but `04_bspline` and with `reproductions/conditioning_small_overlap`.
@@ -397,6 +397,21 @@
         @test all(>(0), regions)
     end
 
+    # The slit plate prints, at its sweep's last order, the energy error and the slit opening of plain finite cells and
+    # of the strip overlay, and the reference opening. Its prose claims a contrast, and the contrast is asserted: plain
+    # finite cells keep the slit almost shut and stall at a large error, the strip opens it and converges.
+    function check_slit_plate(output, tol)
+        fcm, strip = metric_values(output, "energy error, FCM"), metric_values(output, "energy error, strip")
+        shut, opened = metric_values(output, "slit opening, FCM"), metric_values(output, "slit opening, strip")
+        reference = metric_values(output, "slit opening, reference")
+        @test all(values -> length(values) == 1, (fcm, strip, shut, opened, reference))
+        @test tol.fcm < only(fcm) < 1
+        @test sane_error(only(strip), tol.strip)
+        @test only(fcm) / only(strip) > tol.contrast
+        @test abs(only(opened) / only(reference) - 1) < tol.opening
+        @test 0 < only(shut) < 0.1 * only(reference)
+    end
+
     # The imported-geometry bracket prints two numbers that check different things, and the second is the one that
     # exercises the import. The L² error is governed purely by the z resolution — the exact solution does not vary in x₁
     # or x₂, so it would look just as good with the level-set sign inverted. The volume error compares the finite-cell
@@ -644,6 +659,14 @@
              # 2.96e-8. The weak form is written in `Tensors.jl` notation, hence the requirement.
              (name="applications/kirsch_plate_2d", env=Dict{String,String}(), requires=("Tensors", "WriteVTK"),
               check=check_single_l2, tol=1.0e-6),
+             # Plate with a narrow slit: plain finite cells against the same 5×5 grid with a strip overlay whose fold
+             # cuts it in two along the slit. Run to p = 4 (the default sweep goes to 8, 27 s at -O2): measured energy
+             # errors 0.621 for finite cells and 0.107 for the strip (a contrast of 5.8), slit openings 0.00477 and
+             # 0.1357 against the reference 0.137905. The bands sit about a factor of two from the measurements rather
+             # than a decade, which on an error of order 0.1 would assert nothing; every number is deterministic to many
+             # digits (moment fits exact to 1e-14).
+             (name="applications/slit_plate_2d", env=Dict("SLIT_MAX_ORDER" => "4"), requires=("Tensors", "WriteVTK"),
+              check=check_slit_plate, tol=(fcm=0.5, strip=0.2, contrast=3.0, opening=0.05)),
              # Bonded bi-material joint across a seam that misses the grid lines; prints the worse of the two subdomain
              # errors, 1.82e-5, over 14 cut regions with a bit-exact symmetric operator.
              (name="applications/interface_coupling_2d", env=Dict{String,String}(), requires=("WriteVTK",),

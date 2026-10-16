@@ -1,0 +1,13 @@
+[deps]
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Tensors = "48a634ad-e948-5137-8d70-aa71f2a747f4"
+Unfitted = "c68911ed-f311-4fcd-9d58-9cd3adb40d87"
+WriteVTK = "64499a7a-5c06-52f2-abe2-ccb03c286192"
+
+[sources]
+Unfitted = {path = "../../.."}
+
+[compat]
+Tensors = "1.17.1"
+WriteVTK = "1.22.0"
+julia = "1.11"

@@ -1656,7 +1656,7 @@ demos.
     declares the packages it needs beyond `Unfitted` in a `requires`
     field, and a case the active project cannot resolve is skipped
     rather than failed: the examples that need a weak dependency — the
-    ten that write ParaView output (`WriteVTK`), and those needing
+    eleven that write ParaView output (`WriteVTK`), and those needing
     `Tensors`, `BasicBSpline` or `FileIO` + `GeometryBasics` + `MeshIO` —
     run under `Pkg.test`, where all of those sit in the `test` target,
     and skip in a bare `--project=.` isolation run.
