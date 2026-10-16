@@ -1128,17 +1128,40 @@ end
     @test rank(Symmetric(Matrix(mb.matrix))) == active_unknowns(lb)
     @test active_unknowns(lb) == rank(Matrix(_gram(beyond; prune=false)[1].matrix))
 
-    # The defect the `:maximal` loop above repairs is a property of the *clamped* mechanism, which is still shipped and
-    # still reachable as `bspline(; continuity = m)`. Pinned here so the repair is not read as more general than it is:
-    # with the cover clamped, the same `xhi = 1.0` geometry still leaves eight exact null modes, because the clamped
-    # cover reproduces the difference of two buried base functions on Ω while reproducing neither on its own, and a
-    # dedup keyed on single buried functions cannot see it.
+    # The *clamped* mechanism, still shipped as `bspline(; continuity = m)`, reaches the same answer through the core's
+    # artificial-boundary rule rather than through selection. The cover's face at x = 1 lies outside Ω, so it carries no
+    # trace rows (`_on_artificial_boundary`), the cover is free there, and each buried base function is reproduced on
+    # its own and deduplicated. Clamped there, as it used to be, the cover reproduced the difference of two buried base
+    # functions on Ω while reproducing neither, and the stack kept eight exact null modes that a dedup keyed on single
+    # buried functions could not see: rank 96 of 104 unknowns.
     clamped_base = space(Ωfold; cells=6, order=2, basis=bspline(; continuity=0), physical=half())
     clamped = overlay(clamped_base, box((0.0, -1.0), (1.0, 2.0)); cells=(4, 12), order=2, basis=bspline(; continuity=0))
     mc, lc = _gram(clamped)
-    @test count(==(:dedup), lc.elimination_source) == 0
-    @test active_unknowns(lc) == 104
-    @test_broken rank(Symmetric(Matrix(mc.matrix))) == active_unknowns(lc)   # rank 96
+    @test count(==(:dedup), lc.elimination_source) == 16
+    @test active_unknowns(lc) == 102
+    @test rank(Symmetric(Matrix(mc.matrix))) == active_unknowns(lc)
+    @test active_unknowns(lc) == rank(Matrix(_gram(clamped; prune=false)[1].matrix))
+end
+
+@testset "BSpline extension: a cover holding no base cell whole still deduplicates" begin
+    # A 3² base over Ω = {x₁ ≤ 0.82} in [-1, 2]² under a cover ending at x₁ = 0.9: no base cell lies inside the cover's
+    # box, though the cut column's material does. The exact burial test needs no coverage flag — but the driver's
+    # early exit (`_coverage_constraints!`) reads the flags for the whole level, and while they tested whole cell boxes
+    # it skipped the test here, leaving the 5 functions the cover reproduces as exact null modes at degree 2. Both
+    # mechanisms must now match the control, the same cover with its box extended over the cut cells, which leaves its
+    # active cells unchanged.
+    omega = box((-1.0, -1.0), (2.0, 2.0))
+    physical = physical_domain(x -> x[1] - 0.82; lipschitz=1.0, subcell_length_scale=0.0625, max_depth=6)
+    function stack(xhi, nx, basis)
+        V = space(omega; cells=3, order=2, basis, physical)
+        return overlay(V, box((0.0, -1.0), (xhi, 2.0)); cells=(nx, 6), order=2, basis)
+    end
+    for basis in (bspline(), bspline(; continuity=0)), (nx, nxc) in ((18, 20), (9, 10))
+        m, l = _gram(stack(0.9, nx, basis))
+        mc, lc = _gram(stack(1.0, nxc, basis))
+        @test count(==(:dedup), l.elimination_source) == count(==(:dedup), lc.elimination_source) > 0
+        @test rank(Symmetric(Matrix(m.matrix))) == active_unknowns(l) == active_unknowns(lc)
+    end
 end
 
 @testset "BSpline extension: a degree-1 cover is the hat space and deduplicates hats" begin

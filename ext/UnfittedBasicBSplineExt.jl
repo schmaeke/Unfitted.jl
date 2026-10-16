@@ -30,11 +30,12 @@ artificial, and what lies past it is not part of the discretised domain at all. 
 mask geometry and with no constraint equation anywhere. This is Kraft's hierarchical-spline selection rule stated for
 superposed independent grids; the full statement, its maximality proof and the citations are in [`bspline`](@ref).
 
-At an integer `continuity = m < p_d − 1` the level is instead clamped at its artificial faces and the trace and its
-derivatives `k = 0 … m` are constrained to vanish by homogeneous linear constraints, eliminating `m + 1` boundary
-functions per face and leaving a strictly larger space — `∏_d (n_d + p_d − 2(m + 1))` functions against
-`∏_d (n_d − p_d)` — at the price of a globally `C^m` superposition. Arbitrary mask geometries are supported either way,
-because neither mechanism needs the mask to be separable.
+At an integer `continuity = m < p_d − 1` the level is instead clamped at its artificial faces (the faces of its active
+region that hold material: the core's artificial-boundary rule), and the trace and its derivatives `k = 0 … m` are
+constrained to vanish by homogeneous linear constraints, eliminating `m + 1` boundary functions per face and leaving a
+strictly larger space — `∏_d (n_d + p_d − 2(m + 1))` functions against `∏_d (n_d − p_d)` — at the price of a globally
+`C^m` superposition. Arbitrary mask geometries are supported either way, because neither mechanism needs the mask to be
+separable.
 
 The `D`-dimensional basis is the tensor product of these per-axis 1D spaces. Adjacent cells of the level share `p_d` of
 `p_d + 1` 1D functions per axis — the shared dofs fall out of the `TensorDofKey` cache in `src/dofs.jl` once each
@@ -94,7 +95,7 @@ using Unfitted
 # the extension reaches into the package.
 using Unfitted: BasisFamily, IntegratedLegendre, Level, CartesianMesh, AxisDofKey, TensorDofKey, EliminationLedger,
                 _LevelContext, _eliminate!, _constrain!, _pivot!, is_active, AxisBox, _level_side_is_physical,
-                _tensor_dof_key, _Fold, _is_fictitious, _is_void
+                _tensor_dof_key, _is_void, _on_artificial_boundary
 using StaticArrays: SVector
 using BasicBSpline: BSplineSpace, BSplineDerivativeSpace, KnotVector, bsplinebasisall, degree, dim, knotvector
 
@@ -582,12 +583,13 @@ function Unfitted._overlay_constraints!(ledger::EliminationLedger, level::Level{
     _selects_by_support(level.basis) && return _selection_constraints!(ledger, level, ctx)
     # The clamped path does not walk `ctx.raws`: the trace generator walks the mesh face/perp grids and looks raws up
     # through `ctx.raw_by_key`, and every key it builds carries `level.id`, so its rows name only this level's raws.
-    # `ctx.fold` goes to `_active_cell_at_face`, which asks it whether the inactive side of an internal face holds
-    # material; with no physical domain it classifies nothing.
+    # `ctx` goes to `_active_cell_at_face`, which asks the core's artificial-boundary rule of every face of the active
+    # region — a face on the space's own boundary or outside Ω carries no rows; with no physical domain it classifies
+    # nothing.
     family = level.basis
     m = family.continuity
     n_cells = level.mesh.cells
-    domain, tol, raw_by_key = ctx.space.domain, ctx.tolerance, ctx.raw_by_key
+    raw_by_key = ctx.raw_by_key
 
     for d in 1:D
         p_d = degree(family.spaces[d])
@@ -597,11 +599,6 @@ function Unfitted._overlay_constraints!(ledger::EliminationLedger, level::Level{
         perp_modes = CartesianIndices(ntuple(e -> e == d ? (0:0) : (0:degree(family.spaces[e])), D))
 
         for j in 0:n_cells[d]
-            # Skip physical-boundary edges — physical-Dirichlet detection (`_physical_dirichlet`) handles them, not the
-            # overlay constraint.
-            j == 0 && _level_side_is_physical(level, domain, d, :lower, tol) && continue
-            j == n_cells[d] && _level_side_is_physical(level, domain, d, :upper, tol) && continue
-
             t_star = level.mesh.axes[d][j + 1]    # the face's node: the lower box face at j = 0, the upper at j = n
 
             # Two possible spans (= active-cell axis-d index) per face: `j` if the lower-cell is active, `j+1` if the
@@ -613,7 +610,7 @@ function Unfitted._overlay_constraints!(ledger::EliminationLedger, level::Level{
             coeffs_lower, coeffs_upper = _trace_coeffs(P_d, lower_span, upper_span, t_star, Val(m))
 
             for perp_cell in perp_cells
-                located = _active_cell_at_face(level, d, j, perp_cell, n_cells, Val(D), ctx.fold)
+                located = _active_cell_at_face(level, d, j, perp_cell, ctx)
                 located === nothing && continue
                 active_cell, span = located
                 coeffs_for_span = span == lower_span ? coeffs_lower : coeffs_upper
@@ -657,32 +654,22 @@ end
                                                bsplinebasisall(BSplineDerivativeSpace{k}(P_d), span, t_star)
 
 # Returns `(active_cell::CartesianIndex{D}, span::Int)` if the face at axis `d`, position `j`, perpendicular cell
-# `perp_cell` is artificial (i.e., contributes a trace constraint), `nothing` otherwise. For mesh edges, "artificial"
-# reduces to "the boundary cell is active"; for internal faces, it's "the two adjacent cells differ in activity".
-#
-# With one exemption, and it is what lets this family carry an immersed `PhysicalDomain`. What decides an internal face
-# is whether its inactive cell holds material, not which deactivation switched it off: an inactive cell that does — a
-# user mask reaching into Ω — holds material only the coarser level represents, so the face between it and the active
-# side is a real artificial boundary and the trace must vanish there; one that holds none — every cell the fictitious
-# fold switched off, and a user mask entirely outside Ω — leaves no trace to vanish on, and constraining it would delete
-# the cut cell's boundary modes — the very over-constraint the FCM solution must not suffer. `_has_overlay_constraint`
-# in `src/dofs.jl` draws the same line for the integrated-Legendre family, and both ask it of `_is_fictitious`
-# (`src/coverage.jl`) on the build's material oracle `fold`. With no physical domain every inactive cell holds material
-# and nothing is classified.
-function _active_cell_at_face(level::Level{D}, d::Int, j::Int, perp_cell::CartesianIndex{D}, n_cells::NTuple{D,Int},
-                              ::Val{D}, fold::_Fold{D}) where {D}
-    if j == 0 || j == n_cells[d]
-        axis_d_idx = j == 0 ? 1 : n_cells[d]
-        cell = CartesianIndex(ntuple(e -> e == d ? axis_d_idx : perp_cell[e], D))
-        return is_active(level.mask, cell) ? (cell, axis_d_idx) : nothing
-    end
-    cell_j = CartesianIndex(ntuple(e -> e == d ? j : perp_cell[e], D))
-    cell_jp1 = CartesianIndex(ntuple(e -> e == d ? j + 1 : perp_cell[e], D))
-    a_j = is_active(level.mask, cell_j)
-    a_jp1 = is_active(level.mask, cell_jp1)
-    a_j == a_jp1 && return nothing
-    _is_fictitious(fold, level, a_j ? cell_jp1 : cell_j) && return nothing
-    return a_j ? (cell_j, j) : (cell_jp1, j + 1)
+# `perp_cell` is artificial (i.e., contributes trace rows), `nothing` otherwise. The face lies between cells `j` and
+# `j + 1` along `d` — a face of the level's own box at `j = 0` and `j = n`, where the missing cell reads as inactive —
+# and it is artificial when it bounds the active region (one side active, the other not) and the core's
+# artificial-boundary rule puts it on Γ_o (`_on_artificial_boundary`): it holds material, short of the space's own
+# boundary. That rule is what lets this family carry an immersed `PhysicalDomain` without over-constraining a cut cell:
+# a face lying wholly outside Ω, between an active cell and a folded one, a user-masked one or the space past the box,
+# has nothing on either side of it to keep continuous. `_has_overlay_constraint` in `src/dofs.jl` asks the same rule for
+# the integrated-Legendre family.
+function _active_cell_at_face(level::Level{D,T}, d::Int, j::Int, perp_cell::CartesianIndex{D},
+                              ctx::_LevelContext{D,T}) where {D,T}
+    n = level.mesh.cells[d]
+    at(i) = CartesianIndex(ntuple(e -> e == d ? i : perp_cell[e], D))
+    below = j >= 1 && is_active(level.mask, at(j))
+    below == (j < n && is_active(level.mask, at(j + 1))) && return nothing
+    span = below ? j : j + 1
+    return _on_artificial_boundary(ctx, level, at(span), d, below ? :upper : :lower) ? (at(span), span) : nothing
 end
 
 # ── Covered-mode pruning: dedup of what a covering level already contains ─────
@@ -790,7 +777,9 @@ end
 # This is what the clamped path cannot say. There, `k` keeps functions that do not vanish on its own box face, so its
 # span near that face is larger than any statement about supports describes, and it can reproduce a *combination* of two
 # buried functions without reproducing either — a dependency a per-function dedup cannot see, and one exact null mode
-# per combination in the assembled operator.
+# per combination in the assembled operator. That takes a clamped face behind which no material lies, since a buried
+# function's material is covered; the core clamps a face only where it holds material (`_on_artificial_boundary`), so
+# only a face ∂Ω lies on exactly can still produce it.
 function Unfitted._reproduced_by(cover::_Admissibility{D,T,<:BSplineFamily}, level::Level{D,T,<:BSplineFamily},
                                  key::TensorDofKey{D}) where {D,T<:Real}
     coarse = level.basis

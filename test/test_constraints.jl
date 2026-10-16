@@ -892,10 +892,10 @@ end
     # The other half of the material exemption. The fictitious fold and the user's `active =` mask both deactivate
     # cells, and every cell the fold switched off is empty, while a cell the user masked out over material (as the
     # corner block here is) still holds material, so the modes on its face are nonzero on a physical face and must
-    # vanish there as on any artificial boundary. `_has_overlay_constraint` asks whether the inactive cell holds
-    # material (`_is_fictitious`); exempting every inactive neighbour on an immersed level instead would leave the
-    # masked face free and the truncated solution discontinuous, and only an estimator inequality elsewhere would
-    # notice. The B-spline family's counterpart is in test_basis_bspline.jl.
+    # vanish there as on any artificial boundary. `_has_overlay_constraint` asks whether the face holds material
+    # (`_on_artificial_boundary`), and the masked faces here lie in Ω; exempting every inactive neighbour on an immersed
+    # level instead would leave the masked face free and the truncated solution discontinuous, and only an estimator
+    # inequality elsewhere would notice. The B-spline family's counterpart is in test_basis_bspline.jl.
     hole = physical_domain(x -> 0.25 - norm(x .- 0.5); lipschitz=1.0, subcell_length_scale=1 / 64, max_depth=6)
     omega = box((0.0, 0.0), (1.0, 1.0))
     folded = prepare(mass(space(omega; cells=8, order=2, physical=hole)))

@@ -255,7 +255,7 @@ function _oracle_query_bytes(fold, level, probe)
     bytes = @allocated Unfitted._is_void(fold, probe)
     for c in cell_indices(level.mesh)
         bytes += @allocated Unfitted._is_void(fold, level, c)
-        bytes += @allocated Unfitted._is_fictitious(fold, level, c)
+        bytes += @allocated Unfitted._face_holds_material(fold, level, c, 1, :upper)
     end
     return bytes
 end
@@ -303,7 +303,7 @@ end
         end
         @test V.levels[2].mesh.cells == V.levels[3].mesh.cells && expected[2] != expected[3]
 
-        # The void query first, on a fresh oracle, so it takes every miss; then it and the inactive-and-void query
+        # The void query first, on a fresh oracle, so it takes every miss; then it and the full three-way verdict
         # again, all hits.
         fold = Unfitted._Fold(V, cache)
         @test fold isa Unfitted._Fold{2,Float64,typeof(V.physical)}
@@ -311,12 +311,13 @@ end
         for pass in 1:2, level in V.levels
             cells = cell_indices(level.mesh)
             @test [Unfitted._is_void(fold, level, c) for c in cells] == expected[level.id]
-            @test [Unfitted._is_fictitious(fold, level, c) for c in cells] == inactive(level) .& expected[level.id]
+            @test [Unfitted._cell_verdict(fold, level, c) for c in cells] ==
+                  [Unfitted._verdict_code(classify_cell(physical, cell_box(level.mesh, c))) for c in cells]
         end
         # Every verdict the tables hold is the one the box memo holds for that box.
         for level in V.levels
             memo = [cache[(b.lower, b.upper)] for b in (cell_box(level.mesh, c) for c in cell_indices(level.mesh))]
-            @test fold.cells[level.id] == [m === :fictitious ? 0x01 : 0x02 for m in memo]
+            @test fold.cells[level.id] == [Unfitted._verdict_code(m) for m in memo]
         end
         for b in probes
             @test Unfitted._is_void(fold, b) == (classify_cell(physical, b) === :fictitious)
@@ -330,7 +331,8 @@ end
     @test fold isa Unfitted._Fold{2,Float64,Nothing}
     for level in V.levels
         cells = cell_indices(level.mesh)
-        @test !any(c -> Unfitted._is_void(fold, level, c) || Unfitted._is_fictitious(fold, level, c), cells)
+        @test !any(c -> Unfitted._is_void(fold, level, c), cells)
+        @test all(c -> Unfitted._face_holds_material(fold, level, c, 1, :upper), cells)
         _oracle_query_bytes(fold, level, probes[1])                 # compile once
         @test _oracle_query_bytes(fold, level, probes[1]) == 0
     end
@@ -371,11 +373,9 @@ end
         @test coverage.covered[level.id] ==
               [!isempty(above) && wanted[c] && any(k -> fresh(level, c, k), above) for c in cells]
         for k in above
-            # A masked cover's answers are stored as they were computed, and nowhere else; an unmasked one's are never
-            # stored.
-            if k.mask === nothing
-                @test !isassigned(fold.covered_by, level.id, k.id)
-            elseif isassigned(fold.covered_by, level.id, k.id)
+            # Every cover's answers are stored as they were computed, and nowhere else: on an immersed space even an
+            # unmasked cover's answer may take the material question (`_material_inside`), not a box test alone.
+            if isassigned(fold.covered_by, level.id, k.id)
                 table = fold.covered_by[level.id, k.id]
                 @test all(c -> table[c] == 0x00 || (table[c] == 0x01) == fresh(level, c, k), cells)
                 append!(stored, table)
@@ -386,8 +386,15 @@ end
             end
         end
     end
-    # Non-vacuity: `build_coverage` stored both verdicts, and left cells unasked.
+    # Non-vacuity: `build_coverage` stored both verdicts, and left cells unasked; and it stored the unmasked cover's.
     @test 0x00 in stored && 0x01 in stored && 0x02 in stored
+    @test isassigned(fold.covered_by, 1, inner.id)
+
+    # Without a physical domain an unmasked cover's answer is a single box test, and it is never stored.
+    plain = overlay(space(_OMEGA_CR; cells=4, order=1), box((0.25, 0.25), (0.75, 0.75)); cells=4, order=1)
+    pfold = Unfitted._Fold(plain)
+    Unfitted.build_coverage(plain, tol, pfold)
+    @test !isassigned(pfold.covered_by, 1, 2)
 end
 
 # `_nested_over`'s definition written out in the test, independently of the code under test: a scan of every node of the
@@ -447,8 +454,8 @@ function _fold_cover(xhi, p)
     return overlay(base, box((0.0, -1.0), (xhi, 2.0)); cells=(round(Int, 2xhi), 6), order=p)
 end
 
-@testset "a cover ending inside a folded coarse cell is still a cover" begin
-    # The two extents are the two sides of the rule, and both are asserted.
+@testset "a cover ending inside a folded coarse cell, or on its face, is still a cover" begin
+    # Two extents, and the same answer for both.
     #
     #   xhi = 1.5 — the cover's face lands *inside* the folded base cell [1, 2]. That
     #     cell is fictitious, so the base's modes on the x = 1 fold face stay free
@@ -458,15 +465,18 @@ end
     #     `is_inside(cell, cover.domain)` of the fictitious cell, which a cover ending
     #     inside it fails — and the Gram matrix picked up 10 exact null modes at p = 3
     #     (4 vertex hats plus 3 × 2 face modes on x = 1) and 4 at p = 1.
-    #   xhi = 1.0 — the cover stops *at* the fold face. Its own boundary cells there are
-    #     cut cells, hence active, hence clamped: the cover's trace vanishes at x = 1
-    #     and it cannot carry the base's hat. The mode must be retained, and is.
+    #   xhi = 1.0 — the cover stops *at* the fold face. Its boundary cells there are cut,
+    #     hence active, but the face itself lies outside Ω (x = 1 > 0.9), so it carries no
+    #     trace condition (`_on_artificial_boundary`) and the cover reproduces the base's modes on
+    #     x = 1 exactly as at xhi = 1.5. It used to be clamped there, which cost the cover
+    #     those functions (145 unknowns at p = 3 against 154) and left the base's copies
+    #     as the only carriers of the trace.
     #
     # `rank == active_unknowns` is the discriminating assertion. The pointwise reproduction below is the completeness
     # guard only and cannot stand in for it: the null modes live entirely in the fictitious part, a pseudo-inverse
     # projection never touches them, and every reproduction assertion here passes on the singular operator too. What it
     # does guard is the other direction — that the repair prunes nothing the space needs.
-    for (p, xhi, dedup, unknowns) in ((3, 1.5, 4, 154), (3, 1.0, 0, 145), (1, 1.5, 4, 22), (1, 1.0, 0, 19))
+    for (p, xhi, dedup, unknowns) in ((3, 1.5, 4, 154), (3, 1.0, 4, 154), (1, 1.5, 4, 22), (1, 1.0, 4, 22))
         m, l = _gram(_fold_cover(xhi, p))
         mu, _ = _gram(_fold_cover(xhi, p); prune=false)
         M = Symmetric(Matrix(m.matrix))
@@ -485,6 +495,227 @@ end
             @test value(proj, m, x) ≈ x[1]^p atol = 1e-8
         end
     end
+end
+
+# Ω = {x₁ ≤ ω} in [-1, 2]ᴰ, ω = 0.82 unless given: a 3ᴰ base whose middle column [0, 1] is cut and whose right column
+# folds away, under a cover ending at x₁ = `xhi`. At `xhi = 0.9` the cover's face runs through the fictitious part of
+# the cut column, so each cut base cell holds all its material inside the cover's box while its box sticks out of it.
+# `nx` sets the layer of cover cells against that face: 18 leave [0.85, 0.9] wholly outside Ω, folded away; 9 leave
+# [0.8, 0.9] cut. The control is the same cover with its box extended to x₁ = 1 at the same spacing (`nx + nx ÷ 9`
+# cells): it holds the cut cells whole, and the cells it adds all fold away, so it has the same active cells.
+function _physical_cover(xhi, nx, p; D=2, ω=0.82)
+    lo, hi = ntuple(_ -> -1.0, D), ntuple(_ -> 2.0, D)
+    physical = physical_domain(x -> x[1] - ω; lipschitz=1.0, subcell_length_scale=0.0625, max_depth=6)
+    cover = box(Base.setindex(lo, 0.0, 1), Base.setindex(hi, xhi, 1))
+    return overlay(space(box(lo, hi); cells=3, order=p, physical), cover; cells=(nx, ntuple(_ -> 3, D - 1)...), order=p)
+end
+
+# The raws of the cover (level 2) whose node sits on its upper x₁ face, the `nx + 1`-th node of that axis.
+function _upper_face_raws(l, nx)
+    on_face(key) = key.axes[1].kind == Unfitted._AXIS_NODE && key.axes[1].index == nx + 1
+    return [r for r in l.level_raws[2] if on_face(l.raw_keys[r])]
+end
+
+@testset "physical coverage: a cut cell is covered by the level holding its material" begin
+    # Coverage asks for the cell's share of Ω, not its box, and the cover's face carries a trace condition only where it
+    # holds material. Without the first, the cut cells keep high-order modes the cover reproduces on Ω — measured with
+    # Ω = {x₁ ≤ 0.91} and the face at 0.95, 14, 30 and 52 exact null modes at p = 2, 3, 4 behind a folded face layer.
+    # Without the second, a cut face layer clamps the cover on a face no material touches, and it still reproduces every
+    # coarse function vanishing there: 7, 20 and 50. Each change alone leaves the other's case singular, and the face
+    # rule alone made the cut layer worse (14, 30, 52). With both, the reduced space is the control's: the same
+    # unknowns, the same eliminations, the same Gram spectrum, and full rank.
+    tol = GeometryTolerance(Float64)
+    for (nx, layer) in ((18, "folded face layer"), (9, "cut face layer")), p in 1:3
+        V, Vc = _physical_cover(0.9, nx, p), _physical_cover(1.0, nx + nx ÷ 9, p)
+        base, cover = V.levels
+        # The premise: a cut base cell sticks out of the cover's box, and its material does not.
+        cut = cell_box(base.mesh, CartesianIndex(2, 2))
+        @test !Unfitted.is_inside(cut, cover.mesh.domain, tol)
+        @test Unfitted._covered_by_level(cut, cover, tol, Unfitted._Fold(V))
+        m, l = _gram(V)
+        mc, lc = _gram(Vc)
+        M, Mc = Symmetric(Matrix(m.matrix)), Symmetric(Matrix(mc.matrix))
+        @testset "$layer, p = $p" begin
+            @test rank(M) == active_unknowns(l)
+            @test isposdef(M)
+            @test active_unknowns(l) == active_unknowns(lc)
+            for source in (:overlay, :coverage, :dedup)
+                @test count(==(source), l.elimination_source) == count(==(source), lc.elimination_source)
+            end
+            @test count(==(:dedup), l.elimination_source) > 0            # non-vacuity: the cut column is buried
+            @test eigvals(M) ≈ eigvals(Mc) rtol = 1e-10
+            # The face at x₁ = 0.9 holds no material, so none of the modes a cut face layer puts on it is clamped. A
+            # folded layer puts none there at all.
+            face = _upper_face_raws(l, nx)
+            @test isempty(face) == (nx == 18)
+            @test all(r -> l.elimination_source[r] === :free, face)
+        end
+    end
+end
+
+@testset "physical coverage on a curved boundary and in 3D" begin
+    # The same equivalence where ∂Ω is curved — a cover around a disc whose face runs through the rim cells' fictitious
+    # part, its cells there cut near the disc's extremes and folded elsewhere — and in 3D. A curved cut's moments are
+    # accurate rather than exact, and the two covers partition the rim cells' fictitious part differently, so their
+    # spectra agree to the moment fit there and to rounding on the planar cut.
+    #
+    # The rank is taken of the Jacobi-scaled Gram, which is what tells an exact null mode from a small cut cell: the
+    # disc's thin cuts give genuine eigenvalues far below the unscaled matrix's largest — `rank` of the unscaled one
+    # reports 829 of 833 at p = 2, on the control as well — while the scaled one is full rank, its smallest eigenvalue
+    # near 1e-8 of its largest.
+    disc = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.36; lipschitz=1.0, subcell_length_scale=1 / 256,
+                           max_depth=6)
+    around(lo, n) = overlay(space(_OMEGA_CR; cells=4, order=2, physical=disc), box((lo, lo), (1 - lo, 1 - lo)); cells=n,
+                            order=2)
+    for (V, Vc, rtol) in ((around(0.1, 16), around(0.0, 20), 1e-6),
+                          (_physical_cover(0.9, 9, 1; D=3), _physical_cover(1.0, 10, 1; D=3), 1e-10))
+        m, l = _gram(V)
+        mc, lc = _gram(Vc)
+        M = Symmetric(Matrix(m.matrix))
+        s = sqrt.(diag(M))
+        @test rank(Symmetric(M ./ (s * s'))) == active_unknowns(l) == active_unknowns(lc)
+        @test count(==(:dedup), l.elimination_source) == count(==(:dedup), lc.elimination_source) > 0
+        @test eigvals(M) ≈ eigvals(Symmetric(Matrix(mc.matrix))) rtol = rtol
+    end
+end
+
+@testset "a box face that holds material stays clamped" begin
+    # The other side of both rules. With Ω = {x₁ ≤ 0.95} the cut cells' material crosses the cover's face at x₁ = 0.9:
+    # the cover does not cover them, and its face, now inside Ω, keeps its trace condition. With ∂Ω on the face itself,
+    # the face counts as holding material — the classifier answers on closed sets — and stays clamped too, which leaves
+    # the null modes of the cut-layer configuration in place. That is the documented limitation, pinned here so that a
+    # change to it is a deliberate one: 7 and 20 at p = 2 and 3, against none with ∂Ω moved 1e-3 off the face.
+    tol = GeometryTolerance(Float64)
+    for (ω, covered, nulls) in ((0.95, false, (0, 0)), (0.9, false, (7, 20)), (0.899, true, (0, 0)))
+        for (p, null) in zip(2:3, nulls)
+            V = _physical_cover(0.9, 9, p; ω)
+            base, cover = V.levels
+            @test Unfitted._covered_by_level(cell_box(base.mesh, CartesianIndex(2, 2)), cover, tol,
+                                             Unfitted._Fold(V)) == covered
+            m, l = _gram(V)
+            face = _upper_face_raws(l, 9)
+            @test !isempty(face) && all(r -> l.elimination_source[r] === (covered ? :free : :overlay), face)
+            @test active_unknowns(l) - rank(Symmetric(Matrix(m.matrix))) == null
+        end
+    end
+end
+
+@testset "the oracle's material part of a box, and its cell faces" begin
+    tol = GeometryTolerance(Float64)
+
+    # `_any_outside_slab` partitions box \ dom: the slabs are disjoint, miss `dom`, and their volumes add up to the box
+    # minus the overlap — overhanging one side, both sides of two axes, or a corner, in 2D and 3D. An overhang within
+    # `tol.contain` is no slab.
+    for (b, dom) in ((box((0.0, 0.0), (1.0, 1.0)), box((0.0, -1.0), (0.9, 2.0))),
+                     (box((0.0, 0.0), (1.0, 1.0)), box((0.2, 0.3), (0.7, 0.8))),
+                     (box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)), box((0.25, -1.0, 0.5), (2.0, 0.75, 2.0))))
+        slabs = typeof(b)[]
+        @test !Unfitted._any_outside_slab(s -> (push!(slabs, s); false), b, dom, tol)
+        @test sum(Unfitted.volume, slabs) ≈ Unfitted.volume(b) - Unfitted.volume(Unfitted.box_intersection(b, dom))
+        @test all(s -> Unfitted.box_intersection(s, dom) === nothing, slabs)
+        @test all(Unfitted.box_intersection(s, t) === nothing for s in slabs, t in slabs if s !== t)
+    end
+    @test !Unfitted._any_outside_slab(_ -> true, box((0.0, 0.0), (1.0, 1.0)), box((1e-12, 0.0), (1.0, 1.0)), tol)
+
+    # `_material_inside`, every branch: the material of a cut box beyond `dom`'s face is absent (true), crosses the face
+    # (settled by a sample), or is a blob no sample hits (settled only by the proof — the certificate with a Lipschitz
+    # constant, the tiles without one); a `:full` box, a box off `dom`, and no physical domain.
+    b, dom = box((0.0, 0.0), (1.0, 1.0)), box((0.0, -1.0), (0.9, 2.0))
+    for lipschitz in (1.0, Inf)
+        plane(ω) = leaf(x -> x[1] - ω; lipschitz)
+        blob = leaf(x -> hypot(x[1] - 0.95, x[2] - 0.3) - 0.02; lipschitz)
+        oracle(geometry) = Unfitted._Fold(space(box((-1.0, -1.0), (2.0, 2.0)); cells=3, order=1,
+                                                physical=physical_domain(geometry; subcell_length_scale=1 / 128,
+                                                                         max_depth=6)))
+        @test Unfitted._material_inside(oracle(plane(0.82)), b, dom, tol)
+        @test !Unfitted._material_inside(oracle(plane(0.95)), b, dom, tol)
+        @test !Unfitted._material_inside(oracle(union(plane(0.82), blob)), b, dom, tol)
+        @test !Unfitted._material_inside(oracle(plane(1.5)), b, dom, tol)
+        @test !Unfitted._material_inside(oracle(plane(0.82)), b, box((1.5, 0.0), (2.0, 1.0)), tol)
+    end
+    @test !Unfitted._material_inside(Unfitted._Fold(space(_OMEGA_CR; cells=2, order=1)), b, dom, tol)
+
+    # `_face_holds_material` settles a face from the verdicts of the two cells it separates whenever one of them is
+    # uncut, and classifies the face itself — as a facet region on it is classified, through the axis's face table —
+    # only where it must: a box face of a cut cell, or a face between two cut cells. In 1D (a point face), 2D and 3D, on
+    # a cover whose cells along x₁ are full up to 0.8 and cut on [0.8, 0.9].
+    for D in 1:3
+        V = _physical_cover(0.9, 9, 1; D)
+        cover = V.levels[2]
+        fold = Unfitted._Fold(V)
+        cell(i) = CartesianIndex(ntuple(d -> d == 1 ? i : 2, D))
+        # Settled by the cells: between two full cells, the box face x₁ = 0 of a full cell, between a full and a cut
+        # one.
+        @test Unfitted._face_holds_material(fold, cover, cell(5), 1, :upper)
+        @test Unfitted._face_holds_material(fold, cover, cell(1), 1, :lower)
+        @test Unfitted._face_holds_material(fold, cover, cell(9), 1, :lower)
+        @test !isassigned(fold.faces, cover.id, 1)
+        # Classified: the box face x₁ = 0.9 of the cut cell lies outside Ω — once, on its first ask.
+        for pass in 1:2
+            @test !Unfitted._face_holds_material(fold, cover, cell(9), 1, :upper)
+        end
+        table = fold.faces[cover.id, 1]
+        @test size(table) == ntuple(d -> d == 1 ? 10 : 3, D) && count(!=(0x00), table) == 1
+        # ∂Ω on the face counts as material.
+        on_face = _physical_cover(0.9, 9, 1; D, ω=0.9)
+        @test Unfitted._face_holds_material(Unfitted._Fold(on_face), on_face.levels[2], cell(9), 1, :upper)
+    end
+    # Without a physical domain every face holds material, and nothing is allocated.
+    plain = overlay(space(_OMEGA_CR; cells=2, order=1), box((0.0, 0.0), (0.5, 1.0)); cells=2, order=1)
+    pfold = Unfitted._Fold(plain)
+    @test Unfitted._face_holds_material(pfold, plain.levels[2], CartesianIndex(2, 1), 1, :upper)
+    @test !any(i -> isassigned(pfold.faces, i), eachindex(pfold.faces))
+    @test !any(i -> isassigned(pfold.cells, i), eachindex(pfold.cells))
+end
+
+@testset "an internal face through a hole carries no trace condition" begin
+    # The artificial-boundary rule asks every face of a level's active region whether it holds material, a mask face as
+    # much as a box face. Ω is the unit square minus a hole of radius 0.15 at its centre, under an 8² overlay of the
+    # whole square masked to its left half. The mask face x₁ = ½ runs through the hole across rows 4 and 5: the cells
+    # beside it there are cut, holding material only at their far corners, and the face itself lies in the hole. The old
+    # internal-face rule clamped it, because the masked cell across it holds material elsewhere; it now carries no
+    # condition, while the rows where the face meets Ω stay clamped.
+    hole = physical_domain(x -> 0.15 - hypot(x[1] - 0.5, x[2] - 0.5); lipschitz=1.0, subcell_length_scale=1 / 128,
+                           max_depth=6)
+    left = trues(8, 8)
+    left[5:8, :] .= false
+    V = overlay(space(_OMEGA_CR; cells=4, order=2, physical=hole), _OMEGA_CR; cells=8, order=2, active=left)
+    m, l = _gram(V)
+    function on_mask_face(r, rows)
+        key = l.raw_keys[r]
+        return key.axes[1].kind == Unfitted._AXIS_NODE &&
+               key.axes[1].index == 5 &&
+               issubset(Unfitted._axis_incidence(key.axes[2], 8), rows)
+    end
+    through_hole = filter(r -> on_mask_face(r, 4:5), l.level_raws[2])
+    in_material = filter(r -> on_mask_face(r, 1:3) || on_mask_face(r, 6:8), l.level_raws[2])
+    @test length(through_hole) == 3 && all(r -> l.elimination_source[r] === :free, through_hole)
+    @test !isempty(in_material) && all(r -> l.elimination_source[r] === :overlay, in_material)
+    M = Symmetric(Matrix(m.matrix))
+    s = sqrt.(diag(M))
+    @test rank(Symmetric(M ./ (s * s'))) == active_unknowns(l)
+
+    # The faces the cell verdicts settle are never classified. Under a hole of radius 0.1 an 8² overlay of
+    # [0.25, 0.75]² folds the four cells inside the hole away and keeps only full cells along its box: every face of its
+    # active region lies next to a folded or a full cell, so the artificial-boundary pass reads cell verdicts alone and
+    # allocates no face table.
+    small = physical_domain(x -> 0.1 - hypot(x[1] - 0.5, x[2] - 0.5); lipschitz=1.0, subcell_length_scale=1 / 128,
+                            max_depth=6)
+    _, spaces, caches = Unfitted._prepare_spaces(mass(overlay(space(_OMEGA_CR; cells=4, order=2, physical=small),
+                                                              box((0.25, 0.25), (0.75, 0.75)); cells=8, order=2)))
+    W, cache = only(spaces), only(caches)
+    @test count(!, W.levels[2].mask) == 4                        # non-vacuity: the fold faces are there
+    raw_by_key, raw_keys, _, level_raws = Unfitted._enumerate_raws(W)
+    fold = Unfitted._Fold(W, cache)
+    tol = GeometryTolerance(Float64)
+    for level in W.levels
+        ctx = Unfitted._LevelContext(W, fold, tol, Unfitted.Coverage{2}(Dict{Int,BitArray{2}}()), raw_keys, raw_by_key,
+                                     level_raws[level.id])
+        ledger = Unfitted.EliminationLedger{Float64}(length(raw_keys))
+        Unfitted._overlay_constraints!(ledger, level, ctx)
+        level === W.levels[2] && @test count(==(:overlay), ledger.source) > 0
+    end
+    @test !any(i -> isassigned(fold.faces, i), eachindex(fold.faces))
 end
 
 @testset "covered-mode pruning in 3D (edge, face, and interior modes)" begin
