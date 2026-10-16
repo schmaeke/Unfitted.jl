@@ -37,7 +37,7 @@ Two fields share the one space-time mesh:
     stepping it through a *changing* domain would need the state projected onto a new space at every step, which is the
     cost this formulation removes outright.
   * `u` — displacement, one component per *spatial* axis and hence two on a three-dimensional mesh, in quasi-static
-    equilibrium `∇ₓ·σ = 0` with a thermal eigenstrain, `σ = 2μ εₓ(u) + λ tr εₓ(u) I − β_T θ I`: a 2 × 2 stress on a
+    equilibrium `∇ₓ·σ = 0` with a thermal eigenstrain, `σ = 2μ εₓ(u) + λ tr εₓ(u) 𝑰 − β_T θ 𝑰`: a 2 × 2 stress on a
     3-axis mesh. The coupling runs one way, `θ → u`, so the block system is triangular and the temperature is unaffected
     by the stress it causes.
 
@@ -75,7 +75,7 @@ why the cavity centre is placed deliberately off every grid line. It does *not* 
 
 `θ` is the verified field here and `u` is the coupled response, reported through the VTK bundle rather than against a
 closed form, because on this geometry there is not one to compare against. The displacement that *would* have an exact
-form is free thermal expansion, `u = α_T θ (xₛ − c)`, which makes `σ` vanish identically; but that requires `α_T θ I` to
+form is free thermal expansion, `u = α_T θ (xₛ − c)`, which makes `σ` vanish identically; but that requires `α_T θ 𝑰` to
 be a compatible strain, hence `θ` harmonic in space, and a harmonic field with zero normal derivative on a circle is
 constant. So an exactly-verifiable `u` and a spatially varying `θ` cannot be had in the same manufactured solution, and
 the elastic block's own verification against the free-expansion field belongs in the test suite rather than here.
@@ -166,33 +166,31 @@ heat_bilinear(q, trial) = TestChannels(trial.gradient[end], κ * trial.gradient[
 
 heat = WeakForm(bilinear=heat_bilinear)
 
-# The 4th-order isotropic plane-strain tensor ℂ[i,j,k,l] = λ δ_ij δ_kl + μ (δ_ik δ_jl + δ_il δ_jk) over the two
-# *spatial* axes — the third mesh axis is time and carries no stress — so that σ = ℂ ⊡ εₓ is 2μ εₓ + λ tr(εₓ) I with the
-# Lamé pair fixed above; I₂ is the identity the thermal stress −β_T θ I is written against. Both are `const`, as are the
-# fields `θ` and `u` below, because the callbacks capture them and run once per test component per trial dof per
-# quadrature point, where a non-`const` global is read as `Any` and allocates.
-isotropic(i, j, k, l) = λ * (i == j) * (k == l) + μ * ((i == k) * (j == l) + (i == l) * (j == k))
+# Isotropic plane-strain Hooke's law σ(εₓ) = λ tr(εₓ) 𝑰 + 2μ εₓ over the two *spatial* axes, with the Lamé pair fixed
+# above — the third mesh axis is time and carries no stress, so 𝑰 is the 2 × 2 identity, the same one the thermal stress
+# −β_T θ 𝑰 is written against. `𝑰` is `const`, as are the fields `θ` and `u` below, because the callbacks capture them
+# and run once per test component per trial dof per quadrature point, where a non-`const` global is read as `Any` and
+# allocates.
+const 𝑰 = one(SymmetricTensor{2,2,Float64})
+σ(εₓ) = λ * tr(εₓ) * 𝑰 + 2μ * εₓ
 
-const ℂ = SymmetricTensor{4,2,Float64}(isotropic)
-const I₂ = one(SymmetricTensor{2,2,Float64})
-
-# ∫_Q σ(u) : εₓ(v) dQ with σ = ℂ ⊡ εₓ(u), an ordinary constitutive evaluation, so swapping ℂ is the only edit another
-# law needs. The three-argument `TestChannels` takes the whole stress and picks row `r` itself, since assembly contracts
-# against the gradient of the scalar test function of component `r` and `σ : ∇v = Σⱼ σ[r, j] ∂ⱼN`. The *two*-argument
+# ∫_Q σ(εₓ(u)) : εₓ(v) dQ, an ordinary constitutive evaluation, so swapping σ is the only edit another law needs. The
+# three-argument `TestChannels` takes the whole stress and picks row `r` itself, since assembly contracts against the
+# gradient of the scalar test function of component `r` and `σ : ∇v = Σⱼ σ[r, j] ∂ⱼN`. The *two*-argument
 # `symmetric_gradient(trial, u)` is the one to call: `u` has one component per spatial axis while the mesh has a time
 # axis too, so the strain is 2 × 2 on a 3-axis mesh — the one-argument form, sized by the mesh, adds precisely what its
 # docstring describes.
-elasticity_bilinear(q, trial, r) = TestChannels(0.0, ℂ ⊡ symmetric_gradient(trial, u), r)
+elasticity_bilinear(q, trial, r) = TestChannels(0.0, σ(symmetric_gradient(trial, u)), r)
 
 elasticity = WeakForm(bilinear=elasticity_bilinear, component_aware=true)
 
-# −∫_Q β_T θ tr εₓ(v) dQ, written as row `r` of the thermal stress −β_T θ I₂ so that it reaches the displacement rows
+# −∫_Q β_T θ tr εₓ(v) dQ, written as row `r` of the thermal stress −β_T θ 𝑰 so that it reaches the displacement rows
 # through the same contraction as the elastic block. The eigenstrain is a stress contribution and not a load: it sits
-# inside the one stress σ = 2μ εₓ(u) + λ tr εₓ(u) I − β_T θ I, and a load integrand would need θ *known*, which it is
+# inside the one stress σ = 2μ εₓ(u) + λ tr εₓ(u) 𝑰 − β_T θ 𝑰, and a load integrand would need θ *known*, which it is
 # not — θ is an unknown of this same system, which is why the term is an off-diagonal matrix block. Its trial field is
 # `θ`, whose only component is `1`, while the test runs over both displacement components, so no component-matching
 # guard is wanted.
-eigenstrain_bilinear(q, trial, r) = TestChannels(0.0, -β_T * trial.value * I₂, r)
+eigenstrain_bilinear(q, trial, r) = TestChannels(0.0, -β_T * trial.value * 𝑰, r)
 
 eigenstrain = WeakForm(bilinear=eigenstrain_bilinear, component_aware=true)
 

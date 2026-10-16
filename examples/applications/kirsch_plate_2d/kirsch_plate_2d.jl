@@ -135,21 +135,21 @@ end
 
 # ── Plane-stress elasticity bulk form ───────────────────────────────────────
 #
-# 4th-order isotropic plane-stress tensor ℂ[i,j,k,l] = λ* δ_ij δ_kl + μ (δ_ik δ_jl + δ_il δ_jk), with (λ*, μ) =
-# (Eν/(1−ν²), E/2(1+ν)); the double contraction σ = ℂ ⊡ ε then reproduces σ_xx = E/(1−ν²)(ε_xx + ν ε_yy), σ_yy =
-# E/(1−ν²)(ε_yy + ν ε_xx), σ_xy = E/(1+ν) ε_xy.
-const ℂ = SymmetricTensor{4,2,Float64}((i, j, k, l) -> λ_ps * (i == j) * (k == l) +
-                                                       μ * ((i == k) * (j == l) + (i == l) * (j == k)))
+# Isotropic Hooke's law σ = λ* tr(ε) 𝑰 + 2μ ε, with the plane-stress coefficient λ* = Eν/(1−ν²) in place of the Lamé λ
+# and 𝑰 the 2 × 2 identity; written out it reproduces σ_xx = E/(1−ν²)(ε_xx + ν ε_yy), σ_yy = E/(1−ν²)(ε_yy + ν ε_xx),
+# σ_xy = E/(1+ν) ε_xy.
+const 𝑰 = one(SymmetricTensor{2,2})
+σ(ε) = λ_ps * tr(ε) * 𝑰 + 2μ * ε
 
 # Bulk bilinear σ(u) : ε(v), written in tensor notation throughout. `symmetric_gradient(trial)` is the strain ε of the
-# trial basis function currently being assembled, so `ℂ ⊡ ε` is an ordinary constitutive evaluation — swap ℂ for any
+# trial basis function currently being assembled, so `σ(ε)` is an ordinary constitutive evaluation — swap σ for any
 # other law and nothing else here changes.
 #
 # Assembly contracts the returned gradient coefficient against the gradient of the *scalar* test function of component
 # `c`, i.e. against `∇v = e_c ⊗ ∇N`, and `σ : ∇v = Σⱼ σ[c, j] ∂ⱼN`. The three-argument `TestChannels` constructor takes
 # the whole stress tensor and the test component and picks row `c` itself, so the row extraction never has to be spelled
 # out by hand — and the code stays dimension-agnostic instead of naming the two 2-D slots.
-elasticity_bilinear(q, trial, c) = TestChannels(0.0, ℂ ⊡ symmetric_gradient(trial), c)
+elasticity_bilinear(q, trial, c) = TestChannels(0.0, σ(symmetric_gradient(trial)), c)
 
 # ── Discretization and a single p-refinement run ────────────────────────────
 

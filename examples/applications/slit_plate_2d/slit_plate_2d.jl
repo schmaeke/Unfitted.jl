@@ -62,11 +62,12 @@ omega = box((0.0, 0.0), (1.0, 1.0))
 
 # ── Plane-stress elasticity ─────────────────────────────────────────────────
 
+# Hooke's law σ = λ tr(ε) 𝑰 + 2μ ε, with the plane-stress λ = Eν/(1 − ν²) in place of the three-dimensional one.
 const E, ν = 1000.0, 0.3
 const λ, μ = E * ν / (1 - ν^2), E / (2 * (1 + ν))
-const ℂ = SymmetricTensor{4,2,Float64}((i, j, k, l) -> λ * (i == j) * (k == l) +
-                                                       μ * ((i == k) * (j == l) + (i == l) * (j == k)))
-elasticity(q, trial, c) = TestChannels(0.0, ℂ ⊡ symmetric_gradient(trial), c)
+const 𝑰 = one(SymmetricTensor{2,2})
+σ(ε) = λ * tr(ε) * 𝑰 + 2μ * ε
+elasticity(q, trial, c) = TestChannels(0.0, σ(symmetric_gradient(trial)), c)
 
 # Rollers on three sides, the traction on x = 1; the discrete strain energy is ½ fᵀu_h.
 function solve_plate(V)
