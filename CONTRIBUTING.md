@@ -305,7 +305,12 @@ boundary*:
 ```
 
 — i.e. the part of the overlay's boundary that does not coincide with the
-physical boundary `∂Ω`. These artificial constraints are imposed
+physical boundary `∂Ω`. On an immersed space (see *Immersed boundary*)
+`Ω^(k)` is the overlay's box intersected with `Ω`, so `Γ_o^(k)` is the
+part of the box boundary that meets `Ω`: a box face lying wholly outside
+`Ω` has nothing on either side of it to keep continuous and carries no
+condition. One rule decides this for every family, `_clamps_box_face` in
+`src/dofs.jl`. These artificial constraints are imposed
 strongly (eliminated dofs for the integrated Legendre basis and
 maximal-continuity B-splines; homogeneous linear constraints, resolved by
 the basis family that emits them, for integer-continuity B-splines). They
@@ -414,7 +419,24 @@ buried linear mode that a *nested* finer level reproduces exactly is
 deduplicated. Coverage is mask-aware — an inactive cell blocks coverage
 when it holds material (a user-masked cell reaching into Ω), and one that
 holds none (every folded cell, and a user-masked cell lying entirely
-outside Ω) does not.
+outside Ω) does not. On an immersed space it also asks only for a cell's
+share of Ω: a cut cell whose material lies inside a finer level's box is
+covered even where its box sticks out past that level's face, because
+nothing is integrated over the part that sticks out. Asking for the whole
+box left the cell's high-order modes active next to the finer level's
+copies of them on Ω, each an exact null mode of the operator.
+
+Both material questions — the part of a cut cell outside its cover, and
+whether an overlay's box face meets Ω — are answered by the cell
+classifier, whose verdicts are taken on closed sets. A face on which `∂Ω`
+lies exactly therefore counts as holding material: it stays clamped, the
+cell behind it stays uncovered, and the exact null modes those rules
+remove elsewhere remain (7 and 20 at p = 2 and 3 on Ω = {x₁ ≤ ω} under an
+overlay ending at x₁ = ω, none with ω moved 1e-3 off the face). This is
+a documented limitation rather than a defect to repair: an immersed
+boundary that is not built from planes on the grid essentially never lies
+on a cell face. If an overlay's face must sit on such a plane, move it a
+fraction of a cell into the fictitious side.
 
 Covered-mode pruning is a basis-family-specific feature, run by one
 generic driver, `_coverage_constraints!` in `src/dofs.jl`, through which a
@@ -1533,7 +1555,16 @@ demos.
     masked coverage under a ladder — split cover retained, single cover
     shed, lossless by rank against the unreduced twin — is pinned in
     `test_ladder.jl` ("covered-mode pruning on a ladder is lossless", with
-    the rank witness).
+    the rank witness). Coverage of a cut cell by its share of Ω, and an
+    overlay face outside Ω left unclamped, are pinned against a *control*
+    — the same overlay with its box extended over the cut cells, which
+    leaves its active cells unchanged — for a folded and a cut layer of
+    overlay cells at the face, at p = 1…3, on a planar and a curved
+    boundary and in 3D: same unknowns, same eliminations, same Gram
+    spectrum, full rank. A face holding material staying clamped, a cell
+    whose material crosses the face staying uncovered, and the coincident
+    face's remaining null modes (the documented limitation) are pinned
+    too, as are both material queries of the oracle, branch by branch.
   - Per-cell polynomial order: C⁰ conformity across an order jump, asserted
     as a per-basis-function one-sided trace jump `== 0`; the minimum rule's
     shape, and its set-membership form under `:trunk` where a per-axis
@@ -1591,19 +1622,17 @@ demos.
     fresh process that loads Unfitted alone, its entry points asking for
     `using WriteVTK` without writing anything or loading WriteVTK
     (`test_api.jl`).
-    **Requirement not yet met:** the fold configuration that support selection
-    repairs is still singular under the *clamped* mechanism, which `bspline(;
-    continuity = m)` for `m < p − 1` still selects. Where a clamped cover's box
-    face falls on a knot of the level below inside a band of cut cells, it
-    reproduces a *combination* of two buried functions without reproducing either,
-    and a dedup keyed on single buried functions cannot see it: measured at 8 exact
-    null modes of 104 unknowns, pinned `@test_broken` in `test_basis_bspline.jl`.
-    The repair is a per-face rank repair — of the `p` buried functions straddling
-    the face knot with the same perpendicular factor, keep the `m + 1` trace orders
-    and strongly eliminate the rest — which changes what the dedup may eliminate
-    rather than the burial test. Until it lands, use `continuity = :maximal` (the
-    default, where the burial test is exact and the configuration is full rank),
-    move the cover's face off the cut-cell band, or break the nesting.
+    The fold configuration with the cover's face on a knot of the level below,
+    inside the band of cut cells, is pinned under the *clamped* mechanism as
+    well, which `bspline(; continuity = m)` for `m < p − 1` still selects. A
+    clamped cover reproduces a *combination* of two buried functions without
+    reproducing either only behind a clamped face that no material crosses,
+    and the box-face rule clamps a face only where it holds material, so that
+    configuration — 8 exact null modes of 104 unknowns while its face was
+    clamped — is pinned full rank and lossless against the unreduced twin.
+    Only a face that `∂Ω` lies on exactly can still produce one (see *Mesh and
+    refinement model*). A cover holding no base cell whole, whose burial test
+    the driver's early exit used to skip, is pinned under both mechanisms.
   - Example smoke suite: every `examples/<tier>/<name>/<name>.jl`
     script runs to a clean exit at a coarse size in the default suite,
     with a finite, sane headline metric wherever the script prints one,

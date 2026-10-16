@@ -816,7 +816,9 @@ every covered mode, and that is exactly singular on a nested stack.
 
 Concretely a level sheds a mode wherever a *single* finer level has taken over the region that mode lives on. On an
 integrated Legendre level there are two eliminations, both per-mode rather than per-cell, and both asking first that the
-mode be *buried* — every cell it is incident to covered by one finer level:
+mode be *buried* — every cell it is incident to covered by one finer level. On an immersed space that level has to
+cover only the cell's share of Ω, so a cut cell whose material lies inside an overlay is covered even where its box
+sticks out past the overlay's face:
 
   * a buried **high-order** mode (one with at least one bubble axis) is dropped, so a fully covered cell keeps only its
     linear skeleton. An edge or face mode straddling the boundary of the covered region survives, because its own

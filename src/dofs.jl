@@ -14,10 +14,11 @@
 #     boundary trace space by an L² mass-matrix solve so the constrained value list reflects the correct trace at every
 #     constrained dof.
 #   * Artificial overlay constraint — homogeneous Dirichlet on the overlay's artificial boundary
-#     `Γ_o^(k) = ∂Ω^(k) \ ∂Ω`. Strongly eliminated for the integrated Legendre basis by removing the corresponding raw
-#     dof from active enumeration. Also applied at internal active/inactive cell faces of the same level when a
-#     `LevelMask` is in play — except where the inactive side is fully fictitious, since a fold face carries no physical
-#     trace to vanish on (`_has_overlay_constraint`).
+#     `Γ_o^(k) = ∂Ω^(k) \ ∂Ω`, which on an immersed space is the part of the overlay's box boundary that meets Ω: a box
+#     face lying wholly outside Ω carries no trace to vanish on (`_clamps_box_face`). Strongly eliminated for the
+#     integrated Legendre basis by removing the corresponding raw dof from active enumeration. Also applied at internal
+#     active/inactive cell faces of the same level when a `LevelMask` is in play — except where the inactive side is
+#     fully fictitious, since a fold face carries no physical trace to vanish on either (`_has_overlay_constraint`).
 #   * Covered-mode pruning — under leaf semantics, the high-order modes buried under a finer level, plus the buried
 #     linear modes a nested finer level reproduces exactly. Also a strong elimination, and also artificial: it removes
 #     modes the superposition already carries, never a physical condition.
@@ -498,13 +499,37 @@ end
 _coordinate_matches(a::Real, b::Real, tol::GeometryTolerance) = abs(a - b) <= tol.contain
 
 # True iff the level's mesh-domain boundary on the given axis-side coincides with the physical-domain boundary up to
-# `tol.contain`. Used by `_has_overlay_constraint` to decide whether a mesh-boundary face is a physical face (no overlay
-# constraint) or an artificial overlay face (homogeneous Dirichlet constraint).
+# `tol.contain`. Used by the artificial-boundary hooks to decide whether a mesh-boundary face is a physical face (no
+# overlay constraint) or part of the artificial overlay boundary, whose positions the box-face rule `_clamps_box_face`
+# then decides.
 function _level_side_is_physical(level::Level{D,T}, domain::AxisBox{D,T}, axis::Integer, side::Symbol,
                                  tol::GeometryTolerance{T}) where {D,T}
     side === :lower && return _coordinate_matches(level.mesh.domain.lower[axis], domain.lower[axis], tol)
     side === :upper && return _coordinate_matches(level.mesh.domain.upper[axis], domain.upper[axis], tol)
     throw(ArgumentError("boundary side must be :lower or :upper"))
+end
+
+# True iff `level` is clamped to zero on the `side` face of its own box where boundary cell `cell` meets it — the
+# box-face rule, written once for every family that clamps (`_has_overlay_constraint`, and `_active_cell_at_face` in the
+# B-spline extension) and for the burial test that has to predict the clamp (`_reproduced_on_domain`). Asked only of a
+# side that is not physical (`_level_side_is_physical`); there the face is a candidate for the artificial boundary
+# Γ_o = ∂Ω^(k) \ ∂Ω, and it belongs to it where the cell is active and its face holds material (`_is_void_face`).
+#
+# The material half reads Ω^(k) as the overlay's box intersected with Ω, so that Γ_o is the part of the box face that
+# meets Ω. A face lying wholly outside Ω has nothing on either side of it to keep continuous: the level's functions jump
+# to zero there, and nothing is integrated across the jump. Clamping such a face deleted the functions a cut boundary
+# cell needs near ∂Ω, and it left exact null modes wherever the coarse cell behind the face was covered on its material
+# part, because the clamped level still reproduced on Ω every coarse function vanishing on the face. It is the box-face
+# counterpart of the internal-face exemption, which asks the inactive neighbour (`_is_fictitious`); beyond a box face
+# there is no cell of the level to ask, so the face itself is asked.
+#
+# A face on which ∂Ω lies exactly counts as holding material, because the classifier's verdicts are taken on closed
+# sets, so it stays clamped. Measured on Ω = {x₁ ≤ ω} under a cover ending at x₁ = ω: 7 and 20 exact null modes remain
+# at p = 2 and 3 when ω lands on the face, and none with ω moved 1e-3 off it. A boundary that is not built from planes
+# on the grid essentially never lies on a face.
+@inline function _clamps_box_face(fold::_Fold{D,T}, level::Level{D,T}, cell::CartesianIndex{D}, axis::Int,
+                                  side::Symbol) where {D,T}
+    return is_active(level.mask, cell) && !_is_void_face(fold, level, cell, axis, side)
 end
 
 # ── The artificial-boundary hook ──────────────────────────────────────────────
@@ -547,8 +572,8 @@ leaf semantics (`dof_layout`'s `prune`, on by default) and only on a level outsi
 burial hooks below rather than through a method of its own. It strongly eliminates
 
   * every **buried high-order** mode of a family that sheds them (integrated Legendre: at least one bubble axis, every
-    active incident cell covered by and every fictitious one reached by a single finer level) — covered-mode pruning,
-    source `:coverage`; and
+    active incident cell covered on its material part by, and every fictitious one reached by, a single finer level) —
+    covered-mode pruning, source `:coverage`; and
   * every **buried** function a single nested level above whose span contains it reproduces exactly — dedup, source
     `:dedup`. The cover's mesh must nest over this one (`_nested_over`) and its span must contain the function
     (`_reproduces`): for integrated Legendre the linear modes, under a cover whose basis spans that mesh's hats; for a
@@ -560,11 +585,11 @@ first writer wins (see [`EliminationLedger`](@ref)), so a buried raw on `Γ_o` s
 
 Both halves ask `_reproduced_on_domain` (`coverage.jl`) of a cover judged geometrically, which applies the material rule
 on the covering level *and* on this one — an inactive support cell that holds no material (a folded cell, or a user mask
-entirely outside Ω) carries nothing to reproduce, so it neither has to be covered nor may veto the verdict. `ctx.fold`
-is the material oracle that answers it, the same one [`build_coverage`](@ref) used, and its memo holds
-`build_coverage`'s answers to the per-cover coverage question that test asks again. A B-spline level under a cover that
-selects by support is judged exactly instead, by subdivision against the cover's own admissible region (see `bspline` in
-the extension).
+entirely outside Ω) carries nothing to reproduce, so it neither has to be covered nor may veto the verdict, and an
+active one has to be covered only on its share of Ω. `ctx.fold` is the material oracle that answers it, the same one
+[`build_coverage`](@ref) used, and its memo holds `build_coverage`'s answers to the per-cover coverage question that
+test asks again. A B-spline level under a cover that selects by support is judged exactly instead, by subdivision
+against the cover's own admissible region (see `bspline` in the extension).
 
 The dedup half is not an optimisation: a mode a covering level reproduces exactly is linearly dependent on that level's
 own modes, so leaving both active makes the superposed operator exactly singular. The B-spline family takes part for
@@ -597,6 +622,13 @@ Every hook method over a `Level` carries `{D,T<:Real}` in its signature, as the 
 always more specific than the default rather than ambiguous with it.
 """
 function _coverage_constraints!(ledger::EliminationLedger, level::Level{D,T}, ctx::_LevelContext{D,T}) where {D,T}
+    # A level none of whose cells is covered has nothing to bury, under either test. A function a cover reproduces has
+    # every active support cell covered on its share of Ω: the geometric test asks exactly that (condition 1 of
+    # `_reproduced_on_domain`), and the exact test of a selecting B-spline cover asks it through the cover's virtual
+    # cells instead, wanting each support cell's part past the cover's box void. That made the gate sound only once the
+    # flags looked at the material part. While they tested whole cell boxes they skipped the exact test wherever no cell
+    # of the level lay inside a cover's box: a degree-2 B-spline base of 3² over Ω = {x₁ ≤ 0.91} under a cover ending at
+    # x₁ = 0.95 kept the 5 functions the cover reproduces as exact null modes.
     any(ctx.coverage.covered[level.id]) || return ledger
     covers = Level[]
     for k in ctx.space.levels
@@ -673,13 +705,13 @@ end
 # The coverage half — every active support cell covered by some level above — is the prefilter of the geometric test,
 # used when every cover that may dedup is judged geometrically (`geometric`; always, for an integrated-Legendre level):
 # a cover that reproduces the function covers each active support cell, so the flags turn away only functions no
-# geometric cover could decide. It tests the *whole* cell box against the cover's box, which under an immersed geometry
-# can reject a cell whose material part a cover does reach — the rest of it being fictitious — and for the exact test of
-# a selecting cover that would silently under-deduplicate, so it is not asked when such a cover may dedup. The exact
-# test needs no such prefilter for speed: its block test stops at the first inadmissible cell, which for a function
-# nowhere near the cover is one of the first it asks — what keeps the walk off the level's bulk. The flags are read on
-# the active support cells only, the ones `_coverage_cells` computed: a support cell two cells past the active front
-# holds the `false` default, not a verdict.
+# geometric cover could decide. It is not asked when a selecting cover may dedup. Its exact test asks the same material
+# question — does the part of a support cell past the cover's box hold anything? — through other boxes, the cover's
+# virtual cells rather than the slabs `_material_inside` classifies, so on a feature finer than the classifier resolves
+# the two answers can differ, and a prefilter could then only cost a dedup. Nor does the exact test need one for speed:
+# its block test stops at the first inadmissible cell, which for a function nowhere near the cover is one of the first
+# it asks — what keeps the walk off the level's bulk. The flags are read on the active support cells only, the ones
+# `_coverage_cells` computed: a support cell two cells past the active front holds the `false` default, not a verdict.
 #
 # The level half — every inactive support cell void — is the exact test's. An inactive support cell that holds material
 # (a user mask reaching into Ω) blocks: what a masked level assembles is the function truncated to its own active cells,
@@ -1102,32 +1134,33 @@ end
 # overlay constraint. The active region is the union of active cells; its boundary includes
 #
 #   * the mesh-box face on every axis where the level's mesh boundary does not coincide with the physical-domain
-#     boundary (i.e. the artificial overlay boundary `Γ_o^(k) = ∂Ω^(k) \ ∂Ω`);
+#     boundary, where it meets Ω (i.e. the artificial overlay boundary `Γ_o^(k) = ∂Ω^(k) \ ∂Ω`);
 #   * internal faces between active and inactive cells of the *same* level (the `LevelMask` boundary inside the level).
 #
-# With `mask === nothing` the active region equals the level's mesh box, only mesh-box faces matter, and this reduces to
-# the original overlay-boundary rule from the paper.
+# With `mask === nothing` and no physical domain the active region equals the level's mesh box, only mesh-box faces
+# matter, and this reduces to the original overlay-boundary rule from the paper.
 #
 # One walk per node axis decides it. Only an `_AXIS_NODE` factor sits on a face: at node index `i` it is the face
 # between cells `i − 1` and `i` along `axis`, and the key's incidence on the other axes (`_perp_ranges`) gives the
 # perpendicular positions the face spans under the key's support. Every position where activity changes across the face
 # is a face of the active region, and
 #
-#   * on a mesh-box face (`i == 1` or `i == n[axis] + 1`) the first such position settles the axis: the face constrains
-#     unless the level side lies on the physical boundary (`_level_side_is_physical`), and the rest of the face cannot
-#     say otherwise;
+#   * on a mesh-box face (`i == 1` or `i == n[axis] + 1`) the whole face is exempt when the level side lies on the
+#     physical boundary (`_level_side_is_physical`), and otherwise a position constrains when the box-face rule clamps
+#     it (`_clamps_box_face`: the active cell's face holds material);
 #   * on an internal face, a position constrains when the inactive cell across it holds material (it is not
 #     `_is_fictitious`).
 #
-# The second case is the material exemption. A face whose inactive side holds no material — every cell the fictitious
-# fold switched off, and a user-masked cell lying entirely outside Ω — has nothing on that side to stay continuous with,
-# and its boundary modes stay active. They vanish on every physical face — so they cannot break the C⁰ trace condition
-# the overlay constraint enforces — and instead carry the adjacent active cell's approximation (a cut cell's, up to ∂Ω,
-# whenever the fold runs). An inactive cell that holds material — a user mask reaching into Ω — is represented by a
-# coarser level only: the modes on its face are non-zero on a physical face and must be eliminated to keep the truncated
-# solution continuous. With no physical domain every inactive cell holds material, so every internal active/inactive
-# face constrains (the original overlay/user-mask behaviour) and `ctx.fold` classifies nothing. The walk stops at the
-# first constraining position, so a face classifies its inactive neighbours only until one of them holds material.
+# Both material tests are one exemption. A face with no material on one side of it — the face of a cell the fictitious
+# fold switched off, of a user-masked cell lying entirely outside Ω, or a box face lying wholly outside Ω — has nothing
+# there to stay continuous with, and its boundary modes stay active. They vanish on every physical face — so they cannot
+# break the C⁰ trace condition the overlay constraint enforces — and instead carry the adjacent active cell's
+# approximation (a cut cell's, up to ∂Ω, whenever the fold runs). An inactive cell that holds material — a user mask
+# reaching into Ω — is represented by a coarser level only: the modes on its face are non-zero on a physical face and
+# must be eliminated to keep the truncated solution continuous. With no physical domain everything holds material, so
+# every face of the active region constrains (the original overlay/user-mask behaviour) and `ctx.fold` classifies
+# nothing. The walk stops at the first constraining position, so a face classifies its inactive neighbours, or its own
+# cell faces, only until one of them holds material.
 #
 # This runs once per raw on every layout build, and two measured choices keep it cheap: `@inline`, without which the
 # call stays out of `_overlay_constraints!`'s per-raw loop (1.1–1.8× the pass time across the overlay, ladder and
@@ -1136,7 +1169,7 @@ end
 #
 # Integrated-Legendre-specific, because the incidence rule is. The B-spline family in `ext/UnfittedBasicBSplineExt.jl`
 # does the same job in its own `_overlay_constraints!`, with a support map that spans several cells and the same
-# material exemption (`_active_cell_at_face`).
+# material exemptions (`_active_cell_at_face`, which asks the same box-face rule).
 @inline function _has_overlay_constraint(key::TensorDofKey{D}, level::Level{D,T,<:IntegratedLegendre},
                                          ctx::_LevelContext{D,T}) where {D,T}
     n = level.mesh.cells
@@ -1150,7 +1183,9 @@ end
             if i == 1 || i == n[axis] + 1
                 side = i == 1 ? :lower : :upper
                 _level_side_is_physical(level, ctx.space.domain, axis, side, ctx.tolerance) && break
-                return true
+                boundary = CartesianIndex(ntuple(d -> d == axis ? (below_active ? i - 1 : i) : outer[d], D))
+                _clamps_box_face(ctx.fold, level, boundary, axis, side) && return true
+                continue
             end
             across = below_active ? i : i - 1          # the inactive cell's axis position
             inactive = CartesianIndex(ntuple(d -> d == axis ? across : outer[d], D))

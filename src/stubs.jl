@@ -311,11 +311,12 @@ is `C^{p−1}` at a simple interior knot, too smooth to carry the hat's kink, an
 
 At an integer `continuity` below `p − 1` the level is *clamped* at its artificial faces instead of selected, the
 reproduction question stops being a containment, and the burial test falls back to the conservative predicate
-`_reproduced_on_domain` uses. One fold configuration is then still left singular — when the overlay's box face falls on
-a knot of the level below inside a band of cut cells, the clamped overlay reproduces a combination of two buried
-functions while reproducing neither on its own, and the operator keeps one exact null mode per combination (measured at
-8 on a 6×6 degree-2 base over Ω = {x₁ ≤ 0.9} in [−1, 2]² with a quarter-cell overlay ending at x = 1). Use `:maximal`,
-move the overlay's face off the cut-cell band, or break the nesting.
+`_reproduced_on_domain` uses. A clamped overlay can reproduce a combination of two buried functions while reproducing
+neither on its own only behind a clamped face that no material crosses, and the artificial boundary is clamped only
+where its face holds material, so the configuration that used to show it — the overlay's box face on a knot of the level
+below inside a band of cut cells, 8 exact null modes on a 6×6 degree-2 base over Ω = {x₁ ≤ 0.9} in [−1, 2]² with a
+quarter-cell overlay ending at x = 1 — is full rank. The exception is a face that ∂Ω lies on exactly, which counts as
+holding material and stays clamped.
 
 The only stack that deliberately carries both copies is the **unreduced twin**
 [`prepare`](@ref)`(problem; prune = false)` builds, and on a nested stack that twin is exactly singular by construction
