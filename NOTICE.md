@@ -48,7 +48,7 @@ in full at the top of the implementing file, for academic attribution:
 
 ## QuESo (Quadrature for Embedded Solids)
 
-The finite-cell-method machinery in `src/fcm.jl` adopts the non-negative
+The `NonnegativeFit` compression in `src/fcm.jl` adopts the non-negative
 moment-fit-via-NNLS approach to cut-cell quadrature that QuESo's
 `QuadratureTrimmedElement` uses, and the package's FCM pipeline was
 originally developed by porting that structure from QuESo. The current
@@ -60,11 +60,11 @@ older method of B. Müller, F. Kummer, M. Oberlack (Int. J. Numer. Methods
 Engng. **96** (2013) 512, doi:10.1002/nme.4569). QuESo is acknowledged here
 as the reference that informed the FCM pipeline design.
 
-`moment_fit_rule` does run a bounded three-attempt outer loop of its own,
-which is a different mechanism: each attempt densifies the NNLS candidate
-cloud to improve the conditioning of the least-squares solve. It never
-searches for points to eliminate from a fitted rule, and never changes the
-subdivision depth the implicit kernel is allowed.
+`NonnegativeFit` does run a bounded three-attempt loop of its own, which is
+a different mechanism: each attempt draws a denser NNLS candidate cloud from
+the same cut rule, because a subset of that rule need not admit an exact
+non-negative fit of its moments. It never searches for points to eliminate
+from a fitted rule, and never changes the cut rule or its moments.
 
 The geometry and moments are computed differently from QuESo. QuESo
 classifies bounding boxes against a triangulated B-rep and computes

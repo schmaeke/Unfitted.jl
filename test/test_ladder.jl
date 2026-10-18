@@ -503,17 +503,17 @@ end
     @test diagnostics(model, solve!(model)).fit_failure_count == 0
 end
 
-# A cut-cell rule that counts the times it is asked for one. `cut_quadrature` is the documented extension point
-# (`physical_domain`), it sits behind exactly the per-`(box, moment order)` memoisation the moment fit does, and the
-# plan builds it serially, so a plain `Ref` counter sees every fit and nothing else. The rule returned is the region
-# box's own tensor Gauss — the cheapest thing that honours the contract, which is all a counting test needs.
+# A cut rule that counts the times it is asked for one. `cut_rule` is the documented extension point
+# (`physical_domain`), it sits behind exactly the per-`(box, moment order)` memoisation the package's own rule does, and
+# the plan builds it serially, so a plain `Ref` counter sees every rule and nothing else. The rule returned is the
+# region box's own tensor Gauss, kept uncompressed (`compression = nothing`) — the cheapest thing that honours the
+# contract, which is all a counting test needs.
 function counting_cut_rule(fits::Ref{Int})
     return function (physical, region_box::Unfitted.AxisBox{D,T}, moment_order::NTuple{D,Int}) where {D,T}
         fits[] += 1
         rule = Unfitted._tensor_gauss_rule(moment_order .+ 1, T)
         jacobian = Unfitted.volume(region_box) / T(2^D)
-        points = [Unfitted.reference_to_physical(region_box, p) for p in rule.points]
-        return points, rule.weights .* jacobian, zero(T), :custom
+        return [Unfitted.reference_to_physical(region_box, p) for p in rule.points], rule.weights .* jacobian
     end
 end
 
@@ -523,7 +523,7 @@ end
     # is that no derivation refits a rule the source already holds.
     fits = Ref(0)
     disc = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.7; subcell_length_scale=0.25,
-                           cut_quadrature=counting_cut_rule(fits))
+                           cut_rule=counting_cut_rule(fits), compression=nothing)
     V = ladder(box((-1.0, -1.0), (1.0, 1.0)); cells=8, order=2, depth=1, splits=2, physical=disc)
     model = prepare(mass(adapt(V, 2 => trues(16, 16))))
     @test fits[] > 0
@@ -561,7 +561,7 @@ end
     # case above.
     fits = Ref(0)
     disc = physical_domain(x -> sqrt(x[1]^2 + x[2]^2) - 0.7; subcell_length_scale=0.25,
-                           cut_quadrature=counting_cut_rule(fits))
+                           cut_rule=counting_cut_rule(fits), compression=nothing)
     V = ladder(box((-1.0, -1.0), (1.0, 1.0)); cells=8, order=2, depth=1, physical=disc, basis=bspline())
     model = prepare(mass(adapt(V, 2 => trues(16, 16))))
     held = collect(keys(only(Unfitted._fits(model))))
@@ -585,7 +585,7 @@ end
     # at either position.
     fits = Ref(0)
     half = physical_domain(x -> x[1] - 0.55; lipschitz=1.0, subcell_length_scale=1.0e-3, max_depth=3,
-                           cut_quadrature=counting_cut_rule(fits))
+                           cut_rule=counting_cut_rule(fits), compression=nothing)
     V = overlay(space(LADDER_OMEGA; cells=(4, 4), order=1, physical=half), box((0.0, 0.0), (0.25, 0.25)); cells=(1, 1),
                 order=1)
     model = prepare(mass(V; coefficient=1.0))

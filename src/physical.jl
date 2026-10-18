@@ -44,13 +44,13 @@ end
 
 Wrap a scalar level-set callback `f` (on `SVector{D,T}` coordinates) as a CSG leaf with `Ω_leaf = { x : f(x) ≤ 0 }`. `f`
 must accept `ForwardDiff.Dual` arguments so the quadrature kernel can take its gradient: the finite-cell path
-(`physical_domain` → `moment_fit_rule`) installs no gradient override, and the `grad` keyword of
+([`implicit_rule`](@ref)) installs no gradient override, and the `grad` keyword of
 [`implicit_volume_quadrature`](@ref) is reachable only by calling that kernel directly.
 
-`f` must also be safe to call from several threads at once — a pure function of `x` is. The package fits the
-quadrature of cut cells and of cut boundary faces on every thread, and those fits evaluate the leaves concurrently; a
-custom `cut_quadrature` (see [`PhysicalDomain`](@ref)) replaces only the cell fits and is itself called serially, so
-the face fits still evaluate the leaves on several threads.
+`f` must also be safe to call from several threads at once — a pure function of `x` is. The package builds the
+quadrature of cut cells and of cut boundary faces on every thread, and those builds evaluate the leaves concurrently; a
+custom `cut_rule` or `compression` (see [`PhysicalDomain`](@ref)) makes the cell builds serial, but the face builds
+always use [`implicit_rule`](@ref) and still evaluate the leaves on several threads.
 
 `lipschitz` is the Lipschitz constant used by the sign certificate of both the cell classifier and the implicit
 quadrature kernel; `1.0` for a true signed-distance leaf, `Inf` to rely on corner sampling. Supplying it is what lets a
@@ -138,9 +138,8 @@ _leaves(g::LevelSet) = _collect_leaves!(Leaf[], g)
 # ── PhysicalDomain ────────────────────────────────────────────────────────────
 
 """
-    PhysicalDomain{G,T,Q}(geometry, alpha, subcell_length_scale, max_depth,
-                          moment_order_factor, target_residual, keep_fictitious,
-                          cut_quadrature)
+    PhysicalDomain{G,T,R,C}(geometry, alpha, subcell_length_scale, max_depth,
+                            moment_order_factor, keep_fictitious, cut_rule, compression)
 
 CSG level-set description of a physical domain Ω for finite-cell-style immersed integration. `Ω = { x : x ∈ geometry }`,
 where `geometry` is a [`LevelSet`](@ref) tree of smooth leaves combined by `intersect`/`union`/ `setdiff`/`complement`
@@ -164,27 +163,27 @@ Fields:
     and the physical domain clean for post-processing; `true` requires `alpha > 0`, and [`physical_domain`](@ref) raises
     an `ArgumentError` on the `alpha = 0` pairing rather than building a domain whose kept cells carry no quadrature.
   - `subcell_length_scale::T`: target box size, in physical units, for the binary subdivision both the classifier and
-    the moment-fit kernel share. A box is bisected until its largest axis extent is `≤ subcell_length_scale` (capped by
-    `max_depth`); `_effective_subcell_depth` turns the two into a single depth budget. It feeds exactly two consumers,
-    both subdivision budgets — not an octree moment grid:
+    the implicit-quadrature kernel share. A box is bisected until its largest axis extent is `≤ subcell_length_scale`
+    (capped by `max_depth`); `_effective_subcell_depth` turns the two into a single depth budget. It feeds exactly two
+    consumers, both subdivision budgets — not an octree moment grid:
     (1) the cut/full/fictitious classifier, which bisects only when the Lipschitz certificate and corner sampling cannot
     decide a box, so this is a geometry-*robustness* knob (resolving thin or near-tangent features); and
-    (2) the implicit-quadrature kernel's fallback subdivision on *non-graph-like* cut cells (a leaf with a turning point
-    / multiple roots inside the box). Smooth, graph-like cut cells get exact, depth-independent moments from the kernel
-    (see `src/fcm.jl`) and are never subdivided, so on those cells moment accuracy does not depend on this scale at all.
-    Pick it relative to the smallest geometric feature you must classify cleanly.
+    (2) the subdivision of [`implicit_rule`](@ref)'s kernel, which bisects a cut box only where no axis is graph-like
+    and clear of a fold (a leaf turning back inside or just beyond the box). A cut cell on which some axis is gets a
+    rule of the kernel's full order at once and is never subdivided, so on those cells the accuracy does not depend on
+    this scale at all. Pick it relative to the smallest geometric feature you must classify cleanly.
   - `max_depth::Int`: hard cap on the subdivision depth of both consumers above.
-  - `moment_order_factor::Int`: multiplier on the NNMF moment-fit basis order per axis (`factor × max(cell_order)` over
-    the region's parent cells).
+  - `moment_order_factor::Int`: multiplier on the order of the tensor Legendre moments a cut cell's rule reproduces,
+    per axis (`factor × max(cell_order)` over the region's parent cells).
 
-    `2` (the default) spans degree `2p`, so the fit solves for `∏(2p+1)` weights and trial × test *products* integrate
-    exactly — matching on cut regions what tensor Gauss already delivers on `:full` ones.
+    `2` (the default) spans degree `2p`, so trial × test *products* integrate exactly — matching on cut regions what
+    tensor Gauss already delivers on `:full` ones — and the compressed rule carries at most `∏(2p+1)` points.
 
-    `1` spans degree `p` and solves for `∏(p+1)` weights, the same point count tensor Gauss uses on an uncut cell. It is
-    the convention of much of the moment-fitting literature and of QuESo, whose trimmed-element rules likewise carry
-    `n ≤ ∏(p+1)` points, and it is dramatically cheaper: the fit costs roughly the cube of the weight count, so over the
-    146 cut cells of the space-time cavity geometry at cells `(8,8,8)` it runs 1.1 s at `∏(p+1) = 125` against ≈ 500 s
-    at `∏(2p+1) = 729`.
+    `1` spans degree `p` and carries at most `∏(p+1)` points, the tensor Gauss count on an uncut cell. It is the
+    convention of much of the moment-fitting literature and of QuESo, whose trimmed-element rules likewise carry
+    `n ≤ ∏(p+1)` points, and it is dramatically cheaper: a compression costs roughly the cube of the point count, so
+    with [`NonnegativeFit`](@ref) over the 146 cut cells of the space-time cavity geometry at cells `(8,8,8)` it runs
+    1.1 s at `∏(p+1) = 125` against ≈ 500 s at `∏(2p+1) = 729`.
 
     It is not, however, a free choice, and the condition is sharp. A stiffness integrand `∇u·∇v` has degree `2(p−1)`, so
     exactness needs the moment basis to span `2p − 2`, i.e. `factor ≥ 2 − 2/p` — which `1` satisfies only up to `p = 2`.
@@ -199,79 +198,84 @@ Fields:
         order 7   7.33e-2    < 1e-6
 
     At factor `1` the sequence stops converging after `p = 2` and then diverges, ending three times worse than first
-    order, while the moment-fit residual holds at ~1e-16 throughout — the fit is exact for what it fits, and what it
-    fits is too little. Use `1` for low-order work or when only linear functionals are integrated over cut cells; keep
+    order, while the moment residual holds at ~1e-16 throughout — the rule is exact for the moments it reproduces, and
+    those are too few. Use `1` for low-order work or when only linear functionals are integrated over cut cells; keep
     `2` whenever high-order convergence on cut cells is the point.
-  - `target_residual::T`: NNMF L² residual the moment-fit aims for in cut regions. Default `1e-6`; the exact kernel
-    reaches far below it, so this only bounds the conditioning retry.
-  - `cut_quadrature::Q`: the cut-cell quadrature rule. `nothing` (the default, `Q === Nothing`) is the package's own
-    non-negative moment fit; any other value is a callable that replaces it on **cut** regions only. See "Custom
-    cut-cell quadrature" below for the contract it must honour.
+  - `cut_rule::R`: the first stage of a cut cell's quadrature, which integrates `box ∩ Ω` accurately — by default
+    [`implicit_rule`](@ref). See "The cut rule and its compression" below.
+  - `compression::C`: the second stage, which reduces the cut rule to `∏(moment order + 1)` points or fewer that
+    reproduce its moments — by default [`NonnegativeFit`](@ref) — or `nothing` to integrate cut cells with the cut rule
+    itself. See below.
 
-# Custom cut-cell quadrature
+# The cut rule and its compression
 
-`cut_quadrature` is the extension point for integrating a cut cell by some other scheme — a space-tree/octree rule, a
-tessellation, a rule read from a file. It is called once per distinct `(region box, moment order)` pair (see the
-memoisation note below), with the signature
+Every cut region's rule is `moment_fit_rule(physical, box, moment_order)` ([`moment_fit_rule`](@ref)): the cut rule
+integrates `box ∩ Ω` with as many points as accuracy takes, and the compression replaces them by at most `nbasis =
+∏(moment_order .+ 1)` points that reproduce the cut rule's tensor Legendre moments. Either stage can be replaced by a
+callable; both are called once per distinct `(region box, moment order)` pair.
 
-    (physical, box, moment_order) -> (points, weights, residual, status)
+The cut rule has the signature
 
-and must return the same 4-tuple [`moment_fit_rule`](@ref) returns: `points::Vector{SVector{D,T}}`,
-`weights::Vector{T}`, a scalar `residual`, and a `Symbol` status (report `residual = 0` when a rule has no notion of a
-fit residual). Only `:full`, `:fictitious`, and the fictitious fold are unaffected — every other part of the pipeline
-treats the returned rule exactly as it treats a fitted one. Four properties of that pipeline are the caller's
-responsibility:
+    cut_rule(physical, box, moment_order) -> (points, weights)
 
- 1. **Points are in physical coordinates.** `points[q] ∈ box ⊂ ℝᴰ` and `weights[q]` is its physical weight, so
-    `Σ w_q ≈ vol(box ∩ Ω)` — the same convention [`moment_fit_rule`](@ref) returns. The per-box rule cache and the
-    mapping into the region's `[−1, 1]ᴰ` reference frame downstream both assume it; handing back reference-frame points
-    silently integrates the wrong geometry.
- 2. **Weights must be non-negative.** The α-FCM blend below and the fictitious fold in `src/mesh.jl` both assume
-    `w_q ≥ 0`, and a negative weight can make an otherwise SPD form indefinite. The moment fit guarantees this by
-    construction (NNLS); a custom rule must guarantee it itself.
- 3. **An empty rule produces silent zero stiffness.** A rule that returns no points for a sliver cell contributes
-    nothing to the tangent, and *no diagnostic is raised*: the region is kept, tagged, and integrates to zero, so every
-    dof supported only there ends up with a zero row and the system is singular. This is not hypothetical — it is what
-    makes an aggressive space-tree configuration singular at `alpha = 0`. A rule that knows it found nothing should
-    return `status === :empty`, which routes the region to `:cut_failed` (α = 0) or `:cut_alpha_failed` (α > 0) exactly
-    as an empty moment fit would, and so at least reaches `diagnostics(...).fit_failure_count`.
- 4. **α blending still applies**, downstream of the rule. Under `alpha > 0` a cut region carries
-    `(1 − α)·(custom rule) ∪ α·(full-cell tensor rule)`, just as it would with the moment fit, so a custom rule inherits
-    α-FCM rather than replacing it.
+and returns a rule for `box ∩ Ω` in **physical coordinates**: `points[q] ∈ box ⊂ ℝᴰ` and `weights[q]` its physical
+weight, so `Σ w_q ≈ vol(box ∩ Ω)`. A rule in the box's reference frame silently integrates the wrong geometry. Its
+accuracy is the accuracy of the cell: the compression reproduces its moments and can be no better than it. A cut rule
+that finds nothing returns empty vectors, which routes the region to `:cut_failed` (`α = 0`) or `:cut_alpha_failed`
+(`α > 0`) and reaches `diagnostics(...).fit_failure_count`. A rule that misses part of a cut volume is more dangerous
+than an empty one: a dof supported only where the rule has no points gets a zero row and the system is singular at
+`α = 0` — measured for a space-tree rule that keeps the tensor Gauss points of its cut leaves that fall in Ω, at depth 3
+on an 8² mesh at every order from 2.
 
-The rule must also be a deterministic function of its three arguments: results are memoised per
-`(region box, moment order)` in a cache the [`Model`](@ref) owns per participating space and threads back through every
-plan rebuild, so a rule reading mutable state outside its arguments is captured at its first answer for a box and
-silently reused — across rebuilds, not merely within one. Put every knob in the callable itself; that is what makes the
-rule reproducible. The package does not run a custom rule on several threads, unlike its own fit: `_fit_rules` in
-`src/intersections.jl` fits custom rules serially, because they are caller code under no thread-safety contract. The
-leaves are another matter: the package's own fits of cut boundary faces, which never consult the custom rule, still
-evaluate them on several threads (see [`leaf`](@ref)).
-`residual` is reported verbatim through `diagnostics(model).moment_fit_residual_max`.
+The compression has the signature
 
-A region built from a custom rule is tagged `:cut_custom` (see `_trimmed_rule` in `src/intersections.jl`) —
-one kind for every custom rule, whatever status symbol it returns, `:empty` excepted as in point 3 above.
-`_kind_stats` counts `:cut_custom` as a cut region and **not** as a fit failure, since there is no fit to fail.
-The rule is stored on the domain rather than in a global, so two models in one session can use different rules and
-nothing about the choice is process-wide or thread-shared.
+    compression(points, weights, moments, box, moment_order) -> (points, weights)
+
+and receives the cut rule together with its moments `m_α = Σ_q w_q ψ_α(ξ(x_q))`, where `ψ_α(ξ) = ∏_d L_{α_d}(ξ_d)` is
+the tensor product of Legendre polynomials (normalised to `L_n(1) = 1`) on the box's reference coordinate
+`ξ ∈ [−1, 1]ᴰ`, and `α` runs over `CartesianIndices(0:p₁, …, 0:p_D)` in column-major order. It returns a rule in the
+same physical frame whose moments match `m`. [`moment_fit_rule`](@ref) measures that: a rule whose residual exceeds
+1e-2 `‖m‖` is discarded for the cut rule itself (region kind `:cut_fallback`). A compression is also applied on the
+boundary faces of a cut region, one dimension down, so it must not assume the box's dimension.
+
+Three properties of the pipeline are the caller's responsibility for either stage:
+
+ 1. **Weights must be non-negative.** The α-FCM blend `(1 − α)·rule ∪ α·tensor` assumes it, the Dirichlet trace solve
+    reads a zero diagonal of its boundary mass as an unsupported dof only because every facet weight is `≥ 0`, and a
+    negative weight can make an otherwise SPD form indefinite and a squared norm negative. A moment fit at fixed points
+    — the tensor Gauss points of the box, solved in closed form — is the standard example: on 31 cut cells of discs,
+    balls, polytopes and perforated cells it put negative weights on 38% of its points and 79% of its points outside Ω,
+    and the L² error it integrated came out negative.
+ 2. **The callable must be a deterministic function of its arguments.** Rules are memoised per
+    `(region box, moment order)` in a cache the [`Model`](@ref) owns per participating space and threads back through
+    every plan rebuild, so a callable reading mutable state outside its arguments is captured at its first answer for a
+    box and silently reused — across rebuilds, not merely within one. Put every knob in the callable itself.
+ 3. **A custom stage is run serially.** The package builds cut rules on every thread when both stages are its own;
+    with a caller's callable in either stage it builds them on one thread, because caller code is under no
+    thread-safety contract. The leaves are another matter (see [`leaf`](@ref)).
+
+The cut rule is not consulted on a boundary face: it is a rule on a cell box in the model's own dimension, so a face
+always takes [`implicit_rule`](@ref) on the level set restricted to its affine slice, followed by the domain's
+compression. Both stages are stored on the domain rather than in a global, so two models in one session can use
+different ones and nothing about the choice is process-wide.
 
 Construct via [`physical_domain`](@ref).
 """
-struct PhysicalDomain{G<:LevelSet,T<:Real,Q}
+struct PhysicalDomain{G<:LevelSet,T<:Real,R,C}
     geometry::G
     alpha::T
     subcell_length_scale::T
     max_depth::Int
     moment_order_factor::Int
-    target_residual::T
     keep_fictitious::Bool
-    cut_quadrature::Q
+    cut_rule::R
+    compression::C
 end
 
 """
     physical_domain(geometry; lipschitz=Inf, alpha=0.0, keep_fictitious=false,
                     subcell_length_scale, max_depth=8, moment_order_factor=2,
-                    target_residual=1e-6, cut_quadrature=nothing)
+                    cut_rule=implicit_rule, compression=NonnegativeFit())
 
 Construct a [`PhysicalDomain`](@ref). `geometry` is either a [`LevelSet`](@ref) CSG tree (built from [`leaf`](@ref) and
 `intersect`/`union`/`setdiff`/ [`complement`](@ref)) or a bare scalar callable `φ`, which is auto-wrapped as a single
@@ -284,18 +288,17 @@ uncertified leaf would then be integrated as if its feature were not there.
 `subcell_length_scale` is the **required** classifier accuracy / subdivision scale (see the [`PhysicalDomain`](@ref)
 docstring). `alpha = 0` is the strict-cut path; `alpha > 0` enables α-FCM. `keep_fictitious = true` retains
 fully-fictitious cells as active dofs (the classic α-FCM fill) and therefore requires `alpha > 0` — pairing it with
-`alpha = 0` leaves those cells without quadrature and is rejected. `moment_order_factor` and `target_residual` tune the
-NNMF moment fit.
+`alpha = 0` leaves those cells without quadrature and is rejected. `moment_order_factor` sets the order of the moments a
+cut cell's rule reproduces.
 
-`cut_quadrature = nothing` (default) integrates cut cells with the package's non-negative moment fit. Passing a callable
-`(physical, box, moment_order) -> (points, weights, residual, status)` replaces that rule on cut regions and nothing
-else; the contract it must honour — physical-frame points, non-negative weights, the silent-zero-stiffness hazard of an
-empty rule, and the α blend that still applies downstream — is spelled out under "Custom cut-cell quadrature" in the
-[`PhysicalDomain`](@ref) docstring.
+`cut_rule` and `compression` are the two stages of a cut cell's quadrature: [`implicit_rule`](@ref) integrates the cut
+volume, and [`NonnegativeFit`](@ref) compresses that rule to at most `nbasis` points; `compression = nothing` keeps
+the cut rule uncompressed. Either stage can be a callable of the caller's; the contracts they must honour are under
+"The cut rule and its compression" in the [`PhysicalDomain`](@ref) docstring.
 """
 function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0, keep_fictitious::Bool=false,
                          subcell_length_scale::Real, max_depth::Integer=8, moment_order_factor::Integer=2,
-                         target_residual::Real=1.0e-6, cut_quadrature=nothing)
+                         cut_rule=implicit_rule, compression=NonnegativeFit())
     # Validated here rather than only inside `leaf`, so the constraint holds on every path: with a tree argument the
     # auto-wrap never runs, and `lipschitz` would otherwise reach no check at all.
     lipschitz > 0 || throw(ArgumentError("lipschitz must be positive; got $lipschitz"))
@@ -307,7 +310,6 @@ function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0, keep_fi
     subcell_length_scale > 0 || throw(ArgumentError("subcell_length_scale must be > 0; got $subcell_length_scale"))
     max_depth >= 0 || throw(ArgumentError("max_depth must be ≥ 0; got $max_depth"))
     moment_order_factor >= 1 || throw(ArgumentError("moment_order_factor must be ≥ 1; got $moment_order_factor"))
-    target_residual > 0 || throw(ArgumentError("target_residual must be positive; got $target_residual"))
     # A bare callable becomes a single leaf, honouring the `lipschitz` keyword; an explicit CSG tree carries per-leaf
     # Lipschitz constants already, so the keyword has nowhere to go there. Only the combination that actually loses
     # information is rejected — a finite constant supplied alongside a tree with a leaf that carries none — because that
@@ -327,10 +329,9 @@ function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0, keep_fi
                                          "own; set it on the leaf instead: leaf(f; lipschitz=$lipschitz)"))
     end
     g = geometry isa LevelSet ? geometry : leaf(geometry; lipschitz=lipschitz)
-    T = promote_type(typeof(float(alpha)), typeof(float(subcell_length_scale)), typeof(float(target_residual)))
-    return PhysicalDomain{typeof(g),T,typeof(cut_quadrature)}(g, T(alpha), T(subcell_length_scale), Int(max_depth),
-                                                              Int(moment_order_factor), T(target_residual),
-                                                              keep_fictitious, cut_quadrature)
+    T = promote_type(typeof(float(alpha)), typeof(float(subcell_length_scale)))
+    return PhysicalDomain(g, T(alpha), T(subcell_length_scale), Int(max_depth), Int(moment_order_factor),
+                          keep_fictitious, cut_rule, compression)
 end
 
 """
@@ -484,14 +485,14 @@ _restrict(n::Not, k::Int, v) = Not(_restrict(n.part, k, v))
 # its axis from the coordinate vector, so an axis index stays the one the caller named only while no lower-numbered axis
 # has been dropped before it.
 #
-# Built by direct struct construction rather than through `physical_domain`, so that all eight fields survive verbatim —
-# `keep_fictitious` and `cut_quadrature` included — with no keyword round-trip, and so that the slice never meets that
+# Built by direct struct construction rather than through `physical_domain`, so that the fields survive verbatim —
+# `keep_fictitious` and the compression included — with no keyword round-trip, and so that the slice never meets that
 # constructor's argument validation, which is about what a caller may *ask* for and has nothing to say about a slice of
 # an already-valid domain (its uncertified-leaf rejection, in particular, would fire on a tree the caller never wrote).
-function _restrict_domain(physical::PhysicalDomain{G,T,Q}, pins) where {G,T,Q}
+# The one field that does not survive is the cut rule: a caller's is a rule on a cell box in the model's own dimension,
+# so a slice integrates its faces with [`implicit_rule`](@ref), which takes its dimension from the box it is handed.
+function _restrict_domain(physical::PhysicalDomain, pins)
     geometry = foldl((g, pin) -> _restrict(g, pin[1], pin[2]), pins; init=physical.geometry)
-    return PhysicalDomain{typeof(geometry),T,Q}(geometry, physical.alpha, physical.subcell_length_scale,
-                                                physical.max_depth, physical.moment_order_factor,
-                                                physical.target_residual, physical.keep_fictitious,
-                                                physical.cut_quadrature)
+    return PhysicalDomain(geometry, physical.alpha, physical.subcell_length_scale, physical.max_depth,
+                          physical.moment_order_factor, physical.keep_fictitious, implicit_rule, physical.compression)
 end

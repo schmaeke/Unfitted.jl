@@ -195,16 +195,16 @@ Three numbers in the report below are specific to the immersed path.
     rule instead of tensor Gauss. Zero would mean the geometry never actually crossed a cell, i.e. that you are not
     testing what you think you are.
 
-  * `fit failure count` — cut regions whose non-negative fit missed the package's internal failure threshold. Nothing is
+  * `fit failure count` — cut regions whose compressed rule missed the package's internal failure threshold. Nothing is
     silently dropped when that happens: such a region normally falls back to the raw implicit-quadrature rule the
     moments were derived from, which is correct and non-negative but carries 50 to 200 times the points. (`diagnostics`
     reports that subset separately as `cut_fallback_count`, which this printout does not show.) Either way, a nonzero
     count says those cells are too coarse for the geometry passing through them — refine there rather than loosening a
     tolerance. It is 0 here.
 
-  * `moment-fit residual (max)` — the largest L² residual of any fit, i.e. how well the fitted rule reproduces the exact
-    moments. Values around 1e-17 mean the rules are exact to roundoff. Anything approaching the `target_residual` of
-    `physical_domain` (default 1e-6) means the fits are only just succeeding.
+  * `moment-fit residual (max)` — the largest L² residual of any compressed rule against the moments of the
+    implicit-quadrature rule it replaces. Values around 1e-17 mean the rules are exact to roundoff; anything approaching
+    the failure threshold — a hundredth of the moments' own size — means the compression is only just succeeding.
 
 Also worth a glance: `inactive cell counts` includes the cells the level set folded away as fictitious, and
 `small overlaps` counts integration regions so tiny that they are a conditioning hazard — this package reports them

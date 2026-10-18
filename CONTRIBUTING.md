@@ -23,19 +23,19 @@ The implementation is written from the method specification — not ported
 from any single reference codebase. Sub-systems informed by upstream
 open-source projects are attributed in `NOTICE.md` and at the top of every
 file that carries the borrowed design. The notable case is the finite-cell
-method moment-fit quadrature in `src/fcm.jl`. Its cut-cell moments are
-computed exactly by Saye's dimension-reduction implicit quadrature on a CSG
-level set (`src/implicit.jl`, `src/physical.jl`); the non-negative
-moment-fit idea is
+method cut-cell quadrature in `src/fcm.jl`. A cut cell is integrated by
+Saye's dimension-reduction implicit quadrature on a CSG level set
+(`src/implicit.jl`, `src/physical.jl`), and that rule is compressed to one
+that reproduces its moments — the moment-fitting idea of
 
 > B. Müller, F. Kummer, M. Oberlack, *Highly accurate surface and volume
 > integration on implicit domains by means of moment-fitting*, Int. J.
 > Numer. Methods Engng. **96** (2013) 512–528.
 > [doi:10.1002/nme.4569](https://doi.org/10.1002/nme.4569).
 
-and the non-negative least-squares moment-fit *structure* follows QuESo's
-`QuadratureTrimmedElement` — used as an algorithmic reference only, with no
-code vendored:
+and the non-negative least-squares compression, `NonnegativeFit`, follows
+the *structure* of QuESo's `QuadratureTrimmedElement` — used as an
+algorithmic reference only, with no code vendored:
 
 > M. Meßmer, T. Teschemacher, L. F. Leidinger, R. Wüchner, K.-U.
 > Bletzinger, *Efficient CAD-integrated isogeometric analysis of trimmed
@@ -142,7 +142,7 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `physical.jl`     | CSG level-set tree, `PhysicalDomain`, three-valued cell classifier |
 | `implicit.jl`     | Saye dimension-reduction implicit quadrature on the level set (volume rules) |
 | `basis.jl`        | basis-family interface and capability traits, integrated Legendre default, the `:tensor` / `:trunk` index sets and the `_index_admissible` filter the minimum rule is expressed over, tensor-product evaluation |
-| `fcm.jl`          | finite-cell-method cut-cell quadrature: exact moments from `implicit.jl`, non-negative (NNLS) moment fit |
+| `fcm.jl`          | finite-cell-method cut-cell quadrature in two stages: the cut rule (`implicit_rule`, from `implicit.jl`) and its compression to a rule that reproduces its moments (`NonnegativeFit`, NNLS); `moment_fit_rule` runs the two |
 | `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks (`LevelMask`, an alias of `BitArray`) and per-cell polynomial order (`CellOrders` / `CellModes`, with no per-cell arrays on a uniform level); the `space` / `overlay` / `adapt` / `elevate` verbs |
 | `intersections.jl`| the integration-region record (`Region`, `Parent`) and admissible integration regions for non-matching meshes; cut/fictitious region-quadrature dispatch |
 | `coverage.jl`     | per-level covered-cell masks (`Coverage`, `build_coverage`); the mask- and material-aware covering rule behind covered-mode pruning; the material oracle (`_Fold`) the dof layer asks whether an inactive cell holds material |
@@ -562,14 +562,14 @@ constructed as follows:
      raises `ArgumentError`.
   7. Dispatch the region quadrature on the `PhysicalDomain`
      classification — tensor Gauss on `:full`, α-scaled tensor Gauss on
-     `:fictitious` with `α > 0`, the moment-fit pipeline on `:cut` (or
-     the domain's `cut_quadrature` callable in its place, see *Region
-     quadrature kinds* below); a `:fictitious` region under strict α
-     (`α = 0`) is dropped outright.
+     `:fictitious` with `α > 0`, and on `:cut` the domain's cut rule under
+     its compression (`moment_fit_rule`, see *Region quadrature kinds*
+     below); a `:fictitious` region under strict α (`α = 0`) is dropped
+     outright.
   8. Store each contributing parent element with the affine map from the
      box's frame into that element's reference frame, record a
      `SmallOverlap` for every region below `tolerance.small_volume`, and
-     track the largest moment-fit residual seen.
+     track the largest moment residual of a compressed cut rule seen.
 
 The integrand of a basis-function product is smooth (`C^∞`) inside such
 an admissible box. Do not integrate a product of basis functions across
@@ -960,7 +960,7 @@ no state transfer — see *Moving overlays and state transfer*.
 
 ### Immersed boundary (finite cell method)
 
-The package supports the finite cell method with non-negative moment-fit
+The package supports the finite cell method with non-negative, compressed
 quadrature on cut cells. The geometry of `Ω` is a **CSG level set**: a
 Boolean combination of smooth leaves, each a scalar function `f` with
 `Ω_leaf = { x : f(x) ≤ 0 }`. A single leaf is the familiar
@@ -979,7 +979,7 @@ indicator representations are intentionally not supported.
   - **Public construction**:
     `physical_domain(geometry; lipschitz=Inf, alpha=0.0, keep_fictitious=false,
     subcell_length_scale, max_depth=8, moment_order_factor=2,
-    target_residual=1e-6, cut_quadrature=nothing)`.
+    cut_rule=implicit_rule, compression=NonnegativeFit())`.
 
     - `geometry`: a `LevelSet` CSG tree, or a bare scalar callable `φ` on
       `SVector{D,T}` (auto-wrapped as a single leaf). `φ` need not be a
@@ -1007,36 +1007,41 @@ indicator representations are intentionally not supported.
     - `subcell_length_scale` (required): target box size, in physical
       units, for the binary subdivision shared by two consumers — the
       cut/full/fictitious cell classifier, and the implicit kernel's
-      fallback subdivision on *non-graph-like* cut cells (a leaf with a
-      turning point inside the box). It is a geometry-robustness knob
-      (resolving thin or near-tangent features), **not** a moment-accuracy
-      grid: smooth, graph-like cut cells get exact, depth-independent
-      moments and are never subdivided. One `PhysicalDomain` then serves
-      coarse and fine levels of a superposition `Space`.
+      subdivision of cut cells on which no axis is graph-like and clear of
+      a fold (a leaf turning back inside the box or just beyond it). It is
+      a geometry-robustness knob (resolving thin or near-tangent features),
+      **not** a moment-accuracy grid: a cut cell with such an axis gets the
+      kernel's full order at once and is never subdivided. One
+      `PhysicalDomain` then serves coarse and fine levels of a
+      superposition `Space`.
     - `max_depth` (default `8`): hard cap on the subdivision depth of both
       consumers above.
-    - `moment_order_factor`: multiplier on the moment-fit basis order per
-      axis. `2` (default) spans degree `2p`, integrating trial × test
-      products exactly and so matching on cut regions what tensor Gauss does
-      on `:full` ones. `1` spans degree `p`, carrying only `∏(p+1)` points —
+    - `moment_order_factor`: multiplier on the order of the tensor
+      Legendre moments a cut cell's rule reproduces, per axis. `2`
+      (default) spans degree `2p`, integrating trial × test products
+      exactly and so matching on cut regions what tensor Gauss does on
+      `:full` ones. `1` spans degree `p`, carrying only `∏(p+1)` points —
       the tensor Gauss count on an uncut cell, and QuESo's convention — at
-      roughly the cube less fit time, but exact for a stiffness form only up
-      to `p = 2` (the condition is `factor ≥ 2 − 2/p`). `physical_domain`'s
-      docstring carries the measured order-1-to-7 comparison, where factor
-      `1` stops converging after `p = 2`.
-    - `target_residual`: target L² residual for the moment fit. The exact
-      kernel reaches far below the `1e-6` default in a single NNLS solve,
-      so this only bounds a small conditioning retry (a denser candidate
-      cloud) — never moment accuracy or subdivision depth.
-    - `cut_quadrature`: the cut-cell rule. `nothing` (default) is the
-      non-negative moment fit; a callable
-      `(physical, box, moment_order) -> (points, weights, residual, status)`
-      replaces it on cut regions only, and those regions come out tagged
-      `:cut_custom`. The rule must return *physical*-frame points and
-      non-negative weights, gets α-blended downstream exactly as a fit
-      does, and — the trap — silently contributes zero stiffness if it
-      returns no points. The full contract is in the `PhysicalDomain`
-      docstring under "Custom cut-cell quadrature".
+      roughly the cube less compression time, but exact for a stiffness
+      form only up to `p = 2` (the condition is `factor ≥ 2 − 2/p`).
+      `physical_domain`'s docstring carries the measured order-1-to-7
+      comparison, where factor `1` stops converging after `p = 2`.
+    - `cut_rule`: the first stage of a cut cell's quadrature, a callable
+      `(physical, box, moment_order) -> (points, weights)` that integrates
+      `box ∩ Ω` accurately, with as many points as that takes.
+      `implicit_rule` (default) is Saye's implicit volume rule at a Gauss
+      count matched to the moment order.
+    - `compression`: the second stage, a callable
+      `(points, weights, moments, box, moment_order) -> (points, weights)`
+      that replaces the cut rule by at most `∏(moment_order + 1)` points
+      reproducing its tensor Legendre moments. `NonnegativeFit()` (default)
+      is a non-negative least-squares fit on candidates drawn from the cut
+      rule; `nothing` keeps the cut rule uncompressed. Both stages must
+      return *physical*-frame points and non-negative weights, both are
+      memoised per box and moment order, a caller's callable in either is
+      run serially, and only the compression is used on boundary faces.
+      The full contract is in the `PhysicalDomain` docstring under "The cut
+      rule and its compression".
 
   - **Attach** with `space(omega; ..., physical=physical_domain(…))`.
     The default `physical=nothing` keeps the no-FCM hot path.
@@ -1049,55 +1054,58 @@ indicator representations are intentionally not supported.
 
   - **Region quadrature kinds** (visible via `region.kind`):
     `:full` (tensor Gauss), `:fictitious_alpha` (α-scaled tensor Gauss),
-    `:cut_fitted` (NNLS moment-fit rule; under `α > 0` the rule is the
-    concatenation `(1 − α)·moment-fit ∪ α·full-cell tensor Gauss`, from
+    `:cut_fitted` (the compressed cut rule — or the cut rule itself under
+    `compression = nothing`; under `α > 0` the rule is the concatenation
+    `(1 − α)·rule ∪ α·full-cell tensor Gauss`, from
     `∫_cell α(x) f = (1 − α)∫_Ω f + α∫_cell f`), `:cut_fallback` (the
-    moment-fit residual exceeded the failure threshold, so the region
-    carries the raw Saye volume rule the moments were summed from —
+    compressed rule's moment residual exceeded the failure threshold, so
+    the region carries the cut rule the moments were summed from —
     correct and non-negative, but with 50–200× the points, and blended
     with the α-scaled tensor rule exactly as `:cut_fitted` is under
     `α > 0`), `:cut_failed` (strict-cut `α = 0` region whose `Ω ∩ box`
-    carries no volume rule at all; region contributes zero quadrature),
+    carries no cut rule at all; region contributes zero quadrature) and
     `:cut_alpha_failed` (the same under `α > 0`: the empty physical part
     is dropped but the α-scaled tensor rule is retained so the cell's
-    dofs stay α-stabilised — a nonzero rule), `:cut_custom` (the rule came
-    from the domain's `cut_quadrature` callable instead of the moment fit;
-    counted as a cut region, never as a fit failure). The assembly hot loop
-    is unchanged — it just iterates `zip(points, weights)`.
+    dofs stay α-stabilised — a nonzero rule). The assembly hot loop is
+    unchanged — it just iterates `zip(points, weights)`.
 
     **Grid-aligned boundary faces use the same vocabulary**, on
     `FacetRegion.kind`, because they run the same dispatch one dimension
     down: a codim-`K` facet is the affine slice `⋂ⱼ {x_{kⱼ} = vⱼ}`, so `Ω`
     on it is the CSG tree with every leaf restricted to that slice
     (`_restrict_domain`), and the region's own `(D − K)`-dimensional face box
-    is classified and moment-fitted against it. `α` is honoured there too, so a
+    is classified and integrated against it. `α` is honoured there too, so a
     trimmed face at `α > 0` carries the same `(1 − α)·fit ∪ α·tensor` blend a cut
     cell does — and therefore quadrature points outside `Ω`, which is why a datum
     or integrand defined only on `Ω` needs `α = 0`. Two deliberate differences.
     A zero-measure facet region is **kept**, with an empty rule, where a
     fictitious volume region is dropped — its parent cells still carry the
     trace dofs the dof layer constrains on the grid-aligned face test, which
-    knows nothing about the level set. And `cut_quadrature` is **not**
-    consulted on a facet: it is specified as a rule on a cell box in the
-    model's own dimension, so a facet cut region always goes through
-    `moment_fit_rule`. `:cut_custom` therefore never appears on a facet.
+    knows nothing about the level set. And the domain's `cut_rule` is
+    **not** consulted on a facet: it is specified as a rule on a cell box
+    in the model's own dimension, so a facet cut region always takes
+    `implicit_rule` on the restricted level set, under the domain's own
+    compression.
 
-  - **Moment-fit defaults**: moment-fit basis order = `moment_order_factor
-    × max(cell_order)` per axis over the region's parent cells, the factor
-    defaulting to `2`; exact tensor Legendre moments from the Saye volume
-    rule; a single Lawson–Hanson NNLS solve (`NonNegLeastSquares.jl`) selects
-    ≤ `nbasis` non-negative weights from a candidate cloud drawn by even
-    fractional spacing over the volume rule (an integer stride aliases
-    against the fiber Gauss count and draws a degenerate cloud); up to 3
-    attempts, retrying only with a denser cloud — a larger cloud spans a
-    wider cone and so admits a non-negative exact solution the smaller one
-    did not — never with more subdivision; `target_residual` bounds that
-    retry and is **relative** to `‖m‖`, since the residual carries the units
-    of a moment; if no attempt comes within the failure threshold
+  - **Cut-rule defaults**: moment order = `moment_order_factor ×
+    max(cell_order)` per axis over the region's parent cells, the factor
+    defaulting to `2`; the cut rule is the Saye volume rule, whose tensor
+    Legendre moments `moment_fit_rule` sums and hands to the compression.
+    `NonnegativeFit` runs a Lawson–Hanson NNLS solve
+    (`NonNegLeastSquares.jl`) that selects ≤ `nbasis` non-negative weights
+    from a candidate cloud drawn by even fractional spacing over the cut
+    rule (an integer stride aliases against the fiber Gauss count and draws
+    a degenerate cloud); up to 3 attempts, retrying only with a denser
+    cloud from the same rule — a larger cloud spans a wider cone and so
+    admits a non-negative exact solution the smaller one did not — never
+    with more subdivision or a different rule; its `target_residual`
+    bounds that retry and is **relative** to `‖m‖`, since the residual
+    carries the units of a moment. Whatever the compression, a compressed
+    rule whose residual misses the failure threshold
     `_FIT_FAILURE_RESIDUAL · ‖m‖` (1e-2, relative for the same reason, so
-    whether a cell falls back never depends on its size), the raw volume
-    rule is used as a fallback rather than dropping the cell. Rules are
-    cached by canonicalized region bounds + moment order.
+    whether a cell falls back never depends on its size) is replaced by
+    the cut rule itself rather than dropping the cell. Rules are cached by
+    canonicalized region bounds + moment order.
 
   - **Diagnostics**: the FCM statistics on `diagnostics(model, solution)`
     are `cut_region_count`, `fit_failure_count`,
@@ -1283,8 +1291,8 @@ below so the codebase converges over time.
     `src/physical.jl` are fully worked examples.
 
   - **Section dividers in long files.** When a file has clearly
-    separable stages or concerns (`src/fcm.jl`'s NNLS / moment / fit
-    pipeline; `precommit.jl`'s CLI / file discovery / formatting /
+    separable stages or concerns (`src/fcm.jl`'s moments / cut rule /
+    compression pipeline; `precommit.jl`'s CLI / file discovery / formatting /
     code statistics / reporting / main) group them with single-line `─`
     dividers carrying the section name. The canonical form:
 
@@ -1363,8 +1371,8 @@ when they remove real work:
   - iterative Krylov solvers or preconditioners through a narrow
     package;
   - non-negative constrained linear-least-squares solvers, e.g.
-    `NonNegLeastSquares` (used by `src/fcm.jl` for the NNMF moment-fit
-    solve);
+    `NonNegLeastSquares` (used by `src/fcm.jl` for the `NonnegativeFit`
+    compression);
   - forward-mode automatic differentiation for level-set gradients, e.g.
     `ForwardDiff` (used by `src/implicit.jl`; every CSG leaf must accept
     `ForwardDiff.Dual` arguments);
@@ -1528,20 +1536,21 @@ demos.
   - Immersed boundary (`PhysicalDomain`): strict-α cell-level
     fictitious fold drops the right cells; the expected
     `:full` / `:cut_fitted` / `:fictitious_alpha` / `:cut_fallback` /
-    `:cut_failed` / `:cut_alpha_failed` / `:cut_custom` region-kind tags
-    appear; the candidate-cloud retry rescues a many-feature cut cell
-    that the first attempt cannot fit, and the raw-volume-rule fallback
-    still integrates a cell whose fit fails outright; α-FCM weight
-    scaling on a fully fictitious cell; NNMF moment reproduction to
-    within `target_residual`; end-to-end SPD on a cut-disk Poisson; 1D
-    analytic mass-entry check on a cut cell; a custom `cut_quadrature`
-    callable replaces the fit on cut regions only and is counted as a
-    cut region, not as a fit failure. **Requirement not yet met:** no
-    test drives a custom rule returning an `:empty` status, so its
-    routing to `:cut_failed` / `:cut_alpha_failed` is unexercised; and
-    because `_partition` emits pairwise-disjoint boxes, the
-    `(box, moment order)` cache key never repeats within one plan, so
-    no test distinguishes a memoised rule from an unmemoised one.
+    `:cut_failed` / `:cut_alpha_failed` region-kind tags appear; every
+    built-in compression reproduces the cut rule's moments with
+    non-negative weights at ≤ `nbasis` points, at every length scale; the
+    NNLS retry rescues a many-feature cut cell that its first attempt
+    cannot fit, from the same cut rule; a compression that misses the
+    failure threshold falls back to the cut rule; α-FCM weight scaling on a
+    fully fictitious cell; end-to-end SPD on a cut-disk Poisson; 1D
+    analytic mass-entry check on a cut cell; a caller's cut rule and
+    compression replace the package's on cut regions only, compose with
+    each other and with α, are run serially, and a cut rule that finds
+    nothing routes its region to `:cut_failed` / `:cut_alpha_failed`.
+    **Requirement not yet met:** because `_partition` emits
+    pairwise-disjoint boxes, the `(box, moment order)` cache key never
+    repeats within one plan, so no test distinguishes a memoised rule
+    from an unmemoised one.
   - Multi-domain coupling: a machine-precision Nitsche interface patch
     test across two independently discretised subdomains; the `couple`
     four-block sign pattern. The skip of interface regions where one

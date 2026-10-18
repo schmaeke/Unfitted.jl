@@ -845,7 +845,7 @@ function main()
 
         report = (tag, domain) -> begin
             emit(tag * ".classification", classify_cell(domain, region))
-            _, ws, res = moment_fit_rule(domain, region, order; target_residual=1.0e-10)
+            _, ws, res = moment_fit_rule(domain, region, order)
             total = 0.0
             for w in ws
                 total += w

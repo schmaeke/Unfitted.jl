@@ -158,7 +158,7 @@ end
 end
 
 # Build a kernel volume rule from a CSG level-set tree (leaves + membership). `certified = true` forwards the tree's
-# per-leaf Lipschitz constants, which is what `moment_fit_rule` does in the finite-cell pipeline.
+# per-leaf Lipschitz constants, which is what `implicit_rule` does in the finite-cell pipeline.
 function _csg_rule(geom, region; gp, ms=5, certified=false)
     leaves = Unfitted._leaves(geom)
     lipschitz = certified ? Float64[l.lipschitz for l in leaves] : nothing
@@ -497,15 +497,20 @@ end
 
     # What that saves: cube − (sphere ∪ cylinder) around the common axis, where the cylinder lies inside the sphere and
     # its traces on one face cross the sphere's on the other in every cell. Paired, they add a breakpoint to each of
-    # those cells that bounds no part of Ω (3072 kernel points instead of 2240), enough to starve the first moment-fit
-    # attempt: it missed its target or fitted to only 1e-9, and a miss refits with an eight times larger candidate
-    # cloud. Now each cell fits at the first attempt, to round-off.
+    # those cells that bounds no part of Ω (3072 kernel points instead of 2240), enough to starve the first attempt of
+    # the NNLS compression: it missed its target or fitted to only 1e-9, and a miss refits with an eight times larger
+    # candidate cloud. Now each cell fits at the first attempt, to round-off.
     sphere = leaf(x -> norm(x - SVector(0.5, 0.5, 0.5)) - 0.32; lipschitz=1.0)
     cylinder = leaf(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.14; lipschitz=1.0)
     domain = physical_domain(complement(union(sphere, cylinder)); subcell_length_scale=1 / 64, max_depth=4)
+    order = (4, 4, 4)
     for lower in Iterators.product((0.25, 0.5), (0.25, 0.5), (0.25, 0.5))
-        _, _, residual, status = Unfitted._moment_fit_rule(domain, box(lower, lower .+ 0.25), (4, 4, 4), 1e-6, 1)
-        @test status === :fitted && residual < 1e-14
+        cell = box(lower, lower .+ 0.25)
+        rule = implicit_rule(domain, cell, order)
+        first_attempt = Unfitted._cap_candidates(rule[1], order, Unfitted._candidate_budget(1))
+        _, residual = Unfitted.nnls(Unfitted._build_moment_matrix(first_attempt, cell, order),
+                                    Unfitted._moments_from_rule(rule..., cell, order))
+        @test residual < 1e-14
     end
 end
 

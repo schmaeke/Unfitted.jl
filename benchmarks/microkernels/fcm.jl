@@ -23,8 +23,7 @@ let
         q = mo_p + 2
         tag = "mo=$mo_p"
         physical = physical_domain(phi_disk; lipschitz=1.0, subcell_length_scale=0.05)
-        group["moment_fit_rule $tag"] = @benchmarkable moment_fit_rule($physical, $cell, $moment_order;
-                                                                       target_residual=1.0e-6)
+        group["moment_fit_rule $tag"] = @benchmarkable moment_fit_rule($physical, $cell, $moment_order)
         group["implicit_volume_quadrature $tag"] = @benchmarkable implicit_volume_quadrature($phi_disk, $cell;
                                                                                              gauss_points=($q))
     end
@@ -41,8 +40,7 @@ let
         moment_order = (mo_p, mo_p, mo_p)
         q = mo_p + 2
         tag = "mo=$mo_p"
-        fcm3d["moment_fit_rule $tag"] = @benchmarkable moment_fit_rule($physical, $cell, $moment_order;
-                                                                       target_residual=1.0e-6)
+        fcm3d["moment_fit_rule $tag"] = @benchmarkable moment_fit_rule($physical, $cell, $moment_order)
         fcm3d["implicit_volume_quadrature $tag"] = @benchmarkable implicit_volume_quadrature($phi_sphere, $cell;
                                                                                              gauss_points=($q))
     end
@@ -55,6 +53,5 @@ let
                       leaf(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.2; lipschitz=1.0))
     physical = physical_domain(annulus; subcell_length_scale=0.05)
     cell = AxisBox(SVector(0.6, 0.6), SVector(0.8, 0.8))
-    group["moment_fit_rule csg_annulus mo=8"] = @benchmarkable moment_fit_rule($physical, $cell, (8, 8);
-                                                                               target_residual=1.0e-6)
+    group["moment_fit_rule csg_annulus mo=8"] = @benchmarkable moment_fit_rule($physical, $cell, (8, 8))
 end
