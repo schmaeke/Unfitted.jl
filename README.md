@@ -51,9 +51,11 @@ The method is described in
 - **Immersed-boundary integration** through a `PhysicalDomain` carrying a
   CSG level set of smooth leaves (`leaf`/`intersect`/`union`/`setdiff`/
   `complement`). Cells outside `Ω` are dropped from the dof layout; cells
-  crossed by `∂Ω` use a non-negative moment-fitted quadrature rule whose
-  moments come from Saye's exact implicit quadrature, with the moment-fit
-  structure informed by QuESo (see [`NOTICE.md`](NOTICE.md) for upstream
+  crossed by `∂Ω` are integrated by Saye's implicit quadrature, and that
+  rule is compressed by Carathéodory pruning to at most `∏(2p+1)` of its
+  points, with non-negative weights and the same moments. Both stages are
+  replaceable; a non-negative least-squares fit informed by QuESo is the
+  built-in alternative (see [`NOTICE.md`](NOTICE.md) for upstream
   attribution). The level set need not be a formula: a closed segment loop
   or triangle surface becomes a signed-distance leaf through
   `mesh_levelset` / `stl_levelset` in the `FileIO` + `MeshIO` extension.
@@ -296,7 +298,7 @@ A machine-readable record is available in
 
 Unfitted.jl is distributed under the MIT License (see [`LICENSE.md`](LICENSE.md)).
 
-The non-negative moment-fit structure in `src/fcm.jl` is informed by
+The non-negative least-squares compression in `src/fcm.jl` is informed by
 [QuESo](https://github.com/manuelmessmer/QuESo) (BSD-4-Clause), used as an
 algorithmic reference only (no code vendored); the cut-cell moments come
 from Saye's implicit quadrature. See [`NOTICE.md`](NOTICE.md) for the full

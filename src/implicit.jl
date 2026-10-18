@@ -39,25 +39,26 @@
 #   graph-like over R (linear leaves ⇒ machine precision, including polytope corners), and spectrally accurate for
 #   smooth curved boundaries away from turning points.
 #
-#   In the finite-cell moment-fit pipeline (`src/fcm.jl`) the volume rule plays two roles: the moments mₐ = ∫_{Ω∩R} ψₐ
-#   dx are recovered as Σₖ wₖ ψₐ(xₖ), and the points xₖ double as the non-negative moment-fit candidate cloud.
+#   In the finite-cell pipeline (`src/fcm.jl`) the volume rule is the default cut rule, `implicit_rule`: the moments
+#   mₐ = ∫_{Ω∩R} ψₐ dx are recovered from it as Σₖ wₖ ψₐ(xₖ), and the compression keeps a subset of its points xₖ.
 #
 # Method in one paragraph
 #
 #   Integration over Ω ∩ R is reduced one dimension at a time. Pick a "height" axis d* in which the active level sets
 #   are graph-like (each varies monotonically, or is constant, along d* — a constant leaf, e.g. a perpendicular
-#   half-space, simply partitions the base, which is what keeps polytope corners exact). The (D−1)-dimensional base
-#   integral over the projection is built by the same recursion, partitioned by the leaves' restrictions to the two
-#   faces x_{d*} = lo and x_{d*} = hi so the projection boundary and the change in fiber topology are resolved, and by
-#   one pair leaf per two monotone leaves, whose zero set holds the projection of their crossing — where two fiber roots
-#   swap order inside the box, a polytope corner for instance. At each base node a 1D Gauss rule is placed on the parts
-#   of the fiber that lie in Ω, found by root-finding on the level sets and testing the membership predicate. When a box
-#   is not graph-like it is bisected (a shallow octree above the kernel); at the depth floor the kernel reduces anyway —
-#   the multi-root fiber scan still yields the correct region, only the base partition (and thus the order) degrades at
-#   the unresolved feature. ∇φ is obtained by automatic differentiation (`ForwardDiff`); a caller whose leaves cannot
-#   take `Dual` arguments overrides that with its own operator through the `grad` keyword, for which `_fd_gradient`
-#   below is the central-difference choice. Nothing in the finite-cell path sets it, so leaves reaching
-#   `moment_fit_rule` must be AD-capable. Pair leaves are the exception the kernel makes for itself: they are
+#   half-space, simply partitions the base, which is what keeps polytope corners exact) and keep clear of a fold, where
+#   ∂φ/∂x_{d*} would vanish and the height function turn back on itself. The (D−1)-dimensional base integral over the
+#   projection is built by the same recursion, partitioned by the leaves' restrictions to the two faces x_{d*} = lo and
+#   x_{d*} = hi so the projection boundary and the change in fiber topology are resolved, and by one pair leaf per two
+#   monotone leaves, whose zero set holds the projection of their crossing — where two fiber roots swap order inside the
+#   box, a polytope corner for instance. At each base node a 1D Gauss rule is placed on the parts of the fiber that lie
+#   in Ω, found by root-finding on the level sets and testing the membership predicate. When no axis of a box is
+#   graph-like and clear of folds it is bisected (a shallow octree above the kernel); at the depth floor the kernel
+#   reduces anyway — the multi-root fiber scan still yields the correct region, only the base partition (and thus the
+#   order) degrades at the unresolved feature. ∇φ is obtained by automatic differentiation (`ForwardDiff`); a caller
+#   whose leaves cannot take `Dual` arguments overrides that with its own operator through the `grad` keyword, for which
+#   `_fd_gradient` below is the central-difference choice. Nothing in the finite-cell path sets it, so leaves reaching
+#   `cut_cell_rule` must be AD-capable. Pair leaves are the exception the kernel makes for itself: they are
 #   differentiated by finite differences (`_FDLeaf`) and never see a `Dual`.
 #
 #   With the default gradient the kernel evaluates a leaf inside the closed box R only — at its corners, centre and
@@ -126,8 +127,10 @@ Arguments:
   - `grad`: optional gradient operator `(g, x) -> SVector` overriding the `ForwardDiff` default; pass `_fd_gradient`
     from this file for non-AD callbacks. The finite-cell path never sets it, so this keyword is reachable only by
     calling the kernel directly.
-  - `max_subdiv`: subdivision-depth budget for non-graph-like cells. Beyond it the kernel force-reduces (the region
-    stays correct; order degrades only at the unresolved feature).
+  - `max_subdiv`: subdivision-depth budget for cells with no graph-like axis — along every axis some leaf's
+    derivative changes sign, or comes close to zero, a fold where the height function turns back on itself and the
+    base rule converges only algebraically. Beyond it the kernel force-reduces (the region stays correct; order
+    degrades only at the unresolved feature).
   - `lipschitz`: optional Lipschitz constants `Lᵢ` of the leaves (`|fᵢ(x) − fᵢ(y)| ≤ Lᵢ‖x − y‖`) — a vector matching
     `leaves` in the multi-component form, a scalar in the single-`phi` form, and `nothing` (default) to opt out. `1.0`
     is the constant of a true signed-distance function. See the sampling note below for what supplying it certifies.
@@ -158,7 +161,7 @@ end
 
 # `scale` is the region's largest edge length; the breakpoint-drop tolerance `atol` is taken relative to it so the
 # kernel behaves identically under a rescaling of the geometry. `flat_tol` is already relative (to the gradient
-# magnitude) inside `_choose_axis`.
+# magnitude) where `_zero_tol` applies it.
 function _quad_ctx(::Type{T}, gauss_points::Int, grad, max_subdiv::Int, scale::Real) where {T}
     rawnodes, rawweights = gausslegendre(gauss_points)
     gradient = grad === nothing ? (g, x) -> ForwardDiff.gradient(g, x) : grad
@@ -201,11 +204,12 @@ end
 #      optimisation; `membership` re-evaluates the full predicate, so this is safe. With no varying leaf left, U is
 #      uniform: full tensor rule if inside, else empty.
 #   2. Base case D = 1: emit the inside parts of the single axis.
-#   3. Choose the height axis. If not certifiably graph-like and budget remains, bisect and recurse; at the floor (or
-#      on a box too small to bisect), force-reduce on the least-bad axis.
+#   3. Choose the height axis. If no axis is graph-like and clear of folds and budget remains, bisect and recurse; at
+#      the floor (or on a box too small to bisect), force-reduce on the least-bad axis.
 #   4. Reduce: build the base problem on U with the height axis removed (`_base_leaves`: every leaf's two face
-#      restrictions and one pair leaf per two leaves monotone along the axis that are not traces on opposite faces,
-#      partition-only) and recurse; then sweep the base nodes, emitting a fiber rule at each.
+#      restrictions and one pair leaf per two leaves with a single root along the axis — monotone or steep — that are
+#      not traces on opposite faces, partition-only) and recurse; then sweep the base nodes, emitting a fiber rule at
+#      each.
 function _implicit_quad(lsets, membership, U::AxisBox{D,T}, ctx::_QuadCtx, depth::Int) where {D,T}
     active = Any[]
     for g in lsets
@@ -260,19 +264,19 @@ end
 
 # The leaves of the base problem of one reduction along axis `k` of a box spanning `[lo, hi]` on it: every active leaf's
 # restrictions to the two faces x_k = lo and x_k = hi, which resolve the projection boundary and every change of fiber
-# topology on the faces, then one pair leaf per two leaves monotone along `k` that are not restrictions to opposite
-# faces of the previous reduction, for the crossings inside the box (`_PairLeaf`, `_opposite_faces`). `classes` are the
-# leaves' classes along `k` (`_choose_axis`).
+# topology on the faces, then one pair leaf per two leaves with a single root along `k` (`:monotone` or `:steep`) that
+# are not restrictions to opposite faces of the previous reduction, for the crossings inside the box (`_PairLeaf`,
+# `_opposite_faces`). `classes` are the leaves' classes along `k` (`_choose_axis`).
 function _base_leaves(active, classes, k::Int, lo::T, hi::T) where {T}
     base = Any[]
     for g in active
         push!(base, _restrict(g, k, lo), _restrict(g, k, hi))
     end
-    monotone = active[classes .=== :monotone]
+    rooted = active[_single_root.(classes)]
     h = cbrt(eps(T)) * (hi - lo)
-    for i in eachindex(monotone), j in (i+1):lastindex(monotone)
-        _opposite_faces(monotone[i], monotone[j]) && continue
-        push!(base, _FDLeaf(_PairLeaf{T}(monotone[i], monotone[j], k, lo, hi), h))
+    for i in eachindex(rooted), j in (i+1):lastindex(rooted)
+        _opposite_faces(rooted[i], rooted[j]) && continue
+        push!(base, _FDLeaf(_PairLeaf{T}(rooted[i], rooted[j], k, lo, hi), h))
     end
     return base
 end
@@ -467,50 +471,127 @@ end
 # Pick a height axis and report whether it is certifiably graph-like. For each axis k, every leaf is classified by
 # sampling ∂g/∂x_k at the box center and 2ᴰ corners (`_axis_class`):
 #
-#   :monotone — consistent non-zero sign ⇒ at most one fiber root;
+#   :monotone — consistent non-zero sign, clear of a fold ⇒ at most one fiber root;
+#   :steep    — consistent sign, but close to a fold (`_FOLD_CLEARANCE`) ⇒ at most one fiber root, on a height function
+#               too steep for the base rule;
 #   :flat     — |∂g/∂x_k| ≈ 0 at every sample ⇒ no fiber root (the leaf partitions the base instead; this is what makes
 #               polytope corners exact, e.g. a half-space perpendicular to k);
 #   :bad      — the sign of ∂g/∂x_k changes ⇒ possibly several fiber roots.
 #
-# The axis is the lexicographic maximum of (−#bad leaves, score), the first axis winning a tie, where the score is the
-# smallest |∂g/∂x_k| over the monotone leaves (best conditioning) and 0 when no leaf is monotone along k (an axis along
-# which nothing varies cannot root-find the interface). An axis with no bad leaf therefore always wins, and is the one
-# of best conditioning; with none, the least-bad axis is the force-reduce choice at the subdivision floor. Returns
-# `(k, usable, classes)`: `usable` says that no leaf is bad along `k`, and `classes` holds every leaf's class along it.
+# The axis is the lexicographic maximum of (−#bad leaves, −#steep leaves, score), the first axis winning a tie, where
+# the score is the smallest |∂g/∂x_k| over the leaves with a single root (best conditioning) and 0 when there is none
+# along k (an axis along which nothing varies cannot root-find the interface). An axis on which every leaf is monotone
+# or flat therefore always wins, and is the one of best conditioning; with none, the least-bad axis is the force-reduce
+# choice at the subdivision floor, where a steep leaf still counts as a single root. Returns `(k, usable, classes)`:
+# `usable` says that every leaf is monotone or flat along `k`, and `classes` holds every leaf's class along it.
+#
+# A leaf that looks steep along some axis with every sample counting has its samples tested for curvature (`_planar`)
+# before the choice is made, and a sample at which the leaf is planar is left out of its fold clearance (`_axis_class`).
+# Only a leaf that looks steep pays for the test, so a choice in which none does costs what it always did.
 function _choose_axis(lsets, U::AxisBox{D}, ctx::_QuadCtx) where {D}
     samples = (center(U), _box_vertices(U)...)
     grads = [map(x -> _gradient(ctx, g, x, U), samples) for g in lsets]
-    return _choose_axis(grads, ctx.flat_tol, Val(D))::Tuple{Int,Bool,Vector{Symbol}}
+    tols = [_zero_tol(gs, ctx.flat_tol) for gs in grads]
+    planar = [map(_ -> false, samples) for _ in lsets]
+    for (i, g) in pairs(lsets)
+        any(k -> first(_axis_class(grads[i], planar[i], k, tols[i])) === :steep, 1:D) || continue
+        planar[i] = map((x, ∇) -> _planar(ctx, g, x, ∇, U), samples, grads[i])
+    end
+    return _choose_axis(grads, planar, tols, Val(D))::Tuple{Int,Bool,Vector{Symbol}}
 end
 
 # The axis choice on the sampled gradients, behind a function barrier: `lsets` holds `Any`-typed callbacks, so the
 # gradients' type is known only at run time, and the classification below then runs on concrete types. The call into
 # the barrier is dynamic for the same reason, so its caller asserts the result type: without it `k` is inferred as
 # `Any`, and `_implicit_quad` would dispatch `_emit_fiber!` dynamically, boxing its arguments, once per base node.
-function _choose_axis(grads::Vector, flat_tol, ::Val{D}) where {D}
+function _choose_axis(grads::Vector, planar::Vector, tols::Vector, ::Val{D}) where {D}
     k = argmax(1:D) do k
-        nbad, score = 0, oftype(flat_tol, Inf)
-        for gs in grads
-            class, minmag = _axis_class(gs, k, flat_tol)
+        nbad, nsteep, score = 0, 0, eltype(tols)(Inf)
+        for (gs, ps, tol) in zip(grads, planar, tols)
+            class, minmag = _axis_class(gs, ps, k, tol)
             nbad += class === :bad
-            class === :monotone && (score = min(score, minmag))
+            nsteep += class === :steep
+            _single_root(class) && (score = min(score, minmag))
         end
-        return (-nbad, isinf(score) ? zero(score) : score)
+        return (-nbad, -nsteep, isinf(score) ? zero(score) : score)
     end
-    classes = [first(_axis_class(gs, k, flat_tol)) for gs in grads]
-    return k, !(:bad in classes), classes
+    classes = [first(_axis_class(gs, ps, k, tol)) for (gs, ps, tol) in zip(grads, planar, tols)]
+    return k, all(c -> c === :monotone || c === :flat, classes), classes
 end
 
+# Whether a leaf of this class has at most one root on every fiber along the axis it was classified on.
+_single_root(class::Symbol) = class === :monotone || class === :steep
+
+# The magnitude below which a component of a leaf's gradient counts as zero: `flat_tol` of its largest finite gradient
+# norm over the samples `gs`, floored at 1 so a nearly constant leaf is not held to an absolute round-off scale. A
+# non-finite sample is ignored, here and in `_axis_class`: an SDF-like leaf evaluated at its own center yields
+# ∇ = 0/0 = NaN, which must not poison the classification.
+_zero_tol(gs, flat_tol) = flat_tol * max(maximum(∇ -> all(isfinite, ∇) ? norm(∇) : zero(flat_tol), gs), one(flat_tol))
+
+# Whether the leaf `g` is planar at the sample `x` of the box `U`, where its gradient is `∇`: whether the gradient is
+# unchanged a thirty-second of the way from `x` towards the centre (from the centre itself, towards the upper corner).
+# The gradient of a smooth curved leaf moves between two points unless the leaf happens to be linear along the segment
+# joining them; this tells apart the leaves that are smooth only piecewise — a mesh's signed distance, a CSG tree
+# collapsed by max and min — whose planar pieces bend the gradient field without bending the zero set. The tolerance is
+# `flat_tol` (√eps) relative to ‖∇‖: a leaf whose gradient moves by less than that across a thirty-second of the box is
+# linear there to working precision.
+#
+# Without the test, the clearance read a fold into every sample that lies in the Voronoi region of a mesh face parallel
+# to the height axis, where ∂g/∂x_k is exactly zero. On the L-bracket of `examples/applications/imported_geometry_3d`,
+# whose faces are all parallel to an axis, that bisected the 48 cut cells to the depth floor: 5.9× the points and 6×
+# the preparation time, for a rule that had already been exact to 4e-16 and stayed so. With it, points, time and rule
+# are those of a kernel that knows no fold at all.
+function _planar(ctx::_QuadCtx, g, x::SVector{D,T}, ∇, U::AxisBox{D,T}) where {D,T}
+    c = center(U)
+    y = x == c ? c + (U.upper - c) / 32 : x + (c - x) / 32
+    ∇y = _gradient(ctx, g, y, U)
+    all(isfinite, ∇) && all(isfinite, ∇y) || return false
+    return norm(∇y - ∇) <= ctx.flat_tol * max(norm(∇), one(T))
+end
+
+# How far a leaf monotone along the height axis must keep from a fold, where ∂g/∂x_k vanishes and the height function
+# turns back on itself: the smallest |∂g/∂x_k| over the samples must be at least `_FOLD_CLEARANCE` times its spread, the
+# largest minus the smallest ∂g/∂x_k across them. Continuing ∂g/∂x_k linearly, the fold then lies at least a tenth of a
+# box width beyond the box; a leaf closer than that is `:steep`. The base rule integrates a function of the height
+# function, which has a square-root branch point at the fold, so a fold on a face or just past it turns the spectral
+# convergence of the base Gauss rule into an algebraic one. The axis choice prefers an axis on which no leaf is steep,
+# and bisection, where there is none, moves the fold away in units of the children's widths — or, for a fold on a face,
+# confines it to the children touching that face, where it matters only if the zero set reaches it.
+#
+# The test is relative to the spread, not to ‖∇g‖, and that is what keeps it free on polytopes: a linear leaf has zero
+# spread and is never steep, while a bound |∂g/∂x_k| ≥ θ‖∇g‖ — ImplicitIntegration.jl's `min_qual`,
+# https://github.com/maltezfaria/ImplicitIntegration.jl — cannot be met by a linear leaf at any depth. On a cube rotated
+# by (0.04, 0.03) rad, whose faces are steep along two axes each, that bound at θ = 0.1 bisected to the depth floor:
+# 115× the points and a relative volume error of 4e-11 where the corners had been exact to 3e-16.
+#
+# Measured at q = 8 on a ball of radius 0.6789. Centred on the vertex that four 2D or eight 3D cells share, which puts
+# every fold on a face, the relative volume error fell from 3.1e-4 — at any subdivision budget — to 1.3e-11 in 2D and
+# 3.5e-11 in 3D. Centred 0.0123·(1, 2, …) off the vertices of 4ᴰ cells tiling [−1, 1]ᴰ, it fell from 4.4e-6 to 1.4e-11
+# in 3D and from 1.9e-5 to 3.4e-11 in 4D, for 2.0× and 2.2× the points. On 6³ cells, where hardly an axis was steep, the
+# points grew 1.35× and the error stayed 1.1e-10. A clearance of 0.25 or 0.5 gave the same errors as 0.1, at 1.5× and
+# 1.9× its points on the 6³ cells.
+const _FOLD_CLEARANCE = 0.1
+
 # Class of one leaf along axis `k` from its gradient samples `gs`, and the smallest |∂g/∂x_k| over the samples that
-# vary. A component counts as zero within `flat_tol` of the leaf's largest finite gradient norm (floored at 1, so a
-# nearly constant leaf is not held to an absolute round-off scale). Non-finite samples are ignored: an SDF-like leaf
-# evaluated at its own center yields ∇ = 0/0 = NaN, which must not poison the classification.
-function _axis_class(gs, k::Int, flat_tol)
-    tol = flat_tol * max(maximum(g -> all(isfinite, g) ? norm(g) : zero(flat_tol), gs), one(flat_tol))
+# vary. A component counts as zero within `tol` (`_zero_tol`), and non-finite samples are ignored.
+#
+# A monotone leaf's clearance from a fold is measured on the samples at which it curves, `planar` marking the others
+# (`_planar`): a fold needs the zero set to bend, and a planar piece of a piecewise-smooth leaf — the Voronoi region of
+# one face of a mesh, where ∂g/∂x_k is constant, and zero for a face parallel to `k` — bends nothing, though its
+# constant joins the spread of a sampling that also meets another piece. Those curved samples within `tol` of zero
+# count, so a derivative that reaches zero at a corner — a fold on the box itself — makes the leaf steep. A leaf planar
+# at every sample is never steep.
+function _axis_class(gs, planar, k::Int, tol)
     pos = any(g -> isfinite(g[k]) && g[k] > tol, gs)
     neg = any(g -> isfinite(g[k]) && g[k] < -tol, gs)
     minmag = minimum(g -> isfinite(g[k]) && abs(g[k]) > tol ? abs(g[k]) : oftype(tol, Inf), gs)
-    return (pos && neg ? :bad : pos || neg ? :monotone : :flat), minmag
+    pos && neg && return :bad, minmag
+    pos || neg || return :flat, minmag
+    curved = (g[k] for (g, p) in zip(gs, planar) if isfinite(g[k]) && !p)
+    isempty(curved) && return :monotone, minmag
+    lo, hi = extrema(curved)
+    clearance = pos ? lo : -hi
+    return (clearance >= _FOLD_CLEARANCE * (hi - lo) ? :monotone : :steep), minmag
 end
 
 # The gradient of one leaf at a sample `x` of the box `U`: the context's operator (`ForwardDiff`, or the caller's

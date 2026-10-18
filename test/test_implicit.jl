@@ -98,27 +98,19 @@ end
 end
 
 @testset "implicit quadrature — tensor Legendre moment vector matches analytic" begin
-    # The moment-fit pipeline needs mₐ = ∫_{Ω∩R} ψₐ dx with ψₐ the tensor Legendre basis. Build that vector from the
-    # kernel rule and the existing Legendre evaluators in `fcm.jl`, then check the constant moment equals the cut area
-    # and the orthogonality-driven zeros vanish, for Ω = {x ≤ 0.4}.
+    # The compression needs mₐ = ∫_{Ω∩R} ψₐ dx with ψₐ the tensor Legendre basis (`MomentBasis`). Sum that vector from
+    # the kernel rule, then check the constant moment equals the cut area and the orthogonality-driven zeros vanish, for
+    # Ω = {x ≤ 0.4}.
     region = box((0.0, 0.0), (1.0, 1.0))
-    order = (3, 3)
     a = 0.4
     rule = _IVQ(x -> x[1] - a, region; gauss_points=8)
-    idx = Unfitted._moment_basis_indices(order)
-    factors = Unfitted._legendre_factor_buffers(order, Float64)
-    moments = zeros(length(idx))
-    for j in eachindex(rule[2])
-        Unfitted._fill_legendre_factors!(factors, rule[1][j], region.lower, region.upper, order)
-        for (k, α) in pairs(idx)
-            moments[k] += rule[2][j] * Unfitted._tensor_legendre_value(factors, α)
-        end
-    end
+    basis = MomentBasis(region, (3, 3))
+    moments = basis(rule...)
     # α = (0,0): L₀⊗L₀ ≡ 1 ⇒ moment is the cut area a.
     @test moments[1] ≈ a atol = 1e-12
     # α = (0,n) for n ≥ 1: ∫₀^a dx · ∫₀¹ Lₙ(2y−1) dy = a · 0 by Legendre orthogonality to the constant.
     for n in 1:3
-        k = findfirst(==(CartesianIndex(0, n)), idx)
+        k = findfirst(==(CartesianIndex(0, n)), basis.indices)
         @test abs(moments[k]) < 1e-12
     end
 end
@@ -158,7 +150,7 @@ end
 end
 
 # Build a kernel volume rule from a CSG level-set tree (leaves + membership). `certified = true` forwards the tree's
-# per-leaf Lipschitz constants, which is what `moment_fit_rule` does in the finite-cell pipeline.
+# per-leaf Lipschitz constants, which is what `implicit_rule` does in the finite-cell pipeline.
 function _csg_rule(geom, region; gp, ms=5, certified=false)
     leaves = Unfitted._leaves(geom)
     lipschitz = certified ? Float64[l.lipschitz for l in leaves] : nothing
@@ -177,6 +169,65 @@ end
     @test isapprox(a0, π * 0.3^2; atol=5e-2)          # correct region, low order
     a2 = _quad(x -> 1.0, _IVQ(disk, box((0.0, 0.0), (1.0, 1.0)); gauss_points=6, max_subdiv=2))
     @test isapprox(a2, π * 0.3^2; atol=1e-3)           # subdivision recovers accuracy
+end
+
+@testset "implicit quadrature — a height axis close to a fold is not trusted" begin
+    # A ball centred on the vertex its cells share puts the fold of every height function — where ∂φ/∂x_k vanishes and
+    # the zero set turns back on itself — on the cells' faces. Graph-like by sign alone, any axis used to be accepted,
+    # and the base rule then integrated a square-root branch point at the end of its interval: 3.1e-4 relative at
+    # q = 8 in 2D, 6.9e-4 at q = 6 in 3D and 1.9e-3 at q = 4 in 4D, whatever the subdivision budget. Classified
+    # `:steep`, such a leaf sends the kernel to an axis clear of the fold, and to bisection where no axis is.
+    r = 0.6789
+    cells(D, n) = [box(ntuple(d -> -1 + 2(I[d] - 1) / n, D), ntuple(d -> -1 + 2I[d] / n, D))
+                   for I in CartesianIndices(ntuple(_ -> n, D))]
+    for (D, q, rtol) in ((2, 8, 1e-10), (3, 6, 1e-8), (4, 4, 5e-6))
+        exact = (π * r^2, 4π / 3 * r^3, π^2 / 2 * r^4)[D-1]
+        rules = [_IVQ(x -> sqrt(sum(abs2, x)) - r, cell; gauss_points=q, lipschitz=1.0) for cell in cells(D, 2)]
+        @test sum(rule -> _quad(x -> 1.0, rule), rules) ≈ exact rtol = rtol
+    end
+
+    # The fold need not lie on a face to cost accuracy: a ball centred just off the cell vertices of a coarse 4³ tiling
+    # (h/r ≈ 0.74) has its folds a few hundredths of a cell width past the faces, which the old axis choice took for
+    # graph-like and integrated to 4.4e-6 at q = 8.
+    c = SVector(0.0123, 0.0246, 0.0369)
+    rules = [_IVQ(x -> norm(x - c) - r, cell; gauss_points=8, lipschitz=1.0) for cell in cells(3, 4)]
+    @test sum(rule -> _quad(x -> 1.0, rule), rules) ≈ 4π / 3 * r^3 rtol = 1e-10
+end
+
+@testset "implicit quadrature — a linear leaf is never steep" begin
+    # The fold clearance is measured against the spread of ∂g/∂x_k over the box, which a linear leaf does not have, so a
+    # plane nearly parallel to the height axis stays graph-like at any slope. A bound relative to ‖∇g‖ instead —
+    # ImplicitIntegration.jl's — can never be met by such a plane, and bisected a cube rotated by (0.04, 0.03) rad to
+    # the depth floor: 115× the points, and its corners off by 4e-11 instead of exact.
+    tol = sqrt(eps())
+    class(gs, planar=map(_ -> false, gs)) = first(Unfitted._axis_class(gs, planar, 2, tol))
+    @test class(ntuple(_ -> SVector(1.0, 0.01), 5)) === :monotone
+    @test class((SVector(0.3, 0.4), SVector(0.3, 0.7))) === :monotone
+    @test class((SVector(0.3, 0.02), SVector(0.3, 0.7))) === :steep
+    # A derivative that vanishes at a corner is a fold on the box, unless the leaf is planar there.
+    @test class((SVector(1.0, 0.0), SVector(1.0, 0.5))) === :steep
+    @test class((SVector(1.0, 0.0), SVector(1.0, 0.5)), (true, false)) === :monotone
+
+    a, c = 0.55, SVector(0.0123, -0.0345, 0.0217)
+    R = SMatrix{3,3}(cos(0.04), sin(0.04), 0, -sin(0.04), cos(0.04), 0, 0, 0, 1) *
+        SMatrix{3,3}(cos(0.03), 0, -sin(0.03), 0, 1, 0, sin(0.03), 0, cos(0.03))
+    cube = intersect((leaf(x -> s * dot(R[:, k], x - c) - a; lipschitz=1.0) for k in 1:3 for s in (1, -1))...)
+    cells = [box(Tuple(I) ./ 3 .- 1, (Tuple(I) .+ 1) ./ 3 .- 1) for I in CartesianIndices((0:5, 0:5, 0:5))]
+    @test sum(cell -> _quad(x -> 1.0, _csg_rule(cube, cell; gp=4, certified=true)), cells) ≈ (2a)^3 rtol = 1e-13
+end
+
+@testset "implicit quadrature — a planar stretch of a creased leaf is no fold" begin
+    # max(x − 0.7, y − 0.6) is planar on either side of its crease, with ∂g/∂x = 0 wherever the second plane rules: a
+    # zero derivative that is no fold, because the zero set does not bend there. Sampled without regard to curvature it
+    # read as a fold on every axis and bisected the box to the depth floor, for a rule a single reduction gets exact —
+    # the configuration that multiplied the points of a mesh's signed distance by 5.9 (`_planar`).
+    kink = x -> max(x[1] - 0.7, x[2] - 0.6)
+    region = box((0.0, 0.0), (1.0, 1.0))
+    rule = _IVQ(kink, region; gauss_points=6, max_subdiv=4)
+    @test _quad(x -> 1.0, rule) ≈ 0.7 * 0.6 atol = 1e-14
+    @test length(rule[2]) == length(_IVQ(kink, region; gauss_points=6, max_subdiv=0)[2])
+    @test Unfitted._planar(Unfitted._quad_ctx(Float64, 6, nothing, 4, 1.0), kink, SVector(0.0, 1.0), SVector(0.0, 1.0),
+                           region)
 end
 
 @testset "implicit quadrature — CSG intersection (polytope corner) is exact" begin
@@ -408,7 +459,7 @@ end
     @test _quad(x -> 1.0, rule(bounded(p1, corner), bounded(p2, corner), corner)) ≈ 0.0144 rtol = 1e-14
     domain = physical_domain(intersect(leaf(bounded(p1, corner); lipschitz=1.2),
                                        leaf(bounded(p2, corner); lipschitz=2.3)); subcell_length_scale=0.25)
-    _, weights, _, status = Unfitted.moment_fit_rule(domain, corner, (4, 4))
+    _, weights, _, status = cut_cell_rule(domain, corner, (4, 4))
     @test status === :fitted
     @test sum(weights) ≈ 0.0144 rtol = 1e-13
     # The same two planes crossing inside an interior cell.
@@ -423,7 +474,7 @@ end
 end
 
 @testset "implicit quadrature — traces on opposite faces get no pair leaf" begin
-    # The base problem pairs its monotone leaves for the crossings inside the box, but never two restrictions to
+    # The base problem pairs its single-root leaves for the crossings inside the box, but never two restrictions to
     # opposite faces of the previous reduction: the fiber integral is a sum of one term per root clamped to the fiber,
     # so a trace on the face lo and one on the face hi kink different terms, and their crossing needs no breakpoint. Two
     # traces on one face still pair, and so do leaves that are not traces.
@@ -435,19 +486,6 @@ end
     @test length(pairs) == 2 && all(p -> Unfitted._face(p.gi) == Unfitted._face(p.gj), pairs)
     plain = Unfitted._base_leaves(Any[g1, g2], [:monotone, :monotone], 1, 0.0, 0.5)
     @test count(l -> l isa Unfitted._FDLeaf, plain) == 1
-
-    # What that saves: cube − (sphere ∪ cylinder) around the common axis, where the cylinder lies inside the sphere and
-    # its traces on one face cross the sphere's on the other in every cell. Paired, they add a breakpoint to each of
-    # those cells that bounds no part of Ω (3072 kernel points instead of 2240), enough to starve the first moment-fit
-    # attempt: it missed its target or fitted to only 1e-9, and a miss refits with an eight times larger candidate
-    # cloud. Now each cell fits at the first attempt, to round-off.
-    sphere = leaf(x -> norm(x - SVector(0.5, 0.5, 0.5)) - 0.32; lipschitz=1.0)
-    cylinder = leaf(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.14; lipschitz=1.0)
-    domain = physical_domain(complement(union(sphere, cylinder)); subcell_length_scale=1 / 64, max_depth=4)
-    for lower in Iterators.product((0.25, 0.5), (0.25, 0.5), (0.25, 0.5))
-        _, _, residual, status = Unfitted._moment_fit_rule(domain, box(lower, lower .+ 0.25), (4, 4, 4), 1e-6, 1)
-        @test status === :fitted && residual < 1e-14
-    end
 end
 
 @testset "implicit quadrature — a pair leaf that vanishes adds no breakpoints" begin

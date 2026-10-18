@@ -23,6 +23,14 @@
 # Their `MUST-NOT-CHANGE` marking is about correctness fixes and still means what it says for any *later* change;
 # re-baseline against a run made on this commit or newer.
 #
+# A SECOND DELIBERATE MOVE. A cut cell's rule became two stages — Saye's implicit rule, its height axes now kept clear
+# of folds, compressed by Carathéodory pruning where an NNLS fit used to select it — so every immersed case moves: 12,
+# 13, 22, 25, 28, 32 and 33. Measured at `-O0` against the commit before the change: the measures, matrices,
+# solutions and residuals of 12, 13, 22, 28, 32 and 33 move in their last digits, as a different compression of the
+# same cut rule must (33's relative L² error in its fifth); case 25's certified callable and leaf integrate their
+# feature to 1.2e-9 where they reached 9.2e-5, which is the fold clearance; and case 22 prints `weight_tol` for the
+# old `nnls_weight_tol`. The 26 cases without a physical domain are bit-identical. Re-baseline the same way.
+#
 # Every case carries one of two markings:
 #
 #   MUST-NOT-CHANGE     the configuration is *currently correct*. A fix that
@@ -57,7 +65,7 @@
 #
 # Findings this instrument is aimed at:
 #   #1  facet/surface region resolution is not subdomain-aware
-#   #2  `_NNLS_WEIGHT_TOL` is an absolute cutoff on a cut-volume-scaled weight
+#   #2  `_WEIGHT_TOL` is an absolute cutoff on a cut-volume-scaled weight
 #   #3  `tolerance.merge` is an absolute length compared against mesh spacing
 #   #4  the fictitious fold is applied to the already-folded mask
 #   #5  `moved` has no single-domain guard
@@ -120,8 +128,7 @@ using BasicBSpline
 using LinearAlgebra
 using SparseArrays
 
-using Unfitted: SVector, SMatrix, active_unknowns, raw_dof_count, volume, problem_spaces, moment_fit_rule,
-                _diffusion_flux
+using Unfitted: SVector, SMatrix, active_unknowns, raw_dof_count, volume, problem_spaces, cut_cell_rule, _diffusion_flux
 
 # ── Formatting ────────────────────────────────────────────────────────────────
 #
@@ -755,7 +762,7 @@ function main()
     end
 
     # ── 22 ── #2. The same disc geometry as case 12, scaled to S = 1e-5, where
-    #          a correct cut weight is ~1e-11 and `_NNLS_WEIGHT_TOL = 1e-12`
+    #          a correct cut weight is ~1e-11 and `_WEIGHT_TOL = 1e-12`
     #          truncates most of the rule to nothing.
     case(22, "x-fcm-cut-scale-1e-5", "EXPECTED-TO-CHANGE (#2)",
          wrong_because="empty_regions > 0 and domain_measure is a small fraction of exact_area, " *
@@ -772,7 +779,7 @@ function main()
         assemble!(model)
         emit("length_scale", S)
         emit("exact_area", Float64(pi * (0.3S)^2))
-        emit("nnls_weight_tol", 1.0e-12)
+        emit("weight_tol", 1.0e-12)
         emit_model(model)
         dense = Matrix(model.matrix)
         emit("matrix_rank", rank(dense))
@@ -845,7 +852,7 @@ function main()
 
         report = (tag, domain) -> begin
             emit(tag * ".classification", classify_cell(domain, region))
-            _, ws, res = moment_fit_rule(domain, region, order; target_residual=1.0e-10)
+            _, ws, res = cut_cell_rule(domain, region, order)
             total = 0.0
             for w in ws
                 total += w

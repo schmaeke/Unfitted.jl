@@ -27,8 +27,8 @@ let V = space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(16, 16, 16), order=2
     group["D=3 16^3 base"] = @benchmarkable Unfitted.integration_plan($V)
 end
 
-# FCM dispatch + NNMF cache path on a disk-shaped Ω. Cut regions go through `_prefit!` and the moment-fit cache, so the
-# bench measures the realistic moment-fit cost.
+# FCM dispatch + moment-fit cache path on a disk-shaped Ω. Cut regions go through `_prefit!` and the moment-fit cache,
+# so the bench measures the realistic moment-fit cost.
 let
     R = 0.7
     phi(x) = sqrt(x[1]^2 + x[2]^2) - R

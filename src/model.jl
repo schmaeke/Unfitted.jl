@@ -141,14 +141,15 @@ Fields, in declaration order, which is also the order [`diagnostics`](@ref)`(mod
     in field-declaration order. Note the different granularity from `inactive_cell_counts`, which is per *space*: the
     two vectors line up entry-for-entry only when every space carries exactly one field (the common case). Two fields
     over one space give this vector twice the length of that one.
-  - `cut_region_count::Int`, `fit_failure_count::Int`, `moment_fit_residual_max::Float64` — FCM moment-fit statistics
-    from the integration plan. `fit_failure_count` counts every cut region whose fit missed the failure threshold
-    `_FIT_FAILURE_RESIDUAL · ‖m‖` (relative to the norm of the cell's moment vector, so the verdict does not depend on
-    the cell's size), whatever rule the region ended up carrying.
-  - `cut_fallback_count::Int`, `cut_fallback_points::Int` — the subset of those failures that fell back to the raw Saye
-    volume rule (`:cut_fallback`), and the total number of quadrature points those regions carry. A successful fit
-    yields ≈ nbasis points, so the second number is the price of the safety net; a nonzero count means the mesh is too
-    coarse for the geometry in those cells and should be refined. See [`moment_fit_rule`](@ref).
+  - `cut_region_count::Int`, `fit_failure_count::Int`, `moment_fit_residual_max::Float64` — FCM cut-cell statistics
+    from the integration plan. `fit_failure_count` counts every cut region whose compressed rule missed the failure
+    threshold `_FIT_FAILURE_RESIDUAL · ‖m‖` (relative to the norm of the cell's moment vector, so the verdict does not
+    depend on the cell's size) or held no points, whatever rule the region ended up carrying.
+  - `cut_fallback_count::Int`, `cut_fallback_points::Int` — the subset of those failures that fell back to the
+    uncompressed cut rule (`:cut_fallback`), and the total number of quadrature points those regions carry. A compressed
+    rule carries at most as many points as its moment basis has functions, so the second number is the price of the
+    safety net; a nonzero count means the mesh is too coarse for the geometry in those cells and should be refined. See
+    [`cut_cell_rule`](@ref).
   - `symmetry_residual::Float64` — the reported value of `‖A − Aᵀ‖_F` for the assembled matrix. It is asserted, never
     measured: `assemble!` writes exactly `0.0` when the problem declares itself symmetric — such a form is scattered
     into the lower triangle only and mirrored entry-for-entry by `_mirror_lower`, so `A = Aᵀ` holds to the bit by
@@ -883,18 +884,14 @@ end
 # `(cut, trimmed, failed, fallbacks, fallback_points, residual_max, min_relative_measure)`. The plan statistics and the
 # facet statistics both compose from it; the two count "cut" differently, and both counts are here:
 #
-#   - `cut` — the regions `∂Ω` crosses (`_CUT_KINDS`), the volume plan's `cut_region_count`. `:cut_fitted` are
-#     successful fits; `:cut_fallback` (the raw Saye volume rule), `:cut_failed` (empty Ω ∩ box at α = 0) and
-#     `:cut_alpha_failed` (the same at α > 0) all failed to fit, and are `failed` (`_FAILED_KINDS`) too — so
-#     `fit_failure_count` keeps meaning "the moment fit did not succeed" whichever rule the region ended up carrying.
-#     `:cut_custom` — a region integrated by the domain's own `cut_quadrature` rule instead of the fit (see
-#     `PhysicalDomain`) — is a cut region but never a fit failure: no fit ran, so there is nothing for the
-#     residual-based counter to report. A custom rule that wants to be counted as a failure says so by returning
-#     `status === :empty`, which lands the region in `:cut_failed` / `:cut_alpha_failed` instead.
+#   - `cut` — the regions `∂Ω` crosses (`_CUT_KINDS`), the volume plan's `cut_region_count`. `:cut_fitted` carry a
+#     compressed cut rule; `:cut_fallback` (the cut rule itself), `:cut_failed` (empty Ω ∩ box at α = 0) and
+#     `:cut_alpha_failed` (the same at α > 0) all failed to compress, and are `failed` (`_FAILED_KINDS`) too — so
+#     `fit_failure_count` keeps meaning "the compression did not succeed" whichever rule the region ended up carrying.
 #   - `trimmed` — every region that is not `:full`, the facet statistics' `cut_facet_region_count`: a face part of whose
 #     area falls outside Ω, `:fictitious*` faces included.
 #   - `fallbacks` and `fallback_points` — the `:cut_fallback` regions and their quadrature points. That is the assembly
-#     cost of the safety net, and the number a caller should watch: it is bounded only by the volume rule's own point
+#     cost of the safety net, and the number a caller should watch: it is bounded only by the cut rule's own point
 #     count, not by nbasis.
 #   - `residual_max` and `min_relative_measure` — over the `trimmed` regions, the largest moment-fit residual and the
 #     smallest fraction of a region's own measure its rule integrates (`_region_measure`). A list that trims nothing
@@ -1555,7 +1552,7 @@ end
 ```
 
 For the same problem, calling `update_dirichlet!` is typically orders of magnitude cheaper than re-running
-`prepare(problem)` because the per-step rebuild of the integration plan and the NNMF moment-fit cache is skipped — only
+`prepare(problem)` because the per-step rebuild of the integration plan and the moment-fit cache is skipped — only
 the right-hand side of the boundary-trace projection on the constrained-dof subspace is reassembled and
 back-substituted.
 

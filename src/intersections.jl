@@ -75,12 +75,12 @@ Fields:
   - `kind::Symbol` — which rule the region carries, a closed vocabulary (`CONTRIBUTING.md`, "Region quadrature kinds"):
     `:full` (tensor Gauss over the whole region: it lies in Ω, or no [`PhysicalDomain`](@ref) is attached),
     `:fictitious` (a facet region outside Ω under `α = 0`, kept with an empty rule), `:fictitious_alpha` (outside Ω
-    under `α > 0`: the α-scaled tensor rule), `:cut_fitted` (∂Ω crosses it: the moment-fit rule, `src/fcm.jl`),
-    `:cut_fallback` (the fit failed, so the raw Saye volume rule the moments were summed from — correct and
-    non-negative, but with 50–200× the points), `:cut_custom` (the domain's own `cut_quadrature` supplied the rule),
-    `:cut_failed` (`Ω ∩ region` carries no rule at all, under `α = 0`: an empty rule) and `:cut_alpha_failed` (the same
-    under `α > 0`: the α-scaled tensor rule alone, so the cell's dofs stay α-stabilised), and on simplices `:surface`
-    and `:interface`. Under `α > 0` every other cut kind carries `(1 − α)·rule ∪ α·tensor`, rule first.
+    under `α > 0`: the α-scaled tensor rule), `:cut_fitted` (∂Ω crosses it: the domain's compressed cut rule,
+    [`cut_cell_rule`](@ref)), `:cut_fallback` (the compression failed, so the cut rule itself — correct and
+    non-negative, but with 50–200× the points), `:cut_failed` (`Ω ∩ region` carries no rule at all, under `α = 0`: an
+    empty rule) and `:cut_alpha_failed` (the same under `α > 0`: the α-scaled tensor rule alone, so the cell's dofs stay
+    α-stabilised), and on simplices `:surface` and `:interface`. Under `α > 0` every other cut kind carries
+    `(1 − α)·rule ∪ α·tensor`, rule first.
   - `points::Vector{SVector{D,T}}`, `weights::Vector{T}` — the rule in the region's frame (see above). The `:full` and
     the α-scaled kinds alias one cached array per distinct rule, so they cost no allocation per region.
   - `normal::N` — `nothing` on a volume region, else the region's constant unit normal.
@@ -185,10 +185,8 @@ Fields:
     `small_overlap_count`.
   - `min_volume::T` — the smallest region volume in `regions`, or zero if `regions` is empty.
   - `min_relative_volume::T` — `min_volume / volume(V.domain)`.
-  - `moment_fit_residual_max::Float64` — the largest NNMF moment-fit residual observed across all `:cut_fitted`,
-    `:cut_fallback`, `:cut_failed`, and `:cut_alpha_failed` regions. A `:cut_custom` region contributes whatever its
-    `cut_quadrature` rule reports as a residual, so a rule with no such notion should report zero rather than leave the
-    package's own accuracy statistic reading a foreign number.
+  - `moment_fit_residual_max::Float64` — the largest moment residual of a compressed cut rule observed across all
+    `:cut_fitted`, `:cut_fallback`, `:cut_failed`, and `:cut_alpha_failed` regions ([`cut_cell_rule`](@ref)).
 """
 struct IntegrationPlan{D,T<:Real}
     regions::Vector{VolumeRegion{D,T}}
@@ -226,11 +224,10 @@ The construction follows the recipe in `CONTRIBUTING.md`'s "Integration regions"
   3. Decode each box's parents from its signature, building each parent's map from the box's frame into its own
      reference frame ([`Parent`](@ref)), and check the `criterion`.
   4. Dispatch on the `PhysicalDomain` classification to pick the region quadrature: tensor Gauss for `:full`, α-scaled
-     tensor Gauss for `:fictitious + alpha > 0`, and on `:cut` the NNMF moment-fit — or the domain's `cut_quadrature`
-     callable, when it supplies one, in the fit's place. Drop the region entirely under strict-α (`alpha = 0` and
-     `:fictitious`).
+     tensor Gauss for `:fictitious + alpha > 0`, and on `:cut` the domain's cut rule under its compression
+     ([`cut_cell_rule`](@ref)). Drop the region entirely under strict-α (`alpha = 0` and `:fictitious`).
   5. Record a [`SmallOverlap`](@ref) for every region whose physical volume falls below `tolerance.small_volume`, and
-     track the maximum NNMF residual observed across cut regions.
+     track the largest moment residual observed across cut regions.
 
 Keyword arguments:
 
@@ -285,10 +282,8 @@ function integration_plan(V::Space{D,T}; tolerance=GeometryTolerance(T), criteri
     _prefit!(moment_fit_cache, physical, records)
 
     alpha = physical === nothing ? zero(T) : physical.alpha
-    custom = physical !== nothing && physical.cut_quadrature !== nothing
     domain_volume = volume(V.domain)
-    regions, small_overlaps, residual_max = _plan_regions(records, moment_fit_cache, alpha, custom, tolerance,
-                                                          domain_volume)
+    regions, small_overlaps, residual_max = _plan_regions(records, moment_fit_cache, alpha, tolerance, domain_volume)
     min_volume = isempty(regions) ? zero(T) : minimum(volume(_region_box(region)) for region in regions)
     min_relative_volume = iszero(domain_volume) ? zero(T) : min_volume / domain_volume
     return IntegrationPlan{D,T}(regions, small_overlaps, min_volume, min_relative_volume, residual_max)
@@ -703,8 +698,7 @@ const _MomentFitCache{D,T} = Dict{_MomentFitKey{D,T},_MomentFitValue{D,T}}
 # cache to exactly this plan's regions. Classification ran first and serially, in the records (it is memoised, and a
 # `Dict` is not thread-safe); the fits fill the cache afterwards, serially; the rule loop then runs in region order on
 # nothing but cache hits, so region order, `residual_max` and the small-overlap bookkeeping are the serial path's, bit
-# for bit. A custom `cut_quadrature` is fitted serially (`_fit_rules`) and still gets the dedup and the cross-plan
-# reuse.
+# for bit.
 #
 # `live` is the plan's whole cut-key set, not just its misses, because restricting the cache afterwards is what keeps a
 # cache threaded through a long `move!` sweep from holding the sweep's worth of rules. On exit the cache holds only the
@@ -717,7 +711,7 @@ function _prefit!(cache::_MomentFitCache{D,T}, physical, records::Vector{_Region
         record.verdict === :cut && push!(live, (record.lower, record.upper, record.order))
     end
     pending = _MomentFitKey{D,T}[key for key in live if !haskey(cache, key)]
-    fitted = _fit_rules(physical, pending, physical.cut_quadrature)
+    fitted = _fit_rules(physical, pending)
     for i in eachindex(pending)
         cache[pending[i]] = fitted[i]
     end
@@ -747,30 +741,23 @@ function _prefit!(cache::_MomentFitCache{D,T}, physical, records::Vector{_Region
     return cache
 end
 
-# The rules of a list of cut keys `(lower, upper, order)`, in key order: `_fit_rule` with `rule` on every key, on every
-# thread.
+# The rules of a list of cut keys `(lower, upper, order)`, in key order: `_fit_rule` on every key, on every thread.
 #
 # At the default `moment_order_factor = 2` the fits *are* the plan: 99.9% of a 3D build, tens of seconds over a few
 # dozen cut cells. They are also independent of one another — `_fit_rule` reads the immutable `PhysicalDomain` and the
-# box and touches nothing else — so each writes its own slot of a pre-sized vector, with no `Dict` in reach.
-#
-# A user `cut_quadrature` is fitted serially instead. It is caller code under no thread-safety contract — the package's
-# own test rule counts its calls through a shared `Ref` — so the package does not unilaterally run it on N threads.
-function _fit_rules(physical::PhysicalDomain, keys::Vector{_MomentFitKey{D,T}}, rule) where {D,T}
+# box and touches nothing else — so each writes its own slot of a pre-sized vector, with no `Dict` in reach. That holds
+# for a caller's cut rule, compression and level-set leaves as much as for the package's own, because the
+# `PhysicalDomain` contract requires every callable it holds to be thread-safe.
+function _fit_rules(physical::PhysicalDomain, keys::Vector{_MomentFitKey{D,T}}) where {D,T}
     fitted = Vector{_MomentFitValue{D,T}}(undef, length(keys))
-    fit(key) = _fit_rule(physical, key[1], key[2], key[3], rule)
-    if rule !== nothing
-        map!(fit, fitted, keys)
-    else
-        Threads.@threads for i in eachindex(keys)
-            fitted[i] = fit(keys[i])
-        end
+    Threads.@threads for i in eachindex(keys)
+        fitted[i] = _fit_rule(physical, keys[i]...)
     end
     return fitted
 end
 
-# One cut region's rule on the box `lower`–`upper`, in the box's reference frame — the moment fit (`moment_fit_rule`, at
-# the domain's own `target_residual`) when `rule` is `nothing`, else `rule(physical, box, order)` — mapped as follows:
+# One cut region's rule on the box `lower`–`upper` — the domain's cut rule under its compression, `cut_cell_rule` —
+# in the box's reference frame, mapped as follows:
 #
 #   - `ref_points` are the rule's physical points mapped into the box's `[−1, 1]ᴰ` reference frame via
 #     `physical_to_reference`;
@@ -778,24 +765,11 @@ end
 #     loop's `weight * jacobian` step recovers the original physical weight (the same convention used for `:full`
 #     regions);
 #   - `residual` is the moment-fit L² residual reported by `fcm.jl`;
-#   - `status` is `:fitted`, `:fallback`, or `:empty` — see [`moment_fit_rule`](@ref). The mapping above is
-#     rule-agnostic, so a `:fallback` rule (the raw Saye volume rule) is mapped and consumed exactly like a fitted one.
-#
-# `physical.cut_quadrature` is the user extension point: a non-`nothing` callable supplies the cut-cell rule in place of
-# the moment fit, in the same 4-tuple shape and the same *physical*-frame convention. Placing it here puts a custom rule
-# under the same per-box memoisation, the same reference-frame mapping, and the same α-FCM blend as the fit, so swapping
-# the rule changes exactly one thing. `rule` is the caller's, not read off the domain here, because a caller may decline
-# the domain's rule: the volume plan passes `physical.cut_quadrature`, and a boundary facet passes `nothing`, since it
-# never consults it (see `_facet_regions` in `dirichlet.jl`). Passed as a value, its type decides the branch at compile
-# time, so a space with a custom rule compiles no moment fit for its cells, and a facet compiles no call to the rule.
-#
-# A pure function of its arguments, which is what lets `_fit_rules` run it on any thread.
-function _fit_rule(physical::PhysicalDomain, lower::SVector{D,T}, upper::SVector{D,T}, order::NTuple{D,Int},
-                   rule) where {D,T}
+#   - `status` is `:fitted`, `:fallback`, or `:empty` — see [`cut_cell_rule`](@ref). The mapping above is
+#     rule-agnostic, so a `:fallback` rule (the cut rule itself) is mapped and consumed exactly like a compressed one.
+function _fit_rule(physical::PhysicalDomain, lower::SVector{D,T}, upper::SVector{D,T}, order::NTuple{D,Int}) where {D,T}
     box = AxisBox{D,T}(lower, upper)
-    target_residual = physical.target_residual
-    points, weights, residual, status = rule === nothing ? moment_fit_rule(physical, box, order; target_residual) :
-                                        rule(physical, box, order)
+    points, weights, residual, status = cut_cell_rule(physical, box, order)
     jacobian = volume(box) / convert(T, 2^D)
     return ([physical_to_reference(box, p) for p in points], T[w / jacobian for w in weights], T(residual), status)
 end
@@ -808,7 +782,7 @@ end
 # warning, the caller decides whether to stabilise. A function barrier on `alpha`, a field of the abstractly typed
 # `Space.physical`, so the per-region rule dispatch below is static. The region list is reserved at the record count,
 # its bound, so it is filled without regrowing.
-function _plan_regions(records::Vector{_RegionRecord{D,T}}, fits::_MomentFitCache{D,T}, alpha, custom::Bool,
+function _plan_regions(records::Vector{_RegionRecord{D,T}}, fits::_MomentFitCache{D,T}, alpha,
                        tolerance::GeometryTolerance{T}, domain_volume::T) where {D,T}
     regions = sizehint!(VolumeRegion{D,T}[], length(records))
     small_overlaps = SmallOverlap{T}[]
@@ -819,7 +793,7 @@ function _plan_regions(records::Vector{_RegionRecord{D,T}}, fits::_MomentFitCach
         record.verdict === :fictitious && iszero(alpha) && continue
         fit = record.verdict === :cut ? fits[(record.lower, record.upper, record.order)] : nothing
         kind, points, weights, residual = _trimmed_rule(record.verdict, record.counts, tensor_cache, alpha_cache, alpha,
-                                                        fit, custom)
+                                                        fit)
         residual > residual_max && (residual_max = Float64(residual))
         region = Region(record.lower, record.upper, record.parents, kind, points, weights; residual)
         region_volume = volume(_region_box(region))
@@ -851,22 +825,18 @@ end
 #                                       drops such a region before asking; a facet
 #                                       keeps it, see `_facet_regions`)
 #   - `:fictitious`, `α > 0`          → `:fictitious_alpha`, the α-scaled base rule
-#   - `:cut`, a fitted rule           → `:cut_fitted`
+#   - `:cut`, a compressed rule       → `:cut_fitted`
 #     (α > 0 appends the α-scaled base rule for stabilisation)
-#   - `:cut`, the domain's own rule   → `:cut_custom` (`custom`: the domain's
-#     `cut_quadrature` supplied it; α blends it exactly as it blends a fit)
-#   - `:cut`, a failed fit            → `:cut_fallback`, the raw Saye volume rule
+#   - `:cut`, a failed compression    → `:cut_fallback`, the cut rule itself
 #     (correct but uncompressed; α > 0 appends the α-scaled base rule as above)
 #   - `:cut`, empty Ω ∩ box, `α == 0` → `:cut_failed`, the empty rule (zero contribution)
 #   - `:cut`, empty Ω ∩ box, `α > 0`  → `:cut_alpha_failed`, the α-scaled base rule alone
 #     (nonzero: the physical sliver is negligible, but the cell's dofs stay α-stabilised)
 #
-# A `:fallback` rule is the Saye volume rule itself, so it is a valid non-negative physical rule and is consumed exactly
-# like a fit — only with 50–200× the points. The distinct kind is what makes that cost visible in the diagnostics
-# instead of hiding it in `:cut_fitted`. A custom rule owns the region outright, so it gets the single kind
-# `:cut_custom` whatever status symbol it returns — the diagnostic vocabulary stays closed rather than growing one kind
-# per user rule. `:empty` is the one status a custom rule shares with the fit, and it still routes to `:cut_failed` /
-# `:cut_alpha_failed`.
+# A `:fallback` rule is the cut rule itself, so it is a valid non-negative physical rule and is consumed exactly like a
+# compressed one — only with 50–200× the points. The distinct kind is what makes that cost visible in the diagnostics
+# instead of hiding it in `:cut_fitted`. A domain that compresses nothing gets `:cut_fitted` too: its rule reproduces
+# its own moments exactly.
 #
 # α-FCM on a cut region stabilises the fictitious part by *adding* the α-scaled base rule to the physical rule. Writing
 # the α-FCM integrand as
@@ -887,7 +857,7 @@ end
 # status)` in the region's frame, read only on a `:cut` verdict. The residual is the fit's on every `:cut` kind and zero
 # otherwise.
 function _trimmed_rule(verdict::Symbol, counts::NTuple{D,Int}, rules::_TensorRuleCache{D,T},
-                       alpha_rules::Dict{NTuple{D,Int},Vector{T}}, alpha, fit, custom::Bool) where {D,T}
+                       alpha_rules::Dict{NTuple{D,Int},Vector{T}}, alpha, fit) where {D,T}
     base = _cached_tensor_quadrature!(rules, counts, T)
     verdict === :full && return :full, base.points, base.weights, zero(T)
     scaled = iszero(alpha) ? base.weights : get!(() -> base.weights .* alpha, alpha_rules, counts)
@@ -900,13 +870,13 @@ function _trimmed_rule(verdict::Symbol, counts::NTuple{D,Int}, rules::_TensorRul
         iszero(alpha) && return :cut_failed, SVector{D,T}[], T[], residual
         return :cut_alpha_failed, base.points, scaled, residual
     end
-    kind = custom ? :cut_custom : status === :fallback ? :cut_fallback : :cut_fitted
+    kind = status === :fallback ? :cut_fallback : :cut_fitted
     iszero(alpha) && return kind, points, weights, residual
     return kind, vcat(points, base.points), vcat(weights .* (one(T) - alpha), scaled), residual
 end
 
 # The kinds `_trimmed_rule` gives a region `∂Ω` crosses, whatever rule it ended up with, and the subset on which the
-# moment fit failed (a custom rule never fails a fit: no fit ran). The diagnostics count both (`_kind_stats` in
-# `model.jl`), and the post-processing sampler cut-refines exactly the first (`_sample_cells`).
-const _CUT_KINDS = (:cut_fitted, :cut_custom, :cut_fallback, :cut_failed, :cut_alpha_failed)
+# compression failed or found nothing to compress. The diagnostics count both (`_kind_stats` in `model.jl`), and the
+# post-processing sampler cut-refines exactly the first (`_sample_cells`).
+const _CUT_KINDS = (:cut_fitted, :cut_fallback, :cut_failed, :cut_alpha_failed)
 const _FAILED_KINDS = (:cut_fallback, :cut_failed, :cut_alpha_failed)

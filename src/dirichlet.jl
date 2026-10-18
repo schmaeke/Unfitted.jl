@@ -470,11 +470,11 @@ end
 #     every pinned axis and its weights the free-axis weight products, unchanged.
 #   - The α-scaled weights are cached per face, not per resolver: one resolver serves every space of a model, and two
 #     spaces may carry different `α`.
-#   - The fits run through `_fit_rules`, on every thread, and come back in the face box's own reference frame; a `0` on
-#     each pinned axis embeds them in the region's frame. The domain's `cut_quadrature` is **not** consulted: it is
-#     documented as a rule on a cell box in the model's own dimension, so handing a user's callable a face box one
-#     dimension down would silently change what it is being asked for — a facet cut region always goes through the
-#     package's own `moment_fit_rule`.
+#   - The fits run through `_fit_rules` and come back in the face box's own reference frame; a `0` on each pinned axis
+#     embeds them in the region's frame. The domain's cut rule is **not** consulted: it is documented as a rule on a
+#     cell box in the model's own dimension, so handing a user's callable a face box one dimension down would silently
+#     change what it is being asked for. The slice carries [`implicit_rule`](@ref) instead (`_restrict_domain`), under
+#     the domain's own compression.
 #
 # One deliberate departure from the volume plan: a zero-measure region — `:fictitious` under strict `α = 0`, or
 # `:cut_failed` — is kept rather than dropped. Its parents carry trace dofs the dof layer constrains on the same
@@ -482,7 +482,7 @@ end
 # facet (`F = 0`) never reaches the cut branch: `_classify_facet` decides a single point by membership.
 #
 # The fits are entered through `Base.inferencebarrier` (the idiom of `_coverage_constraints!` in `dofs.jl`), so
-# inference never descends from here into the moment-fit chain — `_fit_rules`, `moment_fit_rule`, the implicit kernel,
+# inference never descends from here into the moment-fit chain — `_fit_rules`, `cut_cell_rule`, the implicit kernel,
 # NNLS. The call is resolved at run time on the slice's concrete type, and the chain is inferred and compiled when a
 # face first has a cut region, not before. Without the barrier, an inference that reaches this call with the face's
 # dimension and number type unknown infers the whole chain for them, in code that never runs. That was measured while
@@ -498,7 +498,7 @@ function _facet_regions(records::Vector{_RegionRecord{D,T}}, slice, sides::Vecto
     end
     keys = _MomentFitKey{F,T}[key(record) for record in records if record.verdict === :cut]
     fits = isempty(keys) ? _MomentFitValue{F,T}[] :
-           Base.inferencebarrier(_fit_rules)(slice, keys, nothing)::Vector{_MomentFitValue{F,T}}
+           Base.inferencebarrier(_fit_rules)(slice, keys)::Vector{_MomentFitValue{F,T}}
     frame_pins = [(axis, zero(T)) for (axis, _) in pins]
     alpha = slice === nothing ? zero(T) : slice.alpha
     alpha_cache = Dict{NTuple{D,Int},Vector{T}}()
@@ -511,8 +511,7 @@ function _facet_regions(records::Vector{_RegionRecord{D,T}}, slice, sides::Vecto
             points, weights, residual, status = fits[next += 1]
             fit = (SVector{D,T}[_lift(p, frame_pins) for p in points], weights, residual, status)
         end
-        kind, points, weights, residual = _trimmed_rule(record.verdict, record.counts, rules, alpha_cache, alpha, fit,
-                                                        false)
+        kind, points, weights, residual = _trimmed_rule(record.verdict, record.counts, rules, alpha_cache, alpha, fit)
         push!(regions,
               Region(record.lower, record.upper, record.parents, kind, points, weights; normal, sides, residual))
     end

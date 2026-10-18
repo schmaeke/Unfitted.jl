@@ -8,8 +8,6 @@ using LinearAlgebra
     @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.0)
     @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=-1.0)
     @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1, max_depth=-1)
-    @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1, target_residual=0.0)
-    @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1, target_residual=-1.0)
     # keep_fictitious keeps fully-fictitious cells active, so it needs α > 0 to give them quadrature; pairing it with
     # the strict-cut path is singular.
     @test_throws ArgumentError physical_domain(x -> x[1]; subcell_length_scale=0.1, keep_fictitious=true, alpha=0.0)
@@ -23,13 +21,16 @@ using LinearAlgebra
     @test p.alpha == 0.0
     @test p.subcell_length_scale == 0.0625
     @test p.max_depth == 8
-    @test p.target_residual == 1.0e-6
+    @test p.cut_rule === implicit_rule
+    @test p.compression == Caratheodory()
 
     p_alpha = physical_domain(x -> x[1]; lipschitz=1.0, alpha=0.25, subcell_length_scale=0.1)
     @test p_alpha.alpha == 0.25
 
-    p_tight = physical_domain(x -> x[1]; lipschitz=1.0, subcell_length_scale=0.1, target_residual=1.0e-10)
-    @test p_tight.target_residual == 1.0e-10
+    p_tight = physical_domain(x -> x[1]; lipschitz=1.0, subcell_length_scale=0.1,
+                              compression=NonnegativeFit(; target_residual=1.0e-10))
+    @test p_tight.compression.target_residual == 1.0e-10
+    @test physical_domain(x -> x[1]; subcell_length_scale=0.1, compression=nothing).compression === nothing
 
     p2 = physical_domain(x -> x[1]; subcell_length_scale=0.1)
     @test isinf(p2.geometry.lipschitz)
@@ -161,17 +162,17 @@ end
     @test classify_cell(pt, box((0.75, 0.4), (0.85, 0.5))) === :cut          # straddles x = 0.8
 end
 
-@testset "PhysicalDomain.target_residual drives integration_plan moment-fit" begin
-    # The default 1.0e-6 is a loose bound on the moment fit. The Saye kernel's moments are exact on graph-like cut cells
-    # and high-order on curved ones, so the achieved residual is set by the kernel, not by the target: a tighter target
-    # only triggers extra conditioning retries that cannot beat the kernel's curved-boundary approximation floor. The
-    # 2×2 base box [−1, 1]² is split 8×8 into 0.25-wide cells; subcell_length_scale here only bounds classifier/fallback
-    # subdivision, not moment accuracy.
+@testset "the NNLS target decides retries, not the plan" begin
+    # `NonnegativeFit`'s target only decides whether a fit is retried on a denser candidate cloud. The first attempt
+    # already reproduces a smooth cut cell's moments far below either target, so a tighter one changes neither the
+    # region structure nor a single rule. The 2×2 base box [−1, 1]² is split
+    # 8×8 into 0.25-wide cells; subcell_length_scale here only bounds classifier and kernel subdivision.
     phi(x) = sqrt(x[1]^2 + x[2]^2) - 0.7
     omega = box((-1.0, -1.0), (1.0, 1.0))
 
-    loose = physical_domain(phi; lipschitz=1.0, subcell_length_scale=2.0 / 8 / 2^4)
-    tight = physical_domain(phi; lipschitz=1.0, subcell_length_scale=2.0 / 8 / 2^4, target_residual=1.0e-10)
+    loose = physical_domain(phi; lipschitz=1.0, subcell_length_scale=2.0 / 8 / 2^4, compression=NonnegativeFit())
+    tight = physical_domain(phi; lipschitz=1.0, subcell_length_scale=2.0 / 8 / 2^4,
+                            compression=NonnegativeFit(; target_residual=1.0e-10))
 
     V_loose = space(omega; cells=(8, 8), order=2, physical=loose)
     V_tight = space(omega; cells=(8, 8), order=2, physical=tight)
@@ -185,10 +186,9 @@ end
     cut_tight = count(r -> r.kind === :cut_fitted, plan_tight.regions)
     @test cut_loose == cut_tight > 0
 
-    # Both targets reach the same residual floor: it is set by the kernel's approximation of the curved boundary, which
-    # a tighter target cannot beat.
-    @test plan_loose.moment_fit_residual_max < 1.0e-5
-    @test plan_tight.moment_fit_residual_max < 1.0e-5
+    # And the same rules: the first attempt meets both targets, so neither retries.
+    @test [r.weights for r in plan_loose.regions] == [r.weights for r in plan_tight.regions]
+    @test plan_loose.moment_fit_residual_max == plan_tight.moment_fit_residual_max
 end
 
 @testset "classify_cell — Lipschitz certificate" begin
@@ -253,10 +253,10 @@ end
 end
 
 @testset "interior hole drops the expected cells" begin
-    # 10×10 mesh of width 0.1 each. Disk hole at (0.5, 0.5) radius 0.2.
-    # Cells (5,5), (5,6), (6,5), (6,6) sit entirely inside the disk and should be classified :fictitious. Uses
-    # subcell_length_scale=1.0e-6, max_depth=2 + order=1 to keep the NNMF cost on the surrounding cut cells small — this
-    # test is about cell classification, not cut-quadrature accuracy.
+    # 10×10 mesh of width 0.1 each. Disk hole at (0.5, 0.5) radius 0.2. Cells (5,5), (5,6), (6,5), (6,6) sit entirely
+    # inside the disk and should be classified :fictitious. Uses subcell_length_scale=1.0e-6, max_depth=2 + order=1 to
+    # keep the compression cost on the surrounding cut cells small — this test is about cell classification, not
+    # cut-quadrature accuracy.
     omega = box((0.0, 0.0), (1.0, 1.0))
     hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0, subcell_length_scale=1.0e-6,
                            max_depth=2)
@@ -685,7 +685,7 @@ end
     @test V_overlay.physical === p
 end
 
-@testset "NNMF on a region with multi-level parents" begin
+@testset "the moment order of a region with multi-level parents" begin
     # A cut base cell that is also covered by a cut overlay cell — exercises the moment order's max over parents
     # (`_axis_max` of `_moment_orders`). Use orders that differ between levels so the chosen moment_order is meaningful.
     bc = dirichlet(0.0; on=boundary(:all))
@@ -703,7 +703,7 @@ end
     @test moment_order == (4,)
 end
 
-@testset "moment_order_factor knob tunes the NNMF basis" begin
+@testset "moment_order_factor knob tunes the moment basis" begin
     omega = box((0.0,), (1.0,))
     p_default = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=1.0e-6, max_depth=2)
     p_cheap = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=1.0e-6, max_depth=2,
@@ -725,21 +725,22 @@ end
 end
 
 @testset "high moment order on a starved cut still fits below the failure threshold" begin
-    # A high moment order (20) against a coarse, undivided cut cell stresses the moment fit. The leaf is linear, so the
-    # Saye moments are exact and a single NNLS solve stays well below the failure threshold — the residual branch that
-    # would tag a region :cut_failed is not reached through the public path with the exact kernel.
-    p = physical_domain(x -> 0.5 - x[1]; lipschitz=1.0, subcell_length_scale=10.0, max_depth=0)
+    # A high moment order (20) against a coarse, undivided cut cell stresses the compression. The leaf is linear, so the
+    # Saye moments are exact and the compressed rule stays well below the failure threshold — the residual branch that
+    # would tag a region :cut_fallback is not reached through the public path with the exact kernel.
+    p = physical_domain(x -> 0.5 - x[1]; lipschitz=1.0, subcell_length_scale=10.0, max_depth=0,
+                        compression=NonnegativeFit(; target_residual=1.0e-14))
     region_box = box((0.0,), (1.0,))
-    pts, ws, res, status = Unfitted.moment_fit_rule(p, region_box, (20,); target_residual=1.0e-14)
+    pts, ws, res, status = cut_cell_rule(p, region_box, (20,))
     @test !isempty(pts)
     @test status === :fitted
-    @test res < Unfitted._FIT_FAILURE_RESIDUAL * sum(ws)   # relative to ‖m‖ ≥ m₀ = Σw, the cut measure
+    @test res < 1.0e-9 * sum(ws)
 end
 
 @testset "α-FCM fit failure is :cut_alpha_failed and counts as a failure" begin
     # The empty-Ω∩R branches are defensive (unreachable via the public path with exact kernels), so pin their contract
     # directly. Unlike the empty strict-cut `:cut_failed`, `:cut_alpha_failed` carries a NONZERO α-scaled rule so the
-    # cell's dofs stay α-stabilised. `:cut_fallback` carries the raw Saye volume rule — a full, correct rule with many
+    # cell's dofs stay α-stabilised. `:cut_fallback` carries the uncompressed cut rule — a full, correct rule with many
     # more points than a fit. All three non-fitted kinds feed the fit-failure count, all four count as cut regions, and
     # only `:cut_fallback` contributes to the fallback point budget.
     region(kind, points, weights) = Unfitted.Region(SVector(0.0), SVector(1.0), Unfitted.Parent{1,Float64}[], kind,
@@ -758,79 +759,88 @@ end
     @test stats.fallback_points == 2
 end
 
-@testset "custom cut_quadrature rule replaces the moment fit on cut regions" begin
-    # `PhysicalDomain.cut_quadrature` is the public extension point for integrating cut cells by some other scheme. The
-    # rule below is the plainest one honouring the documented contract: the full-cell tensor Gauss rule of the region
-    # box, in *physical* coordinates, with strictly positive weights. It ignores Ω on purpose, so `Σ w_q = vol(box)`
-    # exactly — a value no moment fit could return on a cut cell, which is what makes "the rule was actually used"
-    # checkable without re-deriving a fit.
-    calls = Ref(0)
+@testset "a caller's cut rule and compression take the place of the package's" begin
+    # `cut_rule` and `compression` are the public extension points of the cut-cell quadrature. The cut rule below is the
+    # plainest one honouring its contract: the full-cell tensor Gauss rule of the region box, in *physical* coordinates,
+    # with strictly positive weights. It ignores Ω on purpose, so `Σ w_q = vol(box)` exactly — a value no rule of the
+    # cut volume could return, which is what makes "the rule was actually used" checkable without re-deriving one. Both
+    # stages are called from every thread at once, so they count their calls atomically.
+    calls = Threads.Atomic{Int}(0)
     function tensor_rule(physical, region_box::Unfitted.AxisBox{D,T}, moment_order::NTuple{D,Int}) where {D,T}
-        calls[] += 1
+        Threads.atomic_add!(calls, 1)
         rule = Unfitted._tensor_gauss_rule(moment_order .+ 1, T)
         jacobian = Unfitted.volume(region_box) / T(2^D)
-        points = [Unfitted.reference_to_physical(region_box, p) for p in rule.points]
-        return points, rule.weights .* jacobian, zero(T), :custom
+        return [Unfitted.reference_to_physical(region_box, p) for p in rule.points], rule.weights .* jacobian
+    end
+    compressions = Threads.Atomic{Int}(0)
+    function counted(points, weights, moments, basis)
+        Threads.atomic_add!(compressions, 1)
+        return Caratheodory()(points, weights, moments, basis)
     end
 
     omega = box((0.0, 0.0), (1.0, 1.0))
     geometry = x -> sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.3
     settings = (; lipschitz=1.0, subcell_length_scale=0.05)
-    fitted = physical_domain(geometry; settings...)
-    custom = physical_domain(geometry; settings..., cut_quadrature=tensor_rule)
-
-    # `Q === Nothing` on the default keeps the struct concrete, which is the reason the rule is a field rather than a
-    # boxed global.
-    @test fitted.cut_quadrature === nothing
-    @test typeof(fitted).parameters[3] === Nothing
-    @test isconcretetype(typeof(fitted))
-    @test isconcretetype(typeof(custom))
-
-    plan_fitted = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2, physical=fitted))
-    plan_custom = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2, physical=custom))
-
+    plan(physical) = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2, physical))
     kinds(plan) = [r.kind for r in plan.regions]
-    @test :cut_fitted in kinds(plan_fitted)
-    @test !(:cut_custom in kinds(plan_fitted))
-    # The rule replaces exactly the cut regions: same region boxes, same `:full` regions, `:cut_fitted` swapped for
-    # `:cut_custom` one for one.
-    @test [(r.lower, r.upper) for r in plan_custom.regions] == [(r.lower, r.upper) for r in plan_fitted.regions]
-    @test count(==(:full), kinds(plan_custom)) == count(==(:full), kinds(plan_fitted))
-    @test count(==(:cut_custom), kinds(plan_custom)) == count(==(:cut_fitted), kinds(plan_fitted)) > 0
-    @test calls[] == count(==(:cut_custom), kinds(plan_custom))
+    fitted = physical_domain(geometry; settings...)
+    raw = physical_domain(geometry; settings..., cut_rule=tensor_rule, compression=nothing)
+
+    # Both stages are type parameters, so a domain is concrete whatever it carries.
+    @test isconcretetype(typeof(fitted)) && isconcretetype(typeof(raw))
+
+    # A caller's stage replaces the rule a cut region carries, not what the region is: same boxes, same kinds — and a
+    # rule kept uncompressed reproduces its own moments exactly, so it is `:cut_fitted` like any other.
+    plan_fitted, plan_raw = plan(fitted), plan(raw)
+    ncut = count(==(:cut_fitted), kinds(plan_fitted))
+    @test ncut > 0
+    @test [(r.lower, r.upper) for r in plan_raw.regions] == [(r.lower, r.upper) for r in plan_fitted.regions]
+    @test kinds(plan_raw) == kinds(plan_fitted)
+    @test calls[] == ncut
+    stats = Unfitted._kind_stats(plan_raw.regions)
+    @test (stats.cut, stats.failed, stats.fallbacks, stats.fallback_points) == (ncut, 0, 0, 0)
 
     # Points come back in the region's reference frame with the standard Jacobian folded out, so `Σ w_q · vol(box) / 2ᴰ`
-    # is the physical measure the rule integrates — here the whole box, since the rule ignores Ω.
-    for region in plan_custom.regions
-        region.kind === :cut_custom || continue
-        region_box = Unfitted._region_box(region)
-        jacobian = Unfitted.volume(region_box) / 4
-        @test sum(region.weights) * jacobian ≈ Unfitted.volume(region_box)
-        @test all(>=(0), region.weights)
+    # is the physical measure the rule integrates — here the whole box, since the rule ignores Ω. The compression is
+    # handed the caller's cut rule and reproduces its moments, the measure among them, at no more than the 5² points of
+    # the moment basis (order 2 at the default factor 2).
+    for compression in (nothing, Caratheodory(), NonnegativeFit())
+        for region in plan(physical_domain(geometry; settings..., cut_rule=tensor_rule, compression)).regions
+            region.kind === :cut_fitted || continue
+            region_box = Unfitted._region_box(region)
+            @test sum(region.weights) * Unfitted.volume(region_box) / 4 ≈ Unfitted.volume(region_box)
+            @test all(>=(0), region.weights)
+            @test length(region.weights) <= 25
+        end
     end
 
-    # A custom region is a cut region but never a fit failure: no fit ran, so there is no residual for
-    # `fit_failure_count` to report on.
-    stats = Unfitted._kind_stats(plan_custom.regions)
-    @test stats.cut == count(==(:cut_custom), kinds(plan_custom))
-    @test stats.failed == 0
-    @test stats.fallbacks == 0
-    @test stats.fallback_points == 0
+    # A caller's compression is called once per cut region, on the package's cut rule.
+    plan_counted = plan(physical_domain(geometry; settings..., compression=counted))
+    @test compressions[] == ncut
+    @test [r.weights for r in plan_counted.regions] == [r.weights for r in plan_fitted.regions]
 
-    # α blends the custom rule exactly as it blends a fit: the region carries `(1 − α)·custom ∪ α·tensor`, so the custom
-    # part is scaled, not replaced.
+    # α blends a caller's rule exactly as it blends the package's: the region carries `(1 − α)·rule ∪ α·tensor`, so the
+    # rule is scaled, not replaced.
     alpha = 0.25
-    blended = physical_domain(geometry; settings..., alpha=alpha, cut_quadrature=tensor_rule)
-    plan_blended = Unfitted.integration_plan(space(omega; cells=(4, 4), order=2, physical=blended))
-    strict = first(r for r in plan_custom.regions if r.kind === :cut_custom)
+    plan_blended = plan(physical_domain(geometry; settings..., alpha, cut_rule=tensor_rule, compression=nothing))
+    strict = first(r for r in plan_raw.regions if r.kind === :cut_fitted)
     mixed = first(r
                   for r in plan_blended.regions
-                  if r.kind === :cut_custom && (r.lower, r.upper) == (strict.lower, strict.upper))
+                  if r.kind === :cut_fitted && (r.lower, r.upper) == (strict.lower, strict.upper))
     n = length(strict.weights)
     @test length(mixed.weights) > n
     @test mixed.points[1:n] == strict.points
     @test mixed.weights[1:n] ≈ strict.weights .* (1 - alpha)
     @test all(>=(0), mixed.weights)
+
+    # A cut rule that finds nothing routes its region to the failure kinds exactly as an empty implicit rule does: no
+    # rule at α = 0, the α-scaled tensor rule alone at α > 0. Both count as failures, so they reach `fit_failure_count`.
+    nothing_found(physical, region_box::Unfitted.AxisBox{D,T}, moment_order) where {D,T} = (SVector{D,T}[], T[])
+    for (a, kind) in ((0.0, :cut_failed), (alpha, :cut_alpha_failed))
+        found = plan(physical_domain(geometry; settings..., alpha=a, cut_rule=nothing_found))
+        @test count(==(kind), kinds(found)) == ncut
+        @test Unfitted._kind_stats(found.regions).failed == ncut
+    end
 end
 
 @testset "an affine slice of the CSG tree is the geometry one dimension down" begin
@@ -873,8 +883,8 @@ end
         here = Unfitted._restrict_domain(physical_domain(plate; subcell_length_scale=scale), [(1, 0.0)])
         native = physical_domain(leaf(y -> y[1] - 0.55; lipschitz=sqrt(2.0)); subcell_length_scale=scale)
         interval = box((bounds[1],), (bounds[2],))
-        a_pts, a_ws, _, a_status = Unfitted.moment_fit_rule(here, interval, (order,))
-        b_pts, b_ws, _, b_status = Unfitted.moment_fit_rule(native, interval, (order,))
+        a_pts, a_ws, _, a_status = cut_cell_rule(here, interval, (order,))
+        b_pts, b_ws, _, b_status = cut_cell_rule(native, interval, (order,))
         @test a_pts == b_pts
         @test a_ws == b_ws
         @test a_status === b_status
@@ -887,7 +897,7 @@ end
     # ≤ 1.55 there, so the whole face is physical and the slice classifies `:full`.
     upper = Unfitted._restrict_domain(physical_domain(plate; subcell_length_scale=0.0625), [(1, 1.0)])
     @test classify_cell(upper, box((0.0,), (1.0,))) === :full
-    @test sum(Unfitted.moment_fit_rule(upper, box((0.0,), (1.0,)), (4,))[2]) ≈ 1.0 rtol = 1.0e-14
+    @test sum(cut_cell_rule(upper, box((0.0,), (1.0,)), (4,))[2]) ≈ 1.0 rtol = 1.0e-14
 
     # Codimension 2: two pins consumed in descending axis order, which is what keeps every remaining pin's index the one
     # the caller named. Consuming them the other way round would renumber the axes that survive the first restriction
@@ -905,21 +915,23 @@ end
     @test !Unfitted._inside(vertex.geometry, SVector{0,Float64}())
 end
 
-@testset "a slice preserves every field of the domain it slices" begin
-    # Built by direct struct construction precisely so that all eight fields come along: a face and the cells behind it
-    # then resolve the same geometry at the same accuracy, with the same α treatment and the same cut-cell rule. Routing
+@testset "a slice preserves every field of the domain it slices but the cut rule" begin
+    # Built by direct struct construction precisely so that the fields come along: a face and the cells behind it then
+    # resolve the same geometry at the same accuracy, with the same α treatment and the same compression. Routing
     # through `physical_domain` instead would mean re-passing seven keywords and submitting the slice to argument
     # validation that is about what a *caller* may ask for — its uncertified-leaf rejection, in particular, would fire
-    # on a tree the caller never wrote.
-    rule = (physical, region_box, moment_order) -> (SVector{1,Float64}[], Float64[], 0.0, :empty)
+    # on a tree the caller never wrote. The cut rule is the one field replaced: a caller's is a rule on a cell box in
+    # the model's own dimension, so a slice integrates with `implicit_rule`, which takes its dimension from its box.
+    rule = (physical, region_box, moment_order) -> (SVector{2,Float64}[], Float64[])
     p = physical_domain(leaf(x -> x[2] - 0.5; lipschitz=1.0); alpha=1.0e-3, keep_fictitious=true,
-                        subcell_length_scale=0.0125, max_depth=5, moment_order_factor=3, target_residual=1.0e-9,
-                        cut_quadrature=rule)
+                        subcell_length_scale=0.0125, max_depth=5, moment_order_factor=3, cut_rule=rule,
+                        compression=NonnegativeFit(; target_residual=1.0e-9))
     sliced = Unfitted._restrict_domain(p, [(1, 0.25)])
     for field in fieldnames(typeof(p))
-        field === :geometry && continue
+        field in (:geometry, :cut_rule) && continue
         @test getfield(sliced, field) === getfield(p, field)
     end
+    @test sliced.cut_rule === implicit_rule
     @test length(fieldnames(typeof(p))) == 8
     @test sliced isa Unfitted.PhysicalDomain
     @test isconcretetype(typeof(sliced))
@@ -974,7 +986,7 @@ end
     @test all(Unfitted._inside(leafwise.geometry, SVector(a, b)) == (levelset_value(collapsed, SVector(a, b)) <= 0)
               for a in 0.05:0.1:0.95, b in 0.05:0.1:0.95)
 
-    err(domain) = abs(sum(Unfitted.moment_fit_rule(domain, face, (4, 4))[2]) - 0.5)
+    err(domain) = abs(sum(cut_cell_rule(domain, face, (4, 4))[2]) - 0.5)
     @test err(leafwise) < 1.0e-13
     @test err(leafwise) < err(collapsed) / 3
 end
@@ -995,7 +1007,7 @@ end
         let ball = leaf(x -> 0.02 - sqrt((x[1] - 0.31337)^2 + (x[2] - 0.43731)^2 + x[3]^2); lipschitz=L),
             p = physical_domain(ball; subcell_length_scale=scale)
 
-            sum(Unfitted.moment_fit_rule(Unfitted._restrict_domain(p, [(3, 0.0)]), face, (4, 4))[2])
+            sum(cut_cell_rule(Unfitted._restrict_domain(p, [(3, 0.0)]), face, (4, 4))[2])
         end
     @test measure(1.0, 0.01) ≈ 1 - π * 0.02^2 rtol = 1.0e-6
     @test all(isapprox(measure(Inf, scale), 1.0; rtol=1.0e-14) for scale in (1.0, 0.1, 0.01))
@@ -1163,5 +1175,5 @@ end
     cache = Unfitted._MomentFitCache{2,Float64}()
     Unfitted.integration_plan(V; moment_fit_cache=cache)
     @test length(cache) > 8
-    @test all(isequal(value, Unfitted._fit_rule(V.physical, key..., nothing)) for (key, value) in cache)
+    @test all(isequal(value, Unfitted._fit_rule(V.physical, key...)) for (key, value) in cache)
 end

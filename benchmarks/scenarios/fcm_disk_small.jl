@@ -2,7 +2,7 @@ using BenchmarkTools
 using Unfitted
 
 # A small circular-FCM regression scenario. The `prepare` bench is the most useful FCM regression signal here: it
-# triggers the cell-level classification fold and the NNMF moment-fit for every cut region.
+# triggers the cell-level classification fold and the cut rule and its compression for every cut region.
 group = SUITE["scenarios"]["fcm_disk_small"] = BenchmarkGroup()
 
 let
