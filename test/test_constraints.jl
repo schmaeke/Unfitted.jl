@@ -1649,13 +1649,12 @@ end
 
     # 3. A curved cut face, where the rule is accurate rather than exact. The space-time cavity's t = 0 slice is the
     #    disc of radius r₀ = 0.1373 about (0.4967, 0.5013) inside the central cell of a 3×3 grid, so the face measure is
-    #    the analytic 1 − π r₀². The moment fit on the slice reaches it to 3.0e-5, which is the honest ceiling on a
-    #    curved cut face and the reason no docstring here promises exactness. That figure tracks how the fit draws its
-    #    candidate points, so it moves when `fcm.jl` does — it was 1.9e-5 before the candidate budget was spent in full
-    #    and drawn without a stride, on the same geometry and with the same residual. Hence the band below, which is
-    #    deliberately loose enough to survive that without being loose enough to miss a trim that stopped trimming: the
-    #    analytic value it is anchored against does not move, and the assertion beside it holds the error *away* from
-    #    zero.
+    #    the analytic 1 − π r₀². The rule on the slice reaches it to 5.9e-8 — never exactly, the boundary being curved,
+    #    which is why no docstring here promises exactness. The figure tracks the implicit kernel: it was 3.0e-5 before
+    #    the kernel kept its height axes clear of folds (`_FOLD_CLEARANCE`), since a closed disc inside one cell puts a
+    #    fold of every axis close to the sub-boxes it bisects into. Hence the band below, which is deliberately loose
+    #    enough to survive such a change without being loose enough to miss a trim that stopped trimming: the analytic
+    #    value it is anchored against does not move, and the assertion beside it holds the error *away* from zero.
     #
     #    And it is insensitive to the geometric-robustness knobs: `_choose_axis` declares the sliced sub-boxes
     #    graph-like and stops bisecting, so driving `subcell_length_scale` from 1/12 to 1/192 (effective depth 2 → 6) or
@@ -1669,15 +1668,13 @@ end
             space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(3, 3, 3), order=(2, 2, 3), physical=dom)
         end
     initial = measure(slab(1 / 12, 8), [(3, :lower)])
-    @test initial ≈ 1 - π * r₀^2 atol = 5.0e-5
-    @test abs(initial - (1 - π * r₀^2)) > 1.0e-6          # accurate, not exact
+    @test initial ≈ 1 - π * r₀^2 atol = 2.0e-7
+    @test abs(initial - (1 - π * r₀^2)) > 1.0e-9          # accurate, not exact
     @test measure(slab(1 / 192, 8), [(3, :lower)]) == initial
     @test measure(slab(1 / 12, 2), [(3, :lower)]) == initial
-    # The t = T face is cut by the grown cavity too, against its own analytic value 1 − π r(T)², so the slab is not a
-    # geometry in which only one face can see the restriction. It comes out nearly two orders of magnitude *better* than
-    # t = 0 (3.9e-7 against 3.0e-5) because the larger disc spans nine cells instead of one, so each cut region sees a
-    # shallower arc — which is the convergence this error does have. The uncut side faces stay exactly 1.0: the trimming
-    # touches the faces the level set reaches and no others.
+    # The t = T face is cut by the grown cavity too, against its own analytic value 1 − π r(T)² — reached to 3.9e-7 — so
+    # the slab is not a geometry in which only one face can see the restriction. The uncut side faces stay exactly 1.0:
+    # the trimming touches the faces the level set reaches and no others.
     @test measure(slab(1 / 12, 8), [(3, :upper)]) ≈ 1 - π * (r₀ + ṙ)^2 atol = 1.0e-6
     @test measure(slab(1 / 12, 8), [(1, :lower)]) ≈ 1.0 rtol = 1.0e-14
     @test measure(slab(1 / 12, 8), [(2, :upper)]) ≈ 1.0 rtol = 1.0e-14
