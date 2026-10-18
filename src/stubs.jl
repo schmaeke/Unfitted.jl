@@ -717,7 +717,8 @@ edges:
     no drawn cell of a later level lies over it, and an edge two cells of one level share is drawn once. The axis keeps
     the data's aspect ratio. To see one level whole, its cells under the overlays included, pass its id as `levels`.
   - **1D.** Each level is a row of segments at the height of its level id, the base at the bottom, with a tick at every
-    cell end, so that the levels read as a ladder over the domain.
+    cell end, so that the levels read as a ladder over the domain. The vertical axis labels every level of the model,
+    of which it shows the ones in view, so that the rows stay labelled whatever `levels` or `field` picks later.
 
 Keyword arguments, which are the plot's attributes:
 

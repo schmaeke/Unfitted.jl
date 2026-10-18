@@ -334,7 +334,7 @@ Makie.preferred_axis_type(p::FieldPlot{<:Tuple{Any,<:Model{2}}}) = p.warp[] ? Ma
 Makie.preferred_axis_type(::Union{LevelPlot,QuadraturePlot,FieldPlot}) = Makie.Axis
 Makie.preferred_axis_attributes(::Type{Makie.Axis}, ::_PlotOf{2}) = (; aspect=Makie.DataAspect())
 function Makie.preferred_axis_attributes(::Type{Makie.Axis}, p::LevelPlot{<:Tuple{<:Model{1}}})
-    return (; ylabel="level", yticks=_drawn_level_ids(p.discretisation[], p.field[], p.levels[]))
+    return (; ylabel="level", yticks=_level_rows(p.discretisation[]))
 end
 Makie.preferred_axis_attributes(::Type{Makie.Axis}, ::QuadraturePlot{<:Tuple{<:Model{1}}}) = (; ylabel="weight")
 function Makie.preferred_axis_attributes(::Type{Makie.Axis}, p::FieldPlot{<:Tuple{Any,<:Model{1}}})
@@ -344,18 +344,11 @@ function Makie.preferred_axis_attributes(::Type{Makie.Axis3}, p::FieldPlot{<:Tup
     return (; aspect=_warped_aspect(p.discretisation[], p.field[]), zlabel=_field_label(p))
 end
 
-# The ids of the levels a 1D level plot draws, which are its rows: the levels of the drawn fields' spaces, as
-# `_sample_levels` meshes them, picked by `levels`. Read off the spaces rather than off the meshes, so that the axis
-# samples nothing; a `levels` the plot cannot use is left to the plot's own refusal.
-function _drawn_level_ids(model::Model, field, levels)
-    ids = Int[]
-    for fld in Unfitted._sampled_fields(model, field), level in fld.space.levels
-        level.id in ids || push!(ids, level.id)
-    end
-    picked = levels isa Integer ? (levels,) : levels
-    picked isa Union{Tuple,AbstractVector} && filter!(in(picked), ids)
-    return sort!(ids)
-end
+# The rows a 1D level plot's axis labels: every level of the model, by id. The axis is made once, with the plot, and
+# Makie shows the ticks that lie in view, so labelling every row the model has keeps the rows labelled whatever
+# `levels` and `field` pick, then or later. Read off the spaces rather than off the meshes, so that the axis samples
+# nothing.
+_level_rows(model::Model) = sort!(unique!([level.id for fld in model.problem.fields for level in fld.space.levels]))
 
 # The name of the quantity a field plot shows, for its axis: the array `by` names, `value` for a callback, and the
 # component picked, if one is.
@@ -390,7 +383,7 @@ Makie.extract_colormap(p::QuadraturePlot) = Makie.extract_colormap(only(c for c 
 # into a vector of a type fixed by the records', whatever is picked, as a computed value of a plot must be.
 function _drawn_levels(records::Vector{@NamedTuple{field::Field,level::Int,role::Symbol,grid::G}}, levels,
                        inactive::Bool) where {G}
-    ids = _drawn_ids(records, levels)
+    ids = _picked_levels(levels, [record.level for record in records])
     drawn = @NamedTuple{id::Int, grid::G, keep::BitVector}[]
     for record in records
         record.level in ids || continue
@@ -408,17 +401,17 @@ function _cell_colors(model::Model{D}, records, drawn, by) where {D}
     return Float64[values[level.id][c] for level in drawn for c in findall(level.keep) for _ in 1:(1<<D)]
 end
 
-# The ids of the levels to draw: every level's, or those `levels` names, each of which must be a level of the records.
-_drawn_ids(records, ::Nothing) = [record.level for record in records]
-function _drawn_ids(records, levels)
+# The ids of the levels `levels` picks among the `available` ones, in their order: every one for `nothing`, or those
+# it names — one id, or any collection of ids — each of which must be available.
+function _picked_levels(levels, available::Vector{Int})
+    levels === nothing && return available
     ids = levels isa Integer ? (levels,) : levels
-    available = [record.level for record in records]
-    ids isa Union{Tuple,AbstractVector} && all(id -> id isa Integer, ids) ||
+    applicable(iterate, ids) && all(id -> id isa Integer, ids) ||
         throw(ArgumentError("levels must be nothing, a level id or a collection of level ids; got $(repr(levels))"))
     all(in(available), ids) ||
         throw(ArgumentError("levels = $(repr(levels)) names a level the drawn space does not have: its levels are " *
                             join(available, ", ")))
-    return ids
+    return filter(in(ids), available)
 end
 
 # The value that colours each cell of each level, in the records' order: one of the record's integer cell arrays,

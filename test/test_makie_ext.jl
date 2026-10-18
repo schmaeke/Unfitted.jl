@@ -145,7 +145,9 @@ end
     plt = levelplot(_makie_2d; levels=2).plot
     @test _GB.coordinates(plt.cell_geometry[]) == _expected_2d(records[2:2], _by_array(records[2:2], "order_max"))[1]
     @test all(x -> x[3] == -1, _GB.coordinates(plt.cell_geometry[]))
-    @test levelplot(_makie_2d; levels=[1, 2]).plot.cell_geometry[] == levelplot(_makie_2d).plot.cell_geometry[]
+    for every in ([1, 2], (2, 1), Set([1, 2]), 1:2)                # any collection of ids, drawn in level order
+        @test levelplot(_makie_2d; levels=every).plot.cell_geometry[] == levelplot(_makie_2d).plot.cell_geometry[]
+    end
 
     # An attribute changed on a drawn plot redraws it. Another `by` recolours the cells without meshing the levels or
     # cutting their edges again.
@@ -257,7 +259,15 @@ end
     @test ax isa Makie.Axis
     @test ax.yticks[] == [1, 2]
     @test ax.ylabel[] == "level"
-    @test levelplot(_makie_1d; levels=2).axis.yticks[] == [2]          # the rows are the drawn levels
+    # The axis labels every level of the model and shows the labels in view, which follow the levels drawn, now and
+    # after a change: a plot of level 2 alone shows its one row's label, and that plot drawn whole shows both.
+    fig, ax, picked = levelplot(_makie_1d; levels=2)
+    @test ax.yticks[] == [1, 2]
+    Makie.update_state_before_display!(fig)
+    @test ax.yaxis.tickvalues[] == [2]
+    picked.levels = nothing
+    Makie.update_state_before_display!(fig)
+    @test ax.yaxis.tickvalues[] == [1, 2]
     segments, ticks = Makie.Point2{Float64}[], Makie.Point2{Float64}[]
     colors = Float64[]
     for record in records, c in 1:Unfitted._cell_count(record.grid)
