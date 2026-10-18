@@ -262,9 +262,9 @@ of them, and a cloud that already holds the whole rule is not drawn again. `targ
 retry; whether the rule is used is decided by [`moment_fit_rule`](@ref) against its failure threshold.
 
 Choose it over the default where its solve on a bounded cloud pays: on a cut rule of 10⁵ points or more at a low moment
-order it is the faster of the two (0.04 s against 0.11 s at moment order (4, 4, 4) on 3.4·10⁵ points), and it reproduces
-the moments to 1e-15 rather than 1e-13. Everywhere else `Caratheodory` is faster, returns fewer points and needs no
-target.
+order it is the faster of the two (0.04 s against 0.10 s at moment order (4, 4, 4) on 3.4·10⁵ points), and it reproduces
+the moments to 1e-15 rather than 1e-13. Wherever else a cell takes more than 10 ms, `Caratheodory` is the faster — 3×
+at moment order (8, 8, 8) — returns fewer points and needs no target.
 """
 struct NonnegativeFit
     target_residual::Float64
@@ -343,14 +343,15 @@ cut rule is first reduced by recombination (Litterer & Lyons): its points are gr
 contiguous runs of a rule the kernel emits fiber by fiber and so spatially coherent; the clusters' moment vectors are
 pruned instead — at most `length(basis)` survive — and each surviving cluster's weights are scaled by its coefficient.
 That halves the points at the cost of one moment sum over them and a few factorisations of a `length(basis) ×
-2 length(basis)` matrix, and repeats until at most `2 · length(basis)` points remain, which are pruned directly. The
-largest matrix formed is the `2 length(basis)`-square basis of that factorisation, however many points the cut rule has.
+2 length(basis)` matrix, and repeats until at most `2 · length(basis)` points remain, which are pruned directly. No
+matrix it forms is larger than `2 length(basis)` square, however many points the cut rule has, and none of its work
+calls BLAS, so it runs on every thread of a plan build without competing with BLAS threads for the cores.
 
 Measured against [`NonnegativeFit`](@ref) on the same cut rules — 34 cells in 2D and 3D at moment orders 2–12: disc,
-sliver, polytope-corner and perforated cells — Carathéodory took 2.4 s altogether against 7.7 s, and 0.91 s against
-5.2 s at moment order (8, 8, 8) where both cost most. It returned 5% fewer points, fewer wherever the cell's moment
-matrix is numerically rank-deficient: 559 against 660 of the 729 a ball's cut cell admits. Its moments matched to
-3e-13 at worst, and no pruning pass of the 192 those cells took drifted far enough to be undone.
+sliver, polytope-corner and perforated cells — Carathéodory took 3.4 s altogether against 7.8 s, and 1.7 s against
+5.2 s at moment order (8, 8, 8) where both cost most. It returned 3% fewer points, fewer wherever the cell's moment
+matrix is numerically rank-deficient: 594 against 660 of the 729 a ball's cut cell admits. Its moments matched to
+3e-13 at worst, and no pruning pass of the 182 those cells took drifted far enough to be undone.
 
   - C. Carathéodory, "Über den Variabilitätsbereich der Fourier'schen Konstanten von positiven harmonischen
     Funktionen", Rend. Circ. Mat. Palermo 32 (1911) 193–217, doi:10.1007/BF03014795.
@@ -386,12 +387,9 @@ end
 # Carathéodory's theorem, constructively: reduce the non-negative coefficients `λ` of the combination `S λ` of the
 # columns of `S`, in place, to at most `rank S` positive ones, leaving `S λ` unchanged to round-off.
 #
-# Each pass factors `S` on the current support for an orthonormal basis of its null space and walks the coefficients
-# along it (`_walk!`). The walks share one factorisation, which is what makes a pass cheap and also what can make it
-# inexact: eliminating a removed column from the vectors still to come compounds round-off, the more so at a small
-# pivot. A pass is therefore checked: if it moved `S λ` by more than `_PRUNE_DRIFT` of its norm, it is undone and only
-# the first vector of the fresh basis is walked — a unit null vector to round-off, whose walk cannot drift. Every pass
-# removes at least one column, so the pruning ends, at the latest when the support has no null space left.
+# Each pass factors `S` on the current support for a basis of its null space (`_nullspace`) and walks the coefficients
+# along it, checked (`_prune_pass!`). Every pass removes at least one column, so the pruning ends, at the latest when
+# the support has no null space left.
 #
 # A coefficient below `eps · max λ` is round-off left by a walk, and is dropped before the support is factored: kept, it
 # would be one more column for the null space to find at that scale.
@@ -401,26 +399,114 @@ function _prune!(λ::AbstractVector{T}, S::AbstractMatrix{T}) where {T}
         support = findall(>(0), λ)
         isempty(support) && return λ
         A = S[:, support]
-        V = nullspace(A)
+        V = _nullspace(A)
         size(V, 2) == 0 && return λ
-        μ = λ[support]
-        before = A * μ
-        _walk!(μ, V)
-        if norm(A * μ - before) > _PRUNE_DRIFT * norm(before)
-            μ .= view(λ, support)
-            _walk!(μ, view(V, :, 1:1))
-        end
-        λ[support] .= μ
+        λ[support] .= _prune_pass!(λ[support], A, V)
     end
 end
 
+# One pass of `_prune!`: walk `μ` along every column of `V`, a basis of the null space of `A` (`_walk!`). The walks
+# share one factorisation, which is what makes a pass cheap and also what can make it inexact: eliminating a removed
+# coefficient from the vectors still to come compounds round-off, the more so at a small pivot. The pass is therefore
+# checked: if it moved `A μ` by more than `_PRUNE_DRIFT` of its norm, it is undone and only the first column of `V` is
+# walked — a null vector no elimination has touched, whose walk cannot drift.
+function _prune_pass!(μ::AbstractVector{T}, A::AbstractMatrix{T}, V::AbstractMatrix{T}) where {T}
+    μ₀ = copy(μ)
+    before = _matvec(A, μ)
+    _walk!(μ, V)
+    norm(_matvec(A, μ) - before) <= _PRUNE_DRIFT * norm(before) && return μ
+    μ .= μ₀
+    return _walk!(μ, view(V, :, 1:1))
+end
+
 # The largest change a pruning pass may make to the combination it prunes, relative to its norm, before the pass is
-# replaced by a single walk. Above the round-off of a sound pass — none of the 192 passes on the 34 cells measured at
+# replaced by a single walk. Above the round-off of a sound pass — none of the 182 passes on the 34 cells measured at
 # `Caratheodory` reached it, their rules matching to 3e-13 at worst — and below what an ill-conditioned matrix makes of
-# one. Over monomials of points crowded towards one end, a search found pruning without the guard ending up to 1.3e-8
-# from where it began, and with it never more than 7.4e-12; the `_prune!` tests carry one such input (8.6e-10 without
-# the guard, 2.3e-13 with it).
+# one: over monomials of random points, 64 of them at 128 points crowded towards one end, single passes moved the
+# combination by up to 3.3e-9, and the pruning with the guard ended within 1.0e-11 of where it began throughout.
 const _PRUNE_DRIFT = 1.0e-11
+
+# A basis of the null space of `A` (n × m): the columns of an m × (m − r) matrix, r the numerical rank of `A`.
+#
+# Householder QR with column pivoting, A P = Q [R₁₁ R₁₂; 0 R₂₂] (P. Businger, G. H. Golub, "Linear least squares
+# solutions by Householder transformations", Numer. Math. 7 (1965) 269–276, doi:10.1007/BF01436084), stopped where the
+# largest column left has norm at most min(n, m) · eps times the largest of `A` — the rank cut LinearAlgebra's
+# `nullspace` makes on the singular values. Q is never formed: `A` and `[R₁₁ R₁₂]` share their null space, which the
+# columns of P [−R₁₁⁻¹ R₁₂; I] span. The walks need null vectors, not orthonormal ones, so this basis serves them as an
+# SVD's would, without the SVD's cost: to read off the last m − r columns of V, it forms all of V, m × m. The norms of
+# the columns left are recomputed in the sweep that applies each reflector, rather than downdated, so no pivot is chosen
+# on a cancelled norm.
+#
+# Written out rather than taken from LAPACK because `_prune!` runs on every thread of a plan build: LAPACK's `gesdd`
+# calls threaded BLAS kernels on matrices this small, whose workers then compete with the plan's threads for the cores.
+function _nullspace(A::AbstractMatrix{T}) where {T}
+    n, m = size(A)
+    R = Matrix{T}(A)
+    perm = collect(1:m)
+    colnorm = [sqrt(sum(abs2, view(R, :, l))) for l in 1:m]
+    tol = min(n, m) * eps(T) * maximum(colnorm; init=zero(T))
+    r = 0
+    @inbounds for j in 1:min(n, m)
+        c = j - 1 + argmax(view(colnorm, j:m))
+        colnorm[c] <= tol && break
+        if c != j
+            for i in 1:n
+                R[i, j], R[i, c] = R[i, c], R[i, j]
+            end
+            perm[j], perm[c] = perm[c], perm[j]
+            colnorm[j], colnorm[c] = colnorm[c], colnorm[j]
+        end
+        # The reflector I − v vᵀ / (α v₁), v = x + α e₁ with α = sign(x₁) ‖x‖, takes x = R[j:n, j] to −α e₁; v is stored
+        # in place of x while the columns to its right are reflected.
+        α = copysign(colnorm[j], R[j, j])
+        R[j, j] += α
+        β = α * R[j, j]
+        for l in (j+1):m
+            s = zero(T)
+            @simd for i in j:n
+                s += R[i, j] * R[i, l]
+            end
+            s /= β
+            R[j, l] -= s * R[j, j]
+            left = zero(T)
+            @simd for i in (j+1):n
+                R[i, l] -= s * R[i, j]
+                left += abs2(R[i, l])
+            end
+            colnorm[l] = sqrt(left)
+        end
+        R[j, j] = -α
+        r = j
+    end
+    # Back-substitute R₁₁⁻¹ R₁₂ in place of R₁₂, a column of R₁₁ at a time, and scatter it through P.
+    N = zeros(T, m, m - r)
+    @inbounds for c in axes(N, 2)
+        x = view(R, 1:r, r + c)
+        for i in r:-1:1
+            x[i] /= R[i, i]
+            @simd for h in 1:(i-1)
+                x[h] -= x[i] * R[h, i]
+            end
+        end
+        N[perm[r+c], c] = one(T)
+        for i in 1:r
+            N[perm[i], c] = -x[i]
+        end
+    end
+    return N
+end
+
+# `A x`, in pure Julia for the reason `_nullspace` gives: at the sizes `_prune!` meets, BLAS runs it threaded.
+function _matvec(A::AbstractMatrix{T}, x::AbstractVector{T}) where {T}
+    y = zeros(T, size(A, 1))
+    @inbounds for j in axes(A, 2)
+        xj = x[j]
+        @simd for i in axes(A, 1)
+            y[i] += A[i, j] * xj
+        end
+    end
+    return y
+end
 
 # Walk the coefficients `μ` along the columns of `V`, a basis of the null space on `μ`'s support: along each, in the
 # direction with the larger positive entry, until the first coefficient reaches zero — the ratio test over the live

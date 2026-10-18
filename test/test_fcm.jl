@@ -428,18 +428,22 @@ end
     @test count(>(0), λ) <= 8
     @test norm(M * λ - target) <= 1.0e-11 * norm(target)
 
-    # A pass that drifts is undone. Crowd the points harder and the monomial matrix is ill-conditioned enough that the
-    # eliminations one pass makes in its null-space basis compound round-off: walked as a single pass, this input moves
-    # the combination by 8.6e-10 of its norm. That pass is replaced by one walk along a fresh null vector
-    # (`_PRUNE_DRIFT`), and the pruning ends 2e-13 from where it began.
-    x = [mod(j * (√5 - 1) / 2, 1)^8 for j in 1:60]
-    M = [xj^(a - 1) for a in 1:12, xj in x]
-    λ = [10.0^(-16 * mod(j * √2, 1)) for j in 1:60]
-    target = M * λ
-    Unfitted._prune!(λ, M)
-    @test all(>=(0), λ)
-    @test count(>(0), λ) <= 12
-    @test norm(M * λ - target) <= 1.0e-11 * norm(target)
+    # A pass that drifts is undone. The basis below is exact in its first column and pushed off the null space by 1e-6
+    # in the others, as eliminations that compounded round-off would leave it — which on clustered monomials they do
+    # (`_PRUNE_DRIFT`), though on no moment matrix measured — so walking it through moves `A μ` far past the guard. The
+    # pass is replaced by the walk along the first column alone: one coefficient fewer, and `A μ` kept to round-off.
+    x = range(0.05, 0.95; length=12)
+    A = [xj^(a - 1) for a in 1:4, xj in x]
+    V = nullspace(A)
+    V[:, 2:end] .+= 1.0e-6 .* sin.(1:12)
+    μ = 1 .+ cos.(1:12) .^ 2
+    target = A * μ
+    walked = Unfitted._walk!(copy(μ), copy(V))
+    @test norm(A * walked - target) > 1.0e3 * Unfitted._PRUNE_DRIFT * norm(target)     # the premise: a drifting pass
+    Unfitted._prune_pass!(μ, A, V)
+    @test all(>=(0), μ)
+    @test count(>(0), μ) == 11
+    @test norm(A * μ - target) <= 1.0e-14 * norm(target)
 end
 
 @testset "FCM — a cut rule or compression with a negative weight is refused" begin
@@ -479,6 +483,21 @@ end
     p = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=0.1, cut_rule=zero_rule, compression=never)
     @test Unfitted.moment_fit_rule(p, box((0.0, 0.0), (1.0, 1.0)), (2, 2)) ==
           (SVector{2,Float64}[], Float64[], 0.0, :empty)
+end
+
+@testset "FCM — `_nullspace` is a basis of the null space at the numerical rank" begin
+    # Wide, the shape `_prune!` factors; with repeated rows; zero; tall; and in Float32. The rank is clear in each, so
+    # the basis has as many columns as LinearAlgebra's SVD-based `nullspace` finds, they are independent, and the matrix
+    # annihilates them to round-off.
+    x = range(-1, 1; length=30)
+    V = [xj^(a - 1) for a in 1:8, xj in x]
+    for A in (V, V[[1, 2, 3, 2, 1, 4], :], zeros(5, 9), V[:, 1:6], Float32.(V))
+        N = Unfitted._nullspace(A)
+        @test eltype(N) === eltype(A)
+        @test size(N) == size(nullspace(A))
+        @test rank(N) == size(N, 2)
+        @test norm(A * N) <= 10 * eps(eltype(A)) * norm(A) * norm(N)
+    end
 end
 
 @testset "FCM — NonnegativeFit refuses a non-positive target" begin

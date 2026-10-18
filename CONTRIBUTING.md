@@ -1104,10 +1104,11 @@ indicator representations are intentionally not supported.
     at least half of them drop per round — until at most `2 · nbasis`
     points are left, and prunes those directly, each pruning walking along
     null vectors of the moment matrix until a weight reaches zero; the
-    largest matrix it forms is the `2 nbasis`-square null-space basis of
-    one pruning, however many points the cut rule has, it has no
-    user-facing tolerance or retry, and it stops at the matrix's numerical
-    rank, below `nbasis` on a sliver. `NonnegativeFit` runs a Lawson–Hanson NNLS solve
+    null vectors come from a pivoted Householder QR written in Julia, so
+    no BLAS call runs inside the threaded plan build; no matrix it forms
+    is larger than `2 nbasis` square, however many points the cut rule
+    has, it has no user-facing tolerance or retry, and it stops at the
+    matrix's numerical rank, below `nbasis` on a sliver. `NonnegativeFit` runs a Lawson–Hanson NNLS solve
     (`NonNegLeastSquares.jl`) that selects ≤ `nbasis` non-negative weights
     from a candidate cloud drawn by even fractional spacing over the cut
     rule (an integer stride aliases against the fiber Gauss count and draws
