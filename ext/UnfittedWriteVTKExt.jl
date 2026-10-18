@@ -136,15 +136,14 @@ function _vtk_multiblock(base::AbstractString, solution::Solution, model::Model{
                          append::Bool=true, compress=true, level_meshes::Bool=true, field=nothing, kwargs...) where {D}
     _check_vtk_dimension(Val(D))
     records = _sample_fields(solution, model; field, kwargs...)
-    meshes = level_meshes ? _sample_levels(model; field) : nothing
+    meshes = level_meshes ? _sample_levels(model; field) : ()
     vtm = vtk_multiblock(base * ".vtm")
     for (i, record) in enumerate(records)
         block = multiblock_add_block(vtm, string(record.field.name))
         leaf = length(records) == 1 ? "data" : "data_$i"
         _add_dataset!(block, base, leaf, leaf, record.grid; ascii, append, compress)
-        meshes === nothing && continue
         for mesh in meshes
-            mesh.field.name === record.field.name || continue
+            mesh.field === record.field || continue
             label = "level_$(mesh.level)_$(mesh.role)"
             _add_dataset!(block, base, label, label * "_mesh", mesh.grid; ascii, append, compress)
         end
