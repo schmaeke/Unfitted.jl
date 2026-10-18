@@ -463,7 +463,7 @@ ParaView's Extract Block (whose data-assembly node names keep only ASCII identif
 its own even when the field names themselves are Unicode (`θ₁`, `θ₂`).
 
 $(_SAMPLING_KEYWORDS_DOC)
-The writer's own keywords:
+The writer samples at `subdivisions = :degree` unless told otherwise, and takes keywords of its own:
 
   - `point_data` — `NamedTuple` / `Dict` / `Tuple` of `name => callback` pairs, each a sampling callback (see "Sampling
     callbacks" below) invoked at every vertex sample. Defaults to a single `uh` entry that emits the current solution
@@ -488,14 +488,14 @@ Returns the path of every file written: the `.vtm` first, then the datasets in b
 memory and written, its directory included, only once it is complete: a call that fails — on a keyword it refuses, or in
 a callback that throws — leaves nothing on disk.
 
+To write a *sequence* of these bundles as one animation — a moving overlay, an adaptive ladder, a time-dependent
+solution — open a [`vtk_series`](@ref) and call this function with it in place of a path.
+
 Requires `using WriteVTK`, which loads the package extension the VTK writers live in. A call made without it raises an
 error that says so, and writes nothing.
 
 $(_SAMPLING_CALLBACK_DOC)
-$(_IMMERSED_BOUNDARY_DOC)
-To write a *sequence* of these bundles as one animation — a moving overlay, an adaptive ladder, a time-dependent
-solution — open a [`vtk_series`](@ref) and call this function with it in place of a path.
-"""
+$(_SAMPLING_BOUNDARY_DOC)"""
 write_vtk(args...; kwargs...) = _extension_missing(write_vtk, args, "WriteVTK")
 
 """
@@ -685,7 +685,7 @@ is refused with an `ArgumentError`: write it with [`write_vtk`](@ref) and look a
 Requires Makie, which each of its backends loads, as for [`levelplot`](@ref).
 
 $(_SAMPLING_CALLBACK_DOC)
-$(_IMMERSED_BOUNDARY_DOC)"""
+$(_SAMPLING_BOUNDARY_DOC)"""
 function fieldplot end
 
 """

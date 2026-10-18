@@ -11,13 +11,21 @@
 # All of them share the overlay-zero-extension convention: a level whose mesh does not cover a point contributes zero
 # there. That mirrors the assembly contract from `CONTRIBUTING.md`'s "The superposition model" section.
 #
-# The consumers are package extensions. The one shipped is the VTK writer, `ext/UnfittedWriteVTKExt.jl`, which
-# `using WriteVTK` loads: [`write_vtk`](@ref) serialises the records of a `(solution, model)` pair as a ParaView
-# multiblock bundle, [`vtk_series`](@ref) collects a sequence of those bundles into a `.pvd` collection, so a feature
-# that moves — and the mesh that follows it — can be watched over time, and [`write_quadrature_vtm`](@ref) writes the
-# quadrature-point cloud, for inspecting where the integration regions land. Everything VTK-specific — cell types,
-# padding to three components, the number types VTK stores, the multiblock layout, the file names — is decided there and
-# nowhere else; the entry points themselves are declared and documented in `stubs.jl`.
+# The consumers are package extensions, and two ship:
+#
+#   * **The VTK writer**, `ext/UnfittedWriteVTKExt.jl`, which `using WriteVTK` loads: [`write_vtk`](@ref) serialises the
+#     records of a `(solution, model)` pair as a ParaView multiblock bundle, [`vtk_series`](@ref) collects a sequence of
+#     those bundles into a `.pvd` collection, so a feature that moves — and the mesh that follows it — can be watched
+#     over time, and [`write_quadrature_vtm`](@ref) writes the quadrature-point cloud, for inspecting where the
+#     integration regions land.
+#   * **The plots**, `ext/UnfittedMakieExt.jl`, which any Makie backend loads: [`fieldplot`](@ref) draws the field
+#     records of a 1D or 2D model, with or without a solution, [`levelplot`](@ref) its level meshes and
+#     [`quadratureplot`](@ref) its quadrature cloud.
+#
+# Everything specific to a format or a front end — for VTK the cell types, the padding to three components, the number
+# types VTK stores, the multiblock layout and the file names; for Makie the primitives, the colours, the cut at ∂Ω and
+# the axes — is decided in its extension and nowhere else; the entry points themselves are declared and documented in
+# `stubs.jl`.
 #
 # ## The record contract
 #
@@ -53,16 +61,12 @@
 #   * `_sample_quadrature(model)` — one `(; signature, grid::SampleGrid{D,T,0})` per sorted covering-level signature, in
 #     sorted order, with the point array `weight`.
 #
-# A consumer reads a record as it is, without permuting or re-deriving anything. A plotting front end on Makie, for
-# one, draws a 2D grid `g` coloured by its first point array, and a quadrature-cloud entry `e` coloured by its weights,
-# as
-#
-#     faces = [QuadFace(4c - 3, 4c - 2, 4c - 1, 4c) for c in 1:_cell_count(g)]
-#     mesh(GeometryBasics.Mesh(Point2.(g.points), faces); color=last(g.point_data[1]))
-#     scatter(Point2.(e.grid.points); color=last(only(e.grid.point_data)))
-#
-# the quads wrapped in a `GeometryBasics.Mesh`, which Makie's `mesh` triangulates, where it refuses a bare list of quad
-# faces. Such a consumer's public functions are declared and documented in `stubs.jl`, as the VTK writer's are.
+# A consumer reads a record as it is, without permuting or re-deriving anything; `ext/UnfittedMakieExt.jl` is the
+# worked example of one that draws them. Besides the records, a consumer reads the core internals that state their
+# rules, so that it neither repeats nor contradicts them: `_cell_count(grid)`; `_sampled_fields(model, field)`, the
+# fields a sampling covers, and `_fields_by_space(model, field)`, those grouped by the space they share; and
+# `_default_point_data(solution)`, the entries a field sampling takes when given none. A consumer's public functions
+# are declared and documented in `stubs.jl`, as the shipped ones are.
 
 # ── Sample records ────────────────────────────────────────────────────────────
 
@@ -108,18 +112,18 @@ end
 
 # ── The sampling keywords, as a user reads them ───────────────────────────────
 #
-# The keywords of `_sample_fields` belong to every public entry point that samples a model, and each of those documents
-# the ones it takes in full. These three texts are that documentation, spliced into each such docstring
+# The keywords of `_sample_fields` belong to every public entry point that samples a model's fields — not to those that
+# draw or write only the level meshes or the quadrature cloud, which take none — and each such entry point documents
+# them in full. These three texts are that documentation, spliced into each such docstring
 # (`$(_SAMPLING_KEYWORDS_DOC)`), so that the entry points read alike and cannot drift apart: the keywords that decide
-# where the model is sampled, which every such entry point takes; the contract of a sampling callback, which
-# `write_vtk`'s `point_data` and `cell_data` and `fieldplot`'s `by` each refer to; and the section on the immersed
-# boundary the keywords' `cut_depth` refers to. The two sections come after the keywords, in that order, in every
-# docstring. What a consumer adds on top — keywords of its own and their defaults, what its format can or cannot hold —
-# its docstring states around them. Written for that reader: no consumer is named except as an example, and nothing here
-# is a promise about one.
+# where the fields are sampled; the contract of a sampling callback, which `write_vtk`'s `point_data` and `cell_data`
+# and `fieldplot`'s `by` each refer to; and the section on the immersed boundary the keywords' `cut_depth` refers to.
+# The two sections come after the keywords, in that order, in every docstring. What a consumer adds on top — keywords
+# of its own and their defaults, what its format can or cannot hold — its docstring states around them. Written for
+# that reader: no consumer is named except as an example, and nothing here is a promise about one.
 
 const _SAMPLING_KEYWORDS_DOC = """
-Sampling keywords, shared by every entry point that samples a model:
+Sampling keywords, which decide where a model's fields are sampled:
 
   - `field` — sample a single [`Field`](@ref), or the one its name `Symbol` names; defaults to every field of the model.
   - `subdivisions` — per-region subdivision count, sized to resolve the *solution*: `:degree` uses each region's parent
@@ -154,7 +158,7 @@ the `region` box, the emitted `cell` box, the covering `parents` — each with t
 `x` into a cell's own frame — and the `model_version` the samples were taken from.
 """
 
-const _IMMERSED_BOUNDARY_DOC = """
+const _SAMPLING_BOUNDARY_DOC = """
 ## Resolving the immersed boundary
 
 For models whose [`Space`](@ref) carries a [`PhysicalDomain`](@ref), the level-set values `φ(x)` are attached at every
@@ -192,9 +196,9 @@ smooth face; an `∩`-corner stays comparatively more faceted at any given depth
 
 # ── Field sampling ────────────────────────────────────────────────────────────
 
-# The records of a solution's data: one `(; field, grid)` per sampled field, in output order — every field in problem
-# order, or the one `field` names — with `grid` the field's sample grid (`_sample_field`). The meshes of the fields'
-# levels are records of their own (`_sample_levels`).
+# The data records of a model's fields: one `(; field, grid)` per sampled field, in output order — every field in
+# problem order, or the one `field` names — with `grid` the field's sample grid (`_sample_field`). The meshes of the
+# fields' levels are records of their own (`_sample_levels`).
 #
 # The one entry of the field sampling and its one keyword surface: a consumer passes every keyword it does not consume
 # on to this function, and the keywords mean what `_SAMPLING_KEYWORDS_DOC` documents, the entries' callbacks what

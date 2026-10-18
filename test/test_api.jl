@@ -249,7 +249,7 @@ end
     # `write_vtk` and `fieldplot` document the sampling keywords, the contract of a sampling callback and the
     # immersed-boundary section the keywords' `cut_depth` refers to with the texts every entry point that samples a
     # model splices into its docstring whole, in that order.
-    shared = (Unfitted._SAMPLING_KEYWORDS_DOC, Unfitted._SAMPLING_CALLBACK_DOC, Unfitted._IMMERSED_BOUNDARY_DOC)
+    shared = (Unfitted._SAMPLING_KEYWORDS_DOC, Unfitted._SAMPLING_CALLBACK_DOC, Unfitted._SAMPLING_BOUNDARY_DOC)
     for name in (:write_vtk, :fieldplot)
         text = only(filter(t -> occursin(first(shared), t),
                            [join(doc.text) for doc in values(meta[Base.Docs.Binding(Unfitted, name)].docs)]))
