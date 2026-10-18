@@ -1,8 +1,8 @@
-# Post-processing: what every consumer of a solved model shares, in two parts.
+# Post-processing: what every consumer of a discretisation and its solution shares, in two parts.
 #
-#   * **Sampling.** A solution, the meshes of its levels and the quadrature-point cloud are sampled into
-#     consumer-neutral records, so that every consumer reads the same geometry and the same arrays rather than
-#     re-deriving them. The contract is below.
+#   * **Sampling.** A model and a solution on it are sampled into consumer-neutral records — the solution's data, the
+#     meshes of the levels and the quadrature-point cloud — so that every consumer reads the same geometry and the same
+#     arrays rather than re-deriving them. The contract is below.
 #   * **Solution evaluation.** [`value`](@ref) and [`field_gradient`](@ref) evaluate the superposed solution at
 #     arbitrary physical points; [`l2_error`](@ref) computes an analytic / manufactured-solution error over the model's
 #     own integration plan; [`boundary_integral`](@ref) integrates a callback over a portion of the boundary or an
@@ -35,17 +35,20 @@
 #     was computed in, `Bool` included: a consumer maps what its format cannot hold (the VTK writer pads a 2-vector to
 #     three components and writes a `Bool` as `UInt8`).
 #
-# Two internal entry points produce records, on demand and without caching them or touching the file system:
+# Three internal entry points produce records, on demand and without caching them or touching the file system. Each
+# samples one thing, and a consumer combines the ones it shows:
 #
-#   * `_sample_fields(solution, model; field, subdivisions, cut_depth, point_data, cell_data, level_meshes)`, whose
-#     keywords mean what `write_vtk` documents — one `(; field, data, meshes)` per sampled field, in problem order.
-#     `data::SampleGrid{D,T,D}` covers the integration regions the field was solved on, each region its `subdivisions`
+#   * `_sample_fields(solution, model; field, subdivisions, cut_depth, point_data, cell_data)`, whose keywords mean
+#     what `write_vtk` documents — one `(; field, data)` per sampled field, in problem order.
+#     `data::SampleGrid{D,T,D}` covers the integration regions of the field's space, each region its `subdivisions`
 #     lattice with the boxes ∂Ω crosses cut-refined; its point arrays are the user's `point_data` entries in their
 #     order, then `level_set` (with a `PhysicalDomain`, unless an entry already has that name); its cell arrays are
-#     `region_id` and `cover_count`, then the user's `cell_data` entries. `meshes` holds one `(; level, role, grid)`
-#     per level of the field's space, in `space.levels` order — empty when `level_meshes = false`, or when an earlier
-#     record already carries the space — and each `grid` covers every cell of its level, active or not, with the `Int`
-#     cell arrays `level_id`, `role_id`, `order_max`, `cell_id`, `active`, `covered`, `active_dofs`, `reduced_dofs`.
+#     `region_id` and `cover_count`, then the user's `cell_data` entries. `solution = nothing` samples the
+#     discretisation alone: no `point_data` entry by default, and a callback that evaluates the solution raises.
+#   * `_sample_levels(model; field)` — one `(; field, level, role, grid::SampleGrid{D,T,D})` per level of each sampled
+#     field's space, in problem order and then `space.levels` order, a space several fields share meshed once, under
+#     the first of them. Each `grid` covers every cell of its level, active or not, with the `Int` cell arrays
+#     `level_id`, `role_id`, `order_max`, `cell_id`, `active`, `covered`, `active_dofs`, `reduced_dofs`.
 #   * `_sample_quadrature(model)` — one `(; signature, grid::SampleGrid{D,T,0})` per sorted covering-level signature, in
 #     sorted order, with the point array `weight`.
 #
@@ -104,18 +107,20 @@ end
 
 # ── Field sampling ────────────────────────────────────────────────────────────
 
-# The records of a solution's data: one `(; field, data, meshes)` per sampled field, in output order — every field in
-# problem order, or the one `field` names. `data` is the field's sample grid (`_sample_field`). `meshes` holds the
-# `(; level, role, grid)` records of its space's levels, in `space.levels` order (`_level_grid`); it is empty with
-# `level_meshes = false`, and for a space an earlier record already carries, so fields sharing a space have its meshes
-# once, under the first of them, whose layout the dof counts are read from — the convention `diagnostics` follows for
-# its per-level counts. That is decided here rather than by each consumer, which would otherwise have to repeat it.
+# The records of a solution's data: one `(; field, data)` per sampled field, in output order — every field in problem
+# order, or the one `field` names — with `data` the field's sample grid (`_sample_field`). The meshes of the fields'
+# levels are records of their own (`_sample_levels`).
 #
-# The one entry of the sampling layer and its one keyword surface: a writer passes every keyword it does not consume
+# The one entry of the field sampling and its one keyword surface: a consumer passes every keyword it does not consume
 # on to this function, and the keywords mean what `write_vtk` documents. The keywords, the solution's pin and the
 # entries' containers are checked before anything is sampled, a callback's values as they are collected, and nothing
 # touches the file system. One workspace and one `FormState` serve every field: the fields are sampled one after
 # another, and each field's accessor frames the regions it reads on its own (`_sample_accessor`).
+#
+# `solution = nothing` samples a discretisation that has not been solved: its regions, their sample cells and the
+# built-in arrays, with no `point_data` entry by default. A callback can still read its arguments, but one that
+# evaluates the solution through `u` raises, and the sampling checks out neither a workspace nor a `FormState`, since
+# nothing reads them.
 #
 # The records are collected by an explicit loop into a vector of their concrete type, so a consumer reads them
 # type-stably whatever inference made of the workspace, whose type is not inferable from the model
@@ -123,36 +128,29 @@ end
 # abstract one sent inference through the whole serialiser with the grids' dimension and cell kind unknown — measured
 # on the first `write_vtk` of a two-level 2D overlay, 2721 code instances inferred and 549 methods compiled, against
 # 1549 and 406 with the loop.
-function _sample_fields(solution::Solution, model::Model{D,T}; field=nothing, subdivisions=:degree, cut_depth=3,
-                        point_data=_default_point_data(), cell_data=NamedTuple(), level_meshes::Bool=true) where {D,T}
+function _sample_fields(solution::Union{Nothing,Solution}, model::Model{D,T}; field=nothing, subdivisions=:degree,
+                        cut_depth=3, point_data=_default_point_data(solution), cell_data=NamedTuple()) where {D,T}
     depth = _cut_depth_budget(cut_depth)
-    state = FormState(model.dofs, _state_vector(solution, model))
+    coefficients = _state_vector(solution, model)
     fields = _sampled_fields(model, field)
     entries = (point=_sample_entries(point_data, :point_data), cell=_sample_entries(cell_data, :cell_data))
     rule = _subdivision_rule(subdivisions, Val(D))
-    ws, meshed = _assembly_workspace(model), Space[]
-    MeshRecord = @NamedTuple{level::Int, role::Symbol, grid::SampleGrid{D,T,D}}
-    records = @NamedTuple{field::Field, data::SampleGrid{D,T,D}, meshes::Vector{MeshRecord}}[]
+    ws, state = coefficients === nothing ? (nothing, nothing) :
+                (_assembly_workspace(model), FormState(model.dofs, coefficients))
+    records = @NamedTuple{field::Field, data::SampleGrid{D,T,D}}[]
     for fld in fields
         space = _field_space(model.problem, fld.name)
-        regions = _region_list(model, nothing, space).regions     # the list the solve integrated the field over
+        regions = _region_list(model, nothing, space).regions     # the list assembly integrates the field over
         data = _sample_field(ws, state, space, regions, fld, rule, depth, entries, model.version)
-        meshes = MeshRecord[]
-        if level_meshes && !any(s -> s === space, meshed)
-            dofs = _field_layout(model.dofs, fld.name).dofs
-            coverage = build_coverage(space, dofs.tolerance)
-            for level in space.levels
-                push!(meshes, (; level=level.id, level.role, grid=_level_grid(level, dofs, coverage)))
-            end
-        end
-        push!(meshed, space)
-        push!(records, (; field=fld, data, meshes))
+        push!(records, (; field=fld, data))
     end
     return records
 end
 
-# The default `point_data`: one entry, `uh`, the solution value at every point.
-_default_point_data() = (uh=(u, c, x, xi) -> u(c, xi),)
+# The default `point_data`: one entry, `uh`, the solution value at every point — and none for a discretisation sampled
+# without a solution, which has no value to show.
+_default_point_data(::Solution) = (uh=(u, c, x, xi) -> u(c, xi),)
+_default_point_data(::Nothing) = NamedTuple()
 
 # Resolve the `cut_depth` keyword to a non-negative bisection budget. Checked first, so a rejected value costs no
 # sampling and, like every other refusal, leaves nothing on disk.
@@ -221,8 +219,8 @@ end
 # and `_sample_array` is the only method that matches, so without the barrier inference descends into it with the
 # callback unknown and infers the collection loop and the value checks for an unknown value, code that never runs: on
 # the first `write_vtk` of a two-level 2D overlay, 67 more code instances inferred.
-function _sample_field(ws, state::FormState, space::Space{D,T}, regions::Vector{VolumeRegion{D,T}}, fld::Field, rule,
-                       depth::Int, entries, version::Int) where {D,T}
+function _sample_field(ws, state::Union{Nothing,FormState}, space::Space{D,T}, regions::Vector{VolumeRegion{D,T}},
+                       fld::Field, rule, depth::Int, entries, version::Int) where {D,T}
     boxes, region_ids = _sample_cells(space, regions, rule, depth)
     points = Vector{SVector{D,T}}(undef, length(boxes) << D)
     for (c, b) in pairs(boxes)
@@ -387,6 +385,15 @@ function _sample_accessor(ws, state::FormState, regions, default::Field)
     end
 end
 
+# The `u` of a sampling without a solution (`_sample_fields(nothing, model)`): there is no value to read, so a callback
+# that asks for one raises, naming the remedy, rather than reading zeros the user would take for a solution.
+function _sample_accessor(_, ::Nothing, _, default::Field)
+    return function (context, xi, field::Field=default)
+        throw(ArgumentError("u(context, xi) evaluates the solution, and this sampling has none: pass the solution " *
+                            "to sample its values"))
+    end
+end
+
 # One user entry's array over a walk: the callback at every sample, each value checked as it comes (`_sample_value`),
 # collected into the narrowest array that holds them. A function barrier — the one dynamic call per entry — so the loop
 # runs on the callback's and the accessor's concrete types. The array takes the first value's type, which is every
@@ -454,6 +461,32 @@ end
 _levelset_values(physical::PhysicalDomain, points, ::Type{T}) where {T} = T[levelset_value(physical, x) for x in points]
 
 # ── Level meshes ──────────────────────────────────────────────────────────────
+
+# The records of the meshes of the sampled fields' levels: one `(; field, level, role, grid)` per level of each sampled
+# field's space — every field in problem order, or the one `field` names — in `space.levels` order, with `grid` the
+# level's mesh (`_level_grid`). A space several sampled fields share is meshed once, under the first of them, whose dof
+# layout the per-cell dof counts are read from — the convention `diagnostics` follows for its per-level counts — so a
+# consumer that groups the meshes by field shows every level once. That is decided here rather than by each consumer,
+# which would otherwise have to repeat it. Level ids are unique across the subdomains of a coupled model, so `level`
+# names a level of the whole model.
+#
+# The meshes are the discretisation's, so no solution is needed: a model can be meshed before it is solved. Collected
+# by an explicit loop into a vector of their concrete type, as `_sample_fields` collects its records.
+function _sample_levels(model::Model{D,T}; field=nothing) where {D,T}
+    records = @NamedTuple{field::Field, level::Int, role::Symbol, grid::SampleGrid{D,T,D}}[]
+    meshed = Space[]
+    for fld in _sampled_fields(model, field)
+        space = _field_space(model.problem, fld.name)
+        any(s -> s === space, meshed) && continue
+        push!(meshed, space)
+        dofs = _field_layout(model.dofs, fld.name).dofs
+        coverage = build_coverage(space, dofs.tolerance)
+        for level in space.levels
+            push!(records, (; field=fld, level=level.id, level.role, grid=_level_grid(level, dofs, coverage)))
+        end
+    end
+    return records
+end
 
 # The record of one level's mesh: every cell of the level, active or not, in `cell_indices` order, as a `K = D` grid
 # with eight integer cell arrays that make the pruning visible in ParaView:

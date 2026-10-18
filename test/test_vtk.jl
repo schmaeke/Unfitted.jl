@@ -309,17 +309,17 @@ _pin_1d = _pin_model(space(box((0.0,), (1.0,)); cells=2, order=1))
 _pin_3d = _pin_model(space(box((0.5, -1.0, 2.0), (1.5, 0.25, 4.0)); cells=1, order=1))
 
 @testset "pin: a bundle's datasets are its records, as VTK stores them" begin
-    # The writer samples nothing itself: the data grid and each level mesh of a bundle are the records `_sample_fields`
-    # returns, serialised — the points padded to three coordinates, the cells in record order over the implicit
-    # connectivity, and every array, scalar or vector, holding the record's values. With the record tests of
-    # `test_postprocessing.jl` this pins what a bundle shows end to end.
+    # The writer samples nothing itself: the data grid of a bundle is the record `_sample_fields` returns and each level
+    # mesh the record `_sample_levels` returns, serialised — the points padded to three coordinates, the cells in record
+    # order over the implicit connectivity, and every array, scalar or vector, holding the record's values. With the
+    # record tests of `test_postprocessing.jl` this pins what a bundle shows end to end.
     _, model, solution = _cut_depth_disk_model()
     keywords = (subdivisions=2, cut_depth=2, cell_data=(region=(u, c, x, xi) -> c.region_id,),
                 point_data=(uh=(u, c, x, xi) -> u(c, xi), xy=(u, c, x, xi) -> (x[1], x[2])))
     dir = mktempdir()
     write_vtk(joinpath(dir, "rec"), solution, model; keywords..., _pin_ascii...)
-    (; data, meshes) = only(Unfitted._sample_fields(solution, model; keywords...))
-    records = ("rec_data.vtu" => data, "rec_level_1_base_mesh.vtu" => only(meshes).grid)
+    records = ("rec_data.vtu" => only(Unfitted._sample_fields(solution, model; keywords...)).data,
+               "rec_level_1_base_mesh.vtu" => only(Unfitted._sample_levels(model)).grid)
     for (file, grid) in records
         xml = read(joinpath(dir, file), String)
         n = length(grid.points)

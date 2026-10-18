@@ -404,7 +404,7 @@ end
 
     # The `order_max` cell array of the level's mesh is the p-field visualisation for free: each cell's own order, in
     # `cell_indices` order.
-    (; grid) = only(only(Unfitted._sample_fields(u, src; point_data=NamedTuple())).meshes)
+    (; grid) = only(Unfitted._sample_levels(src))
     @test Dict(grid.cell_data)["order_max"] == vec([2 + (i + j) % 2 for i in 1:4, j in 1:4])
 end
 

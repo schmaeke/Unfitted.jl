@@ -1626,8 +1626,9 @@ demos.
     writer's bundles, series and quadrature clouds as serialisations of
     the consumer-neutral sampling records (`test_vtk.jl`), the records
     themselves — the sample cells and their cut refinement, the arrays
-    and their element types, the refusals — as records, with no writer
-    loaded (`test_postprocessing.jl`), and, in a fresh process that loads
+    and their element types, the refusals, a discretisation sampled
+    without a solution — as records, with no writer loaded
+    (`test_postprocessing.jl`), and, in a fresh process that loads
     Unfitted alone, the writer's entry points asking for
     `using WriteVTK` without writing anything or loading WriteVTK
     (`test_api.jl`).

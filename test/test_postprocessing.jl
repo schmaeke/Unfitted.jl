@@ -457,11 +457,11 @@ _pin_2d = _pin_model(overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 1), or
 end
 
 @testset "records: a level's mesh" begin
-    # One record per level of the sampled field's space, covering every cell of the level with the eight integer cell
-    # arrays and no point array.
-    _, model, sol = _cut_depth_disk_model()
-    level = only(only(Unfitted._sample_fields(sol, model)).meshes)
-    @test (level.level, level.role) == (1, :base)
+    # One record per level, filed under the field whose space it belongs to, covering every cell of the level with the
+    # eight integer cell arrays and no point array.
+    _, model, _ = _cut_depth_disk_model()
+    level = only(Unfitted._sample_levels(model))
+    @test (level.field.name, level.level, level.role) == (only(model.problem.fields).name, 1, :base)
     @test Unfitted._cell_count(level.grid) == 4
     @test isempty(level.grid.point_data)
     @test first.(level.grid.cell_data) ==
@@ -482,11 +482,12 @@ end
     records = Unfitted._sample_fields(sol, model; subdivisions=:none, point_data=NamedTuple())
     @test [r.field.name for r in records] == [:a, :b]
     @test all(r -> isempty(r.data.point_data), records)
-    @test [[m.level for m in r.meshes] for r in records] == [[1], Int[]]
-    @test _record_array(only(first(records).meshes).grid, "active_dofs") == fill(1, 4)
-    picked = only(Unfitted._sample_fields(sol, model; field=b, subdivisions=:none))
-    @test _record_array(only(picked.meshes).grid, "active_dofs") == fill(4, 4)
-    @test isempty(only(Unfitted._sample_fields(sol, model; field=b, level_meshes=false)).meshes)
+    meshes = Unfitted._sample_levels(model)
+    @test [(m.field.name, m.level) for m in meshes] == [(:a, 1)]
+    @test _record_array(only(meshes).grid, "active_dofs") == fill(1, 4)
+    picked = only(Unfitted._sample_levels(model; field=b))
+    @test (picked.field.name, picked.level) == (:b, 1)
+    @test _record_array(picked.grid, "active_dofs") == fill(4, 4)
 end
 
 @testset "records: the quadrature cloud weighs each signature's regions" begin
@@ -504,6 +505,30 @@ end
         @test sum(last(only(grid.point_data))) ≈ measure rtol = 1.0e-13
     end
     @test sum(entry -> length(entry.grid.points), cloud) == nquadpoints(model)
+end
+
+@testset "records: a discretisation is sampled without a solution" begin
+    # An unsolved model has its regions, their sample cells, its level meshes and its quadrature cloud; only the values
+    # of a solution are missing. Sampled without one, the data grid is the solved one less the default `uh` entry, a
+    # callback that reads only its arguments still runs, and one that evaluates the solution is refused naming the
+    # remedy rather than handed zeros.
+    _, model, sol = _cut_depth_disk_model()
+    keywords = (subdivisions=2, cut_depth=1)
+    solved = only(Unfitted._sample_fields(sol, model; keywords...)).data
+    bare = only(Unfitted._sample_fields(nothing, model; keywords...)).data
+    @test first.(bare.point_data) == ["level_set"]
+    @test _record_contents(bare) == (solved.points, solved.point_data[2:end], solved.cell_data)
+    plain = only(Unfitted._sample_fields(nothing, model; point_data=(x1=(u, c, x, xi) -> x[1],))).data
+    @test _record_array(plain, "x1") == first.(plain.points)
+    err = try
+        Unfitted._sample_fields(nothing, model; point_data=(uh=(u, c, x, xi) -> u(c, xi),))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("pass the solution", err === nothing ? "" : sprint(showerror, err))
+    @test [(m.level, m.role) for m in Unfitted._sample_levels(model)] == [(1, :base)]
 end
 
 @testset "a sampling callback reads only fields of the sampled field's own subdomain" begin
@@ -594,9 +619,8 @@ end
     active[2, 2] = true
     V = overlay(V, box((0.1, 0.1), (0.9, 0.9)); cells=(3, 3), order=1, active=active)
     model = prepare(poisson(V; source=0.0))
-    sol = solution(model, ones(active_unknowns(model)))
 
-    base, top = only(Unfitted._sample_fields(sol, model)).meshes
+    base, top = Unfitted._sample_levels(model)
     @test (base.level, base.role, Unfitted._cell_count(base.grid)) == (1, :base, 1)
     @test (top.level, top.role, Unfitted._cell_count(top.grid)) == (2, :overlay, 9)
     @test _record_array(base.grid, "active") == [1]
@@ -610,8 +634,7 @@ end
     V = overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(4, 4), order=2), box((0.25, 0.25), (0.75, 0.75));
                 cells=(4, 4), order=3)
     model = prepare(mass(V))
-    sol = solution(model, ones(active_unknowns(model)))
-    base = first(only(Unfitted._sample_fields(sol, model)).meshes)
+    base = first(Unfitted._sample_levels(model))
     @test base.role === :base
     covered = _record_array(base.grid, "covered")
     reduced = _record_array(base.grid, "reduced_dofs")

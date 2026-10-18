@@ -28,7 +28,7 @@ a keyword it refuses, or in a callback that throws — leaves nothing on disk.
 module UnfittedWriteVTKExt
 
 using Unfitted
-using Unfitted: SampleGrid, Solution, Model, VTKSeries, _sample_fields, _sample_quadrature, _cell_count
+using Unfitted: SampleGrid, Solution, Model, VTKSeries, _sample_fields, _sample_levels, _sample_quadrature, _cell_count
 using StaticArrays: SVector
 using WriteVTK
 
@@ -47,8 +47,8 @@ end
 # ── Public VTK export ─────────────────────────────────────────────────────────
 #
 # The methods behind the entry points declared and documented in `src/stubs.jl`. Each samples the records first
-# (`_sample_fields`, `_sample_quadrature`), checking every keyword and callback value, builds the whole multiblock in
-# memory, and only then makes the output directory and writes the files.
+# (`_sample_fields` and `_sample_levels`, or `_sample_quadrature`), checking every keyword and callback value, builds
+# the whole multiblock in memory, and only then makes the output directory and writes the files.
 
 function Unfitted.write_vtk(path::AbstractString, solution::Solution, model::Model; kwargs...)
     base = _vtk_base_path(path)
@@ -119,28 +119,32 @@ end
 
 # The multiblock of one bundle rooted at `base`, sampled and built and still open: nothing is on disk until the caller
 # saves it, or hands it to a series' collection, which saves it. The one keyword surface of both `write_vtk` methods:
-# it takes `ascii`, `append` and `compress` for `vtk_grid` and passes every other keyword to `_sample_fields`, after the
-# dimension check, so a bundle and a series frame are refused, sampled and serialised alike.
+# it takes `ascii`, `append` and `compress` for `vtk_grid` and `level_meshes` for the shape of the bundle, and passes
+# `field`, which selects the level meshes too, and every other keyword to `_sample_fields`, after the dimension check,
+# so a bundle and a series frame are refused, sampled and serialised alike.
 #
-# One field block per record, named after its field and holding that field's data grid and the level meshes the record
-# carries as sibling leaf datasets, so a coupled field is a self-contained, independently toggled unit in ParaView:
-# `<field> → { data, level_… }`. The children of a field block are all leaves — never a mix of a leaf and a sub-block,
-# which breaks ParaView's Extract-Block resolution — and every leaf's disambiguating name part is ASCII. ParaView
-# derives its data-assembly node names from the dataset names and keeps only ASCII identifier characters, so a Unicode
-# field name (`θ₁`, `θ₂`), or a name disambiguated only by Unicode digits, collapses to one node and the blocks become
-# indistinguishable. The data leaf is keyed by the ASCII record index (`data_<i>`, plain `data` when there is one
-# record), NOT by the field name, and the meshes by the ASCII level id (`level_<id>_<role>`). The field name is still
-# the block label, where a Unicode collision is harmless: the user extracts leaves.
+# One field block per data record, named after its field and holding that field's data grid and the level meshes
+# `_sample_levels` files under it as sibling leaf datasets, so a coupled field is a self-contained, independently
+# toggled unit in ParaView: `<field> → { data, level_… }`. The children of a field block are all leaves — never a mix of
+# a leaf and a sub-block, which breaks ParaView's Extract-Block resolution — and every leaf's disambiguating name part
+# is ASCII. ParaView derives its data-assembly node names from the dataset names and keeps only ASCII identifier
+# characters, so a Unicode field name (`θ₁`, `θ₂`), or a name disambiguated only by Unicode digits, collapses to one
+# node and the blocks become indistinguishable. The data leaf is keyed by the ASCII record index (`data_<i>`, plain
+# `data` when there is one record), NOT by the field name, and the meshes by the ASCII level id (`level_<id>_<role>`).
+# The field name is still the block label, where a Unicode collision is harmless: the user extracts leaves.
 function _vtk_multiblock(base::AbstractString, solution::Solution, model::Model{D}; ascii::Bool=false,
-                         append::Bool=true, compress=true, kwargs...) where {D}
+                         append::Bool=true, compress=true, level_meshes::Bool=true, field=nothing, kwargs...) where {D}
     _check_vtk_dimension(Val(D))
-    records = _sample_fields(solution, model; kwargs...)
+    records = _sample_fields(solution, model; field, kwargs...)
+    meshes = level_meshes ? _sample_levels(model; field) : nothing
     vtm = vtk_multiblock(base * ".vtm")
     for (i, record) in enumerate(records)
         block = multiblock_add_block(vtm, string(record.field.name))
         leaf = length(records) == 1 ? "data" : "data_$i"
         _add_dataset!(block, base, leaf, leaf, record.data; ascii, append, compress)
-        for mesh in record.meshes
+        meshes === nothing && continue
+        for mesh in meshes
+            mesh.field.name === record.field.name || continue
             label = "level_$(mesh.level)_$(mesh.role)"
             _add_dataset!(block, base, label, label * "_mesh", mesh.grid; ascii, append, compress)
         end
