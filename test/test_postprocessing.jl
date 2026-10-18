@@ -425,17 +425,18 @@ function _cut_depth_disk_model()
 end
 
 # A mass model on `V` and a solution with distinct coefficients, so that no two dofs carry the same value.
-function _pin_model(V)
+function _solved_mass(V)
     model = prepare(mass(V))
     return (; V, model, sol=solution(model, [sin(i) for i in 1:active_unknowns(model)]))
 end
 
 # Two cells of per-cell anisotropic orders (1, 2) and (3, 1), with an order-(1, 3) overlay over the right one, so the
 # right region has two parents and `:degree` takes the per-axis maximum (3, 3) over them.
-_pin_2d = _pin_model(overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 1), order=reshape([(1, 2), (3, 1)], 2, 1)),
-                             box((0.5, 0.0), (1.0, 1.0)); cells=1, order=(1, 3)))
+_anisotropic_2d = let base = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 1), order=reshape([(1, 2), (3, 1)], 2, 1))
+    _solved_mass(overlay(base, box((0.5, 0.0), (1.0, 1.0)); cells=1, order=(1, 3)))
+end
 
-@testset "records: a sampled field's data grid" begin
+@testset "a sampled field's data grid" begin
     phi_disk, model, sol = _cut_depth_disk_model()
     width = (u, c, x, xi) -> c.cell.upper[1] - c.cell.lower[1]
     (; field, grid) = only(Unfitted._sample_fields(sol, model; subdivisions=2, cut_depth=1, cell_data=(width=width,)))
@@ -456,7 +457,7 @@ _pin_2d = _pin_model(overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 1), or
     @test _record_array(grid, "width") == [grid.points[4c - 2][1] - grid.points[4c - 3][1] for c in 1:n]
 end
 
-@testset "records: a level's mesh" begin
+@testset "a level's mesh" begin
     # One record per level, filed under the field whose space it belongs to, covering every cell of the level with the
     # eight integer cell arrays and no point array.
     _, model, _ = _cut_depth_disk_model()
@@ -469,7 +470,7 @@ end
     @test all(entry -> last(entry) isa Vector{Int} && length(last(entry)) == 4, level.grid.cell_data)
 end
 
-@testset "records: fields sharing a space carry its level meshes once" begin
+@testset "fields sharing a space carry its level meshes once" begin
     # Two fields on one space, the Dirichlet condition on `a` alone: the space's one level is meshed once, under the
     # first sampled field, and its per-cell dof counts are that field's — on `a` the boundary vertices are constrained
     # and each cell keeps the one interior vertex, on `b` every vertex is active.
@@ -492,11 +493,11 @@ end
     @test _record_array(picked.grid, "active_dofs") == fill(4, 4)
 end
 
-@testset "records: the quadrature cloud weighs each signature's regions" begin
+@testset "the quadrature cloud weighs each signature's regions" begin
     # One vertex cloud per sorted covering-level signature, in sorted order. Its weights are the physical quadrature
     # weights, so they sum to the measure of that signature's regions — the left region of the two-cell mesh is covered
     # by the base level alone, the right one by the base and the overlay.
-    (; model) = _pin_2d
+    (; model) = _anisotropic_2d
     cloud = Unfitted._sample_quadrature(model)
     @test [record.signature for record in cloud] == [[1], [1, 2]]
     regions = Unfitted.integration_plans(model)[1].regions
@@ -509,7 +510,7 @@ end
     @test sum(record -> length(record.grid.points), cloud) == nquadpoints(model)
 end
 
-@testset "records: a discretisation is sampled without a solution" begin
+@testset "a discretisation is sampled without a solution" begin
     # An unsolved model has its regions, their sample cells, its level meshes and its quadrature cloud; only the values
     # of a solution are missing. Sampled without one, the data grid is the solved one less the default `uh` entry, a
     # callback that reads only its arguments still runs, and one that evaluates the solution is refused naming the
@@ -793,9 +794,9 @@ end
     end
 end
 
-@testset "pin: :degree subdivides each region at its parents' per-axis maximum order" begin
+@testset ":degree subdivides each region at its parents' per-axis maximum order" begin
     # The left region (one parent, order (1, 2)) is cut 1 × 2; the right one (orders (3, 1) and (1, 3)) 3 × 3.
-    (; model, sol) = _pin_2d
+    (; model, sol) = _anisotropic_2d
     grid = only(Unfitted._sample_fields(sol, model)).grid
     covers = _record_array(grid, "cover_count")
     @test Unfitted._cell_count(grid) == 11
@@ -803,17 +804,17 @@ end
     @test count(==(2), covers) == 9
 end
 
-@testset "pin: subdivisions as an NTuple sets the per-axis counts" begin
-    (; model, sol) = _pin_2d
+@testset "subdivisions as an NTuple sets the per-axis counts" begin
+    (; model, sol) = _anisotropic_2d
     grid = only(Unfitted._sample_fields(sol, model; subdivisions=(2, 3))).grid
     @test Unfitted._cell_count(grid) == 12             # two regions, 2 × 3 each
     @test all(==(0.25), _cell_extents(grid, 1))
     @test all(h -> h ≈ 1 / 3, _cell_extents(grid, 2))
 end
 
-@testset "pin: point_data and cell_data as a Dict or a tuple of Pairs" begin
+@testset "point_data and cell_data as a Dict or a tuple of Pairs" begin
     # The three spellings of the entries sample the same arrays; only their order in the record is the container's.
-    (; model, sol) = _pin_2d
+    (; model, sol) = _anisotropic_2d
     uh = (u, c, x, xi) -> u(c, xi)
     tilt = (u, c, x, xi) -> x[1] - 2 * x[2]
     width = (u, c, x, xi) -> c.cell.upper[1] - c.cell.lower[1]
@@ -827,11 +828,11 @@ end
     end
 end
 
-@testset "pin: the element type each callback value shape is sampled in" begin
+@testset "the element type each callback value shape is sampled in" begin
     # A record holds a value unpadded and in the type it was computed in, `Bool` included: a tuple becomes the `SVector`
     # of its components, promoted to one type, and the values of one entry are promoted over every sample. What a
     # format cannot store, its consumer maps.
-    (; model, sol) = _pin_2d
+    (; model, sol) = _anisotropic_2d
     shapes = (pair=(u, c, x, xi) -> (x[1], x[2]), mixed_tuple=(u, c, x, xi) -> (1, x[1], 2),
               vector=(u, c, x, xi) -> SVector(x[1], x[2], 1.0), int_vector=(u, c, x, xi) -> SVector(1, 2, c.region_id),
               mixed=(u, c, x, xi) -> c.region_id == 1 ? 1 : 0.5, int=(u, c, x, xi) -> c.region_id,
@@ -851,7 +852,7 @@ end
     # Converting every SVector to the first sample's type refused a fractional value after an integer first sample
     # (`InexactError`) and rounded every `Float64` value after a `Float32` one. Region 1 is walked first here, so its
     # value is the first sample's.
-    (; model, sol) = _pin_2d
+    (; model, sol) = _anisotropic_2d
     first_int = (u, c, x, xi) -> c.region_id == 1 ? SVector(1, 2) : SVector(x[1], x[2] / 3)
     first_single = (u, c, x, xi) -> c.region_id == 1 ? SVector(0.5f0, 0.25f0) : SVector(x[1] / 3, x[2] / 3)
     for (f, region_one, other) in
@@ -870,7 +871,7 @@ end
     # return, before any consumer sees it, and without naming the keyword the entry came in, which is a consumer's. A
     # real value is not refused whatever its type: a `Rational` is sampled as a `Rational`, and whether a format can
     # store it is its consumer's question.
-    (; model, sol) = _pin_2d
+    (; model, sol) = _anisotropic_2d
     refused = [(:point_data, "vector", (u, c, x, xi) -> [x[1], x[2], 0.0]),          # a Vector, not an SVector
                (:point_data, "matrix", (u, c, x, xi) -> SMatrix{2,2}(x[1], 0.0, 0.0, x[2])),
                (:point_data, "text", (u, c, x, xi) -> "text"),

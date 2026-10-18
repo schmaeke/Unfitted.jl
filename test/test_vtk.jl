@@ -3,8 +3,8 @@ using WriteVTK      # loads UnfittedWriteVTKExt, which provides write_vtk, vtk_s
 
 # The VTK writer's tests: what it makes of the records `src/postprocessing.jl` samples — the files, their layout, the
 # cell types, the number types and the padding — and what it refuses. The records themselves are pinned in
-# `test_postprocessing.jl`, whose fixtures `_cut_depth_disk_model`, `_pin_model` and `_pin_2d` the tests below reuse;
-# `runtests.jl` includes that file first, and this one does not stand alone.
+# `test_postprocessing.jl`, whose fixtures `_cut_depth_disk_model`, `_solved_mass` and `_anisotropic_2d` the tests
+# below reuse; `runtests.jl` includes that file first, and this one does not stand alone.
 
 # Parse one `<DataArray>` back out of an ASCII `.vtu`/`.vtp` by name, so the tests can assert the numbers ParaView will
 # show. Requires `ascii=true, append=false` on the write; the appended-binary form carries no parsable text.
@@ -303,10 +303,10 @@ _vtu_piece(xml, attribute) = parse(Int, match(Regex("<Piece[^>]*$attribute=\"(\\
 _pin_ascii = (ascii=true, append=false, compress=false)
 
 # 1D: two order-1 cells. 3D: one order-1 cell of an off-origin box with unequal edges, so every corner of it has
-# distinct coordinates. The 2D model, `_pin_2d` — two cells of per-cell anisotropic orders under a one-cell overlay — is
-# `test_postprocessing.jl`'s, as is `_pin_model`.
-_pin_1d = _pin_model(space(box((0.0,), (1.0,)); cells=2, order=1))
-_pin_3d = _pin_model(space(box((0.5, -1.0, 2.0), (1.5, 0.25, 4.0)); cells=1, order=1))
+# distinct coordinates. The 2D model, `_anisotropic_2d` — two cells of per-cell anisotropic orders under a one-cell
+# overlay — is `test_postprocessing.jl`'s, as is `_solved_mass`.
+_pin_1d = _solved_mass(space(box((0.0,), (1.0,)); cells=2, order=1))
+_pin_3d = _solved_mass(space(box((0.5, -1.0, 2.0), (1.5, 0.25, 4.0)); cells=1, order=1))
 
 @testset "pin: a bundle's datasets are its records, as VTK stores them" begin
     # The writer samples nothing itself: the data grid of a bundle is the record `_sample_fields` returns and each level
@@ -369,7 +369,7 @@ end
 end
 
 @testset "pin: the written type and component count of each callback value shape" begin
-    (; model, sol) = _pin_2d
+    (; model, sol) = _anisotropic_2d
     dir = mktempdir()
     shapes = (pair=(u, c, x, xi) -> (x[1], x[2]),                 # a 2-tuple: padded to a 3-vector
               mixed_tuple=(u, c, x, xi) -> (1, x[1], 2),          # Int and Float64 components: promoted
@@ -415,7 +415,7 @@ end
 end
 
 @testset "pin: level_meshes=false writes no level mesh" begin
-    (; model, sol) = _pin_2d
+    (; model, sol) = _anisotropic_2d
     dir = mktempdir()
     files = write_vtk(joinpath(dir, "bare"), sol, model; level_meshes=false)
     @test basename.(files) == ["bare.vtm", "bare_data.vtu"]
@@ -424,7 +424,7 @@ end
 end
 
 @testset "pin: the quadrature cloud holds one vertex per quadrature point" begin
-    (; model) = _pin_2d
+    (; model) = _anisotropic_2d
     dir = mktempdir()
     files = write_quadrature_vtm(joinpath(dir, "cloud"), model)
     pieces = [read(file, String) for file in files if endswith(file, ".vtp")]
@@ -434,7 +434,7 @@ end
 end
 
 @testset "pin: write_vtk(path, …) returns every file it wrote, the .vtm first" begin
-    (; model, sol) = _pin_2d
+    (; model, sol) = _anisotropic_2d
     dir = mktempdir()
     files = write_vtk(joinpath(dir, "all"), sol, model)
     @test files isa Vector{String}
@@ -450,7 +450,7 @@ end
     # field of a coupled model is sampled, after the first field's block is complete — all happen while the bundle is
     # still in memory. The writer used to make the directory first and save whatever it had on the way out, leaving a
     # stub `.vtm` and partial grids behind.
-    (; model, sol) = _pin_2d
+    (; model, sol) = _anisotropic_2d
     V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(1, 1), order=1)
     V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(1, 1), order=1)
     u1 = field(:u1, V1)
@@ -483,7 +483,7 @@ end
     # writer, and WriteVTK would refuse it as `data type not supported by VTK`, naming neither the entry nor what the
     # writer accepts. The writer refuses it first, naming both, and like every refusal it leaves nothing on disk. A
     # value of no accepted shape at all is the sampling's to refuse (`test_postprocessing.jl`).
-    (; model, sol) = _pin_2d
+    (; model, sol) = _anisotropic_2d
     for (name, f) in (("rational", (u, c, x, xi) -> 1 // 3), ("big", (u, c, x, xi) -> big(x[1])))
         dir = mktempdir()
         err = try
@@ -504,7 +504,7 @@ end
     # VTK has no boolean type, and WriteVTK refused a Bool array outright (`data type not supported by VTK: Bool`),
     # although a Bool is the natural value of a flag or a mask. It is written as UInt8 0 / 1: alone, in an SVector or in
     # a tuple, and padded to three components like any other 2-vector.
-    (; model, sol) = _pin_2d
+    (; model, sol) = _anisotropic_2d
     dir = mktempdir()
     write_vtk(joinpath(dir, "flags"), sol, model; subdivisions=:none, level_meshes=false, _pin_ascii...,
               point_data=(right=(u, c, x, xi) -> x[1] > 0.5, corner=(u, c, x, xi) -> SVector(x[1] > 0.5, x[2] > 0.5),
@@ -525,7 +525,7 @@ end
 @testset "a frame written to a closed series is refused up front" begin
     # `close` writes the collection and frees it. A later frame used to be sampled in full and then fail inside the XML
     # library (`XMLNoRootError`); it is now refused before any sampling, writes nothing and keeps the frame count.
-    (; model, sol) = _pin_2d
+    (; model, sol) = _anisotropic_2d
     dir = mktempdir()
     series = vtk_series(joinpath(dir, "run"))
     write_vtk(series, 0.0, sol, model; level_meshes=false)
@@ -550,7 +550,7 @@ end
     # time-stamped base name such as `out_t=0.5` has one (`.5`): every file of its bundle used to warn. The writers now
     # name each file with its extension — the data grid, the level meshes, the quadrature clouds, a series frame and its
     # collection — and the names are unchanged.
-    (; model, sol) = _pin_2d
+    (; model, sol) = _anisotropic_2d
     base = joinpath(mktempdir(), "out_t=0.5")
     files = @test_logs write_vtk(base, sol, model)
     @test files == base .* [".vtm", "_data.vtu", "_level_1_base_mesh.vtu", "_level_2_overlay_mesh.vtu"]
