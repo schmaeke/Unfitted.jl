@@ -1185,6 +1185,11 @@ Prefer concise verbs and nouns such as `mesh`, `overlay`, `basis`,
 `diagnostics` over framework-heavy terminology. The public API should
 read like the method, not like a software architecture.
 
+An exported name must not also be an export of a package an extension
+integrates: a session that loads both could call neither by its bare
+name. `mesh` is the case in point — Makie exports one — so it stays
+documented but is not exported, and is called as `Unfitted.mesh`.
+
 ## Code style and documentation
 
 The actual code is held to a strict compactness standard. The

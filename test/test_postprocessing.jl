@@ -134,7 +134,7 @@ end
 
 @testset "cell iteration helpers (cell_indices, cell_box, center)" begin
     domain = box((-1.0, -1.0), (1.0, 1.0))
-    m = mesh(domain; cells=(4, 2))
+    m = Unfitted.mesh(domain; cells=(4, 2))
 
     @test cell_indices(m) == CartesianIndices((4, 2))
 

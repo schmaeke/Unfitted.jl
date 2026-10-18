@@ -142,10 +142,7 @@ The method is described in
   and 2D models are a Makie extension (load any Makie backend, e.g.
   `using CairoMakie`): `levelplot` draws the meshes of the levels coloured
   by order, activity, coverage or an error estimate, and `quadratureplot`
-  the quadrature points — neither needs a solution. With a backend loaded,
-  `mesh` names both Unfitted's function and Makie's, so write
-  `Unfitted.mesh`, or build spaces with `space(box(…); …)`, which needs no
-  `mesh`.
+  the quadrature points — neither needs a solution.
 - **D-generic core**: 1D, 2D, 3D, and 4D smoke-tested.
 
 ## Installation

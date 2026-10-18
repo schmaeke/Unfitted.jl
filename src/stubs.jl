@@ -649,9 +649,7 @@ attribute is changed on a drawn plot. A model of three or more dimensions is ref
 with [`write_vtk`](@ref), whose level meshes carry the same arrays, and look at it in ParaView.
 
 Requires Makie, which each of its backends loads: `using CairoMakie` to draw into files, `GLMakie` for an interactive
-window, `WGLMakie` for a browser or a notebook. Without it a call raises a `MethodError` that says so. With a backend
-loaded, `mesh` names both Unfitted's function and Makie's, so write `Unfitted.mesh` for Unfitted's — or build spaces
-with `space(box(…); …)`, which needs no `mesh`.
+window, `WGLMakie` for a browser or a notebook. Without it a call raises a `MethodError` that says so.
 """
 function levelplot end
 

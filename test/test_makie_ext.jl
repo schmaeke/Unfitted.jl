@@ -2,8 +2,8 @@
 # samples, asserted on the plot objects Makie builds — positions, faces, colours, edges, the axis each plot asks for —
 # with no backend loaded and nothing rendered. The records themselves are pinned in `test_postprocessing.jl`.
 #
-# `import`, not `using`: Makie exports `mesh`, as Unfitted does, and a file that loaded both with `using` would leave
-# every later test file that builds a `mesh` with an ambiguous name.
+# `import`, not `using`: every Makie name below is qualified, which keeps Makie's many exports out of the test files
+# included after this one.
 import Makie        # loads UnfittedMakieExt, which provides levelplot and quadratureplot
 using StaticArrays: SVector
 
@@ -73,6 +73,14 @@ _makie_1d = prepare(mass(overlay(space(box((0.0,), (1.0,)); cells=4, order=1), b
         @test occursin("Conversion failed", sprint(showerror, err))
     end
     @test !occursin("Makie backend", sprint(showerror, MethodError(levelplot, (1,))))
+end
+
+@testset "no export of Unfitted is a different export of Makie" begin
+    # A session that plots loads both packages, and a name both export for different things can be called by neither's
+    # bare name. `mesh` was one, and is no longer exported; it stays callable qualified.
+    @test isempty([n for n in intersect(names(Unfitted), names(Makie)) if getfield(Unfitted, n) !== getfield(Makie, n)])
+    @test :mesh ∉ names(Unfitted)
+    @test Unfitted.mesh(box((0.0,), (1.0,)); cells=2) isa CartesianMesh
 end
 
 @testset "levelplot draws every active cell of every level in 2D, stacked in level order" begin
