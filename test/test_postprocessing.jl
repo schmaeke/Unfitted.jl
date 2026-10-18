@@ -482,6 +482,8 @@ end
     records = Unfitted._sample_fields(sol, model; subdivisions=:none, point_data=NamedTuple())
     @test [r.field.name for r in records] == [:a, :b]
     @test all(r -> isempty(r.grid.point_data), records)
+    @test [[f.name for f in fields] for fields in Unfitted._fields_by_space(model, nothing)] == [[:a, :b]]
+    @test [[f.name for f in fields] for fields in Unfitted._fields_by_space(model, :b)] == [[:b]]
     meshes = Unfitted._sample_levels(model)
     @test [(m.field.name, m.level) for m in meshes] == [(:a, 1)]
     @test _record_array(only(meshes).grid, "active_dofs") == fill(1, 4)

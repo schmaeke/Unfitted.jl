@@ -685,6 +685,10 @@ end
         @test only(_outline(plt)[1][]) ≈ 0.3 atol = 1.0e-15
     end
     @test isempty(fieldplot(_makie_plane).plot.sample_boundary[])        # off by default
+    # Two fields on the immersed space: its ∂Ω is sampled and drawn once.
+    a, b = field(:a, _makie_plane.problem.space), field(:b, _makie_plane.problem.space)
+    two = prepare(Problem((a, b); blocks=(mass_block(a), mass_block(b))))
+    @test _segments_length(_outline(levelplot(two; boundary=true).plot)[1][]) ≈ 1
     @test last(levelplot(_makie_plane; boundary=true, boundarycolor=:red, boundarywidth=3).plot.plots).linewidth[] == 3
 
     # A plane through sample points, φ = x − ½ on cells with corners on x = ½, where every sample edge along it bounds

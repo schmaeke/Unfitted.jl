@@ -34,7 +34,7 @@ module UnfittedMakieExt
 
 using Unfitted
 using Unfitted: Model, Solution, ErrorEstimate, SampleGrid, _sample_fields, _sample_levels, _sample_quadrature,
-                _sampled_fields, _default_point_data, _cell_count
+                _sampled_fields, _fields_by_space, _default_point_data, _cell_count
 import Unfitted: fieldplot, fieldplot!, levelplot, levelplot!, quadratureplot, quadratureplot!
 import Makie
 using Makie: GeometryBasics, Point2, Point3
@@ -633,10 +633,9 @@ end
 # A field plot draws one field per space: two fields on one space cover the same cells, and drawn together one would
 # hide the other. Fields on different subdomains, those of a coupled model, are drawn side by side.
 function _check_one_field_per_space(model::Model, field)
-    fields = _sampled_fields(model, field)
-    for i in eachindex(fields), j in 1:(i-1)
-        fields[i].space === fields[j].space &&
-            throw(ArgumentError("fieldplot draws one field per space, and $(fields[j].name) and $(fields[i].name) " *
+    for fields in _fields_by_space(model, field)
+        length(fields) == 1 ||
+            throw(ArgumentError("fieldplot draws one field per space, and $(fields[1].name) and $(fields[2].name) " *
                                 "share one: pick one with `field`"))
     end
     return nothing
@@ -817,21 +816,19 @@ function _roots!(roots, grid::SampleGrid{1}, φ)
 end
 
 # The ∂Ω a level or a quadrature plot draws, sampled for the purpose: nothing without `boundary`; with it, ∂Ω on the
-# sample cells of the drawn fields' spaces at the sampler's defaults — `:degree`, `cut_depth = 3` — which a model needs
-# no solution for, each space once: in 2D the contour at `_BOUNDARY_Z`, in 1D the roots in order.
+# sample cells of each drawn space that carries a `PhysicalDomain`, sampled once through its first field
+# (`_fields_by_space`) at the sampler's defaults — `:degree`, `cut_depth = 3` — which a model needs no solution for:
+# in 2D the contour at `_BOUNDARY_Z`, in 1D the roots in order.
 function _model_boundary(::Val{D}, model::Model, field, boundary::Bool, plot::Symbol) where {D}
-    found, contour = false, D == 1 ? Float64[] : Point3{Float64}[]
+    contour = D == 1 ? Float64[] : Point3{Float64}[]
     boundary || return contour
-    spaces = []
-    for record in _sample_fields(nothing, model; field, point_data=NamedTuple())
-        any(s -> s === record.field.space, spaces) && continue
-        push!(spaces, record.field.space)
-        φ = _level_set(record.grid)
-        φ === nothing && continue
-        found = true
-        D == 1 ? _roots!(contour, record.grid, φ) : _contour!(contour, record.grid, φ, _BOUNDARY_Z)
+    immersed = [first(fields) for fields in _fields_by_space(model, field) if first(fields).space.physical !== nothing]
+    isempty(immersed) && throw(_no_boundary(plot))
+    for fld in immersed
+        grid = only(_sample_fields(nothing, model; field=fld)).grid
+        φ = _level_set(grid)
+        D == 1 ? _roots!(contour, grid, φ) : _contour!(contour, grid, φ, _BOUNDARY_Z)
     end
-    found || throw(_no_boundary(plot))
     return D == 1 ? sort!(unique!(contour)) : contour
 end
 

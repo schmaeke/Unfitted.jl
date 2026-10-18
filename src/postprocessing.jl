@@ -225,9 +225,8 @@ function _sample_fields(solution::Union{Nothing,Solution}, model::Model{D,T}; fi
                 (_assembly_workspace(model), FormState(model.dofs, coefficients))
     records = @NamedTuple{field::Field, grid::SampleGrid{D,T,D}}[]
     for fld in fields
-        space = _field_space(model.problem, fld.name)
-        regions = _region_list(model, nothing, space).regions     # the list assembly integrates the field over
-        grid = _sample_field(ws, state, space, regions, fld, rule, depth, entries, model.version)
+        regions = _region_list(model, nothing, fld.space).regions     # the list assembly integrates the field over
+        grid = _sample_field(ws, state, fld.space, regions, fld, rule, depth, entries, model.version)
         push!(records, (; field=fld, grid))
     end
     return records
@@ -267,6 +266,19 @@ function _sampled_fields(model::Model, field)
         f.name === name && return [f]
     end
     throw(ArgumentError("unknown field $name"))
+end
+
+# The fields a sampling covers (`_sampled_fields`), grouped by the space they share: each group in problem order, the
+# groups in the order of their first fields. The one statement of which sampled fields share a space, for every
+# consumer of the records to read rather than repeat: one that shows a space once — its level meshes, its ∂Ω — reads the
+# first field of each group, and one that cannot show two fields of one space over each other refuses a group of more.
+function _fields_by_space(model::Model, field)
+    groups = Vector{Field}[]
+    for fld in _sampled_fields(model, field)
+        i = findfirst(group -> first(group).space === fld.space, groups)
+        i === nothing ? push!(groups, Field[fld]) : push!(groups[i], fld)
+    end
+    return groups
 end
 
 # Normalise a `point_data` / `cell_data` keyword to its `name => callback` entries, in the container's order. Three
@@ -551,24 +563,20 @@ _levelset_values(physical::PhysicalDomain, points, ::Type{T}) where {T} = T[leve
 
 # The records of the meshes of the sampled fields' levels: one `(; field, level, role, grid)` per level of each sampled
 # field's space — every field in problem order, or the one `field` names — in `space.levels` order, with `grid` the
-# level's mesh (`_level_grid`). A space several sampled fields share is meshed once, under the first of them, whose dof
-# layout the per-cell dof counts are read from — the convention `diagnostics` follows for its per-level counts — so a
-# consumer that groups the meshes by field shows every level once. That is decided here rather than by each consumer,
-# which would otherwise have to repeat it. Level ids are unique across the subdomains of a coupled model, so `level`
-# names a level of the whole model.
+# level's mesh (`_level_grid`). A space several sampled fields share is meshed once, under the first of them
+# (`_fields_by_space`), whose dof layout the per-cell dof counts are read from — the convention `diagnostics` follows
+# for its per-level counts — so a consumer that groups the meshes by field shows every level once. Level ids are unique
+# across the subdomains of a coupled model, so `level` names a level of the whole model.
 #
 # The meshes are the discretisation's, so no solution is needed: a model can be meshed before it is solved. Collected
 # by an explicit loop into a vector of their concrete type, as `_sample_fields` collects its records.
 function _sample_levels(model::Model{D,T}; field=nothing) where {D,T}
     records = @NamedTuple{field::Field, level::Int, role::Symbol, grid::SampleGrid{D,T,D}}[]
-    meshed = Space[]
-    for fld in _sampled_fields(model, field)
-        space = _field_space(model.problem, fld.name)
-        any(s -> s === space, meshed) && continue
-        push!(meshed, space)
+    for fields in _fields_by_space(model, field)
+        fld = first(fields)
         dofs = _field_layout(model.dofs, fld.name).dofs
-        coverage = build_coverage(space, dofs.tolerance)
-        for level in space.levels
+        coverage = build_coverage(fld.space, dofs.tolerance)
+        for level in fld.space.levels
             push!(records, (; field=fld, level=level.id, level.role, grid=_level_grid(level, dofs, coverage)))
         end
     end
