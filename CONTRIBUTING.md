@@ -1180,15 +1180,14 @@ indicator representations are intentionally not supported.
 
 ### Naming
 
-Prefer concise verbs and nouns such as `mesh`, `overlay`, `basis`,
-`space`, `assemble`, `solve`, `project`, `move`, `evaluate`, and
-`diagnostics` over framework-heavy terminology. The public API should
-read like the method, not like a software architecture.
+Prefer concise verbs and nouns such as `overlay`, `basis`, `space`,
+`assemble`, `solve`, `project`, `move`, `evaluate`, and `diagnostics`
+over framework-heavy terminology. The public API should read like the
+method, not like a software architecture.
 
 An exported name must not also be an export of a package an extension
 integrates: a session that loads both could call neither by its bare
-name. `mesh` is the case in point — Makie exports one — so it stays
-documented but is not exported, and is called as `Unfitted.mesh`.
+name.
 
 ## Code style and documentation
 
