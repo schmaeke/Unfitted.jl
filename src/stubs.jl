@@ -669,7 +669,8 @@ Keyword arguments, which are the plot's attributes:
   - `categorical` — whether the colours are categories, one colour and one colour-bar block per value: `true`, `false`,
     or `automatic` (default) for `:cover_count` alone. Settled when the plot is created.
   - `colormap`, `colorrange`, `colorscale`, `lowclip`, `highclip`, `nan_color`, `alpha` — the colour mapping of a 2D
-    plot, as for every Makie plot; a `Colorbar` reads it off the plot.
+    plot, as for every Makie plot; a `Colorbar` reads it off the plot. A 1D plot has none, and a `Colorbar` of it is
+    refused.
 
 $(_SAMPLING_KEYWORDS_DOC)
 To follow a run, pass the solution, or the model, as an `Observable`. When both change, replace them at once with

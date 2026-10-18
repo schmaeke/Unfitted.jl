@@ -334,6 +334,10 @@ end
     end
     fig, ax, plt = fieldplot(_makie_2d_solution, _makie_2d)
     @test Makie.Colorbar(fig[1, 2], plt) isa Makie.Colorbar
+    # A 1D field plot draws in one colour, and its Colorbar is refused by name.
+    fig, ax, plt = fieldplot(_makie_1d)
+    err = _thrown(() -> Makie.Colorbar(fig[1, 2], plt))
+    @test err isa ArgumentError && occursin("no colour map for a Colorbar to read", sprint(showerror, err))
 end
 
 @testset "the quantities with a few discrete values are coloured as categories" begin

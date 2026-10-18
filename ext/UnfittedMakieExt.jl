@@ -32,8 +32,7 @@ one argument and need no solution: they draw the discretisation.
 """
 module UnfittedMakieExt
 
-using Unfitted
-using Unfitted: Model, Solution, ErrorEstimate, SampleGrid, _sample_fields, _sample_levels, _sample_quadrature,
+using Unfitted: Field, Model, Solution, ErrorEstimate, SampleGrid, _sample_fields, _sample_levels, _sample_quadrature,
                 _sampled_fields, _fields_by_space, _default_point_data, _cell_count
 import Unfitted: fieldplot, fieldplot!, levelplot, levelplot!, quadratureplot, quadratureplot!
 import Makie
@@ -195,7 +194,7 @@ end
 # `colormap`, the node `_colormap_node!` chose.
 function _draw_cells!(p::LevelPlot, ::Val{2}, colormap)
     return Makie.mesh!(p, Makie.shared_attributes(p, Makie.Mesh), p.cell_geometry; color=p.cell_color, colormap,
-                       shading=Makie.NoShading)
+                       shading=false)
 end
 function _draw_cells!(p::LevelPlot, ::Val{1}, colormap)
     return Makie.linesegments!(p, Makie.shared_attributes(p, Makie.LineSegments), p.cell_geometry; color=p.cell_color,
@@ -259,8 +258,8 @@ function _draw_boundary!(p, name::Symbol, ::Val{2})
 end
 function _draw_boundary!(p, name::Symbol, ::Val{1})
     map!(roots -> isempty(roots) ? [NaN] : roots, p.attributes, name, :boundary_lines)
-    return Makie.vlines!(p, p.boundary_lines; color=p.boundarycolor, linewidth=p.boundarywidth, visible=p.visible,
-                         inspectable=p.inspectable)
+    return Makie.vlines!(p, Makie.shared_attributes(p, Makie.VLines), p.boundary_lines; color=p.boundarycolor,
+                         linewidth=p.boundarywidth)
 end
 
 # The points are what a quadrature plot shows, and `∂Ω` is drawn for reference behind them in every backend: its child
@@ -296,9 +295,9 @@ function _colormap_node!(p, name::Symbol, by=p.by[])
 end
 
 # Whether a plot is categorical: as `categorical` says, and for `automatic` when `by` names one of the quantities
-# `_DISCRETE` lists.
+# `_CATEGORICAL_QUANTITIES` lists.
 function _is_categorical(categorical, by)
-    categorical === Makie.automatic && return by isa Symbol && by in _DISCRETE
+    categorical === Makie.automatic && return by isa Symbol && by in _CATEGORICAL_QUANTITIES
     categorical isa Bool && return categorical
     throw(ArgumentError("categorical must be true, false or automatic; got $(repr(categorical))"))
 end
@@ -306,7 +305,7 @@ end
 # The quantities that take a few discrete values, which a categorical colour map shows a block each: a cell's order,
 # level, role, activity and coverage, and the number of levels over a quadrature point. The dof counts and the cell
 # index take too many values for a block each to read, and an error estimate and the weights vary continuously.
-const _DISCRETE = (:order_max, :level_id, :role_id, :active, :covered, :cover_count)
+const _CATEGORICAL_QUANTITIES = (:order_max, :level_id, :role_id, :active, :covered, :cover_count)
 
 # Plots draw one- and two-dimensional models. A three-dimensional one has no view a plot could show without slicing or
 # clipping it, which ParaView does on the VTK writer's output, so the refusal names the writer.
@@ -373,7 +372,27 @@ end
 # plot, whose edges and `∂Ω` are drawn in one solid colour and have none, and the scatter of a quadrature plot, which
 # draws its `∂Ω` first so that the points lie in front of it.
 Makie.extract_colormap(p::Union{LevelPlot,FieldPlot}) = Makie.extract_colormap(first(p.plots))
+# A 1D field plot draws its value as the height of a graph in one colour: it has no colour map to read, and a
+# `Colorbar` of it is refused, by name, rather than with Makie's report of the colours of its several children.
+function Makie.extract_colormap(::FieldPlot{<:Tuple{Any,<:Model{1}}})
+    throw(ArgumentError("a 1D field plot draws its value as the height of a graph in one colour, and has no colour " *
+                        "map for a Colorbar to read"))
+end
 Makie.extract_colormap(p::QuadraturePlot) = Makie.extract_colormap(only(c for c in p.plots if c isa Makie.Scatter))
+
+# ── Record arrays ─────────────────────────────────────────────────────────────
+
+# The array `name` among a record's `arrays` — its `point_data` or its `cell_data` — or `nothing` when it has none of
+# that name. A record holds its arrays as `AbstractVector`s, so a loop that reads one in its own body runs on an
+# abstract type and dispatches at every element: an array found here is handed, as an argument, to a function that
+# loops over it — a broadcast, `map`, or a function of its own — behind which the loop is compiled for the array's
+# concrete type. Read in place, the plotted values of 490 000 sample points took 45 ms; through a barrier, under 0.3 ms.
+function _record_array(arrays::Vector{Pair{String,AbstractVector}}, name::String)
+    for (key, array) in arrays
+        key == name && return array
+    end
+    return nothing
+end
 
 # ── Level meshes ──────────────────────────────────────────────────────────────
 
@@ -442,29 +461,19 @@ function _cell_array(grid::SampleGrid, name::Symbol)
     throw(ArgumentError("by = :$name names no cell array of the level meshes; pass one of $names, or an ErrorEstimate"))
 end
 
-# The array `name` among a record's `arrays` — its `point_data` or its `cell_data` — or `nothing` when it has none of
-# that name. A record holds its arrays as `AbstractVector`s, so a loop that reads one in its own body runs on an
-# abstract type and dispatches at every element: an array found here is handed, as an argument, to a function that
-# loops over it — a broadcast, `map`, or a function of its own — behind which the loop is compiled for the array's
-# concrete type. Read in place, the plotted values of 490 000 sample points took 45 ms; through a barrier, under 0.3 ms.
-function _record_array(arrays::Vector{Pair{String,AbstractVector}}, name::String)
-    for (key, array) in arrays
-        key == name && return array
-    end
-    return nothing
-end
-
 # The 2D drawing of the levels: one mesh of every drawn cell's quad, whose vertex colours are each cell's value repeated
 # over its four corners (`_cell_colors`), and the cell edges as line segments.
 #
-# The faces are stacked in z, in level order: the `k`-th of `n` drawn levels lies at `z = k − n − 1`, so a later level
-# lies in front of an earlier one — a 2D axis draws what is nearer in z in front, and CairoMakie depth-sorts the
-# triangles of a mesh — and every level lies behind `z = 0`, where a plot drawn into the same axis afterwards lands.
+# The faces are stacked in z, in level order: the `k`-th of `n` drawn levels lies at `z = k − n − 1`, and the mesh
+# holds its faces in that order, so a later level lies in front of an earlier one in every backend — one that tests
+# depth (GLMakie) draws what is nearer in z in front, and one that paints a 2D mesh's faces in their order (CairoMakie)
+# paints the later level's last — and every level lies behind `z = 0`, where a plot drawn into the same axis
+# afterwards lands.
 #
 # The edges cannot rely on that: they are one child plot drawn after the whole mesh, which a backend that paints its
-# children in order (CairoMakie) puts in front of every face. So they are cut geometrically instead: each level draws
-# only the parts of its edges that no drawn cell of a later level lies over (`_visible_pieces`), and each edge once
-# (`_level_edges`). The edges keep a level's height plus `½` for the backends that do test depth.
+# children in order puts in front of every face. So they are cut geometrically instead: each level draws only the
+# parts of its edges that no drawn cell of a later level lies over (`_visible_pieces`), and each edge once
+# (`_level_edges`). The edges lie `_EDGE_LIFT` in front of their level for the backends that do test depth.
 function _level_primitives(::Val{2}, drawn)
     positions, edges = Point3{Float64}[], Point3{Float64}[]
     faces = GeometryBasics.QuadFace{Int}[]
@@ -478,29 +487,28 @@ function _level_primitives(::Val{2}, drawn)
             push!(faces, GeometryBasics.QuadFace{Int}(offset + 1, offset + 2, offset + 3, offset + 4))
         end
         later = lattices[(k+1):end]
-        for (axis, at, a, b) in _level_edges(level), (s, t) in _visible_pieces([(a, b)], axis, at, later)
+        for (axis, at, a, b) in _level_edges(lattices[k]), (s, t) in _visible_pieces([(a, b)], axis, at, later)
             ends = axis == 1 ? ((s, at), (t, at)) : ((at, s), (at, t))
-            append!(edges, (Point3{Float64}(x..., z + 0.5) for x in ends))
+            append!(edges, (Point3{Float64}(x..., z + _EDGE_LIFT) for x in ends))
         end
     end
     return GeometryBasics.Mesh(positions, faces), edges
 end
 
 # The edges of a level's drawn cells, each once, as `(axis, at, a, b)`: the edge runs along `axis` from `a` to `b` at
-# the coordinate `at` on the other axis. A quad's corners come in the record's face-cyclic order — lower left, lower
-# right, upper right, upper left — so its edges join consecutive corners. Every corner coordinate is a `lower` or
-# `upper` of a box of the level's own lattice, so two cells that share an edge give it bit-identical coordinates, and
-# the set of these tuples holds a shared edge once. Sorted, so that the edges come out in an order of their own rather
-# than the set's.
-function _level_edges(level)
-    T = eltype(eltype(level.grid.points))
-    edges = Set{Tuple{Int,T,T,T}}()
-    for c in findall(level.keep)
-        ll, lr, ur, ul = level.grid.points[(4c-3):(4c)]
-        push!(edges, (1, ll[2], ll[1], lr[1]), (1, ul[2], ul[1], ur[1]), (2, ll[1], ll[2], ul[2]),
-              (2, lr[1], lr[2], ur[2]))
+# the coordinate `at` on the other axis. Read off the level's lattice (`_drawn_lattice`), whose every edge is one of a
+# drawn cell exactly when a cell on either side of it is drawn: each edge comes out once, in lattice order.
+function _level_edges(lattice)
+    (xs, ys), keep = lattice.breaks, lattice.keep
+    drawn(i, j) = checkbounds(Bool, keep, i, j) && keep[i, j]
+    edges = Tuple{Int,eltype(xs),eltype(xs),eltype(xs)}[]
+    for j in eachindex(ys), i in 1:(length(xs)-1)
+        (drawn(i, j - 1) || drawn(i, j)) && push!(edges, (1, ys[j], xs[i], xs[i+1]))
     end
-    return sort!(collect(edges))
+    for i in eachindex(xs), j in 1:(length(ys)-1)
+        (drawn(i - 1, j) || drawn(i, j)) && push!(edges, (2, xs[i], ys[j], ys[j+1]))
+    end
+    return edges
 end
 
 # A drawn level as the hiding test reads it: the breaks of its lattice along each axis, and which of its cells are
@@ -549,21 +557,21 @@ function _drawn_cell_at(lattice, x)
 end
 
 # The 1D drawing of the levels: every drawn cell a segment at the height of its level id, coloured by its value at both
-# ends (`_cell_colors`), and a tick across each end of it, `_TICK` levels above and below.
+# ends (`_cell_colors`), and a tick across each end of it, `_TICK_HALF_HEIGHT` levels above and below.
 function _level_primitives(::Val{1}, drawn)
     segments, ticks = Point2{Float64}[], Point2{Float64}[]
     for level in drawn, c in findall(level.keep)
         a, b, y = level.grid.points[2c-1][1], level.grid.points[2c][1], level.id
         push!(segments, Point2{Float64}(a, y), Point2{Float64}(b, y))
         for x in (a, b)
-            push!(ticks, Point2{Float64}(x, y - _TICK), Point2{Float64}(x, y + _TICK))
+            push!(ticks, Point2{Float64}(x, y - _TICK_HALF_HEIGHT), Point2{Float64}(x, y + _TICK_HALF_HEIGHT))
         end
     end
     return segments, ticks
 end
 
 # The half height of a 1D level plot's cell-end ticks, in levels: well inside the unit spacing of the rows.
-const _TICK = 0.2
+const _TICK_HALF_HEIGHT = 0.2
 
 # ── Fields ────────────────────────────────────────────────────────────────────
 
@@ -608,7 +616,7 @@ end
 # plotted value on a warped surface, and in front of the flat one. Refused when no sample has a level set to draw.
 function _field_boundary(::Val{D}, samples, boundary::Bool, warp::Bool) where {D}
     boundary || return _boundary(Val(D), ())
-    any(sample -> sample.φ !== nothing, samples) || throw(_no_boundary(:fieldplot))
+    any(sample -> sample.φ !== nothing, samples) || throw(_no_boundary_error(:fieldplot))
     return _boundary(Val(D), ((s.grid, s.φ, warp ? s.values : _BOUNDARY_Z) for s in samples if s.φ !== nothing))
 end
 
@@ -619,7 +627,7 @@ function _level_set(grid::SampleGrid)
 end
 
 # The refusal of `boundary = true` on a plot of no field with a `PhysicalDomain`, whose boundary is the box's own.
-function _no_boundary(plot::Symbol)
+function _no_boundary_error(plot::Symbol)
     return ArgumentError("$plot draws ∂Ω with boundary = true, and no drawn field's space carries a PhysicalDomain: " *
                          "there is no immersed boundary to draw")
 end
@@ -702,8 +710,12 @@ function _plotted_value(::SVector, component)
 end
 
 # The height a flat field plot draws its surface at, behind `z = 0` as a level plot's levels are, so that a plot drawn
-# into the same axis afterwards lies in front of it; its region edges lie half a unit in front of the surface.
-const _FLAT = -1.0
+# into the same axis afterwards lies in front of it.
+const _FIELD_Z = -1.0
+
+# How far in front of its flat surface, or of its level, a plot draws the edges on it, for the backends that test
+# depth: half the spacing of a level plot's levels, so that the edges of a level lie between it and the next.
+const _EDGE_LIFT = 0.5
 
 # The height every flat plot draws ∂Ω at: in front of a field's surface and edges and of every level of a level plot,
 # and behind `z = 0`, where a plot drawn into the same axis afterwards lands.
@@ -711,8 +723,8 @@ const _BOUNDARY_Z = -0.25
 
 # The 2D surface of a field: the triangles of its samples' cells (`_surface!`), each sample cut where `clip` says
 # (`_clip_at`), coloured by the plotted value at each corner, at the height of the value with `warp` and flat at
-# `_FLAT` without. A record's cells own their corners, so a value that jumps between cells, or between regions, is drawn
-# as a jump rather than smeared across it.
+# `_FIELD_Z` without. A record's cells own their corners, so a value that jumps between cells, or between regions, is
+# drawn as a jump rather than smeared across it.
 function _surface(samples, clip, warp::Bool)
     positions, colors, faces = Point3{Float64}[], Float64[], GeometryBasics.TriangleFace{Int}[]
     for sample in samples
@@ -741,7 +753,7 @@ function _surface!(positions, colors, faces, grid::SampleGrid{2}, v, φ, warp::B
     index = zeros(Int, length(grid.points))
     function corner(k)
         if index[k] == 0
-            push!(positions, Point3{Float64}(grid.points[k]..., warp ? v[k] : _FLAT))
+            push!(positions, Point3{Float64}(grid.points[k]..., warp ? v[k] : _FIELD_Z))
             push!(colors, v[k])
             index[k] = length(positions)
         end
@@ -750,7 +762,7 @@ function _surface!(positions, colors, faces, grid::SampleGrid{2}, v, φ, warp::B
     function cut(a, b)
         i, j, t = _crossing(grid.points, φ, a, b)
         x, value = _lerp(grid.points, i, j, t), _lerp(v, i, j, t)
-        push!(positions, Point3{Float64}(x..., warp ? value : _FLAT))
+        push!(positions, Point3{Float64}(x..., warp ? value : _FIELD_Z))
         push!(colors, value)
         return length(positions)
     end
@@ -865,12 +877,12 @@ end
 function _model_boundary(::Val{D}, model::Model, field, boundary::Bool, plot::Symbol) where {D}
     boundary || return _boundary(Val(D), ())
     immersed = [first(fields) for fields in _fields_by_space(model, field) if first(fields).space.physical !== nothing]
-    isempty(immersed) && throw(_no_boundary(plot))
+    isempty(immersed) && throw(_no_boundary_error(plot))
     grids = (only(_sample_fields(nothing, model; field=fld)).grid for fld in immersed)
     return _boundary(Val(D), ((grid, _level_set(grid), _BOUNDARY_Z) for grid in grids))
 end
 
-# The edges of the regions of a field's samples, as segments half a unit in front of the flat surface, each sample cut
+# The edges of the regions of a field's samples, as segments `_EDGE_LIFT` in front of the flat surface, each sample cut
 # where `clip` says (`_clip_at`).
 function _region_edges(samples, clip)
     edges = Point3{Float64}[]
@@ -891,7 +903,7 @@ function _region_edges!(edges, grid::SampleGrid{2}, φ)
     return _region_edges!(edges, grid.points, _record_array(grid.cell_data, "region_id"), φ)
 end
 function _region_edges!(edges, p, regions::AbstractVector, φ)                 # behind the barrier on `regions`' type
-    z, run = _FLAT + 0.5, 1
+    z, run = _FIELD_Z + _EDGE_LIFT, 1
     while run <= length(regions)
         cells = run:(something(findnext(!=(regions[run]), regions, run), length(regions)+1)-1)
         corners = p[(4first(cells)-3):(4last(cells))]
