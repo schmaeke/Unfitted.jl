@@ -393,7 +393,7 @@ end
 @testset "fieldplot draws a 2D solution on its sample cells" begin
     # Every sample cell of every region, at `:degree`, its corners the record's own at z = −1, each cell the two
     # triangles (1, 2, 3) and (1, 3, 4) Makie splits a quad into, coloured by the solution's value at each corner; the
-    # region edges are computed whether or not they are drawn.
+    # region edges are computed only while they are drawn.
     grid = only(Unfitted._sample_fields(_makie_2d_solution, _makie_2d)).grid
     fig, ax, plt = fieldplot(_makie_2d_solution, _makie_2d)
     @test ax isa Makie.Axis && ax.aspect[] isa Makie.DataAspect
@@ -405,8 +405,12 @@ end
           [_GB.TriangleFace{Int}(t) for c in 1:n for t in ((4c - 3, 4c - 2, 4c - 1), (4c - 3, 4c - 1, 4c))]
     @test plt.sample_color[] == _sampled(grid, "uh")
     @test surface.color[] == Float32.(plt.sample_color[])
-    @test edges.linewidth[] == 0                                   # none drawn by default
+    @test edges.linewidth[] == 0 && isempty(plt.sample_edges[])    # none drawn, nor computed, by default
     @test fieldplot(_makie_2d_solution, _makie_2d; strokewidth=2).plot.plots[2].linewidth[] == 2
+    plt.strokewidth = 1
+    drawn = plt.sample_edges[]
+    plt.strokewidth = 2                                            # another width redraws the same edges
+    @test !isempty(drawn) && plt.sample_edges[] === drawn
 end
 
 @testset "fieldplot draws each region's edges, which cross no cell" begin

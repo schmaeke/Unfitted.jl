@@ -215,8 +215,11 @@ function _draw_field!(p::FieldPlot, ::Val{2}, warp::Bool)
     map!(p.attributes, [:samples, :clip], [:sample_geometry, :sample_color]) do samples, clip
         return _surface(samples, clip, warp)
     end
-    map!(p.attributes, [:samples, :clip], :sample_edges) do samples, clip
-        return warp ? Point3{Float64}[] : _region_edges(samples, clip)
+    # The region edges are computed only while they are drawn: `draws_edges` changes only when the width crosses zero,
+    # so a change of width alone recomputes nothing.
+    map!(width -> !warp && width > 0, p.attributes, :strokewidth, :draws_edges)
+    map!(p.attributes, [:samples, :clip, :draws_edges], :sample_edges) do samples, clip, draws_edges
+        return draws_edges ? _region_edges(samples, clip) : Point3{Float64}[]
     end
     colormap = _colormap_node!(p, :sample_colormap, _resolved_by(p.by[], p.solution[]))
     # A warped surface is lit, so that its shape reads apart from its colour; a flat one is not, so that its colours are
@@ -421,7 +424,7 @@ function _cell_values(model::Model, records, estimate::ErrorEstimate)
         throw(ArgumentError("by: this ErrorEstimate holds levels of $(join(size.(estimate.cells), ", ")) cells, and " *
                             "the drawn levels have $(join(shapes, ", ")); pass the estimate `estimate(model, " *
                             "solution)` returned for this model"))
-    return [Float64[estimate.cells[k][i] for i in _cell_array(records[k].grid, :cell_id)] for k in eachindex(records)]
+    return [Float64.(estimate.cells[k][_cell_array(records[k].grid, :cell_id)]) for k in eachindex(records)]
 end
 function _cell_values(::Model, records, by)
     throw(ArgumentError("by must name a cell array of the level meshes, as a Symbol, or be an ErrorEstimate; got " *
@@ -430,11 +433,22 @@ end
 
 # The cell array `name` of a level mesh record, refused with the names it has when it has none of that name.
 function _cell_array(grid::SampleGrid, name::Symbol)
-    for (key, array) in grid.cell_data
-        key == String(name) && return array
-    end
+    array = _record_array(grid.cell_data, String(name))
+    array === nothing || return array
     names = join((":" * key for key in first.(grid.cell_data)), ", ")
     throw(ArgumentError("by = :$name names no cell array of the level meshes; pass one of $names, or an ErrorEstimate"))
+end
+
+# The array `name` among a record's `arrays` — its `point_data` or its `cell_data` — or `nothing` when it has none of
+# that name. A record holds its arrays as `AbstractVector`s, so a loop that reads one in its own body runs on an
+# abstract type and dispatches at every element: an array found here is handed, as an argument, to a function that
+# loops over it — a broadcast, `map`, or a function of its own — behind which the loop is compiled for the array's
+# concrete type. Read in place, the plotted values of 490 000 sample points took 45 ms; through a barrier, under 0.3 ms.
+function _record_array(arrays::Vector{Pair{String,AbstractVector}}, name::String)
+    for (key, array) in arrays
+        key == name && return array
+    end
+    return nothing
 end
 
 # The 2D drawing of the levels: one mesh of every drawn cell's quad, its vertex colours each cell's value repeated over
@@ -599,8 +613,8 @@ end
 
 # A record's `level_set` point array, as floating-point numbers, or `nothing` for a record without one.
 function _level_set(grid::SampleGrid)
-    i = findfirst(entry -> first(entry) == "level_set", grid.point_data)
-    return i === nothing ? nothing : Vector{Float64}(last(grid.point_data[i]))
+    φ = _record_array(grid.point_data, "level_set")
+    return φ === nothing ? nothing : Vector{Float64}(φ)
 end
 
 # The refusal of `boundary = true` on a plot of no field with a `PhysicalDomain`, whose boundary is the box's own.
@@ -662,11 +676,11 @@ end
 # (`_plotted_value`), a cell array's value repeated over the cell's own corners, so that the cell is coloured flat. The
 # one array a request can find missing is `level_set`, which the sampler attaches only for a `PhysicalDomain`.
 function _plotted_values(grid::SampleGrid{D,T,K}, request, component) where {D,T,K}
-    arrays = request.location === :point ? grid.point_data : grid.cell_data
-    i = findfirst(entry -> first(entry) == request.name, arrays)
-    i === nothing && throw(ArgumentError("by = :level_set plots the level set φ, and this model's space carries no " *
-                                         "PhysicalDomain"))
-    values = Float64[_plotted_value(v, component) for v in last(arrays[i])]
+    array = _record_array(request.location === :point ? grid.point_data : grid.cell_data, request.name)
+    array === nothing &&
+        throw(ArgumentError("by = :level_set plots the level set φ, and this model's space carries no " *
+                            "PhysicalDomain"))
+    values = map(v -> _plotted_value(v, component), array)
     return request.location === :point ? values : repeat(values; inner=1 << K)
 end
 
@@ -873,8 +887,10 @@ end
 # cell, which is what lets the edges be drawn after the surface, in CairoMakie's painting order, without covering any
 # of it.
 function _region_edges!(edges, grid::SampleGrid{2}, φ)
-    regions, z = last(grid.cell_data[findfirst(entry -> first(entry) == "region_id", grid.cell_data)]), _FLAT + 0.5
-    p, run = grid.points, 1
+    return _region_edges!(edges, grid.points, _record_array(grid.cell_data, "region_id"), φ)
+end
+function _region_edges!(edges, p, regions::AbstractVector, φ)                 # behind the barrier on `regions`' type
+    z, run = _FLAT + 0.5, 1
     while run <= length(regions)
         cells = run:(something(findnext(!=(regions[run]), regions, run), length(regions)+1)-1)
         corners = p[(4first(cells)-3):(4last(cells))]
@@ -918,13 +934,21 @@ function _quadrature_primitives(::Val{D}, records, by) where {D}
     by in (:weight, :cover_count) || throw(ArgumentError("by must be :weight or :cover_count; got $(repr(by))"))
     positions, colors = Point2{Float64}[], Float64[]
     for (; signature, grid) in records
-        weights = last(only(grid.point_data))
-        for (x, w) in zip(grid.points, weights)
-            push!(positions, D == 1 ? Point2{Float64}(x[1], w) : Point2{Float64}(x[1], x[2]))
-            push!(colors, by === :weight ? w : length(signature))
-        end
+        weights = _record_array(grid.point_data, "weight")
+        _cloud_positions!(positions, Val(D), grid.points, weights)
+        cover = Iterators.repeated(length(signature), length(weights))
+        append!(colors, by === :weight ? weights : cover)
     end
     return positions, colors
+end
+
+# The points of one cloud record, appended to `positions`: in 2D at their positions, in 1D at their positions against
+# their weights. Behind the barrier on the weights' type (`_record_array`).
+function _cloud_positions!(positions, ::Val{D}, points, weights::AbstractVector) where {D}
+    for (x, w) in zip(points, weights)
+        push!(positions, D == 1 ? Point2{Float64}(x[1], w) : Point2{Float64}(x[1], x[2]))
+    end
+    return positions
 end
 
 end
