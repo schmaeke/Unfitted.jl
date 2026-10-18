@@ -10,6 +10,12 @@ using StaticArrays: SVector
 const _MakieExt = Base.get_extension(Unfitted, :UnfittedMakieExt)
 const _GB = Makie.GeometryBasics
 
+# The children of a plot by their role: the one that carries the colours, which a `Colorbar` reads, and the one that
+# draws ∂Ω. A field and a level plot draw their colours first and ∂Ω last; a quadrature plot draws ∂Ω first, behind its
+# points.
+_coloured(plt) = plt isa _MakieExt.QuadraturePlot ? only(c for c in plt.plots if c isa Makie.Scatter) : first(plt.plots)
+_outline(plt) = plt isa _MakieExt.QuadraturePlot ? first(plt.plots) : last(plt.plots)
+
 # A level mesh record's cell array `name`.
 _level_array(record, name) = last(only(filter(entry -> first(entry) == name, record.grid.cell_data)))
 
@@ -263,7 +269,10 @@ end
     @test plt.cell_color[] == colors
     @test plt.cell_edges[] == ticks
     @test length(segments) == 2 * (4 + 2)
-    @test all(p -> p isa Makie.LineSegments, plt.plots)
+    # The cells and the ticks, then ∂Ω, which a model without a PhysicalDomain does not draw (one NaN, see below).
+    cells, ticks_plot, outline = plt.plots
+    @test cells isa Makie.LineSegments && ticks_plot isa Makie.LineSegments
+    @test outline isa Makie.VLines && isnan(only(outline[1][]))
 end
 
 @testset "levelplot draws every subdomain's levels or one field's, and follows its model" begin
@@ -289,8 +298,8 @@ end
     cloud = Unfitted._sample_quadrature(_makie_2d)
     fig, ax, plt = quadratureplot(_makie_2d)
     @test ax isa Makie.Axis && ax.aspect[] isa Makie.DataAspect
-    points = only(plt.plots)
-    @test points isa Makie.Scatter
+    outline, points = plt.plots                         # ∂Ω, not drawn here, then the cloud, in front of it
+    @test points isa Makie.Scatter && isempty(outline[1][])
     @test plt.point_positions[] == [Makie.Point2{Float64}(x...) for entry in cloud for x in entry.grid.points]
     @test plt.point_color[] == reduce(vcat, [last(only(entry.grid.point_data)) for entry in cloud])
     @test length(plt.point_positions[]) == nquadpoints(_makie_2d)
@@ -330,7 +339,7 @@ end
     # One colour per distinct value, and a colour bar with a block and a tick per value, for a cell's order, level,
     # role, activity and coverage and a point's cover count; the dof counts, the cell index, an estimate and the weights
     # keep a continuous map. `categorical` decides for any `by`, and the map wrapped is the plot's own `colormap`.
-    mapping(plt) = first(plt.plots).color_mapping_type[]
+    mapping(plt) = _coloured(plt).color_mapping_type[]
     for by in (:order_max, :level_id, :role_id, :active, :covered)
         @test mapping(levelplot(_makie_2d; by).plot) == Makie.categorical
     end
@@ -384,8 +393,9 @@ end
 # ── fieldplot ─────────────────────────────────────────────────────────────────
 
 @testset "fieldplot draws a 2D solution on its sample cells" begin
-    # Every sample cell of every region, at `:degree`, its corners the record's own at z = −1, coloured by the
-    # solution's value at each corner; the region edges are computed whether or not they are drawn.
+    # Every sample cell of every region, at `:degree`, its corners the record's own at z = −1, each cell the two
+    # triangles (1, 2, 3) and (1, 3, 4) Makie splits a quad into, coloured by the solution's value at each corner; the
+    # region edges are computed whether or not they are drawn.
     grid = only(Unfitted._sample_fields(_makie_2d_solution, _makie_2d)).data
     fig, ax, plt = fieldplot(_makie_2d_solution, _makie_2d)
     @test ax isa Makie.Axis && ax.aspect[] isa Makie.DataAspect
@@ -393,7 +403,8 @@ end
     @test surface isa Makie.Mesh && edges isa Makie.LineSegments
     n = Unfitted._cell_count(grid)
     @test _GB.coordinates(plt.sample_geometry[]) == [Makie.Point3{Float64}(x..., -1) for x in grid.points]
-    @test _GB.faces(plt.sample_geometry[]) == [_GB.QuadFace{Int}(4c - 3, 4c - 2, 4c - 1, 4c) for c in 1:n]
+    @test _GB.faces(plt.sample_geometry[]) ==
+          [_GB.TriangleFace{Int}(t) for c in 1:n for t in ((4c - 3, 4c - 2, 4c - 1), (4c - 3, 4c - 1, 4c))]
     @test plt.sample_color[] == _sampled(grid, "uh")
     @test surface.color[] == Float32.(plt.sample_color[])
     @test edges.linewidth[] == 0                                   # none drawn by default
@@ -402,13 +413,14 @@ end
 
 @testset "fieldplot draws each region's edges, which cross no cell" begin
     # Against the integration plan's own region boxes, of a model whose regions are sampled at different counts and
-    # whose cut cells are refined: every edge lies on a side of a region's box, half a unit in front of the surface, and
-    # inside no region; and the edges cover every side of every region's box.
+    # whose cut cells are refined, unclipped so that every region is drawn whole: every edge lies on a side of a
+    # region's box, half a unit in front of the surface, and inside no region; and the edges cover every side of every
+    # region's box.
     disk = physical_domain(x -> sqrt((x[1] - 0.45)^2 + (x[2] - 0.5)^2) - 0.3; lipschitz=1.0, subcell_length_scale=0.1)
     model = prepare(mass(overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=3, order=1, physical=disk),
                                  box((0.2, 0.3), (0.7, 0.8)); cells=2, order=2)))
     boxes = [Unfitted._region_box(region) for region in Unfitted.integration_plans(model)[1].regions]
-    edges = _segments(fieldplot(model; strokewidth=1).plot.sample_edges[])
+    edges = _segments(fieldplot(model; strokewidth=1, clip=false).plot.sample_edges[])
     @test all(s -> s[1][3] == s[2][3] == -0.5, edges)
     flat(x) = SVector(x[1], x[2])
     within(t, lo, hi) = lo <= t <= hi
@@ -447,11 +459,11 @@ end
               [v[c] for v in values]
     end
 
-    # The level set of an immersed model, at every point.
+    # The level set of an immersed model, at every point, unclipped.
     disk = physical_domain(x -> sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.3; lipschitz=1.0, alpha=1.0,
                            subcell_length_scale=0.125, max_depth=2)
     immersed = prepare(mass(space(box((0.0, 0.0), (1.0, 1.0)); cells=2, order=1, physical=disk)))
-    plt = fieldplot(immersed; by=:level_set).plot
+    plt = fieldplot(immersed; by=:level_set, clip=false).plot
     level = only(Unfitted._sample_fields(nothing, immersed)).data
     @test plt.sample_color[] == _sampled(level, "level_set")
     @test _GB.coordinates(plt.sample_geometry[]) == [Makie.Point3{Float64}(x..., -1) for x in level.points]
@@ -520,8 +532,9 @@ end
     @test ax isa Makie.Axis && ax.xlabel[] == "x" && ax.ylabel[] == "uh"
     @test plt.sample_geometry[] == [Makie.Point2{Float64}(x[1], v) for (x, v) in zip(grid.points, _sampled(grid, "uh"))]
     @test length(plt.sample_geometry[]) == 2 * 32 * length(unique(_sampled(grid, "region_id")))
-    graph = only(plt.plots)
+    graph, outline = plt.plots                                        # the graph, then ∂Ω, not drawn here
     @test graph isa Makie.LineSegments && graph[1][] == plt.sample_geometry[]
+    @test outline isa Makie.VLines && isnan(only(outline[1][]))
     @test fieldplot(s1, m1; color=:red, linewidth=3).plot.plots[1].color[] == Makie.to_color(:red)
     @test length(fieldplot(s1, m1; subdivisions=:degree).plot.sample_geometry[]) < length(plt.sample_geometry[])
 
@@ -559,6 +572,161 @@ end
           [Makie.Point3{Float64}(x..., -1) for grid in grids for x in grid.points]
     @test plt.sample_color[] == reduce(vcat, [_sampled(grid, "uh") for grid in grids])
     @test length(_GB.coordinates(fieldplot(s, coupled; field=:u2).plot.sample_geometry[])) == 4
+end
+
+# ── Clipping and ∂Ω ───────────────────────────────────────────────────────────
+
+# The area of a 2D mesh, from its triangles' `x` and `y`.
+function _mesh_area(mesh)
+    x = _GB.coordinates(mesh)
+    return sum(_GB.faces(mesh); init=0.0) do (a, b, c)
+        return abs((x[b][1] - x[a][1]) * (x[c][2] - x[a][2]) - (x[c][1] - x[a][1]) * (x[b][2] - x[a][2])) / 2
+    end
+end
+
+# The total length of line segments given as consecutive pairs of points, in `x` and `y`.
+_segments_length(points) = sum(((a, b),) -> sqrt((b[1] - a[1])^2 + (b[2] - a[2])^2), _segments(points); init=0.0)
+
+# A planar level set, φ = x − 0.3, on a 4×4 order-2 square and on four order-1 cells of the unit interval: its linear
+# interpolant on the sample cells is φ itself, so a clip at it is exact.
+_makie_plane = prepare(mass(space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=2,
+                                  physical=physical_domain(leaf(x -> x[1] - 0.3; lipschitz=1.0);
+                                                           subcell_length_scale=0.1))))
+_makie_plane_1d = prepare(mass(space(box((0.0,), (1.0,)); cells=4, order=1,
+                                     physical=physical_domain(leaf(x -> x[1] - 0.3; lipschitz=1.0);
+                                                              subcell_length_scale=0.1))))
+
+@testset "fieldplot clips a 2D field to Ω, exactly at a planar level set" begin
+    # Ω is x ≤ 0.3: the clipped mesh covers 0.3 of the unit square, keeps no point where φ > 0, puts every point it adds
+    # on x = 0.3, and colours it with the linear field's own value there.
+    linear = (u, c, x, xi) -> 2x[1] + 3x[2]
+    plt = fieldplot(_makie_plane; by=linear).plot
+    mesh = plt.sample_geometry[]
+    points = _GB.coordinates(mesh)
+    @test _mesh_area(mesh) ≈ 0.3 atol = 1.0e-14
+    @test all(p -> p[1] - 0.3 <= 1.0e-15, points)
+    grid = only(Unfitted._sample_fields(nothing, _makie_plane; point_data=(by=linear,))).data
+    sampled = Set(Makie.Point3{Float64}(x..., -1) for x in grid.points)
+    added = filter(p -> !(p in sampled), points)
+    @test !isempty(added) && all(p -> abs(p[1] - 0.3) <= 1.0e-15, added)
+    @test maximum(abs(c - (2p[1] + 3p[2])) for (p, c) in zip(points, plt.sample_color[])) <= 1.0e-14
+
+    # `clip = false` draws the sample cells whole, the corners in the record's order; `automatic` clips a field whose
+    # space carries a PhysicalDomain, and draws one without whole.
+    whole = fieldplot(_makie_plane; by=linear, clip=false).plot
+    @test _GB.coordinates(whole.sample_geometry[]) == [Makie.Point3{Float64}(x..., -1) for x in grid.points]
+    @test _mesh_area(whole.sample_geometry[]) ≈ 0.5                # the cells the fictitious fold kept
+    @test fieldplot(_makie_plane; by=linear, clip=true).plot.sample_geometry[] == mesh
+    @test fieldplot(_makie_2d).plot.sample_geometry[] == fieldplot(_makie_2d; clip=false).plot.sample_geometry[]
+
+    # Toggling `clip` or `boundary` on a drawn plot redraws it from the samples it took, without sampling again.
+    samples = plt.samples[]
+    plt.clip = false
+    @test plt.sample_geometry[] == whole.sample_geometry[] && plt.samples[] === samples
+    plt.boundary = true
+    @test !isempty(plt.sample_boundary[]) && plt.samples[] === samples
+end
+
+@testset "fieldplot's clipped area and ∂Ω converge at second order in cut_depth" begin
+    # A disk of radius r, whose boundary the clip and the contour facet at the size of the cells `cut_depth` refines
+    # it to: each bisection quarters the area's error and the contour length's.
+    r = 0.35
+    disk = physical_domain(leaf(x -> hypot(x[1] - 0.5, x[2] - 0.5) - r; lipschitz=1.0); subcell_length_scale=0.05)
+    model = prepare(mass(space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=1, physical=disk)))
+    area, length = Float64[], Float64[]
+    for depth in 1:5
+        plt = fieldplot(model; cut_depth=depth, boundary=true).plot
+        push!(area, abs(_mesh_area(plt.sample_geometry[]) - π * r^2))
+        push!(length, abs(_segments_length(plt.sample_boundary[]) - 2π * r))
+    end
+    @test all(ratio -> 3.5 <= ratio <= 4.5, area[1:(end-1)] ./ area[2:end])
+    @test all(ratio -> 3.5 <= ratio <= 4.5, length[1:(end-1)] ./ length[2:end])
+    @test last(area) < 1.0e-4 && last(length) < 1.0e-4
+end
+
+@testset "fieldplot clips region edges, a warped surface and a 1D graph alike" begin
+    linear = (u, c, x, xi) -> 2x[1] + 3x[2]
+    # The region edges keep the parts in Ω, cut at x = 0.3.
+    edges = fieldplot(_makie_plane; by=linear, strokewidth=1).plot.sample_edges[]
+    @test all(p -> p[1] - 0.3 <= 1.0e-15, edges)
+    @test any(p -> abs(p[1] - 0.3) <= 1.0e-15, edges)
+    @test length(edges) < length(fieldplot(_makie_plane; by=linear, strokewidth=1, clip=false).plot.sample_edges[])
+
+    # A warped surface is clipped the same way, every point, the clip points included, at the value's height.
+    points = _GB.coordinates(fieldplot(_makie_plane; by=linear, warp=true).plot.sample_geometry[])
+    @test all(p -> p[1] - 0.3 <= 1.0e-15, points)
+    @test maximum(p -> abs(p[3] - (2p[1] + 3p[2])), points) <= 1.0e-14
+
+    # A 1D graph ends at the root, with the value interpolated there.
+    graph = fieldplot(_makie_plane_1d; by=(u, c, x, xi) -> 1 + 2x[1]).plot.sample_geometry[]
+    @test maximum(p -> p[1], graph) ≈ 0.3 atol = 1.0e-15
+    @test all(p -> abs(p[2] - (1 + 2p[1])) <= 1.0e-14, graph)
+    @test length(graph) < length(fieldplot(_makie_plane_1d; clip=false).plot.sample_geometry[])
+end
+
+@testset "boundary draws ∂Ω on every plot, and needs a PhysicalDomain" begin
+    # 2D: ∂Ω is the line x = 0.3, of length 1, drawn at z = −¼ by every plot, a field plot on its own sample cells and
+    # the others on the sampler's defaults; on a warped field plot at the value's height. A field and a level plot draw
+    # it last, in front of every cell and edge; a quadrature plot first, behind its points, which are what it shows. 1D:
+    # one vertical line, at the root.
+    linear = (u, c, x, xi) -> 2x[1] + 3x[2]
+    @test first(quadratureplot(_makie_plane; boundary=true).plot.plots) isa Makie.LineSegments
+    for plt in (fieldplot(_makie_plane; boundary=true).plot, levelplot(_makie_plane; boundary=true).plot,
+                quadratureplot(_makie_plane; boundary=true).plot)
+        outline = _outline(plt)
+        @test outline isa Makie.LineSegments && outline.color[] == Makie.to_color(:black)
+        points = outline[1][]
+        @test !isempty(points) && all(p -> abs(p[1] - 0.3) <= 1.0e-15 && p[3] == -0.25, points)
+        @test _segments_length(points) ≈ 1
+    end
+    warped = fieldplot(_makie_plane; by=linear, warp=true, boundary=true).plot.sample_boundary[]
+    @test maximum(p -> abs(p[3] - (2p[1] + 3p[2])), warped) <= 1.0e-14
+    for plt in (fieldplot(_makie_plane_1d; boundary=true).plot, levelplot(_makie_plane_1d; boundary=true).plot,
+                quadratureplot(_makie_plane_1d; boundary=true).plot)
+        @test _outline(plt) isa Makie.VLines
+        @test only(_outline(plt)[1][]) ≈ 0.3 atol = 1.0e-15
+    end
+    @test isempty(fieldplot(_makie_plane).plot.sample_boundary[])        # off by default
+    @test last(levelplot(_makie_plane; boundary=true, boundarycolor=:red, boundarywidth=3).plot.plots).linewidth[] == 3
+
+    # A plane through sample points, φ = x − ½ on cells with corners on x = ½, where every sample edge along it bounds
+    # a triangle on either side — on the left the full cells' and on the right the cut cells' refined to `cut_depth` —
+    # and is drawn once, by the triangle in Ω.
+    left = physical_domain(leaf(x -> x[1] - 0.5; lipschitz=1.0); subcell_length_scale=0.1)
+    half = prepare(mass(space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=1, physical=left)))
+    plt = fieldplot(half; boundary=true).plot
+    @test _segments_length(plt.sample_boundary[]) ≈ 1 && all(p -> p[1] == 0.5, plt.sample_boundary[])
+    @test _mesh_area(plt.sample_geometry[]) ≈ 0.5
+    # The cut cells right of it touch Ω along that edge alone and add no point to the mesh: every point is a triangle's.
+    @test length(Set(k for face in _GB.faces(plt.sample_geometry[]) for k in face)) ==
+          length(_GB.coordinates(plt.sample_geometry[]))
+
+    # Makie's VLines fails on no value at all when an axis computes its limits, which it does for every child of a
+    # plot, so a 1D plot without a root draws its ∂Ω from one NaN, which neither draws nor moves the limits.
+    for call in (fieldplot, levelplot, quadratureplot)
+        _, ax, plt = call(_makie_1d)
+        @test isnan(only(_outline(plt)[1][]))
+        Makie.reset_limits!(ax)
+        @test all(isfinite, ax.finallimits[].origin) && all(isfinite, ax.finallimits[].widths)
+    end
+    plt = fieldplot(_makie_1d).plot
+    @test Makie.boundingbox(plt) == Makie.boundingbox(first(plt.plots))       # the graph's own
+
+    # A plot of no field with a PhysicalDomain has no ∂Ω to draw, nor a clip to make.
+    cases = ((() -> fieldplot(_makie_2d; boundary=true), "fieldplot draws ∂Ω"),
+             (() -> levelplot(_makie_2d; boundary=true), "levelplot draws ∂Ω"),
+             (() -> quadratureplot(_makie_2d; boundary=true), "quadratureplot draws ∂Ω"),
+             (() -> fieldplot(_makie_2d; clip=true), "clip = true cuts the plot at ∂Ω"),
+             (() -> fieldplot(_makie_plane; clip=:yes), "clip must be true, false or automatic"))
+    for (call, says) in cases
+        err = try
+            call()
+            nothing
+        catch e
+            e
+        end
+        @test err !== nothing && occursin(says, sprint(showerror, err))
+    end
 end
 
 @testset "the 2D primitives of one quad" begin

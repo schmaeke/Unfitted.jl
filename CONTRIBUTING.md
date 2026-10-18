@@ -1646,7 +1646,9 @@ demos.
     without a solution — as records, with no writer loaded
     (`test_postprocessing.jl`); the Makie recipes' primitives — a
     field's sample cells, values, components, magnitudes, region edges,
-    warped heights and 1D graph, with and without a solution; each level
+    warped heights and 1D graph, with and without a solution, and their
+    cut at `∂Ω`, exact at a planar level set and converging at second
+    order in `cut_depth` on a disk; `∂Ω` drawn by every plot; each level
     mesh's cells, colours, edges and stacking in 2D, the ladder of levels
     in 1D, the colouring by an error estimate; the quadrature cloud —
     asserted exactly against those records on the plot objects

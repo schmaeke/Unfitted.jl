@@ -9,11 +9,16 @@ The extension samples nothing itself. `src/postprocessing.jl` samples a solution
 quadrature-point cloud into consumer-neutral records — `Unfitted.SampleGrid`, whose contract heads that file — and this
 extension draws them. Everything Makie-specific is decided here and nowhere else:
 
-  - the primitives: a 2D field or level mesh as a `GeometryBasics.Mesh` of quads, a 1D field graph, a 1D level mesh and
-    the cell edges as line segments, the quadrature cloud as a scatter;
+  - the primitives: a 2D field mesh as a `GeometryBasics.Mesh` of triangles, a 2D level mesh as one of quads, a 1D
+    field graph, a 1D level mesh, the cell edges and a 2D `∂Ω` as line segments, a 1D `∂Ω` as vertical lines, the
+    quadrature cloud as a scatter;
   - the colour of a cell: its record value repeated over the cell's own corners, which no other cell shares, so that
     the colour is flat and exact rather than interpolated across a neighbour;
-  - the stacking of the levels, and the axis each plot asks for.
+  - the cut of a field plot at `∂Ω`, and `∂Ω` itself: the zero set of the level set's linear interpolant on each
+    sample triangle, or each 1D sample cell. A triangle is cut by one pass, against the half-plane where the interpolant
+    is ≤ 0, of the polygon clipper of I. E. Sutherland, G. W. Hodgman, "Reentrant polygon clipping", Commun. ACM 17
+    (1974) 32–42, doi:10.1145/360767.360802 — a clean-room implementation, as in `src/surface.jl` (`NOTICE.md`);
+  - the stacking of the levels and of `∂Ω` in front of them, and the axis each plot asks for.
 
 Provided pieces:
 
@@ -62,6 +67,12 @@ Makie.@recipe LevelPlot (discretisation::Model,) begin
     strokewidth = 0.5
     "In 1D, the width in pixels of the segments that carry the colour."
     linewidth = 6
+    "Whether to draw ∂Ω, the zero contour of the level set's linear interpolant, which needs a `PhysicalDomain`."
+    boundary = false
+    "The colour of ∂Ω."
+    boundarycolor = :black
+    "The width of ∂Ω, in pixels."
+    boundarywidth = 1.5
     """
     Whether the colours are categories, one colour and one colour-bar block per value: `true`, `false`, or `automatic`
     for the quantities with a few discrete values — `:order_max`, `:level_id`, `:role_id`, `:active` and `:covered` —
@@ -83,6 +94,12 @@ Makie.@recipe QuadraturePlot (discretisation::Model,) begin
     marker = :circle
     "The size of a point's marker, in pixels."
     markersize = 6
+    "Whether to draw ∂Ω, the zero contour of the level set's linear interpolant, which needs a `PhysicalDomain`."
+    boundary = false
+    "The colour of ∂Ω."
+    boundarycolor = :black
+    "The width of ∂Ω, in pixels."
+    boundarywidth = 1.5
     "Whether the colours are categories: `true`, `false`, or `automatic` for `:cover_count` alone. Settled at creation."
     categorical = Makie.automatic
     Makie.mixin_colormap_attributes()...
@@ -118,6 +135,17 @@ Makie.@recipe FieldPlot (solution::Union{Nothing,Solution}, discretisation::Mode
     "In 2D, the width in pixels of the region edges; `0` draws none."
     strokewidth = 0
     """
+    Whether to cut the drawing at ∂Ω and draw only Ω = {φ ≤ 0}: `true`, `false` for the polynomial extension outside Ω
+    as well, or `automatic` for every field whose space carries a `PhysicalDomain`.
+    """
+    clip = Makie.automatic
+    "Whether to draw ∂Ω, the zero contour of the level set's linear interpolant, which needs a `PhysicalDomain`."
+    boundary = false
+    "The colour of ∂Ω."
+    boundarycolor = :black
+    "The width of ∂Ω, in pixels."
+    boundarywidth = 1.5
+    """
     Whether the colours are categories, one colour and one colour-bar block per value: `true`, `false`, or `automatic`
     for `:cover_count` alone. Settled when the plot is created.
     """
@@ -143,6 +171,10 @@ function Makie.plot!(p::LevelPlot{<:Tuple{<:Model{D}}}) where {D}
     _draw_cells!(p, Val(D), _colormap_node!(p, :cell_colormap))
     Makie.linesegments!(p, Makie.shared_attributes(p, Makie.LineSegments), p.cell_edges; color=p.strokecolor,
                         linewidth=p.strokewidth)
+    map!(p.attributes, [:discretisation, :field, :boundary], :model_boundary) do model, field, boundary
+        return _model_boundary(Val(D), model, field, boundary, :levelplot)
+    end
+    _draw_boundary!(p, :model_boundary, Val(D))
     return p
 end
 
@@ -159,13 +191,18 @@ end
 
 function Makie.plot!(p::FieldPlot{<:Tuple{<:Union{Nothing,Solution},<:Model{D}}}) where {D}
     _check_dimension(Val(D), :fieldplot, :write_vtk)
+    # The sampling, the costly part, is a computation of its own, which neither `clip` nor `boundary` reaches, so that
+    # toggling either redraws the samples without taking them again.
     inputs = [:solution, :discretisation, :by, :component, :warp, :field, :subdivisions, :cut_depth]
-    outputs = [:sample_geometry, :sample_color, :sample_edges]
-    map!(p.attributes, inputs, outputs) do solution, model, by, component, warp, field, subdivisions, cut_depth
-        grids, values = _sampled_values(solution, model, by, component, field, subdivisions, cut_depth, warp)
-        return _field_primitives(Val(D), grids, values, warp)
+    map!(p.attributes, inputs, :samples) do solution, model, by, component, warp, field, subdivisions, cut_depth
+        return _samples(solution, model, by, component, field, subdivisions, cut_depth, warp)
+    end
+    outputs = [:sample_geometry, :sample_color, :sample_edges, :sample_boundary]
+    map!(p.attributes, [:samples, :warp, :clip, :boundary], outputs) do samples, warp, clip, boundary
+        return _field_primitives(Val(D), samples, _level_sets(samples, clip, boundary), warp, boundary)
     end
     _draw_field!(p, Val(D))
+    _draw_boundary!(p, :sample_boundary, Val(D))
     return p
 end
 
@@ -183,8 +220,31 @@ function _draw_field!(p::FieldPlot, ::Val{1})
     Makie.linesegments!(p, Makie.shared_attributes(p, Makie.LineSegments), p.sample_geometry)
 end
 
+# The child that draws ∂Ω, the plot's attribute `name`, last, so that CairoMakie, painting children in order, puts it
+# over everything the plot drew before: in 2D the contour as line segments, in 1D a vertical line at each root.
+#
+# Makie's `VLines` takes the extrema of its values for the axis limits, which fails on no value at all — and an axis
+# computes the limits of every child of a plot, the invisible ones included — so a 1D plot without a root, which is
+# every one without `boundary`, hands it one NaN instead, which it neither draws nor counts in the limits.
+function _draw_boundary!(p, name::Symbol, ::Val{2})
+    return Makie.linesegments!(p, Makie.shared_attributes(p, Makie.LineSegments), getproperty(p, name);
+                               color=p.boundarycolor, linewidth=p.boundarywidth)
+end
+function _draw_boundary!(p, name::Symbol, ::Val{1})
+    map!(roots -> isempty(roots) ? [NaN] : roots, p.attributes, name, :boundary_lines)
+    return Makie.vlines!(p, p.boundary_lines; color=p.boundarycolor, linewidth=p.boundarywidth, visible=p.visible,
+                         inspectable=p.inspectable)
+end
+
+# The points are what a quadrature plot shows, and `∂Ω` is drawn for reference behind them in every backend: its child
+# comes first, which a backend that paints in child order (CairoMakie) paints first, and lies at `_BOUNDARY_Z`, behind
+# the points at `z = 0`, which a backend that tests depth (GLMakie) draws behind them.
 function Makie.plot!(p::QuadraturePlot{<:Tuple{<:Model{D}}}) where {D}
     _check_dimension(Val(D), :quadratureplot, :write_quadrature_vtm)
+    map!(p.attributes, [:discretisation, :boundary], :model_boundary) do model, boundary
+        return _model_boundary(Val(D), model, nothing, boundary, :quadratureplot)
+    end
+    _draw_boundary!(p, :model_boundary, Val(D))
     map!(p.attributes, [:discretisation, :by], [:point_positions, :point_color]) do model, by
         return _quadrature_primitives(Val(D), _sample_quadrature(model), by)
     end
@@ -296,9 +356,11 @@ function _warped_aspect(model::Model, field)
     return (widths[1] / maximum(widths), widths[2] / maximum(widths), 2 / 3)
 end
 
-# A `Colorbar` reads the colour mapping off the child that carries the colours, which each recipe draws first; the
-# edges of a level or a field plot are drawn in one solid colour and have none.
-Makie.extract_colormap(p::Union{LevelPlot,QuadraturePlot,FieldPlot}) = Makie.extract_colormap(first(p.plots))
+# A `Colorbar` reads the colour mapping off the child that carries the colours: the first child of a level or a field
+# plot, whose edges and `∂Ω` are drawn in one solid colour and have none, and the scatter of a quadrature plot, which
+# draws its `∂Ω` first so that the points lie in front of it.
+Makie.extract_colormap(p::Union{LevelPlot,FieldPlot}) = Makie.extract_colormap(first(p.plots))
+Makie.extract_colormap(p::QuadraturePlot) = Makie.extract_colormap(only(c for c in p.plots if c isa Makie.Scatter))
 
 # ── Level meshes ──────────────────────────────────────────────────────────────
 
@@ -480,17 +542,54 @@ const _TICK = 0.2
 # of levels covering each region without one.
 _resolved_by(by, solution) = by === Makie.automatic ? (solution === nothing ? :cover_count : :uh) : by
 
-# The sample grids a field plot draws, one per sampled field, and the plotted value at every point of each. `by` is
-# handed to the sampler as the record's one `point_data` entry, or as none for a built-in array, so the sampler checks,
-# evaluates and refuses it as it does `write_vtk`'s entries; the value is read back off the record and reduced to one
-# number per point. `subdivisions = automatic` resolves by what the plot draws (`_automatic_subdivisions`).
-function _sampled_values(solution, model::Model{D}, by, component, field, subdivisions, cut_depth, warp) where {D}
+# The samples a field plot draws, one per sampled field, as `(; name, grid, values)`: the field's name, its record's
+# sample grid, and the plotted value at every point of it. `by` is handed to the sampler as the record's one
+# `point_data` entry, or as none for a built-in array, so the sampler checks, evaluates and refuses it as it does
+# `write_vtk`'s entries; the value is read back off the record and reduced to one number per point.
+# `subdivisions = automatic` resolves by what the plot draws (`_automatic_subdivisions`). A sample's type is the same
+# for every field of a model, which the plot's computed `samples` needs: Makie keeps the type of a computed value's
+# first result, and the records' own type follows the fields drawn.
+function _samples(solution, model::Model{D}, by, component, field, subdivisions, cut_depth, warp) where {D}
     request = _field_request(_resolved_by(by, solution), solution)
     _check_one_field_per_space(model, field)
     subdivisions = subdivisions === Makie.automatic ? _automatic_subdivisions(Val(D), warp) : subdivisions
-    grids = [record.data
-             for record in _sample_fields(solution, model; field, subdivisions, cut_depth, request.point_data)]
-    return grids, [_plotted_values(grid, request, component) for grid in grids]
+    return map(_sample_fields(solution, model; field, subdivisions, cut_depth, request.point_data)) do record
+        return (; name=record.field.name, grid=record.data, values=_plotted_values(record.data, request, component))
+    end
+end
+
+# The level set at every point of each sample, and whether the sample's drawing is clipped to Ω, as `(; φ, clipped)`:
+# `φ` is the sample's `level_set` array, which the sampler attaches for a field whose space carries a `PhysicalDomain`
+# and for no other, or `nothing`. `clip = automatic` clips exactly the samples that have one; `true` clips every sample
+# and refuses one that has none, as `boundary = true` refuses a plot none of whose samples has one.
+function _level_sets(samples, clip, boundary::Bool)
+    if !(clip isa Bool || clip === Makie.automatic)
+        throw(ArgumentError("clip must be true, false or automatic; got $(repr(clip))"))
+    end
+    levels = map(samples) do sample
+        φ = _level_set(sample.grid)
+        clipped = clip === Makie.automatic ? φ !== nothing : clip
+        if clipped && φ === nothing
+            throw(ArgumentError("clip = true cuts the plot at ∂Ω, and the space of the field $(sample.name) carries " *
+                                "no PhysicalDomain: pass clip = false, or automatic to clip only the fields that " *
+                                "have one"))
+        end
+        return (; φ, clipped)
+    end
+    boundary && all(level -> level.φ === nothing, levels) && throw(_no_boundary(:fieldplot))
+    return levels
+end
+
+# A record's `level_set` point array, as floating-point numbers, or `nothing` for a record without one.
+function _level_set(grid::SampleGrid)
+    i = findfirst(entry -> first(entry) == "level_set", grid.point_data)
+    return i === nothing ? nothing : Vector{Float64}(last(grid.point_data[i]))
+end
+
+# The refusal of `boundary = true` on a plot of no field with a `PhysicalDomain`, whose boundary is the box's own.
+function _no_boundary(plot::Symbol)
+    return ArgumentError("$plot draws ∂Ω with boundary = true, and no drawn field's space carries a PhysicalDomain: " *
+                         "there is no immersed boundary to draw")
 end
 
 # The sample cells per region a field plot takes by default, sized by what each drawing shows.
@@ -575,50 +674,187 @@ end
 # into the same axis afterwards lies in front of it; its region edges lie half a unit in front of the surface.
 const _FLAT = -1.0
 
-# The 2D drawing of a field: one mesh of every sample cell, coloured by the plotted value at each corner, at the height
-# of the value with `warp` and flat at `_FLAT` without. A record's cells own their corners, so a value that jumps
-# between cells, or between regions, is drawn as a jump rather than smeared across it. The region edges are drawn on the
-# flat surface only: a warped surface hides parts of its edges, which CairoMakie, painting the edges after the surface,
-# would draw anyway.
-#
-# Each cell is a quad, which Makie splits into the two triangles (1, 2, 3) and (1, 3, 4) and colours linearly over
-# each, where ParaView interpolates a quad bilinearly: the cell's colour then bends along one diagonal, which a
-# contrasting colour map can show as streaks on cells too coarse for the field. `subdivisions` is what resolves it. A
-# fan of four triangles around a centre sampled exactly was measured as the alternative and rejected: its four
-# gradients meet at the centre, which reads as a star at every cell, under the default colour map as well.
-function _field_primitives(::Val{2}, grids, values, warp::Bool)
-    positions, colors, edges = Point3{Float64}[], Float64[], Point3{Float64}[]
-    faces = GeometryBasics.QuadFace{Int}[]
-    for (grid, v) in zip(grids, values)
-        offset = length(positions)
-        append!(positions, (Point3{Float64}(x[1], x[2], warp ? v[k] : _FLAT) for (k, x) in pairs(grid.points)))
-        for c in 1:_cell_count(grid)
-            push!(faces, GeometryBasics.QuadFace{Int}(offset + 4c - 3, offset + 4c - 2, offset + 4c - 1, offset + 4c))
-        end
-        append!(colors, v)
-        warp || _region_edges!(edges, grid)
+# The height every flat plot draws ∂Ω at: in front of a field's surface and edges and of every level of a level plot,
+# and behind `z = 0`, where a plot drawn into the same axis afterwards lands.
+const _BOUNDARY_Z = -0.25
+
+# The 2D drawing of a field: the triangles of its sample cells (`_surface!`), coloured by the plotted value at each
+# corner, at the height of the value with `warp` and flat at `_FLAT` without; the region edges (`_region_edges!`); and,
+# with `boundary`, ∂Ω (`_contour!`), on the surface. A record's cells own their corners, so a value that jumps between
+# cells, or between regions, is drawn as a jump rather than smeared across it. The region edges are drawn on the flat
+# surface only: a warped surface hides parts of its edges, which CairoMakie, painting the edges after the surface, would
+# draw anyway.
+function _field_primitives(::Val{2}, samples, levels, warp::Bool, boundary::Bool)
+    positions, colors, edges, contour = Point3{Float64}[], Float64[], Point3{Float64}[], Point3{Float64}[]
+    faces = GeometryBasics.TriangleFace{Int}[]
+    for ((; grid, values), level) in zip(samples, levels)
+        _surface!(positions, colors, faces, grid, values, level, warp)
+        warp || _region_edges!(edges, grid, level)
+        boundary && level.φ !== nothing && _contour!(contour, grid, level.φ, warp ? values : _BOUNDARY_Z)
     end
-    return GeometryBasics.Mesh(positions, faces), colors, edges
+    return GeometryBasics.Mesh(positions, faces), colors, edges, contour
+end
+
+# The triangles of a record's sample cells, appended to a mesh's `positions`, `colors` and `faces`. Each cell is split
+# as Makie splits a quad, into (1, 2, 3) and (1, 3, 4) (`_cell_triangles`), so that a clipped and an unclipped plot
+# share one face type and colour alike. Makie colours a triangle linearly between its corners, where ParaView
+# interpolates a quad bilinearly, so the colour bends along the cell's diagonal; a contrasting colour map can show it as
+# streaks on cells too coarse for the field, which `subdivisions` resolves. A fan of four triangles around a centre
+# sampled exactly was measured as the alternative and rejected: its four gradients meet at the centre, which reads as a
+# star at every cell, under the default colour map as well.
+#
+# A clipped record keeps of each triangle the part where the linear interpolant of φ at its corners is ≤ 0 — the whole
+# triangle, nothing, or a polygon of three or four vertices cut along the interpolant's zero line, which is fanned from
+# its first vertex (one pass of the clipper of I. E. Sutherland and G. W. Hodgman, "Reentrant polygon clipping",
+# Commun. ACM 17 (1974) 32–42, doi:10.1145/360767.360802, against one half-plane). A clip vertex takes the value and the
+# height interpolated linearly along its edge, which is what the renderer interpolates across the triangle, so a clipped
+# plot draws inside Ω exactly what an unclipped one does. A corner joins the mesh when a triangle first uses it, so a
+# cell outside Ω adds nothing — not even to the axis limits.
+function _surface!(positions, colors, faces, grid::SampleGrid{2}, v, level, warp::Bool)
+    index, φ = zeros(Int, length(grid.points)), level.φ
+    function corner(k)
+        if index[k] == 0
+            push!(positions, Point3{Float64}(grid.points[k]..., warp ? v[k] : _FLAT))
+            push!(colors, v[k])
+            index[k] = length(positions)
+        end
+        return index[k]
+    end
+    function cut(a, b)
+        i, j, t = _crossing(grid.points, φ, a, b)
+        x, value = _lerp(grid.points, i, j, t), _lerp(v, i, j, t)
+        push!(positions, Point3{Float64}(x..., warp ? value : _FLAT))
+        push!(colors, value)
+        return length(positions)
+    end
+    for c in 1:_cell_count(grid), triangle in _cell_triangles(c)
+        if !level.clipped || all(k -> φ[k] <= 0, triangle)
+            push!(faces, GeometryBasics.TriangleFace{Int}(map(corner, triangle)...))
+            continue
+        end
+        any(k -> φ[k] < 0, triangle) || continue                   # φ ≥ 0 throughout: Ω meets it in no area
+        polygon = Int[]
+        for (a, b) in _triangle_edges(triangle)
+            φ[a] <= 0 && push!(polygon, corner(a))
+            _crosses(φ[a], φ[b]) && push!(polygon, cut(a, b))
+        end
+        for j in 2:(length(polygon)-1)
+            push!(faces, GeometryBasics.TriangleFace{Int}(polygon[1], polygon[j], polygon[j+1]))
+        end
+    end
+    return faces
+end
+
+# The two triangles of sample cell `c`, as indices of its points, which come in the face-cyclic order of the record:
+# (1, 2, 3) and (1, 3, 4), Makie's own split of a quad.
+_cell_triangles(c::Int) = ((4c - 3, 4c - 2, 4c - 1), (4c - 3, 4c - 1, 4c))
+
+# The edges of a triangle, each from one vertex to the next.
+_triangle_edges((a, b, c)) = ((a, b), (b, c), (c, a))
+
+# Whether the linear interpolant of φ between two values vanishes strictly between them: one negative, one positive. A
+# value of exactly zero is a vertex of the zero set, which its own vertex accounts for.
+_crosses(φa, φb) = φa < 0 < φb || φb < 0 < φa
+
+# Where φ's linear interpolant along the segment between points `a` and `b` of `points` vanishes, as `(i, j, t)`: the
+# point `_lerp(points, i, j, t)`. The ends are taken in a fixed order, the lexicographically lower point first, so that
+# two cells meeting along an edge, whose points there are bit-identical, find bit-identical crossings on it, and a
+# clipped surface and a contour close up between them.
+function _crossing(points, φ, a::Int, b::Int)
+    i, j = Tuple(points[a]) <= Tuple(points[b]) ? (a, b) : (b, a)
+    return i, j, φ[i] / (φ[i] - φ[j])
+end
+_lerp(values, i::Int, j::Int, t) = values[i] + t * (values[j] - values[i])
+
+# The part of the segment between points `a` and `b` of `points` that a clipped drawing keeps, as its two ends, or
+# `nothing`: all of it unclipped or with φ ≤ 0 at both ends; none of it with φ > 0 at either end and no crossing; and
+# otherwise the part between the end where φ < 0 and the crossing.
+function _kept_piece(points, level, a::Int, b::Int)
+    level.clipped || return (points[a], points[b])
+    φ = level.φ
+    φ[a] <= 0 && φ[b] <= 0 && return (points[a], points[b])
+    _crosses(φ[a], φ[b]) || return nothing
+    x = _lerp(points, _crossing(points, φ, a, b)...)
+    return φ[a] < 0 ? (points[a], x) : (x, points[b])
+end
+
+# ∂Ω on a record's sample cells, appended to `segments`: in each triangle of each cell (`_cell_triangles`, the split
+# the surface is drawn with), the segment along which φ's linear interpolant vanishes — between the two crossings on its
+# edges, or a vertex where φ is zero and the crossing on the opposite edge, or the triangle's edge whose two vertices
+# both have φ = 0. That edge bounds a second triangle, across it, which would draw it again; it is drawn by the triangle
+# whose third vertex has φ < 0, the one in Ω, so a plane through sample points is drawn once along it. A triangle the
+# zero set only touches, at one vertex, has no segment. `heights` gives the segment its height: one `z` for a flat plot,
+# or a point array, interpolated as the surface is, for a warped one.
+function _contour!(segments, grid::SampleGrid{2}, φ, heights)
+    height(k) = heights isa Real ? heights : heights[k]
+    for c in 1:_cell_count(grid), triangle in _cell_triangles(c)
+        ends = Point3{Float64}[]
+        for (a, b) in _triangle_edges(triangle)
+            φ[a] == 0 && push!(ends, Point3{Float64}(grid.points[a]..., height(a)))
+            if _crosses(φ[a], φ[b])
+                i, j, t = _crossing(grid.points, φ, a, b)
+                z = heights isa Real ? heights : _lerp(heights, i, j, t)
+                push!(ends, Point3{Float64}(_lerp(grid.points, i, j, t)..., z))
+            end
+        end
+        length(ends) == 2 || continue
+        count(k -> φ[k] == 0, triangle) < 2 || any(k -> φ[k] < 0, triangle) || continue
+        append!(segments, ends)
+    end
+    return segments
+end
+
+# The roots of φ's linear interpolant on a 1D record's sample cells, appended to `roots`: the crossing inside each cell,
+# and each point where φ is zero.
+function _roots!(roots, grid::SampleGrid{1}, φ)
+    for c in 1:_cell_count(grid)
+        a, b = 2c - 1, 2c
+        φ[a] == 0 && push!(roots, grid.points[a][1])
+        φ[b] == 0 && push!(roots, grid.points[b][1])
+        _crosses(φ[a], φ[b]) && push!(roots, _lerp(grid.points, _crossing(grid.points, φ, a, b)...)[1])
+    end
+    return roots
+end
+
+# The ∂Ω a level or a quadrature plot draws, sampled for the purpose: nothing without `boundary`; with it, ∂Ω on the
+# sample cells of the drawn fields' spaces at the sampler's defaults — `:degree`, `cut_depth = 3` — which a model needs
+# no solution for, each space once: in 2D the contour at `_BOUNDARY_Z`, in 1D the roots in order.
+function _model_boundary(::Val{D}, model::Model, field, boundary::Bool, plot::Symbol) where {D}
+    found, contour = false, D == 1 ? Float64[] : Point3{Float64}[]
+    boundary || return contour
+    spaces = []
+    for record in _sample_fields(nothing, model; field, point_data=NamedTuple())
+        any(s -> s === record.field.space, spaces) && continue
+        push!(spaces, record.field.space)
+        φ = _level_set(record.data)
+        φ === nothing && continue
+        found = true
+        D == 1 ? _roots!(contour, record.data, φ) : _contour!(contour, record.data, φ, _BOUNDARY_Z)
+    end
+    found || throw(_no_boundary(plot))
+    return D == 1 ? sort!(unique!(contour)) : contour
 end
 
 # The edges of the regions of a sample grid, appended to `edges` as segments half a unit in front of the flat surface:
-# of every sample cell, the edges that lie on the boundary of its region's box. A record lists a region's cells together
-# (its `region_id` array does not decrease), so each region is one run of cells and its box is the hull of their
-# corners; a cell's corner coordinates are those of its lattice box, so an edge on the region's box compares equal to
-# it. Regions tile a field's subdomain without overlapping, so a region edge crosses no cell, which is what lets the
-# edges be drawn after the surface, in CairoMakie's painting order, without covering any of it.
-function _region_edges!(edges, grid::SampleGrid{2})
+# of every sample cell, the edges that lie on the boundary of its region's box, and of those only what a clipped drawing
+# keeps of them (`_kept_piece`). A record lists a region's cells together (its `region_id` array does not decrease), so
+# each region is one run of cells and its box is the hull of their corners; a cell's corner coordinates are those of
+# its lattice box, so an edge on the region's box compares equal to it. Regions tile a field's subdomain without
+# overlapping, so a region edge crosses no cell, which is what lets the edges be drawn after the surface, in
+# CairoMakie's painting order, without covering any of it.
+function _region_edges!(edges, grid::SampleGrid{2}, level)
     regions, z = last(grid.cell_data[findfirst(entry -> first(entry) == "region_id", grid.cell_data)]), _FLAT + 0.5
-    run = 1
+    p, run = grid.points, 1
     while run <= length(regions)
         cells = run:(something(findnext(!=(regions[run]), regions, run), length(regions)+1)-1)
-        corners = grid.points[(4first(cells)-3):(4last(cells))]
+        corners = p[(4first(cells)-3):(4last(cells))]
         lo, hi = reduce((a, b) -> min.(a, b), corners), reduce((a, b) -> max.(a, b), corners)
         for c in cells
-            ll, lr, ur, ul = grid.points[(4c-3):(4c)]
-            for (a, b, on) in ((ll, lr, ll[2] == lo[2]), (ul, ur, ul[2] == hi[2]), (ll, ul, ll[1] == lo[1]),
-                               (lr, ur, lr[1] == hi[1]))
-                on && push!(edges, Point3{Float64}(a[1], a[2], z), Point3{Float64}(b[1], b[2], z))
+            ll, lr, ur, ul = 4c - 3, 4c - 2, 4c - 1, 4c
+            for (a, b, on) in ((ll, lr, p[ll][2] == lo[2]), (ul, ur, p[ul][2] == hi[2]), (ll, ul, p[ll][1] == lo[1]),
+                               (lr, ur, p[lr][1] == hi[1]))
+                piece = on ? _kept_piece(p, level, a, b) : nothing
+                piece === nothing || push!(edges, Point3{Float64}(piece[1]..., z), Point3{Float64}(piece[2]..., z))
             end
         end
         run = last(cells) + 1
@@ -627,14 +863,20 @@ function _region_edges!(edges, grid::SampleGrid{2})
 end
 
 # The 1D drawing of a field: its graph over every sample cell, a segment between the values at the cell's two ends —
-# the cell's own two points, so a value that jumps between cells is drawn as a jump. The graph takes the plot's one
-# `color`; the value it would colour by is the height already.
-function _field_primitives(::Val{1}, grids, values, warp::Bool)
-    segments = Point2{Float64}[]
-    for (grid, v) in zip(grids, values), (k, x) in pairs(grid.points)
-        push!(segments, Point2{Float64}(x[1], v[k]))
+# the cell's own two points, so a value that jumps between cells is drawn as a jump — and of a clipped record only the
+# part where φ's linear interpolant is ≤ 0, cut at its root with the value interpolated there; with `boundary`, the
+# roots, in order. The graph takes the plot's one `color`; the value it would colour by is the height already.
+function _field_primitives(::Val{1}, samples, levels, warp::Bool, boundary::Bool)
+    segments, roots = Point2{Float64}[], Float64[]
+    for ((; grid, values), level) in zip(samples, levels)
+        graph = [SVector(x[1], values[k]) for (k, x) in pairs(grid.points)]
+        for c in 1:_cell_count(grid)
+            piece = _kept_piece(graph, level, 2c - 1, 2c)
+            piece === nothing || push!(segments, Point2{Float64}(piece[1]...), Point2{Float64}(piece[2]...))
+        end
+        boundary && level.φ !== nothing && _roots!(roots, grid, level.φ)
     end
-    return segments, Float64[], Point2{Float64}[]
+    return segments, Float64[], Point2{Float64}[], sort!(unique!(roots))
 end
 
 # ── Quadrature cloud ──────────────────────────────────────────────────────────

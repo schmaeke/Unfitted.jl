@@ -596,6 +596,7 @@ write_quadrature_vtm(args...; kwargs...) = _extension_missing(write_quadrature_v
 """
     fieldplot(solution, model; by=automatic, component=nothing, warp=false, field=nothing,
               subdivisions=automatic, cut_depth=3, color, linewidth, strokecolor=:black, strokewidth=0,
+              clip=automatic, boundary=false, boundarycolor=:black, boundarywidth=1.5,
               categorical=automatic, colormap, colorrange, …)
     fieldplot(model; …)
     fieldplot!([axis,] [solution,] model; …)
@@ -609,16 +610,30 @@ The model is sampled as [`write_vtk`](@ref) samples it: every integration region
 `subdivisions` lattice, with the cells `∂Ω` crosses refined `cut_depth` times. Every sample cell owns its corners, so a
 value that jumps between cells, or between regions, is drawn as a jump rather than smeared across it.
 
-  - **2D.** A mesh of the sample cells, coloured by the plotted value at each corner and, in between, linearly over the
-    two triangles Makie splits each quad into — where ParaView interpolates a quad bilinearly, so a contrasting colour
-    map can show the diagonals of cells too coarse for the field, which a larger `subdivisions` resolves. The axis keeps
-    the data's aspect ratio. With `warp = true` the surface rises to the height of the value, in an `Axis3` with the
-    domain to scale and the value on its vertical axis.
+  - **2D.** A mesh of the sample cells, each split along the diagonal from its lower-left to its upper-right corner,
+    coloured by the plotted value at each corner and, in between, linearly over each triangle — where ParaView
+    interpolates a quad bilinearly, so a contrasting colour map can show the diagonals of cells too coarse for the
+    field, which a larger `subdivisions` resolves. The axis keeps the data's aspect ratio. With `warp = true` the
+    surface rises to the height of the value, in an `Axis3` with the domain to scale and the value on its vertical
+    axis.
   - **1D.** The graph of the value against `x`, one segment per sample cell, in one colour, in an axis whose vertical
     axis names the plotted quantity.
 
 Fields on different subdomains of a coupled model are drawn side by side; fields that share a space would cover the same
 cells, so a model with such fields is drawn one field at a time, picked with `field`.
+
+A field whose space carries a [`PhysicalDomain`](@ref) is drawn on `Ω` alone. Each sample triangle, or 1D sample
+cell, keeps the part where the linear interpolant of the level set `φ` between its corners is `≤ 0`; a corner the cut
+adds, where that interpolant vanishes on an edge, takes the plotted value interpolated linearly along the edge, as the
+triangle's colours and a warped surface's heights already are, so that inside `Ω` the cut plot is exactly the uncut
+one. The region edges are cut at the same points, and `boundary = true` draws `∂Ω` itself, the zero set of the same
+interpolant. Both are a facetisation at the size of the sample cells, which `cut_depth` refines where `∂Ω` runs and
+`subdivisions` only at the cost of every cell — see "Resolving the immersed boundary" below. Each step of `cut_depth`
+halves the cells `∂Ω` crosses and quarters the error of the drawn area and of the drawn length of `∂Ω`: on a disk of
+radius 0.35 over 4×4 order-1 cells, from 5.0e-4 and 8.2e-4 at the default `cut_depth = 3` to 3.2e-5 and 5.1e-5 at 5.
+Where two cut regions whose finest sample cells differ in size meet, their cuts need not meet on the shared edge, and
+the plot can show a crack there about as wide as that error. The cut adds at most one triangle per triangle it cuts;
+the cost of a finer `∂Ω` is the sampling's.
 
 Keyword arguments, which are the plot's attributes:
 
@@ -644,6 +659,13 @@ Keyword arguments, which are the plot's attributes:
   - `color`, `linewidth` — in 1D, the colour and the width in pixels of the graph.
   - `strokecolor`, `strokewidth` — in 2D, the colour and the width in pixels of the region edges; `strokewidth = 0`
     (default) draws none. The edges run along the regions' boundaries, so no edge crosses a cell.
+  - `clip` — whether to cut the plot at `∂Ω`, as described above: `automatic` (default) cuts every field whose space
+    carries a `PhysicalDomain` and draws any other whole; `false` draws every sample cell whole, with the polynomial
+    extension a solution has outside `Ω`; `true` cuts, and is refused on a field whose space carries none.
+  - `boundary`, `boundarycolor`, `boundarywidth` — whether to draw `∂Ω`, `false` by default, and its colour and its
+    width in pixels, `:black` and `1.5`: in 2D the segments of the interpolant's zero contour, in front of the cells
+    and the region edges, or on a warped surface at the plotted value's height; in 1D a vertical line at every root.
+    `boundary = true` is refused when no drawn field's space carries a `PhysicalDomain`.
   - `categorical` — whether the colours are categories, one colour and one colour-bar block per value: `true`, `false`,
     or `automatic` (default) for `:cover_count` alone. Settled when the plot is created.
   - `colormap`, `colorrange`, `colorscale`, `lowclip`, `highclip`, `nan_color`, `alpha` — the colour mapping of a 2D
@@ -655,13 +677,12 @@ To follow a run, pass the solution, or the model, as an `Observable`. When both 
 updates. Makie fixes a plot's argument types when it creates the plot, so a new model must be of the plot's model's type
 — the same problem on moved or re-masked levels, say; a model with other levels needs a new plot.
 
-A `by`, `component` or callback the plot cannot use is refused with an error that names the problem, as are `by = :uh`
-without a solution and `by = :level_set` on a model without a `PhysicalDomain`; Makie raises the error wrapped in its
-own exception, since it arises while the plot computes what to draw. A model of three or more dimensions is refused with
-an `ArgumentError`: write it with [`write_vtk`](@ref) and look at it in ParaView.
+A `by`, `component`, `clip` or callback the plot cannot use is refused with an error that names the problem, as are
+`by = :uh` without a solution and `by = :level_set` on a model without a `PhysicalDomain`; Makie raises the error
+wrapped in its own exception, since it arises while the plot computes what to draw. A model of three or more dimensions
+is refused with an `ArgumentError`: write it with [`write_vtk`](@ref) and look at it in ParaView.
 
-Requires Makie, which each of its backends loads, as for [`levelplot`](@ref). Level-set clipping of an immersed model
-is not drawn: the sample cells outside `Ω` are drawn with the polynomial extension the solution has there.
+Requires Makie, which each of its backends loads, as for [`levelplot`](@ref).
 
 $(_SAMPLING_CALLBACK_DOC)
 $(_IMMERSED_BOUNDARY_DOC)"""
@@ -676,7 +697,8 @@ function fieldplot! end
 
 """
     levelplot(model; by=:order_max, levels=nothing, inactive=false, field=nothing,
-              strokecolor=:black, strokewidth=0.5, linewidth=6, categorical=automatic, colormap, colorrange, …)
+              strokecolor=:black, strokewidth=0.5, linewidth=6, boundary=false, boundarycolor=:black,
+              boundarywidth=1.5, categorical=automatic, colormap, colorrange, …)
     levelplot!([axis,] model; …)
 
 Plot the meshes of `model`'s levels, each cell coloured flat by one per-cell quantity: the discretisation itself, which
@@ -716,6 +738,10 @@ Keyword arguments, which are the plot's attributes:
   - `strokecolor`, `strokewidth` — the colour and the width in pixels of the cell edges and, in 1D, of the ticks at the
     cell ends; `strokewidth = 0` draws neither.
   - `linewidth` — in 1D, the width in pixels of the segments that carry the colour.
+  - `boundary`, `boundarycolor`, `boundarywidth` — whether to draw `∂Ω` over the levels, `false` by default, and its
+    colour and its width in pixels, `:black` and `1.5`: `∂Ω` as [`fieldplot`](@ref) draws it, from the level set
+    sampled at the sampling's defaults — in 2D a contour in front of every level and its edges, in 1D a vertical line
+    at every root. `boundary = true` is refused when no drawn space carries a [`PhysicalDomain`](@ref).
   - `categorical` — whether the colours are categories: each distinct value its own colour of `colormap`, and a
     `Colorbar` one block and one tick per value. `automatic` (default) makes the quantities with a few discrete values
     categorical — `:order_max`, `:level_id`, `:role_id`, `:active` and `:covered` — and not the dof counts, the cell
@@ -748,7 +774,8 @@ Draw [`levelplot`](@ref) into `axis`, or into the current axis, and return the p
 function levelplot! end
 
 """
-    quadratureplot(model; by=:weight, marker=:circle, markersize=6, categorical=automatic, colormap, colorrange, …)
+    quadratureplot(model; by=:weight, marker=:circle, markersize=6, boundary=false, boundarycolor=:black,
+                   boundarywidth=1.5, categorical=automatic, colormap, colorrange, …)
     quadratureplot!([axis,] model; …)
 
 Plot `model`'s quadrature points: every point of every subdomain's integration plan, where its integration regions put
@@ -767,6 +794,9 @@ Keyword arguments, which are the plot's attributes:
     as assembly integrates with it; or `:cover_count`, the number of levels whose cells cover its region — 1 where the
     base level alone is active, more under an overlay.
   - `marker`, `markersize` — the marker of a point and its size in pixels.
+  - `boundary`, `boundarycolor`, `boundarywidth` — whether to draw `∂Ω` behind the points, `false` by default, and its
+    colour and its width in pixels, `:black` and `1.5`, as for [`levelplot`](@ref). The points are drawn in front of
+    it in every backend, so the cut cells' points along `∂Ω` stay visible.
   - `categorical` — whether the colours are categories, as for [`levelplot`](@ref): `automatic` (default) for
     `:cover_count`, not for `:weight`.
   - `colormap`, `colorrange`, `colorscale`, `lowclip`, `highclip`, `nan_color`, `alpha` — the colour mapping, as for

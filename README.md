@@ -142,10 +142,11 @@ The method is described in
   and 2D models are a Makie extension (load any Makie backend, e.g.
   `using CairoMakie`): `fieldplot` draws a solution — its value, any
   quantity a callback computes from it, or without one the integration
-  regions — as a coloured or warped surface in 2D and a graph in 1D;
-  `levelplot` draws the meshes of the levels coloured by order, activity,
-  coverage or an error estimate, and `quadratureplot` the quadrature
-  points, neither of which needs a solution.
+  regions — as a coloured or warped surface in 2D and a graph in 1D, cut
+  at `∂Ω` on an immersed model; `levelplot` draws the meshes of the levels
+  coloured by order, activity, coverage or an error estimate, and
+  `quadratureplot` the quadrature points, neither of which needs a
+  solution; each draws `∂Ω` on request.
 - **D-generic core**: 1D, 2D, 3D, and 4D smoke-tested.
 
 ## Installation
