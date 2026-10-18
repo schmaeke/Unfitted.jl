@@ -147,8 +147,9 @@ Fields, in declaration order, which is also the order [`diagnostics`](@ref)`(mod
     depend on the cell's size) or held no points, whatever rule the region ended up carrying.
   - `cut_fallback_count::Int`, `cut_fallback_points::Int` — the subset of those failures that fell back to the
     uncompressed cut rule (`:cut_fallback`), and the total number of quadrature points those regions carry. A compressed
-    rule carries at most nbasis points, so the second number is the price of the safety net; a nonzero count means the
-    mesh is too coarse for the geometry in those cells and should be refined. See [`moment_fit_rule`](@ref).
+    rule carries at most as many points as its moment basis has functions, so the second number is the price of the
+    safety net; a nonzero count means the mesh is too coarse for the geometry in those cells and should be refined. See
+    [`cut_cell_rule`](@ref).
   - `symmetry_residual::Float64` — the reported value of `‖A − Aᵀ‖_F` for the assembled matrix. It is asserted, never
     measured: `assemble!` writes exactly `0.0` when the problem declares itself symmetric — such a form is scattered
     into the lower triangle only and mirrored entry-for-entry by `_mirror_lower`, so `A = Aᵀ` holds to the bit by

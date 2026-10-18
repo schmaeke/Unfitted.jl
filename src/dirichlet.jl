@@ -482,7 +482,7 @@ end
 # facet (`F = 0`) never reaches the cut branch: `_classify_facet` decides a single point by membership.
 #
 # The fits are entered through `Base.inferencebarrier` (the idiom of `_coverage_constraints!` in `dofs.jl`), so
-# inference never descends from here into the moment-fit chain — `_fit_rules`, `moment_fit_rule`, the implicit kernel,
+# inference never descends from here into the moment-fit chain — `_fit_rules`, `cut_cell_rule`, the implicit kernel,
 # NNLS. The call is resolved at run time on the slice's concrete type, and the chain is inferred and compiled when a
 # face first has a cut region, not before. Without the barrier, an inference that reaches this call with the face's
 # dimension and number type unknown infers the whole chain for them, in code that never runs. That was measured while

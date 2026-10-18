@@ -58,7 +58,7 @@
 #   order) degrades at the unresolved feature. ∇φ is obtained by automatic differentiation (`ForwardDiff`); a caller
 #   whose leaves cannot take `Dual` arguments overrides that with its own operator through the `grad` keyword, for which
 #   `_fd_gradient` below is the central-difference choice. Nothing in the finite-cell path sets it, so leaves reaching
-#   `moment_fit_rule` must be AD-capable. Pair leaves are the exception the kernel makes for itself: they are
+#   `cut_cell_rule` must be AD-capable. Pair leaves are the exception the kernel makes for itself: they are
 #   differentiated by finite differences (`_FDLeaf`) and never see a `Dual`.
 #
 #   With the default gradient the kernel evaluates a leaf inside the closed box R only — at its corners, centre and
@@ -161,7 +161,7 @@ end
 
 # `scale` is the region's largest edge length; the breakpoint-drop tolerance `atol` is taken relative to it so the
 # kernel behaves identically under a rescaling of the geometry. `flat_tol` is already relative (to the gradient
-# magnitude) inside `_choose_axis`.
+# magnitude) where `_zero_tol` applies it.
 function _quad_ctx(::Type{T}, gauss_points::Int, grad, max_subdiv::Int, scale::Real) where {T}
     rawnodes, rawweights = gausslegendre(gauss_points)
     gradient = grad === nothing ? (g, x) -> ForwardDiff.gradient(g, x) : grad
@@ -207,8 +207,9 @@ end
 #   3. Choose the height axis. If no axis is graph-like and clear of folds and budget remains, bisect and recurse; at
 #      the floor (or on a box too small to bisect), force-reduce on the least-bad axis.
 #   4. Reduce: build the base problem on U with the height axis removed (`_base_leaves`: every leaf's two face
-#      restrictions and one pair leaf per two leaves monotone along the axis that are not traces on opposite faces,
-#      partition-only) and recurse; then sweep the base nodes, emitting a fiber rule at each.
+#      restrictions and one pair leaf per two leaves with a single root along the axis — monotone or steep — that are
+#      not traces on opposite faces, partition-only) and recurse; then sweep the base nodes, emitting a fiber rule at
+#      each.
 function _implicit_quad(lsets, membership, U::AxisBox{D,T}, ctx::_QuadCtx, depth::Int) where {D,T}
     active = Any[]
     for g in lsets
@@ -271,11 +272,11 @@ function _base_leaves(active, classes, k::Int, lo::T, hi::T) where {T}
     for g in active
         push!(base, _restrict(g, k, lo), _restrict(g, k, hi))
     end
-    monotone = active[_single_root.(classes)]
+    rooted = active[_single_root.(classes)]
     h = cbrt(eps(T)) * (hi - lo)
-    for i in eachindex(monotone), j in (i+1):lastindex(monotone)
-        _opposite_faces(monotone[i], monotone[j]) && continue
-        push!(base, _FDLeaf(_PairLeaf{T}(monotone[i], monotone[j], k, lo, hi), h))
+    for i in eachindex(rooted), j in (i+1):lastindex(rooted)
+        _opposite_faces(rooted[i], rooted[j]) && continue
+        push!(base, _FDLeaf(_PairLeaf{T}(rooted[i], rooted[j], k, lo, hi), h))
     end
     return base
 end
@@ -506,15 +507,15 @@ end
 function _choose_axis(grads::Vector, planar::Vector, tols::Vector, ::Val{D}) where {D}
     k = argmax(1:D) do k
         nbad, nsteep, score = 0, 0, eltype(tols)(Inf)
-        for (gs, flat, tol) in zip(grads, planar, tols)
-            class, minmag = _axis_class(gs, flat, k, tol)
+        for (gs, ps, tol) in zip(grads, planar, tols)
+            class, minmag = _axis_class(gs, ps, k, tol)
             nbad += class === :bad
             nsteep += class === :steep
             _single_root(class) && (score = min(score, minmag))
         end
         return (-nbad, -nsteep, isinf(score) ? zero(score) : score)
     end
-    classes = [first(_axis_class(gs, flat, k, tol)) for (gs, flat, tol) in zip(grads, planar, tols)]
+    classes = [first(_axis_class(gs, ps, k, tol)) for (gs, ps, tol) in zip(grads, planar, tols)]
     return k, all(c -> c === :monotone || c === :flat, classes), classes
 end
 
@@ -586,7 +587,7 @@ function _axis_class(gs, planar, k::Int, tol)
     minmag = minimum(g -> isfinite(g[k]) && abs(g[k]) > tol ? abs(g[k]) : oftype(tol, Inf), gs)
     pos && neg && return :bad, minmag
     pos || neg || return :flat, minmag
-    curved = (g[k] for (g, flat) in zip(gs, planar) if isfinite(g[k]) && !flat)
+    curved = (g[k] for (g, p) in zip(gs, planar) if isfinite(g[k]) && !p)
     isempty(curved) && return :monotone, minmag
     lo, hi = extrema(curved)
     clearance = pos ? lo : -hi

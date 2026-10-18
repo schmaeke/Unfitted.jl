@@ -67,19 +67,19 @@ using ForwardDiff
 using NearestNeighbors
 using NonNegLeastSquares
 
-export AxisBox, GeometryTolerance, PhysicalDomain, physical_domain, implicit_rule, MomentBasis, Caratheodory,
-       NonnegativeFit, classify_cell, LevelSet, leaf, complement, levelset_value, stl_levelset, mesh_levelset,
-       CartesianMesh, Space, IntegratedLegendre, bspline, Field, BlockForm, LoadForm, TrialChannels, TestChannels,
-       WeakForm, Problem, Model, Solution, box, mesh, space, overlay, field, block, loadform, boundary, dirichlet,
-       update_dirichlet!, neumann, couple, interface, Interface, InterfaceForm, onside, jump_sign, BoundaryMesh,
-       segment_mesh, polyline_mesh, triangle_mesh, points_mesh, poisson, mass, mass_form, mass_block, stiffness,
-       stiffness_form, stiffness_block, source_form, source_load, load_vector, prepare, assemble, assemble_matrix,
-       assemble_vector, assemble!, foreach_quadrature_point, nquadpoints, solve!, solution, move!, moved, moved_space,
-       activate!, deactivate!, active_cells, support_extension, dilate, cell_orders, elevate, elevated, cell_order,
-       nominal_order, ladder, adapt, adapted, is_nested, overlapping_cells, level_count, transfer, L2Projection, Rewire,
-       estimate, mark_cells, decide, refine, coarsen, QuadField, RBFP0, write_vtk, vtk_series, VTKSeries,
-       write_quadrature_vtm, l2_error, boundary_integral, value, field_gradient, diagnostics, active_unknowns,
-       cell_indices, cell_box, center, value_vec, gradient_tensor, symmetric_gradient
+export AxisBox, GeometryTolerance, PhysicalDomain, physical_domain, cut_cell_rule, implicit_rule, MomentBasis,
+       Caratheodory, NonnegativeFit, classify_cell, LevelSet, leaf, complement, levelset_value, stl_levelset,
+       mesh_levelset, CartesianMesh, Space, IntegratedLegendre, bspline, Field, BlockForm, LoadForm, TrialChannels,
+       TestChannels, WeakForm, Problem, Model, Solution, box, mesh, space, overlay, field, block, loadform, boundary,
+       dirichlet, update_dirichlet!, neumann, couple, interface, Interface, InterfaceForm, onside, jump_sign,
+       BoundaryMesh, segment_mesh, polyline_mesh, triangle_mesh, points_mesh, poisson, mass, mass_form, mass_block,
+       stiffness, stiffness_form, stiffness_block, source_form, source_load, load_vector, prepare, assemble,
+       assemble_matrix, assemble_vector, assemble!, foreach_quadrature_point, nquadpoints, solve!, solution, move!,
+       moved, moved_space, activate!, deactivate!, active_cells, support_extension, dilate, cell_orders, elevate,
+       elevated, cell_order, nominal_order, ladder, adapt, adapted, is_nested, overlapping_cells, level_count, transfer,
+       L2Projection, Rewire, estimate, mark_cells, decide, refine, coarsen, QuadField, RBFP0, write_vtk, vtk_series,
+       VTKSeries, write_quadrature_vtm, l2_error, boundary_integral, value, field_gradient, diagnostics,
+       active_unknowns, cell_indices, cell_box, center, value_vec, gradient_tensor, symmetric_gradient
 
 include("geometry.jl")
 include("physical.jl")

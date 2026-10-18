@@ -165,7 +165,7 @@ end
 @testset "the NNLS target decides retries, not the plan" begin
     # `NonnegativeFit`'s target only decides whether a fit is retried on a denser candidate cloud. The first attempt
     # already reproduces a smooth cut cell's moments far below either target, so a tighter one changes neither the
-    # region structure nor how far the residual stays under the failure threshold. The 2×2 base box [−1, 1]² is split
+    # region structure nor a single rule. The 2×2 base box [−1, 1]² is split
     # 8×8 into 0.25-wide cells; subcell_length_scale here only bounds classifier and kernel subdivision.
     phi(x) = sqrt(x[1]^2 + x[2]^2) - 0.7
     omega = box((-1.0, -1.0), (1.0, 1.0))
@@ -186,8 +186,9 @@ end
     cut_tight = count(r -> r.kind === :cut_fitted, plan_tight.regions)
     @test cut_loose == cut_tight > 0
 
-    @test plan_loose.moment_fit_residual_max < 1.0e-5
-    @test plan_tight.moment_fit_residual_max < 1.0e-5
+    # And the same rules: the first attempt meets both targets, so neither retries.
+    @test [r.weights for r in plan_loose.regions] == [r.weights for r in plan_tight.regions]
+    @test plan_loose.moment_fit_residual_max == plan_tight.moment_fit_residual_max
 end
 
 @testset "classify_cell — Lipschitz certificate" begin
@@ -730,10 +731,10 @@ end
     p = physical_domain(x -> 0.5 - x[1]; lipschitz=1.0, subcell_length_scale=10.0, max_depth=0,
                         compression=NonnegativeFit(; target_residual=1.0e-14))
     region_box = box((0.0,), (1.0,))
-    pts, ws, res, status = Unfitted.moment_fit_rule(p, region_box, (20,))
+    pts, ws, res, status = cut_cell_rule(p, region_box, (20,))
     @test !isempty(pts)
     @test status === :fitted
-    @test res < Unfitted._FIT_FAILURE_RESIDUAL * sum(ws)   # relative to ‖m‖ ≥ m₀ = Σw, the cut measure
+    @test res < 1.0e-9 * sum(ws)
 end
 
 @testset "α-FCM fit failure is :cut_alpha_failed and counts as a failure" begin
@@ -882,8 +883,8 @@ end
         here = Unfitted._restrict_domain(physical_domain(plate; subcell_length_scale=scale), [(1, 0.0)])
         native = physical_domain(leaf(y -> y[1] - 0.55; lipschitz=sqrt(2.0)); subcell_length_scale=scale)
         interval = box((bounds[1],), (bounds[2],))
-        a_pts, a_ws, _, a_status = Unfitted.moment_fit_rule(here, interval, (order,))
-        b_pts, b_ws, _, b_status = Unfitted.moment_fit_rule(native, interval, (order,))
+        a_pts, a_ws, _, a_status = cut_cell_rule(here, interval, (order,))
+        b_pts, b_ws, _, b_status = cut_cell_rule(native, interval, (order,))
         @test a_pts == b_pts
         @test a_ws == b_ws
         @test a_status === b_status
@@ -896,7 +897,7 @@ end
     # ≤ 1.55 there, so the whole face is physical and the slice classifies `:full`.
     upper = Unfitted._restrict_domain(physical_domain(plate; subcell_length_scale=0.0625), [(1, 1.0)])
     @test classify_cell(upper, box((0.0,), (1.0,))) === :full
-    @test sum(Unfitted.moment_fit_rule(upper, box((0.0,), (1.0,)), (4,))[2]) ≈ 1.0 rtol = 1.0e-14
+    @test sum(cut_cell_rule(upper, box((0.0,), (1.0,)), (4,))[2]) ≈ 1.0 rtol = 1.0e-14
 
     # Codimension 2: two pins consumed in descending axis order, which is what keeps every remaining pin's index the one
     # the caller named. Consuming them the other way round would renumber the axes that survive the first restriction
@@ -985,7 +986,7 @@ end
     @test all(Unfitted._inside(leafwise.geometry, SVector(a, b)) == (levelset_value(collapsed, SVector(a, b)) <= 0)
               for a in 0.05:0.1:0.95, b in 0.05:0.1:0.95)
 
-    err(domain) = abs(sum(Unfitted.moment_fit_rule(domain, face, (4, 4))[2]) - 0.5)
+    err(domain) = abs(sum(cut_cell_rule(domain, face, (4, 4))[2]) - 0.5)
     @test err(leafwise) < 1.0e-13
     @test err(leafwise) < err(collapsed) / 3
 end
@@ -1006,7 +1007,7 @@ end
         let ball = leaf(x -> 0.02 - sqrt((x[1] - 0.31337)^2 + (x[2] - 0.43731)^2 + x[3]^2); lipschitz=L),
             p = physical_domain(ball; subcell_length_scale=scale)
 
-            sum(Unfitted.moment_fit_rule(Unfitted._restrict_domain(p, [(3, 0.0)]), face, (4, 4))[2])
+            sum(cut_cell_rule(Unfitted._restrict_domain(p, [(3, 0.0)]), face, (4, 4))[2])
         end
     @test measure(1.0, 0.01) ≈ 1 - π * 0.02^2 rtol = 1.0e-6
     @test all(isapprox(measure(Inf, scale), 1.0; rtol=1.0e-14) for scale in (1.0, 0.1, 0.01))

@@ -49,7 +49,7 @@ end
     @test moments[1] ≈ 0.7 atol = 1e-14
     for compression in _FCM_COMPRESSIONS
         p = physical_domain(x -> x[1] - 0.7; lipschitz=1.0, subcell_length_scale=1.0 / 2^8, max_depth=8, compression)
-        points, weights, residual, status = Unfitted.moment_fit_rule(p, region, moment_order)
+        points, weights, residual, status = cut_cell_rule(p, region, moment_order)
         @test status === :fitted
         @test residual < 1e-10
         @test MomentBasis(region, moment_order)(points, weights) ≈ moments atol = 1e-10
@@ -68,7 +68,7 @@ end
     for (geometry, area) in cases, compression in _FCM_COMPRESSIONS
         lipschitz = geometry isa Unfitted.LevelSet ? Inf : 3.0
         p = physical_domain(geometry; lipschitz, subcell_length_scale=1.0 / 2^5, max_depth=5, compression)
-        pts, ws, res, status = Unfitted.moment_fit_rule(p, region, order)
+        pts, ws, res, status = cut_cell_rule(p, region, order)
         @test status === :fitted
         @test res < 1.0e-9
         @test all(>(0), ws)
@@ -83,7 +83,7 @@ end
     region = box((0.0, 0.0), (1.0, 1.0))
     for compression in _FCM_COMPRESSIONS
         p = physical_domain(x -> -1.0; lipschitz=1.0, subcell_length_scale=1.0, compression)
-        pts, ws, res = Unfitted.moment_fit_rule(p, region, (3, 3))
+        pts, ws, res = cut_cell_rule(p, region, (3, 3))
         @test all(w -> w >= 0, ws)
         @test res < 1e-10
         @test sum(ws) ≈ 1.0 atol = 1e-10
@@ -97,10 +97,10 @@ end
     for compression in _FCM_COMPRESSIONS
         p = physical_domain(x -> max(x[1] - 0.7, x[2] - 0.6); lipschitz=2.0, subcell_length_scale=1.0 / 2^5,
                             max_depth=5, compression)
-        _, ws, res, status = Unfitted.moment_fit_rule(p, region, (3, 3))
+        _, ws, res, status = cut_cell_rule(p, region, (3, 3))
         @test status === :fitted
         @test all(w -> w >= 0, ws)
-        @test res < Unfitted._FIT_FAILURE_RESIDUAL * sum(ws)   # within the threshold relative to ‖m‖ ≥ m₀ = Σw
+        @test res < 1.0e-9 * sum(ws)
     end
 end
 
@@ -117,7 +117,7 @@ end
         ref_rule = Unfitted.implicit_volume_quadrature(phi, region; gauss_points=22)
         ref = MomentBasis(region, order)(ref_rule...)
         p = physical_domain(phi; lipschitz=2.0, subcell_length_scale=0.5, compression)
-        pts, ws, res = Unfitted.moment_fit_rule(p, region, order)
+        pts, ws, res = cut_cell_rule(p, region, order)
         @test res < 1.0e-9
         @test MomentBasis(region, order)(pts, ws) ≈ ref atol = 1.0e-9
     end
@@ -134,7 +134,7 @@ end
     phi = x -> 0.16 - hypot(x[1] - 0.25, x[2] - 0.25)      # Ω = outside the disc
     p = physical_domain(leaf(phi; lipschitz=1.0); subcell_length_scale=0.1)
     @test classify_cell(p, region) === :cut
-    _, ws, res = Unfitted.moment_fit_rule(p, region, order)
+    _, ws, res = cut_cell_rule(p, region, order)
     @test res < 1.0e-9
     @test all(>=(0), ws)
     @test sum(ws) ≈ 1 - π * 0.16^2 atol = 1e-3
@@ -143,7 +143,7 @@ end
     # stays invisible to the kernel.
     q = physical_domain(leaf(phi); subcell_length_scale=0.1)
     @test classify_cell(q, region) === :cut
-    _, wq, _ = Unfitted.moment_fit_rule(q, region, order)
+    _, wq, _ = cut_cell_rule(q, region, order)
     @test sum(wq) ≈ 1.0 atol = 1e-10
 end
 
@@ -155,7 +155,7 @@ end
     order = (4, 4)
     p = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.3; lipschitz=1.0, subcell_length_scale=0.1,
                         compression=nothing)
-    pts, ws, res, status = Unfitted.moment_fit_rule(p, region, order)
+    pts, ws, res, status = cut_cell_rule(p, region, order)
     @test (pts, ws) == implicit_rule(p, region, order)
     @test res == 0
     @test status === :fitted
@@ -231,7 +231,7 @@ end
     @test all(>=(0), ws)
     @test count(>(0), ws) <= length(basis)
 
-    pts, ws, res, status = Unfitted.moment_fit_rule(p, region, order)
+    pts, ws, res, status = cut_cell_rule(p, region, order)
     @test status === :fitted
     @test res < 1.0e-10
     @test sum(ws) ≈ 1 - 4 * π * radius^2 atol = 1.0e-5
@@ -251,7 +251,7 @@ end
         geom = complement(union((leaf(x -> hypot(x[1] - c[1], x[2] - c[2]) - radius; lipschitz=1.0) for c in holes)...))
         region = box((0.0, 0.0), (L, L))
         p = physical_domain(geom; subcell_length_scale=0.1L, compression=measure_only)
-        pts, ws, res, status = Unfitted.moment_fit_rule(p, region, order)
+        pts, ws, res, status = cut_cell_rule(p, region, order)
         @test status === :fallback
         @test (pts, ws) == implicit_rule(p, region, order)
         # The fallback rule IS the moments' source, so its own moments are the ‖m‖ the verdict was taken against.
@@ -263,6 +263,20 @@ end
         # have used. That cost is what `AssemblyDiagnostics.cut_fallback_points` reports.
         @test sum(ws) ≈ L^2 * (1 - 4π * 0.1^2) rtol = 1.0e-4
         @test length(ws) > 20 * prod(order .+ 1)
+    end
+end
+
+@testset "FCM — a compression that keeps no weight falls back to the cut rule" begin
+    # Its residual is ‖m‖, past the failure threshold, so the region takes the cut rule — which is right there and
+    # correct — rather than being dropped as if the cell held no measure.
+    region, order = box((0.0, 0.0), (1.0, 1.0)), (2, 2)
+    for keeps_nothing in ((p, w, m, basis) -> (p[1:0], w[1:0]), (p, w, m, basis) -> (p, zero(w)))
+        p = physical_domain(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.3; lipschitz=1.0, subcell_length_scale=0.1,
+                            compression=keeps_nothing)
+        pts, ws, res, status = cut_cell_rule(p, region, order)
+        @test status === :fallback
+        @test (pts, ws) == implicit_rule(p, region, order)
+        @test res ≈ norm(MomentBasis(region, order)(pts, ws))
     end
 end
 
@@ -282,7 +296,7 @@ end
 
             p = physical_domain(geom; subcell_length_scale=L / 10, max_depth=8,
                                 compression=NonnegativeFit(; target_residual=target))
-            Unfitted.moment_fit_rule(p, box((0.0f0, 0.0f0), (L, L)), order)
+            cut_cell_rule(p, box((0.0f0, 0.0f0), (L, L)), order)
         end
     for L in (1.0f0, 2000.0f0)
         _, ws, res, status = fit_at(L, 1.0e-9)
@@ -311,8 +325,8 @@ end
     coarse = physical_domain(phi; lipschitz=2.0, subcell_length_scale=0.5)
     fine = physical_domain(phi; lipschitz=2.0, subcell_length_scale=1.0 / 2^6, max_depth=8)
 
-    pc, wc, rc = Unfitted.moment_fit_rule(coarse, region, order)
-    pf, wf, rf = Unfitted.moment_fit_rule(fine, region, order)
+    pc, wc, rc = cut_cell_rule(coarse, region, order)
+    pf, wf, rf = cut_cell_rule(fine, region, order)
     @test rc < 1e-9 && rf < 1e-9
     basis = MomentBasis(region, order)
     mc = basis(pc, wc)
@@ -340,7 +354,7 @@ end
             phi = x -> hypot(x[1] - 0.5S, x[2] - 0.5S) - 0.3S
             p = physical_domain(phi; lipschitz=1.0, subcell_length_scale=S / 32, max_depth=5, compression)
             cell = box((0.25S, 0.25S), (0.5S, 0.5S))          # one cut cell of a 4×4 mesh
-            pts, ws, res, status = Unfitted.moment_fit_rule(p, cell, order)
+            pts, ws, res, status = cut_cell_rule(p, cell, order)
             return cell, pts, ws, res, status
         end
         S = 1.0e-5
@@ -366,17 +380,18 @@ end
     # The pruned rule is a subset of the cut rule's points with non-negative weights, at most nbasis of them positive,
     # reproducing the moments to round-off — on a cell small enough to prune directly (100 cut-rule points against
     # 2 · 81) and on two that are first reduced by recombination (1728 points against 2 · 25, and 512 against 2 · 125 in
-    # 3D).
+    # 3D). Which path each cell takes is asserted, so a change in the cut rule cannot quietly empty the test of one.
     disc = leaf(x -> hypot(x[1] - 0.0123, x[2] + 0.0345) - 0.6789; lipschitz=1.0)
     holes = complement(union((leaf(x -> hypot(x[1] - c[1], x[2] - c[2]) - 0.1; lipschitz=1.0)
                               for c in ((0.3, 0.3), (0.7, 0.3), (0.3, 0.7), (0.7, 0.7)))...))
     ball = leaf(x -> norm(x - SVector(0.0123, -0.0345, 0.0217)) - 0.6789; lipschitz=1.0)
-    cells = ((disc, box((0.5, 0.25), (0.75, 0.5)), (8, 8)), (holes, box((0.0, 0.0), (1.0, 1.0)), (4, 4)),
-             (ball, box((0.5, 0.25, 0.25), (0.75, 0.5, 0.5)), (4, 4, 4)))
-    for (geometry, region, order) in cells
+    cells = ((disc, box((0.5, 0.25), (0.75, 0.5)), (8, 8), false), (holes, box((0.0, 0.0), (1.0, 1.0)), (4, 4), true),
+             (ball, box((0.5, 0.25, 0.25), (0.75, 0.5, 0.5)), (4, 4, 4), true))
+    for (geometry, region, order, recombined) in cells
         p = physical_domain(geometry; subcell_length_scale=0.1)
         rule = implicit_rule(p, region, order)
         basis = MomentBasis(region, order)
+        @test (length(rule[1]) > 2 * length(basis)) == recombined
         moments = basis(rule...)
         pts, ws = Caratheodory()(rule..., moments, basis)
         @test issubset(pts, rule[1])
@@ -388,7 +403,7 @@ end
     # Where the moment matrix is numerically rank-deficient — a sliver of a disc at moment order 12 — the pruning stops
     # at the rank, below nbasis, which is the point count the assembly then pays for.
     p = physical_domain(disc; subcell_length_scale=0.1)
-    pts, ws, res, status = Unfitted.moment_fit_rule(p, box((0.45, 0.45), (0.7, 0.7)), (12, 12))
+    pts, ws, res, status = cut_cell_rule(p, box((0.45, 0.45), (0.7, 0.7)), (12, 12))
     @test status === :fitted
     @test length(pts) < 13^2
     @test res < 1.0e-12 * sum(ws)
@@ -396,7 +411,7 @@ end
     # Float32 carries through, to its own round-off.
     p32 = physical_domain(leaf(x -> hypot(x[1] - 0.5f0, x[2] - 0.5f0) - 0.3f0; lipschitz=1.0);
                           subcell_length_scale=0.1f0)
-    pts32, ws32, res32, status32 = Unfitted.moment_fit_rule(p32, box((0.5f0, 0.5f0), (1.0f0, 1.0f0)), (4, 4))
+    pts32, ws32, res32, status32 = cut_cell_rule(p32, box((0.5f0, 0.5f0), (1.0f0, 1.0f0)), (4, 4))
     @test status32 === :fitted
     @test eltype(ws32) === Float32 && eltype(eltype(pts32)) === Float32
     @test res32 < 1.0f-5 * sum(ws32)
@@ -430,7 +445,7 @@ end
 
     # A pass that drifts is undone. The basis below is exact in its first column and pushed off the null space by 1e-6
     # in the others, as eliminations that compounded round-off would leave it — which on clustered monomials they do
-    # (`_PRUNE_DRIFT`), though on no moment matrix measured — so walking it through moves `A μ` far past the guard. The
+    # (`_prune_drift`), though on no moment matrix measured — so walking it through moves `A μ` far past the guard. The
     # pass is replaced by the walk along the first column alone: one coefficient fewer, and `A μ` kept to round-off.
     x = range(0.05, 0.95; length=12)
     A = [xj^(a - 1) for a in 1:4, xj in x]
@@ -439,11 +454,23 @@ end
     μ = 1 .+ cos.(1:12) .^ 2
     target = A * μ
     walked = Unfitted._walk!(copy(μ), copy(V))
-    @test norm(A * walked - target) > 1.0e3 * Unfitted._PRUNE_DRIFT * norm(target)     # the premise: a drifting pass
+    @test norm(A * walked - target) > 1.0e3 * Unfitted._prune_drift(Float64) * norm(target)    # the premise: it drifts
     Unfitted._prune_pass!(μ, A, V)
     @test all(>=(0), μ)
     @test count(>(0), μ) == 11
     @test norm(A * μ - target) <= 1.0e-14 * norm(target)
+
+    # A sound pass is kept in any precision: the bound scales with the round-off. In Float32 this pass moves `A μ` by
+    # far more than 1e-11 of its norm, so a bound fixed in Float64 terms undid it, as it undid every Float32 pass;
+    # walked through, it removes one coefficient per null vector.
+    A32 = Float32.(A)
+    μ32 = 1 .+ cos.(1.0f0:12.0f0) .^ 2
+    target32 = A32 * μ32
+    walked32 = Unfitted._walk!(copy(μ32), Unfitted._nullspace(A32))
+    @test norm(A32 * walked32 - target32) > 1.0e-11 * norm(target32)     # the premise: Float32 round-off
+    Unfitted._prune_pass!(μ32, A32, Unfitted._nullspace(A32))
+    @test count(>(0), μ32) == 4
+    @test norm(A32 * μ32 - target32) <= 10 * Unfitted._prune_drift(Float32) * norm(target32)
 end
 
 @testset "FCM — a cut rule or compression with a negative weight is refused" begin
@@ -459,8 +486,8 @@ end
     for (cut_rule, compression, stage) in
         ((signed_rule, Caratheodory(), "cut rule"), (implicit_rule, signed_compression, "compression"))
         p = physical_domain(disc; lipschitz=1.0, subcell_length_scale=0.1, cut_rule, compression)
-        @test_throws ArgumentError Unfitted.moment_fit_rule(p, region, (2, 2))
-        @test_throws "the $stage returned the weight" Unfitted.moment_fit_rule(p, region, (2, 2))
+        @test_throws ArgumentError cut_cell_rule(p, region, (2, 2))
+        @test_throws "the $stage returned the weight" cut_cell_rule(p, region, (2, 2))
     end
 
     # Round-off below zero is not a sign: a compression may leave such weights where it means zero, and the pipeline
@@ -470,7 +497,7 @@ end
         return [pts; pts[1:1]], [ws; -eps() * moments[1]]
     end
     p = physical_domain(disc; lipschitz=1.0, subcell_length_scale=0.1, compression=roundoff)
-    pts, ws, res, status = Unfitted.moment_fit_rule(p, region, (2, 2))
+    pts, ws, res, status = cut_cell_rule(p, region, (2, 2))
     @test status === :fitted
     @test all(>(0), ws)
 end
@@ -481,8 +508,7 @@ end
     zero_rule(physical, box, order) = ([box.lower, box.upper], [0.0, 0.0])
     never(args...) = error("the compression must not run on a rule without measure")
     p = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=0.1, cut_rule=zero_rule, compression=never)
-    @test Unfitted.moment_fit_rule(p, box((0.0, 0.0), (1.0, 1.0)), (2, 2)) ==
-          (SVector{2,Float64}[], Float64[], 0.0, :empty)
+    @test cut_cell_rule(p, box((0.0, 0.0), (1.0, 1.0)), (2, 2)) == (SVector{2,Float64}[], Float64[], 0.0, :empty)
 end
 
 @testset "FCM — `_nullspace` is a basis of the null space at the numerical rank" begin

@@ -76,7 +76,7 @@ Fields:
     `:full` (tensor Gauss over the whole region: it lies in Ω, or no [`PhysicalDomain`](@ref) is attached),
     `:fictitious` (a facet region outside Ω under `α = 0`, kept with an empty rule), `:fictitious_alpha` (outside Ω
     under `α > 0`: the α-scaled tensor rule), `:cut_fitted` (∂Ω crosses it: the domain's compressed cut rule,
-    [`moment_fit_rule`](@ref)), `:cut_fallback` (the compression failed, so the cut rule itself — correct and
+    [`cut_cell_rule`](@ref)), `:cut_fallback` (the compression failed, so the cut rule itself — correct and
     non-negative, but with 50–200× the points), `:cut_failed` (`Ω ∩ region` carries no rule at all, under `α = 0`: an
     empty rule) and `:cut_alpha_failed` (the same under `α > 0`: the α-scaled tensor rule alone, so the cell's dofs stay
     α-stabilised), and on simplices `:surface` and `:interface`. Under `α > 0` every other cut kind carries
@@ -186,7 +186,7 @@ Fields:
   - `min_volume::T` — the smallest region volume in `regions`, or zero if `regions` is empty.
   - `min_relative_volume::T` — `min_volume / volume(V.domain)`.
   - `moment_fit_residual_max::Float64` — the largest moment residual of a compressed cut rule observed across all
-    `:cut_fitted`, `:cut_fallback`, `:cut_failed`, and `:cut_alpha_failed` regions ([`moment_fit_rule`](@ref)).
+    `:cut_fitted`, `:cut_fallback`, `:cut_failed`, and `:cut_alpha_failed` regions ([`cut_cell_rule`](@ref)).
 """
 struct IntegrationPlan{D,T<:Real}
     regions::Vector{VolumeRegion{D,T}}
@@ -225,7 +225,7 @@ The construction follows the recipe in `CONTRIBUTING.md`'s "Integration regions"
      reference frame ([`Parent`](@ref)), and check the `criterion`.
   4. Dispatch on the `PhysicalDomain` classification to pick the region quadrature: tensor Gauss for `:full`, α-scaled
      tensor Gauss for `:fictitious + alpha > 0`, and on `:cut` the domain's cut rule under its compression
-     ([`moment_fit_rule`](@ref)). Drop the region entirely under strict-α (`alpha = 0` and `:fictitious`).
+     ([`cut_cell_rule`](@ref)). Drop the region entirely under strict-α (`alpha = 0` and `:fictitious`).
   5. Record a [`SmallOverlap`](@ref) for every region whose physical volume falls below `tolerance.small_volume`, and
      track the largest moment residual observed across cut regions.
 
@@ -756,7 +756,7 @@ function _fit_rules(physical::PhysicalDomain, keys::Vector{_MomentFitKey{D,T}}) 
     return fitted
 end
 
-# One cut region's rule on the box `lower`–`upper` — the domain's cut rule under its compression, `moment_fit_rule` —
+# One cut region's rule on the box `lower`–`upper` — the domain's cut rule under its compression, `cut_cell_rule` —
 # in the box's reference frame, mapped as follows:
 #
 #   - `ref_points` are the rule's physical points mapped into the box's `[−1, 1]ᴰ` reference frame via
@@ -765,11 +765,11 @@ end
 #     loop's `weight * jacobian` step recovers the original physical weight (the same convention used for `:full`
 #     regions);
 #   - `residual` is the moment-fit L² residual reported by `fcm.jl`;
-#   - `status` is `:fitted`, `:fallback`, or `:empty` — see [`moment_fit_rule`](@ref). The mapping above is
+#   - `status` is `:fitted`, `:fallback`, or `:empty` — see [`cut_cell_rule`](@ref). The mapping above is
 #     rule-agnostic, so a `:fallback` rule (the cut rule itself) is mapped and consumed exactly like a compressed one.
 function _fit_rule(physical::PhysicalDomain, lower::SVector{D,T}, upper::SVector{D,T}, order::NTuple{D,Int}) where {D,T}
     box = AxisBox{D,T}(lower, upper)
-    points, weights, residual, status = moment_fit_rule(physical, box, order)
+    points, weights, residual, status = cut_cell_rule(physical, box, order)
     jacobian = volume(box) / convert(T, 2^D)
     return ([physical_to_reference(box, p) for p in points], T[w / jacobian for w in weights], T(residual), status)
 end

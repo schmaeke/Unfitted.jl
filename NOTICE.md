@@ -40,7 +40,11 @@ in full at the top of the implementing file, for academic attribution:
     affordable by the recombination of C. Litterer, T. Lyons, "High order
     recombination and an application to cubature on Wiener space",
     Ann. Appl. Probab. **22** (2012) 1301,
-    [doi:10.1214/11-AAP786](https://doi.org/10.1214/11-AAP786).
+    [doi:10.1214/11-AAP786](https://doi.org/10.1214/11-AAP786). Its null
+    spaces come from Householder QR with column pivoting, after P. Businger,
+    G. H. Golub, "Linear least squares solutions by Householder
+    transformations", Numer. Math. **7** (1965) 269,
+    [doi:10.1007/BF01436084](https://doi.org/10.1007/BF01436084).
 
   - **Polygon splitting** in `src/surface.jl` — the triangles of an immersed
     surface are split at grid planes by single-plane passes of the polygon

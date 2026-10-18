@@ -23,16 +23,18 @@
 #      with the cut rule's points as the candidates and its moments as the target. The package carries two compressions,
 #      both returning non-negative weights at a subset of the cut rule's points:
 #
-#        - `Caratheodory` (default) prunes the cut rule to at most rank-many points by Carathéodory's theorem, made
-#          constructive by null-space elimination and made affordable by the recombination of Litterer & Lyons (both
-#          cited at `Caratheodory`). It reproduces the moments by construction.
+#        - `Caratheodory` (default) prunes the cut rule to at most rank-many points by Carathéodory's theorem
+#          (C. Carathéodory, Rend. Circ. Mat. Palermo 32 (1911) 193–217, doi:10.1007/BF03014795), made constructive by
+#          walks along a null space that a pivoted Householder QR provides (P. Businger, G. H. Golub, Numer. Math. 7
+#          (1965) 269–276, doi:10.1007/BF01436084), and made affordable by the recombination of C. Litterer, T. Lyons
+#          (Ann. Appl. Probab. 22 (2012) 1301–1327, doi:10.1214/11-AAP786). It reproduces the moments by construction.
 #        - `NonnegativeFit` fits non-negative weights at candidates drawn from the cut rule, with the structure of
 #          QuESo's `QuadratureTrimmedElement` (M. Meßmer et al., Comput. Methods Appl. Mech. Engrg. 400 (2022) 115584,
 #          doi:10.1016/j.cma.2022.115584; https://github.com/manuelmessmer/QuESo, BSD-4-Clause), solved by the
 #          classical Lawson–Hanson algorithm (C. L. Lawson, R. J. Hanson, "Solving Least Squares Problems",
 #          Prentice-Hall (1974), Ch. 23; SIAM reprint doi:10.1137/1.9781611971217).
 #
-#   `moment_fit_rule` runs the two and owns everything they share: the moments, the truncation of round-off weights,
+#   `cut_cell_rule` runs the two and owns everything they share: the moments, the truncation of round-off weights,
 #   the refusal of negative weights, the residual of the rule handed back, and the fallback to the cut rule itself when
 #   a compression misses.
 #
@@ -50,7 +52,7 @@
 #   exact non-negative fit (`_candidate_budget`). It never eliminates points from a fitted rule, and never changes the
 #   rule or its moments.
 #
-#   Public entry points: `moment_fit_rule(physical, region_box, moment_order)`, `implicit_rule`, `MomentBasis`,
+#   Public entry points: `cut_cell_rule(physical, region_box, moment_order)`, `implicit_rule`, `MomentBasis`,
 #   `Caratheodory`, `NonnegativeFit`.
 
 # ── 1. The moment basis ───────────────────────────────────────────────────────
@@ -87,6 +89,9 @@ function MomentBasis(box::AxisBox{D,T}, order::NTuple{D,Int}) where {D,T}
 end
 
 Base.length(basis::MomentBasis) = length(basis.indices)
+
+# Printed by its constructor call: the index list holds ∏(order .+ 1) entries, 729 of them at order (8, 8, 8).
+Base.show(io::IO, basis::MomentBasis) = print(io, "MomentBasis(", basis.box, ", ", basis.order, ")")
 
 function (basis::MomentBasis{D,T})(points::AbstractVector{SVector{D,T}}) where {D,T}
     A = Matrix{T}(undef, length(basis), length(points))
@@ -178,7 +183,7 @@ the kernel, so a geometric feature smaller than `region_box` is certified rather
 
 The rule is accurate, not small: a few hundred to a few hundred thousand points per cell, growing with the moment
 order and with the geometric features the cell holds. Making it small is the compression's job (see
-[`moment_fit_rule`](@ref)).
+[`cut_cell_rule`](@ref)).
 """
 function implicit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T}, moment_order::NTuple{D,Int}) where {D,T}
     leaves = _leaves(physical.geometry)
@@ -242,7 +247,7 @@ Allocations are owned by `NonNegLeastSquares.jl`; `A` and `b` are not mutated, s
 """
 function nnls(A::AbstractMatrix{T}, b::AbstractVector{T}) where {T<:Real}
     x = vec(nonneg_lsq(A, b; alg=:nnls, max_iter=10 * size(A, 2)))
-    residual = norm(A * x - b)
+    residual = norm(_matvec(A, x) - b)
     return x, residual
 end
 
@@ -252,14 +257,14 @@ end
 A compression for [`physical_domain`](@ref), the alternative to [`Caratheodory`](@ref): non-negative least squares on
 the moments of the cut rule. One Lawson–Hanson solve ([`nnls`](@ref)) picks non-negative weights at candidate points
 drawn from the cut rule so that they reproduce its moments. It returns every candidate with its weight, and the active
-set — the at most `length(basis)` candidates of positive weight — is the rule [`moment_fit_rule`](@ref) keeps.
+set — the at most `length(basis)` candidates of positive weight — is the rule [`cut_cell_rule`](@ref) keeps.
 
 The candidates are `6 · length(basis)` points of the cut rule, evenly spread over it (`_cap_candidates`). The cut rule
 itself is an exact non-negative solution over all of its points, but a subset admits one only if the moments lie in the
 cone the subset spans (`_candidate_budget`), so a fit whose residual exceeds `target_residual · ‖m‖` is retried on a
 cloud eight times denser, at most twice. The best attempt is returned; the cut rule and its moments are the same for all
 of them, and a cloud that already holds the whole rule is not drawn again. `target_residual` decides only whether to
-retry; whether the rule is used is decided by [`moment_fit_rule`](@ref) against its failure threshold.
+retry; whether the rule is used is decided by [`cut_cell_rule`](@ref) against its failure threshold.
 
 Choose it over the default where its solve on a bounded cloud pays: on a cut rule of 10⁵ points or more at a low moment
 order it is the faster of the two (0.04 s against 0.10 s at moment order (4, 4, 4) on 3.4·10⁵ points), and it reproduces
@@ -345,7 +350,8 @@ pruned instead — at most `length(basis)` survive — and each surviving cluste
 That halves the points at the cost of one moment sum over them and a few factorisations of a `length(basis) ×
 2 length(basis)` matrix, and repeats until at most `2 · length(basis)` points remain, which are pruned directly. No
 matrix it forms is larger than `2 length(basis)` square, however many points the cut rule has, and none of its work
-calls BLAS, so it runs on every thread of a plan build without competing with BLAS threads for the cores.
+runs a threaded BLAS or LAPACK kernel, so it runs on every thread of a plan build without competing with BLAS threads
+for the cores.
 
 Measured against [`NonnegativeFit`](@ref) on the same cut rules — 34 cells in 2D and 3D at moment orders 2–12: disc,
 sliver, polytope-corner and perforated cells — Carathéodory took 3.4 s altogether against 7.8 s, and 1.7 s against
@@ -408,30 +414,34 @@ end
 # One pass of `_prune!`: walk `μ` along every column of `V`, a basis of the null space of `A` (`_walk!`). The walks
 # share one factorisation, which is what makes a pass cheap and also what can make it inexact: eliminating a removed
 # coefficient from the vectors still to come compounds round-off, the more so at a small pivot. The pass is therefore
-# checked: if it moved `A μ` by more than `_PRUNE_DRIFT` of its norm, it is undone and only the first column of `V` is
+# checked: if it moved `A μ` by more than `_prune_drift` of its norm, it is undone and only the first column of `V` is
 # walked — a null vector no elimination has touched, whose walk cannot drift.
 function _prune_pass!(μ::AbstractVector{T}, A::AbstractMatrix{T}, V::AbstractMatrix{T}) where {T}
     μ₀ = copy(μ)
     before = _matvec(A, μ)
     _walk!(μ, V)
-    norm(_matvec(A, μ) - before) <= _PRUNE_DRIFT * norm(before) && return μ
+    norm(_matvec(A, μ) - before) <= _prune_drift(T) * norm(before) && return μ
     μ .= μ₀
     return _walk!(μ, view(V, :, 1:1))
 end
 
 # The largest change a pruning pass may make to the combination it prunes, relative to its norm, before the pass is
-# replaced by a single walk. Above the round-off of a sound pass — none of the 182 passes on the 34 cells measured at
-# `Caratheodory` reached it, their rules matching to 3e-13 at worst — and below what an ill-conditioned matrix makes of
-# one: over monomials of random points, 64 of them at 128 points crowded towards one end, single passes moved the
-# combination by up to 3.3e-9, and the pruning with the guard ended within 1.0e-11 of where it began throughout.
-const _PRUNE_DRIFT = 1.0e-11
+# replaced by a single walk: a thousand times the round-off of the precision, 2.2e-13 in Float64 and 1.2e-4 in Float32.
+# A sound pass drifts by round-off — on the 34 cells measured at `Caratheodory`, every pass stayed within 44 eps in
+# Float64 and within 61 eps when the same cells ran in Float32 — while a pass on an ill-conditioned matrix drifts by
+# orders of magnitude more: over monomials of random points, 64 of them at 128 points crowded towards one end, single
+# passes moved the combination by up to 3.3e-9, 1.5e7 eps. A bound fixed in Float64 terms instead undid every Float32
+# pass, one factorisation per point removed.
+_prune_drift(::Type{T}) where {T} = 1000 * eps(T)
 
 # A basis of the null space of `A` (n × m): the columns of an m × (m − r) matrix, r the numerical rank of `A`.
 #
 # Householder QR with column pivoting, A P = Q [R₁₁ R₁₂; 0 R₂₂] (P. Businger, G. H. Golub, "Linear least squares
 # solutions by Householder transformations", Numer. Math. 7 (1965) 269–276, doi:10.1007/BF01436084), stopped where the
-# largest column left has norm at most min(n, m) · eps times the largest of `A` — the rank cut LinearAlgebra's
-# `nullspace` makes on the singular values. Q is never formed: `A` and `[R₁₁ R₁₂]` share their null space, which the
+# largest column left has norm at most min(n, m) · eps times the largest of `A` — LinearAlgebra's `nullspace` tolerance,
+# applied to the column norms left instead of the singular values, which on a numerically rank-deficient matrix keeps a
+# few more columns than the SVD would (594 points against 559 on a ball's cut cell at moment order (8, 8, 8)). Q is
+# never formed: `A` and `[R₁₁ R₁₂]` share their null space, which the
 # columns of P [−R₁₁⁻¹ R₁₂; I] span. The walks need null vectors, not orthonormal ones, so this basis serves them as an
 # SVD's would, without the SVD's cost: to read off the last m − r columns of V, it forms all of V, m × m. The norms of
 # the columns left are recomputed in the sweep that applies each reflector, rather than downdated, so no pivot is chosen
@@ -439,6 +449,8 @@ const _PRUNE_DRIFT = 1.0e-11
 #
 # Written out rather than taken from LAPACK because `_prune!` runs on every thread of a plan build: LAPACK's `gesdd`
 # calls threaded BLAS kernels on matrices this small, whose workers then compete with the plan's threads for the cores.
+# Unblocked, it streams the matrix once per reflector, which makes one call slower than LAPACK's on a single thread
+# beyond about 170 × 200 (1.6× at 343 × 686, 2.3× at 729 × 1458); on the threads of a plan build it is the faster.
 function _nullspace(A::AbstractMatrix{T}) where {T}
     n, m = size(A)
     R = Matrix{T}(A)
@@ -513,7 +525,8 @@ end
 # coefficients, so every other stays non-negative to round-off — then eliminate that coefficient's entry from the
 # columns still to come, so they stay null vectors of the shrinking support and leave it at exactly zero. The walk ends
 # early when a step takes a second coefficient to round-off along with the first: only one can be eliminated, and the
-# rest would be moved again by the next vector.
+# rest would be moved again by the next vector. `V` is overwritten: a column may be negated when it is walked, and the
+# eliminations change only the columns after it, so the first column stays the null vector it was, up to its sign.
 function _walk!(μ::AbstractVector{T}, V::AbstractMatrix{T}) where {T}
     for j in axes(V, 2)
         v = view(V, :, j)
@@ -522,8 +535,8 @@ function _walk!(μ::AbstractVector{T}, V::AbstractMatrix{T}) where {T}
         isfinite(t) || continue
         μ .-= t .* v
         μ[i] = zero(T)
-        floor = eps(T) * maximum(μ)
-        dead = (μ .!= 0) .& (μ .<= floor)
+        cutoff = eps(T) * maximum(μ)
+        dead = (μ .!= 0) .& (μ .<= cutoff)
         μ[dead] .= zero(T)
         any(dead) && return μ
         for l in (j+1):size(V, 2)
@@ -550,7 +563,7 @@ const _WEIGHT_TOL = 1.0e-12
 
 # Failure threshold for a compressed rule's moment residual, RELATIVE to the moment vector's norm `‖m‖`. A residual
 # above `_FIT_FAILURE_RESIDUAL · ‖m‖` means the compression did not come anywhere near reproducing the moments;
-# `moment_fit_rule` then returns the cut rule itself, and the integration-plan dispatcher tags such a region
+# `cut_cell_rule` then returns the cut rule itself, and the integration-plan dispatcher tags such a region
 # `:cut_fallback`.
 #
 # It is dimensionless for the reason `_WEIGHT_TOL` is: the residual carries the units of a moment, (length)ᴰ. An
@@ -560,7 +573,7 @@ const _WEIGHT_TOL = 1.0e-12
 const _FIT_FAILURE_RESIDUAL = 1.0e-2
 
 """
-    moment_fit_rule(physical, region_box, moment_order) -> (points, weights, residual, status)
+    cut_cell_rule(physical, region_box, moment_order) -> (points, weights, residual, status)
 
 The quadrature rule of `region_box ∩ Ω` that assembly uses on a cut region: the domain's `cut_rule` integrates the cut
 volume, and its `compression` reduces that rule to one with far fewer points that reproduces its moments over
@@ -574,8 +587,9 @@ physical, so `Σ w_q` is the cut volume.
 Between the two stages this function owns what every compression shares. It sums the moments of the cut rule, refuses
 a rule from either stage that carries a weight below zero beyond round-off (an `ArgumentError`), drops the compressed
 weights within `_WEIGHT_TOL` of zero relative to the cut volume — round-off around the exact zeros a compression
-leaves — and measures the L² moment residual `‖basis(points, weights) − m‖` of the rule it hands back, after that
-truncation, so the residual never describes a denser rule than the caller receives.
+leaves — and measures the L² moment residual `‖basis(points, weights) − m‖` of the compressed rule after that
+truncation, so the residual never describes a denser rule than the compression produced. On `:fallback` it is the
+residual that rejected the compressed rule.
 
 `status` reports which rule came back, and the integration-region dispatcher in `intersections.jl` turns it into the
 region's quadrature kind:
@@ -586,10 +600,10 @@ region's quadrature kind:
     diagnostics `fit_failure_count` and `moment_fit_residual_max` — whichever compression produced the rule; under
     `compression = nothing` the cut rule itself comes back, fitted to its own moments with a zero residual.
   - `:fallback` — the compressed rule missed the failure threshold, so the returned rule is the cut rule itself, the
-    very data the moments were summed from, uncompressed. Region kind `:cut_fallback`.
-  - `:empty` — the cut rule integrates no measure over `region_box`, or every compressed weight falls below the
-    truncation cutoff so the rule would hold no points; `points` and `weights` are empty and `residual` is zero. Region
-    kind `:cut_failed` (`:cut_alpha_failed` under α-FCM).
+    very data the moments were summed from, uncompressed. Region kind `:cut_fallback`. A compression that keeps no
+    weight at all lands here too: its residual is ‖m‖.
+  - `:empty` — the cut rule integrates no measure over `region_box`; `points` and `weights` are empty and `residual` is
+    zero. Region kind `:cut_failed` (`:cut_alpha_failed` under α-FCM).
 
 The fallback loses no accuracy: the cut rule is by construction at least as accurate as a successful compression of it,
 and the package's cut rule has non-negative weights — each a product of a positive Gauss weight, a positive fiber
@@ -598,7 +612,7 @@ cell where a compressed rule carries at most `length(basis)`, a 50–200× per-c
 many-feature cells where a fallback is plausible at all. `AssemblyDiagnostics.cut_fallback_count` and
 `cut_fallback_points` report how often it fired and what it cost.
 """
-function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T}, moment_order::NTuple{D,Int}) where {D,T}
+function cut_cell_rule(physical::PhysicalDomain, region_box::AxisBox{D,T}, moment_order::NTuple{D,Int}) where {D,T}
     points, weights = physical.cut_rule(physical, region_box, moment_order)
     measure = sum(abs, weights; init=zero(T))
     _check_weights(weights, measure, "cut rule")
@@ -608,24 +622,23 @@ function moment_fit_rule(physical::PhysicalDomain, region_box::AxisBox{D,T}, mom
     moments = basis(points, weights)
     fitted, fitted_weights = physical.compression(points, weights, moments, basis)
     _check_weights(fitted_weights, measure, "compression")
-    # A compression that truncates to nothing has no rule to offer, and a denser cut rule would not change that: hand
-    # back the same `:empty` a measureless cut rule gives, so the caller drops the region (or keeps its α-stabilised
-    # tensor part) instead of consuming a zero-point rule as a successful fit.
     kept = findall(>(_WEIGHT_TOL * measure), fitted_weights)
-    isempty(kept) && return SVector{D,T}[], T[], zero(T), :empty
     fitted, fitted_weights = fitted[kept], fitted_weights[kept]
     residual = norm(basis(fitted, fitted_weights) - moments)
     residual <= _FIT_FAILURE_RESIDUAL * norm(moments) && return fitted, fitted_weights, residual, :fitted
     return points, weights, residual, :fallback
 end
 
-# Refuse a stage's weights if one lies below zero by more than the round-off `_WEIGHT_TOL` allows. Every consumer of a
-# cut-cell rule relies on w ≥ 0 — the α blend, the Dirichlet trace solve's test for unsupported dofs, any squared norm
-# integrated over the region — and a signed rule breaks them without a trace. The package's own stages never produce
-# one.
+# Refuse a stage's weights if one lies below zero by more than √eps of the cut volume. Every consumer of a cut-cell rule
+# relies on w ≥ 0 — the α blend, the Dirichlet trace solve's test for unsupported dofs, any squared norm integrated over
+# the region — and a signed rule breaks them without a trace. The allowance is for round-off in a caller's stage, so it
+# scales with the precision, and it is generous because a signed rule is not subtle: the moment fit at fixed Gauss
+# points put negative weights on 38% of its points, of the size of the positive ones. The package's own stages never
+# produce a negative weight. A cut rule's round-off negatives inside the allowance reach the caller as they are when the
+# cut rule itself comes back (`compression = nothing`, `:fallback`); a compression's are truncated with its zeros.
 function _check_weights(weights, measure, stage::String)
     w = minimum(weights; init=zero(measure))
-    w >= -_WEIGHT_TOL * measure ||
+    w >= -sqrt(eps(typeof(measure))) * measure ||
         throw(ArgumentError("the $stage returned the weight $w; a cut-cell rule must have non-negative weights " *
                             "(see `PhysicalDomain`)"))
     return nothing

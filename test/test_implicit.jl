@@ -459,7 +459,7 @@ end
     @test _quad(x -> 1.0, rule(bounded(p1, corner), bounded(p2, corner), corner)) ≈ 0.0144 rtol = 1e-14
     domain = physical_domain(intersect(leaf(bounded(p1, corner); lipschitz=1.2),
                                        leaf(bounded(p2, corner); lipschitz=2.3)); subcell_length_scale=0.25)
-    _, weights, _, status = Unfitted.moment_fit_rule(domain, corner, (4, 4))
+    _, weights, _, status = cut_cell_rule(domain, corner, (4, 4))
     @test status === :fitted
     @test sum(weights) ≈ 0.0144 rtol = 1e-13
     # The same two planes crossing inside an interior cell.
@@ -474,7 +474,7 @@ end
 end
 
 @testset "implicit quadrature — traces on opposite faces get no pair leaf" begin
-    # The base problem pairs its monotone leaves for the crossings inside the box, but never two restrictions to
+    # The base problem pairs its single-root leaves for the crossings inside the box, but never two restrictions to
     # opposite faces of the previous reduction: the fiber integral is a sum of one term per root clamped to the fiber,
     # so a trace on the face lo and one on the face hi kink different terms, and their crossing needs no breakpoint. Two
     # traces on one face still pair, and so do leaves that are not traces.
@@ -486,26 +486,6 @@ end
     @test length(pairs) == 2 && all(p -> Unfitted._face(p.gi) == Unfitted._face(p.gj), pairs)
     plain = Unfitted._base_leaves(Any[g1, g2], [:monotone, :monotone], 1, 0.0, 0.5)
     @test count(l -> l isa Unfitted._FDLeaf, plain) == 1
-
-    # What that saves: cube − (sphere ∪ cylinder) around the common axis, where the cylinder lies inside the sphere and
-    # its traces on one face cross the sphere's on the other in every cell. Paired, they added a breakpoint to each of
-    # those cells that bounds no part of Ω (3072 kernel points per cell instead of 2240, measured before the fold
-    # clearance, which now spends 4096 on these cells, every fold of the sphere lying on their faces, and takes their
-    # volume error from 9e-5 to 5e-10), enough to starve the first attempt of the NNLS compression: it missed its target
-    # or fitted to only 1e-9, and a miss refits with an eight times larger candidate cloud. Now each cell fits at the
-    # first attempt, to round-off.
-    sphere = leaf(x -> norm(x - SVector(0.5, 0.5, 0.5)) - 0.32; lipschitz=1.0)
-    cylinder = leaf(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.14; lipschitz=1.0)
-    domain = physical_domain(complement(union(sphere, cylinder)); subcell_length_scale=1 / 64, max_depth=4)
-    order = (4, 4, 4)
-    for lower in Iterators.product((0.25, 0.5), (0.25, 0.5), (0.25, 0.5))
-        cell = box(lower, lower .+ 0.25)
-        rule = implicit_rule(domain, cell, order)
-        basis = MomentBasis(cell, order)
-        first_attempt = Unfitted._cap_candidates(rule[1], length(basis), Unfitted._candidate_budget(1))
-        _, residual = Unfitted.nnls(basis(first_attempt), basis(rule...))
-        @test residual < 1e-14
-    end
 end
 
 @testset "implicit quadrature — a pair leaf that vanishes adds no breakpoints" begin

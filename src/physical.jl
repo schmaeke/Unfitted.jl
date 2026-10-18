@@ -208,7 +208,7 @@ Fields:
 
 # The cut rule and its compression
 
-Every cut region's rule is `moment_fit_rule(physical, box, moment_order)` ([`moment_fit_rule`](@ref)): the cut rule
+Every cut region's rule is `cut_cell_rule(physical, box, moment_order)` ([`cut_cell_rule`](@ref)): the cut rule
 integrates `box ∩ Ω` with as many points as accuracy takes, and the compression replaces them by at most
 `length(MomentBasis(box, moment_order)) = ∏(moment_order .+ 1)` points that reproduce the cut rule's moments over that
 basis ([`MomentBasis`](@ref)). Either stage can be replaced by a callable; both are called once per distinct
@@ -218,14 +218,14 @@ The cut rule has the signature
 
     cut_rule(physical, box, moment_order) -> (points, weights)
 
-and returns a rule for `box ∩ Ω` in **physical coordinates**: `points[q] ∈ box ⊂ ℝᴰ` and `weights[q]` its physical
-weight, so `Σ w_q ≈ vol(box ∩ Ω)`. A rule in the box's reference frame silently integrates the wrong geometry. Its
-accuracy is the accuracy of the cell: the compression reproduces its moments and can be no better than it. A cut rule
-that finds nothing returns empty vectors, which routes the region to `:cut_failed` (`α = 0`) or `:cut_alpha_failed`
-(`α > 0`) and reaches `diagnostics(...).fit_failure_count`. A rule that misses part of a cut volume is more dangerous
-than an empty one: a dof supported only where the rule has no points gets a zero row and the system is singular at
-`α = 0` — measured for a space-tree rule that keeps the tensor Gauss points of its cut leaves that fall in Ω, at depth 3
-on an 8² mesh at every order from 2.
+and returns a rule for `box ∩ Ω` in **physical coordinates**, as a `Vector{SVector{D,T}}` and a `Vector{T}` in the box's
+own `T`: `points[q] ∈ box ⊂ ℝᴰ` and `weights[q]` its physical weight, so `Σ w_q ≈ vol(box ∩ Ω)`. A rule in the box's
+reference frame silently integrates the wrong geometry. Its accuracy is the accuracy of the cell: the compression
+reproduces its moments and can be no better than it. A cut rule that finds nothing returns empty vectors, which routes
+the region to `:cut_failed` (`α = 0`) or `:cut_alpha_failed` (`α > 0`) and reaches `diagnostics(...).fit_failure_count`.
+A rule that misses part of a cut volume is more dangerous than an empty one: a dof supported only where the rule has no
+points gets a zero row and the system is singular at `α = 0` — measured for a space-tree rule that keeps the tensor
+Gauss points of its cut leaves that fall in Ω, at depth 3 on an 8² mesh at every order from 2.
 
 The compression has the signature
 
@@ -233,20 +233,23 @@ The compression has the signature
 
 and receives the cut rule together with the basis its moments are taken over and the moments themselves,
 `moments == basis(points, weights)` — `basis(points)` is the matrix `A[α, q] = ψ_α(x_q)`, so `moments == A * weights`.
-It returns a rule in the same physical frame whose moments match. [`moment_fit_rule`](@ref) measures that: a rule whose
-residual exceeds 1e-2 `‖m‖` is discarded for the cut rule itself (region kind `:cut_fallback`), and the weights it
-returns are truncated at round-off afterwards, so a compression may leave exact or near zeros in place. A compression is
-also applied on the boundary faces of a cut region, one dimension down, so it must not assume the box's dimension.
+It returns a rule in the same physical frame and types whose moments match. [`cut_cell_rule`](@ref) measures that: a
+rule whose residual exceeds 1e-2 `‖m‖` is discarded for the cut rule itself (region kind `:cut_fallback`), and the
+weights it returns are truncated at round-off afterwards, so a compression may leave exact or near zeros in place. It
+must not modify its arguments: on `:fallback` the cut rule it was handed is the rule the region carries. A compression
+is also applied on the boundary faces of a cut region, one dimension down, so it must not assume the box's dimension.
 
 Three properties of the pipeline are the caller's responsibility for either stage:
 
  1. **Weights must be non-negative.** A rule from either stage with a weight below zero beyond round-off is rejected
-    with an `ArgumentError` naming the stage. The α-FCM blend `(1 − α)·rule ∪ α·tensor` assumes it, the Dirichlet trace
-    solve reads a zero diagonal of its boundary mass as an unsupported dof only because every facet weight is `≥ 0`, and
-    a negative weight can make an otherwise SPD form indefinite and a squared norm negative. A moment fit at fixed
-    points — the tensor Gauss points of the box, solved in closed form — is the standard example: on 31 cut cells of
-    discs, balls, polytopes and perforated cells it put negative weights on 38% of its points and 79% of its points
-    outside Ω, and the L² error it integrated came out negative.
+    with an `ArgumentError` naming the stage — raised on a thread of the plan build, so it reaches `prepare` wrapped
+    (`TaskFailedException` inside a `CompositeException`), as any error a stage raises does. The α-FCM blend
+    `(1 − α)·rule ∪ α·tensor` assumes it, the Dirichlet trace solve reads a zero diagonal of its boundary mass as an
+    unsupported dof only because every facet weight is `≥ 0`, and a negative weight can make an otherwise SPD form
+    indefinite and a squared norm negative. A moment fit at fixed points — the tensor Gauss points of the box, solved in
+    closed form — is the standard example: on 31 cut cells of discs, balls, polytopes and perforated cells it put
+    negative weights on 38% of its points and 79% of its points outside Ω, and the L² error it integrated came out
+    negative.
  2. **The callable must be a deterministic function of its arguments.** Rules are memoised per
     `(region box, moment order)` in a cache the [`Model`](@ref) owns per participating space and threads back through
     every plan rebuild, so a callable reading mutable state outside its arguments is captured at its first answer for a
@@ -293,7 +296,8 @@ fully-fictitious cells as active dofs (the classic α-FCM fill) and therefore re
 cut cell's rule reproduces.
 
 `cut_rule` and `compression` are the two stages of a cut cell's quadrature: [`implicit_rule`](@ref) integrates the cut
-volume, and [`Caratheodory`](@ref) prunes that rule to at most `length(basis)` of its points with the same moments;
+volume, and [`Caratheodory`](@ref) prunes that rule to at most as many of its points as the moment basis has
+functions ([`MomentBasis`](@ref)), with the same moments;
 [`NonnegativeFit`](@ref) fits them by non-negative least squares instead, and `compression = nothing` keeps the cut
 rule uncompressed. Either stage can be a callable of the caller's; the contracts they must honour are under
 "The cut rule and its compression" in the [`PhysicalDomain`](@ref) docstring.
@@ -480,7 +484,7 @@ _restrict(n::Not, k::Int, v) = Not(_restrict(n.part, k, v))
 # Ω restricted to the affine slice `⋂ⱼ {x_{kⱼ} = vⱼ}` named by `pins`, as a `PhysicalDomain` of dimension
 # `D − length(pins)`. The struct carries no dimension parameter, so a slice is the same domain with a restricted tree,
 # and every consumer that takes its `D` from the box it is handed — `classify_cell`, `_effective_subcell_depth`,
-# [`moment_fit_rule`](@ref) — works on the slice unchanged. The integration knobs come along with it, which is what
+# [`cut_cell_rule`](@ref) — works on the slice unchanged. The integration knobs come along with it, which is what
 # makes a face and the cells behind it resolve the same geometry at the same accuracy.
 #
 # `pins` are `(axis, coordinate)` pairs in DESCENDING axis order, and the order is load-bearing: each restriction drops

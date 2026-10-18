@@ -145,7 +145,7 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `physical.jl`     | CSG level-set tree, `PhysicalDomain`, three-valued cell classifier |
 | `implicit.jl`     | Saye dimension-reduction implicit quadrature on the level set (volume rules) |
 | `basis.jl`        | basis-family interface and capability traits, integrated Legendre default, the `:tensor` / `:trunk` index sets and the `_index_admissible` filter the minimum rule is expressed over, tensor-product evaluation |
-| `fcm.jl`          | finite-cell-method cut-cell quadrature in two stages: the cut rule (`implicit_rule`, from `implicit.jl`) and its compression to a subset of its points that reproduces its moments (`Caratheodory` pruning, or `NonnegativeFit` NNLS); `moment_fit_rule` runs the two |
+| `fcm.jl`          | finite-cell-method cut-cell quadrature in two stages: the cut rule (`implicit_rule`, from `implicit.jl`) and its compression to a subset of its points that reproduces its moments (`Caratheodory` pruning, or `NonnegativeFit` NNLS); `cut_cell_rule` runs the two |
 | `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks (`LevelMask`, an alias of `BitArray`) and per-cell polynomial order (`CellOrders` / `CellModes`, with no per-cell arrays on a uniform level); the `space` / `overlay` / `adapt` / `elevate` verbs |
 | `intersections.jl`| the integration-region record (`Region`, `Parent`) and admissible integration regions for non-matching meshes; cut/fictitious region-quadrature dispatch |
 | `coverage.jl`     | per-level covered-cell masks (`Coverage`, `build_coverage`); the mask- and material-aware covering rule behind covered-mode pruning; the material oracle (`_Fold`) the dof layer asks whether an inactive cell holds material |
@@ -272,8 +272,8 @@ this protocol:
      Julia package ecosystem inside `src/`, `test/`, or `examples/`.
 
 QuESo's source under `github.com/manuelmessmer/QuESo` is the algorithmic
-reference for the *non-negative moment-fit structure* in `src/fcm.jl`; it
-is a design reference only and no QuESo code is vendored. The deliberate
+reference for the structure of the `NonnegativeFit` compression in
+`src/fcm.jl`; it is a design reference only and no QuESo code is vendored. The deliberate
 deviations from that source — a CSG level-set geometry kernel instead of a
 B-rep triangulation, and *exact* moments from Saye's implicit quadrature
 (`src/implicit.jl`) instead of a divergence-theorem surface integral with a
@@ -566,7 +566,7 @@ constructed as follows:
   7. Dispatch the region quadrature on the `PhysicalDomain`
      classification — tensor Gauss on `:full`, α-scaled tensor Gauss on
      `:fictitious` with `α > 0`, and on `:cut` the domain's cut rule under
-     its compression (`moment_fit_rule`, see *Region quadrature kinds*
+     its compression (`cut_cell_rule`, see *Region quadrature kinds*
      below); a `:fictitious` region under strict α (`α = 0`) is dropped
      outright.
   8. Store each contributing parent element with the affine map from the
@@ -1044,7 +1044,9 @@ indicator representations are intentionally not supported.
       least-squares fit on candidates drawn from the cut rule; `nothing`
       keeps the cut rule uncompressed. Both stages must return
       *physical*-frame points and non-negative weights — a weight below
-      zero beyond round-off is an `ArgumentError` — both are memoised per
+      zero beyond round-off is an `ArgumentError`, which reaches `prepare`
+      wrapped in a `CompositeException` like any error raised on the
+      threads of a plan build — both are memoised per
       box and moment order, both must be thread-safe like every leaf,
       since the cut rules of a plan are built on every thread, and only
       the compression is used on boundary faces. The full contract is in
@@ -1098,17 +1100,18 @@ indicator representations are intentionally not supported.
   - **Cut-rule defaults**: moment order = `moment_order_factor ×
     max(cell_order)` per axis over the region's parent cells, the factor
     defaulting to `2`; the cut rule is the Saye volume rule, whose tensor
-    Legendre moments `moment_fit_rule` sums and hands to the compression.
+    Legendre moments `cut_cell_rule` sums and hands to the compression.
     `Caratheodory` reduces the cut rule by recombination — its points
     grouped into `2 · nbasis` clusters whose moment vectors are pruned, so
     at least half of them drop per round — until at most `2 · nbasis`
     points are left, and prunes those directly, each pruning walking along
     null vectors of the moment matrix until a weight reaches zero; the
     null vectors come from a pivoted Householder QR written in Julia, so
-    no BLAS call runs inside the threaded plan build; no matrix it forms
-    is larger than `2 nbasis` square, however many points the cut rule
-    has, it has no user-facing tolerance or retry, and it stops at the
-    matrix's numerical rank, below `nbasis` on a sliver. `NonnegativeFit` runs a Lawson–Hanson NNLS solve
+    no threaded BLAS or LAPACK kernel runs inside the threaded plan build;
+    no matrix it forms is larger than `2 nbasis` square, however many
+    points the cut rule has, it has no user-facing tolerance or retry, and
+    it stops at the matrix's numerical rank, below `nbasis` on a sliver.
+    `NonnegativeFit` runs a Lawson–Hanson NNLS solve
     (`NonNegLeastSquares.jl`) that selects ≤ `nbasis` non-negative weights
     from a candidate cloud drawn by even fractional spacing over the cut
     rule (an integer stride aliases against the fiber Gauss count and draws
@@ -1560,17 +1563,20 @@ demos.
     that integrate it exactly; Carathéodory pruning keeps a subset of the
     cut rule, directly and through recombination, stops at the numerical
     rank on a sliver, keeps the moments of a rank-deficient matrix under
-    weights spread over thirty orders of magnitude, and carries Float32;
+    weights spread over thirty orders of magnitude, undoes a pass that
+    drifts and keeps a sound one in Float32, and carries Float32; the
+    pure-Julia null space agrees in dimension with LinearAlgebra's
+    `nullspace` on wide, rank-deficient, zero, tall and Float32 matrices;
     the NNLS retry rescues a many-feature cut cell that its first attempt
     cannot fit, from the same cut rule; a compression that misses the
-    failure threshold falls back to the cut rule; α-FCM weight scaling on a
-    fully fictitious cell; end-to-end SPD on a cut-disk Poisson; 1D
-    analytic mass-entry check on a cut cell; a caller's cut rule and
-    compression replace the package's on cut regions only, compose with
-    each other and with α, are run on every thread, are rejected for a
-    negative weight, and a cut rule that finds nothing — or nothing but
-    zero weights — routes its region to `:cut_failed` /
-    `:cut_alpha_failed`.
+    failure threshold, or keeps no weight at all, falls back to the cut
+    rule; α-FCM weight scaling on a fully fictitious cell; end-to-end SPD
+    on a cut-disk Poisson; 1D analytic mass-entry check on a cut cell; a
+    caller's cut rule and compression replace the package's on cut regions
+    only, compose with each other and with α, count their calls atomically
+    as stages that may run on any thread must, are rejected for a negative
+    weight, and a cut rule that finds nothing — or nothing but zero
+    weights — routes its region to `:cut_failed` / `:cut_alpha_failed`.
     **Requirement not yet met:** because `_partition` emits
     pairwise-disjoint boxes, the `(box, moment order)` cache key never
     repeats within one plan, so no test distinguishes a memoised rule
