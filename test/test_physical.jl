@@ -252,10 +252,10 @@ end
 end
 
 @testset "interior hole drops the expected cells" begin
-    # 10×10 mesh of width 0.1 each. Disk hole at (0.5, 0.5) radius 0.2.
-    # Cells (5,5), (5,6), (6,5), (6,6) sit entirely inside the disk and should be classified :fictitious. Uses
-    # subcell_length_scale=1.0e-6, max_depth=2 + order=1 to keep the NNMF cost on the surrounding cut cells small — this
-    # test is about cell classification, not cut-quadrature accuracy.
+    # 10×10 mesh of width 0.1 each. Disk hole at (0.5, 0.5) radius 0.2. Cells (5,5), (5,6), (6,5), (6,6) sit entirely
+    # inside the disk and should be classified :fictitious. Uses subcell_length_scale=1.0e-6, max_depth=2 + order=1 to
+    # keep the compression cost on the surrounding cut cells small — this test is about cell classification, not
+    # cut-quadrature accuracy.
     omega = box((0.0, 0.0), (1.0, 1.0))
     hole = physical_domain(x -> 0.2 - sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2); lipschitz=1.0, subcell_length_scale=1.0e-6,
                            max_depth=2)
@@ -684,7 +684,7 @@ end
     @test V_overlay.physical === p
 end
 
-@testset "NNMF on a region with multi-level parents" begin
+@testset "the moment order of a region with multi-level parents" begin
     # A cut base cell that is also covered by a cut overlay cell — exercises the moment order's max over parents
     # (`_axis_max` of `_moment_orders`). Use orders that differ between levels so the chosen moment_order is meaningful.
     bc = dirichlet(0.0; on=boundary(:all))
@@ -702,7 +702,7 @@ end
     @test moment_order == (4,)
 end
 
-@testset "moment_order_factor knob tunes the NNMF basis" begin
+@testset "moment_order_factor knob tunes the moment basis" begin
     omega = box((0.0,), (1.0,))
     p_default = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=1.0e-6, max_depth=2)
     p_cheap = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=1.0e-6, max_depth=2,
@@ -739,7 +739,7 @@ end
 @testset "α-FCM fit failure is :cut_alpha_failed and counts as a failure" begin
     # The empty-Ω∩R branches are defensive (unreachable via the public path with exact kernels), so pin their contract
     # directly. Unlike the empty strict-cut `:cut_failed`, `:cut_alpha_failed` carries a NONZERO α-scaled rule so the
-    # cell's dofs stay α-stabilised. `:cut_fallback` carries the raw Saye volume rule — a full, correct rule with many
+    # cell's dofs stay α-stabilised. `:cut_fallback` carries the uncompressed cut rule — a full, correct rule with many
     # more points than a fit. All three non-fitted kinds feed the fit-failure count, all four count as cut regions, and
     # only `:cut_fallback` contributes to the fallback point budget.
     region(kind, points, weights) = Unfitted.Region(SVector(0.0), SVector(1.0), Unfitted.Parent{1,Float64}[], kind,
@@ -762,18 +762,19 @@ end
     # `cut_rule` and `compression` are the public extension points of the cut-cell quadrature. The cut rule below is the
     # plainest one honouring its contract: the full-cell tensor Gauss rule of the region box, in *physical* coordinates,
     # with strictly positive weights. It ignores Ω on purpose, so `Σ w_q = vol(box)` exactly — a value no rule of the
-    # cut volume could return, which is what makes "the rule was actually used" checkable without re-deriving one.
-    calls = Ref(0)
+    # cut volume could return, which is what makes "the rule was actually used" checkable without re-deriving one. Both
+    # stages are called from every thread at once, so they count their calls atomically.
+    calls = Threads.Atomic{Int}(0)
     function tensor_rule(physical, region_box::Unfitted.AxisBox{D,T}, moment_order::NTuple{D,Int}) where {D,T}
-        calls[] += 1
+        Threads.atomic_add!(calls, 1)
         rule = Unfitted._tensor_gauss_rule(moment_order .+ 1, T)
         jacobian = Unfitted.volume(region_box) / T(2^D)
         return [Unfitted.reference_to_physical(region_box, p) for p in rule.points], rule.weights .* jacobian
     end
-    compressions = Ref(0)
-    function counted(points, weights, moments, region_box, moment_order)
-        compressions[] += 1
-        return Caratheodory()(points, weights, moments, region_box, moment_order)
+    compressions = Threads.Atomic{Int}(0)
+    function counted(points, weights, moments, basis)
+        Threads.atomic_add!(compressions, 1)
+        return Caratheodory()(points, weights, moments, basis)
     end
 
     omega = box((0.0, 0.0), (1.0, 1.0))
@@ -784,11 +785,8 @@ end
     fitted = physical_domain(geometry; settings...)
     raw = physical_domain(geometry; settings..., cut_rule=tensor_rule, compression=nothing)
 
-    # Both stages are type parameters, so a domain is concrete whatever it carries. The package's own stages may run on
-    # every thread; a caller's callable is run serially.
+    # Both stages are type parameters, so a domain is concrete whatever it carries.
     @test isconcretetype(typeof(fitted)) && isconcretetype(typeof(raw))
-    @test all(Unfitted._threadsafe, (implicit_rule, Caratheodory(), NonnegativeFit(), nothing))
-    @test !Unfitted._threadsafe(tensor_rule) && !Unfitted._threadsafe(counted)
 
     # A caller's stage replaces the rule a cut region carries, not what the region is: same boxes, same kinds — and a
     # rule kept uncompressed reproduces its own moments exactly, so it is `:cut_fitted` like any other.

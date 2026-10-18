@@ -1451,12 +1451,11 @@ diagnostics:
   - `:volume` (default) — the points of every subdomain integration plan.
   - `:facet` — every cached [`FacetRegion`](@ref). On an immersed space this is not a function of the mesh and the
     orders alone: a region on a face `∂Ω` crosses carries the moment-fit rule on the facet's affine slice, not the
-    tensor product its parents size, so its point count is whatever that rule came out at — at most the
-    moment basis size on a `:cut_fitted` region, which at a low order is *more* points than the untrimmed rule rather
-    than fewer (measured 3 → 5 on a cut face of an order-2 space), the raw Saye rule on a `:cut_fallback` one, and none
-    at all for a face wholly outside `Ω` under strict `α = 0`. `α > 0` appends the full-face tensor rule to each of
-    those. The count therefore moves with the geometry, and `cut_facet_region_count` says how many regions are in that
-    regime.
+    tensor product its parents size, so its point count is whatever that rule came out at — at most the moment basis
+    size on a `:cut_fitted` region, which at a low order is *more* points than the untrimmed rule rather than fewer
+    (measured 3 → 5 on a cut face of an order-2 space), the uncompressed Saye rule on a `:cut_fallback` one, and none at
+    all for a face wholly outside `Ω` under strict `α = 0`. `α > 0` appends the full-face tensor rule to each of those.
+    The count therefore moves with the geometry, and `cut_facet_region_count` says how many regions are in that regime.
   - `:surface` — every cached immersed-surface [`SimplexRegion`](@ref) ([`BoundaryMesh`](@ref) integration).
   - `:interface` — every cached multi-domain interface [`SimplexRegion`](@ref).
 

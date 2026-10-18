@@ -48,9 +48,8 @@ must accept `ForwardDiff.Dual` arguments so the quadrature kernel can take its g
 [`implicit_volume_quadrature`](@ref) is reachable only by calling that kernel directly.
 
 `f` must also be safe to call from several threads at once — a pure function of `x` is. The package builds the
-quadrature of cut cells and of cut boundary faces on every thread, and those builds evaluate the leaves concurrently; a
-custom `cut_rule` or `compression` (see [`PhysicalDomain`](@ref)) makes the cell builds serial, but the face builds
-always use [`implicit_rule`](@ref) and still evaluate the leaves on several threads.
+quadrature of cut cells and of cut boundary faces on every thread, and those builds evaluate the leaves concurrently;
+the same holds for a domain's `cut_rule` and `compression` (see [`PhysicalDomain`](@ref)).
 
 `lipschitz` is the Lipschitz constant used by the sign certificate of both the cell classifier and the implicit
 quadrature kernel; `1.0` for a true signed-distance leaf, `Inf` to rely on corner sampling. Supplying it is what lets a
@@ -203,7 +202,7 @@ Fields:
     `2` whenever high-order convergence on cut cells is the point.
   - `cut_rule::R`: the first stage of a cut cell's quadrature, which integrates `box ∩ Ω` accurately — by default
     [`implicit_rule`](@ref). See "The cut rule and its compression" below.
-  - `compression::C`: the second stage, which reduces the cut rule to `∏(moment order + 1)` points or fewer that
+  - `compression::C`: the second stage, which reduces the cut rule to `∏(moment order .+ 1)` points or fewer that
     reproduce its moments — by default [`Caratheodory`](@ref), or [`NonnegativeFit`](@ref) — or `nothing` to integrate
     cut cells with the cut rule itself. See below.
 
@@ -211,8 +210,9 @@ Fields:
 
 Every cut region's rule is `moment_fit_rule(physical, box, moment_order)` ([`moment_fit_rule`](@ref)): the cut rule
 integrates `box ∩ Ω` with as many points as accuracy takes, and the compression replaces them by at most
-`nbasis = ∏(moment_order .+ 1)` points that reproduce the cut rule's tensor Legendre moments. Either stage can be
-replaced by a callable; both are called once per distinct `(region box, moment order)` pair.
+`length(MomentBasis(box, moment_order)) = ∏(moment_order .+ 1)` points that reproduce the cut rule's moments over that
+basis ([`MomentBasis`](@ref)). Either stage can be replaced by a callable; both are called once per distinct
+`(region box, moment order)` pair.
 
 The cut rule has the signature
 
@@ -229,30 +229,31 @@ on an 8² mesh at every order from 2.
 
 The compression has the signature
 
-    compression(points, weights, moments, box, moment_order) -> (points, weights)
+    compression(points, weights, moments, basis) -> (points, weights)
 
-and receives the cut rule together with its moments `m_α = Σ_q w_q ψ_α(ξ(x_q))`, where `ψ_α(ξ) = ∏_d L_{α_d}(ξ_d)` is
-the tensor product of Legendre polynomials (normalised to `L_n(1) = 1`) on the box's reference coordinate
-`ξ ∈ [−1, 1]ᴰ`, and `α` runs over `CartesianIndices(0:p₁, …, 0:p_D)` in column-major order. It returns a rule in the
-same physical frame whose moments match `m`. [`moment_fit_rule`](@ref) measures that: a rule whose residual exceeds
-1e-2 `‖m‖` is discarded for the cut rule itself (region kind `:cut_fallback`). A compression is also applied on the
-boundary faces of a cut region, one dimension down, so it must not assume the box's dimension.
+and receives the cut rule together with the basis its moments are taken over and the moments themselves,
+`moments == basis(points, weights)` — `basis(points)` is the matrix `A[α, q] = ψ_α(x_q)`, so `moments == A * weights`.
+It returns a rule in the same physical frame whose moments match. [`moment_fit_rule`](@ref) measures that: a rule whose
+residual exceeds 1e-2 `‖m‖` is discarded for the cut rule itself (region kind `:cut_fallback`), and the weights it
+returns are truncated at round-off afterwards, so a compression may leave exact or near zeros in place. A compression is
+also applied on the boundary faces of a cut region, one dimension down, so it must not assume the box's dimension.
 
 Three properties of the pipeline are the caller's responsibility for either stage:
 
- 1. **Weights must be non-negative.** The α-FCM blend `(1 − α)·rule ∪ α·tensor` assumes it, the Dirichlet trace solve
-    reads a zero diagonal of its boundary mass as an unsupported dof only because every facet weight is `≥ 0`, and a
-    negative weight can make an otherwise SPD form indefinite and a squared norm negative. A moment fit at fixed points
-    — the tensor Gauss points of the box, solved in closed form — is the standard example: on 31 cut cells of discs,
-    balls, polytopes and perforated cells it put negative weights on 38% of its points and 79% of its points outside Ω,
-    and the L² error it integrated came out negative.
+ 1. **Weights must be non-negative.** A rule from either stage with a weight below zero beyond round-off is rejected
+    with an `ArgumentError` naming the stage. The α-FCM blend `(1 − α)·rule ∪ α·tensor` assumes it, the Dirichlet trace
+    solve reads a zero diagonal of its boundary mass as an unsupported dof only because every facet weight is `≥ 0`, and
+    a negative weight can make an otherwise SPD form indefinite and a squared norm negative. A moment fit at fixed
+    points — the tensor Gauss points of the box, solved in closed form — is the standard example: on 31 cut cells of
+    discs, balls, polytopes and perforated cells it put negative weights on 38% of its points and 79% of its points
+    outside Ω, and the L² error it integrated came out negative.
  2. **The callable must be a deterministic function of its arguments.** Rules are memoised per
     `(region box, moment order)` in a cache the [`Model`](@ref) owns per participating space and threads back through
     every plan rebuild, so a callable reading mutable state outside its arguments is captured at its first answer for a
     box and silently reused — across rebuilds, not merely within one. Put every knob in the callable itself.
- 3. **A custom stage is run serially.** The package builds cut rules on every thread when both stages are its own;
-    with a caller's callable in either stage it builds them on one thread, because caller code is under no
-    thread-safety contract. The leaves are another matter (see [`leaf`](@ref)).
+ 3. **The callable must be thread-safe.** The package builds the rules of a plan's cut regions on every thread, so
+    either stage, like every leaf (see [`leaf`](@ref)), may be called from several threads at once. A pure function of
+    its arguments is; one that counts or logs its calls needs a `Threads.Atomic` or a lock.
 
 The cut rule is not consulted on a boundary face: it is a rule on a cell box in the model's own dimension, so a face
 always takes [`implicit_rule`](@ref) on the level set restricted to its affine slice, followed by the domain's
@@ -292,7 +293,7 @@ fully-fictitious cells as active dofs (the classic α-FCM fill) and therefore re
 cut cell's rule reproduces.
 
 `cut_rule` and `compression` are the two stages of a cut cell's quadrature: [`implicit_rule`](@ref) integrates the cut
-volume, and [`Caratheodory`](@ref) prunes that rule to at most `nbasis` of its points with the same moments;
+volume, and [`Caratheodory`](@ref) prunes that rule to at most `length(basis)` of its points with the same moments;
 [`NonnegativeFit`](@ref) fits them by non-negative least squares instead, and `compression = nothing` keeps the cut
 rule uncompressed. Either stage can be a callable of the caller's; the contracts they must honour are under
 "The cut rule and its compression" in the [`PhysicalDomain`](@ref) docstring.

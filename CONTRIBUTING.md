@@ -1035,18 +1035,21 @@ indicator representations are intentionally not supported.
       `implicit_rule` (default) is Saye's implicit volume rule at a Gauss
       count matched to the moment order.
     - `compression`: the second stage, a callable
-      `(points, weights, moments, box, moment_order) -> (points, weights)`
-      that replaces the cut rule by at most `∏(moment_order + 1)` points
-      reproducing its tensor Legendre moments. `Caratheodory()` (default)
-      prunes the cut rule to a subset of its points by Carathéodory's
-      theorem, exact by construction; `NonnegativeFit()` is a non-negative
+      `(points, weights, moments, basis) -> (points, weights)` that
+      replaces the cut rule by at most `length(basis)` points reproducing
+      its moments `basis(points, weights)` over the tensor Legendre basis
+      `basis::MomentBasis` of the box. `Caratheodory()` (default) prunes
+      the cut rule to a subset of its points by Carathéodory's theorem,
+      exact by construction; `NonnegativeFit()` is a non-negative
       least-squares fit on candidates drawn from the cut rule; `nothing`
-      keeps the cut rule uncompressed. Both stages must
-      return *physical*-frame points and non-negative weights, both are
-      memoised per box and moment order, a caller's callable in either is
-      run serially, and only the compression is used on boundary faces.
-      The full contract is in the `PhysicalDomain` docstring under "The cut
-      rule and its compression".
+      keeps the cut rule uncompressed. Both stages must return
+      *physical*-frame points and non-negative weights — a weight below
+      zero beyond round-off is an `ArgumentError` — both are memoised per
+      box and moment order, both must be thread-safe like every leaf,
+      since the cut rules of a plan are built on every thread, and only
+      the compression is used on boundary faces. The full contract is in
+      the `PhysicalDomain` docstring under "The cut rule and its
+      compression".
 
   - **Attach** with `space(omega; ..., physical=physical_domain(…))`.
     The default `physical=nothing` keeps the no-FCM hot path.
@@ -1099,11 +1102,12 @@ indicator representations are intentionally not supported.
     `Caratheodory` reduces the cut rule by recombination — its points
     grouped into `2 · nbasis` clusters whose moment vectors are pruned, so
     at least half of them drop per round — until at most `2 · nbasis`
-    points are left, and prunes those directly, each pruning walking along null
-    vectors of the moment matrix until a weight reaches zero; it never
-    forms more than an `nbasis × 2 nbasis` matrix, needs no tolerance or
-    retry, and stops at the matrix's numerical rank, below `nbasis` on a
-    sliver. `NonnegativeFit` runs a Lawson–Hanson NNLS solve
+    points are left, and prunes those directly, each pruning walking along
+    null vectors of the moment matrix until a weight reaches zero; the
+    largest matrix it forms is the `2 nbasis`-square null-space basis of
+    one pruning, however many points the cut rule has, it has no
+    user-facing tolerance or retry, and it stops at the matrix's numerical
+    rank, below `nbasis` on a sliver. `NonnegativeFit` runs a Lawson–Hanson NNLS solve
     (`NonNegLeastSquares.jl`) that selects ≤ `nbasis` non-negative weights
     from a candidate cloud drawn by even fractional spacing over the cut
     rule (an integer stride aliases against the fiber Gauss count and draws
@@ -1551,17 +1555,21 @@ demos.
     `:cut_failed` / `:cut_alpha_failed` region-kind tags appear; every
     built-in compression reproduces the cut rule's moments with
     non-negative weights at ≤ `nbasis` points, at every length scale;
-    Carathéodory pruning keeps a subset of the cut rule, directly and
-    through recombination, stops at the numerical rank on a sliver, and
-    carries Float32; the NNLS retry rescues a many-feature cut cell that
-    its first attempt cannot fit, from the same cut rule; a compression
-    that misses the
+    `MomentBasis` evaluates the tensor Legendre basis and sums moments
+    that integrate it exactly; Carathéodory pruning keeps a subset of the
+    cut rule, directly and through recombination, stops at the numerical
+    rank on a sliver, keeps the moments of a rank-deficient matrix under
+    weights spread over thirty orders of magnitude, and carries Float32;
+    the NNLS retry rescues a many-feature cut cell that its first attempt
+    cannot fit, from the same cut rule; a compression that misses the
     failure threshold falls back to the cut rule; α-FCM weight scaling on a
     fully fictitious cell; end-to-end SPD on a cut-disk Poisson; 1D
     analytic mass-entry check on a cut cell; a caller's cut rule and
     compression replace the package's on cut regions only, compose with
-    each other and with α, are run serially, and a cut rule that finds
-    nothing routes its region to `:cut_failed` / `:cut_alpha_failed`.
+    each other and with α, are run on every thread, are rejected for a
+    negative weight, and a cut rule that finds nothing — or nothing but
+    zero weights — routes its region to `:cut_failed` /
+    `:cut_alpha_failed`.
     **Requirement not yet met:** because `_partition` emits
     pairwise-disjoint boxes, the `(box, moment order)` cache key never
     repeats within one plan, so no test distinguishes a memoised rule

@@ -698,8 +698,7 @@ const _MomentFitCache{D,T} = Dict{_MomentFitKey{D,T},_MomentFitValue{D,T}}
 # cache to exactly this plan's regions. Classification ran first and serially, in the records (it is memoised, and a
 # `Dict` is not thread-safe); the fits fill the cache afterwards, serially; the rule loop then runs in region order on
 # nothing but cache hits, so region order, `residual_max` and the small-overlap bookkeeping are the serial path's, bit
-# for bit. A domain with a caller's cut rule or compression is fitted serially (`_fit_rules`) and still gets the dedup
-# and the cross-plan reuse.
+# for bit.
 #
 # `live` is the plan's whole cut-key set, not just its misses, because restricting the cache afterwards is what keeps a
 # cache threaded through a long `move!` sweep from holding the sweep's worth of rules. On exit the cache holds only the
@@ -742,25 +741,17 @@ function _prefit!(cache::_MomentFitCache{D,T}, physical, records::Vector{_Region
     return cache
 end
 
-# The rules of a list of cut keys `(lower, upper, order)`, in key order: `_fit_rule` on every key, on every thread when
-# the domain's stages are the package's own.
+# The rules of a list of cut keys `(lower, upper, order)`, in key order: `_fit_rule` on every key, on every thread.
 #
 # At the default `moment_order_factor = 2` the fits *are* the plan: 99.9% of a 3D build, tens of seconds over a few
 # dozen cut cells. They are also independent of one another — `_fit_rule` reads the immutable `PhysicalDomain` and the
-# box and touches nothing else — so each writes its own slot of a pre-sized vector, with no `Dict` in reach.
-#
-# A domain with a caller's cut rule or compression is fitted serially instead (`_threadsafe` in `fcm.jl`). That is
-# caller code under no thread-safety contract — the package's own test rules count their calls through a shared `Ref` —
-# so the package does not unilaterally run it on N threads.
+# box and touches nothing else — so each writes its own slot of a pre-sized vector, with no `Dict` in reach. That holds
+# for a caller's cut rule, compression and level-set leaves as much as for the package's own, because the
+# `PhysicalDomain` contract requires every callable it holds to be thread-safe.
 function _fit_rules(physical::PhysicalDomain, keys::Vector{_MomentFitKey{D,T}}) where {D,T}
     fitted = Vector{_MomentFitValue{D,T}}(undef, length(keys))
-    fit(key) = _fit_rule(physical, key[1], key[2], key[3])
-    if _threadsafe(physical.cut_rule) && _threadsafe(physical.compression)
-        Threads.@threads for i in eachindex(keys)
-            fitted[i] = fit(keys[i])
-        end
-    else
-        map!(fit, fitted, keys)
+    Threads.@threads for i in eachindex(keys)
+        fitted[i] = _fit_rule(physical, keys[i]...)
     end
     return fitted
 end
@@ -776,9 +767,6 @@ end
 #   - `residual` is the moment-fit L² residual reported by `fcm.jl`;
 #   - `status` is `:fitted`, `:fallback`, or `:empty` — see [`moment_fit_rule`](@ref). The mapping above is
 #     rule-agnostic, so a `:fallback` rule (the cut rule itself) is mapped and consumed exactly like a compressed one.
-#
-# A pure function of its arguments when both stages are the package's own, which is what lets `_fit_rules` run it on any
-# thread.
 function _fit_rule(physical::PhysicalDomain, lower::SVector{D,T}, upper::SVector{D,T}, order::NTuple{D,Int}) where {D,T}
     box = AxisBox{D,T}(lower, upper)
     points, weights, residual, status = moment_fit_rule(physical, box, order)

@@ -98,27 +98,19 @@ end
 end
 
 @testset "implicit quadrature — tensor Legendre moment vector matches analytic" begin
-    # The moment-fit pipeline needs mₐ = ∫_{Ω∩R} ψₐ dx with ψₐ the tensor Legendre basis. Build that vector from the
-    # kernel rule and the existing Legendre evaluators in `fcm.jl`, then check the constant moment equals the cut area
-    # and the orthogonality-driven zeros vanish, for Ω = {x ≤ 0.4}.
+    # The compression needs mₐ = ∫_{Ω∩R} ψₐ dx with ψₐ the tensor Legendre basis (`MomentBasis`). Sum that vector from
+    # the kernel rule, then check the constant moment equals the cut area and the orthogonality-driven zeros vanish, for
+    # Ω = {x ≤ 0.4}.
     region = box((0.0, 0.0), (1.0, 1.0))
-    order = (3, 3)
     a = 0.4
     rule = _IVQ(x -> x[1] - a, region; gauss_points=8)
-    idx = Unfitted._moment_basis_indices(order)
-    factors = Unfitted._legendre_factor_buffers(order, Float64)
-    moments = zeros(length(idx))
-    for j in eachindex(rule[2])
-        Unfitted._fill_legendre_factors!(factors, rule[1][j], region.lower, region.upper, order)
-        for (k, α) in pairs(idx)
-            moments[k] += rule[2][j] * Unfitted._tensor_legendre_value(factors, α)
-        end
-    end
+    basis = MomentBasis(region, (3, 3))
+    moments = basis(rule...)
     # α = (0,0): L₀⊗L₀ ≡ 1 ⇒ moment is the cut area a.
     @test moments[1] ≈ a atol = 1e-12
     # α = (0,n) for n ≥ 1: ∫₀^a dx · ∫₀¹ Lₙ(2y−1) dy = a · 0 by Legendre orthogonality to the constant.
     for n in 1:3
-        k = findfirst(==(CartesianIndex(0, n)), idx)
+        k = findfirst(==(CartesianIndex(0, n)), basis.indices)
         @test abs(moments[k]) < 1e-12
     end
 end
@@ -496,10 +488,12 @@ end
     @test count(l -> l isa Unfitted._FDLeaf, plain) == 1
 
     # What that saves: cube − (sphere ∪ cylinder) around the common axis, where the cylinder lies inside the sphere and
-    # its traces on one face cross the sphere's on the other in every cell. Paired, they add a breakpoint to each of
-    # those cells that bounds no part of Ω (3072 kernel points instead of 2240), enough to starve the first attempt of
-    # the NNLS compression: it missed its target or fitted to only 1e-9, and a miss refits with an eight times larger
-    # candidate cloud. Now each cell fits at the first attempt, to round-off.
+    # its traces on one face cross the sphere's on the other in every cell. Paired, they added a breakpoint to each of
+    # those cells that bounds no part of Ω (3072 kernel points per cell instead of 2240, measured before the fold
+    # clearance, which now spends 4096 on these cells, every fold of the sphere lying on their faces, and takes their
+    # volume error from 9e-5 to 5e-10), enough to starve the first attempt of the NNLS compression: it missed its target
+    # or fitted to only 1e-9, and a miss refits with an eight times larger candidate cloud. Now each cell fits at the
+    # first attempt, to round-off.
     sphere = leaf(x -> norm(x - SVector(0.5, 0.5, 0.5)) - 0.32; lipschitz=1.0)
     cylinder = leaf(x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.14; lipschitz=1.0)
     domain = physical_domain(complement(union(sphere, cylinder)); subcell_length_scale=1 / 64, max_depth=4)
@@ -507,9 +501,9 @@ end
     for lower in Iterators.product((0.25, 0.5), (0.25, 0.5), (0.25, 0.5))
         cell = box(lower, lower .+ 0.25)
         rule = implicit_rule(domain, cell, order)
-        first_attempt = Unfitted._cap_candidates(rule[1], order, Unfitted._candidate_budget(1))
-        _, residual = Unfitted.nnls(Unfitted._build_moment_matrix(first_attempt, cell, order),
-                                    Unfitted._moments_from_rule(rule..., cell, order))
+        basis = MomentBasis(cell, order)
+        first_attempt = Unfitted._cap_candidates(rule[1], length(basis), Unfitted._candidate_budget(1))
+        _, residual = Unfitted.nnls(basis(first_attempt), basis(rule...))
         @test residual < 1e-14
     end
 end

@@ -1,6 +1,6 @@
 using BenchmarkTools
 using StaticArrays
-using Unfitted: AxisBox, physical_domain, leaf
+using Unfitted: AxisBox, physical_domain, leaf, NonnegativeFit
 using Unfitted: moment_fit_rule, implicit_volume_quadrature
 # `intersect`/`setdiff` are Base set ops; Unfitted adds LevelSet methods.
 
@@ -9,9 +9,10 @@ using Unfitted: moment_fit_rule, implicit_volume_quadrature
 # projection; these microkernels isolate `moment_fit_rule` (the public per-cell driver) and the Saye implicit volume
 # rule it is built on, so a regression can be attributed to the moment kernel itself.
 #
-# The pipeline is a single integrator: `moment_fit_rule` builds the exact implicit volume rule, recovers the tensor
-# Legendre moments, and runs one NNLS solve. Cost and point count scale with the moment basis, not with octree depth
-# (the old stair-step integrator grew like 8^depth in 3D).
+# `moment_fit_rule` builds the implicit volume rule, sums its tensor Legendre moments, and compresses it — by
+# Carathéodory pruning, the default, and in the `nnls` rows by `NonnegativeFit`, kept for comparison. Cost and point
+# count scale with the moment basis and the cut rule, not with octree depth (the old stair-step integrator grew like
+# 8^depth in 3D).
 group = SUITE["microkernels"]["fcm"] = BenchmarkGroup()
 
 # 2D smooth disk cut cell straddling the boundary.
@@ -23,7 +24,9 @@ let
         q = mo_p + 2
         tag = "mo=$mo_p"
         physical = physical_domain(phi_disk; lipschitz=1.0, subcell_length_scale=0.05)
+        nnls = physical_domain(phi_disk; lipschitz=1.0, subcell_length_scale=0.05, compression=NonnegativeFit())
         group["moment_fit_rule $tag"] = @benchmarkable moment_fit_rule($physical, $cell, $moment_order)
+        group["moment_fit_rule nnls $tag"] = @benchmarkable moment_fit_rule($nnls, $cell, $moment_order)
         group["implicit_volume_quadrature $tag"] = @benchmarkable implicit_volume_quadrature($phi_disk, $cell;
                                                                                              gauss_points=($q))
     end
@@ -35,12 +38,14 @@ let
     phi_sphere(x) = sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2 + (x[3] - 0.5)^2) - 0.4
     cell = AxisBox(SVector(0.7, 0.45, 0.45), SVector(0.9, 0.65, 0.65))
     physical = physical_domain(phi_sphere; lipschitz=1.0, subcell_length_scale=0.05)
+    nnls = physical_domain(phi_sphere; lipschitz=1.0, subcell_length_scale=0.05, compression=NonnegativeFit())
     fcm3d = group["implicit_3d"] = BenchmarkGroup()
     for mo_p in (4, 6)
         moment_order = (mo_p, mo_p, mo_p)
         q = mo_p + 2
         tag = "mo=$mo_p"
         fcm3d["moment_fit_rule $tag"] = @benchmarkable moment_fit_rule($physical, $cell, $moment_order)
+        fcm3d["moment_fit_rule nnls $tag"] = @benchmarkable moment_fit_rule($nnls, $cell, $moment_order)
         fcm3d["implicit_volume_quadrature $tag"] = @benchmarkable implicit_volume_quadrature($phi_sphere, $cell;
                                                                                              gauss_points=($q))
     end

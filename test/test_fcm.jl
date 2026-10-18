@@ -1,24 +1,34 @@
 using StaticArrays
 using LinearAlgebra
 
-# Tensor Legendre moments mₐ = Σ_q w_q ψₐ(ξ(x_q)) of a quadrature rule, used to check that a compressed rule reproduces
-# a reference set of moments.
-function _legendre_moments(points, weights, region, order)
-    idx = Unfitted._moment_basis_indices(order)
-    factors = Unfitted._legendre_factor_buffers(order, Float64)
-    m = zeros(length(idx))
-    for j in eachindex(weights)
-        Unfitted._fill_legendre_factors!(factors, points[j], region.lower, region.upper, order)
-        for (a, α) in pairs(idx)
-            m[a] += weights[j] * Unfitted._tensor_legendre_value(factors, α)
-        end
-    end
-    return m
-end
-
 # Every built-in compression, for the properties the pipeline promises whichever one a domain carries. The NNLS target
 # is tightened so that its retry, and not its acceptance band, decides the residuals asserted below.
 const _FCM_COMPRESSIONS = (Caratheodory(), NonnegativeFit(; target_residual=1.0e-10))
+
+@testset "FCM — MomentBasis is the tensor Legendre basis of its box" begin
+    # On the box [0, 2] × [1, 3], ξ = (x₁ − 1, x₂ − 2), and up to order (2, 1) the basis is L_a(ξ₁) L_b(ξ₂) with L₀ = 1,
+    # L₁ = ξ, L₂ = (3ξ² − 1) / 2. The functions are enumerated column-major over α, the constant first.
+    region = box((0.0, 1.0), (2.0, 3.0))
+    basis = MomentBasis(region, (2, 1))
+    @test length(basis) == 6
+    L = (ξ -> 1.0, ξ -> ξ, ξ -> (3ξ^2 - 1) / 2)
+    points = [SVector(0.3, 2.9), SVector(1.7, 1.2), SVector(2.0, 1.0)]
+    α = ((0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1))
+    expected = [L[a+1](x[1] - 1) * L[b+1](x[2] - 2) for (a, b) in α, x in points]
+    @test basis(points) ≈ expected rtol = 1.0e-14
+
+    # The moments of a rule are A w, without forming A — and those of a tensor Gauss rule are the exact integrals:
+    # the box's area for the constant, zero for every other function, by orthogonality.
+    weights = [0.25, 1.5, 0.125]
+    @test basis(points, weights) ≈ basis(points) * weights rtol = 1.0e-14
+    x, w = Unfitted.gausslegendre(3)
+    gauss = [SVector(1 + x[i], 2 + x[j]) for i in 1:3 for j in 1:3]
+    @test basis(gauss, [w[i] * w[j] for i in 1:3 for j in 1:3]) ≈ [4.0, 0, 0, 0, 0, 0] atol = 1.0e-14
+
+    # Float32 stays Float32.
+    basis32 = MomentBasis(box((0.0f0,), (1.0f0,)), (3,))
+    @test eltype(basis32([SVector(0.5f0)])) === Float32
+end
 
 @testset "FCM — NNLS wrapper" begin
     # Small well-posed NNLS where the unconstrained solution is non-negative.
@@ -35,14 +45,14 @@ end
     region = box((0.0,), (1.0,))
     moment_order = (4,)
     ref = Unfitted.implicit_volume_quadrature(x -> x[1] - 0.7, region; gauss_points=8)
-    moments = _legendre_moments(ref[1], ref[2], region, moment_order)
+    moments = MomentBasis(region, moment_order)(ref...)
     @test moments[1] ≈ 0.7 atol = 1e-14
     for compression in _FCM_COMPRESSIONS
         p = physical_domain(x -> x[1] - 0.7; lipschitz=1.0, subcell_length_scale=1.0 / 2^8, max_depth=8, compression)
         points, weights, residual, status = Unfitted.moment_fit_rule(p, region, moment_order)
         @test status === :fitted
         @test residual < 1e-10
-        @test _legendre_moments(points, weights, region, moment_order) ≈ moments atol = 1e-10
+        @test MomentBasis(region, moment_order)(points, weights) ≈ moments atol = 1e-10
     end
 end
 
@@ -105,11 +115,11 @@ end
         compression in _FCM_COMPRESSIONS
 
         ref_rule = Unfitted.implicit_volume_quadrature(phi, region; gauss_points=22)
-        ref = _legendre_moments(ref_rule[1], ref_rule[2], region, order)
+        ref = MomentBasis(region, order)(ref_rule...)
         p = physical_domain(phi; lipschitz=2.0, subcell_length_scale=0.5, compression)
         pts, ws, res = Unfitted.moment_fit_rule(p, region, order)
         @test res < 1.0e-9
-        @test _legendre_moments(pts, ws, region, order) ≈ ref atol = 1.0e-9
+        @test MomentBasis(region, order)(pts, ws) ≈ ref atol = 1.0e-9
     end
 end
 
@@ -172,7 +182,7 @@ end
     pts = [SVector(Float64(i), 0.0) for i in 1:200]
     @test length(pts) > cap          # the premise of the test: the cap must bite
 
-    capped = Unfitted._cap_candidates(pts, order, budget)
+    capped = Unfitted._cap_candidates(pts, nbasis, budget)
     # The whole budget, not `cld(n, stride)` of it. The old stride returned 100.
     @test length(capped) == cap
     # Distinct candidates: a duplicated column is a rank-deficient one.
@@ -188,7 +198,7 @@ end
 
     # A rule already inside the cap is returned as-is, identically.
     small = [SVector(Float64(i), 0.0) for i in 1:(cap-1)]
-    @test Unfitted._cap_candidates(small, order, budget) === small
+    @test Unfitted._cap_candidates(small, nbasis, budget) === small
 end
 
 @testset "FCM — the NNLS retry rescues a many-feature cut cell from the same rule" begin
@@ -206,18 +216,20 @@ end
     @test classify_cell(p, region) === :cut
 
     rule = implicit_rule(p, region, order)
-    moments = Unfitted._moments_from_rule(rule..., region, order)
-    starved = Unfitted._cap_candidates(rule[1], order, Unfitted._candidate_budget(1))
-    _, starved_residual = Unfitted.nnls(Unfitted._build_moment_matrix(starved, region, order), moments)
+    basis = MomentBasis(region, order)
+    moments = basis(rule...)
+    starved = Unfitted._cap_candidates(rule[1], length(basis), Unfitted._candidate_budget(1))
+    _, starved_residual = Unfitted.nnls(basis(starved), moments)
     @test starved_residual > Unfitted._FIT_FAILURE_RESIDUAL * norm(moments)
     # The retry genuinely enlarges the cloud.
-    @test length(Unfitted._cap_candidates(rule[1], order, Unfitted._candidate_budget(2))) > 4 * length(starved)
+    @test length(Unfitted._cap_candidates(rule[1], length(basis), Unfitted._candidate_budget(2))) > 4 * length(starved)
 
-    pts, ws = fit(rule..., moments, region, order)
-    @test norm(Unfitted._moments_from_rule(pts, ws, region, order) - moments) < 1.0e-10 * norm(moments)
+    # The fit hands back its whole candidate cloud, the weights off its active set exactly zero.
+    pts, ws = fit(rule..., moments, basis)
+    @test norm(basis(pts, ws) - moments) < 1.0e-10 * norm(moments)
     @test issubset(pts, rule[1])
-    @test all(>(0), ws)
-    @test length(pts) <= prod(order .+ 1)
+    @test all(>=(0), ws)
+    @test count(>(0), ws) <= length(basis)
 
     pts, ws, res, status = Unfitted.moment_fit_rule(p, region, order)
     @test status === :fitted
@@ -232,7 +244,7 @@ end
     # one-point rule whose higher moments are far off, so the verdict is a fallback at every scale: the threshold is
     # relative to ‖m‖.
     order = (8, 8)
-    measure_only(points, weights, moments, box, order) = ([sum(points .* weights) / sum(weights)], [moments[1]])
+    measure_only(points, weights, moments, basis) = ([sum(points .* weights) / sum(weights)], [moments[1]])
     for L in (1.0, 2000.0, 1.0e-3)
         radius = 0.1L
         holes = ((0.3L, 0.3L), (0.7L, 0.3L), (0.3L, 0.7L), (0.7L, 0.7L))
@@ -243,7 +255,7 @@ end
         @test status === :fallback
         @test (pts, ws) == implicit_rule(p, region, order)
         # The fallback rule IS the moments' source, so its own moments are the ‖m‖ the verdict was taken against.
-        @test res > Unfitted._FIT_FAILURE_RESIDUAL * norm(Unfitted._moments_from_rule(pts, ws, region, order))
+        @test res > Unfitted._FIT_FAILURE_RESIDUAL * norm(MomentBasis(region, order)(pts, ws))
         # Non-negativity survives the fallback: every Saye weight is a product of a positive Gauss weight, a positive
         # fiber half-length and a positive base weight (`_emit_fiber!` in `src/implicit.jl`).
         @test all(>=(0), ws)
@@ -302,11 +314,12 @@ end
     pc, wc, rc = Unfitted.moment_fit_rule(coarse, region, order)
     pf, wf, rf = Unfitted.moment_fit_rule(fine, region, order)
     @test rc < 1e-9 && rf < 1e-9
-    mc = _legendre_moments(pc, wc, region, order)
-    @test mc ≈ _legendre_moments(pf, wf, region, order) atol = 1e-10   # depth-independent
+    basis = MomentBasis(region, order)
+    mc = basis(pc, wc)
+    @test mc ≈ basis(pf, wf) atol = 1e-10   # depth-independent
     # …and both equal an independent high-order reference (not just each other).
     ref_rule = Unfitted.implicit_volume_quadrature(phi, region; gauss_points=22)
-    @test mc ≈ _legendre_moments(ref_rule[1], ref_rule[2], region, order) atol = 1e-9
+    @test mc ≈ basis(ref_rule...) atol = 1e-9
 
     nbasis = prod(order .+ 1)
     @test length(implicit_rule(coarse, region, order)[1]) <= 12 * nbasis
@@ -340,7 +353,7 @@ end
         @test sum(wsS) ≈ sum(ws1) * S^2 rtol = 1.0e-10
         # The whole rule as an integrator, not just its measure: every tensor Legendre moment in the cell's own
         # reference frame scales by S^D and nothing else.
-        moments1, momentsS = _legendre_moments(pts1, ws1, cell1, order), _legendre_moments(ptsS, wsS, cellS, order)
+        moments1, momentsS = MomentBasis(cell1, order)(pts1, ws1), MomentBasis(cellS, order)(ptsS, wsS)
         @test momentsS ≈ moments1 .* S^2 rtol = 1.0e-10
         # The reported residual describes the returned rule, and is machine-level relative to the cut volume at both
         # scales — the only scale-free reading.
@@ -350,9 +363,10 @@ end
 end
 
 @testset "FCM — Carathéodory pruning keeps a subset of the cut rule with its moments" begin
-    # The pruned rule is a subset of the cut rule's points with positive weights, at most nbasis of them, reproducing
-    # the moments to round-off — on a cell small enough to prune directly (100 cut-rule points against 2 · 81) and on
-    # two that are first reduced by recombination (1728 points against 2 · 25, and 512 against 2 · 125 in 3D).
+    # The pruned rule is a subset of the cut rule's points with non-negative weights, at most nbasis of them positive,
+    # reproducing the moments to round-off — on a cell small enough to prune directly (100 cut-rule points against
+    # 2 · 81) and on two that are first reduced by recombination (1728 points against 2 · 25, and 512 against 2 · 125 in
+    # 3D).
     disc = leaf(x -> hypot(x[1] - 0.0123, x[2] + 0.0345) - 0.6789; lipschitz=1.0)
     holes = complement(union((leaf(x -> hypot(x[1] - c[1], x[2] - c[2]) - 0.1; lipschitz=1.0)
                               for c in ((0.3, 0.3), (0.7, 0.3), (0.3, 0.7), (0.7, 0.7)))...))
@@ -362,12 +376,13 @@ end
     for (geometry, region, order) in cells
         p = physical_domain(geometry; subcell_length_scale=0.1)
         rule = implicit_rule(p, region, order)
-        moments = Unfitted._moments_from_rule(rule..., region, order)
-        pts, ws = Caratheodory()(rule..., moments, region, order)
+        basis = MomentBasis(region, order)
+        moments = basis(rule...)
+        pts, ws = Caratheodory()(rule..., moments, basis)
         @test issubset(pts, rule[1])
-        @test all(>(0), ws)
-        @test length(pts) <= prod(order .+ 1) < length(rule[1])
-        @test norm(Unfitted._moments_from_rule(pts, ws, region, order) - moments) < 1.0e-13 * norm(moments)
+        @test all(>=(0), ws)
+        @test count(>(0), ws) <= length(basis) < length(rule[1])
+        @test norm(basis(pts, ws) - moments) < 1.0e-13 * norm(moments)
     end
 
     # Where the moment matrix is numerically rank-deficient — a sliver of a disc at moment order 12 — the pruning stops
@@ -400,6 +415,70 @@ end
         @test count(>(0), λ) <= rank
         @test M * λ ≈ target rtol = 1.0e-13
     end
+
+    # Coefficients spread over thirty orders of magnitude, on a rank-deficient matrix whose columns are monomials of
+    # points crowded towards one end: the pruning still stops at the rank, keeps the value to round-off of its largest
+    # term, and drives no coefficient negative.
+    x = range(0, 1; length=60) .^ 3
+    M = [xj^(a - 1) for a in (1, 2, 3, 4, 5, 6, 7, 8, 2, 5), xj in x]
+    λ = 10.0 .^ (30 .* sin.(1:60) .^ 2 .- 30)
+    target = M * λ
+    Unfitted._prune!(λ, M)
+    @test all(>=(0), λ)
+    @test count(>(0), λ) <= 8
+    @test norm(M * λ - target) <= 1.0e-11 * norm(target)
+
+    # A pass that drifts is undone. Crowd the points harder and the monomial matrix is ill-conditioned enough that the
+    # eliminations one pass makes in its null-space basis compound round-off: walked as a single pass, this input moves
+    # the combination by 8.6e-10 of its norm. That pass is replaced by one walk along a fresh null vector
+    # (`_PRUNE_DRIFT`), and the pruning ends 2e-13 from where it began.
+    x = [mod(j * (√5 - 1) / 2, 1)^8 for j in 1:60]
+    M = [xj^(a - 1) for a in 1:12, xj in x]
+    λ = [10.0^(-16 * mod(j * √2, 1)) for j in 1:60]
+    target = M * λ
+    Unfitted._prune!(λ, M)
+    @test all(>=(0), λ)
+    @test count(>(0), λ) <= 12
+    @test norm(M * λ - target) <= 1.0e-11 * norm(target)
+end
+
+@testset "FCM — a cut rule or compression with a negative weight is refused" begin
+    # A signed rule breaks the α blend, the Dirichlet trace solve's test for unsupported dofs and every squared norm,
+    # without a trace: the pipeline refuses it from either stage, and names the stage.
+    region = box((0.0, 0.0), (1.0, 1.0))
+    disc = x -> hypot(x[1] - 0.5, x[2] - 0.5) - 0.3
+    function signed_rule(physical, box, order)
+        pts, ws = implicit_rule(physical, box, order)
+        return pts, [-ws[1]; ws[2:end]]
+    end
+    signed_compression(points, weights, moments, basis) = (points[1:2], [-moments[1], 2moments[1]])
+    for (cut_rule, compression, stage) in
+        ((signed_rule, Caratheodory(), "cut rule"), (implicit_rule, signed_compression, "compression"))
+        p = physical_domain(disc; lipschitz=1.0, subcell_length_scale=0.1, cut_rule, compression)
+        @test_throws ArgumentError Unfitted.moment_fit_rule(p, region, (2, 2))
+        @test_throws "the $stage returned the weight" Unfitted.moment_fit_rule(p, region, (2, 2))
+    end
+
+    # Round-off below zero is not a sign: a compression may leave such weights where it means zero, and the pipeline
+    # truncates them with the rest.
+    function roundoff(points, weights, moments, basis)
+        pts, ws = Caratheodory()(points, weights, moments, basis)
+        return [pts; pts[1:1]], [ws; -eps() * moments[1]]
+    end
+    p = physical_domain(disc; lipschitz=1.0, subcell_length_scale=0.1, compression=roundoff)
+    pts, ws, res, status = Unfitted.moment_fit_rule(p, region, (2, 2))
+    @test status === :fitted
+    @test all(>(0), ws)
+end
+
+@testset "FCM — a cut rule of zero weights carries no measure" begin
+    # A cut rule whose weights are all zero integrates nothing, however many points it lists: the region is `:empty`,
+    # like one with no points, and the compression is never consulted.
+    zero_rule(physical, box, order) = ([box.lower, box.upper], [0.0, 0.0])
+    never(args...) = error("the compression must not run on a rule without measure")
+    p = physical_domain(x -> x[1] - 0.5; lipschitz=1.0, subcell_length_scale=0.1, cut_rule=zero_rule, compression=never)
+    @test Unfitted.moment_fit_rule(p, box((0.0, 0.0), (1.0, 1.0)), (2, 2)) ==
+          (SVector{2,Float64}[], Float64[], 0.0, :empty)
 end
 
 @testset "FCM — NonnegativeFit refuses a non-positive target" begin

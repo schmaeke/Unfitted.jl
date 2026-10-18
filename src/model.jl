@@ -1551,7 +1551,7 @@ end
 ```
 
 For the same problem, calling `update_dirichlet!` is typically orders of magnitude cheaper than re-running
-`prepare(problem)` because the per-step rebuild of the integration plan and the NNMF moment-fit cache is skipped — only
+`prepare(problem)` because the per-step rebuild of the integration plan and the moment-fit cache is skipped — only
 the right-hand side of the boundary-trace projection on the constrained-dof subspace is reassembled and
 back-substituted.
 

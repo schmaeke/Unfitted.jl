@@ -1350,8 +1350,8 @@ end
 # switched off as well, or `nothing` when the classifier reports none. A cell is deactivated when *either* source asks
 # for it: the user explicitly excluded it via `active=`, or it lies entirely outside Ω; a `nothing` user mask is treated
 # as "all active". Cells classified as `:full` or `:cut` stay active: `:cut` cells will get their quadrature replaced by
-# the NNMF moment-fit rule at region-build time (see `intersections.jl`), while `:fictitious` cells are dropped from the
-# dof layout — at every α, unless `keep_fictitious` asks for the classic α-FCM fill instead.
+# the compressed cut rule (`moment_fit_rule`) at region-build time (see `intersections.jl`), while `:fictitious` cells
+# are dropped from the dof layout — at every α, unless `keep_fictitious` asks for the classic α-FCM fill instead.
 #
 # Only cells the level's own mask already keeps active are classified: a cell the user already deactivated stays
 # deactivated whatever the classifier would say about it, so skipping it is bit-identical to classifying it, and the
