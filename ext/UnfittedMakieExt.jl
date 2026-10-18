@@ -5,30 +5,35 @@ Package extension that plots Unfitted's discretisations with [Makie](https://doc
 any of its backends, CairoMakie, GLMakie or WGLMakie — next to `Unfitted` installs the recipes below; without it the
 entry points, which `src/stubs.jl` declares and documents, raise a `MethodError` whose hint says to load a backend.
 
-The extension samples nothing itself. `src/postprocessing.jl` samples the meshes of the levels and the quadrature-point
-cloud into consumer-neutral records — `Unfitted.SampleGrid`, whose contract heads that file — and this extension draws
-them. Everything Makie-specific is decided here and nowhere else:
+The extension samples nothing itself. `src/postprocessing.jl` samples a solution, the meshes of the levels and the
+quadrature-point cloud into consumer-neutral records — `Unfitted.SampleGrid`, whose contract heads that file — and this
+extension draws them. Everything Makie-specific is decided here and nowhere else:
 
-  - the primitives: a 2D level mesh as a `GeometryBasics.Mesh` of quads, a 1D level mesh and the cell edges as line
-    segments, the quadrature cloud as a scatter;
+  - the primitives: a 2D field or level mesh as a `GeometryBasics.Mesh` of quads, a 1D field graph, a 1D level mesh and
+    the cell edges as line segments, the quadrature cloud as a scatter;
   - the colour of a cell: its record value repeated over the cell's own corners, which no other cell shares, so that
     the colour is flat and exact rather than interpolated across a neighbour;
   - the stacking of the levels, and the axis each plot asks for.
 
 Provided pieces:
 
+  - `Unfitted.fieldplot(solution, model; …)`, `Unfitted.fieldplot(model; …)` and `Unfitted.fieldplot!(…)` — the recipe
+    `FieldPlot`;
   - `Unfitted.levelplot(model; …)` and `Unfitted.levelplot!(…)` — the recipe `LevelPlot`;
   - `Unfitted.quadratureplot(model; …)` and `Unfitted.quadratureplot!(…)` — the recipe `QuadraturePlot`.
 
-Both recipes take the model as their one argument and need no solution: they draw the discretisation.
+`fieldplot` draws a solution, or without one the model's integration regions; the other two take the model as their
+one argument and need no solution: they draw the discretisation.
 """
 module UnfittedMakieExt
 
 using Unfitted
-using Unfitted: Model, ErrorEstimate, SampleGrid, _sample_levels, _sample_quadrature, _cell_count
-import Unfitted: levelplot, levelplot!, quadratureplot, quadratureplot!
+using Unfitted: Model, Solution, ErrorEstimate, SampleGrid, _sample_fields, _sample_levels, _sample_quadrature,
+                _sampled_fields, _default_point_data, _cell_count
+import Unfitted: fieldplot, fieldplot!, levelplot, levelplot!, quadratureplot, quadratureplot!
 import Makie
 using Makie: GeometryBasics, Point2, Point3
+using StaticArrays: SVector
 
 # ── Recipes ───────────────────────────────────────────────────────────────────
 #
@@ -84,6 +89,47 @@ Makie.@recipe QuadraturePlot (discretisation::Model,) begin
     Makie.mixin_generic_plot_attributes()...
 end
 
+"""
+The Makie recipe behind Unfitted's [`fieldplot`](@ref), whose documentation precedes this one: what follows is Makie's
+reference of the plot's attributes.
+"""
+Makie.@recipe FieldPlot (solution::Union{Nothing,Solution}, discretisation::Model) begin
+    """
+    What is plotted: a built-in array — `:uh`, `:level_set`, `:region_id`, `:cover_count` — or a sampling callback
+    `(u, context, x, xi) -> value`; `automatic` plots `:uh` with a solution and `:cover_count` without.
+    """
+    by = Makie.automatic
+    "For a vector value, `nothing` for its magnitude or the index of the component to plot; for a scalar, `nothing`."
+    component = nothing
+    "In 2D, whether to lift the surface to the plotted value, in an `Axis3`. Settled when the plot is created."
+    warp = false
+    "The field to plot, a `Field` or its name; `nothing` for every field, each on its own subdomain."
+    field = nothing
+    "The sample cells per region: `automatic` — `:degree` flat in 2D, 8 warped, 32 in 1D — or any sampler value."
+    subdivisions = Makie.automatic
+    "The extra bisections of the sample cells that ∂Ω passes through: `:none` or an integer in `0:8`."
+    cut_depth = 3
+    "In 1D, the colour of the graph."
+    color = @inherit linecolor
+    "In 1D, the width of the graph in pixels."
+    linewidth = @inherit linewidth
+    "In 2D, the colour of the region edges."
+    strokecolor = :black
+    "In 2D, the width in pixels of the region edges; `0` draws none."
+    strokewidth = 0
+    """
+    Whether the colours are categories, one colour and one colour-bar block per value: `true`, `false`, or `automatic`
+    for `:cover_count` alone. Settled when the plot is created.
+    """
+    categorical = Makie.automatic
+    Makie.mixin_colormap_attributes()...
+    Makie.mixin_generic_plot_attributes()...
+end
+
+# The form without a solution, which draws the discretisation's regions: the recipe's first argument is then `nothing`,
+# so both forms are one plot type, and an `Observable` of either argument updates it.
+Makie.convert_arguments(::Type{<:FieldPlot}, model::Model) = (nothing, model)
+
 # Each recipe derives its primitives from its inputs in one computation, so a change of the model or of an attribute —
 # a new model in an `Observable`, another `by` — recomputes them together, and draws them as children that read the
 # colour mapping from the recipe's own attributes, the colour map through `_effective_colormap`. The dimension check
@@ -111,6 +157,32 @@ function _draw_cells!(p::LevelPlot, ::Val{1}, colormap)
                                colormap)
 end
 
+function Makie.plot!(p::FieldPlot{<:Tuple{<:Union{Nothing,Solution},<:Model{D}}}) where {D}
+    _check_dimension(Val(D), :fieldplot, :write_vtk)
+    inputs = [:solution, :discretisation, :by, :component, :warp, :field, :subdivisions, :cut_depth]
+    outputs = [:sample_geometry, :sample_color, :sample_edges]
+    map!(p.attributes, inputs, outputs) do solution, model, by, component, warp, field, subdivisions, cut_depth
+        grids, values = _sampled_values(solution, model, by, component, field, subdivisions, cut_depth, warp)
+        return _field_primitives(Val(D), grids, values, warp)
+    end
+    _draw_field!(p, Val(D))
+    return p
+end
+
+# The children of a field plot: in 2D the coloured surface, first, and the region edges; in 1D the graph, in one colour.
+function _draw_field!(p::FieldPlot, ::Val{2})
+    colormap = _colormap_node!(p, :sample_colormap, _resolved_by(p.by[], p.solution[]))
+    # A warped surface is lit, so that its shape reads apart from its colour; a flat one is not, so that its colours are
+    # the colour map's own.
+    Makie.mesh!(p, Makie.shared_attributes(p, Makie.Mesh), p.sample_geometry; color=p.sample_color, colormap,
+                shading=p.warp[])
+    return Makie.linesegments!(p, Makie.shared_attributes(p, Makie.LineSegments), p.sample_edges; color=p.strokecolor,
+                               linewidth=p.strokewidth)
+end
+function _draw_field!(p::FieldPlot, ::Val{1})
+    Makie.linesegments!(p, Makie.shared_attributes(p, Makie.LineSegments), p.sample_geometry)
+end
+
 function Makie.plot!(p::QuadraturePlot{<:Tuple{<:Model{D}}}) where {D}
     _check_dimension(Val(D), :quadratureplot, :write_quadrature_vtm)
     map!(p.attributes, [:discretisation, :by], [:point_positions, :point_color]) do model, by
@@ -129,8 +201,9 @@ end
 # The choice is settled once, from `categorical` and `by` as the plot is created: Makie colours a categorical and a
 # continuous map through different computations, and neither a drawn plot nor a `Colorbar` reading it can switch from
 # one to the other. A later `by` or `colormap` is drawn within the choice made; a later `categorical` changes nothing.
-function _colormap_node!(p, name::Symbol)
-    _is_categorical(p.categorical[], p.by[]) || return p.colormap
+# `by` is the quantity the plot shows, which a recipe whose `by` defaults to `automatic` resolves first.
+function _colormap_node!(p, name::Symbol, by=p.by[])
+    _is_categorical(p.categorical[], by) || return p.colormap
     map!(map -> map isa Makie.Categorical ? map : Makie.Categorical(map), p.attributes, :colormap, name)
     return getproperty(p, name)
 end
@@ -182,9 +255,50 @@ function _drawn_level_ids(model::Model, field, levels)
     return sort!(ids)
 end
 
+# A field plot draws in a 2D axis, except a 2D one warped into the third dimension: that goes into an `Axis3`, which
+# gives the height an axis and ticks of its own, where an `LScene` would show the surface without any. Both argument
+# forms are a model's, so the axis follows the model's dimension and the plot's `warp`, which is why `warp` is settled
+# when the plot is created.
+Makie.preferred_axis_type(p::FieldPlot, model::Model) = _field_axis_type(p, model)
+Makie.preferred_axis_type(p::FieldPlot, ::Union{Nothing,Solution}, model::Model) = _field_axis_type(p, model)
+_field_axis_type(p::FieldPlot, ::Model{2}) = p.warp[] ? Makie.Axis3 : Makie.Axis
+_field_axis_type(::FieldPlot, ::Model) = Makie.Axis
+
+# The axis a field plot asks for: a flat 2D domain to scale; a warped one with the domain to scale in the horizontal
+# and the plotted value on the vertical axis; and in 1D the plotted value against `x`.
+function Makie.preferred_axis_attributes(axis::Type{<:Union{Makie.Axis,Makie.Axis3}}, p::FieldPlot, model::Model)
+    return _field_axis_attributes(axis, p, nothing, model)
+end
+function Makie.preferred_axis_attributes(axis::Type{<:Union{Makie.Axis,Makie.Axis3}}, p::FieldPlot,
+                                         solution::Union{Nothing,Solution}, model::Model)
+    return _field_axis_attributes(axis, p, solution, model)
+end
+_field_axis_attributes(::Type{Makie.Axis}, p, solution, ::Model{2}) = (; aspect=Makie.DataAspect())
+_field_axis_attributes(::Type{Makie.Axis}, p, solution, ::Model{1}) = (; xlabel="x", ylabel=_field_label(p, solution))
+function _field_axis_attributes(::Type{Makie.Axis3}, p, solution, model::Model{2})
+    return (; aspect=_warped_aspect(model, p.field[]), zlabel=_field_label(p, solution))
+end
+_field_axis_attributes(axis, p, solution, model) = NamedTuple()
+
+# The name of the quantity a field plot shows, for its axis: the array `by` names, `value` for a callback, and the
+# component picked, if one is.
+function _field_label(p::FieldPlot, solution)
+    by, component = _resolved_by(p.by[], solution), p.component[]
+    name = by isa Symbol ? String(by) : "value"
+    return component isa Integer ? "$name[$component]" : name
+end
+
+# The aspect of a warped plot's `Axis3`: the drawn fields' domains to scale in `x` and `y`, the height two thirds of
+# their larger extent, as `Axis3`'s own default has it for a square.
+function _warped_aspect(model::Model, field)
+    domains = [fld.space.domain for fld in _sampled_fields(model, field)]
+    widths = maximum(d -> d.upper, domains) - minimum(d -> d.lower, domains)
+    return (widths[1] / maximum(widths), widths[2] / maximum(widths), 2 / 3)
+end
+
 # A `Colorbar` reads the colour mapping off the child that carries the colours, which each recipe draws first; the
-# edges of a level plot are drawn in one solid colour and have none.
-Makie.extract_colormap(p::Union{LevelPlot,QuadraturePlot}) = Makie.extract_colormap(first(p.plots))
+# edges of a level or a field plot are drawn in one solid colour and have none.
+Makie.extract_colormap(p::Union{LevelPlot,QuadraturePlot,FieldPlot}) = Makie.extract_colormap(first(p.plots))
 
 # ── Level meshes ──────────────────────────────────────────────────────────────
 
@@ -359,6 +473,169 @@ end
 
 # The half height of a 1D level plot's cell-end ticks, in levels: well inside the unit spacing of the rows.
 const _TICK = 0.2
+
+# ── Fields ────────────────────────────────────────────────────────────────────
+
+# The quantity a field plot shows: `by` as given, or for `automatic` the solution's value with a solution and the number
+# of levels covering each region without one.
+_resolved_by(by, solution) = by === Makie.automatic ? (solution === nothing ? :cover_count : :uh) : by
+
+# The sample grids a field plot draws, one per sampled field, and the plotted value at every point of each. `by` is
+# handed to the sampler as the record's one `point_data` entry, or as none for a built-in array, so the sampler checks,
+# evaluates and refuses it as it does `write_vtk`'s entries; the value is read back off the record and reduced to one
+# number per point. `subdivisions = automatic` resolves by what the plot draws (`_automatic_subdivisions`).
+function _sampled_values(solution, model::Model{D}, by, component, field, subdivisions, cut_depth, warp) where {D}
+    request = _field_request(_resolved_by(by, solution), solution)
+    _check_one_field_per_space(model, field)
+    subdivisions = subdivisions === Makie.automatic ? _automatic_subdivisions(Val(D), warp) : subdivisions
+    grids = [record.data
+             for record in _sample_fields(solution, model; field, subdivisions, cut_depth, request.point_data)]
+    return grids, [_plotted_values(grid, request, component) for grid in grids]
+end
+
+# The sample cells per region a field plot takes by default, sized by what each drawing shows.
+#
+#   * A flat 2D plot shows the value as colour alone, and `:degree` — the sampler's own default, `p` sub-cells per axis
+#     for a degree-`p` region — resolves it as ParaView's view of the same records does.
+#   * A warped 2D plot shows the value as height, lit, and two things `:degree` leaves visible there: facets, and the
+#     cracks where regions sampled on different lattices meet, each side of their shared edge linear between its own
+#     points. The crack's width falls as the square of the sample cell's size — measured on a bump of height 1.7 under
+#     an order-3 overlay over an order-2 base: 0.024 at `:degree`, 0.0068 at 4 sub-cells per region, 0.0017 at 8,
+#     0.00042 at 16 — and 8 is where neither shows in a render any more.
+#   * A 1D graph drawn over `p` straight segments shows the corners of a degree-`p` polynomial at any `p ≥ 2`; 32 draw
+#     an order-8 cell as a smooth curve, and a 1D record of that many points per region costs next to nothing.
+_automatic_subdivisions(::Val{2}, warp::Bool) = warp ? 8 : :degree
+_automatic_subdivisions(::Val{1}, warp::Bool) = 32
+
+# What the sampler is asked for to show `by`, as `(; name, location, point_data)`: the record array that holds it,
+# whether a point or a cell array, and the `point_data` entries that produce it. The built-in arrays are the sampler's
+# own — `level_set` with a `PhysicalDomain`, `region_id` and `cover_count` always — and need no entry; `:uh` is the
+# sampler's default entry, which reads a solution; a callback is the record's one entry, named `by`.
+function _field_request(by::Symbol, solution)
+    if by === :uh
+        message = "by = :uh plots the solution, and this plot has none: pass it as `fieldplot(solution, model)`, " *
+                  "or plot the regions by :cover_count or :region_id"
+        solution === nothing && throw(ArgumentError(message))
+        return (; name="uh", location=:point, point_data=_default_point_data(solution))
+    end
+    by === :level_set && return (; name="level_set", location=:point, point_data=NamedTuple())
+    if by in (:region_id, :cover_count)
+        return (; name=String(by), location=:cell, point_data=NamedTuple())
+    end
+    throw(ArgumentError("by = :$by names no array a field plot shows; pass :uh, :level_set, :region_id, " *
+                        ":cover_count, or a callback (u, context, x, xi) -> value"))
+end
+_field_request(by::Function, _) = (; name="by", location=:point, point_data=(by=by,))
+function _field_request(by, _)
+    throw(ArgumentError("by must name an array, as a Symbol, or be a callback (u, context, x, xi) -> value; got " *
+                        repr(by)))
+end
+
+# A field plot draws one field per space: two fields on one space cover the same cells, and drawn together one would
+# hide the other. Fields on different subdomains, those of a coupled model, are drawn side by side.
+function _check_one_field_per_space(model::Model, field)
+    fields = _sampled_fields(model, field)
+    for i in eachindex(fields), j in 1:(i-1)
+        fields[i].space === fields[j].space &&
+            throw(ArgumentError("fieldplot draws one field per space, and $(fields[j].name) and $(fields[i].name) " *
+                                "share one: pick one with `field`"))
+    end
+    return nothing
+end
+
+# The plotted value at every point of a sample grid: the requested array reduced to one number per value
+# (`_plotted_value`), a cell array's value repeated over the cell's own corners, so that the cell is coloured flat. The
+# one array a request can find missing is `level_set`, which the sampler attaches only for a `PhysicalDomain`.
+function _plotted_values(grid::SampleGrid{D,T,K}, request, component) where {D,T,K}
+    arrays = request.location === :point ? grid.point_data : grid.cell_data
+    i = findfirst(entry -> first(entry) == request.name, arrays)
+    i === nothing && throw(ArgumentError("by = :level_set plots the level set φ, and this model's space carries no " *
+                                         "PhysicalDomain"))
+    values = Float64[_plotted_value(v, component) for v in last(arrays[i])]
+    return request.location === :point ? values : repeat(values; inner=1 << K)
+end
+
+# One sampled value as the number plotted: a real number as it is; a vector's magnitude, or its component `component`,
+# which must be one of its components. A scalar has no component to pick.
+_plotted_value(v::Real, ::Nothing) = Float64(v)
+_plotted_value(v::SVector, ::Nothing) = Float64(sqrt(sum(abs2, v)))
+function _plotted_value(v::SVector{N}, component::Integer) where {N}
+    1 <= component <= N || throw(ArgumentError("component = $component picks no component of a $N-component value"))
+    return Float64(v[component])
+end
+function _plotted_value(::Real, component)
+    throw(ArgumentError("component = $(repr(component)) picks a component of a vector value, and this value is a " *
+                        "scalar: pass component = nothing"))
+end
+function _plotted_value(::SVector, component)
+    throw(ArgumentError("component must be nothing or the index of a component; got $(repr(component))"))
+end
+
+# The height a flat field plot draws its surface at, behind `z = 0` as a level plot's levels are, so that a plot drawn
+# into the same axis afterwards lies in front of it; its region edges lie half a unit in front of the surface.
+const _FLAT = -1.0
+
+# The 2D drawing of a field: one mesh of every sample cell, coloured by the plotted value at each corner, at the height
+# of the value with `warp` and flat at `_FLAT` without. A record's cells own their corners, so a value that jumps
+# between cells, or between regions, is drawn as a jump rather than smeared across it. The region edges are drawn on the
+# flat surface only: a warped surface hides parts of its edges, which CairoMakie, painting the edges after the surface,
+# would draw anyway.
+#
+# Each cell is a quad, which Makie splits into the two triangles (1, 2, 3) and (1, 3, 4) and colours linearly over
+# each, where ParaView interpolates a quad bilinearly: the cell's colour then bends along one diagonal, which a
+# contrasting colour map can show as streaks on cells too coarse for the field. `subdivisions` is what resolves it. A
+# fan of four triangles around a centre sampled exactly was measured as the alternative and rejected: its four
+# gradients meet at the centre, which reads as a star at every cell, under the default colour map as well.
+function _field_primitives(::Val{2}, grids, values, warp::Bool)
+    positions, colors, edges = Point3{Float64}[], Float64[], Point3{Float64}[]
+    faces = GeometryBasics.QuadFace{Int}[]
+    for (grid, v) in zip(grids, values)
+        offset = length(positions)
+        append!(positions, (Point3{Float64}(x[1], x[2], warp ? v[k] : _FLAT) for (k, x) in pairs(grid.points)))
+        for c in 1:_cell_count(grid)
+            push!(faces, GeometryBasics.QuadFace{Int}(offset + 4c - 3, offset + 4c - 2, offset + 4c - 1, offset + 4c))
+        end
+        append!(colors, v)
+        warp || _region_edges!(edges, grid)
+    end
+    return GeometryBasics.Mesh(positions, faces), colors, edges
+end
+
+# The edges of the regions of a sample grid, appended to `edges` as segments half a unit in front of the flat surface:
+# of every sample cell, the edges that lie on the boundary of its region's box. A record lists a region's cells together
+# (its `region_id` array does not decrease), so each region is one run of cells and its box is the hull of their
+# corners; a cell's corner coordinates are those of its lattice box, so an edge on the region's box compares equal to
+# it. Regions tile a field's subdomain without overlapping, so a region edge crosses no cell, which is what lets the
+# edges be drawn after the surface, in CairoMakie's painting order, without covering any of it.
+function _region_edges!(edges, grid::SampleGrid{2})
+    regions, z = last(grid.cell_data[findfirst(entry -> first(entry) == "region_id", grid.cell_data)]), _FLAT + 0.5
+    run = 1
+    while run <= length(regions)
+        cells = run:(something(findnext(!=(regions[run]), regions, run), length(regions)+1)-1)
+        corners = grid.points[(4first(cells)-3):(4last(cells))]
+        lo, hi = reduce((a, b) -> min.(a, b), corners), reduce((a, b) -> max.(a, b), corners)
+        for c in cells
+            ll, lr, ur, ul = grid.points[(4c-3):(4c)]
+            for (a, b, on) in ((ll, lr, ll[2] == lo[2]), (ul, ur, ul[2] == hi[2]), (ll, ul, ll[1] == lo[1]),
+                               (lr, ur, lr[1] == hi[1]))
+                on && push!(edges, Point3{Float64}(a[1], a[2], z), Point3{Float64}(b[1], b[2], z))
+            end
+        end
+        run = last(cells) + 1
+    end
+    return edges
+end
+
+# The 1D drawing of a field: its graph over every sample cell, a segment between the values at the cell's two ends —
+# the cell's own two points, so a value that jumps between cells is drawn as a jump. The graph takes the plot's one
+# `color`; the value it would colour by is the height already.
+function _field_primitives(::Val{1}, grids, values, warp::Bool)
+    segments = Point2{Float64}[]
+    for (grid, v) in zip(grids, values), (k, x) in pairs(grid.points)
+        push!(segments, Point2{Float64}(x[1], v[k]))
+    end
+    return segments, Float64[], Point2{Float64}[]
+end
 
 # ── Quadrature cloud ──────────────────────────────────────────────────────────
 

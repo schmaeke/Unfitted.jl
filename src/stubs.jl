@@ -4,9 +4,9 @@
 # `symmetric_gradient`, `value_vec` and `gradient_tensor`; BasicBSpline.jl the B-spline family's factory `bspline`;
 # MeshIO.jl the mesh level sets `mesh_levelset` and `stl_levelset` (MeshIO loads FileIO and GeometryBasics, the other
 # two triggers of its extension, so `using MeshIO` alone installs them); WriteVTK.jl the VTK writers; and Makie.jl the
-# plots `levelplot` and `quadratureplot`. Every such name is declared and documented here rather than in its extension,
-# so that `?name` answers in a bare `using Unfitted` session (an extension's docstrings land in the extension module's
-# own docs, not this one's) and downstream code can name it unconditionally.
+# plots `fieldplot`, `levelplot` and `quadratureplot`. Every such name is declared and documented here rather than in
+# its extension, so that `?name` answers in a bare `using Unfitted` session (an extension's docstrings land in the
+# extension module's own docs, not this one's) and downstream code can name it unconditionally.
 #
 # An entry point is declared in one of two ways, decided by who owns the method that matches every call:
 #
@@ -465,6 +465,11 @@ its own even when the field names themselves are Unicode (`θ₁`, `θ₂`).
 $(_SAMPLING_KEYWORDS_DOC)
 The writer's own keywords:
 
+  - `point_data` — `NamedTuple` / `Dict` / `Tuple` of `name => callback` pairs, each a sampling callback (see "Sampling
+    callbacks" below) invoked at every vertex sample. Defaults to a single `uh` entry that emits the current solution
+    value. A `level_set` entry replaces the built-in array of that name.
+  - `cell_data` — same shape as `point_data` but evaluated at per-cell sample points (the sub-cell center). Defaults to
+    no user-defined cell data; `region_id` and `cover_count` are always included as built-in cell arrays.
   - `level_meshes` — emit one solid-cell `.vtu` per level when `true` (default), each cell carrying per-cell `active` /
     `covered` / `active_dofs` / `reduced_dofs` data.
   - `ascii` / `append` / `compress` — pass-through to `WriteVTK`'s `vtk_grid` constructor, with its own defaults:
@@ -486,6 +491,7 @@ a callback that throws — leaves nothing on disk.
 Requires `using WriteVTK`, which loads the package extension the VTK writers live in. A call made without it raises an
 error that says so, and writes nothing.
 
+$(_SAMPLING_CALLBACK_DOC)
 $(_IMMERSED_BOUNDARY_DOC)
 To write a *sequence* of these bundles as one animation — a moving overlay, an adaptive ladder, a time-dependent
 solution — open a [`vtk_series`](@ref) and call this function with it in place of a path.
@@ -586,6 +592,87 @@ write_quadrature_vtm(args...; kwargs...) = _extension_missing(write_quadrature_v
 # by any of its backends, CairoMakie, GLMakie or WGLMakie, each of which loads Makie. It draws the consumer-neutral
 # records `src/postprocessing.jl` samples, which the VTK writer serialises, and decides everything Makie-specific
 # there. Its entry points are Makie recipes, so they are declared methodless, as the rule at the top of this file says.
+
+"""
+    fieldplot(solution, model; by=automatic, component=nothing, warp=false, field=nothing,
+              subdivisions=automatic, cut_depth=3, color, linewidth, strokecolor=:black, strokewidth=0,
+              categorical=automatic, colormap, colorrange, …)
+    fieldplot(model; …)
+    fieldplot!([axis,] [solution,] model; …)
+
+Plot a solution on the cells it is sampled on — its value, a built-in array of the sampling, or any quantity a sampling
+callback computes — or, without a solution, the model's integration regions, coloured by the number of levels that
+cover each. `fieldplot` returns what every Makie plotting function returns, the figure, the axis and the plot;
+`fieldplot!` draws into an existing axis and returns the plot.
+
+The model is sampled as [`write_vtk`](@ref) samples it: every integration region of each drawn field, cut into its
+`subdivisions` lattice, with the cells `∂Ω` crosses refined `cut_depth` times. Every sample cell owns its corners, so a
+value that jumps between cells, or between regions, is drawn as a jump rather than smeared across it.
+
+  - **2D.** A mesh of the sample cells, coloured by the plotted value at each corner and, in between, linearly over the
+    two triangles Makie splits each quad into — where ParaView interpolates a quad bilinearly, so a contrasting colour
+    map can show the diagonals of cells too coarse for the field, which a larger `subdivisions` resolves. The axis keeps
+    the data's aspect ratio. With `warp = true` the surface rises to the height of the value, in an `Axis3` with the
+    domain to scale and the value on its vertical axis.
+  - **1D.** The graph of the value against `x`, one segment per sample cell, in one colour, in an axis whose vertical
+    axis names the plotted quantity.
+
+Fields on different subdomains of a coupled model are drawn side by side; fields that share a space would cover the same
+cells, so a model with such fields is drawn one field at a time, picked with `field`.
+
+Keyword arguments, which are the plot's attributes:
+
+  - `by` — what is plotted: `:uh`, the solution's value; `:level_set`, the level set `φ` of a
+    [`PhysicalDomain`](@ref); `:region_id`, the index of each cell's region; `:cover_count`, the number of levels
+    covering each cell's region; or a sampling callback `(u, context, x, xi) -> value`, invoked at every vertex sample
+    (see "Sampling callbacks" below). `automatic` (default) plots `:uh` with a solution and `:cover_count` without. A
+    quantity sampled at the vertices varies across a cell; a cell's region and its cover are one value per cell, and
+    colour the cell flat.
+  - `component` — for a vector value, `nothing` (default) plots its magnitude `‖v‖₂` and an integer `i` its component
+    `vᵢ`; for a scalar value, only `nothing`.
+  - `warp` — in 2D, whether to lift the surface to the plotted value; `false` by default, and chosen, with the axis,
+    when the plot is created. A warped surface is drawn without region edges: it hides parts of them, which a backend
+    that paints the edges after the surface would draw anyway. Where two regions sampled on different lattices meet,
+    each side of their shared edge is linear between its own points, so a warped surface opens a crack there, as
+    ParaView's warp of the same data does, whose width falls as the square of the sample cell's size: on a bump of
+    height 1.7 under an order-3 overlay over an order-2 base, 0.024 at `:degree`, 0.0017 at 8 sub-cells per region,
+    0.00042 at 16.
+  - `subdivisions` — `automatic` (default) is `:degree` on a flat 2D plot, where colour is all a cell shows; 8 sub-cells
+    per region on a warped one, which closes the cracks to below what a render shows and draws a lit surface without
+    facets; and 32 in 1D, where a polynomial of degree `p` drawn over `p` straight segments would show its corners. Any
+    value of the sampling keyword below can be passed instead.
+  - `color`, `linewidth` — in 1D, the colour and the width in pixels of the graph.
+  - `strokecolor`, `strokewidth` — in 2D, the colour and the width in pixels of the region edges; `strokewidth = 0`
+    (default) draws none. The edges run along the regions' boundaries, so no edge crosses a cell.
+  - `categorical` — whether the colours are categories, one colour and one colour-bar block per value: `true`, `false`,
+    or `automatic` (default) for `:cover_count` alone. Settled when the plot is created.
+  - `colormap`, `colorrange`, `colorscale`, `lowclip`, `highclip`, `nan_color`, `alpha` — the colour mapping of a 2D
+    plot, as for every Makie plot; a `Colorbar` reads it off the plot.
+
+$(_SAMPLING_KEYWORDS_DOC)
+To follow a run, pass the solution, or the model, as an `Observable`. When both change, replace them at once with
+`Makie.update!(plot, solution, model)`: a solution belongs to one model, and a plot may redraw between two separate
+updates. Makie fixes a plot's argument types when it creates the plot, so a new model must be of the plot's model's type
+— the same problem on moved or re-masked levels, say; a model with other levels needs a new plot.
+
+A `by`, `component` or callback the plot cannot use is refused with an error that names the problem, as are `by = :uh`
+without a solution and `by = :level_set` on a model without a `PhysicalDomain`; Makie raises the error wrapped in its
+own exception, since it arises while the plot computes what to draw. A model of three or more dimensions is refused with
+an `ArgumentError`: write it with [`write_vtk`](@ref) and look at it in ParaView.
+
+Requires Makie, which each of its backends loads, as for [`levelplot`](@ref). Level-set clipping of an immersed model
+is not drawn: the sample cells outside `Ω` are drawn with the polynomial extension the solution has there.
+
+$(_SAMPLING_CALLBACK_DOC)
+$(_IMMERSED_BOUNDARY_DOC)"""
+function fieldplot end
+
+"""
+    fieldplot!([axis,] [solution,] model; …)
+
+Draw [`fieldplot`](@ref) into `axis`, or into the current axis, and return the plot. The attributes are `fieldplot`'s.
+"""
+function fieldplot! end
 
 """
     levelplot(model; by=:order_max, levels=nothing, inactive=false, field=nothing,
@@ -724,8 +811,8 @@ end
 
 # The methodless entry points, each with the package whose extension implements it (see the top of this file). A
 # recipe added to an extension is declared above and added here.
-const _METHODLESS_ENTRY_POINTS = (levelplot => "Makie", levelplot! => "Makie", quadratureplot => "Makie",
-                                  quadratureplot! => "Makie")
+const _METHODLESS_ENTRY_POINTS = (fieldplot => "Makie", fieldplot! => "Makie", levelplot => "Makie",
+                                  levelplot! => "Makie", quadratureplot => "Makie", quadratureplot! => "Makie")
 
 # The error hint `__init__` (in `Unfitted.jl`) registers for `MethodError`: for a call to a methodless entry point made
 # while its extension is not loaded, the line that names the package to load, as `_extension_missing` names it for a

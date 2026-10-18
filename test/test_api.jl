@@ -246,12 +246,15 @@ end
     # docstrings sit on abstract signatures that no method of the core implements, so pin that they reached the docs.
     @test haskey(meta[Base.Docs.Binding(Unfitted, :write_vtk)].docs, Tuple{VTKSeries,Any,Any,Any})
     @test haskey(meta[Base.Docs.Binding(Base, :close)].docs, Tuple{VTKSeries})
-    # `write_vtk` documents its sampling keywords, and the immersed-boundary section their `cut_depth` refers to, with
-    # the texts every entry point that samples a solution splices into its docstring whole, the keywords first.
-    keywords, boundary = Unfitted._SAMPLING_KEYWORDS_DOC, Unfitted._IMMERSED_BOUNDARY_DOC
-    text = only(filter(t -> occursin(keywords, t),
-                       [join(doc.text) for doc in values(meta[Base.Docs.Binding(Unfitted, :write_vtk)].docs)]))
-    @test occursin(boundary, text) && first(findfirst(keywords, text)) < first(findfirst(boundary, text))
+    # `write_vtk` and `fieldplot` document the sampling keywords, the contract of a sampling callback and the
+    # immersed-boundary section the keywords' `cut_depth` refers to with the texts every entry point that samples a
+    # model splices into its docstring whole, in that order.
+    shared = (Unfitted._SAMPLING_KEYWORDS_DOC, Unfitted._SAMPLING_CALLBACK_DOC, Unfitted._IMMERSED_BOUNDARY_DOC)
+    for name in (:write_vtk, :fieldplot)
+        text = only(filter(t -> occursin(first(shared), t),
+                           [join(doc.text) for doc in values(meta[Base.Docs.Binding(Unfitted, name)].docs)]))
+        @test all(s -> occursin(s, text), shared) && issorted([first(findfirst(s, text)) for s in shared])
+    end
     # So are the tensor readers' `Val` and `Field` forms: one docstring per signature the Tensors extension implements.
     ndocs(name) = length(meta[Base.Docs.Binding(Unfitted, name)].docs)
     @test (ndocs(:symmetric_gradient), ndocs(:value_vec), ndocs(:gradient_tensor)) == (3, 2, 2)
@@ -277,8 +280,8 @@ end
                  symmetric_gradient => (nothing,), value_vec => (nothing, :u, Val(2)),
                  gradient_tensor => (nothing, :u, Val(2)), bspline => (),
                  mesh_levelset => (nothing,), stl_levelset => (joinpath(dir, "m", "part.stl"),),
-                 levelplot => (nothing,), levelplot! => (nothing, nothing), quadratureplot => (nothing,),
-                 quadratureplot! => (nothing,))
+                 fieldplot => (nothing, nothing), fieldplot! => (nothing,), levelplot => (nothing,),
+                 levelplot! => (nothing, nothing), quadratureplot => (nothing,), quadratureplot! => (nothing,))
         for (f, args) in calls
             message = try
                 f(args...)
@@ -308,8 +311,9 @@ end
     entry_points = ("write_vtk" => "WriteVTK", "vtk_series" => "WriteVTK", "write_quadrature_vtm" => "WriteVTK",
                     "symmetric_gradient" => "Tensors", "value_vec" => "Tensors", "gradient_tensor" => "Tensors",
                     "bspline" => "BasicBSpline", "mesh_levelset" => "MeshIO", "stl_levelset" => "MeshIO",
-                    "levelplot" => "CairoMakie", "levelplot!" => "CairoMakie", "quadratureplot" => "CairoMakie",
-                    "quadratureplot!" => "CairoMakie", "levelplot with keywords" => "CairoMakie")
+                    "fieldplot" => "CairoMakie", "fieldplot!" => "CairoMakie", "levelplot" => "CairoMakie",
+                    "levelplot!" => "CairoMakie", "quadratureplot" => "CairoMakie", "quadratureplot!" => "CairoMakie",
+                    "levelplot with keywords" => "CairoMakie")
     for (name, package) in entry_points
         @test occursin("using $package", get(reported, name, ""))
     end

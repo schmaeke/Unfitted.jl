@@ -140,9 +140,12 @@ The method is described in
   `vtk_series` collects such bundles into a time series, and
   `write_quadrature_vtm` writes the quadrature-point cloud. Plots of 1D
   and 2D models are a Makie extension (load any Makie backend, e.g.
-  `using CairoMakie`): `levelplot` draws the meshes of the levels coloured
-  by order, activity, coverage or an error estimate, and `quadratureplot`
-  the quadrature points — neither needs a solution.
+  `using CairoMakie`): `fieldplot` draws a solution — its value, any
+  quantity a callback computes from it, or without one the integration
+  regions — as a coloured or warped surface in 2D and a graph in 1D;
+  `levelplot` draws the meshes of the levels coloured by order, activity,
+  coverage or an error estimate, and `quadratureplot` the quadrature
+  points, neither of which needs a solution.
 - **D-generic core**: 1D, 2D, 3D, and 4D smoke-tested.
 
 ## Installation

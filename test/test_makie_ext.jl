@@ -57,12 +57,21 @@ _makie_2d = prepare(poisson(overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=2, 
 # 1D: four order-1 cells under a two-cell order-2 overlay of the left half.
 _makie_1d = prepare(mass(overlay(space(box((0.0,), (1.0,)); cells=4, order=1), box((0.0,), (0.5,)); cells=2, order=2)))
 
+# A record array's values, by name, point or cell.
+_sampled(grid, name) = last(only(filter(entry -> first(entry) == name, [grid.point_data; grid.cell_data])))
+
+# The solution of `_makie_2d`, and a two-component field on a square of order-2 cells with its solution.
+_makie_2d_solution = solve!(_makie_2d)
+_makie_vector = prepare(poisson(field(:u, space(box((0.0, 0.0), (1.0, 1.0)); cells=2, order=2); components=2);
+                                source=SVector(1.0, -2.0), dirichlet=[dirichlet(SVector(0.0, 0.0); on=boundary(:all))]))
+_makie_vector_solution = solve!(_makie_vector)
+
 @testset "the Makie extension provides the plot entry points" begin
     # The entry points are methodless in the core and recipes of the extension. Once the extension is loaded, an
     # argument that is not a model is refused by Makie's own conversion, and the hint that asks for a backend stays
     # silent; the behaviour without the extension is pinned in a fresh process by test_api.jl.
     @test _MakieExt !== nothing
-    for f in (levelplot, quadratureplot)
+    for f in (fieldplot, levelplot, quadratureplot)
         err = try
             f(1)
             nothing
@@ -307,11 +316,14 @@ end
 @testset "a Colorbar reads its colour mapping off either plot" begin
     # Categorical (the default `by` of a level plot, and `:cover_count`) and continuous (the weights) alike.
     cases = ((levelplot, _makie_2d, :order_max), (levelplot, _makie_1d, :order_max),
-             (quadratureplot, _makie_2d, :weight), (quadratureplot, _makie_2d, :cover_count))
+             (quadratureplot, _makie_2d, :weight), (quadratureplot, _makie_2d, :cover_count),
+             (fieldplot, _makie_2d, :cover_count), (fieldplot, _makie_2d, :region_id))
     for (f, model, by) in cases
         fig, ax, plt = f(model; by)
         @test Makie.Colorbar(fig[1, 2], plt) isa Makie.Colorbar
     end
+    fig, ax, plt = fieldplot(_makie_2d_solution, _makie_2d)
+    @test Makie.Colorbar(fig[1, 2], plt) isa Makie.Colorbar
 end
 
 @testset "the quantities with a few discrete values are coloured as categories" begin
@@ -328,6 +340,9 @@ end
     @test mapping(levelplot(_makie_1d).plot) == Makie.categorical
     @test mapping(quadratureplot(_makie_2d; by=:cover_count).plot) == Makie.categorical
     @test mapping(quadratureplot(_makie_2d).plot) == Makie.continuous
+    @test mapping(fieldplot(_makie_2d).plot) == Makie.categorical                  # `automatic` is :cover_count
+    @test mapping(fieldplot(_makie_2d; by=:region_id).plot) == Makie.continuous
+    @test mapping(fieldplot(_makie_2d_solution, _makie_2d).plot) == Makie.continuous   # `automatic` is :uh
     @test mapping(levelplot(_makie_2d; categorical=false).plot) == Makie.continuous
     @test mapping(levelplot(_makie_2d; by=:cell_id, categorical=true).plot) == Makie.categorical
     @test first(levelplot(_makie_2d; colormap=:inferno).plot.plots).colormap[] == Makie.Categorical(:inferno)
@@ -354,7 +369,7 @@ end
 
 @testset "the plots refuse a model of three dimensions, naming the VTK writer" begin
     m3 = prepare(mass(space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=1, order=1)))
-    for (f, writer) in ((levelplot, "write_vtk"), (quadratureplot, "write_quadrature_vtm"))
+    for (f, writer) in ((fieldplot, "write_vtk"), (levelplot, "write_vtk"), (quadratureplot, "write_quadrature_vtm"))
         err = try
             f(m3)
             nothing
@@ -364,6 +379,186 @@ end
         @test err isa ArgumentError
         @test occursin("3-dimensional", sprint(showerror, err)) && occursin("`$writer`", sprint(showerror, err))
     end
+end
+
+# ── fieldplot ─────────────────────────────────────────────────────────────────
+
+@testset "fieldplot draws a 2D solution on its sample cells" begin
+    # Every sample cell of every region, at `:degree`, its corners the record's own at z = −1, coloured by the
+    # solution's value at each corner; the region edges are computed whether or not they are drawn.
+    grid = only(Unfitted._sample_fields(_makie_2d_solution, _makie_2d)).data
+    fig, ax, plt = fieldplot(_makie_2d_solution, _makie_2d)
+    @test ax isa Makie.Axis && ax.aspect[] isa Makie.DataAspect
+    surface, edges = plt.plots
+    @test surface isa Makie.Mesh && edges isa Makie.LineSegments
+    n = Unfitted._cell_count(grid)
+    @test _GB.coordinates(plt.sample_geometry[]) == [Makie.Point3{Float64}(x..., -1) for x in grid.points]
+    @test _GB.faces(plt.sample_geometry[]) == [_GB.QuadFace{Int}(4c - 3, 4c - 2, 4c - 1, 4c) for c in 1:n]
+    @test plt.sample_color[] == _sampled(grid, "uh")
+    @test surface.color[] == Float32.(plt.sample_color[])
+    @test edges.linewidth[] == 0                                   # none drawn by default
+    @test fieldplot(_makie_2d_solution, _makie_2d; strokewidth=2).plot.plots[2].linewidth[] == 2
+end
+
+@testset "fieldplot draws each region's edges, which cross no cell" begin
+    # Against the integration plan's own region boxes, of a model whose regions are sampled at different counts and
+    # whose cut cells are refined: every edge lies on a side of a region's box, half a unit in front of the surface, and
+    # inside no region; and the edges cover every side of every region's box.
+    disk = physical_domain(x -> sqrt((x[1] - 0.45)^2 + (x[2] - 0.5)^2) - 0.3; lipschitz=1.0, subcell_length_scale=0.1)
+    model = prepare(mass(overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=3, order=1, physical=disk),
+                                 box((0.2, 0.3), (0.7, 0.8)); cells=2, order=2)))
+    boxes = [Unfitted._region_box(region) for region in Unfitted.integration_plans(model)[1].regions]
+    edges = _segments(fieldplot(model; strokewidth=1).plot.sample_edges[])
+    @test all(s -> s[1][3] == s[2][3] == -0.5, edges)
+    flat(x) = SVector(x[1], x[2])
+    within(t, lo, hi) = lo <= t <= hi
+    on_side(s, b) = any(1:2) do d                                 # the edge runs along axis 3 − d at a side of `b`
+        a, z, o = flat(s[1]), flat(s[2]), 3 - d
+        a[d] == z[d] &&
+            a[d] in (b.lower[d], b.upper[d]) &&
+            within(a[o], b.lower[o], b.upper[o]) &&
+            within(z[o], b.lower[o], b.upper[o])
+    end
+    inside(x, b) = all(d -> b.lower[d] < x[d] < b.upper[d], 1:2)
+    @test all(s -> any(b -> on_side(s, b), boxes), edges)
+    @test !any(s -> any(b -> inside((flat(s[1]) + flat(s[2])) / 2, b), boxes), edges)
+    covered(x) = any(s -> all(d -> min(s[1][d], s[2][d]) <= x[d] <= max(s[1][d], s[2][d]), 1:2), edges)
+    sides(b) = ((b.lower, SVector(b.upper[1], b.lower[2])), (SVector(b.lower[1], b.upper[2]), b.upper),
+                (b.lower, SVector(b.lower[1], b.upper[2])), (SVector(b.upper[1], b.lower[2]), b.upper))
+    @test all(b -> all(((a, z),) -> all(t -> covered(a + (z - a) * t), (0.13, 0.5, 0.87)), sides(b)), boxes)
+end
+
+@testset "fieldplot colours by a built-in array, a callback, a component or a magnitude" begin
+    # Each `by` is the record's one entry or a built-in array, read back point by point; a cell array colours its
+    # cell's four corners alike.
+    grid = only(Unfitted._sample_fields(_makie_2d_solution, _makie_2d; point_data=NamedTuple())).data
+    for name in ("cover_count", "region_id")
+        plt = fieldplot(_makie_2d_solution, _makie_2d; by=Symbol(name)).plot
+        @test plt.sample_color[] == repeat(Float64.(_sampled(grid, name)); inner=4)
+    end
+    tilt = (u, c, x, xi) -> x[1] - 2x[2]
+    @test fieldplot(_makie_2d_solution, _makie_2d; by=tilt).plot.sample_color[] == [x[1] - 2x[2] for x in grid.points]
+
+    # A vector value: its magnitude by default, or one component.
+    values = _sampled(only(Unfitted._sample_fields(_makie_vector_solution, _makie_vector)).data, "uh")
+    @test fieldplot(_makie_vector_solution, _makie_vector).plot.sample_color[] == [sqrt(sum(abs2, v)) for v in values]
+    for c in 1:2
+        @test fieldplot(_makie_vector_solution, _makie_vector; component=c).plot.sample_color[] ==
+              [v[c] for v in values]
+    end
+
+    # The level set of an immersed model, at every point.
+    disk = physical_domain(x -> sqrt((x[1] - 0.5)^2 + (x[2] - 0.5)^2) - 0.3; lipschitz=1.0, alpha=1.0,
+                           subcell_length_scale=0.125, max_depth=2)
+    immersed = prepare(mass(space(box((0.0, 0.0), (1.0, 1.0)); cells=2, order=1, physical=disk)))
+    plt = fieldplot(immersed; by=:level_set).plot
+    level = only(Unfitted._sample_fields(nothing, immersed)).data
+    @test plt.sample_color[] == _sampled(level, "level_set")
+    @test _GB.coordinates(plt.sample_geometry[]) == [Makie.Point3{Float64}(x..., -1) for x in level.points]
+end
+
+@testset "fieldplot refuses what it cannot draw, naming the problem" begin
+    V = space(box((0.0, 0.0), (1.0, 1.0)); cells=1, order=1)
+    a, b = field(:a, V), field(:b, V)
+    shared = prepare(Problem((a, b); blocks=(mass_block(a), mass_block(b))))
+    shared_solution = solution(shared, ones(active_unknowns(shared)))
+    cases = ((() -> fieldplot(_makie_2d; by=:uh), "by = :uh plots the solution"),
+             (() -> fieldplot(_makie_2d_solution, _makie_2d; by=:level_set), "carries no PhysicalDomain"),
+             (() -> fieldplot(_makie_2d_solution, _makie_2d; by=:nope), "names no array a field plot shows"),
+             (() -> fieldplot(_makie_2d_solution, _makie_2d; by=2), "by must name an array"),
+             (() -> fieldplot(_makie_2d_solution, _makie_2d; component=1), "this value is a scalar"),
+             (() -> fieldplot(_makie_vector_solution, _makie_vector; component=3), "no component of a 2-component"),
+             (() -> fieldplot(_makie_2d; by=(u, c, x, xi) -> u(c, xi)), "pass the solution"),
+             (() -> fieldplot(_makie_2d_solution, _makie_2d; by=(u, c, x, xi) -> "text"), "point_data entry \"by\""),
+             (() -> fieldplot(shared_solution, shared), "a and b share one: pick one with `field`"))
+    for (call, says) in cases
+        err = try
+            call()
+            nothing
+        catch e
+            e
+        end
+        @test err !== nothing && occursin(says, sprint(showerror, err))
+    end
+    @test fieldplot(shared_solution, shared; field=:b).plot.sample_color[] == fill(1.0, 4)
+end
+
+@testset "fieldplot without a solution draws the regions by their cover" begin
+    # The discretisation alone: `by = automatic` is `:cover_count`, read off the records sampled without a solution.
+    grid = only(Unfitted._sample_fields(nothing, _makie_2d)).data
+    plt = fieldplot(_makie_2d).plot
+    @test plt.solution[] === nothing
+    @test _GB.coordinates(plt.sample_geometry[]) == [Makie.Point3{Float64}(x..., -1) for x in grid.points]
+    @test plt.sample_color[] == repeat(Float64.(_sampled(grid, "cover_count")); inner=4)
+    @test sort(unique(plt.sample_color[])) == [1.0, 2.0]
+end
+
+@testset "fieldplot warps a 2D surface to its value in an Axis3" begin
+    # Sampled at 8 sub-cells per region by default, where a flat plot samples at `:degree`: a lit surface shows facets
+    # and the cracks between regions sampled on different lattices, which 8 closes. A `subdivisions` given wins.
+    warped(grid) = [Makie.Point3{Float64}(x..., v) for (x, v) in zip(grid.points, _sampled(grid, "uh"))]
+    grid = only(Unfitted._sample_fields(_makie_2d_solution, _makie_2d; subdivisions=8)).data
+    fig, ax, plt = fieldplot(_makie_2d_solution, _makie_2d; warp=true, strokewidth=1)
+    @test ax isa Makie.Axis3
+    @test ax.aspect[] == (1.0, 1.0, 2 / 3) && ax.zlabel[] == "uh"
+    @test _GB.coordinates(plt.sample_geometry[]) == warped(grid)
+    @test isempty(plt.sample_edges[])                                # a warped surface draws no edges
+    coarse = only(Unfitted._sample_fields(_makie_2d_solution, _makie_2d; subdivisions=:degree)).data
+    plt = fieldplot(_makie_2d_solution, _makie_2d; warp=true, subdivisions=:degree).plot
+    @test _GB.coordinates(plt.sample_geometry[]) == warped(coarse)
+    @test length(coarse.points) < length(grid.points)
+    _, ax, _ = fieldplot(_makie_vector_solution, _makie_vector; warp=true, component=2)
+    @test ax.zlabel[] == "uh[2]"
+end
+
+@testset "fieldplot draws a 1D graph, one segment per sample cell" begin
+    # 32 sample cells per region by default, each a segment between its two ends, so a jump between cells stays one.
+    m1 = prepare(poisson(_makie_1d.problem.space; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    s1 = solve!(m1)
+    grid = only(Unfitted._sample_fields(s1, m1; subdivisions=32)).data
+    fig, ax, plt = fieldplot(s1, m1)
+    @test ax isa Makie.Axis && ax.xlabel[] == "x" && ax.ylabel[] == "uh"
+    @test plt.sample_geometry[] == [Makie.Point2{Float64}(x[1], v) for (x, v) in zip(grid.points, _sampled(grid, "uh"))]
+    @test length(plt.sample_geometry[]) == 2 * 32 * length(unique(_sampled(grid, "region_id")))
+    graph = only(plt.plots)
+    @test graph isa Makie.LineSegments && graph[1][] == plt.sample_geometry[]
+    @test fieldplot(s1, m1; color=:red, linewidth=3).plot.plots[1].color[] == Makie.to_color(:red)
+    @test length(fieldplot(s1, m1; subdivisions=:degree).plot.sample_geometry[]) < length(plt.sample_geometry[])
+
+    # A callback that steps between regions draws the step: the two segments that meet at x = ½ end at different
+    # heights.
+    step = (u, c, x, xi) -> c.region.lower[1] >= 0.5 ? 1.0 : 0.0
+    ends = filter(p -> p[1] == 0.5, fieldplot(s1, m1; by=step).plot.sample_geometry[])
+    @test sort([p[2] for p in ends]) == [0.0, 1.0]
+end
+
+@testset "fieldplot follows its solution and model" begin
+    # An `Observable` solution on a fixed model redraws with the new one; `Makie.update!` replaces both at once.
+    observed = Makie.Observable(_makie_2d_solution)
+    plt = fieldplot(observed, _makie_2d).plot
+    doubled = solution(_makie_2d, 2 .* _makie_2d_solution.coefficients)
+    observed[] = doubled
+    @test plt.sample_color[] == _sampled(only(Unfitted._sample_fields(doubled, _makie_2d)).data, "uh")
+    # A model of the plot's own type — the same problem with its overlay moved — and a solution on it, at once.
+    V = moved_space(_makie_2d.problem.space; level=2, to=box((0.5, 0.5), (1.0, 1.0)))
+    moved = prepare(poisson(V; source=1.0, dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    moved_solution = solve!(moved)
+    Makie.update!(plt, moved_solution, moved)
+    @test plt.sample_color[] == _sampled(only(Unfitted._sample_fields(moved_solution, moved)).data, "uh")
+end
+
+@testset "fieldplot draws the fields of a coupled model side by side" begin
+    V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(1, 1), order=1)
+    u1, u2 = field(:u1, V1), field(:u2, V2)
+    coupled = prepare(Problem((u1, u2); blocks=(mass_block(u1), mass_block(u2))))
+    s = solution(coupled, [Float64(i) for i in 1:active_unknowns(coupled)])
+    grids = [r.data for r in Unfitted._sample_fields(s, coupled)]
+    plt = fieldplot(s, coupled).plot
+    @test _GB.coordinates(plt.sample_geometry[]) ==
+          [Makie.Point3{Float64}(x..., -1) for grid in grids for x in grid.points]
+    @test plt.sample_color[] == reduce(vcat, [_sampled(grid, "uh") for grid in grids])
+    @test length(_GB.coordinates(fieldplot(s, coupled; field=:u2).plot.sample_geometry[])) == 4
 end
 
 @testset "the 2D primitives of one quad" begin

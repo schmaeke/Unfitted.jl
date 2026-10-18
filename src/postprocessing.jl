@@ -39,7 +39,8 @@
 # samples one thing, and a consumer combines the ones it shows:
 #
 #   * `_sample_fields(solution, model; field, subdivisions, cut_depth, point_data, cell_data)`, whose keywords mean
-#     what `_SAMPLING_KEYWORDS_DOC` documents — one `(; field, data)` per sampled field, in problem order.
+#     what the texts below document (`_SAMPLING_KEYWORDS_DOC`, and `_SAMPLING_CALLBACK_DOC` for the entries'
+#     callbacks) — one `(; field, data)` per sampled field, in problem order.
 #     `data::SampleGrid{D,T,D}` covers the integration regions of the field's space, each region its `subdivisions`
 #     lattice with the boxes ∂Ω crosses cut-refined; its point arrays are the user's `point_data` entries in their
 #     order, then `level_set` (with a `PhysicalDomain`, unless an entry already has that name); its cell arrays are
@@ -107,43 +108,50 @@ end
 
 # ── The sampling keywords, as a user reads them ───────────────────────────────
 #
-# The keywords of `_sample_fields` are the keywords of every public entry point that samples a solution, and each of
-# those documents them in full. These two texts are that documentation, spliced into each such docstring
-# (`$(_SAMPLING_KEYWORDS_DOC)`), so that the entry points read alike and cannot drift apart: the keywords, and the
-# section on the immersed boundary their `cut_depth` refers to, which therefore comes after them in every docstring.
-# What a consumer adds on top — keywords of its own, what its format can or cannot hold — its docstring states around
-# them. Written for that reader: no consumer is named except as an example, and nothing here is a promise about one.
+# The keywords of `_sample_fields` belong to every public entry point that samples a model, and each of those documents
+# the ones it takes in full. These three texts are that documentation, spliced into each such docstring
+# (`$(_SAMPLING_KEYWORDS_DOC)`), so that the entry points read alike and cannot drift apart: the keywords that decide
+# where the model is sampled, which every such entry point takes; the contract of a sampling callback, which
+# `write_vtk`'s `point_data` and `cell_data` and `fieldplot`'s `by` each refer to; and the section on the immersed
+# boundary the keywords' `cut_depth` refers to. The two sections come after the keywords, in that order, in every
+# docstring. What a consumer adds on top — keywords of its own and their defaults, what its format can or cannot hold —
+# its docstring states around them. Written for that reader: no consumer is named except as an example, and nothing here
+# is a promise about one.
 
 const _SAMPLING_KEYWORDS_DOC = """
-Sampling keywords, shared by every entry point that samples a solution:
+Sampling keywords, shared by every entry point that samples a model:
 
   - `field` — sample a single [`Field`](@ref), or the one its name `Symbol` names; defaults to every field of the model.
-  - `subdivisions` — per-region subdivision count, sized to resolve the *solution*. `:degree` (default) uses each
-    region's parent polynomial order; `:none` keeps one cell per region; a positive integer uses an isotropic count; an
-    `NTuple{D,Int}` uses explicit per-axis counts.
+  - `subdivisions` — per-region subdivision count, sized to resolve the *solution*: `:degree` uses each region's parent
+    polynomial order; `:none` keeps one cell per region; a positive integer uses an isotropic count; an `NTuple{D,Int}`
+    uses explicit per-axis counts.
   - `cut_depth` — extra bisections applied to the sub-cells that `∂Ω` passes through, sized to resolve the *geometry*.
     `3` by default, `:none` to disable, or an integer in `0:8`. Only regions crossed by the boundary are refined, and a
     model without a [`PhysicalDomain`](@ref) is untouched, so the cost is that of the boundary rather than of the
     volume: in 3D the leaf count grows as `8ᵏ` under `subdivisions` but only as `4ᵏ` under `cut_depth`. See "Resolving
     the immersed boundary" below.
-  - `point_data` — `NamedTuple` / `Dict` / `Tuple` of `name => callback` pairs. Each callback is invoked at every vertex
-    sample as `f(u, context, x, xi)` and returns a real number, a tuple of real numbers or an `SVector` of real numbers,
-    of one shape at every sample. A tuple is taken as the `SVector` of its components, and the values of one entry are
-    promoted to a common element type. An entry is refused with an `ArgumentError` naming it, and nothing is output,
-    when a value has none of these shapes (a `Vector`, a matrix, a `String`, a `Complex`) or when its shapes differ
-    between samples. Each callback is called exactly once per sample, but in an unspecified order — across the samples
-    and across the entries — so a callback should compute its value from its arguments and not count or record its
-    calls. `u(context, xi[, field])` evaluates the current solution at the sample, given the `context` and `xi` the
-    callback received: the sampled field by default, or another `field` on the same subdomain, which must be the
-    model's field of that name, with its component count, as for [`value`](@ref); a `Field` with another count raises
-    an `ArgumentError`. A field on another subdomain of a coupled model raises an `ArgumentError` too; evaluate it with
-    [`value`](@ref)`(solution, model, field, x)` instead. `x` is the physical coordinate and `xi.region` the same point
-    in the region's reference frame; `context` carries `location` (`:point`, or `:cell` for a `cell_data` sample),
-    `region_id`, the `region` box, the emitted `cell` box, the covering `parents` — each with the `parent_box` a
-    callback needs to map `x` into a cell's own frame — and the `model_version` the samples were taken from. Defaults
-    to a single `uh` entry that emits the current solution value.
-  - `cell_data` — same shape as `point_data` but evaluated at per-cell sample points (the sub-cell center). Defaults to
-    no user-defined cell data; `region_id` and `cover_count` are always included as built-in cell arrays.
+"""
+
+const _SAMPLING_CALLBACK_DOC = """
+## Sampling callbacks
+
+A sampling callback is invoked at every sample as `f(u, context, x, xi)` and returns a real number, a tuple of real
+numbers or an `SVector` of real numbers, of one shape at every sample. A tuple is taken as the `SVector` of its
+components, and the values of one callback are promoted to a common element type. A callback is refused with an
+`ArgumentError` naming it, and nothing is output, when a value has none of these shapes (a `Vector`, a matrix, a
+`String`, a `Complex`) or when its shapes differ between samples. Each callback is called exactly once per sample, but
+in an unspecified order — across the samples and across the callbacks — so a callback should compute its value from its
+arguments and not count or record its calls.
+
+`u(context, xi[, field])` evaluates the current solution at the sample, given the `context` and `xi` the callback
+received: the sampled field by default, or another `field` on the same subdomain, which must be the model's field of
+that name, with its component count, as for [`value`](@ref); a `Field` with another count raises an `ArgumentError`. A
+field on another subdomain of a coupled model raises an `ArgumentError` too; evaluate it with
+[`value`](@ref)`(solution, model, field, x)` instead. A model sampled without a solution has none to evaluate, and `u`
+raises an `ArgumentError` that says so. `x` is the physical coordinate and `xi.region` the same point in the region's
+reference frame; `context` carries `location` (`:point` at a vertex sample, `:cell` at a cell's center), `region_id`,
+the `region` box, the emitted `cell` box, the covering `parents` — each with the `parent_box` a callback needs to map
+`x` into a cell's own frame — and the `model_version` the samples were taken from.
 """
 
 const _IMMERSED_BOUNDARY_DOC = """
@@ -151,7 +159,7 @@ const _IMMERSED_BOUNDARY_DOC = """
 
 For models whose [`Space`](@ref) carries a [`PhysicalDomain`](@ref), the level-set values `φ(x)` are attached at every
 vertex as a built-in `level_set` point array — to draw `∂Ω` as the zero-level contour, or to tell cut, full and
-fictitious regions apart. Pass a `level_set` entry in `point_data` to override it.
+fictitious regions apart.
 
 A contour or a clip reconstructs `∂Ω` from that array by interpolating it linearly along each cell's edges — ParaView's
 Clip does — so the surface it draws is a facetisation at the size of the sampled cell: neither `φ`'s own accuracy nor
@@ -189,10 +197,11 @@ smooth face; an `∩`-corner stays comparatively more faceted at any given depth
 # levels are records of their own (`_sample_levels`).
 #
 # The one entry of the field sampling and its one keyword surface: a consumer passes every keyword it does not consume
-# on to this function, and the keywords mean what `_SAMPLING_KEYWORDS_DOC` documents. The keywords, the solution's pin
-# and the entries' containers are checked before anything is sampled, a callback's values as they are collected, and
-# nothing touches the file system. One workspace and one `FormState` serve every field: the fields are sampled one after
-# another, and each field's accessor frames the regions it reads on its own (`_sample_accessor`).
+# on to this function, and the keywords mean what `_SAMPLING_KEYWORDS_DOC` documents, the entries' callbacks what
+# `_SAMPLING_CALLBACK_DOC` does. The keywords, the solution's pin and the entries' containers are checked before
+# anything is sampled, a callback's values as they are collected, and nothing touches the file system. One workspace
+# and one `FormState` serve every field: the fields are sampled one after another, and each field's accessor frames the
+# regions it reads on its own (`_sample_accessor`).
 #
 # `solution = nothing` samples a discretisation that has not been solved: its regions, their sample cells and the
 # built-in arrays, with no `point_data` entry by default. A callback can still read its arguments, but one that

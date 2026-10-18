@@ -33,8 +33,9 @@ samples, and a call made without WriteVTK loaded raises an error saying to run `
 `ext/UnfittedWriteVTKExt.jl`.
 
 Plots of one- and two-dimensional models are a Makie extension: with a Makie backend loaded (`using CairoMakie`, say),
+[`fieldplot`](@ref) draws a solution, any quantity a callback computes from it, or the integration regions,
 [`levelplot`](@ref) draws the meshes of a model's levels coloured by order, activity, coverage or an error estimate,
-and [`quadratureplot`](@ref) draws its quadrature points. Neither needs a solution. See `ext/UnfittedMakieExt.jl`.
+and [`quadratureplot`](@ref) draws its quadrature points. See `ext/UnfittedMakieExt.jl`.
 
 Reference for the unfitted multi-level hp method:
 
@@ -80,8 +81,8 @@ export AxisBox, GeometryTolerance, PhysicalDomain, physical_domain, classify_cel
        moved, moved_space, activate!, deactivate!, active_cells, support_extension, dilate, cell_orders, elevate,
        elevated, cell_order, nominal_order, ladder, adapt, adapted, is_nested, overlapping_cells, level_count, transfer,
        L2Projection, Rewire, estimate, mark_cells, decide, refine, coarsen, QuadField, RBFP0, write_vtk, vtk_series,
-       VTKSeries, write_quadrature_vtm, levelplot, levelplot!, quadratureplot, quadratureplot!, l2_error,
-       boundary_integral, value, field_gradient, diagnostics, active_unknowns, cell_indices, cell_box, center,
+       VTKSeries, write_quadrature_vtm, fieldplot, fieldplot!, levelplot, levelplot!, quadratureplot, quadratureplot!,
+       l2_error, boundary_integral, value, field_gradient, diagnostics, active_unknowns, cell_indices, cell_box, center,
        value_vec, gradient_tensor, symmetric_gradient
 
 include("geometry.jl")

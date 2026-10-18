@@ -160,9 +160,9 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `data.jl`         | per-quadrature-point `QuadField` + RBF transfer             |
 | `postprocessing.jl` | what every post-processing consumer shares: the consumer-neutral sampling records (data grids, level meshes, the quadrature cloud), field/gradient evaluation, L² error, boundary integrals |
 | `api.jl`          | thin public-API wrappers (mass, stiffness, poisson, neumann, …) |
-| `stubs.jl`        | the package extensions' public entry points (`bspline`, `mesh_levelset` / `stl_levelset`, the tensor-notation readers, the VTK writers and `VTKSeries`, the plots `levelplot` / `quadratureplot`), declared and documented in the core — as fallbacks that name the package to load (`_extension_missing`), or, for a Makie recipe, methodless with an error hint that names it (`_extension_hint`, registered by `__init__` in `Unfitted.jl`); included last |
+| `stubs.jl`        | the package extensions' public entry points (`bspline`, `mesh_levelset` / `stl_levelset`, the tensor-notation readers, the VTK writers and `VTKSeries`, the plots `fieldplot` / `levelplot` / `quadratureplot`), declared and documented in the core — as fallbacks that name the package to load (`_extension_missing`), or, for a Makie recipe, methodless with an error hint that names it (`_extension_hint`, registered by `__init__` in `Unfitted.jl`); included last |
 | `ext/UnfittedWriteVTKExt.jl` (not in `src/`) | the VTK consumer of `postprocessing.jl`'s records, a package extension loaded with WriteVTK: `write_vtk`, `vtk_series`, `write_quadrature_vtm`, declared and documented in `stubs.jl` |
-| `ext/UnfittedMakieExt.jl` (not in `src/`) | the plotting consumer of `postprocessing.jl`'s records, a package extension loaded with Makie through any of its backends: the recipes `levelplot` and `quadratureplot` of 1D and 2D models, declared and documented in `stubs.jl` |
+| `ext/UnfittedMakieExt.jl` (not in `src/`) | the plotting consumer of `postprocessing.jl`'s records, a package extension loaded with Makie through any of its backends: the recipes `fieldplot`, `levelplot` and `quadratureplot` of 1D and 2D models, declared and documented in `stubs.jl` |
 
 Only split a single file when a second basis family, an alternative
 transfer scheme, or an honest test burden makes the split helpful.
@@ -1644,10 +1644,12 @@ demos.
     themselves — the sample cells and their cut refinement, the arrays
     and their element types, the refusals, a discretisation sampled
     without a solution — as records, with no writer loaded
-    (`test_postprocessing.jl`); the Makie recipes' primitives — each
-    level mesh's cells, colours, edges and stacking in 2D, the ladder of
-    levels in 1D, the colouring by an error estimate, the quadrature
-    cloud — asserted exactly against those records on the plot objects
+    (`test_postprocessing.jl`); the Makie recipes' primitives — a
+    field's sample cells, values, components, magnitudes, region edges,
+    warped heights and 1D graph, with and without a solution; each level
+    mesh's cells, colours, edges and stacking in 2D, the ladder of levels
+    in 1D, the colouring by an error estimate; the quadrature cloud —
+    asserted exactly against those records on the plot objects
     Makie builds, with no backend loaded and nothing rendered
     (`test_makie_ext.jl`); and, in a fresh process that loads Unfitted
     alone, the entry points asking for their package — `using WriteVTK`
