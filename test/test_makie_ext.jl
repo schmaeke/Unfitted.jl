@@ -1,0 +1,374 @@
+# The Makie extension's tests: what `levelplot` and `quadratureplot` make of the records `src/postprocessing.jl`
+# samples, asserted on the plot objects Makie builds — positions, faces, colours, edges, the axis each plot asks for —
+# with no backend loaded and nothing rendered. The records themselves are pinned in `test_postprocessing.jl`.
+#
+# `import`, not `using`: Makie exports `mesh`, as Unfitted does, and a file that loaded both with `using` would leave
+# every later test file that builds a `mesh` with an ambiguous name.
+import Makie        # loads UnfittedMakieExt, which provides levelplot and quadratureplot
+using StaticArrays: SVector
+
+const _MakieExt = Base.get_extension(Unfitted, :UnfittedMakieExt)
+const _GB = Makie.GeometryBasics
+
+# A level mesh record's cell array `name`.
+_level_array(record, name) = last(only(filter(entry -> first(entry) == name, record.grid.cell_data)))
+
+# The faces a 2D level plot must draw, stated independently of the extension's code: every drawn cell of every drawn
+# record, in record order, its four corners at the height `z = k − n − 1` of the `k`-th of `n` drawn records, and its
+# value repeated over them.
+function _expected_2d(records, values; inactive=false)
+    n = length(records)
+    positions, colors = Makie.Point3{Float64}[], Float64[]
+    for (k, (record, v)) in enumerate(zip(records, values)), c in 1:Unfitted._cell_count(record.grid)
+        inactive || _level_array(record, "active")[c] == 1 || continue
+        append!(positions, [Makie.Point3{Float64}(x[1], x[2], k - n - 1) for x in record.grid.points[(4c-3):(4c)]])
+        append!(colors, fill(v[c], 4))
+    end
+    return positions, colors
+end
+
+# The edges of a record's drawn cells, each once, as segments from the lower to the upper end at the height `z`: what a
+# 2D level plot draws of a level over which no later drawn level has a cell.
+function _drawn_cell_edges(record, z; inactive=false)
+    segments = Set{NTuple{2,Makie.Point3{Float64}}}()
+    for c in 1:Unfitted._cell_count(record.grid)
+        inactive || _level_array(record, "active")[c] == 1 || continue
+        ll, lr, ur, ul = record.grid.points[(4c-3):(4c)]
+        for (a, b) in ((ll, lr), (ul, ur), (ll, ul), (lr, ur))
+            push!(segments, (Makie.Point3{Float64}(a..., z), Makie.Point3{Float64}(b..., z)))
+        end
+    end
+    return segments
+end
+
+# A level plot's edges, the input of its edge child, as segments: consecutive pairs of its points.
+_segments(points) = [(points[2i-1], points[2i]) for i in 1:(length(points)÷2)]
+
+# The values a level plot colours a record's cells with, by one of its integer arrays.
+_by_array(records, name) = [Float64.(_level_array(record, name)) for record in records]
+
+# 2D: a 2×2 order-2 base under a 2×2 order-3 overlay of its lower-left quarter whose upper-right cell is switched off,
+# with homogeneous Dirichlet data on the whole boundary, so that the per-cell dof counts differ from cell to cell.
+_makie_mask = trues(2, 2)
+_makie_mask[2, 2] = false
+_makie_2d = prepare(poisson(overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=2, order=2), box((0.0, 0.0), (0.5, 0.5));
+                                    cells=2, order=3, active=_makie_mask); source=1.0,
+                            dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+# 1D: four order-1 cells under a two-cell order-2 overlay of the left half.
+_makie_1d = prepare(mass(overlay(space(box((0.0,), (1.0,)); cells=4, order=1), box((0.0,), (0.5,)); cells=2, order=2)))
+
+@testset "the Makie extension provides the plot entry points" begin
+    # The entry points are methodless in the core and recipes of the extension. Once the extension is loaded, an
+    # argument that is not a model is refused by Makie's own conversion, and the hint that asks for a backend stays
+    # silent; the behaviour without the extension is pinned in a fresh process by test_api.jl.
+    @test _MakieExt !== nothing
+    for f in (levelplot, quadratureplot)
+        err = try
+            f(1)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("Conversion failed", sprint(showerror, err))
+    end
+    @test !occursin("Makie backend", sprint(showerror, MethodError(levelplot, (1,))))
+end
+
+@testset "levelplot draws every active cell of every level in 2D, stacked in level order" begin
+    records = Unfitted._sample_levels(_makie_2d)
+    fig, ax, plt = levelplot(_makie_2d)
+    @test ax isa Makie.Axis
+    @test ax.aspect[] isa Makie.DataAspect
+    cells, edges = plt.plots
+    @test cells isa Makie.Mesh && edges isa Makie.LineSegments
+
+    # The recipe's primitives, exactly: 4 base cells and the 3 active overlay cells, coloured by their largest order.
+    positions, colors = _expected_2d(records, _by_array(records, "order_max"))
+    @test length(positions) == 4 * (4 + 3)
+    @test _GB.coordinates(plt.cell_geometry[]) == positions
+    @test _GB.faces(plt.cell_geometry[]) == [_GB.QuadFace{Int}(4i - 3, 4i - 2, 4i - 1, 4i) for i in 1:7]
+    @test plt.cell_color[] == colors
+    @test unique(colors) == [2.0, 3.0]
+
+    # Each edge of a level's drawn cells once, at the level's height plus ½. Every base edge runs along a line of the
+    # overlay or outside it, so no overlay cell lies over one and each is drawn whole: 12 of the base, 10 of the
+    # overlay's three drawn cells.
+    segments = _segments(plt.cell_edges[])
+    @test allunique(segments) && length(segments) == 12 + 10
+    @test Set(segments) == union(_drawn_cell_edges(records[1], -1.5), _drawn_cell_edges(records[2], -0.5))
+
+    # What Makie made of them: each quad split as the record contract says, (1, 2, 3) and (1, 3, 4), the colours and
+    # edges handed to the children, the edges in the stroke colour.
+    split = ((_GB.GLTriangleFace(4i - 3, 4i - 2, 4i - 1), _GB.GLTriangleFace(4i - 3, 4i - 1, 4i)) for i in 1:7)
+    @test _GB.faces(cells[1][]) == collect(Iterators.flatten(split))
+    @test cells.color[] == Float32.(colors)
+    @test edges[1][] == plt.cell_edges[]
+    @test edges.color[] == Makie.to_color(:black)
+end
+
+@testset "levelplot colours by any cell array, draws inactive cells on request and picks levels" begin
+    records = Unfitted._sample_levels(_makie_2d)
+    for name in ("level_id", "role_id", "cell_id", "active", "covered", "active_dofs", "reduced_dofs")
+        plt = levelplot(_makie_2d; by=Symbol(name)).plot
+        @test plt.cell_color[] == _expected_2d(records, _by_array(records, name))[2]
+    end
+
+    # The switched-off overlay cell, drawn on request: every cell of both levels.
+    plt = levelplot(_makie_2d; inactive=true, by=:active).plot
+    positions, colors = _expected_2d(records, _by_array(records, "active"); inactive=true)
+    @test _GB.coordinates(plt.cell_geometry[]) == positions
+    @test count(==(0.0), colors) == 4
+
+    # One level alone sits where the last of the drawn levels does; asking for every level is the default.
+    plt = levelplot(_makie_2d; levels=2).plot
+    @test _GB.coordinates(plt.cell_geometry[]) == _expected_2d(records[2:2], _by_array(records[2:2], "order_max"))[1]
+    @test all(x -> x[3] == -1, _GB.coordinates(plt.cell_geometry[]))
+    @test levelplot(_makie_2d; levels=[1, 2]).plot.cell_geometry[] == levelplot(_makie_2d).plot.cell_geometry[]
+
+    # An attribute changed on a drawn plot redraws it.
+    plt.levels = 1
+    @test length(_GB.faces(plt.cell_geometry[])) == 4
+
+    # Refusals name what was wrong and what would be right. Makie reports an error raised while a plot computes its
+    # primitives wrapped in its own exception, whose message ends with the error's.
+    for (keywords, says) in (((; by=:nope), "names no cell array"), ((; by=1.5), "by must name a cell array"),
+                             ((; levels=7), "its levels are 1, 2"), ((; levels=:all), "levels must be nothing"))
+        err = try
+            levelplot(_makie_2d; keywords...)
+            nothing
+        catch e
+            e
+        end
+        @test err !== nothing && occursin(says, sprint(showerror, err))
+    end
+end
+
+@testset "levelplot draws an edge only where no later level's drawn cell lies over it" begin
+    # A 2×2 base under one overlay cell over its middle, [¼, ¾]², which both interior base edges cross. CairoMakie
+    # paints the edge child after every face, so a base edge drawn whole would cut the overlay cell into four: each is
+    # drawn only outside it, in two pieces, and every edge once — 12 base segments, 4 of the overlay.
+    P(x, y, z) = Makie.Point3{Float64}(x, y, z)
+    along_x(y, a, b, z) = (P(a, y, z), P(b, y, z))
+    along_y(x, a, b, z) = (P(x, a, z), P(x, b, z))
+    halves = ((0.0, 0.5), (0.5, 1.0))
+    base(z) = Set([[along_x(y, a, b, z) for y in (0.0, 0.5, 1.0) for (a, b) in halves];
+                   [along_y(x, a, b, z) for x in (0.0, 0.5, 1.0) for (a, b) in halves]])
+    crossing = Set([along_x(0.5, a, b, -1.5) for (a, b) in halves] ∪ [along_y(0.5, a, b, -1.5) for (a, b) in halves])
+    outside = Set([along_x(0.5, 0.0, 0.25, -1.5), along_x(0.5, 0.75, 1.0, -1.5), along_y(0.5, 0.0, 0.25, -1.5),
+                   along_y(0.5, 0.75, 1.0, -1.5)])
+    middle = Set([along_x(0.25, 0.25, 0.75, -0.5), along_x(0.75, 0.25, 0.75, -0.5), along_y(0.25, 0.25, 0.75, -0.5),
+                  along_y(0.75, 0.25, 0.75, -0.5)])
+    cut = union(setdiff(base(-1.5), crossing), outside, middle)
+    covering(active) = prepare(mass(overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=2, order=1),
+                                            box((0.25, 0.25), (0.75, 0.75)); cells=1, order=2, active)))
+
+    segments = _segments(levelplot(covering(trues(1, 1))).plot.cell_edges[])
+    @test allunique(segments) && Set(segments) == cut
+    # An overlay cell that is not drawn hides nothing; drawn on request, it hides what it lies over.
+    hidden = covering(falses(1, 1))
+    segments = _segments(levelplot(hidden).plot.cell_edges[])
+    @test allunique(segments) && Set(segments) == base(-1.5)
+    @test Set(_segments(levelplot(hidden; inactive=true).plot.cell_edges[])) == cut
+    # The base alone draws every one of its edges whole.
+    @test Set(_segments(levelplot(covering(trues(1, 1)); levels=1).plot.cell_edges[])) == base(-0.5)
+end
+
+@testset "levelplot's edges cross no later drawn cell and cover the rest of every edge" begin
+    # An overlay whose lines fall between the base's, with one of its cells switched off. No base segment passes
+    # strictly inside a drawn overlay cell, and every point of a base cell's edge that lies outside the drawn overlay
+    # cells lies on a base segment: the cut removes exactly the covered parts.
+    mask = trues(2, 2)
+    mask[1, 2] = false
+    model = prepare(mass(overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=3, order=1), box((0.2, 0.1), (0.9, 0.8));
+                                 cells=2, order=1, active=mask)))
+    base, top = Unfitted._sample_levels(model)
+    boxes = [(top.grid.points[4c-3], top.grid.points[4c-1]) for c in 1:4 if mask[c]]
+    covered(x) = any(((lo, hi),) -> lo[1] < x[1] < hi[1] && lo[2] < x[2] < hi[2], boxes)
+    # Sample points off the overlay's lines: where two drawn overlay cells meet, an edge has a single point inside
+    # neither of them and on no piece, which no plot can show.
+    along(a, b) = (a + (b - a) * s for s in ((1:99) .+ 0.137) ./ 100)
+    on(x, (a, b)) = all(d -> min(a[d], b[d]) - 1.0e-12 <= x[d] <= max(a[d], b[d]) + 1.0e-12, 1:2)
+
+    segments = _segments(levelplot(model).plot.cell_edges[])
+    @test allunique(segments)
+    drawn = filter(s -> s[1][3] == -1.5, segments)
+    @test !any(s -> any(covered, along(s...)), drawn)
+    edges = NTuple{2,SVector{2,Float64}}[]
+    for c in 1:Unfitted._cell_count(base.grid)
+        ll, lr, ur, ul = base.grid.points[(4c-3):(4c)]
+        append!(edges, ((ll, lr), (ul, ur), (ll, ul), (lr, ur)))
+    end
+    @test all(x -> covered(x) || any(s -> on(x, s), drawn), (x for (a, b) in edges for x in along(a, b)))
+    @test length(drawn) > 12                       # some base edges came out in pieces
+end
+
+@testset "levelplot colours by an error estimate" begin
+    # The indicator of each drawn cell, read off the estimate's array of its level by the cell's linear index; an
+    # estimate of another discretisation is refused rather than read out of order.
+    records = Unfitted._sample_levels(_makie_2d)
+    est = estimate(_makie_2d, solve!(_makie_2d))
+    plt = levelplot(_makie_2d; by=est).plot
+    η = [Float64[est.cells[k][i] for i in _level_array(record, "cell_id")] for (k, record) in pairs(records)]
+    @test plt.cell_color[] == _expected_2d(records, η)[2]
+    @test maximum(plt.cell_color[]) > 0
+
+    other = prepare(poisson(space(box((0.0, 0.0), (1.0, 1.0)); cells=3, order=2); source=1.0,
+                            dirichlet=[dirichlet(0.0; on=boundary(:all))]))
+    err = try
+        levelplot(_makie_2d; by=estimate(other, solve!(other)))
+        nothing
+    catch e
+        e
+    end
+    @test err !== nothing && occursin("ErrorEstimate holds levels of (3, 3) cells", sprint(showerror, err))
+end
+
+@testset "levelplot draws a 1D model as a ladder of its levels" begin
+    # Every active cell a segment at the height of its level id, coloured at both ends, with a tick across each end.
+    records = Unfitted._sample_levels(_makie_1d)
+    fig, ax, plt = levelplot(_makie_1d)
+    @test ax isa Makie.Axis
+    @test ax.yticks[] == [1, 2]
+    @test ax.ylabel[] == "level"
+    @test levelplot(_makie_1d; levels=2).axis.yticks[] == [2]          # the rows are the drawn levels
+    segments, ticks = Makie.Point2{Float64}[], Makie.Point2{Float64}[]
+    colors = Float64[]
+    for record in records, c in 1:Unfitted._cell_count(record.grid)
+        a, b, y = record.grid.points[2c-1][1], record.grid.points[2c][1], record.level
+        append!(segments, [Makie.Point2(a, y), Makie.Point2(b, y)])
+        append!(colors, fill(_level_array(record, "order_max")[c], 2))
+        for x in (a, b)
+            append!(ticks, [Makie.Point2(x, y - 0.2), Makie.Point2(x, y + 0.2)])
+        end
+    end
+    @test plt.cell_geometry[] == segments
+    @test plt.cell_color[] == colors
+    @test plt.cell_edges[] == ticks
+    @test length(segments) == 2 * (4 + 2)
+    @test all(p -> p isa Makie.LineSegments, plt.plots)
+end
+
+@testset "levelplot draws every subdomain's levels or one field's, and follows its model" begin
+    V1 = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
+    V2 = space(box((2.0, 0.0), (3.0, 1.0)); cells=(1, 1), order=1)
+    u1, u2 = field(:u1, V1), field(:u2, V2)
+    coupled = prepare(Problem((u1, u2); blocks=(mass_block(u1), mass_block(u2))))
+    @test length(_GB.faces(levelplot(coupled).plot.cell_geometry[])) == 4 + 1
+    picked = levelplot(coupled; field=:u2).plot
+    @test _GB.coordinates(picked.cell_geometry[]) ==
+          [Makie.Point3{Float64}(x..., -1) for x in ((2.0, 0.0), (3.0, 0.0), (3.0, 1.0), (2.0, 1.0))]
+
+    # Drawn from an `Observable`, the plot follows the model it holds: here a model whose overlay moved.
+    observed = Makie.Observable(_makie_1d)
+    plt = levelplot(observed).plot
+    moved = moved_space(_makie_1d.problem.space; level=2, to=box((0.5,), (1.0,)))
+    observed[] = prepare(mass(moved))
+    @test extrema(p[1] for p in plt.cell_geometry[] if p[2] == 2) == (0.5, 1.0)
+end
+
+@testset "quadratureplot draws every quadrature point, coloured by weight or cover" begin
+    # 2D: every point of every signature at its position; 1D: at its position against its weight.
+    cloud = Unfitted._sample_quadrature(_makie_2d)
+    fig, ax, plt = quadratureplot(_makie_2d)
+    @test ax isa Makie.Axis && ax.aspect[] isa Makie.DataAspect
+    points = only(plt.plots)
+    @test points isa Makie.Scatter
+    @test plt.point_positions[] == [Makie.Point2{Float64}(x...) for entry in cloud for x in entry.grid.points]
+    @test plt.point_color[] == reduce(vcat, [last(only(entry.grid.point_data)) for entry in cloud])
+    @test length(plt.point_positions[]) == nquadpoints(_makie_2d)
+    plt.by = :cover_count
+    @test plt.point_color[] == reduce(vcat, [fill(length(e.signature), length(e.grid.points)) for e in cloud])
+    @test sort(unique(plt.point_color[])) == [1.0, 2.0]
+
+    fig, ax, plt = quadratureplot(_makie_1d)
+    @test ax.ylabel[] == "weight"
+    cloud = Unfitted._sample_quadrature(_makie_1d)
+    @test plt.point_positions[] == [Makie.Point2{Float64}(x[1], w) for e in cloud
+                                    for (x, w) in zip(e.grid.points, last(only(e.grid.point_data)))]
+
+    err = try
+        quadratureplot(_makie_2d; by=:nope)
+        nothing
+    catch e
+        e
+    end
+    @test err !== nothing && occursin("by must be :weight or :cover_count", sprint(showerror, err))
+end
+
+@testset "a Colorbar reads its colour mapping off either plot" begin
+    # Categorical (the default `by` of a level plot, and `:cover_count`) and continuous (the weights) alike.
+    cases = ((levelplot, _makie_2d, :order_max), (levelplot, _makie_1d, :order_max),
+             (quadratureplot, _makie_2d, :weight), (quadratureplot, _makie_2d, :cover_count))
+    for (f, model, by) in cases
+        fig, ax, plt = f(model; by)
+        @test Makie.Colorbar(fig[1, 2], plt) isa Makie.Colorbar
+    end
+end
+
+@testset "the quantities with a few discrete values are coloured as categories" begin
+    # One colour per distinct value, and a colour bar with a block and a tick per value, for a cell's order, level,
+    # role, activity and coverage and a point's cover count; the dof counts, the cell index, an estimate and the weights
+    # keep a continuous map. `categorical` decides for any `by`, and the map wrapped is the plot's own `colormap`.
+    mapping(plt) = first(plt.plots).color_mapping_type[]
+    for by in (:order_max, :level_id, :role_id, :active, :covered)
+        @test mapping(levelplot(_makie_2d; by).plot) == Makie.categorical
+    end
+    for by in (:cell_id, :active_dofs, :reduced_dofs, estimate(_makie_2d, solve!(_makie_2d)))
+        @test mapping(levelplot(_makie_2d; by).plot) == Makie.continuous
+    end
+    @test mapping(levelplot(_makie_1d).plot) == Makie.categorical
+    @test mapping(quadratureplot(_makie_2d; by=:cover_count).plot) == Makie.categorical
+    @test mapping(quadratureplot(_makie_2d).plot) == Makie.continuous
+    @test mapping(levelplot(_makie_2d; categorical=false).plot) == Makie.continuous
+    @test mapping(levelplot(_makie_2d; by=:cell_id, categorical=true).plot) == Makie.categorical
+    @test first(levelplot(_makie_2d; colormap=:inferno).plot.plots).colormap[] == Makie.Categorical(:inferno)
+    categories = Makie.Categorical([:gray, :tomato])
+    @test first(levelplot(_makie_2d; by=:covered, colormap=categories).plot.plots).colormap[] === categories
+
+    # Settled as the plot is created: Makie cannot switch a drawn plot between categorical and continuous colours, so
+    # a drawn categorical plot keeps its categories, and colours by another quantity or map within them.
+    plt = levelplot(_makie_2d).plot
+    plt.by = :cell_id
+    plt.colormap = :inferno
+    @test mapping(plt) == Makie.categorical
+    @test first(plt.plots).colormap[] == Makie.Categorical(:inferno)
+    @test first(plt.plots).scaled_color[] == Float32.(plt.cell_color[])
+
+    err = try
+        levelplot(_makie_2d; categorical=:yes)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError && occursin("categorical must be true, false or automatic", sprint(showerror, err))
+end
+
+@testset "the plots refuse a model of three dimensions, naming the VTK writer" begin
+    m3 = prepare(mass(space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=1, order=1)))
+    for (f, writer) in ((levelplot, "write_vtk"), (quadratureplot, "write_quadrature_vtm"))
+        err = try
+            f(m3)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("3-dimensional", sprint(showerror, err)) && occursin("`$writer`", sprint(showerror, err))
+    end
+end
+
+@testset "the 2D primitives of one quad" begin
+    # The conversion alone, on a hand-made record: one unit quad of value 7, the only level drawn, at z = −1, in the
+    # record's face-cyclic corner order, and its four edges once each, from the lower to the upper end, at z = −½.
+    corners = SVector{2,Float64}[(0, 0), (1, 0), (1, 1), (0, 1)]
+    grid = Unfitted.SampleGrid{2,Float64,2}(corners, Pair{String,AbstractVector}[], Pair{String,AbstractVector}[])
+    mesh, colors, edges = _MakieExt._level_primitives(Val(2), [(; level=1, grid, values=[7.0], keep=trues(1))])
+    @test _GB.coordinates(mesh) == [Makie.Point3{Float64}(x..., -1) for x in corners]
+    @test colors == fill(7.0, 4)
+    ends = ((1, 2), (4, 3), (1, 4), (2, 3))
+    @test length(edges) == 8
+    @test Set(_segments(edges)) ==
+          Set((Makie.Point3{Float64}(corners[i]..., -0.5), Makie.Point3{Float64}(corners[j]..., -0.5))
+              for (i, j) in ends)
+end

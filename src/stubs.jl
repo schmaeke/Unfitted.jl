@@ -1,23 +1,35 @@
 # The public entry points of Unfitted's package extensions, declared and documented in the core.
 #
-# Four package extensions install methods on names declared here: Tensors.jl the tensor-notation readers
+# Five package extensions install methods on names declared here: Tensors.jl the tensor-notation readers
 # `symmetric_gradient`, `value_vec` and `gradient_tensor`; BasicBSpline.jl the B-spline family's factory `bspline`;
 # MeshIO.jl the mesh level sets `mesh_levelset` and `stl_levelset` (MeshIO loads FileIO and GeometryBasics, the other
-# two triggers of its extension, so `using MeshIO` alone installs them); and WriteVTK.jl the VTK writers below. Every
-# such name is declared and documented here rather than in its extension, so that `?name` answers in a bare
-# `using Unfitted` session (an extension's docstrings land in the extension module's own docs, not this one's) and
-# downstream code can name it unconditionally.
+# two triggers of its extension, so `using MeshIO` alone installs them); WriteVTK.jl the VTK writers; and Makie.jl the
+# plots `levelplot` and `quadratureplot`. Every such name is declared and documented here rather than in its extension,
+# so that `?name` answers in a bare `using Unfitted` session (an extension's docstrings land in the extension module's
+# own docs, not this one's) and downstream code can name it unconditionally.
 #
-# Each entry point is one fallback method over every argument list, strictly less specific than every method its
-# extension installs, and its body is `_extension_missing`: without the extension the call raises an error that says
-# which package to load, before the call has touched anything, and with it a call no method accepts raises the ordinary
-# `MethodError`. That error bears the one trace the fallback leaves: since the fallback matches every call, Julia prints
-# it among the closest candidates and adds that the error was thrown manually, as if the method were deliberately left
-# unimplemented. The core defines no other method of these functions: one more specific than an extension method in
-# some argument would take that method's calls, or make them ambiguous. A further signature an extension implements is
-# documented on its abstract signature, which no method of the core implements: the tensor readers' `Val` and
-# `Field` forms and the VTK series operations below. The `Val` and `Field` forms name `TrialChannels` and `Field`,
-# which `problems.jl` defines, so `Unfitted.jl` includes this file last.
+# An entry point is declared in one of two ways, decided by who owns the method that matches every call:
+#
+#   * **A fallback method**, for an entry point whose extension defines its methods one signature at a time. The
+#     fallback is one method over every argument list, strictly less specific than every method its extension
+#     installs, and its body is `_extension_missing`: without the extension the call raises an error that says which
+#     package to load, before the call has touched anything, and with it a call no method accepts raises the ordinary
+#     `MethodError`. That error bears the one trace the fallback leaves: since the fallback matches every call, Julia
+#     prints it among the closest candidates and adds that the error was thrown manually, as if the method were
+#     deliberately left unimplemented.
+#   * **No method at all**, for a Makie recipe. `Makie.@recipe` defines the plot function's catch-all
+#     `f(args...; kw...)` itself, in the extension, and an extension may not overwrite a method of its parent while it
+#     precompiles (Julia refuses with "Method overwriting is not permitted during Module precompilation"), so the core
+#     cannot hold one. The function is declared methodless and listed in `_METHODLESS_ENTRY_POINTS`: a call made
+#     without the extension is then an ordinary `MethodError`, to which the error hint `_extension_hint` adds the
+#     package to load. With the extension loaded, a call the recipe cannot draw is refused by Makie, naming the argument
+#     types it expected.
+#
+# The core defines no other method of these functions: one more specific than an extension method in some argument
+# would take that method's calls, or make them ambiguous. A further signature an extension implements is documented on
+# its abstract signature, which no method of the core implements: the tensor readers' `Val` and `Field` forms and the
+# VTK series operations below. The `Val` and `Field` forms name `TrialChannels` and `Field`, which `problems.jl`
+# defines, so `Unfitted.jl` includes this file last.
 #
 # `symmetric_gradient` is declared here rather than extended from Tensors.jl, because Tensors.jl does not export a
 # function under that name; the closest cousins it ships are the AD entry points `gradient`, `hessian` and
@@ -568,7 +580,137 @@ Requires `using WriteVTK`, like [`write_vtk`](@ref).
 """
 write_quadrature_vtm(args...; kwargs...) = _extension_missing(write_quadrature_vtm, args, "WriteVTK")
 
-# ── The fallback every entry point shares ─────────────────────────────────────
+# ── Plots: the Makie extension ────────────────────────────────────────────────
+#
+# Plotting is the package extension `ext/UnfittedMakieExt.jl`, installed when Makie.jl is loaded alongside Unfitted —
+# by any of its backends, CairoMakie, GLMakie or WGLMakie, each of which loads Makie. It draws the consumer-neutral
+# records `src/postprocessing.jl` samples, which the VTK writer serialises, and decides everything Makie-specific
+# there. Its entry points are Makie recipes, so they are declared methodless, as the rule at the top of this file says.
+
+"""
+    levelplot(model; by=:order_max, levels=nothing, inactive=false, field=nothing,
+              strokecolor=:black, strokewidth=0.5, linewidth=6, categorical=automatic, colormap, colorrange, …)
+    levelplot!([axis,] model; …)
+
+Plot the meshes of `model`'s levels, each cell coloured flat by one per-cell quantity: the discretisation itself, which
+needs no solution — which cells each level has and which of them are active, the polynomial order of every cell, where
+covered-mode pruning removes modes, or where an error estimate puts the error. `levelplot` returns what every Makie
+plotting function returns, the figure, the axis and the plot; `levelplot!` draws into an existing axis and returns the
+plot.
+
+The cells drawn are the active cells of every drawn level — every cell of it with `inactive = true` — in
+`cell_indices` order, the cells of the level meshes [`write_vtk`](@ref) writes as `level_<id>_<role>`, each with its
+edges:
+
+  - **2D.** Each level is a mesh of quads, the levels stacked in level order, the base lowest and each later level above
+    the ones before it, so that wherever a later level has a drawn cell it hides the levels below, and the plot shows
+    at every point the last drawn level that has a cell there, edges included: an edge of a level is drawn only where
+    no drawn cell of a later level lies over it, and an edge two cells of one level share is drawn once. The axis keeps
+    the data's aspect ratio. To see one level whole, its cells under the overlays included, pass its id as `levels`.
+  - **1D.** Each level is a row of segments at the height of its level id, the base at the bottom, with a tick at every
+    cell end, so that the levels read as a ladder over the domain.
+
+Keyword arguments, which are the plot's attributes:
+
+  - `by` — what colours a cell. Either the name of one of the level meshes' integer cell arrays — `:order_max`
+    (default), the largest per-axis polynomial order of the cell; `:level_id`; `:role_id`, 0 on the base level and 1
+    on an overlay; `:cell_id`, the cell's linear index in its level; `:active`, 1 where the level's activation mask and
+    the fictitious fold keep the cell; `:covered`, 1 where the active region of a single higher-id level holds the
+    cell's material; `:active_dofs`, the cell's modes with an active component; `:reduced_dofs`, its modes that
+    covered-mode pruning eliminated — or an [`ErrorEstimate`](@ref) of `model`, whose indicator `η_K` colours each cell
+    `K`. An estimate must be the one [`estimate`](@ref) returned for this model's discretisation, one array per level of
+    that level's shape, which is checked.
+  - `levels` — the levels to draw, by id: `nothing` (default) for every level, one id, or a collection of ids.
+  - `inactive` — whether to draw the cells that a level's activation mask or the fictitious fold switched off; `false`
+    by default, since they carry no approximation, and drawn above a coarser level they would hide its active cells.
+    `by = :active` with `inactive = true` and one level shows that level's mask.
+  - `field` — the field whose space is drawn on a model with several, a [`Field`](@ref) or its name; `nothing`
+    (default) draws the space of every field, each space once.
+  - `strokecolor`, `strokewidth` — the colour and the width in pixels of the cell edges and, in 1D, of the ticks at the
+    cell ends; `strokewidth = 0` draws neither.
+  - `linewidth` — in 1D, the width in pixels of the segments that carry the colour.
+  - `categorical` — whether the colours are categories: each distinct value its own colour of `colormap`, and a
+    `Colorbar` one block and one tick per value. `automatic` (default) makes the quantities with a few discrete values
+    categorical — `:order_max`, `:level_id`, `:role_id`, `:active` and `:covered` — and not the dof counts, the cell
+    index or an error estimate; `true` or `false` decides for any `by`. It is settled when the plot is created: a drawn
+    plot keeps it when `by` or `colormap` changes, since Makie cannot switch a drawn plot between categorical and
+    continuous colours.
+  - `colormap`, `colorrange`, `colorscale`, `lowclip`, `highclip`, `nan_color`, `alpha` — the colour mapping, as for
+    every Makie plot; a `Colorbar` reads it off the plot.
+
+The per-cell arrays mean what they mean on `write_vtk`'s level meshes, including the limit of the `covered` flag: it is
+computed only where the dof layer reads it, so on a masked level an inactive cell far from the active ones shows `0`
+whatever its true coverage. `:covered` and `:reduced_dofs` are read on one level at a time, `levels = id`: the cells
+they mark lie under the level that covers them, which the stacked levels draw in front.
+
+A `by`, `levels` or estimate the plot cannot use is refused with an error that names the problem; Makie raises it
+wrapped in its own exception, since it arises while the plot computes what to draw, and does so again when the
+attribute is changed on a drawn plot. A model of three or more dimensions is refused with an `ArgumentError`: write it
+with [`write_vtk`](@ref), whose level meshes carry the same arrays, and look at it in ParaView.
+
+Requires Makie, which each of its backends loads: `using CairoMakie` to draw into files, `GLMakie` for an interactive
+window, `WGLMakie` for a browser or a notebook. Without it a call raises a `MethodError` that says so. With a backend
+loaded, `mesh` names both Unfitted's function and Makie's, so write `Unfitted.mesh` for Unfitted's — or build spaces
+with `space(box(…); …)`, which needs no `mesh`.
+"""
+function levelplot end
+
+"""
+    levelplot!([axis,] model; …)
+
+Draw [`levelplot`](@ref) into `axis`, or into the current axis, and return the plot. The attributes are `levelplot`'s.
+"""
+function levelplot! end
+
+"""
+    quadratureplot(model; by=:weight, marker=:circle, markersize=6, categorical=automatic, colormap, colorrange, …)
+    quadratureplot!([axis,] model; …)
+
+Plot `model`'s quadrature points: every point of every subdomain's integration plan, where its integration regions put
+it and what it weighs — the cloud [`write_quadrature_vtm`](@ref) writes. It shows what the level meshes cannot: the
+integration regions themselves, the moment-fitted rules of the cut cells, and, by their tiny weights, the small overlaps
+that condition the system badly. `quadratureplot` returns the figure, the axis and the plot; `quadratureplot!` draws
+into an existing axis and returns the plot.
+
+  - **2D.** Each point is a marker at its position. The axis keeps the data's aspect ratio.
+  - **1D.** Each point is a marker at its position against its weight, so that the rule of every region reads as a
+    profile.
+
+Keyword arguments, which are the plot's attributes:
+
+  - `by` — what colours a point: `:weight` (default), its physical weight, the rule weight times the region's Jacobian
+    as assembly integrates with it; or `:cover_count`, the number of levels whose cells cover its region — 1 where the
+    base level alone is active, more under an overlay.
+  - `marker`, `markersize` — the marker of a point and its size in pixels.
+  - `categorical` — whether the colours are categories, as for [`levelplot`](@ref): `automatic` (default) for
+    `:cover_count`, not for `:weight`.
+  - `colormap`, `colorrange`, `colorscale`, `lowclip`, `highclip`, `nan_color`, `alpha` — the colour mapping, as for
+    every Makie plot; a `Colorbar` reads it off the plot.
+
+Any other `by` is refused with an error that names it, wrapped by Makie as for [`levelplot`](@ref). A model of three
+or more dimensions is refused with an `ArgumentError`: write its cloud with [`write_quadrature_vtm`](@ref) and look at
+it in ParaView.
+
+Requires Makie, which each of its backends loads, as for [`levelplot`](@ref).
+"""
+function quadratureplot end
+
+"""
+    quadratureplot!([axis,] model; …)
+
+Draw [`quadratureplot`](@ref) into `axis`, or into the current axis, and return the plot. The attributes are
+`quadratureplot`'s.
+"""
+function quadratureplot! end
+
+# ── The fallback and the hint every entry point shares ────────────────────────
+
+# The remedy for a call made without `package`'s extension, as the fallback and the hint both state it. Makie is the
+# exception to `using` the package: drawing needs a backend, and every backend loads Makie, so the remedy names one.
+function _how_to_load(package::String)
+    package == "Makie" && return "run `using CairoMakie`, or another Makie backend, to load it"
+    return "run `using $package` to load it"
+end
 
 # The body of an extension stub's fallback method `f(args...; kwargs...)`: what a call no method of `f` accepts raises.
 # While the package extension `Unfitted<package>Ext` — the name every extension of this package carries, after the
@@ -578,6 +720,26 @@ write_quadrature_vtm(args...; kwargs...) = _extension_missing(write_quadrature_v
 # what is loaded. Generic in the package, so every extension's entry points share it.
 function _extension_missing(f, args, package::String)
     Base.get_extension(@__MODULE__, Symbol(:Unfitted, package, :Ext)) === nothing &&
-        error("$(nameof(f)) is provided by Unfitted's $package extension: run `using $package` to load it")
+        error("$(nameof(f)) is provided by Unfitted's $package extension: $(_how_to_load(package))")
     throw(MethodError(f, args))
+end
+
+# The methodless entry points, each with the package whose extension implements it (see the top of this file). A
+# recipe added to an extension is declared above and added here.
+const _METHODLESS_ENTRY_POINTS = (levelplot => "Makie", levelplot! => "Makie", quadratureplot => "Makie",
+                                  quadratureplot! => "Makie")
+
+# The error hint `__init__` (in `Unfitted.jl`) registers for `MethodError`: for a call to a methodless entry point made
+# while its extension is not loaded, the line that names the package to load, as `_extension_missing` names it for a
+# fallback. It says nothing about any other `MethodError`, nor once the extension is loaded, when the call failed for
+# another reason. A call with keyword arguments fails as a call of `Core.kwcall`, whose second argument is the function
+# that was called, so that is the function looked up.
+function _extension_hint(io::IO, err::MethodError, _, _)
+    f = err.f === Core.kwcall && length(err.args) >= 2 ? err.args[2] : err.f
+    i = findfirst(entry -> first(entry) === f, _METHODLESS_ENTRY_POINTS)
+    i === nothing && return nothing
+    package = last(_METHODLESS_ENTRY_POINTS[i])
+    Base.get_extension(@__MODULE__, Symbol(:Unfitted, package, :Ext)) === nothing || return nothing
+    print(io, "\n", nameof(f), " is provided by Unfitted's ", package, " extension: ", _how_to_load(package))
+    return nothing
 end

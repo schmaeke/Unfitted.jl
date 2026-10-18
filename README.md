@@ -138,7 +138,14 @@ The method is described in
   writes a solution with the meshes of its levels — cut cells refined toward
   `∂Ω`, so a Clip on the `level_set` array draws the immersed boundary —
   `vtk_series` collects such bundles into a time series, and
-  `write_quadrature_vtm` writes the quadrature-point cloud.
+  `write_quadrature_vtm` writes the quadrature-point cloud. Plots of 1D
+  and 2D models are a Makie extension (load any Makie backend, e.g.
+  `using CairoMakie`): `levelplot` draws the meshes of the levels coloured
+  by order, activity, coverage or an error estimate, and `quadratureplot`
+  the quadrature points — neither needs a solution. With a backend loaded,
+  `mesh` names both Unfitted's function and Makie's, so write
+  `Unfitted.mesh`, or build spaces with `space(box(…); …)`, which needs no
+  `mesh`.
 - **D-generic core**: 1D, 2D, 3D, and 4D smoke-tested.
 
 ## Installation
@@ -153,8 +160,9 @@ Pkg.add(url="https://github.com/schmaeke/Unfitted.jl")
 Julia 1.10 or newer is required. The optional integrations are package
 extensions and load with their package: add `WriteVTK` to your environment
 (`Pkg.add("WriteVTK")`) for ParaView output, as the quick example below
-uses, `BasicBSpline` for the B-spline family, `FileIO` + `MeshIO` for
-imported boundary meshes, and `Tensors` for weak forms in tensor notation.
+uses, `CairoMakie` (or another Makie backend) for plots, `BasicBSpline`
+for the B-spline family, `FileIO` + `MeshIO` for imported boundary meshes,
+and `Tensors` for weak forms in tensor notation.
 
 ## Quick example
 

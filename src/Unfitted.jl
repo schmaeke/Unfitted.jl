@@ -32,6 +32,10 @@ writes the quadrature-point cloud. The extension serialises the consumer-neutral
 samples, and a call made without WriteVTK loaded raises an error saying to run `using WriteVTK`. See
 `ext/UnfittedWriteVTKExt.jl`.
 
+Plots of one- and two-dimensional models are a Makie extension: with a Makie backend loaded (`using CairoMakie`, say),
+[`levelplot`](@ref) draws the meshes of a model's levels coloured by order, activity, coverage or an error estimate,
+and [`quadratureplot`](@ref) draws its quadrature points. Neither needs a solution. See `ext/UnfittedMakieExt.jl`.
+
 Reference for the unfitted multi-level hp method:
 
 > J. N. Schmäke and M. Ruess, *Unfitted Multi-Level hp Refinement for Localized and Moving Solution Features*,
@@ -76,8 +80,9 @@ export AxisBox, GeometryTolerance, PhysicalDomain, physical_domain, classify_cel
        solution, move!, moved, moved_space, activate!, deactivate!, active_cells, support_extension, dilate,
        cell_orders, elevate, elevated, cell_order, nominal_order, ladder, adapt, adapted, is_nested, overlapping_cells,
        level_count, transfer, L2Projection, Rewire, estimate, mark_cells, decide, refine, coarsen, QuadField, RBFP0,
-       write_vtk, vtk_series, VTKSeries, write_quadrature_vtm, l2_error, boundary_integral, value, field_gradient,
-       diagnostics, active_unknowns, cell_indices, cell_box, center, value_vec, gradient_tensor, symmetric_gradient
+       write_vtk, vtk_series, VTKSeries, write_quadrature_vtm, levelplot, levelplot!, quadratureplot, quadratureplot!,
+       l2_error, boundary_integral, value, field_gradient, diagnostics, active_unknowns, cell_indices, cell_box, center,
+       value_vec, gradient_tensor, symmetric_gradient
 
 include("geometry.jl")
 include("physical.jl")
@@ -105,5 +110,13 @@ include("api.jl")
 # The public entry points of the package extensions, declared and documented in the core so that `?name` answers
 # without the extension. Last, because some of their documented signatures name types the files above define.
 include("stubs.jl")
+
+# The one thing loading the package does: register the hint that names the package a methodless extension entry point
+# needs (`_extension_hint` in `stubs.jl`). An error hint belongs to the running session, not to the precompiled module,
+# so it is registered when the module is loaded.
+function __init__()
+    Base.Experimental.register_error_hint(_extension_hint, MethodError)
+    return nothing
+end
 
 end
