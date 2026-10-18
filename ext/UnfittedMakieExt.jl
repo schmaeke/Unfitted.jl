@@ -318,16 +318,31 @@ end
 
 # ── Axes and colour bars ──────────────────────────────────────────────────────
 
-# A plot of a model draws in a 2D axis in either dimension: in 2D a model is its own plane, and in 1D the second axis
-# carries the level (`levelplot`) or the weight (`quadratureplot`). A 2D domain is drawn to scale.
-Makie.preferred_axis_type(::Union{LevelPlot,QuadraturePlot}) = Makie.Axis
-function Makie.preferred_axis_attributes(::Type{Makie.Axis}, ::Union{LevelPlot,QuadraturePlot}, ::Model{2})
-    return (; aspect=Makie.DataAspect())
+# The recipes' plots of a `D`-dimensional model, which is a field plot's second argument and the others' only one. Makie
+# asks a plot for its axis once its arguments are converted, so these hooks take the plot alone and read the rest off
+# it.
+const _PlotOf{D} = Union{LevelPlot{<:Tuple{<:Model{D}}},QuadraturePlot{<:Tuple{<:Model{D}}},
+                         FieldPlot{<:Tuple{Any,<:Model{D}}}}
+
+# Every plot draws in a 2D axis but a warped 2D field plot, which goes into an `Axis3`: that gives the height an axis
+# and ticks of its own, where an `LScene` would show the surface without any. The axis follows the model's dimension
+# and the plot's `warp`, which is why `warp` is settled when the plot is created. In 2D a model is its own plane, drawn
+# to scale; in 1D the second axis carries the level (`levelplot`), the weight (`quadratureplot`) or the plotted value
+# (`fieldplot`). A warped field plot has the domain to scale in the horizontal and the plotted value on the vertical
+# axis.
+Makie.preferred_axis_type(p::FieldPlot{<:Tuple{Any,<:Model{2}}}) = p.warp[] ? Makie.Axis3 : Makie.Axis
+Makie.preferred_axis_type(::Union{LevelPlot,QuadraturePlot,FieldPlot}) = Makie.Axis
+Makie.preferred_axis_attributes(::Type{Makie.Axis}, ::_PlotOf{2}) = (; aspect=Makie.DataAspect())
+function Makie.preferred_axis_attributes(::Type{Makie.Axis}, p::LevelPlot{<:Tuple{<:Model{1}}})
+    return (; ylabel="level", yticks=_drawn_level_ids(p.discretisation[], p.field[], p.levels[]))
 end
-function Makie.preferred_axis_attributes(::Type{Makie.Axis}, plot::LevelPlot, model::Model{1})
-    return (; ylabel="level", yticks=_drawn_level_ids(model, plot.field[], plot.levels[]))
+Makie.preferred_axis_attributes(::Type{Makie.Axis}, ::QuadraturePlot{<:Tuple{<:Model{1}}}) = (; ylabel="weight")
+function Makie.preferred_axis_attributes(::Type{Makie.Axis}, p::FieldPlot{<:Tuple{Any,<:Model{1}}})
+    return (; xlabel="x", ylabel=_field_label(p))
 end
-Makie.preferred_axis_attributes(::Type{Makie.Axis}, ::QuadraturePlot, ::Model{1}) = (; ylabel="weight")
+function Makie.preferred_axis_attributes(::Type{Makie.Axis3}, p::FieldPlot{<:Tuple{Any,<:Model{2}}})
+    return (; aspect=_warped_aspect(p.discretisation[], p.field[]), zlabel=_field_label(p))
+end
 
 # The ids of the levels a 1D level plot draws, which are its rows: the levels of the drawn fields' spaces, as
 # `_sample_levels` meshes them, picked by `levels`. Read off the spaces rather than off the meshes, so that the axis
@@ -342,35 +357,10 @@ function _drawn_level_ids(model::Model, field, levels)
     return sort!(ids)
 end
 
-# A field plot draws in a 2D axis, except a 2D one warped into the third dimension: that goes into an `Axis3`, which
-# gives the height an axis and ticks of its own, where an `LScene` would show the surface without any. Both argument
-# forms are a model's, so the axis follows the model's dimension and the plot's `warp`, which is why `warp` is settled
-# when the plot is created.
-Makie.preferred_axis_type(p::FieldPlot, model::Model) = _field_axis_type(p, model)
-Makie.preferred_axis_type(p::FieldPlot, ::Union{Nothing,Solution}, model::Model) = _field_axis_type(p, model)
-_field_axis_type(p::FieldPlot, ::Model{2}) = p.warp[] ? Makie.Axis3 : Makie.Axis
-_field_axis_type(::FieldPlot, ::Model) = Makie.Axis
-
-# The axis a field plot asks for: a flat 2D domain to scale; a warped one with the domain to scale in the horizontal
-# and the plotted value on the vertical axis; and in 1D the plotted value against `x`.
-function Makie.preferred_axis_attributes(axis::Type{<:Union{Makie.Axis,Makie.Axis3}}, p::FieldPlot, model::Model)
-    return _field_axis_attributes(axis, p, nothing, model)
-end
-function Makie.preferred_axis_attributes(axis::Type{<:Union{Makie.Axis,Makie.Axis3}}, p::FieldPlot,
-                                         solution::Union{Nothing,Solution}, model::Model)
-    return _field_axis_attributes(axis, p, solution, model)
-end
-_field_axis_attributes(::Type{Makie.Axis}, p, solution, ::Model{2}) = (; aspect=Makie.DataAspect())
-_field_axis_attributes(::Type{Makie.Axis}, p, solution, ::Model{1}) = (; xlabel="x", ylabel=_field_label(p, solution))
-function _field_axis_attributes(::Type{Makie.Axis3}, p, solution, model::Model{2})
-    return (; aspect=_warped_aspect(model, p.field[]), zlabel=_field_label(p, solution))
-end
-_field_axis_attributes(axis, p, solution, model) = NamedTuple()
-
 # The name of the quantity a field plot shows, for its axis: the array `by` names, `value` for a callback, and the
 # component picked, if one is.
-function _field_label(p::FieldPlot, solution)
-    by, component = _resolved_by(p.by[], solution), p.component[]
+function _field_label(p::FieldPlot)
+    by, component = _resolved_by(p.by[], p.solution[]), p.component[]
     name = by isa Symbol ? String(by) : "value"
     return component isa Integer ? "$name[$component]" : name
 end
