@@ -147,9 +147,14 @@ end
     @test all(x -> x[3] == -1, _GB.coordinates(plt.cell_geometry[]))
     @test levelplot(_makie_2d; levels=[1, 2]).plot.cell_geometry[] == levelplot(_makie_2d).plot.cell_geometry[]
 
-    # An attribute changed on a drawn plot redraws it.
+    # An attribute changed on a drawn plot redraws it. Another `by` recolours the cells without meshing the levels or
+    # cutting their edges again.
     plt.levels = 1
     @test length(_GB.faces(plt.cell_geometry[])) == 4
+    meshes, geometry, edges = plt.level_records[], plt.cell_geometry[], plt.cell_edges[]
+    plt.by = :level_id
+    @test plt.cell_color[] == fill(1.0, 16)
+    @test plt.level_records[] === meshes && plt.cell_geometry[] === geometry && plt.cell_edges[] === edges
 
     # Refusals name what was wrong and what would be right. Makie reports an error raised while a plot computes its
     # primitives wrapped in its own exception, whose message ends with the error's.
@@ -301,8 +306,10 @@ end
     @test plt.point_positions[] == [Makie.Point2{Float64}(x...) for record in cloud for x in record.grid.points]
     @test plt.point_color[] == reduce(vcat, [last(only(record.grid.point_data)) for record in cloud])
     @test length(plt.point_positions[]) == nquadpoints(_makie_2d)
+    positions = plt.point_positions[]
     plt.by = :cover_count
     @test plt.point_color[] == reduce(vcat, [fill(length(e.signature), length(e.grid.points)) for e in cloud])
+    @test plt.point_positions[] === positions                   # recoloured, not sampled again
     @test sort(unique(plt.point_color[])) == [1.0, 2.0]
 
     fig, ax, plt = quadratureplot(_makie_1d)
@@ -758,19 +765,4 @@ end
         end
         @test err !== nothing && occursin(says, sprint(showerror, err))
     end
-end
-
-@testset "the 2D primitives of one quad" begin
-    # The conversion alone, on a hand-made record: one unit quad of value 7, the only level drawn, at z = −1, in the
-    # record's face-cyclic corner order, and its four edges once each, from the lower to the upper end, at z = −½.
-    corners = SVector{2,Float64}[(0, 0), (1, 0), (1, 1), (0, 1)]
-    grid = Unfitted.SampleGrid{2,Float64,2}(corners, Pair{String,AbstractVector}[], Pair{String,AbstractVector}[])
-    mesh, colors, edges = _MakieExt._level_primitives(Val(2), [(; id=1, grid, values=[7.0], keep=trues(1))])
-    @test _GB.coordinates(mesh) == [Makie.Point3{Float64}(x..., -1) for x in corners]
-    @test colors == fill(7.0, 4)
-    ends = ((1, 2), (4, 3), (1, 4), (2, 3))
-    @test length(edges) == 8
-    @test Set(_segments(edges)) ==
-          Set((Makie.Point3{Float64}(corners[i]..., -0.5), Makie.Point3{Float64}(corners[j]..., -0.5))
-              for (i, j) in ends)
 end

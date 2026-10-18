@@ -158,16 +158,21 @@ end
 # so both forms are one plot type, and an `Observable` of either argument updates it.
 Makie.convert_arguments(::Type{<:FieldPlot}, model::Model) = (nothing, model)
 
-# Each recipe derives its primitives from its inputs in one computation, so a change of the model or of an attribute —
-# a new model in an `Observable`, another `by` — recomputes them together, and draws them as children that read the
-# colour mapping from the recipe's own attributes, the colour map through `_effective_colormap`. The dimension check
-# comes first, before anything is sampled.
+# Each recipe samples its model in a computation of its own and derives each primitive from the samples in another,
+# which reads only the attributes that primitive shows, so that a change of an attribute — another `by`, other
+# `levels` — recomputes what it changes and samples nothing again, while a new model in an `Observable` samples anew.
+# The children read the colour mapping from the recipe's own attributes, the colour map through `_colormap_node!`. The
+# dimension check comes first, before anything is sampled.
+#
+# A level plot meshes its levels from the model and the field; picks the drawn cells from `levels` and `inactive`, and
+# draws them and their edges, which in 2D are cut where a later level hides them; and colours them from `by`. Another
+# `by` recolours the cells without meshing — building the coverage — or cutting the edges again.
 function Makie.plot!(p::LevelPlot{<:Tuple{<:Model{D}}}) where {D}
     _check_dimension(Val(D), :levelplot, :write_vtk)
-    inputs = [:discretisation, :field, :by, :levels, :inactive]
-    map!(p.attributes, inputs, [:cell_geometry, :cell_color, :cell_edges]) do model, field, by, levels, inactive
-        return _level_primitives(Val(D), _drawn_levels(model, field, by, levels, inactive))
-    end
+    map!((model, field) -> _sample_levels(model; field), p.attributes, [:discretisation, :field], :level_records)
+    map!(_drawn_levels, p.attributes, [:level_records, :levels, :inactive], :drawn_levels)
+    map!(drawn -> _level_primitives(Val(D), drawn), p.attributes, :drawn_levels, [:cell_geometry, :cell_edges])
+    map!(_cell_colors, p.attributes, [:discretisation, :level_records, :drawn_levels, :by], :cell_color)
     _draw_cells!(p, Val(D), _colormap_node!(p, :cell_colormap))
     Makie.linesegments!(p, Makie.shared_attributes(p, Makie.LineSegments), p.cell_edges; color=p.strokecolor,
                         linewidth=p.strokewidth)
@@ -175,6 +180,14 @@ function Makie.plot!(p::LevelPlot{<:Tuple{<:Model{D}}}) where {D}
         return _model_boundary(Val(D), model, field, boundary, :levelplot)
     end
     _draw_boundary!(p, :model_boundary, Val(D))
+    return _refuse_now!(p, :cell_color)
+end
+
+# Makie computes a child's geometry as it creates the child but its colours only when it first draws it, so a `by` the
+# plot cannot colour by would be refused by whatever draws the plot rather than by the call that passed it. The plot
+# reads its colours `name` once as it is created, which refuses it there, as every other attribute is refused.
+function _refuse_now!(p, name::Symbol)
+    getproperty(p, name)[]
     return p
 end
 
@@ -259,12 +272,12 @@ function Makie.plot!(p::QuadraturePlot{<:Tuple{<:Model{D}}}) where {D}
         return _model_boundary(Val(D), model, nothing, boundary, :quadratureplot)
     end
     _draw_boundary!(p, :model_boundary, Val(D))
-    map!(p.attributes, [:discretisation, :by], [:point_positions, :point_color]) do model, by
-        return _quadrature_primitives(Val(D), _sample_quadrature(model), by)
-    end
+    map!(_sample_quadrature, p.attributes, :discretisation, :quadrature_records)
+    map!(records -> _cloud_positions(Val(D), records), p.attributes, :quadrature_records, :point_positions)
+    map!(_cloud_colors, p.attributes, [:quadrature_records, :by], :point_color)
     Makie.scatter!(p, Makie.shared_attributes(p, Makie.Scatter), p.point_positions; color=p.point_color,
                    colormap=_colormap_node!(p, :point_colormap))
-    return p
+    return _refuse_now!(p, :point_color)
 end
 
 # The colour map node a plot's coloured child reads: the plot's own `colormap`, or, for a categorical plot, that map
@@ -381,21 +394,28 @@ Makie.extract_colormap(p::QuadraturePlot) = Makie.extract_colormap(only(c for c 
 
 # ── Level meshes ──────────────────────────────────────────────────────────────
 
-# The levels a level plot draws, in level order, each as `(; id, grid, values, keep)`: its id, its mesh record, the
-# value that colours each of its cells (`by`), and which of its cells are drawn — all of them with `inactive`, the
-# active ones otherwise. `levels` picks levels by id; the order they are drawn in is the levels' own, which is what
-# the stacking in 2D relies on.
-function _drawn_levels(model::Model{D,T}, field, by, levels, inactive::Bool) where {D,T}
-    records = _sample_levels(model; field)
-    values = _cell_values(model, records, by)
+# The levels a level plot draws, of its mesh `records`, in level order, each as `(; id, grid, keep)`: its id, its mesh
+# record, and which of its cells are drawn — all of them with `inactive`, the active ones otherwise. `levels` picks
+# levels by id; the order they are drawn in is the levels' own, which is what the stacking in 2D relies on. Collected
+# into a vector of a type fixed by the records', whatever is picked, as a computed value of a plot must be.
+function _drawn_levels(records::Vector{@NamedTuple{field::Field,level::Int,role::Symbol,grid::G}}, levels,
+                       inactive::Bool) where {G}
     ids = _drawn_ids(records, levels)
-    drawn = @NamedTuple{id::Int, grid::SampleGrid{D,T,D}, values::Vector{Float64}, keep::BitVector}[]
-    for (record, v) in zip(records, values)
+    drawn = @NamedTuple{id::Int, grid::G, keep::BitVector}[]
+    for record in records
         record.level in ids || continue
-        keep = inactive ? trues(length(v)) : _cell_array(record.grid, :active) .== 1
-        push!(drawn, (; id=record.level, record.grid, values=v, keep))
+        keep = inactive ? trues(_cell_count(record.grid)) : _cell_array(record.grid, :active) .== 1
+        push!(drawn, (; id=record.level, record.grid, keep))
     end
     return drawn
+end
+
+# The colour of every corner of every drawn cell, in the order the cells are drawn (`_level_primitives`): the value
+# that colours the cell (`_cell_values`), repeated over its 2ᴰ corners. The values are read for every level of the
+# records, so that an estimate is checked against the whole discretisation however few of its levels are drawn.
+function _cell_colors(model::Model{D}, records, drawn, by) where {D}
+    values = Dict(zip((record.level for record in records), _cell_values(model, records, by)))
+    return Float64[values[level.id][c] for level in drawn for c in findall(level.keep) for _ in 1:(1<<D)]
 end
 
 # The ids of the levels to draw: every level's, or those `levels` names, each of which must be a level of the records.
@@ -451,8 +471,8 @@ function _record_array(arrays::Vector{Pair{String,AbstractVector}}, name::String
     return nothing
 end
 
-# The 2D drawing of the levels: one mesh of every drawn cell's quad, its vertex colours each cell's value repeated over
-# the cell's four corners, and the cell edges as line segments.
+# The 2D drawing of the levels: one mesh of every drawn cell's quad, whose vertex colours are each cell's value repeated
+# over its four corners (`_cell_colors`), and the cell edges as line segments.
 #
 # The faces are stacked in z, in level order: the `k`-th of `n` drawn levels lies at `z = k − n − 1`, so a later level
 # lies in front of an earlier one — a 2D axis draws what is nearer in z in front, and CairoMakie depth-sorts the
@@ -463,7 +483,7 @@ end
 # only the parts of its edges that no drawn cell of a later level lies over (`_visible_pieces`), and each edge once
 # (`_level_edges`). The edges keep a level's height plus `½` for the backends that do test depth.
 function _level_primitives(::Val{2}, drawn)
-    positions, colors, edges = Point3{Float64}[], Float64[], Point3{Float64}[]
+    positions, edges = Point3{Float64}[], Point3{Float64}[]
     faces = GeometryBasics.QuadFace{Int}[]
     lattices = map(_drawn_lattice, drawn)
     for (k, level) in pairs(drawn)
@@ -473,7 +493,6 @@ function _level_primitives(::Val{2}, drawn)
             offset = length(positions)
             append!(positions, (Point3{Float64}(x[1], x[2], z) for x in corners))
             push!(faces, GeometryBasics.QuadFace{Int}(offset + 1, offset + 2, offset + 3, offset + 4))
-            append!(colors, Iterators.repeated(level.values[c], 4))
         end
         later = lattices[(k+1):end]
         for (axis, at, a, b) in _level_edges(level), (s, t) in _visible_pieces([(a, b)], axis, at, later)
@@ -481,7 +500,7 @@ function _level_primitives(::Val{2}, drawn)
             append!(edges, (Point3{Float64}(x..., z + 0.5) for x in ends))
         end
     end
-    return GeometryBasics.Mesh(positions, faces), colors, edges
+    return GeometryBasics.Mesh(positions, faces), edges
 end
 
 # The edges of a level's drawn cells, each once, as `(axis, at, a, b)`: the edge runs along `axis` from `a` to `b` at
@@ -547,18 +566,17 @@ function _drawn_cell_at(lattice, x)
 end
 
 # The 1D drawing of the levels: every drawn cell a segment at the height of its level id, coloured by its value at both
-# ends, and a tick across each end of it, `_TICK` levels above and below.
+# ends (`_cell_colors`), and a tick across each end of it, `_TICK` levels above and below.
 function _level_primitives(::Val{1}, drawn)
-    segments, colors, ticks = Point2{Float64}[], Float64[], Point2{Float64}[]
+    segments, ticks = Point2{Float64}[], Point2{Float64}[]
     for level in drawn, c in findall(level.keep)
         a, b, y = level.grid.points[2c-1][1], level.grid.points[2c][1], level.id
         push!(segments, Point2{Float64}(a, y), Point2{Float64}(b, y))
-        append!(colors, (level.values[c], level.values[c]))
         for x in (a, b)
             push!(ticks, Point2{Float64}(x, y - _TICK), Point2{Float64}(x, y + _TICK))
         end
     end
-    return segments, colors, ticks
+    return segments, ticks
 end
 
 # The half height of a 1D level plot's cell-end ticks, in levels: well inside the unit spacing of the rows.
@@ -927,19 +945,26 @@ end
 
 # ── Quadrature cloud ──────────────────────────────────────────────────────────
 
-# The points of a quadrature plot and the value that colours each: every point of every covering-level signature, in
-# the records' order, at its position in 2D and at its position against its weight in 1D, coloured by its weight or by
-# the number of levels in its signature, which is the number of levels covering its region.
-function _quadrature_primitives(::Val{D}, records, by) where {D}
+# The points of a quadrature plot: every point of every covering-level signature, in the records' order, at its
+# position in 2D and at its position against its weight in 1D.
+function _cloud_positions(::Val{D}, records) where {D}
+    positions = Point2{Float64}[]
+    for (; grid) in records
+        _cloud_positions!(positions, Val(D), grid.points, _record_array(grid.point_data, "weight"))
+    end
+    return positions
+end
+
+# The value that colours each point of a quadrature plot, in the order of `_cloud_positions`: its weight, or the number
+# of levels in its signature, which is the number of levels covering its region.
+function _cloud_colors(records, by)
     by in (:weight, :cover_count) || throw(ArgumentError("by must be :weight or :cover_count; got $(repr(by))"))
-    positions, colors = Point2{Float64}[], Float64[]
+    colors = Float64[]
     for (; signature, grid) in records
         weights = _record_array(grid.point_data, "weight")
-        _cloud_positions!(positions, Val(D), grid.points, weights)
-        cover = Iterators.repeated(length(signature), length(weights))
-        append!(colors, by === :weight ? weights : cover)
+        append!(colors, by === :weight ? weights : Iterators.repeated(length(signature), length(weights)))
     end
-    return positions, colors
+    return colors
 end
 
 # The points of one cloud record, appended to `positions`: in 2D at their positions, in 1D at their positions against
