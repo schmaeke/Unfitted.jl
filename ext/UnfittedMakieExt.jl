@@ -348,11 +348,14 @@ function _field_label(p::FieldPlot, solution)
     return component isa Integer ? "$name[$component]" : name
 end
 
-# The aspect of a warped plot's `Axis3`: the drawn fields' domains to scale in `x` and `y`, the height two thirds of
-# their larger extent, as `Axis3`'s own default has it for a square.
+# The aspect of a warped plot's `Axis3`: the box that holds the drawn fields' domains to scale in `x` and `y`, the
+# height two thirds of its larger extent, as `Axis3`'s own default has it for a square. The box is taken axis by axis:
+# `maximum` and `minimum` over the corners would compare them as vectors, lexicographically.
 function _warped_aspect(model::Model, field)
     domains = [fld.space.domain for fld in _sampled_fields(model, field)]
-    widths = maximum(d -> d.upper, domains) - minimum(d -> d.lower, domains)
+    lower = reduce((a, b) -> min.(a, b), (d.lower for d in domains))
+    upper = reduce((a, b) -> max.(a, b), (d.upper for d in domains))
+    widths = upper - lower
     return (widths[1] / maximum(widths), widths[2] / maximum(widths), 2 / 3)
 end
 

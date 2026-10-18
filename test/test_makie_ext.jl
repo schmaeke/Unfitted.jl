@@ -570,6 +570,14 @@ end
           [Makie.Point3{Float64}(x..., -1) for grid in grids for x in grid.points]
     @test plt.sample_color[] == reduce(vcat, [_sampled(grid, "uh") for grid in grids])
     @test length(_GB.coordinates(fieldplot(s, coupled; field=:u2).plot.sample_geometry[])) == 4
+
+    # Warped, the domains [0, 1] × [0, 3] and [2, 3] × [0, 1] are drawn to scale in the box that holds both, [0, 3]²,
+    # whose extent is taken axis by axis — not from the corner that sorts last, (3, 1), which flattened the y axis.
+    tall = space(box((0.0, 0.0), (1.0, 3.0)); cells=1, order=1)
+    wide = space(box((2.0, 0.0), (3.0, 1.0)); cells=1, order=1)
+    t, w = field(:t, tall), field(:w, wide)
+    _, ax, _ = fieldplot(prepare(Problem((t, w); blocks=(mass_block(t), mass_block(w)))); warp=true)
+    @test ax.aspect[] == (1.0, 1.0, 2 / 3)
 end
 
 # ── Clipping and ∂Ω ───────────────────────────────────────────────────────────
