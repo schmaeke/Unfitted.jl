@@ -519,6 +519,13 @@ end
     @test length(coarse.points) < length(grid.points)
     _, ax, _ = fieldplot(_makie_vector_solution, _makie_vector; warp=true, component=2)
     @test ax.zlabel[] == "uh[2]"
+
+    # `warp` is settled with the axis, when the plot is created: a later value changes nothing drawn, either way.
+    flat = fieldplot(_makie_2d_solution, _makie_2d).plot
+    flat.warp = true
+    @test all(x -> x[3] == -1, _GB.coordinates(flat.sample_geometry[]))
+    plt.warp = false
+    @test _GB.coordinates(plt.sample_geometry[]) == warped(coarse)
 end
 
 @testset "fieldplot draws a 1D graph, one segment per sample cell" begin

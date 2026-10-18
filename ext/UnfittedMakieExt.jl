@@ -191,32 +191,35 @@ end
 
 function Makie.plot!(p::FieldPlot{<:Tuple{<:Union{Nothing,Solution},<:Model{D}}}) where {D}
     _check_dimension(Val(D), :fieldplot, :write_vtk)
+    # `warp` chose the axis the plot is drawn in, so it is read once, here, and a later value is ignored, as a later
+    # `categorical` is.
+    warp = p.warp[]
     # The sampling, the costly part, is a computation of its own, which neither `clip` nor `boundary` reaches, so that
     # toggling either redraws the samples without taking them again.
-    inputs = [:solution, :discretisation, :by, :component, :warp, :field, :subdivisions, :cut_depth]
-    map!(p.attributes, inputs, :samples) do solution, model, by, component, warp, field, subdivisions, cut_depth
+    inputs = [:solution, :discretisation, :by, :component, :field, :subdivisions, :cut_depth]
+    map!(p.attributes, inputs, :samples) do solution, model, by, component, field, subdivisions, cut_depth
         return _samples(solution, model, by, component, field, subdivisions, cut_depth, warp)
     end
     outputs = [:sample_geometry, :sample_color, :sample_edges, :sample_boundary]
-    map!(p.attributes, [:samples, :warp, :clip, :boundary], outputs) do samples, warp, clip, boundary
+    map!(p.attributes, [:samples, :clip, :boundary], outputs) do samples, clip, boundary
         return _field_primitives(Val(D), samples, _level_sets(samples, clip, boundary), warp, boundary)
     end
-    _draw_field!(p, Val(D))
+    _draw_field!(p, Val(D), warp)
     _draw_boundary!(p, :sample_boundary, Val(D))
     return p
 end
 
 # The children of a field plot: in 2D the coloured surface, first, and the region edges; in 1D the graph, in one colour.
-function _draw_field!(p::FieldPlot, ::Val{2})
+function _draw_field!(p::FieldPlot, ::Val{2}, warp::Bool)
     colormap = _colormap_node!(p, :sample_colormap, _resolved_by(p.by[], p.solution[]))
     # A warped surface is lit, so that its shape reads apart from its colour; a flat one is not, so that its colours are
     # the colour map's own.
     Makie.mesh!(p, Makie.shared_attributes(p, Makie.Mesh), p.sample_geometry; color=p.sample_color, colormap,
-                shading=p.warp[])
+                shading=warp)
     return Makie.linesegments!(p, Makie.shared_attributes(p, Makie.LineSegments), p.sample_edges; color=p.strokecolor,
                                linewidth=p.strokewidth)
 end
-function _draw_field!(p::FieldPlot, ::Val{1})
+function _draw_field!(p::FieldPlot, ::Val{1}, warp::Bool)
     Makie.linesegments!(p, Makie.shared_attributes(p, Makie.LineSegments), p.sample_geometry)
 end
 
