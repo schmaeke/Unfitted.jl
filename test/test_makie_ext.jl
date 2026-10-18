@@ -632,12 +632,22 @@ _makie_plane_1d = prepare(mass(space(box((0.0,), (1.0,)); cells=4, order=1,
     @test fieldplot(_makie_plane; by=linear, clip=true).plot.sample_geometry[] == mesh
     @test fieldplot(_makie_2d).plot.sample_geometry[] == fieldplot(_makie_2d; clip=false).plot.sample_geometry[]
 
-    # Toggling `clip` or `boundary` on a drawn plot redraws it from the samples it took, without sampling again.
+    # Toggling `clip` or `boundary` on a drawn plot redraws it from the samples it took, without sampling again, and
+    # redraws only what it changes.
     samples = plt.samples[]
     plt.clip = false
-    @test plt.sample_geometry[] == whole.sample_geometry[] && plt.samples[] === samples
+    surface = plt.sample_geometry[]
+    @test surface == whole.sample_geometry[] && plt.samples[] === samples
     plt.boundary = true
-    @test !isempty(plt.sample_boundary[]) && plt.samples[] === samples
+    @test !isempty(plt.sample_boundary[]) && plt.samples[] === samples && plt.sample_geometry[] === surface
+
+    # A model on the same levels without a PhysicalDomain is of the same type, and the plot draws it whole: the samples
+    # are of one type whether or not they carry a level set.
+    observed = Makie.Observable(_makie_plane)
+    plt = fieldplot(observed).plot
+    @test _mesh_area(plt.sample_geometry[]) ≈ 0.3 atol = 1.0e-14
+    observed[] = prepare(mass(space(box((0.0, 0.0), (1.0, 1.0)); cells=4, order=2)))
+    @test _mesh_area(plt.sample_geometry[]) ≈ 1
 end
 
 @testset "fieldplot's clipped area and ∂Ω converge at second order in cut_depth" begin
@@ -751,7 +761,7 @@ end
     # record's face-cyclic corner order, and its four edges once each, from the lower to the upper end, at z = −½.
     corners = SVector{2,Float64}[(0, 0), (1, 0), (1, 1), (0, 1)]
     grid = Unfitted.SampleGrid{2,Float64,2}(corners, Pair{String,AbstractVector}[], Pair{String,AbstractVector}[])
-    mesh, colors, edges = _MakieExt._level_primitives(Val(2), [(; level=1, grid, values=[7.0], keep=trues(1))])
+    mesh, colors, edges = _MakieExt._level_primitives(Val(2), [(; id=1, grid, values=[7.0], keep=trues(1))])
     @test _GB.coordinates(mesh) == [Makie.Point3{Float64}(x..., -1) for x in corners]
     @test colors == fill(7.0, 4)
     ends = ((1, 2), (4, 3), (1, 4), (2, 3))

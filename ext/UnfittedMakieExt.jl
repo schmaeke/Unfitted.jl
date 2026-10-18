@@ -194,23 +194,30 @@ function Makie.plot!(p::FieldPlot{<:Tuple{<:Union{Nothing,Solution},<:Model{D}}}
     # `warp` chose the axis the plot is drawn in, so it is read once, here, and a later value is ignored, as a later
     # `categorical` is.
     warp = p.warp[]
-    # The sampling, the costly part, is a computation of its own, which neither `clip` nor `boundary` reaches, so that
-    # toggling either redraws the samples without taking them again.
+    # The sampling, the costly part, is a computation of its own, and each child draws from the samples in one of its
+    # own, which reads only the attributes that child shows: toggling `clip` or `boundary` redraws without sampling
+    # again, and redraws only the children it changes.
     inputs = [:solution, :discretisation, :by, :component, :field, :subdivisions, :cut_depth]
     map!(p.attributes, inputs, :samples) do solution, model, by, component, field, subdivisions, cut_depth
-        return _samples(solution, model, by, component, field, subdivisions, cut_depth, warp)
-    end
-    outputs = [:sample_geometry, :sample_color, :sample_edges, :sample_boundary]
-    map!(p.attributes, [:samples, :clip, :boundary], outputs) do samples, clip, boundary
-        return _field_primitives(Val(D), samples, _level_sets(samples, clip, boundary), warp, boundary)
+        return _field_samples(solution, model, by, component, field, subdivisions, cut_depth, warp)
     end
     _draw_field!(p, Val(D), warp)
+    map!(p.attributes, [:samples, :boundary], :sample_boundary) do samples, boundary
+        return _field_boundary(Val(D), samples, boundary, warp)
+    end
     _draw_boundary!(p, :sample_boundary, Val(D))
     return p
 end
 
-# The children of a field plot: in 2D the coloured surface, first, and the region edges; in 1D the graph, in one colour.
+# The children of a field plot: in 2D the coloured surface, first, and the region edges, which a warped surface does not
+# draw; in 1D the graph, in one colour.
 function _draw_field!(p::FieldPlot, ::Val{2}, warp::Bool)
+    map!(p.attributes, [:samples, :clip], [:sample_geometry, :sample_color]) do samples, clip
+        return _surface(samples, clip, warp)
+    end
+    map!(p.attributes, [:samples, :clip], :sample_edges) do samples, clip
+        return warp ? Point3{Float64}[] : _region_edges(samples, clip)
+    end
     colormap = _colormap_node!(p, :sample_colormap, _resolved_by(p.by[], p.solution[]))
     # A warped surface is lit, so that its shape reads apart from its colour; a flat one is not, so that its colours are
     # the colour map's own.
@@ -219,8 +226,9 @@ function _draw_field!(p::FieldPlot, ::Val{2}, warp::Bool)
     return Makie.linesegments!(p, Makie.shared_attributes(p, Makie.LineSegments), p.sample_edges; color=p.strokecolor,
                                linewidth=p.strokewidth)
 end
-function _draw_field!(p::FieldPlot, ::Val{1}, warp::Bool)
-    Makie.linesegments!(p, Makie.shared_attributes(p, Makie.LineSegments), p.sample_geometry)
+function _draw_field!(p::FieldPlot, ::Val{1}, _)
+    map!(_graph, p.attributes, [:samples, :clip], :sample_geometry)
+    return Makie.linesegments!(p, Makie.shared_attributes(p, Makie.LineSegments), p.sample_geometry)
 end
 
 # The child that draws ∂Ω, the plot's attribute `name`, last, so that CairoMakie, painting children in order, puts it
@@ -370,7 +378,7 @@ Makie.extract_colormap(p::QuadraturePlot) = Makie.extract_colormap(only(c for c 
 
 # ── Level meshes ──────────────────────────────────────────────────────────────
 
-# The levels a level plot draws, in level order, each as `(; level, grid, values, keep)`: its id, its mesh record, the
+# The levels a level plot draws, in level order, each as `(; id, grid, values, keep)`: its id, its mesh record, the
 # value that colours each of its cells (`by`), and which of its cells are drawn — all of them with `inactive`, the
 # active ones otherwise. `levels` picks levels by id; the order they are drawn in is the levels' own, which is what
 # the stacking in 2D relies on.
@@ -378,11 +386,11 @@ function _drawn_levels(model::Model{D,T}, field, by, levels, inactive::Bool) whe
     records = _sample_levels(model; field)
     values = _cell_values(model, records, by)
     ids = _drawn_ids(records, levels)
-    drawn = @NamedTuple{level::Int, grid::SampleGrid{D,T,D}, values::Vector{Float64}, keep::BitVector}[]
+    drawn = @NamedTuple{id::Int, grid::SampleGrid{D,T,D}, values::Vector{Float64}, keep::BitVector}[]
     for (record, v) in zip(records, values)
         record.level in ids || continue
         keep = inactive ? trues(length(v)) : _cell_array(record.grid, :active) .== 1
-        push!(drawn, (; record.level, record.grid, values=v, keep))
+        push!(drawn, (; id=record.level, record.grid, values=v, keep))
     end
     return drawn
 end
@@ -529,7 +537,7 @@ end
 function _level_primitives(::Val{1}, drawn)
     segments, colors, ticks = Point2{Float64}[], Float64[], Point2{Float64}[]
     for level in drawn, c in findall(level.keep)
-        a, b, y = level.grid.points[2c-1][1], level.grid.points[2c][1], level.level
+        a, b, y = level.grid.points[2c-1][1], level.grid.points[2c][1], level.id
         push!(segments, Point2{Float64}(a, y), Point2{Float64}(b, y))
         append!(colors, (level.values[c], level.values[c]))
         for x in (a, b)
@@ -548,42 +556,45 @@ const _TICK = 0.2
 # of levels covering each region without one.
 _resolved_by(by, solution) = by === Makie.automatic ? (solution === nothing ? :cover_count : :uh) : by
 
-# The samples a field plot draws, one per sampled field, as `(; name, grid, values)`: the field's name, its record's
-# sample grid, and the plotted value at every point of it. `by` is handed to the sampler as the record's one
-# `point_data` entry, or as none for a built-in array, so the sampler checks, evaluates and refuses it as it does
-# `write_vtk`'s entries; the value is read back off the record and reduced to one number per point.
-# `subdivisions = automatic` resolves by what the plot draws (`_automatic_subdivisions`). A sample's type is the same
-# for every field of a model, which the plot's computed `samples` needs: Makie keeps the type of a computed value's
-# first result, and the records' own type follows the fields drawn.
-function _samples(solution, model::Model{D}, by, component, field, subdivisions, cut_depth, warp) where {D}
+# The samples a field plot draws, one per sampled field, as `(; name, grid, values, φ)`: the field's name, its record's
+# sample grid, the plotted value at every point of it, and the level set there — the record's `level_set` array, which
+# the sampler attaches for a field whose space carries a `PhysicalDomain` and for no other — or `nothing`. `by` is
+# handed to the sampler as the record's one `point_data` entry, or as none for a built-in array, so the sampler checks,
+# evaluates and refuses it as it does `write_vtk`'s entries; the value is read back off the record and reduced to one
+# number per point. `subdivisions = automatic` resolves by what the plot draws (`_automatic_subdivisions`).
+#
+# Collected into a vector of the samples' declared type, which is a model's whatever its fields and whether or not its
+# spaces are immersed: Makie keeps the type of a computed value's first result, and refuses a later one of another type.
+function _field_samples(solution, model::Model{D,T}, by, component, field, subdivisions, cut_depth, warp) where {D,T}
     request = _field_request(_resolved_by(by, solution), solution)
     _check_one_field_per_space(model, field)
     subdivisions = subdivisions === Makie.automatic ? _automatic_subdivisions(Val(D), warp) : subdivisions
-    return map(_sample_fields(solution, model; field, subdivisions, cut_depth, request.point_data)) do record
-        return (; name=record.field.name, record.grid, values=_plotted_values(record.grid, request, component))
+    samples = @NamedTuple{name::Symbol, grid::SampleGrid{D,T,D}, values::Vector{Float64},
+                          φ::Union{Nothing,Vector{Float64}}}[]
+    for (; field, grid) in _sample_fields(solution, model; field, subdivisions, cut_depth, request.point_data)
+        push!(samples, (; field.name, grid, values=_plotted_values(grid, request, component), φ=_level_set(grid)))
     end
+    return samples
 end
 
-# The level set at every point of each sample, and whether the sample's drawing is clipped to Ω, as `(; φ, clipped)`:
-# `φ` is the sample's `level_set` array, which the sampler attaches for a field whose space carries a `PhysicalDomain`
-# and for no other, or `nothing`. `clip = automatic` clips exactly the samples that have one; `true` clips every sample
-# and refuses one that has none, as `boundary = true` refuses a plot none of whose samples has one.
-function _level_sets(samples, clip, boundary::Bool)
-    if !(clip isa Bool || clip === Makie.automatic)
-        throw(ArgumentError("clip must be true, false or automatic; got $(repr(clip))"))
+# The level set a sample's drawing is cut at, or `nothing` to draw it whole: `clip = automatic` cuts every sample whose
+# field's space carries a `PhysicalDomain`, `true` every sample, refusing one without, and `false` none.
+function _clip_at(sample, clip)
+    clip === Makie.automatic && return sample.φ
+    clip isa Bool || throw(ArgumentError("clip must be true, false or automatic; got $(repr(clip))"))
+    if clip && sample.φ === nothing
+        throw(ArgumentError("clip = true cuts the plot at ∂Ω, and the space of the field $(sample.name) carries no " *
+                            "PhysicalDomain: pass clip = false, or automatic to clip only the fields that have one"))
     end
-    levels = map(samples) do sample
-        φ = _level_set(sample.grid)
-        clipped = clip === Makie.automatic ? φ !== nothing : clip
-        if clipped && φ === nothing
-            throw(ArgumentError("clip = true cuts the plot at ∂Ω, and the space of the field $(sample.name) carries " *
-                                "no PhysicalDomain: pass clip = false, or automatic to clip only the fields that " *
-                                "have one"))
-        end
-        return (; φ, clipped)
-    end
-    boundary && all(level -> level.φ === nothing, levels) && throw(_no_boundary(:fieldplot))
-    return levels
+    return clip ? sample.φ : nothing
+end
+
+# ∂Ω as a field plot draws it, with `boundary`, from its samples' level sets (`_boundary`): in 2D at the height of the
+# plotted value on a warped surface, and in front of the flat one. Refused when no sample has a level set to draw.
+function _field_boundary(::Val{D}, samples, boundary::Bool, warp::Bool) where {D}
+    boundary || return _boundary(Val(D), ())
+    any(sample -> sample.φ !== nothing, samples) || throw(_no_boundary(:fieldplot))
+    return _boundary(Val(D), ((s.grid, s.φ, warp ? s.values : _BOUNDARY_Z) for s in samples if s.φ !== nothing))
 end
 
 # A record's `level_set` point array, as floating-point numbers, or `nothing` for a record without one.
@@ -683,21 +694,16 @@ const _FLAT = -1.0
 # and behind `z = 0`, where a plot drawn into the same axis afterwards lands.
 const _BOUNDARY_Z = -0.25
 
-# The 2D drawing of a field: the triangles of its sample cells (`_surface!`), coloured by the plotted value at each
-# corner, at the height of the value with `warp` and flat at `_FLAT` without; the region edges (`_region_edges!`); and,
-# with `boundary`, ∂Ω (`_contour!`), on the surface. A record's cells own their corners, so a value that jumps between
-# cells, or between regions, is drawn as a jump rather than smeared across it. The region edges are drawn on the flat
-# surface only: a warped surface hides parts of its edges, which CairoMakie, painting the edges after the surface, would
-# draw anyway.
-function _field_primitives(::Val{2}, samples, levels, warp::Bool, boundary::Bool)
-    positions, colors, edges, contour = Point3{Float64}[], Float64[], Point3{Float64}[], Point3{Float64}[]
-    faces = GeometryBasics.TriangleFace{Int}[]
-    for ((; grid, values), level) in zip(samples, levels)
-        _surface!(positions, colors, faces, grid, values, level, warp)
-        warp || _region_edges!(edges, grid, level)
-        boundary && level.φ !== nothing && _contour!(contour, grid, level.φ, warp ? values : _BOUNDARY_Z)
+# The 2D surface of a field: the triangles of its samples' cells (`_surface!`), each sample cut where `clip` says
+# (`_clip_at`), coloured by the plotted value at each corner, at the height of the value with `warp` and flat at
+# `_FLAT` without. A record's cells own their corners, so a value that jumps between cells, or between regions, is drawn
+# as a jump rather than smeared across it.
+function _surface(samples, clip, warp::Bool)
+    positions, colors, faces = Point3{Float64}[], Float64[], GeometryBasics.TriangleFace{Int}[]
+    for sample in samples
+        _surface!(positions, colors, faces, sample.grid, sample.values, _clip_at(sample, clip), warp)
     end
-    return GeometryBasics.Mesh(positions, faces), colors, edges, contour
+    return GeometryBasics.Mesh(positions, faces), colors
 end
 
 # The triangles of a record's sample cells, appended to a mesh's `positions`, `colors` and `faces`. Each cell is split
@@ -708,15 +714,16 @@ end
 # sampled exactly was measured as the alternative and rejected: its four gradients meet at the centre, which reads as a
 # star at every cell, under the default colour map as well.
 #
-# A clipped record keeps of each triangle the part where the linear interpolant of φ at its corners is ≤ 0 — the whole
-# triangle, nothing, or a polygon of three or four vertices cut along the interpolant's zero line, which is fanned from
-# its first vertex (one pass of the clipper of I. E. Sutherland and G. W. Hodgman, "Reentrant polygon clipping",
-# Commun. ACM 17 (1974) 32–42, doi:10.1145/360767.360802, against one half-plane). A clip vertex takes the value and the
-# height interpolated linearly along its edge, which is what the renderer interpolates across the triangle, so a clipped
-# plot draws inside Ω exactly what an unclipped one does. A corner joins the mesh when a triangle first uses it, so a
-# cell outside Ω adds nothing — not even to the axis limits.
-function _surface!(positions, colors, faces, grid::SampleGrid{2}, v, level, warp::Bool)
-    index, φ = zeros(Int, length(grid.points)), level.φ
+# Cut at a level set `φ` — uncut when `φ = nothing` — a record keeps of each triangle the part where the linear
+# interpolant of φ at its corners is ≤ 0: the whole triangle, nothing, or a polygon of three or four vertices cut along
+# the interpolant's zero line, which is fanned from its first vertex (one pass of the clipper of I. E. Sutherland and
+# G. W. Hodgman, "Reentrant polygon clipping", Commun. ACM 17 (1974) 32–42, doi:10.1145/360767.360802, against one
+# half-plane). A clip vertex takes the value and the height interpolated linearly along its edge, which is what the
+# renderer interpolates across the triangle, so a clipped plot draws inside Ω exactly what an unclipped one does. A
+# corner joins the mesh when a triangle first uses it, so a cell outside Ω adds nothing — not even to the axis
+# limits.
+function _surface!(positions, colors, faces, grid::SampleGrid{2}, v, φ, warp::Bool)
+    index = zeros(Int, length(grid.points))
     function corner(k)
         if index[k] == 0
             push!(positions, Point3{Float64}(grid.points[k]..., warp ? v[k] : _FLAT))
@@ -733,7 +740,7 @@ function _surface!(positions, colors, faces, grid::SampleGrid{2}, v, level, warp
         return length(positions)
     end
     for c in 1:_cell_count(grid), triangle in _cell_triangles(c)
-        if !level.clipped || all(k -> φ[k] <= 0, triangle)
+        if φ === nothing || all(k -> φ[k] <= 0, triangle)
             push!(faces, GeometryBasics.TriangleFace{Int}(map(corner, triangle)...))
             continue
         end
@@ -771,13 +778,11 @@ function _crossing(points, φ, a::Int, b::Int)
 end
 _lerp(values, i::Int, j::Int, t) = values[i] + t * (values[j] - values[i])
 
-# The part of the segment between points `a` and `b` of `points` that a clipped drawing keeps, as its two ends, or
-# `nothing`: all of it unclipped or with φ ≤ 0 at both ends; none of it with φ > 0 at either end and no crossing; and
-# otherwise the part between the end where φ < 0 and the crossing.
-function _kept_piece(points, level, a::Int, b::Int)
-    level.clipped || return (points[a], points[b])
-    φ = level.φ
-    φ[a] <= 0 && φ[b] <= 0 && return (points[a], points[b])
+# The part of the segment between points `a` and `b` of `points` that a drawing cut at the level set `φ` keeps, as its
+# two ends, or `nothing`: all of it uncut (`φ = nothing`) or with φ ≤ 0 at both ends; none of it with φ > 0 at either
+# end and no crossing; and otherwise the part between the end where φ < 0 and the crossing.
+function _clipped_segment(points, φ, a::Int, b::Int)
+    (φ === nothing || φ[a] <= 0 && φ[b] <= 0) && return (points[a], points[b])
     _crosses(φ[a], φ[b]) || return nothing
     x = _lerp(points, _crossing(points, φ, a, b)...)
     return φ[a] < 0 ? (points[a], x) : (x, points[b])
@@ -821,31 +826,53 @@ function _roots!(roots, grid::SampleGrid{1}, φ)
     return roots
 end
 
-# The ∂Ω a level or a quadrature plot draws, sampled for the purpose: nothing without `boundary`; with it, ∂Ω on the
-# sample cells of each drawn space that carries a `PhysicalDomain`, sampled once through its first field
-# (`_fields_by_space`) at the sampler's defaults — `:degree`, `cut_depth = 3` — which a model needs no solution for:
-# in 2D the contour at `_BOUNDARY_Z`, in 1D the roots in order.
-function _model_boundary(::Val{D}, model::Model, field, boundary::Bool, plot::Symbol) where {D}
-    contour = D == 1 ? Float64[] : Point3{Float64}[]
-    boundary || return contour
-    immersed = [first(fields) for fields in _fields_by_space(model, field) if first(fields).space.physical !== nothing]
-    isempty(immersed) && throw(_no_boundary(plot))
-    for fld in immersed
-        grid = only(_sample_fields(nothing, model; field=fld)).grid
-        φ = _level_set(grid)
-        D == 1 ? _roots!(contour, grid, φ) : _contour!(contour, grid, φ, _BOUNDARY_Z)
+# ∂Ω on sample grids, from the level set `φ` at each grid's points, as `(grid, φ, heights)` triples: in 2D the segments
+# of its contour (`_contour!`) at `heights`, in 1D its roots (`_roots!`), in order and each once.
+function _boundary(::Val{2}, pieces)
+    contour = Point3{Float64}[]
+    for (grid, φ, heights) in pieces
+        _contour!(contour, grid, φ, heights)
     end
-    return D == 1 ? sort!(unique!(contour)) : contour
+    return contour
+end
+function _boundary(::Val{1}, pieces)
+    roots = Float64[]
+    for (grid, φ, _) in pieces
+        _roots!(roots, grid, φ)
+    end
+    return sort!(unique!(roots))
 end
 
-# The edges of the regions of a sample grid, appended to `edges` as segments half a unit in front of the flat surface:
-# of every sample cell, the edges that lie on the boundary of its region's box, and of those only what a clipped drawing
-# keeps of them (`_kept_piece`). A record lists a region's cells together (its `region_id` array does not decrease), so
-# each region is one run of cells and its box is the hull of their corners; a cell's corner coordinates are those of
-# its lattice box, so an edge on the region's box compares equal to it. Regions tile a field's subdomain without
-# overlapping, so a region edge crosses no cell, which is what lets the edges be drawn after the surface, in
-# CairoMakie's painting order, without covering any of it.
-function _region_edges!(edges, grid::SampleGrid{2}, level)
+# The ∂Ω a level or a quadrature plot draws, sampled for the purpose: nothing without `boundary`; with it, ∂Ω on the
+# sample cells of each drawn space that carries a `PhysicalDomain`, sampled once through its first field
+# (`_fields_by_space`) at the sampler's defaults — `:degree`, `cut_depth = 3` — which a model needs no solution for,
+# and in 2D at `_BOUNDARY_Z`.
+function _model_boundary(::Val{D}, model::Model, field, boundary::Bool, plot::Symbol) where {D}
+    boundary || return _boundary(Val(D), ())
+    immersed = [first(fields) for fields in _fields_by_space(model, field) if first(fields).space.physical !== nothing]
+    isempty(immersed) && throw(_no_boundary(plot))
+    grids = (only(_sample_fields(nothing, model; field=fld)).grid for fld in immersed)
+    return _boundary(Val(D), ((grid, _level_set(grid), _BOUNDARY_Z) for grid in grids))
+end
+
+# The edges of the regions of a field's samples, as segments half a unit in front of the flat surface, each sample cut
+# where `clip` says (`_clip_at`).
+function _region_edges(samples, clip)
+    edges = Point3{Float64}[]
+    for sample in samples
+        _region_edges!(edges, sample.grid, _clip_at(sample, clip))
+    end
+    return edges
+end
+
+# The edges of the regions of a sample grid, appended to `edges`: of every sample cell, the edges that lie on the
+# boundary of its region's box, and of those only what a drawing cut at the level set `φ` keeps (`_clipped_segment`). A
+# record lists a region's cells together (its `region_id` array does not decrease), so each region is one run of cells
+# and its box is the hull of their corners; a cell's corner coordinates are those of its lattice box, so an edge on the
+# region's box compares equal to it. Regions tile a field's subdomain without overlapping, so a region edge crosses no
+# cell, which is what lets the edges be drawn after the surface, in CairoMakie's painting order, without covering any
+# of it.
+function _region_edges!(edges, grid::SampleGrid{2}, φ)
     regions, z = last(grid.cell_data[findfirst(entry -> first(entry) == "region_id", grid.cell_data)]), _FLAT + 0.5
     p, run = grid.points, 1
     while run <= length(regions)
@@ -856,7 +883,7 @@ function _region_edges!(edges, grid::SampleGrid{2}, level)
             ll, lr, ur, ul = 4c - 3, 4c - 2, 4c - 1, 4c
             for (a, b, on) in ((ll, lr, p[ll][2] == lo[2]), (ul, ur, p[ul][2] == hi[2]), (ll, ul, p[ll][1] == lo[1]),
                                (lr, ur, p[lr][1] == hi[1]))
-                piece = on ? _kept_piece(p, level, a, b) : nothing
+                piece = on ? _clipped_segment(p, φ, a, b) : nothing
                 piece === nothing || push!(edges, Point3{Float64}(piece[1]..., z), Point3{Float64}(piece[2]..., z))
             end
         end
@@ -866,20 +893,20 @@ function _region_edges!(edges, grid::SampleGrid{2}, level)
 end
 
 # The 1D drawing of a field: its graph over every sample cell, a segment between the values at the cell's two ends —
-# the cell's own two points, so a value that jumps between cells is drawn as a jump — and of a clipped record only the
-# part where φ's linear interpolant is ≤ 0, cut at its root with the value interpolated there; with `boundary`, the
-# roots, in order. The graph takes the plot's one `color`; the value it would colour by is the height already.
-function _field_primitives(::Val{1}, samples, levels, warp::Bool, boundary::Bool)
-    segments, roots = Point2{Float64}[], Float64[]
-    for ((; grid, values), level) in zip(samples, levels)
-        graph = [SVector(x[1], values[k]) for (k, x) in pairs(grid.points)]
+# the cell's own two points, so a value that jumps between cells is drawn as a jump — and of a sample cut where `clip`
+# says (`_clip_at`) only the part where φ's linear interpolant is ≤ 0, cut at its root with the value interpolated
+# there. The graph takes the plot's one `color`; the value it would colour by is the height already.
+function _graph(samples, clip)
+    segments = Point2{Float64}[]
+    for sample in samples
+        (; grid, values) = sample
+        φ, graph = _clip_at(sample, clip), [SVector(x[1], values[k]) for (k, x) in pairs(grid.points)]
         for c in 1:_cell_count(grid)
-            piece = _kept_piece(graph, level, 2c - 1, 2c)
+            piece = _clipped_segment(graph, φ, 2c - 1, 2c)
             piece === nothing || push!(segments, Point2{Float64}(piece[1]...), Point2{Float64}(piece[2]...))
         end
-        boundary && level.φ !== nothing && _roots!(roots, grid, level.φ)
     end
-    return segments, Float64[], Point2{Float64}[], sort!(unique!(roots))
+    return segments
 end
 
 # ── Quadrature cloud ──────────────────────────────────────────────────────────
