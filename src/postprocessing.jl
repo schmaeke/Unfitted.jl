@@ -52,16 +52,16 @@
 #   * `_sample_quadrature(model)` — one `(; signature, grid::SampleGrid{D,T,0})` per sorted covering-level signature, in
 #     sorted order, with the point array `weight`.
 #
-# A plotting extension would read the same records. With Makie, a 2D grid `g` coloured by its first point array, and
-# a quadrature-cloud entry `e` coloured by its weights, are
+# A consumer reads a record as it is, without permuting or re-deriving anything. A plotting front end on Makie, for
+# one, draws a 2D grid `g` coloured by its first point array, and a quadrature-cloud entry `e` coloured by its weights,
+# as
 #
 #     faces = [QuadFace(4c - 3, 4c - 2, 4c - 1, 4c) for c in 1:_cell_count(g)]
-#     mesh(Point.(g.points), faces; color=last(g.point_data[1]))
-#     scatter(Point.(e.grid.points); color=last(only(e.grid.point_data)))
+#     mesh(GeometryBasics.Mesh(Point2.(g.points), faces); color=last(g.point_data[1]))
+#     scatter(Point2.(e.grid.points); color=last(only(e.grid.point_data)))
 #
-# Its public functions would be declared and documented in `stubs.jl`, as the VTK writer's are, each a fallback
-# method whose body is `_extension_missing`, so that a call made without the plotting package loaded says which package
-# to load.
+# the quads wrapped in a `GeometryBasics.Mesh`, which Makie's `mesh` triangulates, where it refuses a bare list of quad
+# faces. Such a consumer's public functions are declared and documented in `stubs.jl`, as the VTK writer's are.
 
 # ── Sample records ────────────────────────────────────────────────────────────
 
