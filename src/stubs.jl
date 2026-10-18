@@ -450,39 +450,9 @@ leaf's disambiguating name is **ASCII** — the field *index* `i` for `data_<i>`
 ParaView's Extract Block (whose data-assembly node names keep only ASCII identifier characters) resolves each leaf on
 its own even when the field names themselves are Unicode (`θ₁`, `θ₂`).
 
-Keyword arguments:
+$(_SAMPLING_KEYWORDS_DOC)
+The writer's own keywords:
 
-  - `field` — restrict the output to a single [`Field`](@ref) (or its name `Symbol`); defaults to every field of the
-    model.
-  - `subdivisions` — per-region subdivision count, sized to resolve the *solution*. `:degree` (default) uses each
-    region's parent polynomial order; `:none` keeps one cell per region; a positive integer uses an isotropic count; an
-    `NTuple{D,Int}` uses explicit per-axis counts.
-  - `cut_depth` — extra bisections applied to the sub-cells that `∂Ω` passes through, sized to resolve the *geometry*.
-    `3` by default, `:none` to disable, or an integer in `0:8`. Only regions crossed by the boundary are refined, and a
-    model without a [`PhysicalDomain`](@ref) is untouched, so the cost is that of the boundary rather than of the
-    volume: in 3D the leaf count grows as `8ᵏ` under `subdivisions` but only as `4ᵏ` under `cut_depth`. See "Resolving
-    the immersed boundary" below.
-  - `point_data` — `NamedTuple` / `Dict` / `Tuple` of `name => callback` pairs. Each callback is invoked at every vertex
-    sample as `f(u, context, x, xi)` and returns a real number, a tuple of real numbers or an `SVector` of real numbers,
-    of one shape at every sample. A tuple is written as the `SVector` of its components. The values of one entry are
-    promoted to a common element type, which must be one VTK stores — `Float32`, `Float64` or an integer of at most 64
-    bits — or `Bool`, which VTK has no type for and is written as `UInt8` 0 / 1. A two-component value is written as a
-    three-component VTK vector with a trailing zero. An entry is refused with an `ArgumentError` naming it, and nothing
-    is written, when a value has none of these shapes (a `Vector`, a matrix, a `String`, a `Complex`), when its shapes
-    differ between samples, or when its values promote to a type VTK does not store (a `Rational`, a `BigFloat`); a
-    `Rational` among `Float64` values promotes to `Float64` and is accepted. Each callback is called exactly once per
-    sample, but in an unspecified order — across the samples and across the entries — so a callback should compute its
-    value from its arguments and not count or record its calls. `u(context, xi[, field])` evaluates the current solution
-    at the sample, given the `context` and `xi` the callback received: the block's own field by default, or another
-    `field` on the same subdomain, which must be the model's field of that name, with its component count, as for
-    [`value`](@ref); a `Field` with another count raises an `ArgumentError`. A field on another subdomain of a coupled
-    model raises an `ArgumentError` too; evaluate it with [`value`](@ref)`(solution, model, field, x)` instead. `x` is
-    the physical coordinate and `xi.region` the same point in the region's reference frame; `context` carries `location`
-    (`:point`, or `:cell` for a `cell_data` sample), `region_id`, the `region` box, the emitted `cell` box, the covering
-    `parents` — each with the `parent_box` a callback needs to map `x` into a cell's own frame — and the `model_version`
-    the samples were taken from. Defaults to a single `uh` entry that emits the current solution value.
-  - `cell_data` — same shape as `point_data` but evaluated at per-cell sample points (the subbox center). Defaults to no
-    user-defined cell data; the bundle always includes `region_id` and `cover_count` as built-in cell arrays.
   - `level_meshes` — emit one solid-cell `.vtu` per level when `true` (default), each cell carrying per-cell `active` /
     `covered` / `active_dofs` / `reduced_dofs` data.
   - `ascii` / `append` / `compress` — pass-through to `WriteVTK`'s `vtk_grid` constructor, with its own defaults:
@@ -491,10 +461,11 @@ Keyword arguments:
     write time — and it costs the reader nothing, since ParaView decompresses transparently. Turn it off together with
     `ascii = true, append = false` when a test or a diff needs the arrays as parsable text.
 
-For models whose [`Space`](@ref) carries a [`PhysicalDomain`](@ref), the per-vertex level-set values `φ(x)` are
-automatically attached as a built-in `level_set` point array — convenient for visualising `∂Ω` as a zero-level
-isocontour or for filtering cut / full / fictitious regions in ParaView. Pass a `level_set` entry in `point_data` to
-override or rename it.
+VTK stores a value in one of its own number types, so the values of a `point_data` or `cell_data` entry must also
+promote to `Float32`, `Float64` or an integer of at most 64 bits — or to `Bool`, which VTK has no type for and which is
+written as `UInt8` 0 / 1. An entry whose values promote to another real type (a `Rational`, a `BigFloat`) is refused
+with an `ArgumentError` naming it, and nothing is written; a `Rational` among `Float64` values promotes to `Float64` and
+is accepted. A vector value is written as a VTK vector, a two-component one with a trailing zero as its third.
 
 Returns the path of every file written: the `.vtm` first, then the datasets in block order. The bundle is built in
 memory and written, its directory included, only once it is complete: a call that fails — on a keyword it refuses, or in
@@ -503,35 +474,7 @@ a callback that throws — leaves nothing on disk.
 Requires `using WriteVTK`, which loads the package extension the VTK writers live in. A call made without it raises an
 error that says so, and writes nothing.
 
-## Resolving the immersed boundary
-
-ParaView reconstructs `∂Ω` from the `level_set` array by interpolating it linearly along each cell's edges, so the
-surface a Clip draws is a facetisation at the size of the emitted cell — neither `φ`'s own accuracy nor the solution
-order improves it. Resolving `∂Ω` therefore means emitting small cells where it runs, which is what `cut_depth` does and
-what `subdivisions` cannot: raising `subdivisions` refines every region uniformly, at `2^(D·k)` cells, while `cut_depth`
-refines only the sub-cells the boundary crosses, at `2^((D−1)·k)`. Measured on a 3D 5×5×5 order-2 sphere with 81
-regions: 5 723 cells against 41 472 at 8 sub-cells per axis across `∂Ω`, and 95 891 against 2 654 208 at 32.
-
-A sub-cell is refined when `|φ(c)| ≤ L·r`, with `c` its center, `r` its half-diagonal, and `L` the largest Lipschitz
-constant declared by any leaf of the geometry. That is the exact negation of the uniform-sign certificate the cell
-classifier uses, so an unrefined sub-cell provably holds one sign of `φ` throughout, contributes no cut surface, and
-cannot disagree with a finer neighbour across a shared face. Every refined sub-cell bottoms out at the same depth, so
-the cut cells of one region carry identical corner coordinates where they meet and their facets join exactly: the
-clipped surface is watertight within a region, and across regions whose finest cells coincide on their shared face. Two
-adjacent cut regions whose finest cells differ in size — regions of different extent, or subdivided at different counts
-— meet in T-junctions instead, where the facets of the two sides need not join, and the clipped surface can show a
-crack there about as wide as its own facetisation error.
-
-When **no** leaf declares a constant — `leaf(f)` defaults to `lipschitz = Inf` — no such certificate exists and
-refinement falls back to the corner signs of `φ`, the same evidence ParaView's own clip works from. A feature of `Ω`
-smaller than a sub-cell and missing every corner is then invisible, and the first such write of a session warns so;
-`leaf(f; lipschitz = L)` (`1.0` for a signed distance function) restores the guarantee.
-
-Two limits are worth stating plainly. The clip surface is piecewise planar per cell at every depth, so `cut_depth` buys
-a finer staircase rather than a smooth surface. And at a CSG crease — an edge or corner where two leaves meet —
-`levelset_value` is only `C⁰`, so the clip converges there at first order in the sub-cell size against second order on a
-smooth face; an `∩`-corner stays comparatively more faceted at any given depth.
-
+$(_IMMERSED_BOUNDARY_DOC)
 To write a *sequence* of these bundles as one animation — a moving overlay, an adaptive ladder, a time-dependent
 solution — open a [`vtk_series`](@ref) and call this function with it in place of a path.
 """

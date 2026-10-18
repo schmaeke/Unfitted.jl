@@ -39,7 +39,7 @@
 # samples one thing, and a consumer combines the ones it shows:
 #
 #   * `_sample_fields(solution, model; field, subdivisions, cut_depth, point_data, cell_data)`, whose keywords mean
-#     what `write_vtk` documents — one `(; field, data)` per sampled field, in problem order.
+#     what `_SAMPLING_KEYWORDS_DOC` documents — one `(; field, data)` per sampled field, in problem order.
 #     `data::SampleGrid{D,T,D}` covers the integration regions of the field's space, each region its `subdivisions`
 #     lattice with the boxes ∂Ω crosses cut-refined; its point arrays are the user's `point_data` entries in their
 #     order, then `level_set` (with a `PhysicalDomain`, unless an entry already has that name); its cell arrays are
@@ -105,6 +105,83 @@ function _box_corners(b::AxisBox{D}) where {D}
     return ntuple(j -> v[xor(j - 1, ((j - 1) >> 1) & 1)+1], Val(2^D))
 end
 
+# ── The sampling keywords, as a user reads them ───────────────────────────────
+#
+# The keywords of `_sample_fields` are the keywords of every public entry point that samples a solution, and each of
+# those documents them in full. These two texts are that documentation, spliced into each such docstring
+# (`$(_SAMPLING_KEYWORDS_DOC)`), so that the entry points read alike and cannot drift apart: the keywords, and the
+# section on the immersed boundary their `cut_depth` refers to, which therefore comes after them in every docstring.
+# What a consumer adds on top — keywords of its own, what its format can or cannot hold — its docstring states around
+# them. Written for that reader: no consumer is named except as an example, and nothing here is a promise about one.
+
+const _SAMPLING_KEYWORDS_DOC = """
+Sampling keywords, shared by every entry point that samples a solution:
+
+  - `field` — sample a single [`Field`](@ref), or the one its name `Symbol` names; defaults to every field of the model.
+  - `subdivisions` — per-region subdivision count, sized to resolve the *solution*. `:degree` (default) uses each
+    region's parent polynomial order; `:none` keeps one cell per region; a positive integer uses an isotropic count; an
+    `NTuple{D,Int}` uses explicit per-axis counts.
+  - `cut_depth` — extra bisections applied to the sub-cells that `∂Ω` passes through, sized to resolve the *geometry*.
+    `3` by default, `:none` to disable, or an integer in `0:8`. Only regions crossed by the boundary are refined, and a
+    model without a [`PhysicalDomain`](@ref) is untouched, so the cost is that of the boundary rather than of the
+    volume: in 3D the leaf count grows as `8ᵏ` under `subdivisions` but only as `4ᵏ` under `cut_depth`. See "Resolving
+    the immersed boundary" below.
+  - `point_data` — `NamedTuple` / `Dict` / `Tuple` of `name => callback` pairs. Each callback is invoked at every vertex
+    sample as `f(u, context, x, xi)` and returns a real number, a tuple of real numbers or an `SVector` of real numbers,
+    of one shape at every sample. A tuple is taken as the `SVector` of its components, and the values of one entry are
+    promoted to a common element type. An entry is refused with an `ArgumentError` naming it, and nothing is output,
+    when a value has none of these shapes (a `Vector`, a matrix, a `String`, a `Complex`) or when its shapes differ
+    between samples. Each callback is called exactly once per sample, but in an unspecified order — across the samples
+    and across the entries — so a callback should compute its value from its arguments and not count or record its
+    calls. `u(context, xi[, field])` evaluates the current solution at the sample, given the `context` and `xi` the
+    callback received: the sampled field by default, or another `field` on the same subdomain, which must be the
+    model's field of that name, with its component count, as for [`value`](@ref); a `Field` with another count raises
+    an `ArgumentError`. A field on another subdomain of a coupled model raises an `ArgumentError` too; evaluate it with
+    [`value`](@ref)`(solution, model, field, x)` instead. `x` is the physical coordinate and `xi.region` the same point
+    in the region's reference frame; `context` carries `location` (`:point`, or `:cell` for a `cell_data` sample),
+    `region_id`, the `region` box, the emitted `cell` box, the covering `parents` — each with the `parent_box` a
+    callback needs to map `x` into a cell's own frame — and the `model_version` the samples were taken from. Defaults
+    to a single `uh` entry that emits the current solution value.
+  - `cell_data` — same shape as `point_data` but evaluated at per-cell sample points (the sub-cell center). Defaults to
+    no user-defined cell data; `region_id` and `cover_count` are always included as built-in cell arrays.
+"""
+
+const _IMMERSED_BOUNDARY_DOC = """
+## Resolving the immersed boundary
+
+For models whose [`Space`](@ref) carries a [`PhysicalDomain`](@ref), the level-set values `φ(x)` are attached at every
+vertex as a built-in `level_set` point array — to draw `∂Ω` as the zero-level contour, or to tell cut, full and
+fictitious regions apart. Pass a `level_set` entry in `point_data` to override it.
+
+A contour or a clip reconstructs `∂Ω` from that array by interpolating it linearly along each cell's edges — ParaView's
+Clip does — so the surface it draws is a facetisation at the size of the sampled cell: neither `φ`'s own accuracy nor
+the solution order improves it. Resolving `∂Ω` therefore means emitting small cells where it runs, which is what
+`cut_depth` does and what `subdivisions` cannot: raising `subdivisions` refines every region uniformly, at `2^(D·k)`
+cells, while `cut_depth` refines only the sub-cells the boundary crosses, at `2^((D−1)·k)`. Measured on a 3D 5×5×5
+order-2 sphere with 81 regions: 5 723 cells against 41 472 at 8 sub-cells per axis across `∂Ω`, and 95 891 against
+2 654 208 at 32.
+
+A sub-cell is refined when `|φ(c)| ≤ L·r`, with `c` its center, `r` its half-diagonal, and `L` the largest Lipschitz
+constant declared by any leaf of the geometry. That is the exact negation of the uniform-sign certificate the cell
+classifier uses, so an unrefined sub-cell provably holds one sign of `φ` throughout, contributes no cut surface, and
+cannot disagree with a finer neighbour across a shared face. Every refined sub-cell bottoms out at the same depth, so
+the cut cells of one region carry identical corner coordinates where they meet and their facets join exactly: the
+clipped surface is watertight within a region, and across regions whose finest cells coincide on their shared face. Two
+adjacent cut regions whose finest cells differ in size — regions of different extent, or subdivided at different counts
+— meet in T-junctions instead, where the facets of the two sides need not join, and the clipped surface can show a
+crack there about as wide as its own facetisation error.
+
+When **no** leaf declares a constant — `leaf(f)` defaults to `lipschitz = Inf` — no such certificate exists and
+refinement falls back to the corner signs of `φ`, the same evidence ParaView's own clip works from. A feature of `Ω`
+smaller than a sub-cell and missing every corner is then invisible, and the first such sampling of a session warns so;
+`leaf(f; lipschitz = L)` (`1.0` for a signed distance function) restores the guarantee.
+
+Two limits are worth stating plainly. The clip surface is piecewise planar per cell at every depth, so `cut_depth` buys
+a finer staircase rather than a smooth surface. And at a CSG crease — an edge or corner where two leaves meet —
+`levelset_value` is only `C⁰`, so the clip converges there at first order in the sub-cell size against second order on a
+smooth face; an `∩`-corner stays comparatively more faceted at any given depth.
+"""
+
 # ── Field sampling ────────────────────────────────────────────────────────────
 
 # The records of a solution's data: one `(; field, data)` per sampled field, in output order — every field in problem
@@ -112,9 +189,9 @@ end
 # levels are records of their own (`_sample_levels`).
 #
 # The one entry of the field sampling and its one keyword surface: a consumer passes every keyword it does not consume
-# on to this function, and the keywords mean what `write_vtk` documents. The keywords, the solution's pin and the
-# entries' containers are checked before anything is sampled, a callback's values as they are collected, and nothing
-# touches the file system. One workspace and one `FormState` serve every field: the fields are sampled one after
+# on to this function, and the keywords mean what `_SAMPLING_KEYWORDS_DOC` documents. The keywords, the solution's pin
+# and the entries' containers are checked before anything is sampled, a callback's values as they are collected, and
+# nothing touches the file system. One workspace and one `FormState` serve every field: the fields are sampled one after
 # another, and each field's accessor frames the regions it reads on its own (`_sample_accessor`).
 #
 # `solution = nothing` samples a discretisation that has not been solved: its regions, their sample cells and the

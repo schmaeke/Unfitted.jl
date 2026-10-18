@@ -246,6 +246,12 @@ end
     # docstrings sit on abstract signatures that no method of the core implements, so pin that they reached the docs.
     @test haskey(meta[Base.Docs.Binding(Unfitted, :write_vtk)].docs, Tuple{VTKSeries,Any,Any,Any})
     @test haskey(meta[Base.Docs.Binding(Base, :close)].docs, Tuple{VTKSeries})
+    # `write_vtk` documents its sampling keywords, and the immersed-boundary section their `cut_depth` refers to, with
+    # the texts every entry point that samples a solution splices into its docstring whole, the keywords first.
+    keywords, boundary = Unfitted._SAMPLING_KEYWORDS_DOC, Unfitted._IMMERSED_BOUNDARY_DOC
+    text = only(filter(t -> occursin(keywords, t),
+                       [join(doc.text) for doc in values(meta[Base.Docs.Binding(Unfitted, :write_vtk)].docs)]))
+    @test occursin(boundary, text) && first(findfirst(keywords, text)) < first(findfirst(boundary, text))
     # So are the tensor readers' `Val` and `Field` forms: one docstring per signature the Tensors extension implements.
     ndocs(name) = length(meta[Base.Docs.Binding(Unfitted, name)].docs)
     @test (ndocs(:symmetric_gradient), ndocs(:value_vec), ndocs(:gradient_tensor)) == (3, 2, 2)
