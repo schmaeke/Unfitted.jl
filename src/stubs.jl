@@ -820,22 +820,25 @@ function quadratureplot! end
 
 # ── The fallback and the hint every entry point shares ────────────────────────
 
-# The remedy for a call made without `package`'s extension, as the fallback and the hint both state it. Makie is the
-# exception to `using` the package: drawing needs a backend, and every backend loads Makie, so the remedy names one.
-function _how_to_load(package::String)
-    package == "Makie" && return "run `using CairoMakie`, or another Makie backend, to load it"
-    return "run `using $package` to load it"
+# What a call to the entry point `f` needs to work while `package`'s extension is not loaded, as the fallback raises it
+# and the hint prints it: the package to load. `nothing` once the extension, `Unfitted<package>Ext` — the name every
+# extension of this package carries, after the package that loads it — is loaded, when the call failed for another
+# reason and loading anything would not help. Makie is the exception to `using` the package: drawing needs a backend,
+# and every backend loads Makie, so the remedy names one.
+function _extension_remedy(f, package::String)
+    Base.get_extension(@__MODULE__, Symbol(:Unfitted, package, :Ext)) === nothing || return nothing
+    load = package == "Makie" ? "`using CairoMakie`, or another Makie backend," : "`using $package`"
+    return "$(nameof(f)) is provided by Unfitted's $package extension: run $load to load it"
 end
 
 # The body of an extension stub's fallback method `f(args...; kwargs...)`: what a call no method of `f` accepts raises.
-# While the package extension `Unfitted<package>Ext` — the name every extension of this package carries, after the
-# package that loads it — is not loaded, the error names that package, which is the remedy, and it is raised before the
-# call has touched anything. Once the extension is loaded the call simply matched none of its methods, and the ordinary
-# `MethodError` says so (without the keyword arguments, which it does not carry) rather than asking the user to load
-# what is loaded. Generic in the package, so every extension's entry points share it.
+# While the extension is not loaded, the error is the remedy, raised before the call has touched anything. Once it is
+# loaded the call simply matched none of its methods, and the ordinary `MethodError` says so (without the keyword
+# arguments, which it does not carry) rather than asking the user to load what is loaded. Generic in the package, so
+# every extension's entry points share it.
 function _extension_missing(f, args, package::String)
-    Base.get_extension(@__MODULE__, Symbol(:Unfitted, package, :Ext)) === nothing &&
-        error("$(nameof(f)) is provided by Unfitted's $package extension: $(_how_to_load(package))")
+    remedy = _extension_remedy(f, package)
+    remedy === nothing || error(remedy)
     throw(MethodError(f, args))
 end
 
@@ -845,16 +848,13 @@ const _METHODLESS_ENTRY_POINTS = (fieldplot => "Makie", fieldplot! => "Makie", l
                                   levelplot! => "Makie", quadratureplot => "Makie", quadratureplot! => "Makie")
 
 # The error hint `__init__` (in `Unfitted.jl`) registers for `MethodError`: for a call to a methodless entry point made
-# while its extension is not loaded, the line that names the package to load, as `_extension_missing` names it for a
+# while its extension is not loaded, the line that names the package to load, as `_extension_missing` raises it for a
 # fallback. It says nothing about any other `MethodError`, nor once the extension is loaded, when the call failed for
-# another reason. A call with keyword arguments fails as a call of `Core.kwcall`, whose second argument is the function
-# that was called, so that is the function looked up.
+# another reason.
 function _extension_hint(io::IO, err::MethodError, _, _)
-    f = err.f === Core.kwcall && length(err.args) >= 2 ? err.args[2] : err.f
-    i = findfirst(entry -> first(entry) === f, _METHODLESS_ENTRY_POINTS)
+    i = findfirst(entry -> first(entry) === err.f, _METHODLESS_ENTRY_POINTS)
     i === nothing && return nothing
-    package = last(_METHODLESS_ENTRY_POINTS[i])
-    Base.get_extension(@__MODULE__, Symbol(:Unfitted, package, :Ext)) === nothing || return nothing
-    print(io, "\n", nameof(f), " is provided by Unfitted's ", package, " extension: ", _how_to_load(package))
+    remedy = _extension_remedy(err.f, last(_METHODLESS_ENTRY_POINTS[i]))
+    remedy === nothing || print(io, "\n", remedy)
     return nothing
 end
