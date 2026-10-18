@@ -438,22 +438,22 @@ _pin_2d = _pin_model(overlay(space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 1), or
 @testset "records: a sampled field's data grid" begin
     phi_disk, model, sol = _cut_depth_disk_model()
     width = (u, c, x, xi) -> c.cell.upper[1] - c.cell.lower[1]
-    (; field, data) = only(Unfitted._sample_fields(sol, model; subdivisions=2, cut_depth=1, cell_data=(width=width,)))
-    n = Unfitted._cell_count(data)
+    (; field, grid) = only(Unfitted._sample_fields(sol, model; subdivisions=2, cut_depth=1, cell_data=(width=width,)))
+    n = Unfitted._cell_count(grid)
     @test n > 16                                             # four regions, a 2 × 2 lattice each, and the cut leaves
-    @test length(data.points) == n << 2
+    @test length(grid.points) == n << 2
     # Every cell's corners are the face-cyclic permutation (1, 2, 4, 3) of the `_box_vertices` of the box they span.
     @test all(1:n) do c
-        corners = data.points[(4c-3):(4c)]
+        corners = grid.points[(4c-3):(4c)]
         return corners == collect(Unfitted._box_vertices(corners[1], corners[3]))[[1, 2, 4, 3]]
     end
-    @test first.(data.point_data) == ["uh", "level_set"]
-    @test first.(data.cell_data) == ["region_id", "cover_count", "width"]
-    @test all(length(last(entry)) == length(data.points) for entry in data.point_data)
-    @test all(length(last(entry)) == n for entry in data.cell_data)
-    @test _record_array(data, "level_set") == [levelset_value(field.space.physical, x) for x in data.points]
-    @test issorted(_record_array(data, "region_id"))
-    @test _record_array(data, "width") == [data.points[4c - 2][1] - data.points[4c - 3][1] for c in 1:n]
+    @test first.(grid.point_data) == ["uh", "level_set"]
+    @test first.(grid.cell_data) == ["region_id", "cover_count", "width"]
+    @test all(length(last(entry)) == length(grid.points) for entry in grid.point_data)
+    @test all(length(last(entry)) == n for entry in grid.cell_data)
+    @test _record_array(grid, "level_set") == [levelset_value(field.space.physical, x) for x in grid.points]
+    @test issorted(_record_array(grid, "region_id"))
+    @test _record_array(grid, "width") == [grid.points[4c - 2][1] - grid.points[4c - 3][1] for c in 1:n]
 end
 
 @testset "records: a level's mesh" begin
@@ -481,7 +481,7 @@ end
     sol = solution(model, [sin(i) for i in 1:active_unknowns(model)])
     records = Unfitted._sample_fields(sol, model; subdivisions=:none, point_data=NamedTuple())
     @test [r.field.name for r in records] == [:a, :b]
-    @test all(r -> isempty(r.data.point_data), records)
+    @test all(r -> isempty(r.grid.point_data), records)
     meshes = Unfitted._sample_levels(model)
     @test [(m.field.name, m.level) for m in meshes] == [(:a, 1)]
     @test _record_array(only(meshes).grid, "active_dofs") == fill(1, 4)
@@ -496,7 +496,7 @@ end
     # by the base level alone, the right one by the base and the overlay.
     (; model) = _pin_2d
     cloud = Unfitted._sample_quadrature(model)
-    @test [entry.signature for entry in cloud] == [[1], [1, 2]]
+    @test [record.signature for record in cloud] == [[1], [1, 2]]
     regions = Unfitted.integration_plans(model)[1].regions
     for (; signature, grid) in cloud
         @test Unfitted._cell_count(grid) == length(grid.points)
@@ -504,7 +504,7 @@ end
         measure = sum(Unfitted._region_measure(r) for r in regions if sort([p.level for p in r.parents]) == signature)
         @test sum(last(only(grid.point_data))) ≈ measure rtol = 1.0e-13
     end
-    @test sum(entry -> length(entry.grid.points), cloud) == nquadpoints(model)
+    @test sum(record -> length(record.grid.points), cloud) == nquadpoints(model)
 end
 
 @testset "records: a discretisation is sampled without a solution" begin
@@ -514,11 +514,11 @@ end
     # remedy rather than handed zeros.
     _, model, sol = _cut_depth_disk_model()
     keywords = (subdivisions=2, cut_depth=1)
-    solved = only(Unfitted._sample_fields(sol, model; keywords...)).data
-    bare = only(Unfitted._sample_fields(nothing, model; keywords...)).data
+    solved = only(Unfitted._sample_fields(sol, model; keywords...)).grid
+    bare = only(Unfitted._sample_fields(nothing, model; keywords...)).grid
     @test first.(bare.point_data) == ["level_set"]
     @test _record_contents(bare) == (solved.points, solved.point_data[2:end], solved.cell_data)
-    plain = only(Unfitted._sample_fields(nothing, model; point_data=(x1=(u, c, x, xi) -> x[1],))).data
+    plain = only(Unfitted._sample_fields(nothing, model; point_data=(x1=(u, c, x, xi) -> x[1],))).grid
     @test _record_array(plain, "x1") == first.(plain.points)
     err = try
         Unfitted._sample_fields(nothing, model; point_data=(uh=(u, c, x, xi) -> u(c, xi),))
@@ -572,10 +572,10 @@ end
     solution = Solution([sin(3i) for i in 1:n], model.version, Unfitted.SolverDiagnostics(:manual, 0.0, true))
     point_data = (own=(u, c, x, xi) -> u(c, xi) - value(solution, model, a, x),
                   other=(u, c, x, xi) -> u(c, xi, b) - value(solution, model, b, x))
-    data = only(Unfitted._sample_fields(solution, model; field=:a, subdivisions=2, point_data)).data
-    @test length(data.points) > 50
-    @test maximum(abs, _record_array(data, "own")) ≤ 1.0e-12
-    @test maximum(abs, _record_array(data, "other")) ≤ 1.0e-12
+    grid = only(Unfitted._sample_fields(solution, model; field=:a, subdivisions=2, point_data)).grid
+    @test length(grid.points) > 50
+    @test maximum(abs, _record_array(grid, "own")) ≤ 1.0e-12
+    @test maximum(abs, _record_array(grid, "other")) ≤ 1.0e-12
 end
 
 @testset "a sampling callback reads a field only with the model's component count" begin
@@ -603,10 +603,10 @@ end
     end
     point_data = (a=(u, c, x, xi) -> maximum(abs, u(c, xi, a) - value(solution, model, a, x)),
                   w=(u, c, x, xi) -> maximum(abs, u(c, xi, w) - value(solution, model, w, x)))
-    data = only(Unfitted._sample_fields(solution, model; field=:a, subdivisions=:none, point_data)).data
-    @test length(data.points) == 4
-    @test maximum(_record_array(data, "a")) ≤ 1.0e-12
-    @test maximum(_record_array(data, "w")) ≤ 1.0e-12
+    grid = only(Unfitted._sample_fields(solution, model; field=:a, subdivisions=:none, point_data)).grid
+    @test length(grid.points) == 4
+    @test maximum(_record_array(grid, "a")) ≤ 1.0e-12
+    @test maximum(_record_array(grid, "w")) ≤ 1.0e-12
 end
 
 @testset "a level mesh holds every cell of its level, active or not" begin
@@ -659,9 +659,9 @@ end
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
-    data = only(Unfitted._sample_fields(solution, model; subdivisions=:none)).data
-    @test first.(data.point_data) == ["uh", "level_set"]
-    @test _record_array(data, "level_set") ≈ phi_disk.(data.points) atol = 1.0e-14
+    grid = only(Unfitted._sample_fields(solution, model; subdivisions=:none)).grid
+    @test first.(grid.point_data) == ["uh", "level_set"]
+    @test _record_array(grid, "level_set") ≈ phi_disk.(grid.points) atol = 1.0e-14
 end
 
 @testset "the data grid carries no level_set without a PhysicalDomain" begin
@@ -670,8 +670,8 @@ end
     solution = Solution(ones(Unfitted.active_unknowns(model.dofs)), model.version,
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
-    data = only(Unfitted._sample_fields(solution, model; subdivisions=:none)).data
-    @test first.(data.point_data) == ["uh"]
+    grid = only(Unfitted._sample_fields(solution, model; subdivisions=:none)).grid
+    @test first.(grid.point_data) == ["uh"]
 end
 
 @testset "a user-supplied level_set entry replaces the built-in one" begin
@@ -686,9 +686,9 @@ end
                         Unfitted.SolverDiagnostics(:manual, 0.0, true))
 
     point_data = (level_set=(u, c, x, xi) -> 42.0, uh=(u, c, x, xi) -> u(c, xi))
-    data = only(Unfitted._sample_fields(solution, model; subdivisions=:none, point_data)).data
-    @test first.(data.point_data) == ["level_set", "uh"]
-    @test all(==(42.0), _record_array(data, "level_set"))
+    grid = only(Unfitted._sample_fields(solution, model; subdivisions=:none, point_data)).grid
+    @test first.(grid.point_data) == ["level_set", "uh"]
+    @test all(==(42.0), _record_array(grid, "level_set"))
 end
 
 @testset "cut_depth bisects only the sub-cells ∂Ω passes through" begin
@@ -697,8 +697,8 @@ end
     # the boundary.
     _, model, solution = _cut_depth_disk_model()
     for (depth, cells) in ((0, 4), (1, 16), (2, 52), (3, 160))
-        data = only(Unfitted._sample_fields(solution, model; subdivisions=:none, cut_depth=depth)).data
-        widths = _cell_extents(data)
+        grid = only(Unfitted._sample_fields(solution, model; subdivisions=:none, cut_depth=depth)).grid
+        widths = _cell_extents(grid)
         @test length(widths) == cells
 
         # The crack invariant, stated executably: every cell a clip will cut sits at the finest level, so two of them
@@ -706,7 +706,7 @@ end
         # survive only where φ has one sign, and those contribute no cut surface at all — which is why no 2:1 balance
         # pass is needed.
         finest = 0.5 / 2^depth
-        mixed = _mixed_cells(data)
+        mixed = _mixed_cells(grid)
         @test !isempty(mixed)
         @test all(w -> w ≈ finest, widths[mixed])
         # Every width is a power-of-two fraction of the 0.5 base box, and the finest level is always reached. The
@@ -721,19 +721,19 @@ end
     # The refinement must not interpolate φ: every point, including the ones the tree introduced, carries
     # `levelset_value` evaluated there.
     _, model, solution = _cut_depth_disk_model()
-    (; field, data) = only(Unfitted._sample_fields(solution, model; subdivisions=:none, cut_depth=2))
-    @test _record_array(data, "level_set") == [levelset_value(field.space.physical, x) for x in data.points]
+    (; field, grid) = only(Unfitted._sample_fields(solution, model; subdivisions=:none, cut_depth=2))
+    @test _record_array(grid, "level_set") == [levelset_value(field.space.physical, x) for x in grid.points]
 end
 
 @testset "cut_depth hands cell callbacks the refined leaf" begin
     # `context.cell` must be the box actually emitted, not the `subdivisions` box it was carved from — the subtlest
     # plumbing error the refinement can introduce, and invisible in the geometry.
     _, model, solution = _cut_depth_disk_model()
-    data = only(Unfitted._sample_fields(solution, model; subdivisions=:none, cut_depth=2,
-                                        cell_data=(w=(u, c, x, xi) -> c.cell.upper[1] - c.cell.lower[1],))).data
-    w = _record_array(data, "w")
+    grid = only(Unfitted._sample_fields(solution, model; subdivisions=:none, cut_depth=2,
+                                        cell_data=(w=(u, c, x, xi) -> c.cell.upper[1] - c.cell.lower[1],))).grid
+    w = _record_array(grid, "w")
     @test sort(unique(round.(w; digits=12))) == [0.125, 0.25]
-    @test w ≈ _cell_extents(data)
+    @test w ≈ _cell_extents(grid)
 end
 
 @testset "cut_depth spares full and fictitious regions" begin
@@ -756,9 +756,9 @@ end
     uncut = Set(i for (i, k) in pairs(kinds) if k === :full || k === :fictitious_alpha)
     @test !isempty(uncut)
 
-    data = only(Unfitted._sample_fields(solution, model; subdivisions=:none, cut_depth=2)).data
-    widths = _cell_extents(data)
-    region_ids = _record_array(data, "region_id")
+    grid = only(Unfitted._sample_fields(solution, model; subdivisions=:none, cut_depth=2)).grid
+    widths = _cell_extents(grid)
+    region_ids = _record_array(grid, "region_id")
 
     # Every cell belonging to an uncut region is still a whole base box, and each such region contributes exactly the
     # one cell it did before: 44 uncut regions, 44 unrefined cells, every one of them 1/8 wide.
@@ -774,11 +774,11 @@ end
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=(2, 2), order=1)
     model = prepare(poisson(V; source=0.0, dirichlet=[dirichlet(1.0; on=boundary(:all))]))
     solution = solve!(model)
-    plain(depth) = only(Unfitted._sample_fields(solution, model; subdivisions=2, cut_depth=depth)).data
+    plain(depth) = only(Unfitted._sample_fields(solution, model; subdivisions=2, cut_depth=depth)).grid
     @test allequal(_record_contents(plain(depth)) for depth in (:none, 0, 3))
 
     _, fcm_model, fcm_solution = _cut_depth_disk_model()
-    fcm(depth) = only(Unfitted._sample_fields(fcm_solution, fcm_model; subdivisions=:none, cut_depth=depth)).data
+    fcm(depth) = only(Unfitted._sample_fields(fcm_solution, fcm_model; subdivisions=:none, cut_depth=depth)).grid
     @test _record_contents(fcm(:none)) == _record_contents(fcm(0))
 end
 
@@ -794,19 +794,19 @@ end
 @testset "pin: :degree subdivides each region at its parents' per-axis maximum order" begin
     # The left region (one parent, order (1, 2)) is cut 1 × 2; the right one (orders (3, 1) and (1, 3)) 3 × 3.
     (; model, sol) = _pin_2d
-    data = only(Unfitted._sample_fields(sol, model)).data
-    covers = _record_array(data, "cover_count")
-    @test Unfitted._cell_count(data) == 11
+    grid = only(Unfitted._sample_fields(sol, model)).grid
+    covers = _record_array(grid, "cover_count")
+    @test Unfitted._cell_count(grid) == 11
     @test count(==(1), covers) == 2
     @test count(==(2), covers) == 9
 end
 
 @testset "pin: subdivisions as an NTuple sets the per-axis counts" begin
     (; model, sol) = _pin_2d
-    data = only(Unfitted._sample_fields(sol, model; subdivisions=(2, 3))).data
-    @test Unfitted._cell_count(data) == 12             # two regions, 2 × 3 each
-    @test all(==(0.25), _cell_extents(data, 1))
-    @test all(h -> h ≈ 1 / 3, _cell_extents(data, 2))
+    grid = only(Unfitted._sample_fields(sol, model; subdivisions=(2, 3))).grid
+    @test Unfitted._cell_count(grid) == 12             # two regions, 2 × 3 each
+    @test all(==(0.25), _cell_extents(grid, 1))
+    @test all(h -> h ≈ 1 / 3, _cell_extents(grid, 2))
 end
 
 @testset "pin: point_data and cell_data as a Dict or a tuple of Pairs" begin
@@ -818,10 +818,10 @@ end
     spellings = (named=((uh=uh, tilt=tilt), (width=width,)),
                  dict=(Dict("uh" => uh, :tilt => tilt), Dict(:width => width)),
                  pairs=((:uh => uh, "tilt" => tilt), ("width" => width,)))
-    data = map(((point_data, cell_data),) -> only(Unfitted._sample_fields(sol, model; point_data, cell_data)).data,
-               spellings)
+    grids = map(((point_data, cell_data),) -> only(Unfitted._sample_fields(sol, model; point_data, cell_data)).grid,
+                spellings)
     for label in (:dict, :pairs), name in ("uh", "tilt", "width")
-        @test _record_array(data[label], name) == _record_array(data.named, name)
+        @test _record_array(grids[label], name) == _record_array(grids.named, name)
     end
 end
 
@@ -836,12 +836,12 @@ end
               single=(u, c, x, xi) -> Float32(x[1]), flag=(u, c, x, xi) -> x[1] > 0.5)
     sampled = (pair=SVector{2,Float64}, mixed_tuple=SVector{3,Float64}, vector=SVector{3,Float64},
                int_vector=SVector{3,Int}, mixed=Float64, int=Int, single=Float32, flag=Bool)
-    data = only(Unfitted._sample_fields(sol, model; subdivisions=:none, point_data=shapes)).data
+    grid = only(Unfitted._sample_fields(sol, model; subdivisions=:none, point_data=shapes)).grid
     for (name, type) in pairs(sampled)
-        @test eltype(_record_array(data, String(name))) === type
+        @test eltype(_record_array(grid, String(name))) === type
     end
-    @test _record_array(data, "pair") == data.points
-    @test _record_array(data, "mixed") == [fill(1.0, 4); fill(0.5, 4)]
+    @test _record_array(grid, "pair") == grid.points
+    @test _record_array(grid, "mixed") == [fill(1.0, 4); fill(0.5, 4)]
 end
 
 @testset "SVector callback values are promoted over every sample" begin
@@ -854,12 +854,12 @@ end
     first_single = (u, c, x, xi) -> c.region_id == 1 ? SVector(0.5f0, 0.25f0) : SVector(x[1] / 3, x[2] / 3)
     for (f, region_one, other) in
         ((first_single, (0.5, 0.25), x -> (x[1] / 3, x[2] / 3)), (first_int, (1.0, 2.0), x -> (x[1], x[2] / 3)))
-        data = only(Unfitted._sample_fields(sol, model; subdivisions=:none, point_data=(v=f,))).data
-        v = _record_array(data, "v")
+        grid = only(Unfitted._sample_fields(sol, model; subdivisions=:none, point_data=(v=f,))).grid
+        v = _record_array(grid, "v")
         @test eltype(v) === SVector{2,Float64}
         # Every value exactly what the callback returned.
-        regions = _record_array(data, "region_id")
-        @test v == [SVector(regions[(k - 1) ÷ 4 + 1] == 1 ? region_one : other(x)) for (k, x) in pairs(data.points)]
+        regions = _record_array(grid, "region_id")
+        @test v == [SVector(regions[(k - 1) ÷ 4 + 1] == 1 ? region_one : other(x)) for (k, x) in pairs(grid.points)]
     end
 end
 
@@ -890,6 +890,6 @@ end
         @test occursin("a real number, a tuple of reals or an SVector of reals", message)
     end
     third = (third=(u, c, x, xi) -> 1 // 3,)
-    @test eltype(_record_array(only(Unfitted._sample_fields(sol, model; point_data=third)).data, "third")) ===
+    @test eltype(_record_array(only(Unfitted._sample_fields(sol, model; point_data=third)).grid, "third")) ===
           Rational{Int}
 end

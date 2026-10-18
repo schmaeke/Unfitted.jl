@@ -40,8 +40,8 @@
 #
 #   * `_sample_fields(solution, model; field, subdivisions, cut_depth, point_data, cell_data)`, whose keywords mean
 #     what the texts below document (`_SAMPLING_KEYWORDS_DOC`, and `_SAMPLING_CALLBACK_DOC` for the entries'
-#     callbacks) — one `(; field, data)` per sampled field, in problem order.
-#     `data::SampleGrid{D,T,D}` covers the integration regions of the field's space, each region its `subdivisions`
+#     callbacks) — one `(; field, grid)` per sampled field, in problem order.
+#     `grid::SampleGrid{D,T,D}` covers the integration regions of the field's space, each region its `subdivisions`
 #     lattice with the boxes ∂Ω crosses cut-refined; its point arrays are the user's `point_data` entries in their
 #     order, then `level_set` (with a `PhysicalDomain`, unless an entry already has that name); its cell arrays are
 #     `region_id` and `cover_count`, then the user's `cell_data` entries. `solution = nothing` samples the
@@ -192,8 +192,8 @@ smooth face; an `∩`-corner stays comparatively more faceted at any given depth
 
 # ── Field sampling ────────────────────────────────────────────────────────────
 
-# The records of a solution's data: one `(; field, data)` per sampled field, in output order — every field in problem
-# order, or the one `field` names — with `data` the field's sample grid (`_sample_field`). The meshes of the fields'
+# The records of a solution's data: one `(; field, grid)` per sampled field, in output order — every field in problem
+# order, or the one `field` names — with `grid` the field's sample grid (`_sample_field`). The meshes of the fields'
 # levels are records of their own (`_sample_levels`).
 #
 # The one entry of the field sampling and its one keyword surface: a consumer passes every keyword it does not consume
@@ -223,12 +223,12 @@ function _sample_fields(solution::Union{Nothing,Solution}, model::Model{D,T}; fi
     rule = _subdivision_rule(subdivisions, Val(D))
     ws, state = coefficients === nothing ? (nothing, nothing) :
                 (_assembly_workspace(model), FormState(model.dofs, coefficients))
-    records = @NamedTuple{field::Field, data::SampleGrid{D,T,D}}[]
+    records = @NamedTuple{field::Field, grid::SampleGrid{D,T,D}}[]
     for fld in fields
         space = _field_space(model.problem, fld.name)
         regions = _region_list(model, nothing, space).regions     # the list assembly integrates the field over
-        data = _sample_field(ws, state, space, regions, fld, rule, depth, entries, model.version)
-        push!(records, (; field=fld, data))
+        grid = _sample_field(ws, state, space, regions, fld, rule, depth, entries, model.version)
+        push!(records, (; field=fld, grid))
     end
     return records
 end
@@ -616,18 +616,18 @@ end
 
 # The model's quadrature-point cloud as records: one `(; signature, grid)` per distinct sorted list of covering parent
 # levels, in sorted order, over the regions of every subdomain's integration plan. Level ids are unique across
-# subdomains, so a coupled model's subdomains land in different entries and every one of them is kept. A grid is a
+# subdomains, so a coupled model's subdomains land in different records and every one of them is kept. A grid is a
 # vertex cloud (`K = 0`) of the physical quadrature points, each with its physical weight `weight` (the rule weight
 # times the region's Jacobian, as assembly integrates with it), region by region — subdomain order, then plan order —
 # and point by point. Both arrays are presized from the regions' point counts rather than grown point by point. Not
-# `_quadrature_cloud` (`data.jl`), the bare coordinates in `q.point` order that the RBFP0 transfer indexes. The entries
-# are collected into a vector of their concrete type by an explicit loop, as `_sample_fields` collects its records.
+# `_quadrature_cloud` (`data.jl`), the bare coordinates in `q.point` order that the RBFP0 transfer indexes. The records
+# are collected into a vector of their concrete type by an explicit loop, as `_sample_fields` collects its own.
 function _sample_quadrature(model::Model{D,T}) where {D,T}
     groups = Dict{Vector{Int},Vector{VolumeRegion{D,T}}}()
     for subdomain in model.subdomains, region in subdomain.plan.regions
         push!(get!(() -> VolumeRegion{D,T}[], groups, sort!([p.level for p in region.parents])), region)
     end
-    entries = @NamedTuple{signature::Vector{Int}, grid::SampleGrid{D,T,0}}[]
+    records = @NamedTuple{signature::Vector{Int}, grid::SampleGrid{D,T,0}}[]
     for signature in sort!(collect(keys(groups)))
         regions, n = groups[signature], 0
         for region in regions               # not `sum(f, regions)`, whose reducer chain compiles for every region type
@@ -644,9 +644,9 @@ function _sample_quadrature(model::Model{D,T}) where {D,T}
         end
         grid = SampleGrid{D,T,0}(points, Pair{String,AbstractVector}["weight" => weights],
                                  Pair{String,AbstractVector}[])
-        push!(entries, (; signature, grid))
+        push!(records, (; signature, grid))
     end
-    return entries
+    return records
 end
 
 # ── Solution evaluation ───────────────────────────────────────────────────────

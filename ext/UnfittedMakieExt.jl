@@ -554,7 +554,7 @@ function _samples(solution, model::Model{D}, by, component, field, subdivisions,
     _check_one_field_per_space(model, field)
     subdivisions = subdivisions === Makie.automatic ? _automatic_subdivisions(Val(D), warp) : subdivisions
     return map(_sample_fields(solution, model; field, subdivisions, cut_depth, request.point_data)) do record
-        return (; name=record.field.name, grid=record.data, values=_plotted_values(record.data, request, component))
+        return (; name=record.field.name, record.grid, values=_plotted_values(record.grid, request, component))
     end
 end
 
@@ -826,10 +826,10 @@ function _model_boundary(::Val{D}, model::Model, field, boundary::Bool, plot::Sy
     for record in _sample_fields(nothing, model; field, point_data=NamedTuple())
         any(s -> s === record.field.space, spaces) && continue
         push!(spaces, record.field.space)
-        φ = _level_set(record.data)
+        φ = _level_set(record.grid)
         φ === nothing && continue
         found = true
-        D == 1 ? _roots!(contour, record.data, φ) : _contour!(contour, record.data, φ, _BOUNDARY_Z)
+        D == 1 ? _roots!(contour, record.grid, φ) : _contour!(contour, record.grid, φ, _BOUNDARY_Z)
     end
     found || throw(_no_boundary(plot))
     return D == 1 ? sort!(unique!(contour)) : contour
@@ -884,10 +884,10 @@ end
 # The points of a quadrature plot and the value that colours each: every point of every covering-level signature, in
 # the records' order, at its position in 2D and at its position against its weight in 1D, coloured by its weight or by
 # the number of levels in its signature, which is the number of levels covering its region.
-function _quadrature_primitives(::Val{D}, entries, by) where {D}
+function _quadrature_primitives(::Val{D}, records, by) where {D}
     by in (:weight, :cover_count) || throw(ArgumentError("by must be :weight or :cover_count; got $(repr(by))"))
     positions, colors = Point2{Float64}[], Float64[]
-    for (; signature, grid) in entries
+    for (; signature, grid) in records
         weights = last(only(grid.point_data))
         for (x, w) in zip(grid.points, weights)
             push!(positions, D == 1 ? Point2{Float64}(x[1], w) : Point2{Float64}(x[1], x[2]))

@@ -98,9 +98,9 @@ function Unfitted.write_quadrature_vtm(path::AbstractString, model::Model{D}) wh
     # As for `write_vtk`: the cloud is in memory and every dataset added before the directory is made and the bundle
     # saved, so a call that fails leaves nothing on disk.
     vtm = vtk_multiblock(base * ".vtm")
-    for entry in _sample_quadrature(model)
-        suffix = isempty(entry.signature) ? "none" : join(entry.signature, "_")
-        _add_dataset!(vtm, base, "levels_" * suffix, "quadrature_levels_" * suffix, entry.grid)
+    for record in _sample_quadrature(model)
+        suffix = isempty(record.signature) ? "none" : join(record.signature, "_")
+        _add_dataset!(vtm, base, "levels_" * suffix, "quadrature_levels_" * suffix, record.grid)
     end
     mkpath(dirname(base))
     return vtk_save(vtm)
@@ -141,7 +141,7 @@ function _vtk_multiblock(base::AbstractString, solution::Solution, model::Model{
     for (i, record) in enumerate(records)
         block = multiblock_add_block(vtm, string(record.field.name))
         leaf = length(records) == 1 ? "data" : "data_$i"
-        _add_dataset!(block, base, leaf, leaf, record.data; ascii, append, compress)
+        _add_dataset!(block, base, leaf, leaf, record.grid; ascii, append, compress)
         meshes === nothing && continue
         for mesh in meshes
             mesh.field.name === record.field.name || continue

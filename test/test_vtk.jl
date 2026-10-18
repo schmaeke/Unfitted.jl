@@ -318,7 +318,7 @@ _pin_3d = _pin_model(space(box((0.5, -1.0, 2.0), (1.5, 0.25, 4.0)); cells=1, ord
                 point_data=(uh=(u, c, x, xi) -> u(c, xi), xy=(u, c, x, xi) -> (x[1], x[2])))
     dir = mktempdir()
     write_vtk(joinpath(dir, "rec"), solution, model; keywords..., _pin_ascii...)
-    records = ("rec_data.vtu" => only(Unfitted._sample_fields(solution, model; keywords...)).data,
+    records = ("rec_data.vtu" => only(Unfitted._sample_fields(solution, model; keywords...)).grid,
                "rec_level_1_base_mesh.vtu" => only(Unfitted._sample_levels(model)).grid)
     for (file, grid) in records
         xml = read(joinpath(dir, file), String)
