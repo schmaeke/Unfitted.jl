@@ -1652,9 +1652,10 @@ end
     #    the analytic 1 − π r₀². The rule on the slice reaches it to 5.9e-8 — never exactly, the boundary being curved,
     #    which is why no docstring here promises exactness. The figure tracks the implicit kernel: it was 3.0e-5 before
     #    the kernel kept its height axes clear of folds (`_FOLD_CLEARANCE`), since a closed disc inside one cell puts a
-    #    fold of every axis close to the sub-boxes it bisects into. Hence the band below, which is deliberately loose
-    #    enough to survive such a change without being loose enough to miss a trim that stopped trimming: the analytic
-    #    value it is anchored against does not move, and the assertion beside it holds the error *away* from zero.
+    #    fold of every axis close to the sub-boxes it bisects into. Hence the band below, the t = T face's 1e-6, which
+    #    is deliberately loose enough to survive such a change — seventeen times the error — and four orders of
+    #    magnitude short of missing a trim that stopped trimming (π r₀² = 5.9e-2): the analytic value it is anchored
+    #    against does not move, and the assertion beside it holds the error *away* from zero.
     #
     #    And it is insensitive to the geometric-robustness knobs: `_choose_axis` declares the sliced sub-boxes
     #    graph-like and stops bisecting, so driving `subcell_length_scale` from 1/12 to 1/192 (effective depth 2 → 6) or
@@ -1668,7 +1669,7 @@ end
             space(box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)); cells=(3, 3, 3), order=(2, 2, 3), physical=dom)
         end
     initial = measure(slab(1 / 12, 8), [(3, :lower)])
-    @test initial ≈ 1 - π * r₀^2 atol = 2.0e-7
+    @test initial ≈ 1 - π * r₀^2 atol = 1.0e-6
     @test abs(initial - (1 - π * r₀^2)) > 1.0e-9          # accurate, not exact
     @test measure(slab(1 / 192, 8), [(3, :lower)]) == initial
     @test measure(slab(1 / 12, 2), [(3, :lower)]) == initial

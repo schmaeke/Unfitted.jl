@@ -39,8 +39,8 @@
 #   graph-like over R (linear leaves ⇒ machine precision, including polytope corners), and spectrally accurate for
 #   smooth curved boundaries away from turning points.
 #
-#   In the finite-cell moment-fit pipeline (`src/fcm.jl`) the volume rule plays two roles: the moments mₐ = ∫_{Ω∩R} ψₐ
-#   dx are recovered as Σₖ wₖ ψₐ(xₖ), and the points xₖ double as the non-negative moment-fit candidate cloud.
+#   In the finite-cell pipeline (`src/fcm.jl`) the volume rule is the default cut rule, `implicit_rule`: the moments
+#   mₐ = ∫_{Ω∩R} ψₐ dx are recovered from it as Σₖ wₖ ψₐ(xₖ), and the compression keeps a subset of its points xₖ.
 #
 # Method in one paragraph
 #
@@ -127,8 +127,10 @@ Arguments:
   - `grad`: optional gradient operator `(g, x) -> SVector` overriding the `ForwardDiff` default; pass `_fd_gradient`
     from this file for non-AD callbacks. The finite-cell path never sets it, so this keyword is reachable only by
     calling the kernel directly.
-  - `max_subdiv`: subdivision-depth budget for non-graph-like cells. Beyond it the kernel force-reduces (the region
-    stays correct; order degrades only at the unresolved feature).
+  - `max_subdiv`: subdivision-depth budget for cells with no graph-like axis — along every axis some leaf's
+    derivative changes sign, or comes close to zero, a fold where the height function turns back on itself and the
+    base rule converges only algebraically. Beyond it the kernel force-reduces (the region stays correct; order
+    degrades only at the unresolved feature).
   - `lipschitz`: optional Lipschitz constants `Lᵢ` of the leaves (`|fᵢ(x) − fᵢ(y)| ≤ Lᵢ‖x − y‖`) — a vector matching
     `leaves` in the multi-component form, a scalar in the single-`phi` form, and `nothing` (default) to opt out. `1.0`
     is the constant of a true signed-distance function. See the sampling note below for what supplying it certifies.
@@ -482,56 +484,56 @@ end
 # choice at the subdivision floor, where a steep leaf still counts as a single root. Returns `(k, usable, classes)`:
 # `usable` says that every leaf is monotone or flat along `k`, and `classes` holds every leaf's class along it.
 #
-# A leaf that looks steep along some axis has its samples tested for curvature (`_planar`) before the choice is made,
-# and a sample at which the leaf is planar is left out of its fold clearance (`_axis_class`). Only a leaf that looks
-# steep pays for the test, so a choice in which none does costs what it always did.
+# A leaf that looks steep along some axis with every sample counting has its samples tested for curvature (`_planar`)
+# before the choice is made, and a sample at which the leaf is planar is left out of its fold clearance (`_axis_class`).
+# Only a leaf that looks steep pays for the test, so a choice in which none does costs what it always did.
 function _choose_axis(lsets, U::AxisBox{D}, ctx::_QuadCtx) where {D}
     samples = (center(U), _box_vertices(U)...)
     grads = [map(x -> _gradient(ctx, g, x, U), samples) for g in lsets]
+    tols = [_zero_tol(gs, ctx.flat_tol) for gs in grads]
     planar = [map(_ -> false, samples) for _ in lsets]
     for (i, g) in pairs(lsets)
-        _looks_steep(grads[i], ctx.flat_tol, Val(D)) || continue
+        any(k -> first(_axis_class(grads[i], planar[i], k, tols[i])) === :steep, 1:D) || continue
         planar[i] = map((x, ∇) -> _planar(ctx, g, x, ∇, U), samples, grads[i])
     end
-    return _choose_axis(grads, planar, ctx.flat_tol, Val(D))::Tuple{Int,Bool,Vector{Symbol}}
+    return _choose_axis(grads, planar, tols, Val(D))::Tuple{Int,Bool,Vector{Symbol}}
 end
 
 # The axis choice on the sampled gradients, behind a function barrier: `lsets` holds `Any`-typed callbacks, so the
 # gradients' type is known only at run time, and the classification below then runs on concrete types. The call into
 # the barrier is dynamic for the same reason, so its caller asserts the result type: without it `k` is inferred as
 # `Any`, and `_implicit_quad` would dispatch `_emit_fiber!` dynamically, boxing its arguments, once per base node.
-function _choose_axis(grads::Vector, planar::Vector, flat_tol, ::Val{D}) where {D}
+function _choose_axis(grads::Vector, planar::Vector, tols::Vector, ::Val{D}) where {D}
     k = argmax(1:D) do k
-        nbad, nsteep, score = 0, 0, oftype(flat_tol, Inf)
-        for (gs, flat) in zip(grads, planar)
-            class, minmag = _axis_class(gs, flat, k, flat_tol)
+        nbad, nsteep, score = 0, 0, eltype(tols)(Inf)
+        for (gs, flat, tol) in zip(grads, planar, tols)
+            class, minmag = _axis_class(gs, flat, k, tol)
             nbad += class === :bad
             nsteep += class === :steep
             _single_root(class) && (score = min(score, minmag))
         end
         return (-nbad, -nsteep, isinf(score) ? zero(score) : score)
     end
-    classes = [first(_axis_class(gs, flat, k, flat_tol)) for (gs, flat) in zip(grads, planar)]
+    classes = [first(_axis_class(gs, flat, k, tol)) for (gs, flat, tol) in zip(grads, planar, tols)]
     return k, all(c -> c === :monotone || c === :flat, classes), classes
 end
 
 # Whether a leaf of this class has at most one root on every fiber along the axis it was classified on.
 _single_root(class::Symbol) = class === :monotone || class === :steep
 
-# Whether the leaf with gradient samples `gs` is steep along some axis when every sample counts, which is when its
-# samples are worth testing for curvature.
-function _looks_steep(gs, flat_tol, ::Val{D}) where {D}
-    everywhere = map(_ -> false, gs)
-    return any(k -> first(_axis_class(gs, everywhere, k, flat_tol)) === :steep, 1:D)
-end
+# The magnitude below which a component of a leaf's gradient counts as zero: `flat_tol` of its largest finite gradient
+# norm over the samples `gs`, floored at 1 so a nearly constant leaf is not held to an absolute round-off scale. A
+# non-finite sample is ignored, here and in `_axis_class`: an SDF-like leaf evaluated at its own center yields
+# ∇ = 0/0 = NaN, which must not poison the classification.
+_zero_tol(gs, flat_tol) = flat_tol * max(maximum(∇ -> all(isfinite, ∇) ? norm(∇) : zero(flat_tol), gs), one(flat_tol))
 
 # Whether the leaf `g` is planar at the sample `x` of the box `U`, where its gradient is `∇`: whether the gradient is
 # unchanged a thirty-second of the way from `x` towards the centre (from the centre itself, towards the upper corner).
-# A smooth leaf is planar nowhere unless it is linear, since an analytic function with a constant gradient on an open
-# set is affine; this tells apart the leaves that are smooth only piecewise — a mesh's signed distance, a CSG tree
+# The gradient of a smooth curved leaf moves between two points unless the leaf happens to be linear along the segment
+# joining them; this tells apart the leaves that are smooth only piecewise — a mesh's signed distance, a CSG tree
 # collapsed by max and min — whose planar pieces bend the gradient field without bending the zero set. The tolerance is
-# `_axis_class`'s flatness test; a leaf curved enough to move its gradient by less than that across a thirty-second of
-# the box is linear there to working precision.
+# `flat_tol` (√eps) relative to ‖∇‖: a leaf whose gradient moves by less than that across a thirty-second of the box is
+# linear there to working precision.
 #
 # Without the test, the clearance read a fold into every sample that lies in the Voronoi region of a mesh face parallel
 # to the height axis, where ∂g/∂x_k is exactly zero. On the L-bracket of `examples/applications/imported_geometry_3d`,
@@ -570,18 +572,15 @@ end
 const _FOLD_CLEARANCE = 0.1
 
 # Class of one leaf along axis `k` from its gradient samples `gs`, and the smallest |∂g/∂x_k| over the samples that
-# vary. A component counts as zero within `flat_tol` of the leaf's largest finite gradient norm (floored at 1, so a
-# nearly constant leaf is not held to an absolute round-off scale). Non-finite samples are ignored: an SDF-like leaf
-# evaluated at its own center yields ∇ = 0/0 = NaN, which must not poison the classification.
+# vary. A component counts as zero within `tol` (`_zero_tol`), and non-finite samples are ignored.
 #
 # A monotone leaf's clearance from a fold is measured on the samples at which it curves, `planar` marking the others
 # (`_planar`): a fold needs the zero set to bend, and a planar piece of a piecewise-smooth leaf — the Voronoi region of
 # one face of a mesh, where ∂g/∂x_k is constant, and zero for a face parallel to `k` — bends nothing, though its
-# constant joins the spread of a sampling that also meets another piece. Those curved samples within `flat_tol` of zero
+# constant joins the spread of a sampling that also meets another piece. Those curved samples within `tol` of zero
 # count, so a derivative that reaches zero at a corner — a fold on the box itself — makes the leaf steep. A leaf planar
 # at every sample is never steep.
-function _axis_class(gs, planar, k::Int, flat_tol)
-    tol = flat_tol * max(maximum(g -> all(isfinite, g) ? norm(g) : zero(flat_tol), gs), one(flat_tol))
+function _axis_class(gs, planar, k::Int, tol)
     pos = any(g -> isfinite(g[k]) && g[k] > tol, gs)
     neg = any(g -> isfinite(g[k]) && g[k] < -tol, gs)
     minmag = minimum(g -> isfinite(g[k]) && abs(g[k]) > tol ? abs(g[k]) : oftype(tol, Inf), gs)
