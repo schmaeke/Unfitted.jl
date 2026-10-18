@@ -1623,9 +1623,12 @@ demos.
     integrated-Legendre level's hats, and the fold configurations where the
     cover's face lands before, inside and beyond the cut band; the MeshIO
     signed-distance leaf; the Tensors notation round-trip; the WriteVTK
-    writer's bundles, series and quadrature clouds (`test_vtk.jl`, which
-    also pins the consumer-neutral records they serialise), and, in a
-    fresh process that loads Unfitted alone, its entry points asking for
+    writer's bundles, series and quadrature clouds as serialisations of
+    the consumer-neutral sampling records (`test_vtk.jl`), the records
+    themselves — the sample cells and their cut refinement, the arrays
+    and their element types, the refusals — as records, with no writer
+    loaded (`test_postprocessing.jl`), and, in a fresh process that loads
+    Unfitted alone, the writer's entry points asking for
     `using WriteVTK` without writing anything or loading WriteVTK
     (`test_api.jl`).
     The fold configuration with the cover's face on a knot of the level below,
