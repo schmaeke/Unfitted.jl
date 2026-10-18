@@ -204,15 +204,15 @@ Fields:
   - `cut_rule::R`: the first stage of a cut cell's quadrature, which integrates `box ∩ Ω` accurately — by default
     [`implicit_rule`](@ref). See "The cut rule and its compression" below.
   - `compression::C`: the second stage, which reduces the cut rule to `∏(moment order + 1)` points or fewer that
-    reproduce its moments — by default [`NonnegativeFit`](@ref) — or `nothing` to integrate cut cells with the cut rule
-    itself. See below.
+    reproduce its moments — by default [`Caratheodory`](@ref), or [`NonnegativeFit`](@ref) — or `nothing` to integrate
+    cut cells with the cut rule itself. See below.
 
 # The cut rule and its compression
 
 Every cut region's rule is `moment_fit_rule(physical, box, moment_order)` ([`moment_fit_rule`](@ref)): the cut rule
-integrates `box ∩ Ω` with as many points as accuracy takes, and the compression replaces them by at most `nbasis =
-∏(moment_order .+ 1)` points that reproduce the cut rule's tensor Legendre moments. Either stage can be replaced by a
-callable; both are called once per distinct `(region box, moment order)` pair.
+integrates `box ∩ Ω` with as many points as accuracy takes, and the compression replaces them by at most
+`nbasis = ∏(moment_order .+ 1)` points that reproduce the cut rule's tensor Legendre moments. Either stage can be
+replaced by a callable; both are called once per distinct `(region box, moment order)` pair.
 
 The cut rule has the signature
 
@@ -275,7 +275,7 @@ end
 """
     physical_domain(geometry; lipschitz=Inf, alpha=0.0, keep_fictitious=false,
                     subcell_length_scale, max_depth=8, moment_order_factor=2,
-                    cut_rule=implicit_rule, compression=NonnegativeFit())
+                    cut_rule=implicit_rule, compression=Caratheodory())
 
 Construct a [`PhysicalDomain`](@ref). `geometry` is either a [`LevelSet`](@ref) CSG tree (built from [`leaf`](@ref) and
 `intersect`/`union`/`setdiff`/ [`complement`](@ref)) or a bare scalar callable `φ`, which is auto-wrapped as a single
@@ -292,13 +292,14 @@ fully-fictitious cells as active dofs (the classic α-FCM fill) and therefore re
 cut cell's rule reproduces.
 
 `cut_rule` and `compression` are the two stages of a cut cell's quadrature: [`implicit_rule`](@ref) integrates the cut
-volume, and [`NonnegativeFit`](@ref) compresses that rule to at most `nbasis` points; `compression = nothing` keeps
-the cut rule uncompressed. Either stage can be a callable of the caller's; the contracts they must honour are under
+volume, and [`Caratheodory`](@ref) prunes that rule to at most `nbasis` of its points with the same moments;
+[`NonnegativeFit`](@ref) fits them by non-negative least squares instead, and `compression = nothing` keeps the cut
+rule uncompressed. Either stage can be a callable of the caller's; the contracts they must honour are under
 "The cut rule and its compression" in the [`PhysicalDomain`](@ref) docstring.
 """
 function physical_domain(geometry; lipschitz::Real=Inf, alpha::Real=0.0, keep_fictitious::Bool=false,
                          subcell_length_scale::Real, max_depth::Integer=8, moment_order_factor::Integer=2,
-                         cut_rule=implicit_rule, compression=NonnegativeFit())
+                         cut_rule=implicit_rule, compression=Caratheodory())
     # Validated here rather than only inside `leaf`, so the constraint holds on every path: with a tree argument the
     # auto-wrap never runs, and `lipschitz` would otherwise reach no check at all.
     lipschitz > 0 || throw(ArgumentError("lipschitz must be positive; got $lipschitz"))

@@ -18,7 +18,7 @@ end
 
 # Every built-in compression, for the properties the pipeline promises whichever one a domain carries. The NNLS target
 # is tightened so that its retry, and not its acceptance band, decides the residuals asserted below.
-const _FCM_COMPRESSIONS = (NonnegativeFit(; target_residual=1.0e-10),)
+const _FCM_COMPRESSIONS = (Caratheodory(), NonnegativeFit(; target_residual=1.0e-10))
 
 @testset "FCM — NNLS wrapper" begin
     # Small well-posed NNLS where the unconstrained solution is non-negative.
@@ -346,6 +346,59 @@ end
         # scales — the only scale-free reading.
         @test res1 <= 1.0e-12 * sum(ws1)
         @test resS <= 1.0e-12 * sum(wsS)
+    end
+end
+
+@testset "FCM — Carathéodory pruning keeps a subset of the cut rule with its moments" begin
+    # The pruned rule is a subset of the cut rule's points with positive weights, at most nbasis of them, reproducing
+    # the moments to round-off — on a cell small enough to prune directly (100 cut-rule points against 2 · 81) and on
+    # two that are first reduced by recombination (1728 points against 2 · 25, and 512 against 2 · 125 in 3D).
+    disc = leaf(x -> hypot(x[1] - 0.0123, x[2] + 0.0345) - 0.6789; lipschitz=1.0)
+    holes = complement(union((leaf(x -> hypot(x[1] - c[1], x[2] - c[2]) - 0.1; lipschitz=1.0)
+                              for c in ((0.3, 0.3), (0.7, 0.3), (0.3, 0.7), (0.7, 0.7)))...))
+    ball = leaf(x -> norm(x - SVector(0.0123, -0.0345, 0.0217)) - 0.6789; lipschitz=1.0)
+    cells = ((disc, box((0.5, 0.25), (0.75, 0.5)), (8, 8)), (holes, box((0.0, 0.0), (1.0, 1.0)), (4, 4)),
+             (ball, box((0.5, 0.25, 0.25), (0.75, 0.5, 0.5)), (4, 4, 4)))
+    for (geometry, region, order) in cells
+        p = physical_domain(geometry; subcell_length_scale=0.1)
+        rule = implicit_rule(p, region, order)
+        moments = Unfitted._moments_from_rule(rule..., region, order)
+        pts, ws = Caratheodory()(rule..., moments, region, order)
+        @test issubset(pts, rule[1])
+        @test all(>(0), ws)
+        @test length(pts) <= prod(order .+ 1) < length(rule[1])
+        @test norm(Unfitted._moments_from_rule(pts, ws, region, order) - moments) < 1.0e-13 * norm(moments)
+    end
+
+    # Where the moment matrix is numerically rank-deficient — a sliver of a disc at moment order 12 — the pruning stops
+    # at the rank, below nbasis, which is the point count the assembly then pays for.
+    p = physical_domain(disc; subcell_length_scale=0.1)
+    pts, ws, res, status = Unfitted.moment_fit_rule(p, box((0.45, 0.45), (0.7, 0.7)), (12, 12))
+    @test status === :fitted
+    @test length(pts) < 13^2
+    @test res < 1.0e-12 * sum(ws)
+
+    # Float32 carries through, to its own round-off.
+    p32 = physical_domain(leaf(x -> hypot(x[1] - 0.5f0, x[2] - 0.5f0) - 0.3f0; lipschitz=1.0);
+                          subcell_length_scale=0.1f0)
+    pts32, ws32, res32, status32 = Unfitted.moment_fit_rule(p32, box((0.5f0, 0.5f0), (1.0f0, 1.0f0)), (4, 4))
+    @test status32 === :fitted
+    @test eltype(ws32) === Float32 && eltype(eltype(pts32)) === Float32
+    @test res32 < 1.0f-5 * sum(ws32)
+end
+
+@testset "FCM — `_prune!` is Carathéodory's theorem" begin
+    # A positive combination of 40 columns in ℝ⁶ keeps its value with at most 6 positive coefficients, and with at most
+    # 4 when the columns span only 4 dimensions (two rows repeat others).
+    x = range(0.05, 0.95; length=40)
+    S = [xj^(a - 1) for a in 1:6, xj in x]
+    for (M, rank) in ((S, 6), (S[[1, 2, 3, 4, 2, 3], :], 4))
+        λ = 1 .+ sin.(1:40) .^ 2
+        target = M * λ
+        Unfitted._prune!(λ, M)
+        @test all(>=(0), λ)
+        @test count(>(0), λ) <= rank
+        @test M * λ ≈ target rtol = 1.0e-13
     end
 end
 

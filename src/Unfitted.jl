@@ -66,8 +66,8 @@ using ForwardDiff
 using NearestNeighbors
 using NonNegLeastSquares
 
-export AxisBox, GeometryTolerance, PhysicalDomain, physical_domain, implicit_rule, NonnegativeFit, classify_cell,
-       LevelSet, leaf, complement, levelset_value, stl_levelset, mesh_levelset, CartesianMesh, Space,
+export AxisBox, GeometryTolerance, PhysicalDomain, physical_domain, implicit_rule, Caratheodory, NonnegativeFit,
+       classify_cell, LevelSet, leaf, complement, levelset_value, stl_levelset, mesh_levelset, CartesianMesh, Space,
        IntegratedLegendre, bspline, Field, BlockForm, LoadForm, TrialChannels, TestChannels, WeakForm, Problem, Model,
        Solution, box, mesh, space, overlay, field, block, loadform, boundary, dirichlet, update_dirichlet!, neumann,
        couple, interface, Interface, InterfaceForm, onside, jump_sign, BoundaryMesh, segment_mesh, polyline_mesh,

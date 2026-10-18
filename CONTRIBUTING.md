@@ -26,16 +26,19 @@ file that carries the borrowed design. The notable case is the finite-cell
 method cut-cell quadrature in `src/fcm.jl`. A cut cell is integrated by
 Saye's dimension-reduction implicit quadrature on a CSG level set
 (`src/implicit.jl`, `src/physical.jl`), and that rule is compressed to one
-that reproduces its moments — the moment-fitting idea of
+that reproduces its moments — by default by Carathéodory pruning, cited at
+`Caratheodory` in `src/fcm.jl`. Reproducing the moments of an accurate rule
+is the moment-fitting idea of
 
 > B. Müller, F. Kummer, M. Oberlack, *Highly accurate surface and volume
 > integration on implicit domains by means of moment-fitting*, Int. J.
 > Numer. Methods Engng. **96** (2013) 512–528.
 > [doi:10.1002/nme.4569](https://doi.org/10.1002/nme.4569).
 
-and the non-negative least-squares compression, `NonnegativeFit`, follows
-the *structure* of QuESo's `QuadratureTrimmedElement` — used as an
-algorithmic reference only, with no code vendored:
+and the alternative non-negative least-squares compression,
+`NonnegativeFit`, follows the *structure* of QuESo's
+`QuadratureTrimmedElement` — used as an algorithmic reference only, with no
+code vendored:
 
 > M. Meßmer, T. Teschemacher, L. F. Leidinger, R. Wüchner, K.-U.
 > Bletzinger, *Efficient CAD-integrated isogeometric analysis of trimmed
@@ -142,7 +145,7 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `physical.jl`     | CSG level-set tree, `PhysicalDomain`, three-valued cell classifier |
 | `implicit.jl`     | Saye dimension-reduction implicit quadrature on the level set (volume rules) |
 | `basis.jl`        | basis-family interface and capability traits, integrated Legendre default, the `:tensor` / `:trunk` index sets and the `_index_admissible` filter the minimum rule is expressed over, tensor-product evaluation |
-| `fcm.jl`          | finite-cell-method cut-cell quadrature in two stages: the cut rule (`implicit_rule`, from `implicit.jl`) and its compression to a rule that reproduces its moments (`NonnegativeFit`, NNLS); `moment_fit_rule` runs the two |
+| `fcm.jl`          | finite-cell-method cut-cell quadrature in two stages: the cut rule (`implicit_rule`, from `implicit.jl`) and its compression to a subset of its points that reproduces its moments (`Caratheodory` pruning, or `NonnegativeFit` NNLS); `moment_fit_rule` runs the two |
 | `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks (`LevelMask`, an alias of `BitArray`) and per-cell polynomial order (`CellOrders` / `CellModes`, with no per-cell arrays on a uniform level); the `space` / `overlay` / `adapt` / `elevate` verbs |
 | `intersections.jl`| the integration-region record (`Region`, `Parent`) and admissible integration regions for non-matching meshes; cut/fictitious region-quadrature dispatch |
 | `coverage.jl`     | per-level covered-cell masks (`Coverage`, `build_coverage`); the mask- and material-aware covering rule behind covered-mode pruning; the material oracle (`_Fold`) the dof layer asks whether an inactive cell holds material |
@@ -979,7 +982,7 @@ indicator representations are intentionally not supported.
   - **Public construction**:
     `physical_domain(geometry; lipschitz=Inf, alpha=0.0, keep_fictitious=false,
     subcell_length_scale, max_depth=8, moment_order_factor=2,
-    cut_rule=implicit_rule, compression=NonnegativeFit())`.
+    cut_rule=implicit_rule, compression=Caratheodory())`.
 
     - `geometry`: a `LevelSet` CSG tree, or a bare scalar callable `φ` on
       `SVector{D,T}` (auto-wrapped as a single leaf). `φ` need not be a
@@ -1034,9 +1037,11 @@ indicator representations are intentionally not supported.
     - `compression`: the second stage, a callable
       `(points, weights, moments, box, moment_order) -> (points, weights)`
       that replaces the cut rule by at most `∏(moment_order + 1)` points
-      reproducing its tensor Legendre moments. `NonnegativeFit()` (default)
-      is a non-negative least-squares fit on candidates drawn from the cut
-      rule; `nothing` keeps the cut rule uncompressed. Both stages must
+      reproducing its tensor Legendre moments. `Caratheodory()` (default)
+      prunes the cut rule to a subset of its points by Carathéodory's
+      theorem, exact by construction; `NonnegativeFit()` is a non-negative
+      least-squares fit on candidates drawn from the cut rule; `nothing`
+      keeps the cut rule uncompressed. Both stages must
       return *physical*-frame points and non-negative weights, both are
       memoised per box and moment order, a caller's callable in either is
       run serially, and only the compression is used on boundary faces.
@@ -1091,7 +1096,14 @@ indicator representations are intentionally not supported.
     max(cell_order)` per axis over the region's parent cells, the factor
     defaulting to `2`; the cut rule is the Saye volume rule, whose tensor
     Legendre moments `moment_fit_rule` sums and hands to the compression.
-    `NonnegativeFit` runs a Lawson–Hanson NNLS solve
+    `Caratheodory` reduces the cut rule by recombination — its points
+    grouped into `2 · nbasis` clusters whose moment vectors are pruned, so
+    at least half of them drop per round — until at most `2 · nbasis`
+    points are left, and prunes those directly, each pruning walking along null
+    vectors of the moment matrix until a weight reaches zero; it never
+    forms more than an `nbasis × 2 nbasis` matrix, needs no tolerance or
+    retry, and stops at the matrix's numerical rank, below `nbasis` on a
+    sliver. `NonnegativeFit` runs a Lawson–Hanson NNLS solve
     (`NonNegLeastSquares.jl`) that selects ≤ `nbasis` non-negative weights
     from a candidate cloud drawn by even fractional spacing over the cut
     rule (an integer stride aliases against the fiber Gauss count and draws
@@ -1538,9 +1550,12 @@ demos.
     `:full` / `:cut_fitted` / `:fictitious_alpha` / `:cut_fallback` /
     `:cut_failed` / `:cut_alpha_failed` region-kind tags appear; every
     built-in compression reproduces the cut rule's moments with
-    non-negative weights at ≤ `nbasis` points, at every length scale; the
-    NNLS retry rescues a many-feature cut cell that its first attempt
-    cannot fit, from the same cut rule; a compression that misses the
+    non-negative weights at ≤ `nbasis` points, at every length scale;
+    Carathéodory pruning keeps a subset of the cut rule, directly and
+    through recombination, stops at the numerical rank on a sliver, and
+    carries Float32; the NNLS retry rescues a many-feature cut cell that
+    its first attempt cannot fit, from the same cut rule; a compression
+    that misses the
     failure threshold falls back to the cut rule; α-FCM weight scaling on a
     fully fictitious cell; end-to-end SPD on a cut-disk Poisson; 1D
     analytic mass-entry check on a cut cell; a caller's cut rule and

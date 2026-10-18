@@ -31,6 +31,17 @@ in full at the top of the implementing file, for academic attribution:
     BIT **11** (1971) 168,
     [doi:10.1007/BF01934364](https://doi.org/10.1007/BF01934364).
 
+  - **Carathéodory pruning** in `src/fcm.jl` (`Caratheodory`) — the
+    reduction of a positive measure to at most as many atoms as the moments
+    it must keep, after C. Carathéodory, "Über den Variabilitätsbereich der
+    Fourier'schen Konstanten von positiven harmonischen Funktionen",
+    Rend. Circ. Mat. Palermo **32** (1911) 193,
+    [doi:10.1007/BF03014795](https://doi.org/10.1007/BF03014795), made
+    affordable by the recombination of C. Litterer, T. Lyons, "High order
+    recombination and an application to cubature on Wiener space",
+    Ann. Appl. Probab. **22** (2012) 1301,
+    [doi:10.1214/11-AAP786](https://doi.org/10.1214/11-AAP786).
+
   - **Polygon splitting** in `src/surface.jl` — the triangles of an immersed
     surface are split at grid planes by single-plane passes of the polygon
     clipper of I. E. Sutherland, G. W. Hodgman, "Reentrant polygon

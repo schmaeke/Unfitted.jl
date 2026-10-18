@@ -22,7 +22,7 @@ using LinearAlgebra
     @test p.subcell_length_scale == 0.0625
     @test p.max_depth == 8
     @test p.cut_rule === implicit_rule
-    @test p.compression == NonnegativeFit()
+    @test p.compression == Caratheodory()
 
     p_alpha = physical_domain(x -> x[1]; lipschitz=1.0, alpha=0.25, subcell_length_scale=0.1)
     @test p_alpha.alpha == 0.25
@@ -170,7 +170,7 @@ end
     phi(x) = sqrt(x[1]^2 + x[2]^2) - 0.7
     omega = box((-1.0, -1.0), (1.0, 1.0))
 
-    loose = physical_domain(phi; lipschitz=1.0, subcell_length_scale=2.0 / 8 / 2^4)
+    loose = physical_domain(phi; lipschitz=1.0, subcell_length_scale=2.0 / 8 / 2^4, compression=NonnegativeFit())
     tight = physical_domain(phi; lipschitz=1.0, subcell_length_scale=2.0 / 8 / 2^4,
                             compression=NonnegativeFit(; target_residual=1.0e-10))
 
@@ -773,7 +773,7 @@ end
     compressions = Ref(0)
     function counted(points, weights, moments, region_box, moment_order)
         compressions[] += 1
-        return NonnegativeFit()(points, weights, moments, region_box, moment_order)
+        return Caratheodory()(points, weights, moments, region_box, moment_order)
     end
 
     omega = box((0.0, 0.0), (1.0, 1.0))
@@ -787,7 +787,7 @@ end
     # Both stages are type parameters, so a domain is concrete whatever it carries. The package's own stages may run on
     # every thread; a caller's callable is run serially.
     @test isconcretetype(typeof(fitted)) && isconcretetype(typeof(raw))
-    @test all(Unfitted._threadsafe, (implicit_rule, NonnegativeFit(), nothing))
+    @test all(Unfitted._threadsafe, (implicit_rule, Caratheodory(), NonnegativeFit(), nothing))
     @test !Unfitted._threadsafe(tensor_rule) && !Unfitted._threadsafe(counted)
 
     # A caller's stage replaces the rule a cut region carries, not what the region is: same boxes, same kinds — and a
@@ -805,7 +805,7 @@ end
     # is the physical measure the rule integrates — here the whole box, since the rule ignores Ω. The compression is
     # handed the caller's cut rule and reproduces its moments, the measure among them, at no more than the 5² points of
     # the moment basis (order 2 at the default factor 2).
-    for compression in (nothing, NonnegativeFit())
+    for compression in (nothing, Caratheodory(), NonnegativeFit())
         for region in plan(physical_domain(geometry; settings..., cut_rule=tensor_rule, compression)).regions
             region.kind === :cut_fitted || continue
             region_box = Unfitted._region_box(region)
