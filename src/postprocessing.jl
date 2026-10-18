@@ -318,7 +318,7 @@ function _sample_field(ws, state::Union{Nothing,FormState}, space::Space{D,T}, r
     sample = Base.inferencebarrier(_sample_array)
     point_data = Pair{String,AbstractVector}[]
     for (name, f) in entries.point
-        push!(point_data, name => sample(:point_data, name, f, u, at_points)::AbstractVector)
+        push!(point_data, name => sample(name, f, u, at_points)::AbstractVector)
     end
     space.physical === nothing ||
         any(e -> first(e) == "level_set", entries.point) ||
@@ -329,7 +329,7 @@ function _sample_field(ws, state::Union{Nothing,FormState}, space::Space{D,T}, r
     end
     cell_data = Pair{String,AbstractVector}["region_id" => region_ids, "cover_count" => cover_count]
     for (name, f) in entries.cell
-        push!(cell_data, name => sample(:cell_data, name, f, u, at_cells)::AbstractVector)
+        push!(cell_data, name => sample(name, f, u, at_cells)::AbstractVector)
     end
     return SampleGrid{D,T,D}(points, point_data, cell_data)
 end
@@ -484,16 +484,16 @@ end
 # collected into the narrowest array that holds them. A function barrier — the one dynamic call per entry — so the loop
 # runs on the callback's and the accessor's concrete types. The array takes the first value's type, which is every
 # value's type for the callbacks one writes, and is then kept as it is; a value of another type hands the walk to
-# `_promoted_values`, which promotes over every sample or refuses naming the entry. An empty walk gives an empty
-# `Float64` array.
+# `_promoted_values`, which promotes over every sample or refuses naming the callback by its entry's name. An empty walk
+# gives an empty `Float64` array.
 #
 # An explicit loop, not `map`: Base's `collect` widens its element type as it goes, which compiles its collection
 # machinery anew for every callback type. Here, when the callback's value type is concrete, the type test folds to true
 # and the hand-over is never compiled.
-function _sample_array(kind::Symbol, name::String, f::F, u::U, s) where {F,U}
+function _sample_array(name::String, f::F, u::U, s) where {F,U}
     n = length(s.boxes) << s.shift
     n == 0 && return Float64[]
-    sample(k) = _sample_value(kind, name, f(u, _callback_args(s, k)...))
+    sample(k) = _sample_value(name, f(u, _callback_args(s, k)...))
     first_value = sample(1)
     values = Vector{typeof(first_value)}(undef, n)
     values[1] = first_value
@@ -501,7 +501,7 @@ function _sample_array(kind::Symbol, name::String, f::F, u::U, s) where {F,U}
         v = sample(k)
         # The samples so far, this one and the rest, each callback still called once per sample and in order.
         v isa eltype(values) ||
-            return _promoted_values(kind, name, Any[j < k ? values[j] : j == k ? v : sample(j) for j in 1:n])
+            return _promoted_values(name, Any[j < k ? values[j] : j == k ? v : sample(j) for j in 1:n])
         values[k] = v
     end
     return values
@@ -522,24 +522,25 @@ end
 
 # One callback value, checked and normalised: a real number is kept as it is; a tuple or an `SVector` of reals becomes
 # an `SVector` with its components promoted to one type, so a tuple and the `SVector` of the same numbers give the same
-# array. Anything else — a `Vector`, a matrix, a `String`, a `Complex`, `nothing` — is refused, naming the entry and
-# what it returned, before anything is written.
-function _sample_value(kind::Symbol, name::String, v)
+# array. Anything else — a `Vector`, a matrix, a `String`, a `Complex`, `nothing` — is refused, naming the callback by
+# its entry's name and what it returned, before any consumer sees it. The refusal names no keyword of a consumer, whose
+# entries the callbacks may have come from.
+function _sample_value(name::String, v)
     v isa Real && return v
     v isa Union{Tuple,SVector} && all(x -> x isa Real, v) && return SVector(v...)
-    throw(ArgumentError("$kind entry \"$name\" returned a $(typeof(v)): a callback value must be a real number, a " *
-                        "tuple of reals or an SVector of reals, of one shape at every sample"))
+    throw(ArgumentError("callback \"$name\" returned a $(typeof(v)): a callback value must be a real number, a tuple " *
+                        "of reals or an SVector of reals, of one shape at every sample"))
 end
 
 # The array of an entry whose values differ in type between samples: mixed number types (an `Int` at some samples, a
 # `Float64` at others) and `SVector`s of mixed element types are promoted over every sample with `promote_type`, and
-# anything else — shapes that differ between samples — is refused, naming the entry and the types it returned. Typed
-# on the untyped value list, so it compiles once whatever the callback.
-function _promoted_values(kind::Symbol, name::String, values::Vector{Any})
+# anything else — shapes that differ between samples — is refused, naming the callback and the types it returned.
+# Typed on the untyped value list, so it compiles once whatever the callback.
+function _promoted_values(name::String, values::Vector{Any})
     S = mapreduce(typeof, promote_type, values)
     isconcretetype(S) && (S <: Real || S <: SVector && eltype(S) <: Real) && return convert(Vector{S}, values)
-    throw(ArgumentError("$kind entry \"$name\" returned $(join(unique(typeof.(values)), ", ")): a callback value " *
-                        "must be a real number, a tuple of reals or an SVector of reals, of one shape at every sample"))
+    throw(ArgumentError("callback \"$name\" returned $(join(unique(typeof.(values)), ", ")): a callback value must " *
+                        "be a real number, a tuple of reals or an SVector of reals, of one shape at every sample"))
 end
 
 # `φ` at every point, in the space's number type. A barrier: the space's `PhysicalDomain` is abstractly typed, so one

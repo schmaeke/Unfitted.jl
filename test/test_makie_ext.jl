@@ -479,7 +479,7 @@ end
              (() -> fieldplot(_makie_2d_solution, _makie_2d; component=1), "this value is a scalar"),
              (() -> fieldplot(_makie_vector_solution, _makie_vector; component=3), "no component of a 2-component"),
              (() -> fieldplot(_makie_2d; by=(u, c, x, xi) -> u(c, xi)), "pass the solution"),
-             (() -> fieldplot(_makie_2d_solution, _makie_2d; by=(u, c, x, xi) -> "text"), "point_data entry \"by\""),
+             (() -> fieldplot(_makie_2d_solution, _makie_2d; by=(u, c, x, xi) -> "text"), "callback \"by\" returned"),
              (() -> fieldplot(shared_solution, shared), "a and b share one: pick one with `field`"))
     for (call, says) in cases
         err = try

@@ -863,10 +863,11 @@ end
     end
 end
 
-@testset "a callback value of no accepted shape is refused naming its entry" begin
-    # Each of these is refused while it is sampled, naming the entry and what a callback may return, before any
-    # consumer sees it. A real value is not refused whatever its type: a `Rational` is sampled as a `Rational`, and
-    # whether a format can store it is its consumer's question.
+@testset "a callback value of no accepted shape is refused naming the callback" begin
+    # Each of these is refused while it is sampled, naming the callback by its entry's name and what a callback may
+    # return, before any consumer sees it, and without naming the keyword the entry came in, which is a consumer's. A
+    # real value is not refused whatever its type: a `Rational` is sampled as a `Rational`, and whether a format can
+    # store it is its consumer's question.
     (; model, sol) = _pin_2d
     refused = [(:point_data, "vector", (u, c, x, xi) -> [x[1], x[2], 0.0]),          # a Vector, not an SVector
                (:point_data, "matrix", (u, c, x, xi) -> SMatrix{2,2}(x[1], 0.0, 0.0, x[2])),
@@ -885,7 +886,7 @@ end
         end
         @test err isa ArgumentError
         message = err === nothing ? "" : sprint(showerror, err)
-        @test occursin("$kind entry \"$name\"", message)
+        @test occursin("callback \"$name\" returned", message) && !occursin(String(kind), message)
         @test occursin("a real number, a tuple of reals or an SVector of reals", message)
     end
     third = (third=(u, c, x, xi) -> 1 // 3,)
