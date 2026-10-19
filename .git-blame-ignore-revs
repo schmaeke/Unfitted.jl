@@ -5,3 +5,5 @@
 24f7980c1327b9ae5b7c11e21ab8be6ec0f7eced
 # style: fill comment and docstring prose to 120 characters (prose refill, no word changed)
 c3c2426b0b37208a232d2a52ed9dd00a222884bf
+# style: fill Markdown prose to 120 characters (prose refill, no word changed)
+28d610cf48c36dfc92e3f19f75f445e8829792a0
