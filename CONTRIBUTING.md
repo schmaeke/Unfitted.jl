@@ -37,8 +37,8 @@ is the moment-fitting idea of
 
 and the alternative non-negative least-squares compression,
 `NonnegativeFit`, follows the *structure* of QuESo's
-`QuadratureTrimmedElement` — used as an algorithmic reference only, with no
-code vendored:
+`QuadratureTrimmedElement`. The pipeline was first ported from QuESo; no
+QuESo-derived code remains, and none is vendored (see `NOTICE.md`):
 
 > M. Meßmer, T. Teschemacher, L. F. Leidinger, R. Wüchner, K.-U.
 > Bletzinger, *Efficient CAD-integrated isogeometric analysis of trimmed
@@ -120,16 +120,18 @@ Project.toml                  package metadata + production dependencies
 LICENSE.md                    MIT (Unfitted.jl)
 NOTICE.md                     third-party attributions (QuESo BSD-4-Clause) + clean-room algorithm citations
 README.md                     public landing page
-CLAUDE.md                     agent-instruction pointer documents
+CLAUDE.md                     agent-instruction pointer document
 CONTRIBUTING.md               this file — contributor + agent guide
 CITATION.cff                  machine-readable citation metadata
 .JuliaFormatter.toml          repo-wide formatting config (yas style, indent 4, margin 120)
-precommit.jl                  formatter wrapper + SLOC/comment/docstring stats
+.git-blame-ignore-revs        formatting-only commits for git blame
+precommit.jl                  formatter wrapper + line-length check + SLOC/comment/docstring stats
 src/                          library source
 ext/                          package extensions (BasicBSpline, FileIO+MeshIO+GeometryBasics, Makie, Tensors, WriteVTK)
 test/                         unit and regression tests
 examples/                     runnable scripts in three tiers (tutorials/, applications/, reproductions/), one sub-directory per example, each with its own Project.toml
 benchmarks/                   targeted performance benchmarks (own Project.toml)
+resources/                    logo sources (SVG, TikZ) used by README.md
 .github/workflows/ci.yml      CI: tests on Julia 1.10 and latest, 1 and 4 threads (three legs at -O0, one at default -O), plus the format check
 ```
 
@@ -142,27 +144,27 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 |-------------------|-------------------------------------------------------------|
 | `Unfitted.jl`     | top-level module: imports, exports, include order |
 | `geometry.jl`     | D-dimensional axis-aligned boxes, coordinate maps, tolerances |
-| `physical.jl`     | CSG level-set tree, `PhysicalDomain`, three-valued cell classifier |
+| `physical.jl`     | CSG level-set tree, `PhysicalDomain`, three-valued cell classifier, the tree's affine slice on a facet (`_restrict_domain`) |
 | `implicit.jl`     | Saye dimension-reduction implicit quadrature on the level set (volume rules) |
-| `basis.jl`        | basis-family interface and capability traits, integrated Legendre default, the `:tensor` / `:trunk` index sets and the `_index_admissible` filter the minimum rule is expressed over, tensor-product evaluation |
-| `fcm.jl`          | finite-cell-method cut-cell quadrature in two stages: the cut rule (`implicit_rule`, from `implicit.jl`) and its compression to a subset of its points that reproduces its moments (`Caratheodory` pruning, or `NonnegativeFit` NNLS); `cut_cell_rule` runs the two |
-| `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks (`LevelMask`, an alias of `BitArray`) and per-cell polynomial order (`CellOrders` / `CellModes`, with no per-cell arrays on a uniform level); the `space` / `overlay` / `adapt` / `elevate` verbs |
+| `basis.jl`        | basis-family interface and capability traits, integrated Legendre default, the `:tensor` / `:trunk` index sets and the `_index_admissible` filter the minimum rule is expressed over, tensor-product evaluation, tensor Gauss–Legendre rules, boundary-basis identification |
+| `fcm.jl`          | finite-cell-method cut-cell quadrature in two stages: the cut rule (`implicit_rule`, a wrapper over `implicit.jl`'s kernel) and its compression to a subset of its points that reproduces its moments (`Caratheodory` pruning, or `NonnegativeFit` NNLS); `cut_cell_rule` runs the two |
+| `mesh.jl`         | Cartesian mesh levels, the superposition `Space`, per-cell activation masks (`LevelMask`, an alias of `BitArray`) and per-cell polynomial order (`CellOrders` / `CellModes`, with no per-cell arrays on a uniform level); the `space` / `overlay` / `adapt` / `elevate` verbs; the fictitious-cell fold into the level masks; the level-keyed basis evaluators `basis_values` / `physical_basis_gradients` |
 | `intersections.jl`| the integration-region record (`Region`, `Parent`) and admissible integration regions for non-matching meshes; cut/fictitious region-quadrature dispatch |
 | `coverage.jl`     | per-level covered-cell masks (`Coverage`, `build_coverage`); the mask- and material-aware covering rule behind covered-mode pruning; the material oracle (`_Fold`) the dof layer asks whether an inactive cell holds material |
 | `ladder.jl`       | nested refinement ladders: `ladder` declaration, the depth-map form of `adapt` and the `depth_masks` grading behind it, cross-level cell mapping (`overlapping_cells`), the `is_nested` predicate |
 | `dofs.jl`         | dof keys; the per-space dof topology (raw enumeration, the elimination ledger, the pivot table) and per-field numbering and accessors; the integrated-Legendre family's dof hooks (artificial boundary, leaf-semantics pruning, the hp minimum rule) |
-| `dirichlet.jl`    | physical Dirichlet conditions and boundary selectors, per-level physical-Dirichlet detection, codim-K facet regions and quadrature, and the L² boundary projection for nonzero data |
+| `dirichlet.jl`    | the boundary-selector and Dirichlet-condition types, per-level physical-Dirichlet detection, codim-K facet regions and quadrature, and the L² boundary projection for nonzero data |
 | `surface.jl`      | immersed-boundary surface meshes (`BoundaryMesh`) and surface-region integration |
 | `problems.jl`     | `Field`, weak-form channels and blocks (`BlockForm`/`LoadForm`/`WeakForm`), `Problem` |
 | `coupling.jl`     | multi-domain interface coupling: the `Interface` `on=` tag, two-sided interface-region construction, `InterfaceForm`, and the four-block `couple` jump expansion |
-| `model.jl`        | `Model` lifecycle: `prepare`, `move!`/`moved`, `activate!`/`deactivate!`, the non-mutating `adapted` / `elevated` rebuilds, `active_cells` / `cell_orders` on a model, the discretisation pin, diagnostics |
+| `model.jl`        | `Model` lifecycle: `prepare`, `move!`/`moved`, `activate!`/`deactivate!`, the non-mutating `adapted` / `elevated` rebuilds, `active_cells` / `cell_orders` on a model, the discretisation pin, `dof_layout` and `update_dirichlet!`, the `AssemblyDiagnostics` record and its conditioning estimates |
 | `assembly.jl`     | coupled Galerkin assembly: channel calculus, cached symbolic-scatter (Gustavson) pattern, serial scatter + two-phase compute→gather threaded path |
 | `solvers.jl`      | `Solution` / `SolverDiagnostics`, the default direct sparse solve, and the `linear_solver` hook for external Krylov or preconditioned solvers |
 | `projection.jl`   | variational and rewire-based state transfer between models  |
 | `adaptivity.jl`   | automated hp adaptivity: `estimate` (Bank–Weiser indicator), Dörfler marking, the h-versus-p decision by Melenk–Wohlmuth predicted error reduction, `refine` and `coarsen` |
 | `data.jl`         | per-quadrature-point `QuadField` + RBF transfer             |
 | `postprocessing.jl` | what every post-processing consumer shares: the consumer-neutral sampling records (data grids, level meshes, the quadrature cloud), field/gradient evaluation, L² error, boundary integrals |
-| `api.jl`          | thin public-API wrappers (mass, stiffness, poisson, neumann, …) |
+| `api.jl`          | thin public-API wrappers: the canonical weak forms (`mass_form` / `stiffness_form` / `source_form`), the block, load and problem builders (`mass`, `stiffness`, `poisson`, `neumann`, …), the `boundary` and `dirichlet` constructors, and `_datum_at`, the one reader of coefficient data |
 | `stubs.jl`        | the package extensions' public entry points (`bspline`, `mesh_levelset` / `stl_levelset`, the tensor-notation readers, the VTK writers and `VTKSeries`, the plots `fieldplot` / `levelplot` / `quadratureplot`), declared and documented in the core — as fallbacks that name the package to load (`_extension_missing`), or, for a Makie recipe, methodless with an error hint that names it (`_extension_hint`, registered by `__init__` in `Unfitted.jl`); included last |
 | `ext/UnfittedWriteVTKExt.jl` (not in `src/`) | the VTK consumer of `postprocessing.jl`'s records, a package extension loaded with WriteVTK: `write_vtk`, `vtk_series`, `write_quadrature_vtm`, declared and documented in `stubs.jl` |
 | `ext/UnfittedMakieExt.jl` (not in `src/`) | the plotting consumer of `postprocessing.jl`'s records, a package extension loaded with Makie through any of its backends: the recipes `fieldplot`, `levelplot` and `quadratureplot` of 1D and 2D models, declared and documented in `stubs.jl` |
@@ -176,7 +178,12 @@ Resist the temptation to add framework layers prophylactically.
 `runtests.jl` includes one `test_*.jl` per area of responsibility. Tests
 are written against the public API where possible, and use exact-value
 or manufactured-solution checks rather than plots. Fast unit tests live
-here; expensive convergence studies belong in `examples/`.
+here; expensive convergence studies belong in `examples/`. Two scripts sit
+beside them: `run_examples_child.jl`, the subprocess the example smoke
+suite runs its cases in, and `characterize.jl`, a review instrument that is
+deliberately not included — it asserts nothing and prints a diffable
+golden-value report (`julia --project=. test/characterize.jl > before.txt`,
+apply a fix, rerun, diff).
 
 ### Examples (`examples/`)
 
@@ -188,7 +195,12 @@ example:
 |---|---|---|
 | `tutorials/` | Teach the API | Numbered, read in order, each building on the last. A header block states what the reader will learn and what they should already know; the comments teach rather than annotate; the dimension is never hardcoded unless the example is deliberately 1-D. Aim at roughly 60 SLOC of code — comment volume is unrestricted, and generosity is expected. |
 | `applications/` | Show the package on a recognisable problem | A problem a reader would know from a textbook or from practice, solved plainly, with no cleverness that obscures the API. This is also where the package is shown working alongside third-party Julia packages (`Tensors.jl`, `FileIO`/`MeshIO`, `OrdinaryDiffEq.jl`). |
-| `reproductions/` | Hold the scientific record | Benchmarks whose problem, protocol and headline number are fixed and must not move: the method paper's benchmarks at their published configurations, the FCM moment-fit reproductions, and the package's own benchmarks scored against an external reference (`adaptive_tanh_layer_2d` against deal.II 9.5.1's step-27 on a fixed lattice). These are pinned by the example smoke suite and are not to be coarsened for speed. The one standing exception is `traveling_laser_2d`, which runs a fifth of its revolution in the default suite because the published configuration takes six and a half minutes at `-O0` on eight threads against roughly one and a half for the whole examples testset; its case comment records the full-study numbers and what the shortened run gives up. |
+| `reproductions/` | Hold the scientific record | Benchmarks whose problem, protocol and headline number are fixed and must not move: two studies of the method paper (`singular_square_2d`, one instance of the §5.2 sweep, and the §5.3 `conditioning_small_overlap`), a literature baseline (`laplace_unit_square_smooth`, after Wagner & Liu 2000), and the package's own adaptivity benchmarks, each scored against an external reference (`traveling_laser_2d` against an exact convolution, `adaptive_tanh_layer_2d` against deal.II 9.5.1's step-27 on a fixed lattice). These are pinned by the example smoke suite and are not to be coarsened for speed. The one standing exception is `traveling_laser_2d`, which runs a fifth of its revolution in the default suite because the full study takes 6.3 minutes at `-O0` on eight threads, more than the rest of the example suite put together; its case comment records the full-study numbers and what the shortened run gives up. |
+
+**Requirement not yet met:** `tutorials/03_immersed_fcm`,
+`tutorials/04_bspline` and `tutorials/06_adaptive_hp` hardcode two
+dimensions (literal 2D boxes, `x[1]` / `x[2]`, a 2D polyline boundary);
+only `02_overlays` and `05_ladders` keep the dimension one named constant.
 
 Each example lives in its own sub-directory
 `examples/<tier>/<name>/` with a `<name>.jl` driver and a
@@ -204,8 +216,9 @@ Julia 1.11 feature; the package itself still supports Julia 1.10.
 A shared helper `examples/reporting.jl` is `include`d by every
 example via `joinpath(@__DIR__, "..", "..", "reporting.jl")` and
 depends only on what `Unfitted.jl` already exports. Every example
-prints its report through `print_run_report`, so the whole set reads
-the same way and the smoke suite has one output format to parse.
+prints its report through it — `print_run_report`, or, for the
+conditioning sweep, `print_parameter_block` followed by one CSV row per
+configuration — so the whole set reads the same way.
 
 Run an example with
 
@@ -219,9 +232,9 @@ example resolves and installs that example's own dependencies.
 Output artifacts go under `examples/<tier>/<name>/output/`, which is
 git-ignored repository-wide.
 
-Examples should demonstrate the *public* API; reach into
-`Unfitted._internal` only when an example is specifically about those
-internals, which none of the current set is.
+Examples should demonstrate the *public* API; use an internal
+(`_`-prefixed) name of `Unfitted` only when an example is specifically
+about those internals, which none of the current set is.
 
 Prose in an example is held to the same standard as prose in `src/`:
 full sentences, unicode maths, never LaTeX, and a citation with
@@ -229,11 +242,17 @@ authors, title, journal, year and DOI wherever a published result is
 involved. An application or reproduction must state the problem, the
 reference if there is one, and what the printed metric means, so that a
 reader can tell from the output alone whether the run succeeded.
+**Requirement not yet met:** `reproductions/laplace_unit_square_smooth`
+cites Wagner & Liu (2000) without its DOI.
 
 ### Benchmarks (`benchmarks/`)
 
-Small targeted benchmarks with their own `Project.toml`. Driven and
-documented by `benchmarks/runbenchmarks.jl`.
+Two kinds, sharing their own `Project.toml`: a BenchmarkTools suite
+(`suite.jl`, grouping `microkernels/`, `build/`, `assembly/` and
+`scenarios/`), driven and documented by `benchmarks/runbenchmarks.jl`; and
+standalone timing scripts (`intersections.jl`, `assembly.jl`,
+`transfer.jl`, `dirichlet_projection.jl`) that need nothing beyond the
+package. The commands are under *Performance*.
 
 ### Developer tooling
 
@@ -274,11 +293,14 @@ this protocol:
 
 QuESo's source under `github.com/manuelmessmer/QuESo` is the algorithmic
 reference for the structure of the `NonnegativeFit` compression in
-`src/fcm.jl`; it is a design reference only and no QuESo code is vendored. The deliberate
-deviations from that source — a CSG level-set geometry kernel instead of a
-B-rep triangulation, and *exact* moments from Saye's implicit quadrature
-(`src/implicit.jl`) instead of a divergence-theorem surface integral with a
-point-elimination retry — are documented at the top of `src/fcm.jl`.
+`src/fcm.jl`; no QuESo-derived code remains and none is vendored. The
+deliberate deviations from that source — a CSG level-set geometry kernel
+instead of a B-rep triangulation, and moments from Saye's implicit
+quadrature (`src/implicit.jl`; exact where the leaves are planar,
+spectrally accurate on curved ones) instead of a divergence-theorem surface
+integral, which drops QuESo's octree stair-step integrator, its
+`PointElimination` loop and its `AssembleIPs` retry — are documented at
+the top of `src/fcm.jl`.
 
 ## Method and architecture
 
@@ -296,8 +318,9 @@ u_h(x) = Σₖ u_h^(k)(x)
 
 Each overlay contribution `u_h^(k)` is extended by zero outside its
 overlay domain `Ω^(k)`. The base level covers the full physical domain
-`Ω`; subsequent overlay levels `k > 0` cover proper sub-regions of `Ω`,
-chosen to refine where the solution needs more resolution.
+`Ω`; every overlay lies inside the base level's box, which it may span
+entirely (every level of a `ladder` does), and its active region is what
+refines where the solution needs more resolution.
 
 Overlay levels are *not* topologically merged with their parents, and the
 package contains no hanging-node machinery. Instead, every overlay level
@@ -316,11 +339,13 @@ region intersected with `Ω`, so `Γ_o^(k)` is the part of the active
 region's boundary that meets `Ω`: a face of it lying wholly outside `Ω`,
 on the overlay's box or between two of its cells, has nothing on either
 side to keep continuous and carries no condition. One rule decides this
-for every face and every family, `_on_artificial_boundary` in
-`src/dofs.jl`. These artificial constraints are imposed
-strongly (eliminated dofs for the integrated Legendre basis and
-maximal-continuity B-splines; homogeneous linear constraints, resolved by
-the basis family that emits them, for integer-continuity B-splines). They
+for every face of every family that clamps, `_on_artificial_boundary` in
+`src/dofs.jl`; maximal-continuity B-spline support selection asks the same
+material question of the cells across the face (`_cell_admissible`).
+These artificial constraints are imposed strongly (eliminated dofs for the
+integrated Legendre basis and maximal-continuity B-splines; homogeneous
+linear constraints, resolved by the basis family that emits them, for
+B-splines below maximal continuity). They
 are kept strictly separate from *physical* boundary conditions on `∂Ω`:
 mixing the two is explicitly disallowed.
 
@@ -330,7 +355,10 @@ The core library is written for arbitrary spatial dimension `D ≥ 1`.
 Geometry, meshes, element lookup, basis evaluation, integration regions,
 assembly, constraints, projection, and field evaluation are all
 parameterized by `D`. There are no separate 1D / 2D / 3D code paths
-shadowing a generic implementation.
+shadowing a generic implementation. The one dimensional limit in the core
+is immersed-surface integration: a `BoundaryMesh` carries points,
+segments and triangles, so surface and interface terms (an immersed
+Nitsche condition, a `couple` interface) exist for `D ≤ 3`.
 
 In practice this means:
 
@@ -386,12 +414,17 @@ interface:
     family and polynomial degree;
   - the dof-layer hooks: `_tensor_dof_key`, `_key_on_level_side`,
     `_overlay_constraints!` (whose default eliminates each raw the per-raw
-    `_has_overlay_constraint` predicate accepts) and, for leaf semantics,
-    the burial hooks of the one pruning driver `_coverage_constraints!`
-    (`_sheds_any`, `_burial_cells`, `_reproduces`, …) — each reading a
-    typed per-level context and writing into the elimination ledger — plus
-    `_resolve_rows!` if the family records linear-constraint rows (see
-    *Degree-of-freedom enumeration and constraints*).
+    `_has_overlay_constraint` predicate accepts) and `_resolve_rows!` if
+    the family records linear-constraint rows (see *Degree-of-freedom
+    enumeration and constraints*), which read a typed per-level context and
+    write into the elimination ledger; and, for leaf semantics, the burial
+    predicates of the one pruning driver `_coverage_constraints!`
+    (`_sheds_any`, `_burial_cells`, `_reproduces`, …).
+
+The complete list, with its defaults — including `basis_name`,
+`is_boundary_basis`, and the per-cell-order hooks `_supports_cell_order`,
+`_cell_modes` and `_index_admissible` — is the `BasisFamily` docstring in
+`src/basis.jl`.
 
 The integrated Legendre implementation uses 1D hierarchical endpoint and
 interior modes, then builds `D`-dimensional tensor-product bases from
@@ -411,12 +444,14 @@ properties of *some* families, not of the framework.
 ### Mesh and refinement model
 
 Meshes are axis-aligned Cartesian tensor-product meshes. Each level
-carries its own mesh, basis family, polynomial/order metadata, and dofs.
+carries its own mesh, basis family, per-cell order field and activation
+mask; the dof layout numbers each level's functions as one contiguous range.
 Overlay levels are positioned independently of lower levels: overlay
 boundaries need not coincide with lower-level element boundaries, and
 overlays are never topologically merged with their parents. The package
 does, however, carry a pruning rule for redundancy. Under *leaf
-semantics*, which are unconditional and have no keyword, every
+semantics*, which are on by default and have no keyword on `space`,
+`overlay` or `ladder`, every
 high-order mode whose entire incidence stencil is covered by a finer
 level is eliminated, leaving the linear skeleton. Elimination is
 per-mode, not per-cell: a mode is shed only when *every* cell it is
@@ -434,7 +469,8 @@ box left the cell's high-order modes active next to the finer level's
 copies of them on Ω, each an exact null mode of the operator.
 
 Both material questions — the part of a cut cell outside its cover, and
-whether an overlay's box face meets Ω — are answered by the cell
+whether a face of a level's active region, on its box or between two of
+its cells, meets Ω — are answered by the cell
 classifier, whose verdicts are taken on closed sets. A face on which `∂Ω`
 lies exactly therefore counts as holding material: it stays clamped, the
 cell behind it stays uncovered, and the exact null modes those rules
@@ -461,7 +497,7 @@ subdivision coefficients are strictly positive and its representation is
 unique. Any further
 family takes no part unless it opts in (`_sheds_any`, `_reproduces`), so on such a space
 leaf semantics eliminate nothing. `prepare(problem;
-prune = false)` is the one way to build a space's unreduced twin; it is
+prune = false)` is the public way to build a space's unreduced twin; it is
 a diagnostic — exactly singular on a nested stack — rather than a
 discretisation to solve with. See `src/coverage.jl` and
 `_coverage_constraints!` in `src/dofs.jl`;
@@ -503,8 +539,8 @@ The core stores a level's rows but does not resolve them: a family that
 records rows implements `_resolve_rows!`, which receives them in emission
 order after the level's hooks have run and records each raw it eliminates
 with `_pivot!` — strongly, or as a depth-one pivot `u_r = Σᵢ wᵢ u_{rᵢ}`
-over raws that stay free. The core default raises. Integer-continuity
-B-splines are the only such family today, so the cascade resolver lives
+over raws that stay free. The core default raises. B-splines below
+maximal continuity are the only such family today, so the cascade resolver lives
 in `ext/UnfittedBasicBSplineExt.jl` and is tested in
 `test/test_basis_bspline.jl`. Pivots are stored once per topology, and
 assembly (`_slots!`, `_condense!`) and `dof_value` read them through one
@@ -559,7 +595,8 @@ constructed as follows:
      (the default — at least one level covers the box; used by assembly,
      field evaluation, and visualization), `:all_levels` (every level of
      the space covers it), or a caller-supplied predicate
-     `parents -> Bool`. No in-tree caller uses the predicate form:
+     `parents -> Bool`. No package code uses the predicate form (only the
+     tests do):
      `projection.jl` builds its transfer regions from the partition
      engine (`_partition`) directly and applies its own target-coverage
      test rather than going through a `criterion`. Any other value
@@ -593,35 +630,39 @@ them one dimension down.
 
 When overlay positions change:
 
-  - rebuild affected intersection regions and level couplings;
+  - rebuild the integration plan and dof layout, reusing every cut-cell
+    rule whose box the move left unchanged;
   - reuse geometry-dependent matrices only when the geometry and active
     spaces are unchanged;
   - update time-dependent load vectors independently;
-  - transfer state by a variational projection (such as an `L²`
-    projection or an energy projection), not by pointwise interpolation;
+  - transfer a field's coefficients by `L2Projection`, or by `Rewire`
+    where the target basis contains the source's — never by pointwise
+    interpolation (per-quadrature-point history data is the exception:
+    `RBFP0` interpolates a `QuadField` across a rebuild by design);
   - test projection on constants, low-order polynomials, and fields
     represented exactly in both spaces.
 
 **Requirement not yet met:** on an immersed model — a space carrying a
 `PhysicalDomain` — there is no state transfer across an h-refinement or an
 h-release. `L2Projection` refuses any target carrying a physical domain
-outright, and `Rewire` refuses a target whose active basis does not contain
+outright, and `Rewire()` refuses a target whose active basis does not contain
 the source's, which is what leaf semantics make of a refinement and what a
-release makes of a cover. An adaptive or transient loop on an immersed model
+release makes of a cover (`Rewire(strict = false)` would drop the buried
+coefficients instead of refusing). An adaptive or transient loop on an immersed model
 therefore re-solves on the new space rather than carrying its iterate across,
 and `estimate` needs that fresh solve before it can be called again. The
 restriction is specific to the h-step: a pure **p**-step buries nothing, so
 `Rewire` accepts it — measured on the unit square minus a centred disc, an
-8×8 order-2 base raised to order 3 on two leaf cells (216 → 223 unknowns)
+8×8 order-2 base raised to order 3 on two adjacent leaf cells (216 → 223 unknowns)
 transferred with the evaluated field unchanged to the last bit at four
 interior points. `test_adaptivity.jl` pins both refusals so neither can decay
 into silently dropped coefficients.
 
 ### Small overlaps and conditioning
 
-Tiny integration boxes — those much smaller than the geometry tolerance
-relative to the domain — are a known conditioning hazard for unfitted
-methods. The package detects and reports them in the assembly
+Tiny integration boxes — regions whose box volume falls below
+`GeometryTolerance.small_volume` (default `√eps`, an absolute volume) — are
+a known conditioning hazard for unfitted methods. The package detects and reports them in the assembly
 diagnostics instead of silently dropping or rescaling them.
 
   - Track condition numbers or solver iteration counts in tests and
@@ -647,8 +688,9 @@ masks, or intersection-region internals.
     assemble, solve or step in time, evaluate fields, move overlays, and
     project state — all with a small number of clear calls.
   - **Expert escape hatches.** Users can inspect or provide quadrature
-    rules, tolerances, basis families, solver/preconditioner choices,
-    overlay geometry, and projection forms without rewriting assembly
+    rules, tolerances, basis families, solver hooks (`linear_solver`),
+    overlay geometry, and the transfer backend (`L2Projection`, optionally
+    with a cached mass matrix, or `Rewire`) without rewriting assembly
     code.
   - **Methods exposed directly.** Names and objects reflect domains,
     levels, overlays, basis families, active spaces, integration
@@ -674,7 +716,12 @@ masks, or intersection-region internals.
   - **Actionable errors.** Distinguish invalid overlay placement,
     inconsistent dimensions, unsupported basis-family constraints,
     singular systems, and small-overlap conditioning warnings — by
-    error type and message.
+    error type and message. **Requirement not yet met:** the package
+    defines no exception types of its own — it raises `ArgumentError`,
+    `DimensionMismatch` and `BoundsError`, told apart by message alone —
+    a singular system is not detected (`solve!` reports `converged` from
+    the finiteness of the residual), and small overlaps are reported in
+    `diagnostics`, never warned.
 
 ### Common workflows the API must keep easy
 
@@ -694,8 +741,8 @@ masks, or intersection-region internals.
     refine, coarsen, with the loop itself left to the caller.
   - Attaching an immersed physical domain via a level-set function and
     integrating only over `Ω`.
-  - Moving an overlay and rebuilding only the affected geometry and
-    coupling data.
+  - Moving an overlay in one call, reusing the cut-cell rules of the
+    regions it leaves unchanged.
   - Variational projection from an old space to a new space.
   - Evaluating a superposed solution at points or on a visualization
     grid.
@@ -778,7 +825,8 @@ is linearly independent **by construction** and needs no deduplication — a
 degree-`p`, `C^(p−1)` function supported inside the region would have to be
 `C^p` to lie in the degree-`p+1` space there, hence a polynomial, hence zero
 — so the two spaces intersect trivially. `decide` therefore withholds the
-p-step on such a level and sends every marked cell to h, which is the
+p-step on such a level and sends every marked cell to h (dropping one that
+has no h-step either), which is the
 adaptive loop the isogeometric literature runs; `estimate` uses the same
 superposition idea for its own enrichment.
 
@@ -830,12 +878,14 @@ superposition idea for its own enrichment.
     with them, 0.15 without, the mask's bit per cell being most of the rest;
     about 90 MB across the 22.4 M cells of a depth-9 stack), and the
     discretisation pin digested the class array at 8 hash rounds per cell.
-    The record type is still one; the uniform case is one `nothing` branch
-    in four readers — `cell_order`, `cell_basis_indices`, `cell_orders` and
-    the assembly hot path's `_active_set`, which reads no mask because
-    every region parent is an active cell by construction (`_signature`).
-    The readers check the cell against the level's grid themselves, since
-    a uniform level has no array whose indexing would.
+    The record type is still one; the uniform case is a `nothing` branch in
+    `_order_at` (behind `cell_order`), in `_active_set` (behind
+    `cell_basis_indices` and the assembly hot path, and reading no mask
+    because every region parent is an active cell by construction,
+    `_signature`) and in `cell_orders`. `cell_order` and
+    `cell_basis_indices` check the cell against the level's grid
+    themselves, since a uniform level has no array whose indexing would;
+    `_active_set` is the unchecked hot-path read.
     `cell_order(level, cell)` is the question anything that integrates,
     evaluates or subdivides must ask, and every quadrature consumer does:
     the region rule, the moment-fit order, the facet rule, the immersed
@@ -850,9 +900,12 @@ superposition idea for its own enrichment.
     inner constructor from the orders, the mesh, the family (which carries
     the basis mode) and the mask, and never supplied by a caller.
   - **Order ≥ 1 per cell** is enforced per palette entry at construction, and
-    `mode = :trunk` requires isotropy per cell. Neither can be expressed by
+    `mode = :trunk` requires isotropy per cell; `_build_cell_orders` checks
+    both through `local_basis_indices`. The first cannot be expressed by
     the minimum rule: the dof key collapses the two endpoint modes into one
     node factor, so no filter over keys can see a missing endpoint mode.
+    The second holds because the `:trunk` filter compares against one
+    scalar `p`.
   - **The acceptance test is the per-basis-function one-sided trace jump**,
     asserted `== 0` (`test/test_cell_order.jl`). An L² projection convergence
     rate does *not* discriminate — a non-conforming space is strictly larger
@@ -919,7 +972,8 @@ the loop, and nothing in `src/adaptivity.jl` holds state between cycles.
 
     Two things the application step owes a family with wide support. The p-step
     is withheld on a level that carries no per-cell order, so every marked cell
-    there takes h; and the h-step **support-extends** the cells it wakes, by the
+    there takes h (or is dropped, if it has no h-step either); and the h-step
+    **support-extends** the cells it wakes, by the
     family's own `_support_radius`, because a region narrower than that radius
     carries no functions at all and a refinement that refines nothing makes a
     loop that never terminates. `_support_radius` is zero for integrated
@@ -932,8 +986,8 @@ the loop, and nothing in `src/adaptivity.jl` holds state between cycles.
     that fell short takes h. `previous = (V_last, est_last)` is the only state
     the rule needs — a p-step shows up as a raised order and an h-step as a
     cell that was not active before — so nothing is stored between cycles.
-    Omit `previous` and every marked cell takes p, which is right for the first
-    cycle and wrong thereafter. The constants γ_p² = 0.4 and γ_h² = 4 are the
+    Omit `previous` and every marked cell takes p, falling back to h only where
+    p is unavailable, which is right for the first cycle and wrong thereafter. The constants γ_p² = 0.4 and γ_h² = 4 are the
     literature's calibration and are deliberately not exposed.
 
     > J. M. Melenk, B. I. Wohlmuth, *On residual-based a posteriori error
@@ -946,7 +1000,7 @@ the loop, and nothing in `src/adaptivity.jl` holds state between cycles.
     header records that measurement, the comparison against deal.II's step-27,
     and why the two steps are kept independent rather than welded to depth.
 
-  - **`coarsen(V; h, p, pmin = 1)`** is the inverse of both steps: it releases
+  - **`coarsen(V; h = (), p = (), pmin = 1)`** is the inverse of both steps: it releases
     an h-step by deactivating the cover it woke, and a p-step by lowering the
     order, bounded below by `pmin`. There is deliberately no
     `coarsen(V, estimate)` form — which cells to release is not settled by the
@@ -955,7 +1009,8 @@ the loop, and nothing in `src/adaptivity.jl` holds state between cycles.
 The loop's restrictions, all of them checked rather than assumed: a
 single-domain, single-field model (the field may carry any number of
 components); an assembled model, and a solution of that model as it stands;
-`enrichment ≥ 1`; a coercive form; no form keyed by quadrature-point index,
+`enrichment ≥ 1`; a coercive form (checked as far as the indicator reads it:
+a non-positive complement diagonal raises); no form keyed by quadrature-point index,
 which the enriched model would read on a different cloud; and `V⁺ ⊇ V`, so a
 B-spline level under an integrated-Legendre level is refused. A per-cell order
 (`_supports_cell_order`) is needed by the p-step alone: a level without one
@@ -975,7 +1030,7 @@ Carrying the leaves separately — rather than collapsing them into one
 quadrature kernel stays high-order across creases and corners. Boolean
 indicator representations are intentionally not supported.
 
-  - **Build geometry** with [`leaf`](@ref) and the CSG combinators:
+  - **Build geometry** with `leaf` and the CSG combinators:
     `leaf(f; lipschitz=Inf)`, `intersect(a, b…)`, `union(a, b…)`,
     `setdiff(a, b)`, `complement(a)`. A bare callable is auto-wrapped as a
     default leaf, so the single-level-set case stays ergonomic.
@@ -996,8 +1051,9 @@ indicator representations are intentionally not supported.
       `leaf(...)` call instead.
     - `alpha`: fictitious-region weight for α-FCM stabilization. `0` is
       the strict cut path; `> 0` enables α-FCM (every cut cell's rule
-      becomes `(1 − α)·(physical rule) ∪ α·(full-cell tensor rule)`, and
-      fully fictitious cells carry α-scaled weights). Independently, fully
+      becomes `(1 − α)·(physical rule) ∪ α·(full-cell tensor rule)`, and a
+      fully fictitious region of a kept cell carries α-scaled tensor
+      Gauss). Independently, fully
       fictitious *cells* are dropped from the dof layout by default and
       retained only when `keep_fictitious = true` (which then requires
       `α > 0`). The α-scaled cut-cell enrichment applies regardless of
@@ -1028,7 +1084,7 @@ indicator representations are intentionally not supported.
       the tensor Gauss count on an uncut cell, and QuESo's convention — at
       roughly the cube less compression time, but exact for a stiffness
       form only up to `p = 2` (the condition is `factor ≥ 2 − 2/p`).
-      `physical_domain`'s docstring carries the measured order-1-to-7
+      `PhysicalDomain`'s docstring carries the measured order-1-to-7
       comparison, where factor `1` stops converging after `p = 2`.
     - `cut_rule`: the first stage of a cut cell's quadrature, a callable
       `(physical, box, moment_order) -> (points, weights)` that integrates
@@ -1037,9 +1093,12 @@ indicator representations are intentionally not supported.
       count matched to the moment order.
     - `compression`: the second stage, a callable
       `(points, weights, moments, basis) -> (points, weights)` that
-      replaces the cut rule by at most `length(basis)` points reproducing
-      its moments `basis(points, weights)` over the tensor Legendre basis
-      `basis::MomentBasis` of the box. `Caratheodory()` (default) prunes
+      replaces the cut rule by one reproducing its moments
+      `basis(points, weights)` over the tensor Legendre basis
+      `basis::MomentBasis` of the box, with — in intent — at most
+      `length(basis)` positive weights; `cut_cell_rule` drops the zero
+      weights a compression leaves and does not check the count.
+      `Caratheodory()` (default) prunes
       the cut rule to a subset of its points by Carathéodory's theorem,
       exact by construction; `NonnegativeFit()` is a non-negative
       least-squares fit on candidates drawn from the cut rule; `nothing`
@@ -1071,14 +1130,20 @@ indicator representations are intentionally not supported.
     `∫_cell α(x) f = (1 − α)∫_Ω f + α∫_cell f`), `:cut_fallback` (the
     compressed rule's moment residual exceeded the failure threshold, so
     the region carries the cut rule the moments were summed from —
-    correct and non-negative, but with 50–200× the points, and blended
+    correct and non-negative, but uncompressed: on the many-feature
+    cells where a fallback is plausible, 10³–10⁵ points and a 50–200×
+    blow-up in that cell's assembly work — and blended
     with the α-scaled tensor rule exactly as `:cut_fitted` is under
     `α > 0`), `:cut_failed` (strict-cut `α = 0` region whose `Ω ∩ box`
     carries no cut rule at all; region contributes zero quadrature) and
     `:cut_alpha_failed` (the same under `α > 0`: the empty physical part
     is dropped but the α-scaled tensor rule is retained so the cell's
-    dofs stay α-stabilised — a nonzero rule). The assembly hot loop is
-    unchanged — it just iterates `zip(points, weights)`.
+    dofs stay α-stabilised — a nonzero rule); on a facet region also
+    `:fictitious` (a face outside `Ω` under `α = 0`, kept with an empty
+    rule where the volume plan drops the region), and on the simplex
+    regions of an immersed `BoundaryMesh` or a coupling interface
+    `:surface` / `:interface`. One compiled loop serves every kind: it
+    walks the rule's points and weights (`_region_point`).
 
     **Grid-aligned boundary faces use the same vocabulary**, on
     `FacetRegion.kind`, because they run the same dispatch one dimension
@@ -1103,8 +1168,8 @@ indicator representations are intentionally not supported.
     defaulting to `2`; the cut rule is the Saye volume rule, whose tensor
     Legendre moments `cut_cell_rule` sums and hands to the compression.
     `Caratheodory` reduces the cut rule by recombination — its points
-    grouped into `2 · nbasis` clusters whose moment vectors are pruned, so
-    at least half of them drop per round — until at most `2 · nbasis`
+    grouped into at most `2 · nbasis` clusters whose moment vectors are
+    pruned, roughly halving the points per round — until at most `2 · nbasis`
     points are left, and prunes those directly, each pruning walking along
     null vectors of the moment matrix until a weight reaches zero; the
     null vectors come from a pivoted Householder QR written in Julia, so
@@ -1208,14 +1273,18 @@ indicator representations are intentionally not supported.
 
 ### Naming
 
-Prefer concise verbs and nouns such as `overlay`, `basis`, `space`,
-`assemble`, `solve`, `project`, `move`, `evaluate`, and `diagnostics`
-over framework-heavy terminology. The public API should read like the
-method, not like a software architecture.
+Prefer concise verbs and nouns such as `space`, `overlay`, `ladder`,
+`adapt`, `refine`, `assemble`, `solve!`, `transfer`, `value`, and
+`diagnostics` over framework-heavy terminology. The public API should
+read like the method, not like a software architecture.
 
 An exported name must not also be an export of a package an extension
 integrates: a session that loads both could call neither by its bare
-name.
+name. **Requirement not yet met:** `triangle_mesh` is exported by both
+`Unfitted` and GeometryBasics, a trigger package of the MeshIO
+extension. The documented `using Unfitted, FileIO, MeshIO` does not
+surface the clash, since GeometryBasics loads transitively, but a session
+that also runs `using GeometryBasics` must qualify `Unfitted.triangle_mesh`.
 
 ## Code style and documentation
 
@@ -1313,12 +1382,15 @@ below so the codebase converges over time.
     followed by a blank line and prose in full sentences. Argument
     conventions, defaults, return value, and citations follow in that
     order. The `PhysicalDomain` and `physical_domain` docstrings in
-    `src/physical.jl` are fully worked examples.
+    `src/physical.jl` are worked examples of the layout; `bspline` in
+    `src/stubs.jl` also shows the return type and a citation. The one
+    exception is a Makie recipe, whose docstring opens with prose because
+    Makie appends its attribute reference to it.
 
   - **Section dividers in long files.** When a file has clearly
     separable stages or concerns (`src/fcm.jl`'s moments / cut rule /
     compression pipeline; `precommit.jl`'s CLI / file discovery / formatting /
-    code statistics / reporting / main) group them with single-line `─`
+    line length / code statistics / reporting / main) group them with single-line `─`
     dividers carrying the section name. The canonical form:
 
     ```julia
@@ -1334,11 +1406,16 @@ below so the codebase converges over time.
     the algorithm name; the full upstream citation with authors, title,
     journal, year, and DOI; the upstream license; the source URL; and
     a brief list of deliberate deviations from upstream. The top of
-    `src/fcm.jl` is the model.
+    `src/fcm.jl` is the model. **Requirement not yet met:** that model's
+    own citations are incomplete — its QuESo, Carathéodory, Businger–Golub
+    and Litterer–Lyons references carry no titles, and the QuESo authors
+    are abbreviated.
 
   - **Internal-helper commentary** sits *above* the function or struct
     definition, as either a docstring or a `#` block. Trailing inline
-    comments on a function header line are not used.
+    comments on a function header line are not used. **Requirement not yet
+    met:** the header of `_region_edges!` in `ext/UnfittedMakieExt.jl`
+    carries one.
 
   - **Math and citations** inside docstrings and comments follow the
     same rules as the surrounding prose: unicode math, full citations
@@ -1361,7 +1438,8 @@ below so the codebase converges over time.
 The conventions used throughout the codebase, in one place so files do
 not have to re-derive them:
 
-  - **Physical coordinates** `x ∈ Ω ⊂ ℝᴰ`: the user-facing world frame.
+  - **Physical coordinates** `x ∈ ℝᴰ`: the user-facing world frame, in
+    which the background box and `Ω` are given.
   - **Reference cell coordinates** `ξ ∈ [−1, 1]ᴰ`: per-cell reference
     frame used by basis evaluation and quadrature.
   - **Region frame coordinates** `η ∈ [−1, 1]ᴰ`: the frame of an
@@ -1455,8 +1533,9 @@ Rules:
     arena slice (no shared writes, dynamically load-balanced); phase 2
     gives each task a contiguous range of dofs, walks every region in
     list order, and adds the region's entries in its owned rows and
-    columns through the column kernel the serial scatter uses. Both
-    phases are barrier-free and lock-free. There is no gather plan: the
+    columns through the column kernel the serial scatter uses. Neither
+    phase takes a lock or a barrier between regions; the one barrier is
+    the `@sync` that ends phase 1. There is no gather plan: the
     arena layout is a closed form of each region's dof count, and the
     only symbolic input, each region's sorted dof list, is cached on the
     model with the pattern, so repeated assembly pays for it once.
@@ -1471,7 +1550,7 @@ Rules:
     (whose peak memory scales with the thread count).
   - Avoid locks and atomic *accumulation* in the hot scatter. A racy atomic
     scatter is nondeterministic and was measured to corrupt the solve of an
-    ill-conditioned (cond ≈ 3e16) system; a fixed-order gather does not. (An
+    ill-conditioned system; a fixed-order gather does not. (An
     atomic counter that only hands out region indices for load balancing is
     fine — it never touches the shared output.)
   - Threaded assembly is **bit-identical to serial**: every slot is
@@ -1489,11 +1568,15 @@ Rules:
   - Benchmark before adding complicated optimizations.
 
 For performance-relevant changes, run the targeted benchmarks before
-and after:
+and after. The standalone scripts need nothing beyond the package; the
+BenchmarkTools suite has its own environment, into which Unfitted is
+dev'd once:
 
 ```bash
 julia --project=. benchmarks/intersections.jl
 julia --project=. benchmarks/assembly.jl
+julia --project=benchmarks -e 'using Pkg; Pkg.develop(path=pwd()); Pkg.instantiate()'   # once
+julia --project=benchmarks benchmarks/runbenchmarks.jl
 ```
 
 ## Testing
@@ -1515,6 +1598,14 @@ demos.
     polynomial exactness, and quadrature consistency.
   - Tensor-product basis ordering, values, and gradients in 2D and 3D,
     plus one low-order 4D smoke test.
+
+    **Requirement not yet met** for the four bullets above: box
+    containment is tested in 2D only; mesh construction directly in 2D
+    and 4D, and in 1D and 3D only through `test_ladder.jl`'s ladders; the
+    integrated Legendre basis has no direct 1D polynomial-exactness or
+    quadrature-consistency testset (`test_projection.jl`'s exactly
+    represented polynomial covers it indirectly); and 3D tensor ordering
+    is checked by count only.
   - Basis-family interface tests that fail if assembly or constraints
     rely on integrated-Legendre-only assumptions outside the basis
     layer.
@@ -1535,22 +1626,24 @@ demos.
     carrying a discontinuous or under-resolved feature; a 2D singular
     corner problem; a small-overlap conditioning smoke test; and a
     moving heat-source smoke or reduced regression test. The last three
-    are `reproductions/singular_square_2d`,
-    `reproductions/conditioning_small_overlap` and
-    `reproductions/traveling_laser_2d`, all pinned by the example
-    smoke suite. **Requirement not yet met:** the one-dimensional slot
+    are `reproductions/singular_square_2d` (UMLHP §5.2),
+    `reproductions/conditioning_small_overlap` (§5.3) and
+    `reproductions/traveling_laser_2d` (the package's own moving-source
+    study, against an exact convolution reference), all pinned by the
+    example smoke suite. **Requirement not yet met:** the one-dimensional slot
     is vacant. It used to be `bar_1d_unresolved_interface`, an elastic
     bar whose material interface fell inside a cell; that example was
     retired in the examples rebuild, and `tutorials/01_first_solve`,
     which inherited the 1D slot, solves a *smooth* manufactured sine on
     the interval — it exercises the 1D path end to end, and the smoke
     suite pins its error, but it carries no discontinuity and nothing
-    the mesh fails to resolve. The nearest live coverage is split, and
-    none of it is one-dimensional: `test_assembly.jl`'s "discontinuous
-    coefficient need not align with overlay boundaries" for the
-    discontinuity itself, `applications/interface_coupling_2d` for a
-    jump in material data across a seam, and `tutorials/02_overlays`
-    for a feature the base mesh cannot resolve. Restoring the
+    the mesh fails to resolve. The nearest live coverage is a unit test
+    rather than an example: `test_assembly.jl`'s "discontinuous
+    coefficient need not align with overlay boundaries" puts a 1D jump in
+    the coefficient inside an overlay cell; in 2D,
+    `applications/interface_coupling_2d` covers a jump in material data
+    across a seam, and `tutorials/02_overlays` a feature the base mesh
+    cannot resolve. Restoring the
     requirement means adding a 1D discontinuous- or
     unresolved-feature run — most cheaply as a further section of
     `tutorials/01_first_solve`, or as a `reproductions/` entry if the
@@ -1566,12 +1659,16 @@ demos.
     masked uniform overlay, an immersed level and a ladder — the
     invariant the hot path's mask-free set read rests on. `dilate`'s box
     shape (one cell grows to `∏_d (2·by_d + 1)`), its per-axis widths, its
-    monotonicity in the width, its clipping at a box face, its refusals,
-    and its agreement with `support_extension` at the family's own radius.
+    additivity in the width (two dilations are one by the sum, and width 0
+    is the identity), its clipping at a box face, its refusals, and its
+    agreement with `support_extension` at the family's own radius
+    (`test_basis_bspline.jl`).
   - Immersed boundary (`PhysicalDomain`): strict-α cell-level
     fictitious fold drops the right cells; the expected
     `:full` / `:cut_fitted` / `:fictitious_alpha` / `:cut_fallback` /
-    `:cut_failed` / `:cut_alpha_failed` region-kind tags appear; every
+    `:cut_failed` / `:cut_alpha_failed` region-kind tags appear
+    (`:cut_fallback` through `cut_cell_rule`'s status and a hand-built
+    record: no real geometry is known to reach it); every
     built-in compression reproduces the cut rule's moments with
     non-negative weights at ≤ `nbasis` points, at every length scale;
     `MomentBasis` evaluates the tensor Legendre basis and sums moments
@@ -1590,12 +1687,15 @@ demos.
     caller's cut rule and compression replace the package's on cut regions
     only, compose with each other and with α, count their calls atomically
     as stages that may run on any thread must, are rejected for a negative
-    weight, and a cut rule that finds nothing — or nothing but zero
-    weights — routes its region to `:cut_failed` / `:cut_alpha_failed`.
-    **Requirement not yet met:** because `_partition` emits
-    pairwise-disjoint boxes, the `(box, moment order)` cache key never
-    repeats within one plan, so no test distinguishes a memoised rule
-    from an unmemoised one.
+    weight, and a cut rule that finds nothing routes its region to
+    `:cut_failed` / `:cut_alpha_failed`, one of zero weights being read
+    as empty (`cut_cell_rule`'s `:empty` status). The rule cache, keyed by
+    `(box, moment order)` and owned by the model, is reused across
+    rebuilds without refitting — `move!`, `adapted`, `moved`, an
+    `estimate`'s twin — and stays bounded by the current plan, pinned with
+    a counting `cut_rule` (`test_physical.jl`, `test_ladder.jl`); within
+    one plan a key never repeats, because `_partition` emits
+    pairwise-disjoint boxes.
   - Multi-domain coupling: a machine-precision Nitsche interface patch
     test across two independently discretised subdomains; the `couple`
     four-block sign pattern. The skip of interface regions where one
@@ -1609,13 +1709,16 @@ demos.
     `reduced_mode_counts` matches the eliminated set. The user-masked
     (`active =`) overlays `test_coverage_reduction.jl` builds check the
     material oracle and the coverage memo against a direct recomputation,
-    not a pruned space; the fully deactivated case is pinned indirectly by
+    not a pruned space — except the hole-face testset, which checks a
+    masked overlay's reduced layout and its rank; the fully deactivated
+    case is pinned indirectly by
     test_activation.jl's "fully-deactivated overlay equals no overlay",
     which compares active-unknown counts against an overlay-free space;
-    masked coverage under a ladder — split cover retained, single cover
-    shed, lossless by rank against the unreduced twin — is pinned in
-    `test_ladder.jl` ("covered-mode pruning on a ladder is lossless", with
-    the rank witness). Coverage of a cut cell by its share of Ω, and an
+    coverage under a ladder is pinned in `test_ladder.jl` — a split cover
+    retained ("a mode covered by two different levels is retained"), a
+    single cover shed ("a lower-order cover still sheds"), and lossless by
+    rank against the unreduced twin ("covered-mode pruning on a ladder is
+    lossless"). Coverage of a cut cell by its share of Ω, and an
     overlay face outside Ω left unclamped, are pinned against a *control*
     — the same overlay with its box extended over the cut cells, which
     leaves its active cells unchanged — for a folded and a cut layer of
@@ -1649,7 +1752,9 @@ demos.
     pairs and the per-base-cell depth map, with grading; `adapted` keeping
     the source model intact and reusing the moment-fit cache.
   - Automated hp adaptivity: `estimate`'s effectivity bounded over a range of
-    unknowns; its refusals — an unassembled model, `enrichment = 0`; its
+    unknowns; its refusals, each before `V⁺` is built — an unassembled
+    model, `enrichment = 0`, a second field, a stale solution, a form it
+    cannot measure, per-quadrature-point state, and `V⁺ ⊉ V`; its
     superposed enrichment on a family that carries no per-cell order, indexed
     back onto the caller's levels, and a whole loop driven on such a stack to a
     hundredfold reduction in both the error and the estimate; the h- and p-steps
@@ -1663,9 +1768,8 @@ demos.
   - Package extensions: the B-spline family's basis values, constraints
     and a small assembly; its refusal of a per-cell order through both
     `space` and `elevate`; the support-selection dof ledger — per axis
-    `n + p` with both faces physical and `n − p` with both artificial, one
-    eliminated function per artificial face for degree 1 and `p` for higher,
-    and the closed form `n + p − 2(m + 1)` at a requested continuity `m`; the
+    `n + p` with both faces physical and `n − p` with both artificial, `p`
+    eliminated functions per artificial face, and the closed form `n + p − 2(m + 1)` at a requested continuity `m`; the
     superposition being smooth and not merely each level, asserted as the
     decade ratio of the normal-derivative jump across an overlay face
     (10 at `:maximal`, below 1.5 at `C⁰` and for integrated Legendre); an
@@ -1709,14 +1813,16 @@ demos.
     refinement model*). A cover holding no base cell whole, whose burial test
     the driver's early exit used to skip, is pinned under both mechanisms.
   - Example smoke suite: every `examples/<tier>/<name>/<name>.jl`
-    script runs to a clean exit at a coarse size in the default suite,
-    with a finite, sane headline metric wherever the script prints one,
+    script runs to a clean exit in the default suite, at its published
+    size or at a coarser one its case comment justifies, with a finite,
+    sane headline metric wherever the script prints one,
     banded at the value measured on the configuration the case actually
     runs. Where a tutorial's *prose* tells the reader what to look for
     in the output, that claim is asserted too — the overlay's
     order-of-magnitude improvement over the base level, the agreement
-    between a reduced and an unreduced stack, the thirteen orders of
-    magnitude of conditioning that one duplicated B-spline mode costs —
+    between a reduced and an unreduced stack, the conditioning one
+    duplicated B-spline mode costs (recorded at 253 against 4.9e15, asserted
+    as a band below 1e4 and a floor above 1e10) —
     so a tutorial whose text and output disagree fails here. The cases
     share one batched subprocess (`test/run_examples_child.jl`), each
     included into its own `Module`, because the per-process compilation
@@ -1727,7 +1833,8 @@ demos.
     eleven that write ParaView output (`WriteVTK`), and those needing
     `Tensors`, `BasicBSpline` or `FileIO` + `GeometryBasics` + `MeshIO` —
     run under `Pkg.test`, where all of those sit in the `test` target,
-    and skip in a bare `--project=.` isolation run.
+    and skip in a bare `--project=.` isolation run — all but
+    `applications/time_integration`, below.
     **Requirement not yet met:** `applications/time_integration` needs
     `OrdinaryDiffEq`, which is deliberately absent from the package's
     dependencies, weak dependencies and test target — it is a
@@ -1745,12 +1852,11 @@ demos.
     clearly marked testset that is not required for every quick edit.
   - Pass constant-valued inputs as bare constants, not as closures, for
     the coefficient-shaped keywords that accept both — `source`,
-    `coefficient`, `diffusion` and Dirichlet data, which all pass through
-    `_datum_at`. Write `source = 1.0`, never `source = x -> 1.0`.
-    Every distinct closure is a distinct *type*, and each one forces a
-    full re-specialisation of the assembly emission kernel at roughly
-    0.9 s of compile time, for
-    an assembled result that is identical either way.
+    `coefficient`, `diffusion`, Neumann values and Dirichlet data, which
+    all pass through `_datum_at`. Write `source = 1.0`, never
+    `source = x -> 1.0`. Every distinct closure is a distinct *type*, and
+    each one forces a full re-specialisation of the assembly emission
+    kernel, for an assembled result that is identical either way.
   - When fixing a bug, add a regression test that fails without the
     fix.
   - When adding a new basis family, add at least one small assembly
@@ -1811,7 +1917,7 @@ A PR description should include:
 A task is done only when:
 
   - the implementation is compact and specialized to this method;
-  - relevant tests pass under at least one and many threads;
+  - relevant tests pass under one thread and under several;
   - new behavior is covered by tests, or by a justified benchmark or
     example;
   - numerical invariants are preserved;
@@ -1846,7 +1952,9 @@ spelled out in the PR:
   - Make B-splines or other basis families require rewriting geometry,
     intersections, assembly, projection, or solvers.
   - Hide conditioning problems by silently dropping tiny overlaps.
-  - Use point interpolation for state transfer after moving overlays.
+  - Transfer a field's coefficients by point interpolation after moving
+    overlays (per-quadrature-point history data is the exception; `RBFP0`
+    is the scheme for it).
   - Mix physical and artificial boundary constraints.
   - Introduce Boolean-indicator geometry representations for the
     immersed domain — the package commits to signed scalar level sets.
