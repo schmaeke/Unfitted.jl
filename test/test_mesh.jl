@@ -1,6 +1,6 @@
 @testset "mesh scaffold" begin
     omega = box((0.0, 0.0), (1.0, 1.0))
-    m = mesh(omega; cells=(2, 4))
+    m = CartesianMesh(omega; cells=(2, 4))
 
     @test m.cells == (2, 4)
     @test Unfitted.cell_count(m) == 8
@@ -10,7 +10,7 @@
     @test length(collect(Unfitted.cell_indices(m))) == 8
     @test Unfitted.boundary_coordinates(m)[1] == [0.0, 0.5, 1.0]
 
-    m4 = mesh(box((0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0, 1.0)); cells=(1, 2, 1, 2))
+    m4 = CartesianMesh(box((0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0, 1.0)); cells=(1, 2, 1, 2))
     @test Unfitted.cell_count(m4) == 4
     @test Unfitted.locate_cell(m4, (0.5, 0.75, 0.5, 0.25)) == CartesianIndex(1, 2, 1, 1)
 
@@ -22,7 +22,7 @@ end
     # The refusal is a `BoundsError`, and printing it must name the cell rather than fail inside `showerror` (a
     # hand-built `BoundsError(mesh, ::CartesianIndex)` could be thrown but not displayed). The `Space` form reaches the
     # same check.
-    m = mesh(box((0.0, 0.0), (1.0, 1.0)); cells=3)
+    m = CartesianMesh(box((0.0, 0.0), (1.0, 1.0)); cells=3)
     V = space(box((0.0, 0.0), (1.0, 1.0)); cells=3)
     for refuse in (() -> cell_box(m, CartesianIndex(4, 1)), () -> cell_box(V, CartesianIndex(4, 1); level=1))
         err = try
@@ -40,8 +40,8 @@ end
     # Interior nodes are fractions of the extent. An integer domain used to raise an `InexactError` from inside the node
     # computation (two cells) or to build a mesh no `GeometryTolerance` exists for (one cell); both spellings, and both
     # entry points, now refuse up front and say what to write instead.
-    for build in (() -> space(box((0, 0), (1, 1)); cells=2), () -> mesh(box((0, 0), (1, 1)); cells=2),
-                  () -> mesh(box((0, 0), (1, 1)); cells=1))
+    for build in (() -> space(box((0, 0), (1, 1)); cells=2), () -> CartesianMesh(box((0, 0), (1, 1)); cells=2),
+                  () -> CartesianMesh(box((0, 0), (1, 1)); cells=1))
         err = try
             build()
             nothing
@@ -52,7 +52,7 @@ end
         @test occursin("box((0.0, 0.0), (1.0, 1.0))", sprint(showerror, err))
     end
     # A rational domain is untouched: its nodes are exact.
-    @test mesh(box((0 // 1,), (1 // 1,)); cells=3).axes[1] == [0, 1 // 3, 2 // 3, 1]
+    @test CartesianMesh(box((0 // 1,), (1 // 1,)); cells=3).axes[1] == [0, 1 // 3, 2 // 3, 1]
 end
 
 @testset "a cell count, order or dilation width refusal names what it was given" begin
@@ -60,9 +60,9 @@ end
     # handed: an out-of-range integer or tuple by its value, any other spelling by its type.
     Ω = box((0.0, 0.0), (1.0, 1.0))
     V = space(Ω; cells=4)
-    @test_throws "cells entries must be positive; got 0" mesh(Ω; cells=0)
+    @test_throws "cells entries must be positive; got 0" CartesianMesh(Ω; cells=0)
     @test_throws "cells entries must be positive; got (2, 0)" space(Ω; cells=(2, 0))
-    @test_throws "got Tuple{Int64}" mesh(Ω; cells=(2,))
+    @test_throws "got Tuple{Int64}" CartesianMesh(Ω; cells=(2,))
     @test_throws "order entries must be positive; got (1, 0)" space(Ω; cells=2, order=(1, 0))
     @test_throws "by entries must be non-negative; got -1" dilate(V, [CartesianIndex(1, 1)]; level=1, by=-1)
     @test_throws "by entries must be non-negative; got (1, -1)" dilate(trues(4, 4), (1, -1))

@@ -89,14 +89,6 @@ function _mesh_axes(domain::AxisBox{D,T}, cells::NTuple{D,Int}) where {D,T}
 end
 
 """
-    mesh(domain::AxisBox; cells) -> CartesianMesh
-
-Public-API thin wrapper over the [`CartesianMesh`](@ref) constructor. Use it when you want a standalone mesh; for
-building a discretization for a problem, prefer [`space`](@ref).
-"""
-mesh(domain::AxisBox; cells) = CartesianMesh(domain; cells)
-
-"""
     cell_count(m::CartesianMesh) -> Int
 
 Total number of cells in the mesh, `prod(m.cells)`.

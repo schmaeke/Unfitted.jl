@@ -1,23 +1,35 @@
 # The public entry points of Unfitted's package extensions, declared and documented in the core.
 #
-# Four package extensions install methods on names declared here: Tensors.jl the tensor-notation readers
+# Five package extensions install methods on names declared here: Tensors.jl the tensor-notation readers
 # `symmetric_gradient`, `value_vec` and `gradient_tensor`; BasicBSpline.jl the B-spline family's factory `bspline`;
 # MeshIO.jl the mesh level sets `mesh_levelset` and `stl_levelset` (MeshIO loads FileIO and GeometryBasics, the other
-# two triggers of its extension, so `using MeshIO` alone installs them); and WriteVTK.jl the VTK writers below. Every
-# such name is declared and documented here rather than in its extension, so that `?name` answers in a bare
-# `using Unfitted` session (an extension's docstrings land in the extension module's own docs, not this one's) and
-# downstream code can name it unconditionally.
+# two triggers of its extension, so `using MeshIO` alone installs them); WriteVTK.jl the VTK writers; and Makie.jl the
+# plots `fieldplot`, `levelplot` and `quadratureplot`. Every such name is declared and documented here rather than in
+# its extension, so that `?name` answers in a bare `using Unfitted` session (an extension's docstrings land in the
+# extension module's own docs, not this one's) and downstream code can name it unconditionally.
 #
-# Each entry point is one fallback method over every argument list, strictly less specific than every method its
-# extension installs, and its body is `_extension_missing`: without the extension the call raises an error that says
-# which package to load, before the call has touched anything, and with it a call no method accepts raises the ordinary
-# `MethodError`. That error bears the one trace the fallback leaves: since the fallback matches every call, Julia prints
-# it among the closest candidates and adds that the error was thrown manually, as if the method were deliberately left
-# unimplemented. The core defines no other method of these functions: one more specific than an extension method in
-# some argument would take that method's calls, or make them ambiguous. A further signature an extension implements is
-# documented on its abstract signature, which no method of the core implements: the tensor readers' `Val` and
-# `Field` forms and the VTK series operations below. The `Val` and `Field` forms name `TrialChannels` and `Field`,
-# which `problems.jl` defines, so `Unfitted.jl` includes this file last.
+# An entry point is declared in one of two ways, decided by who owns the method that matches every call:
+#
+#   * **A fallback method**, for an entry point whose extension defines its methods one signature at a time. The
+#     fallback is one method over every argument list, strictly less specific than every method its extension
+#     installs, and its body is `_extension_missing`: without the extension the call raises an error that says which
+#     package to load, before the call has touched anything, and with it a call no method accepts raises the ordinary
+#     `MethodError`. That error bears the one trace the fallback leaves: since the fallback matches every call, Julia
+#     prints it among the closest candidates and adds that the error was thrown manually, as if the method were
+#     deliberately left unimplemented.
+#   * **No method at all**, for a Makie recipe. `Makie.@recipe` defines the plot function's catch-all
+#     `f(args...; kw...)` itself, in the extension, and an extension may not overwrite a method of its parent while it
+#     precompiles (Julia refuses with "Method overwriting is not permitted during Module precompilation"), so the core
+#     cannot hold one. The function is declared methodless and listed in `_METHODLESS_ENTRY_POINTS`: a call made
+#     without the extension is then an ordinary `MethodError`, to which the error hint `_extension_hint` adds the
+#     package to load. With the extension loaded, a call the recipe cannot draw is refused by Makie, naming the argument
+#     types it expected.
+#
+# The core defines no other method of these functions: one more specific than an extension method in some argument
+# would take that method's calls, or make them ambiguous. A further signature an extension implements is documented on
+# its abstract signature, which no method of the core implements: the tensor readers' `Val` and `Field` forms and the
+# VTK series operations below. The `Val` and `Field` forms name `TrialChannels` and `Field`, which `problems.jl`
+# defines, so `Unfitted.jl` includes this file last.
 #
 # `symmetric_gradient` is declared here rather than extended from Tensors.jl, because Tensors.jl does not export a
 # function under that name; the closest cousins it ships are the AD entry points `gradient`, `hessian` and
@@ -450,39 +462,14 @@ leaf's disambiguating name is **ASCII** — the field *index* `i` for `data_<i>`
 ParaView's Extract Block (whose data-assembly node names keep only ASCII identifier characters) resolves each leaf on
 its own even when the field names themselves are Unicode (`θ₁`, `θ₂`).
 
-Keyword arguments:
+$(_SAMPLING_KEYWORDS_DOC)
+The writer samples at `subdivisions = :degree` unless told otherwise, and takes keywords of its own:
 
-  - `field` — restrict the output to a single [`Field`](@ref) (or its name `Symbol`); defaults to every field of the
-    model.
-  - `subdivisions` — per-region subdivision count, sized to resolve the *solution*. `:degree` (default) uses each
-    region's parent polynomial order; `:none` keeps one cell per region; a positive integer uses an isotropic count; an
-    `NTuple{D,Int}` uses explicit per-axis counts.
-  - `cut_depth` — extra bisections applied to the sub-cells that `∂Ω` passes through, sized to resolve the *geometry*.
-    `3` by default, `:none` to disable, or an integer in `0:8`. Only regions crossed by the boundary are refined, and a
-    model without a [`PhysicalDomain`](@ref) is untouched, so the cost is that of the boundary rather than of the
-    volume: in 3D the leaf count grows as `8ᵏ` under `subdivisions` but only as `4ᵏ` under `cut_depth`. See "Resolving
-    the immersed boundary" below.
-  - `point_data` — `NamedTuple` / `Dict` / `Tuple` of `name => callback` pairs. Each callback is invoked at every vertex
-    sample as `f(u, context, x, xi)` and returns a real number, a tuple of real numbers or an `SVector` of real numbers,
-    of one shape at every sample. A tuple is written as the `SVector` of its components. The values of one entry are
-    promoted to a common element type, which must be one VTK stores — `Float32`, `Float64` or an integer of at most 64
-    bits — or `Bool`, which VTK has no type for and is written as `UInt8` 0 / 1. A two-component value is written as a
-    three-component VTK vector with a trailing zero. An entry is refused with an `ArgumentError` naming it, and nothing
-    is written, when a value has none of these shapes (a `Vector`, a matrix, a `String`, a `Complex`), when its shapes
-    differ between samples, or when its values promote to a type VTK does not store (a `Rational`, a `BigFloat`); a
-    `Rational` among `Float64` values promotes to `Float64` and is accepted. Each callback is called exactly once per
-    sample, but in an unspecified order — across the samples and across the entries — so a callback should compute its
-    value from its arguments and not count or record its calls. `u(context, xi[, field])` evaluates the current solution
-    at the sample, given the `context` and `xi` the callback received: the block's own field by default, or another
-    `field` on the same subdomain, which must be the model's field of that name, with its component count, as for
-    [`value`](@ref); a `Field` with another count raises an `ArgumentError`. A field on another subdomain of a coupled
-    model raises an `ArgumentError` too; evaluate it with [`value`](@ref)`(solution, model, field, x)` instead. `x` is
-    the physical coordinate and `xi.region` the same point in the region's reference frame; `context` carries `location`
-    (`:point`, or `:cell` for a `cell_data` sample), `region_id`, the `region` box, the emitted `cell` box, the covering
-    `parents` — each with the `parent_box` a callback needs to map `x` into a cell's own frame — and the `model_version`
-    the samples were taken from. Defaults to a single `uh` entry that emits the current solution value.
-  - `cell_data` — same shape as `point_data` but evaluated at per-cell sample points (the subbox center). Defaults to no
-    user-defined cell data; the bundle always includes `region_id` and `cover_count` as built-in cell arrays.
+  - `point_data` — `NamedTuple` / `Dict` / `Tuple` of `name => callback` pairs, each a sampling callback (see "Sampling
+    callbacks" below) invoked at every vertex sample. Defaults to a single `uh` entry that emits the current solution
+    value. A `level_set` entry replaces the built-in array of that name.
+  - `cell_data` — same shape as `point_data` but evaluated at per-cell sample points (the sub-cell center). Defaults to
+    no user-defined cell data; `region_id` and `cover_count` are always included as built-in cell arrays.
   - `level_meshes` — emit one solid-cell `.vtu` per level when `true` (default), each cell carrying per-cell `active` /
     `covered` / `active_dofs` / `reduced_dofs` data.
   - `ascii` / `append` / `compress` — pass-through to `WriteVTK`'s `vtk_grid` constructor, with its own defaults:
@@ -491,50 +478,24 @@ Keyword arguments:
     write time — and it costs the reader nothing, since ParaView decompresses transparently. Turn it off together with
     `ascii = true, append = false` when a test or a diff needs the arrays as parsable text.
 
-For models whose [`Space`](@ref) carries a [`PhysicalDomain`](@ref), the per-vertex level-set values `φ(x)` are
-automatically attached as a built-in `level_set` point array — convenient for visualising `∂Ω` as a zero-level
-isocontour or for filtering cut / full / fictitious regions in ParaView. Pass a `level_set` entry in `point_data` to
-override or rename it.
+VTK stores a value in one of its own number types, so the values of a `point_data` or `cell_data` entry must also
+promote to `Float32`, `Float64` or an integer of at most 64 bits — or to `Bool`, which VTK has no type for and which is
+written as `UInt8` 0 / 1. An entry whose values promote to another real type (a `Rational`, a `BigFloat`) is refused
+with an `ArgumentError` naming it, and nothing is written; a `Rational` among `Float64` values promotes to `Float64` and
+is accepted. A vector value is written as a VTK vector, a two-component one with a trailing zero as its third.
 
 Returns the path of every file written: the `.vtm` first, then the datasets in block order. The bundle is built in
 memory and written, its directory included, only once it is complete: a call that fails — on a keyword it refuses, or in
 a callback that throws — leaves nothing on disk.
 
+To write a *sequence* of these bundles as one animation — a moving overlay, an adaptive ladder, a time-dependent
+solution — open a [`vtk_series`](@ref) and call this function with it in place of a path.
+
 Requires `using WriteVTK`, which loads the package extension the VTK writers live in. A call made without it raises an
 error that says so, and writes nothing.
 
-## Resolving the immersed boundary
-
-ParaView reconstructs `∂Ω` from the `level_set` array by interpolating it linearly along each cell's edges, so the
-surface a Clip draws is a facetisation at the size of the emitted cell — neither `φ`'s own accuracy nor the solution
-order improves it. Resolving `∂Ω` therefore means emitting small cells where it runs, which is what `cut_depth` does and
-what `subdivisions` cannot: raising `subdivisions` refines every region uniformly, at `2^(D·k)` cells, while `cut_depth`
-refines only the sub-cells the boundary crosses, at `2^((D−1)·k)`. Measured on a 3D 5×5×5 order-2 sphere with 81
-regions: 5 723 cells against 41 472 at 8 sub-cells per axis across `∂Ω`, and 95 891 against 2 654 208 at 32.
-
-A sub-cell is refined when `|φ(c)| ≤ L·r`, with `c` its center, `r` its half-diagonal, and `L` the largest Lipschitz
-constant declared by any leaf of the geometry. That is the exact negation of the uniform-sign certificate the cell
-classifier uses, so an unrefined sub-cell provably holds one sign of `φ` throughout, contributes no cut surface, and
-cannot disagree with a finer neighbour across a shared face. Every refined sub-cell bottoms out at the same depth, so
-the cut cells of one region carry identical corner coordinates where they meet and their facets join exactly: the
-clipped surface is watertight within a region, and across regions whose finest cells coincide on their shared face. Two
-adjacent cut regions whose finest cells differ in size — regions of different extent, or subdivided at different counts
-— meet in T-junctions instead, where the facets of the two sides need not join, and the clipped surface can show a
-crack there about as wide as its own facetisation error.
-
-When **no** leaf declares a constant — `leaf(f)` defaults to `lipschitz = Inf` — no such certificate exists and
-refinement falls back to the corner signs of `φ`, the same evidence ParaView's own clip works from. A feature of `Ω`
-smaller than a sub-cell and missing every corner is then invisible, and the first such write of a session warns so;
-`leaf(f; lipschitz = L)` (`1.0` for a signed distance function) restores the guarantee.
-
-Two limits are worth stating plainly. The clip surface is piecewise planar per cell at every depth, so `cut_depth` buys
-a finer staircase rather than a smooth surface. And at a CSG crease — an edge or corner where two leaves meet —
-`levelset_value` is only `C⁰`, so the clip converges there at first order in the sub-cell size against second order on a
-smooth face; an `∩`-corner stays comparatively more faceted at any given depth.
-
-To write a *sequence* of these bundles as one animation — a moving overlay, an adaptive ladder, a time-dependent
-solution — open a [`vtk_series`](@ref) and call this function with it in place of a path.
-"""
+$(_SAMPLING_CALLBACK_DOC)
+$(_SAMPLING_BOUNDARY_DOC)"""
 write_vtk(args...; kwargs...) = _extension_missing(write_vtk, args, "WriteVTK")
 
 """
@@ -625,16 +586,277 @@ Requires `using WriteVTK`, like [`write_vtk`](@ref).
 """
 write_quadrature_vtm(args...; kwargs...) = _extension_missing(write_quadrature_vtm, args, "WriteVTK")
 
-# ── The fallback every entry point shares ─────────────────────────────────────
+# ── Plots: the Makie extension ────────────────────────────────────────────────
+#
+# Plotting is the package extension `ext/UnfittedMakieExt.jl`, installed when Makie.jl is loaded alongside Unfitted —
+# by any of its backends, CairoMakie, GLMakie or WGLMakie, each of which loads Makie. It draws the consumer-neutral
+# records `src/postprocessing.jl` samples, which the VTK writer serialises, and decides everything Makie-specific
+# there. Its entry points are Makie recipes, so they are declared methodless, as the rule at the top of this file says.
+
+"""
+    fieldplot(solution, model; by=automatic, component=nothing, warp=false, field=nothing,
+              subdivisions=automatic, cut_depth=3, color, linewidth, strokecolor=:black, strokewidth=0,
+              clip=automatic, boundary=false, boundarycolor=:black, boundarywidth=1.5,
+              categorical=automatic, colormap, colorrange, …)
+    fieldplot(model; …)
+    fieldplot!([axis,] [solution,] model; …)
+
+Plot a solution on the cells it is sampled on — its value, a built-in array of the sampling, or any quantity a sampling
+callback computes — or, without a solution, the model's integration regions, coloured by the number of levels that
+cover each. `fieldplot` returns what every Makie plotting function returns, the figure, the axis and the plot;
+`fieldplot!` draws into an existing axis and returns the plot.
+
+The model is sampled as [`write_vtk`](@ref) samples it: every integration region of each drawn field, cut into its
+`subdivisions` lattice, with the cells `∂Ω` crosses refined `cut_depth` times. Every sample cell owns its corners, so a
+value that jumps between cells, or between regions, is drawn as a jump rather than smeared across it.
+
+  - **2D.** A mesh of the sample cells, each split along the diagonal from its lower-left to its upper-right corner,
+    coloured by the plotted value at each corner and, in between, linearly over each triangle — where ParaView
+    interpolates a quad bilinearly, so a contrasting colour map can show the diagonals of cells too coarse for the
+    field, which a larger `subdivisions` resolves. The axis keeps the data's aspect ratio. With `warp = true` the
+    surface rises to the height of the value, in an `Axis3` with the domain to scale and the value on its vertical
+    axis.
+  - **1D.** The graph of the value against `x`, one segment per sample cell, in one colour, in an axis whose vertical
+    axis names the plotted quantity.
+
+Fields on different subdomains of a coupled model are drawn side by side; fields that share a space would cover the same
+cells, so a model with such fields is drawn one field at a time, picked with `field`.
+
+A field whose space carries a [`PhysicalDomain`](@ref) is drawn on `Ω` alone. Each sample triangle, or 1D sample
+cell, keeps the part where the linear interpolant of the level set `φ` between its corners is `≤ 0`; a corner the cut
+adds, where that interpolant vanishes on an edge, takes the plotted value interpolated linearly along the edge, as the
+triangle's colours and a warped surface's heights already are, so that inside `Ω` the cut plot is exactly the uncut
+one. The region edges are cut at the same points, and `boundary = true` draws `∂Ω` itself, the zero set of the same
+interpolant. Both are a facetisation at the size of the sample cells, which `cut_depth` refines where `∂Ω` runs and
+`subdivisions` only at the cost of every cell — see "Resolving the immersed boundary" below. Each step of `cut_depth`
+halves the cells `∂Ω` crosses and quarters the error of the drawn area and of the drawn length of `∂Ω`: on a disk of
+radius 0.35 over 4×4 order-1 cells, from 5.0e-4 and 8.2e-4 at the default `cut_depth = 3` to 3.2e-5 and 5.1e-5 at 5.
+Where two cut regions whose finest sample cells differ in size meet, their cuts need not meet on the shared edge, and
+the plot can show a crack there about as wide as that error. The cut adds at most one triangle per triangle it cuts;
+the cost of a finer `∂Ω` is the sampling's.
+
+Keyword arguments, which are the plot's attributes:
+
+  - `by` — what is plotted: `:uh`, the solution's value; `:level_set`, the level set `φ` of a
+    [`PhysicalDomain`](@ref); `:region_id`, the index of each cell's region; `:cover_count`, the number of levels
+    covering each cell's region; or a sampling callback `(u, context, x, xi) -> value`, invoked at every vertex sample
+    (see "Sampling callbacks" below). `automatic` (default) plots `:uh` with a solution and `:cover_count` without. A
+    quantity sampled at the vertices varies across a cell; a cell's region and its cover are one value per cell, and
+    colour the cell flat.
+  - `component` — for a vector value, `nothing` (default) plots its magnitude `‖v‖₂` and an integer `i` its component
+    `vᵢ`; for a scalar value, only `nothing`.
+  - `warp` — in 2D, whether to lift the surface to the plotted value; `false` by default, and chosen, with the axis,
+    when the plot is created. A warped surface is drawn without region edges: it hides parts of them, which a backend
+    that paints the edges after the surface would draw anyway. Where two regions sampled on different lattices meet,
+    each side of their shared edge is linear between its own points, so a warped surface opens a crack there, as
+    ParaView's warp of the same data does, whose width falls as the square of the sample cell's size: on a bump of
+    height 1.7 under an order-3 overlay over an order-2 base, 0.024 at `:degree`, 0.0017 at 8 sub-cells per region,
+    0.00042 at 16.
+  - `subdivisions` — `automatic` (default) is `:degree` on a flat 2D plot, where colour is all a cell shows; 8 sub-cells
+    per region on a warped one, which closes the cracks to below what a render shows and draws a lit surface without
+    facets; and 32 in 1D, where a polynomial of degree `p` drawn over `p` straight segments would show its corners. Any
+    value of the sampling keyword below can be passed instead.
+  - `color`, `linewidth` — in 1D, the colour and the width in pixels of the graph.
+  - `strokecolor`, `strokewidth` — in 2D, the colour and the width in pixels of the region edges; `strokewidth = 0`
+    (default) draws none. The edges run along the regions' boundaries, so no edge crosses a cell.
+  - `clip` — whether to cut the plot at `∂Ω`, as described above: `automatic` (default) cuts every field whose space
+    carries a `PhysicalDomain` and draws any other whole; `false` draws every sample cell whole, with the polynomial
+    extension a solution has outside `Ω`; `true` cuts, and is refused on a field whose space carries none.
+  - `boundary`, `boundarycolor`, `boundarywidth` — whether to draw `∂Ω`, `false` by default, and its colour and its
+    width in pixels, `:black` and `1.5`: in 2D the segments of the interpolant's zero contour, in front of the cells
+    and the region edges, or on a warped surface at the plotted value's height; in 1D a vertical line at every root.
+    `boundary = true` is refused when no drawn field's space carries a `PhysicalDomain`.
+  - `categorical` — whether the colours are categories, one colour and one colour-bar block per value: `true`, `false`,
+    or `automatic` (default) for `:cover_count` alone. Settled when the plot is created.
+  - `colormap`, `colorrange`, `colorscale`, `lowclip`, `highclip`, `nan_color`, `alpha` — the colour mapping of a 2D
+    plot, as for every Makie plot; a `Colorbar` reads it off the plot. A 1D plot has none, and a `Colorbar` of it is
+    refused.
+
+$(_SAMPLING_KEYWORDS_DOC)
+To follow a run, pass the solution, or the model, as an `Observable`. When both change, replace them at once with
+`Makie.update!(plot, solution, model)`: a solution belongs to one model, and a plot may redraw between two separate
+updates. Makie fixes a plot's argument types when it creates the plot, so a new model must be of the plot's model's type
+— the same problem on moved or re-masked levels, say; a model with other levels needs a new plot.
+
+A `by`, `component`, `clip` or callback the plot cannot use is refused with an error that names the problem, as are
+`by = :uh` without a solution and `by = :level_set` on a model without a `PhysicalDomain`; Makie raises the error
+wrapped in its own exception, since it arises while the plot computes what to draw. A model of three or more dimensions
+is refused with an `ArgumentError`: write it with [`write_vtk`](@ref) and look at it in ParaView.
+
+Requires Makie, which each of its backends loads, as for [`levelplot`](@ref).
+
+$(_SAMPLING_CALLBACK_DOC)
+$(_SAMPLING_BOUNDARY_DOC)"""
+function fieldplot end
+
+"""
+    fieldplot!([axis,] [solution,] model; …)
+
+Draw [`fieldplot`](@ref) into `axis`, or into the current axis, and return the plot. The attributes are `fieldplot`'s.
+"""
+function fieldplot! end
+
+"""
+    levelplot(model; by=:order_max, levels=nothing, inactive=false, field=nothing,
+              strokecolor=:black, strokewidth=0.5, linewidth=6, boundary=false, boundarycolor=:black,
+              boundarywidth=1.5, categorical=automatic, colormap, colorrange, …)
+    levelplot!([axis,] model; …)
+
+Plot the meshes of `model`'s levels, each cell coloured flat by one per-cell quantity: the discretisation itself, which
+needs no solution — which cells each level has and which of them are active, the polynomial order of every cell, where
+covered-mode pruning removes modes, or where an error estimate puts the error. `levelplot` returns what every Makie
+plotting function returns, the figure, the axis and the plot; `levelplot!` draws into an existing axis and returns the
+plot.
+
+The cells drawn are the active cells of every drawn level — every cell of it with `inactive = true` — in
+`cell_indices` order, the cells of the level meshes [`write_vtk`](@ref) writes as `level_<id>_<role>`, each with its
+edges:
+
+  - **2D.** Each level is a mesh of quads, the levels stacked in level order, the base lowest and each later level above
+    the ones before it, so that wherever a later level has a drawn cell it hides the levels below, and the plot shows
+    at every point the last drawn level that has a cell there, edges included: an edge of a level is drawn only where
+    no drawn cell of a later level lies over it, and an edge two cells of one level share is drawn once. The axis keeps
+    the data's aspect ratio. To see one level whole, its cells under the overlays included, pass its id as `levels`.
+  - **1D.** Each level is a row of segments at the height of its level id, the base at the bottom, with a tick at every
+    cell end, so that the levels read as a ladder over the domain. The vertical axis labels every level of the model,
+    of which it shows the ones in view, so that the rows stay labelled whatever `levels` or `field` picks later.
+
+Keyword arguments, which are the plot's attributes:
+
+  - `by` — what colours a cell. Either the name of one of the level meshes' integer cell arrays — `:order_max`
+    (default), the largest per-axis polynomial order of the cell; `:level_id`; `:role_id`, 0 on the base level and 1
+    on an overlay; `:cell_id`, the cell's linear index in its level; `:active`, 1 where the level's activation mask and
+    the fictitious fold keep the cell; `:covered`, 1 where the active region of a single higher-id level holds the
+    cell's material; `:active_dofs`, the cell's modes with an active component; `:reduced_dofs`, its modes that
+    covered-mode pruning eliminated — or an [`ErrorEstimate`](@ref) of `model`, whose indicator `η_K` colours each cell
+    `K`. An estimate must be the one [`estimate`](@ref) returned for this model's discretisation, one array per level of
+    that level's shape, which is checked.
+  - `levels` — the levels to draw, by id: `nothing` (default) for every level, one id, or a collection of ids.
+  - `inactive` — whether to draw the cells that a level's activation mask or the fictitious fold switched off; `false`
+    by default, since they carry no approximation, and drawn above a coarser level they would hide its active cells.
+    `by = :active` with `inactive = true` and one level shows that level's mask.
+  - `field` — the field whose space is drawn on a model with several, a [`Field`](@ref) or its name; `nothing`
+    (default) draws the space of every field, each space once.
+  - `strokecolor`, `strokewidth` — the colour and the width in pixels of the cell edges and, in 1D, of the ticks at the
+    cell ends; `strokewidth = 0` draws neither.
+  - `linewidth` — in 1D, the width in pixels of the segments that carry the colour.
+  - `boundary`, `boundarycolor`, `boundarywidth` — whether to draw `∂Ω` over the levels, `false` by default, and its
+    colour and its width in pixels, `:black` and `1.5`: `∂Ω` as [`fieldplot`](@ref) draws it, from the level set
+    sampled at the sampling's defaults — in 2D a contour in front of every level and its edges, in 1D a vertical line
+    at every root. `boundary = true` is refused when no drawn space carries a [`PhysicalDomain`](@ref).
+  - `categorical` — whether the colours are categories: each distinct value its own colour of `colormap`, and a
+    `Colorbar` one block and one tick per value. `automatic` (default) makes the quantities with a few discrete values
+    categorical — `:order_max`, `:level_id`, `:role_id`, `:active` and `:covered` — and not the dof counts, the cell
+    index or an error estimate; `true` or `false` decides for any `by`. It is settled when the plot is created: a drawn
+    plot keeps it when `by` or `colormap` changes, since Makie cannot switch a drawn plot between categorical and
+    continuous colours.
+  - `colormap`, `colorrange`, `colorscale`, `lowclip`, `highclip`, `nan_color`, `alpha` — the colour mapping, as for
+    every Makie plot; a `Colorbar` reads it off the plot.
+
+The per-cell arrays mean what they mean on `write_vtk`'s level meshes, including the limit of the `covered` flag: it is
+computed only where the dof layer reads it, so on a masked level an inactive cell far from the active ones shows `0`
+whatever its true coverage. `:covered` and `:reduced_dofs` are read on one level at a time, `levels = id`: the cells
+they mark lie under the level that covers them, which the stacked levels draw in front.
+
+A `by`, `levels` or estimate the plot cannot use is refused with an error that names the problem; Makie raises it
+wrapped in its own exception, since it arises while the plot computes what to draw, and does so again when the
+attribute is changed on a drawn plot. A model of three or more dimensions is refused with an `ArgumentError`: write it
+with [`write_vtk`](@ref), whose level meshes carry the same arrays, and look at it in ParaView.
+
+Requires Makie, which each of its backends loads: `using CairoMakie` to draw into files, `GLMakie` for an interactive
+window, `WGLMakie` for a browser or a notebook. Without it a call raises a `MethodError` that says so.
+"""
+function levelplot end
+
+"""
+    levelplot!([axis,] model; …)
+
+Draw [`levelplot`](@ref) into `axis`, or into the current axis, and return the plot. The attributes are `levelplot`'s.
+"""
+function levelplot! end
+
+"""
+    quadratureplot(model; by=:weight, marker=:circle, markersize=6, boundary=false, boundarycolor=:black,
+                   boundarywidth=1.5, categorical=automatic, colormap, colorrange, …)
+    quadratureplot!([axis,] model; …)
+
+Plot `model`'s quadrature points: every point of every subdomain's integration plan, where its integration regions put
+it and what it weighs — the cloud [`write_quadrature_vtm`](@ref) writes. It shows what the level meshes cannot: the
+integration regions themselves, the moment-fitted rules of the cut cells, and, by their tiny weights, the small overlaps
+that condition the system badly. `quadratureplot` returns the figure, the axis and the plot; `quadratureplot!` draws
+into an existing axis and returns the plot.
+
+  - **2D.** Each point is a marker at its position. The axis keeps the data's aspect ratio.
+  - **1D.** Each point is a marker at its position against its weight, so that the rule of every region reads as a
+    profile.
+
+Keyword arguments, which are the plot's attributes:
+
+  - `by` — what colours a point: `:weight` (default), its physical weight, the rule weight times the region's Jacobian
+    as assembly integrates with it; or `:cover_count`, the number of levels whose cells cover its region — 1 where the
+    base level alone is active, more under an overlay.
+  - `marker`, `markersize` — the marker of a point and its size in pixels.
+  - `boundary`, `boundarycolor`, `boundarywidth` — whether to draw `∂Ω` behind the points, `false` by default, and its
+    colour and its width in pixels, `:black` and `1.5`, as for [`levelplot`](@ref). The points are drawn in front of
+    it in every backend, so the cut cells' points along `∂Ω` stay visible.
+  - `categorical` — whether the colours are categories, as for [`levelplot`](@ref): `automatic` (default) for
+    `:cover_count`, not for `:weight`.
+  - `colormap`, `colorrange`, `colorscale`, `lowclip`, `highclip`, `nan_color`, `alpha` — the colour mapping, as for
+    every Makie plot; a `Colorbar` reads it off the plot.
+
+Any other `by` is refused with an error that names it, wrapped by Makie as for [`levelplot`](@ref). A model of three
+or more dimensions is refused with an `ArgumentError`: write its cloud with [`write_quadrature_vtm`](@ref) and look at
+it in ParaView.
+
+Requires Makie, which each of its backends loads, as for [`levelplot`](@ref).
+"""
+function quadratureplot end
+
+"""
+    quadratureplot!([axis,] model; …)
+
+Draw [`quadratureplot`](@ref) into `axis`, or into the current axis, and return the plot. The attributes are
+`quadratureplot`'s.
+"""
+function quadratureplot! end
+
+# ── The fallback and the hint every entry point shares ────────────────────────
+
+# What a call to the entry point `f` needs to work while `package`'s extension is not loaded, as the fallback raises it
+# and the hint prints it: the package to load. `nothing` once the extension, `Unfitted<package>Ext` — the name every
+# extension of this package carries, after the package that loads it — is loaded, when the call failed for another
+# reason and loading anything would not help. Makie is the exception to `using` the package: drawing needs a backend,
+# and every backend loads Makie, so the remedy names one.
+function _extension_remedy(f, package::String)
+    Base.get_extension(@__MODULE__, Symbol(:Unfitted, package, :Ext)) === nothing || return nothing
+    load = package == "Makie" ? "`using CairoMakie`, or another Makie backend," : "`using $package`"
+    return "$(nameof(f)) is provided by Unfitted's $package extension: run $load to load it"
+end
 
 # The body of an extension stub's fallback method `f(args...; kwargs...)`: what a call no method of `f` accepts raises.
-# While the package extension `Unfitted<package>Ext` — the name every extension of this package carries, after the
-# package that loads it — is not loaded, the error names that package, which is the remedy, and it is raised before the
-# call has touched anything. Once the extension is loaded the call simply matched none of its methods, and the ordinary
-# `MethodError` says so (without the keyword arguments, which it does not carry) rather than asking the user to load
-# what is loaded. Generic in the package, so every extension's entry points share it.
+# While the extension is not loaded, the error is the remedy, raised before the call has touched anything. Once it is
+# loaded the call simply matched none of its methods, and the ordinary `MethodError` says so (without the keyword
+# arguments, which it does not carry) rather than asking the user to load what is loaded. Generic in the package, so
+# every extension's entry points share it.
 function _extension_missing(f, args, package::String)
-    Base.get_extension(@__MODULE__, Symbol(:Unfitted, package, :Ext)) === nothing &&
-        error("$(nameof(f)) is provided by Unfitted's $package extension: run `using $package` to load it")
+    remedy = _extension_remedy(f, package)
+    remedy === nothing || error(remedy)
     throw(MethodError(f, args))
+end
+
+# The methodless entry points, each with the package whose extension implements it (see the top of this file). A
+# recipe added to an extension is declared above and added here.
+const _METHODLESS_ENTRY_POINTS = (fieldplot => "Makie", fieldplot! => "Makie", levelplot => "Makie",
+                                  levelplot! => "Makie", quadratureplot => "Makie", quadratureplot! => "Makie")
+
+# The error hint `__init__` (in `Unfitted.jl`) registers for `MethodError`: for a call to a methodless entry point made
+# while its extension is not loaded, the line that names the package to load, as `_extension_missing` raises it for a
+# fallback. It says nothing about any other `MethodError`, nor once the extension is loaded, when the call failed for
+# another reason.
+function _extension_hint(io::IO, err::MethodError, _, _)
+    i = findfirst(entry -> first(entry) === err.f, _METHODLESS_ENTRY_POINTS)
+    i === nothing && return nothing
+    remedy = _extension_remedy(err.f, last(_METHODLESS_ENTRY_POINTS[i]))
+    remedy === nothing || print(io, "\n", remedy)
+    return nothing
 end

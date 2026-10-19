@@ -126,7 +126,7 @@ CITATION.cff                  machine-readable citation metadata
 .JuliaFormatter.toml          repo-wide formatting config (yas style, indent 4, margin 120)
 precommit.jl                  formatter wrapper + SLOC/comment/docstring stats
 src/                          library source
-ext/                          package extensions (BasicBSpline, FileIO+MeshIO+GeometryBasics, Tensors, WriteVTK)
+ext/                          package extensions (BasicBSpline, FileIO+MeshIO+GeometryBasics, Makie, Tensors, WriteVTK)
 test/                         unit and regression tests
 examples/                     runnable scripts in three tiers (tutorials/, applications/, reproductions/), one sub-directory per example, each with its own Project.toml
 benchmarks/                   targeted performance benchmarks (own Project.toml)
@@ -163,8 +163,9 @@ limited to the imports made obvious by `src/Unfitted.jl`'s include order:
 | `data.jl`         | per-quadrature-point `QuadField` + RBF transfer             |
 | `postprocessing.jl` | what every post-processing consumer shares: the consumer-neutral sampling records (data grids, level meshes, the quadrature cloud), field/gradient evaluation, L² error, boundary integrals |
 | `api.jl`          | thin public-API wrappers (mass, stiffness, poisson, neumann, …) |
-| `stubs.jl`        | the package extensions' public entry points (`bspline`, `mesh_levelset` / `stl_levelset`, the tensor-notation readers, the VTK writers and `VTKSeries`), declared and documented in the core as fallbacks that name the package to load (`_extension_missing`); included last |
+| `stubs.jl`        | the package extensions' public entry points (`bspline`, `mesh_levelset` / `stl_levelset`, the tensor-notation readers, the VTK writers and `VTKSeries`, the plots `fieldplot` / `levelplot` / `quadratureplot`), declared and documented in the core — as fallbacks that name the package to load (`_extension_missing`), or, for a Makie recipe, methodless with an error hint that names it (`_extension_hint`, registered by `__init__` in `Unfitted.jl`); included last |
 | `ext/UnfittedWriteVTKExt.jl` (not in `src/`) | the VTK consumer of `postprocessing.jl`'s records, a package extension loaded with WriteVTK: `write_vtk`, `vtk_series`, `write_quadrature_vtm`, declared and documented in `stubs.jl` |
+| `ext/UnfittedMakieExt.jl` (not in `src/`) | the plotting consumer of `postprocessing.jl`'s records, a package extension loaded with Makie through any of its backends: the recipes `fieldplot`, `levelplot` and `quadratureplot` of 1D and 2D models, declared and documented in `stubs.jl` |
 
 Only split a single file when a second basis family, an alternative
 transfer scheme, or an honest test burden makes the split helpful.
@@ -1207,10 +1208,14 @@ indicator representations are intentionally not supported.
 
 ### Naming
 
-Prefer concise verbs and nouns such as `mesh`, `overlay`, `basis`,
-`space`, `assemble`, `solve`, `project`, `move`, `evaluate`, and
-`diagnostics` over framework-heavy terminology. The public API should
-read like the method, not like a software architecture.
+Prefer concise verbs and nouns such as `overlay`, `basis`, `space`,
+`assemble`, `solve`, `project`, `move`, `evaluate`, and `diagnostics`
+over framework-heavy terminology. The public API should read like the
+method, not like a software architecture.
+
+An exported name must not also be an export of a package an extension
+integrates: a session that loads both could call neither by its bare
+name.
 
 ## Code style and documentation
 
@@ -1403,6 +1408,9 @@ when they remove real work:
     operations;
   - VTK output, e.g. `WriteVTK`, as a weak dependency behind the
     `UnfittedWriteVTKExt` package extension;
+  - plotting, e.g. `Makie`, as a weak dependency behind the
+    `UnfittedMakieExt` package extension — on Makie itself, never on one
+    of its backends, which the user picks and which each load Makie;
   - development quality tools, e.g. `BenchmarkTools`, `JuliaFormatter`,
     `Aqua`, `JET`, `Documenter`.
 
@@ -1415,18 +1423,25 @@ Rules:
   - Do not add production dependencies without a short justification in
     the PR summary.
   - Optional integrations belong in `[weakdeps]` + `[extensions]`, not in
-    `[deps]`. The package currently ships four: `BasicBSpline` (B-spline
+    `[deps]`. The package currently ships five: `BasicBSpline` (B-spline
     basis family), `FileIO` + `MeshIO` + `GeometryBasics` (STL /
-    boundary-mesh level sets), `Tensors` (tensor-notation weak forms), and
-    `WriteVTK` (ParaView output). An extension's public names are
-    declared in `src/stubs.jl`, since an extension cannot export a
-    name, and a docstring that `?name` must find in a session without the
-    extension belongs there too: one written in the extension lands in
-    the extension module's own docs. Every such name is declared as one
+    boundary-mesh level sets), `Makie` (plots of 1D and 2D models),
+    `Tensors` (tensor-notation weak forms), and `WriteVTK` (ParaView
+    output). An extension's public names are declared in `src/stubs.jl`,
+    since an extension cannot export a name, and a docstring that `?name`
+    must find in a session without the extension belongs there too: one
+    written in the extension lands in the extension module's own docs.
+    Such a name is declared in one of two ways. As a rule it is one
     fallback method that, without the extension, raises an error naming
-    the package to load (`_extension_missing`); a further signature an
-    extension implements is documented on an abstract signature in the
-    core.
+    the package to load (`_extension_missing`). A Makie recipe is the
+    exception: `Makie.@recipe` defines the function's catch-all method
+    itself, in the extension, and an extension may not overwrite a
+    method of its parent while it precompiles, so the core declares the
+    function without any method, lists it in `_METHODLESS_ENTRY_POINTS`,
+    and the error hint `_extension_hint`, which `__init__` registers,
+    names a Makie backend on the `MethodError` a call without the
+    extension raises. A further signature an extension implements is
+    documented on an abstract signature in the core.
   - `Manifest.toml` is git-ignored. Do not change that.
 
 ## Performance
@@ -1662,11 +1677,25 @@ demos.
     integrated-Legendre level's hats, and the fold configurations where the
     cover's face lands before, inside and beyond the cut band; the MeshIO
     signed-distance leaf; the Tensors notation round-trip; the WriteVTK
-    writer's bundles, series and quadrature clouds (`test_vtk.jl`, which
-    also pins the consumer-neutral records they serialise), and, in a
-    fresh process that loads Unfitted alone, its entry points asking for
-    `using WriteVTK` without writing anything or loading WriteVTK
-    (`test_api.jl`).
+    writer's bundles, series and quadrature clouds as serialisations of
+    the consumer-neutral sampling records (`test_vtk.jl`), the records
+    themselves — the sample cells and their cut refinement, the arrays
+    and their element types, the refusals, a discretisation sampled
+    without a solution — as records, with no writer loaded
+    (`test_postprocessing.jl`); the Makie recipes' primitives — a
+    field's sample cells, values, components, magnitudes, region edges,
+    warped heights and 1D graph, with and without a solution, and their
+    cut at `∂Ω`, exact at a planar level set and converging at second
+    order in `cut_depth` on a disk; `∂Ω` drawn by every plot; each level
+    mesh's cells, colours, edges and stacking in 2D, the ladder of levels
+    in 1D, the colouring by an error estimate; the quadrature cloud —
+    asserted exactly against those records on the plot objects
+    Makie builds, with no backend loaded and nothing rendered
+    (`test_makie_ext.jl`); and, in a fresh process that loads Unfitted
+    alone, the entry points asking for their package — `using WriteVTK`
+    for the writers, a Makie backend for the plots, with keywords or
+    without — while writing nothing and loading none of the extension
+    packages (`test_api.jl`).
     The fold configuration with the cover's face on a knot of the level below,
     inside the band of cut cells, is pinned under the *clamped* mechanism as
     well, which `bspline(; continuity = m)` for `m < p − 1` still selects. A

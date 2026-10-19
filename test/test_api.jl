@@ -246,18 +246,29 @@ end
     # docstrings sit on abstract signatures that no method of the core implements, so pin that they reached the docs.
     @test haskey(meta[Base.Docs.Binding(Unfitted, :write_vtk)].docs, Tuple{VTKSeries,Any,Any,Any})
     @test haskey(meta[Base.Docs.Binding(Base, :close)].docs, Tuple{VTKSeries})
+    # `write_vtk` and `fieldplot` document the sampling keywords, the contract of a sampling callback and the
+    # immersed-boundary section the keywords' `cut_depth` refers to with the texts every entry point that samples a
+    # model splices into its docstring whole, in that order.
+    shared = (Unfitted._SAMPLING_KEYWORDS_DOC, Unfitted._SAMPLING_CALLBACK_DOC, Unfitted._SAMPLING_BOUNDARY_DOC)
+    for name in (:write_vtk, :fieldplot)
+        text = only(filter(t -> occursin(first(shared), t),
+                           [join(doc.text) for doc in values(meta[Base.Docs.Binding(Unfitted, name)].docs)]))
+        @test all(s -> occursin(s, text), shared) && issorted([first(findfirst(s, text)) for s in shared])
+    end
     # So are the tensor readers' `Val` and `Field` forms: one docstring per signature the Tensors extension implements.
     ndocs(name) = length(meta[Base.Docs.Binding(Unfitted, name)].docs)
     @test (ndocs(:symmetric_gradient), ndocs(:value_vec), ndocs(:gradient_tensor)) == (3, 2, 2)
 end
 
-# The VTK writers, the tensor-notation readers, the B-spline factory and the mesh level sets are package extensions that
-# `using WriteVTK`, `using Tensors`, `using BasicBSpline` and `using MeshIO` load. Without its extension each entry
-# point must say so, naming the package, before it touches anything (the file system included), and `using Unfitted`
-# alone must load none of those packages, which is what keeps them out of the package's load time. Only a fresh process
-# can show either: this one may have loaded them already (the extensions' test files do), and a loaded package cannot be
-# unloaded. The child loads Unfitted alone and calls each entry point with placeholder arguments, which a stub never
-# reads, so no model is built and the test costs one package load.
+# The VTK writers, the tensor-notation readers, the B-spline factory, the mesh level sets and the plots are package
+# extensions that `using WriteVTK`, `using Tensors`, `using BasicBSpline`, `using MeshIO` and any Makie backend load.
+# Without its extension each entry point must say so, naming the package — for the plots, which are methodless, a Makie
+# backend, through the error hint on their `MethodError`, called with keywords or without — before it touches anything
+# (the file system included), and `using Unfitted` alone must load none of those packages, which is what keeps them out
+# of the package's load time. Only a fresh process can show either: this one may have loaded them already (the
+# extensions' test files do), and a loaded package cannot be unloaded. The child loads Unfitted alone and calls each
+# entry point with placeholder arguments, which a stub never reads, so no model is built and the test costs one package
+# load.
 @testset "the extension entry points ask for their package until it is loaded" begin
     dir = mktempdir()
     script = """
@@ -268,7 +279,9 @@ end
                  write_quadrature_vtm => (joinpath(dir, "q", "cloud"), nothing),
                  symmetric_gradient => (nothing,), value_vec => (nothing, :u, Val(2)),
                  gradient_tensor => (nothing, :u, Val(2)), bspline => (),
-                 mesh_levelset => (nothing,), stl_levelset => (joinpath(dir, "m", "part.stl"),))
+                 mesh_levelset => (nothing,), stl_levelset => (joinpath(dir, "m", "part.stl"),),
+                 fieldplot => (nothing, nothing), fieldplot! => (nothing,), levelplot => (nothing,),
+                 levelplot! => (nothing, nothing), quadratureplot => (nothing,), quadratureplot! => (nothing,))
         for (f, args) in calls
             message = try
                 f(args...)
@@ -278,7 +291,14 @@ end
             end
             println(nameof(f), " => ", replace(message, '\\n' => ' '))
         end
-        packages = ("WriteVTK", "Tensors", "BasicBSpline", "MeshIO", "FileIO", "GeometryBasics")
+        message = try
+            levelplot(nothing; by=:active)
+            "returned"
+        catch e
+            sprint(showerror, e)
+        end
+        println("levelplot with keywords => ", replace(message, '\\n' => ' '))
+        packages = ("WriteVTK", "Tensors", "BasicBSpline", "MeshIO", "FileIO", "GeometryBasics", "Makie")
         println("packages loaded => ", any(p -> p.name in packages, keys(Base.loaded_modules)))
         """
     cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) -e $script $dir`
@@ -290,7 +310,10 @@ end
     end
     entry_points = ("write_vtk" => "WriteVTK", "vtk_series" => "WriteVTK", "write_quadrature_vtm" => "WriteVTK",
                     "symmetric_gradient" => "Tensors", "value_vec" => "Tensors", "gradient_tensor" => "Tensors",
-                    "bspline" => "BasicBSpline", "mesh_levelset" => "MeshIO", "stl_levelset" => "MeshIO")
+                    "bspline" => "BasicBSpline", "mesh_levelset" => "MeshIO", "stl_levelset" => "MeshIO",
+                    "fieldplot" => "CairoMakie", "fieldplot!" => "CairoMakie", "levelplot" => "CairoMakie",
+                    "levelplot!" => "CairoMakie", "quadratureplot" => "CairoMakie", "quadratureplot!" => "CairoMakie",
+                    "levelplot with keywords" => "CairoMakie")
     for (name, package) in entry_points
         @test occursin("using $package", get(reported, name, ""))
     end

@@ -16,12 +16,14 @@ StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 BasicBSpline = "4c5d9882-2acf-4ea4-9e48-968fd4518195"
 FileIO = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
 GeometryBasics = "5c1252a2-5f33-56bf-86c9-59e7332b4326"
+Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
 MeshIO = "7269a6da-0436-5bbc-96c2-40638cbb6118"
 Tensors = "48a634ad-e948-5137-8d70-aa71f2a747f4"
 WriteVTK = "64499a7a-5c06-52f2-abe2-ccb03c286192"
 
 [extensions]
 UnfittedBasicBSplineExt = "BasicBSpline"
+UnfittedMakieExt = "Makie"
 UnfittedMeshIOExt = ["FileIO", "GeometryBasics", "MeshIO"]
 UnfittedTensorsExt = "Tensors"
 UnfittedWriteVTKExt = "WriteVTK"
@@ -33,6 +35,7 @@ FileIO = "1.20.0"
 ForwardDiff = "1.4.6"
 GeometryBasics = "0.5.13"
 LinearAlgebra = "1"
+Makie = "0.24.16"
 MeshIO = "0.5.5"
 NearestNeighbors = "0.4.29"
 NonNegLeastSquares = "0.4.1"
@@ -46,6 +49,7 @@ julia = "1.10"
 BasicBSpline = "4c5d9882-2acf-4ea4-9e48-968fd4518195"
 FileIO = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
 GeometryBasics = "5c1252a2-5f33-56bf-86c9-59e7332b4326"
+Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
 MeshIO = "7269a6da-0436-5bbc-96c2-40638cbb6118"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Tensors = "48a634ad-e948-5137-8d70-aa71f2a747f4"
@@ -53,4 +57,4 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 WriteVTK = "64499a7a-5c06-52f2-abe2-ccb03c286192"
 
 [targets]
-test = ["BasicBSpline", "FileIO", "GeometryBasics", "MeshIO", "Random", "Tensors", "Test", "WriteVTK"]
+test = ["BasicBSpline", "FileIO", "GeometryBasics", "Makie", "MeshIO", "Random", "Tensors", "Test", "WriteVTK"]

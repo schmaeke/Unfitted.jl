@@ -1,8 +1,8 @@
-# Post-processing: what every consumer of a solved model shares, in two parts.
+# Post-processing: what every consumer of a discretisation and its solution shares, in two parts.
 #
-#   * **Sampling.** A solution, the meshes of its levels and the quadrature-point cloud are sampled into
-#     consumer-neutral records, so that every consumer reads the same geometry and the same arrays rather than
-#     re-deriving them. The contract is below.
+#   * **Sampling.** A model and a solution on it are sampled into consumer-neutral records — the solution's data, the
+#     meshes of the levels and the quadrature-point cloud — so that every consumer reads the same geometry and the same
+#     arrays rather than re-deriving them. The contract is below.
 #   * **Solution evaluation.** [`value`](@ref) and [`field_gradient`](@ref) evaluate the superposed solution at
 #     arbitrary physical points; [`l2_error`](@ref) computes an analytic / manufactured-solution error over the model's
 #     own integration plan; [`boundary_integral`](@ref) integrates a callback over a portion of the boundary or an
@@ -11,13 +11,21 @@
 # All of them share the overlay-zero-extension convention: a level whose mesh does not cover a point contributes zero
 # there. That mirrors the assembly contract from `CONTRIBUTING.md`'s "The superposition model" section.
 #
-# The consumers are package extensions. The one shipped is the VTK writer, `ext/UnfittedWriteVTKExt.jl`, which
-# `using WriteVTK` loads: [`write_vtk`](@ref) serialises the records of a `(solution, model)` pair as a ParaView
-# multiblock bundle, [`vtk_series`](@ref) collects a sequence of those bundles into a `.pvd` collection, so a feature
-# that moves — and the mesh that follows it — can be watched over time, and [`write_quadrature_vtm`](@ref) writes the
-# quadrature-point cloud, for inspecting where the integration regions land. Everything VTK-specific — cell types,
-# padding to three components, the number types VTK stores, the multiblock layout, the file names — is decided there and
-# nowhere else; the entry points themselves are declared and documented in `stubs.jl`.
+# The consumers are package extensions, and two ship:
+#
+#   * **The VTK writer**, `ext/UnfittedWriteVTKExt.jl`, which `using WriteVTK` loads: [`write_vtk`](@ref) serialises the
+#     records of a `(solution, model)` pair as a ParaView multiblock bundle, [`vtk_series`](@ref) collects a sequence of
+#     those bundles into a `.pvd` collection, so a feature that moves — and the mesh that follows it — can be watched
+#     over time, and [`write_quadrature_vtm`](@ref) writes the quadrature-point cloud, for inspecting where the
+#     integration regions land.
+#   * **The plots**, `ext/UnfittedMakieExt.jl`, which any Makie backend loads: [`fieldplot`](@ref) draws the field
+#     records of a 1D or 2D model, with or without a solution, [`levelplot`](@ref) its level meshes and
+#     [`quadratureplot`](@ref) its quadrature cloud.
+#
+# Everything specific to a format or a front end — for VTK the cell types, the padding to three components, the number
+# types VTK stores, the multiblock layout and the file names; for Makie the primitives, the colours, the cut at ∂Ω and
+# the axes — is decided in its extension and nowhere else; the entry points themselves are declared and documented in
+# `stubs.jl`.
 #
 # ## The record contract
 #
@@ -35,30 +43,30 @@
 #     was computed in, `Bool` included: a consumer maps what its format cannot hold (the VTK writer pads a 2-vector to
 #     three components and writes a `Bool` as `UInt8`).
 #
-# Two internal entry points produce records, on demand and without caching them or touching the file system:
+# Three internal entry points produce records, on demand and without caching them or touching the file system. Each
+# samples one thing, and a consumer combines the ones it shows:
 #
-#   * `_sample_fields(solution, model; field, subdivisions, cut_depth, point_data, cell_data, level_meshes)`, whose
-#     keywords mean what `write_vtk` documents — one `(; field, data, meshes)` per sampled field, in problem order.
-#     `data::SampleGrid{D,T,D}` covers the integration regions the field was solved on, each region its `subdivisions`
+#   * `_sample_fields(solution, model; field, subdivisions, cut_depth, point_data, cell_data)`, whose keywords mean
+#     what the texts below document (`_SAMPLING_KEYWORDS_DOC`, and `_SAMPLING_CALLBACK_DOC` for the entries'
+#     callbacks) — one `(; field, grid)` per sampled field, in problem order.
+#     `grid::SampleGrid{D,T,D}` covers the integration regions of the field's space, each region its `subdivisions`
 #     lattice with the boxes ∂Ω crosses cut-refined; its point arrays are the user's `point_data` entries in their
 #     order, then `level_set` (with a `PhysicalDomain`, unless an entry already has that name); its cell arrays are
-#     `region_id` and `cover_count`, then the user's `cell_data` entries. `meshes` holds one `(; level, role, grid)`
-#     per level of the field's space, in `space.levels` order — empty when `level_meshes = false`, or when an earlier
-#     record already carries the space — and each `grid` covers every cell of its level, active or not, with the `Int`
-#     cell arrays `level_id`, `role_id`, `order_max`, `cell_id`, `active`, `covered`, `active_dofs`, `reduced_dofs`.
+#     `region_id` and `cover_count`, then the user's `cell_data` entries. `solution = nothing` samples the
+#     discretisation alone: no `point_data` entry by default, and a callback that evaluates the solution raises.
+#   * `_sample_levels(model; field)` — one `(; field, level, role, grid::SampleGrid{D,T,D})` per level of each sampled
+#     field's space, in problem order and then `space.levels` order, a space several fields share meshed once, under
+#     the first of them. Each `grid` covers every cell of its level, active or not, with the `Int` cell arrays
+#     `level_id`, `role_id`, `order_max`, `cell_id`, `active`, `covered`, `active_dofs`, `reduced_dofs`.
 #   * `_sample_quadrature(model)` — one `(; signature, grid::SampleGrid{D,T,0})` per sorted covering-level signature, in
 #     sorted order, with the point array `weight`.
 #
-# A plotting extension would read the same records. With Makie, a 2D grid `g` coloured by its first point array, and
-# a quadrature-cloud entry `e` coloured by its weights, are
-#
-#     faces = [QuadFace(4c - 3, 4c - 2, 4c - 1, 4c) for c in 1:_cell_count(g)]
-#     mesh(Point.(g.points), faces; color=last(g.point_data[1]))
-#     scatter(Point.(e.grid.points); color=last(only(e.grid.point_data)))
-#
-# Its public functions would be declared and documented in `stubs.jl`, as the VTK writer's are, each a fallback
-# method whose body is `_extension_missing`, so that a call made without the plotting package loaded says which package
-# to load.
+# A consumer reads a record as it is, without permuting or re-deriving anything; `ext/UnfittedMakieExt.jl` is the
+# worked example of one that draws them. Besides the records, a consumer reads the core internals that state their
+# rules, so that it neither repeats nor contradicts them: `_cell_count(grid)`; `_sampled_fields(model, field)`, the
+# fields a sampling covers, and `_fields_by_space(model, field)`, those grouped by the space they share; and
+# `_default_point_data(solution)`, the entries a field sampling takes when given none. A consumer's public functions
+# are declared and documented in `stubs.jl`, as the shipped ones are.
 
 # ── Sample records ────────────────────────────────────────────────────────────
 
@@ -102,20 +110,107 @@ function _box_corners(b::AxisBox{D}) where {D}
     return ntuple(j -> v[xor(j - 1, ((j - 1) >> 1) & 1)+1], Val(2^D))
 end
 
+# ── The sampling keywords, as a user reads them ───────────────────────────────
+#
+# The keywords of `_sample_fields` belong to every public entry point that samples a model's fields — not to those that
+# draw or write only the level meshes or the quadrature cloud, which take none — and each such entry point documents
+# them in full. These three texts are that documentation, spliced into each such docstring
+# (`$(_SAMPLING_KEYWORDS_DOC)`), so that the entry points read alike and cannot drift apart: the keywords that decide
+# where the fields are sampled; the contract of a sampling callback, which `write_vtk`'s `point_data` and `cell_data`
+# and `fieldplot`'s `by` each refer to; and the section on the immersed boundary the keywords' `cut_depth` refers to.
+# The two sections come after the keywords, in that order, in every docstring. What a consumer adds on top — keywords
+# of its own and their defaults, what its format can or cannot hold — its docstring states around them. Written for
+# that reader: no consumer is named except as an example, and nothing here is a promise about one.
+
+const _SAMPLING_KEYWORDS_DOC = """
+Sampling keywords, which decide where a model's fields are sampled:
+
+  - `field` — sample a single [`Field`](@ref), or the one its name `Symbol` names; defaults to every field of the model.
+  - `subdivisions` — per-region subdivision count, sized to resolve the *solution*: `:degree` uses each region's parent
+    polynomial order; `:none` keeps one cell per region; a positive integer uses an isotropic count; an `NTuple{D,Int}`
+    uses explicit per-axis counts.
+  - `cut_depth` — extra bisections applied to the sub-cells that `∂Ω` passes through, sized to resolve the *geometry*.
+    `3` by default, `:none` to disable, or an integer in `0:8`. Only regions crossed by the boundary are refined, and a
+    model without a [`PhysicalDomain`](@ref) is untouched, so the cost is that of the boundary rather than of the
+    volume: in 3D the leaf count grows as `8ᵏ` under `subdivisions` but only as `4ᵏ` under `cut_depth`. See "Resolving
+    the immersed boundary" below.
+"""
+
+const _SAMPLING_CALLBACK_DOC = """
+## Sampling callbacks
+
+A sampling callback is invoked at every sample as `f(u, context, x, xi)` and returns a real number, a tuple of real
+numbers or an `SVector` of real numbers, of one shape at every sample. A tuple is taken as the `SVector` of its
+components, and the values of one callback are promoted to a common element type. A callback is refused with an
+`ArgumentError` naming it, and nothing is output, when a value has none of these shapes (a `Vector`, a matrix, a
+`String`, a `Complex`) or when its shapes differ between samples. Each callback is called exactly once per sample, but
+in an unspecified order — across the samples and across the callbacks — so a callback should compute its value from its
+arguments and not count or record its calls.
+
+`u(context, xi[, field])` evaluates the current solution at the sample, given the `context` and `xi` the callback
+received: the sampled field by default, or another `field` on the same subdomain, which must be the model's field of
+that name, with its component count, as for [`value`](@ref); a `Field` with another count raises an `ArgumentError`. A
+field on another subdomain of a coupled model raises an `ArgumentError` too; evaluate it with
+[`value`](@ref)`(solution, model, field, x)` instead. A model sampled without a solution has none to evaluate, and `u`
+raises an `ArgumentError` that says so. `x` is the physical coordinate and `xi.region` the same point in the region's
+reference frame; `context` carries `location` (`:point` at a vertex sample, `:cell` at a cell's center), `region_id`,
+the `region` box, the emitted `cell` box, the covering `parents` — each with the `parent_box` a callback needs to map
+`x` into a cell's own frame — and the `model_version` the samples were taken from.
+"""
+
+const _SAMPLING_BOUNDARY_DOC = """
+## Resolving the immersed boundary
+
+For models whose [`Space`](@ref) carries a [`PhysicalDomain`](@ref), the level-set values `φ(x)` are attached at every
+vertex as a built-in `level_set` point array — to draw `∂Ω` as the zero-level contour, or to tell cut, full and
+fictitious regions apart.
+
+A contour or a clip reconstructs `∂Ω` from that array by interpolating it linearly along each cell's edges — ParaView's
+Clip does — so the surface it draws is a facetisation at the size of the sampled cell: neither `φ`'s own accuracy nor
+the solution order improves it. Resolving `∂Ω` therefore means emitting small cells where it runs, which is what
+`cut_depth` does and what `subdivisions` cannot: raising `subdivisions` refines every region uniformly, at `2^(D·k)`
+cells, while `cut_depth` refines only the sub-cells the boundary crosses, at `2^((D−1)·k)`. Measured on a 3D 5×5×5
+order-2 sphere with 81 regions: 5 723 cells against 41 472 at 8 sub-cells per axis across `∂Ω`, and 95 891 against
+2 654 208 at 32.
+
+A sub-cell is refined when `|φ(c)| ≤ L·r`, with `c` its center, `r` its half-diagonal, and `L` the largest Lipschitz
+constant declared by any leaf of the geometry. That is the exact negation of the uniform-sign certificate the cell
+classifier uses, so an unrefined sub-cell provably holds one sign of `φ` throughout, contributes no cut surface, and
+cannot disagree with a finer neighbour across a shared face. Every refined sub-cell bottoms out at the same depth, so
+the cut cells of one region carry identical corner coordinates where they meet and their facets join exactly: the
+clipped surface is watertight within a region, and across regions whose finest cells coincide on their shared face. Two
+adjacent cut regions whose finest cells differ in size — regions of different extent, or subdivided at different counts
+— meet in T-junctions instead, where the facets of the two sides need not join, and the clipped surface can show a
+crack there about as wide as its own facetisation error.
+
+When **no** leaf declares a constant — `leaf(f)` defaults to `lipschitz = Inf` — no such certificate exists and
+refinement falls back to the corner signs of `φ`, the same evidence ParaView's own clip works from. A feature of `Ω`
+smaller than a sub-cell and missing every corner is then invisible, and the first such sampling of a session warns so;
+`leaf(f; lipschitz = L)` (`1.0` for a signed distance function) restores the guarantee.
+
+Two limits are worth stating plainly. The clip surface is piecewise planar per cell at every depth, so `cut_depth` buys
+a finer staircase rather than a smooth surface. And at a CSG crease — an edge or corner where two leaves meet —
+`levelset_value` is only `C⁰`, so the clip converges there at first order in the sub-cell size against second order on a
+smooth face; an `∩`-corner stays comparatively more faceted at any given depth.
+"""
+
 # ── Field sampling ────────────────────────────────────────────────────────────
 
-# The records of a solution's data: one `(; field, data, meshes)` per sampled field, in output order — every field in
-# problem order, or the one `field` names. `data` is the field's sample grid (`_sample_field`). `meshes` holds the
-# `(; level, role, grid)` records of its space's levels, in `space.levels` order (`_level_grid`); it is empty with
-# `level_meshes = false`, and for a space an earlier record already carries, so fields sharing a space have its meshes
-# once, under the first of them, whose layout the dof counts are read from — the convention `diagnostics` follows for
-# its per-level counts. That is decided here rather than by each consumer, which would otherwise have to repeat it.
+# The data records of a model's fields: one `(; field, grid)` per sampled field, in output order — every field in
+# problem order, or the one `field` names — with `grid` the field's sample grid (`_sample_field`). The meshes of the
+# fields' levels are records of their own (`_sample_levels`).
 #
-# The one entry of the sampling layer and its one keyword surface: a writer passes every keyword it does not consume
-# on to this function, and the keywords mean what `write_vtk` documents. The keywords, the solution's pin and the
-# entries' containers are checked before anything is sampled, a callback's values as they are collected, and nothing
-# touches the file system. One workspace and one `FormState` serve every field: the fields are sampled one after
-# another, and each field's accessor frames the regions it reads on its own (`_sample_accessor`).
+# The one entry of the field sampling and its one keyword surface: a consumer passes every keyword it does not consume
+# on to this function, and the keywords mean what `_SAMPLING_KEYWORDS_DOC` documents, the entries' callbacks what
+# `_SAMPLING_CALLBACK_DOC` does. The keywords, the solution's pin and the entries' containers are checked before
+# anything is sampled, a callback's values as they are collected, and nothing touches the file system. One workspace
+# and one `FormState` serve every field: the fields are sampled one after another, and each field's accessor frames the
+# regions it reads on its own (`_sample_accessor`).
+#
+# `solution = nothing` samples a discretisation that has not been solved: its regions, their sample cells and the
+# built-in arrays, with no `point_data` entry by default. A callback can still read its arguments, but one that
+# evaluates the solution through `u` raises, and the sampling checks out neither a workspace nor a `FormState`, since
+# nothing reads them.
 #
 # The records are collected by an explicit loop into a vector of their concrete type, so a consumer reads them
 # type-stably whatever inference made of the workspace, whose type is not inferable from the model
@@ -123,36 +218,28 @@ end
 # abstract one sent inference through the whole serialiser with the grids' dimension and cell kind unknown — measured
 # on the first `write_vtk` of a two-level 2D overlay, 2721 code instances inferred and 549 methods compiled, against
 # 1549 and 406 with the loop.
-function _sample_fields(solution::Solution, model::Model{D,T}; field=nothing, subdivisions=:degree, cut_depth=3,
-                        point_data=_default_point_data(), cell_data=NamedTuple(), level_meshes::Bool=true) where {D,T}
+function _sample_fields(solution::Union{Nothing,Solution}, model::Model{D,T}; field=nothing, subdivisions=:degree,
+                        cut_depth=3, point_data=_default_point_data(solution), cell_data=NamedTuple()) where {D,T}
     depth = _cut_depth_budget(cut_depth)
-    state = FormState(model.dofs, _state_vector(solution, model))
+    coefficients = _state_vector(solution, model)
     fields = _sampled_fields(model, field)
     entries = (point=_sample_entries(point_data, :point_data), cell=_sample_entries(cell_data, :cell_data))
     rule = _subdivision_rule(subdivisions, Val(D))
-    ws, meshed = _assembly_workspace(model), Space[]
-    MeshRecord = @NamedTuple{level::Int, role::Symbol, grid::SampleGrid{D,T,D}}
-    records = @NamedTuple{field::Field, data::SampleGrid{D,T,D}, meshes::Vector{MeshRecord}}[]
+    ws, state = coefficients === nothing ? (nothing, nothing) :
+                (_assembly_workspace(model), FormState(model.dofs, coefficients))
+    records = @NamedTuple{field::Field, grid::SampleGrid{D,T,D}}[]
     for fld in fields
-        space = _field_space(model.problem, fld.name)
-        regions = _region_list(model, nothing, space).regions     # the list the solve integrated the field over
-        data = _sample_field(ws, state, space, regions, fld, rule, depth, entries, model.version)
-        meshes = MeshRecord[]
-        if level_meshes && !any(s -> s === space, meshed)
-            dofs = _field_layout(model.dofs, fld.name).dofs
-            coverage = build_coverage(space, dofs.tolerance)
-            for level in space.levels
-                push!(meshes, (; level=level.id, level.role, grid=_level_grid(level, dofs, coverage)))
-            end
-        end
-        push!(meshed, space)
-        push!(records, (; field=fld, data, meshes))
+        regions = _region_list(model, nothing, fld.space).regions     # the list assembly integrates the field over
+        grid = _sample_field(ws, state, fld.space, regions, fld, rule, depth, entries, model.version)
+        push!(records, (; field=fld, grid))
     end
     return records
 end
 
-# The default `point_data`: one entry, `uh`, the solution value at every point.
-_default_point_data() = (uh=(u, c, x, xi) -> u(c, xi),)
+# The default `point_data`: one entry, `uh`, the solution value at every point — and none for a discretisation sampled
+# without a solution, which has no value to show.
+_default_point_data(::Solution) = (uh=(u, c, x, xi) -> u(c, xi),)
+_default_point_data(::Nothing) = NamedTuple()
 
 # Resolve the `cut_depth` keyword to a non-negative bisection budget. Checked first, so a rejected value costs no
 # sampling and, like every other refusal, leaves nothing on disk.
@@ -183,6 +270,19 @@ function _sampled_fields(model::Model, field)
         f.name === name && return [f]
     end
     throw(ArgumentError("unknown field $name"))
+end
+
+# The fields a sampling covers (`_sampled_fields`), grouped by the space they share: each group in problem order, the
+# groups in the order of their first fields. The one statement of which sampled fields share a space, for every
+# consumer of the records to read rather than repeat: one that shows a space once — its level meshes, its ∂Ω — reads the
+# first field of each group, and one that cannot show two fields of one space over each other refuses a group of more.
+function _fields_by_space(model::Model, field)
+    groups = Vector{Field}[]
+    for fld in _sampled_fields(model, field)
+        i = findfirst(group -> first(group).space === fld.space, groups)
+        i === nothing ? push!(groups, Field[fld]) : push!(groups[i], fld)
+    end
+    return groups
 end
 
 # Normalise a `point_data` / `cell_data` keyword to its `name => callback` entries, in the container's order. Three
@@ -221,8 +321,8 @@ end
 # and `_sample_array` is the only method that matches, so without the barrier inference descends into it with the
 # callback unknown and infers the collection loop and the value checks for an unknown value, code that never runs: on
 # the first `write_vtk` of a two-level 2D overlay, 67 more code instances inferred.
-function _sample_field(ws, state::FormState, space::Space{D,T}, regions::Vector{VolumeRegion{D,T}}, fld::Field, rule,
-                       depth::Int, entries, version::Int) where {D,T}
+function _sample_field(ws, state::Union{Nothing,FormState}, space::Space{D,T}, regions::Vector{VolumeRegion{D,T}},
+                       fld::Field, rule, depth::Int, entries, version::Int) where {D,T}
     boxes, region_ids = _sample_cells(space, regions, rule, depth)
     points = Vector{SVector{D,T}}(undef, length(boxes) << D)
     for (c, b) in pairs(boxes)
@@ -234,7 +334,7 @@ function _sample_field(ws, state::FormState, space::Space{D,T}, regions::Vector{
     sample = Base.inferencebarrier(_sample_array)
     point_data = Pair{String,AbstractVector}[]
     for (name, f) in entries.point
-        push!(point_data, name => sample(:point_data, name, f, u, at_points)::AbstractVector)
+        push!(point_data, name => sample(name, f, u, at_points)::AbstractVector)
     end
     space.physical === nothing ||
         any(e -> first(e) == "level_set", entries.point) ||
@@ -245,7 +345,7 @@ function _sample_field(ws, state::FormState, space::Space{D,T}, regions::Vector{
     end
     cell_data = Pair{String,AbstractVector}["region_id" => region_ids, "cover_count" => cover_count]
     for (name, f) in entries.cell
-        push!(cell_data, name => sample(:cell_data, name, f, u, at_cells)::AbstractVector)
+        push!(cell_data, name => sample(name, f, u, at_cells)::AbstractVector)
     end
     return SampleGrid{D,T,D}(points, point_data, cell_data)
 end
@@ -387,20 +487,29 @@ function _sample_accessor(ws, state::FormState, regions, default::Field)
     end
 end
 
+# The `u` of a sampling without a solution (`_sample_fields(nothing, model)`): there is no value to read, so a callback
+# that asks for one raises, naming the remedy, rather than reading zeros the user would take for a solution.
+function _sample_accessor(_, ::Nothing, _, default::Field)
+    return function (context, xi, field::Field=default)
+        throw(ArgumentError("u(context, xi) evaluates the solution, and this sampling has none: pass the solution " *
+                            "to sample its values"))
+    end
+end
+
 # One user entry's array over a walk: the callback at every sample, each value checked as it comes (`_sample_value`),
 # collected into the narrowest array that holds them. A function barrier — the one dynamic call per entry — so the loop
 # runs on the callback's and the accessor's concrete types. The array takes the first value's type, which is every
 # value's type for the callbacks one writes, and is then kept as it is; a value of another type hands the walk to
-# `_promoted_values`, which promotes over every sample or refuses naming the entry. An empty walk gives an empty
-# `Float64` array.
+# `_promoted_values`, which promotes over every sample or refuses naming the callback by its entry's name. An empty walk
+# gives an empty `Float64` array.
 #
 # An explicit loop, not `map`: Base's `collect` widens its element type as it goes, which compiles its collection
 # machinery anew for every callback type. Here, when the callback's value type is concrete, the type test folds to true
 # and the hand-over is never compiled.
-function _sample_array(kind::Symbol, name::String, f::F, u::U, s) where {F,U}
+function _sample_array(name::String, f::F, u::U, s) where {F,U}
     n = length(s.boxes) << s.shift
     n == 0 && return Float64[]
-    sample(k) = _sample_value(kind, name, f(u, _callback_args(s, k)...))
+    sample(k) = _sample_value(name, f(u, _callback_args(s, k)...))
     first_value = sample(1)
     values = Vector{typeof(first_value)}(undef, n)
     values[1] = first_value
@@ -408,7 +517,7 @@ function _sample_array(kind::Symbol, name::String, f::F, u::U, s) where {F,U}
         v = sample(k)
         # The samples so far, this one and the rest, each callback still called once per sample and in order.
         v isa eltype(values) ||
-            return _promoted_values(kind, name, Any[j < k ? values[j] : j == k ? v : sample(j) for j in 1:n])
+            return _promoted_values(name, Any[j < k ? values[j] : j == k ? v : sample(j) for j in 1:n])
         values[k] = v
     end
     return values
@@ -429,24 +538,25 @@ end
 
 # One callback value, checked and normalised: a real number is kept as it is; a tuple or an `SVector` of reals becomes
 # an `SVector` with its components promoted to one type, so a tuple and the `SVector` of the same numbers give the same
-# array. Anything else — a `Vector`, a matrix, a `String`, a `Complex`, `nothing` — is refused, naming the entry and
-# what it returned, before anything is written.
-function _sample_value(kind::Symbol, name::String, v)
+# array. Anything else — a `Vector`, a matrix, a `String`, a `Complex`, `nothing` — is refused, naming the callback by
+# its entry's name and what it returned, before any consumer sees it. The refusal names no keyword of a consumer, whose
+# entries the callbacks may have come from.
+function _sample_value(name::String, v)
     v isa Real && return v
     v isa Union{Tuple,SVector} && all(x -> x isa Real, v) && return SVector(v...)
-    throw(ArgumentError("$kind entry \"$name\" returned a $(typeof(v)): a callback value must be a real number, a " *
-                        "tuple of reals or an SVector of reals, of one shape at every sample"))
+    throw(ArgumentError("callback \"$name\" returned a $(typeof(v)): a callback value must be a real number, a tuple " *
+                        "of reals or an SVector of reals, of one shape at every sample"))
 end
 
 # The array of an entry whose values differ in type between samples: mixed number types (an `Int` at some samples, a
 # `Float64` at others) and `SVector`s of mixed element types are promoted over every sample with `promote_type`, and
-# anything else — shapes that differ between samples — is refused, naming the entry and the types it returned. Typed
-# on the untyped value list, so it compiles once whatever the callback.
-function _promoted_values(kind::Symbol, name::String, values::Vector{Any})
+# anything else — shapes that differ between samples — is refused, naming the callback and the types it returned.
+# Typed on the untyped value list, so it compiles once whatever the callback.
+function _promoted_values(name::String, values::Vector{Any})
     S = mapreduce(typeof, promote_type, values)
     isconcretetype(S) && (S <: Real || S <: SVector && eltype(S) <: Real) && return convert(Vector{S}, values)
-    throw(ArgumentError("$kind entry \"$name\" returned $(join(unique(typeof.(values)), ", ")): a callback value " *
-                        "must be a real number, a tuple of reals or an SVector of reals, of one shape at every sample"))
+    throw(ArgumentError("callback \"$name\" returned $(join(unique(typeof.(values)), ", ")): a callback value must " *
+                        "be a real number, a tuple of reals or an SVector of reals, of one shape at every sample"))
 end
 
 # `φ` at every point, in the space's number type. A barrier: the space's `PhysicalDomain` is abstractly typed, so one
@@ -454,6 +564,28 @@ end
 _levelset_values(physical::PhysicalDomain, points, ::Type{T}) where {T} = T[levelset_value(physical, x) for x in points]
 
 # ── Level meshes ──────────────────────────────────────────────────────────────
+
+# The records of the meshes of the sampled fields' levels: one `(; field, level, role, grid)` per level of each sampled
+# field's space — every field in problem order, or the one `field` names — in `space.levels` order, with `grid` the
+# level's mesh (`_level_grid`). A space several sampled fields share is meshed once, under the first of them
+# (`_fields_by_space`), whose dof layout the per-cell dof counts are read from — the convention `diagnostics` follows
+# for its per-level counts — so a consumer that groups the meshes by field shows every level once. Level ids are unique
+# across the subdomains of a coupled model, so `level` names a level of the whole model.
+#
+# The meshes are the discretisation's, so no solution is needed: a model can be meshed before it is solved. Collected
+# by an explicit loop into a vector of their concrete type, as `_sample_fields` collects its records.
+function _sample_levels(model::Model{D,T}; field=nothing) where {D,T}
+    records = @NamedTuple{field::Field, level::Int, role::Symbol, grid::SampleGrid{D,T,D}}[]
+    for fields in _fields_by_space(model, field)
+        fld = first(fields)
+        dofs = _field_layout(model.dofs, fld.name).dofs
+        coverage = build_coverage(fld.space, dofs.tolerance)
+        for level in fld.space.levels
+            push!(records, (; field=fld, level=level.id, level.role, grid=_level_grid(level, dofs, coverage)))
+        end
+    end
+    return records
+end
 
 # The record of one level's mesh: every cell of the level, active or not, in `cell_indices` order, as a `K = D` grid
 # with eight integer cell arrays that make the pruning visible in ParaView:
@@ -496,18 +628,18 @@ end
 
 # The model's quadrature-point cloud as records: one `(; signature, grid)` per distinct sorted list of covering parent
 # levels, in sorted order, over the regions of every subdomain's integration plan. Level ids are unique across
-# subdomains, so a coupled model's subdomains land in different entries and every one of them is kept. A grid is a
+# subdomains, so a coupled model's subdomains land in different records and every one of them is kept. A grid is a
 # vertex cloud (`K = 0`) of the physical quadrature points, each with its physical weight `weight` (the rule weight
 # times the region's Jacobian, as assembly integrates with it), region by region — subdomain order, then plan order —
 # and point by point. Both arrays are presized from the regions' point counts rather than grown point by point. Not
-# `_quadrature_cloud` (`data.jl`), the bare coordinates in `q.point` order that the RBFP0 transfer indexes. The entries
-# are collected into a vector of their concrete type by an explicit loop, as `_sample_fields` collects its records.
+# `_quadrature_cloud` (`data.jl`), the bare coordinates in `q.point` order that the RBFP0 transfer indexes. The records
+# are collected into a vector of their concrete type by an explicit loop, as `_sample_fields` collects its own.
 function _sample_quadrature(model::Model{D,T}) where {D,T}
     groups = Dict{Vector{Int},Vector{VolumeRegion{D,T}}}()
     for subdomain in model.subdomains, region in subdomain.plan.regions
         push!(get!(() -> VolumeRegion{D,T}[], groups, sort!([p.level for p in region.parents])), region)
     end
-    entries = @NamedTuple{signature::Vector{Int}, grid::SampleGrid{D,T,0}}[]
+    records = @NamedTuple{signature::Vector{Int}, grid::SampleGrid{D,T,0}}[]
     for signature in sort!(collect(keys(groups)))
         regions, n = groups[signature], 0
         for region in regions               # not `sum(f, regions)`, whose reducer chain compiles for every region type
@@ -524,9 +656,9 @@ function _sample_quadrature(model::Model{D,T}) where {D,T}
         end
         grid = SampleGrid{D,T,0}(points, Pair{String,AbstractVector}["weight" => weights],
                                  Pair{String,AbstractVector}[])
-        push!(entries, (; signature, grid))
+        push!(records, (; signature, grid))
     end
-    return entries
+    return records
 end
 
 # ── Solution evaluation ───────────────────────────────────────────────────────

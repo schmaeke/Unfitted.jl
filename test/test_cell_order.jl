@@ -1,6 +1,5 @@
 using StaticArrays
 using LinearAlgebra: norm
-using WriteVTK      # one testset writes the `order_max` level-mesh array through UnfittedWriteVTKExt
 
 using Unfitted: dof_layout, cell_dofs, cell_basis_indices, basis_values, _level_by_id, _index_admissible,
                 local_basis_indices, _tensor_values!, _factor_buffers, _entity_carries, _incident_cells, TensorDofKey,
@@ -385,7 +384,7 @@ end
     @test solve!(model) isa Solution
 end
 
-@testset "per-cell order: transfer, Dirichlet data and VTK" begin
+@testset "per-cell order: transfer, Dirichlet data and the order_max mesh array" begin
     Ω = _CO_2D
     lo = space(Ω; cells=4, order=[2 + (i + j) % 2 for i in 1:4, j in 1:4])
     hi = elevate(lo, 1 => [3 + (i + j) % 2 for i in 1:4, j in 1:4])
@@ -403,11 +402,10 @@ end
     moved = transfer(u, src, tgt; via=L2Projection())
     @test l2_error(moved, tgt, exact) < 1e-10
 
-    # The VTK `order_max` cell array becomes the p-field visualisation for free.
-    mktempdir() do dir
-        path = write_vtk(joinpath(dir, "cellorder"), u, src)
-        @test !isempty(path)
-    end
+    # The `order_max` cell array of the level's mesh is the p-field visualisation for free: each cell's own order, in
+    # `cell_indices` order.
+    (; grid) = only(Unfitted._sample_levels(src))
+    @test Dict(grid.cell_data)["order_max"] == vec([2 + (i + j) % 2 for i in 1:4, j in 1:4])
 end
 
 @testset "per-cell order: immersed physical domain" begin

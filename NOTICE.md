@@ -50,7 +50,10 @@ in full at the top of the implementing file, for academic attribution:
     surface are split at grid planes by single-plane passes of the polygon
     clipper of I. E. Sutherland, G. W. Hodgman, "Reentrant polygon
     clipping", Commun. ACM **17** (1974) 32,
-    [doi:10.1145/360767.360802](https://doi.org/10.1145/360767.360802).
+    [doi:10.1145/360767.360802](https://doi.org/10.1145/360767.360802). The
+    same single pass, against the half-plane where a level set's linear
+    interpolant is ≤ 0, clips the triangles of a plot's sample cells to `Ω`
+    in `ext/UnfittedMakieExt.jl`.
 
   - **Mesh signed-distance** in `ext/UnfittedMeshIOExt.jl` — closest point on a
     triangle: C. Ericson, "Real-Time Collision Detection", Morgan Kaufmann
