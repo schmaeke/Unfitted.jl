@@ -902,17 +902,18 @@ end
 function _region_edges!(edges, grid::SampleGrid{2}, φ)
     return _region_edges!(edges, grid.points, _record_array(grid.cell_data, "region_id"), φ)
 end
-function _region_edges!(edges, p, regions::AbstractVector, φ)                 # behind the barrier on `regions`' type
+function _region_edges!(edges, points, regions::AbstractVector, φ)            # behind the barrier on `regions`' type
     z, run = _FIELD_Z + _EDGE_LIFT, 1
     while run <= length(regions)
         cells = run:(something(findnext(!=(regions[run]), regions, run), length(regions)+1)-1)
-        corners = p[(4first(cells)-3):(4last(cells))]
+        corners = points[(4first(cells)-3):(4last(cells))]
         lo, hi = reduce((a, b) -> min.(a, b), corners), reduce((a, b) -> max.(a, b), corners)
         for c in cells
             ll, lr, ur, ul = 4c - 3, 4c - 2, 4c - 1, 4c
-            for (a, b, on) in ((ll, lr, p[ll][2] == lo[2]), (ul, ur, p[ul][2] == hi[2]), (ll, ul, p[ll][1] == lo[1]),
-                               (lr, ur, p[lr][1] == hi[1]))
-                piece = on ? _clipped_segment(p, φ, a, b) : nothing
+            sides = ((ll, lr, points[ll][2] == lo[2]), (ul, ur, points[ul][2] == hi[2]),
+                     (ll, ul, points[ll][1] == lo[1]), (lr, ur, points[lr][1] == hi[1]))
+            for (a, b, on) in sides
+                piece = on ? _clipped_segment(points, φ, a, b) : nothing
                 piece === nothing || push!(edges, Point3{Float64}(piece[1]..., z), Point3{Float64}(piece[2]..., z))
             end
         end
