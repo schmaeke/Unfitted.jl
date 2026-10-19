@@ -11,8 +11,8 @@
 > you need reproducibility, and review the diff before updating.
 
 A compact, dimension-generic Julia implementation of **unfitted multi-level hp refinement** on axis-aligned Cartesian
-grids, with **selective per-cell activation** and **finite-cell-method (FCM) immersed-boundary integration** via
-non-negative moment-fit quadrature.
+grids, with **selective per-cell activation** and **finite-cell-method (FCM) immersed-boundary integration** by compact,
+non-negative cut-cell quadrature.
 
 ## Method reference
 
@@ -77,9 +77,10 @@ plate = physical_domain(x -> 0.7 - sqrt(x[1]^2 + x[2]^2); lipschitz=1.0,
                         subcell_length_scale=0.02)
 
 # 16×16 cells of quadratic integrated Legendre. Cells wholly outside Ω are
-# dropped; cut cells get a non-negative moment-fitted rule instead of tensor
-# Gauss. `u` is the unknown field on that space — scalar unless you ask for
-# components.
+# dropped; a cut cell gets Saye's implicit quadrature on its part of Ω instead
+# of tensor Gauss, pruned to a subset of its points with the same moments and
+# non-negative weights. `u` is the unknown field on that space — scalar unless
+# you ask for components.
 V = space(omega; cells=(16, 16), order=2, physical=plate)
 u = field(:u, V)
 
@@ -150,7 +151,7 @@ A machine-readable record is available in [`CITATION.cff`](CITATION.cff).
 
 Unfitted.jl is distributed under the MIT License (see [`LICENSE.md`](LICENSE.md)).
 
-The non-negative least-squares compression in `src/fcm.jl` is informed by
+The optional non-negative least-squares compression `NonnegativeFit` in `src/fcm.jl` is informed by
 [QuESo](https://github.com/manuelmessmer/QuESo) (BSD-4-Clause), used as an algorithmic reference only (no code
-vendored); the cut-cell moments come from Saye's implicit quadrature. See [`NOTICE.md`](NOTICE.md) for the full upstream
-attribution.
+vendored); the default compression is Carathéodory pruning, and the cut-cell moments come from Saye's implicit
+quadrature. See [`NOTICE.md`](NOTICE.md) for the full upstream attribution.
