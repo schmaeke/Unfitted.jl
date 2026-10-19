@@ -43,9 +43,9 @@ end
     leaf(f; lipschitz = Inf) -> Leaf
 
 Wrap a scalar level-set callback `f` (on `SVector{D,T}` coordinates) as a CSG leaf with `Ω_leaf = { x : f(x) ≤ 0 }`. `f`
-must accept `ForwardDiff.Dual` arguments so the quadrature kernel can take its gradient: the finite-cell path
-([`implicit_rule`](@ref)) installs no gradient override, and the `grad` keyword of
-[`implicit_volume_quadrature`](@ref) is reachable only by calling that kernel directly.
+need not be a signed-distance function, but it must accept `ForwardDiff.Dual` arguments so the quadrature kernel can
+take its gradient: the finite-cell path ([`implicit_rule`](@ref)) installs no gradient override, and the `grad` keyword
+of [`implicit_volume_quadrature`](@ref) is reachable only by calling that kernel directly.
 
 `f` must also be safe to call from several threads at once — a pure function of `x` is. The package builds the
 quadrature of cut cells and of cut boundary faces on every thread, and those builds evaluate the leaves concurrently;
@@ -170,7 +170,9 @@ Fields:
     (2) the subdivision of [`implicit_rule`](@ref)'s kernel, which bisects a cut box only where no axis is graph-like
     and clear of a fold (a leaf turning back inside or just beyond the box). A cut cell on which some axis is gets a
     rule of the kernel's full order at once and is never subdivided, so on those cells the accuracy does not depend on
-    this scale at all. Pick it relative to the smallest geometric feature you must classify cleanly.
+    this scale at all. Pick it relative to the smallest geometric feature you must classify cleanly. Because it is a
+    physical length and the depth budget is computed per box, one domain serves every level of a superposition `Space`,
+    coarse and fine alike.
   - `max_depth::Int`: hard cap on the subdivision depth of both consumers above.
   - `moment_order_factor::Int`: multiplier on the order of the tensor Legendre moments a cut cell's rule reproduces,
     per axis (`factor × max(cell_order)` over the region's parent cells).

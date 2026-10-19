@@ -1673,7 +1673,8 @@ conditions alike. Both count functions, not unknowns; a function of a field with
 level is counted once however many fields share its space, and both numbers are read from the first field over that
 space, so with several fields over one space `active_functions` reflects the Dirichlet conditions of the first of them.
 A dormant level, with no active cell, reads 0 / 0; a level that enumerated functions and kept none reads `n` / 0 and
-contributes nothing to the system.
+contributes nothing to the system. On a maximal-continuity spline level the usual cause is a region `p` cells wide or
+less, which holds no function whose whole support fits inside it: the level costs a mesh and buys nothing.
 """
 diagnostics(model::Model) = model.diagnostics
 
