@@ -26,130 +26,31 @@ The method is described in
 
 ## What's in the package
 
-- **Unfitted multi-level hp refinement** on tensor-product Cartesian
-  meshes via the superposition of independently discretized levels
-  (base + overlays). Unlike the *fitted* multi-level hp method
-  (Zander et al., as implemented and extended by Kopp et al. CMAME
-  **401** (2022) 115575), this package neither topologically merges
-  overlays with their parents nor introduces hanging-node
-  constraints; every overlay imposes homogeneous Dirichlet data on
-  its artificial boundary `Γ_o^(k) = ∂Ω^(k) \ ∂Ω` instead. The
-  default basis family is hierarchical integrated Legendre; an
-  open-knot tensor-product B-spline family is available through the
-  `BasicBSpline.jl` package extension (load `BasicBSpline` alongside
-  `Unfitted` and pass `basis = bspline()`). That family keeps the
-  functions whose whole support lies inside a level's active region, so
-  the **superposition** is `C^(p−1)` and not merely each level — under
-  any activation pattern, with no constraint equation and no restriction
-  on the shape of the mask. Worked through in
-  [`examples/tutorials/04_bspline/`](examples/tutorials/04_bspline).
-- **Selective per-cell activation** with the `move!`-style invalidation
-  contract; useful for transient problems where small-scale features
-  evolve in time. Overlays, masks and the invalidation contract are
-  worked through in
-  [`examples/tutorials/02_overlays/`](examples/tutorials/02_overlays).
-- **Immersed-boundary integration** through a `PhysicalDomain` carrying a
-  CSG level set of smooth leaves (`leaf`/`intersect`/`union`/`setdiff`/
-  `complement`). Cells outside `Ω` are dropped from the dof layout; cells
-  crossed by `∂Ω` are integrated by Saye's implicit quadrature, and that
-  rule is compressed by Carathéodory pruning to at most `∏(2p+1)` of its
-  points, with non-negative weights and the same moments. Both stages are
-  replaceable; a non-negative least-squares fit informed by QuESo is the
-  built-in alternative (see [`NOTICE.md`](NOTICE.md) for upstream
-  attribution). The level set need not be a formula: a closed segment loop
-  or triangle surface becomes a signed-distance leaf through
-  `mesh_levelset` / `stl_levelset` in the `FileIO` + `MeshIO` extension.
-  See [`examples/tutorials/03_immersed_fcm/`](examples/tutorials/03_immersed_fcm)
-  for the analytic route and
-  [`examples/applications/imported_geometry_3d/`](examples/applications/imported_geometry_3d)
-  for the imported one.
-- **Multi-domain coupling**: fields may live on *independent* spaces —
-  each subdomain with its own mesh, level-set fold and dof block — tied
-  together across a shared interface mesh by `couple(uₐ, u_b, Γ, form)`.
-  A `WeakForm` gives the jump coupling `∫_Γ a(⟦u⟧, ⟦v⟧) dΓ`, expanded
-  into the four field blocks with the `+ − − +` sign pattern; an
-  `InterfaceForm` kernel — reading `q.normal`, the current side's
-  `trial` gradient (with `sides` naming which side that is), both
-  coupled fields through `q.state`, and the `onside` / `jump_sign`
-  helpers — expresses any two-sided law (weighted Nitsche, cohesive,
-  flux-weighted); `couple` instantiates that kernel once per side pair,
-  so the two-sidedness spans the four blocks. The package supplies the
-  two-sided interface integration, never the constitutive choice.
-  `foreach_quadrature_point(f, model; on = interface(uₐ, u_b, Γ), state)`
-  walks the interface's points under the `q.point` numbering the coupling
-  forms see, the key for per-point history such as a cohesive damage state.
-  An `Interface` matches by its two field names, in order, and its mesh
-  object, so a fresh `interface(uₐ, u_b, Γ)` over the Γ given to `couple`
-  finds the points `prepare` resolved; only a Γ rebuilt as a new mesh
-  object, even an equal one, is intersected with both grids again.
-- **Leaf semantics on covered regions**: a cell carries basis functions
-  only where no finer level has taken the region over. Every high-order
-  mode whose entire incidence stencil is covered by a finer level is
-  eliminated, leaving the linear skeleton.
-  Elimination is per-mode rather than per-cell — a mode is shed only
-  when every cell it touches is covered, so an edge or face mode
-  straddling the boundary of the covered region survives — and a buried
-  linear mode that a *nested* finer level reproduces exactly is
-  deduplicated. Coverage is mask-aware — a deactivated overlay cell that
-  carries material does not cover, so a fully deactivated overlay still
-  behaves like no overlay — while one that carries none does cover: every
-  cell folded away as fictitious, and a user-deactivated cell lying
-  entirely outside Ω. Shedding high-order modes is
-  integrated-Legendre only; the deduplication also runs on a B-spline
-  level, where it is what keeps a nested stack non-singular rather than
-  an accuracy trade — the duplicate it removes is reproduced exactly by
-  the level above. `diagnostics(model, solution).reduced_mode_counts`
-  reports the count per level, concatenated field-by-field. There is
-  nothing to configure: `prepare(problem; prune = false)` builds the
-  unreduced twin, which is a diagnostic — exactly singular on a nested
-  stack — rather than a discretisation to solve with.
-- **Per-cell polynomial order** (integrated Legendre only; any other
-  family raises rather than ignoring a non-uniform field): `space` and
-  `overlay` take `order` as an integer, an `NTuple{D,Int}`, an array
-  shaped like the level's cell grid, or a predicate
-  `(cell_box, cell_index) -> order`. `elevate(V, level => order)` and
-  `elevated(model, …)` change it afterwards — including
-  `CartesianIndex => order` pairs, the shape a marking loop produces —
-  and `cell_orders(V; level)` reads it back. Where two cells of
-  different order share a face the shared entity carries the minimum of
-  the two, which is what keeps the space C⁰.
-- **Nested refinement ladders**: `ladder(domain; cells, order, depth,
-  splits)` declares a stack of aligned levels that arrives inert, so
-  every level nests over every level below it by construction.
-  `adapt(V, level => mask, …)` or `adapt(V, depths; grade)` switches
-  cells on per level in one rebuild, `adapted(model, V)` prepares the
-  result, and `is_nested` / `overlapping_cells` query the stack. Worked
-  through in
-  [`examples/tutorials/05_ladders/`](examples/tutorials/05_ladders).
-- **Automated hp adaptivity**: `estimate(model, u)` is a Bank–Weiser
-  indicator carrying a scale-free stopping quantity; `refine(V, est;
-  theta, previous)` marks by Dörfler and, given
-  `previous = (V_last, est_last)`, sends each marked cell to h or to p
-  by Melenk–Wohlmuth predicted error reduction — omit `previous` and
-  every marked cell takes p, falling back to h only where p is
-  unavailable; `coarsen` reverses both steps.
-  [`examples/tutorials/06_adaptive_hp/`](examples/tutorials/06_adaptive_hp)
-  introduces the loop, and
-  [`examples/reproductions/adaptive_tanh_layer_2d/`](examples/reproductions/adaptive_tanh_layer_2d)
-  is the measured protocol that threads `previous`.
-- **Post-processing**: `value` and `field_gradient` evaluate the superposed
-  solution at any point, `l2_error` measures it against an exact solution
-  over the model's own integration plan, and `boundary_integral` integrates
-  over a boundary portion or an interface. ParaView output is the `WriteVTK`
-  package extension (`using WriteVTK` alongside `Unfitted`): `write_vtk`
-  writes a solution with the meshes of its levels — cut cells refined toward
-  `∂Ω`, so a Clip on the `level_set` array draws the immersed boundary —
-  `vtk_series` collects such bundles into a time series, and
-  `write_quadrature_vtm` writes the quadrature-point cloud. Plots of 1D
-  and 2D models are a Makie extension (load any Makie backend, e.g.
-  `using CairoMakie`): `fieldplot` draws a solution — its value, any
-  quantity a callback computes from it, or without one the integration
-  regions — as a coloured or warped surface in 2D and a graph in 1D, cut
-  at `∂Ω` on an immersed model; `levelplot` draws the meshes of the levels
-  coloured by order, activity, coverage or an error estimate, and
-  `quadratureplot` the quadrature points, neither of which needs a
-  solution; each draws `∂Ω` on request.
-- **D-generic core**: 1D, 2D, 3D, and 4D smoke-tested.
+- **Unfitted Multi-level hp refinement by superposition**: overlays are independent
+  levels added on top of a base mesh, with no hanging-node constraints
+  ([`tutorials/02_overlays`](examples/tutorials/02_overlays)).
+- **Selective per-cell activation**: switch individual cells of any level on
+  and off, for instance as a solution feature moves.
+- **Immersed boundaries (finite cell method)**: geometry as a CSG level set
+  or a closed boundary mesh; cut cells get a compact quadrature rule with
+  non-negative weights
+  ([`tutorials/03_immersed_fcm`](examples/tutorials/03_immersed_fcm)).
+- **Two basis families**: hierarchical integrated Legendre, and B-splines
+  whose superposition is `C^(p−1)` under any activation pattern
+  ([`tutorials/04_bspline`](examples/tutorials/04_bspline)).
+- **Per-cell polynomial order** for the integrated Legendre family.
+- **Nested refinement ladders**: declare a stack of aligned levels and switch
+  its cells on per level
+  ([`tutorials/05_ladders`](examples/tutorials/05_ladders)).
+- **Automated hp adaptivity**: error estimation, marking, and an h-or-p
+  decision per cell
+  ([`tutorials/06_adaptive_hp`](examples/tutorials/06_adaptive_hp)).
+- **Multi-domain coupling**: independently meshed subdomains tied across an
+  interface by a user-supplied two-sided form
+  ([`applications/interface_coupling_2d`](examples/applications/interface_coupling_2d)).
+- **Post-processing**: point evaluation, L² errors, boundary integrals,
+  ParaView output, and Makie plots in 1D and 2D.
+- **Dimension-generic**: the same code runs in 1D, 2D, 3D, and 4D.
 
 ## Installation
 
@@ -182,9 +83,10 @@ using WriteVTK   # loads Unfitted's ParaView writer, a package extension
 omega = box((-1.0, -1.0), (1.0, 1.0))
 
 # Ω = { x : φ(x) ≤ 0 } ∩ omega, so this φ keeps the square *minus* a disk of
-# radius 0.7. `lipschitz = 1` certifies φ as a signed distance, which lets the
-# quadrature kernel skip subdivision it can prove unnecessary;
-# `subcell_length_scale` is the geometric resolution for cells it cannot.
+# radius 0.7. φ is a signed distance, so `lipschitz = 1` lets the cell
+# classifier and the quadrature kernel prove its sign on a box instead of
+# guessing it from corner samples; `subcell_length_scale` is the box size they
+# subdivide down to where they cannot.
 plate = physical_domain(x -> 0.7 - sqrt(x[1]^2 + x[2]^2); lipschitz=1.0,
                         subcell_length_scale=0.02)
 
@@ -219,69 +121,32 @@ report   = diagnostics(model, solution)
 write_vtk("plate", solution, model)
 ```
 
-`boundary(:all)` selects faces of the background box `omega`, which here are
-genuine material boundary, so the condition constrains 128 of the 824 raw
-degrees of freedom. That distinction matters as soon as the geometry moves
-inside the box: had `Ω` been the disk itself rather than the plate around it,
-those same faces would lie entirely in the fictitious region and the identical
-line would have constrained nothing, silently. A condition on an immersed
-surface is a different construction — approximate it as a `BoundaryMesh` and
-impose the datum weakly with a Nitsche term, as
-`tutorials/03_immersed_fcm/` does on both rims of an annulus.
+`boundary(:all)` selects faces of the background box `omega`, never the
+immersed boundary. A condition on the hole is imposed weakly instead, as
+[`tutorials/03_immersed_fcm`](examples/tutorials/03_immersed_fcm) shows.
 
-`examples/` is organised in three tiers, which answer three different
-questions. **Tutorials** teach the API and are meant to be read in order.
-**Applications** are recognisable engineering problems solved plainly, and are
-where the package is shown working alongside third-party Julia packages.
-**Reproductions** are the scientific record — the benchmarks behind the method
-paper at their published configurations, the FCM moment-fit reproductions, and
-the adaptivity benchmark scored against deal.II's step-27.
+## Examples
 
-Each example lives in its own sub-directory with a self-contained
-`Project.toml` (Unfitted is wired in via `[sources]`), so example-specific
-dependencies stay out of the package's own `Project.toml`. Run any example
-with
+[`examples/`](examples) holds runnable scripts in three tiers:
+
+- **[Tutorials](examples/tutorials)** teach the API one concept at a time and
+  are meant to be read in order.
+- **[Applications](examples/applications)** solve recognisable engineering
+  problems, some alongside third-party Julia packages.
+- **[Reproductions](examples/reproductions)** are the scientific record:
+  fixed benchmarks from the method paper and the literature, and the package's
+  adaptivity benchmarks, one of them scored against deal.II's step-27.
+
+Each example has its own `Project.toml`, so its dependencies stay out of your
+environment and install on the first run. Examples need Julia 1.11 or newer.
+Run one with
 
 ```bash
-julia --project=examples/<tier>/<name> examples/<tier>/<name>/<name>.jl
+julia --project=examples/tutorials/01_first_solve examples/tutorials/01_first_solve/01_first_solve.jl
 ```
 
-`Manifest.toml` is git-ignored, so the first run of an example resolves and
-installs that example's own dependencies. Most resolve in seconds;
-`applications/time_integration` pulls in the `OrdinaryDiffEq.jl` tree and takes
-a few minutes the first time.
-
-### Tutorials — start here
-
-| Sub-directory | What it teaches |
-|---|---|
-| `tutorials/01_first_solve/` | The whole workflow in seven calls: `box → space → field → poisson → prepare → solve! → diagnostics`, first on an interval and then, unchanged, on a square |
-| `tutorials/02_overlays/` | Local refinement by superposition: adding an overlay, masking it to a patch, `activate!`/`deactivate!`, and reading `reduced_mode_counts` |
-| `tutorials/03_immersed_fcm/` | Geometry the mesh knows nothing about: a CSG level set, cut-cell moment-fit quadrature, and a Nitsche condition on an immersed boundary |
-| `tutorials/04_bspline/` | Swapping the basis family to B-splines, why a nested B-spline stack needs deduplication, and B-splines on an immersed domain |
-| `tutorials/05_ladders/` | Why a finer overlay can be less accurate, declaring a nested stack with `ladder`, and switching its cells on per level with `adapt` |
-| `tutorials/06_adaptive_hp/` | Handing the refinement decision to the solver: `estimate`, `refine`, and how the loop picks h against p from a cell's own refinement history |
-
-### Applications — the package on real problems
-
-| Sub-directory | What it solves |
-|---|---|
-| `applications/kirsch_plate_2d/` | Plane-stress plate with a circular hole, verified against the Kirsch solution; the weak form is written in `Tensors.jl` notation |
-| `applications/slit_plate_2d/` | Plate with a slit far narrower than its grid: plain finite cells cannot open it, one thin-celled overlay whose fold cuts it in two lets the displacement jump; energy errors against a computed reference |
-| `applications/interface_coupling_2d/` | Bonded bi-material joint: two independently meshed subdomains tied across a shared seam by a weighted Nitsche interface form |
-| `applications/imported_geometry_3d/` | Heat conduction in a non-convex L-bracket whose geometry arrives as a triangle surface mesh (`FileIO` + `MeshIO`) rather than as a formula |
-| `applications/time_integration/` | Transient heat conduction where Unfitted supplies `M`, `K` and `f` once and `OrdinaryDiffEq.jl` owns the time axis |
-| `applications/thermal_curing_2d/` | Irreversible thermal curing of a thermoset: the cure fraction is per-quadrature-point `QuadField` state, the conductivity depends on it (Picard per step), and the overlay activates on the cure front — with `RBFP0` carrying the state across every rebuild |
-
-### Reproductions — the scientific record
-
-| Sub-directory | What it pins |
-|---|---|
-| `reproductions/laplace_unit_square_smooth/` | Smooth Laplace verification on the unit square |
-| `reproductions/singular_square_2d/` | 2D corner-singularity convergence with nested overlays |
-| `reproductions/conditioning_small_overlap/` | Small-overlap conditioning sweep, one CSV row per (order, overlap) |
-| `reproductions/traveling_laser_2d/` | Moving Gaussian laser: automated hp adaptivity on a transient, against an exact convolution reference |
-| `reproductions/adaptive_tanh_layer_2d/` | Automated hp on a curved interior layer, scored on a fixed background lattice against deal.II step-27 |
+Every other example runs the same way, with its own `<tier>/<name>` in both
+paths.
 
 ## Documentation
 
